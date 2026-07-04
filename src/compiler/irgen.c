@@ -423,6 +423,55 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
             if (local) {
                 LLVMBuildStore(g->builder, right, local->alloca);
+            } else if (g->current_this && g->current_type_sym) {
+                /* implicit this.Field assignment */
+                int fi = get_field_index(g->current_type_sym, expr->binary.left->ident.name);
+                if (fi >= 0) {
+                    LLVMTypeRef st = get_struct_llvm_type(g, g->current_type_sym);
+                    if (st) {
+                        LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
+                            LLVMPointerType(st, 0), g->current_this, "this");
+                        LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, this_ptr, (unsigned)fi, "fld");
+                        /* type conversion if needed */
+                        zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->binary.left->ident.name);
+                        if (fsym && fsym->type) {
+                            LLVMTypeRef target_t = map_type(g, fsym->type);
+                            LLVMTypeRef val_t = LLVMTypeOf(right);
+                            if (target_t != val_t) {
+                                if (LLVMGetTypeKind(target_t) == LLVMFloatTypeKind &&
+                                    LLVMGetTypeKind(val_t) == LLVMDoubleTypeKind) {
+                                    right = LLVMBuildFPTrunc(g->builder, right, target_t, "trunc");
+                                } else if (LLVMGetTypeKind(target_t) == LLVMDoubleTypeKind &&
+                                           LLVMGetTypeKind(val_t) == LLVMFloatTypeKind) {
+                                    right = LLVMBuildFPExt(g->builder, right, target_t, "ext");
+                                } else if (LLVMGetTypeKind(target_t) == LLVMIntegerTypeKind &&
+                                           LLVMGetTypeKind(val_t) == LLVMIntegerTypeKind) {
+                                    unsigned tw = LLVMGetIntTypeWidth(target_t);
+                                    unsigned vw = LLVMGetIntTypeWidth(val_t);
+                                    if (tw > vw) right = LLVMBuildSExt(g->builder, right, target_t, "ext");
+                                    else if (tw < vw) right = LLVMBuildTrunc(g->builder, right, target_t, "trunc");
+                                }
+                            }
+                        }
+                        LLVMBuildStore(g->builder, right, fptr);
+                    }
+                }
+            }
+        } else if (expr->binary.left->kind == AST_MEMBER_ACCESS) {
+            /* obj.Field = value */
+            zan_ast_node_t *obj_expr = expr->binary.left->member.object;
+            if (obj_expr->kind == AST_IDENTIFIER) {
+                local_var_t *local = local_find(locals, obj_expr->ident.name);
+                if (local && local->type && local->type->sym) {
+                    int fi = get_field_index(local->type->sym, expr->binary.left->member.name);
+                    if (fi >= 0) {
+                        LLVMTypeRef st = get_struct_llvm_type(g, local->type->sym);
+                        if (st) {
+                            LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, local->alloca, (unsigned)fi, "fld");
+                            LLVMBuildStore(g->builder, right, fptr);
+                        }
+                    }
+                }
             }
         }
         return right;
@@ -672,8 +721,72 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     }
 
+    case AST_NEW_EXPR: {
+        /* new ClassName(args) — allocate struct + call constructor */
+        zan_istr_t type_name = {NULL, 0};
+        if (expr->new_expr.type) {
+            if (expr->new_expr.type->kind == AST_IDENTIFIER) {
+                type_name = expr->new_expr.type->ident.name;
+            } else if (expr->new_expr.type->kind == AST_TYPE_REF) {
+                type_name = expr->new_expr.type->type_ref.name;
+            }
+        }
+        if (type_name.str) {
+            zan_symbol_t *sym = zan_binder_lookup(g->binder, type_name);
+            if (sym && sym->type && (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)) {
+                LLVMTypeRef st = get_struct_llvm_type(g, sym);
+                if (st) {
+                    LLVMValueRef alloca = LLVMBuildAlloca(g->builder, st, "new");
+                    LLVMBuildStore(g->builder, LLVMConstNull(st), alloca);
+
+                    /* look for constructor */
+                    for (int ci = 0; ci < g->ctor_count; ci++) {
+                        if (g->ctors[ci].type_sym == sym) {
+                            int argc = expr->new_expr.args.count + 1;
+                            LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
+                            call_args[0] = alloca; /* this ptr */
+                            for (int k = 0; k < expr->new_expr.args.count; k++) {
+                                call_args[k + 1] = emit_expr(g, expr->new_expr.args.items[k], locals);
+                            }
+                            LLVMBuildCall2(g->builder, g->ctors[ci].fn_type,
+                                g->ctors[ci].fn, call_args, (unsigned)argc, "");
+                            free(call_args);
+                            break;
+                        }
+                    }
+
+                    /* if no constructor, handle field initializers */
+                    if (g->ctor_count == 0 || 1) {
+                        for (int i = 0; i < expr->new_expr.args.count; i++) {
+                            zan_ast_node_t *arg = expr->new_expr.args.items[i];
+                            if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
+                                int fi = get_field_index(sym, arg->binary.left->ident.name);
+                                if (fi >= 0) {
+                                    LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, alloca, (unsigned)fi, "finit");
+                                    LLVMValueRef fval = emit_expr(g, arg->binary.right, locals);
+                                    zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
+                                    if (fsym && fsym->type) {
+                                        LLVMTypeRef target_t = map_type(g, fsym->type);
+                                        LLVMTypeRef val_t = LLVMTypeOf(fval);
+                                        if (LLVMGetTypeKind(target_t) == LLVMFloatTypeKind &&
+                                            LLVMGetTypeKind(val_t) == LLVMDoubleTypeKind) {
+                                            fval = LLVMBuildFPTrunc(g->builder, fval, target_t, "trunc");
+                                        }
+                                    }
+                                    LLVMBuildStore(g->builder, fval, fptr);
+                                }
+                            }
+                        }
+                    }
+                    return alloca;
+                }
+            }
+        }
+        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+
     default:
-        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     }
 }
 
@@ -711,30 +824,50 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         LLVMTypeRef st = get_struct_llvm_type(g, sym);
                         if (st) {
                             LLVMValueRef alloca = LLVMBuildAlloca(g->builder, st, "var");
-                            /* zero-initialize */
                             LLVMBuildStore(g->builder, LLVMConstNull(st), alloca);
-                            /* set fields from initializer args (name = value assignments) */
-                            for (int i = 0; i < init->new_expr.args.count; i++) {
-                                zan_ast_node_t *arg = init->new_expr.args.items[i];
-                                if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
-                                    int fi = get_field_index(sym, arg->binary.left->ident.name);
-                                    if (fi >= 0) {
-                                        LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, alloca, (unsigned)fi, "finit");
-                                        LLVMValueRef fval = emit_expr(g, arg->binary.right, locals);
-                                        /* type conversion if needed (e.g., double to float) */
-                                        zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
-                                        if (fsym && fsym->type) {
-                                            LLVMTypeRef target_t = map_type(g, fsym->type);
-                                            LLVMTypeRef val_t = LLVMTypeOf(fval);
-                                            if (LLVMGetTypeKind(target_t) == LLVMFloatTypeKind &&
-                                                LLVMGetTypeKind(val_t) == LLVMDoubleTypeKind) {
-                                                fval = LLVMBuildFPTrunc(g->builder, fval, target_t, "trunc");
-                                            } else if (LLVMGetTypeKind(target_t) == LLVMDoubleTypeKind &&
-                                                       LLVMGetTypeKind(val_t) == LLVMFloatTypeKind) {
-                                                fval = LLVMBuildFPExt(g->builder, fval, target_t, "ext");
+
+                            /* try calling constructor */
+                            bool ctor_called = false;
+                            for (int ci = 0; ci < g->ctor_count; ci++) {
+                                if (g->ctors[ci].type_sym == sym &&
+                                    g->ctors[ci].param_count == init->new_expr.args.count) {
+                                    int argc = init->new_expr.args.count + 1;
+                                    LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
+                                    call_args[0] = alloca;
+                                    for (int k = 0; k < init->new_expr.args.count; k++) {
+                                        call_args[k + 1] = emit_expr(g, init->new_expr.args.items[k], locals);
+                                    }
+                                    LLVMBuildCall2(g->builder, g->ctors[ci].fn_type,
+                                        g->ctors[ci].fn, call_args, (unsigned)argc, "");
+                                    free(call_args);
+                                    ctor_called = true;
+                                    break;
+                                }
+                            }
+
+                            /* if no constructor, handle field initializers */
+                            if (!ctor_called) {
+                                for (int i = 0; i < init->new_expr.args.count; i++) {
+                                    zan_ast_node_t *arg = init->new_expr.args.items[i];
+                                    if (arg->kind == AST_ASSIGNMENT && arg->binary.left->kind == AST_IDENTIFIER) {
+                                        int fi = get_field_index(sym, arg->binary.left->ident.name);
+                                        if (fi >= 0) {
+                                            LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, alloca, (unsigned)fi, "finit");
+                                            LLVMValueRef fval = emit_expr(g, arg->binary.right, locals);
+                                            zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
+                                            if (fsym && fsym->type) {
+                                                LLVMTypeRef target_t = map_type(g, fsym->type);
+                                                LLVMTypeRef val_t = LLVMTypeOf(fval);
+                                                if (LLVMGetTypeKind(target_t) == LLVMFloatTypeKind &&
+                                                    LLVMGetTypeKind(val_t) == LLVMDoubleTypeKind) {
+                                                    fval = LLVMBuildFPTrunc(g->builder, fval, target_t, "trunc");
+                                                } else if (LLVMGetTypeKind(target_t) == LLVMDoubleTypeKind &&
+                                                           LLVMGetTypeKind(val_t) == LLVMFloatTypeKind) {
+                                                    fval = LLVMBuildFPExt(g->builder, fval, target_t, "ext");
+                                                }
                                             }
+                                            LLVMBuildStore(g->builder, fval, fptr);
                                         }
-                                        LLVMBuildStore(g->builder, fval, fptr);
                                     }
                                 }
                             }
@@ -1010,19 +1143,25 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
-            if (member->kind != AST_METHOD_DECL) continue;
+            bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
+            if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
             if (!member->method_decl.body) continue;
 
             /* skip static Main — handled separately */
-            bool is_static = (member->method_decl.modifiers & MOD_STATIC) != 0;
+            bool is_static = !is_ctor && (member->method_decl.modifiers & MOD_STATIC) != 0;
             if (is_static && member->method_decl.name.len == 4 &&
                 memcmp(member->method_decl.name.str, "Main", 4) == 0) continue;
 
-            /* build function name: TypeName_MethodName */
+            /* build function name: TypeName_MethodName or TypeName_ctor */
             char fn_name[512];
-            snprintf(fn_name, sizeof(fn_name), "%.*s_%.*s",
-                     (int)decl->type_decl.name.len, decl->type_decl.name.str,
-                     (int)member->method_decl.name.len, member->method_decl.name.str);
+            if (is_ctor) {
+                snprintf(fn_name, sizeof(fn_name), "%.*s_ctor",
+                         (int)decl->type_decl.name.len, decl->type_decl.name.str);
+            } else {
+                snprintf(fn_name, sizeof(fn_name), "%.*s_%.*s",
+                         (int)decl->type_decl.name.len, decl->type_decl.name.str,
+                         (int)member->method_decl.name.len, member->method_decl.name.str);
+            }
 
             /* build function type */
             int param_count = member->method_decl.params.count;
@@ -1045,15 +1184,24 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 param_types[k + param_offset] = map_type(g, pt);
             }
 
-            zan_type_t *ret_type = member->method_decl.return_type
-                ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
-                : g->binder->type_void;
+            zan_type_t *ret_type = is_ctor ? g->binder->type_void
+                : (member->method_decl.return_type
+                    ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
+                    : g->binder->type_void);
             LLVMTypeRef llvm_ret = map_type(g, ret_type);
             LLVMTypeRef fn_type = LLVMFunctionType(llvm_ret, param_types, (unsigned)total_params, 0);
             LLVMValueRef fn = LLVMAddFunction(g->mod, fn_name, fn_type);
 
-            /* register in function table */
-            if (g->function_count < 1024) {
+            /* register in function/ctor table */
+            if (is_ctor) {
+                if (g->ctor_count < 256) {
+                    g->ctors[g->ctor_count].type_sym = type_sym;
+                    g->ctors[g->ctor_count].fn = fn;
+                    g->ctors[g->ctor_count].fn_type = fn_type;
+                    g->ctors[g->ctor_count].param_count = param_count;
+                    g->ctor_count++;
+                }
+            } else if (g->function_count < 1024) {
                 zan_symbol_t *method_sym = get_method_sym(type_sym, member->method_decl.name);
                 g->functions[g->function_count].sym = method_sym;
                 g->functions[g->function_count].fn = fn;

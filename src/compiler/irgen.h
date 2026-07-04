@@ -54,6 +54,15 @@ struct zan_irgen {
         LLVMTypeRef fn_type;
     } functions[1024];
     int function_count;
+
+    /* constructors */
+    struct {
+        zan_symbol_t *type_sym;
+        LLVMValueRef fn;
+        LLVMTypeRef fn_type;
+        int param_count;
+    } ctors[256];
+    int ctor_count;
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
