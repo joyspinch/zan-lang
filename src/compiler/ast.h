@@ -155,6 +155,7 @@ struct zan_ast_node {
         struct {
             zan_ast_node_t *type;
             zan_ast_list_t args;
+            bool is_array;       /* new Type[size] */
         } new_expr;
 
         /* cast: (Type)expr */

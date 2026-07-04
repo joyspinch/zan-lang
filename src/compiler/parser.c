@@ -317,7 +317,16 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
         n->new_expr.type = type;
         zan_ast_list_init(&n->new_expr.args);
-        if (parser_match(p, TK_LPAREN)) {
+        n->new_expr.is_array = false;
+
+        /* array creation: new Type[size] */
+        if (parser_check(p, TK_LBRACKET) && !type->type_ref.is_array) {
+            parser_advance(p); /* [ */
+            zan_ast_node_t *size = parse_expression(p);
+            parser_expect(p, TK_RBRACKET);
+            zan_ast_list_push(&n->new_expr.args, size, p->arena);
+            n->new_expr.is_array = true;
+        } else if (parser_match(p, TK_LPAREN)) {
             while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
                 zan_ast_node_t *arg = parse_expression(p);
                 zan_ast_list_push(&n->new_expr.args, arg, p->arena);

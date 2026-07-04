@@ -457,6 +457,24 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     }
                 }
             }
+        } else if (expr->binary.left->kind == AST_INDEX) {
+            /* arr[i] = value */
+            zan_ast_node_t *arr_expr = expr->binary.left->index.object;
+            if (arr_expr->kind == AST_IDENTIFIER) {
+                local_var_t *local = local_find(locals, arr_expr->ident.name);
+                if (local) {
+                    LLVMValueRef arr_ptr = LLVMBuildLoad2(g->builder,
+                        LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                        local->alloca, "arrload");
+                    LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                    LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+                    if (local->type && local->type->element_type) {
+                        elem_llvm = map_type(g, local->type->element_type);
+                    }
+                    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
+                    LLVMBuildStore(g->builder, right, elem_ptr);
+                }
+            }
         } else if (expr->binary.left->kind == AST_MEMBER_ACCESS) {
             /* obj.Field = value */
             zan_ast_node_t *obj_expr = expr->binary.left->member.object;
@@ -721,7 +739,50 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     }
 
+    case AST_INDEX: {
+        /* arr[i] — array element access */
+        LLVMValueRef arr_ptr = NULL;
+        zan_type_t *arr_type = NULL;
+        if (expr->index.object->kind == AST_IDENTIFIER) {
+            local_var_t *local = local_find(locals, expr->index.object->ident.name);
+            if (local) {
+                arr_ptr = LLVMBuildLoad2(g->builder, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                    local->alloca, "arrload");
+                arr_type = local->type;
+            }
+        }
+        if (arr_ptr && arr_type) {
+            LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
+            LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+            if (arr_type->element_type) {
+                elem_llvm = map_type(g, arr_type->element_type);
+            }
+            LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
+            return LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
+        }
+        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+
     case AST_NEW_EXPR: {
+        /* new Type[size] — array creation */
+        if (expr->new_expr.is_array && expr->new_expr.args.count > 0) {
+            zan_type_t *elem_type = zan_binder_resolve_type(g->binder, expr->new_expr.type);
+            if (!elem_type) elem_type = g->binder->type_int;
+            LLVMTypeRef elem_llvm = map_type(g, elem_type);
+            LLVMValueRef size_val = emit_expr(g, expr->new_expr.args.items[0], locals);
+
+            /* malloc(size * sizeof(elem)) */
+            LLVMValueRef elem_size = LLVMSizeOf(elem_llvm);
+            LLVMValueRef total = LLVMBuildMul(g->builder,
+                LLVMBuildZExt(g->builder, size_val, LLVMInt64TypeInContext(g->ctx), "zext"),
+                elem_size, "total");
+            LLVMTypeRef malloc_type = LLVMFunctionType(
+                LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                (LLVMTypeRef[]){LLVMInt64TypeInContext(g->ctx)}, 1, 0);
+            LLVMValueRef arr = LLVMBuildCall2(g->builder, malloc_type, g->fn_malloc, &total, 1, "arr");
+            return arr;
+        }
+
         /* new ClassName(args) — allocate struct + call constructor */
         zan_istr_t type_name = {NULL, 0};
         if (expr->new_expr.type) {
@@ -808,6 +869,26 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             type = zan_binder_resolve_type(g->binder, stmt->var_decl.type);
         } else if (stmt->var_decl.initializer) {
             zan_ast_node_t *init = stmt->var_decl.initializer;
+
+            /* check if initializer is array creation: new int[5] */
+            if (init->kind == AST_NEW_EXPR && init->new_expr.is_array) {
+                LLVMValueRef arr_val = emit_expr(g, init, locals);
+                LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ptr_type, "arr");
+                LLVMBuildStore(g->builder, arr_val, alloca);
+
+                zan_type_t *elem_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
+                if (!elem_type) elem_type = g->binder->type_int;
+                zan_type_t *arr_type = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
+                arr_type->kind = TYPE_ARRAY;
+                arr_type->element_type = elem_type;
+                arr_type->name = (zan_istr_t){NULL, 0};
+                arr_type->sym = NULL;
+                arr_type->type_args = NULL;
+                arr_type->type_arg_count = 0;
+                local_add(locals, stmt->var_decl.name, alloca, arr_type);
+                return;
+            }
 
             /* check if initializer is a struct construction: Point { X = 3.0, Y = 4.0 } */
             if (init->kind == AST_NEW_EXPR && init->new_expr.type) {
