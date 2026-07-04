@@ -298,7 +298,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 
     switch (expr->kind) {
     case AST_INT_LITERAL:
-        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), (uint64_t)expr->int_val, 1);
+        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), (uint64_t)expr->int_val, 1);
 
     case AST_FLOAT_LITERAL:
         return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx), expr->float_val);
@@ -481,27 +481,47 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMBuildCall2(g->builder, sqrt_type, sqrt_fn, &arg, 1, "sqrt");
         }
 
-        /* user-defined method call: obj.Method(args) */
+        /* user-defined method call: obj.Method(args) or Type.StaticMethod(args) */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             if (callee->member.object->kind == AST_IDENTIFIER) {
+                /* first try as instance method: local_var.Method(args) */
                 local_var_t *local = local_find(locals, callee->member.object->ident.name);
                 if (local && local->type && local->type->sym) {
                     zan_symbol_t *type_sym = local->type->sym;
-                    /* find the method in the function table */
                     zan_symbol_t *method_sym = get_method_sym(type_sym, callee->member.name);
                     if (method_sym) {
                         for (int fi = 0; fi < g->function_count; fi++) {
                             if (g->functions[fi].sym == method_sym) {
-                                /* call with this pointer + args */
                                 int argc = expr->call.args.count + 1;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
-                                call_args[0] = local->alloca; /* this ptr */
+                                call_args[0] = local->alloca;
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, "mcall");
+                                free(call_args);
+                                return result;
+                            }
+                        }
+                    }
+                }
+
+                /* try as static method: ClassName.Method(args) */
+                zan_symbol_t *type_sym = zan_binder_lookup(g->binder, callee->member.object->ident.name);
+                if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
+                    zan_symbol_t *method_sym = get_method_sym(type_sym, callee->member.name);
+                    if (method_sym) {
+                        for (int fi = 0; fi < g->function_count; fi++) {
+                            if (g->functions[fi].sym == method_sym) {
+                                int argc = expr->call.args.count;
+                                LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                                for (int k = 0; k < argc; k++) {
+                                    call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                                }
+                                LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
+                                    g->functions[fi].fn, call_args, (unsigned)argc, "scall");
                                 free(call_args);
                                 return result;
                             }
@@ -732,10 +752,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBuildStore(g->builder, init_val, alloca);
             if (LLVMGetTypeKind(init_type) == LLVMDoubleTypeKind) {
                 type = g->binder->type_double;
+            } else if (LLVMGetTypeKind(init_type) == LLVMFloatTypeKind) {
+                type = g->binder->type_float;
             } else if (LLVMGetTypeKind(init_type) == LLVMPointerTypeKind) {
                 type = g->binder->type_string;
+            } else if (LLVMGetTypeKind(init_type) == LLVMIntegerTypeKind) {
+                unsigned bits = LLVMGetIntTypeWidth(init_type);
+                if (bits <= 32) type = g->binder->type_int;
+                else type = g->binder->type_long;
             } else {
-                type = g->binder->type_long;
+                type = g->binder->type_int;
             }
             local_add(locals, stmt->var_decl.name, alloca, type);
             return;
@@ -985,8 +1011,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             if (member->kind != AST_METHOD_DECL) continue;
-            if (member->method_decl.modifiers & MOD_STATIC) continue;
             if (!member->method_decl.body) continue;
+
+            /* skip static Main — handled separately */
+            bool is_static = (member->method_decl.modifiers & MOD_STATIC) != 0;
+            if (is_static && member->method_decl.name.len == 4 &&
+                memcmp(member->method_decl.name.str, "Main", 4) == 0) continue;
 
             /* build function name: TypeName_MethodName */
             char fn_name[512];
@@ -994,20 +1024,25 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                      (int)decl->type_decl.name.len, decl->type_decl.name.str,
                      (int)member->method_decl.name.len, member->method_decl.name.str);
 
-            /* build function type: ret_type fn(this_ptr, params...) */
+            /* build function type */
             int param_count = member->method_decl.params.count;
-            int total_params = param_count + 1; /* +1 for this pointer */
-            LLVMTypeRef *param_types = (LLVMTypeRef *)calloc((size_t)total_params, sizeof(LLVMTypeRef));
+            int total_params = is_static ? param_count : param_count + 1;
+            LLVMTypeRef *param_types = (LLVMTypeRef *)calloc((size_t)(total_params > 0 ? total_params : 1), sizeof(LLVMTypeRef));
 
-            /* this pointer */
-            LLVMTypeRef struct_type = get_struct_llvm_type(g, type_sym);
-            param_types[0] = struct_type ? LLVMPointerType(struct_type, 0)
-                                         : LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            int param_offset = 0;
+            LLVMValueRef this_alloca = NULL;
+            if (!is_static) {
+                /* this pointer for instance methods */
+                LLVMTypeRef struct_type = get_struct_llvm_type(g, type_sym);
+                param_types[0] = struct_type ? LLVMPointerType(struct_type, 0)
+                                             : LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                param_offset = 1;
+            }
 
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
-                param_types[k + 1] = map_type(g, pt);
+                param_types[k + param_offset] = map_type(g, pt);
             }
 
             zan_type_t *ret_type = member->method_decl.return_type
@@ -1032,15 +1067,17 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
             local_scope_t *locals = local_scope_new(g->arena);
 
-            /* bind 'this' as first parameter — store to alloca */
-            LLVMValueRef this_alloca = LLVMBuildAlloca(g->builder, param_types[0], "this");
-            LLVMBuildStore(g->builder, LLVMGetParam(fn, 0), this_alloca);
+            if (!is_static) {
+                /* bind 'this' as first parameter */
+                this_alloca = LLVMBuildAlloca(g->builder, param_types[0], "this");
+                LLVMBuildStore(g->builder, LLVMGetParam(fn, 0), this_alloca);
+            }
 
             /* bind method parameters */
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
-                LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k + 1], "p");
-                LLVMBuildStore(g->builder, LLVMGetParam(fn, (unsigned)(k + 1)), param_alloca);
+                LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k + param_offset], "p");
+                LLVMBuildStore(g->builder, LLVMGetParam(fn, (unsigned)(k + param_offset)), param_alloca);
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
                 local_add(locals, param->param.name, param_alloca, pt);
             }
@@ -1051,8 +1088,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             zan_symbol_t *saved_type_sym = g->current_type_sym;
             g->current_fn = fn;
             g->current_fn_ret_type = llvm_ret;
-            g->current_this = this_alloca;
-            g->current_type_sym = type_sym;
+            g->current_this = is_static ? NULL : this_alloca;
+            g->current_type_sym = is_static ? NULL : type_sym;
 
             /* emit method body */
             if (member->method_decl.body->kind == AST_BLOCK) {
