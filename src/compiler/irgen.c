@@ -984,6 +984,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "while.body");
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "while.end");
 
+        LLVMBasicBlockRef saved_break = g->break_target;
+        LLVMBasicBlockRef saved_cont = g->continue_target;
+        g->break_target = end_bb;
+        g->continue_target = cond_bb;
+
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
         LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
@@ -1000,6 +1005,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBuildBr(g->builder, cond_bb);
         }
 
+        g->break_target = saved_break;
+        g->continue_target = saved_cont;
+
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
     }
@@ -1011,6 +1019,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.body");
         LLVMBasicBlockRef step_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.step");
         LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.end");
+
+        LLVMBasicBlockRef saved_break = g->break_target;
+        LLVMBasicBlockRef saved_cont = g->continue_target;
+        g->break_target = end_bb;
+        g->continue_target = step_bb;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -1036,9 +1049,24 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (stmt->for_stmt.step) emit_expr(g, stmt->for_stmt.step, locals);
         LLVMBuildBr(g->builder, cond_bb);
 
+        g->break_target = saved_break;
+        g->continue_target = saved_cont;
+
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
     }
+
+    case AST_BREAK_STMT:
+        if (g->break_target) {
+            LLVMBuildBr(g->builder, g->break_target);
+        }
+        break;
+
+    case AST_CONTINUE_STMT:
+        if (g->continue_target) {
+            LLVMBuildBr(g->builder, g->continue_target);
+        }
+        break;
 
     case AST_SWITCH_STMT: {
         LLVMValueRef switch_val = emit_expr(g, stmt->switch_stmt.expr, locals);

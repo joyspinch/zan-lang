@@ -55,6 +55,10 @@ struct zan_irgen {
     } functions[1024];
     int function_count;
 
+    /* break/continue targets */
+    LLVMBasicBlockRef break_target;
+    LLVMBasicBlockRef continue_target;
+
     /* constructors */
     struct {
         zan_symbol_t *type_sym;
