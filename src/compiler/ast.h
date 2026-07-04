@@ -70,6 +70,7 @@ typedef enum {
     AST_CONDITIONAL,
     AST_LAMBDA,
     AST_POSTFIX_UNARY,
+    AST_STRING_INTERP,  /* $"text {expr} text" */
 
     /* type references */
     AST_TYPE_REF,
@@ -336,6 +337,11 @@ struct zan_ast_node {
             zan_ast_list_t params;
             zan_ast_node_t *body; /* block or expr */
         } lambda;
+
+        /* string interpolation: $"text {expr} text" */
+        struct {
+            zan_ast_list_t parts; /* alternating STRING_LITERAL and expr nodes */
+        } string_interp;
     };
 };
 

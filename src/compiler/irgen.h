@@ -21,11 +21,39 @@ struct zan_irgen {
 
     /* current function being compiled */
     LLVMValueRef current_fn;
+    LLVMTypeRef current_fn_ret_type;
+
+    /* current 'this' context for method bodies */
+    LLVMValueRef current_this;       /* alloca for 'this' pointer */
+    zan_symbol_t *current_type_sym;  /* type symbol for 'this' */
 
     /* runtime function declarations */
     LLVMValueRef rt_println;   /* zan_rt_println(const char*) */
     LLVMValueRef rt_print_int; /* zan_rt_print_int(int64) */
     LLVMValueRef rt_print_double; /* zan_rt_print_double(double) */
+
+    /* C library functions for string interpolation */
+    LLVMValueRef fn_snprintf;
+    LLVMValueRef fn_malloc;
+    LLVMValueRef fn_free;
+    LLVMValueRef fn_strlen;
+    LLVMValueRef fn_strcpy;
+    LLVMValueRef fn_strcat;
+
+    /* struct type registry */
+    struct {
+        zan_symbol_t *sym;
+        LLVMTypeRef llvm_type;
+    } struct_types[256];
+    int struct_type_count;
+
+    /* user-defined functions */
+    struct {
+        zan_symbol_t *sym;
+        LLVMValueRef fn;
+        LLVMTypeRef fn_type;
+    } functions[1024];
+    int function_count;
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

@@ -25,6 +25,8 @@ struct zan_lexer {
     uint32_t file_id;
     zan_arena_t *arena;
     zan_diag_t *diag;
+    int interp_depth;       /* > 0 when inside $"...{expr}..." */
+    int interp_brace_depth; /* tracks nested {} inside interpolation expr */
 };
 
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,

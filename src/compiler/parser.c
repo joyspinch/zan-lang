@@ -201,6 +201,38 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         n->str_val = p->previous.str_val;
         return n;
     }
+    case TK_INTERP_START: {
+        /* $"text {expr} text {expr} text" */
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_STRING_INTERP, loc);
+        zan_ast_list_init(&n->string_interp.parts);
+        parser_advance(p); /* consume INTERP_START */
+        /* add leading text segment */
+        zan_ast_node_t *seg = zan_ast_new(p->arena, AST_STRING_LITERAL, loc);
+        seg->str_val = p->previous.str_val;
+        zan_ast_list_push(&n->string_interp.parts, seg, p->arena);
+        /* parse expr + mid/end pairs */
+        while (true) {
+            zan_ast_node_t *expr = parse_expression(p);
+            zan_ast_list_push(&n->string_interp.parts, expr, p->arena);
+            if (p->current.kind == TK_INTERP_MID) {
+                parser_advance(p);
+                zan_ast_node_t *mid = zan_ast_new(p->arena, AST_STRING_LITERAL, p->previous.loc);
+                mid->str_val = p->previous.str_val;
+                zan_ast_list_push(&n->string_interp.parts, mid, p->arena);
+                /* loop for next expression */
+            } else if (p->current.kind == TK_INTERP_END) {
+                parser_advance(p);
+                zan_ast_node_t *end = zan_ast_new(p->arena, AST_STRING_LITERAL, p->previous.loc);
+                end->str_val = p->previous.str_val;
+                zan_ast_list_push(&n->string_interp.parts, end, p->arena);
+                break;
+            } else {
+                /* no more interpolation — string had no closing text */
+                break;
+            }
+        }
+        return n;
+    }
     case TK_CHAR_LIT: {
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_CHAR_LITERAL, loc);
@@ -764,6 +796,97 @@ static zan_ast_node_t *parse_return_stmt(zan_parser_t *p) {
     return n;
 }
 
+static zan_ast_node_t *parse_switch_stmt(zan_parser_t *p) {
+    zan_loc_t loc = p->current.loc;
+    parser_expect(p, TK_SWITCH);
+    parser_expect(p, TK_LPAREN);
+    zan_ast_node_t *expr = parse_expression(p);
+    parser_expect(p, TK_RPAREN);
+    parser_expect(p, TK_LBRACE);
+
+    zan_ast_node_t *n = zan_ast_new(p->arena, AST_SWITCH_STMT, loc);
+    n->switch_stmt.expr = expr;
+    zan_ast_list_init(&n->switch_stmt.cases);
+
+    while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+        zan_loc_t case_loc = p->current.loc;
+        zan_ast_node_t *pattern = NULL;
+
+        if (parser_check(p, TK_CASE)) {
+            parser_advance(p); /* case */
+            pattern = parse_expression(p);
+            parser_expect(p, TK_COLON);
+        } else if (parser_check(p, TK_DEFAULT)) {
+            parser_advance(p); /* default */
+            parser_expect(p, TK_COLON);
+            /* pattern stays NULL for default */
+        } else {
+            break;
+        }
+
+        /* collect statements until next case/default/} */
+        zan_ast_node_t *body_block = zan_ast_new(p->arena, AST_BLOCK, case_loc);
+        zan_ast_list_init(&body_block->block.stmts);
+        while (!parser_check(p, TK_CASE) && !parser_check(p, TK_DEFAULT) &&
+               !parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+            zan_ast_node_t *stmt = parse_statement(p);
+            zan_ast_list_push(&body_block->block.stmts, stmt, p->arena);
+        }
+
+        zan_ast_node_t *sc = zan_ast_new(p->arena, AST_SWITCH_CASE, case_loc);
+        sc->switch_case.pattern = pattern;
+        sc->switch_case.body = body_block;
+        zan_ast_list_push(&n->switch_stmt.cases, sc, p->arena);
+    }
+
+    parser_expect(p, TK_RBRACE);
+    return n;
+}
+
+static zan_ast_node_t *parse_try_stmt(zan_parser_t *p) {
+    zan_loc_t loc = p->current.loc;
+    parser_expect(p, TK_TRY);
+    zan_ast_node_t *try_body = parse_block(p);
+
+    zan_ast_node_t *n = zan_ast_new(p->arena, AST_TRY_STMT, loc);
+    n->try_stmt.try_body = try_body;
+    zan_ast_list_init(&n->try_stmt.catches);
+    n->try_stmt.finally_body = NULL;
+
+    while (parser_check(p, TK_CATCH)) {
+        zan_loc_t catch_loc = p->current.loc;
+        parser_advance(p); /* catch */
+
+        zan_ast_node_t *catch_type = NULL;
+        zan_istr_t catch_var = {0};
+
+        if (parser_check(p, TK_LPAREN)) {
+            parser_advance(p); /* ( */
+            catch_type = parse_type_ref(p);
+            if (parser_check(p, TK_IDENT)) {
+                parser_advance(p);
+                catch_var = p->previous.str_val;
+            }
+            parser_expect(p, TK_RPAREN);
+        }
+
+        zan_ast_node_t *catch_body = parse_block(p);
+
+        zan_ast_node_t *cc = zan_ast_new(p->arena, AST_CATCH_CLAUSE, catch_loc);
+        cc->catch_clause.type = catch_type;
+        cc->catch_clause.var_name = catch_var;
+        cc->catch_clause.body = catch_body;
+        zan_ast_list_push(&n->try_stmt.catches, cc, p->arena);
+    }
+
+    if (parser_check(p, TK_FINALLY)) {
+        parser_advance(p);
+        n->try_stmt.finally_body = parse_block(p);
+    }
+
+    return n;
+}
+
 static zan_ast_node_t *parse_statement(zan_parser_t *p) {
     switch (p->current.kind) {
     case TK_LBRACE:
@@ -799,6 +922,10 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         n->throw_stmt.value = value;
         return n;
     }
+    case TK_SWITCH:
+        return parse_switch_stmt(p);
+    case TK_TRY:
+        return parse_try_stmt(p);
     case TK_DO: {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);

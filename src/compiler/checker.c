@@ -161,9 +161,25 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         return c->binder->type_void;
     }
 
+    case AST_STRING_INTERP: {
+        for (int i = 0; i < expr->string_interp.parts.count; i++) {
+            zan_checker_check_expr(c, expr->string_interp.parts.items[i]);
+        }
+        return c->binder->type_string;
+    }
+
     case AST_MEMBER_ACCESS: {
-        zan_checker_check_expr(c, expr->member.object);
-        /* for M1 return error — full member resolution in M2 */
+        zan_type_t *obj_type = zan_checker_check_expr(c, expr->member.object);
+        /* resolve field/method on known struct/class types */
+        if (obj_type && obj_type->sym) {
+            for (int i = 0; i < obj_type->sym->member_count; i++) {
+                zan_symbol_t *m = obj_type->sym->members[i];
+                if (m->name.len == expr->member.name.len &&
+                    memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
+                    return m->type ? m->type : c->binder->type_error;
+                }
+            }
+        }
         return c->binder->type_error;
     }
 
@@ -281,6 +297,34 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
     case AST_BREAK_STMT:
     case AST_CONTINUE_STMT:
+        break;
+
+    case AST_SWITCH_STMT: {
+        zan_type_t *sw_type = zan_checker_check_expr(c, stmt->switch_stmt.expr);
+        if (!type_is_numeric(sw_type) && sw_type->kind != TYPE_STRING &&
+            sw_type->kind != TYPE_CHAR && sw_type->kind != TYPE_ERROR) {
+            zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                          "switch expression has non-switchable type '%s'", type_name(sw_type));
+        }
+        for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
+            zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+            if (sc->switch_case.pattern) {
+                zan_checker_check_expr(c, sc->switch_case.pattern);
+            }
+            zan_checker_check_stmt(c, sc->switch_case.body);
+        }
+        break;
+    }
+
+    case AST_TRY_STMT:
+        zan_checker_check_stmt(c, stmt->try_stmt.try_body);
+        for (int i = 0; i < stmt->try_stmt.catches.count; i++) {
+            zan_ast_node_t *cc = stmt->try_stmt.catches.items[i];
+            zan_checker_check_stmt(c, cc->catch_clause.body);
+        }
+        if (stmt->try_stmt.finally_body) {
+            zan_checker_check_stmt(c, stmt->try_stmt.finally_body);
+        }
         break;
 
     default:

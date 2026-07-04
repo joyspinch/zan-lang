@@ -530,6 +530,50 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
     return tok;
 }
 
+/* ---- interpolated string $"..." ---- */
+
+static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_t start_kind) {
+    zan_loc_t loc = lexer_loc(lex);
+    char buf[4096];
+    size_t bi = 0;
+
+    while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"' && lexer_peek_ch(lex) != '{') {
+        if (lexer_peek_ch(lex) == '\\') {
+            lexer_advance(lex); /* \ */
+            if (bi < sizeof(buf) - 1) {
+                buf[bi++] = lexer_escape_char(lex);
+            }
+        } else if (lexer_peek_ch(lex) == '\n') {
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated interpolated string");
+            break;
+        } else {
+            if (bi < sizeof(buf) - 1) {
+                buf[bi++] = lexer_advance(lex);
+            } else {
+                lexer_advance(lex);
+            }
+        }
+    }
+
+    zan_token_kind_t kind;
+    if (lexer_peek_ch(lex) == '{') {
+        lexer_advance(lex); /* { */
+        lex->interp_depth++;
+        lex->interp_brace_depth = 0;
+        kind = start_kind; /* INTERP_START or INTERP_MID */
+    } else {
+        /* closing " or EOF */
+        if (!lexer_at_end(lex)) lexer_advance(lex); /* " */
+        kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT : TK_INTERP_END;
+        lex->interp_depth = 0;
+    }
+
+    zan_token_t tok = lexer_make(lex, kind, loc);
+    tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
+    tok.str_val.len = (uint32_t)bi;
+    return tok;
+}
+
 /* ---- verbatim string @"..." ---- */
 
 static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
@@ -607,10 +651,11 @@ zan_token_t zan_lexer_next(zan_lexer_t *lex) {
         return lexer_verbatim_string(lex);
     }
 
-    /* interpolated string $"..." (for now treat as regular string) */
+    /* interpolated string $"..." */
     if (ch == '$' && lexer_peek_ch2(lex) == '"') {
         lexer_advance(lex); /* $ */
-        return lexer_string(lex);
+        lexer_advance(lex); /* " */
+        return lexer_interp_string_segment(lex, TK_INTERP_START);
     }
 
     /* operators and punctuation */
@@ -619,8 +664,16 @@ zan_token_t zan_lexer_next(zan_lexer_t *lex) {
     switch (ch) {
     case '(': return lexer_make(lex, TK_LPAREN, loc);
     case ')': return lexer_make(lex, TK_RPAREN, loc);
-    case '{': return lexer_make(lex, TK_LBRACE, loc);
-    case '}': return lexer_make(lex, TK_RBRACE, loc);
+    case '{':
+        if (lex->interp_depth > 0) lex->interp_brace_depth++;
+        return lexer_make(lex, TK_LBRACE, loc);
+    case '}':
+        if (lex->interp_depth > 0 && lex->interp_brace_depth == 0) {
+            /* end of interpolation expression — scan next text segment */
+            return lexer_interp_string_segment(lex, TK_INTERP_MID);
+        }
+        if (lex->interp_depth > 0) lex->interp_brace_depth--;
+        return lexer_make(lex, TK_RBRACE, loc);
     case '[': return lexer_make(lex, TK_LBRACKET, loc);
     case ']': return lexer_make(lex, TK_RBRACKET, loc);
     case ';': return lexer_make(lex, TK_SEMICOLON, loc);
@@ -710,6 +763,8 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     size_t pos = lex->pos;
     uint32_t line = lex->line;
     uint32_t col = lex->col;
+    int idepth = lex->interp_depth;
+    int ibrace = lex->interp_brace_depth;
 
     zan_token_t tok = zan_lexer_next(lex);
 
@@ -717,6 +772,8 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     lex->pos = pos;
     lex->line = line;
     lex->col = col;
+    lex->interp_depth = idepth;
+    lex->interp_brace_depth = ibrace;
 
     return tok;
 }

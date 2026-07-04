@@ -404,6 +404,11 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
         dump_ast_node(node->lambda.body, depth + 2);
         break;
 
+    case AST_STRING_INTERP:
+        printf("StringInterp (%d parts)\n", node->string_interp.parts.count);
+        dump_list("parts", &node->string_interp.parts, depth + 1);
+        break;
+
     case AST_ENUM_MEMBER:
         printf("EnumMember '%.*s'\n",
                node->enum_member.name.len, node->enum_member.name.str);
