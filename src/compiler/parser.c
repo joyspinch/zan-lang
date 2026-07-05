@@ -466,6 +466,15 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
 static zan_ast_node_t *parse_unary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
+    /* await expression: await expr */
+    if (parser_check(p, TK_AWAIT)) {
+        parser_advance(p);
+        zan_ast_node_t *expr = parse_unary(p);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_AWAIT_EXPR, loc);
+        n->await_expr.expr = expr;
+        return n;
+    }
+
     if (parser_check(p, TK_BANG) || parser_check(p, TK_MINUS) ||
         parser_check(p, TK_TILDE) || parser_check(p, TK_PLUS_PLUS) ||
         parser_check(p, TK_MINUS_MINUS)) {

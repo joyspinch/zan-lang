@@ -1362,6 +1362,59 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* bare function name call: Compute(21) → look up in current class then global */
+        if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
+            zan_istr_t fn_name = expr->call.callee->ident.name;
+
+            /* try current class methods first */
+            if (g->current_type_sym) {
+                zan_symbol_t *method_sym = get_method_sym(g->current_type_sym, fn_name);
+                if (method_sym) {
+                    for (int fi = 0; fi < g->function_count; fi++) {
+                        if (g->functions[fi].sym == method_sym) {
+                            int argc = expr->call.args.count;
+                            bool is_static = (method_sym->modifiers & MOD_STATIC) != 0;
+                            int extra = is_static ? 0 : 1;
+                            LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+                                (size_t)(argc + extra > 0 ? argc + extra : 1), sizeof(LLVMValueRef));
+                            if (!is_static && g->current_this) {
+                                call_args[0] = LLVMBuildLoad2(g->builder,
+                                    LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                                    g->current_this, "this");
+                            }
+                            for (int k = 0; k < argc; k++) {
+                                call_args[k + extra] = emit_expr(g, expr->call.args.items[k], locals);
+                            }
+                            LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
+                                g->functions[fi].fn, call_args, (unsigned)(argc + extra), "bcall");
+                            free(call_args);
+                            return result;
+                        }
+                    }
+                }
+            }
+
+            /* try global LLVM function by name */
+            char name_buf[256];
+            int nlen = fn_name.len < 255 ? fn_name.len : 255;
+            memcpy(name_buf, fn_name.str, (size_t)nlen);
+            name_buf[nlen] = '\0';
+            LLVMValueRef global_fn = LLVMGetNamedFunction(g->mod, name_buf);
+            if (global_fn) {
+                int argc = expr->call.args.count;
+                LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+                    (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                for (int k = 0; k < argc; k++) {
+                    call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                }
+                LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
+                LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
+                    global_fn, call_args, (unsigned)argc, "gcall");
+                free(call_args);
+                return result;
+            }
+        }
+
         /* generic function call — fallback */
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     }
@@ -1940,6 +1993,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
     }
 
+    case AST_AWAIT_EXPR: {
+        /* await expr — simplified: evaluate synchronously */
+        return emit_expr(g, expr->await_expr.expr, locals);
+    }
+
     case AST_LAMBDA: {
         /* lambda expression — generate anonymous function */
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2492,7 +2550,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
 /* ---- top-level emission ---- */
 
-static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method) {
+static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym) {
     /* create main() function */
     LLVMTypeRef main_type = LLVMFunctionType(
         LLVMInt32TypeInContext(g->ctx), NULL, 0, 0);
@@ -2503,6 +2561,8 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method) {
 
     g->current_fn = main_fn;
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
+    g->current_type_sym = type_sym;
+    g->current_this = NULL;
 
     local_scope_t *locals = local_scope_new(g->arena);
 
@@ -2514,6 +2574,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method) {
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
         LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
     }
+    g->current_type_sym = NULL;
 }
 
 /* ---- emit user-defined methods ---- */
@@ -2687,7 +2748,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_fn = fn;
             g->current_fn_ret_type = llvm_ret;
             g->current_this = is_static ? NULL : this_alloca;
-            g->current_type_sym = is_static ? NULL : type_sym;
+            g->current_type_sym = type_sym;
 
             /* emit method body */
             if (member->method_decl.body->kind == AST_BLOCK) {
@@ -2756,7 +2817,10 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                 (member->method_decl.modifiers & MOD_STATIC) &&
                 member->method_decl.name.len == 4 &&
                 memcmp(member->method_decl.name.str, "Main", 4) == 0) {
-                emit_main_method(g, member);
+                {
+                    zan_symbol_t *main_type_sym = zan_binder_lookup(g->binder, decl->type_decl.name);
+                    emit_main_method(g, member, main_type_sym);
+                }
                 goto done;
             }
         }

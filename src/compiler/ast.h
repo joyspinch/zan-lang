@@ -69,6 +69,7 @@ typedef enum {
     AST_SIZEOF_EXPR,
     AST_CONDITIONAL,
     AST_LAMBDA,
+    AST_AWAIT_EXPR,
     AST_POSTFIX_UNARY,
     AST_STRING_INTERP,  /* $"text {expr} text" */
 
@@ -335,6 +336,11 @@ struct zan_ast_node {
             zan_istr_t name;
             zan_ast_node_t *value; /* NULL for auto */
         } enum_member;
+
+        /* await expression */
+        struct {
+            zan_ast_node_t *expr;
+        } await_expr;
 
         /* lambda: (params) => body */
         struct {
