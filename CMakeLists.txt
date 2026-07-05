@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
-project(zan-lang C)
+# CXX is enabled so that targets linking LLVM's C++ static libraries can be
+# driven by the C++ linker where needed (see the MinGW case below).
+project(zan-lang C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -44,9 +46,11 @@ target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
 if(MSVC)
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} winhttp)
 elseif(WIN32)
-    # MinGW: LLVM's static libs are C++ and pull in system libraries, so the
-    # C++ runtime and ${LLVM_SYSTEM_LIBS} must be linked explicitly.
-    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} winhttp stdc++)
+    # MinGW: LLVM's static libs are C++ and pull in system libraries. Link with
+    # the C++ driver so libstdc++ is resolved correctly, and add the LLVM system
+    # libraries explicitly.
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} winhttp)
+    set_target_properties(zanc PROPERTIES LINKER_LANGUAGE CXX)
 else()
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} stdc++ m pthread)
 endif()
