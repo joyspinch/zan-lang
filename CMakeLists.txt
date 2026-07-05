@@ -152,6 +152,18 @@ foreach(_stage
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 endforeach()
 
+# ---- Real self-hosting: a Zan-written lexer scanning real Zan source ----
+# zlex.zan reads src/self/zlex_input.zan from disk and tokenizes it, so the
+# program is run with WORKDIR set to the source tree (relative File.ReadAllText).
+add_test(NAME selfhost_zlex
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/src/self/zlex.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/zlex.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/self_zlex${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Determinism: codegen must be a pure function of the source ----
 # Compiling the same program twice must yield byte-identical LLVM IR. This is
 # the reproducible-build / correctness net that stands in for a self-hosting
@@ -173,6 +185,11 @@ foreach(_stage
       -DSRC=${CMAKE_SOURCE_DIR}/src/self/${_stage}.zan
       -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
 endforeach()
+add_test(NAME determinism_zlex
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/src/self/zlex.zan
+    -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
 
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway

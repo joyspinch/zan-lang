@@ -2,10 +2,13 @@
 #
 # Invoked as:
 #   cmake -DZANC=<zanc> -DSRC=<file.zan> -DEXPECTED=<file.out> \
-#         -DOUT_EXE=<exe path> [-DZANC_ARGS=<extra;args>] -P run_case.cmake
+#         -DOUT_EXE=<exe path> [-DZANC_ARGS=<extra;args>] [-DWORKDIR=<dir>] \
+#         -P run_case.cmake
 #
 # Fails (non-zero) if compilation fails or the program's stdout does not
-# match the golden file (line-ending normalized).
+# match the golden file (line-ending normalized). When WORKDIR is given the
+# compiled program is run with that working directory (so it can resolve
+# relative paths, e.g. a self-hosting compiler reading a source file).
 
 if(NOT ZANC OR NOT SRC OR NOT EXPECTED OR NOT OUT_EXE)
   message(FATAL_ERROR "run_case.cmake: ZANC, SRC, EXPECTED and OUT_EXE are required")
@@ -22,10 +25,18 @@ if(NOT compile_rc EQUAL 0)
 endif()
 
 # ---- run ----
-execute_process(
-  COMMAND ${OUT_EXE}
-  RESULT_VARIABLE run_rc
-  OUTPUT_VARIABLE actual)
+if(WORKDIR)
+  execute_process(
+    COMMAND ${OUT_EXE}
+    WORKING_DIRECTORY ${WORKDIR}
+    RESULT_VARIABLE run_rc
+    OUTPUT_VARIABLE actual)
+else()
+  execute_process(
+    COMMAND ${OUT_EXE}
+    RESULT_VARIABLE run_rc
+    OUTPUT_VARIABLE actual)
+endif()
 if(NOT run_rc EQUAL 0)
   message(FATAL_ERROR "program exited with ${run_rc}\noutput:\n${actual}")
 endif()
