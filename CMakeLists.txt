@@ -164,6 +164,33 @@ add_test(NAME selfhost_zlex
     -DWORKDIR=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Real self-hosting: a Zan-written compiler emitting real LLVM IR ----
+# zc0.zan lexes + parses a real Zan source and emits LLVM IR to stdout.
+# (a) golden-IR check: the emitted IR text is stable.
+add_test(NAME selfhost_zc0_ir
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/src/self/zc0.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/zc0.ll
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/self_zc0_ir${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+# (b) end-to-end: clang lowers the emitted IR to a native exe whose output
+#     must equal the same source compiled by the C zanc. Requires clang.
+find_program(CLANG_EXE NAMES clang clang.exe)
+if(CLANG_EXE)
+  add_test(NAME selfhost_zc0
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DZC0=${CMAKE_SOURCE_DIR}/src/self/zc0.zan
+      -DINPUT=${CMAKE_SOURCE_DIR}/src/self/zc0_input.zan
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -DBINDIR=${CMAKE_BINARY_DIR}
+      -DCLANG=${CLANG_EXE}
+      -DEXE_EXT=${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_selfcompile.cmake)
+endif()
+
 # ---- Determinism: codegen must be a pure function of the source ----
 # Compiling the same program twice must yield byte-identical LLVM IR. This is
 # the reproducible-build / correctness net that stands in for a self-hosting
@@ -189,6 +216,11 @@ add_test(NAME determinism_zlex
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/src/self/zlex.zan
+    -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
+add_test(NAME determinism_zc0
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/src/self/zc0.zan
     -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
 
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
