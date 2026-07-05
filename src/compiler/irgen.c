@@ -3287,11 +3287,32 @@ zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
 }
 
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
+    /* Initialize every target family the build links (see CMakeLists.txt), so
+     * zanc can emit code for the host regardless of architecture (e.g. arm64
+     * macOS) as well as cross-compile to the advertised targets. */
     LLVMInitializeX86TargetInfo();
     LLVMInitializeX86Target();
     LLVMInitializeX86TargetMC();
     LLVMInitializeX86AsmParser();
     LLVMInitializeX86AsmPrinter();
+
+    LLVMInitializeAArch64TargetInfo();
+    LLVMInitializeAArch64Target();
+    LLVMInitializeAArch64TargetMC();
+    LLVMInitializeAArch64AsmParser();
+    LLVMInitializeAArch64AsmPrinter();
+
+    LLVMInitializeARMTargetInfo();
+    LLVMInitializeARMTarget();
+    LLVMInitializeARMTargetMC();
+    LLVMInitializeARMAsmParser();
+    LLVMInitializeARMAsmPrinter();
+
+    LLVMInitializeWebAssemblyTargetInfo();
+    LLVMInitializeWebAssemblyTarget();
+    LLVMInitializeWebAssemblyTargetMC();
+    LLVMInitializeWebAssemblyAsmParser();
+    LLVMInitializeWebAssemblyAsmPrinter();
 
     char *triple = LLVMGetDefaultTargetTriple();
     LLVMTargetRef target;
