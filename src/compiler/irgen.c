@@ -635,6 +635,8 @@ static zan_type_t *member_access_field_type(local_scope_t *locals, zan_ast_node_
     return NULL;
 }
 
+static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
+
 /* Best-effort static test for whether an expression yields a `string` value.
  * Used to route `+` to concatenation and `==`/`!=` to strcmp rather than raw
  * pointer arithmetic/comparison. Reference (class) values are NOT strings. */
@@ -672,7 +674,11 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
                 (m.len == 7 && memcmp(m.str, "Replace", 7) == 0))
                 return true;
         }
-        return false;
+        /* user method returning string (bare, instance or static call) */
+        {
+            zan_type_t *rt = infer_expr_type(g, e, locals);
+            return rt && rt->kind == TYPE_STRING;
+        }
     }
     default:
         return false;
