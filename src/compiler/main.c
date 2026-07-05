@@ -621,9 +621,24 @@ int main(int argc, char **argv) {
         char link_cmd[2048];
 #ifdef _WIN32
         /* Reserve a large (256 MB) stack: the self-hosted compiler recurses
-         * deeply over big translation units. */
-        snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" -Xlinker /STACK:268435456",
-                 obj_tmp, obj_path);
+         * deeply over big translation units. The way to request it depends on
+         * the linker clang drives — MSVC's link.exe/lld-link takes /STACK:N,
+         * while a mingw GNU ld takes --stack,N. Detect via clang's default
+         * target triple so this works with both toolchains (dev vs CI). */
+        const char *stack_flag = "-Xlinker /STACK:268435456"; /* MSVC default */
+        {
+            FILE *dm = _popen("clang -dumpmachine", "r");
+            if (dm) {
+                char triple[256];
+                if (fgets(triple, sizeof(triple), dm) &&
+                    (strstr(triple, "gnu") || strstr(triple, "mingw"))) {
+                    stack_flag = "-Wl,--stack,268435456";
+                }
+                _pclose(dm);
+            }
+        }
+        snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" %s",
+                 obj_tmp, obj_path, stack_flag);
 #else
         snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
                  obj_tmp, obj_path);
