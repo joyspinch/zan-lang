@@ -162,6 +162,19 @@ add_test(NAME conformance_multifile
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Skeletal multi-file Zan compiler: lexer + parser + driver ----
+# A tiny expression compiler/evaluator written in Zan across three files,
+# exercising classes, enum/switch, List<class>, string char-lexing, casts and
+# cross-file references — the "host is strong enough" acceptance program.
+add_test(NAME conformance_minic
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/examples/minic/driver.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/minic/lexer.zan;${CMAKE_SOURCE_DIR}/examples/minic/parser.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/examples/minic/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)

@@ -2310,18 +2310,18 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
             LLVMValueRef ch_ptr = LLVMBuildGEP2(g->builder, i8t, arr_ptr, &idx, 1, "chp");
             LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8t, ch_ptr, "ch");
-            return LLVMBuildZExt(g->builder, ch, LLVMInt32TypeInContext(g->ctx), "chz");
+            return LLVMBuildZExt(g->builder, ch, LLVMInt64TypeInContext(g->ctx), "chz");
         }
         if (arr_ptr && arr_type) {
             LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
-            LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef elem_llvm = LLVMInt64TypeInContext(g->ctx);
             if (arr_type->element_type) {
                 elem_llvm = map_type(g, arr_type->element_type);
             }
             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
             return LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
         }
-        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     }
 
     case AST_NEW_EXPR: {
