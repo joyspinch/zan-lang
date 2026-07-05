@@ -802,6 +802,20 @@ static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
     else         *b = LLVMBuildSExt(g->builder, *b, ta, "iext");
 }
 
+/* Normalize an integer value to a target integer type before storing it into a
+ * slot of that type, so a width mismatch (e.g. an i32-producing helper feeding
+ * an i64 `int` local) never produces invalid/undefined IR. Non-integer or
+ * matching-width values, and non-integer targets, pass through unchanged. */
+static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target) {
+    LLVMTypeRef vt = LLVMTypeOf(v);
+    if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind ||
+        LLVMGetTypeKind(target) != LLVMIntegerTypeKind) return v;
+    unsigned wv = LLVMGetIntTypeWidth(vt), wt = LLVMGetIntTypeWidth(target);
+    if (wv == wt) return v;
+    if (wv < wt) return LLVMBuildSExt(g->builder, v, target, "sext");
+    return LLVMBuildTrunc(g->builder, v, target, "trunc");
+}
+
 /* Emit `a + b` for two string (i8*) operands as a heap-allocated concatenation:
  * malloc(strlen(a)+strlen(b)+1); strcpy; strcat. Returns the new buffer ptr. */
 static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef b) {
@@ -1064,7 +1078,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         if (expr->binary.left->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
             if (local) {
-                LLVMBuildStore(g->builder, right, local->alloca);
+                LLVMValueRef sv = coerce_int_to(g, right,
+                    LLVMGetAllocatedType(local->alloca));
+                LLVMBuildStore(g->builder, sv, local->alloca);
             } else if (g->current_this && g->current_type_sym) {
                 /* implicit this.Field assignment */
                 int fi = get_field_index(g->current_type_sym, expr->binary.left->ident.name);
@@ -2101,9 +2117,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef strlen_type = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                LLVMValueRef len = LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
-                /* truncate to i32 for compatibility */
-                return LLVMBuildTrunc(g->builder, len, LLVMInt32TypeInContext(g->ctx), "len32");
+                /* strlen returns i64; `int` is i64 so return it directly. */
+                return LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
             }
         }
 
@@ -2849,6 +2864,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         if (stmt->var_decl.initializer) {
             LLVMValueRef init_val = emit_expr(g, stmt->var_decl.initializer, locals);
+            init_val = coerce_int_to(g, init_val, llvm_type);
             LLVMBuildStore(g->builder, init_val, alloca);
         }
 
