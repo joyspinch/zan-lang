@@ -848,6 +848,41 @@ static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
     return LLVMBuildTrunc(g->builder, v, target, "trunc");
 }
 
+/* Coerce a value to an i8* C string. Pointers pass through unchanged; integer
+ * and floating operands are formatted into a fresh heap buffer via snprintf.
+ * Lets `+` concatenate strings with numbers (e.g. "%t" + counter). */
+static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
+    LLVMTypeRef vt = LLVMTypeOf(val);
+    LLVMTypeKind vtk = LLVMGetTypeKind(vt);
+    if (vtk == LLVMPointerTypeKind) return val;
+
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef snprintf_type = LLVMFunctionType(
+        LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr, i64, i8ptr }, 3, 1);
+    LLVMValueRef fmt;
+    LLVMValueRef arg;
+    if (vtk == LLVMDoubleTypeKind || vtk == LLVMFloatTypeKind) {
+        fmt = LLVMBuildGlobalStringPtr(g->builder, "%g", "dfmt");
+        arg = val;
+    } else {
+        fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
+        arg = val;
+        if (LLVMGetIntTypeWidth(vt) < 64) arg = LLVMBuildSExt(g->builder, val, i64, "ext");
+    }
+    LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
+    LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
+    LLVMValueRef a1[] = { null_ptr, zero, fmt, arg };
+    LLVMValueRef needed = LLVMBuildCall2(g->builder, snprintf_type, g->fn_snprintf, a1, 4, "needed");
+    LLVMValueRef needed64 = LLVMBuildSExt(g->builder, needed, i64, "n64");
+    LLVMValueRef bsz = LLVMBuildAdd(g->builder, needed64, LLVMConstInt(i64, 1, 0), "bsz");
+    LLVMValueRef buf = LLVMBuildCall2(g->builder,
+        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0), g->fn_malloc, &bsz, 1, "nbuf");
+    LLVMValueRef a2[] = { buf, bsz, fmt, arg };
+    LLVMBuildCall2(g->builder, snprintf_type, g->fn_snprintf, a2, 4, "");
+    return buf;
+}
+
 /* Emit `a + b` for two string (i8*) operands as a heap-allocated concatenation:
  * malloc(strlen(a)+strlen(b)+1); strcpy; strcat. Returns the new buffer ptr. */
 static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef b) {
@@ -973,9 +1008,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         bool str_operand = is_string_expr(g, expr->binary.left, locals) ||
                            is_string_expr(g, expr->binary.right, locals);
 
-        /* string concatenation: `a + b` on string operands */
-        if (expr->binary.op == TK_PLUS && both_ptr && str_operand) {
-            return emit_str_concat(g, left, right);
+        /* string concatenation: `a + b` when either operand is a string. A
+         * numeric operand is formatted to its decimal string first (e.g.
+         * "%t" + counter), so concat is not limited to two pointers. */
+        if (expr->binary.op == TK_PLUS && str_operand) {
+            return emit_str_concat(g, emit_to_cstr(g, left), emit_to_cstr(g, right));
         }
 
         /* string equality: route `==`/`!=` on strings through strcmp. `== null`

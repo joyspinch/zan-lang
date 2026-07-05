@@ -1,0 +1,360 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// IR backend: lowers the bound AST to LLVM IR text. This first stage covers
+// the integer / control-flow / static-call / Console I/O subset end-to-end so
+// the full pipeline (Zan source -> self-hosted compiler -> .ll -> clang -> exe)
+// is proven; strings, classes with fields and List come in later stages.
+// Mirrors src/compiler/irgen.c. All integer values are modelled as i64.
+class Irgen {
+    public Binder binder;
+    public Diags diags;
+    public string head;      // module-level declarations / globals
+    public string body;      // function definitions
+    public int tmp;          // SSA temp counter
+    public int lbl;          // basic-block label counter
+    public bool term;        // current block already terminated?
+    public string curClass;  // enclosing class name (for bare calls / mangling)
+    public string curRet;    // current function LLVM return type
+    public List<string> locals; // in-scope local names (all i64 slots)
+
+    public Irgen(Binder b, Diags d) {
+        binder = b; diags = d;
+        head = ""; body = "";
+        tmp = 0; lbl = 0; term = false;
+        curClass = ""; curRet = "void";
+        locals = new List<string>();
+    }
+
+    string NT() { tmp = tmp + 1; return "%t" + tmp; }
+    int NL() { lbl = lbl + 1; return lbl; }
+    void L(string s) { body = body + s + "\n"; }
+    void Label(int n) { body = body + "L" + n + ":\n"; term = false; }
+
+    bool HasLocal(string name) {
+        int i = 0;
+        while (i < locals.Count) { if (locals[i] == name) { return true; } i = i + 1; }
+        return false;
+    }
+
+    // ---- driver ----
+    public string Gen(Node unit) {
+        head = head + "declare i32 @printf(i8*, ...)\n";
+        head = head + "declare i8* @malloc(i64)\n";
+        head = head + "@.fmt.nl = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n";
+        head = head + "@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n";
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { GenClass(d); }
+            i = i + 1;
+        }
+        GenMainWrapper(unit);
+        return head + body;
+    }
+
+    // Emit the process entry point that calls the user's static Main.
+    void GenMainWrapper(Node unit) {
+        string owner = "";
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                if (binder.FindMethod(d, "Main") != null) { owner = d.sval; }
+            }
+            i = i + 1;
+        }
+        if (owner == "") { return; }
+        L("define i32 @main() {");
+        L("entry:");
+        L("  call void @" + owner + "_Main()");
+        L("  ret i32 0");
+        L("}");
+    }
+
+    void GenClass(Node cls) {
+        curClass = cls.sval;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl()) { GenMethod(cls, m); }
+            i = i + 1;
+        }
+    }
+
+    string MapType(Node t) {
+        if (t == null) { return "void"; }
+        string n = t.sval;
+        if (n == "void") { return "void"; }
+        if (n == "bool") { return "i64"; }
+        if (n == "char") { return "i64"; }
+        return "i64";
+    }
+
+    void GenMethod(Node cls, Node m) {
+        tmp = 0; lbl = 0; term = false;
+        locals = new List<string>();
+        curRet = MapType(m.type);
+        string sig = "define " + curRet + " @" + cls.sval + "_" + m.sval + "(";
+        // params
+        List<string> pnames = new List<string>();
+        int np = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                if (np > 0) { sig = sig + ", "; }
+                sig = sig + "i64 %p" + np;
+                pnames.Add(p.sval);
+                np = np + 1;
+            }
+            i = i + 1;
+        }
+        sig = sig + ") {";
+        L(sig);
+        L("entry:");
+        // materialise params into local slots
+        int j = 0;
+        while (j < pnames.Count) {
+            string pn = pnames[j];
+            L("  %v." + pn + " = alloca i64");
+            L("  store i64 %p" + j + ", i64* %v." + pn);
+            locals.Add(pn);
+            j = j + 1;
+        }
+        if (m.d != null) { GenStmt(m.d); }
+        if (!term) {
+            if (curRet == "void") { L("  ret void"); } else { L("  ret i64 0"); }
+        }
+        L("}");
+    }
+
+    // ---- statements ----
+    void GenStmt(Node s) {
+        if (s == null) { return; }
+        if (term) { return; }
+        int k = s.kind;
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) { GenStmt(s.kids[i]); i = i + 1; }
+        } else if (k == AK.VarDecl()) {
+            L("  %v." + s.sval + " = alloca i64");
+            locals.Add(s.sval);
+            if (s.b != null) {
+                string v = GenExpr(s.b);
+                L("  store i64 " + v + ", i64* %v." + s.sval);
+            }
+        } else if (k == AK.ExprStmt()) {
+            GenExpr(s.a);
+        } else if (k == AK.ReturnStmt()) {
+            if (s.a != null) {
+                string v = GenExpr(s.a);
+                if (curRet == "void") { L("  ret void"); } else { L("  ret i64 " + v); }
+            } else { L("  ret void"); }
+            term = true;
+        } else if (k == AK.IfStmt()) {
+            GenIf(s);
+        } else if (k == AK.WhileStmt()) {
+            GenWhile(s);
+        } else if (k == AK.BreakStmt()) {
+            // handled by enclosing loop via break target; simplified: no-op fallthrough
+        } else {
+            GenExpr(s);
+        }
+    }
+
+    string GenCond(Node e) {
+        string v = GenExpr(e);
+        string c = NT();
+        L("  " + c + " = icmp ne i64 " + v + ", 0");
+        return c;
+    }
+
+    void GenIf(Node s) {
+        string c = GenCond(s.a);
+        int lt = NL(); int le = NL(); int lend = NL();
+        if (s.c != null) {
+            L("  br i1 " + c + ", label %L" + lt + ", label %L" + le);
+        } else {
+            L("  br i1 " + c + ", label %L" + lt + ", label %L" + lend);
+        }
+        Label(lt);
+        GenStmt(s.b);
+        if (!term) { L("  br label %L" + lend); }
+        if (s.c != null) {
+            Label(le);
+            GenStmt(s.c);
+            if (!term) { L("  br label %L" + lend); }
+        }
+        Label(lend);
+    }
+
+    void GenWhile(Node s) {
+        int lc = NL(); int lb = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string c = GenCond(s.a);
+        L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        Label(lb);
+        GenStmt(s.b);
+        if (!term) { L("  br label %L" + lc); }
+        Label(lend);
+    }
+
+    // ---- expressions (all yield an i64 operand string) ----
+    string GenExpr(Node e) {
+        if (e == null) { return "0"; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return "" + e.ival; }
+        if (k == AK.BoolLit()) { return "" + e.ival; }
+        if (k == AK.CharLit()) { return "" + e.ival; }
+        if (k == AK.Ident()) {
+            if (HasLocal(e.sval)) {
+                string t = NT();
+                L("  " + t + " = load i64, i64* %v." + e.sval);
+                return t;
+            }
+            return "0";
+        }
+        if (k == AK.Unary()) { return GenUnary(e); }
+        if (k == AK.Binary()) { return GenBinary(e); }
+        if (k == AK.Assignment()) { return GenAssign(e); }
+        if (k == AK.Call()) { return GenCall(e); }
+        return "0";
+    }
+
+    string GenUnary(Node e) {
+        string v = GenExpr(e.a);
+        if (e.op == TK.Bang()) {
+            string c = NT();
+            L("  " + c + " = icmp eq i64 " + v + ", 0");
+            string z = NT();
+            L("  " + z + " = zext i1 " + c + " to i64");
+            return z;
+        }
+        if (e.op == TK.Minus()) {
+            string t = NT();
+            L("  " + t + " = sub i64 0, " + v);
+            return t;
+        }
+        return v;
+    }
+
+    string ArithOp(int op) {
+        if (op == TK.Plus()) { return "add"; }
+        if (op == TK.Minus()) { return "sub"; }
+        if (op == TK.Star()) { return "mul"; }
+        if (op == TK.Slash()) { return "sdiv"; }
+        if (op == TK.Percent()) { return "srem"; }
+        return "";
+    }
+
+    string CmpOp(int op) {
+        if (op == TK.EqEq()) { return "eq"; }
+        if (op == TK.BangEq()) { return "ne"; }
+        if (op == TK.Less()) { return "slt"; }
+        if (op == TK.Greater()) { return "sgt"; }
+        if (op == TK.LessEq()) { return "sle"; }
+        if (op == TK.GreaterEq()) { return "sge"; }
+        return "";
+    }
+
+    string GenBinary(Node e) {
+        int op = e.op;
+        if (op == TK.AmpAmp() || op == TK.PipePipe()) {
+            string lc = GenCond(e.a);
+            string rc = GenCond(e.b);
+            string r = NT();
+            if (op == TK.AmpAmp()) { L("  " + r + " = and i1 " + lc + ", " + rc); }
+            else { L("  " + r + " = or i1 " + lc + ", " + rc); }
+            string z = NT();
+            L("  " + z + " = zext i1 " + r + " to i64");
+            return z;
+        }
+        string a = ArithOp(op);
+        if (a != "") {
+            string l = GenExpr(e.a);
+            string rr = GenExpr(e.b);
+            string t = NT();
+            L("  " + t + " = " + a + " i64 " + l + ", " + rr);
+            return t;
+        }
+        string c = CmpOp(op);
+        if (c != "") {
+            string l = GenExpr(e.a);
+            string rr = GenExpr(e.b);
+            string t = NT();
+            L("  " + t + " = icmp " + c + " i64 " + l + ", " + rr);
+            string z = NT();
+            L("  " + z + " = zext i1 " + t + " to i64");
+            return z;
+        }
+        return "0";
+    }
+
+    string GenAssign(Node e) {
+        string v = GenExpr(e.b);
+        Node lhs = e.a;
+        if (lhs.kind == AK.Ident() && HasLocal(lhs.sval)) {
+            if (e.op == TK.Eq()) {
+                L("  store i64 " + v + ", i64* %v." + lhs.sval);
+            } else {
+                string cur = NT();
+                L("  " + cur + " = load i64, i64* %v." + lhs.sval);
+                string t = NT();
+                string a = "add";
+                if (e.op == TK.MinusEq()) { a = "sub"; }
+                if (e.op == TK.StarEq()) { a = "mul"; }
+                if (e.op == TK.SlashEq()) { a = "sdiv"; }
+                L("  " + t + " = " + a + " i64 " + cur + ", " + v);
+                L("  store i64 " + t + ", i64* %v." + lhs.sval);
+            }
+        }
+        return v;
+    }
+
+    string GenCall(Node e) {
+        Node callee = e.a;
+        // Console.Write / Console.WriteLine(intExpr)
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Console") {
+            string fmt = "@.fmt.nn";
+            if (callee.sval == "WriteLine") { fmt = "@.fmt.nl"; }
+            string arg = "0";
+            if (e.kids.Count > 0) { arg = GenExpr(e.kids[0]); }
+            int flen = 5; string fg = "@.fmt.nn";
+            if (callee.sval == "WriteLine") { flen = 6; fg = "@.fmt.nl"; }
+            string gp = NT();
+            L("  " + gp + " = getelementptr inbounds [" + flen + " x i8], [" + flen + " x i8]* " + fg + ", i64 0, i64 0");
+            L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i64 " + arg + ")");
+            return "0";
+        }
+        // static/bare call to Class_Method
+        string cls = curClass;
+        string name = "";
+        if (callee.kind == AK.Ident()) { name = callee.sval; }
+        else if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()) {
+            cls = callee.a.sval; name = callee.sval;
+        }
+        // emit args
+        string args = "";
+        int i = 0;
+        while (i < e.kids.Count) {
+            string v = GenExpr(e.kids[i]);
+            if (i > 0) { args = args + ", "; }
+            args = args + "i64 " + v;
+            i = i + 1;
+        }
+        Node target = binder.FindMethod(binder.FindType(cls), name);
+        string rt = "i64";
+        if (target != null) { rt = MapType(target.type); }
+        if (rt == "void") {
+            L("  call void @" + cls + "_" + name + "(" + args + ")");
+            return "0";
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " @" + cls + "_" + name + "(" + args + ")");
+        return t;
+    }
+}
