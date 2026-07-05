@@ -39,6 +39,22 @@ else()
 endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
 
+
+# ---- IDE executable (Windows only) ----
+if(WIN32)
+    add_executable(zan-ide WIN32
+        src/ide/ide_main.c
+        src/ide/editor.c
+        src/ide/piece_table.c
+        src/ide/project.c
+        src/ide/intellisense.c
+        src/ide/debugger.c
+    )
+    target_include_directories(zan-ide PRIVATE src/ide)
+    target_link_libraries(zan-ide PRIVATE user32 gdi32 comdlg32 shell32 ole32)
+    target_compile_definitions(zan-ide PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # ---- Tests ----
 enable_testing()
 
