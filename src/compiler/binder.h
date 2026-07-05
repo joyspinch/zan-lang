@@ -53,6 +53,7 @@ struct zan_type {
     zan_istr_t name;
     struct zan_symbol *sym;          /* back-pointer to declaring symbol */
     zan_type_t *element_type;        /* for arrays and nullable */
+    zan_type_t *base_type;           /* base class type (for inheritance) */
     zan_type_t **type_args;          /* for generic instantiation */
     int type_arg_count;
 };

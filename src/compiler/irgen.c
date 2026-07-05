@@ -114,6 +114,99 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef strcat_type = LLVMFunctionType(i8ptr, strcat_args, 2, 0);
     g->fn_strcat = LLVMAddFunction(g->mod, "strcat", strcat_type);
 
+    /* ARC runtime: zan_rt_retain(void*) -> void */
+    LLVMTypeRef retain_args[] = { i8ptr };
+    LLVMTypeRef retain_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), retain_args, 1, 0);
+    g->rt_retain = LLVMAddFunction(g->mod, "zan_rt_retain", retain_type);
+
+    /* implement zan_rt_retain: increment refcount at offset -8 */
+    {
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef obj = LLVMGetParam(g->rt_retain, 0);
+        /* null check */
+        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj,
+            LLVMConstNull(i8ptr), "isnull");
+        LLVMBasicBlockRef do_retain = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "retain");
+        LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "ret");
+        LLVMBuildCondBr(g->builder, is_null, ret_bb, do_retain);
+        LLVMPositionBuilderAtEnd(g->builder, do_retain);
+        /* refcount is at (int64_t*)(obj - 8) */
+        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)-8, 1);
+        LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "rcptr");
+        LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
+            LLVMPointerType(i64, 0), "rciptr");
+        LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rc");
+        LLVMValueRef rc1 = LLVMBuildAdd(g->builder, rc, LLVMConstInt(i64, 1, 0), "rc1");
+        LLVMBuildStore(g->builder, rc1, rc_iptr);
+        LLVMBuildBr(g->builder, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, ret_bb);
+        LLVMBuildRetVoid(g->builder);
+    }
+
+    /* ARC runtime: zan_rt_release(void*) -> void */
+    LLVMTypeRef release_args[] = { i8ptr };
+    LLVMTypeRef release_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
+    g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
+
+    /* implement zan_rt_release: decrement refcount, free if 0 */
+    {
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef obj = LLVMGetParam(g->rt_release, 0);
+        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj,
+            LLVMConstNull(i8ptr), "isnull");
+        LLVMBasicBlockRef do_release = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "release");
+        LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "ret");
+        LLVMBuildCondBr(g->builder, is_null, ret_bb, do_release);
+        LLVMPositionBuilderAtEnd(g->builder, do_release);
+        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)-8, 1);
+        LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "rcptr");
+        LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
+            LLVMPointerType(i64, 0), "rciptr");
+        LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rc");
+        LLVMValueRef rc1 = LLVMBuildSub(g->builder, rc, LLVMConstInt(i64, 1, 0), "rc1");
+        LLVMBuildStore(g->builder, rc1, rc_iptr);
+        /* if rc1 == 0, free the object (header starts 8 bytes before obj) */
+        LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, rc1,
+            LLVMConstInt(i64, 0, 0), "iszero");
+        LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
+        LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, free_bb);
+        /* free(obj - 8) to include the header */
+        LLVMValueRef header_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "hdr");
+        LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8ptr }, 1, 0);
+        LLVMBuildCall2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
+        LLVMBuildBr(g->builder, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, ret_bb);
+        LLVMBuildRetVoid(g->builder);
+    }
+
+    /* ARC runtime: zan_rt_alloc(int64_t size) -> void*
+     * Allocates (8 + size) bytes, sets refcount=1 at the header,
+     * returns pointer to user data (after the 8-byte header). */
+    LLVMTypeRef alloc_args[] = { i64 };
+    LLVMTypeRef alloc_type = LLVMFunctionType(i8ptr, alloc_args, 1, 0);
+    g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
+
+    {
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_alloc, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef size = LLVMGetParam(g->rt_alloc, 0);
+        /* total = size + 8 (for refcount header) */
+        LLVMValueRef total = LLVMBuildAdd(g->builder, size, LLVMConstInt(i64, 8, 0), "total");
+        LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
+        LLVMValueRef raw = LLVMBuildCall2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
+        /* store refcount = 1 at raw[0..7] */
+        LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
+        LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
+        /* return raw + 8 */
+        LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
+        LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "usr");
+        LLVMBuildRet(g->builder, user_ptr);
+    }
+
     return ZAN_OK;
 }
 
@@ -196,12 +289,17 @@ static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name
 }
 
 static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_name) {
+    /* search in current type first */
     for (int i = 0; i < type_sym->member_count; i++) {
         if (type_sym->members[i]->kind == SYM_METHOD &&
             type_sym->members[i]->name.len == method_name.len &&
             memcmp(type_sym->members[i]->name.str, method_name.str, method_name.len) == 0) {
             return type_sym->members[i];
         }
+    }
+    /* search in base type (inheritance) */
+    if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
+        return get_method_sym(type_sym->type->base_type->sym, method_name);
     }
     return NULL;
 }
@@ -237,6 +335,65 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     g->struct_type_count++;
 
     free(field_types);
+}
+
+/* ---- virtual dispatch helpers ---- */
+
+static bool class_has_virtual_methods(zan_symbol_t *sym) {
+    for (int i = 0; i < sym->member_count; i++) {
+        if (sym->members[i]->kind == SYM_METHOD &&
+            (sym->members[i]->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE))) {
+            return true;
+        }
+    }
+    /* check base class */
+    if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
+        return class_has_virtual_methods(sym->type->base_type->sym);
+    }
+    return false;
+}
+
+static int count_virtual_methods(zan_symbol_t *sym) {
+    int count = 0;
+    /* count from base first */
+    if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
+        count = count_virtual_methods(sym->type->base_type->sym);
+    }
+    /* add new virtual methods from this class */
+    for (int i = 0; i < sym->member_count; i++) {
+        if (sym->members[i]->kind == SYM_METHOD &&
+            (sym->members[i]->modifiers & MOD_VIRTUAL) &&
+            !(sym->members[i]->modifiers & MOD_OVERRIDE)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static int get_virtual_method_index(zan_symbol_t *type_sym, zan_istr_t method_name) {
+    /* search base classes first for the method slot */
+    if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
+        int idx = get_virtual_method_index(type_sym->type->base_type->sym, method_name);
+        if (idx >= 0) return idx;
+    }
+    /* search current class virtual methods */
+    int base_count = 0;
+    if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
+        base_count = count_virtual_methods(type_sym->type->base_type->sym);
+    }
+    int idx = base_count;
+    for (int i = 0; i < type_sym->member_count; i++) {
+        if (type_sym->members[i]->kind == SYM_METHOD &&
+            (type_sym->members[i]->modifiers & MOD_VIRTUAL) &&
+            !(type_sym->members[i]->modifiers & MOD_OVERRIDE)) {
+            if (type_sym->members[i]->name.len == method_name.len &&
+                memcmp(type_sym->members[i]->name.str, method_name.str, method_name.len) == 0) {
+                return idx;
+            }
+            idx++;
+        }
+    }
+    return -1;
 }
 
 /* ---- local variables (simple stack-based storage) ---- */

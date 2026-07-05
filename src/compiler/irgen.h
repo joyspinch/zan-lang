@@ -67,6 +67,19 @@ struct zan_irgen {
         int param_count;
     } ctors[256];
     int ctor_count;
+
+    /* ARC runtime functions */
+    LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
+    LLVMValueRef rt_release;     /* zan_rt_release(void*) */
+    LLVMValueRef rt_alloc;       /* zan_rt_alloc(int64_t size) -> void* */
+
+    /* vtable registry (for virtual dispatch) */
+    struct {
+        zan_symbol_t *type_sym;
+        LLVMValueRef vtable_global;  /* global constant array */
+        int method_count;
+    } vtables[256];
+    int vtable_count;
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

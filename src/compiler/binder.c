@@ -228,6 +228,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
                 ast_kind_to_sym_kind(node->kind),
                 name, type, node, node->type_decl.modifiers);
             type->sym = sym;
+            type->base_type = NULL;
 
             scope_add(b->arena, b->current_scope, sym);
         }
@@ -239,6 +240,23 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_istr_t type_name = type_node->type_decl.name;
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
     if (!type_sym) return;
+
+    /* resolve base types and inherit members */
+    if (type_node->type_decl.bases.count > 0) {
+        zan_ast_node_t *base_ref = type_node->type_decl.bases.items[0];
+        zan_istr_t base_name = base_ref->type_ref.name;
+        zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
+        if (base_sym && (base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT)) {
+            type_sym->type->base_type = base_sym->type;
+            /* inherit base class fields and properties */
+            for (int bi = 0; bi < base_sym->member_count; bi++) {
+                if (base_sym->members[bi]->kind == SYM_FIELD ||
+                    base_sym->members[bi]->kind == SYM_PROPERTY) {
+                    symbol_add_member(b->arena, type_sym, base_sym->members[bi]);
+                }
+            }
+        }
+    }
 
     zan_scope_t *saved = b->current_scope;
     b->current_scope = scope_new(b->arena, saved);
