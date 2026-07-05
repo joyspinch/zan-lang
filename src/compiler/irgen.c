@@ -715,6 +715,38 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     }
     case AST_INDEX:
         return container_elem_type(infer_expr_type(g, e->index.object, locals));
+    case AST_CALL: {
+        /* Resolve the static return type of a method/function call so that
+         * chained member access (e.g. Next().field) can find the struct. */
+        zan_ast_node_t *callee = e->call.callee;
+        if (!callee) return NULL;
+        if (callee->kind == AST_IDENTIFIER) {
+            /* bare call: current class method, else global function */
+            if (g->current_type_sym) {
+                zan_symbol_t *m = get_method_sym(g->current_type_sym, callee->ident.name);
+                if (m) return m->type;
+            }
+            zan_symbol_t *gf = zan_binder_lookup(g->binder, callee->ident.name);
+            if (gf && gf->kind == SYM_METHOD) return gf->type;
+            return NULL;
+        }
+        if (callee->kind == AST_MEMBER_ACCESS &&
+            callee->member.object->kind == AST_IDENTIFIER) {
+            /* instance: local.Method() */
+            local_var_t *lv = local_find(locals, callee->member.object->ident.name);
+            if (lv && lv->type && lv->type->sym) {
+                zan_symbol_t *m = get_method_sym(lv->type->sym, callee->member.name);
+                if (m) return m->type;
+            }
+            /* static: ClassName.Method() */
+            zan_symbol_t *ts = zan_binder_lookup(g->binder, callee->member.object->ident.name);
+            if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
+                zan_symbol_t *m = get_method_sym(ts, callee->member.name);
+                if (m) return m->type;
+            }
+        }
+        return NULL;
+    }
     default:
         return NULL;
     }
