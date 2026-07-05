@@ -32,11 +32,23 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
     g->builder = LLVMCreateBuilderInContext(g->ctx);
 
+    /* runtime-diagnostics defaults */
+    g->src_file = module_name;
+    g->runtime_checks = true;
+    g->check_leaks = false;
+
+    /* net live-allocation counter for leak detection (internal global) */
+    g->g_live = LLVMAddGlobal(g->mod, LLVMInt64TypeInContext(g->ctx), "__zan_live");
+    LLVMSetInitializer(g->g_live, LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
+    LLVMSetLinkage(g->g_live, LLVMInternalLinkage);
+
     /* declare printf */
     LLVMTypeRef printf_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
     LLVMTypeRef printf_type = LLVMFunctionType(
         LLVMInt32TypeInContext(g->ctx), printf_args, 1, 1 /* varargs */);
     LLVMValueRef printf_fn = LLVMAddFunction(g->mod, "printf", printf_type);
+    g->fn_printf = printf_fn;
+    g->printf_type = printf_type;
 
     /* declare zan_rt_println(const char*) → calls printf("%s\n", str) */
     LLVMTypeRef println_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
@@ -98,6 +110,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef free_args[] = { i8ptr };
     LLVMTypeRef free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), free_args, 1, 0);
     g->fn_free = LLVMAddFunction(g->mod, "free", free_type);
+
+    /* void exit(int) — used by runtime-check panics */
+    LLVMTypeRef exit_args[] = { i32 };
+    g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
+    g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
+
+    /* int atexit(void(*)(void)) — used to schedule the leak report */
+    LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
+    LLVMTypeRef atexit_args[] = { void_fn_ptr };
+    g->atexit_type = LLVMFunctionType(i32, atexit_args, 1, 0);
+    g->fn_atexit = LLVMAddFunction(g->mod, "atexit", g->atexit_type);
 
     /* void* realloc(void*, size_t) */
     LLVMTypeRef realloc_args[] = { i8ptr, i64 };
@@ -203,6 +227,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ i8ptr }, 1, 0);
         LLVMBuildCall2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
+        /* leak tracking: one fewer live object */
+        {
+            LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
+            LLVMValueRef lv1 = LLVMBuildSub(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_dec");
+            LLVMBuildStore(g->builder, lv1, g->g_live);
+        }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
@@ -229,7 +259,36 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         /* return raw + 8 */
         LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "usr");
+        /* leak tracking: one more live object */
+        {
+            LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
+            LLVMValueRef lv1 = LLVMBuildAdd(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
+            LLVMBuildStore(g->builder, lv1, g->g_live);
+        }
         LLVMBuildRet(g->builder, user_ptr);
+    }
+
+    /* void __zan_report_leaks(void): print a message if any ARC object is
+     * still live at program exit. Scheduled via atexit when --check-leaks. */
+    {
+        LLVMTypeRef rl_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+        g->fn_report_leaks = LLVMAddFunction(g->mod, "__zan_report_leaks", rl_type);
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "entry");
+        LLVMBasicBlockRef leak_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "leak");
+        LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "done");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef live = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
+        LLVMValueRef leaked = LLVMBuildICmp(g->builder, LLVMIntSGT, live,
+            LLVMConstInt(i64, 0, 0), "leaked");
+        LLVMBuildCondBr(g->builder, leaked, leak_bb, done_bb);
+        LLVMPositionBuilderAtEnd(g->builder, leak_bb);
+        LLVMValueRef msg = LLVMBuildGlobalStringPtr(g->builder,
+            "zan: memory leak detected: %lld object(s) still reachable at exit\n", "leak_fmt");
+        LLVMValueRef pargs[] = { msg, live };
+        LLVMBuildCall2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
+        LLVMBuildBr(g->builder, done_bb);
+        LLVMPositionBuilderAtEnd(g->builder, done_bb);
+        LLVMBuildRetVoid(g->builder);
     }
 
     return ZAN_OK;
@@ -497,6 +556,50 @@ static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method
             memcmp(method_name.str, method, (size_t)method_name.len) == 0);
 }
 
+/* Emit a runtime guard: when `is_error` is true at runtime, print
+ * "<file>:<line>:<col>: runtime error: <msg>" and exit(70). Execution
+ * continues (in a fresh block) on the non-error path. No-op when runtime
+ * checks are disabled. Must be called with the builder inside `current_fn`. */
+static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
+                               zan_loc_t loc, const char *msg) {
+    if (!g->runtime_checks || !g->current_fn) return;
+
+    LLVMBasicBlockRef panic_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.panic");
+    LLVMBasicBlockRef cont_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "rt.cont");
+    LLVMBuildCondBr(g->builder, is_error, panic_bb, cont_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, panic_bb);
+    char buf[640];
+    const char *file = g->src_file ? g->src_file : "<unknown>";
+    snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
+             file, loc.line, loc.col, msg);
+    LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, buf, "rterr");
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "rterr_fmt");
+    LLVMValueRef pargs[] = { fmt, text };
+    LLVMBuildCall2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
+    LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 70, 0);
+    LLVMBuildCall2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
+    LLVMBuildUnreachable(g->builder);
+
+    LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+}
+
+/* Resolve the base pointer to a struct/class instance held by a local.
+ * A class local may be stored either inline (alloca of the struct itself,
+ * a value-like representation) or as a pointer (alloca of a pointer to a
+ * heap object). Inspect the allocated type and load through the pointer
+ * only in the latter case, so field GEPs work for both representations. */
+static LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st) {
+    LLVMValueRef base = local->alloca;
+    if (LLVMIsAAllocaInst(base)) {
+        LLVMTypeRef alloc_t = LLVMGetAllocatedType(base);
+        if (LLVMGetTypeKind(alloc_t) == LLVMPointerTypeKind) {
+            base = LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0), base, "objld");
+        }
+    }
+    return base;
+}
+
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 
@@ -607,11 +710,21 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return is_float ? LLVMBuildFMul(g->builder, left, right, "mul")
                             : LLVMBuildMul(g->builder, left, right, "mul");
         case TK_SLASH:
-            return is_float ? LLVMBuildFDiv(g->builder, left, right, "div")
-                            : LLVMBuildSDiv(g->builder, left, right, "div");
+            if (is_float) return LLVMBuildFDiv(g->builder, left, right, "div");
+            {
+                LLVMValueRef zero = LLVMConstInt(LLVMTypeOf(right), 0, 0);
+                LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, right, zero, "divz");
+                emit_runtime_check(g, is_zero, expr->loc, "division by zero");
+            }
+            return LLVMBuildSDiv(g->builder, left, right, "div");
         case TK_PERCENT:
-            return is_float ? LLVMBuildFRem(g->builder, left, right, "rem")
-                            : LLVMBuildSRem(g->builder, left, right, "rem");
+            if (is_float) return LLVMBuildFRem(g->builder, left, right, "rem");
+            {
+                LLVMValueRef zero = LLVMConstInt(LLVMTypeOf(right), 0, 0);
+                LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, right, zero, "remz");
+                emit_runtime_check(g, is_zero, expr->loc, "division by zero (modulo)");
+            }
+            return LLVMBuildSRem(g->builder, left, right, "rem");
         case TK_AMP:
             return LLVMBuildAnd(g->builder, left, right, "and");
         case TK_PIPE:
@@ -783,7 +896,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     if (fi >= 0) {
                         LLVMTypeRef st = get_struct_llvm_type(g, local->type->sym);
                         if (st) {
-                            LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, local->alloca, (unsigned)fi, "fld");
+                            LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
+                            LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
                             LLVMBuildStore(g->builder, right, fptr);
                         }
                     }
@@ -1712,7 +1826,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMTypeRef st = get_struct_llvm_type(g, type_sym);
                         if (st) {
                             /* load struct pointer or value, then GEP to field */
-                            LLVMValueRef struct_ptr = local->alloca;
+                            LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
                             LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
                             LLVMTypeRef field_type = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
@@ -1949,7 +2063,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             if (sym && sym->type && (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)) {
                 LLVMTypeRef st = get_struct_llvm_type(g, sym);
                 if (st) {
-                    LLVMValueRef alloca = LLVMBuildAlloca(g->builder, st, "new");
+                    LLVMValueRef alloca;
+                    if (sym->type->kind == TYPE_CLASS) {
+                        /* reference type: heap-allocate via ARC so instances
+                         * outlive the enclosing frame and are leak-tracked. */
+                        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                        LLVMValueRef sz = LLVMSizeOf(st);
+                        LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
+                        LLVMValueRef raw = LLVMBuildCall2(g->builder, alloc_fn_type, g->rt_alloc, &sz, 1, "newobj");
+                        alloca = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(st, 0), "objp");
+                    } else {
+                        /* value type: stack-allocate as before */
+                        alloca = LLVMBuildAlloca(g->builder, st, "new");
+                    }
                     LLVMBuildStore(g->builder, LLVMConstNull(st), alloca);
 
                     /* look for constructor */
@@ -2674,6 +2801,12 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
     g->current_type_sym = type_sym;
     g->current_this = NULL;
+
+    /* schedule the leak report to run at program exit */
+    if (g->check_leaks) {
+        LLVMBuildCall2(g->builder, g->atexit_type, g->fn_atexit,
+                       &g->fn_report_leaks, 1, "");
+    }
 
     local_scope_t *locals = local_scope_new(g->arena);
 

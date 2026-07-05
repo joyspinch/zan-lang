@@ -434,6 +434,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --dump-tokens   Dump lexer tokens\n");
         fprintf(stderr, "  --dump-ast      Dump parse tree\n");
         fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
+        fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit\n");
+        fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
         return 1;
     }
 
@@ -442,6 +444,8 @@ int main(int argc, char **argv) {
     bool do_dump_tokens = false;
     bool do_dump_ast = false;
     bool do_emit_ir = false;
+    bool check_leaks = false;
+    bool runtime_checks = true;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -450,6 +454,10 @@ int main(int argc, char **argv) {
             do_dump_ast = true;
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
             do_emit_ir = true;
+        } else if (strcmp(argv[i], "--check-leaks") == 0) {
+            check_leaks = true;
+        } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
+            runtime_checks = false;
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (argv[i][0] != '-') {
@@ -534,6 +542,8 @@ int main(int argc, char **argv) {
         free(source);
         return 1;
     }
+    irgen.check_leaks = check_leaks;
+    irgen.runtime_checks = runtime_checks;
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");

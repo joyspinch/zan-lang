@@ -73,6 +73,19 @@ struct zan_irgen {
     LLVMValueRef rt_release;     /* zan_rt_release(void*) */
     LLVMValueRef rt_alloc;       /* zan_rt_alloc(int64_t size) -> void* */
 
+    /* runtime diagnostics & leak detection */
+    LLVMValueRef fn_printf;       /* int printf(const char*, ...) */
+    LLVMTypeRef  printf_type;
+    LLVMValueRef fn_exit;         /* void exit(int) */
+    LLVMTypeRef  exit_type;
+    LLVMValueRef fn_atexit;       /* int atexit(void(*)(void)) */
+    LLVMTypeRef  atexit_type;
+    LLVMValueRef g_live;          /* i64 global: net live ARC allocations */
+    LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
+    const char  *src_file;        /* source path, for runtime diagnostics */
+    bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
+    bool         check_leaks;     /* emit a leak report at program exit */
+
     /* vtable registry (for virtual dispatch) */
     struct {
         zan_symbol_t *type_sym;

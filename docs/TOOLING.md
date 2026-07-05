@@ -64,6 +64,49 @@ protocol surface.
 }
 ```
 
+## Runtime diagnostics & leak detection (`zanc`)
+
+The code generator inserts source-location-aware runtime guards and can track
+heap allocations so leaks are reported at program exit.
+
+| `zanc` flag           | Effect                                                            |
+|-----------------------|-------------------------------------------------------------------|
+| *(default)*           | Runtime guards on: integer division/modulo by zero traps with a source location. |
+| `--no-runtime-checks` | Disable the guards (no div-by-zero check) for maximum throughput. |
+| `--check-leaks`       | Register an at-exit report of ARC objects still live at shutdown. |
+
+### Source-located runtime errors
+
+Class instances are heap-allocated through the ARC runtime, and dangerous
+operations are guarded. A failing guard prints the offending
+`file:line:col` plus the specific error, then exits with status `70`:
+
+```
+$ zanc app.zan -o app && ./app
+10
+app.zan:8:19: runtime error: division by zero
+```
+
+The location is taken from the AST node's `zan_loc_t`, the same mechanism the
+compiler front-end uses for compile-time diagnostics.
+
+### Memory-leak detection
+
+`zanc` allocates class instances via `zan_rt_alloc`, which maintains a net
+live-object counter (`+1` on alloc, `-1` when a reference count hits zero and
+the object is freed). With `--check-leaks`, an `atexit` handler prints any
+non-zero balance — e.g. an unbroken reference cycle:
+
+```
+$ zanc cycle.zan -o cycle --check-leaks && ./cycle
+0
+zan: memory leak detected: 2 object(s) still reachable at exit
+```
+
+Correct programs whose objects are all released report nothing, so the check
+is free of false positives. See `src/self/rt_divzero.zan` and
+`src/self/rt_leak.zan` for runnable examples.
+
 ## Testing without an editor
 
 Both tools are plain stdio programs, so they can be driven with framed JSON
