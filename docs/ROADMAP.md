@@ -354,6 +354,7 @@ Self-contained IDE bundled with the compiler (single executable).
     | 8 | `selfvmfn.zan` | function calls: `CALL`/`RET`, per-call frames, recursion (factorial, Fibonacci) |
     | 9 | `selfvmops.zan` | `%`/`==`/`!=` operators; compiles GCD and primality to bytecode |
     | 10 | `selfvmarr.zan` | arrays over a shared heap (`ALOAD`/`ASTORE`, `v[expr]` load/store); Fibonacci table, in-place reverse, array fill in a function |
+    | 11 | `selfvmelse.zan` | `else` clauses on `if` (two-way control flow via JZ/JMP backpatching); max/min, sign with negatives, even/odd classifier |
 
   - Enabling compiler fixes (all landed): short-circuit `&&`/`||` in
     control-flow conditions, array-typed parameters (`int[]`), explicit
