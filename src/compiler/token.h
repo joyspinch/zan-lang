@@ -63,6 +63,7 @@ typedef enum {
     TK_NEW,
     TK_NINT,
     TK_NULL,
+    TK_OPERATOR,
     TK_OBJECT,
     TK_OUT,
     TK_OVERRIDE,

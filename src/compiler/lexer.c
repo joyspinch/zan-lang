@@ -58,6 +58,7 @@ static const keyword_entry_t s_keywords[] = {
     {"new",       TK_NEW},
     {"nint",      TK_NINT},
     {"null",      TK_NULL},
+    {"operator",  TK_OPERATOR},
     {"object",    TK_OBJECT},
     {"out",       TK_OUT},
     {"override",  TK_OVERRIDE},

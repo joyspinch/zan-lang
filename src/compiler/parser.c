@@ -1114,6 +1114,48 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         return n;
     }
 
+    /* operator overloading: static ReturnType operator+(params) { } */
+    if (parser_check(p, TK_OPERATOR)) {
+        parser_advance(p); /* consume 'operator' */
+        /* next token is the operator symbol: +, -, *, /, ==, !=, <, >, etc. */
+        char op_name[32];
+        switch (p->current.kind) {
+        case TK_PLUS:    snprintf(op_name, sizeof(op_name), "op_add"); break;
+        case TK_MINUS:   snprintf(op_name, sizeof(op_name), "op_sub"); break;
+        case TK_STAR:    snprintf(op_name, sizeof(op_name), "op_mul"); break;
+        case TK_SLASH:   snprintf(op_name, sizeof(op_name), "op_div"); break;
+        case TK_PERCENT: snprintf(op_name, sizeof(op_name), "op_mod"); break;
+        case TK_EQ_EQ:   snprintf(op_name, sizeof(op_name), "op_eq"); break;
+        case TK_BANG_EQ: snprintf(op_name, sizeof(op_name), "op_neq"); break;
+        case TK_LESS:    snprintf(op_name, sizeof(op_name), "op_lt"); break;
+        case TK_GREATER: snprintf(op_name, sizeof(op_name), "op_gt"); break;
+        case TK_LESS_EQ: snprintf(op_name, sizeof(op_name), "op_le"); break;
+        case TK_GREATER_EQ: snprintf(op_name, sizeof(op_name), "op_ge"); break;
+        default:         snprintf(op_name, sizeof(op_name), "op_unknown"); break;
+        }
+        parser_advance(p); /* consume operator token */
+        zan_ast_list_t params = parse_param_list(p);
+        zan_ast_node_t *body = NULL;
+        if (parser_check(p, TK_LBRACE)) {
+            body = parse_block(p);
+        } else {
+            parser_expect(p, TK_SEMICOLON);
+        }
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+        size_t op_len = strlen(op_name);
+        char *op_str = zan_arena_strdup(p->arena, op_name, op_len);
+        zan_istr_t iname = { op_str, (int)op_len };
+        n->method_decl.name = iname;
+        n->method_decl.return_type = type;
+        n->method_decl.params = params;
+        zan_ast_list_init(&n->method_decl.type_params);
+        n->method_decl.body = body;
+        n->method_decl.modifiers = mods | MOD_STATIC;
+        n->method_decl.extern_lib = (zan_istr_t){NULL, 0};
+        n->method_decl.entry_point = (zan_istr_t){NULL, 0};
+        return n;
+    }
+
     /* method or field: need name next */
     if (!parser_check(p, TK_IDENT)) {
         zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc, "expected member name");

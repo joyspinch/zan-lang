@@ -580,6 +580,30 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         case TK_GREATER_EQ:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOGE, left, right, "ge")
                             : LLVMBuildICmp(g->builder, LLVMIntSGE, left, right, "ge");
+        case TK_QUESTION_QUESTION: {
+            /* ?? null coalescing: if left != 0/null, use left, else right */
+            LLVMValueRef is_null;
+            if (LLVMGetTypeKind(left_type) == LLVMPointerTypeKind) {
+                LLVMValueRef null_ptr = LLVMConstNull(left_type);
+                is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, left, null_ptr, "isnull");
+            } else {
+                is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, left,
+                    LLVMConstInt(left_type, 0, 0), "isnull");
+            }
+            LLVMValueRef coal_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+            LLVMBasicBlockRef use_right = LLVMAppendBasicBlockInContext(g->ctx, coal_fn, "coal.r");
+            LLVMBasicBlockRef merge = LLVMAppendBasicBlockInContext(g->ctx, coal_fn, "coal.m");
+            LLVMBasicBlockRef left_bb = LLVMGetInsertBlock(g->builder);
+            LLVMBuildCondBr(g->builder, is_null, use_right, merge);
+            LLVMPositionBuilderAtEnd(g->builder, use_right);
+            LLVMBuildBr(g->builder, merge);
+            LLVMPositionBuilderAtEnd(g->builder, merge);
+            LLVMValueRef phi = LLVMBuildPhi(g->builder, left_type, "coal");
+            LLVMValueRef vals[] = { left, right };
+            LLVMBasicBlockRef bbs[] = { left_bb, use_right };
+            LLVMAddIncoming(phi, vals, bbs, 2);
+            return phi;
+        }
         default:
             return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
         }
