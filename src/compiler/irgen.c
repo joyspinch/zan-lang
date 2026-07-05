@@ -1970,6 +1970,36 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* general instance method call: <expr>.Method(args) where <expr> is
+         * any expression of class/struct type (a field, this.field, an index
+         * or a call result) — not just a local variable or class name. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_symbol_t *recv_cls = expr_class_sym(g, callee->member.object, locals);
+            if (recv_cls) {
+                zan_symbol_t *method_sym = get_method_sym(recv_cls, callee->member.name);
+                if (method_sym) {
+                    for (int fi = 0; fi < g->function_count; fi++) {
+                        if (g->functions[fi].sym == method_sym) {
+                            int argc = expr->call.args.count + 1;
+                            LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
+                            /* receiver: the object pointer produced by the
+                             * expression (field load, index, call, ...). */
+                            call_args[0] = emit_expr(g, callee->member.object, locals);
+                            for (int k = 0; k < expr->call.args.count; k++) {
+                                call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
+                            }
+                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
+                            LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
+                                g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                            free(call_args);
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+
         /* bare function name call: Compute(21) → look up in current class then global */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
             zan_istr_t fn_name = expr->call.callee->ident.name;

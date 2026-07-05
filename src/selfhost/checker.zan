@@ -1,0 +1,64 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Checker: light semantic pass over the bound AST. Validates that every type
+// reference resolves to a primitive, a builtin generic, or a declared type,
+// and reports positioned diagnostics. Mirrors the resolution portion of
+// src/compiler/checker.c for the bootstrap subset. This is deliberately
+// conservative: it flags unknown types rather than performing full inference,
+// which the irgen phase handles on demand.
+class Checker {
+    public Binder binder;
+    public Diags diags;
+
+    public Checker(Binder b, Diags d) { binder = b; diags = d; }
+
+    // A type node resolves if its base name is known. Generic args are checked
+    // recursively.
+    void CheckType(Node t) {
+        if (t == null) { return; }
+        string name = t.sval;
+        bool ok = binder.IsPrimitive(name);
+        if (!ok) { ok = binder.IsBuiltinGeneric(name); }
+        if (!ok) { if (binder.FindType(name) != null) { ok = true; } }
+        if (!ok) { diags.Error("unknown type '" + name + "'", t.line, t.col); }
+        int i = 0;
+        while (i < t.kids.Count) { CheckType(t.kids[i]); i = i + 1; }
+    }
+
+    public void Check(Node unit) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { CheckClass(d); }
+            i = i + 1;
+        }
+    }
+
+    void CheckClass(Node cls) {
+        if (cls.sval2 != "") {
+            if (binder.FindType(cls.sval2) == null) {
+                diags.Error("unknown base type '" + cls.sval2 + "'", cls.line, cls.col);
+            }
+        }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl()) { CheckType(m.type); }
+            else if (m.kind == AK.MethodDecl()) { CheckMethod(m); }
+            else if (m.kind == AK.CtorDecl()) { CheckMethod(m); }
+            i = i + 1;
+        }
+    }
+
+    void CheckMethod(Node m) {
+        if (m.type != null) { CheckType(m.type); }
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { CheckType(p.type); }
+            i = i + 1;
+        }
+    }
+}
