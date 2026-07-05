@@ -152,6 +152,28 @@ foreach(_stage
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 endforeach()
 
+# ---- Determinism: codegen must be a pure function of the source ----
+# Compiling the same program twice must yield byte-identical LLVM IR. This is
+# the reproducible-build / correctness net that stands in for a self-hosting
+# gen2==gen3 diff (zanc itself is written in C, not Zan).
+foreach(_src ${_conf_srcs})
+  get_filename_component(_name ${_src} NAME_WE)
+  add_test(NAME determinism_${_name}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_src}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
+endforeach()
+foreach(_stage
+    selfhost selfparse selfpipe selfvars selfctrl
+    selfvm selfvmcf selfvmfn selfvmops)
+  add_test(NAME determinism_${_stage}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/src/self/${_stage}.zan
+      -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
+endforeach()
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)

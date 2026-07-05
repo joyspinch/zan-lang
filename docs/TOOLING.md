@@ -113,6 +113,31 @@ Correct programs whose objects are all released report nothing, so the check
 is free of false positives. See `src/self/rt_divzero.zan` and
 `src/self/rt_leak.zan` for runnable examples.
 
+## Test suite & deterministic codegen
+
+`ctest` runs three regression families over every build configuration:
+
+- **conformance** — each `tests/conformance/*.zan` is compiled, run, and its
+  stdout diffed against a golden `.out`.
+- **selfhost** — the bootstrap-compiler stages in `src/self/` are compiled and
+  run, with golden outputs.
+- **determinism** — every conformance and self-host program is compiled to LLVM
+  IR *twice*, and the two emissions must be byte-for-byte identical.
+
+The determinism check (`tests/run_determinism.cmake`) is the reproducible-build
+correctness net: because `zanc` is written in C rather than in Zan, a classic
+self-hosting `gen2 == gen3` diff does not apply, so instead we assert that
+codegen is a pure function of the source. It catches nondeterminism and
+undefined behaviour in the backend — iteration over unordered containers,
+uninitialised memory, or raw pointer values leaking into the output — any of
+which would otherwise silently break reproducible builds.
+
+```
+$ ctest --test-dir build --output-on-failure
+...
+100% tests passed, 0 tests failed out of 47
+```
+
 ## Testing without an editor
 
 Both tools are plain stdio programs, so they can be driven with framed JSON
