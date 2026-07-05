@@ -140,6 +140,8 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_CHAR:   return LLVMInt32TypeInContext(g->ctx);
     case TYPE_STRING: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_OBJECT: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    case TYPE_ENUM:
+        return LLVMInt32TypeInContext(g->ctx);
     case TYPE_STRUCT:
     case TYPE_CLASS: {
         /* look up registered struct type */
@@ -169,7 +171,8 @@ static LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
 static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
     int idx = 0;
     for (int i = 0; i < type_sym->member_count; i++) {
-        if (type_sym->members[i]->kind == SYM_FIELD) {
+        if (type_sym->members[i]->kind == SYM_FIELD ||
+            type_sym->members[i]->kind == SYM_PROPERTY) {
             if (type_sym->members[i]->name.len == field_name.len &&
                 memcmp(type_sym->members[i]->name.str, field_name.str, field_name.len) == 0) {
                 return idx;
@@ -182,7 +185,8 @@ static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
 
 static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name) {
     for (int i = 0; i < type_sym->member_count; i++) {
-        if (type_sym->members[i]->kind == SYM_FIELD &&
+        if ((type_sym->members[i]->kind == SYM_FIELD ||
+             type_sym->members[i]->kind == SYM_PROPERTY) &&
             type_sym->members[i]->name.len == field_name.len &&
             memcmp(type_sym->members[i]->name.str, field_name.str, field_name.len) == 0) {
             return type_sym->members[i];
@@ -206,16 +210,18 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     if (g->struct_type_count >= 256) return;
     if (get_struct_llvm_type(g, sym)) return;
 
-    /* count fields and build LLVM field types */
+    /* count fields (including auto-property backing fields) */
     int field_count = 0;
     for (int i = 0; i < sym->member_count; i++) {
-        if (sym->members[i]->kind == SYM_FIELD) field_count++;
+        if (sym->members[i]->kind == SYM_FIELD ||
+            sym->members[i]->kind == SYM_PROPERTY) field_count++;
     }
 
     LLVMTypeRef *field_types = (LLVMTypeRef *)calloc((size_t)field_count, sizeof(LLVMTypeRef));
     int fi = 0;
     for (int i = 0; i < sym->member_count; i++) {
-        if (sym->members[i]->kind == SYM_FIELD) {
+        if (sym->members[i]->kind == SYM_FIELD ||
+            sym->members[i]->kind == SYM_PROPERTY) {
             field_types[fi++] = map_type(g, sym->members[i]->type);
         }
     }
@@ -517,6 +523,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         1, 0);
                     LLVMBuildCall2(g->builder, fn_type, g->rt_print_double, &arg, 1, "");
                 } else {
+                    /* ensure integer arg is i64 for print_int */
+                    if (LLVMGetTypeKind(arg_type) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(arg_type) < 64) {
+                        arg = LLVMBuildSExt(g->builder, arg,
+                                            LLVMInt64TypeInContext(g->ctx), "ext");
+                    }
                     LLVMTypeRef fn_type = LLVMFunctionType(
                         LLVMVoidTypeInContext(g->ctx),
                         (LLVMTypeRef[]){ LLVMInt64TypeInContext(g->ctx) },
@@ -712,6 +724,39 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     /* Math.Sqrt is handled as a call — shouldn't reach here */
                     return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
                 }
+            }
+        }
+
+        /* Enum member access: EnumType.MemberName -> integer constant */
+        if (expr->member.object->kind == AST_IDENTIFIER) {
+            zan_symbol_t *enum_sym = zan_binder_lookup(g->binder, expr->member.object->ident.name);
+            if (enum_sym && enum_sym->kind == SYM_ENUM) {
+                int enum_val = 0;
+                for (int ei = 0; ei < enum_sym->member_count; ei++) {
+                    if (enum_sym->members[ei]->kind == SYM_ENUM_MEMBER) {
+                        if (enum_sym->members[ei]->name.len == expr->member.name.len &&
+                            memcmp(enum_sym->members[ei]->name.str, expr->member.name.str,
+                                   (size_t)expr->member.name.len) == 0) {
+                            zan_ast_node_t *em_decl = enum_sym->members[ei]->decl;
+                            if (em_decl && em_decl->kind == AST_ENUM_MEMBER &&
+                                em_decl->enum_member.value &&
+                                em_decl->enum_member.value->kind == AST_INT_LITERAL) {
+                                enum_val = (int)em_decl->enum_member.value->int_val;
+                            }
+                            return LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                                               (uint64_t)enum_val, 0);
+                        }
+                        zan_ast_node_t *em_decl = enum_sym->members[ei]->decl;
+                        if (em_decl && em_decl->kind == AST_ENUM_MEMBER &&
+                            em_decl->enum_member.value &&
+                            em_decl->enum_member.value->kind == AST_INT_LITERAL) {
+                            enum_val = (int)em_decl->enum_member.value->int_val + 1;
+                        } else {
+                            enum_val++;
+                        }
+                    }
+                }
+                return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
             }
         }
 

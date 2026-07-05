@@ -32,7 +32,11 @@ add_executable(zanc
     src/compiler/irgen.c
 )
 target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
-target_link_libraries(zanc PRIVATE ${LLVM_LIBS} stdc++ m)
+if(MSVC)
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS})
+else()
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} stdc++ m)
+endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
 
 # ---- Tests ----

@@ -571,10 +571,15 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* link with cc */
+        /* link with system C compiler */
         char link_cmd[2048];
+#ifdef _WIN32
+        snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\"",
+                 obj_tmp, obj_path);
+#else
         snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
                  obj_tmp, obj_path);
+#endif
         int link_ret = system(link_cmd);
 
         /* clean up object file */
