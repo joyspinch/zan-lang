@@ -80,6 +80,12 @@ struct zan_irgen {
         int method_count;
     } vtables[256];
     int vtable_count;
+
+    /* built-in List<T> runtime support */
+    LLVMValueRef fn_realloc;     /* realloc(void*, size_t) -> void* */
+    LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
+    LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
+    LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

@@ -144,6 +144,16 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (istr_eq(name, "object", 6)) return b->type_object;
     if (istr_eq(name, "nint",   4)) return b->type_nint;
 
+    /* built-in generic types */
+    if (istr_eq(name, "List", 4)) {
+        zan_type_t *list_type = make_type(b->arena, TYPE_CLASS, "List", 4);
+        return list_type;
+    }
+    if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10)) {
+        zan_type_t *dict_type = make_type(b->arena, TYPE_CLASS, "Dict", 4);
+        return dict_type;
+    }
+
     /* user-defined type: look up in scope */
     zan_symbol_t *sym = scope_find(b->current_scope, name);
     if (sym) {
