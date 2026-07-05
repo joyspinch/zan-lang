@@ -28,6 +28,9 @@ class Irgen {
     public bool curHasThis;
     public List<string> locName;
     public List<Node> locType;
+    public List<string> locReg;
+    public int locSeq;
+    public string curLbl;
     public int brkTarget;
     public int contTarget;
 
@@ -38,6 +41,9 @@ class Irgen {
         curClass = ""; curRet = "void"; curHasThis = false;
         locName = new List<string>();
         locType = new List<Node>();
+        locReg = new List<string>();
+        locSeq = 0;
+        curLbl = "entry";
         brkTarget = 0; contTarget = 0;
     }
 
@@ -45,7 +51,7 @@ class Irgen {
     int NL() { lbl = lbl + 1; return lbl; }
     void L(string s) { body = body + s + "\n"; }
     void H(string s) { head = head + s + "\n"; }
-    void Label(int n) { body = body + "L" + n + ":\n"; term = false; }
+    void Label(int n) { body = body + "L" + n + ":\n"; term = false; curLbl = "L" + n; }
 
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
 
@@ -118,7 +124,13 @@ class Irgen {
     }
 
     // ---- locals ----
-    void AddLocal(string name, Node ty) { locName.Add(name); locType.Add(ty); }
+    string AddLocal(string name, Node ty) {
+        locSeq = locSeq + 1;
+        string r = "%v." + name + "." + locSeq;
+        locName.Add(name); locType.Add(ty); locReg.Add(r);
+        return r;
+    }
+    string RegOf(string name) { int i = LocalIdx(name); if (i < 0) { return "%v." + name; } return locReg[i]; }
     int LocalIdx(string name) {
         int i = locName.Count - 1;
         while (i >= 0) { if (locName[i] == name) { return i; } i = i - 1; }
@@ -178,6 +190,16 @@ class Irgen {
         H("declare i8* @strcat(i8*, i8*)");
         H("declare i8* @memcpy(i8*, i8*, i64)");
         H("declare i32 @snprintf(i8*, i64, i8*, ...)");
+        H("declare i8* @fopen(i8*, i8*)");
+        H("declare i32 @fseek(i8*, i64, i32)");
+        H("declare i64 @ftell(i8*)");
+        H("declare i64 @fread(i8*, i64, i64, i8*)");
+        H("declare i64 @fwrite(i8*, i64, i64, i8*)");
+        H("declare i32 @fclose(i8*)");
+        H("@__zan_argc = global i32 0");
+        H("@__zan_argv = global i8** null");
+        H("@.mode_rb = private unnamed_addr constant [3 x i8] c\"rb\\00\"");
+        H("@.mode_wb = private unnamed_addr constant [2 x i8] c\"w\\00\"");
         H("@.fmt.nl = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"");
         H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
@@ -301,8 +323,11 @@ class Irgen {
 
     void StartFn() {
         tmp = 0; lbl = 0; term = false;
+        curLbl = "entry";
         locName = new List<string>();
         locType = new List<Node>();
+        locReg = new List<string>();
+        locSeq = 0;
     }
 
     void GenMethod(Node cls, Node m, bool ctor) {
@@ -338,9 +363,9 @@ class Irgen {
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
-            L("  %v." + pn[j] + " = alloca " + lt);
-            L("  store " + lt + " %p" + j + ", " + lt + "* %v." + pn[j]);
-            AddLocal(pn[j], pt[j]);
+            string preg = AddLocal(pn[j], pt[j]);
+            L("  " + preg + " = alloca " + lt);
+            L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
             j = j + 1;
         }
         if (m.d != null) { GenStmt(m.d); }
@@ -377,9 +402,9 @@ class Irgen {
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
-            L("  %v." + pn[j] + " = alloca " + lt);
-            L("  store " + lt + " %p" + j + ", " + lt + "* %v." + pn[j]);
-            AddLocal(pn[j], pt[j]);
+            string preg = AddLocal(pn[j], pt[j]);
+            L("  " + preg + " = alloca " + lt);
+            L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
             j = j + 1;
         }
         if (m.d != null) { GenStmt(m.d); }
@@ -398,14 +423,11 @@ class Irgen {
             i = i + 1;
         }
         if (owner == "") { return; }
-        Node mm = binder.FindMethod(binder.FindType(owner), "Main");
-        // Main may take string[] args; pass null for the array.
-        int nparams = 0; int k = 0;
-        while (k < mm.kids.Count) { if (mm.kids[k].kind == AK.Param()) { nparams = nparams + 1; } k = k + 1; }
-        L("define i32 @main() {");
+        L("define i32 @main(i32 %argc, i8** %argv) {");
         L("entry:");
-        if (nparams > 0) { L("  call void @" + owner + "_Main(i8* null)"); }
-        else { L("  call void @" + owner + "_Main()"); }
+        L("  store i32 %argc, i32* @__zan_argc");
+        L("  store i8** %argv, i8*** @__zan_argv");
+        L("  call void @" + owner + "_Main()");
         L("  ret i32 0");
         L("}");
     }
@@ -457,10 +479,10 @@ class Irgen {
         if (hasInit) { init = GenExpr(s.b); } else { init = new ExprVal("0", MkType("int")); }
         if (ty == null) { ty = init.ty; }
         string lt = MapType(ty);
-        L("  %v." + s.sval + " = alloca " + lt);
-        AddLocal(s.sval, ty);
+        string reg = AddLocal(s.sval, ty);
+        L("  " + reg + " = alloca " + lt);
         if (hasInit) {
-            L("  store " + lt + " " + Coerce(init, lt) + ", " + lt + "* %v." + s.sval);
+            L("  store " + lt + " " + Coerce(init, lt) + ", " + lt + "* " + reg);
         }
     }
 
@@ -558,9 +580,10 @@ class Irgen {
         int li = LocalIdx(e.sval);
         if (li >= 0) {
             Node ty = locType[li];
+            string reg = locReg[li];
             string lt = MapType(ty);
             string t = NT();
-            L("  " + t + " = load " + lt + ", " + lt + "* %v." + e.sval);
+            L("  " + t + " = load " + lt + ", " + lt + "* " + reg);
             return new ExprVal(t, ty);
         }
         // implicit this.field
@@ -636,11 +659,20 @@ class Irgen {
     ExprVal GenBinary(Node e) {
         int op = e.op;
         if (op == TK.AmpAmp() || op == TK.PipePipe()) {
-            string lc = GenCond(e.a);
-            string rc = GenCond(e.b);
+            bool isAnd = (op == TK.AmpAmp());
+            int lrhs = NL(); int lend = NL();
+            string la = GenCond(e.a);
+            string bpre = curLbl;
+            if (isAnd) { L("  br i1 " + la + ", label %L" + lrhs + ", label %L" + lend); }
+            else { L("  br i1 " + la + ", label %L" + lend + ", label %L" + lrhs); }
+            Label(lrhs);
+            string lb = GenCond(e.b);
+            string bpost = curLbl;
+            L("  br label %L" + lend);
+            Label(lend);
             string r = NT();
-            if (op == TK.AmpAmp()) { L("  " + r + " = and i1 " + lc + ", " + rc); }
-            else { L("  " + r + " = or i1 " + lc + ", " + rc); }
+            string dflt = "true"; if (isAnd) { dflt = "false"; }
+            L("  " + r + " = phi i1 [ " + dflt + ", %" + bpre + " ], [ " + lb + ", %" + bpost + " ]");
             string z = NT();
             L("  " + z + " = zext i1 " + r + " to i64");
             return new ExprVal(z, MkType("bool"));
@@ -774,7 +806,7 @@ class Irgen {
             int li = LocalIdx(lhs.sval);
             if (li >= 0) {
                 string lt = MapType(locType[li]);
-                L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* %v." + lhs.sval);
+                L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + locReg[li]);
                 return;
             }
             if (curHasThis) {
@@ -952,6 +984,50 @@ class Irgen {
     // ---- calls ----
     ExprVal GenCall(Node e) {
         Node callee = e.a;
+        // Environment / File builtins: ClassName.Method(...)
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()) {
+            string cn = callee.a.sval;
+            string mn = callee.sval;
+            if (cn == "Environment" && mn == "ArgCount") {
+                string a = NT(); L("  " + a + " = load i32, i32* @__zan_argc");
+                string a64 = NT(); L("  " + a64 + " = sext i32 " + a + " to i64");
+                string r = NT(); L("  " + r + " = sub i64 " + a64 + ", 1");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (cn == "Environment" && mn == "ArgAt") {
+                ExprVal idx = GenExpr(e.kids[0]);
+                string i1 = NT(); L("  " + i1 + " = add i64 " + idx.op + ", 1");
+                string av = NT(); L("  " + av + " = load i8**, i8*** @__zan_argv");
+                string sp = NT(); L("  " + sp + " = getelementptr i8*, i8** " + av + ", i64 " + i1);
+                string r = NT(); L("  " + r + " = load i8*, i8** " + sp);
+                return new ExprVal(r, MkType("string"));
+            }
+            if (cn == "File" && mn == "ReadAllText") {
+                ExprVal path = GenExpr(e.kids[0]);
+                string rb = NT(); L("  " + rb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_rb, i64 0, i64 0");
+                string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + rb + ")");
+                L("  call i32 @fseek(i8* " + fp + ", i64 0, i32 2)");
+                string sz = NT(); L("  " + sz + " = call i64 @ftell(i8* " + fp + ")");
+                L("  call i32 @fseek(i8* " + fp + ", i64 0, i32 0)");
+                string bsz = NT(); L("  " + bsz + " = add i64 " + sz + ", 1");
+                string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
+                L("  call i64 @fread(i8* " + buf + ", i64 1, i64 " + sz + ", i8* " + fp + ")");
+                string ep = NT(); L("  " + ep + " = getelementptr i8, i8* " + buf + ", i64 " + sz);
+                L("  store i8 0, i8* " + ep);
+                L("  call i32 @fclose(i8* " + fp + ")");
+                return new ExprVal(buf, MkType("string"));
+            }
+            if (cn == "File" && mn == "WriteAllText") {
+                ExprVal path = GenExpr(e.kids[0]);
+                ExprVal content = GenExpr(e.kids[1]);
+                string wb = NT(); L("  " + wb + " = getelementptr inbounds [2 x i8], [2 x i8]* @.mode_wb, i64 0, i64 0");
+                string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + wb + ")");
+                string ln = NT(); L("  " + ln + " = call i64 @strlen(i8* " + content.op + ")");
+                L("  call i64 @fwrite(i8* " + content.op + ", i64 1, i64 " + ln + ", i8* " + fp + ")");
+                L("  call i32 @fclose(i8* " + fp + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+        }
         // Console.Write / WriteLine
         if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
             && callee.a.sval == "Console") {

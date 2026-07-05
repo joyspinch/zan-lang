@@ -620,7 +620,9 @@ int main(int argc, char **argv) {
         /* link with system C compiler */
         char link_cmd[2048];
 #ifdef _WIN32
-        snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\"",
+        /* Reserve a large (256 MB) stack: the self-hosted compiler recurses
+         * deeply over big translation units. */
+        snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" -Xlinker /STACK:268435456",
                  obj_tmp, obj_path);
 #else
         snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",

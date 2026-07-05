@@ -1,23 +1,54 @@
 using System;
 using System.Collections;
+using System.IO;
 namespace Zan;
 
+// Self-hosted compiler driver. Mirrors src/compiler/main.c for the bootstrap
+// subset. Usage:
+//
+//   zanc <output.ll> <input1.zan> [input2.zan ...]
+//
+// All inputs are concatenated into a single translation unit (they share one
+// namespace), lexed, parsed, bound, checked and lowered to LLVM IR text which
+// is written to <output.ll>. clang then compiles that to a native executable.
 class Program {
     static void Main() {
-        string src = "class C { public int x; static int Add(int a, int b) { return a + b; } }";
-        Lexer lx = new Lexer(src);
-        List<Token> toks = lx.Run();
-        Console.WriteLine(toks.Count);
-        int i = 0;
-        while (i < toks.Count) {
-            Token t = toks[i];
-            // print "kind:line:col text"
-            Console.Write(t.kind);
-            Console.Write(":");
-            if (t.kind == TK.Ident()) { Console.Write(t.text); }
-            else if (t.kind == TK.IntLit()) { Console.Write(t.intVal); }
-            Console.WriteLine("");
-            i = i + 1;
+        int argc = Environment.ArgCount();
+        if (argc < 2) {
+            Console.WriteLine("usage: zanc <output.ll> <input.zan> [more.zan ...]");
+        } else {
+            string outPath = Environment.ArgAt(0);
+            string src = "";
+            int i = 1;
+            while (i < argc) {
+                string p = Environment.ArgAt(i);
+                string t = File.ReadAllText(p);
+                src = src + t + "\n";
+                i = i + 1;
+            }
+
+            Lexer lx = new Lexer(src);
+            List<Token> toks = lx.Run();
+
+            Parser ps = new Parser(toks);
+            Node unit = ps.ParseUnit();
+
+            Binder b = new Binder();
+            b.Bind(unit);
+
+            Diags d = new Diags();
+            Checker chk = new Checker(b, d);
+            chk.Check(unit);
+            int j = 0;
+            while (j < d.Count()) {
+                Diag e = d.items[j];
+                Console.WriteLine(e.msg);
+                j = j + 1;
+            }
+
+            Irgen ig = new Irgen(b, d);
+            string ir = ig.Gen(unit);
+            File.WriteAllText(outPath, ir);
         }
     }
 }

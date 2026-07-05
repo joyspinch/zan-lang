@@ -1626,6 +1626,39 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* Environment.ArgCount() -> number of command-line args (excludes the
+         * program name), i.e. argc - 1. */
+        if (is_call_to(expr, "Environment", "ArgCount") && expr->call.args.count == 0) {
+            LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef g_argc = LLVMGetNamedGlobal(g->mod, "__zan_argc");
+            if (!g_argc) {
+                g_argc = LLVMAddGlobal(g->mod, i32, "__zan_argc");
+                LLVMSetInitializer(g_argc, LLVMConstInt(i32, 0, 0));
+            }
+            LLVMValueRef ac = LLVMBuildLoad2(g->builder, i32, g_argc, "argc");
+            LLVMValueRef ac64 = LLVMBuildSExt(g->builder, ac, i64, "argc64");
+            return LLVMBuildSub(g->builder, ac64, LLVMConstInt(i64, 1, 0), "nargs");
+        }
+
+        /* Environment.ArgAt(i) -> string : the (i+1)-th argv entry, so index 0
+         * is the first user argument. */
+        if (is_call_to(expr, "Environment", "ArgAt") && expr->call.args.count == 1) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i8ptrptr = LLVMPointerType(i8ptr, 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef idx = emit_expr(g, expr->call.args.items[0], locals);
+            LLVMValueRef idx1 = LLVMBuildAdd(g->builder, idx, LLVMConstInt(i64, 1, 0), "argi");
+            LLVMValueRef g_argv = LLVMGetNamedGlobal(g->mod, "__zan_argv");
+            if (!g_argv) {
+                g_argv = LLVMAddGlobal(g->mod, i8ptrptr, "__zan_argv");
+                LLVMSetInitializer(g_argv, LLVMConstNull(i8ptrptr));
+            }
+            LLVMValueRef argv = LLVMBuildLoad2(g->builder, i8ptrptr, g_argv, "argv");
+            LLVMValueRef slot = LLVMBuildGEP2(g->builder, i8ptr, argv, &idx1, 1, "argslot");
+            return LLVMBuildLoad2(g->builder, i8ptr, slot, "arg");
+        }
+
         /* File.ReadAllText(path) -> string */
         if (is_call_to(expr, "File", "ReadAllText") && expr->call.args.count == 1) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
@@ -3356,13 +3389,31 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 /* ---- top-level emission ---- */
 
 static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym) {
-    /* create main() function */
-    LLVMTypeRef main_type = LLVMFunctionType(
-        LLVMInt32TypeInContext(g->ctx), NULL, 0, 0);
+    /* create main(i32 argc, i8** argv) so command-line args are available via
+     * the Environment.ArgCount()/ArgAt() builtins. */
+    LLVMTypeRef i32ty = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i8ptrptr = LLVMPointerType(i8ptr, 0);
+    LLVMTypeRef main_params[] = { i32ty, i8ptrptr };
+    LLVMTypeRef main_type = LLVMFunctionType(i32ty, main_params, 2, 0);
     LLVMValueRef main_fn = LLVMAddFunction(g->mod, "main", main_type);
 
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, main_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
+
+    /* stash argc/argv into module globals for Environment.* builtins */
+    LLVMValueRef g_argc = LLVMGetNamedGlobal(g->mod, "__zan_argc");
+    if (!g_argc) {
+        g_argc = LLVMAddGlobal(g->mod, i32ty, "__zan_argc");
+        LLVMSetInitializer(g_argc, LLVMConstInt(i32ty, 0, 0));
+    }
+    LLVMValueRef g_argv = LLVMGetNamedGlobal(g->mod, "__zan_argv");
+    if (!g_argv) {
+        g_argv = LLVMAddGlobal(g->mod, i8ptrptr, "__zan_argv");
+        LLVMSetInitializer(g_argv, LLVMConstNull(i8ptrptr));
+    }
+    LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 0), g_argc);
+    LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 1), g_argv);
 
     g->current_fn = main_fn;
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
