@@ -1536,7 +1536,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         if (expr->member.name.len == 5 && memcmp(expr->member.name.str, "Count", 5) == 0) {
             if (expr->member.object->kind == AST_IDENTIFIER) {
                 local_var_t *list_local = local_find(locals, expr->member.object->ident.name);
-                if (list_local) {
+                if (list_local && list_local->type && list_local->type->name.len >= 4 &&
+                    memcmp(list_local->type->name.str, "List", 4) == 0) {
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw_ptr = LLVMBuildLoad2(g->builder, i8ptr, list_local->alloca, "lraw");
