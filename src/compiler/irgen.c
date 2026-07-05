@@ -1810,6 +1810,161 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     }
 
+    case AST_CONDITIONAL: {
+        /* ternary: condition ? then_expr : else_expr */
+        LLVMValueRef cond = emit_expr(g, expr->conditional.cond, locals);
+        /* normalize to i1 */
+        if (LLVMTypeOf(cond) != LLVMInt1TypeInContext(g->ctx)) {
+            cond = LLVMBuildICmp(g->builder, LLVMIntNE, cond,
+                                 LLVMConstInt(LLVMTypeOf(cond), 0, 0), "cond");
+        }
+        LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(g->ctx,
+            LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)), "tern.then");
+        LLVMBasicBlockRef else_bb = LLVMAppendBasicBlockInContext(g->ctx,
+            LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)), "tern.else");
+        LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlockInContext(g->ctx,
+            LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder)), "tern.merge");
+        LLVMBuildCondBr(g->builder, cond, then_bb, else_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, then_bb);
+        LLVMValueRef then_val = emit_expr(g, expr->conditional.then_expr, locals);
+        LLVMBasicBlockRef then_end = LLVMGetInsertBlock(g->builder);
+        LLVMBuildBr(g->builder, merge_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, else_bb);
+        LLVMValueRef else_val = emit_expr(g, expr->conditional.else_expr, locals);
+        LLVMBasicBlockRef else_end = LLVMGetInsertBlock(g->builder);
+        LLVMBuildBr(g->builder, merge_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, merge_bb);
+        LLVMValueRef phi = LLVMBuildPhi(g->builder, LLVMTypeOf(then_val), "tern");
+        LLVMValueRef incoming_vals[] = { then_val, else_val };
+        LLVMBasicBlockRef incoming_bbs[] = { then_end, else_end };
+        LLVMAddIncoming(phi, incoming_vals, incoming_bbs, 2);
+        return phi;
+    }
+
+    case AST_POSTFIX_UNARY: {
+        /* x++ or x-- */
+        LLVMValueRef ptr = NULL;
+        if (expr->unary.operand->kind == AST_IDENTIFIER) {
+            local_var_t *lv = local_find(locals, expr->unary.operand->ident.name);
+            if (lv) ptr = lv->alloca;
+        }
+        if (!ptr) return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+        LLVMValueRef old_val = LLVMBuildLoad2(g->builder,
+            LLVMInt64TypeInContext(g->ctx), ptr, "post");
+        LLVMValueRef one = LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 1, 0);
+        LLVMValueRef new_val;
+        if (expr->unary.op == TK_PLUS_PLUS) {
+            new_val = LLVMBuildAdd(g->builder, old_val, one, "inc");
+        } else {
+            new_val = LLVMBuildSub(g->builder, old_val, one, "dec");
+        }
+        LLVMBuildStore(g->builder, new_val, ptr);
+        return old_val; /* postfix returns old value */
+    }
+
+    case AST_IS_EXPR: {
+        /* x is Type — runtime type check (simplified: always true for matching static types) */
+        return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0);
+    }
+
+    case AST_AS_EXPR: {
+        /* x as Type — type cast (simplified: pass through value) */
+        return emit_expr(g, expr->type_test.expr, locals);
+    }
+
+    case AST_CAST_EXPR: {
+        /* (Type)x — explicit cast */
+        LLVMValueRef val = emit_expr(g, expr->cast.expr, locals);
+        LLVMTypeRef target = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef src_type = LLVMTypeOf(val);
+        if (src_type == LLVMDoubleTypeInContext(g->ctx) && target == LLVMInt64TypeInContext(g->ctx)) {
+            return LLVMBuildFPToSI(g->builder, val, target, "cast");
+        } else if (src_type == LLVMInt64TypeInContext(g->ctx) && target == LLVMDoubleTypeInContext(g->ctx)) {
+            return LLVMBuildSIToFP(g->builder, val, LLVMDoubleTypeInContext(g->ctx), "cast");
+        }
+        return val;
+    }
+
+    case AST_SIZEOF_EXPR: {
+        /* sizeof(Type) — return size in bytes */
+        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 8, 0);
+    }
+
+    case AST_TYPEOF_EXPR: {
+        /* typeof(x) — return type name as string */
+        return LLVMBuildGlobalStringPtr(g->builder, "object", "tname");
+    }
+
+    case AST_THIS_EXPR: {
+        /* this — first parameter of instance method */
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        if (LLVMCountParams(fn) > 0) {
+            return LLVMGetParam(fn, 0);
+        }
+        return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
+    }
+
+    case AST_BASE_EXPR: {
+        /* base — same as this for single inheritance */
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        if (LLVMCountParams(fn) > 0) {
+            return LLVMGetParam(fn, 0);
+        }
+        return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
+    }
+
+    case AST_LAMBDA: {
+        /* lambda expression — generate anonymous function */
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        int pc = expr->lambda.params.count;
+        LLVMTypeRef *param_types = (LLVMTypeRef *)calloc((size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
+        for (int k = 0; k < pc; k++) {
+            param_types[k] = i64;
+        }
+        LLVMTypeRef ret_type = i64;
+        LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, (unsigned)pc, 0);
+
+        char lname[64];
+        static int lambda_id = 0;
+        snprintf(lname, sizeof(lname), "lambda_%d", lambda_id++);
+        LLVMValueRef lambda_fn = LLVMAddFunction(g->mod, lname, fn_type);
+
+        /* emit lambda body */
+        LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+        LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, entry);
+
+        local_scope_t lambda_locals;
+        memset(&lambda_locals, 0, sizeof(lambda_locals));
+        for (int k = 0; k < pc; k++) {
+            zan_ast_node_t *param = expr->lambda.params.items[k];
+            LLVMValueRef alloc = LLVMBuildAlloca(g->builder, i64, "lp");
+            LLVMBuildStore(g->builder, LLVMGetParam(lambda_fn, (unsigned)k), alloc);
+            local_add(&lambda_locals, param->param.name, alloc, g->binder->type_int);
+        }
+
+        if (expr->lambda.body) {
+            if (expr->lambda.body->kind == AST_BLOCK) {
+                emit_stmt(g, expr->lambda.body, &lambda_locals);
+                if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+                    LLVMBuildRet(g->builder, LLVMConstInt(i64, 0, 0));
+                }
+            } else {
+                LLVMValueRef result = emit_expr(g, expr->lambda.body, &lambda_locals);
+                LLVMBuildRet(g->builder, result);
+            }
+        } else {
+            LLVMBuildRet(g->builder, LLVMConstInt(i64, 0, 0));
+        }
+
+        LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+        free(param_types);
+        return lambda_fn;
+    }
+
     default:
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     }
@@ -2193,6 +2348,116 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * (full exception handling requires personality function + landingpad) */
         emit_stmt(g, stmt->try_stmt.try_body, locals);
         /* TODO: M3+ full LLVM exception handling with landingpad */
+        break;
+    }
+
+    case AST_DO_WHILE_STMT: {
+        /* do { body } while (cond); */
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do.body");
+        LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do.cond");
+        LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "do.end");
+        LLVMBuildBr(g->builder, body_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, body_bb);
+        emit_stmt(g, stmt->while_stmt.body, locals);
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+            LLVMBuildBr(g->builder, cond_bb);
+        }
+
+        LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+        LLVMValueRef cond = emit_expr(g, stmt->while_stmt.cond, locals);
+        if (LLVMTypeOf(cond) != LLVMInt1TypeInContext(g->ctx)) {
+            cond = LLVMBuildICmp(g->builder, LLVMIntNE, cond,
+                                 LLVMConstInt(LLVMTypeOf(cond), 0, 0), "dcond");
+        }
+        LLVMBuildCondBr(g->builder, cond, body_bb, end_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        break;
+    }
+
+    case AST_FOREACH_STMT: {
+        /* foreach (var x in collection) { body } — simplified: iterate List<T> */
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+
+        /* evaluate collection */
+        LLVMValueRef collection = emit_expr(g, stmt->foreach_stmt.collection, locals);
+
+        /* get count: field 0 of List struct */
+        LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            collection, 0, "cnt_ptr");
+        LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "cnt");
+
+        /* get data pointer: field 2 of List struct */
+        LLVMValueRef data_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            collection, 2, "data_ptr");
+        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+            data_ptr, "data");
+
+        /* index variable */
+        LLVMValueRef idx_alloc = LLVMBuildAlloca(g->builder, i64, "fi");
+        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
+
+        /* iteration variable */
+        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, i64, "fv");
+        local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, g->binder->type_int);
+
+        LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.cond");
+        LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.body");
+        LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.end");
+
+        LLVMBuildBr(g->builder, cond_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+        LLVMValueRef idx_val = LLVMBuildLoad2(g->builder, i64, idx_alloc, "i");
+        LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSLT, idx_val, count, "fcmp");
+        LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, body_bb);
+        /* load current element */
+        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_val, 1, "ep");
+        LLVMValueRef elem = LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
+        LLVMBuildStore(g->builder, elem, iter_alloc);
+
+        emit_stmt(g, stmt->foreach_stmt.body, locals);
+
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+            /* increment index */
+            LLVMValueRef next = LLVMBuildAdd(g->builder,
+                LLVMBuildLoad2(g->builder, i64, idx_alloc, "i2"),
+                LLVMConstInt(i64, 1, 0), "next");
+            LLVMBuildStore(g->builder, next, idx_alloc);
+            LLVMBuildBr(g->builder, cond_bb);
+        }
+
+        LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        break;
+    }
+
+    case AST_THROW_STMT: {
+        /* throw expr; — simplified: print error and exit */
+        LLVMValueRef val = emit_expr(g, stmt->throw_stmt.value, locals);
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+            "Unhandled exception\n", "exfmt");
+        LLVMValueRef args[] = { fmt };
+        LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
+        if (printf_fn) {
+            LLVMBuildCall2(g->builder, LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
+                &i8ptr, 1, 1), printf_fn, args, 1, "");
+        }
+        /* call exit(1) */
+        LLVMTypeRef exit_args[] = { LLVMInt32TypeInContext(g->ctx) };
+        LLVMTypeRef exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            exit_args, 1, 0);
+        LLVMValueRef exit_fn = LLVMGetNamedFunction(g->mod, "exit");
+        if (!exit_fn) {
+            exit_fn = LLVMAddFunction(g->mod, "exit", exit_type);
+        }
+        LLVMValueRef exit_arg = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0);
+        LLVMBuildCall2(g->builder, exit_type, exit_fn, &exit_arg, 1, "");
+        LLVMBuildUnreachable(g->builder);
         break;
     }
 
