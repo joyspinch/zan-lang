@@ -440,6 +440,8 @@ int main(int argc, char **argv) {
     }
 
     const char *input_file = NULL;
+    const char *input_files[128];
+    int input_count = 0;
     const char *output_file = NULL;
     bool do_dump_tokens = false;
     bool do_dump_ast = false;
@@ -461,24 +463,30 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (argv[i][0] != '-') {
-            input_file = argv[i];
+            if (input_count < 128) {
+                input_files[input_count++] = argv[i];
+            } else {
+                fprintf(stderr, "error: too many input files (max 128)\n");
+                return 1;
+            }
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 1;
         }
     }
 
-    if (!input_file) {
+    if (input_count == 0) {
         fprintf(stderr, "error: no input file\n");
         return 1;
     }
+    input_file = input_files[0];
 
-    /* read source */
+    /* read first source (also used for --dump-tokens) */
     size_t source_len;
     char *source = read_file(input_file, &source_len);
     if (!source) return 1;
 
-    /* dump tokens mode */
+    /* dump tokens mode (first file only) */
     if (do_dump_tokens) {
         dump_tokens(source, source_len, input_file);
         free(source);
@@ -488,15 +496,43 @@ int main(int argc, char **argv) {
     /* parse */
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
-    zan_diag_add_file(diag, input_file, source);
 
-    zan_lexer_t lex;
-    zan_lexer_init(&lex, source, source_len, 0, arena, diag);
+    /* Parse every input file and merge their declarations into a single
+     * compilation unit so that names resolve across files (multi-file
+     * compilation: zanc a.zan b.zan ... -o out). */
+    zan_ast_node_t *ast = NULL;
+    for (int fi = 0; fi < input_count; fi++) {
+        size_t slen = 0;
+        char *src = (fi == 0) ? source : read_file(input_files[fi], &slen);
+        if (fi == 0) slen = source_len;
+        if (!src) {
+            fprintf(stderr, "error: cannot read '%s'\n", input_files[fi]);
+            zan_arena_free(arena);
+            free(source);
+            return 1;
+        }
+        zan_diag_add_file(diag, input_files[fi], src);
 
-    zan_parser_t parser;
-    zan_parser_init(&parser, &lex, arena, diag);
+        zan_lexer_t lex;
+        zan_lexer_init(&lex, src, slen, fi, arena, diag);
 
-    zan_ast_node_t *ast = zan_parser_parse(&parser);
+        zan_parser_t parser;
+        zan_parser_init(&parser, &lex, arena, diag);
+
+        zan_ast_node_t *unit = zan_parser_parse(&parser);
+
+        if (!ast) {
+            ast = unit;
+        } else {
+            for (int k = 0; k < unit->comp_unit.usings.count; k++)
+                zan_ast_list_push(&ast->comp_unit.usings,
+                                  unit->comp_unit.usings.items[k], arena);
+            for (int k = 0; k < unit->comp_unit.decls.count; k++)
+                zan_ast_list_push(&ast->comp_unit.decls,
+                                  unit->comp_unit.decls.items[k], arena);
+            if (!ast->comp_unit.ns) ast->comp_unit.ns = unit->comp_unit.ns;
+        }
+    }
 
     if (do_dump_ast) {
         if (!zan_diag_has_errors(diag)) {
@@ -619,7 +655,11 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        printf("Compiled '%s' → '%s'\n", input_file, obj_path);
+        if (input_count == 1) {
+            printf("Compiled '%s' → '%s'\n", input_file, obj_path);
+        } else {
+            printf("Compiled %d files → '%s'\n", input_count, obj_path);
+        }
     }
 
     zan_irgen_destroy(&irgen);

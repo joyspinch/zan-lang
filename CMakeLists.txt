@@ -151,6 +151,17 @@ foreach(_src ${_conf_srcs})
       -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
 endforeach()
 
+# ---- Multi-file compilation: compile several .zan files into one program ----
+# Sources live in a subdirectory so the single-file glob above ignores them.
+add_test(NAME conformance_multifile
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/main.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/box.zan;${CMAKE_SOURCE_DIR}/tests/conformance/multifile/util.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)
