@@ -1,0 +1,599 @@
+using System;
+
+namespace ZanCompiler;
+
+// Eighth self-hosting stage: a bytecode compiler + stack VM with FUNCTION
+// CALLS, written in Zan. Functions are declared with `func f(params){...}`,
+// compiled into the instruction stream behind a JMP (so top-level flow skips
+// over them), and invoked via CALL/RET with per-call activation frames in a
+// locals array (frame pointer advances by 26 slots per call). Parameters are
+// bound by a prologue that STOREs the pushed arguments into the new frame.
+// This supports recursion, so we can compile and run recursive factorial and
+// Fibonacci as real bytecode.
+//
+// Opcodes:
+//   0 HALT   1 PUSH n   2 LOAD idx   3 STORE idx   4 ADD   5 SUB
+//   6 MUL    7 DIV      8 PRINT      9 JMP a       10 JZ a
+//   11 LT    12 GT      13 CALL addr 14 RET
+//
+// Token kinds:
+//   0 end 1 num 2 + 3 - 4 * 5 / 6 ( 7 ) 8 ident 9 = 10 ;
+//   11 { 12 } 13 if 14 while 15 print 16 < 17 > 18 func 19 , 20 return
+class Lexer {
+    public int[] src;
+    public int len;
+    public int pos;
+
+    public Lexer() { }
+
+    void Init(int[] s, int n) { src = s; len = n; pos = 0; }
+
+    int WordKind(int st, int wlen) {
+        if (wlen == 2 && src[st] == 105 && src[st + 1] == 102) { return 13; }        // if
+        if (wlen == 5 && src[st] == 119 && src[st + 1] == 104 &&
+            src[st + 2] == 105 && src[st + 3] == 108 && src[st + 4] == 101) { return 14; } // while
+        if (wlen == 5 && src[st] == 112 && src[st + 1] == 114 &&
+            src[st + 2] == 105 && src[st + 3] == 110 && src[st + 4] == 116) { return 15; } // print
+        if (wlen == 4 && src[st] == 102 && src[st + 1] == 117 &&
+            src[st + 2] == 110 && src[st + 3] == 99) { return 18; }                  // func
+        if (wlen == 6 && src[st] == 114 && src[st + 1] == 101 && src[st + 2] == 116 &&
+            src[st + 3] == 117 && src[st + 4] == 114 && src[st + 5] == 110) { return 20; } // return
+        return 8;                                                                   // ident
+    }
+
+    int Tokenize(int[] kinds, int[] vals) {
+        var n = 0;
+        while (pos < len) {
+            var c = src[pos];
+            if (c == 32) {
+                pos = pos + 1;
+            } else if (c >= 48 && c <= 57) {
+                var v = 0;
+                while (pos < len && src[pos] >= 48 && src[pos] <= 57) {
+                    v = v * 10 + (src[pos] - 48);
+                    pos = pos + 1;
+                }
+                kinds[n] = 1; vals[n] = v; n = n + 1;
+            } else if (c >= 97 && c <= 122) {
+                var st = pos;
+                while (pos < len && src[pos] >= 97 && src[pos] <= 122) { pos = pos + 1; }
+                var wlen = pos - st;
+                var wk = WordKind(st, wlen);
+                kinds[n] = wk;
+                if (wk == 8) { vals[n] = src[st] - 97; }
+                else { vals[n] = 0; }
+                n = n + 1;
+            } else {
+                var k = 0;
+                if (c == 43) { k = 2; }
+                else if (c == 45) { k = 3; }
+                else if (c == 42) { k = 4; }
+                else if (c == 47) { k = 5; }
+                else if (c == 40) { k = 6; }
+                else if (c == 41) { k = 7; }
+                else if (c == 61) { k = 9; }
+                else if (c == 59) { k = 10; }
+                else if (c == 123) { k = 11; }
+                else if (c == 125) { k = 12; }
+                else if (c == 60) { k = 16; }
+                else if (c == 62) { k = 17; }
+                else if (c == 44) { k = 19; }
+                kinds[n] = k; vals[n] = 0; n = n + 1;
+                pos = pos + 1;
+            }
+        }
+        kinds[n] = 0; vals[n] = 0;
+        return n;
+    }
+}
+
+class Compiler {
+    public int[] kinds;
+    public int[] vals;
+    public int n;
+    public int pos;
+    public int[] code;
+    public int clen;
+    public int[] funcAddr;   // funcAddr[letter] -> bytecode address
+
+    public Compiler() { }
+
+    void Init(int[] k, int[] v, int count, int[] buf, int[] fa) {
+        kinds = k; vals = v; n = count; pos = 0; code = buf; clen = 0; funcAddr = fa;
+    }
+
+    int Kind() { if (pos < n) { return kinds[pos]; } return 0; }
+    int PeekKind() { if (pos + 1 < n) { return kinds[pos + 1]; } return 0; }
+    int Val() { if (pos < n) { return vals[pos]; } return 0; }
+    void Next() { pos = pos + 1; }
+
+    void Emit(int op) { code[clen] = op; clen = clen + 1; }
+
+    // factor := number | ident | call | '(' add ')'
+    void Factor() {
+        if (Kind() == 6) {
+            Next();
+            Add();
+            if (Kind() == 7) { Next(); }
+        } else if (Kind() == 8) {
+            if (PeekKind() == 6) {          // call: ident '(' args ')'
+                var f = Val();
+                Next();
+                Next();                     // '('
+                if (Kind() != 7) {
+                    Cmp();
+                    while (Kind() == 19) { Next(); Cmp(); }
+                }
+                if (Kind() == 7) { Next(); }
+                Emit(13); Emit(funcAddr[f]); // CALL addr
+            } else {
+                var idx = Val();
+                Next();
+                Emit(2); Emit(idx);          // LOAD
+            }
+        } else {
+            var x = Val();
+            Next();
+            Emit(1); Emit(x);                // PUSH
+        }
+    }
+
+    void Term() {
+        Factor();
+        while (Kind() == 4 || Kind() == 5) {
+            var op = Kind();
+            Next();
+            Factor();
+            if (op == 4) { Emit(6); }
+            else { Emit(7); }
+        }
+    }
+
+    void Add() {
+        Term();
+        while (Kind() == 2 || Kind() == 3) {
+            var op = Kind();
+            Next();
+            Term();
+            if (op == 2) { Emit(4); }
+            else { Emit(5); }
+        }
+    }
+
+    void Cmp() {
+        Add();
+        if (Kind() == 16) { Next(); Add(); Emit(11); }
+        else if (Kind() == 17) { Next(); Add(); Emit(12); }
+    }
+
+    void Block() {
+        if (Kind() == 11) { Next(); }
+        while (Kind() != 12 && Kind() != 0) { Stmt(); }
+        if (Kind() == 12) { Next(); }
+    }
+
+    // func f(params) { body }
+    void FuncDef() {
+        Next();                              // 'func'
+        var f = Val();
+        Next();                              // name
+        var p0 = 0;
+        var p1 = 0;
+        var pc2 = 0;
+        if (Kind() == 6) { Next(); }         // '('
+        if (Kind() == 8) {
+            p0 = Val(); Next(); pc2 = 1;
+            if (Kind() == 19) { Next(); p1 = Val(); Next(); pc2 = 2; }
+        }
+        if (Kind() == 7) { Next(); }         // ')'
+        if (Kind() == 11) { Next(); }        // '{'
+
+        Emit(9); Emit(0);                    // JMP over body
+        var skip = clen - 1;
+        funcAddr[f] = clen;
+
+        // prologue: bind args from stack into this frame (reverse order)
+        if (pc2 == 2) {
+            Emit(3); Emit(p1);
+            Emit(3); Emit(p0);
+        } else if (pc2 == 1) {
+            Emit(3); Emit(p0);
+        }
+
+        while (Kind() != 12 && Kind() != 0) { Stmt(); }
+        if (Kind() == 12) { Next(); }        // '}'
+
+        Emit(1); Emit(0); Emit(14);          // default: PUSH 0; RET
+        code[skip] = clen;                   // backpatch skip target
+    }
+
+    void Stmt() {
+        var kd = Kind();
+        if (kd == 18) {                      // func def
+            FuncDef();
+        } else if (kd == 20) {               // return cmp ;
+            Next();
+            Cmp();
+            if (Kind() == 10) { Next(); }
+            Emit(14);                        // RET
+        } else if (kd == 13) {               // if
+            Next();
+            if (Kind() == 6) { Next(); }
+            Cmp();
+            if (Kind() == 7) { Next(); }
+            Emit(10); Emit(0);
+            var q = clen - 1;
+            Block();
+            code[q] = clen;
+        } else if (kd == 14) {               // while
+            var loopStart = clen;
+            Next();
+            if (Kind() == 6) { Next(); }
+            Cmp();
+            if (Kind() == 7) { Next(); }
+            Emit(10); Emit(0);
+            var q = clen - 1;
+            Block();
+            Emit(9); Emit(loopStart);
+            code[q] = clen;
+        } else if (kd == 15) {               // print
+            Next();
+            Cmp();
+            if (Kind() == 10) { Next(); }
+            Emit(8);
+        } else if (kd == 8) {                // assignment or bare call
+            if (PeekKind() == 9) {
+                var idx = Val();
+                Next();
+                Next();                      // '='
+                Cmp();
+                Emit(3); Emit(idx);          // STORE
+                if (Kind() == 10) { Next(); }
+            } else {
+                Cmp();
+                if (Kind() == 10) { Next(); }
+            }
+        } else {
+            Cmp();
+            if (Kind() == 10) { Next(); }
+        }
+    }
+
+    int Compile() {
+        while (Kind() != 0) { Stmt(); }
+        Emit(0);                             // HALT
+        return clen;
+    }
+}
+
+class VM {
+    public int[] code;
+    public int clen;
+    public int[] stack;
+    public int sp;
+    public int[] locals;
+    public int fp;
+    public int[] retStack;
+    public int[] fpStack;
+    public int csp;
+    public int pc;
+
+    public VM() { }
+
+    void Init(int[] c, int len, int[] st, int[] lo, int[] rs, int[] fs) {
+        code = c; clen = len; stack = st; sp = 0;
+        locals = lo; fp = 0; retStack = rs; fpStack = fs; csp = 0; pc = 0;
+    }
+
+    void Run() {
+        while (pc < clen) {
+            var op = code[pc];
+            pc = pc + 1;
+            if (op == 0) { return; }                 // HALT
+            else if (op == 1) {                      // PUSH n
+                stack[sp] = code[pc]; pc = pc + 1; sp = sp + 1;
+            } else if (op == 2) {                    // LOAD idx (local)
+                stack[sp] = locals[fp + code[pc]]; pc = pc + 1; sp = sp + 1;
+            } else if (op == 3) {                    // STORE idx (local)
+                sp = sp - 1; locals[fp + code[pc]] = stack[sp]; pc = pc + 1;
+            } else if (op == 4) {                    // ADD
+                var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a + b;
+            } else if (op == 5) {                    // SUB
+                var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a - b;
+            } else if (op == 6) {                    // MUL
+                var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a * b;
+            } else if (op == 7) {                    // DIV
+                var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a / b;
+            } else if (op == 8) {                    // PRINT
+                sp = sp - 1; Console.WriteLine(stack[sp]);
+            } else if (op == 9) {                    // JMP a
+                pc = code[pc];
+            } else if (op == 10) {                   // JZ a
+                var t = code[pc]; pc = pc + 1; sp = sp - 1;
+                if (stack[sp] == 0) { pc = t; }
+            } else if (op == 11) {                   // LT
+                var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1;
+                if (a < b) { stack[sp - 1] = 1; } else { stack[sp - 1] = 0; }
+            } else if (op == 12) {                   // GT
+                var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1;
+                if (a > b) { stack[sp - 1] = 1; } else { stack[sp - 1] = 0; }
+            } else if (op == 13) {                   // CALL addr
+                var target = code[pc]; pc = pc + 1;
+                retStack[csp] = pc; fpStack[csp] = fp; csp = csp + 1;
+                fp = fp + 26;
+                pc = target;
+            } else if (op == 14) {                   // RET
+                csp = csp - 1;
+                pc = retStack[csp];
+                fp = fpStack[csp];
+            }
+        }
+    }
+}
+
+class Program {
+    static void Eval(int[] src, int len) {
+        var lex = new Lexer();
+        lex.Init(src, len);
+        var kinds = new int[512];
+        var vals = new int[512];
+        var cnt = lex.Tokenize(kinds, vals);
+
+        var code = new int[2048];
+        var funcAddr = new int[26];
+        var comp = new Compiler();
+        comp.Init(kinds, vals, cnt, code, funcAddr);
+        var clen = comp.Compile();
+
+        var stack = new int[256];
+        var locals = new int[2048];
+        var retStack = new int[256];
+        var fpStack = new int[256];
+        var vm = new VM();
+        vm.Init(code, clen, stack, locals, retStack, fpStack);
+        vm.Run();
+    }
+
+    static void Main() {
+        Console.WriteLine(3000); // function-call stage start
+
+        // recursive factorial(5) -> 120
+        var a = new int[56];
+        a[0] = 102; // 'f'
+        a[1] = 117; // 'u'
+        a[2] = 110; // 'n'
+        a[3] = 99; // 'c'
+        a[4] = 32; // ' '
+        a[5] = 102; // 'f'
+        a[6] = 40; // '('
+        a[7] = 110; // 'n'
+        a[8] = 41; // ')'
+        a[9] = 123; // '{'
+        a[10] = 105; // 'i'
+        a[11] = 102; // 'f'
+        a[12] = 40; // '('
+        a[13] = 110; // 'n'
+        a[14] = 60; // '<'
+        a[15] = 50; // '2'
+        a[16] = 41; // ')'
+        a[17] = 123; // '{'
+        a[18] = 114; // 'r'
+        a[19] = 101; // 'e'
+        a[20] = 116; // 't'
+        a[21] = 117; // 'u'
+        a[22] = 114; // 'r'
+        a[23] = 110; // 'n'
+        a[24] = 32; // ' '
+        a[25] = 49; // '1'
+        a[26] = 59; // ';'
+        a[27] = 125; // '}'
+        a[28] = 114; // 'r'
+        a[29] = 101; // 'e'
+        a[30] = 116; // 't'
+        a[31] = 117; // 'u'
+        a[32] = 114; // 'r'
+        a[33] = 110; // 'n'
+        a[34] = 32; // ' '
+        a[35] = 110; // 'n'
+        a[36] = 42; // '*'
+        a[37] = 102; // 'f'
+        a[38] = 40; // '('
+        a[39] = 110; // 'n'
+        a[40] = 45; // '-'
+        a[41] = 49; // '1'
+        a[42] = 41; // ')'
+        a[43] = 59; // ';'
+        a[44] = 125; // '}'
+        a[45] = 112; // 'p'
+        a[46] = 114; // 'r'
+        a[47] = 105; // 'i'
+        a[48] = 110; // 'n'
+        a[49] = 116; // 't'
+        a[50] = 32; // ' '
+        a[51] = 102; // 'f'
+        a[52] = 40; // '('
+        a[53] = 53; // '5'
+        a[54] = 41; // ')'
+        a[55] = 59; // ';'
+        Eval(a, 56);
+
+        // recursive fibonacci(10) -> 55
+        var b = new int[62];
+        b[0] = 102; // 'f'
+        b[1] = 117; // 'u'
+        b[2] = 110; // 'n'
+        b[3] = 99; // 'c'
+        b[4] = 32; // ' '
+        b[5] = 103; // 'g'
+        b[6] = 40; // '('
+        b[7] = 110; // 'n'
+        b[8] = 41; // ')'
+        b[9] = 123; // '{'
+        b[10] = 105; // 'i'
+        b[11] = 102; // 'f'
+        b[12] = 40; // '('
+        b[13] = 110; // 'n'
+        b[14] = 60; // '<'
+        b[15] = 50; // '2'
+        b[16] = 41; // ')'
+        b[17] = 123; // '{'
+        b[18] = 114; // 'r'
+        b[19] = 101; // 'e'
+        b[20] = 116; // 't'
+        b[21] = 117; // 'u'
+        b[22] = 114; // 'r'
+        b[23] = 110; // 'n'
+        b[24] = 32; // ' '
+        b[25] = 110; // 'n'
+        b[26] = 59; // ';'
+        b[27] = 125; // '}'
+        b[28] = 114; // 'r'
+        b[29] = 101; // 'e'
+        b[30] = 116; // 't'
+        b[31] = 117; // 'u'
+        b[32] = 114; // 'r'
+        b[33] = 110; // 'n'
+        b[34] = 32; // ' '
+        b[35] = 103; // 'g'
+        b[36] = 40; // '('
+        b[37] = 110; // 'n'
+        b[38] = 45; // '-'
+        b[39] = 49; // '1'
+        b[40] = 41; // ')'
+        b[41] = 43; // '+'
+        b[42] = 103; // 'g'
+        b[43] = 40; // '('
+        b[44] = 110; // 'n'
+        b[45] = 45; // '-'
+        b[46] = 50; // '2'
+        b[47] = 41; // ')'
+        b[48] = 59; // ';'
+        b[49] = 125; // '}'
+        b[50] = 112; // 'p'
+        b[51] = 114; // 'r'
+        b[52] = 105; // 'i'
+        b[53] = 110; // 'n'
+        b[54] = 116; // 't'
+        b[55] = 32; // ' '
+        b[56] = 103; // 'g'
+        b[57] = 40; // '('
+        b[58] = 49; // '1'
+        b[59] = 48; // '0'
+        b[60] = 41; // ')'
+        b[61] = 59; // ';'
+        Eval(b, 62);
+
+        // two-arg add(3,4) -> 7
+        var c = new int[37];
+        c[0] = 102; // 'f'
+        c[1] = 117; // 'u'
+        c[2] = 110; // 'n'
+        c[3] = 99; // 'c'
+        c[4] = 32; // ' '
+        c[5] = 97; // 'a'
+        c[6] = 40; // '('
+        c[7] = 120; // 'x'
+        c[8] = 44; // ','
+        c[9] = 121; // 'y'
+        c[10] = 41; // ')'
+        c[11] = 123; // '{'
+        c[12] = 114; // 'r'
+        c[13] = 101; // 'e'
+        c[14] = 116; // 't'
+        c[15] = 117; // 'u'
+        c[16] = 114; // 'r'
+        c[17] = 110; // 'n'
+        c[18] = 32; // ' '
+        c[19] = 120; // 'x'
+        c[20] = 43; // '+'
+        c[21] = 121; // 'y'
+        c[22] = 59; // ';'
+        c[23] = 125; // '}'
+        c[24] = 112; // 'p'
+        c[25] = 114; // 'r'
+        c[26] = 105; // 'i'
+        c[27] = 110; // 'n'
+        c[28] = 116; // 't'
+        c[29] = 32; // ' '
+        c[30] = 97; // 'a'
+        c[31] = 40; // '('
+        c[32] = 51; // '3'
+        c[33] = 44; // ','
+        c[34] = 52; // '4'
+        c[35] = 41; // ')'
+        c[36] = 59; // ';'
+        Eval(c, 37);
+
+        // function with local loop: sum 1..10 -> 55
+        var d = new int[66];
+        d[0] = 102; // 'f'
+        d[1] = 117; // 'u'
+        d[2] = 110; // 'n'
+        d[3] = 99; // 'c'
+        d[4] = 32; // ' '
+        d[5] = 115; // 's'
+        d[6] = 40; // '('
+        d[7] = 110; // 'n'
+        d[8] = 41; // ')'
+        d[9] = 123; // '{'
+        d[10] = 114; // 'r'
+        d[11] = 61; // '='
+        d[12] = 48; // '0'
+        d[13] = 59; // ';'
+        d[14] = 105; // 'i'
+        d[15] = 61; // '='
+        d[16] = 49; // '1'
+        d[17] = 59; // ';'
+        d[18] = 119; // 'w'
+        d[19] = 104; // 'h'
+        d[20] = 105; // 'i'
+        d[21] = 108; // 'l'
+        d[22] = 101; // 'e'
+        d[23] = 40; // '('
+        d[24] = 105; // 'i'
+        d[25] = 60; // '<'
+        d[26] = 110; // 'n'
+        d[27] = 43; // '+'
+        d[28] = 49; // '1'
+        d[29] = 41; // ')'
+        d[30] = 123; // '{'
+        d[31] = 114; // 'r'
+        d[32] = 61; // '='
+        d[33] = 114; // 'r'
+        d[34] = 43; // '+'
+        d[35] = 105; // 'i'
+        d[36] = 59; // ';'
+        d[37] = 105; // 'i'
+        d[38] = 61; // '='
+        d[39] = 105; // 'i'
+        d[40] = 43; // '+'
+        d[41] = 49; // '1'
+        d[42] = 59; // ';'
+        d[43] = 125; // '}'
+        d[44] = 114; // 'r'
+        d[45] = 101; // 'e'
+        d[46] = 116; // 't'
+        d[47] = 117; // 'u'
+        d[48] = 114; // 'r'
+        d[49] = 110; // 'n'
+        d[50] = 32; // ' '
+        d[51] = 114; // 'r'
+        d[52] = 59; // ';'
+        d[53] = 125; // '}'
+        d[54] = 112; // 'p'
+        d[55] = 114; // 'r'
+        d[56] = 105; // 'i'
+        d[57] = 110; // 'n'
+        d[58] = 116; // 't'
+        d[59] = 32; // ' '
+        d[60] = 115; // 's'
+        d[61] = 40; // '('
+        d[62] = 49; // '1'
+        d[63] = 48; // '0'
+        d[64] = 41; // ')'
+        d[65] = 59; // ';'
+        Eval(d, 66);
+
+        Console.WriteLine(2000); // function-call stage end
+    }
+}
