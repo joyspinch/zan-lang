@@ -1,0 +1,769 @@
+using System;
+
+namespace ZanCompiler;
+
+// Tenth self-hosting stage: the operators+algorithms bytecode compiler + VM
+// (stage 9) extended with ARRAYS backed by a shared integer heap. A variable
+// holds a base address; `v[expr]` addresses heap[base + expr] both as an
+// r-value and as an assignment target. Arrays are the first aggregate data
+// structure in the self-hosted mini-language and the prerequisite for the
+// self-hosted compiler to hold real token / node buffers.
+//
+// Opcodes:
+//   0 HALT 1 PUSH 2 LOAD 3 STORE 4 ADD 5 SUB 6 MUL 7 DIV 8 PRINT
+//   9 JMP 10 JZ 11 LT 12 GT 13 CALL 14 RET 15 MOD 16 EQ 17 NE
+//   18 ALOAD 19 ASTORE
+//
+// Token kinds:
+//   0 end 1 num 2 + 3 - 4 * 5 / 6 ( 7 ) 8 ident 9 = 10 ;
+//   11 { 12 } 13 if 14 while 15 print 16 < 17 > 18 func 19 , 20 return
+//   21 % 22 == 23 != 24 [ 25 ]
+class Lexer {
+    public int[] src;
+    public int len;
+    public int pos;
+
+    public Lexer() { }
+
+    void Init(int[] s, int n) { src = s; len = n; pos = 0; }
+
+    int WordKind(int st, int wlen) {
+        if (wlen == 2 && src[st] == 105 && src[st + 1] == 102) { return 13; }
+        if (wlen == 5 && src[st] == 119 && src[st + 1] == 104 &&
+            src[st + 2] == 105 && src[st + 3] == 108 && src[st + 4] == 101) { return 14; }
+        if (wlen == 5 && src[st] == 112 && src[st + 1] == 114 &&
+            src[st + 2] == 105 && src[st + 3] == 110 && src[st + 4] == 116) { return 15; }
+        if (wlen == 4 && src[st] == 102 && src[st + 1] == 117 &&
+            src[st + 2] == 110 && src[st + 3] == 99) { return 18; }
+        if (wlen == 6 && src[st] == 114 && src[st + 1] == 101 && src[st + 2] == 116 &&
+            src[st + 3] == 117 && src[st + 4] == 114 && src[st + 5] == 110) { return 20; }
+        return 8;
+    }
+
+    int Tokenize(int[] kinds, int[] vals) {
+        var n = 0;
+        while (pos < len) {
+            var c = src[pos];
+            if (c == 32) {
+                pos = pos + 1;
+            } else if (c >= 48 && c <= 57) {
+                var v = 0;
+                while (pos < len && src[pos] >= 48 && src[pos] <= 57) {
+                    v = v * 10 + (src[pos] - 48);
+                    pos = pos + 1;
+                }
+                kinds[n] = 1; vals[n] = v; n = n + 1;
+            } else if (c >= 97 && c <= 122) {
+                var st = pos;
+                while (pos < len && src[pos] >= 97 && src[pos] <= 122) { pos = pos + 1; }
+                var wlen = pos - st;
+                var wk = WordKind(st, wlen);
+                kinds[n] = wk;
+                if (wk == 8) { vals[n] = src[st] - 97; }
+                else { vals[n] = 0; }
+                n = n + 1;
+            } else {
+                var k = 0;
+                if (c == 43) { k = 2; }
+                else if (c == 45) { k = 3; }
+                else if (c == 42) { k = 4; }
+                else if (c == 47) { k = 5; }
+                else if (c == 40) { k = 6; }
+                else if (c == 41) { k = 7; }
+                else if (c == 61) {
+                    if (pos + 1 < len && src[pos + 1] == 61) { k = 22; pos = pos + 1; }
+                    else { k = 9; }
+                }
+                else if (c == 33) {
+                    if (pos + 1 < len && src[pos + 1] == 61) { k = 23; pos = pos + 1; }
+                    else { k = 0; }
+                }
+                else if (c == 59) { k = 10; }
+                else if (c == 123) { k = 11; }
+                else if (c == 125) { k = 12; }
+                else if (c == 60) { k = 16; }
+                else if (c == 62) { k = 17; }
+                else if (c == 44) { k = 19; }
+                else if (c == 37) { k = 21; }
+                else if (c == 91) { k = 24; }
+                else if (c == 93) { k = 25; }
+                kinds[n] = k; vals[n] = 0; n = n + 1;
+                pos = pos + 1;
+            }
+        }
+        kinds[n] = 0; vals[n] = 0;
+        return n;
+    }
+}
+
+class Compiler {
+    public int[] kinds;
+    public int[] vals;
+    public int n;
+    public int pos;
+    public int[] code;
+    public int clen;
+    public int[] funcAddr;
+
+    public Compiler() { }
+
+    void Init(int[] k, int[] v, int count, int[] buf, int[] fa) {
+        kinds = k; vals = v; n = count; pos = 0; code = buf; clen = 0; funcAddr = fa;
+    }
+
+    int Kind() { if (pos < n) { return kinds[pos]; } return 0; }
+    int PeekKind() { if (pos + 1 < n) { return kinds[pos + 1]; } return 0; }
+    int Val() { if (pos < n) { return vals[pos]; } return 0; }
+    void Next() { pos = pos + 1; }
+
+    void Emit(int op) { code[clen] = op; clen = clen + 1; }
+
+    void Factor() {
+        if (Kind() == 6) {
+            Next();
+            Add();
+            if (Kind() == 7) { Next(); }
+        } else if (Kind() == 8) {
+            if (PeekKind() == 6) {
+                var f = Val();
+                Next();
+                Next();
+                if (Kind() != 7) {
+                    Cmp();
+                    while (Kind() == 19) { Next(); Cmp(); }
+                }
+                if (Kind() == 7) { Next(); }
+                Emit(13); Emit(funcAddr[f]);
+            } else if (PeekKind() == 24) {
+                var bs = Val();
+                Next();
+                Next();
+                Emit(2); Emit(bs);
+                Cmp();
+                if (Kind() == 25) { Next(); }
+                Emit(4);
+                Emit(18);
+            } else {
+                var idx = Val();
+                Next();
+                Emit(2); Emit(idx);
+            }
+        } else {
+            var x = Val();
+            Next();
+            Emit(1); Emit(x);
+        }
+    }
+
+    void Term() {
+        Factor();
+        while (Kind() == 4 || Kind() == 5 || Kind() == 21) {
+            var op = Kind();
+            Next();
+            Factor();
+            if (op == 4) { Emit(6); }
+            else if (op == 5) { Emit(7); }
+            else { Emit(15); }
+        }
+    }
+
+    void Add() {
+        Term();
+        while (Kind() == 2 || Kind() == 3) {
+            var op = Kind();
+            Next();
+            Term();
+            if (op == 2) { Emit(4); }
+            else { Emit(5); }
+        }
+    }
+
+    void Cmp() {
+        Add();
+        if (Kind() == 16) { Next(); Add(); Emit(11); }
+        else if (Kind() == 17) { Next(); Add(); Emit(12); }
+        else if (Kind() == 22) { Next(); Add(); Emit(16); }
+        else if (Kind() == 23) { Next(); Add(); Emit(17); }
+    }
+
+    void Block() {
+        if (Kind() == 11) { Next(); }
+        while (Kind() != 12 && Kind() != 0) { Stmt(); }
+        if (Kind() == 12) { Next(); }
+    }
+
+    void FuncDef() {
+        Next();
+        var f = Val();
+        Next();
+        var p0 = 0;
+        var p1 = 0;
+        var pc2 = 0;
+        if (Kind() == 6) { Next(); }
+        if (Kind() == 8) {
+            p0 = Val(); Next(); pc2 = 1;
+            if (Kind() == 19) { Next(); p1 = Val(); Next(); pc2 = 2; }
+        }
+        if (Kind() == 7) { Next(); }
+        if (Kind() == 11) { Next(); }
+
+        Emit(9); Emit(0);
+        var skip = clen - 1;
+        funcAddr[f] = clen;
+
+        if (pc2 == 2) {
+            Emit(3); Emit(p1);
+            Emit(3); Emit(p0);
+        } else if (pc2 == 1) {
+            Emit(3); Emit(p0);
+        }
+
+        while (Kind() != 12 && Kind() != 0) { Stmt(); }
+        if (Kind() == 12) { Next(); }
+
+        Emit(1); Emit(0); Emit(14);
+        code[skip] = clen;
+    }
+
+    void Stmt() {
+        var kd = Kind();
+        if (kd == 18) {
+            FuncDef();
+        } else if (kd == 20) {
+            Next();
+            Cmp();
+            if (Kind() == 10) { Next(); }
+            Emit(14);
+        } else if (kd == 13) {
+            Next();
+            if (Kind() == 6) { Next(); }
+            Cmp();
+            if (Kind() == 7) { Next(); }
+            Emit(10); Emit(0);
+            var q = clen - 1;
+            Block();
+            code[q] = clen;
+        } else if (kd == 14) {
+            var loopStart = clen;
+            Next();
+            if (Kind() == 6) { Next(); }
+            Cmp();
+            if (Kind() == 7) { Next(); }
+            Emit(10); Emit(0);
+            var q = clen - 1;
+            Block();
+            Emit(9); Emit(loopStart);
+            code[q] = clen;
+        } else if (kd == 15) {
+            Next();
+            Cmp();
+            if (Kind() == 10) { Next(); }
+            Emit(8);
+        } else if (kd == 8) {
+            if (PeekKind() == 9) {
+                var idx = Val();
+                Next();
+                Next();
+                Cmp();
+                Emit(3); Emit(idx);
+                if (Kind() == 10) { Next(); }
+            } else if (PeekKind() == 24) {
+                var bs = Val();
+                Next();
+                Next();
+                Emit(2); Emit(bs);
+                Cmp();
+                if (Kind() == 25) { Next(); }
+                Emit(4);
+                if (Kind() == 9) {
+                    Next();
+                    Cmp();
+                    Emit(19);
+                } else {
+                    Emit(18);
+                }
+                if (Kind() == 10) { Next(); }
+            } else {
+                Cmp();
+                if (Kind() == 10) { Next(); }
+            }
+        } else {
+            Cmp();
+            if (Kind() == 10) { Next(); }
+        }
+    }
+
+    int Compile() {
+        while (Kind() != 0) { Stmt(); }
+        Emit(0);
+        return clen;
+    }
+}
+
+class VM {
+    public int[] code;
+    public int clen;
+    public int[] stack;
+    public int sp;
+    public int[] locals;
+    public int fp;
+    public int[] retStack;
+    public int[] fpStack;
+    public int csp;
+    public int pc;
+    public int[] heap;
+
+    public VM() { }
+
+    void Init(int[] c, int len, int[] st, int[] lo, int[] rs, int[] fs, int[] hp) {
+        code = c; clen = len; stack = st; sp = 0;
+        locals = lo; fp = 0; retStack = rs; fpStack = fs; csp = 0; pc = 0; heap = hp;
+    }
+
+    void Run() {
+        while (pc < clen) {
+            var op = code[pc];
+            pc = pc + 1;
+            if (op == 0) { return; }
+            else if (op == 1) { stack[sp] = code[pc]; pc = pc + 1; sp = sp + 1; }
+            else if (op == 2) { stack[sp] = locals[fp + code[pc]]; pc = pc + 1; sp = sp + 1; }
+            else if (op == 3) { sp = sp - 1; locals[fp + code[pc]] = stack[sp]; pc = pc + 1; }
+            else if (op == 4) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a + b; }
+            else if (op == 5) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a - b; }
+            else if (op == 6) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a * b; }
+            else if (op == 7) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a / b; }
+            else if (op == 8) { sp = sp - 1; Console.WriteLine(stack[sp]); }
+            else if (op == 9) { pc = code[pc]; }
+            else if (op == 10) { var t = code[pc]; pc = pc + 1; sp = sp - 1; if (stack[sp] == 0) { pc = t; } }
+            else if (op == 11) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; if (a < b) { stack[sp - 1] = 1; } else { stack[sp - 1] = 0; } }
+            else if (op == 12) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; if (a > b) { stack[sp - 1] = 1; } else { stack[sp - 1] = 0; } }
+            else if (op == 13) { var target = code[pc]; pc = pc + 1; retStack[csp] = pc; fpStack[csp] = fp; csp = csp + 1; fp = fp + 26; pc = target; }
+            else if (op == 14) { csp = csp - 1; pc = retStack[csp]; fp = fpStack[csp]; }
+            else if (op == 15) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; stack[sp - 1] = a - a / b * b; }
+            else if (op == 16) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; if (a == b) { stack[sp - 1] = 1; } else { stack[sp - 1] = 0; } }
+            else if (op == 17) { var b = stack[sp - 1]; var a = stack[sp - 2]; sp = sp - 1; if (a != b) { stack[sp - 1] = 1; } else { stack[sp - 1] = 0; } }
+            else if (op == 18) { stack[sp - 1] = heap[stack[sp - 1]]; }
+            else if (op == 19) { sp = sp - 1; var val = stack[sp]; sp = sp - 1; var addr = stack[sp]; heap[addr] = val; }
+        }
+    }
+}
+
+class Program {
+    static void Eval(int[] src, int len) {
+        var lex = new Lexer();
+        lex.Init(src, len);
+        var kinds = new int[512];
+        var vals = new int[512];
+        var cnt = lex.Tokenize(kinds, vals);
+
+        var code = new int[2048];
+        var funcAddr = new int[26];
+        var comp = new Compiler();
+        comp.Init(kinds, vals, cnt, code, funcAddr);
+        var clen = comp.Compile();
+
+        var stack = new int[256];
+        var locals = new int[2048];
+        var retStack = new int[256];
+        var fpStack = new int[256];
+        var heap = new int[4096];
+        var vm = new VM();
+        vm.Init(code, clen, stack, locals, retStack, fpStack, heap);
+        vm.Run();
+    }
+
+    static void Main() {
+        Console.WriteLine(1600); // arrays stage start
+
+        var a = new int[71];
+        a[0] = 112; // 'p'
+        a[1] = 61; // '='
+        a[2] = 48; // '0'
+        a[3] = 59; // ';'
+        a[4] = 112; // 'p'
+        a[5] = 91; // '['
+        a[6] = 48; // '0'
+        a[7] = 93; // ']'
+        a[8] = 61; // '='
+        a[9] = 48; // '0'
+        a[10] = 59; // ';'
+        a[11] = 112; // 'p'
+        a[12] = 91; // '['
+        a[13] = 49; // '1'
+        a[14] = 93; // ']'
+        a[15] = 61; // '='
+        a[16] = 49; // '1'
+        a[17] = 59; // ';'
+        a[18] = 105; // 'i'
+        a[19] = 61; // '='
+        a[20] = 50; // '2'
+        a[21] = 59; // ';'
+        a[22] = 119; // 'w'
+        a[23] = 104; // 'h'
+        a[24] = 105; // 'i'
+        a[25] = 108; // 'l'
+        a[26] = 101; // 'e'
+        a[27] = 40; // '('
+        a[28] = 105; // 'i'
+        a[29] = 60; // '<'
+        a[30] = 49; // '1'
+        a[31] = 48; // '0'
+        a[32] = 41; // ')'
+        a[33] = 123; // '{'
+        a[34] = 112; // 'p'
+        a[35] = 91; // '['
+        a[36] = 105; // 'i'
+        a[37] = 93; // ']'
+        a[38] = 61; // '='
+        a[39] = 112; // 'p'
+        a[40] = 91; // '['
+        a[41] = 105; // 'i'
+        a[42] = 45; // '-'
+        a[43] = 49; // '1'
+        a[44] = 93; // ']'
+        a[45] = 43; // '+'
+        a[46] = 112; // 'p'
+        a[47] = 91; // '['
+        a[48] = 105; // 'i'
+        a[49] = 45; // '-'
+        a[50] = 50; // '2'
+        a[51] = 93; // ']'
+        a[52] = 59; // ';'
+        a[53] = 105; // 'i'
+        a[54] = 61; // '='
+        a[55] = 105; // 'i'
+        a[56] = 43; // '+'
+        a[57] = 49; // '1'
+        a[58] = 59; // ';'
+        a[59] = 125; // '}'
+        a[60] = 112; // 'p'
+        a[61] = 114; // 'r'
+        a[62] = 105; // 'i'
+        a[63] = 110; // 'n'
+        a[64] = 116; // 't'
+        a[65] = 32; // ' '
+        a[66] = 112; // 'p'
+        a[67] = 91; // '['
+        a[68] = 57; // '9'
+        a[69] = 93; // ']'
+        a[70] = 59; // ';'
+        Eval(a, 71);
+
+        var b = new int[78];
+        b[0] = 112; // 'p'
+        b[1] = 61; // '='
+        b[2] = 48; // '0'
+        b[3] = 59; // ';'
+        b[4] = 105; // 'i'
+        b[5] = 61; // '='
+        b[6] = 48; // '0'
+        b[7] = 59; // ';'
+        b[8] = 119; // 'w'
+        b[9] = 104; // 'h'
+        b[10] = 105; // 'i'
+        b[11] = 108; // 'l'
+        b[12] = 101; // 'e'
+        b[13] = 40; // '('
+        b[14] = 105; // 'i'
+        b[15] = 60; // '<'
+        b[16] = 53; // '5'
+        b[17] = 41; // ')'
+        b[18] = 123; // '{'
+        b[19] = 112; // 'p'
+        b[20] = 91; // '['
+        b[21] = 105; // 'i'
+        b[22] = 93; // ']'
+        b[23] = 61; // '='
+        b[24] = 105; // 'i'
+        b[25] = 42; // '*'
+        b[26] = 105; // 'i'
+        b[27] = 59; // ';'
+        b[28] = 105; // 'i'
+        b[29] = 61; // '='
+        b[30] = 105; // 'i'
+        b[31] = 43; // '+'
+        b[32] = 49; // '1'
+        b[33] = 59; // ';'
+        b[34] = 125; // '}'
+        b[35] = 115; // 's'
+        b[36] = 61; // '='
+        b[37] = 48; // '0'
+        b[38] = 59; // ';'
+        b[39] = 105; // 'i'
+        b[40] = 61; // '='
+        b[41] = 48; // '0'
+        b[42] = 59; // ';'
+        b[43] = 119; // 'w'
+        b[44] = 104; // 'h'
+        b[45] = 105; // 'i'
+        b[46] = 108; // 'l'
+        b[47] = 101; // 'e'
+        b[48] = 40; // '('
+        b[49] = 105; // 'i'
+        b[50] = 60; // '<'
+        b[51] = 53; // '5'
+        b[52] = 41; // ')'
+        b[53] = 123; // '{'
+        b[54] = 115; // 's'
+        b[55] = 61; // '='
+        b[56] = 115; // 's'
+        b[57] = 43; // '+'
+        b[58] = 112; // 'p'
+        b[59] = 91; // '['
+        b[60] = 105; // 'i'
+        b[61] = 93; // ']'
+        b[62] = 59; // ';'
+        b[63] = 105; // 'i'
+        b[64] = 61; // '='
+        b[65] = 105; // 'i'
+        b[66] = 43; // '+'
+        b[67] = 49; // '1'
+        b[68] = 59; // ';'
+        b[69] = 125; // '}'
+        b[70] = 112; // 'p'
+        b[71] = 114; // 'r'
+        b[72] = 105; // 'i'
+        b[73] = 110; // 'n'
+        b[74] = 116; // 't'
+        b[75] = 32; // ' '
+        b[76] = 115; // 's'
+        b[77] = 59; // ';'
+        Eval(b, 78);
+
+        var d = new int[122];
+        d[0] = 112; // 'p'
+        d[1] = 61; // '='
+        d[2] = 48; // '0'
+        d[3] = 59; // ';'
+        d[4] = 112; // 'p'
+        d[5] = 91; // '['
+        d[6] = 48; // '0'
+        d[7] = 93; // ']'
+        d[8] = 61; // '='
+        d[9] = 49; // '1'
+        d[10] = 48; // '0'
+        d[11] = 59; // ';'
+        d[12] = 112; // 'p'
+        d[13] = 91; // '['
+        d[14] = 49; // '1'
+        d[15] = 93; // ']'
+        d[16] = 61; // '='
+        d[17] = 50; // '2'
+        d[18] = 48; // '0'
+        d[19] = 59; // ';'
+        d[20] = 112; // 'p'
+        d[21] = 91; // '['
+        d[22] = 50; // '2'
+        d[23] = 93; // ']'
+        d[24] = 61; // '='
+        d[25] = 51; // '3'
+        d[26] = 48; // '0'
+        d[27] = 59; // ';'
+        d[28] = 112; // 'p'
+        d[29] = 91; // '['
+        d[30] = 51; // '3'
+        d[31] = 93; // ']'
+        d[32] = 61; // '='
+        d[33] = 52; // '4'
+        d[34] = 48; // '0'
+        d[35] = 59; // ';'
+        d[36] = 112; // 'p'
+        d[37] = 91; // '['
+        d[38] = 52; // '4'
+        d[39] = 93; // ']'
+        d[40] = 61; // '='
+        d[41] = 53; // '5'
+        d[42] = 48; // '0'
+        d[43] = 59; // ';'
+        d[44] = 105; // 'i'
+        d[45] = 61; // '='
+        d[46] = 48; // '0'
+        d[47] = 59; // ';'
+        d[48] = 106; // 'j'
+        d[49] = 61; // '='
+        d[50] = 52; // '4'
+        d[51] = 59; // ';'
+        d[52] = 119; // 'w'
+        d[53] = 104; // 'h'
+        d[54] = 105; // 'i'
+        d[55] = 108; // 'l'
+        d[56] = 101; // 'e'
+        d[57] = 40; // '('
+        d[58] = 105; // 'i'
+        d[59] = 60; // '<'
+        d[60] = 106; // 'j'
+        d[61] = 41; // ')'
+        d[62] = 123; // '{'
+        d[63] = 116; // 't'
+        d[64] = 61; // '='
+        d[65] = 112; // 'p'
+        d[66] = 91; // '['
+        d[67] = 105; // 'i'
+        d[68] = 93; // ']'
+        d[69] = 59; // ';'
+        d[70] = 112; // 'p'
+        d[71] = 91; // '['
+        d[72] = 105; // 'i'
+        d[73] = 93; // ']'
+        d[74] = 61; // '='
+        d[75] = 112; // 'p'
+        d[76] = 91; // '['
+        d[77] = 106; // 'j'
+        d[78] = 93; // ']'
+        d[79] = 59; // ';'
+        d[80] = 112; // 'p'
+        d[81] = 91; // '['
+        d[82] = 106; // 'j'
+        d[83] = 93; // ']'
+        d[84] = 61; // '='
+        d[85] = 116; // 't'
+        d[86] = 59; // ';'
+        d[87] = 105; // 'i'
+        d[88] = 61; // '='
+        d[89] = 105; // 'i'
+        d[90] = 43; // '+'
+        d[91] = 49; // '1'
+        d[92] = 59; // ';'
+        d[93] = 106; // 'j'
+        d[94] = 61; // '='
+        d[95] = 106; // 'j'
+        d[96] = 45; // '-'
+        d[97] = 49; // '1'
+        d[98] = 59; // ';'
+        d[99] = 125; // '}'
+        d[100] = 112; // 'p'
+        d[101] = 114; // 'r'
+        d[102] = 105; // 'i'
+        d[103] = 110; // 'n'
+        d[104] = 116; // 't'
+        d[105] = 32; // ' '
+        d[106] = 112; // 'p'
+        d[107] = 91; // '['
+        d[108] = 48; // '0'
+        d[109] = 93; // ']'
+        d[110] = 59; // ';'
+        d[111] = 112; // 'p'
+        d[112] = 114; // 'r'
+        d[113] = 105; // 'i'
+        d[114] = 110; // 'n'
+        d[115] = 116; // 't'
+        d[116] = 32; // ' '
+        d[117] = 112; // 'p'
+        d[118] = 91; // '['
+        d[119] = 52; // '4'
+        d[120] = 93; // ']'
+        d[121] = 59; // ';'
+        Eval(d, 122);
+
+        var e = new int[107];
+        e[0] = 102; // 'f'
+        e[1] = 117; // 'u'
+        e[2] = 110; // 'n'
+        e[3] = 99; // 'c'
+        e[4] = 32; // ' '
+        e[5] = 102; // 'f'
+        e[6] = 40; // '('
+        e[7] = 110; // 'n'
+        e[8] = 41; // ')'
+        e[9] = 123; // '{'
+        e[10] = 112; // 'p'
+        e[11] = 61; // '='
+        e[12] = 48; // '0'
+        e[13] = 59; // ';'
+        e[14] = 105; // 'i'
+        e[15] = 61; // '='
+        e[16] = 48; // '0'
+        e[17] = 59; // ';'
+        e[18] = 119; // 'w'
+        e[19] = 104; // 'h'
+        e[20] = 105; // 'i'
+        e[21] = 108; // 'l'
+        e[22] = 101; // 'e'
+        e[23] = 40; // '('
+        e[24] = 105; // 'i'
+        e[25] = 60; // '<'
+        e[26] = 110; // 'n'
+        e[27] = 41; // ')'
+        e[28] = 123; // '{'
+        e[29] = 112; // 'p'
+        e[30] = 91; // '['
+        e[31] = 105; // 'i'
+        e[32] = 93; // ']'
+        e[33] = 61; // '='
+        e[34] = 105; // 'i'
+        e[35] = 43; // '+'
+        e[36] = 49; // '1'
+        e[37] = 59; // ';'
+        e[38] = 105; // 'i'
+        e[39] = 61; // '='
+        e[40] = 105; // 'i'
+        e[41] = 43; // '+'
+        e[42] = 49; // '1'
+        e[43] = 59; // ';'
+        e[44] = 125; // '}'
+        e[45] = 114; // 'r'
+        e[46] = 101; // 'e'
+        e[47] = 116; // 't'
+        e[48] = 117; // 'u'
+        e[49] = 114; // 'r'
+        e[50] = 110; // 'n'
+        e[51] = 32; // ' '
+        e[52] = 110; // 'n'
+        e[53] = 59; // ';'
+        e[54] = 125; // '}'
+        e[55] = 102; // 'f'
+        e[56] = 40; // '('
+        e[57] = 53; // '5'
+        e[58] = 41; // ')'
+        e[59] = 59; // ';'
+        e[60] = 113; // 'q'
+        e[61] = 61; // '='
+        e[62] = 48; // '0'
+        e[63] = 59; // ';'
+        e[64] = 115; // 's'
+        e[65] = 61; // '='
+        e[66] = 48; // '0'
+        e[67] = 59; // ';'
+        e[68] = 105; // 'i'
+        e[69] = 61; // '='
+        e[70] = 48; // '0'
+        e[71] = 59; // ';'
+        e[72] = 119; // 'w'
+        e[73] = 104; // 'h'
+        e[74] = 105; // 'i'
+        e[75] = 108; // 'l'
+        e[76] = 101; // 'e'
+        e[77] = 40; // '('
+        e[78] = 105; // 'i'
+        e[79] = 60; // '<'
+        e[80] = 53; // '5'
+        e[81] = 41; // ')'
+        e[82] = 123; // '{'
+        e[83] = 115; // 's'
+        e[84] = 61; // '='
+        e[85] = 115; // 's'
+        e[86] = 43; // '+'
+        e[87] = 113; // 'q'
+        e[88] = 91; // '['
+        e[89] = 105; // 'i'
+        e[90] = 93; // ']'
+        e[91] = 59; // ';'
+        e[92] = 105; // 'i'
+        e[93] = 61; // '='
+        e[94] = 105; // 'i'
+        e[95] = 43; // '+'
+        e[96] = 49; // '1'
+        e[97] = 59; // ';'
+        e[98] = 125; // '}'
+        e[99] = 112; // 'p'
+        e[100] = 114; // 'r'
+        e[101] = 105; // 'i'
+        e[102] = 110; // 'n'
+        e[103] = 116; // 't'
+        e[104] = 32; // ' '
+        e[105] = 115; // 's'
+        e[106] = 59; // ';'
+        Eval(e, 107);
+        Console.WriteLine(600); // arrays stage end
+    }
+}

@@ -353,13 +353,14 @@ Self-contained IDE bundled with the compiler (single executable).
     | 7 | `selfvmcf.zan` | bytecode control flow: `JMP`/`JZ` with backpatching for `if`/`while` |
     | 8 | `selfvmfn.zan` | function calls: `CALL`/`RET`, per-call frames, recursion (factorial, Fibonacci) |
     | 9 | `selfvmops.zan` | `%`/`==`/`!=` operators; compiles GCD and primality to bytecode |
+    | 10 | `selfvmarr.zan` | arrays over a shared heap (`ALOAD`/`ASTORE`, `v[expr]` load/store); Fibonacci table, in-place reverse, array fill in a function |
 
   - Enabling compiler fixes (all landed): short-circuit `&&`/`||` in
     control-flow conditions, array-typed parameters (`int[]`), explicit
     (`obj.field[i]`) and implicit-`this` (`field[i]`) array-field indexing,
     forward-referenced method calls (two-pass declare/emit), and a UTF-8 BOM
     skip in the lexer. With these, Zan is expressive enough to host a complete
-    bytecode compiler and virtual machine. Remaining work toward full
+    bytecode compiler and virtual machine with heap-backed arrays. Remaining work toward full
     self-compilation of the C front-end is tracked as it progresses.
 
 ---

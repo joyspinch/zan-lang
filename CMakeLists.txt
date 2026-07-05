@@ -142,7 +142,7 @@ endforeach()
 # ---- Self-hosting regression: golden outputs for each bootstrap stage ----
 foreach(_stage
     selfhost selfparse selfpipe selfvars selfctrl
-    selfvm selfvmcf selfvmfn selfvmops)
+    selfvm selfvmcf selfvmfn selfvmops selfvmarr)
   add_test(NAME selfhost_${_stage}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -166,7 +166,7 @@ foreach(_src ${_conf_srcs})
 endforeach()
 foreach(_stage
     selfhost selfparse selfpipe selfvars selfctrl
-    selfvm selfvmcf selfvmfn selfvmops)
+    selfvm selfvmcf selfvmfn selfvmops selfvmarr)
   add_test(NAME determinism_${_stage}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
