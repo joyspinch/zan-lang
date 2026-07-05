@@ -164,6 +164,21 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         return b->type_error;
     }
 
+    /* carry generic arguments (e.g. List<Node>, Dict<K,V>) onto the fresh
+     * built-in generic type so codegen can recover the element type. */
+    if ((istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
+         istr_eq(name, "Dictionary", 10)) &&
+        type_ref->type_ref.type_args.count > 0) {
+        int nargs = type_ref->type_ref.type_args.count;
+        base->type_args = (zan_type_t **)zan_arena_alloc(
+            b->arena, sizeof(zan_type_t *) * (size_t)nargs);
+        base->type_arg_count = nargs;
+        for (int i = 0; i < nargs; i++) {
+            base->type_args[i] = zan_binder_resolve_type(
+                b, type_ref->type_ref.type_args.items[i]);
+        }
+    }
+
     zan_type_t *resolved = base;
     /* wrap in array if needed */
     if (type_ref->type_ref.is_array) {

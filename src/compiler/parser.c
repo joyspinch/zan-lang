@@ -57,6 +57,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p);
 static zan_ast_node_t *parse_block(zan_parser_t *p);
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p);
 static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers);
+static zan_ast_node_t *parse_unary(zan_parser_t *p);
 
 /* ---- qualified name: a.b.c ---- */
 
@@ -287,6 +288,22 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_LPAREN: {
+        /* C-style cast: (PrimitiveType) unary — primitive keywords cannot
+         * begin a parenthesized expression, so this is unambiguous. */
+        switch (zan_lexer_peek(p->lex).kind) {
+        case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
+        case TK_DOUBLE: case TK_FLOAT: case TK_BOOL: case TK_CHAR: {
+            parser_advance(p); /* ( */
+            zan_ast_node_t *ctype = parse_type_ref(p);
+            parser_expect(p, TK_RPAREN);
+            zan_ast_node_t *coperand = parse_unary(p);
+            zan_ast_node_t *cn = zan_ast_new(p->arena, AST_CAST_EXPR, loc);
+            cn->cast.type = ctype;
+            cn->cast.expr = coperand;
+            return cn;
+        }
+        default: break;
+        }
         /* could be grouped expression or lambda: (params) => expr */
         /* save lexer state to try lambda parse */
         parser_advance(p); /* ( */
@@ -642,9 +659,24 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         /* could be type or expression; peek for identifier after */
         zan_token_t peek = zan_lexer_peek(p->lex);
         /* save lexer state is handled by peek */
-        /* heuristic: ident followed by ident, <, [, ? likely a type declaration */
+        /* heuristic: ident followed by ident or `<` is likely a type declaration */
         if (peek.kind == TK_IDENT || peek.kind == TK_LESS) {
             return true;
+        }
+        /* `Ident[] name` (array-typed decl) vs `arr[i]` (index expression):
+         * only a declaration when the brackets are empty. Scan the raw source
+         * after the current identifier for a `[` immediately followed by `]`. */
+        if (peek.kind == TK_LBRACKET) {
+            const char *s = p->lex->source;
+            size_t q = p->lex->pos, n = p->lex->source_len;
+            while (q < n && (s[q] == ' ' || s[q] == '\t' ||
+                             s[q] == '\r' || s[q] == '\n')) q++;
+            if (q < n && s[q] == '[') {
+                q++;
+                while (q < n && (s[q] == ' ' || s[q] == '\t' ||
+                                 s[q] == '\r' || s[q] == '\n')) q++;
+                if (q < n && s[q] == ']') return true;
+            }
         }
         return false;
     }

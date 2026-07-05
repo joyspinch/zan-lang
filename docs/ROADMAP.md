@@ -334,35 +334,43 @@ Self-contained IDE bundled with the compiler (single executable).
   - Source-based packages (git URL + version)
   - Local package cache
 
-- [x] **M7.6 — Self-hosting** *(in progress)*
-  - Rewrite compiler in Zan
-  - Bootstrap verification (gen2 == gen3)
-  - Progress: a staged suite under `src/self/`, each program **written in Zan**
-    and verified by compiling with `zanc` and running the produced native
-    executable. The stages build up from a tokenizer to a full bytecode
-    compiler + VM with functions and recursion:
+- [ ] **M7.6 — Self-hosting** *(in progress)*
 
-    | Stage | File | Demonstrates |
-    |-------|------|--------------|
-    | 1 | `selfhost.zan` | real-buffer tokenizer, exact token counts vs the C front-end |
-    | 2 | `selfparse.zan` | recursive-descent expression evaluator (precedence, parens) |
-    | 3 | `selfpipe.zan` | lexer → parser pipeline (tokens to parallel `kinds[]`/`vals[]` arrays) |
-    | 4 | `selfvars.zan` | variables + statements over an array-backed symbol table |
-    | 5 | `selfctrl.zan` | mini-language interpreter: `if`/`while`/`print`, comparisons, brace blocks |
-    | 6 | `selfvm.zan` | bytecode compiler + stack VM (compilation separated from execution) |
-    | 7 | `selfvmcf.zan` | bytecode control flow: `JMP`/`JZ` with backpatching for `if`/`while` |
-    | 8 | `selfvmfn.zan` | function calls: `CALL`/`RET`, per-call frames, recursion (factorial, Fibonacci) |
-    | 9 | `selfvmops.zan` | `%`/`==`/`!=` operators; compiles GCD and primality to bytecode |
-    | 10 | `selfvmarr.zan` | arrays over a shared heap (`ALOAD`/`ASTORE`, `v[expr]` load/store); Fibonacci table, in-place reverse, array fill in a function |
-    | 11 | `selfvmelse.zan` | `else` clauses on `if` (two-way control flow via JZ/JMP backpatching); max/min, sign with negatives, even/odd classifier |
+  **Goal:** a faithful Zan re-implementation of the C compiler (`src/compiler/`),
+  compiling the full language defined in `SPEC.md`, that ultimately compiles its
+  own source. This supersedes the earlier staged `src/self/` demonstration suite
+  (removed): that suite proved growing language expressiveness on fixed inputs but
+  was not a general compiler (per-input logic, hard-coded fixed-size stack buffers,
+  everything modelled as `i64`). The self-hosted compiler is a real, general
+  compiler with heap-backed growable data structures and located diagnostics.
 
-  - Enabling compiler fixes (all landed): short-circuit `&&`/`||` in
-    control-flow conditions, array-typed parameters (`int[]`), explicit
-    (`obj.field[i]`) and implicit-`this` (`field[i]`) array-field indexing,
-    forward-referenced method calls (two-pass declare/emit), and a UTF-8 BOM
-    skip in the lexer. With these, Zan is expressive enough to host a complete
-    bytecode compiler and virtual machine with heap-backed arrays. Remaining work toward full
-    self-compilation of the C front-end is tracked as it progresses.
+  **Location:** `src/selfhost/`, mirroring the C module layout —
+  `diag / source / token / lexer / ast / parser / binder / checker / irgen /
+  driver / main` (`.zan`).
+
+  **Backend:** emit textual LLVM IR; `clang` lowers it to a native executable
+  (equivalent to the C compiler driving the LLVM C API).
+
+  **Bootstrap subset:** the compiler's own source is written in a general subset
+  (namespaces, classes with methods/fields, `enum`, arrays + a growable `List`,
+  `string`, full control flow incl. `switch`, recursion). This subset is enough
+  to express a compiler and does not require generics/async/exceptions/lambdas;
+  those are still implemented so the compiler *accepts* them per `SPEC.md`.
+
+  **Milestones (by language level, each with acceptance tests):**
+
+  | Level | Scope |
+  |-------|-------|
+  | L0 | scaffold: `driver` reads a file, parses args, emits an (empty) module; CMake + clang link skeleton |
+  | L1 | lexer: full `SPEC.md` token set (keywords, literals, escapes, comments, interpolation) |
+  | L2 | parser + AST: declarations, statements, Pratt expressions |
+  | L3 | binder + checker: symbol table, scopes, type representation, checking/inference |
+  | L4 | IR backend: classes/structs/arrays/methods, minimal ARC, control flow, strings |
+  | L5 | self-host closure: output parity with the C `zanc` on the conformance suite → compiles its own source → **gen2 == gen3** byte-identical |
+
+  **Bootstrap chain:** gen0 = C `zanc` (host) → gen1 = gen0 compiling the Zan
+  compiler → gen2 = gen1 compiling itself → gen3 = gen2 compiling itself; assert
+  gen2 == gen3.
 
 ---
 
