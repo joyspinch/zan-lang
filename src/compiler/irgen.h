@@ -81,6 +81,11 @@ struct zan_irgen {
     LLVMValueRef fn_atexit;       /* int atexit(void(*)(void)) */
     LLVMTypeRef  atexit_type;
     LLVMValueRef g_live;          /* i64 global: net live ARC allocations */
+    LLVMValueRef g_site_live;     /* [N x i64] global: live count per alloc site */
+    LLVMValueRef g_site_names;    /* [N x i8*] global: "file:line:col" per site */
+    LLVMTypeRef  site_live_type;  /* [N x i64] array type */
+    LLVMTypeRef  site_names_type; /* [N x i8*] array type */
+    int          leak_site_count; /* number of distinct `new` sites assigned */
     LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */

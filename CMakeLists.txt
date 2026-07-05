@@ -108,3 +108,41 @@ add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan
 add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast)
 add_test(NAME test_emit_ir_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --emit-ir)
 add_test(NAME test_compile_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan -o ${CMAKE_BINARY_DIR}/hello_test)
+
+# ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
+if(WIN32)
+  set(_exe_ext ".exe")
+else()
+  set(_exe_ext "")
+endif()
+
+file(GLOB _conf_srcs ${CMAKE_SOURCE_DIR}/tests/conformance/*.zan)
+foreach(_src ${_conf_srcs})
+  get_filename_component(_name ${_src} NAME_WE)
+  add_test(NAME conformance_${_name}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_src}
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/${_name}.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_${_name}${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+endforeach()
+
+# ---- Self-hosting regression: golden outputs for each bootstrap stage ----
+foreach(_stage
+    selfhost selfparse selfpipe selfvars selfctrl
+    selfvm selfvmcf selfvmfn selfvmops)
+  add_test(NAME selfhost_${_stage}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/src/self/${_stage}.zan
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/${_stage}.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/self_${_stage}${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+endforeach()
+
+# ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
+add_test(NAME diag_no_runaway
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)
+set_tests_properties(diag_no_runaway PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 20)

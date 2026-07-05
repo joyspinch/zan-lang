@@ -605,9 +605,16 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
     zan_ast_list_init(&block->block.stmts);
 
     while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+        uint32_t before = p->current.loc.offset;
         zan_ast_node_t *stmt = parse_statement(p);
         if (stmt) {
             zan_ast_list_push(&block->block.stmts, stmt, p->arena);
+        }
+        /* guarantee forward progress: if a malformed statement was not
+         * consumed, skip a token so error recovery can't spin forever
+         * (previously this looped, allocating until OOM). */
+        if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+            parser_advance(p);
         }
     }
 
@@ -847,8 +854,12 @@ static zan_ast_node_t *parse_switch_stmt(zan_parser_t *p) {
         zan_ast_list_init(&body_block->block.stmts);
         while (!parser_check(p, TK_CASE) && !parser_check(p, TK_DEFAULT) &&
                !parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+            uint32_t before = p->current.loc.offset;
             zan_ast_node_t *stmt = parse_statement(p);
             zan_ast_list_push(&body_block->block.stmts, stmt, p->arena);
+            if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+                parser_advance(p);
+            }
         }
 
         zan_ast_node_t *sc = zan_ast_new(p->arena, AST_SWITCH_CASE, case_loc);
@@ -1370,9 +1381,15 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     } else {
         parser_expect(p, TK_LBRACE);
         while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+            uint32_t before = p->current.loc.offset;
             zan_ast_node_t *member = parse_member_decl(p);
             if (member) {
                 zan_ast_list_push(&members, member, p->arena);
+            }
+            /* forward-progress guard: a member that fails to parse without
+             * consuming its offending token must not spin the loop. */
+            if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+                parser_advance(p);
             }
         }
         parser_expect(p, TK_RBRACE);

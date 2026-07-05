@@ -94,13 +94,19 @@ compiler front-end uses for compile-time diagnostics.
 
 `zanc` allocates class instances via `zan_rt_alloc`, which maintains a net
 live-object counter (`+1` on alloc, `-1` when a reference count hits zero and
-the object is freed). With `--check-leaks`, an `atexit` handler prints any
-non-zero balance — e.g. an unbroken reference cycle:
+the object is freed). Each object also carries a 16-byte header recording the
+**allocation site** (a stable index whose `file:line:col` descriptor is kept in
+a side table), so leaks can be attributed to the exact `new` that produced them.
+
+With `--check-leaks`, an `atexit` handler prints the total imbalance followed by
+a per-allocation-site breakdown — e.g. an unbroken reference cycle:
 
 ```
 $ zanc cycle.zan -o cycle --check-leaks && ./cycle
 0
 zan: memory leak detected: 2 object(s) still reachable at exit
+  1 object(s) leaked, allocated at cycle.zan:22:18
+  1 object(s) leaked, allocated at cycle.zan:23:18
 ```
 
 Correct programs whose objects are all released report nothing, so the check
