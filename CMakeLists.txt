@@ -17,6 +17,9 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 llvm_map_components_to_libnames(LLVM_LIBS
     core support analysis bitwriter target
     x86codegen x86asmparser x86desc x86info
+    aarch64codegen aarch64asmparser aarch64desc aarch64info
+    webassemblycodegen webassemblyasmparser webassemblydesc webassemblyinfo
+    armcodegen armasmparser armdesc arminfo
     passes
 )
 
@@ -34,10 +37,14 @@ add_executable(zanc
     src/compiler/optimizer.c
     src/compiler/incremental.c
     src/compiler/package.c
+    src/compiler/stdlib_ext.c
+    src/compiler/crosscomp.c
 )
 target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
 if(MSVC)
-    target_link_libraries(zanc PRIVATE ${LLVM_LIBS})
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} winhttp)
+elseif(WIN32)
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} -lwinhttp)
 else()
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} stdc++ m pthread)
 endif()
@@ -62,26 +69,7 @@ endif()
 # ---- Tests ----
 enable_testing()
 
-# Test: dump tokens for hello.zan
-add_test(
-    NAME test_lex_hello
-    COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-tokens
-)
-
-# Test: dump AST for hello.zan
-add_test(
-    NAME test_parse_hello
-    COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast
-)
-
-# Test: compile hello.zan to IR
-add_test(
-    NAME test_emit_ir_hello
-    COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --emit-ir
-)
-
-# Test: compile hello.zan to executable
-add_test(
-    NAME test_compile_hello
-    COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan -o ${CMAKE_BINARY_DIR}/hello_test
-)
+add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-tokens)
+add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast)
+add_test(NAME test_emit_ir_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --emit-ir)
+add_test(NAME test_compile_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan -o ${CMAKE_BINARY_DIR}/hello_test)
