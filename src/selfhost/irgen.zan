@@ -17,8 +17,8 @@ class ExprVal {
 class Irgen {
     public Binder binder;
     public Diags diags;
-    public string head;
-    public string body;
+    public StringBuilder head;
+    public StringBuilder body;
     public int tmp;
     public int lbl;
     public int strn;
@@ -36,7 +36,7 @@ class Irgen {
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
-        head = ""; body = "";
+        head = new StringBuilder(); body = new StringBuilder();
         tmp = 0; lbl = 0; strn = 0; term = false;
         curClass = ""; curRet = "void"; curHasThis = false;
         locName = new List<string>();
@@ -49,9 +49,9 @@ class Irgen {
 
     string NT() { tmp = tmp + 1; return "%t" + tmp; }
     int NL() { lbl = lbl + 1; return lbl; }
-    void L(string s) { body = body + s + "\n"; }
-    void H(string s) { head = head + s + "\n"; }
-    void Label(int n) { body = body + "L" + n + ":\n"; term = false; curLbl = "L" + n; }
+    void L(string s) { body.Append(s); body.Append("\n"); }
+    void H(string s) { head.Append(s); head.Append("\n"); }
+    void Label(int n) { body.Append("L" + n + ":\n"); term = false; curLbl = "L" + n; }
 
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
 
@@ -65,6 +65,7 @@ class Irgen {
         if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short") { return "i64"; }
         if (n == "object" || n == "var") { return "i8*"; }
         if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
+        if (n == "StringBuilder") { return "i8*"; }
         Node d = binder.FindType(n);
         if (d != null) {
             if (d.kind == AK.EnumDecl()) { return "i64"; }
@@ -84,6 +85,12 @@ class Irgen {
     bool IsListType(Node t) {
         if (t == null) { return false; }
         if (t.sval == "List") { return true; }
+        return false;
+    }
+
+    bool IsSbType(Node t) {
+        if (t == null) { return false; }
+        if (t.sval == "StringBuilder") { return true; }
         return false;
     }
 
@@ -205,6 +212,7 @@ class Irgen {
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
         EmitListRuntime();
+        EmitSbRuntime();
         // struct type decls first
         int i = 0;
         while (i < unit.kids.Count) {
@@ -220,7 +228,7 @@ class Irgen {
             i = i + 1;
         }
         GenMainWrapper(unit);
-        return head + body;
+        return head.ToString() + body.ToString();
     }
 
     void EmitStruct(Node cls) {
@@ -305,6 +313,66 @@ class Irgen {
         H("  %cptr = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
         H("  %c = load i64, i64* %cptr");
         H("  ret i64 %c");
+        H("}");
+    }
+
+    // StringBuilder: growable byte buffer { count, cap, i8* data }. Append is
+    // amortised O(1) (capacity doubling); ToString materialises one string.
+    void EmitSbRuntime() {
+        H("%zsb = type { i64, i64, i8* }");
+        H("define i8* @zsb_new() {");
+        H("  %p = call i8* @malloc(i64 24)");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %c = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
+        H("  store i64 0, i64* %c");
+        H("  %cap = getelementptr %zsb, %zsb* %b, i32 0, i32 1");
+        H("  store i64 0, i64* %cap");
+        H("  %d = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  store i8* null, i8** %d");
+        H("  ret i8* %p");
+        H("}");
+        H("define void @zsb_append(i8* %p, i8* %s) {");
+        H("entry:");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %slen = call i64 @strlen(i8* %s)");
+        H("  %cptr = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %capptr = getelementptr %zsb, %zsb* %b, i32 0, i32 1");
+        H("  %cap = load i64, i64* %capptr");
+        H("  %need = add i64 %count, %slen");
+        H("  %full = icmp sgt i64 %need, %cap");
+        H("  br i1 %full, label %grow, label %st");
+        H("grow:");
+        H("  %nc0 = mul i64 %cap, 2");
+        H("  %small = icmp slt i64 %nc0, %need");
+        H("  %nc = select i1 %small, i64 %need, i64 %nc0");
+        H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %olddata = load i8*, i8** %dptr");
+        H("  %newdata = call i8* @realloc(i8* %olddata, i64 %nc)");
+        H("  store i8* %newdata, i8** %dptr");
+        H("  store i64 %nc, i64* %capptr");
+        H("  br label %st");
+        H("st:");
+        H("  %dptr2 = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %data = load i8*, i8** %dptr2");
+        H("  %dest = getelementptr i8, i8* %data, i64 %count");
+        H("  call i8* @memcpy(i8* %dest, i8* %s, i64 %slen)");
+        H("  %ncount = add i64 %count, %slen");
+        H("  store i64 %ncount, i64* %cptr");
+        H("  ret void");
+        H("}");
+        H("define i8* @zsb_tostring(i8* %p) {");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %cptr = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %data = load i8*, i8** %dptr");
+        H("  %bsz = add i64 %count, 1");
+        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  call i8* @memcpy(i8* %buf, i8* %data, i64 %count)");
+        H("  %endp = getelementptr i8, i8* %buf, i64 %count");
+        H("  store i8 0, i8* %endp");
+        H("  ret i8* %buf");
         H("}");
     }
 
@@ -934,6 +1002,11 @@ class Irgen {
             L("  " + t + " = call i8* @zlist_new()");
             return new ExprVal(t, ty);
         }
+        if (IsSbType(ty)) {
+            string t = NT();
+            L("  " + t + " = call i8* @zsb_new()");
+            return new ExprVal(t, ty);
+        }
         // object
         string cn = ty.sval;
         Node cls = binder.FindType(cn);
@@ -1065,6 +1138,8 @@ class Irgen {
             if (IsStr(recv.ty)) { return EmitStrMethod(recv, mname, e); }
             // list methods
             if (IsListType(recv.ty)) { return EmitListMethod(recv, mname, e); }
+            // string-builder methods
+            if (IsSbType(recv.ty)) { return EmitSbMethod(recv, mname, e); }
             // instance method
             Node cls = ClassOf(recv.ty);
             if (cls != null) { return EmitInstanceCall(recv, cls.sval, mname, e); }
@@ -1179,5 +1254,19 @@ class Irgen {
             return new ExprVal(t, MkType("int"));
         }
         return new ExprVal("0", MkType("int"));
+    }
+
+    ExprVal EmitSbMethod(ExprVal recv, string name, Node e) {
+        if (name == "Append") {
+            ExprVal a = GenExpr(e.kids[0]);
+            L("  call void @zsb_append(i8* " + recv.op + ", i8* " + a.op + ")");
+            return recv;
+        }
+        if (name == "ToString") {
+            string t = NT();
+            L("  " + t + " = call i8* @zsb_tostring(i8* " + recv.op + ")");
+            return new ExprVal(t, MkType("string"));
+        }
+        return recv;
     }
 }

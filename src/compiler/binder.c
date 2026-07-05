@@ -152,6 +152,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "List", 4)) base = make_type(b->arena, TYPE_CLASS, "List", 4);
     else if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10))
         base = make_type(b->arena, TYPE_CLASS, "Dict", 4);
+    else if (istr_eq(name, "StringBuilder", 13))
+        base = make_type(b->arena, TYPE_CLASS, "StringBuilder", 13);
     else {
         /* user-defined type: look up in scope */
         zan_symbol_t *sym = scope_find(b->current_scope, name);

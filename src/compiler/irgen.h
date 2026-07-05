@@ -103,6 +103,7 @@ struct zan_irgen {
     LLVMValueRef fn_realloc;     /* realloc(void*, size_t) -> void* */
     LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
     LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
+    LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */
     LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
 
     /* DllImport: tracked extern libraries for linker */

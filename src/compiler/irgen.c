@@ -159,6 +159,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->dict_struct_type = LLVMStructCreateNamed(g->ctx, "Dict");
     LLVMStructSetBody(g->dict_struct_type, dict_fields, 4, 0);
 
+    /* StringBuilder struct type: { i64 count, i64 capacity, i8* data } */
+    LLVMTypeRef sb_fields[] = { i64, i64, i8ptr };
+    g->sb_struct_type = LLVMStructCreateNamed(g->ctx, "StringBuilder");
+    LLVMStructSetBody(g->sb_struct_type, sb_fields, 3, 0);
+
     /* int strcmp(const char*, const char*) */
     LLVMTypeRef strcmp_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcmp_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), strcmp_args, 2, 0);
@@ -1302,6 +1307,90 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_CALL: {
+        /* StringBuilder.Append(s) / StringBuilder.ToString() — growable byte
+         * buffer with amortised O(1) append (capacity doubling). */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *sbcallee = expr->call.callee;
+            zan_istr_t sbm = sbcallee->member.name;
+            zan_type_t *sbt = infer_expr_type(g, sbcallee->member.object, locals);
+            if (sbt && sbt->name.len == 13 &&
+                memcmp(sbt->name.str, "StringBuilder", 13) == 0) {
+                LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef raw = emit_expr(g, sbcallee->member.object, locals);
+                LLVMValueRef sbp = LLVMBuildBitCast(g->builder, raw,
+                    LLVMPointerType(g->sb_struct_type, 0), "sbp");
+                if (sbm.len == 6 && memcmp(sbm.str, "Append", 6) == 0 &&
+                    expr->call.args.count == 1) {
+                    LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
+                    LLVMValueRef slen = LLVMBuildCall2(g->builder,
+                        LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                        g->fn_strlen, &s, 1, "sblen");
+                    LLVMValueRef cptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 0, "sbcp");
+                    LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cptr, "sbcv");
+                    LLVMValueRef capptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 1, "sbcapp");
+                    LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, capptr, "sbcapv");
+                    LLVMValueRef need = LLVMBuildAdd(g->builder, count, slen, "sbneed");
+                    LLVMValueRef full = LLVMBuildICmp(g->builder, LLVMIntSGT, need, cap, "sbfull");
+                    LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb.grow");
+                    LLVMBasicBlockRef st_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sb.st");
+                    LLVMBuildCondBr(g->builder, full, grow_bb, st_bb);
+                    /* grow: newcap = max(cap*2, need); realloc data */
+                    LLVMPositionBuilderAtEnd(g->builder, grow_bb);
+                    LLVMValueRef nc0 = LLVMBuildMul(g->builder, cap, LLVMConstInt(i64, 2, 0), "sbnc0");
+                    LLVMValueRef small = LLVMBuildICmp(g->builder, LLVMIntSLT, nc0, need, "sbsm");
+                    LLVMValueRef nc = LLVMBuildSelect(g->builder, small, need, nc0, "sbnc");
+                    LLVMValueRef dptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp");
+                    LLVMValueRef olddata = LLVMBuildLoad2(g->builder, i8ptr, dptr, "sbod");
+                    LLVMValueRef newdata = LLVMBuildCall2(g->builder,
+                        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0),
+                        g->fn_realloc, (LLVMValueRef[]){ olddata, nc }, 2, "sbnd");
+                    LLVMBuildStore(g->builder, newdata, dptr);
+                    LLVMBuildStore(g->builder, nc, capptr);
+                    LLVMBuildBr(g->builder, st_bb);
+                    /* store: memcpy(data+count, s, slen); count += slen */
+                    LLVMPositionBuilderAtEnd(g->builder, st_bb);
+                    LLVMValueRef dptr2 = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp2");
+                    LLVMValueRef data = LLVMBuildLoad2(g->builder, i8ptr, dptr2, "sbdv");
+                    LLVMValueRef dest = LLVMBuildGEP2(g->builder, i8, data, &count, 1, "sbdest");
+                    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+                    if (!memcpy_fn) {
+                        memcpy_fn = LLVMAddFunction(g->mod, "memcpy",
+                            LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0));
+                    }
+                    LLVMBuildCall2(g->builder,
+                        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0),
+                        memcpy_fn, (LLVMValueRef[]){ dest, s, slen }, 3, "");
+                    LLVMValueRef ncount = LLVMBuildAdd(g->builder, count, slen, "sbncount");
+                    LLVMBuildStore(g->builder, ncount, cptr);
+                    return raw;
+                }
+                if (sbm.len == 8 && memcmp(sbm.str, "ToString", 8) == 0 &&
+                    expr->call.args.count == 0) {
+                    LLVMValueRef cptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 0, "sbcp");
+                    LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cptr, "sbcv");
+                    LLVMValueRef dptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp");
+                    LLVMValueRef data = LLVMBuildLoad2(g->builder, i8ptr, dptr, "sbdv");
+                    LLVMValueRef bsz = LLVMBuildAdd(g->builder, count, LLVMConstInt(i64, 1, 0), "sbbsz");
+                    LLVMValueRef buf = LLVMBuildCall2(g->builder,
+                        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
+                        g->fn_malloc, &bsz, 1, "sbbuf");
+                    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+                    if (!memcpy_fn) {
+                        memcpy_fn = LLVMAddFunction(g->mod, "memcpy",
+                            LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0));
+                    }
+                    LLVMBuildCall2(g->builder,
+                        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0),
+                        memcpy_fn, (LLVMValueRef[]){ buf, data, count }, 3, "");
+                    LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &count, 1, "sbend");
+                    LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+                    return buf;
+                }
+            }
+        }
+
         /* special-case Console.WriteLine */
         if (is_call_to(expr, "Console", "WriteLine") ||
             is_call_to(expr, "Console", "PrintLine")) {
@@ -2552,6 +2641,29 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 2, "df");
                 LLVMBuildStore(g->builder, data_typed, data_field);
                 return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "listv");
+            }
+        }
+
+        /* new StringBuilder() — built-in growable byte buffer */
+        if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF) {
+            zan_istr_t sbname = expr->new_expr.type->type_ref.name;
+            if (sbname.len == 13 && memcmp(sbname.str, "StringBuilder", 13) == 0) {
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                /* allocate StringBuilder struct: { i64 count, i64 cap, i8* data } = 24 bytes */
+                LLVMValueRef sb_size = LLVMConstInt(i64, 24, 0);
+                LLVMValueRef sb_raw = LLVMBuildCall2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
+                    g->fn_malloc, &sb_size, 1, "sb");
+                LLVMValueRef sb_ptr = LLVMBuildBitCast(g->builder, sb_raw,
+                    LLVMPointerType(g->sb_struct_type, 0), "sbp");
+                LLVMValueRef cnt_p = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sb_ptr, 0, "sbc");
+                LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), cnt_p);
+                LLVMValueRef cap_p = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sb_ptr, 1, "sbcap");
+                LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), cap_p);
+                LLVMValueRef data_p = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sb_ptr, 2, "sbd");
+                LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), data_p);
+                return LLVMBuildBitCast(g->builder, sb_ptr, i8ptr, "sbv");
             }
         }
 
