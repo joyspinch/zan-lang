@@ -17,6 +17,7 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 llvm_map_components_to_libnames(LLVM_LIBS
     core support analysis bitwriter target
     x86codegen x86asmparser x86desc x86info
+    passes
 )
 
 # ---- Compiler executable ----
@@ -30,12 +31,15 @@ add_executable(zanc
     src/compiler/binder.c
     src/compiler/checker.c
     src/compiler/irgen.c
+    src/compiler/optimizer.c
+    src/compiler/incremental.c
+    src/compiler/package.c
 )
 target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
 if(MSVC)
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS})
 else()
-    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} stdc++ m)
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} stdc++ m pthread)
 endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
 
