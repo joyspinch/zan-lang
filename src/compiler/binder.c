@@ -130,61 +130,54 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
 
     zan_istr_t name = type_ref->type_ref.name;
 
+    /* Resolve the base (element) type first, then apply array / nullable
+     * wrapping uniformly. Built-in types previously returned early here,
+     * which silently dropped the `[]` on parameters/fields such as `int[]`. */
+    zan_type_t *base = NULL;
+
     /* built-in types */
-    if (istr_eq(name, "void",   4)) return b->type_void;
-    if (istr_eq(name, "bool",   4)) return b->type_bool;
-    if (istr_eq(name, "byte",   4)) return b->type_byte;
-    if (istr_eq(name, "short",  5)) return b->type_short;
-    if (istr_eq(name, "int",    3)) return b->type_int;
-    if (istr_eq(name, "long",   4)) return b->type_long;
-    if (istr_eq(name, "float",  5)) return b->type_float;
-    if (istr_eq(name, "double", 6)) return b->type_double;
-    if (istr_eq(name, "char",   4)) return b->type_char;
-    if (istr_eq(name, "string", 6)) return b->type_string;
-    if (istr_eq(name, "object", 6)) return b->type_object;
-    if (istr_eq(name, "nint",   4)) return b->type_nint;
-
+    if (istr_eq(name, "void",   4)) base = b->type_void;
+    else if (istr_eq(name, "bool",   4)) base = b->type_bool;
+    else if (istr_eq(name, "byte",   4)) base = b->type_byte;
+    else if (istr_eq(name, "short",  5)) base = b->type_short;
+    else if (istr_eq(name, "int",    3)) base = b->type_int;
+    else if (istr_eq(name, "long",   4)) base = b->type_long;
+    else if (istr_eq(name, "float",  5)) base = b->type_float;
+    else if (istr_eq(name, "double", 6)) base = b->type_double;
+    else if (istr_eq(name, "char",   4)) base = b->type_char;
+    else if (istr_eq(name, "string", 6)) base = b->type_string;
+    else if (istr_eq(name, "object", 6)) base = b->type_object;
+    else if (istr_eq(name, "nint",   4)) base = b->type_nint;
     /* built-in generic types */
-    if (istr_eq(name, "List", 4)) {
-        zan_type_t *list_type = make_type(b->arena, TYPE_CLASS, "List", 4);
-        return list_type;
-    }
-    if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10)) {
-        zan_type_t *dict_type = make_type(b->arena, TYPE_CLASS, "Dict", 4);
-        return dict_type;
-    }
-
-    /* user-defined type: look up in scope */
-    zan_symbol_t *sym = scope_find(b->current_scope, name);
-    if (sym) {
-        zan_type_t *resolved = sym->type;
-
-        /* wrap in array if needed */
-        if (type_ref->type_ref.is_array) {
-            zan_type_t *arr = make_type(b->arena, TYPE_ARRAY, name.str, name.len);
-            arr->element_type = resolved;
-            resolved = arr;
-        }
-        /* wrap in nullable if needed */
-        if (type_ref->type_ref.is_nullable) {
-            zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
-            nullable->element_type = resolved;
-            resolved = nullable;
-        }
-        return resolved;
+    else if (istr_eq(name, "List", 4)) base = make_type(b->arena, TYPE_CLASS, "List", 4);
+    else if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10))
+        base = make_type(b->arena, TYPE_CLASS, "Dict", 4);
+    else {
+        /* user-defined type: look up in scope */
+        zan_symbol_t *sym = scope_find(b->current_scope, name);
+        if (sym) base = sym->type;
     }
 
-    /* handle array of built-in types */
+    if (!base) {
+        zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                      "undefined type '%.*s'", name.len, name.str);
+        return b->type_error;
+    }
+
+    zan_type_t *resolved = base;
+    /* wrap in array if needed */
     if (type_ref->type_ref.is_array) {
-        zan_type_t *elem = zan_binder_resolve_type(b, type_ref);
         zan_type_t *arr = make_type(b->arena, TYPE_ARRAY, name.str, name.len);
-        arr->element_type = elem;
-        return arr;
+        arr->element_type = resolved;
+        resolved = arr;
     }
-
-    zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
-                  "undefined type '%.*s'", name.len, name.str);
-    return b->type_error;
+    /* wrap in nullable if needed */
+    if (type_ref->type_ref.is_nullable) {
+        zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
+        nullable->element_type = resolved;
+        resolved = nullable;
+    }
+    return resolved;
 }
 
 /* ---- symbol lookup ---- */

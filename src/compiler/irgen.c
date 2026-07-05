@@ -466,6 +466,22 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
+/* Resolve the declared type of an `obj.field` member access so that element
+ * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
+ * element LLVM type. Returns NULL when the field/type cannot be resolved. */
+static zan_type_t *member_access_field_type(local_scope_t *locals, zan_ast_node_t *member) {
+    if (!member || member->kind != AST_MEMBER_ACCESS) return NULL;
+    zan_ast_node_t *obj = member->member.object;
+    if (obj->kind == AST_IDENTIFIER) {
+        local_var_t *l = local_find(locals, obj->ident.name);
+        if (l && l->type && l->type->sym) {
+            zan_symbol_t *fsym = get_field_sym(l->type->sym, member->member.name);
+            if (fsym) return fsym->type;
+        }
+    }
+    return NULL;
+}
+
 static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method) {
     if (expr->kind != AST_CALL) return false;
     zan_ast_node_t *callee = expr->call.callee;
@@ -529,6 +545,50 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_BINARY: {
+        /* Short-circuit logical operators must not evaluate the right operand
+         * unconditionally (e.g. `i < len && arr[i]`). Handle them before the
+         * eager left/right evaluation used by the arithmetic/relational ops. */
+        if (expr->binary.op == TK_AMP_AMP || expr->binary.op == TK_PIPE_PIPE) {
+            bool is_and = (expr->binary.op == TK_AMP_AMP);
+            LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+            LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+
+            LLVMValueRef lval = emit_expr(g, expr->binary.left, locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(lval)) != LLVMIntegerTypeKind ||
+                LLVMGetIntTypeWidth(LLVMTypeOf(lval)) != 1) {
+                lval = LLVMBuildICmp(g->builder, LLVMIntNE, lval,
+                                     LLVMConstNull(LLVMTypeOf(lval)), "tobool");
+            }
+            LLVMBasicBlockRef left_bb = LLVMGetInsertBlock(g->builder);
+            LLVMBasicBlockRef rhs_bb  = LLVMAppendBasicBlockInContext(g->ctx, fn, "sc.rhs");
+            LLVMBasicBlockRef merge   = LLVMAppendBasicBlockInContext(g->ctx, fn, "sc.end");
+            /* AND: if left is true, test right; else short-circuit false.
+             * OR:  if left is true, short-circuit true; else test right. */
+            if (is_and)
+                LLVMBuildCondBr(g->builder, lval, rhs_bb, merge);
+            else
+                LLVMBuildCondBr(g->builder, lval, merge, rhs_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, rhs_bb);
+            LLVMValueRef rval = emit_expr(g, expr->binary.right, locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(rval)) != LLVMIntegerTypeKind ||
+                LLVMGetIntTypeWidth(LLVMTypeOf(rval)) != 1) {
+                rval = LLVMBuildICmp(g->builder, LLVMIntNE, rval,
+                                     LLVMConstNull(LLVMTypeOf(rval)), "tobool");
+            }
+            LLVMBasicBlockRef rhs_end = LLVMGetInsertBlock(g->builder);
+            LLVMBuildBr(g->builder, merge);
+
+            LLVMPositionBuilderAtEnd(g->builder, merge);
+            LLVMValueRef phi = LLVMBuildPhi(g->builder, i1, "sc");
+            /* short-circuit constant: AND -> false, OR -> true */
+            LLVMValueRef sc_const = LLVMConstInt(i1, is_and ? 0 : 1, 0);
+            LLVMValueRef vals[] = { sc_const, rval };
+            LLVMBasicBlockRef bbs[] = { left_bb, rhs_end };
+            LLVMAddIncoming(phi, vals, bbs, 2);
+            return phi;
+        }
+
         LLVMValueRef left = emit_expr(g, expr->binary.left, locals);
         LLVMValueRef right = emit_expr(g, expr->binary.right, locals);
 
@@ -682,6 +742,19 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                     if (local->type && local->type->element_type) {
                         elem_llvm = map_type(g, local->type->element_type);
+                    }
+                    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
+                    LLVMBuildStore(g->builder, right, elem_ptr);
+                }
+            } else if (arr_expr->kind == AST_MEMBER_ACCESS) {
+                /* obj.field[i] = value — array stored in a struct/class field */
+                zan_type_t *at = member_access_field_type(locals, arr_expr);
+                if (at) {
+                    LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
+                    LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                    LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+                    if (at->element_type) {
+                        elem_llvm = map_type(g, at->element_type);
                     }
                     LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
                     LLVMBuildStore(g->builder, right, elem_ptr);
@@ -1330,8 +1403,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
+                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
-                                    g->functions[fi].fn, call_args, (unsigned)argc, "mcall");
+                                    g->functions[fi].fn, call_args, (unsigned)argc, cn);
                                 free(call_args);
                                 return result;
                             }
@@ -1351,8 +1425,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 for (int k = 0; k < argc; k++) {
                                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
+                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
-                                    g->functions[fi].fn, call_args, (unsigned)argc, "scall");
+                                    g->functions[fi].fn, call_args, (unsigned)argc, cn);
                                 free(call_args);
                                 return result;
                             }
@@ -1385,8 +1460,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             for (int k = 0; k < argc; k++) {
                                 call_args[k + extra] = emit_expr(g, expr->call.args.items[k], locals);
                             }
+                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "bcall";
                             LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
-                                g->functions[fi].fn, call_args, (unsigned)(argc + extra), "bcall");
+                                g->functions[fi].fn, call_args, (unsigned)(argc + extra), cn);
                             free(call_args);
                             return result;
                         }
@@ -1649,6 +1725,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 arr_type = local->type;
                 /* detect List type by checking if type name is "List" */
                 if (arr_type && arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
+                    is_list = 1;
+                }
+            }
+        } else if (expr->index.object->kind == AST_MEMBER_ACCESS) {
+            /* obj.field[i] — array stored in a struct/class field. Load the
+             * field value (the array data pointer) and recover its element
+             * type from the field declaration. */
+            arr_type = member_access_field_type(locals, expr->index.object);
+            if (arr_type) {
+                arr_ptr = emit_expr(g, expr->index.object, locals);
+                if (arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
                     is_list = 1;
                 }
             }

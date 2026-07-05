@@ -171,6 +171,15 @@ const char *zan_token_kind_name(zan_token_kind_t kind) {
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
                     uint32_t file_id, zan_arena_t *arena, zan_diag_t *diag) {
     memset(lex, 0, sizeof(*lex));
+    /* Skip a leading UTF-8 byte-order mark (EF BB BF) if present so that
+     * files saved with a BOM (common on Windows editors) tokenize cleanly. */
+    if (source && len >= 3 &&
+        (unsigned char)source[0] == 0xEF &&
+        (unsigned char)source[1] == 0xBB &&
+        (unsigned char)source[2] == 0xBF) {
+        source += 3;
+        len -= 3;
+    }
     lex->source = source;
     lex->source_len = len;
     lex->pos = 0;
