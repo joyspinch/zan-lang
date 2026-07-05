@@ -1507,6 +1507,50 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* str.Substring(start[, len]) -> heap-allocated copy of the slice.
+         * With one argument, copies from `start` to the end of the string. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *sc = expr->call.callee;
+            zan_istr_t sm = sc->member.name;
+            if (sm.len == 9 && memcmp(sm.str, "Substring", 9) == 0 &&
+                (expr->call.args.count == 1 || expr->call.args.count == 2) &&
+                is_string_expr(g, sc->member.object, locals)) {
+                LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef s = emit_expr(g, sc->member.object, locals);
+                LLVMValueRef start = coerce_int_to(g,
+                    emit_expr(g, expr->call.args.items[0], locals), i64);
+                LLVMValueRef slen;
+                if (expr->call.args.count == 2) {
+                    slen = coerce_int_to(g,
+                        emit_expr(g, expr->call.args.items[1], locals), i64);
+                } else {
+                    LLVMValueRef total = LLVMBuildCall2(g->builder,
+                        LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                        g->fn_strlen, &s, 1, "slen");
+                    slen = LLVMBuildSub(g->builder, total, start, "subl");
+                }
+                LLVMValueRef bufsz = LLVMBuildAdd(g->builder, slen, LLVMConstInt(i64, 1, 0), "bsz");
+                LLVMValueRef buf = LLVMBuildCall2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
+                    g->fn_malloc, &bufsz, 1, "sub");
+                LLVMValueRef srcp = LLVMBuildGEP2(g->builder, i8, s, &start, 1, "srcp");
+                LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+                if (!memcpy_fn) {
+                    memcpy_fn = LLVMAddFunction(g->mod, "memcpy",
+                        LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0));
+                }
+                LLVMValueRef mcargs[] = { buf, srcp, slen };
+                LLVMBuildCall2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0),
+                    memcpy_fn, mcargs, 3, "");
+                LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &slen, 1, "endp");
+                LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+                return buf;
+            }
+        }
+
         /* File.ReadAllText(path) -> string */
         if (is_call_to(expr, "File", "ReadAllText") && expr->call.args.count == 1) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
