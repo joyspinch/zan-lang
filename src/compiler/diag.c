@@ -9,7 +9,16 @@
 
 zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     zan_diag_t *d = (zan_diag_t *)zan_arena_alloc(arena, sizeof(zan_diag_t));
+    d->error_count = 0;
+    d->warning_count = 0;
     d->max_errors = 100;
+    d->file_names = NULL;
+    d->file_sources = NULL;
+    d->file_count = 0;
+    d->capture = false;
+    d->entries = NULL;
+    d->entry_count = 0;
+    d->entry_cap = 0;
     return d;
 }
 
@@ -41,6 +50,47 @@ static int find_line_len(const char *line_start) {
     return (int)(p - line_start);
 }
 
+void zan_diag_set_capture(zan_diag_t *diag, bool enabled) {
+    diag->capture = enabled;
+}
+
+int zan_diag_entry_count(const zan_diag_t *diag) {
+    return diag->entry_count;
+}
+
+const zan_diag_entry_t *zan_diag_entry_at(const zan_diag_t *diag, int index) {
+    if (index < 0 || index >= diag->entry_count) return NULL;
+    return &diag->entries[index];
+}
+
+void zan_diag_free_buffers(zan_diag_t *diag) {
+    free(diag->entries);
+    diag->entries = NULL;
+    diag->entry_count = 0;
+    diag->entry_cap = 0;
+    free((void *)diag->file_names);
+    free((void *)diag->file_sources);
+    diag->file_names = NULL;
+    diag->file_sources = NULL;
+    diag->file_count = 0;
+}
+
+static void diag_capture_entry(zan_diag_t *diag, zan_diag_level_t level,
+                               zan_loc_t loc, const char *fmt, va_list args) {
+    if (diag->entry_count >= diag->entry_cap) {
+        int new_cap = diag->entry_cap ? diag->entry_cap * 2 : 16;
+        zan_diag_entry_t *grown = (zan_diag_entry_t *)realloc(
+            diag->entries, sizeof(zan_diag_entry_t) * (size_t)new_cap);
+        if (!grown) return;
+        diag->entries = grown;
+        diag->entry_cap = new_cap;
+    }
+    zan_diag_entry_t *e = &diag->entries[diag->entry_count++];
+    e->level = level;
+    e->loc = loc;
+    vsnprintf(e->message, sizeof(e->message), fmt, args);
+}
+
 void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                    const char *fmt, ...) {
     if (level == DIAG_ERROR) {
@@ -48,6 +98,15 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
         if (diag->error_count > diag->max_errors) return;
     } else if (level == DIAG_WARNING) {
         diag->warning_count++;
+    }
+
+    /* structured capture path: store and skip stderr rendering */
+    if (diag->capture) {
+        va_list args;
+        va_start(args, fmt);
+        diag_capture_entry(diag, level, loc, fmt, args);
+        va_end(args);
+        return;
     }
 
     const char *level_str = "note";

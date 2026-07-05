@@ -51,6 +51,41 @@ endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
 
 
+# ---- Language Server (M8) ----
+# Reuses the compiler front-end (no LLVM dependency) plus the intellisense
+# engine to serve the Language Server Protocol over stdio.
+add_executable(zan-lsp
+    src/lsp/lsp_main.c
+    src/common/json.c
+    src/common/rpc.c
+    src/compiler/arena.c
+    src/compiler/diag.c
+    src/compiler/lexer.c
+    src/compiler/ast.c
+    src/compiler/parser.c
+    src/compiler/binder.c
+    src/compiler/checker.c
+    src/ide/intellisense.c
+)
+target_include_directories(zan-lsp PRIVATE src/compiler src/common src/ide)
+if(MSVC)
+    target_compile_definitions(zan-lsp PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# ---- Debug Adapter (M9) ----
+# Exposes the IDE debugger engine over the Debug Adapter Protocol (stdio).
+add_executable(zan-dap
+    src/dap/dap_main.c
+    src/common/json.c
+    src/common/rpc.c
+    src/ide/debugger.c
+)
+target_include_directories(zan-dap PRIVATE src/common src/ide)
+if(MSVC)
+    target_compile_definitions(zan-dap PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+
 # ---- IDE executable (Windows only) ----
 if(WIN32)
     add_executable(zan-ide WIN32

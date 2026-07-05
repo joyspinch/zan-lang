@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <ctype.h>
 
+#ifndef _WIN32
+#include <strings.h>
+#define _strnicmp strncasecmp
+#endif
+
 /* Built-in type completions */
 static const char *builtin_types[] = {
     "int", "float", "double", "bool", "string", "char", "byte", "long",

@@ -334,9 +334,78 @@ Self-contained IDE bundled with the compiler (single executable).
   - Source-based packages (git URL + version)
   - Local package cache
 
-- [ ] **M7.6 — Self-hosting**
+- [x] **M7.6 — Self-hosting** *(in progress)*
   - Rewrite compiler in Zan
   - Bootstrap verification (gen2 == gen3)
+  - Progress: `src/self/selfhost.zan` implements a real tokenizer that scans an
+    actual character buffer (not a length estimate) and produces an exact token
+    classification (identifiers / keywords / numbers / operators), verified
+    against the C front-end. Earlier `bootstrap.zan` / `main.zan` model the
+    driver and phase pipeline. Full self-compilation is still gated on compiler
+    fixes for array-typed parameters, array class fields, and short-circuit
+    `&&` / `||` in control-flow conditions (tracked below).
+
+---
+
+## Milestone 8: Language Server Protocol (M8)
+
+**Goal:** IDE-agnostic code intelligence over the Language Server Protocol.
+
+**Status:** ✅ Implemented (`zan-lsp`)
+
+### Tasks
+
+- [x] **M8.1 — Transport**
+  - JSON-RPC over stdio with `Content-Length` framing (`src/common/rpc.c`)
+  - Dependency-free JSON parser/writer (`src/common/json.c`)
+
+- [x] **M8.2 — Lifecycle**
+  - `initialize` (advertises capabilities) / `initialized`
+  - `shutdown` / `exit`
+
+- [x] **M8.3 — Document sync & diagnostics**
+  - `textDocument/didOpen` / `didChange` (full sync) / `didClose`
+  - Runs lexer → parser → binder → checker and publishes
+    `textDocument/publishDiagnostics` with severities and ranges
+
+- [x] **M8.4 — Language features**
+  - `textDocument/completion` (identifier + `Type.` member context)
+  - `textDocument/hover` (symbol signatures)
+  - `textDocument/definition`
+  - `textDocument/documentSymbol`
+
+### Deliverable
+`zan-lsp` executable, usable from any LSP client (VS Code, Neovim, etc.).
+
+---
+
+## Milestone 9: Debugger Integration (M9)
+
+**Goal:** Standard debugging via the Debug Adapter Protocol.
+
+**Status:** ✅ Implemented (`zan-dap`)
+
+### Tasks
+
+- [x] **M9.1 — Transport & lifecycle**
+  - DAP over stdio (`initialize`, `launch`, `configurationDone`, `disconnect`)
+  - `initialized`, `stopped`, `continued`, `terminated`, `exited`, `output` events
+
+- [x] **M9.2 — Breakpoints**
+  - `setBreakpoints` (source breakpoints, verified, optional conditions)
+
+- [x] **M9.3 — Execution control**
+  - `continue`, `next`, `stepIn`, `stepOut`, `pause`
+
+- [x] **M9.4 — Inspection**
+  - `threads`, `stackTrace`, `scopes`, `variables`
+
+The adapter wraps the IDE debugger engine (`src/ide/debugger.c`). Runtime
+process control is delegated to that engine (Windows `CreateProcess`-based;
+a simulated stepping model on other platforms).
+
+### Deliverable
+`zan-dap` executable, usable from any DAP client.
 
 ---
 
@@ -351,6 +420,8 @@ Self-contained IDE bundled with the compiler (single executable).
 | M5 | Advanced Language Features | 3-4 weeks | Week 16 |
 | M6 | Lightweight IDE | 4-6 weeks | Week 22 |
 | M7 | Optimization & Polish | Ongoing | — |
+| M8 | Language Server Protocol (`zan-lsp`) | done | — |
+| M9 | Debugger Integration / DAP (`zan-dap`) | done | — |
 
 ---
 
