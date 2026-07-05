@@ -281,6 +281,7 @@ struct zan_ast_node {
             zan_ast_list_t bases;      /* base types */
             zan_ast_list_t members;
             uint32_t modifiers;
+            bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
         } type_decl;
 
         /* method / constructor */
@@ -291,6 +292,8 @@ struct zan_ast_node {
             zan_ast_list_t type_params;
             zan_ast_node_t *body;
             uint32_t modifiers;
+            zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
+            zan_istr_t entry_point;  /* DllImport entry point override, {NULL,0} if none */
         } method_decl;
 
         /* field */

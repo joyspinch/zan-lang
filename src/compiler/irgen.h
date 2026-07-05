@@ -86,6 +86,10 @@ struct zan_irgen {
     LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
     LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
     LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
+
+    /* DllImport: tracked extern libraries for linker */
+    zan_istr_t extern_libs[64];
+    int extern_lib_count;
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

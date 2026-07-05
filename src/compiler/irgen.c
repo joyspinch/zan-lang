@@ -2242,6 +2242,70 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
             if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
+
+            /* [DllImport] extern methods: generate extern declaration, skip body */
+            if (member->kind == AST_METHOD_DECL && member->method_decl.extern_lib.str &&
+                !member->method_decl.body) {
+                /* build extern function declaration */
+                int pc = member->method_decl.params.count;
+                LLVMTypeRef *pt = (LLVMTypeRef *)calloc((size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
+                for (int k = 0; k < pc; k++) {
+                    zan_ast_node_t *param = member->method_decl.params.items[k];
+                    zan_type_t *ptype = zan_binder_resolve_type(g->binder, param->param.type);
+                    pt[k] = map_type(g, ptype);
+                }
+                zan_type_t *rt = member->method_decl.return_type
+                    ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
+                    : g->binder->type_void;
+                LLVMTypeRef llvm_rt = map_type(g, rt);
+                LLVMTypeRef ft = LLVMFunctionType(llvm_rt, pt, (unsigned)pc, 0);
+                /* use entry_point if specified, otherwise method name */
+                char ext_name[256];
+                if (member->method_decl.entry_point.str) {
+                    snprintf(ext_name, sizeof(ext_name), "%.*s",
+                             (int)member->method_decl.entry_point.len,
+                             member->method_decl.entry_point.str);
+                } else {
+                    snprintf(ext_name, sizeof(ext_name), "%.*s",
+                             (int)member->method_decl.name.len,
+                             member->method_decl.name.str);
+                }
+                LLVMValueRef efn = LLVMAddFunction(g->mod, ext_name, ft);
+                /* register as a static method so it can be called */
+                zan_symbol_t *method_sym = NULL;
+                for (int mi = 0; mi < type_sym->member_count; mi++) {
+                    if (type_sym->members[mi]->name.len == member->method_decl.name.len &&
+                        memcmp(type_sym->members[mi]->name.str, member->method_decl.name.str,
+                               member->method_decl.name.len) == 0) {
+                        method_sym = type_sym->members[mi];
+                        break;
+                    }
+                }
+                if (method_sym && g->function_count < 1024) {
+                    g->functions[g->function_count].sym = method_sym;
+                    g->functions[g->function_count].fn = efn;
+                    g->functions[g->function_count].fn_type = ft;
+                    g->function_count++;
+                }
+                /* store lib name for linker */
+                if (g->extern_lib_count < 64) {
+                    bool already = false;
+                    for (int li = 0; li < g->extern_lib_count; li++) {
+                        if (g->extern_libs[li].len == member->method_decl.extern_lib.len &&
+                            memcmp(g->extern_libs[li].str, member->method_decl.extern_lib.str,
+                                   member->method_decl.extern_lib.len) == 0) {
+                            already = true;
+                            break;
+                        }
+                    }
+                    if (!already) {
+                        g->extern_libs[g->extern_lib_count++] = member->method_decl.extern_lib;
+                    }
+                }
+                free(pt);
+                continue;
+            }
+
             if (!member->method_decl.body) continue;
 
             /* skip static Main — handled separately */

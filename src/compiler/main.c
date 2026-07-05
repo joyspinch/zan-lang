@@ -580,6 +580,22 @@ int main(int argc, char **argv) {
         snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
                  obj_tmp, obj_path);
 #endif
+        /* append -l flags for [DllImport] extern libraries */
+        for (int li = 0; li < irgen.extern_lib_count; li++) {
+            const char *lib = irgen.extern_libs[li].str;
+            int lib_len = (int)irgen.extern_libs[li].len;
+#ifdef _WIN32
+            /* skip "m" and "msvcrt" on Windows — already in default CRT */
+            if (lib_len == 1 && lib[0] == 'm') continue;
+            if (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0) continue;
+            if (lib_len == 1 && lib[0] == 'c') continue;
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
+#else
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
+#endif
+        }
         int link_ret = system(link_cmd);
 
         /* clean up object file */

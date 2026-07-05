@@ -1007,7 +1007,52 @@ static zan_ast_list_t parse_param_list(zan_parser_t *p) {
 }
 
 static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
+    /* parse [DllImport("lib")] attribute if present */
+    zan_istr_t dll_import_lib = {NULL, 0};
+    zan_istr_t dll_entry_point = {NULL, 0};
+    while (parser_check(p, TK_LBRACKET)) {
+        parser_advance(p); /* consume [ */
+        if (parser_check(p, TK_IDENT) &&
+            p->current.str_val.len == 9 &&
+            memcmp(p->current.str_val.str, "DllImport", 9) == 0) {
+            parser_advance(p); /* consume DllImport */
+            if (parser_match(p, TK_LPAREN)) {
+                if (parser_check(p, TK_STRING_LIT)) {
+                    dll_import_lib = p->current.str_val;
+                    parser_advance(p);
+                }
+                /* optional: EntryPoint = "name" */
+                if (parser_match(p, TK_COMMA)) {
+                    /* skip EntryPoint = "name" for now, just consume to ) */
+                    while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
+                        if (parser_check(p, TK_IDENT) &&
+                            p->current.str_val.len == 10 &&
+                            memcmp(p->current.str_val.str, "EntryPoint", 10) == 0) {
+                            parser_advance(p); /* EntryPoint */
+                            parser_expect(p, TK_EQ); /* = */
+                            if (parser_check(p, TK_STRING_LIT)) {
+                                dll_entry_point = p->current.str_val;
+                                parser_advance(p);
+                            }
+                        } else {
+                            parser_advance(p);
+                        }
+                        if (!parser_match(p, TK_COMMA)) break;
+                    }
+                }
+                parser_expect(p, TK_RPAREN);
+            }
+        } else {
+            /* skip unknown attributes */
+            while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
+                parser_advance(p);
+            }
+        }
+        parser_expect(p, TK_RBRACKET);
+    }
+
     uint32_t mods = parse_modifiers(p);
+    if (dll_import_lib.str) mods |= MOD_EXTERN;
     zan_loc_t loc = p->current.loc;
 
     /* destructor: ~ClassName() { } */
@@ -1143,6 +1188,8 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         n->method_decl.type_params = type_params;
         n->method_decl.body = body;
         n->method_decl.modifiers = mods;
+        n->method_decl.extern_lib = dll_import_lib;
+        n->method_decl.entry_point = dll_entry_point;
         return n;
     }
 
@@ -1351,9 +1398,15 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
 
     /* type declarations */
     while (!parser_check(p, TK_EOF) && !parser_check(p, TK_RBRACE)) {
-        /* skip attributes for now */
+        /* parse attributes: [StructLayout(...)] */
+        bool has_c_layout = false;
         while (parser_check(p, TK_LBRACKET)) {
             parser_advance(p);
+            if (parser_check(p, TK_IDENT) &&
+                p->current.str_val.len == 12 &&
+                memcmp(p->current.str_val.str, "StructLayout", 12) == 0) {
+                has_c_layout = true;
+            }
             while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
                 parser_advance(p);
             }
@@ -1365,10 +1418,30 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
         if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
             parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
             zan_ast_node_t *decl = parse_type_decl(p, mods);
+            decl->type_decl.is_c_layout = has_c_layout;
             zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
+        } else if (parser_check(p, TK_DELEGATE)) {
+            /* delegate ReturnType Name(params); */
+            parser_advance(p); /* consume 'delegate' */
+            zan_loc_t dloc = p->current.loc;
+            zan_ast_node_t *ret_type = parse_type_ref(p);
+            parser_expect(p, TK_IDENT);
+            zan_istr_t dname = p->previous.str_val;
+            zan_ast_list_t dparams = parse_param_list(p);
+            parser_expect(p, TK_SEMICOLON);
+            zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
+            ddecl->method_decl.name = dname;
+            ddecl->method_decl.return_type = ret_type;
+            ddecl->method_decl.params = dparams;
+            zan_ast_list_init(&ddecl->method_decl.type_params);
+            ddecl->method_decl.body = NULL;
+            ddecl->method_decl.modifiers = mods;
+            ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
+            ddecl->method_decl.entry_point = (zan_istr_t){NULL, 0};
+            zan_ast_list_push(&unit->comp_unit.decls, ddecl, p->arena);
         } else {
             zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                          "expected type declaration (class, struct, interface, or enum)");
+                          "expected type declaration (class, struct, interface, enum, or delegate)");
             parser_advance(p); /* skip to recover */
         }
     }

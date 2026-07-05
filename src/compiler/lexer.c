@@ -34,6 +34,7 @@ static const keyword_entry_t s_keywords[] = {
     {"const",     TK_CONST},
     {"continue",  TK_CONTINUE},
     {"default",   TK_DEFAULT},
+    {"delegate",  TK_DELEGATE},
     {"do",        TK_DO},
     {"double",    TK_DOUBLE},
     {"else",      TK_ELSE},
