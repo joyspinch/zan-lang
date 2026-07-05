@@ -1,0 +1,346 @@
+using System;
+
+namespace ZanCompiler;
+
+// Sixth self-hosting stage: a bytecode compiler + stack virtual machine,
+// written in Zan. Unlike the tree-walking interpreters, this SEPARATES
+// compilation from execution: Compiler lowers the token stream into a flat
+// int[] bytecode program, then VM executes that bytecode on an operand stack
+// with a 26-slot variable store. This is the real compiler/backend pattern
+// and stresses array emission (code[len++] = op), inline operands and an
+// opcode dispatch loop.
+//
+// Opcodes:
+//   0 HALT   1 PUSH <n>   2 LOAD <idx>   3 STORE <idx>
+//   4 ADD    5 SUB        6 MUL          7 DIV          8 PRINT
+//
+// Token kinds:
+//   0 end 1 num 2 + 3 - 4 * 5 / 6 ( 7 ) 8 ident 9 = 10 ; 15 print
+class Lexer {
+    public int[] src;
+    public int len;
+    public int pos;
+
+    public Lexer() { }
+
+    void Init(int[] s, int n) { src = s; len = n; pos = 0; }
+
+    int Tokenize(int[] kinds, int[] vals) {
+        var n = 0;
+        while (pos < len) {
+            var c = src[pos];
+            if (c == 32) {
+                pos = pos + 1;
+            } else if (c >= 48 && c <= 57) {
+                var v = 0;
+                while (pos < len && src[pos] >= 48 && src[pos] <= 57) {
+                    v = v * 10 + (src[pos] - 48);
+                    pos = pos + 1;
+                }
+                kinds[n] = 1; vals[n] = v; n = n + 1;
+            } else if (c >= 97 && c <= 122) {
+                var st = pos;
+                while (pos < len && src[pos] >= 97 && src[pos] <= 122) { pos = pos + 1; }
+                var wlen = pos - st;
+                if (wlen == 5 && src[st] == 112 && src[st + 1] == 114 &&
+                    src[st + 2] == 105 && src[st + 3] == 110 && src[st + 4] == 116) {
+                    kinds[n] = 15; vals[n] = 0;       // print
+                } else {
+                    kinds[n] = 8; vals[n] = src[st] - 97;
+                }
+                n = n + 1;
+            } else {
+                var k = 0;
+                if (c == 43) { k = 2; }
+                else if (c == 45) { k = 3; }
+                else if (c == 42) { k = 4; }
+                else if (c == 47) { k = 5; }
+                else if (c == 40) { k = 6; }
+                else if (c == 41) { k = 7; }
+                else if (c == 61) { k = 9; }
+                else if (c == 59) { k = 10; }
+                kinds[n] = k; vals[n] = 0; n = n + 1;
+                pos = pos + 1;
+            }
+        }
+        kinds[n] = 0; vals[n] = 0;
+        return n;
+    }
+}
+
+// Lowers tokens to bytecode. Returns the bytecode length.
+class Compiler {
+    public int[] kinds;
+    public int[] vals;
+    public int n;
+    public int pos;
+    public int[] code;
+    public int clen;
+
+    public Compiler() { }
+
+    void Init(int[] k, int[] v, int count, int[] buf) {
+        kinds = k; vals = v; n = count; pos = 0; code = buf; clen = 0;
+    }
+
+    int Kind() { if (pos < n) { return kinds[pos]; } return 0; }
+    int Val() { if (pos < n) { return vals[pos]; } return 0; }
+    void Next() { pos = pos + 1; }
+
+    void Emit(int op) { code[clen] = op; clen = clen + 1; }
+
+    // factor := number | ident | '(' add ')'
+    void Factor() {
+        if (Kind() == 6) {
+            Next();
+            Add();
+            if (Kind() == 7) { Next(); }
+        } else if (Kind() == 8) {
+            var idx = Val();
+            Next();
+            Emit(2);            // LOAD
+            Emit(idx);
+        } else {
+            var x = Val();
+            Next();
+            Emit(1);            // PUSH
+            Emit(x);
+        }
+    }
+
+    void Term() {
+        Factor();
+        while (Kind() == 4 || Kind() == 5) {
+            var op = Kind();
+            Next();
+            Factor();
+            if (op == 4) { Emit(6); }   // MUL
+            else { Emit(7); }           // DIV
+        }
+    }
+
+    void Add() {
+        Term();
+        while (Kind() == 2 || Kind() == 3) {
+            var op = Kind();
+            Next();
+            Term();
+            if (op == 2) { Emit(4); }   // ADD
+            else { Emit(5); }           // SUB
+        }
+    }
+
+    void Stmt() {
+        if (Kind() == 15) {             // print add ;
+            Next();
+            Add();
+            if (Kind() == 10) { Next(); }
+            Emit(8);                    // PRINT
+        } else if (Kind() == 8) {       // ident = add ;
+            var idx = Val();
+            Next();
+            if (Kind() == 9) {
+                Next();
+                Add();
+                Emit(3);                // STORE
+                Emit(idx);
+            }
+            if (Kind() == 10) { Next(); }
+        } else {
+            Add();
+            if (Kind() == 10) { Next(); }
+        }
+    }
+
+    int Compile() {
+        while (Kind() != 0) { Stmt(); }
+        Emit(0);                        // HALT
+        return clen;
+    }
+}
+
+class VM {
+    public int[] code;
+    public int clen;
+    public int[] stack;
+    public int sp;
+    public int[] env;
+    public int pc;
+
+    public VM() { }
+
+    void Init(int[] c, int len, int[] st, int[] e) {
+        code = c; clen = len; stack = st; sp = 0; env = e; pc = 0;
+    }
+
+    void Run() {
+        while (pc < clen) {
+            var op = code[pc];
+            pc = pc + 1;
+            if (op == 0) { return; }                 // HALT
+            else if (op == 1) {                      // PUSH n
+                stack[sp] = code[pc];
+                pc = pc + 1;
+                sp = sp + 1;
+            } else if (op == 2) {                    // LOAD idx
+                stack[sp] = env[code[pc]];
+                pc = pc + 1;
+                sp = sp + 1;
+            } else if (op == 3) {                    // STORE idx
+                sp = sp - 1;
+                env[code[pc]] = stack[sp];
+                pc = pc + 1;
+            } else if (op == 4) {                    // ADD
+                var b = stack[sp - 1];
+                var a = stack[sp - 2];
+                sp = sp - 1;
+                stack[sp - 1] = a + b;
+            } else if (op == 5) {                    // SUB
+                var b = stack[sp - 1];
+                var a = stack[sp - 2];
+                sp = sp - 1;
+                stack[sp - 1] = a - b;
+            } else if (op == 6) {                    // MUL
+                var b = stack[sp - 1];
+                var a = stack[sp - 2];
+                sp = sp - 1;
+                stack[sp - 1] = a * b;
+            } else if (op == 7) {                    // DIV
+                var b = stack[sp - 1];
+                var a = stack[sp - 2];
+                sp = sp - 1;
+                stack[sp - 1] = a / b;
+            } else if (op == 8) {                    // PRINT
+                sp = sp - 1;
+                Console.WriteLine(stack[sp]);
+            }
+        }
+    }
+}
+
+class Program {
+    static void Eval(int[] src, int len) {
+        var lex = new Lexer();
+        lex.Init(src, len);
+        var kinds = new int[256];
+        var vals = new int[256];
+        var cnt = lex.Tokenize(kinds, vals);
+
+        var code = new int[512];
+        var comp = new Compiler();
+        comp.Init(kinds, vals, cnt, code);
+        var clen = comp.Compile();
+
+        var env = new int[26];
+        var stack = new int[128];
+        var vm = new VM();
+        vm.Init(code, clen, stack, env);
+        vm.Run();
+    }
+
+    static void Main() {
+        Console.WriteLine(7000); // bytecode-VM stage start
+
+        // a*b -> 42
+        var a = new int[18];
+        a[0] = 97; // 'a'
+        a[1] = 61; // '='
+        a[2] = 54; // '6'
+        a[3] = 59; // ';'
+        a[4] = 98; // 'b'
+        a[5] = 61; // '='
+        a[6] = 55; // '7'
+        a[7] = 59; // ';'
+        a[8] = 112; // 'p'
+        a[9] = 114; // 'r'
+        a[10] = 105; // 'i'
+        a[11] = 110; // 'n'
+        a[12] = 116; // 't'
+        a[13] = 32; // ' '
+        a[14] = 97; // 'a'
+        a[15] = 42; // '*'
+        a[16] = 98; // 'b'
+        a[17] = 59; // ';'
+        Eval(a, 18);
+
+        // (x+y)*2 -> 60
+        var b = new int[24];
+        b[0] = 120; // 'x'
+        b[1] = 61; // '='
+        b[2] = 49; // '1'
+        b[3] = 48; // '0'
+        b[4] = 59; // ';'
+        b[5] = 121; // 'y'
+        b[6] = 61; // '='
+        b[7] = 50; // '2'
+        b[8] = 48; // '0'
+        b[9] = 59; // ';'
+        b[10] = 112; // 'p'
+        b[11] = 114; // 'r'
+        b[12] = 105; // 'i'
+        b[13] = 110; // 'n'
+        b[14] = 116; // 't'
+        b[15] = 32; // ' '
+        b[16] = 40; // '('
+        b[17] = 120; // 'x'
+        b[18] = 43; // '+'
+        b[19] = 121; // 'y'
+        b[20] = 41; // ')'
+        b[21] = 42; // '*'
+        b[22] = 50; // '2'
+        b[23] = 59; // ';'
+        Eval(b, 24);
+
+        // n-1 -> 99
+        var c = new int[16];
+        c[0] = 110; // 'n'
+        c[1] = 61; // '='
+        c[2] = 49; // '1'
+        c[3] = 48; // '0'
+        c[4] = 48; // '0'
+        c[5] = 59; // ';'
+        c[6] = 112; // 'p'
+        c[7] = 114; // 'r'
+        c[8] = 105; // 'i'
+        c[9] = 110; // 'n'
+        c[10] = 116; // 't'
+        c[11] = 32; // ' '
+        c[12] = 110; // 'n'
+        c[13] = 45; // '-'
+        c[14] = 49; // '1'
+        c[15] = 59; // ';'
+        Eval(c, 16);
+
+        // p*q+r*5 -> 26
+        var d = new int[26];
+        d[0] = 112; // 'p'
+        d[1] = 61; // '='
+        d[2] = 50; // '2'
+        d[3] = 59; // ';'
+        d[4] = 113; // 'q'
+        d[5] = 61; // '='
+        d[6] = 51; // '3'
+        d[7] = 59; // ';'
+        d[8] = 114; // 'r'
+        d[9] = 61; // '='
+        d[10] = 52; // '4'
+        d[11] = 59; // ';'
+        d[12] = 112; // 'p'
+        d[13] = 114; // 'r'
+        d[14] = 105; // 'i'
+        d[15] = 110; // 'n'
+        d[16] = 116; // 't'
+        d[17] = 32; // ' '
+        d[18] = 112; // 'p'
+        d[19] = 42; // '*'
+        d[20] = 113; // 'q'
+        d[21] = 43; // '+'
+        d[22] = 114; // 'r'
+        d[23] = 42; // '*'
+        d[24] = 53; // '5'
+        d[25] = 59; // ';'
+        Eval(d, 26);
+
+        Console.WriteLine(6000); // bytecode-VM stage end
+    }
+}
