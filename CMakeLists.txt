@@ -323,6 +323,28 @@ if(CLANG_EXE)
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfcompile.cmake)
 endif()
 
+# zc7.zan: adds instance methods (implicit ptr %this, @m<idx> callees).
+add_test(NAME selfhost_zc7_ir
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/src/self/zc7.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/zc7.ll
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/self_zc7_ir${_exe_ext}
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+if(CLANG_EXE)
+  add_test(NAME selfhost_zc7
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DZC0=${CMAKE_SOURCE_DIR}/src/self/zc7.zan
+      -DINPUT=${CMAKE_SOURCE_DIR}/src/self/zc7_input.zan
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -DBINDIR=${CMAKE_BINARY_DIR}
+      -DCLANG=${CLANG_EXE}
+      -DEXE_EXT=${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_selfcompile.cmake)
+endif()
+
 # ---- Determinism: codegen must be a pure function of the source ----
 # Compiling the same program twice must yield byte-identical LLVM IR. This is
 # the reproducible-build / correctness net that stands in for a self-hosting
@@ -383,6 +405,11 @@ add_test(NAME determinism_zc6
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/src/self/zc6.zan
+    -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
+add_test(NAME determinism_zc7
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/src/self/zc7.zan
     -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
 
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
