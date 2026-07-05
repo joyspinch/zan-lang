@@ -337,13 +337,30 @@ Self-contained IDE bundled with the compiler (single executable).
 - [x] **M7.6 — Self-hosting** *(in progress)*
   - Rewrite compiler in Zan
   - Bootstrap verification (gen2 == gen3)
-  - Progress: `src/self/selfhost.zan` implements a real tokenizer that scans an
-    actual character buffer (not a length estimate) and produces an exact token
-    classification (identifiers / keywords / numbers / operators), verified
-    against the C front-end. Earlier `bootstrap.zan` / `main.zan` model the
-    driver and phase pipeline. Full self-compilation is still gated on compiler
-    fixes for array-typed parameters, array class fields, and short-circuit
-    `&&` / `||` in control-flow conditions (tracked below).
+  - Progress: a staged suite under `src/self/`, each program **written in Zan**
+    and verified by compiling with `zanc` and running the produced native
+    executable. The stages build up from a tokenizer to a full bytecode
+    compiler + VM with functions and recursion:
+
+    | Stage | File | Demonstrates |
+    |-------|------|--------------|
+    | 1 | `selfhost.zan` | real-buffer tokenizer, exact token counts vs the C front-end |
+    | 2 | `selfparse.zan` | recursive-descent expression evaluator (precedence, parens) |
+    | 3 | `selfpipe.zan` | lexer → parser pipeline (tokens to parallel `kinds[]`/`vals[]` arrays) |
+    | 4 | `selfvars.zan` | variables + statements over an array-backed symbol table |
+    | 5 | `selfctrl.zan` | mini-language interpreter: `if`/`while`/`print`, comparisons, brace blocks |
+    | 6 | `selfvm.zan` | bytecode compiler + stack VM (compilation separated from execution) |
+    | 7 | `selfvmcf.zan` | bytecode control flow: `JMP`/`JZ` with backpatching for `if`/`while` |
+    | 8 | `selfvmfn.zan` | function calls: `CALL`/`RET`, per-call frames, recursion (factorial, Fibonacci) |
+    | 9 | `selfvmops.zan` | `%`/`==`/`!=` operators; compiles GCD and primality to bytecode |
+
+  - Enabling compiler fixes (all landed): short-circuit `&&`/`||` in
+    control-flow conditions, array-typed parameters (`int[]`), explicit
+    (`obj.field[i]`) and implicit-`this` (`field[i]`) array-field indexing,
+    forward-referenced method calls (two-pass declare/emit), and a UTF-8 BOM
+    skip in the lexer. With these, Zan is expressive enough to host a complete
+    bytecode compiler and virtual machine. Remaining work toward full
+    self-compilation of the C front-end is tracked as it progresses.
 
 ---
 
