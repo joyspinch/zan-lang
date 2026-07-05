@@ -401,16 +401,16 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_BOOL:   return LLVMInt1TypeInContext(g->ctx);
     case TYPE_BYTE:   return LLVMInt8TypeInContext(g->ctx);
     case TYPE_SHORT:  return LLVMInt16TypeInContext(g->ctx);
-    case TYPE_INT:    return LLVMInt32TypeInContext(g->ctx);
+    case TYPE_INT:    return LLVMInt64TypeInContext(g->ctx);
     case TYPE_LONG:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NINT:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
-    case TYPE_CHAR:   return LLVMInt32TypeInContext(g->ctx);
+    case TYPE_CHAR:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_STRING: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_OBJECT: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_ENUM:
-        return LLVMInt32TypeInContext(g->ctx);
+        return LLVMInt64TypeInContext(g->ctx);
     case TYPE_STRUCT:
     case TYPE_CLASS: {
         /* look up registered struct type */
@@ -831,7 +831,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 
     switch (expr->kind) {
     case AST_INT_LITERAL:
-        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), (uint64_t)expr->int_val, 1);
+        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), (uint64_t)expr->int_val, 1);
 
     case AST_FLOAT_LITERAL:
         return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx), expr->float_val);
@@ -843,7 +843,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), expr->bool_val ? 1 : 0, 0);
 
     case AST_CHAR_LITERAL:
-        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), (uint64_t)expr->int_val, 0);
+        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), (uint64_t)expr->int_val, 0);
 
     case AST_NULL_LITERAL:
         return LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
@@ -2123,7 +2123,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 em_decl->enum_member.value->kind == AST_INT_LITERAL) {
                                 enum_val = (int)em_decl->enum_member.value->int_val;
                             }
-                            return LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                            return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
                                                (uint64_t)enum_val, 0);
                         }
                         zan_ast_node_t *em_decl = enum_sym->members[ei]->decl;
@@ -3041,6 +3041,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
             LLVMBasicBlockRef case_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.case");
             LLVMValueRef case_val = emit_expr(g, sc->switch_case.pattern, locals);
+            /* case label must match the switch operand's integer width */
+            coerce_int_pair(g, &switch_val, &case_val);
             LLVMAddCase(sw, case_val, case_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, case_bb);
