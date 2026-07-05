@@ -2051,6 +2051,21 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
             return LLVMBuildLoad2(g->builder, i64, res, "dval");
         }
+        /* string[i] — load a single byte (i8) and zero-extend to i32 so that
+         * indexing a string yields the character code, enabling char-level
+         * lexing of real source text. */
+        if (arr_ptr && arr_type && arr_type->kind == TYPE_STRING) {
+            LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(LLVMTypeOf(idx)) != 64) {
+                idx = LLVMBuildSExt(g->builder, idx, i64, "idxext");
+            }
+            LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+            LLVMValueRef ch_ptr = LLVMBuildGEP2(g->builder, i8t, arr_ptr, &idx, 1, "chp");
+            LLVMValueRef ch = LLVMBuildLoad2(g->builder, i8t, ch_ptr, "ch");
+            return LLVMBuildZExt(g->builder, ch, LLVMInt32TypeInContext(g->ctx), "chz");
+        }
         if (arr_ptr && arr_type) {
             LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
             LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
