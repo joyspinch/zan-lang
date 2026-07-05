@@ -44,9 +44,11 @@ target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
 if(MSVC)
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} winhttp)
 elseif(WIN32)
-    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} -lwinhttp)
+    # MinGW: LLVM's static libs are C++ and pull in system libraries, so the
+    # C++ runtime and ${LLVM_SYSTEM_LIBS} must be linked explicitly.
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} winhttp stdc++)
 else()
-    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} stdc++ m pthread)
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} stdc++ m pthread)
 endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
 
@@ -70,6 +72,9 @@ add_executable(zan-lsp
 target_include_directories(zan-lsp PRIVATE src/compiler src/common src/ide)
 if(MSVC)
     target_compile_definitions(zan-lsp PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    # json.c uses floor(); libm is separate from libc on most Unix toolchains.
+    target_link_libraries(zan-lsp PRIVATE m)
 endif()
 
 # ---- Debug Adapter (M9) ----
@@ -83,6 +88,8 @@ add_executable(zan-dap
 target_include_directories(zan-dap PRIVATE src/common src/ide)
 if(MSVC)
     target_compile_definitions(zan-dap PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_link_libraries(zan-dap PRIVATE m)
 endif()
 
 

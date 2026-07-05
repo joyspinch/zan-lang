@@ -7,33 +7,80 @@ on:
     branches: ['**']
 
 jobs:
-  build:
+  # Linux + macOS share a POSIX shell and a system C compiler (used by zanc at
+  # link time). LLVM is provided with its CMake package config so that
+  # find_package(LLVM CONFIG) works.
+  build-unix:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest]
         build_type: [Debug, Release]
     runs-on: ${{ matrix.os }}
-
     steps:
     - uses: actions/checkout@v4
 
-    # Installs a prebuilt LLVM (including its CMake package config, which
-    # `find_package(LLVM CONFIG)` needs) uniformly across all three OSes.
-    - name: Install LLVM
+    - name: Install LLVM (Linux)
+      if: runner.os == 'Linux'
       uses: KyleMayes/install-llvm-action@v2
       with:
         version: "17.0"
         cached: true
 
+    - name: Set LLVM_DIR (Linux)
+      if: runner.os == 'Linux'
+      run: echo "LLVM_DIR=$LLVM_PATH/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+    - name: Install LLVM (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install llvm@17
+        echo "LLVM_DIR=$(brew --prefix llvm@17)/lib/cmake/llvm" >> "$GITHUB_ENV"
+
     - name: Configure
-      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLLVM_DIR="${{ env.LLVM_PATH }}/lib/cmake/llvm"
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLLVM_DIR="$LLVM_DIR"
 
     - name: Build
-      run: cmake --build build --config ${{ matrix.build_type }}
+      run: cmake --build build --config ${{ matrix.build_type }} -j
 
     - name: Test
       run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure
+
+  # Windows uses MSYS2/MinGW, which ships a prebuilt LLVM (with CMake config),
+  # clang (used by zanc at link time), CMake and Ninja in one self-contained
+  # toolchain — no Visual Studio environment juggling required.
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-llvm
+          mingw-w64-x86_64-clang
+          mingw-w64-x86_64-lld
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-ninja
+
+    - name: Configure
+      run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLLVM_DIR="/mingw64/lib/cmake/llvm"
+
+    - name: Build
+      run: cmake --build build -j
+
+    - name: Test
+      run: ctest --test-dir build --output-on-failure
 
   lint:
     runs-on: ubuntu-latest
