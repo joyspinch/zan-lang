@@ -129,15 +129,19 @@ class Irgen {
     bool HasMod(Node m, int flag) { return (m.mods / flag) - ((m.mods / flag) / 2) * 2 == 1; }
     bool IsVirtual(Node m) { return HasMod(m, MOD.Virtual()); }
     bool IsOverride(Node m) { return HasMod(m, MOD.Override()); }
+    bool IsAbstract(Node m) { return HasMod(m, MOD.Abstract()); }
+    // introduces a fresh vtable slot: virtual or abstract, but not an override
+    bool IsVSlotIntro(Node m) { return (IsVirtual(m) || IsAbstract(m)) && !IsOverride(m); }
 
-    // A class is polymorphic if it or any ancestor declares a virtual/override
-    // method; such classes carry a vtable pointer in field slot 0.
+    // A class is polymorphic if it or any ancestor declares a virtual/abstract/
+    // override method; such classes carry a vtable pointer in field slot 0.
+    // Interfaces are modelled as abstract classes and are polymorphic too.
     bool IsPolyClass(Node cls) {
         if (cls == null) { return false; }
         int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.MethodDecl() && (IsVirtual(m) || IsOverride(m))) { return true; }
+            if (m.kind == AK.MethodDecl() && (IsVirtual(m) || IsOverride(m) || IsAbstract(m))) { return true; }
             i = i + 1;
         }
         return IsPolyClass(BaseClassOf(cls));
@@ -277,7 +281,7 @@ class Irgen {
         i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
-            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && IsPolyClass(d)) { EmitVtable(d); }
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && IsPolyClass(d) && !HasMod(d, MOD.Abstract())) { EmitVtable(d); }
             i = i + 1;
         }
         // function bodies
@@ -572,7 +576,10 @@ class Irgen {
         int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.MethodDecl()) { GenMethod(cls, m, false); }
+            if (m.kind == AK.MethodDecl()) {
+                // abstract/interface methods have no body: no function is emitted
+                if (!IsAbstract(m)) { GenMethod(cls, m, false); }
+            }
             else if (m.kind == AK.CtorDecl()) { GenCtor(cls, m); }
             i = i + 1;
         }
@@ -791,7 +798,7 @@ class Irgen {
         int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.MethodDecl() && IsVirtual(m) && !IsOverride(m)) { slots.Add(m.sval); }
+            if (m.kind == AK.MethodDecl() && IsVSlotIntro(m)) { slots.Add(m.sval); }
             i = i + 1;
         }
     }
@@ -804,16 +811,14 @@ class Irgen {
         return -1;
     }
 
-    // most-derived class (from cls upward) that provides a virtual method body
+    // most-derived class (from cls upward) providing a concrete body for a slot.
+    // Matches explicit override AND implicit interface implementation (a plain
+    // method whose name matches an inherited abstract/virtual slot).
     string ResolveImpl(Node cls, string name) {
         Node c = cls;
         while (c != null) {
-            int i = 0;
-            while (i < c.kids.Count) {
-                Node m = c.kids[i];
-                if (m.kind == AK.MethodDecl() && m.sval == name && (IsVirtual(m) || IsOverride(m))) { return c.sval; }
-                i = i + 1;
-            }
+            Node m = binder.FindMethod(c, name);
+            if (m != null && !IsAbstract(m)) { return c.sval; }
             c = BaseClassOf(c);
         }
         return "";
@@ -1560,7 +1565,7 @@ class Irgen {
     ExprVal EmitInstanceCall(ExprVal recv, string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
         Node m = FindMethodUp(cls, name);
-        if (m != null && IsPolyClass(cls) && (IsVirtual(m) || IsOverride(m))) {
+        if (m != null && IsPolyClass(cls) && VSlotIndex(cls, name) >= 0) {
             return EmitVirtualCall(recv, cls, name, m, e);
         }
         string owner = MethodOwner(cls, name);
