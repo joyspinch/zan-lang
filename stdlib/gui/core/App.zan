@@ -1,0 +1,335 @@
+using System;
+
+namespace Gui;
+
+class App {
+    Window window;
+    Canvas canvas;
+    Theme theme;
+    FocusManager focus;
+    HitTester hitTester;
+    bool isRunning;
+    bool needsRedraw;
+    int frameCount;
+    int mouseX;
+    int mouseY;
+    int scrollY;
+    int contentHeight;
+    int scrollSpeed;
+    int dpiScale;
+    int titlebarH;
+    int captionBtnW;
+    int splitX;
+    int sidebarScrollY;
+    int sidebarContentHeight;
+    bool isDark;
+    bool isTopmost;
+
+    static App Create(string title, int width, int height) {
+        App app = new App();
+        app.window = Window.Create(title, width, height);
+        app.theme = Theme.Light();
+        app.focus = FocusManager.Create();
+        app.hitTester = HitTester.Create();
+        app.isRunning = true;
+        app.needsRedraw = true;
+        app.frameCount = 0;
+        app.mouseX = 0;
+        app.mouseY = 0;
+        app.scrollY = 0;
+        app.contentHeight = 0;
+        app.scrollSpeed = 40;
+        app.dpiScale = 100;
+        app.titlebarH = 32;
+        app.captionBtnW = 46;
+        app.splitX = 0;
+        app.sidebarScrollY = 0;
+        app.sidebarContentHeight = 0;
+        app.isDark = false;
+        app.isTopmost = false;
+        app.canvas = Canvas.Create(width, height);
+        return app;
+    }
+
+    static App CreateDark(string title, int width, int height) {
+        App app = App.Create(title, width, height);
+        app.theme = Theme.Dark();
+        app.isDark = true;
+        return app;
+    }
+
+    /// Swaps the active theme (light/dark) and re-applies DPI scaling.
+    void SetDark(bool dark) {
+        isDark = dark;
+        if (dark) { theme = Theme.Dark(); } else { theme = Theme.Light(); }
+        theme.ScaleByDpi(dpiScale);
+        needsRedraw = true;
+    }
+
+    void Show() {
+        window.Show();
+        int realW = window.GetWidth();
+        int realH = window.GetHeight();
+        if (realW != canvas.Width() || realH != canvas.Height()) {
+            canvas.Destroy();
+            canvas = Canvas.Create(realW, realH);
+        }
+        dpiScale = Canvas.GetDpiScale();
+        theme.ScaleByDpi(dpiScale);
+        scrollSpeed = 40 * dpiScale / 100;
+        titlebarH = Window.TitlebarHeight();
+        captionBtnW = Window.CaptionButtonWidth();
+        if (titlebarH < 24) { titlebarH = Scale(32); }
+        if (captionBtnW < 24) { captionBtnW = Scale(46); }
+        // Chrome draws 5 caption buttons (theme, pin, min, max, close); tell the
+        // runtime so the draggable title-bar region excludes all of them.
+        window.SetCaptionButtons(5);
+    }
+
+    /// Height reserved by the custom title bar; content should start below it.
+    int ContentTop() {
+        return titlebarH;
+    }
+
+    /// Draws the borderless-window title bar (brand + drag area + min/max/close
+    /// caption buttons) and processes clicks on the caption buttons. Should be
+    /// drawn last each frame so it overlays content.
+    void RenderChrome(string title) {
+        Canvas c = canvas;
+        Theme t = theme;
+        int W = c.Width();
+        int hbar = titlebarH;
+
+        c.FillRect(0, 0, W, hbar, t.bgSecondary);
+        c.FillRect(0, hbar - 1, W, 1, t.divider);
+
+        int pad = t.paddingLarge;
+        int brand = t.iconSizeSmall;
+        Icon.Draw(c, "home", pad, (hbar - brand) / 2, brand, t.primary);
+        int txtY = (hbar - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+        c.DrawText(pad + brand + t.gapSmall, txtY, title, t.textPrimary, t.fontSizeMedium);
+
+        // Right cluster, left->right: theme, pin, minimize, maximize, close.
+        int bw = captionBtnW;
+        int themeX = W - bw * 5;
+        int pinX = W - bw * 4;
+        int minX = W - bw * 3;
+        int maxX = W - bw * 2;
+        int closeX = W - bw;
+
+        int themeId = focus.AllocId();
+        int pinId = focus.AllocId();
+        int minId = focus.AllocId();
+        int maxId = focus.AllocId();
+        int closeId = focus.AllocId();
+
+        bool themeH = focus.IsHovered(themeId);
+        bool pinH = focus.IsHovered(pinId);
+        bool minH = focus.IsHovered(minId);
+        bool maxH = focus.IsHovered(maxId);
+        bool closeH = focus.IsHovered(closeId);
+
+        if (themeH) { c.FillRect(themeX, 0, bw, hbar, t.bgHover); }
+        if (pinH) { c.FillRect(pinX, 0, bw, hbar, t.bgHover); }
+        if (minH) { c.FillRect(minX, 0, bw, hbar, t.bgHover); }
+        if (maxH) { c.FillRect(maxX, 0, bw, hbar, t.bgHover); }
+        if (closeH) { c.FillRect(closeX, 0, bw, hbar, t.error); }
+
+        int gl = t.iconSizeSmall;
+        int gcolor = t.textSecondary;
+
+        // Theme toggle: sun in light mode, moon in dark mode.
+        int themeColor = gcolor;
+        if (themeH) { themeColor = t.textPrimary; }
+        string themeIcon = "moon";
+        if (isDark) { themeIcon = "sun"; }
+        Icon.DrawCenteredIn(c, themeIcon, themeX, 0, bw, hbar, gl, themeColor);
+
+        // Pin (always-on-top): accent color + filled glyph when active.
+        int pinColor = gcolor;
+        if (pinH) { pinColor = t.textPrimary; }
+        string pinIcon = "pin";
+        if (isTopmost) { pinIcon = "unpin"; pinColor = t.primary; }
+        Icon.DrawCenteredIn(c, pinIcon, pinX, 0, bw, hbar, gl, pinColor);
+
+        int minColor = gcolor;
+        if (minH) { minColor = t.textPrimary; }
+        Icon.DrawCenteredIn(c, "minimize", minX, 0, bw, hbar, gl, minColor);
+
+        string maxName = "maximize";
+        if (window.IsMaximized()) { maxName = "restore"; }
+        int maxColor = gcolor;
+        if (maxH) { maxColor = t.textPrimary; }
+        Icon.DrawCenteredIn(c, maxName, maxX, 0, bw, hbar, gl, maxColor);
+
+        int xcolor = gcolor;
+        if (closeH) { xcolor = t.textInverse; }
+        Icon.DrawCenteredIn(c, "close", closeX, 0, bw, hbar, gl, xcolor);
+
+        hitTester.Register(HitRegion.Create(themeId, themeX, 0, bw, hbar, 3));
+        hitTester.Register(HitRegion.Create(pinId, pinX, 0, bw, hbar, 3));
+        hitTester.Register(HitRegion.Create(minId, minX, 0, bw, hbar, 3));
+        hitTester.Register(HitRegion.Create(maxId, maxX, 0, bw, hbar, 3));
+        hitTester.Register(HitRegion.Create(closeId, closeX, 0, bw, hbar, 3));
+
+        if (window.EventKind() == 3) {
+            int hit = hitTester.HitTest(mouseX, mouseY);
+            if (hit == themeId) {
+                SetDark(!isDark);
+            } else if (hit == pinId) {
+                isTopmost = !isTopmost;
+                window.SetTopmost(isTopmost);
+                needsRedraw = true;
+            } else if (hit == minId) {
+                window.Minimize();
+            } else if (hit == maxId) {
+                window.ToggleMaximize();
+            } else if (hit == closeId) {
+                window.Close();
+            }
+        }
+    }
+
+    void RequestRedraw() {
+        needsRedraw = true;
+    }
+
+    void SetContentHeight(int h) {
+        contentHeight = h;
+    }
+
+    int ViewportHeight() {
+        return canvas.Height();
+    }
+
+    int Scale(int v) {
+        return v * dpiScale / 100;
+    }
+
+    void SetTheme(Theme t) {
+        theme = t;
+        theme.ScaleByDpi(dpiScale);
+        needsRedraw = true;
+    }
+
+    bool ProcessEvent() {
+        // If a repaint is already pending (e.g. a click handler changed state
+        // mid-frame), don't block waiting for the next OS event — poll so the
+        // new state paints immediately. Otherwise block until an event arrives.
+        int result;
+        if (needsRedraw) {
+            result = window.PollEvent();
+        } else {
+            result = window.WaitEvent();
+        }
+        if (result < 0) {
+            isRunning = false;
+            return false;
+        }
+
+        int kind = window.EventKind();
+
+        if (kind == 8) {
+            isRunning = false;
+            return false;
+        }
+
+        // Keep the render surface locked to the real window size. Maximize/restore
+        // sends WM_SIZE synchronously (inside ShowWindow), and the one-shot resize
+        // event can be cleared before we read it — so drive the surface from the
+        // persistent window dimensions, not the transient kind==7 event. This
+        // guarantees Present() blits 1:1 (never stretched/blurry) and that layout
+        // + hit-testing use the same coordinate space as the mouse.
+        int curW = window.GetWidth();
+        int curH = window.GetHeight();
+        if (curW > 0 && curH > 0) {
+            if (curW != canvas.Width() || curH != canvas.Height()) {
+                canvas.Destroy();
+                canvas = Canvas.Create(curW, curH);
+                scrollY = 0;
+                needsRedraw = true;
+            }
+        }
+
+        if (kind == 1) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            int oldHover = focus.hoveredId;
+            focus.SetHovered(hitId);
+            if (hitId != oldHover) {
+                needsRedraw = true;
+            }
+            // While a widget is held (e.g. slider/scrollbar drag) keep repainting
+            // as the pointer moves so the value tracks the cursor live.
+            if (focus.pressedId >= 0) {
+                needsRedraw = true;
+            }
+            int cursorId = hitId;
+            if (focus.pressedId >= 0) { cursorId = focus.pressedId; }
+            int wtype = hitTester.GetWidgetType(cursorId);
+            if (wtype == 0) {
+                Window.SetCursor(1);
+            } else if (wtype == 1) {
+                Window.SetCursor(2);
+            } else {
+                Window.SetCursor(0);
+            }
+        }
+
+        if (kind == 2) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            focus.SetPressed(hitId);
+            focus.SetFocused(hitId);
+            needsRedraw = true;
+        }
+
+        if (kind == 3) {
+            focus.ClearPress();
+            needsRedraw = true;
+        }
+
+        if (kind == 13) {
+            int delta = window.EventKeyCode();
+            int viewH = canvas.Height() - titlebarH;
+            if (splitX > 0 && mouseX < splitX) {
+                // Scroll the sidebar when the pointer is over it.
+                int oldS = sidebarScrollY;
+                sidebarScrollY = sidebarScrollY - delta * scrollSpeed / 120;
+                if (sidebarScrollY < 0) { sidebarScrollY = 0; }
+                int maxS = sidebarContentHeight - viewH;
+                if (maxS < 0) { maxS = 0; }
+                if (sidebarScrollY > maxS) { sidebarScrollY = maxS; }
+                if (sidebarScrollY != oldS) { needsRedraw = true; }
+            } else {
+                int oldScroll = scrollY;
+                scrollY = scrollY - delta * scrollSpeed / 120;
+                if (scrollY < 0) { scrollY = 0; }
+                int maxScroll = contentHeight - viewH;
+                if (maxScroll < 0) { maxScroll = 0; }
+                if (scrollY > maxScroll) { scrollY = maxScroll; }
+                if (scrollY != oldScroll) {
+                    needsRedraw = true;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    void PresentFrame() {
+        window.Present(canvas);
+        frameCount = frameCount + 1;
+    }
+
+    void BeginFrame() {
+        // Clear the redraw flag at frame start; handlers invoked during this
+        // frame may set it again to request an immediate follow-up repaint.
+        needsRedraw = false;
+        hitTester.Clear();
+        focus.ResetIds();
+        canvas.Clear(theme.bgPrimary);
+    }
+}
