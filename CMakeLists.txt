@@ -175,6 +175,16 @@ add_test(NAME conformance_minic
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Gui.Stack layout engine: headless check of the layout cursor math ----
+add_test(NAME conformance_gui_stack
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/examples/layout_test.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Types.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)
