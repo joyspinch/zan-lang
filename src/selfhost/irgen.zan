@@ -100,9 +100,43 @@ class Irgen {
         return t;
     }
 
+    bool IsNullable(Node t) { return t != null && t.op == 1; }
+
+    bool IsPrimValue(Node t) {
+        if (t == null) { return false; }
+        string n = t.sval;
+        return n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "double" || n == "float";
+    }
+
+    bool IsNullableValue(Node t) { return IsNullable(t) && IsPrimValue(t); }
+
+    string UnderLL(Node t) {
+        if (t.sval == "double" || t.sval == "float") { return "double"; }
+        return "i64";
+    }
+
+    // box a value into a heap slot, returning the i8* handle (null = no value)
+    string BoxVal(ExprVal v, Node ty) {
+        string ult = UnderLL(ty);
+        string raw = NT();
+        L("  " + raw + " = call i8* @malloc(i64 8)");
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + raw + " to " + ult + "*");
+        L("  store " + ult + " " + Coerce(v, ult) + ", " + ult + "* " + p);
+        return raw;
+    }
+
+    // operand to store into a nullable value-type slot (i8*)
+    string BoxFor(ExprVal v, Node ty) {
+        if (v.op == "null") { return "null"; }
+        if (IsNullableValue(v.ty)) { return v.op; }
+        return BoxVal(v, ty);
+    }
+
     string MapType(Node t) {
         if (t == null) { return "void"; }
         string n = t.sval;
+        if (IsNullableValue(t)) { return "i8*"; }
         if (IsErasedType(t)) { return "i64"; }
         if (n == "void") { return "void"; }
         if (n == "string") { return "i8*"; }
@@ -922,7 +956,11 @@ class Irgen {
         string reg = AddLocal(s.sval, ty);
         L("  " + reg + " = alloca " + lt);
         if (hasInit) {
-            L("  store " + lt + " " + Coerce(init, lt) + ", " + lt + "* " + reg);
+            if (IsNullableValue(ty)) {
+                L("  store i8* " + BoxFor(init, ty) + ", i8** " + reg);
+            } else {
+                L("  store " + lt + " " + Coerce(init, lt) + ", " + lt + "* " + reg);
+            }
         }
     }
 
@@ -1434,7 +1472,12 @@ class Irgen {
         if (lhs.kind == AK.Ident()) {
             int li = LocalIdx(lhs.sval);
             if (li >= 0) {
-                string lt = MapType(locType[li]);
+                Node lty = locType[li];
+                if (IsNullableValue(lty)) {
+                    L("  store i8* " + BoxFor(v, lty) + ", i8** " + locReg[li]);
+                    return;
+                }
+                string lt = MapType(lty);
                 L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + locReg[li]);
                 return;
             }
@@ -1657,6 +1700,22 @@ class Irgen {
     // ---- member access (field / .Length / .Count) ----
     ExprVal GenMember(Node e) {
         ExprVal obj = GenExpr(e.a);
+        if (IsNullableValue(obj.ty) && e.sval == "HasValue") {
+            string t = NT();
+            L("  " + t + " = icmp ne i8* " + obj.op + ", null");
+            string z = NT();
+            L("  " + z + " = zext i1 " + t + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (IsNullableValue(obj.ty) && e.sval == "Value") {
+            string ult = UnderLL(obj.ty);
+            string p = NT();
+            L("  " + p + " = bitcast i8* " + obj.op + " to " + ult + "*");
+            string t = NT();
+            L("  " + t + " = load " + ult + ", " + ult + "* " + p);
+            Node uty = MkType(obj.ty.sval);
+            return new ExprVal(t, uty);
+        }
         if (IsTuple(obj.ty) && IsItemName(e.sval)) {
             int idx = ItemIndex(e.sval);
             List<Node> ekids = obj.ty.kids;
