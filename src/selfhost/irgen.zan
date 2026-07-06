@@ -369,6 +369,7 @@ class Irgen {
         H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
+        EmitArcRuntime();
         EmitListRuntime();
         EmitSbRuntime();
         EmitDictRuntime();
@@ -419,7 +420,7 @@ class Irgen {
     void EmitListRuntime() {
         H("%zlist = type { i64, i64, i64* }");
         H("define i8* @zlist_new() {");
-        H("  %p = call i8* @malloc(i64 24)");
+        H("  %p = call i8* @zalloc(i64 24)");
         H("  %l = bitcast i8* %p to %zlist*");
         H("  %c = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -484,12 +485,59 @@ class Irgen {
         H("}");
     }
 
+    // ARC: every heap object carries a hidden 8-byte refcount header that lives
+    // immediately BEFORE the pointer handed out, so object field layout, vtable
+    // slot 0 and container internals are all unchanged. zalloc initialises the
+    // count to 1; zretain/zrelease adjust it; zrelease frees at count 0.
+    void EmitArcRuntime() {
+        H("define i8* @zalloc(i64 %n) {");
+        H("  %tot = add i64 %n, 8");
+        H("  %raw = call i8* @malloc(i64 %tot)");
+        H("  %rc = bitcast i8* %raw to i64*");
+        H("  store i64 1, i64* %rc");
+        H("  %obj = getelementptr i8, i8* %raw, i64 8");
+        H("  ret i8* %obj");
+        H("}");
+        H("define void @zretain(i8* %p) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %done, label %go");
+        H("go:");
+        H("  %hdr = getelementptr i8, i8* %p, i64 -8");
+        H("  %rc = bitcast i8* %hdr to i64*");
+        H("  %c = load i64, i64* %rc");
+        H("  %nc = add i64 %c, 1");
+        H("  store i64 %nc, i64* %rc");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+        H("define void @zrelease(i8* %p) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %done, label %go");
+        H("go:");
+        H("  %hdr = getelementptr i8, i8* %p, i64 -8");
+        H("  %rc = bitcast i8* %hdr to i64*");
+        H("  %c = load i64, i64* %rc");
+        H("  %nc = sub i64 %c, 1");
+        H("  store i64 %nc, i64* %rc");
+        H("  %dead = icmp sle i64 %nc, 0");
+        H("  br i1 %dead, label %dofree, label %done");
+        H("dofree:");
+        H("  call void @free(i8* %hdr)");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+    }
+
     // StringBuilder: growable byte buffer { count, cap, i8* data }. Append is
     // amortised O(1) (capacity doubling); ToString materialises one string.
     void EmitSbRuntime() {
         H("%zsb = type { i64, i64, i8* }");
         H("define i8* @zsb_new() {");
-        H("  %p = call i8* @malloc(i64 24)");
+        H("  %p = call i8* @zalloc(i64 24)");
         H("  %b = bitcast i8* %p to %zsb*");
         H("  %c = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -550,7 +598,7 @@ class Irgen {
     void EmitDictRuntime() {
         H("%zdict = type { i64, i64, i8**, i64* }");
         H("define i8* @zdict_new() {");
-        H("  %p = call i8* @malloc(i64 32)");
+        H("  %p = call i8* @zalloc(i64 32)");
         H("  %d = bitcast i8* %p to %zdict*");
         H("  %c = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -1868,7 +1916,7 @@ class Irgen {
         string szi = NT();
         L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
         string raw = NT();
-        L("  " + raw + " = call i8* @malloc(i64 " + szi + ")");
+        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ")");
         string obj = NT();
         L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
         if (IsPolyClass(cls)) {
