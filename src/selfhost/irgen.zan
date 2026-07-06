@@ -1148,6 +1148,7 @@ class Irgen {
         if (k == AK.Lambda()) { return GenLambda(e); }
         if (k == AK.SwitchExpr()) { return GenSwitchExpr(e); }
         if (k == AK.TupleExpr()) { return GenTuple(e); }
+        if (k == AK.IsExpr()) { return GenIs(e); }
         if (k == AK.MemberAccess()) { return GenMember(e); }
         if (k == AK.Index()) { return GenIndex(e); }
         if (k == AK.NewExpr()) { return GenNew(e); }
@@ -1545,6 +1546,66 @@ class Irgen {
         int n = 0; int i = 4;
         while (i < s.Length) { n = n * 10 + (s[i] - '0'); i = i + 1; }
         return n - 1;
+    }
+
+    // is class `sub` equal to or derived from `baseName`?
+    bool IsSubclassName(string sub, string baseName) {
+        Node c = binder.FindType(sub);
+        while (c != null) {
+            if (c.sval == baseName) { return true; }
+            c = BaseClassOf(c);
+        }
+        return false;
+    }
+
+    // type test:  obj is T [name].  Closed-world RTTI: compare the object's
+    // vtable pointer against the vtable of T and of every concrete polymorphic
+    // subclass of T. Optional `name` binds obj cast to T*.
+    ExprVal GenIs(Node e) {
+        ExprVal obj = GenExpr(e.a);
+        string tname = e.type.sval;
+        string sty = obj.ty.sval;
+        Node scls = binder.FindType(sty);
+        if (e.sval != "") {
+            string reg = AddLocal(e.sval, e.type);
+            L("  " + reg + " = alloca %" + tname + "*");
+            string bc = NT();
+            L("  " + bc + " = bitcast " + MapType(obj.ty) + " " + obj.op + " to %" + tname + "*");
+            L("  store %" + tname + "* " + bc + ", %" + tname + "** " + reg);
+        }
+        if (scls == null || !IsPolyClass(scls)) {
+            int ok = 0;
+            if (IsSubclassName(sty, tname)) { ok = 1; }
+            return new ExprVal("" + ok, MkType("bool"));
+        }
+        string vtp = NT();
+        L("  " + vtp + " = getelementptr %" + sty + ", %" + sty + "* " + obj.op + ", i32 0, i32 0");
+        string vt = NT();
+        L("  " + vt + " = load i8*, i8** " + vtp);
+        List<Node> ts = binder.types;
+        string acc = "";
+        int i = 0;
+        while (i < ts.Count) {
+            Node c = ts[i];
+            bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
+            if (isCls && IsPolyClass(c) && !HasMod(c, MOD.Abstract()) && IsSubclassName(c.sval, tname)) {
+                List<string> vslots = new List<string>();
+                CollectVSlots(c, vslots);
+                string cmp = NT();
+                L("  " + cmp + " = icmp eq i8* " + vt + ", bitcast ([" + vslots.Count + " x i8*]* @" + c.sval + "_vtable to i8*)");
+                if (acc == "") { acc = cmp; }
+                else {
+                    string o = NT();
+                    L("  " + o + " = or i1 " + acc + ", " + cmp);
+                    acc = o;
+                }
+            }
+            i = i + 1;
+        }
+        if (acc == "") { return new ExprVal("0", MkType("bool")); }
+        string z = NT();
+        L("  " + z + " = zext i1 " + acc + " to i64");
+        return new ExprVal(z, MkType("bool"));
     }
 
     // tuple literal (a, b, ...) -> heap i64[N], each element packed into a slot.
