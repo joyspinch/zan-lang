@@ -716,6 +716,8 @@ class Irgen {
             GenWhile(s);
         } else if (k == AK.ForStmt()) {
             GenFor(s);
+        } else if (k == AK.ForeachStmt()) {
+            GenForeach(s);
         } else if (k == AK.BreakStmt()) {
             if (brkTarget > 0) { L("  br label %L" + brkTarget); term = true; }
         } else if (k == AK.ContinueStmt()) {
@@ -903,6 +905,48 @@ class Irgen {
         if (!term) { L("  br label %L" + linc); }
         Label(linc);
         if (s.c != null) { GenExpr(s.c); }
+        L("  br label %L" + lc);
+        Label(lend);
+        brkTarget = sb; contTarget = sc;
+    }
+
+    // foreach (T x in coll) body  — lowered as an indexed walk over List<T>
+    void GenForeach(Node s) {
+        ExprVal coll = GenExpr(s.b);
+        if (!IsListType(coll.ty)) { return; }
+        Node elemTy = s.type;
+        if (elemTy == null) { elemTy = ListElem(coll.ty); }
+        string elt = MapType(elemTy);
+        string idx = NT();
+        L("  " + idx + " = alloca i64");
+        L("  store i64 0, i64* " + idx);
+        string ereg = AddLocal(s.sval, elemTy);
+        L("  " + ereg + " = alloca " + elt);
+        int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        int sb = brkTarget; int sc = contTarget;
+        brkTarget = lend; contTarget = linc;
+        L("  br label %L" + lc);
+        Label(lc);
+        string iv = NT();
+        L("  " + iv + " = load i64, i64* " + idx);
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + coll.op + ")");
+        string c = NT();
+        L("  " + c + " = icmp slt i64 " + iv + ", " + cnt);
+        L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        Label(lb);
+        string slot = NT();
+        L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
+        ExprVal ev = FromSlot(slot, elemTy);
+        L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+        GenStmt(s.c);
+        if (!term) { L("  br label %L" + linc); }
+        Label(linc);
+        string iv2 = NT();
+        L("  " + iv2 + " = load i64, i64* " + idx);
+        string inc = NT();
+        L("  " + inc + " = add i64 " + iv2 + ", 1");
+        L("  store i64 " + inc + ", i64* " + idx);
         L("  br label %L" + lc);
         Label(lend);
         brkTarget = sb; contTarget = sc;
