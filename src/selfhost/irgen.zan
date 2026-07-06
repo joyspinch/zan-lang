@@ -1251,19 +1251,8 @@ class Irgen {
             L("  " + z + " = zext i1 " + r + " to i64");
             return new ExprVal(z, MkType("bool"));
         }
-        // addition: concatenate when either operand is a string, else integer add
-        if (op == TK.Plus()) {
-            ExprVal a = GenExpr(e.a);
-            ExprVal b = GenExpr(e.b);
-            if (IsStr(a.ty) || IsStr(b.ty)) {
-                return StrConcat(ToCStr(a), ToCStr(b));
-            }
-            string t = NT();
-            L("  " + t + " = add i64 " + a.op + ", " + b.op);
-            return new ExprVal(t, MkType("int"));
-        }
+        // pointer/null comparisons (peek operand kind before evaluating)
         if (op == TK.EqEq() || op == TK.BangEq()) {
-            // pointer/null comparisons
             if (e.a.kind == AK.NullLit() || e.b.kind == AK.NullLit()) {
                 Node other = e.a; if (e.a.kind == AK.NullLit()) { other = e.b; }
                 ExprVal ov = GenExpr(other);
@@ -1275,8 +1264,22 @@ class Irgen {
                 L("  " + z + " = zext i1 " + c + " to i64");
                 return new ExprVal(z, MkType("bool"));
             }
-            ExprVal a = GenExpr(e.a);
-            ExprVal b = GenExpr(e.b);
+        }
+        ExprVal a = GenExpr(e.a);
+        ExprVal b = GenExpr(e.b);
+        // user-defined operator overloading takes precedence for class operands
+        ExprVal ov = TryOpOverload(op, a, b);
+        if (ov != null) { return ov; }
+        // addition: concatenate when either operand is a string, else integer add
+        if (op == TK.Plus()) {
+            if (IsStr(a.ty) || IsStr(b.ty)) {
+                return StrConcat(ToCStr(a), ToCStr(b));
+            }
+            string t = NT();
+            L("  " + t + " = add i64 " + a.op + ", " + b.op);
+            return new ExprVal(t, MkType("int"));
+        }
+        if (op == TK.EqEq() || op == TK.BangEq()) {
             if (IsStr(a.ty) && IsStr(b.ty)) {
                 string r = NT();
                 L("  " + r + " = call i32 @strcmp(i8* " + a.op + ", i8* " + b.op + ")");
@@ -1296,16 +1299,12 @@ class Irgen {
         }
         string ar = ArithOp(op);
         if (ar != "") {
-            ExprVal a = GenExpr(e.a);
-            ExprVal b = GenExpr(e.b);
             string t = NT();
             L("  " + t + " = " + ar + " i64 " + a.op + ", " + b.op);
             return new ExprVal(t, MkType("int"));
         }
         string cp = CmpOp(op);
         if (cp != "") {
-            ExprVal a = GenExpr(e.a);
-            ExprVal b = GenExpr(e.b);
             string c = NT();
             L("  " + c + " = icmp " + cp + " i64 " + a.op + ", " + b.op);
             string z = NT();
@@ -1313,6 +1312,49 @@ class Irgen {
             return new ExprVal(z, MkType("bool"));
         }
         return new ExprVal("0", MkType("int"));
+    }
+
+    // Map an operator token to the mangled method name (must match parser).
+    string OpName(int op) {
+        if (op == TK.Plus()) { return "op_add"; }
+        if (op == TK.Minus()) { return "op_sub"; }
+        if (op == TK.Star()) { return "op_mul"; }
+        if (op == TK.Slash()) { return "op_div"; }
+        if (op == TK.Percent()) { return "op_mod"; }
+        if (op == TK.EqEq()) { return "op_eq"; }
+        if (op == TK.BangEq()) { return "op_ne"; }
+        if (op == TK.Less()) { return "op_lt"; }
+        if (op == TK.Greater()) { return "op_gt"; }
+        if (op == TK.LessEq()) { return "op_le"; }
+        if (op == TK.GreaterEq()) { return "op_ge"; }
+        return "";
+    }
+
+    // Dispatch a binary op to a static operator method on either operand's
+    // class, e.g. a + b -> @Vec_op_add(Vec, Vec). Returns null when none.
+    ExprVal TryOpOverload(int op, ExprVal a, ExprVal b) {
+        string mn = OpName(op);
+        if (mn == "") { return null; }
+        string owner = "";
+        Node m = null;
+        Node ca = ClassOf(a.ty);
+        if (ca != null) { m = binder.FindMethod(ca, mn); if (m != null) { owner = a.ty.sval; } }
+        if (m == null) {
+            Node cb = ClassOf(b.ty);
+            if (cb != null) { m = binder.FindMethod(cb, mn); if (m != null) { owner = b.ty.sval; } }
+        }
+        if (m == null) { return null; }
+        Node p0 = ParamTypeNode(m, 0);
+        Node p1 = ParamTypeNode(m, 1);
+        string args = MapType(p0) + " " + CallArg(a, p0) + ", " + MapType(p1) + " " + CallArg(b, p1);
+        string rt = MapType(m.type);
+        if (rt == "void") {
+            L("  call void @" + owner + "_" + mn + "(" + args + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " @" + owner + "_" + mn + "(" + args + ")");
+        return new ExprVal(t, m.type);
     }
 
     bool ExprIsStr(Node e) {
