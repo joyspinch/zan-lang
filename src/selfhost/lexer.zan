@@ -187,6 +187,50 @@ class Lexer {
         return new Token(TK.StringLit(), t, 0, startLine, startCol);
     }
 
+    // Interpolated string $"...{expr}...". Spliced into an ordinary
+    // concatenation token stream: ( "" + "seg" + ( expr ) + "seg" + ... ).
+    // The leading "" guarantees a string-typed result even for $"{x}".
+    void InterpStr(List<Token> toks, int sl, int sc) {
+        Adv(); // $
+        Adv(); // opening quote
+        toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), "", 0, sl, sc));
+        int start = pos;
+        while (pos < n && Peek() != 34) {
+            int c = Peek();
+            if (c == 92) { Adv(); Adv(); }
+            else if (c == 123) {
+                string seg = src.Substring(start, pos - start);
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
+                Adv(); // '{'
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+                int depth = 1;
+                while (pos < n && depth > 0) {
+                    SkipTrivia();
+                    if (pos >= n) { break; }
+                    int ic = Peek();
+                    if (ic == 125) { depth = depth - 1; Adv(); if (depth == 0) { break; } continue; }
+                    if (ic == 123) { depth = depth + 1; Adv(); continue; }
+                    if (IsAlpha(ic)) { toks.Add(Ident(line, col)); }
+                    else if (IsDigit(ic)) { toks.Add(Number(line, col)); }
+                    else if (ic == 34) { toks.Add(Str(line, col)); }
+                    else if (ic == 39) { toks.Add(CharLit(line, col)); }
+                    else { toks.Add(Punct(line, col)); }
+                }
+                toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+                start = pos;
+            }
+            else { Adv(); }
+        }
+        string tail = src.Substring(start, pos - start);
+        toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), tail, 0, sl, sc));
+        Adv(); // closing quote
+        toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+    }
+
     Token CharLit(int startLine, int startCol) {
         Adv(); // opening '
         int v = 0;
@@ -207,7 +251,8 @@ class Lexer {
                 return toks;
             }
             int c = Peek();
-            if (IsAlpha(c)) { toks.Add(Ident(sl, sc)); }
+            if (c == 36 && Peek2() == 34) { InterpStr(toks, sl, sc); }
+            else if (IsAlpha(c)) { toks.Add(Ident(sl, sc)); }
             else if (IsDigit(c)) { toks.Add(Number(sl, sc)); }
             else if (c == 34) { toks.Add(Str(sl, sc)); }
             else if (c == 39) { toks.Add(CharLit(sl, sc)); }
