@@ -119,24 +119,64 @@ class Irgen {
         return null;
     }
 
-    int FieldIndex(Node cls, string name) {
-        int idx = 0; int i = 0;
+    // ---- inheritance / virtual dispatch helpers ----
+    Node BaseClassOf(Node cls) {
+        if (cls == null) { return null; }
+        if (cls.sval2 == "") { return null; }
+        return binder.FindType(cls.sval2);
+    }
+
+    bool HasMod(Node m, int flag) { return (m.mods / flag) - ((m.mods / flag) / 2) * 2 == 1; }
+    bool IsVirtual(Node m) { return HasMod(m, MOD.Virtual()); }
+    bool IsOverride(Node m) { return HasMod(m, MOD.Override()); }
+
+    // A class is polymorphic if it or any ancestor declares a virtual/override
+    // method; such classes carry a vtable pointer in field slot 0.
+    bool IsPolyClass(Node cls) {
+        if (cls == null) { return false; }
+        int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.FieldDecl()) {
-                if (m.sval == name) { return idx; }
-                idx = idx + 1;
-            }
+            if (m.kind == AK.MethodDecl() && (IsVirtual(m) || IsOverride(m))) { return true; }
+            i = i + 1;
+        }
+        return IsPolyClass(BaseClassOf(cls));
+    }
+
+    // field slot offset: 1 when a vtable pointer occupies slot 0
+    int FieldBase(Node cls) { if (IsPolyClass(cls)) { return 1; } return 0; }
+
+    // ordered fields, base classes first (layout-compatible with base pointers)
+    void CollectFields(Node cls, List<string> names, List<Node> types) {
+        if (cls == null) { return; }
+        CollectFields(BaseClassOf(cls), names, types);
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl()) { names.Add(m.sval); types.Add(m.type); }
+            i = i + 1;
+        }
+    }
+
+    int FieldIndex(Node cls, string name) {
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
+        int i = 0;
+        while (i < names.Count) {
+            if (names[i] == name) { return FieldBase(cls) + i; }
             i = i + 1;
         }
         return -1;
     }
 
     Node FieldType(Node cls, string name) {
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
         int i = 0;
-        while (i < cls.kids.Count) {
-            Node m = cls.kids[i];
-            if (m.kind == AK.FieldDecl() && m.sval == name) { return m.type; }
+        while (i < names.Count) {
+            if (names[i] == name) { return types[i]; }
             i = i + 1;
         }
         return null;
@@ -233,6 +273,13 @@ class Irgen {
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitStruct(d); }
             i = i + 1;
         }
+        // vtables for polymorphic classes
+        i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && IsPolyClass(d)) { EmitVtable(d); }
+            i = i + 1;
+        }
         // function bodies
         i = 0;
         while (i < unit.kids.Count) {
@@ -245,15 +292,17 @@ class Irgen {
     }
 
     void EmitStruct(Node cls) {
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
         string s = "%" + cls.sval + " = type { ";
-        int cnt = 0; int i = 0;
-        while (i < cls.kids.Count) {
-            Node m = cls.kids[i];
-            if (m.kind == AK.FieldDecl()) {
-                if (cnt > 0) { s = s + ", "; }
-                s = s + MapType(m.type);
-                cnt = cnt + 1;
-            }
+        int cnt = 0;
+        if (IsPolyClass(cls)) { s = s + "i8*"; cnt = 1; }
+        int i = 0;
+        while (i < types.Count) {
+            if (cnt > 0) { s = s + ", "; }
+            s = s + MapType(types[i]);
+            cnt = cnt + 1;
             i = i + 1;
         }
         if (cnt == 0) { s = s + "i64"; }
@@ -676,10 +725,106 @@ class Irgen {
         }
     }
 
-    // when null literal, retype to the target LLVM type
+    bool IsClassPtr(string s) {
+        if (s.Length < 2) { return false; }
+        if (s.Substring(0, 1) != "%") { return false; }
+        if (s.Substring(s.Length - 1, 1) != "*") { return false; }
+        return true;
+    }
+
+    // when null literal, retype to the target LLVM type; bitcast class pointers
+    // (e.g. a derived instance stored into a base-typed slot)
     string Coerce(ExprVal v, string llty) {
         if (v.op == "null") { return "null"; }
+        string vt = MapType(v.ty);
+        if (vt != llty && IsClassPtr(vt) && IsClassPtr(llty)) {
+            string t = NT();
+            L("  " + t + " = bitcast " + vt + " " + v.op + " to " + llty);
+            return t;
+        }
         return v.op;
+    }
+
+    // ---- vtable emission for polymorphic classes ----
+    void EmitVtable(Node cls) {
+        List<string> slots = new List<string>();
+        CollectVSlots(cls, slots);
+        string s = "@" + cls.sval + "_vtable = global [" + slots.Count + " x i8*] [";
+        int i = 0;
+        while (i < slots.Count) {
+            string sl = slots[i];
+            string impl = ResolveImpl(cls, sl);
+            Node m = FindMethodUp(cls, sl);
+            if (i > 0) { s = s + ", "; }
+            s = s + "i8* bitcast (" + MethodFnTypeThis(m, impl) + " @" + impl + "_" + sl + " to i8*)";
+            i = i + 1;
+        }
+        s = s + "]";
+        H(s);
+    }
+
+    Node FindMethodUp(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node m = binder.FindMethod(c, name);
+            if (m != null) { return m; }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    string MethodOwner(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            if (binder.FindMethod(c, name) != null) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    // vtable slot method names, base classes first
+    void CollectVSlots(Node cls, List<string> slots) {
+        if (cls == null) { return; }
+        CollectVSlots(BaseClassOf(cls), slots);
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && IsVirtual(m) && !IsOverride(m)) { slots.Add(m.sval); }
+            i = i + 1;
+        }
+    }
+
+    int VSlotIndex(Node cls, string name) {
+        List<string> slots = new List<string>();
+        CollectVSlots(cls, slots);
+        int i = 0;
+        while (i < slots.Count) { if (slots[i] == name) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // most-derived class (from cls upward) that provides a virtual method body
+    string ResolveImpl(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name && (IsVirtual(m) || IsOverride(m))) { return c.sval; }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    string MethodFnTypeThis(Node m, string thisCls) {
+        string ty = MapType(m.type) + " (%" + thisCls + "*";
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { ty = ty + ", " + MapType(m.kids[i].type); }
+            i = i + 1;
+        }
+        return ty + ")*";
     }
 
     void GenVarDecl(Node s) {
@@ -1181,6 +1326,13 @@ class Irgen {
         L("  " + raw + " = call i8* @malloc(i64 " + szi + ")");
         string obj = NT();
         L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
+        if (IsPolyClass(cls)) {
+            List<string> vslots = new List<string>();
+            CollectVSlots(cls, vslots);
+            string vtp0 = NT();
+            L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
+            L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + cn + "_vtable to i8*), i8** " + vtp0);
+        }
         // call ctor if present
         Node ctor = binder.FindCtor(cls);
         if (ctor != null) {
@@ -1314,7 +1466,8 @@ class Irgen {
             string name = callee.sval;
             if (curHasThis) {
                 Node cls = binder.FindType(curClass);
-                if (cls != null && binder.FindMethod(cls, name) != null && !IsStatic(binder.FindMethod(cls, name))) {
+                Node bm = FindMethodUp(cls, name);
+                if (bm != null && !IsStatic(bm)) {
                     ExprVal recv = new ExprVal("%this", MkType(curClass));
                     return EmitInstanceCall(recv, curClass, name, e);
                 }
@@ -1362,10 +1515,21 @@ class Irgen {
 
     ExprVal EmitInstanceCall(ExprVal recv, string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
-        Node m = binder.FindMethod(cls, name);
+        Node m = FindMethodUp(cls, name);
+        if (m != null && IsPolyClass(cls) && (IsVirtual(m) || IsOverride(m))) {
+            return EmitVirtualCall(recv, cls, name, m, e);
+        }
+        string owner = MethodOwner(cls, name);
+        if (owner == "") { owner = clsName; }
+        string thisOp = recv.op;
+        if (owner != clsName) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + clsName + "* " + recv.op + " to %" + owner + "*");
+            thisOp = bc;
+        }
         string rt = "i64";
         if (m != null) { rt = MapType(m.type); }
-        string args = "%" + clsName + "* " + recv.op;
+        string args = "%" + owner + "* " + thisOp;
         int i = 0;
         while (i < e.kids.Count) {
             ExprVal av = GenExpr(e.kids[i]);
@@ -1374,13 +1538,46 @@ class Irgen {
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + clsName + "_" + name + "(" + args + ")");
+            L("  call void @" + owner + "_" + name + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + clsName + "_" + name + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + owner + "_" + name + "(" + args + ")");
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         return new ExprVal(t, retTy);
+    }
+
+    ExprVal EmitVirtualCall(ExprVal recv, Node cls, string name, Node m, Node e) {
+        string clsName = cls.sval;
+        int slot = VSlotIndex(cls, name);
+        string rt = MapType(m.type);
+        string vtp = NT();
+        L("  " + vtp + " = getelementptr %" + clsName + ", %" + clsName + "* " + recv.op + ", i32 0, i32 0");
+        string vt = NT();
+        L("  " + vt + " = load i8*, i8** " + vtp);
+        string vta = NT();
+        L("  " + vta + " = bitcast i8* " + vt + " to i8**");
+        string slotp = NT();
+        L("  " + slotp + " = getelementptr i8*, i8** " + vta + ", i64 " + slot);
+        string fni8 = NT();
+        L("  " + fni8 + " = load i8*, i8** " + slotp);
+        string fn = NT();
+        L("  " + fn + " = bitcast i8* " + fni8 + " to " + MethodFnTypeThis(m, clsName));
+        string args = "%" + clsName + "* " + recv.op;
+        int i = 0;
+        while (i < e.kids.Count) {
+            ExprVal av = GenExpr(e.kids[i]);
+            string pt = ParamTypeStr(m, i);
+            args = args + ", " + pt + " " + Coerce(av, pt);
+            i = i + 1;
+        }
+        if (rt == "void") {
+            L("  call void " + fn + "(" + args + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        string t = NT();
+        L("  " + t + " = call " + rt + " " + fn + "(" + args + ")");
+        return new ExprVal(t, m.type);
     }
 
     ExprVal EmitStrMethod(ExprVal recv, string name, Node e) {
