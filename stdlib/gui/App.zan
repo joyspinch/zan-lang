@@ -24,6 +24,32 @@ class App {
     int sidebarContentHeight;
     bool isDark;
     bool isTopmost;
+    // Rect (in canvas coords) that wants to consume mouse-wheel events this
+    // frame — e.g. a DataTable body with its own internal row scroll. When the
+    // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
+    // drives the widget instead. Reset every frame in BeginFrame.
+    int wheelCapX;
+    int wheelCapY;
+    int wheelCapW;
+    int wheelCapH;
+
+    // --- Animation clock ---
+    // Per-key tween state. Widgets call AnimTo()/AnimPx() each frame with a
+    // target; the value eases toward it and keeps requesting redraws until it
+    // settles, giving smooth transitions on an otherwise event-driven loop.
+    // AnimTo is *time-based*: progress = (now - start) / duration, so it is
+    // immune to per-frame dt jitter (which used to make the motion stutter).
+    // Columns are index-aligned: key / current value / target / tween-start
+    // value / tween-start time (ms) / duration (ms).
+    List<int> animKeys;
+    List<int> animVals;
+    List<int> animTarget;
+    List<int> animFrom;
+    List<int> animStart;
+    List<int> animDur;
+    int nowMs;
+    int lastFrameMs;
+    int lastPresentMs;
 
     static App Create(string title, int width, int height) {
         App app = new App();
@@ -45,8 +71,21 @@ class App {
         app.splitX = 0;
         app.sidebarScrollY = 0;
         app.sidebarContentHeight = 0;
+        app.wheelCapX = 0;
+        app.wheelCapY = 0;
+        app.wheelCapW = 0;
+        app.wheelCapH = 0;
         app.isDark = false;
         app.isTopmost = false;
+        app.animKeys = new List<int>();
+        app.animVals = new List<int>();
+        app.animTarget = new List<int>();
+        app.animFrom = new List<int>();
+        app.animStart = new List<int>();
+        app.animDur = new List<int>();
+        app.nowMs = Window.GetTickMs();
+        app.lastFrameMs = app.nowMs;
+        app.lastPresentMs = 0;
         app.canvas = Canvas.Create(width, height);
         return app;
     }
@@ -133,9 +172,12 @@ class App {
         if (pinH) { c.FillRect(pinX, 0, bw, hbar, t.bgHover); }
         if (minH) { c.FillRect(minX, 0, bw, hbar, t.bgHover); }
         if (maxH) { c.FillRect(maxX, 0, bw, hbar, t.bgHover); }
-        if (closeH) { c.FillRect(closeX, 0, bw, hbar, t.error); }
+        if (closeH) { c.FillRect(closeX, 0, bw, hbar, -1113821); } // #E81123 Windows close-red
 
-        int gl = t.iconSizeSmall;
+        // Caption glyphs render at the small "caption" size (~11px) that Windows
+        // and WeChat use — thin and crisp rather than chunky — and are centered
+        // in each 46-wide button for a refined, balanced title bar.
+        int gl = t.iconSizeCaption;
         int gcolor = t.textSecondary;
 
         // Theme toggle: sun in light mode, moon in dark mode.
@@ -194,6 +236,128 @@ class App {
         needsRedraw = true;
     }
 
+    /// Finds the row index for an animation key, or -1. Rows are appended by
+    /// AnimTo/AnimPx and kept index-aligned across all six columns.
+    int AnimIndex(int key) {
+        int i = 0;
+        while (i < animKeys.Count) {
+            if (animKeys[i] == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void AnimAdd(int key, int val, int target, int durMs) {
+        animKeys.Add(key);
+        animVals.Add(val);
+        animTarget.Add(target);
+        animFrom.Add(val);
+        animStart.Add(nowMs);
+        animDur.Add(durMs);
+    }
+
+    /// Time-based eased tween of a per-key value (permille, 0..1000) toward
+    /// `target` over `durMs`, returning the *already eased* current value (do
+    /// NOT wrap in Ease again). Progress is (now - start)/duration so motion is
+    /// smooth regardless of frame-rate or timer granularity. Retargeting mid-
+    /// flight restarts the tween from the current value. First sighting snaps.
+    int AnimTo(int key, int target, int durMs) {
+        int idx = AnimIndex(key);
+        if (idx < 0) {
+            AnimAdd(key, target, target, durMs);
+            return target;
+        }
+        if (animTarget[idx] != target) {
+            animFrom[idx] = animVals[idx];
+            animTarget[idx] = target;
+            animStart[idx] = nowMs;
+            animDur[idx] = durMs;
+        }
+        int from = animFrom[idx];
+        int tgt = animTarget[idx];
+        if (from == tgt) { animVals[idx] = tgt; return tgt; }
+        int dur = animDur[idx];
+        if (dur < 1) { dur = 1; }
+        int elapsed = nowMs - animStart[idx];
+        if (elapsed < 0) { elapsed = 0; }
+        int p = elapsed * 1000 / dur;
+        if (p > 1000) { p = 1000; }
+        int e = App.Ease(p);
+        int val = from + (tgt - from) * e / 1000;
+        animVals[idx] = val;
+        if (p < 1000) { needsRedraw = true; } else { animVals[idx] = tgt; }
+        return animVals[idx];
+    }
+
+    /// Eases a per-key value toward `target` in arbitrary (pixel) space using
+    /// exponential smoothing, so it works for any range (unlike AnimTo which is
+    /// 0..1000). `tauMs` is the smoothing time constant (larger = slower). Used
+    /// for e.g. a tab underline sliding between tabs of differing widths.
+    int AnimPx(int key, int target, int tauMs) {
+        int idx = AnimIndex(key);
+        if (idx < 0) {
+            AnimAdd(key, target, target, tauMs);
+            return target;
+        }
+        int cur = animVals[idx];
+        if (cur == target) { return cur; }
+        int dt = nowMs - lastFrameMs;
+        if (dt < 1) { dt = 1; }
+        if (dt > 64) { dt = 64; }
+        if (tauMs < 1) { tauMs = 1; }
+        int f = dt * 1000 / (dt + tauMs);
+        int delta = (target - cur) * f / 1000;
+        if (delta == 0) {
+            if (target > cur) { delta = 1; } else { delta = -1; }
+        }
+        int next = cur + delta;
+        if (delta > 0 && next > target) { next = target; }
+        if (delta < 0 && next < target) { next = target; }
+        animVals[idx] = next;
+        if (next != target) { needsRedraw = true; }
+        return next;
+    }
+
+    /// Smoothstep (3t^2 - 2t^3) easing of a permille value for accel/decel.
+    static int Ease(int p) {
+        if (p <= 0) { return 0; }
+        if (p >= 1000) { return 1000; }
+        int t2 = p * p / 1000;
+        int t3 = t2 * p / 1000;
+        return 3 * t2 - 2 * t3;
+    }
+
+    /// Linear interpolation between a and b by permille p (0..1000).
+    static int Lerp(int a, int b, int p) {
+        return a + (b - a) * p / 1000;
+    }
+
+    /// Blend two packed RGB colors by permille p (0..1000), returning an opaque
+    /// (0xFF alpha) color. Channels are extracted with %256 so it is robust to
+    /// colors stored as negative signed ints.
+    static int LerpColor(int c0, int c1, int p) {
+        int r0 = (c0 / 65536) % 256; if (r0 < 0) { r0 = r0 + 256; }
+        int g0 = (c0 / 256) % 256;   if (g0 < 0) { g0 = g0 + 256; }
+        int b0 = c0 % 256;           if (b0 < 0) { b0 = b0 + 256; }
+        int r1 = (c1 / 65536) % 256; if (r1 < 0) { r1 = r1 + 256; }
+        int g1 = (c1 / 256) % 256;   if (g1 < 0) { g1 = g1 + 256; }
+        int b1 = c1 % 256;           if (b1 < 0) { b1 = b1 + 256; }
+        int r = r0 + (r1 - r0) * p / 1000;
+        int g = g0 + (g1 - g0) * p / 1000;
+        int b = b0 + (b1 - b0) * p / 1000;
+        return 4278190080 + r * 65536 + g * 256 + b;
+    }
+
+    /// A scrollable widget calls this during its render to claim the mouse wheel
+    /// while the pointer is over the given rect, so the page doesn't scroll
+    /// underneath it. Honoured by ProcessEvent on the following frame.
+    void CaptureWheel(int x, int y, int w, int h) {
+        wheelCapX = x;
+        wheelCapY = y;
+        wheelCapW = w;
+        wheelCapH = h;
+    }
+
     void SetContentHeight(int h) {
         contentHeight = h;
     }
@@ -218,6 +382,12 @@ class App {
         // new state paints immediately. Otherwise block until an event arrives.
         int result;
         if (needsRedraw) {
+            // A repaint is pending (state change or an in-flight animation).
+            // Cap the busy-poll to ~60fps so a running animation doesn't spin
+            // the CPU at hundreds of fps; sleeping the remainder of the frame
+            // budget also yields smoother, wall-clock-paced motion.
+            int since = Window.GetTickMs() - lastPresentMs;
+            if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
             result = window.PollEvent();
         } else {
             result = window.WaitEvent();
@@ -246,7 +416,13 @@ class App {
             if (curW != canvas.Width() || curH != canvas.Height()) {
                 canvas.Destroy();
                 canvas = Canvas.Create(curW, curH);
-                scrollY = 0;
+                // Clamp scroll to the new viewport instead of snapping to the
+                // top — resizing shouldn't jump the user's scroll position.
+                int viewH = curH - titlebarH;
+                int maxScroll = contentHeight - viewH;
+                if (maxScroll < 0) { maxScroll = 0; }
+                if (scrollY > maxScroll) { scrollY = maxScroll; }
+                if (scrollY < 0) { scrollY = 0; }
                 needsRedraw = true;
             }
         }
@@ -303,6 +479,12 @@ class App {
                 if (maxS < 0) { maxS = 0; }
                 if (sidebarScrollY > maxS) { sidebarScrollY = maxS; }
                 if (sidebarScrollY != oldS) { needsRedraw = true; }
+            } else if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
+                       && mouseY >= wheelCapY && mouseY < wheelCapY + wheelCapH) {
+                // Pointer is over a widget that scrolls internally (e.g. the
+                // DataTable body); let it handle the wheel during render instead
+                // of scrolling the whole page.
+                needsRedraw = true;
             } else {
                 int oldScroll = scrollY;
                 scrollY = scrollY - delta * scrollSpeed / 120;
@@ -316,18 +498,32 @@ class App {
             }
         }
 
+        // Typed character (WM_CHAR) / key down: repaint so focused text fields
+        // (e.g. the DataTable filter search box) can consume the keystroke this
+        // frame. The event slot still holds the char for widgets to read.
+        if (kind == 6 || kind == 4) {
+            needsRedraw = true;
+        }
+
         return true;
     }
 
     void PresentFrame() {
         window.Present(canvas);
         frameCount = frameCount + 1;
+        lastPresentMs = Window.GetTickMs();
     }
 
     void BeginFrame() {
+        // Advance the animation clock. AnimTo() uses (nowMs - lastFrameMs) as
+        // the elapsed step so eases run at a wall-clock rate regardless of fps.
+        lastFrameMs = nowMs;
+        nowMs = Window.GetTickMs();
         // Clear the redraw flag at frame start; handlers invoked during this
         // frame may set it again to request an immediate follow-up repaint.
         needsRedraw = false;
+        wheelCapW = 0;
+        wheelCapH = 0;
         hitTester.Clear();
         focus.ResetIds();
         canvas.Clear(theme.bgPrimary);

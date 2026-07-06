@@ -18,8 +18,8 @@ if ($LASTEXITCODE -ne 0) { throw "llvm-rc failed" }
 
 Write-Output "[3/4] Emitting LLVM IR from Zan sources..."
 $files = @()
-$files += (Get-ChildItem stdlib\gui\core\*.zan).FullName
-$files += (Get-ChildItem stdlib\gui\widget\*.zan).FullName
+$files += (Get-ChildItem stdlib\Gui\*.zan).FullName
+$files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
 $files += (Join-Path $root "examples\gui_demo.zan")
 Push-Location build
 $ir = & .\zanc.exe --emit-ir $files

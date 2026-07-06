@@ -15,6 +15,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 /* ---- file reading ---- */
 
@@ -436,6 +441,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
         fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit\n");
         fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
+        fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
+        fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
+        fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
         return 1;
     }
 
@@ -448,6 +456,9 @@ int main(int argc, char **argv) {
     bool do_emit_ir = false;
     bool check_leaks = false;
     bool runtime_checks = true;
+    bool publish_mode = false;
+    const char *stdlib_path = NULL;
+    bool auto_stdlib = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -460,6 +471,12 @@ int main(int argc, char **argv) {
             check_leaks = true;
         } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
             runtime_checks = false;
+        } else if (strcmp(argv[i], "--publish") == 0) {
+            publish_mode = true;
+        } else if (strcmp(argv[i], "--stdlib-path") == 0 && i + 1 < argc) {
+            stdlib_path = argv[++i];
+        } else if (strcmp(argv[i], "--auto-stdlib") == 0) {
+            auto_stdlib = true;
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (argv[i][0] != '-') {
@@ -480,6 +497,107 @@ int main(int argc, char **argv) {
         return 1;
     }
     input_file = input_files[0];
+
+    /* --auto-stdlib: discover stdlib path relative to compiler executable,
+     * then scan using directives in source files and add matching stdlib .zan files */
+    if (auto_stdlib || stdlib_path) {
+        /* determine stdlib root */
+        char stdlib_root[1024];
+        if (stdlib_path) {
+            snprintf(stdlib_root, sizeof(stdlib_root), "%s", stdlib_path);
+        } else {
+            /* try: executable_dir/../stdlib/ or executable_dir/stdlib/ */
+#ifdef _WIN32
+            char exe_path[1024];
+            GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
+            char *last_sep = strrchr(exe_path, '\\');
+            if (last_sep) *last_sep = '\0';
+            snprintf(stdlib_root, sizeof(stdlib_root), "%s\\..\\stdlib", exe_path);
+            /* check if it exists, fallback to sibling */
+            {
+                DWORD attr = GetFileAttributesA(stdlib_root);
+                if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    snprintf(stdlib_root, sizeof(stdlib_root), "%s\\stdlib", exe_path);
+                }
+            }
+#else
+            /* on Linux, use /proc/self/exe */
+            char exe_path[1024];
+            ssize_t elen = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
+            if (elen > 0) {
+                exe_path[elen] = '\0';
+                char *last_sep = strrchr(exe_path, '/');
+                if (last_sep) *last_sep = '\0';
+                snprintf(stdlib_root, sizeof(stdlib_root), "%s/../stdlib", exe_path);
+            } else {
+                snprintf(stdlib_root, sizeof(stdlib_root), "stdlib");
+            }
+#endif
+        }
+
+        /* Scan all input files for 'using System.XXX' directives, then
+         * auto-include matching stdlib .zan files. */
+        static const struct { const char *using_ns; const char *subdir; const char *files[32]; } stdlib_map[] = {
+            {"System.IO",        "System/IO",        {"File.zan", "Path.zan", "Directory.zan", NULL}},
+            {"System.Text",      "System/Text",      {"Encoding.zan", NULL}},
+            {"System.Json",      "System/Json",      {"Json.zan", NULL}},
+            {"System.Threading", "System/Threading",  {"Threading.zan", NULL}},
+            {"System.Net",       "System/Net",        {"Net.zan", NULL}},
+            {"System.Windows.Forms", "System/Windows", {"Forms.zan", NULL}},
+            {"System.Drawing", "System/Drawing", {"Primitives.zan", "Graphics.zan", NULL}},
+            {"Gui", "gui", {
+                "Types.zan", "Theme.zan", "Render.zan", "Native.zan",
+                "Event.zan", "Layout.zan", "App.zan", "Reactive.zan",
+                "Icon.zan", NULL
+            }},
+            {"Gui.Widget", "gui/widget", {
+                "Button.zan", "Checkbox.zan", "Radio.zan", "Switch.zan",
+                "Slider.zan", "Progress.zan", "Card.zan", "Modal.zan",
+                "Tabs.zan", "Tag.zan", "Badge.zan", "Avatar.zan",
+                "Tooltip.zan", "Divider.zan", "Select.zan", "Table.zan",
+                "Steps.zan", "Notification.zan", "Scrollbar.zan",
+                "Skeleton.zan", "Empty.zan", "Input.zan", "Label.zan",
+                "Loading.zan", "Breadcrumb.zan", "Pagination.zan", NULL
+            }},
+            {NULL, NULL, {NULL}}
+        };
+        /* collect which namespaces are used */
+        int ns_used[10] = {0};
+        for (int fi = 0; fi < input_count; fi++) {
+            size_t slen2 = 0;
+            char *src2 = read_file(input_files[fi], &slen2);
+            if (!src2) continue;
+            for (int mi = 0; stdlib_map[mi].using_ns; mi++) {
+                if (strstr(src2, stdlib_map[mi].using_ns)) {
+                    ns_used[mi] = 1;
+                }
+            }
+            if (fi > 0) free(src2); /* don't free first file yet */
+        }
+        /* add matching stdlib files */
+        for (int mi = 0; stdlib_map[mi].using_ns; mi++) {
+            if (!ns_used[mi]) continue;
+            for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
+                char mod_path[1024];
+#ifdef _WIN32
+                snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                         stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+#else
+                snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
+                         stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+#endif
+                FILE *check = fopen(mod_path, "rb");
+                if (check) {
+                    fclose(check);
+                    if (input_count < 128) {
+                        char *dup = (char *)malloc(strlen(mod_path) + 1);
+                        strcpy(dup, mod_path);
+                        input_files[input_count++] = dup;
+                    }
+                }
+            }
+        }
+    }
 
     /* read first source (also used for --dump-tokens) */
     size_t source_len;
@@ -637,11 +755,21 @@ int main(int argc, char **argv) {
                 _pclose(dm);
             }
         }
-        snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" %s",
-                 obj_tmp, obj_path, stack_flag);
+        if (publish_mode) {
+            snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" %s -O2 -Xlinker /LTCG",
+                     obj_tmp, obj_path, stack_flag);
+        } else {
+            snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" %s",
+                     obj_tmp, obj_path, stack_flag);
+        }
 #else
-        snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
-                 obj_tmp, obj_path);
+        if (publish_mode) {
+            snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm -O2 -s",
+                     obj_tmp, obj_path);
+        } else {
+            snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
+                     obj_tmp, obj_path);
+        }
 #endif
         /* append -l flags for [DllImport] extern libraries */
         for (int li = 0; li < irgen.extern_lib_count; li++) {
@@ -673,9 +801,9 @@ int main(int argc, char **argv) {
         }
 
         if (input_count == 1) {
-            printf("Compiled '%s' → '%s'\n", input_file, obj_path);
+            printf("%s '%s' → '%s'\n", publish_mode ? "Published" : "Compiled", input_file, obj_path);
         } else {
-            printf("Compiled %d files → '%s'\n", input_count, obj_path);
+            printf("%s %d files → '%s'\n", publish_mode ? "Published" : "Compiled", input_count, obj_path);
         }
     }
 

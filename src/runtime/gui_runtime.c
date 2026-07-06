@@ -53,6 +53,10 @@ typedef struct {
 
 static zan_surface_t *g_surfaces[64];
 static int g_surface_count = 0;
+/* Declared here because destroy_surface / zan_gui_clear (above their definition
+ * below) reference them; the resize re-blit path assigns them later. */
+static i64 g_last_surface = -1;
+static u32 g_bg_color = 0xFFFFFFFF;
 
 static int clamp_i(int v, int lo, int hi) {
     if (v < lo) return lo;
@@ -98,13 +102,24 @@ static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage
 /* ---- Exported rendering functions ---- */
 
 EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
-    if (g_surface_count >= 64) return -1;
+    /* Reuse a slot freed by destroy_surface so repeated resize/maximize cycles
+     * (each destroy+create) don't leak the fixed 64-slot table. */
+    int id = -1;
+    for (int i = 0; i < g_surface_count; i++) {
+        if (!g_surfaces[i]) { id = i; break; }
+    }
+    if (id < 0) {
+        if (g_surface_count >= 64) return -1;
+        id = g_surface_count++;
+    }
     zan_surface_t *s = (zan_surface_t *)calloc(1, sizeof(zan_surface_t));
     s->width = (int)width;
     s->height = (int)height;
     s->stride = (int)width;
-    s->pixels = (u32 *)calloc((size_t)(width * height), sizeof(u32));
-    int id = g_surface_count++;
+    /* malloc (not calloc): every frame starts with zan_gui_clear covering the
+     * whole surface, so zero-init is wasted work — and on large windows the
+     * per-resize zeroing of ~32MB was a noticeable hitch during drag-resize. */
+    s->pixels = (u32 *)malloc((size_t)(width * height) * sizeof(u32));
     g_surfaces[id] = s;
     return (i64)id;
 }
@@ -114,6 +129,9 @@ EXPORT i64 zan_gui_destroy_surface(i64 id) {
     free(g_surfaces[id]->pixels);
     free(g_surfaces[id]);
     g_surfaces[id] = NULL;
+    /* Don't leave the resize re-blit pointing at a freed surface (it would read
+     * a NULL slot at best, a recycled one at worst). */
+    if (id == g_last_surface) g_last_surface = -1;
     return 0;
 }
 
@@ -132,6 +150,7 @@ EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     u32 c = (u32)color;
+    g_bg_color = c;
     int count = s->width * s->height;
     for (int i = 0; i < count; i++) s->pixels[i] = c;
 }
@@ -183,31 +202,35 @@ EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
     if (r > iw/2) r = iw/2;
     if (r > ih/2) r = ih/2;
 
-    /* Center areas (no rounding) */
-    zan_gui_fill_rect(surface_id, ix + r, iy, iw - 2*r, ih, color);
-    zan_gui_fill_rect(surface_id, ix, iy + r, r, ih - 2*r, color);
-    zan_gui_fill_rect(surface_id, ix + iw - r, iy + r, r, ih - 2*r, color);
+    /* Fill the interior as three rects that EXCLUDE the four r*r corner squares,
+     * then draw each corner as a quarter circle over just its square. Every
+     * pixel is thus written exactly once — filling the interior and full corner
+     * circles would double-blend their overlap and darken corners for
+     * translucent fills. */
+    int xl = ix + r, xr = ix + iw - r;      /* inner corner-zone boundaries */
+    int yt = iy + r, yb = iy + ih - r;
+    zan_gui_fill_rect(surface_id, xl, iy, iw - 2*r, r, color);        /* top band  */
+    zan_gui_fill_rect(surface_id, ix, yt, iw, ih - 2*r, color);      /* middle    */
+    zan_gui_fill_rect(surface_id, xl, yb, iw - 2*r, r, color);        /* bottom band */
 
-    /* Four rounded corners with AA */
-    int corners[4][2] = {
-        {ix + r, iy + r},               /* top-left */
-        {ix + iw - r - 1, iy + r},      /* top-right */
-        {ix + r, iy + ih - r - 1},       /* bottom-left */
-        {ix + iw - r - 1, iy + ih - r - 1} /* bottom-right */
+    int cc[4][2] = {
+        {xl, yt},         /* TL, square px<xl, py<yt   */
+        {xr - 1, yt},     /* TR, square px>=xr, py<yt  */
+        {xl, yb - 1},     /* BL, square px<xl, py>=yb  */
+        {xr - 1, yb - 1}  /* BR, square px>=xr, py>=yb */
     };
-
+    int zx[4] = {ix, xr, ix, xr};
+    int zy[4] = {iy, iy, yb, yb};
     for (int ci = 0; ci < 4; ci++) {
-        int ccx = corners[ci][0];
-        int ccy = corners[ci][1];
-        for (int dy = -r; dy <= r; dy++) {
-            for (int dx = -r; dx <= r; dx++) {
-                double dist = sqrt((double)(dx*dx + dy*dy));
-                if (dist <= r - 0.5) {
-                    set_pixel(s, ccx + dx, ccy + dy, c);
-                } else if (dist <= r + 0.5) {
-                    int cov = (int)((r + 0.5 - dist) * 255.0);
-                    set_pixel_aa(s, ccx + dx, ccy + dy, c, cov);
-                }
+        int ccx = cc[ci][0], ccy = cc[ci][1];
+        for (int py = zy[ci]; py < zy[ci] + r; py++) {
+            for (int px = zx[ci]; px < zx[ci] + r; px++) {
+                double ddx = px - ccx, ddy = py - ccy;
+                double dist = sqrt(ddx*ddx + ddy*ddy);
+                double cov = r + 0.5 - dist;
+                if (cov <= 0.0) continue;
+                if (cov > 1.0) cov = 1.0;
+                set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
             }
         }
     }
@@ -231,6 +254,47 @@ EXPORT void zan_gui_fill_circle(i64 surface_id, i64 cx, i64 cy, i64 radius, i64 
                 int cov = (int)((r + 0.5 - dist) * 255.0);
                 set_pixel_aa(s, icx + dx, icy + dy, c, cov);
             }
+        }
+    }
+}
+
+/* Anti-aliased filled ring sector (pie / donut slice). Angles in degrees with
+ * 0 at 12 o'clock, increasing clockwise. r_inner=0 gives a solid pie slice. */
+EXPORT void zan_gui_fill_sector(i64 surface_id, i64 cx, i64 cy, i64 r_inner, i64 r_outer,
+                                i64 a0_deg, i64 a1_deg, i64 color) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    u32 c = (u32)color;
+    int icx = (int)cx, icy = (int)cy;
+    double ri = (double)r_inner, ro = (double)r_outer;
+    double a0 = (double)a0_deg, a1 = (double)a1_deg;
+    if (a1 < a0) { double tmp = a0; a0 = a1; a1 = tmp; }
+    int R = (int)r_outer;
+    const double PI = 3.14159265358979323846;
+
+    for (int dy = -R - 1; dy <= R + 1; dy++) {
+        for (int dx = -R - 1; dx <= R + 1; dx++) {
+            double dist = sqrt((double)(dx*dx + dy*dy));
+            /* radial coverage (AA on inner & outer edge) */
+            double radCov = 1.0;
+            if (dist > ro + 0.5) continue;
+            if (ri > 0.0 && dist < ri - 0.5) continue;
+            if (dist > ro - 0.5) radCov = ro + 0.5 - dist;
+            else if (ri > 0.0 && dist < ri + 0.5) radCov = dist - (ri - 0.5);
+            if (radCov <= 0.0) continue;
+            if (radCov > 1.0) radCov = 1.0;
+            /* angle of this pixel: 0 at top, clockwise, in [0,360) */
+            double ang = atan2((double)dx, (double)(-dy)) * 180.0 / PI;
+            if (ang < 0.0) ang += 360.0;
+            /* test membership allowing the sweep to exceed 360 via wrap */
+            int inside = 0;
+            if (ang >= a0 && ang <= a1) inside = 1;
+            else if ((ang + 360.0) >= a0 && (ang + 360.0) <= a1) inside = 1;
+            if (!inside) continue;
+            int cov = (int)(radCov * 255.0);
+            if (cov >= 255) set_pixel(s, icx + dx, icy + dy, c);
+            else set_pixel_aa(s, icx + dx, icy + dy, c, cov);
         }
     }
 }
@@ -277,20 +341,35 @@ EXPORT void zan_gui_draw_line(i64 surface_id, i64 x0, i64 y0, i64 x1, i64 y1, i6
             intery += gradient;
         }
     } else {
-        /* Thick line: fill along perpendicular */
+        /* Thick line: solid, round-capped, anti-aliased via distance-to-segment
+         * coverage. Filling every pixel within half-thickness of the segment
+         * (instead of sampling perpendicular offsets) avoids the gaps/stipple
+         * that made diagonal strokes look blurry. */
         double dx = (double)(x1 - x0), dy = (double)(y1 - y0);
-        double len = sqrt(dx*dx + dy*dy);
-        if (len < 0.001) return;
-        double nx = -dy/len * t * 0.5, ny = dx/len * t * 0.5;
-        int steps = (int)(len + 0.5);
-        if (steps < 1) steps = 1;
-        for (int i = 0; i <= steps; i++) {
-            double fx = x0 + dx * i / steps;
-            double fy = y0 + dy * i / steps;
-            for (int j = -t/2; j <= t/2; j++) {
-                int px = (int)(fx + (-dy/len) * j + 0.5);
-                int py = (int)(fy + (dx/len) * j + 0.5);
-                set_pixel(s, px, py, c);
+        double len2 = dx*dx + dy*dy;
+        double half = t * 0.5;
+        int lox = (x0 < x1 ? (int)x0 : (int)x1);
+        int hix = (x0 > x1 ? (int)x0 : (int)x1);
+        int loy = (y0 < y1 ? (int)y0 : (int)y1);
+        int hiy = (y0 > y1 ? (int)y0 : (int)y1);
+        int minx = lox - t - 1, maxx = hix + t + 1;
+        int miny = loy - t - 1, maxy = hiy + t + 1;
+        for (int py = miny; py <= maxy; py++) {
+            for (int px = minx; px <= maxx; px++) {
+                double proj = 0.0;
+                if (len2 > 0.0001) {
+                    proj = ((px - (double)x0) * dx + (py - (double)y0) * dy) / len2;
+                    if (proj < 0.0) proj = 0.0;
+                    if (proj > 1.0) proj = 1.0;
+                }
+                double cxp = (double)x0 + proj * dx;
+                double cyp = (double)y0 + proj * dy;
+                double ddx = px - cxp, ddy = py - cyp;
+                double dist = sqrt(ddx*ddx + ddy*ddy);
+                double cov = half - dist + 0.5;   /* ~1px anti-aliased edge */
+                if (cov <= 0.0) continue;
+                if (cov >= 1.0) set_pixel(s, px, py, c);
+                else set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
             }
         }
     }
@@ -582,6 +661,42 @@ static HWND g_main_hwnd = NULL;
 static int g_pending_event[8]; /* kind, x, y, button, keycode, modifiers, 0, 0 */
 static int g_has_event = 0;
 static int g_window_width = 0, g_window_height = 0;
+/* g_last_surface: most recently presented surface, re-blitted synchronously on
+ * WM_SIZE/WM_PAINT so a maximize/resize fills the new client area immediately
+ * instead of flashing black. g_bg_color: last frame's clear color, used to fill
+ * the newly-exposed margin during a live resize. Both declared near the top. */
+static void blit_surface_to_hwnd(HWND hwnd, zan_surface_t *s) {
+    if (!s) return;
+    HDC hdc = GetDC(hwnd);
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = s->width;
+    bmi.bmiHeader.biHeight = -(int)s->height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    /* Blit the last frame crisply at 1:1 (never stretched — stretching looks
+     * rubbery/blurry during a drag-resize). Any client area beyond the frame is
+     * filled with the canvas background so a grow-resize shows solid bg in the
+     * new region until the app thread repaints it crisply. */
+    SetDIBitsToDevice(hdc, 0, 0, (DWORD)s->width, (DWORD)s->height,
+        0, 0, 0, (UINT)s->height, s->pixels, &bmi, DIB_RGB_COLORS);
+    if (g_window_width > (int)s->width || g_window_height > (int)s->height) {
+        HBRUSH br = CreateSolidBrush(RGB((g_bg_color >> 16) & 0xFF,
+                                         (g_bg_color >> 8) & 0xFF,
+                                          g_bg_color & 0xFF));
+        if (g_window_width > (int)s->width) {
+            RECT r = { (int)s->width, 0, g_window_width, g_window_height };
+            FillRect(hdc, &r, br);
+        }
+        if (g_window_height > (int)s->height) {
+            RECT r = { 0, (int)s->height, (int)s->width, g_window_height };
+            FillRect(hdc, &r, br);
+        }
+        DeleteObject(br);
+    }
+    ReleaseDC(hwnd, hdc);
+}
 /* Borderless (client-covers-everything) window chrome metrics, in device px. */
 static int g_dpi = 96;
 static int g_titlebar_h = 32;
@@ -601,6 +716,11 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         g_window_width = LOWORD(lp);
         g_window_height = HIWORD(lp);
+        /* Fill the resized client area now (last frame at 1:1 + bg-colored
+         * margin) so a maximize/drag doesn't flash black before the app thread
+         * repaints crisply. */
+        if (g_last_surface >= 0 && g_last_surface < g_surface_count)
+            blit_surface_to_hwnd(hwnd, g_surfaces[g_last_surface]);
         g_pending_event[0] = 7;
         g_pending_event[1] = g_window_width;
         g_pending_event[2] = g_window_height;
@@ -616,6 +736,9 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_pending_event[0] = 2; g_pending_event[3] = 0;
         g_pending_event[1] = (short)LOWORD(lp);
         g_pending_event[2] = (short)HIWORD(lp);
+        g_pending_event[5] = (GetKeyState(VK_CONTROL) & 0x8000 ? 1 : 0) |
+                             (GetKeyState(VK_SHIFT) & 0x8000 ? 2 : 0) |
+                             (GetKeyState(VK_MENU) & 0x8000 ? 4 : 0);
         g_has_event = 1;
         SetCapture(hwnd);
         return 0;
@@ -623,6 +746,9 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_pending_event[0] = 3; g_pending_event[3] = 0;
         g_pending_event[1] = (short)LOWORD(lp);
         g_pending_event[2] = (short)HIWORD(lp);
+        g_pending_event[5] = (GetKeyState(VK_CONTROL) & 0x8000 ? 1 : 0) |
+                             (GetKeyState(VK_SHIFT) & 0x8000 ? 2 : 0) |
+                             (GetKeyState(VK_MENU) & 0x8000 ? 4 : 0);
         g_has_event = 1;
         ReleaseCapture();
         return 0;
@@ -630,10 +756,15 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_pending_event[0] = 2; g_pending_event[3] = 1;
         g_pending_event[1] = (short)LOWORD(lp);
         g_pending_event[2] = (short)HIWORD(lp);
+        g_pending_event[5] = (GetKeyState(VK_CONTROL) & 0x8000 ? 1 : 0) |
+                             (GetKeyState(VK_SHIFT) & 0x8000 ? 2 : 0) |
+                             (GetKeyState(VK_MENU) & 0x8000 ? 4 : 0);
         g_has_event = 1;
         return 0;
     case WM_RBUTTONUP:
         g_pending_event[0] = 3; g_pending_event[3] = 1;
+        g_pending_event[1] = (short)LOWORD(lp);
+        g_pending_event[2] = (short)HIWORD(lp);
         g_has_event = 1;
         return 0;
     case WM_KEYDOWN:
@@ -706,6 +837,10 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
+        /* Repaint from the last frame so OS-driven invalidations (move, uncover,
+         * DWM) never leave the client black between app repaints. */
+        if (g_last_surface >= 0 && g_last_surface < g_surface_count)
+            blit_surface_to_hwnd(hwnd, g_surfaces[g_last_surface]);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -878,31 +1013,8 @@ EXPORT i64 zan_gui_window_height(void) { return g_window_height; }
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
-    zan_surface_t *s = g_surfaces[surface_id];
-
-    HDC hdc = GetDC(hwnd);
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = s->width;
-    bmi.bmiHeader.biHeight = -(int)s->height;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    if (s->width == g_window_width && s->height == g_window_height) {
-        SetDIBitsToDevice(hdc,
-            0, 0, (DWORD)s->width, (DWORD)s->height,
-            0, 0, 0, (UINT)s->height,
-            s->pixels, &bmi, DIB_RGB_COLORS);
-    } else {
-        SetStretchBltMode(hdc, HALFTONE);
-        StretchDIBits(hdc,
-            0, 0, g_window_width, g_window_height,
-            0, 0, s->width, s->height,
-            s->pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
-    }
-
-    ReleaseDC(hwnd, hdc);
+    g_last_surface = surface_id;
+    blit_surface_to_hwnd(hwnd, g_surfaces[surface_id]);
     return 0;
 }
 
@@ -939,7 +1051,67 @@ EXPORT i64 zan_gui_get_dpi_scale(void) {
 }
 
 EXPORT i64 zan_gui_get_tick_ms(void) {
-    return (i64)GetTickCount64();
+    /* GetTickCount64 only updates every ~10-16ms, so consecutive reads a frame
+     * apart often return the same value -> per-frame dt jitters between 0 and
+     * ~16ms and animations step unevenly (visible stutter). Use the
+     * high-resolution performance counter for smooth, monotonic ms. */
+    static LARGE_INTEGER freq = {0};
+    LARGE_INTEGER now;
+    if (freq.QuadPart == 0) { QueryPerformanceFrequency(&freq); }
+    QueryPerformanceCounter(&now);
+    return (i64)(now.QuadPart * 1000 / freq.QuadPart);
+}
+
+EXPORT void zan_gui_sleep_ms(i64 ms) {
+    if (ms > 0) Sleep((DWORD)ms);
+}
+
+/* Copy a UTF-8 string to the Windows clipboard as CF_UNICODETEXT.
+ * Returns 0 on success, -1 on failure. */
+EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
+    if (!utf8) return -1;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wlen <= 0) return -1;
+    HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, (size_t)wlen * sizeof(WCHAR));
+    if (!hmem) return -1;
+    WCHAR *dst = (WCHAR *)GlobalLock(hmem);
+    if (!dst) { GlobalFree(hmem); return -1; }
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, dst, wlen);
+    GlobalUnlock(hmem);
+    if (!OpenClipboard(g_main_hwnd)) { GlobalFree(hmem); return -1; }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, hmem)) {
+        CloseClipboard();
+        GlobalFree(hmem);
+        return -1;
+    }
+    CloseClipboard();
+    /* Ownership of hmem transferred to the clipboard; do not free. */
+    return 0;
+}
+
+/* Write a UTF-8 string to a file (overwrite), prefixed with a UTF-8 BOM so
+ * spreadsheet apps detect the encoding (important for CJK CSV export).
+ * Returns 0 on success, -1 on failure. */
+EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
+    if (!path || !utf8) return -1;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (wlen <= 0) return -1;
+    WCHAR *wpath = (WCHAR *)malloc((size_t)wlen * sizeof(WCHAR));
+    if (!wpath) return -1;
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
+    HANDLE hf = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wpath);
+    if (hf == INVALID_HANDLE_VALUE) return -1;
+    DWORD wr = 0;
+    const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+    WriteFile(hf, bom, 3, &wr, NULL);
+    size_t len = strlen(utf8);
+    BOOL ok = WriteFile(hf, utf8, (DWORD)len, &wr, NULL);
+    CloseHandle(hf);
+    if (!ok) return -1;
+    return 0;
 }
 
 #endif /* _WIN32 */
@@ -1097,6 +1269,14 @@ EXPORT i64 zan_gui_get_tick_ms(void) {
     return (i64)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+EXPORT void zan_gui_sleep_ms(i64 ms) {
+    if (ms <= 0) return;
+    struct timespec req;
+    req.tv_sec = (time_t)(ms / 1000);
+    req.tv_nsec = (long)((ms % 1000) * 1000000L);
+    nanosleep(&req, NULL);
+}
+
 /* Fallback bitmap font for Linux text rendering */
 static const unsigned char zan_font_6x10[96][10] = {
     /* space (32) */ {0},
@@ -1252,6 +1432,14 @@ EXPORT i64 zan_gui_get_tick_ms(void) {
     return (i64)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+EXPORT void zan_gui_sleep_ms(i64 ms) {
+    if (ms <= 0) return;
+    struct timespec req;
+    req.tv_sec = (time_t)(ms / 1000);
+    req.tv_nsec = (long)((ms % 1000) * 1000000L);
+    nanosleep(&req, NULL);
+}
+
 #endif /* __linux__ */
 
 /* ========================================================================
@@ -1275,6 +1463,7 @@ EXPORT i64 zan_gui_present(i64 h, i64 s) { (void)h;(void)s; return 1; }
 EXPORT i64 zan_gui_set_title(i64 h, const char *t) { (void)h;(void)t; return 0; }
 EXPORT i64 zan_gui_set_cursor(i64 c) { (void)c; return 0; }
 EXPORT i64 zan_gui_get_tick_ms(void) { return 0; }
+EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
 
 EXPORT void zan_gui_draw_text(i64 s, i64 x, i64 y, const char *t, i64 c, i64 f) {
     (void)s;(void)x;(void)y;(void)t;(void)c;(void)f;

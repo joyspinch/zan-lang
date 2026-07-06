@@ -1,0 +1,533 @@
+namespace Gui;
+
+/// One data series: a name, its Y values (one per category label) and a color.
+class ChartSeries {
+    string name;
+    List<int> values;
+    int color;
+
+    static ChartSeries Create(string name, List<int> values, int color) {
+        ChartSeries s = new ChartSeries();
+        s.name = name;
+        s.values = values;
+        s.color = color;
+        return s;
+    }
+}
+
+/// Internal holder for the computed plot rectangle shared by chart drawing.
+class ChartFrame {
+    int plotX;
+    int plotY;
+    int plotW;
+    int plotH;
+}
+
+/// ECharts-inspired chart library built on the raw Canvas primitives:
+/// line, area, grouped/stacked/horizontal bars, pie, donut and scatter.
+/// Integer maths, category + value axes, gridlines, legend, per-series colors.
+class Chart {
+
+    // ---- colors ----
+
+    // Opaque 0xFFRRGGBB packed as a positive int (Canvas casts to u32).
+    static int Rgb(int r, int g, int b) {
+        return 4278190080 + r * 65536 + g * 256 + b;
+    }
+
+    // Same RGB as a packed opaque color but with a custom alpha (for area fills).
+    static int WithAlpha(int packed, int a) {
+        return (packed - 4278190080) + a * 16777216;
+    }
+
+    // ECharts' default qualitative palette.
+    static int Palette(Theme t, int i) {
+        int m = i % 8;
+        if (m == 0) { return Chart.Rgb(84, 112, 198); }   // blue
+        if (m == 1) { return Chart.Rgb(145, 204, 117); }  // green
+        if (m == 2) { return Chart.Rgb(250, 200, 88); }   // yellow
+        if (m == 3) { return Chart.Rgb(238, 102, 102); }  // red
+        if (m == 4) { return Chart.Rgb(115, 192, 222); }  // cyan
+        if (m == 5) { return Chart.Rgb(59, 162, 114); }   // teal
+        if (m == 6) { return Chart.Rgb(252, 132, 82); }   // orange
+        return Chart.Rgb(154, 96, 180);                    // purple
+    }
+
+    // ---- scale helpers ----
+
+    // Round a raw maximum up to a friendly axis bound (2/5/10 * 10^n).
+    static int NiceMax(int v) {
+        if (v <= 5) { return 5; }
+        int mag = 1;
+        while (mag * 10 <= v) { mag = mag * 10; }
+        int unit = v / mag;
+        int nice = 10;
+        if (unit < 2) { nice = 2; } else if (unit < 5) { nice = 5; }
+        return nice * mag;
+    }
+
+    static int MaxOf(List<ChartSeries> series) {
+        int mx = 0;
+        int i = 0;
+        while (i < series.Count) {
+            List<int> vs = series[i].values;
+            int j = 0;
+            while (j < vs.Count) { if (vs[j] > mx) { mx = vs[j]; } j = j + 1; }
+            i = i + 1;
+        }
+        return mx;
+    }
+
+    // Max stacked total across categories (for stacked bars).
+    static int MaxStack(List<ChartSeries> series, int n) {
+        int mx = 0;
+        int i = 0;
+        while (i < n) {
+            int sum = 0;
+            int s = 0;
+            while (s < series.Count) {
+                List<int> vs = series[s].values;
+                if (i < vs.Count) { sum = sum + vs[i]; }
+                s = s + 1;
+            }
+            if (sum > mx) { mx = sum; }
+            i = i + 1;
+        }
+        return mx;
+    }
+
+    static int MaxInt(List<int> vs) {
+        int mx = 0;
+        int i = 0;
+        while (i < vs.Count) { if (vs[i] > mx) { mx = vs[i]; } i = i + 1; }
+        return mx;
+    }
+
+    // ---- shared chrome ----
+
+    // Panel background + title + legend swatches. Returns the y just below the
+    // title/legend band so callers can lay out the plot area beneath it.
+    static int DrawPanel(App app, int x, int y, int w, int h, string title,
+                         List<ChartSeries> series) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+
+        // legend (top-right), one swatch + name per series, right-to-left
+        int lx = x + w - pad;
+        int sw = app.Scale(12);
+        int lgY = y + pad;
+        int si = series.Count - 1;
+        while (si >= 0) {
+            string nm = series[si].name;
+            int tw = Canvas.MeasureText(nm, t.fontSizeSmall);
+            lx = lx - tw;
+            c.DrawText(lx, lgY + app.Scale(2), nm, t.textSecondary, t.fontSizeSmall);
+            lx = lx - app.Scale(6) - sw;
+            c.FillRoundRect(lx, lgY + app.Scale(3), sw, sw, t.borderRadiusSmall, series[si].color);
+            lx = lx - app.Scale(14);
+            si = si - 1;
+        }
+
+        return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+    }
+
+    // Cartesian frame with value gridlines (left) + category labels (bottom).
+    static ChartFrame DrawFrame(App app, int x, int y, int w, int h, int plotTop,
+                                List<string> labels, int maxV) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+
+        int leftGut = Canvas.MeasureText(Convert.ToString(maxV), axisFs) + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, t.divider);
+            int val = maxV * k / ticks;
+            string vs = Convert.ToString(val);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, gy - Canvas.FontHeight(axisFs) / 2, vs, t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+
+        int n = labels.Count;
+        if (n > 0) {
+            int step = plotW / n;
+            int ci = 0;
+            while (ci < n) {
+                int cxs = plotX + ci * step;
+                c.DrawTextCentered(cxs, plotY + plotH + app.Scale(4), step, botGut, labels[ci], t.textTertiary, axisFs);
+                ci = ci + 1;
+            }
+        }
+
+        ChartFrame f = new ChartFrame();
+        f.plotX = plotX;
+        f.plotY = plotY;
+        f.plotW = plotW;
+        f.plotH = plotH;
+        return f;
+    }
+
+    // ---- line / area ----
+
+    static void LineCore(App app, int x, int y, int w, int h, string title,
+                         List<string> labels, List<ChartSeries> series, bool filled) {
+        Canvas c = app.canvas;
+        int maxV = Chart.NiceMax(Chart.MaxOf(series));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
+
+        int n = labels.Count;
+        if (n < 1) { return; }
+        int step = f.plotW / n;
+        int half = step / 2;
+        int th = app.Scale(2);
+        int rad = app.Scale(3);
+        int baseY = f.plotY + f.plotH;
+
+        int si = 0;
+        while (si < series.Count) {
+            ChartSeries s = series[si];
+            List<int> vs = s.values;
+
+            if (filled) {
+                int fillc = Chart.WithAlpha(s.color, 56);
+                int i = 0;
+                while (i + 1 < n && i + 1 < vs.Count) {
+                    int x0 = f.plotX + i * step + half;
+                    int y0 = f.plotY + f.plotH - (vs[i] * f.plotH / maxV);
+                    int x1 = f.plotX + (i + 1) * step + half;
+                    int y1 = f.plotY + f.plotH - (vs[i + 1] * f.plotH / maxV);
+                    int px = x0;
+                    while (px <= x1) {
+                        int yy = y0;
+                        if (x1 > x0) { yy = y0 + (y1 - y0) * (px - x0) / (x1 - x0); }
+                        c.FillRect(px, yy, 1, baseY - yy, fillc);
+                        px = px + 1;
+                    }
+                    i = i + 1;
+                }
+            }
+
+            int prevX = 0;
+            int prevY = 0;
+            int j = 0;
+            while (j < n && j < vs.Count) {
+                int px = f.plotX + j * step + half;
+                int py = f.plotY + f.plotH - (vs[j] * f.plotH / maxV);
+                if (j > 0) { c.DrawLine(prevX, prevY, px, py, s.color, th); }
+                prevX = px;
+                prevY = py;
+                j = j + 1;
+            }
+            int m = 0;
+            while (m < n && m < vs.Count) {
+                int px = f.plotX + m * step + half;
+                int py = f.plotY + f.plotH - (vs[m] * f.plotH / maxV);
+                c.FillCircle(px, py, rad, s.color);
+                m = m + 1;
+            }
+            si = si + 1;
+        }
+    }
+
+    /// Multi-series line chart.
+    static void Line(App app, int x, int y, int w, int h, string title,
+                     List<string> labels, List<ChartSeries> series) {
+        Chart.LineCore(app, x, y, w, h, title, labels, series, false);
+    }
+
+    /// Line chart with the area under each series filled (translucent).
+    static void Area(App app, int x, int y, int w, int h, string title,
+                     List<string> labels, List<ChartSeries> series) {
+        Chart.LineCore(app, x, y, w, h, title, labels, series, true);
+    }
+
+    // ---- bars ----
+
+    /// Grouped vertical bar / column chart.
+    static void Bar(App app, int x, int y, int w, int h, string title,
+                    List<string> labels, List<ChartSeries> series) {
+        Canvas c = app.canvas;
+        int maxV = Chart.NiceMax(Chart.MaxOf(series));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
+
+        int n = labels.Count;
+        int ns = series.Count;
+        if (n < 1 || ns < 1) { return; }
+        int step = f.plotW / n;
+        int groupW = step * 7 / 10;
+        int gap = app.Scale(2);
+        int barW = (groupW - gap * (ns - 1)) / ns;
+        if (barW < app.Scale(2)) { barW = app.Scale(2); }
+        int groupX0 = (step - groupW) / 2;
+        int rad = app.Scale(2);
+
+        int i = 0;
+        while (i < n) {
+            int slotX = f.plotX + i * step + groupX0;
+            int si = 0;
+            while (si < ns) {
+                List<int> vs = series[si].values;
+                int v = 0;
+                if (i < vs.Count) { v = vs[i]; }
+                int bh = v * f.plotH / maxV;
+                if (bh < 0) { bh = 0; }
+                int bx = slotX + si * (barW + gap);
+                int by = f.plotY + f.plotH - bh;
+                c.FillRoundRect(bx, by, barW, bh, rad, series[si].color);
+                si = si + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Stacked vertical bar chart (series summed per category).
+    static void StackedBar(App app, int x, int y, int w, int h, string title,
+                           List<string> labels, List<ChartSeries> series) {
+        Canvas c = app.canvas;
+        int n = labels.Count;
+        int ns = series.Count;
+        int maxV = Chart.NiceMax(Chart.MaxStack(series, n));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
+        if (n < 1 || ns < 1) { return; }
+
+        int step = f.plotW / n;
+        int barW = step * 5 / 10;
+        int barX0 = (step - barW) / 2;
+
+        int i = 0;
+        while (i < n) {
+            int bx = f.plotX + i * step + barX0;
+            int acc = 0;
+            int si = 0;
+            while (si < ns) {
+                List<int> vs = series[si].values;
+                int v = 0;
+                if (i < vs.Count) { v = vs[i]; }
+                int yTop = f.plotY + f.plotH - ((acc + v) * f.plotH / maxV);
+                int yBot = f.plotY + f.plotH - (acc * f.plotH / maxV);
+                c.FillRect(bx, yTop, barW, yBot - yTop, series[si].color);
+                acc = acc + v;
+                si = si + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Grouped horizontal bar chart (categories down the left, values across).
+    static void HBar(App app, int x, int y, int w, int h, string title,
+                     List<string> labels, List<ChartSeries> series) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+        int maxV = Chart.NiceMax(Chart.MaxOf(series));
+        int plotTop = Chart.DrawPanel(app, x, y, w, h, title, series);
+
+        int n = labels.Count;
+        int ns = series.Count;
+        if (n < 1 || ns < 1) { return; }
+
+        // widest category label sets the left gutter
+        int leftGut = app.Scale(20);
+        int li = 0;
+        while (li < n) {
+            int lw = Canvas.MeasureText(labels[li], axisFs);
+            if (lw + app.Scale(12) > leftGut) { leftGut = lw + app.Scale(12); }
+            li = li + 1;
+        }
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+
+        // vertical value gridlines + labels
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gx = plotX + k * plotW / ticks;
+            c.FillRect(gx, plotY, 1, plotH, t.divider);
+            string vs = Convert.ToString(maxV * k / ticks);
+            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4), app.Scale(40), botGut, vs, t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+
+        int rowH = plotH / n;
+        int groupH = rowH * 7 / 10;
+        int gap = app.Scale(2);
+        int barH = (groupH - gap * (ns - 1)) / ns;
+        if (barH < app.Scale(2)) { barH = app.Scale(2); }
+        int groupY0 = (rowH - groupH) / 2;
+        int rad = app.Scale(2);
+
+        int i = 0;
+        while (i < n) {
+            int rowY = plotY + i * rowH;
+            c.DrawTextCentered(x + pad, rowY, leftGut - app.Scale(6), rowH, labels[i], t.textSecondary, axisFs);
+            int si = 0;
+            while (si < ns) {
+                List<int> vs = series[si].values;
+                int v = 0;
+                if (i < vs.Count) { v = vs[i]; }
+                int bw = v * plotW / maxV;
+                int by = rowY + groupY0 + si * (barH + gap);
+                c.FillRoundRect(plotX + 1, by, bw, barH, rad, series[si].color);
+                si = si + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // ---- pie / donut ----
+
+    static void PieCore(App app, int x, int y, int w, int h, string title,
+                        List<string> names, List<int> values, int innerPct) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        top = top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+
+        int total = 0;
+        int i = 0;
+        while (i < values.Count) { total = total + values[i]; i = i + 1; }
+        if (total <= 0) { return; }
+
+        // legend column on the right; pie fills the left region
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (areaH / 2 < rOuter) { rOuter = areaH / 2; }
+        if (rOuter < app.Scale(10)) { rOuter = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int rInner = rOuter * innerPct / 100;
+
+        int acc = 0;
+        int k = 0;
+        while (k < values.Count) {
+            int a0 = acc * 360 / total;
+            int a1 = (acc + values[k]) * 360 / total;
+            c.FillSector(cx, cy, rInner, rOuter, a0, a1, Chart.Palette(t, k));
+            acc = acc + values[k];
+            k = k + 1;
+        }
+
+        // legend: swatch + name + percent
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        int j = 0;
+        while (j < names.Count) {
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, Chart.Palette(t, j));
+            int pct = values[j] * 100 / total;
+            string lbl = names[j] + "  " + Convert.ToString(pct) + "%";
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
+    }
+
+    /// Pie chart with a right-hand legend showing each slice's percentage.
+    static void Pie(App app, int x, int y, int w, int h, string title,
+                    List<string> names, List<int> values) {
+        Chart.PieCore(app, x, y, w, h, title, names, values, 0);
+    }
+
+    /// Donut (ring) chart — a pie with a hollow center.
+    static void Donut(App app, int x, int y, int w, int h, string title,
+                      List<string> names, List<int> values) {
+        Chart.PieCore(app, x, y, w, h, title, names, values, 55);
+    }
+
+    // ---- scatter ----
+
+    /// Scatter plot of numeric (xs[i], ys[i]) points on value axes.
+    static void Scatter(App app, int x, int y, int w, int h, string title,
+                        List<int> xs, List<int> ys, int color) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        top = top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+
+        int maxX = Chart.NiceMax(Chart.MaxInt(xs));
+        int maxY = Chart.NiceMax(Chart.MaxInt(ys));
+        int leftGut = Canvas.MeasureText(Convert.ToString(maxY), axisFs) + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        int plotX = x + pad + leftGut;
+        int plotY = top;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, t.divider);
+            string vs = Convert.ToString(maxY * k / ticks);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, gy - Canvas.FontHeight(axisFs) / 2, vs, t.textTertiary, axisFs);
+            int gx = plotX + k * plotW / ticks;
+            c.DrawTextCentered(gx - app.Scale(20), plotY + plotH + app.Scale(4), app.Scale(40), botGut, Convert.ToString(maxX * k / ticks), t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+
+        int rad = app.Scale(4);
+        int i = 0;
+        while (i < xs.Count && i < ys.Count) {
+            int px = plotX + xs[i] * plotW / maxX;
+            int py = plotY + plotH - (ys[i] * plotH / maxY);
+            c.FillCircle(px, py, rad, color);
+            i = i + 1;
+        }
+    }
+}

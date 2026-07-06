@@ -41,6 +41,50 @@ static const char *console_methods[] = {
     "WriteLine", "Write", "ReadLine", "Read", "Clear", NULL
 };
 
+/* Stdlib static class members for semantic autocomplete */
+typedef struct {
+    const char *class_name;
+    const char *methods[24];
+} stdlib_class_t;
+
+static const stdlib_class_t stdlib_classes[] = {
+    {"File", {"ReadAllText", "WriteAllText", "AppendAllText", "Exists", "Delete",
+              "Move", "Copy", "GetSize", NULL}},
+    {"Path", {"GetFileName", "GetExtension", "Combine", "GetDirectoryName",
+              "HasExtension", "ChangeExtension", "GetFileNameWithoutExtension",
+              "GetTempPath", NULL}},
+    {"Directory", {"Exists", "CreateDirectory", "Delete", "GetCurrentDirectory",
+                   "SetCurrentDirectory", "GetFiles", "GetDirectories", NULL}},
+    {"JsonParser", {"GetString", "GetInt", "GetDouble", "GetBool", "HasKey",
+                    "GetValueRaw", NULL}},
+    {"JsonBuilder", {"ObjectStart", "ObjectEnd", "AddString", "AddInt",
+                     "AddBool", "AddNull", NULL}},
+    {"Thread", {"Sleep", "CurrentId", NULL}},
+    {"Stopwatch", {"GetMilliseconds", NULL}},
+    {"Mutex", {"Create", "Lock", "Unlock", "Destroy", NULL}},
+    {"Encoding", {"IntToString", "ParseInt", "ParseDouble", "GetByteCount", NULL}},
+    {"Convert", {"ToInt32", "ToString", NULL}},
+    {"Math", {"Sqrt", "Abs", "Max", "Min", "Pow", "Floor", "Ceiling", NULL}},
+    {"Environment", {"ArgCount", "ArgAt", NULL}},
+    {NULL, {NULL}}
+};
+
+/* List<T> instance methods */
+static const char *list_methods[] = {
+    "Add", "Clear", "RemoveAt", "IndexOf", "Contains", "Insert", "Reverse",
+    "Count", NULL
+};
+
+/* Dict<K,V> instance methods */
+static const char *dict_methods[] = {
+    "Add", "ContainsKey", "Remove", "Clear", "Count", NULL
+};
+
+/* StringBuilder instance methods */
+static const char *sb_methods[] = {
+    "Append", "ToString", "Clear", "Length", NULL
+};
+
 void intel_init(intellisense_t *is) {
     memset(is, 0, sizeof(intellisense_t));
     is->completion_selected = -1;
@@ -331,6 +375,70 @@ int intel_complete(intellisense_t *is, const char *prefix,
             strncpy(c->insert_text, console_methods[i], sizeof(c->insert_text) - 1);
             snprintf(c->detail, sizeof(c->detail), "Console.%s()", console_methods[i]);
             c->kind = ISYM_METHOD;
+        }
+    }
+
+    /* Stdlib static class methods (File.xxx, Path.xxx, JsonParser.xxx, etc.) */
+    if (context_class) {
+        for (int ci = 0; stdlib_classes[ci].class_name; ci++) {
+            if (strcmp(context_class, stdlib_classes[ci].class_name) != 0) continue;
+            for (int mi = 0; stdlib_classes[ci].methods[mi] && is->completion_count < INTEL_MAX_COMPLETIONS; mi++) {
+                if (plen > 0 && _strnicmp(stdlib_classes[ci].methods[mi], prefix, plen) != 0) continue;
+                completion_t *c = &is->completions[is->completion_count++];
+                strncpy(c->label, stdlib_classes[ci].methods[mi], sizeof(c->label) - 1);
+                strncpy(c->insert_text, stdlib_classes[ci].methods[mi], sizeof(c->insert_text) - 1);
+                snprintf(c->detail, sizeof(c->detail), "%s.%s()", context_class, stdlib_classes[ci].methods[mi]);
+                c->kind = ISYM_METHOD;
+            }
+            break;
+        }
+    }
+
+    /* List<T> instance method completions */
+    if (context_class) {
+        /* check if context looks like a List variable — heuristic: look up in symbols */
+        for (int si = 0; si < is->symbol_count; si++) {
+            if (is->symbols[si].kind == ISYM_VARIABLE &&
+                strcmp(is->symbols[si].name, context_class) == 0 &&
+                strstr(is->symbols[si].type_name, "List") != NULL) {
+                for (int mi = 0; list_methods[mi] && is->completion_count < INTEL_MAX_COMPLETIONS; mi++) {
+                    if (plen > 0 && _strnicmp(list_methods[mi], prefix, plen) != 0) continue;
+                    completion_t *c = &is->completions[is->completion_count++];
+                    strncpy(c->label, list_methods[mi], sizeof(c->label) - 1);
+                    strncpy(c->insert_text, list_methods[mi], sizeof(c->insert_text) - 1);
+                    snprintf(c->detail, sizeof(c->detail), "List.%s", list_methods[mi]);
+                    c->kind = ISYM_METHOD;
+                }
+                break;
+            }
+            /* Dict<K,V> instance methods */
+            if (is->symbols[si].kind == ISYM_VARIABLE &&
+                strcmp(is->symbols[si].name, context_class) == 0 &&
+                strstr(is->symbols[si].type_name, "Dict") != NULL) {
+                for (int mi = 0; dict_methods[mi] && is->completion_count < INTEL_MAX_COMPLETIONS; mi++) {
+                    if (plen > 0 && _strnicmp(dict_methods[mi], prefix, plen) != 0) continue;
+                    completion_t *c = &is->completions[is->completion_count++];
+                    strncpy(c->label, dict_methods[mi], sizeof(c->label) - 1);
+                    strncpy(c->insert_text, dict_methods[mi], sizeof(c->insert_text) - 1);
+                    snprintf(c->detail, sizeof(c->detail), "Dict.%s", dict_methods[mi]);
+                    c->kind = ISYM_METHOD;
+                }
+                break;
+            }
+            /* StringBuilder instance methods */
+            if (is->symbols[si].kind == ISYM_VARIABLE &&
+                strcmp(is->symbols[si].name, context_class) == 0 &&
+                strstr(is->symbols[si].type_name, "StringBuilder") != NULL) {
+                for (int mi = 0; sb_methods[mi] && is->completion_count < INTEL_MAX_COMPLETIONS; mi++) {
+                    if (plen > 0 && _strnicmp(sb_methods[mi], prefix, plen) != 0) continue;
+                    completion_t *c = &is->completions[is->completion_count++];
+                    strncpy(c->label, sb_methods[mi], sizeof(c->label) - 1);
+                    strncpy(c->insert_text, sb_methods[mi], sizeof(c->insert_text) - 1);
+                    snprintf(c->detail, sizeof(c->detail), "StringBuilder.%s", sb_methods[mi]);
+                    c->kind = ISYM_METHOD;
+                }
+                break;
+            }
         }
     }
 

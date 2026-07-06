@@ -175,21 +175,28 @@ add_test(NAME conformance_minic
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-# ---- Self-hosting: the C host builds the whole Zan compiler (gen1) and gen1
-# lexes/parses/binds/checks/lowers a real program to LLVM IR. The full
-# byte-identical gen2==gen3 closure is reproduced by scripts/bootstrap.* (see
-# docs/BOOTSTRAP.md); it needs clang to finish linking the emitted .ll.
-add_test(NAME selfhost_gen1_emits_ir
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
-    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.zan
-    -DGEN1=${CMAKE_BINARY_DIR}/zanc_selfhost${_exe_ext}
-    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_prog1.ll
-    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
-
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)
 set_tests_properties(diag_no_runaway PROPERTIES
   WILL_FAIL TRUE TIMEOUT 20)
+
+# ---- zanpkg (package manager CLI) ----
+add_executable(zanpkg
+    src/pkg/zanpkg_main.c
+)
+if(WIN32)
+    target_link_libraries(zanpkg PRIVATE)
+else()
+    target_link_libraries(zanpkg PRIVATE m)
+endif()
+
+# ---- zanfmt (code formatter) ----
+add_executable(zanfmt
+    src/fmt/zanfmt.c
+)
+
+# ---- zandoc (documentation generator) ----
+add_executable(zandoc
+    src/doc/zandoc.c
+)

@@ -104,6 +104,7 @@ struct zan_irgen {
     LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
     LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
     LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */
+    LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64 thread_handle } */
     LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
 
     /* DllImport: tracked extern libraries for linker */

@@ -36,6 +36,9 @@ class Irgen {
     public List<string> tparamNames;
     public StringBuilder deferred; // hoisted lambda function definitions
     public int lamCount;
+    public List<string> stmtTemps;
+    public List<Node> stmtTempTypes;
+    public int loopScopeBase;
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -50,6 +53,9 @@ class Irgen {
         curLbl = "entry";
         brkTarget = 0; contTarget = 0;
         tparamNames = new List<string>();
+        stmtTemps = new List<string>();
+        stmtTempTypes = new List<Node>();
+        loopScopeBase = 0;
     }
 
     string NT() { tmp = tmp + 1; return "%t" + tmp; }
@@ -340,6 +346,7 @@ class Irgen {
         CollectTParams(unit);
         H("declare i32 @printf(i8*, ...)");
         H("declare i8* @malloc(i64)");
+        H("declare i8* @calloc(i64, i64)");
         H("declare i8* @realloc(i8*, i64)");
         H("declare void @free(i8*)");
         H("declare i64 @strlen(i8*)");
@@ -502,6 +509,15 @@ class Irgen {
         H("  store i64 %v, i64* %slot");
         H("  %ncount = add i64 %count, 1");
         H("  store i64 %ncount, i64* %cptr");
+        H("  %optr = getelementptr %zlist, %zlist* %l, i32 0, i32 3");
+        H("  %owns = load i64, i64* %optr");
+        H("  %doret = icmp ne i64 %owns, 0");
+        H("  br i1 %doret, label %doretain, label %done");
+        H("doretain:");
+        H("  %vp = inttoptr i64 %v to i8*");
+        H("  call void @zretain(i8* %vp)");
+        H("  br label %done");
+        H("done:");
         H("  ret void");
         H("}");
         H("define i64 @zlist_get(i8* %p, i64 %i) {");
@@ -513,11 +529,24 @@ class Irgen {
         H("  ret i64 %v");
         H("}");
         H("define void @zlist_set(i8* %p, i64 %i, i64 %v) {");
+        H("entry:");
         H("  %l = bitcast i8* %p to %zlist*");
         H("  %dptr = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
         H("  %data = load i64*, i64** %dptr");
         H("  %slot = getelementptr i64, i64* %data, i64 %i");
+        H("  %old = load i64, i64* %slot");
         H("  store i64 %v, i64* %slot");
+        H("  %optr = getelementptr %zlist, %zlist* %l, i32 0, i32 3");
+        H("  %owns = load i64, i64* %optr");
+        H("  %doarc = icmp ne i64 %owns, 0");
+        H("  br i1 %doarc, label %arc, label %done");
+        H("arc:");
+        H("  %nvp = inttoptr i64 %v to i8*");
+        H("  call void @zretain(i8* %nvp)");
+        H("  %ovp = inttoptr i64 %old to i8*");
+        H("  call void @zrelease(i8* %ovp)");
+        H("  br label %done");
+        H("done:");
         H("  ret void");
         H("}");
         H("define i64 @zlist_count(i8* %p) {");
@@ -538,7 +567,7 @@ class Irgen {
         // destructor (which releases members / frees internal buffers) then frees.
         H("define i8* @zalloc(i64 %n, i8* %dtor) {");
         H("  %tot = add i64 %n, 16");
-        H("  %raw = call i8* @malloc(i64 %tot)");
+        H("  %raw = call i8* @calloc(i64 1, i64 %tot)");
         H("  %rc = bitcast i8* %raw to i64*");
         H("  store i64 1, i64* %rc");
         H("  %ds0 = getelementptr i8, i8* %raw, i64 8");
@@ -603,6 +632,82 @@ class Irgen {
         Node d = binder.FindType(n);
         if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return true; }
         return false;
+    }
+
+    void EmitArcRetain(string val, Node ty) {
+        if (!ArcManaged(ty)) { return; }
+        string lt = MapType(ty);
+        if (lt == "i8*") {
+            L("  call void @zretain(i8* " + val + ")");
+        } else {
+            string t = NT();
+            L("  " + t + " = bitcast " + lt + " " + val + " to i8*");
+            L("  call void @zretain(i8* " + t + ")");
+        }
+    }
+
+    void EmitArcRelease(string val, Node ty) {
+        if (!ArcManaged(ty)) { return; }
+        string lt = MapType(ty);
+        if (lt == "i8*") {
+            L("  call void @zrelease(i8* " + val + ")");
+        } else {
+            string t = NT();
+            L("  " + t + " = bitcast " + lt + " " + val + " to i8*");
+            L("  call void @zrelease(i8* " + t + ")");
+        }
+    }
+
+    void EmitLocalReleases() {
+        int i = 0;
+        while (i < locName.Count) {
+            if (ArcManaged(locType[i])) {
+                string lt = MapType(locType[i]);
+                string t = NT();
+                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                EmitArcRelease(t, locType[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    void AddTemp(string op, Node ty) {
+        if (ArcManaged(ty)) { stmtTemps.Add(op); stmtTempTypes.Add(ty); }
+    }
+
+    void EmitTempReleases() {
+        int i = 0;
+        while (i < stmtTemps.Count) {
+            EmitArcRelease(stmtTemps[i], stmtTempTypes[i]);
+            i = i + 1;
+        }
+        stmtTemps = new List<string>();
+        stmtTempTypes = new List<Node>();
+    }
+
+    void ReleaseLocalsFrom(int from) {
+        int i = from;
+        while (i < locName.Count) {
+            if (ArcManaged(locType[i])) {
+                string lt = MapType(locType[i]);
+                string t = NT();
+                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                EmitArcRelease(t, locType[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    void TrimLocals(int to) {
+        List<string> nn = new List<string>();
+        List<Node> nt = new List<Node>();
+        List<string> nr = new List<string>();
+        int i = 0;
+        while (i < to) {
+            nn.Add(locName[i]); nt.Add(locType[i]); nr.Add(locReg[i]);
+            i = i + 1;
+        }
+        locName = nn; locType = nt; locReg = nr;
     }
 
     // per-class destructor: release every ARC-managed field, then return (the
@@ -804,7 +909,19 @@ class Irgen {
         H("  %vpu = getelementptr %zdict, %zdict* %du, i32 0, i32 3");
         H("  %valsu = load i64*, i64** %vpu");
         H("  %su = getelementptr i64, i64* %valsu, i64 %idx");
+        H("  %oldval = load i64, i64* %su");
         H("  store i64 %val, i64* %su");
+        H("  %opu = getelementptr %zdict, %zdict* %du, i32 0, i32 4");
+        H("  %ownsu = load i64, i64* %opu");
+        H("  %doarcu = icmp ne i64 %ownsu, 0");
+        H("  br i1 %doarcu, label %arcu, label %doneu");
+        H("arcu:");
+        H("  %nvpu = inttoptr i64 %val to i8*");
+        H("  call void @zretain(i8* %nvpu)");
+        H("  %ovpu = inttoptr i64 %oldval to i8*");
+        H("  call void @zrelease(i8* %ovpu)");
+        H("  br label %doneu");
+        H("doneu:");
         H("  ret void");
         H("insert:");
         H("  %d = bitcast i8* %p to %zdict*");
@@ -845,6 +962,15 @@ class Irgen {
         H("  store i64 %val, i64* %vslot");
         H("  %ncount = add i64 %count, 1");
         H("  store i64 %ncount, i64* %cptr");
+        H("  %opi = getelementptr %zdict, %zdict* %d, i32 0, i32 4");
+        H("  %ownsi = load i64, i64* %opi");
+        H("  %doarci = icmp ne i64 %ownsi, 0");
+        H("  br i1 %doarci, label %arci, label %donei");
+        H("arci:");
+        H("  %nvpi = inttoptr i64 %val to i8*");
+        H("  call void @zretain(i8* %nvpi)");
+        H("  br label %donei");
+        H("donei:");
         H("  ret void");
         H("}");
         H("define i64 @zdict_get(i8* %p, i8* %key) {");
@@ -899,6 +1025,9 @@ class Irgen {
         locType = new List<Node>();
         locReg = new List<string>();
         locSeq = 0;
+        stmtTemps = new List<string>();
+        stmtTempTypes = new List<Node>();
+        loopScopeBase = 0;
     }
 
     void GenMethod(Node cls, Node m, bool ctor) {
@@ -937,10 +1066,12 @@ class Irgen {
             string preg = AddLocal(pn[j], pt[j]);
             L("  " + preg + " = alloca " + lt);
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
+            EmitArcRetain("%p" + j, pt[j]);
             j = j + 1;
         }
         if (m.d != null) { GenStmt(m.d); }
         if (!term) {
+            ReleaseLocalsFrom(0);
             if (curRet == "void") { L("  ret void"); }
             else if (curRet == "i64") { L("  ret i64 0"); }
             else { L("  ret " + curRet + " null"); }
@@ -976,10 +1107,14 @@ class Irgen {
             string preg = AddLocal(pn[j], pt[j]);
             L("  " + preg + " = alloca " + lt);
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
+            EmitArcRetain("%p" + j, pt[j]);
             j = j + 1;
         }
         if (m.d != null) { GenStmt(m.d); }
-        if (!term) { L("  ret void"); }
+        if (!term) {
+            ReleaseLocalsFrom(0);
+            L("  ret void");
+        }
         L("}");
     }
 
@@ -1009,20 +1144,40 @@ class Irgen {
         if (term) { return; }
         int k = s.kind;
         if (k == AK.Block()) {
+            int scopeStart = locName.Count;
             int i = 0;
             while (i < s.kids.Count) { GenStmt(s.kids[i]); i = i + 1; }
+            if (!term) { ReleaseLocalsFrom(scopeStart); }
+            TrimLocals(scopeStart);
         } else if (k == AK.VarDecl()) {
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             GenVarDecl(s);
+            EmitTempReleases();
         } else if (k == AK.DeconDecl()) {
             GenDecon(s);
         } else if (k == AK.ExprStmt()) {
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             GenExpr(s.a);
+            EmitTempReleases();
         } else if (k == AK.ReturnStmt()) {
             if (s.a != null) {
+                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
                 ExprVal v = GenExpr(s.a);
-                if (curRet == "void") { L("  ret void"); }
-                else { L("  ret " + curRet + " " + Coerce(v, curRet)); }
-            } else { L("  ret void"); }
+                if (curRet == "void") {
+                    EmitTempReleases();
+                    ReleaseLocalsFrom(0);
+                    L("  ret void");
+                } else {
+                    string rv = Coerce(v, curRet);
+                    EmitArcRetain(rv, v.ty);
+                    EmitTempReleases();
+                    ReleaseLocalsFrom(0);
+                    L("  ret " + curRet + " " + rv);
+                }
+            } else {
+                ReleaseLocalsFrom(0);
+                L("  ret void");
+            }
             term = true;
         } else if (k == AK.IfStmt()) {
             GenIf(s);
@@ -1037,9 +1192,9 @@ class Irgen {
         } else if (k == AK.ThrowStmt()) {
             GenThrow(s);
         } else if (k == AK.BreakStmt()) {
-            if (brkTarget > 0) { L("  br label %L" + brkTarget); term = true; }
+            if (brkTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + brkTarget); term = true; }
         } else if (k == AK.ContinueStmt()) {
-            if (contTarget > 0) { L("  br label %L" + contTarget); term = true; }
+            if (contTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + contTarget); term = true; }
         } else {
             GenExpr(s);
         }
@@ -1162,8 +1317,12 @@ class Irgen {
             if (IsNullableValue(ty)) {
                 L("  store i8* " + BoxFor(init, ty) + ", i8** " + reg);
             } else {
-                L("  store " + lt + " " + Coerce(init, lt) + ", " + lt + "* " + reg);
+                string sv = Coerce(init, lt);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+                EmitArcRetain(sv, ty);
             }
+        } else {
+            if (ArcManaged(ty)) { L("  store " + lt + " null, " + lt + "* " + reg); }
         }
     }
 
@@ -1199,7 +1358,9 @@ class Irgen {
     void GenWhile(Node s) {
         int lc = NL(); int lb = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
         brkTarget = lend; contTarget = lc;
+        loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
         string c = GenCond(s.a);
@@ -1209,13 +1370,17 @@ class Irgen {
         if (!term) { L("  br label %L" + lc); }
         Label(lend);
         brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
     }
 
     void GenFor(Node s) {
+        int forScope = locName.Count;
         if (s.a != null) { GenStmt(s.a); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
         brkTarget = lend; contTarget = linc;
+        loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
         if (s.b != null) {
@@ -1231,11 +1396,15 @@ class Irgen {
         if (s.c != null) { GenExpr(s.c); }
         L("  br label %L" + lc);
         Label(lend);
+        ReleaseLocalsFrom(forScope);
+        TrimLocals(forScope);
         brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
     }
 
     // foreach (T x in coll) body  — lowered as an indexed walk over List<T>
     void GenForeach(Node s) {
+        int feScope = locName.Count;
         ExprVal coll = GenExpr(s.b);
         if (!IsListType(coll.ty)) { return; }
         Node elemTy = s.type;
@@ -1246,9 +1415,12 @@ class Irgen {
         L("  store i64 0, i64* " + idx);
         string ereg = AddLocal(s.sval, elemTy);
         L("  " + ereg + " = alloca " + elt);
+        if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
         brkTarget = lend; contTarget = linc;
+        loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
         string iv = NT();
@@ -1262,7 +1434,15 @@ class Irgen {
         string slot = NT();
         L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
         ExprVal ev = FromSlot(slot, elemTy);
-        L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+        if (ArcManaged(elemTy)) {
+            string old = NT();
+            L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);
+            L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+            EmitArcRetain(ev.op, elemTy);
+            EmitArcRelease(old, elemTy);
+        } else {
+            L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+        }
         GenStmt(s.c);
         if (!term) { L("  br label %L" + linc); }
         Label(linc);
@@ -1273,7 +1453,10 @@ class Irgen {
         L("  store i64 " + inc + ", i64* " + idx);
         L("  br label %L" + lc);
         Label(lend);
+        ReleaseLocalsFrom(feScope);
+        TrimLocals(feScope);
         brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
     }
 
     // throw expr — store the exception object, pop the innermost handler and
@@ -1345,6 +1528,7 @@ class Irgen {
         Label(lcatch);
         // handler already popped by throw; bind catch variable to @__exc_val
         if (s.b != null) {
+            int catchScope = locName.Count;
             Node cc = s.b;
             if (cc.sval != "" && cc.type != null) {
                 string exv = NT();
@@ -1361,6 +1545,8 @@ class Irgen {
                 L("  store " + ct + " " + cv + ", " + ct + "* " + reg);
             }
             GenStmt(cc.a);
+            if (!term) { ReleaseLocalsFrom(catchScope); }
+            TrimLocals(catchScope);
         }
         if (!term) {
             if (s.c != null) { GenStmt(s.c); }
@@ -1525,6 +1711,8 @@ class Irgen {
             return new ExprVal("" + EvalConstInt(e), MkType("int"));
         }
         if (op == TK.AmpAmp() || op == TK.PipePipe()) {
+            List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             bool isAnd = (op == TK.AmpAmp());
             int lrhs = NL(); int lend = NL();
             string la = GenCond(e.a);
@@ -1541,6 +1729,7 @@ class Irgen {
             L("  " + r + " = phi i1 [ " + dflt + ", %" + bpre + " ], [ " + lb + ", %" + bpost + " ]");
             string z = NT();
             L("  " + z + " = zext i1 " + r + " to i64");
+            stmtTemps = svT; stmtTempTypes = svTT;
             return new ExprVal(z, MkType("bool"));
         }
         // pointer/null comparisons (peek operand kind before evaluating)
@@ -1724,7 +1913,16 @@ class Irgen {
                     return;
                 }
                 string lt = MapType(lty);
-                L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + locReg[li]);
+                if (ArcManaged(lty)) {
+                    string old = NT();
+                    L("  " + old + " = load " + lt + ", " + lt + "* " + locReg[li]);
+                    string sv = Coerce(v, lt);
+                    L("  store " + lt + " " + sv + ", " + lt + "* " + locReg[li]);
+                    EmitArcRetain(sv, lty);
+                    EmitArcRelease(old, lty);
+                } else {
+                    L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + locReg[li]);
+                }
                 return;
             }
             if (curHasThis) {
@@ -1800,7 +1998,16 @@ class Irgen {
             return;
         }
         string ft = MapType(fty);
-        L("  store " + ft + " " + Coerce(v, ft) + ", " + ft + "* " + p);
+        if (ArcManaged(fty)) {
+            string old = NT();
+            L("  " + old + " = load " + ft + ", " + ft + "* " + p);
+            string sv = Coerce(v, ft);
+            L("  store " + ft + " " + sv + ", " + ft + "* " + p);
+            EmitArcRetain(sv, fty);
+            EmitArcRelease(old, fty);
+        } else {
+            L("  store " + ft + " " + Coerce(v, ft) + ", " + ft + "* " + p);
+        }
     }
 
     // convert a value to an i64 list slot (pointers via ptrtoint)
@@ -2051,17 +2258,20 @@ class Irgen {
             string t = NT();
             string ow = "0"; if (ArcManaged(ListElem(ty))) { ow = "1"; }
             L("  " + t + " = call i8* @zlist_new(i64 " + ow + ")");
+            AddTemp(t, ty);
             return new ExprVal(t, ty);
         }
         if (IsDictType(ty)) {
             string t = NT();
             string ow = "0"; if (ArcManaged(DictVal(ty))) { ow = "1"; }
             L("  " + t + " = call i8* @zdict_new(i64 " + ow + ")");
+            AddTemp(t, ty);
             return new ExprVal(t, ty);
         }
         if (IsSbType(ty)) {
             string t = NT();
             L("  " + t + " = call i8* @zsb_new()");
+            AddTemp(t, ty);
             return new ExprVal(t, ty);
         }
         // object
@@ -2097,6 +2307,7 @@ class Irgen {
             L("  call void @" + cn + "_ctor(" + args + ")");
         }
         // preserve generic type arguments (ty may carry <...>) for the result
+        AddTemp(obj, ty);
         return new ExprVal(obj, ty);
     }
 
@@ -2131,6 +2342,8 @@ class Irgen {
     }
 
     ExprVal GenSwitchExpr(Node e) {
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         ExprVal subj = GenExpr(e.a);
         int nend = NL();
         List<string> vals = new List<string>();
@@ -2200,6 +2413,7 @@ class Irgen {
         if (vals.Count > 0) { phi = phi + ", [ " + zero + ", %" + fbLbl + " ]"; }
         else { phi = phi + " [ " + zero + ", %" + fbLbl + " ]"; }
         L("  " + phi);
+        stmtTemps = svT; stmtTempTypes = svTT;
         return new ExprVal(t, resTy);
     }
 
@@ -2356,6 +2570,8 @@ class Irgen {
         List<string> sLocName = locName; List<Node> sLocType = locType;
         List<string> sLocReg = locReg; int sLocSeq = locSeq;
         int sBrk = brkTarget; int sCont = contTarget;
+        int sLoopScope = loopScopeBase;
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
 
         body = new StringBuilder();
         tmp = 0; lbl = 0; term = false; curLbl = "entry";
@@ -2374,6 +2590,7 @@ class Irgen {
             string preg = AddLocal(pn[a], pt[a]);
             L("  " + preg + " = alloca " + lt);
             L("  store " + lt + " %p" + a + ", " + lt + "* " + preg);
+            EmitArcRetain("%p" + a, pt[a]);
             a = a + 1;
         }
         if (nc > 0) {
@@ -2389,21 +2606,34 @@ class Irgen {
                 string lt = MapType(capTy[c]);
                 string creg = AddLocal(caps[c], capTy[c]);
                 L("  " + creg + " = alloca " + lt);
-                L("  store " + lt + " " + Coerce(cv, lt) + ", " + lt + "* " + creg);
+                string csv = Coerce(cv, lt);
+                L("  store " + lt + " " + csv + ", " + lt + "* " + creg);
+                EmitArcRetain(csv, capTy[c]);
                 c = c + 1;
             }
         }
         if (lam.d != null) {
             GenStmt(lam.d);
             if (!term) {
+                ReleaseLocalsFrom(0);
                 if (curRet == "void") { L("  ret void"); }
                 else if (curRet == "i64") { L("  ret i64 0"); }
                 else { L("  ret " + curRet + " null"); }
             }
         } else {
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             ExprVal rv = GenExpr(lam.a);
-            if (curRet == "void") { L("  ret void"); }
-            else { L("  ret " + curRet + " " + Coerce(rv, curRet)); }
+            if (curRet == "void") {
+                EmitTempReleases();
+                ReleaseLocalsFrom(0);
+                L("  ret void");
+            } else {
+                string rvs = Coerce(rv, curRet);
+                EmitArcRetain(rvs, rv.ty);
+                EmitTempReleases();
+                ReleaseLocalsFrom(0);
+                L("  ret " + curRet + " " + rvs);
+            }
         }
         L("}");
         deferred.Append(body.ToString());
@@ -2413,6 +2643,8 @@ class Irgen {
         curRet = sRet; curClass = sClass; curHasThis = sHasThis;
         locName = sLocName; locType = sLocType; locReg = sLocReg; locSeq = sLocSeq;
         brkTarget = sBrk; contTarget = sCont;
+        loopScopeBase = sLoopScope;
+        stmtTemps = svT; stmtTempTypes = svTT;
 
         // build closure { i8* fn, i8* env }
         string clo = NT();
@@ -2455,6 +2687,7 @@ class Irgen {
         if (rt == "void") { L("  call void " + fn + "(" + args + ")"); return new ExprVal("0", MkType("void")); }
         string t = NT();
         L("  " + t + " = call " + rt + " " + fn + "(" + args + ")");
+        AddTemp(t, retTy);
         return new ExprVal(t, retTy);
     }
 
@@ -2679,6 +2912,7 @@ class Irgen {
         L("  " + t + " = call " + rt + " @" + clsName + "_" + name + "(" + args + ")");
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, m.type); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
+        AddTemp(t, retTy);
         return new ExprVal(t, retTy);
     }
 
@@ -2701,6 +2935,7 @@ class Irgen {
         string t = NT();
         L("  " + t + " = call " + rt + " @" + owner + "_" + m.sval + "(" + args + ")");
         if (IsErasedType(m.type)) { return FromSlot(t, m.type); }
+        AddTemp(t, m.type);
         return new ExprVal(t, m.type);
     }
 
@@ -2737,6 +2972,7 @@ class Irgen {
         L("  " + t + " = call " + rt + " @" + owner + "_" + name + "(" + args + ")");
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
+        AddTemp(t, retTy);
         return new ExprVal(t, retTy);
     }
 
@@ -2772,6 +3008,7 @@ class Irgen {
         string t = NT();
         L("  " + t + " = call " + rt + " " + fn + "(" + args + ")");
         if (IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
+        AddTemp(t, m.type);
         return new ExprVal(t, m.type);
     }
 
