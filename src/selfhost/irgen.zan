@@ -1676,6 +1676,14 @@ class Irgen {
     // switch expression:  subj switch { pat => e, _ => e }. Constant patterns
     // (int / string) compared against the subject; "_" is the default arm.
     // Lowered to a test cascade feeding a phi at the join block.
+    string RelCmp(int op) {
+        if (op == TK.Less()) { return "slt"; }
+        if (op == TK.Greater()) { return "sgt"; }
+        if (op == TK.LessEq()) { return "sle"; }
+        if (op == TK.GreaterEq()) { return "sge"; }
+        return "eq";
+    }
+
     ExprVal GenSwitchExpr(Node e) {
         ExprVal subj = GenExpr(e.a);
         int nend = NL();
@@ -1689,18 +1697,37 @@ class Irgen {
             int bodyL = NL();
             int nextL = NL();
             if (arm.a == null) {
-                L("  br label %L" + bodyL);
+                if (arm.c != null) {
+                    ExprVal gv = GenExpr(arm.c);
+                    string gi = NT();
+                    L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
+                } else {
+                    L("  br label %L" + bodyL);
+                }
             } else {
                 ExprVal pv = GenExpr(arm.a);
                 string c = NT();
-                if (IsStr(subj.ty) && IsStr(pv.ty)) {
+                if (arm.op != 0) {
+                    L("  " + c + " = icmp " + RelCmp(arm.op) + " i64 " + subj.op + ", " + pv.op);
+                } else if (IsStr(subj.ty) && IsStr(pv.ty)) {
                     string r = NT();
                     L("  " + r + " = call i32 @strcmp(i8* " + subj.op + ", i8* " + pv.op + ")");
                     L("  " + c + " = icmp eq i32 " + r + ", 0");
                 } else {
                     L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
                 }
-                L("  br i1 " + c + ", label %L" + bodyL + ", label %L" + nextL);
+                if (arm.c != null) {
+                    int guardL = NL();
+                    L("  br i1 " + c + ", label %L" + guardL + ", label %L" + nextL);
+                    Label(guardL);
+                    ExprVal gv = GenExpr(arm.c);
+                    string gi = NT();
+                    L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
+                } else {
+                    L("  br i1 " + c + ", label %L" + bodyL + ", label %L" + nextL);
+                }
             }
             Label(bodyL);
             ExprVal rv = GenExpr(arm.b);
