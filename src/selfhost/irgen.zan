@@ -2129,15 +2129,66 @@ class Irgen {
         return Coerce(av, MapType(pty));
     }
 
+    int IndexOfStr(List<string> xs, string s) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == s) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // Reorder a call's arguments to positional order, applying named-argument
+    // placement and filling omitted trailing parameters with their defaults.
+    // When there are no named args and every parameter is supplied, the call's
+    // own argument list is returned unchanged (keeps existing IR byte-identical).
+    List<Node> OrderArgs(Node m, Node e) {
+        if (m == null) { return e.kids; }
+        List<string> pnames = new List<string>();
+        List<Node> pdefault = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { pnames.Add(m.kids[i].sval); pdefault.Add(m.kids[i].b); }
+            i = i + 1;
+        }
+        int np = pnames.Count;
+        bool anyNamed = false;
+        int j = 0;
+        while (j < e.kids.Count) { if (e.kids[j].sval2 != "") { anyNamed = true; } j = j + 1; }
+        if (!anyNamed && e.kids.Count >= np) { return e.kids; }
+        List<Node> slots = new List<Node>();
+        int s = 0; while (s < np) { slots.Add(null); s = s + 1; }
+        int pos = 0;
+        j = 0;
+        while (j < e.kids.Count) {
+            Node arg = e.kids[j];
+            if (arg.sval2 != "") {
+                int idx = IndexOfStr(pnames, arg.sval2);
+                if (idx >= 0 && idx < np) { slots[idx] = arg; }
+            } else {
+                if (pos < np) { slots[pos] = arg; }
+                pos = pos + 1;
+            }
+            j = j + 1;
+        }
+        int k = 0;
+        while (k < np) {
+            if (slots[k] == null) {
+                if (pdefault[k] != null) { slots[k] = pdefault[k]; }
+                else { Node z = new Node(AK.IntLit()); z.ival = 0; slots[k] = z; }
+            }
+            k = k + 1;
+        }
+        return slots;
+    }
+
     ExprVal EmitStaticCall(string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
         Node m = binder.FindMethod(cls, name);
         string rt = "i64";
         if (m != null) { rt = MapType(m.type); }
         string args = "";
+        List<Node> aargs = OrderArgs(m, e);
         int i = 0;
-        while (i < e.kids.Count) {
-            ExprVal av = GenExpr(e.kids[i]);
+        while (i < aargs.Count) {
+            ExprVal av = GenExpr(aargs[i]);
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             if (i > 0) { args = args + ", "; }
             args = args + MapType(pty) + " " + CallArg(av, pty);
@@ -2171,9 +2222,10 @@ class Irgen {
         string rt = "i64";
         if (m != null) { rt = MapType(m.type); }
         string args = "%" + owner + "* " + thisOp;
+        List<Node> aargs = OrderArgs(m, e);
         int i = 0;
-        while (i < e.kids.Count) {
-            ExprVal av = GenExpr(e.kids[i]);
+        while (i < aargs.Count) {
+            ExprVal av = GenExpr(aargs[i]);
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;
@@ -2206,9 +2258,10 @@ class Irgen {
         string fn = NT();
         L("  " + fn + " = bitcast i8* " + fni8 + " to " + MethodFnTypeThis(m, clsName));
         string args = "%" + clsName + "* " + recv.op;
+        List<Node> aargs = OrderArgs(m, e);
         int i = 0;
-        while (i < e.kids.Count) {
-            ExprVal av = GenExpr(e.kids[i]);
+        while (i < aargs.Count) {
+            ExprVal av = GenExpr(aargs[i]);
             Node pty = ParamTypeNode(m, i);
             args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;
