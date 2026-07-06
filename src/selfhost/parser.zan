@@ -689,11 +689,65 @@ class Parser {
         if (k == TK.Null()) { Next(); return new Node(AK.NullLit()); }
         if (k == TK.This()) { Next(); return new Node(AK.ThisExpr()); }
         if (k == TK.New()) { return ParseNew(); }
-        if (k == TK.LParen()) { Next(); Node e = ParseExpr(); Expect(TK.RParen()); return e; }
+        // single-parameter lambda:  x => ...
+        if (k == TK.Ident() && K1() == TK.Arrow()) { return ParseLambda(); }
+        if (k == TK.LParen()) {
+            if (LooksLikeLambda()) { return ParseLambda(); }
+            Next(); Node e = ParseExpr(); Expect(TK.RParen()); return e;
+        }
         if (k == TK.Value()) { Next(); Node n = new Node(AK.Ident()); n.sval = "value"; return n; }
         if (k == TK.Ident()) { Node n = new Node(AK.Ident()); n.sval = Next().text; return n; }
         // fallback
         Node bad = new Node(AK.Ident()); bad.sval = Next().text; return bad;
+    }
+
+    Node MkTypeRef(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
+
+    // Lookahead: does a parenthesised group end with ) => ?  (a lambda arg list)
+    bool LooksLikeLambda() {
+        int save = pos;
+        if (K() != TK.LParen()) { return false; }
+        int depth = 0;
+        while (!At(TK.Eof())) {
+            int k = K();
+            if (k == TK.LParen()) { depth = depth + 1; }
+            else if (k == TK.RParen()) { depth = depth - 1; Next(); if (depth == 0) { break; } continue; }
+            Next();
+        }
+        bool arrow = At(TK.Arrow());
+        pos = save;
+        return arrow;
+    }
+
+    bool LooksLikeTypedParam() {
+        int k = K();
+        if (IsTypeKeyword(k)) { return true; }
+        if (k == TK.Ident() && K1() == TK.Ident()) { return true; }
+        return false;
+    }
+
+    // Lambda:  x => e | (a, b) => e | (int a) => { ... }
+    Node ParseLambda() {
+        Node lam = new Node(AK.Lambda());
+        if (At(TK.LParen())) {
+            Next();
+            while (!At(TK.RParen()) && !At(TK.Eof())) {
+                Node p = new Node(AK.Param());
+                if (LooksLikeTypedParam()) { p.type = ParseType(); } else { p.type = MkTypeRef("var"); }
+                if (At(TK.Ident())) { p.sval = Next().text; }
+                lam.Add(p);
+                Eat(TK.Comma());
+            }
+            Expect(TK.RParen());
+        } else {
+            Node p = new Node(AK.Param());
+            p.type = MkTypeRef("var");
+            if (At(TK.Ident())) { p.sval = Next().text; }
+            lam.Add(p);
+        }
+        Expect(TK.Arrow());
+        if (At(TK.LBrace())) { lam.d = ParseBlock(); } else { lam.a = ParseExpr(); }
+        return lam;
     }
 
     Node ParseNew() {
