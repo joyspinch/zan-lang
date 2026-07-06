@@ -224,10 +224,21 @@ class Parser {
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
             Node m = ParseMember(cls.sval);
-            if (m != null) { cls.Add(m); }
+            AddMember(cls, m);
         }
         Expect(TK.RBrace());
         return cls;
+    }
+
+    // Add a parsed member, splicing property-desugar groups (kind Block).
+    void AddMember(Node cls, Node m) {
+        if (m == null) { return; }
+        if (m.kind == AK.Block()) {
+            int i = 0;
+            while (i < m.kids.Count) { cls.Add(m.kids[i]); i = i + 1; }
+            return;
+        }
+        cls.Add(m);
     }
 
     Node ParseEnum(int mods) {
@@ -270,10 +281,70 @@ class Parser {
             else { Expect(TK.Semicolon()); }
             return member;
         }
+        // property:  T Name { get; set; } | { get {..} set {..} } | => expr;
+        if (At(TK.LBrace()) || At(TK.Arrow())) {
+            return ParseProperty(type, member.sval, mods);
+        }
         // field
         if (Eat(TK.Eq())) { member.b = ParseExpr(); }
         Expect(TK.Semicolon());
         return member;
+    }
+
+    Node MakeGetter(string name, Node type, int mods, Node body) {
+        Node g = new Node(AK.MethodDecl());
+        g.mods = mods; g.type = type; g.sval = "get_" + name; g.d = body;
+        return g;
+    }
+
+    Node MakeSetter(string name, Node type, int mods, Node body) {
+        Node s = new Node(AK.MethodDecl());
+        s.mods = mods; s.type = new Node(AK.TypeRef()); s.type.sval = "void";
+        s.sval = "set_" + name;
+        Node p = new Node(AK.Param());
+        p.type = type; p.sval = "value";
+        s.Add(p);
+        s.d = body;
+        return s;
+    }
+
+    // Desugar a property into a backing field (auto) or accessor methods
+    // (get_Name / set_Name). Returns a Block whose kids the class splices in.
+    Node ParseProperty(Node type, string name, int mods) {
+        Node group = new Node(AK.Block());
+        if (At(TK.Arrow())) {
+            Next();
+            Node body = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            body.Add(ret);
+            Expect(TK.Semicolon());
+            group.Add(MakeGetter(name, type, mods, body));
+            return group;
+        }
+        Expect(TK.LBrace());
+        Node getBody = null; Node setBody = null;
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            ParseMods(); // accessor-level modifiers, if any
+            if (At(TK.Get())) {
+                Next();
+                if (At(TK.LBrace())) { getBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            } else if (At(TK.Set())) {
+                Next();
+                if (At(TK.LBrace())) { setBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            } else { Next(); }
+        }
+        Expect(TK.RBrace());
+        // both accessors bodyless => auto-property backing field
+        if (getBody == null && setBody == null) {
+            Node f = new Node(AK.FieldDecl());
+            f.mods = mods; f.type = type; f.sval = name;
+            group.Add(f);
+            return group;
+        }
+        if (getBody != null) { group.Add(MakeGetter(name, type, mods, getBody)); }
+        if (setBody != null) { group.Add(MakeSetter(name, type, mods, setBody)); }
+        return group;
     }
 
     void ParseParams(Node fn) {
@@ -593,6 +664,7 @@ class Parser {
         if (k == TK.This()) { Next(); return new Node(AK.ThisExpr()); }
         if (k == TK.New()) { return ParseNew(); }
         if (k == TK.LParen()) { Next(); Node e = ParseExpr(); Expect(TK.RParen()); return e; }
+        if (k == TK.Value()) { Next(); Node n = new Node(AK.Ident()); n.sval = "value"; return n; }
         if (k == TK.Ident()) { Node n = new Node(AK.Ident()); n.sval = Next().text; return n; }
         // fallback
         Node bad = new Node(AK.Ident()); bad.sval = Next().text; return bad;

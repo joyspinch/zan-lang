@@ -1159,6 +1159,10 @@ class Irgen {
             if (cls != null && FieldIndex(cls, e.sval) >= 0) {
                 return LoadField("%this", MkType(curClass), e.sval);
             }
+            if (cls != null && FindMethodUp(cls, "get_" + e.sval) != null) {
+                ExprVal recv = new ExprVal("%this", MkType(curClass));
+                return EmitInstanceCall(recv, curClass, "get_" + e.sval, new Node(AK.Call()));
+            }
         }
         return new ExprVal("0", MkType("int"));
     }
@@ -1385,12 +1389,16 @@ class Irgen {
                     StoreField("%this", curClass, lhs.sval, v);
                     return;
                 }
+                if (cls != null && EmitPropSet("%this", MkType(curClass), lhs.sval, v)) { return; }
             }
             return;
         }
         if (lhs.kind == AK.MemberAccess()) {
             ExprVal obj = GenExpr(lhs.a);
             string cn = obj.ty.sval;
+            Node ocls = binder.FindType(cn);
+            if (ocls != null && FieldIndex(ocls, lhs.sval) < 0
+                && EmitPropSet(obj.op, obj.ty, lhs.sval, v)) { return; }
             StoreField(obj.op, cn, lhs.sval, v);
             return;
         }
@@ -1413,6 +1421,26 @@ class Irgen {
             L("  store i64 " + v.op + ", i64* " + p);
             return;
         }
+    }
+
+    // obj.Name = v  ->  Owner_set_Name(obj, v). Returns false if no setter.
+    bool EmitPropSet(string objOp, Node recvTy, string name, ExprVal v) {
+        string clsName = recvTy.sval;
+        Node cls = binder.FindType(clsName);
+        Node m = FindMethodUp(cls, "set_" + name);
+        if (m == null) { return false; }
+        string owner = MethodOwner(cls, "set_" + name);
+        if (owner == "") { owner = clsName; }
+        string thisOp = objOp;
+        if (owner != clsName) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + clsName + "* " + objOp + " to %" + owner + "*");
+            thisOp = bc;
+        }
+        Node pty = ParamTypeNode(m, 0);
+        L("  call void @" + owner + "_set_" + name + "(%" + owner + "* " + thisOp
+            + ", " + MapType(pty) + " " + CallArg(v, pty) + ")");
+        return true;
     }
 
     void StoreField(string objOp, string clsName, string field, ExprVal v) {
@@ -1470,6 +1498,10 @@ class Irgen {
         Node cls = ClassOf(obj.ty);
         if (cls != null && FieldIndex(cls, e.sval) >= 0) {
             return LoadField(obj.op, obj.ty, e.sval);
+        }
+        // property getter: obj.Name -> obj.get_Name()
+        if (cls != null && FindMethodUp(cls, "get_" + e.sval) != null) {
+            return EmitInstanceCall(obj, obj.ty.sval, "get_" + e.sval, new Node(AK.Call()));
         }
         return new ExprVal("0", MkType("int"));
     }
