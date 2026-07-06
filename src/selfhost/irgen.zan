@@ -33,6 +33,7 @@ class Irgen {
     public string curLbl;
     public int brkTarget;
     public int contTarget;
+    public List<string> tparamNames;
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -45,6 +46,7 @@ class Irgen {
         locSeq = 0;
         curLbl = "entry";
         brkTarget = 0; contTarget = 0;
+        tparamNames = new List<string>();
     }
 
     string NT() { tmp = tmp + 1; return "%t" + tmp; }
@@ -56,9 +58,49 @@ class Irgen {
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
 
     // ---- type mapping ----
+    // ---- generics (type erasure) ----
+    // A type is "erased" if its name is a generic type parameter of some class;
+    // all such types are lowered to i64 slots (pointers packed via ptrtoint).
+    bool IsErasedType(Node t) {
+        if (t == null) { return false; }
+        int i = 0;
+        while (i < tparamNames.Count) { if (tparamNames[i] == t.sval) { return true; } i = i + 1; }
+        return false;
+    }
+
+    List<string> TParams(Node cls) {
+        List<string> r = new List<string>();
+        if (cls == null) { return r; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            if (cls.kids[i].kind == AK.TypeParam()) { r.Add(cls.kids[i].sval); }
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // resolve an erased type to the concrete argument supplied by a receiver's
+    // static type (e.g. T in Box<int> -> int); returns t itself when unresolved.
+    Node ConcreteTP(Node t, Node recvTy) {
+        if (!IsErasedType(t)) { return t; }
+        if (recvTy == null) { return t; }
+        Node cls = binder.FindType(recvTy.sval);
+        List<string> tps = TParams(cls);
+        int i = 0;
+        while (i < tps.Count) {
+            if (tps[i] == t.sval) {
+                if (i < recvTy.kids.Count) { return recvTy.kids[i]; }
+                return t;
+            }
+            i = i + 1;
+        }
+        return t;
+    }
+
     string MapType(Node t) {
         if (t == null) { return "void"; }
         string n = t.sval;
+        if (IsErasedType(t)) { return "i64"; }
         if (n == "void") { return "void"; }
         if (n == "string") { return "i8*"; }
         if (n == "double" || n == "float") { return "double"; }
@@ -241,8 +283,24 @@ class Irgen {
         return new ExprVal(t, MkType("string"));
     }
 
+    void CollectTParams(Node unit) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int j = 0;
+                while (j < d.kids.Count) {
+                    if (d.kids[j].kind == AK.TypeParam()) { tparamNames.Add(d.kids[j].sval); }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+
     // ---- driver ----
     public string Gen(Node unit) {
+        CollectTParams(unit);
         H("declare i32 @printf(i8*, ...)");
         H("declare i8* @malloc(i64)");
         H("declare i8* @realloc(i8*, i64)");
@@ -1099,13 +1157,14 @@ class Irgen {
         if (curHasThis) {
             Node cls = binder.FindType(curClass);
             if (cls != null && FieldIndex(cls, e.sval) >= 0) {
-                return LoadField("%this", curClass, e.sval);
+                return LoadField("%this", MkType(curClass), e.sval);
             }
         }
         return new ExprVal("0", MkType("int"));
     }
 
-    ExprVal LoadField(string objOp, string clsName, string field) {
+    ExprVal LoadField(string objOp, Node recvTy, string field) {
+        string clsName = recvTy.sval;
         Node cls = binder.FindType(clsName);
         int idx = FieldIndex(cls, field);
         Node fty = FieldType(cls, field);
@@ -1114,6 +1173,8 @@ class Irgen {
         L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
         string t = NT();
         L("  " + t + " = load " + ft + ", " + ft + "* " + p);
+        // erased field: storage is i64; unpack to the concrete type when known
+        if (IsErasedType(fty)) { return FromSlot(t, ConcreteTP(fty, recvTy)); }
         return new ExprVal(t, fty);
     }
 
@@ -1358,9 +1419,15 @@ class Irgen {
         Node cls = binder.FindType(clsName);
         int idx = FieldIndex(cls, field);
         Node fty = FieldType(cls, field);
-        string ft = MapType(fty);
         string p = NT();
         L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
+        // erased field: pack the value into an i64 slot
+        if (IsErasedType(fty)) {
+            string sv = ToSlot(v, v.ty);
+            L("  store i64 " + sv + ", i64* " + p);
+            return;
+        }
+        string ft = MapType(fty);
         L("  store " + ft + " " + Coerce(v, ft) + ", " + ft + "* " + p);
     }
 
@@ -1402,7 +1469,7 @@ class Irgen {
         }
         Node cls = ClassOf(obj.ty);
         if (cls != null && FieldIndex(cls, e.sval) >= 0) {
-            return LoadField(obj.op, obj.ty.sval, e.sval);
+            return LoadField(obj.op, obj.ty, e.sval);
         }
         return new ExprVal("0", MkType("int"));
     }
@@ -1495,12 +1562,13 @@ class Irgen {
             while (i < e.kids.Count) {
                 ExprVal av = GenExpr(e.kids[i]);
                 Node pty = CtorParamType(ctor, i);
-                args = args + ", " + MapType(pty) + " " + Coerce(av, MapType(pty));
+                args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
                 i = i + 1;
             }
             L("  call void @" + cn + "_ctor(" + args + ")");
         }
-        return new ExprVal(obj, MkType(cn));
+        // preserve generic type arguments (ty may carry <...>) for the result
+        return new ExprVal(obj, ty);
     }
 
     Node CtorParamType(Node ctor, int argIdx) {
@@ -1643,6 +1711,24 @@ class Irgen {
         return "i64";
     }
 
+    Node ParamTypeNode(Node m, int idx) {
+        int seen = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (seen == idx) { return m.kids[i].type; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return MkType("int");
+    }
+
+    // build a call argument for a (possibly erased) parameter type
+    string CallArg(ExprVal av, Node pty) {
+        if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
+        return Coerce(av, MapType(pty));
+    }
+
     ExprVal EmitStaticCall(string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
         Node m = binder.FindMethod(cls, name);
@@ -1652,9 +1738,9 @@ class Irgen {
         int i = 0;
         while (i < e.kids.Count) {
             ExprVal av = GenExpr(e.kids[i]);
-            string pt = "i64"; if (m != null) { pt = ParamTypeStr(m, i); }
+            Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             if (i > 0) { args = args + ", "; }
-            args = args + pt + " " + Coerce(av, pt);
+            args = args + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;
         }
         if (rt == "void") {
@@ -1663,6 +1749,7 @@ class Irgen {
         }
         string t = NT();
         L("  " + t + " = call " + rt + " @" + clsName + "_" + name + "(" + args + ")");
+        if (m != null && IsErasedType(m.type)) { return FromSlot(t, m.type); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         return new ExprVal(t, retTy);
     }
@@ -1687,8 +1774,8 @@ class Irgen {
         int i = 0;
         while (i < e.kids.Count) {
             ExprVal av = GenExpr(e.kids[i]);
-            string pt = "i64"; if (m != null) { pt = ParamTypeStr(m, i); }
-            args = args + ", " + pt + " " + Coerce(av, pt);
+            Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
+            args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;
         }
         if (rt == "void") {
@@ -1697,6 +1784,7 @@ class Irgen {
         }
         string t = NT();
         L("  " + t + " = call " + rt + " @" + owner + "_" + name + "(" + args + ")");
+        if (m != null && IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         return new ExprVal(t, retTy);
     }
@@ -1721,8 +1809,8 @@ class Irgen {
         int i = 0;
         while (i < e.kids.Count) {
             ExprVal av = GenExpr(e.kids[i]);
-            string pt = ParamTypeStr(m, i);
-            args = args + ", " + pt + " " + Coerce(av, pt);
+            Node pty = ParamTypeNode(m, i);
+            args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;
         }
         if (rt == "void") {
@@ -1731,6 +1819,7 @@ class Irgen {
         }
         string t = NT();
         L("  " + t + " = call " + rt + " " + fn + "(" + args + ")");
+        if (IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         return new ExprVal(t, m.type);
     }
 
