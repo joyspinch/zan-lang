@@ -1144,6 +1144,7 @@ class Irgen {
         if (k == AK.Assignment()) { return GenAssign(e); }
         if (k == AK.Call()) { return GenCall(e); }
         if (k == AK.Lambda()) { return GenLambda(e); }
+        if (k == AK.SwitchExpr()) { return GenSwitchExpr(e); }
         if (k == AK.MemberAccess()) { return GenMember(e); }
         if (k == AK.Index()) { return GenIndex(e); }
         if (k == AK.NewExpr()) { return GenNew(e); }
@@ -1670,6 +1671,63 @@ class Irgen {
         ExprVal v = GenExpr(e.b);
         // numeric casts are all i64 in this model; just retag
         return new ExprVal(v.op, e.type);
+    }
+
+    // switch expression:  subj switch { pat => e, _ => e }. Constant patterns
+    // (int / string) compared against the subject; "_" is the default arm.
+    // Lowered to a test cascade feeding a phi at the join block.
+    ExprVal GenSwitchExpr(Node e) {
+        ExprVal subj = GenExpr(e.a);
+        int nend = NL();
+        List<string> vals = new List<string>();
+        List<string> labs = new List<string>();
+        string resLL = "i64";
+        Node resTy = MkType("int");
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node arm = e.kids[i];
+            int bodyL = NL();
+            int nextL = NL();
+            if (arm.a == null) {
+                L("  br label %L" + bodyL);
+            } else {
+                ExprVal pv = GenExpr(arm.a);
+                string c = NT();
+                if (IsStr(subj.ty) && IsStr(pv.ty)) {
+                    string r = NT();
+                    L("  " + r + " = call i32 @strcmp(i8* " + subj.op + ", i8* " + pv.op + ")");
+                    L("  " + c + " = icmp eq i32 " + r + ", 0");
+                } else {
+                    L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
+                }
+                L("  br i1 " + c + ", label %L" + bodyL + ", label %L" + nextL);
+            }
+            Label(bodyL);
+            ExprVal rv = GenExpr(arm.b);
+            resLL = MapType(rv.ty);
+            resTy = rv.ty;
+            vals.Add(Coerce(rv, resLL));
+            labs.Add(curLbl);
+            L("  br label %L" + nend);
+            Label(nextL);
+            i = i + 1;
+        }
+        L("  br label %L" + nend);
+        string fbLbl = curLbl;
+        Label(nend);
+        string t = NT();
+        string zero = "0"; if (resLL == "i8*") { zero = "null"; }
+        string phi = t + " = phi " + resLL;
+        int j = 0;
+        while (j < vals.Count) {
+            if (j > 0) { phi = phi + ","; }
+            phi = phi + " [ " + vals[j] + ", %" + labs[j] + " ]";
+            j = j + 1;
+        }
+        if (vals.Count > 0) { phi = phi + ", [ " + zero + ", %" + fbLbl + " ]"; }
+        else { phi = phi + " [ " + zero + ", %" + fbLbl + " ]"; }
+        L("  " + phi);
+        return new ExprVal(t, resTy);
     }
 
     // ---- lambdas / delegates ----
