@@ -94,6 +94,18 @@ class Irgen {
         return false;
     }
 
+    bool IsDictType(Node t) {
+        if (t == null) { return false; }
+        if (t.sval == "Dictionary") { return true; }
+        if (t.sval == "Dict") { return true; }
+        return false;
+    }
+
+    Node DictVal(Node t) {
+        if (t != null && t.kids.Count > 1) { return t.kids[1]; }
+        return MkType("int");
+    }
+
     Node ListElem(Node t) {
         if (t != null && t.kids.Count > 0) { return t.kids[0]; }
         return MkType("int");
@@ -213,6 +225,7 @@ class Irgen {
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
         EmitListRuntime();
         EmitSbRuntime();
+        EmitDictRuntime();
         // struct type decls first
         int i = 0;
         while (i < unit.kids.Count) {
@@ -373,6 +386,135 @@ class Irgen {
         H("  %endp = getelementptr i8, i8* %buf, i64 %count");
         H("  store i8 0, i8* %endp");
         H("  ret i8* %buf");
+        H("}");
+    }
+
+    // Dictionary<string,V>: growable parallel arrays { count, cap, i8** keys,
+    // i64* values } with linear-scan lookup. Set updates in place on an existing
+    // key, otherwise appends (capacity doubling). Keys are strings (strcmp).
+    void EmitDictRuntime() {
+        H("%zdict = type { i64, i64, i8**, i64* }");
+        H("define i8* @zdict_new() {");
+        H("  %p = call i8* @malloc(i64 32)");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %c = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  store i64 0, i64* %c");
+        H("  %cap = getelementptr %zdict, %zdict* %d, i32 0, i32 1");
+        H("  store i64 0, i64* %cap");
+        H("  %k = getelementptr %zdict, %zdict* %d, i32 0, i32 2");
+        H("  store i8** null, i8*** %k");
+        H("  %v = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  store i64* null, i64** %v");
+        H("  ret i8* %p");
+        H("}");
+        H("define i64 @zdict_index(i8* %p, i8* %key) {");
+        H("entry:");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %kptr = getelementptr %zdict, %zdict* %d, i32 0, i32 2");
+        H("  %keys = load i8**, i8*** %kptr");
+        H("  %ia = alloca i64");
+        H("  store i64 0, i64* %ia");
+        H("  br label %cond");
+        H("cond:");
+        H("  %i = load i64, i64* %ia");
+        H("  %done = icmp sge i64 %i, %count");
+        H("  br i1 %done, label %notfound, label %body");
+        H("body:");
+        H("  %slot = getelementptr i8*, i8** %keys, i64 %i");
+        H("  %kk = load i8*, i8** %slot");
+        H("  %cmp = call i32 @strcmp(i8* %kk, i8* %key)");
+        H("  %eq = icmp eq i32 %cmp, 0");
+        H("  br i1 %eq, label %found, label %next");
+        H("found:");
+        H("  ret i64 %i");
+        H("next:");
+        H("  %ni = add i64 %i, 1");
+        H("  store i64 %ni, i64* %ia");
+        H("  br label %cond");
+        H("notfound:");
+        H("  ret i64 -1");
+        H("}");
+        H("define void @zdict_set(i8* %p, i8* %key, i64 %val) {");
+        H("entry:");
+        H("  %idx = call i64 @zdict_index(i8* %p, i8* %key)");
+        H("  %exists = icmp sge i64 %idx, 0");
+        H("  br i1 %exists, label %update, label %insert");
+        H("update:");
+        H("  %du = bitcast i8* %p to %zdict*");
+        H("  %vpu = getelementptr %zdict, %zdict* %du, i32 0, i32 3");
+        H("  %valsu = load i64*, i64** %vpu");
+        H("  %su = getelementptr i64, i64* %valsu, i64 %idx");
+        H("  store i64 %val, i64* %su");
+        H("  ret void");
+        H("insert:");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %capptr = getelementptr %zdict, %zdict* %d, i32 0, i32 1");
+        H("  %cap = load i64, i64* %capptr");
+        H("  %full = icmp sge i64 %count, %cap");
+        H("  br i1 %full, label %grow, label %st");
+        H("grow:");
+        H("  %nc0 = mul i64 %cap, 2");
+        H("  %isz = icmp eq i64 %nc0, 0");
+        H("  %nc = select i1 %isz, i64 4, i64 %nc0");
+        H("  %kptr = getelementptr %zdict, %zdict* %d, i32 0, i32 2");
+        H("  %oldk = load i8**, i8*** %kptr");
+        H("  %oldki8 = bitcast i8** %oldk to i8*");
+        H("  %kbytes = mul i64 %nc, 8");
+        H("  %newki8 = call i8* @realloc(i8* %oldki8, i64 %kbytes)");
+        H("  %newk = bitcast i8* %newki8 to i8**");
+        H("  store i8** %newk, i8*** %kptr");
+        H("  %vptr = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %oldv = load i64*, i64** %vptr");
+        H("  %oldvi8 = bitcast i64* %oldv to i8*");
+        H("  %vbytes = mul i64 %nc, 8");
+        H("  %newvi8 = call i8* @realloc(i8* %oldvi8, i64 %vbytes)");
+        H("  %newv = bitcast i8* %newvi8 to i64*");
+        H("  store i64* %newv, i64** %vptr");
+        H("  store i64 %nc, i64* %capptr");
+        H("  br label %st");
+        H("st:");
+        H("  %kptr2 = getelementptr %zdict, %zdict* %d, i32 0, i32 2");
+        H("  %keys = load i8**, i8*** %kptr2");
+        H("  %kslot = getelementptr i8*, i8** %keys, i64 %count");
+        H("  store i8* %key, i8** %kslot");
+        H("  %vptr2 = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %vals = load i64*, i64** %vptr2");
+        H("  %vslot = getelementptr i64, i64* %vals, i64 %count");
+        H("  store i64 %val, i64* %vslot");
+        H("  %ncount = add i64 %count, 1");
+        H("  store i64 %ncount, i64* %cptr");
+        H("  ret void");
+        H("}");
+        H("define i64 @zdict_get(i8* %p, i8* %key) {");
+        H("entry:");
+        H("  %idx = call i64 @zdict_index(i8* %p, i8* %key)");
+        H("  %nf = icmp slt i64 %idx, 0");
+        H("  br i1 %nf, label %ret0, label %load");
+        H("ret0:");
+        H("  ret i64 0");
+        H("load:");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %vptr = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %vals = load i64*, i64** %vptr");
+        H("  %slot = getelementptr i64, i64* %vals, i64 %idx");
+        H("  %v = load i64, i64* %slot");
+        H("  ret i64 %v");
+        H("}");
+        H("define i64 @zdict_contains(i8* %p, i8* %key) {");
+        H("  %idx = call i64 @zdict_index(i8* %p, i8* %key)");
+        H("  %ge = icmp sge i64 %idx, 0");
+        H("  %r = zext i1 %ge to i64");
+        H("  ret i64 %r");
+        H("}");
+        H("define i64 @zdict_count(i8* %p) {");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %c = load i64, i64* %cptr");
+        H("  ret i64 %c");
         H("}");
     }
 
@@ -900,6 +1042,11 @@ class Irgen {
                 L("  call void @zlist_set(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv + ")");
                 return;
             }
+            if (IsDictType(obj.ty)) {
+                string sv = ToSlot(v, DictVal(obj.ty));
+                L("  call void @zdict_set(i8* " + obj.op + ", i8* " + idx.op + ", i64 " + sv + ")");
+                return;
+            }
             // array of i64
             string p = NT();
             L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
@@ -949,6 +1096,11 @@ class Irgen {
             L("  " + t + " = call i64 @zlist_count(i8* " + obj.op + ")");
             return new ExprVal(t, MkType("int"));
         }
+        if (e.sval == "Count" && IsDictType(obj.ty)) {
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_count(i8* " + obj.op + ")");
+            return new ExprVal(t, MkType("int"));
+        }
         Node cls = ClassOf(obj.ty);
         if (cls != null && FieldIndex(cls, e.sval) >= 0) {
             return LoadField(obj.op, obj.ty.sval, e.sval);
@@ -974,6 +1126,11 @@ class Irgen {
             L("  " + slot + " = call i64 @zlist_get(i8* " + obj.op + ", i64 " + idx.op + ")");
             return FromSlot(slot, ListElem(obj.ty));
         }
+        if (IsDictType(obj.ty)) {
+            string slot = NT();
+            L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + idx.op + ")");
+            return FromSlot(slot, DictVal(obj.ty));
+        }
         string p2 = NT();
         L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
         string v = NT();
@@ -997,9 +1154,14 @@ class Irgen {
             Node at = MkType(ty.sval); at.ival = 1;
             return new ExprVal(arr, at);
         }
-        if (IsListType(ty) || ty.sval == "Dictionary" || ty.sval == "Dict") {
+        if (IsListType(ty)) {
             string t = NT();
             L("  " + t + " = call i8* @zlist_new()");
+            return new ExprVal(t, ty);
+        }
+        if (IsDictType(ty)) {
+            string t = NT();
+            L("  " + t + " = call i8* @zdict_new()");
             return new ExprVal(t, ty);
         }
         if (IsSbType(ty)) {
@@ -1138,6 +1300,8 @@ class Irgen {
             if (IsStr(recv.ty)) { return EmitStrMethod(recv, mname, e); }
             // list methods
             if (IsListType(recv.ty)) { return EmitListMethod(recv, mname, e); }
+            // dictionary methods
+            if (IsDictType(recv.ty)) { return EmitDictMethod(recv, mname, e); }
             // string-builder methods
             if (IsSbType(recv.ty)) { return EmitSbMethod(recv, mname, e); }
             // instance method
@@ -1251,6 +1415,28 @@ class Irgen {
         if (name == "get_Count" || name == "Count") {
             string t = NT();
             L("  " + t + " = call i64 @zlist_count(i8* " + recv.op + ")");
+            return new ExprVal(t, MkType("int"));
+        }
+        return new ExprVal("0", MkType("int"));
+    }
+
+    ExprVal EmitDictMethod(ExprVal recv, string name, Node e) {
+        if (name == "Add" || name == "set_Item") {
+            ExprVal key = GenExpr(e.kids[0]);
+            ExprVal val = GenExpr(e.kids[1]);
+            string sv = ToSlot(val, DictVal(recv.ty));
+            L("  call void @zdict_set(i8* " + recv.op + ", i8* " + key.op + ", i64 " + sv + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "ContainsKey") {
+            ExprVal key = GenExpr(e.kids[0]);
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_contains(i8* " + recv.op + ", i8* " + key.op + ")");
+            return new ExprVal(t, MkType("bool"));
+        }
+        if (name == "get_Count" || name == "Count") {
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_count(i8* " + recv.op + ")");
             return new ExprVal(t, MkType("int"));
         }
         return new ExprVal("0", MkType("int"));
