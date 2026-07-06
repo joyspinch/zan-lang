@@ -387,6 +387,13 @@ class Irgen {
             if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && IsPolyClass(d) && !HasMod(d, MOD.Abstract())) { EmitVtable(d); }
             i = i + 1;
         }
+        // per-class destructors (release ARC-managed fields)
+        i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitClassDtor(d); }
+            i = i + 1;
+        }
         // function bodies
         i = 0;
         while (i < unit.kids.Count) {
@@ -418,9 +425,43 @@ class Irgen {
     }
 
     void EmitListRuntime() {
-        H("%zlist = type { i64, i64, i64* }");
-        H("define i8* @zlist_new() {");
-        H("  %p = call i8* @zalloc(i64 24)");
+        H("%zlist = type { i64, i64, i64*, i64 }");
+        H("define void @zlist_dtor(i8* %p) {");
+        H("entry:");
+        H("  %l = bitcast i8* %p to %zlist*");
+        H("  %optr = getelementptr %zlist, %zlist* %l, i32 0, i32 3");
+        H("  %owns = load i64, i64* %optr");
+        H("  %noown = icmp eq i64 %owns, 0");
+        H("  br i1 %noown, label %freedata, label %loopinit");
+        H("loopinit:");
+        H("  %cptr = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %dptr = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
+        H("  %data = load i64*, i64** %dptr");
+        H("  %ia = alloca i64");
+        H("  store i64 0, i64* %ia");
+        H("  br label %cond");
+        H("cond:");
+        H("  %i = load i64, i64* %ia");
+        H("  %done = icmp sge i64 %i, %count");
+        H("  br i1 %done, label %freedata, label %body");
+        H("body:");
+        H("  %slot = getelementptr i64, i64* %data, i64 %i");
+        H("  %ev = load i64, i64* %slot");
+        H("  %ep = inttoptr i64 %ev to i8*");
+        H("  call void @zrelease(i8* %ep)");
+        H("  %ni = add i64 %i, 1");
+        H("  store i64 %ni, i64* %ia");
+        H("  br label %cond");
+        H("freedata:");
+        H("  %dptr2 = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
+        H("  %data2 = load i64*, i64** %dptr2");
+        H("  %datai8 = bitcast i64* %data2 to i8*");
+        H("  call void @free(i8* %datai8)");
+        H("  ret void");
+        H("}");
+        H("define i8* @zlist_new(i64 %owns) {");
+        H("  %p = call i8* @zalloc(i64 32, i8* bitcast (void (i8*)* @zlist_dtor to i8*))");
         H("  %l = bitcast i8* %p to %zlist*");
         H("  %c = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -428,6 +469,8 @@ class Irgen {
         H("  store i64 0, i64* %cap");
         H("  %d = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
         H("  store i64* null, i64** %d");
+        H("  %op = getelementptr %zlist, %zlist* %l, i32 0, i32 3");
+        H("  store i64 %owns, i64* %op");
         H("  ret i8* %p");
         H("}");
         H("define void @zlist_add(i8* %p, i64 %v) {");
@@ -490,12 +533,18 @@ class Irgen {
     // slot 0 and container internals are all unchanged. zalloc initialises the
     // count to 1; zretain/zrelease adjust it; zrelease frees at count 0.
     void EmitArcRuntime() {
-        H("define i8* @zalloc(i64 %n) {");
-        H("  %tot = add i64 %n, 8");
+        // header layout, 16 bytes before the object pointer: [ i64 refcount ]
+        // [ i8* destructor ]. zalloc records both; zrelease at count 0 runs the
+        // destructor (which releases members / frees internal buffers) then frees.
+        H("define i8* @zalloc(i64 %n, i8* %dtor) {");
+        H("  %tot = add i64 %n, 16");
         H("  %raw = call i8* @malloc(i64 %tot)");
         H("  %rc = bitcast i8* %raw to i64*");
         H("  store i64 1, i64* %rc");
-        H("  %obj = getelementptr i8, i8* %raw, i64 8");
+        H("  %ds0 = getelementptr i8, i8* %raw, i64 8");
+        H("  %ds = bitcast i8* %ds0 to i8**");
+        H("  store i8* %dtor, i8** %ds");
+        H("  %obj = getelementptr i8, i8* %raw, i64 16");
         H("  ret i8* %obj");
         H("}");
         H("define void @zretain(i8* %p) {");
@@ -503,7 +552,7 @@ class Irgen {
         H("  %isnull = icmp eq i8* %p, null");
         H("  br i1 %isnull, label %done, label %go");
         H("go:");
-        H("  %hdr = getelementptr i8, i8* %p, i64 -8");
+        H("  %hdr = getelementptr i8, i8* %p, i64 -16");
         H("  %rc = bitcast i8* %hdr to i64*");
         H("  %c = load i64, i64* %rc");
         H("  %nc = add i64 %c, 1");
@@ -517,7 +566,7 @@ class Irgen {
         H("  %isnull = icmp eq i8* %p, null");
         H("  br i1 %isnull, label %done, label %go");
         H("go:");
-        H("  %hdr = getelementptr i8, i8* %p, i64 -8");
+        H("  %hdr = getelementptr i8, i8* %p, i64 -16");
         H("  %rc = bitcast i8* %hdr to i64*");
         H("  %c = load i64, i64* %rc");
         H("  %nc = sub i64 %c, 1");
@@ -525,9 +574,68 @@ class Irgen {
         H("  %dead = icmp sle i64 %nc, 0");
         H("  br i1 %dead, label %dofree, label %done");
         H("dofree:");
+        H("  %ds0 = getelementptr i8, i8* %p, i64 -8");
+        H("  %ds = bitcast i8* %ds0 to i8**");
+        H("  %dtor = load i8*, i8** %ds");
+        H("  %hasd = icmp ne i8* %dtor, null");
+        H("  br i1 %hasd, label %rund, label %fr");
+        H("rund:");
+        H("  %fn = bitcast i8* %dtor to void (i8*)*");
+        H("  call void %fn(i8* %p)");
+        H("  br label %fr");
+        H("fr:");
         H("  call void @free(i8* %hdr)");
         H("  br label %done");
         H("done:");
+        H("  ret void");
+        H("}");
+    }
+
+    // is `t` a heap object carrying an ARC header (class/struct instance or one
+    // of the built-in containers routed through zalloc)? Strings, primitives,
+    // erased generic slots and nullable value boxes are not ARC-managed.
+    bool ArcManaged(Node t) {
+        if (t == null) { return false; }
+        if (IsErasedType(t)) { return false; }
+        if (IsNullableValue(t)) { return false; }
+        string n = t.sval;
+        if (n == "List" || n == "Dictionary" || n == "Dict" || n == "StringBuilder") { return true; }
+        Node d = binder.FindType(n);
+        if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return true; }
+        return false;
+    }
+
+    // per-class destructor: release every ARC-managed field, then return (the
+    // object storage itself is freed by zrelease after this runs).
+    void EmitClassDtor(Node cls) {
+        string cn = cls.sval;
+        H("define void @" + cn + "_dtor(i8* %p) {");
+        H("  %o = bitcast i8* %p to %" + cn + "*");
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
+        int fb = FieldBase(cls);
+        int i = 0;
+        int seq = 0;
+        while (i < names.Count) {
+            if (ArcManaged(types[i])) {
+                int idx = fb + i;
+                string lt = MapType(types[i]);
+                string fp = "%f" + seq;
+                string fv = "%v" + seq;
+                H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
+                H("  " + fv + " = load " + lt + ", " + lt + "* " + fp);
+                if (lt == "i8*") {
+                    H("  call void @zrelease(i8* " + fv + ")");
+                } else {
+                    string fc = "%c" + seq;
+                    H("  " + fc + " = bitcast " + lt + " " + fv + " to i8*");
+                    H("  call void @zrelease(i8* " + fc + ")");
+                }
+                seq = seq + 1;
+            }
+            i = i + 1;
+        }
         H("  ret void");
         H("}");
     }
@@ -536,8 +644,15 @@ class Irgen {
     // amortised O(1) (capacity doubling); ToString materialises one string.
     void EmitSbRuntime() {
         H("%zsb = type { i64, i64, i8* }");
+        H("define void @zsb_dtor(i8* %p) {");
+        H("  %b = bitcast i8* %p to %zsb*");
+        H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
+        H("  %data = load i8*, i8** %dptr");
+        H("  call void @free(i8* %data)");
+        H("  ret void");
+        H("}");
         H("define i8* @zsb_new() {");
-        H("  %p = call i8* @zalloc(i64 24)");
+        H("  %p = call i8* @zalloc(i64 24, i8* bitcast (void (i8*)* @zsb_dtor to i8*))");
         H("  %b = bitcast i8* %p to %zsb*");
         H("  %c = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -596,9 +711,47 @@ class Irgen {
     // i64* values } with linear-scan lookup. Set updates in place on an existing
     // key, otherwise appends (capacity doubling). Keys are strings (strcmp).
     void EmitDictRuntime() {
-        H("%zdict = type { i64, i64, i8**, i64* }");
-        H("define i8* @zdict_new() {");
-        H("  %p = call i8* @zalloc(i64 32)");
+        H("%zdict = type { i64, i64, i8**, i64*, i64 }");
+        H("define void @zdict_dtor(i8* %p) {");
+        H("entry:");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %optr = getelementptr %zdict, %zdict* %d, i32 0, i32 4");
+        H("  %owns = load i64, i64* %optr");
+        H("  %noown = icmp eq i64 %owns, 0");
+        H("  br i1 %noown, label %freearrs, label %loopinit");
+        H("loopinit:");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %vptr = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %vals = load i64*, i64** %vptr");
+        H("  %ia = alloca i64");
+        H("  store i64 0, i64* %ia");
+        H("  br label %cond");
+        H("cond:");
+        H("  %i = load i64, i64* %ia");
+        H("  %done = icmp sge i64 %i, %count");
+        H("  br i1 %done, label %freearrs, label %body");
+        H("body:");
+        H("  %slot = getelementptr i64, i64* %vals, i64 %i");
+        H("  %ev = load i64, i64* %slot");
+        H("  %ep = inttoptr i64 %ev to i8*");
+        H("  call void @zrelease(i8* %ep)");
+        H("  %ni = add i64 %i, 1");
+        H("  store i64 %ni, i64* %ia");
+        H("  br label %cond");
+        H("freearrs:");
+        H("  %kptr = getelementptr %zdict, %zdict* %d, i32 0, i32 2");
+        H("  %keys = load i8**, i8*** %kptr");
+        H("  %keysi8 = bitcast i8** %keys to i8*");
+        H("  call void @free(i8* %keysi8)");
+        H("  %vptr2 = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %vals2 = load i64*, i64** %vptr2");
+        H("  %valsi8 = bitcast i64* %vals2 to i8*");
+        H("  call void @free(i8* %valsi8)");
+        H("  ret void");
+        H("}");
+        H("define i8* @zdict_new(i64 %owns) {");
+        H("  %p = call i8* @zalloc(i64 40, i8* bitcast (void (i8*)* @zdict_dtor to i8*))");
         H("  %d = bitcast i8* %p to %zdict*");
         H("  %c = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -608,6 +761,8 @@ class Irgen {
         H("  store i8** null, i8*** %k");
         H("  %v = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
         H("  store i64* null, i64** %v");
+        H("  %op = getelementptr %zdict, %zdict* %d, i32 0, i32 4");
+        H("  store i64 %owns, i64* %op");
         H("  ret i8* %p");
         H("}");
         H("define i64 @zdict_index(i8* %p, i8* %key) {");
@@ -1894,12 +2049,14 @@ class Irgen {
         }
         if (IsListType(ty)) {
             string t = NT();
-            L("  " + t + " = call i8* @zlist_new()");
+            string ow = "0"; if (ArcManaged(ListElem(ty))) { ow = "1"; }
+            L("  " + t + " = call i8* @zlist_new(i64 " + ow + ")");
             return new ExprVal(t, ty);
         }
         if (IsDictType(ty)) {
             string t = NT();
-            L("  " + t + " = call i8* @zdict_new()");
+            string ow = "0"; if (ArcManaged(DictVal(ty))) { ow = "1"; }
+            L("  " + t + " = call i8* @zdict_new(i64 " + ow + ")");
             return new ExprVal(t, ty);
         }
         if (IsSbType(ty)) {
@@ -1916,7 +2073,7 @@ class Irgen {
         string szi = NT();
         L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
         string raw = NT();
-        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ")");
+        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*))");
         string obj = NT();
         L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
         if (IsPolyClass(cls)) {
