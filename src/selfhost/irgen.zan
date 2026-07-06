@@ -259,6 +259,13 @@ class Irgen {
         H("declare i64 @fread(i8*, i64, i64, i8*)");
         H("declare i64 @fwrite(i8*, i64, i64, i8*)");
         H("declare i32 @fclose(i8*)");
+        H("declare i32 @_setjmp(i8*, i8*)");
+        H("declare void @longjmp(i8*, i32)");
+        H("declare i8* @llvm.frameaddress.p0(i32)");
+        H("declare void @exit(i32)");
+        H("@__exc_sp = global i64 0");
+        H("@__exc_stack = global [64 x i8*] zeroinitializer");
+        H("@__exc_val = global i8* null");
         H("@__zan_argc = global i32 0");
         H("@__zan_argv = global i8** null");
         H("@.mode_rb = private unnamed_addr constant [3 x i8] c\"rb\\00\"");
@@ -725,6 +732,10 @@ class Irgen {
             GenFor(s);
         } else if (k == AK.ForeachStmt()) {
             GenForeach(s);
+        } else if (k == AK.TryStmt()) {
+            GenTry(s);
+        } else if (k == AK.ThrowStmt()) {
+            GenThrow(s);
         } else if (k == AK.BreakStmt()) {
             if (brkTarget > 0) { L("  br label %L" + brkTarget); term = true; }
         } else if (k == AK.ContinueStmt()) {
@@ -955,6 +966,100 @@ class Irgen {
         L("  br label %L" + lc);
         Label(lend);
         brkTarget = sb; contTarget = sc;
+    }
+
+    // throw expr — store the exception object, pop the innermost handler and
+    // longjmp back into its try (setjmp returns nonzero -> catch path).
+    void GenThrow(Node s) {
+        ExprVal v = GenExpr(s.a);
+        string vt = MapType(v.ty);
+        string ev = v.op;
+        if (vt != "i8*") {
+            string t = NT();
+            L("  " + t + " = bitcast " + vt + " " + ev + " to i8*");
+            ev = t;
+        }
+        L("  store i8* " + ev + ", i8** @__exc_val");
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string sp1 = NT();
+        L("  " + sp1 + " = sub i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        string slot = NT();
+        L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp1);
+        string buf = NT();
+        L("  " + buf + " = load i8*, i8** " + slot);
+        L("  call void @longjmp(i8* " + buf + ", i32 1)");
+        L("  unreachable");
+        term = true;
+    }
+
+    void EmitExcPop() {
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string sp1 = NT();
+        L("  " + sp1 + " = sub i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+    }
+
+    // try { } catch (T e) { } finally { }  — setjmp/longjmp based
+    void GenTry(Node s) {
+        string buf = NT();
+        L("  " + buf + " = alloca [32 x i64]");
+        string bufp = NT();
+        L("  " + bufp + " = bitcast [32 x i64]* " + buf + " to i8*");
+        // push handler
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string slot = NT();
+        L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
+        L("  store i8* " + bufp + ", i8** " + slot);
+        string sp1 = NT();
+        L("  " + sp1 + " = add i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        // setjmp
+        string fp = NT();
+        L("  " + fp + " = call i8* @llvm.frameaddress.p0(i32 0)");
+        string r = NT();
+        L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* " + fp + ")");
+        string c = NT();
+        L("  " + c + " = icmp ne i32 " + r + ", 0");
+        int ltry = NL(); int lcatch = NL(); int lend = NL();
+        L("  br i1 " + c + ", label %L" + lcatch + ", label %L" + ltry);
+        Label(ltry);
+        GenStmt(s.a);
+        if (!term) {
+            EmitExcPop();
+            if (s.c != null) { GenStmt(s.c); }
+            if (!term) { L("  br label %L" + lend); }
+        }
+        term = false;
+        Label(lcatch);
+        // handler already popped by throw; bind catch variable to @__exc_val
+        if (s.b != null) {
+            Node cc = s.b;
+            if (cc.sval != "" && cc.type != null) {
+                string exv = NT();
+                L("  " + exv + " = load i8*, i8** @__exc_val");
+                string ct = MapType(cc.type);
+                string reg = AddLocal(cc.sval, cc.type);
+                L("  " + reg + " = alloca " + ct);
+                string cv = exv;
+                if (ct != "i8*") {
+                    string t = NT();
+                    L("  " + t + " = bitcast i8* " + exv + " to " + ct);
+                    cv = t;
+                }
+                L("  store " + ct + " " + cv + ", " + ct + "* " + reg);
+            }
+            GenStmt(cc.a);
+        }
+        if (!term) {
+            if (s.c != null) { GenStmt(s.c); }
+            if (!term) { L("  br label %L" + lend); }
+        }
+        Label(lend);
+        term = false;
     }
 
     // ---- expressions ----
