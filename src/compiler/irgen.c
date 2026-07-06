@@ -594,24 +594,45 @@ typedef struct {
     zan_type_t *type;
 } local_var_t;
 
+/* A function's locals live in a single flat scope. The backing array grows
+ * on demand: a fixed cap used to silently drop overflow locals, which turned
+ * an over-large function into miscompiled code (unregistered locals resolved
+ * to bogus storage, corrupting memory). Growth keeps large functions correct. */
 typedef struct {
-    local_var_t vars[MAX_LOCALS];
+    local_var_t *vars;
     int count;
+    int cap;
+    zan_arena_t *arena;
 } local_scope_t;
+
+static void local_scope_init(local_scope_t *s, zan_arena_t *arena) {
+    s->count = 0;
+    s->cap = MAX_LOCALS;
+    s->arena = arena;
+    s->vars = (local_var_t *)zan_arena_alloc(arena, sizeof(local_var_t) * (size_t)s->cap);
+}
 
 static local_scope_t *local_scope_new(zan_arena_t *arena) {
     local_scope_t *s = (local_scope_t *)zan_arena_alloc(arena, sizeof(local_scope_t));
-    s->count = 0;
+    local_scope_init(s, arena);
     return s;
 }
 
 static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca, zan_type_t *type) {
-    if (scope->count < MAX_LOCALS) {
-        scope->vars[scope->count].name = name;
-        scope->vars[scope->count].alloca = alloca;
-        scope->vars[scope->count].type = type;
-        scope->count++;
+    if (scope->count >= scope->cap) {
+        int new_cap = scope->cap > 0 ? scope->cap * 2 : MAX_LOCALS;
+        local_var_t *grown = (local_var_t *)zan_arena_alloc(scope->arena,
+            sizeof(local_var_t) * (size_t)new_cap);
+        if (scope->count > 0 && scope->vars) {
+            memcpy(grown, scope->vars, sizeof(local_var_t) * (size_t)scope->count);
+        }
+        scope->vars = grown;
+        scope->cap = new_cap;
     }
+    scope->vars[scope->count].name = name;
+    scope->vars[scope->count].alloca = alloca;
+    scope->vars[scope->count].type = type;
+    scope->count++;
 }
 
 static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
@@ -647,6 +668,37 @@ static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
                 g->rt_release, &val, 1, "");
         }
     }
+}
+
+/* Store `value` into element `idx` of a List object. A List is a heap struct
+ * { i64 count, i64 cap, i64* data }; elements live in the `data` buffer (field
+ * 2), NOT in the struct itself. Every `list[i] = v` form (local, this.field,
+ * obj.field) must go through here so it doesn't index into the struct and
+ * clobber the count/cap/data words. Elements are i64 slots; pointer and narrow
+ * integer values are coerced to i64. */
+static void emit_list_element_store(zan_irgen_t *g, LLVMValueRef arr_ptr,
+                                    LLVMValueRef idx, LLVMValueRef value) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
+        LLVMPointerType(g->list_struct_type, 0), "lptr");
+    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder,
+        g->list_struct_type, list_ptr, 2, "df");
+    LLVMValueRef data = LLVMBuildLoad2(g->builder,
+        LLVMPointerType(i64, 0), data_field, "data");
+    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
+        idx = LLVMBuildSExt(g->builder, idx, i64, "ext");
+    }
+    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx, 1, "ep");
+    LLVMValueRef v = value;
+    LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(v));
+    if (vk == LLVMPointerTypeKind) {
+        v = LLVMBuildPtrToInt(g->builder, v, i64, "p2i");
+    } else if (vk == LLVMIntegerTypeKind &&
+               LLVMGetIntTypeWidth(LLVMTypeOf(v)) < 64) {
+        v = LLVMBuildSExt(g->builder, v, i64, "sx");
+    }
+    LLVMBuildStore(g->builder, v, elem_ptr);
 }
 
 /* ---- expression codegen ---- */
@@ -1271,30 +1323,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 if (local && local->type && local->type->name.len == 4 &&
                     memcmp(local->type->name.str, "List", 4) == 0) {
                     /* list[i] = value — store into the list's i64 data slots */
-                    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, local->alloca, "lraw");
-                    LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw,
-                        LLVMPointerType(g->list_struct_type, 0), "lptr");
-                    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder,
-                        g->list_struct_type, list_ptr, 2, "df");
-                    LLVMValueRef data = LLVMBuildLoad2(g->builder,
-                        LLVMPointerType(i64, 0), data_field, "data");
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
-                    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
-                        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
-                        idx = LLVMBuildSExt(g->builder, idx, i64, "ext");
-                    }
-                    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx, 1, "ep");
-                    LLVMValueRef v = right;
-                    LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(v));
-                    if (vk == LLVMPointerTypeKind) {
-                        v = LLVMBuildPtrToInt(g->builder, v, i64, "p2i");
-                    } else if (vk == LLVMIntegerTypeKind &&
-                               LLVMGetIntTypeWidth(LLVMTypeOf(v)) < 64) {
-                        v = LLVMBuildSExt(g->builder, v, i64, "sx");
-                    }
-                    LLVMBuildStore(g->builder, v, elem_ptr);
+                    emit_list_element_store(g, raw, idx, right);
                 } else if (local) {
                     LLVMValueRef arr_ptr = LLVMBuildLoad2(g->builder,
                         LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
@@ -1312,12 +1344,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     if (fsym) {
                         LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
-                        LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
-                        if (fsym->type && fsym->type->element_type) {
-                            elem_llvm = map_type(g, fsym->type->element_type);
+                        if (fsym->type && fsym->type->name.len == 4 &&
+                            memcmp(fsym->type->name.str, "List", 4) == 0) {
+                            emit_list_element_store(g, arr_ptr, idx, right);
+                        } else {
+                            LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+                            if (fsym->type && fsym->type->element_type) {
+                                elem_llvm = map_type(g, fsym->type->element_type);
+                            }
+                            LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
+                            LLVMBuildStore(g->builder, right, elem_ptr);
                         }
-                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
-                        LLVMBuildStore(g->builder, right, elem_ptr);
                     }
                 }
             } else if (arr_expr->kind == AST_MEMBER_ACCESS) {
@@ -1326,12 +1363,18 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 if (at) {
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
-                    LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
-                    if (at->element_type) {
-                        elem_llvm = map_type(g, at->element_type);
+                    if (at->name.len == 4 && memcmp(at->name.str, "List", 4) == 0) {
+                        /* List field: index into the data buffer, not the
+                         * struct — otherwise the store clobbers count/cap/data. */
+                        emit_list_element_store(g, arr_ptr, idx, right);
+                    } else {
+                        LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+                        if (at->element_type) {
+                            elem_llvm = map_type(g, at->element_type);
+                        }
+                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
+                        LLVMBuildStore(g->builder, right, elem_ptr);
                     }
-                    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
-                    LLVMBuildStore(g->builder, right, elem_ptr);
                 }
             }
         } else if (expr->binary.left->kind == AST_MEMBER_ACCESS) {
@@ -3946,7 +3989,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         LLVMPositionBuilderAtEnd(g->builder, entry);
 
         local_scope_t lambda_locals;
-        memset(&lambda_locals, 0, sizeof(lambda_locals));
+        local_scope_init(&lambda_locals, g->arena);
         for (int k = 0; k < pc; k++) {
             zan_ast_node_t *param = expr->lambda.params.items[k];
             LLVMValueRef alloc = LLVMBuildAlloca(g->builder, i64, "lp");
