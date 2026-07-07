@@ -22,6 +22,9 @@
 #else
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 /* ---- file reading ---- */
 
@@ -536,6 +539,17 @@ int main(int argc, char **argv) {
                 if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
                     snprintf(stdlib_root, sizeof(stdlib_root), "%s\\stdlib", exe_path);
                 }
+            }
+#elif defined(__APPLE__)
+            /* macOS has no /proc; ask dyld for the executable path. */
+            char exe_path[1024];
+            uint32_t exe_sz = sizeof(exe_path);
+            if (_NSGetExecutablePath(exe_path, &exe_sz) == 0) {
+                char *last_sep = strrchr(exe_path, '/');
+                if (last_sep) *last_sep = '\0';
+                snprintf(stdlib_root, sizeof(stdlib_root), "%s/../stdlib", exe_path);
+            } else {
+                snprintf(stdlib_root, sizeof(stdlib_root), "stdlib");
             }
 #else
             /* on Linux, use /proc/self/exe */
