@@ -146,6 +146,18 @@ EXPORT i64 zan_gui_surface_height(i64 id) {
     return g_surfaces[id]->height;
 }
 
+/* Internal (not part of the [DllImport] ABI): expose a surface's raw ARGB
+ * buffer to a native platform backend compiled as a separate TU (e.g. the
+ * macOS Cocoa .m file), which cannot see the static g_surfaces table. */
+const u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride) {
+    if (id < 0 || id >= g_surface_count || !g_surfaces[id]) return NULL;
+    zan_surface_t *s = g_surfaces[id];
+    if (w) *w = s->width;
+    if (h) *h = s->height;
+    if (stride) *stride = s->stride;
+    return s->pixels;
+}
+
 EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -1377,8 +1389,15 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
     req.tv_nsec = (long)((ms % 1000) * 1000000L);
     nanosleep(&req, NULL);
 }
+#endif /* __linux__ */
 
-/* Fallback bitmap font for Linux text rendering */
+/* ========================================================================
+ * Software bitmap-font text rendering, shared by all non-Windows backends
+ * (Windows draws text via its own path above). Depends only on the shared
+ * software surface, so Linux (X11) and macOS (Cocoa) render text identically.
+ * ======================================================================== */
+#if !defined(_WIN32)
+/* Fallback bitmap font for software text rendering */
 static const unsigned char zan_font_6x10[96][10] = {
     /* space (32) */ {0},
     /* ! */ {0x04,0x04,0x04,0x04,0x04,0x00,0x04,0x00,0x00,0x00},
@@ -1525,7 +1544,9 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
 }
 
 EXPORT void zan_gui_draw_icon(i64 s, i64 x, i64 y, i64 b, i64 c, i64 cp) { (void)s;(void)x;(void)y;(void)b;(void)c;(void)cp; }
+#endif /* !_WIN32 (shared software text) */
 
+#ifdef __linux__
 /* ---- window management (EWMH / Xlib) ---- */
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
@@ -1607,9 +1628,13 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
 #endif /* __linux__ */
 
 /* ========================================================================
- * macOS Cocoa stubs (Objective-C required for full implementation)
+ * macOS (and other non-Windows, non-Linux) windowing.
+ *
+ * When ZAN_GUI_COCOA is defined the real Cocoa backend in gui_runtime_mac.m
+ * provides these; otherwise they are no-op stubs so the library still links.
+ * Text rendering is the shared software path above, so it is omitted here.
  * ======================================================================== */
-#if !defined(_WIN32) && !defined(__linux__)
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
 
 EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
@@ -1631,13 +1656,6 @@ EXPORT i64 zan_gui_set_title(i64 h, const char *t) { (void)h;(void)t; return 0; 
 EXPORT i64 zan_gui_set_cursor(i64 c) { (void)c; return 0; }
 EXPORT i64 zan_gui_get_tick_ms(void) { return 0; }
 EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
-
-EXPORT void zan_gui_draw_text(i64 s, i64 x, i64 y, const char *t, i64 c, i64 f) {
-    (void)s;(void)x;(void)y;(void)t;(void)c;(void)f;
-}
-EXPORT i64 zan_gui_measure_text(const char *t, i64 f) { (void)t;(void)f; return 0; }
-EXPORT i64 zan_gui_font_height(i64 f) { (void)f; return (i64)f; }
-EXPORT void zan_gui_draw_icon(i64 s, i64 x, i64 y, i64 b, i64 c, i64 cp) { (void)s;(void)x;(void)y;(void)b;(void)c;(void)cp; }
 
 #endif
 
@@ -1661,9 +1679,9 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
 #endif
 
 /* Window management: X11 has real implementations in the __linux__ branch
- * above; macOS (and any other non-Windows target) falls back to no-ops until
- * a native Cocoa backend is wired in. */
-#if !defined(_WIN32) && !defined(__linux__)
+ * above; the Cocoa backend (ZAN_GUI_COCOA) provides them on macOS. Any other
+ * non-Windows target falls back to no-ops. */
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
 EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }

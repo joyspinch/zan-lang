@@ -120,7 +120,7 @@ endif()
 
 # ---- Native GUI runtime (zan_gui) ----
 # Cross-platform software renderer + windowing shell used by the Gui stdlib via
-# [DllImport("zan_gui")]: Win32 (full), X11 (Linux), Cocoa stubs (macOS). Built
+# [DllImport("zan_gui")]: Win32 (full), X11 (Linux), Cocoa (macOS). Built
 # as a shared library so its platform system deps (X11 / user32+gdi32) are
 # self-contained and Zan programs only need `-lzan_gui`.
 option(ZAN_BUILD_GUI "Build the native zan_gui runtime library" ON)
@@ -131,9 +131,13 @@ if(ZAN_BUILD_GUI)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore)
         set(ZAN_GUI_AVAILABLE TRUE)
     elseif(APPLE)
-        # Cocoa stubs are pure C; no extra frameworks needed.
-        add_library(zan_gui SHARED src/runtime/gui_runtime.c)
-        target_link_libraries(zan_gui PRIVATE m)
+        # Real Cocoa backend (Objective-C) + shared software renderer. The C file
+        # is compiled with ZAN_GUI_COCOA so its macOS stub branch is disabled and
+        # gui_runtime_mac.m supplies the native windowing/window-management ABI.
+        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m)
+        set_source_files_properties(src/runtime/gui_runtime.c
+            PROPERTIES COMPILE_DEFINITIONS ZAN_GUI_COCOA)
+        target_link_libraries(zan_gui PRIVATE m "-framework Cocoa")
         set(ZAN_GUI_AVAILABLE TRUE)
     else()
         find_package(X11)
