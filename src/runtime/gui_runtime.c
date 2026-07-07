@@ -1487,3 +1487,33 @@ EXPORT i64 zan_gui_font_height(i64 f) { (void)f; return (i64)f; }
 EXPORT void zan_gui_draw_icon(i64 s, i64 x, i64 y, i64 b, i64 c, i64 cp) { (void)s;(void)x;(void)y;(void)b;(void)c;(void)cp; }
 
 #endif
+
+/* ========================================================================
+ * Window-management shims shared by the non-Windows backends.
+ *
+ * These are native to the Win32 title-bar / DWM integration; on X11 and
+ * macOS they are currently no-ops so that [DllImport("zan_gui")] programs
+ * stay linkable on every platform (the functions above are defined per
+ * backend; only these Win32-specific ones were missing off Windows).
+ * zan_gui_write_file is portable and implemented for real.
+ * ======================================================================== */
+#if !defined(_WIN32)
+#include <stdio.h>
+EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
+EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
+EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
+EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
+EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
+EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
+EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 1;
+    if (utf8) fwrite(utf8, 1, strlen(utf8), f);
+    fclose(f);
+    return 0;
+}
+#endif
