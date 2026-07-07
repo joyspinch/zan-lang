@@ -810,6 +810,34 @@ int main(int argc, char **argv) {
 
         /* ---- link object → executable ---- */
         int link_ret;
+
+        /* Extra library search dirs for [DllImport] libs, taken from the
+         * $ZAN_LIB_PATH env var (platform PATH separator). This lets a Zan
+         * program link against a library that is not on the default system
+         * search path — e.g. a freshly built zan_gui in the CMake build dir. */
+        char zan_lib_dirs[16][512]; int zan_lib_ndirs = 0;
+        {
+            const char *lp = getenv("ZAN_LIB_PATH");
+            if (lp && *lp) {
+#ifdef _WIN32
+                const char sep = ';';
+#else
+                const char sep = ':';
+#endif
+                const char *p = lp;
+                while (*p && zan_lib_ndirs < 16) {
+                    const char *e = strchr(p, sep);
+                    size_t n = e ? (size_t)(e - p) : strlen(p);
+                    if (n > 0 && n < sizeof(zan_lib_dirs[0])) {
+                        memcpy(zan_lib_dirs[zan_lib_ndirs], p, n);
+                        zan_lib_dirs[zan_lib_ndirs][n] = '\0';
+                        zan_lib_ndirs++;
+                    }
+                    if (!e) break;
+                    p = e + 1;
+                }
+            }
+        }
 #ifdef _WIN32
         /* Self-contained linking: prefer the bundled ld.lld + MinGW-w64 runtime
          * shipped next to zanc (in <zanc_dir>/toolchain), so producing an .exe
@@ -849,6 +877,11 @@ int main(int argc, char **argv) {
             argv[a++] = crt2;
             argv[a++] = crtbeg;
             argv[a++] = lflag;
+            char ldirbufs[16][520];
+            for (int di = 0; di < zan_lib_ndirs && a < 60; di++) {
+                snprintf(ldirbufs[di], sizeof(ldirbufs[di]), "-L%s", zan_lib_dirs[di]);
+                argv[a++] = ldirbufs[di];
+            }
             argv[a++] = obj_tmp;
             argv[a++] = "--start-group";
             argv[a++] = "-lmingw32"; argv[a++] = "-lgcc";
@@ -876,6 +909,10 @@ int main(int argc, char **argv) {
             snprintf(link_cmd, sizeof(link_cmd),
                      "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\"%s",
                      obj_tmp, obj_path, publish_mode ? " -O2 -s" : "");
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", zan_lib_dirs[di]);
+            }
             for (int li = 0; li < irgen.extern_lib_count; li++) {
                 const char *lib = irgen.extern_libs[li].str;
                 int lib_len = (int)irgen.extern_libs[li].len;
@@ -895,6 +932,13 @@ int main(int argc, char **argv) {
         } else {
             snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
                      obj_tmp, obj_path);
+        }
+        for (int di = 0; di < zan_lib_ndirs; di++) {
+            size_t cur = strlen(link_cmd);
+            /* -L for link-time resolution, -rpath so the produced exe can load
+             * the shared library at runtime without LD_LIBRARY_PATH. */
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " -L\"%s\" -Wl,-rpath,\"%s\"", zan_lib_dirs[di], zan_lib_dirs[di]);
         }
         for (int li = 0; li < irgen.extern_lib_count; li++) {
             const char *lib = irgen.extern_libs[li].str;

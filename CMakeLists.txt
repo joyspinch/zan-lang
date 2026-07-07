@@ -217,17 +217,19 @@ add_test(NAME conformance_minic
 
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----
 # These programs import Gui modules that reference [DllImport("zan_gui")], so the
-# produced executable must link zan_gui. zanc does not yet add a library search
-# path for DllImport libs, so the tests are opt-in (ZAN_BUILD_GUI_TESTS) and run
-# with LIBRARY_PATH pointing at the freshly built zan_gui. Off by default so the
-# baseline CI stays green; the library itself is still built cross-platform.
-option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" OFF)
+# produced executable must link zan_gui. zanc resolves [DllImport] libs against
+# $ZAN_LIB_PATH, so the tests point that (and the OS loader path) at the freshly
+# built zan_gui. Enabled wherever zan_gui is available; the Windows CI job builds
+# only zanc, so it passes -DZAN_BUILD_GUI_TESTS=OFF.
+option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" ON)
 if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   add_test(NAME conformance_gui_stack
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/examples/layout_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Types.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan"
+      # Types.zan is pulled in automatically by 'using Gui;' (auto-stdlib), so
+      # only the non-auto-included Stack.zan is passed explicitly here.
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/gui/Stack.zan"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -236,13 +238,13 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/examples/text_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/gui/Text.zan"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   set_tests_properties(conformance_gui_stack conformance_gui_text PROPERTIES
-    ENVIRONMENT "LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
+    ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
