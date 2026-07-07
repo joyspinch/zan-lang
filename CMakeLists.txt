@@ -185,6 +185,16 @@ add_test(NAME conformance_gui_stack
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Gui.Text string helpers: headless check of the editor text primitives ----
+add_test(NAME conformance_gui_text
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/examples/text_test.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Runtime diagnostics: parser must not hang/OOM on malformed input ----
 add_test(NAME diag_no_runaway
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan --dump-ast)

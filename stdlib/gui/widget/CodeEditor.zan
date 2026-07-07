@@ -1,0 +1,301 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// A multi-line, line-numbered plain-text code editor. Holds its own buffer
+/// (a list of lines) and cursor, and edits itself in response to keyboard input
+/// while it has focus — the editing surface of the IDE. Immediate-mode: create
+/// one, keep it across frames, and call Render(app, area) each frame.
+///
+///   CodeEditor ed = CodeEditor.Create();      // once
+///   ed.LoadText("using System;\n\nclass Main {}");
+///   ...
+///   ed.Render(app, editorRect);               // every frame
+/// </summary>
+class CodeEditor {
+    List<string> lines;
+    int curLine;
+    int curCol;
+    int scrollLine;
+    int lastId;
+
+    static CodeEditor Create() {
+        CodeEditor e = new CodeEditor();
+        e.lines = new List<string>();
+        e.lines.Add("");
+        e.curLine = 0;
+        e.curCol = 0;
+        e.scrollLine = 0;
+        e.lastId = -1;
+        return e;
+    }
+
+    /// Splits a string into lines on '\n' (stripping '\r').
+    static List<string> SplitLines(string s) {
+        List<string> outLines = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\n") {
+                outLines.Add(cur);
+                cur = "";
+            } else if (ch == "\r") {
+                cur = cur;
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        outLines.Add(cur);
+        return outLines;
+    }
+
+    void SetLines(List<string> ls) {
+        lines = ls;
+        if (lines.Count == 0) { lines.Add(""); }
+        curLine = 0;
+        curCol = 0;
+        scrollLine = 0;
+    }
+
+    void LoadText(string s) {
+        SetLines(CodeEditor.SplitLines(s));
+    }
+
+    string GetText() {
+        string outText = "";
+        int i = 0;
+        while (i < lines.Count) {
+            outText = outText + lines[i];
+            if (i + 1 < lines.Count) { outText = outText + "\n"; }
+            i = i + 1;
+        }
+        return outText;
+    }
+
+    int LineCount() {
+        return lines.Count;
+    }
+
+    // ---- edit primitives ----
+    void InsertStr(string ins) {
+        string ln = lines[curLine];
+        lines[curLine] = Text.InsertAt(ln, curCol, ins);
+        curCol = curCol + ins.Length;
+    }
+
+    void NewLine() {
+        string ln = lines[curLine];
+        string left = Text.Left(ln, curCol);
+        string right = Text.Right(ln, curCol);
+        lines[curLine] = left;
+        lines.Insert(curLine + 1, right);
+        curLine = curLine + 1;
+        curCol = 0;
+    }
+
+    void BackspaceEdit() {
+        if (curCol > 0) {
+            string ln = lines[curLine];
+            lines[curLine] = Text.RemoveAt(ln, curCol - 1);
+            curCol = curCol - 1;
+        } else if (curLine > 0) {
+            string prev = lines[curLine - 1];
+            string cur = lines[curLine];
+            int newCol = prev.Length;
+            lines[curLine - 1] = prev + cur;
+            lines.RemoveAt(curLine);
+            curLine = curLine - 1;
+            curCol = newCol;
+        }
+    }
+
+    void DeleteEdit() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            lines[curLine] = Text.RemoveAt(ln, curCol);
+        } else if (curLine + 1 < lines.Count) {
+            string next = lines[curLine + 1];
+            lines[curLine] = ln + next;
+            lines.RemoveAt(curLine + 1);
+        }
+    }
+
+    void ClampCol() {
+        string ln = lines[curLine];
+        if (curCol > ln.Length) { curCol = ln.Length; }
+        if (curCol < 0) { curCol = 0; }
+    }
+
+    void MoveLeft() {
+        if (curCol > 0) {
+            curCol = curCol - 1;
+        } else if (curLine > 0) {
+            curLine = curLine - 1;
+            curCol = lines[curLine].Length;
+        }
+    }
+
+    void MoveRight() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            curCol = curCol + 1;
+        } else if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            curCol = 0;
+        }
+    }
+
+    void MoveUp() {
+        if (curLine > 0) {
+            curLine = curLine - 1;
+            ClampCol();
+        }
+    }
+
+    void MoveDown() {
+        if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            ClampCol();
+        }
+    }
+
+    void HandleInput(App app) {
+        int kind = app.window.EventKind();
+        if (kind == 6) {
+            int code = app.window.EventKeyCode();
+            if (code == 8) {
+                BackspaceEdit();
+                app.RequestRedraw();
+            } else if (code == 13) {
+                NewLine();
+                app.RequestRedraw();
+            } else if (code == 9) {
+                InsertStr("    ");
+                app.RequestRedraw();
+            } else {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0) {
+                    InsertStr(ch);
+                    app.RequestRedraw();
+                }
+            }
+        } else if (kind == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 37) { MoveLeft(); app.RequestRedraw(); }
+            else if (kc == 39) { MoveRight(); app.RequestRedraw(); }
+            else if (kc == 38) { MoveUp(); app.RequestRedraw(); }
+            else if (kc == 40) { MoveDown(); app.RequestRedraw(); }
+            else if (kc == 36) { curCol = 0; app.RequestRedraw(); }
+            else if (kc == 35) { curCol = lines[curLine].Length; app.RequestRedraw(); }
+            else if (kc == 46) { DeleteEdit(); app.RequestRedraw(); }
+        }
+    }
+
+    /// Maps a pixel x-offset (relative to the text origin) to a column index by
+    /// measuring successive prefixes.
+    static int ColFromX(string s, int px, int fontSize) {
+        if (px <= 0) { return 0; }
+        int i = 1;
+        while (i <= s.Length) {
+            int w = Canvas.MeasureText(Text.Left(s, i), fontSize);
+            if (w >= px) { return i; }
+            i = i + 1;
+        }
+        return s.Length;
+    }
+
+    int Render(App app, Rect area) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        lastId = id;
+        bool focused = app.focus.IsFocused(id);
+
+        int fontSize = t.fontSizeMedium;
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+        int gutterW = app.Scale(48);
+
+        c.FillRect(area.x, area.y, area.width, area.height, t.bgPrimary);
+        c.FillRect(area.x, area.y, gutterW, area.height, t.bgSecondary);
+        c.FillRect(area.x + gutterW, area.y, 1, area.height, t.divider);
+
+        app.CaptureWheel(area.x, area.y, area.width, area.height);
+
+        int visLines = area.height / lineH;
+        if (visLines < 1) { visLines = 1; }
+
+        if (focused) { HandleInput(app); }
+
+        if (app.window.EventKind() == 13) {
+            bool over = app.mouseX >= area.x && app.mouseX < area.x + area.width
+                        && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            if (over) {
+                int delta = app.window.EventKeyCode();
+                int step = delta / 120;
+                if (step == 0) {
+                    if (delta > 0) { step = 1; }
+                    else if (delta < 0) { step = 0 - 1; }
+                }
+                scrollLine = scrollLine - step * 3;
+                app.RequestRedraw();
+            }
+        }
+
+        if (curLine < scrollLine) { scrollLine = curLine; }
+        if (curLine >= scrollLine + visLines) { scrollLine = curLine - visLines + 1; }
+        int maxScroll = lines.Count - visLines;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (scrollLine > maxScroll) { scrollLine = maxScroll; }
+        if (scrollLine < 0) { scrollLine = 0; }
+
+        int textX = area.x + gutterW + t.paddingSmall;
+        int i = 0;
+        while (i < visLines) {
+            int ln = scrollLine + i;
+            if (ln < lines.Count) {
+                int rowY = area.y + i * lineH;
+                int textY = rowY + (lineH - Canvas.FontHeight(fontSize)) / 2;
+
+                if (ln == curLine && focused) {
+                    c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1, lineH, t.bgHover);
+                }
+
+                string num = Convert.ToString(ln + 1);
+                int numW = Canvas.MeasureText(num, fontSize);
+                c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num, t.textTertiary, fontSize);
+
+                string text = lines[ln];
+                c.DrawText(textX, textY, text, t.textPrimary, fontSize);
+
+                if (ln == curLine && focused) {
+                    string upto = Text.Left(text, curCol);
+                    int cxp = textX + Canvas.MeasureText(upto, fontSize);
+                    c.FillRect(cxp, rowY + app.Scale(2), 1, lineH - app.Scale(4), t.primary);
+                }
+            }
+            i = i + 1;
+        }
+
+        app.hitTester.Register(HitRegion.Create(id, area.x, area.y, area.width, area.height, 1));
+
+        if (app.window.EventKind() == 3) {
+            int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
+            if (hit == id) {
+                int rel = app.mouseY - area.y;
+                int clicked = scrollLine + rel / lineH;
+                if (clicked >= lines.Count) { clicked = lines.Count - 1; }
+                if (clicked < 0) { clicked = 0; }
+                curLine = clicked;
+                curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+                app.RequestRedraw();
+            }
+        }
+
+        return id;
+    }
+}

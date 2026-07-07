@@ -1,0 +1,206 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// A miniature aardio/VS-Code-style IDE shell built entirely from the enterprise
+/// GUI components: a Ribbon command band, a resizable file TreeView, a closable
+/// TabView document bar, a line-numbered CodeEditor, and an Output panel — laid
+/// out with Split (no hand-computed pixel coordinates for the panes).
+///
+/// Interactions:
+///   * Ribbon: New / Open / Save / Run / Build / Publish (logs to Output).
+///   * Tree:   click a file to open/activate its tab; click a folder to expand.
+///   * Tabs:   click to switch, X to close, + to add a new document.
+///   * Editor: click to place the caret, then type (arrows/Home/End/Backspace).
+class IdeDemo {
+    static void Main() {
+        App app = App.CreateDark("Zan IDE", 1180, 780);
+        app.Show();
+
+        List<TreeNode> tree = IdeDemo.BuildTree();
+
+        List<string> tabNames = new List<string>();
+        List<string> tabBodies = new List<string>();
+        tabNames.Add("main.zan");
+        tabBodies.Add("using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello, Zan!\");\n    }\n}");
+
+        SignalInt activeTab = SignalInt.Create(0);
+        CodeEditor editor = CodeEditor.Create();
+        editor.LoadText(tabBodies[0]);
+        int lastActive = 0;
+
+        List<string> log = new List<string>();
+        log.Add("> Zan IDE ready.");
+
+        List<RibbonCmd> cmds = new List<RibbonCmd>();
+        cmds.Add(RibbonCmd.Create("file", "New"));
+        cmds.Add(RibbonCmd.Group("folder", "Open"));
+        cmds.Add(RibbonCmd.Create("download", "Save"));
+        cmds.Add(RibbonCmd.Group("arrow-right", "Run"));
+        cmds.Add(RibbonCmd.Create("refresh", "Build"));
+        cmds.Add(RibbonCmd.Create("upload", "Publish"));
+
+        SignalInt treeW = SignalInt.Create(230);
+        SignalInt editorAreaH = SignalInt.Create(440);
+        SignalInt treeSel = SignalInt.Create(-1);
+        int lastTreeSel = -1;
+
+        while (app.isRunning) {
+            if (!app.ProcessEvent()) { break; }
+            if (!app.needsRedraw) { continue; }
+
+            app.BeginFrame();
+            Canvas c = app.canvas;
+            Theme t = app.theme;
+            int W = c.Width();
+            int H = c.Height();
+            int top = app.titlebarH;
+
+            int ribbonH = Ribbon.Height(app);
+            int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
+            if (rc == 0) {
+                tabNames.Add("untitled.zan");
+                tabBodies.Add("");
+                activeTab.Set(tabNames.Count - 1);
+                log.Add("> New file created.");
+                app.RequestRedraw();
+            } else if (rc == 1) {
+                log.Add("> Open: pick a file in the Explorer tree.");
+                app.RequestRedraw();
+            } else if (rc == 2) {
+                int a = activeTab.Get();
+                tabBodies[a] = editor.GetText();
+                log.Add("> Saved " + tabNames[a] + ".");
+                app.RequestRedraw();
+            } else if (rc == 3) {
+                log.Add("> Running " + tabNames[activeTab.Get()] + " ...");
+                log.Add("  Hello, Zan!");
+                app.RequestRedraw();
+            } else if (rc == 4) {
+                log.Add("> Build succeeded. 0 errors, 0 warnings.");
+                app.RequestRedraw();
+            } else if (rc == 5) {
+                log.Add("> Published build/app.exe (console + exe targets).");
+                app.RequestRedraw();
+            }
+
+            Rect area = Rect.Create(0, top + ribbonH, W, H - top - ribbonH);
+            Split cols = Split.Vertical(app, area, treeW, app.Scale(160), app.Scale(420));
+
+            Rect tr = cols.first;
+            c.FillRect(tr.x, tr.y, tr.width, tr.height, t.bgTertiary);
+            c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, "EXPLORER", t.textTertiary, t.fontSizeSmall);
+            Rect treeArea = Rect.Create(tr.x, tr.y + app.Scale(30), tr.width, tr.height - app.Scale(30));
+            TreeView.Render(app, treeArea, tree, treeSel, 0);
+
+            int sel = treeSel.Get();
+            if (sel != lastTreeSel) {
+                lastTreeSel = sel;
+                if (sel >= 0 && sel < tree.Count) {
+                    TreeNode node = tree[sel];
+                    if (!node.isDir) {
+                        IdeDemo.OpenTab(tabNames, tabBodies, activeTab, node.label);
+                        log.Add("> Opened " + node.label + ".");
+                        app.RequestRedraw();
+                    }
+                }
+            }
+
+            Split rows = Split.Horizontal(app, cols.second, editorAreaH, app.Scale(140), app.Scale(90));
+            Rect ea = rows.first;
+
+            int tabH = TabView.Height(app);
+            TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
+            if (hit.action == 3) {
+                tabNames.Add("untitled.zan");
+                tabBodies.Add("");
+                activeTab.Set(tabNames.Count - 1);
+                app.RequestRedraw();
+            } else if (hit.action == 2) {
+                if (tabNames.Count > 1) {
+                    tabNames.RemoveAt(hit.index);
+                    tabBodies.RemoveAt(hit.index);
+                    int a = activeTab.Get();
+                    if (a > hit.index) { a = a - 1; }
+                    if (a >= tabNames.Count) { a = tabNames.Count - 1; }
+                    if (a < 0) { a = 0; }
+                    activeTab.Set(a);
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
+                }
+            } else if (hit.action == 1) {
+                activeTab.Set(hit.index);
+                app.RequestRedraw();
+            }
+
+            int act = activeTab.Get();
+            if (act != lastActive) {
+                if (lastActive >= 0 && lastActive < tabBodies.Count) {
+                    tabBodies[lastActive] = editor.GetText();
+                }
+                if (act >= 0 && act < tabBodies.Count) {
+                    editor.LoadText(tabBodies[act]);
+                }
+                lastActive = act;
+            }
+
+            Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
+            editor.Render(app, edRect);
+
+            Rect orr = rows.second;
+            Rect oi = Panel.Section(app, orr.x, orr.y, orr.width, orr.height, "Output");
+            IdeDemo.RenderLog(app, oi, log);
+
+            app.RenderChrome("Zan IDE  —  Ribbon / TreeView / TabView / CodeEditor");
+            app.PresentFrame();
+        }
+    }
+
+    static List<TreeNode> BuildTree() {
+        List<TreeNode> tree = new List<TreeNode>();
+        tree.Add(TreeNode.Dir("MyProject", 0, true));
+        tree.Add(TreeNode.Dir("src", 1, true));
+        tree.Add(TreeNode.File("main.zan", 2));
+        tree.Add(TreeNode.File("utils.zan", 2));
+        tree.Add(TreeNode.Dir("assets", 1, false));
+        tree.Add(TreeNode.FileIcon("icon.ico", 2, "image"));
+        tree.Add(TreeNode.File("logo.png", 2));
+        tree.Add(TreeNode.FileIcon("README.md", 1, "file"));
+        tree.Add(TreeNode.File("build.zan", 1));
+        return tree;
+    }
+
+    static void OpenTab(List<string> names, List<string> bodies, SignalInt active, string name) {
+        int idx = names.IndexOf(name);
+        if (idx >= 0) {
+            active.Set(idx);
+            return;
+        }
+        names.Add(name);
+        bodies.Add("// " + name + "\n");
+        active.Set(names.Count - 1);
+    }
+
+    static void RenderLog(App app, Rect r, List<string> log) {
+        Theme t = app.theme;
+        int lineH = app.Scale(18);
+        if (lineH < 1) { lineH = 1; }
+        int maxLines = r.height / lineH;
+        if (maxLines < 1) { maxLines = 1; }
+        int start = log.Count - maxLines;
+        if (start < 0) { start = 0; }
+        int i = start;
+        int row = 0;
+        while (i < log.Count) {
+            string ln = log[i];
+            int col = t.textSecondary;
+            if (ln.Length >= 2) {
+                string head = ln.Substring(0, 2);
+                if (head == "> ") { col = t.textPrimary; }
+            }
+            app.canvas.DrawText(r.x, r.y + row * lineH, ln, col, t.fontSizeSmall);
+            i = i + 1;
+            row = row + 1;
+        }
+    }
+}
