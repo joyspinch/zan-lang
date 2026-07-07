@@ -208,6 +208,115 @@ class CodeEditor {
         return s.Length;
     }
 
+    // ---- syntax highlighting ----
+
+    /// True when the one-character string `ch` occurs in `set`.
+    static bool InSet(string chars, string ch) {
+        int i = 0;
+        while (i < chars.Length) {
+            if (chars.Substring(i, 1) == ch) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `hay` contains the substring `needle`.
+    static bool ContainsSub(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        if (m == 0) { return true; }
+        int i = 0;
+        while (i + m <= n) {
+            if (hay.Substring(i, m) == needle) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `w` is a Zan/C#-style language keyword.
+    static bool IsKeyword(string w) {
+        string kws = " using namespace class struct enum interface static void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator ";
+        return CodeEditor.ContainsSub(kws, " " + w + " ");
+    }
+
+    /// Splits `line` into colored segments (parallel outT/outC lists): keywords,
+    /// types (Capitalized identifiers), strings, line comments and numbers get
+    /// distinct colors; everything else uses the default text color.
+    static void Highlight(string line, Theme t, List<string> outT, List<int> outC) {
+        int kwC = 0xFF569CD6;
+        int tyC = 0xFF4EC9B0;
+        int strC = 0xFFCE9178;
+        int comC = 0xFF6A9955;
+        int numC = 0xFFB5CEA8;
+        int def = t.textPrimary;
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string digits = "0123456789";
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int n = line.Length;
+        int i = 0;
+        string pending = "";
+        while (i < n) {
+            string ch = line.Substring(i, 1);
+            if (ch == "/" && i + 1 < n && line.Substring(i + 1, 1) == "/") {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                i = n;
+            } else if (ch == "\"") {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                int j = i + 1;
+                string s = "\"";
+                while (j < n) {
+                    string cj = line.Substring(j, 1);
+                    if (cj == "\\" && j + 1 < n) {
+                        s = s + cj + line.Substring(j + 1, 1);
+                        j = j + 2;
+                    } else if (cj == "\"") {
+                        s = s + cj;
+                        j = j + 1;
+                        break;
+                    } else {
+                        s = s + cj;
+                        j = j + 1;
+                    }
+                }
+                outT.Add(s); outC.Add(strC);
+                i = j;
+            } else if (CodeEditor.InSet(digits, ch)) {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                int j = i;
+                string num = "";
+                while (j < n) {
+                    string cj = line.Substring(j, 1);
+                    if (CodeEditor.InSet(digits, cj) || cj == "." || cj == "x"
+                        || CodeEditor.InSet("abcdefABCDEF", cj)) {
+                        num = num + cj; j = j + 1;
+                    } else { break; }
+                }
+                outT.Add(num); outC.Add(numC);
+                i = j;
+            } else if (CodeEditor.InSet(lower + upper + "_", ch)) {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                int j = i;
+                string w = "";
+                while (j < n) {
+                    string cj = line.Substring(j, 1);
+                    if (CodeEditor.InSet(idrest, cj)) { w = w + cj; j = j + 1; }
+                    else { break; }
+                }
+                int col = def;
+                if (CodeEditor.IsKeyword(w)) { col = kwC; }
+                else if (CodeEditor.InSet(upper, line.Substring(i, 1))) { col = tyC; }
+                outT.Add(w); outC.Add(col);
+                i = j;
+            } else {
+                pending = pending + ch;
+                i = i + 1;
+            }
+        }
+        if (pending.Length > 0) { outT.Add(pending); outC.Add(def); }
+    }
+
     int Render(App app, Rect area) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -270,7 +379,16 @@ class CodeEditor {
                 c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num, t.textTertiary, fontSize);
 
                 string text = lines[ln];
-                c.DrawText(textX, textY, text, t.textPrimary, fontSize);
+                List<string> segT = new List<string>();
+                List<int> segC = new List<int>();
+                CodeEditor.Highlight(text, t, segT, segC);
+                int sx = textX;
+                int si = 0;
+                while (si < segT.Count) {
+                    c.DrawText(sx, textY, segT[si], segC[si], fontSize);
+                    sx = sx + Canvas.MeasureText(segT[si], fontSize);
+                    si = si + 1;
+                }
 
                 if (ln == curLine && focused) {
                     string upto = Text.Left(text, curCol);
