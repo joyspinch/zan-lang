@@ -4,28 +4,26 @@ using System.Diagnostics;
 using Gui;
 using Gui.Widget;
 
-/// A miniature aardio/VS-Code-style IDE built entirely from the enterprise GUI
-/// components (Ribbon / TreeView / TabView / CodeEditor / Panel / Split) wired
-/// to a REAL project on disk:
+/// A miniature aardio/VS-Code-style IDE built from the enterprise GUI components
+/// (Ribbon / TreeView / TabView / CodeEditor / Panel / Split / Modal / Input /
+/// Button) wired to a REAL project on disk and the real Zan toolchain.
 ///
-///   * Explorer tree is scanned from the workspace folder (System.IO.Directory)
-///     — click a folder to expand/collapse, click a file to open it in a tab.
-///   * Tabs are backed by files; edits live in the CodeEditor; Save writes to
-///     disk (System.IO.File). New files are created on first save.
-///   * Ribbon actions invoke the real Zan toolchain via System.Diagnostics.Process:
-///       Build   -> zanc --emit-ir <file>            (reports diagnostics)
-///       Run     -> zanc + clang link + execute      (captures program output)
-///       Publish -> link a standalone .exe into publish/
-///     Output is streamed into the bottom Output panel.
+///   * Project ("New Project"): a modal wizard with categorized templates
+///     (Console / GUI App / DLL Library / Executable / Empty), a project name
+///     and a location — scaffolds the folder + starter files + zan.proj config.
+///   * New ("New File"): a modal wizard with file templates (Program / Class /
+///     GUI Window / Interface / Empty).
+///   * Explorer tree scanned from disk; click a file to open it in a tab.
+///   * Save writes to disk; Build/Run/Publish invoke zanc (+clang) via Process
+///     and stream output to the Output panel.
 class IdeDemo {
-    static string Root() { return "d:/project/zan-lang/build/ide_workspace"; }
     static string Zanc() { return "d:/project/zan-lang/build/zanc.exe"; }
 
     static void Main() {
         App app = App.CreateDark("Zan IDE", 1180, 780);
         app.Show();
 
-        string root = IdeDemo.Root();
+        string root = "d:/project/zan-lang/build/ide_workspace";
         IdeDemo.EnsureWorkspace(root);
 
         List<TreeNode> tree = IdeDemo.ScanTree(root);
@@ -46,12 +44,41 @@ class IdeDemo {
         log.Add("> Zan IDE ready. Workspace: " + root);
 
         List<RibbonCmd> cmds = new List<RibbonCmd>();
-        cmds.Add(RibbonCmd.Create("file", "New"));
-        cmds.Add(RibbonCmd.Group("folder", "Open"));
-        cmds.Add(RibbonCmd.Create("download", "Save"));
-        cmds.Add(RibbonCmd.Group("arrow-right", "Run"));
+        cmds.Add(RibbonCmd.Create("plus", "Project"));
+        cmds.Add(RibbonCmd.Group("file", "New"));
+        cmds.Add(RibbonCmd.Create("folder", "Open"));
+        cmds.Add(RibbonCmd.Group("download", "Save"));
+        cmds.Add(RibbonCmd.Create("arrow-right", "Run"));
         cmds.Add(RibbonCmd.Create("refresh", "Build"));
         cmds.Add(RibbonCmd.Create("upload", "Publish"));
+
+        // ---- New Project template catalog ----
+        List<string> pNames = new List<string>();
+        List<string> pIcons = new List<string>();
+        List<string> pDescs = new List<string>();
+        pNames.Add("Console App");   pIcons.Add("menu");        pDescs.Add("Command-line program that prints to the console.");
+        pNames.Add("GUI Application");pIcons.Add("maximize");   pDescs.Add("Windowed app built on the Gui standard library.");
+        pNames.Add("DLL Library");   pIcons.Add("copy");        pDescs.Add("Reusable library of classes and functions.");
+        pNames.Add("Executable");    pIcons.Add("arrow-right"); pDescs.Add("Standalone .exe with a Main entry point.");
+        pNames.Add("Empty Project"); pIcons.Add("file");        pDescs.Add("Just the folder structure and a README.");
+
+        // ---- New File template catalog ----
+        List<string> fNames = new List<string>();
+        List<string> fIcons = new List<string>();
+        List<string> fDescs = new List<string>();
+        fNames.Add("Program (Main)"); fIcons.Add("arrow-right"); fDescs.Add("Class with a static Main() entry point.");
+        fNames.Add("Class");          fIcons.Add("grid");        fDescs.Add("An empty class with fields and methods.");
+        fNames.Add("GUI Window");     fIcons.Add("maximize");    fDescs.Add("A Gui window with an event loop.");
+        fNames.Add("Interface");      fIcons.Add("copy");        fDescs.Add("A base class defining a contract.");
+        fNames.Add("Empty File");     fIcons.Add("file");        fDescs.Add("A blank .zan file.");
+
+        // ---- Dialog state ----
+        SignalInt modal = SignalInt.Create(0);     // 0 none, 1 new-project, 2 new-file
+        SignalInt pSel = SignalInt.Create(0);
+        SignalInt fSel = SignalInt.Create(0);
+        Input pNameInput = Input.Bind(SignalString.Create("NewProject"), "project name");
+        Input pLocInput = Input.Bind(SignalString.Create(root), "location");
+        Input fNameInput = Input.Bind(SignalString.Create("NewFile"), "file name");
 
         SignalInt treeW = SignalInt.Create(240);
         SignalInt editorAreaH = SignalInt.Create(430);
@@ -68,33 +95,41 @@ class IdeDemo {
             int W = c.Width();
             int H = c.Height();
             int top = app.titlebarH;
-
             int ribbonH = Ribbon.Height(app);
+            bool modalOpen = modal.Get() != 0;
+
             int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
-            if (rc == 0) {
-                IdeDemo.NewFile(tabNames, tabBodies, tabPaths, activeTab);
-                log.Add("> New untitled document.");
-                app.RequestRedraw();
-            } else if (rc == 1) {
-                log.Add("> Open: click a file in the Explorer to open it.");
-                rescan = true;
-                app.RequestRedraw();
-            } else if (rc == 2) {
-                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                rescan = true;
-                app.RequestRedraw();
-            } else if (rc == 3) {
-                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                IdeDemo.RunActive(tabPaths, activeTab, root, log);
-                app.RequestRedraw();
-            } else if (rc == 4) {
-                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                IdeDemo.BuildActive(tabPaths, activeTab, root, log);
-                app.RequestRedraw();
-            } else if (rc == 5) {
-                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                IdeDemo.PublishActive(tabNames, tabPaths, activeTab, root, log);
-                app.RequestRedraw();
+            if (!modalOpen) {
+                if (rc == 0) {
+                    pLocInput.SetText(Path.GetDirectoryName(root));
+                    pSel.Set(0);
+                    modal.Set(1);
+                    app.RequestRedraw();
+                } else if (rc == 1) {
+                    fSel.Set(0);
+                    modal.Set(2);
+                    app.RequestRedraw();
+                } else if (rc == 2) {
+                    log.Add("> Open: click a file in the Explorer to open it.");
+                    rescan = true;
+                    app.RequestRedraw();
+                } else if (rc == 3) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    rescan = true;
+                    app.RequestRedraw();
+                } else if (rc == 4) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    IdeDemo.RunActive(tabPaths, activeTab, root, log);
+                    app.RequestRedraw();
+                } else if (rc == 5) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    IdeDemo.BuildActive(tabPaths, activeTab, root, log);
+                    app.RequestRedraw();
+                } else if (rc == 6) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    IdeDemo.PublishActive(tabNames, tabPaths, activeTab, root, log);
+                    app.RequestRedraw();
+                }
             }
 
             Rect area = Rect.Create(0, top + ribbonH, W, H - top - ribbonH);
@@ -106,15 +141,17 @@ class IdeDemo {
             Rect treeArea = Rect.Create(tr.x, tr.y + app.Scale(30), tr.width, tr.height - app.Scale(30));
             TreeView.Render(app, treeArea, tree, treeSel, 0);
 
-            int sel = treeSel.Get();
-            if (sel != lastTreeSel) {
-                lastTreeSel = sel;
-                if (sel >= 0 && sel < tree.Count) {
-                    TreeNode node = tree[sel];
-                    if (!node.isDir) {
-                        IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
-                        log.Add("> Opened " + node.path + ".");
-                        app.RequestRedraw();
+            if (!modalOpen) {
+                int sel = treeSel.Get();
+                if (sel != lastTreeSel) {
+                    lastTreeSel = sel;
+                    if (sel >= 0 && sel < tree.Count) {
+                        TreeNode node = tree[sel];
+                        if (!node.isDir) {
+                            IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
+                            log.Add("> Opened " + node.path + ".");
+                            app.RequestRedraw();
+                        }
                     }
                 }
             }
@@ -124,25 +161,28 @@ class IdeDemo {
 
             int tabH = TabView.Height(app);
             TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
-            if (hit.action == 3) {
-                IdeDemo.NewFile(tabNames, tabBodies, tabPaths, activeTab);
-                app.RequestRedraw();
-            } else if (hit.action == 2) {
-                if (tabNames.Count > 1) {
-                    tabNames.RemoveAt(hit.index);
-                    tabBodies.RemoveAt(hit.index);
-                    tabPaths.RemoveAt(hit.index);
-                    int a = activeTab.Get();
-                    if (a > hit.index) { a = a - 1; }
-                    if (a >= tabNames.Count) { a = tabNames.Count - 1; }
-                    if (a < 0) { a = 0; }
-                    activeTab.Set(a);
-                    lastActive = 0 - 1;
+            if (!modalOpen) {
+                if (hit.action == 3) {
+                    fSel.Set(0);
+                    modal.Set(2);
+                    app.RequestRedraw();
+                } else if (hit.action == 2) {
+                    if (tabNames.Count > 1) {
+                        tabNames.RemoveAt(hit.index);
+                        tabBodies.RemoveAt(hit.index);
+                        tabPaths.RemoveAt(hit.index);
+                        int a = activeTab.Get();
+                        if (a > hit.index) { a = a - 1; }
+                        if (a >= tabNames.Count) { a = tabNames.Count - 1; }
+                        if (a < 0) { a = 0; }
+                        activeTab.Set(a);
+                        lastActive = 0 - 1;
+                        app.RequestRedraw();
+                    }
+                } else if (hit.action == 1) {
+                    activeTab.Set(hit.index);
                     app.RequestRedraw();
                 }
-            } else if (hit.action == 1) {
-                activeTab.Set(hit.index);
-                app.RequestRedraw();
             }
 
             int act = activeTab.Get();
@@ -163,6 +203,44 @@ class IdeDemo {
             Rect oi = Panel.Section(app, orr.x, orr.y, orr.width, orr.height, "Output");
             IdeDemo.RenderLog(app, oi, log);
 
+            // ---- Modal wizards (drawn on top of a dimming overlay) ----
+            if (modal.Get() == 1) {
+                int pa = IdeDemo.RenderTemplateDialog(app, "New Project", pNames, pIcons, pDescs, pSel,
+                                                      pNameInput, pLocInput, true);
+                if (pa == 1) {
+                    string parent = pLocInput.GetText();
+                    string name = pNameInput.GetText();
+                    string newDir = IdeDemo.CreateProject(pSel.Get(), parent, name, log);
+                    root = newDir;
+                    tabNames = new List<string>();
+                    tabBodies = new List<string>();
+                    tabPaths = new List<string>();
+                    activeTab.Set(0);
+                    lastActive = 0 - 1;
+                    IdeDemo.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                    rescan = true;
+                    modal.Set(0);
+                    app.RequestRedraw();
+                } else if (pa == 2) {
+                    modal.Set(0);
+                    app.RequestRedraw();
+                }
+            } else if (modal.Get() == 2) {
+                int fa = IdeDemo.RenderTemplateDialog(app, "New File", fNames, fIcons, fDescs, fSel,
+                                                      fNameInput, fNameInput, false);
+                if (fa == 1) {
+                    string name = fNameInput.GetText();
+                    string p = IdeDemo.CreateFile(fSel.Get(), root, name, log);
+                    IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
+                    rescan = true;
+                    modal.Set(0);
+                    app.RequestRedraw();
+                } else if (fa == 2) {
+                    modal.Set(0);
+                    app.RequestRedraw();
+                }
+            }
+
             app.RenderChrome("Zan IDE  —  " + root);
             app.PresentFrame();
 
@@ -175,7 +253,8 @@ class IdeDemo {
         }
     }
 
-    /// Creates a starter project on disk the first time the IDE is launched.
+    // ---- workspace / scaffolding ----
+
     static void EnsureWorkspace(string root) {
         if (Directory.Exists(root)) { return; }
         Directory.CreateDirectory(root);
@@ -186,11 +265,96 @@ class IdeDemo {
             "using System;\n\nclass Utils {\n    static int Add(int a, int b) {\n        return a + b;\n    }\n}\n");
         File.WriteAllText(root + "/README.md",
             "# MyProject\n\nA sample Zan project scaffolded by the Zan IDE.\n");
-        File.WriteAllText(root + "/build.zan",
-            "// Build entry point for MyProject.\n");
+        File.WriteAllText(root + "/zan.proj",
+            "name = MyProject\ntype = console\nentry = src/main.zan\ntarget = exe\n");
     }
 
-    /// Recursively scans the workspace into a flat, pre-ordered tree model.
+    /// Scaffolds a new project of the chosen kind and returns its directory.
+    static string CreateProject(int kind, string parent, string name, List<string> log) {
+        string dir = parent + "/" + name;
+        Directory.CreateDirectory(dir);
+        Directory.CreateDirectory(dir + "/src");
+
+        string typeName = "console";
+        string target = "exe";
+        if (kind == 0) {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleTemplate(name));
+        } else if (kind == 1) {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.GuiTemplate(name));
+        } else if (kind == 2) {
+            typeName = "library"; target = "dll";
+            File.WriteAllText(dir + "/src/lib.zan", IdeDemo.LibraryTemplate(name));
+        } else if (kind == 3) {
+            typeName = "executable"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleTemplate(name));
+        } else {
+            typeName = "empty"; target = "exe";
+        }
+
+        File.WriteAllText(dir + "/README.md", "# " + name + "\n\nGenerated by the Zan IDE.\n");
+        File.WriteAllText(dir + "/zan.proj",
+            "name = " + name + "\ntype = " + typeName + "\nentry = src/main.zan\ntarget = " + target + "\n");
+        log.Add("> Created " + typeName + " project at " + dir + ".");
+        return dir;
+    }
+
+    /// Creates a single file from the chosen file template; returns its path.
+    static string CreateFile(int kind, string root, string name, List<string> log) {
+        Directory.CreateDirectory(root + "/src");
+        string path = root + "/src/" + name + ".zan";
+        File.WriteAllText(path, IdeDemo.FileTemplateBody(kind, name));
+        log.Add("> Created file " + path + ".");
+        return path;
+    }
+
+    static void OpenFirst(List<string> names, List<string> bodies, List<string> paths, SignalInt active, string root) {
+        string main = root + "/src/main.zan";
+        string lib = root + "/src/lib.zan";
+        if (File.Exists(main)) {
+            IdeDemo.OpenPath(names, bodies, paths, active, main, "main.zan");
+        } else if (File.Exists(lib)) {
+            IdeDemo.OpenPath(names, bodies, paths, active, lib, "lib.zan");
+        } else {
+            names.Add("README.md");
+            bodies.Add(File.ReadAllText(root + "/README.md"));
+            paths.Add(root + "/README.md");
+            active.Set(0);
+        }
+    }
+
+    // ---- template bodies ----
+
+    static string ConsoleTemplate(string name) {
+        return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
+    }
+
+    static string GuiTemplate(string name) {
+        return "using System;\nusing Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 800, 600);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            app.RenderChrome(\"" + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string LibraryTemplate(string name) {
+        return "using System;\n\n/// " + name + " library.\nclass " + name + " {\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string FileTemplateBody(int kind, string name) {
+        if (kind == 0) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
+        }
+        if (kind == 1) {
+            return "using System;\n\nclass " + name + " {\n    // fields and methods\n}\n";
+        }
+        if (kind == 2) {
+            return IdeDemo.GuiTemplate(name);
+        }
+        if (kind == 3) {
+            return "using System;\n\n/// Contract implemented by concrete types.\nclass " + name + " {\n    void Execute() { }\n}\n";
+        }
+        return "";
+    }
+
+    // ---- tree scanning ----
+
     static List<TreeNode> ScanTree(string root) {
         List<TreeNode> nodes = new List<TreeNode>();
         IdeDemo.ScanInto(nodes, root, "MyProject", 0, true);
@@ -217,7 +381,8 @@ class IdeDemo {
         }
     }
 
-    /// Opens a file into a tab (or re-activates it if already open).
+    // ---- tabs ----
+
     static void OpenPath(List<string> names, List<string> bodies, List<string> paths,
                          SignalInt active, string path, string name) {
         int idx = paths.IndexOf(path);
@@ -232,15 +397,7 @@ class IdeDemo {
         active.Set(names.Count - 1);
     }
 
-    static void NewFile(List<string> names, List<string> bodies, List<string> paths, SignalInt active) {
-        names.Add("untitled.zan");
-        bodies.Add("using System;\n\nclass Program {\n    static void Main() {\n    }\n}\n");
-        paths.Add("");
-        active.Set(names.Count - 1);
-    }
-
-    /// Flushes the editor buffer into the active tab and writes it to disk.
-    static void SaveActive(App app, CodeEditor editor, List<string> names, List<string> bodies,
+    static void SaveActive(CodeEditor editor, List<string> names, List<string> bodies,
                            List<string> paths, SignalInt active, string root, List<string> log) {
         int a = active.Get();
         if (a < 0 || a >= names.Count) { return; }
@@ -254,7 +411,8 @@ class IdeDemo {
         log.Add("> Saved " + p + ".");
     }
 
-    /// Compile-only: runs the Zan compiler and reports diagnostics.
+    // ---- toolchain ----
+
     static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log) {
         int a = active.Get();
         string p = paths[a];
@@ -269,7 +427,6 @@ class IdeDemo {
         }
     }
 
-    /// Compile + link + execute; captures the program's own output.
     static void RunActive(List<string> paths, SignalInt active, string root, List<string> log) {
         int a = active.Get();
         string p = paths[a];
@@ -286,7 +443,6 @@ class IdeDemo {
         log.Add("> (run finished)");
     }
 
-    /// Links a standalone console executable into publish/.
     static void PublishActive(List<string> names, List<string> paths, SignalInt active, string root, List<string> log) {
         int a = active.Get();
         string p = paths[a];
@@ -308,6 +464,112 @@ class IdeDemo {
         while (i < lines.Count) {
             log.Add("  " + lines[i]);
             i = i + 1;
+        }
+    }
+
+    // ---- dialog rendering ----
+
+    /// Renders a modal template picker: a selectable list on the left, a name
+    /// field (+ optional location field) on the right, and Create/Cancel.
+    /// Returns 0 none, 1 create, 2 cancel.
+    static int RenderTemplateDialog(App app, string title, List<string> names, List<string> icons,
+                                    List<string> descs, SignalInt sel, Input nameInput, Input locInput,
+                                    bool showLoc) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int w = app.Scale(700);
+        int h = app.Scale(440);
+        int closeId = Modal.Render(app, w, h, title);
+        int x = (c.Width() - w) / 2;
+        int y = (c.Height() - h) / 2;
+        int pad = t.paddingLarge;
+        int contentY = y + pad + t.heightMedium + t.paddingMedium;
+
+        int listW = app.Scale(250);
+        int listX = x + pad;
+        int listH = h - (contentY - y) - app.Scale(72);
+        IdeDemo.RenderTemplateList(app, listX, contentY, listW, listH, names, icons, sel);
+
+        int fx = listX + listW + pad;
+        int fw = x + w - pad - fx;
+        int fy = contentY;
+
+        c.DrawText(fx, fy, "Name", t.textSecondary, t.fontSizeSmall);
+        nameInput.Render(app, fx, fy + app.Scale(20), fw, t.heightMedium);
+        int nextY = fy + app.Scale(20) + t.heightMedium + t.paddingMedium;
+
+        if (showLoc) {
+            c.DrawText(fx, nextY, "Location", t.textSecondary, t.fontSizeSmall);
+            locInput.Render(app, fx, nextY + app.Scale(20), fw, t.heightMedium);
+            nextY = nextY + app.Scale(20) + t.heightMedium + t.paddingMedium;
+        }
+
+        int s = sel.Get();
+        if (s >= 0 && s < descs.Count) {
+            c.DrawText(fx, nextY, descs[s], t.textTertiary, t.fontSizeSmall);
+        }
+
+        int bw = app.Scale(100);
+        int by = y + h - t.heightMedium - pad;
+        int okX = x + w - pad - bw;
+        int cancelX = okX - t.gapMedium - bw;
+
+        int result = 0;
+        int cancelId = Button.Create("Cancel").Render(app, cancelX, by, bw);
+        if (Button.WasClicked(app, cancelId)) { result = 2; }
+        int okId = Button.Primary("Create").Render(app, okX, by, bw);
+        if (Button.WasClicked(app, okId)) { result = 1; }
+
+        if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            result = 2;
+        }
+        return result;
+    }
+
+    static void RenderTemplateList(App app, int x, int y, int w, int h, List<string> names,
+                                   List<string> icons, SignalInt sel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgSecondary);
+
+        int rowH = app.Scale(42);
+        int n = names.Count;
+        int firstId = app.focus.AllocId();
+        int i = 1;
+        while (i < n) { app.focus.AllocId(); i = i + 1; }
+
+        int selv = sel.Get();
+        int glyph = t.fontSizeLarge;
+        int k = 0;
+        while (k < n) {
+            int id = firstId + k;
+            int rowY = y + k * rowH;
+            bool hovered = app.focus.IsHovered(id);
+            bool active = k == selv;
+            if (active) {
+                c.FillRect(x, rowY, w, rowH, t.bgActive);
+                c.FillRect(x, rowY, app.Scale(3), rowH, t.primary);
+            } else if (hovered) {
+                c.FillRect(x, rowY, w, rowH, t.bgHover);
+            }
+            int iconColor = t.textSecondary;
+            int textColor = t.textPrimary;
+            if (active) { iconColor = t.primary; textColor = t.primary; }
+            Icon.DrawCenteredIn(c, icons[k], x + t.paddingMedium, rowY, glyph, rowH, glyph, iconColor);
+            int textX = x + t.paddingMedium + glyph + t.gapMedium;
+            int textY = rowY + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.DrawText(textX, textY, names[k], textColor, t.fontSizeMedium);
+            app.hitTester.Register(HitRegion.Create(id, x, rowY, w, rowH, 0));
+            k = k + 1;
+        }
+
+        if (app.window.EventKind() == 3) {
+            int hitv = app.hitTester.HitTest(app.mouseX, app.mouseY);
+            int idx = hitv - firstId;
+            if (idx >= 0 && idx < n) {
+                sel.Set(idx);
+                app.RequestRedraw();
+            }
         }
     }
 
