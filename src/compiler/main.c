@@ -940,9 +940,23 @@ int main(int argc, char **argv) {
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
                      " -L\"%s\" -Wl,-rpath,\"%s\"", zan_lib_dirs[di], zan_lib_dirs[di]);
         }
+        /* Windows-only system import libraries have no counterpart on
+         * Unix (their functionality is provided through the cross-platform
+         * zan_gui native library instead), so skip them here — mirroring the
+         * CRT skip on the Windows link path. */
+        static const char *const win_only_libs[] = {
+            "user32", "gdi32", "kernel32", "advapi32", "shell32", "ole32",
+            "oleaut32", "comdlg32", "comctl32", "gdiplus", "dwmapi", "shcore",
+            "uxtheme", "msimg32", "winmm", "ws2_32", "shlwapi", "opengl32", NULL };
         for (int li = 0; li < irgen.extern_lib_count; li++) {
             const char *lib = irgen.extern_libs[li].str;
             int lib_len = (int)irgen.extern_libs[li].len;
+            int skip = 0;
+            for (int wi = 0; win_only_libs[wi]; wi++) {
+                if ((int)strlen(win_only_libs[wi]) == lib_len &&
+                    memcmp(win_only_libs[wi], lib, lib_len) == 0) { skip = 1; break; }
+            }
+            if (skip) continue;
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
         }
