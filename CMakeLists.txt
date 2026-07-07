@@ -251,6 +251,38 @@ add_test(NAME diag_no_runaway
 set_tests_properties(diag_no_runaway PROPERTIES
   WILL_FAIL TRUE TIMEOUT 20)
 
+# ---- Golden compiler regression tests ----
+# Freeze the lexer token stream and parse tree for a set of hermetic (stdlib-free)
+# .zan inputs so any lexer/parser/AST regression is caught in CI on every
+# platform. IR is verified structurally (required @symbol defines present)
+# rather than by exact text, to stay robust across LLVM versions/targets.
+# Regenerate goldens with: cmake -DZANC=<zanc> -P tests/golden/update_golden.cmake
+set(_golden_dir ${CMAKE_SOURCE_DIR}/tests/golden)
+file(GLOB _golden_cases RELATIVE ${_golden_dir}/cases ${_golden_dir}/cases/*.zan)
+foreach(_case ${_golden_cases})
+  string(REGEX REPLACE "\\.zan$" "" _gname ${_case})
+  add_test(NAME golden_${_gname}_tokens COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc> -DMODE=tokens
+    -DSRC=${_golden_dir}/cases/${_case}
+    -DEXPECTED=${_golden_dir}/expected/${_gname}.tokens
+    -DWORKDIR=${CMAKE_BINARY_DIR}
+    -P ${_golden_dir}/run_golden.cmake)
+  add_test(NAME golden_${_gname}_ast COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc> -DMODE=ast
+    -DSRC=${_golden_dir}/cases/${_case}
+    -DEXPECTED=${_golden_dir}/expected/${_gname}.ast
+    -DWORKDIR=${CMAKE_BINARY_DIR}
+    -P ${_golden_dir}/run_golden.cmake)
+  if(EXISTS ${_golden_dir}/expected/${_gname}.ir-contains)
+    add_test(NAME golden_${_gname}_ir COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc> -DMODE=ir
+      -DSRC=${_golden_dir}/cases/${_case}
+      -DEXPECTED=${_golden_dir}/expected/${_gname}.ir-contains
+      -DWORKDIR=${CMAKE_BINARY_DIR}
+      -P ${_golden_dir}/run_golden.cmake)
+  endif()
+endforeach()
+
 # ---- zanpkg (package manager CLI) ----
 add_executable(zanpkg
     src/pkg/zanpkg_main.c
