@@ -4,6 +4,30 @@ using System.Diagnostics;
 using Gui;
 using Gui.Widget;
 
+/// Describes one project template: the category it appears under, its display
+/// name / icon / description, the scaffolding "kind" (console / dll-class /
+/// gui-empty / webview / server / custom / ...), and, for custom templates, the
+/// source directory to copy from.
+class Tpl {
+    string cat;
+    string name;
+    string icon;
+    string desc;
+    string kind;
+    string src;
+
+    static Tpl Make(string cat, string name, string icon, string kind, string desc) {
+        Tpl t = new Tpl();
+        t.cat = cat;
+        t.name = name;
+        t.icon = icon;
+        t.kind = kind;
+        t.desc = desc;
+        t.src = "";
+        return t;
+    }
+}
+
 /// A miniature aardio/VS-Code-style IDE built from the enterprise GUI components
 /// (Ribbon / TreeView / TabView / CodeEditor / Panel / Split / Modal / Input /
 /// Button) wired to a REAL project on disk and the real Zan toolchain.
@@ -51,16 +75,24 @@ class IdeDemo {
         cmds.Add(RibbonCmd.Create("arrow-right", "Run"));
         cmds.Add(RibbonCmd.Create("refresh", "Build"));
         cmds.Add(RibbonCmd.Create("upload", "Publish"));
+        cmds.Add(RibbonCmd.Group("copy", "Template"));
 
-        // ---- New Project template catalog ----
-        List<string> pNames = new List<string>();
-        List<string> pIcons = new List<string>();
-        List<string> pDescs = new List<string>();
-        pNames.Add("Console App");   pIcons.Add("menu");        pDescs.Add("Command-line program that prints to the console.");
-        pNames.Add("GUI Application");pIcons.Add("maximize");   pDescs.Add("Windowed app built on the Gui standard library.");
-        pNames.Add("DLL Library");   pIcons.Add("copy");        pDescs.Add("Reusable library of classes and functions.");
-        pNames.Add("Executable");    pIcons.Add("arrow-right"); pDescs.Add("Standalone .exe with a Main entry point.");
-        pNames.Add("Empty Project"); pIcons.Add("file");        pDescs.Add("Just the folder structure and a README.");
+        // ---- New Project categories (built-in + user "Custom") ----
+        List<string> catNames = new List<string>();
+        catNames.Add("Console");
+        catNames.Add("Library");
+        catNames.Add("Window App");
+        catNames.Add("WebView");
+        catNames.Add("Server");
+        catNames.Add("Custom");
+
+        // The template catalog + its parallel projections; rebuilt whenever the
+        // New Project wizard opens so freshly-saved custom templates show up.
+        List<Tpl> tpls = new List<Tpl>();
+        List<string> tCats = new List<string>();
+        List<string> tNames = new List<string>();
+        List<string> tIcons = new List<string>();
+        List<string> tDescs = new List<string>();
 
         // ---- New File template catalog ----
         List<string> fNames = new List<string>();
@@ -75,14 +107,29 @@ class IdeDemo {
         // ---- Dialog state ----
         // The New Project / New File wizards are REAL secondary top-level windows
         // (draggable anywhere on the desktop), driven from this same event pump.
-        // dlg is null when no wizard is open; dlgMode is 1=new-project, 2=new-file.
+        // dlg is null when no wizard is open.
+        // dlgMode: 1=new-project, 2=new-file, 3=save-as-template.
         App dlg = null;
         int dlgMode = 0;
+        SignalInt catSel = SignalInt.Create(0);
         SignalInt pSel = SignalInt.Create(0);
         SignalInt fSel = SignalInt.Create(0);
         Input pNameInput = Input.Bind(SignalString.Create("NewProject"), "project name");
         Input pLocInput = Input.Bind(SignalString.Create(root), "location");
         Input fNameInput = Input.Bind(SignalString.Create("NewFile"), "file name");
+
+        // Save-current-project-as-custom-template state.
+        SignalInt tmplCatSel = SignalInt.Create(0);
+        Input tmplNameInput = Input.Bind(SignalString.Create("MyTemplate"), "template name");
+        List<string> saveCats = new List<string>();
+        List<string> saveIcons = new List<string>();
+        List<string> saveDescs = new List<string>();
+        saveCats.Add("Console");    saveIcons.Add("menu");        saveDescs.Add("Save under the Console category.");
+        saveCats.Add("Library");    saveIcons.Add("grid");        saveDescs.Add("Save under the Library category.");
+        saveCats.Add("Window App"); saveIcons.Add("maximize");    saveDescs.Add("Save under the Window App category.");
+        saveCats.Add("WebView");    saveIcons.Add("folder");      saveDescs.Add("Save under the WebView category.");
+        saveCats.Add("Server");     saveIcons.Add("arrow-right"); saveDescs.Add("Save under the Server category.");
+        saveCats.Add("Custom");     saveIcons.Add("file");        saveDescs.Add("Save under the Custom category.");
 
         SignalInt treeW = SignalInt.Create(240);
         SignalInt editorAreaH = SignalInt.Create(430);
@@ -135,9 +182,20 @@ class IdeDemo {
 
                 int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
                 if (rc == 0) {
-                    dlg = IdeDemo.OpenWizard("New Project", pSel, pNameInput, "NewProject");
-                    dlgMode = 1;
+                    // Rebuild the catalog (built-ins + custom templates on disk).
+                    tpls = IdeDemo.BuildCatalog(root);
+                    tCats = new List<string>();
+                    tNames = new List<string>();
+                    tIcons = new List<string>();
+                    tDescs = new List<string>();
+                    IdeDemo.SplitTemplates(tpls, tCats, tNames, tIcons, tDescs);
+                    catSel.Set(0);
+                    pSel.Set(0);
+                    pNameInput.SetText("NewProject");
                     pLocInput.SetText(Path.GetDirectoryName(root));
+                    dlg = App.CreateDark("New Project", 900, 560);
+                    dlg.Show();
+                    dlgMode = 1;
                 } else if (rc == 1) {
                     dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
                     dlgMode = 2;
@@ -156,6 +214,12 @@ class IdeDemo {
                 } else if (rc == 6) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     IdeDemo.PublishActive(tabNames, tabPaths, activeTab, root, log);
+                } else if (rc == 7) {
+                    tmplCatSel.Set(5);
+                    tmplNameInput.SetText(Path.GetFileName(root));
+                    dlg = App.CreateDark("Save as Template", 640, 470);
+                    dlg.Show();
+                    dlgMode = 3;
                 }
 
                 Rect area = Rect.Create(0, top + ribbonH, W, H - top - ribbonH);
@@ -232,8 +296,12 @@ class IdeDemo {
                     dlg.BeginFrame();
                     int action = 0;
                     if (dlgMode == 1) {
-                        action = Wizard.Render(dlg, "New Project", pNames, pIcons, pDescs, pSel,
-                                               pNameInput, pLocInput, true);
+                        action = Wizard.RenderCategorized(dlg, "New Project", catNames, catSel,
+                                                          tCats, tNames, tIcons, tDescs, pSel,
+                                                          pNameInput, pLocInput);
+                    } else if (dlgMode == 3) {
+                        action = Wizard.Render(dlg, "Save as Template", saveCats, saveIcons, saveDescs,
+                                               tmplCatSel, tmplNameInput, tmplNameInput, false);
                     } else {
                         action = Wizard.Render(dlg, "New File", fNames, fIcons, fDescs, fSel,
                                                fNameInput, fNameInput, false);
@@ -245,14 +313,21 @@ class IdeDemo {
                         if (dlgMode == 1) {
                             string parent = pLocInput.GetText();
                             string name = pNameInput.GetText();
-                            string newDir = IdeDemo.CreateProject(pSel.Get(), parent, name, log);
-                            root = newDir;
-                            tabNames = new List<string>();
-                            tabBodies = new List<string>();
-                            tabPaths = new List<string>();
-                            activeTab.Set(0);
-                            lastActive = 0 - 1;
-                            IdeDemo.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                            int gi = pSel.Get();
+                            if (gi >= 0 && gi < tpls.Count) {
+                                string newDir = IdeDemo.CreateProjectT(tpls[gi], parent, name, log);
+                                root = newDir;
+                                tabNames = new List<string>();
+                                tabBodies = new List<string>();
+                                tabPaths = new List<string>();
+                                activeTab.Set(0);
+                                lastActive = 0 - 1;
+                                IdeDemo.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                            }
+                        } else if (dlgMode == 3) {
+                            string cat = saveCats[tmplCatSel.Get()];
+                            string tname = tmplNameInput.GetText();
+                            IdeDemo.SaveAsTemplate(root, cat, tname, log);
                         } else {
                             string name = fNameInput.GetText();
                             string p = IdeDemo.CreateFile(fSel.Get(), root, name, log);
@@ -307,33 +382,195 @@ class IdeDemo {
             "name = MyProject\ntype = console\nentry = src/main.zan\ntarget = exe\n");
     }
 
-    /// Scaffolds a new project of the chosen kind and returns its directory.
-    static string CreateProject(int kind, string parent, string name, List<string> log) {
+    // ---- template catalog ----
+
+    /// The built-in project templates, grouped by category. Category labels here
+    /// must match the New Project wizard's category list exactly.
+    static List<Tpl> BuiltinTemplates() {
+        List<Tpl> ts = new List<Tpl>();
+        ts.Add(Tpl.Make("Console", "Hello World", "menu", "console",
+            "Minimal console program that prints a line of text."));
+        ts.Add(Tpl.Make("Console", "Command-line Args", "menu", "console-args",
+            "Console program that reads command-line arguments."));
+        ts.Add(Tpl.Make("Console", "Multi-file Project", "copy", "console-multi",
+            "Console project split into main + utils source files."));
+        ts.Add(Tpl.Make("Library", "Class Library", "grid", "dll-class",
+            "A reusable library of classes, compiled to a DLL."));
+        ts.Add(Tpl.Make("Library", "Export DLL", "copy", "dll-export",
+            "A DLL exposing functions callable from other programs."));
+        ts.Add(Tpl.Make("Window App", "Empty Window", "maximize", "gui-empty",
+            "A blank window app built on the Gui standard library."));
+        ts.Add(Tpl.Make("Window App", "Component Showcase", "grid", "gui-components",
+            "A window with panels/toolbars from the Gui components."));
+        ts.Add(Tpl.Make("WebView", "WebView Window", "folder", "webview",
+            "A window that hosts web content (needs a WebView runtime)."));
+        ts.Add(Tpl.Make("Server", "HTTP Server", "arrow-right", "server",
+            "A minimal HTTP server skeleton."));
+        ts.Add(Tpl.Make("Server", "TCP Echo Server", "refresh", "server-tcp",
+            "A minimal TCP echo server skeleton."));
+        return ts;
+    }
+
+    /// Built-in templates plus any user templates found under root/.templates.
+    static List<Tpl> BuildCatalog(string root) {
+        List<Tpl> ts = IdeDemo.BuiltinTemplates();
+        IdeDemo.LoadCustomTemplates(ts, root);
+        return ts;
+    }
+
+    /// Projects the catalog into the parallel lists the wizard consumes.
+    static void SplitTemplates(List<Tpl> ts, List<string> cats, List<string> names,
+                               List<string> icons, List<string> descs) {
+        int i = 0;
+        while (i < ts.Count) {
+            Tpl t = ts[i];
+            cats.Add(t.cat);
+            names.Add(t.name);
+            icons.Add(t.icon);
+            descs.Add(t.desc);
+            i = i + 1;
+        }
+    }
+
+    /// Scans root/.templates/<name>/ and appends each as a "Custom" template.
+    /// GetDirectories on a missing directory yields an empty list, so no
+    /// separate existence check is needed.
+    static void LoadCustomTemplates(List<Tpl> ts, string root) {
+        string dir = root + "/.templates";
+        List<string> subs = Directory.GetDirectories(dir);
+        int i = 0;
+        while (i < subs.Count) {
+            string tname = subs[i];
+            string tdir = dir + "/" + tname;
+            string desc = "Custom template.";
+            string icon = "file";
+            string mpath = tdir + "/manifest.txt";
+            if (File.Exists(mpath)) {
+                string m = File.ReadAllText(mpath);
+                desc = IdeDemo.ManifestField(m, "desc", desc);
+                icon = IdeDemo.ManifestField(m, "icon", icon);
+            }
+            Tpl t = Tpl.Make("Custom", tname, icon, "custom", desc);
+            t.src = tdir;
+            ts.Add(t);
+            i = i + 1;
+        }
+    }
+
+    /// Reads a "key=value" field from a simple manifest, or returns def.
+    /// Scans char-by-char (rather than splitting into a list) to stay robust.
+    static string ManifestField(string content, string key, string def) {
+        string prefix = key + "=";
+        int n = content.Length;
+        int pl = prefix.Length;
+        int i = 0;
+        while (i < n) {
+            bool atLineStart = (i == 0) || (content.Substring(i - 1, 1) == "\n");
+            if (atLineStart && i + pl <= n && content.Substring(i, pl) == prefix) {
+                int j = i + pl;
+                string val = "";
+                while (j < n) {
+                    string ch = content.Substring(j, 1);
+                    if (ch == "\n" || ch == "\r") { break; }
+                    val = val + ch;
+                    j = j + 1;
+                }
+                return val;
+            }
+            i = i + 1;
+        }
+        return def;
+    }
+
+    /// Recursively copies a template's files (skipping its manifest) into dst.
+    static void CopyTree(string srcDir, string dstDir) {
+        Directory.CreateDirectory(dstDir);
+        List<string> files = Directory.GetFiles(srcDir);
+        int i = 0;
+        while (i < files.Count) {
+            string fn = files[i];
+            if (fn != "manifest.txt") {
+                File.WriteAllText(dstDir + "/" + fn, File.ReadAllText(srcDir + "/" + fn));
+            }
+            i = i + 1;
+        }
+        List<string> subs = Directory.GetDirectories(srcDir);
+        int j = 0;
+        while (j < subs.Count) {
+            IdeDemo.CopyTree(srcDir + "/" + subs[j], dstDir + "/" + subs[j]);
+            j = j + 1;
+        }
+    }
+
+    /// Saves the current project (its src/ tree + zan.proj) as a reusable custom
+    /// template under root/.templates/<tname>/ with a small manifest.
+    static void SaveAsTemplate(string root, string cat, string tname, List<string> log) {
+        string tdir = root + "/.templates/" + tname;
+        Directory.CreateDirectory(tdir);
+        if (Directory.Exists(root + "/src")) {
+            IdeDemo.CopyTree(root + "/src", tdir + "/src");
+        }
+        if (File.Exists(root + "/zan.proj")) {
+            File.WriteAllText(tdir + "/zan.proj", File.ReadAllText(root + "/zan.proj"));
+        }
+        File.WriteAllText(tdir + "/manifest.txt",
+            "name=" + tname + "\ncategory=" + cat + "\nicon=file\ndesc=Custom template from " + Path.GetFileName(root) + ".\n");
+        log.Add("> Saved current project as template '" + tname + "' (" + tdir + ").");
+    }
+
+    /// Scaffolds a new project from a template descriptor; returns its directory.
+    static string CreateProjectT(Tpl tpl, string parent, string name, List<string> log) {
         string dir = parent + "/" + name;
         Directory.CreateDirectory(dir);
         Directory.CreateDirectory(dir + "/src");
 
         string typeName = "console";
         string target = "exe";
-        if (kind == 0) {
+        string entry = "src/main.zan";
+        string kind = tpl.kind;
+
+        if (kind == "console") {
             File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleTemplate(name));
-        } else if (kind == 1) {
+        } else if (kind == "console-args") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleArgsTemplate(name));
+        } else if (kind == "console-multi") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleTemplate(name));
+            File.WriteAllText(dir + "/src/utils.zan",
+                "using System;\n\nclass Utils {\n    static int Add(int a, int b) { return a + b; }\n}\n");
+        } else if (kind == "dll-class") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", IdeDemo.LibraryTemplate(name));
+        } else if (kind == "dll-export") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", IdeDemo.DllExportTemplate(name));
+        } else if (kind == "gui-empty") {
             typeName = "gui"; target = "exe";
             File.WriteAllText(dir + "/src/main.zan", IdeDemo.GuiTemplate(name));
-        } else if (kind == 2) {
-            typeName = "library"; target = "dll";
-            File.WriteAllText(dir + "/src/lib.zan", IdeDemo.LibraryTemplate(name));
-        } else if (kind == 3) {
-            typeName = "executable"; target = "exe";
-            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleTemplate(name));
+        } else if (kind == "gui-components") {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.GuiComponentsTemplate(name));
+        } else if (kind == "webview") {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.WebViewTemplate(name));
+        } else if (kind == "server") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ServerHttpTemplate(name));
+        } else if (kind == "server-tcp") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ServerTcpTemplate(name));
+        } else if (kind == "custom") {
+            IdeDemo.CopyTree(tpl.src, dir);
         } else {
-            typeName = "empty"; target = "exe";
+            typeName = "empty";
         }
 
-        File.WriteAllText(dir + "/README.md", "# " + name + "\n\nGenerated by the Zan IDE.\n");
-        File.WriteAllText(dir + "/zan.proj",
-            "name = " + name + "\ntype = " + typeName + "\nentry = src/main.zan\ntarget = " + target + "\n");
-        log.Add("> Created " + typeName + " project at " + dir + ".");
+        if (!File.Exists(dir + "/README.md")) {
+            File.WriteAllText(dir + "/README.md",
+                "# " + name + "\n\nGenerated by the Zan IDE (template: " + tpl.name + ").\n");
+        }
+        if (kind != "custom") {
+            File.WriteAllText(dir + "/zan.proj",
+                "name = " + name + "\ntype = " + typeName + "\nentry = " + entry + "\ntarget = " + target + "\n");
+        }
+        log.Add("> Created " + typeName + " project at " + dir + " (template: " + tpl.name + ").");
         return dir;
     }
 
@@ -373,6 +610,30 @@ class IdeDemo {
 
     static string LibraryTemplate(string name) {
         return "using System;\n\n/// " + name + " library.\nclass " + name + " {\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string ConsoleArgsTemplate(string name) {
+        return "using System;\n\nclass Program {\n    static void Main() {\n        // TODO: read and parse command-line arguments here.\n        Console.WriteLine(\"" + name + ": pass arguments on the command line\");\n    }\n}\n";
+    }
+
+    static string DllExportTemplate(string name) {
+        return "using System;\n\n/// Functions exported from this library for use by other programs.\nclass " + name + " {\n    static int Add(int a, int b) { return a + b; }\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string GuiComponentsTemplate(string name) {
+        return "using System;\nusing Gui;\nusing Gui.Widget;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 900, 640);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            Canvas c = app.canvas;\n            int w = c.Width();\n            int h = c.Height();\n            int top = app.titlebarH;\n            Rect box = Panel.Section(app, 20, top + 20, w - 40, h - top - 40, \"" + name + "\");\n            c.DrawText(box.x + 12, box.y + 12, \"Build your UI from Gui components here.\", app.theme.textPrimary, app.theme.fontSizeMedium);\n            app.RenderChrome(\"" + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string WebViewTemplate(string name) {
+        return "using System;\nusing Gui;\n\n// WebView window skeleton. Hosting real web content needs a WebView2\n// runtime binding; this placeholder window stands in until that lands.\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 1000, 700);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            app.RenderChrome(\"WebView: " + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string ServerHttpTemplate(string name) {
+        return "using System;\n\n// HTTP server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " listening on http://localhost:8080\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
+    }
+
+    static string ServerTcpTemplate(string name) {
+        return "using System;\n\n// TCP echo server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " TCP echo server on :9000\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
     }
 
     static string FileTemplateBody(int kind, string name) {
