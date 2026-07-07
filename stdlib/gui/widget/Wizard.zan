@@ -1,0 +1,138 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// Renders the full contents of a floating "wizard" child window: a title bar
+/// with a close button, a selectable template list on the left, a name (and
+/// optional location) field on the right, a live description of the selected
+/// template, and Create / Cancel buttons.
+///
+/// Unlike Modal/Dialog (which draw an overlay inside the main window), Wizard is
+/// meant to fill a REAL secondary top-level window that the user can drag
+/// anywhere on the desktop — the caller owns that window's App and event loop
+/// and simply calls Wizard.Render(childApp, ...) each frame.
+///
+/// Returns 0 none, 1 create, 2 cancel/close.
+/// </summary>
+class Wizard {
+    static int Render(App app, string title, List<string> names, List<string> icons,
+                      List<string> descs, SignalInt sel, Input nameInput, Input locInput,
+                      bool showLoc) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+
+        c.FillRect(0, 0, W, H, t.bgPrimary);
+
+        int barH = app.titlebarH;
+        if (barH < app.Scale(32)) { barH = app.Scale(32); }
+        c.FillRect(0, 0, W, barH, t.bgSecondary);
+        int titleY = (barH - Canvas.FontHeight(t.fontSizeLarge)) / 2;
+        c.DrawText(app.Scale(16), titleY, title, t.textPrimary, t.fontSizeLarge);
+        c.FillRect(0, barH, W, 1, t.divider);
+
+        int result = 0;
+
+        // Close button (top-right, within the runtime's client caption region).
+        int closeId = app.focus.AllocId();
+        int cbw = app.Scale(44);
+        int closeX = W - cbw;
+        bool ch = app.focus.IsHovered(closeId);
+        if (ch) { c.FillRect(closeX, 0, cbw, barH, t.error); }
+        Icon.DrawCenteredIn(c, "close", closeX, 0, cbw, barH, t.iconSizeSmall, t.textPrimary);
+        app.hitTester.Register(HitRegion.Create(closeId, closeX, 0, cbw, barH, 0));
+        if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            result = 2;
+        }
+
+        int pad = app.Scale(18);
+        int contentY = barH + pad;
+
+        int listW = app.Scale(230);
+        int listH = H - contentY - app.Scale(74);
+        Wizard.RenderList(app, pad, contentY, listW, listH, names, icons, sel);
+
+        int fx = pad + listW + pad;
+        int fw = W - pad - fx;
+        int fy = contentY;
+
+        c.DrawText(fx, fy, "Name", t.textSecondary, t.fontSizeSmall);
+        nameInput.Render(app, fx, fy + app.Scale(20), fw, t.heightMedium);
+        int ny = fy + app.Scale(20) + t.heightMedium + app.Scale(14);
+
+        if (showLoc) {
+            c.DrawText(fx, ny, "Location", t.textSecondary, t.fontSizeSmall);
+            locInput.Render(app, fx, ny + app.Scale(20), fw, t.heightMedium);
+            ny = ny + app.Scale(20) + t.heightMedium + app.Scale(14);
+        }
+
+        int s = sel.Get();
+        if (s >= 0 && s < descs.Count) {
+            c.DrawText(fx, ny, descs[s], t.textTertiary, t.fontSizeSmall);
+        }
+
+        int bw = app.Scale(104);
+        int by = H - t.heightMedium - pad;
+        int okX = W - pad - bw;
+        int cancelX = okX - app.Scale(12) - bw;
+
+        int cancelId = Button.Create("Cancel").Render(app, cancelX, by, bw);
+        if (Button.WasClicked(app, cancelId)) { result = 2; }
+        int okId = Button.Primary("Create").Render(app, okX, by, bw);
+        if (Button.WasClicked(app, okId)) { result = 1; }
+
+        return result;
+    }
+
+    /// A vertical list of selectable template rows (icon + label), bound to a
+    /// SignalInt selection. Reusable by any picker-style window.
+    static void RenderList(App app, int x, int y, int w, int h, List<string> names,
+                           List<string> icons, SignalInt sel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgSecondary);
+
+        int rowH = app.Scale(42);
+        int n = names.Count;
+        int firstId = app.focus.AllocId();
+        int i = 1;
+        while (i < n) { app.focus.AllocId(); i = i + 1; }
+
+        int selv = sel.Get();
+        int glyph = t.fontSizeLarge;
+        int k = 0;
+        while (k < n) {
+            int id = firstId + k;
+            int rowY = y + k * rowH;
+            bool hovered = app.focus.IsHovered(id);
+            bool active = k == selv;
+            if (active) {
+                c.FillRect(x, rowY, w, rowH, t.bgActive);
+                c.FillRect(x, rowY, app.Scale(3), rowH, t.primary);
+            } else if (hovered) {
+                c.FillRect(x, rowY, w, rowH, t.bgHover);
+            }
+            int iconColor = t.textSecondary;
+            int textColor = t.textPrimary;
+            if (active) { iconColor = t.primary; textColor = t.primary; }
+            Icon.DrawCenteredIn(c, icons[k], x + t.paddingMedium, rowY, glyph, rowH, glyph, iconColor);
+            int textX = x + t.paddingMedium + glyph + t.gapMedium;
+            int textY = rowY + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.DrawText(textX, textY, names[k], textColor, t.fontSizeMedium);
+            app.hitTester.Register(HitRegion.Create(id, x, rowY, w, rowH, 0));
+            k = k + 1;
+        }
+
+        if (app.window.EventKind() == 3) {
+            int hitv = app.hitTester.HitTest(app.mouseX, app.mouseY);
+            int idx = hitv - firstId;
+            if (idx >= 0 && idx < n) {
+                sel.Set(idx);
+                app.RequestRedraw();
+            }
+        }
+    }
+}

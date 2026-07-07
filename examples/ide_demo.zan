@@ -73,7 +73,11 @@ class IdeDemo {
         fNames.Add("Empty File");     fIcons.Add("file");        fDescs.Add("A blank .zan file.");
 
         // ---- Dialog state ----
-        SignalInt modal = SignalInt.Create(0);     // 0 none, 1 new-project, 2 new-file
+        // The New Project / New File wizards are REAL secondary top-level windows
+        // (draggable anywhere on the desktop), driven from this same event pump.
+        // dlg is null when no wizard is open; dlgMode is 1=new-project, 2=new-file.
+        App dlg = null;
+        int dlgMode = 0;
         SignalInt pSel = SignalInt.Create(0);
         SignalInt fSel = SignalInt.Create(0);
         Input pNameInput = Input.Bind(SignalString.Create("NewProject"), "project name");
@@ -85,63 +89,84 @@ class IdeDemo {
         SignalInt treeSel = SignalInt.Create(-1);
         int lastTreeSel = -1;
 
+        int lastPresent = 0;
         while (app.isRunning) {
-            if (!app.ProcessEvent()) { break; }
-            if (!app.needsRedraw) { continue; }
+            // One shared event pump drives BOTH the main window and any open
+            // wizard child window. Poll (to keep animating) when either needs a
+            // repaint; otherwise block until the OS delivers an event.
+            bool want = app.needsRedraw;
+            if (dlg != null) {
+                if (dlg.needsRedraw) { want = true; }
+            }
+            int r;
+            if (want) {
+                int since = Window.GetTickMs() - lastPresent;
+                if (lastPresent > 0 && since < 16) { Window.SleepMs(16 - since); }
+                r = app.window.PollEvent();
+            } else {
+                r = app.window.WaitEvent();
+            }
+            if (r < 0) { break; }
 
-            app.BeginFrame();
-            Canvas c = app.canvas;
-            Theme t = app.theme;
-            int W = c.Width();
-            int H = c.Height();
-            int top = app.titlebarH;
-            int ribbonH = Ribbon.Height(app);
-            bool modalOpen = modal.Get() != 0;
+            int evh = Window.EventHwnd();
+            int kind = app.window.EventKind();
 
-            int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
-            if (!modalOpen) {
+            if (kind == 8) {
+                // Close: only the main window quits the app; a wizard window that
+                // closes simply dismisses the wizard.
+                if (evh == app.WindowHandle()) { break; }
+                dlg = null;
+                dlgMode = 0;
+                app.RequestRedraw();
+            } else {
+                app.ApplyEvent(evh);
+                if (dlg != null) { dlg.ApplyEvent(evh); }
+            }
+
+            // ---------------- main IDE window ----------------
+            if (app.needsRedraw) {
+                app.BeginFrame();
+                Canvas c = app.canvas;
+                Theme t = app.theme;
+                int W = c.Width();
+                int H = c.Height();
+                int top = app.titlebarH;
+                int ribbonH = Ribbon.Height(app);
+
+                int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
                 if (rc == 0) {
+                    dlg = IdeDemo.OpenWizard("New Project", pSel, pNameInput, "NewProject");
+                    dlgMode = 1;
                     pLocInput.SetText(Path.GetDirectoryName(root));
-                    pSel.Set(0);
-                    modal.Set(1);
-                    app.RequestRedraw();
                 } else if (rc == 1) {
-                    fSel.Set(0);
-                    modal.Set(2);
-                    app.RequestRedraw();
+                    dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
+                    dlgMode = 2;
                 } else if (rc == 2) {
                     log.Add("> Open: click a file in the Explorer to open it.");
                     rescan = true;
-                    app.RequestRedraw();
                 } else if (rc == 3) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     rescan = true;
-                    app.RequestRedraw();
                 } else if (rc == 4) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     IdeDemo.RunActive(tabPaths, activeTab, root, log);
-                    app.RequestRedraw();
                 } else if (rc == 5) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     IdeDemo.BuildActive(tabPaths, activeTab, root, log);
-                    app.RequestRedraw();
                 } else if (rc == 6) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     IdeDemo.PublishActive(tabNames, tabPaths, activeTab, root, log);
-                    app.RequestRedraw();
                 }
-            }
 
-            Rect area = Rect.Create(0, top + ribbonH, W, H - top - ribbonH);
-            Split cols = Split.Vertical(app, area, treeW, app.Scale(170), app.Scale(440));
+                Rect area = Rect.Create(0, top + ribbonH, W, H - top - ribbonH);
+                Split cols = Split.Vertical(app, area, treeW, app.Scale(170), app.Scale(440));
 
-            Rect tr = cols.first;
-            c.FillRect(tr.x, tr.y, tr.width, tr.height, t.bgTertiary);
-            c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, "EXPLORER", t.textTertiary, t.fontSizeSmall);
-            Rect treeArea = Rect.Create(tr.x, tr.y + app.Scale(30), tr.width, tr.height - app.Scale(30));
-            TreeView.Render(app, treeArea, tree, treeSel, 0);
+                Rect tr = cols.first;
+                c.FillRect(tr.x, tr.y, tr.width, tr.height, t.bgTertiary);
+                c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, "EXPLORER", t.textTertiary, t.fontSizeSmall);
+                Rect treeArea = Rect.Create(tr.x, tr.y + app.Scale(30), tr.width, tr.height - app.Scale(30));
+                TreeView.Render(app, treeArea, tree, treeSel, 0);
 
-            if (!modalOpen) {
                 int sel = treeSel.Get();
                 if (sel != lastTreeSel) {
                     lastTreeSel = sel;
@@ -150,22 +175,18 @@ class IdeDemo {
                         if (!node.isDir) {
                             IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
                             log.Add("> Opened " + node.path + ".");
-                            app.RequestRedraw();
                         }
                     }
                 }
-            }
 
-            Split rows = Split.Horizontal(app, cols.second, editorAreaH, app.Scale(140), app.Scale(90));
-            Rect ea = rows.first;
+                Split rows = Split.Horizontal(app, cols.second, editorAreaH, app.Scale(140), app.Scale(90));
+                Rect ea = rows.first;
 
-            int tabH = TabView.Height(app);
-            TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
-            if (!modalOpen) {
+                int tabH = TabView.Height(app);
+                TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
                 if (hit.action == 3) {
-                    fSel.Set(0);
-                    modal.Set(2);
-                    app.RequestRedraw();
+                    dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
+                    dlgMode = 2;
                 } else if (hit.action == 2) {
                     if (tabNames.Count > 1) {
                         tabNames.RemoveAt(hit.index);
@@ -177,72 +198,79 @@ class IdeDemo {
                         if (a < 0) { a = 0; }
                         activeTab.Set(a);
                         lastActive = 0 - 1;
-                        app.RequestRedraw();
                     }
                 } else if (hit.action == 1) {
                     activeTab.Set(hit.index);
-                    app.RequestRedraw();
                 }
+
+                int act = activeTab.Get();
+                if (act != lastActive) {
+                    if (lastActive >= 0 && lastActive < tabBodies.Count) {
+                        tabBodies[lastActive] = editor.GetText();
+                    }
+                    if (act >= 0 && act < tabBodies.Count) {
+                        editor.LoadText(tabBodies[act]);
+                    }
+                    lastActive = act;
+                }
+
+                Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
+                editor.Render(app, edRect);
+
+                Rect orr = rows.second;
+                Rect oi = Panel.Section(app, orr.x, orr.y, orr.width, orr.height, "Output");
+                IdeDemo.RenderLog(app, oi, log);
+
+                app.RenderChrome("Zan IDE  —  " + root);
+                app.PresentFrame();
+                lastPresent = Window.GetTickMs();
             }
 
-            int act = activeTab.Get();
-            if (act != lastActive) {
-                if (lastActive >= 0 && lastActive < tabBodies.Count) {
-                    tabBodies[lastActive] = editor.GetText();
-                }
-                if (act >= 0 && act < tabBodies.Count) {
-                    editor.LoadText(tabBodies[act]);
-                }
-                lastActive = act;
-            }
+            // ---------------- wizard child window ----------------
+            if (dlg != null) {
+                if (dlg.needsRedraw) {
+                    dlg.BeginFrame();
+                    int action = 0;
+                    if (dlgMode == 1) {
+                        action = Wizard.Render(dlg, "New Project", pNames, pIcons, pDescs, pSel,
+                                               pNameInput, pLocInput, true);
+                    } else {
+                        action = Wizard.Render(dlg, "New File", fNames, fIcons, fDescs, fSel,
+                                               fNameInput, fNameInput, false);
+                    }
+                    dlg.PresentFrame();
+                    lastPresent = Window.GetTickMs();
 
-            Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
-            editor.Render(app, edRect);
-
-            Rect orr = rows.second;
-            Rect oi = Panel.Section(app, orr.x, orr.y, orr.width, orr.height, "Output");
-            IdeDemo.RenderLog(app, oi, log);
-
-            // ---- Modal wizards (drawn on top of a dimming overlay) ----
-            if (modal.Get() == 1) {
-                int pa = IdeDemo.RenderTemplateDialog(app, "New Project", pNames, pIcons, pDescs, pSel,
-                                                      pNameInput, pLocInput, true);
-                if (pa == 1) {
-                    string parent = pLocInput.GetText();
-                    string name = pNameInput.GetText();
-                    string newDir = IdeDemo.CreateProject(pSel.Get(), parent, name, log);
-                    root = newDir;
-                    tabNames = new List<string>();
-                    tabBodies = new List<string>();
-                    tabPaths = new List<string>();
-                    activeTab.Set(0);
-                    lastActive = 0 - 1;
-                    IdeDemo.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
-                    rescan = true;
-                    modal.Set(0);
-                    app.RequestRedraw();
-                } else if (pa == 2) {
-                    modal.Set(0);
-                    app.RequestRedraw();
-                }
-            } else if (modal.Get() == 2) {
-                int fa = IdeDemo.RenderTemplateDialog(app, "New File", fNames, fIcons, fDescs, fSel,
-                                                      fNameInput, fNameInput, false);
-                if (fa == 1) {
-                    string name = fNameInput.GetText();
-                    string p = IdeDemo.CreateFile(fSel.Get(), root, name, log);
-                    IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
-                    rescan = true;
-                    modal.Set(0);
-                    app.RequestRedraw();
-                } else if (fa == 2) {
-                    modal.Set(0);
-                    app.RequestRedraw();
+                    if (action == 1) {
+                        if (dlgMode == 1) {
+                            string parent = pLocInput.GetText();
+                            string name = pNameInput.GetText();
+                            string newDir = IdeDemo.CreateProject(pSel.Get(), parent, name, log);
+                            root = newDir;
+                            tabNames = new List<string>();
+                            tabBodies = new List<string>();
+                            tabPaths = new List<string>();
+                            activeTab.Set(0);
+                            lastActive = 0 - 1;
+                            IdeDemo.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                        } else {
+                            string name = fNameInput.GetText();
+                            string p = IdeDemo.CreateFile(fSel.Get(), root, name, log);
+                            IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
+                        }
+                        rescan = true;
+                        dlg.window.Close();
+                        dlg = null;
+                        dlgMode = 0;
+                        app.RequestRedraw();
+                    } else if (action == 2) {
+                        dlg.window.Close();
+                        dlg = null;
+                        dlgMode = 0;
+                        app.RequestRedraw();
+                    }
                 }
             }
-
-            app.RenderChrome("Zan IDE  —  " + root);
-            app.PresentFrame();
 
             if (rescan) {
                 rescan = false;
@@ -251,6 +279,16 @@ class IdeDemo {
                 lastTreeSel = -1;
             }
         }
+    }
+
+    /// Spawns a fresh wizard child window (a real draggable top-level window),
+    /// resetting the selection and name field, and returns its App.
+    static App OpenWizard(string title, SignalInt sel, Input nameInput, string defName) {
+        App w = App.CreateDark(title, 720, 470);
+        w.Show();
+        sel.Set(0);
+        nameInput.SetText(defName);
+        return w;
     }
 
     // ---- workspace / scaffolding ----

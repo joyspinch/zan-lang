@@ -1,5 +1,12 @@
 $ErrorActionPreference = "Stop"
 Set-Location 'd:\project\zan-lang'
+
+Write-Output "[0/2] Rebuilding native GUI runtime (multi-window)..."
+clang -O2 -DZAN_GUI_STATIC -c src\runtime\gui_runtime.c -o build\zan_gui_static.obj
+if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
+llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
+
 $files = @()
 $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
 $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName

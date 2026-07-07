@@ -658,6 +658,10 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box, i64 color, 
  * ======================================================================== */
 
 static HWND g_main_hwnd = NULL;
+/* Source window of the most recently reported event, so an app that owns more
+ * than one top-level window (e.g. the IDE with a floating dialog) can route the
+ * event to the right window. Set at the top of the window procedure. */
+static HWND g_event_hwnd = NULL;
 static int g_pending_event[8]; /* kind, x, y, button, keycode, modifiers, 0, 0 */
 static int g_has_event = 0;
 static int g_window_width = 0, g_window_height = 0;
@@ -707,11 +711,14 @@ static int g_btn_w = 46;
 static int g_caption_btn_count = 5;
 
 static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    g_event_hwnd = hwnd;
     switch (msg) {
     case WM_DESTROY:
         g_pending_event[0] = 8;
         g_has_event = 1;
-        PostQuitMessage(0);
+        /* Only tear the whole app down when the primary window closes; a
+         * secondary window (dialog) just reports kind 8 for its own hwnd. */
+        if (hwnd == g_main_hwnd) { PostQuitMessage(0); }
         return 0;
     case WM_SIZE:
         g_window_width = LOWORD(lp);
@@ -907,7 +914,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         NULL, NULL, GetModuleHandleW(NULL), NULL
     );
     free(wtitle);
-    g_main_hwnd = hwnd;
+    if (!g_main_hwnd) { g_main_hwnd = hwnd; }
     /* Restore the system drop shadow on the borderless window. Extending the
      * DWM frame by a 1px sheet re-enables the shadow + rounded corners while
      * WM_NCCALCSIZE still hides the standard frame. */
@@ -1009,6 +1016,22 @@ EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event[5]; }
 
 EXPORT i64 zan_gui_window_width(void)  { return g_window_width; }
 EXPORT i64 zan_gui_window_height(void) { return g_window_height; }
+
+EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(intptr_t)g_event_hwnd; }
+
+EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    RECT rc;
+    if (!hwnd || !GetClientRect(hwnd, &rc)) { return 0; }
+    return rc.right - rc.left;
+}
+
+EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    RECT rc;
+    if (!hwnd || !GetClientRect(hwnd, &rc)) { return 0; }
+    return rc.bottom - rc.top;
+}
 
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
@@ -1229,6 +1252,10 @@ EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event_linux[5]; }
 
 EXPORT i64 zan_gui_window_width(void)  { return g_win_w; }
 EXPORT i64 zan_gui_window_height(void) { return g_win_h; }
+
+EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(intptr_t)g_x11_window; }
+EXPORT i64 zan_gui_client_width(i64 hwnd_val)  { (void)hwnd_val; return g_win_w; }
+EXPORT i64 zan_gui_client_height(i64 hwnd_val) { (void)hwnd_val; return g_win_h; }
 
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     if (!g_display) return 1;
@@ -1459,6 +1486,9 @@ EXPORT i64 zan_gui_event_keycode(void) { return 0; }
 EXPORT i64 zan_gui_event_mods(void) { return 0; }
 EXPORT i64 zan_gui_window_width(void) { return 0; }
 EXPORT i64 zan_gui_window_height(void) { return 0; }
+EXPORT i64 zan_gui_event_hwnd(void) { return 0; }
+EXPORT i64 zan_gui_client_width(i64 h) { (void)h; return 0; }
+EXPORT i64 zan_gui_client_height(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_present(i64 h, i64 s) { (void)h;(void)s; return 1; }
 EXPORT i64 zan_gui_set_title(i64 h, const char *t) { (void)h;(void)t; return 0; }
 EXPORT i64 zan_gui_set_cursor(i64 c) { (void)c; return 0; }
