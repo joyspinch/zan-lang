@@ -21,6 +21,7 @@
 
 #include "src/runtime/rt_sched.h"
 #include "src/runtime/rt_io.h"
+#include "src/runtime/rt_co.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -359,6 +360,115 @@ static void test_connect_refused(int port) {
 
 /* ================= main ================= */
 
+/* ================= stackless-coroutine state-machine driver =================
+ *
+ * Hand-written frames + step functions that mirror EXACTLY what the compiler's
+ * CPS lowering emits (see docs/ASYNC_CPS_DESIGN.md). This validates the rt_co
+ * ready-queue and the await/complete handshake independently of codegen, so the
+ * runtime ABI is proven before irgen targets it.
+ *
+ * Models:
+ *   async int Add(int a, int b)  { return a + b; }              // no await
+ *   async int Compute(int x)     { int r = await Add(x, x);     // chained
+ *                                  return await Add(r, 100); }
+ */
+
+/* Fixed frame header the await protocol relies on (offsets known to codegen). */
+typedef struct co_hdr {
+    int32_t       state;        /* 0 start, k resume point, -1 done */
+    int32_t       done;         /* 1 once result is valid */
+    void         *awaiter;      /* frame blocked on this one */
+    zan_co_step_t awaiter_step; /* awaiter's resume fn */
+    int64_t       result;       /* return value slot */
+} co_hdr_t;
+
+typedef struct { co_hdr_t h; int64_t a, b; } add_frame_t;
+typedef struct { co_hdr_t h; int64_t x, r; void *sub; } compute_frame_t;
+
+static void add_resume(void *fp);
+static void compute_resume(void *fp);
+
+/* Complete `self`: publish result and re-schedule whoever awaited it. */
+static void co_complete(co_hdr_t *self, int64_t result) {
+    self->result = result;
+    self->done   = 1;
+    self->state  = -1;
+    if (self->awaiter) zan_co_ready(self->awaiter, self->awaiter_step);
+}
+
+/* Ramp: allocate + init a frame, but do not run the body yet. */
+static void *add_ramp(int64_t a, int64_t b) {
+    add_frame_t *f = (add_frame_t *)calloc(1, sizeof(*f));
+    f->a = a; f->b = b;
+    return f;
+}
+static void add_resume(void *fp) {
+    add_frame_t *f = (add_frame_t *)fp;
+    switch (f->h.state) {
+    case 0:
+        co_complete(&f->h, f->a + f->b);
+        return;
+    default:
+        return;
+    }
+}
+
+static void *compute_ramp(int64_t x) {
+    compute_frame_t *f = (compute_frame_t *)calloc(1, sizeof(*f));
+    f->x = x;
+    return f;
+}
+static void compute_resume(void *fp) {
+    compute_frame_t *f = (compute_frame_t *)fp;
+    switch (f->h.state) {
+    case 0: {
+        /* r = await Add(x, x); */
+        void *sub = add_ramp(f->x, f->x);
+        co_hdr_t *sh = (co_hdr_t *)sub;
+        sh->awaiter = f; sh->awaiter_step = compute_resume;
+        f->sub = sub;
+        zan_co_ready(sub, add_resume);
+        f->h.state = 1;
+        return;                     /* SUSPEND */
+    }
+    case 1: {
+        add_frame_t *sub = (add_frame_t *)f->sub;
+        f->r = sub->h.result;
+        free(sub);
+        /* return await Add(r, 100); */
+        void *sub2 = add_ramp(f->r, 100);
+        co_hdr_t *sh = (co_hdr_t *)sub2;
+        sh->awaiter = f; sh->awaiter_step = compute_resume;
+        f->sub = sub2;
+        zan_co_ready(sub2, add_resume);
+        f->h.state = 2;
+        return;                     /* SUSPEND */
+    }
+    case 2: {
+        add_frame_t *sub = (add_frame_t *)f->sub;
+        int64_t r2 = sub->h.result;
+        free(sub);
+        co_complete(&f->h, r2);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+static void test_co_statemachine(void) {
+    banner("co state machine (chained await)");
+    zan_co_sched_init();
+    compute_frame_t *root = (compute_frame_t *)compute_ramp(21);
+    zan_co_ready(root, compute_resume);
+    zan_co_sched_run();
+    CHECK(root->h.done == 1, "root not completed");
+    CHECK(root->h.result == 142, "expected 142 (21+21 then +100), got %lld",
+          (long long)root->h.result);
+    CHECK(zan_co_pending() == 0, "ready queue not drained: %zu", zan_co_pending());
+    free(root);
+}
+
 int main(void) {
 #if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
@@ -367,6 +477,7 @@ int main(void) {
 
     test_scheduler();
     test_timer();
+    test_co_statemachine();
     test_io_echo(19801);
     test_io_concurrent(19802);
     test_connect_refused(19899);
