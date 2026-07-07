@@ -21,6 +21,12 @@ class CodeEditor {
     int scrollLine;
     int lastId;
 
+    // ---- autocomplete popup state ----
+    List<string> acItems;   // current candidate list (filtered by prefix)
+    int acSel;              // selected candidate index
+    bool acActive;          // popup currently shown
+    int acStart;            // column where the in-progress word begins
+
     static CodeEditor Create() {
         CodeEditor e = new CodeEditor();
         e.lines = new List<string>();
@@ -29,6 +35,10 @@ class CodeEditor {
         e.curCol = 0;
         e.scrollLine = 0;
         e.lastId = -1;
+        e.acItems = new List<string>();
+        e.acSel = 0;
+        e.acActive = false;
+        e.acStart = 0;
         return e;
     }
 
@@ -163,35 +173,160 @@ class CodeEditor {
         }
     }
 
+    // ---- autocomplete ----
+
+    /// True when list `xs` already contains `v`.
+    static bool Has(List<string> xs, string v) {
+        int i = 0;
+        while (i < xs.Count) {
+            if (xs[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `s` begins with `pre`.
+    static bool StartsWithP(string s, string pre) {
+        if (pre.Length > s.Length) { return false; }
+        return s.Substring(0, pre.Length) == pre;
+    }
+
+    /// Appends the language keywords to `outk`.
+    static void KeywordList(List<string> outk) {
+        string kws = "using namespace class struct enum interface static void int string bool float double char long new return if else while for foreach in break continue true false null this base public private protected override virtual abstract const readonly var switch case default try catch finally throw";
+        string cur = "";
+        int i = 0;
+        int n = kws.Length;
+        while (i < n) {
+            string ch = kws.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0) { outk.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { outk.Add(cur); }
+    }
+
+    /// Collects unique identifier tokens (length >= 2) appearing anywhere in the
+    /// buffer, so the editor can complete symbols the user has already typed.
+    static void CollectWords(List<string> ls, List<string> outw) {
+        string idstart = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < ls.Count) {
+            string line = ls[li];
+            int n = line.Length;
+            int i = 0;
+            while (i < n) {
+                string ch = line.Substring(i, 1);
+                if (CodeEditor.InSet(idstart, ch)) {
+                    int j = i;
+                    string w = "";
+                    while (j < n) {
+                        string cj = line.Substring(j, 1);
+                        if (CodeEditor.InSet(idrest, cj)) { w = w + cj; j = j + 1; }
+                        else { break; }
+                    }
+                    if (w.Length >= 2 && !CodeEditor.Has(outw, w)) { outw.Add(w); }
+                    i = j;
+                } else {
+                    i = i + 1;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// Recomputes the completion popup from the word immediately left of the
+    /// cursor; closes the popup when there is no prefix or no candidate.
+    void UpdateCompletion() {
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string ln = lines[curLine];
+        int st = curCol;
+        while (st > 0) {
+            string ch = ln.Substring(st - 1, 1);
+            if (CodeEditor.InSet(idrest, ch)) { st = st - 1; }
+            else { break; }
+        }
+        acStart = st;
+        string prefix = ln.Substring(st, curCol - st);
+        acItems = new List<string>();
+        if (prefix.Length < 1) { acActive = false; return; }
+
+        List<string> cand = new List<string>();
+        CodeEditor.KeywordList(cand);
+        CodeEditor.CollectWords(lines, cand);
+        int i = 0;
+        while (i < cand.Count) {
+            string w = cand[i];
+            if (w != prefix && CodeEditor.StartsWithP(w, prefix) && !CodeEditor.Has(acItems, w)) {
+                acItems.Add(w);
+                if (acItems.Count >= 12) { i = cand.Count; }
+            }
+            i = i + 1;
+        }
+        if (acItems.Count > 0) { acActive = true; acSel = 0; }
+        else { acActive = false; }
+    }
+
+    /// Replaces the in-progress word with the selected candidate.
+    void AcceptCompletion() {
+        string ln = lines[curLine];
+        string chosen = acItems[acSel];
+        string left = Text.Left(ln, acStart);
+        string right = Text.Right(ln, curCol);
+        lines[curLine] = left + chosen + right;
+        curCol = acStart + chosen.Length;
+        acActive = false;
+    }
+
     void HandleInput(App app) {
         int kind = app.window.EventKind();
         if (kind == 6) {
             int code = app.window.EventKeyCode();
             if (code == 8) {
                 BackspaceEdit();
+                UpdateCompletion();
                 app.RequestRedraw();
             } else if (code == 13) {
-                NewLine();
+                if (acActive) { AcceptCompletion(); }
+                else { NewLine(); }
                 app.RequestRedraw();
             } else if (code == 9) {
-                InsertStr("    ");
+                if (acActive) { AcceptCompletion(); }
+                else { InsertStr("    "); }
+                app.RequestRedraw();
+            } else if (code == 27) {
+                acActive = false;
                 app.RequestRedraw();
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
                     InsertStr(ch);
+                    UpdateCompletion();
                     app.RequestRedraw();
                 }
             }
         } else if (kind == 4) {
             int kc = app.window.EventKeyCode();
-            if (kc == 37) { MoveLeft(); app.RequestRedraw(); }
-            else if (kc == 39) { MoveRight(); app.RequestRedraw(); }
+            if (acActive && kc == 38) {
+                acSel = acSel - 1;
+                if (acSel < 0) { acSel = acItems.Count - 1; }
+                app.RequestRedraw();
+            } else if (acActive && kc == 40) {
+                acSel = acSel + 1;
+                if (acSel >= acItems.Count) { acSel = 0; }
+                app.RequestRedraw();
+            } else if (kc == 27) { acActive = false; app.RequestRedraw(); }
+            else if (kc == 37) { acActive = false; MoveLeft(); app.RequestRedraw(); }
+            else if (kc == 39) { acActive = false; MoveRight(); app.RequestRedraw(); }
             else if (kc == 38) { MoveUp(); app.RequestRedraw(); }
             else if (kc == 40) { MoveDown(); app.RequestRedraw(); }
-            else if (kc == 36) { curCol = 0; app.RequestRedraw(); }
-            else if (kc == 35) { curCol = lines[curLine].Length; app.RequestRedraw(); }
-            else if (kc == 46) { DeleteEdit(); app.RequestRedraw(); }
+            else if (kc == 36) { curCol = 0; acActive = false; app.RequestRedraw(); }
+            else if (kc == 35) { curCol = lines[curLine].Length; acActive = false; app.RequestRedraw(); }
+            else if (kc == 46) { DeleteEdit(); acActive = false; app.RequestRedraw(); }
         }
     }
 
@@ -399,6 +534,45 @@ class CodeEditor {
             i = i + 1;
         }
 
+        // ---- autocomplete popup (drawn above the text, anchored at the word) ----
+        if (acActive && focused && acItems.Count > 0
+            && curLine >= scrollLine && curLine < scrollLine + visLines) {
+            int prow = curLine - scrollLine;
+            int pRowY = area.y + prow * lineH;
+            int px = textX + Canvas.MeasureText(Text.Left(lines[curLine], acStart), fontSize);
+            int shown = acItems.Count;
+            if (shown > 8) { shown = 8; }
+            int itemH = lineH;
+            int popH = shown * itemH + app.Scale(4);
+            int popW = app.Scale(120);
+            int k = 0;
+            while (k < acItems.Count) {
+                int wpx = Canvas.MeasureText(acItems[k], fontSize) + app.Scale(20);
+                if (wpx > popW) { popW = wpx; }
+                k = k + 1;
+            }
+            int popY = pRowY + lineH;
+            int first = 0;
+            if (acSel >= 8) { first = acSel - 7; }
+            c.FillRoundRect(px, popY, popW, popH, t.borderRadiusSmall, t.bgTertiary);
+            c.DrawRect(px, popY, popW, popH, t.borderPrimary, 1);
+            int r2 = 0;
+            while (r2 < shown) {
+                int idx = first + r2;
+                if (idx < acItems.Count) {
+                    int iy = popY + app.Scale(2) + r2 * itemH;
+                    int tcol = t.textPrimary;
+                    if (idx == acSel) {
+                        c.FillRect(px, iy, popW, itemH, t.primary);
+                        tcol = t.bgPrimary;
+                    }
+                    int ity = iy + (itemH - Canvas.FontHeight(fontSize)) / 2;
+                    c.DrawText(px + app.Scale(8), ity, acItems[idx], tcol, fontSize);
+                }
+                r2 = r2 + 1;
+            }
+        }
+
         app.hitTester.Register(HitRegion.Create(id, area.x, area.y, area.width, area.height, 1));
 
         if (app.window.EventKind() == 3) {
@@ -410,6 +584,7 @@ class CodeEditor {
                 if (clicked < 0) { clicked = 0; }
                 curLine = clicked;
                 curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+                acActive = false;
                 app.RequestRedraw();
             }
         }
