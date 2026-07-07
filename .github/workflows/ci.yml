@@ -105,3 +105,23 @@ jobs:
     - name: Check formatting
       run: |
         find src/ -name '*.c' -o -name '*.h' | xargs clang-format --dry-run --Werror || true
+
+  # Fuzz the lexer + parser front-end with libFuzzer under ASan + UBSan. Runs a
+  # short bounded budget on every push so malformed-input crashes / OOB reads /
+  # UB regress loudly. The front-end (arena+diag+lexer+parser+ast) is a closed
+  # link set — no LLVM needed, so this stays fast.
+  fuzz:
+    name: fuzz (lexer+parser)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build & run libFuzzer
+      run: |
+        clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+          -Isrc/compiler \
+          src/compiler/arena.c src/compiler/diag.c src/compiler/lexer.c \
+          src/compiler/parser.c src/compiler/ast.c \
+          tests/fuzz/fuzz_parser.c -o fuzz_parser
+        mkdir -p corpus
+        cp tests/golden/cases/*.zan tests/diag/*.zan examples/*.zan corpus/ 2>/dev/null || true
+        ASAN_OPTIONS=detect_leaks=0 ./fuzz_parser -max_total_time=45 -print_final_stats=1 corpus
