@@ -4,6 +4,12 @@
  * Now integrates with rt_io for async IO multiplexing.
  */
 
+/* macOS gates the ucontext routines behind _XOPEN_SOURCE; it must be defined
+ * before any system header is pulled in (directly or transitively). */
+#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 700
+#endif
+
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601   /* Windows 7+: GetTickCount64, modern Fibers API */
 #endif
