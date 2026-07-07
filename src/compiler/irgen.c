@@ -180,8 +180,148 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef co_ready_args[] = { i8ptr, g->co_step_ptr };
     g->rt_co_ready_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_ready_args, 2, 0);
     g->rt_co_ready = LLVMAddFunction(g->mod, "zan_co_ready", g->rt_co_ready_type);
+    /* void zan_co_sched_init(void) / void zan_co_sched_run(void): root drive */
+    g->rt_co_sched_init_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    g->rt_co_sched_init = LLVMAddFunction(g->mod, "zan_co_sched_init", g->rt_co_sched_init_type);
+    g->rt_co_sched_run_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    g->rt_co_sched_run = LLVMAddFunction(g->mod, "zan_co_sched_run", g->rt_co_sched_run_type);
+
+    /* Emit the cooperative coroutine driver inline (the whole Zan runtime is
+     * emitted into the module, so produced programs are self-contained — see
+     * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
+     * malloc'd nodes {next, frame, step}; zan_co_ready appends, zan_co_sched_run
+     * drains, popping+freeing a node before invoking its step (which may itself
+     * enqueue). Semantically equivalent to src/runtime/rt_co.c. */
+    {
+        LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
+        LLVMTypeRef node_fields[] = { i8ptr /*next*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
+        LLVMTypeRef node_ty = LLVMStructCreateNamed(g->ctx, "zan.co.node");
+        LLVMStructSetBody(node_ty, node_fields, 3, 0);
+        LLVMValueRef g_head = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_head");
+        LLVMSetInitializer(g_head, LLVMConstNull(i8ptr));
+        LLVMSetLinkage(g_head, LLVMInternalLinkage);
+        LLVMValueRef g_tail = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_tail");
+        LLVMSetInitializer(g_tail, LLVMConstNull(i8ptr));
+        LLVMSetLinkage(g_tail, LLVMInternalLinkage);
+
+        /* void zan_co_sched_init(void): reset the queue to empty. */
+        {
+            LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_init, "entry");
+            LLVMPositionBuilderAtEnd(g->builder, bb);
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_head);
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_tail);
+            LLVMBuildRetVoid(g->builder);
+        }
+
+        /* void zan_co_ready(void* frame, step): if step, append a node. */
+        {
+            LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "entry");
+            LLVMBasicBlockRef cont  = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "cont");
+            LLVMBasicBlockRef empty = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "empty");
+            LLVMBasicBlockRef nonempty = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "append");
+            LLVMBasicBlockRef done  = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "done");
+            LLVMBasicBlockRef ret   = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "ret");
+            LLVMPositionBuilderAtEnd(g->builder, entry);
+            LLVMValueRef frame = LLVMGetParam(g->rt_co_ready, 0);
+            LLVMValueRef step  = LLVMGetParam(g->rt_co_ready, 1);
+            LLVMValueRef step_null = LLVMBuildICmp(g->builder, LLVMIntEQ, step,
+                LLVMConstNull(g->co_step_ptr), "step.null");
+            LLVMBuildCondBr(g->builder, step_null, ret, cont);
+
+            LLVMPositionBuilderAtEnd(g->builder, cont);
+            LLVMValueRef node = LLVMBuildCall2(g->builder, malloc_type, g->fn_malloc,
+                (LLVMValueRef[]){ LLVMSizeOf(node_ty) }, 1, "node");
+            LLVMValueRef nnext = LLVMBuildStructGEP2(g->builder, node_ty, node, 0, "n.next");
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), nnext);
+            LLVMValueRef nframe = LLVMBuildStructGEP2(g->builder, node_ty, node, 1, "n.frame");
+            LLVMBuildStore(g->builder, frame, nframe);
+            LLVMValueRef nstep = LLVMBuildStructGEP2(g->builder, node_ty, node, 2, "n.step");
+            LLVMBuildStore(g->builder, step, nstep);
+            LLVMValueRef tail = LLVMBuildLoad2(g->builder, i8ptr, g_tail, "tail");
+            LLVMValueRef is_empty = LLVMBuildICmp(g->builder, LLVMIntEQ, tail,
+                LLVMConstNull(i8ptr), "q.empty");
+            LLVMBuildCondBr(g->builder, is_empty, empty, nonempty);
+
+            LLVMPositionBuilderAtEnd(g->builder, empty);
+            LLVMBuildStore(g->builder, node, g_head);
+            LLVMBuildBr(g->builder, done);
+
+            LLVMPositionBuilderAtEnd(g->builder, nonempty);
+            LLVMValueRef tail_next = LLVMBuildStructGEP2(g->builder, node_ty, tail, 0, "tail.next");
+            LLVMBuildStore(g->builder, node, tail_next);
+            LLVMBuildBr(g->builder, done);
+
+            LLVMPositionBuilderAtEnd(g->builder, done);
+            LLVMBuildStore(g->builder, node, g_tail);
+            LLVMBuildBr(g->builder, ret);
+
+            LLVMPositionBuilderAtEnd(g->builder, ret);
+            LLVMBuildRetVoid(g->builder);
+        }
+
+        /* void zan_co_sched_run(void): drain the queue, invoking each step. */
+        {
+            LLVMBasicBlockRef entry_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "entry");
+            LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "loop");
+            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "body");
+            LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "last");
+            LLVMBasicBlockRef after_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after");
+            LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "exit");
+            LLVMPositionBuilderAtEnd(g->builder, entry_bb);
+            LLVMBuildBr(g->builder, head_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, head_bb);
+            LLVMValueRef head = LLVMBuildLoad2(g->builder, i8ptr, g_head, "head");
+            LLVMValueRef empty = LLVMBuildICmp(g->builder, LLVMIntEQ, head,
+                LLVMConstNull(i8ptr), "q.empty");
+            LLVMBuildCondBr(g->builder, empty, exit_bb, body_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, body_bb);
+            LLVMValueRef fr_ptr = LLVMBuildStructGEP2(g->builder, node_ty, head, 1, "n.frame");
+            LLVMValueRef fr = LLVMBuildLoad2(g->builder, i8ptr, fr_ptr, "frame");
+            LLVMValueRef st_ptr = LLVMBuildStructGEP2(g->builder, node_ty, head, 2, "n.step");
+            LLVMValueRef st = LLVMBuildLoad2(g->builder, g->co_step_ptr, st_ptr, "step");
+            LLVMValueRef nx_ptr = LLVMBuildStructGEP2(g->builder, node_ty, head, 0, "n.next");
+            LLVMValueRef nx = LLVMBuildLoad2(g->builder, i8ptr, nx_ptr, "next");
+            LLVMBuildStore(g->builder, nx, g_head);
+            LLVMValueRef is_last = LLVMBuildICmp(g->builder, LLVMIntEQ, nx,
+                LLVMConstNull(i8ptr), "is.last");
+            LLVMBuildCondBr(g->builder, is_last, last_bb, after_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, last_bb);
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_tail);
+            LLVMBuildBr(g->builder, after_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, after_bb);
+            LLVMBuildCall2(g->builder, free_type, g->fn_free,
+                (LLVMValueRef[]){ head }, 1, "");
+            LLVMBuildCall2(g->builder, g->co_step_type, st,
+                (LLVMValueRef[]){ fr }, 1, "");
+            LLVMBuildBr(g->builder, head_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, exit_bb);
+            LLVMBuildRetVoid(g->builder);
+        }
+        (void)voidt;
+    }
+    /* Shared frame header, identical prefix of every async frame, so the await
+     * protocol can touch a sub-frame's header fields through an i8* without
+     * knowing its concrete frame type (see ASYNC_FRAME_* indices). */
+    LLVMTypeRef co_hdr_fields[] = {
+        LLVMInt32TypeInContext(g->ctx), LLVMInt32TypeInContext(g->ctx),
+        i8ptr, g->co_step_ptr, i64
+    };
+    g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
+    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 5, 0);
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
+    g->current_async_resume_fn = NULL;
+    g->current_async_switch = NULL;
+    g->current_async_next_state = 1;
+    g->current_async_sub_base = 0;
+    g->current_async_sub_next = 0;
+    g->current_async_slots = NULL;
+    g->current_async_slot_count = 0;
 
     /* int strcmp(const char*, const char*) */
     LLVMTypeRef strcmp_args[] = { i8ptr, i8ptr };
@@ -734,6 +874,21 @@ static void emit_list_element_store(zan_irgen_t *g, LLVMValueRef arr_ptr,
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
+
+/* async/await CPS helpers (defined below; forward-declared for use in the
+ * AST_AWAIT_EXPR case of emit_expr). Frame header field indices are shared
+ * across every async frame (see docs/ASYNC_CPS_DESIGN.md). */
+enum {
+    ASYNC_FRAME_STATE = 0,        /* i32: 0=start, k=resume-after-await-k, -1=done */
+    ASYNC_FRAME_DONE = 1,         /* i32: 1 once result slot is valid */
+    ASYNC_FRAME_AWAITER = 2,      /* i8*: frame waiting on this one (or null) */
+    ASYNC_FRAME_AWAITER_STEP = 3, /* void(i8*)*: awaiter's resume fn (or null) */
+    ASYNC_FRAME_RESULT = 4,       /* i64: return value (scalars are i64 here) */
+    ASYNC_FRAME_FIRST_PARAM = 5
+};
+static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
+static void emit_async_save_slots(zan_irgen_t *g);
+static void emit_async_reload_slots(zan_irgen_t *g);
 
 /* Resolve the declared type of an `obj.field` member access so that element
  * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
@@ -4039,18 +4194,95 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_AWAIT_EXPR: {
-        /* await expr — evaluate the expression (which should return a Task).
-         * For now, evaluate synchronously (real thread-based tasks require
-         * async method transformation). Future: poll task.completed field
-         * and yield until ready. */
-        LLVMValueRef task_val = emit_expr(g, expr->await_expr.expr, locals);
-        /* If this is a pointer to a Task struct, load the result field.
-         * Otherwise just return the value synchronously. */
-        if (LLVMGetTypeKind(LLVMTypeOf(task_val)) == LLVMPointerTypeKind) {
-            LLVMValueRef task_ptr = LLVMBuildBitCast(g->builder, task_val,
+        /* await <call> — the awaited expression is a call to an async method's
+         * ramp, yielding an i8* task handle (heap frame). The sub's resume/step
+         * fn is `<ramp>$resume`, resolved from the call target's name. Two
+         * lowerings (see docs/ASYNC_CPS_DESIGN.md):
+         *   - inside an async body: register self as the sub's awaiter, schedule
+         *     the sub, SUSPEND (save live slots, state=k, ret void); a resume-k
+         *     block reloads slots and reads sub.result.
+         *   - at a non-async root (e.g. Main): drive the cooperative scheduler
+         *     synchronously (init/ready/run) and then read sub.result. */
+        LLVMValueRef sub = emit_expr(g, expr->await_expr.expr, locals);
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef hdr = g->co_header_type;
+
+        LLVMValueRef sub_resume = NULL;
+        if (LLVMIsACallInst(sub)) {
+            LLVMValueRef callee = LLVMGetCalledValue(sub);
+            if (callee) {
+                size_t nl = 0;
+                const char *cn = LLVMGetValueName2(callee, &nl);
+                if (cn && nl > 0 && nl < 240) {
+                    char rn[256];
+                    memcpy(rn, cn, nl);
+                    memcpy(rn + nl, "$resume", 8); /* includes NUL */
+                    sub_resume = LLVMGetNamedFunction(g->mod, rn);
+                }
+            }
+        }
+
+        if (sub_resume && LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
+            LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, i8ptr, "sub");
+
+            if (g->current_async_frame && g->current_async_switch) {
+                int k = g->current_async_next_state++;
+                int j = g->current_async_sub_next++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+
+                /* stash sub handle in a frame slot (survives the suspension) */
+                LLVMBuildStore(g->builder, sub_i8,
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        (unsigned)(g->current_async_sub_base + j), "sub.slot"));
+
+                /* sub.awaiter = self; sub.awaiter_step = Self$resume */
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, i8ptr, "self");
+                LLVMBuildStore(g->builder, self_i8,
+                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER, "sub.aw"));
+                LLVMBuildStore(g->builder, g->current_async_resume_fn,
+                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
+
+                /* schedule the sub, then SUSPEND self */
+                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
+                LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+                emit_async_save_slots(g);
+                LLVMBuildStore(g->builder, LLVMConstInt(i32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildRetVoid(g->builder);
+
+                /* resume-k: re-entered by the driver once the sub completes */
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(i32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                /* recompute the sub-slot GEP here (entry dominates rk; the
+                 * pre-suspend block does not). */
+                LLVMValueRef sub_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    (unsigned)(g->current_async_sub_base + j), "sub.slot2");
+                LLVMValueRef sub_rl = LLVMBuildLoad2(g->builder, i8ptr, sub_slot, "sub.rl");
+                LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_rl,
+                    ASYNC_FRAME_RESULT, "sub.result");
+                return LLVMBuildLoad2(g->builder, i64, rptr, "awres");
+            }
+
+            /* root drive (non-async caller) */
+            LLVMBuildCall2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
+            LLVMValueRef sched_args[] = { sub_i8, sub_resume };
+            LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+            LLVMBuildCall2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
+            LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
+                ASYNC_FRAME_RESULT, "sub.result");
+            return LLVMBuildLoad2(g->builder, i64, rptr, "awres");
+        }
+
+        /* Fallback: awaiting a legacy Task struct (busy-wait) or a plain value. */
+        if (LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
+            LLVMValueRef task_ptr = LLVMBuildBitCast(g->builder, sub,
                 LLVMPointerType(g->task_struct_type, 0), "taskp");
-            /* Busy-wait loop: while (!task.completed) { Sleep(1) } */
-            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMBasicBlockRef poll_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "aw.poll");
             LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "aw.done");
             LLVMBuildBr(g->builder, poll_bb);
@@ -4060,11 +4292,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef is_done = LLVMBuildICmp(g->builder, LLVMIntNE, comp, LLVMConstInt(i64, 0, 0), "done");
             LLVMBuildCondBr(g->builder, is_done, done_bb, poll_bb);
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
-            /* load result */
             LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, g->task_struct_type, task_ptr, 1, "resp");
             return LLVMBuildLoad2(g->builder, i64, res_ptr, "awres");
         }
-        return task_val;
+        return sub;
     }
 
     case AST_LAMBDA: {
@@ -4123,17 +4354,6 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 
 /* ---- async/await CPS lowering helpers ---- */
 
-/* Frame header field indices (see docs/ASYNC_CPS_DESIGN.md). Params/locals
- * follow the header starting at ASYNC_FRAME_FIRST_PARAM. */
-enum {
-    ASYNC_FRAME_STATE = 0,        /* i32: 0=start, k=resume-after-await-k, -1=done */
-    ASYNC_FRAME_DONE = 1,         /* i32: 1 once result slot is valid */
-    ASYNC_FRAME_AWAITER = 2,      /* i8*: frame waiting on this one (or null) */
-    ASYNC_FRAME_AWAITER_STEP = 3, /* void(i8*)*: awaiter's resume fn (or null) */
-    ASYNC_FRAME_RESULT = 4,       /* i64: return value (scalars are i64 here) */
-    ASYNC_FRAME_FIRST_PARAM = 5
-};
-
 /* Coerce an arbitrary scalar value to the i64 used by the frame result slot. */
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -4160,20 +4380,22 @@ static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 /* Emit the completion epilogue of an async $resume body: store the result,
- * mark the frame done, then `ret void` (the state machine has finished).
+ * mark the frame done, wake a waiting awaiter (if any), then `ret void`.
  * `result_i64` may be NULL for a void async fn. Assumes the builder is
  * positioned at a block without a terminator.
  *
- * S2 (skeleton) intentionally stops here: there are no awaiters yet, so the
- * awaiter-wake handshake (zan_co_ready(frame.awaiter, frame.awaiter_step)) is
- * deferred to S3 when the await protocol lands. Keeping it out now means an
- * async program is self-contained and links without the co runtime. The frame
- * header still reserves the awaiter/awaiter_step slots for that step. */
+ * The awaiter-wake handshake schedules the frame that awaited us: when a
+ * caller `await`s this task it stores itself + its own $resume into our
+ * awaiter/awaiter_step header slots (see the await protocol). On completion we
+ * re-enqueue that awaiter via zan_co_ready so the cooperative driver re-steps
+ * it and it can read our result. A root (non-async) driver leaves awaiter null
+ * and instead polls the result after zan_co_sched_run drains. */
 static void emit_async_complete(zan_irgen_t *g, LLVMValueRef result_i64) {
     LLVMValueRef frame = g->current_async_frame;
     LLVMTypeRef ft = g->current_async_frame_type;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 
     LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_RESULT, "fr.result");
@@ -4183,8 +4405,229 @@ static void emit_async_complete(zan_irgen_t *g, LLVMValueRef result_i64) {
     LLVMValueRef done_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_DONE, "fr.done");
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0), done_ptr);
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1),
+        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_STATE, "fr.state"));
 
+    /* if (awaiter != null) zan_co_ready(awaiter, awaiter_step); */
+    LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
+        ASYNC_FRAME_AWAITER, "fr.awaiter");
+    LLVMValueRef awaiter = LLVMBuildLoad2(g->builder, i8ptr, aw_ptr, "awaiter");
+    LLVMValueRef has_awaiter = LLVMBuildICmp(g->builder, LLVMIntNE, awaiter,
+        LLVMConstNull(i8ptr), "has.awaiter");
+    LLVMValueRef fn = g->current_fn;
+    LLVMBasicBlockRef wake_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.wake");
+    LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.ret");
+    LLVMBuildCondBr(g->builder, has_awaiter, wake_bb, ret_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, wake_bb);
+    LLVMValueRef aws_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
+        ASYNC_FRAME_AWAITER_STEP, "fr.awaiter.step");
+    LLVMValueRef aw_step = LLVMBuildLoad2(g->builder, g->co_step_ptr, aws_ptr, "awaiter.step");
+    LLVMValueRef wake_args[] = { awaiter, aw_step };
+    LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, wake_args, 2, "");
+    LLVMBuildBr(g->builder, ret_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, ret_bb);
     LLVMBuildRetVoid(g->builder);
+}
+
+/* Save all frame-resident slots (params + named scalar locals) from their
+ * stack allocas back into the heap frame. Emitted right before a suspend so
+ * live values survive across the `ret void`. */
+static void emit_async_save_slots(zan_irgen_t *g) {
+    LLVMTypeRef ft = g->current_async_frame_type;
+    LLVMValueRef frame = g->current_async_frame;
+    for (int i = 0; i < g->current_async_slot_count; i++) {
+        LLVMValueRef v = LLVMBuildLoad2(g->builder, g->current_async_slots[i].llvm,
+            g->current_async_slots[i].slot_alloca, "sv");
+        LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, ft, frame,
+            (unsigned)g->current_async_slots[i].frame_index, "sv.slot");
+        LLVMBuildStore(g->builder, v, slot);
+    }
+}
+
+/* Reload all frame-resident slots from the heap frame into their stack allocas.
+ * Emitted at the top of each state block (co.start and every resume-k) so the
+ * body reads live values that survived a suspension. */
+static void emit_async_reload_slots(zan_irgen_t *g) {
+    LLVMTypeRef ft = g->current_async_frame_type;
+    LLVMValueRef frame = g->current_async_frame;
+    for (int i = 0; i < g->current_async_slot_count; i++) {
+        LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, ft, frame,
+            (unsigned)g->current_async_slots[i].frame_index, "rl.slot");
+        LLVMValueRef v = LLVMBuildLoad2(g->builder, g->current_async_slots[i].llvm,
+            slot, "rl");
+        LLVMBuildStore(g->builder, v, g->current_async_slots[i].slot_alloca);
+    }
+}
+
+/* A named scalar local of an async method that must live in the heap frame so
+ * its value survives across suspensions. `frame_index` is assigned when the
+ * frame struct is laid out (params first, then these locals). */
+typedef struct {
+    zan_istr_t   name;
+    LLVMTypeRef  llvm;        /* slot element type */
+    zan_type_t  *ztype;      /* zan type (for identifier load typing) */
+    int          frame_index;
+} async_local_t;
+
+typedef struct {
+    zan_irgen_t   *g;
+    int            await_count;
+    async_local_t *locals;
+    int            local_count;
+    int            local_cap;
+} async_scan_t;
+
+static bool async_type_is_scalar(LLVMTypeRef t) {
+    switch (LLVMGetTypeKind(t)) {
+    case LLVMIntegerTypeKind:
+    case LLVMFloatTypeKind:
+    case LLVMDoubleTypeKind:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e);
+static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st);
+
+static void async_scan_add_local(async_scan_t *s, zan_istr_t name, LLVMTypeRef llvm, zan_type_t *zt) {
+    for (int i = 0; i < s->local_count; i++) {
+        if (s->locals[i].name.len == name.len &&
+            memcmp(s->locals[i].name.str, name.str, name.len) == 0) {
+            return; /* dedup by name (flat scope) */
+        }
+    }
+    if (s->local_count >= s->local_cap) {
+        int nc = s->local_cap ? s->local_cap * 2 : 8;
+        async_local_t *g2 = (async_local_t *)zan_arena_alloc(s->g->arena,
+            sizeof(async_local_t) * (size_t)nc);
+        if (s->local_count > 0) memcpy(g2, s->locals, sizeof(async_local_t) * (size_t)s->local_count);
+        s->locals = g2;
+        s->local_cap = nc;
+    }
+    s->locals[s->local_count].name = name;
+    s->locals[s->local_count].llvm = llvm;
+    s->locals[s->local_count].ztype = zt;
+    s->locals[s->local_count].frame_index = -1;
+    s->local_count++;
+}
+
+/* Walk expressions to count await points (state-machine transitions). */
+static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e) {
+    if (!e) return;
+    switch (e->kind) {
+    case AST_AWAIT_EXPR:
+        s->await_count++;
+        async_scan_expr(s, e->await_expr.expr);
+        break;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        async_scan_expr(s, e->binary.left);
+        async_scan_expr(s, e->binary.right);
+        break;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        async_scan_expr(s, e->unary.operand);
+        break;
+    case AST_CALL:
+        async_scan_expr(s, e->call.callee);
+        for (int i = 0; i < e->call.args.count; i++)
+            async_scan_expr(s, e->call.args.items[i]);
+        break;
+    case AST_MEMBER_ACCESS:
+        async_scan_expr(s, e->member.object);
+        break;
+    case AST_INDEX:
+        async_scan_expr(s, e->index.object);
+        async_scan_expr(s, e->index.index);
+        break;
+    case AST_CONDITIONAL:
+        async_scan_expr(s, e->conditional.cond);
+        async_scan_expr(s, e->conditional.then_expr);
+        async_scan_expr(s, e->conditional.else_expr);
+        break;
+    case AST_NEW_EXPR:
+        for (int i = 0; i < e->new_expr.args.count; i++)
+            async_scan_expr(s, e->new_expr.args.items[i]);
+        break;
+    case AST_CAST_EXPR:
+        async_scan_expr(s, e->cast.expr);
+        break;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        async_scan_expr(s, e->type_test.expr);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Walk statements to collect named scalar locals (which must live in the frame)
+ * and count await points anywhere in the body. */
+static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
+    if (!st) return;
+    switch (st->kind) {
+    case AST_BLOCK:
+        for (int i = 0; i < st->block.stmts.count; i++)
+            async_scan_stmt(s, st->block.stmts.items[i]);
+        break;
+    case AST_VAR_DECL:
+        if (st->var_decl.type) {
+            zan_type_t *t = zan_binder_resolve_type(s->g->binder, st->var_decl.type);
+            if (t) {
+                LLVMTypeRef lt = map_type(s->g, t);
+                if (async_type_is_scalar(lt))
+                    async_scan_add_local(s, st->var_decl.name, lt, t);
+            }
+        }
+        async_scan_expr(s, st->var_decl.initializer);
+        break;
+    case AST_EXPR_STMT:
+        async_scan_expr(s, st->expr_stmt.expr);
+        break;
+    case AST_RETURN_STMT:
+        async_scan_expr(s, st->ret.value);
+        break;
+    case AST_IF_STMT:
+        async_scan_expr(s, st->if_stmt.cond);
+        async_scan_stmt(s, st->if_stmt.then_body);
+        async_scan_stmt(s, st->if_stmt.else_body);
+        break;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        async_scan_expr(s, st->while_stmt.cond);
+        async_scan_stmt(s, st->while_stmt.body);
+        break;
+    case AST_FOR_STMT:
+        async_scan_stmt(s, st->for_stmt.init);
+        async_scan_expr(s, st->for_stmt.cond);
+        async_scan_expr(s, st->for_stmt.step);
+        async_scan_stmt(s, st->for_stmt.body);
+        break;
+    case AST_FOREACH_STMT:
+        async_scan_expr(s, st->foreach_stmt.collection);
+        async_scan_stmt(s, st->foreach_stmt.body);
+        break;
+    case AST_THROW_STMT:
+        async_scan_expr(s, st->throw_stmt.value);
+        break;
+    case AST_TRY_STMT:
+        async_scan_stmt(s, st->try_stmt.try_body);
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            async_scan_stmt(s, st->try_stmt.catches.items[i]->catch_clause.body);
+        async_scan_stmt(s, st->try_stmt.finally_body);
+        break;
+    case AST_SWITCH_STMT:
+        async_scan_expr(s, st->switch_stmt.expr);
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            async_scan_stmt(s, st->switch_stmt.cases.items[i]->switch_case.body);
+        break;
+    default:
+        break;
+    }
 }
 
 /* ---- statement codegen ---- */
@@ -4200,6 +4643,25 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         break;
 
     case AST_VAR_DECL: {
+        /* In an async $resume body, named scalar locals were pre-allocated in
+         * the entry block and their storage lives in the heap frame (so they
+         * survive suspensions). Reuse that slot instead of a fresh alloca:
+         * just evaluate the initializer and store into it. */
+        if (g->current_async_frame && g->current_async_slot_count > 0) {
+            local_var_t *pre = local_find(locals, stmt->var_decl.name);
+            if (pre) {
+                for (int i = 0; i < g->current_async_slot_count; i++) {
+                    if (g->current_async_slots[i].slot_alloca == pre->alloca) {
+                        if (stmt->var_decl.initializer) {
+                            LLVMValueRef iv = emit_expr(g, stmt->var_decl.initializer, locals);
+                            iv = coerce_int_to(g, iv, g->current_async_slots[i].llvm);
+                            LLVMBuildStore(g->builder, iv, pre->alloca);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         zan_type_t *type = g->binder->type_int; /* default */
         if (stmt->var_decl.type) {
             type = zan_binder_resolve_type(g->binder, stmt->var_decl.type);
@@ -4789,6 +5251,10 @@ typedef struct {
     bool            is_async;
     LLVMValueRef    resume_fn;
     LLVMTypeRef     frame_type;
+    int             await_count;   /* await points in the body (states 1..N) */
+    async_local_t  *alocals;       /* named scalar locals held in the frame */
+    int             alocal_count;
+    int             sub_base;       /* frame index of the first sub-task slot */
 } method_body_work_t;
 
 static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
@@ -4939,14 +5405,30 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             LLVMValueRef fn = NULL;
             LLVMValueRef resume_fn = NULL;
             LLVMTypeRef frame_type = NULL;
+            int a_await_count = 0;
+            async_local_t *a_locals = NULL;
+            int a_local_count = 0;
+            int a_sub_base = 0;
 
             if (is_async) {
                 LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 
-                /* frame = fixed 5-field header + captured params */
-                int nfields = ASYNC_FRAME_FIRST_PARAM + total_params;
+                /* Scan the body: count await points (→ states / sub-task slots)
+                 * and collect named scalar locals that must live in the frame
+                 * so they survive across suspensions. */
+                async_scan_t scan = { g, 0, NULL, 0, 0 };
+                async_scan_stmt(&scan, member->method_decl.body);
+                a_await_count = scan.await_count;
+                a_locals = scan.locals;
+                a_local_count = scan.local_count;
+
+                /* frame = fixed 5-field header + params + frame locals +
+                 * one i8* sub-task handle per await point. */
+                int locals_base = ASYNC_FRAME_FIRST_PARAM + total_params;
+                a_sub_base = locals_base + a_local_count;
+                int nfields = a_sub_base + a_await_count;
                 LLVMTypeRef *fields = (LLVMTypeRef *)calloc((size_t)nfields, sizeof(LLVMTypeRef));
                 fields[ASYNC_FRAME_STATE] = i32;
                 fields[ASYNC_FRAME_DONE] = i32;
@@ -4955,6 +5437,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_RESULT] = i64;
                 for (int k = 0; k < total_params; k++) {
                     fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
+                }
+                for (int k = 0; k < a_local_count; k++) {
+                    a_locals[k].frame_index = locals_base + k;
+                    fields[locals_base + k] = a_locals[k].llvm;
+                }
+                for (int k = 0; k < a_await_count; k++) {
+                    fields[a_sub_base + k] = i8ptr;
                 }
                 char frame_name[560];
                 snprintf(frame_name, sizeof(frame_name), "%s$frame", fn_name);
@@ -5008,6 +5497,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 work[work_count].is_async = is_async;
                 work[work_count].resume_fn = resume_fn;
                 work[work_count].frame_type = frame_type;
+                work[work_count].await_count = a_await_count;
+                work[work_count].alocals = a_locals;
+                work[work_count].alocal_count = a_local_count;
+                work[work_count].sub_base = a_sub_base;
                 work_count++;
             } else {
                 free(param_types);
@@ -5070,35 +5563,54 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             LLVMPositionBuilderAtEnd(g->builder, res_entry);
             LLVMValueRef fparam = LLVMGetParam(resume_fn, 0);
             LLVMValueRef sframe = LLVMBuildBitCast(g->builder, fparam, frame_ptr_ty, "frame");
-            LLVMValueRef state_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
-                ASYNC_FRAME_STATE, "st.ptr");
-            LLVMValueRef state = LLVMBuildLoad2(g->builder, i32, state_ptr, "state");
-            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
-            /* switch(state): case 0 (start) -> body. Later stages add resume-k
-             * cases for await points. */
-            LLVMValueRef sw = LLVMBuildSwitch(g->builder, state, body_bb, 1);
-            LLVMAddCase(sw, LLVMConstInt(i32, 0, 0), body_bb);
-            LLVMPositionBuilderAtEnd(g->builder, body_bb);
 
             local_scope_t *locals = local_scope_new(g->arena);
+
+            /* Frame-resident slots: `this` (instance methods), params, and named
+             * scalar locals. Their storage is stack allocas created here in the
+             * entry block (so they dominate every state block); values are saved
+             * to / reloaded from the heap frame around each suspension. */
+            int alocal_count = work[w].alocal_count;
+            int slot_total = total_params + alocal_count;
+            zan_async_slot_t *slots = (zan_async_slot_t *)zan_arena_alloc(g->arena,
+                sizeof(zan_async_slot_t) * (size_t)(slot_total > 0 ? slot_total : 1));
+            int si = 0;
             LLVMValueRef res_this = NULL;
             if (!is_static) {
                 res_this = LLVMBuildAlloca(g->builder, param_types[0], "this");
-                LLVMValueRef s = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
-                    ASYNC_FRAME_FIRST_PARAM, "this.slot");
-                LLVMBuildStore(g->builder,
-                    LLVMBuildLoad2(g->builder, param_types[0], s, "this.v"), res_this);
+                slots[si].slot_alloca = res_this;
+                slots[si].llvm = param_types[0];
+                slots[si].frame_index = ASYNC_FRAME_FIRST_PARAM;
+                si++;
             }
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
                 LLVMTypeRef pty = param_types[k + param_offset];
                 LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
-                LLVMValueRef s = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
-                    (unsigned)(ASYNC_FRAME_FIRST_PARAM + param_offset + k), "p.slot");
-                LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, pty, s, "p.v"), pa);
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
                 local_add(locals, param->param.name, pa, pt);
+                slots[si].slot_alloca = pa;
+                slots[si].llvm = pty;
+                slots[si].frame_index = ASYNC_FRAME_FIRST_PARAM + param_offset + k;
+                si++;
             }
+            for (int k = 0; k < alocal_count; k++) {
+                LLVMValueRef la = LLVMBuildAlloca(g->builder, work[w].alocals[k].llvm, "fl");
+                local_add(locals, work[w].alocals[k].name, la, work[w].alocals[k].ztype);
+                slots[si].slot_alloca = la;
+                slots[si].llvm = work[w].alocals[k].llvm;
+                slots[si].frame_index = work[w].alocals[k].frame_index;
+                si++;
+            }
+
+            LLVMValueRef state = LLVMBuildLoad2(g->builder, i32,
+                LLVMBuildStructGEP2(g->builder, frame_type, sframe, ASYNC_FRAME_STATE, "st.ptr"),
+                "state");
+            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
+            /* switch(state): case 0 (start) -> body; each await point appends a
+             * resume-k case (see the AST_AWAIT_EXPR lowering). */
+            LLVMValueRef sw = LLVMBuildSwitch(g->builder, state, body_bb, (unsigned)(work[w].await_count + 1));
+            LLVMAddCase(sw, LLVMConstInt(i32, 0, 0), body_bb);
 
             LLVMValueRef saved_fn = g->current_fn;
             LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
@@ -5106,12 +5618,30 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             zan_symbol_t *saved_type_sym = g->current_type_sym;
             LLVMValueRef saved_async_frame = g->current_async_frame;
             LLVMTypeRef saved_async_frame_type = g->current_async_frame_type;
+            LLVMValueRef saved_async_resume_fn = g->current_async_resume_fn;
+            LLVMValueRef saved_async_switch = g->current_async_switch;
+            int saved_next_state = g->current_async_next_state;
+            int saved_sub_base = g->current_async_sub_base;
+            int saved_sub_next = g->current_async_sub_next;
+            void *saved_slots = (void *)g->current_async_slots;
+            int saved_slot_count = g->current_async_slot_count;
+
             g->current_fn = resume_fn;
             g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
             g->current_this = is_static ? NULL : res_this;
             g->current_type_sym = type_sym;
             g->current_async_frame = sframe;
             g->current_async_frame_type = frame_type;
+            g->current_async_resume_fn = resume_fn;
+            g->current_async_switch = sw;
+            g->current_async_next_state = 1;
+            g->current_async_sub_base = work[w].sub_base;
+            g->current_async_sub_next = 0;
+            g->current_async_slots = slots;
+            g->current_async_slot_count = slot_total;
+
+            LLVMPositionBuilderAtEnd(g->builder, body_bb);
+            emit_async_reload_slots(g); /* load `this`/params from the frame */
 
             if (member->method_decl.body->kind == AST_BLOCK) {
                 for (int k = 0; k < member->method_decl.body->block.stmts.count; k++) {
@@ -5134,6 +5664,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_type_sym = saved_type_sym;
             g->current_async_frame = saved_async_frame;
             g->current_async_frame_type = saved_async_frame_type;
+            g->current_async_resume_fn = saved_async_resume_fn;
+            g->current_async_switch = saved_async_switch;
+            g->current_async_next_state = saved_next_state;
+            g->current_async_sub_base = saved_sub_base;
+            g->current_async_sub_next = saved_sub_next;
+            g->current_async_slots = saved_slots;
+            g->current_async_slot_count = saved_slot_count;
             free(param_types);
             continue;
         }

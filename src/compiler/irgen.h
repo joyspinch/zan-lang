@@ -10,6 +10,15 @@
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 
+/* A frame-resident slot of an async $resume body: the stack alloca that holds
+ * the value while executing, and the heap-frame field it is saved to / reloaded
+ * from around each suspension. */
+typedef struct {
+    LLVMValueRef slot_alloca;
+    LLVMTypeRef  llvm;
+    int          frame_index;
+} zan_async_slot_t;
+
 struct zan_irgen {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -110,14 +119,31 @@ struct zan_irgen {
     /* async/await CPS lowering (see docs/ASYNC_CPS_DESIGN.md) */
     LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
     LLVMTypeRef  co_step_ptr;     /* void(i8*)* — pointer to a step fn */
+    LLVMTypeRef  co_header_type;  /* shared frame header {i32,i32,i8*,step*,i64} */
     LLVMValueRef rt_co_ready;     /* void zan_co_ready(void* frame, step) */
     LLVMTypeRef  rt_co_ready_type;
+    LLVMValueRef rt_co_sched_init;/* void zan_co_sched_init(void) */
+    LLVMTypeRef  rt_co_sched_init_type;
+    LLVMValueRef rt_co_sched_run; /* void zan_co_sched_run(void) */
+    LLVMTypeRef  rt_co_sched_run_type;
     /* set while emitting an async function's $resume body: the current heap
      * frame pointer and its struct type, so `return` stores into the frame's
      * result slot + notifies the awaiter instead of a plain ret. NULL when not
      * lowering an async body. */
     LLVMValueRef current_async_frame;
     LLVMTypeRef  current_async_frame_type;
+    LLVMValueRef current_async_resume_fn; /* the $resume fn being emitted */
+    /* await state-machine context, valid only when current_async_frame is set
+     * and the body contains awaits: the entry switch (new resume-k cases are
+     * added here), the next state number to hand out, and the frame slots that
+     * must be saved before a suspend and reloaded after (params + named
+     * scalar locals live across suspensions). */
+    LLVMValueRef current_async_switch;
+    int          current_async_next_state;
+    int          current_async_sub_base; /* frame index of first sub-task slot */
+    int          current_async_sub_next;
+    zan_async_slot_t *current_async_slots;
+    int          current_async_slot_count;
 
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];
