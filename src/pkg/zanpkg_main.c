@@ -20,6 +20,7 @@
 #define PATH_SEP "\\"
 #else
 #include <unistd.h>
+#include <sys/stat.h>   /* mkdir() */
 #define PATH_SEP "/"
 #endif
 
