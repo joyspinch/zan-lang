@@ -169,6 +169,20 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->sb_struct_type = LLVMStructCreateNamed(g->ctx, "StringBuilder");
     LLVMStructSetBody(g->sb_struct_type, sb_fields, 3, 0);
 
+    /* async/await CPS driver ABI (see docs/ASYNC_CPS_DESIGN.md):
+     *   typedef void (*zan_co_step_t)(void *frame);
+     *   void zan_co_ready(void *frame, zan_co_step_t step);
+     * A resume/step fn takes the heap frame (as i8*) and re-enters the state
+     * machine. zan_co_ready enqueues (frame, step) on the cooperative driver. */
+    LLVMTypeRef co_step_args[] = { i8ptr };
+    g->co_step_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_step_args, 1, 0);
+    g->co_step_ptr = LLVMPointerType(g->co_step_type, 0);
+    LLVMTypeRef co_ready_args[] = { i8ptr, g->co_step_ptr };
+    g->rt_co_ready_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_ready_args, 2, 0);
+    g->rt_co_ready = LLVMAddFunction(g->mod, "zan_co_ready", g->rt_co_ready_type);
+    g->current_async_frame = NULL;
+    g->current_async_frame_type = NULL;
+
     /* int strcmp(const char*, const char*) */
     LLVMTypeRef strcmp_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcmp_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), strcmp_args, 2, 0);
@@ -4107,6 +4121,72 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 }
 
+/* ---- async/await CPS lowering helpers ---- */
+
+/* Frame header field indices (see docs/ASYNC_CPS_DESIGN.md). Params/locals
+ * follow the header starting at ASYNC_FRAME_FIRST_PARAM. */
+enum {
+    ASYNC_FRAME_STATE = 0,        /* i32: 0=start, k=resume-after-await-k, -1=done */
+    ASYNC_FRAME_DONE = 1,         /* i32: 1 once result slot is valid */
+    ASYNC_FRAME_AWAITER = 2,      /* i8*: frame waiting on this one (or null) */
+    ASYNC_FRAME_AWAITER_STEP = 3, /* void(i8*)*: awaiter's resume fn (or null) */
+    ASYNC_FRAME_RESULT = 4,       /* i64: return value (scalars are i64 here) */
+    ASYNC_FRAME_FIRST_PARAM = 5
+};
+
+/* Coerce an arbitrary scalar value to the i64 used by the frame result slot. */
+static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef t = LLVMTypeOf(v);
+    switch (LLVMGetTypeKind(t)) {
+    case LLVMIntegerTypeKind: {
+        unsigned bits = LLVMGetIntTypeWidth(t);
+        if (bits < 64) return LLVMBuildSExt(g->builder, v, i64, "res.i64");
+        if (bits > 64) return LLVMBuildTrunc(g->builder, v, i64, "res.i64");
+        return v;
+    }
+    case LLVMPointerTypeKind:
+        return LLVMBuildPtrToInt(g->builder, v, i64, "res.i64");
+    case LLVMDoubleTypeKind:
+        return LLVMBuildBitCast(g->builder, v, i64, "res.i64");
+    case LLVMFloatTypeKind: {
+        LLVMValueRef d = LLVMBuildFPExt(g->builder, v,
+            LLVMDoubleTypeInContext(g->ctx), "res.f64");
+        return LLVMBuildBitCast(g->builder, d, i64, "res.i64");
+    }
+    default:
+        return LLVMConstInt(i64, 0, 0);
+    }
+}
+
+/* Emit the completion epilogue of an async $resume body: store the result,
+ * mark the frame done, then `ret void` (the state machine has finished).
+ * `result_i64` may be NULL for a void async fn. Assumes the builder is
+ * positioned at a block without a terminator.
+ *
+ * S2 (skeleton) intentionally stops here: there are no awaiters yet, so the
+ * awaiter-wake handshake (zan_co_ready(frame.awaiter, frame.awaiter_step)) is
+ * deferred to S3 when the await protocol lands. Keeping it out now means an
+ * async program is self-contained and links without the co runtime. The frame
+ * header still reserves the awaiter/awaiter_step slots for that step. */
+static void emit_async_complete(zan_irgen_t *g, LLVMValueRef result_i64) {
+    LLVMValueRef frame = g->current_async_frame;
+    LLVMTypeRef ft = g->current_async_frame_type;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+
+    LLVMValueRef res_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
+        ASYNC_FRAME_RESULT, "fr.result");
+    LLVMBuildStore(g->builder, result_i64 ? result_i64 : LLVMConstInt(i64, 0, 0),
+        res_ptr);
+
+    LLVMValueRef done_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
+        ASYNC_FRAME_DONE, "fr.done");
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0), done_ptr);
+
+    LLVMBuildRetVoid(g->builder);
+}
+
 /* ---- statement codegen ---- */
 
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
@@ -4279,6 +4359,18 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         break;
 
     case AST_RETURN_STMT:
+        /* Inside an async $resume body, `return e` completes the state machine:
+         * store the result into the frame, mark it done, and `ret void` — the
+         * frame pointer (Task) was already handed out by the ramp. (The awaiter
+         * wake is added in S3 with the await protocol.) */
+        if (g->current_async_frame) {
+            LLVMValueRef ri = NULL;
+            if (stmt->ret.value) {
+                ri = coerce_to_i64(g, emit_expr(g, stmt->ret.value, locals));
+            }
+            emit_async_complete(g, ri);
+            break;
+        }
         if (stmt->ret.value) {
             LLVMValueRef val = emit_expr(g, stmt->ret.value, locals);
             /* convert return value to match function return type */
@@ -4692,6 +4784,11 @@ typedef struct {
     bool            is_static;
     LLVMTypeRef     llvm_ret;
     zan_type_t     *ret_type;
+    /* async CPS lowering: when is_async, `fn` is the ramp (returns the task
+     * handle) and the body is emitted into `resume_fn` over `frame_type`. */
+    bool            is_async;
+    LLVMValueRef    resume_fn;
+    LLVMTypeRef     frame_type;
 } method_body_work_t;
 
 static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
@@ -4834,10 +4931,52 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
                     : g->binder->type_void);
             LLVMTypeRef llvm_ret = map_type(g, ret_type);
-            LLVMTypeRef fn_type = LLVMFunctionType(llvm_ret, param_types, (unsigned)total_params, 0);
-            LLVMValueRef fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+            /* async methods lower to a heap frame + ramp + resume (see
+             * docs/ASYNC_CPS_DESIGN.md); ctors are never async. */
+            bool is_async = !is_ctor && (member->method_decl.modifiers & MOD_ASYNC) != 0;
 
-            /* register in function/ctor table */
+            LLVMTypeRef fn_type = NULL;
+            LLVMValueRef fn = NULL;
+            LLVMValueRef resume_fn = NULL;
+            LLVMTypeRef frame_type = NULL;
+
+            if (is_async) {
+                LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+
+                /* frame = fixed 5-field header + captured params */
+                int nfields = ASYNC_FRAME_FIRST_PARAM + total_params;
+                LLVMTypeRef *fields = (LLVMTypeRef *)calloc((size_t)nfields, sizeof(LLVMTypeRef));
+                fields[ASYNC_FRAME_STATE] = i32;
+                fields[ASYNC_FRAME_DONE] = i32;
+                fields[ASYNC_FRAME_AWAITER] = i8ptr;
+                fields[ASYNC_FRAME_AWAITER_STEP] = g->co_step_ptr;
+                fields[ASYNC_FRAME_RESULT] = i64;
+                for (int k = 0; k < total_params; k++) {
+                    fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
+                }
+                char frame_name[560];
+                snprintf(frame_name, sizeof(frame_name), "%s$frame", fn_name);
+                frame_type = LLVMStructCreateNamed(g->ctx, frame_name);
+                LLVMStructSetBody(frame_type, fields, (unsigned)nfields, 0);
+                free(fields);
+
+                /* ramp keeps the external param list but returns the task
+                 * handle (i8*); the body runs later in resume(frame). */
+                fn_type = LLVMFunctionType(i8ptr, param_types, (unsigned)total_params, 0);
+                fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+
+                char resume_name[560];
+                snprintf(resume_name, sizeof(resume_name), "%s$resume", fn_name);
+                resume_fn = LLVMAddFunction(g->mod, resume_name, g->co_step_type);
+            } else {
+                fn_type = LLVMFunctionType(llvm_ret, param_types, (unsigned)total_params, 0);
+                fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+            }
+
+            /* register in function/ctor table. For async methods the ramp is
+             * the callable symbol (a call site receives the task handle). */
             if (is_ctor) {
                 if (g->ctor_count < 256) {
                     g->ctors[g->ctor_count].type_sym = type_sym;
@@ -4866,6 +5005,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 work[work_count].is_static = is_static;
                 work[work_count].llvm_ret = llvm_ret;
                 work[work_count].ret_type = ret_type;
+                work[work_count].is_async = is_async;
+                work[work_count].resume_fn = resume_fn;
+                work[work_count].frame_type = frame_type;
                 work_count++;
             } else {
                 free(param_types);
@@ -4885,6 +5027,116 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         LLVMTypeRef llvm_ret = work[w].llvm_ret;
         zan_type_t *ret_type = work[w].ret_type;
         LLVMValueRef this_alloca = NULL;
+
+        /* async method: emit ramp (allocate frame, stash params, hand out the
+         * task handle) + resume (state-machine entry running the body). See
+         * docs/ASYNC_CPS_DESIGN.md. */
+        if (work[w].is_async) {
+            LLVMValueRef ramp_fn = fn;
+            LLVMValueRef resume_fn = work[w].resume_fn;
+            LLVMTypeRef frame_type = work[w].frame_type;
+            LLVMTypeRef frame_ptr_ty = LLVMPointerType(frame_type, 0);
+            LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            int total_params = param_count + param_offset;
+
+            /* ---- ramp ---- */
+            LLVMBasicBlockRef ramp_entry = LLVMAppendBasicBlockInContext(g->ctx, ramp_fn, "entry");
+            LLVMPositionBuilderAtEnd(g->builder, ramp_entry);
+            LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
+            LLVMValueRef fsize = LLVMSizeOf(frame_type);
+            LLVMValueRef raw = LLVMBuildCall2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
+            LLVMValueRef rframe = LLVMBuildBitCast(g->builder, raw, frame_ptr_ty, "frame");
+            LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
+                LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_STATE, "st"));
+            LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
+                LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_DONE, "dn"));
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
+                LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_AWAITER, "aw"));
+            LLVMBuildStore(g->builder, LLVMConstNull(g->co_step_ptr),
+                LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_AWAITER_STEP, "aws"));
+            LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),
+                LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_RESULT, "rs"));
+            for (int k = 0; k < total_params; k++) {
+                LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, frame_type, rframe,
+                    (unsigned)(ASYNC_FRAME_FIRST_PARAM + k), "arg");
+                LLVMBuildStore(g->builder, LLVMGetParam(ramp_fn, (unsigned)k), slot);
+            }
+            LLVMBuildRet(g->builder, raw);
+
+            /* ---- resume ---- */
+            LLVMBasicBlockRef res_entry = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "entry");
+            LLVMPositionBuilderAtEnd(g->builder, res_entry);
+            LLVMValueRef fparam = LLVMGetParam(resume_fn, 0);
+            LLVMValueRef sframe = LLVMBuildBitCast(g->builder, fparam, frame_ptr_ty, "frame");
+            LLVMValueRef state_ptr = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+                ASYNC_FRAME_STATE, "st.ptr");
+            LLVMValueRef state = LLVMBuildLoad2(g->builder, i32, state_ptr, "state");
+            LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
+            /* switch(state): case 0 (start) -> body. Later stages add resume-k
+             * cases for await points. */
+            LLVMValueRef sw = LLVMBuildSwitch(g->builder, state, body_bb, 1);
+            LLVMAddCase(sw, LLVMConstInt(i32, 0, 0), body_bb);
+            LLVMPositionBuilderAtEnd(g->builder, body_bb);
+
+            local_scope_t *locals = local_scope_new(g->arena);
+            LLVMValueRef res_this = NULL;
+            if (!is_static) {
+                res_this = LLVMBuildAlloca(g->builder, param_types[0], "this");
+                LLVMValueRef s = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+                    ASYNC_FRAME_FIRST_PARAM, "this.slot");
+                LLVMBuildStore(g->builder,
+                    LLVMBuildLoad2(g->builder, param_types[0], s, "this.v"), res_this);
+            }
+            for (int k = 0; k < param_count; k++) {
+                zan_ast_node_t *param = member->method_decl.params.items[k];
+                LLVMTypeRef pty = param_types[k + param_offset];
+                LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
+                LLVMValueRef s = LLVMBuildStructGEP2(g->builder, frame_type, sframe,
+                    (unsigned)(ASYNC_FRAME_FIRST_PARAM + param_offset + k), "p.slot");
+                LLVMBuildStore(g->builder, LLVMBuildLoad2(g->builder, pty, s, "p.v"), pa);
+                zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
+                local_add(locals, param->param.name, pa, pt);
+            }
+
+            LLVMValueRef saved_fn = g->current_fn;
+            LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+            LLVMValueRef saved_this = g->current_this;
+            zan_symbol_t *saved_type_sym = g->current_type_sym;
+            LLVMValueRef saved_async_frame = g->current_async_frame;
+            LLVMTypeRef saved_async_frame_type = g->current_async_frame_type;
+            g->current_fn = resume_fn;
+            g->current_fn_ret_type = LLVMVoidTypeInContext(g->ctx);
+            g->current_this = is_static ? NULL : res_this;
+            g->current_type_sym = type_sym;
+            g->current_async_frame = sframe;
+            g->current_async_frame_type = frame_type;
+
+            if (member->method_decl.body->kind == AST_BLOCK) {
+                for (int k = 0; k < member->method_decl.body->block.stmts.count; k++) {
+                    emit_stmt(g, member->method_decl.body->block.stmts.items[k], locals);
+                }
+            } else {
+                /* expression body (=> expr): treat as `return expr`. */
+                LLVMValueRef val = emit_expr(g, member->method_decl.body, locals);
+                emit_async_complete(g, coerce_to_i64(g, val));
+            }
+
+            /* fall off the end: implicit completion (void / default result). */
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+                emit_async_complete(g, NULL);
+            }
+
+            g->current_fn = saved_fn;
+            g->current_fn_ret_type = saved_fn_ret;
+            g->current_this = saved_this;
+            g->current_type_sym = saved_type_sym;
+            g->current_async_frame = saved_async_frame;
+            g->current_async_frame_type = saved_async_frame_type;
+            free(param_types);
+            continue;
+        }
 
         LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, entry);

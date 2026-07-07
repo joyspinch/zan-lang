@@ -107,6 +107,18 @@ struct zan_irgen {
     LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64 thread_handle } */
     LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
 
+    /* async/await CPS lowering (see docs/ASYNC_CPS_DESIGN.md) */
+    LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
+    LLVMTypeRef  co_step_ptr;     /* void(i8*)* — pointer to a step fn */
+    LLVMValueRef rt_co_ready;     /* void zan_co_ready(void* frame, step) */
+    LLVMTypeRef  rt_co_ready_type;
+    /* set while emitting an async function's $resume body: the current heap
+     * frame pointer and its struct type, so `return` stores into the frame's
+     * result slot + notifies the awaiter instead of a plain ret. NULL when not
+     * lowering an async body. */
+    LLVMValueRef current_async_frame;
+    LLVMTypeRef  current_async_frame_type;
+
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];
     int extern_lib_count;
