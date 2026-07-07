@@ -499,11 +499,15 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
     }
     zan_io_suspend_current();   /* completion frees op and resumes us */
 
-    setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
-    int err = 0;
-    int len = sizeof(err);
-    getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
-    return err == 0 ? 0 : -1;
+    /* A failed ConnectEx reports its error via the completion packet, not via
+     * SO_ERROR, so query the socket state directly: only a socket that truly
+     * connected has a peer.  SO_UPDATE_CONNECT_CONTEXT makes getpeername (and
+     * later shutdown/recv) valid on the connected socket. */
+    if (setsockopt(s, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0) != 0)
+        return -1;
+    struct sockaddr_in peer;
+    int plen = sizeof(peer);
+    return getpeername(s, (struct sockaddr *)&peer, &plen) == 0 ? 0 : -1;
 }
 
 #else
