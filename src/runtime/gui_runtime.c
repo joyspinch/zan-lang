@@ -29,6 +29,7 @@
 #elif defined(__linux__)
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
 #include <X11/keysym.h>
 #include <time.h>
 #define EXPORT __attribute__((visibility("default")))
@@ -1151,6 +1152,99 @@ static GC g_gc = 0;
 static int g_pending_event_linux[8];
 static int g_has_event_linux = 0;
 static int g_win_w = 0, g_win_h = 0;
+static char *g_clip_text_linux = NULL;
+
+static Atom x11_atom(const char *name) { return XInternAtom(g_display, name, False); }
+
+/* Toggle/set an EWMH _NET_WM_STATE property via the window manager.
+ * action: 0 = remove, 1 = add, 2 = toggle. state2 may be 0. */
+static void x11_wm_state(Atom state1, Atom state2, long action) {
+    if (!g_display || !g_x11_window) return;
+    XEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = ClientMessage;
+    xev.xclient.window = g_x11_window;
+    xev.xclient.message_type = x11_atom("_NET_WM_STATE");
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = action;
+    xev.xclient.data.l[1] = (long)state1;
+    xev.xclient.data.l[2] = (long)state2;
+    xev.xclient.data.l[3] = 1;
+    XSendEvent(g_display, DefaultRootWindow(g_display), False,
+               SubstructureNotifyMask | SubstructureRedirectMask, &xev);
+    XFlush(g_display);
+}
+
+/* Serve a clipboard paste request from another client (we own CLIPBOARD). */
+static void x11_serve_selection(XSelectionRequestEvent *req) {
+    XSelectionEvent resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.type = SelectionNotify;
+    resp.display = req->display;
+    resp.requestor = req->requestor;
+    resp.selection = req->selection;
+    resp.target = req->target;
+    resp.time = req->time;
+    resp.property = req->property ? req->property : req->target;
+
+    Atom a_utf8 = x11_atom("UTF8_STRING");
+    Atom a_targets = x11_atom("TARGETS");
+    const char *txt = g_clip_text_linux ? g_clip_text_linux : "";
+
+    if (req->target == a_targets) {
+        Atom offered[3] = { a_targets, a_utf8, XA_STRING };
+        XChangeProperty(g_display, req->requestor, resp.property, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)offered, 3);
+    } else if (req->target == a_utf8 || req->target == XA_STRING) {
+        XChangeProperty(g_display, req->requestor, resp.property, req->target, 8,
+                        PropModeReplace, (const unsigned char *)txt, (int)strlen(txt));
+    } else {
+        resp.property = None;
+    }
+    XSendEvent(g_display, req->requestor, False, 0, (XEvent *)&resp);
+    XFlush(g_display);
+}
+
+/* Translate a raw XEvent into the flat g_pending_event_linux slots. */
+static void x11_translate_event(XEvent *ev) {
+    switch (ev->type) {
+    case MotionNotify:
+        g_pending_event_linux[0] = 1;
+        g_pending_event_linux[1] = ev->xmotion.x;
+        g_pending_event_linux[2] = ev->xmotion.y;
+        break;
+    case ButtonPress:
+        g_pending_event_linux[0] = 2;
+        g_pending_event_linux[1] = ev->xbutton.x;
+        g_pending_event_linux[2] = ev->xbutton.y;
+        g_pending_event_linux[3] = ev->xbutton.button - 1;
+        break;
+    case ButtonRelease:
+        g_pending_event_linux[0] = 3;
+        g_pending_event_linux[1] = ev->xbutton.x;
+        g_pending_event_linux[2] = ev->xbutton.y;
+        g_pending_event_linux[3] = ev->xbutton.button - 1;
+        break;
+    case KeyPress:
+        g_pending_event_linux[0] = 4;
+        g_pending_event_linux[4] = (int)XLookupKeysym(&ev->xkey, 0);
+        break;
+    case KeyRelease:
+        g_pending_event_linux[0] = 5;
+        g_pending_event_linux[4] = (int)XLookupKeysym(&ev->xkey, 0);
+        break;
+    case ConfigureNotify:
+        g_pending_event_linux[0] = 7;
+        g_win_w = ev->xconfigure.width;
+        g_win_h = ev->xconfigure.height;
+        g_pending_event_linux[1] = g_win_w;
+        g_pending_event_linux[2] = g_win_h;
+        break;
+    case ClientMessage:
+        g_pending_event_linux[0] = 8;
+        break;
+    }
+}
 
 EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
     g_display = XOpenDisplay(NULL);
@@ -1192,45 +1286,15 @@ EXPORT i64 zan_gui_wait_event(void) {
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
 
     XEvent ev;
-    XNextEvent(g_display, &ev);
-
-    switch (ev.type) {
-    case MotionNotify:
-        g_pending_event_linux[0] = 1;
-        g_pending_event_linux[1] = ev.xmotion.x;
-        g_pending_event_linux[2] = ev.xmotion.y;
-        break;
-    case ButtonPress:
-        g_pending_event_linux[0] = 2;
-        g_pending_event_linux[1] = ev.xbutton.x;
-        g_pending_event_linux[2] = ev.xbutton.y;
-        g_pending_event_linux[3] = ev.xbutton.button - 1;
-        break;
-    case ButtonRelease:
-        g_pending_event_linux[0] = 3;
-        g_pending_event_linux[1] = ev.xbutton.x;
-        g_pending_event_linux[2] = ev.xbutton.y;
-        g_pending_event_linux[3] = ev.xbutton.button - 1;
-        break;
-    case KeyPress:
-        g_pending_event_linux[0] = 4;
-        g_pending_event_linux[4] = (int)XLookupKeysym(&ev.xkey, 0);
-        break;
-    case KeyRelease:
-        g_pending_event_linux[0] = 5;
-        g_pending_event_linux[4] = (int)XLookupKeysym(&ev.xkey, 0);
-        break;
-    case ConfigureNotify:
-        g_pending_event_linux[0] = 7;
-        g_win_w = ev.xconfigure.width;
-        g_win_h = ev.xconfigure.height;
-        g_pending_event_linux[1] = g_win_w;
-        g_pending_event_linux[2] = g_win_h;
-        break;
-    case ClientMessage:
-        g_pending_event_linux[0] = 8;
+    for (;;) {
+        XNextEvent(g_display, &ev);
+        if (ev.type == SelectionRequest) {
+            x11_serve_selection(&ev.xselectionrequest);
+            continue;
+        }
         break;
     }
+    x11_translate_event(&ev);
     g_has_event_linux = 1;
     return 0;
 }
@@ -1239,8 +1303,18 @@ EXPORT i64 zan_gui_poll_event(void) {
     if (!g_display) return -1;
     g_has_event_linux = 0;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
-    if (XPending(g_display) <= 0) return 1;
-    return zan_gui_wait_event();
+    for (;;) {
+        if (XPending(g_display) <= 0) return 1;
+        XEvent ev;
+        XNextEvent(g_display, &ev);
+        if (ev.type == SelectionRequest) {
+            x11_serve_selection(&ev.xselectionrequest);
+            continue;
+        }
+        x11_translate_event(&ev);
+        g_has_event_linux = 1;
+        return 0;
+    }
 }
 
 EXPORT i64 zan_gui_event_kind(void)    { return g_pending_event_linux[0]; }
@@ -1451,6 +1525,85 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
 }
 
 EXPORT void zan_gui_draw_icon(i64 s, i64 x, i64 y, i64 b, i64 c, i64 cp) { (void)s;(void)x;(void)y;(void)b;(void)c;(void)cp; }
+
+/* ---- window management (EWMH / Xlib) ---- */
+
+EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
+    (void)hwnd_val;
+    if (g_display && g_x11_window) {
+        XIconifyWindow(g_display, g_x11_window, DefaultScreen(g_display));
+        XFlush(g_display);
+    }
+    return 0;
+}
+
+EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
+    (void)hwnd_val;
+    x11_wm_state(x11_atom("_NET_WM_STATE_MAXIMIZED_VERT"),
+                 x11_atom("_NET_WM_STATE_MAXIMIZED_HORZ"), 2 /* toggle */);
+    return 0;
+}
+
+EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
+    (void)hwnd_val;
+    if (!g_display || !g_x11_window) return 0;
+    Atom vert = x11_atom("_NET_WM_STATE_MAXIMIZED_VERT");
+    Atom horz = x11_atom("_NET_WM_STATE_MAXIMIZED_HORZ");
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems = 0, bytes_after = 0;
+    unsigned char *prop = NULL;
+    int found_v = 0, found_h = 0;
+    if (XGetWindowProperty(g_display, g_x11_window, x11_atom("_NET_WM_STATE"),
+                           0, 64, False, XA_ATOM, &actual_type, &actual_format,
+                           &nitems, &bytes_after, &prop) == Success && prop) {
+        Atom *states = (Atom *)prop;
+        for (unsigned long i = 0; i < nitems; i++) {
+            if (states[i] == vert) found_v = 1;
+            if (states[i] == horz) found_h = 1;
+        }
+        XFree(prop);
+    }
+    return (found_v && found_h) ? 1 : 0;
+}
+
+EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
+    (void)hwnd_val;
+    x11_wm_state(x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
+    return 0;
+}
+
+EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
+    (void)hwnd_val;
+    if (g_display && g_x11_window) {
+        XDestroyWindow(g_display, g_x11_window);
+        XFlush(g_display);
+        g_x11_window = 0;
+    }
+    return 0;
+}
+
+EXPORT i64 zan_gui_get_dpi_scale(void) {
+    if (!g_display) return 100;
+    int screen = DefaultScreen(g_display);
+    int wpx = DisplayWidth(g_display, screen);
+    int wmm = DisplayWidthMM(g_display, screen);
+    if (wmm <= 0) return 100;
+    double dpi = (double)wpx * 25.4 / (double)wmm;
+    long scale = (long)(dpi * 100.0 / 96.0 + 0.5);
+    if (scale < 100) scale = 100; /* never report sub-1x scaling */
+    return (i64)scale;
+}
+
+EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
+    if (!g_display || !g_x11_window) return 1;
+    free(g_clip_text_linux);
+    g_clip_text_linux = utf8 ? strdup(utf8) : strdup("");
+    XSetSelectionOwner(g_display, x11_atom("CLIPBOARD"), g_x11_window, CurrentTime);
+    XSetSelectionOwner(g_display, XA_PRIMARY, g_x11_window, CurrentTime);
+    XFlush(g_display);
+    return 0;
+}
 #endif /* __linux__ */
 
 /* ========================================================================
@@ -1489,26 +1642,15 @@ EXPORT void zan_gui_draw_icon(i64 s, i64 x, i64 y, i64 b, i64 c, i64 cp) { (void
 #endif
 
 /* ========================================================================
- * Window-management shims shared by the non-Windows backends.
- *
- * These are native to the Win32 title-bar / DWM integration; on X11 and
- * macOS they are currently no-ops so that [DllImport("zan_gui")] programs
- * stay linkable on every platform (the functions above are defined per
- * backend; only these Win32-specific ones were missing off Windows).
- * zan_gui_write_file is portable and implemented for real.
- * ======================================================================== */
+ * Portable / fallback shims for functions native only to Win32.
+ * ========================================================================
+ * Client-side-decoration metrics are a Win32 concept; on X11/macOS the window
+ * manager owns the title bar, so these report 0. write_file is portable. */
 #if !defined(_WIN32)
 #include <stdio.h>
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
-EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
-EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
-EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
-EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     FILE *f = fopen(path, "wb");
     if (!f) return 1;
@@ -1516,4 +1658,17 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     fclose(f);
     return 0;
 }
+#endif
+
+/* Window management: X11 has real implementations in the __linux__ branch
+ * above; macOS (and any other non-Windows target) falls back to no-ops until
+ * a native Cocoa backend is wired in. */
+#if !defined(_WIN32) && !defined(__linux__)
+EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
+EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
+EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 #endif
