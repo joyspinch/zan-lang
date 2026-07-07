@@ -3,33 +3,51 @@ using System;
 namespace System.Diagnostics;
 
 /// <summary>
-/// Minimal process launcher that runs a command line through the C runtime's
-/// pipe API (`_popen`/`_pclose`) and captures its combined stdout+stderr as a
-/// list of text lines. Intended for driving CLI tools (the Zan compiler,
-/// linkers, package managers) from Zan programs such as the IDE.
+/// Cross-platform process launcher with output capture.
+/// Uses _popen/_pclose on Windows, popen/pclose on Linux.
 /// </summary>
 class Process {
+    #if WINDOWS
     [DllImport("msvcrt", EntryPoint = "_popen")]
-    static extern int popen(string cmd, string mode);
+    static extern int plat_popen(string cmd, string mode);
 
     [DllImport("msvcrt", EntryPoint = "_pclose")]
-    static extern int pclose(int fp);
+    static extern int plat_pclose(int fp);
+    #elif LINUX
+    [DllImport("libc", EntryPoint = "popen")]
+    static extern int plat_popen(string cmd, string mode);
 
-    [DllImport("msvcrt")]
+    [DllImport("libc", EntryPoint = "pclose")]
+    static extern int plat_pclose(int fp);
+    #endif
+
+    [DllImport("crt")]
     static extern int fread(string buf, int size, int count, int fp);
 
-    [DllImport("msvcrt")]
+    [DllImport("crt")]
     static extern string calloc(int count, int size);
 
-    /// <summary>
-    /// Runs `cmd` (redirecting stderr into stdout) and returns everything it
-    /// prints, split into lines. On failure to launch, returns a single
-    /// diagnostic line beginning with "[error]".
-    /// </summary>
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    [DllImport("crt")]
+    static extern int system(string cmd);
+
+    /// <summary>Opens a process pipe.</summary>
+    static int PipeOpen(string cmd, string mode) {
+        return plat_popen(cmd, mode);
+    }
+
+    /// <summary>Closes a process pipe.</summary>
+    static int PipeClose(int fp) {
+        return plat_pclose(fp);
+    }
+
+    /// <summary>Runs a command and captures stdout+stderr as lines.</summary>
     static List<string> RunCapture(string cmd) {
         List<string> lines = new List<string>();
         string full = "(" + cmd + ") 2>&1";
-        int fp = Process.popen(full, "r");
+        int fp = PipeOpen(full, "r");
         if (fp == 0) {
             lines.Add("[error] failed to launch: " + cmd);
             return lines;
@@ -37,20 +55,30 @@ class Process {
         StringBuilder sb = new StringBuilder();
         bool reading = true;
         while (reading) {
-            string buf = Process.calloc(4097, 1);
-            int n = Process.fread(buf, 1, 4096, fp);
+            string buf = calloc(4097, 1);
+            int n = fread(buf, 1, 4096, fp);
             if (n <= 0) {
                 reading = false;
             } else {
                 sb.Append(buf);
             }
         }
-        Process.pclose(fp);
-        return Process.SplitLines(sb.ToString());
+        PipeClose(fp);
+        return SplitLines(sb.ToString());
     }
 
-    /// Splits text on newlines, dropping carriage returns; trailing empty line
-    /// is omitted so callers get clean per-line output.
+    /// <summary>Runs a command and captures output (wrapper).</summary>
+    static List<string> RunCaptureAsync(string cmd) {
+        List<string> result = RunCapture(cmd);
+        return result;
+    }
+
+    /// <summary>Runs a command and returns the exit code.</summary>
+    static int Run(string cmd) {
+        return system(cmd);
+    }
+
+    /// <summary>Splits text on newlines.</summary>
     static List<string> SplitLines(string text) {
         List<string> lines = new List<string>();
         StringBuilder sb = new StringBuilder();

@@ -26,7 +26,14 @@ typedef enum {
     SYN_OPERATOR,
     SYN_IDENTIFIER,
     SYN_PREPROCESSOR,
-    SYN_BUILTIN
+    SYN_BUILTIN,
+    SYN_STRING_INTERP,      /* interpolated string $"..." */
+    SYN_STRING_VERBATIM,    /* verbatim string @"..." */
+    SYN_ATTRIBUTE,          /* [Attribute] */
+    SYN_GENERIC_PARAM,      /* <T> generic type params */
+    SYN_NAMESPACE_REF,      /* namespace.Type references */
+    SYN_ENUM_MEMBER,        /* enum member names */
+    SYN_PARAM_NAME          /* named parameter in calls */
 } syn_kind_t;
 
 /* A syntax-highlighted span within a line */
@@ -36,12 +43,22 @@ typedef struct {
     syn_kind_t kind;
 } syn_span_t;
 
+/* State carried from previous line for multi-line constructs */
+typedef enum {
+    SYN_STATE_NORMAL = 0,
+    SYN_STATE_BLOCK_COMMENT,   /* inside / * ... * / */
+    SYN_STATE_VERBATIM_STRING, /* inside @"..." */
+    SYN_STATE_RAW_STRING       /* inside """...""" */
+} syn_line_state_t;
+
 /* Highlighted line cache */
 typedef struct {
-    syn_span_t *spans;
-    int          span_count;
-    int          span_cap;
-    bool         dirty;
+    syn_span_t     *spans;
+    int             span_count;
+    int             span_cap;
+    bool            dirty;
+    syn_line_state_t start_state;  /* state at beginning of this line */
+    syn_line_state_t end_state;    /* state at end of this line */
 } syn_line_t;
 
 /* A single editor tab */

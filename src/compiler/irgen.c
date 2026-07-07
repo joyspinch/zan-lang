@@ -421,6 +421,21 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_OBJECT: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_ENUM:
         return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_DELEGATE: {
+        /* delegate types map to function pointer types */
+        int pc = type->delegate_param_count;
+        LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
+            (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
+        for (int i = 0; i < pc; i++) {
+            param_types[i] = map_type(g, type->delegate_param_types[i]);
+        }
+        LLVMTypeRef ret = type->delegate_ret_type
+            ? map_type(g, type->delegate_ret_type)
+            : LLVMVoidTypeInContext(g->ctx);
+        LLVMTypeRef fn_type = LLVMFunctionType(ret, param_types, (unsigned)pc, 0);
+        free(param_types);
+        return LLVMPointerType(fn_type, 0);
+    }
     case TYPE_STRUCT:
     case TYPE_CLASS: {
         /* look up registered struct type */
@@ -1043,6 +1058,27 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 }
             }
         }
+        /* method reference as delegate value: MethodName used as a value
+         * (not called) → return the function pointer */
+        if (g->current_type_sym) {
+            zan_symbol_t *method_sym = get_method_sym(g->current_type_sym, expr->ident.name);
+            if (method_sym) {
+                for (int fi = 0; fi < g->function_count; fi++) {
+                    if (g->functions[fi].sym == method_sym) {
+                        return g->functions[fi].fn;
+                    }
+                }
+            }
+        }
+        /* try global LLVM function by name */
+        {
+            char nbuf[256];
+            int nl = expr->ident.name.len < 255 ? expr->ident.name.len : 255;
+            memcpy(nbuf, expr->ident.name.str, (size_t)nl);
+            nbuf[nl] = '\0';
+            LLVMValueRef gfn = LLVMGetNamedFunction(g->mod, nbuf);
+            if (gfn) return gfn;
+        }
         /* return 0 for unresolved — error was reported in checker */
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     }
@@ -1332,12 +1368,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
                         local->alloca, "arrload");
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
-                    LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
-                    if (local->type && local->type->element_type) {
-                        elem_llvm = map_type(g, local->type->element_type);
+                    /* string (byte buffer): use i8 element type and truncate value */
+                    if (local->type && local->type->kind == TYPE_STRING) {
+                        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
+                        LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
+                        LLVMBuildStore(g->builder, val8, elem_ptr);
+                    } else {
+                        LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+                        if (local->type && local->type->element_type) {
+                            elem_llvm = map_type(g, local->type->element_type);
+                        }
+                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
+                        LLVMBuildStore(g->builder, right, elem_ptr);
                     }
-                    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
-                    LLVMBuildStore(g->builder, right, elem_ptr);
                 } else if (g->current_type_sym) {
                     /* implicit this.field[i] = value */
                     zan_symbol_t *fsym = get_field_sym(g->current_type_sym, arr_expr->ident.name);
@@ -1347,6 +1391,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         if (fsym->type && fsym->type->name.len == 4 &&
                             memcmp(fsym->type->name.str, "List", 4) == 0) {
                             emit_list_element_store(g, arr_ptr, idx, right);
+                        } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
+                            LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                            LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
+                            LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
+                            LLVMBuildStore(g->builder, val8, elem_ptr);
                         } else {
                             LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                             if (fsym->type && fsym->type->element_type) {
@@ -1367,6 +1416,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         /* List field: index into the data buffer, not the
                          * struct — otherwise the store clobbers count/cap/data. */
                         emit_list_element_store(g, arr_ptr, idx, right);
+                    } else if (at->kind == TYPE_STRING) {
+                        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
+                        LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
+                        LLVMBuildStore(g->builder, val8, elem_ptr);
                     } else {
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (at->element_type) {
@@ -3166,6 +3220,38 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         /* bare function name call: Compute(21) → look up in current class then global */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
             zan_istr_t fn_name = expr->call.callee->ident.name;
+
+            /* delegate variable invocation: handler(args) where handler is a local
+             * of delegate type → load function pointer and do indirect call */
+            {
+                local_var_t *lv = local_find(locals, fn_name);
+                if (lv && lv->type && lv->type->kind == TYPE_DELEGATE) {
+                    LLVMTypeRef fn_ptr_type = map_type(g, lv->type);
+                    LLVMValueRef fn_ptr = LLVMBuildLoad2(g->builder, fn_ptr_type, lv->alloca, "dlg_ptr");
+                    int pc = lv->type->delegate_param_count;
+                    LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
+                        (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
+                    for (int k = 0; k < pc; k++) {
+                        param_types[k] = map_type(g, lv->type->delegate_param_types[k]);
+                    }
+                    LLVMTypeRef ret = lv->type->delegate_ret_type
+                        ? map_type(g, lv->type->delegate_ret_type)
+                        : LLVMVoidTypeInContext(g->ctx);
+                    LLVMTypeRef fn_type = LLVMFunctionType(ret, param_types, (unsigned)pc, 0);
+                    int argc = expr->call.args.count;
+                    LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+                        (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                    for (int k = 0; k < argc; k++) {
+                        call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                    }
+                    const char *cn = (LLVMGetTypeKind(ret) == LLVMVoidTypeKind) ? "" : "dlgcall";
+                    LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
+                        fn_ptr, call_args, (unsigned)argc, cn);
+                    free(call_args);
+                    free(param_types);
+                    return result;
+                }
+            }
 
             /* try current class methods first */
             if (g->current_type_sym) {
@@ -4969,6 +5055,22 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     LLVMInitializeWebAssemblyAsmPrinter();
 
     char *triple = LLVMGetDefaultTargetTriple();
+#ifdef _WIN32
+    /* Emit GNU-ABI (MinGW) objects so the produced code links against the
+     * bundled ld.lld + mingw-w64 runtime, keeping zanc self-contained: building
+     * an .exe needs only zan, no external clang / MSVC / Windows SDK. Preserve
+     * the host architecture prefix (e.g. x86_64) and swap the vendor/abi. */
+    {
+        const char *dash = strchr(triple, '-');
+        size_t archlen = dash ? (size_t)(dash - triple) : strlen(triple);
+        char gnu[128];
+        if (archlen > sizeof(gnu) - 20) archlen = sizeof(gnu) - 20;
+        memcpy(gnu, triple, archlen);
+        snprintf(gnu + archlen, sizeof(gnu) - archlen, "-w64-windows-gnu");
+        LLVMDisposeMessage(triple);
+        triple = LLVMCreateMessage(gnu);
+    }
+#endif
     LLVMTargetRef target;
     char *error = NULL;
 

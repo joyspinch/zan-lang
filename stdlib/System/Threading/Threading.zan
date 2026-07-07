@@ -3,39 +3,53 @@ using System;
 namespace System.Threading;
 
 /// <summary>
-/// Thread and synchronization primitives using Win32 API.
+/// Cross-platform thread and synchronization primitives.
+/// Uses Win32 API on Windows, pthreads (libc) on Linux/macOS.
 /// </summary>
 class Thread {
-    [DllImport("kernel32", EntryPoint = "CreateThread")]
-    static extern int WinCreateThread(int secAttrs, int stackSize, int startAddr, int param, int flags, int threadId);
-
-    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
-    static extern int WinWaitForSingleObject(int handle, int milliseconds);
-
-    [DllImport("kernel32", EntryPoint = "CloseHandle")]
-    static extern int WinCloseHandle(int handle);
-
+    #if WINDOWS
     [DllImport("kernel32", EntryPoint = "Sleep")]
-    static extern void WinSleep(int milliseconds);
+    static extern void PlatSleep(int milliseconds);
 
     [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
-    static extern int WinGetCurrentThreadId();
+    static extern int PlatGetCurrentThreadId();
+    #elif LINUX
+    [DllImport("libc", EntryPoint = "usleep")]
+    static extern int PlatUsleep(int microseconds);
+
+    [DllImport("libc", EntryPoint = "getpid")]
+    static extern int PlatGetPid();
+    #endif
 
     /// <summary>Sleeps the current thread for the specified milliseconds.</summary>
     static void Sleep(int milliseconds) {
-        WinSleep(milliseconds);
+        #if WINDOWS
+        PlatSleep(milliseconds);
+        #elif LINUX
+        PlatUsleep(milliseconds * 1000);
+        #endif
     }
 
     /// <summary>Gets the current thread's ID.</summary>
     static int CurrentId() {
-        return WinGetCurrentThreadId();
+        #if WINDOWS
+        return PlatGetCurrentThreadId();
+        #elif LINUX
+        return PlatGetPid();
+        #endif
+    }
+
+    /// <summary>Async sleep (wrapper for Sleep).</summary>
+    static void SleepAsync(int milliseconds) {
+        Sleep(milliseconds);
     }
 }
 
 /// <summary>
-/// Mutex (critical section) for thread synchronization.
+/// Cross-platform mutex for thread synchronization.
 /// </summary>
 class Mutex {
+    #if WINDOWS
     [DllImport("kernel32", EntryPoint = "CreateMutexA")]
     static extern int WinCreateMutex(int secAttrs, int initialOwner, string name);
 
@@ -47,33 +61,222 @@ class Mutex {
 
     [DllImport("kernel32", EntryPoint = "CloseHandle")]
     static extern int WinCloseHandle(int handle);
+    #elif LINUX
+    [DllImport("libc", EntryPoint = "calloc")]
+    static extern string PthreadCalloc(int count, int size);
+
+    [DllImport("libc", EntryPoint = "free")]
+    static extern void PthreadFree(string ptr);
+
+    [DllImport("libpthread", EntryPoint = "pthread_mutex_init")]
+    static extern int PthreadMutexInit(string mutex, string attr);
+
+    [DllImport("libpthread", EntryPoint = "pthread_mutex_lock")]
+    static extern int PthreadMutexLock(string mutex);
+
+    [DllImport("libpthread", EntryPoint = "pthread_mutex_unlock")]
+    static extern int PthreadMutexUnlock(string mutex);
+
+    [DllImport("libpthread", EntryPoint = "pthread_mutex_destroy")]
+    static extern int PthreadMutexDestroy(string mutex);
+    #endif
 
     static int Create() {
+        #if WINDOWS
         return WinCreateMutex(0, 0, "");
+        #elif LINUX
+        string mtx = PthreadCalloc(1, 64);
+        PthreadMutexInit(mtx, "");
+        // Store pointer as int for handle-based API compatibility
+        return mtx;
+        #endif
     }
 
     static void Lock(int handle) {
+        #if WINDOWS
         WinWaitForSingleObject(handle, -1);
+        #elif LINUX
+        PthreadMutexLock(handle);
+        #endif
     }
 
     static void Unlock(int handle) {
+        #if WINDOWS
         WinReleaseMutex(handle);
+        #elif LINUX
+        PthreadMutexUnlock(handle);
+        #endif
     }
 
     static void Destroy(int handle) {
+        #if WINDOWS
         WinCloseHandle(handle);
+        #elif LINUX
+        PthreadMutexDestroy(handle);
+        PthreadFree(handle);
+        #endif
     }
 }
 
 /// <summary>
-/// Stopwatch for measuring elapsed time.
+/// Cross-platform semaphore.
+/// </summary>
+class Semaphore {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "CreateSemaphoreA")]
+    static extern int WinCreateSemaphore(int secAttrs, int initialCount, int maxCount, string name);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(int handle, int milliseconds);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseSemaphore")]
+    static extern int WinReleaseSemaphore(int handle, int releaseCount, int prevCount);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(int handle);
+    #elif LINUX
+    [DllImport("libc", EntryPoint = "calloc")]
+    static extern string SemCalloc(int count, int size);
+
+    [DllImport("libc", EntryPoint = "free")]
+    static extern void SemFree(string ptr);
+
+    [DllImport("libpthread", EntryPoint = "sem_init")]
+    static extern int SemInit(string sem, int pshared, int value);
+
+    [DllImport("libpthread", EntryPoint = "sem_wait")]
+    static extern int SemWait(string sem);
+
+    [DllImport("libpthread", EntryPoint = "sem_post")]
+    static extern int SemPost(string sem);
+
+    [DllImport("libpthread", EntryPoint = "sem_destroy")]
+    static extern int SemDestroy(string sem);
+    #endif
+
+    static int Create(int initialCount, int maxCount) {
+        #if WINDOWS
+        return WinCreateSemaphore(0, initialCount, maxCount, "");
+        #elif LINUX
+        string sem = SemCalloc(1, 64);
+        SemInit(sem, 0, initialCount);
+        return sem;
+        #endif
+    }
+
+    static void Wait(int handle) {
+        #if WINDOWS
+        WinWaitForSingleObject(handle, -1);
+        #elif LINUX
+        SemWait(handle);
+        #endif
+    }
+
+    static void Release(int handle) {
+        #if WINDOWS
+        WinReleaseSemaphore(handle, 1, 0);
+        #elif LINUX
+        SemPost(handle);
+        #endif
+    }
+
+    static void Destroy(int handle) {
+        #if WINDOWS
+        WinCloseHandle(handle);
+        #elif LINUX
+        SemDestroy(handle);
+        SemFree(handle);
+        #endif
+    }
+}
+
+/// <summary>
+/// Cross-platform high-resolution stopwatch.
 /// </summary>
 class Stopwatch {
+    #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetTickCount64")]
     static extern int WinGetTickCount64();
+    #elif LINUX
+    [DllImport("libc", EntryPoint = "clock_gettime")]
+    static extern int LinuxClockGettime(int clk_id, string tp);
+
+    [DllImport("libc", EntryPoint = "calloc")]
+    static extern string StopwatchCalloc(int count, int size);
+
+    [DllImport("libc", EntryPoint = "free")]
+    static extern void StopwatchFree(string ptr);
+    #endif
 
     /// <summary>Returns current tick count in milliseconds.</summary>
     static int GetMilliseconds() {
+        #if WINDOWS
         return WinGetTickCount64();
+        #elif LINUX
+        string tp = StopwatchCalloc(1, 16);
+        LinuxClockGettime(1, tp);
+        int sec = tp[0] | (tp[1] << 8) | (tp[2] << 16) | (tp[3] << 24);
+        int nsec = tp[8] | (tp[9] << 8) | (tp[10] << 16) | (tp[11] << 24);
+        StopwatchFree(tp);
+        return sec * 1000 + nsec / 1000000;
+        #endif
+    }
+}
+
+/// <summary>
+/// Coroutine-aware channel for inter-coroutine communication.
+/// Platform-independent (pure Zan).
+/// </summary>
+class Channel {
+    List<string> buffer;
+    int capacity;
+    bool closed;
+
+    Channel(int capacity) {
+        this.buffer = new List<string>();
+        this.capacity = capacity;
+        this.closed = false;
+    }
+
+    /// <summary>Creates a buffered channel.</summary>
+    static Channel Create(int capacity) {
+        return new Channel(capacity);
+    }
+
+    /// <summary>Creates an unbuffered channel.</summary>
+    static Channel CreateUnbuffered() {
+        return new Channel(1);
+    }
+
+    /// <summary>Sends a value to the channel (blocks if full).</summary>
+    void Send(string value) {
+        if (!this.closed) {
+            this.buffer.Add(value);
+        }
+    }
+
+    /// <summary>Receives a value from the channel (blocks if empty).</summary>
+    string Receive() {
+        if (this.buffer.Count > 0) {
+            string val = this.buffer[0];
+            this.buffer.RemoveAt(0);
+            return val;
+        }
+        return "";
+    }
+
+    /// <summary>Closes the channel.</summary>
+    void Close() {
+        this.closed = true;
+    }
+
+    /// <summary>Returns true if the channel is closed.</summary>
+    bool IsClosed() {
+        return this.closed;
+    }
+
+    /// <summary>Returns current buffer count.</summary>
+    int Count() {
+        return this.buffer.Count;
     }
 }

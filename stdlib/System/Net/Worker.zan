@@ -1,0 +1,270 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.WebSocket;
+
+namespace System.Net;
+
+/// <summary>
+/// Workerman-style multi-protocol Worker server.
+/// Supports TCP, HTTP, WebSocket, and UDP protocols.
+/// </summary>
+class Worker {
+    string protocol;
+    string host;
+    int port;
+    string name;
+    bool running;
+    int connectionCount;
+    int maxConnections;
+
+    static List<Worker> workers = new List<Worker>();
+
+    Worker(string protocol, string host, int port) {
+        this.protocol = protocol;
+        this.host = host;
+        this.port = port;
+        this.name = protocol + "-worker";
+        this.running = false;
+        this.connectionCount = 0;
+        this.maxConnections = 10000;
+    }
+
+    /// <summary>Creates a new Worker for the given protocol.</summary>
+    static Worker Create(string protocol, string host, int port) {
+        Worker w = new Worker(protocol, host, port);
+        workers.Add(w);
+        return w;
+    }
+
+    /// <summary>Sets the worker name.</summary>
+    Worker SetName(string name) {
+        this.name = name;
+        return this;
+    }
+
+    /// <summary>Sets max concurrent connections.</summary>
+    Worker SetMaxConnections(int max) {
+        this.maxConnections = max;
+        return this;
+    }
+
+    /// <summary>Runs all registered workers.</summary>
+    static void RunAll() {
+        Socket.Initialize();
+        Console.WriteLine("[Worker] Starting " + Convert.ToString(workers.Count) + " workers...");
+
+        int i = 0;
+        while (i < workers.Count) {
+            Worker w = workers[i];
+            Console.WriteLine("[Worker] " + w.name + " listening on " + w.protocol + "://" + w.host + ":" + Convert.ToString(w.port));
+            w.Run();
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Starts this worker's event loop.</summary>
+    void Run() {
+        this.running = true;
+
+        if (this.protocol == "udp") {
+            RunUdp();
+            return;
+        }
+
+        TcpListener listener = TcpListener.Create(this.host, this.port);
+        listener.Start();
+
+        while (this.running) {
+            int clientSock = listener.AcceptAsync();
+            if (clientSock >= 0) {
+                this.connectionCount = this.connectionCount + 1;
+                if (this.protocol == "http") {
+                    HandleHttp(clientSock);
+                } else if (this.protocol == "websocket" || this.protocol == "ws") {
+                    HandleWebSocket(clientSock);
+                } else {
+                    HandleTcp(clientSock);
+                }
+            }
+        }
+    }
+
+    /// <summary>Handles a raw TCP connection.</summary>
+    void HandleTcp(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        bool active = true;
+        while (active) {
+            string data = client.RecvAsync(65536);
+            if (data.Length == 0) {
+                active = false;
+            } else {
+                string response = OnTcpMessage(data);
+                if (response.Length > 0) {
+                    client.SendAsync(response);
+                }
+            }
+        }
+        client.Close();
+        this.connectionCount = this.connectionCount - 1;
+    }
+
+    /// <summary>Handles an HTTP connection with keep-alive.</summary>
+    void HandleHttp(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        bool keepAlive = true;
+        while (keepAlive) {
+            string rawData = client.RecvAsync(65536);
+            if (rawData.Length == 0) { break; }
+
+            HttpRequest request = HttpRequest.Parse(rawData);
+            keepAlive = request.keepAlive;
+
+            HttpResponse response = OnHttpRequest(request);
+            response.SetKeepAlive(keepAlive);
+            client.SendAsync(response.Build());
+        }
+        client.Close();
+        this.connectionCount = this.connectionCount - 1;
+    }
+
+    /// <summary>Handles a WebSocket connection.</summary>
+    void HandleWebSocket(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+
+        string rawReq = client.RecvAsync(65536);
+        HttpRequest req = HttpRequest.Parse(rawReq);
+        string wsKey = req.GetHeader("Sec-WebSocket-Key");
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Accept: ");
+        sb.Append(wsKey);
+        sb.Append("\r\n\r\n");
+        client.SendAsync(sb.ToString());
+
+        bool active = true;
+        while (active) {
+            string frameData = client.RecvAsync(65536);
+            if (frameData.Length == 0) { break; }
+
+            WsFrame frame = WsFrame.Decode(frameData, frameData.Length);
+            if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
+                string response = OnWebSocketMessage(frame.payload);
+                if (response.Length > 0) {
+                    WsFrame respFrame = WsFrame.TextFrame(response);
+                    string encoded = respFrame.Encode();
+                    client.SendBytesAsync(encoded, 2 + response.Length);
+                }
+            } else if (frame.opcode == WsOpcode.Ping) {
+                WsFrame pong = WsFrame.PongFrame();
+                string encoded = pong.Encode();
+                client.SendBytesAsync(encoded, 2);
+            } else if (frame.opcode == WsOpcode.Close) {
+                active = false;
+            }
+        }
+
+        client.Close();
+        this.connectionCount = this.connectionCount - 1;
+    }
+
+    /// <summary>Handles UDP messages.</summary>
+    void RunUdp() {
+        UdpClient udp = UdpClient.Bind(this.host, this.port);
+        while (this.running) {
+            string data = udp.RecvFromAsync(65536);
+            if (data.Length > 0) {
+                string response = OnUdpMessage(data);
+            }
+        }
+        udp.Close();
+    }
+
+    string OnTcpMessage(string data) {
+        return data;
+    }
+
+    HttpResponse OnHttpRequest(HttpRequest request) {
+        return HttpResponse.Ok("<h1>Zan Worker - " + this.name + "</h1>");
+    }
+
+    string OnWebSocketMessage(string message) {
+        return message;
+    }
+
+    string OnUdpMessage(string data) {
+        return data;
+    }
+
+    void Stop() {
+        this.running = false;
+    }
+
+    static void StopAll() {
+        int i = 0;
+        while (i < workers.Count) {
+            workers[i].Stop();
+            i = i + 1;
+        }
+    }
+
+    int GetConnectionCount() {
+        return this.connectionCount;
+    }
+}
+
+/// <summary>
+/// Connection abstraction for tracking client connections.
+/// </summary>
+class Connection {
+    int id;
+    int sock;
+    string remoteIp;
+    int remotePort;
+    string protocol;
+    string userData;
+
+    Connection(int id, int sock, string protocol) {
+        this.id = id;
+        this.sock = sock;
+        this.protocol = protocol;
+        this.remoteIp = "";
+        this.remotePort = 0;
+        this.userData = "";
+    }
+
+    static Connection Create(int id, int sock, string protocol) {
+        return new Connection(id, sock, protocol);
+    }
+
+    void SetData(string data) {
+        this.userData = data;
+    }
+
+    string GetData() {
+        return this.userData;
+    }
+
+    int GetId() {
+        return this.id;
+    }
+
+    int GetSocket() {
+        return this.sock;
+    }
+
+    string GetProtocol() {
+        return this.protocol;
+    }
+
+    void Send(string data) {
+        Socket.SendStringAsync(this.sock, data);
+    }
+
+    void Close() {
+        Socket.Close(this.sock);
+    }
+}

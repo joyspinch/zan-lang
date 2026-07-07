@@ -1451,22 +1451,6 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
 }
 
 EXPORT void zan_gui_draw_icon(i64 s, i64 x, i64 y, i64 b, i64 c, i64 cp) { (void)s;(void)x;(void)y;(void)b;(void)c;(void)cp; }
-EXPORT i64 zan_gui_set_cursor(i64 cursor_type) { (void)cursor_type; return 0; }
-EXPORT i64 zan_gui_set_title(i64 h, const char *t) { (void)h; (void)t; return 0; }
-EXPORT i64 zan_gui_get_tick_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (i64)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-}
-
-EXPORT void zan_gui_sleep_ms(i64 ms) {
-    if (ms <= 0) return;
-    struct timespec req;
-    req.tv_sec = (time_t)(ms / 1000);
-    req.tv_nsec = (long)((ms % 1000) * 1000000L);
-    nanosleep(&req, NULL);
-}
-
 #endif /* __linux__ */
 
 /* ========================================================================

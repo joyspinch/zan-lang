@@ -27,12 +27,14 @@
 #include "project.h"
 #include "intellisense.h"
 #include "debugger.h"
+#include "designer.h"
 
 /* ---- Global state ---- */
 static editor_t g_editor;
 static project_tree_t g_project;
 static intellisense_t g_intel;
 static debugger_t g_debugger;
+static designer_t g_designer;
 static HWND     g_hwnd;
 static HFONT    g_code_font;
 static int      g_char_width;
@@ -58,6 +60,14 @@ static int      g_line_num_width;    /* pixels for line number gutter */
 #define CLR_OPERATOR    RGB(212, 212, 212)
 #define CLR_BUILTIN     RGB(220, 220, 170)
 #define CLR_TAB_BORDER  RGB(60, 60, 60)
+#define CLR_INTERP_STR  RGB(255, 200, 140)
+#define CLR_VERBATIM    RGB(206, 145, 120)
+#define CLR_ATTRIBUTE   RGB(200, 200, 120)
+#define CLR_GENERIC     RGB(78, 201, 176)
+#define CLR_NAMESPACE   RGB(120, 180, 220)
+#define CLR_ENUM_MBR    RGB(180, 220, 160)
+#define CLR_PARAM_NAME  RGB(150, 150, 220)
+#define CLR_SIGNATURE   RGB(100, 200, 200)
 
 /* Menu IDs */
 #define IDM_NEW         1001
@@ -92,6 +102,15 @@ static int      g_line_num_width;    /* pixels for line number gutter */
 #define IDM_FORMAT      1030
 #define IDM_GENDOC      1031
 #define IDM_NEWWINDOW   1032
+#define IDM_CONTINUE    1033
+#define IDM_DESIGNER    1034
+#define IDM_DESGNEW     1035
+#define IDM_DESGOPEN    1036
+#define IDM_DESGSAVE    1037
+#define IDM_DESGGEN     1038
+#define IDM_DESGDEL     1039
+#define IDM_DESGUNDO    1040
+#define IDM_DESGREDO    1041
 
 /* Layout constants */
 #define TAB_HEIGHT      28
@@ -271,13 +290,25 @@ static void create_menus(HWND hwnd) {
     AppendMenuW(hDebug, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hDebug, MF_STRING, IDM_TOGGLEBP, L"Toggle &Breakpoint\tF9");
 
+    HMENU hDesigner = CreatePopupMenu();
+    AppendMenuW(hDesigner, MF_STRING, IDM_DESGNEW,  L"&New Form...");
+    AppendMenuW(hDesigner, MF_STRING, IDM_DESGOPEN, L"&Open Designer...");
+    AppendMenuW(hDesigner, MF_STRING, IDM_DESGSAVE, L"&Save Form");
+    AppendMenuW(hDesigner, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hDesigner, MF_STRING, IDM_DESGGEN,  L"&Generate Code");
+    AppendMenuW(hDesigner, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hDesigner, MF_STRING, IDM_DESGDEL,  L"&Delete Control\tDel");
+    AppendMenuW(hDesigner, MF_STRING, IDM_DESGUNDO, L"&Undo\tCtrl+Z");
+    AppendMenuW(hDesigner, MF_STRING, IDM_DESGREDO, L"&Redo\tCtrl+Y");
+
     AppendMenuW(hHelp, MF_STRING, IDM_ABOUT, L"&About Zan IDE");
 
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFile,  L"&File");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hEdit,  L"&Edit");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hBuild, L"&Build");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hDebug, L"&Debug");
-    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hHelp,  L"&Help");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFile,     L"&File");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hEdit,     L"&Edit");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hBuild,    L"&Build");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hDebug,    L"&Debug");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hDesigner, L"D&esigner");
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hHelp,     L"&Help");
 
     SetMenu(hwnd, hMenu);
 }
@@ -286,16 +317,23 @@ static void create_menus(HWND hwnd) {
 
 static COLORREF syn_color(syn_kind_t kind) {
     switch (kind) {
-        case SYN_KEYWORD:     return CLR_KEYWORD;
-        case SYN_TYPE:        return CLR_TYPE;
-        case SYN_STRING:      return CLR_STRING;
-        case SYN_NUMBER:      return CLR_NUMBER;
-        case SYN_COMMENT:     return CLR_COMMENT;
-        case SYN_OPERATOR:    return CLR_OPERATOR;
-        case SYN_BUILTIN:     return CLR_BUILTIN;
-        case SYN_IDENTIFIER:  return CLR_TEXT;
-        case SYN_PREPROCESSOR:return CLR_KEYWORD;
-        default:              return CLR_TEXT;
+        case SYN_KEYWORD:        return CLR_KEYWORD;
+        case SYN_TYPE:           return CLR_TYPE;
+        case SYN_STRING:         return CLR_STRING;
+        case SYN_NUMBER:         return CLR_NUMBER;
+        case SYN_COMMENT:        return CLR_COMMENT;
+        case SYN_OPERATOR:       return CLR_OPERATOR;
+        case SYN_BUILTIN:        return CLR_BUILTIN;
+        case SYN_IDENTIFIER:     return CLR_TEXT;
+        case SYN_PREPROCESSOR:   return CLR_KEYWORD;
+        case SYN_STRING_INTERP:  return CLR_INTERP_STR;
+        case SYN_STRING_VERBATIM:return CLR_VERBATIM;
+        case SYN_ATTRIBUTE:      return CLR_ATTRIBUTE;
+        case SYN_GENERIC_PARAM:  return CLR_GENERIC;
+        case SYN_NAMESPACE_REF:  return CLR_NAMESPACE;
+        case SYN_ENUM_MEMBER:    return CLR_ENUM_MBR;
+        case SYN_PARAM_NAME:     return CLR_PARAM_NAME;
+        default:                 return CLR_TEXT;
     }
 }
 
@@ -769,15 +807,17 @@ static void paint_toolbar(HDC hdc, RECT *rc) {
     SelectObject(hdc, old_pen);
     DeleteObject(pen);
 
-    /* toolbar buttons: [New] [Open] [Save] | [Build] [Run] | [Find] */
+    /* toolbar buttons: [New] [Open] [Save] | [Build] [Run] [Debug] | [Find] */
     static const struct { const char *label; int cmd; } buttons[] = {
         {"New",  IDM_NEW}, {"Open", IDM_OPEN}, {"Save", IDM_SAVE},
         {"|", 0},
-        {"Build", IDM_BUILD}, {"Run", IDM_RUN}, {"F5", IDM_BUILDRUN},
+        {"Build", IDM_BUILD}, {"Run", IDM_RUN}, {"Debug", IDM_DEBUG},
         {"|", 0},
         {"Find", IDM_FIND}, {"Replace", IDM_REPLACE},
         {"|", 0},
         {"Format", IDM_FORMAT},
+        {"|", 0},
+        {"Designer", IDM_DESIGNER},
     };
     int bcount = sizeof(buttons) / sizeof(buttons[0]);
 
@@ -800,13 +840,50 @@ static void paint_toolbar(HDC hdc, RECT *rc) {
         int tw = (int)strlen(buttons[i].label) * g_char_width + 12;
         RECT btn_rc = { bx, 3, bx + tw, TOOLBAR_HEIGHT - 4 };
 
-        HBRUSH bbr = CreateSolidBrush(RGB(55, 55, 58));
+        /* Highlight active Debug button differently */
+        COLORREF btn_bg = RGB(55, 55, 58);
+        if (buttons[i].cmd == IDM_DEBUG && g_debugger.state == DBG_PAUSED)
+            btn_bg = RGB(30, 100, 30); /* green tint when debugging */
+        HBRUSH bbr = CreateSolidBrush(btn_bg);
         FillRect(hdc, &btn_rc, bbr);
         DeleteObject(bbr);
 
         SetTextColor(hdc, RGB(200, 200, 200));
         DrawTextA(hdc, buttons[i].label, -1, &btn_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         bx += tw + 4;
+    }
+
+    /* Debug control buttons (shown when a debug session is active) */
+    if (g_debugger.state == DBG_PAUSED || g_debugger.state == DBG_RUNNING) {
+        static const struct { const char *label; int cmd; COLORREF clr; } dbg_buttons[] = {
+            {"Continue", IDM_CONTINUE, RGB(40, 120, 40)},
+            {"Step",     IDM_STEPOVER, RGB(60, 80, 120)},
+            {"Into",     IDM_STEPINTO, RGB(60, 80, 120)},
+            {"Out",      IDM_STEPOUT,  RGB(60, 80, 120)},
+            {"Stop",     IDM_STOPDBG,  RGB(140, 40, 40)},
+        };
+        int dbg_count = sizeof(dbg_buttons) / sizeof(dbg_buttons[0]);
+
+        /* separator */
+        bx += 6;
+        HPEN dsp = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
+        HPEN odsp = (HPEN)SelectObject(hdc, dsp);
+        MoveToEx(hdc, bx, 4, NULL);
+        LineTo(hdc, bx, TOOLBAR_HEIGHT - 6);
+        SelectObject(hdc, odsp);
+        DeleteObject(dsp);
+        bx += 6;
+
+        for (int di = 0; di < dbg_count; di++) {
+            int dtw = (int)strlen(dbg_buttons[di].label) * g_char_width + 12;
+            RECT dbtn_rc = { bx, 3, bx + dtw, TOOLBAR_HEIGHT - 4 };
+            HBRUSH dbr = CreateSolidBrush(dbg_buttons[di].clr);
+            FillRect(hdc, &dbtn_rc, dbr);
+            DeleteObject(dbr);
+            SetTextColor(hdc, RGB(220, 220, 220));
+            DrawTextA(hdc, dbg_buttons[di].label, -1, &dbtn_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            bx += dtw + 4;
+        }
     }
 }
 
@@ -948,6 +1025,52 @@ static void paint_minimap(HDC hdc, RECT *rc) {
     }
 }
 
+static void paint_designer_view(HDC hdc, RECT *rc) {
+    /* Layout: Toolbox (left 160px) | Design Surface (center) | Properties (right 200px) */
+    int toolbox_w = 160;
+    int props_w = 200;
+    int top = TOOLBAR_HEIGHT + TAB_HEIGHT;
+    int bottom = rc->bottom - OUTPUT_HEIGHT - STATUS_HEIGHT;
+    int surface_x = toolbox_w;
+    int surface_w = rc->right - toolbox_w - props_w;
+    int surface_h = bottom - top;
+
+    /* Toolbox panel background */
+    RECT tb_rect = { 0, top, toolbox_w, bottom };
+    HBRUSH tb_brush = CreateSolidBrush(RGB(245, 245, 245));
+    FillRect(hdc, &tb_rect, tb_brush);
+    DeleteObject(tb_brush);
+    designer_paint_toolbox(&g_designer, (void *)hdc, 0, top, toolbox_w, bottom - top);
+
+    /* Design surface */
+    RECT surf_rect = { surface_x, top, surface_x + surface_w, bottom };
+    HBRUSH surf_brush = CreateSolidBrush(RGB(220, 220, 220));
+    FillRect(hdc, &surf_rect, surf_brush);
+    DeleteObject(surf_brush);
+    /* Center the form on the surface */
+    int form_x = surface_x + (surface_w - (int)(g_designer.form.width * g_designer.zoom)) / 2;
+    int form_y = top + (surface_h - (int)(g_designer.form.height * g_designer.zoom)) / 2;
+    if (form_x < surface_x + 10) form_x = surface_x + 10;
+    if (form_y < top + 10) form_y = top + 10;
+    designer_paint(&g_designer, (void *)hdc, form_x, form_y, surface_w, surface_h);
+
+    /* Properties panel background */
+    RECT pp_rect = { rc->right - props_w, top, rc->right, bottom };
+    HBRUSH pp_brush = CreateSolidBrush(RGB(250, 250, 250));
+    FillRect(hdc, &pp_rect, pp_brush);
+    DeleteObject(pp_brush);
+    designer_paint_properties(&g_designer, (void *)hdc,
+                              rc->right - props_w, top, props_w, bottom - top);
+
+    /* Vertical separators */
+    HPEN sep = CreatePen(PS_SOLID, 1, RGB(180, 180, 180));
+    HPEN old_pen = (HPEN)SelectObject(hdc, sep);
+    MoveToEx(hdc, toolbox_w, top, NULL); LineTo(hdc, toolbox_w, bottom);
+    MoveToEx(hdc, rc->right - props_w, top, NULL); LineTo(hdc, rc->right - props_w, bottom);
+    SelectObject(hdc, old_pen);
+    DeleteObject(sep);
+}
+
 static void paint_editor(HDC hdc, RECT *rc) {
     /* measure font if not done */
     if (g_char_width == 0) {
@@ -962,15 +1085,21 @@ static void paint_editor(HDC hdc, RECT *rc) {
 
     paint_toolbar(hdc, rc);
     paint_tabs(hdc, rc);
-    paint_project(hdc, rc);
-    paint_gutter(hdc, rc);
-    paint_code(hdc, rc);
-    paint_cursor(hdc, rc);
-    paint_minimap(hdc, rc);
-    paint_find_bar(hdc, rc);
+
+    if (g_designer.active) {
+        /* Show designer view instead of code editor */
+        paint_designer_view(hdc, rc);
+    } else {
+        paint_project(hdc, rc);
+        paint_gutter(hdc, rc);
+        paint_code(hdc, rc);
+        paint_cursor(hdc, rc);
+        paint_minimap(hdc, rc);
+        paint_find_bar(hdc, rc);
+        paint_breakpoints(hdc, rc);
+        paint_autocomplete(hdc, rc);
+    }
     paint_output(hdc, rc);
-    paint_breakpoints(hdc, rc);
-    paint_autocomplete(hdc, rc);
     paint_status(hdc, rc);
 }
 
@@ -1269,9 +1398,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case VK_RETURN: editor_insert_newline(&g_editor); break;
         case VK_TAB:    editor_indent(&g_editor); break;
         case VK_F5:
-            if (shift) dbg_stop(&g_debugger);
-            else if (g_debugger.state == DBG_PAUSED) dbg_continue(&g_debugger);
-            else do_build_and_run();
+            if (shift) {
+                dbg_stop(&g_debugger);
+                append_output("[DBG] Debugging stopped.\n");
+                InvalidateRect(hwnd, NULL, TRUE);
+            } else if (g_debugger.state == DBG_PAUSED) {
+                SendMessage(hwnd, WM_COMMAND, IDM_CONTINUE, 0);
+            } else {
+                SendMessage(hwnd, WM_COMMAND, IDM_DEBUG, 0);
+            }
             break;
         case VK_F9:     {
             editor_tab_t *t = editor_active(&g_editor);
@@ -1361,6 +1496,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         if (ch >= 32 && ch < 127) {
             editor_insert_char(&g_editor, ch);
+            /* Auto-trigger completion on dot (member access) */
+            if (ch == '.') {
+                editor_tab_t *atab = editor_active(&g_editor);
+                if (atab) {
+                    size_t llen = pt_line_length(atab->buffer, atab->cursor_line);
+                    char *line_buf = (char *)malloc(llen + 1);
+                    size_t ls = pt_line_start(atab->buffer, atab->cursor_line);
+                    pt_get_text(atab->buffer, ls, llen, line_buf);
+                    line_buf[llen] = '\0';
+                    /* find identifier before the dot */
+                    int dot_pos = (int)atab->cursor_col - 1;
+                    int obj_end = dot_pos;
+                    int obj_start = obj_end;
+                    while (obj_start > 0 && (isalnum((unsigned char)line_buf[obj_start-1]) || line_buf[obj_start-1] == '_')) obj_start--;
+                    if (obj_end > obj_start) {
+                        char ctx[128] = {0};
+                        int ctx_len = obj_end - obj_start;
+                        if (ctx_len > 0 && ctx_len < 127) memcpy(ctx, line_buf + obj_start, (size_t)ctx_len);
+                        intel_complete_members(&g_intel, ctx, "");
+                    }
+                    free(line_buf);
+                }
+            }
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
@@ -1380,7 +1538,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             static const struct { const char *label; int cmd; } tbuttons[] = {
                 {"New",  IDM_NEW}, {"Open", IDM_OPEN}, {"Save", IDM_SAVE},
                 {"|", 0},
-                {"Build", IDM_BUILD}, {"Run", IDM_RUN}, {"F5", IDM_BUILDRUN},
+                {"Build", IDM_BUILD}, {"Run", IDM_RUN}, {"Debug", IDM_DEBUG},
                 {"|", 0},
                 {"Find", IDM_FIND}, {"Replace", IDM_REPLACE},
                 {"|", 0},
@@ -1396,6 +1554,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     return 0;
                 }
                 bx2 += tw2 + 4;
+            }
+            /* Debug control buttons (when debugging) */
+            if (g_debugger.state == DBG_PAUSED || g_debugger.state == DBG_RUNNING) {
+                static const struct { const char *label; int cmd; } dbg_tbuttons[] = {
+                    {"Continue", IDM_CONTINUE},
+                    {"Step",     IDM_STEPOVER},
+                    {"Into",     IDM_STEPINTO},
+                    {"Out",      IDM_STEPOUT},
+                    {"Stop",     IDM_STOPDBG},
+                };
+                int dbt_count = sizeof(dbg_tbuttons) / sizeof(dbg_tbuttons[0]);
+                bx2 += 12; /* separator gap */
+                for (int di = 0; di < dbt_count; di++) {
+                    int dtw2 = (int)strlen(dbg_tbuttons[di].label) * g_char_width + 12;
+                    if (x >= bx2 && x <= bx2 + dtw2) {
+                        SendMessage(hwnd, WM_COMMAND, dbg_tbuttons[di].cmd, 0);
+                        return 0;
+                    }
+                    bx2 += dtw2 + 4;
+                }
             }
             return 0;
         }
@@ -1501,15 +1679,83 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     char exe[MAX_PATH];
                     strncpy(exe, dt->filepath, MAX_PATH - 5);
                     char *dot = strrchr(exe, '.'); if (dot) strcpy(dot, ".exe"); else strcat(exe, ".exe");
-                    dbg_start(&g_debugger, exe, NULL);
+                    bool started = dbg_start(&g_debugger, exe, NULL);
+                    if (!started) {
+                        /* Simulated debugging: set up state to pause at first BP */
+                        g_debugger.state = DBG_PAUSED;
+                        g_debugger.callstack_depth = 1;
+                        g_debugger.active_frame = 0;
+                        strncpy(g_debugger.callstack[0].function_name, "Main",
+                                sizeof(g_debugger.callstack[0].function_name) - 1);
+                        strncpy(g_debugger.callstack[0].file, dt->filepath,
+                                sizeof(g_debugger.callstack[0].file) - 1);
+                        strncpy(g_debugger.current_file, dt->filepath,
+                                sizeof(g_debugger.current_file) - 1);
+                        if (g_debugger.bp_count > 0) {
+                            /* Find first enabled breakpoint in this file */
+                            int first_line = -1;
+                            for (int bi = 0; bi < g_debugger.bp_count; bi++) {
+                                if (!g_debugger.breakpoints[bi].enabled) continue;
+                                if (strcmp(g_debugger.breakpoints[bi].file, dt->filepath) != 0) continue;
+                                if (first_line < 0 || g_debugger.breakpoints[bi].line < first_line)
+                                    first_line = g_debugger.breakpoints[bi].line;
+                            }
+                            if (first_line >= 0) {
+                                g_debugger.current_line = first_line;
+                                g_debugger.callstack[0].line = first_line;
+                                strncpy(g_debugger.stop_reason, "breakpoint",
+                                        sizeof(g_debugger.stop_reason) - 1);
+                                append_output("[DBG] Debugging started. Stopped at breakpoint.\n");
+                            } else {
+                                g_debugger.current_line = 0;
+                                g_debugger.callstack[0].line = 0;
+                                strncpy(g_debugger.stop_reason, "entry",
+                                        sizeof(g_debugger.stop_reason) - 1);
+                                append_output("[DBG] Debugging started. No breakpoints in file.\n");
+                            }
+                        } else {
+                            g_debugger.current_line = 0;
+                            g_debugger.callstack[0].line = 0;
+                            strncpy(g_debugger.stop_reason, "entry",
+                                    sizeof(g_debugger.stop_reason) - 1);
+                            append_output("[DBG] Debugging started (break on entry).\n");
+                        }
+                        dbg_refresh_locals(&g_debugger);
+                        dbg_evaluate_watches(&g_debugger);
+                    } else {
+                        append_output("[DBG] Debugging started with real process.\n");
+                    }
                 }
             }
+            InvalidateRect(hwnd, NULL, TRUE);
             break;
         }
-        case IDM_STOPDBG:   dbg_stop(&g_debugger); break;
-        case IDM_STEPOVER:  dbg_step_over(&g_debugger); break;
-        case IDM_STEPINTO:  dbg_step_into(&g_debugger); break;
-        case IDM_STEPOUT:   dbg_step_out(&g_debugger); break;
+        case IDM_CONTINUE:
+            if (g_debugger.state == DBG_PAUSED) {
+                dbg_continue(&g_debugger);
+                if (g_debugger.state == DBG_TERMINATED) {
+                    append_output("[DBG] Program finished.\n");
+                }
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+        case IDM_STOPDBG:
+            dbg_stop(&g_debugger);
+            append_output("[DBG] Debugging stopped.\n");
+            InvalidateRect(hwnd, NULL, TRUE);
+            break;
+        case IDM_STEPOVER:
+            dbg_step_over(&g_debugger);
+            InvalidateRect(hwnd, NULL, TRUE);
+            break;
+        case IDM_STEPINTO:
+            dbg_step_into(&g_debugger);
+            InvalidateRect(hwnd, NULL, TRUE);
+            break;
+        case IDM_STEPOUT:
+            dbg_step_out(&g_debugger);
+            InvalidateRect(hwnd, NULL, TRUE);
+            break;
         case IDM_TOGGLEBP: {
             editor_tab_t *bt = editor_active(&g_editor);
             if (bt) dbg_toggle_breakpoint(&g_debugger, bt->filepath, (int)bt->cursor_line);
@@ -1523,6 +1769,116 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_FORMAT:  do_format(); break;
         case IDM_GENDOC:  do_gen_doc(); break;
         case IDM_REFRESH: project_refresh(&g_project); break;
+
+        /* ---- Designer commands ---- */
+        case IDM_DESIGNER:
+        case IDM_DESGNEW: {
+            designer_new_form(&g_designer, "MainForm", g_project.root_name);
+            append_output("[Designer] New form created: MainForm\n");
+            InvalidateRect(hwnd, NULL, TRUE);
+            break;
+        }
+        case IDM_DESGOPEN: {
+            OPENFILENAMEW ofn = {0};
+            wchar_t path[512] = {0};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = L"Designer Files (*.designer.zan)\0*.designer.zan\0All Files\0*.*\0";
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = 512;
+            ofn.Flags = OFN_FILEMUSTEXIST;
+            if (GetOpenFileNameW(&ofn)) {
+                char utf8_path[512];
+                WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8_path, 512, NULL, NULL);
+                if (designer_load(&g_designer, utf8_path)) {
+                    append_output("[Designer] Form loaded.\n");
+                } else {
+                    append_output("[Designer] Failed to load form.\n");
+                }
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+        }
+        case IDM_DESGSAVE: {
+            if (g_designer.active) {
+                if (g_designer.designer_file[0]) {
+                    designer_save(&g_designer, g_designer.designer_file);
+                    append_output("[Designer] Form saved.\n");
+                } else {
+                    OPENFILENAMEW ofn = {0};
+                    wchar_t path[512] = {0};
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.lpstrFilter = L"Designer Files (*.designer.zan)\0*.designer.zan\0";
+                    ofn.lpstrFile = path;
+                    ofn.nMaxFile = 512;
+                    ofn.Flags = OFN_OVERWRITEPROMPT;
+                    ofn.lpstrDefExt = L"designer.zan";
+                    if (GetSaveFileNameW(&ofn)) {
+                        char utf8_path[512];
+                        WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8_path, 512, NULL, NULL);
+                        strncpy(g_designer.designer_file, utf8_path, 511);
+                        designer_save(&g_designer, utf8_path);
+                        append_output("[Designer] Form saved.\n");
+                    }
+                }
+            }
+            break;
+        }
+        case IDM_DESGGEN: {
+            if (g_designer.active) {
+                size_t code_len = 0;
+                char *code = designer_generate_code(&g_designer, &code_len);
+                if (code) {
+                    /* Write generated code to a temp file and open it */
+                    char gen_path[512];
+                    snprintf(gen_path, sizeof(gen_path), "%s\\%s.designer.zan",
+                             g_project.root_path, g_designer.form.class_name);
+                    FILE *gf = fopen(gen_path, "w");
+                    if (gf) {
+                        fwrite(code, 1, code_len, gf);
+                        fclose(gf);
+                        editor_open_file(&g_editor, gen_path);
+                        append_output("[Designer] Code generated: ");
+                        append_output(gen_path);
+                        append_output("\n");
+                    } else {
+                        /* Fallback: open new tab and paste code */
+                        editor_new_file(&g_editor);
+                        editor_insert_text(&g_editor, code, code_len);
+                        append_output("[Designer] Code generated in new tab.\n");
+                    }
+                    free(code);
+                    /* Also generate event stubs */
+                    char *stubs = designer_generate_event_stubs(&g_designer, NULL);
+                    if (stubs) {
+                        append_output(stubs);
+                        free(stubs);
+                    }
+                }
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+        }
+        case IDM_DESGDEL:
+            if (g_designer.active) {
+                designer_delete_selected(&g_designer);
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+        case IDM_DESGUNDO:
+            if (g_designer.active) {
+                designer_undo(&g_designer);
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+        case IDM_DESGREDO:
+            if (g_designer.active) {
+                designer_redo(&g_designer);
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            break;
+
         case IDM_ABOUT:
             MessageBoxW(hwnd,
                 L"Zan IDE v1.0\n\n"
@@ -1532,7 +1888,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 L"  Ctrl+N  New file\n"
                 L"  Ctrl+O  Open file\n"
                 L"  Ctrl+S  Save\n"
-                L"  F5      Build & Run\n"
+                L"  Ctrl+R  Run (no debug)\n"
+                L"  F5      Debug / Continue\n"
+                L"  Shift+F5  Stop Debugging\n"
+                L"  F9      Toggle Breakpoint\n"
+                L"  F10     Step Over\n"
+                L"  F11     Step Into\n"
+                L"  Shift+F11  Step Out\n"
                 L"  Ctrl+Z  Undo\n"
                 L"  Ctrl+Y  Redo\n"
                 L"  Ctrl+F  Find\n"

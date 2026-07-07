@@ -1,0 +1,152 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+
+namespace System.Net.Http;
+
+/// <summary>
+/// HTTP client supporting GET, POST, PUT, DELETE.
+/// </summary>
+class HttpClient {
+    string host;
+    int port;
+    int timeout;
+    List<string> defaultHeaders;
+
+    [DllImport("crt")]
+    static extern int fopen(string path, string mode);
+
+    [DllImport("crt")]
+    static extern int fputs(string str, int fp);
+
+    [DllImport("crt")]
+    static extern int fclose(int fp);
+
+    HttpClient() {
+        this.host = "";
+        this.port = 80;
+        this.timeout = 30000;
+        this.defaultHeaders = new List<string>();
+    }
+
+    /// <summary>Creates an HTTP client for a given host and port.</summary>
+    static HttpClient Create(string host, int port) {
+        HttpClient client = new HttpClient();
+        client.host = host;
+        client.port = port;
+        return client;
+    }
+
+    /// <summary>Adds a default header to all requests.</summary>
+    HttpClient SetHeader(string name, string value) {
+        this.defaultHeaders.Add(name + ": " + value);
+        return this;
+    }
+
+    /// <summary>Sets the request timeout in milliseconds.</summary>
+    HttpClient SetTimeout(int ms) {
+        this.timeout = ms;
+        return this;
+    }
+
+    /// <summary>Sends an HTTP request and returns the raw response.</summary>
+    string RequestAsync(string method, string path, string body) {
+        TcpClient conn = TcpClient.ConnectAsync(this.host, this.port);
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append(method);
+        sb.Append(" ");
+        sb.Append(path);
+        sb.Append(" HTTP/1.1\r\n");
+        sb.Append("Host: ");
+        sb.Append(this.host);
+        sb.Append("\r\n");
+
+        int i = 0;
+        while (i < this.defaultHeaders.Count) {
+            sb.Append(this.defaultHeaders[i]);
+            sb.Append("\r\n");
+            i = i + 1;
+        }
+
+        if (body.Length > 0) {
+            sb.Append("Content-Length: ");
+            sb.Append(Convert.ToString(body.Length));
+            sb.Append("\r\n");
+            sb.Append("Content-Type: application/x-www-form-urlencoded\r\n");
+        }
+
+        sb.Append("Connection: close\r\n");
+        sb.Append("\r\n");
+        if (body.Length > 0) {
+            sb.Append(body);
+        }
+
+        conn.SendAsync(sb.ToString());
+
+        // Read response
+        StringBuilder respSb = new StringBuilder();
+        bool reading = true;
+        while (reading) {
+            string chunk = conn.RecvAsync(65536);
+            if (chunk.Length == 0) {
+                reading = false;
+            } else {
+                respSb.Append(chunk);
+            }
+        }
+
+        conn.Close();
+        return respSb.ToString();
+    }
+
+    /// <summary>Sends a GET request and returns the response body.</summary>
+    string GetAsync(string path) {
+        string raw = RequestAsync("GET", path, "");
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    /// <summary>Sends a POST request with form data.</summary>
+    string PostAsync(string path, string body) {
+        string raw = RequestAsync("POST", path, body);
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    /// <summary>Sends a PUT request.</summary>
+    string PutAsync(string path, string body) {
+        string raw = RequestAsync("PUT", path, body);
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    /// <summary>Sends a DELETE request.</summary>
+    string DeleteAsync(string path) {
+        string raw = RequestAsync("DELETE", path, "");
+        HttpResponse resp = HttpResponse.Parse(raw);
+        return resp.body;
+    }
+
+    /// <summary>Quick static GET method (one-shot).</summary>
+    static string GetAsync(string host, int port, string path) {
+        HttpClient client = HttpClient.Create(host, port);
+        return client.GetAsync(path);
+    }
+
+    /// <summary>Quick static POST method (one-shot).</summary>
+    static string PostAsync(string host, int port, string path, string body) {
+        HttpClient client = HttpClient.Create(host, port);
+        return client.PostAsync(path, body);
+    }
+
+    /// <summary>Downloads content to a file.</summary>
+    static void DownloadFileAsync(string host, int port, string path, string localPath) {
+        string body = HttpClient.GetAsync(host, port, path);
+        int fp = fopen(localPath, "wb");
+        if (fp != 0) {
+            fputs(body, fp);
+            fclose(fp);
+        }
+    }
+}

@@ -211,6 +211,7 @@ static zan_sym_kind_t ast_kind_to_sym_kind(zan_ast_kind_t kind) {
     case AST_STRUCT_DECL:    return SYM_STRUCT;
     case AST_INTERFACE_DECL: return SYM_INTERFACE;
     case AST_ENUM_DECL:      return SYM_ENUM;
+    case AST_DELEGATE_DECL:  return SYM_DELEGATE;
     default:                 return SYM_CLASS;
     }
 }
@@ -221,6 +222,7 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
     case AST_STRUCT_DECL:    return TYPE_STRUCT;
     case AST_INTERFACE_DECL: return TYPE_INTERFACE;
     case AST_ENUM_DECL:      return TYPE_ENUM;
+    case AST_DELEGATE_DECL:  return TYPE_DELEGATE;
     default:                 return TYPE_CLASS;
     }
 }
@@ -229,6 +231,41 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
 static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *node = decls->items[i];
+
+        /* delegate declarations use method_decl union */
+        if (node->kind == AST_DELEGATE_DECL) {
+            zan_istr_t name = node->method_decl.name;
+            zan_symbol_t *existing = scope_find(b->current_scope, name);
+            if (existing) {
+                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                              "duplicate type declaration '%.*s'", name.len, name.str);
+                continue;
+            }
+            zan_type_t *type = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
+            /* resolve delegate return type */
+            type->delegate_ret_type = node->method_decl.return_type
+                ? zan_binder_resolve_type(b, node->method_decl.return_type)
+                : b->type_void;
+            /* resolve delegate parameter types */
+            int pc = node->method_decl.params.count;
+            type->delegate_param_count = pc;
+            if (pc > 0) {
+                type->delegate_param_types = (zan_type_t **)zan_arena_alloc(
+                    b->arena, sizeof(zan_type_t *) * (size_t)pc);
+                for (int j = 0; j < pc; j++) {
+                    zan_ast_node_t *param = node->method_decl.params.items[j];
+                    type->delegate_param_types[j] = zan_binder_resolve_type(b, param->param.type);
+                }
+            } else {
+                type->delegate_param_types = NULL;
+            }
+            zan_symbol_t *sym = make_symbol(b->arena, SYM_DELEGATE,
+                name, type, node, node->method_decl.modifiers);
+            type->sym = sym;
+            scope_add(b->arena, b->current_scope, sym);
+            continue;
+        }
+
         if (node->kind == AST_CLASS_DECL || node->kind == AST_STRUCT_DECL ||
             node->kind == AST_INTERFACE_DECL || node->kind == AST_ENUM_DECL) {
 

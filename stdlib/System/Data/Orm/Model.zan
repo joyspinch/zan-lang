@@ -1,0 +1,587 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// FreeSQL-inspired ORM model base.
+/// Provides CRUD operations with automatic SQL generation.
+/// Models map to database tables with column-to-field mapping.
+///
+/// Usage:
+///   // Define a model
+///   Model userModel = Model.Define("users")
+///       .Column("id", "INTEGER", true)
+///       .Column("name", "TEXT")
+///       .Column("email", "TEXT")
+///       .Column("age", "INTEGER")
+///       .Column("created_at", "TEXT");
+///
+///   // Create table
+///   userModel.CreateTable(db);
+///
+///   // Insert
+///   ModelRow row = ModelRow.Create()
+///       .Set("name", "Alice").Set("email", "alice@example.com").Set("age", "30");
+///   userModel.Insert(db, row);
+///
+///   // Query
+///   List<ModelRow> users = userModel.Select(db).Where("age > 18").Execute();
+///
+///   // Update
+///   userModel.Update(db).Set("name", "Bob").Where("id = 1").Execute();
+///
+///   // Delete
+///   userModel.Delete(db).Where("id = 1").Execute();
+/// </summary>
+class Model {
+    string tableName;
+    List<string> columnNames;
+    List<string> columnTypes;
+    string primaryKey;
+    DbConnection db;
+
+    Model(string tableName) {
+        this.tableName = tableName;
+        this.columnNames = new List<string>();
+        this.columnTypes = new List<string>();
+        this.primaryKey = "";
+    }
+
+    /// <summary>Defines a new model with a table name.</summary>
+    static Model Define(string tableName) {
+        return new Model(tableName);
+    }
+
+    /// <summary>Adds a column definition.</summary>
+    Model Column(string name, string type) {
+        this.columnNames.Add(name);
+        this.columnTypes.Add(type);
+        return this;
+    }
+
+    /// <summary>Adds a column as primary key.</summary>
+    Model Column(string name, string type, bool isPrimaryKey) {
+        this.columnNames.Add(name);
+        if (isPrimaryKey) {
+            this.columnTypes.Add(type + " PRIMARY KEY AUTOINCREMENT");
+            this.primaryKey = name;
+        } else {
+            this.columnTypes.Add(type);
+        }
+        return this;
+    }
+
+    /// <summary>Adds a NOT NULL column.</summary>
+    Model ColumnNotNull(string name, string type) {
+        this.columnNames.Add(name);
+        this.columnTypes.Add(type + " NOT NULL");
+        return this;
+    }
+
+    /// <summary>Adds a column with a default value.</summary>
+    Model ColumnDefault(string name, string type, string defaultVal) {
+        this.columnNames.Add(name);
+        this.columnTypes.Add(type + " DEFAULT '" + defaultVal + "'");
+        return this;
+    }
+
+    /// <summary>Adds a UNIQUE column.</summary>
+    Model ColumnUnique(string name, string type) {
+        this.columnNames.Add(name);
+        this.columnTypes.Add(type + " UNIQUE");
+        return this;
+    }
+
+    /// <summary>Creates the table in the database.</summary>
+    void CreateTable(DbConnection db) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("CREATE TABLE IF NOT EXISTS ");
+        sb.Append(this.tableName);
+        sb.Append(" (");
+        int i = 0;
+        while (i < this.columnNames.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(this.columnNames[i]);
+            sb.Append(" ");
+            sb.Append(this.columnTypes[i]);
+            i = i + 1;
+        }
+        sb.Append(")");
+        db.Execute(sb.ToString());
+    }
+
+    /// <summary>Creates the table (wrapper).</summary>
+    void CreateTableAsync(DbConnection db) {
+        CreateTable(db);
+    }
+
+    /// <summary>Drops the table from the database.</summary>
+    void DropTable(DbConnection db) {
+        db.Execute("DROP TABLE IF EXISTS " + this.tableName);
+    }
+
+    /// <summary>Checks if the table exists.</summary>
+    bool TableExists(DbConnection db) {
+        string sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='" + this.tableName + "'";
+        string result = db.ExecuteScalar(sql);
+        return result == "1";
+    }
+
+    /// <summary>Inserts a row into the table.</summary>
+    int Insert(DbConnection db, ModelRow row) {
+        QueryBuilder qb = QueryBuilder.InsertInto(this.tableName);
+        int i = 0;
+        List<string> keys = row.GetKeys();
+        while (i < keys.Count) {
+            string key = keys[i];
+            string val = row.Get(key);
+            qb.Set(key, val);
+            i = i + 1;
+        }
+        return db.Execute(qb.BuildInsert());
+    }
+
+    /// <summary>Inserts a row (wrapper).</summary>
+    int InsertAsync(DbConnection db, ModelRow row) {
+        return Insert(db, row);
+    }
+
+    /// <summary>Starts a SELECT query builder for this model.</summary>
+    ModelQuery Select(DbConnection db) {
+        return ModelQuery.NewSelect(db, this.tableName);
+    }
+
+    /// <summary>Starts an UPDATE query builder for this model.</summary>
+    ModelUpdate UpdateQuery(DbConnection db) {
+        return ModelUpdate.New(db, this.tableName);
+    }
+
+    /// <summary>Starts a DELETE query builder for this model.</summary>
+    ModelDelete DeleteQuery(DbConnection db) {
+        return ModelDelete.New(db, this.tableName);
+    }
+
+    /// <summary>Finds a row by primary key.</summary>
+    ModelRow FindById(DbConnection db, int id) {
+        string pk = this.primaryKey;
+        if (pk.Length == 0) { pk = "id"; }
+        string sql = "SELECT * FROM " + this.tableName + " WHERE " + pk + " = " + Convert.ToString(id);
+        DbResult result = db.Query(sql);
+        if (result.RowCount() > 0) {
+            return ModelRow.FromDbResult(result, 0);
+        }
+        return ModelRow.Create();
+    }
+
+    /// <summary>Finds a row by primary key (wrapper).</summary>
+    ModelRow FindByIdAsync(DbConnection db, int id) {
+        return FindById(db, id);
+    }
+
+    /// <summary>Counts all rows in the table.</summary>
+    int Count(DbConnection db) {
+        string sql = "SELECT COUNT(*) FROM " + this.tableName;
+        string result = db.ExecuteScalar(sql);
+        return Convert.ToInt(result);
+    }
+
+    /// <summary>Counts rows matching a condition.</summary>
+    int CountWhere(DbConnection db, string condition) {
+        string sql = "SELECT COUNT(*) FROM " + this.tableName + " WHERE " + condition;
+        string result = db.ExecuteScalar(sql);
+        return Convert.ToInt(result);
+    }
+
+    /// <summary>Deletes a row by primary key.</summary>
+    void DeleteById(DbConnection db, int id) {
+        string pk = this.primaryKey;
+        if (pk.Length == 0) { pk = "id"; }
+        db.Execute("DELETE FROM " + this.tableName + " WHERE " + pk + " = " + Convert.ToString(id));
+    }
+
+    /// <summary>Returns all rows.</summary>
+    List<ModelRow> All(DbConnection db) {
+        DbResult result = db.Query("SELECT * FROM " + this.tableName);
+        return ModelRow.FromDbResultAll(result);
+    }
+
+    /// <summary>Returns the table name.</summary>
+    string GetTableName() {
+        return this.tableName;
+    }
+
+    /// <summary>Returns the primary key column name.</summary>
+    string GetPrimaryKey() {
+        return this.primaryKey;
+    }
+}
+
+/// <summary>
+/// Represents a single row of model data (key-value pairs).
+/// </summary>
+class ModelRow {
+    List<string> keys;
+    List<string> values;
+
+    ModelRow() {
+        this.keys = new List<string>();
+        this.values = new List<string>();
+    }
+
+    /// <summary>Creates an empty model row.</summary>
+    static ModelRow Create() {
+        return new ModelRow();
+    }
+
+    /// <summary>Sets a value on the row.</summary>
+    ModelRow Set(string key, string value) {
+        // Check if key already exists
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (this.keys[i] == key) {
+                this.values[i] = value;
+                return this;
+            }
+            i = i + 1;
+        }
+        this.keys.Add(key);
+        this.values.Add(value);
+        return this;
+    }
+
+    /// <summary>Sets an integer value.</summary>
+    ModelRow SetInt(string key, int value) {
+        return Set(key, Convert.ToString(value));
+    }
+
+    /// <summary>Gets a string value by key.</summary>
+    string Get(string key) {
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (this.keys[i] == key) {
+                return this.values[i];
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// <summary>Gets an integer value by key.</summary>
+    int GetInt(string key) {
+        string val = Get(key);
+        if (val.Length == 0) { return 0; }
+        return Convert.ToInt(val);
+    }
+
+    /// <summary>Checks if a key exists in the row.</summary>
+    bool Has(string key) {
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (this.keys[i] == key) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>Returns all keys.</summary>
+    List<string> GetKeys() {
+        return this.keys;
+    }
+
+    /// <summary>Returns all values.</summary>
+    List<string> GetValues() {
+        return this.values;
+    }
+
+    /// <summary>Creates a ModelRow from a DbResult row.</summary>
+    static ModelRow FromDbResult(DbResult result, int rowIndex) {
+        ModelRow row = new ModelRow();
+        List<string> columns = result.GetColumnNames();
+        int c = 0;
+        while (c < columns.Count) {
+            row.Set(columns[c], result.GetString(rowIndex, c));
+            c = c + 1;
+        }
+        return row;
+    }
+
+    /// <summary>Creates a list of ModelRows from all DbResult rows.</summary>
+    static List<ModelRow> FromDbResultAll(DbResult result) {
+        List<ModelRow> rows = new List<ModelRow>();
+        int r = 0;
+        while (r < result.RowCount()) {
+            rows.Add(FromDbResult(result, r));
+            r = r + 1;
+        }
+        return rows;
+    }
+
+    /// <summary>Converts the row to a JSON string.</summary>
+    string ToJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{");
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("\"");
+            sb.Append(this.keys[i]);
+            sb.Append("\":\"");
+            sb.Append(this.values[i]);
+            sb.Append("\"");
+            i = i + 1;
+        }
+        sb.Append("}");
+        return sb.ToString();
+    }
+}
+
+/// <summary>
+/// Model-level SELECT query builder.
+/// </summary>
+class ModelQuery {
+    DbConnection db;
+    string tableName;
+    string whereClause;
+    string orderByClause;
+    int limitVal;
+    int offsetVal;
+
+    ModelQuery(DbConnection db, string tableName) {
+        this.db = db;
+        this.tableName = tableName;
+        this.whereClause = "";
+        this.orderByClause = "";
+        this.limitVal = -1;
+        this.offsetVal = -1;
+    }
+
+    static ModelQuery NewSelect(DbConnection db, string tableName) {
+        return new ModelQuery(db, tableName);
+    }
+
+    ModelQuery Where(string condition) {
+        if (this.whereClause.Length == 0) {
+            this.whereClause = condition;
+        } else {
+            this.whereClause = this.whereClause + " AND " + condition;
+        }
+        return this;
+    }
+
+    ModelQuery WhereEq(string column, string value) {
+        return Where(column + " = '" + QueryBuilder.EscapeString(value) + "'");
+    }
+
+    ModelQuery OrderBy(string column) {
+        this.orderByClause = column;
+        return this;
+    }
+
+    ModelQuery OrderByDesc(string column) {
+        this.orderByClause = column + " DESC";
+        return this;
+    }
+
+    ModelQuery Limit(int count) {
+        this.limitVal = count;
+        return this;
+    }
+
+    ModelQuery Offset(int count) {
+        this.offsetVal = count;
+        return this;
+    }
+
+    /// <summary>Executes the query and returns a list of ModelRows.</summary>
+    List<ModelRow> Execute() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT * FROM ");
+        sb.Append(this.tableName);
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        if (this.orderByClause.Length > 0) {
+            sb.Append(" ORDER BY ");
+            sb.Append(this.orderByClause);
+        }
+        if (this.limitVal >= 0) {
+            sb.Append(" LIMIT ");
+            sb.Append(Convert.ToString(this.limitVal));
+        }
+        if (this.offsetVal >= 0) {
+            sb.Append(" OFFSET ");
+            sb.Append(Convert.ToString(this.offsetVal));
+        }
+        DbResult result = this.db.Query(sb.ToString());
+        return ModelRow.FromDbResultAll(result);
+    }
+
+    /// <summary>Executes the query (wrapper).</summary>
+    List<ModelRow> ExecuteAsync() {
+        return Execute();
+    }
+
+    /// <summary>Returns the first result or an empty row.</summary>
+    ModelRow First() {
+        this.limitVal = 1;
+        List<ModelRow> rows = Execute();
+        if (rows.Count > 0) {
+            return rows[0];
+        }
+        return ModelRow.Create();
+    }
+
+    /// <summary>Returns the count matching the query.</summary>
+    int Count() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT COUNT(*) FROM ");
+        sb.Append(this.tableName);
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        string result = this.db.ExecuteScalar(sb.ToString());
+        return Convert.ToInt(result);
+    }
+}
+
+/// <summary>
+/// Model-level UPDATE query builder.
+/// </summary>
+class ModelUpdate {
+    DbConnection db;
+    QueryBuilder qb;
+
+    ModelUpdate(DbConnection db, string tableName) {
+        this.db = db;
+        this.qb = QueryBuilder.Update(tableName);
+    }
+
+    static ModelUpdate New(DbConnection db, string tableName) {
+        return new ModelUpdate(db, tableName);
+    }
+
+    ModelUpdate Set(string column, string value) {
+        this.qb.Set(column, value);
+        return this;
+    }
+
+    ModelUpdate SetInt(string column, int value) {
+        this.qb.SetInt(column, value);
+        return this;
+    }
+
+    ModelUpdate Where(string condition) {
+        this.qb.Where(condition);
+        return this;
+    }
+
+    ModelUpdate WhereEq(string column, string value) {
+        this.qb.WhereEq(column, value);
+        return this;
+    }
+
+    /// <summary>Executes the UPDATE and returns affected row count.</summary>
+    int Execute() {
+        return this.db.Execute(this.qb.BuildUpdate());
+    }
+
+    int ExecuteAsync() {
+        return Execute();
+    }
+}
+
+/// <summary>
+/// Model-level DELETE query builder.
+/// </summary>
+class ModelDelete {
+    DbConnection db;
+    QueryBuilder qb;
+
+    ModelDelete(DbConnection db, string tableName) {
+        this.db = db;
+        this.qb = QueryBuilder.DeleteFrom(tableName);
+    }
+
+    static ModelDelete New(DbConnection db, string tableName) {
+        return new ModelDelete(db, tableName);
+    }
+
+    ModelDelete Where(string condition) {
+        this.qb.Where(condition);
+        return this;
+    }
+
+    ModelDelete WhereEq(string column, string value) {
+        this.qb.WhereEq(column, value);
+        return this;
+    }
+
+    /// <summary>Executes the DELETE and returns affected row count.</summary>
+    int Execute() {
+        return this.db.Execute(this.qb.BuildDelete());
+    }
+
+    int ExecuteAsync() {
+        return Execute();
+    }
+}
+
+/// <summary>
+/// Schema migration helper for managing database schema evolution.
+/// </summary>
+class Migration {
+    string name;
+    string upSql;
+    string downSql;
+
+    Migration(string name, string up, string down) {
+        this.name = name;
+        this.upSql = up;
+        this.downSql = down;
+    }
+
+    /// <summary>Creates a migration.</summary>
+    static Migration Create(string name, string upSql, string downSql) {
+        return new Migration(name, upSql, downSql);
+    }
+
+    /// <summary>Applies the migration (runs UP SQL).</summary>
+    void Up(DbConnection db) {
+        db.Execute(this.upSql);
+    }
+
+    /// <summary>Reverts the migration (runs DOWN SQL).</summary>
+    void Down(DbConnection db) {
+        db.Execute(this.downSql);
+    }
+
+    /// <summary>Ensures the migration tracking table exists.</summary>
+    static void EnsureTable(DbConnection db) {
+        db.Execute("CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TEXT)");
+    }
+
+    /// <summary>Checks if a migration has been applied.</summary>
+    static bool IsApplied(DbConnection db, string name) {
+        string result = db.ExecuteScalar("SELECT COUNT(*) FROM _migrations WHERE name = '" + name + "'");
+        return result == "1";
+    }
+
+    /// <summary>Runs a list of migrations in order.</summary>
+    static void RunAll(DbConnection db, List<Migration> migrations) {
+        EnsureTable(db);
+        int i = 0;
+        while (i < migrations.Count) {
+            Migration m = migrations[i];
+            if (!IsApplied(db, m.name)) {
+                m.Up(db);
+                db.Execute("INSERT INTO _migrations (name, applied_at) VALUES ('" + m.name + "', 'now')");
+                Console.WriteLine("[Migration] Applied: " + m.name);
+            }
+            i = i + 1;
+        }
+    }
+}

@@ -1,4 +1,13 @@
-/* editor.c -- Editor state management implementation. */
+/* editor.c -- Editor state management implementation.
+ *
+ * Enhanced syntax highlighting with:
+ *   - Multi-line block comment tracking
+ *   - Interpolated strings ($"...{expr}...")
+ *   - Verbatim strings (@"...")
+ *   - Attribute highlighting ([Serializable])
+ *   - Generic type parameters (<T, U>)
+ *   - Context-aware type detection (PascalCase identifiers)
+ */
 #include "editor.h"
 #include <stdlib.h>
 #include <string.h>
@@ -19,13 +28,35 @@ static const char *zan_keywords[] = {
     "string", "struct", "switch", "this", "throw", "true", "try",
     "typeof", "uint", "ulong", "unchecked", "unsafe", "ushort",
     "using", "var", "virtual", "void", "volatile", "while", "yield",
+    /* Pattern matching & modern keywords */
+    "when", "and", "or", "not", "with", "record", "init", "required",
+    "global", "file", "scoped", "allows",
+    /* LINQ query syntax keywords */
+    "from", "where", "select", "orderby", "group", "into",
+    "join", "let", "ascending", "descending", "on", "equals",
+    /* Async patterns */
+    "async", "await", "configureawait",
     NULL
 };
 
 static const char *zan_types[] = {
     "int", "float", "double", "bool", "string", "char", "byte", "long",
     "short", "void", "var", "object", "decimal", "uint", "ulong",
-    "ushort", "sbyte", NULL
+    "ushort", "sbyte", "dynamic", "nint", "nuint",
+    /* Common framework types */
+    "List", "Dict", "Dictionary", "Array", "StringBuilder", "Task",
+    "Action", "Func", "Span", "Memory", "Stream", "Exception",
+    "Console", "Math", "File", "Path", "Directory", "Environment",
+    "Thread", "Mutex", "Convert", "Encoding", "Stopwatch",
+    NULL
+};
+
+/* Control-flow keywords that are highlighted differently */
+static const char *zan_flow_keywords[] = {
+    "if", "else", "for", "foreach", "while", "do", "switch", "case",
+    "break", "continue", "return", "throw", "try", "catch", "finally",
+    "yield", "goto", "default",
+    NULL
 };
 
 static bool is_keyword(const char *word, int len) {
@@ -43,6 +74,31 @@ static bool is_type_name(const char *word, int len) {
             memcmp(zan_types[i], word, (size_t)len) == 0)
             return true;
     }
+    /* Heuristic: PascalCase identifiers starting with uppercase that aren't
+     * keywords are likely type names (e.g. MyClass, IDisposable) */
+    if (len >= 2 && isupper((unsigned char)word[0])) {
+        bool has_lower = false;
+        for (int i = 1; i < len; i++) {
+            if (islower((unsigned char)word[i])) { has_lower = true; break; }
+        }
+        if (has_lower && !is_keyword(word, len)) {
+            /* Check if followed by common type-use patterns (handled by caller) */
+            return false; /* let caller decide based on context */
+        }
+    }
+    return false;
+}
+
+/* Check if an identifier looks like a type (PascalCase, starts with I+Upper for
+ * interfaces, or is in the known type list) */
+static bool looks_like_type(const char *word, int len, const char *after) {
+    if (is_type_name(word, len)) return true;
+    /* Interface pattern: IFoo */
+    if (len >= 3 && word[0] == 'I' && isupper((unsigned char)word[1]))
+        return true;
+    /* If followed by '<' (generic usage), it's a type */
+    if (after && *after == '<') return true;
+    /* If preceded by 'new ' context or followed by variable name pattern */
     return false;
 }
 
@@ -383,15 +439,32 @@ void editor_insert_newline(editor_t *ed) {
     while (indent < llen && (line[indent] == ' ' || line[indent] == '\t'))
         indent++;
 
-    char *nl_buf = (char *)malloc(1 + indent);
+    /* increase indent after { */
+    bool add_indent = false;
+    if (tab->cursor_col > 0) {
+        size_t check = tab->cursor_col - 1;
+        while (check > 0 && (line[check] == ' ' || line[check] == '\t')) check--;
+        if (line[check] == '{') add_indent = true;
+    }
+
+    size_t extra = add_indent ? (size_t)ed->tab_size : 0;
+    char *nl_buf = (char *)malloc(1 + indent + extra);
     nl_buf[0] = '\n';
     memcpy(nl_buf + 1, line, indent);
+    if (add_indent) {
+        if (ed->use_spaces) {
+            memset(nl_buf + 1 + indent, ' ', extra);
+        } else {
+            nl_buf[1 + indent] = '\t';
+            extra = 1;
+        }
+    }
     free(line);
 
     size_t off = pt_pos_to_offset(tab->buffer, tab->cursor_line, tab->cursor_col);
-    pt_insert(tab->buffer, off, nl_buf, 1 + indent);
+    pt_insert(tab->buffer, off, nl_buf, 1 + indent + extra);
     tab->cursor_line++;
-    tab->cursor_col = indent;
+    tab->cursor_col = indent + extra;
     tab->modified = true;
     free(nl_buf);
     editor_invalidate_syntax(ed, tab->cursor_line > 0 ? tab->cursor_line - 1 : 0);
@@ -688,10 +761,24 @@ void editor_replace_all(editor_t *ed, const char *query,
     free(new_doc);
 }
 
-/* --- Syntax highlighting --- */
+/* ==========================================================================
+ * ENHANCED SYNTAX HIGHLIGHTING
+ * ==========================================================================
+ * Supports:
+ *   - Multi-line block comments (/* ... * /) with state propagation
+ *   - Interpolated strings ($"...{expr}...")
+ *   - Verbatim strings (@"..." with embedded "" escapes, multi-line)
+ *   - Attribute annotations ([Attribute])
+ *   - Generic type parameters (List<int>)
+ *   - Context-aware type vs identifier detection
+ *   - Numeric literal suffixes (1.0f, 100L, 0xFF)
+ * ========================================================================== */
 
 static void ensure_syn_cache(editor_tab_t *tab, size_t lines) {
-    if (lines <= tab->syn_cache_cap) return;
+    if (lines <= tab->syn_cache_cap) {
+        tab->syn_cache_count = lines;
+        return;
+    }
     size_t new_cap = lines + 64;
     tab->syn_cache = (syn_line_t *)realloc(tab->syn_cache,
         new_cap * sizeof(syn_line_t));
@@ -700,12 +787,15 @@ static void ensure_syn_cache(editor_tab_t *tab, size_t lines) {
         tab->syn_cache[i].span_count = 0;
         tab->syn_cache[i].span_cap = 0;
         tab->syn_cache[i].dirty = true;
+        tab->syn_cache[i].start_state = SYN_STATE_NORMAL;
+        tab->syn_cache[i].end_state = SYN_STATE_NORMAL;
     }
     tab->syn_cache_cap = new_cap;
     tab->syn_cache_count = lines;
 }
 
 static void add_span(syn_line_t *sl, int col_start, int col_end, syn_kind_t kind) {
+    if (col_start >= col_end) return;
     if (sl->span_count >= sl->span_cap) {
         sl->span_cap = sl->span_cap ? sl->span_cap * 2 : 16;
         sl->spans = (syn_span_t *)realloc(sl->spans,
@@ -728,8 +818,15 @@ void editor_highlight_line(editor_t *ed, size_t line) {
     syn_line_t *sl = &tab->syn_cache[line];
     sl->span_count = 0;
 
+    /* Determine starting state from previous line */
+    syn_line_state_t state = SYN_STATE_NORMAL;
+    if (line > 0 && line - 1 < tab->syn_cache_count) {
+        state = tab->syn_cache[line - 1].end_state;
+    }
+    sl->start_state = state;
+
     size_t llen = pt_line_length(tab->buffer, line);
-    if (llen == 0) { sl->dirty = false; return; }
+    if (llen == 0) { sl->end_state = state; sl->dirty = false; return; }
 
     char *buf = (char *)malloc(llen + 1);
     size_t ls = pt_line_start(tab->buffer, line);
@@ -740,16 +837,146 @@ void editor_highlight_line(editor_t *ed, size_t line) {
     int len = (int)llen;
 
     while (i < len) {
+        /* ---- Handle multi-line block comment continuation ---- */
+        if (state == SYN_STATE_BLOCK_COMMENT) {
+            int start = i;
+            while (i < len) {
+                if (i + 1 < len && buf[i] == '*' && buf[i + 1] == '/') {
+                    i += 2;
+                    state = SYN_STATE_NORMAL;
+                    break;
+                }
+                i++;
+            }
+            add_span(sl, start, i, SYN_COMMENT);
+            continue;
+        }
+
+        /* ---- Handle multi-line verbatim string continuation ---- */
+        if (state == SYN_STATE_VERBATIM_STRING) {
+            int start = i;
+            while (i < len) {
+                if (buf[i] == '"') {
+                    if (i + 1 < len && buf[i + 1] == '"') {
+                        i += 2; /* escaped quote in verbatim */
+                    } else {
+                        i++;
+                        state = SYN_STATE_NORMAL;
+                        break;
+                    }
+                } else {
+                    i++;
+                }
+            }
+            add_span(sl, start, i, SYN_STRING_VERBATIM);
+            continue;
+        }
+
         /* skip whitespace */
         if (isspace((unsigned char)buf[i])) { i++; continue; }
 
-        /* single-line comment */
+        /* ---- Single-line comment ---- */
         if (i + 1 < len && buf[i] == '/' && buf[i + 1] == '/') {
             add_span(sl, i, len, SYN_COMMENT);
-            break;
+            i = len;
+            continue;
         }
 
-        /* string literal */
+        /* ---- Block comment start ---- */
+        if (i + 1 < len && buf[i] == '/' && buf[i + 1] == '*') {
+            int start = i;
+            i += 2;
+            state = SYN_STATE_BLOCK_COMMENT;
+            while (i < len) {
+                if (i + 1 < len && buf[i] == '*' && buf[i + 1] == '/') {
+                    i += 2;
+                    state = SYN_STATE_NORMAL;
+                    break;
+                }
+                i++;
+            }
+            add_span(sl, start, i, SYN_COMMENT);
+            continue;
+        }
+
+        /* ---- Attribute: [Name] or [Name(...)] ---- */
+        if (buf[i] == '[' && i + 1 < len && isupper((unsigned char)buf[i + 1])) {
+            int start = i;
+            i++;
+            /* scan to closing ] */
+            int depth = 1;
+            while (i < len && depth > 0) {
+                if (buf[i] == '[') depth++;
+                else if (buf[i] == ']') depth--;
+                i++;
+            }
+            add_span(sl, start, i, SYN_ATTRIBUTE);
+            continue;
+        }
+
+        /* ---- Interpolated string: $"..." ---- */
+        if (buf[i] == '$' && i + 1 < len && buf[i + 1] == '"') {
+            int start = i;
+            i += 2;
+            while (i < len && buf[i] != '"') {
+                if (buf[i] == '\\' && i + 1 < len) { i += 2; continue; }
+                if (buf[i] == '{') {
+                    /* highlight up to { as string */
+                    add_span(sl, start, i, SYN_STRING_INTERP);
+                    /* skip interpolation expression */
+                    int expr_start = i;
+                    int brace_depth = 1;
+                    i++;
+                    while (i < len && brace_depth > 0) {
+                        if (buf[i] == '{') brace_depth++;
+                        else if (buf[i] == '}') brace_depth--;
+                        i++;
+                    }
+                    add_span(sl, expr_start, i, SYN_OPERATOR);
+                    start = i;
+                    continue;
+                }
+                i++;
+            }
+            if (i < len) i++; /* closing " */
+            add_span(sl, start, i, SYN_STRING_INTERP);
+            continue;
+        }
+
+        /* ---- Verbatim string: @"..." (can be multi-line) ---- */
+        if (buf[i] == '@' && i + 1 < len && buf[i + 1] == '"') {
+            int start = i;
+            i += 2;
+            while (i < len) {
+                if (buf[i] == '"') {
+                    if (i + 1 < len && buf[i + 1] == '"') {
+                        i += 2;
+                    } else {
+                        i++;
+                        break;
+                    }
+                } else {
+                    i++;
+                }
+            }
+            /* If we didn't close it, the string continues on next line */
+            if (i >= len && (i < 2 || buf[i - 1] != '"' || (i >= 3 && buf[i - 2] == '"'))) {
+                /* Check: did we actually end? Look backwards */
+                bool ended = false;
+                if (i > 0 && buf[i - 1] == '"') {
+                    /* Could be end of string or "" escape */
+                    if (i >= 3 && buf[i - 2] == '"' && buf[i - 3] != '"')
+                        ended = false; /* it was an escape "" at end */
+                    else
+                        ended = true;
+                }
+                if (!ended) state = SYN_STATE_VERBATIM_STRING;
+            }
+            add_span(sl, start, i, SYN_STRING_VERBATIM);
+            continue;
+        }
+
+        /* ---- Regular string literal ---- */
         if (buf[i] == '"' || buf[i] == '\'') {
             char quote = buf[i];
             int start = i++;
@@ -762,39 +989,104 @@ void editor_highlight_line(editor_t *ed, size_t line) {
             continue;
         }
 
-        /* number */
+        /* ---- Numeric literals (with suffix support) ---- */
         if (isdigit((unsigned char)buf[i]) ||
             (buf[i] == '.' && i + 1 < len && isdigit((unsigned char)buf[i + 1]))) {
             int start = i;
-            while (i < len && (isdigit((unsigned char)buf[i]) ||
-                               buf[i] == '.' || buf[i] == 'x' ||
-                               buf[i] == 'f' ||
-                               (buf[i] >= 'a' && buf[i] <= 'f') ||
-                               (buf[i] >= 'A' && buf[i] <= 'F')))
+            /* hex prefix */
+            if (buf[i] == '0' && i + 1 < len && (buf[i + 1] == 'x' || buf[i + 1] == 'X')) {
+                i += 2;
+                while (i < len && (isxdigit((unsigned char)buf[i]) || buf[i] == '_'))
+                    i++;
+            } else if (buf[i] == '0' && i + 1 < len && (buf[i + 1] == 'b' || buf[i + 1] == 'B')) {
+                /* binary literal */
+                i += 2;
+                while (i < len && (buf[i] == '0' || buf[i] == '1' || buf[i] == '_'))
+                    i++;
+            } else {
+                while (i < len && (isdigit((unsigned char)buf[i]) || buf[i] == '_'))
+                    i++;
+                if (i < len && buf[i] == '.') {
+                    i++;
+                    while (i < len && (isdigit((unsigned char)buf[i]) || buf[i] == '_'))
+                        i++;
+                }
+                /* exponent */
+                if (i < len && (buf[i] == 'e' || buf[i] == 'E')) {
+                    i++;
+                    if (i < len && (buf[i] == '+' || buf[i] == '-')) i++;
+                    while (i < len && isdigit((unsigned char)buf[i])) i++;
+                }
+            }
+            /* type suffix: f, d, m, l, u, ul, lu */
+            while (i < len && (buf[i] == 'f' || buf[i] == 'F' ||
+                               buf[i] == 'd' || buf[i] == 'D' ||
+                               buf[i] == 'm' || buf[i] == 'M' ||
+                               buf[i] == 'l' || buf[i] == 'L' ||
+                               buf[i] == 'u' || buf[i] == 'U'))
                 i++;
             add_span(sl, start, i, SYN_NUMBER);
             continue;
         }
 
-        /* identifier or keyword */
+        /* ---- Identifier or keyword ---- */
         if (isalpha((unsigned char)buf[i]) || buf[i] == '_') {
             int start = i;
             while (i < len && (isalnum((unsigned char)buf[i]) || buf[i] == '_'))
                 i++;
             int wlen = i - start;
-            if (is_type_name(buf + start, wlen))
+
+            /* Check context for highlighting */
+            if (is_type_name(buf + start, wlen)) {
                 add_span(sl, start, i, SYN_TYPE);
-            else if (is_keyword(buf + start, wlen))
+            } else if (is_keyword(buf + start, wlen)) {
                 add_span(sl, start, i, SYN_KEYWORD);
-            else if (i < len && buf[i] == '(')
+            } else if (i < len && buf[i] == '(') {
+                /* function/method call */
                 add_span(sl, start, i, SYN_BUILTIN);
-            else
+            } else if (i < len && buf[i] == '<' &&
+                       isupper((unsigned char)buf[start])) {
+                /* Generic type usage: SomeName<...> */
+                add_span(sl, start, i, SYN_TYPE);
+            } else if (looks_like_type(buf + start, wlen, i < len ? buf + i : NULL)) {
+                add_span(sl, start, i, SYN_TYPE);
+            } else if (i + 1 < len && buf[i] == ':' && buf[i + 1] == ' ') {
+                /* named parameter: name: value */
+                add_span(sl, start, i, SYN_PARAM_NAME);
+            } else {
                 add_span(sl, start, i, SYN_IDENTIFIER);
+            }
             continue;
         }
 
-        /* operator */
+        /* ---- Preprocessor / directives ---- */
+        if (buf[i] == '#' && (i == 0 || buf[i - 1] == '\n' || (i > 0 && isspace((unsigned char)buf[i - 1])))) {
+            int start = i;
+            while (i < len && buf[i] != '\n') i++;
+            add_span(sl, start, i, SYN_PREPROCESSOR);
+            continue;
+        }
+
+        /* ---- Operator ---- */
         if (strchr("+-*/%=<>!&|^~?:.;,{}[]()", buf[i])) {
+            /* Multi-char operators */
+            int start = i;
+            if (i + 1 < len) {
+                char two[3] = { buf[i], buf[i+1], '\0' };
+                if (strcmp(two, "=>") == 0 || strcmp(two, "==") == 0 ||
+                    strcmp(two, "!=") == 0 || strcmp(two, "<=") == 0 ||
+                    strcmp(two, ">=") == 0 || strcmp(two, "&&") == 0 ||
+                    strcmp(two, "||") == 0 || strcmp(two, "??") == 0 ||
+                    strcmp(two, "?.") == 0 || strcmp(two, "++") == 0 ||
+                    strcmp(two, "--") == 0 || strcmp(two, "+=") == 0 ||
+                    strcmp(two, "-=") == 0 || strcmp(two, "*=") == 0 ||
+                    strcmp(two, "/=") == 0 || strcmp(two, "<<") == 0 ||
+                    strcmp(two, ">>") == 0) {
+                    i += 2;
+                    add_span(sl, start, i, SYN_OPERATOR);
+                    continue;
+                }
+            }
             add_span(sl, i, i + 1, SYN_OPERATOR);
             i++;
             continue;
@@ -804,8 +1096,17 @@ void editor_highlight_line(editor_t *ed, size_t line) {
         i++;
     }
 
-    free(buf);
+    sl->end_state = state;
     sl->dirty = false;
+
+    /* If end state changed, invalidate the next line */
+    if (line + 1 < total && line + 1 < tab->syn_cache_count) {
+        if (tab->syn_cache[line + 1].start_state != state) {
+            tab->syn_cache[line + 1].dirty = true;
+        }
+    }
+
+    free(buf);
 }
 
 void editor_highlight_visible(editor_t *ed) {
@@ -817,6 +1118,9 @@ void editor_highlight_visible(editor_t *ed) {
     size_t total = pt_line_count(tab->buffer);
     if (last > total) last = total;
 
+    /* Ensure state propagation: if any line before visible has changed state,
+     * we need to re-highlight from there. For efficiency, just highlight from
+     * the first dirty line in the visible range. */
     for (size_t i = first; i < last; i++) {
         editor_highlight_line(ed, i);
     }

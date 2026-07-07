@@ -5,10 +5,20 @@
  * (src/ide/debugger.c) to any DAP-capable client (VS Code, etc.):
  *
  *   - initialize / launch / configurationDone / disconnect
- *   - setBreakpoints (source breakpoints, verified)
+ *   - setBreakpoints (source breakpoints, verified, with conditions)
  *   - threads / stackTrace / scopes / variables
  *   - continue / next / stepIn / stepOut / pause
+ *   - evaluate (watch expressions and hover evaluation)
+ *   - setVariable (modify variables at runtime)
  *   - stopped / continued / terminated / exited / output events
+ *
+ * Enhanced features:
+ *   - Conditional breakpoints with expression evaluation
+ *   - Hit-count breakpoints
+ *   - Logpoints (tracepoints)
+ *   - Watch expression evaluation
+ *   - Variable modification (setVariable)
+ *   - Multiple scopes (Locals, Watch)
  *
  * Runtime process control is delegated to the debugger engine (Windows
  * CreateProcess-based; a simulated stepping model elsewhere), while this
@@ -41,7 +51,8 @@ typedef struct {
 } dap_t;
 
 /* Reference ids used by scopes/variables. */
-#define VARREF_LOCALS 1000
+#define VARREF_LOCALS  1000
+#define VARREF_WATCHES 2000
 
 /* ============================ message I/O ============================ */
 
@@ -106,8 +117,14 @@ static void handle_initialize(dap_t *d, json_value *request) {
     json_obj_set(caps, "supportsConfigurationDoneRequest", json_new_bool(true));
     json_obj_set(caps, "supportsFunctionBreakpoints", json_new_bool(false));
     json_obj_set(caps, "supportsConditionalBreakpoints", json_new_bool(true));
+    json_obj_set(caps, "supportsHitConditionalBreakpoints", json_new_bool(true));
+    json_obj_set(caps, "supportsLogPoints", json_new_bool(true));
+    json_obj_set(caps, "supportsEvaluateForHovers", json_new_bool(true));
+    json_obj_set(caps, "supportsSetVariable", json_new_bool(true));
     json_obj_set(caps, "supportsStepBack", json_new_bool(false));
     json_obj_set(caps, "supportsTerminateRequest", json_new_bool(true));
+    json_obj_set(caps, "supportsRunInTerminalRequest", json_new_bool(false));
+    json_obj_set(caps, "supportsExceptionInfoRequest", json_new_bool(true));
     dap_send_response(d, request, true, caps);
     /* signal readiness for configuration (breakpoints, etc.) */
     dap_send_event(d, "initialized", NULL);
@@ -123,7 +140,7 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
         /* drop existing breakpoints for this file */
         for (int i = d->dbg.bp_count - 1; i >= 0; i--) {
             if (strcmp(d->dbg.breakpoints[i].file, path) == 0)
-                dbg_remove_breakpoint(&d->dbg, i);
+                dbg_remove_breakpoint(&d->dbg, d->dbg.breakpoints[i].id);
         }
         strncpy(d->source_file, path, sizeof(d->source_file) - 1);
     }
@@ -134,15 +151,36 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
         json_value *bp = json_arr_at(bps, i);
         int line = (int)json_get_num(json_obj_get(bp, "line"), 0);
         const char *cond = json_get_str(json_obj_get(bp, "condition"));
-        int idx = -1;
-        if (path) idx = dbg_add_breakpoint(&d->dbg, path, line);
-        if (idx >= 0 && cond)
-            strncpy(d->dbg.breakpoints[idx].condition, cond,
-                    sizeof(d->dbg.breakpoints[idx].condition) - 1);
+        const char *hit_cond = json_get_str(json_obj_get(bp, "hitCondition"));
+        const char *log_msg = json_get_str(json_obj_get(bp, "logMessage"));
+
+        int id = -1;
+        if (path) {
+            if (log_msg && log_msg[0]) {
+                /* Logpoint */
+                id = dbg_add_logpoint(&d->dbg, path, line, log_msg);
+            } else if (hit_cond && hit_cond[0]) {
+                /* Hit-count breakpoint */
+                int count = atoi(hit_cond);
+                if (count > 0)
+                    id = dbg_add_hitcount_bp(&d->dbg, path, line, count);
+                else
+                    id = dbg_add_breakpoint(&d->dbg, path, line);
+            } else if (cond && cond[0]) {
+                /* Conditional breakpoint */
+                id = dbg_add_conditional_bp(&d->dbg, path, line, cond);
+            } else {
+                /* Normal breakpoint */
+                id = dbg_add_breakpoint(&d->dbg, path, line);
+            }
+        }
 
         json_value *out = json_new_obj();
-        json_obj_set(out, "verified", json_new_bool(idx >= 0));
+        json_obj_set(out, "id", json_new_num(id >= 0 ? id : i));
+        json_obj_set(out, "verified", json_new_bool(id >= 0));
         json_obj_set(out, "line", json_new_num(line));
+        if (cond && cond[0])
+            json_obj_set(out, "message", json_new_str(cond));
         json_arr_add(verified, out);
     }
 
@@ -155,7 +193,10 @@ static void handle_launch(dap_t *d, json_value *request) {
     json_value *args = json_obj_get(request, "arguments");
     const char *program = json_get_str(json_obj_get(args, "program"));
     const char *prog_args = json_get_str(json_obj_get(args, "args"));
+    bool stop_on_entry = (bool)json_get_num(json_obj_get(args, "stopOnEntry"), 0);
+
     if (program) strncpy(d->program, program, sizeof(d->program) - 1);
+    d->dbg.break_on_entry = stop_on_entry;
 
     d->launched = true;
     dap_output(d, "console", "Launching Zan program under debugger...\n");
@@ -168,16 +209,16 @@ static void handle_launch(dap_t *d, json_value *request) {
          * protocol using the debugger's simulated state so the client can
          * drive the session. Position at the first breakpoint if any. */
         d->dbg.state = DBG_PAUSED;
-        d->dbg.frame_count = 1;
-        d->dbg.current_frame = 0;
-        strncpy(d->dbg.frames[0].function, "Main",
-                sizeof(d->dbg.frames[0].function) - 1);
-        strncpy(d->dbg.frames[0].file, d->source_file,
-                sizeof(d->dbg.frames[0].file) - 1);
-        d->dbg.frames[0].line = d->dbg.bp_count ? d->dbg.breakpoints[0].line : 1;
+        d->dbg.callstack_depth = 1;
+        d->dbg.active_frame = 0;
+        strncpy(d->dbg.callstack[0].function_name, "Main",
+                sizeof(d->dbg.callstack[0].function_name) - 1);
+        strncpy(d->dbg.callstack[0].file, d->source_file,
+                sizeof(d->dbg.callstack[0].file) - 1);
+        d->dbg.callstack[0].line = d->dbg.bp_count ? d->dbg.breakpoints[0].line : 1;
         strncpy(d->dbg.current_file, d->source_file,
                 sizeof(d->dbg.current_file) - 1);
-        d->dbg.current_line = d->dbg.frames[0].line;
+        d->dbg.current_line = d->dbg.callstack[0].line;
     }
 
     dap_send_response(d, request, true, NULL);
@@ -189,15 +230,15 @@ static void handle_configuration_done(dap_t *d, json_value *request) {
      * "runs" and terminates. */
     if (d->dbg.bp_count > 0) {
         d->dbg.state = DBG_PAUSED;
-        if (d->dbg.frame_count == 0) {
-            d->dbg.frame_count = 1;
-            d->dbg.current_frame = 0;
-            strncpy(d->dbg.frames[0].function, "Main",
-                    sizeof(d->dbg.frames[0].function) - 1);
-            strncpy(d->dbg.frames[0].file, d->source_file,
-                    sizeof(d->dbg.frames[0].file) - 1);
+        if (d->dbg.callstack_depth == 0) {
+            d->dbg.callstack_depth = 1;
+            d->dbg.active_frame = 0;
+            strncpy(d->dbg.callstack[0].function_name, "Main",
+                    sizeof(d->dbg.callstack[0].function_name) - 1);
+            strncpy(d->dbg.callstack[0].file, d->source_file,
+                    sizeof(d->dbg.callstack[0].file) - 1);
         }
-        d->dbg.frames[0].line = d->dbg.breakpoints[0].line;
+        d->dbg.callstack[0].line = d->dbg.breakpoints[0].line;
         d->dbg.current_line = d->dbg.breakpoints[0].line;
         strncpy(d->dbg.current_file, d->source_file,
                 sizeof(d->dbg.current_file) - 1);
@@ -221,12 +262,12 @@ static void handle_threads(dap_t *d, json_value *request) {
 
 static void handle_stack_trace(dap_t *d, json_value *request) {
     json_value *frames = json_new_arr();
-    for (int i = 0; i < d->dbg.frame_count; i++) {
-        dbg_frame_t *f = &d->dbg.frames[i];
+    for (int i = 0; i < d->dbg.callstack_depth; i++) {
+        dbg_frame_t *f = &d->dbg.callstack[i];
         json_value *frame = json_new_obj();
-        json_obj_set(frame, "id", json_new_num(i));
+        json_obj_set(frame, "id", json_new_num(f->frame_id));
         json_obj_set(frame, "name",
-                     json_new_str(f->function[0] ? f->function : "Main"));
+                     json_new_str(f->function_name[0] ? f->function_name : "Main"));
         json_obj_set(frame, "line", json_new_num(f->line));
         json_obj_set(frame, "column", json_new_num(f->col > 0 ? f->col : 1));
         const char *file = f->file[0] ? f->file : d->source_file;
@@ -239,17 +280,30 @@ static void handle_stack_trace(dap_t *d, json_value *request) {
     }
     json_value *body = json_new_obj();
     json_obj_set(body, "stackFrames", frames);
-    json_obj_set(body, "totalFrames", json_new_num(d->dbg.frame_count));
+    json_obj_set(body, "totalFrames", json_new_num(d->dbg.callstack_depth));
     dap_send_response(d, request, true, body);
 }
 
 static void handle_scopes(dap_t *d, json_value *request) {
-    json_value *scope = json_new_obj();
-    json_obj_set(scope, "name", json_new_str("Locals"));
-    json_obj_set(scope, "variablesReference", json_new_num(VARREF_LOCALS));
-    json_obj_set(scope, "expensive", json_new_bool(false));
     json_value *scopes = json_new_arr();
-    json_arr_add(scopes, scope);
+
+    /* Locals scope */
+    json_value *locals_scope = json_new_obj();
+    json_obj_set(locals_scope, "name", json_new_str("Locals"));
+    json_obj_set(locals_scope, "variablesReference", json_new_num(VARREF_LOCALS));
+    json_obj_set(locals_scope, "expensive", json_new_bool(false));
+    json_obj_set(locals_scope, "presentationHint", json_new_str("locals"));
+    json_arr_add(scopes, locals_scope);
+
+    /* Watch scope (if there are watches) */
+    if (d->dbg.watch_count > 0) {
+        json_value *watch_scope = json_new_obj();
+        json_obj_set(watch_scope, "name", json_new_str("Watch"));
+        json_obj_set(watch_scope, "variablesReference", json_new_num(VARREF_WATCHES));
+        json_obj_set(watch_scope, "expensive", json_new_bool(false));
+        json_arr_add(scopes, watch_scope);
+    }
+
     json_value *body = json_new_obj();
     json_obj_set(body, "scopes", scopes);
     dap_send_response(d, request, true, body);
@@ -259,43 +313,140 @@ static void handle_variables(dap_t *d, json_value *request) {
     json_value *args = json_obj_get(request, "arguments");
     int ref = (int)json_get_num(json_obj_get(args, "variablesReference"), 0);
     json_value *vars = json_new_arr();
+
     if (ref == VARREF_LOCALS) {
         for (int i = 0; i < d->dbg.local_count; i++) {
-            dbg_variable_t *v = &d->dbg.locals[i];
+            dbg_local_t *v = &d->dbg.locals[i];
             json_value *var = json_new_obj();
             json_obj_set(var, "name", json_new_str(v->name));
             json_obj_set(var, "value", json_new_str(v->value));
             json_obj_set(var, "type", json_new_str(v->type));
+            json_obj_set(var, "variablesReference",
+                        json_new_num(v->has_children ? (i + 3000) : 0));
+            json_arr_add(vars, var);
+        }
+    } else if (ref == VARREF_WATCHES) {
+        /* Return watch expression values */
+        dbg_evaluate_watches(&d->dbg);
+        for (int i = 0; i < d->dbg.watch_count; i++) {
+            dbg_watch_t *w = &d->dbg.watches[i];
+            json_value *var = json_new_obj();
+            json_obj_set(var, "name", json_new_str(w->expression));
+            json_obj_set(var, "value", json_new_str(w->value));
+            json_obj_set(var, "type", json_new_str(w->type[0] ? w->type : "unknown"));
             json_obj_set(var, "variablesReference", json_new_num(0));
+            json_obj_set(var, "evaluateName", json_new_str(w->expression));
             json_arr_add(vars, var);
         }
     }
+
     json_value *body = json_new_obj();
     json_obj_set(body, "variables", vars);
     dap_send_response(d, request, true, body);
 }
 
-/* continue / next / stepIn / stepOut share a shape: respond then either stop
- * again (step) or terminate (continue with no more breakpoints). */
+/* NEW: Evaluate expression (watch, hover, repl) */
+static void handle_evaluate(dap_t *d, json_value *request) {
+    json_value *args = json_obj_get(request, "arguments");
+    const char *expression = json_get_str(json_obj_get(args, "expression"));
+    const char *context_str = json_get_str(json_obj_get(args, "context"));
+
+    if (!expression || !expression[0]) {
+        dap_send_response(d, request, false, NULL);
+        return;
+    }
+
+    char result[256];
+    bool success = dbg_evaluate(&d->dbg, expression, result, sizeof(result));
+
+    json_value *body = json_new_obj();
+    json_obj_set(body, "result", json_new_str(result));
+    json_obj_set(body, "variablesReference", json_new_num(0));
+
+    /* If this is a "watch" context, add the watch expression */
+    if (context_str && strcmp(context_str, "watch") == 0) {
+        /* ensure it's in the watch list */
+        bool found = false;
+        for (int i = 0; i < d->dbg.watch_count; i++) {
+            if (strcmp(d->dbg.watches[i].expression, expression) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) dbg_add_watch(&d->dbg, expression);
+    }
+
+    dap_send_response(d, request, success, body);
+}
+
+/* NEW: Set variable value */
+static void handle_set_variable(dap_t *d, json_value *request) {
+    json_value *args = json_obj_get(request, "arguments");
+    const char *name = json_get_str(json_obj_get(args, "name"));
+    const char *value = json_get_str(json_obj_get(args, "value"));
+
+    if (!name || !value) {
+        dap_send_response(d, request, false, NULL);
+        return;
+    }
+
+    bool success = dbg_set_variable(&d->dbg, name, value);
+    json_value *body = json_new_obj();
+    json_obj_set(body, "value", json_new_str(value));
+    json_obj_set(body, "variablesReference", json_new_num(0));
+    dap_send_response(d, request, success, body);
+}
+
+/* NEW: Exception info request */
+static void handle_exception_info(dap_t *d, json_value *request) {
+    char info[256] = {0};
+    bool has_info = dbg_get_exception_info(&d->dbg, info, sizeof(info));
+
+    json_value *body = json_new_obj();
+    json_obj_set(body, "exceptionId", json_new_str(has_info ? info : "unknown"));
+    json_obj_set(body, "breakMode", json_new_str("always"));
+    dap_send_response(d, request, true, body);
+}
+
+/* continue / next / stepIn / stepOut share a shape */
 static void handle_continue(dap_t *d, json_value *request) {
     json_value *body = json_new_obj();
     json_obj_set(body, "allThreadsContinued", json_new_bool(true));
     dap_send_response(d, request, true, body);
     dbg_continue(&d->dbg);
-    /* no persistent runtime breakpoint tracking here: program completes */
-    dap_output(d, "stdout", "Program finished.\n");
-    dap_send_terminated(d);
+
+    /* Check if we hit another breakpoint */
+    if (d->dbg.state == DBG_PAUSED) {
+        dap_send_stopped(d, "breakpoint");
+    } else {
+        dap_output(d, "stdout", "Program finished.\n");
+        dap_send_terminated(d);
+    }
 }
 
-static void handle_step(dap_t *d, json_value *request, dbg_step_t mode) {
+static void handle_next(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    switch (mode) {
-    case DBG_STEP_OVER: dbg_step_over(&d->dbg); break;
-    case DBG_STEP_INTO: dbg_step_into(&d->dbg); break;
-    case DBG_STEP_OUT:  dbg_step_out(&d->dbg);  break;
-    }
-    if (d->dbg.frame_count > 0)
-        d->dbg.frames[d->dbg.current_frame >= 0 ? d->dbg.current_frame : 0].line =
+    dbg_step_over(&d->dbg);
+    if (d->dbg.callstack_depth > 0)
+        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
+            d->dbg.current_line;
+    dap_send_stopped(d, "step");
+}
+
+static void handle_step_in(dap_t *d, json_value *request) {
+    dap_send_response(d, request, true, NULL);
+    dbg_step_into(&d->dbg);
+    if (d->dbg.callstack_depth > 0)
+        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
+            d->dbg.current_line;
+    dap_send_stopped(d, "step");
+}
+
+static void handle_step_out(dap_t *d, json_value *request) {
+    dap_send_response(d, request, true, NULL);
+    dbg_step_out(&d->dbg);
+    if (d->dbg.callstack_depth > 0)
+        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
             d->dbg.current_line;
     dap_send_stopped(d, "step");
 }
@@ -328,10 +479,13 @@ static void dispatch(dap_t *d, json_value *request) {
     else if (strcmp(cmd, "stackTrace") == 0)        handle_stack_trace(d, request);
     else if (strcmp(cmd, "scopes") == 0)            handle_scopes(d, request);
     else if (strcmp(cmd, "variables") == 0)         handle_variables(d, request);
+    else if (strcmp(cmd, "evaluate") == 0)          handle_evaluate(d, request);
+    else if (strcmp(cmd, "setVariable") == 0)       handle_set_variable(d, request);
+    else if (strcmp(cmd, "exceptionInfo") == 0)     handle_exception_info(d, request);
     else if (strcmp(cmd, "continue") == 0)          handle_continue(d, request);
-    else if (strcmp(cmd, "next") == 0)              handle_step(d, request, DBG_STEP_OVER);
-    else if (strcmp(cmd, "stepIn") == 0)            handle_step(d, request, DBG_STEP_INTO);
-    else if (strcmp(cmd, "stepOut") == 0)           handle_step(d, request, DBG_STEP_OUT);
+    else if (strcmp(cmd, "next") == 0)              handle_next(d, request);
+    else if (strcmp(cmd, "stepIn") == 0)            handle_step_in(d, request);
+    else if (strcmp(cmd, "stepOut") == 0)           handle_step_out(d, request);
     else if (strcmp(cmd, "pause") == 0)             handle_pause(d, request);
     else if (strcmp(cmd, "terminate") == 0)         handle_disconnect(d, request);
     else if (strcmp(cmd, "disconnect") == 0)        handle_disconnect(d, request);

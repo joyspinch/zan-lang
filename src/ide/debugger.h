@@ -1,127 +1,245 @@
-/* debugger.h -- Debugging support for the Zan IDE.
+/* debugger.h -- Integrated debugger for the Zan IDE.
  *
- * Provides breakpoint management, step control, variable inspection,
- * and call stack display. Communicates with the compiled program via
- * debug info embedded in the LLVM IR.
+ * Enhanced with:
+ *   - Conditional breakpoints (expression-based)
+ *   - Hit count breakpoints
+ *   - Watch expressions
+ *   - Variable inspection with type info
+ *   - Call stack with parameter values
+ *   - Debug output panel integration
+ *   - Logpoint support (breakpoint that only logs)
  */
 #ifndef ZAN_DEBUGGER_H
 #define ZAN_DEBUGGER_H
 
 #include <stdbool.h>
-#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define DBG_MAX_BREAKPOINTS 256
-#define DBG_MAX_VARIABLES   512
-#define DBG_MAX_FRAMES      64
+#define DBG_MAX_BREAKPOINTS  128
+#define DBG_MAX_WATCHES      32
+#define DBG_MAX_LOCALS       256
+#define DBG_MAX_CALLSTACK    64
+#define DBG_MAX_OUTPUT       8192
 
-/* Debugger state */
+/* Debugger state machine */
 typedef enum {
     DBG_IDLE,       /* not debugging */
     DBG_RUNNING,    /* program running */
-    DBG_PAUSED,     /* hit breakpoint or step */
-    DBG_STOPPED     /* program exited */
+    DBG_PAUSED,     /* hit a breakpoint or step complete */
+    DBG_STEPPING,   /* in the middle of a step operation */
+    DBG_TERMINATED  /* program ended */
 } dbg_state_t;
 
-/* Step mode */
+/* Breakpoint type */
 typedef enum {
-    DBG_STEP_OVER,
-    DBG_STEP_INTO,
-    DBG_STEP_OUT
-} dbg_step_t;
+    BP_NORMAL,      /* always breaks */
+    BP_CONDITIONAL, /* breaks when expression is true */
+    BP_HITCOUNT,    /* breaks after N hits */
+    BP_LOGPOINT     /* doesn't break, logs a message */
+} bp_type_t;
 
 /* A breakpoint */
 typedef struct {
-    char        file[512];
-    int         line;       /* 0-based */
-    bool        enabled;
-    bool        hit;        /* currently stopped at this BP */
-    int         hit_count;
-    char        condition[256]; /* conditional expression (future) */
+    char      file[512];
+    int       line;             /* 0-based */
+    bool      enabled;
+    bool      verified;         /* set once we confirm the BP was placed */
+    int       id;               /* unique breakpoint ID */
+
+    bp_type_t type;
+    char      condition[256];   /* expression for conditional BP */
+    int       hit_count_target; /* for hit-count BP */
+    int       hit_count;        /* current hit count */
+    char      log_message[256]; /* for logpoint */
 } dbg_breakpoint_t;
 
-/* A variable in the watch/locals panel */
+/* A watch expression */
 typedef struct {
-    char        name[128];
-    char        type[64];
-    char        value[256];
-    int         scope_depth;
-    bool        is_local;
-} dbg_variable_t;
+    char      expression[256];
+    char      value[256];       /* last evaluated value */
+    char      type[64];         /* resolved type */
+    bool      valid;            /* was evaluation successful? */
+    bool      has_children;     /* is it a complex object? */
+} dbg_watch_t;
 
-/* A stack frame */
+/* A local variable */
 typedef struct {
-    char        function[256];
-    char        file[512];
-    int         line;
-    int         col;
+    char      name[128];
+    char      value[256];
+    char      type[64];
+    int       scope;            /* 0 = current scope, 1 = parent, etc. */
+    bool      has_children;
+} dbg_local_t;
+
+/* A call stack frame */
+typedef struct {
+    char      function_name[128];
+    char      file[512];
+    int       line;
+    int       col;
+    int       frame_id;
 } dbg_frame_t;
 
-/* The debugger engine */
+/* Debug output entry */
+typedef struct {
+    char      text[512];
+    int       category;     /* 0=stdout, 1=stderr, 2=debug, 3=info */
+} dbg_output_entry_t;
+
+/* Main debugger state */
 typedef struct {
     dbg_state_t     state;
 
     /* breakpoints */
     dbg_breakpoint_t breakpoints[DBG_MAX_BREAKPOINTS];
     int              bp_count;
+    int              bp_next_id;
 
-    /* variables */
-    dbg_variable_t   locals[DBG_MAX_VARIABLES];
-    int              local_count;
+    /* watch expressions */
+    dbg_watch_t     watches[DBG_MAX_WATCHES];
+    int             watch_count;
+
+    /* current locals */
+    dbg_local_t     locals[DBG_MAX_LOCALS];
+    int             local_count;
 
     /* call stack */
-    dbg_frame_t      frames[DBG_MAX_FRAMES];
-    int              frame_count;
-    int              current_frame;
+    dbg_frame_t     callstack[DBG_MAX_CALLSTACK];
+    int             callstack_depth;
+    int             active_frame;   /* selected frame index */
 
-    /* current position */
-    char             current_file[512];
-    int              current_line;
+    /* debug output buffer */
+    char            output[DBG_MAX_OUTPUT];
+    int             output_len;
 
-    /* process handle */
+    /* current stopped location */
+    char            current_file[512];
+    int             current_line;
+    int             current_col;
+    char            stop_reason[128];   /* reason for pause */
+
+    /* process information (platform-specific) */
 #ifdef _WIN32
-    void            *process_handle;   /* HANDLE */
-    void            *thread_handle;    /* HANDLE */
-    unsigned long    process_id;
+    void           *process_handle;
+    void           *thread_handle;
+    unsigned long   process_id;
+    unsigned long   thread_id;
 #else
-    int              child_pid;
+    int             child_pid;
 #endif
+
+    /* settings */
+    bool            break_on_entry;     /* pause at program start */
+    bool            break_on_exception; /* pause on unhandled exceptions */
+    bool            skip_stdlib;        /* don't step into stdlib */
 } debugger_t;
 
 /* Initialize debugger */
 void dbg_init(debugger_t *dbg);
 
-/* Add/remove breakpoints */
-int  dbg_add_breakpoint(debugger_t *dbg, const char *file, int line);
-void dbg_remove_breakpoint(debugger_t *dbg, int index);
-void dbg_toggle_breakpoint(debugger_t *dbg, const char *file, int line);
-dbg_breakpoint_t *dbg_find_breakpoint(debugger_t *dbg, const char *file, int line);
-
 /* Start debugging a program */
-bool dbg_start(debugger_t *dbg, const char *exe_path, const char *args);
+bool dbg_start(debugger_t *dbg, const char *program, const char *args);
 
-/* Stop debugging */
+/* Stop debugging (terminate the program) */
 void dbg_stop(debugger_t *dbg);
 
 /* Continue execution */
 void dbg_continue(debugger_t *dbg);
 
-/* Step operations */
+/* Stepping */
 void dbg_step_over(debugger_t *dbg);
 void dbg_step_into(debugger_t *dbg);
 void dbg_step_out(debugger_t *dbg);
 
-/* Get current state */
-dbg_state_t dbg_get_state(const debugger_t *dbg);
+/* Run to cursor */
+void dbg_run_to_cursor(debugger_t *dbg, const char *file, int line);
 
-/* Check if a line has a breakpoint */
-bool dbg_has_breakpoint(const debugger_t *dbg, const char *file, int line);
+/* --- Breakpoint management --- */
 
-/* Is the debugger currently stopped at this line? */
-bool dbg_is_current_line(const debugger_t *dbg, const char *file, int line);
+/* Add a simple breakpoint. Returns breakpoint ID or -1. */
+int dbg_add_breakpoint(debugger_t *dbg, const char *file, int line);
+
+/* Add a conditional breakpoint */
+int dbg_add_conditional_bp(debugger_t *dbg, const char *file, int line,
+                           const char *condition);
+
+/* Add a hit-count breakpoint */
+int dbg_add_hitcount_bp(debugger_t *dbg, const char *file, int line, int count);
+
+/* Add a logpoint (breakpoint that logs but doesn't stop) */
+int dbg_add_logpoint(debugger_t *dbg, const char *file, int line,
+                     const char *message);
+
+/* Remove a breakpoint by ID */
+bool dbg_remove_breakpoint(debugger_t *dbg, int bp_id);
+
+/* Remove a breakpoint by location */
+bool dbg_remove_breakpoint_at(debugger_t *dbg, const char *file, int line);
+
+/* Toggle breakpoint at location */
+int dbg_toggle_breakpoint(debugger_t *dbg, const char *file, int line);
+
+/* Enable/disable a breakpoint */
+void dbg_enable_breakpoint(debugger_t *dbg, int bp_id, bool enabled);
+
+/* Edit a breakpoint's condition */
+void dbg_set_bp_condition(debugger_t *dbg, int bp_id, const char *condition);
+
+/* Check if line has a breakpoint */
+bool dbg_has_breakpoint(debugger_t *dbg, const char *file, int line);
+
+/* Get breakpoint at location (NULL if none) */
+dbg_breakpoint_t *dbg_get_breakpoint_at(debugger_t *dbg, const char *file, int line);
+
+/* --- Watch expressions --- */
+
+/* Add a watch expression */
+int dbg_add_watch(debugger_t *dbg, const char *expression);
+
+/* Remove a watch expression by index */
+void dbg_remove_watch(debugger_t *dbg, int index);
+
+/* Edit a watch expression */
+void dbg_edit_watch(debugger_t *dbg, int index, const char *new_expression);
+
+/* Evaluate all watch expressions (called when paused) */
+void dbg_evaluate_watches(debugger_t *dbg);
+
+/* Evaluate a single expression and return value as string */
+bool dbg_evaluate(debugger_t *dbg, const char *expression, char *result, int result_size);
+
+/* --- Locals and Call Stack --- */
+
+/* Refresh local variables for current frame */
+void dbg_refresh_locals(debugger_t *dbg);
+
+/* Refresh call stack */
+void dbg_refresh_callstack(debugger_t *dbg);
+
+/* Select a different stack frame (updates locals) */
+void dbg_select_frame(debugger_t *dbg, int frame_index);
+
+/* --- Output --- */
+
+/* Append text to debug output */
+void dbg_append_output(debugger_t *dbg, const char *text);
+
+/* Clear debug output */
+void dbg_clear_output(debugger_t *dbg);
+
+/* --- Utility --- */
+
+/* Check if debugger is paused at specific file:line */
+bool dbg_is_current_line(debugger_t *dbg, const char *file, int line);
+
+/* Set value of a variable (in current scope) */
+bool dbg_set_variable(debugger_t *dbg, const char *name, const char *value);
+
+/* Get exception info if stopped on exception */
+bool dbg_get_exception_info(debugger_t *dbg, char *info, int info_size);
 
 #ifdef __cplusplus
 }

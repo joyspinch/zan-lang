@@ -1,0 +1,372 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Text;
+
+namespace System.Net.WebSocket;
+
+/// <summary>
+/// WebSocket frame opcodes.
+/// </summary>
+class WsOpcode {
+    static int Continuation = 0;
+    static int Text         = 1;
+    static int Binary       = 2;
+    static int Close        = 8;
+    static int Ping         = 9;
+    static int Pong         = 10;
+}
+
+/// <summary>
+/// WebSocket frame builder and parser (RFC 6455).
+/// </summary>
+class WsFrame {
+    int opcode;
+    string payload;
+    int payloadLen;
+    bool fin;
+    bool masked;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    WsFrame() {
+        this.opcode = WsOpcode.Text;
+        this.payload = "";
+        this.payloadLen = 0;
+        this.fin = true;
+        this.masked = false;
+    }
+
+    static WsFrame TextFrame(string data) {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Text;
+        f.payload = data;
+        f.payloadLen = data.Length;
+        return f;
+    }
+
+    static WsFrame BinaryFrame(string data, int len) {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Binary;
+        f.payload = data;
+        f.payloadLen = len;
+        return f;
+    }
+
+    static WsFrame CloseFrame() {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Close;
+        return f;
+    }
+
+    static WsFrame PingFrame() {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Ping;
+        return f;
+    }
+
+    static WsFrame PongFrame() {
+        WsFrame f = new WsFrame();
+        f.opcode = WsOpcode.Pong;
+        return f;
+    }
+
+    string Encode() {
+        int headerLen = 2;
+        if (this.payloadLen > 65535) {
+            headerLen = 10;
+        } else if (this.payloadLen > 125) {
+            headerLen = 4;
+        }
+
+        string buf = calloc(headerLen + this.payloadLen + 1, 1);
+        int byte0 = 128 + this.opcode;
+        buf[0] = byte0;
+
+        if (this.payloadLen > 65535) {
+            buf[1] = 127;
+            buf[2] = 0;
+            buf[3] = 0;
+            buf[4] = 0;
+            buf[5] = 0;
+            buf[6] = (this.payloadLen >> 24) & 255;
+            buf[7] = (this.payloadLen >> 16) & 255;
+            buf[8] = (this.payloadLen >> 8) & 255;
+            buf[9] = this.payloadLen & 255;
+        } else if (this.payloadLen > 125) {
+            buf[1] = 126;
+            buf[2] = (this.payloadLen >> 8) & 255;
+            buf[3] = this.payloadLen & 255;
+        } else {
+            buf[1] = this.payloadLen;
+        }
+
+        int i = 0;
+        while (i < this.payloadLen) {
+            buf[headerLen + i] = this.payload[i];
+            i = i + 1;
+        }
+
+        return buf;
+    }
+
+    static WsFrame Decode(string data, int dataLen) {
+        WsFrame f = new WsFrame();
+        if (dataLen < 2) { return f; }
+
+        int byte0 = data[0] & 255;
+        int byte1 = data[1] & 255;
+
+        f.fin = (byte0 & 128) != 0;
+        f.opcode = byte0 & 15;
+        f.masked = (byte1 & 128) != 0;
+
+        int payloadLen = byte1 & 127;
+        int offset = 2;
+
+        if (payloadLen == 126) {
+            payloadLen = ((data[2] & 255) << 8) + (data[3] & 255);
+            offset = 4;
+        } else if (payloadLen == 127) {
+            payloadLen = ((data[6] & 255) << 24) + ((data[7] & 255) << 16) +
+                         ((data[8] & 255) << 8) + (data[9] & 255);
+            offset = 10;
+        }
+
+        f.payloadLen = payloadLen;
+
+        if (f.masked) {
+            int mask0 = data[offset] & 255;
+            int mask1 = data[offset + 1] & 255;
+            int mask2 = data[offset + 2] & 255;
+            int mask3 = data[offset + 3] & 255;
+            offset = offset + 4;
+
+            string payload = calloc(payloadLen + 1, 1);
+            int i = 0;
+            while (i < payloadLen && (offset + i) < dataLen) {
+                int maskByte = 0;
+                int mod = i % 4;
+                if (mod == 0) { maskByte = mask0; }
+                else if (mod == 1) { maskByte = mask1; }
+                else if (mod == 2) { maskByte = mask2; }
+                else { maskByte = mask3; }
+                payload[i] = (data[offset + i] & 255) ^ maskByte;
+                i = i + 1;
+            }
+            f.payload = payload;
+        } else {
+            f.payload = data.Substring(offset, payloadLen);
+        }
+
+        return f;
+    }
+}
+
+/// <summary>
+/// WebSocket server.
+/// </summary>
+class WebSocketServer {
+    TcpListener listener;
+    string host;
+    int port;
+    bool running;
+    int activeConnections;
+
+    WebSocketServer(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.activeConnections = 0;
+    }
+
+    static WebSocketServer Create(string host, int port) {
+        return new WebSocketServer(host, port);
+    }
+
+    void Start() {
+        Socket.Initialize();
+        this.listener = TcpListener.Create(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+        Console.WriteLine("[WebSocketServer] Listening on " + this.host + ":" + Convert.ToString(this.port));
+
+        while (this.running) {
+            int clientSock = this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                this.activeConnections = this.activeConnections + 1;
+                HandleConnection(clientSock);
+            }
+        }
+    }
+
+    void HandleConnection(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+
+        string rawReq = client.RecvAsync(65536);
+        HttpRequest req = HttpRequest.Parse(rawReq);
+
+        string upgrade = req.GetHeader("Upgrade");
+        if (upgrade != "websocket" && upgrade != "Websocket") {
+            HttpResponse resp = HttpResponse.WithStatus(400, "Bad Request", "Expected WebSocket upgrade");
+            client.SendAsync(resp.Build());
+            client.Close();
+            this.activeConnections = this.activeConnections - 1;
+            return;
+        }
+
+        string wsKey = req.GetHeader("Sec-WebSocket-Key");
+        string acceptKey = Encoding.Base64Encode(wsKey + "258EAFA5");
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Accept: ");
+        sb.Append(acceptKey);
+        sb.Append("\r\n\r\n");
+        client.SendAsync(sb.ToString());
+
+        bool connected = true;
+        while (connected) {
+            string frameData = client.RecvAsync(65536);
+            if (frameData.Length == 0) {
+                connected = false;
+                break;
+            }
+
+            WsFrame frame = WsFrame.Decode(frameData, frameData.Length);
+
+            if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
+                string response = OnMessage(frame.payload);
+                WsFrame respFrame = WsFrame.TextFrame(response);
+                string encoded = respFrame.Encode();
+                client.SendBytesAsync(encoded, 2 + response.Length);
+            } else if (frame.opcode == WsOpcode.Ping) {
+                WsFrame pong = WsFrame.PongFrame();
+                string encoded = pong.Encode();
+                client.SendBytesAsync(encoded, 2);
+            } else if (frame.opcode == WsOpcode.Close) {
+                WsFrame closeResp = WsFrame.CloseFrame();
+                string encoded = closeResp.Encode();
+                client.SendBytesAsync(encoded, 2);
+                connected = false;
+            }
+        }
+
+        client.Close();
+        this.activeConnections = this.activeConnections - 1;
+    }
+
+    string OnMessage(string message) {
+        return message;
+    }
+
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) {
+            this.listener.Stop();
+        }
+    }
+}
+
+/// <summary>
+/// WebSocket client.
+/// </summary>
+class WebSocketClient {
+    TcpClient conn;
+    bool connected;
+    string host;
+    int port;
+    string path;
+
+    WebSocketClient() {
+        this.connected = false;
+        this.host = "";
+        this.port = 0;
+        this.path = "/";
+    }
+
+    static WebSocketClient ConnectAsync(string host, int port, string path) {
+        WebSocketClient ws = new WebSocketClient();
+        ws.host = host;
+        ws.port = port;
+        ws.path = path;
+
+        ws.conn = TcpClient.ConnectAsync(host, port);
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("GET ");
+        sb.Append(path);
+        sb.Append(" HTTP/1.1\r\n");
+        sb.Append("Host: ");
+        sb.Append(host);
+        sb.Append("\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+        sb.Append("Sec-WebSocket-Version: 13\r\n");
+        sb.Append("\r\n");
+        ws.conn.SendAsync(sb.ToString());
+
+        string response = ws.conn.RecvAsync(4096);
+        if (response.Length > 12 && response.Substring(9, 3) == "101") {
+            ws.connected = true;
+        }
+
+        return ws;
+    }
+
+    void SendText(string text) {
+        WsFrame frame = WsFrame.TextFrame(text);
+        string encoded = frame.Encode();
+        this.conn.SendBytesAsync(encoded, 2 + text.Length);
+    }
+
+    void SendBinary(string data, int len) {
+        WsFrame frame = WsFrame.BinaryFrame(data, len);
+        string encoded = frame.Encode();
+        this.conn.SendBytesAsync(encoded, 2 + len);
+    }
+
+    void Ping() {
+        WsFrame frame = WsFrame.PingFrame();
+        string encoded = frame.Encode();
+        this.conn.SendBytesAsync(encoded, 2);
+    }
+
+    string RecvText() {
+        string data = this.conn.RecvAsync(65536);
+        if (data.Length == 0) {
+            this.connected = false;
+            return data;
+        }
+        WsFrame frame = WsFrame.Decode(data, data.Length);
+        if (frame.opcode == WsOpcode.Close) {
+            this.connected = false;
+            return data;
+        }
+        if (frame.opcode == WsOpcode.Ping) {
+            WsFrame pong = WsFrame.PongFrame();
+            string encoded = pong.Encode();
+            this.conn.SendBytesAsync(encoded, 2);
+            return RecvText();
+        }
+        return frame.payload;
+    }
+
+    void Close() {
+        if (this.connected) {
+            WsFrame closeFrame = WsFrame.CloseFrame();
+            string encoded = closeFrame.Encode();
+            this.conn.SendBytesAsync(encoded, 2);
+            this.conn.Close();
+            this.connected = false;
+        }
+    }
+
+    bool IsConnected() {
+        return this.connected;
+    }
+}

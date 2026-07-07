@@ -10,7 +10,7 @@ class Program {
         app.Show();
 
         // ---- Reactive state (persists across frames) ----
-        SignalInt nav = SignalInt.Create(31);
+        SignalInt nav = SignalInt.Create(44);
 
         SignalInt clickCount = SignalInt.Create(0);
         SignalBool check1 = SignalBool.Create(true);
@@ -147,6 +147,8 @@ class Program {
         descs.Add("Loading placeholders that mimic content layout.");
         names.Add("Chart");
         descs.Add("Line & bar/column charts with axes, gridlines and legend.");
+        names.Add("Live");
+        descs.Add("Real-time dashboard: live bar/line charts + a virtual table that refreshes continuously.");
 
         // ----- DataTable demo dataset (built once; rows are virtualised at render) -----
         DataTableState dtState = DataTableState.Create();
@@ -200,6 +202,55 @@ class Program {
         PivotConfig pvCfg = PivotConfig.Create(2, 3, 4, 0);
         pvCfg.valueTitle = "Score";
         SignalInt pvAgg = SignalInt.Create(0);
+
+        // ----- Live dashboard state (persists across frames) -----
+        // A small LCG drives a bounded random walk so the bar/line charts and
+        // the virtual table all "breathe" over wall-clock time without input.
+        SignalInt liveSeed = SignalInt.Create(1234567891);
+        SignalInt liveLastMs = SignalInt.Create(0);
+        List<string> liveBarLabels = new List<string>();
+        List<int> liveBarTarget = new List<int>();   // random-walk targets
+        int lbi = 0;
+        while (lbi < 8) {
+            liveBarLabels.Add("S" + Convert.ToString(lbi + 1));
+            liveBarTarget.Add(30 + (lbi * 17) % 55);
+            lbi = lbi + 1;
+        }
+        List<int> liveLine = new List<int>();         // rolling time series
+        int lli = 0;
+        while (lli < 40) { liveLine.Add(50); lli = lli + 1; }
+
+        // Live virtual table: many rows whose metrics tick in place each update
+        // (no re-sort -> cheap "dynamic rendering" over a virtualised grid).
+        DataTableState liveState = DataTableState.Create();
+        liveState.striped = true;
+        List<DataColumn> liveCols = new List<DataColumn>();
+        liveCols.Add(DataColumn.Numeric("PID", app.Scale(70)));
+        liveCols.Add(DataColumn.Text("Service", app.Scale(150)));
+        liveCols.Add(DataColumn.Numeric("CPU %", app.Scale(110)));
+        liveCols.Add(DataColumn.Numeric("Mem MB", app.Scale(100)));
+        liveCols.Add(DataColumn.ProgressCol("Load", app.Scale(170)));
+        liveCols.Add(DataColumn.Numeric("Req/s", app.Scale(90)));
+        DataColumn.DataBar(liveCols[2], DataTable.Rgb(238, 102, 102));   // CPU data bar
+        liveCols[2].summary = 2;  // avg CPU
+        liveCols[5].summary = 1;  // total req/s
+        List<string> liveSvc = new List<string>();
+        liveSvc.Add("api"); liveSvc.Add("auth"); liveSvc.Add("cache");
+        liveSvc.Add("db"); liveSvc.Add("queue"); liveSvc.Add("worker");
+        liveSvc.Add("cdn"); liveSvc.Add("search");
+        List<DataRow> liveRows = new List<DataRow>();
+        int lri = 0;
+        while (lri < 2000) {
+            DataRow r = DataRow.Create();
+            r.Push(Convert.ToString(4100 + lri));
+            r.Push(liveSvc[lri % 8] + "-" + Convert.ToString(lri / 8));
+            r.Push(Convert.ToString(10 + (lri * 7) % 80));
+            r.Push(Convert.ToString(64 + (lri * 13) % 900));
+            r.Push(Convert.ToString((lri * 29) % 100));
+            r.Push(Convert.ToString(20 + (lri * 11) % 480));
+            liveRows.Add(r);
+            lri = lri + 1;
+        }
 
         while (app.isRunning) {
             if (!app.ProcessEvent()) { break; }
@@ -876,7 +927,7 @@ class Program {
                 cy = cy + app.Scale(24);
                 Skeleton.Rect(app, x, cy, app.Scale(320), app.Scale(14));
                 cy = cy + rowGap;
-            } else {
+            } else if (sel == 43) {
                 // ----- Chart demo: shared monthly categories, two series -----
                 List<string> chLabels = new List<string>();
                 chLabels.Add("Jan"); chLabels.Add("Feb"); chLabels.Add("Mar");
@@ -932,6 +983,68 @@ class Program {
                 Chart.Pie(app, x, cy, chW, chH, "Traffic Sources", pNames, pVals);
                 Chart.Donut(app, col2, cy, chW, chH, "Traffic Sources", pNames, pVals);
                 cy = cy + chH + rowGap;
+            } else if (sel == 44) {
+                int nowT = app.nowMs;
+                if (nowT - liveLastMs.Get() >= 90) {
+                    liveLastMs.Set(nowT);
+                    int seed = liveSeed.Get();
+                    int bk = 0;
+                    while (bk < liveBarTarget.Count) {
+                        seed = (seed * 1103515245 + 12345) % 2147483647;
+                        int d = (seed % 25) - 12;
+                        int nv = liveBarTarget[bk] + d;
+                        if (nv < 6) { nv = 6; }
+                        if (nv > 100) { nv = 100; }
+                        liveBarTarget[bk] = nv;
+                        bk = bk + 1;
+                    }
+                    int sh = 0;
+                    while (sh + 1 < liveLine.Count) { liveLine[sh] = liveLine[sh + 1]; sh = sh + 1; }
+                    seed = (seed * 1103515245 + 12345) % 2147483647;
+                    int lastv = liveLine[liveLine.Count - 1] + ((seed % 27) - 13);
+                    if (lastv < 8) { lastv = 8; }
+                    if (lastv > 100) { lastv = 100; }
+                    liveLine[liveLine.Count - 1] = lastv;
+                    int rr = 0;
+                    while (rr < liveRows.Count) {
+                        DataRow lr = liveRows[rr];
+                        lr.cells[2] = "50";
+                        rr = rr + 1;
+                    }
+                    liveSeed.Set(seed);
+                }
+                int chW = app.Scale(520);
+                int chH = app.Scale(230);
+                int gap2 = app.Scale(24);
+                int col2 = x + chW + gap2;
+                List<int> barDisp = new List<int>();
+                int bd = 0;
+                while (bd < liveBarTarget.Count) {
+                    barDisp.Add(app.AnimPx(3100000 + bd, liveBarTarget[bd], 70));
+                    bd = bd + 1;
+                }
+                List<ChartSeries> liveBarSeries = new List<ChartSeries>();
+                liveBarSeries.Add(ChartSeries.Create("Throughput", barDisp, Chart.Palette(t, 0)));
+                List<ChartSeries> liveLineSeries = new List<ChartSeries>();
+                liveLineSeries.Add(ChartSeries.Create("Latency", liveLine, Chart.Palette(t, 3)));
+                List<string> lineLbls = new List<string>();
+                int llx = 0;
+                while (llx < liveLine.Count) { lineLbls.Add(""); llx = llx + 1; }
+                Label.Small(app, x, cy, "LIVE THROUGHPUT");
+                Label.Small(app, col2, cy, "LIVE LATENCY");
+                cy = cy + capGap;
+                Chart.Bar(app, x, cy, chW, chH, "Throughput req/s", liveBarLabels, liveBarSeries);
+                Chart.Area(app, col2, cy, chW, chH, "Latency ms", lineLbls, liveLineSeries);
+                cy = cy + chH + t.gapLarge;
+                Label.Small(app, x, cy, "LIVE VIRTUAL TABLE");
+                cy = cy + capGap;
+                int liveTotal = app.Scale(46) + app.Scale(690) + app.Scale(16);
+                if (liveTotal > contentW) { liveTotal = contentW; }
+                int liveH = app.Scale(300);
+                liveState.showSelect = false;
+                DataTable.Render(app, x, cy, liveTotal, liveH, liveCols, liveRows, liveState);
+                cy = cy + liveH + t.gapLarge;
+                app.RequestRedraw();
             }
 
             int consumed = (cy + app.scrollY) - top + pad;

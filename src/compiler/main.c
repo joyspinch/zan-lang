@@ -12,11 +12,13 @@
 #include "binder.h"
 #include "checker.h"
 #include "irgen.h"
+#include "optimizer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <process.h>
 #else
 #include <unistd.h>
 #endif
@@ -444,6 +446,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
         fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
         fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
+        fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
+        fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
         return 1;
     }
 
@@ -458,7 +462,10 @@ int main(int argc, char **argv) {
     bool runtime_checks = true;
     bool publish_mode = false;
     const char *stdlib_path = NULL;
-    bool auto_stdlib = false;
+    bool auto_stdlib = true;
+    int opt_level = -1; /* -1 = auto (O0 default, O2 for publish) */
+    const char *pp_defines[64];
+    int pp_define_count = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -479,6 +486,16 @@ int main(int argc, char **argv) {
             auto_stdlib = true;
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
+        } else if (strcmp(argv[i], "-O0") == 0) {
+            opt_level = 0;
+        } else if (strcmp(argv[i], "-O1") == 0) {
+            opt_level = 1;
+        } else if (strcmp(argv[i], "-O2") == 0) {
+            opt_level = 2;
+        } else if (strcmp(argv[i], "-O3") == 0) {
+            opt_level = 3;
+        } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
+            if (pp_define_count < 64) pp_defines[pp_define_count++] = argv[i] + 2;
         } else if (argv[i][0] != '-') {
             if (input_count < 128) {
                 input_files[input_count++] = argv[i];
@@ -542,7 +559,15 @@ int main(int argc, char **argv) {
             {"System.Text",      "System/Text",      {"Encoding.zan", NULL}},
             {"System.Json",      "System/Json",      {"Json.zan", NULL}},
             {"System.Threading", "System/Threading",  {"Threading.zan", NULL}},
-            {"System.Net",       "System/Net",        {"Net.zan", NULL}},
+            {"System.Net.Sockets", "System/Net/Sockets", {"Socket.zan", "TcpListener.zan", "TcpClient.zan", "UdpClient.zan", NULL}},
+            {"System.Net.Http",  "System/Net/Http",  {"HttpRequest.zan", "HttpResponse.zan", "HttpServer.zan", "HttpClient.zan", NULL}},
+            {"System.Net.WebSocket", "System/Net/WebSocket", {"WebSocket.zan", NULL}},
+            {"System.Net.Mqtt",  "System/Net/Mqtt",  {"MqttClient.zan", NULL}},
+            {"System.Net",       "System/Net",        {"Net.zan", "Worker.zan", NULL}},
+            {"System.Data.Orm",  "System/Data/Orm",  {"Model.zan", "QueryBuilder.zan", NULL}},
+            {"System.Data",      "System/Data",      {"DbConnection.zan", "DbResult.zan", NULL}},
+            {"System.Diagnostics", "System/Diagnostics", {"Process.zan", NULL}},
+            {"Platform",         "Platform",          {"Runtime.zan", NULL}},
             {"System.Windows.Forms", "System/Windows", {"Forms.zan", NULL}},
             {"System.Drawing", "System/Drawing", {"Primitives.zan", "Graphics.zan", NULL}},
             {"Gui", "gui", {
@@ -562,13 +587,18 @@ int main(int argc, char **argv) {
             {NULL, NULL, {NULL}}
         };
         /* collect which namespaces are used */
-        int ns_used[10] = {0};
+        int ns_used[20] = {0};
         for (int fi = 0; fi < input_count; fi++) {
             size_t slen2 = 0;
             char *src2 = read_file(input_files[fi], &slen2);
             if (!src2) continue;
             for (int mi = 0; stdlib_map[mi].using_ns; mi++) {
-                if (strstr(src2, stdlib_map[mi].using_ns)) {
+                /* Match "using Namespace;" exactly, not as a substring of
+                   a longer namespace (e.g. System.Net should NOT match when
+                   the source only has "using System.Net.Sockets;"). */
+                char needle[256];
+                snprintf(needle, sizeof(needle), "using %s;", stdlib_map[mi].using_ns);
+                if (strstr(src2, needle)) {
                     ns_used[mi] = 1;
                 }
             }
@@ -633,6 +663,37 @@ int main(int argc, char **argv) {
 
         zan_lexer_t lex;
         zan_lexer_init(&lex, src, slen, fi, arena, diag);
+
+        /* Auto-define platform macros */
+#ifdef _WIN32
+        zan_lexer_define(&lex, "WINDOWS", "1");
+        zan_lexer_define(&lex, "WIN32", "1");
+#elif defined(__linux__)
+        zan_lexer_define(&lex, "LINUX", "1");
+#elif defined(__APPLE__)
+        zan_lexer_define(&lex, "MACOS", "1");
+        zan_lexer_define(&lex, "APPLE", "1");
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+        zan_lexer_define(&lex, "X86_64", "1");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        zan_lexer_define(&lex, "ARM64", "1");
+#endif
+        zan_lexer_define(&lex, "ZAN", "1");
+        /* User -D defines */
+        for (int di = 0; di < pp_define_count; di++) {
+            char dname[64]; const char *dval = "1";
+            const char *eq = strchr(pp_defines[di], '=');
+            if (eq) {
+                int nl = (int)(eq - pp_defines[di]);
+                if (nl > 63) nl = 63;
+                memcpy(dname, pp_defines[di], nl); dname[nl] = '\0';
+                dval = eq + 1;
+            } else {
+                strncpy(dname, pp_defines[di], 63); dname[63] = '\0';
+            }
+            zan_lexer_define(&lex, dname, dval);
+        }
 
         zan_parser_t parser;
         zan_parser_init(&parser, &lex, arena, diag);
@@ -707,6 +768,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* ---- optimize ---- */
+    zan_opt_level_t effective_opt = ZAN_OPT_NONE;
+    if (opt_level >= 0) {
+        effective_opt = (zan_opt_level_t)opt_level;
+    } else if (publish_mode) {
+        effective_opt = ZAN_OPT_FULL; /* O2 for --publish */
+    }
+    if (effective_opt > ZAN_OPT_NONE) {
+        zan_opt_report_t opt_report = zan_optimize(&irgen, &binder, effective_opt);
+        zan_opt_report_print(&opt_report);
+    }
+
     if (do_emit_ir) {
         zan_irgen_write_ir(&irgen, NULL);
     } else {
@@ -735,34 +808,87 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* link with system C compiler */
-        char link_cmd[2048];
+        /* ---- link object → executable ---- */
+        int link_ret;
 #ifdef _WIN32
-        /* Reserve a large (256 MB) stack: the self-hosted compiler recurses
-         * deeply over big translation units. The way to request it depends on
-         * the linker clang drives — MSVC's link.exe/lld-link takes /STACK:N,
-         * while a mingw GNU ld takes --stack,N. Detect via clang's default
-         * target triple so this works with both toolchains (dev vs CI). */
-        const char *stack_flag = "-Xlinker /STACK:268435456"; /* MSVC default */
-        {
-            FILE *dm = _popen("clang -dumpmachine", "r");
-            if (dm) {
-                char triple[256];
-                if (fgets(triple, sizeof(triple), dm) &&
-                    (strstr(triple, "gnu") || strstr(triple, "mingw"))) {
-                    stack_flag = "-Wl,--stack,268435456";
-                }
-                _pclose(dm);
+        /* Self-contained linking: prefer the bundled ld.lld + MinGW-w64 runtime
+         * shipped next to zanc (in <zanc_dir>/toolchain), so producing an .exe
+         * needs only zan — no external clang / MSVC / Windows SDK. Objects are
+         * emitted with the x86_64-w64-windows-gnu ABI (see zan_irgen_write_obj).
+         * If the bundle is absent we fall back to a system clang targeting the
+         * same mingw ABI. */
+        char exe_dir[1024];
+        GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
+        { char *s = strrchr(exe_dir, '\\'); if (s) *s = '\0'; }
+        char ld_path[1200], syslib[1200];
+        snprintf(ld_path, sizeof(ld_path), "%s\\toolchain\\ld.exe", exe_dir);
+        snprintf(syslib, sizeof(syslib), "%s\\toolchain\\mingw\\lib", exe_dir);
+        int have_bundle =
+            GetFileAttributesA(ld_path) != INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesA(syslib)  != INVALID_FILE_ATTRIBUTES;
+
+        if (have_bundle) {
+            char crt2[1300], crtbeg[1300], crtend[1300], lflag[1300];
+            snprintf(crt2,   sizeof(crt2),   "%s\\crt2.o", syslib);
+            snprintf(crtbeg, sizeof(crtbeg), "%s\\crtbegin.o", syslib);
+            snprintf(crtend, sizeof(crtend), "%s\\crtend.o", syslib);
+            snprintf(lflag,  sizeof(lflag),  "-L%s", syslib);
+
+            /* Invoke the bundled GNU ld (mingw binutils) directly. The system
+             * import/static libs have circular references, so wrap them in
+             * --start-group/--end-group for ld's single-pass resolver. */
+            const char *argv[80];
+            int a = 0;
+            argv[a++] = ld_path;
+            argv[a++] = "-m";      argv[a++] = "i386pep";
+            argv[a++] = "-Bdynamic";
+            /* 256 MB stack: the self-hosted compiler recurses deeply. */
+            argv[a++] = "--stack"; argv[a++] = "268435456";
+            if (publish_mode) argv[a++] = "-s";
+            argv[a++] = "-o";      argv[a++] = obj_path;
+            argv[a++] = crt2;
+            argv[a++] = crtbeg;
+            argv[a++] = lflag;
+            argv[a++] = obj_tmp;
+            argv[a++] = "--start-group";
+            argv[a++] = "-lmingw32"; argv[a++] = "-lgcc";
+            argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
+            argv[a++] = "-lmsvcrt";   argv[a++] = "-lkernel32";
+            argv[a++] = "-ladvapi32"; argv[a++] = "-lshell32";
+            argv[a++] = "-luser32";
+            /* extern [DllImport] libraries (skip those already in the CRT) */
+            char libbufs[24][128]; int nb = 0;
+            for (int li = 0; li < irgen.extern_lib_count && a < 68 && nb < 24; li++) {
+                const char *lib = irgen.extern_libs[li].str;
+                int lib_len = (int)irgen.extern_libs[li].len;
+                if (lib_len == 1 && (lib[0] == 'm' || lib[0] == 'c')) continue;
+                if (lib_len == 3 && memcmp(lib, "crt", 3) == 0) continue;
+                if (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0) continue;
+                snprintf(libbufs[nb], sizeof(libbufs[nb]), "-l%.*s", lib_len, lib);
+                argv[a++] = libbufs[nb++];
             }
-        }
-        if (publish_mode) {
-            snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" %s -O2 -Xlinker /LTCG",
-                     obj_tmp, obj_path, stack_flag);
+            argv[a++] = "--end-group";
+            argv[a++] = crtend;
+            argv[a] = NULL;
+            link_ret = (int)_spawnv(_P_WAIT, ld_path, argv);
         } else {
-            snprintf(link_cmd, sizeof(link_cmd), "clang \"%s\" -o \"%s\" %s",
-                     obj_tmp, obj_path, stack_flag);
+            char link_cmd[4096];
+            snprintf(link_cmd, sizeof(link_cmd),
+                     "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\"%s",
+                     obj_tmp, obj_path, publish_mode ? " -O2 -s" : "");
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                const char *lib = irgen.extern_libs[li].str;
+                int lib_len = (int)irgen.extern_libs[li].len;
+                if (lib_len == 1 && (lib[0] == 'm' || lib[0] == 'c')) continue;
+                if (lib_len == 3 && memcmp(lib, "crt", 3) == 0) continue;
+                if (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0) continue;
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
+            }
+            link_ret = system(link_cmd);
         }
 #else
+        char link_cmd[4096];
         if (publish_mode) {
             snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm -O2 -s",
                      obj_tmp, obj_path);
@@ -770,24 +896,14 @@ int main(int argc, char **argv) {
             snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
                      obj_tmp, obj_path);
         }
-#endif
-        /* append -l flags for [DllImport] extern libraries */
         for (int li = 0; li < irgen.extern_lib_count; li++) {
             const char *lib = irgen.extern_libs[li].str;
             int lib_len = (int)irgen.extern_libs[li].len;
-#ifdef _WIN32
-            /* skip "m" and "msvcrt" on Windows — already in default CRT */
-            if (lib_len == 1 && lib[0] == 'm') continue;
-            if (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0) continue;
-            if (lib_len == 1 && lib[0] == 'c') continue;
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
-#else
-            size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
-#endif
         }
-        int link_ret = system(link_cmd);
+        link_ret = system(link_cmd);
+#endif
 
         /* clean up object file */
         remove(obj_tmp);

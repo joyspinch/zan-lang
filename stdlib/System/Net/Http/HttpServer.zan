@@ -1,0 +1,192 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+
+namespace System.Net.Http;
+
+/// <summary>
+/// Coroutine-based HTTP/1.1 server, inspired by Workerman.
+/// Each client connection is handled in its own coroutine,
+/// enabling massive concurrency without threads.
+///
+/// Usage:
+///   class MyApp {
+///       static void Main() {
+///           HttpServer server = HttpServer.Create("0.0.0.0", 8080);
+///           server.OnRequest(HandleRequest);
+///           server.Start();
+///       }
+///       static HttpResponse HandleRequest(HttpRequest req) {
+///           if (req.path == "/") {
+///               return HttpResponse.Ok("<h1>Hello Zan!</h1>");
+///           }
+///           return HttpResponse.NotFound();
+///       }
+///   }
+/// </summary>
+class HttpServer {
+    TcpListener listener;
+    string host;
+    int port;
+    bool running;
+    int maxConnections;
+    int activeConnections;
+    int requestTimeout;
+
+    HttpServer(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.maxConnections = 10000;
+        this.activeConnections = 0;
+        this.requestTimeout = 30000;
+    }
+
+    /// <summary>Creates an HTTP server on the given address.</summary>
+    static HttpServer Create(string host, int port) {
+        HttpServer server = new HttpServer(host, port);
+        return server;
+    }
+
+    /// <summary>Sets the maximum number of concurrent connections.</summary>
+    HttpServer SetMaxConnections(int max) {
+        this.maxConnections = max;
+        return this;
+    }
+
+    /// <summary>Sets the request timeout in milliseconds.</summary>
+    HttpServer SetTimeout(int ms) {
+        this.requestTimeout = ms;
+        return this;
+    }
+
+    /// <summary>Starts the HTTP server event loop.
+    /// Runs forever, accepting and handling connections.</summary>
+    void Start() {
+        Socket.Initialize();
+        this.listener = TcpListener.Create(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+        Console.WriteLine("[HttpServer] Listening on " + this.host + ":" + Convert.ToString(this.port));
+
+        while (this.running) {
+            int clientSock = this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                this.activeConnections = this.activeConnections + 1;
+                HandleConnection(clientSock);
+            }
+        }
+    }
+
+    /// <summary>Handles a single client connection.
+    /// Supports HTTP keep-alive for multiple requests.</summary>
+    void HandleConnection(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        bool keepAlive = true;
+
+        while (keepAlive) {
+            string rawData = client.RecvAsync(65536);
+            if (rawData.Length == 0) {
+                break;
+            }
+
+            HttpRequest request = HttpRequest.Parse(rawData);
+            keepAlive = request.keepAlive;
+
+            HttpResponse response = ProcessRequest(request);
+            response.SetKeepAlive(keepAlive);
+
+            string responseData = response.Build();
+            client.SendAsync(responseData);
+
+            if (!keepAlive) {
+                break;
+            }
+        }
+
+        client.Close();
+        this.activeConnections = this.activeConnections - 1;
+    }
+
+    /// <summary>Default request processor. Override this in subclasses
+    /// or use a routing table.</summary>
+    HttpResponse ProcessRequest(HttpRequest request) {
+        return HttpResponse.Ok("<h1>Zan HTTP Server</h1><p>Override ProcessRequest to handle routes.</p>");
+    }
+
+    /// <summary>Stops the server.</summary>
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) {
+            this.listener.Stop();
+        }
+    }
+
+    /// <summary>Returns the number of active connections.</summary>
+    int GetActiveConnections() {
+        return this.activeConnections;
+    }
+
+    /// <summary>Returns whether the server is running.</summary>
+    bool IsRunning() {
+        return this.running;
+    }
+}
+
+/// <summary>
+/// Simple HTTP router for mapping paths to handlers.
+/// </summary>
+class HttpRouter {
+    List<string> paths;
+    List<string> methods;
+    List<string> responses;
+
+    HttpRouter() {
+        this.paths = new List<string>();
+        this.methods = new List<string>();
+        this.responses = new List<string>();
+    }
+
+    /// <summary>Creates a new router.</summary>
+    static HttpRouter Create() {
+        return new HttpRouter();
+    }
+
+    /// <summary>Registers a GET route.</summary>
+    HttpRouter Get(string path, string responseBody) {
+        this.paths.Add(path);
+        this.methods.Add("GET");
+        this.responses.Add(responseBody);
+        return this;
+    }
+
+    /// <summary>Registers a POST route.</summary>
+    HttpRouter Post(string path, string responseBody) {
+        this.paths.Add(path);
+        this.methods.Add("POST");
+        this.responses.Add(responseBody);
+        return this;
+    }
+
+    /// <summary>Registers a route for any method.</summary>
+    HttpRouter Route(string method, string path, string responseBody) {
+        this.paths.Add(path);
+        this.methods.Add(method);
+        this.responses.Add(responseBody);
+        return this;
+    }
+
+    /// <summary>Matches a request to a registered route.</summary>
+    HttpResponse Match(HttpRequest request) {
+        int i = 0;
+        while (i < this.paths.Count) {
+            if (this.paths[i] == request.path) {
+                if (this.methods[i] == request.method || this.methods[i] == "*") {
+                    return HttpResponse.Ok(this.responses[i]);
+                }
+            }
+            i = i + 1;
+        }
+        return HttpResponse.NotFound();
+    }
+}

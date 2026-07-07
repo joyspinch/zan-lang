@@ -1,0 +1,332 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+/// <summary>
+/// Fluent SQL query builder inspired by FreeSQL.
+/// Supports SELECT, INSERT, UPDATE, DELETE with method chaining.
+///
+/// Usage:
+///   QueryBuilder qb = QueryBuilder.From("users");
+///   string sql = qb.Where("age > 18").OrderBy("name").Limit(10).BuildSelect("*");
+///
+///   string insertSql = QueryBuilder.InsertInto("users")
+///       .Set("name", "Alice").Set("age", "30").BuildInsert();
+///
+///   string updateSql = QueryBuilder.Update("users")
+///       .Set("name", "Bob").Where("id = 1").BuildUpdate();
+/// </summary>
+class QueryBuilder {
+    string tableName;
+    string whereClause;
+    string orderByClause;
+    string groupByClause;
+    string havingClause;
+    string joinClause;
+    int limitVal;
+    int offsetVal;
+    List<string> setColumns;
+    List<string> setValues;
+    bool distinct;
+
+    QueryBuilder(string table) {
+        this.tableName = table;
+        this.whereClause = "";
+        this.orderByClause = "";
+        this.groupByClause = "";
+        this.havingClause = "";
+        this.joinClause = "";
+        this.limitVal = -1;
+        this.offsetVal = -1;
+        this.setColumns = new List<string>();
+        this.setValues = new List<string>();
+        this.distinct = false;
+    }
+
+    /// <summary>Creates a query builder for SELECT from a table.</summary>
+    static QueryBuilder From(string table) {
+        return new QueryBuilder(table);
+    }
+
+    /// <summary>Creates a query builder for INSERT INTO a table.</summary>
+    static QueryBuilder InsertInto(string table) {
+        return new QueryBuilder(table);
+    }
+
+    /// <summary>Creates a query builder for UPDATE a table.</summary>
+    static QueryBuilder Update(string table) {
+        return new QueryBuilder(table);
+    }
+
+    /// <summary>Creates a query builder for DELETE from a table.</summary>
+    static QueryBuilder DeleteFrom(string table) {
+        return new QueryBuilder(table);
+    }
+
+    /// <summary>Adds a WHERE clause.</summary>
+    QueryBuilder Where(string condition) {
+        if (this.whereClause.Length == 0) {
+            this.whereClause = condition;
+        } else {
+            this.whereClause = this.whereClause + " AND " + condition;
+        }
+        return this;
+    }
+
+    /// <summary>Adds an OR WHERE clause.</summary>
+    QueryBuilder OrWhere(string condition) {
+        if (this.whereClause.Length == 0) {
+            this.whereClause = condition;
+        } else {
+            this.whereClause = this.whereClause + " OR " + condition;
+        }
+        return this;
+    }
+
+    /// <summary>Adds a WHERE with parameterized value (SQL injection safe).</summary>
+    QueryBuilder WhereEq(string column, string value) {
+        string cond = column + " = '" + EscapeString(value) + "'";
+        return Where(cond);
+    }
+
+    /// <summary>Adds a WHERE column IN list.</summary>
+    QueryBuilder WhereIn(string column, List<string> values) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(column);
+        sb.Append(" IN (");
+        int i = 0;
+        while (i < values.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("'");
+            sb.Append(EscapeString(values[i]));
+            sb.Append("'");
+            i = i + 1;
+        }
+        sb.Append(")");
+        return Where(sb.ToString());
+    }
+
+    /// <summary>Adds a WHERE LIKE clause.</summary>
+    QueryBuilder WhereLike(string column, string pattern) {
+        return Where(column + " LIKE '" + EscapeString(pattern) + "'");
+    }
+
+    /// <summary>Adds a WHERE BETWEEN clause.</summary>
+    QueryBuilder WhereBetween(string column, string low, string high) {
+        return Where(column + " BETWEEN '" + EscapeString(low) + "' AND '" + EscapeString(high) + "'");
+    }
+
+    /// <summary>Adds a WHERE IS NULL clause.</summary>
+    QueryBuilder WhereNull(string column) {
+        return Where(column + " IS NULL");
+    }
+
+    /// <summary>Adds a WHERE IS NOT NULL clause.</summary>
+    QueryBuilder WhereNotNull(string column) {
+        return Where(column + " IS NOT NULL");
+    }
+
+    /// <summary>Sets ORDER BY clause.</summary>
+    QueryBuilder OrderBy(string column) {
+        this.orderByClause = column;
+        return this;
+    }
+
+    /// <summary>Sets ORDER BY DESC clause.</summary>
+    QueryBuilder OrderByDesc(string column) {
+        this.orderByClause = column + " DESC";
+        return this;
+    }
+
+    /// <summary>Sets GROUP BY clause.</summary>
+    QueryBuilder GroupBy(string column) {
+        this.groupByClause = column;
+        return this;
+    }
+
+    /// <summary>Sets HAVING clause.</summary>
+    QueryBuilder Having(string condition) {
+        this.havingClause = condition;
+        return this;
+    }
+
+    /// <summary>Adds a JOIN clause.</summary>
+    QueryBuilder Join(string table, string on) {
+        this.joinClause = this.joinClause + " JOIN " + table + " ON " + on;
+        return this;
+    }
+
+    /// <summary>Adds a LEFT JOIN clause.</summary>
+    QueryBuilder LeftJoin(string table, string on) {
+        this.joinClause = this.joinClause + " LEFT JOIN " + table + " ON " + on;
+        return this;
+    }
+
+    /// <summary>Adds a RIGHT JOIN clause.</summary>
+    QueryBuilder RightJoin(string table, string on) {
+        this.joinClause = this.joinClause + " RIGHT JOIN " + table + " ON " + on;
+        return this;
+    }
+
+    /// <summary>Sets LIMIT.</summary>
+    QueryBuilder Limit(int count) {
+        this.limitVal = count;
+        return this;
+    }
+
+    /// <summary>Sets OFFSET.</summary>
+    QueryBuilder Offset(int count) {
+        this.offsetVal = count;
+        return this;
+    }
+
+    /// <summary>Sets DISTINCT flag.</summary>
+    QueryBuilder Distinct() {
+        this.distinct = true;
+        return this;
+    }
+
+    /// <summary>Sets a column=value pair for INSERT/UPDATE.</summary>
+    QueryBuilder Set(string column, string value) {
+        this.setColumns.Add(column);
+        this.setValues.Add(value);
+        return this;
+    }
+
+    /// <summary>Sets an integer column=value pair.</summary>
+    QueryBuilder SetInt(string column, int value) {
+        this.setColumns.Add(column);
+        this.setValues.Add(Convert.ToString(value));
+        return this;
+    }
+
+    /// <summary>Builds a SELECT query.</summary>
+    string BuildSelect(string columns) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("SELECT ");
+        if (this.distinct) { sb.Append("DISTINCT "); }
+        sb.Append(columns);
+        sb.Append(" FROM ");
+        sb.Append(this.tableName);
+        AppendClauses(sb);
+        return sb.ToString();
+    }
+
+    /// <summary>Builds a SELECT COUNT query.</summary>
+    string BuildCount() {
+        return BuildSelect("COUNT(*)");
+    }
+
+    /// <summary>Builds an INSERT query.</summary>
+    string BuildInsert() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("INSERT INTO ");
+        sb.Append(this.tableName);
+        sb.Append(" (");
+
+        int i = 0;
+        while (i < this.setColumns.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(this.setColumns[i]);
+            i = i + 1;
+        }
+        sb.Append(") VALUES (");
+
+        i = 0;
+        while (i < this.setValues.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("'");
+            sb.Append(EscapeString(this.setValues[i]));
+            sb.Append("'");
+            i = i + 1;
+        }
+        sb.Append(")");
+        return sb.ToString();
+    }
+
+    /// <summary>Builds an UPDATE query.</summary>
+    string BuildUpdate() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("UPDATE ");
+        sb.Append(this.tableName);
+        sb.Append(" SET ");
+
+        int i = 0;
+        while (i < this.setColumns.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(this.setColumns[i]);
+            sb.Append(" = '");
+            sb.Append(EscapeString(this.setValues[i]));
+            sb.Append("'");
+            i = i + 1;
+        }
+
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Builds a DELETE query.</summary>
+    string BuildDelete() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("DELETE FROM ");
+        sb.Append(this.tableName);
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        return sb.ToString();
+    }
+
+    // --- Internal helpers ---
+
+    void AppendClauses(StringBuilder sb) {
+        if (this.joinClause.Length > 0) {
+            sb.Append(this.joinClause);
+        }
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        if (this.groupByClause.Length > 0) {
+            sb.Append(" GROUP BY ");
+            sb.Append(this.groupByClause);
+        }
+        if (this.havingClause.Length > 0) {
+            sb.Append(" HAVING ");
+            sb.Append(this.havingClause);
+        }
+        if (this.orderByClause.Length > 0) {
+            sb.Append(" ORDER BY ");
+            sb.Append(this.orderByClause);
+        }
+        if (this.limitVal >= 0) {
+            sb.Append(" LIMIT ");
+            sb.Append(Convert.ToString(this.limitVal));
+        }
+        if (this.offsetVal >= 0) {
+            sb.Append(" OFFSET ");
+            sb.Append(Convert.ToString(this.offsetVal));
+        }
+    }
+
+    /// <summary>Escapes single quotes in a string for SQL safety.</summary>
+    static string EscapeString(string val) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int len = val.Length;
+        while (i < len) {
+            string ch = val.Substring(i, 1);
+            if (ch == "'") {
+                sb.Append("''");
+            } else {
+                sb.Append(ch);
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}

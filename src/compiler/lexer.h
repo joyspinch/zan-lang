@@ -6,6 +6,15 @@
 #include "zan.h"
 #include "token.h"
 
+/* ---- Preprocessor defines ---- */
+#define ZAN_PP_MAX_DEFINES 128
+#define ZAN_PP_MAX_COND_DEPTH 32
+
+typedef struct {
+    char name[64];
+    char value[256];
+} zan_pp_define_t;
+
 struct zan_token {
     zan_token_kind_t kind;
     zan_loc_t loc;
@@ -27,11 +36,24 @@ struct zan_lexer {
     zan_diag_t *diag;
     int interp_depth;       /* > 0 when inside $"...{expr}..." */
     int interp_brace_depth; /* tracks nested {} inside interpolation expr */
+
+    /* ---- Preprocessor state ---- */
+    zan_pp_define_t defines[ZAN_PP_MAX_DEFINES];
+    int define_count;
+    /* Conditional compilation stack: 1=active, 0=skipping */
+    int cond_stack[ZAN_PP_MAX_COND_DEPTH];
+    int cond_depth;
+    /* Track whether current #if group had a true branch (for #elif) */
+    int cond_seen_true[ZAN_PP_MAX_COND_DEPTH];
+    int at_line_start; /* 1 if next non-ws char is at start of logical line */
 };
 
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
                     uint32_t file_id, zan_arena_t *arena, zan_diag_t *diag);
 zan_token_t zan_lexer_next(zan_lexer_t *lex);
 zan_token_t zan_lexer_peek(zan_lexer_t *lex);
+
+/* Preprocessor API: add a define before lexing begins */
+void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value);
 
 #endif /* ZAN_LEXER_H */
