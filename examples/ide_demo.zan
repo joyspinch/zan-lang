@@ -1,36 +1,49 @@
 using System;
+using System.IO;
+using System.Diagnostics;
 using Gui;
 using Gui.Widget;
 
-/// A miniature aardio/VS-Code-style IDE shell built entirely from the enterprise
-/// GUI components: a Ribbon command band, a resizable file TreeView, a closable
-/// TabView document bar, a line-numbered CodeEditor, and an Output panel — laid
-/// out with Split (no hand-computed pixel coordinates for the panes).
+/// A miniature aardio/VS-Code-style IDE built entirely from the enterprise GUI
+/// components (Ribbon / TreeView / TabView / CodeEditor / Panel / Split) wired
+/// to a REAL project on disk:
 ///
-/// Interactions:
-///   * Ribbon: New / Open / Save / Run / Build / Publish (logs to Output).
-///   * Tree:   click a file to open/activate its tab; click a folder to expand.
-///   * Tabs:   click to switch, X to close, + to add a new document.
-///   * Editor: click to place the caret, then type (arrows/Home/End/Backspace).
+///   * Explorer tree is scanned from the workspace folder (System.IO.Directory)
+///     — click a folder to expand/collapse, click a file to open it in a tab.
+///   * Tabs are backed by files; edits live in the CodeEditor; Save writes to
+///     disk (System.IO.File). New files are created on first save.
+///   * Ribbon actions invoke the real Zan toolchain via System.Diagnostics.Process:
+///       Build   -> zanc --emit-ir <file>            (reports diagnostics)
+///       Run     -> zanc + clang link + execute      (captures program output)
+///       Publish -> link a standalone .exe into publish/
+///     Output is streamed into the bottom Output panel.
 class IdeDemo {
+    static string Root() { return "d:/project/zan-lang/build/ide_workspace"; }
+    static string Zanc() { return "d:/project/zan-lang/build/zanc.exe"; }
+
     static void Main() {
         App app = App.CreateDark("Zan IDE", 1180, 780);
         app.Show();
 
-        List<TreeNode> tree = IdeDemo.BuildTree();
+        string root = IdeDemo.Root();
+        IdeDemo.EnsureWorkspace(root);
+
+        List<TreeNode> tree = IdeDemo.ScanTree(root);
+        bool rescan = false;
 
         List<string> tabNames = new List<string>();
         List<string> tabBodies = new List<string>();
-        tabNames.Add("main.zan");
-        tabBodies.Add("using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello, Zan!\");\n    }\n}");
+        List<string> tabPaths = new List<string>();
 
         SignalInt activeTab = SignalInt.Create(0);
         CodeEditor editor = CodeEditor.Create();
-        editor.LoadText(tabBodies[0]);
-        int lastActive = 0;
+        int lastActive = 0 - 1;
+
+        IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab,
+                         root + "/src/main.zan", "main.zan");
 
         List<string> log = new List<string>();
-        log.Add("> Zan IDE ready.");
+        log.Add("> Zan IDE ready. Workspace: " + root);
 
         List<RibbonCmd> cmds = new List<RibbonCmd>();
         cmds.Add(RibbonCmd.Create("file", "New"));
@@ -40,8 +53,8 @@ class IdeDemo {
         cmds.Add(RibbonCmd.Create("refresh", "Build"));
         cmds.Add(RibbonCmd.Create("upload", "Publish"));
 
-        SignalInt treeW = SignalInt.Create(230);
-        SignalInt editorAreaH = SignalInt.Create(440);
+        SignalInt treeW = SignalInt.Create(240);
+        SignalInt editorAreaH = SignalInt.Create(430);
         SignalInt treeSel = SignalInt.Create(-1);
         int lastTreeSel = -1;
 
@@ -59,33 +72,33 @@ class IdeDemo {
             int ribbonH = Ribbon.Height(app);
             int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
             if (rc == 0) {
-                tabNames.Add("untitled.zan");
-                tabBodies.Add("");
-                activeTab.Set(tabNames.Count - 1);
-                log.Add("> New file created.");
+                IdeDemo.NewFile(tabNames, tabBodies, tabPaths, activeTab);
+                log.Add("> New untitled document.");
                 app.RequestRedraw();
             } else if (rc == 1) {
-                log.Add("> Open: pick a file in the Explorer tree.");
+                log.Add("> Open: click a file in the Explorer to open it.");
+                rescan = true;
                 app.RequestRedraw();
             } else if (rc == 2) {
-                int a = activeTab.Get();
-                tabBodies[a] = editor.GetText();
-                log.Add("> Saved " + tabNames[a] + ".");
+                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                rescan = true;
                 app.RequestRedraw();
             } else if (rc == 3) {
-                log.Add("> Running " + tabNames[activeTab.Get()] + " ...");
-                log.Add("  Hello, Zan!");
+                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                IdeDemo.RunActive(tabPaths, activeTab, root, log);
                 app.RequestRedraw();
             } else if (rc == 4) {
-                log.Add("> Build succeeded. 0 errors, 0 warnings.");
+                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                IdeDemo.BuildActive(tabPaths, activeTab, root, log);
                 app.RequestRedraw();
             } else if (rc == 5) {
-                log.Add("> Published build/app.exe (console + exe targets).");
+                IdeDemo.SaveActive(app, editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                IdeDemo.PublishActive(tabNames, tabPaths, activeTab, root, log);
                 app.RequestRedraw();
             }
 
             Rect area = Rect.Create(0, top + ribbonH, W, H - top - ribbonH);
-            Split cols = Split.Vertical(app, area, treeW, app.Scale(160), app.Scale(420));
+            Split cols = Split.Vertical(app, area, treeW, app.Scale(170), app.Scale(440));
 
             Rect tr = cols.first;
             c.FillRect(tr.x, tr.y, tr.width, tr.height, t.bgTertiary);
@@ -99,8 +112,8 @@ class IdeDemo {
                 if (sel >= 0 && sel < tree.Count) {
                     TreeNode node = tree[sel];
                     if (!node.isDir) {
-                        IdeDemo.OpenTab(tabNames, tabBodies, activeTab, node.label);
-                        log.Add("> Opened " + node.label + ".");
+                        IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
+                        log.Add("> Opened " + node.path + ".");
                         app.RequestRedraw();
                     }
                 }
@@ -112,14 +125,13 @@ class IdeDemo {
             int tabH = TabView.Height(app);
             TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
             if (hit.action == 3) {
-                tabNames.Add("untitled.zan");
-                tabBodies.Add("");
-                activeTab.Set(tabNames.Count - 1);
+                IdeDemo.NewFile(tabNames, tabBodies, tabPaths, activeTab);
                 app.RequestRedraw();
             } else if (hit.action == 2) {
                 if (tabNames.Count > 1) {
                     tabNames.RemoveAt(hit.index);
                     tabBodies.RemoveAt(hit.index);
+                    tabPaths.RemoveAt(hit.index);
                     int a = activeTab.Get();
                     if (a > hit.index) { a = a - 1; }
                     if (a >= tabNames.Count) { a = tabNames.Count - 1; }
@@ -151,34 +163,152 @@ class IdeDemo {
             Rect oi = Panel.Section(app, orr.x, orr.y, orr.width, orr.height, "Output");
             IdeDemo.RenderLog(app, oi, log);
 
-            app.RenderChrome("Zan IDE  —  Ribbon / TreeView / TabView / CodeEditor");
+            app.RenderChrome("Zan IDE  —  " + root);
             app.PresentFrame();
+
+            if (rescan) {
+                rescan = false;
+                tree = IdeDemo.ScanTree(root);
+                treeSel.Set(-1);
+                lastTreeSel = -1;
+            }
         }
     }
 
-    static List<TreeNode> BuildTree() {
-        List<TreeNode> tree = new List<TreeNode>();
-        tree.Add(TreeNode.Dir("MyProject", 0, true));
-        tree.Add(TreeNode.Dir("src", 1, true));
-        tree.Add(TreeNode.File("main.zan", 2));
-        tree.Add(TreeNode.File("utils.zan", 2));
-        tree.Add(TreeNode.Dir("assets", 1, false));
-        tree.Add(TreeNode.FileIcon("icon.ico", 2, "image"));
-        tree.Add(TreeNode.File("logo.png", 2));
-        tree.Add(TreeNode.FileIcon("README.md", 1, "file"));
-        tree.Add(TreeNode.File("build.zan", 1));
-        return tree;
+    /// Creates a starter project on disk the first time the IDE is launched.
+    static void EnsureWorkspace(string root) {
+        if (Directory.Exists(root)) { return; }
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(root + "/src");
+        File.WriteAllText(root + "/src/main.zan",
+            "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello, Zan!\");\n        int sum = Utils.Add(2, 3);\n        Console.WriteLine(\"2 + 3 = \" + sum);\n    }\n}\n");
+        File.WriteAllText(root + "/src/utils.zan",
+            "using System;\n\nclass Utils {\n    static int Add(int a, int b) {\n        return a + b;\n    }\n}\n");
+        File.WriteAllText(root + "/README.md",
+            "# MyProject\n\nA sample Zan project scaffolded by the Zan IDE.\n");
+        File.WriteAllText(root + "/build.zan",
+            "// Build entry point for MyProject.\n");
     }
 
-    static void OpenTab(List<string> names, List<string> bodies, SignalInt active, string name) {
-        int idx = names.IndexOf(name);
+    /// Recursively scans the workspace into a flat, pre-ordered tree model.
+    static List<TreeNode> ScanTree(string root) {
+        List<TreeNode> nodes = new List<TreeNode>();
+        IdeDemo.ScanInto(nodes, root, "MyProject", 0, true);
+        return nodes;
+    }
+
+    static void ScanInto(List<TreeNode> nodes, string dirPath, string dirName, int depth, bool expanded) {
+        TreeNode d = TreeNode.Dir(dirName, depth, expanded);
+        d.path = dirPath;
+        nodes.Add(d);
+        List<string> subs = Directory.GetDirectories(dirPath);
+        int i = 0;
+        while (i < subs.Count) {
+            IdeDemo.ScanInto(nodes, dirPath + "/" + subs[i], subs[i], depth + 1, false);
+            i = i + 1;
+        }
+        List<string> files = Directory.GetFiles(dirPath);
+        int j = 0;
+        while (j < files.Count) {
+            TreeNode f = TreeNode.File(files[j], depth + 1);
+            f.path = dirPath + "/" + files[j];
+            nodes.Add(f);
+            j = j + 1;
+        }
+    }
+
+    /// Opens a file into a tab (or re-activates it if already open).
+    static void OpenPath(List<string> names, List<string> bodies, List<string> paths,
+                         SignalInt active, string path, string name) {
+        int idx = paths.IndexOf(path);
         if (idx >= 0) {
             active.Set(idx);
             return;
         }
+        string content = File.ReadAllText(path);
         names.Add(name);
-        bodies.Add("// " + name + "\n");
+        bodies.Add(content);
+        paths.Add(path);
         active.Set(names.Count - 1);
+    }
+
+    static void NewFile(List<string> names, List<string> bodies, List<string> paths, SignalInt active) {
+        names.Add("untitled.zan");
+        bodies.Add("using System;\n\nclass Program {\n    static void Main() {\n    }\n}\n");
+        paths.Add("");
+        active.Set(names.Count - 1);
+    }
+
+    /// Flushes the editor buffer into the active tab and writes it to disk.
+    static void SaveActive(App app, CodeEditor editor, List<string> names, List<string> bodies,
+                           List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        if (a < 0 || a >= names.Count) { return; }
+        bodies[a] = editor.GetText();
+        string p = paths[a];
+        if (p == "") {
+            p = root + "/" + names[a];
+            paths[a] = p;
+        }
+        File.WriteAllText(p, bodies[a]);
+        log.Add("> Saved " + p + ".");
+    }
+
+    /// Compile-only: runs the Zan compiler and reports diagnostics.
+    static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to build (save the file first)."); return; }
+        string ll = root + "/.zanbuild.ll";
+        string cmd = "\"" + IdeDemo.Zanc() + "\" --emit-ir \"" + p + "\" > \"" + ll + "\"";
+        log.Add("> Building " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        IdeDemo.AppendAll(log, outp);
+        if (outp.Count == 0) {
+            log.Add("> Build succeeded. 0 errors, 0 warnings.");
+        }
+    }
+
+    /// Compile + link + execute; captures the program's own output.
+    static void RunActive(List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to run (save the file first)."); return; }
+        string ll = root + "/.zanrun.ll";
+        string exe = root + "/.zanrun.exe";
+        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string cmd = z + " --emit-ir \"" + p + "\" > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\""
+            + " && \"" + exe + "\"";
+        log.Add("> Running " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        IdeDemo.AppendAll(log, outp);
+        log.Add("> (run finished)");
+    }
+
+    /// Links a standalone console executable into publish/.
+    static void PublishActive(List<string> names, List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
+        Directory.CreateDirectory(root + "/publish");
+        string ll = root + "/.zanpub.ll";
+        string exe = root + "/publish/" + names[a] + ".exe";
+        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string cmd = z + " --emit-ir \"" + p + "\" > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"";
+        log.Add("> Publishing console exe ...");
+        List<string> outp = Process.RunCapture(cmd);
+        IdeDemo.AppendAll(log, outp);
+        log.Add("> Published " + exe);
+    }
+
+    static void AppendAll(List<string> log, List<string> lines) {
+        int i = 0;
+        while (i < lines.Count) {
+            log.Add("  " + lines[i]);
+            i = i + 1;
+        }
     }
 
     static void RenderLog(App app, Rect r, List<string> log) {

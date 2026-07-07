@@ -3,6 +3,9 @@ Set-Location 'd:\project\zan-lang'
 $files = @()
 $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
 $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
+$files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
+$files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
+$files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
 $files += (Join-Path (Get-Location) "examples\ide_demo.zan")
 Push-Location build
 $ir = & .\zanc.exe --emit-ir $files
@@ -11,6 +14,7 @@ if ($code -eq 0) {
     [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "ide_demo.ll"), $ir)
 } else {
     Write-Output "IR_FAILED code=$code"
+    $ir | Select-Object -Last 30
     Pop-Location
     exit 1
 }

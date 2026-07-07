@@ -1,0 +1,75 @@
+using System;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// Minimal process launcher that runs a command line through the C runtime's
+/// pipe API (`_popen`/`_pclose`) and captures its combined stdout+stderr as a
+/// list of text lines. Intended for driving CLI tools (the Zan compiler,
+/// linkers, package managers) from Zan programs such as the IDE.
+/// </summary>
+class Process {
+    [DllImport("msvcrt", EntryPoint = "_popen")]
+    static extern int popen(string cmd, string mode);
+
+    [DllImport("msvcrt", EntryPoint = "_pclose")]
+    static extern int pclose(int fp);
+
+    [DllImport("msvcrt")]
+    static extern int fread(string buf, int size, int count, int fp);
+
+    [DllImport("msvcrt")]
+    static extern string calloc(int count, int size);
+
+    /// <summary>
+    /// Runs `cmd` (redirecting stderr into stdout) and returns everything it
+    /// prints, split into lines. On failure to launch, returns a single
+    /// diagnostic line beginning with "[error]".
+    /// </summary>
+    static List<string> RunCapture(string cmd) {
+        List<string> lines = new List<string>();
+        string full = "(" + cmd + ") 2>&1";
+        int fp = Process.popen(full, "r");
+        if (fp == 0) {
+            lines.Add("[error] failed to launch: " + cmd);
+            return lines;
+        }
+        StringBuilder sb = new StringBuilder();
+        bool reading = true;
+        while (reading) {
+            string buf = Process.calloc(4097, 1);
+            int n = Process.fread(buf, 1, 4096, fp);
+            if (n <= 0) {
+                reading = false;
+            } else {
+                sb.Append(buf);
+            }
+        }
+        Process.pclose(fp);
+        return Process.SplitLines(sb.ToString());
+    }
+
+    /// Splits text on newlines, dropping carriage returns; trailing empty line
+    /// is omitted so callers get clean per-line output.
+    static List<string> SplitLines(string text) {
+        List<string> lines = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int len = text.Length;
+        while (i < len) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\n") {
+                lines.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else if (ch != "\r") {
+                sb.Append(ch);
+            }
+            i = i + 1;
+        }
+        string last = sb.ToString();
+        if (last.Length > 0) {
+            lines.Add(last);
+        }
+        return lines;
+    }
+}
