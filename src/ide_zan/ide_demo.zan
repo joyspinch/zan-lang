@@ -96,6 +96,7 @@ class IdeDemo {
         cmds.Add(RibbonCmd.Group("copy", "Template"));
         cmds.Add(RibbonCmd.Create("layout", "Designer"));
         cmds.Add(RibbonCmd.Create("home", "Start"));
+        cmds.Add(RibbonCmd.Create("refresh", "Hot"));
 
         // ---- New Project categories (built-in + user "Custom") ----
         List<string> catNames = new List<string>();
@@ -215,6 +216,10 @@ class IdeDemo {
         SignalInt editorAreaH = SignalInt.Create(IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "editorAreaH", 430), 120, 3000));
         // Bottom panel active tab: 0 = Output, 1 = Error List.
         SignalInt bottomTab = SignalInt.Create(IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "bottomTab", 0), 0, 1));
+        // Hot reload: when ON, saving rebuilds and restarts the running app.
+        bool autoRun = IdeDemo.CfgInt(cfg, "autoRun", 0) == 1;
+        // Designer live-preview toggle (0 = design view, 1 = clean preview).
+        SignalInt dPreview = SignalInt.Create(0);
         SignalInt treeSel = SignalInt.Create(-1);
         int lastTreeSel = -1;
 
@@ -387,6 +392,15 @@ class IdeDemo {
                     // Ctrl+R = Replace (Ctrl+H is 8 which conflicts with Backspace)
                     findMode = 2;
                     app.RequestRedraw();
+                } else if (cc == 19) {
+                    // Ctrl+S = Save (+ hot reload when enabled)
+                    int aSv = activeTab.Get();
+                    if (!designerMode && aSv >= 0 && aSv < tabPaths.Count && tabPaths[aSv] != "@start") {
+                        IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        if (autoRun) { IdeDemo.HotReloadRun(tabPaths, activeTab, root, log); }
+                        rescan = true;
+                    }
+                    app.RequestRedraw();
                 }
             }
 
@@ -425,6 +439,7 @@ class IdeDemo {
                     rescan = true;
                 } else if (rc == 3) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    if (autoRun) { IdeDemo.HotReloadRun(tabPaths, activeTab, root, log); }
                     rescan = true;
                 } else if (rc == 4) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
@@ -515,6 +530,11 @@ class IdeDemo {
                         activeTab.Set(tabNames.Count - 1);
                     }
                     lastActive = 0 - 1;
+                    app.RequestRedraw();
+                } else if (rc == 11) {
+                    autoRun = !autoRun;
+                    if (autoRun) { log.Add("> Hot reload: ON (save rebuilds & restarts the app)."); }
+                    else { log.Add("> Hot reload: OFF."); }
                     app.RequestRedraw();
                 }
 
@@ -751,7 +771,7 @@ class IdeDemo {
                         formCache = tabBodies[act];
                     }
                     int dact = IdeDemo.RenderDesigner(app, c, t, edRect, dNames, dX, dY, dW, dH, dTypes,
-                        dSel, dDragMode, dDragOffX, dDragOffY, dResizeH);
+                        dSel, dDragMode, dDragOffX, dDragOffY, dResizeH, dPreview);
                     // Persist any layout change back to the tab body and the .zform file.
                     string newser = IdeDemo.SerializeForm(fname, dNames, dTypes, dX, dY, dW, dH);
                     if (newser != formCache) {
@@ -1122,7 +1142,9 @@ class IdeDemo {
             }
         }
         // Persist window + panel sizes so the next launch restores them.
-        IdeDemo.SaveSettings(treeW.Get(), editorAreaH.Get(), savedW, savedH, bottomTab.Get());
+        int arv = 0;
+        if (autoRun) { arv = 1; }
+        IdeDemo.SaveSettings(treeW.Get(), editorAreaH.Get(), savedW, savedH, bottomTab.Get(), arv);
     }
 
     /// Spawns a fresh wizard child window (a real draggable top-level window),
@@ -1550,6 +1572,33 @@ class IdeDemo {
         List<string> outp = Process.RunCapture(cmd);
         IdeDemo.AppendAll(log, outp);
         log.Add("> (run finished)");
+    }
+
+    /// Hot reload: rebuild the active file and (re)launch it detached, killing
+    /// the previous hot instance so the IDE stays responsive across saves.
+    static void HotReloadRun(List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        if (a < 0 || a >= paths.Count) { return; }
+        string p = paths[a];
+        if (p == "" || p == "@start") { log.Add("> [Hot] Nothing to run (save the file first)."); return; }
+        string ll = root + "/.zanhot.ll";
+        string exe = root + "/zanhot_run.exe";
+        // Stop the previous hot instance so the exe can be overwritten.
+        Process.Run("taskkill /F /IM zanhot_run.exe >nul 2>nul");
+        Process.Run("cmd /c del /f /q \"" + exe + "\" >nul 2>nul");
+        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string cmd = z + " --emit-ir \"" + p + "\" > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"";
+        log.Add("> [Hot] Rebuilding ...");
+        List<string> outp = Process.RunCapture(cmd);
+        IdeDemo.AppendAll(log, outp);
+        if (File.Exists(exe)) {
+            // Launch detached so the IDE stays responsive.
+            Process.Run("cmd /c start \"\" \"" + exe + "\"");
+            log.Add("> [Hot] Reloaded -> restarted app.");
+        } else {
+            log.Add("> [Hot] Build failed; app not restarted.");
+        }
     }
 
     static void PublishActive(List<string> names, List<string> paths, SignalInt active, string root, List<string> log) {
@@ -2373,12 +2422,13 @@ class IdeDemo {
         return v;
     }
 
-    static void SaveSettings(int treeW, int edH, int winW, int winH, int botTab) {
+    static void SaveSettings(int treeW, int edH, int winW, int winH, int botTab, int autoRun) {
         string s = "treeW=" + Convert.ToString(treeW)
             + ";editorAreaH=" + Convert.ToString(edH)
             + ";winW=" + Convert.ToString(winW)
             + ";winH=" + Convert.ToString(winH)
-            + ";bottomTab=" + Convert.ToString(botTab) + ";";
+            + ";bottomTab=" + Convert.ToString(botTab)
+            + ";autoRun=" + Convert.ToString(autoRun) + ";";
         File.WriteAllText(IdeDemo.CfgPath(), s);
     }
 
@@ -3150,9 +3200,11 @@ class IdeDemo {
     static int RenderDesigner(App app, Canvas c, Theme t, Rect area,
             List<string> dNames, List<int> dX, List<int> dY,
             List<int> dW, List<int> dH, List<string> dTypes, SignalInt dSel,
-            SignalInt dragMode, SignalInt dragOffX, SignalInt dragOffY, SignalInt resizeH) {
+            SignalInt dragMode, SignalInt dragOffX, SignalInt dragOffY, SignalInt resizeH,
+            SignalInt preview) {
         int dSelV = dSel.Get();
         int result = 0;
+        int previewOn = preview.Get();
         int gridSz = app.Scale(8);
         c.FillRect(area.x, area.y, area.width, area.height, 0xFF2D2D30);
 
@@ -3189,8 +3241,16 @@ class IdeDemo {
         c.FillRoundRect(area.x + app.Scale(8), dbGenY, toolW - app.Scale(16), dbBtnH, app.Scale(3), 0xFF0E639C);
         int dbGenTw = Canvas.MeasureText("View Code (F7)", t.fontSizeSmall);
         c.DrawText(area.x + (toolW - dbGenTw) / 2, dbGenY + app.Scale(7), "View Code (F7)", 0xFFFFFFFF, t.fontSizeSmall);
-        int dbHintY = dbGenY - app.Scale(16);
-        c.DrawText(area.x + app.Scale(8), dbHintY, "Layout auto-saved", 0xFF808080, t.fontSizeSmall);
+        // Live-preview toggle: hides the grid + selection handles for a clean,
+        // runtime-like view that still updates as the layout changes.
+        int pvBtnY = dbGenY - dbBtnH - app.Scale(6);
+        int pvBg = 0xFF3C3C3C;
+        if (previewOn == 1) { pvBg = 0xFF0E7A45; }
+        c.FillRoundRect(area.x + app.Scale(8), pvBtnY, toolW - app.Scale(16), dbBtnH, app.Scale(3), pvBg);
+        string pvLabel = "Preview: Off";
+        if (previewOn == 1) { pvLabel = "Preview: On"; }
+        int pvTw = Canvas.MeasureText(pvLabel, t.fontSizeSmall);
+        c.DrawText(area.x + (toolW - pvTw) / 2, pvBtnY + app.Scale(7), pvLabel, 0xFFFFFFFF, t.fontSizeSmall);
 
         // Properties panel on right
         int propW = app.Scale(180);
@@ -3258,15 +3318,17 @@ class IdeDemo {
         int surfX = area.x + toolW;
         int surfW = area.width - toolW - propW;
 
-        // Draw grid dots
-        int gx = surfX + gridSz;
-        while (gx < surfX + surfW) {
-            int gy2 = area.y + gridSz;
-            while (gy2 < area.y + area.height) {
-                c.FillRect(gx, gy2, 1, 1, 0xFF444444);
-                gy2 = gy2 + gridSz * 2;
+        // Draw grid dots (design view only).
+        if (previewOn == 0) {
+            int gx = surfX + gridSz;
+            while (gx < surfX + surfW) {
+                int gy2 = area.y + gridSz;
+                while (gy2 < area.y + area.height) {
+                    c.FillRect(gx, gy2, 1, 1, 0xFF444444);
+                    gy2 = gy2 + gridSz * 2;
+                }
+                gx = gx + gridSz * 2;
             }
-            gx = gx + gridSz * 2;
         }
 
         // Form outline
@@ -3318,8 +3380,8 @@ class IdeDemo {
                 c.DrawText(cx + app.Scale(4), cy + app.Scale(3), dNames[di], 0xFFCCCCCC, t.fontSizeSmall);
             }
 
-            // Selection handles (8 handles around control)
-            if (di == dSelV) {
+            // Selection handles (8 handles around control) - design view only.
+            if (di == dSelV && previewOn == 0) {
                 c.DrawRect(cx - 1, cy - 1, cw + 2, ch + 2, t.primary, 1);
                 int hs = app.Scale(6);
                 int hh = hs / 2;
@@ -3350,8 +3412,12 @@ class IdeDemo {
             if (mx >= area.x + app.Scale(8) && mx < area.x + toolW - app.Scale(8)
                 && my >= dbGenY && my < dbGenY + dbBtnH) {
                 result = 1;
+            } else if (mx >= area.x + app.Scale(8) && mx < area.x + toolW - app.Scale(8)
+                && my >= pvBtnY && my < pvBtnY + dbBtnH) {
+                if (previewOn == 1) { preview.Set(0); } else { preview.Set(1); }
+                app.RequestRedraw();
             } else if (mx >= area.x && mx < area.x + toolW && my >= area.y + app.Scale(28)
-                && my < dbGenY - app.Scale(16)) {
+                && my < pvBtnY - app.Scale(4)) {
                 int toolIdx = (my - area.y - app.Scale(28)) / app.Scale(24);
                 string newType = IdeDemo.ToolByIndex(toolIdx);
                 if (newType != "") {
