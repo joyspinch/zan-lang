@@ -573,7 +573,7 @@ int main(int argc, char **argv) {
             {"System.Text",      "System/Text",      {"Encoding.zan", NULL}},
             {"System.Json",      "System/Json",      {"Json.zan", NULL}},
             {"System.Threading", "System/Threading",  {"Threading.zan", NULL}},
-            {"System.Net.Sockets", "System/Net/Sockets", {"Socket.zan", "TcpListener.zan", "TcpClient.zan", "UdpClient.zan", NULL}},
+            {"System.Net.Sockets", "System/Net/Sockets", {"Socket.zan", "AsyncSocket.zan", "TcpListener.zan", "TcpClient.zan", "UdpClient.zan", NULL}},
             {"System.Net.Http",  "System/Net/Http",  {"HttpRequest.zan", "HttpResponse.zan", "HttpServer.zan", "HttpClient.zan", NULL}},
             {"System.Net.WebSocket", "System/Net/WebSocket", {"WebSocket.zan", NULL}},
             {"System.Net.Mqtt",  "System/Net/Mqtt",  {"MqttClient.zan", NULL}},
