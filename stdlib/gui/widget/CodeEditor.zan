@@ -94,6 +94,18 @@ class CodeEditor {
     List<string> errorMsgs;
     int lastDiagLine;       // caret line at last CheckErrors run (-1 = never)
 
+    // ---- symbol index (accurate, using-aware completion) ----
+    // Types (class/struct/enum) declared across the project's other files, and
+    // for each, a space-separated list of its declared member names. Fed by the
+    // host IDE via SetProjectFiles() so `Utils.` completes with Utils's real
+    // members instead of guesswork. The current buffer is scanned on demand.
+    List<string> projTypeNames;
+    List<string> projTypeMembers;
+    // Missing-`using` quick-fix map: fixLines[i] is a line whose error can be
+    // resolved by inserting `using fixNs[i];`.
+    List<int> fixLines;
+    List<string> fixNs;
+
     // ---- debugging ----
     List<int> bps;
     int execLine;
@@ -155,6 +167,10 @@ class CodeEditor {
         e.errorLines = new List<int>();
         e.errorMsgs = new List<string>();
         e.lastDiagLine = -1;
+        e.projTypeNames = new List<string>();
+        e.projTypeMembers = new List<string>();
+        e.fixLines = new List<int>();
+        e.fixNs = new List<string>();
         e.bps = new List<int>();
         e.execLine = -1;
         e.dbgVars = new List<string>();
@@ -724,6 +740,7 @@ class CodeEditor {
         else if (act == 12) { ctxCmd = "findrefs"; }
         else if (act == 13) { AddCaretAbove(); }
         else if (act == 14) { AddCaretBelow(); }
+        else if (act == 20) { ApplyQuickFix(); }
         ctxOpen = false;
         app.RequestRedraw();
     }
@@ -745,6 +762,13 @@ class CodeEditor {
         List<string> mKeys = new List<string>();
         List<int> mActs = new List<int>();
         CodeEditor.BuildCtxMenu(mLabels, mKeys, mActs);
+        // Quick-fix: offer to insert a missing `using` when the caret line uses
+        // a stdlib type whose namespace has not been imported.
+        string qfNs = QuickFixNs();
+        if (qfNs.Length > 0) {
+            mLabels.Insert(0, ""); mKeys.Insert(0, ""); mActs.Insert(0, 0);
+            mLabels.Insert(0, "Add using " + qfNs + ";"); mKeys.Insert(0, "Ctrl+."); mActs.Insert(0, 20);
+        }
         int itemH = lineH;
         int sepH = app.Scale(7);
         int mW = app.Scale(150);
@@ -935,6 +959,8 @@ class CodeEditor {
             errorLines.Add(lines.Count - 1);
             errorMsgs.Add("Missing closing ')'");
         }
+        // Flag stdlib types used without the required `using` import.
+        AnalyzeMissingUsings();
     }
 
     // ---- autocomplete ----
@@ -957,7 +983,7 @@ class CodeEditor {
 
     /// Appends the language keywords to `outk`.
     static void KeywordList(List<string> outk) {
-        string kws = "using namespace class struct enum interface static void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
+        string kws = "using namespace class struct enum interface static extern void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
         string cur = "";
         int i = 0;
         int n = kws.Length;
@@ -1098,10 +1124,17 @@ class CodeEditor {
 
         List<string> cand = new List<string>();
         List<string> candKinds = new List<string>();
-        CodeEditor.SnippetListK(cand, candKinds);
-        CodeEditor.KeywordListK(cand, candKinds);
-        CodeEditor.StdlibListK(cand, candKinds);
-        CodeEditor.CollectWordsK(lines, cand, candKinds);
+        if (InAttributeContext()) {
+            // Inside `[ ... ]`: only real attributes exist here. The compiler
+            // recognizes exactly DllImport and StructLayout (see parser.c).
+            CodeEditor.AddKindWords(cand, candKinds, "DllImport StructLayout", "M");
+        } else {
+            CodeEditor.SnippetListK(cand, candKinds);
+            CodeEditor.KeywordListK(cand, candKinds);
+            AddStdlibCandidates(cand, candKinds);
+            AddProjectCandidates(cand, candKinds);
+            CodeEditor.CollectWordsK(lines, cand, candKinds);
+        }
         acAllItems = new List<string>();
         acAllKinds = new List<string>();
         int i = 0;
@@ -1474,46 +1507,50 @@ class CodeEditor {
         acFull = new List<string>();
         acDot = true;
 
-        // Known static types
-        if (owner == "Console" || lastWord == "Console") {
-            CodeEditor.AddMembers(acFull, "Console");
-        } else if (owner == "Math" || lastWord == "Math") {
-            CodeEditor.AddMembers(acFull, "Math");
-        } else if (owner == "File" || lastWord == "File") {
-            CodeEditor.AddMembers(acFull, "File");
-        } else if (owner == "Directory" || lastWord == "Directory") {
-            CodeEditor.AddMembers(acFull, "Directory");
-        } else if (owner == "Path" || lastWord == "Path") {
-            CodeEditor.AddMembers(acFull, "Path");
-        } else if (owner == "Convert" || lastWord == "Convert") {
-            CodeEditor.AddMembers(acFull, "Convert");
-        } else if (owner == "Environment" || lastWord == "Environment") {
-            CodeEditor.AddMembers(acFull, "Environment");
-        } else if (owner == "string" || lastWord == "string" || owner == "String" || lastWord == "String") {
-            CodeEditor.AddMembers(acFull, "string");
-        } else if (owner == "List" || lastWord == "List") {
-            CodeEditor.AddMembers(acFull, "List");
-        } else if (owner == "Dictionary" || lastWord == "Dictionary") {
-            CodeEditor.AddMembers(acFull, "Dictionary");
-        } else if (owner == "StringBuilder" || lastWord == "StringBuilder") {
-            CodeEditor.AddMembers(acFull, "StringBuilder");
-        } else if (owner == "DateTime" || lastWord == "DateTime") {
-            CodeEditor.AddMembers(acFull, "DateTime");
-        } else if (owner == "Array" || lastWord == "Array") {
-            CodeEditor.AddMembers(acFull, "Array");
-        } else if (owner == "Process" || lastWord == "Process") {
-            CodeEditor.AddMembers(acFull, "Process");
-        } else if (owner == "App" || lastWord == "App") {
-            CodeEditor.AddMembers(acFull, "App");
-        } else if (owner == "Canvas" || lastWord == "Canvas") {
-            CodeEditor.AddMembers(acFull, "Canvas");
-        } else if (owner == "Theme" || lastWord == "Theme") {
-            CodeEditor.AddMembers(acFull, "Theme");
-        } else if (owner == "Window" || lastWord == "Window") {
-            CodeEditor.AddMembers(acFull, "Window");
+        // Resolve the receiver's type, then list ONLY that type's real members.
+        // Priority: hardcoded stdlib static types -> user/project type -> the
+        // declared type of a local variable -> universal object members. We
+        // never dump speculative string/collection/LINQ helpers for a receiver
+        // we cannot resolve (that produced bogus `Utils.OrderByDescending`).
+        string recv = lastWord;
+        if (recv.Length == 0) { recv = owner; }
+        string norm = CodeEditor.NormalizeStdlibType(recv);
+        if (CodeEditor.IsKnownStdlibType(norm)) {
+            CodeEditor.AddMembers(acFull, norm);
+            if (CodeEditor.IsCollectionType(norm) && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
         } else {
-            // Unknown type - show all common instance members + LINQ chain methods
-            CodeEditor.AddMembers(acFull, "_instance");
+            List<string> mem = new List<string>();
+            bool found = FindTypeMembers(recv, mem);
+            bool coll = false;
+            if (!found) {
+                string vt = ResolveVarType(recv);
+                if (vt.Length > 0) {
+                    string nvt = CodeEditor.NormalizeStdlibType(vt);
+                    if (CodeEditor.IsKnownStdlibType(nvt)) {
+                        CodeEditor.AddMembers(acFull, nvt);
+                        found = true;
+                        if (CodeEditor.IsCollectionType(nvt)) { coll = true; }
+                    } else if (FindTypeMembers(vt, mem)) {
+                        found = true;
+                    }
+                }
+            }
+            if (found) {
+                int mi = 0;
+                while (mi < mem.Count) {
+                    if (!CodeEditor.Has(acFull, mem[mi])) { acFull.Add(mem[mi]); }
+                    mi = mi + 1;
+                }
+                if (coll && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
+                // Universal members every object inherits.
+                if (!CodeEditor.Has(acFull, "ToString")) { acFull.Add("ToString"); }
+                if (!CodeEditor.Has(acFull, "Equals")) { acFull.Add("Equals"); }
+                if (!CodeEditor.Has(acFull, "GetHashCode")) { acFull.Add("GetHashCode"); }
+                if (!CodeEditor.Has(acFull, "GetType")) { acFull.Add("GetType"); }
+            } else {
+                acFull.Add("ToString"); acFull.Add("Equals");
+                acFull.Add("GetHashCode"); acFull.Add("GetType");
+            }
         }
 
         acFilter = "";
@@ -1598,16 +1635,11 @@ class CodeEditor {
             out2.Add("Find"); out2.Add("FindAll"); out2.Add("FindIndex");
             out2.Add("Exists"); out2.Add("ForEach"); out2.Add("AddRange");
             out2.Add("GetRange"); out2.Add("CopyTo"); out2.Add("BinarySearch");
-            // LINQ chain methods
-            out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
-            out2.Add("OrderBy"); out2.Add("OrderByDescending"); out2.Add("ThenBy");
-            out2.Add("GroupBy"); out2.Add("First"); out2.Add("FirstOrDefault");
-            out2.Add("Last"); out2.Add("LastOrDefault"); out2.Add("Single");
-            out2.Add("Any"); out2.Add("All"); out2.Add("Sum"); out2.Add("Average");
-            out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
-            out2.Add("Distinct"); out2.Add("Concat"); out2.Add("ToList");
-            out2.Add("Aggregate"); out2.Add("Zip"); out2.Add("Append");
-            out2.Add("OfType"); out2.Add("Cast"); out2.Add("ToDictionary");
+            out2.Add("ToArray");
+            // NOTE: LINQ chain methods (Where/Select/OrderBy…) are intentionally
+            // NOT added here. They only exist under `using System.Linq;` and are
+            // appended by DotCompletion via AddLinqMembers() when that using is
+            // present, so custom types never see them by accident.
         } else if (typeName == "Dictionary") {
             out2.Add("Add"); out2.Add("Remove"); out2.Add("Clear"); out2.Add("Count");
             out2.Add("ContainsKey"); out2.Add("ContainsValue"); out2.Add("TryGetValue");
@@ -1667,25 +1699,625 @@ class CodeEditor {
             out2.Add("EventY"); out2.Add("PollEvent"); out2.Add("WaitEvent");
             out2.Add("GetWidth"); out2.Add("GetHeight"); out2.Add("Close");
             out2.Add("SetCursor"); out2.Add("GetTickMs"); out2.Add("SleepMs");
+        } else if (typeName == "LayoutKind") {
+            // [StructLayout(LayoutKind.Sequential)] — the only real member used
+            // by the FFI/marshalling attribute.
+            out2.Add("Sequential"); out2.Add("Explicit"); out2.Add("Auto");
         } else {
-            // Unknown type: common instance members + LINQ
-            out2.Add("ToString"); out2.Add("Equals"); out2.Add("GetHashCode");
-            out2.Add("GetType"); out2.Add("Count"); out2.Add("Length");
-            out2.Add("Add"); out2.Add("Remove"); out2.Add("RemoveAt");
-            out2.Add("Insert"); out2.Add("IndexOf"); out2.Add("Contains");
-            out2.Add("Clear"); out2.Add("Sort"); out2.Add("Reverse");
-            out2.Add("Substring"); out2.Add("Replace"); out2.Add("Trim");
-            out2.Add("StartsWith"); out2.Add("EndsWith"); out2.Add("Split");
-            out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
-            out2.Add("OrderBy"); out2.Add("OrderByDescending");
-            out2.Add("GroupBy"); out2.Add("First"); out2.Add("FirstOrDefault");
-            out2.Add("Last"); out2.Add("LastOrDefault"); out2.Add("Single");
-            out2.Add("Any"); out2.Add("All"); out2.Add("Sum"); out2.Add("Average");
-            out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
-            out2.Add("Distinct"); out2.Add("Concat"); out2.Add("ToList"); out2.Add("ToArray");
-            out2.Add("Aggregate"); out2.Add("Zip"); out2.Add("Append");
-            out2.Add("OfType"); out2.Add("Cast"); out2.Add("ToDictionary");
+            // Unknown / unresolved receiver: only the universally-available
+            // object members. We deliberately do NOT guess string / collection /
+            // LINQ helpers, because doing so shows methods the type may not have
+            // (e.g. `Utils.OrderByDescending`). DotCompletion resolves user and
+            // stdlib types by name/using and only falls back here when nothing is
+            // known about the receiver.
+            out2.Add("ToString"); out2.Add("Equals");
+            out2.Add("GetHashCode"); out2.Add("GetType");
         }
+    }
+
+    /// Appends the LINQ query-operator methods. Only called for collection
+    /// receivers when the file imports `using System.Linq;`.
+    static void AddLinqMembers(List<string> out2) {
+        out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
+        out2.Add("OrderBy"); out2.Add("OrderByDescending"); out2.Add("ThenBy");
+        out2.Add("ThenByDescending"); out2.Add("GroupBy"); out2.Add("First");
+        out2.Add("FirstOrDefault"); out2.Add("Last"); out2.Add("LastOrDefault");
+        out2.Add("Single"); out2.Add("SingleOrDefault"); out2.Add("Any");
+        out2.Add("All"); out2.Add("Count"); out2.Add("Sum"); out2.Add("Average");
+        out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
+        out2.Add("TakeWhile"); out2.Add("SkipWhile"); out2.Add("Distinct");
+        out2.Add("Concat"); out2.Add("Union"); out2.Add("Intersect"); out2.Add("Except");
+        out2.Add("Reverse"); out2.Add("ToList"); out2.Add("ToArray");
+        out2.Add("ToDictionary"); out2.Add("Aggregate"); out2.Add("Zip");
+        out2.Add("Append"); out2.Add("Prepend"); out2.Add("OfType"); out2.Add("Cast");
+    }
+
+    // ============================================================
+    //  Symbol index & using-aware, accurate completion
+    // ============================================================
+
+    /// Splits a space-separated string into tokens appended to `out2`.
+    static void AddWords(List<string> out2, string s) {
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " ") { if (cur.Length > 0) { out2.Add(cur); cur = ""; } }
+            else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { out2.Add(cur); }
+    }
+
+    /// Appends each space-separated token of `s` to `cand` (kind `kind`),
+    /// skipping duplicates already present.
+    static void AddKindWords(List<string> cand, List<string> kinds, string s, string kind) {
+        List<string> tmp = new List<string>();
+        CodeEditor.AddWords(tmp, s);
+        int i = 0;
+        while (i < tmp.Count) {
+            if (!CodeEditor.Has(cand, tmp[i])) { cand.Add(tmp[i]); kinds.Add(kind); }
+            i = i + 1;
+        }
+    }
+
+    /// Strips leading declaration modifiers (public/static/…) from a trimmed
+    /// line, returning what remains (e.g. "class Foo {" from "public class Foo {").
+    static string StripModifiers(string trimmed) {
+        string mods = " public private protected internal static abstract sealed partial file virtual override readonly const async unsafe extern new ";
+        string s = trimmed;
+        while (true) {
+            int sp = CodeEditor.Find(s, " ");
+            if (sp <= 0) { break; }
+            string first = s.Substring(0, sp);
+            if (CodeEditor.Find(mods, " " + first + " ") >= 0) {
+                s = CodeEditor.LTrim(s.Substring(sp, s.Length - sp));
+            } else { break; }
+        }
+        return s;
+    }
+
+    /// If `trimmed` declares a class/struct/enum/interface, returns its name;
+    /// otherwise "".
+    static string TypeDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        string kw = "";
+        if (CodeEditor.StartsWithP(s, "class ")) { kw = "class "; }
+        else if (CodeEditor.StartsWithP(s, "struct ")) { kw = "struct "; }
+        else if (CodeEditor.StartsWithP(s, "enum ")) { kw = "enum "; }
+        else if (CodeEditor.StartsWithP(s, "interface ")) { kw = "interface "; }
+        else { return ""; }
+        string rest = CodeEditor.LTrim(s.Substring(kw.Length, s.Length - kw.Length));
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string name = "";
+        int i = 0;
+        while (i < rest.Length) {
+            string ch = rest.Substring(i, 1);
+            if (CodeEditor.InSet(idset, ch)) { name = name + ch; i = i + 1; }
+            else { break; }
+        }
+        return name;
+    }
+
+    /// If `trimmed` is a direct member declaration (method / field / property)
+    /// returns the member name; otherwise "".
+    static string MemberDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        if (s.Length == 0) { return ""; }
+        string f = s.Substring(0, 1);
+        if (f == "/" || f == "*" || f == "#" || f == "@" || f == "[" || f == "}" || f == "{") { return ""; }
+        if (CodeEditor.TypeDeclName(trimmed).Length > 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        // Method: an identifier immediately followed by '('.
+        int paren = CodeEditor.Find(s, "(");
+        if (paren > 0) {
+            int e = paren;
+            while (e > 0 && CodeEditor.InSet(idset, s.Substring(e - 1, 1))) { e = e - 1; }
+            string mname = s.Substring(e, paren - e);
+            if (mname.Length == 0) { return ""; }
+            if (e == 0) { return ""; }
+            if (CodeEditor.IsControlWord(mname)) { return ""; }
+            return mname;
+        }
+        // Field / property: "Type name;" or "Type name =" or "Type name {".
+        int term = -1;
+        int ti = 0;
+        while (ti < s.Length) {
+            string ch = s.Substring(ti, 1);
+            if (ch == ";" || ch == "=" || ch == "{") { term = ti; break; }
+            ti = ti + 1;
+        }
+        if (term < 0) { return ""; }
+        string head = CodeEditor.TrimStr(s.Substring(0, term));
+        int b = head.Length;
+        while (b > 0 && !CodeEditor.InSet(idset, head.Substring(b - 1, 1))) { b = b - 1; }
+        int a = b;
+        while (a > 0 && CodeEditor.InSet(idset, head.Substring(a - 1, 1))) { a = a - 1; }
+        if (b <= a) { return ""; }
+        string name = head.Substring(a, b - a);
+        string before = CodeEditor.TrimStr(head.Substring(0, a));
+        if (before.Length == 0) { return ""; }        // needs a type token before it
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        string digits = "0123456789";
+        if (CodeEditor.InSet(digits, name.Substring(0, 1))) { return ""; }
+        return name;
+    }
+
+    /// Scans `src` for every class/struct/enum declaration, appending each type
+    /// name to `names` and its space-separated direct member names to `membersJoined`.
+    static void ScanTypesInto(string src, List<string> names, List<string> membersJoined) {
+        List<string> ls = CodeEditor.SplitLines(src);
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.TrimStr(ls[i]);
+            string tname = CodeEditor.TypeDeclName(tr);
+            if (tname.Length > 0) {
+                string members = " ";
+                int depth = 0;
+                bool started = false;
+                int j = i;
+                while (j < ls.Count) {
+                    string lj = ls[j];
+                    if (started && depth == 1 && j != i) {
+                        string mn = CodeEditor.MemberDeclName(CodeEditor.TrimStr(lj));
+                        if (mn.Length > 0 && CodeEditor.Find(members, " " + mn + " ") < 0) {
+                            members = members + mn + " ";
+                        }
+                    }
+                    int k = 0;
+                    while (k < lj.Length) {
+                        string ch = lj.Substring(k, 1);
+                        if (ch == "{") { depth = depth + 1; started = true; }
+                        else if (ch == "}") { depth = depth - 1; }
+                        k = k + 1;
+                    }
+                    j = j + 1;
+                    if (started && depth <= 0) { break; }
+                }
+                names.Add(tname);
+                membersJoined.Add(CodeEditor.TrimStr(members));
+                i = j;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /// Host IDE hook: supply the source text of every other project file so the
+    /// editor can resolve cross-file types (e.g. a `Utils` class in utils.zan).
+    void SetProjectFiles(List<string> contents) {
+        projTypeNames = new List<string>();
+        projTypeMembers = new List<string>();
+        int i = 0;
+        while (i < contents.Count) {
+            CodeEditor.ScanTypesInto(contents[i], projTypeNames, projTypeMembers);
+            i = i + 1;
+        }
+    }
+
+    /// Collects the namespaces imported by the current buffer's `using` lines.
+    void ParseUsingsInto(List<string> outNs) {
+        int i = 0;
+        while (i < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "using ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(6, tr.Length - 6));
+                if (CodeEditor.StartsWithP(rest, "static ")) {
+                    rest = CodeEditor.LTrim(rest.Substring(7, rest.Length - 7));
+                }
+                string ns = "";
+                int j = 0;
+                while (j < rest.Length) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == "=" || ch == " ") { break; }
+                    ns = ns + ch;
+                    j = j + 1;
+                }
+                if (ns.Length > 0 && !CodeEditor.Has(outNs, ns)) { outNs.Add(ns); }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The namespace the current buffer declares (`namespace X;`), or "".
+    string FileNamespace() {
+        int i = 0;
+        while (i < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "namespace ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(10, tr.Length - 10));
+                string ns = "";
+                int j = 0;
+                while (j < rest.Length) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == " " || ch == "{") { break; }
+                    ns = ns + ch;
+                    j = j + 1;
+                }
+                return ns;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// True when namespace `ns` is visible in the current buffer: imported via
+    /// `using`, or it is (an ancestor of) the file's own namespace.
+    bool NsVisible(string ns) {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        if (CodeEditor.Has(u, ns)) { return true; }
+        string fn = FileNamespace();
+        if (fn.Length > 0) {
+            if (fn == ns) { return true; }
+            if (fn.Length > ns.Length && CodeEditor.StartsWithP(fn, ns + ".")) { return true; }
+        }
+        return false;
+    }
+
+    /// True when the file imports System.Linq (gates LINQ query operators).
+    bool UsesLinq() {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        return CodeEditor.Has(u, "System.Linq");
+    }
+
+    /// The stdlib types the editor has hardcoded member data for.
+    static bool IsKnownStdlibType(string name) {
+        string known = " Console Math File Directory Path Convert Environment string List Dictionary StringBuilder DateTime Array Process App Canvas Theme Window LayoutKind ";
+        return CodeEditor.Find(known, " " + name + " ") >= 0;
+    }
+
+    /// Canonicalizes a type name for member lookup (String -> string).
+    static string NormalizeStdlibType(string name) {
+        if (name == "String") { return "string"; }
+        return name;
+    }
+
+    /// True for the built-in collection types that expose LINQ under System.Linq.
+    static bool IsCollectionType(string name) {
+        return name == "List" || name == "Array" || name == "Dictionary";
+    }
+
+    /// The full namespace -> types catalog used to add in-scope stdlib types to
+    /// completion. One entry per line: "Namespace=Type Type Type".
+    static string StdlibNsData() {
+        return "System.IO=File Directory Path;"
+            + "System.Text=Encoding;"
+            + "System.Json=JsonBuilder JsonParser;"
+            + "System.Threading=Thread Mutex Semaphore Stopwatch Channel;"
+            + "System.Net.Sockets=Socket AsyncSocket TcpListener TcpClient UdpClient;"
+            + "System.Net.Http=HttpClient HttpRequest HttpResponse HttpServer HttpRouter;"
+            + "System.Net.WebSocket=WebSocketClient WebSocketServer WsFrame WsOpcode;"
+            + "System.Net.Mqtt=MqttClient MqttPacketType MqttQos;"
+            + "System.Net=Dns IPAddress SocketHttpClient TcpSocket Worker Connection;"
+            + "System.Data.Orm=Model ModelQuery ModelRow ModelUpdate ModelDelete Migration QueryBuilder;"
+            + "System.Data=DbConnection DbProvider DbResult;"
+            + "System.Diagnostics=Process;"
+            + "System.Drawing=Graphics Bitmap Font Rectangle;"
+            + "Platform=Posix Runtime Win32;"
+            + "Gui=App Canvas Theme Window Icon Text Stack Ui SignalInt SignalBool SignalString FocusManager HitRegion HitTester Clipboard Keys Modifiers Cursor Insets FlexNode FlexStyle;"
+            + "Gui.Widget=Alert Avatar Badge Breadcrumb Button Card Carousel Chart Checkbox CodeEditor Collapse DataTable Dialog Divider Drawer Dropdown Empty FloatButton Input Label ListView Loading Menu Message Modal Notification Pagination Panel PivotTable Popover Progress Radio Rate Result Ribbon RibbonCmd Scrollbar Select Skeleton Slider Spin Split Statistic Steps Switch Table Tabs TabView Tag Timeline Tooltip TreeNode TreeView Typography Wizard;"
+            + "System.Windows.Forms=MessageBox TextBox;";
+    }
+
+    /// Appends to `out2` the type names declared in namespace `ns`.
+    static void StdlibTypesForNs(string ns, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        int i = 0;
+        string cur = "";
+        while (i <= data.Length) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) {
+                    string key = cur.Substring(0, eq);
+                    if (key == ns) {
+                        CodeEditor.AddWords(out2, cur.Substring(eq + 1, cur.Length - eq - 1));
+                    }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The namespace that must be imported to use stdlib type `name`, or "" when
+    /// `name` is a built-in / ambiguous / non-stdlib type. Deliberately limited
+    /// to distinctive, unambiguous names so a missing-using diagnostic never
+    /// fires on a user's own identifiers.
+    static string NsForStdlibType(string name) {
+        string io = " File Directory Path ";
+        string diag = " Process ";
+        string text = " Encoding ";
+        string json = " JsonBuilder JsonParser ";
+        string thread = " Thread Mutex Semaphore Stopwatch ";
+        string sock = " Socket TcpListener TcpClient UdpClient AsyncSocket ";
+        string http = " HttpClient HttpRequest HttpResponse HttpServer HttpRouter ";
+        string ws = " WebSocketClient WebSocketServer ";
+        string data = " DbConnection DbResult ";
+        string orm = " QueryBuilder ";
+        string gui = " App Canvas Theme ";
+        string widget = " CodeEditor TreeView TabView Ribbon Modal DataTable Dropdown Carousel Pagination ";
+        string key = " " + name + " ";
+        if (CodeEditor.Find(io, key) >= 0) { return "System.IO"; }
+        if (CodeEditor.Find(diag, key) >= 0) { return "System.Diagnostics"; }
+        if (CodeEditor.Find(text, key) >= 0) { return "System.Text"; }
+        if (CodeEditor.Find(json, key) >= 0) { return "System.Json"; }
+        if (CodeEditor.Find(thread, key) >= 0) { return "System.Threading"; }
+        if (CodeEditor.Find(sock, key) >= 0) { return "System.Net.Sockets"; }
+        if (CodeEditor.Find(http, key) >= 0) { return "System.Net.Http"; }
+        if (CodeEditor.Find(ws, key) >= 0) { return "System.Net.WebSocket"; }
+        if (CodeEditor.Find(data, key) >= 0) { return "System.Data"; }
+        if (CodeEditor.Find(orm, key) >= 0) { return "System.Data.Orm"; }
+        if (CodeEditor.Find(gui, key) >= 0) { return "Gui"; }
+        if (CodeEditor.Find(widget, key) >= 0) { return "Gui.Widget"; }
+        return "";
+    }
+
+    /// True when `name` is a type declared in the project (other files) or the
+    /// current buffer.
+    bool IsProjectType(string name) {
+        if (CodeEditor.Has(projTypeNames, name)) { return true; }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        return CodeEditor.Has(tn, name);
+    }
+
+    /// Looks up the declared members of user type `typeName` (project files, then
+    /// current buffer). Returns true and fills `outMem` when found.
+    bool FindTypeMembers(string typeName, List<string> outMem) {
+        int i = 0;
+        while (i < projTypeNames.Count) {
+            if (projTypeNames[i] == typeName) {
+                CodeEditor.AddWords(outMem, projTypeMembers[i]);
+                return true;
+            }
+            i = i + 1;
+        }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        int j = 0;
+        while (j < tn.Count) {
+            if (tn[j] == typeName) {
+                CodeEditor.AddWords(outMem, tm[j]);
+                return true;
+            }
+            j = j + 1;
+        }
+        return false;
+    }
+
+    /// Best-effort resolution of a local variable's declared type by scanning the
+    /// buffer for a `Type name` declaration. Returns the base type (generics
+    /// stripped), or "".
+    string ResolveVarType(string name) {
+        if (name.Length == 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < lines.Count) {
+            string s = CodeEditor.TrimStr(lines[li]);
+            int from = 0;
+            while (true) {
+                int p = CodeEditor.FindFrom(s, name, from);
+                if (p < 0) { break; }
+                bool lok = (p > 0 && s.Substring(p - 1, 1) == " ");
+                int rp = p + name.Length;
+                bool rok = false;
+                if (rp < s.Length) {
+                    string rc = s.Substring(rp, 1);
+                    if (rc == " " || rc == "=" || rc == ";") { rok = true; }
+                }
+                if (lok && rok) {
+                    // token immediately before `name` must be a type reference
+                    int te = p - 1;
+                    while (te > 0 && s.Substring(te - 1, 1) == " ") { te = te - 1; }
+                    int ts = te;
+                    while (ts > 0 && CodeEditor.InSet(idset, s.Substring(ts - 1, 1))) { ts = ts - 1; }
+                    // allow a trailing generic argument list on the type: List<int>
+                    int gts = ts;
+                    if (te > ts) {
+                        string tok = s.Substring(ts, te - ts);
+                        // strip a generic close if the char right before name-token is '>'
+                        string typeTok = tok;
+                        int lt = CodeEditor.Find(typeTok, "<");
+                        if (lt > 0) { typeTok = typeTok.Substring(0, lt); }
+                        if (typeTok.Length > 0 && !CodeEditor.IsControlWord(typeTok)
+                            && !CodeEditor.StartsWithP(typeTok, "return")) {
+                            string firstc = typeTok.Substring(0, 1);
+                            string digits = "0123456789";
+                            if (!CodeEditor.InSet(digits, firstc)) { return typeTok; }
+                        }
+                    }
+                }
+                from = p + name.Length;
+            }
+            li = li + 1;
+        }
+        return "";
+    }
+
+    /// Adds the in-scope stdlib type names to completion: always the built-ins,
+    /// plus the types of every imported (or own) namespace, plus LINQ operators
+    /// only when System.Linq is imported.
+    void AddStdlibCandidates(List<string> cand, List<string> kinds) {
+        CodeEditor.AddKindWords(cand, kinds,
+            "Console Math Convert Environment String Array List Dictionary StringBuilder DateTime TimeSpan Task Object Exception Tuple Random", "T");
+        List<string> ns = new List<string>();
+        ParseUsingsInto(ns);
+        string fn = FileNamespace();
+        if (fn.Length > 0 && !CodeEditor.Has(ns, fn)) { ns.Add(fn); }
+        int i = 0;
+        while (i < ns.Count) {
+            List<string> types = new List<string>();
+            CodeEditor.StdlibTypesForNs(ns[i], types);
+            int j = 0;
+            while (j < types.Count) {
+                if (!CodeEditor.Has(cand, types[j])) { cand.Add(types[j]); kinds.Add("T"); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        if (UsesLinq()) {
+            List<string> linq = new List<string>();
+            CodeEditor.AddLinqMembers(linq);
+            int k = 0;
+            while (k < linq.Count) {
+                if (!CodeEditor.Has(cand, linq[k])) { cand.Add(linq[k]); kinds.Add("M"); }
+                k = k + 1;
+            }
+        }
+    }
+
+    /// Adds project-declared types (and their members) to completion.
+    void AddProjectCandidates(List<string> cand, List<string> kinds) {
+        int i = 0;
+        while (i < projTypeNames.Count) {
+            if (!CodeEditor.Has(cand, projTypeNames[i])) { cand.Add(projTypeNames[i]); kinds.Add("T"); }
+            List<string> mem = new List<string>();
+            CodeEditor.AddWords(mem, projTypeMembers[i]);
+            int j = 0;
+            while (j < mem.Count) {
+                if (!CodeEditor.Has(cand, mem[j])) { cand.Add(mem[j]); kinds.Add("M"); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        int a = 0;
+        while (a < tn.Count) {
+            if (!CodeEditor.Has(cand, tn[a])) { cand.Add(tn[a]); kinds.Add("T"); }
+            List<string> mem2 = new List<string>();
+            CodeEditor.AddWords(mem2, tm[a]);
+            int b = 0;
+            while (b < mem2.Count) {
+                if (!CodeEditor.Has(cand, mem2[b])) { cand.Add(mem2[b]); kinds.Add("M"); }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+    }
+
+    /// True when the in-progress word at (curLine, up to curCol) sits inside an
+    /// attribute bracket — i.e. the nearest unmatched '[' precedes it on the line.
+    bool InAttributeContext() {
+        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        string s = lines[curLine];
+        int i = curCol - 1;
+        if (i >= s.Length) { i = s.Length - 1; }
+        while (i >= 0) {
+            string ch = s.Substring(i, 1);
+            if (ch == "[") { return true; }
+            if (ch == "]") { return false; }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    /// Scans the buffer for `using X;` type usages that require an import which is
+    /// missing, recording a diagnostic + quick-fix per offending line.
+    void AnalyzeMissingUsings() {
+        fixLines = new List<int>();
+        fixNs = new List<string>();
+        List<string> usings = new List<string>();
+        ParseUsingsInto(usings);
+        string fileNs = FileNamespace();
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        int li = 0;
+        while (li < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[li]);
+            if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
+                || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
+                li = li + 1; continue;
+            }
+            string ln = lines[li];
+            int p = 0;
+            int n = ln.Length;
+            while (p < n) {
+                string ch = ln.Substring(p, 1);
+                if (CodeEditor.InSet(idset, ch)) {
+                    int s2 = p;
+                    string w = "";
+                    while (p < n && CodeEditor.InSet(idset, ln.Substring(p, 1))) {
+                        w = w + ln.Substring(p, 1); p = p + 1;
+                    }
+                    bool dotAfter = (p < n && ln.Substring(p, 1) == ".");
+                    bool dotBefore = (s2 > 0 && ln.Substring(s2 - 1, 1) == ".");
+                    bool cap = (w.Length > 0 && CodeEditor.InSet(upper, w.Substring(0, 1)));
+                    if (dotAfter && !dotBefore && cap) {
+                        string ns = CodeEditor.NsForStdlibType(w);
+                        if (ns.Length > 0) {
+                            bool imported = CodeEditor.Has(usings, ns);
+                            if (!imported && fileNs.Length > 0) {
+                                if (fileNs == ns) { imported = true; }
+                                else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
+                            }
+                            bool userType = CodeEditor.Has(tn, w) || CodeEditor.Has(projTypeNames, w);
+                            if (!imported && !userType && !CodeEditor.HasInt(fixLines, li)) {
+                                errorLines.Add(li);
+                                errorMsgs.Add("'" + w + "' needs 'using " + ns + ";'");
+                                fixLines.Add(li);
+                                fixNs.Add(ns);
+                            }
+                        }
+                    }
+                } else {
+                    p = p + 1;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// The namespace a missing-`using` quick-fix would add for the caret line, or "".
+    string QuickFixNs() {
+        int i = 0;
+        while (i < fixLines.Count) {
+            if (fixLines[i] == curLine) { return fixNs[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// True when the caret line has a missing-`using` quick-fix available.
+    bool HasQuickFix() { return QuickFixNs().Length > 0; }
+
+    /// Inserts `using ns;` after the last existing using (or at the top),
+    /// unless already present.
+    void AddUsing(string ns) {
+        if (ns.Length == 0) { return; }
+        List<string> cur = new List<string>();
+        ParseUsingsInto(cur);
+        if (CodeEditor.Has(cur, ns)) { return; }
+        int lastUsing = -1;
+        int i = 0;
+        while (i < lines.Count) {
+            if (CodeEditor.StartsWithP(CodeEditor.TrimStr(lines[i]), "using ")) { lastUsing = i; }
+            i = i + 1;
+        }
+        SaveUndo();
+        int at = 0;
+        if (lastUsing >= 0) { at = lastUsing + 1; }
+        lines.Insert(at, "using " + ns + ";");
+        if (at <= curLine) { curLine = curLine + 1; }
+        lastDiagLine = -1;
+        CheckErrors();
+    }
+
+    /// Applies the missing-`using` quick-fix for the caret line, if any.
+    void ApplyQuickFix() {
+        AddUsing(QuickFixNs());
     }
 
     // ---- IntelliSense descriptions & snippets ----
