@@ -997,6 +997,15 @@ int main(int argc, char **argv) {
             const char *lib = irgen.extern_libs[li].str;
             int lib_len = (int)irgen.extern_libs[li].len;
             int skip = 0;
+            /* The C runtime is libc/libm on Unix, linked by default (libm via
+             * the explicit -lm above), so a [DllImport("crt"/"msvcrt"/"c"/"m")]
+             * has no -l counterpart here — mirror the CRT skip on the Windows
+             * link path instead of emitting a bogus -lcrt. */
+            if ((lib_len == 1 && (lib[0] == 'c' || lib[0] == 'm')) ||
+                (lib_len == 3 && memcmp(lib, "crt", 3) == 0) ||
+                (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0)) {
+                continue;
+            }
             for (int wi = 0; win_only_libs[wi]; wi++) {
                 if ((int)strlen(win_only_libs[wi]) == lib_len &&
                     memcmp(win_only_libs[wi], lib, lib_len) == 0) { skip = 1; break; }
