@@ -188,6 +188,14 @@ class IdeDemo {
         int pendingGotoLine = 0 - 1;
         int pendingGotoCol = 0;
 
+        // ---- Output console text selection (drag to select, right-click copy) ----
+        // Anchor/head positions are absolute (row = index into `log`, col = char).
+        int coSelDrag = 0;
+        int coSelA = 0 - 1;
+        int coSelAc = 0;
+        int coSelB = 0 - 1;
+        int coSelBc = 0;
+
         // ---- Debug state ----
         int dbgState = 0;
         int dbgExecLine = -1;
@@ -973,9 +981,50 @@ class IdeDemo {
                     List<string> eLine = new List<string>();
                     List<string> eMsg = new List<string>();
                     IdeDemo.ParseErrorList(log, ePath, eLine, eMsg);
-                    IdeDemo.RenderOutputBottom(app, c, t, orr, botTab, log, ePath, eLine, eMsg);
+                    IdeDemo.RenderOutputBottom(app, c, t, orr, botTab, log, ePath, eLine, eMsg,
+                        coSelA, coSelAc, coSelB, coSelBc);
+                    int obTabH = app.Scale(28);
+                    // Drag-to-select over the Output console. Register a hit region
+                    // so pointer-move events keep repainting while dragging.
+                    int coId = app.focus.AllocId();
+                    int coContentY = orr.y + obTabH;
+                    int coContentH = orr.height - obTabH;
+                    app.hitTester.Register(HitRegion.Create(coId, orr.x, coContentY,
+                        orr.width, coContentH, 1));
+                    if (botTab == 0) {
+                        int coRowH = app.Scale(18);
+                        int coPad = app.Scale(6);
+                        int coTextX = orr.x + coPad;
+                        int coMaxRows = coContentH / coRowH;
+                        bool coOver = app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
+                            && app.mouseY >= coContentY && app.mouseY < coContentY + coContentH;
+                        if (app.window.EventKind() == 2 && app.window.EventButton() == 0 && coOver) {
+                            int rr = IdeDemo.ConsoleRowAt(app, coContentY, coRowH, coPad,
+                                log.Count, coMaxRows, app.mouseY);
+                            int cc = 0;
+                            if (rr >= 0 && rr < log.Count) {
+                                cc = IdeDemo.ConsoleColAt(log[rr], coTextX, t.fontSizeSmall, app.mouseX);
+                            }
+                            coSelA = rr; coSelAc = cc; coSelB = rr; coSelBc = cc; coSelDrag = 1;
+                            app.RequestRedraw();
+                        }
+                        if (app.window.EventKind() == 1 && coSelDrag == 1) {
+                            int rr = IdeDemo.ConsoleRowAt(app, coContentY, coRowH, coPad,
+                                log.Count, coMaxRows, app.mouseY);
+                            int cc = 0;
+                            if (rr >= 0 && rr < log.Count) {
+                                cc = IdeDemo.ConsoleColAt(log[rr], coTextX, t.fontSizeSmall, app.mouseX);
+                            }
+                            coSelB = rr; coSelBc = cc;
+                            app.RequestRedraw();
+                        }
+                        if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                            && coSelDrag == 1) {
+                            coSelDrag = 0;
+                            app.RequestRedraw();
+                        }
+                    }
                     if (app.window.EventKind() == 3) {
-                        int obTabH = app.Scale(28);
                         int obTabW = app.Scale(90);
                         if (app.mouseY >= orr.y && app.mouseY < orr.y + obTabH
                             && app.mouseX >= orr.x && app.mouseX < orr.x + obTabW * 2) {
@@ -1008,7 +1057,12 @@ class IdeDemo {
                         && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
                         && app.mouseY >= orr.y && app.mouseY < orr.y + orr.height) {
                         string clip = "";
-                        if (botTab == 0) {
+                        bool haveSel = coSelA >= 0
+                            && !(coSelA == coSelB && coSelAc == coSelBc);
+                        if (botTab == 0 && haveSel) {
+                            clip = IdeDemo.ConsoleSelectionText(log,
+                                coSelA, coSelAc, coSelB, coSelBc);
+                        } else if (botTab == 0) {
                             int ci = 0;
                             while (ci < log.Count) { clip = clip + log[ci] + "\n"; ci = ci + 1; }
                         } else {
@@ -2507,7 +2561,8 @@ class IdeDemo {
     /// Tabbed bottom panel (Output / Error List) with tight padding, replacing
     /// the single bordered Output section.
     static void RenderOutputBottom(App app, Canvas c, Theme t, Rect orr, int tab,
-            List<string> log, List<string> ePath, List<string> eLine, List<string> eMsg) {
+            List<string> log, List<string> ePath, List<string> eLine, List<string> eMsg,
+            int selR0, int selC0, int selR1, int selC1) {
         int tabH = app.Scale(28);
         int tabW = app.Scale(90);
         c.FillRect(orr.x, orr.y, orr.width, tabH, 0xFF252526);
@@ -2522,12 +2577,13 @@ class IdeDemo {
         string elabel = "Errors";
         if (eLine.Count > 0) { elabel = "Errors (" + Convert.ToString(eLine.Count) + ")"; }
         c.DrawText(orr.x + tabW + app.Scale(8), orr.y + app.Scale(6), elabel, t.textPrimary, t.fontSizeSmall);
-        c.DrawText(orr.x + orr.width - app.Scale(120), orr.y + app.Scale(7), "right-click: copy", 0xFF808080, t.fontSizeSmall);
+        c.DrawText(orr.x + orr.width - app.Scale(190), orr.y + app.Scale(7), "drag: select · right-click: copy", 0xFF808080, t.fontSizeSmall);
         int contentY = orr.y + tabH;
         int contentH = orr.height - tabH;
         c.FillRect(orr.x, contentY, orr.width, contentH, 0xFF1E1E1E);
         if (tab == 0) {
-            IdeDemo.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, log);
+            IdeDemo.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, log,
+                selR0, selC0, selR1, selC1);
         } else {
             IdeDemo.RenderErrorList(app, c, t, orr.x, contentY, orr.width, contentH, ePath, eLine, eMsg);
         }
@@ -2851,7 +2907,8 @@ class IdeDemo {
         c.FillRect(orr.x, contentY, orr.width, contentH, 0xFF1E1E1E);
 
         if (tab == 0) {
-            IdeDemo.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, console);
+            IdeDemo.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, console,
+                0 - 1, 0, 0 - 1, 0);
         } else if (tab == 1) {
             IdeDemo.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
         } else if (tab == 2) {
@@ -2875,16 +2932,41 @@ class IdeDemo {
     }
 
     static void RenderConsoleTab(App app, Canvas c, Theme t,
-            int x, int y, int w, int h, List<string> lines) {
+            int x, int y, int w, int h, List<string> lines,
+            int selR0, int selC0, int selR1, int selC1) {
         int rowH = app.Scale(18);
         int pad = app.Scale(6);
         int maxRows = h / rowH;
         int startIdx = 0;
         if (lines.Count > maxRows) { startIdx = lines.Count - maxRows; }
+        // Normalize the selection so (selR0,selC0) precedes (selR1,selC1).
+        if (selR0 >= 0) {
+            if (selR0 > selR1 || (selR0 == selR1 && selC0 > selC1)) {
+                int tr = selR0; selR0 = selR1; selR1 = tr;
+                int tc = selC0; selC0 = selC1; selC1 = tc;
+            }
+        }
         int ri = startIdx;
         int cy = y + pad;
         while (ri < lines.Count && cy + rowH <= y + h) {
             string ln = lines[ri];
+            // Selection highlight for this row (drawn behind the text).
+            if (selR0 >= 0 && ri >= selR0 && ri <= selR1) {
+                int hs = 0;
+                int he = ln.Length;
+                if (ri == selR0) { hs = selC0; }
+                if (ri == selR1) { he = selC1; }
+                if (hs < 0) { hs = 0; }
+                if (he > ln.Length) { he = ln.Length; }
+                if (hs > he) { hs = he; }
+                int hx0 = x + pad + Canvas.MeasureText(Text.Left(ln, hs), t.fontSizeSmall);
+                int hx1 = x + pad + Canvas.MeasureText(Text.Left(ln, he), t.fontSizeSmall);
+                // Full lines in the middle of a multi-line selection extend to the
+                // right edge so the trailing newline reads as selected.
+                if (ri < selR1) { hx1 = hx1 + app.Scale(6); }
+                if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
+                c.FillRect(hx0, cy, hx1 - hx0, rowH, 0xFF264F78);
+            }
             int textColor = 0xFFCCCCCC;
             // Color debug output lines
             if (ln.Length > 2) {
@@ -2905,6 +2987,60 @@ class IdeDemo {
         if (lines.Count == 0) {
             c.DrawText(x + pad, y + pad, "(no console output)", 0xFF666666, t.fontSizeSmall);
         }
+    }
+
+    /// Map a pointer Y within the console content rect to an absolute line index
+    /// (into `lines`), matching RenderConsoleTab's tail-scroll layout.
+    static int ConsoleRowAt(App app, int contentY, int rowH, int pad,
+            int count, int maxRows, int mouseY) {
+        if (count == 0) { return 0 - 1; }
+        int startIdx = 0;
+        if (count > maxRows) { startIdx = count - maxRows; }
+        int rel = (mouseY - (contentY + pad)) / rowH;
+        if (rel < 0) { rel = 0; }
+        int ri = startIdx + rel;
+        if (ri < 0) { ri = 0; }
+        if (ri >= count) { ri = count - 1; }
+        return ri;
+    }
+
+    /// Map a pointer X to the nearest character boundary within `line`.
+    static int ConsoleColAt(string line, int textX, int fontSize, int mouseX) {
+        int i = 0;
+        while (i < line.Length) {
+            int wa = Canvas.MeasureText(Text.Left(line, i), fontSize);
+            int wb = Canvas.MeasureText(Text.Left(line, i + 1), fontSize);
+            int mid = textX + (wa + wb) / 2;
+            if (mouseX < mid) { return i; }
+            i = i + 1;
+        }
+        return line.Length;
+    }
+
+    /// Extract the selected text spanning (r0,c0)..(r1,c1) as newline-joined text.
+    static string ConsoleSelectionText(List<string> lines,
+            int r0, int c0, int r1, int c1) {
+        if (r0 < 0 || r1 < 0) { return ""; }
+        if (r0 > r1 || (r0 == r1 && c0 > c1)) {
+            int tr = r0; r0 = r1; r1 = tr;
+            int tc = c0; c0 = c1; c1 = tc;
+        }
+        string outp = "";
+        int r = r0;
+        while (r <= r1 && r < lines.Count) {
+            string ln = lines[r];
+            int s = 0;
+            int e = ln.Length;
+            if (r == r0) { s = c0; }
+            if (r == r1) { e = c1; }
+            if (s < 0) { s = 0; }
+            if (e > ln.Length) { e = ln.Length; }
+            if (s > e) { s = e; }
+            outp = outp + ln.Substring(s, e - s);
+            if (r < r1) { outp = outp + "\n"; }
+            r = r + 1;
+        }
+        return outp;
     }
 
     static void RenderVarsTab(App app, Canvas c, Theme t,
