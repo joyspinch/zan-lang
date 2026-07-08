@@ -185,7 +185,7 @@ class WebSocketServer {
         return new WebSocketServer(host, port);
     }
 
-    void Start() {
+    async void Start() {
         Socket.Initialize();
         this.listener = TcpListener.Create(this.host, this.port);
         this.listener.Start();
@@ -193,24 +193,24 @@ class WebSocketServer {
         Console.WriteLine("[WebSocketServer] Listening on " + this.host + ":" + Convert.ToString(this.port));
 
         while (this.running) {
-            int clientSock = this.listener.AcceptAsync();
+            int clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
                 this.activeConnections = this.activeConnections + 1;
-                HandleConnection(clientSock);
+                await HandleConnection(clientSock);
             }
         }
     }
 
-    void HandleConnection(int clientSock) {
+    async void HandleConnection(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
 
-        string rawReq = client.RecvAsync(65536);
+        string rawReq = await client.RecvAsync(65536);
         HttpRequest req = HttpRequest.Parse(rawReq);
 
         string upgrade = req.GetHeader("Upgrade");
         if (upgrade != "websocket" && upgrade != "Websocket") {
             HttpResponse resp = HttpResponse.WithStatus(400, "Bad Request", "Expected WebSocket upgrade");
-            client.SendAsync(resp.Build());
+            await client.SendAsync(resp.Build());
             client.Close();
             this.activeConnections = this.activeConnections - 1;
             return;
@@ -226,11 +226,11 @@ class WebSocketServer {
         sb.Append("Sec-WebSocket-Accept: ");
         sb.Append(acceptKey);
         sb.Append("\r\n\r\n");
-        client.SendAsync(sb.ToString());
+        await client.SendAsync(sb.ToString());
 
         bool connected = true;
         while (connected) {
-            string frameData = client.RecvAsync(65536);
+            string frameData = await client.RecvAsync(65536);
             if (frameData.Length == 0) {
                 connected = false;
                 break;
@@ -242,15 +242,15 @@ class WebSocketServer {
                 string response = OnMessage(frame.payload);
                 WsFrame respFrame = WsFrame.TextFrame(response);
                 string encoded = respFrame.Encode();
-                client.SendBytesAsync(encoded, 2 + response.Length);
+                await client.SendBytesAsync(encoded, 2 + response.Length);
             } else if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
                 string encoded = pong.Encode();
-                client.SendBytesAsync(encoded, 2);
+                await client.SendBytesAsync(encoded, 2);
             } else if (frame.opcode == WsOpcode.Close) {
                 WsFrame closeResp = WsFrame.CloseFrame();
                 string encoded = closeResp.Encode();
-                client.SendBytesAsync(encoded, 2);
+                await client.SendBytesAsync(encoded, 2);
                 connected = false;
             }
         }
@@ -288,13 +288,13 @@ class WebSocketClient {
         this.path = "/";
     }
 
-    static WebSocketClient ConnectAsync(string host, int port, string path) {
+    static async WebSocketClient ConnectAsync(string host, int port, string path) {
         WebSocketClient ws = new WebSocketClient();
         ws.host = host;
         ws.port = port;
         ws.path = path;
 
-        ws.conn = TcpClient.ConnectAsync(host, port);
+        ws.conn = await TcpClient.ConnectAsync(host, port);
 
         StringBuilder sb = new StringBuilder();
         sb.Append("GET ");
@@ -308,9 +308,9 @@ class WebSocketClient {
         sb.Append("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
         sb.Append("Sec-WebSocket-Version: 13\r\n");
         sb.Append("\r\n");
-        ws.conn.SendAsync(sb.ToString());
+        await ws.conn.SendAsync(sb.ToString());
 
-        string response = ws.conn.RecvAsync(4096);
+        string response = await ws.conn.RecvAsync(4096);
         if (response.Length > 12 && response.Substring(9, 3) == "101") {
             ws.connected = true;
         }
@@ -318,26 +318,26 @@ class WebSocketClient {
         return ws;
     }
 
-    void SendText(string text) {
+    async void SendText(string text) {
         WsFrame frame = WsFrame.TextFrame(text);
         string encoded = frame.Encode();
-        this.conn.SendBytesAsync(encoded, 2 + text.Length);
+        await this.conn.SendBytesAsync(encoded, 2 + text.Length);
     }
 
-    void SendBinary(string data, int len) {
+    async void SendBinary(string data, int len) {
         WsFrame frame = WsFrame.BinaryFrame(data, len);
         string encoded = frame.Encode();
-        this.conn.SendBytesAsync(encoded, 2 + len);
+        await this.conn.SendBytesAsync(encoded, 2 + len);
     }
 
-    void Ping() {
+    async void Ping() {
         WsFrame frame = WsFrame.PingFrame();
         string encoded = frame.Encode();
-        this.conn.SendBytesAsync(encoded, 2);
+        await this.conn.SendBytesAsync(encoded, 2);
     }
 
-    string RecvText() {
-        string data = this.conn.RecvAsync(65536);
+    async string RecvText() {
+        string data = await this.conn.RecvAsync(65536);
         if (data.Length == 0) {
             this.connected = false;
             return data;
@@ -350,17 +350,17 @@ class WebSocketClient {
         if (frame.opcode == WsOpcode.Ping) {
             WsFrame pong = WsFrame.PongFrame();
             string encoded = pong.Encode();
-            this.conn.SendBytesAsync(encoded, 2);
-            return RecvText();
+            await this.conn.SendBytesAsync(encoded, 2);
+            return await RecvText();
         }
         return frame.payload;
     }
 
-    void Close() {
+    async void Close() {
         if (this.connected) {
             WsFrame closeFrame = WsFrame.CloseFrame();
             string encoded = closeFrame.Encode();
-            this.conn.SendBytesAsync(encoded, 2);
+            await this.conn.SendBytesAsync(encoded, 2);
             this.conn.Close();
             this.connected = false;
         }

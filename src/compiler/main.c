@@ -600,43 +600,55 @@ int main(int argc, char **argv) {
             }},
             {NULL, NULL, {NULL}}
         };
-        /* collect which namespaces are used */
-        int ns_used[20] = {0};
-        for (int fi = 0; fi < input_count; fi++) {
-            size_t slen2 = 0;
-            char *src2 = read_file(input_files[fi], &slen2);
-            if (!src2) continue;
-            for (int mi = 0; stdlib_map[mi].using_ns; mi++) {
-                /* Match "using Namespace;" exactly, not as a substring of
-                   a longer namespace (e.g. System.Net should NOT match when
-                   the source only has "using System.Net.Sockets;"). */
-                char needle[256];
-                snprintf(needle, sizeof(needle), "using %s;", stdlib_map[mi].using_ns);
-                if (strstr(src2, needle)) {
-                    ns_used[mi] = 1;
+        /* Resolve stdlib dependencies to a fixpoint: an included file (user
+         * source OR an already-pulled stdlib module) may itself `using` another
+         * stdlib namespace. Re-scan every included file and pull newly-needed
+         * modules until nothing more is added, so importing e.g.
+         * System.Net.WebSocket transitively pulls System.Text (Encoding). */
+        int ns_added[64] = {0};
+        int changed = 1;
+        while (changed) {
+            changed = 0;
+            /* collect which namespaces are used across all included files */
+            int ns_used[64] = {0};
+            for (int fi = 0; fi < input_count; fi++) {
+                size_t slen2 = 0;
+                char *src2 = read_file(input_files[fi], &slen2);
+                if (!src2) continue;
+                for (int mi = 0; stdlib_map[mi].using_ns; mi++) {
+                    /* Match "using Namespace;" exactly, not as a substring of
+                       a longer namespace (e.g. System.Net should NOT match when
+                       the source only has "using System.Net.Sockets;"). */
+                    char needle[256];
+                    snprintf(needle, sizeof(needle), "using %s;", stdlib_map[mi].using_ns);
+                    if (strstr(src2, needle)) {
+                        ns_used[mi] = 1;
+                    }
                 }
+                free(src2);
             }
-            if (fi > 0) free(src2); /* don't free first file yet */
-        }
-        /* add matching stdlib files */
-        for (int mi = 0; stdlib_map[mi].using_ns; mi++) {
-            if (!ns_used[mi]) continue;
-            for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
-                char mod_path[1024];
+            /* add matching stdlib files not yet pulled */
+            for (int mi = 0; stdlib_map[mi].using_ns && mi < 64; mi++) {
+                if (!ns_used[mi] || ns_added[mi]) continue;
+                ns_added[mi] = 1;
+                changed = 1;
+                for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
+                    char mod_path[1024];
 #ifdef _WIN32
-                snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
-                         stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+                    snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                             stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
 #else
-                snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
-                         stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+                    snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
+                             stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
 #endif
-                FILE *check = fopen(mod_path, "rb");
-                if (check) {
-                    fclose(check);
-                    if (input_count < 128) {
-                        char *dup = (char *)malloc(strlen(mod_path) + 1);
-                        strcpy(dup, mod_path);
-                        input_files[input_count++] = dup;
+                    FILE *check = fopen(mod_path, "rb");
+                    if (check) {
+                        fclose(check);
+                        if (input_count < 128) {
+                            char *dup = (char *)malloc(strlen(mod_path) + 1);
+                            strcpy(dup, mod_path);
+                            input_files[input_count++] = dup;
+                        }
                     }
                 }
             }

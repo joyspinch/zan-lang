@@ -50,7 +50,7 @@ class Worker {
     }
 
     /// <summary>Runs all registered workers.</summary>
-    static void RunAll() {
+    static async void RunAll() {
         Socket.Initialize();
         Console.WriteLine("[Worker] Starting " + Convert.ToString(workers.Count) + " workers...");
 
@@ -58,17 +58,17 @@ class Worker {
         while (i < workers.Count) {
             Worker w = workers[i];
             Console.WriteLine("[Worker] " + w.name + " listening on " + w.protocol + "://" + w.host + ":" + Convert.ToString(w.port));
-            w.Run();
+            await w.Run();
             i = i + 1;
         }
     }
 
     /// <summary>Starts this worker's event loop.</summary>
-    void Run() {
+    async void Run() {
         this.running = true;
 
         if (this.protocol == "udp") {
-            RunUdp();
+            await RunUdp();
             return;
         }
 
@@ -76,32 +76,32 @@ class Worker {
         listener.Start();
 
         while (this.running) {
-            int clientSock = listener.AcceptAsync();
+            int clientSock = await listener.AcceptAsync();
             if (clientSock >= 0) {
                 this.connectionCount = this.connectionCount + 1;
                 if (this.protocol == "http") {
-                    HandleHttp(clientSock);
+                    await HandleHttp(clientSock);
                 } else if (this.protocol == "websocket" || this.protocol == "ws") {
-                    HandleWebSocket(clientSock);
+                    await HandleWebSocket(clientSock);
                 } else {
-                    HandleTcp(clientSock);
+                    await HandleTcp(clientSock);
                 }
             }
         }
     }
 
     /// <summary>Handles a raw TCP connection.</summary>
-    void HandleTcp(int clientSock) {
+    async void HandleTcp(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         bool active = true;
         while (active) {
-            string data = client.RecvAsync(65536);
+            string data = await client.RecvAsync(65536);
             if (data.Length == 0) {
                 active = false;
             } else {
                 string response = OnTcpMessage(data);
                 if (response.Length > 0) {
-                    client.SendAsync(response);
+                    await client.SendAsync(response);
                 }
             }
         }
@@ -110,11 +110,11 @@ class Worker {
     }
 
     /// <summary>Handles an HTTP connection with keep-alive.</summary>
-    void HandleHttp(int clientSock) {
+    async void HandleHttp(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         bool keepAlive = true;
         while (keepAlive) {
-            string rawData = client.RecvAsync(65536);
+            string rawData = await client.RecvAsync(65536);
             if (rawData.Length == 0) { break; }
 
             HttpRequest request = HttpRequest.Parse(rawData);
@@ -122,17 +122,17 @@ class Worker {
 
             HttpResponse response = OnHttpRequest(request);
             response.SetKeepAlive(keepAlive);
-            client.SendAsync(response.Build());
+            await client.SendAsync(response.Build());
         }
         client.Close();
         this.connectionCount = this.connectionCount - 1;
     }
 
     /// <summary>Handles a WebSocket connection.</summary>
-    void HandleWebSocket(int clientSock) {
+    async void HandleWebSocket(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
 
-        string rawReq = client.RecvAsync(65536);
+        string rawReq = await client.RecvAsync(65536);
         HttpRequest req = HttpRequest.Parse(rawReq);
         string wsKey = req.GetHeader("Sec-WebSocket-Key");
 
@@ -143,11 +143,11 @@ class Worker {
         sb.Append("Sec-WebSocket-Accept: ");
         sb.Append(wsKey);
         sb.Append("\r\n\r\n");
-        client.SendAsync(sb.ToString());
+        await client.SendAsync(sb.ToString());
 
         bool active = true;
         while (active) {
-            string frameData = client.RecvAsync(65536);
+            string frameData = await client.RecvAsync(65536);
             if (frameData.Length == 0) { break; }
 
             WsFrame frame = WsFrame.Decode(frameData, frameData.Length);
@@ -156,12 +156,12 @@ class Worker {
                 if (response.Length > 0) {
                     WsFrame respFrame = WsFrame.TextFrame(response);
                     string encoded = respFrame.Encode();
-                    client.SendBytesAsync(encoded, 2 + response.Length);
+                    await client.SendBytesAsync(encoded, 2 + response.Length);
                 }
             } else if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
                 string encoded = pong.Encode();
-                client.SendBytesAsync(encoded, 2);
+                await client.SendBytesAsync(encoded, 2);
             } else if (frame.opcode == WsOpcode.Close) {
                 active = false;
             }
@@ -172,10 +172,10 @@ class Worker {
     }
 
     /// <summary>Handles UDP messages.</summary>
-    void RunUdp() {
+    async void RunUdp() {
         UdpClient udp = UdpClient.Bind(this.host, this.port);
         while (this.running) {
-            string data = udp.RecvFromAsync(65536);
+            string data = await udp.RecvFromAsync(65536);
             if (data.Length > 0) {
                 string response = OnUdpMessage(data);
             }
@@ -260,8 +260,8 @@ class Connection {
         return this.protocol;
     }
 
-    void Send(string data) {
-        Socket.SendStringAsync(this.sock, data);
+    async void Send(string data) {
+        await Socket.SendStringAsync(this.sock, data);
     }
 
     void Close() {
