@@ -193,6 +193,13 @@ class IdeDemo {
         Input pLocInput = Input.Bind(SignalString.Create(root), "location");
         Input fNameInput = Input.Bind(SignalString.Create("NewFile"), "file name");
 
+        // Right-click context menu (file tree + tab bar) state.
+        // ctxKind: 0 = none, 1 = project tree row, 3 = editor tab.
+        int ctxKind = 0;
+        int ctxX = 0;
+        int ctxY = 0;
+        int ctxTarget = 0 - 1;
+
         // Save-current-project-as-custom-template state.
         SignalInt tmplCatSel = SignalInt.Create(0);
         Input tmplNameInput = Input.Bind(SignalString.Create("MyTemplate"), "template name");
@@ -677,7 +684,11 @@ class IdeDemo {
                 if (tScroll > treeMaxScroll) { tScroll = treeMaxScroll; }
                 if (tScroll < 0) { tScroll = 0; }
                 treeScrollY.Set(tScroll);
-                TreeView.Render(app, treeArea, tree, treeSel, tScroll);
+                int trRight = TreeView.Render(app, treeArea, tree, treeSel, tScroll);
+                if (trRight >= 0) {
+                    ctxKind = 1; ctxX = app.mouseX; ctxY = app.mouseY;
+                    ctxTarget = trRight; app.RequestRedraw();
+                }
 
                 // Section 2: Examples (collapsible tree, click a leaf to open)
                 int exY = tr.y + explorerH;
@@ -711,7 +722,7 @@ class IdeDemo {
                 int sel = treeSel.Get();
                 if (sel != lastTreeSel) {
                     lastTreeSel = sel;
-                    if (sel >= 0 && sel < tree.Count) {
+                    if (ctxKind == 0 && sel >= 0 && sel < tree.Count) {
                         TreeNode node = tree[sel];
                         if (!node.isDir) {
                             IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
@@ -747,23 +758,28 @@ class IdeDemo {
 
                 int tabH = TabView.Height(app);
                 TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
-                if (hit.action == 3) {
-                    dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
-                    dlgMode = 2;
-                } else if (hit.action == 2) {
-                    if (tabNames.Count > 1) {
-                        tabNames.RemoveAt(hit.index);
-                        tabBodies.RemoveAt(hit.index);
-                        tabPaths.RemoveAt(hit.index);
-                        int a = activeTab.Get();
-                        if (a > hit.index) { a = a - 1; }
-                        if (a >= tabNames.Count) { a = tabNames.Count - 1; }
-                        if (a < 0) { a = 0; }
-                        activeTab.Set(a);
-                        lastActive = 0 - 1;
+                if (hit.action == 4) {
+                    ctxKind = 3; ctxX = app.mouseX; ctxY = app.mouseY;
+                    ctxTarget = hit.index; app.RequestRedraw();
+                } else if (ctxKind == 0) {
+                    if (hit.action == 3) {
+                        dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
+                        dlgMode = 2;
+                    } else if (hit.action == 2) {
+                        if (tabNames.Count > 1) {
+                            tabNames.RemoveAt(hit.index);
+                            tabBodies.RemoveAt(hit.index);
+                            tabPaths.RemoveAt(hit.index);
+                            int a = activeTab.Get();
+                            if (a > hit.index) { a = a - 1; }
+                            if (a >= tabNames.Count) { a = tabNames.Count - 1; }
+                            if (a < 0) { a = 0; }
+                            activeTab.Set(a);
+                            lastActive = 0 - 1;
+                        }
+                    } else if (hit.action == 1) {
+                        activeTab.Set(hit.index);
                     }
-                } else if (hit.action == 1) {
-                    activeTab.Set(hit.index);
                 }
 
                 int act = activeTab.Get();
@@ -1145,6 +1161,64 @@ class IdeDemo {
                         app.RequestRedraw();
                     }
                 }
+                // File-tree / tab right-click context menus, drawn above the
+                // editor overlay. ctxKind: 1 = project tree row, 3 = editor tab.
+                if (ctxKind != 0) {
+                    List<string> cmLabels = new List<string>();
+                    if (ctxKind == 1) {
+                        cmLabels.Add("New File");
+                        cmLabels.Add("Refresh");
+                        cmLabels.Add("-");
+                        cmLabels.Add("Copy Path");
+                        cmLabels.Add("Reveal in Explorer");
+                    } else if (ctxKind == 3) {
+                        cmLabels.Add("Close");
+                        cmLabels.Add("Close Others");
+                        cmLabels.Add("-");
+                        cmLabels.Add("Copy Path");
+                    }
+                    int chosen = IdeDemo.RenderMenu(app, c, t, ctxX, ctxY, cmLabels);
+                    if (chosen == 0 - 2) {
+                        ctxKind = 0;
+                        app.RequestRedraw();
+                    } else if (chosen >= 0) {
+                        string lbl = cmLabels[chosen];
+                        if (ctxKind == 1) {
+                            if (lbl == "New File") {
+                                dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
+                                dlgMode = 2;
+                            } else if (lbl == "Refresh") {
+                                rescan = true;
+                            } else if (lbl == "Copy Path") {
+                                if (ctxTarget >= 0 && ctxTarget < tree.Count) {
+                                    Clipboard.SetText(tree[ctxTarget].path);
+                                    log.Add("> Copied path: " + tree[ctxTarget].path);
+                                }
+                            } else if (lbl == "Reveal in Explorer") {
+                                if (ctxTarget >= 0 && ctxTarget < tree.Count) {
+                                    string wp = IdeDemo.ToWinPath(tree[ctxTarget].path);
+                                    Process.Run("explorer /select,\"" + wp + "\"");
+                                }
+                            }
+                        } else if (ctxKind == 3) {
+                            if (lbl == "Close") {
+                                IdeDemo.CloseTabAt(tabNames, tabBodies, tabPaths, activeTab, ctxTarget);
+                                lastActive = 0 - 1;
+                            } else if (lbl == "Close Others") {
+                                IdeDemo.CloseOtherTabs(tabNames, tabBodies, tabPaths, activeTab, ctxTarget);
+                                lastActive = 0 - 1;
+                            } else if (lbl == "Copy Path") {
+                                if (ctxTarget >= 0 && ctxTarget < tabPaths.Count) {
+                                    Clipboard.SetText(tabPaths[ctxTarget]);
+                                    log.Add("> Copied path: " + tabPaths[ctxTarget]);
+                                }
+                            }
+                        }
+                        ctxKind = 0;
+                        app.RequestRedraw();
+                    }
+                }
+
                 // Publish dialog overlay (modal, topmost).
                 if (pubOpen) {
                     string pubName = "project";
@@ -1245,6 +1319,127 @@ class IdeDemo {
         sel.Set(0);
         nameInput.SetText(defName);
         return w;
+    }
+
+    /// Draws a floating context menu at (mx, my) and reports the user's choice
+    /// this frame: -1 = nothing yet, -2 = dismissed (clicked outside), or the
+    /// index of the chosen label. Entries equal to "-" render as separators.
+    static int RenderMenu(App app, Canvas c, Theme t, int mx, int my, List<string> labels) {
+        int fontSize = t.fontSizeMedium;
+        int itemH = Canvas.FontHeight(fontSize) + app.Scale(8);
+        int sepH = app.Scale(7);
+        int mW = app.Scale(150);
+        int i = 0;
+        while (i < labels.Count) {
+            if (labels[i] != "-") {
+                int lw = Canvas.MeasureText(labels[i], fontSize) + app.Scale(28);
+                if (lw > mW) { mW = lw; }
+            }
+            i = i + 1;
+        }
+        int mH = app.Scale(6);
+        int hi = 0;
+        while (hi < labels.Count) {
+            if (labels[hi] == "-") { mH = mH + sepH; } else { mH = mH + itemH; }
+            hi = hi + 1;
+        }
+
+        int winW = c.Width();
+        int winH = c.Height();
+        if (mx + mW > winW) { mx = winW - mW - app.Scale(4); }
+        if (my + mH > winH) { my = winH - mH - app.Scale(4); }
+        if (mx < 0) { mx = 0; }
+        if (my < app.titlebarH) { my = app.titlebarH; }
+
+        c.FillRoundRect(mx + 2, my + 2, mW, mH, app.Scale(4), 0x50000000);
+        c.FillRoundRect(mx, my, mW, mH, app.Scale(4), 0xFF252526);
+        c.DrawRect(mx, my, mW, mH, 0xFF3E3E42, 1);
+
+        int ry = my + app.Scale(3);
+        int ri = 0;
+        while (ri < labels.Count) {
+            if (labels[ri] == "-") {
+                c.FillRect(mx + app.Scale(6), ry + sepH / 2, mW - app.Scale(12), 1, 0xFF3E3E42);
+                ry = ry + sepH;
+            } else {
+                bool hov = app.mouseX >= mx && app.mouseX < mx + mW
+                           && app.mouseY >= ry && app.mouseY < ry + itemH;
+                int tcol = 0xFFD4D4D4;
+                if (hov) {
+                    c.FillRect(mx + app.Scale(2), ry, mW - app.Scale(4), itemH, 0xFF094771);
+                    tcol = 0xFFFFFFFF;
+                }
+                int ty = ry + (itemH - Canvas.FontHeight(fontSize)) / 2;
+                c.DrawText(mx + app.Scale(12), ty, labels[ri], tcol, fontSize);
+                ry = ry + itemH;
+            }
+            ri = ri + 1;
+        }
+
+        if (app.window.EventKind() == 3 && app.window.EventButton() == 0) {
+            bool inside = app.mouseX >= mx && app.mouseX < mx + mW
+                          && app.mouseY >= my && app.mouseY < my + mH;
+            if (inside) {
+                int cy = my + app.Scale(3);
+                int ci = 0;
+                while (ci < labels.Count) {
+                    int rh = itemH;
+                    if (labels[ci] == "-") { rh = sepH; }
+                    if (labels[ci] != "-" && app.mouseY >= cy && app.mouseY < cy + rh) {
+                        return ci;
+                    }
+                    cy = cy + rh;
+                    ci = ci + 1;
+                }
+                return 0 - 1;
+            }
+            return 0 - 2;
+        }
+        return 0 - 1;
+    }
+
+    /// Converts forward slashes to Windows backslashes (for explorer.exe).
+    static string ToWinPath(string p) {
+        string outp = "";
+        int i = 0;
+        while (i < p.Length) {
+            string ch = p.Substring(i, 1);
+            if (ch == "/") { outp = outp + "\\"; } else { outp = outp + ch; }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Closes the tab at `idx`, keeping at least one tab open and clamping the
+    /// active index.
+    static void CloseTabAt(List<string> names, List<string> bodies,
+            List<string> paths, SignalInt active, int idx) {
+        if (idx < 0 || idx >= names.Count) { return; }
+        if (names.Count <= 1) { return; }
+        names.RemoveAt(idx);
+        bodies.RemoveAt(idx);
+        paths.RemoveAt(idx);
+        int a = active.Get();
+        if (a > idx) { a = a - 1; }
+        if (a >= names.Count) { a = names.Count - 1; }
+        if (a < 0) { a = 0; }
+        active.Set(a);
+    }
+
+    /// Closes every tab except the one at `idx`, which becomes active.
+    static void CloseOtherTabs(List<string> names, List<string> bodies,
+            List<string> paths, SignalInt active, int idx) {
+        if (idx < 0 || idx >= names.Count) { return; }
+        int k = names.Count - 1;
+        while (k >= 0) {
+            if (k != idx) {
+                names.RemoveAt(k);
+                bodies.RemoveAt(k);
+                paths.RemoveAt(k);
+            }
+            k = k - 1;
+        }
+        active.Set(0);
     }
 
     // ---- workspace / scaffolding ----
