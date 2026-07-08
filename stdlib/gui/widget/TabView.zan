@@ -1,0 +1,151 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// Result of a single TabView interaction this frame.
+/// action: 0 = none, 1 = select, 2 = close, 3 = add. index = tab index (or -1).
+class TabHit {
+    int action;
+    int index;
+
+    static TabHit Create(int action, int index) {
+        TabHit h = new TabHit();
+        h.action = action;
+        h.index = index;
+        return h;
+    }
+}
+
+/// <summary>
+/// A horizontal strip of closable tabs with an optional trailing "+" button —
+/// the document-tab bar of an editor/IDE. Stateless and immediate-mode: the
+/// caller owns the `labels` list and the `active` index signal; Render draws
+/// the bar and returns a TabHit describing any click, and Apply performs the
+/// usual add/close/select bookkeeping on the model.
+///
+///   TabHit hit = TabView.Render(app, x, y, w, h, files, active, true);
+///   TabView.Apply(hit, files, active, "untitled");
+/// </summary>
+class TabView {
+    static int Height(App app) {
+        return app.theme.heightLarge;
+    }
+
+    static TabHit Render(App app, int x, int y, int w, int h,
+                         List<string> labels, SignalInt active, bool showAdd) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int count = labels.Count;
+
+        int firstId = app.focus.AllocId();
+        int need = count * 2;
+        if (showAdd) { need = need + 1; }
+        int i = 1;
+        while (i < need) {
+            app.focus.AllocId();
+            i = i + 1;
+        }
+
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.FillRect(x, y + h - 1, w, 1, t.divider);
+
+        int activeIdx = active.Get();
+        int fontSize = t.fontSizeMedium;
+        int closeBox = fontSize;
+        int padX = t.paddingMedium;
+        int gap = t.gapSmall;
+
+        int tabX = x;
+        int j = 0;
+        while (j < count) {
+            string label = labels[j];
+            int labelW = Canvas.MeasureText(label, fontSize);
+            int tabW = padX + labelW + gap + closeBox + padX;
+            int tabId = firstId + j * 2;
+            int closeId = firstId + j * 2 + 1;
+            bool isActive = j == activeIdx;
+            bool hovered = app.focus.IsHovered(tabId);
+            bool closeHover = app.focus.IsHovered(closeId);
+
+            int bg = t.bgSecondary;
+            if (isActive) { bg = t.bgPrimary; }
+            else if (hovered || closeHover) { bg = t.bgHover; }
+            c.FillRect(tabX, y, tabW, h - 1, bg);
+            c.FillRect(tabX + tabW - 1, y, 1, h - 2, t.divider);
+
+            int textColor = t.textSecondary;
+            if (isActive) { textColor = t.textPrimary; }
+            int textY = y + (h - Canvas.FontHeight(fontSize)) / 2;
+            c.DrawText(tabX + padX, textY, label, textColor, fontSize);
+
+            if (isActive) { c.FillRect(tabX, y + h - 2, tabW, 2, t.primary); }
+
+            int cbx = tabX + padX + labelW + gap;
+            int cby = y + (h - closeBox) / 2;
+            int closeColor = t.textTertiary;
+            if (closeHover) {
+                c.FillRoundRect(cbx - 2, cby - 2, closeBox + 4, closeBox + 4, t.borderRadiusSmall, t.bgActive);
+                closeColor = t.textPrimary;
+            }
+            Icon.DrawCenteredIn(c, "close", cbx, cby, closeBox, closeBox, closeBox - 3, closeColor);
+
+            app.hitTester.Register(HitRegion.Create(tabId, tabX, y, tabW, h, 0));
+            app.hitTester.Register(HitRegion.Create(closeId, cbx - 2, cby - 2, closeBox + 4, closeBox + 4, 0));
+
+            tabX = tabX + tabW;
+            j = j + 1;
+        }
+
+        int addId = firstId + count * 2;
+        if (showAdd) {
+            int addW = h;
+            bool addHover = app.focus.IsHovered(addId);
+            if (addHover) { c.FillRect(tabX, y, addW, h - 1, t.bgHover); }
+            int addColor = t.textSecondary;
+            if (addHover) { addColor = t.primary; }
+            Icon.DrawCenteredIn(c, "plus", tabX, y, addW, h, t.iconSizeSmall, addColor);
+            app.hitTester.Register(HitRegion.Create(addId, tabX, y, addW, h, 0));
+        }
+
+        if (app.window.EventKind() == 3) {
+            int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
+            if (showAdd && hit == addId) { return TabHit.Create(3, -1); }
+            int k = 0;
+            while (k < count) {
+                int tabId = firstId + k * 2;
+                int closeId = firstId + k * 2 + 1;
+                if (hit == closeId) { return TabHit.Create(2, k); }
+                if (hit == tabId) { return TabHit.Create(1, k); }
+                k = k + 1;
+            }
+        }
+        return TabHit.Create(0, -1);
+    }
+
+    /// Applies a TabHit to the model, doing the usual bookkeeping:
+    /// select -> set active; close -> remove tab and clamp active; add -> append
+    /// `newLabel` and focus it. Returns true if the model changed (redraw).
+    static bool Apply(TabHit hit, List<string> labels, SignalInt active, string newLabel) {
+        if (hit.action == 1) {
+            active.Set(hit.index);
+            return true;
+        }
+        if (hit.action == 2) {
+            if (labels.Count <= 1) { return false; }
+            labels.RemoveAt(hit.index);
+            int a = active.Get();
+            if (a > hit.index) { a = a - 1; }
+            if (a >= labels.Count) { a = labels.Count - 1; }
+            if (a < 0) { a = 0; }
+            active.Set(a);
+            return true;
+        }
+        if (hit.action == 3) {
+            labels.Add(newLabel);
+            active.Set(labels.Count - 1);
+            return true;
+        }
+        return false;
+    }
+}

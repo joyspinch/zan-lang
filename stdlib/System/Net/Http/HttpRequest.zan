@@ -1,0 +1,231 @@
+using System;
+
+namespace System.Net.Http;
+
+/// <summary>
+/// HTTP request representation and parser.
+/// Parses raw HTTP/1.1 requests from TCP data.
+/// </summary>
+class HttpRequest {
+    string method;
+    string path;
+    string version;
+    string body;
+    string rawHeaders;
+    string queryString;
+    string host;
+    string contentType;
+    int contentLength;
+    bool keepAlive;
+
+    HttpRequest() {
+        this.method = "";
+        this.path = "";
+        this.version = "HTTP/1.1";
+        this.body = "";
+        this.rawHeaders = "";
+        this.queryString = "";
+        this.host = "";
+        this.contentType = "";
+        this.contentLength = 0;
+        this.keepAlive = true;
+    }
+
+    /// <summary>Parses a raw HTTP request string into an HttpRequest.</summary>
+    static HttpRequest Parse(string raw) {
+        HttpRequest req = new HttpRequest();
+        int len = raw.Length;
+        if (len == 0) { return req; }
+
+        // Find end of request line
+        int lineEnd = 0;
+        while (lineEnd < len && raw.Substring(lineEnd, 1) != "\n") {
+            lineEnd = lineEnd + 1;
+        }
+        string requestLine = raw.Substring(0, lineEnd);
+        // Remove \r if present
+        if (requestLine.Length > 0 && requestLine.Substring(requestLine.Length - 1, 1) == "\r") {
+            requestLine = requestLine.Substring(0, requestLine.Length - 1);
+        }
+
+        // Parse: METHOD PATH VERSION
+        int sp1 = 0;
+        while (sp1 < requestLine.Length && requestLine.Substring(sp1, 1) != " ") {
+            sp1 = sp1 + 1;
+        }
+        req.method = requestLine.Substring(0, sp1);
+
+        int sp2 = sp1 + 1;
+        while (sp2 < requestLine.Length && requestLine.Substring(sp2, 1) != " ") {
+            sp2 = sp2 + 1;
+        }
+        string fullPath = requestLine.Substring(sp1 + 1, sp2 - sp1 - 1);
+        if (sp2 < requestLine.Length) {
+            req.version = requestLine.Substring(sp2 + 1);
+        }
+
+        // Split path and query string
+        int qmark = 0;
+        bool foundQ = false;
+        while (qmark < fullPath.Length) {
+            if (fullPath.Substring(qmark, 1) == "?") {
+                foundQ = true;
+                break;
+            }
+            qmark = qmark + 1;
+        }
+        if (foundQ) {
+            req.path = fullPath.Substring(0, qmark);
+            req.queryString = fullPath.Substring(qmark + 1);
+        } else {
+            req.path = fullPath;
+        }
+
+        // Parse headers
+        int pos = lineEnd + 1;
+        StringBuilder headersSb = new StringBuilder();
+        while (pos < len) {
+            int hEnd = pos;
+            while (hEnd < len && raw.Substring(hEnd, 1) != "\n") {
+                hEnd = hEnd + 1;
+            }
+            string headerLine = raw.Substring(pos, hEnd - pos);
+            if (headerLine.Length > 0 && headerLine.Substring(headerLine.Length - 1, 1) == "\r") {
+                headerLine = headerLine.Substring(0, headerLine.Length - 1);
+            }
+            if (headerLine.Length == 0) {
+                // Empty line = end of headers
+                pos = hEnd + 1;
+                break;
+            }
+            headersSb.Append(headerLine);
+            headersSb.Append("\n");
+
+            // Parse well-known headers
+            string lowerLine = headerLine;  // simplified (no toLower)
+            int colonPos = 0;
+            while (colonPos < headerLine.Length && headerLine.Substring(colonPos, 1) != ":") {
+                colonPos = colonPos + 1;
+            }
+            if (colonPos < headerLine.Length) {
+                string hName = headerLine.Substring(0, colonPos);
+                string hValue = headerLine.Substring(colonPos + 1);
+                // Trim leading space
+                if (hValue.Length > 0 && hValue.Substring(0, 1) == " ") {
+                    hValue = hValue.Substring(1);
+                }
+                if (hName == "Host" || hName == "host") {
+                    req.host = hValue;
+                } else if (hName == "Content-Type" || hName == "content-type") {
+                    req.contentType = hValue;
+                } else if (hName == "Content-Length" || hName == "content-length") {
+                    req.contentLength = Convert.ToInt(hValue);
+                } else if (hName == "Connection" || hName == "connection") {
+                    req.keepAlive = (hValue != "close");
+                }
+            }
+            pos = hEnd + 1;
+        }
+        req.rawHeaders = headersSb.ToString();
+
+        // Body
+        if (pos < len) {
+            req.body = raw.Substring(pos);
+        }
+
+        return req;
+    }
+
+    /// <summary>Gets a specific header value by name.</summary>
+    string GetHeader(string name) {
+        // Search through rawHeaders
+        int pos = 0;
+        int len = this.rawHeaders.Length;
+        while (pos < len) {
+            int lineEnd = pos;
+            while (lineEnd < len && this.rawHeaders.Substring(lineEnd, 1) != "\n") {
+                lineEnd = lineEnd + 1;
+            }
+            string line = this.rawHeaders.Substring(pos, lineEnd - pos);
+            int colonPos = 0;
+            while (colonPos < line.Length && line.Substring(colonPos, 1) != ":") {
+                colonPos = colonPos + 1;
+            }
+            if (colonPos < line.Length) {
+                string hName = line.Substring(0, colonPos);
+                if (hName == name) {
+                    string hValue = line.Substring(colonPos + 1);
+                    if (hValue.Length > 0 && hValue.Substring(0, 1) == " ") {
+                        hValue = hValue.Substring(1);
+                    }
+                    return hValue;
+                }
+            }
+            pos = lineEnd + 1;
+        }
+        return "";
+    }
+
+    /// <summary>Gets a query parameter value by name.</summary>
+    string GetQueryParam(string name) {
+        if (this.queryString.Length == 0) { return ""; }
+        int pos = 0;
+        int len = this.queryString.Length;
+        while (pos < len) {
+            int eqPos = pos;
+            while (eqPos < len && this.queryString.Substring(eqPos, 1) != "=" && this.queryString.Substring(eqPos, 1) != "&") {
+                eqPos = eqPos + 1;
+            }
+            string paramName = this.queryString.Substring(pos, eqPos - pos);
+            string paramValue = "";
+            if (eqPos < len && this.queryString.Substring(eqPos, 1) == "=") {
+                int valEnd = eqPos + 1;
+                while (valEnd < len && this.queryString.Substring(valEnd, 1) != "&") {
+                    valEnd = valEnd + 1;
+                }
+                paramValue = this.queryString.Substring(eqPos + 1, valEnd - eqPos - 1);
+                pos = valEnd + 1;
+            } else {
+                pos = eqPos + 1;
+            }
+            if (paramName == name) {
+                return paramValue;
+            }
+        }
+        return "";
+    }
+
+    /// <summary>Builds an HTTP request string for sending.</summary>
+    static string Build(string method, string path, string host, string body) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(method);
+        sb.Append(" ");
+        sb.Append(path);
+        sb.Append(" HTTP/1.1\r\n");
+        sb.Append("Host: ");
+        sb.Append(host);
+        sb.Append("\r\n");
+        if (body.Length > 0) {
+            sb.Append("Content-Length: ");
+            sb.Append(Convert.ToString(body.Length));
+            sb.Append("\r\n");
+            sb.Append("Content-Type: application/x-www-form-urlencoded\r\n");
+        }
+        sb.Append("Connection: keep-alive\r\n");
+        sb.Append("\r\n");
+        if (body.Length > 0) {
+            sb.Append(body);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Builds a GET request.</summary>
+    static string BuildGet(string path, string host) {
+        return Build("GET", path, host, "");
+    }
+
+    /// <summary>Builds a POST request.</summary>
+    static string BuildPost(string path, string host, string body) {
+        return Build("POST", path, host, body);
+    }
+}

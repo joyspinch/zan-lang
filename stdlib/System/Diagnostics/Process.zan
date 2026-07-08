@@ -1,0 +1,103 @@
+using System;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// Cross-platform process launcher with output capture.
+/// Uses _popen/_pclose on Windows, popen/pclose on Linux.
+/// </summary>
+class Process {
+    #if WINDOWS
+    [DllImport("msvcrt", EntryPoint = "_popen")]
+    static extern int plat_popen(string cmd, string mode);
+
+    [DllImport("msvcrt", EntryPoint = "_pclose")]
+    static extern int plat_pclose(int fp);
+    #elif LINUX
+    [DllImport("libc", EntryPoint = "popen")]
+    static extern int plat_popen(string cmd, string mode);
+
+    [DllImport("libc", EntryPoint = "pclose")]
+    static extern int plat_pclose(int fp);
+    #endif
+
+    [DllImport("crt")]
+    static extern int fread(string buf, int size, int count, int fp);
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    [DllImport("crt")]
+    static extern int system(string cmd);
+
+    /// <summary>Opens a process pipe.</summary>
+    static int PipeOpen(string cmd, string mode) {
+        return plat_popen(cmd, mode);
+    }
+
+    /// <summary>Closes a process pipe.</summary>
+    static int PipeClose(int fp) {
+        return plat_pclose(fp);
+    }
+
+    /// <summary>Runs a command and captures stdout+stderr as lines.</summary>
+    static List<string> RunCapture(string cmd) {
+        List<string> lines = new List<string>();
+        string full = "(" + cmd + ") 2>&1";
+        int fp = PipeOpen(full, "r");
+        if (fp == 0) {
+            lines.Add("[error] failed to launch: " + cmd);
+            return lines;
+        }
+        StringBuilder sb = new StringBuilder();
+        bool reading = true;
+        while (reading) {
+            string buf = calloc(4097, 1);
+            int n = fread(buf, 1, 4096, fp);
+            if (n <= 0) {
+                reading = false;
+            } else {
+                sb.Append(buf);
+            }
+        }
+        PipeClose(fp);
+        return SplitLines(sb.ToString());
+    }
+
+    /// <summary>Runs a command and captures output (wrapper).</summary>
+    static List<string> RunCaptureAsync(string cmd) {
+        List<string> result = RunCapture(cmd);
+        return result;
+    }
+
+    /// <summary>Runs a command and returns the exit code.</summary>
+    static int Run(string cmd) {
+        return system(cmd);
+    }
+
+    /// <summary>Splits text on newlines.</summary>
+    static List<string> SplitLines(string text) {
+        List<string> lines = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int len = text.Length;
+        while (i < len) {
+            string ch = text.Substring(i, 1);
+            if (ch == "\n") {
+                lines.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else if (ch != "\r") {
+                sb.Append(ch);
+            }
+            i = i + 1;
+        }
+        string last = sb.ToString();
+        if (last.Length > 0) {
+            lines.Add(last);
+        }
+        return lines;
+    }
+}

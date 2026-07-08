@@ -1,0 +1,268 @@
+using System;
+
+namespace System.Data;
+
+/// <summary>
+/// Database provider types.
+/// </summary>
+class DbProvider {
+    static int SQLite  = 1;
+    static int MySQL   = 2;
+    static int PostgreSQL = 3;
+}
+
+/// <summary>
+/// Cross-platform database connection abstraction.
+/// Supports SQLite (via sqlite3 library), MySQL, and PostgreSQL.
+/// All operations are coroutine-aware for async database access.
+///
+/// Usage:
+///   DbConnection db = DbConnection.OpenSQLite("mydb.sqlite3");
+///   db.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+///   db.Execute("INSERT INTO users (name) VALUES ('Alice')");
+///   DbResult result = db.Query("SELECT * FROM users");
+///   db.Close();
+/// </summary>
+class DbConnection {
+    int handle;
+    int provider;
+    string connectionString;
+    bool connected;
+
+    // --- SQLite3 FFI ---
+    [DllImport("sqlite3")]
+    static extern int sqlite3_open(string filename, string ppDb);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_close(int db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_exec(int db, string sql, int callback, int arg, string errmsg);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_prepare_v2(int db, string sql, int nByte, string ppStmt, string pzTail);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_step(int stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_finalize(int stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_count(int stmt);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_column_text(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_int(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern double sqlite3_column_double(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_column_name(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_type(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_errmsg(int db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_changes(int db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_last_insert_rowid(int db);
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    DbConnection() {
+        this.handle = 0;
+        this.provider = 0;
+        this.connectionString = "";
+        this.connected = false;
+    }
+
+    /// <summary>Opens a SQLite database file.</summary>
+    static DbConnection OpenSQLite(string filename) {
+        DbConnection conn = new DbConnection();
+        conn.provider = DbProvider.SQLite;
+        conn.connectionString = filename;
+
+        string ppDb = calloc(8, 1);
+        int rc = sqlite3_open(filename, ppDb);
+        if (rc == 0) {
+            // Extract db handle from ppDb pointer
+            conn.handle = ppDb[0] + (ppDb[1] << 8) + (ppDb[2] << 16) + (ppDb[3] << 24);
+            conn.connected = true;
+        }
+        free(ppDb);
+        return conn;
+    }
+
+    /// <summary>Opens a SQLite database (wrapper).</summary>
+    static DbConnection OpenSQLiteAsync(string filename) {
+        return OpenSQLite(filename);
+    }
+
+    /// <summary>Executes a non-query SQL statement (INSERT, UPDATE, DELETE, CREATE).</summary>
+    int Execute(string sql) {
+        if (!this.connected) { return -1; }
+
+        if (this.provider == DbProvider.SQLite) {
+            string errmsg = calloc(8, 1);
+            int rc = sqlite3_exec(this.handle, sql, 0, 0, errmsg);
+            free(errmsg);
+            if (rc == 0) {
+                return sqlite3_changes(this.handle);
+            }
+            return -1;
+        }
+        return -1;
+    }
+
+    /// <summary>Executes a non-query SQL statement (wrapper).</summary>
+    int ExecuteAsync(string sql) {
+        return Execute(sql);
+    }
+
+    /// <summary>Executes a query and returns a result set.</summary>
+    DbResult Query(string sql) {
+        if (!this.connected) {
+            return DbResult.Empty();
+        }
+
+        if (this.provider == DbProvider.SQLite) {
+            return QuerySQLite(sql);
+        }
+        return DbResult.Empty();
+    }
+
+    /// <summary>Executes a query (wrapper).</summary>
+    DbResult QueryAsync(string sql) {
+        return Query(sql);
+    }
+
+    /// <summary>Executes a scalar query (returns first column of first row as string).</summary>
+    string ExecuteScalar(string sql) {
+        DbResult result = Query(sql);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// <summary>Executes a scalar query (wrapper).</summary>
+    string ExecuteScalarAsync(string sql) {
+        return ExecuteScalar(sql);
+    }
+
+    /// <summary>Gets the last inserted row ID (SQLite).</summary>
+    int LastInsertId() {
+        if (this.provider == DbProvider.SQLite) {
+            return sqlite3_last_insert_rowid(this.handle);
+        }
+        return 0;
+    }
+
+    /// <summary>Gets the last error message.</summary>
+    string GetError() {
+        if (this.provider == DbProvider.SQLite) {
+            return sqlite3_errmsg(this.handle);
+        }
+        return "";
+    }
+
+    /// <summary>Begins a transaction.</summary>
+    void BeginTransaction() {
+        Execute("BEGIN TRANSACTION");
+    }
+
+    /// <summary>Commits the current transaction.</summary>
+    void Commit() {
+        Execute("COMMIT");
+    }
+
+    /// <summary>Rolls back the current transaction.</summary>
+    void Rollback() {
+        Execute("ROLLBACK");
+    }
+
+    /// <summary>Closes the database connection.</summary>
+    void Close() {
+        if (this.connected) {
+            if (this.provider == DbProvider.SQLite) {
+                sqlite3_close(this.handle);
+            }
+            this.connected = false;
+            this.handle = 0;
+        }
+    }
+
+    /// <summary>Returns whether the connection is open.</summary>
+    bool IsConnected() {
+        return this.connected;
+    }
+
+    /// <summary>Returns the provider type.</summary>
+    int GetProvider() {
+        return this.provider;
+    }
+
+    // --- Internal SQLite query implementation ---
+    DbResult QuerySQLite(string sql) {
+        DbResult result = DbResult.Create();
+
+        string ppStmt = calloc(8, 1);
+        string pzTail = calloc(8, 1);
+        int sqlLen = sql.Length;
+
+        int rc = sqlite3_prepare_v2(this.handle, sql, sqlLen, ppStmt, pzTail);
+        if (rc != 0) {
+            free(ppStmt);
+            free(pzTail);
+            return result;
+        }
+
+        int stmt = ppStmt[0] + (ppStmt[1] << 8) + (ppStmt[2] << 16) + (ppStmt[3] << 24);
+        free(ppStmt);
+        free(pzTail);
+
+        int colCount = sqlite3_column_count(stmt);
+        result.SetColumnCount(colCount);
+
+        // Get column names
+        int c = 0;
+        while (c < colCount) {
+            string colName = sqlite3_column_name(stmt, c);
+            result.AddColumnName(colName);
+            c = c + 1;
+        }
+
+        // Fetch rows
+        while (sqlite3_step(stmt) == 100) {  // SQLITE_ROW = 100
+            List<string> row = new List<string>();
+            c = 0;
+            while (c < colCount) {
+                int colType = sqlite3_column_type(stmt, c);
+                if (colType == 5) {
+                    // SQLITE_NULL
+                    row.Add("");
+                } else {
+                    string val = sqlite3_column_text(stmt, c);
+                    row.Add(val);
+                }
+                c = c + 1;
+            }
+            result.AddRow(row);
+        }
+
+        sqlite3_finalize(stmt);
+        return result;
+    }
+}

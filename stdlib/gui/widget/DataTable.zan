@@ -1,0 +1,2022 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// A column descriptor for DataTable.
+/// cellType: 0 text, 1 link, 2 tag, 3 progress, 4 badge
+/// align:    0 left, 1 center, 2 right
+class DataColumn {
+    string title;
+    int width;
+    int cellType;
+    int align;
+    bool sortable;
+    bool filterable;
+    int tagType;
+    bool numeric;
+    int summary;   // total-row aggregate: 0 none,1 sum,2 avg,3 min,4 max,5 count
+
+    // ---- conditional formatting ----
+    int cfMode;    // 0 none,1 data bar,2 color scale,3 highlight >,4 highlight <
+    int cfColor;   // data-bar / low-end / highlight accent color
+    int cfColor2;  // color-scale high-end color
+    int cfThreshold; // highlight comparison value
+
+    static DataColumn Create(string title, int width) {
+        DataColumn col = new DataColumn();
+        col.title = title;
+        col.width = width;
+        col.cellType = 0;
+        col.align = 0;
+        col.sortable = true;
+        col.filterable = true;
+        col.tagType = 1;
+        col.numeric = false;
+        col.summary = 0;
+        col.cfMode = 0;
+        col.cfColor = 0;
+        col.cfColor2 = 0;
+        col.cfThreshold = 0;
+        return col;
+    }
+
+    // ---- conditional-format configurators (static so they compose without
+    // relying on instance-method chaining) ----
+    static DataColumn DataBar(DataColumn c, int color) {
+        c.cfMode = 1; c.cfColor = color; return c;
+    }
+    static DataColumn ColorScale(DataColumn c, int lowColor, int highColor) {
+        c.cfMode = 2; c.cfColor = lowColor; c.cfColor2 = highColor; return c;
+    }
+    static DataColumn HighlightGreater(DataColumn c, int threshold, int color) {
+        c.cfMode = 3; c.cfThreshold = threshold; c.cfColor = color; return c;
+    }
+    static DataColumn HighlightLess(DataColumn c, int threshold, int color) {
+        c.cfMode = 4; c.cfThreshold = threshold; c.cfColor = color; return c;
+    }
+
+    static DataColumn Text(string title, int width) {
+        return DataColumn.Create(title, width);
+    }
+
+    static DataColumn Numeric(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.numeric = true;
+        c.align = 2;
+        return c;
+    }
+
+    static DataColumn Link(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 1;
+        return c;
+    }
+
+    static DataColumn TagCol(string title, int width, int tagType) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 2;
+        c.tagType = tagType;
+        c.align = 1;
+        return c;
+    }
+
+    static DataColumn ProgressCol(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 3;
+        c.numeric = true;
+        return c;
+    }
+
+    static DataColumn BadgeCol(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 4;
+        c.align = 1;
+        return c;
+    }
+}
+
+/// One row of string cells. Build with Create() then Push() per column.
+class DataRow {
+    List<string> cells;
+
+    static DataRow Create() {
+        DataRow r = new DataRow();
+        r.cells = new List<string>();
+        return r;
+    }
+
+    void Push(string v) {
+        cells.Add(v);
+    }
+
+    string At(int i) {
+        if (i < 0) { return ""; }
+        if (i >= cells.Count) { return ""; }
+        return cells[i];
+    }
+}
+
+/// Per-column filter with three cooperating stages (all optional):
+///  1. set filter   \u2014 values present in `hidden` are removed (Values tab);
+///  2. text filter  \u2014 `textMode` (1 contains / 2 equals / 3 starts / 4 ends)
+///     tested against `textQuery` (Text Filters tab);
+///  3. batch filter \u2014 each entry in `batchTerms` is matched (exact or
+///     substring per `batchExact`); `batchKeep` keeps matches, else excludes.
+class ColFilter {
+    List<string> hidden;
+    int textMode;
+    string textQuery;
+    List<string> batchTerms;
+    bool batchExact;
+    bool batchKeep;
+
+    static ColFilter Create() {
+        ColFilter f = new ColFilter();
+        f.hidden = new List<string>();
+        f.textMode = 1;
+        f.textQuery = "";
+        f.batchTerms = new List<string>();
+        f.batchExact = false;
+        f.batchKeep = true;
+        return f;
+    }
+
+    bool IsHidden(string v) {
+        return hidden.Contains(v);
+    }
+
+    void Toggle(string v) {
+        int idx = hidden.IndexOf(v);
+        if (idx >= 0) {
+            hidden.RemoveAt(idx);
+        } else {
+            hidden.Add(v);
+        }
+    }
+
+    bool Active() {
+        if (hidden.Count > 0) { return true; }
+        if (textQuery.Length > 0) { return true; }
+        if (batchTerms.Count > 0) { return true; }
+        return false;
+    }
+}
+
+/// Persisted DataTable state — create once (outside the frame loop) and pass in
+/// every frame so selection / sort / filter / scroll survive across repaints.
+class DataTableState {
+    bool inited;
+    int sortCol;
+    int sortDir;
+    List<bool> selected;
+    List<int> colWidths;
+    List<int> dispW;
+    List<int> order;
+    List<ColFilter> filters;
+    int openMenu;
+    int scrollRow;
+    int resizeCol;
+    int resizeStartX;
+    int resizeStartW;
+    bool dirty;
+
+    int filterTab;
+    string searchText;
+    int valScroll;
+    int editFocus;
+    List<string> batchLines;
+    int batchExactFlag;
+    List<string> menuVals;
+    List<string> menuMatched;
+    string menuSearchCache;
+
+    bool showRowNum;
+    bool showSelect;
+    bool striped;
+
+    // ---- summary (total) row ----
+    bool showSummary;
+    List<int> aggMode;         // per column: 0 none,1 sum,2 avg,3 min,4 max,5 count
+    List<string> summaryText;  // cached formatted aggregate per column
+
+    // ---- conditional formatting: per-column min/max over the filtered set,
+    // cached so data-bar / color-scale cells normalise without a per-frame scan ----
+    List<int> cfMin;
+    List<int> cfMax;
+
+    // ---- pagination ----
+    bool paged;
+    SignalInt pageModel;       // 1-based current page, bound to the Pagination widget
+    int pageRows;              // rows per page (auto-fit), recomputed each frame
+
+    // ---- selection & interaction ----
+    int selAnchor;             // order-index anchor for shift range row-select (-1 none)
+    int rangeR0;               // cell-range start row (order-index, -1 = no range)
+    int rangeC0;               // cell-range start column
+    int rangeR1;               // cell-range end row (order-index)
+    int rangeC1;               // cell-range end column
+    bool rangeDrag;            // currently drag-selecting a cell range
+    int dragRow;               // order-index position of row being drag-reordered (-1 none)
+    int dragStartY;            // pointer Y where a row press began
+    bool dragMoved;            // pointer moved enough to become a reorder drag
+    bool ctxOpen;              // right-click context menu open
+    int ctxX;                  // context-menu anchor X
+    int ctxY;                  // context-menu anchor Y
+    string toast;              // transient status message (copy/export feedback)
+    int toastFrames;           // frames remaining to show the toast
+
+    static DataTableState Create() {
+        DataTableState s = new DataTableState();
+        s.inited = false;
+        s.sortCol = -1;
+        s.sortDir = 1;
+        s.selected = new List<bool>();
+        s.colWidths = new List<int>();
+        s.dispW = new List<int>();
+        s.order = new List<int>();
+        s.filters = new List<ColFilter>();
+        s.openMenu = -1;
+        s.scrollRow = 0;
+        s.resizeCol = -1;
+        s.resizeStartX = 0;
+        s.resizeStartW = 0;
+        s.dirty = true;
+        s.filterTab = 0;
+        s.searchText = "";
+        s.valScroll = 0;
+        s.editFocus = 0;
+        s.batchLines = new List<string>();
+        s.batchLines.Add("");
+        s.batchExactFlag = 0;
+        s.menuVals = new List<string>();
+        s.menuMatched = new List<string>();
+        s.menuSearchCache = "";
+        s.showRowNum = true;
+        s.showSelect = true;
+        s.striped = true;
+        s.showSummary = false;
+        s.aggMode = new List<int>();
+        s.summaryText = new List<string>();
+        s.cfMin = new List<int>();
+        s.cfMax = new List<int>();
+        s.paged = false;
+        s.pageModel = SignalInt.Create(1);
+        s.pageRows = 0;
+        s.selAnchor = -1;
+        s.rangeR0 = -1;
+        s.rangeC0 = -1;
+        s.rangeR1 = -1;
+        s.rangeC1 = -1;
+        s.rangeDrag = false;
+        s.dragRow = -1;
+        s.dragStartY = 0;
+        s.dragMoved = false;
+        s.ctxOpen = false;
+        s.ctxX = 0;
+        s.ctxY = 0;
+        s.toast = "";
+        s.toastFrames = 0;
+        return s;
+    }
+}
+
+/// Enterprise-style data grid: fixed row-number & selection columns, sortable
+/// headers, Excel-style set-filter header menus, resizable columns, custom cell
+/// renderers (text/link/tag/progress/badge) and virtualised rows (only the
+/// visible window is drawn, so tens of thousands of rows stay smooth).
+class DataTable {
+    // ---------- small helpers ----------
+
+    static int CompareStr(string a, string b) {
+        int la = a.Length;
+        int lb = b.Length;
+        int n = la;
+        if (lb < n) { n = lb; }
+        int i = 0;
+        while (i < n) {
+            char cha = a[i];
+            char chb = b[i];
+            int ca = (int)cha;
+            int cb = (int)chb;
+            if (ca < cb) { return -1; }
+            if (ca > cb) { return 1; }
+            i = i + 1;
+        }
+        if (la < lb) { return -1; }
+        if (la > lb) { return 1; }
+        return 0;
+    }
+
+    static bool IsIntStr(string s) {
+        int n = s.Length;
+        if (n == 0) { return false; }
+        int i = 0;
+        while (i < n) {
+            char ch = s[i];
+            int c = (int)ch;
+            bool neg = (i == 0 && c == 45);
+            if (!neg) {
+                if (c < 48 || c > 57) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static int ParseInt(string s) {
+        int n = s.Length;
+        if (n == 0) { return 0; }
+        int i = 0;
+        bool neg = false;
+        char c0 = s[0];
+        if ((int)c0 == 45) { neg = true; i = 1; }
+        int v = 0;
+        while (i < n) {
+            char ch = s[i];
+            int c = (int)ch;
+            if (c < 48 || c > 57) { i = n; } else {
+                v = v * 10 + (c - 48);
+                i = i + 1;
+            }
+        }
+        if (neg) { return 0 - v; }
+        return v;
+    }
+
+    // ---- case-insensitive string matching for the text/batch filters ----
+
+    static int FoldC(int cc) {
+        if (cc >= 65 && cc <= 90) { return cc + 32; }
+        return cc;
+    }
+
+    static bool MatchAt(string hay, string needle, int off) {
+        int j = 0;
+        while (j < needle.Length) {
+            char ch = hay[off + j];
+            char cn = needle[j];
+            if (DataTable.FoldC((int)ch) != DataTable.FoldC((int)cn)) { return false; }
+            j = j + 1;
+        }
+        return true;
+    }
+
+    static bool EqCI(string a, string b) {
+        if (a.Length != b.Length) { return false; }
+        return DataTable.MatchAt(a, b, 0);
+    }
+
+    static bool ContainsCI(string hay, string needle) {
+        int nl = needle.Length;
+        int hl = hay.Length;
+        if (nl == 0) { return true; }
+        if (nl > hl) { return false; }
+        int i = 0;
+        while (i <= hl - nl) {
+            if (DataTable.MatchAt(hay, needle, i)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static bool StartsCI(string hay, string needle) {
+        if (needle.Length > hay.Length) { return false; }
+        return DataTable.MatchAt(hay, needle, 0);
+    }
+
+    static bool EndsCI(string hay, string needle) {
+        int nl = needle.Length;
+        int hl = hay.Length;
+        if (nl > hl) { return false; }
+        return DataTable.MatchAt(hay, needle, hl - nl);
+    }
+
+    static bool TextMatch(string v, string q, int mode) {
+        if (q.Length == 0) { return true; }
+        if (mode == 2) { return DataTable.EqCI(v, q); }
+        if (mode == 3) { return DataTable.StartsCI(v, q); }
+        if (mode == 4) { return DataTable.EndsCI(v, q); }
+        return DataTable.ContainsCI(v, q);
+    }
+
+    // Build a one-character string from an ASCII code (printable range only).
+    static string CharStr(int code) {
+        if (code < 32 || code > 126) { return ""; }
+        string tbl = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+        return tbl.Substring(code - 32, 1);
+    }
+
+    static string Backspace(string s) {
+        if (s.Length <= 1) { return ""; }
+        return s.Substring(0, s.Length - 1);
+    }
+
+    // Whether a single cell value survives every stage of the column filter.
+    static bool CellPasses(ColFilter f, string v) {
+        if (f.hidden.Contains(v)) { return false; }
+        if (f.textQuery.Length > 0) {
+            if (!DataTable.TextMatch(v, f.textQuery, f.textMode)) { return false; }
+        }
+        if (f.batchTerms.Count > 0) {
+            bool matched = false;
+            int i = 0;
+            while (i < f.batchTerms.Count) {
+                bool hit = false;
+                if (f.batchExact) { hit = DataTable.EqCI(v, f.batchTerms[i]); }
+                else { hit = DataTable.ContainsCI(v, f.batchTerms[i]); }
+                if (hit) { matched = true; i = f.batchTerms.Count; }
+                else { i = i + 1; }
+            }
+            if (f.batchKeep) {
+                if (!matched) { return false; }
+            } else {
+                if (matched) { return false; }
+            }
+        }
+        return true;
+    }
+
+    static int CompareCell(string a, string b, bool numeric) {
+        if (numeric) {
+            int va = ParseInt(a);
+            int vb = ParseInt(b);
+            if (va < vb) { return -1; }
+            if (va > vb) { return 1; }
+            return 0;
+        }
+        return DataTable.CompareStr(a, b);
+    }
+
+    static string Truncate(string text, int fontSize, int maxW) {
+        if (maxW <= 0) { return ""; }
+        if (Canvas.MeasureText(text, fontSize) <= maxW) { return text; }
+        int n = text.Length;
+        int k = n;
+        while (k > 0) {
+            string cand = text.Substring(0, k);
+            string withDots = cand + "…";
+            if (Canvas.MeasureText(withDots, fontSize) <= maxW) {
+                return withDots;
+            }
+            k = k - 1;
+        }
+        return "…";
+    }
+
+    static int TypeColor(Theme t, int type) {
+        if (type == 1) { return t.primary; }
+        if (type == 2) { return t.info; }
+        if (type == 3) { return t.success; }
+        if (type == 4) { return t.warning; }
+        if (type == 5) { return t.error; }
+        return t.textSecondary;
+    }
+
+    // ---------- state maintenance ----------
+
+    static void EnsureInit(DataTableState st, List<DataColumn> cols, List<DataRow> rows) {
+        if (!st.inited) {
+            int i = 0;
+            while (i < cols.Count) {
+                st.colWidths.Add(cols[i].width);
+                st.filters.Add(ColFilter.Create());
+                st.aggMode.Add(cols[i].summary);
+                st.summaryText.Add("");
+                i = i + 1;
+            }
+            i = 0;
+            while (i < rows.Count) {
+                st.selected.Add(false);
+                i = i + 1;
+            }
+            st.inited = true;
+            st.dirty = true;
+        }
+        while (st.selected.Count < rows.Count) { st.selected.Add(false); }
+    }
+
+    static bool RowPasses(DataTableState st, List<DataColumn> cols, DataRow row) {
+        int i = 0;
+        while (i < cols.Count) {
+            ColFilter f = st.filters[i];
+            if (f.Active()) {
+                if (!DataTable.CellPasses(f, row.At(i))) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static void Recompute(DataTableState st, List<DataColumn> cols, List<DataRow> rows) {
+        if (!st.dirty) { return; }
+        st.order.Clear();
+        int i = 0;
+        while (i < rows.Count) {
+            if (DataTable.RowPasses(st, cols, rows[i])) { st.order.Add(i); }
+            i = i + 1;
+        }
+        if (st.sortCol >= 0 && st.sortCol < cols.Count) {
+            DataTable.SortOrder(st, cols, rows);
+        }
+        if (st.showSummary) { DataTable.ComputeSummary(st, cols, rows); }
+        DataTable.ComputeColStats(st, cols, rows);
+        int maxScroll = st.order.Count - 1;
+        if (st.scrollRow > maxScroll) { st.scrollRow = maxScroll; }
+        if (st.scrollRow < 0) { st.scrollRow = 0; }
+        st.dirty = false;
+    }
+
+    // Per-column aggregate over the current filtered set (st.order), cached as
+    // formatted strings so the summary row costs nothing to redraw per frame.
+    static void ComputeSummary(DataTableState st, List<DataColumn> cols, List<DataRow> rows) {
+        while (st.aggMode.Count < cols.Count) { st.aggMode.Add(0); }
+        st.summaryText.Clear();
+        int n = st.order.Count;
+        int col = 0;
+        while (col < cols.Count) {
+            int mode = st.aggMode[col];
+            string txt = "";
+            if (mode == 5) { txt = "n " + Convert.ToString(n); }
+            else if (mode != 0) {
+                int sum = 0;
+                int mn = 0;
+                int mx = 0;
+                int k = 0;
+                while (k < n) {
+                    int v = DataTable.ParseInt(rows[st.order[k]].At(col));
+                    if (k == 0) { mn = v; mx = v; }
+                    else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
+                    sum = sum + v;
+                    k = k + 1;
+                }
+                if (mode == 1) { txt = "Σ " + Convert.ToString(sum); }
+                else if (mode == 2) { int avg = 0; if (n > 0) { avg = sum / n; } txt = "avg " + Convert.ToString(avg); }
+                else if (mode == 3) { txt = "min " + Convert.ToString(mn); }
+                else if (mode == 4) { txt = "max " + Convert.ToString(mx); }
+            }
+            st.summaryText.Add(txt);
+            col = col + 1;
+        }
+    }
+
+    // Per-column min/max over the filtered set, for data-bar & color-scale
+    // normalisation. Only columns with cfMode 1 or 2 are scanned.
+    static void ComputeColStats(DataTableState st, List<DataColumn> cols, List<DataRow> rows) {
+        st.cfMin.Clear();
+        st.cfMax.Clear();
+        int n = st.order.Count;
+        int col = 0;
+        while (col < cols.Count) {
+            int mn = 0;
+            int mx = 0;
+            if (cols[col].cfMode == 1 || cols[col].cfMode == 2) {
+                int k = 0;
+                while (k < n) {
+                    int v = DataTable.ParseInt(rows[st.order[k]].At(col));
+                    if (k == 0) { mn = v; mx = v; }
+                    else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
+                    k = k + 1;
+                }
+            }
+            st.cfMin.Add(mn);
+            st.cfMax.Add(mx);
+            col = col + 1;
+        }
+    }
+
+    // ---- color helpers for conditional formatting ----
+    // Opaque 0xFFRRGGBB packed as a positive int.
+    static int Rgb(int r, int g, int b) {
+        return 4278190080 + r * 65536 + g * 256 + b;
+    }
+    // Same RGB with a custom alpha (for translucent cell tints / data bars).
+    static int ColorAlpha(int packed, int a) {
+        int rgb = packed % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        return rgb + a * 16777216;
+    }
+    // Linear blend of two opaque packed colors: (1-num/den)*c0 + (num/den)*c1.
+    static int LerpColor(int c0, int c1, int num, int den) {
+        if (den <= 0) { return c0; }
+        if (num < 0) { num = 0; }
+        if (num > den) { num = den; }
+        int r0 = (c0 / 65536) % 256;
+        int g0 = (c0 / 256) % 256;
+        int b0 = c0 % 256;
+        int r1 = (c1 / 65536) % 256;
+        int g1 = (c1 / 256) % 256;
+        int b1 = c1 % 256;
+        int r = r0 + (r1 - r0) * num / den;
+        int g = g0 + (g1 - g0) * num / den;
+        int b = b0 + (b1 - b0) * num / den;
+        return DataTable.Rgb(r, g, b);
+    }
+
+    // ---- O(n log n) merge sort of row indices by the active sort column ----
+    // The previous selection sort was O(n^2) and locked up on large datasets;
+    // this bottom-up merge sort keeps sorting 100k+ rows responsive.
+
+    static void MergeOrder(List<DataRow> rows, int sortCol, bool numeric, int dir,
+                           List<int> src, int lo, int mid, int hi, List<int> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            int cmp = DataTable.CompareCell(rows[src[i]].At(sortCol), rows[src[j]].At(sortCol), numeric);
+            if (dir == 2) { cmp = 0 - cmp; }
+            if (cmp <= 0) { tmp[k] = src[i]; i = i + 1; }
+            else { tmp[k] = src[j]; j = j + 1; }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = src[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = src[j]; j = j + 1; k = k + 1; }
+        k = lo;
+        while (k < hi) { src[k] = tmp[k]; k = k + 1; }
+    }
+
+    static void SortOrder(DataTableState st, List<DataColumn> cols, List<DataRow> rows) {
+        int n = st.order.Count;
+        if (n < 2) { return; }
+        bool numeric = cols[st.sortCol].numeric;
+        int dir = st.sortDir;
+        int sc = st.sortCol;
+        List<int> tmp = new List<int>();
+        int p = 0;
+        while (p < n) { tmp.Add(0); p = p + 1; }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeOrder(rows, sc, numeric, dir, st.order, lo, mid, hi, tmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    // ---- O(n log n) merge sort of a string list (used for Distinct) ----
+
+    static void MergeStr(List<string> src, int lo, int mid, int hi, List<string> tmp) {
+        int i = lo;
+        int j = mid;
+        int k = lo;
+        while (i < mid && j < hi) {
+            if (DataTable.CompareStr(src[i], src[j]) <= 0) { tmp[k] = src[i]; i = i + 1; }
+            else { tmp[k] = src[j]; j = j + 1; }
+            k = k + 1;
+        }
+        while (i < mid) { tmp[k] = src[i]; i = i + 1; k = k + 1; }
+        while (j < hi) { tmp[k] = src[j]; j = j + 1; k = k + 1; }
+        k = lo;
+        while (k < hi) { src[k] = tmp[k]; k = k + 1; }
+    }
+
+    static void SortStr(List<string> a) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        List<string> tmp = new List<string>();
+        int p = 0;
+        while (p < n) { tmp.Add(""); p = p + 1; }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeStr(a, lo, mid, hi, tmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    // Sorted distinct values of a column, computed by sorting all cell values
+    // (O(n log n)) and collapsing adjacent duplicates (O(n)). The previous
+    // implementation rescanned the result list per row — O(n^2) — which hung
+    // on high-cardinality columns once the dataset grew large.
+    static List<string> Distinct(List<DataRow> rows, int col) {
+        List<string> vals = new List<string>();
+        int i = 0;
+        while (i < rows.Count) { vals.Add(rows[i].At(col)); i = i + 1; }
+        DataTable.SortStr(vals);
+        List<string> res = new List<string>();
+        int j = 0;
+        while (j < vals.Count) {
+            if (j == 0 || DataTable.CompareStr(vals[j], vals[j - 1]) != 0) { res.Add(vals[j]); }
+            j = j + 1;
+        }
+        return res;
+    }
+
+    // ---------- selection / clipboard / export helpers ----------
+
+    static int MinI(int a, int b) { if (a < b) { return a; } return b; }
+    static int MaxI(int a, int b) { if (a > b) { return a; } return b; }
+
+    static bool HasRange(DataTableState st) {
+        return st.rangeR0 >= 0 && st.rangeC0 >= 0;
+    }
+
+    // Escape one CSV field (quote when it holds a comma, quote or newline).
+    static string CsvField(string v) {
+        bool needsQuote = false;
+        int i = 0;
+        while (i < v.Length) {
+            char ch = v[i];
+            int cc = (int)ch;
+            if (cc == 44 || cc == 34 || cc == 10 || cc == 13) { needsQuote = true; i = v.Length; }
+            else { i = i + 1; }
+        }
+        if (!needsQuote) { return v; }
+        // Double any embedded quotes, copying runs with Substring so non-ASCII
+        // characters survive intact (no char-by-char reconstruction).
+        string body = "";
+        int start = 0;
+        int k = 0;
+        while (k < v.Length) {
+            if ((int)v[k] == 34) {
+                body = body + v.Substring(start, k - start + 1) + "\"";
+                start = k + 1;
+            }
+            k = k + 1;
+        }
+        body = body + v.Substring(start, v.Length - start);
+        return "\"" + body + "\"";
+    }
+
+    // Build a tab-separated (clipboard) or comma-separated (CSV) block for the
+    // active cell range if any, otherwise for the checkbox-selected rows, else
+    // the whole (filtered/sorted) view. `csv` picks the delimiter + escaping;
+    // `withHeader` prepends the column titles.
+    static string BuildText(DataTableState st, List<DataColumn> cols, List<DataRow> rows, bool csv, bool withHeader) {
+        string sep = "\t";
+        if (csv) { sep = ","; }
+        string nl = "\r\n";
+        string outp = "";
+
+        int c0 = 0;
+        int c1 = cols.Count - 1;
+        bool rangeMode = DataTable.HasRange(st);
+        if (rangeMode) {
+            c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+            c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        }
+
+        if (withHeader) {
+            string line = "";
+            int cc = c0;
+            while (cc <= c1) {
+                string h = cols[cc].title;
+                if (csv) { h = DataTable.CsvField(h); }
+                if (cc > c0) { line = line + sep; }
+                line = line + h;
+                cc = cc + 1;
+            }
+            outp = line + nl;
+        }
+
+        if (rangeMode) {
+            int r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+            int r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            int rr = r0;
+            while (rr <= r1) {
+                if (rr >= 0 && rr < st.order.Count) {
+                    DataRow row = rows[st.order[rr]];
+                    string line = "";
+                    int cc = c0;
+                    while (cc <= c1) {
+                        string v = row.At(cc);
+                        if (csv) { v = DataTable.CsvField(v); }
+                        if (cc > c0) { line = line + sep; }
+                        line = line + v;
+                        cc = cc + 1;
+                    }
+                    outp = outp + line + nl;
+                }
+                rr = rr + 1;
+            }
+            return outp;
+        }
+
+        // else: selected rows, or the whole view when nothing is checked
+        bool anySel = false;
+        int s = 0;
+        while (s < st.order.Count) { if (st.selected[st.order[s]]) { anySel = true; s = st.order.Count; } else { s = s + 1; } }
+        int oi = 0;
+        while (oi < st.order.Count) {
+            int ri = st.order[oi];
+            if (!anySel || st.selected[ri]) {
+                DataRow row = rows[ri];
+                string line = "";
+                int cc = c0;
+                while (cc <= c1) {
+                    string v = row.At(cc);
+                    if (csv) { v = DataTable.CsvField(v); }
+                    if (cc > c0) { line = line + sep; }
+                    line = line + v;
+                    cc = cc + 1;
+                }
+                outp = outp + line + nl;
+            }
+            oi = oi + 1;
+        }
+        return outp;
+    }
+
+    static void SelectAllRows(DataTableState st, bool val) {
+        int k = 0;
+        while (k < st.order.Count) { st.selected[st.order[k]] = val; k = k + 1; }
+    }
+
+    static void ClearRange(DataTableState st) {
+        st.rangeR0 = -1;
+        st.rangeC0 = -1;
+        st.rangeR1 = -1;
+        st.rangeC1 = -1;
+    }
+
+    // Move the row occupying order-position `from` so it lands at order-position
+    // `to`, shifting the rest — the manual drag-reorder of the visible order.
+    static void MoveOrder(DataTableState st, int from, int to) {
+        if (from < 0 || from >= st.order.Count) { return; }
+        if (to < 0) { to = 0; }
+        if (to >= st.order.Count) { to = st.order.Count - 1; }
+        if (from == to) { return; }
+        int v = st.order[from];
+        st.order.RemoveAt(from);
+        st.order.Insert(to, v);
+    }
+
+    // ---------- cell rendering ----------
+
+    static void DrawCell(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, int cfLo, int cfHi) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeMedium;
+        int pad = t.paddingSmall;
+        int innerW = cw - pad * 2;
+
+        // ---- conditional formatting (plain text/numeric cells only) ----
+        int cfText = t.textPrimary;
+        if (col.cfMode != 0 && col.cellType == 0) {
+            int v = DataTable.ParseInt(val);
+            if (col.cfMode == 1) {
+                // data bar proportional to value across the column's min..max
+                int span = cfHi - cfLo;
+                if (span <= 0) { span = 1; }
+                int frac = (v - cfLo) * 100 / span;
+                if (frac < 0) { frac = 0; }
+                if (frac > 100) { frac = 100; }
+                int barH = rowH - app.Scale(8);
+                int barY = cy + app.Scale(4);
+                int barW = frac * innerW / 100;
+                int tint = DataTable.ColorAlpha(col.cfColor, 95);
+                int rad = app.Scale(2);
+                if (barW > 0) {
+                    // Clean flat data bar with a slight corner radius; fall back to
+                    // a plain rect when the bar is too short to round without the
+                    // straight-segment math underflowing.
+                    if (barW < rad * 2) { c.FillRect(cx + pad, barY, barW, barH, tint); }
+                    else { c.FillRoundRect(cx + pad, barY, barW, barH, rad, tint); }
+                }
+                string sb = DataTable.Truncate(val, fs, innerW);
+                int twb = Canvas.MeasureText(sb, fs);
+                int tyb = cy + (rowH - Canvas.FontHeight(fs)) / 2;
+                c.DrawText(cx + cw - pad - twb, tyb, sb, t.textPrimary, fs);
+                return;
+            } else if (col.cfMode == 2) {
+                c.FillRect(cx, cy, cw, rowH, DataTable.LerpColor(col.cfColor, col.cfColor2, v - cfLo, cfHi - cfLo));
+            } else if (col.cfMode == 3 && v > col.cfThreshold) {
+                c.FillRect(cx, cy, cw, rowH, DataTable.ColorAlpha(col.cfColor, 38));
+                cfText = col.cfColor;
+            } else if (col.cfMode == 4 && v < col.cfThreshold) {
+                c.FillRect(cx, cy, cw, rowH, DataTable.ColorAlpha(col.cfColor, 38));
+                cfText = col.cfColor;
+            }
+        }
+
+        if (col.cellType == 3) {
+            int pct = DataTable.ParseInt(val);
+            if (pct < 0) { pct = 0; }
+            if (pct > 100) { pct = 100; }
+            int barH = app.Scale(6);
+            int barY = cy + (rowH - barH) / 2;
+            int barW = innerW - app.Scale(40);
+            if (barW < app.Scale(20)) { barW = app.Scale(20); }
+            c.FillRoundRect(cx + pad, barY, barW, barH, barH / 2, t.bgTertiary);
+            int fillW = pct * barW / 100;
+            int barColor = t.primary;
+            if (pct >= 100) { barColor = t.success; }
+            c.FillRoundRect(cx + pad, barY, fillW, barH, barH / 2, barColor);
+            int txtY = cy + (rowH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+            c.DrawText(cx + pad + barW + app.Scale(6), txtY, Convert.ToString(pct) + "%", t.textSecondary, t.fontSizeSmall);
+            return;
+        }
+
+        if (col.cellType == 2) {
+            int tc = DataTable.TypeColor(t, col.tagType);
+            int tagH = t.heightSmall;
+            int tagY = cy + (rowH - tagH) / 2;
+            string label = DataTable.Truncate(val, t.fontSizeSmall, innerW - pad * 2);
+            int tagW = Canvas.MeasureText(label, t.fontSizeSmall) + pad * 2;
+            int tagX = cx + pad;
+            if (col.align == 1) { tagX = cx + (cw - tagW) / 2; }
+            c.FillRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, t.bgSecondary);
+            c.DrawRect(tagX, tagY, tagW, tagH, tc, 1);
+            int txtY = tagY + (tagH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+            c.DrawText(tagX + pad, txtY, label, tc, t.fontSizeSmall);
+            return;
+        }
+
+        if (col.cellType == 4) {
+            int dotR = app.Scale(4);
+            int dotColor = t.success;
+            if (val == "0" || val == "" || val == "Offline" || val == "Idle" || val == "Inactive" || val == "Closed") { dotColor = t.textTertiary; }
+            int cxc = cx + pad + dotR;
+            if (col.align == 1) { cxc = cx + cw / 2 - Canvas.MeasureText(val, fs) / 2 - dotR - app.Scale(4); }
+            c.FillCircle(cxc, cy + rowH / 2, dotR, dotColor);
+            int txtY = cy + (rowH - Canvas.FontHeight(fs)) / 2;
+            c.DrawText(cxc + dotR + app.Scale(4), txtY, val, t.textPrimary, fs);
+            return;
+        }
+
+        int color = cfText;
+        if (col.cellType == 1) { color = t.primary; }
+        string shown = DataTable.Truncate(val, fs, innerW);
+        int tw = Canvas.MeasureText(shown, fs);
+        int tx = cx + pad;
+        if (col.align == 1) { tx = cx + (cw - tw) / 2; }
+        if (col.align == 2) { tx = cx + cw - pad - tw; }
+        int ty = cy + (rowH - Canvas.FontHeight(fs)) / 2;
+        c.DrawText(tx, ty, shown, color, fs);
+    }
+
+    // ---------- main render ----------
+
+    static void Render(App app, int x, int y, int viewW, int viewH,
+                       List<DataColumn> cols, List<DataRow> rows, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        DataTable.EnsureInit(st, cols, rows);
+        DataTable.Recompute(st, cols, rows);
+
+        int headerH = t.heightMedium;
+        int rowH = t.heightMedium;
+        int fs = t.fontSizeMedium;
+
+        int numW = 0;
+        if (st.showRowNum) { numW = app.Scale(46); }
+        int selW = 0;
+        if (st.showSelect) { selW = app.Scale(40); }
+
+        int gridColor = t.divider;
+        int menuIconW = app.Scale(22);
+
+        // Right edge that content may not spill past (leaves room for the
+        // vertical scrollbar). Columns whose right side would exceed this are
+        // clamped, and any column starting beyond it is skipped — so cells and
+        // headers never draw outside the table's own border.
+        int sbGutter = app.Scale(12);
+        int clipRight = x + viewW - sbGutter;
+
+        // total data width
+        int dataW = 0;
+        int ci = 0;
+        while (ci < st.colWidths.Count) { dataW = dataW + st.colWidths[ci]; ci = ci + 1; }
+        int totalW = numW + selW + dataW;
+
+        // Fit-to-width: when the columns' natural total exceeds the available
+        // band, shrink every column proportionally so the whole grid always
+        // stays inside [x, clipRight] — no column or cell ever spills past the
+        // table's own border. Manual resize edits the *base* widths; the
+        // displayed widths are re-derived from them each frame.
+        int availData = clipRight - (x + numW + selW);
+        if (availData < app.Scale(80)) { availData = app.Scale(80); }
+        st.dispW.Clear();
+        int di = 0;
+        if (dataW > availData && dataW > 0) {
+            while (di < st.colWidths.Count) {
+                st.dispW.Add(st.colWidths[di] * availData / dataW);
+                di = di + 1;
+            }
+        } else {
+            while (di < st.colWidths.Count) {
+                st.dispW.Add(st.colWidths[di]);
+                di = di + 1;
+            }
+        }
+
+        // outer border
+        c.FillRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, viewW, viewH, t.borderPrimary, 1);
+
+        // ---------------- header ----------------
+        c.FillRect(x, y, viewW, headerH, t.bgSecondary);
+        int hx = x;
+
+        if (st.showRowNum) {
+            c.DrawTextCentered(hx, y, numW, headerH, "#", t.textTertiary, t.fontSizeSmall);
+            hx = hx + numW;
+            c.FillRect(hx, y, 1, headerH, gridColor);
+        }
+        if (st.showSelect) {
+            // select-all checkbox
+            int allId = app.focus.AllocId();
+            bool allChecked = st.order.Count > 0;
+            int oi = 0;
+            while (oi < st.order.Count) {
+                if (!st.selected[st.order[oi]]) { allChecked = false; oi = st.order.Count; } else { oi = oi + 1; }
+            }
+            int box = app.Scale(16);
+            int bx = hx + (selW - box) / 2;
+            int by = y + (headerH - box) / 2;
+            if (allChecked) {
+                c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
+                int ins = app.Scale(3);
+                Icon.Draw(c, "check", bx + ins, by + ins, box - ins * 2, t.textInverse);
+            } else {
+                c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
+                c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+            }
+            app.hitTester.Register(HitRegion.Create(allId, hx, y, selW, headerH, 0));
+            if (app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
+                bool target = !allChecked;
+                int k = 0;
+                while (k < st.order.Count) { st.selected[st.order[k]] = target; k = k + 1; }
+                app.RequestRedraw();
+            }
+            hx = hx + selW;
+            c.FillRect(hx, y, 1, headerH, gridColor);
+        }
+
+        int i = 0;
+        while (i < cols.Count) {
+            DataColumn col = cols[i];
+            int cw = st.dispW[i];
+            int drawW = cw;
+            if (hx + drawW > clipRight) { drawW = clipRight - hx; }
+            if (drawW < app.Scale(8)) { break; }
+            bool lastCol = drawW < cw;
+            int titleId = app.focus.AllocId();
+            bool hHover = app.focus.IsHovered(titleId);
+            if (hHover) { c.FillRect(hx, y, drawW, headerH, t.bgHover); }
+
+            int pad = t.paddingSmall;
+            int availTitle = drawW - pad * 2 - menuIconW;
+            string ht = DataTable.Truncate(col.title, fs, availTitle);
+            int ty = y + (headerH - Canvas.FontHeight(fs)) / 2;
+            c.DrawText(hx + pad, ty, ht, t.textSecondary, fs);
+
+            // sort indicator
+            if (st.sortCol == i) {
+                string arrow = "arrow-up";
+                if (st.sortDir == 2) { arrow = "arrow-down"; }
+                int aw = app.Scale(12);
+                Icon.Draw(c, arrow, hx + pad + Canvas.MeasureText(ht, fs) + app.Scale(4),
+                          y + (headerH - aw) / 2, aw, t.primary);
+            }
+
+            // header menu icon — DevExpress-style: only revealed when the mouse
+            // is over the header cell, when this column has an active filter, or
+            // while its menu is open. `menuId` is always allocated so widget ids
+            // stay stable across frames regardless of the icon's visibility.
+            if (col.filterable || col.sortable) {
+                int menuId = app.focus.AllocId();
+                int mIx = hx + drawW - menuIconW - app.Scale(2);
+                bool active = st.filters[i].Active();
+                bool cellHover = app.mouseX >= hx && app.mouseX < hx + drawW
+                                 && app.mouseY >= y && app.mouseY < y + headerH;
+                bool showIcon = active || cellHover || st.openMenu == i;
+                if (showIcon) {
+                    int mColor = t.textTertiary;
+                    if (active) { mColor = t.primary; }
+                    if (app.focus.IsHovered(menuId)) { mColor = t.textPrimary; }
+                    Icon.DrawCenteredIn(c, "filter", mIx, y, menuIconW, headerH, app.Scale(13), mColor);
+                    app.hitTester.Register(HitRegion.Create(menuId, mIx, y, menuIconW, headerH, 0));
+                    if (app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId) {
+                        if (st.openMenu == i) { st.openMenu = -1; } else {
+                            st.openMenu = i;
+                            st.filterTab = 0;
+                            st.searchText = "";
+                            st.valScroll = 0;
+                            st.editFocus = 0;
+                            st.batchLines = new List<string>();
+                            st.batchLines.Add("");
+                            st.batchExactFlag = 0;
+                            st.menuVals = DataTable.Distinct(rows, i);
+                            st.menuMatched = st.menuVals;
+                            st.menuSearchCache = "";
+                        }
+                        app.RequestRedraw();
+                    }
+                }
+            }
+
+            // title click => cycle sort
+            app.hitTester.Register(HitRegion.Create(titleId, hx, y, drawW - menuIconW, headerH, 0));
+            if (col.sortable && app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == titleId) {
+                if (st.sortCol != i) { st.sortCol = i; st.sortDir = 1; }
+                else if (st.sortDir == 1) { st.sortDir = 2; }
+                else { st.sortCol = -1; st.sortDir = 1; }
+                st.dirty = true;
+                app.RequestRedraw();
+            }
+
+            // resize handle (right border)
+            int rzId = app.focus.AllocId();
+            int rzW = app.Scale(6);
+            int rzX = hx + drawW - rzW / 2;
+            app.hitTester.Register(HitRegion.Create(rzId, rzX, y, rzW, headerH, 0));
+            if (app.window.EventKind() == 2 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == rzId) {
+                st.resizeCol = i;
+                st.resizeStartX = app.mouseX;
+                st.resizeStartW = st.colWidths[i];
+            }
+            if (st.resizeCol == i && app.focus.pressedId == rzId) {
+                int nw = st.resizeStartW + (app.mouseX - st.resizeStartX);
+                if (nw < app.Scale(48)) { nw = app.Scale(48); }
+                st.colWidths[i] = nw;
+                app.RequestRedraw();
+            }
+
+            hx = hx + drawW;
+            c.FillRect(hx, y, 1, headerH, gridColor);
+            if (lastCol) { break; }
+            i = i + 1;
+        }
+        c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
+
+        // ---------------- body (virtualised) ----------------
+        int total = st.order.Count;
+        int summaryH = 0;
+        if (st.showSummary) { summaryH = rowH; }
+        int pagerH = 0;
+        if (st.paged) { pagerH = app.Scale(38); }
+
+        int bodyTop = y + headerH;
+        int bodyH = viewH - headerH - summaryH - pagerH;
+        if (bodyH < rowH) { bodyH = rowH; }
+        int visRows = bodyH / rowH;
+        if (visRows < 1) { visRows = 1; }
+
+        // In paged mode the visible window is a whole page; otherwise it is the
+        // virtual-scroll offset.
+        int start = 0;
+        if (st.paged) {
+            st.pageRows = visRows;
+            int totalPages = 1;
+            if (total > 0) { totalPages = (total + visRows - 1) / visRows; }
+            int cur = st.pageModel.Get();
+            if (cur > totalPages) { cur = totalPages; st.pageModel.Set(cur); }
+            if (cur < 1) { cur = 1; st.pageModel.Set(cur); }
+            start = (cur - 1) * visRows;
+        } else {
+            start = st.scrollRow;
+            if (start > total - visRows) { start = total - visRows; }
+            if (start < 0) { start = 0; }
+            st.scrollRow = start;
+        }
+
+        // Normalised cell-range bounds (order-index rows + column indices) for
+        // highlighting the drag-selected rectangle behind the cells.
+        bool hasRange = DataTable.HasRange(st);
+        int rgR0 = 0;
+        int rgR1 = -1;
+        int rgC0 = 0;
+        int rgC1 = -1;
+        if (hasRange) {
+            rgR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+            rgR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            rgC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+            rgC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        }
+
+        int r = 0;
+        while (r < visRows && (start + r) < total) {
+            int oiRow = start + r;
+            int rowIdx = st.order[oiRow];
+            DataRow row = rows[rowIdx];
+            int ry = bodyTop + r * rowH;
+            bool rowInRange = hasRange && oiRow >= rgR0 && oiRow <= rgR1;
+
+            int rowId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(rowId, x, ry, viewW, rowH, 0));
+            bool rHover = app.focus.IsHovered(rowId);
+            bool rSel = st.selected[rowIdx];
+
+            int rowBg = t.bgPrimary;
+            if (st.striped && ((start + r) % 2 == 1)) { rowBg = t.bgSecondary; }
+            if (rSel) { rowBg = t.bgActive; }
+            if (rHover) { rowBg = t.bgHover; }
+            c.FillRect(x + 1, ry, viewW - 2, rowH, rowBg);
+
+            int cx2 = x;
+            if (st.showRowNum) {
+                // Sequential display position (1,2,3…) in the current sorted/
+                // filtered view — NOT the original data index, so the row-number
+                // column stays ordered instead of jumping around when the user
+                // sorts or filters.
+                c.DrawTextCentered(cx2, ry, numW, rowH, Convert.ToString(start + r + 1), t.textTertiary, t.fontSizeSmall);
+                cx2 = cx2 + numW;
+            }
+            if (st.showSelect) {
+                int box = app.Scale(16);
+                int bx = cx2 + (selW - box) / 2;
+                int by = ry + (rowH - box) / 2;
+                if (rSel) {
+                    c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
+                    int ins = app.Scale(3);
+                    Icon.Draw(c, "check", bx + ins, by + ins, box - ins * 2, t.textInverse);
+                } else {
+                    c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
+                    c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+                }
+                int selId = app.focus.AllocId();
+                app.hitTester.Register(HitRegion.Create(selId, cx2, ry, selW, rowH, 0));
+                if (app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == selId) {
+                    st.selected[rowIdx] = !rSel;
+                    app.RequestRedraw();
+                }
+                cx2 = cx2 + selW;
+            }
+
+            int cc = 0;
+            while (cc < cols.Count) {
+                int cw = st.dispW[cc];
+                int cdrawW = cw;
+                if (cx2 + cdrawW > clipRight) { cdrawW = clipRight - cx2; }
+                if (cdrawW < app.Scale(8)) { break; }
+                if (rowInRange && cc >= rgC0 && cc <= rgC1) {
+                    c.FillRect(cx2, ry, cdrawW, rowH, t.bgActive);
+                }
+                int cfLo = 0;
+                int cfHi = 0;
+                if (cc < st.cfMin.Count) { cfLo = st.cfMin[cc]; cfHi = st.cfMax[cc]; }
+                DataTable.DrawCell(app, cols[cc], row.At(cc), cx2, ry, cdrawW, rowH, cfLo, cfHi);
+                cx2 = cx2 + cdrawW;
+                if (cdrawW < cw) { break; }
+                cc = cc + 1;
+            }
+
+            c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+            r = r + 1;
+        }
+
+        // ---------------- row-drag drop indicator ----------------
+        if (st.dragRow >= 0 && st.dragMoved) {
+            int dropRow = (app.mouseY - bodyTop) / rowH;
+            if (dropRow < 0) { dropRow = 0; }
+            if (dropRow > visRows) { dropRow = visRows; }
+            int dy = bodyTop + dropRow * rowH;
+            if (dy < bodyTop) { dy = bodyTop; }
+            if (dy > bodyTop + bodyH) { dy = bodyTop + bodyH; }
+            c.FillRect(x + 1, dy - 1, viewW - 2, app.Scale(2), t.primary);
+        }
+
+        // ---------------- body pointer interaction ----------------
+        // Map the pointer to an order-position row and a data column purely from
+        // geometry (works for range-extend / reorder even outside hit regions).
+        int firstDataX = x + numW + selW;
+        int ptrOi = -1;
+        if (app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH && app.mouseX >= x && app.mouseX < clipRight) {
+            int rr2 = (app.mouseY - bodyTop) / rowH;
+            if (rr2 >= 0 && rr2 < visRows && (start + rr2) < total) { ptrOi = start + rr2; }
+        }
+        int ptrCol = -1;
+        if (ptrOi >= 0 && app.mouseX >= firstDataX) {
+            int colL = firstDataX;
+            int cci = 0;
+            while (cci < cols.Count) {
+                int cwv = st.dispW[cci];
+                if (app.mouseX >= colL && app.mouseX < colL + cwv) { ptrCol = cci; cci = cols.Count; }
+                else { colL = colL + cwv; cci = cci + 1; }
+            }
+        }
+        int ek = app.window.EventKind();
+        int eb = app.window.EventButton();
+        int emods = app.window.EventMods();
+        // While the context menu is open it is modal: swallow body events so a
+        // click on a menu item can't also start a range/selection behind it.
+        // (RenderContextMenu reads the raw event to drive item hits / dismiss.)
+        if (st.ctxOpen) { ek = 0; }
+
+        // left press
+        if (ek == 2 && eb == 0 && ptrOi >= 0) {
+            if (app.mouseX >= x && app.mouseX < x + numW) {
+                // row-number press: could become a row click or a reorder drag
+                st.dragRow = ptrOi;
+                st.dragStartY = app.mouseY;
+                st.dragMoved = false;
+            } else if (app.mouseX >= firstDataX && ptrCol >= 0) {
+                // data cell press: begin a rectangular range selection
+                st.rangeR0 = ptrOi;
+                st.rangeR1 = ptrOi;
+                st.rangeC0 = ptrCol;
+                st.rangeC1 = ptrCol;
+                st.rangeDrag = true;
+                st.selAnchor = ptrOi;
+                app.RequestRedraw();
+            }
+        }
+
+        // drag move
+        if (ek == 1) {
+            if (st.rangeDrag && ptrOi >= 0) {
+                st.rangeR1 = ptrOi;
+                if (ptrCol >= 0) { st.rangeC1 = ptrCol; }
+                app.RequestRedraw();
+            }
+            if (st.dragRow >= 0) {
+                int dd = app.mouseY - st.dragStartY;
+                if (dd < 0) { dd = 0 - dd; }
+                if (dd > rowH / 2) { st.dragMoved = true; app.RequestRedraw(); }
+            }
+        }
+
+        // left release
+        if (ek == 3 && eb == 0) {
+            if (st.rangeDrag) { st.rangeDrag = false; app.RequestRedraw(); }
+            if (st.dragRow >= 0) {
+                if (st.dragMoved && ptrOi >= 0 && ptrOi != st.dragRow) {
+                    DataTable.MoveOrder(st, st.dragRow, ptrOi);
+                    st.sortCol = -1;   // manual order — drop any active sort
+                    app.RequestRedraw();
+                } else if (!st.dragMoved) {
+                    // treat as a row-selection click (按行选择)
+                    int ri = st.order[st.dragRow];
+                    bool shift = (emods & 2) != 0;
+                    bool ctrl = (emods & 1) != 0;
+                    if (shift && st.selAnchor >= 0) {
+                        DataTable.SelectAllRows(st, false);
+                        int a = DataTable.MinI(st.selAnchor, st.dragRow);
+                        int b = DataTable.MaxI(st.selAnchor, st.dragRow);
+                        int kk = a;
+                        while (kk <= b) { if (kk >= 0 && kk < st.order.Count) { st.selected[st.order[kk]] = true; } kk = kk + 1; }
+                    } else if (ctrl) {
+                        st.selected[ri] = !st.selected[ri];
+                        st.selAnchor = st.dragRow;
+                    } else {
+                        DataTable.SelectAllRows(st, false);
+                        st.selected[ri] = true;
+                        st.selAnchor = st.dragRow;
+                        DataTable.ClearRange(st);
+                    }
+                    app.RequestRedraw();
+                }
+                st.dragRow = -1;
+                st.dragMoved = false;
+            }
+        }
+
+        // right press => context menu
+        if (ek == 2 && eb == 1 && st.openMenu < 0
+            && app.mouseX >= x && app.mouseX < x + viewW
+            && app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH) {
+            // if right-clicking a row outside any current range/selection, make
+            // that row the selection so the menu's copy/export act on something.
+            if (ptrOi >= 0 && !DataTable.HasRange(st)) {
+                int ri = st.order[ptrOi];
+                if (!st.selected[ri]) {
+                    DataTable.SelectAllRows(st, false);
+                    st.selected[ri] = true;
+                    st.selAnchor = ptrOi;
+                }
+            }
+            st.ctxOpen = true;
+            st.ctxX = app.mouseX;
+            st.ctxY = app.mouseY;
+            app.RequestRedraw();
+        }
+
+        // empty state
+        if (total == 0) {
+            c.DrawTextCentered(x, bodyTop, viewW, bodyH, "No matching rows", t.textTertiary, t.fontSizeMedium);
+        }
+
+        // ---------------- summary (total) row ----------------
+        if (st.showSummary) {
+            int sumY = bodyTop + bodyH;
+            c.FillRect(x + 1, sumY, viewW - 2, summaryH, t.bgSecondary);
+            c.FillRect(x + 1, sumY, viewW - 2, 1, gridColor);
+            int sx = x + numW + selW;
+            if (st.showRowNum || st.showSelect) {
+                c.DrawTextCentered(x, sumY, numW + selW, summaryH, "Σ", t.textTertiary, t.fontSizeSmall);
+            }
+            int sc = 0;
+            while (sc < cols.Count) {
+                int cw = st.dispW[sc];
+                int cdrawW = cw;
+                if (sx + cdrawW > clipRight) { cdrawW = clipRight - sx; }
+                if (cdrawW < app.Scale(8)) { break; }
+                string stxt = "";
+                if (sc < st.summaryText.Count) { stxt = st.summaryText[sc]; }
+                if (stxt.Length > 0) {
+                    int pad = t.paddingSmall;
+                    string shown = DataTable.Truncate(stxt, fs, cdrawW - pad * 2);
+                    int tw = Canvas.MeasureText(shown, fs);
+                    int tx = sx + pad;
+                    if (cols[sc].align == 2) { tx = sx + cdrawW - pad - tw; }
+                    else if (cols[sc].align == 1) { tx = sx + (cdrawW - tw) / 2; }
+                    int ty = sumY + (summaryH - Canvas.FontHeight(fs)) / 2;
+                    c.DrawText(tx, ty, shown, t.textPrimary, fs);
+                }
+                sx = sx + cdrawW;
+                if (cdrawW < cw) { break; }
+                sc = sc + 1;
+            }
+        }
+
+        // ---------------- pager footer (reuses the Pagination widget) ----------------
+        if (st.paged) {
+            int fY = bodyTop + bodyH + summaryH;
+            c.FillRect(x + 1, fY, viewW - 2, pagerH, t.bgSecondary);
+            c.FillRect(x + 1, fY, viewW - 2, 1, gridColor);
+            int totalPages = 1;
+            if (total > 0) { totalPages = (total + visRows - 1) / visRows; }
+            int cur = st.pageModel.Get();
+            int pgW = Pagination.MeasureWidth(app, totalPages, cur);
+            int pgX = x + (viewW - pgW) / 2;
+            if (pgX < x + t.paddingMedium) { pgX = x + t.paddingMedium; }
+            int pgY = fY + (pagerH - t.heightMedium) / 2;
+            int pgFirst = Pagination.Render(app, pgX, pgY, totalPages, st.pageModel);
+            Pagination.HandleClick(app, pgFirst, totalPages, st.pageModel);
+            // range info on the left
+            int from = (cur - 1) * visRows + 1;
+            int to = cur * visRows;
+            if (to > total) { to = total; }
+            if (total == 0) { from = 0; }
+            string info = Convert.ToString(from) + "-" + Convert.ToString(to) + " / " + Convert.ToString(total);
+            c.DrawText(x + t.paddingMedium, pgY + (t.heightMedium - Canvas.FontHeight(t.fontSizeSmall)) / 2, info, t.textTertiary, t.fontSizeSmall);
+        }
+
+        // ---------------- vertical scrollbar ----------------
+        if (!st.paged && total > visRows && visRows > 0) {
+            int sbW = app.Scale(8);
+            int sbX = x + viewW - sbW - app.Scale(2);
+            int trackY = bodyTop + app.Scale(2);
+            int trackH = bodyH - app.Scale(4);
+            int thumbH = trackH * visRows / total;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            int maxStart = total - visRows;
+            int thumbY = trackY;
+            if (maxStart > 0) { thumbY = trackY + (trackH - thumbH) * start / maxStart; }
+
+            int sbId = app.focus.AllocId();
+            bool sbHover = app.focus.IsHovered(sbId);
+            int thumbColor = t.scrollbar;
+            if (sbHover || app.focus.pressedId == sbId) { thumbColor = t.scrollbarHover; }
+            c.FillRoundRect(sbX, thumbY, sbW, thumbH, sbW / 2, thumbColor);
+            app.hitTester.Register(HitRegion.Create(sbId, sbX, trackY, sbW, trackH, 0));
+            if (app.focus.pressedId == sbId && maxStart > 0) {
+                int rel = app.mouseY - trackY - thumbH / 2;
+                int denom = trackH - thumbH;
+                if (denom < 1) { denom = 1; }
+                int ns = rel * maxStart / denom;
+                if (ns < 0) { ns = 0; }
+                if (ns > maxStart) { ns = maxStart; }
+                if (ns != st.scrollRow) { st.scrollRow = ns; app.RequestRedraw(); }
+            }
+        }
+
+        // ---------------- mouse-wheel scrolls the table body ----------------
+        // Claim the wheel while the pointer is over the body so the surrounding
+        // page doesn't scroll instead, then advance the virtual row window.
+        if (visRows > 0) {
+            app.CaptureWheel(x, bodyTop, viewW, bodyH);
+        }
+        if (st.openMenu < 0 && app.window.EventKind() == 13) {
+            bool overBody = app.mouseX >= x && app.mouseX < x + viewW
+                            && app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH;
+            if (overBody && total > visRows) {
+                int delta = app.window.EventKeyCode();
+                int step = delta / 120;
+                if (step == 0) { if (delta > 0) { step = 1; } else if (delta < 0) { step = 0 - 1; } }
+                if (st.paged) {
+                    // wheel flips whole pages
+                    int totalPages = (total + visRows - 1) / visRows;
+                    int cp = st.pageModel.Get();
+                    int np = cp - step;
+                    if (np < 1) { np = 1; }
+                    if (np > totalPages) { np = totalPages; }
+                    if (np != cp) { st.pageModel.Set(np); app.RequestRedraw(); }
+                } else {
+                    int ns = st.scrollRow - step * 3;
+                    int maxStart = total - visRows;
+                    if (ns < 0) { ns = 0; }
+                    if (ns > maxStart) { ns = maxStart; }
+                    if (ns != st.scrollRow) { st.scrollRow = ns; app.RequestRedraw(); }
+                }
+            }
+        }
+
+        // ---------------- header set-filter menu (overlay, drawn last) ----------------
+        if (st.openMenu >= 0 && st.openMenu < cols.Count) {
+            DataTable.RenderMenu(app, x, y, viewW, headerH, numW, selW, cols, rows, st);
+        }
+
+        // ---------------- right-click context menu (overlay) ----------------
+        if (st.ctxOpen) {
+            DataTable.RenderContextMenu(app, x, y, viewW, viewH, cols, rows, st);
+        }
+
+        // ---------------- transient toast (copy/export feedback) ----------------
+        if (st.toastFrames > 0 && st.toast.Length > 0) {
+            int tfs = t.fontSizeSmall;
+            int tw = Canvas.MeasureText(st.toast, tfs) + app.Scale(24);
+            int th = t.heightMedium;
+            int tx = x + (viewW - tw) / 2;
+            int tyy = y + viewH - th - app.Scale(12);
+            c.FillRoundRect(tx, tyy, tw, th, t.borderRadiusMedium, t.textPrimary);
+            c.DrawTextCentered(tx, tyy, tw, th, st.toast, t.bgPrimary, tfs);
+            st.toastFrames = st.toastFrames - 1;
+            if (st.toastFrames > 0) { app.RequestRedraw(); }
+        }
+    }
+
+    // ---------- right-click context menu ----------
+
+    static void CtxItem(App app, int mx, int my, int mw, int ih, string label, string accel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        bool hov = app.focus.IsHovered(id);
+        if (hov) { c.FillRect(mx, my, mw, ih, t.bgHover); }
+        c.DrawText(mx + app.Scale(12), my + (ih - Canvas.FontHeight(t.fontSizeSmall)) / 2, label, t.textPrimary, t.fontSizeSmall);
+        if (accel.Length > 0) {
+            int aw = Canvas.MeasureText(accel, t.fontSizeSmall);
+            c.DrawText(mx + mw - aw - app.Scale(12), my + (ih - Canvas.FontHeight(t.fontSizeSmall)) / 2, accel, t.textTertiary, t.fontSizeSmall);
+        }
+        app.hitTester.Register(HitRegion.Create(id, mx, my, mw, ih, 0));
+    }
+
+    static bool CtxHit(App app, int mx, int my, int mw, int ih) {
+        // Was the row spanning (mx,my,mw,ih) just clicked? Uses geometry so the
+        // ids stay simple; the menu is modal-ish (drawn last, wins hit-testing).
+        return app.window.EventKind() == 3 && app.window.EventButton() == 0
+               && app.mouseX >= mx && app.mouseX < mx + mw
+               && app.mouseY >= my && app.mouseY < my + ih;
+    }
+
+    static void Flash(DataTableState st, string msg) {
+        st.toast = msg;
+        st.toastFrames = 90;
+    }
+
+    static void RenderContextMenu(App app, int x, int y, int viewW, int viewH,
+                                  List<DataColumn> cols, List<DataRow> rows, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int mw = app.Scale(230);
+        int ih = t.heightMedium;
+        int sepH = app.Scale(9);
+
+        // menu items: label, accelerator, kind (0 item, 1 separator)
+        // 0 copy, 1 copy-with-headers, 2 export csv, sep, 3 select all, 4 clear
+        int nItems = 5;
+        int mh = ih * nItems + sepH * 2 + app.Scale(8);
+
+        int mx = st.ctxX;
+        int my = st.ctxY;
+        if (mx + mw > x + viewW) { mx = x + viewW - mw - app.Scale(2); }
+        if (my + mh > y + viewH) { my = y + viewH - mh - app.Scale(2); }
+        if (mx < x) { mx = x; }
+        if (my < y) { my = y; }
+
+        c.FillRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(mx, my, mw, mh, t.borderPrimary, 1);
+
+        int iy = my + app.Scale(4);
+        DataTable.CtxItem(app, mx, iy, mw, ih, "复制  Copy", "Ctrl+C");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            Clipboard.SetText(DataTable.BuildText(st, cols, rows, false, false));
+            DataTable.Flash(st, "已复制到剪贴板");
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "复制（含表头）", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            Clipboard.SetText(DataTable.BuildText(st, cols, rows, false, true));
+            DataTable.Flash(st, "已复制（含表头）");
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "导出 CSV", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            bool ok = SysFile.Write("datatable_export.csv", DataTable.BuildText(st, cols, rows, true, true));
+            if (ok) { DataTable.Flash(st, "已导出 datatable_export.csv"); }
+            else { DataTable.Flash(st, "导出失败"); }
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+        iy = iy + sepH;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "全选", "Ctrl+A");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.SelectAllRows(st, true);
+            DataTable.ClearRange(st);
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
+        iy = iy + sepH;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "清除选择", "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            DataTable.SelectAllRows(st, false);
+            DataTable.ClearRange(st);
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+
+        // click outside closes the menu
+        if (app.window.EventKind() == 3
+            && !(app.mouseX >= mx && app.mouseX < mx + mw && app.mouseY >= my && app.mouseY < my + mh)) {
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    // ---------- tabbed filter popup (DevExpress-style) ----------
+
+    static bool TabBtn(App app, int bx, int by, int bw, int bh, string label, bool active) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        bool hov = app.focus.IsHovered(id);
+        if (active) { c.FillRect(bx, by, bw, bh, t.bgActive); }
+        else if (hov) { c.FillRect(bx, by, bw, bh, t.bgHover); }
+        int fg = t.textSecondary;
+        if (active) { fg = t.primary; }
+        c.DrawTextCentered(bx, by, bw, bh, label, fg, t.fontSizeSmall);
+        if (active) { c.FillRect(bx, by + bh - app.Scale(2), bw, app.Scale(2), t.primary); }
+        app.hitTester.Register(HitRegion.Create(id, bx, by, bw, bh, 0));
+        return app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+    }
+
+    static bool IconBtn(App app, int bx, int by, int bw, int bh, string icon, bool active) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        bool hov = app.focus.IsHovered(id);
+        int col = t.textSecondary;
+        if (active) { c.FillRoundRect(bx, by, bw, bh, t.borderRadiusSmall, t.bgActive); col = t.primary; }
+        else if (hov) { c.FillRoundRect(bx, by, bw, bh, t.borderRadiusSmall, t.bgHover); }
+        Icon.DrawCenteredIn(c, icon, bx, by, bw, bh, app.Scale(13), col);
+        app.hitTester.Register(HitRegion.Create(id, bx, by, bw, bh, 0));
+        return app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+    }
+
+    static bool TextBtn(App app, int bx, int by, int bw, int bh, string label, bool primary) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        bool hov = app.focus.IsHovered(id);
+        int bg = t.bgSecondary;
+        int fg = t.textPrimary;
+        if (primary) { bg = t.primary; fg = t.textInverse; }
+        else if (hov) { bg = t.bgHover; }
+        c.FillRoundRect(bx, by, bw, bh, t.borderRadiusSmall, bg);
+        if (!primary) { c.DrawRect(bx, by, bw, bh, t.borderPrimary, 1); }
+        c.DrawTextCentered(bx, by, bw, bh, label, fg, t.fontSizeSmall);
+        app.hitTester.Register(HitRegion.Create(id, bx, by, bw, bh, 0));
+        return app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+    }
+
+    static void EditBox(App app, int bx, int by, int bw, int bh, string text, string ph, bool focused) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int bc = t.borderPrimary;
+        if (focused) { bc = t.borderFocus; }
+        c.FillRoundRect(bx, by, bw, bh, t.borderRadiusSmall, t.bgPrimary);
+        c.DrawRect(bx, by, bw, bh, bc, 1);
+        int tpad = app.Scale(6);
+        int ty = by + (bh - Canvas.FontHeight(fs)) / 2;
+        string shown = DataTable.Truncate(text, fs, bw - tpad * 2);
+        if (text.Length == 0) {
+            c.DrawText(bx + tpad, ty, ph, t.textTertiary, fs);
+        } else {
+            c.DrawText(bx + tpad, ty, shown, t.textPrimary, fs);
+        }
+        if (focused) {
+            int cxp = bx + tpad + Canvas.MeasureText(shown, fs);
+            if (cxp > bx + bw - tpad) { cxp = bx + bw - tpad; }
+            c.FillRect(cxp, ty, app.Scale(1), Canvas.FontHeight(fs), t.primary);
+        }
+    }
+
+    static void RenderMenu(App app, int x, int y, int viewW, int headerH, int numW, int selW,
+                           List<DataColumn> cols, List<DataRow> rows, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int mi = st.openMenu;
+        ColFilter f = st.filters[mi];
+
+        int pad = app.Scale(10);
+        int fs = t.fontSizeSmall;
+        int fsM = t.fontSizeMedium;
+        int rowH = app.Scale(28);
+        int menuW = app.Scale(256);
+        int menuH = app.Scale(348);
+
+        // anchor under the column, clamp fully inside the window
+        int mx = x + numW + selW;
+        int k = 0;
+        while (k < mi) { mx = mx + st.dispW[k]; k = k + 1; }
+        if (mx + menuW > x + viewW) { mx = x + viewW - menuW; }
+        if (mx < x) { mx = x; }
+        int my = y + headerH;
+        int canH = c.Height();
+        if (my + menuH > canH) { my = canH - menuH - app.Scale(6); }
+        if (my < app.titlebarH) { my = app.titlebarH; }
+
+        // claim the wheel over the popup so the page underneath doesn't scroll
+        app.CaptureWheel(mx, my, menuW, menuH);
+
+        // route typed keys to the focused edit field
+        if (app.window.EventKind() == 6 && st.editFocus != 0) {
+            int chv = app.window.EventKeyCode();
+            if (st.editFocus == 1) {
+                if (chv == 8) { st.searchText = DataTable.Backspace(st.searchText); }
+                else { string ad = DataTable.CharStr(chv); if (ad.Length > 0) { st.searchText = st.searchText + ad; } }
+            } else if (st.editFocus == 2) {
+                if (chv == 8) { f.textQuery = DataTable.Backspace(f.textQuery); }
+                else { string ad = DataTable.CharStr(chv); if (ad.Length > 0) { f.textQuery = f.textQuery + ad; } }
+                st.dirty = true;
+            } else if (st.editFocus == 3) {
+                int last = st.batchLines.Count - 1;
+                if (last < 0) { st.batchLines.Add(""); last = 0; }
+                if (chv == 13) { st.batchLines.Add(""); }
+                else if (chv == 8) {
+                    string cur = st.batchLines[last];
+                    if (cur.Length > 0) { st.batchLines[last] = DataTable.Backspace(cur); }
+                    else if (last > 0) { st.batchLines.RemoveAt(last); }
+                } else {
+                    string ad = DataTable.CharStr(chv);
+                    if (ad.Length > 0) { st.batchLines[last] = st.batchLines[last] + ad; }
+                }
+            }
+            app.RequestRedraw();
+        }
+
+        // panel
+        c.FillRoundRect(mx + app.Scale(2), my + app.Scale(3), menuW, menuH, t.borderRadiusMedium, t.overlay);
+        c.FillRoundRect(mx, my, menuW, menuH, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(mx, my, menuW, menuH, t.borderPrimary, 1);
+
+        // header: title + sort asc/desc
+        int hy = my + app.Scale(8);
+        c.DrawText(mx + pad, hy + (rowH - Canvas.FontHeight(fsM)) / 2, cols[mi].title, t.textPrimary, fsM);
+        int sbw = app.Scale(26);
+        int sUpX = mx + menuW - pad - sbw * 2 - app.Scale(4);
+        int sDnX = mx + menuW - pad - sbw;
+        if (DataTable.IconBtn(app, sUpX, hy, sbw, rowH, "arrow-up", st.sortCol == mi && st.sortDir == 1)) {
+            st.sortCol = mi; st.sortDir = 1; st.dirty = true; app.RequestRedraw();
+        }
+        if (DataTable.IconBtn(app, sDnX, hy, sbw, rowH, "arrow-down", st.sortCol == mi && st.sortDir == 2)) {
+            st.sortCol = mi; st.sortDir = 2; st.dirty = true; app.RequestRedraw();
+        }
+        int cy = hy + rowH + app.Scale(6);
+
+        // tabs
+        int tabW = (menuW - pad * 2) / 3;
+        if (DataTable.TabBtn(app, mx + pad, cy, tabW, rowH, "Values", st.filterTab == 0)) { st.filterTab = 0; st.editFocus = 0; app.RequestRedraw(); }
+        if (DataTable.TabBtn(app, mx + pad + tabW, cy, tabW, rowH, "Text", st.filterTab == 1)) { st.filterTab = 1; st.editFocus = 0; app.RequestRedraw(); }
+        if (DataTable.TabBtn(app, mx + pad + tabW * 2, cy, tabW, rowH, "Batch", st.filterTab == 2)) { st.filterTab = 2; st.editFocus = 0; app.RequestRedraw(); }
+        c.FillRect(mx + pad, cy + rowH, menuW - pad * 2, 1, t.divider);
+        cy = cy + rowH + app.Scale(8);
+
+        int footerH = app.Scale(40);
+        int contentBottom = my + menuH - footerH;
+
+        if (st.filterTab == 0) {
+            int boxH = app.Scale(26);
+            DataTable.EditBox(app, mx + pad, cy, menuW - pad * 2, boxH, st.searchText, "Search values...", st.editFocus == 1);
+            int sId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(sId, mx + pad, cy, menuW - pad * 2, boxH, 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == sId) { st.editFocus = 1; app.RequestRedraw(); }
+            cy = cy + boxH + app.Scale(6);
+
+            int itemH = app.Scale(24);
+            int allId = app.focus.AllocId();
+            bool anyHidden = f.hidden.Count > 0;
+            if (app.focus.IsHovered(allId)) { c.FillRect(mx + pad, cy, menuW - pad * 2, itemH, t.bgHover); }
+            DataTable.DrawMiniCheck(app, mx + pad, cy, itemH, !anyHidden);
+            c.DrawText(mx + pad + app.Scale(22), cy + (itemH - Canvas.FontHeight(fs)) / 2, "(Select All)", t.textPrimary, fs);
+            app.hitTester.Register(HitRegion.Create(allId, mx + pad, cy, menuW - pad * 2, itemH, 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
+                f.hidden.Clear();
+                st.dirty = true; app.RequestRedraw();
+            }
+            cy = cy + itemH;
+
+            // Rebuild the filtered value list only when the search text changes
+            // (not every frame): a column can have thousands of distinct values,
+            // so re-scanning + reallocating each frame would stutter. The list
+            // is virtualised — only the visible window is drawn — so it stays
+            // smooth no matter how many distinct values there are.
+            if (!(st.searchText == st.menuSearchCache)) {
+                st.menuMatched = new List<string>();
+                int vi0 = 0;
+                while (vi0 < st.menuVals.Count) {
+                    if (DataTable.ContainsCI(st.menuVals[vi0], st.searchText)) { st.menuMatched.Add(st.menuVals[vi0]); }
+                    vi0 = vi0 + 1;
+                }
+                st.menuSearchCache = st.searchText;
+                st.valScroll = 0;
+            }
+            List<string> matched = st.menuMatched;
+
+            int sbGW = app.Scale(10);
+            int listX = mx + pad;
+            int itemW = menuW - pad * 2 - sbGW;
+            int listH = contentBottom - cy;
+            int visN = listH / itemH;
+            if (visN < 1) { visN = 1; }
+            int maxScroll = matched.Count - visN;
+            if (maxScroll < 0) { maxScroll = 0; }
+            if (st.valScroll > maxScroll) { st.valScroll = maxScroll; }
+            if (st.valScroll < 0) { st.valScroll = 0; }
+
+            int listTop = cy;
+            int r2 = 0;
+            while (r2 < visN && (st.valScroll + r2) < matched.Count) {
+                string v = matched[st.valScroll + r2];
+                int vId = app.focus.AllocId();
+                if (app.focus.IsHovered(vId)) { c.FillRect(listX, cy, itemW, itemH, t.bgHover); }
+                bool visible = !f.IsHidden(v);
+                DataTable.DrawMiniCheck(app, listX, cy, itemH, visible);
+                string label = DataTable.Truncate(v, fs, itemW - app.Scale(26));
+                c.DrawText(listX + app.Scale(22), cy + (itemH - Canvas.FontHeight(fs)) / 2, label, t.textPrimary, fs);
+                app.hitTester.Register(HitRegion.Create(vId, listX, cy, itemW, itemH, 0));
+                if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == vId) {
+                    f.Toggle(v); st.dirty = true; app.RequestRedraw();
+                }
+                cy = cy + itemH;
+                r2 = r2 + 1;
+            }
+
+            // draggable scrollbar for the virtualised value list
+            if (matched.Count > visN) {
+                int trackX = listX + itemW + app.Scale(3);
+                int trackY = listTop;
+                int trackH = visN * itemH;
+                int sbW = app.Scale(6);
+                int thumbH = trackH * visN / matched.Count;
+                if (thumbH < app.Scale(20)) { thumbH = app.Scale(20); }
+                int thumbY = trackY;
+                if (maxScroll > 0) { thumbY = trackY + (trackH - thumbH) * st.valScroll / maxScroll; }
+                int vsbId = app.focus.AllocId();
+                int thumbColor = t.scrollbar;
+                if (app.focus.IsHovered(vsbId) || app.focus.pressedId == vsbId) { thumbColor = t.scrollbarHover; }
+                c.FillRoundRect(trackX, thumbY, sbW, thumbH, sbW / 2, thumbColor);
+                app.hitTester.Register(HitRegion.Create(vsbId, trackX, trackY, sbW, trackH, 0));
+                if (app.focus.pressedId == vsbId && maxScroll > 0) {
+                    int rel = app.mouseY - trackY - thumbH / 2;
+                    int denom = trackH - thumbH;
+                    if (denom < 1) { denom = 1; }
+                    int ns = rel * maxScroll / denom;
+                    if (ns < 0) { ns = 0; }
+                    if (ns > maxScroll) { ns = maxScroll; }
+                    if (ns != st.valScroll) { st.valScroll = ns; app.RequestRedraw(); }
+                }
+            }
+            if (app.window.EventKind() == 13) {
+                bool inside = app.mouseX >= mx && app.mouseX < mx + menuW && app.mouseY >= my && app.mouseY < my + menuH;
+                if (inside) {
+                    int delta = app.window.EventKeyCode();
+                    st.valScroll = st.valScroll - delta / 120;
+                    if (st.valScroll > maxScroll) { st.valScroll = maxScroll; }
+                    if (st.valScroll < 0) { st.valScroll = 0; }
+                    app.RequestRedraw();
+                }
+            }
+        } else if (st.filterTab == 1) {
+            int chipW = (menuW - pad * 2 - app.Scale(9)) / 4;
+            int chipH = app.Scale(24);
+            int gap = app.Scale(3);
+            if (DataTable.TabBtn(app, mx + pad, cy, chipW, chipH, "Contains", f.textMode == 1)) { f.textMode = 1; st.dirty = true; app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap), cy, chipW, chipH, "Equals", f.textMode == 2)) { f.textMode = 2; st.dirty = true; app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 2, cy, chipW, chipH, "Starts", f.textMode == 3)) { f.textMode = 3; st.dirty = true; app.RequestRedraw(); }
+            if (DataTable.TabBtn(app, mx + pad + (chipW + gap) * 3, cy, chipW, chipH, "Ends", f.textMode == 4)) { f.textMode = 4; st.dirty = true; app.RequestRedraw(); }
+            cy = cy + chipH + app.Scale(8);
+
+            int boxH = app.Scale(26);
+            DataTable.EditBox(app, mx + pad, cy, menuW - pad * 2, boxH, f.textQuery, "Enter filter text...", st.editFocus == 2);
+            int qId = app.focus.AllocId();
+            app.hitTester.Register(HitRegion.Create(qId, mx + pad, cy, menuW - pad * 2, boxH, 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == qId) { st.editFocus = 2; app.RequestRedraw(); }
+            cy = cy + boxH + app.Scale(10);
+
+            c.DrawText(mx + pad, cy, "Live-filters as you type", t.textTertiary, fs);
+            cy = cy + Canvas.FontHeight(fs) + app.Scale(2);
+            c.DrawText(mx + pad, cy, "(case-insensitive).", t.textTertiary, fs);
+        } else {
+            c.DrawText(mx + pad, cy, "One condition per line:", t.textSecondary, fs);
+            cy = cy + Canvas.FontHeight(fs) + app.Scale(4);
+            int areaH = contentBottom - cy - app.Scale(66);
+            if (areaH < app.Scale(48)) { areaH = app.Scale(48); }
+            int aId = app.focus.AllocId();
+            int abc = t.borderPrimary;
+            if (st.editFocus == 3) { abc = t.borderFocus; }
+            c.FillRoundRect(mx + pad, cy, menuW - pad * 2, areaH, t.borderRadiusSmall, t.bgPrimary);
+            c.DrawRect(mx + pad, cy, menuW - pad * 2, areaH, abc, 1);
+            app.hitTester.Register(HitRegion.Create(aId, mx + pad, cy, menuW - pad * 2, areaH, 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == aId) { st.editFocus = 3; app.RequestRedraw(); }
+            int lh = Canvas.FontHeight(fs) + app.Scale(3);
+            int li = 0;
+            int ly = cy + app.Scale(4);
+            while (li < st.batchLines.Count && ly + lh < cy + areaH) {
+                string ln = DataTable.Truncate(st.batchLines[li], fs, menuW - pad * 2 - app.Scale(10));
+                c.DrawText(mx + pad + app.Scale(5), ly, ln, t.textPrimary, fs);
+                if (st.editFocus == 3 && li == st.batchLines.Count - 1) {
+                    int cxp = mx + pad + app.Scale(5) + Canvas.MeasureText(ln, fs);
+                    c.FillRect(cxp, ly, app.Scale(1), Canvas.FontHeight(fs), t.primary);
+                }
+                ly = ly + lh;
+                li = li + 1;
+            }
+            cy = cy + areaH + app.Scale(6);
+
+            int exId = app.focus.AllocId();
+            bool exact = st.batchExactFlag == 1;
+            DataTable.DrawMiniCheck(app, mx + pad, cy, app.Scale(22), exact);
+            c.DrawText(mx + pad + app.Scale(22), cy + (app.Scale(22) - Canvas.FontHeight(fs)) / 2, "Exact match", t.textPrimary, fs);
+            app.hitTester.Register(HitRegion.Create(exId, mx + pad, cy, app.Scale(130), app.Scale(22), 0));
+            if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
+                if (st.batchExactFlag == 1) { st.batchExactFlag = 0; } else { st.batchExactFlag = 1; }
+                app.RequestRedraw();
+            }
+            cy = cy + app.Scale(28);
+
+            int bw = (menuW - pad * 2 - app.Scale(6)) / 2;
+            int bh = app.Scale(26);
+            bool keepClick = DataTable.TextBtn(app, mx + pad, cy, bw, bh, "Keep matching", true);
+            bool exclClick = DataTable.TextBtn(app, mx + pad + bw + app.Scale(6), cy, bw, bh, "Exclude", false);
+            if (keepClick || exclClick) {
+                f.batchTerms.Clear();
+                int bl = 0;
+                while (bl < st.batchLines.Count) {
+                    if (st.batchLines[bl].Length > 0) { f.batchTerms.Add(st.batchLines[bl]); }
+                    bl = bl + 1;
+                }
+                f.batchExact = st.batchExactFlag == 1;
+                f.batchKeep = keepClick;
+                st.dirty = true;
+                app.RequestRedraw();
+            }
+        }
+
+        // footer: Clear / Close
+        int fy = my + menuH - footerH + app.Scale(6);
+        int fbw = (menuW - pad * 2 - app.Scale(6)) / 2;
+        int fbh = app.Scale(28);
+        c.FillRect(mx + pad, my + menuH - footerH, menuW - pad * 2, 1, t.divider);
+        bool clearClick = DataTable.TextBtn(app, mx + pad, fy, fbw, fbh, "Clear Filter", false);
+        bool closeClick = DataTable.TextBtn(app, mx + pad + fbw + app.Scale(6), fy, fbw, fbh, "Close", false);
+        if (clearClick) {
+            st.filters[mi] = ColFilter.Create();
+            st.searchText = "";
+            st.batchLines = new List<string>();
+            st.batchLines.Add("");
+            st.batchExactFlag = 0;
+            st.editFocus = 0;
+            st.dirty = true;
+            app.RequestRedraw();
+        }
+        if (closeClick) { st.openMenu = -1; app.RequestRedraw(); }
+
+        // click outside closes the menu (and blurs the edit field)
+        if (app.window.EventKind() == 3) {
+            bool inside = app.mouseX >= mx && app.mouseX < mx + menuW && app.mouseY >= my && app.mouseY < my + menuH;
+            bool onIcon = app.mouseY >= y && app.mouseY < y + headerH;
+            if (!inside && !onIcon) { st.openMenu = -1; app.RequestRedraw(); }
+        }
+    }
+
+    static void DrawMiniCheck(App app, int bx, int cy, int itemH, bool checked) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int box = app.Scale(15);
+        int by = cy + (itemH - box) / 2;
+        if (checked) {
+            c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
+            int ins = app.Scale(3);
+            Icon.Draw(c, "check", bx + ins, by + ins, box - ins * 2, t.textInverse);
+        } else {
+            c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
+            c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+        }
+    }
+}

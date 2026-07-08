@@ -21,6 +21,7 @@ typedef enum {
     SYM_LOCAL,
     SYM_ENUM_MEMBER,
     SYM_TYPE_PARAM,
+    SYM_DELEGATE,
 } zan_sym_kind_t;
 
 /* ---- type representation ---- */
@@ -44,6 +45,7 @@ typedef enum {
     TYPE_ARRAY,
     TYPE_NULLABLE,
     TYPE_TYPE_PARAM,
+    TYPE_DELEGATE,
     TYPE_ERROR,
 } zan_type_kind_t;
 
@@ -53,8 +55,13 @@ struct zan_type {
     zan_istr_t name;
     struct zan_symbol *sym;          /* back-pointer to declaring symbol */
     zan_type_t *element_type;        /* for arrays and nullable */
+    zan_type_t *base_type;           /* base class type (for inheritance) */
     zan_type_t **type_args;          /* for generic instantiation */
     int type_arg_count;
+    /* delegate signature (only for TYPE_DELEGATE) */
+    zan_type_t *delegate_ret_type;
+    zan_type_t **delegate_param_types;
+    int delegate_param_count;
 };
 
 /* ---- symbol table entry ---- */

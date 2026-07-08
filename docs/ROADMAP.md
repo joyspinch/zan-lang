@@ -334,9 +334,105 @@ Self-contained IDE bundled with the compiler (single executable).
   - Source-based packages (git URL + version)
   - Local package cache
 
-- [ ] **M7.6 — Self-hosting**
-  - Rewrite compiler in Zan
-  - Bootstrap verification (gen2 == gen3)
+- [ ] **M7.6 — Self-hosting** *(in progress)*
+
+  **Goal:** a faithful Zan re-implementation of the C compiler (`src/compiler/`),
+  compiling the full language defined in `SPEC.md`, that ultimately compiles its
+  own source. This supersedes the earlier staged `src/self/` demonstration suite
+  (removed): that suite proved growing language expressiveness on fixed inputs but
+  was not a general compiler (per-input logic, hard-coded fixed-size stack buffers,
+  everything modelled as `i64`). The self-hosted compiler is a real, general
+  compiler with heap-backed growable data structures and located diagnostics.
+
+  **Location:** `src/selfhost/`, mirroring the C module layout —
+  `diag / source / token / lexer / ast / parser / binder / checker / irgen /
+  driver / main` (`.zan`).
+
+  **Backend:** emit textual LLVM IR; `clang` lowers it to a native executable
+  (equivalent to the C compiler driving the LLVM C API).
+
+  **Bootstrap subset:** the compiler's own source is written in a general subset
+  (namespaces, classes with methods/fields, `enum`, arrays + a growable `List`,
+  `string`, full control flow incl. `switch`, recursion). This subset is enough
+  to express a compiler and does not require generics/async/exceptions/lambdas;
+  those are still implemented so the compiler *accepts* them per `SPEC.md`.
+
+  **Milestones (by language level, each with acceptance tests):**
+
+  | Level | Scope |
+  |-------|-------|
+  | L0 | scaffold: `driver` reads a file, parses args, emits an (empty) module; CMake + clang link skeleton |
+  | L1 | lexer: full `SPEC.md` token set (keywords, literals, escapes, comments, interpolation) |
+  | L2 | parser + AST: declarations, statements, Pratt expressions |
+  | L3 | binder + checker: symbol table, scopes, type representation, checking/inference |
+  | L4 | IR backend: classes/structs/arrays/methods, minimal ARC, control flow, strings |
+  | L5 | self-host closure: output parity with the C `zanc` on the conformance suite → compiles its own source → **gen2 == gen3** byte-identical |
+
+  **Bootstrap chain:** gen0 = C `zanc` (host) → gen1 = gen0 compiling the Zan
+  compiler → gen2 = gen1 compiling itself → gen3 = gen2 compiling itself; assert
+  gen2 == gen3.
+
+---
+
+## Milestone 8: Language Server Protocol (M8)
+
+**Goal:** IDE-agnostic code intelligence over the Language Server Protocol.
+
+**Status:** ✅ Implemented (`zan-lsp`)
+
+### Tasks
+
+- [x] **M8.1 — Transport**
+  - JSON-RPC over stdio with `Content-Length` framing (`src/common/rpc.c`)
+  - Dependency-free JSON parser/writer (`src/common/json.c`)
+
+- [x] **M8.2 — Lifecycle**
+  - `initialize` (advertises capabilities) / `initialized`
+  - `shutdown` / `exit`
+
+- [x] **M8.3 — Document sync & diagnostics**
+  - `textDocument/didOpen` / `didChange` (full sync) / `didClose`
+  - Runs lexer → parser → binder → checker and publishes
+    `textDocument/publishDiagnostics` with severities and ranges
+
+- [x] **M8.4 — Language features**
+  - `textDocument/completion` (identifier + `Type.` member context)
+  - `textDocument/hover` (symbol signatures)
+  - `textDocument/definition`
+  - `textDocument/documentSymbol`
+
+### Deliverable
+`zan-lsp` executable, usable from any LSP client (VS Code, Neovim, etc.).
+
+---
+
+## Milestone 9: Debugger Integration (M9)
+
+**Goal:** Standard debugging via the Debug Adapter Protocol.
+
+**Status:** ✅ Implemented (`zan-dap`)
+
+### Tasks
+
+- [x] **M9.1 — Transport & lifecycle**
+  - DAP over stdio (`initialize`, `launch`, `configurationDone`, `disconnect`)
+  - `initialized`, `stopped`, `continued`, `terminated`, `exited`, `output` events
+
+- [x] **M9.2 — Breakpoints**
+  - `setBreakpoints` (source breakpoints, verified, optional conditions)
+
+- [x] **M9.3 — Execution control**
+  - `continue`, `next`, `stepIn`, `stepOut`, `pause`
+
+- [x] **M9.4 — Inspection**
+  - `threads`, `stackTrace`, `scopes`, `variables`
+
+The adapter wraps the IDE debugger engine (`src/ide/debugger.c`). Runtime
+process control is delegated to that engine (Windows `CreateProcess`-based;
+a simulated stepping model on other platforms).
+
+### Deliverable
+`zan-dap` executable, usable from any DAP client.
 
 ---
 
@@ -351,6 +447,8 @@ Self-contained IDE bundled with the compiler (single executable).
 | M5 | Advanced Language Features | 3-4 weeks | Week 16 |
 | M6 | Lightweight IDE | 4-6 weeks | Week 22 |
 | M7 | Optimization & Polish | Ongoing | — |
+| M8 | Language Server Protocol (`zan-lsp`) | done | — |
+| M9 | Debugger Integration / DAP (`zan-dap`) | done | — |
 
 ---
 

@@ -1,0 +1,865 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Recursive-descent parser producing the tagged Node AST. Faithful to
+// src/compiler/parser.c for the bootstrap subset: using/namespace, class/
+// struct/enum decls, fields/methods/constructors, the statement set and a
+// precedence-climbing expression parser.
+class Parser {
+    public List<Token> toks;
+    public int pos;
+
+    public Parser(List<Token> t) { toks = t; pos = 0; }
+
+    Token Cur() { return toks[pos]; }
+    int K() { return toks[pos].kind; }
+    int K1() { if (pos + 1 < toks.Count) { return toks[pos + 1].kind; } return TK.Eof(); }
+    Token Next() { Token t = toks[pos]; pos = pos + 1; return t; }
+    bool At(int k) { return K() == k; }
+    bool Eat(int k) { if (K() == k) { pos = pos + 1; return true; } return false; }
+    void Expect(int k) { if (!Eat(k)) { pos = pos + 1; } }
+
+    bool IsTypeKeyword(int k) {
+        if (k == TK.Int()) { return true; }
+        if (k == TK.Long()) { return true; }
+        if (k == TK.Bool()) { return true; }
+        if (k == TK.String()) { return true; }
+        if (k == TK.Char()) { return true; }
+        if (k == TK.Double()) { return true; }
+        if (k == TK.Float()) { return true; }
+        if (k == TK.Void()) { return true; }
+        if (k == TK.Object()) { return true; }
+        if (k == TK.Byte()) { return true; }
+        if (k == TK.Short()) { return true; }
+        return false;
+    }
+
+    string TypeKeywordName(int k) {
+        if (k == TK.Int()) { return "int"; }
+        if (k == TK.Long()) { return "long"; }
+        if (k == TK.Bool()) { return "bool"; }
+        if (k == TK.String()) { return "string"; }
+        if (k == TK.Char()) { return "char"; }
+        if (k == TK.Double()) { return "double"; }
+        if (k == TK.Float()) { return "float"; }
+        if (k == TK.Void()) { return "void"; }
+        if (k == TK.Object()) { return "object"; }
+        if (k == TK.Byte()) { return "byte"; }
+        if (k == TK.Short()) { return "short"; }
+        return "int";
+    }
+
+    // ---- types ----
+    Node ParseType() {
+        Node t = new Node(AK.TypeRef());
+        int k = K();
+        // tuple type:  ( T1, T2, ... )
+        if (k == TK.LParen()) {
+            Next();
+            t.sval = "Tuple";
+            t.Add(ParseType());
+            while (Eat(TK.Comma())) { t.Add(ParseType()); }
+            Expect(TK.RParen());
+            return t;
+        }
+        if (IsTypeKeyword(k)) { t.sval = TypeKeywordName(k); Next(); }
+        else if (k == TK.Ident()) { t.sval = Next().text; }
+        else { t.sval = "int"; Next(); }
+        // generic args:  Name < T (, T)* >
+        if (At(TK.Less())) {
+            Next();
+            t.a = ParseType();
+            t.Add(t.a);
+            while (Eat(TK.Comma())) { t.Add(ParseType()); }
+            Expect(TK.Greater());
+        }
+        // nullable
+        if (At(TK.Question())) { Next(); t.op = 1; }
+        // array
+        while (At(TK.LBracket()) && K1() == TK.RBracket()) {
+            Next(); Next();
+            t.ival = 1;
+        }
+        return t;
+    }
+
+    // Scan past a type without building it (for decl lookahead).
+    void SkipType() {
+        if (IsTypeKeyword(K())) { Next(); } else if (At(TK.Ident())) { Next(); } else { return; }
+        if (At(TK.Less())) {
+            int depth = 0;
+            Next(); depth = 1;
+            while (depth > 0 && !At(TK.Eof())) {
+                if (At(TK.Less())) { depth = depth + 1; }
+                else if (At(TK.Greater())) { depth = depth - 1; }
+                Next();
+            }
+        }
+        if (At(TK.Question())) { Next(); }
+        while (At(TK.LBracket()) && K1() == TK.RBracket()) { Next(); Next(); }
+    }
+
+    bool IsDeclStart() {
+        int k = K();
+        if (k == TK.Var()) { return true; }
+        if (IsTypeKeyword(k)) { return true; }
+        if (k == TK.Ident()) {
+            int save = pos;
+            SkipType();
+            bool ok = (K() == TK.Ident());
+            pos = save;
+            return ok;
+        }
+        return false;
+    }
+
+    // ---- modifiers ----
+    int ParseMods() {
+        int m = 0;
+        while (true) {
+            int k = K();
+            if (k == TK.Public()) { m = m + MOD.Public(); Next(); }
+            else if (k == TK.Private()) { m = m + MOD.Private(); Next(); }
+            else if (k == TK.Protected()) { m = m + MOD.Protected(); Next(); }
+            else if (k == TK.Static()) { m = m + MOD.Static(); Next(); }
+            else if (k == TK.Virtual()) { m = m + MOD.Virtual(); Next(); }
+            else if (k == TK.Override()) { m = m + MOD.Override(); Next(); }
+            else if (k == TK.Abstract()) { m = m + MOD.Abstract(); Next(); }
+            else if (k == TK.Readonly()) { m = m + MOD.Readonly(); Next(); }
+            else if (k == TK.Sealed()) { Next(); }
+            else if (k == TK.Const()) { Next(); }
+            else { return m; }
+        }
+    }
+
+    // ---- top level ----
+    public Node ParseUnit() {
+        Node unit = new Node(AK.CompUnit());
+        while (!At(TK.Eof())) {
+            int k = K();
+            if (k == TK.Using()) { unit.Add(ParseUsing()); }
+            else if (k == TK.Namespace()) { ParseNamespace(unit); }
+            else { Node d = ParseTypeDecl(); if (d != null) { unit.Add(d); } }
+        }
+        return unit;
+    }
+
+    Node ParseUsing() {
+        Next(); // using
+        Node u = new Node(AK.UsingDecl());
+        string name = "";
+        if (At(TK.Ident())) { name = Next().text; }
+        while (Eat(TK.Dot())) { if (At(TK.Ident())) { name = name + "." + Next().text; } }
+        u.sval = name;
+        Expect(TK.Semicolon());
+        return u;
+    }
+
+    void ParseNamespace(Node unit) {
+        Next(); // namespace
+        string name = "";
+        if (At(TK.Ident())) { name = Next().text; }
+        while (Eat(TK.Dot())) { if (At(TK.Ident())) { name = name + "." + Next().text; } }
+        unit.sval = name;
+        if (Eat(TK.Semicolon())) { return; } // file-scoped
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node d = ParseTypeDecl();
+            if (d != null) { unit.Add(d); }
+        }
+        Expect(TK.RBrace());
+    }
+
+    Node ParseTypeDecl() {
+        int mods = ParseMods();
+        int k = K();
+        if (k == TK.Class() || k == TK.Struct()) { return ParseClass(mods, k); }
+        if (k == TK.Interface()) { return ParseInterface(mods); }
+        if (k == TK.Enum()) { return ParseEnum(mods); }
+        // unknown: skip token to make progress
+        Next();
+        return null;
+    }
+
+    // An interface is modelled as an abstract class: no fields, every method is
+    // an abstract vtable slot that implementers override.
+    Node ParseInterface(int mods) {
+        Next(); // interface
+        Node cls = new Node(AK.ClassDecl());
+        cls.mods = mods + MOD.Abstract();
+        if (At(TK.Ident())) { cls.sval = Next().text; }
+        if (At(TK.Less())) { while (!At(TK.Greater()) && !At(TK.Eof())) { Next(); } Expect(TK.Greater()); }
+        if (Eat(TK.Colon())) {
+            if (At(TK.Ident())) { cls.sval2 = Next().text; }
+            while (Eat(TK.Comma())) { if (At(TK.Ident())) { Next(); } }
+        }
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node m = ParseMember(cls.sval);
+            if (m != null) {
+                if (m.kind == AK.MethodDecl()) { m.mods = m.mods + MOD.Abstract(); }
+                cls.Add(m);
+            }
+        }
+        Expect(TK.RBrace());
+        return cls;
+    }
+
+    Node ParseClass(int mods, int kw) {
+        Next(); // class/struct
+        Node cls = new Node(AK.ClassDecl());
+        if (kw == TK.Struct()) { cls.kind = AK.StructDecl(); }
+        cls.mods = mods;
+        if (At(TK.Ident())) { cls.sval = Next().text; }
+        // generic params <T, ...> recorded as TypeParam children
+        if (At(TK.Less())) {
+            Next();
+            while (!At(TK.Greater()) && !At(TK.Eof())) {
+                if (At(TK.Ident())) {
+                    Node tp = new Node(AK.TypeParam());
+                    tp.sval = Next().text;
+                    cls.Add(tp);
+                } else { Next(); }
+                Eat(TK.Comma());
+            }
+            Expect(TK.Greater());
+        }
+        // base list
+        if (Eat(TK.Colon())) {
+            if (At(TK.Ident())) { cls.sval2 = Next().text; }
+            while (Eat(TK.Comma())) { if (At(TK.Ident())) { Next(); } }
+        }
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node m = ParseMember(cls.sval);
+            AddMember(cls, m);
+        }
+        Expect(TK.RBrace());
+        return cls;
+    }
+
+    // Add a parsed member, splicing property-desugar groups (kind Block).
+    void AddMember(Node cls, Node m) {
+        if (m == null) { return; }
+        if (m.kind == AK.Block()) {
+            int i = 0;
+            while (i < m.kids.Count) { cls.Add(m.kids[i]); i = i + 1; }
+            return;
+        }
+        cls.Add(m);
+    }
+
+    Node ParseEnum(int mods) {
+        Next(); // enum
+        Node en = new Node(AK.EnumDecl());
+        en.mods = mods;
+        if (At(TK.Ident())) { en.sval = Next().text; }
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node mem = new Node(AK.EnumMember());
+            if (At(TK.Ident())) { mem.sval = Next().text; }
+            if (Eat(TK.Eq())) { mem.a = ParseExpr(); }
+            en.Add(mem);
+            Eat(TK.Comma());
+        }
+        Expect(TK.RBrace());
+        return en;
+    }
+
+    Node ParseMember(string className) {
+        int mods = ParseMods();
+        // constructor: Name '('
+        if (At(TK.Ident()) && Cur().text == className && K1() == TK.LParen()) {
+            Node ctor = new Node(AK.CtorDecl());
+            ctor.mods = mods;
+            ctor.sval = Next().text;
+            ParseParams(ctor);
+            ctor.d = ParseBlock();
+            return ctor;
+        }
+        Node type = ParseType();
+        Node member = new Node(AK.FieldDecl());
+        member.mods = mods;
+        member.type = type;
+        if (At(TK.Ident())) { member.sval = Next().text; }
+        // operator overload:  T operator <sym> ( ... ) { ... }
+        if (member.sval == "operator") {
+            int otk = Next().kind;
+            member.kind = AK.MethodDecl();
+            member.sval = OpMethodName(otk);
+            ParseParams(member);
+            if (At(TK.LBrace())) { member.d = ParseBlock(); }
+            else { Expect(TK.Semicolon()); }
+            return member;
+        }
+        if (At(TK.LParen())) {
+            member.kind = AK.MethodDecl();
+            ParseParams(member);
+            if (At(TK.LBrace())) { member.d = ParseBlock(); }
+            else { Expect(TK.Semicolon()); }
+            return member;
+        }
+        // property:  T Name { get; set; } | { get {..} set {..} } | => expr;
+        if (At(TK.LBrace()) || At(TK.Arrow())) {
+            return ParseProperty(type, member.sval, mods);
+        }
+        // field
+        if (Eat(TK.Eq())) { member.b = ParseExpr(); }
+        Expect(TK.Semicolon());
+        return member;
+    }
+
+    // Map an operator token to the mangled method name (must match irgen).
+    string OpMethodName(int tk) {
+        if (tk == TK.Plus()) { return "op_add"; }
+        if (tk == TK.Minus()) { return "op_sub"; }
+        if (tk == TK.Star()) { return "op_mul"; }
+        if (tk == TK.Slash()) { return "op_div"; }
+        if (tk == TK.Percent()) { return "op_mod"; }
+        if (tk == TK.EqEq()) { return "op_eq"; }
+        if (tk == TK.BangEq()) { return "op_ne"; }
+        if (tk == TK.Less()) { return "op_lt"; }
+        if (tk == TK.Greater()) { return "op_gt"; }
+        if (tk == TK.LessEq()) { return "op_le"; }
+        if (tk == TK.GreaterEq()) { return "op_ge"; }
+        return "op_unknown";
+    }
+
+    Node MakeGetter(string name, Node type, int mods, Node body) {
+        Node g = new Node(AK.MethodDecl());
+        g.mods = mods; g.type = type; g.sval = "get_" + name; g.d = body;
+        return g;
+    }
+
+    Node MakeSetter(string name, Node type, int mods, Node body) {
+        Node s = new Node(AK.MethodDecl());
+        s.mods = mods; s.type = new Node(AK.TypeRef()); s.type.sval = "void";
+        s.sval = "set_" + name;
+        Node p = new Node(AK.Param());
+        p.type = type; p.sval = "value";
+        s.Add(p);
+        s.d = body;
+        return s;
+    }
+
+    // Desugar a property into a backing field (auto) or accessor methods
+    // (get_Name / set_Name). Returns a Block whose kids the class splices in.
+    Node ParseProperty(Node type, string name, int mods) {
+        Node group = new Node(AK.Block());
+        if (At(TK.Arrow())) {
+            Next();
+            Node body = new Node(AK.Block());
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = ParseExpr();
+            body.Add(ret);
+            Expect(TK.Semicolon());
+            group.Add(MakeGetter(name, type, mods, body));
+            return group;
+        }
+        Expect(TK.LBrace());
+        Node getBody = null; Node setBody = null;
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            ParseMods(); // accessor-level modifiers, if any
+            if (At(TK.Get())) {
+                Next();
+                if (At(TK.LBrace())) { getBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            } else if (At(TK.Set())) {
+                Next();
+                if (At(TK.LBrace())) { setBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            } else { Next(); }
+        }
+        Expect(TK.RBrace());
+        // both accessors bodyless => auto-property backing field
+        if (getBody == null && setBody == null) {
+            Node f = new Node(AK.FieldDecl());
+            f.mods = mods; f.type = type; f.sval = name;
+            group.Add(f);
+            return group;
+        }
+        if (getBody != null) { group.Add(MakeGetter(name, type, mods, getBody)); }
+        if (setBody != null) { group.Add(MakeSetter(name, type, mods, setBody)); }
+        return group;
+    }
+
+    void ParseParams(Node fn) {
+        Expect(TK.LParen());
+        bool first = true;
+        while (!At(TK.RParen()) && !At(TK.Eof())) {
+            Node p = new Node(AK.Param());
+            if (first && At(TK.This())) { Next(); fn.ival = 1; } // extension receiver
+            p.type = ParseType();
+            if (At(TK.Ident())) { p.sval = Next().text; }
+            if (Eat(TK.Eq())) { p.b = ParseExpr(); } // optional default value
+            fn.Add(p);
+            first = false;
+            if (!Eat(TK.Comma())) { }
+        }
+        Expect(TK.RParen());
+    }
+
+    // ---- statements ----
+    Node ParseBlock() {
+        Node blk = new Node(AK.Block());
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node s = ParseStmt();
+            if (s != null) { blk.Add(s); }
+        }
+        Expect(TK.RBrace());
+        return blk;
+    }
+
+    Node ParseStmt() {
+        int k = K();
+        if (k == TK.LBrace()) { return ParseBlock(); }
+        if (k == TK.If()) { return ParseIf(); }
+        if (k == TK.While()) { return ParseWhile(); }
+        if (k == TK.For()) { return ParseFor(); }
+        if (k == TK.Foreach()) { return ParseForeach(); }
+        if (k == TK.Return()) { return ParseReturn(); }
+        if (k == TK.Switch()) { return ParseSwitch(); }
+        if (k == TK.Break()) { Next(); Expect(TK.Semicolon()); return new Node(AK.BreakStmt()); }
+        if (k == TK.Continue()) { Next(); Expect(TK.Semicolon()); return new Node(AK.ContinueStmt()); }
+        if (k == TK.Try()) { return ParseTry(); }
+        if (k == TK.Throw()) { return ParseThrow(); }
+        if (k == TK.Var() && K1() == TK.LParen()) { return ParseDecon(); }
+        if (IsDeclStart()) { return ParseVarDecl(); }
+        Node es = new Node(AK.ExprStmt());
+        es.a = ParseExpr();
+        Expect(TK.Semicolon());
+        return es;
+    }
+
+    Node ParseVarDecl() {
+        Node vd = new Node(AK.VarDecl());
+        if (At(TK.Var())) { Next(); vd.type = null; } else { vd.type = ParseType(); }
+        if (At(TK.Ident())) { vd.sval = Next().text; }
+        if (Eat(TK.Eq())) { vd.b = ParseExpr(); }
+        Expect(TK.Semicolon());
+        return vd;
+    }
+
+    // deconstruction:  var (a, b) = expr;  |  var (int a, string b) = expr;
+    Node ParseDecon() {
+        Next(); // var
+        Next(); // (
+        Node d = new Node(AK.DeconDecl());
+        while (!At(TK.RParen()) && !At(TK.Eof())) {
+            Node p = new Node(AK.Param());
+            if (LooksLikeTypedParam()) { p.type = ParseType(); }
+            if (At(TK.Ident())) { p.sval = Next().text; }
+            d.Add(p);
+            Eat(TK.Comma());
+        }
+        Expect(TK.RParen());
+        Expect(TK.Eq());
+        d.b = ParseExpr();
+        Expect(TK.Semicolon());
+        return d;
+    }
+
+    Node ParseIf() {
+        Next(); // if
+        Node n = new Node(AK.IfStmt());
+        Expect(TK.LParen());
+        n.a = ParseExpr();
+        Expect(TK.RParen());
+        n.b = ParseStmt();
+        if (Eat(TK.Else())) { n.c = ParseStmt(); }
+        return n;
+    }
+
+    Node ParseWhile() {
+        Next();
+        Node n = new Node(AK.WhileStmt());
+        Expect(TK.LParen());
+        n.a = ParseExpr();
+        Expect(TK.RParen());
+        n.b = ParseStmt();
+        return n;
+    }
+
+    Node ParseFor() {
+        Next();
+        Node n = new Node(AK.ForStmt());
+        Expect(TK.LParen());
+        if (!At(TK.Semicolon())) {
+            if (IsDeclStart()) { n.a = ParseVarDeclNoSemi(); } else { Node e = new Node(AK.ExprStmt()); e.a = ParseExpr(); n.a = e; }
+        }
+        Expect(TK.Semicolon());
+        if (!At(TK.Semicolon())) { n.b = ParseExpr(); }
+        Expect(TK.Semicolon());
+        if (!At(TK.RParen())) { n.c = ParseExpr(); }
+        Expect(TK.RParen());
+        n.d = ParseStmt();
+        return n;
+    }
+
+    Node ParseVarDeclNoSemi() {
+        Node vd = new Node(AK.VarDecl());
+        if (At(TK.Var())) { Next(); } else { vd.type = ParseType(); }
+        if (At(TK.Ident())) { vd.sval = Next().text; }
+        if (Eat(TK.Eq())) { vd.b = ParseExpr(); }
+        return vd;
+    }
+
+    Node ParseForeach() {
+        Next();
+        Node n = new Node(AK.ForeachStmt());
+        Expect(TK.LParen());
+        if (At(TK.Var())) { Next(); } else { n.type = ParseType(); }
+        if (At(TK.Ident())) { n.sval = Next().text; }
+        Expect(TK.In());
+        n.b = ParseExpr();
+        Expect(TK.RParen());
+        n.c = ParseStmt();
+        return n;
+    }
+
+    // try { } catch (T e) { } finally { }
+    // n.a = try body, n.b = first catch clause (or null), n.c = finally body (or null)
+    // Additional catch clauses are parsed and discarded (single-catch subset).
+    Node ParseTry() {
+        Next(); // try
+        Node n = new Node(AK.TryStmt());
+        n.a = ParseBlock();
+        bool first = true;
+        while (At(TK.Catch())) {
+            Next();
+            Node cc = new Node(AK.CatchClause());
+            if (Eat(TK.LParen())) {
+                if (!At(TK.RParen())) {
+                    cc.type = ParseType();
+                    if (At(TK.Ident())) { cc.sval = Next().text; }
+                }
+                Expect(TK.RParen());
+            }
+            Node body = ParseBlock();
+            cc.a = body;
+            if (first) { n.b = cc; first = false; }
+        }
+        if (At(TK.Finally())) { Next(); n.c = ParseBlock(); }
+        return n;
+    }
+
+    Node ParseThrow() {
+        Next(); // throw
+        Node n = new Node(AK.ThrowStmt());
+        if (!At(TK.Semicolon())) { n.a = ParseExpr(); }
+        Expect(TK.Semicolon());
+        return n;
+    }
+
+    Node ParseReturn() {
+        Next();
+        Node n = new Node(AK.ReturnStmt());
+        if (!At(TK.Semicolon())) { n.a = ParseExpr(); }
+        Expect(TK.Semicolon());
+        return n;
+    }
+
+    Node ParseSwitch() {
+        Next();
+        Node n = new Node(AK.SwitchStmt());
+        Expect(TK.LParen());
+        n.a = ParseExpr();
+        Expect(TK.RParen());
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node c = new Node(AK.SwitchCase());
+            if (Eat(TK.Case())) { c.a = ParseExpr(); Expect(TK.Colon()); }
+            else if (Eat(TK.Default())) { Expect(TK.Colon()); }
+            else { Next(); }
+            Node body = new Node(AK.Block());
+            while (!At(TK.Case()) && !At(TK.Default()) && !At(TK.RBrace()) && !At(TK.Eof())) {
+                Node s = ParseStmt();
+                if (s != null) { body.Add(s); }
+            }
+            c.b = body;
+            n.Add(c);
+        }
+        Expect(TK.RBrace());
+        return n;
+    }
+
+    // ---- expressions (precedence climbing) ----
+    public Node ParseExpr() { return ParseAssign(); }
+
+    bool IsAssignOp(int k) {
+        if (k == TK.Eq()) { return true; }
+        if (k == TK.PlusEq()) { return true; }
+        if (k == TK.MinusEq()) { return true; }
+        if (k == TK.StarEq()) { return true; }
+        if (k == TK.SlashEq()) { return true; }
+        return false;
+    }
+
+    Node ParseAssign() {
+        Node left = ParseOr();
+        if (IsAssignOp(K())) {
+            int op = Next().kind;
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = op; n.a = left; n.b = right;
+            return n;
+        }
+        return left;
+    }
+
+    Node ParseOr() {
+        Node left = ParseAnd();
+        while (At(TK.PipePipe())) { int op = Next().kind; Node r = ParseAnd(); left = Bin(op, left, r); }
+        return left;
+    }
+    Node ParseAnd() {
+        Node left = ParseEq();
+        while (At(TK.AmpAmp())) { int op = Next().kind; Node r = ParseEq(); left = Bin(op, left, r); }
+        return left;
+    }
+    Node ParseEq() {
+        Node left = ParseRel();
+        while (At(TK.EqEq()) || At(TK.BangEq())) { int op = Next().kind; Node r = ParseRel(); left = Bin(op, left, r); }
+        return left;
+    }
+    Node ParseRel() {
+        Node left = ParseAdd();
+        while (At(TK.Less()) || At(TK.Greater()) || At(TK.LessEq()) || At(TK.GreaterEq())) {
+            int op = Next().kind; Node r = ParseAdd(); left = Bin(op, left, r);
+        }
+        // type pattern:  x is T  |  x is T name
+        if (At(TK.Is())) {
+            Next();
+            Node ie = new Node(AK.IsExpr());
+            ie.a = left;
+            ie.type = ParseType();
+            if (At(TK.Ident())) { ie.sval = Next().text; }
+            left = ie;
+        }
+        return left;
+    }
+    Node ParseAdd() {
+        Node left = ParseMul();
+        while (At(TK.Plus()) || At(TK.Minus())) { int op = Next().kind; Node r = ParseMul(); left = Bin(op, left, r); }
+        return left;
+    }
+    Node ParseMul() {
+        Node left = ParseUnary();
+        while (At(TK.Star()) || At(TK.Slash()) || At(TK.Percent())) { int op = Next().kind; Node r = ParseUnary(); left = Bin(op, left, r); }
+        return left;
+    }
+
+    Node Bin(int op, Node l, Node r) {
+        Node n = new Node(AK.Binary());
+        n.op = op; n.a = l; n.b = r;
+        return n;
+    }
+
+    Node ParseUnary() {
+        int k = K();
+        if (k == TK.Bang() || k == TK.Minus() || k == TK.Plus()) {
+            int op = Next().kind;
+            Node n = new Node(AK.Unary());
+            n.op = op; n.a = ParseUnary();
+            return n;
+        }
+        // cast: '(' typeKeyword ')' unary
+        if (k == TK.LParen() && IsTypeKeyword(K1())) {
+            int save = pos;
+            Next(); // (
+            Node ty = ParseType();
+            if (Eat(TK.RParen())) {
+                Node n = new Node(AK.CastExpr());
+                n.type = ty; n.b = ParseUnary();
+                return n;
+            }
+            pos = save;
+        }
+        Node e = ParsePostfix();
+        if (At(TK.Switch())) { return ParseSwitchExpr(e); }
+        return e;
+    }
+
+    // switch expression:  operand switch { pat => e, _ => e }
+    Node ParseSwitchExpr(Node operand) {
+        Next(); // switch
+        Node n = new Node(AK.SwitchExpr());
+        n.a = operand;
+        Expect(TK.LBrace());
+        while (!At(TK.RBrace()) && !At(TK.Eof())) {
+            Node arm = new Node(AK.SwitchCase());
+            int rk = K();
+            if (At(TK.Ident()) && Cur().text == "_") { Next(); arm.a = null; }
+            else if (rk == TK.Less() || rk == TK.Greater() || rk == TK.LessEq() || rk == TK.GreaterEq()) {
+                arm.op = Next().kind; arm.a = ParseAdd();
+            }
+            else { arm.a = ParseExpr(); }
+            if (At(TK.Ident()) && Cur().text == "when") { Next(); arm.c = ParseExpr(); }
+            Expect(TK.Arrow());
+            arm.b = ParseExpr();
+            n.Add(arm);
+            Eat(TK.Comma());
+        }
+        Expect(TK.RBrace());
+        return n;
+    }
+
+    Node ParsePostfix() {
+        Node e = ParsePrimary();
+        while (true) {
+            int k = K();
+            if (k == TK.Dot()) {
+                Next();
+                Node m = new Node(AK.MemberAccess());
+                m.a = e;
+                if (At(TK.Ident())) { m.sval = Next().text; }
+                else { m.sval = Next().text; }
+                e = m;
+            } else if (k == TK.LParen()) {
+                Node call = new Node(AK.Call());
+                call.a = e;
+                ParseArgs(call);
+                e = call;
+            } else if (k == TK.LBracket()) {
+                Next();
+                Node idx = new Node(AK.Index());
+                idx.a = e; idx.b = ParseExpr();
+                Expect(TK.RBracket());
+                e = idx;
+            } else if (k == TK.PlusPlus() || k == TK.MinusMinus()) {
+                int op = Next().kind;
+                Node pf = new Node(AK.PostfixUnary());
+                pf.op = op; pf.a = e;
+                e = pf;
+            } else {
+                return e;
+            }
+        }
+    }
+
+    void ParseArgs(Node call) {
+        Expect(TK.LParen());
+        while (!At(TK.RParen()) && !At(TK.Eof())) {
+            // named argument:  name: expr
+            string aname = "";
+            if (At(TK.Ident()) && K1() == TK.Colon()) { aname = Next().text; Next(); }
+            Node arg = ParseExpr();
+            if (aname != "") { arg.sval2 = aname; }
+            call.Add(arg);
+            if (!Eat(TK.Comma())) { }
+        }
+        Expect(TK.RParen());
+    }
+
+    Node ParsePrimary() {
+        int k = K();
+        if (k == TK.IntLit()) { Node n = new Node(AK.IntLit()); n.ival = Next().intVal; return n; }
+        if (k == TK.FloatLit()) { Node n = new Node(AK.FloatLit()); n.sval = Next().text; return n; }
+        if (k == TK.StringLit()) { Node n = new Node(AK.StringLit()); n.sval = Next().text; return n; }
+        if (k == TK.CharLit()) { Node n = new Node(AK.CharLit()); n.ival = Next().intVal; return n; }
+        if (k == TK.True()) { Next(); Node n = new Node(AK.BoolLit()); n.ival = 1; return n; }
+        if (k == TK.False()) { Next(); Node n = new Node(AK.BoolLit()); n.ival = 0; return n; }
+        if (k == TK.Null()) { Next(); return new Node(AK.NullLit()); }
+        if (k == TK.This()) { Next(); return new Node(AK.ThisExpr()); }
+        if (k == TK.New()) { return ParseNew(); }
+        // single-parameter lambda:  x => ...
+        if (k == TK.Ident() && K1() == TK.Arrow()) { return ParseLambda(); }
+        if (k == TK.LParen()) {
+            if (LooksLikeLambda()) { return ParseLambda(); }
+            Next();
+            Node e = ParseExpr();
+            if (At(TK.Comma())) {
+                Node tup = new Node(AK.TupleExpr());
+                tup.Add(e);
+                while (Eat(TK.Comma())) { tup.Add(ParseExpr()); }
+                Expect(TK.RParen());
+                return tup;
+            }
+            Expect(TK.RParen()); return e;
+        }
+        if (k == TK.Value()) { Next(); Node n = new Node(AK.Ident()); n.sval = "value"; return n; }
+        if (k == TK.Ident()) { Node n = new Node(AK.Ident()); n.sval = Next().text; return n; }
+        // fallback
+        Node bad = new Node(AK.Ident()); bad.sval = Next().text; return bad;
+    }
+
+    Node MkTypeRef(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
+
+    // Lookahead: does a parenthesised group end with ) => ?  (a lambda arg list)
+    bool LooksLikeLambda() {
+        int save = pos;
+        if (K() != TK.LParen()) { return false; }
+        int depth = 0;
+        while (!At(TK.Eof())) {
+            int k = K();
+            if (k == TK.LParen()) { depth = depth + 1; }
+            else if (k == TK.RParen()) { depth = depth - 1; Next(); if (depth == 0) { break; } continue; }
+            Next();
+        }
+        bool arrow = At(TK.Arrow());
+        pos = save;
+        return arrow;
+    }
+
+    bool LooksLikeTypedParam() {
+        int k = K();
+        if (IsTypeKeyword(k)) { return true; }
+        if (k == TK.Ident() && K1() == TK.Ident()) { return true; }
+        return false;
+    }
+
+    // Lambda:  x => e | (a, b) => e | (int a) => { ... }
+    Node ParseLambda() {
+        Node lam = new Node(AK.Lambda());
+        if (At(TK.LParen())) {
+            Next();
+            while (!At(TK.RParen()) && !At(TK.Eof())) {
+                Node p = new Node(AK.Param());
+                if (LooksLikeTypedParam()) { p.type = ParseType(); } else { p.type = MkTypeRef("var"); }
+                if (At(TK.Ident())) { p.sval = Next().text; }
+                lam.Add(p);
+                Eat(TK.Comma());
+            }
+            Expect(TK.RParen());
+        } else {
+            Node p = new Node(AK.Param());
+            p.type = MkTypeRef("var");
+            if (At(TK.Ident())) { p.sval = Next().text; }
+            lam.Add(p);
+        }
+        Expect(TK.Arrow());
+        if (At(TK.LBrace())) { lam.d = ParseBlock(); } else { lam.a = ParseExpr(); }
+        return lam;
+    }
+
+    Node ParseNew() {
+        Next(); // new
+        Node n = new Node(AK.NewExpr());
+        n.type = ParseTypeNoArray();
+        if (At(TK.LBracket())) {
+            Next();
+            n.ival = 1; // array
+            if (!At(TK.RBracket())) { n.b = ParseExpr(); }
+            Expect(TK.RBracket());
+        } else if (At(TK.LParen())) {
+            ParseArgs(n);
+        }
+        return n;
+    }
+
+    // like ParseType but do not consume trailing [] (that means array-new size)
+    Node ParseTypeNoArray() {
+        Node t = new Node(AK.TypeRef());
+        int k = K();
+        if (IsTypeKeyword(k)) { t.sval = TypeKeywordName(k); Next(); }
+        else if (k == TK.Ident()) { t.sval = Next().text; }
+        else { t.sval = "int"; Next(); }
+        if (At(TK.Less())) {
+            Next();
+            t.Add(ParseType());
+            while (Eat(TK.Comma())) { t.Add(ParseType()); }
+            Expect(TK.Greater());
+        }
+        return t;
+    }
+}

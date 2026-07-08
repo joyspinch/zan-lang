@@ -1,0 +1,1621 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// A multi-line, line-numbered plain-text code editor. Holds its own buffer
+/// (a list of lines) and cursor, and edits itself in response to keyboard input
+/// while it has focus — the editing surface of the IDE. Immediate-mode: create
+/// one, keep it across frames, and call Render(app, area) each frame.
+///
+///   CodeEditor ed = CodeEditor.Create();      // once
+///   ed.LoadText("using System;\n\nclass Main {}");
+///   ...
+///   ed.Render(app, editorRect);               // every frame
+/// </summary>
+class CodeEditor {
+    List<string> lines;
+    int curLine;
+    int curCol;
+    int scrollLine;
+    int lastId;
+
+    // ---- autocomplete popup state ----
+    List<string> acItems;   // current candidate list (filtered by prefix)
+    List<string> acFull;    // full unfiltered candidates (for dot-mode re-filter)
+    int acSel;              // selected candidate index
+    bool acActive;          // popup currently shown
+    int acStart;            // column where the in-progress word begins
+    bool acDot;             // true when popup was triggered by '.' (member completion)
+    List<string> acKinds;   // kind tag per item: "M"=method, "P"=property, "T"=type, "K"=keyword, "S"=snippet, "F"=field
+
+    // ---- popup geometry (set during Render, read during click) ----
+    int popX;
+    int popY;
+    int popW;
+    int popH;
+    int popItemH;
+    int popFirst;
+    int popShown;
+
+    // ---- selection ----
+    bool selActive;
+    int selAnchorLine;
+    int selAnchorCol;
+
+    // ---- clipboard & undo ----
+    string clipboard;
+    List<string> undoStack;
+    List<int> undoLines;
+    List<int> undoCols;
+
+    // ---- error diagnostics ----
+    List<int> errorLines;
+    List<string> errorMsgs;
+
+    // ---- debugging ----
+    List<int> bps;
+    int execLine;
+    List<string> dbgVars;   // tab-separated "name\ttype\tvalue" entries for hover tooltip
+    string hoverTip;        // current hover tooltip text
+    int hoverTipX;
+    int hoverTipY;
+
+    static CodeEditor Create() {
+        CodeEditor e = new CodeEditor();
+        e.lines = new List<string>();
+        e.lines.Add("");
+        e.curLine = 0;
+        e.curCol = 0;
+        e.scrollLine = 0;
+        e.lastId = -1;
+        e.acItems = new List<string>();
+        e.acFull = new List<string>();
+        e.acSel = 0;
+        e.acActive = false;
+        e.acStart = 0;
+        e.acDot = false;
+        e.acKinds = new List<string>();
+        e.popX = 0; e.popY = 0; e.popW = 0; e.popH = 0;
+        e.popItemH = 0; e.popFirst = 0; e.popShown = 0;
+        e.selActive = false;
+        e.selAnchorLine = 0;
+        e.selAnchorCol = 0;
+        e.clipboard = "";
+        e.undoStack = new List<string>();
+        e.undoLines = new List<int>();
+        e.undoCols = new List<int>();
+        e.errorLines = new List<int>();
+        e.errorMsgs = new List<string>();
+        e.bps = new List<int>();
+        e.execLine = -1;
+        e.dbgVars = new List<string>();
+        e.hoverTip = "";
+        e.hoverTipX = 0;
+        e.hoverTipY = 0;
+        return e;
+    }
+
+    /// Splits a string into lines on '\n' (stripping '\r').
+    static List<string> SplitLines(string s) {
+        List<string> outLines = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\n") {
+                outLines.Add(cur);
+                cur = "";
+            } else if (ch == "\r") {
+                cur = cur;
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        outLines.Add(cur);
+        return outLines;
+    }
+
+    void SetLines(List<string> ls) {
+        lines = ls;
+        if (lines.Count == 0) { lines.Add(""); }
+        curLine = 0;
+        curCol = 0;
+        scrollLine = 0;
+    }
+
+    void LoadText(string s) {
+        SetLines(CodeEditor.SplitLines(s));
+    }
+
+    string GetText() {
+        string outText = "";
+        int i = 0;
+        while (i < lines.Count) {
+            outText = outText + lines[i];
+            if (i + 1 < lines.Count) { outText = outText + "\n"; }
+            i = i + 1;
+        }
+        return outText;
+    }
+
+    int LineCount() {
+        return lines.Count;
+    }
+
+    int CurLine() { return curLine; }
+    int CurCol() { return curCol; }
+
+    void SetDebugVars(List<string> vars) { dbgVars = vars; }
+
+    void GoToLine(int line) {
+        if (line < 0) { line = 0; }
+        if (line >= lines.Count) { line = lines.Count - 1; }
+        curLine = line;
+        curCol = 0;
+        selActive = false;
+    }
+
+    void GoToLineCol(int line, int col) {
+        GoToLine(line);
+        curCol = col;
+        ClampCol();
+    }
+
+    // ---- edit primitives ----
+    void InsertStr(string ins) {
+        string ln = lines[curLine];
+        lines[curLine] = Text.InsertAt(ln, curCol, ins);
+        curCol = curCol + ins.Length;
+    }
+
+    void NewLine() {
+        string ln = lines[curLine];
+        string left = Text.Left(ln, curCol);
+        string right = Text.Right(ln, curCol);
+        lines[curLine] = left;
+        lines.Insert(curLine + 1, right);
+        curLine = curLine + 1;
+        curCol = 0;
+    }
+
+    void BackspaceEdit() {
+        if (curCol > 0) {
+            string ln = lines[curLine];
+            lines[curLine] = Text.RemoveAt(ln, curCol - 1);
+            curCol = curCol - 1;
+        } else if (curLine > 0) {
+            string prev = lines[curLine - 1];
+            string cur = lines[curLine];
+            int newCol = prev.Length;
+            lines[curLine - 1] = prev + cur;
+            lines.RemoveAt(curLine);
+            curLine = curLine - 1;
+            curCol = newCol;
+        }
+    }
+
+    void DeleteEdit() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            lines[curLine] = Text.RemoveAt(ln, curCol);
+        } else if (curLine + 1 < lines.Count) {
+            string next = lines[curLine + 1];
+            lines[curLine] = ln + next;
+            lines.RemoveAt(curLine + 1);
+        }
+    }
+
+    void ClampCol() {
+        string ln = lines[curLine];
+        if (curCol > ln.Length) { curCol = ln.Length; }
+        if (curCol < 0) { curCol = 0; }
+    }
+
+    void MoveLeft() {
+        if (curCol > 0) {
+            curCol = curCol - 1;
+        } else if (curLine > 0) {
+            curLine = curLine - 1;
+            curCol = lines[curLine].Length;
+        }
+    }
+
+    void MoveRight() {
+        string ln = lines[curLine];
+        if (curCol < ln.Length) {
+            curCol = curCol + 1;
+        } else if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            curCol = 0;
+        }
+    }
+
+    void MoveUp() {
+        if (curLine > 0) {
+            curLine = curLine - 1;
+            ClampCol();
+        }
+    }
+
+    void MoveDown() {
+        if (curLine + 1 < lines.Count) {
+            curLine = curLine + 1;
+            ClampCol();
+        }
+    }
+
+    // ---- undo ----
+    void SaveUndo() {
+        string snap = GetText();
+        undoStack.Add(snap);
+        undoLines.Add(curLine);
+        undoCols.Add(curCol);
+        if (undoStack.Count > 50) {
+            undoStack.RemoveAt(0);
+            undoLines.RemoveAt(0);
+            undoCols.RemoveAt(0);
+        }
+    }
+
+    void Undo() {
+        if (undoStack.Count == 0) { return; }
+        int last = undoStack.Count - 1;
+        string snap = undoStack[last];
+        int sl = undoLines[last];
+        int sc = undoCols[last];
+        undoStack.RemoveAt(last);
+        undoLines.RemoveAt(last);
+        undoCols.RemoveAt(last);
+        LoadText(snap);
+        curLine = sl;
+        curCol = sc;
+        ClampCol();
+        selActive = false;
+    }
+
+    // ---- selection ----
+    void SelectAll() {
+        selAnchorLine = 0;
+        selAnchorCol = 0;
+        curLine = lines.Count - 1;
+        curCol = lines[curLine].Length;
+        selActive = true;
+    }
+
+    void ClearSelection() { selActive = false; }
+
+    void StartSelection() {
+        if (!selActive) {
+            selAnchorLine = curLine;
+            selAnchorCol = curCol;
+            selActive = true;
+        }
+    }
+
+    string GetSelectedText() {
+        if (!selActive) { return ""; }
+        int sL = selAnchorLine;
+        int sC = selAnchorCol;
+        int eL = curLine;
+        int eC = curCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tmpL = sL; sL = eL; eL = tmpL;
+            int tmpC = sC; sC = eC; eC = tmpC;
+        }
+        if (sL == eL) {
+            string ln = lines[sL];
+            if (sC > ln.Length) { sC = ln.Length; }
+            if (eC > ln.Length) { eC = ln.Length; }
+            return ln.Substring(sC, eC - sC);
+        }
+        string result = "";
+        string firstLn = lines[sL];
+        if (sC <= firstLn.Length) {
+            result = firstLn.Substring(sC, firstLn.Length - sC);
+        }
+        int mi = sL + 1;
+        while (mi < eL) {
+            result = result + "\n" + lines[mi];
+            mi = mi + 1;
+        }
+        string lastLn = lines[eL];
+        if (eC > lastLn.Length) { eC = lastLn.Length; }
+        result = result + "\n" + lastLn.Substring(0, eC);
+        return result;
+    }
+
+    void DeleteSelection() {
+        if (!selActive) { return; }
+        int sL = selAnchorLine;
+        int sC = selAnchorCol;
+        int eL = curLine;
+        int eC = curCol;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tmpL = sL; sL = eL; eL = tmpL;
+            int tmpC = sC; sC = eC; eC = tmpC;
+        }
+        SaveUndo();
+        if (sL == eL) {
+            string ln = lines[sL];
+            if (sC > ln.Length) { sC = ln.Length; }
+            if (eC > ln.Length) { eC = ln.Length; }
+            lines[sL] = ln.Substring(0, sC) + ln.Substring(eC, ln.Length - eC);
+        } else {
+            string firstLn = lines[sL];
+            string lastLn = lines[eL];
+            if (sC > firstLn.Length) { sC = firstLn.Length; }
+            if (eC > lastLn.Length) { eC = lastLn.Length; }
+            string keep = firstLn.Substring(0, sC) + lastLn.Substring(eC, lastLn.Length - eC);
+            lines[sL] = keep;
+            int ri = eL;
+            while (ri > sL) {
+                lines.RemoveAt(ri);
+                ri = ri - 1;
+            }
+        }
+        curLine = sL;
+        curCol = sC;
+        selActive = false;
+    }
+
+    void CopySelection() {
+        if (!selActive) { return; }
+        clipboard = GetSelectedText();
+    }
+
+    void CutSelection() {
+        if (!selActive) { return; }
+        clipboard = GetSelectedText();
+        DeleteSelection();
+    }
+
+    void PasteClipboard() {
+        if (clipboard.Length == 0) { return; }
+        if (selActive) { DeleteSelection(); }
+        else { SaveUndo(); }
+        List<string> pLines = CodeEditor.SplitLines(clipboard);
+        if (pLines.Count == 1) {
+            InsertStr(pLines[0]);
+        } else {
+            string ln = lines[curLine];
+            string left = ln.Substring(0, curCol);
+            string right = "";
+            if (curCol < ln.Length) {
+                right = ln.Substring(curCol, ln.Length - curCol);
+            }
+            lines[curLine] = left + pLines[0];
+            int pi = 1;
+            while (pi < pLines.Count - 1) {
+                lines.Insert(curLine + pi, pLines[pi]);
+                pi = pi + 1;
+            }
+            int lastIdx = pLines.Count - 1;
+            string lastP = pLines[lastIdx];
+            lines.Insert(curLine + lastIdx, lastP + right);
+            curLine = curLine + lastIdx;
+            curCol = lastP.Length;
+        }
+    }
+
+    // ---- error diagnostics ----
+    void CheckErrors() {
+        errorLines = new List<int>();
+        errorMsgs = new List<string>();
+        int braceDepth = 0;
+        int parenDepth = 0;
+        int li = 0;
+        while (li < lines.Count) {
+            string ln = lines[li];
+            string tr = ln;
+            // Trim leading whitespace
+            int si = 0;
+            while (si < tr.Length) {
+                string sch = tr.Substring(si, 1);
+                if (sch == " " || sch == "\t") { si = si + 1; }
+                else { break; }
+            }
+            if (si > 0) { tr = tr.Substring(si, tr.Length - si); }
+            // Skip empty/comment lines
+            if (tr.Length > 0 && tr.Substring(0, 1) != "/" && tr.Substring(0, 1) != "*") {
+                // Check brace/paren balance per line
+                int ci = 0;
+                while (ci < ln.Length) {
+                    string ch = ln.Substring(ci, 1);
+                    if (ch == "{") { braceDepth = braceDepth + 1; }
+                    if (ch == "}") { braceDepth = braceDepth - 1; }
+                    if (ch == "(") { parenDepth = parenDepth + 1; }
+                    if (ch == ")") { parenDepth = parenDepth - 1; }
+                    ci = ci + 1;
+                }
+                if (braceDepth < 0) {
+                    errorLines.Add(li);
+                    errorMsgs.Add("Unexpected '}'");
+                    braceDepth = 0;
+                }
+                if (parenDepth < 0) {
+                    errorLines.Add(li);
+                    errorMsgs.Add("Unexpected ')'");
+                    parenDepth = 0;
+                }
+                // Check for missing semicolon on statement lines
+                if (tr.Length > 2) {
+                    string lastCh = tr.Substring(tr.Length - 1, 1);
+                    string firstCh = tr.Substring(0, 1);
+                    bool needsSemi = true;
+                    if (lastCh == "{" || lastCh == "}" || lastCh == ";" || lastCh == ",") { needsSemi = false; }
+                    if (firstCh == "/" || firstCh == "*" || firstCh == "#") { needsSemi = false; }
+                    if (CodeEditor.StartsWithP(tr, "using ") && lastCh != ";") {
+                        errorLines.Add(li);
+                        errorMsgs.Add("Missing ';' after using");
+                    }
+                    if (CodeEditor.StartsWithP(tr, "class ") || CodeEditor.StartsWithP(tr, "struct ")) { needsSemi = false; }
+                    if (CodeEditor.StartsWithP(tr, "if ") || CodeEditor.StartsWithP(tr, "if(")) { needsSemi = false; }
+                    if (CodeEditor.StartsWithP(tr, "else") || CodeEditor.StartsWithP(tr, "while") || CodeEditor.StartsWithP(tr, "for")) { needsSemi = false; }
+                    if (CodeEditor.StartsWithP(tr, "namespace") || CodeEditor.StartsWithP(tr, "static void") || CodeEditor.StartsWithP(tr, "void ")) { needsSemi = false; }
+                }
+            }
+            li = li + 1;
+        }
+        if (braceDepth > 0) {
+            errorLines.Add(lines.Count - 1);
+            errorMsgs.Add("Missing closing '}'");
+        }
+        if (parenDepth > 0) {
+            errorLines.Add(lines.Count - 1);
+            errorMsgs.Add("Missing closing ')'");
+        }
+    }
+
+    // ---- autocomplete ----
+
+    /// True when list `xs` already contains `v`.
+    static bool Has(List<string> xs, string v) {
+        int i = 0;
+        while (i < xs.Count) {
+            if (xs[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `s` begins with `pre`.
+    static bool StartsWithP(string s, string pre) {
+        if (pre.Length > s.Length) { return false; }
+        return s.Substring(0, pre.Length) == pre;
+    }
+
+    /// Appends the language keywords to `outk`.
+    static void KeywordList(List<string> outk) {
+        string kws = "using namespace class struct enum interface static void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
+        string cur = "";
+        int i = 0;
+        int n = kws.Length;
+        while (i < n) {
+            string ch = kws.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0) { outk.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { outk.Add(cur); }
+    }
+
+    /// Appends common standard library types and members for completion.
+    static void StdlibList(List<string> outk) {
+        string types = "Console List Dictionary StringBuilder String Math File Directory Path Environment Process Convert Array DateTime TimeSpan Task Thread App Canvas Theme Rect Button Label Input Panel Split Modal TreeView TabView CodeEditor Ribbon Icon SignalInt SignalBool SignalString Window TreeNode RibbonCmd TabHit HitRegion Point Size";
+        string methods = "WriteLine ReadLine Write ToString Add Remove RemoveAt Insert IndexOf Contains Count Length Clear Sort Reverse Join Split Substring Replace Trim StartsWith EndsWith ToUpper ToLower Format Concat Exists ReadAllText WriteAllText CreateDirectory GetFiles GetDirectories Append AppendLine Max Min Abs Round Sqrt Floor Ceiling Pow Parse TryParse GetText LoadText Render Create SetText";
+        string snippets = "Program Main InitializeComponent EventArgs Dispose Override";
+        string all = types + " " + methods + " " + snippets;
+        string cur = "";
+        int i = 0;
+        int n = all.Length;
+        while (i < n) {
+            string ch = all.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); }
+    }
+
+    /// Collects unique identifier tokens (length >= 2) appearing anywhere in the
+    /// buffer, so the editor can complete symbols the user has already typed.
+    static void CollectWords(List<string> ls, List<string> outw) {
+        string idstart = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < ls.Count) {
+            string line = ls[li];
+            int n = line.Length;
+            int i = 0;
+            while (i < n) {
+                string ch = line.Substring(i, 1);
+                if (CodeEditor.InSet(idstart, ch)) {
+                    int j = i;
+                    string w = "";
+                    while (j < n) {
+                        string cj = line.Substring(j, 1);
+                        if (CodeEditor.InSet(idrest, cj)) { w = w + cj; j = j + 1; }
+                        else { break; }
+                    }
+                    if (w.Length >= 2 && !CodeEditor.Has(outw, w)) { outw.Add(w); }
+                    i = j;
+                } else {
+                    i = i + 1;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// Recomputes the completion popup from the word immediately left of the
+    /// cursor; closes the popup when there is no prefix or no candidate.
+    void UpdateCompletion() {
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string ln = lines[curLine];
+
+        // If in dot-mode, filter the full member list by the typed prefix
+        if (acDot) {
+            string prefix = ln.Substring(acStart, curCol - acStart);
+            acItems = new List<string>();
+            acKinds = new List<string>();
+            if (prefix.Length == 0) {
+                int fi = 0;
+                while (fi < acFull.Count) {
+                    acItems.Add(acFull[fi]);
+                    acKinds.Add("M");
+                    fi = fi + 1;
+                }
+            } else {
+                int fi = 0;
+                while (fi < acFull.Count) {
+                    if (CodeEditor.StartsWithI(acFull[fi], prefix)) {
+                        acItems.Add(acFull[fi]);
+                        acKinds.Add("M");
+                    }
+                    fi = fi + 1;
+                }
+            }
+            if (acItems.Count > 0) { acActive = true; acSel = 0; }
+            else { acActive = false; acDot = false; }
+            return;
+        }
+
+        // Regular word completion
+        int st = curCol;
+        while (st > 0) {
+            string ch = ln.Substring(st - 1, 1);
+            if (CodeEditor.InSet(idrest, ch)) { st = st - 1; }
+            else { break; }
+        }
+        acStart = st;
+        string pfx = ln.Substring(st, curCol - st);
+        acItems = new List<string>();
+        if (pfx.Length < 1) { acActive = false; return; }
+
+        List<string> cand = new List<string>();
+        List<string> candKinds = new List<string>();
+        CodeEditor.KeywordListK(cand, candKinds);
+        CodeEditor.StdlibListK(cand, candKinds);
+        CodeEditor.CollectWordsK(lines, cand, candKinds);
+        acKinds = new List<string>();
+        int i = 0;
+        while (i < cand.Count) {
+            string w = cand[i];
+            if (w != pfx && CodeEditor.StartsWithI(w, pfx) && !CodeEditor.Has(acItems, w)) {
+                acItems.Add(w);
+                if (i < candKinds.Count) { acKinds.Add(candKinds[i]); }
+                else { acKinds.Add("W"); }
+                if (acItems.Count >= 20) { i = cand.Count; }
+            }
+            i = i + 1;
+        }
+        if (acItems.Count > 0) { acActive = true; acSel = 0; }
+        else { acActive = false; }
+    }
+
+    static void KeywordListK(List<string> outk, List<string> kinds) {
+        List<string> tmp = new List<string>();
+        CodeEditor.KeywordList(tmp);
+        int i = 0;
+        while (i < tmp.Count) {
+            outk.Add(tmp[i]);
+            kinds.Add("K");
+            i = i + 1;
+        }
+    }
+
+    static void StdlibListK(List<string> outk, List<string> kinds) {
+        string types = "Console List Dictionary StringBuilder String Math File Directory Path Environment Process Convert Array DateTime TimeSpan Task Thread App Canvas Theme Rect Button Label Input Panel Split Modal TreeView TabView CodeEditor Ribbon Icon SignalInt SignalBool SignalString Window TreeNode RibbonCmd TabHit HitRegion Point Size Color Font Graphics Bitmap Image Stream StreamReader StreamWriter HttpClient JsonSerializer Regex Match Timer Socket WebSocket";
+        string methods = "WriteLine ReadLine Write ToString Add Remove RemoveAt Insert IndexOf Contains Count Length Clear Sort Reverse Join Split Substring Replace Trim StartsWith EndsWith ToUpper ToLower Format Concat Exists ReadAllText WriteAllText CreateDirectory GetFiles GetDirectories Append AppendLine Max Min Abs Round Sqrt Floor Ceiling Pow Parse TryParse GetText LoadText Render Create SetText Where Select OrderBy GroupBy First Last Any All Sum Skip Take Distinct Aggregate";
+        string all = types;
+        string cur = "";
+        int i = 0;
+        while (i < all.Length) {
+            string ch = all.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("T"); }
+                cur = "";
+            } else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("T"); }
+        cur = "";
+        i = 0;
+        while (i < methods.Length) {
+            string ch = methods.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("M"); }
+                cur = "";
+            } else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("M"); }
+    }
+
+    static void CollectWordsK(List<string> ls, List<string> outw, List<string> kinds) {
+        List<string> tmp = new List<string>();
+        CodeEditor.CollectWords(ls, tmp);
+        int i = 0;
+        while (i < tmp.Count) {
+            if (!CodeEditor.Has(outw, tmp[i])) {
+                outw.Add(tmp[i]);
+                kinds.Add("W");
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Case-insensitive StartsWith check.
+    static bool StartsWithI(string s, string pre) {
+        if (pre.Length > s.Length) { return false; }
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        int i = 0;
+        while (i < pre.Length) {
+            string a = s.Substring(i, 1);
+            string b = pre.Substring(i, 1);
+            // Normalize both to same case
+            string la = a;
+            string lb = b;
+            int ai = 0;
+            while (ai < 26) {
+                if (upper.Substring(ai, 1) == a) { la = lower.Substring(ai, 1); }
+                if (upper.Substring(ai, 1) == b) { lb = lower.Substring(ai, 1); }
+                ai = ai + 1;
+            }
+            if (la != lb) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// Replaces the in-progress word with the selected candidate.
+    void AcceptCompletion() {
+        if (!acActive) { return; }
+        if (acSel < 0 || acSel >= acItems.Count) { acActive = false; return; }
+        string ln = lines[curLine];
+        string chosen = acItems[acSel];
+        string left = Text.Left(ln, acStart);
+        string right = Text.Right(ln, curCol);
+        lines[curLine] = left + chosen + right;
+        curCol = acStart + chosen.Length;
+        acActive = false;
+        acDot = false;
+    }
+
+    /// Triggered when user types '.'. Looks at the word before the dot and
+    /// suggests known members for that type, or the chain return type.
+    void DotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        if (dotPos < 0) { acActive = false; return; }
+
+        // Walk backwards through the chain: skip matched parens and identifiers
+        string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int pos = dotPos;
+        // Skip over closing paren groups (for chained calls like .Where(...).Select)
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ")") {
+            int depth = 1;
+            pos = pos - 1;
+            while (pos > 0 && depth > 0) {
+                pos = pos - 1;
+                string pc = ln.Substring(pos, 1);
+                if (pc == ")") { depth = depth + 1; }
+                else if (pc == "(") { depth = depth - 1; }
+            }
+        }
+        // Now get the word (method or variable name) before the paren or dot
+        int end = pos;
+        while (pos > 0) {
+            string pc = ln.Substring(pos - 1, 1);
+            if (CodeEditor.InSet(idchars, pc)) { pos = pos - 1; }
+            else { break; }
+        }
+        string lastWord = ln.Substring(pos, end - pos);
+
+        // Walk further back to find the owner (e.g. "Console" in "Console.Xxx")
+        string owner = lastWord;
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ".") {
+            int ownerEnd = pos - 1;
+            int ownerStart = ownerEnd;
+            while (ownerStart > 0) {
+                string pc = ln.Substring(ownerStart - 1, 1);
+                if (CodeEditor.InSet(idchars, pc)) { ownerStart = ownerStart - 1; }
+                else { break; }
+            }
+            owner = ln.Substring(ownerStart, ownerEnd - ownerStart);
+        }
+
+        // Build member list based on identified type
+        acStart = curCol;
+        acFull = new List<string>();
+        acDot = true;
+
+        // Known static types
+        if (owner == "Console" || lastWord == "Console") {
+            CodeEditor.AddMembers(acFull, "Console");
+        } else if (owner == "Math" || lastWord == "Math") {
+            CodeEditor.AddMembers(acFull, "Math");
+        } else if (owner == "File" || lastWord == "File") {
+            CodeEditor.AddMembers(acFull, "File");
+        } else if (owner == "Directory" || lastWord == "Directory") {
+            CodeEditor.AddMembers(acFull, "Directory");
+        } else if (owner == "Path" || lastWord == "Path") {
+            CodeEditor.AddMembers(acFull, "Path");
+        } else if (owner == "Convert" || lastWord == "Convert") {
+            CodeEditor.AddMembers(acFull, "Convert");
+        } else if (owner == "Environment" || lastWord == "Environment") {
+            CodeEditor.AddMembers(acFull, "Environment");
+        } else if (owner == "string" || lastWord == "string" || owner == "String" || lastWord == "String") {
+            CodeEditor.AddMembers(acFull, "string");
+        } else if (owner == "List" || lastWord == "List") {
+            CodeEditor.AddMembers(acFull, "List");
+        } else if (owner == "Dictionary" || lastWord == "Dictionary") {
+            CodeEditor.AddMembers(acFull, "Dictionary");
+        } else if (owner == "StringBuilder" || lastWord == "StringBuilder") {
+            CodeEditor.AddMembers(acFull, "StringBuilder");
+        } else if (owner == "DateTime" || lastWord == "DateTime") {
+            CodeEditor.AddMembers(acFull, "DateTime");
+        } else if (owner == "Array" || lastWord == "Array") {
+            CodeEditor.AddMembers(acFull, "Array");
+        } else if (owner == "Process" || lastWord == "Process") {
+            CodeEditor.AddMembers(acFull, "Process");
+        } else if (owner == "App" || lastWord == "App") {
+            CodeEditor.AddMembers(acFull, "App");
+        } else if (owner == "Canvas" || lastWord == "Canvas") {
+            CodeEditor.AddMembers(acFull, "Canvas");
+        } else if (owner == "Theme" || lastWord == "Theme") {
+            CodeEditor.AddMembers(acFull, "Theme");
+        } else if (owner == "Window" || lastWord == "Window") {
+            CodeEditor.AddMembers(acFull, "Window");
+        } else {
+            // Unknown type - show all common instance members + LINQ chain methods
+            CodeEditor.AddMembers(acFull, "_instance");
+        }
+
+        acItems = new List<string>();
+        acKinds = new List<string>();
+        int fi = 0;
+        while (fi < acFull.Count) {
+            acItems.Add(acFull[fi]);
+            acKinds.Add("M");
+            fi = fi + 1;
+        }
+        if (acItems.Count > 0) { acActive = true; acSel = 0; }
+        else { acActive = false; acDot = false; }
+    }
+
+    /// Populates member lists for known types.
+    static void AddMembers(List<string> out2, string typeName) {
+        if (typeName == "Console") {
+            out2.Add("WriteLine"); out2.Add("ReadLine"); out2.Add("Write");
+            out2.Add("Clear"); out2.Add("ReadKey"); out2.Add("SetCursorPosition");
+            out2.Add("ForegroundColor"); out2.Add("BackgroundColor"); out2.Add("ResetColor");
+            out2.Add("Title"); out2.Add("WindowWidth"); out2.Add("WindowHeight");
+            out2.Add("Beep"); out2.Add("Error"); out2.Add("Out"); out2.Add("In");
+        } else if (typeName == "Math") {
+            out2.Add("Max"); out2.Add("Min"); out2.Add("Abs"); out2.Add("Sqrt");
+            out2.Add("Round"); out2.Add("Floor"); out2.Add("Ceiling"); out2.Add("Pow");
+            out2.Add("Log"); out2.Add("Log10"); out2.Add("Sin"); out2.Add("Cos");
+            out2.Add("Tan"); out2.Add("Atan"); out2.Add("Atan2"); out2.Add("Exp");
+            out2.Add("Sign"); out2.Add("Truncate"); out2.Add("Clamp");
+            out2.Add("PI"); out2.Add("E");
+        } else if (typeName == "File") {
+            out2.Add("ReadAllText"); out2.Add("WriteAllText"); out2.Add("ReadAllLines");
+            out2.Add("WriteAllLines"); out2.Add("AppendAllText"); out2.Add("Exists");
+            out2.Add("Delete"); out2.Add("Copy"); out2.Add("Move"); out2.Add("Create");
+            out2.Add("Open"); out2.Add("OpenRead"); out2.Add("OpenWrite");
+            out2.Add("ReadAllBytes"); out2.Add("WriteAllBytes"); out2.Add("GetCreationTime");
+            out2.Add("GetLastWriteTime"); out2.Add("SetAttributes");
+        } else if (typeName == "Directory") {
+            out2.Add("Exists"); out2.Add("CreateDirectory"); out2.Add("Delete");
+            out2.Add("GetFiles"); out2.Add("GetDirectories"); out2.Add("Move");
+            out2.Add("GetCurrentDirectory"); out2.Add("SetCurrentDirectory");
+            out2.Add("EnumerateFiles"); out2.Add("EnumerateDirectories");
+            out2.Add("GetParent"); out2.Add("GetDirectoryRoot");
+        } else if (typeName == "Path") {
+            out2.Add("GetFileName"); out2.Add("GetDirectoryName"); out2.Add("GetExtension");
+            out2.Add("Combine"); out2.Add("GetFullPath"); out2.Add("GetTempPath");
+            out2.Add("GetTempFileName"); out2.Add("ChangeExtension");
+            out2.Add("GetFileNameWithoutExtension"); out2.Add("HasExtension");
+            out2.Add("IsPathRooted"); out2.Add("GetPathRoot");
+            out2.Add("DirectorySeparatorChar"); out2.Add("AltDirectorySeparatorChar");
+        } else if (typeName == "Convert") {
+            out2.Add("ToString"); out2.Add("ToInt32"); out2.Add("ToInt64");
+            out2.Add("ToDouble"); out2.Add("ToSingle"); out2.Add("ToBoolean");
+            out2.Add("ToByte"); out2.Add("ToChar"); out2.Add("ToDateTime");
+            out2.Add("ToDecimal"); out2.Add("ToUInt32"); out2.Add("ToUInt64");
+            out2.Add("FromBase64String"); out2.Add("ToBase64String");
+            out2.Add("ChangeType");
+        } else if (typeName == "Environment") {
+            out2.Add("GetEnvironmentVariable"); out2.Add("SetEnvironmentVariable");
+            out2.Add("CurrentDirectory"); out2.Add("NewLine");
+            out2.Add("MachineName"); out2.Add("UserName"); out2.Add("OSVersion");
+            out2.Add("ProcessorCount"); out2.Add("TickCount"); out2.Add("StackTrace");
+            out2.Add("CommandLine"); out2.Add("Exit"); out2.Add("FailFast");
+            out2.Add("GetCommandLineArgs"); out2.Add("Is64BitOperatingSystem");
+        } else if (typeName == "string") {
+            out2.Add("Length"); out2.Add("Substring"); out2.Add("IndexOf");
+            out2.Add("LastIndexOf"); out2.Add("Contains"); out2.Add("StartsWith");
+            out2.Add("EndsWith"); out2.Add("Replace"); out2.Add("Trim");
+            out2.Add("TrimStart"); out2.Add("TrimEnd"); out2.Add("ToUpper");
+            out2.Add("ToLower"); out2.Add("Split"); out2.Add("Join");
+            out2.Add("Insert"); out2.Add("Remove"); out2.Add("PadLeft");
+            out2.Add("PadRight"); out2.Add("Format"); out2.Add("Concat");
+            out2.Add("IsNullOrEmpty"); out2.Add("IsNullOrWhiteSpace");
+            out2.Add("Equals"); out2.Add("CompareTo"); out2.Add("ToCharArray");
+            out2.Add("Chars"); out2.Add("Empty");
+        } else if (typeName == "List") {
+            out2.Add("Add"); out2.Add("Insert"); out2.Add("Remove"); out2.Add("RemoveAt");
+            out2.Add("RemoveAll"); out2.Add("Clear"); out2.Add("Count");
+            out2.Add("Contains"); out2.Add("IndexOf"); out2.Add("LastIndexOf");
+            out2.Add("Sort"); out2.Add("Reverse"); out2.Add("ToArray");
+            out2.Add("Find"); out2.Add("FindAll"); out2.Add("FindIndex");
+            out2.Add("Exists"); out2.Add("ForEach"); out2.Add("AddRange");
+            out2.Add("GetRange"); out2.Add("CopyTo"); out2.Add("BinarySearch");
+            // LINQ chain methods
+            out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
+            out2.Add("OrderBy"); out2.Add("OrderByDescending"); out2.Add("ThenBy");
+            out2.Add("GroupBy"); out2.Add("First"); out2.Add("FirstOrDefault");
+            out2.Add("Last"); out2.Add("LastOrDefault"); out2.Add("Single");
+            out2.Add("Any"); out2.Add("All"); out2.Add("Sum"); out2.Add("Average");
+            out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
+            out2.Add("Distinct"); out2.Add("Concat"); out2.Add("ToList");
+            out2.Add("Aggregate"); out2.Add("Zip"); out2.Add("Append");
+            out2.Add("OfType"); out2.Add("Cast"); out2.Add("ToDictionary");
+        } else if (typeName == "Dictionary") {
+            out2.Add("Add"); out2.Add("Remove"); out2.Add("Clear"); out2.Add("Count");
+            out2.Add("ContainsKey"); out2.Add("ContainsValue"); out2.Add("TryGetValue");
+            out2.Add("Keys"); out2.Add("Values"); out2.Add("GetEnumerator");
+        } else if (typeName == "StringBuilder") {
+            out2.Add("Append"); out2.Add("AppendLine"); out2.Add("AppendFormat");
+            out2.Add("Insert"); out2.Add("Remove"); out2.Add("Replace");
+            out2.Add("Clear"); out2.Add("ToString"); out2.Add("Length");
+            out2.Add("Capacity"); out2.Add("EnsureCapacity");
+        } else if (typeName == "DateTime") {
+            out2.Add("Now"); out2.Add("Today"); out2.Add("UtcNow");
+            out2.Add("Year"); out2.Add("Month"); out2.Add("Day");
+            out2.Add("Hour"); out2.Add("Minute"); out2.Add("Second");
+            out2.Add("DayOfWeek"); out2.Add("DayOfYear"); out2.Add("Ticks");
+            out2.Add("AddDays"); out2.Add("AddHours"); out2.Add("AddMinutes");
+            out2.Add("AddSeconds"); out2.Add("AddMonths"); out2.Add("AddYears");
+            out2.Add("ToString"); out2.Add("ToShortDateString"); out2.Add("ToLongDateString");
+            out2.Add("Parse"); out2.Add("TryParse"); out2.Add("Compare");
+        } else if (typeName == "Array") {
+            out2.Add("Length"); out2.Add("Sort"); out2.Add("Reverse");
+            out2.Add("IndexOf"); out2.Add("Copy"); out2.Add("Clear");
+            out2.Add("Resize"); out2.Add("Find"); out2.Add("FindAll");
+            out2.Add("Exists"); out2.Add("ForEach"); out2.Add("ConvertAll");
+        } else if (typeName == "Process") {
+            out2.Add("Start"); out2.Add("Kill"); out2.Add("WaitForExit");
+            out2.Add("RunCapture"); out2.Add("ExitCode"); out2.Add("HasExited");
+            out2.Add("Id"); out2.Add("ProcessName"); out2.Add("GetCurrentProcess");
+            out2.Add("GetProcesses"); out2.Add("GetProcessesByName");
+            out2.Add("StandardOutput"); out2.Add("StandardError"); out2.Add("StandardInput");
+        } else if (typeName == "App") {
+            out2.Add("CreateDark"); out2.Add("Create"); out2.Add("Show");
+            out2.Add("BeginFrame"); out2.Add("PresentFrame"); out2.Add("RenderChrome");
+            out2.Add("ProcessEvent"); out2.Add("RequestRedraw"); out2.Add("Scale");
+            out2.Add("isRunning"); out2.Add("needsRedraw"); out2.Add("canvas");
+            out2.Add("theme"); out2.Add("window"); out2.Add("titlebarH");
+            out2.Add("mouseX"); out2.Add("mouseY"); out2.Add("focus");
+            out2.Add("hitTester"); out2.Add("ApplyEvent"); out2.Add("WindowHandle");
+            out2.Add("CaptureWheel");
+        } else if (typeName == "Canvas") {
+            out2.Add("DrawText"); out2.Add("FillRect"); out2.Add("DrawRect");
+            out2.Add("FillRoundRect"); out2.Add("Width"); out2.Add("Height");
+            out2.Add("MeasureText"); out2.Add("FontHeight"); out2.Add("Create");
+            out2.Add("Destroy"); out2.Add("DrawLine"); out2.Add("DrawCircle");
+            out2.Add("FillCircle"); out2.Add("SetClip"); out2.Add("ResetClip");
+        } else if (typeName == "Theme") {
+            out2.Add("bgPrimary"); out2.Add("bgSecondary"); out2.Add("bgTertiary");
+            out2.Add("bgHover"); out2.Add("bgActive"); out2.Add("textPrimary");
+            out2.Add("textSecondary"); out2.Add("textTertiary"); out2.Add("primary");
+            out2.Add("error"); out2.Add("warning"); out2.Add("success");
+            out2.Add("divider"); out2.Add("borderPrimary"); out2.Add("borderRadiusMedium");
+            out2.Add("borderRadiusSmall"); out2.Add("fontSizeSmall"); out2.Add("fontSizeMedium");
+            out2.Add("fontSizeLarge"); out2.Add("iconSizeLarge"); out2.Add("paddingSmall");
+            out2.Add("paddingMedium"); out2.Add("paddingLarge"); out2.Add("paddingTiny");
+            out2.Add("gapMedium"); out2.Add("heightMedium");
+        } else if (typeName == "Window") {
+            out2.Add("EventKind"); out2.Add("EventKeyCode"); out2.Add("EventX");
+            out2.Add("EventY"); out2.Add("PollEvent"); out2.Add("WaitEvent");
+            out2.Add("GetWidth"); out2.Add("GetHeight"); out2.Add("Close");
+            out2.Add("SetCursor"); out2.Add("GetTickMs"); out2.Add("SleepMs");
+        } else {
+            // Unknown type: common instance members + LINQ
+            out2.Add("ToString"); out2.Add("Equals"); out2.Add("GetHashCode");
+            out2.Add("GetType"); out2.Add("Count"); out2.Add("Length");
+            out2.Add("Add"); out2.Add("Remove"); out2.Add("RemoveAt");
+            out2.Add("Insert"); out2.Add("IndexOf"); out2.Add("Contains");
+            out2.Add("Clear"); out2.Add("Sort"); out2.Add("Reverse");
+            out2.Add("Substring"); out2.Add("Replace"); out2.Add("Trim");
+            out2.Add("StartsWith"); out2.Add("EndsWith"); out2.Add("Split");
+            out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
+            out2.Add("OrderBy"); out2.Add("OrderByDescending");
+            out2.Add("GroupBy"); out2.Add("First"); out2.Add("FirstOrDefault");
+            out2.Add("Last"); out2.Add("LastOrDefault"); out2.Add("Single");
+            out2.Add("Any"); out2.Add("All"); out2.Add("Sum"); out2.Add("Average");
+            out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
+            out2.Add("Distinct"); out2.Add("Concat"); out2.Add("ToList"); out2.Add("ToArray");
+            out2.Add("Aggregate"); out2.Add("Zip"); out2.Add("Append");
+            out2.Add("OfType"); out2.Add("Cast"); out2.Add("ToDictionary");
+        }
+    }
+
+    // ---- breakpoints ----
+
+    /// True when integer list `xs` contains `v`.
+    static bool HasInt(List<int> xs, int v) {
+        int i = 0;
+        while (i < xs.Count) {
+            if (xs[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when line `line` (0-based) has a breakpoint.
+    bool HasBreakpoint(int line) {
+        return CodeEditor.HasInt(bps, line);
+    }
+
+    /// Toggles a breakpoint on `line`.
+    void ToggleBreakpoint(int line) {
+        int idx = -1;
+        int i = 0;
+        while (i < bps.Count) {
+            if (bps[i] == line) { idx = i; }
+            i = i + 1;
+        }
+        if (idx >= 0) { bps.RemoveAt(idx); }
+        else { bps.Add(line); }
+    }
+
+    /// The set of breakpoint line numbers (0-based).
+    List<int> Breakpoints() {
+        return bps;
+    }
+
+    /// Highlights `line` as the currently paused execution line (-1 clears).
+    void SetExecLine(int line) {
+        execLine = line;
+        if (line >= 0) {
+            curLine = line;
+            if (curLine < scrollLine) { scrollLine = curLine; }
+        }
+    }
+
+    void HandleInput(App app) {
+        int kind = app.window.EventKind();
+        if (kind == 6) {
+            int code = app.window.EventKeyCode();
+            // Ctrl+A = select all (code 1)
+            if (code == 1) {
+                SelectAll();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+C = copy (code 3)
+            if (code == 3) {
+                CopySelection();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+X = cut (code 24)
+            if (code == 24) {
+                CutSelection();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+V = paste (code 22)
+            if (code == 22) {
+                PasteClipboard();
+                CheckErrors();
+                UpdateCompletion();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+Z = undo (code 26)
+            if (code == 26) {
+                Undo();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            if (code == 8) {
+                if (selActive) { DeleteSelection(); }
+                else { SaveUndo(); BackspaceEdit(); }
+                CheckErrors();
+                UpdateCompletion();
+                app.RequestRedraw();
+            } else if (code == 13) {
+                if (acActive) { AcceptCompletion(); }
+                else {
+                    if (selActive) { DeleteSelection(); }
+                    else { SaveUndo(); }
+                    NewLine();
+                    CheckErrors();
+                }
+                app.RequestRedraw();
+            } else if (code == 9) {
+                if (acActive) { AcceptCompletion(); }
+                else {
+                    if (selActive) { DeleteSelection(); }
+                    InsertStr("    ");
+                }
+                app.RequestRedraw();
+            } else if (code == 27) {
+                acActive = false;
+                selActive = false;
+                app.RequestRedraw();
+            } else if (code > 31) {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0) {
+                    if (selActive) { DeleteSelection(); }
+                    else { SaveUndo(); }
+                    InsertStr(ch);
+                    selActive = false;
+                    if (ch == ".") {
+                        DotCompletion();
+                    } else {
+                        UpdateCompletion();
+                    }
+                    CheckErrors();
+                    app.RequestRedraw();
+                }
+            }
+        } else if (kind == 4) {
+            int kc = app.window.EventKeyCode();
+            if (acActive && kc == 38) {
+                acSel = acSel - 1;
+                if (acSel < 0) { acSel = acItems.Count - 1; }
+                app.RequestRedraw();
+            } else if (acActive && kc == 40) {
+                acSel = acSel + 1;
+                if (acSel >= acItems.Count) { acSel = 0; }
+                app.RequestRedraw();
+            } else if (kc == 27) { acActive = false; selActive = false; app.RequestRedraw(); }
+            else if (kc == 37) { acActive = false; selActive = false; MoveLeft(); app.RequestRedraw(); }
+            else if (kc == 39) { acActive = false; selActive = false; MoveRight(); app.RequestRedraw(); }
+            else if (kc == 38) { selActive = false; MoveUp(); app.RequestRedraw(); }
+            else if (kc == 40) { selActive = false; MoveDown(); app.RequestRedraw(); }
+            else if (kc == 36) { curCol = 0; acActive = false; selActive = false; app.RequestRedraw(); }
+            else if (kc == 35) { curCol = lines[curLine].Length; acActive = false; selActive = false; app.RequestRedraw(); }
+            else if (kc == 46) {
+                if (selActive) { DeleteSelection(); }
+                else { SaveUndo(); DeleteEdit(); }
+                acActive = false;
+                CheckErrors();
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    /// Maps a pixel x-offset (relative to the text origin) to a column index by
+    /// measuring successive prefixes.
+    static int ColFromX(string s, int px, int fontSize) {
+        if (px <= 0) { return 0; }
+        int i = 1;
+        while (i <= s.Length) {
+            int w = Canvas.MeasureText(Text.Left(s, i), fontSize);
+            if (w >= px) { return i; }
+            i = i + 1;
+        }
+        return s.Length;
+    }
+
+    // ---- syntax highlighting ----
+
+    /// True when the one-character string `ch` occurs in `set`.
+    static bool InSet(string chars, string ch) {
+        int i = 0;
+        while (i < chars.Length) {
+            if (chars.Substring(i, 1) == ch) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `hay` contains the substring `needle`.
+    static bool ContainsSub(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        if (m == 0) { return true; }
+        int i = 0;
+        while (i + m <= n) {
+            if (hay.Substring(i, m) == needle) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `w` is a Zan/C#-style language keyword.
+    static bool IsKeyword(string w) {
+        string kws = " using namespace class struct enum interface static void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof ";
+        return CodeEditor.ContainsSub(kws, " " + w + " ");
+    }
+
+    /// Splits `line` into colored segments (parallel outT/outC lists): keywords,
+    /// types (Capitalized identifiers), strings, line comments and numbers get
+    /// distinct colors; everything else uses the default text color.
+    static void Highlight(string line, Theme t, List<string> outT, List<int> outC) {
+        int kwC = 0xFF569CD6;
+        int tyC = 0xFF4EC9B0;
+        int strC = 0xFFCE9178;
+        int comC = 0xFF6A9955;
+        int numC = 0xFFB5CEA8;
+        int def = t.textPrimary;
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string digits = "0123456789";
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int n = line.Length;
+        int i = 0;
+        string pending = "";
+        while (i < n) {
+            string ch = line.Substring(i, 1);
+            if (ch == "/" && i + 1 < n && line.Substring(i + 1, 1) == "/") {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                i = n;
+            } else if (ch == "\"") {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                int j = i + 1;
+                string s = "\"";
+                while (j < n) {
+                    string cj = line.Substring(j, 1);
+                    if (cj == "\\" && j + 1 < n) {
+                        s = s + cj + line.Substring(j + 1, 1);
+                        j = j + 2;
+                    } else if (cj == "\"") {
+                        s = s + cj;
+                        j = j + 1;
+                        break;
+                    } else {
+                        s = s + cj;
+                        j = j + 1;
+                    }
+                }
+                outT.Add(s); outC.Add(strC);
+                i = j;
+            } else if (CodeEditor.InSet(digits, ch)) {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                int j = i;
+                string num = "";
+                while (j < n) {
+                    string cj = line.Substring(j, 1);
+                    if (CodeEditor.InSet(digits, cj) || cj == "." || cj == "x"
+                        || CodeEditor.InSet("abcdefABCDEF", cj)) {
+                        num = num + cj; j = j + 1;
+                    } else { break; }
+                }
+                outT.Add(num); outC.Add(numC);
+                i = j;
+            } else if (CodeEditor.InSet(lower + upper + "_", ch)) {
+                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+                int j = i;
+                string w = "";
+                while (j < n) {
+                    string cj = line.Substring(j, 1);
+                    if (CodeEditor.InSet(idrest, cj)) { w = w + cj; j = j + 1; }
+                    else { break; }
+                }
+                int col = def;
+                if (CodeEditor.IsKeyword(w)) { col = kwC; }
+                else if (CodeEditor.InSet(upper, line.Substring(i, 1))) { col = tyC; }
+                outT.Add(w); outC.Add(col);
+                i = j;
+            } else {
+                pending = pending + ch;
+                i = i + 1;
+            }
+        }
+        if (pending.Length > 0) { outT.Add(pending); outC.Add(def); }
+    }
+
+    static void DrawSelHighlight(Canvas c, App app,
+            int aL, int aC, int cL, int cC,
+            int ln, string text, int textX, int rowY, int lineH, int fontSize, Rect area) {
+        int sL = aL; int sC = aC; int eL = cL; int eC = cC;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tL = sL; sL = eL; eL = tL;
+            int tC = sC; sC = eC; eC = tC;
+        }
+        if (ln < sL || ln > eL) { return; }
+        int startC = 0;
+        int endC = text.Length;
+        if (ln == sL) { startC = sC; }
+        if (ln == eL) { endC = eC; }
+        if (startC > text.Length) { startC = text.Length; }
+        if (endC > text.Length) { endC = text.Length; }
+        if (startC >= endC && ln != sL && ln != eL) {
+            startC = 0; endC = text.Length;
+        }
+        if (startC >= endC) { return; }
+        int xStart = textX + Canvas.MeasureText(Text.Left(text, startC), fontSize);
+        int xEnd = textX + Canvas.MeasureText(Text.Left(text, endC), fontSize);
+        c.FillRect(xStart, rowY, xEnd - xStart, lineH, 0x40264F78);
+    }
+
+    static string GetErrorMsg(List<int> errLines, List<string> errMsgs, int line) {
+        int i = 0;
+        while (i < errLines.Count) {
+            if (errLines[i] == line && i < errMsgs.Count) {
+                return errMsgs[i];
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    int Render(App app, Rect area) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int id = app.focus.AllocId();
+        lastId = id;
+        bool focused = app.focus.IsFocused(id);
+
+        int fontSize = t.fontSizeMedium;
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+        int gutterW = app.Scale(48);
+
+        c.FillRect(area.x, area.y, area.width, area.height, t.bgPrimary);
+        c.FillRect(area.x, area.y, gutterW, area.height, t.bgSecondary);
+        c.FillRect(area.x + gutterW, area.y, 1, area.height, t.divider);
+
+        app.CaptureWheel(area.x, area.y, area.width, area.height);
+
+        int visLines = area.height / lineH;
+        if (visLines < 1) { visLines = 1; }
+
+        if (focused) { HandleInput(app); }
+
+        if (app.window.EventKind() == 13) {
+            bool over = app.mouseX >= area.x && app.mouseX < area.x + area.width
+                        && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            if (over) {
+                int delta = app.window.EventKeyCode();
+                int step = delta / 120;
+                if (step == 0) {
+                    if (delta > 0) { step = 1; }
+                    else if (delta < 0) { step = 0 - 1; }
+                }
+                scrollLine = scrollLine - step * 3;
+                app.RequestRedraw();
+            }
+        }
+
+        if (curLine < scrollLine) { scrollLine = curLine; }
+        if (curLine >= scrollLine + visLines) { scrollLine = curLine - visLines + 1; }
+        int maxScroll = lines.Count - visLines;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (scrollLine > maxScroll) { scrollLine = maxScroll; }
+        if (scrollLine < 0) { scrollLine = 0; }
+
+        int textX = area.x + gutterW + t.paddingSmall;
+        int i = 0;
+        while (i < visLines) {
+            int ln = scrollLine + i;
+            if (ln < lines.Count) {
+                int rowY = area.y + i * lineH;
+                int textY = rowY + (lineH - Canvas.FontHeight(fontSize)) / 2;
+
+                if (ln == execLine) {
+                    c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1, lineH, 0x40FFB020);
+                } else if (ln == curLine && focused) {
+                    c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1, lineH, t.bgHover);
+                }
+
+                if (HasBreakpoint(ln)) {
+                    int dotSz = app.Scale(10);
+                    int dotX = area.x + app.Scale(6);
+                    int dotY = rowY + (lineH - dotSz) / 2;
+                    c.FillRoundRect(dotX, dotY, dotSz, dotSz, dotSz, t.error);
+                }
+                if (ln == execLine) {
+                    int aw = app.Scale(10);
+                    int ax = area.x + app.Scale(6);
+                    int ay = rowY + (lineH - aw) / 2;
+                    c.FillRoundRect(ax, ay, aw, aw, app.Scale(2), 0xFFFFB020);
+                }
+
+                string num = Convert.ToString(ln + 1);
+                int numW = Canvas.MeasureText(num, fontSize);
+                c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num, t.textTertiary, fontSize);
+
+                string text = lines[ln];
+
+                // Selection highlight
+                if (selActive) {
+                    CodeEditor.DrawSelHighlight(c, app, selAnchorLine, selAnchorCol,
+                        curLine, curCol, ln, text, textX, rowY, lineH, fontSize, area);
+                }
+
+                // Error indicator (red underline)
+                if (CodeEditor.HasInt(errorLines, ln)) {
+                    c.FillRect(textX, rowY + lineH - app.Scale(2),
+                        Canvas.MeasureText(text, fontSize), app.Scale(2), 0xAAFF4444);
+                }
+
+                List<string> segT = new List<string>();
+                List<int> segC = new List<int>();
+                CodeEditor.Highlight(text, t, segT, segC);
+                int sx = textX;
+                int si2 = 0;
+                while (si2 < segT.Count) {
+                    c.DrawText(sx, textY, segT[si2], segC[si2], fontSize);
+                    sx = sx + Canvas.MeasureText(segT[si2], fontSize);
+                    si2 = si2 + 1;
+                }
+
+                if (ln == curLine && focused) {
+                    string upto = Text.Left(text, curCol);
+                    int cxp = textX + Canvas.MeasureText(upto, fontSize);
+                    c.FillRect(cxp, rowY + app.Scale(2), 1, lineH - app.Scale(4), t.primary);
+                }
+
+                // Show error tooltip on hovered error line
+                if (CodeEditor.HasInt(errorLines, ln) && ln == curLine) {
+                    string errMsg = CodeEditor.GetErrorMsg(errorLines, errorMsgs, ln);
+                    if (errMsg.Length > 0) {
+                        int ttW = Canvas.MeasureText(errMsg, fontSize) + app.Scale(12);
+                        int ttH = lineH;
+                        int ttX = textX;
+                        int ttY = rowY - ttH - app.Scale(2);
+                        if (ttY < area.y) { ttY = rowY + lineH; }
+                        c.FillRoundRect(ttX, ttY, ttW, ttH, app.Scale(3), 0xFF5A1D1D);
+                        c.DrawRect(ttX, ttY, ttW, ttH, 0xFFFF4444, 1);
+                        c.DrawText(ttX + app.Scale(6), ttY + app.Scale(3), errMsg, 0xFFFF8888, fontSize);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+
+        // ---- autocomplete popup (drawn below the cursor, with icons) ----
+        if (acActive && focused && acItems.Count > 0
+            && curLine >= scrollLine && curLine < scrollLine + visLines) {
+            int prow = curLine - scrollLine;
+            int pRowY = area.y + prow * lineH;
+            int px = textX + Canvas.MeasureText(Text.Left(lines[curLine], acStart), fontSize);
+            int maxShow = 10;
+            int shown = acItems.Count;
+            if (shown > maxShow) { shown = maxShow; }
+            int itemH2 = lineH + app.Scale(2);
+            int popH2 = shown * itemH2 + app.Scale(4);
+            int iconW = app.Scale(22);
+            int popW2 = app.Scale(220);
+            int k = 0;
+            while (k < acItems.Count) {
+                int wpx = Canvas.MeasureText(acItems[k], fontSize) + iconW + app.Scale(16);
+                if (wpx > popW2) { popW2 = wpx; }
+                k = k + 1;
+            }
+            if (popW2 > app.Scale(400)) { popW2 = app.Scale(400); }
+            int popY2 = pRowY + lineH;
+            // Ensure popup stays within the visible area
+            if (popY2 + popH2 > area.y + area.height) { popY2 = pRowY - popH2; }
+            if (px + popW2 > area.x + area.width) { px = area.x + area.width - popW2 - 4; }
+            int first2 = 0;
+            if (acSel >= maxShow) { first2 = acSel - maxShow + 1; }
+            // Save popup geometry for click detection
+            popX = px; popY = popY2; popW = popW2; popH = popH2;
+            popItemH = itemH2; popFirst = first2; popShown = shown;
+            // Draw shadow
+            c.FillRoundRect(px + 2, popY2 + 2, popW2, popH2, app.Scale(4), 0x40000000);
+            // Draw popup background
+            c.FillRoundRect(px, popY2, popW2, popH2, app.Scale(4), 0xFF252526);
+            c.DrawRect(px, popY2, popW2, popH2, 0xFF3E3E42, 1);
+            int r2 = 0;
+            while (r2 < shown) {
+                int idx = first2 + r2;
+                if (idx < acItems.Count) {
+                    int iy = popY2 + app.Scale(2) + r2 * itemH2;
+                    int tcol = 0xFFD4D4D4;
+                    if (idx == acSel) {
+                        c.FillRect(px + 2, iy, popW2 - 4, itemH2, 0xFF094771);
+                        tcol = 0xFFFFFFFF;
+                    }
+                    int ity = iy + (itemH2 - Canvas.FontHeight(fontSize)) / 2;
+                    // Draw kind icon/indicator
+                    string kind2 = "";
+                    if (idx < acKinds.Count) { kind2 = acKinds[idx]; }
+                    int iconColor = 0xFF569CD6;
+                    string iconLetter = "?";
+                    if (kind2 == "M") { iconColor = 0xFF9B6DCA; iconLetter = "M"; }
+                    else if (kind2 == "P") { iconColor = 0xFF569CD6; iconLetter = "P"; }
+                    else if (kind2 == "T") { iconColor = 0xFF4EC9B0; iconLetter = "T"; }
+                    else if (kind2 == "K") { iconColor = 0xFF569CD6; iconLetter = "K"; }
+                    else if (kind2 == "S") { iconColor = 0xFFDCDCAA; iconLetter = "S"; }
+                    else if (kind2 == "F") { iconColor = 0xFF9CDCFE; iconLetter = "F"; }
+                    else if (kind2 == "E") { iconColor = 0xFFB8D7A3; iconLetter = "E"; }
+                    else { iconColor = 0xFFCCCCCC; iconLetter = "W"; }
+                    c.FillRoundRect(px + app.Scale(3), ity, app.Scale(16), app.Scale(16), app.Scale(3), iconColor);
+                    c.DrawText(px + app.Scale(6), ity + app.Scale(1), iconLetter, 0xFF1E1E1E, t.fontSizeSmall);
+                    c.DrawText(px + iconW, ity, acItems[idx], tcol, fontSize);
+                }
+                r2 = r2 + 1;
+            }
+            // Scrollbar hint if there are more items
+            if (acItems.Count > maxShow) {
+                int sbH = popH2 * shown / acItems.Count;
+                if (sbH < app.Scale(10)) { sbH = app.Scale(10); }
+                int sbY = popY2 + (popH2 - sbH) * first2 / (acItems.Count - shown);
+                c.FillRoundRect(px + popW2 - app.Scale(6), sbY, app.Scale(4), sbH, app.Scale(2), 0xFF555555);
+            }
+        }
+
+        app.hitTester.Register(HitRegion.Create(id, area.x, area.y, area.width, area.height, 1));
+
+        if (app.window.EventKind() == 3) {
+            // Check autocomplete popup click FIRST
+            if (acActive && popShown > 0
+                && app.mouseX >= popX && app.mouseX < popX + popW
+                && app.mouseY >= popY && app.mouseY < popY + popH) {
+                int relY = app.mouseY - popY - app.Scale(2);
+                int clickedRow = relY / popItemH;
+                if (clickedRow >= 0 && clickedRow < popShown) {
+                    int clickedIdx = popFirst + clickedRow;
+                    if (clickedIdx >= 0 && clickedIdx < acItems.Count) {
+                        acSel = clickedIdx;
+                        AcceptCompletion();
+                    }
+                }
+                app.RequestRedraw();
+            } else {
+                int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
+                if (hit == id) {
+                    int rel = app.mouseY - area.y;
+                    int clicked = scrollLine + rel / lineH;
+                    if (clicked >= lines.Count) { clicked = lines.Count - 1; }
+                    if (clicked < 0) { clicked = 0; }
+                    if (app.mouseX < area.x + gutterW) {
+                        ToggleBreakpoint(clicked);
+                    } else {
+                        curLine = clicked;
+                        curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+                    }
+                    acActive = false;
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        // ---- Debug hover tooltip ----
+        if (execLine >= 0 && dbgVars.Count > 0) {
+            // Detect word under mouse cursor
+            if (app.mouseX >= textX && app.mouseX < area.x + area.width
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+                int hoverLine = scrollLine + (app.mouseY - area.y) / lineH;
+                if (hoverLine >= 0 && hoverLine < lines.Count) {
+                    int hoverCol = CodeEditor.ColFromX(lines[hoverLine], app.mouseX - textX, fontSize);
+                    string hWord = CodeEditor.WordAt(lines[hoverLine], hoverCol);
+                    if (hWord.Length > 0) {
+                        string tip = CodeEditor.LookupVar(dbgVars, hWord);
+                        if (tip.Length > 0) {
+                            hoverTip = tip;
+                            hoverTipX = app.mouseX;
+                            hoverTipY = app.mouseY;
+                        } else {
+                            hoverTip = "";
+                        }
+                    } else {
+                        hoverTip = "";
+                    }
+                }
+            }
+            // Draw tooltip
+            if (hoverTip.Length > 0) {
+                int ttW2 = Canvas.MeasureText(hoverTip, fontSize) + app.Scale(16);
+                int ttH2 = lineH + app.Scale(4);
+                int ttX2 = hoverTipX + app.Scale(8);
+                int ttY2 = hoverTipY - ttH2 - app.Scale(4);
+                if (ttY2 < area.y) { ttY2 = hoverTipY + app.Scale(20); }
+                if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - 4; }
+                c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), 0x60000000);
+                c.FillRoundRect(ttX2, ttY2, ttW2, ttH2, app.Scale(4), 0xFF1E1E1E);
+                c.DrawRect(ttX2, ttY2, ttW2, ttH2, 0xFF569CD6, 1);
+                c.DrawText(ttX2 + app.Scale(8), ttY2 + app.Scale(4), hoverTip, 0xFFCE9178, fontSize);
+            }
+        }
+
+        return id;
+    }
+
+    static string WordAt(string line, int col) {
+        if (col < 0 || col >= line.Length) { return ""; }
+        // Find word boundaries
+        int start = col;
+        while (start > 0) {
+            string ch = line.Substring(start - 1, 1);
+            if (CodeEditor.IsIdentChar(ch)) { start = start - 1; }
+            else { break; }
+        }
+        int end = col;
+        while (end < line.Length) {
+            string ch = line.Substring(end, 1);
+            if (CodeEditor.IsIdentChar(ch)) { end = end + 1; }
+            else { break; }
+        }
+        if (start == end) { return ""; }
+        return line.Substring(start, end - start);
+    }
+
+    static bool IsIdentChar(string ch) {
+        if (ch == "_") { return true; }
+        int c = ch.Substring(0, 1).Length;
+        if (c == 0) { return false; }
+        string fc = ch.Substring(0, 1);
+        if (fc >= "a" && fc <= "z") { return true; }
+        if (fc >= "A" && fc <= "Z") { return true; }
+        if (fc >= "0" && fc <= "9") { return true; }
+        return false;
+    }
+
+    static string LookupVar(List<string> vars, string name) {
+        int i = 0;
+        while (i < vars.Count) {
+            string entry = vars[i];
+            // entry is "name\ttype\tvalue"
+            int tab1 = -1;
+            int tab2 = -1;
+            int j = 0;
+            while (j < entry.Length) {
+                string ch = entry.Substring(j, 1);
+                if (ch == "\t") {
+                    if (tab1 < 0) { tab1 = j; }
+                    else if (tab2 < 0) { tab2 = j; }
+                }
+                j = j + 1;
+            }
+            if (tab1 > 0) {
+                string vName = entry.Substring(0, tab1);
+                if (vName == name) {
+                    string vType = "";
+                    string vVal = "";
+                    if (tab2 > tab1) {
+                        vType = entry.Substring(tab1 + 1, tab2 - tab1 - 1);
+                        vVal = entry.Substring(tab2 + 1, entry.Length - tab2 - 1);
+                    } else {
+                        vType = entry.Substring(tab1 + 1, entry.Length - tab1 - 1);
+                    }
+                    return vName + " : " + vType + " = " + vVal;
+                }
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+}

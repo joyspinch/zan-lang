@@ -1,0 +1,320 @@
+using System;
+using System.Net.Sockets;
+
+namespace System.Net.Mqtt;
+
+class MqttPacketType {
+    static int CONNECT     = 1;
+    static int CONNACK     = 2;
+    static int PUBLISH     = 3;
+    static int PUBACK      = 4;
+    static int SUBSCRIBE   = 8;
+    static int SUBACK      = 9;
+    static int UNSUBSCRIBE = 10;
+    static int UNSUBACK    = 11;
+    static int PINGREQ     = 12;
+    static int PINGRESP    = 13;
+    static int DISCONNECT  = 14;
+}
+
+class MqttQos {
+    static int AtMostOnce  = 0;
+    static int AtLeastOnce = 1;
+    static int ExactlyOnce = 2;
+}
+
+/// <summary>
+/// MQTT v3.1.1 client.
+/// </summary>
+class MqttClient {
+    TcpClient conn;
+    string clientId;
+    string host;
+    int port;
+    bool connected;
+    int nextPacketId;
+    int keepAlive;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    [DllImport("crt")]
+    static extern int strlen(string str);
+
+    MqttClient() {
+        this.clientId = "";
+        this.host = "";
+        this.port = 1883;
+        this.connected = false;
+        this.nextPacketId = 1;
+        this.keepAlive = 60;
+    }
+
+    static MqttClient ConnectAsync(string host, int port, string clientId) {
+        MqttClient mqtt = new MqttClient();
+        mqtt.host = host;
+        mqtt.port = port;
+        mqtt.clientId = clientId;
+
+        mqtt.conn = TcpClient.ConnectAsync(host, port);
+
+        string packet = mqtt.BuildConnectPacket();
+        mqtt.conn.SendBytesAsync(packet, mqtt.CalcConnectLen());
+
+        string response = mqtt.conn.RecvAsync(4);
+        int packetType = (response[0] >> 4) & 15;
+        if (packetType == MqttPacketType.CONNACK) {
+            int returnCode = response[3] & 255;
+            if (returnCode == 0) {
+                mqtt.connected = true;
+            }
+        }
+
+        return mqtt;
+    }
+
+    void Publish(string topic, string message, int qos) {
+        int topicLen = strlen(topic);
+        int msgLen = strlen(message);
+
+        int byte0 = (MqttPacketType.PUBLISH << 4);
+        if (qos > 0) {
+            byte0 = byte0 + (qos << 1);
+        }
+
+        int remainLen = 2 + topicLen + msgLen;
+        if (qos > 0) {
+            remainLen = remainLen + 2;
+        }
+
+        string packet = calloc(remainLen + 2, 1);
+        int offset = 0;
+        packet[offset] = byte0;
+        offset = offset + 1;
+        packet[offset] = remainLen;
+        offset = offset + 1;
+
+        packet[offset] = (topicLen >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = topicLen & 255;
+        offset = offset + 1;
+
+        int i = 0;
+        while (i < topicLen) {
+            packet[offset] = topic[i];
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        if (qos > 0) {
+            int pid = this.nextPacketId;
+            this.nextPacketId = this.nextPacketId + 1;
+            packet[offset] = (pid >> 8) & 255;
+            offset = offset + 1;
+            packet[offset] = pid & 255;
+            offset = offset + 1;
+        }
+
+        i = 0;
+        while (i < msgLen) {
+            packet[offset] = message[i];
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        this.conn.SendBytesAsync(packet, offset);
+
+        if (qos == MqttQos.AtLeastOnce) {
+            string ack = this.conn.RecvAsync(4);
+        }
+    }
+
+    void Subscribe(string topic, int qos) {
+        int topicLen = strlen(topic);
+        int pid = this.nextPacketId;
+        this.nextPacketId = this.nextPacketId + 1;
+
+        int remainLen = 2 + 2 + topicLen + 1;
+        string packet = calloc(remainLen + 2, 1);
+        int offset = 0;
+
+        packet[offset] = (MqttPacketType.SUBSCRIBE << 4) + 2;
+        offset = offset + 1;
+        packet[offset] = remainLen;
+        offset = offset + 1;
+
+        packet[offset] = (pid >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = pid & 255;
+        offset = offset + 1;
+
+        packet[offset] = (topicLen >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = topicLen & 255;
+        offset = offset + 1;
+
+        int i = 0;
+        while (i < topicLen) {
+            packet[offset] = topic[i];
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        packet[offset] = qos;
+        offset = offset + 1;
+
+        this.conn.SendBytesAsync(packet, offset);
+        string ack = this.conn.RecvAsync(16);
+    }
+
+    void Unsubscribe(string topic) {
+        int topicLen = strlen(topic);
+        int pid = this.nextPacketId;
+        this.nextPacketId = this.nextPacketId + 1;
+
+        int remainLen = 2 + 2 + topicLen;
+        string packet = calloc(remainLen + 2, 1);
+        int offset = 0;
+
+        packet[offset] = (MqttPacketType.UNSUBSCRIBE << 4) + 2;
+        offset = offset + 1;
+        packet[offset] = remainLen;
+        offset = offset + 1;
+
+        packet[offset] = (pid >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = pid & 255;
+        offset = offset + 1;
+
+        packet[offset] = (topicLen >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = topicLen & 255;
+        offset = offset + 1;
+
+        int i = 0;
+        while (i < topicLen) {
+            packet[offset] = topic[i];
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        this.conn.SendBytesAsync(packet, offset);
+        string ack = this.conn.RecvAsync(16);
+    }
+
+    string Receive() {
+        string data = this.conn.RecvAsync(65536);
+        if (data.Length == 0) {
+            this.connected = false;
+            return data;
+        }
+
+        int byte0 = data[0] & 255;
+        int packetType = (byte0 >> 4) & 15;
+
+        if (packetType == MqttPacketType.PUBLISH) {
+            int remainLen = data[1] & 127;
+            int offset = 2;
+
+            int topicLen = ((data[offset] & 255) << 8) + (data[offset + 1] & 255);
+            offset = offset + 2;
+            offset = offset + topicLen;
+
+            int qos = (byte0 >> 1) & 3;
+            if (qos > 0) {
+                offset = offset + 2;
+            }
+
+            int payloadLen = remainLen - (offset - 2);
+            string payload = data.Substring(offset, payloadLen);
+            return payload;
+        } else if (packetType == MqttPacketType.PINGREQ) {
+            string pong = calloc(2, 1);
+            pong[0] = MqttPacketType.PINGRESP << 4;
+            pong[1] = 0;
+            this.conn.SendBytesAsync(pong, 2);
+            return Receive();
+        }
+
+        return data;
+    }
+
+    void Ping() {
+        string packet = calloc(2, 1);
+        packet[0] = MqttPacketType.PINGREQ << 4;
+        packet[1] = 0;
+        this.conn.SendBytesAsync(packet, 2);
+    }
+
+    void Disconnect() {
+        string packet = calloc(2, 1);
+        packet[0] = MqttPacketType.DISCONNECT << 4;
+        packet[1] = 0;
+        this.conn.SendBytesAsync(packet, 2);
+        this.conn.Close();
+        this.connected = false;
+    }
+
+    bool IsConnected() {
+        return this.connected;
+    }
+
+    string BuildConnectPacket() {
+        int clientIdLen = strlen(this.clientId);
+        int remainLen = 10 + 2 + clientIdLen;
+
+        string packet = calloc(remainLen + 2, 1);
+        int offset = 0;
+
+        packet[offset] = MqttPacketType.CONNECT << 4;
+        offset = offset + 1;
+        packet[offset] = remainLen;
+        offset = offset + 1;
+
+        packet[offset] = 0;
+        offset = offset + 1;
+        packet[offset] = 4;
+        offset = offset + 1;
+        packet[offset] = 77;
+        offset = offset + 1;
+        packet[offset] = 81;
+        offset = offset + 1;
+        packet[offset] = 84;
+        offset = offset + 1;
+        packet[offset] = 84;
+        offset = offset + 1;
+
+        packet[offset] = 4;
+        offset = offset + 1;
+
+        packet[offset] = 2;
+        offset = offset + 1;
+
+        packet[offset] = (this.keepAlive >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = this.keepAlive & 255;
+        offset = offset + 1;
+
+        packet[offset] = (clientIdLen >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = clientIdLen & 255;
+        offset = offset + 1;
+
+        int i = 0;
+        while (i < clientIdLen) {
+            packet[offset] = this.clientId[i];
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        return packet;
+    }
+
+    int CalcConnectLen() {
+        int clientIdLen = strlen(this.clientId);
+        return 2 + 10 + 2 + clientIdLen;
+    }
+}

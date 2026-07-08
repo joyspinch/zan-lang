@@ -1,0 +1,158 @@
+using System;
+
+namespace Gui;
+
+/// <summary>
+/// Linear layout cursor for immediate-mode composition.
+///
+/// A Stack wraps a content rectangle and a main-axis direction (row/column).
+/// Callers carve child rectangles out of it in order via Slot()/Fill()/Space(),
+/// so widgets no longer need hand-computed x/y/w/h. Each allocation advances an
+/// internal cursor and honours the configured gap and padding.
+///
+/// Because the framework is immediate-mode, a Stack is a cheap per-frame value:
+/// build it, place children top-to-bottom (or left-to-right), discard it.
+///
+/// Example (a padded toolbar row with a fixed button then a flexible search box):
+///   Stack bar = Stack.Row(x, y, w, h);
+///   bar.SetPad(8);
+///   bar.SetGap(8);
+///   Rect btn = bar.Slot(96);
+///   Rect search = bar.Fill();
+/// </summary>
+class Stack {
+    /// Content box the cursor walks inside (already inset by padding).
+    int ox;
+    int oy;
+    int ow;
+    int oh;
+    /// Main axis: 0 = row (horizontal), 1 = column (vertical).
+    int dir;
+    int gap;
+    /// Offset of the cursor along the main axis, relative to the content box.
+    int cursor;
+    /// Number of children placed (drives gap insertion).
+    int placed;
+
+    static Stack Of(int x, int y, int w, int h, int direction, int gap) {
+        Stack s = new Stack();
+        s.ox = x;
+        s.oy = y;
+        s.ow = w;
+        s.oh = h;
+        s.dir = direction;
+        s.gap = gap;
+        s.cursor = 0;
+        s.placed = 0;
+        return s;
+    }
+
+    /// A top-to-bottom (vertical) stack filling the given rectangle.
+    static Stack Column(int x, int y, int w, int h) {
+        return Stack.Of(x, y, w, h, 1, 0);
+    }
+
+    /// A left-to-right (horizontal) stack filling the given rectangle.
+    static Stack Row(int x, int y, int w, int h) {
+        return Stack.Of(x, y, w, h, 0, 0);
+    }
+
+    /// A vertical stack laid out inside an existing Rect.
+    static Stack ColumnIn(Rect r) {
+        return Stack.Of(r.x, r.y, r.width, r.height, 1, 0);
+    }
+
+    /// A horizontal stack laid out inside an existing Rect.
+    static Stack RowIn(Rect r) {
+        return Stack.Of(r.x, r.y, r.width, r.height, 0, 0);
+    }
+
+    /// Sets the gap inserted between consecutive children. Returns this so it
+    /// can be used as a standalone statement (not chained before another call).
+    Stack SetGap(int g) {
+        gap = g;
+        return this;
+    }
+
+    /// Insets the content box uniformly on all four sides. Call before placing
+    /// children; it shrinks the walkable area so Slot/Fill/Remaining respect it.
+    Stack SetPad(int p) {
+        return SetPadding(p, p, p, p);
+    }
+
+    /// Insets the content box per edge (top, right, bottom, left).
+    Stack SetPadding(int top, int right, int bottom, int left) {
+        ox = ox + left;
+        oy = oy + top;
+        ow = ow - left - right;
+        oh = oh - top - bottom;
+        if (ow < 0) { ow = 0; }
+        if (oh < 0) { oh = 0; }
+        return this;
+    }
+
+    /// Length of the main axis (width for a row, height for a column).
+    int MainSize() {
+        if (dir == 1) { return oh; }
+        return ow;
+    }
+
+    /// Length of the cross axis (height for a row, width for a column).
+    int CrossSize() {
+        if (dir == 1) { return ow; }
+        return oh;
+    }
+
+    /// Space still available along the main axis after what has been placed.
+    int Remaining() {
+        int rem = MainSize() - cursor;
+        if (rem < 0) { rem = 0; }
+        return rem;
+    }
+
+    /// True if a child of the given main-axis size (plus a leading gap when not
+    /// the first child) still fits in the remaining space.
+    bool HasRoom(int mainSize) {
+        int need = mainSize;
+        if (placed > 0) { need = need + gap; }
+        return need <= Remaining();
+    }
+
+    /// Advances the cursor without producing a child rect (a spacer).
+    void Space(int mainSize) {
+        if (placed > 0) { cursor = cursor + gap; }
+        cursor = cursor + mainSize;
+        placed = placed + 1;
+    }
+
+    /// Carves the next child rectangle of the given main-axis size. The cross
+    /// axis is stretched to the full content extent. Advances the cursor.
+    Rect Slot(int mainSize) {
+        if (placed > 0) { cursor = cursor + gap; }
+        Rect r;
+        if (dir == 1) {
+            r = Rect.Create(ox, oy + cursor, ow, mainSize);
+        } else {
+            r = Rect.Create(ox + cursor, oy, mainSize, oh);
+        }
+        cursor = cursor + mainSize;
+        placed = placed + 1;
+        return r;
+    }
+
+    /// Carves a child that takes all remaining main-axis space (a flexible
+    /// fill). Useful as the last child of a stack.
+    Rect Fill() {
+        int rem = Remaining();
+        if (placed > 0) { rem = rem - gap; }
+        if (rem < 0) { rem = 0; }
+        return Slot(rem);
+    }
+
+    /// Carves a child sized to a fraction (permille, 0..1000) of the ORIGINAL
+    /// main-axis extent — handy for proportional splits like a 300/700 sidebar.
+    Rect SlotFraction(int permille) {
+        int size = MainSize() * permille / 1000;
+        return Slot(size);
+    }
+}

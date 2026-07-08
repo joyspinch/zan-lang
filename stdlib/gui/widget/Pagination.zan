@@ -1,0 +1,138 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// Pagination with reactive page binding.
+/// For large page counts the middle is windowed with ellipses
+/// (NaiveUI-style): 1 … 4 5 [6] 7 8 … 200.
+class Pagination {
+
+    /// Builds the visible page list for the current page. A value of 0 marks
+    /// an ellipsis placeholder. Small ranges (<= 7 pages) show every page.
+    static List<int> BuildPages(int totalPages, int current) {
+        List<int> r = new List<int>();
+        if (totalPages <= 7) {
+            int i = 1;
+            while (i <= totalPages) { r.Add(i); i = i + 1; }
+            return r;
+        }
+        r.Add(1);
+        int lo = current - 1;
+        int hi = current + 1;
+        if (lo < 2) { lo = 2; }
+        if (hi > totalPages - 1) { hi = totalPages - 1; }
+        if (lo > 2) { r.Add(0); }
+        int p = lo;
+        while (p <= hi) { r.Add(p); p = p + 1; }
+        if (hi < totalPages - 1) { r.Add(0); }
+        r.Add(totalPages);
+        return r;
+    }
+
+    static int Render(App app, int x, int y, int totalPages, SignalInt model) {
+        int firstId = app.focus.AllocId();
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int currentPage = model.Get();
+
+        int btnSize = t.heightMedium;
+        int gap = t.gapSmall;
+        int ico = t.iconSizeSmall;
+        int cx = x;
+
+        // Prev
+        bool prevHovered = app.focus.IsHovered(firstId);
+        bool prevDisabled = currentPage <= 1;
+        int prevBg = t.bgPrimary;
+        if (prevHovered && !prevDisabled) { prevBg = t.bgHover; }
+        int prevArrow = t.textPrimary;
+        if (prevDisabled) { prevArrow = t.textDisabled; }
+        c.FillRoundRect(cx, y, btnSize, btnSize, t.borderRadiusSmall, prevBg);
+        c.DrawRect(cx, y, btnSize, btnSize, t.borderPrimary, 1);
+        Icon.Draw(c, "arrow-left", cx + (btnSize - ico) / 2, y + (btnSize - ico) / 2, ico, prevArrow);
+        app.hitTester.Register(HitRegion.Create(firstId, cx, y, btnSize, btnSize, 0));
+        cx = cx + btnSize + gap;
+
+        // Windowed page buttons. One id is allocated per entry (including
+        // ellipsis) so HandleClick can recompute the same layout.
+        List<int> pages = Pagination.BuildPages(totalPages, currentPage);
+        int i = 0;
+        while (i < pages.Count) {
+            int pageId = app.focus.AllocId();
+            int pg = pages[i];
+            if (pg == 0) {
+                c.DrawTextCentered(cx, y, btnSize, btnSize, "…", t.textTertiary, t.fontSizeMedium);
+            } else {
+                bool hovered = app.focus.IsHovered(pageId);
+                bool active = pg == currentPage;
+                int bg = t.bgPrimary;
+                int textColor = t.textPrimary;
+                int borderC = t.borderPrimary;
+                if (active) { bg = t.primary; textColor = t.textInverse; borderC = t.primary; }
+                if (hovered && !active) { bg = t.bgHover; borderC = t.borderHover; }
+                c.FillRoundRect(cx, y, btnSize, btnSize, t.borderRadiusSmall, bg);
+                c.DrawRect(cx, y, btnSize, btnSize, borderC, 1);
+                c.DrawTextCentered(cx, y, btnSize, btnSize, Convert.ToString(pg), textColor, t.fontSizeMedium);
+                app.hitTester.Register(HitRegion.Create(pageId, cx, y, btnSize, btnSize, 0));
+            }
+            cx = cx + btnSize + gap;
+            i = i + 1;
+        }
+
+        // Next
+        int nextId = app.focus.AllocId();
+        bool nextHovered = app.focus.IsHovered(nextId);
+        bool nextDisabled = currentPage >= totalPages;
+        int nextBg = t.bgPrimary;
+        if (nextHovered && !nextDisabled) { nextBg = t.bgHover; }
+        int nextArrow = t.textPrimary;
+        if (nextDisabled) { nextArrow = t.textDisabled; }
+        c.FillRoundRect(cx, y, btnSize, btnSize, t.borderRadiusSmall, nextBg);
+        c.DrawRect(cx, y, btnSize, btnSize, t.borderPrimary, 1);
+        Icon.Draw(c, "arrow-right", cx + (btnSize - ico) / 2, y + (btnSize - ico) / 2, ico, nextArrow);
+        app.hitTester.Register(HitRegion.Create(nextId, cx, y, btnSize, btnSize, 0));
+
+        return firstId;
+    }
+
+    /// Total pixel width of the control for the given page count, so callers
+    /// can center it. Mirrors the id/entry layout used in Render.
+    static int MeasureWidth(App app, int totalPages, int current) {
+        Theme t = app.theme;
+        int btnSize = t.heightMedium;
+        int gap = t.gapSmall;
+        List<int> pages = Pagination.BuildPages(totalPages, current);
+        int count = pages.Count + 2; // prev + entries + next
+        return count * (btnSize + gap) - gap;
+    }
+
+    /// Handles clicks on prev / page / next buttons and updates the bound page.
+    /// Ids are allocated in Render as: firstId=prev, then one per windowed
+    /// entry, then next.
+    static void HandleClick(App app, int firstId, int totalPages, SignalInt model) {
+        if (app.window.EventKind() != 3) { return; }
+        int hitId = app.hitTester.HitTest(app.mouseX, app.mouseY);
+        int current = model.Get();
+
+        if (hitId == firstId) {
+            if (current > 1) { model.Set(current - 1); app.RequestRedraw(); }
+            return;
+        }
+        List<int> pages = Pagination.BuildPages(totalPages, current);
+        int nextId = firstId + 1 + pages.Count;
+        if (hitId == nextId) {
+            if (current < totalPages) { model.Set(current + 1); app.RequestRedraw(); }
+            return;
+        }
+        int i = 0;
+        while (i < pages.Count) {
+            if (hitId == firstId + 1 + i) {
+                int pg = pages[i];
+                if (pg != 0 && pg != current) { model.Set(pg); app.RequestRedraw(); }
+                return;
+            }
+            i = i + 1;
+        }
+    }
+}

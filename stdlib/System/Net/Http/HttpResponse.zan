@@ -1,0 +1,204 @@
+using System;
+
+namespace System.Net.Http;
+
+/// <summary>
+/// HTTP response builder and parser.
+/// </summary>
+class HttpResponse {
+    int statusCode;
+    string statusText;
+    string body;
+    string contentType;
+    List<string> headers;
+    bool keepAlive;
+
+    HttpResponse() {
+        this.statusCode = 200;
+        this.statusText = "OK";
+        this.body = "";
+        this.contentType = "text/html";
+        this.headers = new List<string>();
+        this.keepAlive = true;
+    }
+
+    /// <summary>Creates a 200 OK response with the given body.</summary>
+    static HttpResponse Ok(string body) {
+        HttpResponse resp = new HttpResponse();
+        resp.body = body;
+        return resp;
+    }
+
+    /// <summary>Creates a JSON response.</summary>
+    static HttpResponse Json(string jsonBody) {
+        HttpResponse resp = new HttpResponse();
+        resp.body = jsonBody;
+        resp.contentType = "application/json";
+        return resp;
+    }
+
+    /// <summary>Creates a plain text response.</summary>
+    static HttpResponse Text(string text) {
+        HttpResponse resp = new HttpResponse();
+        resp.body = text;
+        resp.contentType = "text/plain";
+        return resp;
+    }
+
+    /// <summary>Creates a redirect response.</summary>
+    static HttpResponse Redirect(string url) {
+        HttpResponse resp = new HttpResponse();
+        resp.statusCode = 302;
+        resp.statusText = "Found";
+        resp.headers.Add("Location: " + url);
+        return resp;
+    }
+
+    /// <summary>Creates a 404 Not Found response.</summary>
+    static HttpResponse NotFound() {
+        HttpResponse resp = new HttpResponse();
+        resp.statusCode = 404;
+        resp.statusText = "Not Found";
+        resp.body = "<h1>404 Not Found</h1>";
+        return resp;
+    }
+
+    /// <summary>Creates a 500 Internal Server Error response.</summary>
+    static HttpResponse ServerError(string message) {
+        HttpResponse resp = new HttpResponse();
+        resp.statusCode = 500;
+        resp.statusText = "Internal Server Error";
+        resp.body = "<h1>500 Internal Server Error</h1><p>" + message + "</p>";
+        return resp;
+    }
+
+    /// <summary>Creates a response with a custom status code.</summary>
+    static HttpResponse WithStatus(int code, string text, string body) {
+        HttpResponse resp = new HttpResponse();
+        resp.statusCode = code;
+        resp.statusText = text;
+        resp.body = body;
+        return resp;
+    }
+
+    /// <summary>Sets a response header.</summary>
+    HttpResponse SetHeader(string name, string headerValue) {
+        this.headers.Add(name + ": " + headerValue);
+        return this;
+    }
+
+    /// <summary>Sets the content type.</summary>
+    HttpResponse SetContentType(string ct) {
+        this.contentType = ct;
+        return this;
+    }
+
+    /// <summary>Sets the connection mode.</summary>
+    HttpResponse SetKeepAlive(bool keep) {
+        this.keepAlive = keep;
+        return this;
+    }
+
+    /// <summary>Serializes the response to a raw HTTP response string.</summary>
+    string Build() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 ");
+        sb.Append(Convert.ToString(this.statusCode));
+        sb.Append(" ");
+        sb.Append(this.statusText);
+        sb.Append("\r\n");
+
+        sb.Append("Content-Type: ");
+        sb.Append(this.contentType);
+        sb.Append("\r\n");
+
+        sb.Append("Content-Length: ");
+        sb.Append(Convert.ToString(this.body.Length));
+        sb.Append("\r\n");
+
+        if (this.keepAlive) {
+            sb.Append("Connection: keep-alive\r\n");
+        } else {
+            sb.Append("Connection: close\r\n");
+        }
+
+        sb.Append("Server: Zan/1.0\r\n");
+
+        int i = 0;
+        while (i < this.headers.Count) {
+            sb.Append(this.headers[i]);
+            sb.Append("\r\n");
+            i = i + 1;
+        }
+
+        sb.Append("\r\n");
+        sb.Append(this.body);
+        return sb.ToString();
+    }
+
+    /// <summary>Parses a raw HTTP response (from client-side usage).</summary>
+    static HttpResponse Parse(string raw) {
+        HttpResponse resp = new HttpResponse();
+        int len = raw.Length;
+        if (len == 0) { return resp; }
+
+        // Status line: HTTP/1.1 200 OK
+        int lineEnd = 0;
+        while (lineEnd < len && raw.Substring(lineEnd, 1) != "\n") {
+            lineEnd = lineEnd + 1;
+        }
+        string statusLine = raw.Substring(0, lineEnd);
+        if (statusLine.Length > 0 && statusLine.Substring(statusLine.Length - 1, 1) == "\r") {
+            statusLine = statusLine.Substring(0, statusLine.Length - 1);
+        }
+
+        // Parse status code
+        int sp1 = 0;
+        while (sp1 < statusLine.Length && statusLine.Substring(sp1, 1) != " ") {
+            sp1 = sp1 + 1;
+        }
+        int sp2 = sp1 + 1;
+        while (sp2 < statusLine.Length && statusLine.Substring(sp2, 1) != " ") {
+            sp2 = sp2 + 1;
+        }
+        if (sp2 > sp1 + 1) {
+            resp.statusCode = Convert.ToInt(statusLine.Substring(sp1 + 1, sp2 - sp1 - 1));
+        }
+        if (sp2 < statusLine.Length) {
+            resp.statusText = statusLine.Substring(sp2 + 1);
+        }
+
+        // Parse headers until empty line
+        int pos = lineEnd + 1;
+        int bodyStart = pos;
+        while (pos < len) {
+            int hEnd = pos;
+            while (hEnd < len && raw.Substring(hEnd, 1) != "\n") {
+                hEnd = hEnd + 1;
+            }
+            string headerLine = raw.Substring(pos, hEnd - pos);
+            if (headerLine.Length > 0 && headerLine.Substring(headerLine.Length - 1, 1) == "\r") {
+                headerLine = headerLine.Substring(0, headerLine.Length - 1);
+            }
+            if (headerLine.Length == 0) {
+                bodyStart = hEnd + 1;
+                break;
+            }
+            resp.headers.Add(headerLine);
+            // Parse Content-Type
+            if (headerLine.Length > 14) {
+                string prefix = headerLine.Substring(0, 13);
+                if (prefix == "Content-Type:" || prefix == "content-type:") {
+                    resp.contentType = headerLine.Substring(14);
+                }
+            }
+            pos = hEnd + 1;
+        }
+
+        if (bodyStart < len) {
+            resp.body = raw.Substring(bodyStart);
+        }
+
+        return resp;
+    }
+}

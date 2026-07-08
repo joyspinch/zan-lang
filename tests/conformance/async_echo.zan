@@ -1,0 +1,46 @@
+// await Socket.ReadReady/WriteReady end-to-end: a self-contained loopback echo
+// driven entirely by the IO reactor (S4b-2, path A). One async task plays both
+// ends -- it connects a client to its own listener, accepts the server side,
+// then PING -> (await server readable) recv into a buffer -> (await server
+// writable) echo the buffer back -> (await client readable) recv the reply.
+// Each await genuinely suspends to the reactor (IOCP/epoll/kqueue/select) and
+// is resumed when the fd is ready; the `req` buffer is a string local that is
+// live across the writable suspension, so it must be frame-resident. Prints PING.
+using System;
+using System.Net.Sockets;
+
+class Program {
+    static async int Echo() {
+        Socket.Initialize();
+
+        int listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", 54321);
+        Socket.Listen(listener, 8);
+
+        int client = Socket.CreateTcp();
+        Socket.Connect(client, "127.0.0.1", 54321);
+        int server = Socket.Accept(listener);
+
+        Socket.SendString(client, "PING");
+
+        await Socket.ReadReady(server);
+        string req = Socket.Receive(server, 64);
+
+        await Socket.WriteReady(server);
+        Socket.SendString(server, req);
+
+        await Socket.ReadReady(client);
+        string reply = Socket.Receive(client, 64);
+        Console.WriteLine(reply);
+
+        Socket.Close(client);
+        Socket.Close(server);
+        Socket.Close(listener);
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Echo();
+    }
+}

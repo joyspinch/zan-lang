@@ -1,0 +1,2327 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using Gui;
+using Gui.Widget;
+
+/// Describes one project template: the category it appears under, its display
+/// name / icon / description, the scaffolding "kind" (console / dll-class /
+/// gui-empty / webview / server / custom / ...), and, for custom templates, the
+/// source directory to copy from.
+class Tpl {
+    string cat;
+    string name;
+    string icon;
+    string desc;
+    string kind;
+    string src;
+
+    static Tpl Make(string cat, string name, string icon, string kind, string desc) {
+        Tpl t = new Tpl();
+        t.cat = cat;
+        t.name = name;
+        t.icon = icon;
+        t.kind = kind;
+        t.desc = desc;
+        t.src = "";
+        return t;
+    }
+}
+
+/// A miniature aardio/VS-Code-style IDE built from the enterprise GUI components
+/// (Ribbon / TreeView / TabView / CodeEditor / Panel / Split / Modal / Input /
+/// Button) wired to a REAL project on disk and the real Zan toolchain.
+///
+///   * Project ("New Project"): a modal wizard with categorized templates
+///     (Console / GUI App / DLL Library / Executable / Empty), a project name
+///     and a location — scaffolds the folder + starter files + zan.proj config.
+///   * New ("New File"): a modal wizard with file templates (Program / Class /
+///     GUI Window / Interface / Empty).
+///   * Explorer tree scanned from disk; click a file to open it in a tab.
+///   * Save writes to disk; Build/Run/Publish invoke zanc (+clang) via Process
+///     and stream output to the Output panel.
+class IdeDemo {
+    static string Zanc() { return "d:/project/zan-lang/build/zanc.exe"; }
+
+    static void Main() {
+        App app = App.CreateDark("Zan IDE", 1180, 780);
+        app.Show();
+
+        string root = "d:/project/zan-lang/build/ide_workspace";
+        IdeDemo.EnsureWorkspace(root);
+
+        List<TreeNode> tree = IdeDemo.ScanTree(root);
+        bool rescan = false;
+
+        List<string> tabNames = new List<string>();
+        List<string> tabBodies = new List<string>();
+        List<string> tabPaths = new List<string>();
+
+        SignalInt activeTab = SignalInt.Create(0);
+        CodeEditor editor = CodeEditor.Create();
+        int lastActive = 0 - 1;
+
+        IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab,
+                         root + "/src/main.zan", "main.zan");
+
+        List<string> log = new List<string>();
+        log.Add("> Zan IDE ready. Workspace: " + root);
+
+        List<RibbonCmd> cmds = new List<RibbonCmd>();
+        cmds.Add(RibbonCmd.Create("plus", "Project"));
+        cmds.Add(RibbonCmd.Group("file", "New"));
+        cmds.Add(RibbonCmd.Create("folder", "Open"));
+        cmds.Add(RibbonCmd.Group("download", "Save"));
+        cmds.Add(RibbonCmd.Create("arrow-right", "Run"));
+        cmds.Add(RibbonCmd.Create("refresh", "Build"));
+        cmds.Add(RibbonCmd.Create("upload", "Publish"));
+        cmds.Add(RibbonCmd.Create("bug", "Debug"));
+        cmds.Add(RibbonCmd.Group("copy", "Template"));
+        cmds.Add(RibbonCmd.Create("layout", "Designer"));
+
+        // ---- New Project categories (built-in + user "Custom") ----
+        List<string> catNames = new List<string>();
+        catNames.Add("Console");
+        catNames.Add("Library");
+        catNames.Add("Window App");
+        catNames.Add("WebView");
+        catNames.Add("Server");
+        catNames.Add("Custom");
+
+        // The template catalog + its parallel projections; rebuilt whenever the
+        // New Project wizard opens so freshly-saved custom templates show up.
+        List<Tpl> tpls = new List<Tpl>();
+        List<string> tCats = new List<string>();
+        List<string> tNames = new List<string>();
+        List<string> tIcons = new List<string>();
+        List<string> tDescs = new List<string>();
+
+        // ---- New File template catalog ----
+        List<string> fNames = new List<string>();
+        List<string> fIcons = new List<string>();
+        List<string> fDescs = new List<string>();
+        fNames.Add("Program (Main)"); fIcons.Add("arrow-right"); fDescs.Add("Class with a static Main() entry point.");
+        fNames.Add("Class");          fIcons.Add("grid");        fDescs.Add("An empty class with fields and methods.");
+        fNames.Add("GUI Window");     fIcons.Add("maximize");    fDescs.Add("A Gui window with an event loop.");
+        fNames.Add("Interface");      fIcons.Add("copy");        fDescs.Add("A base class defining a contract.");
+        fNames.Add("Empty File");     fIcons.Add("file");        fDescs.Add("A blank .zan file.");
+
+        // ---- Dialog state ----
+        // The New Project / New File wizards are REAL secondary top-level windows
+        // (draggable anywhere on the desktop), driven from this same event pump.
+        // dlg is null when no wizard is open.
+        // dlgMode: 1=new-project, 2=new-file, 3=save-as-template.
+        App dlg = null;
+        int dlgMode = 0;
+        SignalInt catSel = SignalInt.Create(0);
+        SignalInt pSel = SignalInt.Create(0);
+        SignalInt fSel = SignalInt.Create(0);
+
+        // Target platforms for New Project (multi-select OS + architecture);
+        // platSel holds a 0/1 flag per entry, parallel to platformNames.
+        // One column per OS; two architecture chips stacked per column. Chip
+        // labels are arch-only (the OS is the column header). Order is
+        // column-major: [Win x64, Win ARM64, Linux x64, Linux ARM64, ...].
+        List<string> platformGroups = new List<string>();
+        platformGroups.Add("Windows");
+        platformGroups.Add("Linux");
+        platformGroups.Add("macOS");
+        List<string> platformNames = new List<string>();
+        platformNames.Add("x64"); platformNames.Add("ARM64");
+        platformNames.Add("x64"); platformNames.Add("ARM64");
+        platformNames.Add("x64"); platformNames.Add("ARM64");
+        List<int> platSel = new List<int>();
+        platSel.Add(1); platSel.Add(0); platSel.Add(0);
+        platSel.Add(0); platSel.Add(0); platSel.Add(0);
+        Input pNameInput = Input.Bind(SignalString.Create("NewProject"), "project name");
+        Input pLocInput = Input.Bind(SignalString.Create(root), "location");
+        Input fNameInput = Input.Bind(SignalString.Create("NewFile"), "file name");
+
+        // Save-current-project-as-custom-template state.
+        SignalInt tmplCatSel = SignalInt.Create(0);
+        Input tmplNameInput = Input.Bind(SignalString.Create("MyTemplate"), "template name");
+        List<string> saveCats = new List<string>();
+        List<string> saveIcons = new List<string>();
+        List<string> saveDescs = new List<string>();
+        saveCats.Add("Console");    saveIcons.Add("menu");        saveDescs.Add("Save under the Console category.");
+        saveCats.Add("Library");    saveIcons.Add("grid");        saveDescs.Add("Save under the Library category.");
+        saveCats.Add("Window App"); saveIcons.Add("maximize");    saveDescs.Add("Save under the Window App category.");
+        saveCats.Add("WebView");    saveIcons.Add("folder");      saveDescs.Add("Save under the WebView category.");
+        saveCats.Add("Server");     saveIcons.Add("arrow-right"); saveDescs.Add("Save under the Server category.");
+        saveCats.Add("Custom");     saveIcons.Add("file");        saveDescs.Add("Save under the Custom category.");
+
+        // ---- Find/Replace & GoToLine state ----
+        int findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine
+        string findText = "";
+        string replText = "";
+        string gotoText = "";
+        int findMatch = -1;   // line of current match
+
+        // ---- Debug state ----
+        int dbgState = 0;
+        int dbgExecLine = -1;
+        List<string> dbgConsole = new List<string>();
+        List<string> dbgVarInfo = new List<string>();
+        List<string> dbgStack = new List<string>();
+        int dbgPanelTab = 0;
+
+        // ---- Designer state ----
+        bool designerMode = false;
+        List<string> dNames = new List<string>();
+        List<int> dX = new List<int>();
+        List<int> dY = new List<int>();
+        List<int> dW = new List<int>();
+        List<int> dH = new List<int>();
+        List<string> dTypes = new List<string>();
+        List<string> dProps = new List<string>();
+        List<string> dEvents = new List<string>();
+        SignalInt dSel = SignalInt.Create(-1);
+        SignalInt dDragMode = SignalInt.Create(0);  // 0=idle 1=move 2=resize
+        SignalInt dDragOffX = SignalInt.Create(0);
+        SignalInt dDragOffY = SignalInt.Create(0);
+        SignalInt dResizeH = SignalInt.Create(0);   // resize handle 0-7
+
+        SignalInt treeW = SignalInt.Create(240);
+        SignalInt editorAreaH = SignalInt.Create(430);
+        SignalInt treeSel = SignalInt.Create(-1);
+        int lastTreeSel = -1;
+
+        int lastPresent = 0;
+        while (app.isRunning) {
+            // One shared event pump drives BOTH the main window and any open
+            // wizard child window. Poll (to keep animating) when either needs a
+            // repaint; otherwise block until the OS delivers an event.
+            bool want = app.needsRedraw;
+            if (dlg != null) {
+                if (dlg.needsRedraw) { want = true; }
+            }
+            int r;
+            if (want) {
+                int since = Window.GetTickMs() - lastPresent;
+                if (lastPresent > 0 && since < 16) { Window.SleepMs(16 - since); }
+                r = app.window.PollEvent();
+            } else {
+                r = app.window.WaitEvent();
+            }
+            if (r < 0) { break; }
+
+            int evh = Window.EventHwnd();
+            int kind = app.window.EventKind();
+
+            if (kind == 8) {
+                // Close: only the main window quits the app; a wizard window that
+                // closes simply dismisses the wizard.
+                if (evh == app.WindowHandle()) { break; }
+                dlg = null;
+                dlgMode = 0;
+                app.RequestRedraw();
+            } else {
+                app.ApplyEvent(evh);
+                if (dlg != null) { dlg.ApplyEvent(evh); }
+            }
+
+            // ---- keyboard shortcuts for debug ----
+            if (kind == 5) {
+                int kc = app.window.EventKey();
+                if (kc == 116 && dbgState == 0) {
+                    // F5 = Start Debug (same as clicking Debug button)
+                    List<int> bpF5 = editor.Breakpoints();
+                    if (bpF5.Count > 0) {
+                        dbgExecLine = IdeDemo.FindFirstBp(bpF5);
+                        dbgState = 2;
+                        editor.SetExecLine(dbgExecLine);
+                        dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                        dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                        dbgPanelTab = 1;
+                        log.Add("> [Debug] Started. Paused at line " + Convert.ToString(dbgExecLine + 1));
+                        IdeDemo.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                    } else {
+                        log.Add("> [Debug] No breakpoints set.");
+                    }
+                    app.RequestRedraw();
+                } else if (kc == 116 && dbgState == 2) {
+                    // F5 = Continue to next breakpoint
+                    List<int> bpF5c = editor.Breakpoints();
+                    int nBpF5 = IdeDemo.FindNextBp(bpF5c, dbgExecLine);
+                    if (nBpF5 >= 0) {
+                        dbgExecLine = nBpF5;
+                        editor.SetExecLine(dbgExecLine);
+                        dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                        dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                        log.Add("> [Debug] Continue -> line " + Convert.ToString(dbgExecLine + 1));
+                        IdeDemo.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                    } else {
+                        log.Add("> [Debug] Finished.");
+                        dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                    }
+                    app.RequestRedraw();
+                } else if (kc == 121 && dbgState == 2) {
+                    // F10 = Step Over
+                    dbgExecLine = dbgExecLine + 1;
+                    if (dbgExecLine >= editor.LineCount()) {
+                        dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                        log.Add("> [Debug] Finished (end).");
+                    } else {
+                        editor.SetExecLine(dbgExecLine);
+                        dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                        dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                        log.Add("> [Debug] Step -> line " + Convert.ToString(dbgExecLine + 1));
+                        IdeDemo.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                    }
+                    app.RequestRedraw();
+                } else if (kc == 122 && dbgState == 2) {
+                    // F11 = Step Into
+                    dbgExecLine = dbgExecLine + 1;
+                    if (dbgExecLine >= editor.LineCount()) {
+                        dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                    } else {
+                        editor.SetExecLine(dbgExecLine);
+                        dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                        dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                    }
+                    app.RequestRedraw();
+                } else if (kc == 27 && dbgState == 2) {
+                    // Escape = Stop debugging
+                    dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                    log.Add("> [Debug] Stopped.");
+                    app.RequestRedraw();
+                } else if (kc == 27 && findMode > 0) {
+                    // Escape = close find/replace/goto
+                    findMode = 0;
+                    app.RequestRedraw();
+                }
+            }
+            // Ctrl+key via WM_CHAR (kind == 6)
+            if (kind == 6) {
+                int cc = app.window.EventKeyCode();
+                if (cc == 6) {
+                    // Ctrl+F = Find
+                    findMode = 1;
+                    app.RequestRedraw();
+                } else if (cc == 7) {
+                    // Ctrl+G = Go to Line
+                    findMode = 3;
+                    gotoText = "";
+                    app.RequestRedraw();
+                } else if (cc == 18) {
+                    // Ctrl+R = Replace (Ctrl+H is 8 which conflicts with Backspace)
+                    findMode = 2;
+                    app.RequestRedraw();
+                }
+            }
+
+            // ---------------- main IDE window ----------------
+            if (app.needsRedraw) {
+                app.BeginFrame();
+                Canvas c = app.canvas;
+                Theme t = app.theme;
+                int W = c.Width();
+                int H = c.Height();
+                int top = app.titlebarH;
+                int ribbonH = Ribbon.Height(app);
+
+                int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
+                if (rc == 0) {
+                    // Rebuild the catalog (built-ins + custom templates on disk).
+                    tpls = IdeDemo.BuildCatalog(root);
+                    tCats = new List<string>();
+                    tNames = new List<string>();
+                    tIcons = new List<string>();
+                    tDescs = new List<string>();
+                    IdeDemo.SplitTemplates(tpls, tCats, tNames, tIcons, tDescs);
+                    catSel.Set(0);
+                    pSel.Set(0);
+                    pNameInput.SetText("NewProject");
+                    pLocInput.SetText(Path.GetDirectoryName(root));
+                    dlg = App.CreateDark("New Project", 900, 640);
+                    dlg.Show();
+                    dlgMode = 1;
+                } else if (rc == 1) {
+                    dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
+                    dlgMode = 2;
+                } else if (rc == 2) {
+                    log.Add("> Open: click a file in the Explorer to open it.");
+                    rescan = true;
+                } else if (rc == 3) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    rescan = true;
+                } else if (rc == 4) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    IdeDemo.RunActive(tabPaths, activeTab, root, log);
+                } else if (rc == 5) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    IdeDemo.BuildActive(tabPaths, activeTab, root, log);
+                } else if (rc == 6) {
+                    IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    IdeDemo.PublishActive(tabNames, tabPaths, activeTab, root, log);
+                } else if (rc == 7) {
+                    // Debug (F5)
+                    designerMode = false;
+                    if (dbgState == 0) {
+                        List<int> bpList = editor.Breakpoints();
+                        if (bpList.Count > 0) {
+                            dbgExecLine = IdeDemo.FindFirstBp(bpList);
+                            dbgState = 2;
+                            editor.SetExecLine(dbgExecLine);
+                            dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                            dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                            dbgPanelTab = 1;
+                            log.Add("> [Debug] Started. Paused at line " + Convert.ToString(dbgExecLine + 1));
+                            log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Esc=Stop");
+                        } else {
+                            log.Add("> [Debug] No breakpoints set. Click the line number margin to add breakpoints.");
+                        }
+                    } else if (dbgState == 2) {
+                        List<int> bpList2 = editor.Breakpoints();
+                        int nBp = IdeDemo.FindNextBp(bpList2, dbgExecLine);
+                        if (nBp >= 0) {
+                            dbgExecLine = nBp;
+                            editor.SetExecLine(dbgExecLine);
+                            dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                            dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                            log.Add("> [Debug] Continue -> line " + Convert.ToString(dbgExecLine + 1));
+                        } else {
+                            log.Add("> [Debug] Finished. No more breakpoints.");
+                            dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                        }
+                    }
+                } else if (rc == 8) {
+                    tmplCatSel.Set(5);
+                    tmplNameInput.SetText(Path.GetFileName(root));
+                    dlg = App.CreateDark("Save as Template", 640, 470);
+                    dlg.Show();
+                    dlgMode = 3;
+                } else if (rc == 9) {
+                    designerMode = !designerMode;
+                }
+
+                // ---- Debug toolbar (when debugging) ----
+                int dbgBarH = 0;
+                if (dbgState == 2) {
+                    dbgBarH = app.Scale(32);
+                    IdeDemo.RenderDebugToolbar(app, c, t, 0, top + ribbonH, W, dbgBarH,
+                        dbgExecLine);
+                    // Handle debug toolbar button clicks
+                    if (app.window.EventKind() == 3 && app.mouseY >= top + ribbonH
+                            && app.mouseY < top + ribbonH + dbgBarH) {
+                        int btnW = app.Scale(80);
+                        int btnX = app.Scale(10);
+                        int relX = app.mouseX - btnX;
+                        int btnIdx = relX / (btnW + app.Scale(6));
+                        if (btnIdx == 0) {
+                            // Continue
+                            List<int> bpTb = editor.Breakpoints();
+                            int nBpTb = IdeDemo.FindNextBp(bpTb, dbgExecLine);
+                            if (nBpTb >= 0) {
+                                dbgExecLine = nBpTb;
+                                editor.SetExecLine(dbgExecLine);
+                                dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                                dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                            } else {
+                                dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                                log.Add("> [Debug] Finished.");
+                            }
+                            app.RequestRedraw();
+                        } else if (btnIdx == 1) {
+                            // Step Over
+                            dbgExecLine = dbgExecLine + 1;
+                            if (dbgExecLine >= editor.LineCount()) {
+                                dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                            } else {
+                                editor.SetExecLine(dbgExecLine);
+                                dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                                dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                            }
+                            app.RequestRedraw();
+                        } else if (btnIdx == 2) {
+                            // Step Into
+                            dbgExecLine = dbgExecLine + 1;
+                            if (dbgExecLine >= editor.LineCount()) {
+                                dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                            } else {
+                                editor.SetExecLine(dbgExecLine);
+                                dbgVarInfo = IdeDemo.ParseVarsSimple(editor.GetText(), dbgExecLine);
+                                dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
+                            }
+                            app.RequestRedraw();
+                        } else if (btnIdx == 3) {
+                            // Stop
+                            dbgState = 0; dbgExecLine = -1; editor.SetExecLine(-1);
+                            log.Add("> [Debug] Stopped.");
+                            app.RequestRedraw();
+                        }
+                    }
+                }
+
+                Rect area = Rect.Create(0, top + ribbonH + dbgBarH, W, H - top - ribbonH - dbgBarH);
+                Split cols = Split.Vertical(app, area, treeW, app.Scale(170), app.Scale(440));
+
+                Rect tr = cols.first;
+                c.FillRect(tr.x, tr.y, tr.width, tr.height, t.bgTertiary);
+                int sectionH = app.Scale(24);
+                int leftSections = 3;
+                int explorerH = (tr.height * 40) / 100;
+                int compH = (tr.height * 30) / 100;
+                int exampleH = tr.height - explorerH - compH;
+
+                // Section 1: Explorer
+                c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, "EXPLORER", t.textTertiary, t.fontSizeSmall);
+                Rect treeArea = Rect.Create(tr.x, tr.y + sectionH, tr.width, explorerH - sectionH);
+                TreeView.Render(app, treeArea, tree, treeSel, 0);
+
+                // Section 2: Components
+                int compY = tr.y + explorerH;
+                c.FillRect(tr.x, compY, tr.width, 1, t.divider);
+                c.DrawText(tr.x + t.paddingMedium, compY + t.paddingSmall, "COMPONENTS", t.textTertiary, t.fontSizeSmall);
+                IdeDemo.RenderComponentList(app, c, t,
+                    tr.x, compY + sectionH, tr.width, compH - sectionH);
+
+                // Section 3: Examples
+                int exY = compY + compH;
+                c.FillRect(tr.x, exY, tr.width, 1, t.divider);
+                c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, "EXAMPLES", t.textTertiary, t.fontSizeSmall);
+                IdeDemo.RenderExampleList(app, c, t,
+                    tr.x, exY + sectionH, tr.width, exampleH - sectionH,
+                    tabNames, tabBodies, tabPaths, activeTab, editor, log);
+
+                int sel = treeSel.Get();
+                if (sel != lastTreeSel) {
+                    lastTreeSel = sel;
+                    if (sel >= 0 && sel < tree.Count) {
+                        TreeNode node = tree[sel];
+                        if (!node.isDir) {
+                            IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
+                            log.Add("> Opened " + node.path + ".");
+                        }
+                    }
+                }
+
+                int bottomMin = app.Scale(90);
+                if (dbgState == 2) { bottomMin = app.Scale(160); }
+                Split rows = Split.Horizontal(app, cols.second, editorAreaH, bottomMin, bottomMin);
+                Rect ea = rows.first;
+
+                int tabH = TabView.Height(app);
+                TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
+                if (hit.action == 3) {
+                    dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
+                    dlgMode = 2;
+                } else if (hit.action == 2) {
+                    if (tabNames.Count > 1) {
+                        tabNames.RemoveAt(hit.index);
+                        tabBodies.RemoveAt(hit.index);
+                        tabPaths.RemoveAt(hit.index);
+                        int a = activeTab.Get();
+                        if (a > hit.index) { a = a - 1; }
+                        if (a >= tabNames.Count) { a = tabNames.Count - 1; }
+                        if (a < 0) { a = 0; }
+                        activeTab.Set(a);
+                        lastActive = 0 - 1;
+                    }
+                } else if (hit.action == 1) {
+                    activeTab.Set(hit.index);
+                }
+
+                int act = activeTab.Get();
+                if (act != lastActive) {
+                    if (lastActive >= 0 && lastActive < tabBodies.Count) {
+                        tabBodies[lastActive] = editor.GetText();
+                    }
+                    if (act >= 0 && act < tabBodies.Count) {
+                        editor.LoadText(tabBodies[act]);
+                    }
+                    lastActive = act;
+                }
+
+                Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
+                if (designerMode) {
+                    IdeDemo.RenderDesigner(app, c, t, edRect, dNames, dX, dY, dW, dH, dTypes,
+                        dSel, dDragMode, dDragOffX, dDragOffY, dResizeH);
+                } else {
+                    // Sync debug vars into editor for hover tooltips
+                    if (dbgState == 2) { editor.SetDebugVars(dbgVarInfo); }
+                    else { editor.SetDebugVars(new List<string>()); }
+                    editor.Render(app, edRect);
+                    // Draw inline debug annotations
+                    if (dbgState == 2 && dbgExecLine >= 0) {
+                        IdeDemo.RenderInlineVars(app, c, t, edRect, dbgVarInfo, dbgExecLine);
+                    }
+                }
+
+                // ---- Find / Replace / GoToLine overlay ----
+                if (findMode > 0 && !designerMode) {
+                    int fpH = app.Scale(36);
+                    if (findMode == 2) { fpH = app.Scale(68); }
+                    int fpW = app.Scale(360);
+                    int fpX = edRect.x + edRect.width - fpW - app.Scale(8);
+                    int fpY = edRect.y + app.Scale(4);
+                    c.FillRoundRect(fpX, fpY, fpW, fpH, app.Scale(4), 0xFF252526);
+                    c.DrawRect(fpX, fpY, fpW, fpH, t.borderPrimary, 1);
+                    int inpX = fpX + app.Scale(8);
+                    int inpY = fpY + app.Scale(8);
+                    int inpW = fpW - app.Scale(100);
+                    int inpH = app.Scale(22);
+                    if (findMode == 1) {
+                        c.DrawText(fpX + app.Scale(4), fpY + app.Scale(2), "Find (Ctrl+F)", 0xFF888888, t.fontSizeSmall);
+                        c.FillRect(inpX, inpY, inpW, inpH, 0xFF1E1E1E);
+                        c.DrawRect(inpX, inpY, inpW, inpH, 0xFF3E3E42, 1);
+                        c.DrawText(inpX + app.Scale(4), inpY + app.Scale(4), findText, 0xFFCCCCCC, t.fontSizeSmall);
+                        // Find/Next buttons
+                        int btnX = inpX + inpW + app.Scale(6);
+                        c.FillRoundRect(btnX, inpY, app.Scale(36), inpH, app.Scale(3), 0xFF0E639C);
+                        c.DrawText(btnX + app.Scale(6), inpY + app.Scale(4), "Find", 0xFFFFFFFF, t.fontSizeSmall);
+                        int btn2X = btnX + app.Scale(42);
+                        c.FillRoundRect(btn2X, inpY, app.Scale(36), inpH, app.Scale(3), 0xFF555555);
+                        c.DrawText(btn2X + app.Scale(4), inpY + app.Scale(4), "Next", 0xFFCCCCCC, t.fontSizeSmall);
+                        // Handle key input into find box
+                        if (kind == 6) {
+                            int fcc = app.window.EventKeyCode();
+                            if (fcc == 8 && findText.Length > 0) {
+                                findText = findText.Substring(0, findText.Length - 1);
+                                app.RequestRedraw();
+                            } else if (fcc == 13) {
+                                findMatch = IdeDemo.FindInEditor(editor, findText, findMatch);
+                                app.RequestRedraw();
+                            } else if (fcc > 31) {
+                                findText = findText + Text.CharStr(fcc);
+                                app.RequestRedraw();
+                            }
+                        }
+                        // Click Find/Next buttons
+                        if (app.window.EventKind() == 3) {
+                            if (app.mouseX >= btnX && app.mouseX < btn2X && app.mouseY >= inpY && app.mouseY < inpY + inpH) {
+                                findMatch = IdeDemo.FindInEditor(editor, findText, -1);
+                                app.RequestRedraw();
+                            }
+                            if (app.mouseX >= btn2X && app.mouseX < btn2X + app.Scale(36) && app.mouseY >= inpY && app.mouseY < inpY + inpH) {
+                                findMatch = IdeDemo.FindInEditor(editor, findText, findMatch);
+                                app.RequestRedraw();
+                            }
+                        }
+                    } else if (findMode == 2) {
+                        c.DrawText(fpX + app.Scale(4), fpY + app.Scale(2), "Replace (Ctrl+R)", 0xFF888888, t.fontSizeSmall);
+                        c.FillRect(inpX, inpY, inpW, inpH, 0xFF1E1E1E);
+                        c.DrawRect(inpX, inpY, inpW, inpH, 0xFF3E3E42, 1);
+                        c.DrawText(inpX + app.Scale(4), inpY + app.Scale(4), findText, 0xFFCCCCCC, t.fontSizeSmall);
+                        int row2Y = inpY + inpH + app.Scale(6);
+                        c.FillRect(inpX, row2Y, inpW, inpH, 0xFF1E1E1E);
+                        c.DrawRect(inpX, row2Y, inpW, inpH, 0xFF3E3E42, 1);
+                        c.DrawText(inpX + app.Scale(4), row2Y + app.Scale(4), replText, 0xFFCCCCCC, t.fontSizeSmall);
+                        int rbX = inpX + inpW + app.Scale(6);
+                        c.FillRoundRect(rbX, inpY, app.Scale(70), inpH, app.Scale(3), 0xFF0E639C);
+                        c.DrawText(rbX + app.Scale(6), inpY + app.Scale(4), "Replace", 0xFFFFFFFF, t.fontSizeSmall);
+                        c.FillRoundRect(rbX, row2Y, app.Scale(70), inpH, app.Scale(3), 0xFF555555);
+                        c.DrawText(rbX + app.Scale(4), row2Y + app.Scale(4), "Repl All", 0xFFCCCCCC, t.fontSizeSmall);
+                    } else if (findMode == 3) {
+                        c.DrawText(fpX + app.Scale(4), fpY + app.Scale(2), "Go to Line (Ctrl+G)", 0xFF888888, t.fontSizeSmall);
+                        c.FillRect(inpX, inpY, inpW, inpH, 0xFF1E1E1E);
+                        c.DrawRect(inpX, inpY, inpW, inpH, 0xFF3E3E42, 1);
+                        c.DrawText(inpX + app.Scale(4), inpY + app.Scale(4), gotoText, 0xFFCCCCCC, t.fontSizeSmall);
+                        int gbX = inpX + inpW + app.Scale(6);
+                        c.FillRoundRect(gbX, inpY, app.Scale(30), inpH, app.Scale(3), 0xFF0E639C);
+                        c.DrawText(gbX + app.Scale(6), inpY + app.Scale(4), "Go", 0xFFFFFFFF, t.fontSizeSmall);
+                        // Handle key input for goto line
+                        if (kind == 6) {
+                            int gcc = app.window.EventKeyCode();
+                            if (gcc == 8 && gotoText.Length > 0) {
+                                gotoText = gotoText.Substring(0, gotoText.Length - 1);
+                                app.RequestRedraw();
+                            } else if (gcc == 13) {
+                                int gLine = IdeDemo.ParseInt(gotoText);
+                                if (gLine > 0) { editor.GoToLine(gLine - 1); }
+                                findMode = 0;
+                                app.RequestRedraw();
+                            } else if (gcc >= 48 && gcc <= 57) {
+                                gotoText = gotoText + Text.CharStr(gcc);
+                                app.RequestRedraw();
+                            }
+                        }
+                        // Click Go button
+                        if (app.window.EventKind() == 3 && app.mouseX >= gbX && app.mouseY >= inpY && app.mouseY < inpY + inpH) {
+                            int gLine2 = IdeDemo.ParseInt(gotoText);
+                            if (gLine2 > 0) { editor.GoToLine(gLine2 - 1); }
+                            findMode = 0;
+                            app.RequestRedraw();
+                        }
+                    }
+                }
+
+                Rect orr = rows.second;
+                if (dbgState == 2) {
+                    IdeDemo.RenderDebugBottom(app, c, t, orr, dbgPanelTab,
+                        log, dbgVarInfo, dbgStack, log);
+                    // Handle tab clicks
+                    if (app.window.EventKind() == 3) {
+                        int tabClickW = app.Scale(80);
+                        int tabClickY = orr.y;
+                        int tabClickH = app.Scale(28);
+                        if (app.mouseY >= tabClickY && app.mouseY < tabClickY + tabClickH) {
+                            int tabIdx = (app.mouseX - orr.x) / tabClickW;
+                            if (tabIdx >= 0 && tabIdx < 4) {
+                                dbgPanelTab = tabIdx;
+                                app.RequestRedraw();
+                            }
+                        }
+                    }
+                } else {
+                    Rect oi = Panel.Section(app, orr.x, orr.y, orr.width, orr.height, "Output");
+                    IdeDemo.RenderLog(app, oi, log);
+                }
+
+                // Status bar
+                int sbH = app.Scale(22);
+                int sbY = H - sbH;
+                c.FillRect(0, sbY, W, sbH, 0xFF007ACC);
+                int curLn = editor.CurLine();
+                int curCl = editor.CurCol();
+                string posInfo = "Ln " + Convert.ToString(curLn + 1) + ", Col " + Convert.ToString(curCl + 1);
+                c.DrawText(app.Scale(8), sbY + app.Scale(3), posInfo, 0xFFFFFFFF, t.fontSizeSmall);
+                string modeInfo = "Zan";
+                if (designerMode) { modeInfo = "Designer"; }
+                if (dbgState == 2) { modeInfo = "Debugging"; }
+                c.DrawText(W - app.Scale(100), sbY + app.Scale(3), modeInfo, 0xFFFFFFFF, t.fontSizeSmall);
+                c.DrawText(W / 2 - app.Scale(40), sbY + app.Scale(3), "UTF-8", 0xFFFFFFFF, t.fontSizeSmall);
+
+                app.RenderChrome("Zan IDE  —  " + root);
+                app.PresentFrame();
+                lastPresent = Window.GetTickMs();
+            }
+
+            // ---------------- wizard child window ----------------
+            if (dlg != null) {
+                if (dlg.needsRedraw) {
+                    dlg.BeginFrame();
+                    int action = 0;
+                    if (dlgMode == 1) {
+                        action = Wizard.RenderCategorized(dlg, "New Project", catNames, catSel,
+                                                          tCats, tNames, tIcons, tDescs, pSel,
+                                                          pNameInput, pLocInput,
+                                                          platformNames, platformGroups, platSel);
+                    } else if (dlgMode == 3) {
+                        action = Wizard.Render(dlg, "Save as Template", saveCats, saveIcons, saveDescs,
+                                               tmplCatSel, tmplNameInput, tmplNameInput, false);
+                    } else {
+                        action = Wizard.Render(dlg, "New File", fNames, fIcons, fDescs, fSel,
+                                               fNameInput, fNameInput, false);
+                    }
+                    dlg.PresentFrame();
+                    lastPresent = Window.GetTickMs();
+
+                    if (action == 1) {
+                        if (dlgMode == 1) {
+                            string parent = pLocInput.GetText();
+                            string name = pNameInput.GetText();
+                            int gi = pSel.Get();
+                            if (gi >= 0 && gi < tpls.Count) {
+                                string plats = IdeDemo.PlatformCsv(platSel);
+                                string newDir = IdeDemo.CreateProjectT(tpls[gi], parent, name, plats, log);
+                                root = newDir;
+                                tabNames = new List<string>();
+                                tabBodies = new List<string>();
+                                tabPaths = new List<string>();
+                                activeTab.Set(0);
+                                lastActive = 0 - 1;
+                                IdeDemo.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                            }
+                        } else if (dlgMode == 3) {
+                            string cat = saveCats[tmplCatSel.Get()];
+                            string tname = tmplNameInput.GetText();
+                            IdeDemo.SaveAsTemplate(root, cat, tname, log);
+                        } else {
+                            string name = fNameInput.GetText();
+                            string p = IdeDemo.CreateFile(fSel.Get(), root, name, log);
+                            IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
+                        }
+                        rescan = true;
+                        dlg.window.Close();
+                        dlg = null;
+                        dlgMode = 0;
+                        app.RequestRedraw();
+                    } else if (action == 2) {
+                        dlg.window.Close();
+                        dlg = null;
+                        dlgMode = 0;
+                        app.RequestRedraw();
+                    }
+                }
+            }
+
+            if (rescan) {
+                rescan = false;
+                tree = IdeDemo.ScanTree(root);
+                treeSel.Set(-1);
+                lastTreeSel = -1;
+            }
+        }
+    }
+
+    /// Spawns a fresh wizard child window (a real draggable top-level window),
+    /// resetting the selection and name field, and returns its App.
+    static App OpenWizard(string title, SignalInt sel, Input nameInput, string defName) {
+        App w = App.CreateDark(title, 720, 470);
+        w.Show();
+        sel.Set(0);
+        nameInput.SetText(defName);
+        return w;
+    }
+
+    // ---- workspace / scaffolding ----
+
+    static void EnsureWorkspace(string root) {
+        if (Directory.Exists(root)) { return; }
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(root + "/src");
+        File.WriteAllText(root + "/src/main.zan",
+            "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello, Zan!\");\n        int sum = Utils.Add(2, 3);\n        Console.WriteLine(\"2 + 3 = \" + sum);\n    }\n}\n");
+        File.WriteAllText(root + "/src/utils.zan",
+            "using System;\n\nclass Utils {\n    static int Add(int a, int b) {\n        return a + b;\n    }\n}\n");
+        File.WriteAllText(root + "/README.md",
+            "# MyProject\n\nA sample Zan project scaffolded by the Zan IDE.\n");
+        File.WriteAllText(root + "/zan.proj",
+            "name = MyProject\ntype = console\nentry = src/main.zan\ntarget = exe\n");
+    }
+
+    // ---- template catalog ----
+
+    /// The built-in project templates, grouped by category. Category labels here
+    /// must match the New Project wizard's category list exactly.
+    static List<Tpl> BuiltinTemplates() {
+        List<Tpl> ts = new List<Tpl>();
+        ts.Add(Tpl.Make("Console", "Hello World", "menu", "console",
+            "Minimal console program that prints a line of text."));
+        ts.Add(Tpl.Make("Console", "Command-line Args", "menu", "console-args",
+            "Console program that reads command-line arguments."));
+        ts.Add(Tpl.Make("Console", "Multi-file Project", "copy", "console-multi",
+            "Console project split into main + utils source files."));
+        ts.Add(Tpl.Make("Library", "Class Library", "grid", "dll-class",
+            "A reusable library of classes, compiled to a DLL."));
+        ts.Add(Tpl.Make("Library", "Export DLL", "copy", "dll-export",
+            "A DLL exposing functions callable from other programs."));
+        ts.Add(Tpl.Make("Window App", "Empty Window", "maximize", "gui-empty",
+            "A blank window app built on the Gui standard library."));
+        ts.Add(Tpl.Make("Window App", "Component Showcase", "grid", "gui-components",
+            "A window with panels/toolbars from the Gui components."));
+        ts.Add(Tpl.Make("WebView", "WebView Window", "folder", "webview",
+            "A window that hosts web content (needs a WebView runtime)."));
+        ts.Add(Tpl.Make("Server", "HTTP Server", "arrow-right", "server",
+            "A minimal HTTP server skeleton."));
+        ts.Add(Tpl.Make("Server", "TCP Echo Server", "refresh", "server-tcp",
+            "A minimal TCP echo server skeleton."));
+        return ts;
+    }
+
+    /// Built-in templates plus any user templates found under root/.templates.
+    static List<Tpl> BuildCatalog(string root) {
+        List<Tpl> ts = IdeDemo.BuiltinTemplates();
+        IdeDemo.LoadCustomTemplates(ts, root);
+        return ts;
+    }
+
+    /// Projects the catalog into the parallel lists the wizard consumes.
+    static void SplitTemplates(List<Tpl> ts, List<string> cats, List<string> names,
+                               List<string> icons, List<string> descs) {
+        int i = 0;
+        while (i < ts.Count) {
+            Tpl t = ts[i];
+            cats.Add(t.cat);
+            names.Add(t.name);
+            icons.Add(t.icon);
+            descs.Add(t.desc);
+            i = i + 1;
+        }
+    }
+
+    /// Scans root/.templates/<name>/ and appends each as a "Custom" template.
+    /// GetDirectories on a missing directory yields an empty list, so no
+    /// separate existence check is needed.
+    static void LoadCustomTemplates(List<Tpl> ts, string root) {
+        string dir = root + "/.templates";
+        List<string> subs = Directory.GetDirectories(dir);
+        int i = 0;
+        while (i < subs.Count) {
+            string tname = subs[i];
+            string tdir = dir + "/" + tname;
+            string desc = "Custom template.";
+            string icon = "file";
+            string mpath = tdir + "/manifest.txt";
+            if (File.Exists(mpath)) {
+                string m = File.ReadAllText(mpath);
+                desc = IdeDemo.ManifestField(m, "desc", desc);
+                icon = IdeDemo.ManifestField(m, "icon", icon);
+            }
+            Tpl t = Tpl.Make("Custom", tname, icon, "custom", desc);
+            t.src = tdir;
+            ts.Add(t);
+            i = i + 1;
+        }
+    }
+
+    /// Reads a "key=value" field from a simple manifest, or returns def.
+    /// Scans char-by-char (rather than splitting into a list) to stay robust.
+    static string ManifestField(string content, string key, string def) {
+        string prefix = key + "=";
+        int n = content.Length;
+        int pl = prefix.Length;
+        int i = 0;
+        while (i < n) {
+            bool atLineStart = (i == 0) || (content.Substring(i - 1, 1) == "\n");
+            if (atLineStart && i + pl <= n && content.Substring(i, pl) == prefix) {
+                int j = i + pl;
+                string val = "";
+                while (j < n) {
+                    string ch = content.Substring(j, 1);
+                    if (ch == "\n" || ch == "\r") { break; }
+                    val = val + ch;
+                    j = j + 1;
+                }
+                return val;
+            }
+            i = i + 1;
+        }
+        return def;
+    }
+
+    /// Recursively copies a template's files (skipping its manifest) into dst.
+    static void CopyTree(string srcDir, string dstDir) {
+        Directory.CreateDirectory(dstDir);
+        List<string> files = Directory.GetFiles(srcDir);
+        int i = 0;
+        while (i < files.Count) {
+            string fn = files[i];
+            if (fn != "manifest.txt") {
+                File.WriteAllText(dstDir + "/" + fn, File.ReadAllText(srcDir + "/" + fn));
+            }
+            i = i + 1;
+        }
+        List<string> subs = Directory.GetDirectories(srcDir);
+        int j = 0;
+        while (j < subs.Count) {
+            IdeDemo.CopyTree(srcDir + "/" + subs[j], dstDir + "/" + subs[j]);
+            j = j + 1;
+        }
+    }
+
+    /// Saves the current project (its src/ tree + zan.proj) as a reusable custom
+    /// template under root/.templates/<tname>/ with a small manifest.
+    static void SaveAsTemplate(string root, string cat, string tname, List<string> log) {
+        string tdir = root + "/.templates/" + tname;
+        Directory.CreateDirectory(tdir);
+        if (Directory.Exists(root + "/src")) {
+            IdeDemo.CopyTree(root + "/src", tdir + "/src");
+        }
+        if (File.Exists(root + "/zan.proj")) {
+            File.WriteAllText(tdir + "/zan.proj", File.ReadAllText(root + "/zan.proj"));
+        }
+        File.WriteAllText(tdir + "/manifest.txt",
+            "name=" + tname + "\ncategory=" + cat + "\nicon=file\ndesc=Custom template from " + Path.GetFileName(root) + ".\n");
+        log.Add("> Saved current project as template '" + tname + "' (" + tdir + ").");
+    }
+
+    /// Maps the multi-select platform flags to a comma-separated id list
+    /// (e.g. "windows-x64,linux-arm64"); defaults to windows-x64 if none chosen.
+    static string PlatformCsv(List<int> flags) {
+        List<string> ids = new List<string>();
+        ids.Add("windows-x64"); ids.Add("windows-arm64");
+        ids.Add("linux-x64"); ids.Add("linux-arm64");
+        ids.Add("macos-x64"); ids.Add("macos-arm64");
+        string outp = "";
+        int i = 0;
+        while (i < flags.Count) {
+            if (i < ids.Count && flags[i] == 1) {
+                if (outp.Length > 0) { outp = outp + ","; }
+                outp = outp + ids[i];
+            }
+            i = i + 1;
+        }
+        if (outp.Length == 0) { outp = "windows-x64"; }
+        return outp;
+    }
+
+    /// Scaffolds a new project from a template descriptor; returns its directory.
+    /// platforms is a comma-separated target-platform id list written to zan.proj.
+    static string CreateProjectT(Tpl tpl, string parent, string name, string platforms, List<string> log) {
+        string dir = parent + "/" + name;
+        Directory.CreateDirectory(dir);
+        Directory.CreateDirectory(dir + "/src");
+
+        string typeName = "console";
+        string target = "exe";
+        string entry = "src/main.zan";
+        string kind = tpl.kind;
+
+        if (kind == "console") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleTemplate(name));
+        } else if (kind == "console-args") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleArgsTemplate(name));
+        } else if (kind == "console-multi") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ConsoleTemplate(name));
+            File.WriteAllText(dir + "/src/utils.zan",
+                "using System;\n\nclass Utils {\n    static int Add(int a, int b) { return a + b; }\n}\n");
+        } else if (kind == "dll-class") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", IdeDemo.LibraryTemplate(name));
+        } else if (kind == "dll-export") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", IdeDemo.DllExportTemplate(name));
+        } else if (kind == "gui-empty") {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.GuiTemplate(name));
+        } else if (kind == "gui-components") {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.GuiComponentsTemplate(name));
+        } else if (kind == "webview") {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.WebViewTemplate(name));
+        } else if (kind == "server") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ServerHttpTemplate(name));
+        } else if (kind == "server-tcp") {
+            File.WriteAllText(dir + "/src/main.zan", IdeDemo.ServerTcpTemplate(name));
+        } else if (kind == "custom") {
+            IdeDemo.CopyTree(tpl.src, dir);
+        } else {
+            typeName = "empty";
+        }
+
+        if (!File.Exists(dir + "/README.md")) {
+            File.WriteAllText(dir + "/README.md",
+                "# " + name + "\n\nGenerated by the Zan IDE (template: " + tpl.name + ").\n");
+        }
+        if (kind != "custom") {
+            File.WriteAllText(dir + "/zan.proj",
+                "name = " + name + "\ntype = " + typeName + "\nentry = " + entry
+                + "\ntarget = " + target + "\nplatform = " + platforms + "\n");
+        }
+        log.Add("> Created " + typeName + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
+        return dir;
+    }
+
+    /// Creates a single file from the chosen file template; returns its path.
+    static string CreateFile(int kind, string root, string name, List<string> log) {
+        Directory.CreateDirectory(root + "/src");
+        string path = root + "/src/" + name + ".zan";
+        File.WriteAllText(path, IdeDemo.FileTemplateBody(kind, name));
+        log.Add("> Created file " + path + ".");
+        return path;
+    }
+
+    static void OpenFirst(List<string> names, List<string> bodies, List<string> paths, SignalInt active, string root) {
+        string main = root + "/src/main.zan";
+        string lib = root + "/src/lib.zan";
+        if (File.Exists(main)) {
+            IdeDemo.OpenPath(names, bodies, paths, active, main, "main.zan");
+        } else if (File.Exists(lib)) {
+            IdeDemo.OpenPath(names, bodies, paths, active, lib, "lib.zan");
+        } else {
+            names.Add("README.md");
+            bodies.Add(File.ReadAllText(root + "/README.md"));
+            paths.Add(root + "/README.md");
+            active.Set(0);
+        }
+    }
+
+    // ---- template bodies ----
+
+    static string ConsoleTemplate(string name) {
+        return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
+    }
+
+    static string GuiTemplate(string name) {
+        return "using System;\nusing Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 800, 600);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            app.RenderChrome(\"" + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string LibraryTemplate(string name) {
+        return "using System;\n\n/// " + name + " library.\nclass " + name + " {\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string ConsoleArgsTemplate(string name) {
+        return "using System;\n\nclass Program {\n    static void Main() {\n        // TODO: read and parse command-line arguments here.\n        Console.WriteLine(\"" + name + ": pass arguments on the command line\");\n    }\n}\n";
+    }
+
+    static string DllExportTemplate(string name) {
+        return "using System;\n\n/// Functions exported from this library for use by other programs.\nclass " + name + " {\n    static int Add(int a, int b) { return a + b; }\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string GuiComponentsTemplate(string name) {
+        return "using System;\nusing Gui;\nusing Gui.Widget;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 900, 640);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            Canvas c = app.canvas;\n            int w = c.Width();\n            int h = c.Height();\n            int top = app.titlebarH;\n            Rect box = Panel.Section(app, 20, top + 20, w - 40, h - top - 40, \"" + name + "\");\n            c.DrawText(box.x + 12, box.y + 12, \"Build your UI from Gui components here.\", app.theme.textPrimary, app.theme.fontSizeMedium);\n            app.RenderChrome(\"" + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string WebViewTemplate(string name) {
+        return "using System;\nusing Gui;\n\n// WebView window skeleton. Hosting real web content needs a WebView2\n// runtime binding; this placeholder window stands in until that lands.\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 1000, 700);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            app.RenderChrome(\"WebView: " + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string ServerHttpTemplate(string name) {
+        return "using System;\n\n// HTTP server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " listening on http://localhost:8080\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
+    }
+
+    static string ServerTcpTemplate(string name) {
+        return "using System;\n\n// TCP echo server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " TCP echo server on :9000\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
+    }
+
+    static string FileTemplateBody(int kind, string name) {
+        if (kind == 0) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
+        }
+        if (kind == 1) {
+            return "using System;\n\nclass " + name + " {\n    // fields and methods\n}\n";
+        }
+        if (kind == 2) {
+            return IdeDemo.GuiTemplate(name);
+        }
+        if (kind == 3) {
+            return "using System;\n\n/// Contract implemented by concrete types.\nclass " + name + " {\n    void Execute() { }\n}\n";
+        }
+        return "";
+    }
+
+    // ---- tree scanning ----
+
+    static List<TreeNode> ScanTree(string root) {
+        List<TreeNode> nodes = new List<TreeNode>();
+        IdeDemo.ScanInto(nodes, root, "MyProject", 0, true);
+        return nodes;
+    }
+
+    static void ScanInto(List<TreeNode> nodes, string dirPath, string dirName, int depth, bool expanded) {
+        TreeNode d = TreeNode.Dir(dirName, depth, expanded);
+        d.path = dirPath;
+        nodes.Add(d);
+        List<string> subs = Directory.GetDirectories(dirPath);
+        int i = 0;
+        while (i < subs.Count) {
+            IdeDemo.ScanInto(nodes, dirPath + "/" + subs[i], subs[i], depth + 1, false);
+            i = i + 1;
+        }
+        List<string> files = Directory.GetFiles(dirPath);
+        int j = 0;
+        while (j < files.Count) {
+            TreeNode f = TreeNode.File(files[j], depth + 1);
+            f.path = dirPath + "/" + files[j];
+            nodes.Add(f);
+            j = j + 1;
+        }
+    }
+
+    // ---- tabs ----
+
+    static void OpenPath(List<string> names, List<string> bodies, List<string> paths,
+                         SignalInt active, string path, string name) {
+        int idx = paths.IndexOf(path);
+        if (idx >= 0) {
+            active.Set(idx);
+            return;
+        }
+        string content = File.ReadAllText(path);
+        names.Add(name);
+        bodies.Add(content);
+        paths.Add(path);
+        active.Set(names.Count - 1);
+    }
+
+    static void SaveActive(CodeEditor editor, List<string> names, List<string> bodies,
+                           List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        if (a < 0 || a >= names.Count) { return; }
+        bodies[a] = editor.GetText();
+        string p = paths[a];
+        if (p == "") {
+            p = root + "/" + names[a];
+            paths[a] = p;
+        }
+        File.WriteAllText(p, bodies[a]);
+        log.Add("> Saved " + p + ".");
+    }
+
+    // ---- toolchain ----
+
+    static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to build (save the file first)."); return; }
+        string ll = root + "/.zanbuild.ll";
+        string cmd = "\"" + IdeDemo.Zanc() + "\" --emit-ir \"" + p + "\" > \"" + ll + "\"";
+        log.Add("> Building " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        IdeDemo.AppendAll(log, outp);
+        if (outp.Count == 0) {
+            log.Add("> Build succeeded. 0 errors, 0 warnings.");
+        }
+    }
+
+    static void RunActive(List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to run (save the file first)."); return; }
+        string ll = root + "/.zanrun.ll";
+        string exe = root + "/.zanrun.exe";
+        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string cmd = z + " --emit-ir \"" + p + "\" > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\""
+            + " && \"" + exe + "\"";
+        log.Add("> Running " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        IdeDemo.AppendAll(log, outp);
+        log.Add("> (run finished)");
+    }
+
+    static void PublishActive(List<string> names, List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
+        Directory.CreateDirectory(root + "/publish");
+        string ll = root + "/.zanpub.ll";
+        string exe = root + "/publish/" + names[a] + ".exe";
+        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string cmd = z + " --emit-ir \"" + p + "\" > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"";
+        log.Add("> Publishing console exe ...");
+        List<string> outp = Process.RunCapture(cmd);
+        IdeDemo.AppendAll(log, outp);
+        log.Add("> Published " + exe);
+    }
+
+    static void AppendAll(List<string> log, List<string> lines) {
+        int i = 0;
+        while (i < lines.Count) {
+            log.Add("  " + lines[i]);
+            i = i + 1;
+        }
+    }
+
+    // ---- dialog rendering ----
+
+    /// Renders a modal template picker: a selectable list on the left, a name
+    /// field (+ optional location field) on the right, and Create/Cancel.
+    /// Returns 0 none, 1 create, 2 cancel.
+    static int RenderTemplateDialog(App app, string title, List<string> names, List<string> icons,
+                                    List<string> descs, SignalInt sel, Input nameInput, Input locInput,
+                                    bool showLoc) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int w = app.Scale(700);
+        int h = app.Scale(440);
+        int closeId = Modal.Render(app, w, h, title);
+        int x = (c.Width() - w) / 2;
+        int y = (c.Height() - h) / 2;
+        int pad = t.paddingLarge;
+        int contentY = y + pad + t.heightMedium + t.paddingMedium;
+
+        int listW = app.Scale(250);
+        int listX = x + pad;
+        int listH = h - (contentY - y) - app.Scale(72);
+        IdeDemo.RenderTemplateList(app, listX, contentY, listW, listH, names, icons, sel);
+
+        int fx = listX + listW + pad;
+        int fw = x + w - pad - fx;
+        int fy = contentY;
+
+        c.DrawText(fx, fy, "Name", t.textSecondary, t.fontSizeSmall);
+        nameInput.Render(app, fx, fy + app.Scale(20), fw, t.heightMedium);
+        int nextY = fy + app.Scale(20) + t.heightMedium + t.paddingMedium;
+
+        if (showLoc) {
+            c.DrawText(fx, nextY, "Location", t.textSecondary, t.fontSizeSmall);
+            locInput.Render(app, fx, nextY + app.Scale(20), fw, t.heightMedium);
+            nextY = nextY + app.Scale(20) + t.heightMedium + t.paddingMedium;
+        }
+
+        int s = sel.Get();
+        if (s >= 0 && s < descs.Count) {
+            c.DrawText(fx, nextY, descs[s], t.textTertiary, t.fontSizeSmall);
+        }
+
+        int bw = app.Scale(100);
+        int by = y + h - t.heightMedium - pad;
+        int okX = x + w - pad - bw;
+        int cancelX = okX - t.gapMedium - bw;
+
+        int result = 0;
+        int cancelId = Button.Create("Cancel").Render(app, cancelX, by, bw);
+        if (Button.WasClicked(app, cancelId)) { result = 2; }
+        int okId = Button.Primary("Create").Render(app, okX, by, bw);
+        if (Button.WasClicked(app, okId)) { result = 1; }
+
+        if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            result = 2;
+        }
+        return result;
+    }
+
+    static void RenderTemplateList(App app, int x, int y, int w, int h, List<string> names,
+                                   List<string> icons, SignalInt sel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgSecondary);
+
+        int rowH = app.Scale(42);
+        int n = names.Count;
+        int firstId = app.focus.AllocId();
+        int i = 1;
+        while (i < n) { app.focus.AllocId(); i = i + 1; }
+
+        int selv = sel.Get();
+        int glyph = t.fontSizeLarge;
+        int k = 0;
+        while (k < n) {
+            int id = firstId + k;
+            int rowY = y + k * rowH;
+            bool hovered = app.focus.IsHovered(id);
+            bool active = k == selv;
+            if (active) {
+                c.FillRect(x, rowY, w, rowH, t.bgActive);
+                c.FillRect(x, rowY, app.Scale(3), rowH, t.primary);
+            } else if (hovered) {
+                c.FillRect(x, rowY, w, rowH, t.bgHover);
+            }
+            int iconColor = t.textSecondary;
+            int textColor = t.textPrimary;
+            if (active) { iconColor = t.primary; textColor = t.primary; }
+            Icon.DrawCenteredIn(c, icons[k], x + t.paddingMedium, rowY, glyph, rowH, glyph, iconColor);
+            int textX = x + t.paddingMedium + glyph + t.gapMedium;
+            int textY = rowY + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.DrawText(textX, textY, names[k], textColor, t.fontSizeMedium);
+            app.hitTester.Register(HitRegion.Create(id, x, rowY, w, rowH, 0));
+            k = k + 1;
+        }
+
+        if (app.window.EventKind() == 3) {
+            int hitv = app.hitTester.HitTest(app.mouseX, app.mouseY);
+            int idx = hitv - firstId;
+            if (idx >= 0 && idx < n) {
+                sel.Set(idx);
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    static void RenderLog(App app, Rect r, List<string> log) {
+        Theme t = app.theme;
+        int lineH = app.Scale(18);
+        if (lineH < 1) { lineH = 1; }
+        int maxLines = r.height / lineH;
+        if (maxLines < 1) { maxLines = 1; }
+        int start = log.Count - maxLines;
+        if (start < 0) { start = 0; }
+        int i = start;
+        int row = 0;
+        while (i < log.Count) {
+            string ln = log[i];
+            int col = t.textSecondary;
+            if (ln.Length >= 2) {
+                string head = ln.Substring(0, 2);
+                if (head == "> ") { col = t.textPrimary; }
+            }
+            app.canvas.DrawText(r.x, r.y + row * lineH, ln, col, t.fontSizeSmall);
+            i = i + 1;
+            row = row + 1;
+        }
+    }
+
+    // ================================================================
+    // Debug helpers
+    // ================================================================
+
+    static List<string> DebugBuildRun(List<string> tabPaths, SignalInt activeTab,
+            string root, List<string> log) {
+        List<string> console = new List<string>();
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabPaths.Count) { return console; }
+        string p = tabPaths[a];
+        if (p == "") {
+            log.Add("> [Debug] Save the file first.");
+            return console;
+        }
+        string ll = root + "/.zandbg.ll";
+        string exe = root + "/.zandbg.exe";
+        string z = IdeDemo.Zanc();
+        string buildCmd = "\"" + z + "\" --emit-ir \"" + p + "\" > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"";
+        log.Add("> [Debug] Building ...");
+        List<string> buildOut = Process.RunCapture(buildCmd);
+        int bo = 0;
+        while (bo < buildOut.Count) {
+            log.Add("  " + buildOut[bo]);
+            bo = bo + 1;
+        }
+        log.Add("> [Debug] Running ...");
+        List<string> runOut = Process.RunCapture("\"" + exe + "\"");
+        int ri = 0;
+        while (ri < runOut.Count) {
+            console.Add(runOut[ri]);
+            ri = ri + 1;
+        }
+        if (console.Count == 0) {
+            console.Add("(no output)");
+        }
+        return console;
+    }
+
+    static int FindInEditor(CodeEditor editor, string query, int afterLine) {
+        if (query.Length == 0) { return -1; }
+        int lc = editor.LineCount();
+        int startLine = afterLine + 1;
+        if (startLine < 0) { startLine = 0; }
+        string text = editor.GetText();
+        List<string> edLines = new List<string>();
+        string cur = "";
+        int ii = 0;
+        while (ii < text.Length) {
+            string ch = text.Substring(ii, 1);
+            if (ch == "\n") { edLines.Add(cur); cur = ""; }
+            else if (ch == "\r") { cur = cur; }
+            else { cur = cur + ch; }
+            ii = ii + 1;
+        }
+        edLines.Add(cur);
+        int li = startLine;
+        while (li < edLines.Count) {
+            string ln = edLines[li];
+            int fi = 0;
+            while (fi + query.Length <= ln.Length) {
+                string sub = ln.Substring(fi, query.Length);
+                if (sub == query) {
+                    editor.GoToLineCol(li, fi);
+                    return li;
+                }
+                fi = fi + 1;
+            }
+            li = li + 1;
+        }
+        // Wrap around from beginning
+        li = 0;
+        while (li < startLine && li < edLines.Count) {
+            string ln = edLines[li];
+            int fi = 0;
+            while (fi + query.Length <= ln.Length) {
+                string sub = ln.Substring(fi, query.Length);
+                if (sub == query) {
+                    editor.GoToLineCol(li, fi);
+                    return li;
+                }
+                fi = fi + 1;
+            }
+            li = li + 1;
+        }
+        return -1;
+    }
+
+    static int ParseInt(string s) {
+        int result = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "0") { result = result * 10; }
+            else if (ch == "1") { result = result * 10 + 1; }
+            else if (ch == "2") { result = result * 10 + 2; }
+            else if (ch == "3") { result = result * 10 + 3; }
+            else if (ch == "4") { result = result * 10 + 4; }
+            else if (ch == "5") { result = result * 10 + 5; }
+            else if (ch == "6") { result = result * 10 + 6; }
+            else if (ch == "7") { result = result * 10 + 7; }
+            else if (ch == "8") { result = result * 10 + 8; }
+            else if (ch == "9") { result = result * 10 + 9; }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    static int FindFirstBp(List<int> bpList) {
+        if (bpList.Count == 0) { return 0; }
+        int best = bpList[0];
+        int i = 1;
+        while (i < bpList.Count) {
+            if (bpList[i] < best) { best = bpList[i]; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    static int FindNextBp(List<int> bpList, int currentLine) {
+        int best = -1;
+        int i = 0;
+        while (i < bpList.Count) {
+            if (bpList[i] > currentLine) {
+                if (best < 0 || bpList[i] < best) { best = bpList[i]; }
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    static List<string> ParseVarsSimple(string src, int line) {
+        List<string> result = new List<string>();
+        if (line < 0) { return result; }
+        List<string> lines = CodeEditor.SplitLines(src);
+        int maxL = line;
+        if (maxL >= lines.Count) { maxL = lines.Count - 1; }
+        int li = 0;
+        while (li <= maxL) {
+            string ln = lines[li];
+            string tr = IdeDemo.TrimLeadSpaces(ln);
+            if (tr.Length > 2) {
+                IdeDemo.TryAddVar(result, tr, "int ");
+                IdeDemo.TryAddVar(result, tr, "string ");
+                IdeDemo.TryAddVar(result, tr, "bool ");
+                IdeDemo.TryAddVar(result, tr, "float ");
+                IdeDemo.TryAddVar(result, tr, "double ");
+                IdeDemo.TryAddVar(result, tr, "long ");
+                IdeDemo.TryAddVar(result, tr, "char ");
+                IdeDemo.TryAddVar(result, tr, "var ");
+                // Also detect List<...> and other generic types
+                IdeDemo.TryAddGenericVar(result, tr);
+            }
+            li = li + 1;
+        }
+        return result;
+    }
+
+    static string TrimLeadSpaces(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") { i = i + 1; }
+            else { break; }
+        }
+        if (i == 0) { return s; }
+        return s.Substring(i, s.Length - i);
+    }
+
+    static void TryAddVar(List<string> result, string tr, string typePrefix) {
+        if (tr.Length <= typePrefix.Length) { return; }
+        string head = tr.Substring(0, typePrefix.Length);
+        if (head != typePrefix) { return; }
+        string rest = tr.Substring(typePrefix.Length, tr.Length - typePrefix.Length);
+        string name = IdeDemo.ExtractIdent(rest, 0);
+        if (name.Length == 0) { return; }
+        int ni = name.Length;
+        while (ni < rest.Length && rest.Substring(ni, 1) == " ") { ni = ni + 1; }
+        string val = IdeDemo.ExtractValue(rest, ni);
+        string typeName = IdeDemo.TrimTrailSpaces(typePrefix);
+        result.Add(name + "\t" + typeName + "\t" + val);
+    }
+
+    static void TryAddGenericVar(List<string> result, string tr) {
+        // Match patterns like: List<string> foo = ...
+        string idc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int i = 0;
+        while (i < tr.Length && CodeEditor.InSet(idc, tr.Substring(i, 1))) { i = i + 1; }
+        if (i == 0) { return; }
+        if (i >= tr.Length) { return; }
+        if (tr.Substring(i, 1) != "<") { return; }
+        // Found a generic type name
+        string typeName = tr.Substring(0, i);
+        // skip to closing >
+        int depth = 1;
+        int j = i + 1;
+        while (j < tr.Length && depth > 0) {
+            string ch = tr.Substring(j, 1);
+            if (ch == "<") { depth = depth + 1; }
+            if (ch == ">") { depth = depth - 1; }
+            j = j + 1;
+        }
+        if (depth != 0) { return; }
+        string fullType = tr.Substring(0, j);
+        // skip spaces
+        while (j < tr.Length && tr.Substring(j, 1) == " ") { j = j + 1; }
+        if (j >= tr.Length) { return; }
+        string rest = tr.Substring(j, tr.Length - j);
+        string name = IdeDemo.ExtractIdent(rest, 0);
+        if (name.Length == 0) { return; }
+        int ni = name.Length;
+        while (ni < rest.Length && rest.Substring(ni, 1) == " ") { ni = ni + 1; }
+        string val = IdeDemo.ExtractValue(rest, ni);
+        result.Add(name + "\t" + fullType + "\t" + val);
+    }
+
+    static string ExtractIdent(string s, int start) {
+        string idc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string name = "";
+        int i = start;
+        while (i < s.Length && CodeEditor.InSet(idc, s.Substring(i, 1))) {
+            name = name + s.Substring(i, 1);
+            i = i + 1;
+        }
+        return name;
+    }
+
+    static string ExtractValue(string rest, int ni) {
+        if (ni >= rest.Length) { return "(uninitialized)"; }
+        if (rest.Substring(ni, 1) != "=") { return "(uninitialized)"; }
+        ni = ni + 1;
+        while (ni < rest.Length && rest.Substring(ni, 1) == " ") { ni = ni + 1; }
+        string val = "";
+        while (ni < rest.Length && rest.Substring(ni, 1) != ";") {
+            val = val + rest.Substring(ni, 1);
+            ni = ni + 1;
+        }
+        if (val.Length == 0) { return "(empty)"; }
+        return val;
+    }
+
+    static string TrimTrailSpaces(string s) {
+        int e = s.Length;
+        while (e > 0 && s.Substring(e - 1, 1) == " ") { e = e - 1; }
+        if (e == s.Length) { return s; }
+        return s.Substring(0, e);
+    }
+
+    static List<string> BuildStack(List<string> tabNames, SignalInt activeTab, int line) {
+        List<string> stack = new List<string>();
+        string fname = "";
+        int at = activeTab.Get();
+        if (at >= 0 && at < tabNames.Count) { fname = tabNames[at]; }
+        stack.Add(fname + " : line " + Convert.ToString(line + 1));
+        return stack;
+    }
+
+    static void RenderDebugBottom(App app, Canvas c, Theme t, Rect orr, int tab,
+            List<string> console, List<string> vars, List<string> stack, List<string> log) {
+        int tabH = app.Scale(28);
+        int tabW = app.Scale(80);
+        int pad = app.Scale(4);
+        int rowH = app.Scale(18);
+
+        // Tab bar
+        c.FillRect(orr.x, orr.y, orr.width, tabH, 0xFF252526);
+        c.FillRect(orr.x, orr.y + tabH - 1, orr.width, 1, t.divider);
+
+        // Tab 0: Console
+        int bg0 = 0xFF333333;
+        if (tab == 0) { bg0 = 0xFF1E1E1E; }
+        c.FillRect(orr.x, orr.y, tabW, tabH, bg0);
+        c.DrawText(orr.x + app.Scale(6), orr.y + app.Scale(6), "Console", t.textPrimary, t.fontSizeSmall);
+        // Tab 1: Variables
+        int bg1 = 0xFF333333;
+        if (tab == 1) { bg1 = 0xFF1E1E1E; }
+        c.FillRect(orr.x + tabW, orr.y, tabW, tabH, bg1);
+        c.DrawText(orr.x + tabW + app.Scale(6), orr.y + app.Scale(6), "Variables", t.textPrimary, t.fontSizeSmall);
+        // Tab 2: Watch
+        int bg2 = 0xFF333333;
+        if (tab == 2) { bg2 = 0xFF1E1E1E; }
+        c.FillRect(orr.x + tabW + tabW, orr.y, tabW, tabH, bg2);
+        c.DrawText(orr.x + tabW + tabW + app.Scale(6), orr.y + app.Scale(6), "Watch", t.textPrimary, t.fontSizeSmall);
+        // Tab 3: Call Stack
+        int bg3 = 0xFF333333;
+        if (tab == 3) { bg3 = 0xFF1E1E1E; }
+        c.FillRect(orr.x + tabW + tabW + tabW, orr.y, tabW + app.Scale(10), tabH, bg3);
+        c.DrawText(orr.x + tabW + tabW + tabW + app.Scale(6), orr.y + app.Scale(6), "CallStack", t.textPrimary, t.fontSizeSmall);
+
+        // Content area
+        int contentY = orr.y + tabH;
+        int contentH = orr.height - tabH;
+        c.FillRect(orr.x, contentY, orr.width, contentH, 0xFF1E1E1E);
+
+        if (tab == 0) {
+            IdeDemo.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, console);
+        } else if (tab == 1) {
+            IdeDemo.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
+        } else if (tab == 2) {
+            IdeDemo.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
+        } else if (tab == 3) {
+            IdeDemo.RenderStackTab(app, c, t, orr.x, contentY, orr.width, contentH, stack);
+        }
+    }
+
+    static void LogVarsToConsole(List<string> log, List<string> vars, int execLine) {
+        log.Add("> --- Line " + Convert.ToString(execLine + 1) + " ---");
+        int vi = 0;
+        while (vi < vars.Count) {
+            string entry = vars[vi];
+            string vn = IdeDemo.GetTabField(entry, 0);
+            string vt = IdeDemo.GetTabField(entry, 1);
+            string vv = IdeDemo.GetTabField(entry, 2);
+            log.Add(">   " + vn + " : " + vt + " = " + vv);
+            vi = vi + 1;
+        }
+    }
+
+    static void RenderConsoleTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> lines) {
+        int rowH = app.Scale(18);
+        int pad = app.Scale(6);
+        int maxRows = h / rowH;
+        int startIdx = 0;
+        if (lines.Count > maxRows) { startIdx = lines.Count - maxRows; }
+        int ri = startIdx;
+        int cy = y + pad;
+        while (ri < lines.Count && cy + rowH <= y + h) {
+            string ln = lines[ri];
+            int textColor = 0xFFCCCCCC;
+            // Color debug output lines
+            if (ln.Length > 2) {
+                string prefix = ln.Substring(0, 2);
+                if (prefix == "> ") {
+                    if (ln.Length > 8) {
+                        string sub6 = ln.Substring(2, 6);
+                        if (sub6 == "[Debug") { textColor = 0xFF4EC9B0; }
+                        else if (sub6 == "--- Li") { textColor = 0xFF569CD6; }
+                        else if (sub6 == "  ") { textColor = 0xFFCE9178; }
+                    }
+                }
+            }
+            c.DrawText(x + pad, cy, ln, textColor, t.fontSizeSmall);
+            cy = cy + rowH;
+            ri = ri + 1;
+        }
+        if (lines.Count == 0) {
+            c.DrawText(x + pad, y + pad, "(no console output)", 0xFF666666, t.fontSizeSmall);
+        }
+    }
+
+    static void RenderVarsTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> vars) {
+        int rowH = app.Scale(20);
+        int pad = app.Scale(4);
+        int colName = app.Scale(120);
+        int colType = app.Scale(100);
+        // Header
+        c.FillRect(x, y, w, rowH, 0xFF2D2D30);
+        c.DrawText(x + pad, y + pad, "Name", 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRect(x + colName - 1, y, 1, rowH, 0xFF444444);
+        c.DrawText(x + colName + pad, y + pad, "Type", 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRect(x + colName + colType - 1, y, 1, rowH, 0xFF444444);
+        c.DrawText(x + colName + colType + pad, y + pad, "Value", 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRect(x, y + rowH, w, 1, t.divider);
+        int cy = y + rowH + 1;
+        int ri = 0;
+        while (ri < vars.Count && cy + rowH <= y + h) {
+            int bg = 0xFF1E1E1E;
+            if (ri % 2 == 1) { bg = 0xFF252526; }
+            c.FillRect(x, cy, w, rowH, bg);
+            // Parse tab-separated: name\ttype\tvalue
+            string entry = vars[ri];
+            string vName = IdeDemo.GetTabField(entry, 0);
+            string vType = IdeDemo.GetTabField(entry, 1);
+            string vVal = IdeDemo.GetTabField(entry, 2);
+            c.DrawText(x + pad, cy + pad, vName, 0xFF9CDCFE, t.fontSizeSmall);
+            c.FillRect(x + colName - 1, cy, 1, rowH, 0xFF333333);
+            c.DrawText(x + colName + pad, cy + pad, vType, 0xFF4EC9B0, t.fontSizeSmall);
+            c.FillRect(x + colName + colType - 1, cy, 1, rowH, 0xFF333333);
+            c.DrawText(x + colName + colType + pad, cy + pad, vVal, 0xFFCE9178, t.fontSizeSmall);
+            cy = cy + rowH;
+            ri = ri + 1;
+        }
+        if (vars.Count == 0) {
+            c.DrawText(x + pad, y + rowH + pad + pad, "(no variables in scope)", 0xFF666666, t.fontSizeSmall);
+        }
+    }
+
+    static string GetTabField(string s, int fieldIdx) {
+        int fi = 0;
+        int start = 0;
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == "\t") {
+                if (fi == fieldIdx) {
+                    return s.Substring(start, i - start);
+                }
+                fi = fi + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (fi == fieldIdx) {
+            return s.Substring(start, s.Length - start);
+        }
+        return "";
+    }
+
+    static void RenderStackTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> stack) {
+        int rowH = app.Scale(22);
+        int pad = app.Scale(6);
+        c.FillRect(x, y, w, rowH, 0xFF2D2D30);
+        c.DrawText(x + pad, y + pad, "Call Stack", 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRect(x, y + rowH, w, 1, t.divider);
+        int cy = y + rowH + 1;
+        int ri = 0;
+        while (ri < stack.Count && cy + rowH <= y + h) {
+            int bg = 0xFF1E1E1E;
+            if (ri == 0) { bg = 0xFF264F78; }
+            c.FillRect(x, cy, w, rowH, bg);
+            c.DrawText(x + pad, cy + pad, stack[ri], 0xFFDCDCAA, t.fontSizeSmall);
+            cy = cy + rowH;
+            ri = ri + 1;
+        }
+    }
+
+    static void RenderInlineVars(App app, Canvas c, Theme t, Rect edRect,
+            List<string> varInfo, int execLine) {
+        if (varInfo.Count == 0) { return; }
+        int fontSize = t.fontSizeSmall;
+        int lineH = Canvas.FontHeight(t.fontSizeMedium) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+        // Build inline text from all variables
+        string inlineText = "";
+        int vi = 0;
+        while (vi < varInfo.Count) {
+            string entry = varInfo[vi];
+            string vName = IdeDemo.GetTabField(entry, 0);
+            string vVal = IdeDemo.GetTabField(entry, 2);
+            if (inlineText.Length > 0) { inlineText = inlineText + "  |  "; }
+            inlineText = inlineText + vName + " = " + vVal;
+            vi = vi + 1;
+        }
+        if (inlineText.Length == 0) { return; }
+        // Draw at top-right of editor area as an overlay
+        int tw = Canvas.MeasureText(inlineText, fontSize) + app.Scale(16);
+        int th = app.Scale(22);
+        int tx = edRect.x + edRect.width - tw - app.Scale(8);
+        int ty = edRect.y + app.Scale(4);
+        c.FillRoundRect(tx, ty, tw, th, app.Scale(4), 0xDD1E1E1E);
+        c.DrawRect(tx, ty, tw, th, 0xFF569CD6, 1);
+        c.DrawText(tx + app.Scale(8), ty + app.Scale(4), inlineText, 0xFFCE9178, fontSize);
+    }
+
+    static void RenderDebugToolbar(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, int execLine) {
+        c.FillRect(x, y, w, h, 0xFF1E1E1E);
+        c.FillRect(x, y + h - 1, w, 1, t.divider);
+        int btnW = app.Scale(80);
+        int btnH = app.Scale(26);
+        int gap = app.Scale(6);
+        int bx = x + app.Scale(10);
+        int by = y + (h - btnH) / 2;
+        // Continue (green)
+        c.FillRoundRect(bx, by, btnW, btnH, app.Scale(4), 0xFF388E3C);
+        c.DrawText(bx + app.Scale(8), by + app.Scale(5), "Continue", 0xFFFFFFFF, t.fontSizeSmall);
+        bx = bx + btnW + gap;
+        // Step Over (blue)
+        c.FillRoundRect(bx, by, btnW, btnH, app.Scale(4), 0xFF1565C0);
+        c.DrawText(bx + app.Scale(6), by + app.Scale(5), "Step Over", 0xFFFFFFFF, t.fontSizeSmall);
+        bx = bx + btnW + gap;
+        // Step Into (blue)
+        c.FillRoundRect(bx, by, btnW, btnH, app.Scale(4), 0xFF1565C0);
+        c.DrawText(bx + app.Scale(6), by + app.Scale(5), "Step Into", 0xFFFFFFFF, t.fontSizeSmall);
+        bx = bx + btnW + gap;
+        // Stop (red)
+        c.FillRoundRect(bx, by, btnW, btnH, app.Scale(4), 0xFFC62828);
+        c.DrawText(bx + app.Scale(18), by + app.Scale(5), "Stop", 0xFFFFFFFF, t.fontSizeSmall);
+        bx = bx + btnW + gap + gap;
+        // Line info
+        string lineInfo = "Line: " + Convert.ToString(execLine + 1);
+        c.DrawText(bx, by + app.Scale(5), lineInfo, 0xFFCCCCCC, t.fontSizeSmall);
+    }
+
+    // ================================================================
+    // Designer
+    // ================================================================
+
+    static int SnapGrid(int v, int grid) {
+        int r = v / grid;
+        if (v - r * grid > grid / 2) { r = r + 1; }
+        return r * grid;
+    }
+
+    static void RenderDesigner(App app, Canvas c, Theme t, Rect area,
+            List<string> dNames, List<int> dX, List<int> dY,
+            List<int> dW, List<int> dH, List<string> dTypes, SignalInt dSel,
+            SignalInt dragMode, SignalInt dragOffX, SignalInt dragOffY, SignalInt resizeH) {
+        int dSelV = dSel.Get();
+        int gridSz = app.Scale(8);
+        c.FillRect(area.x, area.y, area.width, area.height, 0xFF2D2D30);
+
+        // Toolbox panel on left
+        int toolW = app.Scale(140);
+        c.FillRect(area.x, area.y, toolW, area.height, 0xFF252526);
+        c.FillRect(area.x + toolW - 1, area.y, 1, area.height, t.divider);
+        c.DrawText(area.x + app.Scale(8), area.y + app.Scale(6), "TOOLBOX", 0xFFCCCCCC, t.fontSizeSmall);
+        int ty = area.y + app.Scale(28);
+        int toolH2 = app.Scale(24);
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "Button", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "Label", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "TextBox", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "CheckBox", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "ComboBox", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "ListBox", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "Panel", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "GroupBox", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "TabControl", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "TreeView", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "ListView", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "DataGrid", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "MenuStrip", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "ToolStrip", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "StatusBar", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "ProgressBar", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "PictureBox", t); ty = ty + toolH2;
+        IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "RichTextBox", t);
+
+        // Properties panel on right
+        int propW = app.Scale(180);
+        int propX = area.x + area.width - propW;
+        c.FillRect(propX, area.y, propW, area.height, 0xFF252526);
+        c.FillRect(propX, area.y, 1, area.height, t.divider);
+        c.DrawText(propX + app.Scale(8), area.y + app.Scale(6), "PROPERTIES", 0xFFCCCCCC, t.fontSizeSmall);
+
+        if (dSelV >= 0 && dSelV < dNames.Count) {
+            int py = area.y + app.Scale(28);
+            int lblW = app.Scale(60);
+            c.DrawText(propX + app.Scale(8), py, "Name:", 0xFF999999, t.fontSizeSmall);
+            c.DrawText(propX + lblW, py, dNames[dSelV], 0xFFCCCCCC, t.fontSizeSmall);
+            py = py + app.Scale(20);
+            c.DrawText(propX + app.Scale(8), py, "Type:", 0xFF999999, t.fontSizeSmall);
+            c.DrawText(propX + lblW, py, dTypes[dSelV], 0xFF4EC9B0, t.fontSizeSmall);
+            py = py + app.Scale(20);
+            c.DrawText(propX + app.Scale(8), py, "X:", 0xFF999999, t.fontSizeSmall);
+            c.DrawText(propX + lblW, py, Convert.ToString(dX[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            py = py + app.Scale(20);
+            c.DrawText(propX + app.Scale(8), py, "Y:", 0xFF999999, t.fontSizeSmall);
+            c.DrawText(propX + lblW, py, Convert.ToString(dY[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            py = py + app.Scale(20);
+            c.DrawText(propX + app.Scale(8), py, "Width:", 0xFF999999, t.fontSizeSmall);
+            c.DrawText(propX + lblW, py, Convert.ToString(dW[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            py = py + app.Scale(20);
+            c.DrawText(propX + app.Scale(8), py, "Height:", 0xFF999999, t.fontSizeSmall);
+            c.DrawText(propX + lblW, py, Convert.ToString(dH[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            py = py + app.Scale(24);
+            c.FillRect(propX + app.Scale(4), py, propW - app.Scale(8), 1, t.divider);
+            py = py + app.Scale(8);
+            c.DrawText(propX + app.Scale(8), py, "Events:", 0xFF999999, t.fontSizeSmall);
+            py = py + app.Scale(18);
+            c.DrawText(propX + app.Scale(8), py, "Click", 0xFF569CD6, t.fontSizeSmall);
+            py = py + app.Scale(18);
+            c.DrawText(propX + app.Scale(8), py, "Load", 0xFF569CD6, t.fontSizeSmall);
+            py = py + app.Scale(18);
+            c.DrawText(propX + app.Scale(8), py, "TextChanged", 0xFF569CD6, t.fontSizeSmall);
+        } else {
+            c.DrawText(propX + app.Scale(8), area.y + app.Scale(28), "(no selection)", 0xFF666666, t.fontSizeSmall);
+        }
+
+        // Design surface (center area)
+        int surfX = area.x + toolW;
+        int surfW = area.width - toolW - propW;
+
+        // Draw grid dots
+        int gx = surfX + gridSz;
+        while (gx < surfX + surfW) {
+            int gy2 = area.y + gridSz;
+            while (gy2 < area.y + area.height) {
+                c.FillRect(gx, gy2, 1, 1, 0xFF444444);
+                gy2 = gy2 + gridSz * 2;
+            }
+            gx = gx + gridSz * 2;
+        }
+
+        // Form outline
+        int formX = surfX + app.Scale(20);
+        int formY = area.y + app.Scale(16);
+        int formW = surfW - app.Scale(40);
+        int formH = area.height - app.Scale(32);
+        c.FillRect(formX, formY, formW, formH, 0xFF1E1E1E);
+        int titleH = app.Scale(28);
+        c.FillRect(formX, formY, formW, titleH, 0xFF333333);
+        c.DrawText(formX + app.Scale(8), formY + app.Scale(6), "Form1", 0xFFCCCCCC, t.fontSizeSmall);
+        // Close/min/max buttons
+        int btnSz = app.Scale(12);
+        c.FillRect(formX + formW - app.Scale(22), formY + app.Scale(8), btnSz, btnSz, 0xFFE81123);
+        c.FillRect(formX + formW - app.Scale(40), formY + app.Scale(8), btnSz, btnSz, 0xFF888888);
+        c.FillRect(formX + formW - app.Scale(58), formY + app.Scale(8), btnSz, btnSz, 0xFF888888);
+        // Form border
+        c.DrawRect(formX, formY, formW, formH, 0xFF555555, 1);
+
+        // Draw placed controls
+        int cntX = formX;
+        int cntY = formY + titleH;
+        int di = 0;
+        while (di < dNames.Count) {
+            int cx = cntX + dX[di];
+            int cy = cntY + dY[di];
+            int cw = dW[di];
+            int ch = dH[di];
+            string cType = dTypes[di];
+            // Control rendering per type
+            int cbg = 0xFF3C3C3C;
+            if (cType == "Button") { cbg = 0xFF404040; }
+            if (cType == "TextBox" || cType == "RichTextBox") { cbg = 0xFF1E1E1E; }
+            if (cType == "Panel" || cType == "GroupBox") { cbg = 0xFF2D2D30; }
+            c.FillRect(cx, cy, cw, ch, cbg);
+            if (cType == "Button") {
+                c.FillRoundRect(cx + 1, cy + 1, cw - 2, ch - 2, app.Scale(3), 0xFF555555);
+                int tw = Canvas.MeasureText(dNames[di], t.fontSizeSmall);
+                c.DrawText(cx + (cw - tw) / 2, cy + (ch - app.Scale(12)) / 2, dNames[di], 0xFFFFFFFF, t.fontSizeSmall);
+            } else if (cType == "CheckBox") {
+                int cbSz = app.Scale(14);
+                c.DrawRect(cx + app.Scale(4), cy + (ch - cbSz) / 2, cbSz, cbSz, 0xFF888888, 1);
+                c.DrawText(cx + app.Scale(22), cy + app.Scale(4), dNames[di], 0xFFCCCCCC, t.fontSizeSmall);
+            } else if (cType == "ProgressBar") {
+                c.DrawRect(cx, cy, cw, ch, 0xFF555555, 1);
+                c.FillRect(cx + 2, cy + 2, (cw - 4) * 60 / 100, ch - 4, 0xFF007ACC);
+            } else {
+                c.DrawRect(cx, cy, cw, ch, 0xFF555555, 1);
+                c.DrawText(cx + app.Scale(4), cy + app.Scale(3), dNames[di], 0xFFCCCCCC, t.fontSizeSmall);
+            }
+
+            // Selection handles (8 handles around control)
+            if (di == dSelV) {
+                c.DrawRect(cx - 1, cy - 1, cw + 2, ch + 2, t.primary, 1);
+                int hs = app.Scale(6);
+                int hh = hs / 2;
+                // Top-left, Top-center, Top-right
+                c.FillRect(cx - hh, cy - hh, hs, hs, 0xFFFFFFFF);
+                c.FillRect(cx + cw / 2 - hh, cy - hh, hs, hs, 0xFFFFFFFF);
+                c.FillRect(cx + cw - hh, cy - hh, hs, hs, 0xFFFFFFFF);
+                // Mid-left, Mid-right
+                c.FillRect(cx - hh, cy + ch / 2 - hh, hs, hs, 0xFFFFFFFF);
+                c.FillRect(cx + cw - hh, cy + ch / 2 - hh, hs, hs, 0xFFFFFFFF);
+                // Bot-left, Bot-center, Bot-right
+                c.FillRect(cx - hh, cy + ch - hh, hs, hs, 0xFFFFFFFF);
+                c.FillRect(cx + cw / 2 - hh, cy + ch - hh, hs, hs, 0xFFFFFFFF);
+                c.FillRect(cx + cw - hh, cy + ch - hh, hs, hs, 0xFFFFFFFF);
+            }
+            di = di + 1;
+        }
+
+        // ---- Mouse interaction ----
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int evKind = app.window.EventKind();
+        int dm = dragMode.Get();
+
+        // Mouse down - start drag or select
+        if (evKind == 3) {
+            // Check toolbox click to add control
+            if (mx >= area.x && mx < area.x + toolW && my >= area.y + app.Scale(28)) {
+                int toolIdx = (my - area.y - app.Scale(28)) / app.Scale(24);
+                string newType = IdeDemo.ToolByIndex(toolIdx);
+                if (newType != "") {
+                    int newIdx = dNames.Count;
+                    string newName = newType + Convert.ToString(newIdx + 1);
+                    dNames.Add(newName);
+                    dX.Add(app.Scale(20));
+                    dY.Add(app.Scale(20));
+                    dW.Add(app.Scale(100));
+                    dH.Add(app.Scale(30));
+                    dTypes.Add(newType);
+                    dSel.Set(newIdx);
+                    app.RequestRedraw();
+                }
+            }
+            // Check click on design surface
+            if (mx >= cntX && mx < formX + formW && my >= cntY && my < formY + formH) {
+                // Check resize handles first (if something selected)
+                if (dSelV >= 0 && dSelV < dNames.Count) {
+                    int rh = IdeDemo.HitHandle(app, mx, my, cntX + dX[dSelV], cntY + dY[dSelV], dW[dSelV], dH[dSelV]);
+                    if (rh >= 0) {
+                        dragMode.Set(2);
+                        resizeH.Set(rh);
+                        dragOffX.Set(mx);
+                        dragOffY.Set(my);
+                        app.RequestRedraw();
+                    } else {
+                        // Check click on controls (top-to-bottom z-order, last is on top)
+                        int ci = dNames.Count - 1;
+                        bool found = false;
+                        while (ci >= 0 && !found) {
+                            int ccx = cntX + dX[ci];
+                            int ccy = cntY + dY[ci];
+                            if (mx >= ccx && mx < ccx + dW[ci] && my >= ccy && my < ccy + dH[ci]) {
+                                dSel.Set(ci);
+                                dragMode.Set(1);
+                                dragOffX.Set(mx - ccx);
+                                dragOffY.Set(my - ccy);
+                                found = true;
+                            }
+                            ci = ci - 1;
+                        }
+                        if (!found) { dSel.Set(-1); }
+                        app.RequestRedraw();
+                    }
+                } else {
+                    // No selection, try to select
+                    int ci = dNames.Count - 1;
+                    bool found = false;
+                    while (ci >= 0 && !found) {
+                        int ccx = cntX + dX[ci];
+                        int ccy = cntY + dY[ci];
+                        if (mx >= ccx && mx < ccx + dW[ci] && my >= ccy && my < ccy + dH[ci]) {
+                            dSel.Set(ci);
+                            dragMode.Set(1);
+                            dragOffX.Set(mx - ccx);
+                            dragOffY.Set(my - ccy);
+                            found = true;
+                        }
+                        ci = ci - 1;
+                    }
+                    if (!found) { dSel.Set(-1); }
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        // Mouse move - drag or resize
+        if (evKind == 7 && dm > 0 && dSelV >= 0 && dSelV < dNames.Count) {
+            if (dm == 1) {
+                // Move control
+                int newX = mx - dragOffX.Get() - cntX;
+                int newY = my - dragOffY.Get() - cntY;
+                newX = IdeDemo.SnapGrid(newX, gridSz);
+                newY = IdeDemo.SnapGrid(newY, gridSz);
+                if (newX < 0) { newX = 0; }
+                if (newY < 0) { newY = 0; }
+                dX[dSelV] = newX;
+                dY[dSelV] = newY;
+                app.RequestRedraw();
+            }
+            if (dm == 2) {
+                // Resize control
+                int rhi = resizeH.Get();
+                int dx = mx - dragOffX.Get();
+                int dy = my - dragOffY.Get();
+                int ox = dX[dSelV]; int oy = dY[dSelV];
+                int ow = dW[dSelV]; int oh = dH[dSelV];
+                // Handle 0=TL 1=TC 2=TR 3=ML 4=MR 5=BL 6=BC 7=BR
+                if (rhi == 0 || rhi == 3 || rhi == 5) { ox = ox + dx; ow = ow - dx; }
+                if (rhi == 0 || rhi == 1 || rhi == 2) { oy = oy + dy; oh = oh - dy; }
+                if (rhi == 2 || rhi == 4 || rhi == 7) { ow = ow + dx; }
+                if (rhi == 5 || rhi == 6 || rhi == 7) { oh = oh + dy; }
+                ow = IdeDemo.SnapGrid(ow, gridSz);
+                oh = IdeDemo.SnapGrid(oh, gridSz);
+                if (ow < gridSz * 2) { ow = gridSz * 2; }
+                if (oh < gridSz * 2) { oh = gridSz * 2; }
+                dX[dSelV] = IdeDemo.SnapGrid(ox, gridSz);
+                dY[dSelV] = IdeDemo.SnapGrid(oy, gridSz);
+                dW[dSelV] = ow;
+                dH[dSelV] = oh;
+                dragOffX.Set(mx);
+                dragOffY.Set(my);
+                app.RequestRedraw();
+            }
+        }
+
+        // Mouse up - end drag
+        if (evKind == 10) {
+            if (dm > 0) {
+                dragMode.Set(0);
+                app.RequestRedraw();
+            }
+        }
+
+        // Delete key removes selected control
+        if (evKind == 4 && app.window.EventKeyCode() == 46) {
+            if (dSelV >= 0 && dSelV < dNames.Count) {
+                dNames.RemoveAt(dSelV);
+                dX.RemoveAt(dSelV);
+                dY.RemoveAt(dSelV);
+                dW.RemoveAt(dSelV);
+                dH.RemoveAt(dSelV);
+                dTypes.RemoveAt(dSelV);
+                dSel.Set(-1);
+                dragMode.Set(0);
+                app.RequestRedraw();
+            }
+        }
+
+        // Status text at bottom of design surface
+        string statusTxt = "Controls: " + Convert.ToString(dNames.Count);
+        if (dSelV >= 0 && dSelV < dNames.Count) {
+            statusTxt = statusTxt + "  |  Selected: " + dNames[dSelV]
+                + " (" + Convert.ToString(dX[dSelV]) + "," + Convert.ToString(dY[dSelV])
+                + " " + Convert.ToString(dW[dSelV]) + "x" + Convert.ToString(dH[dSelV]) + ")";
+        }
+        c.DrawText(surfX + app.Scale(8), area.y + area.height - app.Scale(16), statusTxt, 0xFF888888, t.fontSizeSmall);
+    }
+
+    static int HitHandle(App app, int mx, int my, int cx, int cy, int cw, int ch) {
+        int hs = app.Scale(8);
+        // 0=TL 1=TC 2=TR 3=ML 4=MR 5=BL 6=BC 7=BR
+        if (mx >= cx - hs && mx <= cx + hs && my >= cy - hs && my <= cy + hs) { return 0; }
+        if (mx >= cx + cw / 2 - hs && mx <= cx + cw / 2 + hs && my >= cy - hs && my <= cy + hs) { return 1; }
+        if (mx >= cx + cw - hs && mx <= cx + cw + hs && my >= cy - hs && my <= cy + hs) { return 2; }
+        if (mx >= cx - hs && mx <= cx + hs && my >= cy + ch / 2 - hs && my <= cy + ch / 2 + hs) { return 3; }
+        if (mx >= cx + cw - hs && mx <= cx + cw + hs && my >= cy + ch / 2 - hs && my <= cy + ch / 2 + hs) { return 4; }
+        if (mx >= cx - hs && mx <= cx + hs && my >= cy + ch - hs && my <= cy + ch + hs) { return 5; }
+        if (mx >= cx + cw / 2 - hs && mx <= cx + cw / 2 + hs && my >= cy + ch - hs && my <= cy + ch + hs) { return 6; }
+        if (mx >= cx + cw - hs && mx <= cx + cw + hs && my >= cy + ch - hs && my <= cy + ch + hs) { return 7; }
+        return -1;
+    }
+
+    static void DrawToolItem(Canvas c, int x, int y, int w, int h, string label, Theme t) {
+        c.DrawText(x + 28, y + 4, label, 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRect(x + 8, y + 5, 14, 14, 0xFF3C3C3C);
+        c.FillRect(x + 8, y + 5, 14, 1, 0xFF666666);
+        c.FillRect(x + 8, y + 18, 14, 1, 0xFF666666);
+        c.FillRect(x + 8, y + 5, 1, 14, 0xFF666666);
+        c.FillRect(x + 21, y + 5, 1, 14, 0xFF666666);
+    }
+
+    static string ToolByIndex(int idx) {
+        if (idx == 0) { return "Button"; }
+        if (idx == 1) { return "Label"; }
+        if (idx == 2) { return "TextBox"; }
+        if (idx == 3) { return "CheckBox"; }
+        if (idx == 4) { return "ComboBox"; }
+        if (idx == 5) { return "ListBox"; }
+        if (idx == 6) { return "Panel"; }
+        if (idx == 7) { return "GroupBox"; }
+        if (idx == 8) { return "TabControl"; }
+        if (idx == 9) { return "TreeView"; }
+        if (idx == 10) { return "ListView"; }
+        if (idx == 11) { return "DataGrid"; }
+        if (idx == 12) { return "MenuStrip"; }
+        if (idx == 13) { return "ToolStrip"; }
+        if (idx == 14) { return "StatusBar"; }
+        if (idx == 15) { return "ProgressBar"; }
+        if (idx == 16) { return "PictureBox"; }
+        if (idx == 17) { return "RichTextBox"; }
+        return "";
+    }
+
+    // ================================================================
+    // Component List Panel (VB/Aardio-style component reference)
+    // ================================================================
+
+    static void RenderComponentList(App app, Canvas c, Theme t,
+            int x, int y, int w, int h) {
+        int rowH = app.Scale(20);
+        int pad = app.Scale(6);
+        int cy = y;
+        // GUI Components
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "App", "GUI Application", 0xFF4EC9B0, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Window", "OS Window Handle", 0xFF4EC9B0, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Canvas", "2D Drawing Surface", 0xFF4EC9B0, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Button", "Clickable Button", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Label", "Text Display", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Input", "Text Input Field", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Panel", "Container Panel", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "TreeView", "Tree Navigation", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "TabView", "Tab Container", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Ribbon", "Toolbar Ribbon", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "CodeEditor", "Code Editor", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Modal", "Dialog Modal", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Split", "Layout Splitter", 0xFF569CD6, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "List<T>", "Generic List", 0xFF9B6DCA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Dict<K,V>", "Dictionary", 0xFF9B6DCA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "SignalInt", "Reactive Int", 0xFF9B6DCA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "SignalBool", "Reactive Bool", 0xFF9B6DCA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "SignalString", "Reactive String", 0xFF9B6DCA, t);
+    }
+
+    static void DrawCompItem(App app, Canvas c, int x, int y, int w, int rowH, int pad,
+            string name, string desc, int color, Theme t) {
+        c.FillRoundRect(x + pad, y + app.Scale(3), app.Scale(14), app.Scale(14), app.Scale(2), color);
+        c.DrawText(x + pad + app.Scale(16), y + app.Scale(2), name, 0xFFD4D4D4, t.fontSizeSmall);
+    }
+
+    // ================================================================
+    // Example Code Library Panel
+    // ================================================================
+
+    static void RenderExampleList(App app, Canvas c, Theme t,
+            int x, int y, int w, int h,
+            List<string> tabNames, List<string> tabBodies, List<string> tabPaths,
+            SignalInt activeTab, CodeEditor editor, List<string> log) {
+        int rowH = app.Scale(22);
+        int pad = app.Scale(6);
+        int cy = y;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Hello World", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "File Read/Write", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "List & LINQ", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "GUI Window", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "HTTP Client", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "JSON Parse", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Timer & Events", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Calculator", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Text Editor", 0xFFDCDCAA, t);
+        cy = cy + rowH;
+
+        // Handle click on example to open as new tab
+        if (app.window.EventKind() == 3) {
+            if (app.mouseX >= x && app.mouseX < x + w
+                && app.mouseY >= y && app.mouseY < y + 9 * rowH) {
+                int clickedIdx = (app.mouseY - y) / rowH;
+                string code = IdeDemo.GetExampleCode(clickedIdx);
+                string eName = IdeDemo.GetExampleName(clickedIdx);
+                if (code.Length > 0) {
+                    IdeDemo.OpenNewTab(tabNames, tabBodies, tabPaths, activeTab, eName, code);
+                    log.Add("> Opened example: " + eName);
+                    app.RequestRedraw();
+                }
+            }
+        }
+    }
+
+    static void DrawExItem(App app, Canvas c, int x, int y, int w, int h, int pad,
+            string name, int color, Theme t) {
+        int iconSz = app.Scale(14);
+        c.FillRoundRect(x + pad, y + app.Scale(4), iconSz, iconSz, app.Scale(2), 0xFF333333);
+        c.DrawText(x + pad + app.Scale(2), y + app.Scale(5), "E", color, t.fontSizeSmall);
+        c.DrawText(x + pad + iconSz + app.Scale(4), y + app.Scale(3), name, 0xFFCCCCCC, t.fontSizeSmall);
+    }
+
+    static void OpenNewTab(List<string> tabNames, List<string> tabBodies,
+            List<string> tabPaths, SignalInt activeTab, string name, string code) {
+        tabNames.Add(name);
+        tabBodies.Add(code);
+        tabPaths.Add("");
+        activeTab.Set(tabNames.Count - 1);
+    }
+
+    static string GetExampleName(int idx) {
+        if (idx == 0) { return "hello.zan"; }
+        if (idx == 1) { return "fileio.zan"; }
+        if (idx == 2) { return "linq.zan"; }
+        if (idx == 3) { return "gui_window.zan"; }
+        if (idx == 4) { return "http.zan"; }
+        if (idx == 5) { return "json.zan"; }
+        if (idx == 6) { return "timer.zan"; }
+        if (idx == 7) { return "calculator.zan"; }
+        if (idx == 8) { return "texteditor.zan"; }
+        return "";
+    }
+
+    static string GetExampleCode(int idx) {
+        if (idx == 0) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello, Zan!\");\n        string name = Console.ReadLine();\n        Console.WriteLine(\"Welcome, \" + name + \"!\");\n    }\n}\n";
+        }
+        if (idx == 1) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        // Write to file\n        File.WriteAllText(\"test.txt\", \"Hello File!\");\n        \n        // Read from file\n        string content = File.ReadAllText(\"test.txt\");\n        Console.WriteLine(content);\n        \n        // List directory\n        List<string> files = Directory.GetFiles(\".\");\n        foreach (string f in files) {\n            Console.WriteLine(f);\n        }\n    }\n}\n";
+        }
+        if (idx == 2) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        List<int> nums = new List<int>();\n        nums.Add(5); nums.Add(3); nums.Add(8);\n        nums.Add(1); nums.Add(9); nums.Add(2);\n        \n        // LINQ chain operations\n        var sorted = nums.OrderBy(x => x).ToList();\n        var even = nums.Where(x => x % 2 == 0).ToList();\n        int sum = nums.Sum();\n        int max = nums.Max();\n        \n        Console.WriteLine(\"Sum: \" + Convert.ToString(sum));\n        Console.WriteLine(\"Max: \" + Convert.ToString(max));\n    }\n}\n";
+        }
+        if (idx == 3) {
+            return "using System;\nusing Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"My Window\", 800, 600);\n        app.Show();\n        while (app.isRunning) {\n            if (app.BeginFrame()) {\n                Canvas c = app.canvas;\n                Theme t = app.theme;\n                app.RenderChrome();\n                c.FillRect(10, 40, 200, 100, t.primary);\n                c.DrawText(20, 60, \"Hello GUI!\",\n                    0xFFFFFFFF, t.fontSizeMedium);\n                app.PresentFrame();\n            }\n            app.ProcessEvent();\n        }\n    }\n}\n";
+        }
+        if (idx == 4) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        // HTTP GET request\n        HttpClient client = new HttpClient();\n        string url = \"https://api.example.com/data\";\n        string response = client.GetString(url);\n        Console.WriteLine(response);\n        \n        // HTTP POST\n        string body = \"{\\\"key\\\": \\\"value\\\"}\";\n        string result = client.PostString(url, body);\n        Console.WriteLine(result);\n    }\n}\n";
+        }
+        if (idx == 5) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        string json = \"{\\\"name\\\": \\\"Zan\\\", \\\"version\\\": 1}\";\n        \n        // Parse JSON\n        var obj = JsonSerializer.Parse(json);\n        string name = obj.GetString(\"name\");\n        int ver = obj.GetInt(\"version\");\n        \n        Console.WriteLine(\"Name: \" + name);\n        Console.WriteLine(\"Version: \" + Convert.ToString(ver));\n        \n        // Create JSON\n        var builder = JsonSerializer.CreateObject();\n        builder.Set(\"lang\", \"Zan\");\n        builder.Set(\"year\", 2026);\n        Console.WriteLine(builder.ToString());\n    }\n}\n";
+        }
+        if (idx == 6) {
+            return "using System;\nusing Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"Timer\", 400, 300);\n        app.Show();\n        int count = 0;\n        int lastTick = 0;\n        while (app.isRunning) {\n            if (app.BeginFrame()) {\n                Canvas c = app.canvas;\n                app.RenderChrome();\n                int now = app.window.GetTickMs();\n                if (now - lastTick > 1000) {\n                    count = count + 1;\n                    lastTick = now;\n                    app.RequestRedraw();\n                }\n                c.DrawText(20, 60, \"Count: \" +\n                    Convert.ToString(count),\n                    0xFFFFFFFF, 24);\n                app.PresentFrame();\n            }\n            app.ProcessEvent();\n        }\n    }\n}\n";
+        }
+        if (idx == 7) {
+            return "using System;\n\nclass Calculator {\n    static int Eval(string expr) {\n        // Simple expression evaluator\n        int result = 0;\n        int num = 0;\n        string op = \"+\";\n        int i = 0;\n        while (i < expr.Length) {\n            string ch = expr.Substring(i, 1);\n            if (ch == \"+\" || ch == \"-\") {\n                if (op == \"+\") { result = result + num; }\n                else { result = result - num; }\n                num = 0; op = ch;\n            } else {\n                num = num * 10 + Convert.ToInt32(ch);\n            }\n            i = i + 1;\n        }\n        if (op == \"+\") { result = result + num; }\n        else { result = result - num; }\n        return result;\n    }\n    \n    static void Main() {\n        Console.WriteLine(\"Calculator\");\n        string expr = Console.ReadLine();\n        int val = Calculator.Eval(expr);\n        Console.WriteLine(\"= \" + Convert.ToString(val));\n    }\n}\n";
+        }
+        if (idx == 8) {
+            return "using System;\nusing Gui;\nusing Gui.Widget;\n\nclass TextEditor {\n    static void Main() {\n        App app = App.CreateDark(\"Editor\", 800, 600);\n        app.Show();\n        CodeEditor ed = CodeEditor.Create();\n        ed.LoadText(\"Hello World!\\nLine 2\\nLine 3\");\n        while (app.isRunning) {\n            if (app.BeginFrame()) {\n                app.RenderChrome();\n                Rect area = Rect.Create(0, 32, 800, 568);\n                ed.Render(app, area);\n                app.PresentFrame();\n            }\n            app.ProcessEvent();\n        }\n    }\n}\n";
+        }
+        return "";
+    }
+}

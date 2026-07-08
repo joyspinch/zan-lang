@@ -10,6 +10,15 @@
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 
+/* A frame-resident slot of an async $resume body: the stack alloca that holds
+ * the value while executing, and the heap-frame field it is saved to / reloaded
+ * from around each suspension. */
+typedef struct {
+    LLVMValueRef slot_alloca;
+    LLVMTypeRef  llvm;
+    int          frame_index;
+} zan_async_slot_t;
+
 struct zan_irgen {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -67,6 +76,91 @@ struct zan_irgen {
         int param_count;
     } ctors[256];
     int ctor_count;
+
+    /* ARC runtime functions */
+    LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
+    LLVMValueRef rt_release;     /* zan_rt_release(void*) */
+    LLVMValueRef rt_alloc;       /* zan_rt_alloc(int64_t size) -> void* */
+
+    /* runtime diagnostics & leak detection */
+    LLVMValueRef fn_printf;       /* int printf(const char*, ...) */
+    LLVMTypeRef  printf_type;
+    LLVMValueRef fn_exit;         /* void exit(int) */
+    LLVMTypeRef  exit_type;
+    LLVMValueRef fn_atexit;       /* int atexit(void(*)(void)) */
+    LLVMTypeRef  atexit_type;
+    LLVMValueRef g_live;          /* i64 global: net live ARC allocations */
+    LLVMValueRef g_site_live;     /* [N x i64] global: live count per alloc site */
+    LLVMValueRef g_site_names;    /* [N x i8*] global: "file:line:col" per site */
+    LLVMTypeRef  site_live_type;  /* [N x i64] array type */
+    LLVMTypeRef  site_names_type; /* [N x i8*] array type */
+    int          leak_site_count; /* number of distinct `new` sites assigned */
+    LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
+    const char  *src_file;        /* source path, for runtime diagnostics */
+    bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
+    bool         check_leaks;     /* emit a leak report at program exit */
+
+    /* vtable registry (for virtual dispatch) */
+    struct {
+        zan_symbol_t *type_sym;
+        LLVMValueRef vtable_global;  /* global constant array */
+        int method_count;
+    } vtables[256];
+    int vtable_count;
+
+    /* built-in List<T> runtime support */
+    LLVMValueRef fn_realloc;     /* realloc(void*, size_t) -> void* */
+    LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
+    LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
+    LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */
+    LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64 thread_handle } */
+    LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
+
+    /* async/await CPS lowering (see docs/ASYNC_CPS_DESIGN.md) */
+    LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
+    LLVMTypeRef  co_step_ptr;     /* void(i8*)* — pointer to a step fn */
+    LLVMTypeRef  co_header_type;  /* shared frame header {i32,i32,i8*,step*,i64} */
+    LLVMValueRef rt_co_ready;     /* void zan_co_ready(void* frame, step) */
+    LLVMTypeRef  rt_co_ready_type;
+    LLVMValueRef rt_co_sched_init;/* void zan_co_sched_init(void) */
+    LLVMTypeRef  rt_co_sched_init_type;
+    LLVMValueRef rt_co_sched_run; /* void zan_co_sched_run(void) */
+    LLVMTypeRef  rt_co_sched_run_type;
+    LLVMValueRef rt_co_delay;     /* void zan_co_delay(i64 ms, void* frame, step) */
+    LLVMTypeRef  rt_co_delay_type;
+    /* socket async (S4b-2): the readiness reactor, provided by the shipped
+     * zanrt_io object (built from src/runtime/rt_io.c). zan_io_wait_co registers
+     * a one-shot fd watcher that re-readies (frame, step) when ready; zan_io_pump
+     * blocks in the reactor for the next event. A weak inline zan_io_pump that
+     * returns 0 lets non-socket programs link and behave as before; the reactor
+     * object's strong definition overrides it for socket-async programs. */
+    LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(i64 fd,i32 interest,i8* frame,step) */
+    LLVMTypeRef  rt_io_wait_co_type;
+    LLVMValueRef rt_io_pump;      /* i32 zan_io_pump(void) */
+    LLVMTypeRef  rt_io_pump_type;
+    bool         uses_socket_async; /* set when a socket await is lowered */
+    /* set while emitting an async function's $resume body: the current heap
+     * frame pointer and its struct type, so `return` stores into the frame's
+     * result slot + notifies the awaiter instead of a plain ret. NULL when not
+     * lowering an async body. */
+    LLVMValueRef current_async_frame;
+    LLVMTypeRef  current_async_frame_type;
+    LLVMValueRef current_async_resume_fn; /* the $resume fn being emitted */
+    /* await state-machine context, valid only when current_async_frame is set
+     * and the body contains awaits: the entry switch (new resume-k cases are
+     * added here), the next state number to hand out, and the frame slots that
+     * must be saved before a suspend and reloaded after (params + named
+     * scalar locals live across suspensions). */
+    LLVMValueRef current_async_switch;
+    int          current_async_next_state;
+    int          current_async_sub_base; /* frame index of first sub-task slot */
+    int          current_async_sub_next;
+    zan_async_slot_t *current_async_slots;
+    int          current_async_slot_count;
+
+    /* DllImport: tracked extern libraries for linker */
+    zan_istr_t extern_libs[64];
+    int extern_lib_count;
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

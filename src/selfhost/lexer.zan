@@ -1,0 +1,327 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Faithful port of src/compiler/lexer.c (bootstrap subset). Produces a
+// List<Token> covering identifiers/keywords, int/float/string/char literals,
+// comments and the operator/punctuation set the compiler itself uses.
+class Lexer {
+    public string src;
+    public int pos;
+    public int n;
+    public int line;
+    public int col;
+
+    public Lexer(string s) {
+        src = s; pos = 0; n = s.Length; line = 1; col = 1;
+    }
+
+    int Peek() { if (pos < n) { return (int)src[pos]; } return 0; }
+    int Peek2() { if (pos + 1 < n) { return (int)src[pos + 1]; } return 0; }
+
+    int Adv() {
+        int c = 0;
+        if (pos < n) { c = (int)src[pos]; }
+        pos = pos + 1;
+        if (c == 10) { line = line + 1; col = 1; } else { col = col + 1; }
+        return c;
+    }
+
+    bool IsDigit(int c) { return c >= 48 && c <= 57; }
+    bool IsHex(int c) {
+        if (c >= 48 && c <= 57) { return true; }
+        if (c >= 97 && c <= 102) { return true; }
+        if (c >= 65 && c <= 70) { return true; }
+        return false;
+    }
+    bool IsAlpha(int c) {
+        if (c >= 97 && c <= 122) { return true; }
+        if (c >= 65 && c <= 90) { return true; }
+        if (c == 95) { return true; }
+        return false;
+    }
+    bool IsAlnum(int c) { if (IsAlpha(c)) { return true; } return IsDigit(c); }
+
+    int KeywordKind(string s) {
+        if (s == "abstract") { return TK.Abstract(); }
+        if (s == "as") { return TK.As(); }
+        if (s == "base") { return TK.Base(); }
+        if (s == "bool") { return TK.Bool(); }
+        if (s == "break") { return TK.Break(); }
+        if (s == "byte") { return TK.Byte(); }
+        if (s == "case") { return TK.Case(); }
+        if (s == "char") { return TK.Char(); }
+        if (s == "class") { return TK.Class(); }
+        if (s == "const") { return TK.Const(); }
+        if (s == "continue") { return TK.Continue(); }
+        if (s == "default") { return TK.Default(); }
+        if (s == "do") { return TK.Do(); }
+        if (s == "double") { return TK.Double(); }
+        if (s == "else") { return TK.Else(); }
+        if (s == "enum") { return TK.Enum(); }
+        if (s == "false") { return TK.False(); }
+        if (s == "float") { return TK.Float(); }
+        if (s == "for") { return TK.For(); }
+        if (s == "foreach") { return TK.Foreach(); }
+        if (s == "get") { return TK.Get(); }
+        if (s == "if") { return TK.If(); }
+        if (s == "in") { return TK.In(); }
+        if (s == "int") { return TK.Int(); }
+        if (s == "interface") { return TK.Interface(); }
+        if (s == "is") { return TK.Is(); }
+        if (s == "long") { return TK.Long(); }
+        if (s == "namespace") { return TK.Namespace(); }
+        if (s == "new") { return TK.New(); }
+        if (s == "null") { return TK.Null(); }
+        if (s == "object") { return TK.Object(); }
+        if (s == "override") { return TK.Override(); }
+        if (s == "private") { return TK.Private(); }
+        if (s == "protected") { return TK.Protected(); }
+        if (s == "public") { return TK.Public(); }
+        if (s == "readonly") { return TK.Readonly(); }
+        if (s == "ref") { return TK.Ref(); }
+        if (s == "return") { return TK.Return(); }
+        if (s == "sealed") { return TK.Sealed(); }
+        if (s == "try") { return TK.Try(); }
+        if (s == "catch") { return TK.Catch(); }
+        if (s == "throw") { return TK.Throw(); }
+        if (s == "finally") { return TK.Finally(); }
+        if (s == "set") { return TK.Set(); }
+        if (s == "short") { return TK.Short(); }
+        if (s == "static") { return TK.Static(); }
+        if (s == "string") { return TK.String(); }
+        if (s == "struct") { return TK.Struct(); }
+        if (s == "switch") { return TK.Switch(); }
+        if (s == "this") { return TK.This(); }
+        if (s == "true") { return TK.True(); }
+        if (s == "using") { return TK.Using(); }
+        if (s == "value") { return TK.Value(); }
+        if (s == "var") { return TK.Var(); }
+        if (s == "virtual") { return TK.Virtual(); }
+        if (s == "void") { return TK.Void(); }
+        if (s == "while") { return TK.While(); }
+        return TK.Ident();
+    }
+
+    void SkipTrivia() {
+        while (pos < n) {
+            int c = Peek();
+            if (c == 32 || c == 9 || c == 13 || c == 10) {
+                Adv();
+            } else if (c == 47 && Peek2() == 47) {
+                // line comment
+                while (pos < n && Peek() != 10) { Adv(); }
+            } else if (c == 47 && Peek2() == 42) {
+                // block comment
+                Adv(); Adv();
+                while (pos < n) {
+                    if (Peek() == 42 && Peek2() == 47) { Adv(); Adv(); break; }
+                    Adv();
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    Token Ident(int startLine, int startCol) {
+        int start = pos;
+        while (pos < n && IsAlnum(Peek())) { Adv(); }
+        string t = src.Substring(start, pos - start);
+        int k = KeywordKind(t);
+        return new Token(k, t, 0, startLine, startCol);
+    }
+
+    Token Number(int startLine, int startCol) {
+        int start = pos;
+        long val = 0;
+        bool isFloat = false;
+        if (Peek() == 48 && (Peek2() == 120 || Peek2() == 88)) {
+            // hex
+            Adv(); Adv();
+            while (pos < n && (IsHex(Peek()) || Peek() == 95)) {
+                int c = Peek();
+                if (c != 95) {
+                    int d = 0;
+                    if (c >= 48 && c <= 57) { d = c - 48; }
+                    else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
+                    else { d = c - 65 + 10; }
+                    val = val * 16 + d;
+                }
+                Adv();
+            }
+            string ht = src.Substring(start, pos - start);
+            return new Token(TK.IntLit(), ht, val, startLine, startCol);
+        }
+        while (pos < n && (IsDigit(Peek()) || Peek() == 95)) {
+            int c = Peek();
+            if (c != 95) { val = val * 10 + (c - 48); }
+            Adv();
+        }
+        if (Peek() == 46 && IsDigit(Peek2())) {
+            isFloat = true;
+            Adv();
+            while (pos < n && (IsDigit(Peek()) || Peek() == 95)) { Adv(); }
+        }
+        string t = src.Substring(start, pos - start);
+        if (isFloat) { return new Token(TK.FloatLit(), t, 0, startLine, startCol); }
+        return new Token(TK.IntLit(), t, val, startLine, startCol);
+    }
+
+    int EscapeChar(int c) {
+        if (c == 110) { return 10; }  // n
+        if (c == 116) { return 9; }   // t
+        if (c == 114) { return 13; }  // r
+        if (c == 48) { return 0; }    // 0
+        return c;                     // \ " ' and others
+    }
+
+    Token Str(int startLine, int startCol) {
+        Adv(); // opening quote
+        int start = pos;
+        while (pos < n && Peek() != 34) {
+            if (Peek() == 92) { Adv(); Adv(); } else { Adv(); }
+        }
+        string t = src.Substring(start, pos - start);
+        Adv(); // closing quote
+        return new Token(TK.StringLit(), t, 0, startLine, startCol);
+    }
+
+    // Interpolated string $"...{expr}...". Spliced into an ordinary
+    // concatenation token stream: ( "" + "seg" + ( expr ) + "seg" + ... ).
+    // The leading "" guarantees a string-typed result even for $"{x}".
+    void InterpStr(List<Token> toks, int sl, int sc) {
+        Adv(); // $
+        Adv(); // opening quote
+        toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), "", 0, sl, sc));
+        int start = pos;
+        while (pos < n && Peek() != 34) {
+            int c = Peek();
+            if (c == 92) { Adv(); Adv(); }
+            else if (c == 123) {
+                string seg = src.Substring(start, pos - start);
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
+                Adv(); // '{'
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+                int depth = 1;
+                while (pos < n && depth > 0) {
+                    SkipTrivia();
+                    if (pos >= n) { break; }
+                    int ic = Peek();
+                    if (ic == 125) { depth = depth - 1; Adv(); if (depth == 0) { break; } continue; }
+                    if (ic == 123) { depth = depth + 1; Adv(); continue; }
+                    if (IsAlpha(ic)) { toks.Add(Ident(line, col)); }
+                    else if (IsDigit(ic)) { toks.Add(Number(line, col)); }
+                    else if (ic == 34) { toks.Add(Str(line, col)); }
+                    else if (ic == 39) { toks.Add(CharLit(line, col)); }
+                    else { toks.Add(Punct(line, col)); }
+                }
+                toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+                start = pos;
+            }
+            else { Adv(); }
+        }
+        string tail = src.Substring(start, pos - start);
+        toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), tail, 0, sl, sc));
+        Adv(); // closing quote
+        toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+    }
+
+    Token CharLit(int startLine, int startCol) {
+        Adv(); // opening '
+        int v = 0;
+        if (Peek() == 92) { Adv(); v = EscapeChar(Peek()); Adv(); }
+        else { v = Peek(); Adv(); }
+        if (Peek() == 39) { Adv(); } // closing '
+        return new Token(TK.CharLit(), "", v, startLine, startCol);
+    }
+
+    public List<Token> Run() {
+        List<Token> toks = new List<Token>();
+        while (true) {
+            SkipTrivia();
+            int sl = line;
+            int sc = col;
+            if (pos >= n) {
+                toks.Add(new Token(TK.Eof(), "", 0, sl, sc));
+                return toks;
+            }
+            int c = Peek();
+            if (c == 36 && Peek2() == 34) { InterpStr(toks, sl, sc); }
+            else if (IsAlpha(c)) { toks.Add(Ident(sl, sc)); }
+            else if (IsDigit(c)) { toks.Add(Number(sl, sc)); }
+            else if (c == 34) { toks.Add(Str(sl, sc)); }
+            else if (c == 39) { toks.Add(CharLit(sl, sc)); }
+            else { toks.Add(Punct(sl, sc)); }
+        }
+    }
+
+    Token Mk(int k, int sl, int sc) { return new Token(k, "", 0, sl, sc); }
+
+    Token Punct(int sl, int sc) {
+        int c = Adv();
+        int d = Peek();
+        if (c == 40) { return Mk(TK.LParen(), sl, sc); }
+        if (c == 41) { return Mk(TK.RParen(), sl, sc); }
+        if (c == 123) { return Mk(TK.LBrace(), sl, sc); }
+        if (c == 125) { return Mk(TK.RBrace(), sl, sc); }
+        if (c == 91) { return Mk(TK.LBracket(), sl, sc); }
+        if (c == 93) { return Mk(TK.RBracket(), sl, sc); }
+        if (c == 59) { return Mk(TK.Semicolon(), sl, sc); }
+        if (c == 58) { return Mk(TK.Colon(), sl, sc); }
+        if (c == 44) { return Mk(TK.Comma(), sl, sc); }
+        if (c == 46) { return Mk(TK.Dot(), sl, sc); }
+        if (c == 63) { return Mk(TK.Question(), sl, sc); }
+        if (c == 126) { return Mk(TK.Bang(), sl, sc); } // ~ (reuse bang slot rarely used)
+        if (c == 43) {
+            if (d == 43) { Adv(); return Mk(TK.PlusPlus(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.PlusEq(), sl, sc); }
+            return Mk(TK.Plus(), sl, sc);
+        }
+        if (c == 45) {
+            if (d == 45) { Adv(); return Mk(TK.MinusMinus(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.MinusEq(), sl, sc); }
+            return Mk(TK.Minus(), sl, sc);
+        }
+        if (c == 42) {
+            if (d == 61) { Adv(); return Mk(TK.StarEq(), sl, sc); }
+            return Mk(TK.Star(), sl, sc);
+        }
+        if (c == 47) {
+            if (d == 61) { Adv(); return Mk(TK.SlashEq(), sl, sc); }
+            return Mk(TK.Slash(), sl, sc);
+        }
+        if (c == 37) { return Mk(TK.Percent(), sl, sc); }
+        if (c == 60) {
+            if (d == 61) { Adv(); return Mk(TK.LessEq(), sl, sc); }
+            return Mk(TK.Less(), sl, sc);
+        }
+        if (c == 62) {
+            if (d == 61) { Adv(); return Mk(TK.GreaterEq(), sl, sc); }
+            return Mk(TK.Greater(), sl, sc);
+        }
+        if (c == 61) {
+            if (d == 61) { Adv(); return Mk(TK.EqEq(), sl, sc); }
+            if (d == 62) { Adv(); return Mk(TK.Arrow(), sl, sc); }
+            return Mk(TK.Eq(), sl, sc);
+        }
+        if (c == 33) {
+            if (d == 61) { Adv(); return Mk(TK.BangEq(), sl, sc); }
+            return Mk(TK.Bang(), sl, sc);
+        }
+        if (c == 38) {
+            if (d == 38) { Adv(); return Mk(TK.AmpAmp(), sl, sc); }
+            return Mk(TK.Amp(), sl, sc);
+        }
+        if (c == 124) {
+            if (d == 124) { Adv(); return Mk(TK.PipePipe(), sl, sc); }
+            return Mk(TK.Pipe(), sl, sc);
+        }
+        if (c == 94) { return Mk(TK.Caret(), sl, sc); }
+        return Mk(TK.Invalid(), sl, sc);
+    }
+}

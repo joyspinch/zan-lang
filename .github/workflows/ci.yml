@@ -2,45 +2,101 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: ['**']
   pull_request:
-    branches: [main]
+    branches: ['**']
 
 jobs:
-  build:
+  # Linux + macOS share a POSIX shell and a system C compiler (used by zanc at
+  # link time). LLVM is provided with its CMake package config so that
+  # find_package(LLVM CONFIG) works.
+  build-unix:
     strategy:
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest]
         build_type: [Debug, Release]
     runs-on: ${{ matrix.os }}
-
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install LLVM (Ubuntu)
+    - name: Install LLVM (Linux)
+      if: runner.os == 'Linux'
+      uses: KyleMayes/install-llvm-action@v2
+      with:
+        version: "17.0"
+        cached: true
+
+    - name: Set LLVM_DIR (Linux)
+      if: runner.os == 'Linux'
+      run: echo "LLVM_DIR=$LLVM_PATH/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+    - name: Install libX11 (Linux)
       if: runner.os == 'Linux'
       run: |
-        wget https://apt.llvm.org/llvm.sh
-        chmod +x llvm.sh
-        sudo ./llvm.sh 17
-        sudo apt-get install -y llvm-17-dev
+        # Drop flaky third-party repos (packages.microsoft.com periodically
+        # serves an unsigned InRelease and breaks `apt-get update`); they are
+        # irrelevant to this project.
+        sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                   /etc/apt/sources.list.d/azure-cli.list \
+                   /etc/apt/sources.list.d/azure-cli.sources
+        sudo apt-get update
+        sudo apt-get install -y libx11-dev
 
     - name: Install LLVM (macOS)
       if: runner.os == 'macOS'
-      run: brew install llvm@17
-
-    - name: Install LLVM (Windows)
-      if: runner.os == 'Windows'
-      run: choco install llvm --version=17.0.6
+      run: |
+        brew install llvm@17
+        echo "LLVM_DIR=$(brew --prefix llvm@17)/lib/cmake/llvm" >> "$GITHUB_ENV"
 
     - name: Configure
-      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLLVM_DIR="$LLVM_DIR"
 
     - name: Build
-      run: cmake --build build --config ${{ matrix.build_type }}
+      run: cmake --build build --config ${{ matrix.build_type }} -j
 
     - name: Test
       run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure
+
+  # Windows uses MSYS2/MinGW, which ships a prebuilt LLVM (with CMake config),
+  # clang (used by zanc at link time), CMake and Ninja in one self-contained
+  # toolchain — no Visual Studio environment juggling required.
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-llvm
+          mingw-w64-x86_64-clang
+          mingw-w64-x86_64-lld
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-ninja
+
+    - name: Configure
+      run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLLVM_DIR="/mingw64/lib/cmake/llvm" -DZAN_BUILD_GUI_TESTS=OFF
+
+    # Only the compiler is built under MinGW: the LSP/DAP/IDE tools depend on
+    # MSVC/Win32-specific headers. ctest exercises the compiler end to end
+    # (compile + link + run real .zan programs), which is the cross-platform
+    # guarantee that matters here.
+    - name: Build
+      run: cmake --build build --target zanc -j
+
+    - name: Test
+      run: ctest --test-dir build --output-on-failure
 
   lint:
     runs-on: ubuntu-latest
@@ -49,3 +105,23 @@ jobs:
     - name: Check formatting
       run: |
         find src/ -name '*.c' -o -name '*.h' | xargs clang-format --dry-run --Werror || true
+
+  # Fuzz the lexer + parser front-end with libFuzzer under ASan + UBSan. Runs a
+  # short bounded budget on every push so malformed-input crashes / OOB reads /
+  # UB regress loudly. The front-end (arena+diag+lexer+parser+ast) is a closed
+  # link set — no LLVM needed, so this stays fast.
+  fuzz:
+    name: fuzz (lexer+parser)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build & run libFuzzer
+      run: |
+        clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+          -Isrc/compiler \
+          src/compiler/arena.c src/compiler/diag.c src/compiler/lexer.c \
+          src/compiler/parser.c src/compiler/ast.c \
+          tests/fuzz/fuzz_parser.c -o fuzz_parser
+        mkdir -p corpus
+        cp tests/golden/cases/*.zan tests/diag/*.zan examples/*.zan corpus/ 2>/dev/null || true
+        ASAN_OPTIONS=detect_leaks=0 ./fuzz_parser -max_total_time=45 -print_final_stats=1 corpus

@@ -322,3 +322,53 @@ Track output binary sizes. Increases > 10% require justification.
 
 Track peak memory during compilation of standard test programs. Increases > 20% require investigation.
 
+
+---
+
+## 6. Self-Hosting Bootstrap Memory
+
+The self-hosted compiler (`src/selfhost/`) generates LLVM IR as text. The IR for
+one translation unit is assembled by the IR generator (`irgen.zan`) before being
+written to disk.
+
+### 6.1 The O(n²) accumulation problem
+
+Earlier, `irgen.zan` accumulated the whole IR module by immutable-string
+concatenation:
+
+```
+void L(string s) { body = body + s + "\n"; }   // O(n) copy per call
+```
+
+Because strings are immutable, every `body = body + s` allocated a fresh buffer
+and copied the entire IR emitted so far, and the bootstrap subset has no
+`free`, so none of the intermediate buffers were released. Assembling a 744 KB
+module therefore cost O(n²) time and memory. Self-compiling the compiler peaked
+at **~13 GB**.
+
+### 6.2 Fix: a real `StringBuilder`
+
+`StringBuilder` is now a first-class builtin in both compilers (the C bootstrap
+compiler `zanc` and the self-hosted `irgen.zan`). It is a growable byte buffer
+`{ i64 count, i64 capacity, i8* data }` with capacity doubling, so `Append` is
+amortised O(1) and only copies the appended fragment:
+
+```
+void L(string s) { body.Append(s); body.Append("\n"); }   // amortised O(1)
+```
+
+`ToString()` materialises the final string once. Total memory is now O(output
+size) instead of O(output size²).
+
+### 6.3 Result
+
+| Metric | Before (`string +`) | After (`StringBuilder`) |
+|--------|---------------------|-------------------------|
+| Peak RSS, self-compile (~744 KB IR) | ~13 GB | **22.8 MB** |
+| Append complexity | O(n) per call, O(n²) total | O(1) amortised, O(n) total |
+
+The three-generation bootstrap fixpoint is preserved: `gen0 → gen1 → g2.ll`,
+`clang g2.ll → zanc2 → g3.ll`, and `g2.ll` and `g3.ll` remain **byte-identical**.
+
+Measured with `build/mem.ps1` (`PeakWorkingSet64` sampling); reproduced by
+`build/loop.bat` (full bootstrap + `fc /b` comparison).

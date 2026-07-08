@@ -501,6 +501,30 @@ await Task.Delay(1000);    // yields for 1 second
 
 The runtime abstracts platform differences. User code is identical across platforms.
 
+### 8.3 Implementation status
+
+The async I/O stack is implemented end to end and verified on Linux, macOS and
+Windows (CI runs the loopback-echo conformance tests on all three):
+
+- **IO reactor** (`src/runtime/rt_io.c`): one readiness/completion reactor with
+  an `epoll` (Linux), `kqueue` (macOS/BSD), `IOCP` (Windows) and `select`
+  (fallback) backend. The stackless coroutine driver (`rt_co.c`) drains its
+  ready queue and then blocks in the reactor (`zan_io_pump`), resuming a
+  coroutine when its fd becomes ready.
+- **Socket await primitives**: `await Socket.ReadReady(fd)` /
+  `await Socket.WriteReady(fd)` genuinely suspend to the reactor. Reference
+  locals (buffers) stay live across a suspension because they are frame-resident.
+- **Real-async Net stack**: `Socket.*Async`, `AsyncSocket`, `TcpClient`,
+  `TcpListener` and `UdpClient` suspend on the reactor (non-blocking + retry on
+  `EWOULDBLOCK`); `Http`, `WebSocket`, `Mqtt` and `Worker` mark their I/O paths
+  `async` and `await` down into the socket layer.
+- **Cross-platform correctness**: `sockaddr_in` is built with host-order
+  `sin_family` and network-order `sin_port` on Linux/Windows, and the BSD
+  `sin_len`/`sin_family` layout (plus BSD `O_NONBLOCK`/`SO_REUSEADDR`) on macOS.
+- **Method overloading**: same-named methods are resolved by argument count at
+  the call site, which the async Net APIs (e.g. `RecvAsync()` vs `RecvAsync(n)`)
+  rely on.
+
 ---
 
 ## 9. Examples

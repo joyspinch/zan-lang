@@ -130,51 +130,71 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
 
     zan_istr_t name = type_ref->type_ref.name;
 
+    /* Resolve the base (element) type first, then apply array / nullable
+     * wrapping uniformly. Built-in types previously returned early here,
+     * which silently dropped the `[]` on parameters/fields such as `int[]`. */
+    zan_type_t *base = NULL;
+
     /* built-in types */
-    if (istr_eq(name, "void",   4)) return b->type_void;
-    if (istr_eq(name, "bool",   4)) return b->type_bool;
-    if (istr_eq(name, "byte",   4)) return b->type_byte;
-    if (istr_eq(name, "short",  5)) return b->type_short;
-    if (istr_eq(name, "int",    3)) return b->type_int;
-    if (istr_eq(name, "long",   4)) return b->type_long;
-    if (istr_eq(name, "float",  5)) return b->type_float;
-    if (istr_eq(name, "double", 6)) return b->type_double;
-    if (istr_eq(name, "char",   4)) return b->type_char;
-    if (istr_eq(name, "string", 6)) return b->type_string;
-    if (istr_eq(name, "object", 6)) return b->type_object;
-    if (istr_eq(name, "nint",   4)) return b->type_nint;
-
-    /* user-defined type: look up in scope */
-    zan_symbol_t *sym = scope_find(b->current_scope, name);
-    if (sym) {
-        zan_type_t *resolved = sym->type;
-
-        /* wrap in array if needed */
-        if (type_ref->type_ref.is_array) {
-            zan_type_t *arr = make_type(b->arena, TYPE_ARRAY, name.str, name.len);
-            arr->element_type = resolved;
-            resolved = arr;
-        }
-        /* wrap in nullable if needed */
-        if (type_ref->type_ref.is_nullable) {
-            zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
-            nullable->element_type = resolved;
-            resolved = nullable;
-        }
-        return resolved;
+    if (istr_eq(name, "void",   4)) base = b->type_void;
+    else if (istr_eq(name, "bool",   4)) base = b->type_bool;
+    else if (istr_eq(name, "byte",   4)) base = b->type_byte;
+    else if (istr_eq(name, "short",  5)) base = b->type_short;
+    else if (istr_eq(name, "int",    3)) base = b->type_int;
+    else if (istr_eq(name, "long",   4)) base = b->type_long;
+    else if (istr_eq(name, "float",  5)) base = b->type_float;
+    else if (istr_eq(name, "double", 6)) base = b->type_double;
+    else if (istr_eq(name, "char",   4)) base = b->type_char;
+    else if (istr_eq(name, "string", 6)) base = b->type_string;
+    else if (istr_eq(name, "object", 6)) base = b->type_object;
+    else if (istr_eq(name, "nint",   4)) base = b->type_nint;
+    /* built-in generic types */
+    else if (istr_eq(name, "List", 4)) base = make_type(b->arena, TYPE_CLASS, "List", 4);
+    else if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10))
+        base = make_type(b->arena, TYPE_CLASS, "Dict", 4);
+    else if (istr_eq(name, "StringBuilder", 13))
+        base = make_type(b->arena, TYPE_CLASS, "StringBuilder", 13);
+    else {
+        /* user-defined type: look up in scope */
+        zan_symbol_t *sym = scope_find(b->current_scope, name);
+        if (sym) base = sym->type;
     }
 
-    /* handle array of built-in types */
+    if (!base) {
+        zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                      "undefined type '%.*s'", name.len, name.str);
+        return b->type_error;
+    }
+
+    /* carry generic arguments (e.g. List<Node>, Dict<K,V>) onto the fresh
+     * built-in generic type so codegen can recover the element type. */
+    if ((istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
+         istr_eq(name, "Dictionary", 10)) &&
+        type_ref->type_ref.type_args.count > 0) {
+        int nargs = type_ref->type_ref.type_args.count;
+        base->type_args = (zan_type_t **)zan_arena_alloc(
+            b->arena, sizeof(zan_type_t *) * (size_t)nargs);
+        base->type_arg_count = nargs;
+        for (int i = 0; i < nargs; i++) {
+            base->type_args[i] = zan_binder_resolve_type(
+                b, type_ref->type_ref.type_args.items[i]);
+        }
+    }
+
+    zan_type_t *resolved = base;
+    /* wrap in array if needed */
     if (type_ref->type_ref.is_array) {
-        zan_type_t *elem = zan_binder_resolve_type(b, type_ref);
         zan_type_t *arr = make_type(b->arena, TYPE_ARRAY, name.str, name.len);
-        arr->element_type = elem;
-        return arr;
+        arr->element_type = resolved;
+        resolved = arr;
     }
-
-    zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
-                  "undefined type '%.*s'", name.len, name.str);
-    return b->type_error;
+    /* wrap in nullable if needed */
+    if (type_ref->type_ref.is_nullable) {
+        zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
+        nullable->element_type = resolved;
+        resolved = nullable;
+    }
+    return resolved;
 }
 
 /* ---- symbol lookup ---- */
@@ -191,6 +211,7 @@ static zan_sym_kind_t ast_kind_to_sym_kind(zan_ast_kind_t kind) {
     case AST_STRUCT_DECL:    return SYM_STRUCT;
     case AST_INTERFACE_DECL: return SYM_INTERFACE;
     case AST_ENUM_DECL:      return SYM_ENUM;
+    case AST_DELEGATE_DECL:  return SYM_DELEGATE;
     default:                 return SYM_CLASS;
     }
 }
@@ -201,6 +222,7 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
     case AST_STRUCT_DECL:    return TYPE_STRUCT;
     case AST_INTERFACE_DECL: return TYPE_INTERFACE;
     case AST_ENUM_DECL:      return TYPE_ENUM;
+    case AST_DELEGATE_DECL:  return TYPE_DELEGATE;
     default:                 return TYPE_CLASS;
     }
 }
@@ -209,6 +231,41 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
 static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *node = decls->items[i];
+
+        /* delegate declarations use method_decl union */
+        if (node->kind == AST_DELEGATE_DECL) {
+            zan_istr_t name = node->method_decl.name;
+            zan_symbol_t *existing = scope_find(b->current_scope, name);
+            if (existing) {
+                zan_diag_emit(b->diag, DIAG_ERROR, node->loc,
+                              "duplicate type declaration '%.*s'", name.len, name.str);
+                continue;
+            }
+            zan_type_t *type = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
+            /* resolve delegate return type */
+            type->delegate_ret_type = node->method_decl.return_type
+                ? zan_binder_resolve_type(b, node->method_decl.return_type)
+                : b->type_void;
+            /* resolve delegate parameter types */
+            int pc = node->method_decl.params.count;
+            type->delegate_param_count = pc;
+            if (pc > 0) {
+                type->delegate_param_types = (zan_type_t **)zan_arena_alloc(
+                    b->arena, sizeof(zan_type_t *) * (size_t)pc);
+                for (int j = 0; j < pc; j++) {
+                    zan_ast_node_t *param = node->method_decl.params.items[j];
+                    type->delegate_param_types[j] = zan_binder_resolve_type(b, param->param.type);
+                }
+            } else {
+                type->delegate_param_types = NULL;
+            }
+            zan_symbol_t *sym = make_symbol(b->arena, SYM_DELEGATE,
+                name, type, node, node->method_decl.modifiers);
+            type->sym = sym;
+            scope_add(b->arena, b->current_scope, sym);
+            continue;
+        }
+
         if (node->kind == AST_CLASS_DECL || node->kind == AST_STRUCT_DECL ||
             node->kind == AST_INTERFACE_DECL || node->kind == AST_ENUM_DECL) {
 
@@ -228,6 +285,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
                 ast_kind_to_sym_kind(node->kind),
                 name, type, node, node->type_decl.modifiers);
             type->sym = sym;
+            type->base_type = NULL;
 
             scope_add(b->arena, b->current_scope, sym);
         }
@@ -239,6 +297,23 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_istr_t type_name = type_node->type_decl.name;
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
     if (!type_sym) return;
+
+    /* resolve base types and inherit members */
+    if (type_node->type_decl.bases.count > 0) {
+        zan_ast_node_t *base_ref = type_node->type_decl.bases.items[0];
+        zan_istr_t base_name = base_ref->type_ref.name;
+        zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
+        if (base_sym && (base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT)) {
+            type_sym->type->base_type = base_sym->type;
+            /* inherit base class fields and properties */
+            for (int bi = 0; bi < base_sym->member_count; bi++) {
+                if (base_sym->members[bi]->kind == SYM_FIELD ||
+                    base_sym->members[bi]->kind == SYM_PROPERTY) {
+                    symbol_add_member(b->arena, type_sym, base_sym->members[bi]);
+                }
+            }
+        }
+    }
 
     zan_scope_t *saved = b->current_scope;
     b->current_scope = scope_new(b->arena, saved);

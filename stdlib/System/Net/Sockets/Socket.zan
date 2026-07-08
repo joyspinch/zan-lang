@@ -1,0 +1,458 @@
+using System;
+
+namespace System.Net.Sockets;
+
+/// <summary>
+/// Cross-platform low-level socket operations.
+/// Uses Winsock2 on Windows, BSD sockets (libc) on Linux/macOS.
+/// </summary>
+class Socket {
+    // ---- Platform-specific DllImport ----
+    #if WINDOWS
+    [DllImport("ws2_32", EntryPoint = "WSAStartup")]
+    static extern int WSAStartup(int version, string wsaData);
+
+    [DllImport("ws2_32", EntryPoint = "WSACleanup")]
+    static extern int WSACleanup();
+
+    [DllImport("ws2_32")]
+    static extern int socket(int af, int type, int protocol);
+
+    [DllImport("ws2_32")]
+    static extern int closesocket(int s);
+
+    [DllImport("ws2_32", EntryPoint = "send")]
+    static extern int winsend(int s, string buf, int len, int flags);
+
+    [DllImport("ws2_32", EntryPoint = "recv")]
+    static extern int winrecv(int s, string buf, int len, int flags);
+
+    [DllImport("ws2_32")]
+    static extern int bind(int s, string addr, int addrlen);
+
+    [DllImport("ws2_32")]
+    static extern int listen(int s, int backlog);
+
+    [DllImport("ws2_32")]
+    static extern int accept(int s, string addr, string addrlen);
+
+    [DllImport("ws2_32")]
+    static extern int connect(int s, string addr, int addrlen);
+
+    [DllImport("ws2_32")]
+    static extern int setsockopt(int s, int level, int optname, string optval, int optlen);
+
+    [DllImport("ws2_32")]
+    static extern int ioctlsocket(int s, int cmd, string argp);
+
+    [DllImport("ws2_32")]
+    static extern int select(int nfds, string readfds, string writefds, string exceptfds, string timeout);
+
+    [DllImport("ws2_32")]
+    static extern int sendto(int s, string buf, int len, int flags, string to, int tolen);
+
+    [DllImport("ws2_32")]
+    static extern int recvfrom(int s, string buf, int len, int flags, string from, string fromlen);
+
+    [DllImport("ws2_32")]
+    static extern int htons(int hostshort);
+
+    [DllImport("ws2_32")]
+    static extern int htonl(int hostlong);
+
+    [DllImport("ws2_32")]
+    static extern int ntohs(int netshort);
+
+    [DllImport("ws2_32")]
+    static extern int inet_addr(string cp);
+
+    [DllImport("ws2_32")]
+    static extern int gethostbyname(string name);
+    #elif LINUX || MACOS
+    [DllImport("libc")]
+    static extern int socket(int af, int type, int protocol);
+
+    [DllImport("libc", EntryPoint = "close")]
+    static extern int closesocket(int fd);
+
+    [DllImport("libc", EntryPoint = "send")]
+    static extern int winsend(int fd, string buf, int len, int flags);
+
+    [DllImport("libc", EntryPoint = "recv")]
+    static extern int winrecv(int fd, string buf, int len, int flags);
+
+    [DllImport("libc")]
+    static extern int bind(int fd, string addr, int addrlen);
+
+    [DllImport("libc")]
+    static extern int listen(int fd, int backlog);
+
+    [DllImport("libc")]
+    static extern int accept(int fd, string addr, string addrlen);
+
+    [DllImport("libc")]
+    static extern int connect(int fd, string addr, int addrlen);
+
+    [DllImport("libc")]
+    static extern int setsockopt(int fd, int level, int optname, string optval, int optlen);
+
+    [DllImport("libc")]
+    static extern int ioctl(int fd, int request, string argp);
+
+    [DllImport("libc")]
+    static extern int select(int nfds, string readfds, string writefds, string exceptfds, string timeout);
+
+    [DllImport("libc")]
+    static extern int sendto(int fd, string buf, int len, int flags, string to, int tolen);
+
+    [DllImport("libc")]
+    static extern int recvfrom(int fd, string buf, int len, int flags, string from, string fromlen);
+
+    [DllImport("libc")]
+    static extern int htons(int hostshort);
+
+    [DllImport("libc")]
+    static extern int htonl(int hostlong);
+
+    [DllImport("libc")]
+    static extern int ntohs(int netshort);
+
+    [DllImport("libc")]
+    static extern int inet_addr(string cp);
+
+    [DllImport("libc")]
+    static extern int gethostbyname(string name);
+
+    [DllImport("libc")]
+    static extern int fcntl(int fd, int cmd, int arg);
+    #endif
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    [DllImport("crt")]
+    static extern int strlen(string str);
+
+    [DllImport("crt")]
+    static extern string memcpy(string dest, string src, int n);
+
+    /// <summary>Initializes the socket subsystem (WSAStartup on Windows, no-op on Linux).</summary>
+    static void Initialize() {
+        #if WINDOWS
+        string wsaData = calloc(512, 1);
+        WSAStartup(514, wsaData);
+        free(wsaData);
+        #endif
+    }
+
+    /// <summary>Cleans up the socket subsystem.</summary>
+    static void Cleanup() {
+        #if WINDOWS
+        WSACleanup();
+        #endif
+    }
+
+    /// <summary>Creates a TCP socket.</summary>
+    static int CreateTcp() {
+        return socket(2, 1, 6);
+    }
+
+    /// <summary>Creates a UDP socket.</summary>
+    static int CreateUdp() {
+        return socket(2, 2, 17);
+    }
+
+    /// <summary>Closes a socket.</summary>
+    static void Close(int sock) {
+        closesocket(sock);
+    }
+
+    /// <summary>Sets the socket to non-blocking mode.</summary>
+    static int SetNonBlocking(int sock) {
+        #if WINDOWS
+        string argp = calloc(4, 1);
+        argp[0] = 1;
+        int result = ioctlsocket(sock, -2147195266, argp);
+        free(argp);
+        return result;
+        #elif LINUX
+        int flags = fcntl(sock, 3, 0);
+        return fcntl(sock, 4, flags | 2048);
+        #elif MACOS
+        int flags = fcntl(sock, 3, 0);
+        return fcntl(sock, 4, flags | 4);
+        #endif
+    }
+
+    /// <summary>Sets SO_REUSEADDR on a socket.</summary>
+    static void SetReuseAddr(int sock) {
+        string optval = calloc(4, 1);
+        optval[0] = 1;
+        #if WINDOWS
+        setsockopt(sock, 65535, 4, optval, 4);
+        #elif LINUX
+        setsockopt(sock, 1, 2, optval, 4);
+        #elif MACOS
+        setsockopt(sock, 65535, 4, optval, 4);
+        #endif
+        free(optval);
+    }
+
+    /// <summary>Builds a sockaddr_in structure for IPv4.</summary>
+    static string BuildSockAddr(string ip, int port) {
+        string addr = calloc(16, 1);
+        #if MACOS
+        addr[0] = 16;
+        addr[1] = 2;
+        #else
+        addr[0] = 2;
+        addr[1] = 0;
+        #endif
+        int nport = htons(port);
+        addr[2] = nport & 255;
+        addr[3] = (nport >> 8) & 255;
+        int ipAddr = 0;
+        if (ip == "0.0.0.0" || ip == "") {
+            ipAddr = 0;
+        } else {
+            ipAddr = inet_addr(ip);
+        }
+        addr[4] = ipAddr & 255;
+        addr[5] = (ipAddr >> 8) & 255;
+        addr[6] = (ipAddr >> 16) & 255;
+        addr[7] = (ipAddr >> 24) & 255;
+        return addr;
+    }
+
+    /// <summary>Binds a socket to an address and port.</summary>
+    static int Bind(int sock, string ip, int port) {
+        string addr = BuildSockAddr(ip, port);
+        int result = bind(sock, addr, 16);
+        free(addr);
+        return result;
+    }
+
+    /// <summary>Starts listening for connections.</summary>
+    static int Listen(int sock, int backlog) {
+        return listen(sock, backlog);
+    }
+
+    /// <summary>Accepts a connection synchronously.</summary>
+    static int Accept(int sock) {
+        string clientAddr = calloc(16, 1);
+        string addrLen = calloc(4, 1);
+        addrLen[0] = 16;
+        int clientSock = accept(sock, clientAddr, addrLen);
+        free(clientAddr);
+        free(addrLen);
+        return clientSock;
+    }
+
+    /// <summary>Suspends on the IO reactor until an inbound connection is
+    /// pending, then accepts it. Requires a non-blocking listener socket.</summary>
+    static async int AcceptAsync(int sock) {
+        while (true) {
+            await ReadReady(sock);
+            int client = Accept(sock);
+            if (client >= 0) {
+                return client;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Connects to a remote address synchronously.</summary>
+    static int Connect(int sock, string ip, int port) {
+        string addr = BuildSockAddr(ip, port);
+        int result = connect(sock, addr, 16);
+        free(addr);
+        return result;
+    }
+
+    /// <summary>Begins a non-blocking connect, then suspends on the IO reactor
+    /// until the socket becomes writable (connection established). Returns 0.
+    /// Requires a non-blocking socket.</summary>
+    static async int ConnectAsync(int sock, string ip, int port) {
+        Connect(sock, ip, port);
+        await WriteReady(sock);
+        return 0;
+    }
+
+    /// <summary>Sends data synchronously.</summary>
+    static int Send(int sock, string data, int len) {
+        return winsend(sock, data, len, 0);
+    }
+
+    /// <summary>Suspends until writable, then sends; re-awaits on partial writes
+    /// until all <paramref name="len"/> bytes are sent or the peer closes.
+    /// Returns the number of bytes sent. Requires a non-blocking socket.</summary>
+    static async int SendAsync(int sock, string data, int len) {
+        int totalSent = 0;
+        while (totalSent < len) {
+            await WriteReady(sock);
+            int sent = winsend(sock, data + totalSent, len - totalSent, 0);
+            if (sent > 0) {
+                totalSent = totalSent + sent;
+            } else if (sent == 0) {
+                return totalSent;
+            }
+        }
+        return totalSent;
+    }
+
+    /// <summary>Sends a string (calculates length automatically).</summary>
+    static int SendString(int sock, string data) {
+        int len = strlen(data);
+        return Send(sock, data, len);
+    }
+
+    /// <summary>Sends a whole string asynchronously (length via strlen).</summary>
+    static async int SendStringAsync(int sock, string data) {
+        int len = strlen(data);
+        int r = await SendAsync(sock, data, len);
+        return r;
+    }
+
+    /// <summary>Receives data synchronously.</summary>
+    static int Recv(int sock, string buf, int bufSize) {
+        return winrecv(sock, buf, bufSize, 0);
+    }
+
+    /// <summary>Suspends on the IO reactor until readable, then receives up to
+    /// <paramref name="bufSize"/> bytes. Returns the data as a NUL-terminated
+    /// string (empty on peer close / EOF). Requires a non-blocking socket.</summary>
+    static async string RecvAsync(int sock, int bufSize) {
+        string buf = calloc(bufSize + 1, 1);
+        while (true) {
+            await ReadReady(sock);
+            int n = winrecv(sock, buf, bufSize, 0);
+            if (n >= 0) {
+                return buf;
+            }
+        }
+        return buf;
+    }
+
+    /// <summary>Receives into a buffer (returns string).</summary>
+    static string Receive(int sock, int bufSize) {
+        string buf = calloc(bufSize + 1, 1);
+        Recv(sock, buf, bufSize);
+        return buf;
+    }
+
+    /// <summary>Sends a UDP datagram.</summary>
+    static int SendTo(int sock, string data, int len, string ip, int port) {
+        string addr = BuildSockAddr(ip, port);
+        int result = sendto(sock, data, len, 0, addr, 16);
+        free(addr);
+        return result;
+    }
+
+    /// <summary>Suspends until writable, then sends a UDP datagram. Requires a
+    /// non-blocking socket.</summary>
+    static async int SendToAsync(int sock, string data, int len, string ip, int port) {
+        await WriteReady(sock);
+        int result = SendTo(sock, data, len, ip, port);
+        return result;
+    }
+
+    /// <summary>Receives a UDP datagram.</summary>
+    static string RecvFrom(int sock, int bufSize) {
+        string buf = calloc(bufSize + 1, 1);
+        string fromAddr = calloc(16, 1);
+        string fromLen = calloc(4, 1);
+        fromLen[0] = 16;
+        recvfrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        free(fromAddr);
+        free(fromLen);
+        return buf;
+    }
+
+    /// <summary>Suspends on the IO reactor until a datagram is available, then
+    /// receives it. Requires a non-blocking socket.</summary>
+    static async string RecvFromAsync(int sock, int bufSize) {
+        await ReadReady(sock);
+        string result = RecvFrom(sock, bufSize);
+        return result;
+    }
+
+    /// <summary>Resolves a hostname to an IP address.</summary>
+    static string Resolve(string hostname) {
+        int he = gethostbyname(hostname);
+        if (he == 0) { return ""; }
+        return hostname;
+    }
+
+    /// <summary>Checks if a socket is readable using select() with zero timeout.</summary>
+    static bool IsReadable(int sock) {
+        #if WINDOWS
+        string readfds = calloc(520, 1);
+        readfds[0] = 1;
+        readfds[8] = sock & 255;
+        readfds[9] = (sock >> 8) & 255;
+        readfds[10] = (sock >> 16) & 255;
+        readfds[11] = (sock >> 24) & 255;
+        string emptyw = calloc(8, 1);
+        string emptye = calloc(8, 1);
+        string timeout = calloc(8, 1);
+        int result = select(0, readfds, emptyw, emptye, timeout);
+        free(readfds);
+        free(emptyw);
+        free(emptye);
+        free(timeout);
+        return result > 0;
+        #elif LINUX || MACOS
+        string readfds = calloc(128, 1);
+        int byteIdx = sock / 8;
+        int bitIdx = sock % 8;
+        readfds[byteIdx] = 1 << bitIdx;
+        string emptyw = calloc(128, 1);
+        string emptye = calloc(128, 1);
+        string timeout = calloc(16, 1);
+        int result = select(sock + 1, readfds, emptyw, emptye, timeout);
+        free(readfds);
+        free(emptyw);
+        free(emptye);
+        free(timeout);
+        return result > 0;
+        #endif
+    }
+
+    /// <summary>Checks if a socket is writable using select() with zero timeout.</summary>
+    static bool IsWritable(int sock) {
+        #if WINDOWS
+        string writefds = calloc(520, 1);
+        writefds[0] = 1;
+        writefds[8] = sock & 255;
+        writefds[9] = (sock >> 8) & 255;
+        writefds[10] = (sock >> 16) & 255;
+        writefds[11] = (sock >> 24) & 255;
+        string emptyr = calloc(8, 1);
+        string emptye = calloc(8, 1);
+        string timeout = calloc(8, 1);
+        int result = select(0, emptyr, writefds, emptye, timeout);
+        free(writefds);
+        free(emptyr);
+        free(emptye);
+        free(timeout);
+        return result > 0;
+        #elif LINUX || MACOS
+        string writefds = calloc(128, 1);
+        int byteIdx = sock / 8;
+        int bitIdx = sock % 8;
+        writefds[byteIdx] = 1 << bitIdx;
+        string emptyr = calloc(128, 1);
+        string emptye = calloc(128, 1);
+        string timeout = calloc(16, 1);
+        int result = select(sock + 1, emptyr, writefds, emptye, timeout);
+        free(writefds);
+        free(emptyr);
+        free(emptye);
+        free(timeout);
+        return result > 0;
+        #endif
+    }
+}

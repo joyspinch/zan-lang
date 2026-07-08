@@ -1,0 +1,165 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// One row of a TreeView, in pre-order. `depth` is the indent level (root = 0).
+/// Directories can be expanded/collapsed; files are leaves. `icon` overrides the
+/// default folder/file glyph when non-empty. `path` optionally carries the real
+/// filesystem path this row represents (empty for purely in-memory trees).
+class TreeNode {
+    string label;
+    int depth;
+    bool isDir;
+    bool expanded;
+    string icon;
+    string path;
+
+    static TreeNode Dir(string label, int depth, bool expanded) {
+        TreeNode n = new TreeNode();
+        n.label = label;
+        n.depth = depth;
+        n.isDir = true;
+        n.expanded = expanded;
+        n.icon = "";
+        n.path = "";
+        return n;
+    }
+
+    static TreeNode File(string label, int depth) {
+        TreeNode n = new TreeNode();
+        n.label = label;
+        n.depth = depth;
+        n.isDir = false;
+        n.expanded = false;
+        n.icon = "";
+        n.path = "";
+        return n;
+    }
+
+    static TreeNode FileIcon(string label, int depth, string icon) {
+        TreeNode n = TreeNode.File(label, depth);
+        n.icon = icon;
+        return n;
+    }
+}
+
+/// <summary>
+/// A collapsible file tree built from a flat, pre-ordered `List<TreeNode>`. A
+/// node is hidden when any ancestor directory is collapsed. Clicking a
+/// directory toggles it; clicking any row selects it (row index -> `selected`).
+/// The list is scrolled by `scrollOffset` pixels; rows outside the viewport are
+/// culled. Interaction is handled inside Render (immediate-mode), so a single
+/// call both draws and updates the model.
+/// </summary>
+class TreeView {
+    static int RowHeight(App app) {
+        return app.theme.heightSmall;
+    }
+
+    /// Total pixel height of the currently-visible rows (for scrollbar math).
+    static int ContentHeight(App app, List<TreeNode> nodes) {
+        int rowH = TreeView.RowHeight(app);
+        int visible = 0;
+        int hideDepth = -1;
+        int k = 0;
+        while (k < nodes.Count) {
+            TreeNode n = nodes[k];
+            bool shown = true;
+            if (hideDepth >= 0) {
+                if (n.depth > hideDepth) { shown = false; }
+                else { hideDepth = -1; }
+            }
+            if (shown) {
+                visible = visible + 1;
+                if (n.isDir) { if (!n.expanded) { hideDepth = n.depth; } }
+            }
+            k = k + 1;
+        }
+        return visible * rowH;
+    }
+
+    static void Render(App app, Rect area, List<TreeNode> nodes,
+                       SignalInt selected, int scrollOffset) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rowH = TreeView.RowHeight(app);
+        int count = nodes.Count;
+
+        int firstId = app.focus.AllocId();
+        int i = 1;
+        while (i < count) {
+            app.focus.AllocId();
+            i = i + 1;
+        }
+
+        app.CaptureWheel(area.x, area.y, area.width, area.height);
+
+        int sel = selected.Get();
+        int indent = app.Scale(14);
+        int fontSize = t.fontSizeMedium;
+        int hideDepth = -1;
+        int rowY = area.y - scrollOffset;
+
+        int k = 0;
+        while (k < count) {
+            TreeNode n = nodes[k];
+            bool shown = true;
+            if (hideDepth >= 0) {
+                if (n.depth > hideDepth) { shown = false; }
+                else { hideDepth = -1; }
+            }
+            if (shown) {
+                int id = firstId + k;
+                bool onscreen = rowY + rowH > area.y && rowY < area.y + area.height;
+                if (onscreen) {
+                    bool hovered = app.focus.IsHovered(id);
+                    bool active = k == sel;
+                    if (active) {
+                        c.FillRect(area.x, rowY, area.width, rowH, t.bgActive);
+                        c.FillRect(area.x, rowY, app.Scale(3), rowH, t.primary);
+                    } else if (hovered) {
+                        c.FillRect(area.x, rowY, area.width, rowH, t.bgHover);
+                    }
+
+                    int x0 = area.x + t.paddingSmall + n.depth * indent;
+                    if (n.isDir) {
+                        string chev = "chevron-right";
+                        if (n.expanded) { chev = "chevron-down"; }
+                        Icon.DrawCenteredIn(c, chev, x0, rowY, fontSize, rowH, fontSize - 4, t.textTertiary);
+                    }
+                    int iconX = x0 + fontSize + t.gapSmall / 2;
+                    string ic = n.icon;
+                    if (ic == "") {
+                        if (n.isDir) { ic = "folder"; } else { ic = "file"; }
+                    }
+                    int iconColor = t.textSecondary;
+                    if (n.isDir) { iconColor = t.primary; }
+                    Icon.DrawCenteredIn(c, ic, iconX, rowY, fontSize, rowH, fontSize, iconColor);
+
+                    int textX = iconX + fontSize + t.gapSmall;
+                    int textColor = t.textPrimary;
+                    if (active) { textColor = t.primary; }
+                    int textY = rowY + (rowH - Canvas.FontHeight(fontSize)) / 2;
+                    c.DrawText(textX, textY, n.label, textColor, fontSize);
+
+                    app.hitTester.Register(HitRegion.Create(id, area.x, rowY, area.width, rowH, 0));
+                }
+                rowY = rowY + rowH;
+                if (n.isDir) { if (!n.expanded) { hideDepth = n.depth; } }
+            }
+            k = k + 1;
+        }
+
+        if (app.window.EventKind() == 3) {
+            int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
+            int idx = hit - firstId;
+            if (idx >= 0 && idx < count) {
+                TreeNode n = nodes[idx];
+                selected.Set(idx);
+                if (n.isDir) { n.expanded = !n.expanded; }
+                app.RequestRedraw();
+            }
+        }
+    }
+}

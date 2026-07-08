@@ -1,0 +1,84 @@
+using System;
+
+namespace System.Net.Sockets;
+
+/// <summary>
+/// Reactor-driven asynchronous socket operations.
+///
+/// Unlike the legacy <c>Socket.*Async</c> helpers -- which busy-wait on
+/// <c>select()</c> and block the calling thread -- these methods genuinely
+/// suspend to the stackless IO reactor via <c>await Socket.ReadReady</c> /
+/// <c>await Socket.WriteReady</c> and only touch the fd once it is ready, so
+/// many coroutines can make progress on a single thread.
+///
+/// Sockets should be non-blocking (<c>Socket.SetNonBlocking</c>). After a
+/// readiness wake the syscall completes without blocking; a spurious wake or a
+/// transient would-block (&lt; 0) simply re-arms the watcher and re-awaits.
+/// </summary>
+class AsyncSocket {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern int strlen(string str);
+
+    /// <summary>Suspends until <paramref name="sock"/> is readable, then
+    /// receives up to <paramref name="bufSize"/> bytes. Returns the data as a
+    /// NUL-terminated string (empty string on peer close / EOF).</summary>
+    static async string Receive(int sock, int bufSize) {
+        string buf = calloc(bufSize + 1, 1);
+        while (true) {
+            await Socket.ReadReady(sock);
+            int n = Socket.Recv(sock, buf, bufSize);
+            if (n >= 0) {
+                return buf;
+            }
+        }
+        return buf;
+    }
+
+    /// <summary>Suspends until writable, then sends; loops (re-awaiting on
+    /// partial writes) until all <paramref name="len"/> bytes are sent or the
+    /// peer closes. Returns the number of bytes sent.</summary>
+    static async int Send(int sock, string data, int len) {
+        int total = 0;
+        while (total < len) {
+            await Socket.WriteReady(sock);
+            int sent = Socket.Send(sock, data + total, len - total);
+            if (sent > 0) {
+                total = total + sent;
+            } else if (sent == 0) {
+                return total;
+            }
+        }
+        return total;
+    }
+
+    /// <summary>Sends a whole string (length via strlen).</summary>
+    static async int SendString(int sock, string data) {
+        int len = strlen(data);
+        int r = await Send(sock, data, len);
+        return r;
+    }
+
+    /// <summary>Suspends until an inbound connection is pending, then accepts
+    /// it. Returns the accepted client fd.</summary>
+    static async int Accept(int sock) {
+        while (true) {
+            await Socket.ReadReady(sock);
+            int client = Socket.Accept(sock);
+            if (client >= 0) {
+                return client;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Begins a non-blocking connect, then suspends until the socket
+    /// becomes writable (connection completed). Returns 0.</summary>
+    static async int Connect(int sock, string ip, int port) {
+        Socket.Connect(sock, ip, port);
+        await Socket.WriteReady(sock);
+        return 0;
+    }
+}

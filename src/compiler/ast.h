@@ -69,6 +69,7 @@ typedef enum {
     AST_SIZEOF_EXPR,
     AST_CONDITIONAL,
     AST_LAMBDA,
+    AST_AWAIT_EXPR,
     AST_POSTFIX_UNARY,
     AST_STRING_INTERP,  /* $"text {expr} text" */
 
@@ -281,6 +282,7 @@ struct zan_ast_node {
             zan_ast_list_t bases;      /* base types */
             zan_ast_list_t members;
             uint32_t modifiers;
+            bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
         } type_decl;
 
         /* method / constructor */
@@ -291,6 +293,8 @@ struct zan_ast_node {
             zan_ast_list_t type_params;
             zan_ast_node_t *body;
             uint32_t modifiers;
+            zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
+            zan_istr_t entry_point;  /* DllImport entry point override, {NULL,0} if none */
         } method_decl;
 
         /* field */
@@ -332,6 +336,11 @@ struct zan_ast_node {
             zan_istr_t name;
             zan_ast_node_t *value; /* NULL for auto */
         } enum_member;
+
+        /* await expression */
+        struct {
+            zan_ast_node_t *expr;
+        } await_expr;
 
         /* lambda: (params) => body */
         struct {

@@ -157,8 +157,22 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_checker_check_expr(c, expr->call.args.items[i]);
         }
-        /* for M1 return void — full call resolution in M2 */
-        return c->binder->type_void;
+        /* Resolve the callee's return type when the function/method symbol
+         * is in scope. Fall back to type_error (NOT void) for unresolved
+         * calls so that using a call result in an expression — e.g. the
+         * recursive `Fib(n-1) + Fib(n-2)` — does not raise a spurious
+         * "cannot apply operator to 'void'..." error. */
+        if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
+            zan_symbol_t *fsym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);
+            if (fsym && (fsym->kind == SYM_METHOD) && fsym->decl) {
+                zan_ast_node_t *m = fsym->decl;
+                if (m->method_decl.return_type) {
+                    return zan_binder_resolve_type(c->binder, m->method_decl.return_type);
+                }
+                return c->binder->type_void; /* explicit void return */
+            }
+        }
+        return c->binder->type_error;
     }
 
     case AST_STRING_INTERP: {

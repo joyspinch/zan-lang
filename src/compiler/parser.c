@@ -57,6 +57,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p);
 static zan_ast_node_t *parse_block(zan_parser_t *p);
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p);
 static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers);
+static zan_ast_node_t *parse_unary(zan_parser_t *p);
 
 /* ---- qualified name: a.b.c ---- */
 
@@ -287,6 +288,22 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_LPAREN: {
+        /* C-style cast: (PrimitiveType) unary — primitive keywords cannot
+         * begin a parenthesized expression, so this is unambiguous. */
+        switch (zan_lexer_peek(p->lex).kind) {
+        case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
+        case TK_DOUBLE: case TK_FLOAT: case TK_BOOL: case TK_CHAR: {
+            parser_advance(p); /* ( */
+            zan_ast_node_t *ctype = parse_type_ref(p);
+            parser_expect(p, TK_RPAREN);
+            zan_ast_node_t *coperand = parse_unary(p);
+            zan_ast_node_t *cn = zan_ast_new(p->arena, AST_CAST_EXPR, loc);
+            cn->cast.type = ctype;
+            cn->cast.expr = coperand;
+            return cn;
+        }
+        default: break;
+        }
         /* could be grouped expression or lambda: (params) => expr */
         /* save lexer state to try lambda parse */
         parser_advance(p); /* ( */
@@ -466,6 +483,15 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
 static zan_ast_node_t *parse_unary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
+    /* await expression: await expr */
+    if (parser_check(p, TK_AWAIT)) {
+        parser_advance(p);
+        zan_ast_node_t *expr = parse_unary(p);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_AWAIT_EXPR, loc);
+        n->await_expr.expr = expr;
+        return n;
+    }
+
     if (parser_check(p, TK_BANG) || parser_check(p, TK_MINUS) ||
         parser_check(p, TK_TILDE) || parser_check(p, TK_PLUS_PLUS) ||
         parser_check(p, TK_MINUS_MINUS)) {
@@ -596,9 +622,16 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
     zan_ast_list_init(&block->block.stmts);
 
     while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+        uint32_t before = p->current.loc.offset;
         zan_ast_node_t *stmt = parse_statement(p);
         if (stmt) {
             zan_ast_list_push(&block->block.stmts, stmt, p->arena);
+        }
+        /* guarantee forward progress: if a malformed statement was not
+         * consumed, skip a token so error recovery can't spin forever
+         * (previously this looped, allocating until OOM). */
+        if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+            parser_advance(p);
         }
     }
 
@@ -626,9 +659,24 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         /* could be type or expression; peek for identifier after */
         zan_token_t peek = zan_lexer_peek(p->lex);
         /* save lexer state is handled by peek */
-        /* heuristic: ident followed by ident, <, [, ? likely a type declaration */
+        /* heuristic: ident followed by ident or `<` is likely a type declaration */
         if (peek.kind == TK_IDENT || peek.kind == TK_LESS) {
             return true;
+        }
+        /* `Ident[] name` (array-typed decl) vs `arr[i]` (index expression):
+         * only a declaration when the brackets are empty. Scan the raw source
+         * after the current identifier for a `[` immediately followed by `]`. */
+        if (peek.kind == TK_LBRACKET) {
+            const char *s = p->lex->source;
+            size_t q = p->lex->pos, n = p->lex->source_len;
+            while (q < n && (s[q] == ' ' || s[q] == '\t' ||
+                             s[q] == '\r' || s[q] == '\n')) q++;
+            if (q < n && s[q] == '[') {
+                q++;
+                while (q < n && (s[q] == ' ' || s[q] == '\t' ||
+                                 s[q] == '\r' || s[q] == '\n')) q++;
+                if (q < n && s[q] == ']') return true;
+            }
         }
         return false;
     }
@@ -838,8 +886,12 @@ static zan_ast_node_t *parse_switch_stmt(zan_parser_t *p) {
         zan_ast_list_init(&body_block->block.stmts);
         while (!parser_check(p, TK_CASE) && !parser_check(p, TK_DEFAULT) &&
                !parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+            uint32_t before = p->current.loc.offset;
             zan_ast_node_t *stmt = parse_statement(p);
             zan_ast_list_push(&body_block->block.stmts, stmt, p->arena);
+            if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+                parser_advance(p);
+            }
         }
 
         zan_ast_node_t *sc = zan_ast_new(p->arena, AST_SWITCH_CASE, case_loc);
@@ -1007,7 +1059,52 @@ static zan_ast_list_t parse_param_list(zan_parser_t *p) {
 }
 
 static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
+    /* parse [DllImport("lib")] attribute if present */
+    zan_istr_t dll_import_lib = {NULL, 0};
+    zan_istr_t dll_entry_point = {NULL, 0};
+    while (parser_check(p, TK_LBRACKET)) {
+        parser_advance(p); /* consume [ */
+        if (parser_check(p, TK_IDENT) &&
+            p->current.str_val.len == 9 &&
+            memcmp(p->current.str_val.str, "DllImport", 9) == 0) {
+            parser_advance(p); /* consume DllImport */
+            if (parser_match(p, TK_LPAREN)) {
+                if (parser_check(p, TK_STRING_LIT)) {
+                    dll_import_lib = p->current.str_val;
+                    parser_advance(p);
+                }
+                /* optional: EntryPoint = "name" */
+                if (parser_match(p, TK_COMMA)) {
+                    /* skip EntryPoint = "name" for now, just consume to ) */
+                    while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
+                        if (parser_check(p, TK_IDENT) &&
+                            p->current.str_val.len == 10 &&
+                            memcmp(p->current.str_val.str, "EntryPoint", 10) == 0) {
+                            parser_advance(p); /* EntryPoint */
+                            parser_expect(p, TK_EQ); /* = */
+                            if (parser_check(p, TK_STRING_LIT)) {
+                                dll_entry_point = p->current.str_val;
+                                parser_advance(p);
+                            }
+                        } else {
+                            parser_advance(p);
+                        }
+                        if (!parser_match(p, TK_COMMA)) break;
+                    }
+                }
+                parser_expect(p, TK_RPAREN);
+            }
+        } else {
+            /* skip unknown attributes */
+            while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
+                parser_advance(p);
+            }
+        }
+        parser_expect(p, TK_RBRACKET);
+    }
+
     uint32_t mods = parse_modifiers(p);
+    if (dll_import_lib.str) mods |= MOD_EXTERN;
     zan_loc_t loc = p->current.loc;
 
     /* destructor: ~ClassName() { } */
@@ -1066,6 +1163,48 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         n->method_decl.modifiers = mods;
         n->method_decl.return_type = NULL;
         zan_ast_list_init(&n->method_decl.type_params);
+        return n;
+    }
+
+    /* operator overloading: static ReturnType operator+(params) { } */
+    if (parser_check(p, TK_OPERATOR)) {
+        parser_advance(p); /* consume 'operator' */
+        /* next token is the operator symbol: +, -, *, /, ==, !=, <, >, etc. */
+        char op_name[32];
+        switch (p->current.kind) {
+        case TK_PLUS:    snprintf(op_name, sizeof(op_name), "op_add"); break;
+        case TK_MINUS:   snprintf(op_name, sizeof(op_name), "op_sub"); break;
+        case TK_STAR:    snprintf(op_name, sizeof(op_name), "op_mul"); break;
+        case TK_SLASH:   snprintf(op_name, sizeof(op_name), "op_div"); break;
+        case TK_PERCENT: snprintf(op_name, sizeof(op_name), "op_mod"); break;
+        case TK_EQ_EQ:   snprintf(op_name, sizeof(op_name), "op_eq"); break;
+        case TK_BANG_EQ: snprintf(op_name, sizeof(op_name), "op_neq"); break;
+        case TK_LESS:    snprintf(op_name, sizeof(op_name), "op_lt"); break;
+        case TK_GREATER: snprintf(op_name, sizeof(op_name), "op_gt"); break;
+        case TK_LESS_EQ: snprintf(op_name, sizeof(op_name), "op_le"); break;
+        case TK_GREATER_EQ: snprintf(op_name, sizeof(op_name), "op_ge"); break;
+        default:         snprintf(op_name, sizeof(op_name), "op_unknown"); break;
+        }
+        parser_advance(p); /* consume operator token */
+        zan_ast_list_t params = parse_param_list(p);
+        zan_ast_node_t *body = NULL;
+        if (parser_check(p, TK_LBRACE)) {
+            body = parse_block(p);
+        } else {
+            parser_expect(p, TK_SEMICOLON);
+        }
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+        size_t op_len = strlen(op_name);
+        char *op_str = zan_arena_strdup(p->arena, op_name, op_len);
+        zan_istr_t iname = { op_str, (int)op_len };
+        n->method_decl.name = iname;
+        n->method_decl.return_type = type;
+        n->method_decl.params = params;
+        zan_ast_list_init(&n->method_decl.type_params);
+        n->method_decl.body = body;
+        n->method_decl.modifiers = mods | MOD_STATIC;
+        n->method_decl.extern_lib = (zan_istr_t){NULL, 0};
+        n->method_decl.entry_point = (zan_istr_t){NULL, 0};
         return n;
     }
 
@@ -1143,6 +1282,8 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         n->method_decl.type_params = type_params;
         n->method_decl.body = body;
         n->method_decl.modifiers = mods;
+        n->method_decl.extern_lib = dll_import_lib;
+        n->method_decl.entry_point = dll_entry_point;
         return n;
     }
 
@@ -1272,9 +1413,15 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     } else {
         parser_expect(p, TK_LBRACE);
         while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+            uint32_t before = p->current.loc.offset;
             zan_ast_node_t *member = parse_member_decl(p);
             if (member) {
                 zan_ast_list_push(&members, member, p->arena);
+            }
+            /* forward-progress guard: a member that fails to parse without
+             * consuming its offending token must not spin the loop. */
+            if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+                parser_advance(p);
             }
         }
         parser_expect(p, TK_RBRACE);
@@ -1351,9 +1498,15 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
 
     /* type declarations */
     while (!parser_check(p, TK_EOF) && !parser_check(p, TK_RBRACE)) {
-        /* skip attributes for now */
+        /* parse attributes: [StructLayout(...)] */
+        bool has_c_layout = false;
         while (parser_check(p, TK_LBRACKET)) {
             parser_advance(p);
+            if (parser_check(p, TK_IDENT) &&
+                p->current.str_val.len == 12 &&
+                memcmp(p->current.str_val.str, "StructLayout", 12) == 0) {
+                has_c_layout = true;
+            }
             while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
                 parser_advance(p);
             }
@@ -1365,10 +1518,30 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
         if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
             parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
             zan_ast_node_t *decl = parse_type_decl(p, mods);
+            decl->type_decl.is_c_layout = has_c_layout;
             zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
+        } else if (parser_check(p, TK_DELEGATE)) {
+            /* delegate ReturnType Name(params); */
+            parser_advance(p); /* consume 'delegate' */
+            zan_loc_t dloc = p->current.loc;
+            zan_ast_node_t *ret_type = parse_type_ref(p);
+            parser_expect(p, TK_IDENT);
+            zan_istr_t dname = p->previous.str_val;
+            zan_ast_list_t dparams = parse_param_list(p);
+            parser_expect(p, TK_SEMICOLON);
+            zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
+            ddecl->method_decl.name = dname;
+            ddecl->method_decl.return_type = ret_type;
+            ddecl->method_decl.params = dparams;
+            zan_ast_list_init(&ddecl->method_decl.type_params);
+            ddecl->method_decl.body = NULL;
+            ddecl->method_decl.modifiers = mods;
+            ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
+            ddecl->method_decl.entry_point = (zan_istr_t){NULL, 0};
+            zan_ast_list_push(&unit->comp_unit.decls, ddecl, p->arena);
         } else {
             zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                          "expected type declaration (class, struct, interface, or enum)");
+                          "expected type declaration (class, struct, interface, enum, or delegate)");
             parser_advance(p); /* skip to recover */
         }
     }
