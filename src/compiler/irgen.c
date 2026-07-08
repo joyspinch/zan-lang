@@ -5116,6 +5116,17 @@ static bool async_type_is_scalar(LLVMTypeRef t) {
     }
 }
 
+/* A local must be frame-resident (saved to / reloaded from the heap frame
+ * around each suspension) if it can be live across an await. Scalars and any
+ * pointer-shaped value (string, array, List/Dict, class instances — all lowered
+ * to a pointer here) qualify; the save/reload just relocates the bits and never
+ * touches a refcount, so ARC ownership (release on throw-cleanup / scope exit,
+ * driven off the reloaded alloca) is unaffected. Aggregates passed by value are
+ * left alone (they do not cross suspends in the current lowering). */
+static bool async_type_is_frame_resident(LLVMTypeRef t) {
+    return async_type_is_scalar(t) || LLVMGetTypeKind(t) == LLVMPointerTypeKind;
+}
+
 static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e);
 static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st);
 
@@ -5205,7 +5216,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             zan_type_t *t = zan_binder_resolve_type(s->g->binder, st->var_decl.type);
             if (t) {
                 LLVMTypeRef lt = map_type(s->g, t);
-                if (async_type_is_scalar(lt))
+                if (async_type_is_frame_resident(lt))
                     async_scan_add_local(s, st->var_decl.name, lt, t);
             }
         }
@@ -5280,7 +5291,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     if (g->current_async_slots[i].slot_alloca == pre->alloca) {
                         if (stmt->var_decl.initializer) {
                             LLVMValueRef iv = emit_expr(g, stmt->var_decl.initializer, locals);
-                            iv = coerce_int_to(g, iv, g->current_async_slots[i].llvm);
+                            LLVMTypeRef slot_ty = g->current_async_slots[i].llvm;
+                            iv = coerce_int_to(g, iv, slot_ty);
+                            /* pointer-shaped locals (string/array/List/class) are
+                             * frame-resident too; normalize a differing pointer
+                             * type to the slot's before the store. */
+                            if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind &&
+                                LLVMGetTypeKind(LLVMTypeOf(iv)) == LLVMPointerTypeKind &&
+                                LLVMTypeOf(iv) != slot_ty) {
+                                iv = LLVMBuildBitCast(g->builder, iv, slot_ty, "fl.bc");
+                            }
                             LLVMBuildStore(g->builder, iv, pre->alloca);
                         }
                         return;
