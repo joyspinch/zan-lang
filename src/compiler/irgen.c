@@ -2059,6 +2059,27 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMBuildCall2(g->builder, sqrt_type, sqrt_fn, &arg, 1, "sqrt");
         }
 
+        /* Math.Sin/Cos/Tan/Log/Exp(expr) → libm call (double -> double) */
+        {
+            static const char *math1[] = { "Sin", "sin", "Cos", "cos", "Tan", "tan",
+                                           "Log", "log", "Exp", "exp", NULL };
+            for (int mi = 0; math1[mi]; mi += 2) {
+                if (is_call_to(expr, "Math", math1[mi]) && expr->call.args.count == 1) {
+                    LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
+                    LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+                    if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMFloatTypeKind) {
+                        arg = LLVMBuildFPExt(g->builder, arg, dbl, "ext");
+                    } else if (LLVMGetTypeKind(LLVMTypeOf(arg)) != LLVMDoubleTypeKind) {
+                        arg = LLVMBuildSIToFP(g->builder, arg, dbl, "tofp");
+                    }
+                    LLVMTypeRef fty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
+                    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, math1[mi + 1]);
+                    if (!fn) fn = LLVMAddFunction(g->mod, math1[mi + 1], fty);
+                    return LLVMBuildCall2(g->builder, fty, fn, &arg, 1, math1[mi + 1]);
+                }
+            }
+        }
+
         /* Math.Abs(expr) */
         if (is_call_to(expr, "Math", "Abs") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
@@ -3688,6 +3709,31 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     global_fn, call_args, (unsigned)argc, "gcall");
                 free(call_args);
                 return result;
+            }
+        }
+
+        /* Robustness: a member-access call `X.Method(...)` where X is neither a
+         * local variable nor any known symbol (class / struct / enum / namespace)
+         * is an unresolved reference. This most often means the class was never
+         * compiled — e.g. a stdlib file missing from the stdlib_map in main.c —
+         * or a typo. Historically such a call silently lowered to a 0/null result
+         * (a string method would then return "(null)"), which is very hard to
+         * diagnose. Emit a hard compile error instead. Valid builtin calls
+         * (Console.*, Math.*, ...) and resolved user methods return earlier, so
+         * only genuinely unresolved references reach this point; keying on the
+         * object being an unknown name (rather than a known class missing the
+         * method) keeps this from firing on extern/DllImport members. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.callee->member.object->kind == AST_IDENTIFIER) {
+            zan_istr_t on = expr->call.callee->member.object->ident.name;
+            zan_istr_t mn = expr->call.callee->member.name;
+            if (!local_find(locals, on) && !zan_binder_lookup(g->binder, on)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "unresolved call '%.*s.%.*s': '%.*s' is not a known variable, "
+                    "type, or namespace (is the class imported and registered in "
+                    "the stdlib map?)",
+                    (int)on.len, on.str, (int)mn.len, mn.str,
+                    (int)on.len, on.str);
             }
         }
 
