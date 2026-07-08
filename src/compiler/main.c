@@ -997,12 +997,10 @@ int main(int argc, char **argv) {
             const char *lib = irgen.extern_libs[li].str;
             int lib_len = (int)irgen.extern_libs[li].len;
             int skip = 0;
-            /* The C runtime is libc/libm on Unix, linked by default (libm via
-             * the explicit -lm above), so a [DllImport("crt"/"msvcrt"/"c"/"m")]
-             * has no -l counterpart here — mirror the CRT skip on the Windows
-             * link path instead of emitting a bogus -lcrt. */
-            if ((lib_len == 1 && (lib[0] == 'c' || lib[0] == 'm')) ||
-                (lib_len == 3 && memcmp(lib, "crt", 3) == 0) ||
+            /* The Windows CRT pseudo-libs have no -l counterpart on Unix —
+             * mirror the CRT skip on the Windows link path instead of emitting
+             * a bogus -lcrt. */
+            if ((lib_len == 3 && memcmp(lib, "crt", 3) == 0) ||
                 (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0)) {
                 continue;
             }
@@ -1011,8 +1009,15 @@ int main(int argc, char **argv) {
                     memcmp(win_only_libs[wi], lib, lib_len) == 0) { skip = 1; break; }
             }
             if (skip) continue;
+            /* A [DllImport("libfoo")] names the shared object by its base name;
+             * on Unix `-l` re-adds the "lib" prefix, so strip a leading "lib"
+             * (DllImport("libc") -> -lc, "libpthread" -> -lpthread) to avoid a
+             * bogus -llibc. libc/libm are implicit (libm already via -lm). */
+            const char *name = lib; int name_len = lib_len;
+            if (name_len > 3 && memcmp(name, "lib", 3) == 0) { name += 3; name_len -= 3; }
+            if (name_len == 1 && (name[0] == 'c' || name[0] == 'm')) continue;
             size_t cur = strlen(link_cmd);
-            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", name_len, name);
         }
         link_ret = system(link_cmd);
 #endif
