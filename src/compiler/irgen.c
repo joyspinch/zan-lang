@@ -210,28 +210,34 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetInitializer(g_tail, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_tail, LLVMInternalLinkage);
 
-        /* Timer wheel for time-based suspensions (`await Task.Delay(ms)`): a
-         * singly-linked list of {next, due_ms, frame, step}. zan_co_delay
-         * registers a one-shot timer; zan_co_sched_run, when the ready queue is
-         * empty, sleeps until the earliest due timer, then readies its frame —
-         * this is the "reactor wakes a suspended coroutine later" path. Absolute
-         * deadlines use a monotonic millisecond clock (GetTickCount64 on the
-         * Windows target). */
+        /* Timer list for time-based suspensions (`await Task.Delay(ms)`): a
+         * singly-linked list of {next, ms, frame, step}. zan_co_delay registers
+         * a one-shot timer; zan_co_sched_run, when the ready queue is empty,
+         * sleeps for the smallest pending delay, then readies its frame — the
+         * "reactor wakes a suspended coroutine later" path. The current (still
+         * sequential) await model has at most one pending timer at a time, so a
+         * relative millisecond delay is stored directly and no monotonic clock
+         * is needed. The blocking sleep is the one platform primitive here, and
+         * since zanc's target equals its host it is selected at build time:
+         * Sleep (kernel32) on Windows, poll(NULL,0,ms) on POSIX. */
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-        LLVMTypeRef tnode_fields[] = { i8ptr /*next*/, i64t /*due_ms*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
+        LLVMTypeRef tnode_fields[] = { i8ptr /*next*/, i64t /*ms*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
         LLVMTypeRef tnode_ty = LLVMStructCreateNamed(g->ctx, "zan.co.timer");
         LLVMStructSetBody(tnode_ty, tnode_fields, 4, 0);
         LLVMValueRef g_timers = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_timers");
         LLVMSetInitializer(g_timers, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_timers, LLVMInternalLinkage);
 
-        /* Platform clock/sleep (kernel32, linked by produced Windows exes). */
-        LLVMTypeRef tick_type = LLVMFunctionType(i64t, NULL, 0, 0);
-        LLVMValueRef fn_tick = LLVMAddFunction(g->mod, "GetTickCount64", tick_type);
+#if defined(_WIN32)
         LLVMTypeRef sleep_args[] = { i32t };
         LLVMTypeRef sleep_type = LLVMFunctionType(voidt, sleep_args, 1, 0);
         LLVMValueRef fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
+#else
+        LLVMTypeRef poll_args[] = { i8ptr, i64t, i32t };
+        LLVMTypeRef poll_type = LLVMFunctionType(i32t, poll_args, 3, 0);
+        LLVMValueRef fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
+#endif
 
         /* void zan_co_sched_init(void): reset the queue to empty. */
         {
@@ -252,13 +258,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef ms    = LLVMGetParam(g->rt_co_delay, 0);
             LLVMValueRef frame = LLVMGetParam(g->rt_co_delay, 1);
             LLVMValueRef step  = LLVMGetParam(g->rt_co_delay, 2);
-            LLVMValueRef now = LLVMBuildCall2(g->builder, tick_type, fn_tick, NULL, 0, "now");
-            LLVMValueRef due = LLVMBuildAdd(g->builder, now, ms, "due");
             LLVMValueRef tn = LLVMBuildCall2(g->builder, malloc_type, g->fn_malloc,
                 (LLVMValueRef[]){ LLVMSizeOf(tnode_ty) }, 1, "tn");
             LLVMValueRef old = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
             LLVMBuildStore(g->builder, old, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 0, "tn.next"));
-            LLVMBuildStore(g->builder, due, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 1, "tn.due"));
+            LLVMBuildStore(g->builder, ms, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 1, "tn.ms"));
             LLVMBuildStore(g->builder, frame, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 2, "tn.frame"));
             LLVMBuildStore(g->builder, step, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 3, "tn.step"));
             LLVMBuildStore(g->builder, tn, g_timers);
@@ -438,18 +442,21 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildBr(g->builder, after_unlink);
 
             LLVMPositionBuilderAtEnd(g->builder, after_unlink);
-            LLVMValueRef due_v = LLVMBuildLoad2(g->builder, i64t,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 1, "best.duep"), "best.due");
-            LLVMValueRef now_v = LLVMBuildCall2(g->builder, tick_type, fn_tick, NULL, 0, "now");
-            LLVMValueRef wait_v = LLVMBuildSub(g->builder, due_v, now_v, "wait");
-            LLVMValueRef wait_pos = LLVMBuildICmp(g->builder, LLVMIntSGT, wait_v,
-                LLVMConstInt(i64t, 0, 0), "wait.pos");
-            LLVMBuildCondBr(g->builder, wait_pos, do_sleep, after_sleep);
+            LLVMValueRef ms_v = LLVMBuildLoad2(g->builder, i64t,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 1, "best.msp"), "best.ms");
+            LLVMValueRef ms_pos = LLVMBuildICmp(g->builder, LLVMIntSGT, ms_v,
+                LLVMConstInt(i64t, 0, 0), "ms.pos");
+            LLVMBuildCondBr(g->builder, ms_pos, do_sleep, after_sleep);
 
             LLVMPositionBuilderAtEnd(g->builder, do_sleep);
-            LLVMValueRef wait32 = LLVMBuildTrunc(g->builder, wait_v, i32t, "wait32");
+            LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms_v, i32t, "ms32");
+#if defined(_WIN32)
             LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
-                (LLVMValueRef[]){ wait32 }, 1, "");
+                (LLVMValueRef[]){ ms32 }, 1, "");
+#else
+            LLVMBuildCall2(g->builder, poll_type, fn_poll,
+                (LLVMValueRef[]){ LLVMConstNull(i8ptr), LLVMConstInt(i64t, 0, 0), ms32 }, 3, "");
+#endif
             LLVMBuildBr(g->builder, after_sleep);
 
             LLVMPositionBuilderAtEnd(g->builder, after_sleep);
@@ -4390,14 +4397,26 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 emit_async_reload_slots(g);
                 return LLVMConstInt(di64, 0, 0);
             }
-            /* root: sleep synchronously (no scheduler frame to suspend) */
+            /* root: sleep synchronously (no scheduler frame to suspend). Use the
+             * same platform primitive the scheduler uses (Sleep / poll), already
+             * declared in the module by the runtime emission. */
+            LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
+#if defined(_WIN32)
             LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
             if (fn_sleep) {
                 LLVMTypeRef sl_args[] = { di32 };
                 LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
-                LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
                 LLVMBuildCall2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
             }
+#else
+            LLVMValueRef fn_poll = LLVMGetNamedFunction(g->mod, "poll");
+            if (fn_poll) {
+                LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
+                LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
+                LLVMBuildCall2(g->builder, pl_ty, fn_poll,
+                    (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
+            }
+#endif
             return LLVMConstInt(di64, 0, 0);
         }
 
