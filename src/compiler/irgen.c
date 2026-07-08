@@ -864,6 +864,44 @@ static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_na
     return NULL;
 }
 
+/* Return the symbol that was created for a specific method-declaration AST node.
+ * With method overloading, several same-named SYM_METHOD members coexist on a
+ * type; each corresponds to exactly one AST_METHOD_DECL. Matching on the decl
+ * back-pointer (not the name) is the only way to recover the right one. */
+static zan_symbol_t *method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t *decl) {
+    for (int i = 0; i < type_sym->member_count; i++) {
+        if (type_sym->members[i]->kind == SYM_METHOD &&
+            type_sym->members[i]->decl == decl) {
+            return type_sym->members[i];
+        }
+    }
+    return NULL;
+}
+
+/* Overload-aware method resolution used at call sites. Among same-named methods
+ * pick the one whose declared parameter count matches the number of arguments
+ * supplied at the call. When several remain (same arity) the first is returned;
+ * when none match on arity the first same-named method is returned so that
+ * behaviour degrades to the historical name-only lookup instead of failing. */
+static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, int argc) {
+    zan_symbol_t *first = NULL;
+    for (int i = 0; i < type_sym->member_count; i++) {
+        zan_symbol_t *m = type_sym->members[i];
+        if (m->kind != SYM_METHOD) continue;
+        if (m->name.len != name.len ||
+            memcmp(m->name.str, name.str, name.len) != 0) continue;
+        if (!first) first = m;
+        if (m->decl && m->decl->method_decl.params.count == argc) {
+            return m;
+        }
+    }
+    if (first) return first;
+    if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
+        return resolve_overload(type_sym->type->base_type->sym, name, argc);
+    }
+    return NULL;
+}
+
 static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     if (g->struct_type_count >= 256) return;
     if (get_struct_llvm_type(g, sym)) return;
@@ -1098,7 +1136,7 @@ static void emit_async_reload_slots(zan_irgen_t *g);
 /* Resolve the declared type of an `obj.field` member access so that element
  * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
  * element LLVM type. Returns NULL when the field/type cannot be resolved. */
-static zan_type_t *member_access_field_type(local_scope_t *locals, zan_ast_node_t *member) {
+static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_ast_node_t *member) {
     if (!member || member->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = member->member.object;
     if (obj->kind == AST_IDENTIFIER) {
@@ -1107,6 +1145,21 @@ static zan_type_t *member_access_field_type(local_scope_t *locals, zan_ast_node_
             zan_symbol_t *fsym = get_field_sym(l->type->sym, member->member.name);
             if (fsym) return fsym->type;
         }
+        /* not a local: could be an implicit `this` field whose own type is a
+         * class, e.g. `field.subfield` inside a method. */
+        if (g && g->current_type_sym) {
+            zan_symbol_t *ofsym = get_field_sym(g->current_type_sym, obj->ident.name);
+            if (ofsym && ofsym->type && ofsym->type->sym) {
+                zan_symbol_t *fsym = get_field_sym(ofsym->type->sym, member->member.name);
+                if (fsym) return fsym->type;
+            }
+        }
+    }
+    /* explicit `this.field` / `base.field` — resolve against the current type. */
+    if ((obj->kind == AST_THIS_EXPR || obj->kind == AST_BASE_EXPR) &&
+        g && g->current_type_sym) {
+        zan_symbol_t *fsym = get_field_sym(g->current_type_sym, member->member.name);
+        if (fsym) return fsym->type;
     }
     return NULL;
 }
@@ -1132,7 +1185,7 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
         return false;
     }
     case AST_MEMBER_ACCESS: {
-        zan_type_t *ft = member_access_field_type(locals, e);
+        zan_type_t *ft = member_access_field_type(g, locals, e);
         return ft && ft->kind == TYPE_STRING;
     }
     case AST_BINARY:
@@ -1782,7 +1835,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 }
             } else if (arr_expr->kind == AST_MEMBER_ACCESS) {
                 /* obj.field[i] = value — array stored in a struct/class field */
-                zan_type_t *at = member_access_field_type(locals, arr_expr);
+                zan_type_t *at = member_access_field_type(g, locals, arr_expr);
                 if (at) {
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
@@ -3531,7 +3584,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 local_var_t *local = local_find(locals, callee->member.object->ident.name);
                 if (local && local->type && local->type->sym) {
                     zan_symbol_t *type_sym = local->type->sym;
-                    zan_symbol_t *method_sym = get_method_sym(type_sym, callee->member.name);
+                    zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
                     if (method_sym) {
                         for (int fi = 0; fi < g->function_count; fi++) {
                             if (g->functions[fi].sym == method_sym) {
@@ -3562,7 +3615,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* try as static method: ClassName.Method(args) */
                 zan_symbol_t *type_sym = zan_binder_lookup(g->binder, callee->member.object->ident.name);
                 if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
-                    zan_symbol_t *method_sym = get_method_sym(type_sym, callee->member.name);
+                    zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
                     if (method_sym) {
                         for (int fi = 0; fi < g->function_count; fi++) {
                             if (g->functions[fi].sym == method_sym) {
@@ -3590,7 +3643,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             zan_ast_node_t *callee = expr->call.callee;
             zan_symbol_t *recv_cls = expr_class_sym(g, callee->member.object, locals);
             if (recv_cls) {
-                zan_symbol_t *method_sym = get_method_sym(recv_cls, callee->member.name);
+                zan_symbol_t *method_sym = resolve_overload(recv_cls, callee->member.name, expr->call.args.count);
                 if (method_sym) {
                     for (int fi = 0; fi < g->function_count; fi++) {
                         if (g->functions[fi].sym == method_sym) {
@@ -3651,7 +3704,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 
             /* try current class methods first */
             if (g->current_type_sym) {
-                zan_symbol_t *method_sym = get_method_sym(g->current_type_sym, fn_name);
+                zan_symbol_t *method_sym = resolve_overload(g->current_type_sym, fn_name, expr->call.args.count);
                 if (method_sym) {
                     for (int fi = 0; fi < g->function_count; fi++) {
                         if (g->functions[fi].sym == method_sym) {
@@ -4006,7 +4059,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             /* obj.field[i] — array stored in a struct/class field. Load the
              * field value (the array data pointer) and recover its element
              * type from the field declaration. */
-            arr_type = member_access_field_type(locals, expr->index.object);
+            arr_type = member_access_field_type(g, locals, expr->index.object);
             if (arr_type) {
                 arr_ptr = emit_expr(g, expr->index.object, locals);
                 if (arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
@@ -6026,15 +6079,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     efn = LLVMAddFunction(g->mod, ext_name, ft);
                 }
                 /* register as a static method so it can be called */
-                zan_symbol_t *method_sym = NULL;
-                for (int mi = 0; mi < type_sym->member_count; mi++) {
-                    if (type_sym->members[mi]->name.len == member->method_decl.name.len &&
-                        memcmp(type_sym->members[mi]->name.str, member->method_decl.name.str,
-                               member->method_decl.name.len) == 0) {
-                        method_sym = type_sym->members[mi];
-                        break;
-                    }
-                }
+                zan_symbol_t *method_sym = method_sym_for_decl(type_sym, member);
                 if (method_sym && g->function_count < 1024) {
                     g->functions[g->function_count].sym = method_sym;
                     g->functions[g->function_count].fn = efn;
@@ -6190,7 +6235,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     g->ctor_count++;
                 }
             } else if (g->function_count < 1024) {
-                zan_symbol_t *method_sym = get_method_sym(type_sym, member->method_decl.name);
+                zan_symbol_t *method_sym = method_sym_for_decl(type_sym, member);
                 g->functions[g->function_count].sym = method_sym;
                 g->functions[g->function_count].fn = fn;
                 g->functions[g->function_count].fn_type = fn_type;
