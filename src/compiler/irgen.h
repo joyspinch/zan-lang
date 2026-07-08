@@ -126,6 +126,8 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_sched_init_type;
     LLVMValueRef rt_co_sched_run; /* void zan_co_sched_run(void) */
     LLVMTypeRef  rt_co_sched_run_type;
+    LLVMValueRef rt_co_delay;     /* void zan_co_delay(i64 ms, void* frame, step) */
+    LLVMTypeRef  rt_co_delay_type;
     /* set while emitting an async function's $resume body: the current heap
      * frame pointer and its struct type, so `return` stores into the frame's
      * result slot + notifies the awaiter instead of a plain ret. NULL when not

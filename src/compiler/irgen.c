@@ -185,6 +185,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->rt_co_sched_init = LLVMAddFunction(g->mod, "zan_co_sched_init", g->rt_co_sched_init_type);
     g->rt_co_sched_run_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_sched_run = LLVMAddFunction(g->mod, "zan_co_sched_run", g->rt_co_sched_run_type);
+    {
+        LLVMTypeRef i64d = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef delay_args[] = { i64d, i8ptr, g->co_step_ptr };
+        g->rt_co_delay_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), delay_args, 3, 0);
+        g->rt_co_delay = LLVMAddFunction(g->mod, "zan_co_delay", g->rt_co_delay_type);
+    }
 
     /* Emit the cooperative coroutine driver inline (the whole Zan runtime is
      * emitted into the module, so produced programs are self-contained — see
@@ -204,12 +210,58 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetInitializer(g_tail, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_tail, LLVMInternalLinkage);
 
+        /* Timer wheel for time-based suspensions (`await Task.Delay(ms)`): a
+         * singly-linked list of {next, due_ms, frame, step}. zan_co_delay
+         * registers a one-shot timer; zan_co_sched_run, when the ready queue is
+         * empty, sleeps until the earliest due timer, then readies its frame —
+         * this is the "reactor wakes a suspended coroutine later" path. Absolute
+         * deadlines use a monotonic millisecond clock (GetTickCount64 on the
+         * Windows target). */
+        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef tnode_fields[] = { i8ptr /*next*/, i64t /*due_ms*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
+        LLVMTypeRef tnode_ty = LLVMStructCreateNamed(g->ctx, "zan.co.timer");
+        LLVMStructSetBody(tnode_ty, tnode_fields, 4, 0);
+        LLVMValueRef g_timers = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_timers");
+        LLVMSetInitializer(g_timers, LLVMConstNull(i8ptr));
+        LLVMSetLinkage(g_timers, LLVMInternalLinkage);
+
+        /* Platform clock/sleep (kernel32, linked by produced Windows exes). */
+        LLVMTypeRef tick_type = LLVMFunctionType(i64t, NULL, 0, 0);
+        LLVMValueRef fn_tick = LLVMAddFunction(g->mod, "GetTickCount64", tick_type);
+        LLVMTypeRef sleep_args[] = { i32t };
+        LLVMTypeRef sleep_type = LLVMFunctionType(voidt, sleep_args, 1, 0);
+        LLVMValueRef fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
+
         /* void zan_co_sched_init(void): reset the queue to empty. */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_init, "entry");
             LLVMPositionBuilderAtEnd(g->builder, bb);
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_head);
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_tail);
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), g_timers);
+            LLVMBuildRetVoid(g->builder);
+        }
+
+        /* void zan_co_delay(i64 ms, i8* frame, step): register a one-shot timer
+         * with an absolute deadline of now+ms, pushed on the front of the timer
+         * list. The caller then performs the CPS suspend (state=k, ret void). */
+        {
+            LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_delay, "entry");
+            LLVMPositionBuilderAtEnd(g->builder, bb);
+            LLVMValueRef ms    = LLVMGetParam(g->rt_co_delay, 0);
+            LLVMValueRef frame = LLVMGetParam(g->rt_co_delay, 1);
+            LLVMValueRef step  = LLVMGetParam(g->rt_co_delay, 2);
+            LLVMValueRef now = LLVMBuildCall2(g->builder, tick_type, fn_tick, NULL, 0, "now");
+            LLVMValueRef due = LLVMBuildAdd(g->builder, now, ms, "due");
+            LLVMValueRef tn = LLVMBuildCall2(g->builder, malloc_type, g->fn_malloc,
+                (LLVMValueRef[]){ LLVMSizeOf(tnode_ty) }, 1, "tn");
+            LLVMValueRef old = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
+            LLVMBuildStore(g->builder, old, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 0, "tn.next"));
+            LLVMBuildStore(g->builder, due, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 1, "tn.due"));
+            LLVMBuildStore(g->builder, frame, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 2, "tn.frame"));
+            LLVMBuildStore(g->builder, step, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 3, "tn.step"));
+            LLVMBuildStore(g->builder, tn, g_timers);
             LLVMBuildRetVoid(g->builder);
         }
 
@@ -259,22 +311,42 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* void zan_co_sched_run(void): drain the queue, invoking each step. */
+        /* void zan_co_sched_run(void): drain the ready queue, invoking each
+         * step. When the queue empties but timers remain, sleep until the
+         * earliest deadline, ready that timer's frame, and continue; exit only
+         * when both the ready queue and the timer list are empty. */
         {
             LLVMBasicBlockRef entry_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "entry");
             LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "loop");
             LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "body");
             LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "last");
             LLVMBasicBlockRef after_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after");
+            LLVMBasicBlockRef timers_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timers");
+            LLVMBasicBlockRef scan_setup = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.setup");
+            LLVMBasicBlockRef scan_cond = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.cond");
+            LLVMBasicBlockRef scan_body = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.body");
+            LLVMBasicBlockRef scan_take = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.take");
+            LLVMBasicBlockRef scan_next = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.next");
+            LLVMBasicBlockRef scan_done = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.done");
+            LLVMBasicBlockRef unlink_head = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "unlink.head");
+            LLVMBasicBlockRef unlink_mid = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "unlink.mid");
+            LLVMBasicBlockRef after_unlink = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after.unlink");
+            LLVMBasicBlockRef do_sleep = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "do.sleep");
+            LLVMBasicBlockRef after_sleep = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after.sleep");
             LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "exit");
             LLVMPositionBuilderAtEnd(g->builder, entry_bb);
+            /* scan state (no opt pass runs, so plain allocas are fine) */
+            LLVMValueRef a_best     = LLVMBuildAlloca(g->builder, i8ptr, "a.best");
+            LLVMValueRef a_bestprev = LLVMBuildAlloca(g->builder, i8ptr, "a.bestprev");
+            LLVMValueRef a_cur      = LLVMBuildAlloca(g->builder, i8ptr, "a.cur");
+            LLVMValueRef a_curprev  = LLVMBuildAlloca(g->builder, i8ptr, "a.curprev");
             LLVMBuildBr(g->builder, head_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, head_bb);
             LLVMValueRef head = LLVMBuildLoad2(g->builder, i8ptr, g_head, "head");
             LLVMValueRef empty = LLVMBuildICmp(g->builder, LLVMIntEQ, head,
                 LLVMConstNull(i8ptr), "q.empty");
-            LLVMBuildCondBr(g->builder, empty, exit_bb, body_bb);
+            LLVMBuildCondBr(g->builder, empty, timers_bb, body_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, body_bb);
             LLVMValueRef fr_ptr = LLVMBuildStructGEP2(g->builder, node_ty, head, 1, "n.frame");
@@ -297,6 +369,98 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 (LLVMValueRef[]){ head }, 1, "");
             LLVMBuildCall2(g->builder, g->co_step_type, st,
                 (LLVMValueRef[]){ fr }, 1, "");
+            LLVMBuildBr(g->builder, head_bb);
+
+            /* ready queue empty: if no timers, we're done; else find the
+             * earliest-due timer, unlink it, sleep to its deadline, ready it. */
+            LLVMPositionBuilderAtEnd(g->builder, timers_bb);
+            LLVMValueRef t0 = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
+            LLVMValueRef tnull = LLVMBuildICmp(g->builder, LLVMIntEQ, t0,
+                LLVMConstNull(i8ptr), "t.empty");
+            LLVMBuildCondBr(g->builder, tnull, exit_bb, scan_setup);
+
+            LLVMPositionBuilderAtEnd(g->builder, scan_setup);
+            LLVMBuildStore(g->builder, t0, a_best);
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), a_bestprev);
+            LLVMValueRef t0next = LLVMBuildLoad2(g->builder, i8ptr,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, t0, 0, "t0.next"), "t0.nextv");
+            LLVMBuildStore(g->builder, t0next, a_cur);
+            LLVMBuildStore(g->builder, t0, a_curprev);
+            LLVMBuildBr(g->builder, scan_cond);
+
+            LLVMPositionBuilderAtEnd(g->builder, scan_cond);
+            LLVMValueRef cur_c = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur");
+            LLVMValueRef cur_null = LLVMBuildICmp(g->builder, LLVMIntEQ, cur_c,
+                LLVMConstNull(i8ptr), "cur.null");
+            LLVMBuildCondBr(g->builder, cur_null, scan_done, scan_body);
+
+            LLVMPositionBuilderAtEnd(g->builder, scan_body);
+            LLVMValueRef cur_b = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur.b");
+            LLVMValueRef best_b = LLVMBuildLoad2(g->builder, i8ptr, a_best, "best.b");
+            LLVMValueRef curdue = LLVMBuildLoad2(g->builder, i64t,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, cur_b, 1, "cur.due"), "curdue");
+            LLVMValueRef bestdue = LLVMBuildLoad2(g->builder, i64t,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, best_b, 1, "best.due"), "bestdue");
+            LLVMValueRef lt = LLVMBuildICmp(g->builder, LLVMIntULT, curdue, bestdue, "due.lt");
+            LLVMBuildCondBr(g->builder, lt, scan_take, scan_next);
+
+            LLVMPositionBuilderAtEnd(g->builder, scan_take);
+            LLVMValueRef cur_t = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur.t");
+            LLVMValueRef curprev_t = LLVMBuildLoad2(g->builder, i8ptr, a_curprev, "curprev.t");
+            LLVMBuildStore(g->builder, cur_t, a_best);
+            LLVMBuildStore(g->builder, curprev_t, a_bestprev);
+            LLVMBuildBr(g->builder, scan_next);
+
+            LLVMPositionBuilderAtEnd(g->builder, scan_next);
+            LLVMValueRef cur_n = LLVMBuildLoad2(g->builder, i8ptr, a_cur, "cur.n");
+            LLVMBuildStore(g->builder, cur_n, a_curprev);
+            LLVMValueRef curnext = LLVMBuildLoad2(g->builder, i8ptr,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, cur_n, 0, "cur.nextp"), "cur.nextv");
+            LLVMBuildStore(g->builder, curnext, a_cur);
+            LLVMBuildBr(g->builder, scan_cond);
+
+            LLVMPositionBuilderAtEnd(g->builder, scan_done);
+            LLVMValueRef best = LLVMBuildLoad2(g->builder, i8ptr, a_best, "best");
+            LLVMValueRef bestprev = LLVMBuildLoad2(g->builder, i8ptr, a_bestprev, "bestprev");
+            LLVMValueRef bestnext = LLVMBuildLoad2(g->builder, i8ptr,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 0, "best.nextp"), "best.nextv");
+            LLVMValueRef bp_null = LLVMBuildICmp(g->builder, LLVMIntEQ, bestprev,
+                LLVMConstNull(i8ptr), "bp.null");
+            LLVMBuildCondBr(g->builder, bp_null, unlink_head, unlink_mid);
+
+            LLVMPositionBuilderAtEnd(g->builder, unlink_head);
+            LLVMBuildStore(g->builder, bestnext, g_timers);
+            LLVMBuildBr(g->builder, after_unlink);
+
+            LLVMPositionBuilderAtEnd(g->builder, unlink_mid);
+            LLVMBuildStore(g->builder, bestnext,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, bestprev, 0, "bp.nextp"));
+            LLVMBuildBr(g->builder, after_unlink);
+
+            LLVMPositionBuilderAtEnd(g->builder, after_unlink);
+            LLVMValueRef due_v = LLVMBuildLoad2(g->builder, i64t,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 1, "best.duep"), "best.due");
+            LLVMValueRef now_v = LLVMBuildCall2(g->builder, tick_type, fn_tick, NULL, 0, "now");
+            LLVMValueRef wait_v = LLVMBuildSub(g->builder, due_v, now_v, "wait");
+            LLVMValueRef wait_pos = LLVMBuildICmp(g->builder, LLVMIntSGT, wait_v,
+                LLVMConstInt(i64t, 0, 0), "wait.pos");
+            LLVMBuildCondBr(g->builder, wait_pos, do_sleep, after_sleep);
+
+            LLVMPositionBuilderAtEnd(g->builder, do_sleep);
+            LLVMValueRef wait32 = LLVMBuildTrunc(g->builder, wait_v, i32t, "wait32");
+            LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
+                (LLVMValueRef[]){ wait32 }, 1, "");
+            LLVMBuildBr(g->builder, after_sleep);
+
+            LLVMPositionBuilderAtEnd(g->builder, after_sleep);
+            LLVMValueRef bframe = LLVMBuildLoad2(g->builder, i8ptr,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 2, "best.framep"), "best.frame");
+            LLVMValueRef bstep = LLVMBuildLoad2(g->builder, g->co_step_ptr,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 3, "best.stepp"), "best.step");
+            LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready,
+                (LLVMValueRef[]){ bframe, bstep }, 2, "");
+            LLVMBuildCall2(g->builder, free_type, g->fn_free,
+                (LLVMValueRef[]){ best }, 1, "");
             LLVMBuildBr(g->builder, head_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, exit_bb);
@@ -4194,6 +4358,49 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_AWAIT_EXPR: {
+        /* await Task.Delay(ms) — time-based suspension (no sub-frame). Inside an
+         * async body: register a one-shot timer that will re-ready this frame at
+         * now+ms, then SUSPEND; the resume-k block just continues. At a non-async
+         * root, sleep synchronously. Delay yields no value (returns i64 0). */
+        if (is_call_to(expr->await_expr.expr, "Task", "Delay") &&
+            expr->await_expr.expr->call.args.count == 1) {
+            LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef ms = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+            if (LLVMTypeOf(ms) != di64) {
+                ms = LLVMBuildIntCast2(g->builder, ms, di64, 1, "ms64");
+            }
+            if (g->current_async_frame && g->current_async_switch) {
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                LLVMBuildCall2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
+                    (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
+                emit_async_save_slots(g);
+                LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                return LLVMConstInt(di64, 0, 0);
+            }
+            /* root: sleep synchronously (no scheduler frame to suspend) */
+            LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
+            if (fn_sleep) {
+                LLVMTypeRef sl_args[] = { di32 };
+                LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
+                LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
+                LLVMBuildCall2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
+            }
+            return LLVMConstInt(di64, 0, 0);
+        }
+
         /* await <call> — the awaited expression is a call to an async method's
          * ramp, yielding an i8* task handle (heap frame). The sub's resume/step
          * fn is `<ramp>$resume`, resolved from the call target's name. Two
