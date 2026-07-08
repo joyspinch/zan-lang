@@ -44,8 +44,15 @@ class IdeDemo {
     static string Zanc() { return "d:/project/zan-lang/build/zanc.exe"; }
 
     static void Main() {
-        App app = App.CreateDark("Zan IDE", 1180, 780);
+        // Restore the last-used window / panel sizes (see SaveSettings).
+        string cfg = "";
+        if (File.Exists(IdeDemo.CfgPath())) { cfg = File.ReadAllText(IdeDemo.CfgPath()); }
+        int cfgW = IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "winW", 1180), 640, 4000);
+        int cfgH = IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "winH", 780), 480, 3000);
+        App app = App.CreateDark("Zan IDE", cfgW, cfgH);
         app.Show();
+        int savedW = cfgW;
+        int savedH = cfgH;
 
         string root = "d:/project/zan-lang/build/ide_workspace";
         IdeDemo.EnsureWorkspace(root);
@@ -204,8 +211,10 @@ class IdeDemo {
         SignalInt dDragOffY = SignalInt.Create(0);
         SignalInt dResizeH = SignalInt.Create(0);   // resize handle 0-7
 
-        SignalInt treeW = SignalInt.Create(240);
-        SignalInt editorAreaH = SignalInt.Create(430);
+        SignalInt treeW = SignalInt.Create(IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "treeW", 240), 120, 900));
+        SignalInt editorAreaH = SignalInt.Create(IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "editorAreaH", 430), 120, 3000));
+        // Bottom panel active tab: 0 = Output, 1 = Error List.
+        SignalInt bottomTab = SignalInt.Create(IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "bottomTab", 0), 0, 1));
         SignalInt treeSel = SignalInt.Create(-1);
         int lastTreeSel = -1;
 
@@ -388,6 +397,7 @@ class IdeDemo {
                 Theme t = app.theme;
                 int W = c.Width();
                 int H = c.Height();
+                savedW = W; savedH = H;
                 int top = app.titlebarH;
                 int ribbonH = Ribbon.Height(app);
 
@@ -938,8 +948,41 @@ class IdeDemo {
                         }
                     }
                 } else {
-                    Rect oi = Panel.Section(app, orr.x, orr.y, orr.width, orr.height, "Output");
-                    IdeDemo.RenderLog(app, oi, log);
+                    int botTab = bottomTab.Get();
+                    List<string> ePath = new List<string>();
+                    List<string> eLine = new List<string>();
+                    List<string> eMsg = new List<string>();
+                    IdeDemo.ParseErrorList(log, ePath, eLine, eMsg);
+                    IdeDemo.RenderOutputBottom(app, c, t, orr, botTab, log, ePath, eLine, eMsg);
+                    if (app.window.EventKind() == 3) {
+                        int obTabH = app.Scale(28);
+                        int obTabW = app.Scale(90);
+                        if (app.mouseY >= orr.y && app.mouseY < orr.y + obTabH
+                            && app.mouseX >= orr.x && app.mouseX < orr.x + obTabW * 2) {
+                            int ti = 0;
+                            if (app.mouseX >= orr.x + obTabW) { ti = 1; }
+                            bottomTab.Set(ti);
+                            app.RequestRedraw();
+                        } else if (botTab == 1 && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width) {
+                            // Click an error row -> jump to its file:line.
+                            int rowH = app.Scale(20);
+                            int cy0 = orr.y + obTabH + app.Scale(6);
+                            if (app.mouseY >= cy0) {
+                                int idx = (app.mouseY - cy0) / rowH;
+                                if (idx >= 0 && idx < ePath.Count) {
+                                    int j = IdeDemo.FindTabByBase(tabPaths, IdeDemo.BaseName(ePath[idx]));
+                                    int gl = IdeDemo.ParseInt(eLine[idx]);
+                                    if (j >= 0) {
+                                        activeTab.Set(j);
+                                        lastActive = 0 - 1;
+                                        pendingGotoLine = gl - 1;
+                                        pendingGotoCol = 0;
+                                    }
+                                    app.RequestRedraw();
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Status bar
@@ -1058,6 +1101,8 @@ class IdeDemo {
                 lastTreeSel = -1;
             }
         }
+        // Persist window + panel sizes so the next launch restores them.
+        IdeDemo.SaveSettings(treeW.Get(), editorAreaH.Get(), savedW, savedH, bottomTab.Get());
     }
 
     /// Spawns a fresh wizard child window (a real draggable top-level window),
@@ -2247,6 +2292,173 @@ class IdeDemo {
                 sel.Set(idx);
                 app.RequestRedraw();
             }
+        }
+    }
+
+    // ================================================================
+    // Settings persistence (window + panel sizes)
+    // ================================================================
+
+    static string CfgPath() { return "d:/project/zan-lang/build/ide_workspace/.zanide.cfg"; }
+
+    static bool IsDigit(string ch) {
+        return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
+            || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9";
+    }
+
+    /// Finds the first index of `sub` in `s`, or -1.
+    static int StrFind(string s, string sub) {
+        if (sub.Length == 0) { return 0; }
+        if (sub.Length > s.Length) { return -1; }
+        int n = s.Length - sub.Length;
+        int i = 0;
+        while (i <= n) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// The file name portion of a path (after the last '/' or '\').
+    static string BaseName(string p) {
+        int best = -1;
+        int i = 0;
+        while (i < p.Length) {
+            string ch = p.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { best = i; }
+            i = i + 1;
+        }
+        if (best >= 0 && best + 1 <= p.Length) { return p.Substring(best + 1, p.Length - best - 1); }
+        return p;
+    }
+
+    /// Reads an integer "key=NNN" from a settings blob, or `def` when absent.
+    static int CfgInt(string cfg, string key, int def) {
+        int idx = IdeDemo.StrFind(cfg, key + "=");
+        if (idx < 0) { return def; }
+        int p = idx + key.Length + 1;
+        string num = "";
+        while (p < cfg.Length) {
+            string ch = cfg.Substring(p, 1);
+            if (IdeDemo.IsDigit(ch)) { num = num + ch; p = p + 1; } else { break; }
+        }
+        if (num.Length == 0) { return def; }
+        return IdeDemo.ParseInt(num);
+    }
+
+    /// Clamps a restored dimension into a sane range.
+    static int CfgClamp(int v, int lo, int hi) {
+        if (v < lo) { return lo; }
+        if (v > hi) { return hi; }
+        return v;
+    }
+
+    static void SaveSettings(int treeW, int edH, int winW, int winH, int botTab) {
+        string s = "treeW=" + Convert.ToString(treeW)
+            + ";editorAreaH=" + Convert.ToString(edH)
+            + ";winW=" + Convert.ToString(winW)
+            + ";winH=" + Convert.ToString(winH)
+            + ";bottomTab=" + Convert.ToString(botTab) + ";";
+        File.WriteAllText(IdeDemo.CfgPath(), s);
+    }
+
+    /// Index of the open tab whose file name matches `base`, or -1.
+    static int FindTabByBase(List<string> tabPaths, string bn) {
+        int i = 0;
+        while (i < tabPaths.Count) {
+            if (IdeDemo.BaseName(tabPaths[i]) == bn) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ================================================================
+    // Error list (parsed from build/run output) + tabbed bottom panel
+    // ================================================================
+
+    /// Scans the log for compiler/linker diagnostics of the form
+    /// `...<file>.zan:<line>[:col]: ... message`, filling parallel lists.
+    static void ParseErrorList(List<string> log, List<string> outPath,
+            List<string> outLine, List<string> outMsg) {
+        int i = 0;
+        while (i < log.Count) {
+            string ln = log[i];
+            int idx = IdeDemo.StrFind(ln, ".zan:");
+            if (idx >= 0) {
+                // path: from first non-prefix char up to and including ".zan"
+                int ps = 0;
+                while (ps < ln.Length) {
+                    string pc = ln.Substring(ps, 1);
+                    if (pc == " " || pc == ">" || pc == "\t") { ps = ps + 1; } else { break; }
+                }
+                string path = ln.Substring(ps, (idx + 4) - ps);
+                int p = idx + 5;
+                string num = "";
+                while (p < ln.Length) {
+                    string ch = ln.Substring(p, 1);
+                    if (IdeDemo.IsDigit(ch)) { num = num + ch; p = p + 1; } else { break; }
+                }
+                if (num.Length > 0) {
+                    string msg = ln;
+                    int me = IdeDemo.StrFind(ln, "error");
+                    if (me < 0) { me = IdeDemo.StrFind(ln, "warning"); }
+                    if (me >= 0) { msg = ln.Substring(me, ln.Length - me); }
+                    outPath.Add(path);
+                    outLine.Add(num);
+                    outMsg.Add(msg);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Draws the parsed error rows; each row is clickable (hover-highlighted).
+    static void RenderErrorList(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> ePath, List<string> eLine, List<string> eMsg) {
+        int rowH = app.Scale(20);
+        int pad = app.Scale(6);
+        if (ePath.Count == 0) {
+            c.DrawText(x + pad, y + pad, "No errors.", 0xFF6A9955, t.fontSizeSmall);
+            return;
+        }
+        int i = 0;
+        int cy = y + pad;
+        while (i < ePath.Count && cy + rowH <= y + h) {
+            if (app.mouseX >= x && app.mouseX < x + w && app.mouseY >= cy && app.mouseY < cy + rowH) {
+                c.FillRect(x, cy, w, rowH, 0xFF2A2D2E);
+            }
+            string row = IdeDemo.BaseName(ePath[i]) + ":" + eLine[i] + "   " + eMsg[i];
+            c.DrawText(x + pad, cy, row, 0xFFF48771, t.fontSizeSmall);
+            cy = cy + rowH;
+            i = i + 1;
+        }
+    }
+
+    /// Tabbed bottom panel (Output / Error List) with tight padding, replacing
+    /// the single bordered Output section.
+    static void RenderOutputBottom(App app, Canvas c, Theme t, Rect orr, int tab,
+            List<string> log, List<string> ePath, List<string> eLine, List<string> eMsg) {
+        int tabH = app.Scale(28);
+        int tabW = app.Scale(90);
+        c.FillRect(orr.x, orr.y, orr.width, tabH, 0xFF252526);
+        c.FillRect(orr.x, orr.y + tabH - 1, orr.width, 1, t.divider);
+        int bg0 = 0xFF333333;
+        if (tab == 0) { bg0 = 0xFF1E1E1E; }
+        c.FillRect(orr.x, orr.y, tabW, tabH, bg0);
+        c.DrawText(orr.x + app.Scale(8), orr.y + app.Scale(6), "Output", t.textPrimary, t.fontSizeSmall);
+        int bg1 = 0xFF333333;
+        if (tab == 1) { bg1 = 0xFF1E1E1E; }
+        c.FillRect(orr.x + tabW, orr.y, tabW, tabH, bg1);
+        string elabel = "Errors";
+        if (eLine.Count > 0) { elabel = "Errors (" + Convert.ToString(eLine.Count) + ")"; }
+        c.DrawText(orr.x + tabW + app.Scale(8), orr.y + app.Scale(6), elabel, t.textPrimary, t.fontSizeSmall);
+        int contentY = orr.y + tabH;
+        int contentH = orr.height - tabH;
+        c.FillRect(orr.x, contentY, orr.width, contentH, 0xFF1E1E1E);
+        if (tab == 0) {
+            IdeDemo.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, log);
+        } else {
+            IdeDemo.RenderErrorList(app, c, t, orr.x, contentY, orr.width, contentH, ePath, eLine, eMsg);
         }
     }
 
