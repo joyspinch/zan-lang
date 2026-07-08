@@ -249,14 +249,14 @@ class Socket {
         return clientSock;
     }
 
-    /// <summary>Accepts a connection (blocking with select).</summary>
-    static int AcceptAsync(int sock) {
+    /// <summary>Suspends on the IO reactor until an inbound connection is
+    /// pending, then accepts it. Requires a non-blocking listener socket.</summary>
+    static async int AcceptAsync(int sock) {
         while (true) {
-            if (IsReadable(sock)) {
-                int client = Accept(sock);
-                if (client >= 0) {
-                    return client;
-                }
+            await ReadReady(sock);
+            int client = Accept(sock);
+            if (client >= 0) {
+                return client;
             }
         }
         return -1;
@@ -270,10 +270,13 @@ class Socket {
         return result;
     }
 
-    /// <summary>Connects (wrapper for Connect).</summary>
-    static int ConnectAsync(int sock, string ip, int port) {
-        int result = Connect(sock, ip, port);
-        return result;
+    /// <summary>Begins a non-blocking connect, then suspends on the IO reactor
+    /// until the socket becomes writable (connection established). Returns 0.
+    /// Requires a non-blocking socket.</summary>
+    static async int ConnectAsync(int sock, string ip, int port) {
+        Connect(sock, ip, port);
+        await WriteReady(sock);
+        return 0;
     }
 
     /// <summary>Sends data synchronously.</summary>
@@ -281,10 +284,13 @@ class Socket {
         return winsend(sock, data, len, 0);
     }
 
-    /// <summary>Sends all data, retrying on partial sends.</summary>
-    static int SendAsync(int sock, string data, int len) {
+    /// <summary>Suspends until writable, then sends; re-awaits on partial writes
+    /// until all <paramref name="len"/> bytes are sent or the peer closes.
+    /// Returns the number of bytes sent. Requires a non-blocking socket.</summary>
+    static async int SendAsync(int sock, string data, int len) {
         int totalSent = 0;
         while (totalSent < len) {
+            await WriteReady(sock);
             int sent = winsend(sock, data + totalSent, len - totalSent, 0);
             if (sent > 0) {
                 totalSent = totalSent + sent;
@@ -301,10 +307,11 @@ class Socket {
         return Send(sock, data, len);
     }
 
-    /// <summary>Sends a string (full send).</summary>
-    static int SendStringAsync(int sock, string data) {
+    /// <summary>Sends a whole string asynchronously (length via strlen).</summary>
+    static async int SendStringAsync(int sock, string data) {
         int len = strlen(data);
-        return SendAsync(sock, data, len);
+        int r = await SendAsync(sock, data, len);
+        return r;
     }
 
     /// <summary>Receives data synchronously.</summary>
@@ -312,17 +319,16 @@ class Socket {
         return winrecv(sock, buf, bufSize, 0);
     }
 
-    /// <summary>Receives data, blocking until available via select().</summary>
-    static string RecvAsync(int sock, int bufSize) {
+    /// <summary>Suspends on the IO reactor until readable, then receives up to
+    /// <paramref name="bufSize"/> bytes. Returns the data as a NUL-terminated
+    /// string (empty on peer close / EOF). Requires a non-blocking socket.</summary>
+    static async string RecvAsync(int sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
         while (true) {
-            if (IsReadable(sock)) {
-                int n = winrecv(sock, buf, bufSize, 0);
-                if (n > 0) {
-                    return buf;
-                } else if (n == 0) {
-                    return buf;
-                }
+            await ReadReady(sock);
+            int n = winrecv(sock, buf, bufSize, 0);
+            if (n >= 0) {
+                return buf;
             }
         }
         return buf;
@@ -343,8 +349,10 @@ class Socket {
         return result;
     }
 
-    /// <summary>Sends a UDP datagram (wrapper).</summary>
-    static int SendToAsync(int sock, string data, int len, string ip, int port) {
+    /// <summary>Suspends until writable, then sends a UDP datagram. Requires a
+    /// non-blocking socket.</summary>
+    static async int SendToAsync(int sock, string data, int len, string ip, int port) {
+        await WriteReady(sock);
         int result = SendTo(sock, data, len, ip, port);
         return result;
     }
@@ -361,17 +369,12 @@ class Socket {
         return buf;
     }
 
-    /// <summary>Receives a UDP datagram, blocking until available.</summary>
-    static string RecvFromAsync(int sock, int bufSize) {
-        while (true) {
-            if (IsReadable(sock)) {
-                string result = RecvFrom(sock, bufSize);
-                if (strlen(result) > 0) {
-                    return result;
-                }
-            }
-        }
-        return RecvFrom(sock, bufSize);
+    /// <summary>Suspends on the IO reactor until a datagram is available, then
+    /// receives it. Requires a non-blocking socket.</summary>
+    static async string RecvFromAsync(int sock, int bufSize) {
+        await ReadReady(sock);
+        string result = RecvFrom(sock, bufSize);
+        return result;
     }
 
     /// <summary>Resolves a hostname to an IP address.</summary>
