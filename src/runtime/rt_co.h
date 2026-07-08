@@ -30,4 +30,14 @@ void   zan_co_ready(void *frame, zan_co_step_t step);
 void   zan_co_sched_run(void);
 size_t zan_co_pending(void);
 
+/* Optional idle hook. When the ready queue empties, the scheduler calls this to
+ * block for external events (the IO reactor / timers) and enqueue any newly
+ * runnable frames. It returns the number of frames it made ready; a return of 0
+ * means nothing is left to wait for and the scheduler stops. This is how the IO
+ * reactor bridges into the driver without rt_co depending on rt_io directly
+ * (wire it with zan_co_set_idle(zan_io_pump)). NULL (the default) = queue-only.
+ */
+typedef int (*zan_co_idle_fn)(void);
+void   zan_co_set_idle(zan_co_idle_fn fn);
+
 #endif /* ZAN_RT_CO_H */

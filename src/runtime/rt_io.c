@@ -23,6 +23,7 @@
 #endif
 
 #include "rt_io.h"
+#include "rt_co.h"
 #include "rt_sched.h"
 #include <stdlib.h>
 #include <string.h>
@@ -39,20 +40,28 @@ extern void zan_io_suspend_current(void);   /* implemented in rt_sched.c */
 extern void zan_io_resume(void *co);        /* implemented in rt_sched.c */
 extern void *zan_io_get_current_co(void);   /* implemented in rt_sched.c */
 
-/* ---- interest flags ---- */
-#define ZAN_IO_READ  1
-#define ZAN_IO_WRITE 2
+/* ZAN_IO_READ / ZAN_IO_WRITE come from rt_io.h. */
 
 /* Number of in-flight watchers / operations; used by zan_io_has_pending()
  * and to short-circuit an empty poll on every backend. */
 static int g_io_count;
+
+/* Wake a watcher whose fd became ready. A stackless watcher (registered via
+ * zan_io_wait_co) carries a resume `step` and is re-entered through the co
+ * driver's ready queue; a stackful watcher (rt_sched fiber) has step==NULL and
+ * is resumed by switching to its fiber. */
+static void io_wake(void *co, zan_co_step_t step) {
+    if (step) zan_co_ready(co, step);
+    else      zan_io_resume(co);
+}
 
 #if !defined(_WIN32)
 /* ---- readiness watcher (epoll / kqueue / select backends) ---- */
 typedef struct zan_io_entry {
     int fd;
     int interest;           /* ZAN_IO_READ or ZAN_IO_WRITE */
-    void *co;               /* suspended coroutine handle */
+    void *co;               /* fiber handle, or stackless frame pointer */
+    zan_co_step_t step;     /* stackless resume fn (NULL => stackful fiber) */
     struct zan_io_entry *next;
 } zan_io_entry_t;
 
@@ -95,11 +104,12 @@ int zan_io_set_nonblocking(int64_t fd) {
     return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void io_register(int fd, int interest, void *co) {
+static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
     e->fd = fd;
     e->interest = interest;
     e->co = co;
+    e->step = step;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -116,20 +126,21 @@ int zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     struct epoll_event events[64];
     int n = epoll_wait(g_epoll_fd, events, 64,
-                       (int)(timeout_ms < 0 ? 0 : timeout_ms));
+                       timeout_ms < 0 ? -1 : (int)timeout_ms);
     int woke = 0;
     for (int i = 0; i < n; i++) {
         int fd = events[i].data.fd;
         zan_io_entry_t **pp = &g_io_entries;
         while (*pp) {
             if ((*pp)->fd == fd) {
-                void *co = (*pp)->co;
                 zan_io_entry_t *e = *pp;
+                void *co = e->co;
+                zan_co_step_t step = e->step;
                 *pp = e->next;
                 epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
                 free(e);
                 g_io_count--;
-                zan_io_resume(co);
+                io_wake(co, step);
                 woke++;
                 break;
             }
@@ -171,11 +182,12 @@ int zan_io_set_nonblocking(int64_t fd) {
     return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void io_register(int fd, int interest, void *co) {
+static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
     e->fd = fd;
     e->interest = interest;
     e->co = co;
+    e->step = step;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -198,12 +210,13 @@ int zan_io_poll(int64_t timeout_ms) {
         zan_io_entry_t **pp = &g_io_entries;
         while (*pp) {
             if ((*pp)->fd == fd) {
-                void *co = (*pp)->co;
                 zan_io_entry_t *e = *pp;
+                void *co = e->co;
+                zan_co_step_t step = e->step;
                 *pp = e->next;
                 free(e);
                 g_io_count--;
-                zan_io_resume(co);
+                io_wake(co, step);
                 woke++;
                 break;
             }
@@ -228,7 +241,8 @@ typedef struct zan_io_op {
     OVERLAPPED ov;
     SOCKET     sock;
     int        interest;     /* ZAN_IO_READ / ZAN_IO_WRITE */
-    void      *co;
+    void      *co;           /* fiber handle, or stackless frame pointer */
+    zan_co_step_t step;      /* stackless resume fn (NULL => stackful fiber) */
 } zan_io_op_t;
 
 static HANDLE g_iocp;
@@ -280,7 +294,7 @@ int zan_io_set_nonblocking(int64_t fd) {
 }
 
 /* Post a zero-byte overlapped op to learn when `fd` is read/write ready. */
-static void io_register(int fd, int interest, void *co) {
+static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     SOCKET s = (SOCKET)fd;
     ensure_assoc(s);
 
@@ -288,6 +302,7 @@ static void io_register(int fd, int interest, void *co) {
     op->sock = s;
     op->interest = interest;
     op->co = co;
+    op->step = step;
     g_io_count++;
 
     WSABUF b;
@@ -311,7 +326,7 @@ int zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
-    DWORD to = (DWORD)(timeout_ms < 0 ? 0 : timeout_ms);
+    DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
     if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE))
         return 0;
     int woke = 0;
@@ -319,9 +334,10 @@ int zan_io_poll(int64_t timeout_ms) {
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
                                             zan_io_op_t, ov);
         void *co = op->co;
+        zan_co_step_t step = op->step;
         free(op);
         g_io_count--;
-        zan_io_resume(co);
+        io_wake(co, step);
         woke++;
     }
     return woke;
@@ -355,11 +371,12 @@ int zan_io_set_nonblocking(int64_t fd) {
     return fcntl((int)fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void io_register(int fd, int interest, void *co) {
+static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     zan_io_entry_t *e = (zan_io_entry_t *)calloc(1, sizeof(*e));
     e->fd = fd;
     e->interest = interest;
     e->co = co;
+    e->step = step;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -400,10 +417,11 @@ int zan_io_poll(int64_t timeout_ms) {
             ready = 1;
         if (ready) {
             void *co = cur->co;
+            zan_co_step_t step = cur->step;
             *pp = cur->next;
             free(cur);
             g_io_count--;
-            zan_io_resume(co);
+            io_wake(co, step);
             woke++;
         } else {
             pp = &cur->next;
@@ -419,7 +437,7 @@ int zan_io_poll(int64_t timeout_ms) {
 int64_t zan_io_wait_readable(int64_t fd) {
     void *co = zan_io_get_current_co();
     if (!co) return -1;
-    io_register((int)fd, ZAN_IO_READ, co);
+    io_register((int)fd, ZAN_IO_READ, co, NULL);
     zan_io_suspend_current();
     return 0;
 }
@@ -427,9 +445,20 @@ int64_t zan_io_wait_readable(int64_t fd) {
 int64_t zan_io_wait_writable(int64_t fd) {
     void *co = zan_io_get_current_co();
     if (!co) return -1;
-    io_register((int)fd, ZAN_IO_WRITE, co);
+    io_register((int)fd, ZAN_IO_WRITE, co, NULL);
     zan_io_suspend_current();
     return 0;
+}
+
+/* ---- stackless (CPS) registration + idle bridge ---- */
+
+void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step) {
+    io_register((int)fd, interest, frame, step);
+}
+
+int zan_io_pump(void) {
+    if (!zan_io_has_pending()) return 0;
+    return zan_io_poll(-1);   /* block until an fd is ready (wakes via zan_co_ready) */
 }
 
 int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms) {
@@ -440,7 +469,7 @@ int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms) {
     (void)timeout_ms;
     void *co = zan_io_get_current_co();
     if (!co) return -1;
-    io_register((int)fd, ZAN_IO_READ, co);
+    io_register((int)fd, ZAN_IO_READ, co, NULL);
     zan_io_suspend_current();
     return 1;
 }

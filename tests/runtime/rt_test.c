@@ -469,6 +469,103 @@ static void test_co_statemachine(void) {
     free(root);
 }
 
+/* ===== stackless co + async IO =====
+ *
+ * Mirrors what the compiler's async lowering will emit for an `await` on a
+ * socket read: the frame records its resume point and returns to the scheduler,
+ * which blocks in the IO reactor (zan_io_pump) until the fd is ready and then
+ * re-enters the state machine via zan_co_ready. Proves the reactor-to-CPS
+ * bridge (zan_io_wait_co) on every platform's backend (epoll/kqueue/IOCP/select)
+ * without any dependency on the stackful rt_sched fiber path. */
+
+static const char IO_CO_MSG[] = "hello-zan-async-io";
+
+typedef struct {
+    co_hdr_t h;
+    sock_t   s;
+    int      port;
+    int64_t  got;       /* bytes received so far (survives suspensions) */
+    char     buf[64];
+} io_co_frame_t;
+
+static void io_co_resume(void *fp) {
+    io_co_frame_t *f = (io_co_frame_t *)fp;
+    int len = (int)strlen(IO_CO_MSG);
+    switch (f->h.state) {
+    case 0: {
+        /* connect (loopback, blocking) + send the request synchronously */
+        sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == BAD_SOCK) { co_complete(&f->h, -1); return; }
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons((unsigned short)f->port);
+        if (connect(s, (struct sockaddr *)&a, sizeof(a)) != 0) {
+            closesock(s); co_complete(&f->h, -2); return;
+        }
+        int sent = 0;
+        while (sent < len) {
+            int n = send(s, IO_CO_MSG + sent, len - sent, SEND_FLAGS);
+            if (n <= 0) { closesock(s); co_complete(&f->h, -3); return; }
+            sent += n;
+        }
+        zan_io_set_nonblocking((int64_t)s);
+        f->s = s;
+        /* await socket-readable: register + SUSPEND (return to scheduler). */
+        f->h.state = 1;
+        zan_io_wait_co((int64_t)s, ZAN_IO_READ, f, io_co_resume);
+        return;
+    }
+    case 1: {
+        /* readable: read the echoed bytes; re-await if not all arrived yet. */
+        while (f->got < len) {
+            int n = recv(f->s, f->buf + f->got, len - (int)f->got, 0);
+            if (n > 0) { f->got += n; continue; }
+            if (n < 0 && WOULD_BLOCK(sock_errno())) {
+                zan_io_wait_co((int64_t)f->s, ZAN_IO_READ, f, io_co_resume);
+                return;             /* stay in state 1, suspend again */
+            }
+            break;                  /* EOF or hard error */
+        }
+        closesock(f->s);
+        co_complete(&f->h, (f->got == len && memcmp(f->buf, IO_CO_MSG, len) == 0)
+                               ? f->got : -4);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+static void test_co_io(int port) {
+    banner("stackless co + async-io: await readable wakes a CPS frame");
+    zan_co_sched_init();
+    zan_io_init();                      /* WSAStartup before any socket() */
+    g_listen = make_listener(port);
+    CHECK(g_listen != BAD_SOCK, "could not bind echo server on port %d", port);
+    if (g_listen == BAD_SOCK) { zan_io_shutdown(); return; }
+    thread_t srv;
+#if defined(_WIN32)
+    srv = CreateThread(NULL, 0, server_thread, NULL, 0, NULL); (void)srv;
+#else
+    pthread_create(&srv, NULL, server_thread, NULL); (void)srv;
+#endif
+    zan_co_set_idle(zan_io_pump);
+    io_co_frame_t *root = (io_co_frame_t *)calloc(1, sizeof(*root));
+    root->port = port;
+    zan_co_ready(root, io_co_resume);
+    zan_co_sched_run();
+    closesock(g_listen); g_listen = BAD_SOCK;
+    zan_io_shutdown();
+    CHECK(root->h.done == 1, "stackless io frame not completed");
+    CHECK(root->got == (int64_t)strlen(IO_CO_MSG),
+          "stackless io got %lld bytes, expected %d",
+          (long long)root->got, (int)strlen(IO_CO_MSG));
+    CHECK(zan_co_pending() == 0, "ready queue not drained: %zu", zan_co_pending());
+    free(root);
+}
+
 int main(void) {
 #if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
@@ -478,6 +575,7 @@ int main(void) {
     test_scheduler();
     test_timer();
     test_co_statemachine();
+    test_co_io(19803);
     test_io_echo(19801);
     test_io_concurrent(19802);
     test_connect_refused(19899);

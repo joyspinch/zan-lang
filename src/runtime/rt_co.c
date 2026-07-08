@@ -18,10 +18,18 @@ static size_t         g_cap;    /* allocated slots */
 static size_t         g_len;    /* live entries */
 static size_t         g_head;   /* index of next to pop */
 
+/* Optional bridge to a blocking event source (the IO reactor); NULL = none. */
+static zan_co_idle_fn g_idle;
+
 void zan_co_sched_init(void) {
     free(g_queue);
     g_queue = NULL;
     g_cap = g_len = g_head = 0;
+    g_idle = NULL;
+}
+
+void zan_co_set_idle(zan_co_idle_fn fn) {
+    g_idle = fn;
 }
 
 static void queue_grow(void) {
@@ -48,11 +56,18 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
 }
 
 void zan_co_sched_run(void) {
-    while (g_len > 0) {
-        zan_co_slot_t slot = g_queue[g_head];
-        g_head = (g_head + 1) % g_cap;
-        g_len--;
-        slot.step(slot.frame);
+    for (;;) {
+        while (g_len > 0) {
+            zan_co_slot_t slot = g_queue[g_head];
+            g_head = (g_head + 1) % g_cap;
+            g_len--;
+            slot.step(slot.frame);
+        }
+        /* Ready queue drained. If an idle bridge (IO reactor) is wired, block
+         * for external events that may enqueue more work; stop when it reports
+         * nothing left to wait for. */
+        if (!g_idle) return;
+        if (g_idle() <= 0) return;
     }
 }
 

@@ -17,12 +17,33 @@
 #define ZAN_RT_IO_H
 
 #include <stdint.h>
+#include "rt_co.h"   /* zan_co_step_t (stackless bridge) */
+
+/* Readiness interest flags accepted by zan_io_wait_co(). */
+#define ZAN_IO_READ  1
+#define ZAN_IO_WRITE 2
 
 /* ---- lifecycle ---- */
 void zan_io_init(void);
 void zan_io_shutdown(void);
 
-/* ---- coroutine-facing ABI ---- */
+/* ---- stackless (CPS state-machine) ABI ----
+ *
+ * The compiler's async lowering (see docs/ASYNC_CPS_DESIGN.md) has no fiber to
+ * park: an `await` on IO records its resume point in the heap frame and returns
+ * to the scheduler. So instead of suspending the caller inline, register a
+ * one-shot watcher that, when `fd` becomes ready for `interest`
+ * (ZAN_IO_READ / ZAN_IO_WRITE), calls `zan_co_ready(frame, step)` to re-enter
+ * the state machine. Returns immediately (does not block or suspend). */
+void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step);
+
+/* Idle bridge for the stackless scheduler: if IO watchers are pending, block
+ * until at least one fires (readying its frame via zan_co_ready) and return the
+ * number woken; otherwise return 0. Wire into the co driver with
+ * zan_co_set_idle(zan_io_pump). */
+int zan_io_pump(void);
+
+/* ---- coroutine-facing ABI (stackful rt_sched fibers) ---- */
 
 /* Suspend the current coroutine until `fd` is readable.
  * Returns 0 on success, -1 on error (fd closed, etc.). */
