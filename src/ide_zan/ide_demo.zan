@@ -60,9 +60,19 @@ class IdeDemo {
         SignalInt activeTab = SignalInt.Create(0);
         CodeEditor editor = CodeEditor.Create();
         int lastActive = 0 - 1;
+        // Which .zform tab the designer is currently bound to, and the last
+        // serialized layout (to detect changes and persist them back to disk).
+        string loadedFormPath = "";
+        string formCache = "";
 
         IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab,
                          root + "/src/main.zan", "main.zan");
+        // Start page is a real tab (path sentinel "@start"), shown first like
+        // VS's Start Page. Rendered specially instead of the code editor.
+        tabNames.Insert(0, "Start");
+        tabBodies.Insert(0, "");
+        tabPaths.Insert(0, "@start");
+        activeTab.Set(0);
 
         List<string> log = new List<string>();
         log.Add("> Zan IDE ready. Workspace: " + root);
@@ -78,6 +88,7 @@ class IdeDemo {
         cmds.Add(RibbonCmd.Create("bug", "Debug"));
         cmds.Add(RibbonCmd.Group("copy", "Template"));
         cmds.Add(RibbonCmd.Create("layout", "Designer"));
+        cmds.Add(RibbonCmd.Create("home", "Start"));
 
         // ---- New Project categories (built-in + user "Custom") ----
         List<string> catNames = new List<string>();
@@ -100,11 +111,12 @@ class IdeDemo {
         List<string> fNames = new List<string>();
         List<string> fIcons = new List<string>();
         List<string> fDescs = new List<string>();
-        fNames.Add("Program (Main)"); fIcons.Add("arrow-right"); fDescs.Add("Class with a static Main() entry point.");
-        fNames.Add("Class");          fIcons.Add("grid");        fDescs.Add("An empty class with fields and methods.");
-        fNames.Add("GUI Window");     fIcons.Add("maximize");    fDescs.Add("A Gui window with an event loop.");
-        fNames.Add("Interface");      fIcons.Add("copy");        fDescs.Add("A base class defining a contract.");
-        fNames.Add("Empty File");     fIcons.Add("file");        fDescs.Add("A blank .zan file.");
+        fNames.Add("Program (Main)"); fIcons.Add("arrow-right"); fDescs.Add("Code file: class with a static Main() entry point.");
+        fNames.Add("Class");          fIcons.Add("grid");        fDescs.Add("Code file: an empty class with fields and methods.");
+        fNames.Add("GUI Window");     fIcons.Add("maximize");    fDescs.Add("Code file: a Gui window with an event loop.");
+        fNames.Add("Interface");      fIcons.Add("copy");        fDescs.Add("Code file: a base class defining a contract.");
+        fNames.Add("Empty File");     fIcons.Add("file");        fDescs.Add("Code file: a blank .zan file.");
+        fNames.Add("Form (Designer)"); fIcons.Add("layout");     fDescs.Add("Form: creates Name.zform (visual layout) + Name.zan (code-behind).");
 
         // ---- Dialog state ----
         // The New Project / New File wizards are REAL secondary top-level windows
@@ -157,6 +169,17 @@ class IdeDemo {
         string gotoText = "";
         int findMatch = -1;   // line of current match
 
+        // ---- Publish dialog state ----
+        // pubSel holds a 0/1 flag per platform, parallel to the id list in
+        // PlatformCsv (windows-x64, windows-arm64, linux-x64, linux-arm64,
+        // macos-x64, macos-arm64). Non-Windows targets are locked on Windows.
+        bool pubOpen = false;
+        List<int> pubSel = new List<int>();
+
+        // Pending "go to definition" jump, applied after the target tab loads.
+        int pendingGotoLine = 0 - 1;
+        int pendingGotoCol = 0;
+
         // ---- Debug state ----
         int dbgState = 0;
         int dbgExecLine = -1;
@@ -185,6 +208,16 @@ class IdeDemo {
         SignalInt editorAreaH = SignalInt.Create(430);
         SignalInt treeSel = SignalInt.Create(-1);
         int lastTreeSel = -1;
+
+        // Vertical scroll offsets for the sidebar sections, so long lists stay
+        // inside their region (EXPLORER in pixels, COMPONENTS/EXAMPLES in rows).
+        SignalInt treeScrollY = SignalInt.Create(0);
+
+        // Examples panel is a collapsible tree (categories -> sample leaves).
+        List<TreeNode> exTree = IdeDemo.BuildExampleTree();
+        SignalInt exSel = SignalInt.Create(-1);
+        int lastExSel = -1;
+        SignalInt exTreeScrollY = SignalInt.Create(0);
 
         int lastPresent = 0;
         while (app.isRunning) {
@@ -218,6 +251,16 @@ class IdeDemo {
             } else {
                 app.ApplyEvent(evh);
                 if (dlg != null) { dlg.ApplyEvent(evh); }
+            }
+
+            // The form designer is bound to .zform tabs (C#-style form files):
+            // the active tab's extension decides whether the designer or the code
+            // editor is shown, rather than a global toggle.
+            int actDM = activeTab.Get();
+            if (actDM >= 0 && actDM < tabPaths.Count) {
+                designerMode = IdeDemo.IsFormPath(tabPaths[actDM]);
+            } else {
+                designerMode = false;
             }
 
             // ---- keyboard shortcuts for debug ----
@@ -289,6 +332,34 @@ class IdeDemo {
                     // Escape = close find/replace/goto
                     findMode = 0;
                     app.RequestRedraw();
+                } else if (kc == 27 && pubOpen) {
+                    // Escape = close publish dialog
+                    pubOpen = false;
+                    app.RequestRedraw();
+                } else if (kc == 123 && !designerMode && dbgState == 0) {
+                    // F12 = Go to Definition
+                    int gl12 = IdeDemo.GoToDefinition(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                    if (gl12 >= 0) { pendingGotoLine = gl12; pendingGotoCol = 0; lastActive = 0 - 1; }
+                    app.RequestRedraw();
+                } else if (kc == 118 && !designerMode && dbgState == 0) {
+                    // F7 = View Designer: open the .zform paired with this code-behind.
+                    int actF7 = activeTab.Get();
+                    if (actF7 >= 0 && actF7 < tabPaths.Count) {
+                        string ap7 = tabPaths[actF7];
+                        if (ap7.Length > 4 && ap7.Substring(ap7.Length - 4, 4) == ".zan") {
+                            string cand7 = ap7.Substring(0, ap7.Length - 4) + ".zform";
+                            if (File.Exists(cand7)) {
+                                int ci7 = IdeDemo.FindTabByPath(tabPaths, cand7);
+                                if (ci7 >= 0) { activeTab.Set(ci7); }
+                                else { IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, cand7, Path.GetFileName(cand7)); }
+                                loadedFormPath = "";
+                                lastActive = 0 - 1;
+                            } else {
+                                log.Add("> No paired .zform for " + Path.GetFileName(ap7) + ".");
+                            }
+                        }
+                    }
+                    app.RequestRedraw();
                 }
             }
             // Ctrl+key via WM_CHAR (kind == 6)
@@ -353,7 +424,9 @@ class IdeDemo {
                     IdeDemo.BuildActive(tabPaths, activeTab, root, log);
                 } else if (rc == 6) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                    IdeDemo.PublishActive(tabNames, tabPaths, activeTab, root, log);
+                    pubSel = IdeDemo.ReadProjectPlatforms(root);
+                    pubOpen = true;
+                    app.RequestRedraw();
                 } else if (rc == 7) {
                     // Debug (F5)
                     designerMode = false;
@@ -392,7 +465,47 @@ class IdeDemo {
                     dlg.Show();
                     dlgMode = 3;
                 } else if (rc == 9) {
-                    designerMode = !designerMode;
+                    // Open the form designer (C#-style .zform files). If a code-behind
+                    // is active, open its sibling .zform; otherwise open/create Form1.zform.
+                    int actR = activeTab.Get();
+                    string formP = "";
+                    if (actR >= 0 && actR < tabPaths.Count) {
+                        string ap = tabPaths[actR];
+                        if (IdeDemo.IsFormPath(ap)) {
+                            formP = ap;
+                        } else if (ap.Length > 4 && ap.Substring(ap.Length - 4, 4) == ".zan") {
+                            string cand = ap.Substring(0, ap.Length - 4) + ".zform";
+                            if (File.Exists(cand)) { formP = cand; }
+                        }
+                    }
+                    if (formP == "") {
+                        formP = root + "/src/Form1.zform";
+                        Directory.CreateDirectory(root + "/src");
+                        if (!File.Exists(formP)) {
+                            File.WriteAllText(formP,
+                                "# Zan Form Design File\n# Visual layout for Form1; edit in the IDE form designer.\n# Application logic lives in the code-behind file Form1.zan\nform Form1\n");
+                        }
+                    }
+                    int fti = IdeDemo.FindTabByPath(tabPaths, formP);
+                    if (fti >= 0) {
+                        activeTab.Set(fti);
+                    } else {
+                        IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, formP, Path.GetFileName(formP));
+                    }
+                    loadedFormPath = "";
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
+                } else if (rc == 10) {
+                    // Focus the Start tab, opening one if it was closed.
+                    int si = IdeDemo.FindTabByPath(tabPaths, "@start");
+                    if (si >= 0) {
+                        activeTab.Set(si);
+                    } else {
+                        tabNames.Add("Start"); tabBodies.Add(""); tabPaths.Add("@start");
+                        activeTab.Set(tabNames.Count - 1);
+                    }
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
                 }
 
                 // ---- Debug toolbar (when debugging) ----
@@ -459,30 +572,67 @@ class IdeDemo {
                 Rect tr = cols.first;
                 c.FillRect(tr.x, tr.y, tr.width, tr.height, t.bgTertiary);
                 int sectionH = app.Scale(24);
-                int leftSections = 3;
-                int explorerH = (tr.height * 40) / 100;
-                int compH = (tr.height * 30) / 100;
-                int exampleH = tr.height - explorerH - compH;
+                int explorerH = (tr.height * 55) / 100;
+                int exampleH = tr.height - explorerH;
 
                 // Section 1: Explorer
                 c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, "EXPLORER", t.textTertiary, t.fontSizeSmall);
                 Rect treeArea = Rect.Create(tr.x, tr.y + sectionH, tr.width, explorerH - sectionH);
-                TreeView.Render(app, treeArea, tree, treeSel, 0);
+                // Wheel-scroll the tree when the pointer is over it. Scroll in
+                // whole-row steps so rows always align to the region top (the
+                // renderer only draws rows fully inside the area).
+                int treeRowH = TreeView.RowHeight(app);
+                int treeVis = treeArea.height / treeRowH;
+                if (treeVis < 1) { treeVis = 1; }
+                int treeContentH = TreeView.ContentHeight(app, tree);
+                int treeMaxScroll = treeContentH - treeVis * treeRowH;
+                if (treeMaxScroll < 0) { treeMaxScroll = 0; }
+                int tScroll = treeScrollY.Get();
+                if (app.window.EventKind() == 13
+                    && app.mouseX >= treeArea.x && app.mouseX < treeArea.x + treeArea.width
+                    && app.mouseY >= treeArea.y && app.mouseY < treeArea.y + treeArea.height) {
+                    int td = app.window.EventKeyCode();
+                    int step = td / 120;
+                    if (step == 0) {
+                        if (td > 0) { step = 1; }
+                        else if (td < 0) { step = 0 - 1; }
+                    }
+                    tScroll = tScroll - step * treeRowH;
+                    app.RequestRedraw();
+                }
+                if (tScroll > treeMaxScroll) { tScroll = treeMaxScroll; }
+                if (tScroll < 0) { tScroll = 0; }
+                treeScrollY.Set(tScroll);
+                TreeView.Render(app, treeArea, tree, treeSel, tScroll);
 
-                // Section 2: Components
-                int compY = tr.y + explorerH;
-                c.FillRect(tr.x, compY, tr.width, 1, t.divider);
-                c.DrawText(tr.x + t.paddingMedium, compY + t.paddingSmall, "COMPONENTS", t.textTertiary, t.fontSizeSmall);
-                IdeDemo.RenderComponentList(app, c, t,
-                    tr.x, compY + sectionH, tr.width, compH - sectionH);
-
-                // Section 3: Examples
-                int exY = compY + compH;
+                // Section 2: Examples (collapsible tree, click a leaf to open)
+                int exY = tr.y + explorerH;
                 c.FillRect(tr.x, exY, tr.width, 1, t.divider);
                 c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, "EXAMPLES", t.textTertiary, t.fontSizeSmall);
-                IdeDemo.RenderExampleList(app, c, t,
-                    tr.x, exY + sectionH, tr.width, exampleH - sectionH,
-                    tabNames, tabBodies, tabPaths, activeTab, editor, log);
+                Rect exArea = Rect.Create(tr.x, exY + sectionH, tr.width, exampleH - sectionH);
+                int exRowH = TreeView.RowHeight(app);
+                int exVis = exArea.height / exRowH;
+                if (exVis < 1) { exVis = 1; }
+                int exContentH = TreeView.ContentHeight(app, exTree);
+                int exMaxScroll = exContentH - exVis * exRowH;
+                if (exMaxScroll < 0) { exMaxScroll = 0; }
+                int exSc = exTreeScrollY.Get();
+                if (app.window.EventKind() == 13
+                    && app.mouseX >= exArea.x && app.mouseX < exArea.x + exArea.width
+                    && app.mouseY >= exArea.y && app.mouseY < exArea.y + exArea.height) {
+                    int exd = app.window.EventKeyCode();
+                    int exstep = exd / 120;
+                    if (exstep == 0) {
+                        if (exd > 0) { exstep = 1; }
+                        else if (exd < 0) { exstep = 0 - 1; }
+                    }
+                    exSc = exSc - exstep * exRowH;
+                    app.RequestRedraw();
+                }
+                if (exSc > exMaxScroll) { exSc = exMaxScroll; }
+                if (exSc < 0) { exSc = 0; }
+                exTreeScrollY.Set(exSc);
+                TreeView.Render(app, exArea, exTree, exSel, exSc);
 
                 int sel = treeSel.Get();
                 if (sel != lastTreeSel) {
@@ -492,6 +642,26 @@ class IdeDemo {
                         if (!node.isDir) {
                             IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
                             log.Add("> Opened " + node.path + ".");
+                        }
+                    }
+                }
+
+                // Open an example when its tree leaf is clicked.
+                int exSelV = exSel.Get();
+                if (exSelV != lastExSel) {
+                    lastExSel = exSelV;
+                    if (exSelV >= 0 && exSelV < exTree.Count) {
+                        TreeNode en = exTree[exSelV];
+                        if (!en.isDir && en.path.Length > 4) {
+                            int eidx = IdeDemo.ParseInt(en.path.Substring(4, en.path.Length - 4));
+                            string eCode = IdeDemo.GetExampleCode(eidx);
+                            string eName = IdeDemo.GetExampleName(eidx);
+                            if (eCode.Length > 0) {
+                                IdeDemo.OpenNewTab(tabNames, tabBodies, tabPaths, activeTab, eName, eCode);
+                                lastActive = 0 - 1;
+                                log.Add("> Opened example: " + eName);
+                                app.RequestRedraw();
+                            }
                         }
                     }
                 }
@@ -524,24 +694,128 @@ class IdeDemo {
 
                 int act = activeTab.Get();
                 if (act != lastActive) {
-                    if (lastActive >= 0 && lastActive < tabBodies.Count) {
+                    // Only sync editor text for code tabs; .zform tabs are owned by
+                    // the designer and must not be overwritten with editor contents.
+                    if (lastActive >= 0 && lastActive < tabBodies.Count
+                        && !IdeDemo.IsFormPath(tabPaths[lastActive])) {
                         tabBodies[lastActive] = editor.GetText();
                     }
-                    if (act >= 0 && act < tabBodies.Count) {
+                    if (act >= 0 && act < tabBodies.Count
+                        && !IdeDemo.IsFormPath(tabPaths[act])) {
                         editor.LoadText(tabBodies[act]);
+                        // Feed the other open source files to the editor so it can
+                        // resolve cross-file types (e.g. a `Utils` class defined
+                        // in another tab) for accurate completion.
+                        List<string> projFiles = new List<string>();
+                        int pf = 0;
+                        while (pf < tabBodies.Count) {
+                            if (pf != act && pf < tabPaths.Count
+                                && !IdeDemo.IsFormPath(tabPaths[pf])
+                                && tabPaths[pf] != "@start") {
+                                projFiles.Add(tabBodies[pf]);
+                            }
+                            pf = pf + 1;
+                        }
+                        editor.SetProjectFiles(projFiles);
                     }
                     lastActive = act;
                 }
 
+                if (pendingGotoLine >= 0) {
+                    editor.GoToLineCol(pendingGotoLine, pendingGotoCol);
+                    pendingGotoLine = 0 - 1;
+                    app.RequestRedraw();
+                }
+
                 Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
+                bool activeIsStart = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@start");
                 if (designerMode) {
-                    IdeDemo.RenderDesigner(app, c, t, edRect, dNames, dX, dY, dW, dH, dTypes,
+                    // Bind the designer to the active .zform tab. On first display of
+                    // a form (path change) load its controls from the tab body.
+                    string fpath = tabPaths[act];
+                    string fname = IdeDemo.FormBaseName(fpath);
+                    if (fpath != loadedFormPath) {
+                        IdeDemo.ParseForm(tabBodies[act], dNames, dTypes, dX, dY, dW, dH);
+                        dSel.Set(0 - 1);
+                        loadedFormPath = fpath;
+                        formCache = tabBodies[act];
+                    }
+                    int dact = IdeDemo.RenderDesigner(app, c, t, edRect, dNames, dX, dY, dW, dH, dTypes,
                         dSel, dDragMode, dDragOffX, dDragOffY, dResizeH);
+                    // Persist any layout change back to the tab body and the .zform file.
+                    string newser = IdeDemo.SerializeForm(fname, dNames, dTypes, dX, dY, dW, dH);
+                    if (newser != formCache) {
+                        tabBodies[act] = newser;
+                        if (fpath.Length > 0 && fpath.Substring(0, 1) != "@") {
+                            File.WriteAllText(fpath, newser);
+                        }
+                        formCache = newser;
+                    }
+                    if (dact == 1) {
+                        // "View Code": open the code-behind, generating/refreshing its
+                        // designer region from the current layout.
+                        string cbp = IdeDemo.CodeBehindPath(fpath);
+                        string cbtext = "";
+                        if (File.Exists(cbp)) {
+                            cbtext = IdeDemo.RegenerateCodeBehind(File.ReadAllText(cbp), fname,
+                                dNames, dTypes, dX, dY, dW, dH);
+                        } else {
+                            cbtext = IdeDemo.BuildCodeBehind(fname, dNames, dTypes, dX, dY, dW, dH);
+                        }
+                        File.WriteAllText(cbp, cbtext);
+                        int cbi = IdeDemo.FindTabByPath(tabPaths, cbp);
+                        if (cbi >= 0) {
+                            tabBodies[cbi] = cbtext;
+                            activeTab.Set(cbi);
+                        } else {
+                            IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, cbp, Path.GetFileName(cbp));
+                        }
+                        lastActive = 0 - 1;
+                        log.Add("> Code-behind -> " + cbp + " (design region regenerated).");
+                        app.RequestRedraw();
+                    }
+                } else if (activeIsStart) {
+                    List<string> spFiles = IdeDemo.ListZanFiles(root + "/src");
+                    int sact = IdeDemo.RenderStartPage(app, c, t, edRect, spFiles);
+                    if (sact == 1) {
+                        tpls = IdeDemo.BuildCatalog(root);
+                        tCats = new List<string>();
+                        tNames = new List<string>();
+                        tIcons = new List<string>();
+                        tDescs = new List<string>();
+                        IdeDemo.SplitTemplates(tpls, tCats, tNames, tIcons, tDescs);
+                        catSel.Set(0);
+                        pSel.Set(0);
+                        pNameInput.SetText("NewProject");
+                        pLocInput.SetText(Path.GetDirectoryName(root));
+                        dlg = App.CreateDark("New Project", 900, 640);
+                        dlg.Show();
+                        dlgMode = 1;
+                        app.RequestRedraw();
+                    } else if (sact == 2) {
+                        dlg = IdeDemo.OpenWizard("New File", fSel, fNameInput, "NewFile");
+                        dlgMode = 2;
+                        app.RequestRedraw();
+                    } else if (sact >= 100) {
+                        int fidx = sact - 100;
+                        if (fidx >= 0 && fidx < spFiles.Count) {
+                            IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab,
+                                spFiles[fidx], Path.GetFileName(spFiles[fidx]));
+                            lastActive = 0 - 1;
+                            app.RequestRedraw();
+                        }
+                    }
                 } else {
                     // Sync debug vars into editor for hover tooltips
                     if (dbgState == 2) { editor.SetDebugVars(dbgVarInfo); }
                     else { editor.SetDebugVars(new List<string>()); }
                     editor.Render(app, edRect);
+                    // Ctrl+click in the editor requests Go to Definition.
+                    if (editor.ConsumeGotoRequest()) {
+                        int glc = IdeDemo.GoToDefinition(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        if (glc >= 0) { pendingGotoLine = glc; pendingGotoCol = 0; lastActive = 0 - 1; }
+                        app.RequestRedraw();
+                    }
                     // Draw inline debug annotations
                     if (dbgState == 2 && dbgExecLine >= 0) {
                         IdeDemo.RenderInlineVars(app, c, t, edRect, dbgVarInfo, dbgExecLine);
@@ -549,7 +823,7 @@ class IdeDemo {
                 }
 
                 // ---- Find / Replace / GoToLine overlay ----
-                if (findMode > 0 && !designerMode) {
+                if (findMode > 0 && !designerMode && !activeIsStart) {
                     int fpH = app.Scale(36);
                     if (findMode == 2) { fpH = app.Scale(68); }
                     int fpW = app.Scale(360);
@@ -682,6 +956,37 @@ class IdeDemo {
                 c.DrawText(W - app.Scale(100), sbY + app.Scale(3), modeInfo, 0xFFFFFFFF, t.fontSizeSmall);
                 c.DrawText(W / 2 - app.Scale(40), sbY + app.Scale(3), "UTF-8", 0xFFFFFFFF, t.fontSizeSmall);
 
+                // Top-level editor context menu overlay (drawn last so nothing
+                // paints over it), then bridge its host commands.
+                if (!designerMode && !activeIsStart) {
+                    editor.RenderCtxMenu(app);
+                    string ecmd = editor.TakeCommand();
+                    if (ecmd == "find") { findMode = 1; app.RequestRedraw(); }
+                    else if (ecmd == "gotoline") { findMode = 3; gotoText = ""; app.RequestRedraw(); }
+                    else if (ecmd == "gotodef") {
+                        int gl = IdeDemo.GoToDefinition(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        if (gl >= 0) { pendingGotoLine = gl; pendingGotoCol = 0; lastActive = 0 - 1; }
+                        app.RequestRedraw();
+                    } else if (ecmd == "findrefs") {
+                        IdeDemo.FindReferences(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        app.RequestRedraw();
+                    }
+                }
+                // Publish dialog overlay (modal, topmost).
+                if (pubOpen) {
+                    string pubName = "project";
+                    int at = activeTab.Get();
+                    if (at >= 0 && at < tabNames.Count) { pubName = tabNames[at]; }
+                    int pAct = IdeDemo.RenderPublishDialog(app, pubName, pubSel);
+                    if (pAct == 1) {
+                        IdeDemo.PublishPlatforms(tabNames, tabPaths, activeTab, root, pubSel, log);
+                        pubOpen = false;
+                        app.RequestRedraw();
+                    } else if (pAct == 2) {
+                        pubOpen = false;
+                        app.RequestRedraw();
+                    }
+                }
                 app.RenderChrome("Zan IDE  —  " + root);
                 app.PresentFrame();
                 lastPresent = Window.GetTickMs();
@@ -995,9 +1300,28 @@ class IdeDemo {
         return dir;
     }
 
-    /// Creates a single file from the chosen file template; returns its path.
+    /// Creates a file from the chosen file template; returns the path to open.
+    /// For a Form (kind 5) this follows the C#-style rule and creates BOTH the
+    /// visual layout file (Name.zform) and its code-behind (Name.zan), returning
+    /// the .zform so it opens in the designer.
     static string CreateFile(int kind, string root, string name, List<string> log) {
         Directory.CreateDirectory(root + "/src");
+        if (kind == 5) {
+            string formPath = root + "/src/" + name + ".zform";
+            string cbPath = root + "/src/" + name + ".zan";
+            List<string> dNames = new List<string>();
+            List<string> dTypes = new List<string>();
+            List<int> dX = new List<int>();
+            List<int> dY = new List<int>();
+            List<int> dW = new List<int>();
+            List<int> dH = new List<int>();
+            File.WriteAllText(formPath, IdeDemo.SerializeForm(name, dNames, dTypes, dX, dY, dW, dH));
+            if (!File.Exists(cbPath)) {
+                File.WriteAllText(cbPath, IdeDemo.BuildCodeBehind(name, dNames, dTypes, dX, dY, dW, dH));
+            }
+            log.Add("> Created form " + formPath + " + code-behind " + cbPath + ".");
+            return formPath;
+        }
         string path = root + "/src/" + name + ".zan";
         File.WriteAllText(path, IdeDemo.FileTemplateBody(kind, name));
         log.Add("> Created file " + path + ".");
@@ -1179,12 +1503,645 @@ class IdeDemo {
         log.Add("> Published " + exe);
     }
 
+    /// Naive substring search (the stdlib string type here exposes only
+    /// Substring/Length), used to detect platform ids inside zan.proj.
+    static bool Has(string hay, string needle) {
+        int n = needle.Length;
+        int h = hay.Length;
+        if (n == 0) { return true; }
+        int i = 0;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Reads the active project's target platforms from zan.proj into 6 flags
+    /// parallel to PlatformCsv's id list. Non-Windows targets are force-cleared
+    /// because this Windows host cannot produce them without a cross toolchain.
+    static List<int> ReadProjectPlatforms(string root) {
+        List<int> flags = new List<int>();
+        int z = 0;
+        while (z < 6) { flags.Add(0); z = z + 1; }
+        string content = "";
+        string pj = root + "/zan.proj";
+        if (File.Exists(pj)) { content = File.ReadAllText(pj); }
+        List<string> ids = new List<string>();
+        ids.Add("windows-x64"); ids.Add("windows-arm64");
+        ids.Add("linux-x64"); ids.Add("linux-arm64");
+        ids.Add("macos-x64"); ids.Add("macos-arm64");
+        int k = 0;
+        while (k < ids.Count) {
+            if (IdeDemo.Has(content, ids[k])) { flags[k] = 1; }
+            k = k + 1;
+        }
+        flags[2] = 0; flags[3] = 0; flags[4] = 0; flags[5] = 0;
+        if (flags[0] == 0 && flags[1] == 0) { flags[0] = 1; }
+        return flags;
+    }
+
+    /// Publishes the active file for each selected Windows target into
+    /// <root>/publish. Non-Windows targets are locked and only logged.
+    static void PublishPlatforms(List<string> names, List<string> paths, SignalInt active, string root, List<int> sel, List<string> log) {
+        int a = active.Get();
+        if (a < 0 || a >= paths.Count) { log.Add("> Nothing to publish."); return; }
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
+        Directory.CreateDirectory(root + "/publish");
+        string zc = "\"" + IdeDemo.Zanc() + "\"";
+        string baseName = names[a];
+        if (baseName.Length > 4 && baseName.Substring(baseName.Length - 4, 4) == ".zan") {
+            baseName = baseName.Substring(0, baseName.Length - 4);
+        }
+        int published = 0;
+        if (sel.Count > 0 && sel[0] == 1) {
+            string exe = root + "/publish/" + baseName + "-windows-x64.exe";
+            string ll = root + "/.zanpub_x64.ll";
+            string cmd = zc + " --emit-ir \"" + p + "\" > \"" + ll + "\""
+                + " && clang \"" + ll + "\" -o \"" + exe + "\"";
+            log.Add("> Publishing windows-x64 ...");
+            List<string> outp = Process.RunCapture(cmd);
+            IdeDemo.AppendAll(log, outp);
+            log.Add("> Published " + exe);
+            published = published + 1;
+        }
+        if (sel.Count > 1 && sel[1] == 1) {
+            string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
+            string ll = root + "/.zanpub_arm64.ll";
+            string cmd = zc + " --emit-ir \"" + p + "\" > \"" + ll + "\""
+                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"";
+            log.Add("> Publishing windows-arm64 (requires ARM64 toolchain) ...");
+            List<string> outp = Process.RunCapture(cmd);
+            IdeDemo.AppendAll(log, outp);
+            log.Add("> Published " + exe);
+            published = published + 1;
+        }
+        bool anyLocked = false;
+        if (sel.Count > 2 && sel[2] == 1) { anyLocked = true; }
+        if (sel.Count > 3 && sel[3] == 1) { anyLocked = true; }
+        if (sel.Count > 4 && sel[4] == 1) { anyLocked = true; }
+        if (sel.Count > 5 && sel[5] == 1) { anyLocked = true; }
+        if (anyLocked) {
+            log.Add("> Skipped Linux/macOS targets: cross-compiling from Windows needs their toolchains (locked).");
+        }
+        if (published == 0) {
+            log.Add("> No Windows target selected; nothing published.");
+        }
+    }
+
+    /// Renders the modal Publish dialog. Returns 0 (none), 1 (publish), 2 (cancel).
+    /// Windows targets are toggleable; non-Windows rows are drawn locked.
+    static int RenderPublishDialog(App app, string projName, List<int> sel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        c.FillRect(0, 0, W, H, t.overlay);
+
+        int w = app.Scale(470);
+        int h = app.Scale(380);
+        int x = (W - w) / 2;
+        int y = (H - h) / 2;
+        c.FillRoundRect(x + 2, y + 3, w, h, app.Scale(6), t.shadowColor);
+        c.FillRoundRect(x, y, w, h, app.Scale(6), 0xFF252526);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+
+        int pad = app.Scale(18);
+        c.DrawText(x + pad, y + pad, "Publish Project", 0xFFFFFFFF, t.fontSizeLarge);
+        c.DrawText(x + pad, y + pad + app.Scale(24), "Target file: " + projName, 0xFF888888, t.fontSizeSmall);
+        c.FillRect(x + 1, y + app.Scale(60), w - 2, 1, t.divider);
+        c.DrawText(x + pad, y + app.Scale(72), "Platforms", 0xFFCCCCCC, t.fontSizeSmall);
+
+        List<string> disp = new List<string>();
+        disp.Add("Windows   x64"); disp.Add("Windows   ARM64");
+        disp.Add("Linux   x64"); disp.Add("Linux   ARM64");
+        disp.Add("macOS   x64"); disp.Add("macOS   ARM64");
+
+        int rowH = app.Scale(30);
+        int listX = x + pad;
+        int listY = y + app.Scale(94);
+        int boxSize = app.Scale(18);
+        int clicked = 0 - 1;
+
+        int i = 0;
+        while (i < 6) {
+            int ry = listY + i * rowH;
+            bool isWin = i < 2;
+            bool on = false;
+            if (i < sel.Count && sel[i] == 1) { on = true; }
+            int boxX = listX;
+            int boxY = ry + (rowH - boxSize) / 2;
+            int boxCol = 0xFF1E1E1E;
+            int borderCol = 0xFF3E3E42;
+            int labelCol = 0xFFCCCCCC;
+            if (!isWin) { labelCol = 0xFF6A6A6A; borderCol = 0xFF333333; }
+            if (isWin && on) { boxCol = 0xFF0E639C; }
+            c.FillRoundRect(boxX, boxY, boxSize, boxSize, app.Scale(3), boxCol);
+            c.DrawRect(boxX, boxY, boxSize, boxSize, borderCol, 1);
+            if (isWin && on) {
+                Icon.Draw(c, "check", boxX + app.Scale(3), boxY + app.Scale(3), boxSize - app.Scale(6), 0xFFFFFFFF);
+            }
+            int lblY = ry + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.DrawText(boxX + boxSize + app.Scale(10), lblY, disp[i], labelCol, t.fontSizeMedium);
+            if (!isWin) {
+                c.DrawText(x + w - pad - app.Scale(118), lblY, "locked on Windows", 0xFF6A6A6A, t.fontSizeSmall);
+            }
+            if (isWin && app.window.EventKind() == 3
+                && app.mouseX >= boxX && app.mouseX < x + w - pad
+                && app.mouseY >= ry && app.mouseY < ry + rowH) {
+                clicked = i;
+            }
+            i = i + 1;
+        }
+
+        if (clicked >= 0 && clicked < sel.Count) {
+            if (sel[clicked] == 1) { sel[clicked] = 0; } else { sel[clicked] = 1; }
+            app.RequestRedraw();
+        }
+
+        c.DrawText(x + pad, listY + 6 * rowH + app.Scale(8),
+            "Non-Windows targets need a cross toolchain — unavailable on this host.",
+            0xFF888888, t.fontSizeSmall);
+
+        int btnH = app.Scale(30);
+        int btnY = y + h - btnH - app.Scale(16);
+        int pubW = app.Scale(100);
+        int canW = app.Scale(86);
+        int pubX = x + w - pad - pubW;
+        int canX = pubX - app.Scale(10) - canW;
+        c.FillRoundRect(canX, btnY, canW, btnH, app.Scale(4), 0xFF3E3E42);
+        c.DrawText(canX + app.Scale(24), btnY + app.Scale(8), "Cancel", 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRoundRect(pubX, btnY, pubW, btnH, app.Scale(4), 0xFF0E639C);
+        c.DrawText(pubX + app.Scale(28), btnY + app.Scale(8), "Publish", 0xFFFFFFFF, t.fontSizeSmall);
+
+        int action = 0;
+        if (app.window.EventKind() == 3) {
+            if (app.mouseX >= pubX && app.mouseX < pubX + pubW
+                && app.mouseY >= btnY && app.mouseY < btnY + btnH) {
+                action = 1;
+            } else if (app.mouseX >= canX && app.mouseX < canX + canW
+                       && app.mouseY >= btnY && app.mouseY < btnY + btnH) {
+                action = 2;
+            }
+        }
+        return action;
+    }
+
+    // ---- code navigation (go to definition / find references) ----
+
+    static string RTrimS(string s) {
+        int e = s.Length;
+        while (e > 0) {
+            string ch = s.Substring(e - 1, 1);
+            if (ch == " " || ch == "\t") { e = e - 1; } else { break; }
+        }
+        return s.Substring(0, e);
+    }
+
+    /// True if `after` begins with `word` followed by a non-identifier char.
+    static bool StartsWithWord(string after, string word) {
+        int wl = word.Length;
+        if (after.Length < wl) { return false; }
+        if (after.Substring(0, wl) != word) { return false; }
+        if (after.Length == wl) { return true; }
+        return !CodeEditor.IsIdentChar(after.Substring(wl, 1));
+    }
+
+    /// True if the line declares a type named `word` (class/struct/enum/interface).
+    static bool IsTypeDecl(string line, string word) {
+        string s = CodeEditor.LTrim(line);
+        List<string> kws = new List<string>();
+        kws.Add("class "); kws.Add("struct "); kws.Add("enum "); kws.Add("interface ");
+        int i = 0;
+        while (i < kws.Count) {
+            string kw = kws[i];
+            if (s.Length >= kw.Length && s.Substring(0, kw.Length) == kw) {
+                string after = s.Substring(kw.Length, s.Length - kw.Length);
+                if (IdeDemo.StartsWithWord(CodeEditor.LTrim(after), word)) { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Index of a whole-word `word(` occurrence in s, or -1.
+    static int FindWordCall(string s, string word) {
+        int wl = word.Length;
+        if (wl == 0) { return 0 - 1; }
+        int i = 0;
+        while (i + wl < s.Length) {
+            if (s.Substring(i, wl) == word && s.Substring(i + wl, 1) == "(") {
+                bool leftOk = true;
+                if (i > 0) { leftOk = !CodeEditor.IsIdentChar(s.Substring(i - 1, 1)); }
+                if (leftOk) { return i; }
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Heuristic: the line is a method/function definition header for `word`
+    /// (a return-type token precedes `word(` and the line opens a block / ends
+    /// the signature), as opposed to a call site.
+    static bool IsMethodDef(string line, string word) {
+        string s = CodeEditor.LTrim(line);
+        if (IdeDemo.StartsWithWord(s, "if") || IdeDemo.StartsWithWord(s, "while")
+            || IdeDemo.StartsWithWord(s, "for") || IdeDemo.StartsWithWord(s, "foreach")
+            || IdeDemo.StartsWithWord(s, "switch") || IdeDemo.StartsWithWord(s, "return")
+            || IdeDemo.StartsWithWord(s, "else")) { return false; }
+        int pos = IdeDemo.FindWordCall(s, word);
+        if (pos <= 0) { return false; }
+        if (s.Substring(pos - 1, 1) != " ") { return false; }
+        string rt = IdeDemo.RTrimS(s);
+        if (rt.Length == 0) { return false; }
+        string last = rt.Substring(rt.Length - 1, 1);
+        return last == "{" || last == ")";
+    }
+
+    /// First line index declaring `word` in `body` (type decls first, then
+    /// method definitions), or -1 when not found.
+    static int FindDeclLine(string body, string word) {
+        List<string> ls = CodeEditor.SplitLines(body);
+        int i = 0;
+        while (i < ls.Count) {
+            if (IdeDemo.IsTypeDecl(ls[i], word)) { return i; }
+            i = i + 1;
+        }
+        int k = 0;
+        while (k < ls.Count) {
+            if (IdeDemo.IsMethodDef(ls[k], word)) { return k; }
+            k = k + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Recursively collects every .zan file path under `dir`.
+    static List<string> ListZanFiles(string dir) {
+        List<string> outp = new List<string>();
+        IdeDemo.CollectZan(dir, outp);
+        return outp;
+    }
+
+    static void CollectZan(string dir, List<string> outp) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> files = Directory.GetFiles(dir);
+        int i = 0;
+        while (i < files.Count) {
+            string nm = files[i];
+            if (nm.Length > 4 && nm.Substring(nm.Length - 4, 4) == ".zan") {
+                outp.Add(dir + "/" + nm);
+            } else if (nm.Length > 6 && nm.Substring(nm.Length - 6, 6) == ".zform") {
+                outp.Add(dir + "/" + nm);
+            }
+            i = i + 1;
+        }
+        List<string> subs = Directory.GetDirectories(dir);
+        int j = 0;
+        while (j < subs.Count) {
+            IdeDemo.CollectZan(dir + "/" + subs[j], outp);
+            j = j + 1;
+        }
+    }
+
+    /// Finds the definition of the symbol under the caret across the current
+    /// file, other open tabs, then the project's src tree. Switches/opens the
+    /// target tab and returns the destination line (-1 when not found).
+    static int GoToDefinition(CodeEditor editor, List<string> tabNames, List<string> tabBodies,
+                              List<string> tabPaths, SignalInt active, string root, List<string> log) {
+        string word = editor.WordAtCaret();
+        if (word == "") { log.Add("> Go to Definition: no symbol under caret."); return 0 - 1; }
+        int a = active.Get();
+        if (a >= 0 && a < tabBodies.Count) { tabBodies[a] = editor.GetText(); }
+        if (a >= 0 && a < tabBodies.Count) {
+            int ln = IdeDemo.FindDeclLine(tabBodies[a], word);
+            if (ln >= 0) {
+                log.Add("> Definition of '" + word + "' at line " + Convert.ToString(ln + 1) + " (this file).");
+                return ln;
+            }
+        }
+        int i = 0;
+        while (i < tabBodies.Count) {
+            if (i != a) {
+                int ln = IdeDemo.FindDeclLine(tabBodies[i], word);
+                if (ln >= 0) {
+                    active.Set(i);
+                    log.Add("> Definition of '" + word + "' in " + tabNames[i]
+                        + " at line " + Convert.ToString(ln + 1) + ".");
+                    return ln;
+                }
+            }
+            i = i + 1;
+        }
+        List<string> files = IdeDemo.ListZanFiles(root + "/src");
+        int fi = 0;
+        while (fi < files.Count) {
+            string fp = files[fi];
+            if (tabPaths.IndexOf(fp) < 0) {
+                string body = File.ReadAllText(fp);
+                int ln = IdeDemo.FindDeclLine(body, word);
+                if (ln >= 0) {
+                    IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, active, fp, Path.GetFileName(fp));
+                    log.Add("> Definition of '" + word + "' in " + Path.GetFileName(fp)
+                        + " at line " + Convert.ToString(ln + 1) + ".");
+                    return ln;
+                }
+            }
+            fi = fi + 1;
+        }
+        log.Add("> Go to Definition: '" + word + "' not found in project.");
+        return 0 - 1;
+    }
+
+    /// Counts whole-word occurrences of `word` in `line`.
+    static int CountWord(string line, string word) {
+        int wl = word.Length;
+        if (wl == 0) { return 0; }
+        int count = 0;
+        int i = 0;
+        while (i + wl <= line.Length) {
+            if (line.Substring(i, wl) == word) {
+                bool leftOk = true;
+                bool rightOk = true;
+                if (i > 0) { leftOk = !CodeEditor.IsIdentChar(line.Substring(i - 1, 1)); }
+                if (i + wl < line.Length) { rightOk = !CodeEditor.IsIdentChar(line.Substring(i + wl, 1)); }
+                if (leftOk && rightOk) { count = count + 1; i = i + wl; }
+                else { i = i + 1; }
+            } else { i = i + 1; }
+        }
+        return count;
+    }
+
+    static int CountRefsInFile(string name, string body, string word, List<string> log) {
+        List<string> ls = CodeEditor.SplitLines(body);
+        int count = 0;
+        int i = 0;
+        while (i < ls.Count) {
+            int occ = IdeDemo.CountWord(ls[i], word);
+            if (occ > 0) {
+                count = count + occ;
+                log.Add("   " + name + ":" + Convert.ToString(i + 1) + ": " + CodeEditor.LTrim(ls[i]));
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    /// Lists every whole-word reference to the symbol under the caret across
+    /// open tabs and the project's src tree, into the output log.
+    static void FindReferences(CodeEditor editor, List<string> tabNames, List<string> tabBodies,
+                               List<string> tabPaths, SignalInt active, string root, List<string> log) {
+        string word = editor.WordAtCaret();
+        if (word == "") { log.Add("> Find All References: no symbol under caret."); return; }
+        int a = active.Get();
+        if (a >= 0 && a < tabBodies.Count) { tabBodies[a] = editor.GetText(); }
+        log.Add("> References to '" + word + "':");
+        int total = 0;
+        int i = 0;
+        while (i < tabBodies.Count) {
+            total = total + IdeDemo.CountRefsInFile(tabNames[i], tabBodies[i], word, log);
+            i = i + 1;
+        }
+        List<string> files = IdeDemo.ListZanFiles(root + "/src");
+        int fi = 0;
+        while (fi < files.Count) {
+            string fp = files[fi];
+            if (tabPaths.IndexOf(fp) < 0) {
+                string body = File.ReadAllText(fp);
+                total = total + IdeDemo.CountRefsInFile(Path.GetFileName(fp), body, word, log);
+            }
+            fi = fi + 1;
+        }
+        log.Add("> " + Convert.ToString(total) + " reference(s) found.");
+    }
+
+    // ---- designer <-> code (form serialization) ----
+
+    /// Splits a string on runs of spaces/tabs into tokens.
+    static List<string> SplitSpaces(string s) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") {
+                if (cur.Length > 0) { outp.Add(cur); cur = ""; }
+            } else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { outp.Add(cur); }
+        return outp;
+    }
+
+    /// Serializes the designer's controls into a compilable Zan source file.
+    /// The `// @control` markers are the canonical design model that
+    /// LoadFormFromCode reads back, so the designer and this file round-trip.
+    static string GenerateFormCode(string formName, List<string> dNames, List<string> dTypes,
+                                   List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+        string s = "";
+        s = s + "using System;\n";
+        s = s + "using Gui;\n\n";
+        s = s + "// Auto-generated by the Zan IDE form designer.\n";
+        s = s + "// The '@control <Type> <Name> <X> <Y> <W> <H>' markers below are the\n";
+        s = s + "// serialized design model; the designer reads them back via Load Design.\n\n";
+        s = s + "class " + formName + " {\n";
+        s = s + "    // Design surface: " + Convert.ToString(dNames.Count) + " control(s).\n";
+        s = s + "    static void InitializeComponent(App app) {\n";
+        int i = 0;
+        while (i < dNames.Count) {
+            s = s + "        // @control " + dTypes[i] + " " + dNames[i] + " "
+                  + Convert.ToString(dX[i]) + " " + Convert.ToString(dY[i]) + " "
+                  + Convert.ToString(dW[i]) + " " + Convert.ToString(dH[i]) + "\n";
+            i = i + 1;
+        }
+        s = s + "    }\n";
+        s = s + "}\n";
+        return s;
+    }
+
+    /// Rebuilds the designer's control lists from GenerateFormCode markers.
+    static void LoadFormFromCode(string src, List<string> dNames, List<string> dTypes,
+                                 List<int> dX, List<int> dY, List<int> dW, List<int> dH,
+                                 List<string> log) {
+        while (dNames.Count > 0) {
+            int last = dNames.Count - 1;
+            dNames.RemoveAt(last); dTypes.RemoveAt(last);
+            dX.RemoveAt(last); dY.RemoveAt(last);
+            dW.RemoveAt(last); dH.RemoveAt(last);
+        }
+        List<string> ls = CodeEditor.SplitLines(src);
+        string marker = "// @control ";
+        int n = 0;
+        int i = 0;
+        while (i < ls.Count) {
+            string s = CodeEditor.LTrim(ls[i]);
+            if (s.Length > marker.Length && s.Substring(0, marker.Length) == marker) {
+                string rest = s.Substring(marker.Length, s.Length - marker.Length);
+                List<string> toks = IdeDemo.SplitSpaces(rest);
+                if (toks.Count >= 6) {
+                    dTypes.Add(toks[0]);
+                    dNames.Add(toks[1]);
+                    dX.Add(IdeDemo.ParseInt(toks[2]));
+                    dY.Add(IdeDemo.ParseInt(toks[3]));
+                    dW.Add(IdeDemo.ParseInt(toks[4]));
+                    dH.Add(IdeDemo.ParseInt(toks[5]));
+                    n = n + 1;
+                }
+            }
+            i = i + 1;
+        }
+        log.Add("> Loaded " + Convert.ToString(n) + " control(s) from Form1.designer.zan into the designer.");
+    }
+
     static void AppendAll(List<string> log, List<string> lines) {
         int i = 0;
         while (i < lines.Count) {
             log.Add("  " + lines[i]);
             i = i + 1;
         }
+    }
+
+    // ==== C#-style form file model (.zform design file + .zan code-behind) ====
+
+    /// True when the path names a visual form design file (opened in the designer).
+    static bool IsFormPath(string p) {
+        int n = p.Length;
+        if (n < 6) { return false; }
+        return p.Substring(n - 6, 6) == ".zform";
+    }
+
+    /// Base name of a .zform (the form/class name), e.g. src/Login.zform -> Login.
+    static string FormBaseName(string p) {
+        string fn = Path.GetFileName(p);
+        int n = fn.Length;
+        if (n >= 6 && fn.Substring(n - 6, 6) == ".zform") { return fn.Substring(0, n - 6); }
+        return fn;
+    }
+
+    /// Code-behind path for a .zform, e.g. src/Login.zform -> src/Login.zan.
+    static string CodeBehindPath(string formPath) {
+        int n = formPath.Length;
+        if (n >= 6 && formPath.Substring(n - 6, 6) == ".zform") {
+            return formPath.Substring(0, n - 6) + ".zan";
+        }
+        return formPath + ".zan";
+    }
+
+    /// Serializes the designer controls into .zform text (layout only, no logic).
+    static string SerializeForm(string name, List<string> dNames, List<string> dTypes,
+                                List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+        string s = "# Zan Form Design File\n";
+        s = s + "# Visual layout for " + name + "; edit in the IDE form designer.\n";
+        s = s + "# Application logic lives in the code-behind file " + name + ".zan\n";
+        s = s + "form " + name + "\n";
+        int i = 0;
+        while (i < dNames.Count) {
+            s = s + "control " + dTypes[i] + " " + dNames[i] + " "
+                  + Convert.ToString(dX[i]) + " " + Convert.ToString(dY[i]) + " "
+                  + Convert.ToString(dW[i]) + " " + Convert.ToString(dH[i]) + "\n";
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// Parses .zform text back into the designer control lists.
+    static void ParseForm(string text, List<string> dNames, List<string> dTypes,
+                          List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+        while (dNames.Count > 0) {
+            int last = dNames.Count - 1;
+            dNames.RemoveAt(last); dTypes.RemoveAt(last);
+            dX.RemoveAt(last); dY.RemoveAt(last);
+            dW.RemoveAt(last); dH.RemoveAt(last);
+        }
+        List<string> ls = CodeEditor.SplitLines(text);
+        int i = 0;
+        while (i < ls.Count) {
+            string s = CodeEditor.LTrim(ls[i]);
+            if (s.Length > 8 && s.Substring(0, 8) == "control ") {
+                List<string> toks = IdeDemo.SplitSpaces(s.Substring(8, s.Length - 8));
+                if (toks.Count >= 6) {
+                    dTypes.Add(toks[0]);
+                    dNames.Add(toks[1]);
+                    dX.Add(IdeDemo.ParseInt(toks[2]));
+                    dY.Add(IdeDemo.ParseInt(toks[3]));
+                    dW.Add(IdeDemo.ParseInt(toks[4]));
+                    dH.Add(IdeDemo.ParseInt(toks[5]));
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The generated designer region (InitializeComponent), delimited by markers so
+    /// it can be regenerated in place while preserving the user's own code around it.
+    static string BuildDesignerRegion(string name, List<string> dNames, List<string> dTypes,
+                                      List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+        string s = "    // <<< ZAN-DESIGNER BEGIN (generated from " + name + ".zform - do not edit) >>>\n";
+        s = s + "    // Fields for each designed control.\n";
+        int i = 0;
+        while (i < dNames.Count) {
+            s = s + "    " + dTypes[i] + " " + dNames[i] + ";\n";
+            i = i + 1;
+        }
+        s = s + "    void InitializeComponent(App app) {\n";
+        i = 0;
+        while (i < dNames.Count) {
+            s = s + "        // " + dTypes[i] + " " + dNames[i] + " @ ("
+                  + Convert.ToString(dX[i]) + "," + Convert.ToString(dY[i]) + ") "
+                  + Convert.ToString(dW[i]) + "x" + Convert.ToString(dH[i]) + "\n";
+            i = i + 1;
+        }
+        if (dNames.Count == 0) {
+            s = s + "        // (no controls yet - add some in the form designer)\n";
+        }
+        s = s + "    }\n";
+        s = s + "    // <<< ZAN-DESIGNER END >>>\n";
+        return s;
+    }
+
+    /// A fresh code-behind file: designer region + a Main entry the user can extend.
+    static string BuildCodeBehind(string name, List<string> dNames, List<string> dTypes,
+                                  List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+        string s = "using System;\n";
+        s = s + "using Gui;\n";
+        s = s + "using Gui.Widget;\n\n";
+        s = s + "// Code-behind for " + name + ".zform.\n";
+        s = s + "// The layout is defined visually in " + name + ".zform; the region below is\n";
+        s = s + "// regenerated from it. Write your own logic outside that region.\n";
+        s = s + "class " + name + " {\n";
+        s = s + IdeDemo.BuildDesignerRegion(name, dNames, dTypes, dX, dY, dW, dH);
+        s = s + "\n";
+        s = s + "    void Load() {\n";
+        s = s + "        // TODO: your form initialization logic here.\n";
+        s = s + "    }\n";
+        s = s + "}\n";
+        return s;
+    }
+
+    /// Replaces the designer region of an existing code-behind in place, keeping all
+    /// user code outside the BEGIN/END markers. If markers are missing, returns the
+    /// text unchanged (the designer will not clobber a hand-written file).
+    static string RegenerateCodeBehind(string existing, string name, List<string> dNames,
+            List<string> dTypes, List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+        List<string> ls = CodeEditor.SplitLines(existing);
+        int bi = 0 - 1;
+        int ei = 0 - 1;
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.LTrim(ls[i]);
+            if (bi < 0 && tr.Length >= 20 && tr.Substring(0, 20) == "// <<< ZAN-DESIGNER B") { bi = i; }
+            else if (bi >= 0 && ei < 0 && tr.Length >= 20 && tr.Substring(0, 20) == "// <<< ZAN-DESIGNER E") { ei = i; }
+            i = i + 1;
+        }
+        if (bi < 0 || ei < 0 || ei < bi) { return existing; }
+        string region = IdeDemo.BuildDesignerRegion(name, dNames, dTypes, dX, dY, dW, dH);
+        string outp = "";
+        i = 0;
+        while (i < bi) { outp = outp + ls[i] + "\n"; i = i + 1; }
+        outp = outp + region;
+        i = ei + 1;
+        while (i < ls.Count) { outp = outp + ls[i] + "\n"; i = i + 1; }
+        return outp;
     }
 
     // ---- dialog rendering ----
@@ -1812,11 +2769,157 @@ class IdeDemo {
         return r * grid;
     }
 
-    static void RenderDesigner(App app, Canvas c, Theme t, Rect area,
+    /// Draws a [-][+] stepper pair right-aligned to `rightX` on row `rowY`.
+    static void DrawStepper(App app, Canvas c, Theme t, int rightX, int rowY) {
+        int btnW = app.Scale(18);
+        int btnH = app.Scale(15);
+        int btnY = rowY - app.Scale(1);
+        int plusX = rightX - app.Scale(8) - btnW;
+        int minusX = plusX - app.Scale(2) - btnW;
+        c.FillRoundRect(minusX, btnY, btnW, btnH, app.Scale(2), 0xFF3E3E42);
+        c.DrawText(minusX + app.Scale(6), btnY + app.Scale(1), "-", 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRoundRect(plusX, btnY, btnW, btnH, app.Scale(2), 0xFF0E639C);
+        c.DrawText(plusX + app.Scale(5), btnY + app.Scale(1), "+", 0xFFFFFFFF, t.fontSizeSmall);
+    }
+
+    /// Hit-tests a DrawStepper pair. Returns +1 (plus), -1 (minus), 0 (none).
+    static int StepperHit(App app, int mx, int my, int rightX, int rowY) {
+        int btnW = app.Scale(18);
+        int btnH = app.Scale(15);
+        int btnY = rowY - app.Scale(1);
+        int plusX = rightX - app.Scale(8) - btnW;
+        int minusX = plusX - app.Scale(2) - btnW;
+        if (my < btnY || my >= btnY + btnH) { return 0; }
+        if (mx >= minusX && mx < minusX + btnW) { return 0 - 1; }
+        if (mx >= plusX && mx < plusX + btnW) { return 1; }
+        return 0;
+    }
+
+    static string ExampleCat(int idx) {
+        if (idx == 0 || idx == 1 || idx == 2) { return "Basics"; }
+        if (idx == 3 || idx == 6 || idx == 7 || idx == 8) { return "GUI & Apps"; }
+        return "Network & Data";
+    }
+
+    static string ExampleDesc(int idx) {
+        if (idx == 0) { return "Console I/O: print and read a line."; }
+        if (idx == 1) { return "Read/write files and list a directory."; }
+        if (idx == 2) { return "List operations with LINQ (OrderBy/Where/Sum)."; }
+        if (idx == 3) { return "A Gui window with an event loop."; }
+        if (idx == 4) { return "HTTP GET/POST with HttpClient."; }
+        if (idx == 5) { return "Parse and build JSON."; }
+        if (idx == 6) { return "Timers and event handling."; }
+        if (idx == 7) { return "A small calculator app."; }
+        if (idx == 8) { return "A minimal text editor."; }
+        return "";
+    }
+
+    // Builds the sidebar Examples tree: category folders with sample leaves.
+    // Each leaf carries "@ex:<idx>" in its path so a click can open the sample.
+    static List<TreeNode> BuildExampleTree() {
+        List<TreeNode> n = new List<TreeNode>();
+        n.Add(TreeNode.Dir("Basics", 0, true));
+        n.Add(IdeDemo.ExLeaf("Hello World", 0));
+        n.Add(IdeDemo.ExLeaf("File Read/Write", 1));
+        n.Add(IdeDemo.ExLeaf("List & LINQ", 2));
+        n.Add(TreeNode.Dir("GUI & Apps", 0, true));
+        n.Add(IdeDemo.ExLeaf("GUI Window", 3));
+        n.Add(IdeDemo.ExLeaf("Timer & Events", 6));
+        n.Add(IdeDemo.ExLeaf("Calculator", 7));
+        n.Add(IdeDemo.ExLeaf("Text Editor", 8));
+        n.Add(TreeNode.Dir("Network & Data", 0, true));
+        n.Add(IdeDemo.ExLeaf("HTTP Client", 4));
+        n.Add(IdeDemo.ExLeaf("JSON Parse", 5));
+        return n;
+    }
+
+    static TreeNode ExLeaf(string label, int idx) {
+        TreeNode f = TreeNode.FileIcon(label, 1, "file");
+        f.path = "@ex:" + Convert.ToString(idx);
+        return f;
+    }
+
+    // Returns the index of the first tab whose path equals p, or -1.
+    static int FindTabByPath(List<string> paths, string p) {
+        int i = 0;
+        while (i < paths.Count) {
+            if (paths[i] == p) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    // Start page (welcome): quick actions + project file list.
+    // Returns 0 = none, 1 = New Project, 2 = New File, 100+idx = open files[idx].
+    static int RenderStartPage(App app, Canvas c, Theme t, Rect area, List<string> files) {
+        int result = 0;
+        c.FillRect(area.x, area.y, area.width, area.height, 0xFF1E1E1E);
+        int pad = app.Scale(32);
+        int x0 = area.x + pad;
+        int y = area.y + pad;
+        c.DrawText(x0, y, "Zan IDE", 0xFFFFFFFF, t.fontSizeLarge);
+        y = y + app.Scale(30);
+        c.DrawText(x0, y, "Self-hosted IDE  -  Start", 0xFF888888, t.fontSizeSmall);
+        y = y + app.Scale(34);
+
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int evKind = app.window.EventKind();
+
+        // ---- Quick actions ----
+        c.DrawText(x0, y, "Get started", 0xFFCCCCCC, t.fontSizeMedium);
+        y = y + app.Scale(26);
+        int btnW = app.Scale(240);
+        int btnH = app.Scale(40);
+        int gap = app.Scale(10);
+
+        int npY = y;
+        c.FillRoundRect(x0, npY, btnW, btnH, app.Scale(4), 0xFF0E639C);
+        c.DrawText(x0 + app.Scale(14), npY + app.Scale(13), "New Project...", 0xFFFFFFFF, t.fontSizeSmall);
+        y = y + btnH + gap;
+
+        int nfY = y;
+        c.FillRoundRect(x0, nfY, btnW, btnH, app.Scale(4), 0xFF3E3E42);
+        c.DrawText(x0 + app.Scale(14), nfY + app.Scale(13), "New File...", 0xFFCCCCCC, t.fontSizeSmall);
+        y = y + btnH + gap;
+
+        if (evKind == 3) {
+            if (mx >= x0 && mx < x0 + btnW && my >= npY && my < npY + btnH) { result = 1; }
+            else if (mx >= x0 && mx < x0 + btnW && my >= nfY && my < nfY + btnH) { result = 2; }
+        }
+
+        // ---- Project files list (right column) ----
+        int colX = x0 + btnW + app.Scale(48);
+        int colY = area.y + pad + app.Scale(64);
+        c.DrawText(colX, colY - app.Scale(26), "Project files (src)", 0xFFCCCCCC, t.fontSizeMedium);
+        int rowH = app.Scale(24);
+        int maxRows = (area.y + area.height - app.Scale(16) - colY) / rowH;
+        int shown = files.Count;
+        if (shown > maxRows) { shown = maxRows; }
+        int i = 0;
+        while (i < shown) {
+            int ry = colY + i * rowH;
+            bool hot = (mx >= colX && mx < colX + app.Scale(320) && my >= ry && my < ry + rowH);
+            if (hot) { c.FillRect(colX - app.Scale(4), ry, app.Scale(324), rowH, 0xFF2A2D2E); }
+            c.DrawText(colX, ry + app.Scale(5), Path.GetFileName(files[i]), 0xFF9CDCFE, t.fontSizeSmall);
+            if (evKind == 3 && hot) { result = 100 + i; }
+            i = i + 1;
+        }
+        if (files.Count == 0) {
+            c.DrawText(colX, colY + app.Scale(5), "(no .zan files under src/)", 0xFF666666, t.fontSizeSmall);
+        }
+
+        c.DrawText(x0, area.y + area.height - app.Scale(16),
+            "Tip: click Start in the ribbon to toggle this page.", 0xFF666666, t.fontSizeSmall);
+        return result;
+    }
+
+    static int RenderDesigner(App app, Canvas c, Theme t, Rect area,
             List<string> dNames, List<int> dX, List<int> dY,
             List<int> dW, List<int> dH, List<string> dTypes, SignalInt dSel,
             SignalInt dragMode, SignalInt dragOffX, SignalInt dragOffY, SignalInt resizeH) {
         int dSelV = dSel.Get();
+        int result = 0;
         int gridSz = app.Scale(8);
         c.FillRect(area.x, area.y, area.width, area.height, 0xFF2D2D30);
 
@@ -1846,6 +2949,16 @@ class IdeDemo {
         IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "PictureBox", t); ty = ty + toolH2;
         IdeDemo.DrawToolItem(c, area.x, ty, toolW, toolH2, "RichTextBox", t);
 
+        // "View Code" opens the associated code-behind (.zan), like WinForms.
+        // The form layout itself is auto-saved to the .zform file by the host.
+        int dbBtnH = app.Scale(26);
+        int dbGenY = area.y + area.height - dbBtnH - app.Scale(8);
+        c.FillRoundRect(area.x + app.Scale(8), dbGenY, toolW - app.Scale(16), dbBtnH, app.Scale(3), 0xFF0E639C);
+        int dbGenTw = Canvas.MeasureText("View Code (F7)", t.fontSizeSmall);
+        c.DrawText(area.x + (toolW - dbGenTw) / 2, dbGenY + app.Scale(7), "View Code (F7)", 0xFFFFFFFF, t.fontSizeSmall);
+        int dbHintY = dbGenY - app.Scale(16);
+        c.DrawText(area.x + app.Scale(8), dbHintY, "Layout auto-saved", 0xFF808080, t.fontSizeSmall);
+
         // Properties panel on right
         int propW = app.Scale(180);
         int propX = area.x + area.width - propW;
@@ -1862,17 +2975,38 @@ class IdeDemo {
             c.DrawText(propX + app.Scale(8), py, "Type:", 0xFF999999, t.fontSizeSmall);
             c.DrawText(propX + lblW, py, dTypes[dSelV], 0xFF4EC9B0, t.fontSizeSmall);
             py = py + app.Scale(20);
+            int xRowY = py;
             c.DrawText(propX + app.Scale(8), py, "X:", 0xFF999999, t.fontSizeSmall);
             c.DrawText(propX + lblW, py, Convert.ToString(dX[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            IdeDemo.DrawStepper(app, c, t, propX + propW, py);
             py = py + app.Scale(20);
+            int yRowY = py;
             c.DrawText(propX + app.Scale(8), py, "Y:", 0xFF999999, t.fontSizeSmall);
             c.DrawText(propX + lblW, py, Convert.ToString(dY[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            IdeDemo.DrawStepper(app, c, t, propX + propW, py);
             py = py + app.Scale(20);
+            int wRowY = py;
             c.DrawText(propX + app.Scale(8), py, "Width:", 0xFF999999, t.fontSizeSmall);
             c.DrawText(propX + lblW, py, Convert.ToString(dW[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            IdeDemo.DrawStepper(app, c, t, propX + propW, py);
             py = py + app.Scale(20);
+            int hRowY = py;
             c.DrawText(propX + app.Scale(8), py, "Height:", 0xFF999999, t.fontSizeSmall);
             c.DrawText(propX + lblW, py, Convert.ToString(dH[dSelV]), 0xFFB5CEA8, t.fontSizeSmall);
+            IdeDemo.DrawStepper(app, c, t, propX + propW, py);
+
+            // Property stepper clicks (grid-sized nudge of the selected control).
+            if (app.window.EventKind() == 3) {
+                int step = app.Scale(8);
+                int sd = IdeDemo.StepperHit(app, app.mouseX, app.mouseY, propX + propW, xRowY);
+                if (sd != 0) { dX[dSelV] = dX[dSelV] + sd * step; if (dX[dSelV] < 0) { dX[dSelV] = 0; } app.RequestRedraw(); }
+                sd = IdeDemo.StepperHit(app, app.mouseX, app.mouseY, propX + propW, yRowY);
+                if (sd != 0) { dY[dSelV] = dY[dSelV] + sd * step; if (dY[dSelV] < 0) { dY[dSelV] = 0; } app.RequestRedraw(); }
+                sd = IdeDemo.StepperHit(app, app.mouseX, app.mouseY, propX + propW, wRowY);
+                if (sd != 0) { dW[dSelV] = dW[dSelV] + sd * step; if (dW[dSelV] < app.Scale(16)) { dW[dSelV] = app.Scale(16); } app.RequestRedraw(); }
+                sd = IdeDemo.StepperHit(app, app.mouseX, app.mouseY, propX + propW, hRowY);
+                if (sd != 0) { dH[dSelV] = dH[dSelV] + sd * step; if (dH[dSelV] < app.Scale(16)) { dH[dSelV] = app.Scale(16); } app.RequestRedraw(); }
+            }
             py = py + app.Scale(24);
             c.FillRect(propX + app.Scale(4), py, propW - app.Scale(8), 1, t.divider);
             py = py + app.Scale(8);
@@ -1979,8 +3113,12 @@ class IdeDemo {
 
         // Mouse down - start drag or select
         if (evKind == 3) {
-            // Check toolbox click to add control
-            if (mx >= area.x && mx < area.x + toolW && my >= area.y + app.Scale(28)) {
+            // Designer action buttons take priority over toolbox rows.
+            if (mx >= area.x + app.Scale(8) && mx < area.x + toolW - app.Scale(8)
+                && my >= dbGenY && my < dbGenY + dbBtnH) {
+                result = 1;
+            } else if (mx >= area.x && mx < area.x + toolW && my >= area.y + app.Scale(28)
+                && my < dbGenY - app.Scale(16)) {
                 int toolIdx = (my - area.y - app.Scale(28)) / app.Scale(24);
                 string newType = IdeDemo.ToolByIndex(toolIdx);
                 if (newType != "") {
@@ -2119,6 +3257,7 @@ class IdeDemo {
                 + " " + Convert.ToString(dW[dSelV]) + "x" + Convert.ToString(dH[dSelV]) + ")";
         }
         c.DrawText(surfX + app.Scale(8), area.y + area.height - app.Scale(16), statusTxt, 0xFF888888, t.fontSizeSmall);
+        return result;
     }
 
     static int HitHandle(App app, int mx, int my, int cx, int cy, int cw, int ch) {
@@ -2166,112 +3305,77 @@ class IdeDemo {
         return "";
     }
 
-    // ================================================================
-    // Component List Panel (VB/Aardio-style component reference)
-    // ================================================================
+    /// Draws a vertically-scrollable icon+label list clipped to [y, y+h): only
+    /// rows that fully fit are drawn (Canvas has no clip region), the wheel
+    /// scrolls when the pointer is over the area, and a thin thumb shows the
+    /// position. Returns the row index clicked this frame, or -1.
+    static int RenderScrollList(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, int rowH,
+            List<string> names, List<int> colors, SignalInt scroll, bool roundIcon) {
+        int count = names.Count;
+        int maxRows = h / rowH;
+        if (maxRows < 1) { maxRows = 1; }
+        int maxOff = count - maxRows;
+        if (maxOff < 0) { maxOff = 0; }
+        int off = scroll.Get();
 
-    static void RenderComponentList(App app, Canvas c, Theme t,
-            int x, int y, int w, int h) {
-        int rowH = app.Scale(20);
-        int pad = app.Scale(6);
-        int cy = y;
-        // GUI Components
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "App", "GUI Application", 0xFF4EC9B0, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Window", "OS Window Handle", 0xFF4EC9B0, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Canvas", "2D Drawing Surface", 0xFF4EC9B0, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Button", "Clickable Button", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Label", "Text Display", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Input", "Text Input Field", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Panel", "Container Panel", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "TreeView", "Tree Navigation", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "TabView", "Tab Container", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Ribbon", "Toolbar Ribbon", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "CodeEditor", "Code Editor", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Modal", "Dialog Modal", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Split", "Layout Splitter", 0xFF569CD6, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "List<T>", "Generic List", 0xFF9B6DCA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "Dict<K,V>", "Dictionary", 0xFF9B6DCA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "SignalInt", "Reactive Int", 0xFF9B6DCA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "SignalBool", "Reactive Bool", 0xFF9B6DCA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawCompItem(app, c, x, cy, w, rowH, pad, "SignalString", "Reactive String", 0xFF9B6DCA, t);
-    }
-
-    static void DrawCompItem(App app, Canvas c, int x, int y, int w, int rowH, int pad,
-            string name, string desc, int color, Theme t) {
-        c.FillRoundRect(x + pad, y + app.Scale(3), app.Scale(14), app.Scale(14), app.Scale(2), color);
-        c.DrawText(x + pad + app.Scale(16), y + app.Scale(2), name, 0xFFD4D4D4, t.fontSizeSmall);
-    }
-
-    // ================================================================
-    // Example Code Library Panel
-    // ================================================================
-
-    static void RenderExampleList(App app, Canvas c, Theme t,
-            int x, int y, int w, int h,
-            List<string> tabNames, List<string> tabBodies, List<string> tabPaths,
-            SignalInt activeTab, CodeEditor editor, List<string> log) {
-        int rowH = app.Scale(22);
-        int pad = app.Scale(6);
-        int cy = y;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Hello World", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "File Read/Write", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "List & LINQ", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "GUI Window", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "HTTP Client", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "JSON Parse", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Timer & Events", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Calculator", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-        IdeDemo.DrawExItem(app, c, x, cy, w, rowH, pad, "Text Editor", 0xFFDCDCAA, t);
-        cy = cy + rowH;
-
-        // Handle click on example to open as new tab
-        if (app.window.EventKind() == 3) {
-            if (app.mouseX >= x && app.mouseX < x + w
-                && app.mouseY >= y && app.mouseY < y + 9 * rowH) {
-                int clickedIdx = (app.mouseY - y) / rowH;
-                string code = IdeDemo.GetExampleCode(clickedIdx);
-                string eName = IdeDemo.GetExampleName(clickedIdx);
-                if (code.Length > 0) {
-                    IdeDemo.OpenNewTab(tabNames, tabBodies, tabPaths, activeTab, eName, code);
-                    log.Add("> Opened example: " + eName);
-                    app.RequestRedraw();
-                }
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        bool over = mx >= x && mx < x + w && my >= y && my < y + h;
+        if (app.window.EventKind() == 13 && over) {
+            int delta = app.window.EventKeyCode();
+            int step = delta / 120;
+            if (step == 0) {
+                if (delta > 0) { step = 1; }
+                else if (delta < 0) { step = 0 - 1; }
             }
+            off = off - step;
+            app.RequestRedraw();
         }
+        if (off > maxOff) { off = maxOff; }
+        if (off < 0) { off = 0; }
+        scroll.Set(off);
+
+        int pad = app.Scale(6);
+        int iconSz = app.Scale(14);
+        int shown = 0;
+        int cy = y;
+        while (off + shown < count && shown < maxRows) {
+            int i = off + shown;
+            if (roundIcon) {
+                c.FillRoundRect(x + pad, cy + app.Scale(3), iconSz, iconSz, app.Scale(2), colors[i]);
+            } else {
+                c.FillRoundRect(x + pad, cy + app.Scale(4), iconSz, iconSz, app.Scale(2), 0xFF333333);
+                c.DrawText(x + pad + app.Scale(2), cy + app.Scale(5), "E", colors[i], t.fontSizeSmall);
+            }
+            int tx = x + pad + iconSz + app.Scale(4);
+            if (roundIcon) { tx = x + pad + app.Scale(16); }
+            c.DrawText(tx, cy + app.Scale(3), names[i], 0xFFD4D4D4, t.fontSizeSmall);
+            cy = cy + rowH;
+            shown = shown + 1;
+        }
+
+        // Scroll thumb on the right edge when content overflows.
+        if (count > maxRows) {
+            int thumbH = h * maxRows / count;
+            if (thumbH < app.Scale(16)) { thumbH = app.Scale(16); }
+            int thumbY = y;
+            if (maxOff > 0) { thumbY = y + (h - thumbH) * off / maxOff; }
+            c.FillRect(x + w - app.Scale(3), y, app.Scale(3), h, 0xFF2A2A2A);
+            c.FillRect(x + w - app.Scale(3), thumbY, app.Scale(3), thumbH, 0xFF555555);
+        }
+
+        // Report a click on a visible row (mouse-up over the area).
+        if (app.window.EventKind() == 3 && over) {
+            int rel = (my - y) / rowH;
+            if (rel >= 0 && rel < shown) { return off + rel; }
+        }
+        return 0 - 1;
     }
 
-    static void DrawExItem(App app, Canvas c, int x, int y, int w, int h, int pad,
-            string name, int color, Theme t) {
-        int iconSz = app.Scale(14);
-        c.FillRoundRect(x + pad, y + app.Scale(4), iconSz, iconSz, app.Scale(2), 0xFF333333);
-        c.DrawText(x + pad + app.Scale(2), y + app.Scale(5), "E", color, t.fontSizeSmall);
-        c.DrawText(x + pad + iconSz + app.Scale(4), y + app.Scale(3), name, 0xFFCCCCCC, t.fontSizeSmall);
-    }
+    // ================================================================
+    // Example Code Library
+    // ================================================================
 
     static void OpenNewTab(List<string> tabNames, List<string> tabBodies,
             List<string> tabPaths, SignalInt activeTab, string name, string code) {
