@@ -3531,9 +3531,9 @@ class CodeEditor {
                     int hoverCol = CodeEditor.ColFromX(lines[hoverLine], app.mouseX - textX, fontSize);
                     string hWord = CodeEditor.WordAt(lines[hoverLine], hoverCol);
                     if (hWord.Length > 0) {
-                        string tip = CodeEditor.LookupVar(dbgVars, hWord);
-                        if (tip.Length > 0) {
-                            hoverTip = tip;
+                        string raw = CodeEditor.LookupVarRaw(dbgVars, hWord);
+                        if (raw.Length > 0) {
+                            hoverTip = raw;
                             hoverTipX = app.mouseX;
                             hoverTipY = app.mouseY;
                         } else {
@@ -3544,18 +3544,40 @@ class CodeEditor {
                     }
                 }
             }
-            // Draw tooltip
+            // Draw the (possibly multi-line, JSON-formatted) tooltip.
             if (hoverTip.Length > 0) {
-                int ttW2 = Canvas.MeasureText(hoverTip, fontSize) + app.Scale(16);
-                int ttH2 = lineH + app.Scale(4);
+                List<string> hl = new List<string>();
+                CodeEditor.BuildHoverLines(hoverTip, hl);
+                int rowh = Canvas.FontHeight(fontSize) + app.Scale(2);
+                int maxw = 0;
+                int k = 0;
+                while (k < hl.Count) {
+                    int mw = Canvas.MeasureText(hl[k], fontSize);
+                    if (mw > maxw) { maxw = mw; }
+                    k = k + 1;
+                }
+                int ttW2 = maxw + app.Scale(16);
+                int capW = area.width - app.Scale(8);
+                if (ttW2 > capW) { ttW2 = capW; }
+                int ttH2 = rowh * hl.Count + app.Scale(8);
                 int ttX2 = hoverTipX + app.Scale(8);
-                int ttY2 = hoverTipY - ttH2 - app.Scale(4);
-                if (ttY2 < area.y) { ttY2 = hoverTipY + app.Scale(20); }
-                if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - 4; }
-                c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), 0x60000000);
+                int ttY2 = hoverTipY + app.Scale(20);
+                if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - app.Scale(4); }
+                if (ttX2 < area.x) { ttX2 = area.x; }
+                if (ttY2 + ttH2 > area.y + area.height) { ttY2 = hoverTipY - ttH2 - app.Scale(6); }
+                if (ttY2 < area.y) { ttY2 = area.y; }
+                c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), 0x80000000);
                 c.FillRoundRect(ttX2, ttY2, ttW2, ttH2, app.Scale(4), 0xFF1E1E1E);
                 c.DrawRect(ttX2, ttY2, ttW2, ttH2, 0xFF569CD6, 1);
-                c.DrawText(ttX2 + app.Scale(8), ttY2 + app.Scale(4), hoverTip, 0xFFCE9178, fontSize);
+                int ty = ttY2 + app.Scale(4);
+                int kk = 0;
+                while (kk < hl.Count) {
+                    int col = 0xFFCE9178;
+                    if (kk == 0) { col = 0xFF9CDCFE; }
+                    c.DrawText(ttX2 + app.Scale(8), ty, hl[kk], col, fontSize);
+                    ty = ty + rowh;
+                    kk = kk + 1;
+                }
             }
         }
 
@@ -3766,5 +3788,119 @@ class CodeEditor {
             i = i + 1;
         }
         return "";
+    }
+
+    /// Like LookupVar, but returns the raw "name\ttype\tvalue" entry so the
+    /// caller can render an expandable, formatted tooltip.
+    static string LookupVarRaw(List<string> vars, string name) {
+        int i = 0;
+        while (i < vars.Count) {
+            string entry = vars[i];
+            int tab1 = -1;
+            int j = 0;
+            while (j < entry.Length) {
+                if (entry.Substring(j, 1) == "\t") { tab1 = j; j = entry.Length; }
+                j = j + 1;
+            }
+            if (tab1 > 0 && entry.Substring(0, tab1) == name) { return entry; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    static string Indent(int n) {
+        string s = "";
+        int i = 0;
+        while (i < n && i < 12) { s = s + "  "; i = i + 1; }
+        return s;
+    }
+
+    /// Pretty-prints a JSON-ish value string into indented lines. Ignores
+    /// structure inside quoted strings, caps at maxLines, truncates very long
+    /// lines, and reads at most 8000 input chars (large-data safety).
+    static void PrettyJson(string s, List<string> out2, int maxLines) {
+        int indent = 0;
+        string cur = "";
+        bool inStr = false;
+        int i = 0;
+        int limit = s.Length;
+        if (limit > 8000) { limit = 8000; }
+        while (i < limit) {
+            string ch = s.Substring(i, 1);
+            if (inStr) {
+                cur = cur + ch;
+                if (ch == "\"") { inStr = false; }
+                else if (ch == "\\" && i + 1 < limit) { cur = cur + s.Substring(i + 1, 1); i = i + 1; }
+            } else if (ch == "\"") {
+                cur = cur + ch; inStr = true;
+            } else if (ch == "{" || ch == "[") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+                indent = indent + 1;
+            } else if (ch == "}" || ch == "]") {
+                if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); cur = ""; }
+                indent = indent - 1;
+                if (indent < 0) { indent = 0; }
+                out2.Add(CodeEditor.Indent(indent) + ch);
+            } else if (ch == ",") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+            } else if (ch == ":") {
+                cur = cur + ": ";
+            } else if (ch == " " || ch == "\n" || ch == "\t" || ch == "\r") {
+                // insignificant whitespace outside strings
+            } else {
+                cur = cur + ch;
+            }
+            if (out2.Count >= maxLines) { out2.Add("  ...(truncated)"); return; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); }
+    }
+
+    /// Caps a single tooltip line so a very long value can't blow up the box.
+    static string Clip(string s) {
+        if (s.Length > 200) { return s.Substring(0, 200) + " ..."; }
+        return s;
+    }
+
+    /// Builds the lines shown in the debug hover tooltip: a header
+    /// (`name : type`) followed by the value, pretty-printed if it looks like
+    /// JSON / an array / an object.
+    static void BuildHoverLines(string entry, List<string> out2) {
+        int tab1 = -1;
+        int tab2 = -1;
+        int j = 0;
+        while (j < entry.Length) {
+            string ch = entry.Substring(j, 1);
+            if (ch == "\t") {
+                if (tab1 < 0) { tab1 = j; }
+                else if (tab2 < 0) { tab2 = j; }
+            }
+            j = j + 1;
+        }
+        string vName = entry;
+        string vType = "";
+        string vVal = "";
+        if (tab1 > 0) {
+            vName = entry.Substring(0, tab1);
+            if (tab2 > tab1) {
+                vType = entry.Substring(tab1 + 1, tab2 - tab1 - 1);
+                vVal = entry.Substring(tab2 + 1, entry.Length - tab2 - 1);
+            } else {
+                vType = entry.Substring(tab1 + 1, entry.Length - tab1 - 1);
+            }
+        }
+        out2.Add(vName + " : " + vType);
+        int a = 0;
+        while (a < vVal.Length && vVal.Substring(a, 1) == " ") { a = a + 1; }
+        string vt = vVal.Substring(a, vVal.Length - a);
+        if (vt.Length > 0 && (vt.Substring(0, 1) == "{" || vt.Substring(0, 1) == "[")) {
+            CodeEditor.PrettyJson(vt, out2, 60);
+        } else {
+            out2.Add("= " + CodeEditor.Clip(vVal));
+        }
     }
 }
