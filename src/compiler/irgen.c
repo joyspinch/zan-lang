@@ -192,6 +192,27 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_co_delay = LLVMAddFunction(g->mod, "zan_co_delay", g->rt_co_delay_type);
     }
 
+    /* Socket-async readiness reactor (S4b-2). zan_io_wait_co is an external
+     * symbol resolved from the shipped zanrt_io object only when a program uses
+     * socket await (otherwise unreferenced, so no link dependency). zan_io_pump
+     * is given a WEAK inline definition returning 0 so ordinary programs link
+     * and the scheduler's idle path is a no-op; linking zanrt_io overrides it
+     * with the real blocking reactor pump. */
+    {
+        LLVMTypeRef i64d = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i32d = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef wc_args[] = { i64d, i32d, i8ptr, g->co_step_ptr };
+        g->rt_io_wait_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), wc_args, 4, 0);
+        g->rt_io_wait_co = LLVMAddFunction(g->mod, "zan_io_wait_co", g->rt_io_wait_co_type);
+        g->rt_io_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
+        g->rt_io_pump = LLVMAddFunction(g->mod, "zan_io_pump", g->rt_io_pump_type);
+        LLVMSetLinkage(g->rt_io_pump, LLVMWeakAnyLinkage);
+        LLVMBasicBlockRef pbb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_io_pump, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, pbb);
+        LLVMBuildRet(g->builder, LLVMConstInt(i32d, 0, 0));
+    }
+    g->uses_socket_async = false;
+
     /* Emit the cooperative coroutine driver inline (the whole Zan runtime is
      * emitted into the module, so produced programs are self-contained — see
      * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
@@ -337,6 +358,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBasicBlockRef after_unlink = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after.unlink");
             LLVMBasicBlockRef do_sleep = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "do.sleep");
             LLVMBasicBlockRef after_sleep = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after.sleep");
+            LLVMBasicBlockRef io_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "io.pump");
             LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "exit");
             LLVMPositionBuilderAtEnd(g->builder, entry_bb);
             /* scan state (no opt pass runs, so plain allocas are fine) */
@@ -381,7 +403,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef t0 = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
             LLVMValueRef tnull = LLVMBuildICmp(g->builder, LLVMIntEQ, t0,
                 LLVMConstNull(i8ptr), "t.empty");
-            LLVMBuildCondBr(g->builder, tnull, exit_bb, scan_setup);
+            LLVMBuildCondBr(g->builder, tnull, io_bb, scan_setup);
 
             LLVMPositionBuilderAtEnd(g->builder, scan_setup);
             LLVMBuildStore(g->builder, t0, a_best);
@@ -469,6 +491,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildCall2(g->builder, free_type, g->fn_free,
                 (LLVMValueRef[]){ best }, 1, "");
             LLVMBuildBr(g->builder, head_bb);
+
+            /* ready queue and timers both empty: block in the IO reactor for
+             * the next fd event, which re-readies suspended frames. zan_io_pump
+             * returns the number of frames it woke (0 when there is no pending
+             * IO — the weak no-op for non-socket programs), so a positive count
+             * loops back to drain them and zero means the program is done. */
+            LLVMPositionBuilderAtEnd(g->builder, io_bb);
+            LLVMValueRef woke = LLVMBuildCall2(g->builder, g->rt_io_pump_type,
+                g->rt_io_pump, NULL, 0, "woke");
+            LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntSGT, woke,
+                LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "io.more");
+            LLVMBuildCondBr(g->builder, more, head_bb, exit_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, exit_bb);
             LLVMBuildRetVoid(g->builder);
@@ -4418,6 +4452,54 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
 #endif
             return LLVMConstInt(di64, 0, 0);
+        }
+
+        /* await Socket.ReadReady(fd) / Socket.WriteReady(fd) — readiness-based
+         * suspension driven by the IO reactor (S4b-2, path A). Inside an async
+         * body: register a one-shot fd watcher via zan_io_wait_co that re-readies
+         * this frame when the fd becomes readable/writable, then SUSPEND; the
+         * resume-k block continues once ready. The intrinsic yields no value
+         * (returns i64 0). Only valid inside an async body — there is no CPS frame
+         * to suspend at a non-async root. */
+        {
+            bool is_read  = is_call_to(expr->await_expr.expr, "Socket", "ReadReady");
+            bool is_write = is_call_to(expr->await_expr.expr, "Socket", "WriteReady");
+            if ((is_read || is_write) && expr->await_expr.expr->call.args.count == 1) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.%s is only supported inside an async method",
+                        is_read ? "ReadReady" : "WriteReady");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef fd = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(fd) != di64) {
+                    fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
+                }
+                /* ZAN_IO_READ = 1, ZAN_IO_WRITE = 2 (see rt_io.h) */
+                LLVMValueRef interest = LLVMConstInt(di32, is_read ? 1 : 2, 0);
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                LLVMBuildCall2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
+                    (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
+                emit_async_save_slots(g);
+                LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                return LLVMConstInt(di64, 0, 0);
+            }
         }
 
         /* await <call> — the awaited expression is a call to an async method's

@@ -825,6 +825,15 @@ int main(int argc, char **argv) {
         /* ---- link object → executable ---- */
         int link_ret;
 
+        /* Socket-async programs (await Socket.ReadReady/WriteReady) link the
+         * readiness reactor object shipped with zanc; it provides zan_io_wait_co
+         * and the strong zan_io_pump that overrides the program's weak no-op.
+         * ZAN_RT_IO_OBJ is the build/install path baked in by CMake. */
+        const char *rt_io_obj = NULL;
+#ifdef ZAN_RT_IO_OBJ
+        if (irgen.uses_socket_async) rt_io_obj = ZAN_RT_IO_OBJ;
+#endif
+
         /* Extra library search dirs for [DllImport] libs, taken from the
          * $ZAN_LIB_PATH env var (platform PATH separator). This lets a Zan
          * program link against a library that is not on the default system
@@ -897,12 +906,14 @@ int main(int argc, char **argv) {
                 argv[a++] = ldirbufs[di];
             }
             argv[a++] = obj_tmp;
+            if (rt_io_obj) argv[a++] = rt_io_obj;
             argv[a++] = "--start-group";
             argv[a++] = "-lmingw32"; argv[a++] = "-lgcc";
             argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
             argv[a++] = "-lmsvcrt";   argv[a++] = "-lkernel32";
             argv[a++] = "-ladvapi32"; argv[a++] = "-lshell32";
             argv[a++] = "-luser32";
+            if (rt_io_obj) argv[a++] = "-lws2_32";
             /* extern [DllImport] libraries (skip those already in the CRT) */
             char libbufs[24][128]; int nb = 0;
             for (int li = 0; li < irgen.extern_lib_count && a < 68 && nb < 24; li++) {
@@ -923,6 +934,10 @@ int main(int argc, char **argv) {
             snprintf(link_cmd, sizeof(link_cmd),
                      "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\"%s",
                      obj_tmp, obj_path, publish_mode ? " -O2 -s" : "");
+            if (rt_io_obj) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\" -lws2_32", rt_io_obj);
+            }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", zan_lib_dirs[di]);
@@ -946,6 +961,10 @@ int main(int argc, char **argv) {
         } else {
             snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
                      obj_tmp, obj_path);
+        }
+        if (rt_io_obj) {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_io_obj);
         }
         for (int di = 0; di < zan_lib_ndirs; di++) {
             size_t cur = strlen(link_cmd);

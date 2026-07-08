@@ -56,6 +56,46 @@ else()
 endif()
 target_compile_definitions(zanc PRIVATE ${LLVM_DEFINITIONS})
 
+# ---- Socket-async reactor object (S4b-2) ----
+# Programs that use socket await (await Socket.ReadReady/WriteReady) link a
+# small readiness reactor built from src/runtime/rt_io.c (epoll/kqueue/IOCP).
+# It is compiled here as a standalone object (ZAN_IO_STACKLESS_ONLY drops the
+# rt_sched fiber half, so it depends only on zan_co_ready, which the produced
+# program provides inline). zanc injects this object into the link only when a
+# program actually uses socket await (see src/compiler/main.c). The object must
+# match the ABI of zanc's produced objects: on Windows zanc emits
+# x86_64-w64-windows-gnu (MinGW) objects and links them with the bundled GNU ld,
+# so compile the reactor with a MinGW gcc (NOT clang-cl/MSVC); elsewhere the
+# system C compiler already matches.
+if(WIN32)
+    find_program(ZAN_RT_IO_CC NAMES gcc x86_64-w64-mingw32-gcc
+                 HINTS ${ZAN_MINGW_ROOT}/bin C:/TDM-GCC-64/bin)
+    if(NOT ZAN_RT_IO_CC)
+        set(ZAN_RT_IO_CC ${CMAKE_C_COMPILER})
+    endif()
+else()
+    set(ZAN_RT_IO_CC ${CMAKE_C_COMPILER})
+endif()
+set(ZAN_RT_IO_OBJ "${CMAKE_BINARY_DIR}/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_IO_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} -DZAN_IO_STACKLESS_ONLY
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
+    COMMENT "Building socket-async reactor object (zanrt_io)"
+    VERBATIM)
+add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
+add_dependencies(zanc zanrt_io)
+target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
+# Also keep a copy next to the zanc binary so a shipped compiler can find it.
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_IO_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
 # ---- Self-contained linking toolchain (Windows) ----
 # Bundle a small GNU ld + the redistributable MinGW-w64 runtime next to zanc so
 # that `zanc app.zan -o app.exe` needs only zan: no external clang / gcc / MSVC /

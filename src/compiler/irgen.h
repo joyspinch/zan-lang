@@ -128,6 +128,17 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_sched_run_type;
     LLVMValueRef rt_co_delay;     /* void zan_co_delay(i64 ms, void* frame, step) */
     LLVMTypeRef  rt_co_delay_type;
+    /* socket async (S4b-2): the readiness reactor, provided by the shipped
+     * zanrt_io object (built from src/runtime/rt_io.c). zan_io_wait_co registers
+     * a one-shot fd watcher that re-readies (frame, step) when ready; zan_io_pump
+     * blocks in the reactor for the next event. A weak inline zan_io_pump that
+     * returns 0 lets non-socket programs link and behave as before; the reactor
+     * object's strong definition overrides it for socket-async programs. */
+    LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(i64 fd,i32 interest,i8* frame,step) */
+    LLVMTypeRef  rt_io_wait_co_type;
+    LLVMValueRef rt_io_pump;      /* i32 zan_io_pump(void) */
+    LLVMTypeRef  rt_io_pump_type;
+    bool         uses_socket_async; /* set when a socket await is lowered */
     /* set while emitting an async function's $resume body: the current heap
      * frame pointer and its struct type, so `return` stores into the frame's
      * result slot + notifies the awaiter instead of a plain ret. NULL when not

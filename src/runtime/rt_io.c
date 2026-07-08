@@ -24,7 +24,6 @@
 
 #include "rt_io.h"
 #include "rt_co.h"
-#include "rt_sched.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,10 +34,21 @@
 #include <errno.h>
 #endif
 
+/* The reactor serves two clients:
+ *   - stackless CPS frames (the async/await state machine) via zan_io_wait_co,
+ *     woken through the co ready queue (zan_co_ready);
+ *   - stackful rt_sched fibers via zan_io_wait_readable/writable, woken by
+ *     switching fibers (zan_io_resume).
+ * When built with ZAN_IO_STACKLESS_ONLY (the object shipped with zanc and
+ * linked into produced async programs), the fiber half is dropped so the
+ * reactor has no dependency on rt_sched. */
+#ifndef ZAN_IO_STACKLESS_ONLY
+#include "rt_sched.h"
 /* ---- forward declarations from rt_sched (internal) ---- */
 extern void zan_io_suspend_current(void);   /* implemented in rt_sched.c */
 extern void zan_io_resume(void *co);        /* implemented in rt_sched.c */
 extern void *zan_io_get_current_co(void);   /* implemented in rt_sched.c */
+#endif
 
 /* ZAN_IO_READ / ZAN_IO_WRITE come from rt_io.h. */
 
@@ -46,13 +56,21 @@ extern void *zan_io_get_current_co(void);   /* implemented in rt_sched.c */
  * and to short-circuit an empty poll on every backend. */
 static int g_io_count;
 
+/* Whether the backend has been initialized. Generated async programs never
+ * call zan_io_init explicitly, so zan_io_wait_co lazy-inits on first use. */
+static int g_io_started;
+
 /* Wake a watcher whose fd became ready. A stackless watcher (registered via
  * zan_io_wait_co) carries a resume `step` and is re-entered through the co
  * driver's ready queue; a stackful watcher (rt_sched fiber) has step==NULL and
  * is resumed by switching to its fiber. */
 static void io_wake(void *co, zan_co_step_t step) {
+#ifdef ZAN_IO_STACKLESS_ONLY
+    zan_co_ready(co, step);      /* stackless programs never register fibers */
+#else
     if (step) zan_co_ready(co, step);
     else      zan_io_resume(co);
+#endif
 }
 
 #if !defined(_WIN32)
@@ -79,9 +97,11 @@ static zan_io_entry_t *g_io_entries;    /* linked list of active watchers */
 static int g_epoll_fd = -1;
 
 void zan_io_init(void) {
+    if (g_io_started) return;
     g_io_entries = NULL;
     g_io_count = 0;
     g_epoll_fd = epoll_create1(0);
+    g_io_started = 1;
 }
 
 void zan_io_shutdown(void) {
@@ -96,6 +116,7 @@ void zan_io_shutdown(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
+    g_io_started = 0;
 }
 
 int zan_io_set_nonblocking(int64_t fd) {
@@ -159,9 +180,11 @@ int zan_io_poll(int64_t timeout_ms) {
 static int g_kq_fd = -1;
 
 void zan_io_init(void) {
+    if (g_io_started) return;
     g_io_entries = NULL;
     g_io_count = 0;
     g_kq_fd = kqueue();
+    g_io_started = 1;
 }
 
 void zan_io_shutdown(void) {
@@ -174,6 +197,7 @@ void zan_io_shutdown(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     if (g_kq_fd >= 0) { close(g_kq_fd); g_kq_fd = -1; }
+    g_io_started = 0;
 }
 
 int zan_io_set_nonblocking(int64_t fd) {
@@ -270,6 +294,7 @@ static void ensure_assoc(SOCKET s) {
 }
 
 void zan_io_init(void) {
+    if (g_io_started) return;
     g_io_count = 0;
     g_assoc = NULL;
     g_assoc_len = 0;
@@ -277,6 +302,7 @@ void zan_io_init(void) {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    g_io_started = 1;
 }
 
 void zan_io_shutdown(void) {
@@ -286,6 +312,7 @@ void zan_io_shutdown(void) {
     g_assoc_len = g_assoc_cap = 0;
     g_io_count = 0;
     WSACleanup();
+    g_io_started = 0;
 }
 
 int zan_io_set_nonblocking(int64_t fd) {
@@ -350,8 +377,10 @@ int zan_io_poll(int64_t timeout_ms) {
 #include <unistd.h>
 
 void zan_io_init(void) {
+    if (g_io_started) return;
     g_io_entries = NULL;
     g_io_count = 0;
+    g_io_started = 1;
 }
 
 void zan_io_shutdown(void) {
@@ -363,6 +392,7 @@ void zan_io_shutdown(void) {
     }
     g_io_entries = NULL;
     g_io_count = 0;
+    g_io_started = 0;
 }
 
 int zan_io_set_nonblocking(int64_t fd) {
@@ -434,6 +464,26 @@ int zan_io_poll(int64_t timeout_ms) {
 
 /* ================= coroutine-facing ABI ================= */
 
+/* ---- stackless (CPS) registration + idle bridge ---- */
+
+void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step) {
+    zan_io_init();      /* lazy: generated programs never call zan_io_init */
+    io_register((int)fd, interest, frame, step);
+}
+
+int zan_io_pump(void) {
+    if (!zan_io_has_pending()) return 0;
+    return zan_io_poll(-1);   /* block until an fd is ready (wakes via zan_co_ready) */
+}
+
+int zan_io_has_pending(void) {
+    return g_io_count > 0;
+}
+
+#ifndef ZAN_IO_STACKLESS_ONLY
+/* ---- stackful (rt_sched fiber) ABI: excluded from the reactor object
+ * shipped with zanc so it needs no rt_sched. ---- */
+
 int64_t zan_io_wait_readable(int64_t fd) {
     void *co = zan_io_get_current_co();
     if (!co) return -1;
@@ -450,17 +500,6 @@ int64_t zan_io_wait_writable(int64_t fd) {
     return 0;
 }
 
-/* ---- stackless (CPS) registration + idle bridge ---- */
-
-void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step) {
-    io_register((int)fd, interest, frame, step);
-}
-
-int zan_io_pump(void) {
-    if (!zan_io_has_pending()) return 0;
-    return zan_io_poll(-1);   /* block until an fd is ready (wakes via zan_co_ready) */
-}
-
 int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms) {
     /* For simplicity, delegate to wait_readable; timeout is handled
      * by the scheduler's timer integration.  A proper implementation
@@ -472,10 +511,6 @@ int64_t zan_io_wait_readable_timeout(int64_t fd, int64_t timeout_ms) {
     io_register((int)fd, ZAN_IO_READ, co, NULL);
     zan_io_suspend_current();
     return 1;
-}
-
-int zan_io_has_pending(void) {
-    return g_io_count > 0;
 }
 
 /* ================= async connect ================= */
@@ -563,3 +598,4 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
     return err == 0 ? 0 : -1;
 }
 #endif
+#endif /* ZAN_IO_STACKLESS_ONLY */
