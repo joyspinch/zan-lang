@@ -4461,6 +4461,324 @@ static void emit_async_reload_slots(zan_irgen_t *g) {
     }
 }
 
+/* ---- await A-normal-form (ANF) normalization ----
+ *
+ * S3 keeps a value alive across a suspension only when it is a named scalar
+ * local (those live in the heap frame and are reloaded at every state block).
+ * An intermediate SSA temp produced *before* an await and consumed *after* it
+ * does not survive: the resume-k block is entered from the entry switch, so a
+ * value computed in the pre-suspend block does not dominate it and LLVM rejects
+ * the module ("instruction does not dominate all uses"). This shows up for
+ * compound / multiple awaits, e.g. `c + await f()`, `await a() + await b()`,
+ * or `h(await a(), await b())`.
+ *
+ * This pass rewrites each async body into A-normal form for awaits: every
+ * `await E` in a linearly-evaluated position becomes its own preceding
+ * statement `int $awN = await E;` and the original occurrence is replaced by a
+ * reference to `$awN`. Because `$awN` is a named scalar local it is made
+ * frame-resident by async_scan and reloaded after the suspension, so no value
+ * crosses a suspend point in a register. Awaits inside short-circuit (`&&`,
+ * `||`) and conditional (`?:`) operands, and inside loop conditions/steps, are
+ * left in place (their existing control-flow lowering handles them and hoisting
+ * would change evaluation semantics). */
+
+typedef struct {
+    zan_irgen_t    *g;
+    zan_ast_list_t *out;  /* hoisted statements, appended in evaluation order */
+    int            *counter;
+} anf_ctx_t;
+
+static bool anf_expr_contains_await(zan_ast_node_t *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case AST_AWAIT_EXPR: return true;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        return anf_expr_contains_await(e->binary.left) ||
+               anf_expr_contains_await(e->binary.right);
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        return anf_expr_contains_await(e->unary.operand);
+    case AST_CALL: {
+        if (anf_expr_contains_await(e->call.callee)) return true;
+        for (int i = 0; i < e->call.args.count; i++)
+            if (anf_expr_contains_await(e->call.args.items[i])) return true;
+        return false;
+    }
+    case AST_MEMBER_ACCESS: return anf_expr_contains_await(e->member.object);
+    case AST_INDEX:
+        return anf_expr_contains_await(e->index.object) ||
+               anf_expr_contains_await(e->index.index);
+    case AST_CONDITIONAL:
+        return anf_expr_contains_await(e->conditional.cond) ||
+               anf_expr_contains_await(e->conditional.then_expr) ||
+               anf_expr_contains_await(e->conditional.else_expr);
+    case AST_NEW_EXPR: {
+        for (int i = 0; i < e->new_expr.args.count; i++)
+            if (anf_expr_contains_await(e->new_expr.args.items[i])) return true;
+        return false;
+    }
+    case AST_CAST_EXPR: return anf_expr_contains_await(e->cast.expr);
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:  return anf_expr_contains_await(e->type_test.expr);
+    default: return false;
+    }
+}
+
+/* A side-effecting operand (a call, assignment, or ++/--) evaluated *before* an
+ * await in the same operand list would be reordered to run *after* the await if
+ * we only hoist the await (it stays in the residual). Detect that to reject it
+ * with a clear message instead of silently changing evaluation order. Awaits
+ * themselves are hoisted in order, so they are not counted here. */
+static bool anf_expr_has_side_effect(zan_ast_node_t *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case AST_AWAIT_EXPR: return false; /* hoisted separately, order preserved */
+    case AST_CALL: return true;
+    case AST_ASSIGNMENT: return true;
+    case AST_POSTFIX_UNARY: return true;
+    case AST_UNARY:
+        if (e->unary.op == TK_PLUS_PLUS || e->unary.op == TK_MINUS_MINUS) return true;
+        return anf_expr_has_side_effect(e->unary.operand);
+    case AST_BINARY:
+        return anf_expr_has_side_effect(e->binary.left) ||
+               anf_expr_has_side_effect(e->binary.right);
+    case AST_MEMBER_ACCESS: return anf_expr_has_side_effect(e->member.object);
+    case AST_INDEX:
+        return anf_expr_has_side_effect(e->index.object) ||
+               anf_expr_has_side_effect(e->index.index);
+    case AST_CAST_EXPR: return anf_expr_has_side_effect(e->cast.expr);
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:  return anf_expr_has_side_effect(e->type_test.expr);
+    default: return false;
+    }
+}
+
+static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e);
+
+/* If operand `before` (evaluated first) has side effects and a later operand
+ * `after` contains an await, hoisting only the await reorders them. Flag it. */
+static void anf_check_order(anf_ctx_t *c, zan_ast_node_t *before, zan_ast_node_t *after) {
+    if (after && before && anf_expr_contains_await(after) &&
+        anf_expr_has_side_effect(before)) {
+        zan_diag_emit(c->g->diag, DIAG_ERROR, before->loc,
+            "async: an expression with side effects is evaluated before an "
+            "await in the same expression; assign it to a local first");
+    }
+}
+
+/* Hoist `await E` into `int $awN = await E;` and return a reference to $awN. */
+static zan_ast_node_t *anf_hoist_await(anf_ctx_t *c, zan_ast_node_t *aw) {
+    /* normalize any nested awaits inside the awaited expression first */
+    aw->await_expr.expr = anf_expr(c, aw->await_expr.expr);
+
+    char buf[32];
+    int len = snprintf(buf, sizeof buf, "$aw%d", (*c->counter)++);
+    char *nm = (char *)zan_arena_alloc(c->g->arena, (size_t)len + 1);
+    memcpy(nm, buf, (size_t)len + 1);
+    zan_istr_t name = { nm, (uint32_t)len };
+
+    zan_ast_node_t *tref = zan_ast_new(c->g->arena, AST_TYPE_REF, aw->loc);
+    static const char intname[] = "int";
+    tref->type_ref.name = (zan_istr_t){ intname, 3 };
+
+    zan_ast_node_t *vd = zan_ast_new(c->g->arena, AST_VAR_DECL, aw->loc);
+    vd->var_decl.name = name;
+    vd->var_decl.type = tref;
+    vd->var_decl.initializer = aw;
+    zan_ast_list_push(c->out, vd, c->g->arena);
+
+    zan_ast_node_t *id = zan_ast_new(c->g->arena, AST_IDENTIFIER, aw->loc);
+    id->ident.name = name;
+    return id;
+}
+
+/* Recursively lift awaits out of a linearly-evaluated expression, appending
+ * hoisted `$awN` declarations to c->out in evaluation order and returning the
+ * residual expression (which no longer contains any hoistable await). */
+static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
+    if (!e) return e;
+    switch (e->kind) {
+    case AST_AWAIT_EXPR:
+        return anf_hoist_await(c, e);
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        if (e->binary.op == TK_AMP_AMP || e->binary.op == TK_PIPE_PIPE) {
+            /* short-circuit: only the left operand is unconditional. */
+            e->binary.left = anf_expr(c, e->binary.left);
+            return e;
+        }
+        anf_check_order(c, e->binary.left, e->binary.right);
+        e->binary.left  = anf_expr(c, e->binary.left);
+        e->binary.right = anf_expr(c, e->binary.right);
+        return e;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        e->unary.operand = anf_expr(c, e->unary.operand);
+        return e;
+    case AST_CALL:
+        for (int i = 0; i < e->call.args.count; i++) {
+            for (int j = i + 1; j < e->call.args.count; j++)
+                anf_check_order(c, e->call.args.items[i], e->call.args.items[j]);
+        }
+        e->call.callee = anf_expr(c, e->call.callee);
+        for (int i = 0; i < e->call.args.count; i++)
+            e->call.args.items[i] = anf_expr(c, e->call.args.items[i]);
+        return e;
+    case AST_MEMBER_ACCESS:
+        e->member.object = anf_expr(c, e->member.object);
+        return e;
+    case AST_INDEX:
+        anf_check_order(c, e->index.object, e->index.index);
+        e->index.object = anf_expr(c, e->index.object);
+        e->index.index  = anf_expr(c, e->index.index);
+        return e;
+    case AST_CONDITIONAL:
+        /* only the guard is unconditional; leave branch awaits in place. */
+        e->conditional.cond = anf_expr(c, e->conditional.cond);
+        return e;
+    case AST_CAST_EXPR:
+        e->cast.expr = anf_expr(c, e->cast.expr);
+        return e;
+    case AST_NEW_EXPR:
+        for (int i = 0; i < e->new_expr.args.count; i++) {
+            for (int j = i + 1; j < e->new_expr.args.count; j++)
+                anf_check_order(c, e->new_expr.args.items[i], e->new_expr.args.items[j]);
+        }
+        for (int i = 0; i < e->new_expr.args.count; i++)
+            e->new_expr.args.items[i] = anf_expr(c, e->new_expr.args.items[i]);
+        return e;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        e->type_test.expr = anf_expr(c, e->type_test.expr);
+        return e;
+    default:
+        return e;
+    }
+}
+
+static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter);
+
+/* Does a statement subtree contain any await? Used to decide whether a
+ * single-statement body must be wrapped in a block for hoisting. */
+static bool anf_stmt_contains_await(zan_ast_node_t *st) {
+    if (!st) return false;
+    switch (st->kind) {
+    case AST_VAR_DECL:    return anf_expr_contains_await(st->var_decl.initializer);
+    case AST_EXPR_STMT:   return anf_expr_contains_await(st->expr_stmt.expr);
+    case AST_RETURN_STMT: return anf_expr_contains_await(st->ret.value);
+    case AST_THROW_STMT:  return anf_expr_contains_await(st->throw_stmt.value);
+    case AST_IF_STMT:
+        return anf_expr_contains_await(st->if_stmt.cond) ||
+               anf_stmt_contains_await(st->if_stmt.then_body) ||
+               anf_stmt_contains_await(st->if_stmt.else_body);
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        return anf_expr_contains_await(st->while_stmt.cond) ||
+               anf_stmt_contains_await(st->while_stmt.body);
+    case AST_FOR_STMT:
+        return anf_stmt_contains_await(st->for_stmt.init) ||
+               anf_expr_contains_await(st->for_stmt.cond) ||
+               anf_expr_contains_await(st->for_stmt.step) ||
+               anf_stmt_contains_await(st->for_stmt.body);
+    case AST_FOREACH_STMT:
+        return anf_expr_contains_await(st->foreach_stmt.collection) ||
+               anf_stmt_contains_await(st->foreach_stmt.body);
+    case AST_BLOCK: {
+        for (int i = 0; i < st->block.stmts.count; i++)
+            if (anf_stmt_contains_await(st->block.stmts.items[i])) return true;
+        return false;
+    }
+    default: return false;
+    }
+}
+
+/* Ensure `*slot` is an AST_BLOCK so hoisted statements can be inserted before
+ * the awaits it contains, then normalize it. Used for single-statement bodies
+ * (e.g. `if (c) return await f();`). */
+static void anf_normalize_body(zan_irgen_t *g, zan_ast_node_t **slot, int *counter) {
+    zan_ast_node_t *body = *slot;
+    if (!body) return;
+    if (body->kind != AST_BLOCK) {
+        if (!anf_stmt_contains_await(body)) return;
+        zan_ast_node_t *blk = zan_ast_new(g->arena, AST_BLOCK, body->loc);
+        zan_ast_list_init(&blk->block.stmts);
+        zan_ast_list_push(&blk->block.stmts, body, g->arena);
+        *slot = blk;
+        body = blk;
+    }
+    anf_normalize_block(g, body, counter);
+}
+
+/* Normalize one statement, appending any hoisted declarations to `dst` (in
+ * evaluation order) *before* the statement is pushed by the caller. Nested
+ * statement bodies are normalized recursively. */
+static void anf_normalize_stmt(zan_irgen_t *g, zan_ast_node_t *st,
+                               zan_ast_list_t *dst, int *counter) {
+    if (!st) return;
+    anf_ctx_t c = { g, dst, counter };
+    switch (st->kind) {
+    case AST_VAR_DECL:
+        st->var_decl.initializer = anf_expr(&c, st->var_decl.initializer);
+        break;
+    case AST_EXPR_STMT:
+        st->expr_stmt.expr = anf_expr(&c, st->expr_stmt.expr);
+        break;
+    case AST_RETURN_STMT:
+        st->ret.value = anf_expr(&c, st->ret.value);
+        break;
+    case AST_THROW_STMT:
+        st->throw_stmt.value = anf_expr(&c, st->throw_stmt.value);
+        break;
+    case AST_IF_STMT:
+        /* condition is evaluated once → safe to hoist */
+        st->if_stmt.cond = anf_expr(&c, st->if_stmt.cond);
+        anf_normalize_body(g, &st->if_stmt.then_body, counter);
+        anf_normalize_body(g, &st->if_stmt.else_body, counter);
+        break;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        /* condition is re-evaluated each iteration → must NOT hoist it out */
+        anf_normalize_body(g, &st->while_stmt.body, counter);
+        break;
+    case AST_FOR_STMT:
+        anf_normalize_body(g, &st->for_stmt.body, counter);
+        break;
+    case AST_FOREACH_STMT:
+        anf_normalize_body(g, &st->foreach_stmt.body, counter);
+        break;
+    case AST_BLOCK:
+        anf_normalize_block(g, st, counter);
+        break;
+    case AST_TRY_STMT:
+        anf_normalize_body(g, &st->try_stmt.try_body, counter);
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            anf_normalize_body(g, &st->try_stmt.catches.items[i]->catch_clause.body, counter);
+        anf_normalize_body(g, &st->try_stmt.finally_body, counter);
+        break;
+    case AST_SWITCH_STMT:
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            anf_normalize_body(g, &st->switch_stmt.cases.items[i]->switch_case.body, counter);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Rebuild a block's statement list, inserting hoisted `$awN` declarations
+ * before each statement that needed them. */
+static void anf_normalize_block(zan_irgen_t *g, zan_ast_node_t *block, int *counter) {
+    if (!block || block->kind != AST_BLOCK) return;
+    zan_ast_list_t nl;
+    zan_ast_list_init(&nl);
+    for (int i = 0; i < block->block.stmts.count; i++) {
+        zan_ast_node_t *st = block->block.stmts.items[i];
+        anf_normalize_stmt(g, st, &nl, counter);
+        zan_ast_list_push(&nl, st, g->arena);
+    }
+    block->block.stmts = nl;
+}
+
 /* A named scalar local of an async method that must live in the heap frame so
  * its value survives across suspensions. `frame_index` is assigned when the
  * frame struct is laid out (params first, then these locals). */
@@ -5415,6 +5733,15 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 
+                /* Normalize awaits into A-normal form so no intermediate value
+                 * crosses a suspension in a register (compound / multiple
+                 * awaits). This mutates the body in place; the scan and body
+                 * emission below both see the rewritten tree. */
+                {
+                    int anf_counter = 0;
+                    anf_normalize_block(g, member->method_decl.body, &anf_counter);
+                }
+
                 /* Scan the body: count await points (→ states / sub-task slots)
                  * and collect named scalar locals that must live in the frame
                  * so they survive across suspensions. */
@@ -5782,6 +6109,12 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
 done:
     ;
+    /* An error diagnostic emitted during codegen (e.g. an unsupported await
+     * form flagged by the ANF pass) must fail the build — the driver only
+     * checks diagnostics before codegen, so surface it here. */
+    if (zan_diag_has_errors(g->diag)) {
+        return ZAN_ERROR;
+    }
     /* verify module */
     char *error = NULL;
     if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &error)) {
