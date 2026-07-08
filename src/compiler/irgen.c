@@ -4427,7 +4427,16 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_THIS_EXPR: {
-        /* this — first parameter of instance method */
+        /* `this` — load from the receiver alloca (g->current_this) when set. That
+         * alloca is the single source of truth for the receiver and, in an async
+         * method, is reloaded from the heap frame at every state block. The
+         * function's param 0 is NOT usable here for async methods: the resume
+         * function's param 0 is the frame pointer, not the receiver. Fall back to
+         * param 0 only when there is no receiver alloca (defensive). */
+        if (g->current_this) {
+            return LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(g->current_this),
+                g->current_this, "this");
+        }
         LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
         if (LLVMCountParams(fn) > 0) {
             return LLVMGetParam(fn, 0);
@@ -4436,7 +4445,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_BASE_EXPR: {
-        /* base — same as this for single inheritance */
+        /* base — same as this for single inheritance (see AST_THIS_EXPR). */
+        if (g->current_this) {
+            return LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(g->current_this),
+                g->current_this, "this");
+        }
         LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
         if (LLVMCountParams(fn) > 0) {
             return LLVMGetParam(fn, 0);
