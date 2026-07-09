@@ -520,6 +520,7 @@ int main(int argc, char **argv) {
     bool check_leaks = false;
     bool runtime_checks = true;
     bool publish_mode = false;
+    bool mt_scheduler = false;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
     int opt_level = -1; /* -1 = auto (O0 default, O2 for publish) */
@@ -540,6 +541,12 @@ int main(int argc, char **argv) {
             runtime_checks = false;
         } else if (strcmp(argv[i], "--publish") == 0) {
             publish_mode = true;
+        } else if (strcmp(argv[i], "--async-workers") == 0 ||
+                   strcmp(argv[i], "--mt") == 0) {
+            /* Use the multi-worker coroutine scheduler: async programs run
+             * their ready queue across a thread pool (worker count from the
+             * ZAN_CO_WORKERS env var at run time; default = CPU count). */
+            mt_scheduler = true;
         } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
             target_name = argv[++i];
         } else if (strcmp(argv[i], "--list-targets") == 0) {
@@ -890,7 +897,7 @@ int main(int argc, char **argv) {
     zan_irgen_t irgen;
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
                        cross_compiling ? target.triple : NULL,
-                       target.os == ZAN_OS_WINDOWS) != ZAN_OK) {
+                       target.os == ZAN_OS_WINDOWS, mt_scheduler) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
         zan_arena_free(arena);
         free(source);
@@ -957,6 +964,13 @@ int main(int argc, char **argv) {
         const char *rt_io_obj = NULL;
 #ifdef ZAN_RT_IO_OBJ
         if (irgen.uses_socket_async) rt_io_obj = ZAN_RT_IO_OBJ;
+#endif
+        /* --async-workers (mt_scheduler): the inline single-thread coroutine
+         * driver was NOT emitted, so the program must link the multi-worker
+         * reactor variant, which supplies both the reactor and the driver.
+         * Force-link it even for non-socket async programs. */
+#ifdef ZAN_RT_IO_MT_OBJ
+        if (mt_scheduler) rt_io_obj = ZAN_RT_IO_MT_OBJ;
 #endif
 
         /* Extra library search dirs for [DllImport] libs, taken from the

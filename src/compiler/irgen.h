@@ -168,13 +168,16 @@ struct zan_irgen {
      * "use the host default" (unchanged legacy behaviour). */
     char target_triple[128];
     bool target_is_windows;   /* true when emitting for Windows (Sleep vs poll) */
+    bool mt_scheduler;        /* --async-workers: skip the inline single-thread
+                               * coroutine driver and link the multi-worker one
+                               * from the zanrt_io_mt reactor object instead. */
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
                             const char *target_triple,
-                            bool target_is_windows);
+                            bool target_is_windows, bool mt_scheduler);
 void zan_irgen_destroy(zan_irgen_t *g);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);

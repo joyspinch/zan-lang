@@ -28,7 +28,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
                             const char *target_triple,
-                            bool target_is_windows) {
+                            bool target_is_windows, bool mt_scheduler) {
     memset(g, 0, sizeof(*g));
     g->arena = arena;
     g->diag = diag;
@@ -37,6 +37,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     if (target_triple && target_triple[0])
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
     g->target_is_windows = target_is_windows;
+    /* Must be set before the inline coroutine driver is (conditionally)
+     * emitted below, so the multi-worker mode can skip it. */
+    g->mt_scheduler = mt_scheduler;
 
     g->ctx = LLVMContextCreate();
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
@@ -224,8 +227,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
      * malloc'd nodes {next, frame, step}; zan_co_ready appends, zan_co_sched_run
      * drains, popping+freeing a node before invoking its step (which may itself
-     * enqueue). Semantically equivalent to src/runtime/rt_co.c. */
-    {
+     * enqueue). Semantically equivalent to src/runtime/rt_co.c.
+     *
+     * Skipped under --async-workers (g->mt_scheduler): the driver symbols are
+     * then left as external declarations and resolved from the multi-worker
+     * reactor object (zanrt_io_mt) at link time. */
+    if (!g->mt_scheduler) {
         LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
         LLVMTypeRef node_fields[] = { i8ptr /*next*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
         LLVMTypeRef node_ty = LLVMStructCreateNamed(g->ctx, "zan.co.node");
