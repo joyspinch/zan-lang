@@ -117,6 +117,24 @@ if(WIN32)
     endif()
 endif()
 
+# ---- Linux cross-compilation sysroot ----
+# Copy the bundled musl sysroot (committed at toolchain/linux-musl/) next to
+# zanc so that --target linux-musl / linux-x64 can static-link ELF binaries
+# without any external toolchain.  The sysroot contains crt*.o, libc.a, and
+# a pre-built zanrt_io.o for socket-async programs.
+set(LINUX_MUSL_SYS "${CMAKE_SOURCE_DIR}/toolchain/linux-musl")
+if(EXISTS "${LINUX_MUSL_SYS}/libc.a")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/toolchain/linux-musl
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LINUX_MUSL_SYS}/crt1.o" "${LINUX_MUSL_SYS}/crti.o"
+                "${LINUX_MUSL_SYS}/crtn.o" "${LINUX_MUSL_SYS}/libc.a"
+                "${LINUX_MUSL_SYS}/zanrt_io.o"
+                $<TARGET_FILE_DIR:zanc>/toolchain/linux-musl/
+        COMMENT "Copying Linux musl sysroot for cross-compilation"
+        VERBATIM)
+endif()
+
 
 # ---- Language Server (M8) ----
 # Reuses the compiler front-end (no LLVM dependency) plus the intellisense
@@ -193,8 +211,8 @@ if(ZAN_BUILD_GUI)
 endif()
 
 # ---- IDE ----
-# The IDE is built from examples/ide_demo.zan using the Zan compiler (zanc).
-# It is compiled separately: zanc examples/ide_demo.zan -o build/ide_demo.exe
+# The IDE is built from src/ide_zan/ide_demo.zan using the Zan compiler (zanc).
+# It is compiled separately: zanc src/ide_zan/ide_demo.zan -o build/ide_demo.exe
 # The old C-based zan-ide target has been removed in favour of ide_demo.
 
 # ---- Tests ----
@@ -250,7 +268,7 @@ add_test(NAME conformance_multifile
 # ---- Skeletal multi-file Zan compiler: lexer + parser + driver ----
 # A tiny expression compiler/evaluator written in Zan across three files,
 # exercising classes, enum/switch, List<class>, string char-lexing, casts and
-# cross-file references â€” the "host is strong enough" acceptance program.
+# cross-file references â€?the "host is strong enough" acceptance program.
 add_test(NAME conformance_minic
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
