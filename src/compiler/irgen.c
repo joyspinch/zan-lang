@@ -1265,18 +1265,22 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
             if (gf && gf->kind == SYM_METHOD) return gf->type;
             return NULL;
         }
-        if (callee->kind == AST_MEMBER_ACCESS &&
-            callee->member.object->kind == AST_IDENTIFIER) {
-            /* instance: local.Method() */
-            local_var_t *lv = local_find(locals, callee->member.object->ident.name);
-            if (lv && lv->type && lv->type->sym) {
-                zan_symbol_t *m = get_method_sym(lv->type->sym, callee->member.name);
-                if (m) return m->type;
+        if (callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *obj = callee->member.object;
+            /* static: ClassName.Method() (class name, not a shadowing local) */
+            if (obj->kind == AST_IDENTIFIER && !local_find(locals, obj->ident.name)) {
+                zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
+                if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
+                    zan_symbol_t *m = get_method_sym(ts, callee->member.name);
+                    if (m) return m->type;
+                }
             }
-            /* static: ClassName.Method() */
-            zan_symbol_t *ts = zan_binder_lookup(g->binder, callee->member.object->ident.name);
-            if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
-                zan_symbol_t *m = get_method_sym(ts, callee->member.name);
+            /* instance: <expr>.Method() -- resolve the receiver type
+             * generally (local, this, field, index, or a nested call) so
+             * that fluent chains a.M1().M2().M3() infer at any depth. */
+            zan_type_t *rt = infer_expr_type(g, obj, locals);
+            if (rt && rt->sym) {
+                zan_symbol_t *m = get_method_sym(rt->sym, callee->member.name);
                 if (m) return m->type;
             }
         }
@@ -3981,6 +3985,23 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     }
                 }
                 return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+            }
+        }
+
+        /* Static class/struct field access: ClassName.StaticField.
+         * Fold a const-style declaration (`static int X = 1;`) to the
+         * value of its initializer, mirroring enum member access. */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            !local_find(locals, expr->member.object->ident.name)) {
+            zan_symbol_t *cs = zan_binder_lookup(g->binder, expr->member.object->ident.name);
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                zan_symbol_t *fs = get_field_sym(cs, expr->member.name);
+                if (fs && fs->decl && fs->decl->kind == AST_FIELD_DECL &&
+                    fs->decl->field_decl.initializer &&
+                    ((fs->modifiers & MOD_STATIC) ||
+                     (fs->decl->field_decl.modifiers & MOD_STATIC))) {
+                    return emit_expr(g, fs->decl->field_decl.initializer, locals);
+                }
             }
         }
 

@@ -4,6 +4,19 @@ using System.Data;
 namespace System.Data.Orm;
 
 /// <summary>
+/// SQL paging dialects. Different engines express LIMIT/OFFSET differently.
+///   - Standard : LIMIT n OFFSET m   (SQLite, MySQL, PostgreSQL, ClickHouse,
+///                                    QuestDB, DuckDB, Firebird 3+)
+///   - SqlServer: OFFSET m ROWS FETCH NEXT n ROWS ONLY  (requires ORDER BY)
+///   - Oracle   : OFFSET m ROWS FETCH NEXT n ROWS ONLY  (12c+)
+/// </summary>
+class SqlDialect {
+    static int Standard  = 0;
+    static int SqlServer = 1;
+    static int Oracle    = 2;
+}
+
+/// <summary>
 /// Fluent SQL query builder inspired by FreeSQL.
 /// Supports SELECT, INSERT, UPDATE, DELETE with method chaining.
 ///
@@ -26,6 +39,7 @@ class QueryBuilder {
     string joinClause;
     int limitVal;
     int offsetVal;
+    int dialect;
     List<string> setColumns;
     List<string> setValues;
     bool distinct;
@@ -39,6 +53,7 @@ class QueryBuilder {
         this.joinClause = "";
         this.limitVal = -1;
         this.offsetVal = -1;
+        this.dialect = SqlDialect.Standard;
         this.setColumns = new List<string>();
         this.setValues = new List<string>();
         this.distinct = false;
@@ -85,8 +100,8 @@ class QueryBuilder {
     }
 
     /// <summary>Adds a WHERE with parameterized value (SQL injection safe).</summary>
-    QueryBuilder WhereEq(string column, string value) {
-        string cond = column + " = '" + EscapeString(value) + "'";
+    QueryBuilder WhereEq(string column, string val) {
+        string cond = column + " = '" + EscapeString(val) + "'";
         return Where(cond);
     }
 
@@ -181,6 +196,12 @@ class QueryBuilder {
         return this;
     }
 
+    /// <summary>Selects the SQL paging dialect (see SqlDialect).</summary>
+    QueryBuilder Dialect(int d) {
+        this.dialect = d;
+        return this;
+    }
+
     /// <summary>Sets DISTINCT flag.</summary>
     QueryBuilder Distinct() {
         this.distinct = true;
@@ -188,16 +209,16 @@ class QueryBuilder {
     }
 
     /// <summary>Sets a column=value pair for INSERT/UPDATE.</summary>
-    QueryBuilder Set(string column, string value) {
+    QueryBuilder Set(string column, string val) {
         this.setColumns.Add(column);
-        this.setValues.Add(value);
+        this.setValues.Add(val);
         return this;
     }
 
     /// <summary>Sets an integer column=value pair.</summary>
-    QueryBuilder SetInt(string column, int value) {
+    QueryBuilder SetInt(string column, int val) {
         this.setColumns.Add(column);
-        this.setValues.Add(Convert.ToString(value));
+        this.setValues.Add(Convert.ToString(val));
         return this;
     }
 
@@ -303,13 +324,29 @@ class QueryBuilder {
             sb.Append(" ORDER BY ");
             sb.Append(this.orderByClause);
         }
-        if (this.limitVal >= 0) {
-            sb.Append(" LIMIT ");
-            sb.Append(Convert.ToString(this.limitVal));
-        }
-        if (this.offsetVal >= 0) {
-            sb.Append(" OFFSET ");
-            sb.Append(Convert.ToString(this.offsetVal));
+        if (this.dialect == SqlDialect.Standard) {
+            if (this.limitVal >= 0) {
+                sb.Append(" LIMIT ");
+                sb.Append(Convert.ToString(this.limitVal));
+            }
+            if (this.offsetVal >= 0) {
+                sb.Append(" OFFSET ");
+                sb.Append(Convert.ToString(this.offsetVal));
+            }
+        } else {
+            // SQL Server / Oracle: OFFSET m ROWS FETCH NEXT n ROWS ONLY.
+            if (this.offsetVal >= 0 || this.limitVal >= 0) {
+                int off = this.offsetVal;
+                if (off < 0) { off = 0; }
+                sb.Append(" OFFSET ");
+                sb.Append(Convert.ToString(off));
+                sb.Append(" ROWS");
+                if (this.limitVal >= 0) {
+                    sb.Append(" FETCH NEXT ");
+                    sb.Append(Convert.ToString(this.limitVal));
+                    sb.Append(" ROWS ONLY");
+                }
+            }
         }
     }
 

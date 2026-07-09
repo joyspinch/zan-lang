@@ -21,6 +21,7 @@
 #include <process.h>
 #else
 #include <unistd.h>
+#include <dirent.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -47,6 +48,57 @@ static char *read_file(const char *path, size_t *out_len) {
     fclose(f);
     if (out_len) *out_len = read;
     return buf;
+}
+
+/* ---- input-file list helpers (auto-stdlib dedup) ---- */
+
+/* Produce a normalized comparison key for a path so the same file passed both
+ * explicitly and via auto-stdlib (which may differ in case / slash direction,
+ * e.g. "stdlib\Gui\Widget\Select.zan" vs "...\stdlib\gui/widget\Select.zan")
+ * compares equal and is only compiled once. */
+static void canon_key(const char *in, char *out, size_t out_sz) {
+#ifdef _WIN32
+    char full[1024];
+    DWORD n = GetFullPathNameA(in, (DWORD)sizeof(full), full, NULL);
+    if (n == 0 || n >= sizeof(full)) snprintf(full, sizeof(full), "%s", in);
+    size_t j = 0;
+    for (size_t i = 0; full[i] && j + 1 < out_sz; i++) {
+        char c = full[i];
+        if (c == '/') c = '\\';
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[j++] = c;
+    }
+    out[j] = '\0';
+#else
+    char full[4096];
+    if (realpath(in, full) == NULL) snprintf(full, sizeof(full), "%s", in);
+    snprintf(out, out_sz, "%s", full);
+#endif
+}
+
+static int input_file_present(const char **files, int count, const char *cand) {
+    char ck[1024];
+    canon_key(cand, ck, sizeof(ck));
+    for (int i = 0; i < count; i++) {
+        char ek[1024];
+        canon_key(files[i], ek, sizeof(ek));
+        if (strcmp(ck, ek) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Append an auto-discovered stdlib file: skip if it does not exist or is
+ * already present (explicitly or from an earlier auto-include). */
+static void add_stdlib_input(const char **files, int *count, const char *path) {
+    FILE *check = fopen(path, "rb");
+    if (!check) return;
+    fclose(check);
+    if (input_file_present(files, *count, path)) return;
+    if (*count < 128) {
+        char *dup = (char *)malloc(strlen(path) + 1);
+        strcpy(dup, path);
+        files[(*count)++] = dup;
+    }
 }
 
 /* ---- dump tokens ---- */
@@ -579,25 +631,19 @@ int main(int argc, char **argv) {
             {"System.Net.Mqtt",  "System/Net/Mqtt",  {"MqttClient.zan", NULL}},
             {"System.Net",       "System/Net",        {"Net.zan", "Worker.zan", NULL}},
             {"System.Data.Orm",  "System/Data/Orm",  {"Model.zan", "QueryBuilder.zan", NULL}},
+            {"System.Data.Sqlite",   "System/Data/Sqlite",   {"SqliteConnection.zan", NULL}},
+            {"System.Data.Postgres", "System/Data/Postgres", {"PgConnection.zan", NULL}},
             {"System.Data",      "System/Data",      {"DbConnection.zan", "DbResult.zan", NULL}},
             {"System.Diagnostics", "System/Diagnostics", {"Process.zan", NULL}},
             {"Platform",         "Platform",          {"Runtime.zan", NULL}},
             {"System.Windows.Forms", "System/Windows", {"Forms.zan", NULL}},
             {"System.Drawing", "System/Drawing", {"Primitives.zan", "Graphics.zan", NULL}},
-            {"Gui", "gui", {
-                "Types.zan", "Theme.zan", "Render.zan", "Native.zan",
-                "Event.zan", "Layout.zan", "App.zan", "Reactive.zan",
-                "Icon.zan", NULL
-            }},
-            {"Gui.Widget", "gui/widget", {
-                "Button.zan", "Checkbox.zan", "Radio.zan", "Switch.zan",
-                "Slider.zan", "Progress.zan", "Card.zan", "Modal.zan",
-                "Tabs.zan", "Tag.zan", "Badge.zan", "Avatar.zan",
-                "Tooltip.zan", "Divider.zan", "Select.zan", "Table.zan",
-                "Steps.zan", "Notification.zan", "Scrollbar.zan",
-                "Skeleton.zan", "Empty.zan", "Input.zan", "Label.zan",
-                "Loading.zan", "Breadcrumb.zan", "Pagination.zan", NULL
-            }},
+            /* "*" = auto-include every .zan file in the subdir. The gui and
+             * widget catalogs grow over time and any component may reference
+             * any other, so glob the whole directory rather than tracking a
+             * hand-maintained (and previously incomplete) file list. */
+            {"Gui", "gui", {"*", NULL}},
+            {"Gui.Widget", "gui/widget", {"*", NULL}},
             {NULL, NULL, {NULL}}
         };
         /* Resolve stdlib dependencies to a fixpoint: an included file (user
@@ -632,23 +678,55 @@ int main(int argc, char **argv) {
                 if (!ns_used[mi] || ns_added[mi]) continue;
                 ns_added[mi] = 1;
                 changed = 1;
-                for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
-                    char mod_path[1024];
+                if (stdlib_map[mi].files[0] &&
+                    strcmp(stdlib_map[mi].files[0], "*") == 0) {
+                    /* Glob every .zan file in the namespace's subdir. */
 #ifdef _WIN32
-                    snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
-                             stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+                    char glob_path[1024];
+                    snprintf(glob_path, sizeof(glob_path), "%s\\%s\\*.zan",
+                             stdlib_root, stdlib_map[mi].subdir);
+                    WIN32_FIND_DATAA fd;
+                    HANDLE h = FindFirstFileA(glob_path, &fd);
+                    if (h != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                            char mod_path[1024];
+                            snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                                     stdlib_root, stdlib_map[mi].subdir, fd.cFileName);
+                            add_stdlib_input(input_files, &input_count, mod_path);
+                        } while (FindNextFileA(h, &fd));
+                        FindClose(h);
+                    }
 #else
-                    snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
-                             stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
-#endif
-                    FILE *check = fopen(mod_path, "rb");
-                    if (check) {
-                        fclose(check);
-                        if (input_count < 128) {
-                            char *dup = (char *)malloc(strlen(mod_path) + 1);
-                            strcpy(dup, mod_path);
-                            input_files[input_count++] = dup;
+                    char dir_path[1024];
+                    snprintf(dir_path, sizeof(dir_path), "%s/%s",
+                             stdlib_root, stdlib_map[mi].subdir);
+                    DIR *d = opendir(dir_path);
+                    if (d) {
+                        struct dirent *ent;
+                        while ((ent = readdir(d)) != NULL) {
+                            size_t nlen = strlen(ent->d_name);
+                            if (nlen < 5 ||
+                                strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
+                            char mod_path[1024];
+                            snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
+                                     stdlib_root, stdlib_map[mi].subdir, ent->d_name);
+                            add_stdlib_input(input_files, &input_count, mod_path);
                         }
+                        closedir(d);
+                    }
+#endif
+                } else {
+                    for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
+                        char mod_path[1024];
+#ifdef _WIN32
+                        snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                                 stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+#else
+                        snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
+                                 stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+#endif
+                        add_stdlib_input(input_files, &input_count, mod_path);
                     }
                 }
             }
