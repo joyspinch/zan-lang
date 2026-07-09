@@ -81,6 +81,9 @@ struct zan_irgen {
     LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
     LLVMValueRef rt_release;     /* zan_rt_release(void*) */
     LLVMValueRef rt_alloc;       /* zan_rt_alloc(int64_t size) -> void* */
+    LLVMValueRef rt_str_retain;  /* zan_rt_str_retain(void*) */
+    LLVMValueRef rt_str_release; /* zan_rt_str_release(void*) */
+    LLVMValueRef rt_str_alloc;   /* zan_rt_str_alloc(int64_t size) -> void* */
 
     /* runtime diagnostics & leak detection */
     LLVMValueRef fn_printf;       /* int printf(const char*, ...) */
@@ -115,6 +118,13 @@ struct zan_irgen {
     LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */
     LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64 thread_handle } */
     LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
+
+    /* string literal cache (dedup same-content globals) */
+    struct {
+        zan_istr_t text;
+        LLVMValueRef value;
+    } string_literals[2048];
+    int string_literal_count;
 
     /* async/await CPS lowering (see docs/ASYNC_CPS_DESIGN.md) */
     LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
