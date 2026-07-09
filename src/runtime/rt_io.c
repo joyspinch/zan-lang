@@ -271,34 +271,24 @@ typedef struct zan_io_op {
 
 static HANDLE g_iocp;
 
-/* Sockets already associated with the completion port (association is
- * one-shot and permanent for the life of the socket). */
-static SOCKET *g_assoc;
-static int     g_assoc_len;
-static int     g_assoc_cap;
-
-static int assoc_contains(SOCKET s) {
-    for (int i = 0; i < g_assoc_len; i++)
-        if (g_assoc[i] == s) return 1;
-    return 0;
-}
-
+/* Associate a socket with the completion port. Association is one-shot per
+ * socket *kernel object*, but socket HANDLE numbers are recycled by Windows
+ * after a socket is closed. Caching associated handles (by value) would then
+ * wrongly skip associating a brand-new socket that happens to reuse a closed
+ * handle's number, and that socket's overlapped completions would never be
+ * delivered to the port (the coroutine awaiting it blocks forever). So just
+ * (re)associate on every registration and treat "already associated with this
+ * port" (ERROR_INVALID_PARAMETER) as success. */
 static void ensure_assoc(SOCKET s) {
-    if (assoc_contains(s)) return;
-    if (g_assoc_len == g_assoc_cap) {
-        g_assoc_cap = g_assoc_cap ? g_assoc_cap * 2 : 64;
-        g_assoc = (SOCKET *)realloc(g_assoc, (size_t)g_assoc_cap * sizeof(SOCKET));
+    if (CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0) == NULL) {
+        DWORD e = GetLastError();
+        (void)e;   /* ERROR_INVALID_PARAMETER == already bound to this port */
     }
-    CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0);
-    g_assoc[g_assoc_len++] = s;
 }
 
 void zan_io_init(void) {
     if (g_io_started) return;
     g_io_count = 0;
-    g_assoc = NULL;
-    g_assoc_len = 0;
-    g_assoc_cap = 0;
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
@@ -307,9 +297,6 @@ void zan_io_init(void) {
 
 void zan_io_shutdown(void) {
     if (g_iocp) { CloseHandle(g_iocp); g_iocp = NULL; }
-    free(g_assoc);
-    g_assoc = NULL;
-    g_assoc_len = g_assoc_cap = 0;
     g_io_count = 0;
     WSACleanup();
     g_io_started = 0;
