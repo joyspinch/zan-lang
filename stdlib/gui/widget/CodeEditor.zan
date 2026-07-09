@@ -1094,6 +1094,7 @@ class CodeEditor {
 
         // If in dot-mode, filter the full member list by the typed prefix
         if (acDot) {
+            if (acStart > curCol || acStart < 0) { acActive = false; acDot = false; return; }
             string prefix = ln.Substring(acStart, curCol - acStart);
             acAllItems = new List<string>();
             acAllKinds = new List<string>();
@@ -1466,6 +1467,12 @@ class CodeEditor {
         int dotPos = curCol - 1;
         if (dotPos < 0) { acActive = false; return; }
 
+        // On a `using X.` directive, complete child namespaces, not members.
+        if (CodeEditor.StartsWithP(CodeEditor.TrimStr(ln), "using ")) {
+            UsingDotCompletion();
+            return;
+        }
+
         // Walk backwards through the chain: skip matched parens and identifiers
         string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         int pos = dotPos;
@@ -1565,6 +1572,71 @@ class CodeEditor {
         if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
         acSel = 0;
         ApplyKindFilter();
+    }
+
+    /// Namespace completion for a `using X.` directive: lists the child
+    /// namespaces of the prefix typed so far (e.g. `using System.` -> Data,
+    /// Net, IO, Text, ...). Derived from the stdlib namespace catalog so it
+    /// never invents members and never falls through to the type-member path.
+    void UsingDotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        string nsset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+        int s = dotPos;
+        while (s > 0 && CodeEditor.InSet(nsset, ln.Substring(s - 1, 1))) { s = s - 1; }
+        string prefix = ln.Substring(s, dotPos - s);
+        while (prefix.Length > 0 && prefix.Substring(prefix.Length - 1, 1) == ".") {
+            prefix = prefix.Substring(0, prefix.Length - 1);
+        }
+        acStart = curCol;
+        acDot = true;
+        acFull = new List<string>();
+        List<string> kids = new List<string>();
+        CodeEditor.ChildNamespaces(prefix, kids);
+        int ki = 0;
+        while (ki < kids.Count) { acFull.Add(kids[ki]); ki = ki + 1; }
+        acFilter = "";
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        int fi = 0;
+        while (fi < acFull.Count) {
+            acAllItems.Add(acFull[fi]);
+            acAllKinds.Add("M");
+            fi = fi + 1;
+        }
+        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// Appends to `out2` the distinct next-segment child namespaces of `prefix`
+    /// found in the stdlib catalog (e.g. prefix "System.Data" -> Orm Sqlite
+    /// Postgres).
+    static void ChildNamespaces(string prefix, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        string pre = prefix + ".";
+        int i = 0;
+        string cur = "";
+        while (i <= data.Length) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                string key = cur;
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) { key = cur.Substring(0, eq); }
+                if (key.Length > pre.Length && CodeEditor.StartsWithP(key, pre)) {
+                    string rest = key.Substring(pre.Length, key.Length - pre.Length);
+                    string seg = rest;
+                    int dotp = CodeEditor.Find(rest, ".");
+                    if (dotp > 0) { seg = rest.Substring(0, dotp); }
+                    if (seg.Length > 0 && !CodeEditor.Has(out2, seg)) { out2.Add(seg); }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
     }
 
     /// Populates member lists for known types.
@@ -1992,6 +2064,8 @@ class CodeEditor {
             + "System.Net.Mqtt=MqttClient MqttPacketType MqttQos;"
             + "System.Net=Dns IPAddress SocketHttpClient TcpSocket Worker Connection;"
             + "System.Data.Orm=Model ModelQuery ModelRow ModelUpdate ModelDelete Migration QueryBuilder;"
+            + "System.Data.Sqlite=SqliteConnection;"
+            + "System.Data.Postgres=PgConnection;"
             + "System.Data=DbConnection DbProvider DbResult;"
             + "System.Diagnostics=Process;"
             + "System.Drawing=Graphics Bitmap Font Rectangle;"
