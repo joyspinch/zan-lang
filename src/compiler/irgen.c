@@ -213,6 +213,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef wc_args[] = { i64d, i32d, i8ptr, g->co_step_ptr };
         g->rt_io_wait_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), wc_args, 4, 0);
         g->rt_io_wait_co = LLVMAddFunction(g->mod, "zan_io_wait_co", g->rt_io_wait_co_type);
+        LLVMTypeRef i64ptr = LLVMPointerType(i64d, 0);
+        LLVMTypeRef rc_args[] = { i64d, i8ptr, i32d, i8ptr, g->co_step_ptr, i64ptr };
+        g->rt_io_recv_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rc_args, 6, 0);
+        g->rt_io_recv_co = LLVMAddFunction(g->mod, "zan_io_recv_co", g->rt_io_recv_co_type);
         g->rt_io_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
         g->rt_io_pump = LLVMAddFunction(g->mod, "zan_io_pump", g->rt_io_pump_type);
         LLVMSetLinkage(g->rt_io_pump, LLVMWeakAnyLinkage);
@@ -4682,6 +4686,63 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 emit_async_reload_slots(g);
                 return LLVMConstInt(di64, 0, 0);
+            }
+        }
+
+        /* await Socket.RecvOv(fd, buf, len) — overlapped receive. Unlike
+         * ReadReady (a bare readiness probe followed by a synchronous recv in
+         * zan), this posts the real recv via zan_io_recv_co and SUSPENDS; the
+         * byte count is written by the reactor into this frame's RESULT slot
+         * before it is re-readied, and the resume-k block loads it as the await
+         * value. Issuing the recv as one op removes the probe/recv window that
+         * leaked completions under the multi-worker driver at high load. */
+        {
+            if (is_call_to(expr->await_expr.expr, "Socket", "RecvOv") &&
+                expr->await_expr.expr->call.args.count == 3) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.RecvOv is only supported inside an async method");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef fd = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(fd) != di64)
+                    fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
+                LLVMValueRef buf = emit_expr(g, expr->await_expr.expr->call.args.items[1], locals);
+                if (LLVMTypeOf(buf) != di8ptr)
+                    buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "recvbuf");
+                LLVMValueRef len = emit_expr(g, expr->await_expr.expr->call.args.items[2], locals);
+                if (LLVMTypeOf(len) != di32)
+                    len = LLVMBuildIntCast2(g->builder, len, di32, 1, "len32");
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                /* &self.result — the reactor stores the recv byte count here. */
+                LLVMValueRef out_n = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.iores");
+                LLVMBuildCall2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
+                    (LLVMValueRef[]){ fd, buf, len, self_i8,
+                        g->current_async_resume_fn, out_n }, 6, "");
+                emit_async_save_slots(g);
+                LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                /* recompute the result GEP: entry dominates rk, the pre-suspend
+                 * block does not. */
+                LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.iores2");
+                return LLVMBuildLoad2(g->builder, di64, res_slot, "recvn");
             }
         }
 

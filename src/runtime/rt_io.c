@@ -24,6 +24,7 @@
 
 #include "rt_io.h"
 #include "rt_co.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -80,16 +81,36 @@ static void io_wake(void *co, zan_co_step_t step) {
 }
 
 #if !defined(_WIN32)
+#include <sys/socket.h>
 /* ---- readiness watcher (epoll / kqueue / select backends) ---- */
 typedef struct zan_io_entry {
     int fd;
     int interest;           /* ZAN_IO_READ or ZAN_IO_WRITE */
     void *co;               /* fiber handle, or stackless frame pointer */
     zan_co_step_t step;     /* stackless resume fn (NULL => stackful fiber) */
+    void *rbuf;             /* recv sink (zan_io_recv_co); NULL => plain probe */
+    int   rlen;
+    int64_t *out_n;         /* recv byte-count sink (NULL => plain probe) */
     struct zan_io_entry *next;
 } zan_io_entry_t;
 
 static zan_io_entry_t *g_io_entries;    /* linked list of active watchers */
+
+/* Pending recv-op parameters, consumed by the next io_register. The POSIX
+ * backends run only under the single-thread inline driver, so plain statics are
+ * safe (the multi-worker driver is Windows/IOCP-only). */
+static void   *g_pending_rbuf;
+static int      g_pending_rlen;
+static int64_t *g_pending_out_n;
+
+/* On POSIX there is no overlapped recv, so zan_io_recv_co registers a readiness
+ * watcher and performs the recv here once the fd is readable -- same net effect
+ * (one recv per await, byte count delivered via out_n). No-op for plain probes. */
+static void io_deliver_recv(zan_io_entry_t *e) {
+    if (!e->out_n) return;
+    ssize_t rn = recv(e->fd, e->rbuf, (size_t)e->rlen, 0);
+    *e->out_n = (rn < 0) ? 0 : (int64_t)rn;
+}
 #endif
 
 /* ---- platform backend ---- */
@@ -137,6 +158,11 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     e->interest = interest;
     e->co = co;
     e->step = step;
+    e->rbuf = g_pending_rbuf;
+    e->rlen = g_pending_rlen;
+    e->out_n = g_pending_out_n;
+    g_pending_rbuf = NULL;
+    g_pending_out_n = NULL;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -165,6 +191,7 @@ int zan_io_poll(int64_t timeout_ms) {
                 zan_co_step_t step = e->step;
                 *pp = e->next;
                 epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+                io_deliver_recv(e);
                 free(e);
                 g_io_count--;
                 io_wake(co, step);
@@ -218,6 +245,11 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     e->interest = interest;
     e->co = co;
     e->step = step;
+    e->rbuf = g_pending_rbuf;
+    e->rlen = g_pending_rlen;
+    e->out_n = g_pending_out_n;
+    g_pending_rbuf = NULL;
+    g_pending_out_n = NULL;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -244,6 +276,7 @@ int zan_io_poll(int64_t timeout_ms) {
                 void *co = e->co;
                 zan_co_step_t step = e->step;
                 *pp = e->next;
+                io_deliver_recv(e);
                 free(e);
                 g_io_count--;
                 io_wake(co, step);
@@ -273,6 +306,7 @@ typedef struct zan_io_op {
     int        interest;     /* ZAN_IO_READ / ZAN_IO_WRITE */
     void      *co;           /* fiber handle, or stackless frame pointer */
     zan_co_step_t step;      /* stackless resume fn (NULL => stackful fiber) */
+    int64_t   *out_n;        /* recv byte-count sink (NULL => readiness probe) */
 } zan_io_op_t;
 
 static HANDLE g_iocp;
@@ -294,23 +328,18 @@ static void ensure_assoc(SOCKET s) {
         (void)e;   /* ERROR_INVALID_PARAMETER == already bound to this port */
     }
 #if defined(ZAN_CO_DRIVER)
-    /* Skip queuing an IOCP packet when an overlapped op completes inline
-     * (data already buffered). Under the multi-worker driver such inline
-     * completions were being lost under high load -- a zero-byte WSARecv on an
-     * already-readable socket returns 0, but the assumed follow-up completion
-     * packet did not reliably arrive, leaking the in-flight count until every
-     * connection parked (server hang). With this mode set, io_register resumes
-     * the waiter directly on inline success instead of awaiting a packet. */
-#ifndef FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
-#define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 0x1
-#endif
-    BOOL ok = SetFileCompletionNotificationModes(
-                  (HANDLE)s, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
-    /* Record whether the OS honoured skip-on-success. io_register only takes
-     * the inline-resume shortcut when it did; otherwise an inline completion
-     * still posts a packet and must be left to the IOCP (resuming inline too
-     * would double-complete the op). The result is uniform per OS. */
-    if (g_skip_mode < 0) InterlockedExchange(&g_skip_mode, ok ? 1 : 0);
+    /* Do NOT enable FILE_SKIP_COMPLETION_PORT_ON_SUCCESS under the multi-worker
+     * driver. Skip-on-success means an inline completion posts no IOCP packet,
+     * so the op site must resume the waiter itself -- but that resume happens
+     * mid-step, while the coroutine is still executing (before it saves its live
+     * slots, advances its resume state, and returns). Re-queueing the frame that
+     * early lets another worker pop and re-enter it at the wrong state, racing
+     * the still-running step and eventually deadlocking the pool under load.
+     * Leaving skip-on-success off makes every completion (inline or pending)
+     * arrive as an IOCP packet that co_wait_io delivers only after the frame has
+     * fully suspended -- the serialization point the pool needs. g_skip_mode
+     * stays 0 so io_register / zan_io_recv_co never take the inline shortcut. */
+    if (g_skip_mode < 0) InterlockedExchange(&g_skip_mode, 0);
 #endif
 }
 
@@ -418,6 +447,53 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
 }
 
+/* Overlapped receive. Issues the real WSARecv into `buf` (no zero-byte probe),
+ * so exactly one op delivers the data and its byte count -- eliminating the
+ * probe/synchronous-recv window that leaked completions under the multi-worker
+ * driver at high load. The byte count reaches the coroutine via `*out_n`, set
+ * either inline (immediate completion) or when the completion is dequeued. */
+void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
+                    zan_co_step_t step, int64_t *out_n) {
+    zan_io_init();
+    SOCKET s = (SOCKET)fd;
+    ensure_assoc(s);
+
+    zan_io_op_t *op = (zan_io_op_t *)calloc(1, sizeof(*op));
+    op->sock = s;
+    op->interest = ZAN_IO_READ;
+    op->co = frame;
+    op->step = step;
+    op->out_n = out_n;
+    IO_CNT_INC();
+
+    WSABUF b;
+    b.len = (ULONG)len;
+    b.buf = (char *)buf;
+    DWORD flags = 0, got = 0;
+    int r = WSARecv(s, &b, 1, &got, &flags, &op->ov, NULL);
+    if (r == 0) {
+#if defined(ZAN_CO_DRIVER)
+        /* Immediate completion. With skip-on-success no packet is queued, so
+         * deliver the count and resume here; otherwise a packet is still queued
+         * and zan_io_poll/co_wait_io will deliver it (avoid double-completion). */
+        if (g_skip_mode == 1) {
+            if (out_n) *out_n = (int64_t)got;
+            free(op);
+            IO_CNT_DEC();
+            if (step) zan_co_ready(frame, step);
+        }
+        return;
+#else
+        return;   /* single-thread reactor: packet still queued to the IOCP */
+#endif
+    }
+    int e = WSAGetLastError();
+    if (e == WSA_IO_PENDING) return;
+    /* Hard error: report 0 bytes (peer-close semantics) via a queued packet. */
+    if (out_n) *out_n = 0;
+    PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
+}
+
 int zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
@@ -431,6 +507,7 @@ int zan_io_poll(int64_t timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        if (op->out_n) *op->out_n = (int64_t)entries[i].dwNumberOfBytesTransferred;
         free(op);
         g_io_count--;
         io_wake(co, step);
@@ -476,6 +553,11 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     e->interest = interest;
     e->co = co;
     e->step = step;
+    e->rbuf = g_pending_rbuf;
+    e->rlen = g_pending_rlen;
+    e->out_n = g_pending_out_n;
+    g_pending_rbuf = NULL;
+    g_pending_out_n = NULL;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -518,6 +600,7 @@ int zan_io_poll(int64_t timeout_ms) {
             void *co = cur->co;
             zan_co_step_t step = cur->step;
             *pp = cur->next;
+            io_deliver_recv(cur);
             free(cur);
             g_io_count--;
             io_wake(co, step);
@@ -539,6 +622,20 @@ void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step) {
     zan_io_init();      /* lazy: generated programs never call zan_io_init */
     io_register((int)fd, interest, frame, step);
 }
+
+#if !defined(_WIN32)
+/* POSIX overlapped-recv shim: register a read-readiness watcher carrying the
+ * recv sink, so the poll loop performs the recv and delivers the byte count
+ * (see io_deliver_recv). Windows has a true overlapped implementation above. */
+void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
+                    zan_co_step_t step, int64_t *out_n) {
+    zan_io_init();
+    g_pending_rbuf = buf;
+    g_pending_rlen = len;
+    g_pending_out_n = out_n;
+    io_register((int)fd, ZAN_IO_READ, frame, step);
+}
+#endif
 
 int zan_io_pump(void) {
     if (!zan_io_has_pending()) return 0;
@@ -805,6 +902,7 @@ static void co_wait_io(long long timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        if (op->out_n) *op->out_n = (int64_t)entries[i].dwNumberOfBytesTransferred;
         free(op);
         /* Re-ready the coroutine BEFORE dropping the in-flight count: if the
          * order were reversed, another worker could momentarily observe an

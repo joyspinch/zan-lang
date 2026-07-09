@@ -136,6 +136,8 @@ struct zan_irgen {
      * object's strong definition overrides it for socket-async programs. */
     LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(i64 fd,i32 interest,i8* frame,step) */
     LLVMTypeRef  rt_io_wait_co_type;
+    LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(i64 fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
+    LLVMTypeRef  rt_io_recv_co_type;
     LLVMValueRef rt_io_pump;      /* i32 zan_io_pump(void) */
     LLVMTypeRef  rt_io_pump_type;
     bool         uses_socket_async; /* set when a socket await is lowered */

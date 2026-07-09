@@ -37,6 +37,19 @@ void zan_io_shutdown(void);
  * the state machine. Returns immediately (does not block or suspend). */
 void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step);
 
+/* Overlapped receive: post a real recv of up to `len` bytes into `buf` and
+ * suspend `frame` until it completes, then re-enter via `step`. The number of
+ * bytes received (0 on peer close) is stored into `*out_n` before the frame is
+ * re-readied, so the resumed state machine can read it as the await value.
+ *
+ * Unlike the zero-byte readiness probe used by zan_io_wait_co (which needs a
+ * separate synchronous recv after waking), this issues the receive itself as a
+ * single overlapped op, so there is no probe/recv window -- the pattern the
+ * multi-worker IOCP driver needs to avoid lost completions under high load.
+ * On POSIX backends the recv is performed at readiness (same effect). */
+void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
+                    zan_co_step_t step, int64_t *out_n);
+
 /* Idle bridge for the stackless scheduler: if IO watchers are pending, block
  * until at least one fires (readying its frame via zan_co_ready) and return the
  * number woken; otherwise return 0. Wire into the co driver with
