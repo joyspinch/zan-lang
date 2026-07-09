@@ -1126,6 +1126,32 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
     return 0;
 }
 
+/* Read CF_UNICODETEXT from the Windows clipboard as a UTF-8 string. Returns a
+ * pointer valid until the next call (the previous buffer is freed each time),
+ * or "" when the clipboard holds no text. The Zan `string` ABI is a plain
+ * NUL-terminated i8*, so a heap char* can be handed back directly. */
+EXPORT const char *zan_gui_get_clipboard(void) {
+    static char *g_clip_buf = NULL;
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return "";
+    if (!OpenClipboard(g_main_hwnd)) return "";
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (!h) { CloseClipboard(); return ""; }
+    WCHAR *w = (WCHAR *)GlobalLock(h);
+    if (!w) { CloseClipboard(); return ""; }
+    int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *nb = (char *)malloc((size_t)(need > 0 ? need : 1));
+    if (nb) {
+        if (need > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, nb, need, NULL, NULL);
+        else nb[0] = '\0';
+    }
+    GlobalUnlock(h);
+    CloseClipboard();
+    if (!nb) return "";
+    free(g_clip_buf);
+    g_clip_buf = nb;
+    return g_clip_buf;
+}
+
 /* Write a UTF-8 string to a file (overwrite), prefixed with a UTF-8 BOM so
  * spreadsheet apps detect the encoding (important for CJK CSV export).
  * Returns 0 on success, -1 on failure. */
@@ -1625,6 +1651,14 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
     XFlush(g_display);
     return 0;
 }
+
+/* Return the text we currently own on the CLIPBOARD selection. Fetching a
+ * selection owned by another X client requires an async XConvertSelection /
+ * SelectionNotify round-trip; that is not wired up here, so cross-application
+ * paste on X11 falls back to the last text this process copied. */
+EXPORT const char *zan_gui_get_clipboard(void) {
+    return g_clip_text_linux ? g_clip_text_linux : "";
+}
 #endif /* __linux__ */
 
 /* ========================================================================
@@ -1689,4 +1723,5 @@ EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
+EXPORT const char *zan_gui_get_clipboard(void) { return ""; }
 #endif

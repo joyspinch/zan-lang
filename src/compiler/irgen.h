@@ -173,6 +173,12 @@ struct zan_irgen {
     bool mt_scheduler;        /* --async-workers: skip the inline single-thread
                                * coroutine driver and link the multi-worker one
                                * from the zanrt_io_mt reactor object instead. */
+
+    /* ARC: nesting depth of the statement currently being emitted, counting
+     * only control-flow bodies (if/loop/switch/try). A class-typed local is
+     * tracked as an owning reference (released at function exit) only when it
+     * is declared at depth 0, so its stack slot dominates every exit block. */
+    int arc_stmt_depth;
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

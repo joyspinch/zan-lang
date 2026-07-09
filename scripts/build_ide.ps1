@@ -13,7 +13,7 @@ $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
 $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
-$files += (Join-Path (Get-Location) "examples\ide_demo.zan")
+$files += (Join-Path (Get-Location) "src\ide_zan\ide_demo.zan")
 Push-Location build
 $ir = & .\zanc.exe --emit-ir $files
 $code = $LASTEXITCODE
