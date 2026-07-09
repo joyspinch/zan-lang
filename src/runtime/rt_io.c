@@ -276,6 +276,9 @@ typedef struct zan_io_op {
 } zan_io_op_t;
 
 static HANDLE g_iocp;
+#if defined(ZAN_CO_DRIVER)
+static volatile LONG g_skip_mode = -1;  /* -1 unknown, 1 on, 0 unsupported */
+#endif
 
 /* Associate a socket with the completion port. Association is one-shot per
  * socket *kernel object*, but socket HANDLE numbers are recycled by Windows
@@ -290,6 +293,25 @@ static void ensure_assoc(SOCKET s) {
         DWORD e = GetLastError();
         (void)e;   /* ERROR_INVALID_PARAMETER == already bound to this port */
     }
+#if defined(ZAN_CO_DRIVER)
+    /* Skip queuing an IOCP packet when an overlapped op completes inline
+     * (data already buffered). Under the multi-worker driver such inline
+     * completions were being lost under high load -- a zero-byte WSARecv on an
+     * already-readable socket returns 0, but the assumed follow-up completion
+     * packet did not reliably arrive, leaking the in-flight count until every
+     * connection parked (server hang). With this mode set, io_register resumes
+     * the waiter directly on inline success instead of awaiting a packet. */
+#ifndef FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+#define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 0x1
+#endif
+    BOOL ok = SetFileCompletionNotificationModes(
+                  (HANDLE)s, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
+    /* Record whether the OS honoured skip-on-success. io_register only takes
+     * the inline-resume shortcut when it did; otherwise an inline completion
+     * still posts a packet and must be left to the IOCP (resuming inline too
+     * would double-complete the op). The result is uniform per OS. */
+    if (g_skip_mode < 0) InterlockedExchange(&g_skip_mode, ok ? 1 : 0);
+#endif
 }
 
 void zan_io_init(void) {
@@ -373,7 +395,23 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     } else {
         r = WSASend(s, &b, 1, NULL, 0, &op->ov, NULL);
     }
-    if (r == 0) return;                  /* completed inline; still queued to IOCP */
+    if (r == 0) {
+#if defined(ZAN_CO_DRIVER)
+        /* Inline completion. With skip-on-success in effect no IOCP packet is
+         * posted, so resume the waiter here rather than blocking it on a
+         * completion that never comes. If skip-on-success is unsupported, a
+         * packet is still queued -- leave it to the IOCP to avoid a double
+         * completion. */
+        if (g_skip_mode == 1) {
+            free(op);
+            IO_CNT_DEC();
+            if (step) zan_co_ready(co, step);
+        }
+        return;
+#else
+        return;                  /* single-thread reactor: still queued to IOCP */
+#endif
+    }
     e = WSAGetLastError();
     if (e == WSA_IO_PENDING) return;
     /* Hard error: queue a completion so the coroutine is still resumed. */
@@ -788,8 +826,19 @@ static int co_all_idle(void) {
 }
 
 static void co_worker(void) {
+    long long last_pump = 0;
     for (;;) {
         if (g_co_stop) return;
+        /* Pump due timers even while the ready queue stays busy. Otherwise, at
+         * high request rates co_pop always succeeds first and co_pump_timers
+         * (only reached when the queue drains) never runs, starving timer-driven
+         * work -- notably the accept-readiness poll that keeps the listen loop
+         * alive -- so new connections stop being accepted. Throttle to ~1ms to
+         * bound lock traffic; g_tq is read unlocked as a cheap hint. */
+        if (g_tq) {
+            long long now = co_now_ms();
+            if (now - last_pump >= 1) { co_pump_timers(); last_pump = now; }
+        }
         void *frame; zan_co_step_t step;
         if (co_pop(&frame, &step)) {
             step(frame);
