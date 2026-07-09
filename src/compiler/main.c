@@ -897,13 +897,13 @@ int main(int argc, char **argv) {
     zan_irgen_t irgen;
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
                        cross_compiling ? target.triple : NULL,
-                       target.os == ZAN_OS_WINDOWS, mt_scheduler) != ZAN_OK) {
+                       target.os == ZAN_OS_WINDOWS, mt_scheduler,
+                       check_leaks) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
         zan_arena_free(arena);
         free(source);
         return 1;
     }
-    irgen.check_leaks = check_leaks;
     irgen.runtime_checks = runtime_checks;
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
