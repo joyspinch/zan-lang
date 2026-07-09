@@ -26,11 +26,17 @@
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
-                            const char *module_name) {
+                            const char *module_name,
+                            const char *target_triple,
+                            bool target_is_windows) {
     memset(g, 0, sizeof(*g));
     g->arena = arena;
     g->diag = diag;
     g->binder = binder;
+    /* Set target before runtime codegen so Sleep/poll selection is correct. */
+    if (target_triple && target_triple[0])
+        snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
+    g->target_is_windows = target_is_windows;
 
     g->ctx = LLVMContextCreate();
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
@@ -250,15 +256,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetInitializer(g_timers, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_timers, LLVMInternalLinkage);
 
-#if defined(_WIN32)
+        /* Declare the platform sleep primitive for the *target* OS (not host):
+         * Sleep (kernel32) on Windows, poll(NULL,0,ms) on POSIX/Linux. */
         LLVMTypeRef sleep_args[] = { i32t };
         LLVMTypeRef sleep_type = LLVMFunctionType(voidt, sleep_args, 1, 0);
-        LLVMValueRef fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
-#else
+        LLVMValueRef fn_sleep = NULL;
         LLVMTypeRef poll_args[] = { i8ptr, i64t, i32t };
         LLVMTypeRef poll_type = LLVMFunctionType(i32t, poll_args, 3, 0);
-        LLVMValueRef fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
-#endif
+        LLVMValueRef fn_poll = NULL;
+        if (g->target_is_windows)
+            fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
+        else
+            fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
 
         /* void zan_co_sched_init(void): reset the queue to empty. */
         {
@@ -472,13 +481,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
             LLVMPositionBuilderAtEnd(g->builder, do_sleep);
             LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms_v, i32t, "ms32");
-#if defined(_WIN32)
-            LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
-                (LLVMValueRef[]){ ms32 }, 1, "");
-#else
-            LLVMBuildCall2(g->builder, poll_type, fn_poll,
-                (LLVMValueRef[]){ LLVMConstNull(i8ptr), LLVMConstInt(i64t, 0, 0), ms32 }, 3, "");
-#endif
+            if (g->target_is_windows)
+                LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
+                    (LLVMValueRef[]){ ms32 }, 1, "");
+            else
+                LLVMBuildCall2(g->builder, poll_type, fn_poll,
+                    (LLVMValueRef[]){ LLVMConstNull(i8ptr), LLVMConstInt(i64t, 0, 0), ms32 }, 3, "");
             LLVMBuildBr(g->builder, after_sleep);
 
             LLVMPositionBuilderAtEnd(g->builder, after_sleep);
@@ -4569,22 +4577,22 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
              * same platform primitive the scheduler uses (Sleep / poll), already
              * declared in the module by the runtime emission. */
             LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
-#if defined(_WIN32)
-            LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
-            if (fn_sleep) {
-                LLVMTypeRef sl_args[] = { di32 };
-                LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
-                LLVMBuildCall2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
+            if (g->target_is_windows) {
+                LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
+                if (fn_sleep) {
+                    LLVMTypeRef sl_args[] = { di32 };
+                    LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
+                    LLVMBuildCall2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
+                }
+            } else {
+                LLVMValueRef fn_poll = LLVMGetNamedFunction(g->mod, "poll");
+                if (fn_poll) {
+                    LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
+                    LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
+                    LLVMBuildCall2(g->builder, pl_ty, fn_poll,
+                        (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
+                }
             }
-#else
-            LLVMValueRef fn_poll = LLVMGetNamedFunction(g->mod, "poll");
-            if (fn_poll) {
-                LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
-                LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
-                LLVMBuildCall2(g->builder, pl_ty, fn_poll,
-                    (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
-            }
-#endif
             return LLVMConstInt(di64, 0, 0);
         }
 
@@ -6630,23 +6638,31 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     LLVMInitializeWebAssemblyAsmParser();
     LLVMInitializeWebAssemblyAsmPrinter();
 
-    char *triple = LLVMGetDefaultTargetTriple();
+    char *triple;
+    if (g->target_triple[0]) {
+        /* Cross-compilation: emit for the requested target triple verbatim
+         * (e.g. x86_64-unknown-linux-musl). The X86/AArch64 backends produce
+         * the right object format (ELF/Mach-O/COFF) from the triple's OS. */
+        triple = LLVMCreateMessage(g->target_triple);
+    } else {
+        triple = LLVMGetDefaultTargetTriple();
 #ifdef _WIN32
-    /* Emit GNU-ABI (MinGW) objects so the produced code links against the
-     * bundled ld.lld + mingw-w64 runtime, keeping zanc self-contained: building
-     * an .exe needs only zan, no external clang / MSVC / Windows SDK. Preserve
-     * the host architecture prefix (e.g. x86_64) and swap the vendor/abi. */
-    {
-        const char *dash = strchr(triple, '-');
-        size_t archlen = dash ? (size_t)(dash - triple) : strlen(triple);
-        char gnu[128];
-        if (archlen > sizeof(gnu) - 20) archlen = sizeof(gnu) - 20;
-        memcpy(gnu, triple, archlen);
-        snprintf(gnu + archlen, sizeof(gnu) - archlen, "-w64-windows-gnu");
-        LLVMDisposeMessage(triple);
-        triple = LLVMCreateMessage(gnu);
-    }
+        /* Emit GNU-ABI (MinGW) objects so the produced code links against the
+         * bundled ld.lld + mingw-w64 runtime, keeping zanc self-contained:
+         * building an .exe needs only zan, no external clang / MSVC / Windows
+         * SDK. Preserve the host architecture prefix and swap the vendor/abi. */
+        {
+            const char *dash = strchr(triple, '-');
+            size_t archlen = dash ? (size_t)(dash - triple) : strlen(triple);
+            char gnu[128];
+            if (archlen > sizeof(gnu) - 20) archlen = sizeof(gnu) - 20;
+            memcpy(gnu, triple, archlen);
+            snprintf(gnu + archlen, sizeof(gnu) - archlen, "-w64-windows-gnu");
+            LLVMDisposeMessage(triple);
+            triple = LLVMCreateMessage(gnu);
+        }
 #endif
+    }
     LLVMTargetRef target;
     char *error = NULL;
 

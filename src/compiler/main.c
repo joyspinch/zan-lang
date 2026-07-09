@@ -13,9 +13,11 @@
 #include "checker.h"
 #include "irgen.h"
 #include "optimizer.h"
+#include "crosscomp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
@@ -502,6 +504,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
         fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
         fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
+        fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
+        fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
         fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
         return 1;
     }
@@ -521,6 +525,7 @@ int main(int argc, char **argv) {
     int opt_level = -1; /* -1 = auto (O0 default, O2 for publish) */
     const char *pp_defines[64];
     int pp_define_count = 0;
+    const char *target_name = NULL; /* --target <name|triple>; NULL = host */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -535,6 +540,15 @@ int main(int argc, char **argv) {
             runtime_checks = false;
         } else if (strcmp(argv[i], "--publish") == 0) {
             publish_mode = true;
+        } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            target_name = argv[++i];
+        } else if (strcmp(argv[i], "--list-targets") == 0) {
+            const zan_target_info_t *ts;
+            int nt = zan_target_list(&ts);
+            printf("Available cross-compilation targets:\n");
+            for (int t = 0; t < nt; t++)
+                printf("  %-12s %-30s %s\n", ts[t].name, ts[t].triple, ts[t].desc);
+            return 0;
         } else if (strcmp(argv[i], "--stdlib-path") == 0 && i + 1 < argc) {
             stdlib_path = argv[++i];
         } else if (strcmp(argv[i], "--auto-stdlib") == 0) {
@@ -569,6 +583,18 @@ int main(int argc, char **argv) {
         return 1;
     }
     input_file = input_files[0];
+
+    /* ---- resolve compilation target (host unless --target given) ---- */
+    zan_target_t target;
+    if (target_name) {
+        if (!zan_target_parse(target_name, &target)) {
+            fprintf(stderr, "error: unknown target '%s' (see --list-targets)\n", target_name);
+            return 1;
+        }
+    } else {
+        zan_target_host(&target);
+    }
+    bool cross_compiling = (target_name != NULL);
 
     /* --auto-stdlib: discover stdlib path relative to compiler executable,
      * then scan using directives in source files and add matching stdlib .zan files */
@@ -768,21 +794,28 @@ int main(int argc, char **argv) {
         zan_lexer_t lex;
         zan_lexer_init(&lex, src, slen, fi, arena, diag);
 
-        /* Auto-define platform macros */
-#ifdef _WIN32
-        zan_lexer_define(&lex, "WINDOWS", "1");
-        zan_lexer_define(&lex, "WIN32", "1");
-#elif defined(__linux__)
-        zan_lexer_define(&lex, "LINUX", "1");
-#elif defined(__APPLE__)
-        zan_lexer_define(&lex, "MACOS", "1");
-        zan_lexer_define(&lex, "APPLE", "1");
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-        zan_lexer_define(&lex, "X86_64", "1");
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        zan_lexer_define(&lex, "ARM64", "1");
-#endif
+        /* Auto-define platform macros for the *target* (== host unless
+         * --target was given), so cross-compiled sources see the destination
+         * OS/arch (e.g. LINUX instead of WINDOWS). */
+        switch (target.os) {
+        case ZAN_OS_WINDOWS:
+            zan_lexer_define(&lex, "WINDOWS", "1");
+            zan_lexer_define(&lex, "WIN32", "1");
+            break;
+        case ZAN_OS_LINUX:
+            zan_lexer_define(&lex, "LINUX", "1");
+            break;
+        case ZAN_OS_MACOS:
+            zan_lexer_define(&lex, "MACOS", "1");
+            zan_lexer_define(&lex, "APPLE", "1");
+            break;
+        default:
+            break;
+        }
+        if (target.arch == ZAN_ARCH_AARCH64)
+            zan_lexer_define(&lex, "ARM64", "1");
+        else if (target.arch == ZAN_ARCH_X86_64)
+            zan_lexer_define(&lex, "X86_64", "1");
         zan_lexer_define(&lex, "ZAN", "1");
         /* User -D defines */
         for (int di = 0; di < pp_define_count; di++) {
@@ -855,7 +888,9 @@ int main(int argc, char **argv) {
 
     /* ---- codegen ---- */
     zan_irgen_t irgen;
-    if (zan_irgen_init(&irgen, arena, diag, &binder, input_file) != ZAN_OK) {
+    if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
+                       cross_compiling ? target.triple : NULL,
+                       target.os == ZAN_OS_WINDOWS) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
         zan_arena_free(arena);
         free(source);
@@ -951,6 +986,55 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        if (cross_compiling && target.os == ZAN_OS_LINUX) {
+            /* Self-contained cross-compile to Linux: static-link the ELF object
+             * against a bundled musl sysroot with ld.lld. The result is a
+             * dependency-free static binary — no glibc, no shared libs, no WSL
+             * on the target — so "build on Windows, upload, run" just works.
+             * Sysroot lives next to zanc at toolchain/<sub>/ (crt*.o + libc.a,
+             * plus a linux-built zanrt_io.o for socket-async programs). */
+            char exe_dir[1024] = {0};
+#ifdef _WIN32
+            GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
+            { char *s = strrchr(exe_dir, '\\'); if (s) *s = '\0'; }
+#elif defined(__APPLE__)
+            { uint32_t sz = sizeof(exe_dir);
+              if (_NSGetExecutablePath(exe_dir, &sz) != 0) exe_dir[0] = '\0';
+              char *s = strrchr(exe_dir, '/'); if (s) *s = '\0'; }
+#else
+            { ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+              if (n > 0) { exe_dir[n] = '\0'; char *s = strrchr(exe_dir, '/'); if (s) *s = '\0'; } }
+#endif
+            const char *sub = (target.arch == ZAN_ARCH_AARCH64)
+                              ? "linux-arm64" : "linux-musl";
+            char sys[1200];
+            snprintf(sys, sizeof(sys), "%s/toolchain/%s", exe_dir, sub);
+
+            char cmd[4096];
+            snprintf(cmd, sizeof(cmd),
+                     "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
+                     publish_mode ? " -s" : "", obj_path, sys, sys, obj_tmp);
+            if (irgen.uses_socket_async) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " --start-group \"%s/libc.a\" --end-group \"%s/crtn.o\"",
+                       sys, sys); }
+            link_ret = system(cmd);
+        } else if (cross_compiling) {
+            fprintf(stderr,
+                    "error: cross-compilation to '%s' is not supported yet; "
+                    "only linux targets are implemented (see --list-targets)\n",
+                    target.triple);
+            remove(obj_tmp);
+            zan_irgen_destroy(&irgen);
+            zan_arena_free(arena);
+            free(source);
+            return 1;
+        } else {
 #ifdef _WIN32
         /* Self-contained linking: prefer the bundled ld.lld + MinGW-w64 runtime
          * shipped next to zanc (in <zanc_dir>/toolchain), so producing an .exe
@@ -1099,6 +1183,7 @@ int main(int argc, char **argv) {
         }
         link_ret = system(link_cmd);
 #endif
+        }
 
         /* clean up object file */
         remove(obj_tmp);

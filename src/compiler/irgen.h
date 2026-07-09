@@ -161,11 +161,20 @@ struct zan_irgen {
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];
     int extern_lib_count;
+
+    /* cross-compilation target. When target_triple[0] is set, write_obj emits
+     * an object for that LLVM triple verbatim (e.g. x86_64-unknown-linux-musl)
+     * instead of applying the host's default/windows-gnu triple. Empty means
+     * "use the host default" (unchanged legacy behaviour). */
+    char target_triple[128];
+    bool target_is_windows;   /* true when emitting for Windows (Sleep vs poll) */
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
-                            const char *module_name);
+                            const char *module_name,
+                            const char *target_triple,
+                            bool target_is_windows);
 void zan_irgen_destroy(zan_irgen_t *g);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
