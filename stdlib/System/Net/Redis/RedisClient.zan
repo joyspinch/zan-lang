@@ -67,6 +67,71 @@ class RedisReply {
 }
 
 /// <summary>
+/// A message delivered on a subscribed connection. <c>kind</c> is one of
+/// "message", "pmessage", "subscribe", "unsubscribe", "psubscribe" or
+/// "punsubscribe". For "pmessage" the matched glob is in <c>pattern</c>.
+/// Subscribe/unsubscribe confirmations carry the current subscription
+/// <c>count</c> instead of a payload.
+/// </summary>
+class RedisMessage {
+    string kind;
+    string pattern;
+    string channel;
+    string payload;
+    int count;
+
+    RedisMessage() {
+        this.kind = "";
+        this.pattern = "";
+        this.channel = "";
+        this.payload = "";
+        this.count = 0;
+    }
+
+    /// <summary>True for an actual published message ("message"/"pmessage"), as
+    /// opposed to a subscribe/unsubscribe confirmation.</summary>
+    bool IsMessage() { return this.kind == "message" || this.kind == "pmessage"; }
+}
+
+/// <summary>
+/// An ordered batch of Redis commands for pipelining or a MULTI/EXEC
+/// transaction. Build it up with <c>Add</c> (each argv is a Redis.ArgsN list),
+/// then hand it to <c>ExecPipelineAsync</c>/<c>TransactionAsync</c> (or their
+/// sync counterparts). Commands are serialized to RESP frames as they are added.
+/// </summary>
+class RedisBatch {
+    List<string> frames;
+    int count;
+
+    RedisBatch() {
+        this.frames = new List<string>();
+        this.count = 0;
+    }
+
+    /// <summary>Queues one command, e.g. batch.Add(Redis.Args3("SET","k","v")).
+    /// Returns this batch so calls can be chained.</summary>
+    RedisBatch Add(List<string> args) {
+        this.frames.Add(Redis.BuildCommand(args));
+        this.count = this.count + 1;
+        return this;
+    }
+
+    /// <summary>Number of queued commands.</summary>
+    int Count() { return this.count; }
+
+    /// <summary>The concatenated RESP wire payload of every queued frame.</summary>
+    string Payload() {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < this.frames.Count) {
+            sb.Append(this.frames[i]);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}
+
+/// <summary>
 /// Synchronous Redis client speaking RESP over a TCP socket. Values are treated
 /// as UTF-8 text; embedded NUL bytes and byte lengths of multibyte values are
 /// not supported (adequate for cache/session/counter use).
@@ -394,6 +459,184 @@ class Redis {
 
     /// <summary>PUBLISH channel message; returns receiver count.</summary>
     int Publish(string channel, string message) { return Command(Redis.Args3("PUBLISH", channel, message)).AsInt(); }
+
+    /// <summary>PUBLISH (async); returns the number of clients that received it.</summary>
+    async int PublishAsync(string channel, string message) {
+        RedisReply r = await CommandAsync(Redis.Args3("PUBLISH", channel, message));
+        return r.AsInt();
+    }
+
+    /// <summary>Parses a RESP push array (message/pmessage/subscribe/...) into a
+    /// RedisMessage.</summary>
+    static RedisMessage ParseMessage(RedisReply r) {
+        RedisMessage m = new RedisMessage();
+        if (r.Count() == 0) { return m; }
+        m.kind = r.Item(0).AsString();
+        if (m.kind == "pmessage" && r.Count() >= 4) {
+            m.pattern = r.Item(1).AsString();
+            m.channel = r.Item(2).AsString();
+            m.payload = r.Item(3).AsString();
+        } else if (m.kind == "message" && r.Count() >= 3) {
+            m.channel = r.Item(1).AsString();
+            m.payload = r.Item(2).AsString();
+        } else if (r.Count() >= 3) {
+            // subscribe / unsubscribe / psubscribe / punsubscribe confirmation:
+            // [kind, channel-or-pattern, current-subscription-count]
+            m.channel = r.Item(1).AsString();
+            m.count = r.Item(2).AsInt();
+        }
+        return m;
+    }
+
+    /// <summary>SUBSCRIBE channel (async); consumes and returns the subscribe
+    /// confirmation. After subscribing, call ReceiveMessageAsync to await
+    /// published messages — it suspends on the IO reactor until one arrives, so
+    /// a subscriber coroutine yields its worker while idle.</summary>
+    async RedisMessage SubscribeAsync(string channel) {
+        int sent = await this.conn.SendAsync(Redis.BuildCommand(Redis.Args2("SUBSCRIBE", channel)));
+        RedisReply r = await ReadReplyAsync();
+        return Redis.ParseMessage(r);
+    }
+
+    /// <summary>PSUBSCRIBE pattern (async); consumes the subscribe confirmation.</summary>
+    async RedisMessage PSubscribeAsync(string pattern) {
+        int sent = await this.conn.SendAsync(Redis.BuildCommand(Redis.Args2("PSUBSCRIBE", pattern)));
+        RedisReply r = await ReadReplyAsync();
+        return Redis.ParseMessage(r);
+    }
+
+    /// <summary>UNSUBSCRIBE channel (async); consumes the unsubscribe confirmation.</summary>
+    async RedisMessage UnsubscribeAsync(string channel) {
+        int sent = await this.conn.SendAsync(Redis.BuildCommand(Redis.Args2("UNSUBSCRIBE", channel)));
+        RedisReply r = await ReadReplyAsync();
+        return Redis.ParseMessage(r);
+    }
+
+    /// <summary>PUNSUBSCRIBE pattern (async); consumes the confirmation.</summary>
+    async RedisMessage PUnsubscribeAsync(string pattern) {
+        int sent = await this.conn.SendAsync(Redis.BuildCommand(Redis.Args2("PUNSUBSCRIBE", pattern)));
+        RedisReply r = await ReadReplyAsync();
+        return Redis.ParseMessage(r);
+    }
+
+    /// <summary>Awaits the next pushed pub/sub message, suspending on the IO
+    /// reactor until the server delivers one (yielding the worker meanwhile).</summary>
+    async RedisMessage ReceiveMessageAsync() {
+        RedisReply r = await ReadReplyAsync();
+        return Redis.ParseMessage(r);
+    }
+
+    /// <summary>SUBSCRIBE channel (sync); returns the subscribe confirmation.</summary>
+    RedisMessage Subscribe(string channel) {
+        this.conn.Send(Redis.BuildCommand(Redis.Args2("SUBSCRIBE", channel)));
+        return Redis.ParseMessage(ReadReply());
+    }
+
+    /// <summary>Blocks for the next pushed pub/sub message (sync).</summary>
+    RedisMessage ReceiveMessage() {
+        return Redis.ParseMessage(ReadReply());
+    }
+
+    // ---- pipelining ----
+
+    /// <summary>Sends a batch of commands in one write, then reads every reply in
+    /// order (sync). Collapses N round-trips into one for bulk operations.</summary>
+    List<RedisReply> ExecPipeline(RedisBatch batch) {
+        this.conn.Send(batch.Payload());
+        List<RedisReply> results = new List<RedisReply>();
+        int j = 0;
+        while (j < batch.Count()) {
+            results.Add(ReadReply());
+            j = j + 1;
+        }
+        return results;
+    }
+
+    /// <summary>Pipelines a batch of commands on the coroutine path: one awaited
+    /// send, then awaits each reply on the IO reactor, in order.</summary>
+    async List<RedisReply> ExecPipelineAsync(RedisBatch batch) {
+        int sent = await this.conn.SendAsync(batch.Payload());
+        List<RedisReply> results = new List<RedisReply>();
+        int j = 0;
+        while (j < batch.Count()) {
+            RedisReply rep = await ReadReplyAsync();
+            results.Add(rep);
+            j = j + 1;
+        }
+        return results;
+    }
+
+    // ---- transactions (MULTI / EXEC) ----
+
+    /// <summary>MULTI — begins a transaction (async). Commands issued afterwards
+    /// are queued by the server until ExecAsync.</summary>
+    async bool MultiAsync() {
+        RedisReply r = await CommandAsync(Redis.Args1("MULTI"));
+        return r.AsBool();
+    }
+
+    /// <summary>EXEC — runs the queued transaction and returns the array reply of
+    /// per-command results (async).</summary>
+    async RedisReply ExecAsync() {
+        return await CommandAsync(Redis.Args1("EXEC"));
+    }
+
+    /// <summary>DISCARD — abandons the queued transaction (async).</summary>
+    async bool DiscardAsync() {
+        RedisReply r = await CommandAsync(Redis.Args1("DISCARD"));
+        return r.AsBool();
+    }
+
+    /// <summary>Runs a whole MULTI/.../EXEC transaction as one batched round-trip
+    /// (async): sends MULTI + every queued command + EXEC, drains the +OK and the
+    /// per-command +QUEUED acks, and returns the EXEC result array as a list.</summary>
+    async List<RedisReply> TransactionAsync(RedisBatch batch) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Redis.BuildCommand(Redis.Args1("MULTI")));
+        sb.Append(batch.Payload());
+        sb.Append(Redis.BuildCommand(Redis.Args1("EXEC")));
+        int sent = await this.conn.SendAsync(sb.ToString());
+
+        RedisReply multi = await ReadReplyAsync();
+        int j = 0;
+        while (j < batch.Count()) {
+            RedisReply queued = await ReadReplyAsync();
+            j = j + 1;
+        }
+        RedisReply exec = await ReadReplyAsync();
+
+        List<RedisReply> results = new List<RedisReply>();
+        int k = 0;
+        while (k < exec.Count()) {
+            results.Add(exec.Item(k));
+            k = k + 1;
+        }
+        return results;
+    }
+
+    /// <summary>Synchronous MULTI/.../EXEC transaction batch.</summary>
+    List<RedisReply> Transaction(RedisBatch batch) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Redis.BuildCommand(Redis.Args1("MULTI")));
+        sb.Append(batch.Payload());
+        sb.Append(Redis.BuildCommand(Redis.Args1("EXEC")));
+        this.conn.Send(sb.ToString());
+
+        ReadReply();
+        int j = 0;
+        while (j < batch.Count()) {
+            ReadReply();
+            j = j + 1;
+        }
+        RedisReply exec = ReadReply();
+        List<RedisReply> results = new List<RedisReply>();
+        int k = 0;
+        while (k < exec.Count()) {
+            results.Add(exec.Item(k));
+            k = k + 1;
+        }
+        return results;
+    }
 
     // ---- common async helpers (coroutine path) ----
 
