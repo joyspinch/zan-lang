@@ -288,14 +288,32 @@ class Socket {
 
     /// <summary>Suspends until writable, then sends; re-awaits on partial writes
     /// until all <paramref name="len"/> bytes are sent or the peer closes.
-    /// Returns the number of bytes sent. Requires a non-blocking socket.</summary>
+    /// Returns the number of bytes sent. Requires a non-blocking socket.
+    ///
+    /// Binary-safe: the unsent remainder is carried in a separate buffer rebuilt
+    /// by index copy, never via <c>data + totalSent</c> pointer arithmetic. On a
+    /// string that would compute as concatenation and truncate at the first NUL
+    /// byte, corrupting any payload that contains NULs (e.g. MQTT packets).</summary>
     static async int SendAsync(int sock, string data, int len) {
         int totalSent = 0;
+        string cur = data;
+        int curLen = len;
         while (totalSent < len) {
             await Socket.WriteReady(sock);
-            int sent = winsend(sock, data + totalSent, len - totalSent, 0);
+            int sent = winsend(sock, cur, curLen, 0);
             if (sent > 0) {
                 totalSent = totalSent + sent;
+                if (totalSent < len) {
+                    int remaining = len - totalSent;
+                    string tail = calloc(remaining + 1, 1);
+                    int j = 0;
+                    while (j < remaining) {
+                        tail[j] = data[totalSent + j];
+                        j = j + 1;
+                    }
+                    cur = tail;
+                    curLen = remaining;
+                }
             } else if (sent == 0) {
                 return totalSent;
             }
