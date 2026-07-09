@@ -51,6 +51,16 @@ Copy-Item $ideExe  (Join-Path $dist 'ide_demo.exe')
 Copy-Item $zancExe (Join-Path $dist 'zanc.exe')
 Copy-Item $stdlib  (Join-Path $dist 'stdlib') -Recurse
 
+# Bundle the self-contained linker toolchain (ld + mingw runtime) that zanc
+# looks for next to itself. Without it, a published zanc falls back to a
+# system clang/gcc and fails to link (e.g. "cannot find -lgcc_eh").
+$toolchain = Join-Path $root 'build\toolchain'
+if (Test-Path (Join-Path $toolchain 'ld.exe')) {
+    Copy-Item $toolchain (Join-Path $dist 'toolchain') -Recurse
+} else {
+    Write-Output "PUBLISH_WARN: build\toolchain missing; dist zanc will need a system LLVM/clang on PATH"
+}
+
 # ---- copy a small set of example programs, if present ----
 $examples = Join-Path $root 'examples'
 if (Test-Path $examples) {
@@ -69,11 +79,15 @@ Contents
                  directory, so keep it next to ide_demo.exe.
   stdlib\        Standard library sources. zanc auto-includes the .zan files
                  it needs from here; keep this folder next to zanc.exe.
+  toolchain\     Bundled linker (ld) + MinGW-w64 runtime. zanc uses this to
+                 produce executables with no external toolchain; keep it next
+                 to zanc.exe.
   examples\      Sample programs shown in the IDE's Examples pane (optional).
 
 Requirement
-  An LLVM toolchain must be on PATH (clang and llvm-lib). zanc compiles Zan
-  source to LLVM IR and invokes clang to link the final executable.
+  None for normal use: zanc links via the bundled toolchain\ folder, so no
+  external LLVM/clang install is needed. (If toolchain\ is removed, zanc falls
+  back to a system clang on PATH.)
 
 Run
   Double-click ide_demo.exe (or run it from a terminal). Everything the IDE
