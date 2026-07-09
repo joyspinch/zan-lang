@@ -629,6 +629,7 @@ int main(int argc, char **argv) {
             {"System.Net.Http",  "System/Net/Http",  {"HttpRequest.zan", "HttpResponse.zan", "HttpServer.zan", "HttpClient.zan", NULL}},
             {"System.Net.WebSocket", "System/Net/WebSocket", {"WebSocket.zan", NULL}},
             {"System.Net.Mqtt",  "System/Net/Mqtt",  {"MqttClient.zan", NULL}},
+            {"System.Net.Redis", "System/Net/Redis", {"RedisClient.zan", "RedisPool.zan", NULL}},
             {"System.Net",       "System/Net",        {"Net.zan", "Worker.zan", NULL}},
             {"System.Data.Orm",  "System/Data/Orm",  {"Model.zan", "QueryBuilder.zan", NULL}},
             {"System.Data.Sqlite",   "System/Data/Sqlite",   {"SqliteConnection.zan", NULL}},

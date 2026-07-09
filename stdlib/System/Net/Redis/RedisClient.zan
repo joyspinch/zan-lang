@@ -1,0 +1,430 @@
+using System;
+using System.Text;
+using System.Net.Sockets;
+
+namespace System.Net.Redis;
+
+/// <summary>
+/// A single RESP (REdis Serialization Protocol) reply. Kind is one of
+/// "simple", "error", "int", "bulk", "array" or "null".
+/// </summary>
+class RedisReply {
+    string kind;
+    string str;
+    int num;
+    List<RedisReply> items;
+
+    RedisReply() {
+        this.kind = "null";
+        this.str = "";
+        this.num = 0;
+        this.items = new List<RedisReply>();
+    }
+
+    static RedisReply Simple(string s) { RedisReply r = new RedisReply(); r.kind = "simple"; r.str = s; return r; }
+    static RedisReply Err(string s)    { RedisReply r = new RedisReply(); r.kind = "error";  r.str = s; return r; }
+    static RedisReply Int(int n)       { RedisReply r = new RedisReply(); r.kind = "int";    r.num = n; return r; }
+    static RedisReply Bulk(string s)   { RedisReply r = new RedisReply(); r.kind = "bulk";   r.str = s; return r; }
+    static RedisReply Null()           { RedisReply r = new RedisReply(); r.kind = "null";   return r; }
+    static RedisReply Arr()            { RedisReply r = new RedisReply(); r.kind = "array";  return r; }
+
+    /// <summary>True for a nil bulk string or nil array reply.</summary>
+    bool IsNull() { return this.kind == "null"; }
+    /// <summary>True when the server returned an error reply.</summary>
+    bool IsError() { return this.kind == "error"; }
+    /// <summary>The error text (empty for non-error replies).</summary>
+    string ErrorText() { if (this.kind == "error") { return this.str; } return ""; }
+
+    /// <summary>Reply as text (integers are stringified).</summary>
+    string AsString() {
+        if (this.kind == "int") { return Convert.ToString(this.num); }
+        return this.str;
+    }
+    /// <summary>Reply as an integer (parses bulk/simple strings).</summary>
+    int AsInt() {
+        if (this.kind == "int") { return this.num; }
+        return Redis.ParseIntSafe(this.str);
+    }
+    /// <summary>Common truthiness: +OK, :1, or "1".</summary>
+    bool AsBool() {
+        if (this.kind == "int") { return this.num != 0; }
+        return this.str == "OK" || this.str == "1";
+    }
+    /// <summary>Number of elements for an array reply.</summary>
+    int Count() { return this.items.Count; }
+    /// <summary>The i-th element of an array reply.</summary>
+    RedisReply Item(int i) { return this.items[i]; }
+    /// <summary>Flattens an array reply to a list of strings.</summary>
+    List<string> AsStringList() {
+        List<string> outl = new List<string>();
+        int i = 0;
+        while (i < this.items.Count) {
+            outl.Add(this.items[i].AsString());
+            i = i + 1;
+        }
+        return outl;
+    }
+}
+
+/// <summary>
+/// Synchronous Redis client speaking RESP over a TCP socket. Values are treated
+/// as UTF-8 text; embedded NUL bytes and byte lengths of multibyte values are
+/// not supported (adequate for cache/session/counter use).
+/// </summary>
+class Redis {
+    TcpClient conn;
+    string buf;
+    bool connected;
+
+    Redis() {
+        this.buf = "";
+        this.connected = false;
+    }
+
+    /// <summary>Connects to a Redis server.</summary>
+    static Redis Connect(string host, int port) {
+        Redis r = new Redis();
+        r.conn = TcpClient.Connect(host, port);
+        r.buf = "";
+        r.connected = true;
+        return r;
+    }
+
+    /// <summary>Connects and authenticates in one step.</summary>
+    static Redis ConnectAuth(string host, int port, string password) {
+        Redis r = Redis.Connect(host, port);
+        r.Auth(password);
+        return r;
+    }
+
+    /// <summary>Connects to a Redis server, suspending on the IO reactor until
+    /// the TCP connection is established (coroutine-friendly).</summary>
+    static async Redis ConnectAsync(string host, int port) {
+        Redis r = new Redis();
+        r.conn = await TcpClient.ConnectAsync(host, port);
+        r.buf = "";
+        r.connected = true;
+        return r;
+    }
+
+    /// <summary>Async connect + authenticate in one step.</summary>
+    static async Redis ConnectAuthAsync(string host, int port, string password) {
+        Redis r = await Redis.ConnectAsync(host, port);
+        await r.AuthAsync(password);
+        return r;
+    }
+
+    // ---- protocol ----
+
+    /// <summary>Serializes an argv list into a RESP command frame.</summary>
+    static string BuildCommand(List<string> args) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("*");
+        sb.Append(Convert.ToString(args.Count));
+        sb.Append("\r\n");
+        int i = 0;
+        while (i < args.Count) {
+            string a = args[i];
+            sb.Append("$");
+            sb.Append(Convert.ToString(a.Length));
+            sb.Append("\r\n");
+            sb.Append(a);
+            sb.Append("\r\n");
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    void SendCommand(List<string> args) {
+        this.conn.Send(Redis.BuildCommand(args));
+    }
+
+    /// <summary>Sends a raw command (argv) and returns the parsed reply.</summary>
+    RedisReply Command(List<string> args) {
+        SendCommand(args);
+        return ReadReply();
+    }
+
+    /// <summary>Sends a raw command and awaits the reply on the IO reactor.
+    /// This is the coroutine path: it suspends instead of blocking the worker
+    /// thread, so many pooled connections can make progress concurrently.</summary>
+    async RedisReply CommandAsync(List<string> args) {
+        int sent = await this.conn.SendAsync(Redis.BuildCommand(args));
+        RedisReply rep = await ReadReplyAsync();
+        return rep;
+    }
+
+    RedisReply ReadReply() {
+        string line = ReadLine();
+        if (line.Length == 0) { return RedisReply.Err("connection closed"); }
+        string t = line.Substring(0, 1);
+        string rest = line.Substring(1, line.Length - 1);
+        if (t == "+") { return RedisReply.Simple(rest); }
+        if (t == "-") { return RedisReply.Err(rest); }
+        if (t == ":") { return RedisReply.Int(Redis.ParseIntSafe(rest)); }
+        if (t == "$") {
+            int n = Redis.ParseIntSafe(rest);
+            if (n < 0) { return RedisReply.Null(); }
+            string data = ReadBytes(n);
+            ReadBytes(2);
+            return RedisReply.Bulk(data);
+        }
+        if (t == "*") {
+            int n = Redis.ParseIntSafe(rest);
+            if (n < 0) { return RedisReply.Null(); }
+            RedisReply arr = RedisReply.Arr();
+            int i = 0;
+            while (i < n) {
+                arr.items.Add(ReadReply());
+                i = i + 1;
+            }
+            return arr;
+        }
+        return RedisReply.Err("protocol error: " + line);
+    }
+
+    string ReadLine() {
+        while (true) {
+            int idx = Redis.FindCRLF(this.buf);
+            if (idx >= 0) {
+                string line = this.buf.Substring(0, idx);
+                this.buf = this.buf.Substring(idx + 2, this.buf.Length - idx - 2);
+                return line;
+            }
+            string chunk = this.conn.Recv(65536);
+            if (chunk.Length == 0) {
+                string all = this.buf;
+                this.buf = "";
+                return all;
+            }
+            this.buf = this.buf + chunk;
+        }
+    }
+
+    string ReadBytes(int n) {
+        while (this.buf.Length < n) {
+            string chunk = this.conn.Recv(65536);
+            if (chunk.Length == 0) { break; }
+            this.buf = this.buf + chunk;
+        }
+        int take = n;
+        if (take > this.buf.Length) { take = this.buf.Length; }
+        string data = this.buf.Substring(0, take);
+        this.buf = this.buf.Substring(take, this.buf.Length - take);
+        return data;
+    }
+
+    static int FindCRLF(string s) {
+        int i = 0;
+        while (i + 1 < s.Length) {
+            if (s.Substring(i, 1) == "\r" && s.Substring(i + 1, 1) == "\n") { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ---- async protocol readers (mirror the sync readers, suspending on I/O) ----
+
+    async RedisReply ReadReplyAsync() {
+        string line = await ReadLineAsync();
+        if (line.Length == 0) { return RedisReply.Err("connection closed"); }
+        string t = line.Substring(0, 1);
+        string rest = line.Substring(1, line.Length - 1);
+        if (t == "+") { return RedisReply.Simple(rest); }
+        if (t == "-") { return RedisReply.Err(rest); }
+        if (t == ":") { return RedisReply.Int(Redis.ParseIntSafe(rest)); }
+        if (t == "$") {
+            int n = Redis.ParseIntSafe(rest);
+            if (n < 0) { return RedisReply.Null(); }
+            string data = await ReadBytesAsync(n);
+            string crlf = await ReadBytesAsync(2);
+            return RedisReply.Bulk(data);
+        }
+        if (t == "*") {
+            int n = Redis.ParseIntSafe(rest);
+            if (n < 0) { return RedisReply.Null(); }
+            RedisReply arr = RedisReply.Arr();
+            int i = 0;
+            while (i < n) {
+                RedisReply item = await ReadReplyAsync();
+                arr.items.Add(item);
+                i = i + 1;
+            }
+            return arr;
+        }
+        return RedisReply.Err("protocol error: " + line);
+    }
+
+    async string ReadLineAsync() {
+        while (true) {
+            int idx = Redis.FindCRLF(this.buf);
+            if (idx >= 0) {
+                string line = this.buf.Substring(0, idx);
+                this.buf = this.buf.Substring(idx + 2, this.buf.Length - idx - 2);
+                return line;
+            }
+            string chunk = await this.conn.RecvAsync(65536);
+            if (chunk.Length == 0) {
+                string all = this.buf;
+                this.buf = "";
+                return all;
+            }
+            this.buf = this.buf + chunk;
+        }
+        return "";
+    }
+
+    async string ReadBytesAsync(int n) {
+        while (this.buf.Length < n) {
+            string chunk = await this.conn.RecvAsync(65536);
+            if (chunk.Length == 0) { break; }
+            this.buf = this.buf + chunk;
+        }
+        int take = n;
+        if (take > this.buf.Length) { take = this.buf.Length; }
+        string data = this.buf.Substring(0, take);
+        this.buf = this.buf.Substring(take, this.buf.Length - take);
+        return data;
+    }
+
+    static int ParseIntSafe(string s) {
+        if (s.Length == 0) { return 0; }
+        bool neg = false;
+        string t = s;
+        if (s.Substring(0, 1) == "-") { neg = true; t = s.Substring(1, s.Length - 1); }
+        if (t.Length == 0) { return 0; }
+        int v = Convert.ToInt(t);
+        if (neg) { return 0 - v; }
+        return v;
+    }
+
+    // ---- argv builders ----
+
+    static List<string> Args1(string a) { List<string> l = new List<string>(); l.Add(a); return l; }
+    static List<string> Args2(string a, string b) { List<string> l = new List<string>(); l.Add(a); l.Add(b); return l; }
+    static List<string> Args3(string a, string b, string c) { List<string> l = new List<string>(); l.Add(a); l.Add(b); l.Add(c); return l; }
+    static List<string> Args4(string a, string b, string c, string d) { List<string> l = new List<string>(); l.Add(a); l.Add(b); l.Add(c); l.Add(d); return l; }
+
+    // ---- connection / server ----
+
+    /// <summary>PING; returns "PONG" on success.</summary>
+    string Ping() { return Command(Redis.Args1("PING")).AsString(); }
+    /// <summary>AUTH password.</summary>
+    bool Auth(string password) { return Command(Redis.Args2("AUTH", password)).AsBool(); }
+    /// <summary>SELECT db index.</summary>
+    bool Select(int db) { return Command(Redis.Args2("SELECT", Convert.ToString(db))).AsBool(); }
+    /// <summary>FLUSHDB — clears the current database.</summary>
+    bool FlushDb() { return Command(Redis.Args1("FLUSHDB")).AsBool(); }
+
+    // ---- strings / keys ----
+
+    /// <summary>SET key value.</summary>
+    bool Set(string key, string val) { return Command(Redis.Args3("SET", key, val)).AsBool(); }
+    /// <summary>SET key value EX seconds.</summary>
+    bool SetEx(string key, int seconds, string val) {
+        List<string> a = new List<string>();
+        a.Add("SET"); a.Add(key); a.Add(val); a.Add("EX"); a.Add(Convert.ToString(seconds));
+        return Command(a).AsBool();
+    }
+    /// <summary>GET key (empty string when the key is missing).</summary>
+    string Get(string key) { return Command(Redis.Args2("GET", key)).AsString(); }
+    /// <summary>GET key as a full reply so callers can distinguish nil.</summary>
+    RedisReply GetReply(string key) { return Command(Redis.Args2("GET", key)); }
+    /// <summary>EXISTS key.</summary>
+    bool Exists(string key) { return Command(Redis.Args2("EXISTS", key)).AsInt() > 0; }
+    /// <summary>DEL key; returns the number of keys removed.</summary>
+    int Del(string key) { return Command(Redis.Args2("DEL", key)).AsInt(); }
+    /// <summary>INCR key.</summary>
+    int Incr(string key) { return Command(Redis.Args2("INCR", key)).AsInt(); }
+    /// <summary>INCRBY key n.</summary>
+    int IncrBy(string key, int n) { return Command(Redis.Args3("INCRBY", key, Convert.ToString(n))).AsInt(); }
+    /// <summary>DECR key.</summary>
+    int Decr(string key) { return Command(Redis.Args2("DECR", key)).AsInt(); }
+    /// <summary>EXPIRE key seconds.</summary>
+    bool Expire(string key, int seconds) { return Command(Redis.Args3("EXPIRE", key, Convert.ToString(seconds))).AsInt() > 0; }
+    /// <summary>TTL key (-1 no expiry, -2 missing).</summary>
+    int Ttl(string key) { return Command(Redis.Args2("TTL", key)).AsInt(); }
+    /// <summary>KEYS pattern.</summary>
+    List<string> Keys(string pattern) { return Command(Redis.Args2("KEYS", pattern)).AsStringList(); }
+
+    // ---- hashes ----
+
+    /// <summary>HSET key field value.</summary>
+    int HSet(string key, string field, string val) { return Command(Redis.Args4("HSET", key, field, val)).AsInt(); }
+    /// <summary>HGET key field.</summary>
+    string HGet(string key, string field) { return Command(Redis.Args3("HGET", key, field)).AsString(); }
+    /// <summary>HGETALL key — flat [field, value, field, value, ...].</summary>
+    List<string> HGetAll(string key) { return Command(Redis.Args2("HGETALL", key)).AsStringList(); }
+    /// <summary>HDEL key field.</summary>
+    int HDel(string key, string field) { return Command(Redis.Args3("HDEL", key, field)).AsInt(); }
+    /// <summary>HEXISTS key field.</summary>
+    bool HExists(string key, string field) { return Command(Redis.Args3("HEXISTS", key, field)).AsInt() > 0; }
+
+    // ---- lists ----
+
+    /// <summary>LPUSH key value.</summary>
+    int LPush(string key, string val) { return Command(Redis.Args3("LPUSH", key, val)).AsInt(); }
+    /// <summary>RPUSH key value.</summary>
+    int RPush(string key, string val) { return Command(Redis.Args3("RPUSH", key, val)).AsInt(); }
+    /// <summary>LPOP key.</summary>
+    string LPop(string key) { return Command(Redis.Args2("LPOP", key)).AsString(); }
+    /// <summary>RPOP key.</summary>
+    string RPop(string key) { return Command(Redis.Args2("RPOP", key)).AsString(); }
+    /// <summary>LLEN key.</summary>
+    int LLen(string key) { return Command(Redis.Args2("LLEN", key)).AsInt(); }
+    /// <summary>LRANGE key start stop.</summary>
+    List<string> LRange(string key, int start, int stop) {
+        return Command(Redis.Args4("LRANGE", key, Convert.ToString(start), Convert.ToString(stop))).AsStringList();
+    }
+
+    // ---- sets ----
+
+    /// <summary>SADD key member.</summary>
+    int SAdd(string key, string member) { return Command(Redis.Args3("SADD", key, member)).AsInt(); }
+    /// <summary>SREM key member.</summary>
+    int SRem(string key, string member) { return Command(Redis.Args3("SREM", key, member)).AsInt(); }
+    /// <summary>SMEMBERS key.</summary>
+    List<string> SMembers(string key) { return Command(Redis.Args2("SMEMBERS", key)).AsStringList(); }
+    /// <summary>SCARD key.</summary>
+    int SCard(string key) { return Command(Redis.Args2("SCARD", key)).AsInt(); }
+    /// <summary>SISMEMBER key member.</summary>
+    bool SIsMember(string key, string member) { return Command(Redis.Args3("SISMEMBER", key, member)).AsInt() > 0; }
+
+    // ---- pub/sub ----
+
+    /// <summary>PUBLISH channel message; returns receiver count.</summary>
+    int Publish(string channel, string message) { return Command(Redis.Args3("PUBLISH", channel, message)).AsInt(); }
+
+    // ---- common async helpers (coroutine path) ----
+
+    /// <summary>PING (async); returns "PONG" on success.</summary>
+    async string PingAsync() { RedisReply r = await CommandAsync(Redis.Args1("PING")); return r.AsString(); }
+    /// <summary>AUTH password (async).</summary>
+    async bool AuthAsync(string password) { RedisReply r = await CommandAsync(Redis.Args2("AUTH", password)); return r.AsBool(); }
+    /// <summary>SELECT db index (async).</summary>
+    async bool SelectAsync(int db) { RedisReply r = await CommandAsync(Redis.Args2("SELECT", Convert.ToString(db))); return r.AsBool(); }
+    /// <summary>SET key value (async).</summary>
+    async bool SetAsync(string key, string val) { RedisReply r = await CommandAsync(Redis.Args3("SET", key, val)); return r.AsBool(); }
+    /// <summary>GET key (async); empty string when the key is missing.</summary>
+    async string GetAsync(string key) { RedisReply r = await CommandAsync(Redis.Args2("GET", key)); return r.AsString(); }
+    /// <summary>DEL key (async); returns the number of keys removed.</summary>
+    async int DelAsync(string key) { RedisReply r = await CommandAsync(Redis.Args2("DEL", key)); return r.AsInt(); }
+    /// <summary>INCR key (async).</summary>
+    async int IncrAsync(string key) { RedisReply r = await CommandAsync(Redis.Args2("INCR", key)); return r.AsInt(); }
+    /// <summary>EXPIRE key seconds (async).</summary>
+    async bool ExpireAsync(string key, int seconds) { RedisReply r = await CommandAsync(Redis.Args3("EXPIRE", key, Convert.ToString(seconds))); return r.AsInt() > 0; }
+
+    /// <summary>True while the underlying connection is open. Used by the pool
+    /// to decide whether a returned connection can be reused.</summary>
+    bool IsConnected() {
+        return this.connected;
+    }
+
+    /// <summary>Closes the connection.</summary>
+    void Close() {
+        if (this.connected) {
+            this.conn.Close();
+            this.connected = false;
+        }
+    }
+}
