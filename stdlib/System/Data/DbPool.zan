@@ -1,0 +1,251 @@
+using System;
+using System.Threading;
+using System.Data;
+
+namespace System.Data;
+
+/// <summary>
+/// Coroutine-friendly database connection pool.
+///
+/// The pool hands out live <see cref="DbConnection"/> handles via
+/// <c>await Rent()</c> and takes them back with <c>Return(conn)</c>. Idle
+/// connections are reused, so hot paths avoid a full driver connect (and, for
+/// networked engines, a TCP + auth round-trip) on every statement.
+///
+/// Because a rented connection is an ordinary <see cref="DbConnection"/>, the
+/// FreeSQL-style ORM runs against a pooled connection unchanged
+/// (<c>DbConnection db = await pool.Rent(); model.Insert(db, row); pool.Return(db);</c>),
+/// and <see cref="System.Data.Orm.Model"/> also exposes <c>*Pooled</c> helpers
+/// that rent/return automatically.
+///
+/// Design notes:
+///   - The public API is <c>async</c>/awaitable so it composes naturally inside
+///     coroutines and matches the connection-pool shape used by RedisPool.
+///   - The idle list and counters are guarded by a short <see cref="Mutex"/>
+///     critical section; the lock is never held across an <c>await</c>, so a
+///     coroutine can never deadlock waiting for a connection it also owns.
+///   - <c>maxSize</c> bounds the number of *pooled* (retained) connections. Under
+///     a burst the pool may open extra transient connections; those are closed on
+///     Return once the idle slots are full, so the steady-state connection count
+///     stays at or below <c>maxSize</c>.
+///   - ODBC/libpq calls are synchronous C FFI, so pooled statements use blocking
+///     driver I/O, matching the rest of the data-access stdlib. The awaitable
+///     surface keeps call sites uniform with the async networking stack.
+///
+/// Usage:
+///   DbPool pool = DbPool.ForPostgreSQL("127.0.0.1", 5432, "app", "user", "pw", 8);
+///   DbConnection db = await pool.Rent();
+///   DbResult r = db.Query("SELECT * FROM users");
+///   pool.Return(db);
+///
+///   // or auto rent/return:
+///   DbResult r2 = await pool.Query("SELECT * FROM users");
+///   int n = await pool.Execute("DELETE FROM users WHERE id = 1");
+/// </summary>
+class DbPool {
+    string connectionString;
+    int provider;
+    int maxSize;
+
+    List<DbConnection> idle;
+    int active;    // connections currently rented out
+    int opened;    // total connections ever opened (diagnostics)
+    int mtx;
+
+    DbPool(string connectionString, int provider) {
+        this.connectionString = connectionString;
+        this.provider = provider;
+        this.maxSize = 8;
+        this.idle = new List<DbConnection>();
+        this.active = 0;
+        this.opened = 0;
+        this.mtx = Mutex.Create();
+    }
+
+    // ---- factories ----
+
+    /// <summary>Creates a pool from a full ODBC connection string / DSN.</summary>
+    static DbPool Create(string connectionString, int maxSize) {
+        DbPool p = new DbPool(connectionString, DbProvider.ODBC);
+        p.maxSize = maxSize;
+        return p;
+    }
+
+    /// <summary>Creates a pool from a connection string and explicit provider.</summary>
+    static DbPool CreateWith(string connectionString, int provider, int maxSize) {
+        DbPool p = new DbPool(connectionString, provider);
+        p.maxSize = maxSize;
+        return p;
+    }
+
+    /// <summary>Creates a pool for PostgreSQL (also openGauss / Kingbase / QuestDB
+    /// via the PostgreSQL ODBC driver).</summary>
+    static DbPool ForPostgreSQL(string host, int port, string database,
+            string user, string password, int maxSize) {
+        string cs = "Driver={PostgreSQL Unicode};Server=" + host
+            + ";Port=" + Convert.ToString(port) + ";Database=" + database
+            + ";Uid=" + user + ";Pwd=" + password + ";";
+        return CreateWith(cs, DbProvider.PostgreSQL, maxSize);
+    }
+
+    /// <summary>Creates a pool for Microsoft SQL Server.</summary>
+    static DbPool ForSqlServer(string host, int port, string database,
+            string user, string password, int maxSize) {
+        string cs = "Driver={ODBC Driver 17 for SQL Server};Server=" + host
+            + "," + Convert.ToString(port) + ";Database=" + database
+            + ";UID=" + user + ";PWD=" + password + ";TrustServerCertificate=yes;";
+        return CreateWith(cs, DbProvider.SqlServer, maxSize);
+    }
+
+    /// <summary>Creates a pool for MySQL / MariaDB / TiDB / OceanBase.</summary>
+    static DbPool ForMySQL(string host, int port, string database,
+            string user, string password, int maxSize) {
+        string cs = "Driver={MySQL ODBC 8.0 Unicode Driver};Server=" + host
+            + ";Port=" + Convert.ToString(port) + ";Database=" + database
+            + ";User=" + user + ";Password=" + password + ";";
+        return CreateWith(cs, DbProvider.MySQL, maxSize);
+    }
+
+    /// <summary>Creates a pool for a SQLite file via the SQLite ODBC driver.</summary>
+    static DbPool ForSQLite(string path, int maxSize) {
+        string cs = "Driver={SQLite3 ODBC Driver};Database=" + path + ";";
+        return CreateWith(cs, DbProvider.SQLite, maxSize);
+    }
+
+    // ---- rent / return ----
+
+    /// <summary>Takes a live connection from the pool, reusing an idle one when
+    /// available or opening a new one otherwise. Awaitable so it composes inside
+    /// coroutines; reuse returns without any driver I/O.</summary>
+    async DbConnection Rent() {
+        DbConnection reused = TryTakeIdle();
+        if (reused != null) {
+            return reused;
+        }
+        DbConnection c = await OpenNew();
+        Mutex.Lock(this.mtx);
+        this.active = this.active + 1;
+        Mutex.Unlock(this.mtx);
+        return c;
+    }
+
+    /// <summary>Returns a connection to the pool. Healthy connections are kept for
+    /// reuse (up to maxSize idle); the rest are closed.</summary>
+    void Return(DbConnection c) {
+        if (c == null) { return; }
+        bool keep = false;
+        Mutex.Lock(this.mtx);
+        if (this.active > 0) {
+            this.active = this.active - 1;
+        }
+        if (c.IsConnected() && this.idle.Count < this.maxSize) {
+            this.idle.Add(c);
+            keep = true;
+        }
+        Mutex.Unlock(this.mtx);
+        if (!keep) {
+            c.Close();
+        }
+    }
+
+    /// <summary>Pops an idle connection under lock, or null when none are free.
+    /// Never performs I/O, so it is safe to call inside the critical section.</summary>
+    DbConnection TryTakeIdle() {
+        DbConnection c = null;
+        Mutex.Lock(this.mtx);
+        while (this.idle.Count > 0 && c == null) {
+            DbConnection cand = this.idle[this.idle.Count - 1];
+            this.idle.RemoveAt(this.idle.Count - 1);
+            if (cand.IsConnected()) {
+                c = cand;
+                this.active = this.active + 1;
+            } else {
+                // Drop a dead connection and keep scanning.
+                cand.Close();
+            }
+        }
+        Mutex.Unlock(this.mtx);
+        return c;
+    }
+
+    /// <summary>Opens a fresh connection with the pool's driver/connection string.</summary>
+    async DbConnection OpenNew() {
+        DbConnection c = DbConnection.OpenWith(this.connectionString, this.provider);
+        Mutex.Lock(this.mtx);
+        this.opened = this.opened + 1;
+        Mutex.Unlock(this.mtx);
+        return c;
+    }
+
+    // ---- auto rent/return convenience helpers ----
+
+    /// <summary>Rents a connection, runs a query, and returns the connection.</summary>
+    async DbResult Query(string sql) {
+        DbConnection c = await Rent();
+        DbResult r = c.Query(sql);
+        Return(c);
+        return r;
+    }
+
+    /// <summary>Rents a connection, runs a non-query statement, and returns it.</summary>
+    async int Execute(string sql) {
+        DbConnection c = await Rent();
+        int n = c.Execute(sql);
+        Return(c);
+        return n;
+    }
+
+    /// <summary>Rents a connection, runs a scalar query, and returns it.</summary>
+    async string ExecuteScalar(string sql) {
+        DbConnection c = await Rent();
+        string s = c.ExecuteScalar(sql);
+        Return(c);
+        return s;
+    }
+
+    // ---- lifecycle / diagnostics ----
+
+    /// <summary>Closes every idle connection and clears the pool. Connections
+    /// currently rented out are unaffected until they are returned.</summary>
+    void Close() {
+        Mutex.Lock(this.mtx);
+        int i = 0;
+        while (i < this.idle.Count) {
+            this.idle[i].Close();
+            i = i + 1;
+        }
+        while (this.idle.Count > 0) {
+            this.idle.RemoveAt(this.idle.Count - 1);
+        }
+        Mutex.Unlock(this.mtx);
+    }
+
+    /// <summary>Number of idle connections currently pooled.</summary>
+    int Idle() {
+        Mutex.Lock(this.mtx);
+        int n = this.idle.Count;
+        Mutex.Unlock(this.mtx);
+        return n;
+    }
+
+    /// <summary>Number of connections currently rented out.</summary>
+    int Active() {
+        Mutex.Lock(this.mtx);
+        int n = this.active;
+        Mutex.Unlock(this.mtx);
+        return n;
+    }
+
+    /// <summary>Total connections opened over the pool's lifetime.</summary>
+    int Opened() {
+        Mutex.Lock(this.mtx);
+        int n = this.opened;
+        Mutex.Unlock(this.mtx);
+        return n;
+    }
+
+    /// <summary>Maximum number of idle connections retained for reuse.</summary>
+    int MaxSize() {
+        return this.maxSize;
+    }
+}
