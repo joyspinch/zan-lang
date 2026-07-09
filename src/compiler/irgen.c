@@ -1911,6 +1911,40 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_CALL: {
+        /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
+         * independent coroutine WITHOUT awaiting it. Emits the callee's ramp
+         * (heap frame) then schedules it on the cooperative driver with no
+         * awaiter and without suspending the caller (contrast await, which
+         * registers self as awaiter and suspends). This is the concurrency
+         * primitive a server accept loop uses to handle each connection on its
+         * own coroutine instead of serially. See docs/ASYNC_CPS_DESIGN.md. */
+        if (is_call_to(expr, "Task", "Spawn") && expr->call.args.count == 1 &&
+            expr->call.args.items[0]->kind == AST_CALL) {
+            LLVMTypeRef sp_i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef sp_i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef sub = emit_expr(g, expr->call.args.items[0], locals);
+            LLVMValueRef sub_resume = NULL;
+            if (LLVMIsACallInst(sub)) {
+                LLVMValueRef callee = LLVMGetCalledValue(sub);
+                if (callee) {
+                    size_t nl = 0;
+                    const char *cn = LLVMGetValueName2(callee, &nl);
+                    if (cn && nl > 0 && nl < 240) {
+                        char rn[256];
+                        memcpy(rn, cn, nl);
+                        memcpy(rn + nl, "$resume", 8); /* includes NUL */
+                        sub_resume = LLVMGetNamedFunction(g->mod, rn);
+                    }
+                }
+            }
+            if (sub_resume && LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
+                LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, sp_i8ptr, "spawn.sub");
+                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
+                LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+            }
+            return LLVMConstInt(sp_i64, 0, 0);
+        }
+
         /* StringBuilder.Append(s) / StringBuilder.ToString() — growable byte
          * buffer with amortised O(1) append (capacity doubling). */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
