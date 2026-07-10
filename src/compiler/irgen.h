@@ -189,6 +189,45 @@ struct zan_irgen {
      * tracked as an owning reference (released at function exit) only when it
      * is declared at depth 0, so its stack slot dominates every exit block. */
     int arc_stmt_depth;
+
+    /* exception handling (try/catch/finally + throw). The runtime is
+     * single-threaded/cooperative, so the in-flight exception is a process
+     * global i8* (an RC-managed exception object, or null when none). */
+    LLVMValueRef g_current_exc;      /* i8* __zan_current_exc */
+    LLVMValueRef fn_isa;             /* i32 __zan_isa(i8* obj, i64 target_type_id) */
+    LLVMTypeRef  isa_type;
+    LLVMValueRef g_type_parent;      /* [N x i64]: parent type-id per type-id */
+    LLVMTypeRef  type_parent_type;
+    int          type_parent_count;  /* number of type-id slots (incl. slot 0) */
+    LLVMValueRef fn_uncaught;        /* void __zan_uncaught(void): report + exit(1) */
+    LLVMTypeRef  uncaught_type;
+    /* landing-target stack: after every call that may throw, branch to the
+     * innermost landing block when g_current_exc is set. Before branching, the
+     * owned locals declared since the handler was entered (scope_base..count)
+     * are released inline. The bottom entry (is_fn) is the function-level
+     * propagate block. Empty => no unwinding here (checks suppressed). */
+    LLVMBasicBlockRef exc_landing[64];
+    int          exc_landing_base[64]; /* locals->count when handler was pushed */
+    int          exc_landing_cleanup[64]; /* exc_cleanup_count when pushed: an
+                                           * unwind to this landing replays the
+                                           * cleanups above this floor */
+    int          exc_landing_count;
+    bool         current_fn_can_throw; /* gate call-site exception checks */
+    /* the exception object currently being handled by the innermost catch body
+     * (for `throw;` rethrow, which re-publishes it). */
+    LLVMValueRef exc_current[64];
+    int          exc_current_count;
+    /* pending cleanups that a `return`/`break`/`continue` leaving a try region
+     * must run before its terminator: finally bodies to replay and caught
+     * exceptions to release. Innermost is on top. `floor` marks how many
+     * entries the current loop encloses (break/continue replay down to it). */
+    struct {
+        int kind;                 /* 0 = finally body, 1 = release caught exc */
+        struct zan_ast_node *fin; /* finally body (kind 0) */
+        LLVMValueRef exc;         /* caught exception value (kind 1) */
+    } exc_cleanups[64];
+    int          exc_cleanup_count;
+    int          loop_cleanup_floor; /* exc_cleanup_count at the enclosing loop */
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

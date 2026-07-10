@@ -977,7 +977,12 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
     case TK_THROW: {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
-        zan_ast_node_t *value = parse_expression(p);
+        /* bare `throw;` rethrows the exception the enclosing catch is
+         * handling; `throw expr;` throws a new one. */
+        zan_ast_node_t *value = NULL;
+        if (p->current.kind != TK_SEMICOLON) {
+            value = parse_expression(p);
+        }
         parser_expect(p, TK_SEMICOLON);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_THROW_STMT, loc);
         n->throw_stmt.value = value;

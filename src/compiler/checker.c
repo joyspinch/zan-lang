@@ -306,7 +306,8 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_THROW_STMT:
-        zan_checker_check_expr(c, stmt->throw_stmt.value);
+        if (stmt->throw_stmt.value)
+            zan_checker_check_expr(c, stmt->throw_stmt.value);
         break;
 
     case AST_BREAK_STMT:

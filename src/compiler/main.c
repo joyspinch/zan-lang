@@ -652,6 +652,21 @@ int main(int argc, char **argv) {
 #endif
         }
 
+        /* Always include the exception prelude (System.Exception + built-in
+         * derived types): exception handling is a language feature, so its
+         * base class must be available to every program regardless of `using`
+         * directives. Skipped silently if the file is absent. Not pulled for
+         * --dump-tokens/--dump-ast, which reflect only the user's source. */
+        if (!do_dump_tokens && !do_dump_ast) {
+            char exc_path[1024];
+#ifdef _WIN32
+            snprintf(exc_path, sizeof(exc_path), "%s\\System\\Exception.zan", stdlib_root);
+#else
+            snprintf(exc_path, sizeof(exc_path), "%s/System/Exception.zan", stdlib_root);
+#endif
+            add_stdlib_input(input_files, &input_count, exc_path);
+        }
+
         /* Scan all input files for 'using System.XXX' directives, then
          * auto-include matching stdlib .zan files. */
         static const struct { const char *using_ns; const char *subdir; const char *files[32]; } stdlib_map[] = {
