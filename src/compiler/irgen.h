@@ -35,6 +35,7 @@ struct zan_irgen {
     /* current 'this' context for method bodies */
     LLVMValueRef current_this;       /* alloca for 'this' pointer */
     zan_symbol_t *current_type_sym;  /* type symbol for 'this' */
+    zan_ast_node_t *current_fn_body; /* root AST body of the fn being compiled */
 
     /* runtime function declarations */
     LLVMValueRef rt_println;   /* zan_rt_println(const char*) */

@@ -6612,6 +6612,132 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
     }
 }
 
+/* ---- rc-element array escape analysis ----
+ * A `new T[n]` array of rc elements is released element-by-element at scope
+ * exit. That is only sound when the buffer does not outlive the scope, i.e. it
+ * never escapes: used only as an index base `a[i]` or a borrowed member read
+ * `a.Length`. Any other use of the bare identifier (return, assignment RHS,
+ * call argument, collection/field store, ...) shares the pointer, so we skip
+ * the release for it (leak rather than risk a double-free). */
+static int arr_ident_named(zan_ast_node_t *e, zan_istr_t nm) {
+    return e && e->kind == AST_IDENTIFIER &&
+           e->ident.name.len == nm.len &&
+           (nm.len == 0 || memcmp(e->ident.name.str, nm.str, (size_t)nm.len) == 0);
+}
+static void arr_escape_stmt(zan_istr_t nm, zan_ast_node_t *st, int *esc);
+static void arr_escape_expr(zan_istr_t nm, zan_ast_node_t *e, int *esc) {
+    if (!e || *esc) return;
+    switch (e->kind) {
+    case AST_IDENTIFIER:
+        if (arr_ident_named(e, nm)) *esc = 1;
+        break;
+    case AST_INDEX:
+        if (!arr_ident_named(e->index.object, nm))
+            arr_escape_expr(nm, e->index.object, esc);
+        arr_escape_expr(nm, e->index.index, esc);
+        break;
+    case AST_MEMBER_ACCESS:
+        if (!arr_ident_named(e->member.object, nm))
+            arr_escape_expr(nm, e->member.object, esc);
+        break;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        arr_escape_expr(nm, e->binary.left, esc);
+        arr_escape_expr(nm, e->binary.right, esc);
+        break;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        arr_escape_expr(nm, e->unary.operand, esc);
+        break;
+    case AST_CALL:
+        arr_escape_expr(nm, e->call.callee, esc);
+        for (int i = 0; i < e->call.args.count; i++)
+            arr_escape_expr(nm, e->call.args.items[i], esc);
+        break;
+    case AST_CONDITIONAL:
+        arr_escape_expr(nm, e->conditional.cond, esc);
+        arr_escape_expr(nm, e->conditional.then_expr, esc);
+        arr_escape_expr(nm, e->conditional.else_expr, esc);
+        break;
+    case AST_NEW_EXPR:
+        for (int i = 0; i < e->new_expr.args.count; i++)
+            arr_escape_expr(nm, e->new_expr.args.items[i], esc);
+        break;
+    case AST_CAST_EXPR:
+        arr_escape_expr(nm, e->cast.expr, esc);
+        break;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        arr_escape_expr(nm, e->type_test.expr, esc);
+        break;
+    case AST_AWAIT_EXPR:
+        arr_escape_expr(nm, e->await_expr.expr, esc);
+        break;
+    default:
+        break;
+    }
+}
+static void arr_escape_stmt(zan_istr_t nm, zan_ast_node_t *st, int *esc) {
+    if (!st || *esc) return;
+    switch (st->kind) {
+    case AST_BLOCK:
+        for (int i = 0; i < st->block.stmts.count; i++)
+            arr_escape_stmt(nm, st->block.stmts.items[i], esc);
+        break;
+    case AST_VAR_DECL:
+        arr_escape_expr(nm, st->var_decl.initializer, esc);
+        break;
+    case AST_EXPR_STMT:
+        arr_escape_expr(nm, st->expr_stmt.expr, esc);
+        break;
+    case AST_RETURN_STMT:
+        arr_escape_expr(nm, st->ret.value, esc);
+        break;
+    case AST_IF_STMT:
+        arr_escape_expr(nm, st->if_stmt.cond, esc);
+        arr_escape_stmt(nm, st->if_stmt.then_body, esc);
+        arr_escape_stmt(nm, st->if_stmt.else_body, esc);
+        break;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        arr_escape_expr(nm, st->while_stmt.cond, esc);
+        arr_escape_stmt(nm, st->while_stmt.body, esc);
+        break;
+    case AST_FOR_STMT:
+        arr_escape_stmt(nm, st->for_stmt.init, esc);
+        arr_escape_expr(nm, st->for_stmt.cond, esc);
+        arr_escape_expr(nm, st->for_stmt.step, esc);
+        arr_escape_stmt(nm, st->for_stmt.body, esc);
+        break;
+    case AST_FOREACH_STMT:
+        arr_escape_expr(nm, st->foreach_stmt.collection, esc);
+        arr_escape_stmt(nm, st->foreach_stmt.body, esc);
+        break;
+    case AST_THROW_STMT:
+        arr_escape_expr(nm, st->throw_stmt.value, esc);
+        break;
+    case AST_TRY_STMT:
+        arr_escape_stmt(nm, st->try_stmt.try_body, esc);
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            arr_escape_stmt(nm, st->try_stmt.catches.items[i]->catch_clause.body, esc);
+        arr_escape_stmt(nm, st->try_stmt.finally_body, esc);
+        break;
+    case AST_SWITCH_STMT:
+        arr_escape_expr(nm, st->switch_stmt.expr, esc);
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            arr_escape_stmt(nm, st->switch_stmt.cases.items[i]->switch_case.body, esc);
+        break;
+    default:
+        break;
+    }
+}
+static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm) {
+    int esc = 0;
+    if (g->current_fn_body) arr_escape_stmt(nm, g->current_fn_body, &esc);
+    else esc = 1; /* unknown body: conservative */
+    return esc;
+}
+
 /* ---- statement codegen ---- */
 
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
@@ -6871,10 +6997,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * elements can be released at scope exit (arrays have no length header). */
         if (type && type->kind == TYPE_ARRAY && type->element_type &&
             is_rc_managed_type(type->element_type) &&
+            !g->current_async_frame &&
             stmt->var_decl.initializer &&
             stmt->var_decl.initializer->kind == AST_NEW_EXPR &&
             stmt->var_decl.initializer->new_expr.is_array &&
-            stmt->var_decl.initializer->new_expr.args.count > 0) {
+            stmt->var_decl.initializer->new_expr.args.count > 0 &&
+            !rc_array_local_escapes(g, stmt->var_decl.name)) {
             zan_ast_node_t *sz = stmt->var_decl.initializer->new_expr.args.items[0];
             if (sz->kind == AST_INT_LITERAL || sz->kind == AST_IDENTIFIER) {
                 LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -7334,6 +7462,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
     g->current_type_sym = type_sym;
     g->current_this = NULL;
+    g->current_fn_body = method->method_decl.body;
 
     /* schedule the leak report to run at program exit */
     if (g->check_leaks) {
@@ -7354,6 +7483,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
     }
     g->current_type_sym = NULL;
+    g->current_fn_body = NULL;
 }
 
 /* ---- emit user-defined methods ---- */
@@ -7840,10 +7970,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
         LLVMValueRef saved_this = g->current_this;
         zan_symbol_t *saved_type_sym = g->current_type_sym;
+        zan_ast_node_t *saved_fn_body = g->current_fn_body;
         g->current_fn = fn;
         g->current_fn_ret_type = llvm_ret;
         g->current_this = is_static ? NULL : this_alloca;
         g->current_type_sym = type_sym;
+        g->current_fn_body = member->method_decl.body;
 
         /* emit method body */
         if (member->method_decl.body->kind == AST_BLOCK) {
@@ -7887,6 +8019,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_fn_ret_type = saved_fn_ret;
         g->current_this = saved_this;
         g->current_type_sym = saved_type_sym;
+        g->current_fn_body = saved_fn_body;
         free(param_types);
     }
 
