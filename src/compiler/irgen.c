@@ -234,6 +234,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_io_pump_timeout = LLVMAddFunction(g->mod, "zan_io_pump_timeout",
             g->rt_io_pump_timeout_type);
         LLVMSetLinkage(g->rt_io_pump_timeout, LLVMWeakAnyLinkage);
+
+        LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
+        LLVMValueRef legacy_pump = LLVMAddFunction(g->mod, "zan_io_pump",
+            legacy_pump_type);
+        LLVMSetLinkage(legacy_pump, LLVMWeakAnyLinkage);
+        LLVMBasicBlockRef legacy_entry = LLVMAppendBasicBlockInContext(g->ctx,
+            legacy_pump, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, legacy_entry);
+        LLVMValueRef legacy_woke = LLVMBuildCall2(g->builder,
+            g->rt_io_pump_timeout_type, g->rt_io_pump_timeout,
+            (LLVMValueRef[]){ LLVMConstInt(i64d, (uint64_t)-1, 1) }, 1, "woke");
+        LLVMBuildRet(g->builder, legacy_woke);
     }
     g->uses_socket_async = false;
 
@@ -600,9 +612,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
              * zero immediately, while the reactor returns zero only when there
              * is no pending IO. */
             LLVMPositionBuilderAtEnd(g->builder, io_bb);
-            LLVMValueRef woke = LLVMBuildCall2(g->builder, g->rt_io_pump_timeout_type,
-                g->rt_io_pump_timeout,
-                (LLVMValueRef[]){ LLVMConstInt(i64t, (uint64_t)-1, 1) }, 1, "woke");
+            LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32t, NULL, 0, 0);
+            LLVMValueRef legacy_pump = LLVMGetNamedFunction(g->mod, "zan_io_pump");
+            LLVMValueRef woke = LLVMBuildCall2(g->builder, legacy_pump_type,
+                legacy_pump, NULL, 0, "woke");
             LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntSGT, woke,
                 LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "io.more");
             LLVMBuildCondBr(g->builder, more, head_bb, exit_bb);
