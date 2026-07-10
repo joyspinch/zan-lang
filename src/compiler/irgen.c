@@ -4632,6 +4632,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                for (int k = 0; k < expr->call.args.count; k++) {
+                                    emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                        call_args[k + 1], locals);
+                                }
                                 free(call_args);
                                 return result;
                             }
@@ -4654,6 +4658,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                for (int k = 0; k < argc; k++) {
+                                    emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                        call_args[k], locals);
+                                }
                                 free(call_args);
                                 return result;
                             }
