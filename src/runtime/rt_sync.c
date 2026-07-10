@@ -246,7 +246,7 @@ static void zan_make_names(
     snprintf(lock_name, 96, "Local\\zan_table_lock_%016llx", hash);
 #else
     snprintf(map_name, 96, "/zan_table_%016llx", hash);
-    snprintf(lock_name, 96, "/zan_table_lock_%016llx", hash);
+    snprintf(lock_name, 96, "/zan_l_%016llx", hash);
 #endif
 }
 

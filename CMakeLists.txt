@@ -279,6 +279,7 @@ else()
     endif()
 endif()
 add_test(NAME runtime_sync COMMAND zanrt_sync_test)
+add_dependencies(zanc zanrt_sync_test)
 
 add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-tokens)
 add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast)
