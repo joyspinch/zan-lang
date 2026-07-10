@@ -285,10 +285,10 @@ zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
     while (fn) {
         /* Never force-inline interposable definitions (weak/linkonce/common):
          * they exist to be replaced at link time. The prime example is the
-         * weak zan_io_pump stub, which the real blocking reactor pump in
-         * zanrt_io overrides at link time. Force-inlining its `ret 0` body
-         * folds the scheduler's idle path to a constant "no IO pending", so
-         * any async/socket program (e.g. a server awaiting Accept) exits
+         * weak zan_io_pump_timeout fallback, which the real reactor pump in
+         * zanrt_io overrides at link time. Force-inlining the fallback would
+         * prevent socket IO from waking the scheduler, so any async/socket
+         * program (e.g. a server awaiting Accept) exits
          * immediately instead of blocking on the reactor. Leave inlining of
          * such functions to the LLVM pipeline, which honors link-time
          * interposition. */

@@ -56,6 +56,11 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
  * zan_co_set_idle(zan_io_pump). */
 int zan_io_pump(void);
 
+/* Timer-aware idle bridge used by generated schedulers. Blocks for IO for at
+ * most timeout_ms, or sleeps for that duration when no IO is pending. A
+ * negative timeout waits indefinitely when IO is pending. */
+int zan_io_pump_timeout(int64_t timeout_ms);
+
 /* ---- coroutine-facing ABI (stackful rt_sched fibers) ---- */
 
 /* Suspend the current coroutine until `fd` is readable.

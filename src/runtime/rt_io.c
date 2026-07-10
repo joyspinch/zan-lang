@@ -41,6 +41,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <time.h>
 #endif
 #if defined(__linux__)
 #include <sys/epoll.h>
@@ -647,9 +648,25 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
 }
 #endif
 
+int zan_io_pump_timeout(int64_t timeout_ms) {
+    if (zan_io_has_pending())
+        return zan_io_poll(timeout_ms);
+    if (timeout_ms <= 0)
+        return 0;
+#ifdef _WIN32
+    Sleep((DWORD)timeout_ms);
+#else
+    struct timespec ts = {
+        (time_t)(timeout_ms / 1000),
+        (long)((timeout_ms % 1000) * 1000000)
+    };
+    nanosleep(&ts, NULL);
+#endif
+    return 0;
+}
+
 int zan_io_pump(void) {
-    if (!zan_io_has_pending()) return 0;
-    return zan_io_poll(-1);   /* block until an fd is ready (wakes via zan_co_ready) */
+    return zan_io_pump_timeout(-1);
 }
 
 int zan_io_has_pending(void) {
@@ -1053,7 +1070,13 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
     if (!step) return;
     zan_co_timer *t = (zan_co_timer *)malloc(sizeof(*t));
-    t->next = g_tq; t->due_ms = ms; t->frame = frame; t->step = step;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    t->next = g_tq;
+    t->due_ms = now + (ms > 0 ? ms : 0);
+    t->frame = frame;
+    t->step = step;
     g_tq = t;
 }
 
@@ -1073,12 +1096,18 @@ void zan_co_sched_run(void) {
             step(frame);
         }
         if (g_tq) {
-            /* earliest (relative-ms) timer, matching the legacy model */
             zan_co_timer **bp = &g_tq, **pp = &g_tq;
             for (pp = &(*pp)->next; *pp; pp = &(*pp)->next)
                 if ((*pp)->due_ms < (*bp)->due_ms) bp = pp;
-            zan_co_timer *best = *bp; *bp = best->next;
-            if (best->due_ms > 0) poll(NULL, 0, (int)best->due_ms);
+            zan_co_timer *best = *bp;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            if (best->due_ms > now) {
+                zan_io_pump_timeout(best->due_ms - now);
+                continue;
+            }
+            *bp = best->next;
             zan_co_ready(best->frame, best->step);
             free(best);
             continue;

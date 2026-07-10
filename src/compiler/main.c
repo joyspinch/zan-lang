@@ -960,8 +960,9 @@ int main(int argc, char **argv) {
 
         /* Socket-async programs (await Socket.ReadReady/WriteReady) link the
          * readiness reactor object shipped with zanc; it provides zan_io_wait_co
-         * and the strong zan_io_pump that overrides the program's weak no-op.
-         * ZAN_RT_IO_OBJ is the build/install path baked in by CMake. */
+         * and the strong zan_io_pump_timeout that overrides the program's weak
+         * timer-only fallback. ZAN_RT_IO_OBJ is the build/install path baked in
+         * by CMake. */
         const char *rt_io_obj = NULL;
 #ifdef ZAN_RT_IO_OBJ
         if (irgen.uses_socket_async) rt_io_obj = ZAN_RT_IO_OBJ;
