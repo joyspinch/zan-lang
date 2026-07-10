@@ -1248,6 +1248,9 @@ static int is_rc_managed_type(zan_type_t *t) {
 }
 
 static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
+static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
+                                      local_scope_t *locals);
+static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 
 /* Release all RC-managed local variables in scope (for throw/exception cleanup) */
 static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
@@ -1261,35 +1264,80 @@ static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     }
 }
 
-/* Store `value` into element `idx` of a List object. A List is a heap struct
- * { i64 count, i64 cap, i64* data }; elements live in the `data` buffer (field
- * 2), NOT in the struct itself. Every `list[i] = v` form (local, this.field,
- * obj.field) must go through here so it doesn't index into the struct and
- * clobber the count/cap/data words. Elements are i64 slots; pointer and narrow
- * integer values are coerced to i64. */
-static void emit_list_element_store(zan_irgen_t *g, LLVMValueRef arr_ptr,
-                                    LLVMValueRef idx, LLVMValueRef value) {
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
-        LLVMPointerType(g->list_struct_type, 0), "lptr");
-    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder,
-        g->list_struct_type, list_ptr, 2, "df");
-    LLVMValueRef data = LLVMBuildLoad2(g->builder,
-        LLVMPointerType(i64, 0), data_field, "data");
-    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
-        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
-        idx = LLVMBuildSExt(g->builder, idx, i64, "ext");
+/* Store `value` into a collection slot, retaining the new occupant when needed
+ * and releasing the old occupant when overwrite_old is true.
+ *
+ * The slot may be typed (arrays) or i64/raw-pointer-encoded (List/Dict slots).
+ * RC-managed values are class instances or strings. */
+static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
+                                       LLVMTypeRef slot_ty, LLVMValueRef slot_ptr,
+                                       LLVMValueRef value,
+                                       zan_ast_node_t *rhs, local_scope_t *locals,
+                                       int overwrite_old) {
+    LLVMValueRef old = NULL;
+    if (overwrite_old) {
+        old = LLVMBuildLoad2(g->builder, slot_ty, slot_ptr, "arc.old");
     }
-    LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx, 1, "ep");
-    LLVMValueRef v = value;
-    LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(v));
-    if (vk == LLVMPointerTypeKind) {
-        v = LLVMBuildPtrToInt(g->builder, v, i64, "p2i");
-    } else if (vk == LLVMIntegerTypeKind &&
-               LLVMGetIntTypeWidth(LLVMTypeOf(v)) < 64) {
-        v = LLVMBuildSExt(g->builder, v, i64, "sx");
+    if (!expr_yields_owned_rc_value(g, rhs, locals)) {
+        emit_rc_retain_for_type(g, elem_type, value);
     }
-    LLVMBuildStore(g->builder, v, elem_ptr);
+
+    LLVMValueRef stored = value;
+    LLVMTypeKind slot_k = LLVMGetTypeKind(slot_ty);
+    LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
+    if (slot_k == LLVMPointerTypeKind) {
+        if (val_k == LLVMIntegerTypeKind) {
+            stored = LLVMBuildIntToPtr(g->builder, stored, slot_ty, "slot.ip");
+        } else if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != slot_ty) {
+            stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.bc");
+        }
+    } else if (slot_k == LLVMIntegerTypeKind) {
+        if (val_k == LLVMPointerTypeKind) {
+            stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
+        } else if (val_k == LLVMIntegerTypeKind &&
+                   LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
+            stored = LLVMBuildSExt(g->builder, stored, slot_ty, "slot.sx");
+        }
+    }
+    LLVMBuildStore(g->builder, stored, slot_ptr);
+    if (overwrite_old) {
+        if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind) {
+            emit_rc_release_for_type(g, elem_type, old);
+        } else if (LLVMGetTypeKind(slot_ty) == LLVMIntegerTypeKind && is_rc_managed_type(elem_type)) {
+            LLVMTypeRef mt = map_type(g, elem_type);
+            if (LLVMGetTypeKind(mt) == LLVMPointerTypeKind) {
+                LLVMValueRef old_ptr = LLVMBuildIntToPtr(g->builder, old, mt, "slot.old");
+                emit_rc_release_for_type(g, elem_type, old_ptr);
+            }
+        }
+    }
+}
+
+static void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_type,
+                                             LLVMValueRef raw, LLVMTypeRef slot_ty) {
+    if (!elem_type || !is_rc_managed_type(elem_type)) return;
+    if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind) {
+        emit_rc_release_for_type(g, elem_type, raw);
+        return;
+    }
+    if (LLVMGetTypeKind(slot_ty) == LLVMIntegerTypeKind) {
+        LLVMTypeRef mt = map_type(g, elem_type);
+        if (LLVMGetTypeKind(mt) == LLVMPointerTypeKind) {
+            LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, raw, mt, "slot.old");
+            emit_rc_release_for_type(g, elem_type, ptr);
+        }
+    }
+}
+
+static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
+    LLVMValueRef f = LLVMGetNamedFunction(g->mod, "calloc");
+    if (!f) {
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef ft = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0);
+        f = LLVMAddFunction(g->mod, "calloc", ft);
+    }
+    return f;
 }
 
 /* ---- expression codegen ---- */
@@ -1399,6 +1447,16 @@ static zan_type_t *container_elem_type(zan_type_t *t) {
     if (t->element_type) return t->element_type;
     if (t->type_args && t->type_arg_count > 0) return t->type_args[0];
     return NULL;
+}
+
+static zan_type_t *dict_key_type(zan_irgen_t *g, zan_type_t *t) {
+    if (!t || !t->type_args || t->type_arg_count < 1) return g ? g->binder->type_string : NULL;
+    return t->type_args[0];
+}
+
+static zan_type_t *dict_value_type(zan_type_t *t) {
+    if (!t || !t->type_args || t->type_arg_count < 2) return NULL;
+    return t->type_args[1];
 }
 
 /* Best-effort static inference of an expression's Zan type, composed over
@@ -2288,8 +2346,21 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     /* list[i] = value — store into the list's i64 data slots */
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, local->alloca, "lraw");
+                    LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw,
+                        LLVMPointerType(g->list_struct_type, 0), "lptr");
+                    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+                        list_ptr, 2, "df");
+                    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(LLVMInt64TypeInContext(g->ctx), 0),
+                        data_field, "data");
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
-                    emit_list_element_store(g, raw, idx, right);
+                    if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                        LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
+                        idx = LLVMBuildSExt(g->builder, idx, LLVMInt64TypeInContext(g->ctx), "idxext");
+                    }
+                    LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, LLVMInt64TypeInContext(g->ctx), data, &idx, 1, "ep");
+                    emit_collection_slot_store(g, container_elem_type(local->type),
+                        LLVMInt64TypeInContext(g->ctx), slot_ptr,
+                        right, expr->binary.right, locals, 1);
                 } else if (local) {
                     LLVMValueRef arr_ptr = LLVMBuildLoad2(g->builder,
                         LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
@@ -2304,10 +2375,43 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     } else {
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (local->type && local->type->element_type) {
-                            elem_llvm = map_type(g, local->type->element_type);
+                            zan_type_t *et = local->type->element_type;
+                            elem_llvm = map_type(g, et);
                         }
-                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
-                        LLVMBuildStore(g->builder, right, elem_ptr);
+                        LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
+                            LLVMPointerType(elem_llvm, 0), "arrp");
+                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                        zan_type_t *et = local->type ? local->type->element_type : NULL;
+                        LLVMValueRef stored = right;
+                        LLVMTypeKind slot_k = LLVMGetTypeKind(elem_llvm);
+                        LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
+                        if (et && is_rc_managed_type(et)) {
+                            if (!expr_yields_owned_rc_value(g, expr->binary.right, locals)) {
+                                emit_rc_retain_for_type(g, et, stored);
+                            }
+                            if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != elem_llvm) {
+                                stored = LLVMBuildBitCast(g->builder, stored, elem_llvm, "slot.bc");
+                            }
+                            LLVMValueRef old = LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "old");
+                            LLVMBuildStore(g->builder, stored, elem_ptr);
+                            emit_rc_release_for_type(g, et, old);
+                        } else {
+                            if (slot_k == LLVMPointerTypeKind) {
+                                if (val_k == LLVMIntegerTypeKind) {
+                                    stored = LLVMBuildIntToPtr(g->builder, stored, elem_llvm, "slot.ip");
+                                } else if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != elem_llvm) {
+                                    stored = LLVMBuildBitCast(g->builder, stored, elem_llvm, "slot.bc");
+                                }
+                            } else if (slot_k == LLVMIntegerTypeKind) {
+                                if (val_k == LLVMPointerTypeKind) {
+                                    stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
+                                } else if (val_k == LLVMIntegerTypeKind &&
+                                           LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
+                                    stored = LLVMBuildSExt(g->builder, stored, elem_llvm, "slot.sx");
+                                }
+                            }
+                            LLVMBuildStore(g->builder, stored, elem_ptr);
+                        }
                     }
                 } else if (g->current_type_sym) {
                     /* implicit this.field[i] = value */
@@ -2317,19 +2421,65 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                         if (fsym->type && fsym->type->name.len == 4 &&
                             memcmp(fsym->type->name.str, "List", 4) == 0) {
-                            emit_list_element_store(g, arr_ptr, idx, right);
+                            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                            LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
+                                LLVMPointerType(g->list_struct_type, 0), "lptr");
+                            LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+                                list_ptr, 2, "df");
+                            LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0),
+                                data_field, "data");
+                            if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                                LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
+                                idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
+                            }
+                            LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
+                            emit_collection_slot_store(g, container_elem_type(fsym->type), i64t, slot_ptr,
+                                right, expr->binary.right, locals, 1);
                         } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
                             LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                             LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                             LLVMBuildStore(g->builder, val8, elem_ptr);
                         } else {
-                            LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
-                            if (fsym->type && fsym->type->element_type) {
-                                elem_llvm = map_type(g, fsym->type->element_type);
+                        LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
+                        if (fsym->type && fsym->type->element_type) {
+                            zan_type_t *et = fsym->type->element_type;
+                            elem_llvm = map_type(g, et);
+                        }
+                        LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
+                            LLVMPointerType(elem_llvm, 0), "arrp");
+                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                        zan_type_t *et = fsym->type ? fsym->type->element_type : NULL;
+                        LLVMValueRef stored = right;
+                        LLVMTypeKind slot_k = LLVMGetTypeKind(elem_llvm);
+                        LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
+                        if (et && is_rc_managed_type(et)) {
+                            if (!expr_yields_owned_rc_value(g, expr->binary.right, locals)) {
+                                emit_rc_retain_for_type(g, et, stored);
                             }
-                            LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
-                            LLVMBuildStore(g->builder, right, elem_ptr);
+                            if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != elem_llvm) {
+                                stored = LLVMBuildBitCast(g->builder, stored, elem_llvm, "slot.bc");
+                            }
+                            LLVMValueRef old = LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "old");
+                            LLVMBuildStore(g->builder, stored, elem_ptr);
+                            emit_rc_release_for_type(g, et, old);
+                        } else {
+                            if (slot_k == LLVMPointerTypeKind) {
+                                if (val_k == LLVMIntegerTypeKind) {
+                                    stored = LLVMBuildIntToPtr(g->builder, stored, elem_llvm, "slot.ip");
+                                } else if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != elem_llvm) {
+                                    stored = LLVMBuildBitCast(g->builder, stored, elem_llvm, "slot.bc");
+                                }
+                            } else if (slot_k == LLVMIntegerTypeKind) {
+                                if (val_k == LLVMPointerTypeKind) {
+                                    stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
+                                } else if (val_k == LLVMIntegerTypeKind &&
+                                           LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
+                                    stored = LLVMBuildSExt(g->builder, stored, elem_llvm, "slot.sx");
+                                }
+                            }
+                            LLVMBuildStore(g->builder, stored, elem_ptr);
+                        }
                         }
                     }
                 }
@@ -2342,19 +2492,64 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     if (at->name.len == 4 && memcmp(at->name.str, "List", 4) == 0) {
                         /* List field: index into the data buffer, not the
                          * struct — otherwise the store clobbers count/cap/data. */
-                        emit_list_element_store(g, arr_ptr, idx, right);
+                        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                        LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
+                            LLVMPointerType(g->list_struct_type, 0), "lptr");
+                        LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+                            list_ptr, 2, "df");
+                        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0),
+                            data_field, "data");
+                        if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
+                            idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
+                        }
+                        LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
+                        emit_collection_slot_store(g, container_elem_type(at), i64t, slot_ptr,
+                            right, expr->binary.right, locals, 1);
                     } else if (at->kind == TYPE_STRING) {
                         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
                         LLVMValueRef val8 = LLVMBuildTrunc(g->builder, right, i8, "byte");
                         LLVMBuildStore(g->builder, val8, elem_ptr);
-                    } else {
+                        } else {
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
                         if (at->element_type) {
                             elem_llvm = map_type(g, at->element_type);
                         }
-                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
-                        LLVMBuildStore(g->builder, right, elem_ptr);
+                        LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
+                            LLVMPointerType(elem_llvm, 0), "arrp");
+                        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
+                        zan_type_t *et = at->element_type;
+                        LLVMValueRef stored = right;
+                        LLVMTypeKind slot_k = LLVMGetTypeKind(elem_llvm);
+                        LLVMTypeKind val_k = LLVMGetTypeKind(LLVMTypeOf(stored));
+                        if (et && is_rc_managed_type(et)) {
+                            if (!expr_yields_owned_rc_value(g, expr->binary.right, locals)) {
+                                emit_rc_retain_for_type(g, et, stored);
+                            }
+                            if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != elem_llvm) {
+                                stored = LLVMBuildBitCast(g->builder, stored, elem_llvm, "slot.bc");
+                            }
+                            LLVMValueRef old = LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "old");
+                            LLVMBuildStore(g->builder, stored, elem_ptr);
+                            emit_rc_release_for_type(g, et, old);
+                        } else {
+                            if (slot_k == LLVMPointerTypeKind) {
+                                if (val_k == LLVMIntegerTypeKind) {
+                                    stored = LLVMBuildIntToPtr(g->builder, stored, elem_llvm, "slot.ip");
+                                } else if (val_k == LLVMPointerTypeKind && LLVMTypeOf(stored) != elem_llvm) {
+                                    stored = LLVMBuildBitCast(g->builder, stored, elem_llvm, "slot.bc");
+                                }
+                            } else if (slot_k == LLVMIntegerTypeKind) {
+                                if (val_k == LLVMPointerTypeKind) {
+                                    stored = LLVMBuildPtrToInt(g->builder, stored, elem_llvm, "slot.pi");
+                                } else if (val_k == LLVMIntegerTypeKind &&
+                                           LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
+                                    stored = LLVMBuildSExt(g->builder, stored, elem_llvm, "slot.sx");
+                                }
+                            }
+                            LLVMBuildStore(g->builder, stored, elem_ptr);
+                        }
                     }
                 }
             }
@@ -3564,11 +3759,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &count2, 1, "ep");
                     /* emit the value to add */
                     LLVMValueRef val = emit_expr(g, expr->call.args.items[0], locals);
-                    if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMIntegerTypeKind &&
-                        LLVMGetIntTypeWidth(LLVMTypeOf(val)) < 64) {
-                        val = LLVMBuildSExt(g->builder, val, i64, "ext");
-                    }
-                    LLVMBuildStore(g->builder, val, elem_ptr);
+                    emit_collection_slot_store(g, container_elem_type(ltype), i64, elem_ptr,
+                        val, expr->call.args.items[0], locals, 0);
                     /* count++ */
                     LLVMValueRef new_count = LLVMBuildAdd(g->builder, count2, LLVMConstInt(i64, 1, 0), "nc");
                     LLVMBuildStore(g->builder, new_count, count_ptr);
@@ -3587,11 +3779,32 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 zan_type_t *ltype = infer_expr_type(g, lobj, locals);
                 if (ltype && ltype->name.len == 4 && memcmp(ltype->name.str, "List", 4) == 0) {
                     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-                    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
                     LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
+                    LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt");
+                    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
+                    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
+                    LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "lc");
+                    LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
+                    LLVMBasicBlockRef c_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lc.cond");
+                    LLVMBasicBlockRef b_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lc.body");
+                    LLVMBasicBlockRef d_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lc.done");
+                    LLVMBuildBr(g->builder, c_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, c_bb);
+                    LLVMValueRef ci = LLVMBuildLoad2(g->builder, i64, idx_a, "ci");
+                    LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntULT, ci, count, "more");
+                    LLVMBuildCondBr(g->builder, more, b_bb, d_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, b_bb);
+                    LLVMValueRef ci2 = LLVMBuildLoad2(g->builder, i64, idx_a, "ci2");
+                    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, data, &ci2, 1, "sl");
+                    LLVMValueRef val = LLVMBuildLoad2(g->builder, i64, slot, "sv");
+                    emit_collection_release_raw_slot(g, container_elem_type(ltype), val, i64);
+                    LLVMValueRef ni = LLVMBuildAdd(g->builder, ci2, LLVMConstInt(i64, 1, 0), "ni");
+                    LLVMBuildStore(g->builder, ni, idx_a);
+                    LLVMBuildBr(g->builder, c_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, d_bb);
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), count_ptr);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
                 }
@@ -3617,6 +3830,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
                     LLVMValueRef idx = emit_expr(g, expr->call.args.items[0], locals);
+                    LLVMValueRef removed_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx, 1, "rmp");
+                    LLVMValueRef removed = LLVMBuildLoad2(g->builder, i64, removed_ptr, "rmv");
+                    emit_collection_release_raw_slot(g, container_elem_type(ltype), removed, i64);
                     /* shift loop: for j = idx; j < count-1; j++ : data[j] = data[j+1] */
                     LLVMValueRef j_a = LLVMBuildAlloca(g->builder, i64, "j");
                     LLVMBuildStore(g->builder, idx, j_a);
@@ -3641,6 +3857,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMBuildBr(g->builder, cond_bb);
                     LLVMPositionBuilderAtEnd(g->builder, done_bb);
                     LLVMBuildStore(g->builder, last, count_ptr);
+                    LLVMValueRef tail_ptr = LLVMBuildGEP2(g->builder, i64, data, &last, 1, "tail");
+                    LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), tail_ptr);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
                 }
             }
@@ -3852,7 +4070,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMPositionBuilderAtEnd(g->builder, sdone_bb);
                     /* store item at index */
                     LLVMValueRef ins_slot = LLVMBuildGEP2(g->builder, i64, phi_data, &idx, 1, "is");
-                    LLVMBuildStore(g->builder, item, ins_slot);
+                    emit_collection_slot_store(g, container_elem_type(ltype), i64, ins_slot,
+                        item, expr->call.args.items[1], locals, 1);
                     LLVMValueRef nc = LLVMBuildAdd(g->builder, count, LLVMConstInt(i64, 1, 0), "nc");
                     LLVMBuildStore(g->builder, nc, count_ptr);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
@@ -3935,14 +4154,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
                         LLVMValueRef key_val = emit_expr(g, expr->call.args.items[0], locals);
                         LLVMValueRef val_v = emit_expr(g, expr->call.args.items[1], locals);
-                        if (LLVMGetTypeKind(LLVMTypeOf(val_v)) == LLVMIntegerTypeKind &&
-                            LLVMGetIntTypeWidth(LLVMTypeOf(val_v)) < 64) {
-                            val_v = LLVMBuildSExt(g->builder, val_v, i64, "ext");
-                        }
                         LLVMValueRef kslot = LLVMBuildGEP2(g->builder, i8ptr, ks, &cnt, 1, "ksl");
-                        LLVMBuildStore(g->builder, key_val, kslot);
                         LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs, &cnt, 1, "vsl");
-                        LLVMBuildStore(g->builder, val_v, vslot);
+                        emit_collection_slot_store(g, dict_key_type(g, dict_local->type), i8ptr, kslot,
+                            key_val, expr->call.args.items[0], locals, 0);
+                        emit_collection_slot_store(g, dict_value_type(dict_local->type), i64, vslot,
+                            val_v, expr->call.args.items[1], locals, 0);
                         LLVMValueRef nc = LLVMBuildAdd(g->builder, cnt, LLVMConstInt(i64, 1, 0), "nc");
                         LLVMBuildStore(g->builder, nc, cntp);
                         return LLVMConstInt(i32t, 0, 0);
@@ -3993,6 +4210,38 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         /* done: return result */
                         LLVMPositionBuilderAtEnd(g->builder, done_bb);
                         return LLVMBuildLoad2(g->builder, i32t, res, "ckres");
+                    }
+                    if (mname.len == 5 && memcmp(mname.str, "Clear", 5) == 0 && expr->call.args.count == 0) {
+                        LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
+                        LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "cnt");
+                        LLVMValueRef kp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 2, "kp");
+                        LLVMValueRef ks = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp, "ks");
+                        LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
+                        LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
+                        LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "dc");
+                        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
+                        LLVMBasicBlockRef cbb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dc.cond");
+                        LLVMBasicBlockRef bbb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dc.body");
+                        LLVMBasicBlockRef dbb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dc.done");
+                        LLVMBuildBr(g->builder, cbb);
+                        LLVMPositionBuilderAtEnd(g->builder, cbb);
+                        LLVMValueRef ci = LLVMBuildLoad2(g->builder, i64, idx_a, "ci");
+                        LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntULT, ci, cnt, "more");
+                        LLVMBuildCondBr(g->builder, more, bbb, dbb);
+                        LLVMPositionBuilderAtEnd(g->builder, bbb);
+                        LLVMValueRef ci2 = LLVMBuildLoad2(g->builder, i64, idx_a, "ci2");
+                        LLVMValueRef kslot = LLVMBuildGEP2(g->builder, i8ptr, ks, &ci2, 1, "ksl");
+                        LLVMValueRef kv = LLVMBuildLoad2(g->builder, i8ptr, kslot, "kv");
+                        emit_collection_release_raw_slot(g, dict_key_type(g, dict_local->type), kv, i8ptr);
+                        LLVMValueRef vslot = LLVMBuildGEP2(g->builder, i64, vs, &ci2, 1, "vsl");
+                        LLVMValueRef vv = LLVMBuildLoad2(g->builder, i64, vslot, "vv");
+                        emit_collection_release_raw_slot(g, dict_value_type(dict_local->type), vv, i64);
+                        LLVMValueRef ni = LLVMBuildAdd(g->builder, ci2, LLVMConstInt(i64, 1, 0), "ni");
+                        LLVMBuildStore(g->builder, ni, idx_a);
+                        LLVMBuildBr(g->builder, cbb);
+                        LLVMPositionBuilderAtEnd(g->builder, dbb);
+                        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), cntp);
+                        return LLVMConstInt(i32t, 0, 0);
                     }
                 }
             }
@@ -4068,6 +4317,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMPositionBuilderAtEnd(g->builder, found_bb);
                         LLVMValueRef fi = LLVMBuildLoad2(g->builder, i64, idx_a, "fi");
                         LLVMValueRef last = LLVMBuildSub(g->builder, cnt, LLVMConstInt(i64, 1, 0), "last");
+                        LLVMValueRef rkey = LLVMBuildGEP2(g->builder, i8ptr, ks, &fi, 1, "rkey");
+                        LLVMValueRef rkv = LLVMBuildLoad2(g->builder, i8ptr, rkey, "rkv");
+                        emit_collection_release_raw_slot(g, dict_key_type(g, dict_local->type), rkv, i8ptr);
+                        LLVMValueRef rvslot = LLVMBuildGEP2(g->builder, i64, vs, &fi, 1, "rvslot");
+                        LLVMValueRef rv = LLVMBuildLoad2(g->builder, i64, rvslot, "rv");
+                        emit_collection_release_raw_slot(g, dict_value_type(dict_local->type), rv, i64);
                         LLVMValueRef j_a = LLVMBuildAlloca(g->builder, i64, "fj");
                         LLVMBuildStore(g->builder, fi, j_a);
                         LLVMBasicBlockRef sc_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dr.sc");
@@ -4092,6 +4347,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMBuildBr(g->builder, sc_bb);
                         LLVMPositionBuilderAtEnd(g->builder, sd_bb);
                         LLVMBuildStore(g->builder, last, cntp);
+                        LLVMValueRef ktail = LLVMBuildGEP2(g->builder, i8ptr, ks, &last, 1, "ktail");
+                        LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), ktail);
+                        LLVMValueRef vtail = LLVMBuildGEP2(g->builder, i64, vs, &last, 1, "vtail");
+                        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), vtail);
                         LLVMBuildBr(g->builder, done_bb);
                         /* next: increment and loop */
                         LLVMPositionBuilderAtEnd(g->builder, next_bb);
@@ -4716,7 +4975,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             if (arr_type->element_type) {
                 elem_llvm = map_type(g, arr_type->element_type);
             }
-            LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, arr_ptr, &idx, 1, "eidx");
+            LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
+                LLVMPointerType(elem_llvm, 0), "arrp");
+            LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
             return LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
@@ -4732,8 +4993,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* allocate List struct on heap */
                 LLVMValueRef list_size = LLVMConstInt(i64, 24, 0); /* 3 * i64 = 24 bytes */
                 LLVMValueRef list_ptr = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
-                    g->fn_malloc, &list_size, 1, "list");
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), list_size }, 2, "list");
                 /* cast to List* */
                 LLVMValueRef typed_ptr = LLVMBuildBitCast(g->builder, list_ptr,
                     LLVMPointerType(g->list_struct_type, 0), "lptr");
@@ -4746,8 +5007,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* allocate initial data buffer: 8 * sizeof(i64) = 64 bytes */
                 LLVMValueRef data_size = LLVMConstInt(i64, 64, 0);
                 LLVMValueRef data_ptr = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
-                    g->fn_malloc, &data_size, 1, "data");
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), data_size }, 2, "data");
                 LLVMValueRef data_typed = LLVMBuildBitCast(g->builder, data_ptr,
                     LLVMPointerType(i64, 0), "dptr");
                 LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, typed_ptr, 2, "df");
@@ -4788,8 +5049,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* allocate Dict struct: { i64 count, i64 capacity, i8** keys, i64* values } = 32 bytes */
                 LLVMValueRef dict_size = LLVMConstInt(i64, 32, 0);
                 LLVMValueRef dict_raw = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
-                    g->fn_malloc, &dict_size, 1, "dict");
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), dict_size }, 2, "dict");
                 LLVMValueRef typed_ptr = LLVMBuildBitCast(g->builder, dict_raw,
                     LLVMPointerType(g->dict_struct_type, 0), "dptr");
                 /* count = 0 */
@@ -4801,8 +5062,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* keys = malloc(16 * 8) */
                 LLVMValueRef keys_sz = LLVMConstInt(i64, 128, 0);
                 LLVMValueRef keys_raw = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
-                    g->fn_malloc, &keys_sz, 1, "keys");
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), keys_sz }, 2, "keys");
                 LLVMValueRef keys_typed = LLVMBuildBitCast(g->builder, keys_raw,
                     LLVMPointerType(i8ptr, 0), "kptr");
                 LLVMValueRef kf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 2, "kf");
@@ -4810,8 +5071,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* values = malloc(16 * 8) */
                 LLVMValueRef vals_sz = LLVMConstInt(i64, 128, 0);
                 LLVMValueRef vals_raw = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
-                    g->fn_malloc, &vals_sz, 1, "vals");
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), vals_sz }, 2, "vals");
                 LLVMValueRef vals_typed = LLVMBuildBitCast(g->builder, vals_raw,
                     LLVMPointerType(i64, 0), "vptr");
                 LLVMValueRef vf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 3, "vf");
@@ -4827,15 +5088,15 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMTypeRef elem_llvm = map_type(g, elem_type);
             LLVMValueRef size_val = emit_expr(g, expr->new_expr.args.items[0], locals);
 
-            /* malloc(size * sizeof(elem)) */
+            /* calloc(size, sizeof(elem)) */
             LLVMValueRef elem_size = LLVMSizeOf(elem_llvm);
             LLVMValueRef total = LLVMBuildMul(g->builder,
                 LLVMBuildZExt(g->builder, size_val, LLVMInt64TypeInContext(g->ctx), "zext"),
                 elem_size, "total");
-            LLVMTypeRef malloc_type = LLVMFunctionType(
-                LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
-                (LLVMTypeRef[]){LLVMInt64TypeInContext(g->ctx)}, 1, 0);
-            LLVMValueRef arr = LLVMBuildCall2(g->builder, malloc_type, g->fn_malloc, &total, 1, "arr");
+            LLVMValueRef arr = LLVMBuildCall2(g->builder,
+                LLVMFunctionType(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                    (LLVMTypeRef[]){LLVMInt64TypeInContext(g->ctx), LLVMInt64TypeInContext(g->ctx)}, 2, 0),
+                get_calloc_fn(g), (LLVMValueRef[]){ total, LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 1, 0) }, 2, "arr");
             return arr;
         }
 
