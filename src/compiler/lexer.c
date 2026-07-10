@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <limits.h>
 
 /* ---- keyword table ---- */
 
@@ -318,11 +319,15 @@ static int pp_eval_atom(zan_lexer_t *lex) {
         return v;
     }
     if (isdigit((unsigned char)ch)) {
-        int v = 0;
+        /* Accumulate in a wider type and clamp to INT_MAX so a pathologically
+         * long digit run in a #if expression cannot overflow (signed overflow
+         * is UB and trips the sanitizer/fuzzer build). */
+        long long v = 0;
         while (!lexer_at_end(lex) && isdigit((unsigned char)lexer_peek_ch(lex))) {
             v = v * 10 + (lexer_advance(lex) - '0');
+            if (v > INT_MAX) v = INT_MAX;
         }
-        return v;
+        return (int)v;
     }
     if (isalpha((unsigned char)ch) || ch == '_') {
         char name[64];

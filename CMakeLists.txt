@@ -277,6 +277,27 @@ foreach(_src ${_conf_srcs})
       -P ${CMAKE_SOURCE_DIR}/tests/run_determinism.cmake)
 endforeach()
 
+# ---- Leak detection: run each program under --check-leaks, fail on leaks ----
+# The --check-leaks build tracks rc-managed allocations and reports any object
+# still reachable at exit. Programs known to leak (rc objects owned by arrays,
+# List/Dict or object fields are not yet released when their owner dies -- a
+# documented ARC follow-up) are marked WILL_FAIL so this gate stays green while
+# still catching *new* leaks; fixing such a leak flips its test to failing, a
+# reminder to drop it from the allow-list below.
+set(_known_leaky)
+foreach(_src ${_conf_srcs})
+  get_filename_component(_name ${_src} NAME_WE)
+  add_test(NAME leakcheck_${_name}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${_src}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/leak_${_name}${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_leakcheck.cmake)
+  if(_name IN_LIST _known_leaky)
+    set_tests_properties(leakcheck_${_name} PROPERTIES WILL_FAIL TRUE)
+  endif()
+endforeach()
+
 # ---- Multi-file compilation: compile several .zan files into one program ----
 # Sources live in a subdirectory so the single-file glob above ignores them.
 add_test(NAME conformance_multifile
