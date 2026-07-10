@@ -209,7 +209,7 @@ int dbg_add_watch(debugger_t *dbg, const char *expression) {
     memset(w, 0, sizeof(dbg_watch_t));
     strncpy(w->expression, expression, sizeof(w->expression) - 1);
     w->valid = false;
-    strcpy(w->value, "<not evaluated>");
+    snprintf(w->value, sizeof(w->value), "%s", "<not evaluated>");
 
     char msg[256];
     snprintf(msg, sizeof(msg), "[DBG] Watch added: %s\n", expression);
@@ -231,7 +231,8 @@ void dbg_edit_watch(debugger_t *dbg, int index, const char *new_expression) {
     strncpy(dbg->watches[index].expression, new_expression,
             sizeof(dbg->watches[index].expression) - 1);
     dbg->watches[index].valid = false;
-    strcpy(dbg->watches[index].value, "<not evaluated>");
+    snprintf(dbg->watches[index].value, sizeof(dbg->watches[index].value), "%s",
+             "<not evaluated>");
 }
 
 /* Evaluate a simple expression against locals */
@@ -596,7 +597,8 @@ void dbg_refresh_callstack(debugger_t *dbg) {
                 sizeof(dbg->callstack[0].file) - 1);
         dbg->callstack[0].line = dbg->current_line;
         dbg->callstack[0].col = dbg->current_col;
-        strcpy(dbg->callstack[0].function_name, "<unknown>");
+        snprintf(dbg->callstack[0].function_name,
+                 sizeof(dbg->callstack[0].function_name), "%s", "<unknown>");
         dbg->callstack_depth = 1;
     }
 }

@@ -155,11 +155,11 @@ static void parse_docs(const char *src, doc_file_t *doc) {
 
         /* detect access modifier */
         char *decl = trimmed;
-        if (strncmp(decl, "public ", 7) == 0) { strcpy(m->access, "public"); decl += 7; }
-        else if (strncmp(decl, "private ", 8) == 0) { strcpy(m->access, "private"); decl += 8; }
-        else if (strncmp(decl, "protected ", 10) == 0) { strcpy(m->access, "protected"); decl += 10; }
-        else if (strncmp(decl, "internal ", 9) == 0) { strcpy(m->access, "internal"); decl += 9; }
-        else strcpy(m->access, "public");
+        if (strncmp(decl, "public ", 7) == 0) { snprintf(m->access, sizeof(m->access), "%s", "public"); decl += 7; }
+        else if (strncmp(decl, "private ", 8) == 0) { snprintf(m->access, sizeof(m->access), "%s", "private"); decl += 8; }
+        else if (strncmp(decl, "protected ", 10) == 0) { snprintf(m->access, sizeof(m->access), "%s", "protected"); decl += 10; }
+        else if (strncmp(decl, "internal ", 9) == 0) { snprintf(m->access, sizeof(m->access), "%s", "internal"); decl += 9; }
+        else snprintf(m->access, sizeof(m->access), "%s", "public");
 
         if (strncmp(decl, "static ", 7) == 0) decl += 7;
 

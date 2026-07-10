@@ -71,7 +71,7 @@ bool zan_target_parse(const char *triple_str, zan_target_t *out) {
     out->arch = parse_arch(triple_str);
     out->os = parse_os(triple_str);
     out->abi = parse_abi(triple_str, out->os);
-    strcpy(out->cpu, "generic");
+    snprintf(out->cpu, sizeof(out->cpu), "%s", "generic");
     out->features[0] = 0;
     out->pointer_size = (out->arch == ZAN_ARCH_WASM32) ? 4 : 8;
     out->pic = (out->os == ZAN_OS_LINUX || out->os == ZAN_OS_MACOS);

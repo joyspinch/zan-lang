@@ -99,7 +99,7 @@ static void add_stdlib_input(const char **files, int *count, const char *path) {
     if (input_file_present(files, *count, path)) return;
     if (*count < 128) {
         char *dup = (char *)malloc(strlen(path) + 1);
-        strcpy(dup, path);
+        memcpy(dup, path, strlen(path) + 1);
         files[(*count)++] = dup;
     }
 }
