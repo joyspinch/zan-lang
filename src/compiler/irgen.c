@@ -1397,7 +1397,7 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scop
  * Used to route `+` to concatenation and `==`/`!=` to strcmp rather than raw
  * pointer arithmetic/comparison. Reference (class) values are NOT strings. */
 static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
-    if (!e) return false;
+    if (!e || !locals) return false;
     switch (e->kind) {
     case AST_STRING_LITERAL:
     case AST_STRING_INTERP:
@@ -1523,6 +1523,10 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
         }
         return NULL;
     }
+    case AST_NEW_EXPR:
+        /* `new T(...)` yields a T; array `new T[n]` is not a single rc object. */
+        if (e->new_expr.is_array) return NULL;
+        return zan_binder_resolve_type(g->binder, e->new_expr.type);
     default:
         return NULL;
     }
@@ -1641,6 +1645,21 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     return 0;
 }
 
+static int expr_is_local_ident(zan_ast_node_t *e, local_scope_t *locals) {
+    return e && e->kind == AST_IDENTIFIER && locals && local_find(locals, e->ident.name);
+}
+
+static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
+                                         LLVMValueRef val, local_scope_t *locals) {
+    if (!arg || !locals || !val) return;
+    if (LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return;
+    if (expr_is_local_ident(arg, locals)) return;
+    zan_type_t *t = infer_expr_type(g, arg, locals);
+    if (!t || !is_rc_managed_type(t)) return;
+    if (!expr_yields_owned_rc_value(g, arg, locals)) return;
+    emit_rc_release_for_type(g, t, val);
+}
+
 /* True when a local owns a class heap reference held as a pointer (excludes
  * borrowed params, stack-struct classes and non-class types). */
 static int local_owns_arc(local_var_t *v) {
@@ -1705,73 +1724,6 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     if (!expr_yields_owned_rc_value(g, rhs, locals)) emit_rc_retain_for_type(g, type, v);
     LLVMBuildStore(g->builder, v, field_ptr);
     emit_rc_release_for_type(g, type, old);
-}
-
-/* Does the expression subtree reference a bare identifier named `name`? */
-static int ast_refs_ident(zan_ast_node_t *n, zan_istr_t name) {
-    if (!n) return 0;
-    switch (n->kind) {
-    case AST_IDENTIFIER:
-        return n->ident.name.len == name.len &&
-               memcmp(n->ident.name.str, name.str, (size_t)name.len) == 0;
-    case AST_BINARY:
-    case AST_ASSIGNMENT:
-        return ast_refs_ident(n->binary.left, name) ||
-               ast_refs_ident(n->binary.right, name);
-    case AST_UNARY:
-    case AST_POSTFIX_UNARY:
-        return ast_refs_ident(n->unary.operand, name);
-    case AST_CALL: {
-        if (ast_refs_ident(n->call.callee, name)) return 1;
-        for (int i = 0; i < n->call.args.count; i++)
-            if (ast_refs_ident(n->call.args.items[i], name)) return 1;
-        return 0;
-    }
-    case AST_MEMBER_ACCESS:
-        return ast_refs_ident(n->member.object, name);
-    case AST_INDEX:
-        return ast_refs_ident(n->index.object, name) ||
-               ast_refs_ident(n->index.index, name);
-    case AST_CONDITIONAL:
-        return ast_refs_ident(n->conditional.cond, name) ||
-               ast_refs_ident(n->conditional.then_expr, name) ||
-               ast_refs_ident(n->conditional.else_expr, name);
-    case AST_NEW_EXPR: {
-        for (int i = 0; i < n->new_expr.args.count; i++)
-            if (ast_refs_ident(n->new_expr.args.items[i], name)) return 1;
-        return 0;
-    }
-    case AST_CAST_EXPR:
-        return ast_refs_ident(n->cast.expr, name);
-    case AST_IS_EXPR:
-    case AST_AS_EXPR:
-        return ast_refs_ident(n->type_test.expr, name);
-    case AST_AWAIT_EXPR:
-        return ast_refs_ident(n->await_expr.expr, name);
-    case AST_STRING_INTERP: {
-        for (int i = 0; i < n->string_interp.parts.count; i++)
-            if (ast_refs_ident(n->string_interp.parts.items[i], name)) return 1;
-        return 0;
-    }
-    default:
-        return 0;
-    }
-}
-
-/* At a call, hand off ownership of any owning class local that appears in an
- * argument (the callee may capture it into a collection/field), so it is not
- * released at function exit — preventing a use-after-free of the captured
- * reference. */
-static void arc_mark_call_arg_escapes(zan_ast_node_t *callexpr, local_scope_t *locals) {
-    if (!callexpr || callexpr->kind != AST_CALL) return;
-    for (int a = 0; a < callexpr->call.args.count; a++) {
-        zan_ast_node_t *arg = callexpr->call.args.items[a];
-        for (int i = 0; i < locals->count; i++) {
-            if (locals->vars[i].arc_owned == 1 &&
-                ast_refs_ident(arg, locals->vars[i].name))
-                locals->vars[i].arc_owned = 0;
-        }
-    }
 }
 
 /* Emit a runtime guard: when `is_error` is true at runtime, print
@@ -2611,14 +2563,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
          * registers self as awaiter and suspends). This is the concurrency
          * primitive a server accept loop uses to handle each connection on its
          * own coroutine instead of serially. See docs/ASYNC_CPS_DESIGN.md. */
-        /* ARC: an owning class local passed as an argument may be captured by
-         * the callee (stored in a collection/field), so relinquish ownership. */
-        arc_mark_call_arg_escapes(expr, locals);
         if (is_call_to(expr, "Task", "Spawn") && expr->call.args.count == 1 &&
             expr->call.args.items[0]->kind == AST_CALL) {
             LLVMTypeRef sp_i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef sp_i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-            LLVMValueRef sub = emit_expr(g, expr->call.args.items[0], locals);
+            zan_ast_node_t *sub_arg = expr->call.args.items[0];
+            LLVMValueRef sub = emit_expr(g, sub_arg, locals);
             LLVMValueRef sub_resume = NULL;
             if (LLVMIsACallInst(sub)) {
                 LLVMValueRef callee = LLVMGetCalledValue(sub);
@@ -2638,6 +2588,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef sched_args[] = { sub_i8, sub_resume };
                 LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
             }
+            emit_release_owned_call_temp(g, sub_arg, sub, locals);
             return LLVMConstInt(sp_i64, 0, 0);
         }
 
@@ -2657,7 +2608,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMPointerType(g->sb_struct_type, 0), "sbp");
                 if (sbm.len == 6 && memcmp(sbm.str, "Append", 6) == 0 &&
                     expr->call.args.count == 1) {
-                    LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
+                    zan_ast_node_t *arg0 = expr->call.args.items[0];
+                    LLVMValueRef s = emit_expr(g, arg0, locals);
                     LLVMValueRef slen = LLVMBuildCall2(g->builder,
                         LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                         g->fn_strlen, &s, 1, "sblen");
@@ -2698,6 +2650,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         memcpy_fn, (LLVMValueRef[]){ dest, s, slen }, 3, "");
                     LLVMValueRef ncount = LLVMBuildAdd(g->builder, count, slen, "sbncount");
                     LLVMBuildStore(g->builder, ncount, cptr);
+                    emit_release_owned_call_temp(g, arg0, s, locals);
                     return raw;
                 }
                 if (sbm.len == 8 && memcmp(sbm.str, "ToString", 8) == 0 &&
@@ -2727,7 +2680,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         if (is_call_to(expr, "Console", "WriteLine") ||
             is_call_to(expr, "Console", "PrintLine")) {
             if (expr->call.args.count > 0) {
-                LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
+                zan_ast_node_t *arg_ast = expr->call.args.items[0];
+                LLVMValueRef arg = emit_expr(g, arg_ast, locals);
                 LLVMTypeRef arg_type = LLVMTypeOf(arg);
 
                 if (LLVMGetTypeKind(arg_type) == LLVMPointerTypeKind) {
@@ -2756,6 +2710,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         1, 0);
                     LLVMBuildCall2(g->builder, fn_type, g->rt_print_int, &arg, 1, "");
                 }
+                emit_release_owned_call_temp(g, arg_ast, arg, locals);
             }
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
@@ -2763,7 +2718,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         /* Console.Write (no newline) */
         if (is_call_to(expr, "Console", "Write")) {
             if (expr->call.args.count > 0) {
-                LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
+                zan_ast_node_t *arg_ast = expr->call.args.items[0];
+                LLVMValueRef arg = emit_expr(g, arg_ast, locals);
                 LLVMTypeRef arg_type = LLVMTypeOf(arg);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef printf_args[] = { i8ptr };
@@ -2793,6 +2749,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef args[] = { fmt, int_arg };
                     LLVMBuildCall2(g->builder, printf_type, printf_fn, args, 2, "");
                 }
+                emit_release_owned_call_temp(g, arg_ast, arg, locals);
             }
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
@@ -3085,7 +3042,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i8ptrptr = LLVMPointerType(i8ptr, 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-            LLVMValueRef idx = emit_expr(g, expr->call.args.items[0], locals);
+            zan_ast_node_t *idx_ast = expr->call.args.items[0];
+            LLVMValueRef idx = emit_expr(g, idx_ast, locals);
             LLVMValueRef idx1 = LLVMBuildAdd(g->builder, idx, LLVMConstInt(i64, 1, 0), "argi");
             LLVMValueRef g_argv = LLVMGetNamedGlobal(g->mod, "__zan_argv");
             if (!g_argv) {
@@ -3094,12 +3052,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             LLVMValueRef argv = LLVMBuildLoad2(g->builder, i8ptrptr, g_argv, "argv");
             LLVMValueRef slot = LLVMBuildGEP2(g->builder, i8ptr, argv, &idx1, 1, "argslot");
+            emit_release_owned_call_temp(g, idx_ast, idx, locals);
             return LLVMBuildLoad2(g->builder, i8ptr, slot, "arg");
         }
 
         /* File.ReadAllText(path) -> string */
         if (is_call_to(expr, "File", "ReadAllText") && expr->call.args.count == 1) {
-            LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
+            zan_ast_node_t *path_ast = expr->call.args.items[0];
+            LLVMValueRef path_arg = emit_expr(g, path_ast, locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -3159,13 +3119,16 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             /* close */
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &fp, 1, "");
+            emit_release_owned_call_temp(g, path_ast, path_arg, locals);
             return buf;
         }
 
         /* File.WriteAllText(path, content) */
         if (is_call_to(expr, "File", "WriteAllText") && expr->call.args.count == 2) {
-            LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
-            LLVMValueRef content_arg = emit_expr(g, expr->call.args.items[1], locals);
+            zan_ast_node_t *path_ast = expr->call.args.items[0];
+            zan_ast_node_t *content_ast = expr->call.args.items[1];
+            LLVMValueRef path_arg = emit_expr(g, path_ast, locals);
+            LLVMValueRef content_arg = emit_expr(g, content_ast, locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -3194,6 +3157,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 fputs_fn, fputs_args, 2, "");
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &fp, 1, "");
+            emit_release_owned_call_temp(g, path_ast, path_arg, locals);
+            emit_release_owned_call_temp(g, content_ast, content_arg, locals);
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
@@ -3201,7 +3166,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         if (is_call_to(expr, "Path", "GetFileName") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-            LLVMValueRef path_val = emit_expr(g, expr->call.args.items[0], locals);
+            zan_ast_node_t *path_ast = expr->call.args.items[0];
+            LLVMValueRef path_val = emit_expr(g, path_ast, locals);
             /* call strrchr(path, '/') then strrchr(path, '\\') and pick later one */
             LLVMValueRef strrchr_fn = LLVMGetNamedFunction(g->mod, "strrchr");
             LLVMValueRef slash_args[] = { path_val, LLVMConstInt(i32t, '/', 0) };
@@ -3227,7 +3193,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         if (is_call_to(expr, "Path", "GetExtension") && expr->call.args.count == 1) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-            LLVMValueRef path_val = emit_expr(g, expr->call.args.items[0], locals);
+            zan_ast_node_t *path_ast = expr->call.args.items[0];
+            LLVMValueRef path_val = emit_expr(g, path_ast, locals);
             LLVMValueRef strrchr_fn = LLVMGetNamedFunction(g->mod, "strrchr");
             LLVMValueRef dot_args[] = { path_val, LLVMConstInt(i32t, '.', 0) };
             LLVMValueRef dot = LLVMBuildCall2(g->builder,
@@ -3267,6 +3234,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMBuildCall2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 g->fn_strcat, cat2_args, 2, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], a, locals);
+            emit_release_owned_call_temp(g, expr->call.args.items[1], b, locals);
             return buf;
         }
 
@@ -3301,6 +3270,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 fputs_fn, fputs_args, 2, "");
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &fp, 1, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
+            emit_release_owned_call_temp(g, expr->call.args.items[1], content_arg, locals);
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
@@ -3335,6 +3306,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMBuildBr(g->builder, end_bb);
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
             LLVMValueRef result = LLVMBuildZExt(g->builder, is_null, LLVMInt64TypeInContext(g->ctx), "fex");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return result;
         }
 
@@ -3350,6 +3322,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 remove_fn, &path_arg, 1, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMConstInt(i32, 0, 0);
         }
 
@@ -3367,6 +3340,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef args[] = { src, dst };
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 rename_fn, args, 2, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], src, locals);
+            emit_release_owned_call_temp(g, expr->call.args.items[1], dst, locals);
             return LLVMConstInt(i32, 0, 0);
         }
 
@@ -3446,6 +3421,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             /* free buffer */
             LLVMBuildCall2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 g->fn_free, &buf, 1, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], src, locals);
+            emit_release_owned_call_temp(g, expr->call.args.items[1], dst, locals);
             return LLVMConstInt(i32, 0, 0);
         }
 
@@ -3487,6 +3464,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0), ftell_fn, &fp, 1, "fsz");
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 fclose_fn, &fp, 1, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return sz;
         }
 
@@ -3513,6 +3491,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef is_dir_bool = LLVMBuildICmp(g->builder, LLVMIntNE, is_dir,
                 LLVMConstInt(i32, 0, 0), "isdirb");
             LLVMValueRef result = LLVMBuildAnd(g->builder, not_invalid, is_dir_bool, "dexist");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMBuildZExt(g->builder, result, i64, "dex");
         }
 
@@ -3528,6 +3507,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 mkdir_fn, &path_arg, 1, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMConstInt(i32, 0, 0);
         }
 
@@ -3543,6 +3523,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 rmdir_fn, &path_arg, 1, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMConstInt(i32, 0, 0);
         }
 
@@ -3575,6 +3556,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 chdir_fn, &path_arg, 1, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMConstInt(i32, 0, 0);
         }
 
@@ -3621,6 +3603,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), sep_ptr);
             LLVMBuildBr(g->builder, end_bb);
             LLVMPositionBuilderAtEnd(g->builder, end_bb);
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_val, locals);
             return buf;
         }
 
@@ -3636,6 +3619,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0),
                 strrchr_fn, dot_args, 2, "dot");
             LLVMValueRef has = LLVMBuildICmp(g->builder, LLVMIntNE, dot, LLVMConstNull(i8ptr), "hasext");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], path_val, locals);
             return LLVMBuildZExt(g->builder, has, i64, "he");
         }
 
@@ -4438,15 +4422,21 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         if (g->functions[fi].sym == method_sym) {
                             int argc = expr->call.args.count + 1;
                             LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
+                            LLVMValueRef recv_val = emit_expr(g, callee->member.object, locals);
                             /* receiver: the object pointer produced by the
                              * expression (field load, index, call, ...). */
-                            call_args[0] = emit_expr(g, callee->member.object, locals);
+                            call_args[0] = recv_val;
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
                             }
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
                             LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                 g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                            emit_release_owned_call_temp(g, callee->member.object, recv_val, locals);
+                            for (int k = 0; k < expr->call.args.count; k++) {
+                                emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                    call_args[k + 1], locals);
+                            }
                             free(call_args);
                             return result;
                         }
@@ -4485,6 +4475,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     const char *cn = (LLVMGetTypeKind(ret) == LLVMVoidTypeKind) ? "" : "dlgcall";
                     LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
                         fn_ptr, call_args, (unsigned)argc, cn);
+                    for (int k = 0; k < argc; k++) {
+                        emit_release_owned_call_temp(g, expr->call.args.items[k],
+                            call_args[k], locals);
+                    }
                     free(call_args);
                     free(param_types);
                     return result;
@@ -4527,6 +4521,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "bcall";
                             LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                 g->functions[fi].fn, call_args, (unsigned)(argc + extra), cn);
+                            for (int k = 0; k < argc; k++) {
+                                emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                    call_args[k + extra], locals);
+                            }
                             free(call_args);
                             return result;
                         }
@@ -4550,6 +4548,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
                 LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
                     global_fn, call_args, (unsigned)argc, "gcall");
+                for (int k = 0; k < argc; k++) {
+                    emit_release_owned_call_temp(g, expr->call.args.items[k],
+                        call_args[k], locals);
+                }
                 free(call_args);
                 return result;
             }
@@ -5154,6 +5156,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             }
                             LLVMBuildCall2(g->builder, g->ctors[ci].fn_type,
                                 g->ctors[ci].fn, call_args, (unsigned)argc, "");
+                            for (int k = 0; k < expr->new_expr.args.count; k++) {
+                                emit_release_owned_call_temp(g, expr->new_expr.args.items[k],
+                                    call_args[k + 1], locals);
+                            }
                             free(call_args);
                             break;
                         }
