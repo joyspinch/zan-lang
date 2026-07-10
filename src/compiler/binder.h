@@ -78,6 +78,7 @@ struct zan_symbol {
     zan_symbol_t **members;
     int member_count;
     int member_cap;
+    int members_bound;               /* pass-2 idempotency / ordering guard */
 };
 
 /* ---- scope ---- */

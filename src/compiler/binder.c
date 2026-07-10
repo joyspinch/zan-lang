@@ -35,6 +35,7 @@ static zan_symbol_t *make_symbol(zan_arena_t *arena, zan_sym_kind_t kind,
     s->members = NULL;
     s->member_count = 0;
     s->member_cap = 0;
+    s->members_bound = 0;
     return s;
 }
 
@@ -298,12 +299,23 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
     if (!type_sym) return;
 
+    /* Idempotency + ordering guard: a subclass may be bound before its base
+     * appears in decl order (e.g. a user class extending a force-included
+     * prelude class like System.Exception). Set the flag before recursing so a
+     * cycle terminates. */
+    if (type_sym->members_bound) return;
+    type_sym->members_bound = 1;
+
     /* resolve base types and inherit members */
     if (type_node->type_decl.bases.count > 0) {
         zan_ast_node_t *base_ref = type_node->type_decl.bases.items[0];
         zan_istr_t base_name = base_ref->type_ref.name;
         zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
         if (base_sym && (base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT)) {
+            /* Ensure the base's own members are bound first, regardless of the
+             * order the two types appear across compilation inputs. */
+            if (!base_sym->members_bound && base_sym->decl)
+                bind_members(b, base_sym->decl);
             type_sym->type->base_type = base_sym->type;
             /* inherit base class fields and properties */
             for (int bi = 0; bi < base_sym->member_count; bi++) {
