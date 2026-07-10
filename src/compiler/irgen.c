@@ -1434,6 +1434,17 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
          * chained member access (e.g. Next().field) can find the struct. */
         zan_ast_node_t *callee = e->call.callee;
         if (!callee) return NULL;
+        /* Built-in string instance methods return string but have no symbol to
+         * resolve through, so name-match them (mirrors is_string_expr) — lets
+         * their owned result be released when passed straight into a call. */
+        if (callee->kind == AST_MEMBER_ACCESS) {
+            zan_istr_t mm = callee->member.name;
+            if ((mm.len == 9 && memcmp(mm.str, "Substring", 9) == 0) ||
+                (mm.len == 8 && memcmp(mm.str, "ToString", 8) == 0) ||
+                (mm.len == 4 && memcmp(mm.str, "Trim", 4) == 0) ||
+                (mm.len == 7 && memcmp(mm.str, "Replace", 7) == 0))
+                return g->binder->type_string;
+        }
         if (callee->kind == AST_IDENTIFIER) {
             /* bare call: current class method, else global function */
             if (g->current_type_sym) {
