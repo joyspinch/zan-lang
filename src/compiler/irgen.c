@@ -1466,6 +1466,12 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
         /* `new T(...)` yields a T; array `new T[n]` is not a single rc object. */
         if (e->new_expr.is_array) return NULL;
         return zan_binder_resolve_type(g->binder, e->new_expr.type);
+    case AST_BINARY:
+        /* string concatenation (`a + b`) yields a freshly heap-allocated,
+         * owned string; other binary operators produce non-rc scalars. */
+        if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals))
+            return g->binder->type_string;
+        return NULL;
     default:
         return NULL;
     }
