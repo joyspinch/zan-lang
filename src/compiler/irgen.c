@@ -2320,6 +2320,33 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g) {
     return reap;
 }
 
+/* Backing LLVM global for a static class/struct field `Class.field`.
+ * Static fields are shared mutable storage (not compile-time constants):
+ * they are lowered to an internal, zero-initialised module global. The
+ * field's declared initializer is applied once at main() entry as a runtime
+ * store (see emit_main_method), so any initializer expression works with
+ * correct ordering. Returns NULL when `fsym` is not a static field. */
+static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
+                                            zan_symbol_t *fsym) {
+    if (!class_sym || !fsym || !fsym->decl || fsym->decl->kind != AST_FIELD_DECL)
+        return NULL;
+    if (!((fsym->modifiers & MOD_STATIC) ||
+          (fsym->decl->field_decl.modifiers & MOD_STATIC)))
+        return NULL;
+    char name[512];
+    snprintf(name, sizeof(name), "__zan_sf_%.*s_%.*s",
+             (int)class_sym->name.len, class_sym->name.str,
+             (int)fsym->name.len, fsym->name.str);
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
+    if (gv) return gv;
+    LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
+                                : LLVMInt64TypeInContext(g->ctx);
+    gv = LLVMAddGlobal(g->mod, ft, name);
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    LLVMSetInitializer(gv, LLVMConstNull(ft));
+    return gv;
+}
+
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 
@@ -2361,6 +2388,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMTypeRef ft = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
                     return LLVMBuildLoad2(g->builder, ft, fptr, "fval");
                 }
+            }
+        }
+        /* bare-name static field of the enclosing class: `field` -> global.
+         * Works in both static and instance methods. */
+        if (g->current_type_sym) {
+            zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
+            LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fsym);
+            if (gv) {
+                LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
+                                            : LLVMInt64TypeInContext(g->ctx);
+                return LLVMBuildLoad2(g->builder, ft, gv, "sfld");
             }
         }
         /* method reference as delegate value: MethodName used as a value
@@ -2637,6 +2675,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef sv = coerce_int_to(g, right,
                     LLVMGetAllocatedType(local->alloca));
                 LLVMBuildStore(g->builder, sv, local->alloca);
+            } else if (g->current_type_sym &&
+                       get_static_field_global(g, g->current_type_sym,
+                           get_field_sym(g->current_type_sym, expr->binary.left->ident.name))) {
+                /* bare-name static field of the enclosing class: `field = v` */
+                zan_symbol_t *fs = get_field_sym(g->current_type_sym,
+                    expr->binary.left->ident.name);
+                LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs);
+                if (fs->type && is_rc_managed_type(fs->type)) {
+                    emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals);
+                } else {
+                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                              : LLVMInt64TypeInContext(g->ctx);
+                    LLVMBuildStore(g->builder, coerce_int_to(g, right, ft), gv);
+                }
             } else if (g->current_this && g->current_type_sym) {
                 /* implicit this.Field assignment */
                 int fi = get_field_index(g->current_type_sym, expr->binary.left->ident.name);
@@ -2896,7 +2948,27 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             /* obj.Field = value */
             zan_ast_node_t *obj_expr = expr->binary.left->member.object;
             bool stored = false;
-            if (obj_expr->kind == AST_IDENTIFIER) {
+            /* ClassName.StaticField = value — store into the backing global. */
+            if (obj_expr->kind == AST_IDENTIFIER &&
+                !local_find(locals, obj_expr->ident.name)) {
+                zan_symbol_t *cs = zan_binder_lookup(g->binder, obj_expr->ident.name);
+                if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                    zan_symbol_t *fs = get_field_sym(cs, expr->binary.left->member.name);
+                    LLVMValueRef gv = get_static_field_global(g, cs, fs);
+                    if (gv) {
+                        if (fs->type && is_rc_managed_type(fs->type)) {
+                            emit_rc_store_field(g, fs->type, gv, right,
+                                                expr->binary.right, locals);
+                        } else {
+                            LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                                      : LLVMInt64TypeInContext(g->ctx);
+                            LLVMBuildStore(g->builder, coerce_int_to(g, right, ft), gv);
+                        }
+                        stored = true;
+                    }
+                }
+            }
+            if (!stored && obj_expr->kind == AST_IDENTIFIER) {
                 local_var_t *local = local_find(locals, obj_expr->ident.name);
                 if (local && local->type && local->type->sym) {
                     int fi = get_field_index(local->type->sym, expr->binary.left->member.name);
@@ -5189,18 +5261,18 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         }
 
         /* Static class/struct field access: ClassName.StaticField.
-         * Fold a const-style declaration (`static int X = 1;`) to the
-         * value of its initializer, mirroring enum member access. */
+         * Load from the field's backing global (shared mutable storage);
+         * the initializer is applied at main() entry, not folded here. */
         if (expr->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, expr->member.object->ident.name)) {
             zan_symbol_t *cs = zan_binder_lookup(g->binder, expr->member.object->ident.name);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, expr->member.name);
-                if (fs && fs->decl && fs->decl->kind == AST_FIELD_DECL &&
-                    fs->decl->field_decl.initializer &&
-                    ((fs->modifiers & MOD_STATIC) ||
-                     (fs->decl->field_decl.modifiers & MOD_STATIC))) {
-                    return emit_expr(g, fs->decl->field_decl.initializer, locals);
+                LLVMValueRef gv = get_static_field_global(g, cs, fs);
+                if (gv) {
+                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                              : LLVMInt64TypeInContext(g->ctx);
+                    return LLVMBuildLoad2(g->builder, ft, gv, "sfld");
                 }
             }
         }
@@ -5997,8 +6069,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 return awres;
             }
 
-            /* root drive (non-async caller) */
-            LLVMBuildCall2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
+            /* root drive (non-async caller). The scheduler is initialized once
+             * at program entry (see emit_main_method); re-initializing here
+             * would reset the ready queue and discard any coroutines already
+             * enqueued by Task.Spawn before this await -- e.g. a spawned server
+             * in a concurrent client/server program would never run. */
             LLVMValueRef sched_args[] = { sub_i8, sub_resume };
             LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
             LLVMBuildCall2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
@@ -6865,9 +6940,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             stmt->var_decl.initializer->kind == AST_CALL &&
                             stmt->var_decl.initializer->call.callee &&
                             stmt->var_decl.initializer->call.callee->kind == AST_IDENTIFIER;
+                        /* Own every rc-managed local, including those declared
+                         * inside loop/if/block bodies (arc_stmt_depth != 0):
+                         * per-block release at scope exit (emit_release_owned_
+                         * locals_from) frees them each iteration and truncates
+                         * them out of scope, so there is no double-release at
+                         * function exit. Gating on top-level only leaked one
+                         * object per iteration for class-typed loop locals. */
                         int arc_own = (type && is_rc_managed_type(type) &&
                                        LLVMGetTypeKind(g->current_async_slots[i].llvm) == LLVMPointerTypeKind &&
-                                       (type->kind == TYPE_STRING || g->arc_stmt_depth == 0) &&
                                        !string_from_raw_source);
                         /* No null-init here: the frame is zeroed at allocation
                          * and the slot is reloaded at the top of this state block,
@@ -7054,13 +7135,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             ? emit_entry_alloca(g, llvm_type, "var")
             : LLVMBuildAlloca(g->builder, llvm_type, "var");
 
-        /* ARC: a class-typed local holds an owning heap reference. Track it only
-         * when declared at the top level of the function body (arc_stmt_depth==0)
-         * so its slot dominates every exit; null-init so the release at exit is
-         * safe even before the initializer has stored anything. */
+        /* ARC: a class-typed local holds an owning heap reference. Track every
+         * rc-managed local, including those declared inside loop/if/block
+         * bodies: each enclosing block releases its owned locals at scope exit
+         * (emit_release_owned_locals_from) and truncates them out of scope, so
+         * they are freed once per iteration and never double-released at
+         * function exit. (Gating on arc_stmt_depth==0 leaked one object per
+         * iteration for class-typed loop/if locals.) Null-init so the release
+         * at exit is safe even before the initializer has stored anything. */
         int arc_own = (type && is_rc_managed_type(type) &&
-                       LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind &&
-                       (type->kind == TYPE_STRING || g->arc_stmt_depth == 0));
+                       LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind);
         if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
@@ -7243,6 +7327,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_FOR_STMT: {
         int for_start = locals->count;
         if (stmt->for_stmt.init) emit_stmt(g, stmt->for_stmt.init, locals);
+        /* Loop variables declared in the init clause live in [for_start,
+         * for_body_start) and must survive across iterations (the step and
+         * condition read them). Only body-scope locals [for_body_start, ..)
+         * are released at the end of each iteration; the loop variables are
+         * dropped once, at loop exit. Releasing from for_start each iteration
+         * would truncate the loop var out of scope, so the step `i = i + 1`
+         * and condition `i < n` would operate on a dropped slot -> infinite
+         * loop. */
+        int for_body_start = locals->count;
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.cond");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.body");
@@ -7271,10 +7364,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
         emit_stmt(g, stmt->for_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            emit_release_owned_locals_from(g, locals, for_start);
+            emit_release_owned_locals_from(g, locals, for_body_start);
             LLVMBuildBr(g->builder, step_bb);
         } else {
-            emit_release_owned_locals_from(g, locals, for_start);
+            emit_release_owned_locals_from(g, locals, for_body_start);
         }
 
         LLVMPositionBuilderAtEnd(g->builder, step_bb);
@@ -7285,6 +7378,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->continue_target = saved_cont;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        /* Drop the loop variables (and any owned init-clause locals) now that
+         * the loop has fully exited. */
+        emit_release_owned_locals_from(g, locals, for_start);
         break;
     }
 
@@ -7513,7 +7609,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
 /* ---- top-level emission ---- */
 
-static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym) {
+static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym,
+                             zan_ast_node_t *unit) {
     /* create main(i32 argc, i8** argv) so command-line args are available via
      * the Environment.ArgCount()/ArgAt() builtins. */
     LLVMTypeRef i32ty = LLVMInt32TypeInContext(g->ctx);
@@ -7551,6 +7648,51 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         emit_leak_report_support(g);
         LLVMBuildCall2(g->builder, g->atexit_type, g->fn_atexit,
                        &g->fn_report_leaks, 1, "");
+    }
+
+    /* Initialize the coroutine scheduler exactly once, before the body runs.
+     * Task.Spawn appends onto the ready queue; a root-level `await` used to call
+     * zan_co_sched_init itself, which resets the queue and would discard any
+     * coroutine spawned before that await. Doing it once here (dominating every
+     * Task.Spawn and every root await) fixes concurrent client/server programs
+     * where the server is spawned and a client is awaited. Harmless for
+     * non-async programs (it just nulls an already-empty queue). */
+    LLVMBuildCall2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
+
+    /* Apply static-field initializers once, at program entry, into their
+     * backing globals. Runs before the Main body so every subsequent read
+     * (in Main or in any method/coroutine) observes the initialized value. */
+    if (unit && unit->kind == AST_COMPILATION_UNIT) {
+        local_scope_t *sf_locals = local_scope_new(g->arena);
+        zan_symbol_t *saved_type = g->current_type_sym;
+        LLVMValueRef saved_this = g->current_this;
+        g->current_this = NULL;
+        for (int di = 0; di < unit->comp_unit.decls.count; di++) {
+            zan_ast_node_t *d = unit->comp_unit.decls.items[di];
+            if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+            zan_symbol_t *csym = zan_binder_lookup(g->binder, d->type_decl.name);
+            if (!csym) continue;
+            g->current_type_sym = csym;
+            for (int mi = 0; mi < d->type_decl.members.count; mi++) {
+                zan_ast_node_t *m = d->type_decl.members.items[mi];
+                if (m->kind != AST_FIELD_DECL) continue;
+                if (!(m->field_decl.modifiers & MOD_STATIC)) continue;
+                if (!m->field_decl.initializer) continue;
+                zan_symbol_t *fs = get_field_sym(csym, m->field_decl.name);
+                LLVMValueRef gv = get_static_field_global(g, csym, fs);
+                if (!gv) continue;
+                LLVMValueRef v = emit_expr(g, m->field_decl.initializer, sf_locals);
+                if (fs->type && is_rc_managed_type(fs->type)) {
+                    emit_rc_store_field(g, fs->type, gv, v, m->field_decl.initializer, sf_locals);
+                } else {
+                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                              : LLVMInt64TypeInContext(g->ctx);
+                    LLVMBuildStore(g->builder, coerce_int_to(g, v, ft), gv);
+                }
+            }
+        }
+        g->current_type_sym = saved_type;
+        g->current_this = saved_this;
     }
 
     local_scope_t *locals = local_scope_new(g->arena);
@@ -8154,7 +8296,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                 memcmp(member->method_decl.name.str, "Main", 4) == 0) {
                 {
                     zan_symbol_t *main_type_sym = zan_binder_lookup(g->binder, decl->type_decl.name);
-                    emit_main_method(g, member, main_type_sym);
+                    emit_main_method(g, member, main_type_sym, unit);
                 }
                 goto done;
             }
