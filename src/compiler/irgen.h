@@ -56,6 +56,15 @@ struct zan_irgen {
     } struct_types[256];
     int struct_type_count;
 
+    /* per-class ARC release functions: __zan_release_<T>(i8*) releases the
+     * object's RC-managed fields when its refcount reaches zero, then frees it
+     * via zan_rt_release. Built lazily and cached by class symbol. */
+    struct {
+        zan_symbol_t *sym;
+        LLVMValueRef  fn;
+    } class_release[256];
+    int class_release_count;
+
     /* user-defined functions */
     struct {
         zan_symbol_t *sym;
