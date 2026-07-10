@@ -5695,7 +5695,7 @@ static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v) {
  * re-enqueue that awaiter via zan_co_ready so the cooperative driver re-steps
  * it and it can read our result. A root (non-async) driver leaves awaiter null
  * and instead polls the result after zan_co_sched_run drains. */
-static void emit_async_complete(zan_irgen_t *g, LLVMValueRef result_i64) {
+static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValueRef result_i64) {
     LLVMValueRef frame = g->current_async_frame;
     LLVMTypeRef ft = g->current_async_frame_type;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -5712,6 +5712,8 @@ static void emit_async_complete(zan_irgen_t *g, LLVMValueRef result_i64) {
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0), done_ptr);
     LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_STATE, "fr.state"));
+
+    emit_release_owned_locals(g, locals);
 
     /* if (awaiter != null) zan_co_ready(awaiter, awaiter_step); */
     LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
@@ -6299,22 +6301,43 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (g->current_async_frame && g->current_async_slot_count > 0) {
             local_var_t *pre = local_find(locals, stmt->var_decl.name);
             if (pre) {
+                zan_type_t *type = stmt->var_decl.type
+                    ? zan_binder_resolve_type(g->binder, stmt->var_decl.type)
+                    : pre->type;
                 for (int i = 0; i < g->current_async_slot_count; i++) {
                     if (g->current_async_slots[i].slot_alloca == pre->alloca) {
+                        int string_from_raw_source = type && type->kind == TYPE_STRING &&
+                            stmt->var_decl.initializer &&
+                            (stmt->var_decl.initializer->kind == AST_CALL ||
+                             stmt->var_decl.initializer->kind == AST_AWAIT_EXPR);
+                        int arc_own = (type && is_rc_managed_type(type) &&
+                                       LLVMGetTypeKind(g->current_async_slots[i].llvm) == LLVMPointerTypeKind &&
+                                       (type->kind == TYPE_STRING || g->arc_stmt_depth == 0) &&
+                                       !string_from_raw_source);
+                        if (arc_own) {
+                            LLVMBuildStore(g->builder,
+                                LLVMConstNull(g->current_async_slots[i].llvm), pre->alloca);
+                        }
                         if (stmt->var_decl.initializer) {
                             LLVMValueRef iv = emit_expr(g, stmt->var_decl.initializer, locals);
                             LLVMTypeRef slot_ty = g->current_async_slots[i].llvm;
-                            iv = coerce_int_to(g, iv, slot_ty);
-                            /* pointer-shaped locals (string/array/List/class) are
-                             * frame-resident too; normalize a differing pointer
-                             * type to the slot's before the store. */
-                            if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind &&
-                                LLVMGetTypeKind(LLVMTypeOf(iv)) == LLVMPointerTypeKind &&
-                                LLVMTypeOf(iv) != slot_ty) {
-                                iv = LLVMBuildBitCast(g->builder, iv, slot_ty, "fl.bc");
+                            if (arc_own) {
+                                emit_rc_capture_local(g, type, pre->alloca, iv,
+                                    stmt->var_decl.initializer, locals);
+                            } else {
+                                iv = coerce_int_to(g, iv, slot_ty);
+                                /* pointer-shaped locals (string/array/List/class) are
+                                 * frame-resident too; normalize a differing pointer
+                                 * type to the slot's before the store. */
+                                if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind &&
+                                    LLVMGetTypeKind(LLVMTypeOf(iv)) == LLVMPointerTypeKind &&
+                                    LLVMTypeOf(iv) != slot_ty) {
+                                    iv = LLVMBuildBitCast(g->builder, iv, slot_ty, "fl.bc");
+                                }
+                                LLVMBuildStore(g->builder, iv, pre->alloca);
                             }
-                            LLVMBuildStore(g->builder, iv, pre->alloca);
                         }
+                        if (arc_own) pre->arc_owned = 1;
                         return;
                     }
                 }
@@ -6511,9 +6534,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (g->current_async_frame) {
             LLVMValueRef ri = NULL;
             if (stmt->ret.value) {
-                ri = coerce_to_i64(g, emit_expr(g, stmt->ret.value, locals));
+                LLVMValueRef rv = emit_expr(g, stmt->ret.value, locals);
+                zan_type_t *ret_type = infer_expr_type(g, stmt->ret.value, locals);
+                if (is_rc_managed_type(ret_type) &&
+                    !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
+                    emit_rc_retain_for_type(g, ret_type, rv);
+                }
+                ri = coerce_to_i64(g, rv);
             }
-            emit_async_complete(g, ri);
+            emit_async_complete(g, locals, ri);
             break;
         }
         if (stmt->ret.value) {
@@ -7378,12 +7407,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             } else {
                 /* expression body (=> expr): treat as `return expr`. */
                 LLVMValueRef val = emit_expr(g, member->method_decl.body, locals);
-                emit_async_complete(g, coerce_to_i64(g, val));
+                emit_async_complete(g, locals, coerce_to_i64(g, val));
             }
 
             /* fall off the end: implicit completion (void / default result). */
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-                emit_async_complete(g, NULL);
+                emit_async_complete(g, locals, NULL);
             }
 
             g->current_fn = saved_fn;
