@@ -318,11 +318,18 @@ static int pp_eval_atom(zan_lexer_t *lex) {
         return v;
     }
     if (isdigit((unsigned char)ch)) {
-        int v = 0;
+        /* Accumulate in a wider type and saturate at INT_MAX so a huge literal
+         * in a preprocessor #if expression cannot trigger signed-overflow UB. */
+        long long v = 0;
         while (!lexer_at_end(lex) && isdigit((unsigned char)lexer_peek_ch(lex))) {
-            v = v * 10 + (lexer_advance(lex) - '0');
+            int d = lexer_advance(lex) - '0';
+            if (v <= (2147483647LL - d) / 10) {
+                v = v * 10 + d;
+            } else {
+                v = 2147483647LL;
+            }
         }
-        return v;
+        return (int)v;
     }
     if (isalpha((unsigned char)ch) || ch == '_') {
         char name[64];
