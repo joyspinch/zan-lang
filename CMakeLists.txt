@@ -284,7 +284,7 @@ endforeach()
 # documented ARC follow-up) are marked WILL_FAIL so this gate stays green while
 # still catching *new* leaks; fixing such a leak flips its test to failing, a
 # reminder to drop it from the allow-list below.
-set(_known_leaky async_asocket_echo encoding_base64 list_class object_array)
+set(_known_leaky async_asocket_echo encoding_base64 object_array)
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   add_test(NAME leakcheck_${_name}

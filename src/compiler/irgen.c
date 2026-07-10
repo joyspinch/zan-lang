@@ -1190,6 +1190,9 @@ static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValue
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals);
 static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
+static void emit_arc_release_typed(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
+static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym);
+static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef col);
 
 /* Release all RC-managed local variables in scope (for throw/exception cleanup) */
 static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
@@ -1564,7 +1567,167 @@ static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValue
     if (type->kind == TYPE_STRING) {
         emit_string_release(g, v);
     } else if (is_arc_managed_type(type)) {
-        emit_arc_release(g, v);
+        emit_arc_release_typed(g, type, v);
+    }
+}
+
+/* ---- object-graph release (per-class destructors) ------------------------
+ * User class instances carry a 16-byte rc header; their RC-managed fields
+ * (strings, other class instances, and the elements held by a List field) are
+ * retained on capture but were never released when the owning object died,
+ * leaking the whole object graph. For each class we synthesise
+ *   void __zan_release_<T>(i8* obj):
+ *     if (obj == null) return;
+ *     if (*refcount == 1)          // this release drops the last reference
+ *         <release each RC-managed field>;
+ *     zan_rt_release(obj);         // decrement + free (+ leak bookkeeping)
+ * Peeking the refcount keeps field release aliasing-safe: fields are dropped
+ * exactly once, on the release that brings the object to zero. */
+
+static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym) {
+    if (!sym) return NULL;
+    for (int i = 0; i < g->class_release_count; i++)
+        if (g->class_release[i].sym == sym) return g->class_release[i].fn;
+    if (g->class_release_count >= 256) return NULL;
+    /* only classes with a registered struct layout can be walked */
+    if (!get_struct_llvm_type(g, sym)) return NULL;
+    char name[320];
+    snprintf(name, sizeof(name), "__zan_release_%.*s_%d",
+             (int)sym->name.len, sym->name.str, g->class_release_count);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, name, ft);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    g->class_release[g->class_release_count].sym = sym;
+    g->class_release[g->class_release_count].fn = fn;
+    g->class_release_count++;
+    return fn;
+}
+
+/* Release the RC-managed elements held by a List<T> value `col` (an i8* to the
+ * bare List struct { i64 count, i64 cap, i64* data }). No-op for null lists or
+ * non-RC element types. Only the tracked elements are released; the header-less
+ * List struct/buffer are not rc-counted and are left as-is. */
+static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef col) {
+    if (!elem_type || !is_rc_managed_type(elem_type)) return;
+    if (!col || LLVMGetTypeKind(LLVMTypeOf(col)) != LLVMPointerTypeKind) return;
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef chk  = LLVMAppendBasicBlockInContext(c, fn, "lc.chk");
+    LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(c, fn, "lc.head");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(c, fn, "lc.body");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(c, fn, "lc.done");
+    LLVMValueRef c8 = (LLVMTypeOf(col) == i8ptr) ? col
+                      : LLVMBuildBitCast(b, col, i8ptr, "lc.c8");
+    LLVMValueRef isn = LLVMBuildICmp(b, LLVMIntEQ, c8, LLVMConstNull(i8ptr), "lc.isn");
+    LLVMBuildCondBr(b, isn, done, chk);
+    LLVMPositionBuilderAtEnd(b, chk);
+    LLVMValueRef lp = LLVMBuildBitCast(b, c8, LLVMPointerType(g->list_struct_type, 0), "lp");
+    LLVMValueRef cntp = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 0, "cntp");
+    LLVMValueRef cnt = LLVMBuildLoad2(b, i64, cntp, "cnt");
+    LLVMValueRef datap = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 2, "datap");
+    LLVMValueRef data = LLVMBuildLoad2(b, LLVMPointerType(i64, 0), datap, "data");
+    LLVMBuildBr(b, head);
+    LLVMPositionBuilderAtEnd(b, head);
+    LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
+    LLVMValueRef lt = LLVMBuildICmp(b, LLVMIntSLT, iphi, cnt, "lt");
+    LLVMBuildCondBr(b, lt, body, done);
+    LLVMPositionBuilderAtEnd(b, body);
+    LLVMValueRef slot = LLVMBuildGEP2(b, i64, data, &iphi, 1, "slot");
+    LLVMValueRef raw = LLVMBuildLoad2(b, i64, slot, "raw");
+    emit_collection_release_raw_slot(g, elem_type, raw, i64);
+    LLVMValueRef inext = LLVMBuildAdd(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
+    LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
+    LLVMBuildBr(b, head);
+    LLVMValueRef vals[2] = { LLVMConstInt(i64, 0, 0), inext };
+    LLVMBasicBlockRef blks[2] = { chk, body_end };
+    LLVMAddIncoming(iphi, vals, blks, 2);
+    LLVMPositionBuilderAtEnd(b, done);
+}
+
+/* Emit the body of __zan_release_<T>: null-guard, peek the refcount, release the
+ * RC-managed fields when it is about to hit zero, then hand off to
+ * zan_rt_release for the decrement + free. */
+static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValueRef fn) {
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef structT = get_struct_llvm_type(g, sym);
+    LLVMValueRef obj = LLVMGetParam(fn, 0);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef cont  = LLVMAppendBasicBlockInContext(c, fn, "cont");
+    LLVMBasicBlockRef relf  = LLVMAppendBasicBlockInContext(c, fn, "relf");
+    LLVMBasicBlockRef dorel = LLVMAppendBasicBlockInContext(c, fn, "dorel");
+    LLVMBasicBlockRef ret   = LLVMAppendBasicBlockInContext(c, fn, "ret");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef isnull = LLVMBuildICmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
+    LLVMBuildCondBr(b, isnull, ret, cont);
+    LLVMPositionBuilderAtEnd(b, cont);
+    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
+    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
+    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
+    LLVMValueRef is1 = LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMBuildCondBr(b, is1, relf, dorel);
+    LLVMPositionBuilderAtEnd(b, relf);
+    LLVMValueRef self = LLVMBuildBitCast(b, obj, LLVMPointerType(structT, 0), "self");
+    int fi = 0;
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) continue;
+        int idx = fi++;
+        zan_type_t *ft = m->type;
+        if (!ft) continue;
+        if (ft->kind == TYPE_STRING) {
+            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
+            LLVMValueRef s = LLVMBuildLoad2(b, i8ptr, fp, "fs");
+            emit_string_release(g, s);
+        } else if (is_arc_managed_type(ft)) {
+            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
+            LLVMValueRef cv = LLVMBuildLoad2(b, map_type(g, ft), fp, "fc");
+            emit_arc_release_typed(g, ft, cv);
+        } else if (is_builtin_collection_type(ft) &&
+                   ft->name.len == 4 && memcmp(ft->name.str, "List", 4) == 0) {
+            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
+            LLVMValueRef col = LLVMBuildLoad2(b, i8ptr, fp, "fcol");
+            emit_list_release_elems(g, container_elem_type(ft), col);
+        }
+    }
+    LLVMBuildBr(b, dorel);
+    LLVMPositionBuilderAtEnd(b, dorel);
+    LLVMBuildCall2(b, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
+                   g->rt_release, &obj, 1, "");
+    LLVMBuildBr(b, ret);
+    LLVMPositionBuilderAtEnd(b, ret);
+    LLVMBuildRetVoid(b);
+}
+
+/* Release a class value `v` of static type `type` via its synthesised
+ * __zan_release_<T> (which releases RC fields then frees). Falls back to the
+ * plain rc decrement when no per-class function exists (unregistered type). */
+static void emit_arc_release_typed(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
+    if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMValueRef fn = type ? get_class_release_decl(g, type->sym) : NULL;
+    if (!fn) { emit_arc_release(g, v); return; }
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rlt");
+    LLVMBuildCall2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+                   fn, &v, 1, "");
+}
+
+/* Build the bodies of every class release function. Called at finalize, once
+ * all class types are registered. Iterating the registered struct types covers
+ * every function get_class_release_decl may lazily create for nested fields. */
+static void emit_all_class_releases(zan_irgen_t *g) {
+    for (int i = 0; i < g->struct_type_count; i++) {
+        zan_symbol_t *sym = g->struct_types[i].sym;
+        if (!sym || !sym->type || !is_arc_managed_type(sym->type)) continue;
+        LLVMValueRef fn = get_class_release_decl(g, sym);
+        if (fn) build_class_release_body(g, sym, fn);
     }
 }
 
@@ -7660,6 +7823,9 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
 done:
     ;
+    /* Synthesise per-class release functions now that every class type has
+     * been registered (Pass 1) and referenced (Passes 2/3). */
+    emit_all_class_releases(g);
     /* An error diagnostic emitted during codegen (e.g. an unsupported await
      * form flagged by the ANF pass) must fail the build — the driver only
      * checks diagnostics before codegen, so surface it here. */
