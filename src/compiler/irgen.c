@@ -1697,8 +1697,16 @@ static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
 
 static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals, int start) {
     if (!locals || start >= locals->count) return;
+    /* If the current block already ends in a terminator (e.g. the scope exited
+     * via `return`/`break`/`continue`), emitting release calls here would append
+     * dead instructions *after* the terminator — invalid IR ("basic block does
+     * not have terminator"). A `return` has already released the owning locals
+     * on its own path, so only the bookkeeping (drop ownership tracking, shrink
+     * the scope) is needed in that case. */
+    bool terminated =
+        LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)) != NULL;
     for (int i = locals->count - 1; i >= start; i--) {
-        if (local_owns_arc(&locals->vars[i])) {
+        if (!terminated && local_owns_arc(&locals->vars[i])) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
