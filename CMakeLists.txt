@@ -119,6 +119,25 @@ add_custom_command(TARGET zanc POST_BUILD
             ${ZAN_RT_IO_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}
     VERBATIM)
 
+# ---- Atomics and cross-process shared-memory table runtime ----
+set(ZAN_RT_SYNC_OBJ "${CMAKE_BINARY_DIR}/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_SYNC_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c -o ${ZAN_RT_SYNC_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.h
+    COMMENT "Building atomic/shared-memory runtime object (zanrt_sync)"
+    VERBATIM)
+add_custom_target(zanrt_sync ALL DEPENDS ${ZAN_RT_SYNC_OBJ})
+add_dependencies(zanc zanrt_sync)
+target_compile_definitions(zanc PRIVATE ZAN_RT_SYNC_OBJ="${ZAN_RT_SYNC_OBJ}")
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_SYNC_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
 # ---- Self-contained linking toolchain (Windows) ----
 # Bundle a small GNU ld + the redistributable MinGW-w64 runtime next to zanc so
 # that `zanc app.zan -o app.exe` needs only zan: no external clang / gcc / MSVC /
@@ -240,6 +259,26 @@ endif()
 
 # ---- Tests ----
 enable_testing()
+
+add_executable(zanrt_sync_test
+    tests/runtime/rt_sync_test.c
+    src/runtime/rt_sync.c
+)
+target_include_directories(zanrt_sync_test PRIVATE ${CMAKE_SOURCE_DIR})
+set_target_properties(zanrt_sync_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(WIN32)
+    target_link_libraries(zanrt_sync_test PRIVATE)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(zanrt_sync_test PRIVATE Threads::Threads)
+    if(NOT APPLE)
+        target_link_libraries(zanrt_sync_test PRIVATE rt)
+    endif()
+endif()
+add_test(NAME runtime_sync COMMAND zanrt_sync_test)
 
 add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-tokens)
 add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast)

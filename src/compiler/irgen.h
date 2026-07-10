@@ -165,6 +165,7 @@ struct zan_irgen {
     LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
     LLVMTypeRef  rt_io_pump_timeout_type;
     bool         uses_socket_async; /* set when a socket await is lowered */
+    bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
     /* set while emitting an async function's $resume body: the current heap
      * frame pointer and its struct type, so `return` stores into the frame's
      * result slot + notifies the awaiter instead of a plain ret. NULL when not

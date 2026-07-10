@@ -974,6 +974,20 @@ int main(int argc, char **argv) {
 #ifdef ZAN_RT_IO_MT_OBJ
         if (mt_scheduler) rt_io_obj = ZAN_RT_IO_MT_OBJ;
 #endif
+        const char *rt_sync_obj = NULL;
+#ifdef ZAN_RT_SYNC_OBJ
+        if (irgen.uses_sync_runtime) rt_sync_obj = ZAN_RT_SYNC_OBJ;
+#endif
+        if (cross_compiling && rt_sync_obj) {
+            fprintf(stderr,
+                    "error: AtomicInt and SharedTable are not available for "
+                    "cross-compilation targets yet\n");
+            remove(obj_tmp);
+            zan_irgen_destroy(&irgen);
+            zan_arena_free(arena);
+            free(source);
+            return 1;
+        }
 
         /* Extra library search dirs for [DllImport] libs, taken from the
          * $ZAN_LIB_PATH env var (platform PATH separator). This lets a Zan
@@ -1097,6 +1111,7 @@ int main(int argc, char **argv) {
             }
             argv[a++] = obj_tmp;
             if (rt_io_obj) argv[a++] = rt_io_obj;
+            if (rt_sync_obj) argv[a++] = rt_sync_obj;
             argv[a++] = "--start-group";
             argv[a++] = "-lmingw32"; argv[a++] = "-lgcc";
             argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
@@ -1128,6 +1143,10 @@ int main(int argc, char **argv) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\" -lws2_32", rt_io_obj);
             }
+            if (rt_sync_obj) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_sync_obj);
+            }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", zan_lib_dirs[di]);
@@ -1155,6 +1174,16 @@ int main(int argc, char **argv) {
         if (rt_io_obj) {
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_io_obj);
+        }
+        if (rt_sync_obj) {
+            size_t cur = strlen(link_cmd);
+#ifdef __APPLE__
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " \"%s\" -pthread", rt_sync_obj);
+#else
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " \"%s\" -pthread -lrt", rt_sync_obj);
+#endif
         }
         for (int di = 0; di < zan_lib_ndirs; di++) {
             size_t cur = strlen(link_cmd);
