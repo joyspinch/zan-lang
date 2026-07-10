@@ -1081,14 +1081,25 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
     return NULL;
 }
 
-/* Helper: check if a type is ARC-managed (class instance, not string/int/struct/enum) */
+/* The built-in generic collections (List/Dict) and StringBuilder are lowered to
+ * bare malloc'd structs *without* the 16-byte rc header that zan_rt_alloc emits
+ * for user classes. They share TYPE_CLASS with user classes, so ARC must exclude
+ * them by name — retaining/releasing one reads a refcount at obj-16 that lands in
+ * unrelated heap memory and corrupts it. */
+static int is_builtin_collection_type(zan_type_t *t) {
+    if (!t || t->kind != TYPE_CLASS) return 0;
+    zan_istr_t n = t->name;
+    return (n.len == 4 && memcmp(n.str, "List", 4) == 0) ||
+           (n.len == 4 && memcmp(n.str, "Dict", 4) == 0) ||
+           (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
+}
+
+/* Helper: check if a type is ARC-managed (user class instance carrying the
+ * zan_rt_alloc rc header; not string/int/struct/enum, and not the header-less
+ * built-in collections). */
 static int is_arc_managed_type(zan_type_t *t) {
     if (!t) return 0;
-    /* Only class instances carry the zan_rt_alloc rc header. List/Dict/
-     * StringBuilder are raw-malloc'd without a header, so releasing them via
-     * zan_rt_release (which reads rc at offset -8) would corrupt memory. */
-    if (t->kind == TYPE_CLASS) return 1;
-    return 0;
+    return t->kind == TYPE_CLASS && !is_builtin_collection_type(t);
 }
 
 /* Release all ARC-managed local variables in scope (for throw/exception cleanup) */
@@ -1377,13 +1388,13 @@ static int expr_yields_owned_ref(zan_ast_node_t *e) {
 
 static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
-    return t && t->kind == TYPE_CLASS;
+    return is_arc_managed_type(t);
 }
 
 /* True when a local owns a class heap reference held as a pointer (excludes
  * borrowed params, stack-struct classes and non-class types). */
 static int local_owns_arc(local_var_t *v) {
-    if (!v || v->arc_owned != 1 || !v->type || v->type->kind != TYPE_CLASS) return 0;
+    if (!v || v->arc_owned != 1 || !v->type || !is_arc_managed_type(v->type)) return 0;
     return LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
 }
 
@@ -1963,7 +1974,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 }
                             }
                         }
-                        if (fsym && fsym->type && fsym->type->kind == TYPE_CLASS) {
+                        if (fsym && fsym->type && is_arc_managed_type(fsym->type)) {
                             emit_arc_store_field(g, fptr, right, expr->binary.right);
                         } else {
                             LLVMBuildStore(g->builder, right, fptr);
@@ -2065,7 +2076,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
                             LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
-                            if (afsym && afsym->type && afsym->type->kind == TYPE_CLASS) {
+                            if (afsym && afsym->type && is_arc_managed_type(afsym->type)) {
                                 emit_arc_store_field(g, fptr, right, expr->binary.right);
                             } else {
                                 LLVMBuildStore(g->builder, right, fptr);
@@ -2088,7 +2099,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st,
                                 obj_val, (unsigned)fi, "gfld");
                             zan_symbol_t *gfsym = get_field_sym(cls, expr->binary.left->member.name);
-                            if (gfsym && gfsym->type && gfsym->type->kind == TYPE_CLASS) {
+                            if (gfsym && gfsym->type && is_arc_managed_type(gfsym->type)) {
                                 emit_arc_store_field(g, fptr, right, expr->binary.right);
                             } else {
                                 LLVMBuildStore(g->builder, right, fptr);
@@ -5899,7 +5910,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * when declared at the top level of the function body (arc_stmt_depth==0)
          * so its slot dominates every exit; null-init so the release at exit is
          * safe even before the initializer has stored anything. */
-        int arc_own = (type && type->kind == TYPE_CLASS &&
+        int arc_own = (type && is_arc_managed_type(type) &&
                        LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind &&
                        g->arc_stmt_depth == 0);
         if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
@@ -6839,7 +6850,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     val = LLVMBuildFPExt(g->builder, val, llvm_ret, "ext");
                 }
             }
-            if (ret_type && ret_type->kind == TYPE_CLASS &&
+            if (ret_type && is_arc_managed_type(ret_type) &&
                 !expr_yields_owned_ref(member->method_decl.body)) {
                 emit_arc_retain(g, val);
             }
