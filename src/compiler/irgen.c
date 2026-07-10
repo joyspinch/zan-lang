@@ -577,7 +577,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef retain_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), retain_args, 1, 0);
     g->rt_retain = LLVMAddFunction(g->mod, "zan_rt_retain", retain_type);
 
-    /* implement zan_rt_retain: increment refcount at offset -8 */
+    /* implement zan_rt_retain: atomically increment refcount at offset -16 */
     {
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -589,14 +589,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, do_retain);
         LLVMPositionBuilderAtEnd(g->builder, do_retain);
-        /* refcount is at (int64_t*)(obj - 8) */
-        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)-8, 1);
-        LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "rcptr");
+        /* refcount is the first header word, at (int64_t*)(obj - 16) */
+        LLVMValueRef neg16 = LLVMConstInt(i64, (uint64_t)-16, 1);
+        LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
-        LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rc");
-        LLVMValueRef rc1 = LLVMBuildAdd(g->builder, rc, LLVMConstInt(i64, 1, 0), "rc1");
-        LLVMBuildStore(g->builder, rc1, rc_iptr);
+        LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd, rc_iptr,
+            LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingMonotonic, 0);
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
@@ -623,9 +622,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
-        LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rc");
-        LLVMValueRef rc1 = LLVMBuildSub(g->builder, rc, LLVMConstInt(i64, 1, 0), "rc1");
-        LLVMBuildStore(g->builder, rc1, rc_iptr);
+        /* atomically decrement; LLVMBuildAtomicRMW returns the pre-op value */
+        LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
+            LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+        LLVMValueRef rc1 = LLVMBuildSub(g->builder, rc_old, LLVMConstInt(i64, 1, 0), "rc1");
         /* if rc1 == 0, free the object (16-byte header precedes obj) */
         LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, rc1,
             LLVMConstInt(i64, 0, 0), "iszero");
