@@ -17,8 +17,9 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
-#include <semaphore.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -79,7 +80,9 @@ typedef struct {
     HANDLE mutex;
 #else
     int fd;
-    sem_t *semaphore;
+    int lock_fd;
+    pthread_mutex_t local_mutex;
+    int local_mutex_ready;
 #endif
 } zan_shared_table;
 
@@ -246,7 +249,9 @@ static void zan_make_names(
     snprintf(lock_name, 96, "Local\\zan_table_lock_%016llx", hash);
 #else
     snprintf(map_name, 96, "/zan_table_%016llx", hash);
-    snprintf(lock_name, 96, "/zan_l_%016llx", hash);
+    snprintf(
+        lock_name, 96, "/tmp/zan_table_%lu_%016llx.lock",
+        (unsigned long)getuid(), hash);
 #endif
 }
 
@@ -255,10 +260,12 @@ static int zan_table_lock(zan_shared_table *table) {
     DWORD result = WaitForSingleObject(table->mutex, INFINITE);
     return result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
 #else
+    if (pthread_mutex_lock(&table->local_mutex) != 0) return 0;
     int result;
     do {
-        result = sem_wait(table->semaphore);
+        result = flock(table->lock_fd, LOCK_EX);
     } while (result != 0 && errno == EINTR);
+    if (result != 0) pthread_mutex_unlock(&table->local_mutex);
     return result == 0;
 #endif
 }
@@ -267,7 +274,8 @@ static void zan_table_unlock(zan_shared_table *table) {
 #ifdef _WIN32
     ReleaseMutex(table->mutex);
 #else
-    sem_post(table->semaphore);
+    flock(table->lock_fd, LOCK_UN);
+    pthread_mutex_unlock(&table->local_mutex);
 #endif
 }
 
@@ -388,10 +396,9 @@ static void zan_shared_table_free(zan_shared_table *table) {
     if (table->header && table->mapped_size) {
         munmap(table->header, table->mapped_size);
     }
-    if (table->semaphore && table->semaphore != SEM_FAILED) {
-        sem_close(table->semaphore);
-    }
     if (table->fd >= 0) close(table->fd);
+    if (table->lock_fd >= 0) close(table->lock_fd);
+    if (table->local_mutex_ready) pthread_mutex_destroy(&table->local_mutex);
 #endif
     free(table);
 }
@@ -494,7 +501,12 @@ int64_t zan_shared_table_create(
     if (!table) return 0;
 #ifndef _WIN32
     table->fd = -1;
-    table->semaphore = SEM_FAILED;
+    table->lock_fd = -1;
+    if (pthread_mutex_init(&table->local_mutex, NULL) != 0) {
+        free(table);
+        return 0;
+    }
+    table->local_mutex_ready = 1;
 #endif
     zan_make_names(name, table->map_name, table->lock_name);
 
@@ -538,14 +550,8 @@ int64_t zan_shared_table_create(
         zan_shared_table_free(table);
         return 0;
     }
-    table->semaphore = sem_open(
-        table->lock_name, O_CREAT | O_EXCL, 0600, 1);
-    if (table->semaphore == SEM_FAILED && errno == EEXIST) {
-        sem_unlink(table->lock_name);
-        table->semaphore = sem_open(
-            table->lock_name, O_CREAT | O_EXCL, 0600, 1);
-    }
-    if (table->semaphore == SEM_FAILED) {
+    table->lock_fd = open(table->lock_name, O_RDWR | O_CREAT, 0600);
+    if (table->lock_fd < 0) {
         shm_unlink(table->map_name);
         zan_shared_table_free(table);
         return 0;
@@ -577,7 +583,12 @@ int64_t zan_shared_table_open(const char *name) {
     if (!table) return 0;
 #ifndef _WIN32
     table->fd = -1;
-    table->semaphore = SEM_FAILED;
+    table->lock_fd = -1;
+    if (pthread_mutex_init(&table->local_mutex, NULL) != 0) {
+        free(table);
+        return 0;
+    }
+    table->local_mutex_ready = 1;
 #endif
     zan_make_names(name, table->map_name, table->lock_name);
 
@@ -620,8 +631,8 @@ int64_t zan_shared_table_open(const char *name) {
         zan_shared_table_free(table);
         return 0;
     }
-    table->semaphore = sem_open(table->lock_name, 0);
-    if (table->semaphore == SEM_FAILED) {
+    table->lock_fd = open(table->lock_name, O_RDWR | O_CREAT, 0600);
+    if (table->lock_fd < 0) {
         zan_shared_table_free(table);
         return 0;
     }
@@ -660,7 +671,7 @@ int64_t zan_shared_table_destroy(int64_t handle) {
     int64_t result = 1;
 #ifndef _WIN32
     if (shm_unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
-    if (sem_unlink(table->lock_name) != 0 && errno != ENOENT) result = 0;
+    if (unlink(table->lock_name) != 0 && errno != ENOENT) result = 0;
 #endif
     zan_shared_table_free(table);
     return result;
