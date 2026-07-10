@@ -8059,6 +8059,24 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_type_sym = type_sym;
         g->current_fn_body = member->method_decl.body;
 
+        /* implicit base construction: a derived constructor first chains to
+         * its base class's parameterless constructor so inherited fields are
+         * initialised (base fields are laid out as a prefix of the derived
+         * struct, so `this` upcasts by a plain bitcast). */
+        if (member->kind == AST_CONSTRUCTOR_DECL && type_sym->type && type_sym->type->base_type &&
+            type_sym->type->base_type->sym) {
+            zan_symbol_t *base_sym = type_sym->type->base_type->sym;
+            for (int ci = 0; ci < g->ctor_count; ci++) {
+                if (g->ctors[ci].type_sym == base_sym && g->ctors[ci].param_count == 0) {
+                    LLVMValueRef thisv = LLVMBuildLoad2(g->builder, param_types[0], this_alloca, "this.base");
+                    LLVMTypeRef bst = get_struct_llvm_type(g, base_sym);
+                    if (bst) thisv = LLVMBuildBitCast(g->builder, thisv, LLVMPointerType(bst, 0), "base.this");
+                    LLVMBuildCall2(g->builder, g->ctors[ci].fn_type, g->ctors[ci].fn, &thisv, 1, "");
+                    break;
+                }
+            }
+        }
+
         /* emit method body */
         if (member->method_decl.body->kind == AST_BLOCK) {
             for (int k = 0; k < member->method_decl.body->block.stmts.count; k++) {
