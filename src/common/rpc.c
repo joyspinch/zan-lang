@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <stdbool.h>
 
+#include "host_oom.h"
 /* Read a single header line (up to and including the terminating \n) into
  * `buf`. Returns the length, or -1 on EOF. */
 static int read_line(FILE *in, char *buf, int cap) {

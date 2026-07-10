@@ -18,6 +18,7 @@
 #define zan_strdup strdup
 #endif
 
+#include "../common/host_oom.h"
 /* ---- FNV-1a 64-bit hash ---- */
 
 uint64_t zan_hash_buffer(const void *data, size_t len) {

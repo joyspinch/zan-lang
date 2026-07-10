@@ -14,6 +14,7 @@
 #include <windows.h>
 #endif
 
+#include "../common/host_oom.h"
 /* ---- Control type metadata ---- */
 
 typedef struct {

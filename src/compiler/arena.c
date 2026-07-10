@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/host_oom.h"
 zan_arena_t *zan_arena_new(void) {
     zan_arena_t *a = (zan_arena_t *)malloc(sizeof(zan_arena_t));
     if (!a) return NULL;

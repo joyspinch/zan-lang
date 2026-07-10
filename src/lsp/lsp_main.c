@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #endif
 
+#include "../common/host_oom.h"
 /* ============================ document store ========================== */
 
 #define LSP_MAX_DOCS 256

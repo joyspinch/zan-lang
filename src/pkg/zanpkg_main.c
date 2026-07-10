@@ -24,6 +24,7 @@
 #define PATH_SEP "/"
 #endif
 
+#include "../common/host_oom.h"
 /* Inline minimal manifest handling (avoids linking full package.c + LLVM) */
 
 static void cmd_init(int argc, char **argv) {

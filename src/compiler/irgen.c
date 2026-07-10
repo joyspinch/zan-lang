@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/host_oom.h"
 /* Maximum number of distinct `new` allocation sites tracked for per-site
  * leak reporting. Sites beyond this share the last bucket. */
 #define ZAN_MAX_LEAK_SITES 4096

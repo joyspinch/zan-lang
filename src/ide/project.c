@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #endif
 
+#include "../common/host_oom.h"
 /* ---------- helpers ---------- */
 
 static int cmp_entries(const void *a, const void *b) {

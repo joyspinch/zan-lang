@@ -16,6 +16,7 @@
 #include <time.h>
 #endif
 
+#include "../common/host_oom.h"
 /* ==== HTTP Client ==== */
 
 #ifdef _WIN32

@@ -29,6 +29,7 @@
 #include <mach-o/dyld.h>
 #endif
 
+#include "../common/host_oom.h"
 /* ---- file reading ---- */
 
 static char *read_file(const char *path, size_t *out_len) {

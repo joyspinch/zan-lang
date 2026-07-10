@@ -19,6 +19,7 @@
 #define PATH_SEP "/"
 #endif
 
+#include "../common/host_oom.h"
 /* ---- version parsing ---- */
 
 bool zan_version_parse(const char *str, zan_version_t *out) {

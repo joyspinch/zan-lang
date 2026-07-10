@@ -16,6 +16,7 @@
 #define MAX_LINE 4096
 #define INDENT_SIZE 4
 
+#include "../common/host_oom.h"
 typedef struct {
     char *buf;
     int len;

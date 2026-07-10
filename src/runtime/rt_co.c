@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 
+#include "../common/host_oom.h"
 /* A queued resumption: step(frame) will re-enter the state machine. */
 typedef struct {
     void         *frame;

@@ -14,6 +14,11 @@
 #include <stdio.h>
 #include <ctype.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include "../common/host_oom.h"
+
 /* Zan keywords for syntax highlighting */
 static const char *zan_keywords[] = {
     "abstract", "as", "async", "await", "base", "bool", "break", "byte",
@@ -589,7 +594,6 @@ void editor_delete_selection(editor_t *ed) {
 /* --- Clipboard (platform-specific, stub for now) --- */
 
 #ifdef _WIN32
-#include <windows.h>
 void editor_copy(editor_t *ed) {
     size_t len;
     char *text = editor_get_selection(ed, &len);
