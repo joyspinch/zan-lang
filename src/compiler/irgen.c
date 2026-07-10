@@ -1095,6 +1095,10 @@ typedef struct {
      * on overwrite and at function exit; 0 for params, borrowed, escaped or
      * non-class locals. See the ARC helpers below. */
     int arc_owned;
+    /* For a local owning an rc-element array from `new T[n]`, the i64 alloca
+     * holding its element count; NULL otherwise. Elements are released at
+     * scope exit. */
+    LLVMValueRef arr_len;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -1136,6 +1140,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].alloca = alloca;
     scope->vars[scope->count].type = type;
     scope->vars[scope->count].arc_owned = 0;
+    scope->vars[scope->count].arr_len = NULL;
     scope->count++;
 }
 
@@ -1193,6 +1198,8 @@ static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueR
 static void emit_arc_release_typed(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym);
 static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef col);
+static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
+                                     LLVMValueRef arr, LLVMValueRef len);
 
 /* Release all RC-managed local variables in scope (for throw/exception cleanup) */
 static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
@@ -1659,6 +1666,52 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
     LLVMPositionBuilderAtEnd(b, done);
 }
 
+/* Release the rc-managed elements of a bare `new T[n]` array buffer. Arrays
+ * carry no length header, so the count is threaded in explicitly (captured at
+ * the declaration). Null buffer is a no-op. */
+static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
+                                     LLVMValueRef arr, LLVMValueRef len) {
+    if (!elem_type || !is_rc_managed_type(elem_type)) return;
+    if (!arr || LLVMGetTypeKind(LLVMTypeOf(arr)) != LLVMPointerTypeKind) return;
+    if (!len) return;
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    LLVMTypeRef elem_llvm = map_type(g, elem_type);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef chk  = LLVMAppendBasicBlockInContext(c, fn, "ac.chk");
+    LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(c, fn, "ac.head");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(c, fn, "ac.body");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(c, fn, "ac.done");
+    LLVMValueRef a8 = (LLVMTypeOf(arr) == i8ptr) ? arr
+                      : LLVMBuildBitCast(b, arr, i8ptr, "ac.a8");
+    LLVMValueRef isn = LLVMBuildICmp(b, LLVMIntEQ, a8, LLVMConstNull(i8ptr), "ac.isn");
+    LLVMBuildCondBr(b, isn, done, chk);
+    LLVMPositionBuilderAtEnd(b, chk);
+    LLVMValueRef typed = LLVMBuildBitCast(b, a8, LLVMPointerType(elem_llvm, 0), "ac.tp");
+    LLVMValueRef n = len;
+    if (LLVMGetTypeKind(LLVMTypeOf(n)) == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(LLVMTypeOf(n)) < 64)
+        n = LLVMBuildSExt(b, n, i64, "ac.n");
+    LLVMBuildBr(b, head);
+    LLVMPositionBuilderAtEnd(b, head);
+    LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
+    LLVMValueRef lt = LLVMBuildICmp(b, LLVMIntSLT, iphi, n, "ac.lt");
+    LLVMBuildCondBr(b, lt, body, done);
+    LLVMPositionBuilderAtEnd(b, body);
+    LLVMValueRef slot = LLVMBuildGEP2(b, elem_llvm, typed, &iphi, 1, "ac.slot");
+    LLVMValueRef elem = LLVMBuildLoad2(b, elem_llvm, slot, "ac.elem");
+    emit_rc_release_for_type(g, elem_type, elem);
+    LLVMValueRef inext = LLVMBuildAdd(b, iphi, LLVMConstInt(i64, 1, 0), "ac.inext");
+    LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
+    LLVMBuildBr(b, head);
+    LLVMValueRef vals[2] = { LLVMConstInt(i64, 0, 0), inext };
+    LLVMBasicBlockRef blks[2] = { chk, body_end };
+    LLVMAddIncoming(iphi, vals, blks, 2);
+    LLVMPositionBuilderAtEnd(b, done);
+}
+
 /* Emit the body of __zan_release_<T>: null-guard, peek the refcount, release the
  * RC-managed fields when it is about to hit zero, then hand off to
  * zan_rt_release for the decrement + free. */
@@ -1886,6 +1939,12 @@ static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
+        } else if (locals->vars[i].arr_len && locals->vars[i].type) {
+            LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
+                                            locals->vars[i].alloca, "arr.rel");
+            LLVMValueRef nn = LLVMBuildLoad2(g->builder,
+                LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
+            emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
     }
 }
@@ -1906,7 +1965,15 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
+        } else if (!terminated && locals->vars[i].arr_len && locals->vars[i].type) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
+                                            locals->vars[i].alloca, "arr.rel");
+            LLVMValueRef nn = LLVMBuildLoad2(g->builder,
+                LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
+            emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
         }
+        locals->vars[i].arr_len = NULL;
         locals->vars[i].arc_owned = 0;
     }
     locals->count = start;
@@ -6800,6 +6867,26 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         local_add(locals, stmt->var_decl.name, alloca, type);
         if (arc_own) locals->vars[locals->count - 1].arc_owned = 1;
+        /* rc-element array from `new T[n]`: remember the element count so its
+         * elements can be released at scope exit (arrays have no length header). */
+        if (type && type->kind == TYPE_ARRAY && type->element_type &&
+            is_rc_managed_type(type->element_type) &&
+            stmt->var_decl.initializer &&
+            stmt->var_decl.initializer->kind == AST_NEW_EXPR &&
+            stmt->var_decl.initializer->new_expr.is_array &&
+            stmt->var_decl.initializer->new_expr.args.count > 0) {
+            zan_ast_node_t *sz = stmt->var_decl.initializer->new_expr.args.items[0];
+            if (sz->kind == AST_INT_LITERAL || sz->kind == AST_IDENTIFIER) {
+                LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef szv = emit_expr(g, sz, locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(szv)) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(LLVMTypeOf(szv)) < 64)
+                    szv = LLVMBuildSExt(g->builder, szv, i64t, "arr.len");
+                LLVMValueRef lenslot = emit_entry_alloca(g, i64t, "arr.lenslot");
+                LLVMBuildStore(g->builder, szv, lenslot);
+                locals->vars[locals->count - 1].arr_len = lenslot;
+            }
+        }
         break;
     }
 
