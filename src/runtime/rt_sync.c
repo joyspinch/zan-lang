@@ -28,6 +28,10 @@
 #include <unistd.h>
 #endif
 
+#if !defined(_WIN32) && !defined(O_NOFOLLOW)
+#define O_NOFOLLOW 0
+#endif
+
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
 #define ZAN_TABLE_VERSION 1
 #define ZAN_TABLE_MAX_COLUMNS 16
@@ -251,7 +255,9 @@ static void zan_make_names(
     snprintf(map_name, 96, "Local\\zan_table_%016llx", hash);
     snprintf(lock_name, 96, "Local\\zan_table_lock_%016llx", hash);
 #else
-    snprintf(map_name, 96, "/zan_table_%016llx", hash);
+    snprintf(
+        map_name, 96, "/tmp/zan_table_%lu_%016llx.shm",
+        (unsigned long)getuid(), hash);
     snprintf(
         lock_name, 96, "/tmp/zan_table_%lu_%016llx.lock",
         (unsigned long)getuid(), hash);
@@ -535,13 +541,14 @@ int64_t zan_shared_table_create(
         return 0;
     }
 #else
-    table->fd = shm_open(table->map_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    table->fd = open(
+        table->map_name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (table->fd < 0) {
         zan_shared_table_free(table);
         return 0;
     }
     if (ftruncate(table->fd, (off_t)total_size) != 0) {
-        shm_unlink(table->map_name);
+        unlink(table->map_name);
         zan_shared_table_free(table);
         return 0;
     }
@@ -549,13 +556,14 @@ int64_t zan_shared_table_create(
         NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, table->fd, 0);
     if (table->header == MAP_FAILED) {
         table->header = NULL;
-        shm_unlink(table->map_name);
+        unlink(table->map_name);
         zan_shared_table_free(table);
         return 0;
     }
-    table->lock_fd = open(table->lock_name, O_RDWR | O_CREAT, 0600);
+    table->lock_fd = open(
+        table->lock_name, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (table->lock_fd < 0) {
-        shm_unlink(table->map_name);
+        unlink(table->map_name);
         zan_shared_table_free(table);
         return 0;
     }
@@ -615,7 +623,7 @@ int64_t zan_shared_table_open(const char *name) {
         return 0;
     }
 #else
-    table->fd = shm_open(table->map_name, O_RDWR, 0600);
+    table->fd = open(table->map_name, O_RDWR | O_NOFOLLOW);
     if (table->fd < 0) {
         zan_shared_table_free(table);
         return 0;
@@ -634,7 +642,8 @@ int64_t zan_shared_table_open(const char *name) {
         zan_shared_table_free(table);
         return 0;
     }
-    table->lock_fd = open(table->lock_name, O_RDWR | O_CREAT, 0600);
+    table->lock_fd = open(
+        table->lock_name, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (table->lock_fd < 0) {
         zan_shared_table_free(table);
         return 0;
@@ -673,7 +682,7 @@ int64_t zan_shared_table_destroy(int64_t handle) {
     if (!table) return 0;
     int64_t result = 1;
 #ifndef _WIN32
-    if (shm_unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
+    if (unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
     if (unlink(table->lock_name) != 0 && errno != ENOENT) result = 0;
 #endif
     zan_shared_table_free(table);
