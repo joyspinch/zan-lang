@@ -13,14 +13,17 @@
 #include "checker.h"
 #include "irgen.h"
 #include "optimizer.h"
+#include "crosscomp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
 #else
 #include <unistd.h>
+#include <dirent.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -47,6 +50,57 @@ static char *read_file(const char *path, size_t *out_len) {
     fclose(f);
     if (out_len) *out_len = read;
     return buf;
+}
+
+/* ---- input-file list helpers (auto-stdlib dedup) ---- */
+
+/* Produce a normalized comparison key for a path so the same file passed both
+ * explicitly and via auto-stdlib (which may differ in case / slash direction,
+ * e.g. "stdlib\Gui\Widget\Select.zan" vs "...\stdlib\gui/widget\Select.zan")
+ * compares equal and is only compiled once. */
+static void canon_key(const char *in, char *out, size_t out_sz) {
+#ifdef _WIN32
+    char full[1024];
+    DWORD n = GetFullPathNameA(in, (DWORD)sizeof(full), full, NULL);
+    if (n == 0 || n >= sizeof(full)) snprintf(full, sizeof(full), "%s", in);
+    size_t j = 0;
+    for (size_t i = 0; full[i] && j + 1 < out_sz; i++) {
+        char c = full[i];
+        if (c == '/') c = '\\';
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[j++] = c;
+    }
+    out[j] = '\0';
+#else
+    char full[4096];
+    if (realpath(in, full) == NULL) snprintf(full, sizeof(full), "%s", in);
+    snprintf(out, out_sz, "%s", full);
+#endif
+}
+
+static int input_file_present(const char **files, int count, const char *cand) {
+    char ck[1024];
+    canon_key(cand, ck, sizeof(ck));
+    for (int i = 0; i < count; i++) {
+        char ek[1024];
+        canon_key(files[i], ek, sizeof(ek));
+        if (strcmp(ck, ek) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Append an auto-discovered stdlib file: skip if it does not exist or is
+ * already present (explicitly or from an earlier auto-include). */
+static void add_stdlib_input(const char **files, int *count, const char *path) {
+    FILE *check = fopen(path, "rb");
+    if (!check) return;
+    fclose(check);
+    if (input_file_present(files, *count, path)) return;
+    if (*count < 128) {
+        char *dup = (char *)malloc(strlen(path) + 1);
+        strcpy(dup, path);
+        files[(*count)++] = dup;
+    }
 }
 
 /* ---- dump tokens ---- */
@@ -450,6 +504,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
         fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
         fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
+        fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
+        fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
         fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
         return 1;
     }
@@ -464,11 +520,13 @@ int main(int argc, char **argv) {
     bool check_leaks = false;
     bool runtime_checks = true;
     bool publish_mode = false;
+    bool mt_scheduler = false;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
     int opt_level = -1; /* -1 = auto (O0 default, O2 for publish) */
     const char *pp_defines[64];
     int pp_define_count = 0;
+    const char *target_name = NULL; /* --target <name|triple>; NULL = host */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -483,6 +541,21 @@ int main(int argc, char **argv) {
             runtime_checks = false;
         } else if (strcmp(argv[i], "--publish") == 0) {
             publish_mode = true;
+        } else if (strcmp(argv[i], "--async-workers") == 0 ||
+                   strcmp(argv[i], "--mt") == 0) {
+            /* Use the multi-worker coroutine scheduler: async programs run
+             * their ready queue across a thread pool (worker count from the
+             * ZAN_CO_WORKERS env var at run time; default = CPU count). */
+            mt_scheduler = true;
+        } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            target_name = argv[++i];
+        } else if (strcmp(argv[i], "--list-targets") == 0) {
+            const zan_target_info_t *ts;
+            int nt = zan_target_list(&ts);
+            printf("Available cross-compilation targets:\n");
+            for (int t = 0; t < nt; t++)
+                printf("  %-12s %-30s %s\n", ts[t].name, ts[t].triple, ts[t].desc);
+            return 0;
         } else if (strcmp(argv[i], "--stdlib-path") == 0 && i + 1 < argc) {
             stdlib_path = argv[++i];
         } else if (strcmp(argv[i], "--auto-stdlib") == 0) {
@@ -517,6 +590,18 @@ int main(int argc, char **argv) {
         return 1;
     }
     input_file = input_files[0];
+
+    /* ---- resolve compilation target (host unless --target given) ---- */
+    zan_target_t target;
+    if (target_name) {
+        if (!zan_target_parse(target_name, &target)) {
+            fprintf(stderr, "error: unknown target '%s' (see --list-targets)\n", target_name);
+            return 1;
+        }
+    } else {
+        zan_target_host(&target);
+    }
+    bool cross_compiling = (target_name != NULL);
 
     /* --auto-stdlib: discover stdlib path relative to compiler executable,
      * then scan using directives in source files and add matching stdlib .zan files */
@@ -579,25 +664,19 @@ int main(int argc, char **argv) {
             {"System.Net.Mqtt",  "System/Net/Mqtt",  {"MqttClient.zan", NULL}},
             {"System.Net",       "System/Net",        {"Net.zan", "Worker.zan", NULL}},
             {"System.Data.Orm",  "System/Data/Orm",  {"Model.zan", "QueryBuilder.zan", NULL}},
+            {"System.Data.Sqlite",   "System/Data/Sqlite",   {"SqliteConnection.zan", NULL}},
+            {"System.Data.Postgres", "System/Data/Postgres", {"PgConnection.zan", NULL}},
             {"System.Data",      "System/Data",      {"DbConnection.zan", "DbResult.zan", NULL}},
             {"System.Diagnostics", "System/Diagnostics", {"Process.zan", NULL}},
             {"Platform",         "Platform",          {"Runtime.zan", NULL}},
             {"System.Windows.Forms", "System/Windows", {"Forms.zan", NULL}},
             {"System.Drawing", "System/Drawing", {"Primitives.zan", "Graphics.zan", NULL}},
-            {"Gui", "gui", {
-                "Types.zan", "Theme.zan", "Render.zan", "Native.zan",
-                "Event.zan", "Layout.zan", "App.zan", "Reactive.zan",
-                "Icon.zan", NULL
-            }},
-            {"Gui.Widget", "gui/widget", {
-                "Button.zan", "Checkbox.zan", "Radio.zan", "Switch.zan",
-                "Slider.zan", "Progress.zan", "Card.zan", "Modal.zan",
-                "Tabs.zan", "Tag.zan", "Badge.zan", "Avatar.zan",
-                "Tooltip.zan", "Divider.zan", "Select.zan", "Table.zan",
-                "Steps.zan", "Notification.zan", "Scrollbar.zan",
-                "Skeleton.zan", "Empty.zan", "Input.zan", "Label.zan",
-                "Loading.zan", "Breadcrumb.zan", "Pagination.zan", NULL
-            }},
+            /* "*" = auto-include every .zan file in the subdir. The gui and
+             * widget catalogs grow over time and any component may reference
+             * any other, so glob the whole directory rather than tracking a
+             * hand-maintained (and previously incomplete) file list. */
+            {"Gui", "gui", {"*", NULL}},
+            {"Gui.Widget", "gui/widget", {"*", NULL}},
             {NULL, NULL, {NULL}}
         };
         /* Resolve stdlib dependencies to a fixpoint: an included file (user
@@ -632,23 +711,55 @@ int main(int argc, char **argv) {
                 if (!ns_used[mi] || ns_added[mi]) continue;
                 ns_added[mi] = 1;
                 changed = 1;
-                for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
-                    char mod_path[1024];
+                if (stdlib_map[mi].files[0] &&
+                    strcmp(stdlib_map[mi].files[0], "*") == 0) {
+                    /* Glob every .zan file in the namespace's subdir. */
 #ifdef _WIN32
-                    snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
-                             stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+                    char glob_path[1024];
+                    snprintf(glob_path, sizeof(glob_path), "%s\\%s\\*.zan",
+                             stdlib_root, stdlib_map[mi].subdir);
+                    WIN32_FIND_DATAA fd;
+                    HANDLE h = FindFirstFileA(glob_path, &fd);
+                    if (h != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                            char mod_path[1024];
+                            snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                                     stdlib_root, stdlib_map[mi].subdir, fd.cFileName);
+                            add_stdlib_input(input_files, &input_count, mod_path);
+                        } while (FindNextFileA(h, &fd));
+                        FindClose(h);
+                    }
 #else
-                    snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
-                             stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
-#endif
-                    FILE *check = fopen(mod_path, "rb");
-                    if (check) {
-                        fclose(check);
-                        if (input_count < 128) {
-                            char *dup = (char *)malloc(strlen(mod_path) + 1);
-                            strcpy(dup, mod_path);
-                            input_files[input_count++] = dup;
+                    char dir_path[1024];
+                    snprintf(dir_path, sizeof(dir_path), "%s/%s",
+                             stdlib_root, stdlib_map[mi].subdir);
+                    DIR *d = opendir(dir_path);
+                    if (d) {
+                        struct dirent *ent;
+                        while ((ent = readdir(d)) != NULL) {
+                            size_t nlen = strlen(ent->d_name);
+                            if (nlen < 5 ||
+                                strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
+                            char mod_path[1024];
+                            snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
+                                     stdlib_root, stdlib_map[mi].subdir, ent->d_name);
+                            add_stdlib_input(input_files, &input_count, mod_path);
                         }
+                        closedir(d);
+                    }
+#endif
+                } else {
+                    for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
+                        char mod_path[1024];
+#ifdef _WIN32
+                        snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                                 stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+#else
+                        snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
+                                 stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
+#endif
+                        add_stdlib_input(input_files, &input_count, mod_path);
                     }
                 }
             }
@@ -690,21 +801,28 @@ int main(int argc, char **argv) {
         zan_lexer_t lex;
         zan_lexer_init(&lex, src, slen, fi, arena, diag);
 
-        /* Auto-define platform macros */
-#ifdef _WIN32
-        zan_lexer_define(&lex, "WINDOWS", "1");
-        zan_lexer_define(&lex, "WIN32", "1");
-#elif defined(__linux__)
-        zan_lexer_define(&lex, "LINUX", "1");
-#elif defined(__APPLE__)
-        zan_lexer_define(&lex, "MACOS", "1");
-        zan_lexer_define(&lex, "APPLE", "1");
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-        zan_lexer_define(&lex, "X86_64", "1");
-#elif defined(__aarch64__) || defined(_M_ARM64)
-        zan_lexer_define(&lex, "ARM64", "1");
-#endif
+        /* Auto-define platform macros for the *target* (== host unless
+         * --target was given), so cross-compiled sources see the destination
+         * OS/arch (e.g. LINUX instead of WINDOWS). */
+        switch (target.os) {
+        case ZAN_OS_WINDOWS:
+            zan_lexer_define(&lex, "WINDOWS", "1");
+            zan_lexer_define(&lex, "WIN32", "1");
+            break;
+        case ZAN_OS_LINUX:
+            zan_lexer_define(&lex, "LINUX", "1");
+            break;
+        case ZAN_OS_MACOS:
+            zan_lexer_define(&lex, "MACOS", "1");
+            zan_lexer_define(&lex, "APPLE", "1");
+            break;
+        default:
+            break;
+        }
+        if (target.arch == ZAN_ARCH_AARCH64)
+            zan_lexer_define(&lex, "ARM64", "1");
+        else if (target.arch == ZAN_ARCH_X86_64)
+            zan_lexer_define(&lex, "X86_64", "1");
         zan_lexer_define(&lex, "ZAN", "1");
         /* User -D defines */
         for (int di = 0; di < pp_define_count; di++) {
@@ -777,7 +895,9 @@ int main(int argc, char **argv) {
 
     /* ---- codegen ---- */
     zan_irgen_t irgen;
-    if (zan_irgen_init(&irgen, arena, diag, &binder, input_file) != ZAN_OK) {
+    if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
+                       cross_compiling ? target.triple : NULL,
+                       target.os == ZAN_OS_WINDOWS, mt_scheduler) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
         zan_arena_free(arena);
         free(source);
@@ -845,6 +965,13 @@ int main(int argc, char **argv) {
 #ifdef ZAN_RT_IO_OBJ
         if (irgen.uses_socket_async) rt_io_obj = ZAN_RT_IO_OBJ;
 #endif
+        /* --async-workers (mt_scheduler): the inline single-thread coroutine
+         * driver was NOT emitted, so the program must link the multi-worker
+         * reactor variant, which supplies both the reactor and the driver.
+         * Force-link it even for non-socket async programs. */
+#ifdef ZAN_RT_IO_MT_OBJ
+        if (mt_scheduler) rt_io_obj = ZAN_RT_IO_MT_OBJ;
+#endif
 
         /* Extra library search dirs for [DllImport] libs, taken from the
          * $ZAN_LIB_PATH env var (platform PATH separator). This lets a Zan
@@ -873,6 +1000,55 @@ int main(int argc, char **argv) {
                 }
             }
         }
+
+        if (cross_compiling && target.os == ZAN_OS_LINUX) {
+            /* Self-contained cross-compile to Linux: static-link the ELF object
+             * against a bundled musl sysroot with ld.lld. The result is a
+             * dependency-free static binary — no glibc, no shared libs, no WSL
+             * on the target — so "build on Windows, upload, run" just works.
+             * Sysroot lives next to zanc at toolchain/<sub>/ (crt*.o + libc.a,
+             * plus a linux-built zanrt_io.o for socket-async programs). */
+            char exe_dir[1024] = {0};
+#ifdef _WIN32
+            GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
+            { char *s = strrchr(exe_dir, '\\'); if (s) *s = '\0'; }
+#elif defined(__APPLE__)
+            { uint32_t sz = sizeof(exe_dir);
+              if (_NSGetExecutablePath(exe_dir, &sz) != 0) exe_dir[0] = '\0';
+              char *s = strrchr(exe_dir, '/'); if (s) *s = '\0'; }
+#else
+            { ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+              if (n > 0) { exe_dir[n] = '\0'; char *s = strrchr(exe_dir, '/'); if (s) *s = '\0'; } }
+#endif
+            const char *sub = (target.arch == ZAN_ARCH_AARCH64)
+                              ? "linux-arm64" : "linux-musl";
+            char sys[1200];
+            snprintf(sys, sizeof(sys), "%s/toolchain/%s", exe_dir, sub);
+
+            char cmd[4096];
+            snprintf(cmd, sizeof(cmd),
+                     "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
+                     publish_mode ? " -s" : "", obj_path, sys, sys, obj_tmp);
+            if (irgen.uses_socket_async) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " --start-group \"%s/libc.a\" --end-group \"%s/crtn.o\"",
+                       sys, sys); }
+            link_ret = system(cmd);
+        } else if (cross_compiling) {
+            fprintf(stderr,
+                    "error: cross-compilation to '%s' is not supported yet; "
+                    "only linux targets are implemented (see --list-targets)\n",
+                    target.triple);
+            remove(obj_tmp);
+            zan_irgen_destroy(&irgen);
+            zan_arena_free(arena);
+            free(source);
+            return 1;
+        } else {
 #ifdef _WIN32
         /* Self-contained linking: prefer the bundled ld.lld + MinGW-w64 runtime
          * shipped next to zanc (in <zanc_dir>/toolchain), so producing an .exe
@@ -1021,6 +1197,7 @@ int main(int argc, char **argv) {
         }
         link_ret = system(link_cmd);
 #endif
+        }
 
         /* clean up object file */
         remove(obj_tmp);

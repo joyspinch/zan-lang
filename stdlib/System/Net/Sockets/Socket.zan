@@ -255,7 +255,7 @@ class Socket {
     /// pending, then accepts it. Requires a non-blocking listener socket.</summary>
     static async int AcceptAsync(int sock) {
         while (true) {
-            await ReadReady(sock);
+            await Socket.ReadReady(sock);
             int client = Accept(sock);
             if (client >= 0) {
                 return client;
@@ -277,7 +277,7 @@ class Socket {
     /// Requires a non-blocking socket.</summary>
     static async int ConnectAsync(int sock, string ip, int port) {
         Connect(sock, ip, port);
-        await WriteReady(sock);
+        await Socket.WriteReady(sock);
         return 0;
     }
 
@@ -288,14 +288,32 @@ class Socket {
 
     /// <summary>Suspends until writable, then sends; re-awaits on partial writes
     /// until all <paramref name="len"/> bytes are sent or the peer closes.
-    /// Returns the number of bytes sent. Requires a non-blocking socket.</summary>
+    /// Returns the number of bytes sent. Requires a non-blocking socket.
+    ///
+    /// Binary-safe: the unsent remainder is carried in a separate buffer rebuilt
+    /// by index copy, never via <c>data + totalSent</c> pointer arithmetic. On a
+    /// string that would compute as concatenation and truncate at the first NUL
+    /// byte, corrupting any payload that contains NULs (e.g. MQTT packets).</summary>
     static async int SendAsync(int sock, string data, int len) {
         int totalSent = 0;
+        string cur = data;
+        int curLen = len;
         while (totalSent < len) {
-            await WriteReady(sock);
-            int sent = winsend(sock, data + totalSent, len - totalSent, 0);
+            await Socket.WriteReady(sock);
+            int sent = winsend(sock, cur, curLen, 0);
             if (sent > 0) {
                 totalSent = totalSent + sent;
+                if (totalSent < len) {
+                    int remaining = len - totalSent;
+                    string tail = calloc(remaining + 1, 1);
+                    int j = 0;
+                    while (j < remaining) {
+                        tail[j] = data[totalSent + j];
+                        j = j + 1;
+                    }
+                    cur = tail;
+                    curLen = remaining;
+                }
             } else if (sent == 0) {
                 return totalSent;
             }
@@ -327,13 +345,28 @@ class Socket {
     static async string RecvAsync(int sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
         while (true) {
-            await ReadReady(sock);
+            await Socket.ReadReady(sock);
             int n = winrecv(sock, buf, bufSize, 0);
             if (n >= 0) {
                 return buf;
             }
         }
         return buf;
+    }
+
+    /// <summary>Suspends until readable, then receives up to <paramref
+    /// name="bufSize"/> bytes into a caller-owned buffer, NUL-terminating at the
+    /// byte count. Returns the number of bytes read (0 on peer close). Lets a
+    /// keep-alive connection reuse one buffer across requests instead of
+    /// allocating and zeroing a fresh (up to 64KB) buffer per request.</summary>
+    static async int RecvIntoAsync(int sock, string buf, int bufSize) {
+        int n = await Socket.RecvOv(sock, buf, bufSize);
+        if (n > 0) {
+            buf[n] = 0;
+            return n;
+        }
+        buf[0] = 0;
+        return 0;
     }
 
     /// <summary>Receives into a buffer (returns string).</summary>
@@ -354,7 +387,7 @@ class Socket {
     /// <summary>Suspends until writable, then sends a UDP datagram. Requires a
     /// non-blocking socket.</summary>
     static async int SendToAsync(int sock, string data, int len, string ip, int port) {
-        await WriteReady(sock);
+        await Socket.WriteReady(sock);
         int result = SendTo(sock, data, len, ip, port);
         return result;
     }
@@ -374,7 +407,7 @@ class Socket {
     /// <summary>Suspends on the IO reactor until a datagram is available, then
     /// receives it. Requires a non-blocking socket.</summary>
     static async string RecvFromAsync(int sock, int bufSize) {
-        await ReadReady(sock);
+        await Socket.ReadReady(sock);
         string result = RecvFrom(sock, bufSize);
         return result;
     }

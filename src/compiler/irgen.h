@@ -136,6 +136,8 @@ struct zan_irgen {
      * object's strong definition overrides it for socket-async programs. */
     LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(i64 fd,i32 interest,i8* frame,step) */
     LLVMTypeRef  rt_io_wait_co_type;
+    LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(i64 fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
+    LLVMTypeRef  rt_io_recv_co_type;
     LLVMValueRef rt_io_pump;      /* i32 zan_io_pump(void) */
     LLVMTypeRef  rt_io_pump_type;
     bool         uses_socket_async; /* set when a socket await is lowered */
@@ -161,11 +163,29 @@ struct zan_irgen {
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];
     int extern_lib_count;
+
+    /* cross-compilation target. When target_triple[0] is set, write_obj emits
+     * an object for that LLVM triple verbatim (e.g. x86_64-unknown-linux-musl)
+     * instead of applying the host's default/windows-gnu triple. Empty means
+     * "use the host default" (unchanged legacy behaviour). */
+    char target_triple[128];
+    bool target_is_windows;   /* true when emitting for Windows (Sleep vs poll) */
+    bool mt_scheduler;        /* --async-workers: skip the inline single-thread
+                               * coroutine driver and link the multi-worker one
+                               * from the zanrt_io_mt reactor object instead. */
+
+    /* ARC: nesting depth of the statement currently being emitted, counting
+     * only control-flow bodies (if/loop/switch/try). A class-typed local is
+     * tracked as an owning reference (released at function exit) only when it
+     * is declared at depth 0, so its stack slot dominates every exit block. */
+    int arc_stmt_depth;
 };
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
-                            const char *module_name);
+                            const char *module_name,
+                            const char *target_triple,
+                            bool target_is_windows, bool mt_scheduler);
 void zan_irgen_destroy(zan_irgen_t *g);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);

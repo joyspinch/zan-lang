@@ -1,0 +1,194 @@
+using System;
+using System.Data;
+
+namespace System.Data.Sqlite;
+
+/// <summary>
+/// Native, dependency-free embedded SQLite connection (sqlite3 C library).
+///
+/// Prefer this over the ODBC path when you want zero external configuration and
+/// only need SQLite. Requires the sqlite3 shared library at build/run time.
+///
+/// Usage:
+///   SqliteConnection db = SqliteConnection.Open("app.sqlite3");
+///   db.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+///   DbResult r = db.Query("SELECT * FROM users");
+///   db.Close();
+/// </summary>
+class SqliteConnection {
+    int handle;
+    bool connected;
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_open(string filename, string ppDb);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_close(int db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_exec(int db, string sql, int callback, int arg, string errmsg);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_prepare_v2(int db, string sql, int nByte, string ppStmt, string pzTail);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_step(int stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_finalize(int stmt);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_count(int stmt);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_column_text(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_column_name(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_column_type(int stmt, int col);
+
+    [DllImport("sqlite3")]
+    static extern string sqlite3_errmsg(int db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_changes(int db);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_last_insert_rowid(int db);
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    SqliteConnection() {
+        this.handle = 0;
+        this.connected = false;
+    }
+
+    static int HandleFromBuf(string p) {
+        int v = 0;
+        v = v + (p[0] & 255);
+        v = v + ((p[1] & 255) << 8);
+        v = v + ((p[2] & 255) << 16);
+        v = v + ((p[3] & 255) << 24);
+        v = v + ((p[4] & 255) << 32);
+        v = v + ((p[5] & 255) << 40);
+        v = v + ((p[6] & 255) << 48);
+        v = v + ((p[7] & 255) << 56);
+        return v;
+    }
+
+    /// <summary>Opens (or creates) a SQLite database file.</summary>
+    static SqliteConnection Open(string filename) {
+        SqliteConnection conn = new SqliteConnection();
+        string ppDb = calloc(8, 1);
+        int rc = sqlite3_open(filename, ppDb);
+        if (rc == 0) {
+            conn.handle = HandleFromBuf(ppDb);
+            conn.connected = true;
+        }
+        free(ppDb);
+        return conn;
+    }
+
+    /// <summary>Executes a non-query statement (INSERT/UPDATE/DELETE/DDL).</summary>
+    int Execute(string sql) {
+        if (!this.connected) { return -1; }
+        string errmsg = calloc(8, 1);
+        int rc = sqlite3_exec(this.handle, sql, 0, 0, errmsg);
+        free(errmsg);
+        if (rc == 0) {
+            return sqlite3_changes(this.handle);
+        }
+        return -1;
+    }
+
+    /// <summary>Executes a query and returns a result set.</summary>
+    DbResult Query(string sql) {
+        if (!this.connected) { return DbResult.Empty(); }
+        DbResult result = DbResult.Create();
+
+        string ppStmt = calloc(8, 1);
+        string pzTail = calloc(8, 1);
+        int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length, ppStmt, pzTail);
+        if (rc != 0) {
+            free(ppStmt);
+            free(pzTail);
+            return result;
+        }
+
+        int stmt = HandleFromBuf(ppStmt);
+        free(ppStmt);
+        free(pzTail);
+
+        int colCount = sqlite3_column_count(stmt);
+        result.SetColumnCount(colCount);
+
+        int c = 0;
+        while (c < colCount) {
+            result.AddColumnName(sqlite3_column_name(stmt, c));
+            c = c + 1;
+        }
+
+        while (sqlite3_step(stmt) == 100) {  // SQLITE_ROW = 100
+            List<string> row = new List<string>();
+            c = 0;
+            while (c < colCount) {
+                if (sqlite3_column_type(stmt, c) == 5) {  // SQLITE_NULL
+                    row.Add("");
+                } else {
+                    row.Add(sqlite3_column_text(stmt, c));
+                }
+                c = c + 1;
+            }
+            result.AddRow(row);
+        }
+
+        sqlite3_finalize(stmt);
+        return result;
+    }
+
+    /// <summary>Executes a scalar query (first column of first row).</summary>
+    string ExecuteScalar(string sql) {
+        DbResult result = Query(sql);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// <summary>Gets the last inserted row ID.</summary>
+    int LastInsertId() {
+        return sqlite3_last_insert_rowid(this.handle);
+    }
+
+    /// <summary>Gets the last error message.</summary>
+    string GetError() {
+        return sqlite3_errmsg(this.handle);
+    }
+
+    /// <summary>Begins a transaction.</summary>
+    void BeginTransaction() { Execute("BEGIN TRANSACTION"); }
+
+    /// <summary>Commits the current transaction.</summary>
+    void Commit() { Execute("COMMIT"); }
+
+    /// <summary>Rolls back the current transaction.</summary>
+    void Rollback() { Execute("ROLLBACK"); }
+
+    /// <summary>Closes the database connection.</summary>
+    void Close() {
+        if (this.connected) {
+            sqlite3_close(this.handle);
+            this.connected = false;
+            this.handle = 0;
+        }
+    }
+
+    /// <summary>Returns whether the connection is open.</summary>
+    bool IsConnected() { return this.connected; }
+}

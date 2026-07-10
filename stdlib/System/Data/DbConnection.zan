@@ -3,78 +3,105 @@ using System;
 namespace System.Data;
 
 /// <summary>
-/// Database provider types.
+/// Database provider types understood by the FreeSQL-style ORM.
+///
+/// The default <see cref="DbConnection"/> reaches every one of these engines
+/// through its ODBC driver (the "对应的驱动"), so a single, dependency-light
+/// connection type serves the whole ORM. Two native, higher-performance
+/// drivers are also available as opt-in namespaces:
+///   - System.Data.Sqlite  : embedded SQLite via the sqlite3 C library.
+///   - System.Data.Postgres: PostgreSQL and PG-wire compatible engines (openGauss,
+///                           KingbaseES/人大金仓, Vastbase, GaussDB, QuestDB) via libpq.
 /// </summary>
 class DbProvider {
-    static int SQLite  = 1;
-    static int MySQL   = 2;
+    static int ODBC       = 0;   // generic ODBC DSN / connection string
+    static int SQLite     = 1;
+    static int MySQL      = 2;   // + MariaDB / TiDB / OceanBase / PolarDB-X
     static int PostgreSQL = 3;
+    static int SqlServer  = 4;
+    static int Oracle     = 5;
+    static int ClickHouse = 7;
+    static int QuestDB     = 8;
+    static int Firebird   = 9;
+    static int DuckDB     = 10;
+    static int TDengine   = 11;
+    static int MariaDB    = 12;
+    static int Kingbase   = 13;  // 人大金仓 (PG-wire compatible)
+    static int OpenGauss  = 14;  // openGauss / GaussDB (PG-wire compatible)
+    static int DM          = 15;  // 达梦
 }
 
 /// <summary>
-/// Cross-platform database connection abstraction.
-/// Supports SQLite (via sqlite3 library), MySQL, and PostgreSQL.
+/// Universal database connection built on the ODBC driver manager (odbc32).
+///
+/// Any engine that ships an ODBC driver is reachable: SQL Server, Oracle,
+/// MySQL/MariaDB/TiDB/OceanBase, PostgreSQL, ClickHouse, QuestDB, Firebird,
+/// DuckDB, TDengine, 达梦DM, SQLite, ... The convenience factories below build
+/// the right connection string; OpenODBC accepts any DSN or driver string.
+///
 /// All operations are coroutine-aware for async database access.
 ///
 /// Usage:
-///   DbConnection db = DbConnection.OpenSQLite("mydb.sqlite3");
-///   db.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-///   db.Execute("INSERT INTO users (name) VALUES ('Alice')");
+///   DbConnection db = DbConnection.OpenSqlServer("127.0.0.1", 1433,
+///                          "app", "sa", "secret");
+///   db.Execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(64))");
+///   db.Execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
 ///   DbResult result = db.Query("SELECT * FROM users");
 ///   db.Close();
+///
+///   DbConnection any = DbConnection.OpenODBC("DSN=mydsn;UID=u;PWD=p;");
 /// </summary>
 class DbConnection {
-    int handle;
-    int provider;
+    int handle;        // ODBC connection (dbc) handle, as int
+    int env;           // ODBC environment handle
+    int provider;      // DbProvider.*
     string connectionString;
     bool connected;
+    string lastError;
 
-    // --- SQLite3 FFI ---
-    [DllImport("sqlite3")]
-    static extern int sqlite3_open(string filename, string ppDb);
+    // --- ODBC (odbc32) FFI ---
+    // The ODBC manager exposes a uniform buffer-based API (SQLGetData), so one
+    // implementation serves every engine that provides an ODBC driver.
+    [DllImport("odbc32")]
+    static extern int SQLAllocHandle(int handleType, int inputHandle, string outputHandle);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_close(int db);
+    [DllImport("odbc32")]
+    static extern int SQLSetEnvAttr(int env, int attr, int valuePtr, int strLen);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_exec(int db, string sql, int callback, int arg, string errmsg);
+    [DllImport("odbc32")]
+    static extern int SQLDriverConnect(int dbc, int hwnd, string inConn, int inLen,
+        string outConn, int outBufLen, string outLenPtr, int completion);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_prepare_v2(int db, string sql, int nByte, string ppStmt, string pzTail);
+    [DllImport("odbc32")]
+    static extern int SQLExecDirect(int stmt, string sql, int textLength);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_step(int stmt);
+    [DllImport("odbc32")]
+    static extern int SQLNumResultCols(int stmt, string colCountPtr);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_finalize(int stmt);
+    [DllImport("odbc32")]
+    static extern int SQLDescribeCol(int stmt, int colNum, string colName, int bufLen,
+        string nameLenPtr, string typePtr, string sizePtr, string decPtr, string nullPtr);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_column_count(int stmt);
+    [DllImport("odbc32")]
+    static extern int SQLFetch(int stmt);
 
-    [DllImport("sqlite3")]
-    static extern string sqlite3_column_text(int stmt, int col);
+    [DllImport("odbc32")]
+    static extern int SQLGetData(int stmt, int colNum, int targetType, string buf,
+        int bufLen, string strLenOrIndPtr);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_column_int(int stmt, int col);
+    [DllImport("odbc32")]
+    static extern int SQLRowCount(int stmt, string rowCountPtr);
 
-    [DllImport("sqlite3")]
-    static extern double sqlite3_column_double(int stmt, int col);
+    [DllImport("odbc32")]
+    static extern int SQLFreeHandle(int handleType, int handle);
 
-    [DllImport("sqlite3")]
-    static extern string sqlite3_column_name(int stmt, int col);
+    [DllImport("odbc32")]
+    static extern int SQLDisconnect(int dbc);
 
-    [DllImport("sqlite3")]
-    static extern int sqlite3_column_type(int stmt, int col);
+    [DllImport("odbc32")]
+    static extern int SQLFreeStmt(int stmt, int option);
 
-    [DllImport("sqlite3")]
-    static extern string sqlite3_errmsg(int db);
-
-    [DllImport("sqlite3")]
-    static extern int sqlite3_changes(int db);
-
-    [DllImport("sqlite3")]
-    static extern int sqlite3_last_insert_rowid(int db);
-
+    // --- C runtime ---
     [DllImport("crt")]
     static extern string calloc(int count, int size);
 
@@ -83,64 +110,318 @@ class DbConnection {
 
     DbConnection() {
         this.handle = 0;
-        this.provider = 0;
+        this.env = 0;
+        this.provider = DbProvider.ODBC;
         this.connectionString = "";
         this.connected = false;
+        this.lastError = "";
     }
 
-    /// <summary>Opens a SQLite database file.</summary>
-    static DbConnection OpenSQLite(string filename) {
-        DbConnection conn = new DbConnection();
-        conn.provider = DbProvider.SQLite;
-        conn.connectionString = filename;
+    // ============================================================
+    // Pointer / buffer helpers
+    // ============================================================
 
-        string ppDb = calloc(8, 1);
-        int rc = sqlite3_open(filename, ppDb);
-        if (rc == 0) {
-            // Extract db handle from ppDb pointer
-            conn.handle = ppDb[0] + (ppDb[1] << 8) + (ppDb[2] << 16) + (ppDb[3] << 24);
-            conn.connected = true;
+    /// <summary>Reconstructs a 64-bit handle/pointer written into an out buffer.
+    /// Handles are pointer-sized (8 bytes) on 64-bit platforms, so all eight
+    /// little-endian bytes must be read back.</summary>
+    static int HandleFromBuf(string p) {
+        int v = 0;
+        v = v + (p[0] & 255);
+        v = v + ((p[1] & 255) << 8);
+        v = v + ((p[2] & 255) << 16);
+        v = v + ((p[3] & 255) << 24);
+        v = v + ((p[4] & 255) << 32);
+        v = v + ((p[5] & 255) << 40);
+        v = v + ((p[6] & 255) << 48);
+        v = v + ((p[7] & 255) << 56);
+        return v;
+    }
+
+    /// <summary>Reads a 16-bit little-endian value from an out buffer.</summary>
+    static int Int16FromBuf(string p) {
+        return (p[0] & 255) + ((p[1] & 255) << 8);
+    }
+
+    /// <summary>Index of the first NUL byte in a driver-filled text buffer.</summary>
+    static int ScanNul(string buf, int max) {
+        int i = 0;
+        while (i < max) {
+            if (buf[i] == 0) { return i; }
+            i = i + 1;
         }
-        free(ppDb);
+        return max;
+    }
+
+    /// <summary>Copies a NUL-terminated C buffer into a Zan string.</summary>
+    static string BufToString(string buf, int max) {
+        return buf.Substring(0, ScanNul(buf, max));
+    }
+
+    // ============================================================
+    // Connection factories
+    // ============================================================
+
+    /// <summary>Opens any data source from a full ODBC connection string / DSN.</summary>
+    static DbConnection OpenODBC(string connectionString) {
+        return OpenWith(connectionString, DbProvider.ODBC);
+    }
+
+    /// <summary>Opens Microsoft SQL Server.</summary>
+    static DbConnection OpenSqlServer(string host, int port, string database,
+            string user, string password) {
+        string cs = "Driver={ODBC Driver 17 for SQL Server};Server=" + host
+            + "," + Convert.ToString(port) + ";Database=" + database
+            + ";UID=" + user + ";PWD=" + password + ";TrustServerCertificate=yes;";
+        return OpenWith(cs, DbProvider.SqlServer);
+    }
+
+    /// <summary>Opens MySQL / MariaDB / TiDB / OceanBase.</summary>
+    static DbConnection OpenMySQL(string host, int port, string database,
+            string user, string password) {
+        string cs = "Driver={MySQL ODBC 8.0 Unicode Driver};Server=" + host
+            + ";Port=" + Convert.ToString(port) + ";Database=" + database
+            + ";User=" + user + ";Password=" + password + ";";
+        return OpenWith(cs, DbProvider.MySQL);
+    }
+
+    /// <summary>Opens MariaDB (alias of the MySQL ODBC path).</summary>
+    static DbConnection OpenMariaDB(string host, int port, string database,
+            string user, string password) {
+        return OpenMySQL(host, port, database, user, password);
+    }
+
+    /// <summary>Opens PostgreSQL via the psqlODBC driver.</summary>
+    static DbConnection OpenPostgreSQL(string host, int port, string database,
+            string user, string password) {
+        string cs = "Driver={PostgreSQL Unicode};Server=" + host
+            + ";Port=" + Convert.ToString(port) + ";Database=" + database
+            + ";Uid=" + user + ";Pwd=" + password + ";";
+        return OpenWith(cs, DbProvider.PostgreSQL);
+    }
+
+    /// <summary>Opens openGauss / GaussDB via the PostgreSQL ODBC driver.</summary>
+    static DbConnection OpenOpenGauss(string host, int port, string database,
+            string user, string password) {
+        DbConnection c = OpenPostgreSQL(host, port, database, user, password);
+        c.provider = DbProvider.OpenGauss;
+        return c;
+    }
+
+    /// <summary>Opens KingbaseES / 人大金仓 via the PostgreSQL ODBC driver.</summary>
+    static DbConnection OpenKingbase(string host, int port, string database,
+            string user, string password) {
+        DbConnection c = OpenPostgreSQL(host, port, database, user, password);
+        c.provider = DbProvider.Kingbase;
+        return c;
+    }
+
+    /// <summary>Opens QuestDB via the PostgreSQL ODBC driver.</summary>
+    static DbConnection OpenQuestDB(string host, int port, string user, string password) {
+        DbConnection c = OpenPostgreSQL(host, port, "qdb", user, password);
+        c.provider = DbProvider.QuestDB;
+        return c;
+    }
+
+    /// <summary>Opens Oracle (dbq = host:port/service).</summary>
+    static DbConnection OpenOracle(string host, int port, string service,
+            string user, string password) {
+        string cs = "Driver={Oracle in OraClient};DBQ=" + host + ":"
+            + Convert.ToString(port) + "/" + service
+            + ";UID=" + user + ";PWD=" + password + ";";
+        return OpenWith(cs, DbProvider.Oracle);
+    }
+
+    /// <summary>Opens Firebird (embedded or server).</summary>
+    static DbConnection OpenFirebird(string host, int port, string dbPath,
+            string user, string password) {
+        string cs = "Driver={Firebird/InterBase(r) driver};DBNAME=" + host
+            + "/" + Convert.ToString(port) + ":" + dbPath
+            + ";UID=" + user + ";PWD=" + password + ";";
+        return OpenWith(cs, DbProvider.Firebird);
+    }
+
+    /// <summary>Opens ClickHouse.</summary>
+    static DbConnection OpenClickHouse(string host, int port, string database,
+            string user, string password) {
+        string cs = "Driver={ClickHouse ODBC Driver (Unicode)};Server=" + host
+            + ";Port=" + Convert.ToString(port) + ";Database=" + database
+            + ";UID=" + user + ";PWD=" + password + ";";
+        return OpenWith(cs, DbProvider.ClickHouse);
+    }
+
+    /// <summary>Opens TDengine.</summary>
+    static DbConnection OpenTDengine(string host, int port, string database,
+            string user, string password) {
+        string cs = "Driver={TDengine};Server=" + host + ":"
+            + Convert.ToString(port) + ";Database=" + database
+            + ";UID=" + user + ";PWD=" + password + ";";
+        return OpenWith(cs, DbProvider.TDengine);
+    }
+
+    /// <summary>Opens a DuckDB database (embedded OLAP).</summary>
+    static DbConnection OpenDuckDB(string path) {
+        string cs = "Driver={DuckDB Driver};Database=" + path + ";";
+        return OpenWith(cs, DbProvider.DuckDB);
+    }
+
+    /// <summary>Opens 达梦 DM.</summary>
+    static DbConnection OpenDM(string host, int port, string user, string password) {
+        string cs = "Driver={DM ODBC DRIVER};Server=" + host + ":"
+            + Convert.ToString(port) + ";UID=" + user + ";PWD=" + password + ";";
+        return OpenWith(cs, DbProvider.DM);
+    }
+
+    /// <summary>Opens a SQLite file through the SQLite ODBC driver.
+    /// For dependency-free embedded access use System.Data.Sqlite.SqliteConnection.</summary>
+    static DbConnection OpenSQLite(string path) {
+        string cs = "Driver={SQLite3 ODBC Driver};Database=" + path + ";";
+        return OpenWith(cs, DbProvider.SQLite);
+    }
+
+    static DbConnection OpenWith(string connectionString, int provider) {
+        DbConnection conn = new DbConnection();
+        conn.provider = provider;
+        conn.connectionString = connectionString;
+
+        // Allocate environment handle (SQL_HANDLE_ENV = 1).
+        string pEnv = calloc(8, 1);
+        int rc = SQLAllocHandle(1, 0, pEnv);
+        if (rc < 0) { free(pEnv); conn.lastError = "SQLAllocHandle(ENV) failed"; return conn; }
+        int envH = HandleFromBuf(pEnv);
+        free(pEnv);
+
+        // SQL_ATTR_ODBC_VERSION = 200, SQL_OV_ODBC3 = 3.
+        SQLSetEnvAttr(envH, 200, 3, 0);
+
+        // Allocate connection handle (SQL_HANDLE_DBC = 2).
+        string pDbc = calloc(8, 1);
+        rc = SQLAllocHandle(2, envH, pDbc);
+        if (rc < 0) { free(pDbc); conn.lastError = "SQLAllocHandle(DBC) failed"; return conn; }
+        int dbcH = HandleFromBuf(pDbc);
+        free(pDbc);
+
+        // Connect. SQL_NTS = -3, SQL_DRIVER_NOPROMPT = 0.
+        string outConn = calloc(1024, 1);
+        string pOutLen = calloc(8, 1);
+        rc = SQLDriverConnect(dbcH, 0, connectionString, -3, outConn, 1024, pOutLen, 0);
+        free(outConn);
+        free(pOutLen);
+
+        if (rc == 0 || rc == 1) {
+            conn.env = envH;
+            conn.handle = dbcH;
+            conn.connected = true;
+        } else {
+            conn.lastError = "SQLDriverConnect failed";
+        }
         return conn;
     }
 
-    /// <summary>Opens a SQLite database (wrapper).</summary>
-    static DbConnection OpenSQLiteAsync(string filename) {
-        return OpenSQLite(filename);
+    // ============================================================
+    // Execute / Query
+    // ============================================================
+
+    /// <summary>Allocates a statement handle (SQL_HANDLE_STMT = 3); 0 on failure.</summary>
+    int AllocStmt() {
+        string pStmt = calloc(8, 1);
+        int rc = SQLAllocHandle(3, this.handle, pStmt);
+        if (rc < 0) { free(pStmt); return 0; }
+        int stmt = HandleFromBuf(pStmt);
+        free(pStmt);
+        return stmt;
     }
 
-    /// <summary>Executes a non-query SQL statement (INSERT, UPDATE, DELETE, CREATE).</summary>
+    /// <summary>Executes a non-query statement (INSERT/UPDATE/DELETE/DDL).</summary>
     int Execute(string sql) {
         if (!this.connected) { return -1; }
+        int stmt = AllocStmt();
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
 
-        if (this.provider == DbProvider.SQLite) {
-            string errmsg = calloc(8, 1);
-            int rc = sqlite3_exec(this.handle, sql, 0, 0, errmsg);
-            free(errmsg);
-            if (rc == 0) {
-                return sqlite3_changes(this.handle);
-            }
+        int rc = SQLExecDirect(stmt, sql, -3);   // SQL_NTS
+        if (rc < 0) {
+            this.lastError = "SQLExecDirect failed";
+            SQLFreeHandle(3, stmt);
             return -1;
         }
-        return -1;
+
+        string pRows = calloc(8, 1);
+        SQLRowCount(stmt, pRows);
+        int affected = HandleFromBuf(pRows);
+        free(pRows);
+
+        SQLFreeHandle(3, stmt);
+        return affected;
     }
 
-    /// <summary>Executes a non-query SQL statement (wrapper).</summary>
+    /// <summary>Executes a non-query statement (wrapper).</summary>
     int ExecuteAsync(string sql) {
         return Execute(sql);
     }
 
     /// <summary>Executes a query and returns a result set.</summary>
     DbResult Query(string sql) {
-        if (!this.connected) {
-            return DbResult.Empty();
+        if (!this.connected) { return DbResult.Empty(); }
+        DbResult result = DbResult.Create();
+        int stmt = AllocStmt();
+        if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
+
+        int rc = SQLExecDirect(stmt, sql, -3);   // SQL_NTS
+        if (rc < 0) {
+            this.lastError = "SQLExecDirect failed";
+            SQLFreeHandle(3, stmt);
+            return result;
         }
 
-        if (this.provider == DbProvider.SQLite) {
-            return QuerySQLite(sql);
+        string pcc = calloc(4, 1);
+        SQLNumResultCols(stmt, pcc);
+        int colCount = Int16FromBuf(pcc);
+        free(pcc);
+        result.SetColumnCount(colCount);
+
+        int c = 0;
+        while (c < colCount) {
+            string nameBuf = calloc(256, 1);
+            string pNameLen = calloc(4, 1);
+            string pType = calloc(4, 1);
+            string pSize = calloc(8, 1);
+            string pDec = calloc(4, 1);
+            string pNull = calloc(4, 1);
+            SQLDescribeCol(stmt, c + 1, nameBuf, 256, pNameLen, pType, pSize, pDec, pNull);
+            result.AddColumnName(BufToString(nameBuf, 256));
+            free(nameBuf);
+            free(pNameLen);
+            free(pType);
+            free(pSize);
+            free(pDec);
+            free(pNull);
+            c = c + 1;
         }
-        return DbResult.Empty();
+
+        // SQL_SUCCESS = 0, SQL_SUCCESS_WITH_INFO = 1, SQL_NO_DATA = 100.
+        int fr = SQLFetch(stmt);
+        while (fr == 0 || fr == 1) {
+            List<string> row = new List<string>();
+            c = 0;
+            while (c < colCount) {
+                string buf = calloc(4096, 1);
+                string pInd = calloc(8, 1);
+                int g = SQLGetData(stmt, c + 1, 1, buf, 4096, pInd);   // SQL_C_CHAR = 1
+                if (g == 100) {
+                    row.Add("");
+                } else {
+                    row.Add(BufToString(buf, 4096));
+                }
+                free(buf);
+                free(pInd);
+                c = c + 1;
+            }
+            result.AddRow(row);
+            fr = SQLFetch(stmt);
+        }
+
+        SQLFreeStmt(stmt, 0);        // SQL_CLOSE
+        SQLFreeHandle(3, stmt);
+        return result;
     }
 
     /// <summary>Executes a query (wrapper).</summary>
@@ -148,7 +429,7 @@ class DbConnection {
         return Query(sql);
     }
 
-    /// <summary>Executes a scalar query (returns first column of first row as string).</summary>
+    /// <summary>Executes a scalar query (first column of first row as string).</summary>
     string ExecuteScalar(string sql) {
         DbResult result = Query(sql);
         if (result.RowCount() > 0) {
@@ -162,25 +443,14 @@ class DbConnection {
         return ExecuteScalar(sql);
     }
 
-    /// <summary>Gets the last inserted row ID (SQLite).</summary>
-    int LastInsertId() {
-        if (this.provider == DbProvider.SQLite) {
-            return sqlite3_last_insert_rowid(this.handle);
-        }
-        return 0;
-    }
-
-    /// <summary>Gets the last error message.</summary>
+    /// <summary>Gets the last error message recorded on this connection.</summary>
     string GetError() {
-        if (this.provider == DbProvider.SQLite) {
-            return sqlite3_errmsg(this.handle);
-        }
-        return "";
+        return this.lastError;
     }
 
     /// <summary>Begins a transaction.</summary>
     void BeginTransaction() {
-        Execute("BEGIN TRANSACTION");
+        Execute("BEGIN");
     }
 
     /// <summary>Commits the current transaction.</summary>
@@ -196,11 +466,12 @@ class DbConnection {
     /// <summary>Closes the database connection.</summary>
     void Close() {
         if (this.connected) {
-            if (this.provider == DbProvider.SQLite) {
-                sqlite3_close(this.handle);
-            }
+            SQLDisconnect(this.handle);
+            SQLFreeHandle(2, this.handle);   // SQL_HANDLE_DBC
+            SQLFreeHandle(1, this.env);      // SQL_HANDLE_ENV
             this.connected = false;
             this.handle = 0;
+            this.env = 0;
         }
     }
 
@@ -212,57 +483,5 @@ class DbConnection {
     /// <summary>Returns the provider type.</summary>
     int GetProvider() {
         return this.provider;
-    }
-
-    // --- Internal SQLite query implementation ---
-    DbResult QuerySQLite(string sql) {
-        DbResult result = DbResult.Create();
-
-        string ppStmt = calloc(8, 1);
-        string pzTail = calloc(8, 1);
-        int sqlLen = sql.Length;
-
-        int rc = sqlite3_prepare_v2(this.handle, sql, sqlLen, ppStmt, pzTail);
-        if (rc != 0) {
-            free(ppStmt);
-            free(pzTail);
-            return result;
-        }
-
-        int stmt = ppStmt[0] + (ppStmt[1] << 8) + (ppStmt[2] << 16) + (ppStmt[3] << 24);
-        free(ppStmt);
-        free(pzTail);
-
-        int colCount = sqlite3_column_count(stmt);
-        result.SetColumnCount(colCount);
-
-        // Get column names
-        int c = 0;
-        while (c < colCount) {
-            string colName = sqlite3_column_name(stmt, c);
-            result.AddColumnName(colName);
-            c = c + 1;
-        }
-
-        // Fetch rows
-        while (sqlite3_step(stmt) == 100) {  // SQLITE_ROW = 100
-            List<string> row = new List<string>();
-            c = 0;
-            while (c < colCount) {
-                int colType = sqlite3_column_type(stmt, c);
-                if (colType == 5) {
-                    // SQLITE_NULL
-                    row.Add("");
-                } else {
-                    string val = sqlite3_column_text(stmt, c);
-                    row.Add(val);
-                }
-                c = c + 1;
-            }
-            result.AddRow(row);
-        }
-
-        sqlite3_finalize(stmt);
-        return result;
     }
 }

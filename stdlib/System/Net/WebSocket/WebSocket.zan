@@ -165,6 +165,134 @@ class WsFrame {
 }
 
 /// <summary>
+/// Buffered, binary-safe WebSocket frame reader.
+///
+/// Fixes two correctness/throughput bugs in the naive "one recv == one whole
+/// frame" model:
+///   1. A frame larger than a single recv (or split across TCP segments) is
+///      reassembled by accumulating bytes until the declared frame length is
+///      available.
+///   2. Multiple frames delivered in one recv (pipelined / coalesced sends) are
+///      each drained in turn instead of only decoding the first.
+///
+/// It also avoids the NUL-truncation hazard of string-based recv: bytes are
+/// received via <c>Socket.Recv</c> (which returns the real byte count) and the
+/// valid length is tracked explicitly in <c>len</c>, never via <c>strlen</c>.
+/// </summary>
+class WsReader {
+    int sock;
+    string buf;
+    int len;
+    int cap;
+    string tmp;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    WsReader(int sock) {
+        this.sock = sock;
+        this.cap = 65536;
+        this.buf = calloc(this.cap + 1, 1);
+        this.len = 0;
+        this.tmp = calloc(65537, 1);
+    }
+
+    /// <summary>Grows the accumulation buffer to hold at least `need` bytes.</summary>
+    void Ensure(int need) {
+        if (need <= this.cap) { return; }
+        int nc = this.cap * 2;
+        while (nc < need) { nc = nc * 2; }
+        string nb = calloc(nc + 1, 1);
+        int i = 0;
+        while (i < this.len) {
+            nb[i] = this.buf[i];
+            i = i + 1;
+        }
+        free(this.buf);
+        this.buf = nb;
+        this.cap = nc;
+    }
+
+    /// <summary>Suspends on the reactor until readable, then appends the received
+    /// bytes to the buffer. Returns bytes read; 0 means the peer closed (EOF).</summary>
+    async int FillMore() {
+        int got = 0;
+        while (got == 0) {
+            await Socket.ReadReady(this.sock);
+            int n = 0;
+            if (this.len == 0) {
+                // Fast path: buffer empty (the common one-frame-per-recv case) —
+                // receive straight into it, no intermediate copy.
+                n = Socket.Recv(this.sock, this.buf, this.cap);
+                if (n > 0) {
+                    this.len = n;
+                    got = n;
+                } else if (n == 0) {
+                    return 0;
+                }
+            } else {
+                // Bytes already buffered (partial/coalesced frames): receive into
+                // a scratch buffer and append.
+                n = Socket.Recv(this.sock, this.tmp, 65536);
+                if (n > 0) {
+                    this.Ensure(this.len + n);
+                    int i = 0;
+                    while (i < n) {
+                        this.buf[this.len + i] = this.tmp[i];
+                        i = i + 1;
+                    }
+                    this.len = this.len + n;
+                    got = n;
+                } else if (n == 0) {
+                    return 0;
+                }
+            }
+            // n < 0: EWOULDBLOCK / spurious wakeup — await readability again.
+        }
+        return got;
+    }
+
+    /// <summary>Total byte length of the frame at the front of the buffer, or -1
+    /// if a complete frame is not yet buffered.</summary>
+    int FrameSize() {
+        if (this.len < 2) { return -1; }
+        int b1 = this.buf[1] & 255;
+        bool masked = (b1 & 128) != 0;
+        int payloadLen = b1 & 127;
+        int offset = 2;
+        if (payloadLen == 126) {
+            if (this.len < 4) { return -1; }
+            payloadLen = ((this.buf[2] & 255) << 8) + (this.buf[3] & 255);
+            offset = 4;
+        } else if (payloadLen == 127) {
+            if (this.len < 10) { return -1; }
+            payloadLen = ((this.buf[6] & 255) << 24) + ((this.buf[7] & 255) << 16) +
+                         ((this.buf[8] & 255) << 8) + (this.buf[9] & 255);
+            offset = 10;
+        }
+        int maskLen = 0;
+        if (masked) { maskLen = 4; }
+        int total = offset + maskLen + payloadLen;
+        if (this.len < total) { return -1; }
+        return total;
+    }
+
+    /// <summary>Drops the first `total` bytes (one consumed frame), shifting any
+    /// remaining buffered frames to the front.</summary>
+    void Consume(int total) {
+        int rem = this.len - total;
+        int i = 0;
+        while (i < rem) {
+            this.buf[i] = this.buf[total + i];
+            i = i + 1;
+        }
+        this.len = rem;
+    }
+}
+
+/// <summary>
 /// WebSocket server.
 /// </summary>
 class WebSocketServer {
@@ -196,7 +324,9 @@ class WebSocketServer {
             int clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
                 this.activeConnections = this.activeConnections + 1;
-                await HandleConnection(clientSock);
+                // Handle each connection on its own coroutine so the accept loop
+                // keeps accepting instead of serving one client at a time.
+                Task.Spawn(HandleConnection(clientSock));
             }
         }
     }
@@ -228,21 +358,41 @@ class WebSocketServer {
         sb.Append("\r\n\r\n");
         await client.SendAsync(sb.ToString());
 
+        WsReader reader = new WsReader(clientSock);
         bool connected = true;
         while (connected) {
-            string frameData = await client.RecvAsync(65536);
-            if (frameData.Length == 0) {
-                connected = false;
-                break;
+            // Reassemble one complete frame, pulling more bytes as needed. A
+            // single recv may under-deliver (large frame) or over-deliver
+            // (pipelined frames); the reader handles both.
+            int total = reader.FrameSize();
+            while (total < 0) {
+                int n = await reader.FillMore();
+                if (n == 0) {
+                    connected = false;
+                    break;
+                }
+                total = reader.FrameSize();
             }
+            if (!connected) { break; }
 
-            WsFrame frame = WsFrame.Decode(frameData, frameData.Length);
+            WsFrame frame = WsFrame.Decode(reader.buf, total);
+            reader.Consume(total);
 
             if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
                 string response = OnMessage(frame.payload);
-                WsFrame respFrame = WsFrame.TextFrame(response);
+                // Echo back the exact received length (binary-safe): the decoded
+                // payload length is authoritative, not strlen(response).
+                int respLen = frame.payloadLen;
+                WsFrame respFrame = WsFrame.BinaryFrame(response, respLen);
+                respFrame.opcode = frame.opcode;
                 string encoded = respFrame.Encode();
-                await client.SendBytesAsync(encoded, 2 + response.Length);
+                int hdrLen = 2;
+                if (respLen > 65535) {
+                    hdrLen = 10;
+                } else if (respLen > 125) {
+                    hdrLen = 4;
+                }
+                await client.SendBytesAsync(encoded, hdrLen + respLen);
             } else if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
                 string encoded = pong.Encode();

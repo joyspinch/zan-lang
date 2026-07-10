@@ -26,11 +26,20 @@
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
-                            const char *module_name) {
+                            const char *module_name,
+                            const char *target_triple,
+                            bool target_is_windows, bool mt_scheduler) {
     memset(g, 0, sizeof(*g));
     g->arena = arena;
     g->diag = diag;
     g->binder = binder;
+    /* Set target before runtime codegen so Sleep/poll selection is correct. */
+    if (target_triple && target_triple[0])
+        snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
+    g->target_is_windows = target_is_windows;
+    /* Must be set before the inline coroutine driver is (conditionally)
+     * emitted below, so the multi-worker mode can skip it. */
+    g->mt_scheduler = mt_scheduler;
 
     g->ctx = LLVMContextCreate();
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
@@ -204,6 +213,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef wc_args[] = { i64d, i32d, i8ptr, g->co_step_ptr };
         g->rt_io_wait_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), wc_args, 4, 0);
         g->rt_io_wait_co = LLVMAddFunction(g->mod, "zan_io_wait_co", g->rt_io_wait_co_type);
+        LLVMTypeRef i64ptr = LLVMPointerType(i64d, 0);
+        LLVMTypeRef rc_args[] = { i64d, i8ptr, i32d, i8ptr, g->co_step_ptr, i64ptr };
+        g->rt_io_recv_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rc_args, 6, 0);
+        g->rt_io_recv_co = LLVMAddFunction(g->mod, "zan_io_recv_co", g->rt_io_recv_co_type);
         g->rt_io_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
         g->rt_io_pump = LLVMAddFunction(g->mod, "zan_io_pump", g->rt_io_pump_type);
         LLVMSetLinkage(g->rt_io_pump, LLVMWeakAnyLinkage);
@@ -218,8 +231,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
      * malloc'd nodes {next, frame, step}; zan_co_ready appends, zan_co_sched_run
      * drains, popping+freeing a node before invoking its step (which may itself
-     * enqueue). Semantically equivalent to src/runtime/rt_co.c. */
-    {
+     * enqueue). Semantically equivalent to src/runtime/rt_co.c.
+     *
+     * Skipped under --async-workers (g->mt_scheduler): the driver symbols are
+     * then left as external declarations and resolved from the multi-worker
+     * reactor object (zanrt_io_mt) at link time. */
+    if (!g->mt_scheduler) {
         LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
         LLVMTypeRef node_fields[] = { i8ptr /*next*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
         LLVMTypeRef node_ty = LLVMStructCreateNamed(g->ctx, "zan.co.node");
@@ -250,15 +267,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetInitializer(g_timers, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_timers, LLVMInternalLinkage);
 
-#if defined(_WIN32)
+        /* Declare the platform sleep primitive for the *target* OS (not host):
+         * Sleep (kernel32) on Windows, poll(NULL,0,ms) on POSIX/Linux. */
         LLVMTypeRef sleep_args[] = { i32t };
         LLVMTypeRef sleep_type = LLVMFunctionType(voidt, sleep_args, 1, 0);
-        LLVMValueRef fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
-#else
+        LLVMValueRef fn_sleep = NULL;
         LLVMTypeRef poll_args[] = { i8ptr, i64t, i32t };
         LLVMTypeRef poll_type = LLVMFunctionType(i32t, poll_args, 3, 0);
-        LLVMValueRef fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
-#endif
+        LLVMValueRef fn_poll = NULL;
+        if (g->target_is_windows)
+            fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
+        else
+            fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
 
         /* void zan_co_sched_init(void): reset the queue to empty. */
         {
@@ -472,13 +492,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
             LLVMPositionBuilderAtEnd(g->builder, do_sleep);
             LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms_v, i32t, "ms32");
-#if defined(_WIN32)
-            LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
-                (LLVMValueRef[]){ ms32 }, 1, "");
-#else
-            LLVMBuildCall2(g->builder, poll_type, fn_poll,
-                (LLVMValueRef[]){ LLVMConstNull(i8ptr), LLVMConstInt(i64t, 0, 0), ms32 }, 3, "");
-#endif
+            if (g->target_is_windows)
+                LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
+                    (LLVMValueRef[]){ ms32 }, 1, "");
+            else
+                LLVMBuildCall2(g->builder, poll_type, fn_poll,
+                    (LLVMValueRef[]){ LLVMConstNull(i8ptr), LLVMConstInt(i64t, 0, 0), ms32 }, 3, "");
             LLVMBuildBr(g->builder, after_sleep);
 
             LLVMPositionBuilderAtEnd(g->builder, after_sleep);
@@ -1004,6 +1023,10 @@ typedef struct {
     zan_istr_t name;
     LLVMValueRef alloca;
     zan_type_t *type;
+    /* ARC: 1 when this local owns a heap class reference that must be released
+     * on overwrite and at function exit; 0 for params, borrowed, escaped or
+     * non-class locals. See the ARC helpers below. */
+    int arc_owned;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -1044,6 +1067,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].name = name;
     scope->vars[scope->count].alloca = alloca;
     scope->vars[scope->count].type = type;
+    scope->vars[scope->count].arc_owned = 0;
     scope->count++;
 }
 
@@ -1060,11 +1084,10 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
 /* Helper: check if a type is ARC-managed (class instance, not string/int/struct/enum) */
 static int is_arc_managed_type(zan_type_t *t) {
     if (!t) return 0;
+    /* Only class instances carry the zan_rt_alloc rc header. List/Dict/
+     * StringBuilder are raw-malloc'd without a header, so releasing them via
+     * zan_rt_release (which reads rc at offset -8) would corrupt memory. */
     if (t->kind == TYPE_CLASS) return 1;
-    /* List and Dict are also ARC-managed (heap-allocated with rc header) */
-    if (t->name.len == 4 && memcmp(t->name.str, "List", 4) == 0) return 1;
-    if (t->name.len == 4 && memcmp(t->name.str, "Dict", 4) == 0) return 1;
-    if (t->name.len == 13 && memcmp(t->name.str, "StringBuilder", 13) == 0) return 1;
     return 0;
 }
 
@@ -1265,18 +1288,22 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
             if (gf && gf->kind == SYM_METHOD) return gf->type;
             return NULL;
         }
-        if (callee->kind == AST_MEMBER_ACCESS &&
-            callee->member.object->kind == AST_IDENTIFIER) {
-            /* instance: local.Method() */
-            local_var_t *lv = local_find(locals, callee->member.object->ident.name);
-            if (lv && lv->type && lv->type->sym) {
-                zan_symbol_t *m = get_method_sym(lv->type->sym, callee->member.name);
-                if (m) return m->type;
+        if (callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *obj = callee->member.object;
+            /* static: ClassName.Method() (class name, not a shadowing local) */
+            if (obj->kind == AST_IDENTIFIER && !local_find(locals, obj->ident.name)) {
+                zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
+                if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
+                    zan_symbol_t *m = get_method_sym(ts, callee->member.name);
+                    if (m) return m->type;
+                }
             }
-            /* static: ClassName.Method() */
-            zan_symbol_t *ts = zan_binder_lookup(g->binder, callee->member.object->ident.name);
-            if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
-                zan_symbol_t *m = get_method_sym(ts, callee->member.name);
+            /* instance: <expr>.Method() -- resolve the receiver type
+             * generally (local, this, field, index, or a nested call) so
+             * that fluent chains a.M1().M2().M3() infer at any depth. */
+            zan_type_t *rt = infer_expr_type(g, obj, locals);
+            if (rt && rt->sym) {
+                zan_symbol_t *m = get_method_sym(rt->sym, callee->member.name);
                 if (m) return m->type;
             }
         }
@@ -1308,6 +1335,165 @@ static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method
             memcmp(obj_name.str, obj, (size_t)obj_name.len) == 0 &&
             (int)method_name.len == (int)strlen(method) &&
             memcmp(method_name.str, method, (size_t)method_name.len) == 0);
+}
+
+/* ===== ARC (automatic reference counting) for heap class objects ===========
+ * Only TYPE_CLASS instances are heap-allocated with the 16-byte rc header
+ * (zan_rt_alloc); struct values live on the stack and List/Dict/StringBuilder
+ * are raw-malloc'd without a header, so retain/release apply strictly to class
+ * pointers. Ownership model (classifier-based, no temp pool):
+ *   - `new C(...)` and calls yield an already-owned (+1) reference;
+ *   - identifier / member / index loads yield a borrowed reference.
+ * A borrowed reference is retained when captured into an owning class slot
+ * (local or field) or returned; owning class locals are released when
+ * overwritten and at every function exit. A class local passed as a call
+ * argument is conservatively treated as escaped (ownership handed off) and not
+ * released, which keeps collections/stores that capture it use-after-free
+ * safe. Strings, async frames and collection element release are follow-ups. */
+
+static void emit_arc_retain(zan_irgen_t *g, LLVMValueRef v) {
+    if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rt");
+    LLVMBuildCall2(g->builder,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        g->rt_retain, &v, 1, "");
+}
+
+static void emit_arc_release(zan_irgen_t *g, LLVMValueRef v) {
+    if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rl");
+    LLVMBuildCall2(g->builder,
+        LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+        g->rt_release, &v, 1, "");
+}
+
+/* A value already carrying an owned (+1) reference we may take over as-is;
+ * anything else is a borrowed load that must be retained on capture. */
+static int expr_yields_owned_ref(zan_ast_node_t *e) {
+    return e && (e->kind == AST_NEW_EXPR || e->kind == AST_CALL);
+}
+
+static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && t->kind == TYPE_CLASS;
+}
+
+/* True when a local owns a class heap reference held as a pointer (excludes
+ * borrowed params, stack-struct classes and non-class types). */
+static int local_owns_arc(local_var_t *v) {
+    if (!v || v->arc_owned != 1 || !v->type || v->type->kind != TYPE_CLASS) return 0;
+    return LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
+}
+
+static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
+    if (!locals) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = 0; i < locals->count; i++) {
+        if (local_owns_arc(&locals->vars[i])) {
+            LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
+                                              locals->vars[i].alloca, "arc.rel");
+            emit_arc_release(g, cur);
+        }
+    }
+}
+
+/* Capture value `v` (from `rhs`) into class pointer slot `slot_alloca`: release
+ * the previous occupant, retain a borrowed reference, then store. The slot must
+ * be null-initialised before its first capture so the release is a no-op. */
+static void emit_arc_capture_local(zan_irgen_t *g, LLVMValueRef slot_alloca,
+                                   LLVMValueRef v, zan_ast_node_t *rhs) {
+    LLVMTypeRef slot_ty = LLVMGetAllocatedType(slot_alloca);
+    LLVMValueRef old = LLVMBuildLoad2(g->builder, slot_ty, slot_alloca, "arc.old");
+    if (!expr_yields_owned_ref(rhs)) emit_arc_retain(g, v);
+    if (LLVMTypeOf(v) != slot_ty &&
+        LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
+        v = LLVMBuildBitCast(g->builder, v, slot_ty, "arc.bc");
+    LLVMBuildStore(g->builder, v, slot_alloca);
+    emit_arc_release(g, old);
+}
+
+/* Retain a borrowed class value stored into an owning field, releasing the
+ * previous occupant (fields are zero-initialised at object allocation). */
+static void emit_arc_store_field(zan_irgen_t *g, LLVMValueRef field_ptr,
+                                 LLVMValueRef v, zan_ast_node_t *rhs) {
+    LLVMTypeRef vt = LLVMTypeOf(v);
+    if (LLVMGetTypeKind(vt) != LLVMPointerTypeKind) {
+        LLVMBuildStore(g->builder, v, field_ptr);
+        return;
+    }
+    LLVMValueRef old = LLVMBuildLoad2(g->builder, vt, field_ptr, "arc.fold");
+    if (!expr_yields_owned_ref(rhs)) emit_arc_retain(g, v);
+    LLVMBuildStore(g->builder, v, field_ptr);
+    emit_arc_release(g, old);
+}
+
+/* Does the expression subtree reference a bare identifier named `name`? */
+static int ast_refs_ident(zan_ast_node_t *n, zan_istr_t name) {
+    if (!n) return 0;
+    switch (n->kind) {
+    case AST_IDENTIFIER:
+        return n->ident.name.len == name.len &&
+               memcmp(n->ident.name.str, name.str, (size_t)name.len) == 0;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        return ast_refs_ident(n->binary.left, name) ||
+               ast_refs_ident(n->binary.right, name);
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        return ast_refs_ident(n->unary.operand, name);
+    case AST_CALL: {
+        if (ast_refs_ident(n->call.callee, name)) return 1;
+        for (int i = 0; i < n->call.args.count; i++)
+            if (ast_refs_ident(n->call.args.items[i], name)) return 1;
+        return 0;
+    }
+    case AST_MEMBER_ACCESS:
+        return ast_refs_ident(n->member.object, name);
+    case AST_INDEX:
+        return ast_refs_ident(n->index.object, name) ||
+               ast_refs_ident(n->index.index, name);
+    case AST_CONDITIONAL:
+        return ast_refs_ident(n->conditional.cond, name) ||
+               ast_refs_ident(n->conditional.then_expr, name) ||
+               ast_refs_ident(n->conditional.else_expr, name);
+    case AST_NEW_EXPR: {
+        for (int i = 0; i < n->new_expr.args.count; i++)
+            if (ast_refs_ident(n->new_expr.args.items[i], name)) return 1;
+        return 0;
+    }
+    case AST_CAST_EXPR:
+        return ast_refs_ident(n->cast.expr, name);
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        return ast_refs_ident(n->type_test.expr, name);
+    case AST_AWAIT_EXPR:
+        return ast_refs_ident(n->await_expr.expr, name);
+    case AST_STRING_INTERP: {
+        for (int i = 0; i < n->string_interp.parts.count; i++)
+            if (ast_refs_ident(n->string_interp.parts.items[i], name)) return 1;
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* At a call, hand off ownership of any owning class local that appears in an
+ * argument (the callee may capture it into a collection/field), so it is not
+ * released at function exit — preventing a use-after-free of the captured
+ * reference. */
+static void arc_mark_call_arg_escapes(zan_ast_node_t *callexpr, local_scope_t *locals) {
+    if (!callexpr || callexpr->kind != AST_CALL) return;
+    for (int a = 0; a < callexpr->call.args.count; a++) {
+        zan_ast_node_t *arg = callexpr->call.args.items[a];
+        for (int i = 0; i < locals->count; i++) {
+            if (locals->vars[i].arc_owned == 1 &&
+                ast_refs_ident(arg, locals->vars[i].name))
+                locals->vars[i].arc_owned = 0;
+        }
+    }
 }
 
 /* Emit a runtime guard: when `is_error` is true at runtime, print
@@ -1740,7 +1926,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         LLVMValueRef right = emit_expr(g, expr->binary.right, locals);
         if (expr->binary.left->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
-            if (local) {
+            if (local && local_owns_arc(local)) {
+                /* ARC: release the previous occupant and retain the new one. */
+                emit_arc_capture_local(g, local->alloca, right, expr->binary.right);
+            } else if (local) {
                 LLVMValueRef sv = coerce_int_to(g, right,
                     LLVMGetAllocatedType(local->alloca));
                 LLVMBuildStore(g->builder, sv, local->alloca);
@@ -1774,7 +1963,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 }
                             }
                         }
-                        LLVMBuildStore(g->builder, right, fptr);
+                        if (fsym && fsym->type && fsym->type->kind == TYPE_CLASS) {
+                            emit_arc_store_field(g, fptr, right, expr->binary.right);
+                        } else {
+                            LLVMBuildStore(g->builder, right, fptr);
+                        }
                     }
                 }
             }
@@ -1871,7 +2064,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         if (st) {
                             LLVMValueRef struct_ptr = struct_base_ptr(g, local, st);
                             LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
-                            LLVMBuildStore(g->builder, right, fptr);
+                            zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
+                            if (afsym && afsym->type && afsym->type->kind == TYPE_CLASS) {
+                                emit_arc_store_field(g, fptr, right, expr->binary.right);
+                            } else {
+                                LLVMBuildStore(g->builder, right, fptr);
+                            }
                             stored = true;
                         }
                     }
@@ -1889,7 +2087,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         if (st && LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
                             LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st,
                                 obj_val, (unsigned)fi, "gfld");
-                            LLVMBuildStore(g->builder, right, fptr);
+                            zan_symbol_t *gfsym = get_field_sym(cls, expr->binary.left->member.name);
+                            if (gfsym && gfsym->type && gfsym->type->kind == TYPE_CLASS) {
+                                emit_arc_store_field(g, fptr, right, expr->binary.right);
+                            } else {
+                                LLVMBuildStore(g->builder, right, fptr);
+                            }
                         }
                     }
                 }
@@ -1899,6 +2102,43 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_CALL: {
+        /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
+         * independent coroutine WITHOUT awaiting it. Emits the callee's ramp
+         * (heap frame) then schedules it on the cooperative driver with no
+         * awaiter and without suspending the caller (contrast await, which
+         * registers self as awaiter and suspends). This is the concurrency
+         * primitive a server accept loop uses to handle each connection on its
+         * own coroutine instead of serially. See docs/ASYNC_CPS_DESIGN.md. */
+        /* ARC: an owning class local passed as an argument may be captured by
+         * the callee (stored in a collection/field), so relinquish ownership. */
+        arc_mark_call_arg_escapes(expr, locals);
+        if (is_call_to(expr, "Task", "Spawn") && expr->call.args.count == 1 &&
+            expr->call.args.items[0]->kind == AST_CALL) {
+            LLVMTypeRef sp_i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef sp_i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef sub = emit_expr(g, expr->call.args.items[0], locals);
+            LLVMValueRef sub_resume = NULL;
+            if (LLVMIsACallInst(sub)) {
+                LLVMValueRef callee = LLVMGetCalledValue(sub);
+                if (callee) {
+                    size_t nl = 0;
+                    const char *cn = LLVMGetValueName2(callee, &nl);
+                    if (cn && nl > 0 && nl < 240) {
+                        char rn[256];
+                        memcpy(rn, cn, nl);
+                        memcpy(rn + nl, "$resume", 8); /* includes NUL */
+                        sub_resume = LLVMGetNamedFunction(g->mod, rn);
+                    }
+                }
+            }
+            if (sub_resume && LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
+                LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, sp_i8ptr, "spawn.sub");
+                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
+                LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
+            }
+            return LLVMConstInt(sp_i64, 0, 0);
+        }
+
         /* StringBuilder.Append(s) / StringBuilder.ToString() — growable byte
          * buffer with amortised O(1) append (capacity doubling). */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
@@ -3984,6 +4224,23 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* Static class/struct field access: ClassName.StaticField.
+         * Fold a const-style declaration (`static int X = 1;`) to the
+         * value of its initializer, mirroring enum member access. */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            !local_find(locals, expr->member.object->ident.name)) {
+            zan_symbol_t *cs = zan_binder_lookup(g->binder, expr->member.object->ident.name);
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                zan_symbol_t *fs = get_field_sym(cs, expr->member.name);
+                if (fs && fs->decl && fs->decl->kind == AST_FIELD_DECL &&
+                    fs->decl->field_decl.initializer &&
+                    ((fs->modifiers & MOD_STATIC) ||
+                     (fs->decl->field_decl.modifiers & MOD_STATIC))) {
+                    return emit_expr(g, fs->decl->field_decl.initializer, locals);
+                }
+            }
+        }
+
         /* struct field access: obj.Field */
         if (expr->member.object->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->member.object->ident.name);
@@ -4362,6 +4619,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                             fval = LLVMBuildFPTrunc(g->builder, fval, target_t, "trunc");
                                         }
                                     }
+                                    /* ARC: retain a borrowed class value captured into the
+                                     * field so it survives release of any source local. */
+                                    if (fsym && fsym->type && fsym->type->kind == TYPE_CLASS &&
+                                        !expr_yields_owned_ref(arg->binary.right)) {
+                                        emit_arc_retain(g, fval);
+                                    }
                                     LLVMBuildStore(g->builder, fval, fptr);
                                 }
                             }
@@ -4548,22 +4811,22 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
              * same platform primitive the scheduler uses (Sleep / poll), already
              * declared in the module by the runtime emission. */
             LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
-#if defined(_WIN32)
-            LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
-            if (fn_sleep) {
-                LLVMTypeRef sl_args[] = { di32 };
-                LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
-                LLVMBuildCall2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
+            if (g->target_is_windows) {
+                LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
+                if (fn_sleep) {
+                    LLVMTypeRef sl_args[] = { di32 };
+                    LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
+                    LLVMBuildCall2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
+                }
+            } else {
+                LLVMValueRef fn_poll = LLVMGetNamedFunction(g->mod, "poll");
+                if (fn_poll) {
+                    LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
+                    LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
+                    LLVMBuildCall2(g->builder, pl_ty, fn_poll,
+                        (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
+                }
             }
-#else
-            LLVMValueRef fn_poll = LLVMGetNamedFunction(g->mod, "poll");
-            if (fn_poll) {
-                LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
-                LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
-                LLVMBuildCall2(g->builder, pl_ty, fn_poll,
-                    (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
-            }
-#endif
             return LLVMConstInt(di64, 0, 0);
         }
 
@@ -4612,6 +4875,63 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 emit_async_reload_slots(g);
                 return LLVMConstInt(di64, 0, 0);
+            }
+        }
+
+        /* await Socket.RecvOv(fd, buf, len) — overlapped receive. Unlike
+         * ReadReady (a bare readiness probe followed by a synchronous recv in
+         * zan), this posts the real recv via zan_io_recv_co and SUSPENDS; the
+         * byte count is written by the reactor into this frame's RESULT slot
+         * before it is re-readied, and the resume-k block loads it as the await
+         * value. Issuing the recv as one op removes the probe/recv window that
+         * leaked completions under the multi-worker driver at high load. */
+        {
+            if (is_call_to(expr->await_expr.expr, "Socket", "RecvOv") &&
+                expr->await_expr.expr->call.args.count == 3) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.RecvOv is only supported inside an async method");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef fd = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(fd) != di64)
+                    fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
+                LLVMValueRef buf = emit_expr(g, expr->await_expr.expr->call.args.items[1], locals);
+                if (LLVMTypeOf(buf) != di8ptr)
+                    buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "recvbuf");
+                LLVMValueRef len = emit_expr(g, expr->await_expr.expr->call.args.items[2], locals);
+                if (LLVMTypeOf(len) != di32)
+                    len = LLVMBuildIntCast2(g->builder, len, di32, 1, "len32");
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                /* &self.result — the reactor stores the recv byte count here. */
+                LLVMValueRef out_n = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.iores");
+                LLVMBuildCall2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
+                    (LLVMValueRef[]){ fd, buf, len, self_i8,
+                        g->current_async_resume_fn, out_n }, 6, "");
+                emit_async_save_slots(g);
+                LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                /* recompute the result GEP: entry dominates rk, the pre-suspend
+                 * block does not. */
+                LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.iores2");
+                return LLVMBuildLoad2(g->builder, di64, res_slot, "recvn");
             }
         }
 
@@ -5385,6 +5705,16 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
+    /* ARC: track control-flow nesting so class locals declared inside a
+     * conditional/loop body (whose stack slot does not dominate the exit) are
+     * not registered as owning references. Every branch here ends in `break`,
+     * so the matching decrement below always runs. */
+    int arc_nested = (stmt->kind == AST_IF_STMT || stmt->kind == AST_WHILE_STMT ||
+                      stmt->kind == AST_DO_WHILE_STMT || stmt->kind == AST_FOR_STMT ||
+                      stmt->kind == AST_FOREACH_STMT || stmt->kind == AST_SWITCH_STMT ||
+                      stmt->kind == AST_TRY_STMT);
+    if (arc_nested) g->arc_stmt_depth++;
+
     switch (stmt->kind) {
     case AST_BLOCK:
         for (int i = 0; i < stmt->block.stmts.count; i++) {
@@ -5565,13 +5895,27 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMTypeRef llvm_type = map_type(g, type);
         LLVMValueRef alloca = LLVMBuildAlloca(g->builder, llvm_type, "var");
 
+        /* ARC: a class-typed local holds an owning heap reference. Track it only
+         * when declared at the top level of the function body (arc_stmt_depth==0)
+         * so its slot dominates every exit; null-init so the release at exit is
+         * safe even before the initializer has stored anything. */
+        int arc_own = (type && type->kind == TYPE_CLASS &&
+                       LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind &&
+                       g->arc_stmt_depth == 0);
+        if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
+
         if (stmt->var_decl.initializer) {
             LLVMValueRef init_val = emit_expr(g, stmt->var_decl.initializer, locals);
-            init_val = coerce_int_to(g, init_val, llvm_type);
-            LLVMBuildStore(g->builder, init_val, alloca);
+            if (arc_own) {
+                emit_arc_capture_local(g, alloca, init_val, stmt->var_decl.initializer);
+            } else {
+                init_val = coerce_int_to(g, init_val, llvm_type);
+                LLVMBuildStore(g->builder, init_val, alloca);
+            }
         }
 
         local_add(locals, stmt->var_decl.name, alloca, type);
+        if (arc_own) locals->vars[locals->count - 1].arc_owned = 1;
         break;
     }
 
@@ -5594,6 +5938,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         if (stmt->ret.value) {
             LLVMValueRef val = emit_expr(g, stmt->ret.value, locals);
+            /* ARC: hand the caller an owned (+1) reference, then release our
+             * owning locals. Retaining a borrowed return value first keeps it
+             * alive when it aliases a local about to be released. */
+            if (expr_is_arc_object(g, stmt->ret.value, locals) &&
+                !expr_yields_owned_ref(stmt->ret.value)) {
+                emit_arc_retain(g, val);
+            }
+            emit_release_owned_locals(g, locals);
             /* convert return value to match function return type */
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
             LLVMTypeRef val_t = LLVMTypeOf(val);
@@ -5617,6 +5969,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             LLVMBuildRet(g->builder, val);
         } else {
+            emit_release_owned_locals(g, locals);
             LLVMBuildRetVoid(g->builder);
         }
         break;
@@ -5935,6 +6288,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     default:
         break;
     }
+
+    if (arc_nested) g->arc_stmt_depth--;
 }
 
 /* ---- top-level emission ---- */
@@ -5985,6 +6340,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     /* add return 0 if no terminator */
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+        emit_release_owned_locals(g, locals);
         LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
     }
     g->current_type_sym = NULL;
@@ -6483,12 +6839,18 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     val = LLVMBuildFPExt(g->builder, val, llvm_ret, "ext");
                 }
             }
+            if (ret_type && ret_type->kind == TYPE_CLASS &&
+                !expr_yields_owned_ref(member->method_decl.body)) {
+                emit_arc_retain(g, val);
+            }
+            emit_release_owned_locals(g, locals);
             LLVMBuildRet(g->builder, val);
         }
 
         /* ensure function has terminator */
         LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
         if (!LLVMGetBasicBlockTerminator(cur_bb)) {
+            emit_release_owned_locals(g, locals);
             if (ret_type->kind == TYPE_VOID) {
                 LLVMBuildRetVoid(g->builder);
             } else {
@@ -6609,23 +6971,31 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     LLVMInitializeWebAssemblyAsmParser();
     LLVMInitializeWebAssemblyAsmPrinter();
 
-    char *triple = LLVMGetDefaultTargetTriple();
+    char *triple;
+    if (g->target_triple[0]) {
+        /* Cross-compilation: emit for the requested target triple verbatim
+         * (e.g. x86_64-unknown-linux-musl). The X86/AArch64 backends produce
+         * the right object format (ELF/Mach-O/COFF) from the triple's OS. */
+        triple = LLVMCreateMessage(g->target_triple);
+    } else {
+        triple = LLVMGetDefaultTargetTriple();
 #ifdef _WIN32
-    /* Emit GNU-ABI (MinGW) objects so the produced code links against the
-     * bundled ld.lld + mingw-w64 runtime, keeping zanc self-contained: building
-     * an .exe needs only zan, no external clang / MSVC / Windows SDK. Preserve
-     * the host architecture prefix (e.g. x86_64) and swap the vendor/abi. */
-    {
-        const char *dash = strchr(triple, '-');
-        size_t archlen = dash ? (size_t)(dash - triple) : strlen(triple);
-        char gnu[128];
-        if (archlen > sizeof(gnu) - 20) archlen = sizeof(gnu) - 20;
-        memcpy(gnu, triple, archlen);
-        snprintf(gnu + archlen, sizeof(gnu) - archlen, "-w64-windows-gnu");
-        LLVMDisposeMessage(triple);
-        triple = LLVMCreateMessage(gnu);
-    }
+        /* Emit GNU-ABI (MinGW) objects so the produced code links against the
+         * bundled ld.lld + mingw-w64 runtime, keeping zanc self-contained:
+         * building an .exe needs only zan, no external clang / MSVC / Windows
+         * SDK. Preserve the host architecture prefix and swap the vendor/abi. */
+        {
+            const char *dash = strchr(triple, '-');
+            size_t archlen = dash ? (size_t)(dash - triple) : strlen(triple);
+            char gnu[128];
+            if (archlen > sizeof(gnu) - 20) archlen = sizeof(gnu) - 20;
+            memcpy(gnu, triple, archlen);
+            snprintf(gnu + archlen, sizeof(gnu) - archlen, "-w64-windows-gnu");
+            LLVMDisposeMessage(triple);
+            triple = LLVMCreateMessage(gnu);
+        }
 #endif
+    }
     LLVMTargetRef target;
     char *error = NULL;
 

@@ -22,8 +22,39 @@ class CodeEditor {
     int lastId;
 
     // ---- autocomplete popup state ----
-    List<string> acItems;   // current candidate list (filtered by prefix)
+    List<string> acItems;   // current candidate list (filtered by prefix + kind)
+    List<string> acAllItems; // candidates before the kind filter is applied
+    List<string> acAllKinds; // kind tag per acAllItems entry
+    string acFilter;        // "" = show all kinds; else a single kind letter
+    // Geometry of the popup's kind-filter strip (for click hit-testing).
+    int filtX;
+    int filtY;
+    int filtW;
+    int filtH;
     List<string> acFull;    // full unfiltered candidates (for dot-mode re-filter)
+    // CodeLens: clickable "N references" annotations (rebuilt each render).
+    List<int> clLine;
+    List<string> clName;
+    List<int> clX;
+    List<int> clY;
+    List<int> clW;
+    // Expandable reference list popup (opened by clicking a CodeLens count).
+    bool refPopOpen;
+    string refPopName;
+    List<int> refPopLines;
+    int refPopX;
+    int refPopY;
+    int refPopSel;
+    // Final clamped popup geometry from the last render, used for hit testing.
+    int refPopGX;
+    int refPopGY;
+    int refPopGW;
+    int refPopGH;
+    int refPopRowH;
+    int refPopHeadH;
+    int refPopShown;
+    // Set when a Ctrl+click asks the host to run Go to Definition.
+    bool gotoRequested;
     int acSel;              // selected candidate index
     bool acActive;          // popup currently shown
     int acStart;            // column where the in-progress word begins
@@ -43,6 +74,14 @@ class CodeEditor {
     bool selActive;
     int selAnchorLine;
     int selAnchorCol;
+    // True while the left button is held and dragging out a selection.
+    bool mouseSelecting;
+    // Number of fully visible text rows from the last Render (for Page Up/Down).
+    int pageRows;
+
+    // ---- multi-cursor (secondary carets, each on a distinct line) ----
+    List<int> mcLines;
+    List<int> mcCols;
 
     // ---- clipboard & undo ----
     string clipboard;
@@ -53,6 +92,19 @@ class CodeEditor {
     // ---- error diagnostics ----
     List<int> errorLines;
     List<string> errorMsgs;
+    int lastDiagLine;       // caret line at last CheckErrors run (-1 = never)
+
+    // ---- symbol index (accurate, using-aware completion) ----
+    // Types (class/struct/enum) declared across the project's other files, and
+    // for each, a space-separated list of its declared member names. Fed by the
+    // host IDE via SetProjectFiles() so `Utils.` completes with Utils's real
+    // members instead of guesswork. The current buffer is scanned on demand.
+    List<string> projTypeNames;
+    List<string> projTypeMembers;
+    // Missing-`using` quick-fix map: fixLines[i] is a line whose error can be
+    // resolved by inserting `using fixNs[i];`.
+    List<int> fixLines;
+    List<string> fixNs;
 
     // ---- debugging ----
     List<int> bps;
@@ -61,6 +113,12 @@ class CodeEditor {
     string hoverTip;        // current hover tooltip text
     int hoverTipX;
     int hoverTipY;
+
+    // Right-click context menu state.
+    bool ctxOpen;
+    int ctxX;
+    int ctxY;
+    string ctxCmd;          // command the host IDE must handle ("find"/"gotoline")
 
     static CodeEditor Create() {
         CodeEditor e = new CodeEditor();
@@ -71,7 +129,23 @@ class CodeEditor {
         e.scrollLine = 0;
         e.lastId = -1;
         e.acItems = new List<string>();
+        e.acAllItems = new List<string>();
+        e.acAllKinds = new List<string>();
+        e.acFilter = "";
+        e.filtX = 0; e.filtY = 0; e.filtW = 0; e.filtH = 0;
         e.acFull = new List<string>();
+        e.clLine = new List<int>();
+        e.clName = new List<string>();
+        e.clX = new List<int>();
+        e.clY = new List<int>();
+        e.clW = new List<int>();
+        e.refPopOpen = false;
+        e.refPopName = "";
+        e.refPopLines = new List<int>();
+        e.refPopX = 0; e.refPopY = 0; e.refPopSel = 0;
+        e.refPopGX = 0; e.refPopGY = 0; e.refPopGW = 0; e.refPopGH = 0;
+        e.refPopRowH = 0; e.refPopHeadH = 0; e.refPopShown = 0;
+        e.gotoRequested = false;
         e.acSel = 0;
         e.acActive = false;
         e.acStart = 0;
@@ -82,18 +156,31 @@ class CodeEditor {
         e.selActive = false;
         e.selAnchorLine = 0;
         e.selAnchorCol = 0;
+        e.mouseSelecting = false;
+        e.pageRows = 20;
+        e.mcLines = new List<int>();
+        e.mcCols = new List<int>();
         e.clipboard = "";
         e.undoStack = new List<string>();
         e.undoLines = new List<int>();
         e.undoCols = new List<int>();
         e.errorLines = new List<int>();
         e.errorMsgs = new List<string>();
+        e.lastDiagLine = -1;
+        e.projTypeNames = new List<string>();
+        e.projTypeMembers = new List<string>();
+        e.fixLines = new List<int>();
+        e.fixNs = new List<string>();
         e.bps = new List<int>();
         e.execLine = -1;
         e.dbgVars = new List<string>();
         e.hoverTip = "";
         e.hoverTipX = 0;
         e.hoverTipY = 0;
+        e.ctxOpen = false;
+        e.ctxX = 0;
+        e.ctxY = 0;
+        e.ctxCmd = "";
         return e;
     }
 
@@ -124,6 +211,7 @@ class CodeEditor {
         curLine = 0;
         curCol = 0;
         scrollLine = 0;
+        lastDiagLine = -1;  // force diagnostics to recompute for the new content
     }
 
     void LoadText(string s) {
@@ -147,6 +235,23 @@ class CodeEditor {
 
     int CurLine() { return curLine; }
     int CurCol() { return curCol; }
+
+    /// Returns the identifier under the caret (empty string when none).
+    string WordAtCaret() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string s = lines[curLine];
+        int col = curCol;
+        if (col >= s.Length) { col = s.Length - 1; }
+        if (col < 0) { return ""; }
+        return CodeEditor.WordAt(s, col);
+    }
+
+    /// Returns true once after a Ctrl+click requested Go to Definition,
+    /// clearing the flag so the host handles it exactly once.
+    bool ConsumeGotoRequest() {
+        if (gotoRequested) { gotoRequested = false; return true; }
+        return false;
+    }
 
     void SetDebugVars(List<string> vars) { dbgVars = vars; }
 
@@ -287,6 +392,88 @@ class CodeEditor {
 
     void ClearSelection() { selActive = false; }
 
+    /// Prepares selection state before a caret move: when `shift` is held the
+    /// anchor is planted at the current caret (if not already selecting) so the
+    /// move extends the selection; otherwise the selection is dropped.
+    void SelPrepare(bool shift) {
+        if (shift) {
+            if (!selActive) {
+                selAnchorLine = curLine;
+                selAnchorCol = curCol;
+                selActive = true;
+            }
+        } else {
+            selActive = false;
+        }
+    }
+
+    /// Places the caret from a mouse position (pixels) inside the text area.
+    void CaretFromMouse(App app, Rect area, int gutterW, int fontSize) {
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        int rel = app.mouseY - area.y;
+        int clicked = scrollLine + rel / (Canvas.FontHeight(fontSize) + app.Scale(4));
+        if (clicked >= lines.Count) { clicked = lines.Count - 1; }
+        if (clicked < 0) { clicked = 0; }
+        curLine = clicked;
+        curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+    }
+
+    // ---- multi-cursor ----
+    void ClearExtraCarets() { mcLines = new List<int>(); mcCols = new List<int>(); }
+
+    /// Adds a secondary caret one line below the lowest active caret.
+    void AddCaretBelow() {
+        int maxL = curLine;
+        int i = 0;
+        while (i < mcLines.Count) { if (mcLines[i] > maxL) { maxL = mcLines[i]; } i = i + 1; }
+        if (maxL + 1 < lines.Count) { mcLines.Add(maxL + 1); mcCols.Add(curCol); }
+    }
+
+    /// Adds a secondary caret one line above the highest active caret.
+    void AddCaretAbove() {
+        int minL = curLine;
+        int i = 0;
+        while (i < mcLines.Count) { if (mcLines[i] < minL) { minL = mcLines[i]; } i = i + 1; }
+        if (minL - 1 >= 0) { mcLines.Add(minL - 1); mcCols.Add(curCol); }
+    }
+
+    /// Inserts `ins` at the primary caret and every secondary caret.
+    /// All carets sit on distinct lines, so per-line edits stay independent.
+    void McInsertStr(string ins) {
+        InsertStr(ins);
+        int i = 0;
+        while (i < mcLines.Count) {
+            int L = mcLines[i];
+            if (L >= 0 && L < lines.Count) {
+                int C = mcCols[i];
+                if (C > lines[L].Length) { C = lines[L].Length; }
+                lines[L] = Text.InsertAt(lines[L], C, ins);
+                mcCols[i] = C + ins.Length;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Backspace at every caret. Collapses to a single caret when the primary
+    /// caret is at column 0 (which would merge lines and shift indices).
+    void McBackspace() {
+        if (curCol <= 0) { ClearExtraCarets(); SaveUndo(); BackspaceEdit(); return; }
+        SaveUndo();
+        string ln = lines[curLine];
+        lines[curLine] = Text.RemoveAt(ln, curCol - 1);
+        curCol = curCol - 1;
+        int i = 0;
+        while (i < mcLines.Count) {
+            int L = mcLines[i];
+            int C = mcCols[i];
+            if (L >= 0 && L < lines.Count && C > 0) {
+                lines[L] = Text.RemoveAt(lines[L], C - 1);
+                mcCols[i] = C - 1;
+            }
+            i = i + 1;
+        }
+    }
+
     void StartSelection() {
         if (!selActive) {
             selAnchorLine = curLine;
@@ -364,15 +551,21 @@ class CodeEditor {
     void CopySelection() {
         if (!selActive) { return; }
         clipboard = GetSelectedText();
+        Clipboard.SetText(clipboard);
     }
 
     void CutSelection() {
         if (!selActive) { return; }
         clipboard = GetSelectedText();
+        Clipboard.SetText(clipboard);
         DeleteSelection();
     }
 
     void PasteClipboard() {
+        // Prefer the OS clipboard so text copied in other apps pastes here;
+        // fall back to the in-editor buffer when the OS clipboard has no text.
+        string os = Clipboard.GetText();
+        if (os.Length > 0) { clipboard = os; }
         if (clipboard.Length == 0) { return; }
         if (selActive) { DeleteSelection(); }
         else { SaveUndo(); }
@@ -397,6 +590,263 @@ class CodeEditor {
             lines.Insert(curLine + lastIdx, lastP + right);
             curLine = curLine + lastIdx;
             curCol = lastP.Length;
+        }
+    }
+
+    // ---- line editing (context-menu / VS-style commands) ----
+
+    /// Deletes the active selection, or the character at the caret otherwise.
+    void DeleteAtCaret() {
+        if (selActive) { DeleteSelection(); }
+        else { SaveUndo(); DeleteEdit(); }
+    }
+
+    /// Toggles a leading "// " line comment on the current line, or on every
+    /// line spanned by the selection.
+    void ToggleComment() {
+        SaveUndo();
+        int a = curLine;
+        int b = curLine;
+        if (selActive) {
+            a = selAnchorLine;
+            b = curLine;
+            if (a > b) { int tmp = a; a = b; b = tmp; }
+        }
+        // If every line in range is already commented, uncomment; else comment.
+        bool allComment = true;
+        int i = a;
+        while (i <= b) {
+            string s = lines[i];
+            string trimmed = CodeEditor.LTrim(s);
+            if (trimmed.Length < 2 || trimmed.Substring(0, 2) != "//") {
+                if (trimmed.Length > 0) { allComment = false; }
+            }
+            i = i + 1;
+        }
+        i = a;
+        while (i <= b) {
+            string s = lines[i];
+            if (allComment) {
+                lines[i] = CodeEditor.Uncomment(s);
+            } else {
+                if (CodeEditor.LTrim(s).Length > 0) {
+                    lines[i] = "// " + s;
+                }
+            }
+            i = i + 1;
+        }
+        selActive = false;
+        ClampCol();
+    }
+
+    /// Duplicates the current line directly below it.
+    void DuplicateLine() {
+        SaveUndo();
+        string s = lines[curLine];
+        lines.Insert(curLine + 1, s);
+        curLine = curLine + 1;
+        ClampCol();
+    }
+
+    /// Removes the current line entirely.
+    void DeleteLine() {
+        SaveUndo();
+        if (lines.Count <= 1) {
+            lines[0] = "";
+            curLine = 0;
+            curCol = 0;
+            return;
+        }
+        lines.RemoveAt(curLine);
+        if (curLine >= lines.Count) { curLine = lines.Count - 1; }
+        ClampCol();
+    }
+
+    static string LTrim(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") { i = i + 1; }
+            else { break; }
+        }
+        return s.Substring(i, s.Length - i);
+    }
+
+    /// Removes the first "// " (or "//") after leading whitespace.
+    static string Uncomment(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") { i = i + 1; }
+            else { break; }
+        }
+        string lead = s.Substring(0, i);
+        string rest = s.Substring(i, s.Length - i);
+        if (rest.Length >= 2 && rest.Substring(0, 2) == "//") {
+            rest = rest.Substring(2, rest.Length - 2);
+            if (rest.Length >= 1 && rest.Substring(0, 1) == " ") {
+                rest = rest.Substring(1, rest.Length - 1);
+            }
+        }
+        return lead + rest;
+    }
+
+    /// Returns and clears any pending host command requested from the context
+    /// menu (e.g. "find", "gotoline"); empty string when none.
+    string TakeCommand() {
+        string cmd = ctxCmd;
+        ctxCmd = "";
+        return cmd;
+    }
+
+    /// Fills the parallel label / shortcut / action lists for the context menu.
+    /// Action 0 marks a separator row.
+    static void BuildCtxMenu(List<string> labels, List<string> keys, List<int> acts) {
+        labels.Add("Cut"); keys.Add("Ctrl+X"); acts.Add(1);
+        labels.Add("Copy"); keys.Add("Ctrl+C"); acts.Add(2);
+        labels.Add("Paste"); keys.Add("Ctrl+V"); acts.Add(3);
+        labels.Add("Delete"); keys.Add("Del"); acts.Add(4);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add("Select All"); keys.Add("Ctrl+A"); acts.Add(5);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add("Toggle Comment"); keys.Add("Ctrl+/"); acts.Add(6);
+        labels.Add("Duplicate Line"); keys.Add("Ctrl+D"); acts.Add(7);
+        labels.Add("Delete Line"); keys.Add("Ctrl+L"); acts.Add(8);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add("Add Cursor Above"); keys.Add("Ctrl+Alt+Up"); acts.Add(13);
+        labels.Add("Add Cursor Below"); keys.Add("Ctrl+Alt+Down"); acts.Add(14);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add("Go to Definition"); keys.Add("F12"); acts.Add(11);
+        labels.Add("Find All References"); keys.Add("Shift+F12"); acts.Add(12);
+        labels.Add(""); keys.Add(""); acts.Add(0);
+        labels.Add("Find..."); keys.Add("Ctrl+F"); acts.Add(9);
+        labels.Add("Go to Line..."); keys.Add("Ctrl+G"); acts.Add(10);
+    }
+
+    /// Runs a context-menu action by id (see BuildCtxMenu).
+    void RunCtxAction(App app, int act) {
+        if (act == 1) { CutSelection(); CheckErrors(); }
+        else if (act == 2) { CopySelection(); }
+        else if (act == 3) { PasteClipboard(); CheckErrors(); UpdateCompletion(); }
+        else if (act == 4) { DeleteAtCaret(); CheckErrors(); }
+        else if (act == 5) { SelectAll(); }
+        else if (act == 6) { ToggleComment(); CheckErrors(); }
+        else if (act == 7) { DuplicateLine(); CheckErrors(); }
+        else if (act == 8) { DeleteLine(); CheckErrors(); }
+        else if (act == 9) { ctxCmd = "find"; }
+        else if (act == 10) { ctxCmd = "gotoline"; }
+        else if (act == 11) { ctxCmd = "gotodef"; }
+        else if (act == 12) { ctxCmd = "findrefs"; }
+        else if (act == 13) { AddCaretAbove(); }
+        else if (act == 14) { AddCaretBelow(); }
+        else if (act == 20) { ApplyQuickFix(); }
+        ctxOpen = false;
+        app.RequestRedraw();
+    }
+
+    bool CtxMenuOpen() { return ctxOpen; }
+
+    /// Draws the context menu as a top-level overlay (clamped to the whole
+    /// window, not the editor rect) and handles item clicks. Must be called at
+    /// the very end of the frame so nothing paints over it.
+    void RenderCtxMenu(App app) {
+        if (!ctxOpen) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fontSize = t.fontSizeMedium;
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+
+        List<string> mLabels = new List<string>();
+        List<string> mKeys = new List<string>();
+        List<int> mActs = new List<int>();
+        CodeEditor.BuildCtxMenu(mLabels, mKeys, mActs);
+        // Quick-fix: offer to insert a missing `using` when the caret line uses
+        // a stdlib type whose namespace has not been imported.
+        string qfNs = QuickFixNs();
+        if (qfNs.Length > 0) {
+            mLabels.Insert(0, ""); mKeys.Insert(0, ""); mActs.Insert(0, 0);
+            mLabels.Insert(0, "Add using " + qfNs + ";"); mKeys.Insert(0, "Ctrl+."); mActs.Insert(0, 20);
+        }
+        int itemH = lineH;
+        int sepH = app.Scale(7);
+        int mW = app.Scale(150);
+        int wi = 0;
+        while (wi < mLabels.Count) {
+            if (mActs[wi] != 0) {
+                int lw = Canvas.MeasureText(mLabels[wi], fontSize)
+                         + Canvas.MeasureText(mKeys[wi], fontSize) + app.Scale(44);
+                if (lw > mW) { mW = lw; }
+            }
+            wi = wi + 1;
+        }
+        int mH = app.Scale(6);
+        int hi = 0;
+        while (hi < mActs.Count) {
+            if (mActs[hi] == 0) { mH = mH + sepH; } else { mH = mH + itemH; }
+            hi = hi + 1;
+        }
+
+        int winW = c.Width();
+        int winH = c.Height();
+        int topB = app.titlebarH;
+        int mX = ctxX;
+        int mY = ctxY;
+        if (mX + mW > winW) { mX = winW - mW - app.Scale(4); }
+        if (mY + mH > winH) { mY = winH - mH - app.Scale(4); }
+        if (mX < 0) { mX = 0; }
+        if (mY < topB) { mY = topB; }
+
+        c.FillRoundRect(mX + 2, mY + 2, mW, mH, app.Scale(4), 0x50000000);
+        c.FillRoundRect(mX, mY, mW, mH, app.Scale(4), 0xFF252526);
+        c.DrawRect(mX, mY, mW, mH, 0xFF3E3E42, 1);
+
+        int ry = mY + app.Scale(3);
+        int ri = 0;
+        while (ri < mActs.Count) {
+            if (mActs[ri] == 0) {
+                c.FillRect(mX + app.Scale(6), ry + sepH / 2, mW - app.Scale(12), 1, 0xFF3E3E42);
+                ry = ry + sepH;
+            } else {
+                bool hov = app.mouseX >= mX && app.mouseX < mX + mW
+                           && app.mouseY >= ry && app.mouseY < ry + itemH;
+                int tcol = 0xFFD4D4D4;
+                if (hov) {
+                    c.FillRect(mX + app.Scale(2), ry, mW - app.Scale(4), itemH, 0xFF094771);
+                    tcol = 0xFFFFFFFF;
+                }
+                int ty = ry + (itemH - Canvas.FontHeight(fontSize)) / 2;
+                c.DrawText(mX + app.Scale(12), ty, mLabels[ri], tcol, fontSize);
+                int kw = Canvas.MeasureText(mKeys[ri], fontSize);
+                c.DrawText(mX + mW - kw - app.Scale(10), ty, mKeys[ri], 0xFF808080, fontSize);
+                ry = ry + itemH;
+            }
+            ri = ri + 1;
+        }
+
+        // Left-click selects an item or dismisses the menu.
+        if (app.window.EventKind() == 3 && app.window.EventButton() == 0) {
+            bool inside = app.mouseX >= mX && app.mouseX < mX + mW
+                          && app.mouseY >= mY && app.mouseY < mY + mH;
+            if (inside) {
+                int cy2 = mY + app.Scale(3);
+                int ci = 0;
+                int chosen = 0 - 1;
+                while (ci < mActs.Count) {
+                    int rh = itemH;
+                    if (mActs[ci] == 0) { rh = sepH; }
+                    if (mActs[ci] != 0 && app.mouseY >= cy2 && app.mouseY < cy2 + rh) {
+                        chosen = mActs[ci];
+                    }
+                    cy2 = cy2 + rh;
+                    ci = ci + 1;
+                }
+                if (chosen >= 0) { RunCtxAction(app, chosen); }
+            } else {
+                ctxOpen = false;
+                app.RequestRedraw();
+            }
         }
     }
 
@@ -440,21 +890,63 @@ class CodeEditor {
                     errorMsgs.Add("Unexpected ')'");
                     parenDepth = 0;
                 }
-                // Check for missing semicolon on statement lines
-                if (tr.Length > 2) {
+                // Check for a missing semicolon / stray statement. A code line
+                // must terminate in ';' '{' '}' etc.; a line that ends on an
+                // identifier or literal (e.g. `Utils.Equals`) is flagged.
+                if (tr.Length >= 1) {
                     string lastCh = tr.Substring(tr.Length - 1, 1);
                     string firstCh = tr.Substring(0, 1);
                     bool needsSemi = true;
-                    if (lastCh == "{" || lastCh == "}" || lastCh == ";" || lastCh == ",") { needsSemi = false; }
-                    if (firstCh == "/" || firstCh == "*" || firstCh == "#") { needsSemi = false; }
-                    if (CodeEditor.StartsWithP(tr, "using ") && lastCh != ";") {
+                    // Terminators / continuation characters that make a line OK as-is
+                    // (ends a block, a statement, or clearly continues onto the next).
+                    string endOk = "{};,:.([+-*/=<>&|?)!%^~";
+                    if (CodeEditor.InSet(endOk, lastCh)) { needsSemi = false; }
+                    if (firstCh == "/" || firstCh == "*" || firstCh == "#" || firstCh == "@") { needsSemi = false; }
+                    // Control / declaration headers that legitimately stand without ';'.
+                    if (CodeEditor.StartsWithP(tr, "class ") || CodeEditor.StartsWithP(tr, "struct ")
+                        || CodeEditor.StartsWithP(tr, "if ") || CodeEditor.StartsWithP(tr, "if(")
+                        || CodeEditor.StartsWithP(tr, "else") || CodeEditor.StartsWithP(tr, "while")
+                        || CodeEditor.StartsWithP(tr, "for") || CodeEditor.StartsWithP(tr, "foreach")
+                        || CodeEditor.StartsWithP(tr, "switch") || CodeEditor.StartsWithP(tr, "case ")
+                        || CodeEditor.StartsWithP(tr, "default") || CodeEditor.StartsWithP(tr, "do")
+                        || CodeEditor.StartsWithP(tr, "try") || CodeEditor.StartsWithP(tr, "catch")
+                        || CodeEditor.StartsWithP(tr, "finally") || CodeEditor.StartsWithP(tr, "namespace")
+                        || CodeEditor.StartsWithP(tr, "enum") || CodeEditor.StartsWithP(tr, "interface")
+                        || CodeEditor.StartsWithP(tr, "public") || CodeEditor.StartsWithP(tr, "private")
+                        || CodeEditor.StartsWithP(tr, "protected") || CodeEditor.StartsWithP(tr, "internal")
+                        || CodeEditor.StartsWithP(tr, "static") || CodeEditor.StartsWithP(tr, "void ")
+                        || CodeEditor.StartsWithP(tr, "abstract") || CodeEditor.StartsWithP(tr, "override")
+                        || CodeEditor.StartsWithP(tr, "virtual")) { needsSemi = false; }
+                    // Never flag the line the caret is currently on: it is
+                    // expected to be incomplete while the user is typing it.
+                    if (li == curLine) { needsSemi = false; }
+                    if (li != curLine && CodeEditor.StartsWithP(tr, "using ") && lastCh != ";") {
                         errorLines.Add(li);
                         errorMsgs.Add("Missing ';' after using");
+                        needsSemi = false;
                     }
-                    if (CodeEditor.StartsWithP(tr, "class ") || CodeEditor.StartsWithP(tr, "struct ")) { needsSemi = false; }
-                    if (CodeEditor.StartsWithP(tr, "if ") || CodeEditor.StartsWithP(tr, "if(")) { needsSemi = false; }
-                    if (CodeEditor.StartsWithP(tr, "else") || CodeEditor.StartsWithP(tr, "while") || CodeEditor.StartsWithP(tr, "for")) { needsSemi = false; }
-                    if (CodeEditor.StartsWithP(tr, "namespace") || CodeEditor.StartsWithP(tr, "static void") || CodeEditor.StartsWithP(tr, "void ")) { needsSemi = false; }
+                    // A following line that starts with a joining character means
+                    // this line is part of a multi-line expression (fluent chain,
+                    // continued operator) — don't flag it.
+                    if (needsSemi) {
+                        string nxt = "";
+                        int nj = li + 1;
+                        while (nj < lines.Count) {
+                            string ns = CodeEditor.LTrim(lines[nj]);
+                            if (ns.Length > 0 && ns.Substring(0, 1) != "/" && ns.Substring(0, 1) != "*") {
+                                nxt = ns; break;
+                            }
+                            nj = nj + 1;
+                        }
+                        if (nxt.Length > 0) {
+                            string joinSet = ".)+-*/=<>&|?:,]}";
+                            if (CodeEditor.InSet(joinSet, nxt.Substring(0, 1))) { needsSemi = false; }
+                        }
+                    }
+                    if (needsSemi) {
+                        errorLines.Add(li);
+                        errorMsgs.Add("Missing ';' (or incomplete statement)");
+                    }
                 }
             }
             li = li + 1;
@@ -467,6 +959,8 @@ class CodeEditor {
             errorLines.Add(lines.Count - 1);
             errorMsgs.Add("Missing closing ')'");
         }
+        // Flag stdlib types used without the required `using` import.
+        AnalyzeMissingUsings();
     }
 
     // ---- autocomplete ----
@@ -489,7 +983,7 @@ class CodeEditor {
 
     /// Appends the language keywords to `outk`.
     static void KeywordList(List<string> outk) {
-        string kws = "using namespace class struct enum interface static void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
+        string kws = "using namespace class struct enum interface static extern void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
         string cur = "";
         int i = 0;
         int n = kws.Length;
@@ -556,6 +1050,42 @@ class CodeEditor {
         }
     }
 
+    /// Rebuilds the visible acItems/acKinds from acAllItems/acAllKinds by
+    /// applying the current kind filter, then updates popup active state.
+    void ApplyKindFilter() {
+        acItems = new List<string>();
+        acKinds = new List<string>();
+        int i = 0;
+        while (i < acAllItems.Count) {
+            string k = "";
+            if (i < acAllKinds.Count) { k = acAllKinds[i]; }
+            if (acFilter == "" || acFilter == k) {
+                acItems.Add(acAllItems[i]);
+                acKinds.Add(k);
+            }
+            i = i + 1;
+        }
+        if (acAllItems.Count > 0) {
+            acActive = true;
+            if (acSel >= acItems.Count) { acSel = acItems.Count - 1; }
+            if (acSel < 0) { acSel = 0; }
+        } else {
+            acActive = false;
+            acFilter = "";
+        }
+    }
+
+    /// True when the unfiltered candidate list contains at least one item of
+    /// the given kind (used to gray out unavailable filter buttons).
+    bool HasKind(string kind) {
+        int i = 0;
+        while (i < acAllKinds.Count) {
+            if (acAllKinds[i] == kind) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     /// Recomputes the completion popup from the word immediately left of the
     /// cursor; closes the popup when there is no prefix or no candidate.
     void UpdateCompletion() {
@@ -564,28 +1094,21 @@ class CodeEditor {
 
         // If in dot-mode, filter the full member list by the typed prefix
         if (acDot) {
+            if (acStart > curCol || acStart < 0) { acActive = false; acDot = false; return; }
             string prefix = ln.Substring(acStart, curCol - acStart);
-            acItems = new List<string>();
-            acKinds = new List<string>();
-            if (prefix.Length == 0) {
-                int fi = 0;
-                while (fi < acFull.Count) {
-                    acItems.Add(acFull[fi]);
-                    acKinds.Add("M");
-                    fi = fi + 1;
+            acAllItems = new List<string>();
+            acAllKinds = new List<string>();
+            int fi = 0;
+            while (fi < acFull.Count) {
+                if (prefix.Length == 0 || CodeEditor.StartsWithI(acFull[fi], prefix)) {
+                    acAllItems.Add(acFull[fi]);
+                    acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
                 }
-            } else {
-                int fi = 0;
-                while (fi < acFull.Count) {
-                    if (CodeEditor.StartsWithI(acFull[fi], prefix)) {
-                        acItems.Add(acFull[fi]);
-                        acKinds.Add("M");
-                    }
-                    fi = fi + 1;
-                }
+                fi = fi + 1;
             }
-            if (acItems.Count > 0) { acActive = true; acSel = 0; }
-            else { acActive = false; acDot = false; }
+            if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+            acSel = 0;
+            ApplyKindFilter();
             return;
         }
 
@@ -598,28 +1121,248 @@ class CodeEditor {
         }
         acStart = st;
         string pfx = ln.Substring(st, curCol - st);
-        acItems = new List<string>();
         if (pfx.Length < 1) { acActive = false; return; }
 
         List<string> cand = new List<string>();
         List<string> candKinds = new List<string>();
-        CodeEditor.KeywordListK(cand, candKinds);
-        CodeEditor.StdlibListK(cand, candKinds);
-        CodeEditor.CollectWordsK(lines, cand, candKinds);
-        acKinds = new List<string>();
+        if (InAttributeContext()) {
+            // Inside `[ ... ]`: only real attributes exist here. The compiler
+            // recognizes exactly DllImport and StructLayout (see parser.c).
+            CodeEditor.AddKindWords(cand, candKinds, "DllImport StructLayout", "M");
+        } else {
+            CodeEditor.SnippetListK(cand, candKinds);
+            CodeEditor.KeywordListK(cand, candKinds);
+            AddStdlibCandidates(cand, candKinds);
+            AddProjectCandidates(cand, candKinds);
+            CodeEditor.CollectWordsK(lines, cand, candKinds);
+        }
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
         int i = 0;
         while (i < cand.Count) {
             string w = cand[i];
-            if (w != pfx && CodeEditor.StartsWithI(w, pfx) && !CodeEditor.Has(acItems, w)) {
-                acItems.Add(w);
-                if (i < candKinds.Count) { acKinds.Add(candKinds[i]); }
-                else { acKinds.Add("W"); }
-                if (acItems.Count >= 20) { i = cand.Count; }
+            if (w != pfx && CodeEditor.StartsWithI(w, pfx) && !CodeEditor.Has(acAllItems, w)) {
+                acAllItems.Add(w);
+                if (i < candKinds.Count) { acAllKinds.Add(candKinds[i]); }
+                else { acAllKinds.Add("W"); }
+                if (acAllItems.Count >= 40) { i = cand.Count; }
             }
             i = i + 1;
         }
-        if (acItems.Count > 0) { acActive = true; acSel = 0; }
-        else { acActive = false; }
+        if (acAllItems.Count == 0) { acActive = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// Heuristic kind tag for a member name: camelCase → field, known nouns →
+    /// property, *Changed/*Click → event, otherwise method.
+    static string MemberKind(string name) {
+        if (name.Length == 0) { return "M"; }
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        if (CodeEditor.InSet(lower, name.Substring(0, 1))) { return "F"; }
+        if (CodeEditor.Find(name, "Changed") >= 0 || CodeEditor.Find(name, "Click") >= 0) { return "E"; }
+        string props = " Count Length Keys Values Now Today UtcNow Year Month Day Hour Minute Second DayOfWeek DayOfYear Ticks PI E Capacity Empty Chars ForegroundColor BackgroundColor ResetColor Title WindowWidth WindowHeight ExitCode HasExited Id ProcessName StandardOutput StandardError StandardInput NewLine MachineName UserName OSVersion ProcessorCount TickCount StackTrace CommandLine CurrentDirectory Is64BitOperatingSystem DirectorySeparatorChar AltDirectorySeparatorChar ";
+        if (CodeEditor.Find(props, " " + name + " ") >= 0) { return "P"; }
+        return "M";
+    }
+
+    /// True when `w` is a control-flow keyword that looks like a call.
+    static bool IsControlWord(string w) {
+        string ctrl = " if for while switch catch foreach using lock return sizeof typeof new ";
+        return CodeEditor.Find(ctrl, " " + w + " ") >= 0;
+    }
+
+    /// If `line` is a method/function declaration, returns the method name;
+    /// otherwise returns "". Heuristic: an identifier followed by '(' whose
+    /// line ends with '{' and is not a control statement.
+    static string DeclNameAt(string line) {
+        string trimmed = CodeEditor.TrimStr(line);
+        if (trimmed.Length == 0) { return ""; }
+        // Must contain a '(' and end with '{' (opening brace on same line).
+        int paren = CodeEditor.Find(trimmed, "(");
+        if (paren <= 0) { return ""; }
+        if (trimmed.Substring(trimmed.Length - 1, 1) != "{") { return ""; }
+        // Reject obvious non-decls.
+        if (CodeEditor.Find(trimmed, "=") >= 0 && CodeEditor.Find(trimmed, "==") < 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int e = paren;
+        while (e > 0) {
+            string ch = trimmed.Substring(e - 1, 1);
+            if (CodeEditor.InSet(idset, ch)) { e = e - 1; }
+            else { break; }
+        }
+        string name = trimmed.Substring(e, paren - e);
+        if (name.Length == 0) { return ""; }
+        // A declaration has a return type / modifier before the name.
+        if (e == 0) { return ""; }
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        return name;
+    }
+
+    /// Counts whole-word occurrences of `name` across all lines.
+    int CountWord(string name) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int total = 0;
+        int li = 0;
+        while (li < lines.Count) {
+            string s = lines[li];
+            int from = 0;
+            while (true) {
+                int p = CodeEditor.FindFrom(s, name, from);
+                if (p < 0) { break; }
+                bool lok = true;
+                bool rok = true;
+                if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+                int rp = p + name.Length;
+                if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+                if (lok && rok) { total = total + 1; }
+                from = p + name.Length;
+            }
+            li = li + 1;
+        }
+        return total;
+    }
+
+    /// Moves the caret to the next whole-word reference of `name` after
+    /// `declLine` (wrapping around), skipping the declaration line itself, and
+    /// selects it. Does nothing when no other reference exists.
+    void JumpToNextRef(string name, int declLine) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int total = lines.Count;
+        int scanned = 0;
+        int li = declLine + 1;
+        while (scanned < total) {
+            if (li >= lines.Count) { li = 0; }
+            if (li != declLine) {
+                string s = lines[li];
+                int from = 0;
+                while (true) {
+                    int p = CodeEditor.FindFrom(s, name, from);
+                    if (p < 0) { break; }
+                    bool lok = true;
+                    bool rok = true;
+                    if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+                    int rp = p + name.Length;
+                    if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+                    if (lok && rok) {
+                        ClearExtraCarets();
+                        selActive = true;
+                        selAnchorLine = li; selAnchorCol = p;
+                        curLine = li; curCol = p + name.Length;
+                        return;
+                    }
+                    from = p + name.Length;
+                }
+            }
+            li = li + 1;
+            scanned = scanned + 1;
+        }
+    }
+
+    /// Collects every line index (excluding `declLine`) that contains a
+    /// whole-word reference of `name`, in file order, into `outLines`.
+    void CollectRefs(string name, int declLine, List<int> outLines) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < lines.Count) {
+            if (li != declLine) {
+                string s = lines[li];
+                int from = 0;
+                bool found = false;
+                while (!found) {
+                    int p = CodeEditor.FindFrom(s, name, from);
+                    if (p < 0) { break; }
+                    bool lok = true;
+                    bool rok = true;
+                    if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+                    int rp = p + name.Length;
+                    if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+                    if (lok && rok) { outLines.Add(li); found = true; }
+                    from = p + name.Length;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// Moves the caret to the first whole-word reference of `name` on `targetLine`
+    /// and selects it (used by the reference-list popup).
+    void JumpToRefLine(string name, int targetLine) {
+        if (targetLine < 0 || targetLine >= lines.Count) { return; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string s = lines[targetLine];
+        int from = 0;
+        while (true) {
+            int p = CodeEditor.FindFrom(s, name, from);
+            if (p < 0) { break; }
+            bool lok = true;
+            bool rok = true;
+            if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+            int rp = p + name.Length;
+            if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+            if (lok && rok) {
+                ClearExtraCarets();
+                selActive = true;
+                selAnchorLine = targetLine; selAnchorCol = p;
+                curLine = targetLine; curCol = p + name.Length;
+                if (curLine < scrollLine || curLine >= scrollLine + 4) {
+                    scrollLine = curLine - 4;
+                    if (scrollLine < 0) { scrollLine = 0; }
+                }
+                return;
+            }
+            from = p + name.Length;
+        }
+    }
+
+    /// First index of `sub` in `s` at or after `start`, or -1.
+    static int FindFrom(string s, string sub, int start) {
+        if (sub.Length == 0) { return start; }
+        int limit = s.Length - sub.Length;
+        int i = start;
+        if (i < 0) { i = 0; }
+        while (i <= limit) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Trims leading/trailing spaces and tabs from `s`.
+    static string TrimStr(string s) {
+        int a = 0;
+        while (a < s.Length) {
+            string ch = s.Substring(a, 1);
+            if (ch == " " || ch == "\t") { a = a + 1; }
+            else { break; }
+        }
+        int b = s.Length;
+        while (b > a) {
+            string ch = s.Substring(b - 1, 1);
+            if (ch == " " || ch == "\t" || ch == "\r") { b = b - 1; }
+            else { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    /// Returns the identifier under the mouse pointer, or "" if none.
+    string WordAtMouse(App app, Rect area, int gutterW, int fontSize) {
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        if (app.mouseX < textX || app.mouseX >= area.x + area.width) { return ""; }
+        if (app.mouseY < area.y || app.mouseY >= area.y + area.height) { return ""; }
+        int rel = app.mouseY - area.y;
+        int ln = scrollLine + rel / (Canvas.FontHeight(fontSize) + app.Scale(4));
+        if (ln < 0 || ln >= lines.Count) { return ""; }
+        string s = lines[ln];
+        int col = CodeEditor.ColFromX(s, app.mouseX - textX, fontSize);
+        if (col < 0 || col > s.Length) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int a = col;
+        while (a > 0 && CodeEditor.InSet(idset, s.Substring(a - 1, 1))) { a = a - 1; }
+        int b = col;
+        while (b < s.Length && CodeEditor.InSet(idset, s.Substring(b, 1))) { b = b + 1; }
+        if (b <= a) { return ""; }
+        return s.Substring(a, b - a);
     }
 
     static void KeywordListK(List<string> outk, List<string> kinds) {
@@ -698,18 +1441,23 @@ class CodeEditor {
         return true;
     }
 
-    /// Replaces the in-progress word with the selected candidate.
-    void AcceptCompletion() {
+    /// Replaces the in-progress word with the selected candidate. When `viaTab`
+    /// is true and the candidate is a code snippet, its template is expanded.
+    void AcceptCompletion(bool viaTab) {
         if (!acActive) { return; }
         if (acSel < 0 || acSel >= acItems.Count) { acActive = false; return; }
         string ln = lines[curLine];
         string chosen = acItems[acSel];
+        string chosenKind = "";
+        if (acSel < acKinds.Count) { chosenKind = acKinds[acSel]; }
+        if (viaTab && chosenKind == "S") { SaveUndo(); ExpandSnippet(chosen); return; }
         string left = Text.Left(ln, acStart);
         string right = Text.Right(ln, curCol);
         lines[curLine] = left + chosen + right;
         curCol = acStart + chosen.Length;
         acActive = false;
         acDot = false;
+        acFilter = "";
     }
 
     /// Triggered when user types '.'. Looks at the word before the dot and
@@ -718,6 +1466,12 @@ class CodeEditor {
         string ln = lines[curLine];
         int dotPos = curCol - 1;
         if (dotPos < 0) { acActive = false; return; }
+
+        // On a `using X.` directive, complete child namespaces, not members.
+        if (CodeEditor.StartsWithP(CodeEditor.TrimStr(ln), "using ")) {
+            UsingDotCompletion();
+            return;
+        }
 
         // Walk backwards through the chain: skip matched parens and identifiers
         string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
@@ -760,58 +1514,129 @@ class CodeEditor {
         acFull = new List<string>();
         acDot = true;
 
-        // Known static types
-        if (owner == "Console" || lastWord == "Console") {
-            CodeEditor.AddMembers(acFull, "Console");
-        } else if (owner == "Math" || lastWord == "Math") {
-            CodeEditor.AddMembers(acFull, "Math");
-        } else if (owner == "File" || lastWord == "File") {
-            CodeEditor.AddMembers(acFull, "File");
-        } else if (owner == "Directory" || lastWord == "Directory") {
-            CodeEditor.AddMembers(acFull, "Directory");
-        } else if (owner == "Path" || lastWord == "Path") {
-            CodeEditor.AddMembers(acFull, "Path");
-        } else if (owner == "Convert" || lastWord == "Convert") {
-            CodeEditor.AddMembers(acFull, "Convert");
-        } else if (owner == "Environment" || lastWord == "Environment") {
-            CodeEditor.AddMembers(acFull, "Environment");
-        } else if (owner == "string" || lastWord == "string" || owner == "String" || lastWord == "String") {
-            CodeEditor.AddMembers(acFull, "string");
-        } else if (owner == "List" || lastWord == "List") {
-            CodeEditor.AddMembers(acFull, "List");
-        } else if (owner == "Dictionary" || lastWord == "Dictionary") {
-            CodeEditor.AddMembers(acFull, "Dictionary");
-        } else if (owner == "StringBuilder" || lastWord == "StringBuilder") {
-            CodeEditor.AddMembers(acFull, "StringBuilder");
-        } else if (owner == "DateTime" || lastWord == "DateTime") {
-            CodeEditor.AddMembers(acFull, "DateTime");
-        } else if (owner == "Array" || lastWord == "Array") {
-            CodeEditor.AddMembers(acFull, "Array");
-        } else if (owner == "Process" || lastWord == "Process") {
-            CodeEditor.AddMembers(acFull, "Process");
-        } else if (owner == "App" || lastWord == "App") {
-            CodeEditor.AddMembers(acFull, "App");
-        } else if (owner == "Canvas" || lastWord == "Canvas") {
-            CodeEditor.AddMembers(acFull, "Canvas");
-        } else if (owner == "Theme" || lastWord == "Theme") {
-            CodeEditor.AddMembers(acFull, "Theme");
-        } else if (owner == "Window" || lastWord == "Window") {
-            CodeEditor.AddMembers(acFull, "Window");
+        // Resolve the receiver's type, then list ONLY that type's real members.
+        // Priority: hardcoded stdlib static types -> user/project type -> the
+        // declared type of a local variable -> universal object members. We
+        // never dump speculative string/collection/LINQ helpers for a receiver
+        // we cannot resolve (that produced bogus `Utils.OrderByDescending`).
+        string recv = lastWord;
+        if (recv.Length == 0) { recv = owner; }
+        string norm = CodeEditor.NormalizeStdlibType(recv);
+        if (CodeEditor.IsKnownStdlibType(norm)) {
+            CodeEditor.AddMembers(acFull, norm);
+            if (CodeEditor.IsCollectionType(norm) && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
         } else {
-            // Unknown type - show all common instance members + LINQ chain methods
-            CodeEditor.AddMembers(acFull, "_instance");
+            List<string> mem = new List<string>();
+            bool found = FindTypeMembers(recv, mem);
+            bool coll = false;
+            if (!found) {
+                string vt = ResolveVarType(recv);
+                if (vt.Length > 0) {
+                    string nvt = CodeEditor.NormalizeStdlibType(vt);
+                    if (CodeEditor.IsKnownStdlibType(nvt)) {
+                        CodeEditor.AddMembers(acFull, nvt);
+                        found = true;
+                        if (CodeEditor.IsCollectionType(nvt)) { coll = true; }
+                    } else if (FindTypeMembers(vt, mem)) {
+                        found = true;
+                    }
+                }
+            }
+            if (found) {
+                int mi = 0;
+                while (mi < mem.Count) {
+                    if (!CodeEditor.Has(acFull, mem[mi])) { acFull.Add(mem[mi]); }
+                    mi = mi + 1;
+                }
+                if (coll && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
+                // Universal members every object inherits.
+                if (!CodeEditor.Has(acFull, "ToString")) { acFull.Add("ToString"); }
+                if (!CodeEditor.Has(acFull, "Equals")) { acFull.Add("Equals"); }
+                if (!CodeEditor.Has(acFull, "GetHashCode")) { acFull.Add("GetHashCode"); }
+                if (!CodeEditor.Has(acFull, "GetType")) { acFull.Add("GetType"); }
+            } else {
+                acFull.Add("ToString"); acFull.Add("Equals");
+                acFull.Add("GetHashCode"); acFull.Add("GetType");
+            }
         }
 
-        acItems = new List<string>();
-        acKinds = new List<string>();
+        acFilter = "";
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
         int fi = 0;
         while (fi < acFull.Count) {
-            acItems.Add(acFull[fi]);
-            acKinds.Add("M");
+            acAllItems.Add(acFull[fi]);
+            acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
             fi = fi + 1;
         }
-        if (acItems.Count > 0) { acActive = true; acSel = 0; }
-        else { acActive = false; acDot = false; }
+        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// Namespace completion for a `using X.` directive: lists the child
+    /// namespaces of the prefix typed so far (e.g. `using System.` -> Data,
+    /// Net, IO, Text, ...). Derived from the stdlib namespace catalog so it
+    /// never invents members and never falls through to the type-member path.
+    void UsingDotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        string nsset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+        int s = dotPos;
+        while (s > 0 && CodeEditor.InSet(nsset, ln.Substring(s - 1, 1))) { s = s - 1; }
+        string prefix = ln.Substring(s, dotPos - s);
+        while (prefix.Length > 0 && prefix.Substring(prefix.Length - 1, 1) == ".") {
+            prefix = prefix.Substring(0, prefix.Length - 1);
+        }
+        acStart = curCol;
+        acDot = true;
+        acFull = new List<string>();
+        List<string> kids = new List<string>();
+        CodeEditor.ChildNamespaces(prefix, kids);
+        int ki = 0;
+        while (ki < kids.Count) { acFull.Add(kids[ki]); ki = ki + 1; }
+        acFilter = "";
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        int fi = 0;
+        while (fi < acFull.Count) {
+            acAllItems.Add(acFull[fi]);
+            acAllKinds.Add("M");
+            fi = fi + 1;
+        }
+        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// Appends to `out2` the distinct next-segment child namespaces of `prefix`
+    /// found in the stdlib catalog (e.g. prefix "System.Data" -> Orm Sqlite
+    /// Postgres).
+    static void ChildNamespaces(string prefix, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        string pre = prefix + ".";
+        int i = 0;
+        string cur = "";
+        while (i <= data.Length) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                string key = cur;
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) { key = cur.Substring(0, eq); }
+                if (key.Length > pre.Length && CodeEditor.StartsWithP(key, pre)) {
+                    string rest = key.Substring(pre.Length, key.Length - pre.Length);
+                    string seg = rest;
+                    int dotp = CodeEditor.Find(rest, ".");
+                    if (dotp > 0) { seg = rest.Substring(0, dotp); }
+                    if (seg.Length > 0 && !CodeEditor.Has(out2, seg)) { out2.Add(seg); }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
     }
 
     /// Populates member lists for known types.
@@ -882,16 +1707,11 @@ class CodeEditor {
             out2.Add("Find"); out2.Add("FindAll"); out2.Add("FindIndex");
             out2.Add("Exists"); out2.Add("ForEach"); out2.Add("AddRange");
             out2.Add("GetRange"); out2.Add("CopyTo"); out2.Add("BinarySearch");
-            // LINQ chain methods
-            out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
-            out2.Add("OrderBy"); out2.Add("OrderByDescending"); out2.Add("ThenBy");
-            out2.Add("GroupBy"); out2.Add("First"); out2.Add("FirstOrDefault");
-            out2.Add("Last"); out2.Add("LastOrDefault"); out2.Add("Single");
-            out2.Add("Any"); out2.Add("All"); out2.Add("Sum"); out2.Add("Average");
-            out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
-            out2.Add("Distinct"); out2.Add("Concat"); out2.Add("ToList");
-            out2.Add("Aggregate"); out2.Add("Zip"); out2.Add("Append");
-            out2.Add("OfType"); out2.Add("Cast"); out2.Add("ToDictionary");
+            out2.Add("ToArray");
+            // NOTE: LINQ chain methods (Where/Select/OrderBy…) are intentionally
+            // NOT added here. They only exist under `using System.Linq;` and are
+            // appended by DotCompletion via AddLinqMembers() when that using is
+            // present, so custom types never see them by accident.
         } else if (typeName == "Dictionary") {
             out2.Add("Add"); out2.Add("Remove"); out2.Add("Clear"); out2.Add("Count");
             out2.Add("ContainsKey"); out2.Add("ContainsValue"); out2.Add("TryGetValue");
@@ -951,25 +1771,889 @@ class CodeEditor {
             out2.Add("EventY"); out2.Add("PollEvent"); out2.Add("WaitEvent");
             out2.Add("GetWidth"); out2.Add("GetHeight"); out2.Add("Close");
             out2.Add("SetCursor"); out2.Add("GetTickMs"); out2.Add("SleepMs");
+        } else if (typeName == "LayoutKind") {
+            // [StructLayout(LayoutKind.Sequential)] — the only real member used
+            // by the FFI/marshalling attribute.
+            out2.Add("Sequential"); out2.Add("Explicit"); out2.Add("Auto");
         } else {
-            // Unknown type: common instance members + LINQ
-            out2.Add("ToString"); out2.Add("Equals"); out2.Add("GetHashCode");
-            out2.Add("GetType"); out2.Add("Count"); out2.Add("Length");
-            out2.Add("Add"); out2.Add("Remove"); out2.Add("RemoveAt");
-            out2.Add("Insert"); out2.Add("IndexOf"); out2.Add("Contains");
-            out2.Add("Clear"); out2.Add("Sort"); out2.Add("Reverse");
-            out2.Add("Substring"); out2.Add("Replace"); out2.Add("Trim");
-            out2.Add("StartsWith"); out2.Add("EndsWith"); out2.Add("Split");
-            out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
-            out2.Add("OrderBy"); out2.Add("OrderByDescending");
-            out2.Add("GroupBy"); out2.Add("First"); out2.Add("FirstOrDefault");
-            out2.Add("Last"); out2.Add("LastOrDefault"); out2.Add("Single");
-            out2.Add("Any"); out2.Add("All"); out2.Add("Sum"); out2.Add("Average");
-            out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
-            out2.Add("Distinct"); out2.Add("Concat"); out2.Add("ToList"); out2.Add("ToArray");
-            out2.Add("Aggregate"); out2.Add("Zip"); out2.Add("Append");
-            out2.Add("OfType"); out2.Add("Cast"); out2.Add("ToDictionary");
+            // Unknown / unresolved receiver: only the universally-available
+            // object members. We deliberately do NOT guess string / collection /
+            // LINQ helpers, because doing so shows methods the type may not have
+            // (e.g. `Utils.OrderByDescending`). DotCompletion resolves user and
+            // stdlib types by name/using and only falls back here when nothing is
+            // known about the receiver.
+            out2.Add("ToString"); out2.Add("Equals");
+            out2.Add("GetHashCode"); out2.Add("GetType");
         }
+    }
+
+    /// Appends the LINQ query-operator methods. Only called for collection
+    /// receivers when the file imports `using System.Linq;`.
+    static void AddLinqMembers(List<string> out2) {
+        out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
+        out2.Add("OrderBy"); out2.Add("OrderByDescending"); out2.Add("ThenBy");
+        out2.Add("ThenByDescending"); out2.Add("GroupBy"); out2.Add("First");
+        out2.Add("FirstOrDefault"); out2.Add("Last"); out2.Add("LastOrDefault");
+        out2.Add("Single"); out2.Add("SingleOrDefault"); out2.Add("Any");
+        out2.Add("All"); out2.Add("Count"); out2.Add("Sum"); out2.Add("Average");
+        out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
+        out2.Add("TakeWhile"); out2.Add("SkipWhile"); out2.Add("Distinct");
+        out2.Add("Concat"); out2.Add("Union"); out2.Add("Intersect"); out2.Add("Except");
+        out2.Add("Reverse"); out2.Add("ToList"); out2.Add("ToArray");
+        out2.Add("ToDictionary"); out2.Add("Aggregate"); out2.Add("Zip");
+        out2.Add("Append"); out2.Add("Prepend"); out2.Add("OfType"); out2.Add("Cast");
+    }
+
+    // ============================================================
+    //  Symbol index & using-aware, accurate completion
+    // ============================================================
+
+    /// Splits a space-separated string into tokens appended to `out2`.
+    static void AddWords(List<string> out2, string s) {
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " ") { if (cur.Length > 0) { out2.Add(cur); cur = ""; } }
+            else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { out2.Add(cur); }
+    }
+
+    /// Appends each space-separated token of `s` to `cand` (kind `kind`),
+    /// skipping duplicates already present.
+    static void AddKindWords(List<string> cand, List<string> kinds, string s, string kind) {
+        List<string> tmp = new List<string>();
+        CodeEditor.AddWords(tmp, s);
+        int i = 0;
+        while (i < tmp.Count) {
+            if (!CodeEditor.Has(cand, tmp[i])) { cand.Add(tmp[i]); kinds.Add(kind); }
+            i = i + 1;
+        }
+    }
+
+    /// Strips leading declaration modifiers (public/static/…) from a trimmed
+    /// line, returning what remains (e.g. "class Foo {" from "public class Foo {").
+    static string StripModifiers(string trimmed) {
+        string mods = " public private protected internal static abstract sealed partial file virtual override readonly const async unsafe extern new ";
+        string s = trimmed;
+        while (true) {
+            int sp = CodeEditor.Find(s, " ");
+            if (sp <= 0) { break; }
+            string first = s.Substring(0, sp);
+            if (CodeEditor.Find(mods, " " + first + " ") >= 0) {
+                s = CodeEditor.LTrim(s.Substring(sp, s.Length - sp));
+            } else { break; }
+        }
+        return s;
+    }
+
+    /// If `trimmed` declares a class/struct/enum/interface, returns its name;
+    /// otherwise "".
+    static string TypeDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        string kw = "";
+        if (CodeEditor.StartsWithP(s, "class ")) { kw = "class "; }
+        else if (CodeEditor.StartsWithP(s, "struct ")) { kw = "struct "; }
+        else if (CodeEditor.StartsWithP(s, "enum ")) { kw = "enum "; }
+        else if (CodeEditor.StartsWithP(s, "interface ")) { kw = "interface "; }
+        else { return ""; }
+        string rest = CodeEditor.LTrim(s.Substring(kw.Length, s.Length - kw.Length));
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string name = "";
+        int i = 0;
+        while (i < rest.Length) {
+            string ch = rest.Substring(i, 1);
+            if (CodeEditor.InSet(idset, ch)) { name = name + ch; i = i + 1; }
+            else { break; }
+        }
+        return name;
+    }
+
+    /// If `trimmed` is a direct member declaration (method / field / property)
+    /// returns the member name; otherwise "".
+    static string MemberDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        if (s.Length == 0) { return ""; }
+        string f = s.Substring(0, 1);
+        if (f == "/" || f == "*" || f == "#" || f == "@" || f == "[" || f == "}" || f == "{") { return ""; }
+        if (CodeEditor.TypeDeclName(trimmed).Length > 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        // Method: an identifier immediately followed by '('.
+        int paren = CodeEditor.Find(s, "(");
+        if (paren > 0) {
+            int e = paren;
+            while (e > 0 && CodeEditor.InSet(idset, s.Substring(e - 1, 1))) { e = e - 1; }
+            string mname = s.Substring(e, paren - e);
+            if (mname.Length == 0) { return ""; }
+            if (e == 0) { return ""; }
+            if (CodeEditor.IsControlWord(mname)) { return ""; }
+            return mname;
+        }
+        // Field / property: "Type name;" or "Type name =" or "Type name {".
+        int term = -1;
+        int ti = 0;
+        while (ti < s.Length) {
+            string ch = s.Substring(ti, 1);
+            if (ch == ";" || ch == "=" || ch == "{") { term = ti; break; }
+            ti = ti + 1;
+        }
+        if (term < 0) { return ""; }
+        string head = CodeEditor.TrimStr(s.Substring(0, term));
+        int b = head.Length;
+        while (b > 0 && !CodeEditor.InSet(idset, head.Substring(b - 1, 1))) { b = b - 1; }
+        int a = b;
+        while (a > 0 && CodeEditor.InSet(idset, head.Substring(a - 1, 1))) { a = a - 1; }
+        if (b <= a) { return ""; }
+        string name = head.Substring(a, b - a);
+        string before = CodeEditor.TrimStr(head.Substring(0, a));
+        if (before.Length == 0) { return ""; }        // needs a type token before it
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        string digits = "0123456789";
+        if (CodeEditor.InSet(digits, name.Substring(0, 1))) { return ""; }
+        return name;
+    }
+
+    /// Scans `src` for every class/struct/enum declaration, appending each type
+    /// name to `names` and its space-separated direct member names to `membersJoined`.
+    static void ScanTypesInto(string src, List<string> names, List<string> membersJoined) {
+        List<string> ls = CodeEditor.SplitLines(src);
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.TrimStr(ls[i]);
+            string tname = CodeEditor.TypeDeclName(tr);
+            if (tname.Length > 0) {
+                string members = " ";
+                int depth = 0;
+                bool started = false;
+                int j = i;
+                while (j < ls.Count) {
+                    string lj = ls[j];
+                    if (started && depth == 1 && j != i) {
+                        string mn = CodeEditor.MemberDeclName(CodeEditor.TrimStr(lj));
+                        if (mn.Length > 0 && CodeEditor.Find(members, " " + mn + " ") < 0) {
+                            members = members + mn + " ";
+                        }
+                    }
+                    int k = 0;
+                    while (k < lj.Length) {
+                        string ch = lj.Substring(k, 1);
+                        if (ch == "{") { depth = depth + 1; started = true; }
+                        else if (ch == "}") { depth = depth - 1; }
+                        k = k + 1;
+                    }
+                    j = j + 1;
+                    if (started && depth <= 0) { break; }
+                }
+                names.Add(tname);
+                membersJoined.Add(CodeEditor.TrimStr(members));
+                i = j;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /// Host IDE hook: supply the source text of every other project file so the
+    /// editor can resolve cross-file types (e.g. a `Utils` class in utils.zan).
+    void SetProjectFiles(List<string> contents) {
+        projTypeNames = new List<string>();
+        projTypeMembers = new List<string>();
+        int i = 0;
+        while (i < contents.Count) {
+            CodeEditor.ScanTypesInto(contents[i], projTypeNames, projTypeMembers);
+            i = i + 1;
+        }
+    }
+
+    /// Collects the namespaces imported by the current buffer's `using` lines.
+    void ParseUsingsInto(List<string> outNs) {
+        int i = 0;
+        while (i < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "using ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(6, tr.Length - 6));
+                if (CodeEditor.StartsWithP(rest, "static ")) {
+                    rest = CodeEditor.LTrim(rest.Substring(7, rest.Length - 7));
+                }
+                string ns = "";
+                int j = 0;
+                while (j < rest.Length) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == "=" || ch == " ") { break; }
+                    ns = ns + ch;
+                    j = j + 1;
+                }
+                if (ns.Length > 0 && !CodeEditor.Has(outNs, ns)) { outNs.Add(ns); }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The namespace the current buffer declares (`namespace X;`), or "".
+    string FileNamespace() {
+        int i = 0;
+        while (i < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "namespace ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(10, tr.Length - 10));
+                string ns = "";
+                int j = 0;
+                while (j < rest.Length) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == " " || ch == "{") { break; }
+                    ns = ns + ch;
+                    j = j + 1;
+                }
+                return ns;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// True when namespace `ns` is visible in the current buffer: imported via
+    /// `using`, or it is (an ancestor of) the file's own namespace.
+    bool NsVisible(string ns) {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        if (CodeEditor.Has(u, ns)) { return true; }
+        string fn = FileNamespace();
+        if (fn.Length > 0) {
+            if (fn == ns) { return true; }
+            if (fn.Length > ns.Length && CodeEditor.StartsWithP(fn, ns + ".")) { return true; }
+        }
+        return false;
+    }
+
+    /// True when the file imports System.Linq (gates LINQ query operators).
+    bool UsesLinq() {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        return CodeEditor.Has(u, "System.Linq");
+    }
+
+    /// The stdlib types the editor has hardcoded member data for.
+    static bool IsKnownStdlibType(string name) {
+        string known = " Console Math File Directory Path Convert Environment string List Dictionary StringBuilder DateTime Array Process App Canvas Theme Window LayoutKind ";
+        return CodeEditor.Find(known, " " + name + " ") >= 0;
+    }
+
+    /// Canonicalizes a type name for member lookup (String -> string).
+    static string NormalizeStdlibType(string name) {
+        if (name == "String") { return "string"; }
+        return name;
+    }
+
+    /// True for the built-in collection types that expose LINQ under System.Linq.
+    static bool IsCollectionType(string name) {
+        return name == "List" || name == "Array" || name == "Dictionary";
+    }
+
+    /// The full namespace -> types catalog used to add in-scope stdlib types to
+    /// completion. One entry per line: "Namespace=Type Type Type".
+    static string StdlibNsData() {
+        return "System.IO=File Directory Path;"
+            + "System.Text=Encoding;"
+            + "System.Json=JsonBuilder JsonParser;"
+            + "System.Threading=Thread Mutex Semaphore Stopwatch Channel;"
+            + "System.Net.Sockets=Socket AsyncSocket TcpListener TcpClient UdpClient;"
+            + "System.Net.Http=HttpClient HttpRequest HttpResponse HttpServer HttpRouter;"
+            + "System.Net.WebSocket=WebSocketClient WebSocketServer WsFrame WsOpcode;"
+            + "System.Net.Mqtt=MqttClient MqttPacketType MqttQos;"
+            + "System.Net=Dns IPAddress SocketHttpClient TcpSocket Worker Connection;"
+            + "System.Data.Orm=Model ModelQuery ModelRow ModelUpdate ModelDelete Migration QueryBuilder;"
+            + "System.Data.Sqlite=SqliteConnection;"
+            + "System.Data.Postgres=PgConnection;"
+            + "System.Data=DbConnection DbProvider DbResult;"
+            + "System.Diagnostics=Process;"
+            + "System.Drawing=Graphics Bitmap Font Rectangle;"
+            + "Platform=Posix Runtime Win32;"
+            + "Gui=App Canvas Theme Window Icon Text Stack Ui SignalInt SignalBool SignalString FocusManager HitRegion HitTester Clipboard Keys Modifiers Cursor Insets FlexNode FlexStyle;"
+            + "Gui.Widget=Alert Avatar Badge Breadcrumb Button Card Carousel Chart Checkbox CodeEditor Collapse DataTable Dialog Divider Drawer Dropdown Empty FloatButton Input Label ListView Loading Menu Message Modal Notification Pagination Panel PivotTable Popover Progress Radio Rate Result Ribbon RibbonCmd Scrollbar Select Skeleton Slider Spin Split Statistic Steps Switch Table Tabs TabView Tag Timeline Tooltip TreeNode TreeView Typography Wizard;"
+            + "System.Windows.Forms=MessageBox TextBox;";
+    }
+
+    /// Appends to `out2` the type names declared in namespace `ns`.
+    static void StdlibTypesForNs(string ns, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        int i = 0;
+        string cur = "";
+        while (i <= data.Length) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) {
+                    string key = cur.Substring(0, eq);
+                    if (key == ns) {
+                        CodeEditor.AddWords(out2, cur.Substring(eq + 1, cur.Length - eq - 1));
+                    }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The namespace that must be imported to use stdlib type `name`, or "" when
+    /// `name` is a built-in / ambiguous / non-stdlib type. Deliberately limited
+    /// to distinctive, unambiguous names so a missing-using diagnostic never
+    /// fires on a user's own identifiers.
+    static string NsForStdlibType(string name) {
+        string io = " File Directory Path ";
+        string diag = " Process ";
+        string text = " Encoding ";
+        string json = " JsonBuilder JsonParser ";
+        string thread = " Thread Mutex Semaphore Stopwatch ";
+        string sock = " Socket TcpListener TcpClient UdpClient AsyncSocket ";
+        string http = " HttpClient HttpRequest HttpResponse HttpServer HttpRouter ";
+        string ws = " WebSocketClient WebSocketServer ";
+        string data = " DbConnection DbResult ";
+        string orm = " QueryBuilder ";
+        string gui = " App Canvas Theme ";
+        string widget = " CodeEditor TreeView TabView Ribbon Modal DataTable Dropdown Carousel Pagination ";
+        string key = " " + name + " ";
+        if (CodeEditor.Find(io, key) >= 0) { return "System.IO"; }
+        if (CodeEditor.Find(diag, key) >= 0) { return "System.Diagnostics"; }
+        if (CodeEditor.Find(text, key) >= 0) { return "System.Text"; }
+        if (CodeEditor.Find(json, key) >= 0) { return "System.Json"; }
+        if (CodeEditor.Find(thread, key) >= 0) { return "System.Threading"; }
+        if (CodeEditor.Find(sock, key) >= 0) { return "System.Net.Sockets"; }
+        if (CodeEditor.Find(http, key) >= 0) { return "System.Net.Http"; }
+        if (CodeEditor.Find(ws, key) >= 0) { return "System.Net.WebSocket"; }
+        if (CodeEditor.Find(data, key) >= 0) { return "System.Data"; }
+        if (CodeEditor.Find(orm, key) >= 0) { return "System.Data.Orm"; }
+        if (CodeEditor.Find(gui, key) >= 0) { return "Gui"; }
+        if (CodeEditor.Find(widget, key) >= 0) { return "Gui.Widget"; }
+        return "";
+    }
+
+    /// True when `name` is a type declared in the project (other files) or the
+    /// current buffer.
+    bool IsProjectType(string name) {
+        if (CodeEditor.Has(projTypeNames, name)) { return true; }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        return CodeEditor.Has(tn, name);
+    }
+
+    /// Looks up the declared members of user type `typeName` (project files, then
+    /// current buffer). Returns true and fills `outMem` when found.
+    bool FindTypeMembers(string typeName, List<string> outMem) {
+        int i = 0;
+        while (i < projTypeNames.Count) {
+            if (projTypeNames[i] == typeName) {
+                CodeEditor.AddWords(outMem, projTypeMembers[i]);
+                return true;
+            }
+            i = i + 1;
+        }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        int j = 0;
+        while (j < tn.Count) {
+            if (tn[j] == typeName) {
+                CodeEditor.AddWords(outMem, tm[j]);
+                return true;
+            }
+            j = j + 1;
+        }
+        return false;
+    }
+
+    /// Best-effort resolution of a local variable's declared type by scanning the
+    /// buffer for a `Type name` declaration. Returns the base type (generics
+    /// stripped), or "".
+    string ResolveVarType(string name) {
+        if (name.Length == 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < lines.Count) {
+            string s = CodeEditor.TrimStr(lines[li]);
+            int from = 0;
+            while (true) {
+                int p = CodeEditor.FindFrom(s, name, from);
+                if (p < 0) { break; }
+                bool lok = (p > 0 && s.Substring(p - 1, 1) == " ");
+                int rp = p + name.Length;
+                bool rok = false;
+                if (rp < s.Length) {
+                    string rc = s.Substring(rp, 1);
+                    if (rc == " " || rc == "=" || rc == ";") { rok = true; }
+                }
+                if (lok && rok) {
+                    // token immediately before `name` must be a type reference
+                    int te = p - 1;
+                    while (te > 0 && s.Substring(te - 1, 1) == " ") { te = te - 1; }
+                    int ts = te;
+                    while (ts > 0 && CodeEditor.InSet(idset, s.Substring(ts - 1, 1))) { ts = ts - 1; }
+                    // allow a trailing generic argument list on the type: List<int>
+                    int gts = ts;
+                    if (te > ts) {
+                        string tok = s.Substring(ts, te - ts);
+                        // strip a generic close if the char right before name-token is '>'
+                        string typeTok = tok;
+                        int lt = CodeEditor.Find(typeTok, "<");
+                        if (lt > 0) { typeTok = typeTok.Substring(0, lt); }
+                        if (typeTok.Length > 0 && !CodeEditor.IsControlWord(typeTok)
+                            && !CodeEditor.StartsWithP(typeTok, "return")) {
+                            string firstc = typeTok.Substring(0, 1);
+                            string digits = "0123456789";
+                            if (!CodeEditor.InSet(digits, firstc)) { return typeTok; }
+                        }
+                    }
+                }
+                from = p + name.Length;
+            }
+            li = li + 1;
+        }
+        return "";
+    }
+
+    /// Adds the in-scope stdlib type names to completion: always the built-ins,
+    /// plus the types of every imported (or own) namespace, plus LINQ operators
+    /// only when System.Linq is imported.
+    void AddStdlibCandidates(List<string> cand, List<string> kinds) {
+        CodeEditor.AddKindWords(cand, kinds,
+            "Console Math Convert Environment String Array List Dictionary StringBuilder DateTime TimeSpan Task Object Exception Tuple Random", "T");
+        List<string> ns = new List<string>();
+        ParseUsingsInto(ns);
+        string fn = FileNamespace();
+        if (fn.Length > 0 && !CodeEditor.Has(ns, fn)) { ns.Add(fn); }
+        int i = 0;
+        while (i < ns.Count) {
+            List<string> types = new List<string>();
+            CodeEditor.StdlibTypesForNs(ns[i], types);
+            int j = 0;
+            while (j < types.Count) {
+                if (!CodeEditor.Has(cand, types[j])) { cand.Add(types[j]); kinds.Add("T"); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        if (UsesLinq()) {
+            List<string> linq = new List<string>();
+            CodeEditor.AddLinqMembers(linq);
+            int k = 0;
+            while (k < linq.Count) {
+                if (!CodeEditor.Has(cand, linq[k])) { cand.Add(linq[k]); kinds.Add("M"); }
+                k = k + 1;
+            }
+        }
+    }
+
+    /// Adds project-declared types (and their members) to completion.
+    void AddProjectCandidates(List<string> cand, List<string> kinds) {
+        int i = 0;
+        while (i < projTypeNames.Count) {
+            if (!CodeEditor.Has(cand, projTypeNames[i])) { cand.Add(projTypeNames[i]); kinds.Add("T"); }
+            List<string> mem = new List<string>();
+            CodeEditor.AddWords(mem, projTypeMembers[i]);
+            int j = 0;
+            while (j < mem.Count) {
+                if (!CodeEditor.Has(cand, mem[j])) { cand.Add(mem[j]); kinds.Add("M"); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        int a = 0;
+        while (a < tn.Count) {
+            if (!CodeEditor.Has(cand, tn[a])) { cand.Add(tn[a]); kinds.Add("T"); }
+            List<string> mem2 = new List<string>();
+            CodeEditor.AddWords(mem2, tm[a]);
+            int b = 0;
+            while (b < mem2.Count) {
+                if (!CodeEditor.Has(cand, mem2[b])) { cand.Add(mem2[b]); kinds.Add("M"); }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+    }
+
+    /// True when the in-progress word at (curLine, up to curCol) sits inside an
+    /// attribute bracket — i.e. the nearest unmatched '[' precedes it on the line.
+    bool InAttributeContext() {
+        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        string s = lines[curLine];
+        int i = curCol - 1;
+        if (i >= s.Length) { i = s.Length - 1; }
+        while (i >= 0) {
+            string ch = s.Substring(i, 1);
+            if (ch == "[") { return true; }
+            if (ch == "]") { return false; }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    /// Scans the buffer for `using X;` type usages that require an import which is
+    /// missing, recording a diagnostic + quick-fix per offending line.
+    void AnalyzeMissingUsings() {
+        fixLines = new List<int>();
+        fixNs = new List<string>();
+        List<string> usings = new List<string>();
+        ParseUsingsInto(usings);
+        string fileNs = FileNamespace();
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        int li = 0;
+        while (li < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[li]);
+            if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
+                || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
+                li = li + 1; continue;
+            }
+            string ln = lines[li];
+            int p = 0;
+            int n = ln.Length;
+            while (p < n) {
+                string ch = ln.Substring(p, 1);
+                if (CodeEditor.InSet(idset, ch)) {
+                    int s2 = p;
+                    string w = "";
+                    while (p < n && CodeEditor.InSet(idset, ln.Substring(p, 1))) {
+                        w = w + ln.Substring(p, 1); p = p + 1;
+                    }
+                    bool dotAfter = (p < n && ln.Substring(p, 1) == ".");
+                    bool dotBefore = (s2 > 0 && ln.Substring(s2 - 1, 1) == ".");
+                    bool cap = (w.Length > 0 && CodeEditor.InSet(upper, w.Substring(0, 1)));
+                    if (dotAfter && !dotBefore && cap) {
+                        string ns = CodeEditor.NsForStdlibType(w);
+                        if (ns.Length > 0) {
+                            bool imported = CodeEditor.Has(usings, ns);
+                            if (!imported && fileNs.Length > 0) {
+                                if (fileNs == ns) { imported = true; }
+                                else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
+                            }
+                            bool userType = CodeEditor.Has(tn, w) || CodeEditor.Has(projTypeNames, w);
+                            if (!imported && !userType && !CodeEditor.HasInt(fixLines, li)) {
+                                errorLines.Add(li);
+                                errorMsgs.Add("'" + w + "' needs 'using " + ns + ";'");
+                                fixLines.Add(li);
+                                fixNs.Add(ns);
+                            }
+                        }
+                    }
+                } else {
+                    p = p + 1;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// The namespace a missing-`using` quick-fix would add for the caret line, or "".
+    string QuickFixNs() {
+        int i = 0;
+        while (i < fixLines.Count) {
+            if (fixLines[i] == curLine) { return fixNs[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// True when the caret line has a missing-`using` quick-fix available.
+    bool HasQuickFix() { return QuickFixNs().Length > 0; }
+
+    /// Inserts `using ns;` after the last existing using (or at the top),
+    /// unless already present.
+    void AddUsing(string ns) {
+        if (ns.Length == 0) { return; }
+        List<string> cur = new List<string>();
+        ParseUsingsInto(cur);
+        if (CodeEditor.Has(cur, ns)) { return; }
+        int lastUsing = -1;
+        int i = 0;
+        while (i < lines.Count) {
+            if (CodeEditor.StartsWithP(CodeEditor.TrimStr(lines[i]), "using ")) { lastUsing = i; }
+            i = i + 1;
+        }
+        SaveUndo();
+        int at = 0;
+        if (lastUsing >= 0) { at = lastUsing + 1; }
+        lines.Insert(at, "using " + ns + ";");
+        if (at <= curLine) { curLine = curLine + 1; }
+        lastDiagLine = -1;
+        CheckErrors();
+    }
+
+    /// Applies the missing-`using` quick-fix for the caret line, if any.
+    void ApplyQuickFix() {
+        AddUsing(QuickFixNs());
+    }
+
+    // ---- IntelliSense descriptions & snippets ----
+
+    /// First index of substring `sub` in `s`, or -1.
+    static int Find(string s, string sub) {
+        if (sub.Length == 0) { return 0; }
+        int limit = s.Length - sub.Length;
+        int i = 0;
+        while (i <= limit) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Human-readable label for a completion kind tag.
+    static string KindWord(string kind) {
+        if (kind == "M") { return "method"; }
+        if (kind == "P") { return "property"; }
+        if (kind == "T") { return "type"; }
+        if (kind == "K") { return "keyword"; }
+        if (kind == "S") { return "code snippet"; }
+        if (kind == "F") { return "field"; }
+        if (kind == "E") { return "event"; }
+        return "symbol";
+    }
+
+    /// Curated one-line signature for well-known members, else "".
+    static string DescSig(string name) {
+        if (name == "WriteLine") { return "void WriteLine(object value)"; }
+        if (name == "ReadLine") { return "string ReadLine()"; }
+        if (name == "Write") { return "void Write(object value)"; }
+        if (name == "Add") { return "void Add(T item)"; }
+        if (name == "Remove") { return "bool Remove(T item)"; }
+        if (name == "RemoveAt") { return "void RemoveAt(int index)"; }
+        if (name == "Insert") { return "void Insert(int index, T item)"; }
+        if (name == "Count") { return "int Count { get; }"; }
+        if (name == "Length") { return "int Length { get; }"; }
+        if (name == "Clear") { return "void Clear()"; }
+        if (name == "Contains") { return "bool Contains(T item)"; }
+        if (name == "IndexOf") { return "int IndexOf(T item)"; }
+        if (name == "Substring") { return "string Substring(int start, int len)"; }
+        if (name == "Replace") { return "string Replace(string old, string new)"; }
+        if (name == "Split") { return "string[] Split(string separator)"; }
+        if (name == "Join") { return "string Join(string sep, IEnumerable values)"; }
+        if (name == "Trim") { return "string Trim()"; }
+        if (name == "ToUpper") { return "string ToUpper()"; }
+        if (name == "ToLower") { return "string ToLower()"; }
+        if (name == "StartsWith") { return "bool StartsWith(string value)"; }
+        if (name == "EndsWith") { return "bool EndsWith(string value)"; }
+        if (name == "ToString") { return "string ToString()"; }
+        if (name == "Parse") { return "T Parse(string s)"; }
+        if (name == "TryParse") { return "bool TryParse(string s, out T result)"; }
+        if (name == "Where") { return "IEnumerable<T> Where(Func<T,bool> predicate)"; }
+        if (name == "Select") { return "IEnumerable<R> Select(Func<T,R> selector)"; }
+        if (name == "OrderBy") { return "IEnumerable<T> OrderBy(Func<T,K> key)"; }
+        if (name == "First") { return "T First()"; }
+        if (name == "Last") { return "T Last()"; }
+        if (name == "Any") { return "bool Any(Func<T,bool> predicate)"; }
+        if (name == "All") { return "bool All(Func<T,bool> predicate)"; }
+        if (name == "Sum") { return "N Sum()"; }
+        if (name == "Max") { return "T Max()"; }
+        if (name == "Min") { return "T Min()"; }
+        if (name == "Abs") { return "double Abs(double value)"; }
+        if (name == "Sqrt") { return "double Sqrt(double value)"; }
+        if (name == "ReadAllText") { return "string ReadAllText(string path)"; }
+        if (name == "WriteAllText") { return "void WriteAllText(string path, string text)"; }
+        if (name == "Format") { return "string Format(string fmt, params object[] args)"; }
+        if (name == "ContainsKey") { return "bool ContainsKey(K key)"; }
+        if (name == "TryGetValue") { return "bool TryGetValue(K key, out V value)"; }
+        if (name == "Append") { return "StringBuilder Append(object value)"; }
+        if (name == "AppendLine") { return "StringBuilder AppendLine(object value)"; }
+        return "";
+    }
+
+    /// Curated one-line documentation for well-known members, else "".
+    static string DescDoc(string name) {
+        if (name == "WriteLine") { return "Writes the value followed by a line terminator to standard output."; }
+        if (name == "ReadLine") { return "Reads the next line of characters from standard input."; }
+        if (name == "Write") { return "Writes the value to standard output (no line terminator)."; }
+        if (name == "Add") { return "Adds an item to the end of the collection."; }
+        if (name == "Remove") { return "Removes the first occurrence of the item; returns whether it was found."; }
+        if (name == "RemoveAt") { return "Removes the item at the given zero-based index."; }
+        if (name == "Insert") { return "Inserts an item at the given index, shifting later items."; }
+        if (name == "Count") { return "Number of elements currently in the collection."; }
+        if (name == "Length") { return "Number of characters/elements."; }
+        if (name == "Clear") { return "Removes all elements."; }
+        if (name == "Contains") { return "Returns whether the item is present."; }
+        if (name == "IndexOf") { return "Zero-based index of the first matching item, or -1."; }
+        if (name == "Substring") { return "Returns a portion of the string starting at start."; }
+        if (name == "Replace") { return "Returns a copy with all occurrences of old replaced by new."; }
+        if (name == "Split") { return "Splits the string into an array around the separator."; }
+        if (name == "Join") { return "Concatenates values, inserting the separator between them."; }
+        if (name == "Trim") { return "Removes leading and trailing whitespace."; }
+        if (name == "ToUpper") { return "Returns an uppercase copy of the string."; }
+        if (name == "ToLower") { return "Returns a lowercase copy of the string."; }
+        if (name == "StartsWith") { return "Returns whether the string begins with the given value."; }
+        if (name == "EndsWith") { return "Returns whether the string ends with the given value."; }
+        if (name == "ToString") { return "Returns the text representation of this object."; }
+        if (name == "Parse") { return "Converts the string to the target type; throws on failure."; }
+        if (name == "TryParse") { return "Attempts to convert the string; returns success without throwing."; }
+        if (name == "Where") { return "Filters a sequence by a predicate."; }
+        if (name == "Select") { return "Projects each element into a new form."; }
+        if (name == "OrderBy") { return "Sorts elements in ascending order by a key."; }
+        if (name == "First") { return "Returns the first element (throws if empty)."; }
+        if (name == "Last") { return "Returns the last element (throws if empty)."; }
+        if (name == "Any") { return "Returns whether any element satisfies the predicate."; }
+        if (name == "All") { return "Returns whether every element satisfies the predicate."; }
+        if (name == "Sum") { return "Computes the sum of the sequence."; }
+        if (name == "Max") { return "Returns the maximum value."; }
+        if (name == "Min") { return "Returns the minimum value."; }
+        if (name == "Abs") { return "Returns the absolute value."; }
+        if (name == "Sqrt") { return "Returns the square root."; }
+        if (name == "ReadAllText") { return "Opens a file, reads all text, then closes it."; }
+        if (name == "WriteAllText") { return "Creates or overwrites a file with the given text."; }
+        if (name == "Format") { return "Replaces format items in a string with argument values."; }
+        if (name == "ContainsKey") { return "Returns whether the dictionary contains the key."; }
+        if (name == "TryGetValue") { return "Gets the value for a key without throwing if absent."; }
+        if (name == "Append") { return "Appends the value to this builder."; }
+        if (name == "AppendLine") { return "Appends the value followed by a line terminator."; }
+        return "";
+    }
+
+    /// Word-wraps `s` to fit within `maxW` pixels at `fontSize`, appending the
+    /// resulting lines to `outl` (at most `maxLines`).
+    static void WrapText(string s, int maxW, int fontSize, List<string> outl, int maxLines) {
+        string cur = "";
+        string word = "";
+        int i = 0;
+        while (i <= s.Length) {
+            string ch = "";
+            if (i < s.Length) { ch = s.Substring(i, 1); }
+            if (ch == " " || i == s.Length) {
+                string trial = cur;
+                if (trial.Length > 0) { trial = trial + " "; }
+                trial = trial + word;
+                if (Canvas.MeasureText(trial, fontSize) > maxW && cur.Length > 0) {
+                    outl.Add(cur);
+                    cur = word;
+                    if (outl.Count >= maxLines - 1) {
+                        // Dump the rest onto the final line and stop.
+                        int j = i;
+                        while (j < s.Length) { cur = cur + s.Substring(j, 1); j = j + 1; }
+                        outl.Add(cur);
+                        return;
+                    }
+                } else {
+                    cur = trial;
+                }
+                word = "";
+            } else {
+                word = word + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { outl.Add(cur); }
+    }
+
+    /// Appends built-in code-snippet triggers (kind "S") to a candidate list.
+    static void SnippetListK(List<string> outk, List<string> kinds) {
+        outk.Add("for"); kinds.Add("S");
+        outk.Add("foreach"); kinds.Add("S");
+        outk.Add("while"); kinds.Add("S");
+        outk.Add("if"); kinds.Add("S");
+        outk.Add("ifelse"); kinds.Add("S");
+        outk.Add("class"); kinds.Add("S");
+        outk.Add("func"); kinds.Add("S");
+        outk.Add("prop"); kinds.Add("S");
+        outk.Add("try"); kinds.Add("S");
+    }
+
+    /// Expands a code snippet at the current caret, replacing the trigger word
+    /// [acStart, curCol). Places the caret at the "$C$" marker in the body.
+    void ExpandSnippet(string name) {
+        List<string> body = new List<string>();
+        if (name == "for") {
+            body.Add("for (int i = 0; i < $C$; i = i + 1) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "foreach") {
+            body.Add("foreach (var item in $C$) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "while") {
+            body.Add("while ($C$) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "if") {
+            body.Add("if ($C$) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "ifelse") {
+            body.Add("if ($C$) {");
+            body.Add("    ");
+            body.Add("} else {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "class") {
+            body.Add("class $C$ {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "func") {
+            body.Add("void $C$() {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "prop") {
+            body.Add("int $C$;");
+        } else if (name == "try") {
+            body.Add("try {");
+            body.Add("    $C$");
+            body.Add("} catch (Exception e) {");
+            body.Add("    ");
+            body.Add("}");
+        } else {
+            return;
+        }
+
+        string curls = lines[curLine];
+        string left = Text.Left(curls, acStart);
+        string right = Text.Right(curls, curCol);
+        // Base indent = leading whitespace of the current line.
+        string indent = "";
+        int p = 0;
+        while (p < left.Length) {
+            string ch = left.Substring(p, 1);
+            if (ch == " ") { indent = indent + " "; p = p + 1; }
+            else { break; }
+        }
+
+        int caretLine = curLine;
+        int caretCol = acStart;
+        List<string> assembled = new List<string>();
+        int n = body.Count;
+        int bi = 0;
+        while (bi < n) {
+            string pre = indent;
+            if (bi == 0) { pre = left; }
+            string lineText = pre + body[bi];
+            if (bi == n - 1) { lineText = lineText + right; }
+            int mk = CodeEditor.Find(lineText, "$C$");
+            if (mk >= 0) {
+                caretLine = curLine + bi;
+                caretCol = mk;
+                lineText = Text.Left(lineText, mk) + Text.Right(lineText, mk + 3);
+            }
+            assembled.Add(lineText);
+            bi = bi + 1;
+        }
+
+        lines[curLine] = assembled[0];
+        int ins = 1;
+        while (ins < assembled.Count) {
+            lines.Insert(curLine + ins, assembled[ins]);
+            ins = ins + 1;
+        }
+        curLine = caretLine;
+        curCol = caretCol;
+        acActive = false;
+        acDot = false;
+        acFilter = "";
+        CheckErrors();
     }
 
     // ---- breakpoints ----
@@ -1053,15 +2737,38 @@ class CodeEditor {
                 app.RequestRedraw();
                 return;
             }
+            // Ctrl+D = duplicate line (code 4)
+            if (code == 4) {
+                DuplicateLine();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+L = delete line (code 12)
+            if (code == 12) {
+                DeleteLine();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+/ = toggle line comment (code 31)
+            if (code == 31) {
+                ToggleComment();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
             if (code == 8) {
-                if (selActive) { DeleteSelection(); }
+                if (selActive) { ClearExtraCarets(); DeleteSelection(); }
+                else if (mcLines.Count > 0) { McBackspace(); }
                 else { SaveUndo(); BackspaceEdit(); }
                 CheckErrors();
                 UpdateCompletion();
                 app.RequestRedraw();
             } else if (code == 13) {
-                if (acActive) { AcceptCompletion(); }
+                if (acActive) { AcceptCompletion(false); }
                 else {
+                    ClearExtraCarets();
                     if (selActive) { DeleteSelection(); }
                     else { SaveUndo(); }
                     NewLine();
@@ -1069,29 +2776,42 @@ class CodeEditor {
                 }
                 app.RequestRedraw();
             } else if (code == 9) {
-                if (acActive) { AcceptCompletion(); }
+                if (acActive) { AcceptCompletion(true); }
                 else {
-                    if (selActive) { DeleteSelection(); }
-                    InsertStr("    ");
+                    if (selActive) { ClearExtraCarets(); DeleteSelection(); }
+                    if (mcLines.Count > 0) { McInsertStr("    "); }
+                    else { InsertStr("    "); }
                 }
                 app.RequestRedraw();
             } else if (code == 27) {
                 acActive = false;
+                acFilter = "";
                 selActive = false;
+                refPopOpen = false;
+                ClearExtraCarets();
+                ctxOpen = false;
                 app.RequestRedraw();
             } else if (code > 31) {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
-                    if (selActive) { DeleteSelection(); }
+                    if (selActive) { ClearExtraCarets(); DeleteSelection(); }
                     else { SaveUndo(); }
-                    InsertStr(ch);
+                    if (mcLines.Count > 0) { McInsertStr(ch); }
+                    else { InsertStr(ch); }
                     selActive = false;
                     if (ch == ".") {
                         DotCompletion();
                     } else {
                         UpdateCompletion();
                     }
-                    CheckErrors();
+                    // Only re-run diagnostics for characters that can change the
+                    // structure of *other* lines (brace/paren balance, statement
+                    // termination). Ordinary text on the current line is validated
+                    // once the caret leaves the line, avoiding a full-document
+                    // rescan on every keystroke.
+                    if (ch == "{" || ch == "}" || ch == "(" || ch == ")" || ch == ";") {
+                        CheckErrors();
+                    }
                     app.RequestRedraw();
                 }
             }
@@ -1105,13 +2825,49 @@ class CodeEditor {
                 acSel = acSel + 1;
                 if (acSel >= acItems.Count) { acSel = 0; }
                 app.RequestRedraw();
-            } else if (kc == 27) { acActive = false; selActive = false; app.RequestRedraw(); }
-            else if (kc == 37) { acActive = false; selActive = false; MoveLeft(); app.RequestRedraw(); }
-            else if (kc == 39) { acActive = false; selActive = false; MoveRight(); app.RequestRedraw(); }
-            else if (kc == 38) { selActive = false; MoveUp(); app.RequestRedraw(); }
-            else if (kc == 40) { selActive = false; MoveDown(); app.RequestRedraw(); }
-            else if (kc == 36) { curCol = 0; acActive = false; selActive = false; app.RequestRedraw(); }
-            else if (kc == 35) { curCol = lines[curLine].Length; acActive = false; selActive = false; app.RequestRedraw(); }
+            } else if (kc == 27) { acActive = false; acFilter = ""; selActive = false; refPopOpen = false; app.RequestRedraw(); }
+            else if (kc == 37) {
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh); MoveLeft(); app.RequestRedraw();
+            }
+            else if (kc == 39) {
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh); MoveRight(); app.RequestRedraw();
+            }
+            else if (kc == 38) {
+                int mods38 = app.window.EventMods();
+                if (Modifiers.HasCtrl(mods38) && Modifiers.HasAlt(mods38)) { AddCaretAbove(); }
+                else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods38)); MoveUp(); }
+                app.RequestRedraw();
+            }
+            else if (kc == 40) {
+                int mods40 = app.window.EventMods();
+                if (Modifiers.HasCtrl(mods40) && Modifiers.HasAlt(mods40)) { AddCaretBelow(); }
+                else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods40)); MoveDown(); }
+                app.RequestRedraw();
+            }
+            else if (kc == 33) {
+                int vis = pageRows;
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh);
+                int np = curLine - vis; if (np < 0) { np = 0; }
+                curLine = np; ClampCol(); app.RequestRedraw();
+            }
+            else if (kc == 34) {
+                int vis = pageRows;
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh);
+                int np = curLine + vis; if (np > lines.Count - 1) { np = lines.Count - 1; }
+                curLine = np; ClampCol(); app.RequestRedraw();
+            }
+            else if (kc == 36) {
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh); curCol = 0; app.RequestRedraw();
+            }
+            else if (kc == 35) {
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh); curCol = lines[curLine].Length; app.RequestRedraw();
+            }
             else if (kc == 46) {
                 if (selActive) { DeleteSelection(); }
                 else { SaveUndo(); DeleteEdit(); }
@@ -1299,8 +3055,17 @@ class CodeEditor {
 
         int visLines = area.height / lineH;
         if (visLines < 1) { visLines = 1; }
+        pageRows = visLines;
 
         if (focused) { HandleInput(app); }
+        // Re-validate diagnostics when the caret moves to a different line: the
+        // line just left is now complete and checkable, while the active line is
+        // deliberately skipped by CheckErrors. This also avoids a full-document
+        // rescan on every keystroke within a line.
+        if (curLine != lastDiagLine) {
+            CheckErrors();
+            lastDiagLine = curLine;
+        }
 
         if (app.window.EventKind() == 13) {
             bool over = app.mouseX >= area.x && app.mouseX < area.x + area.width
@@ -1325,6 +3090,11 @@ class CodeEditor {
         if (scrollLine < 0) { scrollLine = 0; }
 
         int textX = area.x + gutterW + t.paddingSmall;
+        clLine = new List<int>();
+        clName = new List<string>();
+        clX = new List<int>();
+        clY = new List<int>();
+        clW = new List<int>();
         int i = 0;
         while (i < visLines) {
             int ln = scrollLine + i;
@@ -1386,6 +3156,36 @@ class CodeEditor {
                     c.FillRect(cxp, rowY + app.Scale(2), 1, lineH - app.Scale(4), t.primary);
                 }
 
+                // CodeLens: reference count for a method declaration on this line.
+                string decl = CodeEditor.DeclNameAt(text);
+                if (decl.Length > 0) {
+                    int refs = CountWord(decl) - 1;
+                    if (refs < 0) { refs = 0; }
+                    string clLabel = Convert.ToString(refs) + " references";
+                    if (refs == 1) { clLabel = "1 reference"; }
+                    int clx = sx + app.Scale(24);
+                    int clw = Canvas.MeasureText(clLabel, t.fontSizeSmall);
+                    if (clx + clw < area.x + area.width) {
+                        c.DrawText(clx, textY, clLabel, 0xFF608B4E, t.fontSizeSmall);
+                        clLine.Add(ln); clName.Add(decl);
+                        clX.Add(clx); clY.Add(rowY); clW.Add(clw);
+                    }
+                }
+
+                // Secondary carets (multi-cursor) on this line.
+                if (focused && mcLines.Count > 0) {
+                    int mci = 0;
+                    while (mci < mcLines.Count) {
+                        if (mcLines[mci] == ln) {
+                            int mcc = mcCols[mci];
+                            if (mcc > text.Length) { mcc = text.Length; }
+                            int mcx = textX + Canvas.MeasureText(Text.Left(text, mcc), fontSize);
+                            c.FillRect(mcx, rowY + app.Scale(2), 1, lineH - app.Scale(4), 0xFF00D0A0);
+                        }
+                        mci = mci + 1;
+                    }
+                }
+
                 // Show error tooltip on hovered error line
                 if (CodeEditor.HasInt(errorLines, ln) && ln == curLine) {
                     string errMsg = CodeEditor.GetErrorMsg(errorLines, errorMsgs, ln);
@@ -1404,8 +3204,35 @@ class CodeEditor {
             i = i + 1;
         }
 
+        // ---- right-edge diagnostics / scroll strip (VS-style overview ruler) ----
+        // Shows a viewport thumb plus a red tick for every diagnostic line so the
+        // user can jump straight to problem areas; clicking the strip scrolls there.
+        {
+            int stripW = app.Scale(14);
+            int stripX = area.x + area.width - stripW;
+            c.FillRect(stripX, area.y, stripW, area.height, 0xFF2A2A2E);
+            c.FillRect(stripX, area.y, app.Scale(1), area.height, 0xFF3E3E42);
+            int total = lines.Count;
+            if (total < 1) { total = 1; }
+            int thumbY = area.y + scrollLine * area.height / total;
+            int thumbH = visLines * area.height / total;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            if (thumbY + thumbH > area.y + area.height) { thumbY = area.y + area.height - thumbH; }
+            if (thumbY < area.y) { thumbY = area.y; }
+            c.FillRoundRect(stripX + app.Scale(3), thumbY, stripW - app.Scale(6), thumbH, app.Scale(3), 0x50FFFFFF);
+            int mi = 0;
+            while (mi < errorLines.Count) {
+                int el = errorLines[mi];
+                if (el >= 0 && el < lines.Count) {
+                    int my = area.y + el * area.height / total;
+                    c.FillRect(stripX + app.Scale(2), my, stripW - app.Scale(4), app.Scale(3), 0xFFFF4444);
+                }
+                mi = mi + 1;
+            }
+        }
+
         // ---- autocomplete popup (drawn below the cursor, with icons) ----
-        if (acActive && focused && acItems.Count > 0
+        if (acActive && focused && acAllItems.Count > 0
             && curLine >= scrollLine && curLine < scrollLine + visLines) {
             int prow = curLine - scrollLine;
             int pRowY = area.y + prow * lineH;
@@ -1415,6 +3242,7 @@ class CodeEditor {
             if (shown > maxShow) { shown = maxShow; }
             int itemH2 = lineH + app.Scale(2);
             int popH2 = shown * itemH2 + app.Scale(4);
+            if (shown == 0) { popH2 = itemH2 + app.Scale(4); }
             int iconW = app.Scale(22);
             int popW2 = app.Scale(220);
             int k = 0;
@@ -1475,13 +3303,273 @@ class CodeEditor {
                 int sbY = popY2 + (popH2 - sbH) * first2 / (acItems.Count - shown);
                 c.FillRoundRect(px + popW2 - app.Scale(6), sbY, app.Scale(4), sbH, app.Scale(2), 0xFF555555);
             }
+
+            // Placeholder text when the active filter hides every item.
+            if (acItems.Count == 0) {
+                int hy = popY2 + (itemH2 - Canvas.FontHeight(fontSize)) / 2 + app.Scale(2);
+                c.DrawText(px + app.Scale(8), hy, "no " + CodeEditor.KindWord(acFilter) + " here", 0xFF808080, fontSize);
+            }
+
+            // ---- kind filter strip (click to show only one kind) ----
+            List<string> fkinds = new List<string>();
+            fkinds.Add(""); fkinds.Add("M"); fkinds.Add("P"); fkinds.Add("F");
+            fkinds.Add("E"); fkinds.Add("T"); fkinds.Add("K"); fkinds.Add("S");
+            int fbH = app.Scale(22);
+            int fbY = popY2 + popH2;
+            filtX = px; filtY = fbY; filtW = popW2; filtH = fbH;
+            c.FillRect(px, fbY, popW2, fbH, 0xFF2D2D30);
+            c.DrawRect(px, fbY, popW2, fbH, 0xFF3E3E42, 1);
+            int isz = app.Scale(16);
+            int fgap = app.Scale(4);
+            int fbx = px + app.Scale(5);
+            int fiy = fbY + (fbH - isz) / 2;
+            int fki = 0;
+            while (fki < fkinds.Count) {
+                string fk = fkinds[fki];
+                bool present = fk == "" || HasKind(fk);
+                bool seld = acFilter == fk;
+                string flet = "*";
+                int fcol = 0xFFCCCCCC;
+                if (fk == "M") { fcol = 0xFF9B6DCA; flet = "M"; }
+                else if (fk == "P") { fcol = 0xFF569CD6; flet = "P"; }
+                else if (fk == "F") { fcol = 0xFF9CDCFE; flet = "F"; }
+                else if (fk == "E") { fcol = 0xFFB8D7A3; flet = "E"; }
+                else if (fk == "T") { fcol = 0xFF4EC9B0; flet = "T"; }
+                else if (fk == "K") { fcol = 0xFF569CD6; flet = "K"; }
+                else if (fk == "S") { fcol = 0xFFDCDCAA; flet = "S"; }
+                if (!present) { fcol = 0xFF4A4A4A; }
+                if (seld) {
+                    c.FillRoundRect(fbx - app.Scale(2), fiy - app.Scale(2), isz + app.Scale(4), isz + app.Scale(4), app.Scale(3), 0xFF094771);
+                }
+                c.FillRoundRect(fbx, fiy, isz, isz, app.Scale(3), fcol);
+                int tc = 0xFF1E1E1E;
+                if (!present) { tc = 0xFF6A6A6A; }
+                c.DrawText(fbx + app.Scale(4), fiy + app.Scale(1), flet, tc, t.fontSizeSmall);
+                fbx = fbx + isz + fgap;
+                fki = fki + 1;
+            }
+
+            // ---- description panel for the highlighted item ----
+            if (acSel >= 0 && acSel < acItems.Count) {
+                string dName = acItems[acSel];
+                string dKind = "";
+                if (acSel < acKinds.Count) { dKind = acKinds[acSel]; }
+                string dSig = CodeEditor.DescSig(dName);
+                string dDoc = CodeEditor.DescDoc(dName);
+                string sigLine = dSig;
+                if (sigLine.Length == 0) { sigLine = dName; }
+                string kindLine = "(" + CodeEditor.KindWord(dKind) + ")";
+                if (dDoc.Length == 0 && dKind == "S") {
+                    dDoc = "Press Tab to insert the '" + dName + "' code template.";
+                }
+
+                int dw = app.Scale(280);
+                int dpad = app.Scale(8);
+                int fh = Canvas.FontHeight(fontSize);
+                List<string> wrapped = new List<string>();
+                if (dDoc.Length > 0) {
+                    CodeEditor.WrapText(dDoc, dw - dpad * 2, t.fontSizeSmall, wrapped, 6);
+                }
+                int dh = dpad * 2 + fh + app.Scale(4) + fh;
+                if (wrapped.Count > 0) {
+                    dh = dh + app.Scale(6) + wrapped.Count * (Canvas.FontHeight(t.fontSizeSmall) + app.Scale(2));
+                }
+                // Prefer right of the popup; fall back to the left.
+                int dx = px + popW2 + app.Scale(6);
+                if (dx + dw > area.x + area.width) { dx = px - dw - app.Scale(6); }
+                if (dx < area.x) { dx = area.x + app.Scale(2); }
+                int dy = popY2;
+                if (dy + dh > area.y + area.height) { dy = area.y + area.height - dh; }
+                if (dy < area.y) { dy = area.y; }
+
+                c.FillRoundRect(dx + 2, dy + 2, dw, dh, app.Scale(4), 0x40000000);
+                c.FillRoundRect(dx, dy, dw, dh, app.Scale(4), 0xFF2D2D30);
+                c.DrawRect(dx, dy, dw, dh, 0xFF3E3E42, 1);
+                int ty = dy + dpad;
+                c.DrawText(dx + dpad, ty, sigLine, 0xFF9CDCFE, fontSize);
+                ty = ty + fh + app.Scale(4);
+                c.DrawText(dx + dpad, ty, kindLine, 0xFF808080, t.fontSizeSmall);
+                ty = ty + Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+                int wl = 0;
+                while (wl < wrapped.Count) {
+                    c.DrawText(dx + dpad, ty, wrapped[wl], 0xFFCCCCCC, t.fontSizeSmall);
+                    ty = ty + Canvas.FontHeight(t.fontSizeSmall) + app.Scale(2);
+                    wl = wl + 1;
+                }
+            }
+        }
+
+        // ---- right-click context menu ----
+        // Open on right mouse button (button 1) pressed inside the text area.
+        if (app.window.EventKind() == 2 && app.window.EventButton() == 1) {
+            bool overArea = app.mouseX >= area.x + gutterW && app.mouseX < area.x + area.width
+                            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            if (overArea) {
+                if (!selActive) {
+                    int rrel = app.mouseY - area.y;
+                    int rclk = scrollLine + rrel / lineH;
+                    if (rclk >= lines.Count) { rclk = lines.Count - 1; }
+                    if (rclk < 0) { rclk = 0; }
+                    curLine = rclk;
+                    curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+                }
+                ctxOpen = true;
+                ctxX = app.mouseX;
+                ctxY = app.mouseY;
+                acActive = false;
+                app.RequestRedraw();
+            }
         }
 
         app.hitTester.Register(HitRegion.Create(id, area.x, area.y, area.width, area.height, 1));
 
-        if (app.window.EventKind() == 3) {
-            // Check autocomplete popup click FIRST
-            if (acActive && popShown > 0
+        // ---- left button pressed: place caret / begin drag-select ----
+        // Skip when the click lands on the autocomplete popup (handled on up).
+        bool overPopup = acActive && popShown > 0
+            && app.mouseX >= popX && app.mouseX < popX + popW
+            && app.mouseY >= popY && app.mouseY < popY + popH;
+        bool overFilter = acActive && filtW > 0
+            && app.mouseX >= filtX && app.mouseX < filtX + filtW
+            && app.mouseY >= filtY && app.mouseY < filtY + filtH;
+        bool overCodeLens = false;
+        int cli = 0;
+        while (cli < clLine.Count) {
+            if (app.mouseX >= clX[cli] && app.mouseX < clX[cli] + clW[cli]
+                && app.mouseY >= clY[cli] && app.mouseY < clY[cli] + lineH) {
+                overCodeLens = true;
+            }
+            cli = cli + 1;
+        }
+        // Reference-list popup: click an entry to jump, click outside to dismiss.
+        if (refPopOpen && app.window.EventKind() == 2 && app.window.EventButton() == 0) {
+            bool insidePop = app.mouseX >= refPopGX && app.mouseX < refPopGX + refPopGW
+                && app.mouseY >= refPopGY && app.mouseY < refPopGY + refPopGH;
+            if (insidePop) {
+                int relRow = (app.mouseY - refPopGY - refPopHeadH) / refPopRowH;
+                if (relRow >= 0 && relRow < refPopShown && relRow < refPopLines.Count) {
+                    JumpToRefLine(refPopName, refPopLines[relRow]);
+                    refPopOpen = false;
+                }
+                app.RequestRedraw();
+                return id;
+            }
+            refPopOpen = false;
+            app.RequestRedraw();
+        }
+
+        // Click on the diagnostics/scroll strip (right edge): jump to that line.
+        int diagStripW = app.Scale(14);
+        int diagStripX = area.x + area.width - diagStripW;
+        if (app.window.EventKind() == 2 && app.window.EventButton() == 0
+            && !ctxOpen && !overPopup && !overFilter && !overCodeLens
+            && app.mouseX >= diagStripX && app.mouseX < area.x + area.width
+            && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+            int dtotal = lines.Count;
+            if (dtotal < 1) { dtotal = 1; }
+            int dtgt = (app.mouseY - area.y) * dtotal / area.height;
+            if (dtgt < 0) { dtgt = 0; }
+            if (dtgt >= lines.Count) { dtgt = lines.Count - 1; }
+            curLine = dtgt;
+            if (curCol > lines[curLine].Length) { curCol = lines[curLine].Length; }
+            selActive = false;
+            ClearExtraCarets();
+            scrollLine = dtgt - visLines / 2;
+            if (scrollLine < 0) { scrollLine = 0; }
+            app.RequestRedraw();
+            return id;
+        }
+        if (app.window.EventKind() == 2 && app.window.EventButton() == 0
+            && !ctxOpen && !overPopup && !overFilter && !overCodeLens) {
+            bool overText = app.mouseX >= area.x + gutterW && app.mouseX < diagStripX
+                            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            if (overText) {
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                bool ct = Modifiers.HasCtrl(app.window.EventMods());
+                if (ct) {
+                    // Ctrl+click: place caret and ask the host for Go to Definition.
+                    CaretFromMouse(app, area, gutterW, fontSize);
+                    selActive = false;
+                    ClearExtraCarets();
+                    gotoRequested = true;
+                } else if (sh) {
+                    if (!selActive) {
+                        selAnchorLine = curLine; selAnchorCol = curCol; selActive = true;
+                    }
+                    CaretFromMouse(app, area, gutterW, fontSize);
+                } else {
+                    CaretFromMouse(app, area, gutterW, fontSize);
+                    selAnchorLine = curLine; selAnchorCol = curCol;
+                    selActive = false;
+                    ClearExtraCarets();
+                    mouseSelecting = true;
+                }
+                acActive = false;
+                app.RequestRedraw();
+            }
+        }
+
+        // ---- dragging: extend the selection to the pointer ----
+        if (app.window.EventKind() == 1 && mouseSelecting) {
+            CaretFromMouse(app, area, gutterW, fontSize);
+            if (curLine != selAnchorLine || curCol != selAnchorCol) { selActive = true; }
+            else { selActive = false; }
+            app.RequestRedraw();
+        }
+
+        // ---- hover: redraw so the symbol tooltip tracks the pointer ----
+        if (app.window.EventKind() == 1 && !mouseSelecting && !acActive) {
+            if (app.mouseX >= area.x && app.mouseX < area.x + area.width
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+                app.RequestRedraw();
+            }
+        }
+
+        if (app.window.EventKind() == 3 && app.window.EventButton() == 0 && !ctxOpen) {
+            mouseSelecting = false;
+            // CodeLens click: open an expandable list of all references.
+            bool clHit = false;
+            int clc = 0;
+            while (clc < clLine.Count) {
+                if (app.mouseX >= clX[clc] && app.mouseX < clX[clc] + clW[clc]
+                    && app.mouseY >= clY[clc] && app.mouseY < clY[clc] + lineH) {
+                    refPopLines = new List<int>();
+                    CollectRefs(clName[clc], clLine[clc], refPopLines);
+                    refPopName = clName[clc];
+                    refPopSel = 0;
+                    refPopX = clX[clc];
+                    refPopY = clY[clc] + lineH;
+                    refPopOpen = refPopLines.Count > 0;
+                    if (!refPopOpen) { JumpToNextRef(clName[clc], clLine[clc]); }
+                    clHit = true;
+                    app.RequestRedraw();
+                }
+                clc = clc + 1;
+            }
+            if (clHit) {
+                // handled
+            }
+            // Kind filter strip click: toggle the selected kind.
+            else if (acActive && filtW > 0
+                && app.mouseX >= filtX && app.mouseX < filtX + filtW
+                && app.mouseY >= filtY && app.mouseY < filtY + filtH) {
+                List<string> fk2 = new List<string>();
+                fk2.Add(""); fk2.Add("M"); fk2.Add("P"); fk2.Add("F");
+                fk2.Add("E"); fk2.Add("T"); fk2.Add("K"); fk2.Add("S");
+                int step = app.Scale(16) + app.Scale(4);
+                int fidx = (app.mouseX - (filtX + app.Scale(5))) / step;
+                if (fidx >= 0 && fidx < fk2.Count) {
+                    string chosenF = fk2[fidx];
+                    if (chosenF == "" || HasKind(chosenF)) {
+                        if (acFilter == chosenF) { acFilter = ""; }
+                        else { acFilter = chosenF; }
+                        acSel = 0;
+                        ApplyKindFilter();
+                    }
+                }
+                app.RequestRedraw();
+            }
+            // Check autocomplete popup click
+            else if (acActive && popShown > 0
                 && app.mouseX >= popX && app.mouseX < popX + popW
                 && app.mouseY >= popY && app.mouseY < popY + popH) {
                 int relY = app.mouseY - popY - app.Scale(2);
@@ -1490,24 +3578,18 @@ class CodeEditor {
                     int clickedIdx = popFirst + clickedRow;
                     if (clickedIdx >= 0 && clickedIdx < acItems.Count) {
                         acSel = clickedIdx;
-                        AcceptCompletion();
+                        AcceptCompletion(false);
                     }
                 }
                 app.RequestRedraw();
             } else {
                 int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
-                if (hit == id) {
+                if (hit == id && app.mouseX < area.x + gutterW) {
                     int rel = app.mouseY - area.y;
                     int clicked = scrollLine + rel / lineH;
                     if (clicked >= lines.Count) { clicked = lines.Count - 1; }
                     if (clicked < 0) { clicked = 0; }
-                    if (app.mouseX < area.x + gutterW) {
-                        ToggleBreakpoint(clicked);
-                    } else {
-                        curLine = clicked;
-                        curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
-                    }
-                    acActive = false;
+                    ToggleBreakpoint(clicked);
                     app.RequestRedraw();
                 }
             }
@@ -1523,9 +3605,9 @@ class CodeEditor {
                     int hoverCol = CodeEditor.ColFromX(lines[hoverLine], app.mouseX - textX, fontSize);
                     string hWord = CodeEditor.WordAt(lines[hoverLine], hoverCol);
                     if (hWord.Length > 0) {
-                        string tip = CodeEditor.LookupVar(dbgVars, hWord);
-                        if (tip.Length > 0) {
-                            hoverTip = tip;
+                        string raw = CodeEditor.LookupVarRaw(dbgVars, hWord);
+                        if (raw.Length > 0) {
+                            hoverTip = raw;
                             hoverTipX = app.mouseX;
                             hoverTipY = app.mouseY;
                         } else {
@@ -1536,18 +3618,181 @@ class CodeEditor {
                     }
                 }
             }
-            // Draw tooltip
+            // Draw the (possibly multi-line, JSON-formatted) tooltip.
             if (hoverTip.Length > 0) {
-                int ttW2 = Canvas.MeasureText(hoverTip, fontSize) + app.Scale(16);
-                int ttH2 = lineH + app.Scale(4);
+                List<string> hl = new List<string>();
+                CodeEditor.BuildHoverLines(hoverTip, hl);
+                int rowh = Canvas.FontHeight(fontSize) + app.Scale(2);
+                int maxw = 0;
+                int k = 0;
+                while (k < hl.Count) {
+                    int mw = Canvas.MeasureText(hl[k], fontSize);
+                    if (mw > maxw) { maxw = mw; }
+                    k = k + 1;
+                }
+                int ttW2 = maxw + app.Scale(16);
+                int capW = area.width - app.Scale(8);
+                if (ttW2 > capW) { ttW2 = capW; }
+                int ttH2 = rowh * hl.Count + app.Scale(8);
                 int ttX2 = hoverTipX + app.Scale(8);
-                int ttY2 = hoverTipY - ttH2 - app.Scale(4);
-                if (ttY2 < area.y) { ttY2 = hoverTipY + app.Scale(20); }
-                if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - 4; }
-                c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), 0x60000000);
+                int ttY2 = hoverTipY + app.Scale(20);
+                if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - app.Scale(4); }
+                if (ttX2 < area.x) { ttX2 = area.x; }
+                if (ttY2 + ttH2 > area.y + area.height) { ttY2 = hoverTipY - ttH2 - app.Scale(6); }
+                if (ttY2 < area.y) { ttY2 = area.y; }
+                c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), 0x80000000);
                 c.FillRoundRect(ttX2, ttY2, ttW2, ttH2, app.Scale(4), 0xFF1E1E1E);
                 c.DrawRect(ttX2, ttY2, ttW2, ttH2, 0xFF569CD6, 1);
-                c.DrawText(ttX2 + app.Scale(8), ttY2 + app.Scale(4), hoverTip, 0xFFCE9178, fontSize);
+                int ty = ttY2 + app.Scale(4);
+                int kk = 0;
+                while (kk < hl.Count) {
+                    int col = 0xFFCE9178;
+                    if (kk == 0) { col = 0xFF9CDCFE; }
+                    c.DrawText(ttX2 + app.Scale(8), ty, hl[kk], col, fontSize);
+                    ty = ty + rowh;
+                    kk = kk + 1;
+                }
+            }
+        }
+
+        // ---- Ctrl+hover: underline the identifier as a clickable link ----
+        if (!acActive && !ctxOpen && Modifiers.HasCtrl(app.window.EventMods())) {
+            int utextX = area.x + gutterW + t.paddingSmall;
+            if (app.mouseX >= utextX && app.mouseX < area.x + area.width
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+                int urel = app.mouseY - area.y;
+                int uln = scrollLine + urel / lineH;
+                if (uln >= 0 && uln < lines.Count) {
+                    string uls = lines[uln];
+                    int ucol = CodeEditor.ColFromX(uls, app.mouseX - utextX, fontSize);
+                    string uidset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+                    if (ucol >= 0 && ucol <= uls.Length) {
+                        int ua = ucol;
+                        while (ua > 0 && CodeEditor.InSet(uidset, uls.Substring(ua - 1, 1))) { ua = ua - 1; }
+                        int ub = ucol;
+                        while (ub < uls.Length && CodeEditor.InSet(uidset, uls.Substring(ub, 1))) { ub = ub + 1; }
+                        if (ub > ua) {
+                            int uxp = utextX + Canvas.MeasureText(uls.Substring(0, ua), fontSize);
+                            int uwp = Canvas.MeasureText(uls.Substring(ua, ub - ua), fontSize);
+                            int uyp = area.y + (uln - scrollLine) * lineH
+                                + (lineH + Canvas.FontHeight(fontSize)) / 2 + app.Scale(1);
+                            c.FillRect(uxp, uyp, uwp, app.Scale(1), 0xFF4EA1D3);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- symbol hover tooltip (method/property signature + docs) ----
+        if (!acActive && !ctxOpen && execLine < 0) {
+            string hw = WordAtMouse(app, area, gutterW, fontSize);
+            if (hw.Length > 0) {
+                string hsig = CodeEditor.DescSig(hw);
+                string hdoc = CodeEditor.DescDoc(hw);
+                if (hsig.Length > 0) {
+                    int hpad = app.Scale(8);
+                    int hfh = Canvas.FontHeight(fontSize);
+                    int sfh = Canvas.FontHeight(t.fontSizeSmall);
+                    // Fixed inner text width; wrap BOTH signature and docs to it so no
+                    // content can spill past the box, then shrink the box to the widest
+                    // line actually produced (never wider than the cap).
+                    int innerW = app.Scale(300);
+                    List<string> siglines = new List<string>();
+                    CodeEditor.WrapText(hsig, innerW, fontSize, siglines, 4);
+                    List<string> hlines = new List<string>();
+                    if (hdoc.Length > 0) {
+                        CodeEditor.WrapText(hdoc, innerW, t.fontSizeSmall, hlines, 6);
+                    }
+                    int widest = 0;
+                    int wi = 0;
+                    while (wi < siglines.Count) {
+                        int lw = Canvas.MeasureText(siglines[wi], fontSize);
+                        if (lw > widest) { widest = lw; }
+                        wi = wi + 1;
+                    }
+                    wi = 0;
+                    while (wi < hlines.Count) {
+                        int lw = Canvas.MeasureText(hlines[wi], t.fontSizeSmall);
+                        if (lw > widest) { widest = lw; }
+                        wi = wi + 1;
+                    }
+                    if (widest > innerW) { widest = innerW; }
+                    int hw2 = widest + hpad * 2;
+                    if (hw2 < app.Scale(120)) { hw2 = app.Scale(120); }
+                    int hh = hpad * 2 + siglines.Count * hfh;
+                    if (hlines.Count > 0) {
+                        hh = hh + app.Scale(4) + hlines.Count * (sfh + app.Scale(2));
+                    }
+                    int hx = app.mouseX + app.Scale(12);
+                    int hy = app.mouseY + app.Scale(18);
+                    if (hx + hw2 > area.x + area.width) { hx = area.x + area.width - hw2 - app.Scale(4); }
+                    if (hx < area.x) { hx = area.x + app.Scale(2); }
+                    if (hy + hh > area.y + area.height) { hy = app.mouseY - hh - app.Scale(6); }
+                    if (hy < area.y) { hy = area.y + app.Scale(2); }
+                    c.FillRoundRect(hx + 2, hy + 2, hw2, hh, app.Scale(4), 0x50000000);
+                    c.FillRoundRect(hx, hy, hw2, hh, app.Scale(4), 0xFF252526);
+                    c.DrawRect(hx, hy, hw2, hh, 0xFF569CD6, 1);
+                    int hty = hy + hpad;
+                    int sl = 0;
+                    while (sl < siglines.Count) {
+                        c.DrawText(hx + hpad, hty, siglines[sl], 0xFF9CDCFE, fontSize);
+                        hty = hty + hfh;
+                        sl = sl + 1;
+                    }
+                    hty = hty + app.Scale(4);
+                    int hl = 0;
+                    while (hl < hlines.Count) {
+                        c.DrawText(hx + hpad, hty, hlines[hl], 0xFFCCCCCC, t.fontSizeSmall);
+                        hty = hty + sfh + app.Scale(2);
+                        hl = hl + 1;
+                    }
+                }
+            }
+        }
+
+        // ---- expandable reference list popup (from a CodeLens click) ----
+        if (refPopOpen && refPopLines.Count > 0) {
+            int rpMax = 10;
+            int rpShown = refPopLines.Count;
+            if (rpShown > rpMax) { rpShown = rpMax; }
+            int rpRowH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+            int rpHeadH = rpRowH;
+            int rpW = app.Scale(440);
+            if (rpW > area.width - app.Scale(20)) { rpW = area.width - app.Scale(20); }
+            int rpH = rpHeadH + rpShown * rpRowH + app.Scale(6);
+            int rpX = refPopX;
+            int rpY = refPopY;
+            if (rpX + rpW > area.x + area.width) { rpX = area.x + area.width - rpW - app.Scale(6); }
+            if (rpX < area.x) { rpX = area.x + app.Scale(2); }
+            if (rpY + rpH > area.y + area.height) { rpY = area.y + area.height - rpH - app.Scale(4); }
+            if (rpY < area.y) { rpY = area.y + app.Scale(2); }
+            refPopGX = rpX; refPopGY = rpY; refPopGW = rpW; refPopGH = rpH;
+            refPopRowH = rpRowH; refPopHeadH = rpHeadH; refPopShown = rpShown;
+            c.FillRoundRect(rpX + 2, rpY + 2, rpW, rpH, app.Scale(4), 0x60000000);
+            c.FillRoundRect(rpX, rpY, rpW, rpH, app.Scale(4), 0xFF252526);
+            c.DrawRect(rpX, rpY, rpW, rpH, 0xFF569CD6, 1);
+            // Header: "N references to <name>"
+            string rpHead = Convert.ToString(refPopLines.Count) + " references to " + refPopName;
+            c.FillRect(rpX + 1, rpY + 1, rpW - 2, rpHeadH, 0xFF2D2D30);
+            c.DrawText(rpX + app.Scale(8), rpY + app.Scale(4), rpHead, 0xFF9CDCFE, t.fontSizeSmall);
+            int rri = 0;
+            while (rri < rpShown) {
+                int rl = refPopLines[rri];
+                int ry = rpY + rpHeadH + rri * rpRowH;
+                bool rhover = app.mouseX >= rpX && app.mouseX < rpX + rpW
+                    && app.mouseY >= ry && app.mouseY < ry + rpRowH;
+                if (rhover) { c.FillRect(rpX + 1, ry, rpW - 2, rpRowH, 0xFF094771); }
+                string rnum = Convert.ToString(rl + 1);
+                c.DrawText(rpX + app.Scale(8), ry + app.Scale(3), rnum, 0xFF858585, t.fontSizeSmall);
+                string rcode = CodeEditor.TrimStr(lines[rl]);
+                if (rcode.Length > 64) { rcode = rcode.Substring(0, 64) + "..."; }
+                c.DrawText(rpX + app.Scale(48), ry + app.Scale(3), rcode, 0xFFCCCCCC, t.fontSizeSmall);
+                rri = rri + 1;
+            }
+            if (refPopLines.Count > rpShown) {
+                int mory = rpY + rpHeadH + rpShown * rpRowH;
+                c.DrawText(rpX + app.Scale(8), mory - rpRowH + app.Scale(3),
+                    "... +" + Convert.ToString(refPopLines.Count - rpShown) + " more", 0xFF858585, t.fontSizeSmall);
             }
         }
 
@@ -1617,5 +3862,119 @@ class CodeEditor {
             i = i + 1;
         }
         return "";
+    }
+
+    /// Like LookupVar, but returns the raw "name\ttype\tvalue" entry so the
+    /// caller can render an expandable, formatted tooltip.
+    static string LookupVarRaw(List<string> vars, string name) {
+        int i = 0;
+        while (i < vars.Count) {
+            string entry = vars[i];
+            int tab1 = -1;
+            int j = 0;
+            while (j < entry.Length) {
+                if (entry.Substring(j, 1) == "\t") { tab1 = j; j = entry.Length; }
+                j = j + 1;
+            }
+            if (tab1 > 0 && entry.Substring(0, tab1) == name) { return entry; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    static string Indent(int n) {
+        string s = "";
+        int i = 0;
+        while (i < n && i < 12) { s = s + "  "; i = i + 1; }
+        return s;
+    }
+
+    /// Pretty-prints a JSON-ish value string into indented lines. Ignores
+    /// structure inside quoted strings, caps at maxLines, truncates very long
+    /// lines, and reads at most 8000 input chars (large-data safety).
+    static void PrettyJson(string s, List<string> out2, int maxLines) {
+        int indent = 0;
+        string cur = "";
+        bool inStr = false;
+        int i = 0;
+        int limit = s.Length;
+        if (limit > 8000) { limit = 8000; }
+        while (i < limit) {
+            string ch = s.Substring(i, 1);
+            if (inStr) {
+                cur = cur + ch;
+                if (ch == "\"") { inStr = false; }
+                else if (ch == "\\" && i + 1 < limit) { cur = cur + s.Substring(i + 1, 1); i = i + 1; }
+            } else if (ch == "\"") {
+                cur = cur + ch; inStr = true;
+            } else if (ch == "{" || ch == "[") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+                indent = indent + 1;
+            } else if (ch == "}" || ch == "]") {
+                if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); cur = ""; }
+                indent = indent - 1;
+                if (indent < 0) { indent = 0; }
+                out2.Add(CodeEditor.Indent(indent) + ch);
+            } else if (ch == ",") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+            } else if (ch == ":") {
+                cur = cur + ": ";
+            } else if (ch == " " || ch == "\n" || ch == "\t" || ch == "\r") {
+                // insignificant whitespace outside strings
+            } else {
+                cur = cur + ch;
+            }
+            if (out2.Count >= maxLines) { out2.Add("  ...(truncated)"); return; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); }
+    }
+
+    /// Caps a single tooltip line so a very long value can't blow up the box.
+    static string Clip(string s) {
+        if (s.Length > 200) { return s.Substring(0, 200) + " ..."; }
+        return s;
+    }
+
+    /// Builds the lines shown in the debug hover tooltip: a header
+    /// (`name : type`) followed by the value, pretty-printed if it looks like
+    /// JSON / an array / an object.
+    static void BuildHoverLines(string entry, List<string> out2) {
+        int tab1 = -1;
+        int tab2 = -1;
+        int j = 0;
+        while (j < entry.Length) {
+            string ch = entry.Substring(j, 1);
+            if (ch == "\t") {
+                if (tab1 < 0) { tab1 = j; }
+                else if (tab2 < 0) { tab2 = j; }
+            }
+            j = j + 1;
+        }
+        string vName = entry;
+        string vType = "";
+        string vVal = "";
+        if (tab1 > 0) {
+            vName = entry.Substring(0, tab1);
+            if (tab2 > tab1) {
+                vType = entry.Substring(tab1 + 1, tab2 - tab1 - 1);
+                vVal = entry.Substring(tab2 + 1, entry.Length - tab2 - 1);
+            } else {
+                vType = entry.Substring(tab1 + 1, entry.Length - tab1 - 1);
+            }
+        }
+        out2.Add(vName + " : " + vType);
+        int a = 0;
+        while (a < vVal.Length && vVal.Substring(a, 1) == " ") { a = a + 1; }
+        string vt = vVal.Substring(a, vVal.Length - a);
+        if (vt.Length > 0 && (vt.Substring(0, 1) == "{" || vt.Substring(0, 1) == "[")) {
+            CodeEditor.PrettyJson(vt, out2, 60);
+        } else {
+            out2.Add("= " + CodeEditor.Clip(vVal));
+        }
     }
 }
