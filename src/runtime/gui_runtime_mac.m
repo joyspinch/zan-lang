@@ -11,6 +11,7 @@
  */
 #import <Cocoa/Cocoa.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -288,4 +289,22 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
         [pb setString:(s ? s : @"") forType:NSPasteboardTypeString];
     }
     return 0;
+}
+
+/* Read the general pasteboard's text as UTF-8. Mirrors the Windows/X11 ABI:
+ * returns a NUL-terminated i8* valid until the next call (the previous buffer
+ * is freed each time), or "" when the pasteboard holds no text. */
+EXPORT const char *zan_gui_get_clipboard(void) {
+    static char *g_clip_buf = NULL;
+    @autoreleasepool {
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        NSString *s = [pb stringForType:NSPasteboardTypeString];
+        const char *utf8 = s ? [s UTF8String] : NULL;
+        if (!utf8) return "";
+        char *nb = strdup(utf8);
+        if (!nb) return "";
+        free(g_clip_buf);
+        g_clip_buf = nb;
+        return g_clip_buf;
+    }
 }
