@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.16)
 # CXX is enabled so that targets linking LLVM's C++ static libraries can be
 # driven by the C++ linker where needed (see the MinGW case below).
 project(zan-lang C CXX)
@@ -241,10 +241,10 @@ endif()
 # ---- Tests ----
 enable_testing()
 
-add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-tokens)
-add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast)
-add_test(NAME test_emit_ir_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --emit-ir)
-add_test(NAME test_compile_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan -o ${CMAKE_BINARY_DIR}/hello_test)
+add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/fixtures/hello.zan --dump-tokens)
+add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/fixtures/hello.zan --dump-ast)
+add_test(NAME test_emit_ir_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/fixtures/hello.zan --emit-ir)
+add_test(NAME test_compile_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/fixtures/hello.zan -o ${CMAKE_BINARY_DIR}/hello_test)
 
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
@@ -295,9 +295,9 @@ add_test(NAME conformance_multifile
 add_test(NAME conformance_minic
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/examples/minic/driver.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/minic/lexer.zan;${CMAKE_SOURCE_DIR}/examples/minic/parser.zan"
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/examples/minic/expected.out
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/fixtures/minic/driver.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/fixtures/minic/lexer.zan;${CMAKE_SOURCE_DIR}/tests/fixtures/minic/parser.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/fixtures/minic/expected.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
@@ -312,7 +312,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   add_test(NAME conformance_gui_stack
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/examples/layout_test.zan
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/fixtures/gui/layout_test.zan
       # Types.zan is pulled in automatically by 'using Gui;' (auto-stdlib), so
       # only the non-auto-included Stack.zan is passed explicitly here.
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/gui/Stack.zan"
@@ -323,7 +323,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   add_test(NAME conformance_gui_text
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/examples/text_test.zan
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/fixtures/gui/text_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/gui/Text.zan"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
