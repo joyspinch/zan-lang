@@ -113,6 +113,21 @@ Correct programs whose objects are all released report nothing, so the check
 is free of false positives. See `src/self/rt_divzero.zan` and
 `src/self/rt_leak.zan` for runnable examples.
 
+The same report also covers **coroutine frames**. An `async` call heap-allocates
+a frame that lives across suspensions; a detached (`Task.Spawn`) or never-awaited
+coroutine that never completes leaks that frame. Under `--check-leaks` each
+frame's allocation is attributed to the `async` method that produced it, so a
+leaked frame prints with its `file:line:col`, e.g.:
+
+```
+zan: memory leak detected: 1 object(s) still reachable at exit
+  1 object(s) leaked, allocated at server.zan:42:5 [coroutine frame: HttpServer$HandleConnection]
+```
+
+The `file:line:col` prefix lets an editor/IDE jump straight to the leaking
+`async` method. Frames carry no ARC header (they are raw allocations), so this
+attribution is what makes such leaks visible at all.
+
 ## Test suite & deterministic codegen
 
 `ctest` runs three regression families over every build configuration:

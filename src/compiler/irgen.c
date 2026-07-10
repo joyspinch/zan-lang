@@ -540,10 +540,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * knowing its concrete frame type (see ASYNC_FRAME_* indices). */
     LLVMTypeRef co_hdr_fields[] = {
         LLVMInt32TypeInContext(g->ctx), LLVMInt32TypeInContext(g->ctx),
-        i8ptr, g->co_step_ptr, i64
+        i8ptr, g->co_step_ptr, i64, i64
     };
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
-    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 5, 0);
+    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 6, 0);
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
     g->current_async_resume_fn = NULL;
@@ -1293,7 +1293,9 @@ enum {
     ASYNC_FRAME_AWAITER = 2,      /* i8*: frame waiting on this one (or null) */
     ASYNC_FRAME_AWAITER_STEP = 3, /* void(i8*)*: awaiter's resume fn (or null) */
     ASYNC_FRAME_RESULT = 4,       /* i64: return value (scalars are i64 here) */
-    ASYNC_FRAME_FIRST_PARAM = 5
+    ASYNC_FRAME_SITE = 5,         /* i64: allocation-site index for --check-leaks
+                                   * frame-leak reporting (0 otherwise) */
+    ASYNC_FRAME_FIRST_PARAM = 6
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);
@@ -1972,6 +1974,31 @@ static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef
     return buf;
 }
 
+/* --check-leaks: decrement the live-object counters for a coroutine frame just
+ * before it is freed. The frame's allocation-site index lives in its header
+ * (ASYNC_FRAME_SITE, stored by the ramp), reachable through an i8* via the
+ * shared co_header_type -- mirroring how the await protocol touches header
+ * fields of a sub-frame it only knows as i8*. No-op unless --check-leaks. */
+static void emit_co_frame_untrack(zan_irgen_t *g, LLVMValueRef frame_i8) {
+    if (!g->check_leaks) return;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef site_ptr = LLVMBuildStructGEP2(g->builder, g->co_header_type,
+        frame_i8, ASYNC_FRAME_SITE, "co.site.p");
+    LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, site_ptr, "co.site");
+    /* __zan_live-- */
+    LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
+    LLVMBuildStore(g->builder,
+        LLVMBuildSub(g->builder, lv, LLVMConstInt(i64, 1, 0), "live.dec"), g->g_live);
+    /* __zan_site_live[site]-- */
+    LLVMValueRef gidx[2] = { LLVMConstInt(i32, 0, 0), site };
+    LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live,
+        gidx, 2, "co.scp");
+    LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64, sc_ptr, "co.sc");
+    LLVMBuildStore(g->builder,
+        LLVMBuildSub(g->builder, sc, LLVMConstInt(i64, 1, 0), "co.sc.dec"), sc_ptr);
+}
+
 /* Return the internal `__zan_co_reap` step function, creating it once per
  * module. It matches zan_co_step_t (void(i8*)) and simply frees the frame it is
  * handed. A detached (Task.Spawn) coroutine has no awaiter to hand its frame
@@ -1990,6 +2017,7 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, reap, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef arg = LLVMGetParam(reap, 0);
+    emit_co_frame_untrack(g, arg);
     LLVMBuildCall2(g->builder, LLVMGlobalGetValueType(g->fn_free), g->fn_free, &arg, 1, "");
     LLVMBuildRetVoid(g->builder);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
@@ -5655,6 +5683,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                  * owns it once the sub is done). Without this, every awaited
                  * async call leaks its frame -- a per-request leak that grows a
                  * long-running socket server's memory without bound. */
+                emit_co_frame_untrack(g, sub_rl);
                 LLVMBuildCall2(g->builder, LLVMGlobalGetValueType(g->fn_free),
                     g->fn_free, &sub_rl, 1, "");
                 return awres;
@@ -5670,6 +5699,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");
             /* Root-driven sub has run to completion; copy out its result then
              * free its heap frame (no awaiter will). */
+            emit_co_frame_untrack(g, sub_i8);
             LLVMBuildCall2(g->builder, LLVMGlobalGetValueType(g->fn_free),
                 g->fn_free, &sub_i8, 1, "");
             return awres;
@@ -7286,6 +7316,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_AWAITER] = i8ptr;
                 fields[ASYNC_FRAME_AWAITER_STEP] = g->co_step_ptr;
                 fields[ASYNC_FRAME_RESULT] = i64;
+                fields[ASYNC_FRAME_SITE] = i64;
                 for (int k = 0; k < total_params; k++) {
                     fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
                 }
@@ -7417,6 +7448,45 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_AWAITER_STEP, "aws"));
             LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),
                 LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_RESULT, "rs"));
+            /* Record this frame's allocation site so a --check-leaks run reports
+             * a leaked coroutine frame by source location (file:line:col), just
+             * like an ARC `new` leak site -- enabling jump-to-code in an editor.
+             * Frames are raw malloc (no ARC header), so they need their own
+             * counter bump here and matching decrement in emit_co_frame_untrack. */
+            {
+                int co_site_idx = 0;
+                if (g->check_leaks) {
+                    co_site_idx = g->leak_site_count;
+                    if (co_site_idx >= ZAN_MAX_LEAK_SITES) co_site_idx = ZAN_MAX_LEAK_SITES - 1;
+                    else g->leak_site_count++;
+                    size_t cfn_len = 0;
+                    const char *cfn = LLVMGetValueName2(ramp_fn, &cfn_len);
+                    if (!cfn) cfn = "?";
+                    const char *sfile = g->src_file ? g->src_file : "<unknown>";
+                    char co_site_buf[700];
+                    snprintf(co_site_buf, sizeof(co_site_buf), "%s:%u:%u [coroutine frame: %s]",
+                             sfile, member->loc.line, member->loc.col, cfn);
+                    LLVMValueRef co_site_name = LLVMBuildGlobalStringPtr(g->builder, co_site_buf, "co.site");
+                    LLVMValueRef gidx[2] = { LLVMConstInt(i32, 0, 0),
+                        LLVMConstInt(i64, (unsigned long long)co_site_idx, 0) };
+                    /* __zan_live++ */
+                    LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
+                    LLVMBuildStore(g->builder,
+                        LLVMBuildAdd(g->builder, lv, LLVMConstInt(i64, 1, 0), "live.inc"), g->g_live);
+                    /* __zan_site_live[idx]++ */
+                    LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live,
+                        gidx, 2, "co.scp");
+                    LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64, sc_ptr, "co.sc");
+                    LLVMBuildStore(g->builder,
+                        LLVMBuildAdd(g->builder, sc, LLVMConstInt(i64, 1, 0), "co.sc.inc"), sc_ptr);
+                    /* __zan_site_names[idx] = "file:line:col [coroutine frame: fn]" */
+                    LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, g->site_names_type, g->g_site_names,
+                        gidx, 2, "co.nmp");
+                    LLVMBuildStore(g->builder, co_site_name, nm_ptr);
+                }
+                LLVMBuildStore(g->builder, LLVMConstInt(i64, (unsigned long long)co_site_idx, 0),
+                    LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_SITE, "site"));
+            }
             for (int k = 0; k < total_params; k++) {
                 LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, frame_type, rframe,
                     (unsigned)(ASYNC_FRAME_FIRST_PARAM + k), "arg");
