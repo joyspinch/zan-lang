@@ -233,7 +233,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_io_pump_timeout_type = LLVMFunctionType(i32d, pump_args, 1, 0);
         g->rt_io_pump_timeout = LLVMAddFunction(g->mod, "zan_io_pump_timeout",
             g->rt_io_pump_timeout_type);
-        LLVMSetLinkage(g->rt_io_pump_timeout, LLVMWeakAnyLinkage);
+        LLVMSetLinkage(g->rt_io_pump_timeout,
+            g->mt_scheduler ? LLVMExternalLinkage : LLVMWeakAnyLinkage);
 
         LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
         LLVMValueRef legacy_pump = LLVMAddFunction(g->mod, "zan_io_pump",
