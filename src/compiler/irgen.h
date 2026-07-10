@@ -35,6 +35,7 @@ struct zan_irgen {
     /* current 'this' context for method bodies */
     LLVMValueRef current_this;       /* alloca for 'this' pointer */
     zan_symbol_t *current_type_sym;  /* type symbol for 'this' */
+    zan_ast_node_t *current_fn_body; /* root AST body of the fn being compiled */
 
     /* runtime function declarations */
     LLVMValueRef rt_println;   /* zan_rt_println(const char*) */
@@ -89,6 +90,7 @@ struct zan_irgen {
     /* ARC runtime functions */
     LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
     LLVMValueRef rt_release;     /* zan_rt_release(void*) */
+    LLVMValueRef rt_release_dyn; /* zan_rt_release_dyn(void*): RTTI dispatch */
     LLVMValueRef rt_alloc;       /* zan_rt_alloc(int64_t size) -> void* */
     LLVMValueRef rt_str_retain;  /* zan_rt_str_retain(void*) */
     LLVMValueRef rt_str_release; /* zan_rt_str_release(void*) */
@@ -106,6 +108,9 @@ struct zan_irgen {
     LLVMValueRef g_site_names;    /* [N x i8*] global: "file:line:col" per site */
     LLVMTypeRef  site_live_type;  /* [N x i64] array type */
     LLVMTypeRef  site_names_type; /* [N x i8*] array type */
+    LLVMValueRef g_site_dtors;    /* [N x i8*] global: release fn per alloc site */
+    LLVMTypeRef  site_dtors_type; /* [N x i8*] array type */
+    zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
     int          leak_site_count; /* number of distinct `new` sites assigned */
     LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */

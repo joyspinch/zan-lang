@@ -75,6 +75,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->g_site_names = LLVMAddGlobal(g->mod, g->site_names_type, "__zan_site_names");
         LLVMSetInitializer(g->g_site_names, LLVMConstNull(g->site_names_type));
         LLVMSetLinkage(g->g_site_names, LLVMInternalLinkage);
+        /* dynamic release dispatch: per-site concrete destructor table */
+        g->site_dtors_type = LLVMArrayType(i8p, ZAN_MAX_LEAK_SITES);
+        g->g_site_dtors = LLVMAddGlobal(g->mod, g->site_dtors_type, "__zan_site_dtors");
+        LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(g->site_dtors_type));
+        LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
+        g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
     }
 
     /* declare printf */
@@ -662,6 +668,54 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef sc1 = LLVMBuildSub(g->builder, sc, LLVMConstInt(i64, 1, 0), "sc_dec");
             LLVMBuildStore(g->builder, sc1, sc_ptr);
         }
+        LLVMBuildBr(g->builder, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, ret_bb);
+        LLVMBuildRetVoid(g->builder);
+    }
+
+    /* ARC runtime: zan_rt_release_dyn(void*) -> void
+     * Read the allocation-site index recorded in the header and dispatch to
+     * that site's concrete per-class destructor (releases the object's RC
+     * fields, then decrements/frees). Falls back to a plain zan_rt_release
+     * when the site has no destructor. Using the recorded (concrete) site
+     * makes release follow the *runtime* type, so derived-instance fields are
+     * freed even when the value is held through a base-typed reference. */
+    {
+        LLVMTypeRef reld_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
+        g->rt_release_dyn = LLVMAddFunction(g->mod, "zan_rt_release_dyn", reld_type);
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef obj = LLVMGetParam(g->rt_release_dyn, 0);
+        LLVMValueRef is_null = LLVMBuildICmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
+        LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "cont");
+        LLVMBasicBlockRef lookup = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "lookup");
+        LLVMBasicBlockRef calld = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "calld");
+        LLVMBasicBlockRef fb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "fallback");
+        LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "ret");
+        LLVMBuildCondBr(g->builder, is_null, ret_bb, cont);
+        LLVMPositionBuilderAtEnd(g->builder, cont);
+        LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)-8, 1);
+        LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
+        LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
+        LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
+        LLVMValueRef inrange = LLVMBuildICmp(g->builder, LLVMIntULT, site,
+            LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
+        LLVMBuildCondBr(g->builder, inrange, lookup, fb);
+        LLVMPositionBuilderAtEnd(g->builder, lookup);
+        LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        LLVMValueRef gidx[2] = { z32, site };
+        LLVMValueRef dpp = LLVMBuildGEP2(g->builder, g->site_dtors_type, g->g_site_dtors, gidx, 2, "dpp");
+        LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr, dpp, "dtor");
+        LLVMValueRef hasd = LLVMBuildICmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
+        LLVMBuildCondBr(g->builder, hasd, calld, fb);
+        LLVMPositionBuilderAtEnd(g->builder, calld);
+        LLVMTypeRef dfnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+        LLVMValueRef dfn = LLVMBuildBitCast(g->builder, dtor, LLVMPointerType(dfnty, 0), "dfn");
+        LLVMBuildCall2(g->builder, dfnty, dfn, &obj, 1, "");
+        LLVMBuildBr(g->builder, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, fb);
+        LLVMBuildCall2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+            g->rt_release, &obj, 1, "");
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
@@ -1774,13 +1828,16 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
  * __zan_release_<T> (which releases RC fields then frees). Falls back to the
  * plain rc decrement when no per-class function exists (unregistered type). */
 static void emit_arc_release_typed(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
+    (void)type;
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
-    LLVMValueRef fn = type ? get_class_release_decl(g, type->sym) : NULL;
-    if (!fn) { emit_arc_release(g, v); return; }
+    /* Dispatch on the object's recorded allocation site (its concrete type)
+     * rather than the static type, so a base-typed reference still frees the
+     * derived instance's fields. zan_rt_release_dyn falls back to a plain
+     * decrement when the site has no per-class destructor. */
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rlt");
     LLVMBuildCall2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-                   fn, &v, 1, "");
+                   g->rt_release_dyn, &v, 1, "");
 }
 
 /* Build the bodies of every class release function. Called at finalize, once
@@ -1793,6 +1850,26 @@ static void emit_all_class_releases(zan_irgen_t *g) {
         LLVMValueRef fn = get_class_release_decl(g, sym);
         if (fn) build_class_release_body(g, sym, fn);
     }
+}
+
+/* Fill __zan_site_dtors[site] with the concrete per-class destructor recorded
+ * for that allocation site, so zan_rt_release_dyn can dispatch on runtime
+ * type. Must run after emit_all_class_releases (all destructors declared). */
+static void emit_site_dtor_table(zan_irgen_t *g) {
+    if (!g->site_syms) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    int n = ZAN_MAX_LEAK_SITES;
+    LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
+    for (int i = 0; i < n; i++) {
+        LLVMValueRef e = LLVMConstNull(i8ptr);
+        if (i < g->leak_site_count && g->site_syms[i]) {
+            LLVMValueRef fn = get_class_release_decl(g, g->site_syms[i]);
+            if (fn) e = LLVMConstBitCast(fn, i8ptr);
+        }
+        elems[i] = e;
+    }
+    LLVMSetInitializer(g->g_site_dtors, LLVMConstArray(i8ptr, elems, (unsigned)n));
+    free(elems);
 }
 
 /* A value already carrying an owned (+1) reference we may take over as-is;
@@ -5454,18 +5531,23 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMValueRef sz = LLVMSizeOf(st);
                         LLVMValueRef site_name = LLVMConstNull(i8ptr);
                         LLVMValueRef site_val = LLVMConstInt(i64, 0, 0);
-                        if (g->check_leaks) {
-                            /* assign a stable allocation-site index and a
-                             * "file:line:col" descriptor for leak reporting. */
+                        {
+                            /* Assign a stable allocation-site index (always: it
+                             * also keys dynamic release dispatch to this site's
+                             * concrete class). The "file:line:col" descriptor is
+                             * only needed for --check-leaks reporting. */
                             int site_idx = g->leak_site_count;
                             if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
                             else g->leak_site_count++;
-                            char site_buf[600];
-                            const char *sfile = g->src_file ? g->src_file : "<unknown>";
-                            snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
-                                     sfile, expr->loc.line, expr->loc.col);
-                            site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+                            if (g->site_syms) g->site_syms[site_idx] = sym;
                             site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
+                            if (g->check_leaks) {
+                                char site_buf[600];
+                                const char *sfile = g->src_file ? g->src_file : "<unknown>";
+                                snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
+                                         sfile, expr->loc.line, expr->loc.col);
+                                site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+                            }
                         }
                         LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
                             (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
@@ -6612,6 +6694,132 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
     }
 }
 
+/* ---- rc-element array escape analysis ----
+ * A `new T[n]` array of rc elements is released element-by-element at scope
+ * exit. That is only sound when the buffer does not outlive the scope, i.e. it
+ * never escapes: used only as an index base `a[i]` or a borrowed member read
+ * `a.Length`. Any other use of the bare identifier (return, assignment RHS,
+ * call argument, collection/field store, ...) shares the pointer, so we skip
+ * the release for it (leak rather than risk a double-free). */
+static int arr_ident_named(zan_ast_node_t *e, zan_istr_t nm) {
+    return e && e->kind == AST_IDENTIFIER &&
+           e->ident.name.len == nm.len &&
+           (nm.len == 0 || memcmp(e->ident.name.str, nm.str, (size_t)nm.len) == 0);
+}
+static void arr_escape_stmt(zan_istr_t nm, zan_ast_node_t *st, int *esc);
+static void arr_escape_expr(zan_istr_t nm, zan_ast_node_t *e, int *esc) {
+    if (!e || *esc) return;
+    switch (e->kind) {
+    case AST_IDENTIFIER:
+        if (arr_ident_named(e, nm)) *esc = 1;
+        break;
+    case AST_INDEX:
+        if (!arr_ident_named(e->index.object, nm))
+            arr_escape_expr(nm, e->index.object, esc);
+        arr_escape_expr(nm, e->index.index, esc);
+        break;
+    case AST_MEMBER_ACCESS:
+        if (!arr_ident_named(e->member.object, nm))
+            arr_escape_expr(nm, e->member.object, esc);
+        break;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        arr_escape_expr(nm, e->binary.left, esc);
+        arr_escape_expr(nm, e->binary.right, esc);
+        break;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        arr_escape_expr(nm, e->unary.operand, esc);
+        break;
+    case AST_CALL:
+        arr_escape_expr(nm, e->call.callee, esc);
+        for (int i = 0; i < e->call.args.count; i++)
+            arr_escape_expr(nm, e->call.args.items[i], esc);
+        break;
+    case AST_CONDITIONAL:
+        arr_escape_expr(nm, e->conditional.cond, esc);
+        arr_escape_expr(nm, e->conditional.then_expr, esc);
+        arr_escape_expr(nm, e->conditional.else_expr, esc);
+        break;
+    case AST_NEW_EXPR:
+        for (int i = 0; i < e->new_expr.args.count; i++)
+            arr_escape_expr(nm, e->new_expr.args.items[i], esc);
+        break;
+    case AST_CAST_EXPR:
+        arr_escape_expr(nm, e->cast.expr, esc);
+        break;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        arr_escape_expr(nm, e->type_test.expr, esc);
+        break;
+    case AST_AWAIT_EXPR:
+        arr_escape_expr(nm, e->await_expr.expr, esc);
+        break;
+    default:
+        break;
+    }
+}
+static void arr_escape_stmt(zan_istr_t nm, zan_ast_node_t *st, int *esc) {
+    if (!st || *esc) return;
+    switch (st->kind) {
+    case AST_BLOCK:
+        for (int i = 0; i < st->block.stmts.count; i++)
+            arr_escape_stmt(nm, st->block.stmts.items[i], esc);
+        break;
+    case AST_VAR_DECL:
+        arr_escape_expr(nm, st->var_decl.initializer, esc);
+        break;
+    case AST_EXPR_STMT:
+        arr_escape_expr(nm, st->expr_stmt.expr, esc);
+        break;
+    case AST_RETURN_STMT:
+        arr_escape_expr(nm, st->ret.value, esc);
+        break;
+    case AST_IF_STMT:
+        arr_escape_expr(nm, st->if_stmt.cond, esc);
+        arr_escape_stmt(nm, st->if_stmt.then_body, esc);
+        arr_escape_stmt(nm, st->if_stmt.else_body, esc);
+        break;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        arr_escape_expr(nm, st->while_stmt.cond, esc);
+        arr_escape_stmt(nm, st->while_stmt.body, esc);
+        break;
+    case AST_FOR_STMT:
+        arr_escape_stmt(nm, st->for_stmt.init, esc);
+        arr_escape_expr(nm, st->for_stmt.cond, esc);
+        arr_escape_expr(nm, st->for_stmt.step, esc);
+        arr_escape_stmt(nm, st->for_stmt.body, esc);
+        break;
+    case AST_FOREACH_STMT:
+        arr_escape_expr(nm, st->foreach_stmt.collection, esc);
+        arr_escape_stmt(nm, st->foreach_stmt.body, esc);
+        break;
+    case AST_THROW_STMT:
+        arr_escape_expr(nm, st->throw_stmt.value, esc);
+        break;
+    case AST_TRY_STMT:
+        arr_escape_stmt(nm, st->try_stmt.try_body, esc);
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            arr_escape_stmt(nm, st->try_stmt.catches.items[i]->catch_clause.body, esc);
+        arr_escape_stmt(nm, st->try_stmt.finally_body, esc);
+        break;
+    case AST_SWITCH_STMT:
+        arr_escape_expr(nm, st->switch_stmt.expr, esc);
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            arr_escape_stmt(nm, st->switch_stmt.cases.items[i]->switch_case.body, esc);
+        break;
+    default:
+        break;
+    }
+}
+static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm) {
+    int esc = 0;
+    if (g->current_fn_body) arr_escape_stmt(nm, g->current_fn_body, &esc);
+    else esc = 1; /* unknown body: conservative */
+    return esc;
+}
+
 /* ---- statement codegen ---- */
 
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
@@ -6871,10 +7079,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * elements can be released at scope exit (arrays have no length header). */
         if (type && type->kind == TYPE_ARRAY && type->element_type &&
             is_rc_managed_type(type->element_type) &&
+            !g->current_async_frame &&
             stmt->var_decl.initializer &&
             stmt->var_decl.initializer->kind == AST_NEW_EXPR &&
             stmt->var_decl.initializer->new_expr.is_array &&
-            stmt->var_decl.initializer->new_expr.args.count > 0) {
+            stmt->var_decl.initializer->new_expr.args.count > 0 &&
+            !rc_array_local_escapes(g, stmt->var_decl.name)) {
             zan_ast_node_t *sz = stmt->var_decl.initializer->new_expr.args.items[0];
             if (sz->kind == AST_INT_LITERAL || sz->kind == AST_IDENTIFIER) {
                 LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -7334,6 +7544,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
     g->current_type_sym = type_sym;
     g->current_this = NULL;
+    g->current_fn_body = method->method_decl.body;
 
     /* schedule the leak report to run at program exit */
     if (g->check_leaks) {
@@ -7354,6 +7565,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
     }
     g->current_type_sym = NULL;
+    g->current_fn_body = NULL;
 }
 
 /* ---- emit user-defined methods ---- */
@@ -7840,10 +8052,30 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
         LLVMValueRef saved_this = g->current_this;
         zan_symbol_t *saved_type_sym = g->current_type_sym;
+        zan_ast_node_t *saved_fn_body = g->current_fn_body;
         g->current_fn = fn;
         g->current_fn_ret_type = llvm_ret;
         g->current_this = is_static ? NULL : this_alloca;
         g->current_type_sym = type_sym;
+        g->current_fn_body = member->method_decl.body;
+
+        /* implicit base construction: a derived constructor first chains to
+         * its base class's parameterless constructor so inherited fields are
+         * initialised (base fields are laid out as a prefix of the derived
+         * struct, so `this` upcasts by a plain bitcast). */
+        if (member->kind == AST_CONSTRUCTOR_DECL && type_sym->type && type_sym->type->base_type &&
+            type_sym->type->base_type->sym) {
+            zan_symbol_t *base_sym = type_sym->type->base_type->sym;
+            for (int ci = 0; ci < g->ctor_count; ci++) {
+                if (g->ctors[ci].type_sym == base_sym && g->ctors[ci].param_count == 0) {
+                    LLVMValueRef thisv = LLVMBuildLoad2(g->builder, param_types[0], this_alloca, "this.base");
+                    LLVMTypeRef bst = get_struct_llvm_type(g, base_sym);
+                    if (bst) thisv = LLVMBuildBitCast(g->builder, thisv, LLVMPointerType(bst, 0), "base.this");
+                    LLVMBuildCall2(g->builder, g->ctors[ci].fn_type, g->ctors[ci].fn, &thisv, 1, "");
+                    break;
+                }
+            }
+        }
 
         /* emit method body */
         if (member->method_decl.body->kind == AST_BLOCK) {
@@ -7887,6 +8119,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_fn_ret_type = saved_fn_ret;
         g->current_this = saved_this;
         g->current_type_sym = saved_type_sym;
+        g->current_fn_body = saved_fn_body;
         free(param_types);
     }
 
@@ -7932,6 +8165,7 @@ done:
     /* Synthesise per-class release functions now that every class type has
      * been registered (Pass 1) and referenced (Passes 2/3). */
     emit_all_class_releases(g);
+    emit_site_dtor_table(g);
     /* An error diagnostic emitted during codegen (e.g. an unsupported await
      * form flagged by the ANF pass) must fail the build — the driver only
      * checks diagnostics before codegen, so surface it here. */
