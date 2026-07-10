@@ -25,6 +25,7 @@
 #define MAX_MEMBERS 512
 #define MAX_DOC 4096
 
+#include "../common/host_oom.h"
 typedef enum {
     DOC_CLASS,
     DOC_STRUCT,

@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <math.h>
 
+#include "host_oom.h"
 /* ============================ construction ============================ */
 
 /* small local strdup to avoid depending on the non-standard strdup */

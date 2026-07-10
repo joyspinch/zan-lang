@@ -19,6 +19,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <ucontext.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+#include "../common/host_oom.h"
+
 /* Per-coroutine stack size. */
 #define ZAN_CO_STACK (128 * 1024)
 
@@ -62,8 +71,6 @@ static int          g_live;
 /* ================= platform fiber layer ================= */
 
 #ifdef _WIN32
-#include <windows.h>
-
 static void WINAPI co_trampoline(void *p);
 
 static void plat_sched_enter(void) { g_sched_fiber = ConvertThreadToFiber(NULL); }
@@ -78,10 +85,6 @@ static int64_t plat_now_ms(void)       { return (int64_t)GetTickCount64(); }
 
 #else
 /* POSIX ucontext backend */
-#include <ucontext.h>
-#include <time.h>
-#include <unistd.h>
-
 static ucontext_t g_sched_ctx;
 static void co_trampoline_posix(unsigned hi, unsigned lo);
 

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "../common/host_oom.h"
 /* ---------- helpers ---------- */
 
 static size_t count_newlines(const char *s, size_t len) {

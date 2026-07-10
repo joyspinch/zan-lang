@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "../common/host_oom.h"
 zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     zan_diag_t *d = (zan_diag_t *)zan_arena_alloc(arena, sizeof(zan_diag_t));
     d->error_count = 0;

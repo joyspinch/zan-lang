@@ -37,6 +37,7 @@
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
+#include "../common/host_oom.h"
 typedef int64_t i64;
 typedef uint32_t u32;
 typedef uint8_t  u8;

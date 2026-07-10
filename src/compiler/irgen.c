@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/host_oom.h"
 /* Maximum number of distinct `new` allocation sites tracked for per-site
  * leak reporting. Sites beyond this share the last bucket. */
 #define ZAN_MAX_LEAK_SITES 4096
@@ -33,7 +34,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
                             const char *target_triple,
-                            bool target_is_windows, bool mt_scheduler) {
+                            bool target_is_windows, bool mt_scheduler,
+                            bool check_leaks) {
     memset(g, 0, sizeof(*g));
     g->arena = arena;
     g->diag = diag;
@@ -53,16 +55,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     /* runtime-diagnostics defaults */
     g->src_file = module_name;
     g->runtime_checks = true;
-    g->check_leaks = false;
+    g->check_leaks = check_leaks;
 
-    /* net live-allocation counter for leak detection (internal global) */
+    /* leak-tracking globals are always created; instrumentation and reporting
+     * are gated on g->check_leaks, so normal builds still optimize them away. */
     g->g_live = LLVMAddGlobal(g->mod, LLVMInt64TypeInContext(g->ctx), "__zan_live");
     LLVMSetInitializer(g->g_live, LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
     LLVMSetLinkage(g->g_live, LLVMInternalLinkage);
 
-    /* per-allocation-site leak tracking: fixed-capacity parallel tables
-     * mapping a site index -> (live count, "file:line:col" descriptor).
-     * Each `new` expression is assigned a stable site index. */
     g->leak_site_count = 0;
     {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -151,12 +151,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
 
-    /* int atexit(void(*)(void)) — used to schedule the leak report */
-    LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
-    LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
-    LLVMTypeRef atexit_args[] = { void_fn_ptr };
-    g->atexit_type = LLVMFunctionType(i32, atexit_args, 1, 0);
-    g->fn_atexit = LLVMAddFunction(g->mod, "atexit", g->atexit_type);
+    if (g->check_leaks) {
+        /* int atexit(void(*)(void)) — used to schedule the leak report */
+        LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+        LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
+        LLVMTypeRef atexit_args[] = { void_fn_ptr };
+        g->atexit_type = LLVMFunctionType(i32, atexit_args, 1, 0);
+        g->fn_atexit = LLVMAddFunction(g->mod, "atexit", g->atexit_type);
+    }
 
     /* void* realloc(void*, size_t) */
     LLVMTypeRef realloc_args[] = { i8ptr, i64 };
@@ -637,17 +639,20 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
         LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, free_bb);
-        /* read the allocation-site index stored at obj-8 */
-        LLVMValueRef site_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
-        LLVMValueRef site_iptr = LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
-        LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, site_iptr, "site");
+        LLVMValueRef site = NULL;
+        if (g->check_leaks) {
+            /* read the allocation-site index while the object memory is still live */
+            LLVMValueRef site_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
+            LLVMValueRef site_iptr = LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
+            site = LLVMBuildLoad2(g->builder, i64, site_iptr, "site");
+        }
         /* free(obj - 16) to include the header */
         LLVMValueRef header_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
             (LLVMTypeRef[]){ i8ptr }, 1, 0);
         LLVMBuildCall2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
-        /* leak tracking: one fewer live object, and one fewer at this site */
-        {
+        if (g->check_leaks) {
+            /* leak tracking: one fewer live object, and one fewer at this site */
             LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
             LLVMValueRef lv1 = LLVMBuildSub(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_dec");
             LLVMBuildStore(g->builder, lv1, g->g_live);
@@ -693,8 +698,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         /* user data = raw + 16 */
         LLVMValueRef sixteen = LLVMConstInt(i64, 16, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &sixteen, 1, "usr");
-        /* leak tracking: total + per-site count, and record the site name */
-        {
+        if (g->check_leaks) {
+            /* leak tracking: total + per-site count, and record the site name */
             LLVMValueRef z32 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
             LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
             LLVMValueRef lv1 = LLVMBuildAdd(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
@@ -734,7 +739,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildStore(g->builder, LLVMConstInt(i64, ZAN_STRING_MAGIC, 0), magic_iptr);
         LLVMValueRef sixteen = LLVMConstInt(i64, 16, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &sixteen, 1, "usr");
-        {
+        if (g->check_leaks) {
             LLVMValueRef lv = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
             LLVMValueRef lv1 = LLVMBuildAdd(g->builder, lv, LLVMConstInt(i64, 1, 0), "live_inc");
             LLVMBuildStore(g->builder, lv1, g->g_live);
@@ -831,72 +836,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
-        LLVMBuildRetVoid(g->builder);
-    }
-
-    /* void __zan_report_leaks(void): at program exit, if any ARC object is
-     * still live, print a summary line and then a per-allocation-site
-     * breakdown ("file:line:col"). Scheduled via atexit when --check-leaks. */
-    {
-        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-        LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-        LLVMTypeRef rl_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
-        g->fn_report_leaks = LLVMAddFunction(g->mod, "__zan_report_leaks", rl_type);
-        LLVMBasicBlockRef bb       = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "entry");
-        LLVMBasicBlockRef leak_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "leak");
-        LLVMBasicBlockRef head_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.head");
-        LLVMBasicBlockRef body_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.body");
-        LLVMBasicBlockRef print_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.print");
-        LLVMBasicBlockRef next_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.next");
-        LLVMBasicBlockRef done_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "done");
-
-        LLVMPositionBuilderAtEnd(g->builder, bb);
-        LLVMValueRef live = LLVMBuildLoad2(g->builder, i64, g->g_live, "live");
-        LLVMValueRef leaked = LLVMBuildICmp(g->builder, LLVMIntSGT, live,
-            LLVMConstInt(i64, 0, 0), "leaked");
-        LLVMBuildCondBr(g->builder, leaked, leak_bb, done_bb);
-
-        LLVMPositionBuilderAtEnd(g->builder, leak_bb);
-        LLVMValueRef msg = LLVMBuildGlobalStringPtr(g->builder,
-            "zan: memory leak detected: %lld object(s) still reachable at exit\n", "leak_fmt");
-        LLVMValueRef pargs[] = { msg, live };
-        LLVMBuildCall2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
-        LLVMBuildBr(g->builder, head_bb);
-
-        /* iterate the site buckets, printing those with a positive live count */
-        LLVMPositionBuilderAtEnd(g->builder, head_bb);
-        LLVMValueRef idx = LLVMBuildPhi(g->builder, i64, "i");
-        LLVMValueRef in_range = LLVMBuildICmp(g->builder, LLVMIntSLT, idx,
-            LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
-        LLVMBuildCondBr(g->builder, in_range, body_bb, done_bb);
-
-        LLVMPositionBuilderAtEnd(g->builder, body_bb);
-        LLVMValueRef z32 = LLVMConstInt(i32t, 0, 0);
-        LLVMValueRef cidx[2] = { z32, idx };
-        LLVMValueRef sc_ptr = LLVMBuildGEP2(g->builder, g->site_live_type, g->g_site_live, cidx, 2, "scptr");
-        LLVMValueRef sc = LLVMBuildLoad2(g->builder, i64, sc_ptr, "sc");
-        LLVMValueRef has = LLVMBuildICmp(g->builder, LLVMIntSGT, sc, LLVMConstInt(i64, 0, 0), "has");
-        LLVMBuildCondBr(g->builder, has, print_bb, next_bb);
-
-        LLVMPositionBuilderAtEnd(g->builder, print_bb);
-        LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, g->site_names_type, g->g_site_names, cidx, 2, "nmptr");
-        LLVMValueRef nm = LLVMBuildLoad2(g->builder, i8p, nm_ptr, "nm");
-        LLVMValueRef dmsg = LLVMBuildGlobalStringPtr(g->builder,
-            "  %lld object(s) leaked, allocated at %s\n", "leak_site_fmt");
-        LLVMValueRef dargs[] = { dmsg, sc, nm };
-        LLVMBuildCall2(g->builder, g->printf_type, g->fn_printf, dargs, 3, "");
-        LLVMBuildBr(g->builder, next_bb);
-
-        LLVMPositionBuilderAtEnd(g->builder, next_bb);
-        LLVMValueRef idx1 = LLVMBuildAdd(g->builder, idx, LLVMConstInt(i64, 1, 0), "i.next");
-        LLVMBuildBr(g->builder, head_bb);
-
-        /* phi: start at 0 from leak_bb, then idx+1 from next_bb */
-        LLVMValueRef phi_vals[2] = { LLVMConstInt(i64, 0, 0), idx1 };
-        LLVMBasicBlockRef phi_bbs[2] = { leak_bb, next_bb };
-        LLVMAddIncoming(idx, phi_vals, phi_bbs, 2);
-
-        LLVMPositionBuilderAtEnd(g->builder, done_bb);
         LLVMBuildRetVoid(g->builder);
     }
 
@@ -1658,6 +1597,83 @@ static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
     if (!t || !is_rc_managed_type(t)) return;
     if (!expr_yields_owned_rc_value(g, arg, locals)) return;
     emit_rc_release_for_type(g, t, val);
+}
+
+static void emit_leak_report_support(zan_irgen_t *g) {
+    if (!g->check_leaks || g->fn_report_leaks) return;
+    /* void __zan_report_leaks(void): at program exit, if any ARC object is
+     * still live, print a summary line and then a per-allocation-site
+     * breakdown ("file:line:col"). Scheduled via atexit when --check-leaks. */
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef rl_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+    g->fn_report_leaks = LLVMAddFunction(g->mod, "__zan_report_leaks", rl_type);
+    LLVMBasicBlockRef bb       = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "entry");
+    LLVMBasicBlockRef leak_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "leak");
+    LLVMBasicBlockRef head_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.head");
+    LLVMBasicBlockRef body_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.body");
+    LLVMBasicBlockRef print_bb = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.print");
+    LLVMBasicBlockRef next_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "loop.next");
+    LLVMBasicBlockRef done_bb  = LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "done");
+
+    LLVMPositionBuilderAtEnd(b, bb);
+    LLVMValueRef live = LLVMBuildLoad2(b, i64, g->g_live, "live");
+    LLVMValueRef leaked = LLVMBuildICmp(b, LLVMIntSGT, live,
+        LLVMConstInt(i64, 0, 0), "leaked");
+    LLVMBuildCondBr(b, leaked, leak_bb, done_bb);
+
+    LLVMPositionBuilderAtEnd(b, leak_bb);
+    LLVMValueRef msg = LLVMBuildGlobalStringPtr(b,
+        "zan: memory leak detected: %lld object(s) still reachable at exit\n", "leak_fmt");
+    LLVMValueRef pargs[] = { msg, live };
+    LLVMBuildCall2(b, g->printf_type, g->fn_printf, pargs, 2, "");
+    LLVMBuildBr(b, head_bb);
+
+    /* iterate the site buckets, printing those with a positive live count */
+    LLVMPositionBuilderAtEnd(b, head_bb);
+    LLVMValueRef idx = LLVMBuildPhi(b, i64, "i");
+    LLVMValueRef in_range = LLVMBuildICmp(b, LLVMIntSLT, idx,
+        LLVMConstInt(i64, ZAN_MAX_LEAK_SITES, 0), "inrange");
+    LLVMBuildCondBr(b, in_range, body_bb, done_bb);
+
+    LLVMPositionBuilderAtEnd(b, body_bb);
+    LLVMValueRef z32 = LLVMConstInt(i32t, 0, 0);
+    LLVMValueRef cidx[2] = { z32, idx };
+    LLVMValueRef sc_ptr = LLVMBuildGEP2(b, g->site_live_type, g->g_site_live, cidx, 2, "scptr");
+    LLVMValueRef sc = LLVMBuildLoad2(b, i64, sc_ptr, "sc");
+    LLVMValueRef has = LLVMBuildICmp(b, LLVMIntSGT, sc, LLVMConstInt(i64, 0, 0), "has");
+    LLVMBuildCondBr(b, has, print_bb, next_bb);
+
+    LLVMPositionBuilderAtEnd(b, print_bb);
+    LLVMValueRef nm_ptr = LLVMBuildGEP2(b, g->site_names_type, g->g_site_names, cidx, 2, "nmptr");
+    LLVMValueRef nm = LLVMBuildLoad2(b, i8p, nm_ptr, "nm");
+    LLVMValueRef dmsg = LLVMBuildGlobalStringPtr(b,
+        "  %lld object(s) leaked, allocated at %s\n", "leak_site_fmt");
+    LLVMValueRef dargs[] = { dmsg, sc, nm };
+    LLVMBuildCall2(b, g->printf_type, g->fn_printf, dargs, 3, "");
+    LLVMBuildBr(b, next_bb);
+
+    LLVMPositionBuilderAtEnd(b, next_bb);
+    LLVMValueRef idx1 = LLVMBuildAdd(b, idx, LLVMConstInt(i64, 1, 0), "i.next");
+    LLVMBuildBr(b, head_bb);
+
+    LLVMValueRef phi_vals[2] = { LLVMConstInt(i64, 0, 0), idx1 };
+    LLVMBasicBlockRef phi_bbs[2] = { leak_bb, next_bb };
+    LLVMAddIncoming(idx, phi_vals, phi_bbs, 2);
+
+    LLVMPositionBuilderAtEnd(b, done_bb);
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+
+    if (!g->fn_atexit) {
+        LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+        LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
+        LLVMTypeRef atexit_args[] = { void_fn_ptr };
+        g->atexit_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), atexit_args, 1, 0);
+        g->fn_atexit = LLVMAddFunction(g->mod, "atexit", g->atexit_type);
+    }
 }
 
 /* True when a local owns a class heap reference held as a pointer (excludes
@@ -5123,17 +5139,21 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                         LLVMValueRef sz = LLVMSizeOf(st);
-                        /* assign a stable allocation-site index and a
-                         * "file:line:col" descriptor for leak reporting. */
-                        int site_idx = g->leak_site_count;
-                        if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
-                        else g->leak_site_count++;
-                        char site_buf[600];
-                        const char *sfile = g->src_file ? g->src_file : "<unknown>";
-                        snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
-                                 sfile, expr->loc.line, expr->loc.col);
-                        LLVMValueRef site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
-                        LLVMValueRef site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
+                        LLVMValueRef site_name = LLVMConstNull(i8ptr);
+                        LLVMValueRef site_val = LLVMConstInt(i64, 0, 0);
+                        if (g->check_leaks) {
+                            /* assign a stable allocation-site index and a
+                             * "file:line:col" descriptor for leak reporting. */
+                            int site_idx = g->leak_site_count;
+                            if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
+                            else g->leak_site_count++;
+                            char site_buf[600];
+                            const char *sfile = g->src_file ? g->src_file : "<unknown>";
+                            snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
+                                     sfile, expr->loc.line, expr->loc.col);
+                            site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+                            site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
+                        }
                         LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
                             (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
                         LLVMValueRef alloc_args3[] = { sz, site_val, site_name };
@@ -6969,6 +6989,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     /* schedule the leak report to run at program exit */
     if (g->check_leaks) {
+        emit_leak_report_support(g);
         LLVMBuildCall2(g->builder, g->atexit_type, g->fn_atexit,
                        &g->fn_report_leaks, 1, "");
     }

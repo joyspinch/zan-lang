@@ -19,6 +19,14 @@
 #define _strnicmp strncasecmp
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
+#include "../common/host_oom.h"
+
 /* Built-in type completions */
 static const char *builtin_types[] = {
     "int", "float", "double", "bool", "string", "char", "byte", "long",
@@ -1293,7 +1301,6 @@ const char *intel_resolve_chain(intellisense_t *is, const char *chain,
 /* --- Project-wide indexing --- */
 
 #ifdef _WIN32
-#include <windows.h>
 
 static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
     char search_path[1024];
@@ -1350,9 +1357,6 @@ void intel_index_project(intellisense_t *is, const char *project_root) {
 }
 
 #else /* Non-Windows: use dirent.h */
-#include <dirent.h>
-#include <sys/stat.h>
-
 static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
     DIR *dir = opendir(dir_path);
     if (!dir) return;

@@ -7,6 +7,8 @@
  *   - F5 compile-and-run
  */
 
+#include <stdio.h>
+
 #ifdef _WIN32
 
 #ifndef UNICODE
@@ -19,7 +21,6 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shlobj.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,6 +29,7 @@
 #include "intellisense.h"
 #include "debugger.h"
 #include "designer.h"
+#include "../common/host_oom.h"
 
 /* ---- Global state ---- */
 static editor_t g_editor;
@@ -2073,8 +2075,6 @@ static void do_gen_doc(void) {
 }
 
 #else /* non-Windows stub */
-
-#include <stdio.h>
 
 int main(void) {
     fprintf(stderr, "Zan IDE currently requires Windows.\n");

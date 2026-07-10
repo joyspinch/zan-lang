@@ -25,15 +25,8 @@
 #include "rt_io.h"
 #include "rt_co.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#endif
 
 /* The reactor serves two clients:
  *   - stackless CPS frames (the async/await state machine) via zan_io_wait_co,
@@ -43,6 +36,36 @@
  * When built with ZAN_IO_STACKLESS_ONLY (the object shipped with zanc and
  * linked into produced async programs), the fiber half is dropped so the
  * reactor has no dependency on rt_sched. */
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#endif
+#if defined(__linux__)
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/event.h>
+#include <fcntl.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>          /* ConnectEx + WSAID_CONNECTEX */
+#include <windows.h>
+#else
+#include <sys/select.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#ifdef ZAN_CO_DRIVER
+#include <stdlib.h>
+#ifndef _WIN32
+#include <poll.h>
+#endif
+#endif
 #ifndef ZAN_IO_STACKLESS_ONLY
 #include "rt_sched.h"
 /* ---- forward declarations from rt_sched (internal) ---- */
@@ -50,6 +73,7 @@ extern void zan_io_suspend_current(void);   /* implemented in rt_sched.c */
 extern void zan_io_resume(void *co);        /* implemented in rt_sched.c */
 extern void *zan_io_get_current_co(void);   /* implemented in rt_sched.c */
 #endif
+#include "../common/host_oom.h"
 
 /* ZAN_IO_READ / ZAN_IO_WRITE come from rt_io.h. */
 
@@ -81,7 +105,6 @@ static void io_wake(void *co, zan_co_step_t step) {
 }
 
 #if !defined(_WIN32)
-#include <sys/socket.h>
 /* ---- readiness watcher (epoll / kqueue / select backends) ---- */
 typedef struct zan_io_entry {
     int fd;
@@ -117,9 +140,6 @@ static void io_deliver_recv(zan_io_entry_t *e) {
 
 #if defined(__linux__)
 /* ==================== EPOLL ==================== */
-#include <sys/epoll.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 static int g_epoll_fd = -1;
 
@@ -206,9 +226,6 @@ int zan_io_poll(int64_t timeout_ms) {
 
 #elif defined(__APPLE__) || defined(__FreeBSD__)
 /* ==================== KQUEUE ==================== */
-#include <sys/event.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 static int g_kq_fd = -1;
 
@@ -291,10 +308,6 @@ int zan_io_poll(int64_t timeout_ms) {
 
 #elif defined(_WIN32)
 /* ==================== WINDOWS IOCP ==================== */
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <mswsock.h>          /* ConnectEx + WSAID_CONNECTEX */
-#include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
@@ -518,9 +531,6 @@ int zan_io_poll(int64_t timeout_ms) {
 
 #else
 /* ==================== FALLBACK SELECT (POSIX) ==================== */
-#include <sys/select.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 void zan_io_init(void) {
     if (g_io_started) return;
@@ -781,7 +791,6 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
  * ZAN_CO_WORKERS env var, defaulting to the number of logical processors.
  * ====================================================================== */
 #ifdef ZAN_CO_DRIVER
-#include <stdlib.h>
 
 typedef struct zan_co_node {
     struct zan_co_node *next;
@@ -1004,8 +1013,6 @@ size_t zan_co_pending(void) {
 
 #else
 /* ---------------- Non-Windows: single-threaded fallback ---------------- */
-#include <unistd.h>
-#include <poll.h>
 
 void zan_co_sched_init(void) { g_rq_head = g_rq_tail = NULL; g_tq = NULL; }
 
