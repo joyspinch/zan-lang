@@ -812,6 +812,7 @@ static zan_co_timer *g_tq;
 /* ---------------- Windows: real multi-worker pool over IOCP ------------- */
 static CRITICAL_SECTION g_co_lock;
 static volatile LONG    g_co_running;   /* workers currently inside a step() */
+static volatile LONG    g_co_idle;      /* workers blocked in co_wait_io */
 static volatile LONG    g_co_stop;
 static int              g_co_inited;
 static int              g_co_workers;
@@ -827,6 +828,7 @@ void zan_co_sched_init(void) {
     g_rq_head = g_rq_tail = NULL;
     g_tq = NULL;
     g_co_running = 0;
+    g_co_idle = 0;
     g_co_stop = 0;
 }
 
@@ -838,7 +840,14 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     if (g_rq_tail) g_rq_tail->next = n; else g_rq_head = n;
     g_rq_tail = n;
     LeaveCriticalSection(&g_co_lock);
-    co_wake_port();   /* nudge a worker to pick up the new frame */
+    /* Only nudge the port when a worker is actually blocked waiting for work.
+     * While every worker is busy (g_co_idle == 0) the frame will be picked up
+     * by a worker's own run-loop iteration, so posting a completion packet per
+     * ready is pure overhead -- that wake storm is what made --async-workers
+     * slower than single-threaded under load. The idle count is registered
+     * under g_co_lock together with a final queue check in co_worker, so a
+     * worker about to block is guaranteed visible here (no lost wakeup). */
+    if (g_co_idle > 0) co_wake_port();
 }
 
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
@@ -850,7 +859,7 @@ void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
     EnterCriticalSection(&g_co_lock);
     t->next = g_tq; g_tq = t;
     LeaveCriticalSection(&g_co_lock);
-    co_wake_port();
+    if (g_co_idle > 0) co_wake_port();
 }
 
 /* Pop one ready frame, marking a worker busy (g_co_running) atomically with
@@ -903,7 +912,14 @@ static void co_wait_io(long long timeout_ms) {
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
-    if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE))
+    BOOL ok = GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE);
+    /* We are no longer parked: drop the idle count before re-readying the
+     * completed coroutines below. This lets those zan_co_ready calls skip the
+     * wake syscall when this worker is the only idle one -- it will drain the
+     * whole batch itself on its next loop iterations -- instead of posting a
+     * wake packet per completion. */
+    InterlockedDecrement(&g_co_idle);
+    if (!ok)
         return;
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) continue;   /* wake packet */
@@ -971,7 +987,17 @@ static void co_worker(void) {
         if (tnext >= 0)               to = tnext;
         else if (g_io_count > 0)      to = 1000;
         else                          to = 50;
-        co_wait_io(to);
+        /* Register as idle under the lock with a final queue re-check. This
+         * pairs with the g_co_idle gate in zan_co_ready/zan_co_delay: a
+         * producer either enqueues before we mark idle (so we see the node and
+         * skip the block) or after (so it observes g_co_idle>0 and wakes us).
+         * Both paths serialize on g_co_lock, so no wakeup is lost. */
+        EnterCriticalSection(&g_co_lock);
+        int have_work = (g_rq_head != NULL);
+        if (!have_work) InterlockedIncrement(&g_co_idle);
+        LeaveCriticalSection(&g_co_lock);
+        if (have_work) continue;   /* never marked idle; nothing to undo */
+        co_wait_io(to);            /* decrements g_co_idle on return */
     }
 }
 

@@ -1182,11 +1182,11 @@ static void do_build(void) {
     /* construct build command */
     char cmd[2048];
     char out_path[MAX_PATH];
-    strncpy(out_path, tab->filepath, MAX_PATH - 5);
+    snprintf(out_path, sizeof(out_path), "%s", tab->filepath);
     /* replace .zan with .exe */
     char *dot = strrchr(out_path, '.');
-    if (dot) strcpy(dot, ".exe");
-    else strcat(out_path, ".exe");
+    if (dot) *dot = '\0';
+    snprintf(out_path + strlen(out_path), sizeof(out_path) - strlen(out_path), "%s", ".exe");
 
     snprintf(cmd, sizeof(cmd), "zanc \"%s\" -o \"%s\" 2>&1",
              tab->filepath, out_path);
@@ -1215,10 +1215,10 @@ static void do_run(void) {
     if (!tab || tab->is_new) return;
 
     char exe_path[MAX_PATH];
-    strncpy(exe_path, tab->filepath, MAX_PATH - 5);
+    snprintf(exe_path, sizeof(exe_path), "%s", tab->filepath);
     char *dot = strrchr(exe_path, '.');
-    if (dot) strcpy(dot, ".exe");
-    else strcat(exe_path, ".exe");
+    if (dot) *dot = '\0';
+    snprintf(exe_path + strlen(exe_path), sizeof(exe_path) - strlen(exe_path), "%s", ".exe");
 
     append_output("\nRunning: ");
     append_output(exe_path);
@@ -1679,8 +1679,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 do_build();
                 if (strstr(g_output, "Build successful")) {
                     char exe[MAX_PATH];
-                    strncpy(exe, dt->filepath, MAX_PATH - 5);
-                    char *dot = strrchr(exe, '.'); if (dot) strcpy(dot, ".exe"); else strcat(exe, ".exe");
+                    snprintf(exe, sizeof(exe), "%s", dt->filepath);
+                    char *dot = strrchr(exe, '.'); if (dot) *dot = '\0';
+                    snprintf(exe + strlen(exe), sizeof(exe) - strlen(exe), "%s", ".exe");
                     bool started = dbg_start(&g_debugger, exe, NULL);
                     if (!started) {
                         /* Simulated debugging: set up state to pause at first BP */
@@ -2054,9 +2055,10 @@ static void do_gen_doc(void) {
     }
 
     char out_path[MAX_PATH];
-    strncpy(out_path, tab->filepath, MAX_PATH - 6);
+    snprintf(out_path, sizeof(out_path), "%s", tab->filepath);
     char *dot = strrchr(out_path, '.');
-    if (dot) strcpy(dot, ".html"); else strcat(out_path, ".html");
+    if (dot) *dot = '\0';
+    snprintf(out_path + strlen(out_path), sizeof(out_path) - strlen(out_path), "%s", ".html");
 
     char cmd[MAX_PATH * 3];
     snprintf(cmd, sizeof(cmd), "zandoc.exe \"%s\" --html -o \"%s\" 2>&1", tab->filepath, out_path);

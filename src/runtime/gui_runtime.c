@@ -7,10 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <rpc.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #pragma comment(lib, "shcore.lib")
@@ -1700,7 +1702,6 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
  * Client-side-decoration metrics are a Win32 concept; on X11/macOS the window
  * manager owns the title bar, so these report 0. write_file is portable. */
 #if !defined(_WIN32)
-#include <stdio.h>
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
