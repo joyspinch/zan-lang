@@ -1,0 +1,108 @@
+using System;
+
+namespace System.Data.MySql;
+
+/// <summary>
+/// Minimal, dependency-free SHA-256 used by the native MySQL client for
+/// <c>caching_sha2_password</c> authentication. Operates on raw byte buffers
+/// (Zan strings used as byte arrays) so it is binary-safe with embedded NULs.
+///
+/// This is a pure-Zan implementation -- the native MySQL protocol needs no
+/// external crypto library, which keeps the client fully localized (only the
+/// socket layer + C runtime are required).
+/// </summary>
+class Sha256 {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    static int rotr(int x, int n) {
+        return ((x >> n) | (x << (32 - n))) & 4294967295;
+    }
+
+    /// <summary>Computes SHA-256 over <paramref name="len"/> bytes of
+    /// <paramref name="msg"/>. Returns a freshly allocated 32-byte digest
+    /// buffer (caller owns it; free with <c>free</c>).</summary>
+    static string Hash(string msg, int len) {
+        List<int> k = new List<int>();
+        k.Add(1116352408); k.Add(1899447441); k.Add(3049323471); k.Add(3921009573);
+        k.Add(961987163); k.Add(1508970993); k.Add(2453635748); k.Add(2870763221);
+        k.Add(3624381080); k.Add(310598401); k.Add(607225278); k.Add(1426881987);
+        k.Add(1925078388); k.Add(2162078206); k.Add(2614888103); k.Add(3248222580);
+        k.Add(3835390401); k.Add(4022224774); k.Add(264347078); k.Add(604807628);
+        k.Add(770255983); k.Add(1249150122); k.Add(1555081692); k.Add(1996064986);
+        k.Add(2554220882); k.Add(2821834349); k.Add(2952996808); k.Add(3210313671);
+        k.Add(3336571891); k.Add(3584528711); k.Add(113926993); k.Add(338241895);
+        k.Add(666307205); k.Add(773529912); k.Add(1294757372); k.Add(1396182291);
+        k.Add(1695183700); k.Add(1986661051); k.Add(2177026350); k.Add(2456956037);
+        k.Add(2730485921); k.Add(2820302411); k.Add(3259730800); k.Add(3345764771);
+        k.Add(3516065817); k.Add(3600352804); k.Add(4094571909); k.Add(275423344);
+        k.Add(430227734); k.Add(506948616); k.Add(659060556); k.Add(883997877);
+        k.Add(958139571); k.Add(1322822218); k.Add(1537002063); k.Add(1747873779);
+        k.Add(1955562222); k.Add(2024104815); k.Add(2227730452); k.Add(2361852424);
+        k.Add(2428436474); k.Add(2756734187); k.Add(3204031479); k.Add(3329325298);
+
+        int h0 = 1779033703; int h1 = 3144134277; int h2 = 1013904242; int h3 = 2773480762;
+        int h4 = 1359893119; int h5 = 2600822924; int h6 = 528734635; int h7 = 1541459225;
+
+        int total = len + 1 + 8;
+        int rem = total % 64;
+        int pad = 0;
+        if (rem != 0) { pad = 64 - rem; }
+        int plen = total + pad;
+        string m = calloc(plen + 1, 1);
+        int i = 0;
+        while (i < len) { m[i] = msg[i] & 255; i = i + 1; }
+        m[len] = 128;
+        int bits = len * 8;
+        int bi = plen - 8;
+        m[bi+0]=(bits>>56)&255; m[bi+1]=(bits>>48)&255; m[bi+2]=(bits>>40)&255; m[bi+3]=(bits>>32)&255;
+        m[bi+4]=(bits>>24)&255; m[bi+5]=(bits>>16)&255; m[bi+6]=(bits>>8)&255; m[bi+7]=bits&255;
+
+        int blocks = plen / 64;
+        int b = 0;
+        while (b < blocks) {
+            int off = b * 64;
+            List<int> w = new List<int>();
+            int t = 0;
+            while (t < 16) {
+                int j = off + t*4;
+                w.Add((((m[j]&255)<<24)|((m[j+1]&255)<<16)|((m[j+2]&255)<<8)|(m[j+3]&255)) & 4294967295);
+                t = t + 1;
+            }
+            t = 16;
+            while (t < 64) {
+                int s0 = rotr(w[t-15],7) ^ rotr(w[t-15],18) ^ (w[t-15]>>3);
+                int s1 = rotr(w[t-2],17) ^ rotr(w[t-2],19) ^ (w[t-2]>>10);
+                w.Add((w[t-16]+s0+w[t-7]+s1) & 4294967295);
+                t = t + 1;
+            }
+            int a=h0; int bb=h1; int c=h2; int d=h3; int e=h4; int f=h5; int g=h6; int hh=h7;
+            t = 0;
+            while (t < 64) {
+                int S1 = rotr(e,6)^rotr(e,11)^rotr(e,25);
+                int ch = (e & f) ^ ((e ^ 4294967295) & g);
+                int temp1 = (hh + S1 + ch + k[t] + w[t]) & 4294967295;
+                int S0 = rotr(a,2)^rotr(a,13)^rotr(a,22);
+                int maj = (a & bb) ^ (a & c) ^ (bb & c);
+                int temp2 = (S0 + maj) & 4294967295;
+                hh=g; g=f; f=e; e=(d+temp1)&4294967295; d=c; c=bb; bb=a; a=(temp1+temp2)&4294967295;
+                t = t + 1;
+            }
+            h0=(h0+a)&4294967295; h1=(h1+bb)&4294967295; h2=(h2+c)&4294967295; h3=(h3+d)&4294967295;
+            h4=(h4+e)&4294967295; h5=(h5+f)&4294967295; h6=(h6+g)&4294967295; h7=(h7+hh)&4294967295;
+            b = b + 1;
+        }
+        free(m);
+        string outb = calloc(33, 1);
+        wBE(outb,0,h0); wBE(outb,4,h1); wBE(outb,8,h2); wBE(outb,12,h3);
+        wBE(outb,16,h4); wBE(outb,20,h5); wBE(outb,24,h6); wBE(outb,28,h7);
+        return outb;
+    }
+
+    static void wBE(string buf, int off, int v) {
+        buf[off+0]=(v>>24)&255; buf[off+1]=(v>>16)&255; buf[off+2]=(v>>8)&255; buf[off+3]=v&255;
+    }
+}
