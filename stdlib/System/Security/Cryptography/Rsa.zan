@@ -1,0 +1,157 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>RSA (RFC 8017 / PKCS#1): raw public/private operations plus PKCS#1
+/// v1.5 and OAEP encryption padding. Big-integer maths come from BigInt; hashes
+/// (for OAEP MGF1) from this namespace. All buffers carry explicit lengths
+/// because String.Length is strlen-based and unsafe for binary data.</summary>
+class Rsa {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    // hash dispatch: 0=SHA-256, 1=SHA-1, 2=SM3
+    static int hLen(int algo) { if (algo == 1) { return 20; } return 32; }
+    static string hashOf(int algo, string buf, int len) {
+        if (algo == 1) { return Sha1.Hash(buf, len); }
+        if (algo == 2) { return Sm3.Hash(buf, len); }
+        return Sha256.Hash(buf, len);
+    }
+
+    /// <summary>Raw RSA: base^exp mod n. Returns a k-byte big-endian buffer,
+    /// where k = <paramref name="nLen"/>.</summary>
+    static string ModExp(string msg, int mLen, string n, int nLen, string exp, int eLen) {
+        BigInt m = BigInt.FromBytesBE(msg, mLen);
+        BigInt nn = BigInt.FromBytesBE(n, nLen);
+        BigInt ee = BigInt.FromBytesBE(exp, eLen);
+        BigInt r = BigInt.ModPow(m, ee, nn);
+        return r.ToBytesBE(nLen);
+    }
+
+    // MGF1 mask generation (RFC 8017)
+    static string mgf1(string seed, int seedLen, int maskLen, int algo) {
+        int hl = hLen(algo);
+        string mask = calloc(maskLen + 1, 1);
+        int counter = 0; int outPos = 0;
+        while (outPos < maskLen) {
+            string buf = calloc(seedLen + 4 + 1, 1);
+            int i = 0; while (i < seedLen) { buf[i] = seed[i] & 255; i = i + 1; }
+            buf[seedLen]   = (counter >> 24) & 255;
+            buf[seedLen+1] = (counter >> 16) & 255;
+            buf[seedLen+2] = (counter >> 8) & 255;
+            buf[seedLen+3] = counter & 255;
+            string h = hashOf(algo, buf, seedLen + 4);
+            int j = 0;
+            while (j < hl && outPos < maskLen) { mask[outPos] = h[j] & 255; outPos = outPos + 1; j = j + 1; }
+            free(buf); free(h);
+            counter = counter + 1;
+        }
+        return mask;
+    }
+
+    /// <summary>RSA-OAEP encrypt (RFC 8017 §7.1.1). <paramref name="seed"/> must
+    /// supply hLen fresh random bytes. Empty label. Returns a k-byte ciphertext.</summary>
+    static string EncryptOaep(string msg, int mLen, string n, int k, string e, int eLen, int algo, string seed) {
+        int hl = hLen(algo);
+        string lHash = hashOf(algo, "", 0);
+        int dbLen = k - hl - 1;
+        string db = calloc(dbLen + 1, 1);
+        int i = 0;
+        while (i < hl) { db[i] = lHash[i] & 255; i = i + 1; }
+        // PS zeros already from calloc; place 0x01 separator
+        int psEnd = dbLen - mLen - 1;
+        db[psEnd] = 1;
+        i = 0;
+        while (i < mLen) { db[psEnd + 1 + i] = msg[i] & 255; i = i + 1; }
+        free(lHash);
+
+        string dbMask = mgf1(seed, hl, dbLen, algo);
+        string maskedDb = calloc(dbLen + 1, 1);
+        i = 0; while (i < dbLen) { maskedDb[i] = (db[i] & 255) ^ (dbMask[i] & 255); i = i + 1; }
+        string seedMask = mgf1(maskedDb, dbLen, hl, algo);
+        string maskedSeed = calloc(hl + 1, 1);
+        i = 0; while (i < hl) { maskedSeed[i] = (seed[i] & 255) ^ (seedMask[i] & 255); i = i + 1; }
+
+        string em = calloc(k + 1, 1);
+        em[0] = 0;
+        i = 0; while (i < hl) { em[1 + i] = maskedSeed[i] & 255; i = i + 1; }
+        i = 0; while (i < dbLen) { em[1 + hl + i] = maskedDb[i] & 255; i = i + 1; }
+        free(db); free(dbMask); free(maskedDb); free(seedMask); free(maskedSeed);
+
+        string c = ModExp(em, k, n, k, e, eLen);
+        free(em);
+        return c;
+    }
+
+    /// <summary>RSA-OAEP decrypt. Returns the recovered message;
+    /// <paramref name="outLen"/>[0] receives its length (-1 on padding error).</summary>
+    static string DecryptOaep(string cph, string n, int k, string d, int dLen, int algo, List<int> outLen) {
+        int hl = hLen(algo);
+        string em = ModExp(cph, k, n, k, d, dLen);
+        int dbLen = k - hl - 1;
+        string maskedSeed = calloc(hl + 1, 1);
+        int i = 0; while (i < hl) { maskedSeed[i] = em[1 + i] & 255; i = i + 1; }
+        string maskedDb = calloc(dbLen + 1, 1);
+        i = 0; while (i < dbLen) { maskedDb[i] = em[1 + hl + i] & 255; i = i + 1; }
+
+        string seedMask = mgf1(maskedDb, dbLen, hl, algo);
+        string seed = calloc(hl + 1, 1);
+        i = 0; while (i < hl) { seed[i] = (maskedSeed[i] & 255) ^ (seedMask[i] & 255); i = i + 1; }
+        string dbMask = mgf1(seed, hl, dbLen, algo);
+        string db = calloc(dbLen + 1, 1);
+        i = 0; while (i < dbLen) { db[i] = (maskedDb[i] & 255) ^ (dbMask[i] & 255); i = i + 1; }
+
+        // skip lHash (hl bytes), then zeros until 0x01
+        int p = hl;
+        while (p < dbLen && (db[p] & 255) == 0) { p = p + 1; }
+        int mlen = -1;
+        string outb = calloc(dbLen + 1, 1);
+        if (p < dbLen && (db[p] & 255) == 1) {
+            p = p + 1;
+            mlen = dbLen - p;
+            int j = 0; while (j < mlen) { outb[j] = db[p + j] & 255; j = j + 1; }
+        }
+        free(em); free(maskedSeed); free(maskedDb); free(seedMask); free(seed); free(dbMask); free(db);
+        outLen[0] = mlen;
+        return outb;
+    }
+
+    /// <summary>RSA PKCS#1 v1.5 type-2 encrypt. <paramref name="rnd"/> supplies
+    /// (k - mLen - 3) nonzero random bytes for the padding string.</summary>
+    static string EncryptPkcs1(string msg, int mLen, string n, int k, string e, int eLen, string rnd) {
+        string em = calloc(k + 1, 1);
+        em[0] = 0; em[1] = 2;
+        int psLen = k - mLen - 3;
+        int i = 0;
+        while (i < psLen) {
+            int b = rnd[i] & 255; if (b == 0) { b = 1; }
+            em[2 + i] = b;
+            i = i + 1;
+        }
+        em[2 + psLen] = 0;
+        i = 0; while (i < mLen) { em[3 + psLen + i] = msg[i] & 255; i = i + 1; }
+        string c = ModExp(em, k, n, k, e, eLen);
+        free(em);
+        return c;
+    }
+
+    /// <summary>RSA PKCS#1 v1.5 decrypt. <paramref name="outLen"/>[0] receives
+    /// the message length (-1 on padding error).</summary>
+    static string DecryptPkcs1(string cph, string n, int k, string d, int dLen, List<int> outLen) {
+        string em = ModExp(cph, k, n, k, d, dLen);
+        int mlen = -1;
+        string outb = calloc(k + 1, 1);
+        if ((em[0] & 255) == 0 && (em[1] & 255) == 2) {
+            int p = 2;
+            while (p < k && (em[p] & 255) != 0) { p = p + 1; }
+            if (p < k) {
+                p = p + 1;
+                mlen = k - p;
+                int j = 0; while (j < mlen) { outb[j] = em[p + j] & 255; j = j + 1; }
+            }
+        }
+        free(em);
+        outLen[0] = mlen;
+        return outb;
+    }
+}
