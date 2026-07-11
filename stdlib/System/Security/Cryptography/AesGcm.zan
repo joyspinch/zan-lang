@@ -1,0 +1,177 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>AES-GCM (NIST SP 800-38D) authenticated encryption in pure Zan.
+/// Only the common 96-bit IV form is supported (J0 = IV || 0^31 || 1). A
+/// 128-bit block is carried as two 64-bit halves; GF(2^128) multiplication uses
+/// the right-shift algorithm with reduction polynomial R = 0xE1||0^120.</summary>
+class AesGcm {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    // load 8 big-endian bytes from buf[off..] into a 64-bit word
+    static int load64(string buf, int off) {
+        int v = 0; int i = 0;
+        while (i < 8) { v = (v << 8) | (buf[off + i] & 255); i = i + 1; }
+        return v;
+    }
+    static void store64(string buf, int off, int v) {
+        int i = 0;
+        while (i < 8) { buf[off + i] = Bits.Shr64(v, 8 * (7 - i)) & 255; i = i + 1; }
+    }
+
+    // GF(2^128) multiply: X,Y as [hi,lo]; returns [hi,lo]
+    static List<int> gfmul(List<int> X, List<int> Y) {
+        int zhi = 0; int zlo = 0;
+        int vhi = Y[0]; int vlo = Y[1];
+        int i = 0;
+        while (i < 128) {
+            int bit = 0;
+            if (i < 64) { bit = Bits.Shr64(X[0], 63 - i) & 1; }
+            else { bit = Bits.Shr64(X[1], 63 - (i - 64)) & 1; }
+            if (bit == 1) { zhi = zhi ^ vhi; zlo = zlo ^ vlo; }
+            int lsb = vlo & 1;
+            // V >>= 1 across the 128-bit pair (logical)
+            vlo = Bits.Shr64(vlo, 1) | ((vhi & 1) << 63);
+            vhi = Bits.Shr64(vhi, 1);
+            if (lsb == 1) { vhi = vhi ^ (225 << 56); }
+            i = i + 1;
+        }
+        List<int> r = new List<int>(); r.Add(zhi); r.Add(zlo);
+        return r;
+    }
+
+    // Y = (Y xor block) * H, where block is 16 bytes at buf[off..], zero-padded
+    static List<int> ghashBlock(List<int> Y, string buf, int off, int avail, List<int> H) {
+        string blk = calloc(17, 1);
+        int i = 0;
+        while (i < 16) {
+            if (i < avail) { blk[i] = buf[off + i] & 255; } else { blk[i] = 0; }
+            i = i + 1;
+        }
+        List<int> x = new List<int>();
+        x.Add(Y[0] ^ load64(blk, 0));
+        x.Add(Y[1] ^ load64(blk, 8));
+        free(blk);
+        return gfmul(x, H);
+    }
+
+    static List<int> ghash(List<int> H, string aad, int aadLen, string data, int dataLen) {
+        List<int> Y = new List<int>(); Y.Add(0); Y.Add(0);
+        int p = 0;
+        while (p < aadLen) {
+            int avail = aadLen - p; if (avail > 16) { avail = 16; }
+            Y = ghashBlock(Y, aad, p, avail, H);
+            p = p + 16;
+        }
+        p = 0;
+        while (p < dataLen) {
+            int avail = dataLen - p; if (avail > 16) { avail = 16; }
+            Y = ghashBlock(Y, data, p, avail, H);
+            p = p + 16;
+        }
+        // length block: [aadBits(64) | dataBits(64)]
+        string lb = calloc(17, 1);
+        store64(lb, 0, aadLen * 8);
+        store64(lb, 8, dataLen * 8);
+        List<int> x = new List<int>();
+        x.Add(Y[0] ^ load64(lb, 0));
+        x.Add(Y[1] ^ load64(lb, 8));
+        free(lb);
+        return gfmul(x, H);
+    }
+
+    static void inc32(string ctr) {
+        int i = 15;
+        int carry = 1;
+        while (i >= 12 && carry == 1) {
+            int v = (ctr[i] & 255) + carry;
+            ctr[i] = v & 255;
+            carry = (v >> 8) & 1;
+            i = i - 1;
+        }
+    }
+
+    // GCTR: keystream from AES(counter), xored into data (in place into out)
+    static void gctr(string key, int keyLen, string ctr, string data, int dataLen, string outb) {
+        string cnt = calloc(17, 1);
+        int i = 0; while (i < 16) { cnt[i] = ctr[i] & 255; i = i + 1; }
+        int p = 0;
+        while (p < dataLen) {
+            string ks = Aes.EncryptBlockEcb(key, keyLen, cnt);
+            int avail = dataLen - p; if (avail > 16) { avail = 16; }
+            int j = 0;
+            while (j < avail) { outb[p + j] = (data[p + j] & 255) ^ (ks[j] & 255); j = j + 1; }
+            free(ks);
+            inc32(cnt);
+            p = p + 16;
+        }
+        free(cnt);
+    }
+
+    /// <summary>AES-GCM encrypt with a 96-bit (12-byte) IV. Writes the ciphertext
+    /// (same length as plaintext) to the return value and the 16-byte tag into
+    /// <paramref name="tagOut"/>.</summary>
+    static string Encrypt(string key, int keyLen, string iv, string aad, int aadLen, string pt, int ptLen, string tagOut) {
+        string zero = calloc(17, 1);
+        string Hb = Aes.EncryptBlockEcb(key, keyLen, zero);
+        List<int> H = new List<int>(); H.Add(load64(Hb, 0)); H.Add(load64(Hb, 8));
+        free(Hb); free(zero);
+
+        // J0 = IV || 0^31 || 1
+        string j0 = calloc(17, 1);
+        int i = 0; while (i < 12) { j0[i] = iv[i] & 255; i = i + 1; }
+        j0[15] = 1;
+
+        string ct = calloc(ptLen + 1, 1);
+        string ctr = calloc(17, 1);
+        i = 0; while (i < 16) { ctr[i] = j0[i] & 255; i = i + 1; }
+        inc32(ctr);
+        gctr(key, keyLen, ctr, pt, ptLen, ct);
+
+        List<int> S = ghash(H, aad, aadLen, ct, ptLen);
+        string sb = calloc(17, 1);
+        store64(sb, 0, S[0]); store64(sb, 8, S[1]);
+        string ej0 = Aes.EncryptBlockEcb(key, keyLen, j0);
+        i = 0; while (i < 16) { tagOut[i] = (ej0[i] & 255) ^ (sb[i] & 255); i = i + 1; }
+        free(sb); free(ej0); free(j0); free(ctr);
+        return ct;
+    }
+
+    /// <summary>AES-GCM decrypt with a 96-bit IV. Returns the plaintext and sets
+    /// <paramref name="ok"/>[0] to -1 (true) if the tag verifies, else 0.</summary>
+    static string Decrypt(string key, int keyLen, string iv, string aad, int aadLen, string ct, int ctLen, string tag, List<int> ok) {
+        string zero = calloc(17, 1);
+        string Hb = Aes.EncryptBlockEcb(key, keyLen, zero);
+        List<int> H = new List<int>(); H.Add(load64(Hb, 0)); H.Add(load64(Hb, 8));
+        free(Hb); free(zero);
+
+        string j0 = calloc(17, 1);
+        int i = 0; while (i < 12) { j0[i] = iv[i] & 255; i = i + 1; }
+        j0[15] = 1;
+
+        List<int> S = ghash(H, aad, aadLen, ct, ctLen);
+        string sb = calloc(17, 1);
+        store64(sb, 0, S[0]); store64(sb, 8, S[1]);
+        string ej0 = Aes.EncryptBlockEcb(key, keyLen, j0);
+        int diff = 0;
+        i = 0;
+        while (i < 16) {
+            int t = (ej0[i] & 255) ^ (sb[i] & 255);
+            diff = diff | (t ^ (tag[i] & 255));
+            i = i + 1;
+        }
+        free(sb); free(ej0);
+
+        string pt = calloc(ctLen + 1, 1);
+        string ctr = calloc(17, 1);
+        i = 0; while (i < 16) { ctr[i] = j0[i] & 255; i = i + 1; }
+        inc32(ctr);
+        gctr(key, keyLen, ctr, ct, ctLen, pt);
+        free(j0); free(ctr);
+
+        if (diff == 0) { ok[0] = -1; } else { ok[0] = 0; }
+        return pt;
+    }
+}
