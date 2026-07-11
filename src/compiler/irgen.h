@@ -111,6 +111,8 @@ struct zan_irgen {
     LLVMValueRef g_site_dtors;    /* [N x i8*] global: release fn per alloc site */
     LLVMTypeRef  site_dtors_type; /* [N x i8*] array type */
     zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
+    int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
+    zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
     int          leak_site_count; /* number of distinct `new` sites assigned */
     LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */

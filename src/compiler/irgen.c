@@ -81,6 +81,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(g->site_dtors_type));
         LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
         g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
+        g->site_coll = (int *)calloc(ZAN_MAX_LEAK_SITES, sizeof(int));
+        g->site_coll_elem = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
     }
 
     /* declare printf */
@@ -1308,11 +1310,14 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
     return NULL;
 }
 
-/* The built-in generic collections (List/Dict) and StringBuilder are lowered to
- * bare malloc'd structs *without* the 16-byte rc header that zan_rt_alloc emits
- * for user classes. They share TYPE_CLASS with user classes, so ARC must exclude
- * them by name — retaining/releasing one reads a refcount at obj-16 that lands in
- * unrelated heap memory and corrupts it. */
+/* The built-in generic collections (List/Dict) and StringBuilder share
+ * TYPE_CLASS with user classes but are lowered to intrinsic structs, not user
+ * classes with a member layout. List and StringBuilder now carry the same
+ * 16-byte rc header (allocated via zan_rt_alloc) and participate in ARC like
+ * classes; Dict remains header-less (its backing buffers are still not
+ * reclaimed) so ARC must continue to exclude it by name — retaining/releasing a
+ * header-less struct reads a refcount at obj-16 that lands in unrelated heap
+ * memory and corrupts it. */
 static int is_builtin_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
@@ -1321,12 +1326,23 @@ static int is_builtin_collection_type(zan_type_t *t) {
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
-/* Helper: check if a type is ARC-managed (user class instance carrying the
- * zan_rt_alloc rc header; not string/int/struct/enum, and not the header-less
- * built-in collections). */
+/* List and StringBuilder are refcounted collections: they carry the rc header
+ * and are freed (backing buffer + struct) via a per-site collection destructor.
+ * Dict is deliberately excluded (still header-less). */
+static int is_rc_collection_type(zan_type_t *t) {
+    if (!t || t->kind != TYPE_CLASS) return 0;
+    zan_istr_t n = t->name;
+    return (n.len == 4 && memcmp(n.str, "List", 4) == 0) ||
+           (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
+}
+
+/* Helper: check if a type is ARC-managed (carries the zan_rt_alloc rc header:
+ * user class instances plus the refcounted collections List/StringBuilder; not
+ * string/int/struct/enum, and not the header-less Dict). */
 static int is_arc_managed_type(zan_type_t *t) {
-    if (!t) return 0;
-    return t->kind == TYPE_CLASS && !is_builtin_collection_type(t);
+    if (!t || t->kind != TYPE_CLASS) return 0;
+    if (is_builtin_collection_type(t)) return is_rc_collection_type(t);
+    return 1;
 }
 
 static int is_rc_managed_type(zan_type_t *t) {
@@ -1429,6 +1445,38 @@ static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
         f = LLVMAddFunction(g->mod, "calloc", ft);
     }
     return f;
+}
+
+/* Allocate a refcounted built-in collection (List/StringBuilder) struct through
+ * zan_rt_alloc so it carries the 16-byte rc header. Records the collection kind
+ * (and, for List, the element type) at a fresh allocation site; the per-site
+ * destructor emitted at finalize releases the elements and frees the backing
+ * buffer before the struct itself. `coll_kind` is 1=List, 2=StringBuilder.
+ * Returns the user pointer (i8*), i.e. the struct base past the header. */
+static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
+                                             long size, int coll_kind,
+                                             zan_type_t *elem_type) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    int site_idx = g->leak_site_count;
+    if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
+    else g->leak_site_count++;
+    if (g->site_coll) g->site_coll[site_idx] = coll_kind;
+    if (g->site_coll_elem) g->site_coll_elem[site_idx] = elem_type;
+    LLVMValueRef site_name = LLVMConstNull(i8ptr);
+    if (g->check_leaks) {
+        char site_buf[600];
+        const char *sfile = g->src_file ? g->src_file : "<unknown>";
+        snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
+                 sfile, expr->loc.line, expr->loc.col);
+        site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+    }
+    LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
+    LLVMValueRef args[] = { LLVMConstInt(i64, (unsigned long long)size, 0),
+                            LLVMConstInt(i64, (unsigned long long)site_idx, 0),
+                            site_name };
+    return LLVMBuildCall2(g->builder, alloc_fn_type, g->rt_alloc, args, 3, "coll");
 }
 
 /* ---- expression codegen ---- */
@@ -1893,14 +1941,12 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
             LLVMValueRef s = LLVMBuildLoad2(b, i8ptr, fp, "fs");
             emit_string_release(g, s);
         } else if (is_arc_managed_type(ft)) {
+            /* User class instances and the refcounted collections List/
+             * StringBuilder: release via the recorded site destructor (which
+             * releases elements and frees the backing buffer + struct). */
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef cv = LLVMBuildLoad2(b, map_type(g, ft), fp, "fc");
             emit_arc_release_typed(g, ft, cv);
-        } else if (is_builtin_collection_type(ft) &&
-                   ft->name.len == 4 && memcmp(ft->name.str, "List", 4) == 0) {
-            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
-            LLVMValueRef col = LLVMBuildLoad2(b, i8ptr, fp, "fcol");
-            emit_list_release_elems(g, container_elem_type(ft), col);
         }
     }
     LLVMBuildBr(b, dorel);
@@ -1910,6 +1956,76 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
     LLVMBuildBr(b, ret);
     LLVMPositionBuilderAtEnd(b, ret);
     LLVMBuildRetVoid(b);
+}
+
+/* Emit the body of a per-site collection destructor (List/StringBuilder):
+ * null-guard, peek the refcount, and when this release brings it to zero
+ * release the RC-managed elements (List) and free the separately-malloc'd
+ * backing buffer, then hand off to zan_rt_release for the struct decrement +
+ * free. Peeking the refcount keeps buffer release aliasing-safe. */
+static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
+                                          zan_type_t *elem_type, LLVMValueRef fn) {
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMValueRef obj = LLVMGetParam(fn, 0);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef cont  = LLVMAppendBasicBlockInContext(c, fn, "cont");
+    LLVMBasicBlockRef relf  = LLVMAppendBasicBlockInContext(c, fn, "relf");
+    LLVMBasicBlockRef dorel = LLVMAppendBasicBlockInContext(c, fn, "dorel");
+    LLVMBasicBlockRef ret   = LLVMAppendBasicBlockInContext(c, fn, "ret");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef isnull = LLVMBuildICmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
+    LLVMBuildCondBr(b, isnull, ret, cont);
+    LLVMPositionBuilderAtEnd(b, cont);
+    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
+    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
+    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
+    LLVMValueRef is1 = LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMBuildCondBr(b, is1, relf, dorel);
+    LLVMPositionBuilderAtEnd(b, relf);
+    LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
+    if (coll_kind == 1) {
+        /* List: release RC-managed elements, then free the i64* data buffer.
+         * emit_list_release_elems may split the block and leaves the builder at
+         * its own terminator block; capture the data pointer beforehand. */
+        LLVMValueRef lp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->list_struct_type, 0), "lp");
+        LLVMValueRef dp = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 2, "dp");
+        LLVMValueRef data = LLVMBuildLoad2(b, LLVMPointerType(i64, 0), dp, "data");
+        emit_list_release_elems(g, elem_type, obj);
+        LLVMValueRef d8 = LLVMBuildBitCast(b, data, i8ptr, "d8");
+        LLVMBuildCall2(b, free_ty, g->fn_free, &d8, 1, "");
+    } else if (coll_kind == 2) {
+        /* StringBuilder: free the i8* data buffer (free tolerates null). */
+        LLVMValueRef sp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->sb_struct_type, 0), "sp");
+        LLVMValueRef dp = LLVMBuildStructGEP2(b, g->sb_struct_type, sp, 2, "dp");
+        LLVMValueRef data = LLVMBuildLoad2(b, i8ptr, dp, "data");
+        LLVMBuildCall2(b, free_ty, g->fn_free, &data, 1, "");
+    }
+    LLVMBuildBr(b, dorel);
+    LLVMPositionBuilderAtEnd(b, dorel);
+    LLVMBuildCall2(b, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
+                   g->rt_release, &obj, 1, "");
+    LLVMBuildBr(b, ret);
+    LLVMPositionBuilderAtEnd(b, ret);
+    LLVMBuildRetVoid(b);
+}
+
+/* Get (creating on first use) the per-site collection destructor for a List/
+ * StringBuilder allocation site, building its body immediately. */
+static LLVMValueRef get_collection_release_decl(zan_irgen_t *g, int site) {
+    char name[64];
+    snprintf(name, sizeof(name), "__zan_release_coll_%d", site);
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
+    if (existing) return existing;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, name, ft);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    build_collection_release_body(g, g->site_coll[site], g->site_coll_elem[site], fn);
+    return fn;
 }
 
 /* Release a class value `v` of static type `type` via its synthesised
@@ -1950,7 +2066,10 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
     LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
     for (int i = 0; i < n; i++) {
         LLVMValueRef e = LLVMConstNull(i8ptr);
-        if (i < g->leak_site_count && g->site_syms[i]) {
+        if (i < g->leak_site_count && g->site_coll && g->site_coll[i]) {
+            LLVMValueRef fn = get_collection_release_decl(g, i);
+            if (fn) e = LLVMConstBitCast(fn, i8ptr);
+        } else if (i < g->leak_site_count && g->site_syms[i]) {
             LLVMValueRef fn = get_class_release_decl(g, g->site_syms[i]);
             if (fn) e = LLVMConstBitCast(fn, i8ptr);
         }
@@ -5558,11 +5677,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             if (tname.len == 4 && memcmp(tname.str, "List", 4) == 0) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                /* allocate List struct on heap */
-                LLVMValueRef list_size = LLVMConstInt(i64, 24, 0); /* 3 * i64 = 24 bytes */
-                LLVMValueRef list_ptr = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
-                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), list_size }, 2, "list");
+                /* allocate List struct on heap with an rc header (24 bytes:
+                 * 3 * i64), so ARC frees it and its data buffer on release. */
+                zan_type_t *lelem = NULL;
+                {
+                    zan_type_t *lt = zan_binder_resolve_type(g->binder, expr->new_expr.type);
+                    if (lt) lelem = container_elem_type(lt);
+                }
+                LLVMValueRef list_ptr = emit_alloc_rc_collection(g, expr, 24, 1, lelem);
                 /* cast to List* */
                 LLVMValueRef typed_ptr = LLVMBuildBitCast(g->builder, list_ptr,
                     LLVMPointerType(g->list_struct_type, 0), "lptr");
@@ -5591,11 +5713,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             if (sbname.len == 13 && memcmp(sbname.str, "StringBuilder", 13) == 0) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                /* allocate StringBuilder struct: { i64 count, i64 cap, i8* data } = 24 bytes */
-                LLVMValueRef sb_size = LLVMConstInt(i64, 24, 0);
-                LLVMValueRef sb_raw = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
-                    g->fn_malloc, &sb_size, 1, "sb");
+                /* allocate StringBuilder struct { i64 count, i64 cap, i8* data }
+                 * = 24 bytes, with an rc header so ARC frees the struct and its
+                 * data buffer on release. */
+                LLVMValueRef sb_raw = emit_alloc_rc_collection(g, expr, 24, 2, NULL);
                 LLVMValueRef sb_ptr = LLVMBuildBitCast(g->builder, sb_raw,
                     LLVMPointerType(g->sb_struct_type, 0), "sbp");
                 LLVMValueRef cnt_p = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sb_ptr, 0, "sbc");
@@ -7150,6 +7271,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBuildStore(g->builder, list_val, alloca);
                     zan_type_t *list_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, list_type);
+                    /* List is refcounted: `new` yields an owned (+1) reference, so
+                     * this local owns it and must release it at scope exit. */
+                    if (list_type && is_rc_managed_type(list_type))
+                        locals->vars[locals->count - 1].arc_owned = 1;
+                    return;
+                }
+                if (tname.len == 13 && memcmp(tname.str, "StringBuilder", 13) == 0) {
+                    LLVMValueRef sb_val = emit_expr(g, init, locals);
+                    LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ptr_type, "sb");
+                    LLVMBuildStore(g->builder, sb_val, alloca);
+                    zan_type_t *sb_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
+                    local_add(locals, stmt->var_decl.name, alloca, sb_type);
+                    /* StringBuilder is refcounted: `new` yields an owned (+1)
+                     * reference this local owns and releases at scope exit. */
+                    if (sb_type && is_rc_managed_type(sb_type))
+                        locals->vars[locals->count - 1].arc_owned = 1;
                     return;
                 }
                 if (tname.len == 4 && memcmp(tname.str, "Dict", 4) == 0) {

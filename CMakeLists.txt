@@ -303,6 +303,11 @@ foreach(_src ${_conf_srcs})
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/${_name}.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_${_name}${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  # A program and its leakcheck twin are built from the same source, so any
+  # hardcoded listen port (e.g. the async networking conformance tests) is
+  # shared between them. Serialize the runnable variants of one source via a
+  # per-source resource lock so parallel ctest can't collide on that port.
+  set_tests_properties(conformance_${_name} PROPERTIES RESOURCE_LOCK src_${_name})
 endforeach()
 
 # ---- Determinism: codegen must be a pure function of the source ----
@@ -333,6 +338,7 @@ foreach(_src ${_conf_srcs})
       -DSRC=${_src}
       -DOUT_EXE=${CMAKE_BINARY_DIR}/leak_${_name}${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_leakcheck.cmake)
+  set_tests_properties(leakcheck_${_name} PROPERTIES RESOURCE_LOCK src_${_name})
   if(_name IN_LIST _known_leaky)
     set_tests_properties(leakcheck_${_name} PROPERTIES WILL_FAIL TRUE)
   endif()
