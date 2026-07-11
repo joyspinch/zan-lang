@@ -55,6 +55,12 @@ void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step);
 void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
                     zan_co_step_t step, int64_t *out_n);
 
+/* Overlapped accept: post AcceptEx for listener `fd` and suspend `frame`
+ * until a connection completes. The accepted socket is stored in `*out_fd`,
+ * or -1 when the operation cannot be posted or completed. */
+void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
+                      int64_t *out_fd);
+
 /* Idle bridge for the stackless scheduler: if IO watchers are pending, block
  * until at least one fires (readying its frame via zan_co_ready) and return the
  * number woken; otherwise return 0. Wire into the co driver with

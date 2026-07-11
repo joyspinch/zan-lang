@@ -229,6 +229,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef rc_args[] = { i64d, i8ptr, i32d, i8ptr, g->co_step_ptr, i64ptr };
         g->rt_io_recv_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rc_args, 6, 0);
         g->rt_io_recv_co = LLVMAddFunction(g->mod, "zan_io_recv_co", g->rt_io_recv_co_type);
+        LLVMTypeRef ac_args[] = { i64d, i8ptr, g->co_step_ptr, i64ptr };
+        g->rt_io_accept_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), ac_args, 4, 0);
+        g->rt_io_accept_co = LLVMAddFunction(g->mod, "zan_io_accept_co", g->rt_io_accept_co_type);
         LLVMTypeRef pump_args[] = { i64d };
         g->rt_io_pump_timeout_type = LLVMFunctionType(i32d, pump_args, 1, 0);
         g->rt_io_pump_timeout = LLVMAddFunction(g->mod, "zan_io_pump_timeout",
@@ -6068,6 +6071,52 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                     ASYNC_FRAME_RESULT, "self.iores2");
                 return LLVMBuildLoad2(g->builder, di64, res_slot, "recvn");
+            }
+        }
+
+        /* await Socket.AcceptOv(fd) — Windows AcceptEx completion. The
+         * accepted socket is written into the frame result slot before the
+         * suspended state machine is re-readied. */
+        {
+            if (is_call_to(expr->await_expr.expr, "Socket", "AcceptOv") &&
+                expr->await_expr.expr->call.args.count == 1) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.AcceptOv is only supported inside an async method");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef fd = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(fd) != di64)
+                    fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                LLVMValueRef out_fd = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.acceptfd");
+                emit_async_save_slots(g);
+                LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_io_accept_co_type,
+                    g->rt_io_accept_co, (LLVMValueRef[]){ fd, self_i8,
+                        g->current_async_resume_fn, out_fd }, 4, "");
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch,
+                    LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft,
+                    selfframe, ASYNC_FRAME_RESULT, "self.acceptfd2");
+                return LLVMBuildLoad2(g->builder, di64, res_slot, "acceptfd");
             }
         }
 

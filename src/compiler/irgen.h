@@ -162,6 +162,8 @@ struct zan_irgen {
     LLVMTypeRef  rt_io_wait_co_type;
     LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(i64 fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
     LLVMTypeRef  rt_io_recv_co_type;
+    LLVMValueRef rt_io_accept_co; /* void zan_io_accept_co(i64 fd,i8* frame,step,i64* out_fd) */
+    LLVMTypeRef  rt_io_accept_co_type;
     LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
     LLVMTypeRef  rt_io_pump_timeout_type;
     bool         uses_socket_async; /* set when a socket await is lowered */

@@ -115,6 +115,7 @@ typedef struct zan_io_entry {
     void *rbuf;             /* recv sink (zan_io_recv_co); NULL => plain probe */
     int   rlen;
     int64_t *out_n;         /* recv byte-count sink (NULL => plain probe) */
+    int64_t *out_accept;    /* accepted fd sink (NULL => not an accept op) */
     struct zan_io_entry *next;
 } zan_io_entry_t;
 
@@ -126,11 +127,16 @@ static zan_io_entry_t *g_io_entries;    /* linked list of active watchers */
 static void   *g_pending_rbuf;
 static int      g_pending_rlen;
 static int64_t *g_pending_out_n;
+static int64_t *g_pending_accept_out;
 
 /* On POSIX there is no overlapped recv, so zan_io_recv_co registers a readiness
  * watcher and performs the recv here once the fd is readable -- same net effect
  * (one recv per await, byte count delivered via out_n). No-op for plain probes. */
 static void io_deliver_recv(zan_io_entry_t *e) {
+    if (e->out_accept) {
+        *e->out_accept = (int64_t)accept(e->fd, NULL, NULL);
+        return;
+    }
     if (!e->out_n) return;
     ssize_t rn = recv(e->fd, e->rbuf, (size_t)e->rlen, 0);
     *e->out_n = (rn < 0) ? 0 : (int64_t)rn;
@@ -350,10 +356,19 @@ typedef struct zan_io_op {
     OVERLAPPED ov;
     SOCKET     sock;
     int        interest;     /* ZAN_IO_READ / ZAN_IO_WRITE */
+    int        kind;         /* readiness/recv/accept */
     void      *co;           /* fiber handle, or stackless frame pointer */
     zan_co_step_t step;      /* stackless resume fn (NULL => stackful fiber) */
     int64_t   *out_n;        /* recv byte-count sink (NULL => readiness probe) */
+    SOCKET     accepted;
+    void      *accept_buf;
 } zan_io_op_t;
+
+enum {
+    ZAN_IO_OP_READY,
+    ZAN_IO_OP_RECV,
+    ZAN_IO_OP_ACCEPT
+};
 
 static HANDLE g_iocp;
 #if defined(ZAN_CO_DRIVER)
@@ -460,6 +475,7 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     zan_io_op_t *op = (zan_io_op_t *)calloc(1, sizeof(*op));
     op->sock = s;
     op->interest = interest;
+    op->kind = ZAN_IO_OP_READY;
     op->co = co;
     op->step = step;
     IO_CNT_INC();
@@ -511,6 +527,7 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     zan_io_op_t *op = (zan_io_op_t *)calloc(1, sizeof(*op));
     op->sock = s;
     op->interest = ZAN_IO_READ;
+    op->kind = ZAN_IO_OP_RECV;
     op->co = frame;
     op->step = step;
     op->out_n = out_n;
@@ -544,6 +561,76 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
 }
 
+void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
+                      int64_t *out_fd) {
+    zan_io_init();
+    SOCKET listener = (SOCKET)fd;
+    ensure_assoc(listener);
+
+    LPFN_ACCEPTEX accept_ex = NULL;
+    GUID guid = WSAID_ACCEPTEX;
+    DWORD got = 0;
+    if (WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &guid, sizeof(guid), &accept_ex, sizeof(accept_ex),
+                 &got, NULL, NULL) == SOCKET_ERROR) {
+        if (out_fd) *out_fd = -1;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+
+    SOCKET accepted = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
+                                 WSA_FLAG_OVERLAPPED);
+    if (accepted == INVALID_SOCKET) {
+        if (out_fd) *out_fd = -1;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+
+    const DWORD addr_len = (DWORD)sizeof(struct sockaddr_in) + 16;
+    zan_io_op_t *op = (zan_io_op_t *)calloc(1, sizeof(*op));
+    op->sock = listener;
+    op->kind = ZAN_IO_OP_ACCEPT;
+    op->co = frame;
+    op->step = step;
+    op->out_n = out_fd;
+    op->accepted = accepted;
+    op->accept_buf = calloc(1, addr_len * 2);
+    IO_CNT_INC();
+
+    got = 0;
+    BOOL ok = accept_ex(listener, accepted, op->accept_buf, 0,
+                        addr_len, addr_len, &got, &op->ov);
+    if (ok || WSAGetLastError() == WSA_IO_PENDING) return;
+
+    closesocket(accepted);
+    free(op->accept_buf);
+    free(op);
+    IO_CNT_DEC();
+    if (out_fd) *out_fd = -1;
+    if (step) zan_co_ready(frame, step);
+}
+
+static void io_complete_op(zan_io_op_t *op, DWORD transferred,
+                           ULONG_PTR status) {
+    if (op->kind == ZAN_IO_OP_ACCEPT) {
+        SOCKET accepted = op->accepted;
+        int64_t result = -1;
+        if (status == 0 &&
+            setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                       (const char *)&op->sock, (int)sizeof(op->sock)) == 0) {
+            u_long mode = 1;
+            ioctlsocket(accepted, FIONBIO, &mode);
+            result = (int64_t)accepted;
+        } else {
+            closesocket(accepted);
+        }
+        if (op->out_n) *op->out_n = result;
+        free(op->accept_buf);
+        return;
+    }
+    if (op->out_n) *op->out_n = (int64_t)transferred;
+}
+
 int zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
@@ -557,7 +644,8 @@ int zan_io_poll(int64_t timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
-        if (op->out_n) *op->out_n = (int64_t)entries[i].dwNumberOfBytesTransferred;
+        io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
+                       entries[i].Internal);
         free(op);
         g_io_count--;
         io_wake(co, step);
@@ -603,8 +691,10 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     e->rbuf = g_pending_rbuf;
     e->rlen = g_pending_rlen;
     e->out_n = g_pending_out_n;
+    e->out_accept = g_pending_accept_out;
     g_pending_rbuf = NULL;
     g_pending_out_n = NULL;
+    g_pending_accept_out = NULL;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -680,6 +770,13 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     g_pending_rbuf = buf;
     g_pending_rlen = len;
     g_pending_out_n = out_n;
+    io_register((int)fd, ZAN_IO_READ, frame, step);
+}
+
+void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
+                      int64_t *out_fd) {
+    zan_io_init();
+    g_pending_accept_out = out_fd;
     io_register((int)fd, ZAN_IO_READ, frame, step);
 }
 #endif
@@ -1027,7 +1124,8 @@ static void co_wait_io(long long timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
-        if (op->out_n) *op->out_n = (int64_t)entries[i].dwNumberOfBytesTransferred;
+        io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
+                       entries[i].Internal);
         free(op);
         /* Re-ready the coroutine BEFORE dropping the in-flight count: if the
          * order were reversed, another worker could momentarily observe an
