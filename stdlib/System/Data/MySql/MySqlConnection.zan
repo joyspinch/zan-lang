@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 
 namespace System.Data.MySql;
 
@@ -16,9 +17,10 @@ namespace System.Data.MySql;
 /// 8.x default), computed with a pure-Zan <see cref="Sha256"/>:
 ///   token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce )
 /// The server's credential cache is primed after any successful login, so
-/// fast-auth applies to every subsequent connection. A cold-cache full-auth
-/// (RSA public-key) handshake is reported as an error rather than silently
-/// falling back.
+/// fast-auth applies to every subsequent connection. On a cold cache the
+/// server demands full authentication: the client fetches the server's RSA
+/// public key, XORs the NUL-terminated password with the handshake nonce, and
+/// sends it RSA-OAEP(SHA-1) encrypted -- all in pure Zan.
 ///
 /// Packets are built and parsed as raw byte buffers (Zan strings used as byte
 /// arrays), which is binary-safe with embedded NUL bytes.
@@ -44,6 +46,10 @@ class MySqlConnection {
 
     [DllImport("crt")]
     static extern void free(string ptr);
+
+    // RtlGenRandom: OS CSPRNG used to seed RSA-OAEP for full authentication.
+    [DllImport("advapi32")]
+    static extern int SystemFunction036(string buf, int len);
 
     MySqlConnection() {
         this.sock = -1;
@@ -178,6 +184,86 @@ class MySqlConnection {
     }
 
     // ============================================================
+    // caching_sha2_password full authentication (cold cache)
+    // ============================================================
+
+    static string genSeed(int n) {
+        string b = calloc(n + 1, 1);
+        SystemFunction036(b, n);
+        return b;
+    }
+
+    /// <summary>Finds needle in haystack starting at <paramref name="from"/>;
+    /// returns the index or -1.</summary>
+    static int findSub(string h, int hlen, string ndl, int nlen, int from) {
+        int i = from;
+        while (i + nlen <= hlen) {
+            int j = 0; bool ok = true;
+            while (j < nlen) { if ((h[i + j] & 255) != (ndl[j] & 255)) { ok = false; break; } j = j + 1; }
+            if (ok) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>Extracts the DER SubjectPublicKeyInfo from a PEM public key.
+    /// outLen[0] receives the DER length; returns null if no PEM body found.</summary>
+    static string pemToDer(string pem, int pemLen, List<int> outLen) {
+        int begin = findSub(pem, pemLen, "-----BEGIN", 10, 0);
+        if (begin < 0) { return null; }
+        int hb = begin;
+        while (hb < pemLen && (pem[hb] & 255) != 10) { hb = hb + 1; }
+        hb = hb + 1;
+        int end = findSub(pem, pemLen, "-----END", 8, hb);
+        if (end < 0) { end = pemLen; }
+        int blen = end - hb;
+        string b64 = calloc(blen + 1, 1);
+        int i = 0; while (i < blen) { b64[i] = pem[hb + i] & 255; i = i + 1; }
+        List<int> dl = new List<int>(); dl.Add(0);
+        string der = Base64.Decode(b64, dl);
+        free(b64);
+        outLen[0] = dl[0];
+        return der;
+    }
+
+    /// <summary>Reads a DER length at cursor c[0], advancing c[0] past it.</summary>
+    static int readDerLen(string der, List<int> c) {
+        int b = der[c[0]] & 255; c[0] = c[0] + 1;
+        if (b < 128) { return b; }
+        int nb = b - 128;
+        int v = 0; int i = 0;
+        while (i < nb) { v = (v << 8) | (der[c[0]] & 255); c[0] = c[0] + 1; i = i + 1; }
+        return v;
+    }
+
+    /// <summary>Parses an RSA SubjectPublicKeyInfo and encrypts <paramref name="obf"/>
+    /// with RSA OAEP-SHA1 (MySQL full-auth padding). kOut[0] receives the modulus
+    /// byte length (== ciphertext length).</summary>
+    static string fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
+        List<int> c = new List<int>(); c.Add(0);
+        c[0] = c[0] + 1; readDerLen(der, c);                       // outer SEQUENCE
+        c[0] = c[0] + 1; int algLen = readDerLen(der, c); c[0] = c[0] + algLen;  // skip AlgorithmIdentifier
+        c[0] = c[0] + 1; readDerLen(der, c);                       // BIT STRING
+        c[0] = c[0] + 1;                                           // unused-bits byte (0x00)
+        c[0] = c[0] + 1; readDerLen(der, c);                       // inner SEQUENCE (RSAPublicKey)
+        c[0] = c[0] + 1; int nLen = readDerLen(der, c);            // INTEGER modulus
+        int origStart = c[0]; int origLen = nLen;
+        int nStart = origStart; int useLen = origLen;
+        if ((der[nStart] & 255) == 0) { nStart = nStart + 1; useLen = useLen - 1; }
+        c[0] = origStart + origLen;
+        c[0] = c[0] + 1; int eLen = readDerLen(der, c);            // INTEGER exponent
+        int eStart = c[0];
+        string nBuf = calloc(useLen + 1, 1);
+        int i = 0; while (i < useLen) { nBuf[i] = der[nStart + i] & 255; i = i + 1; }
+        string eBuf = calloc(eLen + 1, 1);
+        i = 0; while (i < eLen) { eBuf[i] = der[eStart + i] & 255; i = i + 1; }
+        string cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
+        free(nBuf); free(eBuf);
+        kOut[0] = useLen;
+        return cph;
+    }
+
+    // ============================================================
     // Connect
     // ============================================================
 
@@ -238,7 +324,6 @@ class MySqlConnection {
         bool hasDb = db.Length > 0;
         if (hasDb) { caps = caps | 8; }              // CLIENT_CONNECT_WITH_DB
         string token = scramble41(pw, nonce);
-        free(nonce);
         string plugin = "caching_sha2_password";
         int userLen = user.Length;
         int respLen = 4 + 4 + 1 + 23 + userLen + 1 + 1 + 32;
@@ -267,35 +352,58 @@ class MySqlConnection {
         // --- auth result ---
         while (true) {
             string r = await this.readPacket();
-            if (r == null) { this.lastError = "connection closed during auth"; return false; }
+            if (r == null) { this.lastError = "connection closed during auth"; free(nonce); return false; }
             int b0 = r[0] & 255;
-            if (b0 == 0) { free(r); return true; }                      // OK -> authenticated
+            if (b0 == 0) { free(r); free(nonce); return true; }         // OK -> authenticated
             if (b0 == 255) {
                 int code = (r[1]&255)|((r[2]&255)<<8);
                 this.lastError = "auth err " + Convert.ToString(code) + ": "
                     + bytesToStr(r, 9, this.lastLen - 9);
-                free(r); return false;
+                free(r); free(nonce); return false;
             }
             if (b0 == 1) {
                 int more = r[1] & 255;
                 free(r);
                 if (more == 3) { continue; }                             // fast_auth_success -> OK follows
                 if (more == 4) {
-                    this.lastError = "caching_sha2_password full auth (RSA) required; "
-                        + "cache not primed for this user (log in once via a client to prime, or use TLS)";
-                    return false;
+                    // perform_full_authentication: request the server's RSA public
+                    // key, then send (password XOR nonce) encrypted with OAEP-SHA1.
+                    string req = calloc(2, 1); req[0] = 2;               // request_public_key
+                    await this.writePacket(req, 1, this.lastSeq + 1);
+                    free(req);
+                    string pk = await this.readPacket();
+                    if (pk == null) { this.lastError = "no RSA public key from server"; free(nonce); return false; }
+                    int pemLen = this.lastLen - 1;                        // skip leading 0x01
+                    string pem = calloc(pemLen + 1, 1);
+                    i = 0; while (i < pemLen) { pem[i] = pk[1 + i] & 255; i = i + 1; }
+                    free(pk);
+                    List<int> derLen = new List<int>(); derLen.Add(0);
+                    string der = pemToDer(pem, pemLen, derLen);
+                    if (der == null) { this.lastError = "bad RSA public key PEM"; free(pem); free(nonce); return false; }
+                    free(pem);
+                    int pwLen = pw.Length;
+                    int obfLen = pwLen + 1;                               // include trailing NUL
+                    string obf = calloc(obfLen + 1, 1);
+                    i = 0; while (i < obfLen) { obf[i] = (pw[i] & 255) ^ (nonce[i % 20] & 255); i = i + 1; }
+                    string seed = genSeed(20);
+                    List<int> kOut = new List<int>(); kOut.Add(0);
+                    string cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
+                    free(der); free(obf); free(seed);
+                    await this.writePacket(cipher, kOut[0], this.lastSeq + 1);
+                    free(cipher);
+                    continue;                                            // OK / ERR follows
                 }
                 this.lastError = "unexpected auth-more-data " + Convert.ToString(more);
-                return false;
+                free(nonce); return false;
             }
             if (b0 == 254) {
                 free(r);
                 this.lastError = "auth-switch requested (unsupported plugin)";
-                return false;
+                free(nonce); return false;
             }
             free(r);
             this.lastError = "unexpected auth packet " + Convert.ToString(b0);
-            return false;
+            free(nonce); return false;
         }
         return false;
     }
