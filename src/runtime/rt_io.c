@@ -137,6 +137,38 @@ static void io_deliver_recv(zan_io_entry_t *e) {
 }
 #endif
 
+#if defined(_WIN32)
+static volatile LONG g_socket_cleanup_requested;
+
+void zan_io_socket_cleanup(void) {
+#if defined(ZAN_CO_DRIVER)
+    InterlockedIncrement(&g_socket_cleanup_requested);
+#else
+    WSACleanup();
+#endif
+}
+#else
+void zan_io_socket_cleanup(void) {}
+#endif
+
+int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
+                           int64_t flags) {
+#if defined(_WIN32)
+    return (int64_t)send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
+#else
+    return (int64_t)send((int)fd, buf, (size_t)len, (int)flags);
+#endif
+}
+
+int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
+                           int64_t flags) {
+#if defined(_WIN32)
+    return (int64_t)recv((SOCKET)fd, (char *)buf, (int)len, (int)flags);
+#else
+    return (int64_t)recv((int)fd, buf, (size_t)len, (int)flags);
+#endif
+}
+
 /* ---- platform backend ---- */
 
 #if defined(__linux__)
@@ -370,6 +402,10 @@ void zan_io_shutdown(void) {
     if (g_iocp) { CloseHandle(g_iocp); g_iocp = NULL; }
     g_io_count = 0;
     WSACleanup();
+#if defined(ZAN_CO_DRIVER)
+    LONG requested = InterlockedExchange(&g_socket_cleanup_requested, 0);
+    while (requested-- > 0) WSACleanup();
+#endif
     g_io_started = 0;
 }
 
@@ -833,6 +869,8 @@ static volatile LONG    g_co_idle;      /* workers blocked in co_wait_io */
 static volatile LONG    g_co_stop;
 static int              g_co_inited;
 static int              g_co_workers;
+static void           **g_co_active;
+static int              g_co_active_count;
 
 static long long co_now_ms(void) { return (long long)GetTickCount64(); }
 
@@ -847,6 +885,7 @@ void zan_co_sched_init(void) {
     g_co_running = 0;
     g_co_idle = 0;
     g_co_stop = 0;
+    g_co_active_count = 0;
 }
 
 void zan_co_ready(void *frame, zan_co_step_t step) {
@@ -854,6 +893,13 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     zan_co_node *n = (zan_co_node *)malloc(sizeof(*n));
     n->next = NULL; n->frame = frame; n->step = step;
     EnterCriticalSection(&g_co_lock);
+    for (zan_co_node *queued = g_rq_head; queued; queued = queued->next) {
+        if (queued->frame == frame) {
+            LeaveCriticalSection(&g_co_lock);
+            free(n);
+            return;
+        }
+    }
     if (g_rq_tail) g_rq_tail->next = n; else g_rq_head = n;
     g_rq_tail = n;
     LeaveCriticalSection(&g_co_lock);
@@ -885,17 +931,55 @@ void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
 static int co_pop(void **frame, zan_co_step_t *step) {
     int got = 0;
     EnterCriticalSection(&g_co_lock);
-    if (g_rq_head) {
-        zan_co_node *n = g_rq_head;
-        g_rq_head = n->next;
-        if (!g_rq_head) g_rq_tail = NULL;
+    zan_co_node *prev = NULL;
+    zan_co_node *n = g_rq_head;
+    while (n) {
+        int active = 0;
+        for (int i = 0; i < g_co_active_count; i++) {
+            if (g_co_active[i] == n->frame) { active = 1; break; }
+        }
+        if (!active) break;
+        prev = n;
+        n = n->next;
+    }
+    if (n) {
+        if (prev) prev->next = n->next;
+        else g_rq_head = n->next;
+        if (g_rq_tail == n) g_rq_tail = prev;
         *frame = n->frame; *step = n->step;
         free(n);
+        g_co_active[g_co_active_count++] = *frame;
         InterlockedIncrement(&g_co_running);
         got = 1;
     }
     LeaveCriticalSection(&g_co_lock);
     return got;
+}
+
+static int co_has_runnable_locked(void) {
+    for (zan_co_node *n = g_rq_head; n; n = n->next) {
+        int active = 0;
+        for (int i = 0; i < g_co_active_count; i++) {
+            if (g_co_active[i] == n->frame) { active = 1; break; }
+        }
+        if (!active) return 1;
+    }
+    return 0;
+}
+
+static void co_step_done(void *frame) {
+    int wake;
+    EnterCriticalSection(&g_co_lock);
+    for (int i = 0; i < g_co_active_count; i++) {
+        if (g_co_active[i] == frame) {
+            g_co_active[i] = g_co_active[--g_co_active_count];
+            break;
+        }
+    }
+    InterlockedDecrement(&g_co_running);
+    wake = g_rq_head != NULL && g_co_idle > 0;
+    LeaveCriticalSection(&g_co_lock);
+    if (wake) co_wake_port();
 }
 
 /* Move any due timers onto the ready queue; return ms until the next pending
@@ -936,8 +1020,7 @@ static void co_wait_io(long long timeout_ms) {
      * whole batch itself on its next loop iterations -- instead of posting a
      * wake packet per completion. */
     InterlockedDecrement(&g_co_idle);
-    if (!ok)
-        return;
+    if (!ok) return;
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) continue;   /* wake packet */
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
@@ -982,13 +1065,13 @@ static void co_worker(void) {
         void *frame; zan_co_step_t step;
         if (co_pop(&frame, &step)) {
             step(frame);
-            InterlockedDecrement(&g_co_running);
+            co_step_done(frame);
             continue;
         }
         long long tnext = co_pump_timers();
         if (co_pop(&frame, &step)) {
             step(frame);
-            InterlockedDecrement(&g_co_running);
+            co_step_done(frame);
             continue;
         }
         if (co_all_idle()) {
@@ -1010,7 +1093,7 @@ static void co_worker(void) {
          * skip the block) or after (so it observes g_co_idle>0 and wakes us).
          * Both paths serialize on g_co_lock, so no wakeup is lost. */
         EnterCriticalSection(&g_co_lock);
-        int have_work = (g_rq_head != NULL);
+        int have_work = co_has_runnable_locked();
         if (!have_work) InterlockedIncrement(&g_co_idle);
         LeaveCriticalSection(&g_co_lock);
         if (have_work) continue;   /* never marked idle; nothing to undo */
@@ -1018,7 +1101,11 @@ static void co_worker(void) {
     }
 }
 
-static DWORD WINAPI co_worker_thunk(LPVOID p) { (void)p; co_worker(); return 0; }
+static DWORD WINAPI co_worker_thunk(LPVOID p) {
+    (void)p;
+    co_worker();
+    return 0;
+}
 
 void zan_co_sched_run(void) {
     zan_io_init();   /* ensure the port exists before workers block on it */
@@ -1033,6 +1120,8 @@ void zan_co_sched_run(void) {
     if (w > 64) w = 64;
     g_co_workers = w;
     g_co_stop = 0;
+    free(g_co_active);
+    g_co_active = (void **)calloc((size_t)w, sizeof(*g_co_active));
 
     HANDLE th[64]; int nt = 0;
     for (int i = 1; i < w; i++) {
@@ -1044,6 +1133,7 @@ void zan_co_sched_run(void) {
         WaitForSingleObject(th[i], INFINITE);
         CloseHandle(th[i]);
     }
+    zan_io_shutdown();
 }
 
 size_t zan_co_pending(void) {

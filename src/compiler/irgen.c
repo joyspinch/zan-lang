@@ -5929,11 +5929,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef selfframe = g->current_async_frame;
                 LLVMTypeRef self_ft = g->current_async_frame_type;
                 LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
-                LLVMBuildCall2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
-                    (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
+                    (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -5998,11 +5998,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef selfframe = g->current_async_frame;
                 LLVMTypeRef self_ft = g->current_async_frame_type;
                 LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
-                LLVMBuildCall2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
-                    (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
+                    (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -6050,12 +6050,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* &self.result — the reactor stores the recv byte count here. */
                 LLVMValueRef out_n = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                     ASYNC_FRAME_RESULT, "self.iores");
-                LLVMBuildCall2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
-                    (LLVMValueRef[]){ fd, buf, len, self_i8,
-                        g->current_async_resume_fn, out_n }, 6, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
+                    (LLVMValueRef[]){ fd, buf, len, self_i8,
+                        g->current_async_resume_fn, out_n }, 6, "");
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -6122,12 +6122,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMBuildStore(g->builder, g->current_async_resume_fn,
                     LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
 
-                /* schedule the sub, then SUSPEND self */
-                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
-                LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(i32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
+                LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
                 LLVMBuildRetVoid(g->builder);
 
                 /* resume-k: re-entered by the driver once the sub completes */
@@ -7880,6 +7879,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
                     strncmp(ext_name, "zan_shared_table_", 17) == 0) {
                     g->uses_sync_runtime = true;
+                }
+                if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {
+                    g->uses_socket_async = true;
                 }
                 /* Reuse existing declaration if the symbol already exists in the module
                  * (e.g. built-in malloc/free/strlen, or duplicate DllImport across files). */
