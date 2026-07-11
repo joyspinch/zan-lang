@@ -2,6 +2,7 @@ using System;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.WebSocket;
+using System.Text;
 
 namespace System.Net;
 
@@ -49,7 +50,12 @@ class Worker {
         return this;
     }
 
-    /// <summary>Runs all registered workers.</summary>
+    /// <summary>Runs all registered workers concurrently. Every worker but the
+    /// last is spawned as its own coroutine; the last is awaited so this call
+    /// drives the scheduler forever while all workers accept connections in
+    /// parallel on the single-threaded IO reactor. (Previously each worker was
+    /// awaited in turn, so only the first -- whose accept loop never returns --
+    /// ever ran.)</summary>
     static async void RunAll() {
         Socket.Initialize();
         Console.WriteLine("[Worker] Starting " + Convert.ToString(workers.Count) + " workers...");
@@ -58,8 +64,17 @@ class Worker {
         while (i < workers.Count) {
             Worker w = workers[i];
             Console.WriteLine("[Worker] " + w.name + " listening on " + w.protocol + "://" + w.host + ":" + Convert.ToString(w.port));
-            await w.Run();
             i = i + 1;
+        }
+
+        int n = workers.Count;
+        int j = 0;
+        while (j < n - 1) {
+            Task.Spawn(workers[j].Run());
+            j = j + 1;
+        }
+        if (n > 0) {
+            await workers[n - 1].Run();
         }
     }
 
@@ -79,12 +94,14 @@ class Worker {
             int clientSock = await listener.AcceptAsync();
             if (clientSock >= 0) {
                 this.connectionCount = this.connectionCount + 1;
+                // Handle each connection on its own coroutine so the accept loop
+                // keeps accepting instead of serving one client at a time.
                 if (this.protocol == "http") {
-                    await HandleHttp(clientSock);
+                    Task.Spawn(HandleHttp(clientSock));
                 } else if (this.protocol == "websocket" || this.protocol == "ws") {
-                    await HandleWebSocket(clientSock);
+                    Task.Spawn(HandleWebSocket(clientSock));
                 } else {
-                    await HandleTcp(clientSock);
+                    Task.Spawn(HandleTcp(clientSock));
                 }
             }
         }
@@ -141,16 +158,29 @@ class Worker {
         sb.Append("Upgrade: websocket\r\n");
         sb.Append("Connection: Upgrade\r\n");
         sb.Append("Sec-WebSocket-Accept: ");
-        sb.Append(wsKey);
+        sb.Append(Encoding.WebSocketAccept(wsKey));
         sb.Append("\r\n\r\n");
         await client.SendAsync(sb.ToString());
 
+        // Reassemble whole frames via WsReader (handles partial and coalesced
+        // frames), rather than assuming one recv == one frame.
+        WsReader reader = new WsReader(clientSock);
         bool active = true;
         while (active) {
-            string frameData = await client.RecvAsync(65536);
-            if (frameData.Length == 0) { break; }
+            int total = reader.FrameSize();
+            while (total < 0) {
+                int got = await reader.FillMore();
+                if (got == 0) {
+                    active = false;
+                    break;
+                }
+                total = reader.FrameSize();
+            }
+            if (!active) { break; }
 
-            WsFrame frame = WsFrame.Decode(frameData, frameData.Length);
+            WsFrame frame = WsFrame.Decode(reader.buf, total);
+            reader.Consume(total);
+
             if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
                 string response = OnWebSocketMessage(frame.payload);
                 if (response.Length > 0) {

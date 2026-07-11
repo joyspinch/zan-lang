@@ -1,0 +1,75 @@
+// Conformance: many connections served concurrently on the IO reactor.
+// A server accept loop spawns a per-connection echo coroutine (the pattern the
+// Worker/HttpServer/WebSocketServer accept loops use) instead of serving one
+// client at a time, and several client coroutines run in parallel. Each client
+// connects, sends "PING", and awaits the echo; the run finishes only once every
+// client has round-tripped, printing the count. If connections were serialized
+// this would still pass but the point is that Task.Spawn keeps the accept loop
+// live while handlers are in flight.
+using System;
+using System.Net.Sockets;
+
+class Program {
+    static int PORT = 54330;
+    static int N = 5;
+    static int done = 0;
+
+    static async void ServeConn(int client) {
+        string req = await AsyncSocket.Receive(client, 64);
+        int sent = await AsyncSocket.SendString(client, req);
+        Socket.Close(client);
+    }
+
+    static async void ServerAccept(int listener) {
+        int served = 0;
+        while (served < N) {
+            int client = await AsyncSocket.Accept(listener);
+            Socket.SetNonBlocking(client);
+            Task.Spawn(ServeConn(client));
+            served = served + 1;
+        }
+    }
+
+    static async void Client(int id) {
+        int sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(sock);
+        int rc = await AsyncSocket.Connect(sock, "127.0.0.1", PORT);
+        int s = await AsyncSocket.SendString(sock, "PING");
+        string reply = await AsyncSocket.Receive(sock, 64);
+        if (reply == "PING") {
+            done = done + 1;
+        }
+        Socket.Close(sock);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        int listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", PORT);
+        Socket.Listen(listener, 16);
+        Socket.SetNonBlocking(listener);
+
+        Task.Spawn(ServerAccept(listener));
+
+        int i = 0;
+        while (i < N) {
+            Task.Spawn(Client(i));
+            i = i + 1;
+        }
+
+        while (done < N) {
+            await Task.Delay(5);
+        }
+
+        Console.WriteLine(done);
+        Socket.Close(listener);
+        Socket.Cleanup();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

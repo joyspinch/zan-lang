@@ -145,4 +145,177 @@ class Encoding {
         }
         return sb.ToString();
     }
+
+    /// <summary>Base64-encodes <paramref name="len"/> raw bytes from
+    /// <paramref name="data"/>. Binary-safe: the length is explicit, so embedded
+    /// NUL bytes (e.g. a SHA-1 digest) are encoded rather than truncated the way
+    /// the strlen-based <see cref="Base64Encode"/> would.</summary>
+    static string Base64EncodeBytes(string data, int len) {
+        string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < len) {
+            int b0 = data[i] & 255;
+            int b1 = 0;
+            int b2 = 0;
+            int pad = 0;
+            if (i + 1 < len) {
+                b1 = data[i + 1] & 255;
+            } else {
+                pad = pad + 1;
+            }
+            if (i + 2 < len) {
+                b2 = data[i + 2] & 255;
+            } else {
+                pad = pad + 1;
+            }
+            int triple = (b0 << 16) + (b1 << 8) + b2;
+            sb.Append(chars.Substring((triple >> 18) & 63, 1));
+            sb.Append(chars.Substring((triple >> 12) & 63, 1));
+            if (pad < 2) {
+                sb.Append(chars.Substring((triple >> 6) & 63, 1));
+            } else {
+                sb.Append("=");
+            }
+            if (pad < 1) {
+                sb.Append(chars.Substring(triple & 63, 1));
+            } else {
+                sb.Append("=");
+            }
+            i = i + 3;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>32-bit left rotate. Operands are masked to 32 bits so the result
+    /// stays a well-defined unsigned 32-bit value on Zan's 64-bit ints.</summary>
+    static int Rotl32(int x, int n) {
+        int m = x & 4294967295;
+        return ((m << n) | (m >> (32 - n))) & 4294967295;
+    }
+
+    /// <summary>Computes the 20-byte SHA-1 digest of the first <paramref
+    /// name="len"/> bytes of <paramref name="data"/> and writes it into the
+    /// caller-owned 20-byte buffer <paramref name="digest"/>. Message lengths up
+    /// to 2^29 bytes are supported (the 64-bit length field is written from a
+    /// 32-bit bit count), which covers the handshake/hashing uses here.</summary>
+    static void Sha1(string data, int len, string digest) {
+        int h0 = 1732584193;   // 0x67452301
+        int h1 = 4023233417;   // 0xEFCDAB89
+        int h2 = 2562383102;   // 0x98BADCFE
+        int h3 = 271733878;    // 0x10325476
+        int h4 = 3285377520;   // 0xC3D2E1F0
+
+        int bitLen = len * 8;
+        int fullLen = len + 1;
+        while ((fullLen % 64) != 56) {
+            fullLen = fullLen + 1;
+        }
+        fullLen = fullLen + 8;
+
+        string msg = calloc(fullLen + 1, 1);
+        int i = 0;
+        while (i < len) {
+            msg[i] = data[i];
+            i = i + 1;
+        }
+        msg[len] = 128;   // 0x80 terminator; trailing bytes are already zero
+        msg[fullLen - 4] = (bitLen >> 24) & 255;
+        msg[fullLen - 3] = (bitLen >> 16) & 255;
+        msg[fullLen - 2] = (bitLen >> 8) & 255;
+        msg[fullLen - 1] = bitLen & 255;
+
+        int[] w = new int[80];
+        int chunk = 0;
+        while (chunk < fullLen) {
+            int t = 0;
+            while (t < 16) {
+                int j = chunk + t * 4;
+                w[t] = ((msg[j] & 255) << 24) | ((msg[j + 1] & 255) << 16) |
+                       ((msg[j + 2] & 255) << 8) | (msg[j + 3] & 255);
+                t = t + 1;
+            }
+            t = 16;
+            while (t < 80) {
+                int x = w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16];
+                w[t] = Rotl32(x, 1);
+                t = t + 1;
+            }
+
+            int a = h0;
+            int b = h1;
+            int c = h2;
+            int d = h3;
+            int e = h4;
+            t = 0;
+            while (t < 80) {
+                int f = 0;
+                int k = 0;
+                if (t < 20) {
+                    f = (b & c) | ((b ^ 4294967295) & d);
+                    k = 1518500249;    // 0x5A827999
+                } else if (t < 40) {
+                    f = b ^ c ^ d;
+                    k = 1859775393;    // 0x6ED9EBA1
+                } else if (t < 60) {
+                    f = (b & c) | (b & d) | (c & d);
+                    k = 2400959708;    // 0x8F1BBCDC
+                } else {
+                    f = b ^ c ^ d;
+                    k = 3395469782;    // 0xCA62C1D6
+                }
+                int tmp = (Rotl32(a, 5) + (f & 4294967295) + (e & 4294967295) +
+                           (k & 4294967295) + (w[t] & 4294967295)) & 4294967295;
+                e = d;
+                d = c;
+                c = Rotl32(b, 30);
+                b = a;
+                a = tmp;
+                t = t + 1;
+            }
+
+            h0 = (h0 + a) & 4294967295;
+            h1 = (h1 + b) & 4294967295;
+            h2 = (h2 + c) & 4294967295;
+            h3 = (h3 + d) & 4294967295;
+            h4 = (h4 + e) & 4294967295;
+            chunk = chunk + 64;
+        }
+        free(msg);
+
+        digest[0] = (h0 >> 24) & 255;
+        digest[1] = (h0 >> 16) & 255;
+        digest[2] = (h0 >> 8) & 255;
+        digest[3] = h0 & 255;
+        digest[4] = (h1 >> 24) & 255;
+        digest[5] = (h1 >> 16) & 255;
+        digest[6] = (h1 >> 8) & 255;
+        digest[7] = h1 & 255;
+        digest[8] = (h2 >> 24) & 255;
+        digest[9] = (h2 >> 16) & 255;
+        digest[10] = (h2 >> 8) & 255;
+        digest[11] = h2 & 255;
+        digest[12] = (h3 >> 24) & 255;
+        digest[13] = (h3 >> 16) & 255;
+        digest[14] = (h3 >> 8) & 255;
+        digest[15] = h3 & 255;
+        digest[16] = (h4 >> 24) & 255;
+        digest[17] = (h4 >> 16) & 255;
+        digest[18] = (h4 >> 8) & 255;
+        digest[19] = h4 & 255;
+    }
+
+    /// <summary>Computes the RFC 6455 <c>Sec-WebSocket-Accept</c> value for a
+    /// client's <c>Sec-WebSocket-Key</c>: base64(SHA1(key + GUID)). This is the
+    /// handshake response a WebSocket server must echo for standard browser and
+    /// library clients to accept the upgrade.</summary>
+    static string WebSocketAccept(string key) {
+        string combined = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        int len = strlen(combined);
+        string digest = calloc(21, 1);
+        Sha1(combined, len, digest);
+        string result = Base64EncodeBytes(digest, 20);
+        free(digest);
+        return result;
+    }
 }
