@@ -1499,6 +1499,22 @@ static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);
 static void emit_async_reload_slots(zan_irgen_t *g);
 
+/* A "name path" is a chain of identifiers joined by member access, e.g.
+ * `Foo.Bar.Widget` — the syntactic form of a namespace-qualified type
+ * reference. It contains no calls, indexes, `this`/`base`, etc. */
+static bool is_name_path(zan_ast_node_t *node) {
+    if (!node) return false;
+    if (node->kind == AST_IDENTIFIER) return true;
+    if (node->kind == AST_MEMBER_ACCESS) return is_name_path(node->member.object);
+    return false;
+}
+
+/* Leftmost identifier of a name path (the outermost namespace segment). */
+static zan_ast_node_t *name_path_head(zan_ast_node_t *node) {
+    while (node && node->kind == AST_MEMBER_ACCESS) node = node->member.object;
+    return (node && node->kind == AST_IDENTIFIER) ? node : NULL;
+}
+
 /* Resolve the declared type of an `obj.field` member access so that element
  * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
  * element LLVM type. Returns NULL when the field/type cannot be resolved. */
@@ -1660,6 +1676,18 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                 if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
                     zan_symbol_t *m = get_method_sym(ts, callee->member.name);
                     if (m) return m->type;
+                }
+            }
+            /* static: Namespace.Path.ClassName.Method() -- the object is a
+             * name path, so its rightmost segment is the type name. */
+            if (obj->kind == AST_MEMBER_ACCESS && is_name_path(obj)) {
+                zan_ast_node_t *head = name_path_head(obj);
+                if (head && !local_find(locals, head->ident.name)) {
+                    zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->member.name);
+                    if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
+                        zan_symbol_t *m = get_method_sym(ts, callee->member.name);
+                        if (m) return m->type;
+                    }
                 }
             }
             /* instance: <expr>.Method() -- resolve the receiver type
@@ -5133,6 +5161,46 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             }
                             free(call_args);
                             return result;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* namespace-qualified static call: Foo.Bar.Widget.Method(args).
+         * The callee's object is a name path (Foo.Bar.Widget) rather than a
+         * bare class identifier, so the AST_IDENTIFIER static branch above
+         * misses it. Types are registered by simple name, so the rightmost
+         * path segment is the type name. Guard on the path head not being a
+         * local so genuine instance chains (a.b.Method()) fall through to the
+         * instance handlers above. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.callee->member.object->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_ast_node_t *obj = callee->member.object;
+            zan_ast_node_t *head = name_path_head(obj);
+            if (is_name_path(obj) && head && !local_find(locals, head->ident.name)) {
+                zan_symbol_t *type_sym = zan_binder_lookup(g->binder, obj->member.name);
+                if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
+                    zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
+                    if (method_sym) {
+                        for (int fi = 0; fi < g->function_count; fi++) {
+                            if (g->functions[fi].sym == method_sym) {
+                                int argc = expr->call.args.count;
+                                LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                                for (int k = 0; k < argc; k++) {
+                                    call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                                }
+                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
+                                LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
+                                    g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                for (int k = 0; k < argc; k++) {
+                                    emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                        call_args[k], locals);
+                                }
+                                free(call_args);
+                                return result;
+                            }
                         }
                     }
                 }
