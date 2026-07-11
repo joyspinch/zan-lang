@@ -30,33 +30,35 @@ class AsyncSocket {
     /// NUL-terminated string (empty string on peer close / EOF).</summary>
     static async string Receive(int sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
-        while (true) {
-            await Socket.ReadReady(sock);
-            int n = Socket.Recv(sock, buf, bufSize);
-            if (n >= 0) {
-                string result = buf.Substring(0, n);
-                free(buf);
-                return result;
-            }
+        int n = await Socket.RecvOv(sock, buf, bufSize);
+        if (n < 0) {
+            n = 0;
         }
-        return buf;
+        string result = buf.Substring(0, n);
+        free(buf);
+        return result;
+    }
+
+    /// <summary>Suspends until readable, then receives up to
+    /// <paramref name="bufSize"/> bytes into a caller-owned buffer, returning
+    /// the byte count (0 on peer close). No per-call allocation or copy -- a
+    /// keep-alive connection reuses one buffer across messages instead of the
+    /// calloc + <c>Substring</c> that <see cref="Receive"/> does every call.
+    /// </summary>
+    static async int ReceiveInto(int sock, string buf, int bufSize) {
+        int n = await Socket.RecvIntoAsync(sock, buf, bufSize);
+        return n;
     }
 
     /// <summary>Suspends until writable, then sends; loops (re-awaiting on
     /// partial writes) until all <paramref name="len"/> bytes are sent or the
-    /// peer closes. Returns the number of bytes sent.</summary>
+    /// peer closes. Returns the number of bytes sent. Binary-safe: carries the
+    /// unsent remainder by index copy rather than <c>data + total</c> pointer
+    /// arithmetic (which compiles as concatenation and truncates at the first
+    /// NUL byte).</summary>
     static async int Send(int sock, string data, int len) {
-        int total = 0;
-        while (total < len) {
-            await Socket.WriteReady(sock);
-            int sent = Socket.Send(sock, data + total, len - total);
-            if (sent > 0) {
-                total = total + sent;
-            } else if (sent == 0) {
-                return total;
-            }
-        }
-        return total;
+        int r = await Socket.SendAsync(sock, data, len);
+        return r;
     }
 
     /// <summary>Sends a whole string (length via strlen).</summary>
@@ -69,6 +71,9 @@ class AsyncSocket {
     /// <summary>Suspends until an inbound connection is pending, then accepts
     /// it. Returns the accepted client fd.</summary>
     static async int Accept(int sock) {
+        #if WINDOWS
+        return await Socket.AcceptOv(sock);
+        #else
         while (true) {
             await Socket.ReadReady(sock);
             int client = Socket.Accept(sock);
@@ -77,6 +82,7 @@ class AsyncSocket {
             }
         }
         return -1;
+        #endif
     }
 
     /// <summary>Begins a non-blocking connect, then suspends until the socket

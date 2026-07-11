@@ -31,54 +31,58 @@ class HttpRequest {
         this.keepAlive = true;
     }
 
-    /// <summary>Parses a raw HTTP request string into an HttpRequest.</summary>
+    /// <summary>Parses a raw HTTP request string into an HttpRequest.
+    ///
+    /// Scans by byte index (<c>raw[i] &amp; 255</c>) rather than
+    /// <c>raw.Substring(i, 1)</c>. The latter heap-allocates a one-character
+    /// string for every byte inspected, so the old parser did O(request size)
+    /// allocations per request; this walks the buffer in place and allocates
+    /// only the handful of fields it actually extracts.</summary>
     static HttpRequest Parse(string raw) {
         HttpRequest req = new HttpRequest();
         int len = raw.Length;
         if (len == 0) { return req; }
 
-        // Find end of request line
+        // Request line: scan to '\n', then trim a trailing '\r'.
         int lineEnd = 0;
-        while (lineEnd < len && raw.Substring(lineEnd, 1) != "\n") {
+        while (lineEnd < len && (raw[lineEnd] & 255) != 10) {
             lineEnd = lineEnd + 1;
         }
-        string requestLine = raw.Substring(0, lineEnd);
-        // Remove \r if present
-        if (requestLine.Length > 0 && requestLine.Substring(requestLine.Length - 1, 1) == "\r") {
-            requestLine = requestLine.Substring(0, requestLine.Length - 1);
-        }
+        int rlEnd = lineEnd;
+        if (rlEnd > 0 && (raw[rlEnd - 1] & 255) == 13) { rlEnd = rlEnd - 1; }
 
         // Parse: METHOD PATH VERSION
         int sp1 = 0;
-        while (sp1 < requestLine.Length && requestLine.Substring(sp1, 1) != " ") {
+        while (sp1 < rlEnd && (raw[sp1] & 255) != 32) {
             sp1 = sp1 + 1;
         }
-        req.method = requestLine.Substring(0, sp1);
+        req.method = raw.Substring(0, sp1);
 
         int sp2 = sp1 + 1;
-        while (sp2 < requestLine.Length && requestLine.Substring(sp2, 1) != " ") {
+        while (sp2 < rlEnd && (raw[sp2] & 255) != 32) {
             sp2 = sp2 + 1;
         }
-        string fullPath = requestLine.Substring(sp1 + 1, sp2 - sp1 - 1);
-        if (sp2 < requestLine.Length) {
-            req.version = requestLine.Substring(sp2 + 1);
+        int pathStart = sp1 + 1;
+        int pathEnd = sp2;
+        if (sp2 < rlEnd) {
+            req.version = raw.Substring(sp2 + 1, rlEnd - sp2 - 1);
         }
 
         // Split path and query string
-        int qmark = 0;
+        int qmark = pathStart;
         bool foundQ = false;
-        while (qmark < fullPath.Length) {
-            if (fullPath.Substring(qmark, 1) == "?") {
+        while (qmark < pathEnd) {
+            if ((raw[qmark] & 255) == 63) {
                 foundQ = true;
                 break;
             }
             qmark = qmark + 1;
         }
         if (foundQ) {
-            req.path = fullPath.Substring(0, qmark);
-            req.queryString = fullPath.Substring(qmark + 1);
+            req.path = raw.Substring(pathStart, qmark - pathStart);
+            req.queryString = raw.Substring(qmark + 1, pathEnd - qmark - 1);
         } else {
-            req.path = fullPath;
+            req.path = raw.Substring(pathStart, pathEnd - pathStart);
         }
 
         // Parse headers
@@ -86,34 +90,32 @@ class HttpRequest {
         StringBuilder headersSb = new StringBuilder();
         while (pos < len) {
             int hEnd = pos;
-            while (hEnd < len && raw.Substring(hEnd, 1) != "\n") {
+            while (hEnd < len && (raw[hEnd] & 255) != 10) {
                 hEnd = hEnd + 1;
             }
-            string headerLine = raw.Substring(pos, hEnd - pos);
-            if (headerLine.Length > 0 && headerLine.Substring(headerLine.Length - 1, 1) == "\r") {
-                headerLine = headerLine.Substring(0, headerLine.Length - 1);
-            }
-            if (headerLine.Length == 0) {
+            int lineStop = hEnd;
+            if (lineStop > pos && (raw[lineStop - 1] & 255) == 13) { lineStop = lineStop - 1; }
+            if (lineStop == pos) {
                 // Empty line = end of headers
                 pos = hEnd + 1;
                 break;
             }
-            headersSb.Append(headerLine);
+            headersSb.Append(raw.Substring(pos, lineStop - pos));
             headersSb.Append("\n");
 
             // Parse well-known headers
-            string lowerLine = headerLine;  // simplified (no toLower)
-            int colonPos = 0;
-            while (colonPos < headerLine.Length && headerLine.Substring(colonPos, 1) != ":") {
+            int colonPos = pos;
+            while (colonPos < lineStop && (raw[colonPos] & 255) != 58) {
                 colonPos = colonPos + 1;
             }
-            if (colonPos < headerLine.Length) {
-                string hName = headerLine.Substring(0, colonPos);
-                string hValue = headerLine.Substring(colonPos + 1);
+            if (colonPos < lineStop) {
+                string hName = raw.Substring(pos, colonPos - pos);
+                int vStart = colonPos + 1;
                 // Trim leading space
-                if (hValue.Length > 0 && hValue.Substring(0, 1) == " ") {
-                    hValue = hValue.Substring(1);
+                if (vStart < lineStop && (raw[vStart] & 255) == 32) {
+                    vStart = vStart + 1;
                 }
+                string hValue = raw.Substring(vStart, lineStop - vStart);
                 if (hName == "Host" || hName == "host") {
                     req.host = hValue;
                 } else if (hName == "Content-Type" || hName == "content-type") {

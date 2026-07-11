@@ -111,6 +111,8 @@ struct zan_irgen {
     LLVMValueRef g_site_dtors;    /* [N x i8*] global: release fn per alloc site */
     LLVMTypeRef  site_dtors_type; /* [N x i8*] array type */
     zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
+    int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
+    zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
     int          leak_site_count; /* number of distinct `new` sites assigned */
     LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */
@@ -154,17 +156,20 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_delay_type;
     /* socket async (S4b-2): the readiness reactor, provided by the shipped
      * zanrt_io object (built from src/runtime/rt_io.c). zan_io_wait_co registers
-     * a one-shot fd watcher that re-readies (frame, step) when ready; zan_io_pump
-     * blocks in the reactor for the next event. A weak inline zan_io_pump that
-     * returns 0 lets non-socket programs link and behave as before; the reactor
-     * object's strong definition overrides it for socket-async programs. */
+     * a one-shot fd watcher that re-readies (frame, step) when ready;
+     * zan_io_pump_timeout blocks for IO up to the next timer deadline. A weak
+     * inline fallback sleeps for timer-only programs; the reactor object's
+     * strong definition overrides it for socket-async programs. */
     LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(i64 fd,i32 interest,i8* frame,step) */
     LLVMTypeRef  rt_io_wait_co_type;
     LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(i64 fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
     LLVMTypeRef  rt_io_recv_co_type;
-    LLVMValueRef rt_io_pump;      /* i32 zan_io_pump(void) */
-    LLVMTypeRef  rt_io_pump_type;
+    LLVMValueRef rt_io_accept_co; /* void zan_io_accept_co(i64 fd,i8* frame,step,i64* out_fd) */
+    LLVMTypeRef  rt_io_accept_co_type;
+    LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
+    LLVMTypeRef  rt_io_pump_timeout_type;
     bool         uses_socket_async; /* set when a socket await is lowered */
+    bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
     /* set while emitting an async function's $resume body: the current heap
      * frame pointer and its struct type, so `return` stores into the frame's
      * result slot + notifies the awaiter instead of a plain ret. NULL when not

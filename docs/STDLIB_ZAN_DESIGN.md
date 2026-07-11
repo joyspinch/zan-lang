@@ -17,7 +17,7 @@ zan 是 M:N 协程（`Task`）+ channel + 跨平台异步 I/O（Linux `io_uring/
 
 > 换句话说：本文下面所有涉及读写/网络/DB 的签名都带 `async Task<...>`；同步 IO API（如现有 `File.ReadAllText`）只作为对 `await File.ReadAllTextAsync` 的便捷包装或干脆废弃。
 
-并发原语（`Channel<T>` / `Mutex.Lock()`(返回可 `using` 的锁) / `RWLock` / `Semaphore` / `Atomic<T>` / `TaskGroup` / `CancellationToken`）已在 `CONCURRENCY.md` 定义，stdlib 直接复用，不再自造。所有耗时 API 都接受可选 `CancellationToken`。
+并发原语（`Channel<T>` / `Mutex.Lock()`(返回可 `using` 的锁) / `RWLock` / `Semaphore` / `AtomicInt` / `TaskGroup` / `CancellationToken`）已在 `CONCURRENCY.md` 定义，stdlib 直接复用，不再自造。所有耗时 API 都接受可选 `CancellationToken`。
 
 ---
 
@@ -153,7 +153,7 @@ List<User> list = await q.Where(User.Age >= 18)     // User.Age 是强类型列 
 - **`Socket` / `TcpListener` / `Dns`**：`await Socket.Connect`、`await listener.Accept`、`await sock.Read/Write`——对接 io_uring/IOCP/kqueue（参 `CONCURRENCY.md` §9.3 的 echo server）。
 - **文件 / Stream 家族**：`Stream / FileStream / MemoryStream / TextReader / TextWriter / BinaryReader / BinaryWriter`，读写均 `async`（`await stream.ReadAsync`）；`File.ReadLinesAsync` 返回 `IAsyncEnumerable<string>`。
 - **JSON**：接通运行时值树，`Json.Parse → JsonValue`（索引器 `v["a"][0]`，同步——纯计算）；大流解析提供 `Json.ParseStreamAsync`；反射做对象↔JSON 映射 `Json.Deserialize<T>()`。
-- **并发**：直接用 `CONCURRENCY.md` 的 `Task/Channel<T>/TaskGroup/Mutex/RWLock/Semaphore/Atomic<T>`；lock 用 `using (await mutex.Lock())`。
+- **并发**：直接用 `CONCURRENCY.md` 的 `Task/Channel<T>/TaskGroup/Mutex/RWLock/Semaphore/AtomicInt`；lock 用 `using (await mutex.Lock())`。
 - **安全**：`SHA256 / MD5 / HMAC / AES / Base64`（纯计算，同步）。
 - **`Environment` / `Process`（跨平台，`await proc.WaitForExit` / stdout 用 `IAsyncEnumerable`）/ `Stopwatch`（高精度）/ `Timer`（`await Task.Delay`）**。
 

@@ -81,41 +81,42 @@ class Mutex {
     static extern int PthreadMutexDestroy(string mutex);
     #endif
 
+    #if WINDOWS
     static int Create() {
-        #if WINDOWS
         return WinCreateMutex(0, 0, "");
-        #elif LINUX
-        string mtx = PthreadCalloc(1, 64);
-        PthreadMutexInit(mtx, "");
-        // Store pointer as int for handle-based API compatibility
-        return mtx;
-        #endif
     }
 
     static void Lock(int handle) {
-        #if WINDOWS
         WinWaitForSingleObject(handle, -1);
-        #elif LINUX
-        PthreadMutexLock(handle);
-        #endif
     }
 
     static void Unlock(int handle) {
-        #if WINDOWS
         WinReleaseMutex(handle);
-        #elif LINUX
-        PthreadMutexUnlock(handle);
-        #endif
     }
 
     static void Destroy(int handle) {
-        #if WINDOWS
         WinCloseHandle(handle);
-        #elif LINUX
+    }
+    #elif LINUX
+    static string Create() {
+        string mtx = PthreadCalloc(1, 64);
+        PthreadMutexInit(mtx, "");
+        return mtx;
+    }
+
+    static void Lock(string handle) {
+        PthreadMutexLock(handle);
+    }
+
+    static void Unlock(string handle) {
+        PthreadMutexUnlock(handle);
+    }
+
+    static void Destroy(string handle) {
         PthreadMutexDestroy(handle);
         PthreadFree(handle);
-        #endif
     }
+    #endif
 }
 
 /// <summary>
@@ -154,40 +155,42 @@ class Semaphore {
     static extern int SemDestroy(string sem);
     #endif
 
+    #if WINDOWS
     static int Create(int initialCount, int maxCount) {
-        #if WINDOWS
         return WinCreateSemaphore(0, initialCount, maxCount, "");
-        #elif LINUX
-        string sem = SemCalloc(1, 64);
-        SemInit(sem, 0, initialCount);
-        return sem;
-        #endif
     }
 
     static void Wait(int handle) {
-        #if WINDOWS
         WinWaitForSingleObject(handle, -1);
-        #elif LINUX
-        SemWait(handle);
-        #endif
     }
 
     static void Release(int handle) {
-        #if WINDOWS
         WinReleaseSemaphore(handle, 1, 0);
-        #elif LINUX
-        SemPost(handle);
-        #endif
     }
 
     static void Destroy(int handle) {
-        #if WINDOWS
         WinCloseHandle(handle);
-        #elif LINUX
+    }
+    #elif LINUX
+    static string Create(int initialCount, int maxCount) {
+        string sem = SemCalloc(1, 64);
+        SemInit(sem, 0, initialCount);
+        return sem;
+    }
+
+    static void Wait(string handle) {
+        SemWait(handle);
+    }
+
+    static void Release(string handle) {
+        SemPost(handle);
+    }
+
+    static void Destroy(string handle) {
         SemDestroy(handle);
         SemFree(handle);
-        #endif
     }
+    #endif
 }
 
 /// <summary>
@@ -220,6 +223,247 @@ class Stopwatch {
         StopwatchFree(tp);
         return sec * 1000 + nsec / 1000000;
         #endif
+    }
+}
+
+/// <summary>
+/// A sequentially-consistent 64-bit integer for sharing between worker threads.
+/// </summary>
+class AtomicInt {
+    int handle;
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_create")]
+    static extern int NativeCreate(int initialValue);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_destroy")]
+    static extern void NativeDestroy(int handle);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_load")]
+    static extern int NativeLoad(int handle);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_store")]
+    static extern void NativeStore(int handle, int newValue);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_exchange")]
+    static extern int NativeExchange(int handle, int newValue);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_compare_exchange")]
+    static extern int NativeCompareExchange(int handle, int expected, int desired);
+
+    [DllImport("crt", EntryPoint = "zan_atomic_int_add")]
+    static extern int NativeAdd(int handle, int delta);
+
+    AtomicInt(int initialValue) {
+        this.handle = NativeCreate(initialValue);
+    }
+
+    ~AtomicInt() {
+        if (this.handle != 0) {
+            NativeDestroy(this.handle);
+            this.handle = 0;
+        }
+    }
+
+    bool IsValid() {
+        return this.handle != 0;
+    }
+
+    int Load() {
+        return NativeLoad(this.handle);
+    }
+
+    void Store(int newValue) {
+        NativeStore(this.handle, newValue);
+    }
+
+    int Exchange(int newValue) {
+        return NativeExchange(this.handle, newValue);
+    }
+
+    int CompareExchange(int expected, int desired) {
+        return NativeCompareExchange(this.handle, expected, desired);
+    }
+
+    int Add(int delta) {
+        return NativeAdd(this.handle, delta);
+    }
+
+    int Increment() {
+        return NativeAdd(this.handle, 1);
+    }
+
+    int Decrement() {
+        return NativeAdd(this.handle, -1);
+    }
+}
+
+/// <summary>
+/// A fixed-capacity, fixed-schema hash table backed by named shared memory.
+/// Every operation is atomic across threads and processes.
+/// </summary>
+class SharedTable {
+    int handle;
+    string tableName;
+    int tableCapacity;
+    int tableKeySize;
+    string tableSchema;
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_create")]
+    static extern int NativeCreate(string name, int capacity, int keySize, string schema);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_open")]
+    static extern int NativeOpen(string name);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_close")]
+    static extern void NativeClose(int handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_destroy")]
+    static extern int NativeDestroy(int handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_int")]
+    static extern int NativeSetInt(int handle, string key, string column, int newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_int")]
+    static extern int NativeGetInt(int handle, string key, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_float")]
+    static extern int NativeSetFloat(int handle, string key, string column, double newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_float")]
+    static extern double NativeGetFloat(int handle, string key, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_string")]
+    static extern int NativeSetString(int handle, string key, string column, string newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_string")]
+    static extern string NativeGetString(int handle, string key, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_increment")]
+    static extern int NativeIncrement(int handle, string key, string column, int delta);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_delete")]
+    static extern int NativeDelete(int handle, string key);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_exists")]
+    static extern int NativeExists(int handle, string key);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_count")]
+    static extern int NativeCount(int handle);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_clear")]
+    static extern void NativeClear(int handle);
+
+    SharedTable(string name, int capacity) {
+        this.handle = 0;
+        this.tableName = name;
+        this.tableCapacity = capacity;
+        this.tableKeySize = 64;
+        this.tableSchema = "";
+    }
+
+    ~SharedTable() {
+        Close();
+    }
+
+    void KeySize(int size) {
+        this.tableKeySize = size;
+    }
+
+    void ColumnInt(string name) {
+        this.tableSchema = this.tableSchema + "i:" + name + ";";
+    }
+
+    void ColumnFloat(string name) {
+        this.tableSchema = this.tableSchema + "f:" + name + ";";
+    }
+
+    void ColumnString(string name, int size) {
+        this.tableSchema = this.tableSchema + "s:" +
+            Convert.ToString(size) + ":" + name + ";";
+    }
+
+    bool Create() {
+        if (this.handle != 0) {
+            return false;
+        }
+        this.handle = NativeCreate(
+            this.tableName, this.tableCapacity, this.tableKeySize, this.tableSchema);
+        return this.handle != 0;
+    }
+
+    static SharedTable Open(string name) {
+        SharedTable table = new SharedTable(name, 1);
+        table.handle = NativeOpen(name);
+        return table;
+    }
+
+    bool IsOpen() {
+        return this.handle != 0;
+    }
+
+    void Close() {
+        if (this.handle != 0) {
+            NativeClose(this.handle);
+            this.handle = 0;
+        }
+    }
+
+    bool Destroy() {
+        if (this.handle == 0) {
+            return false;
+        }
+        int current = this.handle;
+        this.handle = 0;
+        return NativeDestroy(current) != 0;
+    }
+
+    bool SetInt(string key, string column, int newValue) {
+        return NativeSetInt(this.handle, key, column, newValue) != 0;
+    }
+
+    int GetInt(string key, string column) {
+        return NativeGetInt(this.handle, key, column);
+    }
+
+    bool SetFloat(string key, string column, double newValue) {
+        return NativeSetFloat(this.handle, key, column, newValue) != 0;
+    }
+
+    double GetFloat(string key, string column) {
+        return NativeGetFloat(this.handle, key, column);
+    }
+
+    bool SetString(string key, string column, string newValue) {
+        return NativeSetString(this.handle, key, column, newValue) != 0;
+    }
+
+    string GetString(string key, string column) {
+        string text = NativeGetString(this.handle, key, column);
+        return text.Substring(0, text.Length);
+    }
+
+    int Increment(string key, string column, int delta) {
+        return NativeIncrement(this.handle, key, column, delta);
+    }
+
+    int Decrement(string key, string column, int delta) {
+        return NativeIncrement(this.handle, key, column, -delta);
+    }
+
+    bool Delete(string key) {
+        return NativeDelete(this.handle, key) != 0;
+    }
+
+    bool Exists(string key) {
+        return NativeExists(this.handle, key) != 0;
+    }
+
+    int Count() {
+        return NativeCount(this.handle);
+    }
+
+    void Clear() {
+        NativeClear(this.handle);
     }
 }
 

@@ -41,6 +41,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <time.h>
 #endif
 #if defined(__linux__)
 #include <sys/epoll.h>
@@ -55,6 +56,7 @@
 #include <ws2tcpip.h>
 #include <mswsock.h>          /* ConnectEx + WSAID_CONNECTEX */
 #include <windows.h>
+#include <malloc.h>           /* _aligned_malloc / _aligned_free (op pool) */
 #else
 #include <sys/select.h>
 #include <fcntl.h>
@@ -114,6 +116,7 @@ typedef struct zan_io_entry {
     void *rbuf;             /* recv sink (zan_io_recv_co); NULL => plain probe */
     int   rlen;
     int64_t *out_n;         /* recv byte-count sink (NULL => plain probe) */
+    int64_t *out_accept;    /* accepted fd sink (NULL => not an accept op) */
     struct zan_io_entry *next;
 } zan_io_entry_t;
 
@@ -125,16 +128,53 @@ static zan_io_entry_t *g_io_entries;    /* linked list of active watchers */
 static void   *g_pending_rbuf;
 static int      g_pending_rlen;
 static int64_t *g_pending_out_n;
+static int64_t *g_pending_accept_out;
 
 /* On POSIX there is no overlapped recv, so zan_io_recv_co registers a readiness
  * watcher and performs the recv here once the fd is readable -- same net effect
  * (one recv per await, byte count delivered via out_n). No-op for plain probes. */
 static void io_deliver_recv(zan_io_entry_t *e) {
+    if (e->out_accept) {
+        *e->out_accept = (int64_t)accept(e->fd, NULL, NULL);
+        return;
+    }
     if (!e->out_n) return;
     ssize_t rn = recv(e->fd, e->rbuf, (size_t)e->rlen, 0);
     *e->out_n = (rn < 0) ? 0 : (int64_t)rn;
 }
 #endif
+
+#if defined(_WIN32)
+static volatile LONG g_socket_cleanup_requested;
+
+void zan_io_socket_cleanup(void) {
+#if defined(ZAN_CO_DRIVER)
+    InterlockedIncrement(&g_socket_cleanup_requested);
+#else
+    WSACleanup();
+#endif
+}
+#else
+void zan_io_socket_cleanup(void) {}
+#endif
+
+int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
+                           int64_t flags) {
+#if defined(_WIN32)
+    return (int64_t)send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
+#else
+    return (int64_t)send((int)fd, buf, (size_t)len, (int)flags);
+#endif
+}
+
+int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
+                           int64_t flags) {
+#if defined(_WIN32)
+    return (int64_t)recv((SOCKET)fd, (char *)buf, (int)len, (int)flags);
+#else
+    return (int64_t)recv((int)fd, buf, (size_t)len, (int)flags);
+#endif
+}
 
 /* ---- platform backend ---- */
 
@@ -317,29 +357,168 @@ typedef struct zan_io_op {
     OVERLAPPED ov;
     SOCKET     sock;
     int        interest;     /* ZAN_IO_READ / ZAN_IO_WRITE */
+    int        kind;         /* readiness/recv/accept */
     void      *co;           /* fiber handle, or stackless frame pointer */
     zan_co_step_t step;      /* stackless resume fn (NULL => stackful fiber) */
     int64_t   *out_n;        /* recv byte-count sink (NULL => readiness probe) */
+    SOCKET     accepted;
+    void      *accept_buf;
 } zan_io_op_t;
+
+enum {
+    ZAN_IO_OP_READY,
+    ZAN_IO_OP_RECV,
+    ZAN_IO_OP_ACCEPT
+};
 
 static HANDLE g_iocp;
 #if defined(ZAN_CO_DRIVER)
 static volatile LONG g_skip_mode = -1;  /* -1 unknown, 1 on, 0 unsupported */
 #endif
 
-/* Associate a socket with the completion port. Association is one-shot per
- * socket *kernel object*, but socket HANDLE numbers are recycled by Windows
- * after a socket is closed. Caching associated handles (by value) would then
- * wrongly skip associating a brand-new socket that happens to reuse a closed
- * handle's number, and that socket's overlapped completions would never be
- * delivered to the port (the coroutine awaiting it blocks forever). So just
- * (re)associate on every registration and treat "already associated with this
- * port" (ERROR_INVALID_PARAMETER) as success. */
-static void ensure_assoc(SOCKET s) {
+/* ---- overlapped-op pool ----
+ * Each overlapped IO needs a heap zan_io_op_t; recycling them removes a
+ * malloc/free pair from every request on the hot path. The single-threaded
+ * reactor uses a plain intrusive free list. The multi-worker driver uses a
+ * Windows interlocked SLIST (lock-free) because several workers issue ops
+ * (recv/accept/connect) and complete/free them concurrently. A pooled op's
+ * leading bytes hold the SLIST_ENTRY; that overlaps the (unused-while-pooled)
+ * OVERLAPPED at offset 0, so pool ops are 16-byte aligned via _aligned_malloc
+ * to satisfy the interlocked-SLIST alignment contract. */
+#if defined(ZAN_CO_DRIVER)
+/* The interlocked SLIST head must be MEMORY_ALLOCATION_ALIGNMENT-aligned (16 on
+ * x64) for the 128-bit compare-exchange; SLIST_HEADER's natural alignment is
+ * only 8, so force it (GCC/MSVC spell the attribute differently). */
+#if defined(__GNUC__)
+static SLIST_HEADER g_op_slist __attribute__((aligned(MEMORY_ALLOCATION_ALIGNMENT)));
+#else
+static __declspec(align(MEMORY_ALLOCATION_ALIGNMENT)) SLIST_HEADER g_op_slist;
+#endif
+
+static zan_io_op_t *op_alloc(void) {
+    zan_io_op_t *op = (zan_io_op_t *)InterlockedPopEntrySList(&g_op_slist);
+    if (!op)
+        op = (zan_io_op_t *)_aligned_malloc(sizeof(zan_io_op_t),
+                                            MEMORY_ALLOCATION_ALIGNMENT);
+    if (op) memset(op, 0, sizeof(*op));
+    return op;
+}
+static void op_free(zan_io_op_t *op) {
+    InterlockedPushEntrySList(&g_op_slist, (PSLIST_ENTRY)op);
+}
+#else
+static zan_io_op_t *g_op_pool;   /* singly-linked free list (next @ offset 0) */
+
+static zan_io_op_t *op_alloc(void) {
+    zan_io_op_t *op = g_op_pool;
+    if (op) {
+        g_op_pool = *(zan_io_op_t **)op;
+        memset(op, 0, sizeof(*op));
+    } else {
+        op = (zan_io_op_t *)calloc(1, sizeof(*op));
+    }
+    return op;
+}
+static void op_free(zan_io_op_t *op) {
+    *(zan_io_op_t **)op = g_op_pool;
+    g_op_pool = op;
+}
+#endif
+
+/* ---- completion-port association cache ----
+ * A socket only needs to be associated with the IOCP once, yet the recv
+ * registration path re-ran CreateIoCompletionPort on every op -- a syscall per
+ * request. Cache the sockets the reactor freshly created (accept/connect) so
+ * their later registrations skip the redundant association. Windows recycles
+ * closed handle numbers, which a naive value cache would mishandle; that is
+ * safe here because mark_assoc() -- called for every newly created socket --
+ * always issues the real association for the new kernel object, so a recycled
+ * number never makes ensure_assoc() skip associating a fresh socket (which is
+ * why ensure_assoc() itself never records sockets it did not force-associate).
+ * The table is guarded by an SRWLOCK under the multi-worker driver (many
+ * workers register concurrently); in the single-threaded reactor the lock
+ * macros expand to nothing. */
+#if defined(ZAN_CO_DRIVER)
+static SRWLOCK g_assoc_lock = SRWLOCK_INIT;
+#define ASSOC_RLOCK()   AcquireSRWLockShared(&g_assoc_lock)
+#define ASSOC_RUNLOCK() ReleaseSRWLockShared(&g_assoc_lock)
+#define ASSOC_WLOCK()   AcquireSRWLockExclusive(&g_assoc_lock)
+#define ASSOC_WUNLOCK() ReleaseSRWLockExclusive(&g_assoc_lock)
+#else
+#define ASSOC_RLOCK()
+#define ASSOC_RUNLOCK()
+#define ASSOC_WLOCK()
+#define ASSOC_WUNLOCK()
+#endif
+
+static SOCKET *g_assoc_tab;      /* open-addressed, power-of-two, linear probe */
+static size_t  g_assoc_cap;
+static size_t  g_assoc_len;
+
+static void assoc_insert_locked(SOCKET s);
+
+static void assoc_grow_locked(void) {
+    size_t ncap = g_assoc_cap ? g_assoc_cap * 2 : 64;
+    SOCKET *old = g_assoc_tab;
+    size_t oldcap = g_assoc_cap;
+    SOCKET *nt = (SOCKET *)malloc(ncap * sizeof(SOCKET));
+    for (size_t i = 0; i < ncap; i++) nt[i] = INVALID_SOCKET;
+    g_assoc_tab = nt;
+    g_assoc_cap = ncap;
+    g_assoc_len = 0;
+    for (size_t i = 0; i < oldcap; i++)
+        if (old[i] != INVALID_SOCKET) assoc_insert_locked(old[i]);
+    free(old);
+}
+
+static void assoc_insert_locked(SOCKET s) {
+    if ((g_assoc_len + 1) * 4 >= g_assoc_cap * 3) assoc_grow_locked();
+    size_t mask = g_assoc_cap - 1;
+    size_t i = ((size_t)s / 4) & mask;
+    while (g_assoc_tab[i] != INVALID_SOCKET) {
+        if (g_assoc_tab[i] == s) return;
+        i = (i + 1) & mask;
+    }
+    g_assoc_tab[i] = s;
+    g_assoc_len++;
+}
+
+static int assoc_contains(SOCKET s) {
+    int found = 0;
+    ASSOC_RLOCK();
+    if (g_assoc_cap) {
+        size_t mask = g_assoc_cap - 1;
+        size_t i = ((size_t)s / 4) & mask;
+        while (g_assoc_tab[i] != INVALID_SOCKET) {
+            if (g_assoc_tab[i] == s) { found = 1; break; }
+            i = (i + 1) & mask;
+        }
+    }
+    ASSOC_RUNLOCK();
+    return found;
+}
+
+/* Associate a brand-new kernel socket with the port and record it. Always
+ * performs the association: a recycled handle number may still sit in the cache
+ * from a since-closed socket, but this new kernel object is unassociated. */
+static void mark_assoc(SOCKET s) {
     if (CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0) == NULL) {
         DWORD e = GetLastError();
-        (void)e;   /* ERROR_INVALID_PARAMETER == already bound to this port */
+        (void)e;
     }
+    ASSOC_WLOCK();
+    assoc_insert_locked(s);
+    ASSOC_WUNLOCK();
+}
+
+/* Associate a socket with the completion port on first use. Sockets the reactor
+ * created itself (accept/connect) were already force-associated by mark_assoc
+ * and sit in the cache, so their hot-path registrations skip the syscall.
+ * Everything else -- e.g. the listener -- (re)associates and is treated as
+ * success when already bound (ERROR_INVALID_PARAMETER). ensure_assoc never
+ * records a socket, so a recycled handle number can never make it skip
+ * associating a socket that was not force-associated by mark_assoc. */
+static void ensure_assoc(SOCKET s) {
 #if defined(ZAN_CO_DRIVER)
     /* Do NOT enable FILE_SKIP_COMPLETION_PORT_ON_SUCCESS under the multi-worker
      * driver. Skip-on-success means an inline completion posts no IOCP packet,
@@ -354,6 +533,11 @@ static void ensure_assoc(SOCKET s) {
      * stays 0 so io_register / zan_io_recv_co never take the inline shortcut. */
     if (g_skip_mode < 0) InterlockedExchange(&g_skip_mode, 0);
 #endif
+    if (assoc_contains(s)) return;
+    if (CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0) == NULL) {
+        DWORD e = GetLastError();
+        (void)e;   /* ERROR_INVALID_PARAMETER == already bound to this port */
+    }
 }
 
 void zan_io_init(void) {
@@ -362,13 +546,42 @@ void zan_io_init(void) {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+#if defined(ZAN_CO_DRIVER)
+    InitializeSListHead(&g_op_slist);   /* lock-free op pool for the workers */
+#endif
     g_io_started = 1;
 }
 
 void zan_io_shutdown(void) {
     if (g_iocp) { CloseHandle(g_iocp); g_iocp = NULL; }
     g_io_count = 0;
+    /* Drop pooled ops and the association cache: the completion port is gone,
+     * so the cached socket->associated facts and recycled op structs are all
+     * stale for any future zan_io_init(). */
+#if defined(ZAN_CO_DRIVER)
+    for (;;) {
+        PSLIST_ENTRY e = InterlockedPopEntrySList(&g_op_slist);
+        if (!e) break;
+        _aligned_free(e);
+    }
+#else
+    while (g_op_pool) {
+        zan_io_op_t *nx = *(zan_io_op_t **)g_op_pool;
+        free(g_op_pool);
+        g_op_pool = nx;
+    }
+#endif
+    ASSOC_WLOCK();
+    free(g_assoc_tab);
+    g_assoc_tab = NULL;
+    g_assoc_cap = 0;
+    g_assoc_len = 0;
+    ASSOC_WUNLOCK();
     WSACleanup();
+#if defined(ZAN_CO_DRIVER)
+    LONG requested = InterlockedExchange(&g_socket_cleanup_requested, 0);
+    while (requested-- > 0) WSACleanup();
+#endif
     g_io_started = 0;
 }
 
@@ -420,9 +633,10 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
 
     ensure_assoc(s);
 
-    zan_io_op_t *op = (zan_io_op_t *)calloc(1, sizeof(*op));
+    zan_io_op_t *op = op_alloc();
     op->sock = s;
     op->interest = interest;
+    op->kind = ZAN_IO_OP_READY;
     op->co = co;
     op->step = step;
     IO_CNT_INC();
@@ -445,7 +659,7 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
          * packet is still queued -- leave it to the IOCP to avoid a double
          * completion. */
         if (g_skip_mode == 1) {
-            free(op);
+            op_free(op);
             IO_CNT_DEC();
             if (step) zan_co_ready(co, step);
         }
@@ -471,9 +685,10 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     SOCKET s = (SOCKET)fd;
     ensure_assoc(s);
 
-    zan_io_op_t *op = (zan_io_op_t *)calloc(1, sizeof(*op));
+    zan_io_op_t *op = op_alloc();
     op->sock = s;
     op->interest = ZAN_IO_READ;
+    op->kind = ZAN_IO_OP_RECV;
     op->co = frame;
     op->step = step;
     op->out_n = out_n;
@@ -491,7 +706,7 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
          * and zan_io_poll/co_wait_io will deliver it (avoid double-completion). */
         if (g_skip_mode == 1) {
             if (out_n) *out_n = (int64_t)got;
-            free(op);
+            op_free(op);
             IO_CNT_DEC();
             if (step) zan_co_ready(frame, step);
         }
@@ -507,6 +722,79 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov);
 }
 
+void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
+                      int64_t *out_fd) {
+    zan_io_init();
+    SOCKET listener = (SOCKET)fd;
+    ensure_assoc(listener);
+
+    LPFN_ACCEPTEX accept_ex = NULL;
+    GUID guid = WSAID_ACCEPTEX;
+    DWORD got = 0;
+    if (WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                 &guid, sizeof(guid), &accept_ex, sizeof(accept_ex),
+                 &got, NULL, NULL) == SOCKET_ERROR) {
+        if (out_fd) *out_fd = -1;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+
+    SOCKET accepted = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
+                                 WSA_FLAG_OVERLAPPED);
+    if (accepted == INVALID_SOCKET) {
+        if (out_fd) *out_fd = -1;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+
+    const DWORD addr_len = (DWORD)sizeof(struct sockaddr_in) + 16;
+    zan_io_op_t *op = op_alloc();
+    op->sock = listener;
+    op->kind = ZAN_IO_OP_ACCEPT;
+    op->co = frame;
+    op->step = step;
+    op->out_n = out_fd;
+    op->accepted = accepted;
+    op->accept_buf = calloc(1, addr_len * 2);
+    IO_CNT_INC();
+
+    got = 0;
+    BOOL ok = accept_ex(listener, accepted, op->accept_buf, 0,
+                        addr_len, addr_len, &got, &op->ov);
+    if (ok || WSAGetLastError() == WSA_IO_PENDING) return;
+
+    closesocket(accepted);
+    free(op->accept_buf);
+    op_free(op);
+    IO_CNT_DEC();
+    if (out_fd) *out_fd = -1;
+    if (step) zan_co_ready(frame, step);
+}
+
+static void io_complete_op(zan_io_op_t *op, DWORD transferred,
+                           ULONG_PTR status) {
+    if (op->kind == ZAN_IO_OP_ACCEPT) {
+        SOCKET accepted = op->accepted;
+        int64_t result = -1;
+        if (status == 0 &&
+            setsockopt(accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                       (const char *)&op->sock, (int)sizeof(op->sock)) == 0) {
+            u_long mode = 1;
+            ioctlsocket(accepted, FIONBIO, &mode);
+            /* Force-associate the freshly accepted socket once, so its recv
+             * registrations can skip CreateIoCompletionPort (ensure_assoc). */
+            mark_assoc(accepted);
+            result = (int64_t)accepted;
+        } else {
+            closesocket(accepted);
+        }
+        if (op->out_n) *op->out_n = result;
+        free(op->accept_buf);
+        return;
+    }
+    if (op->out_n) *op->out_n = (int64_t)transferred;
+}
+
 int zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0) return 0;
     OVERLAPPED_ENTRY entries[64];
@@ -520,8 +808,9 @@ int zan_io_poll(int64_t timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
-        if (op->out_n) *op->out_n = (int64_t)entries[i].dwNumberOfBytesTransferred;
-        free(op);
+        io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
+                       entries[i].Internal);
+        op_free(op);
         g_io_count--;
         io_wake(co, step);
         woke++;
@@ -566,8 +855,10 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     e->rbuf = g_pending_rbuf;
     e->rlen = g_pending_rlen;
     e->out_n = g_pending_out_n;
+    e->out_accept = g_pending_accept_out;
     g_pending_rbuf = NULL;
     g_pending_out_n = NULL;
+    g_pending_accept_out = NULL;
     e->next = g_io_entries;
     g_io_entries = e;
     g_io_count++;
@@ -645,11 +936,34 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     g_pending_out_n = out_n;
     io_register((int)fd, ZAN_IO_READ, frame, step);
 }
+
+void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
+                      int64_t *out_fd) {
+    zan_io_init();
+    g_pending_accept_out = out_fd;
+    io_register((int)fd, ZAN_IO_READ, frame, step);
+}
 #endif
 
+int zan_io_pump_timeout(int64_t timeout_ms) {
+    if (zan_io_has_pending())
+        return zan_io_poll(timeout_ms);
+    if (timeout_ms <= 0)
+        return 0;
+#ifdef _WIN32
+    Sleep((DWORD)timeout_ms);
+#else
+    struct timespec ts = {
+        (time_t)(timeout_ms / 1000),
+        (long)((timeout_ms % 1000) * 1000000)
+    };
+    nanosleep(&ts, NULL);
+#endif
+    return 0;
+}
+
 int zan_io_pump(void) {
-    if (!zan_io_has_pending()) return 0;
-    return zan_io_poll(-1);   /* block until an fd is ready (wakes via zan_co_ready) */
+    return zan_io_pump_timeout(-1);
 }
 
 int zan_io_has_pending(void) {
@@ -705,7 +1019,8 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
     local.sin_port = 0;
     bind(s, (struct sockaddr *)&local, sizeof(local));
 
-    ensure_assoc(s);
+    /* Freshly-connecting socket: force-associate once and record it. */
+    mark_assoc(s);
 
     GUID guid = WSAID_CONNECTEX;
     LPFN_CONNECTEX pConnectEx = NULL;
@@ -724,7 +1039,7 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
     void *co = zan_io_get_current_co();
     if (!co) return -1;
 
-    zan_io_op_t *op = (zan_io_op_t *)calloc(1, sizeof(*op));
+    zan_io_op_t *op = op_alloc();
     op->sock = s;
     op->interest = ZAN_IO_WRITE;
     op->co = co;
@@ -733,7 +1048,7 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
     BOOL ok = pConnectEx(s, (struct sockaddr *)&target, sizeof(target),
                          NULL, 0, NULL, &op->ov);
     if (!ok && WSAGetLastError() != ERROR_IO_PENDING) {
-        free(op);
+        op_free(op);
         g_io_count--;
         return -1;
     }
@@ -786,9 +1101,10 @@ int64_t zan_io_connect(int64_t fd, const char *ip, int port) {
  * zan_co_sched_run / zan_co_delay), but runs the ready queue across a pool of
  * OS worker threads that all pull completions from the shared IOCP and resume
  * coroutines concurrently -- so CPU-bound coroutine work (e.g. HTTP parsing)
- * scales across cores. The ready queue and timer list are guarded by a lock;
- * the IOCP itself is kernel-thread-safe. Worker count comes from the
- * ZAN_CO_WORKERS env var, defaulting to the number of logical processors.
+ * scales across cores. Ready frames and active-frame state are sharded by
+ * frame address so workers do not serialize on one scheduler lock; the timer
+ * list remains shared and the IOCP itself is kernel-thread-safe. Worker count
+ * comes from ZAN_CO_WORKERS, defaulting to the logical processor count.
  * ====================================================================== */
 #ifdef ZAN_CO_DRIVER
 
@@ -810,12 +1126,21 @@ static zan_co_timer *g_tq;
 
 #if defined(_WIN32)
 /* ---------------- Windows: real multi-worker pool over IOCP ------------- */
+typedef struct zan_co_worker_queue {
+    CRITICAL_SECTION lock;
+    zan_co_node      *head;
+    zan_co_node      *tail;
+    void             *active[64];
+    int               active_count;
+} zan_co_worker_queue;
+
 static CRITICAL_SECTION g_co_lock;
 static volatile LONG    g_co_running;   /* workers currently inside a step() */
 static volatile LONG    g_co_idle;      /* workers blocked in co_wait_io */
 static volatile LONG    g_co_stop;
 static int              g_co_inited;
 static int              g_co_workers;
+static zan_co_worker_queue g_co_queues[64];
 
 static long long co_now_ms(void) { return (long long)GetTickCount64(); }
 
@@ -823,23 +1148,61 @@ static void co_wake_port(void) {
     if (g_iocp) PostQueuedCompletionStatus(g_iocp, 0, 0, NULL);
 }
 
+static int co_worker_count(void) {
+    int w = 0;
+    const char *e = getenv("ZAN_CO_WORKERS");
+    if (e && *e) w = atoi(e);
+    if (w <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        w = (int)si.dwNumberOfProcessors;
+    }
+    if (w < 1) w = 1;
+    if (w > 64) w = 64;
+    return w;
+}
+
+static int co_queue_index(void *frame) {
+    uintptr_t value = (uintptr_t)frame;
+    return (int)((value >> 4) % (uintptr_t)g_co_workers);
+}
+
 void zan_co_sched_init(void) {
-    if (!g_co_inited) { InitializeCriticalSection(&g_co_lock); g_co_inited = 1; }
+    if (!g_co_inited) {
+        InitializeCriticalSection(&g_co_lock);
+        for (int i = 0; i < 64; i++)
+            InitializeCriticalSection(&g_co_queues[i].lock);
+        g_co_inited = 1;
+    }
+    g_co_workers = co_worker_count();
     g_rq_head = g_rq_tail = NULL;
     g_tq = NULL;
     g_co_running = 0;
     g_co_idle = 0;
     g_co_stop = 0;
+    for (int i = 0; i < 64; i++) {
+        g_co_queues[i].head = NULL;
+        g_co_queues[i].tail = NULL;
+        g_co_queues[i].active_count = 0;
+    }
 }
 
 void zan_co_ready(void *frame, zan_co_step_t step) {
     if (!step) return;
     zan_co_node *n = (zan_co_node *)malloc(sizeof(*n));
     n->next = NULL; n->frame = frame; n->step = step;
-    EnterCriticalSection(&g_co_lock);
-    if (g_rq_tail) g_rq_tail->next = n; else g_rq_head = n;
-    g_rq_tail = n;
-    LeaveCriticalSection(&g_co_lock);
+    zan_co_worker_queue *q = &g_co_queues[co_queue_index(frame)];
+    EnterCriticalSection(&q->lock);
+    for (zan_co_node *queued = q->head; queued; queued = queued->next) {
+        if (queued->frame == frame) {
+            LeaveCriticalSection(&q->lock);
+            free(n);
+            return;
+        }
+    }
+    if (q->tail) q->tail->next = n; else q->head = n;
+    q->tail = n;
+    LeaveCriticalSection(&q->lock);
     /* Only nudge the port when a worker is actually blocked waiting for work.
      * While every worker is busy (g_co_idle == 0) the frame will be picked up
      * by a worker's own run-loop iteration, so posting a completion packet per
@@ -865,20 +1228,72 @@ void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
 /* Pop one ready frame, marking a worker busy (g_co_running) atomically with
  * the dequeue so the idle test can never race a just-popped-but-not-yet-run
  * step. Returns 1 and fills *frame/*step when a node was taken. */
-static int co_pop(void **frame, zan_co_step_t *step) {
-    int got = 0;
-    EnterCriticalSection(&g_co_lock);
-    if (g_rq_head) {
-        zan_co_node *n = g_rq_head;
-        g_rq_head = n->next;
-        if (!g_rq_head) g_rq_tail = NULL;
-        *frame = n->frame; *step = n->step;
-        free(n);
-        InterlockedIncrement(&g_co_running);
-        got = 1;
+static int co_pop(int worker, void **frame, zan_co_step_t *step) {
+    for (int offset = 0; offset < g_co_workers; offset++) {
+        int index = (worker + offset) % g_co_workers;
+        zan_co_worker_queue *q = &g_co_queues[index];
+        EnterCriticalSection(&q->lock);
+        zan_co_node *prev = NULL;
+        zan_co_node *n = q->head;
+        while (n) {
+            int active = 0;
+            for (int i = 0; i < q->active_count; i++) {
+                if (q->active[i] == n->frame) { active = 1; break; }
+            }
+            if (!active) break;
+            prev = n;
+            n = n->next;
+        }
+        if (n) {
+            if (prev) prev->next = n->next;
+            else q->head = n->next;
+            if (q->tail == n) q->tail = prev;
+            *frame = n->frame;
+            *step = n->step;
+            free(n);
+            q->active[q->active_count++] = *frame;
+            InterlockedIncrement(&g_co_running);
+            LeaveCriticalSection(&q->lock);
+            return 1;
+        }
+        LeaveCriticalSection(&q->lock);
     }
-    LeaveCriticalSection(&g_co_lock);
-    return got;
+    return 0;
+}
+
+static int co_has_runnable(void) {
+    for (int index = 0; index < g_co_workers; index++) {
+        zan_co_worker_queue *q = &g_co_queues[index];
+        EnterCriticalSection(&q->lock);
+        for (zan_co_node *n = q->head; n; n = n->next) {
+            int active = 0;
+            for (int i = 0; i < q->active_count; i++) {
+                if (q->active[i] == n->frame) { active = 1; break; }
+            }
+            if (!active) {
+                LeaveCriticalSection(&q->lock);
+                return 1;
+            }
+        }
+        LeaveCriticalSection(&q->lock);
+    }
+    return 0;
+}
+
+static void co_step_done(void *frame) {
+    int wake;
+    zan_co_worker_queue *q = &g_co_queues[co_queue_index(frame)];
+    EnterCriticalSection(&q->lock);
+    for (int i = 0; i < q->active_count; i++) {
+        if (q->active[i] == frame) {
+            q->active[i] = q->active[--q->active_count];
+            break;
+        }
+    }
+    InterlockedDecrement(&g_co_running);
+    wake = q->head != NULL && g_co_idle > 0;
+    LeaveCriticalSection(&q->lock);
+    if (wake) co_wake_port();
 }
 
 /* Move any due timers onto the ready queue; return ms until the next pending
@@ -893,8 +1308,11 @@ static long long co_pump_timers(void) {
             *pp = t->next;
             zan_co_node *n = (zan_co_node *)malloc(sizeof(*n));
             n->next = NULL; n->frame = t->frame; n->step = t->step;
-            if (g_rq_tail) g_rq_tail->next = n; else g_rq_head = n;
-            g_rq_tail = n;
+            zan_co_worker_queue *q = &g_co_queues[co_queue_index(t->frame)];
+            EnterCriticalSection(&q->lock);
+            if (q->tail) q->tail->next = n; else q->head = n;
+            q->tail = n;
+            LeaveCriticalSection(&q->lock);
             free(t);
         } else {
             long long d = t->due_ms - now;
@@ -919,16 +1337,16 @@ static void co_wait_io(long long timeout_ms) {
      * whole batch itself on its next loop iterations -- instead of posting a
      * wake packet per completion. */
     InterlockedDecrement(&g_co_idle);
-    if (!ok)
-        return;
+    if (!ok) return;
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) continue;   /* wake packet */
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
-        if (op->out_n) *op->out_n = (int64_t)entries[i].dwNumberOfBytesTransferred;
-        free(op);
+        io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
+                       entries[i].Internal);
+        op_free(op);
         /* Re-ready the coroutine BEFORE dropping the in-flight count: if the
          * order were reversed, another worker could momentarily observe an
          * empty queue with io==0 and running==0 and wrongly declare the whole
@@ -940,15 +1358,21 @@ static void co_wait_io(long long timeout_ms) {
 }
 
 static int co_all_idle(void) {
-    int idle;
+    int idle = 1;
     EnterCriticalSection(&g_co_lock);
-    idle = (g_rq_head == NULL) && (g_tq == NULL) &&
-           (g_co_running == 0) && (g_io_count == 0);
+    if (g_tq != NULL || g_co_running != 0 || g_io_count != 0)
+        idle = 0;
+    for (int i = 0; idle && i < g_co_workers; i++) {
+        zan_co_worker_queue *q = &g_co_queues[i];
+        EnterCriticalSection(&q->lock);
+        if (q->head != NULL) idle = 0;
+        LeaveCriticalSection(&q->lock);
+    }
     LeaveCriticalSection(&g_co_lock);
     return idle;
 }
 
-static void co_worker(void) {
+static void co_worker(int worker) {
     long long last_pump = 0;
     for (;;) {
         if (g_co_stop) return;
@@ -963,15 +1387,15 @@ static void co_worker(void) {
             if (now - last_pump >= 1) { co_pump_timers(); last_pump = now; }
         }
         void *frame; zan_co_step_t step;
-        if (co_pop(&frame, &step)) {
+        if (co_pop(worker, &frame, &step)) {
             step(frame);
-            InterlockedDecrement(&g_co_running);
+            co_step_done(frame);
             continue;
         }
         long long tnext = co_pump_timers();
-        if (co_pop(&frame, &step)) {
+        if (co_pop(worker, &frame, &step)) {
             step(frame);
-            InterlockedDecrement(&g_co_running);
+            co_step_done(frame);
             continue;
         }
         if (co_all_idle()) {
@@ -987,53 +1411,51 @@ static void co_worker(void) {
         if (tnext >= 0)               to = tnext;
         else if (g_io_count > 0)      to = 1000;
         else                          to = 50;
-        /* Register as idle under the lock with a final queue re-check. This
-         * pairs with the g_co_idle gate in zan_co_ready/zan_co_delay: a
-         * producer either enqueues before we mark idle (so we see the node and
-         * skip the block) or after (so it observes g_co_idle>0 and wakes us).
-         * Both paths serialize on g_co_lock, so no wakeup is lost. */
-        EnterCriticalSection(&g_co_lock);
-        int have_work = (g_rq_head != NULL);
-        if (!have_work) InterlockedIncrement(&g_co_idle);
-        LeaveCriticalSection(&g_co_lock);
-        if (have_work) continue;   /* never marked idle; nothing to undo */
+        /* Publish the idle state before the final shard scan. A producer that
+         * enqueues first is found by the scan; one that enqueues afterward
+         * observes g_co_idle > 0 and posts a wake packet. */
+        InterlockedIncrement(&g_co_idle);
+        int have_work = co_has_runnable();
+        if (have_work) {
+            InterlockedDecrement(&g_co_idle);
+            continue;
+        }
         co_wait_io(to);            /* decrements g_co_idle on return */
     }
 }
 
-static DWORD WINAPI co_worker_thunk(LPVOID p) { (void)p; co_worker(); return 0; }
+static DWORD WINAPI co_worker_thunk(LPVOID p) {
+    co_worker((int)(uintptr_t)p);
+    return 0;
+}
 
 void zan_co_sched_run(void) {
     zan_io_init();   /* ensure the port exists before workers block on it */
-    int w = 0;
-    const char *e = getenv("ZAN_CO_WORKERS");
-    if (e && *e) w = atoi(e);
-    if (w <= 0) {
-        SYSTEM_INFO si; GetSystemInfo(&si);
-        w = (int)si.dwNumberOfProcessors;
-    }
-    if (w < 1) w = 1;
-    if (w > 64) w = 64;
-    g_co_workers = w;
+    int w = g_co_workers;
     g_co_stop = 0;
 
     HANDLE th[64]; int nt = 0;
     for (int i = 1; i < w; i++) {
-        th[nt] = CreateThread(NULL, 0, co_worker_thunk, NULL, 0, NULL);
+        th[nt] = CreateThread(NULL, 0, co_worker_thunk,
+                              (LPVOID)(uintptr_t)i, 0, NULL);
         if (th[nt]) nt++;
     }
-    co_worker();   /* the calling thread is a worker too */
+    co_worker(0);   /* the calling thread is a worker too */
     for (int i = 0; i < nt; i++) {
         WaitForSingleObject(th[i], INFINITE);
         CloseHandle(th[i]);
     }
+    zan_io_shutdown();
 }
 
 size_t zan_co_pending(void) {
     size_t n = 0;
-    EnterCriticalSection(&g_co_lock);
-    for (zan_co_node *p = g_rq_head; p; p = p->next) n++;
-    LeaveCriticalSection(&g_co_lock);
+    for (int i = 0; i < g_co_workers; i++) {
+        zan_co_worker_queue *q = &g_co_queues[i];
+        EnterCriticalSection(&q->lock);
+        for (zan_co_node *p = q->head; p; p = p->next) n++;
+        LeaveCriticalSection(&q->lock);
+    }
     return n;
 }
 
@@ -1053,7 +1475,13 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
     if (!step) return;
     zan_co_timer *t = (zan_co_timer *)malloc(sizeof(*t));
-    t->next = g_tq; t->due_ms = ms; t->frame = frame; t->step = step;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    t->next = g_tq;
+    t->due_ms = now + (ms > 0 ? ms : 0);
+    t->frame = frame;
+    t->step = step;
     g_tq = t;
 }
 
@@ -1073,12 +1501,18 @@ void zan_co_sched_run(void) {
             step(frame);
         }
         if (g_tq) {
-            /* earliest (relative-ms) timer, matching the legacy model */
             zan_co_timer **bp = &g_tq, **pp = &g_tq;
             for (pp = &(*pp)->next; *pp; pp = &(*pp)->next)
                 if ((*pp)->due_ms < (*bp)->due_ms) bp = pp;
-            zan_co_timer *best = *bp; *bp = best->next;
-            if (best->due_ms > 0) poll(NULL, 0, (int)best->due_ms);
+            zan_co_timer *best = *bp;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            long long now = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            if (best->due_ms > now) {
+                zan_io_pump_timeout(best->due_ms - now);
+                continue;
+            }
+            *bp = best->next;
             zan_co_ready(best->frame, best->step);
             free(best);
             continue;

@@ -26,6 +26,11 @@
 /* ---- lifecycle ---- */
 void zan_io_init(void);
 void zan_io_shutdown(void);
+void zan_io_socket_cleanup(void);
+int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
+                           int64_t flags);
+int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
+                           int64_t flags);
 
 /* ---- stackless (CPS state-machine) ABI ----
  *
@@ -50,11 +55,22 @@ void zan_io_wait_co(int64_t fd, int interest, void *frame, zan_co_step_t step);
 void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
                     zan_co_step_t step, int64_t *out_n);
 
+/* Overlapped accept: post AcceptEx for listener `fd` and suspend `frame`
+ * until a connection completes. The accepted socket is stored in `*out_fd`,
+ * or -1 when the operation cannot be posted or completed. */
+void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
+                      int64_t *out_fd);
+
 /* Idle bridge for the stackless scheduler: if IO watchers are pending, block
  * until at least one fires (readying its frame via zan_co_ready) and return the
  * number woken; otherwise return 0. Wire into the co driver with
  * zan_co_set_idle(zan_io_pump). */
 int zan_io_pump(void);
+
+/* Timer-aware idle bridge used by generated schedulers. Blocks for IO for at
+ * most timeout_ms, or sleeps for that duration when no IO is pending. A
+ * negative timeout waits indefinitely when IO is pending. */
+int zan_io_pump_timeout(int64_t timeout_ms);
 
 /* ---- coroutine-facing ABI (stackful rt_sched fibers) ---- */
 

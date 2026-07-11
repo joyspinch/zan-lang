@@ -81,6 +81,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(g->site_dtors_type));
         LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
         g->site_syms = (zan_symbol_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_symbol_t *));
+        g->site_coll = (int *)calloc(ZAN_MAX_LEAK_SITES, sizeof(int));
+        g->site_coll_elem = (zan_type_t **)calloc(ZAN_MAX_LEAK_SITES, sizeof(zan_type_t *));
     }
 
     /* declare printf */
@@ -216,10 +218,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     /* Socket-async readiness reactor (S4b-2). zan_io_wait_co is an external
      * symbol resolved from the shipped zanrt_io object only when a program uses
-     * socket await (otherwise unreferenced, so no link dependency). zan_io_pump
-     * is given a WEAK inline definition returning 0 so ordinary programs link
-     * and the scheduler's idle path is a no-op; linking zanrt_io overrides it
-     * with the real blocking reactor pump. */
+     * socket await (otherwise unreferenced, so no link dependency).
+     * zan_io_pump_timeout has a WEAK timer-only fallback; linking zanrt_io
+     * overrides it with the real timeout-bounded reactor pump. */
     {
         LLVMTypeRef i64d = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i32d = LLVMInt32TypeInContext(g->ctx);
@@ -230,12 +231,27 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef rc_args[] = { i64d, i8ptr, i32d, i8ptr, g->co_step_ptr, i64ptr };
         g->rt_io_recv_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rc_args, 6, 0);
         g->rt_io_recv_co = LLVMAddFunction(g->mod, "zan_io_recv_co", g->rt_io_recv_co_type);
-        g->rt_io_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
-        g->rt_io_pump = LLVMAddFunction(g->mod, "zan_io_pump", g->rt_io_pump_type);
-        LLVMSetLinkage(g->rt_io_pump, LLVMWeakAnyLinkage);
-        LLVMBasicBlockRef pbb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_io_pump, "entry");
-        LLVMPositionBuilderAtEnd(g->builder, pbb);
-        LLVMBuildRet(g->builder, LLVMConstInt(i32d, 0, 0));
+        LLVMTypeRef ac_args[] = { i64d, i8ptr, g->co_step_ptr, i64ptr };
+        g->rt_io_accept_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), ac_args, 4, 0);
+        g->rt_io_accept_co = LLVMAddFunction(g->mod, "zan_io_accept_co", g->rt_io_accept_co_type);
+        LLVMTypeRef pump_args[] = { i64d };
+        g->rt_io_pump_timeout_type = LLVMFunctionType(i32d, pump_args, 1, 0);
+        g->rt_io_pump_timeout = LLVMAddFunction(g->mod, "zan_io_pump_timeout",
+            g->rt_io_pump_timeout_type);
+        LLVMSetLinkage(g->rt_io_pump_timeout,
+            g->mt_scheduler ? LLVMExternalLinkage : LLVMWeakAnyLinkage);
+
+        LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
+        LLVMValueRef legacy_pump = LLVMAddFunction(g->mod, "zan_io_pump",
+            legacy_pump_type);
+        LLVMSetLinkage(legacy_pump, LLVMWeakAnyLinkage);
+        LLVMBasicBlockRef legacy_entry = LLVMAppendBasicBlockInContext(g->ctx,
+            legacy_pump, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, legacy_entry);
+        LLVMValueRef legacy_woke = LLVMBuildCall2(g->builder,
+            g->rt_io_pump_timeout_type, g->rt_io_pump_timeout,
+            (LLVMValueRef[]){ LLVMConstInt(i64d, (uint64_t)-1, 1) }, 1, "woke");
+        LLVMBuildRet(g->builder, legacy_woke);
     }
     g->uses_socket_async = false;
 
@@ -262,18 +278,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetLinkage(g_tail, LLVMInternalLinkage);
 
         /* Timer list for time-based suspensions (`await Task.Delay(ms)`): a
-         * singly-linked list of {next, ms, frame, step}. zan_co_delay registers
-         * a one-shot timer; zan_co_sched_run, when the ready queue is empty,
-         * sleeps for the smallest pending delay, then readies its frame — the
-         * "reactor wakes a suspended coroutine later" path. The current (still
-         * sequential) await model has at most one pending timer at a time, so a
-         * relative millisecond delay is stored directly and no monotonic clock
-         * is needed. The blocking sleep is the one platform primitive here, and
-         * since zanc's target equals its host it is selected at build time:
-         * Sleep (kernel32) on Windows, poll(NULL,0,ms) on POSIX. */
+         * singly-linked list of {next, deadline_ms, frame, step}. Deadlines use
+         * a monotonic clock so timers registered at different scheduler turns
+         * remain comparable. When the ready queue drains, the reactor is polled
+         * with the time remaining until the earliest deadline, allowing socket
+         * completions and timers to make progress in the same wait. */
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-        LLVMTypeRef tnode_fields[] = { i8ptr /*next*/, i64t /*ms*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
+        LLVMTypeRef tnode_fields[] = { i8ptr /*next*/, i64t /*deadline_ms*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
         LLVMTypeRef tnode_ty = LLVMStructCreateNamed(g->ctx, "zan.co.timer");
         LLVMStructSetBody(tnode_ty, tnode_fields, 4, 0);
         LLVMValueRef g_timers = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_timers");
@@ -292,6 +304,80 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             fn_sleep = LLVMAddFunction(g->mod, "Sleep", sleep_type);
         else
             fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
+
+        /* Monotonic millisecond clock used for absolute timer deadlines. */
+        LLVMTypeRef now_type = LLVMFunctionType(i64t, NULL, 0, 0);
+        LLVMValueRef fn_now = LLVMAddFunction(g->mod, "__zan_co_now_ms", now_type);
+        LLVMSetLinkage(fn_now, LLVMInternalLinkage);
+        {
+            LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn_now, "entry");
+            LLVMPositionBuilderAtEnd(g->builder, bb);
+            if (g->target_is_windows) {
+                LLVMTypeRef tick_type = LLVMFunctionType(i64t, NULL, 0, 0);
+                LLVMValueRef fn_tick = LLVMAddFunction(g->mod, "GetTickCount64", tick_type);
+                LLVMValueRef now = LLVMBuildCall2(g->builder, tick_type, fn_tick, NULL, 0, "now");
+                LLVMBuildRet(g->builder, now);
+            } else {
+                LLVMTypeRef ts_fields[] = { i64t, i64t };
+                LLVMTypeRef ts_type = LLVMStructCreateNamed(g->ctx, "zan.timespec");
+                LLVMStructSetBody(ts_type, ts_fields, 2, 0);
+                LLVMTypeRef clock_args[] = { i32t, LLVMPointerType(ts_type, 0) };
+                LLVMTypeRef clock_type = LLVMFunctionType(i32t, clock_args, 2, 0);
+                LLVMValueRef fn_clock = LLVMAddFunction(g->mod, "clock_gettime", clock_type);
+                int clock_monotonic = 1;
+                if (strstr(g->target_triple, "apple") || strstr(g->target_triple, "darwin"))
+                    clock_monotonic = 6;
+                else if (strstr(g->target_triple, "freebsd"))
+                    clock_monotonic = 4;
+#if defined(__APPLE__)
+                else if (!g->target_triple[0])
+                    clock_monotonic = 6;
+#elif defined(__FreeBSD__)
+                else if (!g->target_triple[0])
+                    clock_monotonic = 4;
+#endif
+                LLVMValueRef ts = LLVMBuildAlloca(g->builder, ts_type, "ts");
+                LLVMBuildCall2(g->builder, clock_type, fn_clock,
+                    (LLVMValueRef[]){ LLVMConstInt(i32t, (unsigned)clock_monotonic, 0), ts }, 2, "");
+                LLVMValueRef sec = LLVMBuildLoad2(g->builder, i64t,
+                    LLVMBuildStructGEP2(g->builder, ts_type, ts, 0, "ts.sec.p"), "ts.sec");
+                LLVMValueRef nsec = LLVMBuildLoad2(g->builder, i64t,
+                    LLVMBuildStructGEP2(g->builder, ts_type, ts, 1, "ts.nsec.p"), "ts.nsec");
+                LLVMValueRef sec_ms = LLVMBuildMul(g->builder, sec,
+                    LLVMConstInt(i64t, 1000, 0), "sec.ms");
+                LLVMValueRef nsec_ms = LLVMBuildSDiv(g->builder, nsec,
+                    LLVMConstInt(i64t, 1000000, 0), "nsec.ms");
+                LLVMBuildRet(g->builder, LLVMBuildAdd(g->builder, sec_ms, nsec_ms, "now"));
+            }
+        }
+
+        /* Timer-only fallback for programs that do not link the IO reactor. */
+        {
+            LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_io_pump_timeout, "entry");
+            LLVMBasicBlockRef sleep = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_io_pump_timeout, "sleep");
+            LLVMBasicBlockRef ret = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_io_pump_timeout, "ret");
+            LLVMPositionBuilderAtEnd(g->builder, entry);
+            LLVMValueRef timeout = LLVMGetParam(g->rt_io_pump_timeout, 0);
+            LLVMValueRef positive = LLVMBuildICmp(g->builder, LLVMIntSGT, timeout,
+                LLVMConstInt(i64t, 0, 0), "positive");
+            LLVMBuildCondBr(g->builder, positive, sleep, ret);
+
+            LLVMPositionBuilderAtEnd(g->builder, sleep);
+            LLVMValueRef timeout32 = LLVMBuildTrunc(g->builder, timeout, i32t, "timeout32");
+            if (g->target_is_windows)
+                LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
+                    (LLVMValueRef[]){ timeout32 }, 1, "");
+            else
+                LLVMBuildCall2(g->builder, poll_type, fn_poll,
+                    (LLVMValueRef[]){ LLVMConstNull(i8ptr), LLVMConstInt(i64t, 0, 0), timeout32 }, 3, "");
+            LLVMBuildBr(g->builder, ret);
+
+            LLVMPositionBuilderAtEnd(g->builder, ret);
+            LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
+        }
 
         /* void zan_co_sched_init(void): reset the queue to empty. */
         {
@@ -316,7 +402,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 (LLVMValueRef[]){ LLVMSizeOf(tnode_ty) }, 1, "tn");
             LLVMValueRef old = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
             LLVMBuildStore(g->builder, old, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 0, "tn.next"));
-            LLVMBuildStore(g->builder, ms, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 1, "tn.ms"));
+            LLVMValueRef now = LLVMBuildCall2(g->builder, now_type, fn_now, NULL, 0, "now");
+            LLVMValueRef positive = LLVMBuildICmp(g->builder, LLVMIntSGT, ms,
+                LLVMConstInt(i64t, 0, 0), "positive");
+            LLVMValueRef delay = LLVMBuildSelect(g->builder, positive, ms,
+                LLVMConstInt(i64t, 0, 0), "delay");
+            LLVMValueRef deadline = LLVMBuildAdd(g->builder, now, delay, "deadline");
+            LLVMBuildStore(g->builder, deadline,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 1, "tn.deadline"));
             LLVMBuildStore(g->builder, frame, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 2, "tn.frame"));
             LLVMBuildStore(g->builder, step, LLVMBuildStructGEP2(g->builder, tnode_ty, tn, 3, "tn.step"));
             LLVMBuildStore(g->builder, tn, g_timers);
@@ -370,9 +463,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         }
 
         /* void zan_co_sched_run(void): drain the ready queue, invoking each
-         * step. When the queue empties but timers remain, sleep until the
-         * earliest deadline, ready that timer's frame, and continue; exit only
-         * when both the ready queue and the timer list are empty. */
+         * step. When it empties, poll IO up to the earliest timer deadline.
+         * Re-check after every wake or timeout and exit only when ready work,
+         * timers, and IO are all exhausted. */
         {
             LLVMBasicBlockRef entry_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "entry");
             LLVMBasicBlockRef head_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "loop");
@@ -386,11 +479,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBasicBlockRef scan_take = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.take");
             LLVMBasicBlockRef scan_next = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.next");
             LLVMBasicBlockRef scan_done = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "scan.done");
+            LLVMBasicBlockRef timer_due = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timer.due");
+            LLVMBasicBlockRef wait_timer = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "timer.wait");
             LLVMBasicBlockRef unlink_head = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "unlink.head");
             LLVMBasicBlockRef unlink_mid = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "unlink.mid");
             LLVMBasicBlockRef after_unlink = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after.unlink");
-            LLVMBasicBlockRef do_sleep = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "do.sleep");
-            LLVMBasicBlockRef after_sleep = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "after.sleep");
             LLVMBasicBlockRef io_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "io.pump");
             LLVMBasicBlockRef exit_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_run, "exit");
             LLVMPositionBuilderAtEnd(g->builder, entry_bb);
@@ -430,8 +523,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 (LLVMValueRef[]){ fr }, 1, "");
             LLVMBuildBr(g->builder, head_bb);
 
-            /* ready queue empty: if no timers, we're done; else find the
-             * earliest-due timer, unlink it, sleep to its deadline, ready it. */
+            /* Ready queue empty: find the earliest timer. It stays linked while
+             * the reactor waits, so an IO wake cannot lose the timer. */
             LLVMPositionBuilderAtEnd(g->builder, timers_bb);
             LLVMValueRef t0 = LLVMBuildLoad2(g->builder, i8ptr, g_timers, "t.head");
             LLVMValueRef tnull = LLVMBuildICmp(g->builder, LLVMIntEQ, t0,
@@ -481,6 +574,20 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMPositionBuilderAtEnd(g->builder, scan_done);
             LLVMValueRef best = LLVMBuildLoad2(g->builder, i8ptr, a_best, "best");
             LLVMValueRef bestprev = LLVMBuildLoad2(g->builder, i8ptr, a_bestprev, "bestprev");
+            LLVMValueRef bestdue_done = LLVMBuildLoad2(g->builder, i64t,
+                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 1, "best.duep"), "best.due");
+            LLVMValueRef now_done = LLVMBuildCall2(g->builder, now_type, fn_now, NULL, 0, "now");
+            LLVMValueRef due_now = LLVMBuildICmp(g->builder, LLVMIntSLE,
+                bestdue_done, now_done, "due.now");
+            LLVMBuildCondBr(g->builder, due_now, timer_due, wait_timer);
+
+            LLVMPositionBuilderAtEnd(g->builder, wait_timer);
+            LLVMValueRef remaining = LLVMBuildSub(g->builder, bestdue_done, now_done, "remaining");
+            LLVMBuildCall2(g->builder, g->rt_io_pump_timeout_type,
+                g->rt_io_pump_timeout, (LLVMValueRef[]){ remaining }, 1, "");
+            LLVMBuildBr(g->builder, head_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, timer_due);
             LLVMValueRef bestnext = LLVMBuildLoad2(g->builder, i8ptr,
                 LLVMBuildStructGEP2(g->builder, tnode_ty, best, 0, "best.nextp"), "best.nextv");
             LLVMValueRef bp_null = LLVMBuildICmp(g->builder, LLVMIntEQ, bestprev,
@@ -497,23 +604,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildBr(g->builder, after_unlink);
 
             LLVMPositionBuilderAtEnd(g->builder, after_unlink);
-            LLVMValueRef ms_v = LLVMBuildLoad2(g->builder, i64t,
-                LLVMBuildStructGEP2(g->builder, tnode_ty, best, 1, "best.msp"), "best.ms");
-            LLVMValueRef ms_pos = LLVMBuildICmp(g->builder, LLVMIntSGT, ms_v,
-                LLVMConstInt(i64t, 0, 0), "ms.pos");
-            LLVMBuildCondBr(g->builder, ms_pos, do_sleep, after_sleep);
-
-            LLVMPositionBuilderAtEnd(g->builder, do_sleep);
-            LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms_v, i32t, "ms32");
-            if (g->target_is_windows)
-                LLVMBuildCall2(g->builder, sleep_type, fn_sleep,
-                    (LLVMValueRef[]){ ms32 }, 1, "");
-            else
-                LLVMBuildCall2(g->builder, poll_type, fn_poll,
-                    (LLVMValueRef[]){ LLVMConstNull(i8ptr), LLVMConstInt(i64t, 0, 0), ms32 }, 3, "");
-            LLVMBuildBr(g->builder, after_sleep);
-
-            LLVMPositionBuilderAtEnd(g->builder, after_sleep);
             LLVMValueRef bframe = LLVMBuildLoad2(g->builder, i8ptr,
                 LLVMBuildStructGEP2(g->builder, tnode_ty, best, 2, "best.framep"), "best.frame");
             LLVMValueRef bstep = LLVMBuildLoad2(g->builder, g->co_step_ptr,
@@ -524,14 +614,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 (LLVMValueRef[]){ best }, 1, "");
             LLVMBuildBr(g->builder, head_bb);
 
-            /* ready queue and timers both empty: block in the IO reactor for
-             * the next fd event, which re-readies suspended frames. zan_io_pump
-             * returns the number of frames it woke (0 when there is no pending
-             * IO — the weak no-op for non-socket programs), so a positive count
-             * loops back to drain them and zero means the program is done. */
+            /* No timers: block for IO indefinitely. The weak fallback returns
+             * zero immediately, while the reactor returns zero only when there
+             * is no pending IO. */
             LLVMPositionBuilderAtEnd(g->builder, io_bb);
-            LLVMValueRef woke = LLVMBuildCall2(g->builder, g->rt_io_pump_type,
-                g->rt_io_pump, NULL, 0, "woke");
+            LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32t, NULL, 0, 0);
+            LLVMValueRef legacy_pump = LLVMGetNamedFunction(g->mod, "zan_io_pump");
+            LLVMValueRef woke = LLVMBuildCall2(g->builder, legacy_pump_type,
+                legacy_pump, NULL, 0, "woke");
             LLVMValueRef more = LLVMBuildICmp(g->builder, LLVMIntSGT, woke,
                 LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "io.more");
             LLVMBuildCondBr(g->builder, more, head_bb, exit_bb);
@@ -1220,11 +1310,14 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
     return NULL;
 }
 
-/* The built-in generic collections (List/Dict) and StringBuilder are lowered to
- * bare malloc'd structs *without* the 16-byte rc header that zan_rt_alloc emits
- * for user classes. They share TYPE_CLASS with user classes, so ARC must exclude
- * them by name — retaining/releasing one reads a refcount at obj-16 that lands in
- * unrelated heap memory and corrupts it. */
+/* The built-in generic collections (List/Dict) and StringBuilder share
+ * TYPE_CLASS with user classes but are lowered to intrinsic structs, not user
+ * classes with a member layout. List and StringBuilder now carry the same
+ * 16-byte rc header (allocated via zan_rt_alloc) and participate in ARC like
+ * classes; Dict remains header-less (its backing buffers are still not
+ * reclaimed) so ARC must continue to exclude it by name — retaining/releasing a
+ * header-less struct reads a refcount at obj-16 that lands in unrelated heap
+ * memory and corrupts it. */
 static int is_builtin_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
@@ -1233,12 +1326,23 @@ static int is_builtin_collection_type(zan_type_t *t) {
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
-/* Helper: check if a type is ARC-managed (user class instance carrying the
- * zan_rt_alloc rc header; not string/int/struct/enum, and not the header-less
- * built-in collections). */
+/* List and StringBuilder are refcounted collections: they carry the rc header
+ * and are freed (backing buffer + struct) via a per-site collection destructor.
+ * Dict is deliberately excluded (still header-less). */
+static int is_rc_collection_type(zan_type_t *t) {
+    if (!t || t->kind != TYPE_CLASS) return 0;
+    zan_istr_t n = t->name;
+    return (n.len == 4 && memcmp(n.str, "List", 4) == 0) ||
+           (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
+}
+
+/* Helper: check if a type is ARC-managed (carries the zan_rt_alloc rc header:
+ * user class instances plus the refcounted collections List/StringBuilder; not
+ * string/int/struct/enum, and not the header-less Dict). */
 static int is_arc_managed_type(zan_type_t *t) {
-    if (!t) return 0;
-    return t->kind == TYPE_CLASS && !is_builtin_collection_type(t);
+    if (!t || t->kind != TYPE_CLASS) return 0;
+    if (is_builtin_collection_type(t)) return is_rc_collection_type(t);
+    return 1;
 }
 
 static int is_rc_managed_type(zan_type_t *t) {
@@ -1341,6 +1445,38 @@ static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
         f = LLVMAddFunction(g->mod, "calloc", ft);
     }
     return f;
+}
+
+/* Allocate a refcounted built-in collection (List/StringBuilder) struct through
+ * zan_rt_alloc so it carries the 16-byte rc header. Records the collection kind
+ * (and, for List, the element type) at a fresh allocation site; the per-site
+ * destructor emitted at finalize releases the elements and frees the backing
+ * buffer before the struct itself. `coll_kind` is 1=List, 2=StringBuilder.
+ * Returns the user pointer (i8*), i.e. the struct base past the header. */
+static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
+                                             long size, int coll_kind,
+                                             zan_type_t *elem_type) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    int site_idx = g->leak_site_count;
+    if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
+    else g->leak_site_count++;
+    if (g->site_coll) g->site_coll[site_idx] = coll_kind;
+    if (g->site_coll_elem) g->site_coll_elem[site_idx] = elem_type;
+    LLVMValueRef site_name = LLVMConstNull(i8ptr);
+    if (g->check_leaks) {
+        char site_buf[600];
+        const char *sfile = g->src_file ? g->src_file : "<unknown>";
+        snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
+                 sfile, expr->loc.line, expr->loc.col);
+        site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+    }
+    LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
+    LLVMValueRef args[] = { LLVMConstInt(i64, (unsigned long long)size, 0),
+                            LLVMConstInt(i64, (unsigned long long)site_idx, 0),
+                            site_name };
+    return LLVMBuildCall2(g->builder, alloc_fn_type, g->rt_alloc, args, 3, "coll");
 }
 
 /* ---- expression codegen ---- */
@@ -1805,14 +1941,12 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
             LLVMValueRef s = LLVMBuildLoad2(b, i8ptr, fp, "fs");
             emit_string_release(g, s);
         } else if (is_arc_managed_type(ft)) {
+            /* User class instances and the refcounted collections List/
+             * StringBuilder: release via the recorded site destructor (which
+             * releases elements and frees the backing buffer + struct). */
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef cv = LLVMBuildLoad2(b, map_type(g, ft), fp, "fc");
             emit_arc_release_typed(g, ft, cv);
-        } else if (is_builtin_collection_type(ft) &&
-                   ft->name.len == 4 && memcmp(ft->name.str, "List", 4) == 0) {
-            LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
-            LLVMValueRef col = LLVMBuildLoad2(b, i8ptr, fp, "fcol");
-            emit_list_release_elems(g, container_elem_type(ft), col);
         }
     }
     LLVMBuildBr(b, dorel);
@@ -1822,6 +1956,76 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
     LLVMBuildBr(b, ret);
     LLVMPositionBuilderAtEnd(b, ret);
     LLVMBuildRetVoid(b);
+}
+
+/* Emit the body of a per-site collection destructor (List/StringBuilder):
+ * null-guard, peek the refcount, and when this release brings it to zero
+ * release the RC-managed elements (List) and free the separately-malloc'd
+ * backing buffer, then hand off to zan_rt_release for the struct decrement +
+ * free. Peeking the refcount keeps buffer release aliasing-safe. */
+static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
+                                          zan_type_t *elem_type, LLVMValueRef fn) {
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMValueRef obj = LLVMGetParam(fn, 0);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
+    LLVMBasicBlockRef cont  = LLVMAppendBasicBlockInContext(c, fn, "cont");
+    LLVMBasicBlockRef relf  = LLVMAppendBasicBlockInContext(c, fn, "relf");
+    LLVMBasicBlockRef dorel = LLVMAppendBasicBlockInContext(c, fn, "dorel");
+    LLVMBasicBlockRef ret   = LLVMAppendBasicBlockInContext(c, fn, "ret");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef isnull = LLVMBuildICmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
+    LLVMBuildCondBr(b, isnull, ret, cont);
+    LLVMPositionBuilderAtEnd(b, cont);
+    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-16, 1);
+    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
+    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "rc");
+    LLVMValueRef is1 = LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 1, 0), "is1");
+    LLVMBuildCondBr(b, is1, relf, dorel);
+    LLVMPositionBuilderAtEnd(b, relf);
+    LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
+    if (coll_kind == 1) {
+        /* List: release RC-managed elements, then free the i64* data buffer.
+         * emit_list_release_elems may split the block and leaves the builder at
+         * its own terminator block; capture the data pointer beforehand. */
+        LLVMValueRef lp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->list_struct_type, 0), "lp");
+        LLVMValueRef dp = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 2, "dp");
+        LLVMValueRef data = LLVMBuildLoad2(b, LLVMPointerType(i64, 0), dp, "data");
+        emit_list_release_elems(g, elem_type, obj);
+        LLVMValueRef d8 = LLVMBuildBitCast(b, data, i8ptr, "d8");
+        LLVMBuildCall2(b, free_ty, g->fn_free, &d8, 1, "");
+    } else if (coll_kind == 2) {
+        /* StringBuilder: free the i8* data buffer (free tolerates null). */
+        LLVMValueRef sp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->sb_struct_type, 0), "sp");
+        LLVMValueRef dp = LLVMBuildStructGEP2(b, g->sb_struct_type, sp, 2, "dp");
+        LLVMValueRef data = LLVMBuildLoad2(b, i8ptr, dp, "data");
+        LLVMBuildCall2(b, free_ty, g->fn_free, &data, 1, "");
+    }
+    LLVMBuildBr(b, dorel);
+    LLVMPositionBuilderAtEnd(b, dorel);
+    LLVMBuildCall2(b, LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0),
+                   g->rt_release, &obj, 1, "");
+    LLVMBuildBr(b, ret);
+    LLVMPositionBuilderAtEnd(b, ret);
+    LLVMBuildRetVoid(b);
+}
+
+/* Get (creating on first use) the per-site collection destructor for a List/
+ * StringBuilder allocation site, building its body immediately. */
+static LLVMValueRef get_collection_release_decl(zan_irgen_t *g, int site) {
+    char name[64];
+    snprintf(name, sizeof(name), "__zan_release_coll_%d", site);
+    LLVMValueRef existing = LLVMGetNamedFunction(g->mod, name);
+    if (existing) return existing;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, name, ft);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    build_collection_release_body(g, g->site_coll[site], g->site_coll_elem[site], fn);
+    return fn;
 }
 
 /* Release a class value `v` of static type `type` via its synthesised
@@ -1862,7 +2066,10 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
     LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
     for (int i = 0; i < n; i++) {
         LLVMValueRef e = LLVMConstNull(i8ptr);
-        if (i < g->leak_site_count && g->site_syms[i]) {
+        if (i < g->leak_site_count && g->site_coll && g->site_coll[i]) {
+            LLVMValueRef fn = get_collection_release_decl(g, i);
+            if (fn) e = LLVMConstBitCast(fn, i8ptr);
+        } else if (i < g->leak_site_count && g->site_syms[i]) {
             LLVMValueRef fn = get_class_release_decl(g, g->site_syms[i]);
             if (fn) e = LLVMConstBitCast(fn, i8ptr);
         }
@@ -2320,6 +2527,33 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g) {
     return reap;
 }
 
+/* Backing LLVM global for a static class/struct field `Class.field`.
+ * Static fields are shared mutable storage (not compile-time constants):
+ * they are lowered to an internal, zero-initialised module global. The
+ * field's declared initializer is applied once at main() entry as a runtime
+ * store (see emit_main_method), so any initializer expression works with
+ * correct ordering. Returns NULL when `fsym` is not a static field. */
+static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
+                                            zan_symbol_t *fsym) {
+    if (!class_sym || !fsym || !fsym->decl || fsym->decl->kind != AST_FIELD_DECL)
+        return NULL;
+    if (!((fsym->modifiers & MOD_STATIC) ||
+          (fsym->decl->field_decl.modifiers & MOD_STATIC)))
+        return NULL;
+    char name[512];
+    snprintf(name, sizeof(name), "__zan_sf_%.*s_%.*s",
+             (int)class_sym->name.len, class_sym->name.str,
+             (int)fsym->name.len, fsym->name.str);
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
+    if (gv) return gv;
+    LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
+                                : LLVMInt64TypeInContext(g->ctx);
+    gv = LLVMAddGlobal(g->mod, ft, name);
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    LLVMSetInitializer(gv, LLVMConstNull(ft));
+    return gv;
+}
+
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 
@@ -2361,6 +2595,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMTypeRef ft = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
                     return LLVMBuildLoad2(g->builder, ft, fptr, "fval");
                 }
+            }
+        }
+        /* bare-name static field of the enclosing class: `field` -> global.
+         * Works in both static and instance methods. */
+        if (g->current_type_sym) {
+            zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
+            LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fsym);
+            if (gv) {
+                LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
+                                            : LLVMInt64TypeInContext(g->ctx);
+                return LLVMBuildLoad2(g->builder, ft, gv, "sfld");
             }
         }
         /* method reference as delegate value: MethodName used as a value
@@ -2637,6 +2882,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef sv = coerce_int_to(g, right,
                     LLVMGetAllocatedType(local->alloca));
                 LLVMBuildStore(g->builder, sv, local->alloca);
+            } else if (g->current_type_sym &&
+                       get_static_field_global(g, g->current_type_sym,
+                           get_field_sym(g->current_type_sym, expr->binary.left->ident.name))) {
+                /* bare-name static field of the enclosing class: `field = v` */
+                zan_symbol_t *fs = get_field_sym(g->current_type_sym,
+                    expr->binary.left->ident.name);
+                LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs);
+                if (fs->type && is_rc_managed_type(fs->type)) {
+                    emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals);
+                } else {
+                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                              : LLVMInt64TypeInContext(g->ctx);
+                    LLVMBuildStore(g->builder, coerce_int_to(g, right, ft), gv);
+                }
             } else if (g->current_this && g->current_type_sym) {
                 /* implicit this.Field assignment */
                 int fi = get_field_index(g->current_type_sym, expr->binary.left->ident.name);
@@ -2896,7 +3155,27 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             /* obj.Field = value */
             zan_ast_node_t *obj_expr = expr->binary.left->member.object;
             bool stored = false;
-            if (obj_expr->kind == AST_IDENTIFIER) {
+            /* ClassName.StaticField = value — store into the backing global. */
+            if (obj_expr->kind == AST_IDENTIFIER &&
+                !local_find(locals, obj_expr->ident.name)) {
+                zan_symbol_t *cs = zan_binder_lookup(g->binder, obj_expr->ident.name);
+                if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                    zan_symbol_t *fs = get_field_sym(cs, expr->binary.left->member.name);
+                    LLVMValueRef gv = get_static_field_global(g, cs, fs);
+                    if (gv) {
+                        if (fs->type && is_rc_managed_type(fs->type)) {
+                            emit_rc_store_field(g, fs->type, gv, right,
+                                                expr->binary.right, locals);
+                        } else {
+                            LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                                      : LLVMInt64TypeInContext(g->ctx);
+                            LLVMBuildStore(g->builder, coerce_int_to(g, right, ft), gv);
+                        }
+                        stored = true;
+                    }
+                }
+            }
+            if (!stored && obj_expr->kind == AST_IDENTIFIER) {
                 local_var_t *local = local_find(locals, obj_expr->ident.name);
                 if (local && local->type && local->type->sym) {
                     int fi = get_field_index(local->type->sym, expr->binary.left->member.name);
@@ -5189,18 +5468,18 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         }
 
         /* Static class/struct field access: ClassName.StaticField.
-         * Fold a const-style declaration (`static int X = 1;`) to the
-         * value of its initializer, mirroring enum member access. */
+         * Load from the field's backing global (shared mutable storage);
+         * the initializer is applied at main() entry, not folded here. */
         if (expr->member.object->kind == AST_IDENTIFIER &&
             !local_find(locals, expr->member.object->ident.name)) {
             zan_symbol_t *cs = zan_binder_lookup(g->binder, expr->member.object->ident.name);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, expr->member.name);
-                if (fs && fs->decl && fs->decl->kind == AST_FIELD_DECL &&
-                    fs->decl->field_decl.initializer &&
-                    ((fs->modifiers & MOD_STATIC) ||
-                     (fs->decl->field_decl.modifiers & MOD_STATIC))) {
-                    return emit_expr(g, fs->decl->field_decl.initializer, locals);
+                LLVMValueRef gv = get_static_field_global(g, cs, fs);
+                if (gv) {
+                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                              : LLVMInt64TypeInContext(g->ctx);
+                    return LLVMBuildLoad2(g->builder, ft, gv, "sfld");
                 }
             }
         }
@@ -5398,11 +5677,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             if (tname.len == 4 && memcmp(tname.str, "List", 4) == 0) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                /* allocate List struct on heap */
-                LLVMValueRef list_size = LLVMConstInt(i64, 24, 0); /* 3 * i64 = 24 bytes */
-                LLVMValueRef list_ptr = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
-                    get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), list_size }, 2, "list");
+                /* allocate List struct on heap with an rc header (24 bytes:
+                 * 3 * i64), so ARC frees it and its data buffer on release. */
+                zan_type_t *lelem = NULL;
+                {
+                    zan_type_t *lt = zan_binder_resolve_type(g->binder, expr->new_expr.type);
+                    if (lt) lelem = container_elem_type(lt);
+                }
+                LLVMValueRef list_ptr = emit_alloc_rc_collection(g, expr, 24, 1, lelem);
                 /* cast to List* */
                 LLVMValueRef typed_ptr = LLVMBuildBitCast(g->builder, list_ptr,
                     LLVMPointerType(g->list_struct_type, 0), "lptr");
@@ -5431,11 +5713,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             if (sbname.len == 13 && memcmp(sbname.str, "StringBuilder", 13) == 0) {
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                /* allocate StringBuilder struct: { i64 count, i64 cap, i8* data } = 24 bytes */
-                LLVMValueRef sb_size = LLVMConstInt(i64, 24, 0);
-                LLVMValueRef sb_raw = LLVMBuildCall2(g->builder,
-                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0),
-                    g->fn_malloc, &sb_size, 1, "sb");
+                /* allocate StringBuilder struct { i64 count, i64 cap, i8* data }
+                 * = 24 bytes, with an rc header so ARC frees the struct and its
+                 * data buffer on release. */
+                LLVMValueRef sb_raw = emit_alloc_rc_collection(g, expr, 24, 2, NULL);
                 LLVMValueRef sb_ptr = LLVMBuildBitCast(g->builder, sb_raw,
                     LLVMPointerType(g->sb_struct_type, 0), "sbp");
                 LLVMValueRef cnt_p = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sb_ptr, 0, "sbc");
@@ -5772,11 +6053,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef selfframe = g->current_async_frame;
                 LLVMTypeRef self_ft = g->current_async_frame_type;
                 LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
-                LLVMBuildCall2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
-                    (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_co_delay_type, g->rt_co_delay,
+                    (LLVMValueRef[]){ ms, self_i8, g->current_async_resume_fn }, 3, "");
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -5841,11 +6122,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef selfframe = g->current_async_frame;
                 LLVMTypeRef self_ft = g->current_async_frame_type;
                 LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
-                LLVMBuildCall2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
-                    (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_io_wait_co_type, g->rt_io_wait_co,
+                    (LLVMValueRef[]){ fd, interest, self_i8, g->current_async_resume_fn }, 4, "");
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -5893,12 +6174,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 /* &self.result — the reactor stores the recv byte count here. */
                 LLVMValueRef out_n = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                     ASYNC_FRAME_RESULT, "self.iores");
-                LLVMBuildCall2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
-                    (LLVMValueRef[]){ fd, buf, len, self_i8,
-                        g->current_async_resume_fn, out_n }, 6, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_io_recv_co_type, g->rt_io_recv_co,
+                    (LLVMValueRef[]){ fd, buf, len, self_i8,
+                        g->current_async_resume_fn, out_n }, 6, "");
                 LLVMBuildRetVoid(g->builder);
 
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -5911,6 +6192,52 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                     ASYNC_FRAME_RESULT, "self.iores2");
                 return LLVMBuildLoad2(g->builder, di64, res_slot, "recvn");
+            }
+        }
+
+        /* await Socket.AcceptOv(fd) — Windows AcceptEx completion. The
+         * accepted socket is written into the frame result slot before the
+         * suspended state machine is re-readied. */
+        {
+            if (is_call_to(expr->await_expr.expr, "Socket", "AcceptOv") &&
+                expr->await_expr.expr->call.args.count == 1) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.AcceptOv is only supported inside an async method");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef fd = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(fd) != di64)
+                    fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                LLVMValueRef out_fd = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.acceptfd");
+                emit_async_save_slots(g);
+                LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                        ASYNC_FRAME_STATE, "self.state"));
+                LLVMBuildCall2(g->builder, g->rt_io_accept_co_type,
+                    g->rt_io_accept_co, (LLVMValueRef[]){ fd, self_i8,
+                        g->current_async_resume_fn, out_fd }, 4, "");
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch,
+                    LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft,
+                    selfframe, ASYNC_FRAME_RESULT, "self.acceptfd2");
+                return LLVMBuildLoad2(g->builder, di64, res_slot, "acceptfd");
             }
         }
 
@@ -5965,12 +6292,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMBuildStore(g->builder, g->current_async_resume_fn,
                     LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
 
-                /* schedule the sub, then SUSPEND self */
-                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
-                LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
                 emit_async_save_slots(g);
                 LLVMBuildStore(g->builder, LLVMConstInt(i32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                LLVMValueRef sched_args[] = { sub_i8, sub_resume };
+                LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
                 LLVMBuildRetVoid(g->builder);
 
                 /* resume-k: re-entered by the driver once the sub completes */
@@ -5997,8 +6323,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 return awres;
             }
 
-            /* root drive (non-async caller) */
-            LLVMBuildCall2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
+            /* root drive (non-async caller). The scheduler is initialized once
+             * at program entry (see emit_main_method); re-initializing here
+             * would reset the ready queue and discard any coroutines already
+             * enqueued by Task.Spawn before this await -- e.g. a spawned server
+             * in a concurrent client/server program would never run. */
             LLVMValueRef sched_args[] = { sub_i8, sub_resume };
             LLVMBuildCall2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
             LLVMBuildCall2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
@@ -6865,9 +7194,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             stmt->var_decl.initializer->kind == AST_CALL &&
                             stmt->var_decl.initializer->call.callee &&
                             stmt->var_decl.initializer->call.callee->kind == AST_IDENTIFIER;
+                        /* Own every rc-managed local, including those declared
+                         * inside loop/if/block bodies (arc_stmt_depth != 0):
+                         * per-block release at scope exit (emit_release_owned_
+                         * locals_from) frees them each iteration and truncates
+                         * them out of scope, so there is no double-release at
+                         * function exit. Gating on top-level only leaked one
+                         * object per iteration for class-typed loop locals. */
                         int arc_own = (type && is_rc_managed_type(type) &&
                                        LLVMGetTypeKind(g->current_async_slots[i].llvm) == LLVMPointerTypeKind &&
-                                       (type->kind == TYPE_STRING || g->arc_stmt_depth == 0) &&
                                        !string_from_raw_source);
                         /* No null-init here: the frame is zeroed at allocation
                          * and the slot is reloaded at the top of this state block,
@@ -6936,6 +7271,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBuildStore(g->builder, list_val, alloca);
                     zan_type_t *list_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, list_type);
+                    /* List is refcounted: `new` yields an owned (+1) reference, so
+                     * this local owns it and must release it at scope exit. */
+                    if (list_type && is_rc_managed_type(list_type))
+                        locals->vars[locals->count - 1].arc_owned = 1;
+                    return;
+                }
+                if (tname.len == 13 && memcmp(tname.str, "StringBuilder", 13) == 0) {
+                    LLVMValueRef sb_val = emit_expr(g, init, locals);
+                    LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ptr_type, "sb");
+                    LLVMBuildStore(g->builder, sb_val, alloca);
+                    zan_type_t *sb_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
+                    local_add(locals, stmt->var_decl.name, alloca, sb_type);
+                    /* StringBuilder is refcounted: `new` yields an owned (+1)
+                     * reference this local owns and releases at scope exit. */
+                    if (sb_type && is_rc_managed_type(sb_type))
+                        locals->vars[locals->count - 1].arc_owned = 1;
                     return;
                 }
                 if (tname.len == 4 && memcmp(tname.str, "Dict", 4) == 0) {
@@ -7054,13 +7406,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             ? emit_entry_alloca(g, llvm_type, "var")
             : LLVMBuildAlloca(g->builder, llvm_type, "var");
 
-        /* ARC: a class-typed local holds an owning heap reference. Track it only
-         * when declared at the top level of the function body (arc_stmt_depth==0)
-         * so its slot dominates every exit; null-init so the release at exit is
-         * safe even before the initializer has stored anything. */
+        /* ARC: a class-typed local holds an owning heap reference. Track every
+         * rc-managed local, including those declared inside loop/if/block
+         * bodies: each enclosing block releases its owned locals at scope exit
+         * (emit_release_owned_locals_from) and truncates them out of scope, so
+         * they are freed once per iteration and never double-released at
+         * function exit. (Gating on arc_stmt_depth==0 leaked one object per
+         * iteration for class-typed loop/if locals.) Null-init so the release
+         * at exit is safe even before the initializer has stored anything. */
         int arc_own = (type && is_rc_managed_type(type) &&
-                       LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind &&
-                       (type->kind == TYPE_STRING || g->arc_stmt_depth == 0));
+                       LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind);
         if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
@@ -7243,6 +7598,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_FOR_STMT: {
         int for_start = locals->count;
         if (stmt->for_stmt.init) emit_stmt(g, stmt->for_stmt.init, locals);
+        /* Loop variables declared in the init clause live in [for_start,
+         * for_body_start) and must survive across iterations (the step and
+         * condition read them). Only body-scope locals [for_body_start, ..)
+         * are released at the end of each iteration; the loop variables are
+         * dropped once, at loop exit. Releasing from for_start each iteration
+         * would truncate the loop var out of scope, so the step `i = i + 1`
+         * and condition `i < n` would operate on a dropped slot -> infinite
+         * loop. */
+        int for_body_start = locals->count;
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.cond");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.body");
@@ -7271,10 +7635,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
         emit_stmt(g, stmt->for_stmt.body, locals);
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            emit_release_owned_locals_from(g, locals, for_start);
+            emit_release_owned_locals_from(g, locals, for_body_start);
             LLVMBuildBr(g->builder, step_bb);
         } else {
-            emit_release_owned_locals_from(g, locals, for_start);
+            emit_release_owned_locals_from(g, locals, for_body_start);
         }
 
         LLVMPositionBuilderAtEnd(g->builder, step_bb);
@@ -7285,6 +7649,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         g->continue_target = saved_cont;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        /* Drop the loop variables (and any owned init-clause locals) now that
+         * the loop has fully exited. */
+        emit_release_owned_locals_from(g, locals, for_start);
         break;
     }
 
@@ -7513,7 +7880,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
 /* ---- top-level emission ---- */
 
-static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym) {
+static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym,
+                             zan_ast_node_t *unit) {
     /* create main(i32 argc, i8** argv) so command-line args are available via
      * the Environment.ArgCount()/ArgAt() builtins. */
     LLVMTypeRef i32ty = LLVMInt32TypeInContext(g->ctx);
@@ -7551,6 +7919,51 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         emit_leak_report_support(g);
         LLVMBuildCall2(g->builder, g->atexit_type, g->fn_atexit,
                        &g->fn_report_leaks, 1, "");
+    }
+
+    /* Initialize the coroutine scheduler exactly once, before the body runs.
+     * Task.Spawn appends onto the ready queue; a root-level `await` used to call
+     * zan_co_sched_init itself, which resets the queue and would discard any
+     * coroutine spawned before that await. Doing it once here (dominating every
+     * Task.Spawn and every root await) fixes concurrent client/server programs
+     * where the server is spawned and a client is awaited. Harmless for
+     * non-async programs (it just nulls an already-empty queue). */
+    LLVMBuildCall2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
+
+    /* Apply static-field initializers once, at program entry, into their
+     * backing globals. Runs before the Main body so every subsequent read
+     * (in Main or in any method/coroutine) observes the initialized value. */
+    if (unit && unit->kind == AST_COMPILATION_UNIT) {
+        local_scope_t *sf_locals = local_scope_new(g->arena);
+        zan_symbol_t *saved_type = g->current_type_sym;
+        LLVMValueRef saved_this = g->current_this;
+        g->current_this = NULL;
+        for (int di = 0; di < unit->comp_unit.decls.count; di++) {
+            zan_ast_node_t *d = unit->comp_unit.decls.items[di];
+            if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+            zan_symbol_t *csym = zan_binder_lookup(g->binder, d->type_decl.name);
+            if (!csym) continue;
+            g->current_type_sym = csym;
+            for (int mi = 0; mi < d->type_decl.members.count; mi++) {
+                zan_ast_node_t *m = d->type_decl.members.items[mi];
+                if (m->kind != AST_FIELD_DECL) continue;
+                if (!(m->field_decl.modifiers & MOD_STATIC)) continue;
+                if (!m->field_decl.initializer) continue;
+                zan_symbol_t *fs = get_field_sym(csym, m->field_decl.name);
+                LLVMValueRef gv = get_static_field_global(g, csym, fs);
+                if (!gv) continue;
+                LLVMValueRef v = emit_expr(g, m->field_decl.initializer, sf_locals);
+                if (fs->type && is_rc_managed_type(fs->type)) {
+                    emit_rc_store_field(g, fs->type, gv, v, m->field_decl.initializer, sf_locals);
+                } else {
+                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
+                                              : LLVMInt64TypeInContext(g->ctx);
+                    LLVMBuildStore(g->builder, coerce_int_to(g, v, ft), gv);
+                }
+            }
+        }
+        g->current_type_sym = saved_type;
+        g->current_this = saved_this;
     }
 
     local_scope_t *locals = local_scope_new(g->arena);
@@ -7649,6 +8062,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     snprintf(ext_name, sizeof(ext_name), "%.*s",
                              (int)member->method_decl.name.len,
                              member->method_decl.name.str);
+                }
+                if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
+                    strncmp(ext_name, "zan_shared_table_", 17) == 0) {
+                    g->uses_sync_runtime = true;
+                }
+                if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {
+                    g->uses_socket_async = true;
                 }
                 /* Reuse existing declaration if the symbol already exists in the module
                  * (e.g. built-in malloc/free/strlen, or duplicate DllImport across files). */
@@ -8154,7 +8574,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
                 memcmp(member->method_decl.name.str, "Main", 4) == 0) {
                 {
                     zan_symbol_t *main_type_sym = zan_binder_lookup(g->binder, decl->type_decl.name);
-                    emit_main_method(g, member, main_type_sym);
+                    emit_main_method(g, member, main_type_sym, unit);
                 }
                 goto done;
             }

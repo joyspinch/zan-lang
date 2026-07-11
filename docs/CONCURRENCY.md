@@ -250,17 +250,42 @@ async Task FetchUrl(string url) {
 ### 4.4 Atomic Operations
 
 ```csharp
-var counter = new Atomic<int>(0);
+var counter = new AtomicInt(0);
 
 Task.Run(() => {
     counter.Increment();                    // atomic ++
     counter.Add(5);                         // atomic +=
-    int old = counter.CompareExchange(5, 10); // CAS
+    int old = counter.CompareExchange(5, 10); // replace 5 with 10, return observed value
     int val = counter.Load();               // atomic read
 });
 ```
 
-### 4.5 Once (One-time Initialization)
+`AtomicInt` is a sequentially-consistent 64-bit integer shared by tasks running
+on different scheduler workers in the same process.
+
+### 4.5 Cross-Process SharedTable
+
+```csharp
+var table = new SharedTable("server-stats", 1024);
+table.ColumnInt("requests");
+table.ColumnFloat("load");
+table.ColumnString("status", 32);
+if (!table.Create()) {
+    table = SharedTable.Open("server-stats");
+}
+
+table.Increment("worker-1", "requests", 1);
+table.SetFloat("worker-1", "load", 0.75);
+table.SetString("worker-1", "status", "ready");
+```
+
+`SharedTable` uses named shared memory, a fixed int/float/string schema, and
+row-level locking. Updates to different rows can proceed concurrently, while
+each operation remains atomic across threads and processes. The creator calls
+`Destroy()` when the shared table is no longer needed; other processes attach
+with `SharedTable.Open(name)` and call `Close()` when done.
+
+### 4.6 Once (One-time Initialization)
 
 ```csharp
 var once = new Once();
@@ -424,7 +449,8 @@ Types that can be safely shared between tasks:
 | `class` with `Mutex` protection | Yes | Developer responsibility |
 | `class` without synchronization | No | Compiler warning |
 | Channels | Yes | Thread-safe by design |
-| Atomic<T> | Yes | Lock-free operations |
+| AtomicInt | Yes | Lock-free 64-bit operations |
+| SharedTable | Yes | Fixed-schema, cross-process atomic operations |
 
 ### 7.2 Compiler Checks
 
@@ -464,7 +490,7 @@ Task.Run(async () => {
 });
 
 // Pattern 3: Atomic
-var counter = new Atomic<int>(0);
+var counter = new AtomicInt(0);
 Task.Run(() => counter.Increment());
 
 // Pattern 4: Immutable data

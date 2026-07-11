@@ -7,13 +7,19 @@ namespace System.Net.Sockets;
 /// Uses Winsock2 on Windows, BSD sockets (libc) on Linux/macOS.
 /// </summary>
 class Socket {
+    [DllImport("crt", EntryPoint = "zan_io_socket_send")]
+    static extern int ReactorSend(int sock, string buf, int len, int flags);
+
+    [DllImport("crt", EntryPoint = "zan_io_socket_recv")]
+    static extern int ReactorRecv(int sock, string buf, int len, int flags);
+
     // ---- Platform-specific DllImport ----
     #if WINDOWS
     [DllImport("ws2_32", EntryPoint = "WSAStartup")]
     static extern int WSAStartup(int version, string wsaData);
 
-    [DllImport("ws2_32", EntryPoint = "WSACleanup")]
-    static extern int WSACleanup();
+    [DllImport("crt", EntryPoint = "zan_io_socket_cleanup")]
+    static extern void ReactorCleanup();
 
     [DllImport("ws2_32")]
     static extern int socket(int af, int type, int protocol);
@@ -151,7 +157,7 @@ class Socket {
     /// <summary>Cleans up the socket subsystem.</summary>
     static void Cleanup() {
         #if WINDOWS
-        WSACleanup();
+        ReactorCleanup();
         #endif
     }
 
@@ -254,6 +260,9 @@ class Socket {
     /// <summary>Suspends on the IO reactor until an inbound connection is
     /// pending, then accepts it. Requires a non-blocking listener socket.</summary>
     static async int AcceptAsync(int sock) {
+        #if WINDOWS
+        return await Socket.AcceptOv(sock);
+        #else
         while (true) {
             await Socket.ReadReady(sock);
             int client = Accept(sock);
@@ -262,6 +271,7 @@ class Socket {
             }
         }
         return -1;
+        #endif
     }
 
     /// <summary>Connects to a remote address synchronously.</summary>
@@ -283,7 +293,7 @@ class Socket {
 
     /// <summary>Sends data synchronously.</summary>
     static int Send(int sock, string data, int len) {
-        return winsend(sock, data, len, 0);
+        return ReactorSend(sock, data, len, 0);
     }
 
     /// <summary>Suspends until writable, then sends; re-awaits on partial writes
@@ -293,14 +303,18 @@ class Socket {
     /// Binary-safe: the unsent remainder is carried in a separate buffer rebuilt
     /// by index copy, never via <c>data + totalSent</c> pointer arithmetic. On a
     /// string that would compute as concatenation and truncate at the first NUL
-    /// byte, corrupting any payload that contains NULs (e.g. MQTT packets).</summary>
+    /// byte, corrupting any payload that contains NULs (e.g. MQTT packets).
+    ///
+    /// Sends eagerly: the non-blocking send is attempted first and the reactor
+    /// is only awaited when the socket would block (partial write / full send
+    /// buffer). On an uncongested socket the whole payload leaves in one syscall
+    /// with no suspension, avoiding a reactor round-trip per message.</summary>
     static async int SendAsync(int sock, string data, int len) {
         int totalSent = 0;
         string cur = data;
         int curLen = len;
         while (totalSent < len) {
-            await Socket.WriteReady(sock);
-            int sent = winsend(sock, cur, curLen, 0);
+            int sent = ReactorSend(sock, cur, curLen, 0);
             if (sent > 0) {
                 totalSent = totalSent + sent;
                 if (totalSent < len) {
@@ -316,6 +330,8 @@ class Socket {
                 }
             } else if (sent == 0) {
                 return totalSent;
+            } else {
+                await Socket.WriteReady(sock);
             }
         }
         return totalSent;
@@ -336,7 +352,7 @@ class Socket {
 
     /// <summary>Receives data synchronously.</summary>
     static int Recv(int sock, string buf, int bufSize) {
-        return winrecv(sock, buf, bufSize, 0);
+        return ReactorRecv(sock, buf, bufSize, 0);
     }
 
     /// <summary>Suspends on the IO reactor until readable, then receives up to
