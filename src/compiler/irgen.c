@@ -2756,9 +2756,18 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef r = LLVMBuildCall2(g->builder,
                 LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 g->fn_strcmp, cmp_args, 2, "scmp");
-            return LLVMBuildICmp(g->builder,
+            LLVMValueRef seq = LLVMBuildICmp(g->builder,
                 expr->binary.op == TK_EQ_EQ ? LLVMIntEQ : LLVMIntNE,
                 r, LLVMConstInt(i32t, 0, 0), "seq");
+            if (is_string_expr(g, expr->binary.left, locals) &&
+                expr_yields_owned_rc_value(g, expr->binary.left, locals)) {
+                emit_string_release(g, left);
+            }
+            if (is_string_expr(g, expr->binary.right, locals) &&
+                expr_yields_owned_rc_value(g, expr->binary.right, locals)) {
+                emit_string_release(g, right);
+            }
+            return seq;
         }
 
         LLVMTypeRef left_type = LLVMTypeOf(left);

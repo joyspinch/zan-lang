@@ -667,6 +667,7 @@ int main(int argc, char **argv) {
             {"System.Data.Orm",  "System/Data/Orm",  {"Model.zan", "QueryBuilder.zan", NULL}},
             {"System.Data.Sqlite",   "System/Data/Sqlite",   {"SqliteConnection.zan", NULL}},
             {"System.Data.Postgres", "System/Data/Postgres", {"PgConnection.zan", NULL}},
+            {"System.Data.Redis",    "System/Data/Redis",    {"RedisReply.zan", "RedisClient.zan", NULL}},
             {"System.Data",      "System/Data",      {"DbConnection.zan", "DbResult.zan", NULL}},
             {"System.Diagnostics", "System/Diagnostics", {"Process.zan", NULL}},
             {"Platform",         "Platform",          {"Runtime.zan", NULL}},
