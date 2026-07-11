@@ -99,7 +99,18 @@ class TcpClient {
     /// buffer and stays valid only until the next receive on this client.</summary>
     async string RecvReuseAsync() {
         if (this.recvBuf == null) {
-            this.recvBuf = calloc(this.recvBufSize + 1, 1);
+            // Allocate the reusable buffer as a genuine ARC-managed string (built
+            // once per connection). Unlike a raw calloc block, it carries the
+            // string refcount header, so ARC frees it correctly on Close(); a raw
+            // buffer would be freed manually and then read again by a later
+            // str_release, faulting once the heap returns the 64KB pages.
+            StringBuilder sb = new StringBuilder();
+            int i = 0;
+            while (i < this.recvBufSize) {
+                sb.Append(" ");
+                i = i + 1;
+            }
+            this.recvBuf = sb.ToString();
         }
         int _n = await Socket.RecvIntoAsync(this.sock, this.recvBuf, this.recvBufSize);
         return this.recvBuf;
@@ -122,11 +133,9 @@ class TcpClient {
             this.connected = false;
             this.sock = -1;
         }
-        // Release the per-connection receive buffer. It is a raw calloc block
-        // (not an ARC-managed string), so nothing reclaims it otherwise -- every
-        // closed connection would leak recvBufSize bytes.
+        // Release the per-connection receive buffer. It is an ARC-managed string,
+        // so clearing the field drops the last reference and the runtime frees it.
         if (this.recvBuf != null) {
-            free(this.recvBuf);
             this.recvBuf = null;
         }
     }
