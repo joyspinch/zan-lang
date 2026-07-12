@@ -576,6 +576,19 @@ static int zan_copy_file(const char *src, const char *dst) {
     return rc;
 }
 
+/* A driver-bundle manifest lists runtime libraries to copy next to the
+ * published executable. Each entry must be a bare filename inside the driver
+ * directory: reject absolute paths, drive letters, path separators and ".."
+ * so a manifest can never make publishing read or (worse) write outside the
+ * driver / output directory. */
+static bool zan_is_safe_bundle_name(const char *name) {
+    if (!name || !name[0]) return false;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\' || *p == ':') return false;
+    return true;
+}
+
 /* Per-target driver-bundle subdirectory under <zanc_dir>/drivers/. Matches the
  * cross-compile toolchain naming so publishing for a target reads the drivers
  * built for that target. */
@@ -1376,7 +1389,15 @@ int main(int argc, char **argv) {
                         while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'
                                          || line[l-1] == ' ' || line[l-1] == '\t'))
                             line[--l] = '\0';
-                        if (l > 0) snprintf(cands[ncand++], sizeof(cands[0]), "%s", line);
+                        if (l > 0) {
+                            if (zan_is_safe_bundle_name(line)) {
+                                snprintf(cands[ncand++], sizeof(cands[0]), "%s", line);
+                            } else {
+                                fprintf(stderr, "warning: ignoring unsafe entry "
+                                    "'%s' in %s (must be a bare filename)\n",
+                                    line, manifest);
+                            }
+                        }
                     }
                     fclose(mf);
                 } else if (win_target) {
