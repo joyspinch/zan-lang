@@ -2159,6 +2159,24 @@ static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
     emit_rc_release_for_type(g, t, val);
 }
 
+static int call_consumes_free_arg(LLVMValueRef callee) {
+    if (!callee) return 0;
+    size_t name_len = 0;
+    const char *name = LLVMGetValueName2(callee, &name_len);
+    return name && name_len == 4 && memcmp(name, "free", 4) == 0;
+}
+
+static void emit_invalidate_freed_local(zan_irgen_t *g, zan_ast_node_t *arg,
+                                        local_scope_t *locals) {
+    if (!arg || arg->kind != AST_IDENTIFIER || !locals) return;
+    local_var_t *local = local_find(locals, arg->ident.name);
+    if (!local || !local->type || local->type->kind != TYPE_STRING) return;
+    LLVMTypeRef slot_type = LLVMGetAllocatedType(local->alloca);
+    if (LLVMGetTypeKind(slot_type) == LLVMPointerTypeKind) {
+        LLVMBuildStore(g->builder, LLVMConstNull(slot_type), local->alloca);
+    }
+}
+
 static void emit_leak_report_support(zan_irgen_t *g) {
     if (!g->check_leaks || g->fn_report_leaks) return;
     /* void __zan_report_leaks(void): at program exit, if any ARC object is
@@ -5175,9 +5193,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                int consumes_free_arg =
+                                    argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
+                                if (consumes_free_arg) {
+                                    emit_invalidate_freed_local(g,
+                                        expr->call.args.items[0], locals);
+                                }
                                 for (int k = 0; k < argc; k++) {
-                                    emit_release_owned_call_temp(g, expr->call.args.items[k],
-                                        call_args[k], locals);
+                                    if (!consumes_free_arg || k != 0) {
+                                        emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                            call_args[k], locals);
+                                    }
                                 }
                                 free(call_args);
                                 return result;
@@ -5251,9 +5277,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                int consumes_free_arg =
+                                    argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
+                                if (consumes_free_arg) {
+                                    emit_invalidate_freed_local(g,
+                                        expr->call.args.items[0], locals);
+                                }
                                 for (int k = 0; k < argc; k++) {
-                                    emit_release_owned_call_temp(g, expr->call.args.items[k],
-                                        call_args[k], locals);
+                                    if (!consumes_free_arg || k != 0) {
+                                        emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                            call_args[k], locals);
+                                    }
                                 }
                                 free(call_args);
                                 return result;
@@ -5340,9 +5374,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "bcall";
                             LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                 g->functions[fi].fn, call_args, (unsigned)(argc + extra), cn);
+                            int consumes_free_arg =
+                                argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
+                            if (consumes_free_arg) {
+                                emit_invalidate_freed_local(g,
+                                    expr->call.args.items[0], locals);
+                            }
                             for (int k = 0; k < argc; k++) {
-                                emit_release_owned_call_temp(g, expr->call.args.items[k],
-                                    call_args[k + extra], locals);
+                                if (!consumes_free_arg || k != 0) {
+                                    emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                        call_args[k + extra], locals);
+                                }
                             }
                             free(call_args);
                             return result;
@@ -5367,9 +5409,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
                 LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
                     global_fn, call_args, (unsigned)argc, "gcall");
+                int consumes_free_arg =
+                    argc == 1 && call_consumes_free_arg(global_fn);
+                if (consumes_free_arg) {
+                    emit_invalidate_freed_local(g,
+                        expr->call.args.items[0], locals);
+                }
                 for (int k = 0; k < argc; k++) {
-                    emit_release_owned_call_temp(g, expr->call.args.items[k],
-                        call_args[k], locals);
+                    if (!consumes_free_arg || k != 0) {
+                        emit_release_owned_call_temp(g, expr->call.args.items[k],
+                            call_args[k], locals);
+                    }
                 }
                 free(call_args);
                 return result;
