@@ -26,19 +26,40 @@ extern u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride);
 
 #define EXPORT __attribute__((visibility("default")))
 
-/* ---- global state (single window, matching the other backends) ---- */
-static NSWindow *g_window = nil;
-static NSView   *g_view   = nil;
-static CGImageRef g_frame = NULL;
-/* Flat pending-event slots: [kind, x, y, button, keycode, mods]. */
-static long g_evt[6];
+/* ---- per-window registry ----
+ * One process can drive several top-level windows. Each keeps its own view
+ * (which owns its last-presented image) and size. g_mwins[0] is the primary
+ * window used for the handle-less size queries. */
+#define ZAN_MAX_WINDOWS 16
+typedef struct {
+    NSWindow *window;
+    NSView   *view;
+    int w, h;
+} zan_mwin_t;
+static zan_mwin_t g_mwins[ZAN_MAX_WINDOWS];
+static int g_mwin_count = 0;
+
+/* Pending-event slots: [kind, x, y, button, keycode, mods, hwnd]. */
+static long g_evt[7];
+/* Handle of the window feeding the events currently being decoded. */
+static long g_evt_win = 0;
+
+static zan_mwin_t *mwin_find_win(NSWindow *w) {
+    for (int i = 0; i < g_mwin_count; i++)
+        if (g_mwins[i].window == w) return &g_mwins[i];
+    return NULL;
+}
+static zan_mwin_t *mwin_find(long hwnd) {
+    return mwin_find_win((NSWindow *)(intptr_t)hwnd);
+}
 
 /* Decoded events are queued so a single NSEvent can yield several ABI events
  * (e.g. a key press emits a keyDown followed by a textInput, and a window
  * resize/close arrives from the delegate), matching the Win32 backend where
- * WM_KEYDOWN and WM_CHAR are distinct messages. */
+ * WM_KEYDOWN and WM_CHAR are distinct messages. Each entry also carries the
+ * source window handle so the app can route it. */
 #define ZAN_EVQ_CAP 64
-static long g_evq[ZAN_EVQ_CAP][6];
+static long g_evq[ZAN_EVQ_CAP][7];
 static int g_evq_head = 0;
 static int g_evq_tail = 0;
 
@@ -51,6 +72,7 @@ static void evq_push(long kind, long x, long y, long button, long keycode, long 
     g_evq[g_evq_tail][3] = button;
     g_evq[g_evq_tail][4] = keycode;
     g_evq[g_evq_tail][5] = mods;
+    g_evq[g_evq_tail][6] = g_evt_win;
     g_evq_tail = next;
 }
 
@@ -61,8 +83,12 @@ static int evq_pop(void) {
     return 1;
 }
 
-/* Custom content view that blits the last presented CGImage. */
-@interface ZanView : NSView
+/* Custom content view that blits its own last-presented CGImage, so each
+ * window renders independently. */
+@interface ZanView : NSView {
+@public
+    CGImageRef frame;
+}
 @end
 
 @implementation ZanView
@@ -70,10 +96,10 @@ static int evq_pop(void) {
 - (BOOL)acceptsFirstResponder { return YES; }
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
-    if (!g_frame) return;
+    if (!frame) return;
     CGContextRef ctx = (CGContextRef)[[NSGraphicsContext currentContext] CGContext];
     if (!ctx) return;
-    CGContextDrawImage(ctx, self.bounds, g_frame);
+    CGContextDrawImage(ctx, self.bounds, frame);
 }
 @end
 
@@ -85,14 +111,18 @@ static int evq_pop(void) {
 
 @implementation ZanDelegate
 - (void)windowDidResize:(NSNotification *)note {
-    (void)note;
-    if (g_view) {
-        NSSize s = [g_view bounds].size;
+    NSWindow *win = [note object];
+    zan_mwin_t *mw = mwin_find_win(win);
+    if (mw && mw->view) {
+        NSSize s = [mw->view bounds].size;
+        mw->w = (int)s.width;
+        mw->h = (int)s.height;
+        g_evt_win = (long)(intptr_t)win;
         evq_push(7, (long)s.width, (long)s.height, 0, 0, 0);
     }
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
-    (void)sender;
+    g_evt_win = (long)(intptr_t)sender;
     evq_push(8, 0, 0, 0, 0, 0);
     return NO; /* let the app decide when to quit rather than tearing down */
 }
@@ -103,47 +133,61 @@ static ZanDelegate *g_delegate = nil;
 /* ---- window lifecycle ---- */
 
 EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
+    if (g_mwin_count >= ZAN_MAX_WINDOWS) return 0;
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        if (!g_delegate) g_delegate = [[ZanDelegate alloc] init];
 
         NSRect rect = NSMakeRect(0, 0, (CGFloat)width, (CGFloat)height);
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
-        g_window = [[NSWindow alloc] initWithContentRect:rect
+        NSWindow *window = [[NSWindow alloc] initWithContentRect:rect
                                                styleMask:style
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
-        g_view = [[ZanView alloc] initWithFrame:rect];
-        [g_window setContentView:g_view];
-        [g_window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
-        g_delegate = [[ZanDelegate alloc] init];
-        [g_window setDelegate:g_delegate];
+        ZanView *view = [[ZanView alloc] initWithFrame:rect];
+        view->frame = NULL;
+        [window setContentView:view];
+        [window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
+        [window setDelegate:g_delegate];          /* one delegate serves all windows */
         if (title) {
-            [g_window setTitle:[NSString stringWithUTF8String:title]];
+            [window setTitle:[NSString stringWithUTF8String:title]];
         }
-        [g_window center];
-        return (i64)(intptr_t)g_window;
+        [window center];
+
+        zan_mwin_t *mw = &g_mwins[g_mwin_count++];
+        mw->window = window;
+        mw->view = view;
+        mw->w = (int)width;
+        mw->h = (int)height;
+        return (i64)(intptr_t)window;
     }
 }
 
 EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (!g_window) return 1;
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
     @autoreleasepool {
         [NSApp activateIgnoringOtherApps:YES];
-        [g_window makeKeyAndOrderFront:nil];
+        [mw->window makeKeyAndOrderFront:nil];
     }
     return 0;
 }
 
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (g_window) {
-        @autoreleasepool { [g_window close]; }
-        g_window = nil;
-        g_view = nil;
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count == 1) mw = &g_mwins[0];
+    if (!mw) return 0;
+    @autoreleasepool {
+        ZanView *view = (ZanView *)mw->view;
+        if (view && view->frame) { CGImageRelease(view->frame); view->frame = NULL; }
+        [mw->window setDelegate:nil];
+        [mw->window close];
     }
+    int idx = (int)(mw - g_mwins);
+    g_mwins[idx] = g_mwins[--g_mwin_count];
     return 0;
 }
 
@@ -202,8 +246,12 @@ static long zan_vk_from_chars(NSString *bare) {
 static void decode_event(NSEvent *ev) {
     NSEventType type = [ev type];
     long mods = zan_mods([ev modifierFlags]);
+    NSWindow *win = [ev window];
+    zan_mwin_t *mw = win ? mwin_find_win(win) : NULL;
+    NSView *view = mw ? mw->view : NULL;
+    g_evt_win = (long)(intptr_t)win;
     NSPoint p = [ev locationInWindow];
-    NSPoint local = g_view ? [g_view convertPoint:p fromView:nil] : p;
+    NSPoint local = view ? [view convertPoint:p fromView:nil] : p;
     long lx = (long)local.x, ly = (long)local.y;
 
     switch (type) {
@@ -273,7 +321,7 @@ static void decode_event(NSEvent *ev) {
 }
 
 static i64 pump(bool wait) {
-    if (!g_window) return -1;
+    if (g_mwin_count == 0) return -1;
     if (evq_pop()) return 0;               /* drain already-decoded events first */
     memset(g_evt, 0, sizeof(g_evt));
     @autoreleasepool {
@@ -302,7 +350,7 @@ EXPORT i64 zan_gui_event_y(void)       { return g_evt[2]; }
 EXPORT i64 zan_gui_event_button(void)  { return g_evt[3]; }
 EXPORT i64 zan_gui_event_keycode(void) { return g_evt[4]; }
 EXPORT i64 zan_gui_event_mods(void)    { return g_evt[5]; }
-EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(intptr_t)g_window; }
+EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)g_evt[6]; }
 
 /* ---- native text rendering ---- */
 
@@ -435,21 +483,31 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
 /* ---- geometry ---- */
 
 EXPORT i64 zan_gui_window_width(void) {
-    if (!g_view) return 0;
-    return (i64)[g_view bounds].size.width;
+    if (g_mwin_count == 0 || !g_mwins[0].view) return 0;
+    return (i64)[g_mwins[0].view bounds].size.width;
 }
 EXPORT i64 zan_gui_window_height(void) {
-    if (!g_view) return 0;
-    return (i64)[g_view bounds].size.height;
+    if (g_mwin_count == 0 || !g_mwins[0].view) return 0;
+    return (i64)[g_mwins[0].view bounds].size.height;
 }
-EXPORT i64 zan_gui_client_width(i64 hwnd_val)  { (void)hwnd_val; return zan_gui_window_width(); }
-EXPORT i64 zan_gui_client_height(i64 hwnd_val) { (void)hwnd_val; return zan_gui_window_height(); }
+EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw || !mw->view) return zan_gui_window_width();
+    return (i64)[mw->view bounds].size.width;
+}
+EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw || !mw->view) return zan_gui_window_height();
+    return (i64)[mw->view bounds].size.height;
+}
 
 /* ---- present: blit the software surface to the window ---- */
 
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
-    (void)hwnd_val;
-    if (!g_view) return 1;
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw || !mw->view) return 1;
+    ZanView *view = (ZanView *)mw->view;
     int w = 0, h = 0, stride = 0;
     const u32 *pixels = zan_gui_internal_surface_data(surface_id, &w, &h, &stride);
     if (!pixels || w <= 0 || h <= 0) return 1;
@@ -463,10 +521,10 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
                                                  8, (size_t)stride * 4, cs, info);
         CGImageRef img = bmp ? CGBitmapContextCreateImage(bmp) : NULL;
         if (img) {
-            if (g_frame) CGImageRelease(g_frame);
-            g_frame = img;                 /* retained; released on next present */
-            [g_view setNeedsDisplay:YES];
-            [g_view displayIfNeeded];
+            if (view->frame) CGImageRelease(view->frame);
+            view->frame = img;             /* retained; released on next present */
+            [view setNeedsDisplay:YES];
+            [view displayIfNeeded];
         }
         if (bmp) CGContextRelease(bmp);
         CGColorSpaceRelease(cs);
@@ -477,9 +535,10 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
 /* ---- misc ---- */
 
 EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
-    (void)hwnd_val;
-    if (g_window && title) {
-        @autoreleasepool { [g_window setTitle:[NSString stringWithUTF8String:title]]; }
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (mw && title) {
+        @autoreleasepool { [mw->window setTitle:[NSString stringWithUTF8String:title]]; }
     }
     return 0;
 }
@@ -510,34 +569,38 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
 /* ---- window management ---- */
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (g_window) { @autoreleasepool { [g_window miniaturize:nil]; } }
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (mw) { @autoreleasepool { [mw->window miniaturize:nil]; } }
     return 0;
 }
 
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (g_window) { @autoreleasepool { [g_window zoom:nil]; } }
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (mw) { @autoreleasepool { [mw->window zoom:nil]; } }
     return 0;
 }
 
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (!g_window) return 0;
-    return [g_window isZoomed] ? 1 : 0;
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 0;
+    return [mw->window isZoomed] ? 1 : 0;
 }
 
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
-    (void)hwnd_val;
-    if (g_window) {
-        [g_window setLevel:(on ? NSFloatingWindowLevel : NSNormalWindowLevel)];
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (mw) {
+        [mw->window setLevel:(on ? NSFloatingWindowLevel : NSNormalWindowLevel)];
     }
     return 0;
 }
 
 EXPORT i64 zan_gui_get_dpi_scale(void) {
     @autoreleasepool {
-        NSWindow *w = g_window;
+        NSWindow *w = g_mwin_count > 0 ? g_mwins[0].window : nil;
         CGFloat scale = w ? [w backingScaleFactor]
                           : [[NSScreen mainScreen] backingScaleFactor];
         if (scale <= 0) scale = 1.0;

@@ -1198,7 +1198,6 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
 
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
-static GC g_gc = 0;
 static int g_pending_event_linux[8];
 static int g_win_w = 0, g_win_h = 0;
 static char *g_clip_text_linux = NULL;
@@ -1206,8 +1205,6 @@ static char *g_clip_read_linux = NULL;
 static Cursor g_cursors_linux[8];
 static XIM g_xim = NULL;
 static XIC g_xic = NULL;
-static Pixmap g_backbuf = 0;
-static int g_backbuf_w = 0, g_backbuf_h = 0;
 
 /* Client-side decoration metrics for the borderless window with an app-drawn
  * title bar, mirroring the Win32 backend. */
@@ -1215,6 +1212,30 @@ static int g_scale_linux = 100;
 static int g_titlebar_h_l = 32;
 static int g_btn_w_l = 46;
 static int g_caption_btn_count_l = 5;
+
+/* Per-window state so one process can drive several top-level windows. The
+ * globals above still track the primary window for process-wide operations
+ * (clipboard, cursor, input method) and single-window size queries. */
+#define ZAN_MAX_WINDOWS 16
+typedef struct {
+    Window xid;
+    GC gc;
+    XIC xic;
+    Pixmap backbuf;
+    int backbuf_w, backbuf_h;
+    int w, h;
+} zan_lwin_t;
+static zan_lwin_t g_lwins[ZAN_MAX_WINDOWS];
+static int g_lwin_count = 0;
+static Window g_primary_win = 0;
+/* xid of the window the event currently being decoded originated from. */
+static Window g_evwin_linux = 0;
+
+static zan_lwin_t *lwin_find(Window xid) {
+    for (int i = 0; i < g_lwin_count; i++)
+        if (g_lwins[i].xid == xid) return &g_lwins[i];
+    return NULL;
+}
 
 i64 zan_gui_get_dpi_scale(void);
 i64 zan_gui_is_maximized(i64 hwnd_val);
@@ -1232,7 +1253,7 @@ static void evq_push_linux(int kind, int x, int y, int button, int keycode, int 
     if (next == g_evq_head_linux) return; /* queue full: drop */
     int *e = g_evq_linux[g_evq_tail_linux];
     e[0] = kind; e[1] = x; e[2] = y; e[3] = button;
-    e[4] = keycode; e[5] = mods; e[6] = 0; e[7] = 0;
+    e[4] = keycode; e[5] = mods; e[6] = (int)g_evwin_linux; e[7] = 0;
     g_evq_tail_linux = next;
 }
 
@@ -1304,12 +1325,12 @@ static Atom x11_atom(const char *name) { return XInternAtom(g_display, name, Fal
 
 /* Toggle/set an EWMH _NET_WM_STATE property via the window manager.
  * action: 0 = remove, 1 = add, 2 = toggle. state2 may be 0. */
-static void x11_wm_state(Atom state1, Atom state2, long action) {
-    if (!g_display || !g_x11_window) return;
+static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
+    if (!g_display || !win) return;
     XEvent xev;
     memset(&xev, 0, sizeof(xev));
     xev.type = ClientMessage;
-    xev.xclient.window = g_x11_window;
+    xev.xclient.window = win;
     xev.xclient.message_type = x11_atom("_NET_WM_STATE");
     xev.xclient.format = 32;
     xev.xclient.data.l[0] = action;
@@ -1334,8 +1355,8 @@ static void x11_wm_state(Atom state1, Atom state2, long action) {
 
 /* Remove window-manager decorations via the Motif hint so the app can draw its
  * own title bar (matching the Win32 borderless window). */
-static void x11_set_borderless(void) {
-    if (!g_display || !g_x11_window) return;
+static void x11_set_borderless(Window win) {
+    if (!g_display || !win) return;
     struct {
         unsigned long flags, functions, decorations;
         long input_mode;
@@ -1345,19 +1366,19 @@ static void x11_set_borderless(void) {
     hints.flags = (1L << 1); /* MWM_HINTS_DECORATIONS */
     hints.decorations = 0;
     Atom a = x11_atom("_MOTIF_WM_HINTS");
-    XChangeProperty(g_display, g_x11_window, a, a, 32, PropModeReplace,
+    XChangeProperty(g_display, win, a, a, 32, PropModeReplace,
                     (unsigned char *)&hints, 5);
 }
 
 /* Ask the window manager to start an interactive move/resize, so the app-drawn
  * caption and resize borders behave like real ones. */
-static void x11_start_moveresize(int x_root, int y_root, int direction) {
-    if (!g_display || !g_x11_window) return;
+static void x11_start_moveresize(Window win, int x_root, int y_root, int direction) {
+    if (!g_display || !win) return;
     XUngrabPointer(g_display, CurrentTime);
     XEvent xev;
     memset(&xev, 0, sizeof(xev));
     xev.type = ClientMessage;
-    xev.xclient.window = g_x11_window;
+    xev.xclient.window = win;
     xev.xclient.message_type = x11_atom("_NET_WM_MOVERESIZE");
     xev.xclient.format = 32;
     xev.xclient.data.l[0] = x_root;
@@ -1373,11 +1394,11 @@ static void x11_start_moveresize(int x_root, int y_root, int direction) {
 /* Map a left press to a move/resize direction, mirroring the Win32
  * WM_NCHITTEST logic: 8px resize borders plus a draggable caption that excludes
  * the caption-button cluster. Returns -1 for an ordinary client click. */
-static int x11_caption_hit(int x, int y) {
-    int w = g_win_w, h = g_win_h;
+static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
+    int w = lw->w, h = lw->h;
     int capW = g_caption_btn_count_l * g_btn_w_l;
     int inCaptionDrag = (y < g_titlebar_h_l && x < w - capW);
-    if (zan_gui_is_maximized(0)) {
+    if (zan_gui_is_maximized((i64)lw->xid)) {
         return inCaptionDrag ? ZAN_NWMR_MOVE : -1;
     }
     int b = 8 * g_scale_linux / 100;
@@ -1427,6 +1448,7 @@ static void x11_serve_selection(XSelectionRequestEvent *req) {
 
 /* Decode a raw XEvent into zero or more queued ABI events. */
 static void x11_translate_event(XEvent *ev) {
+    g_evwin_linux = ev->xany.window;
     switch (ev->type) {
     case MotionNotify:
         evq_push_linux(1, ev->xmotion.x, ev->xmotion.y, 0, 0,
@@ -1446,9 +1468,11 @@ static void x11_translate_event(XEvent *ev) {
             /* Honor the app-drawn caption and resize borders by delegating to
              * the WM, mirroring Win32 WM_NCHITTEST. Presses over content or the
              * caption buttons fall through as ordinary clicks. */
-            int dir = x11_caption_hit(ev->xbutton.x, ev->xbutton.y);
+            zan_lwin_t *bw = lwin_find(ev->xbutton.window);
+            int dir = bw ? x11_caption_hit(bw, ev->xbutton.x, ev->xbutton.y) : -1;
             if (dir >= 0) {
-                x11_start_moveresize(ev->xbutton.x_root, ev->xbutton.y_root, dir);
+                x11_start_moveresize(ev->xbutton.window,
+                                     ev->xbutton.x_root, ev->xbutton.y_root, dir);
             } else {
                 evq_push_linux(2, ev->xbutton.x, ev->xbutton.y, 0, 0,
                                x11_mods(ev->xbutton.state));
@@ -1470,9 +1494,11 @@ static void x11_translate_event(XEvent *ev) {
         KeySym ks = 0;
         char buf[32];
         int n;
-        if (g_xic) {
+        zan_lwin_t *kw = lwin_find(ev->xkey.window);
+        XIC xic = (kw && kw->xic) ? kw->xic : g_xic;
+        if (xic) {
             Status st = 0;
-            n = Xutf8LookupString(g_xic, &ev->xkey, buf, sizeof(buf) - 1, &ks, &st);
+            n = Xutf8LookupString(xic, &ev->xkey, buf, sizeof(buf) - 1, &ks, &st);
         } else {
             n = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &ks, NULL);
         }
@@ -1498,20 +1524,29 @@ static void x11_translate_event(XEvent *ev) {
                        x11_mods(ev->xkey.state));
         break;
     }
-    case ConfigureNotify:
-        if (ev->xconfigure.width != g_win_w || ev->xconfigure.height != g_win_h) {
-            g_win_w = ev->xconfigure.width;
-            g_win_h = ev->xconfigure.height;
-            evq_push_linux(7, g_win_w, g_win_h, 0, 0, 0);
+    case ConfigureNotify: {
+        zan_lwin_t *cw = lwin_find(ev->xconfigure.window);
+        if (cw && (ev->xconfigure.width != cw->w ||
+                   ev->xconfigure.height != cw->h)) {
+            cw->w = ev->xconfigure.width;
+            cw->h = ev->xconfigure.height;
+            if (ev->xconfigure.window == g_primary_win) {
+                g_win_w = cw->w;
+                g_win_h = cw->h;
+            }
+            evq_push_linux(7, cw->w, cw->h, 0, 0, 0);
         }
         break;
-    case Expose:
-        /* Re-blit the last frame from the back buffer so uncover/move never
-         * leaves stale or blank content. */
-        if (g_backbuf)
-            XCopyArea(g_display, g_backbuf, g_x11_window, g_gc, 0, 0,
-                      (unsigned)g_backbuf_w, (unsigned)g_backbuf_h, 0, 0);
+    }
+    case Expose: {
+        /* Re-blit the last frame from the window's back buffer so uncover/move
+         * never leaves stale or blank content. */
+        zan_lwin_t *ew = lwin_find(ev->xexpose.window);
+        if (ew && ew->backbuf)
+            XCopyArea(g_display, ew->backbuf, ew->xid, ew->gc, 0, 0,
+                      (unsigned)ew->backbuf_w, (unsigned)ew->backbuf_h, 0, 0);
         break;
+    }
     case ClientMessage:
         evq_push_linux(8, 0, 0, 0, 0, 0);
         break;
@@ -1519,53 +1554,74 @@ static void x11_translate_event(XEvent *ev) {
 }
 
 EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
-    g_display = XOpenDisplay(NULL);
-    if (!g_display) return 0;
+    if (!g_display) {
+        g_display = XOpenDisplay(NULL);
+        if (!g_display) return 0;
+        /* Input method for UTF-8 text input (also enables IME preedit); opened
+         * once per display and shared by every window's input context. */
+        setlocale(LC_ALL, "");
+        XSetLocaleModifiers("");
+        g_xim = XOpenIM(g_display, NULL, NULL, NULL);
+    }
+    if (g_lwin_count >= ZAN_MAX_WINDOWS) return 0;
 
     int screen = DefaultScreen(g_display);
-    g_x11_window = XCreateSimpleWindow(g_display, RootWindow(g_display, screen),
+    Window xid = XCreateSimpleWindow(g_display, RootWindow(g_display, screen),
         0, 0, (unsigned)width, (unsigned)height, 0,
         BlackPixel(g_display, screen), WhitePixel(g_display, screen));
 
-    XStoreName(g_display, g_x11_window, title);
-    XSelectInput(g_display, g_x11_window,
+    XStoreName(g_display, xid, title);
+    XSelectInput(g_display, xid,
         ExposureMask | KeyPressMask | KeyReleaseMask |
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
         StructureNotifyMask);
 
     Atom wm_delete = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(g_display, g_x11_window, &wm_delete, 1);
+    XSetWMProtocols(g_display, xid, &wm_delete, 1);
 
-    /* Input method for UTF-8 text input (also enables IME preedit). */
-    setlocale(LC_ALL, "");
-    XSetLocaleModifiers("");
-    g_xim = XOpenIM(g_display, NULL, NULL, NULL);
+    XIC xic = NULL;
     if (g_xim) {
-        g_xic = XCreateIC(g_xim,
+        xic = XCreateIC(g_xim,
             XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-            XNClientWindow, g_x11_window,
-            XNFocusWindow, g_x11_window,
+            XNClientWindow, xid,
+            XNFocusWindow, xid,
             NULL);
-        if (g_xic) XSetICFocus(g_xic);
+        if (xic) XSetICFocus(xic);
     }
+    GC gc = XCreateGC(g_display, xid, 0, NULL);
 
-    g_gc = XCreateGC(g_display, g_x11_window, 0, NULL);
-    g_win_w = (int)width;
-    g_win_h = (int)height;
+    zan_lwin_t *w = &g_lwins[g_lwin_count++];
+    w->xid = xid;
+    w->gc = gc;
+    w->xic = xic;
+    w->backbuf = 0;
+    w->backbuf_w = 0;
+    w->backbuf_h = 0;
+    w->w = (int)width;
+    w->h = (int)height;
 
+    if (!g_primary_win) {
+        /* First window drives process-wide operations (clipboard, cursor) and
+         * the client-side title-bar metrics computed once from its DPI. */
+        g_primary_win = xid;
+        g_x11_window = xid;
+        g_xic = xic;
+        g_win_w = (int)width;
+        g_win_h = (int)height;
+        g_scale_linux = (int)zan_gui_get_dpi_scale();
+        g_titlebar_h_l = 32 * g_scale_linux / 100;
+        g_btn_w_l = 46 * g_scale_linux / 100;
+    }
     /* Borderless window with app-drawn title bar (matches the Win32 backend). */
-    g_scale_linux = (int)zan_gui_get_dpi_scale();
-    g_titlebar_h_l = 32 * g_scale_linux / 100;
-    g_btn_w_l = 46 * g_scale_linux / 100;
-    x11_set_borderless();
+    x11_set_borderless(xid);
 
-    return (i64)g_x11_window;
+    return (i64)xid;
 }
 
 EXPORT i64 zan_gui_show_window(i64 win) {
-    (void)win;
-    if (g_display && g_x11_window) {
-        XMapWindow(g_display, g_x11_window);
+    Window xid = win ? (Window)(intptr_t)win : g_x11_window;
+    if (g_display && xid) {
+        XMapWindow(g_display, xid);
         XFlush(g_display);
     }
     return 0;
@@ -1617,38 +1673,46 @@ EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event_linux[5]; }
 EXPORT i64 zan_gui_window_width(void)  { return g_win_w; }
 EXPORT i64 zan_gui_window_height(void) { return g_win_h; }
 
-EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(intptr_t)g_x11_window; }
-EXPORT i64 zan_gui_client_width(i64 hwnd_val)  { (void)hwnd_val; return g_win_w; }
-EXPORT i64 zan_gui_client_height(i64 hwnd_val) { (void)hwnd_val; return g_win_h; }
+EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(unsigned)g_pending_event_linux[6]; }
+EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+    zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
+    return w ? w->w : g_win_w;
+}
+EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+    zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
+    return w ? w->h : g_win_h;
+}
 
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
-    (void)hwnd_val;
     if (!g_display) return 1;
+    zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
+    if (!w && g_lwin_count > 0) w = &g_lwins[0];
+    if (!w) return 1;
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
     zan_surface_t *s = g_surfaces[surface_id];
 
     int screen = DefaultScreen(g_display);
     unsigned depth = (unsigned)DefaultDepth(g_display, screen);
 
-    /* Blit through an off-screen Pixmap (double buffering) so resizes and
-     * expose events never show a half-drawn or torn frame. */
-    if (!g_backbuf || g_backbuf_w != s->width || g_backbuf_h != s->height) {
-        if (g_backbuf) XFreePixmap(g_display, g_backbuf);
-        g_backbuf = XCreatePixmap(g_display, g_x11_window,
-                                  (unsigned)s->width, (unsigned)s->height, depth);
-        g_backbuf_w = s->width;
-        g_backbuf_h = s->height;
+    /* Blit through the window's own off-screen Pixmap (double buffering) so
+     * resizes and expose events never show a half-drawn or torn frame. */
+    if (!w->backbuf || w->backbuf_w != s->width || w->backbuf_h != s->height) {
+        if (w->backbuf) XFreePixmap(g_display, w->backbuf);
+        w->backbuf = XCreatePixmap(g_display, w->xid,
+                                   (unsigned)s->width, (unsigned)s->height, depth);
+        w->backbuf_w = s->width;
+        w->backbuf_h = s->height;
     }
 
     XImage *img = XCreateImage(g_display, DefaultVisual(g_display, screen),
         depth, ZPixmap, 0, (char *)s->pixels, (unsigned)s->width, (unsigned)s->height, 32, 0);
     if (img) {
         img->byte_order = LSBFirst;
-        XPutImage(g_display, g_backbuf, g_gc, img, 0, 0, 0, 0,
+        XPutImage(g_display, w->backbuf, w->gc, img, 0, 0, 0, 0,
                   (unsigned)s->width, (unsigned)s->height);
         img->data = NULL;
         XDestroyImage(img);
-        XCopyArea(g_display, g_backbuf, g_x11_window, g_gc, 0, 0,
+        XCopyArea(g_display, w->backbuf, w->xid, w->gc, 0, 0,
                   (unsigned)s->width, (unsigned)s->height, 0, 0);
     }
     XFlush(g_display);
@@ -1656,16 +1720,16 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
 }
 
 EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
-    (void)hwnd_val;
-    if (g_display && g_x11_window) {
-        XStoreName(g_display, g_x11_window, title);
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (g_display && xid) {
+        XStoreName(g_display, xid, title);
         XFlush(g_display);
     }
     return 0;
 }
 
 EXPORT i64 zan_gui_set_cursor(i64 cursor_type) {
-    if (!g_display || !g_x11_window) return 1;
+    if (!g_display || g_lwin_count == 0) return 1;
     int slot = (int)cursor_type;
     if (slot < 0 || slot >= 8) slot = 0;
     if (!g_cursors_linux[slot]) {
@@ -1677,7 +1741,8 @@ EXPORT i64 zan_gui_set_cursor(i64 cursor_type) {
         else if (slot == 5) shape = XC_crosshair;
         g_cursors_linux[slot] = XCreateFontCursor(g_display, shape);
     }
-    XDefineCursor(g_display, g_x11_window, g_cursors_linux[slot]);
+    for (int i = 0; i < g_lwin_count; i++)
+        XDefineCursor(g_display, g_lwins[i].xid, g_cursors_linux[slot]);
     XFlush(g_display);
     return 0;
 }
@@ -2395,24 +2460,24 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
 /* ---- window management (EWMH / Xlib) ---- */
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (g_display && g_x11_window) {
-        XIconifyWindow(g_display, g_x11_window, DefaultScreen(g_display));
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (g_display && xid) {
+        XIconifyWindow(g_display, xid, DefaultScreen(g_display));
         XFlush(g_display);
     }
     return 0;
 }
 
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
-    (void)hwnd_val;
-    x11_wm_state(x11_atom("_NET_WM_STATE_MAXIMIZED_VERT"),
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    x11_wm_state(xid, x11_atom("_NET_WM_STATE_MAXIMIZED_VERT"),
                  x11_atom("_NET_WM_STATE_MAXIMIZED_HORZ"), 2 /* toggle */);
     return 0;
 }
 
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (!g_display || !g_x11_window) return 0;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!g_display || !xid) return 0;
     Atom vert = x11_atom("_NET_WM_STATE_MAXIMIZED_VERT");
     Atom horz = x11_atom("_NET_WM_STATE_MAXIMIZED_HORZ");
     Atom actual_type;
@@ -2420,7 +2485,7 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     unsigned long nitems = 0, bytes_after = 0;
     unsigned char *prop = NULL;
     int found_v = 0, found_h = 0;
-    if (XGetWindowProperty(g_display, g_x11_window, x11_atom("_NET_WM_STATE"),
+    if (XGetWindowProperty(g_display, xid, x11_atom("_NET_WM_STATE"),
                            0, 64, False, XA_ATOM, &actual_type, &actual_format,
                            &nitems, &bytes_after, &prop) == Success && prop) {
         Atom *states = (Atom *)prop;
@@ -2434,8 +2499,8 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
 }
 
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
-    (void)hwnd_val;
-    x11_wm_state(x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    x11_wm_state(xid, x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
     return 0;
 }
 
@@ -2448,28 +2513,44 @@ EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
 }
 
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (g_display && g_x11_window) {
+    if (!g_display) return 0;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    zan_lwin_t *w = lwin_find(xid);
+    if (w) {
+        if (w->backbuf) XFreePixmap(g_display, w->backbuf);
+        if (w->gc) XFreeGC(g_display, w->gc);
+        if (w->xic) XDestroyIC(w->xic);
+        XDestroyWindow(g_display, w->xid);
+        int idx = (int)(w - g_lwins);
+        g_lwins[idx] = g_lwins[--g_lwin_count];
+    }
+    if (xid == g_primary_win) {
+        /* Promote another window to primary so process-wide ops keep working. */
+        g_primary_win = g_lwin_count ? g_lwins[0].xid : 0;
+        g_x11_window = g_primary_win;
+        if (g_lwin_count) {
+            g_xic = g_lwins[0].xic;
+            g_win_w = g_lwins[0].w;
+            g_win_h = g_lwins[0].h;
+        } else {
+            g_xic = NULL;
+        }
+    }
+    if (g_lwin_count == 0) {
+        /* Last window gone: tear down shared resources. */
         for (int i = 0; i < 8; i++) {
             if (g_cursors_linux[i]) {
                 XFreeCursor(g_display, g_cursors_linux[i]);
                 g_cursors_linux[i] = 0;
             }
         }
-        if (g_backbuf) {
-            XFreePixmap(g_display, g_backbuf);
-            g_backbuf = 0; g_backbuf_w = 0; g_backbuf_h = 0;
-        }
-        if (g_xic) { XDestroyIC(g_xic); g_xic = NULL; }
         if (g_xim) { XCloseIM(g_xim); g_xim = NULL; }
-        XDestroyWindow(g_display, g_x11_window);
-        XFlush(g_display);
-        g_x11_window = 0;
         free(g_clip_text_linux);
         g_clip_text_linux = NULL;
         free(g_clip_read_linux);
         g_clip_read_linux = NULL;
     }
+    XFlush(g_display);
     return 0;
 }
 

@@ -417,6 +417,14 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         add_test(NAME runtime_gui_titlebar
           COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_titlebar_test>)
         set_tests_properties(runtime_gui_titlebar PROPERTIES TIMEOUT 20)
+
+        # Multi-window event routing also drives synthetic pointer events.
+        add_executable(zan_gui_multiwindow_test tests/runtime/gui_multiwindow_test.c)
+        target_link_libraries(zan_gui_multiwindow_test
+          PRIVATE zan_gui ${X11_LIBRARIES} ${X11_XTest_LIB})
+        add_test(NAME runtime_gui_multiwindow
+          COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_multiwindow_test>)
+        set_tests_properties(runtime_gui_multiwindow PROPERTIES TIMEOUT 20)
       endif()
     endif()
   endif()
