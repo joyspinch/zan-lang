@@ -102,6 +102,12 @@ class CodeEditor {
     List<int> errorLines;
     List<string> errorMsgs;
     int lastDiagLine;       // caret line at last CheckErrors run (-1 = never)
+    // Real compiler diagnostics from the last Run/Build, mapped onto this file.
+    // Kept separate from the heuristic ones and invalidated on the next edit
+    // (tracked by cErrStamp = buffer length when the diagnostics were set).
+    List<int> cErrLines;
+    List<string> cErrMsgs;
+    int cErrStamp;
 
     // ---- symbol index (accurate, using-aware completion) ----
     // Types (class/struct/enum) declared across the project's other files, and
@@ -209,6 +215,9 @@ class CodeEditor {
         e.errorLines = new List<int>();
         e.errorMsgs = new List<string>();
         e.lastDiagLine = -1;
+        e.cErrLines = new List<int>();
+        e.cErrMsgs = new List<string>();
+        e.cErrStamp = -1;
         e.projTypeNames = new List<string>();
         e.projTypeMembers = new List<string>();
         e.fixLines = new List<int>();
@@ -303,6 +312,45 @@ class CodeEditor {
         curLine = line;
         curCol = 0;
         selActive = false;
+    }
+
+    /// Total buffer size, used only as a cheap change signal for invalidating
+    /// compiler diagnostics when the user edits the file.
+    int BufLen() {
+        int n = 0;
+        int i = 0;
+        while (i < lines.Count) { n = n + lines[i].Length + 1; i = i + 1; }
+        return n;
+    }
+
+    /// Replaces the compiler diagnostics shown as red underlines + tooltips with
+    /// the real errors reported by the last Run/Build for this file, and jumps
+    /// the caret to the first one so its reason is visible immediately.
+    void SetCompilerDiagnostics(List<int> errLines, List<string> msgs) {
+        cErrLines = errLines;
+        cErrMsgs = msgs;
+        cErrStamp = BufLen();
+        if (cErrLines.Count > 0) {
+            GoToLine(cErrLines[0]);
+        }
+    }
+
+    /// True once the buffer has changed since the compiler diagnostics were set,
+    /// so stale errors stop being drawn the moment the user starts editing.
+    bool CompilerDiagStale() {
+        return cErrStamp < 0 || BufLen() != cErrStamp;
+    }
+
+    /// The compiler-diagnostic message for a line, or "" when none/stale.
+    string CompilerErrMsg(int ln) {
+        if (CompilerDiagStale()) { return ""; }
+        return CodeEditor.GetErrorMsg(cErrLines, cErrMsgs, ln);
+    }
+
+    /// True when line `ln` currently carries a live compiler diagnostic.
+    bool HasCompilerErr(int ln) {
+        if (CompilerDiagStale()) { return false; }
+        return CodeEditor.HasInt(cErrLines, ln);
     }
 
     void GoToLineCol(int line, int col) {
@@ -1176,7 +1224,11 @@ class CodeEditor {
                             if (CodeEditor.InSet(joinSet, nxt.Substring(0, 1))) { needsSemi = false; }
                         }
                     }
-                    if (needsSemi) {
+                    // The generic "missing semicolon" guess produced too many
+                    // false positives (multi-line calls, attributes, generics);
+                    // real, accurate diagnostics now come from the compiler after
+                    // Run/Build, so this heuristic is intentionally dropped.
+                    if (false && needsSemi) {
                         errorLines.Add(li);
                         errorMsgs.Add("Missing ';' (or incomplete statement)");
                     }
@@ -3402,8 +3454,12 @@ class CodeEditor {
                         curLine, curCol, ln, text, textX, rowY, lineH, fontSize, area);
                 }
 
-                // Error indicator (red underline)
-                if (CodeEditor.HasInt(errorLines, ln)) {
+                // Error indicator (red underline). Real compiler errors take
+                // priority and are drawn a touch bolder than the heuristic ones.
+                if (HasCompilerErr(ln)) {
+                    c.FillRect(textX, rowY + lineH - app.Scale(2),
+                        Canvas.MeasureText(text, fontSize), app.Scale(2), 0xFFFF4444);
+                } else if (CodeEditor.HasInt(errorLines, ln)) {
                     c.FillRect(textX, rowY + lineH - app.Scale(2),
                         Canvas.MeasureText(text, fontSize), app.Scale(2), 0xAAFF4444);
                 }
@@ -3455,9 +3511,11 @@ class CodeEditor {
                     }
                 }
 
-                // Show error tooltip on hovered error line
-                if (CodeEditor.HasInt(errorLines, ln) && ln == curLine) {
-                    string errMsg = CodeEditor.GetErrorMsg(errorLines, errorMsgs, ln);
+                // Show the error reason for the caret line. Compiler diagnostics
+                // win over the heuristic guess when both are present.
+                if ((HasCompilerErr(ln) || CodeEditor.HasInt(errorLines, ln)) && ln == curLine) {
+                    string errMsg = CompilerErrMsg(ln);
+                    if (errMsg.Length == 0) { errMsg = CodeEditor.GetErrorMsg(errorLines, errorMsgs, ln); }
                     if (errMsg.Length > 0) {
                         int ttW = Canvas.MeasureText(errMsg, fontSize) + app.Scale(12);
                         int ttH = lineH;
@@ -3497,6 +3555,17 @@ class CodeEditor {
                     c.FillRect(stripX + app.Scale(2), my, stripW - app.Scale(4), app.Scale(3), 0xFFFF4444);
                 }
                 mi = mi + 1;
+            }
+            if (!CompilerDiagStale()) {
+                int ci2 = 0;
+                while (ci2 < cErrLines.Count) {
+                    int el2 = cErrLines[ci2];
+                    if (el2 >= 0 && el2 < lines.Count) {
+                        int my2 = area.y + el2 * area.height / total;
+                        c.FillRect(stripX + app.Scale(2), my2, stripW - app.Scale(4), app.Scale(3), 0xFFFF4444);
+                    }
+                    ci2 = ci2 + 1;
+                }
             }
         }
 

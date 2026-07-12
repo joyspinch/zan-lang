@@ -917,10 +917,10 @@ class IdeDemo {
                     rescan = true;
                 } else if (rc == 4) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                    IdeDemo.RunActive(tabPaths, activeTab, root, log);
+                    IdeDemo.RunActive(tabPaths, activeTab, root, log, editor);
                 } else if (rc == 5) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                    IdeDemo.BuildActive(tabPaths, activeTab, root, log);
+                    IdeDemo.BuildActive(tabPaths, activeTab, root, log, editor);
                 } else if (rc == 6) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     pubSel = IdeDemo.ReadProjectPlatforms(root);
@@ -2438,40 +2438,162 @@ class IdeDemo {
 
     // ---- toolchain ----
 
-    static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log) {
+    static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
         int a = active.Get();
-        string p = paths[a];
+        string activePath = paths[a];
+        string p = activePath;
         if (p == "") { log.Add("> Nothing to build (save the file first)."); return; }
         if (IdeDemo.IsFormPath(p)) { p = IdeDemo.ProjectEntry(root); }
         string bd = IdeDemo.EnsureBuildDir(root);
         string ll = bd + "/.zanbuild.ll";
-        string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
+        string inputs = IdeDemo.SmartInputs(root, IdeDemo.DirOf(p), p);
         string cmd = IdeDemo.ZancCmd() + " --emit-ir " + inputs + " > \"" + ll + "\"";
         log.Add("> Building " + p + " ...");
         List<string> outp = Process.RunCapture(cmd);
         IdeDemo.AppendAll(log, outp);
+        IdeDemo.ApplyDiagnostics(editor, activePath, outp, log);
         if (outp.Count == 0) {
             log.Add("> Build succeeded. 0 errors, 0 warnings.");
         }
     }
 
-    static void RunActive(List<string> paths, SignalInt active, string root, List<string> log) {
+    static void RunActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
         int a = active.Get();
-        string p = paths[a];
+        string activePath = paths[a];
+        string p = activePath;
         if (p == "") { log.Add("> Nothing to run (save the file first)."); return; }
         if (IdeDemo.IsFormPath(p)) { p = IdeDemo.ProjectEntry(root); }
         string bd = IdeDemo.EnsureBuildDir(root);
         string ll = bd + "/.zanrun.ll";
         string exe = bd + "/.zanrun" + IdeDemo.ExeSuffix();
         string z = IdeDemo.ZancCmd();
-        string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
+        string inputs = IdeDemo.SmartInputs(root, IdeDemo.DirOf(p), p);
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root)
             + " && \"" + exe + "\"";
         log.Add("> Running " + p + " ...");
         List<string> outp = Process.RunCapture(cmd);
         IdeDemo.AppendAll(log, outp);
+        IdeDemo.ApplyDiagnostics(editor, activePath, outp, log);
         log.Add("> (run finished)");
+    }
+
+    /// Compiler inputs for Run/Build. Inside a project (a zan.proj at the root or
+    /// beside the file) all sibling .zan files are compiled together; a loose
+    /// single file is compiled on its own so unrelated scratch files in the same
+    /// folder don't clash (e.g. two Main methods).
+    static string SmartInputs(string root, string dir, string entry) {
+        bool proj = File.Exists(root + "/zan.proj") || File.Exists(dir + "/zan.proj");
+        if (proj) { return IdeDemo.ProjectInputs(dir, entry, ""); }
+        return "\"" + entry + "\"";
+    }
+
+    /// First index of `needle` in `hay`, or -1.
+    static int IndexOfStr(string hay, string needle) {
+        int n = needle.Length;
+        int h = hay.Length;
+        if (n == 0) { return 0; }
+        int i = 0;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Last index of `needle` in `hay`, or -1.
+    static int LastIndexOfStr(string hay, string needle) {
+        int n = needle.Length;
+        int h = hay.Length;
+        if (n == 0) { return h; }
+        int i = h - n;
+        while (i >= 0) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i - 1;
+        }
+        return -1;
+    }
+
+    /// Numeric value of a single-character digit string, or -1.
+    static int DigitVal(string ch) {
+        return IdeDemo.IndexOfStr("0123456789", ch);
+    }
+
+    /// Parses a leading run of digits into an int, or -1 when there are none.
+    static int ParseLeadInt(string s) {
+        int v = 0;
+        int i = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int d = IdeDemo.DigitVal(s.Substring(i, 1));
+            if (d < 0) { break; }
+            v = v * 10 + d;
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return -1; }
+        return v;
+    }
+
+    /// Strips ANSI SGR escape sequences (ESC [ ... m) from compiler output so the
+    /// text can be matched and shown cleanly.
+    static string StripAnsi(string s) {
+        string esc = Text.ByteChar(27);
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == esc) {
+                i = i + 1;
+                while (i < s.Length && s.Substring(i, 1) != "m") { i = i + 1; }
+                if (i < s.Length) { i = i + 1; }
+            } else {
+                outp = outp + ch;
+                i = i + 1;
+            }
+        }
+        return outp;
+    }
+
+    /// Parses compiler output lines of the form `<path>:<line>:<col>: error: <msg>`
+    /// that refer to the active file, and pushes them onto the editor as real
+    /// diagnostics (red underline + reason tooltip), jumping to the first error.
+    static void ApplyDiagnostics(CodeEditor editor, string activePath, List<string> output, List<string> log) {
+        List<int> dl = new List<int>();
+        List<string> dm = new List<string>();
+        bool isZan = activePath.Length > 4
+            && activePath.Substring(activePath.Length - 4, 4) == ".zan";
+        if (isZan) {
+            string baseName = Path.GetFileName(activePath);
+            int oi = 0;
+            while (oi < output.Count) {
+                string raw = IdeDemo.StripAnsi(output[oi]);
+                int ep = IdeDemo.IndexOfStr(raw, ": error:");
+                if (ep > 0) {
+                    string loc = raw.Substring(0, ep);
+                    if (IdeDemo.IndexOfStr(loc, baseName) >= 0) {
+                        int c2 = IdeDemo.LastIndexOfStr(loc, ":");
+                        if (c2 > 0) {
+                            int c1 = IdeDemo.LastIndexOfStr(loc.Substring(0, c2), ":");
+                            if (c1 >= 0) {
+                                string lineStr = loc.Substring(c1 + 1, c2 - (c1 + 1));
+                                int lineNo = IdeDemo.ParseLeadInt(lineStr);
+                                if (lineNo > 0) {
+                                    string msg = raw.Substring(ep + 8, raw.Length - (ep + 8));
+                                    dl.Add(lineNo - 1);
+                                    dm.Add(IdeDemo.TrimLeadSpaces(msg));
+                                }
+                            }
+                        }
+                    }
+                }
+                oi = oi + 1;
+            }
+        }
+        editor.SetCompilerDiagnostics(dl, dm);
+        if (dl.Count > 0) {
+            log.Add("> " + Convert.ToString(dl.Count) + " error(s) in this file; jumped to the first.");
+        }
     }
 
     /// Hot reload: rebuild the active file and (re)launch it detached, killing
@@ -2494,7 +2616,7 @@ class IdeDemo {
         Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
         #endif
         string z = IdeDemo.ZancCmd();
-        string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
+        string inputs = IdeDemo.SmartInputs(root, IdeDemo.DirOf(p), p);
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root);
         log.Add("> [Hot] Rebuilding ...");
