@@ -1044,10 +1044,10 @@ int main(int argc, char **argv) {
 #ifdef ZAN_RT_SYNC_OBJ
         if (irgen.uses_sync_runtime) rt_sync_obj = ZAN_RT_SYNC_OBJ;
 #endif
-        if (cross_compiling && rt_sync_obj) {
+        if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX) {
             fprintf(stderr,
                     "error: AtomicInt and SharedTable are not available for "
-                    "cross-compilation targets yet\n");
+                    "this cross-compilation target yet\n");
             remove(obj_tmp);
             zan_irgen_destroy(&irgen);
             zan_arena_free(arena);
@@ -1169,6 +1169,12 @@ int main(int argc, char **argv) {
             if (irgen.uses_socket_async) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+            }
+            if (irgen.uses_sync_runtime) {
+                /* atomics / shared-table runtime; its pthread, flock and shm
+                 * symbols resolve from the static musl libc.a below. */
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
             }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
