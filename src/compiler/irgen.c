@@ -3938,7 +3938,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 g->fn_strcpy, strcpy_args, 2, "");
             /* strcat(buf, "/") */
-            LLVMValueRef sep = LLVMBuildGlobalStringPtr(g->builder, "/", "sep");
+            LLVMValueRef sep = LLVMBuildGlobalStringPtr(g->builder, g->target_is_windows ? "\\" : "/", "sep");
             LLVMValueRef cat1_args[] = { buf, sep };
             LLVMBuildCall2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
@@ -4188,23 +4188,48 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-            /* Use GetFileAttributesA on Windows, stat on POSIX */
-            LLVMValueRef gfa_fn = LLVMGetNamedFunction(g->mod, "GetFileAttributesA");
-            if (!gfa_fn) {
-                LLVMTypeRef gfa_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                gfa_fn = LLVMAddFunction(g->mod, "GetFileAttributesA", gfa_type);
+            /* Windows: GetFileAttributesA & FILE_ATTRIBUTE_DIRECTORY. POSIX: opendir!=NULL. */
+            LLVMValueRef result;
+            if (g->target_is_windows) {
+                LLVMValueRef gfa_fn = LLVMGetNamedFunction(g->mod, "GetFileAttributesA");
+                if (!gfa_fn) {
+                    LLVMTypeRef gfa_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                    gfa_fn = LLVMAddFunction(g->mod, "GetFileAttributesA", gfa_type);
+                }
+                LLVMValueRef attrs = LLVMBuildCall2(g->builder,
+                    LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                    gfa_fn, &path_arg, 1, "attrs");
+                LLVMValueRef not_invalid = LLVMBuildICmp(g->builder, LLVMIntNE, attrs,
+                    LLVMConstInt(i32, 0xFFFFFFFF, 0), "noinv");
+                LLVMValueRef is_dir = LLVMBuildAnd(g->builder, attrs,
+                    LLVMConstInt(i32, 0x10, 0), "isdir");
+                LLVMValueRef is_dir_bool = LLVMBuildICmp(g->builder, LLVMIntNE, is_dir,
+                    LLVMConstInt(i32, 0, 0), "isdirb");
+                result = LLVMBuildAnd(g->builder, not_invalid, is_dir_bool, "dexist");
+            } else {
+                LLVMValueRef opendir_fn = LLVMGetNamedFunction(g->mod, "opendir");
+                if (!opendir_fn) {
+                    LLVMTypeRef ft = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                    opendir_fn = LLVMAddFunction(g->mod, "opendir", ft);
+                }
+                LLVMValueRef dirp = LLVMBuildCall2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                    opendir_fn, &path_arg, 1, "dirp");
+                result = LLVMBuildICmp(g->builder, LLVMIntNE, dirp, LLVMConstNull(i8ptr), "dopen");
+                LLVMValueRef closedir_fn = LLVMGetNamedFunction(g->mod, "closedir");
+                if (!closedir_fn) {
+                    LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                    closedir_fn = LLVMAddFunction(g->mod, "closedir", ft);
+                }
+                LLVMBasicBlockRef cl_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "de.close");
+                LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "de.end");
+                LLVMBuildCondBr(g->builder, result, cl_bb, end_bb);
+                LLVMPositionBuilderAtEnd(g->builder, cl_bb);
+                LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                    closedir_fn, &dirp, 1, "");
+                LLVMBuildBr(g->builder, end_bb);
+                LLVMPositionBuilderAtEnd(g->builder, end_bb);
             }
-            LLVMValueRef attrs = LLVMBuildCall2(g->builder,
-                LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-                gfa_fn, &path_arg, 1, "attrs");
-            /* INVALID_FILE_ATTRIBUTES = -1, FILE_ATTRIBUTE_DIRECTORY = 0x10 */
-            LLVMValueRef not_invalid = LLVMBuildICmp(g->builder, LLVMIntNE, attrs,
-                LLVMConstInt(i32, 0xFFFFFFFF, 0), "noinv");
-            LLVMValueRef is_dir = LLVMBuildAnd(g->builder, attrs,
-                LLVMConstInt(i32, 0x10, 0), "isdir");
-            LLVMValueRef is_dir_bool = LLVMBuildICmp(g->builder, LLVMIntNE, is_dir,
-                LLVMConstInt(i32, 0, 0), "isdirb");
-            LLVMValueRef result = LLVMBuildAnd(g->builder, not_invalid, is_dir_bool, "dexist");
             emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMBuildZExt(g->builder, result, i64, "dex");
         }
@@ -4214,13 +4239,24 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-            LLVMValueRef mkdir_fn = LLVMGetNamedFunction(g->mod, "_mkdir");
-            if (!mkdir_fn) {
-                LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                mkdir_fn = LLVMAddFunction(g->mod, "_mkdir", ft);
+            if (g->target_is_windows) {
+                LLVMValueRef mkdir_fn = LLVMGetNamedFunction(g->mod, "_mkdir");
+                if (!mkdir_fn) {
+                    LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                    mkdir_fn = LLVMAddFunction(g->mod, "_mkdir", ft);
+                }
+                LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                    mkdir_fn, &path_arg, 1, "");
+            } else {
+                LLVMValueRef mkdir_fn = LLVMGetNamedFunction(g->mod, "mkdir");
+                if (!mkdir_fn) {
+                    LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0);
+                    mkdir_fn = LLVMAddFunction(g->mod, "mkdir", ft);
+                }
+                LLVMValueRef margs[] = { path_arg, LLVMConstInt(i32, 0777, 0) };
+                LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0),
+                    mkdir_fn, margs, 2, "");
             }
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-                mkdir_fn, &path_arg, 1, "");
             emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMConstInt(i32, 0, 0);
         }
@@ -4230,10 +4266,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-            LLVMValueRef rmdir_fn = LLVMGetNamedFunction(g->mod, "_rmdir");
+            const char *rmname = g->target_is_windows ? "_rmdir" : "rmdir";
+            LLVMValueRef rmdir_fn = LLVMGetNamedFunction(g->mod, rmname);
             if (!rmdir_fn) {
                 LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                rmdir_fn = LLVMAddFunction(g->mod, "_rmdir", ft);
+                rmdir_fn = LLVMAddFunction(g->mod, rmname, ft);
             }
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 rmdir_fn, &path_arg, 1, "");
@@ -4247,10 +4284,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 4096, 0));
-            LLVMValueRef getcwd_fn = LLVMGetNamedFunction(g->mod, "_getcwd");
+            const char *cwdname = g->target_is_windows ? "_getcwd" : "getcwd";
+            LLVMValueRef getcwd_fn = LLVMGetNamedFunction(g->mod, cwdname);
             if (!getcwd_fn) {
                 LLVMTypeRef ft = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0);
-                getcwd_fn = LLVMAddFunction(g->mod, "_getcwd", ft);
+                getcwd_fn = LLVMAddFunction(g->mod, cwdname, ft);
             }
             LLVMValueRef cwd_args[] = { buf, LLVMConstInt(i32, 4096, 0) };
             LLVMBuildCall2(g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0),
@@ -4263,10 +4301,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-            LLVMValueRef chdir_fn = LLVMGetNamedFunction(g->mod, "_chdir");
+            const char *chname = g->target_is_windows ? "_chdir" : "chdir";
+            LLVMValueRef chdir_fn = LLVMGetNamedFunction(g->mod, chname);
             if (!chdir_fn) {
                 LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                chdir_fn = LLVMAddFunction(g->mod, "_chdir", ft);
+                chdir_fn = LLVMAddFunction(g->mod, chname, ft);
             }
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                 chdir_fn, &path_arg, 1, "");
@@ -4343,14 +4382,32 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 260, 0));
-            LLVMValueRef gtp_fn = LLVMGetNamedFunction(g->mod, "GetTempPathA");
-            if (!gtp_fn) {
-                LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i32, i8ptr }, 2, 0);
-                gtp_fn = LLVMAddFunction(g->mod, "GetTempPathA", ft);
+            if (g->target_is_windows) {
+                LLVMValueRef gtp_fn = LLVMGetNamedFunction(g->mod, "GetTempPathA");
+                if (!gtp_fn) {
+                    LLVMTypeRef ft = LLVMFunctionType(i32, (LLVMTypeRef[]){ i32, i8ptr }, 2, 0);
+                    gtp_fn = LLVMAddFunction(g->mod, "GetTempPathA", ft);
+                }
+                LLVMValueRef gtp_args[] = { LLVMConstInt(i32, 260, 0), buf };
+                LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i32, i8ptr }, 2, 0),
+                    gtp_fn, gtp_args, 2, "");
+            } else {
+                LLVMValueRef getenv_fn = LLVMGetNamedFunction(g->mod, "getenv");
+                if (!getenv_fn) {
+                    LLVMTypeRef ft = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                    getenv_fn = LLVMAddFunction(g->mod, "getenv", ft);
+                }
+                LLVMValueRef key = LLVMBuildGlobalStringPtr(g->builder, "TMPDIR", "tmpdir_k");
+                LLVMValueRef env = LLVMBuildCall2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                    getenv_fn, &key, 1, "tmpenv");
+                LLVMValueRef isnull = LLVMBuildICmp(g->builder, LLVMIntEQ, env, LLVMConstNull(i8ptr), "tnull");
+                LLVMValueRef deflt = LLVMBuildGlobalStringPtr(g->builder, "/tmp/", "tmpdef");
+                LLVMValueRef src = LLVMBuildSelect(g->builder, isnull, deflt, env, "tmpsrc");
+                LLVMValueRef cpy_args[] = { buf, src };
+                LLVMBuildCall2(g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
+                    g->fn_strcpy, cpy_args, 2, "");
             }
-            LLVMValueRef gtp_args[] = { LLVMConstInt(i32, 260, 0), buf };
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i32, i8ptr }, 2, 0),
-                gtp_fn, gtp_args, 2, "");
             return buf;
         }
 
