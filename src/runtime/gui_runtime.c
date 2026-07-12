@@ -2701,6 +2701,11 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
+#endif
+
+/* write_file is portable across every non-Win32 backend (X11, Cocoa and the
+ * no-op fallback all need it), so it lives outside the CSD-metrics guard. */
+#if !defined(_WIN32)
 EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     FILE *f = fopen(path, "wb");
     if (!f) return 1;
