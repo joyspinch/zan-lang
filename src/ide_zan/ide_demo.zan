@@ -41,16 +41,37 @@ class Tpl {
 ///   * Save writes to disk; Build/Run/Publish invoke zanc (+clang) via Process
 ///     and stream output to the Output panel.
 class IdeDemo {
+    #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
     static extern int WinGetModuleFileName(int hModule, string buf, int size);
+    #elif MACOS
+    // _NSGetExecutablePath(char* buf, uint32_t* bufsize): fills buf with the
+    // executable path; bufsize points to a 4-byte little-endian capacity.
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    static extern int MacGetExecutablePath(string buf, string bufsize);
+    #else
+    // Linux exposes the running executable via the /proc/self/exe symlink.
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern int LinuxReadlink(string path, string buf, int bufsize);
+    #endif
 
     [DllImport("crt")]
     static extern string calloc(int count, int size);
 
-    /// Full path of the running IDE executable (e.g. ...\build\ide_demo.exe).
+    /// Full path of the running IDE executable. Platform-specific: Win32
+    /// GetModuleFileNameA, macOS _NSGetExecutablePath, Linux /proc/self/exe.
+    /// The buffer is calloc-zeroed so the returned path stays NUL-terminated.
     static string ExePath() {
         string buf = calloc(4096, 1);
+        #if WINDOWS
         WinGetModuleFileName(0, buf, 4096);
+        #elif MACOS
+        string cap = calloc(4, 1);
+        cap[1] = 16;
+        MacGetExecutablePath(buf, cap);
+        #else
+        LinuxReadlink("/proc/self/exe", buf, 4096);
+        #endif
         return buf;
     }
 
@@ -70,13 +91,25 @@ class IdeDemo {
         return p.Substring(0, cut);
     }
 
-    /// Resolve zanc.exe next to the IDE (so its auto-stdlib lookup finds the
-    /// stdlib shipped alongside the IDE). Falls back to the dev build path.
+    /// Executable file suffix for produced binaries: ".exe" on Windows, none
+    /// on POSIX (where the extension is irrelevant and conventionally absent).
+    #if WINDOWS
+    static string ExeSuffix() { return ".exe"; }
+    #else
+    static string ExeSuffix() { return ""; }
+    #endif
+
+    /// Basename of the Zan compiler shipped next to the IDE.
+    static string ZancName() { return "zanc" + IdeDemo.ExeSuffix(); }
+
+    /// Resolve the Zan compiler next to the IDE (so its auto-stdlib lookup
+    /// finds the stdlib shipped alongside the IDE). Falls back to the bare
+    /// name so the shell resolves it via PATH -- no hard-coded absolute path.
     static string Zanc() {
         string dir = IdeDemo.ExeDir();
-        string cand = dir + "/zanc.exe";
+        string cand = dir + "/" + IdeDemo.ZancName();
         if (File.Exists(cand)) { return cand; }
-        return "d:/project/zan-lang/build/zanc.exe";
+        return IdeDemo.ZancName();
     }
 
     static void Main() {
@@ -90,7 +123,7 @@ class IdeDemo {
         int savedW = cfgW;
         int savedH = cfgH;
 
-        string root = "d:/project/zan-lang/build/ide_workspace";
+        string root = IdeDemo.ExeDir() + "/ide_workspace";
         IdeDemo.EnsureWorkspace(root);
 
         List<TreeNode> tree = IdeDemo.ScanTree(root);
@@ -1196,8 +1229,7 @@ class IdeDemo {
                                 }
                             } else if (lbl == "Reveal in Explorer") {
                                 if (ctxTarget >= 0 && ctxTarget < tree.Count) {
-                                    string wp = IdeDemo.ToWinPath(tree[ctxTarget].path);
-                                    Process.Run("explorer /select,\"" + wp + "\"");
+                                    IdeDemo.RevealInFileManager(tree[ctxTarget].path);
                                 }
                             }
                         } else if (ctxKind == 3) {
@@ -1396,6 +1428,18 @@ class IdeDemo {
             return 0 - 2;
         }
         return 0 - 1;
+    }
+
+    /// Reveals a path in the OS file manager: Explorer (Windows), Finder via
+    /// `open -R` (macOS), or the containing directory via `xdg-open` (Linux).
+    static void RevealInFileManager(string path) {
+        #if WINDOWS
+        Process.Run("explorer /select,\"" + IdeDemo.ToWinPath(path) + "\"");
+        #elif MACOS
+        Process.Run("open -R \"" + path + "\"");
+        #else
+        Process.Run("xdg-open \"" + IdeDemo.DirOf(path) + "\"");
+        #endif
     }
 
     /// Converts forward slashes to Windows backslashes (for explorer.exe).
@@ -1849,7 +1893,7 @@ class IdeDemo {
         string p = paths[a];
         if (p == "") { log.Add("> Nothing to run (save the file first)."); return; }
         string ll = root + "/.zanrun.ll";
-        string exe = root + "/.zanrun.exe";
+        string exe = root + "/.zanrun" + IdeDemo.ExeSuffix();
         string z = "\"" + IdeDemo.Zanc() + "\"";
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
@@ -1869,10 +1913,15 @@ class IdeDemo {
         string p = paths[a];
         if (p == "" || p == "@start") { log.Add("> [Hot] Nothing to run (save the file first)."); return; }
         string ll = root + "/.zanhot.ll";
-        string exe = root + "/zanhot_run.exe";
+        string exe = root + "/zanhot_run" + IdeDemo.ExeSuffix();
         // Stop the previous hot instance so the exe can be overwritten.
+        #if WINDOWS
         Process.Run("taskkill /F /IM zanhot_run.exe >nul 2>nul");
         Process.Run("cmd /c del /f /q \"" + exe + "\" >nul 2>nul");
+        #else
+        Process.Run("pkill -f zanhot_run >/dev/null 2>&1");
+        Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
+        #endif
         string z = "\"" + IdeDemo.Zanc() + "\"";
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
@@ -1882,7 +1931,11 @@ class IdeDemo {
         IdeDemo.AppendAll(log, outp);
         if (File.Exists(exe)) {
             // Launch detached so the IDE stays responsive.
+            #if WINDOWS
             Process.Run("cmd /c start \"\" \"" + exe + "\"");
+            #else
+            Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
+            #endif
             log.Add("> [Hot] Reloaded -> restarted app.");
         } else {
             log.Add("> [Hot] Build failed; app not restarted.");
@@ -2658,7 +2711,7 @@ class IdeDemo {
     // Settings persistence (window + panel sizes)
     // ================================================================
 
-    static string CfgPath() { return "d:/project/zan-lang/build/ide_workspace/.zanide.cfg"; }
+    static string CfgPath() { return IdeDemo.ExeDir() + "/ide_workspace/.zanide.cfg"; }
 
     static bool IsDigit(string ch) {
         return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
@@ -2863,7 +2916,7 @@ class IdeDemo {
             return console;
         }
         string ll = root + "/.zandbg.ll";
-        string exe = root + "/.zandbg.exe";
+        string exe = root + "/.zandbg" + IdeDemo.ExeSuffix();
         string z = IdeDemo.Zanc();
         string buildCmd = "\"" + z + "\" --emit-ir \"" + p + "\" > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\"";
@@ -3149,7 +3202,7 @@ class IdeDemo {
 
         string probe = root + "/.zandbg_probe.zan";
         string ll = root + "/.zandbg.ll";
-        string exe = root + "/.zandbg.exe";
+        string exe = root + "/.zandbg" + IdeDemo.ExeSuffix();
         string gatherDir = root;
         if (curPath.Length > 0) { gatherDir = IdeDemo.DirOf(curPath); }
 
@@ -3174,7 +3227,11 @@ class IdeDemo {
                 lj = lj + 1;
             }
             File.WriteAllText(probe, instr);
+            #if WINDOWS
             Process.Run("cmd /c del /f /q \"" + exe + "\" >nul 2>nul");
+            #else
+            Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
+            #endif
             string z = IdeDemo.Zanc();
             string inputs = IdeDemo.ProjectInputs(gatherDir, probe, curPath);
             string buildCmd = "\"" + z + "\" --emit-ir " + inputs + " > \"" + ll + "\""
