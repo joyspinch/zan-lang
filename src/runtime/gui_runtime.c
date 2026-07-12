@@ -1209,6 +1209,16 @@ static XIC g_xic = NULL;
 static Pixmap g_backbuf = 0;
 static int g_backbuf_w = 0, g_backbuf_h = 0;
 
+/* Client-side decoration metrics for the borderless window with an app-drawn
+ * title bar, mirroring the Win32 backend. */
+static int g_scale_linux = 100;
+static int g_titlebar_h_l = 32;
+static int g_btn_w_l = 46;
+static int g_caption_btn_count_l = 5;
+
+i64 zan_gui_get_dpi_scale(void);
+i64 zan_gui_is_maximized(i64 hwnd_val);
+
 /* Decoded-event queue: a single XEvent can yield several ABI events (a key
  * press -> keyDown + textInput; a wheel button -> scroll), so decoded events
  * are buffered and drained one per poll/wait call, mirroring the Win32 message
@@ -1311,6 +1321,80 @@ static void x11_wm_state(Atom state1, Atom state2, long action) {
     XFlush(g_display);
 }
 
+/* _NET_WM_MOVERESIZE directions. */
+#define ZAN_NWMR_TOPLEFT     0
+#define ZAN_NWMR_TOP         1
+#define ZAN_NWMR_TOPRIGHT    2
+#define ZAN_NWMR_RIGHT       3
+#define ZAN_NWMR_BOTTOMRIGHT 4
+#define ZAN_NWMR_BOTTOM      5
+#define ZAN_NWMR_BOTTOMLEFT  6
+#define ZAN_NWMR_LEFT        7
+#define ZAN_NWMR_MOVE        8
+
+/* Remove window-manager decorations via the Motif hint so the app can draw its
+ * own title bar (matching the Win32 borderless window). */
+static void x11_set_borderless(void) {
+    if (!g_display || !g_x11_window) return;
+    struct {
+        unsigned long flags, functions, decorations;
+        long input_mode;
+        unsigned long status;
+    } hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = (1L << 1); /* MWM_HINTS_DECORATIONS */
+    hints.decorations = 0;
+    Atom a = x11_atom("_MOTIF_WM_HINTS");
+    XChangeProperty(g_display, g_x11_window, a, a, 32, PropModeReplace,
+                    (unsigned char *)&hints, 5);
+}
+
+/* Ask the window manager to start an interactive move/resize, so the app-drawn
+ * caption and resize borders behave like real ones. */
+static void x11_start_moveresize(int x_root, int y_root, int direction) {
+    if (!g_display || !g_x11_window) return;
+    XUngrabPointer(g_display, CurrentTime);
+    XEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = ClientMessage;
+    xev.xclient.window = g_x11_window;
+    xev.xclient.message_type = x11_atom("_NET_WM_MOVERESIZE");
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = x_root;
+    xev.xclient.data.l[1] = y_root;
+    xev.xclient.data.l[2] = direction;
+    xev.xclient.data.l[3] = 1; /* button 1 */
+    xev.xclient.data.l[4] = 1; /* source indication: application */
+    XSendEvent(g_display, DefaultRootWindow(g_display), False,
+               SubstructureNotifyMask | SubstructureRedirectMask, &xev);
+    XFlush(g_display);
+}
+
+/* Map a left press to a move/resize direction, mirroring the Win32
+ * WM_NCHITTEST logic: 8px resize borders plus a draggable caption that excludes
+ * the caption-button cluster. Returns -1 for an ordinary client click. */
+static int x11_caption_hit(int x, int y) {
+    int w = g_win_w, h = g_win_h;
+    int capW = g_caption_btn_count_l * g_btn_w_l;
+    int inCaptionDrag = (y < g_titlebar_h_l && x < w - capW);
+    if (zan_gui_is_maximized(0)) {
+        return inCaptionDrag ? ZAN_NWMR_MOVE : -1;
+    }
+    int b = 8 * g_scale_linux / 100;
+    if (b < 4) b = 4;
+    int left = x < b, right = x >= w - b, top = y < b, bottom = y >= h - b;
+    if (top && left) return ZAN_NWMR_TOPLEFT;
+    if (top && right) return ZAN_NWMR_TOPRIGHT;
+    if (bottom && left) return ZAN_NWMR_BOTTOMLEFT;
+    if (bottom && right) return ZAN_NWMR_BOTTOMRIGHT;
+    if (left) return ZAN_NWMR_LEFT;
+    if (right) return ZAN_NWMR_RIGHT;
+    if (top) return ZAN_NWMR_TOP;
+    if (bottom) return ZAN_NWMR_BOTTOM;
+    if (inCaptionDrag) return ZAN_NWMR_MOVE;
+    return -1;
+}
+
 /* Serve a clipboard paste request from another client (we own CLIPBOARD). */
 static void x11_serve_selection(XSelectionRequestEvent *req) {
     XSelectionEvent resp;
@@ -1358,6 +1442,17 @@ static void x11_translate_event(XEvent *ev) {
                            x11_mods(ev->xbutton.state));
         } else if (ev->xbutton.button == 6 || ev->xbutton.button == 7) {
             /* horizontal wheel: ignored */
+        } else if (ev->xbutton.button == 1) {
+            /* Honor the app-drawn caption and resize borders by delegating to
+             * the WM, mirroring Win32 WM_NCHITTEST. Presses over content or the
+             * caption buttons fall through as ordinary clicks. */
+            int dir = x11_caption_hit(ev->xbutton.x, ev->xbutton.y);
+            if (dir >= 0) {
+                x11_start_moveresize(ev->xbutton.x_root, ev->xbutton.y_root, dir);
+            } else {
+                evq_push_linux(2, ev->xbutton.x, ev->xbutton.y, 0, 0,
+                               x11_mods(ev->xbutton.state));
+            }
         } else {
             evq_push_linux(2, ev->xbutton.x, ev->xbutton.y,
                            (int)ev->xbutton.button - 1, 0,
@@ -1457,6 +1552,12 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
     g_gc = XCreateGC(g_display, g_x11_window, 0, NULL);
     g_win_w = (int)width;
     g_win_h = (int)height;
+
+    /* Borderless window with app-drawn title bar (matches the Win32 backend). */
+    g_scale_linux = (int)zan_gui_get_dpi_scale();
+    g_titlebar_h_l = 32 * g_scale_linux / 100;
+    g_btn_w_l = 46 * g_scale_linux / 100;
+    x11_set_borderless();
 
     return (i64)g_x11_window;
 }
@@ -2338,6 +2439,14 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     return 0;
 }
 
+/* ---- client-side title-bar metrics (borderless window) ---- */
+EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
+EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w_l; }
+EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+    if (count >= 0 && count <= 8) { g_caption_btn_count_l = (int)count; }
+    return 0;
+}
+
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     (void)hwnd_val;
     if (g_display && g_x11_window) {
@@ -2507,7 +2616,7 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
  * ========================================================================
  * Client-side-decoration metrics are a Win32 concept; on X11/macOS the window
  * manager owns the title bar, so these report 0. write_file is portable. */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__linux__)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }

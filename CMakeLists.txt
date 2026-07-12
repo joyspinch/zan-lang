@@ -408,6 +408,16 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       add_test(NAME runtime_gui_x11
         COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_x11_test>)
       set_tests_properties(runtime_gui_x11 PROPERTIES TIMEOUT 15)
+
+      # Borderless-window caption hit-testing needs synthetic pointer events.
+      if(X11_XTest_FOUND)
+        add_executable(zan_gui_titlebar_test tests/runtime/gui_titlebar_test.c)
+        target_link_libraries(zan_gui_titlebar_test
+          PRIVATE zan_gui ${X11_LIBRARIES} ${X11_XTest_LIB})
+        add_test(NAME runtime_gui_titlebar
+          COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_titlebar_test>)
+        set_tests_properties(runtime_gui_titlebar PROPERTIES TIMEOUT 20)
+      endif()
     endif()
   endif()
 
