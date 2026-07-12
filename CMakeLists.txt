@@ -177,6 +177,19 @@ if(EXISTS "${LINUX_MUSL_SYS}/libc.a")
         VERBATIM)
 endif()
 
+# ---- Native database drivers (publish-time bundling) ----
+# Stage the committed drivers tree (manifests + any per-target native driver
+# binaries under drivers/<target>/) next to zanc so `--publish` can resolve and
+# bundle them. Driver binaries themselves are gitignored (see drivers/.gitignore)
+# and dropped in by the developer/IDE; only the layout + manifests are tracked.
+if(EXISTS "${CMAKE_SOURCE_DIR}/drivers")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/drivers" $<TARGET_FILE_DIR:zanc>/drivers
+        COMMENT "Staging native database drivers next to zanc"
+        VERBATIM)
+endif()
+
 
 # ---- Language Server (M8) ----
 # Reuses the compiler front-end (no LLVM dependency) plus the intellisense

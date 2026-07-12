@@ -548,6 +548,45 @@ static const char *zan_dllimport_lname(const char *lib, int lib_len,
     return name;
 }
 
+/* Known third-party native DB drivers a published program must carry, unlike
+ * system libs (kernel32/msvcrt/libc/…) that already exist on every target.
+ * Names are normalized -l basenames (see zan_dllimport_lname). Extend this
+ * list as new native-backed stdlib modules are added. */
+static const char *const zan_known_drivers[] = { "pq", "sqlite3", NULL };
+
+static bool zan_is_driver(const char *lname, int len) {
+    for (int i = 0; zan_known_drivers[i]; i++)
+        if ((int)strlen(zan_known_drivers[i]) == len &&
+            memcmp(zan_known_drivers[i], lname, (size_t)len) == 0) return true;
+    return false;
+}
+
+/* Copy a file byte-for-byte (portable; no shell). Returns 0 on success. */
+static int zan_copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    char buf[65536]; size_t n; int rc = 0;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { rc = -1; break; }
+    }
+    fclose(in);
+    if (fclose(out) != 0) rc = -1;
+    return rc;
+}
+
+/* Per-target driver-bundle subdirectory under <zanc_dir>/drivers/. Matches the
+ * cross-compile toolchain naming so publishing for a target reads the drivers
+ * built for that target. */
+static const char *zan_driver_subdir(const zan_target_t *t) {
+    if (t->os == ZAN_OS_LINUX)
+        return (t->arch == ZAN_ARCH_AARCH64) ? "linux-arm64" : "linux-x64";
+    if (t->os == ZAN_OS_MACOS)
+        return (t->arch == ZAN_ARCH_AARCH64) ? "macos-arm64" : "macos-x64";
+    return "win-x64";
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Zan Compiler v0.1.0\n");
@@ -560,6 +599,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit\n");
         fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
         fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
+        fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
+        fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
+        fprintf(stderr, "  --driver-dir <d> Override the bundled native driver directory\n");
         fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
         fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
         fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
@@ -586,6 +628,8 @@ int main(int argc, char **argv) {
     const char *pp_defines[64];
     int pp_define_count = 0;
     const char *target_name = NULL; /* --target <name|triple>; NULL = host */
+    bool link_static_drivers = false; /* --link-mode static; default shared */
+    const char *driver_dir_override = NULL; /* --driver-dir */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -606,6 +650,13 @@ int main(int argc, char **argv) {
              * their ready queue across a thread pool (worker count from the
              * ZAN_CO_WORKERS env var at run time; default = CPU count). */
             mt_scheduler = true;
+        } else if (strcmp(argv[i], "--link-mode") == 0 && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "static") == 0) link_static_drivers = true;
+            else if (strcmp(m, "shared") == 0) link_static_drivers = false;
+            else { fprintf(stderr, "error: --link-mode must be 'static' or 'shared'\n"); return 1; }
+        } else if (strcmp(argv[i], "--driver-dir") == 0 && i + 1 < argc) {
+            driver_dir_override = argv[++i];
         } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
             target_name = argv[++i];
         } else if (strcmp(argv[i], "--list-targets") == 0) {
@@ -1019,6 +1070,61 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* ---- native database drivers ----------------------------------
+         * Third-party DB drivers (libpq, sqlite3) are NOT present on an
+         * arbitrary target, so a published program must carry them. They live
+         * bundled next to zanc at <zanc_dir>/drivers/<target-sub>/ (overridable
+         * with --driver-dir). That directory is added to the link search path
+         * so both dev builds and publishes resolve the driver, and on
+         * `--publish` (shared mode) the driver's runtime shared libraries are
+         * copied next to the produced executable. */
+        char driver_dir[1024] = {0};
+        const char *used_drivers[16]; int used_driver_count = 0;
+        int used_driver_len[16];
+        for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
+            int nlen;
+            const char *nm = zan_dllimport_lname(
+                irgen.extern_libs[li].str, (int)irgen.extern_libs[li].len, &nlen);
+            if (nm && zan_is_driver(nm, nlen)) {
+                used_drivers[used_driver_count] = nm;
+                used_driver_len[used_driver_count] = nlen;
+                used_driver_count++;
+            }
+        }
+        if (used_driver_count > 0) {
+            if (driver_dir_override) {
+                snprintf(driver_dir, sizeof(driver_dir), "%s", driver_dir_override);
+            } else {
+                char exe_dir2[1024] = {0};
+#ifdef _WIN32
+                GetModuleFileNameA(NULL, exe_dir2, sizeof(exe_dir2));
+                { char *s = strrchr(exe_dir2, '\\'); if (s) *s = '\0'; }
+#elif defined(__APPLE__)
+                { uint32_t sz = sizeof(exe_dir2);
+                  if (_NSGetExecutablePath(exe_dir2, &sz) != 0) exe_dir2[0] = '\0';
+                  char *s = strrchr(exe_dir2, '/'); if (s) *s = '\0'; }
+#else
+                { ssize_t n = readlink("/proc/self/exe", exe_dir2, sizeof(exe_dir2) - 1);
+                  if (n > 0) { exe_dir2[n] = '\0'; char *s = strrchr(exe_dir2, '/'); if (s) *s = '\0'; } }
+#endif
+                snprintf(driver_dir, sizeof(driver_dir), "%s/drivers/%s",
+                         exe_dir2, zan_driver_subdir(&target));
+            }
+            /* Add the driver dir to the link search path (link-time -l
+             * resolution) for every link branch below. Static linking reads
+             * the archives from the "static" subdir so shared import libs and
+             * static archives can coexist without ld ambiguity. */
+            char linkdir[1100];
+            if (link_static_drivers)
+                snprintf(linkdir, sizeof(linkdir), "%s/static", driver_dir);
+            else
+                snprintf(linkdir, sizeof(linkdir), "%s", driver_dir);
+            if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
+                snprintf(zan_lib_dirs[zan_lib_ndirs++], sizeof(zan_lib_dirs[0]),
+                         "%s", linkdir);
+            }
+        }
+
         if (cross_compiling && target.os == ZAN_OS_LINUX) {
             /* Self-contained cross-compile to Linux: static-link the ELF object
              * against a bundled musl sysroot with ld.lld. The result is a
@@ -1233,6 +1339,71 @@ int main(int argc, char **argv) {
             zan_arena_free(arena);
             free(source);
             return 1;
+        }
+
+        /* ---- bundle native driver runtime libraries (publish, shared) ----
+         * Copy each used driver's runtime shared libraries next to the produced
+         * executable so the published program runs without the driver being
+         * pre-installed on the target. The set of files per driver is taken
+         * from an optional manifest "<driver_dir>/<driver>.bundle" (one file
+         * name per line — lets a driver ship its own dependencies, e.g. libpq
+         * with the OpenSSL DLLs); absent a manifest, common default file names
+         * are tried. Static linking folds the driver into the exe, so nothing
+         * is copied there. */
+        if (publish_mode && !link_static_drivers && used_driver_count > 0 &&
+            driver_dir[0]) {
+            char outdir[1024];
+            snprintf(outdir, sizeof(outdir), "%s", obj_path);
+            { char *s1 = strrchr(outdir, '/'); char *s2 = strrchr(outdir, '\\');
+              char *s = (s1 > s2) ? s1 : s2;
+              if (s) *s = '\0'; else snprintf(outdir, sizeof(outdir), "."); }
+
+            bool win_target = (target.os == ZAN_OS_WINDOWS);
+            for (int d = 0; d < used_driver_count; d++) {
+                char drv[64];
+                snprintf(drv, sizeof(drv), "%.*s",
+                         used_driver_len[d], used_drivers[d]);
+
+                /* candidate runtime file names for this driver */
+                char cands[4][128]; int ncand = 0;
+                char manifest[1200];
+                snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);
+                FILE *mf = fopen(manifest, "rb");
+                if (mf) {
+                    char line[128];
+                    while (ncand < 4 && fgets(line, sizeof(line), mf)) {
+                        size_t l = strlen(line);
+                        while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'
+                                         || line[l-1] == ' ' || line[l-1] == '\t'))
+                            line[--l] = '\0';
+                        if (l > 0) snprintf(cands[ncand++], sizeof(cands[0]), "%s", line);
+                    }
+                    fclose(mf);
+                } else if (win_target) {
+                    snprintf(cands[ncand++], sizeof(cands[0]), "%s.dll", drv);
+                    snprintf(cands[ncand++], sizeof(cands[0]), "lib%s.dll", drv);
+                } else {
+                    snprintf(cands[ncand++], sizeof(cands[0]), "lib%s.so", drv);
+                }
+
+                int copied = 0;
+                for (int c = 0; c < ncand; c++) {
+                    char src[1300], dst[1300];
+                    snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
+                    snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
+                    if (zan_copy_file(src, dst) == 0) {
+                        printf("  bundled driver '%s' → %s\n", drv, cands[c]);
+                        copied++;
+                    }
+                }
+                if (copied == 0) {
+                    fprintf(stderr,
+                        "warning: driver '%s' was not bundled (no runtime library "
+                        "found in %s). The published program will require '%s' to "
+                        "be installed on the target, or add a %s/%s.bundle manifest.\n",
+                        drv, driver_dir, drv, driver_dir, drv);
+                }
+            }
         }
 
         if (input_count == 1) {
