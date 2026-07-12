@@ -104,6 +104,47 @@ static void add_stdlib_input(const char **files, int *count, const char *path) {
     }
 }
 
+/* Auto-include every *.zan file in stdlib_root/subdir (dedup + existence
+ * checked). Returns 1 if any new file was added. `subdir` uses '/' separators
+ * (accepted by the Win32 file APIs too). */
+static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
+                           const char **files, int *count) {
+    int before = *count;
+#ifdef _WIN32
+    char glob_path[1024];
+    snprintf(glob_path, sizeof(glob_path), "%s\\%s\\*.zan", stdlib_root, subdir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(glob_path, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            char mod_path[1024];
+            snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                     stdlib_root, subdir, fd.cFileName);
+            add_stdlib_input(files, count, mod_path);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    char dir_path[1024];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", stdlib_root, subdir);
+    DIR *d = opendir(dir_path);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            size_t nlen = strlen(ent->d_name);
+            if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
+            char mod_path[1024];
+            snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
+                     stdlib_root, subdir, ent->d_name);
+            add_stdlib_input(files, count, mod_path);
+        }
+        closedir(d);
+    }
+#endif
+    return *count != before;
+}
+
 /* ---- dump tokens ---- */
 
 static void dump_tokens(const char *source, size_t len, const char *filename) {
@@ -490,6 +531,23 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
 
 /* ---- main ---- */
 
+/* Map a [DllImport] name to its linker basename (the -l argument).
+ * Strips a leading "lib" so DllImport("libpq") and DllImport("pq") both
+ * resolve to libpq, and normalizes identically on every link path
+ * (bundled ld, clang fallback, Unix cc). Sets *out_len. Returns NULL for
+ * implicit CRT/libc/libm pseudo-libs that must not be emitted as -l. */
+static const char *zan_dllimport_lname(const char *lib, int lib_len,
+                                       int *out_len) {
+    if (lib_len == 3 && memcmp(lib, "crt", 3) == 0) return NULL;
+    if (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0) return NULL;
+    const char *name = lib;
+    int n = lib_len;
+    if (n > 3 && memcmp(name, "lib", 3) == 0) { name += 3; n -= 3; }
+    if (n == 1 && (name[0] == 'c' || name[0] == 'm')) return NULL;
+    *out_len = n;
+    return name;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Zan Compiler v0.1.0\n");
@@ -652,117 +710,61 @@ int main(int argc, char **argv) {
 #endif
         }
 
-        /* Scan all input files for 'using System.XXX' directives, then
-         * auto-include matching stdlib .zan files. */
-        static const struct { const char *using_ns; const char *subdir; const char *files[32]; } stdlib_map[] = {
-            {"System.IO",        "System/IO",        {"File.zan", "Path.zan", "Directory.zan", NULL}},
-            {"System.Text",      "System/Text",      {"Encoding.zan", NULL}},
-            {"System.Json",      "System/Json",      {"Json.zan", NULL}},
-            {"System.Threading", "System/Threading",  {"Threading.zan", NULL}},
-            {"System.Net.Sockets", "System/Net/Sockets", {"Socket.zan", "AsyncSocket.zan", "TcpListener.zan", "TcpClient.zan", "UdpClient.zan", NULL}},
-            {"System.Net.Http",  "System/Net/Http",  {"HttpRequest.zan", "HttpResponse.zan", "HttpServer.zan", "HttpClient.zan", NULL}},
-            {"System.Net.WebSocket", "System/Net/WebSocket", {"WebSocket.zan", NULL}},
-            {"System.Net.Mqtt",  "System/Net/Mqtt",  {"MqttClient.zan", NULL}},
-            {"System.Net",       "System/Net",        {"Net.zan", "Worker.zan", NULL}},
-            {"System.Data.Orm",  "System/Data/Orm",  {"Model.zan", "QueryBuilder.zan", NULL}},
-            {"System.Data.Sqlite",   "System/Data/Sqlite",   {"SqliteConnection.zan", NULL}},
-            {"System.Data.Postgres", "System/Data/Postgres", {"PgConnection.zan", NULL}},
-            {"System.Data",      "System/Data",      {"DbConnection.zan", "DbResult.zan", NULL}},
-            {"System.Diagnostics", "System/Diagnostics", {"Process.zan", NULL}},
-            {"Platform",         "Platform",          {"Runtime.zan", NULL}},
-            {"System.Windows.Forms", "System/Windows", {"Forms.zan", NULL}},
-            {"System.Drawing", "System/Drawing", {"Primitives.zan", "Graphics.zan", NULL}},
-            /* "*" = auto-include every .zan file in the subdir. The gui and
-             * widget catalogs grow over time and any component may reference
-             * any other, so glob the whole directory rather than tracking a
-             * hand-maintained (and previously incomplete) file list. */
-            {"Gui", "gui", {"*", NULL}},
-            {"Gui.Widget", "gui/widget", {"*", NULL}},
-            {NULL, NULL, {NULL}}
-        };
-        /* Resolve stdlib dependencies to a fixpoint: an included file (user
-         * source OR an already-pulled stdlib module) may itself `using` another
-         * stdlib namespace. Re-scan every included file and pull newly-needed
-         * modules until nothing more is added, so importing e.g.
-         * System.Net.WebSocket transitively pulls System.Text (Encoding). */
-        int ns_added[64] = {0};
+        /* Auto-include stdlib modules by PATH. Every `using X.Y.Z;` directive
+         * maps directly to the directory stdlib_root/X/Y/Z, and all *.zan files
+         * there are compiled in. There is deliberately NO hand-maintained
+         * namespace->file table: adding or extending a stdlib module is just
+         * dropping .zan files at the matching path, requiring no compiler change
+         * or rebuild. The stdlib directory layout therefore mirrors the
+         * namespace hierarchy 1:1 (e.g. `using Gui.Widget;` -> stdlib/Gui/Widget,
+         * `using System.Windows.Forms;` -> stdlib/System/Windows/Forms).
+         *
+         * Resolve to a fixpoint because a pulled-in module may itself `using`
+         * another namespace (e.g. System.Net.WebSocket -> System.Text), so
+         * re-scan every included file until nothing new is added. */
         int changed = 1;
         while (changed) {
             changed = 0;
-            /* collect which namespaces are used across all included files */
-            int ns_used[64] = {0};
             for (int fi = 0; fi < input_count; fi++) {
-                size_t slen2 = 0;
-                char *src2 = read_file(input_files[fi], &slen2);
-                if (!src2) continue;
-                for (int mi = 0; stdlib_map[mi].using_ns; mi++) {
-                    /* Match "using Namespace;" exactly, not as a substring of
-                       a longer namespace (e.g. System.Net should NOT match when
-                       the source only has "using System.Net.Sockets;"). */
-                    char needle[256];
-                    snprintf(needle, sizeof(needle), "using %s;", stdlib_map[mi].using_ns);
-                    if (strstr(src2, needle)) {
-                        ns_used[mi] = 1;
-                    }
-                }
-                free(src2);
-            }
-            /* add matching stdlib files not yet pulled */
-            for (int mi = 0; stdlib_map[mi].using_ns && mi < 64; mi++) {
-                if (!ns_used[mi] || ns_added[mi]) continue;
-                ns_added[mi] = 1;
-                changed = 1;
-                if (stdlib_map[mi].files[0] &&
-                    strcmp(stdlib_map[mi].files[0], "*") == 0) {
-                    /* Glob every .zan file in the namespace's subdir. */
-#ifdef _WIN32
-                    char glob_path[1024];
-                    snprintf(glob_path, sizeof(glob_path), "%s\\%s\\*.zan",
-                             stdlib_root, stdlib_map[mi].subdir);
-                    WIN32_FIND_DATAA fd;
-                    HANDLE h = FindFirstFileA(glob_path, &fd);
-                    if (h != INVALID_HANDLE_VALUE) {
-                        do {
-                            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                            char mod_path[1024];
-                            snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
-                                     stdlib_root, stdlib_map[mi].subdir, fd.cFileName);
-                            add_stdlib_input(input_files, &input_count, mod_path);
-                        } while (FindNextFileA(h, &fd));
-                        FindClose(h);
-                    }
-#else
-                    char dir_path[1024];
-                    snprintf(dir_path, sizeof(dir_path), "%s/%s",
-                             stdlib_root, stdlib_map[mi].subdir);
-                    DIR *d = opendir(dir_path);
-                    if (d) {
-                        struct dirent *ent;
-                        while ((ent = readdir(d)) != NULL) {
-                            size_t nlen = strlen(ent->d_name);
-                            if (nlen < 5 ||
-                                strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
-                            char mod_path[1024];
-                            snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
-                                     stdlib_root, stdlib_map[mi].subdir, ent->d_name);
-                            add_stdlib_input(input_files, &input_count, mod_path);
+                size_t slen3 = 0;
+                char *src3 = read_file(input_files[fi], &slen3);
+                if (!src3) continue;
+                const char *p = src3;
+                while ((p = strstr(p, "using ")) != NULL) {
+                    /* require the match to start a token (not e.g. "reusing ") */
+                    if (p != src3) {
+                        char prev = p[-1];
+                        if (prev != '\n' && prev != '\r' && prev != ' ' &&
+                            prev != '\t' && prev != ';' && prev != '{') {
+                            p += 6;
+                            continue;
                         }
-                        closedir(d);
                     }
-#endif
-                } else {
-                    for (int fi2 = 0; fi2 < 32 && stdlib_map[mi].files[fi2]; fi2++) {
-                        char mod_path[1024];
-#ifdef _WIN32
-                        snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
-                                 stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
-#else
-                        snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
-                                 stdlib_root, stdlib_map[mi].subdir, stdlib_map[mi].files[fi2]);
-#endif
-                        add_stdlib_input(input_files, &input_count, mod_path);
+                    p += 6;
+                    while (*p == ' ' || *p == '\t') p++;
+                    char subdir[512];
+                    int j = 0;
+                    while (j < 510) {
+                        char c = *p;
+                        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '_') {
+                            subdir[j++] = c;
+                        } else if (c == '.') {
+                            subdir[j++] = '/';
+                        } else {
+                            break;
+                        }
+                        p++;
+                    }
+                    subdir[j] = '\0';
+                    if (j > 0 && *p == ';') {
+                        if (glob_stdlib_dir(stdlib_root, subdir,
+                                            input_files, &input_count)) {
+                            changed = 1;
+                        }
                     }
                 }
+                free(src3);
             }
         }
     }
@@ -1122,12 +1124,12 @@ int main(int argc, char **argv) {
             /* extern [DllImport] libraries (skip those already in the CRT) */
             char libbufs[24][128]; int nb = 0;
             for (int li = 0; li < irgen.extern_lib_count && a < 68 && nb < 24; li++) {
-                const char *lib = irgen.extern_libs[li].str;
-                int lib_len = (int)irgen.extern_libs[li].len;
-                if (lib_len == 1 && (lib[0] == 'm' || lib[0] == 'c')) continue;
-                if (lib_len == 3 && memcmp(lib, "crt", 3) == 0) continue;
-                if (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0) continue;
-                snprintf(libbufs[nb], sizeof(libbufs[nb]), "-l%.*s", lib_len, lib);
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue;
+                snprintf(libbufs[nb], sizeof(libbufs[nb]), "-l%.*s", nlen, nm);
                 argv[a++] = libbufs[nb++];
             }
             argv[a++] = "--end-group";
@@ -1152,13 +1154,13 @@ int main(int argc, char **argv) {
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", zan_lib_dirs[di]);
             }
             for (int li = 0; li < irgen.extern_lib_count; li++) {
-                const char *lib = irgen.extern_libs[li].str;
-                int lib_len = (int)irgen.extern_libs[li].len;
-                if (lib_len == 1 && (lib[0] == 'm' || lib[0] == 'c')) continue;
-                if (lib_len == 3 && memcmp(lib, "crt", 3) == 0) continue;
-                if (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0) continue;
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue;
                 size_t cur = strlen(link_cmd);
-                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", lib_len, lib);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", nlen, nm);
             }
             link_ret = system(link_cmd);
         }
@@ -1204,25 +1206,17 @@ int main(int argc, char **argv) {
             const char *lib = irgen.extern_libs[li].str;
             int lib_len = (int)irgen.extern_libs[li].len;
             int skip = 0;
-            /* The Windows CRT pseudo-libs have no -l counterpart on Unix —
-             * mirror the CRT skip on the Windows link path instead of emitting
-             * a bogus -lcrt. */
-            if ((lib_len == 3 && memcmp(lib, "crt", 3) == 0) ||
-                (lib_len == 6 && memcmp(lib, "msvcrt", 6) == 0)) {
-                continue;
-            }
+            /* Windows-only system import libs have no -l counterpart on Unix. */
             for (int wi = 0; win_only_libs[wi]; wi++) {
                 if ((int)strlen(win_only_libs[wi]) == lib_len &&
                     memcmp(win_only_libs[wi], lib, lib_len) == 0) { skip = 1; break; }
             }
             if (skip) continue;
-            /* A [DllImport("libfoo")] names the shared object by its base name;
-             * on Unix `-l` re-adds the "lib" prefix, so strip a leading "lib"
-             * (DllImport("libc") -> -lc, "libpthread" -> -lpthread) to avoid a
-             * bogus -llibc. libc/libm are implicit (libm already via -lm). */
-            const char *name = lib; int name_len = lib_len;
-            if (name_len > 3 && memcmp(name, "lib", 3) == 0) { name += 3; name_len -= 3; }
-            if (name_len == 1 && (name[0] == 'c' || name[0] == 'm')) continue;
+            /* Shared normalization: strip a leading "lib", drop implicit
+             * CRT/libc/libm pseudo-libs (libm already via -lm). */
+            int name_len;
+            const char *name = zan_dllimport_lname(lib, lib_len, &name_len);
+            if (!name) continue;
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", name_len, name);
         }

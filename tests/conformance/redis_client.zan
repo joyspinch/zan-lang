@@ -1,0 +1,96 @@
+// Conformance: the coroutine-ized RESP client round-trips against an in-process
+// mock Redis server over the async IO reactor. The mock scripts a fixed RESP
+// reply per request (covering +simple, :integer, $bulk, $-1 nil and *array), so
+// the test is deterministic and needs no external redis-server. Exercises the
+// full path: non-blocking connect, RESP command encoding, and the incremental,
+// binary-safe reply parser.
+using System;
+using System.Net.Sockets;
+using System.Data.Redis;
+
+class Program {
+    static int PORT = 54341;
+    static int done = 0;
+    static bool serverReady = false;
+
+    // Mock Redis: for each client request, drain it then send the next scripted
+    // RESP reply. The client issues its commands in this exact order.
+    static async void MockServer(int listener) {
+        int client = await AsyncSocket.Accept(listener);
+        Socket.SetNonBlocking(client);
+
+        List<string> replies = new List<string>();
+        replies.Add("+PONG\r\n");                               // PING
+        replies.Add("+OK\r\n");                                 // SET name Alice
+        replies.Add("$5\r\nAlice\r\n");                         // GET name
+        replies.Add(":1\r\n");                                  // DEL name
+        replies.Add("$-1\r\n");                                 // GET name (nil)
+        replies.Add("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");        // LRANGE
+
+        int i = 0;
+        while (i < replies.Count) {
+            string _req = await AsyncSocket.Receive(client, 1024);
+            int _s = await AsyncSocket.SendString(client, replies[i]);
+            i = i + 1;
+        }
+        Socket.Close(client);
+    }
+
+    static async void RunClient() {
+        RedisClient r = await RedisClient.ConnectAsync("127.0.0.1", PORT);
+
+        bool pong = await r.PingAsync();
+        if (pong) { done = done + 1; }
+
+        bool setOk = await r.SetAsync("name", "Alice");
+        if (setOk) { done = done + 1; }
+
+        string v = await r.GetAsync("name");
+        if (v == "Alice") { done = done + 1; }
+
+        int deleted = await r.DelAsync("name");
+        if (deleted == 1) { done = done + 1; }
+
+        RedisReply missing = await r.GetReplyAsync("name");
+        if (missing.IsNil()) { done = done + 1; }
+
+        List<string> lr = new List<string>();
+        lr.Add("LRANGE");
+        lr.Add("mylist");
+        lr.Add("0");
+        lr.Add("-1");
+        RedisReply arr = await r.CommandAsync(lr);
+        if (arr.Count() == 2 && arr.At(0).AsString() == "foo" &&
+            arr.At(1).AsString() == "bar") {
+            done = done + 1;
+        }
+
+        r.Close();
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        int listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", PORT);
+        Socket.Listen(listener, 16);
+        Socket.SetNonBlocking(listener);
+
+        Task.Spawn(MockServer(listener));
+
+        // Run the client sequence in this (main) coroutine and await it to
+        // completion, so its reply objects are released deterministically at
+        // scope exit rather than lingering in a spawned frame at program exit.
+        await RunClient();
+
+        Console.WriteLine(done);
+        Socket.Close(listener);
+        Socket.Cleanup();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
