@@ -1,10 +1,11 @@
 $ErrorActionPreference = "Stop"
-Set-Location 'd:\project\zan-lang\build'
-$src = 'd:\project\zan-lang\examples\proc_test.zan'
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location (Join-Path $root 'build')
+$src = Join-Path $root 'examples\proc_test.zan'
 $deps = @(
-  'd:\project\zan-lang\stdlib\System\Diagnostics\Process.zan',
-  'd:\project\zan-lang\stdlib\System\IO\File.zan',
-  'd:\project\zan-lang\stdlib\System\IO\Directory.zan'
+  (Join-Path $root 'stdlib\System\Diagnostics\Process.zan'),
+  (Join-Path $root 'stdlib\System\IO\File.zan'),
+  (Join-Path $root 'stdlib\System\IO\Directory.zan')
 )
 $ir = & .\zanc.exe --emit-ir $src @deps
 if ($LASTEXITCODE -ne 0) { Write-Output "IR_FAILED"; $ir; exit 1 }

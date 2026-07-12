@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location 'd:\project\zan-lang'
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location $root
 
 Write-Output "[0/2] Rebuilding native GUI runtime (multi-window)..."
 clang -O2 -DZAN_GUI_STATIC -c src\runtime\gui_runtime.c -o build\zan_gui_static.obj

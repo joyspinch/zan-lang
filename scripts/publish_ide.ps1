@@ -21,9 +21,9 @@
 param([switch]$SkipBuild)
 
 $ErrorActionPreference = "Stop"
-Set-Location 'd:\project\zan-lang'
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location $root
 
-$root = (Get-Location).Path
 $dist = Join-Path $root 'dist'
 
 if (-not $SkipBuild) {

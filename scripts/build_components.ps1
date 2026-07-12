@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Stop"
-Set-Location 'd:\project\zan-lang'
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location $root
 $files = @()
 $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
 $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName

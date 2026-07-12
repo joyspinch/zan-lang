@@ -139,7 +139,9 @@ class IdeDemo {
     static string ProjectsHome() { return IdeDemo.HomeDir() + "/ZanProjects"; }
 
     /// Shipped (read-only) resource roots, laid out relative to the IDE exe:
-    ///   <ExeDir>/toolchain/zanc[.exe]   <ExeDir>/stdlib   (+ examples, templates)
+    ///   <ExeDir>/zanc[.exe]   <ExeDir>/stdlib   <ExeDir>/toolchain (linker)
+    /// This matches scripts/publish_ide.ps1: zanc sits next to the IDE and finds
+    /// its own linker under <ExeDir>/toolchain.
     static string ToolchainDir() { return IdeDemo.ExeDir() + "/toolchain"; }
     static string StdlibDir() { return IdeDemo.ExeDir() + "/stdlib"; }
 
@@ -151,11 +153,14 @@ class IdeDemo {
         return d;
     }
 
-    /// Resolve the Zan compiler under <ExeDir>/toolchain. Falls back to the bare
-    /// name so the shell resolves it via PATH -- no hard-coded absolute path.
+    /// Resolve the Zan compiler. In the published layout it sits next to the IDE
+    /// (<ExeDir>/zanc.exe); older/dev trees kept it under toolchain/, so check
+    /// that too. Falls back to the bare name (PATH) -- no hard-coded absolute path.
     static string Zanc() {
-        string cand = IdeDemo.ToolchainDir() + "/" + IdeDemo.ZancName();
+        string cand = IdeDemo.ExeDir() + "/" + IdeDemo.ZancName();
         if (File.Exists(cand)) { return cand; }
+        string legacy = IdeDemo.ToolchainDir() + "/" + IdeDemo.ZancName();
+        if (File.Exists(legacy)) { return legacy; }
         return IdeDemo.ZancName();
     }
 
@@ -348,6 +353,9 @@ class IdeDemo {
         SignalInt dDragOffX = SignalInt.Create(0);
         SignalInt dDragOffY = SignalInt.Create(0);
         SignalInt dResizeH = SignalInt.Create(0);   // resize handle 0-7
+        SignalInt dNewTool = SignalInt.Create(-1);  // toolbox index being dragged onto the surface (-1 = none)
+        List<string> dAnchor = new List<string>();  // per-control anchor edges, e.g. "LT" / "LTRB"
+        List<string> dDock = new List<string>();     // per-control dock, "None" / "Top" / "Fill" / ...
 
         SignalInt treeW = SignalInt.Create(IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "treeW", 240), 120, 900));
         // The code editor is the primary area: it fills the space left over
@@ -657,7 +665,9 @@ class IdeDemo {
                             List<int> fey = new List<int>();
                             List<int> few = new List<int>();
                             List<int> feh = new List<int>();
-                            File.WriteAllText(formP, IdeDemo.SerializeForm("Form1", fen, fet, fex, fey, few, feh));
+                            List<string> fanc = new List<string>();
+                            List<string> fdok = new List<string>();
+                            File.WriteAllText(formP, IdeDemo.SerializeForm("Form1", fen, fet, fex, fey, few, feh, fanc, fdok));
                             string fcb = root + "/src/Form1.zan";
                             if (!File.Exists(fcb)) {
                                 File.WriteAllText(fcb, IdeDemo.BuildCodeBehind("Form1", fen, fet, fex, fey, few, feh));
@@ -938,15 +948,15 @@ class IdeDemo {
                     string fpath = tabPaths[act];
                     string fname = IdeDemo.FormBaseName(fpath);
                     if (fpath != loadedFormPath) {
-                        IdeDemo.ParseForm(tabBodies[act], dNames, dTypes, dX, dY, dW, dH);
+                        IdeDemo.ParseForm(tabBodies[act], dNames, dTypes, dX, dY, dW, dH, dAnchor, dDock);
                         dSel.Set(0 - 1);
                         loadedFormPath = fpath;
                         formCache = tabBodies[act];
                     }
                     int dact = IdeDemo.RenderDesigner(app, c, t, edRect, dNames, dX, dY, dW, dH, dTypes,
-                        dSel, dDragMode, dDragOffX, dDragOffY, dResizeH, dPreview);
+                        dSel, dDragMode, dDragOffX, dDragOffY, dResizeH, dPreview, dNewTool, dAnchor, dDock);
                     // Persist any layout change back to the tab body and the .zform file.
-                    string newser = IdeDemo.SerializeForm(fname, dNames, dTypes, dX, dY, dW, dH);
+                    string newser = IdeDemo.SerializeForm(fname, dNames, dTypes, dX, dY, dW, dH, dAnchor, dDock);
                     if (newser != formCache) {
                         tabBodies[act] = newser;
                         if (fpath.Length > 0 && fpath.Substring(0, 1) != "@") {
@@ -1012,6 +1022,35 @@ class IdeDemo {
                     // Sync debug vars into editor for hover tooltips
                     if (dbgState == 2) { editor.SetDebugVars(dbgVarInfo); }
                     else { editor.SetDebugVars(new List<string>()); }
+                    // A code-behind with a paired .zform gets a one-click switch to
+                    // the visual designer (the mirror of the designer's "View Code").
+                    string apCode = tabPaths[act];
+                    bool hasForm = false;
+                    string zformSib = "";
+                    if (apCode.Length > 4 && apCode.Substring(apCode.Length - 4, 4) == ".zan") {
+                        zformSib = apCode.Substring(0, apCode.Length - 4) + ".zform";
+                        if (File.Exists(zformSib)) { hasForm = true; }
+                    }
+                    if (hasForm) {
+                        int dbW = app.Scale(104);
+                        int dbX = edRect.x + edRect.width - dbW - app.Scale(12);
+                        int dbY = edRect.y + app.Scale(8);
+                        int dbH2 = app.Scale(24);
+                        bool dbHover = app.mouseX >= dbX && app.mouseX < dbX + dbW
+                            && app.mouseY >= dbY && app.mouseY < dbY + dbH2;
+                        if (app.window.EventKind() == 3 && dbHover) {
+                            int zfi = IdeDemo.FindTabByPath(tabPaths, zformSib);
+                            if (zfi >= 0) { activeTab.Set(zfi); }
+                            else { IdeDemo.OpenPath(tabNames, tabBodies, tabPaths, activeTab, zformSib, Path.GetFileName(zformSib)); }
+                            loadedFormPath = "";
+                            lastActive = 0 - 1;
+                            app.RequestRedraw();
+                        }
+                        int dbBg = 0xFF0E639C;
+                        if (dbHover) { dbBg = 0xFF1177BB; }
+                        c.FillRoundRect(dbX, dbY, dbW, dbH2, app.Scale(4), dbBg);
+                        c.DrawText(dbX + app.Scale(12), dbY + app.Scale(6), "View Designer", 0xFFFFFFFF, t.fontSizeSmall);
+                    }
                     editor.Render(app, edRect);
                     // Ctrl+click in the editor requests Go to Definition.
                     if (editor.ConsumeGotoRequest()) {
@@ -1809,7 +1848,9 @@ class IdeDemo {
             List<int> dY = new List<int>();
             List<int> dW = new List<int>();
             List<int> dH = new List<int>();
-            File.WriteAllText(formPath, IdeDemo.SerializeForm(name, dNames, dTypes, dX, dY, dW, dH));
+            List<string> dAnchor = new List<string>();
+            List<string> dDock = new List<string>();
+            File.WriteAllText(formPath, IdeDemo.SerializeForm(name, dNames, dTypes, dX, dY, dW, dH, dAnchor, dDock));
             if (!File.Exists(cbPath)) {
                 File.WriteAllText(cbPath, IdeDemo.BuildCodeBehind(name, dNames, dTypes, dX, dY, dW, dH));
             }
@@ -2583,30 +2624,40 @@ class IdeDemo {
 
     /// Serializes the designer controls into .zform text (layout only, no logic).
     static string SerializeForm(string name, List<string> dNames, List<string> dTypes,
-                                List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+                                List<int> dX, List<int> dY, List<int> dW, List<int> dH,
+                                List<string> dAnchor, List<string> dDock) {
         string s = "# Zan Form Design File\n";
         s = s + "# Visual layout for " + name + "; edit in the IDE form designer.\n";
         s = s + "# Application logic lives in the code-behind file " + name + ".zan\n";
         s = s + "form " + name + "\n";
         int i = 0;
         while (i < dNames.Count) {
+            string anc = "LT";
+            if (i < dAnchor.Count && dAnchor[i].Length > 0) { anc = dAnchor[i]; }
+            string dk = "None";
+            if (i < dDock.Count && dDock[i].Length > 0) { dk = dDock[i]; }
             s = s + "control " + dTypes[i] + " " + dNames[i] + " "
                   + Convert.ToString(dX[i]) + " " + Convert.ToString(dY[i]) + " "
-                  + Convert.ToString(dW[i]) + " " + Convert.ToString(dH[i]) + "\n";
+                  + Convert.ToString(dW[i]) + " " + Convert.ToString(dH[i]) + " "
+                  + anc + " " + dk + "\n";
             i = i + 1;
         }
         return s;
     }
 
-    /// Parses .zform text back into the designer control lists.
+    /// Parses .zform text back into the designer control lists. The anchor/dock
+    /// tokens are optional (older files omit them) and default to top-left / none.
     static void ParseForm(string text, List<string> dNames, List<string> dTypes,
-                          List<int> dX, List<int> dY, List<int> dW, List<int> dH) {
+                          List<int> dX, List<int> dY, List<int> dW, List<int> dH,
+                          List<string> dAnchor, List<string> dDock) {
         while (dNames.Count > 0) {
             int last = dNames.Count - 1;
             dNames.RemoveAt(last); dTypes.RemoveAt(last);
             dX.RemoveAt(last); dY.RemoveAt(last);
             dW.RemoveAt(last); dH.RemoveAt(last);
         }
+        while (dAnchor.Count > 0) { dAnchor.RemoveAt(dAnchor.Count - 1); }
+        while (dDock.Count > 0) { dDock.RemoveAt(dDock.Count - 1); }
         List<string> ls = CodeEditor.SplitLines(text);
         int i = 0;
         while (i < ls.Count) {
@@ -2620,6 +2671,8 @@ class IdeDemo {
                     dY.Add(IdeDemo.ParseInt(toks[3]));
                     dW.Add(IdeDemo.ParseInt(toks[4]));
                     dH.Add(IdeDemo.ParseInt(toks[5]));
+                    if (toks.Count >= 7) { dAnchor.Add(toks[6]); } else { dAnchor.Add("LT"); }
+                    if (toks.Count >= 8) { dDock.Add(toks[7]); } else { dDock.Add("None"); }
                 }
             }
             i = i + 1;
@@ -4077,7 +4130,7 @@ class IdeDemo {
             List<string> dNames, List<int> dX, List<int> dY,
             List<int> dW, List<int> dH, List<string> dTypes, SignalInt dSel,
             SignalInt dragMode, SignalInt dragOffX, SignalInt dragOffY, SignalInt resizeH,
-            SignalInt preview) {
+            SignalInt preview, SignalInt newTool, List<string> dAnchor, List<string> dDock) {
         int dSelV = dSel.Get();
         int result = 0;
         int previewOn = preview.Get();
@@ -4305,6 +4358,8 @@ class IdeDemo {
                     dW.Add(app.Scale(100));
                     dH.Add(app.Scale(30));
                     dTypes.Add(newType);
+                    dAnchor.Add("LT");
+                    dDock.Add("None");
                     dSel.Set(newIdx);
                     app.RequestRedraw();
                 }
@@ -4418,6 +4473,8 @@ class IdeDemo {
                 dW.RemoveAt(dSelV);
                 dH.RemoveAt(dSelV);
                 dTypes.RemoveAt(dSelV);
+                if (dSelV < dAnchor.Count) { dAnchor.RemoveAt(dSelV); }
+                if (dSelV < dDock.Count) { dDock.RemoveAt(dSelV); }
                 dSel.Set(-1);
                 dragMode.Set(0);
                 app.RequestRedraw();
