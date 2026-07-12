@@ -10,9 +10,11 @@
  * Built only on Apple targets; requires the Cocoa framework.
  */
 #import <Cocoa/Cocoa.h>
+#import <CoreText/CoreText.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -20,7 +22,7 @@ typedef int64_t i64;
 typedef uint32_t u32;
 
 /* Implemented in gui_runtime.c; not part of the [DllImport] ABI. */
-extern const u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride);
+extern u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride);
 
 #define EXPORT __attribute__((visibility("default")))
 
@@ -30,6 +32,34 @@ static NSView   *g_view   = nil;
 static CGImageRef g_frame = NULL;
 /* Flat pending-event slots: [kind, x, y, button, keycode, mods]. */
 static long g_evt[6];
+
+/* Decoded events are queued so a single NSEvent can yield several ABI events
+ * (e.g. a key press emits a keyDown followed by a textInput, and a window
+ * resize/close arrives from the delegate), matching the Win32 backend where
+ * WM_KEYDOWN and WM_CHAR are distinct messages. */
+#define ZAN_EVQ_CAP 64
+static long g_evq[ZAN_EVQ_CAP][6];
+static int g_evq_head = 0;
+static int g_evq_tail = 0;
+
+static void evq_push(long kind, long x, long y, long button, long keycode, long mods) {
+    int next = (g_evq_tail + 1) % ZAN_EVQ_CAP;
+    if (next == g_evq_head) return; /* queue full: drop oldest-behavior avoided */
+    g_evq[g_evq_tail][0] = kind;
+    g_evq[g_evq_tail][1] = x;
+    g_evq[g_evq_tail][2] = y;
+    g_evq[g_evq_tail][3] = button;
+    g_evq[g_evq_tail][4] = keycode;
+    g_evq[g_evq_tail][5] = mods;
+    g_evq_tail = next;
+}
+
+static int evq_pop(void) {
+    if (g_evq_head == g_evq_tail) return 0;
+    memcpy(g_evt, g_evq[g_evq_head], sizeof(g_evt));
+    g_evq_head = (g_evq_head + 1) % ZAN_EVQ_CAP;
+    return 1;
+}
 
 /* Custom content view that blits the last presented CGImage. */
 @interface ZanView : NSView
@@ -47,6 +77,29 @@ static long g_evt[6];
 }
 @end
 
+/* Window delegate: surfaces resize (kind 7) and close (kind 8) events, which
+ * do not flow through -nextEventMatchingMask:, so the app can relayout and
+ * quit exactly as it does on the Win32/X11 backends. */
+@interface ZanDelegate : NSObject <NSWindowDelegate>
+@end
+
+@implementation ZanDelegate
+- (void)windowDidResize:(NSNotification *)note {
+    (void)note;
+    if (g_view) {
+        NSSize s = [g_view bounds].size;
+        evq_push(7, (long)s.width, (long)s.height, 0, 0, 0);
+    }
+}
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    (void)sender;
+    evq_push(8, 0, 0, 0, 0, 0);
+    return NO; /* let the app decide when to quit rather than tearing down */
+}
+@end
+
+static ZanDelegate *g_delegate = nil;
+
 /* ---- window lifecycle ---- */
 
 EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
@@ -63,6 +116,9 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
                                                    defer:NO];
         g_view = [[ZanView alloc] initWithFrame:rect];
         [g_window setContentView:g_view];
+        [g_window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
+        g_delegate = [[ZanDelegate alloc] init];
+        [g_window setDelegate:g_delegate];
         if (title) {
             [g_window setTitle:[NSString stringWithUTF8String:title]];
         }
@@ -93,49 +149,105 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
 
 /* ---- event pump ---- */
 
-static void translate_event(NSEvent *ev) {
-    memset(g_evt, 0, sizeof(g_evt));
+/* Map Cocoa modifier flags to the Win32 encoding the cross-platform widgets
+ * expect: bit0=Ctrl, bit1=Shift, bit2=Alt. macOS's Command is folded into the
+ * Ctrl bit as well so Cmd-based shortcuts (Cmd+C/V/X/Z/A/S) exercise the same
+ * logic the widgets were written against for Windows' Ctrl shortcuts. */
+static long zan_mods(NSUInteger f) {
+    long mods = 0;
+    if (f & (NSEventModifierFlagControl | NSEventModifierFlagCommand)) mods |= 1;
+    if (f & NSEventModifierFlagShift)  mods |= 2;
+    if (f & NSEventModifierFlagOption) mods |= 4;
+    return mods;
+}
+
+/* Translate a Cocoa virtual key code to the Windows VK code the Zan `Keys`
+ * constants use, so keyboard handling is identical across backends. Returns 0
+ * for keys resolved from their character below (letters/digits). */
+static long zan_vk_from_keycode(unsigned short kc) {
+    switch (kc) {
+    case 53:  return 27;  /* Escape */
+    case 36:  return 13;  /* Return */
+    case 76:  return 13;  /* keypad Enter */
+    case 48:  return 9;   /* Tab */
+    case 51:  return 8;   /* Backspace (Delete key) */
+    case 117: return 46;  /* Forward Delete */
+    case 123: return 37;  /* Left */
+    case 126: return 38;  /* Up */
+    case 124: return 39;  /* Right */
+    case 125: return 40;  /* Down */
+    case 115: return 36;  /* Home */
+    case 119: return 35;  /* End */
+    case 116: return 33;  /* PageUp */
+    case 121: return 34;  /* PageDown */
+    case 49:  return 32;  /* Space */
+    case 122: return 112; /* F1 */
+    case 120: return 113; /* F2 */
+    case 96:  return 116; /* F5 */
+    case 103: return 122; /* F11 */
+    default:  return 0;
+    }
+}
+
+/* Resolve an alphanumeric VK code from a key event's layout-independent
+ * character (VK_A..VK_Z == 'A'..'Z', VK_0..VK_9 == '0'..'9'). */
+static long zan_vk_from_chars(NSString *bare) {
+    if ([bare length] == 0) return 0;
+    unichar u = [bare characterAtIndex:0];
+    if (u >= 'a' && u <= 'z') return (long)(u - 'a' + 'A');
+    if ((u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9')) return (long)u;
+    return 0;
+}
+
+static void decode_event(NSEvent *ev) {
+    NSEventType type = [ev type];
+    long mods = zan_mods([ev modifierFlags]);
     NSPoint p = [ev locationInWindow];
     NSPoint local = g_view ? [g_view convertPoint:p fromView:nil] : p;
-    long mods = 0;
-    NSUInteger f = [ev modifierFlags];
-    if (f & NSEventModifierFlagShift)   mods |= 1;
-    if (f & NSEventModifierFlagControl) mods |= 2;
-    if (f & NSEventModifierFlagOption)  mods |= 4;
-    if (f & NSEventModifierFlagCommand) mods |= 8;
-    g_evt[5] = mods;
+    long lx = (long)local.x, ly = (long)local.y;
 
-    switch ([ev type]) {
+    switch (type) {
     case NSEventTypeMouseMoved:
     case NSEventTypeLeftMouseDragged:
     case NSEventTypeRightMouseDragged:
     case NSEventTypeOtherMouseDragged:
-        g_evt[0] = 1; g_evt[1] = (long)local.x; g_evt[2] = (long)local.y;
+        evq_push(1, lx, ly, 0, 0, mods);
         break;
-    case NSEventTypeLeftMouseDown:
-        g_evt[0] = 2; g_evt[1] = (long)local.x; g_evt[2] = (long)local.y; g_evt[3] = 0;
+    case NSEventTypeLeftMouseDown:  evq_push(2, lx, ly, 0, 0, mods); break;
+    case NSEventTypeRightMouseDown: evq_push(2, lx, ly, 1, 0, mods); break;
+    case NSEventTypeOtherMouseDown: evq_push(2, lx, ly, 2, 0, mods); break;
+    case NSEventTypeLeftMouseUp:    evq_push(3, lx, ly, 0, 0, mods); break;
+    case NSEventTypeRightMouseUp:   evq_push(3, lx, ly, 1, 0, mods); break;
+    case NSEventTypeOtherMouseUp:   evq_push(3, lx, ly, 2, 0, mods); break;
+    case NSEventTypeScrollWheel: {
+        double dy = [ev scrollingDeltaY];
+        if ([ev hasPreciseScrollingDeltas]) dy /= 10.0;
+        long delta = (long)(dy * 120.0); /* one wheel notch == 120, like Win32 */
+        if (delta == 0 && dy != 0.0) delta = dy > 0 ? 120 : -120;
+        if (delta != 0) evq_push(13, lx, ly, 0, delta, mods);
         break;
-    case NSEventTypeRightMouseDown:
-        g_evt[0] = 2; g_evt[1] = (long)local.x; g_evt[2] = (long)local.y; g_evt[3] = 1;
+    }
+    case NSEventTypeKeyDown: {
+        long vk = zan_vk_from_keycode([ev keyCode]);
+        if (vk == 0) vk = zan_vk_from_chars([ev charactersIgnoringModifiers]);
+        evq_push(4, 0, 0, 0, vk, mods);
+        /* Emit typed characters as text input, unless a Ctrl/Cmd shortcut is
+         * active (mods bit0) — matching WM_CHAR filtering on Windows. */
+        if (!(mods & 1)) {
+            NSString *chars = [ev characters];
+            for (NSUInteger i = 0; i < [chars length]; i++) {
+                unichar u = [chars characterAtIndex:i];
+                if (u >= 32 && u != 127) evq_push(6, 0, 0, 0, (long)u, mods);
+            }
+        }
         break;
-    case NSEventTypeOtherMouseDown:
-        g_evt[0] = 2; g_evt[1] = (long)local.x; g_evt[2] = (long)local.y; g_evt[3] = 2;
+    }
+    case NSEventTypeKeyUp: {
+        long vk = zan_vk_from_keycode([ev keyCode]);
+        if (vk == 0) vk = zan_vk_from_chars([ev charactersIgnoringModifiers]);
+        evq_push(5, 0, 0, 0, vk, mods);
         break;
-    case NSEventTypeLeftMouseUp:
-        g_evt[0] = 3; g_evt[1] = (long)local.x; g_evt[2] = (long)local.y; g_evt[3] = 0;
-        break;
-    case NSEventTypeRightMouseUp:
-        g_evt[0] = 3; g_evt[1] = (long)local.x; g_evt[2] = (long)local.y; g_evt[3] = 1;
-        break;
-    case NSEventTypeOtherMouseUp:
-        g_evt[0] = 3; g_evt[1] = (long)local.x; g_evt[2] = (long)local.y; g_evt[3] = 2;
-        break;
-    case NSEventTypeKeyDown:
-        g_evt[0] = 4; g_evt[4] = (long)[ev keyCode];
-        break;
-    case NSEventTypeKeyUp:
-        g_evt[0] = 5; g_evt[4] = (long)[ev keyCode];
-        break;
+    }
     default:
         break;
     }
@@ -143,18 +255,23 @@ static void translate_event(NSEvent *ev) {
 
 static i64 pump(bool wait) {
     if (!g_window) return -1;
+    if (evq_pop()) return 0;               /* drain already-decoded events first */
     memset(g_evt, 0, sizeof(g_evt));
     @autoreleasepool {
-        NSDate *until = wait ? [NSDate distantFuture] : [NSDate distantPast];
-        NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                         untilDate:until
-                                            inMode:NSDefaultRunLoopMode
-                                           dequeue:YES];
-        if (!ev) return 1;                 /* no event pending (poll) */
-        translate_event(ev);
-        [NSApp sendEvent:ev];              /* keep the window responsive */
+        for (;;) {
+            NSDate *until = wait ? [NSDate distantFuture] : [NSDate distantPast];
+            NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                             untilDate:until
+                                                inMode:NSDefaultRunLoopMode
+                                               dequeue:YES];
+            if (!ev) return 1;             /* nothing pending (poll) */
+            decode_event(ev);
+            [NSApp sendEvent:ev];          /* keep the window responsive */
+            if (evq_pop()) return 0;
+            if (!wait) return 1;           /* polled event produced nothing decodable */
+            /* wait: keep pumping until an event decodes into something */
+        }
     }
-    return 0;
 }
 
 EXPORT i64 zan_gui_wait_event(void) { return pump(true); }
@@ -167,6 +284,134 @@ EXPORT i64 zan_gui_event_button(void)  { return g_evt[3]; }
 EXPORT i64 zan_gui_event_keycode(void) { return g_evt[4]; }
 EXPORT i64 zan_gui_event_mods(void)    { return g_evt[5]; }
 EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(intptr_t)g_window; }
+
+/* ---- native text rendering ---- */
+
+static CTFontRef zan_font(i64 font_size) {
+    CGFloat size = (CGFloat)font_size;
+    if (size < 8.0) size = 8.0;
+    return CTFontCreateWithName(CFSTR(".AppleSystemUIFont"), size, NULL);
+}
+
+static CTLineRef zan_text_line(const char *utf8, CTFontRef font) {
+    if (!utf8 || !*utf8 || !font) return NULL;
+    CFStringRef text = CFStringCreateWithCString(
+        kCFAllocatorDefault, utf8, kCFStringEncodingUTF8);
+    if (!text) return NULL;
+    CGColorRef white = CGColorCreateGenericGray(1.0, 1.0);
+    const void *keys[] = {
+        kCTFontAttributeName,
+        kCTForegroundColorAttributeName
+    };
+    const void *values[] = { font, white };
+    CFDictionaryRef attrs = CFDictionaryCreate(
+        kCFAllocatorDefault, keys, values, 2,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFAttributedStringRef attributed = CFAttributedStringCreate(
+        kCFAllocatorDefault, text, attrs);
+    CTLineRef line = CTLineCreateWithAttributedString(attributed);
+    CFRelease(attributed);
+    CFRelease(attrs);
+    CGColorRelease(white);
+    CFRelease(text);
+    return line;
+}
+
+static u32 zan_blend(u32 dst, u32 color, unsigned int coverage) {
+    u32 ca = (color >> 24) & 0xFF;
+    if (ca == 0) ca = 255;
+    u32 alpha = ca * coverage / 255;
+    u32 inv = 255 - alpha;
+    u32 sr = (color >> 16) & 0xFF;
+    u32 sg = (color >> 8) & 0xFF;
+    u32 sb = color & 0xFF;
+    u32 dr = (dst >> 16) & 0xFF;
+    u32 dg = (dst >> 8) & 0xFF;
+    u32 db = dst & 0xFF;
+    u32 r = (sr * alpha + dr * inv) / 255;
+    u32 g = (sg * alpha + dg * inv) / 255;
+    u32 b = (sb * alpha + db * inv) / 255;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
+                              const char *utf8, i64 color, i64 font_size) {
+    int sw = 0, sh = 0, stride = 0;
+    u32 *pixels = zan_gui_internal_surface_data(surface_id, &sw, &sh, &stride);
+    if (!pixels || !utf8 || !*utf8) return;
+
+    @autoreleasepool {
+        CTFontRef font = zan_font(font_size);
+        CTLineRef line = zan_text_line(utf8, font);
+        if (!line) {
+            if (font) CFRelease(font);
+            return;
+        }
+        CGFloat ascent = 0, descent = 0, leading = 0;
+        double measured =
+            CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
+        int tw = (int)ceil(measured) + 2;
+        int th = (int)ceil(ascent + descent + leading) + 2;
+        if (tw > 0 && th > 0) {
+            unsigned char *mask =
+                (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+            CGContextRef ctx = CGBitmapContextCreate(
+                mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
+                cs, (CGBitmapInfo)kCGImageAlphaNone);
+            if (ctx) {
+                CGContextSetGrayFillColor(ctx, 1.0, 1.0);
+                CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+                CTLineDraw(line, ctx);
+                CGContextFlush(ctx);
+                for (int py = 0; py < th; py++) {
+                    int dy = (int)y + py;
+                    if (dy < 0 || dy >= sh) continue;
+                    int sy = th - 1 - py;
+                    for (int px = 0; px < tw; px++) {
+                        int dx = (int)x + px;
+                        if (dx < 0 || dx >= sw) continue;
+                        unsigned int coverage = mask[sy * tw + px];
+                        if (!coverage) continue;
+                        int index = dy * stride + dx;
+                        pixels[index] =
+                            zan_blend(pixels[index], (u32)color, coverage);
+                    }
+                }
+                CGContextRelease(ctx);
+            }
+            CGColorSpaceRelease(cs);
+            free(mask);
+        }
+        CFRelease(line);
+        CFRelease(font);
+    }
+}
+
+EXPORT i64 zan_gui_measure_text(const char *utf8, i64 font_size) {
+    if (!utf8 || !*utf8) return 0;
+    @autoreleasepool {
+        CTFontRef font = zan_font(font_size);
+        CTLineRef line = zan_text_line(utf8, font);
+        if (!line) {
+            if (font) CFRelease(font);
+            return 0;
+        }
+        double width = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+        CFRelease(line);
+        CFRelease(font);
+        return (i64)ceil(width);
+    }
+}
+
+EXPORT i64 zan_gui_font_height(i64 font_size) {
+    CTFontRef font = zan_font(font_size);
+    if (!font) return 0;
+    CGFloat height = CTFontGetAscent(font) + CTFontGetDescent(font) +
+                     CTFontGetLeading(font);
+    CFRelease(font);
+    return (i64)ceil(height);
+}
 
 /* ---- geometry ---- */
 

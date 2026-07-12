@@ -250,7 +250,7 @@ if(ZAN_BUILD_GUI)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m)
         set_source_files_properties(src/runtime/gui_runtime.c
             PROPERTIES COMPILE_DEFINITIONS ZAN_GUI_COCOA)
-        target_link_libraries(zan_gui PRIVATE m "-framework Cocoa")
+        target_link_libraries(zan_gui PRIVATE m "-framework Cocoa" "-framework CoreText")
         set(ZAN_GUI_AVAILABLE TRUE)
     else()
         find_package(X11)
@@ -258,6 +258,13 @@ if(ZAN_BUILD_GUI)
             add_library(zan_gui SHARED src/runtime/gui_runtime.c)
             target_include_directories(zan_gui PRIVATE ${X11_INCLUDE_DIR})
             target_link_libraries(zan_gui PRIVATE ${X11_LIBRARIES} m)
+            find_package(Freetype QUIET)
+            find_package(Fontconfig QUIET)
+            if(Freetype_FOUND AND Fontconfig_FOUND)
+                target_compile_definitions(zan_gui PRIVATE ZAN_GUI_FREETYPE)
+                target_link_libraries(zan_gui PRIVATE
+                    Freetype::Freetype Fontconfig::Fontconfig)
+            endif()
             set(ZAN_GUI_AVAILABLE TRUE)
         else()
             message(WARNING "libX11 not found; skipping zan_gui (Gui conformance tests will be disabled)")
@@ -389,6 +396,21 @@ add_test(NAME conformance_minic
 # only zanc, so it passes -DZAN_BUILD_GUI_TESTS=OFF.
 option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" ON)
 if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
+  add_executable(zan_gui_runtime_test tests/runtime/gui_runtime_test.c)
+  target_link_libraries(zan_gui_runtime_test PRIVATE zan_gui)
+  add_test(NAME runtime_gui COMMAND zan_gui_runtime_test)
+
+  if(UNIX AND NOT APPLE)
+    find_program(XVFB_RUN_EXECUTABLE xvfb-run)
+    if(XVFB_RUN_EXECUTABLE)
+      add_executable(zan_gui_x11_test tests/runtime/gui_x11_test.c)
+      target_link_libraries(zan_gui_x11_test PRIVATE zan_gui ${X11_LIBRARIES})
+      add_test(NAME runtime_gui_x11
+        COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_x11_test>)
+      set_tests_properties(runtime_gui_x11 PROPERTIES TIMEOUT 15)
+    endif()
+  endif()
+
   add_test(NAME conformance_gui_stack
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -409,7 +431,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(conformance_gui_stack conformance_gui_text PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
