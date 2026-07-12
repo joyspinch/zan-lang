@@ -31,6 +31,7 @@ int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
                            int64_t flags);
 int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
                            int64_t flags);
+int64_t zan_io_socket_ready(int64_t fd, int64_t write_ready);
 
 /* ---- stackless (CPS state-machine) ABI ----
  *
