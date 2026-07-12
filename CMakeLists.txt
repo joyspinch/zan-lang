@@ -178,17 +178,12 @@ if(EXISTS "${LINUX_MUSL_SYS}/libc.a")
 endif()
 
 # ---- Native database drivers (publish-time bundling) ----
-# Stage the committed drivers tree (manifests + any per-target native driver
-# binaries under drivers/<target>/) next to zanc so `--publish` can resolve and
-# bundle them. Driver binaries themselves are gitignored (see drivers/.gitignore)
-# and dropped in by the developer/IDE; only the layout + manifests are tracked.
-if(EXISTS "${CMAKE_SOURCE_DIR}/drivers")
-    add_custom_command(TARGET zanc POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${CMAKE_SOURCE_DIR}/drivers" $<TARGET_FILE_DIR:zanc>/drivers
-        COMMENT "Staging native database drivers next to zanc"
-        VERBATIM)
-endif()
+# Each native DB driver now lives inside the stdlib module that owns it
+# (e.g. stdlib/System/Data/Sqlite/drivers/<target>/), so it travels with stdlib
+# and needs no separate staging next to zanc: zanc resolves it from
+# <stdlib_root>/<module>/drivers/<target>/. Driver binaries are gitignored and
+# dropped in per target by the developer / release-assembly step; only the
+# layout + manifests are tracked.
 
 
 # ---- Language Server (M8) ----

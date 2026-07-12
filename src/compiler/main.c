@@ -623,6 +623,16 @@ static bool zan_is_driver(const char *lname, int len) {
     return false;
 }
 
+/* stdlib module (namespace path, '/'-separated) that ships each native driver,
+ * so its bundle lives at <stdlib_root>/<module>/drivers/<target-sub>/ and
+ * travels with stdlib rather than sitting next to zanc. Extend alongside
+ * zan_known_drivers as native-backed modules are added. */
+static const char *zan_driver_module(const char *lname, int len) {
+    if (len == 7 && memcmp(lname, "sqlite3", 7) == 0) return "System/Data/Sqlite";
+    if (len == 2 && memcmp(lname, "pq", 2) == 0) return "System/Data/Postgres";
+    return NULL;
+}
+
 /* Copy a file byte-for-byte (portable; no shell). Returns 0 on success. */
 static int zan_copy_file(const char *src, const char *dst) {
     FILE *in = fopen(src, "rb");
@@ -651,7 +661,7 @@ static bool zan_is_safe_bundle_name(const char *name) {
     return true;
 }
 
-/* Per-target driver-bundle subdirectory under <zanc_dir>/drivers/. Matches the
+/* Per-target driver-bundle subdirectory under <module>/drivers/. Matches the
  * cross-compile toolchain naming so publishing for a target reads the drivers
  * built for that target. */
 static const char *zan_driver_subdir(const zan_target_t *t) {
@@ -705,6 +715,10 @@ int main(int argc, char **argv) {
     const char *target_name = NULL; /* --target <name|triple>; NULL = host */
     bool link_static_drivers = false; /* --link-mode static; default shared */
     const char *driver_dir_override = NULL; /* --driver-dir */
+    /* Resolved stdlib root, hoisted so the native-driver block (which lives
+     * outside the stdlib-discovery scope) can root driver dirs at
+     * <stdlib_root>/<module>/drivers/<target>/. Empty when no stdlib is used. */
+    char resolved_stdlib_root[1024] = {0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--dump-tokens") == 0) {
@@ -835,6 +849,9 @@ int main(int argc, char **argv) {
             }
 #endif
         }
+        /* Hoist for the native-driver block below (outside this scope). */
+        snprintf(resolved_stdlib_root, sizeof(resolved_stdlib_root), "%s",
+                 stdlib_root);
 
         /* Auto-include stdlib modules by PATH. Every `using X.Y.Z;` directive
          * maps directly to the directory stdlib_root/X/Y/Z, and all *.zan files
@@ -1147,13 +1164,14 @@ int main(int argc, char **argv) {
 
         /* ---- native database drivers ----------------------------------
          * Third-party DB drivers (libpq, sqlite3) are NOT present on an
-         * arbitrary target, so a published program must carry them. They live
-         * bundled next to zanc at <zanc_dir>/drivers/<target-sub>/ (overridable
-         * with --driver-dir). That directory is added to the link search path
-         * so both dev builds and publishes resolve the driver, and on
-         * `--publish` (shared mode) the driver's runtime shared libraries are
-         * copied next to the produced executable. */
-        char driver_dir[1024] = {0};
+         * arbitrary target, so a published program must carry them. Each driver
+         * ships inside the stdlib module that owns it, at
+         * <stdlib_root>/<module>/drivers/<target-sub>/ (e.g. System/Data/Sqlite
+         * for sqlite3), overridable with --driver-dir. Its directory is added
+         * to the link search path so both dev builds and publishes resolve the
+         * driver, and on `--publish` (shared mode) the driver's runtime shared
+         * libraries are copied next to the produced executable. */
+        char driver_dirs[16][1024];
         const char *used_drivers[16]; int used_driver_count = 0;
         int used_driver_len[16];
         for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
@@ -1166,37 +1184,36 @@ int main(int argc, char **argv) {
                 used_driver_count++;
             }
         }
-        if (used_driver_count > 0) {
-            if (driver_dir_override) {
-                snprintf(driver_dir, sizeof(driver_dir), "%s", driver_dir_override);
-            } else {
-                char exe_dir2[1024] = {0};
-#ifdef _WIN32
-                GetModuleFileNameA(NULL, exe_dir2, sizeof(exe_dir2));
-                { char *s = strrchr(exe_dir2, '\\'); if (s) *s = '\0'; }
-#elif defined(__APPLE__)
-                { uint32_t sz = sizeof(exe_dir2);
-                  if (_NSGetExecutablePath(exe_dir2, &sz) != 0) exe_dir2[0] = '\0';
-                  char *s = strrchr(exe_dir2, '/'); if (s) *s = '\0'; }
-#else
-                { ssize_t n = readlink("/proc/self/exe", exe_dir2, sizeof(exe_dir2) - 1);
-                  if (n > 0) { exe_dir2[n] = '\0'; char *s = strrchr(exe_dir2, '/'); if (s) *s = '\0'; } }
-#endif
-                snprintf(driver_dir, sizeof(driver_dir), "%s/drivers/%s",
-                         exe_dir2, zan_driver_subdir(&target));
-            }
-            /* Add the driver dir to the link search path (link-time -l
-             * resolution) for every link branch below. Static linking reads
-             * the archives from the "static" subdir so shared import libs and
-             * static archives can coexist without ld ambiguity. */
-            char linkdir[1100];
-            if (link_static_drivers)
-                snprintf(linkdir, sizeof(linkdir), "%s/static", driver_dir);
-            else
-                snprintf(linkdir, sizeof(linkdir), "%s", driver_dir);
-            if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
-                snprintf(zan_lib_dirs[zan_lib_ndirs++], sizeof(zan_lib_dirs[0]),
-                         "%s", linkdir);
+        {
+            const char *dsub = zan_driver_subdir(&target);
+            for (int d = 0; d < used_driver_count; d++) {
+                driver_dirs[d][0] = '\0';
+                if (driver_dir_override) {
+                    snprintf(driver_dirs[d], sizeof(driver_dirs[d]), "%s",
+                             driver_dir_override);
+                } else {
+                    const char *mod = zan_driver_module(used_drivers[d],
+                                                        used_driver_len[d]);
+                    if (mod && resolved_stdlib_root[0]) {
+                        snprintf(driver_dirs[d], sizeof(driver_dirs[d]),
+                                 "%s/%s/drivers/%s", resolved_stdlib_root,
+                                 mod, dsub);
+                    }
+                }
+                if (!driver_dirs[d][0]) continue;
+                /* Add the driver dir to the link search path (link-time -l
+                 * resolution) for every link branch below. Static linking reads
+                 * the archives from the "static" subdir so shared import libs
+                 * and static archives can coexist without ld ambiguity. */
+                char linkdir[1100];
+                if (link_static_drivers)
+                    snprintf(linkdir, sizeof(linkdir), "%s/static", driver_dirs[d]);
+                else
+                    snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
+                if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
+                    snprintf(zan_lib_dirs[zan_lib_ndirs++], sizeof(zan_lib_dirs[0]),
+                             "%s", linkdir);
+                }
             }
         }
 
@@ -1431,8 +1448,7 @@ int main(int argc, char **argv) {
          * with the OpenSSL DLLs); absent a manifest, common default file names
          * are tried. Static linking folds the driver into the exe, so nothing
          * is copied there. */
-        if (publish_mode && !link_static_drivers && used_driver_count > 0 &&
-            driver_dir[0]) {
+        if (publish_mode && !link_static_drivers && used_driver_count > 0) {
             char outdir[1024];
             snprintf(outdir, sizeof(outdir), "%s", obj_path);
             { char *s1 = strrchr(outdir, '/'); char *s2 = strrchr(outdir, '\\');
@@ -1441,6 +1457,8 @@ int main(int argc, char **argv) {
 
             bool win_target = (target.os == ZAN_OS_WINDOWS);
             for (int d = 0; d < used_driver_count; d++) {
+                const char *driver_dir = driver_dirs[d];
+                if (!driver_dir[0]) continue;
                 char drv[64];
                 snprintf(drv, sizeof(drv), "%.*s",
                          used_driver_len[d], used_drivers[d]);
