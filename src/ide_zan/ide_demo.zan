@@ -102,14 +102,67 @@ class IdeDemo {
     /// Basename of the Zan compiler shipped next to the IDE.
     static string ZancName() { return "zanc" + IdeDemo.ExeSuffix(); }
 
-    /// Resolve the Zan compiler next to the IDE (so its auto-stdlib lookup
-    /// finds the stdlib shipped alongside the IDE). Falls back to the bare
+    /// C library getenv, for locating per-user directories (mirrors the
+    /// approach in System.IO.Path). Returns null when the variable is unset.
+    [DllImport("crt")]
+    static extern string getenv(string name);
+
+    /// User home directory (USERPROFILE on Windows, HOME on POSIX).
+    static string HomeDir() {
+        #if WINDOWS
+        string h = getenv("USERPROFILE");
+        #else
+        string h = getenv("HOME");
+        #endif
+        if (h == null || h == "") { return "."; }
+        return h;
+    }
+
+    /// Per-user, writable directory for IDE config + custom templates. Kept out
+    /// of the (possibly read-only) install dir so nothing user-owned lives there.
+    static string UserConfigDir() {
+        #if WINDOWS
+        string a = getenv("APPDATA");
+        if (a == null || a == "") { a = IdeDemo.HomeDir(); }
+        return a + "/ZanIDE";
+        #elif MACOS
+        return IdeDemo.HomeDir() + "/Library/Application Support/ZanIDE";
+        #else
+        string x = getenv("XDG_CONFIG_HOME");
+        if (x != null && x != "") { return x + "/zan-ide"; }
+        return IdeDemo.HomeDir() + "/.config/zan-ide";
+        #endif
+    }
+
+    /// Default parent for user projects. Projects are user-owned and never
+    /// created under the install dir; the wizard lets the user pick any path.
+    static string ProjectsHome() { return IdeDemo.HomeDir() + "/ZanProjects"; }
+
+    /// Shipped (read-only) resource roots, laid out relative to the IDE exe:
+    ///   <ExeDir>/toolchain/zanc[.exe]   <ExeDir>/stdlib   (+ examples, templates)
+    static string ToolchainDir() { return IdeDemo.ExeDir() + "/toolchain"; }
+    static string StdlibDir() { return IdeDemo.ExeDir() + "/stdlib"; }
+
+    /// Per-project build scratch dir (writable, colocated with the sources),
+    /// created on demand so build artifacts never touch the install dir.
+    static string EnsureBuildDir(string root) {
+        string d = root + "/.build";
+        if (!Directory.Exists(d)) { Directory.CreateDirectoryRecursive(d); }
+        return d;
+    }
+
+    /// Resolve the Zan compiler under <ExeDir>/toolchain. Falls back to the bare
     /// name so the shell resolves it via PATH -- no hard-coded absolute path.
     static string Zanc() {
-        string dir = IdeDemo.ExeDir();
-        string cand = dir + "/" + IdeDemo.ZancName();
+        string cand = IdeDemo.ToolchainDir() + "/" + IdeDemo.ZancName();
         if (File.Exists(cand)) { return cand; }
         return IdeDemo.ZancName();
+    }
+
+    /// Quoted zanc invocation prefix with an explicit --stdlib-path so stdlib
+    /// resolution never depends on relative (../stdlib) lookup or the cwd.
+    static string ZancCmd() {
+        return "\"" + IdeDemo.Zanc() + "\" --stdlib-path \"" + IdeDemo.StdlibDir() + "\"";
     }
 
     static void Main() {
@@ -123,7 +176,7 @@ class IdeDemo {
         int savedW = cfgW;
         int savedH = cfgH;
 
-        string root = IdeDemo.ExeDir() + "/ide_workspace";
+        string root = IdeDemo.ProjectsHome() + "/hello";
         IdeDemo.EnsureWorkspace(root);
 
         List<TreeNode> tree = IdeDemo.ScanTree(root);
@@ -223,7 +276,7 @@ class IdeDemo {
         platSel.Add(1); platSel.Add(0); platSel.Add(0);
         platSel.Add(0); platSel.Add(0); platSel.Add(0);
         Input pNameInput = Input.Bind(SignalString.Create("NewProject"), "project name");
-        Input pLocInput = Input.Bind(SignalString.Create(root), "location");
+        Input pLocInput = Input.Bind(SignalString.Create(IdeDemo.ProjectsHome()), "location");
         Input fNameInput = Input.Bind(SignalString.Create("NewFile"), "file name");
 
         // Right-click context menu (file tree + tab bar) state.
@@ -1490,8 +1543,7 @@ class IdeDemo {
 
     static void EnsureWorkspace(string root) {
         if (Directory.Exists(root)) { return; }
-        Directory.CreateDirectory(root);
-        Directory.CreateDirectory(root + "/src");
+        Directory.CreateDirectoryRecursive(root + "/src");
         File.WriteAllText(root + "/src/main.zan",
             "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello, Zan!\");\n        int sum = Utils.Add(2, 3);\n        Console.WriteLine(\"2 + 3 = \" + sum);\n    }\n}\n");
         File.WriteAllText(root + "/src/utils.zan",
@@ -1556,7 +1608,7 @@ class IdeDemo {
     /// GetDirectories on a missing directory yields an empty list, so no
     /// separate existence check is needed.
     static void LoadCustomTemplates(List<Tpl> ts, string root) {
-        string dir = root + "/.templates";
+        string dir = IdeDemo.UserConfigDir() + "/templates";
         List<string> subs = Directory.GetDirectories(dir);
         int i = 0;
         while (i < subs.Count) {
@@ -1625,8 +1677,8 @@ class IdeDemo {
     /// Saves the current project (its src/ tree + zan.proj) as a reusable custom
     /// template under root/.templates/<tname>/ with a small manifest.
     static void SaveAsTemplate(string root, string cat, string tname, List<string> log) {
-        string tdir = root + "/.templates/" + tname;
-        Directory.CreateDirectory(tdir);
+        string tdir = IdeDemo.UserConfigDir() + "/templates/" + tname;
+        Directory.CreateDirectoryRecursive(tdir);
         if (Directory.Exists(root + "/src")) {
             IdeDemo.CopyTree(root + "/src", tdir + "/src");
         }
@@ -1877,9 +1929,10 @@ class IdeDemo {
         int a = active.Get();
         string p = paths[a];
         if (p == "") { log.Add("> Nothing to build (save the file first)."); return; }
-        string ll = root + "/.zanbuild.ll";
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string ll = bd + "/.zanbuild.ll";
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
-        string cmd = "\"" + IdeDemo.Zanc() + "\" --emit-ir " + inputs + " > \"" + ll + "\"";
+        string cmd = IdeDemo.ZancCmd() + " --emit-ir " + inputs + " > \"" + ll + "\"";
         log.Add("> Building " + p + " ...");
         List<string> outp = Process.RunCapture(cmd);
         IdeDemo.AppendAll(log, outp);
@@ -1892,9 +1945,10 @@ class IdeDemo {
         int a = active.Get();
         string p = paths[a];
         if (p == "") { log.Add("> Nothing to run (save the file first)."); return; }
-        string ll = root + "/.zanrun.ll";
-        string exe = root + "/.zanrun" + IdeDemo.ExeSuffix();
-        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string ll = bd + "/.zanrun.ll";
+        string exe = bd + "/.zanrun" + IdeDemo.ExeSuffix();
+        string z = IdeDemo.ZancCmd();
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\""
@@ -1912,8 +1966,9 @@ class IdeDemo {
         if (a < 0 || a >= paths.Count) { return; }
         string p = paths[a];
         if (p == "" || p == "@start") { log.Add("> [Hot] Nothing to run (save the file first)."); return; }
-        string ll = root + "/.zanhot.ll";
-        string exe = root + "/zanhot_run" + IdeDemo.ExeSuffix();
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string ll = bd + "/.zanhot.ll";
+        string exe = bd + "/zanhot_run" + IdeDemo.ExeSuffix();
         // Stop the previous hot instance so the exe can be overwritten.
         #if WINDOWS
         Process.Run("taskkill /F /IM zanhot_run.exe >nul 2>nul");
@@ -1922,7 +1977,7 @@ class IdeDemo {
         Process.Run("pkill -f zanhot_run >/dev/null 2>&1");
         Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
         #endif
-        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string z = IdeDemo.ZancCmd();
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\"";
@@ -1947,9 +2002,10 @@ class IdeDemo {
         string p = paths[a];
         if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
         Directory.CreateDirectory(root + "/publish");
-        string ll = root + "/.zanpub.ll";
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string ll = bd + "/.zanpub.ll";
         string exe = root + "/publish/" + names[a] + ".exe";
-        string z = "\"" + IdeDemo.Zanc() + "\"";
+        string z = IdeDemo.ZancCmd();
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\"";
@@ -2005,7 +2061,8 @@ class IdeDemo {
         string p = paths[a];
         if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
         Directory.CreateDirectory(root + "/publish");
-        string zc = "\"" + IdeDemo.Zanc() + "\"";
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string zc = IdeDemo.ZancCmd();
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
         string baseName = names[a];
         if (baseName.Length > 4 && baseName.Substring(baseName.Length - 4, 4) == ".zan") {
@@ -2014,7 +2071,7 @@ class IdeDemo {
         int published = 0;
         if (sel.Count > 0 && sel[0] == 1) {
             string exe = root + "/publish/" + baseName + "-windows-x64.exe";
-            string ll = root + "/.zanpub_x64.ll";
+            string ll = bd + "/.zanpub_x64.ll";
             string cmd = zc + " --emit-ir " + inputs + " > \"" + ll + "\""
                 + " && clang \"" + ll + "\" -o \"" + exe + "\"";
             log.Add("> Publishing windows-x64 ...");
@@ -2025,7 +2082,7 @@ class IdeDemo {
         }
         if (sel.Count > 1 && sel[1] == 1) {
             string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
-            string ll = root + "/.zanpub_arm64.ll";
+            string ll = bd + "/.zanpub_arm64.ll";
             string cmd = zc + " --emit-ir " + inputs + " > \"" + ll + "\""
                 + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"";
             log.Add("> Publishing windows-arm64 (requires ARM64 toolchain) ...");
@@ -2711,7 +2768,7 @@ class IdeDemo {
     // Settings persistence (window + panel sizes)
     // ================================================================
 
-    static string CfgPath() { return IdeDemo.ExeDir() + "/ide_workspace/.zanide.cfg"; }
+    static string CfgPath() { return IdeDemo.UserConfigDir() + "/config.cfg"; }
 
     static bool IsDigit(string ch) {
         return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
@@ -2772,6 +2829,7 @@ class IdeDemo {
             + ";winH=" + Convert.ToString(winH)
             + ";bottomTab=" + Convert.ToString(botTab)
             + ";autoRun=" + Convert.ToString(autoRun) + ";";
+        Directory.CreateDirectoryRecursive(IdeDemo.UserConfigDir());
         File.WriteAllText(IdeDemo.CfgPath(), s);
     }
 
@@ -2915,10 +2973,10 @@ class IdeDemo {
             log.Add("> [Debug] Save the file first.");
             return console;
         }
-        string ll = root + "/.zandbg.ll";
-        string exe = root + "/.zandbg" + IdeDemo.ExeSuffix();
-        string z = IdeDemo.Zanc();
-        string buildCmd = "\"" + z + "\" --emit-ir \"" + p + "\" > \"" + ll + "\""
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string ll = bd + "/.zandbg.ll";
+        string exe = bd + "/.zandbg" + IdeDemo.ExeSuffix();
+        string buildCmd = IdeDemo.ZancCmd() + " --emit-ir \"" + p + "\" > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\"";
         log.Add("> [Debug] Building ...");
         List<string> buildOut = Process.RunCapture(buildCmd);
@@ -3200,9 +3258,10 @@ class IdeDemo {
         // Only instrument when the breakpoint is inside a function body.
         if (insertDepth < 1) { return vars; }
 
-        string probe = root + "/.zandbg_probe.zan";
-        string ll = root + "/.zandbg.ll";
-        string exe = root + "/.zandbg" + IdeDemo.ExeSuffix();
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string probe = bd + "/.zandbg_probe.zan";
+        string ll = bd + "/.zandbg.ll";
+        string exe = bd + "/.zandbg" + IdeDemo.ExeSuffix();
         string gatherDir = root;
         if (curPath.Length > 0) { gatherDir = IdeDemo.DirOf(curPath); }
 
@@ -3232,9 +3291,8 @@ class IdeDemo {
             #else
             Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
             #endif
-            string z = IdeDemo.Zanc();
             string inputs = IdeDemo.ProjectInputs(gatherDir, probe, curPath);
-            string buildCmd = "\"" + z + "\" --emit-ir " + inputs + " > \"" + ll + "\""
+            string buildCmd = IdeDemo.ZancCmd() + " --emit-ir " + inputs + " > \"" + ll + "\""
                 + " && clang \"" + ll + "\" -o \"" + exe + "\"";
             List<string> buildOut = Process.RunCapture(buildCmd);
             if (File.Exists(exe)) {
