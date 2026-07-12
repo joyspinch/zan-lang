@@ -669,7 +669,7 @@ static const char *zan_driver_subdir(const zan_target_t *t) {
         return (t->arch == ZAN_ARCH_AARCH64) ? "linux-arm64" : "linux-x64";
     if (t->os == ZAN_OS_MACOS)
         return (t->arch == ZAN_ARCH_AARCH64) ? "macos-arm64" : "macos-x64";
-    return "win-x64";
+    return (t->arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
 }
 
 int main(int argc, char **argv) {
