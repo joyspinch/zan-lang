@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 Set-Location 'd:\project\zan-lang'
 
 Write-Output "[0/2] Rebuilding native GUI runtime (multi-window)..."
