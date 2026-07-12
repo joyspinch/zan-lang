@@ -2166,16 +2166,8 @@ static int call_consumes_free_arg(LLVMValueRef callee) {
     return name && name_len == 4 && memcmp(name, "free", 4) == 0;
 }
 
-static void emit_invalidate_freed_local(zan_irgen_t *g, zan_ast_node_t *arg,
-                                        local_scope_t *locals) {
-    if (!arg || arg->kind != AST_IDENTIFIER || !locals) return;
-    local_var_t *local = local_find(locals, arg->ident.name);
-    if (!local || !local->type || local->type->kind != TYPE_STRING) return;
-    LLVMTypeRef slot_type = LLVMGetAllocatedType(local->alloca);
-    if (LLVMGetTypeKind(slot_type) == LLVMPointerTypeKind) {
-        LLVMBuildStore(g->builder, LLVMConstNull(slot_type), local->alloca);
-    }
-}
+static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
+                                         local_scope_t *locals);
 
 static void emit_leak_report_support(zan_irgen_t *g) {
     if (!g->check_leaks || g->fn_report_leaks) return;
@@ -2598,6 +2590,95 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
     LLVMSetLinkage(gv, LLVMInternalLinkage);
     LLVMSetInitializer(gv, LLVMConstNull(ft));
     return gv;
+}
+
+static int is_stable_field_base(zan_ast_node_t *expr) {
+    if (!expr) return 0;
+    if (expr->kind == AST_IDENTIFIER || expr->kind == AST_THIS_EXPR ||
+        expr->kind == AST_BASE_EXPR) return 1;
+    return expr->kind == AST_MEMBER_ACCESS &&
+           is_stable_field_base(expr->member.object);
+}
+
+static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
+                                         local_scope_t *locals) {
+    if (!arg || !locals) return;
+    if (arg->kind == AST_IDENTIFIER) {
+        local_var_t *local = local_find(locals, arg->ident.name);
+        if (local && local->type && local->type->kind == TYPE_STRING) {
+            LLVMTypeRef slot_type = LLVMGetAllocatedType(local->alloca);
+            if (LLVMGetTypeKind(slot_type) == LLVMPointerTypeKind) {
+                LLVMBuildStore(g->builder, LLVMConstNull(slot_type), local->alloca);
+            }
+            return;
+        }
+        if (g->current_type_sym) {
+            zan_symbol_t *field = get_field_sym(g->current_type_sym, arg->ident.name);
+            if (!field || !field->type || field->type->kind != TYPE_STRING) return;
+            LLVMValueRef global = get_static_field_global(g, g->current_type_sym, field);
+            LLVMTypeRef field_type = map_type(g, field->type);
+            if (global) {
+                LLVMBuildStore(g->builder, LLVMConstNull(field_type), global);
+            } else if (g->current_this) {
+                int fi = get_field_index(g->current_type_sym, arg->ident.name);
+                LLVMTypeRef st = get_struct_llvm_type(g, g->current_type_sym);
+                if (fi >= 0 && st) {
+                    LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
+                        LLVMPointerType(st, 0), g->current_this, "this");
+                    LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st,
+                        this_ptr, (unsigned)fi, "freed.fld");
+                    LLVMBuildStore(g->builder, LLVMConstNull(field_type), field_ptr);
+                }
+            }
+        }
+        return;
+    }
+    if (arg->kind != AST_MEMBER_ACCESS) return;
+    zan_type_t *field_type = infer_expr_type(g, arg, locals);
+    if (!field_type || field_type->kind != TYPE_STRING) return;
+    zan_ast_node_t *obj = arg->member.object;
+    zan_symbol_t *class_sym = NULL;
+    LLVMValueRef object_ptr = NULL;
+    if (obj->kind == AST_IDENTIFIER) {
+        local_var_t *local = local_find(locals, obj->ident.name);
+        if (local && local->type && local->type->sym) {
+            class_sym = local->type->sym;
+            LLVMTypeRef st = get_struct_llvm_type(g, class_sym);
+            if (st) object_ptr = struct_base_ptr(g, local, st);
+        } else {
+            class_sym = zan_binder_lookup(g->binder, obj->ident.name);
+            if (class_sym && (class_sym->kind == SYM_CLASS ||
+                              class_sym->kind == SYM_STRUCT)) {
+                zan_symbol_t *field = get_field_sym(class_sym, arg->member.name);
+                LLVMValueRef global = get_static_field_global(g, class_sym, field);
+                if (global) {
+                    LLVMBuildStore(g->builder,
+                        LLVMConstNull(map_type(g, field_type)), global);
+                    return;
+                }
+            }
+            class_sym = NULL;
+        }
+    } else if ((obj->kind == AST_THIS_EXPR || obj->kind == AST_BASE_EXPR) &&
+               g->current_type_sym && g->current_this) {
+        class_sym = g->current_type_sym;
+        LLVMTypeRef st = get_struct_llvm_type(g, class_sym);
+        if (st) {
+            object_ptr = LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0),
+                                       g->current_this, "this");
+        }
+    } else if (is_stable_field_base(obj)) {
+        class_sym = expr_class_sym(g, obj, locals);
+        if (class_sym) object_ptr = emit_expr(g, obj, locals);
+    }
+    if (!class_sym || !object_ptr ||
+        LLVMGetTypeKind(LLVMTypeOf(object_ptr)) != LLVMPointerTypeKind) return;
+    int fi = get_field_index(class_sym, arg->member.name);
+    LLVMTypeRef st = get_struct_llvm_type(g, class_sym);
+    if (fi < 0 || !st) return;
+    LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st, object_ptr,
+                                                 (unsigned)fi, "freed.fld");
+    LLVMBuildStore(g->builder, LLVMConstNull(map_type(g, field_type)), field_ptr);
 }
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
@@ -5196,7 +5277,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {
-                                    emit_invalidate_freed_local(g,
+                                    emit_invalidate_freed_string(g,
                                         expr->call.args.items[0], locals);
                                 }
                                 for (int k = 0; k < argc; k++) {
@@ -5280,7 +5361,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {
-                                    emit_invalidate_freed_local(g,
+                                    emit_invalidate_freed_string(g,
                                         expr->call.args.items[0], locals);
                                 }
                                 for (int k = 0; k < argc; k++) {
@@ -5377,7 +5458,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             int consumes_free_arg =
                                 argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                             if (consumes_free_arg) {
-                                emit_invalidate_freed_local(g,
+                                emit_invalidate_freed_string(g,
                                     expr->call.args.items[0], locals);
                             }
                             for (int k = 0; k < argc; k++) {
@@ -5412,7 +5493,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 int consumes_free_arg =
                     argc == 1 && call_consumes_free_arg(global_fn);
                 if (consumes_free_arg) {
-                    emit_invalidate_freed_local(g,
+                    emit_invalidate_freed_string(g,
                         expr->call.args.items[0], locals);
                 }
                 for (int k = 0; k < argc; k++) {
