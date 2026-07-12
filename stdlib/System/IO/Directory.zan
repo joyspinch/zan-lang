@@ -4,8 +4,9 @@ namespace System.IO;
 
 /// <summary>
 /// Directory operations. Uses the Win32 API on Windows and POSIX
-/// opendir/readdir/mkdir on Linux and macOS, so the same code produces
-/// identical behaviour on every target.
+/// opendir/readdir/mkdir on Linux and macOS. The struct dirent field offsets
+/// read by readdir differ between glibc and Darwin, so they are selected per
+/// target (see direntTypeOffset/direntNameOffset).
 /// </summary>
 class Directory {
     #if WINDOWS
@@ -163,12 +164,25 @@ class Directory {
         return result;
     }
     #else
-    // Reads the NUL-terminated d_name (offset 19) from a struct dirent*.
+    // struct dirent layout differs by platform:
+    //   Linux (glibc): d_ino(8) d_off(8) d_reclen(2) d_type@18 d_name@19
+    //   macOS (Darwin): d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2)
+    //                   d_type@20 d_name@21
+    #if MACOS
+    static int direntTypeOffset() { return 20; }
+    static int direntNameOffset() { return 21; }
+    #else
+    static int direntTypeOffset() { return 18; }
+    static int direntNameOffset() { return 19; }
+    #endif
+
+    // Reads the NUL-terminated d_name from a struct dirent*.
     static string posixName(string ent) {
+        int nameOff = direntNameOffset();
         string name = "";
         int j = 0;
         while (j < 255) {
-            string ch = ent.Substring(19 + j, 1);
+            string ch = ent.Substring(nameOff + j, 1);
             if (ch == "\0") { break; }
             name = name + ch;
             j = j + 1;
@@ -184,7 +198,7 @@ class Directory {
         while (ent != null) {
             string name = posixName(ent);
             if (name != "" && name != "." && name != "..") {
-                int dtype = ent[18] & 255;   // d_type
+                int dtype = ent[direntTypeOffset()] & 255;   // d_type
                 bool isDir = false;
                 if (dtype == 4) {            // DT_DIR
                     isDir = true;

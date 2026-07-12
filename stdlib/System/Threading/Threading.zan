@@ -135,6 +135,22 @@ class Semaphore {
 
     [DllImport("kernel32", EntryPoint = "CloseHandle")]
     static extern int WinCloseHandle(int handle);
+    #elif MACOS
+    // macOS has no unnamed POSIX semaphores (sem_init sets ENOSYS and returns
+    // -1), so use a GCD dispatch semaphore. The opaque dispatch_semaphore_t
+    // pointer is carried as a string handle, matching the Linux sem_t*
+    // convention below. dispatch_* lives in libSystem, which -lc resolves.
+    [DllImport("libc", EntryPoint = "dispatch_semaphore_create")]
+    static extern string MacSemCreate(int value);
+
+    [DllImport("libc", EntryPoint = "dispatch_semaphore_wait")]
+    static extern int MacSemWait(string sem, int timeout);
+
+    [DllImport("libc", EntryPoint = "dispatch_semaphore_signal")]
+    static extern int MacSemSignal(string sem);
+
+    [DllImport("libc", EntryPoint = "dispatch_release")]
+    static extern void MacSemRelease(string sem);
     #else
     [DllImport("libc", EntryPoint = "calloc")]
     static extern string SemCalloc(int count, int size);
@@ -171,6 +187,22 @@ class Semaphore {
     static void Destroy(int handle) {
         WinCloseHandle(handle);
     }
+    #elif MACOS
+    static string Create(int initialCount, int maxCount) {
+        return MacSemCreate(initialCount);
+    }
+
+    static void Wait(string handle) {
+        MacSemWait(handle, -1);   // -1 == DISPATCH_TIME_FOREVER
+    }
+
+    static void Release(string handle) {
+        MacSemSignal(handle);
+    }
+
+    static void Destroy(string handle) {
+        MacSemRelease(handle);
+    }
     #else
     static string Create(int initialCount, int maxCount) {
         string sem = SemCalloc(1, 64);
@@ -202,13 +234,21 @@ class Stopwatch {
     static extern int WinGetTickCount64();
     #else
     [DllImport("libc", EntryPoint = "clock_gettime")]
-    static extern int LinuxClockGettime(int clk_id, string tp);
+    static extern int ClockGettime(int clk_id, string tp);
 
     [DllImport("libc", EntryPoint = "calloc")]
     static extern string StopwatchCalloc(int count, int size);
 
     [DllImport("libc", EntryPoint = "free")]
     static extern void StopwatchFree(string ptr);
+
+    // CLOCK_MONOTONIC has a different numeric value per platform: 1 on Linux,
+    // 6 on macOS (where clk_id 1 is not a valid clock and would fail).
+    #if MACOS
+    static int MonotonicClockId() { return 6; }
+    #else
+    static int MonotonicClockId() { return 1; }
+    #endif
     #endif
 
     /// <summary>Returns current tick count in milliseconds.</summary>
@@ -217,7 +257,7 @@ class Stopwatch {
         return WinGetTickCount64();
         #else
         string tp = StopwatchCalloc(1, 16);
-        LinuxClockGettime(1, tp);
+        ClockGettime(MonotonicClockId(), tp);
         int sec = tp[0] | (tp[1] << 8) | (tp[2] << 16) | (tp[3] << 24);
         int nsec = tp[8] | (tp[9] << 8) | (tp[10] << 16) | (tp[11] << 24);
         StopwatchFree(tp);
