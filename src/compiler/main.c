@@ -24,6 +24,8 @@
 #else
 #include <unistd.h>
 #include <dirent.h>
+#include <strings.h>
+#include <sys/stat.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -82,10 +84,22 @@ static void canon_key(const char *in, char *out, size_t out_sz) {
 static int input_file_present(const char **files, int count, const char *cand) {
     char ck[1024];
     canon_key(cand, ck, sizeof(ck));
+#ifndef _WIN32
+    struct stat cand_stat;
+    int have_cand_stat = stat(cand, &cand_stat) == 0;
+#endif
     for (int i = 0; i < count; i++) {
         char ek[1024];
         canon_key(files[i], ek, sizeof(ek));
         if (strcmp(ck, ek) == 0) return 1;
+#ifndef _WIN32
+        if (have_cand_stat) {
+            struct stat existing_stat;
+            if (stat(files[i], &existing_stat) == 0 &&
+                cand_stat.st_dev == existing_stat.st_dev &&
+                cand_stat.st_ino == existing_stat.st_ino) return 1;
+        }
+#endif
     }
     return 0;
 }
@@ -103,6 +117,54 @@ static void add_stdlib_input(const char **files, int *count, const char *path) {
         files[(*count)++] = dup;
     }
 }
+
+#ifndef _WIN32
+static int resolve_dir_component(const char *parent, const char *component,
+                                 char *resolved, size_t resolved_sz) {
+    DIR *dir = opendir(parent);
+    if (!dir) return 0;
+    char match_name[256] = {0};
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcasecmp(ent->d_name, component) != 0) continue;
+        if (!match_name[0] || strcmp(ent->d_name, component) == 0)
+            snprintf(match_name, sizeof(match_name), "%s", ent->d_name);
+        if (strcmp(ent->d_name, component) == 0) break;
+    }
+    closedir(dir);
+    if (!match_name[0]) return 0;
+    char candidate[1024];
+    int n = snprintf(candidate, sizeof(candidate), "%s/%s", parent, match_name);
+    if (n < 0 || (size_t)n >= sizeof(candidate)) return 0;
+    DIR *match = opendir(candidate);
+    if (!match) return 0;
+    closedir(match);
+    snprintf(resolved, resolved_sz, "%s", candidate);
+    return 1;
+}
+
+static int resolve_stdlib_dir(const char *stdlib_root, const char *subdir,
+                              char *resolved, size_t resolved_sz) {
+    char current[1024];
+    snprintf(current, sizeof(current), "%s", stdlib_root);
+    const char *p = subdir;
+    while (*p) {
+        char component[256];
+        size_t len = 0;
+        while (p[len] && p[len] != '/') len++;
+        if (len == 0 || len >= sizeof(component)) return 0;
+        memcpy(component, p, len);
+        component[len] = '\0';
+        char next[1024];
+        if (!resolve_dir_component(current, component, next, sizeof(next))) return 0;
+        snprintf(current, sizeof(current), "%s", next);
+        p += len;
+        if (*p == '/') p++;
+    }
+    snprintf(resolved, resolved_sz, "%s", current);
+    return 1;
+}
+#endif
 
 /* Auto-include every *.zan file in stdlib_root/subdir (dedup + existence
  * checked). Returns 1 if any new file was added. `subdir` uses '/' separators
@@ -127,7 +189,8 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
     }
 #else
     char dir_path[1024];
-    snprintf(dir_path, sizeof(dir_path), "%s/%s", stdlib_root, subdir);
+    if (!resolve_stdlib_dir(stdlib_root, subdir, dir_path, sizeof(dir_path)))
+        return 0;
     DIR *d = opendir(dir_path);
     if (d) {
         struct dirent *ent;
@@ -135,8 +198,7 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
             size_t nlen = strlen(ent->d_name);
             if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
             char mod_path[1024];
-            snprintf(mod_path, sizeof(mod_path), "%s/%s/%s",
-                     stdlib_root, subdir, ent->d_name);
+            snprintf(mod_path, sizeof(mod_path), "%s/%s", dir_path, ent->d_name);
             add_stdlib_input(files, count, mod_path);
         }
         closedir(d);
