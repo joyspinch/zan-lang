@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location 'd:\project\zan-lang'
 
 Write-Output "[0/2] Rebuilding native GUI runtime (multi-window)..."
@@ -25,7 +25,7 @@ if ($code -eq 0) {
     Pop-Location
     exit 1
 }
-clang ide_demo.ll zan_icon.res -o ide_demo.exe -O2 -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup -lzan_gui
+clang ide_demo.ll zan_icon.res -o ide_demo.exe -O2 -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup -lzan_gui -llegacy_stdio_definitions
 $lc = $LASTEXITCODE
 Pop-Location
 if ($lc -ne 0) { Write-Output "LINK_FAILED code=$lc"; exit 1 }
