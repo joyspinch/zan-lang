@@ -1547,6 +1547,7 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
 }
 
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
+static zan_type_t *container_elem_type(zan_type_t *t);
 
 /* Best-effort static test for whether an expression yields a `string` value.
  * Used to route `+` to concatenation and `==`/`!=` to strcmp rather than raw
@@ -1569,6 +1570,13 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
     case AST_MEMBER_ACCESS: {
         zan_type_t *ft = member_access_field_type(g, locals, e);
         return ft && ft->kind == TYPE_STRING;
+    }
+    case AST_INDEX: {
+        /* Indexing a List<string>/string[] yields a borrowed string element.
+         * Recognising it keeps `a + list[i]` from releasing the element (which
+         * is still owned by the container). */
+        zan_type_t *et = container_elem_type(infer_expr_type(g, e->index.object, locals));
+        return et && et->kind == TYPE_STRING;
     }
     case AST_BINARY:
         if (e->binary.op == TK_PLUS)
@@ -4922,10 +4930,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMBuildStore(g->builder, prev, j_a);
                     LLVMBuildBr(g->builder, scond_bb);
                     LLVMPositionBuilderAtEnd(g->builder, sdone_bb);
-                    /* store item at index */
+                    /* store item at index. overwrite_old must be 0: Insert
+                     * shifts the previous occupant of this slot up to idx+1
+                     * where it stays live, so it must not be released here
+                     * (doing so frees a still-referenced element). The new
+                     * item is still retained by emit_collection_slot_store. */
                     LLVMValueRef ins_slot = LLVMBuildGEP2(g->builder, i64, phi_data, &idx, 1, "is");
                     emit_collection_slot_store(g, container_elem_type(ltype), i64, ins_slot,
-                        item, expr->call.args.items[1], locals, 1);
+                        item, expr->call.args.items[1], locals, 0);
                     LLVMValueRef nc = LLVMBuildAdd(g->builder, count, LLVMConstInt(i64, 1, 0), "nc");
                     LLVMBuildStore(g->builder, nc, count_ptr);
                     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
