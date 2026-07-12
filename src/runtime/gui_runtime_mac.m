@@ -231,13 +231,32 @@ static void decode_event(NSEvent *ev) {
         long vk = zan_vk_from_keycode([ev keyCode]);
         if (vk == 0) vk = zan_vk_from_chars([ev charactersIgnoringModifiers]);
         evq_push(4, 0, 0, 0, vk, mods);
-        /* Emit typed characters as text input, unless a Ctrl/Cmd shortcut is
-         * active (mods bit0) — matching WM_CHAR filtering on Windows. */
-        if (!(mods & 1)) {
+        /* Emit a WM_CHAR-style text event so widgets receive the same integer
+         * codes as on Win32 (typing, Backspace/Tab/Enter, and Ctrl/Cmd
+         * shortcuts as ASCII control codes). */
+        if (mods & 1) {
+            /* Ctrl or Cmd held: deliver a control code (Ctrl+A..Z => 1..26,
+             * Ctrl+/ => 31) since Cocoa's -characters does not fold these. */
+            NSString *ci = [ev charactersIgnoringModifiers];
+            if ([ci length] == 1) {
+                unichar u = [ci characterAtIndex:0];
+                long code = 0;
+                if (u >= 'a' && u <= 'z') code = u - 'a' + 1;
+                else if (u >= 'A' && u <= 'Z') code = u - 'A' + 1;
+                else if (u == '/') code = 31;
+                if (code) evq_push(6, 0, 0, 0, code, mods);
+            }
+        } else if (vk == 8) {
+            /* Backspace: Cocoa reports 0x7F in -characters; deliver 8 like Win32. */
+            evq_push(6, 0, 0, 0, 8, mods);
+        } else {
             NSString *chars = [ev characters];
             for (NSUInteger i = 0; i < [chars length]; i++) {
                 unichar u = [chars characterAtIndex:i];
-                if (u >= 32 && u != 127) evq_push(6, 0, 0, 0, (long)u, mods);
+                /* printable text plus Tab(9)/Enter(13); skip DEL and the
+                 * 0xF700-0xF8FF private range Cocoa uses for function keys. */
+                if (u < 0xF700 && ((u >= 32 && u != 127) || u == 9 || u == 13))
+                    evq_push(6, 0, 0, 0, (long)u, mods);
             }
         }
         break;

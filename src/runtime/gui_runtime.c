@@ -1382,14 +1382,16 @@ static void x11_translate_event(XEvent *ev) {
             n = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &ks, NULL);
         }
         evq_push_linux(4, 0, 0, 0, x11_vk_from_keysym(ks), mods);
-        /* Emit typed characters as text input unless a Ctrl shortcut is held,
-         * matching WM_CHAR filtering on Windows. */
-        if (n > 0 && !(mods & 1)) {
+        /* Emit a WM_CHAR-style text event for each decoded character. X already
+         * folds Ctrl combos to control codes (e.g. Ctrl+C -> 0x03) and delivers
+         * Backspace/Tab/Enter as 8/9/13, exactly like Win32 WM_CHAR; the widgets
+         * rely on those integer codes for both typing and shortcuts. */
+        if (n > 0) {
             buf[n] = '\0';
             const char *p = buf;
             while (*p) {
                 unsigned cp = x11_utf8_next(&p);
-                if (cp >= 32 && cp != 127)
+                if (cp != 0 && cp != 127)
                     evq_push_linux(6, 0, 0, 0, (int)cp, mods);
             }
         }

@@ -6,28 +6,93 @@ namespace Gui;
 /// Small pure string helpers shared by text-editing widgets (Input, CodeEditor,
 /// filter boxes). Keeping them here means each widget no longer re-implements
 /// character decoding and edit primitives.
+///
+/// Strings are UTF-8 byte arrays and all indices below are byte offsets. The
+/// character helpers keep those offsets on UTF-8 sequence boundaries so multi-
+/// byte characters (CJK, accented Latin, emoji) are inserted, deleted and
+/// navigated as whole characters rather than raw bytes.
 /// </summary>
 class Text {
-    /// Maps a printable ASCII code (32..126) to a one-character string.
-    /// Returns "" for control/non-printable codes so callers can ignore them.
-    static string CharStr(int code) {
-        if (code < 32) { return ""; }
-        if (code > 126) { return ""; }
-        string tbl = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-        return tbl.Substring(code - 32, 1);
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern int sprintf(string buf, string fmt, int val);
+
+    /// One raw byte value (0..255) as a single-byte string.
+    static string ByteChar(int b) {
+        string buf = calloc(2, 1);
+        sprintf(buf, "%c", b);
+        return buf;
     }
 
-    /// True when `code` is a printable ASCII character.
+    /// Encodes a Unicode code point as its UTF-8 string. Returns "" for control
+    /// codes, DEL, lone surrogates and out-of-range values so callers can ignore
+    /// non-text input (the runtime delivers typed characters as code points).
+    static string CharStr(int code) {
+        if (code < 32) { return ""; }
+        if (code == 127) { return ""; }
+        if (code >= 55296 && code <= 57343) { return ""; }
+        if (code > 1114111) { return ""; }
+        if (code < 127) {
+            string tbl = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+            return tbl.Substring(code - 32, 1);
+        }
+        if (code < 2048) {
+            return ByteChar(192 + code / 64) + ByteChar(128 + code % 64);
+        }
+        if (code < 65536) {
+            return ByteChar(224 + code / 4096)
+                 + ByteChar(128 + (code / 64) % 64)
+                 + ByteChar(128 + code % 64);
+        }
+        return ByteChar(240 + code / 262144)
+             + ByteChar(128 + (code / 4096) % 64)
+             + ByteChar(128 + (code / 64) % 64)
+             + ByteChar(128 + code % 64);
+    }
+
+    /// True when `code` is a printable character (any non-control code point).
     static bool IsPrintable(int code) {
         if (code < 32) { return false; }
-        if (code > 126) { return false; }
+        if (code == 127) { return false; }
         return true;
+    }
+
+    /// Number of bytes in the UTF-8 sequence whose lead byte is `b`.
+    static int SeqLen(int b) {
+        if (b < 128) { return 1; }
+        if (b < 224) { return 2; }
+        if (b < 240) { return 3; }
+        return 4;
+    }
+
+    /// Byte index where the character ending just before `pos` starts (scans back
+    /// over UTF-8 continuation bytes). Clamped to 0.
+    static int PrevCharStart(string s, int pos) {
+        if (pos <= 0) { return 0; }
+        int i = pos - 1;
+        while (i > 0) {
+            int b = s[i];
+            if (b >= 128 && b < 192) { i = i - 1; }
+            else { return i; }
+        }
+        return 0;
+    }
+
+    /// Byte index just past the character that starts at `pos`. Clamped to length.
+    static int NextCharEnd(string s, int pos) {
+        int len = s.Length;
+        if (pos >= len) { return len; }
+        int end = pos + Text.SeqLen(s[pos]);
+        if (end > len) { return len; }
+        return end;
     }
 
     /// Removes the last character of `s` (empty string stays empty).
     static string DropLast(string s) {
         if (s.Length <= 1) { return ""; }
-        return s.Substring(0, s.Length - 1);
+        return Text.Left(s, Text.PrevCharStart(s, s.Length));
     }
 
     /// Left slice [0, pos) of `s`, clamped to valid bounds.
@@ -44,15 +109,22 @@ class Text {
         return s.Substring(pos, s.Length - pos);
     }
 
-    /// Inserts `ins` into `s` at index `pos` (0..len).
+    /// Inserts `ins` into `s` at byte index `pos` (0..len).
     static string InsertAt(string s, int pos, string ins) {
         return Text.Left(s, pos) + ins + Text.Right(s, pos);
     }
 
-    /// Removes the single character at index `pos` (no-op if out of range).
+    /// Removes the whole character that starts at byte index `pos` (no-op if out
+    /// of range).
     static string RemoveAt(string s, int pos) {
         if (pos < 0) { return s; }
         if (pos >= s.Length) { return s; }
-        return Text.Left(s, pos) + Text.Right(s, pos + 1);
+        return Text.Left(s, pos) + Text.Right(s, Text.NextCharEnd(s, pos));
+    }
+
+    /// Removes the whole character ending just before byte index `pos` (backspace).
+    static string DeleteBefore(string s, int pos) {
+        if (pos <= 0) { return s; }
+        return Text.Left(s, Text.PrevCharStart(s, pos)) + Text.Right(s, pos);
     }
 }
