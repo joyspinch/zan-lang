@@ -1,0 +1,55 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>Cross-platform cryptographically secure random bytes.
+/// Windows uses the OS CSPRNG (RtlGenRandom / SystemFunction036); POSIX reads
+/// from /dev/urandom (Linux, macOS, BSD). No weak fallback: a caller that asks
+/// for N bytes and gets fewer receives an explicit failure (null / short count),
+/// never predictable or uninitialised data.</summary>
+class RandomNumberGenerator {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    #if WINDOWS
+    [DllImport("advapi32")]
+    static extern int SystemFunction036(string buf, int len);
+    #else
+    // FILE*-based I/O keeps 64-bit return values (pointer / size_t) intact,
+    // avoiding the 32-bit-int return truncation hazard of open()/read().
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern int urandOpen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    static extern int urandRead(string buf, int size, int count, int fp);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int urandClose(int fp);
+    #endif
+
+    /// <summary>Fill the first n bytes of buf with secure random data.
+    /// Returns the number of bytes written (n on success, less on failure).</summary>
+    static int Fill(string buf, int n) {
+        if (n <= 0) { return 0; }
+        #if WINDOWS
+        int ok = SystemFunction036(buf, n);
+        if (ok == 0) { return 0; }
+        return n;
+        #else
+        int fp = urandOpen("/dev/urandom", "rb");
+        if (fp == 0) { return 0; }
+        int got = urandRead(buf, 1, n, fp);
+        urandClose(fp);
+        return got;
+        #endif
+    }
+
+    /// <summary>Allocate a buffer of n secure random bytes (n+1, NUL-terminated).
+    /// Returns null if the OS CSPRNG could not supply n bytes.</summary>
+    static string GetBytes(int n) {
+        string b = calloc(n + 1, 1);
+        int got = Fill(b, n);
+        if (got < n) { return null; }
+        return b;
+    }
+}
