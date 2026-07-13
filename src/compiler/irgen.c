@@ -3025,8 +3025,22 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             return LLVMBuildNeg(g->builder, operand, "neg");
         }
-        case TK_BANG:
+        case TK_BANG: {
+            /* Logical not: true iff the operand is zero/null. A bitwise not
+             * would be wrong for bools materialized wider than i1 (e.g. an i8
+             * `1` bitwise-nots to 0xFE, which is still truthy). */
+            LLVMTypeRef ot = LLVMTypeOf(operand);
+            LLVMTypeKind otk = LLVMGetTypeKind(ot);
+            if (otk == LLVMIntegerTypeKind) {
+                return LLVMBuildICmp(g->builder, LLVMIntEQ, operand,
+                    LLVMConstInt(ot, 0, 0), "lnot");
+            }
+            if (otk == LLVMPointerTypeKind) {
+                return LLVMBuildICmp(g->builder, LLVMIntEQ, operand,
+                    LLVMConstNull(ot), "lnotp");
+            }
             return LLVMBuildNot(g->builder, operand, "not");
+        }
         case TK_TILDE:
             return LLVMBuildNot(g->builder, operand, "bnot");
         default:
