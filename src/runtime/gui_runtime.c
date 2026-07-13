@@ -817,11 +817,18 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_pending_event[4] = (int)wp;
         g_has_event = 1;
         return 0;
-    case WM_MOUSEWHEEL:
+    case WM_MOUSEWHEEL: {
+        POINT wheel_pt = {
+            (int)(short)LOWORD(lp), (int)(short)HIWORD(lp)
+        };
+        ScreenToClient(hwnd, &wheel_pt);
+        g_pending_event[1] = wheel_pt.x;
+        g_pending_event[2] = wheel_pt.y;
         g_pending_event[0] = 13;
         g_pending_event[4] = GET_WHEEL_DELTA_WPARAM(wp);
         g_has_event = 1;
         return 0;
+    }
     case WM_NCCALCSIZE:
         /* Remove the standard window frame so the client area covers the whole
          * window (custom, themeable title bar). Keep the frame inset when

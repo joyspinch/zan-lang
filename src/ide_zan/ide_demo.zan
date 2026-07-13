@@ -687,8 +687,9 @@ class IdeDemo {
             // One shared event pump drives BOTH the main window and any open
             // wizard child window. Poll (to keep animating) when either needs a
             // repaint; otherwise block until the OS delivers an event.
-            bool want = app.needsRedraw;
-            if (dlg != null) {
+            bool want = pathPicker.NeedsRedraw();
+            if (!pathPicker.IsOpen() && app.needsRedraw) { want = true; }
+            if (!pathPicker.IsOpen() && dlg != null) {
                 if (dlg.needsRedraw) { want = true; }
             }
             int r;
@@ -705,16 +706,23 @@ class IdeDemo {
             int kind = app.window.EventKind();
 
             if (kind == 8) {
-                // Close: only the main window quits the app; a wizard window that
-                // closes simply dismisses the wizard.
-                if (evh == app.WindowHandle()) { break; }
-                dlg = null;
-                dlgMode = 0;
-                if (pathPickerOwner == 1) {
-                    pathPicker.Close();
-                    pathPickerOwner = 0;
+                if (pathPicker.OwnsWindow(evh)) {
+                    pathPicker.ApplyEvent(evh);
+                } else if (!pathPicker.IsOpen()) {
+                    // Close: only the main window quits the app; a wizard window
+                    // that closes simply dismisses the wizard.
+                    if (evh == app.WindowHandle()) { break; }
+                    dlg = null;
+                    dlgMode = 0;
+                    if (pathPickerOwner == 1) {
+                        pathPicker.Close();
+                        pathPickerOwner = 0;
+                    }
+                    app.RequestRedraw();
                 }
-                app.RequestRedraw();
+            } else if (pathPicker.IsOpen()
+                       || pathPicker.OwnsWindow(evh)) {
+                pathPicker.ApplyEvent(evh);
             } else {
                 app.ApplyEvent(evh);
                 if (dlg != null) { dlg.ApplyEvent(evh); }
@@ -858,7 +866,7 @@ class IdeDemo {
             }
 
             // ---------------- main IDE window ----------------
-            if (app.needsRedraw) {
+            if (app.needsRedraw && !pathPicker.IsOpen()) {
                 app.BeginFrame();
                 Canvas c = app.canvas;
                 Theme t = app.theme;
@@ -1782,7 +1790,7 @@ class IdeDemo {
                 }
 
                 // Project configuration overlay (modal): icon + static resources.
-                if (cfgOpen && !(pathPicker.IsOpen() && pathPickerOwner >= 2)) {
+                if (cfgOpen) {
                     int cAct = IdeDemo.RenderProjectConfigDialog(app, root, log);
                     if (cAct == 1) {
                         cfgOpen = false;
@@ -1802,31 +1810,6 @@ class IdeDemo {
                         app.RequestRedraw();
                     }
                 }
-                if (pathPicker.IsOpen() && pathPickerOwner >= 2) {
-                    int pAct = pathPicker.Render(app);
-                    if (pAct == 1) {
-                        string picked = pathPicker.SelectedPath();
-                        IdeDemo.WriteLastPickerDirectory(pathPicker.CurrentDirectory());
-                        if (pathPickerOwner == 2) {
-                            string ad = IdeDemo.AssetsDir(root);
-                            Directory.CreateDirectoryRecursive(ad);
-                            File.Copy(picked, ad + "/app.ico");
-                            IdeDemo.SetProjectIcon(root, "assets/app.ico");
-                            log.Add("> App icon set: assets/app.ico (embedded into the exe on the next Build/Run/Publish).");
-                        } else {
-                            string ad = IdeDemo.AssetsDir(root);
-                            Directory.CreateDirectoryRecursive(ad);
-                            string nm = Path.GetFileName(picked);
-                            File.Copy(picked, ad + "/" + nm);
-                            log.Add("> Added resource: assets/" + nm);
-                        }
-                        pathPickerOwner = 0;
-                        app.RequestRedraw();
-                    } else if (pAct == 2) {
-                        pathPickerOwner = 0;
-                        app.RequestRedraw();
-                    }
-                }
                 app.RenderChrome("Zan IDE  —  " + root);
                 app.PresentFrame();
                 lastPresent = Window.GetTickMs();
@@ -1834,22 +1817,10 @@ class IdeDemo {
 
             // ---------------- wizard child window ----------------
             if (dlg != null) {
-                if (dlg.needsRedraw) {
+                if (dlg.needsRedraw && !pathPicker.IsOpen()) {
                     dlg.BeginFrame();
                     int action = 0;
-                    if (pathPicker.IsOpen() && pathPickerOwner == 1) {
-                        int pAct = pathPicker.Render(dlg);
-                        if (pAct == 1) {
-                            string picked = pathPicker.SelectedPath();
-                            IdeDemo.WriteLastPickerDirectory(pathPicker.CurrentDirectory());
-                            pLocInput.SetText(picked);
-                            pathPickerOwner = 0;
-                            dlg.RequestRedraw();
-                        } else if (pAct == 2) {
-                            pathPickerOwner = 0;
-                            dlg.RequestRedraw();
-                        }
-                    } else if (dlgMode == 1) {
+                    if (dlgMode == 1) {
                         action = Wizard.RenderCategorized(dlg, IdeDemo.T("New Project", "新建项目"), catNames, catSel,
                                                           tCats, tNames, tIcons, tDescs, pSel,
                                                           pNameInput, pLocInput,
@@ -1910,6 +1881,40 @@ class IdeDemo {
                         }
                     }
                 }
+            }
+
+            if (pathPicker.NeedsRedraw()) {
+                pathPicker.RenderWindow();
+                lastPresent = Window.GetTickMs();
+            }
+            int pickerResult = pathPicker.TakeResult();
+            if (pickerResult == 1) {
+                string picked = pathPicker.SelectedPath();
+                IdeDemo.WriteLastPickerDirectory(
+                    pathPicker.CurrentDirectory());
+                if (pathPickerOwner == 1) {
+                    pLocInput.SetText(picked);
+                    if (dlg != null) { dlg.RequestRedraw(); }
+                } else if (pathPickerOwner == 2) {
+                    string ad = IdeDemo.AssetsDir(root);
+                    Directory.CreateDirectoryRecursive(ad);
+                    File.Copy(picked, ad + "/app.ico");
+                    IdeDemo.SetProjectIcon(root, "assets/app.ico");
+                    log.Add(
+                        "> App icon set: assets/app.ico (embedded into the exe on the next Build/Run/Publish).");
+                } else if (pathPickerOwner == 3) {
+                    string ad = IdeDemo.AssetsDir(root);
+                    Directory.CreateDirectoryRecursive(ad);
+                    string nm = Path.GetFileName(picked);
+                    File.Copy(picked, ad + "/" + nm);
+                    log.Add("> Added resource: assets/" + nm);
+                }
+                pathPickerOwner = 0;
+                app.RequestRedraw();
+            } else if (pickerResult == 2) {
+                pathPickerOwner = 0;
+                if (dlg != null) { dlg.RequestRedraw(); }
+                app.RequestRedraw();
             }
 
             if (rescan) {
