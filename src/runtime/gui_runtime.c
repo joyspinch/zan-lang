@@ -15,10 +15,12 @@
 #include <rpc.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
+#include <imm.h>
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "imm32.lib")
 /* When ZAN_GUI_STATIC is defined the runtime is compiled into a static archive
  * and linked directly into the executable (no zan_gui.dll dependency). The lib
  * pragmas above are honored by lld-link even in that mode, so the Win32 system
@@ -821,9 +823,49 @@ static int g_btn_w = 46;
  * area (clickable) rather than draggable caption. */
 static int g_caption_btn_count = 5;
 
+/* Caret position (client-area px) reported by the focused text widget so the
+ * IME composition + candidate windows follow the cursor instead of pinning to
+ * the window origin. Updated from Zan via zan_gui_set_ime_pos each frame. */
+static int g_ime_x = 0;
+static int g_ime_y = 0;
+
+/* Move the active input context's composition + candidate windows to the caret.
+ * Safe to call whenever; no-op if the window has no IMM context. */
+static void zan_ime_reposition(HWND hwnd) {
+    HIMC himc = ImmGetContext(hwnd);
+    if (!himc) { return; }
+    COMPOSITIONFORM cf;
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = g_ime_x;
+    cf.ptCurrentPos.y = g_ime_y;
+    ImmSetCompositionWindow(himc, &cf);
+    CANDIDATEFORM cand;
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_CANDIDATEPOS;
+    cand.ptCurrentPos.x = g_ime_x;
+    cand.ptCurrentPos.y = g_ime_y;
+    cand.rcArea.left = 0;
+    cand.rcArea.top = 0;
+    cand.rcArea.right = 0;
+    cand.rcArea.bottom = 0;
+    ImmSetCandidateWindow(himc, &cand);
+    ImmReleaseContext(hwnd, himc);
+}
+
 static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     g_event_hwnd = hwnd;
     switch (msg) {
+    case WM_IME_STARTCOMPOSITION:
+        /* Position the composition window at the caret before the IME draws it,
+         * then let DefWindowProc run the normal composition handling. */
+        zan_ime_reposition(hwnd);
+        break;
+    case WM_IME_COMPOSITION:
+        zan_ime_reposition(hwnd);
+        break;
+    case WM_IME_SETCONTEXT:
+        zan_ime_reposition(hwnd);
+        break;
     case WM_DESTROY:
         g_pending_event[0] = 8;
         g_has_event = 1;
@@ -1264,6 +1306,14 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
     CloseClipboard();
     /* Ownership of hmem transferred to the clipboard; do not free. */
     return 0;
+}
+
+/* Report the caret position (client-area px) so the IME composition/candidate
+ * windows follow the cursor. Called each frame by the focused text widget. */
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
+    g_ime_x = (int)x;
+    g_ime_y = (int)y;
+    if (g_event_hwnd) { zan_ime_reposition(g_event_hwnd); }
 }
 
 /* Read CF_UNICODETEXT from the Windows clipboard as a UTF-8 string. Returns a
@@ -2838,6 +2888,11 @@ static int x11_read_selection(Atom selection, Atom target, char **out) {
     }
 }
 
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
+    /* X11 IME (XIM over-the-spot) not wired yet; accept + ignore. */
+    (void)x; (void)y;
+}
+
 EXPORT const char *zan_gui_get_clipboard(void) {
     if (!g_display || !g_x11_window) return "";
     Atom clipboard = x11_atom("CLIPBOARD");
@@ -2924,4 +2979,5 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT const char *zan_gui_get_clipboard(void) { return ""; }
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
 #endif

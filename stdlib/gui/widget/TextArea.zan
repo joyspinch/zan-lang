@@ -12,17 +12,23 @@ namespace Gui.Widget;
 /// and it keeps the caret in view while typing) — so a call site is just:
 ///
 ///   TextArea notes = TextArea.Create("Write something...");   // once
+///   notes.Change += () => { ... };                            // C#-style
 ///   notes.Render(app, x, y, w, h);                            // each frame
 ///   string value = notes.GetText();
 ///
-/// For read-only code display / syntax features use CodeEditor; this is the
-/// plain editable multi-line field.
+/// It has a stable identity (focus survives sibling/popup churn), the framework
+/// resolves its focus/click, and it reports the caret so the IME composition
+/// window follows the cursor. For read-only code display / syntax features use
+/// CodeEditor; this is the plain editable multi-line field.
 /// </summary>
 class TextArea {
     SignalString model;
     string hint;
     int cursorPos;
     int scrollY;
+    int wid;
+    /// Fires whenever the text changes (C#-style: `area.Change += h;`).
+    UiEvent Change;
 
     static TextArea Create(string hintText) {
         return TextArea.Bind(SignalString.Create(""), hintText);
@@ -34,6 +40,8 @@ class TextArea {
         a.hint = hintText;
         a.cursorPos = 0;
         a.scrollY = 0;
+        a.wid = WidgetId.Next();
+        a.Change = UiEvent.Create();
         return a;
     }
 
@@ -74,21 +82,25 @@ class TextArea {
                     int start = Text.PrevCharStart(txt, cursorPos);
                     model.Set(Text.DeleteBefore(txt, cursorPos));
                     cursorPos = start;
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             } else if (code == 13) {
                 model.Set(Text.InsertAt(txt, cursorPos, "\n"));
                 cursorPos = cursorPos + 1;
+                Change.Raise();
                 app.RequestRedraw();
             } else if (code == 9) {
                 model.Set(Text.InsertAt(txt, cursorPos, "  "));
                 cursorPos = cursorPos + 2;
+                Change.Raise();
                 app.RequestRedraw();
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
                     model.Set(Text.InsertAt(txt, cursorPos, ch));
                     cursorPos = cursorPos + ch.Length;
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             }
@@ -126,6 +138,7 @@ class TextArea {
             } else if (kc == 46) {
                 if (cursorPos < txt.Length) {
                     model.Set(Text.RemoveAt(txt, cursorPos));
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             }
@@ -133,10 +146,11 @@ class TextArea {
     }
 
     int Render(App app, int x, int y, int w, int h) {
-        int id = app.focus.AllocId();
+        int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
 
+        app.focus.RegisterFocusable(id);
         bool hovered = app.focus.IsHovered(id);
         bool focused = app.focus.IsFocused(id);
 
@@ -203,7 +217,10 @@ class TextArea {
             if (focused) {
                 int caretX = innerX + Canvas.MeasureText(caretPrefix, t.fontSizeMedium);
                 int caretY = innerY + caretLine * lineH - scrollY;
-                c.FillRect(caretX, caretY, 1, Canvas.FontHeight(t.fontSizeMedium), t.primary);
+                int fh = Canvas.FontHeight(t.fontSizeMedium);
+                c.FillRect(caretX, caretY, 1, fh, t.primary);
+                // Keep the IME composition window at the caret.
+                app.SetImeCaret(caretX, caretY + fh);
             }
         }
         c.PopClip();
@@ -223,19 +240,18 @@ class TextArea {
 
         app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 1));
 
-        // Click to place the caret.
-        if (app.window.EventKind() == 3) {
-            if (app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
-                int relY = app.mouseY - innerY + scrollY;
-                int line = relY / lineH;
-                if (line < 0) { line = 0; }
-                if (line >= lines.Count) { line = lines.Count - 1; }
-                int relX = app.mouseX - innerX;
-                int col = CodeEditor.ColFromX(lines[line], relX, t.fontSizeMedium);
-                cursorPos = this.LineStartAbs(lines, line) + col;
-                this.ClampCursor();
-                app.RequestRedraw();
-            }
+        // Single-consumer click: place the caret when this area is the click
+        // target resolved by the framework.
+        if (Ui.Clicked(app, id)) {
+            int relY = app.mouseY - innerY + scrollY;
+            int line = relY / lineH;
+            if (line < 0) { line = 0; }
+            if (line >= lines.Count) { line = lines.Count - 1; }
+            int relX = app.mouseX - innerX;
+            int col = CodeEditor.ColFromX(lines[line], relX, t.fontSizeMedium);
+            cursorPos = this.LineStartAbs(lines, line) + col;
+            this.ClampCursor();
+            app.RequestRedraw();
         }
 
         return id;

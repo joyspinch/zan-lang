@@ -236,7 +236,7 @@ set(ZAN_GUI_AVAILABLE FALSE)
 if(ZAN_BUILD_GUI)
     if(WIN32)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c)
-        target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore)
+        target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32)
         set(ZAN_GUI_AVAILABLE TRUE)
     elseif(APPLE)
         # Real Cocoa backend (Objective-C) + shared software renderer. The C file

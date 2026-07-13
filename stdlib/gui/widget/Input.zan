@@ -4,19 +4,36 @@ using Gui;
 namespace Gui.Widget;
 
 /// Single-line text input with a caret, placeholder and reactive binding.
+///
+/// Retained, C#-style widget: it has a stable identity (so focus survives
+/// sibling/popup churn), the framework resolves focus/click for it, and it
+/// exposes delegate events:
+///     Input name = Input.Bind(model, "your name");
+///     name.Change += () => { ... };   // fires on every edit
+///     name.Submit += () => { ... };   // fires on Enter
+///     name.Render(app, x, y, w, h);
 /// When focused it consumes keyboard events (printable chars, Backspace,
-/// Delete, Left/Right/Home/End) and edits its bound SignalString in place, so
-/// it is a fully working text field rather than a display-only box.
+/// Delete, Left/Right/Home/End) and edits its bound SignalString in place, and
+/// reports the caret position to the framework so the IME composition window
+/// follows the cursor.
 class Input {
     SignalString model;
     string hint;
     int cursorPos;
+    int wid;
+    /// Fires whenever the text changes (C#-style: `inp.Change += h;`).
+    UiEvent Change;
+    /// Fires when Enter is pressed while focused.
+    UiEvent Submit;
 
     static Input Create(string hintText) {
         Input inp = new Input();
         inp.model = SignalString.Create("");
         inp.hint = hintText;
         inp.cursorPos = 0;
+        inp.wid = WidgetId.Next();
+        inp.Change = UiEvent.Create();
+        inp.Submit = UiEvent.Create();
         return inp;
     }
 
@@ -25,6 +42,9 @@ class Input {
         inp.model = sig;
         inp.hint = hintText;
         inp.cursorPos = 0;
+        inp.wid = WidgetId.Next();
+        inp.Change = UiEvent.Create();
+        inp.Submit = UiEvent.Create();
         return inp;
     }
 
@@ -51,17 +71,20 @@ class Input {
                     int start = Text.PrevCharStart(txt, cursorPos);
                     model.Set(Text.DeleteBefore(txt, cursorPos));
                     cursorPos = start;
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             } else if (code == 13) {
-                // ignore newline in single-line input
+                Submit.Raise();
+                app.RequestRedraw();
             } else if (code == 9) {
-                // ignore tab
+                // ignore tab (handled by framework focus traversal)
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
                     model.Set(Text.InsertAt(txt, cursorPos, ch));
                     cursorPos = cursorPos + ch.Length;
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             }
@@ -74,6 +97,7 @@ class Input {
             else if (kc == 46) {
                 if (cursorPos < txt.Length) {
                     model.Set(Text.RemoveAt(txt, cursorPos));
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             }
@@ -81,10 +105,11 @@ class Input {
     }
 
     int Render(App app, int x, int y, int w, int h) {
-        int id = app.focus.AllocId();
+        int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
 
+        app.focus.RegisterFocusable(id);
         bool hovered = app.focus.IsHovered(id);
         bool focused = app.focus.IsFocused(id);
 
@@ -112,16 +137,18 @@ class Input {
             int cursorX = x + t.paddingSmall + Canvas.MeasureText(upto, t.fontSizeMedium);
             int cursorH = Canvas.FontHeight(t.fontSizeMedium);
             c.FillRect(cursorX, textY, 1, cursorH, t.primary);
+            // Keep the IME composition window at the caret.
+            app.SetImeCaret(cursorX, textY + cursorH);
         }
 
         app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 1));
 
-        if (app.window.EventKind() == 3) {
-            if (app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
-                int rel = app.mouseX - (x + t.paddingSmall);
-                cursorPos = CodeEditor.ColFromX(txt, rel, t.fontSizeMedium);
-                app.RequestRedraw();
-            }
+        // Single-consumer click: place the caret when this input is the click
+        // target resolved by the framework.
+        if (Ui.Clicked(app, id)) {
+            int rel = app.mouseX - (x + t.paddingSmall);
+            cursorPos = CodeEditor.ColFromX(txt, rel, t.fontSizeMedium);
+            app.RequestRedraw();
         }
 
         return id;
