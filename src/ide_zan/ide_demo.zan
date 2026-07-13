@@ -333,6 +333,46 @@ class IdeDemo {
         return picked;
     }
 
+    /// Launches the native folder picker WITHOUT blocking the IDE: the picker
+    /// runs as a detached child that writes the chosen directory (or the sentinel
+    /// "@CANCELLED") to `resultPath`. The caller polls `resultPath` each frame so
+    /// the IDE keeps pumping messages (no "Not Responding" freeze while the modal
+    /// dialog is open). Any stale result file is removed first.
+    static void PickFolderStart(string initial, string resultPath) {
+        if (File.Exists(resultPath)) { File.Delete(resultPath); }
+        #if WINDOWS
+        string cfgDir = IdeDemo.UserConfigDir();
+        Directory.CreateDirectoryRecursive(cfgDir);
+        string ps1 = cfgDir + "/pickfolder.ps1";
+        string outWin = IdeDemo.ToWinPath(resultPath);
+        string script = "Add-Type -AssemblyName System.Windows.Forms | Out-Null\n"
+            + "$f = New-Object System.Windows.Forms.FolderBrowserDialog\n"
+            + "$f.Description = 'Select project location'\n"
+            + "$f.SelectedPath = '" + IdeDemo.ToWinPath(initial) + "'\n"
+            + "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $p = $f.SelectedPath } else { $p = '@CANCELLED' }\n"
+            + "[System.IO.File]::WriteAllText('" + outWin + "', $p)\n";
+        File.WriteAllText(ps1, script);
+        Process.RunDetached("powershell -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File \"" + IdeDemo.ToWinPath(ps1) + "\"");
+        #elif MACOS
+        Process.RunDetached("p=$(osascript -e 'POSIX path of (choose folder with prompt \"Select project location\")' 2>/dev/null); if [ -z \"$p\" ]; then p='@CANCELLED'; fi; printf '%s' \"$p\" > \"" + resultPath + "\"");
+        #else
+        Process.RunDetached("p=$(zenity --file-selection --directory --title=\"Select project location\" 2>/dev/null); if [ -z \"$p\" ]; then p='@CANCELLED'; fi; printf '%s' \"$p\" > \"" + resultPath + "\"");
+        #endif
+    }
+
+    /// Reads the result written by PickFolderStart. Returns "" while the picker
+    /// is still open (no result yet), "@CANCELLED" when it was dismissed, or the
+    /// chosen directory. Once a result is present the file is consumed.
+    static string PickFolderPoll(string resultPath) {
+        if (!File.Exists(resultPath)) { return ""; }
+        string raw = IdeDemo.NormSlashes(File.ReadAllText(resultPath));
+        File.Delete(resultPath);
+        raw = IdeDemo.TrimTrailSpaces(IdeDemo.TrimLeadSpaces(raw));
+        if (raw == "" || raw == "@CANCELLED") { return "@CANCELLED"; }
+        if (!Directory.Exists(raw)) { return "@CANCELLED"; }
+        return raw;
+    }
+
     /// Opens a native file-open dialog and returns the chosen file (normalized to
     /// forward slashes), or "" if cancelled. `filter` uses the Win32 dialog syntax
     /// (`Label|*.ext|...`); it is ignored on other platforms.
@@ -575,6 +615,11 @@ class IdeDemo {
         // dlgMode: 1=new-project, 2=new-file, 3=save-as-template.
         App dlg = null;
         int dlgMode = 0;
+        // Async folder-picker: the native picker runs detached and writes its
+        // result here; polled each frame so the IDE never freezes ("未响应")
+        // while the modal dialog is open.
+        bool pickPending = false;
+        string pickResultPath = IdeDemo.UserConfigDir() + "/pickfolder.result";
         SignalInt catSel = SignalInt.Create(0);
         SignalInt pSel = SignalInt.Create(0);
         SignalInt fSel = SignalInt.Create(0);
@@ -1886,15 +1931,36 @@ class IdeDemo {
                         dlgMode = 0;
                         app.RequestRedraw();
                     } else if (action == 3) {
-                        // Browse: open the native folder picker and apply the
-                        // chosen directory to the New Project location field.
-                        if (dlgMode == 1) {
-                            string picked = IdeDemo.PickFolder(pLocInput.GetText());
-                            if (picked != "") { pLocInput.SetText(picked); }
-                            dlg.RequestRedraw();
-                            app.RequestRedraw();
+                        // Browse: launch the native folder picker detached and
+                        // poll for its result on later frames, so the IDE keeps
+                        // pumping messages instead of freezing ("未响应") while
+                        // the modal dialog is open.
+                        if (dlgMode == 1 && !pickPending) {
+                            IdeDemo.PickFolderStart(pLocInput.GetText(), pickResultPath);
+                            pickPending = true;
+                            log.Add("> " + IdeDemo.T("Choose a project folder in the dialog...",
+                                                     "请在弹出的对话框中选择项目文件夹..."));
                         }
                     }
+                }
+            }
+
+            // Poll the async folder picker. Keep requesting redraws while it is
+            // pending so this pump stays active (and repaints) until the user
+            // picks or cancels; apply the chosen folder to the Location field.
+            if (pickPending) {
+                string picked = IdeDemo.PickFolderPoll(pickResultPath);
+                if (picked == "") {
+                    // Still open: keep pumping/repainting so the IDE stays
+                    // responsive while the modal picker is up.
+                    if (dlg != null) { dlg.RequestRedraw(); }
+                    app.RequestRedraw();
+                    Window.SleepMs(30);
+                } else {
+                    pickPending = false;
+                    if (picked != "@CANCELLED") { pLocInput.SetText(picked); }
+                    if (dlg != null) { dlg.RequestRedraw(); }
+                    app.RequestRedraw();
                 }
             }
 
