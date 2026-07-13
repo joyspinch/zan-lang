@@ -45,6 +45,16 @@ class Gallery {
     static SignalInt codeScroll;
     static List<Comp> comps;
 
+    // Read-only code selection (line/col anchor..focus into the current
+    // snippet's split lines). selDrag is true while the mouse button is held.
+    static bool selHas;
+    static bool selDrag;
+    static int selAL;
+    static int selAC;
+    static int selFL;
+    static int selFC;
+    static int copiedFrame;
+
     static void Main() {
         App app = App.CreateDark("Zan GUI Components", 1120, 720);
         Gallery.demoBool = SignalBool.Create(true);
@@ -53,13 +63,18 @@ class Gallery {
         Gallery.selected = SignalInt.Create(0);
         Gallery.navScroll = SignalInt.Create(0);
         Gallery.codeScroll = SignalInt.Create(0);
+        Gallery.selHas = false;
+        Gallery.selDrag = false;
+        Gallery.copiedFrame = 0;
         Gallery.comps = new List<Comp>();
         Gallery.BuildComps(Gallery.comps);
 
         app.Show();
         while (app.isRunning) {
             if (!app.ProcessEvent()) { break; }
-            if (!app.needsRedraw) { continue; }
+            // Motion events don't flag a repaint on their own, so force a frame
+            // while a code selection drag is in progress to track the pointer.
+            if (!app.needsRedraw && !Gallery.selDrag) { continue; }
             app.BeginFrame();
             Gallery.Render(app);
             app.RenderChrome("Zan GUI Components");
@@ -174,6 +189,8 @@ class Gallery {
                     if (click && hot) {
                         Gallery.selected.Set(d);
                         Gallery.codeScroll.Set(0);
+                        Gallery.selHas = false;
+                        Gallery.selDrag = false;
                         app.RequestRedraw();
                     }
                 }
@@ -215,11 +232,14 @@ class Gallery {
         Gallery.RenderCode(app, c, t, e, cx, cy, cw, area);
     }
 
-    /// Code panel with a Copy button, matching the IDE documentation style.
+    /// Code panel: line-number gutter, Zan syntax highlighting, a Copy button
+    /// for the whole snippet, and drag-to-select (which copies the selection to
+    /// the clipboard on release). Matches the IDE editor's colors.
     static void RenderCode(App app, Canvas c, Theme t, Comp e,
             int cx, int cy, int cw, Rect area) {
         List<string> codeLines = CodeEditor.SplitLines(e.code);
-        int codeLineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
+        int fs = t.fontSizeSmall;
+        int codeLineH = Canvas.FontHeight(fs) + app.Scale(4);
         int hdrH = app.Scale(28);
         int panelH = hdrH + codeLines.Count * codeLineH + app.Scale(16);
         int maxPanelH = area.y + area.height - app.Scale(16) - cy;
@@ -230,8 +250,19 @@ class Gallery {
         c.FillRoundRect(cx, cy, cw, panelH, app.Scale(6), 0xFF1E1E1E);
         c.DrawRect(cx, cy, cw, panelH, t.borderPrimary, 1);
         c.FillRect(cx, cy + hdrH, cw, 1, 0xFF2D2D30);
-        c.DrawText(cx + app.Scale(12), cy + app.Scale(7), "Zan",
-            t.textTertiary, t.fontSizeSmall);
+
+        // Gutter background.
+        int gnW = Canvas.MeasureText(Convert.ToString(codeLines.Count), fs);
+        int gutterW = gnW + app.Scale(20);
+        int textX = cx + gutterW + app.Scale(8);
+        int codeY0 = cy + hdrH + app.Scale(8);
+        int codeBottom = cy + panelH - app.Scale(6);
+        c.FillRect(cx + 1, cy + hdrH + 1, gutterW, panelH - hdrH - 2, 0xFF181818);
+
+        string hdr = "Zan";
+        if (Gallery.selHas && Gallery.SelNonEmpty()) { hdr = "Zan  -  selection copied"; }
+        c.DrawText(cx + app.Scale(12), cy + app.Scale(7), hdr,
+            t.textTertiary, fs);
 
         int cpW = app.Scale(74);
         int cpH = app.Scale(20);
@@ -245,18 +276,23 @@ class Gallery {
         Icon.Draw(c, "copy", cpX + app.Scale(8), cpY + app.Scale(4),
             app.Scale(12), 0xFFFFFFFF);
         c.DrawText(cpX + app.Scale(24), cpY + app.Scale(3), "Copy",
-            0xFFFFFFFF, t.fontSizeSmall);
+            0xFFFFFFFF, fs);
         if (app.window.EventKind() == 3 && cpHot) {
             Clipboard.SetText(e.code);
             app.RequestRedraw();
         }
 
-        int codeY = cy + hdrH + app.Scale(8);
-        int codeBottom = cy + panelH - app.Scale(6);
-        int visibleCodeLines = (codeBottom - codeY) / codeLineH;
+        int visibleCodeLines = (codeBottom - codeY0) / codeLineH;
         if (visibleCodeLines < 1) { visibleCodeLines = 1; }
         int maxCodeScroll = codeLines.Count - visibleCodeLines;
         if (maxCodeScroll < 0) { maxCodeScroll = 0; }
+
+        bool inText = app.mouseX >= cx && app.mouseX < cx + cw - app.Scale(10)
+            && app.mouseY >= codeY0 && app.mouseY < codeBottom;
+        int scrollW = 0;
+        if (maxCodeScroll > 0) { scrollW = app.Scale(10); }
+        int textRight = cx + cw - app.Scale(6) - scrollW;
+
         if (app.window.EventKind() == 13
             && app.mouseX >= cx && app.mouseX < cx + cw
             && app.mouseY >= cy && app.mouseY < cy + panelH) {
@@ -274,13 +310,77 @@ class Gallery {
         if (codeScroll > maxCodeScroll) { codeScroll = maxCodeScroll; }
         Gallery.codeScroll.Set(codeScroll);
 
+        // Selection input: press to anchor, drag to extend, release to copy.
+        int ek = app.window.EventKind();
+        if (ek == 2 && app.window.EventButton() == 0 && inText) {
+            int hl = Gallery.HitLine(codeLines, codeScroll, app.mouseY, codeY0, codeLineH);
+            int hc = CodeEditor.ColFromX(codeLines[hl], app.mouseX - textX, fs);
+            Gallery.selAL = hl; Gallery.selAC = hc;
+            Gallery.selFL = hl; Gallery.selFC = hc;
+            Gallery.selHas = true;
+            Gallery.selDrag = true;
+            app.RequestRedraw();
+        } else if (ek == 1 && Gallery.selDrag) {
+            int hl = Gallery.HitLine(codeLines, codeScroll, app.mouseY, codeY0, codeLineH);
+            int hc = CodeEditor.ColFromX(codeLines[hl], app.mouseX - textX, fs);
+            Gallery.selFL = hl; Gallery.selFC = hc;
+            app.RequestRedraw();
+        } else if (ek == 3 && Gallery.selDrag) {
+            Gallery.selDrag = false;
+            if (Gallery.SelNonEmpty()) {
+                Clipboard.SetText(Gallery.SelectedText(codeLines));
+            } else {
+                Gallery.selHas = false;
+            }
+            app.RequestRedraw();
+        }
+
+        // Normalized selection bounds for drawing.
+        int nsL = Gallery.selAL; int nsC = Gallery.selAC;
+        int neL = Gallery.selFL; int neC = Gallery.selFC;
+        if (nsL > neL || (nsL == neL && nsC > neC)) {
+            nsL = Gallery.selFL; nsC = Gallery.selFC;
+            neL = Gallery.selAL; neC = Gallery.selAC;
+        }
+
+        int codeY = codeY0;
         int ci = codeScroll;
         while (ci < codeLines.Count) {
             if (codeY + codeLineH > codeBottom) {
                 ci = codeLines.Count;
             } else {
-                c.DrawText(cx + app.Scale(12), codeY, codeLines[ci],
-                    0xFFD4D4D4, t.fontSizeSmall);
+                string ln = codeLines[ci];
+
+                c.DrawText(cx + gutterW - gnW - app.Scale(6), codeY,
+                    Convert.ToString(ci + 1), 0xFF6E7681, fs);
+
+                if (Gallery.selHas && ci >= nsL && ci <= neL) {
+                    int sCol = 0;
+                    if (ci == nsL) { sCol = nsC; }
+                    int eCol = ln.Length;
+                    if (ci == neL) { eCol = neC; }
+                    if (sCol < 0) { sCol = 0; }
+                    if (eCol > ln.Length) { eCol = ln.Length; }
+                    int x0 = textX + Canvas.MeasureText(Text.Left(ln, sCol), fs);
+                    int x1 = textX + Canvas.MeasureText(Text.Left(ln, eCol), fs);
+                    if (ci < neL) { x1 = x1 + app.Scale(6); }
+                    if (x1 < x0 + app.Scale(2)) { x1 = x0 + app.Scale(2); }
+                    if (x1 > textRight) { x1 = textRight; }
+                    c.FillRect(x0, codeY - app.Scale(1), x1 - x0,
+                        codeLineH, 0x553B79C7);
+                }
+
+                List<string> segT = new List<string>();
+                List<int> segC = new List<int>();
+                CodeEditor.HighlightSpans(ln, 0xFF569CD6, 0xFF4EC9B0,
+                    0xFFCE9178, 0xFF6A9955, 0xFFB5CEA8, 0xFFD4D4D4, segT, segC);
+                int sx = textX;
+                int si = 0;
+                while (si < segT.Count) {
+                    c.DrawText(sx, codeY, segT[si], segC[si], fs);
+                    sx = sx + Canvas.MeasureText(segT[si], fs);
+                    si = si + 1;
+                }
                 codeY = codeY + codeLineH;
                 ci = ci + 1;
             }
@@ -290,6 +390,51 @@ class Gallery {
                 cy + hdrH + app.Scale(4), panelH - hdrH - app.Scale(8),
                 codeLines.Count * codeLineH, codeScroll * codeLineH);
         }
+    }
+
+    /// Maps a mouse y to a code line index (clamped to the snippet).
+    static int HitLine(List<string> lines, int scroll, int my,
+            int codeY0, int lineH) {
+        int hl = scroll + (my - codeY0) / lineH;
+        if (hl < 0) { hl = 0; }
+        if (hl >= lines.Count) { hl = lines.Count - 1; }
+        return hl;
+    }
+
+    /// True when the current selection spans at least one character.
+    static bool SelNonEmpty() {
+        if (Gallery.selAL != Gallery.selFL) { return true; }
+        return Gallery.selAC != Gallery.selFC;
+    }
+
+    /// Extracts the selected substring from the split snippet lines.
+    static string SelectedText(List<string> lines) {
+        int sL = Gallery.selAL; int sC = Gallery.selAC;
+        int eL = Gallery.selFL; int eC = Gallery.selFC;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            sL = Gallery.selFL; sC = Gallery.selFC;
+            eL = Gallery.selAL; eC = Gallery.selAC;
+        }
+        if (sL < 0) { sL = 0; }
+        if (eL >= lines.Count) { eL = lines.Count - 1; }
+        if (sL == eL) {
+            string only = lines[sL];
+            if (sC < 0) { sC = 0; }
+            if (eC > only.Length) { eC = only.Length; }
+            return only.Substring(sC, eC - sC);
+        }
+        string first = lines[sL];
+        if (sC < 0) { sC = 0; }
+        string res = first.Substring(sC, first.Length - sC);
+        int i = sL + 1;
+        while (i < eL) {
+            res = res + "\n" + lines[i];
+            i = i + 1;
+        }
+        string last = lines[eL];
+        if (eC > last.Length) { eC = last.Length; }
+        res = res + "\n" + last.Substring(0, eC);
+        return res;
     }
 
     // ------------------------------------------------------------------
