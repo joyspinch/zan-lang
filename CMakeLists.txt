@@ -344,12 +344,7 @@ endforeach()
 # documented ARC follow-up) are marked WILL_FAIL so this gate stays green while
 # still catching *new* leaks; fixing such a leak flips its test to failing, a
 # reminder to drop it from the allow-list below.
-# crossplat_stdlib lists a directory, and the returned List<string> keeps its
-# heap-built element strings reachable at exit (the documented ARC follow-up:
-# rc objects owned by a List/array are not released when the owner dies). The
-# leak is platform-independent, so it is allow-listed rather than masking a
-# real regression; the conformance/determinism gates still validate behaviour.
-set(_known_leaky crossplat_stdlib)
+set(_known_leaky)
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   add_test(NAME leakcheck_${_name}
