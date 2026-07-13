@@ -97,6 +97,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (type_is_numeric(left) && type_is_numeric(right)) {
                 return promote_numeric(c->binder, left, right);
             }
+            /* User-defined operator overloading: `a + b` on a class/struct left
+             * operand dispatches to a static op_add/op_sub/... method resolved
+             * in irgen. Assume the result is the left operand's type (e.g. an
+             * event `+= handler` yields the event) rather than rejecting it. */
+            if (left->kind == TYPE_CLASS || left->kind == TYPE_STRUCT) {
+                return left;
+            }
             if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR) {
                 zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                               "cannot apply operator to '%s' and '%s'",

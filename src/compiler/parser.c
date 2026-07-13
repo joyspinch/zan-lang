@@ -687,6 +687,35 @@ static zan_ast_node_t *parse_expression(zan_parser_t *p) {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
         zan_ast_node_t *right = parse_expression(p);
+
+        /* Desugar compound assignment `lhs OP= rhs` into `lhs = lhs OP rhs`.
+         * irgen has no dedicated compound-assign path, so lowering here fixes
+         * +=/-=/... for scalars and strings and, because `+` already dispatches
+         * to a class's op_add, lets operator-overloaded types drive `+=`
+         * (e.g. `btn.Click += handler`). */
+        zan_token_kind_t base = TK_EOF;
+        switch (op) {
+        case TK_PLUS_EQ:            base = TK_PLUS; break;
+        case TK_MINUS_EQ:           base = TK_MINUS; break;
+        case TK_STAR_EQ:            base = TK_STAR; break;
+        case TK_SLASH_EQ:           base = TK_SLASH; break;
+        case TK_PERCENT_EQ:         base = TK_PERCENT; break;
+        case TK_AMP_EQ:             base = TK_AMP; break;
+        case TK_PIPE_EQ:            base = TK_PIPE; break;
+        case TK_CARET_EQ:           base = TK_CARET; break;
+        case TK_LESS_LESS_EQ:       base = TK_LESS_LESS; break;
+        case TK_GREATER_GREATER_EQ: base = TK_GREATER_GREATER; break;
+        default: break;
+        }
+        if (base != TK_EOF) {
+            zan_ast_node_t *bin = zan_ast_new(p->arena, AST_BINARY, loc);
+            bin->binary.op = base;
+            bin->binary.left = expr;
+            bin->binary.right = right;
+            right = bin;
+            op = TK_EQ;
+        }
+
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_ASSIGNMENT, loc);
         n->binary.op = op;
         n->binary.left = expr;

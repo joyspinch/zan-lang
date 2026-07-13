@@ -2165,8 +2165,32 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         e->ident.name.str[2] == 'w')
         return 1;
     if (e->kind == AST_STRING_INTERP) return 1;
-    if (e->kind == AST_BINARY && e->binary.op == TK_PLUS && is_string_expr(g, e, locals)) {
-        return 1;
+    if (e->kind == AST_BINARY) {
+        if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals)) {
+            return 1;
+        }
+        /* A binary op on a user class/struct lowers to a static op_add/op_sub/...
+         * method call, which returns an owned (+1) value like any other call.
+         * Reporting it as owned prevents the assignment target from retaining a
+         * second reference (which would leak, e.g. `event += handler`). */
+        const char *opn = NULL;
+        switch (e->binary.op) {
+        case TK_PLUS:    opn = "op_add"; break;
+        case TK_MINUS:   opn = "op_sub"; break;
+        case TK_STAR:    opn = "op_mul"; break;
+        case TK_SLASH:   opn = "op_div"; break;
+        case TK_PERCENT: opn = "op_mod"; break;
+        default: break;
+        }
+        if (opn) {
+            zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
+            if (lt && (lt->kind == TYPE_CLASS || lt->kind == TYPE_STRUCT) && lt->sym) {
+                zan_istr_t op_istr = { (char *)opn, (int)strlen(opn) };
+                if (get_method_sym(lt->sym, op_istr)) {
+                    return 1;
+                }
+            }
+        }
     }
     return 0;
 }

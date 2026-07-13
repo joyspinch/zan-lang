@@ -110,6 +110,88 @@ class EventHub {
     }
 }
 
+/// <summary>
+/// A C#-style multicast event. Unlike <see cref="EventHub"/> (keyed, polled),
+/// a UiEvent is a first-class field on a widget that supports the delegate
+/// <c>+=</c> / <c>-=</c> operators, so registering a handler reads exactly like
+/// C#:
+/// <code>
+/// Button save = Button.Create("Save");   // retained
+/// save.Click += () =&gt; { Console.WriteLine("saved"); };
+/// save.Click += Store.Commit;            // method group
+/// // per frame:
+/// save.Render(app, x, y, 120);           // fires Click on click
+/// </code>
+/// Built-in widget events are raised from inside <c>Render</c>, i.e. on the UI
+/// thread, so handlers are always safe to touch the UI. To raise from a worker
+/// thread, use <see cref="Post"/>, which marshals every handler back onto the
+/// UI-thread dispatch queue.
+/// </summary>
+class UiEvent {
+    List<Action> handlers;
+
+    static UiEvent Create() {
+        UiEvent e = new UiEvent();
+        e.handlers = new List<Action>();
+        return e;
+    }
+
+    /// Operator backing <c>event += handler</c> (append, multicast).
+    static UiEvent op_add(UiEvent self, Action handler) {
+        self.handlers.Add(handler);
+        return self;
+    }
+
+    /// Operator backing <c>event -= handler</c> (removes the most recent
+    /// identical registration; a no-op if it was never added).
+    static UiEvent op_sub(UiEvent self, Action handler) {
+        int i = self.handlers.Count - 1;
+        while (i >= 0) {
+            if (self.handlers[i] == handler) {
+                self.handlers.RemoveAt(i);
+                return self;
+            }
+            i = i - 1;
+        }
+        return self;
+    }
+
+    /// Register a handler (same as <c>+=</c>).
+    void Add(Action handler) { handlers.Add(handler); }
+
+    /// Drop every handler.
+    void Clear() { handlers = new List<Action>(); }
+
+    /// Number of registered handlers.
+    int Count() { return handlers.Count; }
+
+    /// Invoke every handler on the current thread.
+    void Raise() {
+        int i = 0;
+        while (i < handlers.Count) {
+            Action h = handlers[i];
+            h();
+            i = i + 1;
+        }
+    }
+
+    /// Invoke handlers only when <paramref name="fire"/> is true.
+    void RaiseIf(bool fire) {
+        if (fire) { this.Raise(); }
+    }
+
+    /// Marshal every handler onto the UI-thread dispatch queue. Safe to call
+    /// from any thread; handlers run later on the UI thread (see App.DrainPosts).
+    void Post() {
+        int i = 0;
+        while (i < handlers.Count) {
+            Action h = handlers[i];
+            Dispatcher.Post(h);
+            i = i + 1;
+        }
+    }
+}
+
 class FocusManager {
     int focusedId;
     int hoveredId;
