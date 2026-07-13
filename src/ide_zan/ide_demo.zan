@@ -331,6 +331,17 @@ class IdeDemo {
     static string ToolchainDir() { return IdeDemo.ExeDir() + "/toolchain"; }
     static string StdlibDir() { return IdeDemo.ExeDir() + "/stdlib"; }
 
+    /// Shipped example programs. Published next to the IDE as <ExeDir>/examples
+    /// (scripts/publish_ide.ps1); when running from the build tree it sits one
+    /// level up at the repo root. Returns "" when neither exists.
+    static string ExamplesDir() {
+        string a = IdeDemo.ExeDir() + "/examples";
+        if (Directory.Exists(a)) { return a; }
+        string b = IdeDemo.ExeDir() + "/../examples";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
     /// Per-project build scratch dir (writable, colocated with the sources),
     /// created on demand so build artifacts never touch the install dir.
     static string EnsureBuildDir(string root) {
@@ -467,6 +478,8 @@ class IdeDemo {
         int cfgW = IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "winW", 1080), 640, 4000);
         int cfgH = IdeDemo.CfgClamp(IdeDemo.CfgInt(cfg, "winH", 720), 480, 3000);
         App app = App.CreateDark("Zan IDE", cfgW, cfgH);
+        // Restore the last-used app color scheme (dark/light title-bar theme).
+        app.SetDark(IdeDemo.CfgInt(cfg, "dark", 1) != 0);
         app.Show();
         int savedW = cfgW;
         int savedH = cfgH;
@@ -1244,28 +1257,33 @@ class IdeDemo {
                     }
                 }
 
-                // Open an example when its tree leaf is clicked.
+                // Open an example when its tree leaf is clicked. Real files
+                // (scanned from examples/) open by path so Run/Debug compile
+                // the actual source; the "@ex:" pseudo-leaf is the built-in
+                // component center used only when no examples ship on disk.
                 int exSelV = exSel.Get();
                 if (exSelV != lastExSel) {
                     lastExSel = exSelV;
                     if (exSelV >= 0 && exSelV < exTree.Count) {
                         TreeNode en = exTree[exSelV];
-                        if (!en.isDir && en.path.Length > 4) {
-                            int eidx = IdeDemo.ParseInt(en.path.Substring(4, en.path.Length - 4));
-                            if (eidx == 0) {
-                                int di = IdeDemo.FindTabByPath(tabPaths, "@docs");
-                                if (di >= 0) {
-                                    activeTab.Set(di);
-                                } else {
-                                    tabNames.Add(IdeDemo.T("Components", "组件中心"));
-                                    tabBodies.Add("");
-                                    tabPaths.Add("@docs");
-                                    activeTab.Set(tabNames.Count - 1);
-                                }
-                                lastActive = 0 - 1;
-                                log.Add("> Opened the GUI component center.");
-                                app.RequestRedraw();
+                        if (!en.isDir && IdeDemo.StartsWith(en.path, "@ex:")) {
+                            int di = IdeDemo.FindTabByPath(tabPaths, "@docs");
+                            if (di >= 0) {
+                                activeTab.Set(di);
+                            } else {
+                                tabNames.Add(IdeDemo.T("Components", "组件中心"));
+                                tabBodies.Add("");
+                                tabPaths.Add("@docs");
+                                activeTab.Set(tabNames.Count - 1);
                             }
+                            lastActive = 0 - 1;
+                            log.Add("> Opened the GUI component center.");
+                            app.RequestRedraw();
+                        } else if (!en.isDir && en.path != "") {
+                            IdeDemo.OpenPath(tabNames, tabBodies, tabPaths,
+                                activeTab, en.path, en.label);
+                            log.Add("> Opened " + en.path + ".");
+                            app.RequestRedraw();
                         }
                     }
                 }
@@ -2011,7 +2029,9 @@ class IdeDemo {
         // Persist window + panel sizes so the next launch restores them.
         int arv = 0;
         if (autoRun) { arv = 1; }
-        IdeDemo.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, bottomTab.Get(), arv);
+        int darkV = 0;
+        if (app.isDark) { darkV = 1; }
+        IdeDemo.SaveSettings(treeW.Get(), bottomPanelH.Get(), savedW, savedH, bottomTab.Get(), arv, darkV);
     }
 
     /// Spawns a fresh wizard child window (a real draggable top-level window),
@@ -4044,13 +4064,14 @@ class IdeDemo {
         return v;
     }
 
-    static void SaveSettings(int treeW, int botH, int winW, int winH, int botTab, int autoRun) {
+    static void SaveSettings(int treeW, int botH, int winW, int winH, int botTab, int autoRun, int dark) {
         string s = "treeW=" + Convert.ToString(treeW)
             + ";bottomH=" + Convert.ToString(botH)
             + ";winW=" + Convert.ToString(winW)
             + ";winH=" + Convert.ToString(winH)
             + ";bottomTab=" + Convert.ToString(botTab)
-            + ";autoRun=" + Convert.ToString(autoRun) + ";";
+            + ";autoRun=" + Convert.ToString(autoRun)
+            + ";dark=" + Convert.ToString(dark) + ";";
         Directory.CreateDirectoryRecursive(IdeDemo.UserConfigDir());
         File.WriteAllText(IdeDemo.CfgPath(), s);
     }
@@ -5336,10 +5357,47 @@ class IdeDemo {
     // center so examples stay aligned with the current Gui.Widget API.
     static List<TreeNode> BuildExampleTree() {
         List<TreeNode> n = new List<TreeNode>();
-        n.Add(TreeNode.Dir(IdeDemo.T("GUI Reference", "GUI 参考"), 0, true));
-        n.Add(IdeDemo.ExLeaf(
-            IdeDemo.T("Component Center", "组件示例中心"), 0));
+        string dir = IdeDemo.ExamplesDir();
+        if (dir != "") {
+            // Scan the real examples/ folder so every leaf carries the actual
+            // on-disk path; clicking one opens the true source and Run/Debug
+            // compile it directly. Sub-directories become collapsible groups.
+            IdeDemo.ScanExamplesInto(n, dir, 0);
+        }
+        if (n.Count == 0) {
+            // No examples shipped alongside the IDE: fall back to the built-in
+            // GUI component center so the panel is never empty.
+            n.Add(TreeNode.Dir(IdeDemo.T("GUI Reference", "GUI 参考"), 0, true));
+            n.Add(IdeDemo.ExLeaf(
+                IdeDemo.T("Component Center", "组件示例中心"), 0));
+        }
         return n;
+    }
+
+    /// Adds the `.zan` files and sub-directories of `dirPath` to `nodes` in
+    /// pre-order, tagging every file leaf with its real path. Mirrors ScanInto
+    /// but keeps only Zan sources (examples never ship manifests) and omits the
+    /// redundant root directory row so the pane starts at the first example.
+    static void ScanExamplesInto(List<TreeNode> nodes, string dirPath, int depth) {
+        List<string> subs = Directory.GetDirectories(dirPath);
+        int i = 0;
+        while (i < subs.Count) {
+            TreeNode d = TreeNode.Dir(subs[i], depth, true);
+            d.path = dirPath + "/" + subs[i];
+            nodes.Add(d);
+            IdeDemo.ScanExamplesInto(nodes, dirPath + "/" + subs[i], depth + 1);
+            i = i + 1;
+        }
+        List<string> files = Directory.GetFiles(dirPath);
+        int j = 0;
+        while (j < files.Count) {
+            if (IdeDemo.EndsWith(files[j], ".zan")) {
+                TreeNode f = TreeNode.FileIcon(files[j], depth, "file");
+                f.path = dirPath + "/" + files[j];
+                nodes.Add(f);
+            }
+            j = j + 1;
+        }
     }
 
     static TreeNode ExLeaf(string label, int idx) {
