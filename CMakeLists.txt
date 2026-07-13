@@ -345,6 +345,11 @@ endforeach()
 # still catching *new* leaks; fixing such a leak flips its test to failing, a
 # reminder to drop it from the allow-list below.
 set(_known_leaky)
+if(NOT WIN32)
+  # POSIX dirent names are assembled incrementally and remain reachable from
+  # the returned list until collection ownership gains recursive ARC release.
+  list(APPEND _known_leaky crossplat_stdlib)
+endif()
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   add_test(NAME leakcheck_${_name}
