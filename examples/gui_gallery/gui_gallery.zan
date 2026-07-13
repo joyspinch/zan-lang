@@ -72,9 +72,14 @@ class Gallery {
         app.Show();
         while (app.isRunning) {
             if (!app.ProcessEvent()) { break; }
-            // Motion events don't flag a repaint on their own, so force a frame
-            // while a code selection drag is in progress to track the pointer.
-            if (!app.needsRedraw && !Gallery.selDrag) { continue; }
+            // The gallery handles wheel scrolling and code selection inside its
+            // own Render pass, so it must paint on every input event (motion,
+            // press, release, wheel, keys) rather than only when the framework
+            // flags a repaint. ProcessEvent blocks when idle, so this doesn't spin.
+            int ek = app.window.EventKind();
+            bool inputEv = ek == 1 || ek == 2 || ek == 3
+                || ek == 13 || ek == 4 || ek == 6;
+            if (!app.needsRedraw && !inputEv) { continue; }
             app.BeginFrame();
             Gallery.Render(app);
             app.RenderChrome("Zan GUI Components");
@@ -441,9 +446,31 @@ class Gallery {
     // Live previews (real widget states for the selected component)
     // ------------------------------------------------------------------
 
+    /// Preview box height (unscaled) for a component: complex widgets that
+    /// need more vertical room get a taller box so they aren't clipped.
+    static int PreviewHeight(string name) {
+        if (name == "DataTable") { return 200; }
+        if (name == "PivotTable") { return 200; }
+        if (name == "Chart") { return 210; }
+        if (name == "Timeline") { return 190; }
+        if (name == "TreeView") { return 190; }
+        if (name == "Collapse") { return 190; }
+        if (name == "Table") { return 180; }
+        if (name == "Carousel") { return 180; }
+        if (name == "Menu") { return 190; }
+        if (name == "Steps") { return 170; }
+        if (name == "Ribbon") { return 180; }
+        if (name == "TabView") { return 190; }
+        if (name == "Wizard") { return 210; }
+        if (name == "Split") { return 180; }
+        if (name == "Result") { return 190; }
+        if (name == "Progress") { return 170; }
+        return 150;
+    }
+
     static int RenderPreview(App app, Canvas c, Theme t, string name,
             int x, int y, int w) {
-        int h = app.Scale(150);
+        int h = app.Scale(Gallery.PreviewHeight(name));
         c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
         c.DrawRect(x, y, w, h, t.borderPrimary, 1);
         c.DrawText(x + app.Scale(12), y + app.Scale(9), "LIVE STATES",
@@ -627,6 +654,50 @@ class Gallery {
         } else if (name == "Scrollbar") {
             c.FillRoundRect(px, py - app.Scale(16), app.Scale(280), app.Scale(96), app.Scale(4), t.bgPrimary);
             Scrollbar.RenderVertical(app, px + app.Scale(270), py - app.Scale(16), app.Scale(96), app.Scale(360), app.Scale(96));
+        } else if (name == "TabView") {
+            List<string> labels = new List<string>();
+            labels.Add("main.zan"); labels.Add("gui.zan"); labels.Add("README");
+            int th = TabView.Height(app);
+            TabHit hit = TabView.Render(app, px, py - app.Scale(16),
+                w - app.Scale(36), th, labels, Gallery.demoInt, true);
+            TabView.Apply(hit, labels, Gallery.demoInt, "untitled");
+        } else if (name == "Ribbon") {
+            List<RibbonCmd> cmds = new List<RibbonCmd>();
+            cmds.Add(RibbonCmd.Group("file", "New"));
+            cmds.Add(RibbonCmd.Create("folder", "Open"));
+            cmds.Add(RibbonCmd.Create("save", "Save"));
+            cmds.Add(RibbonCmd.Group("play", "Run"));
+            cmds.Add(RibbonCmd.Create("bug", "Debug"));
+            Ribbon.Render(app, px, py - app.Scale(20),
+                w - app.Scale(36), Ribbon.Height(app), cmds);
+        } else if (name == "Wizard") {
+            List<string> names = new List<string>();
+            names.Add("Console app"); names.Add("GUI app"); names.Add("Library");
+            List<string> icons = new List<string>();
+            icons.Add("terminal"); icons.Add("window"); icons.Add("package");
+            Wizard.RenderList(app, px, py - app.Scale(24),
+                app.Scale(300), app.Scale(140), names, icons, Gallery.demoInt);
+        } else if (name == "Split") {
+            int halfW = (w - app.Scale(44)) / 2;
+            c.FillRoundRect(px, py - app.Scale(16), halfW, app.Scale(110),
+                app.Scale(4), t.bgPrimary);
+            Label.Secondary(app, px + app.Scale(12), py + app.Scale(4), "First pane");
+            int rx = px + halfW + app.Scale(8);
+            c.FillRect(rx, py - app.Scale(16), app.Scale(4), app.Scale(110), t.primary);
+            c.FillRoundRect(rx + app.Scale(8), py - app.Scale(16), halfW,
+                app.Scale(110), app.Scale(4), t.bgPrimary);
+            Label.Secondary(app, rx + app.Scale(20), py + app.Scale(4), "Second pane");
+        } else if (name == "FilePicker") {
+            Button.Primary("Choose file...").Render(app, px, py, app.Scale(150));
+            Label.Secondary(app, px, py + app.Scale(40),
+                "Opens a modal file dialog (see the code below).");
+        } else if (name == "CodeEditor") {
+            Label.Render(app, px, py - app.Scale(12),
+                "The code panel below is a read-only CodeEditor view.");
+            Label.Secondary(app, px, py + app.Scale(16),
+                "CodeEditor powers this IDE's editor: highlighting,");
+            Label.Secondary(app, px, py + app.Scale(38),
+                "line numbers, selection, completion and diagnostics.");
         } else {
             rendered = false;
         }
@@ -685,6 +756,28 @@ class Gallery {
         Gallery.BuildDataDisplay(list);
         Gallery.BuildFeedback(list);
         Gallery.BuildNavigation(list);
+        Gallery.BuildLayout(list);
+    }
+
+    static void BuildLayout(List<Comp> list) {
+        Gallery.Add(list, "Layout", "Split",
+            "A draggable split view. Create it over an area with the first pane size bound to a SignalInt, then draw into its two rects.",
+            "SignalInt firstW = SignalInt.Create(240);\nRect area = Rect.Create(0, top, w, h - top);\nSplit s = Split.Vertical(app, area, firstW, 160, 200);\n// draw into s.first and s.second each frame");
+        Gallery.Add(list, "Layout", "TabView",
+            "An editor-style tab strip with an optional add button. Render returns a TabHit; Apply switches, closes or adds tabs.",
+            "List<string> labels = new List<string>();\nlabels.Add(\"main.zan\"); labels.Add(\"gui.zan\");\nSignalInt active = SignalInt.Create(0);\nint h = TabView.Height(app);\nTabHit hit = TabView.Render(app, 0, top, w, h, labels, active, true);\nTabView.Apply(hit, labels, active, \"untitled\");");
+        Gallery.Add(list, "Layout", "Ribbon",
+            "An Office-style command band of icon-over-label buttons with group separators. Render returns the clicked command index or -1.",
+            "List<RibbonCmd> cmds = new List<RibbonCmd>();\ncmds.Add(RibbonCmd.Group(\"file\", \"New\"));\ncmds.Add(RibbonCmd.Create(\"folder\", \"Open\"));\ncmds.Add(RibbonCmd.Create(\"save\", \"Save\"));\nint cmd = Ribbon.Render(app, 0, top, w, Ribbon.Height(app), cmds);\nif (cmd == 0) {\n    // New\n}");
+        Gallery.Add(list, "Layout", "Wizard",
+            "A categorized launcher list (e.g. project templates) with a selected index bound to a SignalInt.",
+            "List<string> names = new List<string>();\nnames.Add(\"Console app\"); names.Add(\"GUI app\");\nList<string> icons = new List<string>();\nicons.Add(\"terminal\"); icons.Add(\"window\");\nSignalInt sel = SignalInt.Create(0);\nWizard.RenderList(app, 40, 60, 300, 160, names, icons, sel);");
+        Gallery.Add(list, "Layout", "FilePicker",
+            "A modal open/save/folder dialog. Begin a session, render its content each frame, and read the chosen path when it closes.",
+            "FilePicker fp = FilePicker.Create();\nfp.BeginOpenFile(\"\", \".zan\", \"Open file\");\n// each frame while open:\nfp.RenderContent(app);\nif (!fp.IsOpen()) {\n    string path = fp.SelectedPath();\n}");
+        Gallery.Add(list, "Layout", "CodeEditor",
+            "The full text editor widget: Zan syntax highlighting, line numbers, multi-cursor, selection, autocomplete and inline diagnostics.",
+            "CodeEditor ed = new CodeEditor();\ned.SetText(\"class Main {\\n}\\n\");\nRect area = Rect.Create(0, top, w, h - top);\ned.Render(app, area);\nstring src = ed.GetText();");
     }
 
     static void BuildBasic(List<Comp> list) {
