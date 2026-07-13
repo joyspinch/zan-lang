@@ -192,11 +192,41 @@ class UiEvent {
     }
 }
 
+/// <summary>
+/// Monotonic source of stable, per-instance widget ids. A retained widget
+/// grabs one in its factory (Create) so its identity is fixed for its whole
+/// lifetime, regardless of sibling widgets appearing or disappearing between
+/// frames (a popup opening no longer renumbers everything after it). Ids start
+/// high so they never collide with the legacy per-frame positional ids handed
+/// out by <see cref="FocusManager.AllocId"/>.
+/// </summary>
+class WidgetId {
+    static int seq;
+
+    /// A fresh, process-unique widget id (stable for the caller's lifetime).
+    static int Next() {
+        seq = seq + 1;
+        return 1000000 + seq;
+    }
+
+    /// Reserves `n` consecutive stable ids and returns the first. Widgets that
+    /// register several hit regions (e.g. each star of a Rate) use this so
+    /// their sub-ids stay contiguous and stable across frames.
+    static int Block(int n) {
+        int first = 1000000 + seq + 1;
+        seq = seq + n;
+        return first;
+    }
+}
+
 class FocusManager {
     int focusedId;
     int hoveredId;
     int pressedId;
     int nextId;
+    // Ids of focusable widgets in the order they registered this frame, so Tab
+    // / Shift+Tab can move focus to the next/previous one. Rebuilt each frame.
+    List<int> tabOrder;
 
     static FocusManager Create() {
         FocusManager fm = new FocusManager();
@@ -204,6 +234,7 @@ class FocusManager {
         fm.hoveredId = -1;
         fm.pressedId = -1;
         fm.nextId = 0;
+        fm.tabOrder = new List<int>();
         return fm;
     }
 
@@ -215,6 +246,37 @@ class FocusManager {
 
     void ResetIds() {
         nextId = 0;
+        tabOrder = new List<int>();
+    }
+
+    /// A focusable widget records itself each frame (in render order) so keyboard
+    /// Tab traversal has a stable, layout-ordered ring to walk.
+    void RegisterFocusable(int id) {
+        tabOrder.Add(id);
+    }
+
+    int IndexOf(int id) {
+        int i = 0;
+        while (i < tabOrder.Count) {
+            if (tabOrder[i] == id) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Moves focus to the next focusable widget (wraps). `dir` is +1 for Tab,
+    /// -1 for Shift+Tab. No-op when nothing focusable rendered.
+    void FocusStep(int dir) {
+        if (tabOrder.Count == 0) { return; }
+        int idx = IndexOf(focusedId);
+        if (idx < 0) {
+            if (dir >= 0) { focusedId = tabOrder[0]; }
+            else { focusedId = tabOrder[tabOrder.Count - 1]; }
+            return;
+        }
+        int n = tabOrder.Count;
+        int next = (idx + dir + n) % n;
+        focusedId = tabOrder[next];
     }
 
     bool IsFocused(int id) { return focusedId == id; }
@@ -296,5 +358,102 @@ class HitTester {
             i = i + 1;
         }
         return -1;
+    }
+}
+
+/// <summary>
+/// A framework-owned floating option-list popup (used by Select / SelectBox /
+/// Dropdown / Menu). Zan delegates can't capture locals or bind `this`, so a
+/// popup is described as *data*: the widget hands one to <c>App.AddOverlay</c>
+/// during the main pass, and <c>App.RunOverlays</c> draws + dispatches it AFTER
+/// all content, so it always paints above everything and owns the top-most hit
+/// regions (HitTester is last-registered-wins). Selecting an option writes the
+/// bound model, raises <see cref="onChange"/> and closes the popup; a press
+/// anywhere else closes it (single, centralized dispatch — no per-widget event
+/// scraping, no z-order hacks in application code).
+/// </summary>
+class OverlayPopup {
+    int x;
+    int y;
+    int w;
+    List<string> options;
+    int baseId;
+    SignalInt model;
+    int triggerId;
+    SignalBool openFlag;
+    UiEvent onChange;
+
+    static OverlayPopup OptionList(int x, int y, int w, List<string> options,
+                                   int baseId, SignalInt model, int triggerId,
+                                   SignalBool openFlag, UiEvent onChange) {
+        OverlayPopup p = new OverlayPopup();
+        p.x = x;
+        p.y = y;
+        p.w = w;
+        p.options = options;
+        p.baseId = baseId;
+        p.model = model;
+        p.triggerId = triggerId;
+        p.openFlag = openFlag;
+        p.onChange = onChange;
+        return p;
+    }
+
+    void Render(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int count = options.Count;
+        int optH = t.heightMedium;
+        int totalH = count * optH;
+
+        // Shadow + body.
+        c.FillRoundRect(x + 1, y + 2, w, totalH, t.borderRadiusMedium, t.shadowColor);
+        c.FillRoundRect(x, y, w, totalH, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, totalH, t.borderPrimary, 1);
+
+        int selectedIdx = model.Get();
+        int i = 0;
+        while (i < count) {
+            int optId = baseId + i;
+            int optY = y + i * optH;
+            bool hovered = app.focus.IsHovered(optId);
+            bool selected = i == selectedIdx;
+            if (hovered) { c.FillRect(x + 1, optY, w - 2, optH, t.bgHover); }
+            int textColor = t.textPrimary;
+            if (selected) { textColor = t.primary; }
+            int optMaxW = w - t.paddingSmall - t.paddingLarge - t.iconSizeSmall - t.paddingSmall;
+            c.DrawText(x + t.paddingSmall, optY + (optH - Canvas.FontHeight(t.fontSizeMedium)) / 2,
+                       Ellipsis.Fit(options[i], optMaxW, t.fontSizeMedium), textColor, t.fontSizeMedium);
+            if (selected) {
+                Icon.DrawCenteredIn(c, "check", x + w - t.paddingLarge - t.iconSizeSmall, optY, t.iconSizeSmall, optH, t.iconSizeSmall, t.primary);
+            }
+            app.hitTester.Register(HitRegion.Create(optId, x, optY, w, optH, 0));
+            i = i + 1;
+        }
+
+        // Centralized dispatch: choose on a click that landed on an option
+        // (resolved against last frame's regions, which already had the popup
+        // on top), and dismiss on a press anywhere outside popup + trigger.
+        int kind = app.window.EventKind();
+        if (kind == 3) {
+            int hit = app.ClickTarget();
+            if (hit >= baseId && hit < baseId + count) {
+                int idx = hit - baseId;
+                if (idx != model.Get()) {
+                    model.Set(idx);
+                    onChange.Raise();
+                }
+                openFlag.Set(false);
+                app.RequestRedraw();
+            }
+        }
+        if (kind == 2) {
+            int pt = app.PressTarget();
+            bool insideOption = pt >= baseId && pt < baseId + count;
+            if (pt != triggerId && !insideOption) {
+                openFlag.Set(false);
+                app.RequestRedraw();
+            }
+        }
     }
 }

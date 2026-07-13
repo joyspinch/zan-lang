@@ -4,9 +4,66 @@ using Gui;
 namespace Gui.Widget;
 
 /// Dropdown select with reactive binding.
+///
+/// C#-style retained instance — owns its open state and defers its option list
+/// to the framework overlay layer (so it always drops above later content and
+/// dispatches selection centrally):
+///     Select state = Select.Bind(options, model, "Choose a state");
+///     state.Change += () => { ... };
+///     state.Render(app, x, y, w, h);
+/// Legacy immediate-mode statics (Render + RenderOptions) are kept for callers
+/// that drive the open state themselves.
 class Select {
-    static int Render(App app, int x, int y, int w, int h, List<string> options, SignalInt model, string hint) {
-        int id = app.focus.AllocId();
+    List<string> options;
+    SignalInt model;
+    string hint;
+    int wid;
+    int optBaseId;
+    SignalBool open;
+    /// Fires when the selection changes (C#-style: `sel.Change += h;`).
+    UiEvent Change;
+
+    static Select Bind(List<string> options, SignalInt model, string hint) {
+        Select s = new Select();
+        s.options = options;
+        s.model = model;
+        s.hint = hint;
+        s.wid = WidgetId.Next();
+        s.optBaseId = WidgetId.Block(options.Count);
+        s.open = SignalBool.Create(false);
+        s.Change = UiEvent.Create();
+        return s;
+    }
+
+    int Value() { return model.Get(); }
+    bool IsOpen() { return open.Get(); }
+
+    int Render(App app, int x, int y, int w, int h) {
+        int id = wid;
+        Select.PaintHead(app, id, x, y, w, h, options, model, hint);
+        app.focus.RegisterFocusable(id);
+
+        // Toggle open on click / keyboard.
+        bool toggle = Ui.Clicked(app, id);
+        if (Ui.Focused(app, id) && app.window.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 13 || kc == 32) { toggle = true; }
+        }
+        if (toggle) {
+            open.Set(!open.Get());
+            app.RequestRedraw();
+        }
+
+        // Defer the option list to the framework overlay layer.
+        if (open.Get()) {
+            int py = y + h + app.Scale(4);
+            app.AddOverlay(OverlayPopup.OptionList(x, py, w, options,
+                optBaseId, model, id, open, Change));
+        }
+        return id;
+    }
+
+    static int PaintHead(App app, int id, int x, int y, int w, int h, List<string> options, SignalInt model, string hint) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
@@ -29,11 +86,15 @@ class Select {
             c.DrawText(x + t.paddingSmall, textY, Ellipsis.Fit(hint, headMaxW, t.fontSizeMedium), t.textTertiary, t.fontSizeMedium);
         }
 
-        // Arrow icon
         Icon.DrawCenteredIn(c, "arrow-down", x + w - t.paddingLarge - t.iconSizeSmall, y, t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
 
         app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 4));
         return id;
+    }
+
+    static int Render(App app, int x, int y, int w, int h, List<string> options, SignalInt model, string hint) {
+        int id = app.focus.AllocId();
+        return Select.PaintHead(app, id, x, y, w, h, options, model, hint);
     }
 
     static int RenderOptions(App app, int x, int y, int w, List<string> options, SignalInt model) {
@@ -51,7 +112,6 @@ class Select {
         int optH = t.heightMedium;
         int totalH = count * optH;
 
-        // Shadow + body
         c.FillRoundRect(x + 1, y + 2, w, totalH, t.borderRadiusMedium, t.shadowColor);
         c.FillRoundRect(x, y, w, totalH, t.borderRadiusMedium, t.bgPrimary);
         c.DrawRect(x, y, w, totalH, t.borderPrimary, 1);

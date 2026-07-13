@@ -4,14 +4,65 @@ using Gui;
 namespace Gui.Widget;
 
 /// Checkbox with check icon and reactive bool binding.
+///
+/// Two ways to use it:
+///  * C#-style retained instance with a delegate event:
+///      Checkbox agree = Checkbox.Bind("I agree", model);
+///      agree.Change += () => { ... };   // fires on every toggle
+///      agree.Render(app, x, y);
+///  * legacy immediate-mode static (kept for existing callers):
+///      int id = Checkbox.Render(app, x, y, "I agree", model);
+///      Checkbox.HandleClick(app, id, model);
 class Checkbox {
-    static int Render(App app, int x, int y, string label, SignalBool model) {
-        int id = app.focus.AllocId();
+    string label;
+    SignalBool model;
+    int wid;
+    /// Fires whenever the checked state toggles (C#-style: `cb.Change += h;`).
+    UiEvent Change;
+
+    static Checkbox Bind(string label, SignalBool model) {
+        Checkbox cb = new Checkbox();
+        cb.label = label;
+        cb.model = model;
+        cb.wid = WidgetId.Next();
+        cb.Change = UiEvent.Create();
+        return cb;
+    }
+
+    static Checkbox Create(string label) {
+        return Checkbox.Bind(label, SignalBool.Create(false));
+    }
+
+    bool IsChecked() { return model.Get(); }
+    void SetChecked(bool v) { model.Set(v); }
+
+    /// Retained render: draws, dispatches its own click/keyboard toggle and
+    /// raises Change. Returns the widget id.
+    int Render(App app, int x, int y) {
+        int id = wid;
+        Checkbox.Paint(app, id, x, y, label, model.Get());
+        app.focus.RegisterFocusable(id);
+
+        bool fire = Ui.Clicked(app, id);
+        if (Ui.Focused(app, id) && app.window.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 32 || kc == 13) { fire = true; }
+        }
+        if (fire) {
+            model.Toggle();
+            Change.Raise();
+            app.RequestRedraw();
+        }
+        return id;
+    }
+
+    /// Draws the box + label and registers the hit region. Shared by the
+    /// retained and legacy paths so both look identical.
+    static int Paint(App app, int id, int x, int y, string label, bool isChecked) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
         bool hovered = app.focus.IsHovered(id);
-        bool isChecked = model.Get();
         int boxSize = app.Scale(18);
         int gap = app.Scale(8);
         int totalH = t.heightMedium;
@@ -51,6 +102,11 @@ class Checkbox {
         int totalW = boxSize + gap + Canvas.MeasureText(label, t.fontSizeMedium);
         app.hitTester.Register(HitRegion.Create(id, x, y, totalW, totalH, 2));
         return id;
+    }
+
+    static int Render(App app, int x, int y, string label, SignalBool model) {
+        int id = app.focus.AllocId();
+        return Checkbox.Paint(app, id, x, y, label, model.Get());
     }
 
     static void HandleClick(App app, int id, SignalBool model) {

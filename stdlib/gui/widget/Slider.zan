@@ -6,14 +6,59 @@ namespace Gui.Widget;
 /// Slider with reactive int binding and live drag / click-to-seek.
 /// While the handle (or track) is pressed the value tracks the pointer,
 /// mirroring NaiveUI's n-slider behaviour. All sizes are DPI-scaled.
+///
+/// C#-style retained instance:
+///     Slider vol = Slider.Bind(0, 100, model);
+///     vol.Change += () => { ... };   // fires while dragging as value changes
+///     vol.Render(app, x, y, width);
+/// Legacy immediate-mode static is kept for existing callers.
 class Slider {
-    static int Render(App app, int x, int y, int width, int minVal, int maxVal, SignalInt model) {
-        int id = app.focus.AllocId();
+    int minVal;
+    int maxVal;
+    SignalInt model;
+    int wid;
+    /// Fires whenever the value changes (C#-style: `s.Change += h;`).
+    UiEvent Change;
+
+    static Slider Bind(int minVal, int maxVal, SignalInt model) {
+        Slider s = new Slider();
+        s.minVal = minVal;
+        s.maxVal = maxVal;
+        s.model = model;
+        s.wid = WidgetId.Next();
+        s.Change = UiEvent.Create();
+        return s;
+    }
+
+    int Value() { return model.Get(); }
+
+    int Render(App app, int x, int y, int width) {
+        int id = wid;
+        app.focus.RegisterFocusable(id);
+        bool changed = Slider.Paint(app, id, x, y, width, minVal, maxVal, model);
+        // Keyboard: arrows nudge the focused slider.
+        if (Ui.Focused(app, id) && app.window.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            int v = model.Get();
+            if (kc == 37 || kc == 40) { v = v - 1; }
+            if (kc == 39 || kc == 38) { v = v + 1; }
+            if (v < minVal) { v = minVal; }
+            if (v > maxVal) { v = maxVal; }
+            if (v != model.Get()) { model.Set(v); changed = true; app.RequestRedraw(); }
+        }
+        if (changed) { Change.Raise(); }
+        return id;
+    }
+
+    /// Draws the rail/fill/handle and applies live drag. Returns true if the
+    /// value changed this frame. Shared by retained + legacy paths.
+    static bool Paint(App app, int id, int x, int y, int width, int minVal, int maxVal, SignalInt model) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
         bool hovered = app.focus.IsHovered(id);
         bool active = app.focus.IsPressed(id);
+        bool changed = false;
 
         int totalH = t.heightMedium;
         int range = maxVal - minVal;
@@ -29,6 +74,7 @@ class Slider {
             if (newVal > maxVal) { newVal = maxVal; }
             if (newVal != model.Get()) {
                 model.Set(newVal);
+                changed = true;
                 app.RequestRedraw();
             }
         }
@@ -57,6 +103,12 @@ class Slider {
         c.FillCircle(knobX, knobY, knobR - app.Scale(2), t.bgPrimary);
 
         app.hitTester.Register(HitRegion.Create(id, x, y, width, totalH, 3));
+        return changed;
+    }
+
+    static int Render(App app, int x, int y, int width, int minVal, int maxVal, SignalInt model) {
+        int id = app.focus.AllocId();
+        Slider.Paint(app, id, x, y, width, minVal, maxVal, model);
         return id;
     }
 }

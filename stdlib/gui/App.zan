@@ -37,6 +37,22 @@ class App {
     int wheelCapW;
     int wheelCapH;
 
+    // --- Event delegation ---
+    // Target of the current mouse event, resolved once per event in
+    // ProcessEvent against the PREVIOUS frame's complete hit regions (which
+    // already include popups/overlays on top). Widgets ask Ui.Clicked/Pressed
+    // whether they are this target, so a click is delivered to exactly one
+    // widget — the top-most one under the pointer — instead of every widget
+    // that happens to re-read the raw event during its own render.
+    int clickTargetId;
+    int pressTargetId;
+    // Deferred overlay popups (Select/SelectBox/Dropdown/Menu option lists).
+    // They run AFTER the main content pass so they both paint above it and
+    // register their hit regions last (making them the top-most target). Data,
+    // not callbacks, because Zan delegates can't capture locals / bind `this`.
+    // Collected during a frame, drained by RunOverlays, cleared in BeginFrame.
+    List<OverlayPopup> overlays;
+
     // --- Animation clock ---
     // Per-key tween state. Widgets call AnimTo()/AnimPx() each frame with a
     // target; the value eases toward it and keeps requesting redraws until it
@@ -79,6 +95,9 @@ class App {
         app.wheelCapY = 0;
         app.wheelCapW = 0;
         app.wheelCapH = 0;
+        app.clickTargetId = -1;
+        app.pressTargetId = -1;
+        app.overlays = new List<OverlayPopup>();
         app.isDark = false;
         app.isTopmost = false;
         app.showThemeButton = true;
@@ -585,11 +604,27 @@ class App {
             int hitId = hitTester.HitTest(mouseX, mouseY);
             focus.SetPressed(hitId);
             focus.SetFocused(hitId);
+            pressTargetId = hitId;
             needsRedraw = true;
         }
 
         if (kind == 3) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            // Resolve the click target against the still-intact previous-frame
+            // hit regions (popups included, top-most wins) before BeginFrame
+            // clears them, so exactly one widget sees Ui.Clicked this frame.
+            clickTargetId = hitTester.HitTest(mouseX, mouseY);
             focus.ClearPress();
+            needsRedraw = true;
+        }
+
+        // Tab / Shift+Tab move keyboard focus through the focusable ring built
+        // last frame (see FocusManager.RegisterFocusable).
+        if (kind == 4 && window.EventKeyCode() == 9) {
+            int dir = 1;
+            if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+            focus.FocusStep(dir);
             needsRedraw = true;
         }
 
@@ -694,11 +729,22 @@ class App {
             int hitId = hitTester.HitTest(mouseX, mouseY);
             focus.SetPressed(hitId);
             focus.SetFocused(hitId);
+            pressTargetId = hitId;
             needsRedraw = true;
         }
 
         if (kind == 3) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            clickTargetId = hitTester.HitTest(mouseX, mouseY);
             focus.ClearPress();
+            needsRedraw = true;
+        }
+
+        if (kind == 4 && window.EventKeyCode() == 9) {
+            int dir = 1;
+            if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+            focus.FocusStep(dir);
             needsRedraw = true;
         }
 
@@ -726,6 +772,9 @@ class App {
     }
 
     void PresentFrame() {
+        // Draw + dispatch popups last so they sit above all content and own the
+        // top-most hit regions (framework-owned overlay/z-order layer).
+        RunOverlays();
         window.Present(canvas);
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
@@ -743,6 +792,34 @@ class App {
         wheelCapH = 0;
         hitTester.Clear();
         focus.ResetIds();
+        overlays = new List<OverlayPopup>();
         canvas.Clear(theme.bgPrimary);
     }
+
+    /// Queues a popup to be painted and dispatched after the main content pass,
+    /// so it sits above everything and owns the top-most hit regions. See
+    /// <see cref="RunOverlays"/>.
+    void AddOverlay(OverlayPopup p) {
+        overlays.Add(p);
+    }
+
+    /// Draws + dispatches every overlay registered this frame, in registration
+    /// order. Call once, right after the main render and before PresentFrame.
+    void RunOverlays() {
+        int i = 0;
+        while (i < overlays.Count) {
+            OverlayPopup p = overlays[i];
+            p.Render(this);
+            i = i + 1;
+        }
+    }
+
+    /// True while a popup layer is active this frame.
+    bool HasOverlays() { return overlays.Count > 0; }
+
+    /// Id of the widget the current click (mouse-up) landed on, or -1.
+    int ClickTarget() { return clickTargetId; }
+
+    /// Id of the widget the current press (mouse-down) landed on, or -1.
+    int PressTarget() { return pressTargetId; }
 }

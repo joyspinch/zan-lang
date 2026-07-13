@@ -43,6 +43,7 @@ class Gallery {
     static SelectBox demoSelect;
     static SelectBox demoMulti;
     static SelectBox demoLong;
+    static Select demoSelectLow;
     static VirtualList demoVList;
 
     // Delegate/event demo state. evtHub retains click handlers (C#-style
@@ -70,6 +71,9 @@ class Gallery {
     // snippet's split lines). selDrag is true while the mouse button is held.
     static bool selHas;
     static bool selDrag;
+    // Retained state for the deferred-overlay / interactive demos.
+    static string copiedIcon;
+    static DataTableState demoTableState;
     static int selAL;
     static int selAC;
     static int selFL;
@@ -136,6 +140,11 @@ class Gallery {
         Gallery.tbCard.Add("Tabs.zan", true);
         Gallery.selHas = false;
         Gallery.selDrag = false;
+        List<string> lowOpts = new List<string>();
+        lowOpts.Add("Default"); lowOpts.Add("Success"); lowOpts.Add("Warning");
+        Gallery.demoSelectLow = Select.Bind(lowOpts, Gallery.demoInt, "Choose a state");
+        Gallery.copiedIcon = "";
+        Gallery.demoTableState = DataTableState.Create();
         Gallery.copiedFrame = 0;
         Gallery.comps = new List<Comp>();
         Gallery.BuildComps(Gallery.comps);
@@ -338,9 +347,12 @@ class Gallery {
         cy = cy + app.Scale(12);
 
         int previewH = Gallery.RenderPreview(app, c, t, e.name, cx, cy, cw);
-        cy = cy + previewH + app.Scale(14);
-
-        Gallery.RenderCode(app, c, t, e, cx, cy, cw, area);
+        int codeY = cy + previewH + app.Scale(14);
+        Gallery.RenderCode(app, c, t, e, cx, codeY, cw, area);
+        // Deferred overlay pass: floating popups (dropdowns, menus, filter
+        // panels) draw AFTER the code panel so they sit above it instead of
+        // being occluded, and outside the preview box's clip.
+        Gallery.RenderOverlay(app, c, t, e.name, cx, cy, cw);
     }
 
     /// Code panel: line-number gutter, Zan syntax highlighting, a Copy button
@@ -566,6 +578,8 @@ class Gallery {
     }
 
     static int PreviewHeight(string name) {
+        if (name == "Button") { return 235; }
+        if (name == "Icon") { return 360; }
         if (name == "States") { return 150; }
         if (name == "TabBar") { return 220; }
         if (name == "TextArea") { return 190; }
@@ -598,13 +612,91 @@ class Gallery {
         c.DrawRect(x, y, w, h, t.borderPrimary, 1);
         c.DrawText(x + app.Scale(12), y + app.Scale(9), "LIVE STATES",
             t.textTertiary, t.fontSizeSmall);
+        // Floating/interactive components are drawn later in the deferred
+        // overlay pass (above the code panel); the base pass only frames them.
+        if (Gallery.IsOverlayComp(name)) { return h; }
+        // Clip every base demo to the preview box so nothing bleeds into the
+        // title, description or the code panel below (fixes the overflow and
+        // scroll "see-through" artifacts).
+        c.PushClip(x, y, w, h);
         int px = x + app.Scale(18);
         int py = y + app.Scale(48);
         bool rendered = true;
         if (name == "Button") {
-            Button.Create("Default").Render(app, px, py, app.Scale(104));
-            Button.Primary("Primary").Render(app, px + app.Scale(116), py, app.Scale(104));
-            Button.Create("Disabled").SetDisabled(true).Render(app, px + app.Scale(232), py, app.Scale(104));
+            int bw = app.Scale(92);
+            int gap = app.Scale(10);
+            int step = bw + gap;
+            int ry = y + app.Scale(40);
+            Button.Create("Default").Render(app, px, ry, bw);
+            Button.Typed("Primary", 1).Render(app, px + step, ry, bw);
+            Button.Typed("Info", 2).Render(app, px + 2 * step, ry, bw);
+            Button.Typed("Success", 3).Render(app, px + 3 * step, ry, bw);
+            Button.Typed("Warning", 4).Render(app, px + 4 * step, ry, bw);
+            Button.Typed("Error", 5).Render(app, px + 5 * step, ry, bw);
+            int ry2 = ry + app.Scale(42);
+            Button.Styled("Solid", 1, 0).Render(app, px, ry2, bw);
+            Button.Styled("Outline", 1, 1).Render(app, px + step, ry2, bw);
+            Button.Styled("Text", 1, 2).Render(app, px + 2 * step, ry2, bw);
+            Button.Styled("Dashed", 1, 3).Render(app, px + 3 * step, ry2, bw);
+            Button bdis = Button.Create("Disabled");
+            bdis.SetDisabled(true);
+            bdis.Render(app, px + 4 * step, ry2, bw);
+            int ry3 = ry2 + app.Scale(42);
+            Button.Round("Round", 1).Render(app, px, ry3, bw);
+            Button.IconTextTyped("Save", "save", 3).Render(app, px + step, ry3, bw);
+            Button.IconTextTyped("Delete", "trash", 5).Render(app, px + 2 * step, ry3, bw);
+            Button.IconTyped("plus", 1).Render(app, px + 3 * step, ry3, t.heightMedium);
+            Button.IconTyped("settings", 0).Render(app, px + 3 * step + t.heightMedium + gap, ry3, t.heightMedium);
+            int ry4 = ry3 + app.Scale(46);
+            Button bt = Button.Create("Tiny");
+            bt.SetSize(0);
+            bt.Render(app, px, ry4, app.Scale(72));
+            Button bsm = Button.Create("Small");
+            bsm.SetSize(1);
+            bsm.Render(app, px + app.Scale(84), ry4, app.Scale(84));
+            Button.Create("Medium").Render(app, px + app.Scale(180), ry4, app.Scale(96));
+            Button bl = Button.Create("Large");
+            bl.SetSize(3);
+            bl.Render(app, px + app.Scale(288), ry4, app.Scale(104));
+        } else if (name == "Icon") {
+            List<string> icons = Icon.Names();
+            int cell = app.Scale(62);
+            int iconSz = app.Scale(22);
+            int gcols = (w - app.Scale(24)) / cell;
+            if (gcols < 1) { gcols = 1; }
+            bool iconClick = app.window.EventKind() == 3;
+            int gx0 = x + app.Scale(12);
+            int gy0 = y + app.Scale(34);
+            int gi = 0;
+            while (gi < icons.Count) {
+                int gr = gi / gcols;
+                int gc = gi % gcols;
+                int gx = gx0 + gc * cell;
+                int gy = gy0 + gr * cell;
+                bool hot = app.mouseX >= gx && app.mouseX < gx + cell
+                    && app.mouseY >= gy && app.mouseY < gy + cell;
+                if (hot) {
+                    c.FillRoundRect(gx, gy, cell - app.Scale(4), cell - app.Scale(4),
+                        app.Scale(4), t.bgHover);
+                }
+                Icon.DrawCenteredIn(c, icons[gi], gx, gy + app.Scale(6),
+                    cell - app.Scale(4), iconSz, iconSz, t.textPrimary);
+                c.DrawTextCentered(gx, gy + iconSz + app.Scale(12), cell - app.Scale(4),
+                    Canvas.FontHeight(t.fontSizeSmall),
+                    Ellipsis.Fit(icons[gi], cell - app.Scale(6), t.fontSizeSmall),
+                    t.textTertiary, t.fontSizeSmall);
+                if (hot && iconClick) {
+                    Clipboard.SetText("Icon.Draw(c, \"" + icons[gi] + "\", x, y, 24, color);");
+                    Gallery.copiedIcon = icons[gi];
+                    app.RequestRedraw();
+                }
+                gi = gi + 1;
+            }
+            if (Gallery.copiedIcon != "") {
+                c.DrawText(x + app.Scale(110), y + app.Scale(9),
+                    "copied  Icon.Draw(c, \"" + Gallery.copiedIcon + "\", ...)",
+                    t.success, t.fontSizeSmall);
+            }
         } else if (name == "Label") {
             Label.Title(app, px, py - app.Scale(12), "Title");
             Label.Render(app, px, py + app.Scale(22), "Default label");
@@ -616,13 +708,6 @@ class Gallery {
             Gallery.demoInput.Render(app, px, py, app.Scale(260), t.heightMedium);
         } else if (name == "TextArea") {
             Gallery.demoArea.Render(app, px, py - app.Scale(20), app.Scale(360), app.Scale(120));
-        } else if (name == "SelectBox") {
-            Label.Secondary(app, px, py - app.Scale(24), "single · clearable");
-            Gallery.demoSelect.Render(app, px, py, app.Scale(180));
-            Label.Secondary(app, px + app.Scale(200), py - app.Scale(24), "multi-select");
-            Gallery.demoMulti.Render(app, px + app.Scale(200), py, app.Scale(180));
-            Label.Secondary(app, px + app.Scale(400), py - app.Scale(24), "long · scrolls");
-            Gallery.demoLong.Render(app, px + app.Scale(400), py, app.Scale(180));
         } else if (name == "Checkbox") {
             int id = Checkbox.Render(app, px, py, "Checked", Gallery.demoBool);
             Checkbox.HandleClick(app, id, Gallery.demoBool);
@@ -638,10 +723,6 @@ class Gallery {
         } else if (name == "Slider") {
             Slider.Render(app, px, py, app.Scale(300), 0, 100, Gallery.demoInt);
             Label.Secondary(app, px + app.Scale(320), py, Convert.ToString(Gallery.demoInt.Get()));
-        } else if (name == "Select") {
-            List<string> opts = new List<string>();
-            opts.Add("Default"); opts.Add("Success"); opts.Add("Warning");
-            Select.Render(app, px, py, app.Scale(220), t.heightMedium, opts, Gallery.demoInt, "Choose a state");
         } else if (name == "Rate") {
             int id = Rate.Render(app, px, py, Gallery.demoInt, 5);
             Rate.HandleClick(app, id, 5, Gallery.demoInt);
@@ -720,15 +801,6 @@ class Gallery {
             List<string> cells = new List<string>();
             cells.Add("Zan"); cells.Add("Ready");
             Table.RenderRow(app, px, py - app.Scale(16) + t.heightMedium, cells, widths, true);
-        } else if (name == "DataTable") {
-            List<DataColumn> cols = new List<DataColumn>();
-            cols.Add(DataColumn.Text("Name", app.Scale(160)));
-            cols.Add(DataColumn.Numeric("Score", app.Scale(100)));
-            List<DataRow> rows = new List<DataRow>();
-            DataRow row = DataRow.Create();
-            row.Push("Zan"); row.Push("98"); rows.Add(row);
-            DataTableState state = DataTableState.Create();
-            DataTable.Render(app, px, py - app.Scale(20), w - app.Scale(36), app.Scale(100), cols, rows, state);
         } else if (name == "PivotTable") {
             List<DataRow> rows = new List<DataRow>();
             DataRow p0 = DataRow.Create();
@@ -791,13 +863,6 @@ class Gallery {
         } else if (name == "Tooltip") {
             Button.Create("Hover target").Render(app, px, py, app.Scale(130));
             Tooltip.Render(app, px + app.Scale(150), py, "Helpful context");
-        } else if (name == "Popover") {
-            Popover.Render(app, px, py - app.Scale(12), app.Scale(280), app.Scale(96), "Popover", "Anchored explanatory content.");
-        } else if (name == "Dropdown") {
-            Dropdown.RenderTrigger(app, px, py, app.Scale(150), t.heightMedium, "Actions", true);
-            List<string> items = new List<string>();
-            items.Add("Edit"); items.Add("Delete");
-            Dropdown.RenderMenu(app, px + app.Scale(166), py, app.Scale(160), items);
         } else if (name == "Spin") {
             Spin.Render(app, px + app.Scale(26), py + app.Scale(20), app.Scale(18), t.primary);
             Spin.WithTip(app, px + app.Scale(80), py - app.Scale(20), app.Scale(240), app.Scale(96), "Loading data...");
@@ -886,7 +951,62 @@ class Gallery {
             c.DrawText(px + app.Scale(46), py, "Overlay / interactive component", t.textPrimary, t.fontSizeMedium);
             c.DrawText(px + app.Scale(46), py + app.Scale(28), "Copy the API example below to use it.", t.textSecondary, t.fontSizeSmall);
         }
+        c.PopClip();
         return h;
+    }
+
+    /// Components whose live demo floats outside the preview box (dropdowns,
+    /// menus, popovers, a table with a filter panel). They are drawn in the
+    /// deferred overlay pass so their popups sit above the code panel.
+    static bool IsOverlayComp(string name) {
+        if (name == "Select") { return true; }
+        if (name == "SelectBox") { return true; }
+        if (name == "Dropdown") { return true; }
+        if (name == "Popover") { return true; }
+        if (name == "DataTable") { return true; }
+        return false;
+    }
+
+    static void RenderOverlay(App app, Canvas c, Theme t, string name,
+            int x, int y, int w) {
+        int px = x + app.Scale(18);
+        int py = y + app.Scale(48);
+        if (name == "SelectBox") {
+            Label.Secondary(app, px, py - app.Scale(24), "single · clearable");
+            Gallery.demoSelect.Render(app, px, py, app.Scale(180));
+            Label.Secondary(app, px + app.Scale(200), py - app.Scale(24), "multi-select");
+            Gallery.demoMulti.Render(app, px + app.Scale(200), py, app.Scale(180));
+            Label.Secondary(app, px + app.Scale(400), py - app.Scale(24), "long · scrolls");
+            Gallery.demoLong.Render(app, px + app.Scale(400), py, app.Scale(180));
+        } else if (name == "Select") {
+            // Retained instance: owns its open state and defers the option list
+            // to the framework overlay layer (draws above the code panel, one
+            // centralized dispatch). No manual hit-testing here.
+            Gallery.demoSelectLow.Render(app, px, py, app.Scale(220), t.heightMedium);
+            Label.Secondary(app, px, py + t.heightMedium + app.Scale(10),
+                "click to open · Change fires on select");
+        } else if (name == "Dropdown") {
+            Dropdown.RenderTrigger(app, px, py, app.Scale(150),
+                t.heightMedium, "Actions", true);
+            List<string> items = new List<string>();
+            items.Add("Edit"); items.Add("Delete");
+            Dropdown.RenderMenu(app, px + app.Scale(166), py, app.Scale(160), items);
+        } else if (name == "Popover") {
+            Popover.Render(app, px + app.Scale(140), py + app.Scale(6),
+                app.Scale(280), app.Scale(96), "Popover",
+                "Anchored explanatory content.");
+        } else if (name == "DataTable") {
+            List<DataColumn> cols = new List<DataColumn>();
+            cols.Add(DataColumn.Text("Name", app.Scale(160)));
+            cols.Add(DataColumn.Numeric("Score", app.Scale(100)));
+            List<DataRow> rows = new List<DataRow>();
+            DataRow row = DataRow.Create();
+            row.Push("Zan"); row.Push("98"); rows.Add(row);
+            DataRow row2 = DataRow.Create();
+            row2.Push("Lang"); row2.Push("87"); rows.Add(row2);
+            DataTable.Render(app, px, py - app.Scale(20), w - app.Scale(36),
+                app.Scale(110), cols, rows, Gallery.demoTableState);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1011,8 +1131,8 @@ class Gallery {
             "Slider.Render(app, x, y, width, min, max, model) edits a SignalInt within a range.",
             "SignalInt volume = SignalInt.Create(50);\nSlider.Render(app, 40, 80, 200, 0, 100, volume);");
         Gallery.Add(list, "Data Entry", "Select",
-            "Select shows a dropdown of options; the chosen index lives in a SignalInt.",
-            "List<string> opts = new List<string>();\nopts.Add(\"Red\"); opts.Add(\"Green\"); opts.Add(\"Blue\");\nSignalInt sel = SignalInt.Create(0);\nSelect.Render(app, 40, 80, 200, 28, opts, sel, \"pick a color\");");
+            "Retained dropdown. Bind() gives it a stable identity; it owns its open state and defers the option list to the framework overlay layer, so the popup always draws above later content. Change fires on select (C#-style delegate).",
+            "List<string> opts = new List<string>();\nopts.Add(\"Red\"); opts.Add(\"Green\"); opts.Add(\"Blue\");\nSignalInt sel = SignalInt.Create(0);\nSelect color = Select.Bind(opts, sel, \"pick a color\");\ncolor.Change += () => { /* sel.Get() changed */ };\n// each frame:\ncolor.Render(app, 40, 80, 200, 28);");
         Gallery.Add(list, "Data Entry", "SelectBox",
             "High-level select. Owns open/close, the popup (with its own clipping + scrolling for long lists), single- or multi-selection, an optional clear button, plus size and status variants. One Render() call does everything.",
             "SelectBox city = SelectBox.Create(\"Pick a city\").Clearable(true);\ncity.AddOption(\"London\"); city.AddOption(\"Paris\");\ncity.Render(app, 40, 80, 200);\nint i = city.Selected();      // -1 if none\n// multi-select: SelectBox.Multi(hint) + city.IsChosen(i)");
