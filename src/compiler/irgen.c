@@ -1066,6 +1066,14 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
 
 /* ---- struct type registry helpers ---- */
 
+/* Forward decl: classes with any virtual/override method carry a hidden
+ * vtable pointer as struct field 0, so field indexing and layout are shifted
+ * by one for them. */
+static bool class_has_virtual_methods(zan_symbol_t *sym);
+static int class_vptr_offset(zan_symbol_t *sym) {
+    return class_has_virtual_methods(sym) ? 1 : 0;
+}
+
 static LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
     for (int i = 0; i < g->struct_type_count; i++) {
         if (g->struct_types[i].sym == sym) return g->struct_types[i].llvm_type;
@@ -1074,7 +1082,7 @@ static LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
 }
 
 static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
-    int idx = 0;
+    int idx = class_vptr_offset(type_sym);
     for (int i = 0; i < type_sym->member_count; i++) {
         if (type_sym->members[i]->kind == SYM_FIELD ||
             type_sym->members[i]->kind == SYM_PROPERTY) {
@@ -1176,8 +1184,16 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
             sym->members[i]->kind == SYM_PROPERTY) field_count++;
     }
 
-    LLVMTypeRef *field_types = (LLVMTypeRef *)calloc((size_t)field_count, sizeof(LLVMTypeRef));
+    /* Reserve field 0 for a hidden vtable pointer on classes that participate
+     * in virtual dispatch. Base fields are flattened in first, so a derived
+     * instance stays layout-compatible with its base (vptr at 0, then base
+     * fields, then derived fields). */
+    int vptr = class_has_virtual_methods(sym) ? 1 : 0;
+    LLVMTypeRef *field_types = (LLVMTypeRef *)calloc((size_t)(field_count + vptr), sizeof(LLVMTypeRef));
     int fi = 0;
+    if (vptr) {
+        field_types[fi++] = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    }
     for (int i = 0; i < sym->member_count; i++) {
         if (sym->members[i]->kind == SYM_FIELD ||
             sym->members[i]->kind == SYM_PROPERTY) {
@@ -1185,7 +1201,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
         }
     }
 
-    LLVMStructSetBody(st, field_types, (unsigned)field_count, 0);
+    LLVMStructSetBody(st, field_types, (unsigned)(field_count + vptr), 0);
     free(field_types);
 }
 
@@ -2005,7 +2021,7 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
     LLVMBuildCondBr(b, is1, relf, dorel);
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMValueRef self = LLVMBuildBitCast(b, obj, LLVMPointerType(structT, 0), "self");
-    int fi = 0;
+    int fi = class_vptr_offset(sym);
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];
         if (m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) continue;
@@ -2153,6 +2169,112 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
     }
     LLVMSetInitializer(g->g_site_dtors, LLVMConstArray(i8ptr, elems, (unsigned)n));
     free(elems);
+}
+
+/* ---- virtual dispatch: vtable globals + dynamic call ---------------------
+ * Each class with virtual/override methods gets an internal global
+ * __zan_vtable_<Class> : [N x i8*], one slot per virtual method (base-first
+ * ordering shared across the hierarchy). Objects store &vtable[0] in field 0
+ * at construction; a virtual call loads the slot and calls through it, so the
+ * runtime (most-derived) implementation runs even via a base-typed reference
+ * or a List<Base> element. */
+
+static LLVMValueRef find_fn_for_sym(zan_irgen_t *g, zan_symbol_t *msym) {
+    if (!msym) return NULL;
+    for (int i = 0; i < g->function_count; i++)
+        if (g->functions[i].sym == msym) return g->functions[i].fn;
+    return NULL;
+}
+
+/* Enumerate the virtual *slot-defining* methods (MOD_VIRTUAL and not an
+ * override) of a class hierarchy, base classes first, matching the slot
+ * numbering used by get_virtual_method_index/count_virtual_methods. */
+static void collect_vslot_decls(zan_symbol_t *sym, zan_symbol_t **out, int *n, int cap) {
+    if (sym->type && sym->type->base_type && sym->type->base_type->sym)
+        collect_vslot_decls(sym->type->base_type->sym, out, n, cap);
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (m->kind == SYM_METHOD &&
+            (m->modifiers & MOD_VIRTUAL) && !(m->modifiers & MOD_OVERRIDE)) {
+            if (*n < cap) out[(*n)++] = m;
+        }
+    }
+}
+
+static LLVMValueRef get_vtable_global(zan_irgen_t *g, zan_symbol_t *sym) {
+    char name[320];
+    snprintf(name, sizeof(name), "__zan_vtable_%.*s",
+             (int)sym->name.len, sym->name.str);
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
+    if (gv) return gv;
+    int n = count_virtual_methods(sym);
+    if (n < 1) n = 1;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)n);
+    gv = LLVMAddGlobal(g->mod, at, name);
+    LLVMSetInitializer(gv, LLVMConstNull(at));
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    return gv;
+}
+
+/* Populate every instantiable class's vtable with the most-derived function
+ * for each slot. Runs at finalize, after all methods are registered. */
+static void emit_vtables(zan_irgen_t *g) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = 0; i < g->struct_type_count; i++) {
+        zan_symbol_t *sym = g->struct_types[i].sym;
+        if (!sym || !class_has_virtual_methods(sym)) continue;
+        int n = count_virtual_methods(sym);
+        if (n < 1) continue;
+        zan_symbol_t *decls[128];
+        int nd = 0;
+        collect_vslot_decls(sym, decls, &nd, 128);
+        LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
+        for (int s = 0; s < n; s++) {
+            LLVMValueRef e = LLVMConstNull(i8ptr);
+            if (s < nd) {
+                zan_symbol_t *decl = decls[s];
+                int arity = decl->decl ? decl->decl->method_decl.params.count : 0;
+                zan_symbol_t *impl = resolve_overload(sym, decl->name, arity);
+                LLVMValueRef fn = find_fn_for_sym(g, impl);
+                if (fn) e = LLVMConstBitCast(fn, i8ptr);
+            }
+            elems[s] = e;
+        }
+        LLVMValueRef gv = get_vtable_global(g, sym);
+        LLVMSetInitializer(gv, LLVMConstArray(i8ptr, elems, (unsigned)n));
+        free(elems);
+    }
+}
+
+/* Emit a call that dispatches through the object's vtable when the target is a
+ * virtual/override method invoked on a class instance; otherwise a plain
+ * static call. `static_sym` is the receiver's *declared* type. */
+static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
+        zan_symbol_t *method_sym, LLVMValueRef static_fn, LLVMTypeRef fn_type,
+        LLVMValueRef *call_args, int argc, const char *cn) {
+    if (static_sym && method_sym &&
+        (method_sym->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE)) &&
+        class_has_virtual_methods(static_sym) && argc >= 1 && call_args[0] &&
+        LLVMGetTypeKind(LLVMTypeOf(call_args[0])) == LLVMPointerTypeKind) {
+        int slot = get_virtual_method_index(static_sym, method_sym->name);
+        LLVMTypeRef st = get_struct_llvm_type(g, static_sym);
+        if (slot >= 0 && st) {
+            LLVMBuilderRef b = g->builder;
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef thisp = LLVMBuildBitCast(b, call_args[0], LLVMPointerType(st, 0), "vthis");
+            LLVMValueRef vpf = LLVMBuildStructGEP2(b, st, thisp, 0, "vpf");
+            LLVMValueRef vt8 = LLVMBuildLoad2(b, i8ptr, vpf, "vt8");
+            LLVMValueRef vt = LLVMBuildBitCast(b, vt8, LLVMPointerType(i8ptr, 0), "vt");
+            LLVMValueRef sidx = LLVMConstInt(i64, (unsigned long long)slot, 0);
+            LLVMValueRef sp = LLVMBuildGEP2(b, i8ptr, vt, &sidx, 1, "vsp");
+            LLVMValueRef fn8 = LLVMBuildLoad2(b, i8ptr, sp, "vfn8");
+            LLVMValueRef fnp = LLVMBuildBitCast(b, fn8, LLVMPointerType(fn_type, 0), "vfnp");
+            return LLVMBuildCall2(b, fn_type, fnp, call_args, (unsigned)argc, cn);
+        }
+    }
+    return LLVMBuildCall2(g->builder, fn_type, static_fn, call_args, (unsigned)argc, cn);
 }
 
 /* A value already carrying an owned (+1) reference we may take over as-is;
@@ -5348,8 +5470,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                     call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
-                                LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
-                                    g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                LLVMValueRef result = emit_dispatch_call(g, type_sym, method_sym,
+                                    g->functions[fi].fn, g->functions[fi].fn_type, call_args, argc, cn);
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     emit_release_owned_call_temp(g, expr->call.args.items[k],
                                         call_args[k + 1], locals);
@@ -5418,8 +5540,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
                             }
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
-                            LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
-                                g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                            LLVMValueRef result = emit_dispatch_call(g, recv_cls, method_sym,
+                                g->functions[fi].fn, g->functions[fi].fn_type, call_args, argc, cn);
                             emit_release_owned_call_temp(g, callee->member.object, recv_val, locals);
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -5555,8 +5677,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 call_args[k + extra] = emit_expr(g, expr->call.args.items[k], locals);
                             }
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "bcall";
-                            LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
-                                g->functions[fi].fn, call_args, (unsigned)(argc + extra), cn);
+                            LLVMValueRef result = emit_dispatch_call(g,
+                                is_static ? NULL : g->current_type_sym, method_sym,
+                                g->functions[fi].fn, g->functions[fi].fn_type,
+                                call_args, argc + extra, cn);
                             int consumes_free_arg =
                                 argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                             if (consumes_free_arg) {
@@ -6225,6 +6349,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         alloca = LLVMBuildAlloca(g->builder, st, "new");
                     }
                     LLVMBuildStore(g->builder, LLVMConstNull(st), alloca);
+
+                    /* install the vtable pointer (field 0) before the ctor runs
+                     * so virtual calls made during construction dispatch to the
+                     * most-derived implementation. */
+                    if (sym->type->kind == TYPE_CLASS && class_has_virtual_methods(sym)) {
+                        LLVMTypeRef i8ptr_vt = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                        LLVMValueRef vtg = get_vtable_global(g, sym);
+                        LLVMValueRef vpf0 = LLVMBuildStructGEP2(g->builder, st, alloca, 0, "vpf.init");
+                        LLVMBuildStore(g->builder,
+                            LLVMBuildBitCast(g->builder, vtg, i8ptr_vt, "vt.i8"), vpf0);
+                    }
 
                     /* look for constructor */
                     for (int ci = 0; ci < g->ctor_count; ci++) {
@@ -9026,6 +9161,7 @@ done:
      * been registered (Pass 1) and referenced (Passes 2/3). */
     emit_all_class_releases(g);
     emit_site_dtor_table(g);
+    emit_vtables(g);
     /* An error diagnostic emitted during codegen (e.g. an unsupported await
      * form flagged by the ANF pass) must fail the build — the driver only
      * checks diagnostics before codegen, so surface it here. */
