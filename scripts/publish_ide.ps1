@@ -46,8 +46,17 @@ foreach ($p in @($ideExe, $zancExe, $stdlib)) {
 
 # ---- clean + recreate dist (release output only) ----
 Write-Output "[2/4] Preparing clean dist directory: $dist"
-if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
-New-Item -ItemType Directory -Path $dist | Out-Null
+if (Test-Path $dist) {
+    try { Remove-Item $dist -Recurse -Force -ErrorAction Stop }
+    catch {
+        # The dist folder itself is held by another process (e.g. an Explorer
+        # window open on it, or a shell whose current directory is inside it),
+        # so it can't be deleted. Clearing its contents and reusing the folder
+        # works around the lock on the directory node.
+        Get-ChildItem -Path $dist -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist | Out-Null }
 
 # ---- copy the toolchain ----
 Write-Output "[3/4] Copying IDE + compiler + stdlib ..."
