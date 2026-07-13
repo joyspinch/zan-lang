@@ -152,7 +152,7 @@ if(WIN32)
         add_custom_command(TARGET zanc POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                     -DMINGW_ROOT=${ZAN_MINGW_ROOT}
-                    -DDEST=$<TARGET_FILE_DIR:zanc>/toolchain
+                    -DDEST=$<TARGET_FILE_DIR:zanc>
                     -P ${CMAKE_SOURCE_DIR}/cmake/bundle_toolchain.cmake
             COMMENT "Assembling self-contained MinGW linking toolchain"
             VERBATIM)
@@ -167,12 +167,12 @@ endif()
 set(LINUX_MUSL_SYS "${CMAKE_SOURCE_DIR}/toolchain/linux-musl")
 if(EXISTS "${LINUX_MUSL_SYS}/libc.a")
     add_custom_command(TARGET zanc POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/toolchain/linux-musl
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/linux-musl
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${LINUX_MUSL_SYS}/crt1.o" "${LINUX_MUSL_SYS}/crti.o"
                 "${LINUX_MUSL_SYS}/crtn.o" "${LINUX_MUSL_SYS}/libc.a"
                 "${LINUX_MUSL_SYS}/zanrt_io.o"
-                $<TARGET_FILE_DIR:zanc>/toolchain/linux-musl/
+                $<TARGET_FILE_DIR:zanc>/linux-musl/
         COMMENT "Copying Linux musl sysroot for cross-compilation"
         VERBATIM)
 endif()

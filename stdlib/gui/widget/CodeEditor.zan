@@ -102,6 +102,12 @@ class CodeEditor {
     List<int> errorLines;
     List<string> errorMsgs;
     int lastDiagLine;       // caret line at last CheckErrors run (-1 = never)
+    // Real compiler diagnostics from the last Run/Build, mapped onto this file.
+    // Kept separate from the heuristic ones and invalidated on the next edit
+    // (tracked by cErrStamp = buffer length when the diagnostics were set).
+    List<int> cErrLines;
+    List<string> cErrMsgs;
+    int cErrStamp;
 
     // ---- symbol index (accurate, using-aware completion) ----
     // Types (class/struct/enum) declared across the project's other files, and
@@ -110,6 +116,9 @@ class CodeEditor {
     // members instead of guesswork. The current buffer is scanned on demand.
     List<string> projTypeNames;
     List<string> projTypeMembers;
+    // Raw source of every other project file, kept so signature help can parse
+    // the real parameter list of a user/project method (not just its name).
+    List<string> projFileSrc;
     // Missing-`using` quick-fix map: fixLines[i] is a line whose error can be
     // resolved by inserting `using fixNs[i];`.
     List<int> fixLines;
@@ -129,8 +138,34 @@ class CodeEditor {
     int ctxY;
     string ctxCmd;          // command the host IDE must handle ("find"/"gotoline")
 
+    // ---- appearance (font + syntax colors), set by the host via ApplyTheme ----
+    // edFont is the code font size; 0 means "use the UI theme's medium size".
+    // The syntax colors are ARGB; 0 means "fall back to the built-in default".
+    int edFont;
+    int synKw;
+    int synTy;
+    int synStr;
+    int synCom;
+    int synNum;
+    int synText;
+
+    /// Sets the editor's code font size and syntax-highlight colors. A 0 for any
+    /// argument keeps that aspect at its built-in default.
+    void ApplyTheme(int fontPx, int kw, int ty, int str, int com, int num, int text) {
+        edFont = fontPx;
+        synKw = kw; synTy = ty; synStr = str; synCom = com; synNum = num; synText = text;
+    }
+
+    /// The code font size to render with, honoring the theme's default when unset.
+    int FontSize(Theme t) {
+        if (edFont > 0) { return edFont; }
+        return t.fontSizeMedium;
+    }
+
     static CodeEditor Create() {
         CodeEditor e = new CodeEditor();
+        e.edFont = 0;
+        e.synKw = 0; e.synTy = 0; e.synStr = 0; e.synCom = 0; e.synNum = 0; e.synText = 0;
         e.lines = new List<string>();
         e.lines.Add("");
         e.curLine = 0;
@@ -183,8 +218,12 @@ class CodeEditor {
         e.errorLines = new List<int>();
         e.errorMsgs = new List<string>();
         e.lastDiagLine = -1;
+        e.cErrLines = new List<int>();
+        e.cErrMsgs = new List<string>();
+        e.cErrStamp = -1;
         e.projTypeNames = new List<string>();
         e.projTypeMembers = new List<string>();
+        e.projFileSrc = new List<string>();
         e.fixLines = new List<int>();
         e.fixNs = new List<string>();
         e.bps = new List<int>();
@@ -277,6 +316,45 @@ class CodeEditor {
         curLine = line;
         curCol = 0;
         selActive = false;
+    }
+
+    /// Total buffer size, used only as a cheap change signal for invalidating
+    /// compiler diagnostics when the user edits the file.
+    int BufLen() {
+        int n = 0;
+        int i = 0;
+        while (i < lines.Count) { n = n + lines[i].Length + 1; i = i + 1; }
+        return n;
+    }
+
+    /// Replaces the compiler diagnostics shown as red underlines + tooltips with
+    /// the real errors reported by the last Run/Build for this file, and jumps
+    /// the caret to the first one so its reason is visible immediately.
+    void SetCompilerDiagnostics(List<int> errLines, List<string> msgs) {
+        cErrLines = errLines;
+        cErrMsgs = msgs;
+        cErrStamp = BufLen();
+        if (cErrLines.Count > 0) {
+            GoToLine(cErrLines[0]);
+        }
+    }
+
+    /// True once the buffer has changed since the compiler diagnostics were set,
+    /// so stale errors stop being drawn the moment the user starts editing.
+    bool CompilerDiagStale() {
+        return cErrStamp < 0 || BufLen() != cErrStamp;
+    }
+
+    /// The compiler-diagnostic message for a line, or "" when none/stale.
+    string CompilerErrMsg(int ln) {
+        if (CompilerDiagStale()) { return ""; }
+        return CodeEditor.GetErrorMsg(cErrLines, cErrMsgs, ln);
+    }
+
+    /// True when line `ln` currently carries a live compiler diagnostic.
+    bool HasCompilerErr(int ln) {
+        if (CompilerDiagStale()) { return false; }
+        return CodeEditor.HasInt(cErrLines, ln);
     }
 
     void GoToLineCol(int line, int col) {
@@ -1150,7 +1228,11 @@ class CodeEditor {
                             if (CodeEditor.InSet(joinSet, nxt.Substring(0, 1))) { needsSemi = false; }
                         }
                     }
-                    if (needsSemi) {
+                    // The generic "missing semicolon" guess produced too many
+                    // false positives (multi-line calls, attributes, generics);
+                    // real, accurate diagnostics now come from the compiler after
+                    // Run/Build, so this heuristic is intentionally dropped.
+                    if (false && needsSemi) {
                         errorLines.Add(li);
                         errorMsgs.Add("Missing ';' (or incomplete statement)");
                     }
@@ -2167,6 +2249,7 @@ class CodeEditor {
     void SetProjectFiles(List<string> contents) {
         projTypeNames = new List<string>();
         projTypeMembers = new List<string>();
+        projFileSrc = contents;
         int i = 0;
         while (i < contents.Count) {
             CodeEditor.ScanTypesInto(contents[i], projTypeNames, projTypeMembers);
@@ -2625,6 +2708,67 @@ class CodeEditor {
         if (kind == "F") { return "field"; }
         if (kind == "E") { return "event"; }
         return "symbol";
+    }
+
+    /// Given a trimmed method declaration line, returns a clean one-line
+    /// signature "ReturnType Name(params)" (modifiers stripped, body removed),
+    /// or "" if the line is not a method declaration.
+    static string SigFromLine(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        int paren = CodeEditor.Find(s, "(");
+        if (paren <= 0) { return ""; }
+        // Reject control keywords like "if (" / "while (" masquerading as methods.
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int e = paren;
+        while (e > 0 && CodeEditor.InSet(idset, s.Substring(e - 1, 1))) { e = e - 1; }
+        string mname = s.Substring(e, paren - e);
+        if (mname.Length == 0 || e == 0) { return ""; }
+        if (CodeEditor.IsControlWord(mname)) { return ""; }
+        // Take through the matching close paren on this line; if none, to EOL.
+        int depth = 0;
+        int i = paren;
+        int close = -1;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "(") { depth = depth + 1; }
+            else if (ch == ")") { depth = depth - 1; if (depth == 0) { close = i; break; } }
+            i = i + 1;
+        }
+        string sig = "";
+        if (close >= 0) { sig = s.Substring(0, close + 1); }
+        else { sig = CodeEditor.TrimStr(s) + ")"; }
+        return CodeEditor.TrimStr(sig);
+    }
+
+    /// Scans the given source lines for a method named `name` and returns its
+    /// real parsed signature, or "".
+    static string SigInSource(string src, string name) {
+        List<string> ls = CodeEditor.SplitLines(src);
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.TrimStr(ls[i]);
+            if (CodeEditor.MemberDeclName(tr) == name) {
+                string sig = CodeEditor.SigFromLine(tr);
+                if (sig.Length > 0) { return sig; }
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Real signature of a user/project method named `name`, parsed from the
+    /// current buffer first, then other project files. "" when not found — so
+    /// callers can fall back to the curated stdlib signatures.
+    string RealSigFor(string name) {
+        string here = CodeEditor.SigInSource(GetText(), name);
+        if (here.Length > 0) { return here; }
+        int i = 0;
+        while (i < projFileSrc.Count) {
+            string s = CodeEditor.SigInSource(projFileSrc[i], name);
+            if (s.Length > 0) { return s; }
+            i = i + 1;
+        }
+        return "";
     }
 
     /// Curated one-line signature for well-known members, else "".
@@ -3162,13 +3306,19 @@ class CodeEditor {
     /// Splits `line` into colored segments (parallel outT/outC lists): keywords,
     /// types (Capitalized identifiers), strings, line comments and numbers get
     /// distinct colors; everything else uses the default text color.
-    static void Highlight(string line, Theme t, List<string> outT, List<int> outC) {
+    void Highlight(string line, Theme t, List<string> outT, List<int> outC) {
         int kwC = 0xFF569CD6;
         int tyC = 0xFF4EC9B0;
         int strC = 0xFFCE9178;
         int comC = 0xFF6A9955;
         int numC = 0xFFB5CEA8;
         int def = t.textPrimary;
+        if (synKw != 0) { kwC = synKw; }
+        if (synTy != 0) { tyC = synTy; }
+        if (synStr != 0) { strC = synStr; }
+        if (synCom != 0) { comC = synCom; }
+        if (synNum != 0) { numC = synNum; }
+        if (synText != 0) { def = synText; }
         string lower = "abcdefghijklmnopqrstuvwxyz";
         string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         string digits = "0123456789";
@@ -3279,7 +3429,7 @@ class CodeEditor {
         lastId = id;
         bool focused = app.focus.IsFocused(id);
 
-        int fontSize = t.fontSizeMedium;
+        int fontSize = FontSize(t);
         int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
         if (lineH < 1) { lineH = 1; }
         int gutterW = app.Scale(48);
@@ -3370,15 +3520,19 @@ class CodeEditor {
                         curLine, curCol, ln, text, textX, rowY, lineH, fontSize, area);
                 }
 
-                // Error indicator (red underline)
-                if (CodeEditor.HasInt(errorLines, ln)) {
+                // Error indicator (red underline). Real compiler errors take
+                // priority and are drawn a touch bolder than the heuristic ones.
+                if (HasCompilerErr(ln)) {
+                    c.FillRect(textX, rowY + lineH - app.Scale(2),
+                        Canvas.MeasureText(text, fontSize), app.Scale(2), 0xFFFF4444);
+                } else if (CodeEditor.HasInt(errorLines, ln)) {
                     c.FillRect(textX, rowY + lineH - app.Scale(2),
                         Canvas.MeasureText(text, fontSize), app.Scale(2), 0xAAFF4444);
                 }
 
                 List<string> segT = new List<string>();
                 List<int> segC = new List<int>();
-                CodeEditor.Highlight(text, t, segT, segC);
+                Highlight(text, t, segT, segC);
                 int sx = textX;
                 int si2 = 0;
                 while (si2 < segT.Count) {
@@ -3423,9 +3577,11 @@ class CodeEditor {
                     }
                 }
 
-                // Show error tooltip on hovered error line
-                if (CodeEditor.HasInt(errorLines, ln) && ln == curLine) {
-                    string errMsg = CodeEditor.GetErrorMsg(errorLines, errorMsgs, ln);
+                // Show the error reason for the caret line. Compiler diagnostics
+                // win over the heuristic guess when both are present.
+                if ((HasCompilerErr(ln) || CodeEditor.HasInt(errorLines, ln)) && ln == curLine) {
+                    string errMsg = CompilerErrMsg(ln);
+                    if (errMsg.Length == 0) { errMsg = CodeEditor.GetErrorMsg(errorLines, errorMsgs, ln); }
                     if (errMsg.Length > 0) {
                         int ttW = Canvas.MeasureText(errMsg, fontSize) + app.Scale(12);
                         int ttH = lineH;
@@ -3465,6 +3621,17 @@ class CodeEditor {
                     c.FillRect(stripX + app.Scale(2), my, stripW - app.Scale(4), app.Scale(3), 0xFFFF4444);
                 }
                 mi = mi + 1;
+            }
+            if (!CompilerDiagStale()) {
+                int ci2 = 0;
+                while (ci2 < cErrLines.Count) {
+                    int el2 = cErrLines[ci2];
+                    if (el2 >= 0 && el2 < lines.Count) {
+                        int my2 = area.y + el2 * area.height / total;
+                        c.FillRect(stripX + app.Scale(2), my2, stripW - app.Scale(4), app.Scale(3), 0xFFFF4444);
+                    }
+                    ci2 = ci2 + 1;
+                }
             }
         }
 
@@ -3591,7 +3758,8 @@ class CodeEditor {
                 string dName = acItems[acSel];
                 string dKind = "";
                 if (acSel < acKinds.Count) { dKind = acKinds[acSel]; }
-                string dSig = CodeEditor.DescSig(dName);
+                string dSig = RealSigFor(dName);
+                if (dSig.Length == 0) { dSig = CodeEditor.DescSig(dName); }
                 string dDoc = CodeEditor.DescDoc(dName);
                 string sigLine = dSig;
                 if (sigLine.Length == 0) { sigLine = dName; }
@@ -3943,7 +4111,8 @@ class CodeEditor {
         if (!acActive && !ctxOpen && execLine < 0) {
             string hw = WordAtMouse(app, area, gutterW, fontSize);
             if (hw.Length > 0) {
-                string hsig = CodeEditor.DescSig(hw);
+                string hsig = RealSigFor(hw);
+                if (hsig.Length == 0) { hsig = CodeEditor.DescSig(hw); }
                 string hdoc = CodeEditor.DescDoc(hw);
                 if (hsig.Length > 0) {
                     int hpad = app.Scale(8);

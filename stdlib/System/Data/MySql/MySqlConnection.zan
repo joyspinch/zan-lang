@@ -180,6 +180,45 @@ class MySqlConnection {
         return tok;
     }
 
+    /// <summary>mysql_native_password scramble:
+    /// SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) ). Returns a 20-byte
+    /// buffer (caller frees).</summary>
+    static string scrambleNative(string pw, string nonce20) {
+        string a = Sha1.Hash(pw, pw.Length);
+        string b = Sha1.Hash(a, 20);
+        string cat = calloc(41, 1);
+        int i = 0;
+        while (i < 20) { cat[i] = nonce20[i] & 255; i = i + 1; }
+        i = 0;
+        while (i < 20) { cat[20 + i] = b[i] & 255; i = i + 1; }
+        string c = Sha1.Hash(cat, 40);
+        free(cat);
+        string tok = calloc(21, 1);
+        i = 0;
+        while (i < 20) { tok[i] = (a[i] ^ c[i]) & 255; i = i + 1; }
+        free(a);
+        free(b);
+        free(c);
+        return tok;
+    }
+
+    static string authToken(string plugin, string pw, string nonce20, List<int> outLen) {
+        if (pw.Length == 0) {
+            outLen[0] = 0;
+            return calloc(1, 1);
+        }
+        if (plugin == "caching_sha2_password") {
+            outLen[0] = 32;
+            return scramble41(pw, nonce20);
+        }
+        if (plugin == "mysql_native_password") {
+            outLen[0] = 20;
+            return scrambleNative(pw, nonce20);
+        }
+        outLen[0] = -1;
+        return null;
+    }
+
     // ============================================================
     // caching_sha2_password full authentication (cold cache)
     // ============================================================
@@ -299,9 +338,12 @@ class MySqlConnection {
         while (i < 8) { nonce[i] = hs[p+i] & 255; i = i + 1; }
         p = p + 8;
         p = p + 1;                                    // filler
+        int capLow = (hs[p]&255)|((hs[p+1]&255)<<8);
         p = p + 2;                                    // capability flags (lower)
         p = p + 1;                                    // charset
         p = p + 2;                                    // status flags
+        int capHigh = (hs[p]&255)|((hs[p+1]&255)<<8);
+        int serverCaps = capLow | (capHigh << 16);
         p = p + 2;                                    // capability flags (upper)
         int authlen = hs[p] & 255; p = p + 1;         // auth-plugin-data length
         p = p + 10;                                   // reserved
@@ -311,6 +353,15 @@ class MySqlConnection {
         if (copy2 > 12) { copy2 = 12; }
         i = 0;
         while (i < copy2) { nonce[8+i] = hs[p+i] & 255; i = i + 1; }
+        p = p + part2;
+        string plugin = "mysql_native_password";
+        if ((serverCaps & 524288) != 0 && p < this.lastLen) {
+            int pluginEnd = p;
+            while (pluginEnd < this.lastLen && (hs[pluginEnd] & 255) != 0) {
+                pluginEnd = pluginEnd + 1;
+            }
+            if (pluginEnd > p) { plugin = bytesToStr(hs, p, pluginEnd - p); }
+        }
         free(hs);
 
         // --- build + send handshake response (seq 1) ---
@@ -319,10 +370,16 @@ class MySqlConnection {
         int caps = 1 | 4 | 512 | 8192 | 32768 | 524288;
         bool hasDb = db.Length > 0;
         if (hasDb) { caps = caps | 8; }              // CLIENT_CONNECT_WITH_DB
-        string token = scramble41(pw, nonce);
-        string plugin = "caching_sha2_password";
+        List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
+        string token = authToken(plugin, pw, nonce, tokenLenOut);
+        int tokenLen = tokenLenOut[0];
+        if (token == null || tokenLen < 0) {
+            this.lastError = "unsupported auth plugin: " + plugin;
+            free(nonce);
+            return false;
+        }
         int userLen = user.Length;
-        int respLen = 4 + 4 + 1 + 23 + userLen + 1 + 1 + 32;
+        int respLen = 4 + 4 + 1 + 23 + userLen + 1 + 1 + tokenLen;
         if (hasDb) { respLen = respLen + db.Length + 1; }
         respLen = respLen + plugin.Length + 1;
         string resp = calloc(respLen + 1, 1);
@@ -333,8 +390,8 @@ class MySqlConnection {
         q = q + 23;                                                 // 23-byte filler (zeros)
         i = 0; while (i < userLen) { resp[q+i] = user[i] & 255; i = i + 1; } q = q + userLen;
         resp[q]=0; q=q+1;
-        resp[q]=32; q=q+1;                                          // auth response length
-        i = 0; while (i < 32) { resp[q+i] = token[i] & 255; i = i + 1; } q = q + 32;
+        resp[q]=tokenLen; q=q+1;                                    // auth response length
+        i = 0; while (i < tokenLen) { resp[q+i] = token[i] & 255; i = i + 1; } q = q + tokenLen;
         free(token);
         if (hasDb) {
             i = 0; while (i < db.Length) { resp[q+i] = db[i] & 255; i = i + 1; } q = q + db.Length;
@@ -397,9 +454,35 @@ class MySqlConnection {
                 free(nonce); return false;
             }
             if (b0 == 254) {
+                int pluginEnd = 1;
+                while (pluginEnd < this.lastLen && (r[pluginEnd] & 255) != 0) {
+                    pluginEnd = pluginEnd + 1;
+                }
+                string switchPlugin = bytesToStr(r, 1, pluginEnd - 1);
+                int nonceStart = pluginEnd + 1;
+                int switchNonceLen = this.lastLen - nonceStart;
+                if (switchNonceLen > 20) { switchNonceLen = 20; }
+                string switchNonce = calloc(21, 1);
+                i = 0;
+                while (i < switchNonceLen) {
+                    switchNonce[i] = r[nonceStart + i] & 255;
+                    i = i + 1;
+                }
                 free(r);
-                this.lastError = "auth-switch requested (unsupported plugin)";
-                free(nonce); return false;
+                List<int> switchLenOut = new List<int>(); switchLenOut.Add(0);
+                string switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
+                int switchLen = switchLenOut[0];
+                if (switchToken == null || switchLen < 0) {
+                    this.lastError = "unsupported auth-switch plugin: " + switchPlugin;
+                    free(switchNonce);
+                    free(nonce);
+                    return false;
+                }
+                free(nonce);
+                nonce = switchNonce;
+                await this.writePacket(switchToken, switchLen, this.lastSeq + 1);
+                free(switchToken);
+                continue;
             }
             free(r);
             this.lastError = "unexpected auth packet " + Convert.ToString(b0);

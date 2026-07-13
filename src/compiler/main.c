@@ -672,6 +672,33 @@ static const char *zan_driver_subdir(const zan_target_t *t) {
     return (t->arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
 }
 
+/* Directory containing the running zanc executable. Everything zanc links with
+ * (runtime objects, linker bundle, sysroot) is installed as its sibling, so
+ * paths are resolved relative to this at runtime -- never a build-time absolute
+ * path baked in, which would break once zanc is relocated/redistributed. */
+static void zan_exe_dir(char *out, size_t outsz) {
+    out[0] = '\0';
+#ifdef _WIN32
+    GetModuleFileNameA(NULL, out, (DWORD)outsz);
+    { char *s = strrchr(out, '\\'); if (s) *s = '\0'; }
+#elif defined(__APPLE__)
+    { uint32_t sz = (uint32_t)outsz;
+      if (_NSGetExecutablePath(out, &sz) != 0) out[0] = '\0';
+      char *s = strrchr(out, '/'); if (s) *s = '\0'; }
+#else
+    { ssize_t n = readlink("/proc/self/exe", out, outsz - 1);
+      if (n > 0) { out[n] = '\0'; char *s = strrchr(out, '/'); if (s) *s = '\0'; } }
+#endif
+}
+
+/* Bare filename of a path (after the last '/' or '\\'). */
+static const char *zan_path_basename(const char *p) {
+    const char *b = p;
+    for (const char *q = p; *q; q++)
+        if (*q == '/' || *q == '\\') b = q + 1;
+    return b;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Zan Compiler v0.1.0\n");
@@ -1103,25 +1130,46 @@ int main(int argc, char **argv) {
         /* ---- link object → executable ---- */
         int link_ret;
 
+        /* The compiler's own directory: the runtime objects below ship as its
+         * siblings (copied there by the build / publish step), so we resolve
+         * them relative to zanc at runtime rather than trusting the build-time
+         * absolute path CMake baked into ZAN_RT_*_OBJ (which vanishes once zanc
+         * is relocated into a redistributable dist\toolchain). */
+        char link_exe_dir[1024];
+        zan_exe_dir(link_exe_dir, sizeof(link_exe_dir));
+        char rt_io_buf[1200];
+        char rt_sync_buf[1200];
+
         /* Socket-async programs (await Socket.ReadReady/WriteReady) link the
          * readiness reactor object shipped with zanc; it provides zan_io_wait_co
          * and the strong zan_io_pump_timeout that overrides the program's weak
-         * timer-only fallback. ZAN_RT_IO_OBJ is the build/install path baked in
-         * by CMake. */
+         * timer-only fallback. */
         const char *rt_io_obj = NULL;
 #ifdef ZAN_RT_IO_OBJ
-        if (irgen.uses_socket_async) rt_io_obj = ZAN_RT_IO_OBJ;
+        if (irgen.uses_socket_async) {
+            snprintf(rt_io_buf, sizeof(rt_io_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_IO_OBJ));
+            rt_io_obj = rt_io_buf;
+        }
 #endif
         /* --async-workers (mt_scheduler): the inline single-thread coroutine
          * driver was NOT emitted, so the program must link the multi-worker
          * reactor variant, which supplies both the reactor and the driver.
          * Force-link it even for non-socket async programs. */
 #ifdef ZAN_RT_IO_MT_OBJ
-        if (mt_scheduler) rt_io_obj = ZAN_RT_IO_MT_OBJ;
+        if (mt_scheduler) {
+            snprintf(rt_io_buf, sizeof(rt_io_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_IO_MT_OBJ));
+            rt_io_obj = rt_io_buf;
+        }
 #endif
         const char *rt_sync_obj = NULL;
 #ifdef ZAN_RT_SYNC_OBJ
-        if (irgen.uses_sync_runtime) rt_sync_obj = ZAN_RT_SYNC_OBJ;
+        if (irgen.uses_sync_runtime) {
+            snprintf(rt_sync_buf, sizeof(rt_sync_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_SYNC_OBJ));
+            rt_sync_obj = rt_sync_buf;
+        }
 #endif
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX) {
             fprintf(stderr,
@@ -1238,8 +1286,11 @@ int main(int argc, char **argv) {
 #endif
             const char *sub = (target.arch == ZAN_ARCH_AARCH64)
                               ? "linux-arm64" : "linux-musl";
+            /* Sysroot sits right next to zanc, in whatever directory the
+             * compiler was installed into (dev: build/<sub>; release:
+             * dist/toolchain/<sub>). No separate toolchain/ subdirectory. */
             char sys[1200];
-            snprintf(sys, sizeof(sys), "%s/toolchain/%s", exe_dir, sub);
+            snprintf(sys, sizeof(sys), "%s/%s", exe_dir, sub);
 
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
@@ -1281,9 +1332,12 @@ int main(int argc, char **argv) {
         char exe_dir[1024];
         GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir));
         { char *s = strrchr(exe_dir, '\\'); if (s) *s = '\0'; }
+        /* The linker bundle (ld + mingw runtime) sits right next to zanc, in
+         * whatever directory the compiler was installed into (dev: build\;
+         * release: dist\toolchain\). No separate toolchain\ subdirectory. */
         char ld_path[1200], syslib[1200];
-        snprintf(ld_path, sizeof(ld_path), "%s\\toolchain\\ld.exe", exe_dir);
-        snprintf(syslib, sizeof(syslib), "%s\\toolchain\\mingw\\lib", exe_dir);
+        snprintf(ld_path, sizeof(ld_path), "%s\\ld.exe", exe_dir);
+        snprintf(syslib, sizeof(syslib), "%s\\mingw\\lib", exe_dir);
         int have_bundle =
             GetFileAttributesA(ld_path) != INVALID_FILE_ATTRIBUTES &&
             GetFileAttributesA(syslib)  != INVALID_FILE_ATTRIBUTES;

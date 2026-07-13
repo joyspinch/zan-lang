@@ -1,0 +1,333 @@
+using System;
+using System.IO;
+using Gui;
+
+namespace Gui.Widget;
+
+/// Reusable in-app path picker for selecting folders, opening files, and saving
+/// files without invoking a platform-native dialog.
+class FilePicker {
+    static int lang;
+
+    Input pathInput;
+    Input nameInput;
+    SignalInt scroll;
+    bool open;
+    int mode;
+    string title;
+    string suffix;
+    string selectedPath;
+
+    static FilePicker Create() {
+        FilePicker picker = new FilePicker();
+        picker.pathInput = Input.Bind(SignalString.Create(""), "path");
+        picker.nameInput = Input.Bind(SignalString.Create(""), "file name");
+        picker.scroll = SignalInt.Create(0);
+        picker.open = false;
+        picker.mode = 0;
+        picker.title = "";
+        picker.suffix = "";
+        picker.selectedPath = "";
+        return picker;
+    }
+
+    static string T(string en, string zh) {
+        if (FilePicker.lang == 1) { return zh; }
+        return en;
+    }
+
+    static string Normalize(string path) {
+        string result = "";
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            if (ch == "\\") { result = result + "/"; }
+            else { result = result + ch; }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    static string LowerAscii(string text) {
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        string result = "";
+        int i = 0;
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            int j = 0;
+            bool found = false;
+            while (j < 26 && !found) {
+                if (upper.Substring(j, 1) == ch) {
+                    result = result + lower.Substring(j, 1);
+                    found = true;
+                }
+                j = j + 1;
+            }
+            if (!found) { result = result + ch; }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    static bool EndsWith(string text, string ending) {
+        if (ending == "") { return true; }
+        string left = FilePicker.LowerAscii(text);
+        string right = FilePicker.LowerAscii(ending);
+        if (right.Length > left.Length) { return false; }
+        return left.Substring(left.Length - right.Length, right.Length) == right;
+    }
+
+    static string Join(string dir, string name) {
+        if (dir.Length > 0 && dir.Substring(dir.Length - 1, 1) == "/") {
+            return dir + name;
+        }
+        return dir + "/" + name;
+    }
+
+    static string ValidDirectory(string initial) {
+        string dir = FilePicker.Normalize(initial);
+        if (File.Exists(dir)) { dir = FilePicker.Normalize(Path.GetDirectoryName(dir)); }
+        if (Directory.Exists(dir)) { return dir; }
+        if (Directory.Exists(".")) { return "."; }
+        return "";
+    }
+
+    void BeginFolder(string initial, string dialogTitle) {
+        mode = 0;
+        title = dialogTitle;
+        suffix = "";
+        selectedPath = "";
+        pathInput.SetText(FilePicker.ValidDirectory(initial));
+        nameInput.SetText("");
+        scroll.Set(0);
+        open = true;
+    }
+
+    void BeginOpenFile(string initial, string extension, string dialogTitle) {
+        mode = 1;
+        title = dialogTitle;
+        suffix = extension;
+        selectedPath = "";
+        pathInput.SetText(FilePicker.ValidDirectory(initial));
+        nameInput.SetText("");
+        scroll.Set(0);
+        open = true;
+    }
+
+    void BeginSaveFile(string initial, string extension, string defaultName, string dialogTitle) {
+        mode = 2;
+        title = dialogTitle;
+        suffix = extension;
+        selectedPath = "";
+        pathInput.SetText(FilePicker.ValidDirectory(initial));
+        nameInput.SetText(defaultName);
+        scroll.Set(0);
+        open = true;
+    }
+
+    bool IsOpen() { return open; }
+    string SelectedPath() { return selectedPath; }
+    string CurrentDirectory() { return FilePicker.Normalize(pathInput.GetText()); }
+
+    void Close() {
+        open = false;
+        selectedPath = "";
+    }
+
+    void Navigate(string dir) {
+        dir = FilePicker.Normalize(dir);
+        if (!Directory.Exists(dir)) { return; }
+        pathInput.SetText(dir);
+        selectedPath = "";
+        scroll.Set(0);
+    }
+
+    int Render(App app) {
+        if (!open) { return 0; }
+
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int w = app.Scale(720);
+        int h = app.Scale(540);
+        int x = (c.Width() - w) / 2;
+        int y = (c.Height() - h) / 2;
+        int closeId = Modal.Render(app, w, h, title);
+        int pad = t.paddingLarge;
+        int top = y + pad + t.heightMedium + app.Scale(14);
+
+        int upW = app.Scale(72);
+        int goW = app.Scale(64);
+        int pathX = x + pad + upW + t.gapSmall;
+        int pathW = w - pad - pad - upW - goW - t.gapSmall - t.gapSmall;
+        int upId = Button.Create(FilePicker.T("Up", "上一级")).Render(app, x + pad, top, upW);
+        pathInput.Render(app, pathX, top, pathW, t.heightMedium);
+        int goId = Button.Create(FilePicker.T("Go", "转到")).Render(
+            app, pathX + pathW + t.gapSmall, top, goW);
+
+        string dir = FilePicker.Normalize(pathInput.GetText());
+        bool valid = Directory.Exists(dir);
+        int listX = x + pad;
+        int listY = top + t.heightMedium + t.gapMedium;
+        int footerH = app.Scale(76);
+        if (mode == 2) { footerH = app.Scale(116); }
+        int listW = w - pad - pad;
+        int listH = y + h - pad - footerH - listY;
+        c.FillRoundRect(listX, listY, listW, listH, t.borderRadiusMedium, t.bgSecondary);
+        c.DrawRect(listX, listY, listW, listH, t.borderSecondary, 1);
+
+        List<string> names = new List<string>();
+        List<string> paths = new List<string>();
+        List<int> kinds = new List<int>();
+        if (valid) {
+            List<string> dirs = Directory.GetDirectories(dir);
+            int di = 0;
+            while (di < dirs.Count) {
+                names.Add(dirs[di]);
+                paths.Add(FilePicker.Join(dir, dirs[di]));
+                kinds.Add(1);
+                di = di + 1;
+            }
+            if (mode != 0) {
+                List<string> files = Directory.GetFiles(dir);
+                int fi = 0;
+                while (fi < files.Count) {
+                    if (FilePicker.EndsWith(files[fi], suffix)) {
+                        names.Add(files[fi]);
+                        paths.Add(FilePicker.Join(dir, files[fi]));
+                        kinds.Add(0);
+                    }
+                    fi = fi + 1;
+                }
+            }
+        }
+
+        int rowH = app.Scale(32);
+        int maxRows = listH / rowH;
+        if (maxRows < 1) { maxRows = 1; }
+        int maxOff = names.Count - maxRows;
+        if (maxOff < 0) { maxOff = 0; }
+        int off = scroll.Get();
+        bool overList = app.mouseX >= listX && app.mouseX < listX + listW
+            && app.mouseY >= listY && app.mouseY < listY + listH;
+        if (app.window.EventKind() == 13 && overList) {
+            int delta = app.window.EventKeyCode();
+            int step = delta / 120;
+            if (step == 0) {
+                if (delta > 0) { step = 1; }
+                else if (delta < 0) { step = 0 - 1; }
+            }
+            off = off - step;
+            app.RequestRedraw();
+        }
+        if (off < 0) { off = 0; }
+        if (off > maxOff) { off = maxOff; }
+        scroll.Set(off);
+
+        int clicked = 0 - 1;
+        int shown = 0;
+        while (off + shown < names.Count && shown < maxRows) {
+            int idx = off + shown;
+            int rowY = listY + shown * rowH;
+            int rowId = app.focus.AllocId();
+            bool selected = selectedPath == paths[idx];
+            if (selected) {
+                c.FillRect(listX + 1, rowY, listW - 2, rowH, t.primaryHover);
+            } else if (app.focus.IsHovered(rowId)) {
+                c.FillRect(listX + 1, rowY, listW - 2, rowH, t.bgHover);
+            }
+            string prefix = "[FILE] ";
+            int color = t.textPrimary;
+            if (kinds[idx] == 1) {
+                prefix = "[DIR]  ";
+                color = t.primary;
+            }
+            c.DrawText(listX + t.paddingMedium, rowY + app.Scale(7),
+                prefix + names[idx], color, t.fontSizeMedium);
+            app.hitTester.Register(HitRegion.Create(
+                rowId, listX + 1, rowY, listW - 2, rowH, 0));
+            if (app.window.EventKind() == 3
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == rowId) {
+                clicked = idx;
+            }
+            shown = shown + 1;
+        }
+
+        if (names.Count == 0) {
+            string emptyText = FilePicker.T("This folder is empty.", "此文件夹为空。");
+            if (!valid) { emptyText = FilePicker.T("Folder not found.", "找不到文件夹。"); }
+            c.DrawText(listX + pad, listY + pad, emptyText, t.textTertiary, t.fontSizeMedium);
+        }
+
+        if (names.Count > maxRows) {
+            int thumbH = listH * maxRows / names.Count;
+            if (thumbH < app.Scale(18)) { thumbH = app.Scale(18); }
+            int thumbY = listY;
+            if (maxOff > 0) { thumbY = listY + (listH - thumbH) * off / maxOff; }
+            c.FillRect(listX + listW - app.Scale(4), listY, app.Scale(4), listH, t.bgTertiary);
+            c.FillRect(listX + listW - app.Scale(4), thumbY, app.Scale(4), thumbH, t.borderHover);
+        }
+
+        int footerY = listY + listH + t.gapMedium;
+        if (mode == 2) {
+            c.DrawText(listX, footerY + app.Scale(8), FilePicker.T("File name", "文件名"),
+                t.textSecondary, t.fontSizeMedium);
+            nameInput.Render(app, listX + app.Scale(84), footerY,
+                listW - app.Scale(84), t.heightMedium);
+            footerY = footerY + t.heightMedium + t.gapMedium;
+        }
+
+        string current = dir;
+        if (mode != 0 && selectedPath != "") { current = selectedPath; }
+        c.DrawText(listX, footerY + app.Scale(8), current, t.textTertiary, t.fontSizeSmall);
+
+        int buttonW = app.Scale(96);
+        int buttonX = x + w - pad - buttonW;
+        int cancelX = buttonX - t.gapMedium - buttonW;
+        string acceptText = FilePicker.T("Select Folder", "选择文件夹");
+        if (mode == 1) { acceptText = FilePicker.T("Open", "打开"); }
+        if (mode == 2) { acceptText = FilePicker.T("Save", "保存"); }
+        int cancelId = Button.Create(FilePicker.T("Cancel", "取消")).Render(
+            app, cancelX, footerY, buttonW);
+        int acceptId = Button.Primary(acceptText).Render(app, buttonX, footerY, buttonW);
+
+        if (Button.WasClicked(app, upId)) {
+            string parent = FilePicker.Normalize(Path.GetDirectoryName(dir));
+            if (Directory.Exists(parent)) { Navigate(parent); }
+        } else if (Button.WasClicked(app, goId)) {
+            Navigate(pathInput.GetText());
+        } else if (clicked >= 0 && clicked < paths.Count) {
+            if (kinds[clicked] == 1) {
+                Navigate(paths[clicked]);
+            } else {
+                selectedPath = paths[clicked];
+                nameInput.SetText(names[clicked]);
+                app.RequestRedraw();
+            }
+        } else if (Button.WasClicked(app, cancelId)
+                   || (app.window.EventKind() == 3
+                       && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId)) {
+            open = false;
+            selectedPath = "";
+            return 2;
+        } else if (Button.WasClicked(app, acceptId)) {
+            if (mode == 0 && valid) {
+                selectedPath = dir;
+                open = false;
+                return 1;
+            }
+            if (mode == 1 && File.Exists(selectedPath)) {
+                open = false;
+                return 1;
+            }
+            if (mode == 2 && valid && nameInput.GetText() != "") {
+                string name = nameInput.GetText();
+                if (suffix != "" && !FilePicker.EndsWith(name, suffix)) { name = name + suffix; }
+                selectedPath = FilePicker.Join(dir, name);
+                open = false;
+                return 1;
+            }
+        }
+        return 0;
+    }
+}
