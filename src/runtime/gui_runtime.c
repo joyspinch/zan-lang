@@ -596,10 +596,10 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
     if (ca == 0) ca = 255; /* treat 0 alpha as opaque for text */
     for (int py = 0; py < th; py++) {
         int dst_y = (int)y + py;
-        if (dst_y < 0 || dst_y >= s->height) continue;
+        if (dst_y < s->clip_y0 || dst_y >= s->clip_y1) continue;
         for (int px = 0; px < tw; px++) {
             int dst_x = (int)x + px;
-            if (dst_x < 0 || dst_x >= s->width) continue;
+            if (dst_x < s->clip_x0 || dst_x >= s->clip_x1) continue;
             u32 sp = src[py * tw + px];
             u32 sr = (sp >> 16) & 0xFF;
             u32 sg = (sp >> 8) & 0xFF;
@@ -737,10 +737,10 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box, i64 color, 
     u32 *src = (u32 *)bits;
     for (int py = 0; py < th; py++) {
         int dst_y = oy + py;
-        if (dst_y < 0 || dst_y >= s->height) continue;
+        if (dst_y < s->clip_y0 || dst_y >= s->clip_y1) continue;
         for (int px = 0; px < tw; px++) {
             int dst_x = ox + px;
-            if (dst_x < 0 || dst_x >= s->width) continue;
+            if (dst_x < s->clip_x0 || dst_x >= s->clip_x1) continue;
             u32 sp = src[py * tw + px];
             u32 sr = (sp >> 16) & 0xFF;
             u32 sg = (sp >> 8) & 0xFF;
