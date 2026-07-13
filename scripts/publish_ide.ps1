@@ -6,7 +6,7 @@
 # into dist -- treat it as the single, clean release output.
 #
 #   dist\
-#     ide_demo.exe        the IDE
+#     ZanIDE.exe           the IDE
 #     toolchain\          the Zan compiler + its self-contained linker bundle:
 #                           zanc.exe, ld.exe, mingw\, linux-musl\ ...
 #                         (the IDE finds zanc here; zanc finds its linker next
@@ -37,7 +37,7 @@ if (-not $SkipBuild) {
 
 # ---- required inputs ----
 $b       = Join-Path $root 'build'
-$ideExe  = Join-Path $b 'ide_demo.exe'
+$ideExe  = Join-Path $b 'ZanIDE.exe'
 $zancExe = Join-Path $b 'zanc.exe'
 $stdlib  = Join-Path $root 'stdlib'
 foreach ($p in @($ideExe, $zancExe, $stdlib)) {
@@ -62,7 +62,7 @@ if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist | Out-Nul
 Write-Output "[3/4] Copying IDE + compiler + stdlib ..."
 $distTc = Join-Path $dist 'toolchain'
 New-Item -ItemType Directory -Path $distTc | Out-Null
-Copy-Item $ideExe (Join-Path $dist 'ide_demo.exe')
+Copy-Item $ideExe (Join-Path $dist 'ZanIDE.exe')
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 
 # Everything the compiler needs travels together in dist\toolchain, laid out
@@ -115,7 +115,7 @@ Zan IDE - self-contained release
 ================================
 
 Contents
-  ide_demo.exe   The Zan IDE.
+  ZanIDE.exe     The Zan IDE.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
                    zan-lsp.exe             language server (for external editors)
@@ -128,7 +128,7 @@ Contents
                  next to itself in this same folder, so producing an .exe needs
                  no external toolchain. Keep this folder intact.
   stdlib\        Standard library sources. zanc auto-includes the .zan files
-                 it needs from here; keep this folder next to ide_demo.exe.
+                 it needs from here; keep this folder next to ZanIDE.exe.
   examples\      Sample programs shown in the IDE's Examples pane (optional).
 
 Requirement
@@ -137,7 +137,7 @@ Requirement
   are removed, zanc falls back to a system clang on PATH.)
 
 Run
-  Double-click ide_demo.exe (or run it from a terminal). Everything the IDE
+  Double-click ZanIDE.exe (or run it from a terminal). Everything the IDE
   needs to build and run Zan programs ships in this folder.
 
 Note

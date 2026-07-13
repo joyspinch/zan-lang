@@ -28,7 +28,7 @@ The script (`scripts/publish_ide.ps1`):
 
 | Path            | Purpose                                                              |
 | --------------- | ------------------------------------------------------------------- |
-| `ide_demo.exe`  | The IDE.                                                             |
+| `ZanIDE.exe`    | The IDE.                                                             |
 | `zanc.exe`      | The Zan compiler. Kept next to the IDE.                              |
 | `stdlib\`       | Standard library sources. `zanc` auto-includes what it needs.       |
 | `examples\`     | Sample programs for the IDE's Examples pane (optional).             |
@@ -40,7 +40,7 @@ The IDE resolves the compiler relative to **its own executable directory**
 (`IdeDemo.ExeDir()` → `zanc.exe`), and `zanc` in turn resolves its stdlib
 relative to **its own** executable (`<exe_dir>/stdlib` or `<exe_dir>/../stdlib`).
 
-Because `ide_demo.exe`, `zanc.exe` and `stdlib\` all sit together in `dist\`,
+Because `ZanIDE.exe`, `zanc.exe` and `stdlib\` all sit together in `dist\`,
 the release is fully relocatable: copy the folder anywhere and the IDE still
 finds the compiler and standard library — no absolute paths, no registry, no
 environment variables.

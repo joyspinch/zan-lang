@@ -268,9 +268,9 @@ if(ZAN_BUILD_GUI)
 endif()
 
 # ---- IDE ----
-# The IDE is built from src/ide_zan/ide_demo.zan using the Zan compiler (zanc).
-# It is compiled separately: zanc src/ide_zan/ide_demo.zan -o build/ide_demo.exe
-# The old C-based zan-ide target has been removed in favour of ide_demo.
+# The IDE is built from src/ide_zan/ZanIDE.zan using the Zan compiler (zanc).
+# It is compiled separately: zanc src/ide_zan/ZanIDE.zan -o build/ZanIDE.exe
+# The old C-based zan-ide target has been removed in favour of ZanIDE.
 
 # ---- Tests ----
 enable_testing()
