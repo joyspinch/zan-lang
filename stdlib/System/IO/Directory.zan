@@ -10,29 +10,51 @@ namespace System.IO;
 /// </summary>
 class Directory {
     #if WINDOWS
-    [DllImport("kernel32", EntryPoint = "GetFileAttributesA")]
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
     static extern int WinGetFileAttributes(string path);
 
-    [DllImport("kernel32", EntryPoint = "CreateDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "CreateDirectoryW")]
     static extern int WinCreateDirectory(string path, int secAttrs);
 
-    [DllImport("kernel32", EntryPoint = "RemoveDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "RemoveDirectoryW")]
     static extern int WinRemoveDirectory(string path);
 
-    [DllImport("kernel32", EntryPoint = "GetCurrentDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "GetCurrentDirectoryW")]
     static extern int WinGetCurrentDirectory(int bufLen, string buf);
 
-    [DllImport("kernel32", EntryPoint = "SetCurrentDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "SetCurrentDirectoryW")]
     static extern int WinSetCurrentDirectory(string path);
 
-    [DllImport("kernel32", EntryPoint = "FindFirstFileA")]
+    [DllImport("kernel32", EntryPoint = "FindFirstFileW")]
     static extern int WinFindFirstFile(string pattern, string findData);
 
-    [DllImport("kernel32", EntryPoint = "FindNextFileA")]
+    [DllImport("kernel32", EntryPoint = "FindNextFileW")]
     static extern int WinFindNextFile(int handle, string findData);
 
     [DllImport("kernel32", EntryPoint = "FindClose")]
     static extern int WinFindClose(int handle);
+
+    [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
+    static extern int WinToWide(
+        int codePage,
+        int flags,
+        string source,
+        int sourceLength,
+        string output,
+        int outputLength
+    );
+
+    [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
+    static extern int WinToUtf8(
+        int codePage,
+        int flags,
+        string source,
+        int sourceLength,
+        string output,
+        int outputLength,
+        string defaultChar,
+        string usedDefaultChar
+    );
     #else
     // POSIX directory + filesystem primitives (libc).
     [DllImport("crt", EntryPoint = "opendir")]
@@ -72,11 +94,74 @@ class Directory {
     [DllImport("crt")]
     static extern int strlen(string str);
 
+    #if WINDOWS
+    static string winWide(string text) {
+        int count = WinToWide(65001, 0, text, -1, null, 0);
+        if (count <= 0) { return null; }
+        string wide = calloc(count, 2);
+        WinToWide(65001, 0, text, -1, wide, count);
+        return wide;
+    }
+
+    static string winUtf8(string wide) {
+        int count = WinToUtf8(
+            65001, 0, wide, -1, null, 0, null, null);
+        if (count <= 0) { return ""; }
+        string text = calloc(count, 1);
+        WinToUtf8(
+            65001, 0, wide, -1, text, count, null, null);
+        return text;
+    }
+
+    static int winAttributesUtf8(string path) {
+        string wide = winWide(path);
+        if (wide == null) { return -1; }
+        int attrs = WinGetFileAttributes(wide);
+        free(wide);
+        return attrs;
+    }
+    #endif
+
+    /// <summary>Checks a UTF-8 path without using the ANSI Windows API.</summary>
+    static bool ExistsUtf8(string path) {
+        #if WINDOWS
+        int attrs = winAttributesUtf8(path);
+        if (attrs == -1 || attrs == 4294967295) { return false; }
+        return (attrs & 16) != 0;
+        #else
+        return Exists(path);
+        #endif
+    }
+
+    /// <summary>Checks whether a UTF-8 path names a regular file.</summary>
+    static bool FileExistsUtf8(string path) {
+        #if WINDOWS
+        int attrs = winAttributesUtf8(path);
+        if (attrs == -1 || attrs == 4294967295) { return false; }
+        return (attrs & 16) == 0;
+        #else
+        return File.Exists(path);
+        #endif
+    }
+
+    /// <summary>Creates a directory whose path is encoded as UTF-8.</summary>
+    static void CreateDirectoryUtf8(string path) {
+        #if WINDOWS
+        string wide = winWide(path);
+        if (wide != null) {
+            WinCreateDirectory(wide, 0);
+            free(wide);
+        }
+        #else
+        CreateDirectory(path);
+        #endif
+    }
+
     /// <summary>Checks whether a directory exists.</summary>
     static bool Exists(string path) {
         #if WINDOWS
-        int attrs = WinGetFileAttributes(path);
-        // GetFileAttributesA returns the 32-bit DWORD INVALID_FILE_ATTRIBUTES
+        int attrs = winAttributesUtf8(path);
+        // GetFileAttributesW returns the 32-bit DWORD INVALID_FILE_ATTRIBUTES
         // (0xFFFFFFFF) on failure. Widened to a 64-bit int it reads as
         // 4294967295 rather than -1, so test both forms.
         if (attrs == -1 || attrs == 4294967295) { return false; }
@@ -92,7 +177,11 @@ class Directory {
     /// <summary>Creates a directory at the specified path.</summary>
     static void CreateDirectory(string path) {
         #if WINDOWS
-        WinCreateDirectory(path, 0);
+        string wide = winWide(path);
+        if (wide != null) {
+            WinCreateDirectory(wide, 0);
+            free(wide);
+        }
         #else
         mkdir(path, 511);   // 0o777, subject to umask
         #endif
@@ -101,7 +190,11 @@ class Directory {
     /// <summary>Deletes an empty directory.</summary>
     static void Delete(string path) {
         #if WINDOWS
-        WinRemoveDirectory(path);
+        string wide = winWide(path);
+        if (wide != null) {
+            WinRemoveDirectory(wide);
+            free(wide);
+        }
         #else
         rmdir(path);
         #endif
@@ -109,10 +202,13 @@ class Directory {
 
     /// <summary>Gets the current working directory.</summary>
     static string GetCurrentDirectory() {
-        string buf = calloc(4096, 1);
         #if WINDOWS
-        WinGetCurrentDirectory(4096, buf);
+        string wide = calloc(4096, 2);
+        WinGetCurrentDirectory(4096, wide);
+        string buf = winUtf8(wide);
+        free(wide);
         #else
+        string buf = calloc(4096, 1);
         getcwd(buf, 4096);
         #endif
         return buf;
@@ -121,24 +217,21 @@ class Directory {
     /// <summary>Sets the current working directory.</summary>
     static void SetCurrentDirectory(string path) {
         #if WINDOWS
-        WinSetCurrentDirectory(path);
+        string wide = winWide(path);
+        if (wide != null) {
+            WinSetCurrentDirectory(wide);
+            free(wide);
+        }
         #else
         chdir(path);
         #endif
     }
 
     #if WINDOWS
-    // Reads the file name out of a WIN32_FIND_DATAA buffer (cFileName at +44).
+    // Reads cFileName from a WIN32_FIND_DATAW buffer (UTF-16 at byte +44).
     static string winName(string findData) {
-        string fname = "";
-        int j = 0;
-        while (j < 259) {
-            string ch = findData.Substring(44 + j, 1);
-            if (ch == "\0") { break; }
-            fname = fname + ch;
-            j = j + 1;
-        }
-        return fname;
+        string wideName = findData.Substring(44, 520);
+        return winUtf8(wideName);
     }
 
     static List<string> winList(string path, bool wantDirs) {
@@ -147,8 +240,12 @@ class Directory {
         string pattern = calloc(plen + 3, 1);
         strcpy(pattern, path);
         strcat(pattern, "\\*");
-        string findData = calloc(328, 1);
-        int handle = WinFindFirstFile(pattern, findData);
+        string widePattern = winWide(pattern);
+        string findData = calloc(592, 1);
+        int handle = -1;
+        if (widePattern != null) {
+            handle = WinFindFirstFile(widePattern, findData);
+        }
         if (handle != -1) {
             bool more = true;
             while (more) {
@@ -162,6 +259,7 @@ class Directory {
             }
             WinFindClose(handle);
         }
+        if (widePattern != null) { free(widePattern); }
         free(pattern);
         free(findData);
         return result;
