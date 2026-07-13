@@ -939,7 +939,34 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         NULL, NULL, GetModuleHandleW(NULL), NULL
     );
     free(wtitle);
-    if (!g_main_hwnd) { g_main_hwnd = hwnd; }
+    if (!g_main_hwnd) {
+        g_main_hwnd = hwnd;
+    } else {
+        RECT parent_rect;
+        RECT child_rect;
+        if (GetWindowRect(g_main_hwnd, &parent_rect) &&
+            GetWindowRect(hwnd, &child_rect)) {
+            int child_w = child_rect.right - child_rect.left;
+            int child_h = child_rect.bottom - child_rect.top;
+            int x = parent_rect.left +
+                ((parent_rect.right - parent_rect.left) - child_w) / 2;
+            int y = parent_rect.top +
+                ((parent_rect.bottom - parent_rect.top) - child_h) / 2;
+            MONITORINFO monitor = { sizeof(MONITORINFO) };
+            HMONITOR hm = MonitorFromWindow(
+                g_main_hwnd, MONITOR_DEFAULTTONEAREST);
+            if (GetMonitorInfoW(hm, &monitor)) {
+                if (x < monitor.rcWork.left) x = monitor.rcWork.left;
+                if (y < monitor.rcWork.top) y = monitor.rcWork.top;
+                if (x + child_w > monitor.rcWork.right)
+                    x = monitor.rcWork.right - child_w;
+                if (y + child_h > monitor.rcWork.bottom)
+                    y = monitor.rcWork.bottom - child_h;
+            }
+            SetWindowPos(hwnd, NULL, x, y, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     /* Restore the system drop shadow on the borderless window. Extending the
      * DWM frame by a 1px sheet re-enables the shadow + rounded corners while
      * WM_NCCALCSIZE still hides the standard frame. */
@@ -1611,6 +1638,27 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         g_scale_linux = (int)zan_gui_get_dpi_scale();
         g_titlebar_h_l = 32 * g_scale_linux / 100;
         g_btn_w_l = 46 * g_scale_linux / 100;
+    } else {
+        XWindowAttributes parent_attr;
+        Window child = 0;
+        int parent_x = 0;
+        int parent_y = 0;
+        Window root = RootWindow(g_display, screen);
+        if (XGetWindowAttributes(g_display, g_primary_win, &parent_attr) &&
+            XTranslateCoordinates(g_display, g_primary_win, root, 0, 0,
+                                  &parent_x, &parent_y, &child)) {
+            int x = parent_x + (parent_attr.width - (int)width) / 2;
+            int y = parent_y + (parent_attr.height - (int)height) / 2;
+            int screen_w = DisplayWidth(g_display, screen);
+            int screen_h = DisplayHeight(g_display, screen);
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x + (int)width > screen_w) x = screen_w - (int)width;
+            if (y + (int)height > screen_h) y = screen_h - (int)height;
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            XMoveWindow(g_display, xid, x, y);
+        }
     }
     /* Borderless window with app-drawn title bar (matches the Win32 backend). */
     x11_set_borderless(xid);

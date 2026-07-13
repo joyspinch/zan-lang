@@ -154,7 +154,26 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         if (title) {
             [window setTitle:[NSString stringWithUTF8String:title]];
         }
-        [window center];
+        if (g_mwin_count > 0) {
+            NSRect parent = [g_mwins[0].window frame];
+            NSRect child = [window frame];
+            NSPoint origin = NSMakePoint(
+                NSMidX(parent) - child.size.width / 2.0,
+                NSMidY(parent) - child.size.height / 2.0);
+            NSScreen *screen = [g_mwins[0].window screen];
+            if (screen) {
+                NSRect work = [screen visibleFrame];
+                if (origin.x < NSMinX(work)) origin.x = NSMinX(work);
+                if (origin.y < NSMinY(work)) origin.y = NSMinY(work);
+                if (origin.x + child.size.width > NSMaxX(work))
+                    origin.x = NSMaxX(work) - child.size.width;
+                if (origin.y + child.size.height > NSMaxY(work))
+                    origin.y = NSMaxY(work) - child.size.height;
+            }
+            [window setFrameOrigin:origin];
+        } else {
+            [window center];
+        }
 
         zan_mwin_t *mw = &g_mwins[g_mwin_count++];
         mw->window = window;
