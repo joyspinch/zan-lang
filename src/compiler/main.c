@@ -610,27 +610,125 @@ static const char *zan_dllimport_lname(const char *lib, int lib_len,
     return name;
 }
 
-/* Known third-party native DB drivers a published program must carry, unlike
- * system libs (kernel32/msvcrt/libc/…) that already exist on every target.
- * Names are normalized -l basenames (see zan_dllimport_lname). Extend this
- * list as new native-backed stdlib modules are added. */
-static const char *const zan_known_drivers[] = { "pq", "sqlite3", NULL };
+/* Registry of third-party native drivers a published program must carry,
+ * unlike system libs (kernel32/msvcrt/libc/.) that already exist on every
+ * target. Instead of hardcoding the set in the compiler, it is DISCOVERED from
+ * the stdlib tree: each native-backed module declares the [DllImport] library
+ * basenames it owns in a `drivers/driver.manifest` file (one -l basename per
+ * line; blank lines and '#' comments ignored). The module that ships a driver
+ * is simply the directory that contains that `drivers/` folder, so its bundle
+ * lives at <stdlib_root>/<module>/drivers/<target-sub>/ and travels with
+ * stdlib. Adding a new native module therefore needs no compiler change. */
+#define ZAN_MAX_DRIVERS 32
+typedef struct {
+    char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_sdl3" */
+    char module[512];  /* owning module path relative to stdlib root, '/'-sep */
+} zan_driver_entry_t;
+typedef struct {
+    zan_driver_entry_t entries[ZAN_MAX_DRIVERS];
+    int count;
+} zan_driver_registry_t;
 
-static bool zan_is_driver(const char *lname, int len) {
-    for (int i = 0; zan_known_drivers[i]; i++)
-        if ((int)strlen(zan_known_drivers[i]) == len &&
-            memcmp(zan_known_drivers[i], lname, (size_t)len) == 0) return true;
-    return false;
+static void zan_registry_add(zan_driver_registry_t *reg,
+                             const char *lib, const char *module) {
+    if (reg->count >= ZAN_MAX_DRIVERS) return;
+    for (int i = 0; i < reg->count; i++)
+        if (strcmp(reg->entries[i].lib, lib) == 0) return; /* first wins */
+    snprintf(reg->entries[reg->count].lib,
+             sizeof(reg->entries[0].lib), "%s", lib);
+    snprintf(reg->entries[reg->count].module,
+             sizeof(reg->entries[0].module), "%s", module);
+    reg->count++;
 }
 
-/* stdlib module (namespace path, '/'-separated) that ships each native driver,
- * so its bundle lives at <stdlib_root>/<module>/drivers/<target-sub>/ and
- * travels with stdlib rather than sitting next to zanc. Extend alongside
- * zan_known_drivers as native-backed modules are added. */
-static const char *zan_driver_module(const char *lname, int len) {
-    if (len == 7 && memcmp(lname, "sqlite3", 7) == 0) return "System/Data/Sqlite";
-    if (len == 2 && memcmp(lname, "pq", 2) == 0) return "System/Data/Postgres";
-    return NULL;
+/* Read one module's driver.manifest, registering each listed lib against the
+ * owning module (its directory relative to the stdlib root). */
+static void zan_read_driver_manifest(const char *manifest_path,
+                                     const char *module,
+                                     zan_driver_registry_t *reg) {
+    FILE *f = fopen(manifest_path, "rb");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t len = strlen(s);
+        while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
+                           s[len - 1] == ' ' || s[len - 1] == '\t'))
+            s[--len] = '\0';
+        if (s[0] == '\0' || s[0] == '#') continue;
+        zan_registry_add(reg, s, module);
+    }
+    fclose(f);
+}
+
+/* Recursively walk the stdlib tree looking for module directories that own a
+ * `drivers/driver.manifest`. `rel` is the current directory relative to the
+ * stdlib root ('/'-separated, empty at the root). Depth is bounded so a stray
+ * symlink cycle can't wedge the compiler; `drivers`/`native`/dot directories
+ * are not descended into (driver payloads, not further modules). */
+static void zan_scan_drivers_dir(const char *dir_full, const char *rel,
+                                 int depth, zan_driver_registry_t *reg) {
+    if (depth > 8) return;
+    char manifest[1200];
+    snprintf(manifest, sizeof(manifest), "%s/drivers/driver.manifest", dir_full);
+    if (rel[0]) zan_read_driver_manifest(manifest, rel, reg);
+#ifdef _WIN32
+    char glob[1200];
+    snprintf(glob, sizeof(glob), "%s\\*", dir_full);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(glob, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            const char *nm = fd.cFileName;
+            if (nm[0] == '.') continue;
+            if (strcmp(nm, "drivers") == 0 || strcmp(nm, "native") == 0) continue;
+            char sub[1200];
+            snprintf(sub, sizeof(sub), "%s\\%s", dir_full, nm);
+            char subrel[512];
+            if (rel[0]) snprintf(subrel, sizeof(subrel), "%s/%s", rel, nm);
+            else snprintf(subrel, sizeof(subrel), "%s", nm);
+            zan_scan_drivers_dir(sub, subrel, depth + 1, reg);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    DIR *d = opendir(dir_full);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            const char *nm = ent->d_name;
+            if (nm[0] == '.') continue;
+            if (strcmp(nm, "drivers") == 0 || strcmp(nm, "native") == 0) continue;
+            char sub[1200];
+            snprintf(sub, sizeof(sub), "%s/%s", dir_full, nm);
+            struct stat st;
+            if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            char subrel[512];
+            if (rel[0]) snprintf(subrel, sizeof(subrel), "%s/%s", rel, nm);
+            else snprintf(subrel, sizeof(subrel), "%s", nm);
+            zan_scan_drivers_dir(sub, subrel, depth + 1, reg);
+        }
+        closedir(d);
+    }
+#endif
+}
+
+static void zan_discover_drivers(const char *stdlib_root,
+                                 zan_driver_registry_t *reg) {
+    reg->count = 0;
+    if (!stdlib_root || !stdlib_root[0]) return;
+    zan_scan_drivers_dir(stdlib_root, "", 0, reg);
+}
+
+/* Index of the discovered driver whose lib basename matches, or -1. */
+static int zan_driver_find(const zan_driver_registry_t *reg,
+                           const char *lname, int len) {
+    for (int i = 0; i < reg->count; i++)
+        if ((int)strlen(reg->entries[i].lib) == len &&
+            memcmp(reg->entries[i].lib, lname, (size_t)len) == 0) return i;
+    return -1;
 }
 
 /* Copy a file byte-for-byte (portable; no shell). Returns 0 on success. */
@@ -1107,7 +1205,7 @@ int main(int argc, char **argv) {
         if (output_file) {
             snprintf(obj_path, sizeof(obj_path), "%s", output_file);
         } else {
-            /* input.zan → input */
+            /* input.zan ? input */
             size_t ilen = strlen(input_file);
             if (ilen > 4 && strcmp(input_file + ilen - 4, ".zan") == 0) {
                 snprintf(obj_path, sizeof(obj_path), "%.*s", (int)(ilen - 4), input_file);
@@ -1127,7 +1225,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* ---- link object → executable ---- */
+        /* ---- link object ? executable ---- */
         int link_ret;
 
         /* The compiler's own directory: the runtime objects below ship as its
@@ -1185,7 +1283,7 @@ int main(int argc, char **argv) {
         /* Extra library search dirs for [DllImport] libs, taken from the
          * $ZAN_LIB_PATH env var (platform PATH separator). This lets a Zan
          * program link against a library that is not on the default system
-         * search path — e.g. a freshly built zan_gui in the CMake build dir. */
+         * search path - e.g. a freshly built zan_gui in the CMake build dir. */
         char zan_lib_dirs[16][512]; int zan_lib_ndirs = 0;
         {
             const char *lp = getenv("ZAN_LIB_PATH");
@@ -1210,25 +1308,34 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ---- native database drivers ----------------------------------
-         * Third-party DB drivers (libpq, sqlite3) are NOT present on an
+        /* ---- native stdlib drivers ------------------------------------
+         * Third-party drivers (libpq, sqlite3, SDL3 bridges, ...) are NOT
+         * present on an
          * arbitrary target, so a published program must carry them. Each driver
          * ships inside the stdlib module that owns it, at
          * <stdlib_root>/<module>/drivers/<target-sub>/ (e.g. System/Data/Sqlite
-         * for sqlite3), overridable with --driver-dir. Its directory is added
-         * to the link search path so both dev builds and publishes resolve the
-         * driver, and on `--publish` (shared mode) the driver's runtime shared
-         * libraries are copied next to the produced executable. */
+         * for sqlite3), overridable with --driver-dir. Which libs are drivers
+         * and which module owns each is discovered from the stdlib tree's
+         * `drivers/driver.manifest` files (see zan_discover_drivers), not
+         * hardcoded here. Its directory is added to the link search path so
+         * both dev builds and publishes resolve the driver, and on `--publish`
+         * (shared mode) the driver's runtime shared libraries are copied next
+         * to the produced executable. */
+        zan_driver_registry_t driver_reg;
+        zan_discover_drivers(resolved_stdlib_root, &driver_reg);
         char driver_dirs[16][1024];
         const char *used_drivers[16]; int used_driver_count = 0;
         int used_driver_len[16];
+        const char *used_driver_module[16];
         for (int li = 0; li < irgen.extern_lib_count && used_driver_count < 16; li++) {
             int nlen;
             const char *nm = zan_dllimport_lname(
                 irgen.extern_libs[li].str, (int)irgen.extern_libs[li].len, &nlen);
-            if (nm && zan_is_driver(nm, nlen)) {
+            int didx = nm ? zan_driver_find(&driver_reg, nm, nlen) : -1;
+            if (didx >= 0) {
                 used_drivers[used_driver_count] = nm;
                 used_driver_len[used_driver_count] = nlen;
+                used_driver_module[used_driver_count] = driver_reg.entries[didx].module;
                 used_driver_count++;
             }
         }
@@ -1240,9 +1347,8 @@ int main(int argc, char **argv) {
                     snprintf(driver_dirs[d], sizeof(driver_dirs[d]), "%s",
                              driver_dir_override);
                 } else {
-                    const char *mod = zan_driver_module(used_drivers[d],
-                                                        used_driver_len[d]);
-                    if (mod && resolved_stdlib_root[0]) {
+                    const char *mod = used_driver_module[d];
+                    if (mod && mod[0] && resolved_stdlib_root[0]) {
                         snprintf(driver_dirs[d], sizeof(driver_dirs[d]),
                                  "%s/%s/drivers/%s", resolved_stdlib_root,
                                  mod, dsub);
@@ -1268,8 +1374,8 @@ int main(int argc, char **argv) {
         if (cross_compiling && target.os == ZAN_OS_LINUX) {
             /* Self-contained cross-compile to Linux: static-link the ELF object
              * against a bundled musl sysroot with ld.lld. The result is a
-             * dependency-free static binary — no glibc, no shared libs, no WSL
-             * on the target — so "build on Windows, upload, run" just works.
+             * dependency-free static binary - no glibc, no shared libs, no WSL
+             * on the target - so "build on Windows, upload, run" just works.
              * Sysroot lives next to zanc at toolchain/<sub>/ (crt*.o + libc.a,
              * plus a linux-built zanrt_io.o for socket-async programs). */
             char exe_dir[1024] = {0};
@@ -1325,7 +1431,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
         /* Self-contained linking: prefer the bundled ld.lld + MinGW-w64 runtime
          * shipped next to zanc (in <zanc_dir>/toolchain), so producing an .exe
-         * needs only zan — no external clang / MSVC / Windows SDK. Objects are
+         * needs only zan - no external clang / MSVC / Windows SDK. Objects are
          * emitted with the x86_64-w64-windows-gnu ABI (see zan_irgen_write_obj).
          * If the bundle is absent we fall back to a system clang targeting the
          * same mingw ABI. */
@@ -1454,7 +1560,7 @@ int main(int argc, char **argv) {
         }
         /* Windows-only system import libraries have no counterpart on
          * Unix (their functionality is provided through the cross-platform
-         * zan_gui native library instead), so skip them here — mirroring the
+         * zan_gui native library instead), so skip them here - mirroring the
          * CRT skip on the Windows link path. */
         static const char *const win_only_libs[] = {
             "user32", "gdi32", "kernel32", "advapi32", "shell32", "ole32",
@@ -1498,7 +1604,7 @@ int main(int argc, char **argv) {
          * executable so the published program runs without the driver being
          * pre-installed on the target. The set of files per driver is taken
          * from an optional manifest "<driver_dir>/<driver>.bundle" (one file
-         * name per line — lets a driver ship its own dependencies, e.g. libpq
+         * name per line - lets a driver ship its own dependencies, e.g. libpq
          * with the OpenSSL DLLs); absent a manifest, common default file names
          * are tried. Static linking folds the driver into the exe, so nothing
          * is copied there. */
@@ -1553,7 +1659,7 @@ int main(int argc, char **argv) {
                     snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
                     snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
                     if (zan_copy_file(src, dst) == 0) {
-                        printf("  bundled driver '%s' → %s\n", drv, cands[c]);
+                        printf("  bundled driver '%s' ? %s\n", drv, cands[c]);
                         copied++;
                     }
                 }
@@ -1568,9 +1674,9 @@ int main(int argc, char **argv) {
         }
 
         if (input_count == 1) {
-            printf("%s '%s' → '%s'\n", publish_mode ? "Published" : "Compiled", input_file, obj_path);
+            printf("%s '%s' ? '%s'\n", publish_mode ? "Published" : "Compiled", input_file, obj_path);
         } else {
-            printf("%s %d files → '%s'\n", publish_mode ? "Published" : "Compiled", input_count, obj_path);
+            printf("%s %d files ? '%s'\n", publish_mode ? "Published" : "Compiled", input_count, obj_path);
         }
     }
 
