@@ -8,6 +8,12 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
 llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
+# Build the atomic/dispatch/thread runtime (rt_sync.c) with the same MSVC-target
+# clang used to link the IDE, so its libc references match (the CMake-built
+# zanrt_sync.obj targets the GNU runtime and pulls in __mingw_* symbols).
+clang -O2 -std=c11 -I src\runtime -c src\runtime\rt_sync.c -o build\zanrt_sync_ide.obj
+if ($LASTEXITCODE -ne 0) { Write-Output "SYNC_COMPILE_FAILED"; exit 1 }
+
 $files = @()
 $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
 $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
@@ -26,7 +32,7 @@ if ($code -eq 0) {
     Pop-Location
     exit 1
 }
-clang ZanIDE.ll zan_icon.res -o ZanIDE.exe -O2 -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup -lzan_gui -llegacy_stdio_definitions
+clang ZanIDE.ll zanrt_sync_ide.obj zan_icon.res -o ZanIDE.exe -O2 -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup -lzan_gui -llegacy_stdio_definitions
 $lc = $LASTEXITCODE
 Pop-Location
 if ($lc -ne 0) { Write-Output "LINK_FAILED code=$lc"; exit 1 }

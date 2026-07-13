@@ -66,13 +66,14 @@ struct zan_irgen {
     } class_release[256];
     int class_release_count;
 
-    /* user-defined functions */
-    struct {
+    /* user-defined functions (dynamically grown) */
+    struct zan_fn_entry {
         zan_symbol_t *sym;
         LLVMValueRef fn;
         LLVMTypeRef fn_type;
-    } functions[1024];
+    } *functions;
     int function_count;
+    int function_cap;
 
     /* break/continue targets */
     LLVMBasicBlockRef break_target;

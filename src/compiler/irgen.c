@@ -30,6 +30,23 @@
 
 /* ---- initialization ---- */
 
+/* Register a user-defined function so call sites can resolve it. The table
+ * grows on demand: a fixed cap would silently drop functions in large
+ * multi-file programs, leaving later calls unresolved and mis-typed. */
+static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
+                                    LLVMValueRef fn, LLVMTypeRef fn_type) {
+    if (g->function_count >= g->function_cap) {
+        int ncap = g->function_cap ? g->function_cap * 2 : 1024;
+        g->functions = realloc(g->functions,
+                               (size_t)ncap * sizeof(*g->functions));
+        g->function_cap = ncap;
+    }
+    g->functions[g->function_count].sym = sym;
+    g->functions[g->function_count].fn = fn;
+    g->functions[g->function_count].fn_type = fn_type;
+    g->function_count++;
+}
+
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
@@ -990,6 +1007,10 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     if (g->builder) LLVMDisposeBuilder(g->builder);
     if (g->mod) LLVMDisposeModule(g->mod);
     if (g->ctx) LLVMContextDispose(g->ctx);
+    free(g->functions);
+    g->functions = NULL;
+    g->function_count = 0;
+    g->function_cap = 0;
 }
 
 /* ---- type mapping ---- */
@@ -8503,11 +8524,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 }
                 /* register as a static method so it can be called */
                 zan_symbol_t *method_sym = method_sym_for_decl(type_sym, member);
-                if (method_sym && g->function_count < 1024) {
-                    g->functions[g->function_count].sym = method_sym;
-                    g->functions[g->function_count].fn = efn;
-                    g->functions[g->function_count].fn_type = ft;
-                    g->function_count++;
+                if (method_sym) {
+                    irgen_register_function(g, method_sym, efn, ft);
                 }
                 /* store lib name for linker */
                 if (g->extern_lib_count < 64) {
@@ -8657,12 +8675,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     g->ctors[g->ctor_count].param_count = param_count;
                     g->ctor_count++;
                 }
-            } else if (g->function_count < 1024) {
+            } else {
                 zan_symbol_t *method_sym = method_sym_for_decl(type_sym, member);
-                g->functions[g->function_count].sym = method_sym;
-                g->functions[g->function_count].fn = fn;
-                g->functions[g->function_count].fn_type = fn_type;
-                g->function_count++;
+                irgen_register_function(g, method_sym, fn, fn_type);
             }
 
             /* defer body emission to Pass B so calls may forward-reference
