@@ -64,6 +64,15 @@ typedef struct {
     int width;
     int height;
     int stride;
+    /* Active clip window (x1/y1 exclusive) enforced by every pixel write, so
+     * scroll containers can bound their content to a viewport. clip_stack holds
+     * saved windows for nested PushClip/PopClip (4 ints per level, 16 levels). */
+    int clip_x0;
+    int clip_y0;
+    int clip_x1;
+    int clip_y1;
+    int clip_stack[64];
+    int clip_depth;
 } zan_surface_t;
 
 static zan_surface_t *g_surfaces[64];
@@ -97,15 +106,32 @@ static u32 blend_over(u32 dst, u32 src) {
     return (255u << 24) | (or_ << 16) | (og << 8) | ob;
 }
 
+/* Reset the clip window to the whole surface (frame start / new surface). */
+static void clip_reset_full(zan_surface_t *s) {
+    s->clip_x0 = 0;
+    s->clip_y0 = 0;
+    s->clip_x1 = s->width;
+    s->clip_y1 = s->height;
+    s->clip_depth = 0;
+}
+
+/* True when (x,y) lies outside the surface or the active clip window. */
+static int clipped_out(zan_surface_t *s, int x, int y) {
+    if (x < 0 || x >= s->width || y < 0 || y >= s->height) return 1;
+    if (x < s->clip_x0 || x >= s->clip_x1) return 1;
+    if (y < s->clip_y0 || y >= s->clip_y1) return 1;
+    return 0;
+}
+
 static void set_pixel(zan_surface_t *s, int x, int y, u32 color) {
-    if (x < 0 || x >= s->width || y < 0 || y >= s->height) return;
+    if (clipped_out(s, x, y)) return;
     int idx = y * s->stride + x;
     s->pixels[idx] = blend_over(s->pixels[idx], color);
 }
 
 /* Set pixel with coverage alpha applied on top of color's own alpha */
 static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage) {
-    if (x < 0 || x >= s->width || y < 0 || y >= s->height) return;
+    if (clipped_out(s, x, y)) return;
     if (coverage <= 0) return;
     if (coverage > 255) coverage = 255;
     u32 a = ((color >> 24) & 0xFF) * (u32)coverage / 255;
@@ -131,6 +157,7 @@ EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
     s->width = (int)width;
     s->height = (int)height;
     s->stride = (int)width;
+    clip_reset_full(s);
     /* malloc (not calloc): every frame starts with zan_gui_clear covering the
      * whole surface, so zero-init is wasted work — and on large windows the
      * per-resize zeroing of ~32MB was a noticeable hitch during drag-resize. */
@@ -176,10 +203,66 @@ EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
+    /* A frame begins with clear(), so drop any clip left set by the last one. */
+    clip_reset_full(s);
     u32 c = (u32)color;
     g_bg_color = c;
     int count = s->width * s->height;
     for (int i = 0; i < count; i++) s->pixels[i] = c;
+}
+
+/* Intersect the clip window with (x,y,w,h) and save the previous window so a
+ * matching zan_gui_pop_clip restores it. Nested pushes can only shrink. */
+EXPORT void zan_gui_push_clip(i64 surface_id, i64 x, i64 y, i64 w, i64 h) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int cap = (int)(sizeof(s->clip_stack) / sizeof(s->clip_stack[0]));
+    if (s->clip_depth * 4 + 4 <= cap) {
+        s->clip_stack[s->clip_depth * 4 + 0] = s->clip_x0;
+        s->clip_stack[s->clip_depth * 4 + 1] = s->clip_y0;
+        s->clip_stack[s->clip_depth * 4 + 2] = s->clip_x1;
+        s->clip_stack[s->clip_depth * 4 + 3] = s->clip_y1;
+        s->clip_depth++;
+    }
+    int nx0 = (int)x;
+    int ny0 = (int)y;
+    int nx1 = (int)x + (int)w;
+    int ny1 = (int)y + (int)h;
+    if (nx0 < s->clip_x0) nx0 = s->clip_x0;
+    if (ny0 < s->clip_y0) ny0 = s->clip_y0;
+    if (nx1 > s->clip_x1) nx1 = s->clip_x1;
+    if (ny1 > s->clip_y1) ny1 = s->clip_y1;
+    if (nx1 < nx0) nx1 = nx0;
+    if (ny1 < ny0) ny1 = ny0;
+    s->clip_x0 = nx0;
+    s->clip_y0 = ny0;
+    s->clip_x1 = nx1;
+    s->clip_y1 = ny1;
+}
+
+/* Restore the clip window saved by the most recent zan_gui_push_clip. */
+EXPORT void zan_gui_pop_clip(i64 surface_id) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    if (s->clip_depth > 0) {
+        s->clip_depth--;
+        s->clip_x0 = s->clip_stack[s->clip_depth * 4 + 0];
+        s->clip_y0 = s->clip_stack[s->clip_depth * 4 + 1];
+        s->clip_x1 = s->clip_stack[s->clip_depth * 4 + 2];
+        s->clip_y1 = s->clip_stack[s->clip_depth * 4 + 3];
+    } else {
+        clip_reset_full(s);
+    }
+}
+
+/* Drop all clip windows and clip to the whole surface again. */
+EXPORT void zan_gui_reset_clip(i64 surface_id) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    clip_reset_full(s);
 }
 
 EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color) {

@@ -1,0 +1,161 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// A self-managing vertical scroll container.
+///
+/// Create one and keep it across frames; it owns its scroll offset, consumes
+/// the mouse wheel while the pointer is inside, clips its content to the
+/// viewport, and draws (and drag-handles) a scrollbar only when the content
+/// overflows. Callers never register a scrollbar or track scroll state:
+///
+///   // once, next to your other state:
+///   ScrollView nav = ScrollView.Create();
+///
+///   // each frame:
+///   Rect area = Rect.Create(x, y, w, h);
+///   int dy = nav.Begin(app, area, contentHeight);
+///   // draw items at their natural Y minus dy; anything outside `area`
+///   // is clipped automatically.
+///   nav.End(app, area);
+/// </summary>
+class ScrollView {
+    int offset;
+    int viewH;
+    int contentH;
+    int barW;
+    bool dragging;
+    int dragMouseY0;
+    int dragOffset0;
+
+    static ScrollView Create() {
+        ScrollView s = new ScrollView();
+        s.offset = 0;
+        s.viewH = 0;
+        s.contentH = 0;
+        s.barW = 8;
+        s.dragging = false;
+        s.dragMouseY0 = 0;
+        s.dragOffset0 = 0;
+        return s;
+    }
+
+    /// Current scroll position in pixels.
+    int Offset() {
+        return offset;
+    }
+
+    /// Largest valid scroll offset for the last measured viewport/content.
+    int MaxOffset() {
+        int m = contentH - viewH;
+        if (m < 0) { m = 0; }
+        return m;
+    }
+
+    /// True when content is taller than the viewport (scrollbar is shown).
+    bool Overflowing() {
+        return contentH > viewH;
+    }
+
+    /// Programmatically scroll to a pixel offset (clamped next frame).
+    void ScrollTo(int y) {
+        offset = y;
+        if (offset < 0) { offset = 0; }
+    }
+
+    /// <summary>
+    /// Begin a frame: measure the viewport, apply the mouse wheel, clamp the
+    /// offset and clip drawing to `area`. Returns the number of pixels content
+    /// should be shifted up — subtract it from each item's natural Y.
+    /// </summary>
+    int Begin(App app, Rect area, int contentHeight) {
+        viewH = area.height;
+        contentH = contentHeight;
+
+        bool inside = app.mouseX >= area.x && app.mouseX < area.x + area.width
+            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+
+        if (inside) {
+            // Claim the wheel so the page (and any outer container) does not
+            // also scroll while the pointer is over this viewport.
+            app.CaptureWheel(area.x, area.y, area.width, area.height);
+            if (app.window.EventKind() == 13) {
+                int d = app.window.EventKeyCode();
+                int before = offset;
+                offset = offset - d * app.scrollSpeed / 120;
+                if (offset != before) { app.RequestRedraw(); }
+            }
+        }
+
+        int mo = contentH - viewH;
+        if (mo < 0) { mo = 0; }
+        if (offset > mo) { offset = mo; }
+        if (offset < 0) { offset = 0; }
+
+        app.canvas.PushClip(area.x, area.y, area.width, area.height);
+        return offset;
+    }
+
+    /// <summary>
+    /// End a frame: release the viewport clip and, when content overflows, draw
+    /// the scrollbar and process thumb dragging. Pass the same Rect as Begin.
+    /// </summary>
+    void End(App app, Rect area) {
+        app.canvas.PopClip();
+
+        if (contentH <= viewH) {
+            dragging = false;
+            return;
+        }
+
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int bx = area.x + area.width - barW - 2;
+        int by = area.y;
+        int bh = area.height;
+
+        int thumbH = bh * bh / contentH;
+        if (thumbH < 24) { thumbH = 24; }
+        int mo = contentH - viewH;
+        if (mo < 0) { mo = 0; }
+        int travel = bh - thumbH;
+        if (travel < 0) { travel = 0; }
+
+        int thumbY = by;
+        if (mo > 0) { thumbY = by + offset * travel / mo; }
+
+        bool overThumb = app.mouseX >= bx && app.mouseX < bx + barW
+            && app.mouseY >= thumbY && app.mouseY < thumbY + thumbH;
+
+        if (!dragging && Ui.MousePressed(app) && overThumb) {
+            dragging = true;
+            dragMouseY0 = app.mouseY;
+            dragOffset0 = offset;
+        }
+
+        if (dragging) {
+            int dyPix = app.mouseY - dragMouseY0;
+            int off = dragOffset0;
+            if (travel > 0) { off = dragOffset0 + dyPix * mo / travel; }
+            if (off < 0) { off = 0; }
+            if (off > mo) { off = mo; }
+            if (off != offset) {
+                offset = off;
+                app.RequestRedraw();
+            }
+            if (Ui.MouseReleased(app)) { dragging = false; }
+            thumbY = by;
+            if (mo > 0) { thumbY = by + offset * travel / mo; }
+        }
+
+        int thumbColor = t.scrollbar;
+        if (dragging || overThumb) { thumbColor = t.scrollbarHover; }
+
+        int half = barW / 2;
+        c.FillRoundRect(bx, by, barW, bh, half, t.bgTertiary);
+        c.FillRoundRect(bx, thumbY, barW, thumbH, half, thumbColor);
+    }
+}
