@@ -180,6 +180,84 @@ static uint32_t parse_modifiers(zan_parser_t *p) {
 
 /* ---- expressions (Pratt-style precedence climbing) ---- */
 
+/* Lookahead used to disambiguate a parenthesized group from a lambda
+ * parameter list. With p->current sitting on '(', returns true when the
+ * matching ')' is immediately followed by '=>'. Token-level only: it saves
+ * and restores the lexer + current/previous tokens and allocates no AST,
+ * so it emits no diagnostics. */
+static bool paren_is_lambda(zan_parser_t *p) {
+    zan_lexer_t saved_lex = *p->lex;
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    int depth = 0;
+    bool result = false;
+    while (p->current.kind != TK_EOF) {
+        if (p->current.kind == TK_LPAREN) {
+            depth++;
+        } else if (p->current.kind == TK_RPAREN) {
+            depth--;
+            if (depth == 0) {
+                result = (zan_lexer_peek(p->lex).kind == TK_ARROW);
+                break;
+            }
+        }
+        parser_advance(p);
+    }
+    *p->lex = saved_lex;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return result;
+}
+
+/* A single lambda parameter: either an untyped bare identifier (when the
+ * identifier is directly followed by ',' or ')') or a typed `Type name`. */
+static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
+    zan_loc_t loc = p->current.loc;
+    if (parser_check(p, TK_IDENT)) {
+        zan_token_kind_t after = zan_lexer_peek(p->lex).kind;
+        if (after == TK_COMMA || after == TK_RPAREN) {
+            parser_advance(p);
+            zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
+            pn->param.name = p->previous.str_val;
+            pn->param.type = NULL;
+            pn->param.default_val = NULL;
+            return pn;
+        }
+    }
+    zan_ast_node_t *type = parse_type_ref(p);
+    zan_istr_t name = {0};
+    if (parser_check(p, TK_IDENT)) {
+        parser_advance(p);
+        name = p->previous.str_val;
+    }
+    zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
+    pn->param.name = name;
+    pn->param.type = type;
+    pn->param.default_val = NULL;
+    return pn;
+}
+
+/* Parse a parenthesized lambda: `( params ) => body`, with p->current on '('.
+ * The body is a block when it starts with '{', otherwise a single expression. */
+static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
+    zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, loc);
+    zan_ast_list_init(&n->lambda.params);
+    parser_expect(p, TK_LPAREN);
+    while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
+        zan_ast_node_t *param = parse_lambda_param(p);
+        zan_ast_list_push(&n->lambda.params, param, p->arena);
+        if (!parser_match(p, TK_COMMA)) break;
+    }
+    parser_expect(p, TK_RPAREN);
+    parser_expect(p, TK_ARROW);
+    if (parser_check(p, TK_LBRACE)) {
+        n->lambda.body = parse_block(p);
+    } else {
+        n->lambda.body = parse_expression(p);
+    }
+    return n;
+}
+
 static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
@@ -271,7 +349,8 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             parser_advance(p); /* ident */
             zan_istr_t param_name = p->previous.str_val;
             parser_advance(p); /* => */
-            zan_ast_node_t *body = parse_expression(p);
+            zan_ast_node_t *body = parser_check(p, TK_LBRACE)
+                ? parse_block(p) : parse_expression(p);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, loc);
             zan_ast_list_init(&n->lambda.params);
             zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
@@ -288,6 +367,12 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_LPAREN: {
+        /* Lambda with a parenthesized parameter list: () =>, (a, b) =>,
+         * (int x) => ... — detected by a matching ')' followed by '=>'. Must
+         * be checked before the cast rule so typed params like (int x) work. */
+        if (paren_is_lambda(p)) {
+            return parse_lambda_paren(p, loc);
+        }
         /* C-style cast: (PrimitiveType) unary — primitive keywords cannot
          * begin a parenthesized expression, so this is unambiguous. */
         switch (zan_lexer_peek(p->lex).kind) {

@@ -95,6 +95,9 @@ class App {
         app.lastFrameMs = app.nowMs;
         app.lastPresentMs = 0;
         app.canvas = Canvas.Create(width, height);
+        // Reset the UI-thread dispatch queue up front (on the UI thread) so
+        // App.Post is safe the moment any background worker is spawned.
+        Dispatcher.Init();
         return app;
     }
 
@@ -322,6 +325,35 @@ class App {
         needsRedraw = true;
     }
 
+    /// <summary>
+    /// Marshals a delegate onto this window's UI thread — the equivalent of
+    /// C#'s <c>Control.Invoke</c>/<c>BeginInvoke</c>. Safe to call from any
+    /// thread: the delegate is queued (under an OS mutex in the runtime) and
+    /// runs on the UI thread at the start of the next frame, after which a
+    /// repaint is requested. A background worker uses this to hand results back
+    /// without touching UI state off-thread.
+    /// </summary>
+    void Post(Action handler) {
+        Dispatcher.Post(handler);
+        // Wake the loop if it is blocked in WaitEvent so the queued work runs
+        // promptly instead of waiting for the next input event.
+        window.Wake();
+    }
+
+    /// <summary>
+    /// Runs every delegate queued via <see cref="Post"/> on the UI thread and
+    /// requests a repaint if any ran. Called automatically each event-loop
+    /// iteration by ProcessEvent; a hand-rolled loop can also call it directly.
+    /// </summary>
+    void DrainPosts() {
+        Action handler = Dispatcher.Take();
+        while (handler != null) {
+            handler();
+            needsRedraw = true;
+            handler = Dispatcher.Take();
+        }
+    }
+
     /// Finds the row index for an animation key, or -1. Rows are appended by
     /// AnimTo/AnimPx and kept index-aligned across all six columns.
     int AnimIndex(int key) {
@@ -482,6 +514,10 @@ class App {
             isRunning = false;
             return false;
         }
+
+        // Run any work marshalled from background threads on the UI thread.
+        // A Wake() delivers an empty (kind 0) event solely to trigger this.
+        DrainPosts();
 
         int kind = window.EventKind();
 

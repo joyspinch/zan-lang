@@ -1,6 +1,114 @@
 using System;
+using System.Threading;
 
 namespace Gui;
+
+/// <summary>
+/// A parameterless GUI event handler, like a C# <c>Action</c> / <c>EventHandler</c>.
+/// Assign a lambda (<c>() =&gt; { ... }</c>) or a static method group.
+/// </summary>
+delegate void Action();
+
+/// <summary>
+/// Thin wrapper over the runtime UI-thread dispatch queue. Background threads
+/// call <see cref="Post"/> to hand a delegate back to the UI thread; the UI
+/// thread drains it once per frame (see <c>App.Post</c> / <c>App.DrainPosts</c>).
+/// The queue itself is guarded by an OS mutex inside the runtime, so posting is
+/// safe from any thread and never touches the Zan heap off-thread.
+/// </summary>
+class Dispatcher {
+    [DllImport("crt", EntryPoint = "zan_dispatch_init")]
+    static extern void PlatInit();
+
+    [DllImport("crt", EntryPoint = "zan_dispatch_post")]
+    static extern int PlatPost(Action handler);
+
+    [DllImport("crt", EntryPoint = "zan_dispatch_take")]
+    static extern Action PlatTake();
+
+    /// <summary>Resets the queue. Call once on the UI thread before spawning workers.</summary>
+    static void Init() { Dispatcher.PlatInit(); }
+
+    /// <summary>Enqueues a delegate to run on the UI thread. Thread-safe.</summary>
+    static bool Post(Action handler) { return Dispatcher.PlatPost(handler) != 0; }
+
+    /// <summary>Pops the next queued delegate (UI thread) or null when empty.</summary>
+    static Action Take() { return Dispatcher.PlatTake(); }
+}
+
+/// <summary>
+/// A retained, multicast event registry that layers C#-style delegate events
+/// over the immediate-mode widgets. Register handlers once (before the frame
+/// loop) against a stable integer key, then bridge the immediate-mode click
+/// each frame with <see cref="RaiseIf"/>:
+/// <code>
+/// EventHub hub = EventHub.Create();
+/// hub.On(BTN_SAVE, () =&gt; { ... });   // like  OnClick += handler
+/// // per frame:
+/// int id = Button.Render(app, x, y, "Save");
+/// hub.RaiseIf(BTN_SAVE, Ui.Clicked(app, id));
+/// </code>
+/// Multiple <see cref="On"/> calls for the same key are all invoked (multicast);
+/// <see cref="Off"/> clears them (like <c>OnClick -= handler</c> for the whole key).
+/// </summary>
+class EventHub {
+    List<int> keys;
+    List<Action> handlers;
+
+    static EventHub Create() {
+        EventHub h = new EventHub();
+        h.keys = new List<int>();
+        h.handlers = new List<Action>();
+        return h;
+    }
+
+    /// <summary>Appends a handler for an event key (like <c>event += handler</c>).</summary>
+    void On(int key, Action handler) {
+        keys.Add(key);
+        handlers.Add(handler);
+    }
+
+    /// <summary>Removes every handler registered for a key (like clearing an event).</summary>
+    void Off(int key) {
+        int i = keys.Count - 1;
+        while (i >= 0) {
+            if (keys[i] == key) {
+                keys.RemoveAt(i);
+                handlers.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+    }
+
+    /// <summary>How many handlers are registered for a key.</summary>
+    int Count(int key) {
+        int n = 0;
+        int i = 0;
+        while (i < keys.Count) {
+            if (keys[i] == key) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// <summary>Invokes every handler registered for a key (multicast).</summary>
+    void Raise(int key) {
+        int i = 0;
+        while (i < keys.Count) {
+            if (keys[i] == key) {
+                Action h = handlers[i];
+                h();
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Invokes handlers for a key only when <paramref name="fire"/> is true
+    /// (e.g. pass <c>Ui.Clicked(app, id)</c> to fire on click).</summary>
+    void RaiseIf(int key, bool fire) {
+        if (fire) { Raise(key); }
+    }
+}
 
 class FocusManager {
     int focusedId;

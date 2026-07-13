@@ -363,6 +363,24 @@ static i64 pump(bool wait) {
 EXPORT i64 zan_gui_wait_event(void) { return pump(true); }
 EXPORT i64 zan_gui_poll_event(void) { return pump(false); }
 
+/* Wake a UI thread blocked in pump() from another thread so it can drain the
+ * dispatch queue. Posting an application-defined NSEvent is thread-safe. */
+EXPORT i64 zan_gui_wake(void) {
+    @autoreleasepool {
+        NSEvent *ev = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                         location:NSMakePoint(0, 0)
+                                    modifierFlags:0
+                                        timestamp:0
+                                     windowNumber:0
+                                          context:nil
+                                          subtype:0
+                                            data1:0
+                                            data2:0];
+        [NSApp postEvent:ev atStart:NO];
+    }
+    return 0;
+}
+
 EXPORT i64 zan_gui_event_kind(void)    { return g_evt[0]; }
 EXPORT i64 zan_gui_event_x(void)       { return g_evt[1]; }
 EXPORT i64 zan_gui_event_y(void)       { return g_evt[2]; }

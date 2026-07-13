@@ -5806,6 +5806,24 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* Static method reference used as a delegate value: ClassName.Method
+         * (not immediately called) → the function pointer. Instance-method
+         * groups are not bound here (they'd require a captured receiver). */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            !local_find(locals, expr->member.object->ident.name)) {
+            zan_symbol_t *cs = zan_binder_lookup(g->binder, expr->member.object->ident.name);
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                zan_symbol_t *ms = get_method_sym(cs, expr->member.name);
+                if (ms) {
+                    for (int fi = 0; fi < g->function_count; fi++) {
+                        if (g->functions[fi].sym == ms) {
+                            return g->functions[fi].fn;
+                        }
+                    }
+                }
+            }
+        }
+
         /* struct field access: obj.Field */
         if (expr->member.object->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->member.object->ident.name);
@@ -6703,6 +6721,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, entry);
 
+        /* The body must emit into the lambda's own function: control-flow
+         * blocks append to current_fn and `return` coerces to current_fn_ret.
+         * Lambdas are non-capturing (no `this`/enclosing locals), so clear the
+         * instance/async context while keeping the enclosing type for static
+         * member access. */
+        LLVMValueRef saved_fn = g->current_fn;
+        LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+        LLVMValueRef saved_this = g->current_this;
+        LLVMValueRef saved_async_frame = g->current_async_frame;
+        g->current_fn = lambda_fn;
+        g->current_fn_ret_type = ret_type;
+        g->current_this = NULL;
+        g->current_async_frame = NULL;
+
         local_scope_t lambda_locals;
         local_scope_init(&lambda_locals, g->arena);
         for (int k = 0; k < pc; k++) {
@@ -6720,12 +6752,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 }
             } else {
                 LLVMValueRef result = emit_expr(g, expr->lambda.body, &lambda_locals);
+                result = coerce_to_i64(g, result);
                 LLVMBuildRet(g->builder, result);
             }
         } else {
             LLVMBuildRet(g->builder, LLVMConstInt(i64, 0, 0));
         }
 
+        g->current_fn = saved_fn;
+        g->current_fn_ret_type = saved_fn_ret;
+        g->current_this = saved_this;
+        g->current_async_frame = saved_async_frame;
         LLVMPositionBuilderAtEnd(g->builder, saved_bb);
         free(param_types);
         return lambda_fn;
@@ -8426,7 +8463,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                              member->method_decl.name.str);
                 }
                 if (strncmp(ext_name, "zan_atomic_int_", 15) == 0 ||
-                    strncmp(ext_name, "zan_shared_table_", 17) == 0) {
+                    strncmp(ext_name, "zan_shared_table_", 17) == 0 ||
+                    strncmp(ext_name, "zan_thread_", 11) == 0 ||
+                    strncmp(ext_name, "zan_dispatch_", 13) == 0) {
                     g->uses_sync_runtime = true;
                 }
                 if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {

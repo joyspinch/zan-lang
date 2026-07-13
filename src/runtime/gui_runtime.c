@@ -37,6 +37,9 @@
 #include <poll.h>
 #include <time.h>
 #include <locale.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #ifdef ZAN_GUI_FREETYPE
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
@@ -1066,6 +1069,14 @@ EXPORT i64 zan_gui_wait_event(void) {
     return 0;
 }
 
+/* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
+ * PostMessageW is documented thread-safe, so this is callable from any
+ * thread. The posted WM_NULL carries no event; wait_event returns kind 0. */
+EXPORT i64 zan_gui_wake(void) {
+    if (g_main_hwnd) { PostMessageW(g_main_hwnd, WM_NULL, 0, 0); }
+    return 0;
+}
+
 EXPORT i64 zan_gui_event_kind(void)    { return g_pending_event[0]; }
 EXPORT i64 zan_gui_event_x(void)       { return g_pending_event[1]; }
 EXPORT i64 zan_gui_event_y(void)       { return g_pending_event[2]; }
@@ -1232,6 +1243,10 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
 
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
+/* Self-pipe used to wake a UI thread blocked in wait_event from another
+ * thread (Xlib is not thread-safe, so we can't post an X event off-thread;
+ * writing a byte to a pipe that wait_event also polls is safe). */
+static int g_wake_pipe[2] = { -1, -1 };
 static int g_pending_event_linux[8];
 static int g_win_w = 0, g_win_h = 0;
 static char *g_clip_text_linux = NULL;
@@ -1596,6 +1611,12 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         setlocale(LC_ALL, "");
         XSetLocaleModifiers("");
         g_xim = XOpenIM(g_display, NULL, NULL, NULL);
+        if (g_wake_pipe[0] < 0 && pipe(g_wake_pipe) == 0) {
+            fcntl(g_wake_pipe[0], F_SETFL, O_NONBLOCK);
+            fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
+            fcntl(g_wake_pipe[0], F_SETFD, FD_CLOEXEC);
+            fcntl(g_wake_pipe[1], F_SETFD, FD_CLOEXEC);
+        }
     }
     if (g_lwin_count >= ZAN_MAX_WINDOWS) return 0;
 
@@ -1687,17 +1708,54 @@ EXPORT i64 zan_gui_wait_event(void) {
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
     if (evq_pop_linux()) return 0;
 
+    int xfd = ConnectionNumber(g_display);
     XEvent ev;
     for (;;) {
-        XNextEvent(g_display, &ev);
-        if (ev.type == SelectionRequest) {
-            x11_serve_selection(&ev.xselectionrequest);
-            continue;
+        /* Drain any X events already buffered in the client before blocking. */
+        while (XPending(g_display) > 0) {
+            XNextEvent(g_display, &ev);
+            if (ev.type == SelectionRequest) {
+                x11_serve_selection(&ev.xselectionrequest);
+                continue;
+            }
+            if (XFilterEvent(&ev, None)) continue;
+            x11_translate_event(&ev);
+            if (evq_pop_linux()) return 0;
         }
-        if (XFilterEvent(&ev, None)) continue; /* consumed by the input method */
-        x11_translate_event(&ev);
-        if (evq_pop_linux()) return 0;
+        /* Block until the X connection or the wake pipe becomes readable. */
+        struct pollfd fds[2];
+        fds[0].fd = xfd; fds[0].events = POLLIN; fds[0].revents = 0;
+        int nfds = 1;
+        if (g_wake_pipe[0] >= 0) {
+            fds[1].fd = g_wake_pipe[0]; fds[1].events = POLLIN; fds[1].revents = 0;
+            nfds = 2;
+        }
+        int pr = poll(fds, (nfds_t)nfds, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (nfds == 2 && (fds[1].revents & POLLIN)) {
+            char buf[64];
+            while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) { }
+            /* Return a benign empty frame (kind 0) so the caller drains its
+             * dispatch queue. Any pending X events are handled next loop. */
+            return 0;
+        }
+        /* X connection readable: loop back to XPending/XNextEvent. */
     }
+}
+
+/* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
+ * write() is async-signal-safe and thread-safe, so this is callable from any
+ * thread even though Xlib is not. */
+EXPORT i64 zan_gui_wake(void) {
+    if (g_wake_pipe[1] >= 0) {
+        char b = 1;
+        ssize_t n = write(g_wake_pipe[1], &b, 1);
+        (void)n;
+    }
+    return 0;
 }
 
 EXPORT i64 zan_gui_poll_event(void) {
@@ -2728,6 +2786,7 @@ EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_wait_event(void) { return -1; }
 EXPORT i64 zan_gui_poll_event(void) { return -1; }
+EXPORT i64 zan_gui_wake(void) { return 0; }
 EXPORT i64 zan_gui_event_kind(void) { return 0; }
 EXPORT i64 zan_gui_event_x(void) { return 0; }
 EXPORT i64 zan_gui_event_y(void) { return 0; }
