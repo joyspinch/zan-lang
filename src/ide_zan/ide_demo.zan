@@ -368,13 +368,26 @@ class IdeDemo {
     /// (zan_gui.lib, shipped next to the IDE and under toolchain\), the stdio
     /// shim sprintf resolves against, and the windowed subsystem/entry the GUI
     /// runtime expects. Returns "" for console projects (link with defaults).
-    static string GuiLinkArgs(string root) {
-        if (!IdeDemo.IsGuiProject(root)) { return ""; }
+    static bool IsGuiTarget(string root, string sourcePath) {
+        bool isGui = IdeDemo.IsGuiProject(root);
+        if (!isGui && File.Exists(sourcePath)) {
+            string source = File.ReadAllText(sourcePath);
+            isGui = IdeDemo.Has(source, "using Gui;");
+        }
+        return isGui;
+    }
+
+    static string GuiLinkArgs(string root, string sourcePath) {
+        bool isGui = IdeDemo.IsGuiTarget(root, sourcePath);
+        if (!isGui) { return ""; }
         string args = " -L\"" + IdeDemo.ExeDir() + "\" -L\"" + IdeDemo.ToolchainDir() + "\""
             + " -lzan_gui -llegacy_stdio_definitions"
             + " -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup"
             + " -Xlinker /STACK:268435456";
-        string res = IdeDemo.EnsureProjectIconRes(root);
+        string res = "";
+        if (IdeDemo.IsGuiProject(root)) {
+            res = IdeDemo.EnsureProjectIconRes(root);
+        }
         if (res != "") { args = args + " \"" + res + "\""; }
         return args;
     }
@@ -466,7 +479,8 @@ class IdeDemo {
         string root = IdeDemo.ProjectsHome();
         if (haveProject) { root = lastProj; }
 
-        List<TreeNode> tree = IdeDemo.ScanTree(root);
+        List<TreeNode> tree = new List<TreeNode>();
+        if (haveProject) { tree = IdeDemo.ScanTree(root); }
         bool rescan = false;
 
         List<string> tabNames = new List<string>();
@@ -492,7 +506,11 @@ class IdeDemo {
         activeTab.Set(0);
 
         List<string> log = new List<string>();
-        log.Add("> Zan IDE ready. Workspace: " + root);
+        if (haveProject) {
+            log.Add("> Zan IDE ready. Workspace: " + root);
+        } else {
+            log.Add("> Zan IDE ready. No project is open.");
+        }
 
         IdeDemo.uiLang = IdeDemo.ReadUiLang();
         Wizard.lang = IdeDemo.uiLang;
@@ -610,6 +628,11 @@ class IdeDemo {
         Input docsSearch = Input.Bind(SignalString.Create(""), IdeDemo.T("Search syntax & components...", "搜索语法与组件..."));
         SignalInt docsSel = SignalInt.Create(0);
         SignalInt docsScroll = SignalInt.Create(0);
+        SignalInt docsCodeScroll = SignalInt.Create(0);
+        SignalBool docsDemoBool = SignalBool.Create(true);
+        SignalInt docsDemoInt = SignalInt.Create(2);
+        Input docsDemoInput = Input.Bind(
+            SignalString.Create("Zan"), IdeDemo.T("Type here", "在此输入"));
 
         // Pending "go to definition" jump, applied after the target tab loads.
         int pendingGotoLine = 0 - 1;
@@ -743,18 +766,28 @@ class IdeDemo {
                 int kc = app.window.EventKey();
                 if (kc == 116 && dbgState == 0) {
                     // F5 = Start Debug (same as clicking Debug button)
-                    List<int> bpF5 = editor.Breakpoints();
-                    if (bpF5.Count > 0) {
-                        dbgExecLine = IdeDemo.FindFirstBp(bpF5);
+                    IdeDemo.SaveActive(
+                        editor, tabNames, tabBodies,
+                        tabPaths, activeTab, root, log);
+                    if (IdeDemo.DebugBuild(
+                            tabPaths, activeTab, root, log, editor)) {
+                        List<int> bpF5 = editor.Breakpoints();
+                        if (bpF5.Count > 0) {
+                            dbgExecLine = IdeDemo.FindFirstBp(bpF5);
+                        } else {
+                            dbgExecLine = IdeDemo.FirstDebugLine(editor);
+                        }
                         dbgState = 2;
                         editor.SetExecLine(dbgExecLine);
                         dbgVarInfo = IdeDemo.DebugVarsAt(root, IdeDemo.PathOf(tabPaths, activeTab), editor.GetText(), dbgExecLine, dbgConsole);
                         dbgStack = IdeDemo.BuildStack(tabNames, activeTab, dbgExecLine);
                         dbgPanelTab = 1;
                         log.Add("> [Debug] Started. Paused at line " + Convert.ToString(dbgExecLine + 1));
+                        log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Esc=Stop");
+                        if (bpF5.Count == 0) {
+                            log.Add("> [Debug] No breakpoint set; paused at the first executable line.");
+                        }
                         IdeDemo.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
-                    } else {
-                        log.Add("> [Debug] No breakpoints set.");
                     }
                     app.RequestRedraw();
                 } else if (kc == 116 && dbgState == 2) {
@@ -894,7 +927,7 @@ class IdeDemo {
                 bool activeIsFile = apE != "" && apE != "@start";
                 bool haveProj = File.Exists(root + "/zan.proj");
                 cmds[4].SetEnabled(activeIsFile);
-                cmds[5].SetEnabled(haveProj);
+                cmds[5].SetEnabled(activeIsFile);
                 cmds[6].SetEnabled(haveProj);
                 cmds[7].SetEnabled(activeIsFile);
                 cmds[9].SetEnabled(activeIsFile);
@@ -920,8 +953,11 @@ class IdeDemo {
                     dlg = IdeDemo.OpenWizard(IdeDemo.T("New File", "新建文件"), fSel, fNameInput, "NewFile");
                     dlgMode = 2;
                 } else if (rc == 2) {
-                    log.Add("> Open: click a file in the Explorer to open it.");
-                    rescan = true;
+                    pathPicker.BeginOpenFile(
+                        IdeDemo.ReadLastPickerDirectory(root), ".zan",
+                        IdeDemo.T("Open Zan source file", "打开 Zan 源文件"));
+                    pathPickerOwner = 4;
+                    app.RequestRedraw();
                 } else if (rc == 3) {
                     IdeDemo.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     if (autoRun) { IdeDemo.HotReloadRun(tabPaths, activeTab, root, log); }
@@ -941,9 +977,17 @@ class IdeDemo {
                     // Debug (F5)
                     designerMode = false;
                     if (dbgState == 0) {
-                        List<int> bpList = editor.Breakpoints();
-                        if (bpList.Count > 0) {
-                            dbgExecLine = IdeDemo.FindFirstBp(bpList);
+                        IdeDemo.SaveActive(
+                            editor, tabNames, tabBodies,
+                            tabPaths, activeTab, root, log);
+                        if (IdeDemo.DebugBuild(
+                                tabPaths, activeTab, root, log, editor)) {
+                            List<int> bpList = editor.Breakpoints();
+                            if (bpList.Count > 0) {
+                                dbgExecLine = IdeDemo.FindFirstBp(bpList);
+                            } else {
+                                dbgExecLine = IdeDemo.FirstDebugLine(editor);
+                            }
                             dbgState = 2;
                             editor.SetExecLine(dbgExecLine);
                             dbgVarInfo = IdeDemo.DebugVarsAt(root, IdeDemo.PathOf(tabPaths, activeTab), editor.GetText(), dbgExecLine, dbgConsole);
@@ -951,8 +995,9 @@ class IdeDemo {
                             dbgPanelTab = 1;
                             log.Add("> [Debug] Started. Paused at line " + Convert.ToString(dbgExecLine + 1));
                             log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Esc=Stop");
-                        } else {
-                            log.Add("> [Debug] No breakpoints set. Click the line number margin to add breakpoints.");
+                            if (bpList.Count == 0) {
+                                log.Add("> [Debug] No breakpoint set; paused at the first executable line.");
+                            }
                         }
                     } else if (dbgState == 2) {
                         List<int> bpList2 = editor.Breakpoints();
@@ -1207,12 +1252,18 @@ class IdeDemo {
                         TreeNode en = exTree[exSelV];
                         if (!en.isDir && en.path.Length > 4) {
                             int eidx = IdeDemo.ParseInt(en.path.Substring(4, en.path.Length - 4));
-                            string eCode = IdeDemo.GetExampleCode(eidx);
-                            string eName = IdeDemo.GetExampleName(eidx);
-                            if (eCode.Length > 0) {
-                                IdeDemo.OpenNewTab(tabNames, tabBodies, tabPaths, activeTab, eName, eCode);
+                            if (eidx == 0) {
+                                int di = IdeDemo.FindTabByPath(tabPaths, "@docs");
+                                if (di >= 0) {
+                                    activeTab.Set(di);
+                                } else {
+                                    tabNames.Add(IdeDemo.T("Components", "组件中心"));
+                                    tabBodies.Add("");
+                                    tabPaths.Add("@docs");
+                                    activeTab.Set(tabNames.Count - 1);
+                                }
                                 lastActive = 0 - 1;
-                                log.Add("> Opened example: " + eName);
+                                log.Add("> Opened the GUI component center.");
                                 app.RequestRedraw();
                             }
                         }
@@ -1358,7 +1409,10 @@ class IdeDemo {
                         app.RequestRedraw();
                     }
                 } else if (activeIsDocs) {
-                    IdeDemo.RenderDocsPage(app, c, t, edRect, docsSearch, docsSel, docsScroll, log);
+                    IdeDemo.RenderDocsPage(
+                        app, c, t, edRect, docsSearch,
+                        docsSel, docsScroll, docsCodeScroll, docsDemoBool,
+                        docsDemoInt, docsDemoInput, log);
                 } else if (activeIsStart) {
                     List<string> spFiles = IdeDemo.ListZanFiles(root + "/src");
                     int sact = IdeDemo.RenderStartPage(app, c, t, edRect, spFiles);
@@ -1610,19 +1664,30 @@ class IdeDemo {
                             bottomTab.Set(ti);
                             app.RequestRedraw();
                         } else if (botTab == 1 && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width) {
-                            // Click an error row -> jump to its file:line.
+                            // Click an error row -> apply an import quick-fix or
+                            // jump to its file:line.
                             int rowH = app.Scale(20);
                             int cy0 = orr.y + obTabH + app.Scale(6);
                             if (app.mouseY >= cy0) {
                                 int idx = (app.mouseY - cy0) / rowH;
                                 if (idx >= 0 && idx < ePath.Count) {
-                                    int j = IdeDemo.FindTabByBase(tabPaths, IdeDemo.BaseName(ePath[idx]));
-                                    int gl = IdeDemo.ParseInt(eLine[idx]);
-                                    if (j >= 0) {
-                                        activeTab.Set(j);
-                                        lastActive = 0 - 1;
-                                        pendingGotoLine = gl - 1;
-                                        pendingGotoCol = 0;
+                                    string importNs = IdeDemo.SuggestedUsing(eMsg[idx]);
+                                    int fixW = app.Scale(154);
+                                    if (importNs != ""
+                                        && app.mouseX >= orr.x + orr.width - fixW) {
+                                        IdeDemo.AddUsing(
+                                            editor, tabBodies, activeTab,
+                                            importNs, log);
+                                    } else {
+                                        int j = IdeDemo.FindTabByBase(
+                                            tabPaths, IdeDemo.BaseName(ePath[idx]));
+                                        int gl = IdeDemo.ParseInt(eLine[idx]);
+                                        if (j >= 0) {
+                                            activeTab.Set(j);
+                                            lastActive = 0 - 1;
+                                            pendingGotoLine = gl - 1;
+                                            pendingGotoCol = 0;
+                                        }
                                     }
                                     app.RequestRedraw();
                                 }
@@ -1810,7 +1875,9 @@ class IdeDemo {
                         app.RequestRedraw();
                     }
                 }
-                app.RenderChrome("Zan IDE  —  " + root);
+                string windowTitle = "Zan IDE";
+                if (haveProject) { windowTitle = windowTitle + "  —  " + root; }
+                app.RenderChrome(windowTitle);
                 app.PresentFrame();
                 lastPresent = Window.GetTickMs();
             }
@@ -1845,6 +1912,7 @@ class IdeDemo {
                                 IdeDemo.WriteLastPickerDirectory(parent);
                                 string newDir = IdeDemo.CreateProjectT(tpls[gi], parent, name, plats, log);
                                 root = newDir;
+                                haveProject = true;
                                 IdeDemo.WriteLastProject(root);
                                 tabNames = new List<string>();
                                 tabBodies = new List<string>();
@@ -1908,6 +1976,21 @@ class IdeDemo {
                     string nm = Path.GetFileName(picked);
                     File.Copy(picked, ad + "/" + nm);
                     log.Add("> Added resource: assets/" + nm);
+                } else if (pathPickerOwner == 4) {
+                    string projectRoot = IdeDemo.FindProjectRoot(picked);
+                    haveProject = projectRoot != "";
+                    if (haveProject) {
+                        root = projectRoot;
+                        IdeDemo.WriteLastProject(root);
+                    } else {
+                        root = IdeDemo.DirOf(picked);
+                    }
+                    IdeDemo.OpenPath(
+                        tabNames, tabBodies, tabPaths, activeTab,
+                        picked, Path.GetFileName(picked));
+                    lastActive = 0 - 1;
+                    rescan = true;
+                    log.Add("> Opened " + picked + ".");
                 }
                 pathPickerOwner = 0;
                 app.RequestRedraw();
@@ -1919,7 +2002,8 @@ class IdeDemo {
 
             if (rescan) {
                 rescan = false;
-                tree = IdeDemo.ScanTree(root);
+                tree = new List<TreeNode>();
+                if (haveProject) { tree = IdeDemo.ScanTree(root); }
                 treeSel.Set(-1);
                 lastTreeSel = -1;
             }
@@ -2442,7 +2526,8 @@ class IdeDemo {
 
     static List<TreeNode> ScanTree(string root) {
         List<TreeNode> nodes = new List<TreeNode>();
-        IdeDemo.ScanInto(nodes, root, "MyProject", 0, true);
+        IdeDemo.ScanInto(
+            nodes, root, Path.GetFileName(root), 0, true);
         return nodes;
     }
 
@@ -2530,23 +2615,42 @@ class IdeDemo {
 
     static void RunActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
         int a = active.Get();
+        if (a < 0 || a >= paths.Count) {
+            log.Add("> Nothing to run (open a source file first).");
+            return;
+        }
         string activePath = paths[a];
         string p = activePath;
-        if (p == "") { log.Add("> Nothing to run (save the file first)."); return; }
+        if (p == "" || p == "@start" || p == "@docs") {
+            log.Add("> Nothing to run (open and save a source file first).");
+            return;
+        }
         if (IdeDemo.IsFormPath(p)) { p = IdeDemo.ProjectEntry(root); }
         string bd = IdeDemo.EnsureBuildDir(root);
         string ll = bd + "/.zanrun.ll";
         string exe = bd + "/.zanrun" + IdeDemo.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
         string z = IdeDemo.ZancCmd();
         string inputs = IdeDemo.SmartInputs(root, IdeDemo.DirOf(p), p);
+        bool isGui = IdeDemo.IsGuiTarget(root, p);
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root)
-            + " && \"" + exe + "\"";
+            + " && clang \"" + ll + "\" -o \"" + exe + "\""
+            + IdeDemo.GuiLinkArgs(root, p);
+        if (!isGui) { cmd = cmd + " && \"" + exe + "\""; }
         log.Add("> Running " + p + " ...");
         List<string> outp = Process.RunCapture(cmd);
         IdeDemo.AppendAll(log, outp);
         IdeDemo.ApplyDiagnostics(editor, activePath, outp, log);
-        log.Add("> (run finished)");
+        if (isGui && File.Exists(exe)) {
+            #if WINDOWS
+            Process.Run("cmd /c start \"\" \"" + exe + "\"");
+            #else
+            Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
+            #endif
+            log.Add("> GUI app started.");
+        } else {
+            log.Add("> (run finished)");
+        }
     }
 
     /// Compiler inputs for Run/Build. Inside a project (a zan.proj at the root or
@@ -2689,7 +2793,7 @@ class IdeDemo {
         string z = IdeDemo.ZancCmd();
         string inputs = IdeDemo.SmartInputs(root, IdeDemo.DirOf(p), p);
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root);
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root, p);
         log.Add("> [Hot] Rebuilding ...");
         List<string> outp = Process.RunCapture(cmd);
         IdeDemo.AppendAll(log, outp);
@@ -2720,7 +2824,7 @@ class IdeDemo {
         string z = IdeDemo.ZancCmd();
         string inputs = IdeDemo.ProjectInputs(IdeDemo.DirOf(p), p, "");
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root);
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root, p);
         log.Add("> Publishing console exe ...");
         List<string> outp = Process.RunCapture(cmd);
         IdeDemo.AppendAll(log, outp);
@@ -2786,7 +2890,7 @@ class IdeDemo {
             string exe = root + "/publish/" + baseName + "-windows-x64.exe";
             string ll = bd + "/.zanpub_x64.ll";
             string cmd = zc + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root);
+                + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root, p);
             log.Add("> Publishing windows-x64 ...");
             List<string> outp = Process.RunCapture(cmd);
             IdeDemo.AppendAll(log, outp);
@@ -2797,7 +2901,7 @@ class IdeDemo {
             string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
             string ll = bd + "/.zanpub_arm64.ll";
             string cmd = zc + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root);
+                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root, p);
             log.Add("> Publishing windows-arm64 (requires ARM64 toolchain) ...");
             List<string> outp = Process.RunCapture(cmd);
             IdeDemo.AppendAll(log, outp);
@@ -2904,7 +3008,7 @@ class IdeDemo {
             0xFF888888, t.fontSizeSmall);
 
         int btnH = app.Scale(30);
-        int btnY = y + h - btnH - app.Scale(16);
+        int btnY = y + h - btnH - t.paddingLarge;
         int pubW = app.Scale(100);
         int canW = app.Scale(86);
         int pubX = x + w - pad - pubW;
@@ -3065,7 +3169,7 @@ class IdeDemo {
         int dbH = app.Scale(30);
         int dbW = app.Scale(100);
         int dbX = x + w - pad - dbW;
-        int dbYb = y + h - dbH - app.Scale(16);
+        int dbYb = y + h - dbH - t.paddingLarge;
         c.FillRoundRect(dbX, dbYb, dbW, dbH, app.Scale(4), 0xFF0E639C);
         c.DrawTextCentered(dbX, dbYb, dbW, dbH, IdeDemo.T("Done", "完成"), 0xFFFFFFFF, t.fontSizeSmall);
         IdeDemo.HandRegion(app, dbX, dbYb, dbW, dbH);
@@ -3199,7 +3303,7 @@ class IdeDemo {
         int dbH = app.Scale(30);
         int dbW = app.Scale(100);
         int dbX = x + w - pad - dbW;
-        int dbYb = y + h - dbH - app.Scale(14);
+        int dbYb = y + h - dbH - t.paddingLarge;
         c.FillRoundRect(dbX, dbYb, dbW, dbH, app.Scale(4), 0xFF0E639C);
         c.DrawTextCentered(dbX, dbYb, dbW, dbH, IdeDemo.T("Done", "完成"), 0xFFFFFFFF, t.fontSizeSmall);
         IdeDemo.HandRegion(app, dbX, dbYb, dbW, dbH);
@@ -4001,6 +4105,105 @@ class IdeDemo {
         }
     }
 
+    static string DiagnosticName(string msg) {
+        int first = IdeDemo.StrFind(msg, "'");
+        if (first < 0) { return ""; }
+        int rest = first + 1;
+        int secondRel = IdeDemo.StrFind(
+            msg.Substring(rest, msg.Length - rest), "'");
+        if (secondRel < 0) { return ""; }
+        return msg.Substring(rest, secondRel);
+    }
+
+    static string SuggestedUsing(string msg) {
+        string name = IdeDemo.DiagnosticName(msg);
+        string widgets = "|Alert|Avatar|Badge|Breadcrumb|Button|Card|Carousel|Chart|"
+            + "Checkbox|CodeEditor|Collapse|DataTable|Dialog|Divider|Drawer|Dropdown|"
+            + "Ellipsis|Empty|FilePicker|FloatButton|Input|Label|ListView|Loading|"
+            + "Menu|Message|Modal|Notification|PageHeader|Pagination|Panel|PivotTable|"
+            + "Popconfirm|Popover|Progress|Radio|Rate|Result|Ribbon|Scrollbar|Select|"
+            + "Skeleton|Slider|Spin|Split|Statistic|Steps|Switch|Table|Tabs|TabView|"
+            + "Tag|Timeline|Tooltip|TreeView|Typography|Wizard|";
+        string gui = "|App|Canvas|Theme|Window|Rect|Color|SignalBool|SignalInt|"
+            + "SignalString|HitRegion|TreeNode|Icon|Clipboard|Ui|Stack|Text|Point|"
+            + "Size|FlexStyle|FocusManager|";
+        string io = "|File|Directory|Path|";
+        string system = "|Console|Convert|List|StringBuilder|";
+        string text = "|Encoding|";
+        string threading = "|Thread|Mutex|Semaphore|Stopwatch|Channel|AtomicInt|";
+        string http = "|HttpClient|HttpRequest|HttpResponse|HttpServer|HttpRouter|";
+        string sockets = "|Socket|TcpClient|UdpClient|TcpListener|AsyncSocket|";
+        string net = "|Dns|IPAddress|";
+        string json = "|JsonParser|JsonBuilder|";
+        string drawing = "|Graphics|Bitmap|Font|Rectangle|";
+        string crypto = "|Sha1|Sha256|Sha512|Md5|Hmac|Aes|AesGcm|Rsa|Base64|Hex|"
+            + "RandomNumberGenerator|BigInt|";
+        string data = "|DbConnection|DbResult|";
+        if (name != "" && IdeDemo.Has(widgets, "|" + name + "|")) {
+            return "Gui.Widget";
+        }
+        if (name != "" && IdeDemo.Has(gui, "|" + name + "|")) {
+            return "Gui";
+        }
+        if (name != "" && IdeDemo.Has(io, "|" + name + "|")) {
+            return "System.IO";
+        }
+        if (name != "" && IdeDemo.Has(system, "|" + name + "|")) {
+            return "System";
+        }
+        if (name != "" && IdeDemo.Has(text, "|" + name + "|")) {
+            return "System.Text";
+        }
+        if (name != "" && IdeDemo.Has(threading, "|" + name + "|")) {
+            return "System.Threading";
+        }
+        if (name != "" && IdeDemo.Has(http, "|" + name + "|")) {
+            return "System.Net.Http";
+        }
+        if (name != "" && IdeDemo.Has(sockets, "|" + name + "|")) {
+            return "System.Net.Sockets";
+        }
+        if (name != "" && IdeDemo.Has(net, "|" + name + "|")) {
+            return "System.Net";
+        }
+        if (name != "" && IdeDemo.Has(json, "|" + name + "|")) {
+            return "System.Json";
+        }
+        if (name != "" && IdeDemo.Has(drawing, "|" + name + "|")) {
+            return "System.Drawing";
+        }
+        if (name != "" && IdeDemo.Has(crypto, "|" + name + "|")) {
+            return "System.Security.Cryptography";
+        }
+        if (name != "" && IdeDemo.Has(data, "|" + name + "|")) {
+            return "System.Data";
+        }
+        if (name == "Process") { return "System.Diagnostics"; }
+        return "";
+    }
+
+    static void AddUsing(
+        CodeEditor editor,
+        List<string> bodies,
+        SignalInt active,
+        string importNs,
+        List<string> log
+    ) {
+        string line = "using " + importNs + ";";
+        string text = editor.GetText();
+        if (IdeDemo.Has(text, line)) {
+            log.Add("> " + line + " is already present.");
+            return;
+        }
+        text = line + "\n" + text;
+        editor.LoadText(text);
+        int a = active.Get();
+        if (a >= 0 && a < bodies.Count) { bodies[a] = text; }
+        editor.SetCompilerDiagnostics(
+            new List<int>(), new List<string>());
+        log.Add("> Added " + line);
+    }
+
     /// Draws the parsed error rows; each row is clickable (hover-highlighted).
     static void RenderErrorList(App app, Canvas c, Theme t,
             int x, int y, int w, int h, List<string> ePath, List<string> eLine, List<string> eMsg) {
@@ -4018,6 +4221,18 @@ class IdeDemo {
             }
             string row = IdeDemo.BaseName(ePath[i]) + ":" + eLine[i] + "   " + eMsg[i];
             c.DrawText(x + pad, cy, row, 0xFFF48771, t.fontSizeSmall);
+            string importNs = IdeDemo.SuggestedUsing(eMsg[i]);
+            if (importNs != "") {
+                int fixW = app.Scale(154);
+                int fixX = x + w - fixW;
+                c.FillRoundRect(
+                    fixX + app.Scale(4), cy, fixW - app.Scale(8),
+                    rowH - app.Scale(2), app.Scale(3), t.primary);
+                c.DrawText(
+                    fixX + app.Scale(10), cy + app.Scale(2),
+                    IdeDemo.T("Add using " + importNs, "添加 using " + importNs),
+                    t.textInverse, t.fontSizeSmall);
+            }
             cy = cy + rowH;
             i = i + 1;
         }
@@ -4081,6 +4296,59 @@ class IdeDemo {
     // Debug helpers
     // ================================================================
 
+    static bool DebugBuild(
+        List<string> tabPaths,
+        SignalInt activeTab,
+        string root,
+        List<string> log,
+        CodeEditor editor
+    ) {
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabPaths.Count) { return false; }
+        string activePath = tabPaths[a];
+        string p = activePath;
+        if (p == "" || p == "@start" || p == "@docs") {
+            log.Add("> [Debug] Open a source file first.");
+            return false;
+        }
+        if (IdeDemo.IsFormPath(p)) { p = IdeDemo.ProjectEntry(root); }
+        string bd = IdeDemo.EnsureBuildDir(root);
+        string ll = bd + "/.zandbg.ll";
+        string exe = bd + "/.zandbg" + IdeDemo.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
+        string inputs = IdeDemo.SmartInputs(root, IdeDemo.DirOf(p), p);
+        string buildCmd = IdeDemo.ZancCmd()
+            + " --emit-ir " + inputs + " > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\""
+            + IdeDemo.GuiLinkArgs(root, p);
+        log.Add("> [Debug] Building " + p + " ...");
+        List<string> buildOut = Process.RunCapture(buildCmd);
+        IdeDemo.AppendAll(log, buildOut);
+        IdeDemo.ApplyDiagnostics(editor, activePath, buildOut, log);
+        if (!File.Exists(exe)) {
+            log.Add("> [Debug] Build failed.");
+            return false;
+        }
+        log.Add("> [Debug] Build succeeded.");
+        return true;
+    }
+
+    static int FirstDebugLine(CodeEditor editor) {
+        List<string> lines = CodeEditor.SplitLines(editor.GetText());
+        int i = 0;
+        while (i < lines.Count) {
+            string line = IdeDemo.TrimLeadSpaces(lines[i]);
+            bool skip = line == "" || line == "{" || line == "}"
+                || IdeDemo.Has(line, "using ")
+                || IdeDemo.Has(line, "class ")
+                || IdeDemo.Has(line, "static void Main")
+                || IdeDemo.Has(line, "//");
+            if (!skip) { return i; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
     static List<string> DebugBuildRun(List<string> tabPaths, SignalInt activeTab,
             string root, List<string> log) {
         List<string> console = new List<string>();
@@ -4095,7 +4363,7 @@ class IdeDemo {
         string ll = bd + "/.zandbg.ll";
         string exe = bd + "/.zandbg" + IdeDemo.ExeSuffix();
         string buildCmd = IdeDemo.ZancCmd() + " --emit-ir \"" + p + "\" > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root);
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + IdeDemo.GuiLinkArgs(root, p);
         log.Add("> [Debug] Building ...");
         List<string> buildOut = Process.RunCapture(buildCmd);
         int bo = 0;
@@ -4480,6 +4748,19 @@ class IdeDemo {
         }
         if (last < 0) { return "."; }
         return path.Substring(0, last);
+    }
+
+    static string FindProjectRoot(string path) {
+        string dir = IdeDemo.DirOf(path);
+        int depth = 0;
+        while (depth < 24) {
+            if (File.Exists(dir + "/zan.proj")) { return dir; }
+            string parent = IdeDemo.DirOf(dir);
+            if (parent == dir || parent == ".") { break; }
+            dir = parent;
+            depth = depth + 1;
+        }
+        return "";
     }
 
     static bool IsZanFile(string name) {
@@ -5051,22 +5332,13 @@ class IdeDemo {
         return "";
     }
 
-    // Builds the sidebar Examples tree: category folders with sample leaves.
-    // Each leaf carries "@ex:<idx>" in its path so a click can open the sample.
+    // The old standalone snippets were replaced by the searchable component
+    // center so examples stay aligned with the current Gui.Widget API.
     static List<TreeNode> BuildExampleTree() {
         List<TreeNode> n = new List<TreeNode>();
-        n.Add(TreeNode.Dir("Basics", 0, true));
-        n.Add(IdeDemo.ExLeaf("Hello World", 0));
-        n.Add(IdeDemo.ExLeaf("File Read/Write", 1));
-        n.Add(IdeDemo.ExLeaf("List & LINQ", 2));
-        n.Add(TreeNode.Dir("GUI & Apps", 0, true));
-        n.Add(IdeDemo.ExLeaf("GUI Window", 3));
-        n.Add(IdeDemo.ExLeaf("Timer & Events", 6));
-        n.Add(IdeDemo.ExLeaf("Calculator", 7));
-        n.Add(IdeDemo.ExLeaf("Text Editor", 8));
-        n.Add(TreeNode.Dir("Network & Data", 0, true));
-        n.Add(IdeDemo.ExLeaf("HTTP Client", 4));
-        n.Add(IdeDemo.ExLeaf("JSON Parse", 5));
+        n.Add(TreeNode.Dir(IdeDemo.T("GUI Reference", "GUI 参考"), 0, true));
+        n.Add(IdeDemo.ExLeaf(
+            IdeDemo.T("Component Center", "组件示例中心"), 0));
         return n;
     }
 
@@ -5153,6 +5425,10 @@ class IdeDemo {
 
     static void DocAdd(List<string> cat, List<string> title, List<string> body,
                        List<string> code, string ca, string ti, string bo, string co) {
+        if (ca == IdeDemo.T("GUI - Widgets", "GUI - 组件")
+            && !IdeDemo.Has(co, "using Gui;")) {
+            co = "using System;\nusing Gui;\nusing Gui.Widget;\n\n" + co;
+        }
         cat.Add(ca); title.Add(ti); body.Add(bo); code.Add(co);
     }
 
@@ -5198,6 +5474,14 @@ class IdeDemo {
             IdeDemo.T("A for loop packs initialization, condition and step into one header.",
                 "for 循环把初始化、条件和步进合并到一个头部。"),
             "for (int i = 0; i < 10; i = i + 1) {\n    Console.WriteLine(Convert.ToString(i));\n}");
+        IdeDemo.DocAdd(cat, title, body, code, cLang, IdeDemo.T("Foreach Loop", "Foreach 循环"),
+            IdeDemo.T("foreach visits every item in a collection without manually managing an index.",
+                "foreach 会依次访问集合中的每个元素，不需要手动维护索引。"),
+            "List<int> numbers = new List<int>();\nnumbers.Add(7);\nnumbers.Add(11);\nforeach (int number in numbers) {\n    Console.WriteLine(Convert.ToString(number));\n}");
+        IdeDemo.DocAdd(cat, title, body, code, cLang, IdeDemo.T("String Interpolation", "字符串插值"),
+            IdeDemo.T("Prefix a string with $ and place expressions inside braces to format readable output.",
+                "在字符串前加 $，并把表达式放进花括号中，即可生成易读的格式化文本。"),
+            "string name = \"Zan\";\nint version = 1;\nConsole.WriteLine($\"Hello {name} v{version}\");");
         IdeDemo.DocAdd(cat, title, body, code, cLang, IdeDemo.T("Functions", "函数"),
             IdeDemo.T("Functions are static methods: return type, name, typed parameters, then a body. Use return to yield a value.",
                 "函数即静态方法：返回类型、名称、带类型的参数，然后是函数体。用 return 返回值。"),
@@ -5222,10 +5506,18 @@ class IdeDemo {
             IdeDemo.T("An interface declares methods a class must implement. Classes implement it with the : syntax.",
                 "接口声明类必须实现的方法。类通过 : 语法实现接口。"),
             "interface IShape {\n    double Area();\n}\n\nclass Square : IShape {\n    double side;\n    double Area() { return side * side; }\n}");
-        IdeDemo.DocAdd(cat, title, body, code, cType, IdeDemo.T("Generics", "泛型"),
-            IdeDemo.T("Generic types are parameterized by a type argument in angle brackets, like List<T>.",
-                "泛型类型通过尖括号中的类型参数进行参数化，例如 List<T>。"),
-            "List<int> numbers = new List<int>();\nnumbers.Add(1);\nnumbers.Add(2);\nDictionary<string, int> ages = new Dictionary<string, int>();");
+        IdeDemo.DocAdd(cat, title, body, code, cType, IdeDemo.T("Generic Collections", "泛型集合"),
+            IdeDemo.T("List<T> is the built-in generic collection: the element type goes in angle brackets. Add appends, Count is the length and [i] reads an element. The same List<T> works for any element type.",
+                "List<T> 是内置的泛型集合：元素类型写在尖括号中。Add 追加，Count 为长度，[i] 读取元素。同一个 List<T> 适用于任意元素类型。"),
+            "List<int> numbers = new List<int>();\nnumbers.Add(1);\nnumbers.Add(2);\nnumbers.Add(3);\n\nint sum = 0;\nint i = 0;\nwhile (i < numbers.Count) {\n    sum = sum + numbers[i];\n    i = i + 1;\n}\nConsole.WriteLine(\"sum = \" + Convert.ToString(sum));\n\nList<string> names = new List<string>();\nnames.Add(\"Zan\");\nnames.Add(\"lang\");\nConsole.WriteLine(names[0] + \" \" + names[1]);");
+        IdeDemo.DocAdd(cat, title, body, code, cType, IdeDemo.T("Nullable Values", "可空值"),
+            IdeDemo.T("T? represents a value that may be null. Use ?? to provide a fallback value.",
+                "T? 表示可能为 null 的值；使用 ?? 提供后备值。"),
+            "string? nickname = null;\nstring shown = nickname ?? \"anonymous\";\nConsole.WriteLine(shown);");
+        IdeDemo.DocAdd(cat, title, body, code, cType, IdeDemo.T("Enums", "枚举"),
+            IdeDemo.T("An enum defines a fixed set of named values.",
+                "枚举定义一组固定的命名值。"),
+            "enum Status {\n    Pending,\n    Running,\n    Done\n}\n\nStatus current = Status.Running;");
         IdeDemo.DocAdd(cat, title, body, code, cColl, IdeDemo.T("Lists", "列表"),
             IdeDemo.T("List<T> is a growable array. Add appends, Count is the length, and [i] indexes.",
                 "List<T> 是可增长的数组。Add 追加，Count 为长度，[i] 用于索引。"),
@@ -5239,9 +5531,9 @@ class IdeDemo {
                 "字符串支持 Length、Substring(start, len) 以及用 + 拼接。"),
             "string s = \"Zan\";\nint len = s.Length;\nstring sub = s.Substring(0, 2);\nstring joined = s + \" lang\";");
         IdeDemo.DocAdd(cat, title, body, code, cColl, IdeDemo.T("Convert & Parse", "转换与解析"),
-            IdeDemo.T("Convert.ToString turns a number into text; use it when concatenating numbers into strings.",
-                "Convert.ToString 把数字转成文本；把数字拼接进字符串时会用到它。"),
-            "int n = 42;\nstring text = Convert.ToString(n);\nConsole.WriteLine(\"n = \" + text);");
+            IdeDemo.T("Convert.ToString formats a value as text. Convert.ToInt32 parses an integer from text.",
+                "Convert.ToString 把值格式化为文本；Convert.ToInt32 从文本解析整数。"),
+            "int n = Convert.ToInt32(\"42\");\nstring text = Convert.ToString(n);\nConsole.WriteLine(\"n = \" + text);");
         IdeDemo.DocAdd(cat, title, body, code, cLang, IdeDemo.T("Namespaces & using", "命名空间与 using"),
             IdeDemo.T("Bring library types into scope with using at the top of the file.",
                 "在文件顶部用 using 把库中的类型引入作用域。"),
@@ -5265,7 +5557,11 @@ class IdeDemo {
         IdeDemo.DocAdd(cat, title, body, code, cBasics, IdeDemo.T("Custom Drawing Loop", "自定义绘制循环"),
             IdeDemo.T("To draw your own content, run the frame loop yourself and paint with the Canvas each frame.",
                 "若要绘制自定义内容，可自行运行帧循环，并在每帧用 Canvas 绘制。"),
-            "app.Show();\nwhile (app.isRunning) {\n    if (!app.ProcessEvent()) { break; }\n    if (!app.needsRedraw) { continue; }\n    app.BeginFrame();\n    Canvas c = app.canvas;\n    c.DrawText(40, 80, \"Hello\", app.theme.textPrimary, 16);\n    app.RenderChrome(\"My App\");\n    app.PresentFrame();\n}");
+            "using Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"My App\", 800, 600);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            app.canvas.DrawText(40, 80, \"Hello\", app.theme.textPrimary, 16);\n            app.RenderChrome(\"My App\");\n            app.PresentFrame();\n        }\n    }\n}");
+        IdeDemo.DocAdd(cat, title, body, code, cBasics, IdeDemo.T("Reactive State", "响应式状态"),
+            IdeDemo.T("SignalInt, SignalBool and SignalString hold widget state. Get reads the current value; Set updates it and requests a redraw through the bound widget.",
+                "SignalInt、SignalBool 和 SignalString 保存组件状态。Get 读取当前值，Set 更新状态；绑定的组件会据此重绘。"),
+            "using Gui;\n\nSignalInt count = SignalInt.Create(0);\nSignalBool enabled = SignalBool.Create(true);\nSignalString name = SignalString.Create(\"Zan\");\n\ncount.Set(count.Get() + 1);");
         IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Button",
             IdeDemo.T("Button.Create builds a button; Render draws it (x, y, width) and returns its id. Button.WasClicked tests for a click this frame.",
                 "Button.Create 创建按钮；Render 绘制它（x, y, width）并返回 id。Button.WasClicked 判断本帧是否被点击。"),
@@ -5281,15 +5577,15 @@ class IdeDemo {
         IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Checkbox",
             IdeDemo.T("Checkbox binds to a SignalBool; Get() reads the checked state.",
                 "Checkbox 绑定到 SignalBool；Get() 读取勾选状态。"),
-            "SignalBool agree = SignalBool.Create(false);\nCheckbox.Render(app, 40, 80, \"I agree\", agree);\nif (agree.Get()) {\n    // enabled\n}");
+            "SignalBool agree = SignalBool.Create(false);\nint id = Checkbox.Render(app, 40, 80, \"I agree\", agree);\nCheckbox.HandleClick(app, id, agree);\nif (agree.Get()) {\n    // enabled\n}");
         IdeDemo.DocAdd(cat, title, body, code, cWidgets, IdeDemo.T("Radio Group", "单选组"),
             IdeDemo.T("Radio buttons share one SignalInt; each has a distinct option value.",
                 "多个单选按钮共享一个 SignalInt；每个有各自的选项值。"),
-            "SignalInt choice = SignalInt.Create(0);\nRadio.Render(app, 40, 80, \"Option A\", choice, 0);\nRadio.Render(app, 40, 110, \"Option B\", choice, 1);");
+            "SignalInt choice = SignalInt.Create(0);\nint a = Radio.Render(app, 40, 80, \"Option A\", choice, 0);\nint b = Radio.Render(app, 40, 110, \"Option B\", choice, 1);\nRadio.HandleClick(app, a, choice, 0);\nRadio.HandleClick(app, b, choice, 1);");
         IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Switch",
             IdeDemo.T("A toggle switch bound to a SignalBool.",
                 "绑定到 SignalBool 的开关切换控件。"),
-            "SignalBool on = SignalBool.Create(true);\nSwitch.Render(app, 40, 80, on);");
+            "SignalBool on = SignalBool.Create(true);\nint id = Switch.Render(app, 40, 80, on);\nSwitch.HandleClick(app, id, on);");
         IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Slider",
             IdeDemo.T("Slider.Render(app, x, y, width, min, max, model) edits a SignalInt within a range.",
                 "Slider.Render(app, x, y, width, min, max, model) 在区间内编辑一个 SignalInt。"),
@@ -5301,7 +5597,7 @@ class IdeDemo {
         IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Tabs",
             IdeDemo.T("Tabs render a row of labels; the active tab index is a SignalInt.",
                 "Tabs 渲染一行标签；当前激活的标签索引是一个 SignalInt。"),
-            "List<string> labels = new List<string>();\nlabels.Add(\"General\"); labels.Add(\"Advanced\");\nSignalInt active = SignalInt.Create(0);\nTabs.Render(app, 40, 40, 400, labels, active);");
+            "List<string> labels = new List<string>();\nlabels.Add(\"General\"); labels.Add(\"Advanced\");\nSignalInt active = SignalInt.Create(0);\nint first = Tabs.Render(app, 40, 40, 400, labels, active);\nTabs.HandleClick(app, first, labels.Count, active);");
         IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Card",
             IdeDemo.T("Card draws a titled panel. Card.ContentY gives the y where your content should start.",
                 "Card 绘制带标题的面板。Card.ContentY 给出内容应开始的 y 坐标。"),
@@ -5322,6 +5618,8 @@ class IdeDemo {
             IdeDemo.T("Tooltip draws a small floating hint anchored at a point.",
                 "Tooltip 在某个点绘制一个浮动的小提示。"),
             "Tooltip.Render(app, 120, 80, \"More information\");");
+        IdeDemo.AddExtendedWidgetDocs(
+            cat, title, body, code, cWidgets);
         IdeDemo.DocAdd(cat, title, body, code, cProj, IdeDemo.T("Project Layout", "项目结构"),
             IdeDemo.T("A project has zan.proj describing the entry file, target platforms, icon and resources. Source files live alongside it.",
                 "项目包含 zan.proj，描述入口文件、目标平台、图标和资源。源文件与它放在一起。"),
@@ -5330,6 +5628,14 @@ class IdeDemo {
             IdeDemo.T("Run compiles and launches the active file (or the project entry). Build produces an executable without running it.",
                 "运行会编译并启动当前文件（或项目入口）。构建只生成可执行文件而不运行。"),
             "// Ribbon: Run (F5) or Build.\n// A stray single file compiles on its own;\n// a project (zan.proj) compiles the whole entry.");
+        IdeDemo.DocAdd(cat, title, body, code, cProj, IdeDemo.T("Standalone Source Files", "独立源文件"),
+            IdeDemo.T("Open can load a .zan file without creating a project. The explorer remains empty; Run, Build and Debug use the file's containing folder for temporary output.",
+                "“打开”可直接载入 .zan 文件而无需创建项目。资源管理器保持为空；运行、构建和调试会在文件所在目录使用临时输出。"),
+            "// Ribbon: Open -> choose example.zan\n// Run / Build / Debug operate on example.zan.\n// Add `using Gui;` to link the GUI runtime automatically.");
+        IdeDemo.DocAdd(cat, title, body, code, cProj, IdeDemo.T("Debugging", "调试"),
+            IdeDemo.T("Debug first validates a fresh debug build. It pauses at the first breakpoint, or at the first executable line when no breakpoint exists. Use Continue, Step Over, Step Into and Stop from the debug toolbar.",
+                "调试会先执行新的调试构建。若有断点则停在首个断点；没有断点时停在首个可执行行。可用调试工具栏中的继续、单步跳过、单步进入和停止。"),
+            "// Click a line number to toggle a breakpoint.\n// Ribbon: Debug\n// Fix compiler errors before the debug session starts.");
         IdeDemo.DocAdd(cat, title, body, code, cProj, IdeDemo.T("Window Designer (.zform)", "窗口设计器 (.zform)"),
             IdeDemo.T("A Window App pairs a .zform layout with a .zan code-behind. Edit the layout visually; write your logic in OnLoad(app).",
                 "窗口程序由 .zform 布局与 .zan 代码后置配对组成。可视化编辑布局；在 OnLoad(app) 中编写逻辑。"),
@@ -5342,17 +5648,205 @@ class IdeDemo {
             IdeDemo.T("After Run/Build, errors appear as red underlines in the editor; the reason shows above the current line. Click a problem to jump to it.",
                 "运行/构建后，错误会在编辑器中显示为红色下划线；原因显示在当前行上方。点击问题即可跳转。"),
             "// error: expected ';'\nint x = 1   // <- missing semicolon\nint y = 2;");
+        IdeDemo.DocAdd(cat, title, body, code, cErr, IdeDemo.T("Add a Missing using", "补全缺失的 using"),
+            IdeDemo.T("When an unknown type belongs to System, System.IO, Gui or Gui.Widget, the Error List shows an Add using action. Click it to insert the import once at the top of the active source file.",
+                "当未知类型属于 System、System.IO、Gui 或 Gui.Widget 时，错误列表会显示“添加 using”操作。点击后会在当前源文件顶部插入一次对应导入。"),
+            "// Error List: unknown type 'Button'\n// Click: Add using Gui.Widget\nusing Gui.Widget;");
         IdeDemo.DocAdd(cat, title, body, code, cErr, IdeDemo.T("Undefined Symbol", "未定义的符号"),
             IdeDemo.T("An 'undefined reference' at link time usually means a needed library was not linked. GUI apps must include the Gui runtime.",
                 "链接期出现 “undefined reference” 通常意味着缺少所需的库。GUI 程序必须包含 Gui 运行时。"),
             "// LNK2019 undefined symbol: zan_gui_draw_text\n// Fix: use App/Canvas from the Gui library so the\n// GUI runtime is linked in.\nusing Gui;");
     }
 
+    static void AddExtendedWidgetDocs(
+        List<string> cat,
+        List<string> title,
+        List<string> body,
+        List<string> code,
+        string cWidgets
+    ) {
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Typography",
+            IdeDemo.T("Headings, paragraphs and inline text styles for documentation and application content.",
+                "用于文档和应用内容的标题、段落与行内文本样式。"),
+            "Typography.Heading(app, 40, 40, \"Heading\", 1);\nTypography.Paragraph(app, 40, 84, \"Readable body text.\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Avatar",
+            IdeDemo.T("Render an initial or icon inside a circular avatar.",
+                "在圆形头像中渲染首字母或图标。"),
+            "Avatar.Render(app, 40, 60, 40, \"Z\");\nAvatar.RenderWithIcon(app, 96, 60, 40, \"user\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Badge",
+            IdeDemo.T("Use a status dot or numeric count badge next to another control.",
+                "在其他控件旁显示状态圆点或数字计数徽标。"),
+            "Badge.Dot(app, 48, 60);\nBadge.Count(app, 96, 60, 12);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Breadcrumb",
+            IdeDemo.T("Show the current location as a sequence of navigation labels.",
+                "用一组导航标签显示当前位置。"),
+            "List<string> items = new List<string>();\nitems.Add(\"Home\"); items.Add(\"Projects\"); items.Add(\"Zan\");\nBreadcrumb.Render(app, 40, 60, items);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Carousel",
+            IdeDemo.T("Rotate through a list of slide labels with a SignalInt active index.",
+                "使用 SignalInt 当前索引在多张幻灯片标签之间切换。"),
+            "List<string> slides = new List<string>();\nslides.Add(\"First\"); slides.Add(\"Second\");\nSignalInt slide = SignalInt.Create(0);\nint id = Carousel.Render(app, 40, 60, 420, 180, slides, slide);\nCarousel.HandleClick(app, id, slides.Count, slide);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Chart",
+            IdeDemo.T("Draw line, area, bar, pie, donut and scatter charts from ChartSeries data.",
+                "从 ChartSeries 数据绘制折线图、面积图、柱状图、饼图、环图和散点图。"),
+            "List<string> labels = new List<string>();\nlabels.Add(\"Q1\"); labels.Add(\"Q2\"); labels.Add(\"Q3\");\nList<int> values = new List<int>();\nvalues.Add(12); values.Add(28); values.Add(20);\nChartSeries sales = ChartSeries.Create(\"Sales\", values, 0xFF18A058);\nList<ChartSeries> series = new List<ChartSeries>();\nseries.Add(sales);\nChart.Line(app, 40, 60, 480, 240, \"Quarterly sales\", labels, series);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Collapse",
+            IdeDemo.T("Display expandable sections controlled by a SignalInt open index.",
+                "显示由 SignalInt 展开索引控制的可折叠区段。"),
+            "List<string> heads = new List<string>();\nheads.Add(\"General\"); heads.Add(\"Advanced\");\nList<string> content = new List<string>();\ncontent.Add(\"General settings\"); content.Add(\"Advanced settings\");\nSignalInt open = SignalInt.Create(0);\nint first = Collapse.Render(app, 40, 60, 420, heads, content, open);\nCollapse.HandleClick(app, first, heads.Count, open);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "DataTable",
+            IdeDemo.T("A stateful table with typed columns, sorting, filtering and CSV export.",
+                "支持类型列、排序、筛选和 CSV 导出的有状态表格。"),
+            "List<DataColumn> cols = new List<DataColumn>();\ncols.Add(DataColumn.Text(\"Name\", 180));\ncols.Add(DataColumn.Numeric(\"Score\", 100));\nList<DataRow> rows = new List<DataRow>();\nDataTableState state = DataTableState.Create();\nDataTable.Render(app, 40, 60, 520, 260, cols, rows, state);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Dialog",
+            IdeDemo.T("Render a modal dialog with a title, message and action buttons.",
+                "渲染带标题、消息和操作按钮的模态对话框。"),
+            "int action = Dialog.Render(app, 420, 220, 0, \"Confirm\", \"Save changes?\", \"Save\", \"Cancel\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Divider",
+            IdeDemo.T("Separate content horizontally, vertically or with a text label.",
+                "用水平线、垂直线或带文字的分隔线划分内容。"),
+            "Divider.Render(app, 40, 80, 420);\nDivider.RenderText(app, 40, 120, 420, \"Section\", 0);\nDivider.RenderVertical(app, 500, 60, 120);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Drawer",
+            IdeDemo.T("Show a side panel attached to an edge of the current window.",
+                "显示附着在当前窗口边缘的侧边面板。"),
+            "int action = Drawer.Render(app, 1, 320, \"Details\");\nint bodyY = Drawer.BodyTop(app, 1, 320);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Dropdown",
+            IdeDemo.T("Combine a trigger button with an anchored menu of actions.",
+                "把触发按钮与锚定的操作菜单组合起来。"),
+            "bool open = true;\nint trigger = Dropdown.RenderTrigger(app, 40, 60, 160, 34, \"Actions\", open);\nList<string> items = new List<string>();\nitems.Add(\"Edit\"); items.Add(\"Delete\");\nint chosen = Dropdown.RenderMenu(app, 40, 98, 180, items);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Ellipsis",
+            IdeDemo.T("Measure and truncate long text so it fits a fixed width.",
+                "测量并截断长文本，使其适合固定宽度。"),
+            "string shown = Ellipsis.Fit(\"A very long file name.zan\", 160, app.theme.fontSizeMedium);\nEllipsis.Render(app, 40, 60, 160, shown);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Empty",
+            IdeDemo.T("Display a clear empty-state placeholder when no data is available.",
+                "没有数据时显示清晰的空状态占位内容。"),
+            "Empty.Render(app, 40, 60, 420, 180, \"No records yet\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "FilePicker",
+            IdeDemo.T("Open the reusable custom folder, open-file or save-file child window.",
+                "打开可复用的自绘文件夹、打开文件或保存文件子窗口。"),
+            "FilePicker picker = FilePicker.Create();\npicker.BeginOpenFile(\".\", \".zan\", \"Open Zan source\");\n// Each outer loop: picker.RenderWindow();\n// Then inspect picker.TakeResult() and picker.SelectedPath().");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "FloatButton",
+            IdeDemo.T("A compact circular floating action button with an icon.",
+                "带图标的紧凑圆形浮动操作按钮。"),
+            "int id = FloatButton.Render(app, 520, 360, 48, \"plus\", 1);\nif (Ui.Clicked(app, id)) {\n    // create an item\n}");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "ListView",
+            IdeDemo.T("Render a compact vertical list of strings.",
+                "渲染紧凑的纵向字符串列表。"),
+            "List<string> items = new List<string>();\nitems.Add(\"Alpha\"); items.Add(\"Beta\");\nListView.Render(app, 40, 60, 280, items);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Loading",
+            IdeDemo.T("Draw an animated loading indicator.",
+                "绘制动画加载指示器。"),
+            "Loading.Render(app, 80, 80, 18);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Menu",
+            IdeDemo.T("A vertical application menu with a SignalInt active item.",
+                "使用 SignalInt 当前项的纵向应用菜单。"),
+            "List<string> labels = new List<string>();\nlabels.Add(\"Home\"); labels.Add(\"Settings\");\nSignalInt active = SignalInt.Create(0);\nint first = Menu.RenderVertical(app, 40, 60, 220, 300, 36, labels, active, 0);\nMenu.HandleClick(app, first, labels.Count, active);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Message",
+            IdeDemo.T("Render a temporary inline toast message in a screen slot.",
+                "在屏幕位置中渲染临时行内消息提示。"),
+            "Message.Render(app, 0, \"Saved successfully\", 1);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Modal",
+            IdeDemo.T("Draw a centered modal surface and receive its close action.",
+                "绘制居中的模态表面并接收关闭操作。"),
+            "int action = Modal.Render(app, 460, 260, \"Account settings\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Notification",
+            IdeDemo.T("Show a notification card at a chosen position.",
+                "在指定位置显示通知卡片。"),
+            "Notification.Render(app, 620, 60, 300, \"Build completed\", 1);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "PageHeader",
+            IdeDemo.T("Render a page title, subtitle and back action.",
+                "渲染页面标题、副标题与返回操作。"),
+            "int backId = PageHeader.Render(app, 40, 40, 520, \"Components\", \"GUI reference\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Pagination",
+            IdeDemo.T("Navigate pages with a SignalInt current page.",
+                "使用 SignalInt 当前页在多个页面之间导航。"),
+            "SignalInt page = SignalInt.Create(1);\nint id = Pagination.Render(app, 40, 60, 12, page);\nPagination.HandleClick(app, id, 12, page);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Panel",
+            IdeDemo.T("Create card, section or colored surface rectangles for custom content.",
+                "为自定义内容创建卡片、区段或彩色表面矩形。"),
+            "Rect content = Panel.Card(app, 40, 60, 420, 220);\nLabel.Render(app, content.x, content.y, \"Inside the panel\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "PivotTable",
+            IdeDemo.T("Summarize rows by configured row, column and value fields.",
+                "按配置的行字段、列字段和值字段汇总数据。"),
+            "PivotConfig config = PivotConfig.Create(0, 1, 2, 0);\nList<DataRow> rows = new List<DataRow>();\nPivotTable.Render(app, 40, 60, 560, 280, rows, config);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Popconfirm",
+            IdeDemo.T("Ask for confirmation next to an invoking control.",
+                "在触发控件旁请求用户确认。"),
+            "int action = Popconfirm.Render(app, 180, 80, \"Delete this item?\", \"Delete\", \"Cancel\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Popover",
+            IdeDemo.T("Display titled explanatory content next to an anchor.",
+                "在锚点旁显示带标题的说明内容。"),
+            "Popover.Render(app, 180, 80, 260, 140, \"Details\", \"Additional information\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Rate",
+            IdeDemo.T("An interactive star rating bound to a SignalInt.",
+                "绑定到 SignalInt 的交互式星级评分。"),
+            "SignalInt rating = SignalInt.Create(3);\nint id = Rate.Render(app, 40, 60, rating, 5);\nRate.HandleClick(app, id, 5, rating);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Result",
+            IdeDemo.T("Show a success, warning or error result with a title and description.",
+                "显示带标题和说明的成功、警告或错误结果。"),
+            "Result.Render(app, 40, 60, 460, 1, \"Published\", \"The executable is ready.\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Ribbon",
+            IdeDemo.T("Build command groups for an IDE-style ribbon toolbar.",
+                "为 IDE 风格的功能区工具栏构建命令分组。"),
+            "List<RibbonCmd> commands = new List<RibbonCmd>();\ncommands.Add(RibbonCmd.Group(\"play\", \"Run\"));\ncommands.Add(RibbonCmd.Create(\"build\", \"Build\"));\nRibbon.Render(app, 0, 40, 800, Ribbon.Height(app), commands);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Scrollbar",
+            IdeDemo.T("Draw a vertical scrollbar for a custom scrollable surface.",
+                "为自定义可滚动表面绘制纵向滚动条。"),
+            "Scrollbar.RenderVertical(app, 500, 60, 240, 900, 120);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Skeleton",
+            IdeDemo.T("Compose rectangle, circle and text placeholders while content loads.",
+                "在内容加载时组合矩形、圆形和文本骨架占位。"),
+            "Skeleton.Circle(app, 60, 80, 20);\nSkeleton.Text(app, 96, 62, 240);\nSkeleton.Rect(app, 96, 90, 180, 14);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Spin",
+            IdeDemo.T("Draw a spinner by itself or centered with a loading tip.",
+                "单独绘制旋转器，或将其与加载提示居中显示。"),
+            "Spin.Render(app, 80, 80, 18, app.theme.primary);\nSpin.WithTip(app, 40, 120, 280, 100, \"Loading data...\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Split",
+            IdeDemo.T("Create draggable vertical or horizontal panes backed by a SignalInt size.",
+                "创建由 SignalInt 尺寸控制、可拖动的纵向或横向分栏。"),
+            "SignalInt firstWidth = SignalInt.Create(240);\nRect area = Rect.Create(0, 60, 800, 500);\nSplit panes = Split.Vertical(app, area, firstWidth, 160, 240);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Statistic",
+            IdeDemo.T("Show a highlighted numeric value with a descriptive label.",
+                "显示带说明标签的突出数值。"),
+            "Statistic.Render(app, 40, 60, \"Active users\", \"12,480\");");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Steps",
+            IdeDemo.T("Show progress through a sequence of labeled steps.",
+                "显示一组带标签步骤的完成进度。"),
+            "List<string> labels = new List<string>();\nlabels.Add(\"Details\"); labels.Add(\"Review\"); labels.Add(\"Done\");\nSignalInt current = SignalInt.Create(1);\nSteps.Render(app, 40, 60, 520, labels, current);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Table",
+            IdeDemo.T("Render a lightweight table header and striped rows.",
+                "渲染轻量表头与交替底色的数据行。"),
+            "List<string> cols = new List<string>();\ncols.Add(\"Name\"); cols.Add(\"Status\");\nList<int> widths = new List<int>();\nwidths.Add(220); widths.Add(120);\nTable.RenderHeader(app, 40, 60, cols, widths);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "TabView",
+            IdeDemo.T("Closable document tabs with an optional add button.",
+                "带关闭与可选新增按钮的文档标签页。"),
+            "List<string> tabs = new List<string>();\ntabs.Add(\"main.zan\"); tabs.Add(\"App.zan\");\nSignalInt active = SignalInt.Create(0);\nTabHit hit = TabView.Render(app, 40, 60, 520, TabView.Height(app), tabs, active, true);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Timeline",
+            IdeDemo.T("Display ordered events with titles and descriptions.",
+                "按顺序显示带标题与说明的事件。"),
+            "List<string> titles = new List<string>();\ntitles.Add(\"Created\"); titles.Add(\"Published\");\nList<string> descs = new List<string>();\ndescs.Add(\"Project initialized\"); descs.Add(\"Executable generated\");\nTimeline.Render(app, 40, 60, titles, descs);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "TreeView",
+            IdeDemo.T("Render expandable directory and file nodes with scrolling and selection.",
+                "渲染带滚动与选择的可展开目录和文件节点。"),
+            "List<TreeNode> nodes = new List<TreeNode>();\nnodes.Add(TreeNode.Dir(\"src\", 0, true));\nnodes.Add(TreeNode.FileIcon(\"main.zan\", 1, \"file\"));\nSignalInt selected = SignalInt.Create(1);\nint scrollOffset = 0;\nTreeView.Render(app, Rect.Create(40, 60, 320, 280), nodes, selected, scrollOffset);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "Wizard",
+            IdeDemo.T("Build a full child-window template or project creation workflow.",
+                "构建完整的子窗口模板或项目创建流程。"),
+            "List<string> names = new List<string>();\nList<string> icons = new List<string>();\nList<string> descs = new List<string>();\nSignalInt selected = SignalInt.Create(0);\nInput name = Input.Create(\"project name\");\nInput location = Input.Create(\"location\");\nint result = Wizard.Render(app, \"New Project\", names, icons, descs, selected, name, location, true);");
+        IdeDemo.DocAdd(cat, title, body, code, cWidgets, "CodeEditor",
+            IdeDemo.T("A full source editor with diagnostics, undo/redo, multiple carets, breakpoints and completion.",
+                "完整的源代码编辑器，支持诊断、撤销/重做、多光标、断点与补全。"),
+            "CodeEditor editor = CodeEditor.Create();\neditor.LoadText(\"class Program {\\n}\\n\");\neditor.Render(app, Rect.Create(40, 60, 680, 420));");
+    }
+
     /// Renders the Help / documentation browser: a searchable sidebar of topics
     /// (language + GUI components) and a detail pane with a copyable code
     /// example, in the spirit of a component showcase.
     static void RenderDocsPage(App app, Canvas c, Theme t, Rect area, Input search,
-                               SignalInt selSig, SignalInt scrollSig, List<string> log) {
+                               SignalInt selSig, SignalInt scrollSig,
+                               SignalInt codeScrollSig,
+                               SignalBool demoBool, SignalInt demoInt,
+                               Input demoInput, List<string> log) {
         c.FillRect(area.x, area.y, area.width, area.height, t.bgPrimary);
 
         List<string> dCat = new List<string>();
@@ -5453,7 +5947,11 @@ class IdeDemo {
                     if (selected) { tc = 0xFFFFFFFF; }
                     c.DrawText(sx + app.Scale(8), ry + app.Scale(5), rowText[idx], tc, t.fontSizeSmall);
                     IdeDemo.HandRegion(app, sx - app.Scale(4), ry, swid + app.Scale(8), rowH - app.Scale(2));
-                    if (click && hot) { selSig.Set(d); app.RequestRedraw(); }
+                    if (click && hot) {
+                        selSig.Set(d);
+                        codeScrollSig.Set(0);
+                        app.RequestRedraw();
+                    }
                 }
             }
             r = r + 1;
@@ -5485,6 +5983,13 @@ class IdeDemo {
         }
         cy = cy + app.Scale(10);
 
+        if (dCat[selAbs] == IdeDemo.T("GUI - Widgets", "GUI - 组件")) {
+            int previewH = IdeDemo.RenderComponentPreview(
+                app, c, t, dTitle[selAbs],
+                cx, cy, cw, demoBool, demoInt, demoInput);
+            cy = cy + previewH + app.Scale(12);
+        }
+
         // Code example panel with a Copy button.
         List<string> codeLines = CodeEditor.SplitLines(dCode[selAbs]);
         int codeLineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
@@ -5492,6 +5997,9 @@ class IdeDemo {
         int panelH = hdrH + codeLines.Count * codeLineH + app.Scale(16);
         int maxPanelH = area.y + area.height - app.Scale(16) - cy;
         if (panelH > maxPanelH) { panelH = maxPanelH; }
+        if (panelH < hdrH + codeLineH + app.Scale(16)) {
+            panelH = hdrH + codeLineH + app.Scale(16);
+        }
         c.FillRoundRect(cx, cy, cw, panelH, app.Scale(6), 0xFF1E1E1E);
         c.DrawRect(cx, cy, cw, panelH, t.borderPrimary, 1);
         c.FillRect(cx, cy + hdrH, cw, 1, 0xFF2D2D30);
@@ -5514,10 +6022,30 @@ class IdeDemo {
 
         int codeY = cy + hdrH + app.Scale(8);
         int codeBottom = cy + panelH - app.Scale(6);
-        int ci = 0;
+        int visibleCodeLines = (codeBottom - codeY) / codeLineH;
+        if (visibleCodeLines < 1) { visibleCodeLines = 1; }
+        int maxCodeScroll = codeLines.Count - visibleCodeLines;
+        if (maxCodeScroll < 0) { maxCodeScroll = 0; }
+        app.CaptureWheel(cx, cy, cw, panelH);
+        if (app.window.EventKind() == 13
+            && app.mouseX >= cx && app.mouseX < cx + cw
+            && app.mouseY >= cy && app.mouseY < cy + panelH) {
+            int delta = app.window.EventKeyCode();
+            int step = delta / 120;
+            if (step == 0) {
+                if (delta > 0) { step = 1; }
+                else if (delta < 0) { step = 0 - 1; }
+            }
+            codeScrollSig.Set(codeScrollSig.Get() - step * 3);
+            app.RequestRedraw();
+        }
+        int codeScroll = codeScrollSig.Get();
+        if (codeScroll < 0) { codeScroll = 0; }
+        if (codeScroll > maxCodeScroll) { codeScroll = maxCodeScroll; }
+        codeScrollSig.Set(codeScroll);
+        int ci = codeScroll;
         while (ci < codeLines.Count) {
             if (codeY + codeLineH > codeBottom) {
-                c.DrawText(cx + app.Scale(12), codeY, "...", t.textTertiary, t.fontSizeSmall);
                 ci = codeLines.Count;
             } else {
                 c.DrawText(cx + app.Scale(12), codeY, codeLines[ci], 0xFFD4D4D4, t.fontSizeSmall);
@@ -5525,6 +6053,335 @@ class IdeDemo {
                 ci = ci + 1;
             }
         }
+        if (maxCodeScroll > 0) {
+            Scrollbar.RenderVertical(
+                app, cx + cw - app.Scale(8),
+                cy + hdrH + app.Scale(4),
+                panelH - hdrH - app.Scale(8),
+                codeLines.Count * codeLineH,
+                codeScroll * codeLineH);
+        }
+    }
+
+    static int RenderComponentPreview(
+        App app,
+        Canvas c,
+        Theme t,
+        string name,
+        int x,
+        int y,
+        int w,
+        SignalBool demoBool,
+        SignalInt demoInt,
+        Input demoInput
+    ) {
+        int h = app.Scale(142);
+        c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        c.DrawText(
+            x + app.Scale(12), y + app.Scale(9),
+            IdeDemo.T("LIVE STATES", "实时状态"),
+            t.textTertiary, t.fontSizeSmall);
+        int px = x + app.Scale(18);
+        int py = y + app.Scale(44);
+        bool rendered = true;
+        if (name == "Button") {
+            Button.Create("Default").Render(app, px, py, app.Scale(104));
+            Button.Primary("Primary").Render(
+                app, px + app.Scale(116), py, app.Scale(104));
+            Button.Create("Disabled").SetDisabled(true).Render(
+                app, px + app.Scale(232), py, app.Scale(104));
+        } else if (name == "Label") {
+            Label.Title(app, px, py, "Title");
+            Label.Render(app, px, py + app.Scale(34), "Default label");
+            Label.Secondary(
+                app, px + app.Scale(170), py + app.Scale(34), "Secondary");
+        } else if (name == IdeDemo.T("Text Input", "文本输入框")) {
+            demoInput.Render(app, px, py, app.Scale(260), t.heightMedium);
+        } else if (name == "Checkbox") {
+            int id = Checkbox.Render(app, px, py, "Checked", demoBool);
+            Checkbox.HandleClick(app, id, demoBool);
+        } else if (name == IdeDemo.T("Radio Group", "单选组")) {
+            int r0 = Radio.Render(app, px, py, "Option A", demoInt, 0);
+            int r1 = Radio.Render(
+                app, px + app.Scale(130), py, "Option B", demoInt, 1);
+            Radio.HandleClick(app, r0, demoInt, 0);
+            Radio.HandleClick(app, r1, demoInt, 1);
+        } else if (name == "Switch") {
+            int id = Switch.Render(app, px, py, demoBool);
+            Switch.HandleClick(app, id, demoBool);
+            Label.Render(
+                app, px + app.Scale(62), py + app.Scale(6),
+                IdeDemo.T("Interactive state", "可交互状态"));
+        } else if (name == "Slider") {
+            Slider.Render(
+                app, px, py, app.Scale(300), 0, 100, demoInt);
+            Label.Secondary(
+                app, px + app.Scale(320), py,
+                Convert.ToString(demoInt.Get()));
+        } else if (name == IdeDemo.T("Select (Dropdown)", "下拉选择")) {
+            List<string> opts = new List<string>();
+            opts.Add("Default"); opts.Add("Success"); opts.Add("Warning");
+            Select.Render(
+                app, px, py, app.Scale(220), t.heightMedium,
+                opts, demoInt, IdeDemo.T("Choose a state", "选择状态"));
+        } else if (name == "Tabs") {
+            List<string> tabs = new List<string>();
+            tabs.Add("Overview"); tabs.Add("API"); tabs.Add("Examples");
+            int id = Tabs.Render(
+                app, px, py, app.Scale(420), tabs, demoInt);
+            Tabs.HandleClick(app, id, tabs.Count, demoInt);
+        } else if (name == "Card") {
+            Card.Render(app, px, py - app.Scale(8), app.Scale(360), app.Scale(90), "Card");
+            Label.Render(
+                app, px + app.Scale(14),
+                Card.ContentY(py - app.Scale(8), t),
+                IdeDemo.T("Card content and actions", "卡片内容与操作"));
+        } else if (name == "Progress") {
+            Progress.Render(app, px, py, app.Scale(320), 68, 0);
+            Progress.Render(
+                app, px, py + app.Scale(42), app.Scale(320), 42, 1);
+        } else if (name == "Tag") {
+            Tag.Render(app, px, py, "Default", 0);
+            Tag.Render(app, px + app.Scale(100), py, "Success", 1);
+            Tag.Render(app, px + app.Scale(200), py, "Warning", 2);
+            Tag.Render(app, px + app.Scale(300), py, "Error", 3);
+        } else if (name == "Alert") {
+            Alert.Render(
+                app, px, py - app.Scale(8), w - app.Scale(36),
+                IdeDemo.T("Build succeeded", "构建成功"),
+                IdeDemo.T("The executable is ready.", "可执行文件已准备就绪。"), 1);
+        } else if (name == "Tooltip") {
+            Button.Create(IdeDemo.T("Hover target", "悬停目标")).Render(
+                app, px, py, app.Scale(130));
+            Tooltip.Render(
+                app, px + app.Scale(150), py,
+                IdeDemo.T("Helpful context", "辅助说明"));
+        } else if (name == "Avatar") {
+            Avatar.Render(app, px, py, app.Scale(42), "Z");
+            Avatar.RenderWithIcon(
+                app, px + app.Scale(72), py, app.Scale(42), "user");
+        } else if (name == "Badge") {
+            Badge.Dot(app, px + app.Scale(10), py + app.Scale(10));
+            Badge.Count(app, px + app.Scale(90), py, 12);
+        } else if (name == "Divider") {
+            Divider.RenderText(
+                app, px, py, w - app.Scale(36),
+                IdeDemo.T("Section", "区段"), 0);
+        } else if (name == "Empty") {
+            Empty.Render(
+                app, px, py - app.Scale(20),
+                w - app.Scale(36), app.Scale(96),
+                IdeDemo.T("No data", "暂无数据"));
+        } else if (name == "ListView") {
+            List<string> items = new List<string>();
+            items.Add("Alpha"); items.Add("Beta"); items.Add("Gamma");
+            ListView.Render(app, px, py - app.Scale(14), app.Scale(260), items);
+        } else if (name == "Loading") {
+            Loading.Render(app, px + app.Scale(30), py + app.Scale(24), app.Scale(18));
+        } else if (name == "Skeleton") {
+            Skeleton.Circle(app, px + app.Scale(20), py + app.Scale(20), app.Scale(20));
+            Skeleton.Text(
+                app, px + app.Scale(58), py, app.Scale(260));
+            Skeleton.Rect(
+                app, px + app.Scale(58), py + app.Scale(30),
+                app.Scale(180), app.Scale(14));
+        } else if (name == "Statistic") {
+            Statistic.Render(
+                app, px, py,
+                IdeDemo.T("Active users", "活跃用户"), "12,480");
+        } else if (name == "Typography") {
+            Typography.Heading(app, px, py - app.Scale(12), "Heading", 2);
+            Typography.Paragraph(
+                app, px, py + app.Scale(34),
+                IdeDemo.T(
+                    "Readable paragraph text for application content.",
+                    "用于应用内容的易读段落文本。"));
+        } else if (name == "Breadcrumb") {
+            List<string> crumbs = new List<string>();
+            crumbs.Add("Home"); crumbs.Add("Components"); crumbs.Add("Breadcrumb");
+            Breadcrumb.Render(app, px, py, crumbs);
+        } else if (name == "Carousel") {
+            List<string> slides = new List<string>();
+            slides.Add("First state"); slides.Add("Second state");
+            int id = Carousel.Render(
+                app, px, py - app.Scale(18),
+                w - app.Scale(36), app.Scale(92), slides, demoInt);
+            Carousel.HandleClick(app, id, slides.Count, demoInt);
+        } else if (name == "Chart") {
+            List<string> labels = new List<string>();
+            labels.Add("Q1"); labels.Add("Q2");
+            labels.Add("Q3"); labels.Add("Q4");
+            List<int> values = new List<int>();
+            values.Add(12); values.Add(28); values.Add(20); values.Add(35);
+            List<ChartSeries> series = new List<ChartSeries>();
+            series.Add(ChartSeries.Create("Series", values, t.primary));
+            Chart.Line(
+                app, px, py - app.Scale(24),
+                w - app.Scale(36), app.Scale(104), "", labels, series);
+        } else if (name == "Collapse") {
+            List<string> heads = new List<string>();
+            heads.Add("General"); heads.Add("Advanced");
+            List<string> content = new List<string>();
+            content.Add("General settings"); content.Add("Advanced settings");
+            int id = Collapse.Render(
+                app, px, py - app.Scale(18),
+                w - app.Scale(36), heads, content, demoInt);
+            Collapse.HandleClick(app, id, heads.Count, demoInt);
+        } else if (name == "DataTable") {
+            List<DataColumn> cols = new List<DataColumn>();
+            cols.Add(DataColumn.Text("Name", app.Scale(160)));
+            cols.Add(DataColumn.Numeric("Score", app.Scale(100)));
+            List<DataRow> rows = new List<DataRow>();
+            DataRow row = DataRow.Create();
+            row.Push("Zan"); row.Push("98"); rows.Add(row);
+            DataTableState state = DataTableState.Create();
+            DataTable.Render(
+                app, px, py - app.Scale(18),
+                w - app.Scale(36), app.Scale(100),
+                cols, rows, state);
+        } else if (name == "Dropdown") {
+            Dropdown.RenderTrigger(
+                app, px, py, app.Scale(150), t.heightMedium,
+                IdeDemo.T("Actions", "操作"), true);
+            List<string> items = new List<string>();
+            items.Add(IdeDemo.T("Edit", "编辑"));
+            items.Add(IdeDemo.T("Delete", "删除"));
+            Dropdown.RenderMenu(
+                app, px + app.Scale(166), py, app.Scale(160), items);
+        } else if (name == "Ellipsis") {
+            string longText = IdeDemo.T(
+                "A very long component example that must fit the available width",
+                "一个必须适应可用宽度的超长组件示例");
+            Ellipsis.Render(app, px, py, app.Scale(280), longText);
+        } else if (name == "FloatButton") {
+            FloatButton.Render(
+                app, px, py - app.Scale(8), app.Scale(48), "plus", 1);
+            FloatButton.Render(
+                app, px + app.Scale(72), py - app.Scale(8),
+                app.Scale(48), "edit", 0);
+        } else if (name == "Menu") {
+            List<string> menuItems = new List<string>();
+            menuItems.Add("Overview"); menuItems.Add("Settings");
+            int id = Menu.RenderVertical(
+                app, px, py - app.Scale(18), app.Scale(220),
+                py + app.Scale(78), app.Scale(36),
+                menuItems, demoInt, 0);
+            Menu.HandleClick(app, id, menuItems.Count, demoInt);
+        } else if (name == "PageHeader") {
+            PageHeader.Render(
+                app, px, py - app.Scale(12), w - app.Scale(36),
+                IdeDemo.T("Component page", "组件页面"),
+                IdeDemo.T("Title, subtitle and back action", "标题、副标题与返回操作"));
+        } else if (name == "Pagination") {
+            int id = Pagination.Render(app, px, py, 12, demoInt);
+            Pagination.HandleClick(app, id, 12, demoInt);
+        } else if (name == "Panel") {
+            Rect content = Panel.Section(
+                app, px, py - app.Scale(18),
+                w - app.Scale(36), app.Scale(96),
+                IdeDemo.T("Panel title", "面板标题"));
+            Label.Render(
+                app, content.x, content.y,
+                IdeDemo.T("Panel content", "面板内容"));
+        } else if (name == "PivotTable") {
+            List<DataRow> rows = new List<DataRow>();
+            DataRow p0 = DataRow.Create();
+            p0.Push("North"); p0.Push("2026"); p0.Push("42"); rows.Add(p0);
+            DataRow p1 = DataRow.Create();
+            p1.Push("South"); p1.Push("2026"); p1.Push("35"); rows.Add(p1);
+            PivotConfig cfg = PivotConfig.Create(0, 1, 2, 0);
+            PivotTable.Render(
+                app, px, py - app.Scale(18),
+                w - app.Scale(36), app.Scale(100), rows, cfg);
+        } else if (name == "Popover") {
+            Popover.Render(
+                app, px, py - app.Scale(12),
+                app.Scale(280), app.Scale(90),
+                IdeDemo.T("Popover", "气泡卡片"),
+                IdeDemo.T("Anchored explanatory content.", "锚定的说明内容。"));
+        } else if (name == "Rate") {
+            int id = Rate.Render(app, px, py, demoInt, 5);
+            Rate.HandleClick(app, id, 5, demoInt);
+        } else if (name == "Result") {
+            Result.Render(
+                app, px, py - app.Scale(28), w - app.Scale(36), 1,
+                IdeDemo.T("Operation complete", "操作完成"),
+                IdeDemo.T("The requested action succeeded.", "请求的操作已成功。"));
+        } else if (name == "Ribbon") {
+            List<RibbonCmd> commands = new List<RibbonCmd>();
+            commands.Add(RibbonCmd.Group("play", "Run"));
+            commands.Add(RibbonCmd.Create("build", "Build"));
+            Ribbon.Render(
+                app, px, py - app.Scale(18),
+                w - app.Scale(36), Ribbon.Height(app), commands);
+        } else if (name == "Scrollbar") {
+            c.FillRoundRect(
+                px, py - app.Scale(12), app.Scale(280), app.Scale(90),
+                app.Scale(4), t.bgPrimary);
+            Scrollbar.RenderVertical(
+                app, px + app.Scale(270), py - app.Scale(12),
+                app.Scale(90), app.Scale(360), app.Scale(90));
+        } else if (name == "Spin") {
+            Spin.Render(
+                app, px + app.Scale(26), py + app.Scale(20),
+                app.Scale(18), t.primary);
+            Spin.WithTip(
+                app, px + app.Scale(80), py - app.Scale(18),
+                app.Scale(240), app.Scale(90),
+                IdeDemo.T("Loading data...", "正在加载数据..."));
+        } else if (name == "Steps") {
+            List<string> steps = new List<string>();
+            steps.Add("Details"); steps.Add("Review"); steps.Add("Done");
+            Steps.Render(
+                app, px, py, w - app.Scale(36), steps, demoInt);
+        } else if (name == "Table") {
+            List<string> columns = new List<string>();
+            columns.Add("Name"); columns.Add("Status");
+            List<int> widths = new List<int>();
+            widths.Add(app.Scale(200)); widths.Add(app.Scale(140));
+            Table.RenderHeader(app, px, py - app.Scale(14), columns, widths);
+            List<string> cells = new List<string>();
+            cells.Add("Zan"); cells.Add("Ready");
+            Table.RenderRow(
+                app, px, py - app.Scale(14) + t.heightMedium,
+                cells, widths, true);
+        } else if (name == "Timeline") {
+            List<string> titles = new List<string>();
+            titles.Add("Created"); titles.Add("Published");
+            List<string> descs = new List<string>();
+            descs.Add("Project initialized"); descs.Add("Executable generated");
+            Timeline.Render(
+                app, px, py - app.Scale(20), titles, descs);
+        } else if (name == "TreeView") {
+            List<TreeNode> nodes = new List<TreeNode>();
+            nodes.Add(TreeNode.Dir("src", 0, true));
+            nodes.Add(TreeNode.FileIcon("main.zan", 1, "file"));
+            TreeView.Render(
+                app, Rect.Create(
+                    px, py - app.Scale(18),
+                    app.Scale(280), app.Scale(96)),
+                nodes, demoInt, 0);
+        } else {
+            rendered = false;
+        }
+        if (!rendered) {
+            Icon.Draw(
+                c, "code", px, py, app.Scale(30), t.primary);
+            c.DrawText(
+                px + app.Scale(46), py,
+                IdeDemo.T(
+                    "Interactive / overlay example",
+                    "交互式 / 浮层示例"),
+                t.textPrimary, t.fontSizeMedium);
+            c.DrawText(
+                px + app.Scale(46), py + app.Scale(28),
+                IdeDemo.T(
+                    "Copy the current API example below.",
+                    "复制下方当前 API 示例。"),
+                t.textSecondary, t.fontSizeSmall);
+        }
+        return h;
     }
 
     /// Renders a category label as an uppercase-ish section header. (Kept simple:

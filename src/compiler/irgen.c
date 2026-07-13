@@ -3783,13 +3783,25 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         /* allocate buffer and sprintf */
                         LLVMValueRef buf_size = LLVMConstInt(i64, 32, 0);
                         LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
-                        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "itoa_fmt");
-                        LLVMValueRef int_arg = arg;
-                        if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind &&
-                            LLVMGetIntTypeWidth(LLVMTypeOf(arg)) < 64) {
-                            int_arg = LLVMBuildSExt(g->builder, arg, i64, "ext");
+                        LLVMTypeKind atk = LLVMGetTypeKind(LLVMTypeOf(arg));
+                        LLVMValueRef fmt;
+                        LLVMValueRef num_arg = arg;
+                        if (atk == LLVMDoubleTypeKind || atk == LLVMFloatTypeKind) {
+                            /* floating point: print with %g (varargs promote
+                             * float to double), matching Console.WriteLine. */
+                            fmt = LLVMBuildGlobalStringPtr(g->builder, "%g", "ftoa_fmt");
+                            if (atk == LLVMFloatTypeKind) {
+                                num_arg = LLVMBuildFPExt(g->builder, arg,
+                                    LLVMDoubleTypeInContext(g->ctx), "ext");
+                            }
+                        } else {
+                            fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "itoa_fmt");
+                            if (atk == LLVMIntegerTypeKind &&
+                                LLVMGetIntTypeWidth(LLVMTypeOf(arg)) < 64) {
+                                num_arg = LLVMBuildSExt(g->builder, arg, i64, "ext");
+                            }
                         }
-                        LLVMValueRef sn_args[] = { buf, LLVMConstInt(i64, 32, 0), fmt, int_arg };
+                        LLVMValueRef sn_args[] = { buf, LLVMConstInt(i64, 32, 0), fmt, num_arg };
                         LLVMBuildCall2(g->builder,
                             LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
                                 (LLVMTypeRef[]){ i8ptr, i64, i8ptr }, 3, 1),
