@@ -1,0 +1,151 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// High-level virtualized list.
+///
+/// Retained (create once, keep across frames). Renders a fixed-height,
+/// bordered viewport over an arbitrarily large item list, drawing ONLY the
+/// rows currently visible (row virtualization), so 100k rows cost the same as
+/// a screenful. It owns pixel scrolling, the scrollbar and hover/selection by
+/// composing a ScrollView internally — the call site is just:
+///
+///   VirtualList list = VirtualList.Create();     // once
+///   list.SetItems(rows);
+///
+///   list.Render(app, x, y, w, h);                // each frame
+///   int sel = list.Selected();                   // -1 if none
+///   int hit = list.TakeActivated();              // clicked row this frame, -1
+///
+/// Unlike ListView (which lays out every row at full height with no viewport),
+/// this keeps a constant cost and scrolls itself.
+/// </summary>
+class VirtualList {
+    ScrollView scroll;
+    List<string> items;
+    int selected;
+    int rowH;
+    int activated;
+
+    static VirtualList Create() {
+        VirtualList v = new VirtualList();
+        v.scroll = ScrollView.Create();
+        v.items = new List<string>();
+        v.selected = 0 - 1;
+        v.rowH = 0;
+        v.activated = 0 - 1;
+        return v;
+    }
+
+    void SetItems(List<string> rows) {
+        items = rows;
+        if (selected >= rows.Count) { selected = rows.Count - 1; }
+    }
+
+    void Add(string row) {
+        items.Add(row);
+    }
+
+    void SetRowHeight(int h) {
+        rowH = h;
+    }
+
+    int Count() {
+        return items.Count;
+    }
+
+    int Selected() {
+        return selected;
+    }
+
+    string SelectedText() {
+        if (selected < 0 || selected >= items.Count) { return ""; }
+        return items[selected];
+    }
+
+    /// Row clicked this frame (or -1), then cleared.
+    int TakeActivated() {
+        int r = activated;
+        activated = 0 - 1;
+        return r;
+    }
+
+    int ResolveRowH(App app) {
+        if (rowH > 0) { return rowH; }
+        return app.theme.heightLarge;
+    }
+
+    void Render(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, h, t.borderSecondary, 1);
+
+        int rh = this.ResolveRowH(app);
+        int contentH = items.Count * rh;
+
+        Rect area = Rect.Create(x + 1, y + 1, w - 2, h - 2);
+        int dy = scroll.Begin(app, area, contentH);
+        int accent = app.Scale(3);
+
+        // Only iterate the rows intersecting the viewport.
+        int first = dy / rh;
+        if (first < 0) { first = 0; }
+        int visible = area.height / rh + 2;
+        int last = first + visible;
+        if (last > items.Count) { last = items.Count; }
+
+        int i = first;
+        while (i < last) {
+            int ry = area.y + i * rh - dy;
+            bool over = app.mouseX >= area.x && app.mouseX < area.x + area.width
+                && app.mouseY >= ry && app.mouseY < ry + rh
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            bool isSel = i == selected;
+
+            if (isSel) {
+                c.FillRect(area.x, ry, area.width, rh, t.bgActive);
+                c.FillRect(area.x, ry, accent, rh, t.primary);
+            } else if (over) {
+                c.FillRect(area.x, ry, area.width, rh, t.bgHover);
+            }
+            if (i > 0) { c.FillRect(area.x, ry, area.width, 1, t.divider); }
+
+            int tc = t.textPrimary;
+            if (isSel) { tc = t.primary; }
+            int ty = ry + (rh - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.DrawText(area.x + t.paddingLarge, ty,
+                Ellipsis.Fit(items[i], area.width - t.paddingLarge * 2, t.fontSizeMedium),
+                tc, t.fontSizeMedium);
+            i = i + 1;
+        }
+
+        scroll.End(app, area);
+
+        // Row selection (click inside the viewport).
+        bool leftUp = app.window.EventKind() == 3 && app.window.EventButton() == 0;
+        bool inArea = app.mouseX >= area.x && app.mouseX < area.x + area.width
+            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+        if (leftUp && inArea && !scroll.Overflowing()) {
+            this.HitSelect(app, area, rh, dy);
+        } else if (leftUp && inArea) {
+            // Ignore clicks that land on the scrollbar gutter.
+            int gutter = area.x + area.width - app.Scale(12);
+            if (app.mouseX < gutter) {
+                this.HitSelect(app, area, rh, dy);
+            }
+        }
+    }
+
+    void HitSelect(App app, Rect area, int rh, int dy) {
+        int idx = (app.mouseY - area.y + dy) / rh;
+        if (idx >= 0 && idx < items.Count) {
+            selected = idx;
+            activated = idx;
+            app.RequestRedraw();
+        }
+    }
+}
