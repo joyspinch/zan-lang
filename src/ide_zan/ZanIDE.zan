@@ -403,6 +403,29 @@ class ZanIDE {
         return args;
     }
 
+    /// Extra link input for programs that use the synchronization runtime
+    /// (Thread.Start / AtomicInt / SharedTable / Dispatcher). Those symbols
+    /// (zan_thread_start / zan_atomic_int_* / zan_shared_table_* /
+    /// zan_dispatch_*) live in the prebuilt zanrt_sync object rather than the
+    /// emitted IR, so the IDE's `clang <ir>.ll` step must link it explicitly.
+    /// Prefer the MSVC-target object (zanrt_sync_ide.obj) since the IDE links
+    /// against clang's default MSVC target; the GNU-target zanrt_sync.obj pulls
+    /// in __mingw_* and won't resolve. Returns "" when no object is present so
+    /// ordinary programs still link unchanged. The object only references
+    /// kernel32 (threads / mutexes / file mappings), so linking it into a
+    /// program that doesn't call it is harmless dead code.
+    static string RtSyncArg() {
+        string cand = ZanIDE.ToolchainDir() + "/zanrt_sync_ide.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        cand = ZanIDE.ExeDir() + "/zanrt_sync_ide.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        cand = ZanIDE.ToolchainDir() + "/zanrt_sync.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        cand = ZanIDE.ExeDir() + "/zanrt_sync.obj";
+        if (File.Exists(cand)) { return " \"" + cand + "\""; }
+        return "";
+    }
+
     /// Reads a `key = value` field from the project's zan.proj, or "" if absent.
     static string ProjField(string root, string key) {
         string proj = root + "/zan.proj";
@@ -658,6 +681,13 @@ class ZanIDE {
         int coSelAc = 0;
         int coSelB = 0 - 1;
         int coSelBc = 0;
+        // Output console scroll (lines up from the bottom; 0 = follow the tail),
+        // a scrollbar-drag flag, and a substring filter box. The console owns its
+        // own scrolling/filtering rather than the caller wiring it up each time.
+        int coScroll = 0;
+        int coSbDrag = 0;
+        Input coFilter = Input.Bind(SignalString.Create(""),
+            ZanIDE.T("Filter output...", "筛选输出..."));
 
         // ---- Debug state ----
         int dbgState = 0;
@@ -1630,39 +1660,108 @@ class ZanIDE {
                     List<string> eLine = new List<string>();
                     List<string> eMsg = new List<string>();
                     ZanIDE.ParseErrorList(log, ePath, eLine, eMsg);
-                    ZanIDE.RenderOutputBottom(app, c, t, orr, botTab, log, ePath, eLine, eMsg,
-                        coSelA, coSelAc, coSelB, coSelBc);
+                    // Build the (optionally) filtered view the console shows. The
+                    // real `log` is untouched; selection/copy operate on the view.
+                    string coFilterText = coFilter.GetText();
+                    List<string> coView = log;
+                    if (coFilterText != "") {
+                        coView = new List<string>();
+                        int cvi = 0;
+                        while (cvi < log.Count) {
+                            if (ZanIDE.Has(log[cvi], coFilterText)) { coView.Add(log[cvi]); }
+                            cvi = cvi + 1;
+                        }
+                    }
                     int obTabH = app.Scale(28);
+                    int coContentY = orr.y + obTabH;
+                    int coContentH = orr.height - obTabH;
+                    int coRowH = app.Scale(18);
+                    int coPad = app.Scale(6);
+                    int coTextX = orr.x + coPad;
+                    int coMaxRows = coContentH / coRowH;
+                    if (coMaxRows < 1) { coMaxRows = 1; }
+                    int coMaxScroll = coView.Count - coMaxRows;
+                    if (coMaxScroll < 0) { coMaxScroll = 0; }
+                    // Mouse wheel scrolls through output history (wheel up = older).
+                    if (botTab == 0 && app.window.EventKind() == 13
+                        && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
+                        && app.mouseY >= coContentY && app.mouseY < coContentY + coContentH) {
+                        int wd = app.window.EventKeyCode();
+                        int wstep = wd / 120;
+                        if (wstep == 0) {
+                            if (wd > 0) { wstep = 1; }
+                            else if (wd < 0) { wstep = 0 - 1; }
+                        }
+                        coScroll = coScroll + wstep;
+                        app.RequestRedraw();
+                    }
+                    if (coScroll < 0) { coScroll = 0; }
+                    if (coScroll > coMaxScroll) { coScroll = coMaxScroll; }
+                    ZanIDE.RenderOutputBottom(app, c, t, orr, botTab, coView, ePath, eLine, eMsg,
+                        coScroll, coFilter, coSelA, coSelAc, coSelB, coSelBc);
+                    // Clear button empties the real log and resets the view state.
+                    Rect coClr = ZanIDE.OutClearRect(app, orr);
+                    if (app.window.EventKind() == 3
+                        && app.mouseX >= coClr.x && app.mouseX < coClr.x + coClr.width
+                        && app.mouseY >= coClr.y && app.mouseY < coClr.y + coClr.height) {
+                        log = new List<string>();
+                        coFilter.SetText("");
+                        coScroll = 0;
+                        coSelA = 0 - 1; coSelB = 0 - 1;
+                        app.RequestRedraw();
+                    }
                     // Drag-to-select over the Output console. Register a hit region
                     // so pointer-move events keep repainting while dragging.
                     int coId = app.focus.AllocId();
-                    int coContentY = orr.y + obTabH;
-                    int coContentH = orr.height - obTabH;
                     app.hitTester.Register(HitRegion.Create(coId, orr.x, coContentY,
                         orr.width, coContentH, 1));
                     if (botTab == 0) {
-                        int coRowH = app.Scale(18);
-                        int coPad = app.Scale(6);
-                        int coTextX = orr.x + coPad;
-                        int coMaxRows = coContentH / coRowH;
-                        bool coOver = app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
+                        // Scrollbar thumb drag takes precedence over text selection.
+                        int coSbX = orr.x + orr.width - app.Scale(10);
+                        bool coSbVisible = coView.Count > coMaxRows;
+                        bool overSb = coSbVisible && app.mouseX >= coSbX
+                            && app.mouseX < coSbX + app.Scale(10)
+                            && app.mouseY >= coContentY && app.mouseY < coContentY + coContentH;
+                        if (app.window.EventKind() == 2 && app.window.EventButton() == 0 && overSb) {
+                            coSbDrag = 1;
+                        }
+                        if (coSbDrag == 1
+                            && (app.window.EventKind() == 1 || app.window.EventKind() == 2)) {
+                            int contentPx = coView.Count * coRowH;
+                            int viewPx = coMaxRows * coRowH;
+                            int thumbH = viewPx * viewPx / contentPx;
+                            if (thumbH < 20) { thumbH = 20; }
+                            int denom = viewPx - thumbH;
+                            if (denom < 1) { denom = 1; }
+                            int rel = (app.mouseY - thumbH / 2) - (coContentY + coPad);
+                            if (rel < 0) { rel = 0; }
+                            int scrollPx = rel * (contentPx - viewPx) / denom;
+                            int startIdx = scrollPx / coRowH;
+                            if (startIdx < 0) { startIdx = 0; }
+                            if (startIdx > coMaxScroll) { startIdx = coMaxScroll; }
+                            coScroll = coMaxScroll - startIdx;
+                            app.RequestRedraw();
+                        }
+                        if (app.window.EventKind() == 3) { coSbDrag = 0; }
+                        bool coOver = !overSb && coSbDrag == 0
+                            && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
                             && app.mouseY >= coContentY && app.mouseY < coContentY + coContentH;
                         if (app.window.EventKind() == 2 && app.window.EventButton() == 0 && coOver) {
                             int rr = ZanIDE.ConsoleRowAt(app, coContentY, coRowH, coPad,
-                                log.Count, coMaxRows, app.mouseY);
+                                coView.Count, coMaxRows, coScroll, app.mouseY);
                             int cc = 0;
-                            if (rr >= 0 && rr < log.Count) {
-                                cc = ZanIDE.ConsoleColAt(log[rr], coTextX, t.fontSizeSmall, app.mouseX);
+                            if (rr >= 0 && rr < coView.Count) {
+                                cc = ZanIDE.ConsoleColAt(coView[rr], coTextX, t.fontSizeSmall, app.mouseX);
                             }
                             coSelA = rr; coSelAc = cc; coSelB = rr; coSelBc = cc; coSelDrag = 1;
                             app.RequestRedraw();
                         }
                         if (app.window.EventKind() == 1 && coSelDrag == 1) {
                             int rr = ZanIDE.ConsoleRowAt(app, coContentY, coRowH, coPad,
-                                log.Count, coMaxRows, app.mouseY);
+                                coView.Count, coMaxRows, coScroll, app.mouseY);
                             int cc = 0;
-                            if (rr >= 0 && rr < log.Count) {
-                                cc = ZanIDE.ConsoleColAt(log[rr], coTextX, t.fontSizeSmall, app.mouseX);
+                            if (rr >= 0 && rr < coView.Count) {
+                                cc = ZanIDE.ConsoleColAt(coView[rr], coTextX, t.fontSizeSmall, app.mouseX);
                             }
                             coSelB = rr; coSelBc = cc;
                             app.RequestRedraw();
@@ -1720,11 +1819,11 @@ class ZanIDE {
                         bool haveSel = coSelA >= 0
                             && !(coSelA == coSelB && coSelAc == coSelBc);
                         if (botTab == 0 && haveSel) {
-                            clip = ZanIDE.ConsoleSelectionText(log,
+                            clip = ZanIDE.ConsoleSelectionText(coView,
                                 coSelA, coSelAc, coSelB, coSelBc);
                         } else if (botTab == 0) {
                             int ci = 0;
-                            while (ci < log.Count) { clip = clip + log[ci] + "\n"; ci = ci + 1; }
+                            while (ci < coView.Count) { clip = clip + coView[ci] + "\n"; ci = ci + 1; }
                         } else {
                             int ci = 0;
                             while (ci < ePath.Count) {
@@ -2655,7 +2754,7 @@ class ZanIDE {
         bool isGui = ZanIDE.IsGuiTarget(root, p);
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\""
-            + ZanIDE.GuiLinkArgs(root, p);
+            + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
         if (!isGui) { cmd = cmd + " && \"" + exe + "\""; }
         log.Add("> Running " + p + " ...");
         List<string> outp = Process.RunCapture(cmd);
@@ -2813,7 +2912,7 @@ class ZanIDE {
         string z = ZanIDE.ZancCmd();
         string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p);
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
         log.Add("> [Hot] Rebuilding ...");
         List<string> outp = Process.RunCapture(cmd);
         ZanIDE.AppendAll(log, outp);
@@ -2844,7 +2943,7 @@ class ZanIDE {
         string z = ZanIDE.ZancCmd();
         string inputs = ZanIDE.ProjectInputs(ZanIDE.DirOf(p), p, "");
         string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p);
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
         log.Add("> Publishing console exe ...");
         List<string> outp = Process.RunCapture(cmd);
         ZanIDE.AppendAll(log, outp);
@@ -2910,7 +3009,7 @@ class ZanIDE {
             string exe = root + "/publish/" + baseName + "-windows-x64.exe";
             string ll = bd + "/.zanpub_x64.ll";
             string cmd = zc + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p);
+                + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
             log.Add("> Publishing windows-x64 ...");
             List<string> outp = Process.RunCapture(cmd);
             ZanIDE.AppendAll(log, outp);
@@ -4259,10 +4358,33 @@ class ZanIDE {
         }
     }
 
-    /// Tabbed bottom panel (Output / Error List) with tight padding, replacing
-    /// the single bordered Output section.
+    /// The Output panel's "Clear" button rect, right-aligned in the tab strip.
+    /// Shared by the renderer (draw) and the caller (hit-test) so they agree.
+    static Rect OutClearRect(App app, Rect orr) {
+        int tabH = app.Scale(28);
+        int bw = app.Scale(52);
+        int bh = tabH - app.Scale(8);
+        int bx = orr.x + orr.width - bw - app.Scale(8);
+        int by = orr.y + app.Scale(4);
+        return Rect.Create(bx, by, bw, bh);
+    }
+
+    /// The Output panel's filter box rect, left of the Clear button.
+    static Rect OutFilterRect(App app, Rect orr) {
+        int tabH = app.Scale(28);
+        Rect cb = ZanIDE.OutClearRect(app, orr);
+        int fw = app.Scale(160);
+        int fh = tabH - app.Scale(8);
+        int fx = cb.x - fw - app.Scale(6);
+        int fy = orr.y + app.Scale(4);
+        return Rect.Create(fx, fy, fw, fh);
+    }
+
+    /// Tabbed bottom panel (Output / Error List) with a filter box + Clear
+    /// button in the tab strip. The Output tab owns its scrolling/scrollbar.
     static void RenderOutputBottom(App app, Canvas c, Theme t, Rect orr, int tab,
             List<string> log, List<string> ePath, List<string> eLine, List<string> eMsg,
+            int scroll, Input filter,
             int selR0, int selC0, int selR1, int selC1) {
         int tabH = app.Scale(28);
         int tabW = app.Scale(90);
@@ -4278,13 +4400,22 @@ class ZanIDE {
         string elabel = "Errors";
         if (eLine.Count > 0) { elabel = "Errors (" + Convert.ToString(eLine.Count) + ")"; }
         c.DrawText(orr.x + tabW + app.Scale(8), orr.y + app.Scale(6), elabel, t.textPrimary, t.fontSizeSmall);
-        c.DrawText(orr.x + orr.width - app.Scale(190), orr.y + app.Scale(7), "drag: select · right-click: copy", t.textTertiary, t.fontSizeSmall);
+        // Toolbar: a substring filter box + Clear, right-aligned in the tab strip.
+        Rect fr = ZanIDE.OutFilterRect(app, orr);
+        filter.Render(app, fr.x, fr.y, fr.width, fr.height);
+        Rect cbr = ZanIDE.OutClearRect(app, orr);
+        bool clrHov = app.mouseX >= cbr.x && app.mouseX < cbr.x + cbr.width
+            && app.mouseY >= cbr.y && app.mouseY < cbr.y + cbr.height;
+        int clrBg = 0xFF3C3C3C;
+        if (clrHov) { clrBg = 0xFF4E4E52; }
+        c.FillRoundRect(cbr.x, cbr.y, cbr.width, cbr.height, app.Scale(3), clrBg);
+        c.DrawText(cbr.x + app.Scale(8), cbr.y + app.Scale(3), ZanIDE.T("Clear", "清空"), t.textPrimary, t.fontSizeSmall);
         int contentY = orr.y + tabH;
         int contentH = orr.height - tabH;
         c.FillRect(orr.x, contentY, orr.width, contentH, t.bgPrimary);
         if (tab == 0) {
             ZanIDE.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, log,
-                selR0, selC0, selR1, selC1);
+                scroll, selR0, selC0, selR1, selC1);
         } else {
             ZanIDE.RenderErrorList(app, c, t, orr.x, contentY, orr.width, contentH, ePath, eLine, eMsg);
         }
@@ -4341,7 +4472,7 @@ class ZanIDE {
         string buildCmd = ZanIDE.ZancCmd()
             + " --emit-ir " + inputs + " > \"" + ll + "\""
             + " && clang \"" + ll + "\" -o \"" + exe + "\""
-            + ZanIDE.GuiLinkArgs(root, p);
+            + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
         log.Add("> [Debug] Building " + p + " ...");
         List<string> buildOut = Process.RunCapture(buildCmd);
         ZanIDE.AppendAll(log, buildOut);
@@ -4384,7 +4515,7 @@ class ZanIDE {
         string ll = bd + "/.zandbg.ll";
         string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
         string buildCmd = ZanIDE.ZancCmd() + " --emit-ir \"" + p + "\" > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p);
+            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
         log.Add("> [Debug] Building ...");
         List<string> buildOut = Process.RunCapture(buildCmd);
         int bo = 0;
@@ -4700,7 +4831,7 @@ class ZanIDE {
             #endif
             string inputs = ZanIDE.ProjectInputs(gatherDir, probe, curPath);
             string buildCmd = ZanIDE.ZancCmd() + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang \"" + ll + "\" -o \"" + exe + "\"";
+                + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.RtSyncArg();
             List<string> buildOut = Process.RunCapture(buildCmd);
             if (File.Exists(exe)) {
                 runOut = Process.RunCapture("\"" + exe + "\"");
@@ -5028,7 +5159,7 @@ class ZanIDE {
 
         if (tab == 0) {
             ZanIDE.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, console,
-                0 - 1, 0, 0 - 1, 0);
+                0, 0 - 1, 0, 0 - 1, 0);
         } else if (tab == 1) {
             ZanIDE.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
         } else if (tab == 2) {
@@ -5052,13 +5183,19 @@ class ZanIDE {
     }
 
     static void RenderConsoleTab(App app, Canvas c, Theme t,
-            int x, int y, int w, int h, List<string> lines,
+            int x, int y, int w, int h, List<string> lines, int scroll,
             int selR0, int selC0, int selR1, int selC1) {
         int rowH = app.Scale(18);
         int pad = app.Scale(6);
         int maxRows = h / rowH;
-        int startIdx = 0;
-        if (lines.Count > maxRows) { startIdx = lines.Count - maxRows; }
+        if (maxRows < 1) { maxRows = 1; }
+        // `scroll` is measured in lines up from the bottom (0 = follow the tail).
+        int maxScroll = lines.Count - maxRows;
+        if (maxScroll < 0) { maxScroll = 0; }
+        int sc = scroll;
+        if (sc < 0) { sc = 0; }
+        if (sc > maxScroll) { sc = maxScroll; }
+        int startIdx = maxScroll - sc;
         // Normalize the selection so (selR0,selC0) precedes (selR1,selC1).
         if (selR0 >= 0) {
             if (selR0 > selR1 || (selR0 == selR1 && selC0 > selC1)) {
@@ -5107,15 +5244,23 @@ class ZanIDE {
         if (lines.Count == 0) {
             c.DrawText(x + pad, y + pad, "(no console output)", t.textDisabled, t.fontSizeSmall);
         }
+        if (lines.Count > maxRows) {
+            Scrollbar.RenderVertical(app, x + w - app.Scale(10), y + pad,
+                maxRows * rowH, lines.Count * rowH, startIdx * rowH);
+        }
     }
 
     /// Map a pointer Y within the console content rect to an absolute line index
     /// (into `lines`), matching RenderConsoleTab's tail-scroll layout.
     static int ConsoleRowAt(App app, int contentY, int rowH, int pad,
-            int count, int maxRows, int mouseY) {
+            int count, int maxRows, int scroll, int mouseY) {
         if (count == 0) { return 0 - 1; }
-        int startIdx = 0;
-        if (count > maxRows) { startIdx = count - maxRows; }
+        int maxScroll = count - maxRows;
+        if (maxScroll < 0) { maxScroll = 0; }
+        int sc = scroll;
+        if (sc < 0) { sc = 0; }
+        if (sc > maxScroll) { sc = maxScroll; }
+        int startIdx = maxScroll - sc;
         int rel = (mouseY - (contentY + pad)) / rowH;
         if (rel < 0) { rel = 0; }
         int ri = startIdx + rel;
