@@ -1527,6 +1527,15 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
             zan_symbol_t *fsym = get_field_sym(l->type->sym, member->member.name);
             if (fsym) return fsym->type;
         }
+        /* ClassName.StaticField: obj names a class (not a shadowing local) and
+         * member is one of its static fields. */
+        if (!l && g && g->binder) {
+            zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                zan_symbol_t *fsym = get_field_sym(cs, member->member.name);
+                if (fsym) return fsym->type;
+            }
+        }
         /* not a local: could be an implicit `this` field whose own type is a
          * class, e.g. `field.subfield` inside a method. */
         if (g && g->current_type_sym) {
@@ -1641,6 +1650,16 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_THIS_EXPR:
         return g->current_type_sym ? g->current_type_sym->type : NULL;
     case AST_MEMBER_ACCESS: {
+        /* static field: ClassName.StaticField (class name, not a local). */
+        if (e->member.object->kind == AST_IDENTIFIER &&
+            !local_find(locals, e->member.object->ident.name)) {
+            zan_symbol_t *cs = zan_binder_lookup(g->binder,
+                                                 e->member.object->ident.name);
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                zan_symbol_t *fs = get_field_sym(cs, e->member.name);
+                if (fs) return fs->type;
+            }
+        }
         zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
         if (ot && ot->sym) {
             zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
@@ -8176,6 +8195,36 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     if (arc_nested) g->arc_stmt_depth--;
 }
 
+/* Release every RC-managed static field into its backing global at program
+ * exit, so long-lived singletons held in static fields do not leak. Mirrors
+ * the static-field initializer pass at main() entry. Runs before the leak
+ * report (which is scheduled via atexit and therefore fires afterwards). */
+static void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    zan_symbol_t *saved_type = g->current_type_sym;
+    for (int di = 0; di < unit->comp_unit.decls.count; di++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[di];
+        if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+        zan_symbol_t *csym = zan_binder_lookup(g->binder, d->type_decl.name);
+        if (!csym) continue;
+        g->current_type_sym = csym;
+        for (int mi = 0; mi < d->type_decl.members.count; mi++) {
+            zan_ast_node_t *m = d->type_decl.members.items[mi];
+            if (m->kind != AST_FIELD_DECL) continue;
+            if (!(m->field_decl.modifiers & MOD_STATIC)) continue;
+            zan_symbol_t *fs = get_field_sym(csym, m->field_decl.name);
+            if (!fs || !fs->type || !is_rc_managed_type(fs->type)) continue;
+            LLVMValueRef gv = get_static_field_global(g, csym, fs);
+            if (!gv) continue;
+            LLVMTypeRef ft = map_type(g, fs->type);
+            LLVMValueRef old = LLVMBuildLoad2(g->builder, ft, gv, "sf.rel");
+            emit_rc_release_for_type(g, fs->type, old);
+            LLVMBuildStore(g->builder, LLVMConstNull(ft), gv);
+        }
+    }
+    g->current_type_sym = saved_type;
+}
+
 /* ---- top-level emission ---- */
 
 static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_t *type_sym,
@@ -8273,6 +8322,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     /* add return 0 if no terminator */
     if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
         emit_release_owned_locals(g, locals);
+        emit_release_static_rc_fields(g, unit);
         LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
     }
     g->current_type_sym = NULL;
