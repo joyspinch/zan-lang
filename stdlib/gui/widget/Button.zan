@@ -17,6 +17,10 @@ class Button : Control {
     bool round;
     bool circle;
     bool block;
+    bool loading;
+    bool ghost;
+    bool secondary;
+    int customColor;
     int wid;
     /// Fires on the frame the button is clicked (C#-style: `btn.Click += h;`).
     UiEvent Click;
@@ -36,6 +40,10 @@ class Button : Control {
         round = false;
         circle = false;
         block = false;
+        loading = false;
+        ghost = false;
+        secondary = false;
+        customColor = 0;
         wid = WidgetId.Next();
         Click = UiEvent.Create();
     }
@@ -92,6 +100,35 @@ class Button : Control {
         return b;
     }
 
+    /// Secondary: a subtly tinted fill with type-colored text.
+    static Button Secondary(string text, int type) {
+        Button b = Button.Typed(text, type);
+        b.secondary = true;
+        return b;
+    }
+
+    /// Ghost: transparent fill with a type-colored border + text (reads on any
+    /// background).
+    static Button Ghost(string text, int type) {
+        Button b = Button.Typed(text, type);
+        b.ghost = true;
+        return b;
+    }
+
+    /// Loading: shows an animated spinner and ignores clicks until cleared.
+    static Button Loading(string text, int type) {
+        Button b = Button.Typed(text, type);
+        b.loading = true;
+        return b;
+    }
+
+    /// Custom color: a solid button painted from an arbitrary ARGB base color.
+    static Button Colored(string text, int color) {
+        Button b = Button.Create(text);
+        b.customColor = color;
+        return b;
+    }
+
     static Button IconTyped(string iconName, int type) {
         Button b = Button.IconOnly(iconName);
         b.btnType = type;
@@ -112,6 +149,21 @@ class Button : Control {
     Button SetCircle(bool c) { circle = c; return this; }
     Button SetBlock(bool b) { block = b; return this; }
     Button SetIcon(string i) { icon = i; return this; }
+    Button SetLoading(bool l) { loading = l; return this; }
+    Button SetGhost(bool g) { ghost = g; return this; }
+    Button SetSecondary(bool s) { secondary = s; return this; }
+    Button SetColor(int col) { customColor = col; return this; }
+
+    /// The button's semantic accent color for its type (default falls back to
+    /// the primary text color so tinted/ghost/text styles still read).
+    int TypeColor(Theme t) {
+        if (btnType == 1) { return t.primary; }
+        if (btnType == 2) { return t.info; }
+        if (btnType == 3) { return t.success; }
+        if (btnType == 4) { return t.warning; }
+        if (btnType == 5) { return t.error; }
+        return t.textPrimary;
+    }
 
     int GetHeight(Theme t) {
         if (size == 0) { return t.heightTiny; }
@@ -181,13 +233,46 @@ class Button : Control {
         }
 
         if (disabled) {
-            bgColor = t.bgDisabled;
-            fgColor = t.textDisabled;
-            borderColor = t.borderSecondary;
+            // A disabled button keeps a clearly visible muted, filled shape in
+            // both light and dark themes. bgDisabled/borderSecondary blend into
+            // the surrounding panel and read as an empty outline, so fill with
+            // the (opaque) border-grey and derive a readable-but-muted text and
+            // a subtle edge from it -- guaranteed contrast against any page.
+            bgColor = t.borderPrimary;
+            fgColor = App.LerpColor(t.borderPrimary, t.textPrimary, 110);
+            borderColor = App.LerpColor(t.borderPrimary, t.textPrimary, 45);
         }
 
-        // Render by style
-        if (btnStyle == 1) {
+        int tc = TypeColor(t);
+
+        // Modifier variants override the type/style palette resolved above.
+        // Custom color: solid button from an arbitrary base color.
+        if (customColor != 0 && !disabled) {
+            bgColor = customColor;
+            fgColor = t.textInverse;
+            if (pressed) { bgColor = App.LerpColor(customColor, 4278190080, 150); }
+            else if (hovered) { bgColor = App.LerpColor(customColor, 4294967295, 150); }
+            borderColor = bgColor;
+        }
+
+        // Render by style / variant
+        if ((ghost || secondary || customColor != 0) && !disabled) {
+            if (customColor != 0) {
+                c.FillRoundRect(x, y, w, h, radius, bgColor);
+            } else if (secondary) {
+                int sbg = App.LerpColor(t.bgPrimary, tc, 90);
+                if (pressed) { sbg = App.LerpColor(t.bgPrimary, tc, 200); }
+                else if (hovered) { sbg = App.LerpColor(t.bgPrimary, tc, 150); }
+                c.FillRoundRect(x, y, w, h, radius, sbg);
+                fgColor = tc;
+            } else {
+                // Ghost: transparent fill, type-colored border + text.
+                if (pressed) { c.FillRoundRect(x, y, w, h, radius, Chart.WithAlpha(tc, 55)); }
+                else if (hovered) { c.FillRoundRect(x, y, w, h, radius, Chart.WithAlpha(tc, 30)); }
+                c.DrawRect(x, y, w, h, tc, 1);
+                fgColor = tc;
+            }
+        } else if (btnStyle == 1) {
             // Outline
             int outlineColor = borderColor;
             if (!disabled && btnType > 0) { fgColor = outlineColor; }
@@ -211,17 +296,23 @@ class Button : Control {
             if (btnType == 0) { c.DrawRect(x, y, w, h, borderColor, 1); }
         }
 
-        // Content (icon + text), centered. Button glyphs read ~1.33x the text
-        // size (NaiveUI proportion) so icon buttons don't look undersized.
+        // Content (icon/spinner + text), centered. Button glyphs read ~1.33x
+        // the text size (NaiveUI proportion) so icon buttons don't look small.
         int contentW = 0;
         int iconSize = fontSize * 4 / 3;
-        if (icon != "") { contentW = contentW + iconSize; }
-        if (icon != "" && text != "") { contentW = contentW + t.gapSmall; }
+        bool lead = loading || icon != "";
+        if (lead) { contentW = contentW + iconSize; }
+        if (lead && text != "") { contentW = contentW + t.gapSmall; }
         if (text != "") { contentW = contentW + Canvas.MeasureText(text, fontSize); }
 
         int cx = x + (w - contentW) / 2;
         int iconY = y + (h - iconSize) / 2;
-        if (icon != "") {
+        if (loading) {
+            c.PushClip(x, y, w, h);
+            Spin.Render(app, cx + iconSize / 2, y + h / 2, iconSize / 2, fgColor);
+            c.PopClip();
+            cx = cx + iconSize + t.gapSmall;
+        } else if (icon != "") {
             Icon.Draw(c, icon, cx, iconY, iconSize, fgColor);
             cx = cx + iconSize + t.gapSmall;
         }
@@ -230,7 +321,7 @@ class Button : Control {
             c.DrawText(cx, textY, text, fgColor, fontSize);
         }
 
-        if (!disabled) {
+        if (!disabled && !loading) {
             app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
             app.focus.RegisterFocusable(id);
             bool fire = Ui.Clicked(app, id);
@@ -247,6 +338,60 @@ class Button : Control {
     static bool WasClicked(App app, int id) {
         if (app.window.EventKind() != 3) { return false; }
         return app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+    }
+
+    // --- Designer / serialization model ---
+
+    override string Kind() { return "Button"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("text", "Text"));
+        ps.Add(PropSpec.Text("icon", "Icon"));
+        PropSpec ty = PropSpec.Enum("type", "Type", new List<string>());
+        ty.Option("default"); ty.Option("primary"); ty.Option("info");
+        ty.Option("success"); ty.Option("warning"); ty.Option("error");
+        ps.Add(ty);
+        PropSpec st = PropSpec.Enum("style", "Style", new List<string>());
+        st.Option("solid"); st.Option("outline"); st.Option("text"); st.Option("dashed");
+        ps.Add(st);
+        ps.Add(PropSpec.Bool("disabled", "Disabled"));
+        ps.Add(PropSpec.Bool("round", "Round"));
+        ps.Add(PropSpec.Bool("secondary", "Secondary"));
+        ps.Add(PropSpec.Bool("ghost", "Ghost"));
+        ps.Add(PropSpec.Bool("loading", "Loading"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "text") { return text; }
+        if (key == "icon") { return icon; }
+        if (key == "type") { return Convert.ToString(btnType); }
+        if (key == "style") { return Convert.ToString(btnStyle); }
+        if (key == "disabled") { if (disabled) { return "true"; } return "false"; }
+        if (key == "round") { if (round) { return "true"; } return "false"; }
+        if (key == "secondary") { if (secondary) { return "true"; } return "false"; }
+        if (key == "ghost") { if (ghost) { return "true"; } return "false"; }
+        if (key == "loading") { if (loading) { return "true"; } return "false"; }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "text") { text = val; name = val; }
+        else if (key == "icon") { icon = val; }
+        else if (key == "type") { btnType = Convert.ToInt32(val); }
+        else if (key == "style") { btnStyle = Convert.ToInt32(val); }
+        else if (key == "disabled") { disabled = (val == "true"); }
+        else if (key == "round") { round = (val == "true"); }
+        else if (key == "secondary") { secondary = (val == "true"); }
+        else if (key == "ghost") { ghost = (val == "true"); }
+        else if (key == "loading") { loading = (val == "true"); }
+    }
+
+    override List<string> Events() {
+        List<string> e = new List<string>();
+        e.Add("Click");
+        return e;
     }
 
     // --- Retained-mode hooks (Control) ---

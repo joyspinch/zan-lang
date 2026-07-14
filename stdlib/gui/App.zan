@@ -28,6 +28,16 @@ class App {
     bool showPinButton;
     bool showMinimizeButton;
     bool showMaximizeButton;
+    // Title-bar theme picker. When themeNames is non-empty the theme caption
+    // button opens a dropdown menu listing these presets (a "color" glyph)
+    // instead of toggling dark/light; themeMenuChange fires on a new pick and
+    // themeMenuModel carries the chosen index. The option ids live in a stable
+    // high WidgetId block so they never collide with the caption button ids.
+    List<string> themeNames;
+    SignalInt themeMenuModel;
+    SignalBool themeMenuOpen;
+    int themeMenuBaseId;
+    UiEvent themeMenuChange;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
     // frame — e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
@@ -110,6 +120,11 @@ class App {
         app.showPinButton = true;
         app.showMinimizeButton = true;
         app.showMaximizeButton = true;
+        app.themeNames = new List<string>();
+        app.themeMenuModel = SignalInt.Create(0);
+        app.themeMenuOpen = SignalBool.Create(false);
+        app.themeMenuBaseId = 0;
+        app.themeMenuChange = UiEvent.Create();
         app.animKeys = new List<int>();
         app.animVals = new List<int>();
         app.animTarget = new List<int>();
@@ -142,6 +157,15 @@ class App {
         needsRedraw = true;
     }
 
+    /// Installs an arbitrary theme preset (re-applying DPI scaling). `dark`
+    /// controls dark-appropriate chrome details (caption hover wash, etc.).
+    void ApplyTheme(Theme t, bool dark) {
+        isDark = dark;
+        theme = t;
+        theme.ScaleByDpi(dpiScale);
+        needsRedraw = true;
+    }
+
     int ChromeButtonCount() {
         int count = 1;
         if (showThemeButton) { count = count + 1; }
@@ -162,6 +186,34 @@ class App {
         showMinimizeButton = minimizeButton;
         showMaximizeButton = maximizeButton;
         window.SetCaptionButtons(ChromeButtonCount());
+        needsRedraw = true;
+    }
+
+    /// Turns the title-bar theme caption button into a dropdown menu that lists
+    /// `names` (e.g. skin presets) instead of a plain dark/light toggle, and
+    /// keeps it in the ORIGINAL caption-button slot so it stays non-draggable.
+    /// Add a handler to the returned event to react to a pick, then read
+    /// ThemeMenuIndex(). Call once, before WidgetId.Mark(), so the option-id
+    /// block is stable for the app's lifetime.
+    UiEvent SetThemeMenu(List<string> names, int index) {
+        themeNames = names;
+        themeMenuModel.Set(index);
+        themeMenuBaseId = WidgetId.Block(names.Count);
+        showThemeButton = true;
+        window.SetCaptionButtons(ChromeButtonCount());
+        needsRedraw = true;
+        return themeMenuChange;
+    }
+
+    /// True when the title-bar theme button acts as a preset menu.
+    bool ThemeMenuMode() { return themeNames.Count > 0; }
+
+    /// Index currently selected in the title-bar theme menu.
+    int ThemeMenuIndex() { return themeMenuModel.Get(); }
+
+    /// Sync the menu selection without firing the change event (deep links).
+    void SetThemeMenuIndex(int i) {
+        themeMenuModel.Set(i);
         needsRedraw = true;
     }
 
@@ -271,11 +323,15 @@ class App {
         int gl = (t.iconSizeCaption * 6) / 5;
         int gcolor = t.textSecondary;
 
-        // Theme toggle: sun in light mode, moon in dark mode.
+        // Theme control: a "color" palette glyph when it opens a preset menu,
+        // otherwise the classic sun/moon dark-light toggle.
         int themeColor = gcolor;
-        if (themeH) { themeColor = t.textPrimary; }
+        if (themeH || (this.ThemeMenuMode() && themeMenuOpen.Get())) {
+            themeColor = t.textPrimary;
+        }
         string themeIcon = "moon";
         if (isDark) { themeIcon = "sun"; }
+        if (this.ThemeMenuMode()) { themeIcon = "color"; }
         if (showThemeButton) {
             Icon.DrawCenteredIn(
                 c, themeIcon, themeX, 0, bw, hbar, gl, themeColor);
@@ -332,7 +388,12 @@ class App {
         if (window.EventKind() == 3) {
             int hit = hitTester.HitTest(mouseX, mouseY);
             if (showThemeButton && hit == themeId) {
-                SetDark(!isDark);
+                if (this.ThemeMenuMode()) {
+                    themeMenuOpen.Set(!themeMenuOpen.Get());
+                    needsRedraw = true;
+                } else {
+                    SetDark(!isDark);
+                }
             } else if (showPinButton && hit == pinId) {
                 isTopmost = !isTopmost;
                 window.SetTopmost(isTopmost);
@@ -344,6 +405,19 @@ class App {
             } else if (hit == closeId) {
                 window.Close();
             }
+        }
+
+        // Defer the preset menu to the overlay layer so it drops above all
+        // content and its option hit regions win the z-order. Right-align the
+        // menu under the caption button; nudge it in if it would clip the edge.
+        if (this.ThemeMenuMode() && themeMenuOpen.Get()) {
+            int menuW = Scale(168);
+            int mx = themeX + bw - menuW;
+            if (mx < Scale(4)) { mx = Scale(4); }
+            int my = hbar + Scale(2);
+            AddOverlay(OverlayPopup.OptionList(mx, my, menuW, themeNames,
+                themeMenuBaseId, themeMenuModel, themeId, themeMenuOpen,
+                themeMenuChange));
         }
     }
 

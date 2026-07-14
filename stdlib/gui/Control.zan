@@ -23,6 +23,13 @@ class Control {
     string name;
     /// 0 manual, 1 top, 2 bottom, 3 left, 4 right, 5 fill.
     int dock;
+    /// Auto-flow for children added via With(): 0 none, 1 column, 2 row.
+    /// A container (see Panel.Column/Row) sets this so each With() child docks
+    /// along the flow axis automatically.
+    int layout;
+    /// When true this node should grow to fill the remaining main-axis space of
+    /// its flow parent (dock == fill), overriding the flow's default docking.
+    bool grow;
     /// Preferred main-axis extent used while docking (height for top/bottom,
     /// width for left/right). Ignored for a Fill child. A widget's OnMeasure
     /// typically sets these from the theme.
@@ -44,6 +51,10 @@ class Control {
     int bh;
     Control parent;
     List<Control> children;
+    /// Event-handler bindings for the designer/serializer: parallel lists mapping
+    /// an event name (see Events()) to a handler identifier. Empty when unbound.
+    List<string> evtKeys;
+    List<string> evtVals;
 
     /// Base initialiser every subclass calls from its factory/constructor.
     void InitControl(string n, int d) {
@@ -65,6 +76,10 @@ class Control {
         bh = 0;
         parent = null;
         children = new List<Control>();
+        evtKeys = new List<string>();
+        evtVals = new List<string>();
+        layout = 0;
+        grow = false;
     }
 
     Control Dock(int d) {
@@ -118,6 +133,92 @@ class Control {
         return c;
     }
 
+    /// Fluent child append: adds `c` and returns THIS container (not the child),
+    /// so several children can be chained — `panel.With(a).With(b).With(c)`. If
+    /// this node has a flow layout (column/row) the child is auto-docked along
+    /// the flow axis unless it opted into Grow().
+    Control With(Control c) {
+        if (layout != 0 && !c.grow) {
+            if (layout == 2) { c.dock = 3; } else { c.dock = 1; }
+        }
+        c.parent = this;
+        children.Add(c);
+        return this;
+    }
+
+    /// Marks this node to fill the remaining main-axis space of its flow parent.
+    Control Grow() {
+        grow = true;
+        dock = 5;
+        return this;
+    }
+
+    Control DockTop() { dock = 1; return this; }
+    Control DockBottom() { dock = 2; return this; }
+    Control DockLeft() { dock = 3; return this; }
+    Control DockRight() { dock = 4; return this; }
+    Control DockFill() { dock = 5; return this; }
+    Control DockManual() { dock = 0; return this; }
+
+    /// Fluent id setter, so a node built inline can still be located later with
+    /// Find() or targeted by the designer/serializer.
+    Control Named(string n) {
+        name = n;
+        return this;
+    }
+
+    int IndexOf(Control c) {
+        int i = 0;
+        while (i < children.Count) {
+            if (children[i] == c) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Detaches a child (no-op if not a child of this node).
+    void Remove(Control c) {
+        int idx = IndexOf(c);
+        if (idx >= 0) {
+            children.RemoveAt(idx);
+            c.parent = null;
+        }
+    }
+
+    /// Inserts a child at a position, clamped into range. Reparents `c`.
+    void InsertAt(int idx, Control c) {
+        int at = idx;
+        if (at < 0) { at = 0; }
+        if (at > children.Count) { at = children.Count; }
+        c.parent = this;
+        children.Insert(at, c);
+    }
+
+    /// Moves an existing child to a new index (for designer drag-reorder).
+    void MoveChild(Control c, int to) {
+        int idx = IndexOf(c);
+        if (idx < 0) { return; }
+        children.RemoveAt(idx);
+        int at = to;
+        if (at < 0) { at = 0; }
+        if (at > children.Count) { at = children.Count; }
+        children.Insert(at, c);
+    }
+
+    /// The deepest visible descendant whose resolved bounds contain the point,
+    /// preferring later (top-most) children. Used for designer hit-selection.
+    Control HitTest(int x, int y) {
+        if (!visible) { return null; }
+        if (x < bx || y < by || x >= bx + bw || y >= by + bh) { return null; }
+        int i = children.Count - 1;
+        while (i >= 0) {
+            Control hit = children[i].HitTest(x, y);
+            if (hit != null) { return hit; }
+            i = i - 1;
+        }
+        return this;
+    }
+
     /// Depth-first search by name, including this node. Returns null if absent.
     Control Find(string n) {
         if (name == n) {
@@ -136,6 +237,27 @@ class Control {
 
     int ChildCount() {
         return children.Count;
+    }
+
+    /// The handler bound to `evt`, or "" if none. Used by the event inspector.
+    string GetHandler(string evt) {
+        int i = 0;
+        while (i < evtKeys.Count) {
+            if (evtKeys[i] == evt) { return evtVals[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Binds (or rebinds) a handler identifier to `evt`.
+    void SetHandler(string evt, string h) {
+        int i = 0;
+        while (i < evtKeys.Count) {
+            if (evtKeys[i] == evt) { evtVals[i] = h; return; }
+            i = i + 1;
+        }
+        evtKeys.Add(evt);
+        evtVals.Add(h);
     }
 
     /// Lets a node set its preferred size from the theme, bottom-up (children
@@ -193,6 +315,37 @@ class Control {
 
     /// Sets prefW/prefH from content/theme. Base is a no-op; leaves override.
     virtual void OnMeasure(App app) {
+    }
+
+    // --- Designer / serialization model (uniform, cast-free via virtuals) ---
+
+    /// Stable type tag used to reconstruct this node (see ControlFactory). Every
+    /// concrete widget overrides it; the base tag is only a fallback.
+    virtual string Kind() {
+        return "Control";
+    }
+
+    /// Widget-specific editable properties for the inspector and serializer.
+    /// Common geometry (dock/pad/gap/size/pos/name) is handled by Serialize, so
+    /// this returns only the properties unique to the widget. Base has none.
+    virtual List<PropSpec> Props() {
+        return new List<PropSpec>();
+    }
+
+    /// Declared event names for the designer's event inspector. Base has none;
+    /// widgets that expose C#-style events (e.g. Button.Click) override this.
+    virtual List<string> Events() {
+        return new List<string>();
+    }
+
+    /// Reads a property by key as text. Base knows nothing; widgets override for
+    /// the keys they publish in Props().
+    virtual string GetProp(string key) {
+        return "";
+    }
+
+    /// Writes a property by key from text. Base ignores; widgets override.
+    virtual void SetProp(string key, string val) {
     }
 
     /// Renders the subtree: self, then children clipped to this node's box so a
@@ -271,4 +424,15 @@ class Form : Control {
             app.PresentFrame();
         }
     }
+}
+
+/// Named dock values, so trees read `.Dock(Dock.Top())` instead of a magic
+/// number. (The language has no static-field constants, hence static methods.)
+class Dock {
+    static int Manual() { return 0; }
+    static int Top() { return 1; }
+    static int Bottom() { return 2; }
+    static int Left() { return 3; }
+    static int Right() { return 4; }
+    static int Fill() { return 5; }
 }

@@ -289,6 +289,115 @@ EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 co
     }
 }
 
+/* Vertical linear gradient fill: each row is a lerp between color_top (at y)
+ * and color_bottom (at y+h-1). Opaque; used for modern gradient wallpapers
+ * (AI / Aurora / Glass backdrops). Single pass, no allocation. */
+EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
+                               i64 color_top, i64 color_bottom) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rh = (int)h;
+    if (rh < 1) rh = 1;
+    int denom = rh > 1 ? rh - 1 : 1;
+    u32 ct = (u32)color_top, cb = (u32)color_bottom;
+    int tr = (ct >> 16) & 0xFF, tg = (ct >> 8) & 0xFF, tb = ct & 0xFF;
+    int mr = (cb >> 16) & 0xFF, mg = (cb >> 8) & 0xFF, mb = cb & 0xFF;
+    for (int py = y0; py < y1; py++) {
+        int num = py - (int)y;
+        if (num < 0) num = 0;
+        if (num > rh - 1) num = rh - 1;
+        int rr = tr + (mr - tr) * num / denom;
+        int gg = tg + (mg - tg) * num / denom;
+        int bb = tb + (mb - tb) * num / denom;
+        u32 c = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+        u32 *row = s->pixels + py * s->stride;
+        for (int px = x0; px < x1; px++) row[px] = c;
+    }
+}
+
+/* Backdrop blur: separable box blur (3 passes ~ Gaussian) over a rectangular
+ * region, in place. Used to render frosted-glass panels — draw the backdrop,
+ * blur the region behind a panel, then overlay a translucent tint. Alpha is
+ * forced opaque (the backdrop under an overlay is opaque). Edge samples are
+ * clamped to the region. Cost is O(passes * area), independent of radius. */
+EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 radius) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    int r = (int)radius;
+    if (r < 1) return;
+    if (r > 40) r = 40;
+
+    size_t n = (size_t)rw * (size_t)rh;
+    u32 *a = (u32 *)malloc(n * sizeof(u32));
+    u32 *b = (u32 *)malloc(n * sizeof(u32));
+    if (!a || !b) { free(a); free(b); return; }
+
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        for (int i = 0; i < rw; i++) a[j * rw + i] = row[i];
+    }
+
+    int win = 2 * r + 1;
+    for (int p = 0; p < 3; p++) {
+        /* horizontal: a -> b */
+        for (int j = 0; j < rh; j++) {
+            u32 *src = a + j * rw;
+            u32 *dst = b + j * rw;
+            int sr = 0, sg = 0, sb = 0;
+            for (int k = -r; k <= r; k++) {
+                int ii = clamp_i(k, 0, rw - 1);
+                u32 px = src[ii];
+                sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
+            }
+            for (int i = 0; i < rw; i++) {
+                dst[i] = 0xFF000000u | ((u32)(sr / win) << 16)
+                       | ((u32)(sg / win) << 8) | (u32)(sb / win);
+                u32 pa = src[clamp_i(i + r + 1, 0, rw - 1)];
+                u32 ps = src[clamp_i(i - r, 0, rw - 1)];
+                sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+                sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
+                sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
+            }
+        }
+        /* vertical: b -> a */
+        for (int i = 0; i < rw; i++) {
+            int sr = 0, sg = 0, sb = 0;
+            for (int k = -r; k <= r; k++) {
+                int jj = clamp_i(k, 0, rh - 1);
+                u32 px = b[jj * rw + i];
+                sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
+            }
+            for (int j = 0; j < rh; j++) {
+                a[j * rw + i] = 0xFF000000u | ((u32)(sr / win) << 16)
+                              | ((u32)(sg / win) << 8) | (u32)(sb / win);
+                u32 pa = b[clamp_i(j + r + 1, 0, rh - 1) * rw + i];
+                u32 ps = b[clamp_i(j - r, 0, rh - 1) * rw + i];
+                sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+                sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
+                sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
+            }
+        }
+    }
+
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        for (int i = 0; i < rw; i++) row[i] = a[j * rw + i];
+    }
+    free(a); free(b);
+}
+
 EXPORT void zan_gui_draw_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color, i64 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
