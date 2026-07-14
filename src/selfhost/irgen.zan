@@ -377,6 +377,8 @@ class Irgen {
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
         H("@.msg.unhandled = private unnamed_addr constant [21 x i8] c\"Unhandled exception\\0A\\00\"");
+        H("@.msg.rderr = private unnamed_addr constant [18 x i8] c\"cannot read file\\0A\\00\"");
+        H("@.msg.wrerr = private unnamed_addr constant [19 x i8] c\"cannot write file\\0A\\00\"");
         EmitArcRuntime();
         EmitListRuntime();
         EmitSbRuntime();
@@ -1117,6 +1119,21 @@ class Irgen {
             L("  ret void");
         }
         L("}");
+    }
+
+    // After a fopen, branch to a fail block that reports the error and exits 1
+    // when the returned pointer is null, so a missing input or unwritable
+    // output fails cleanly instead of dereferencing null (which crashed).
+    void EmitFopenCheck(string fp, string msg, int len) {
+        string np = NT(); L("  " + np + " = icmp eq i8* " + fp + ", null");
+        int lf = NL(); int lk = NL();
+        L("  br i1 " + np + ", label %L" + lf + ", label %L" + lk);
+        Label(lf);
+        string em = NT(); L("  " + em + " = getelementptr inbounds [" + len + " x i8], [" + len + " x i8]* " + msg + ", i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + em + ")");
+        L("  call void @exit(i32 1)");
+        L("  unreachable");
+        Label(lk);
     }
 
     void GenMainWrapper(Node unit) {
@@ -2736,6 +2753,7 @@ class Irgen {
                 ExprVal path = GenExpr(e.kids[0]);
                 string rb = NT(); L("  " + rb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_rb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + rb + ")");
+                EmitFopenCheck(fp, "@.msg.rderr", 18);
                 L("  call i32 @fseek(i8* " + fp + ", i64 0, i32 2)");
                 string sz = NT(); L("  " + sz + " = call i64 @ftell(i8* " + fp + ")");
                 L("  call i32 @fseek(i8* " + fp + ", i64 0, i32 0)");
@@ -2752,6 +2770,7 @@ class Irgen {
                 ExprVal content = GenExpr(e.kids[1]);
                 string wb = NT(); L("  " + wb + " = getelementptr inbounds [2 x i8], [2 x i8]* @.mode_wb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + wb + ")");
+                EmitFopenCheck(fp, "@.msg.wrerr", 19);
                 string ln = NT(); L("  " + ln + " = call i64 @strlen(i8* " + content.op + ")");
                 L("  call i64 @fwrite(i8* " + content.op + ", i64 1, i64 " + ln + ", i8* " + fp + ")");
                 L("  call i32 @fclose(i8* " + fp + ")");

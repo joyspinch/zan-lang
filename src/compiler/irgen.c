@@ -2528,6 +2528,29 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     emit_rc_release_for_type(g, type, old);
 }
 
+/* Emit an unconditional guard for a fopen result: if `fp` is null, print
+ * `msg` and exit(1), then continue in a fresh block. Unlike
+ * emit_runtime_check this always fires -- file I/O errors are not optional
+ * and must fail cleanly instead of dereferencing a null FILE*. */
+static void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg) {
+    if (!g->current_fn) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef isnull = LLVMBuildICmp(g->builder, LLVMIntEQ, fp,
+        LLVMConstPointerNull(i8ptr), "fp.isnull");
+    LLVMBasicBlockRef fail_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "io.fail");
+    LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "io.cont");
+    LLVMBuildCondBr(g->builder, isnull, fail_bb, cont_bb);
+    LLVMPositionBuilderAtEnd(g->builder, fail_bb);
+    LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, msg, "ioerr");
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "ioerr_fmt");
+    LLVMValueRef pargs[] = { fmt, text };
+    LLVMBuildCall2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
+    LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0);
+    LLVMBuildCall2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
+    LLVMBuildUnreachable(g->builder);
+    LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+}
+
 /* Emit a runtime guard: when `is_error` is true at runtime, print
  * "<file>:<line>:<col>: runtime error: <msg>" and exit(70). Execution
  * continues (in a fresh block) on the non-error path. No-op when runtime
@@ -4129,6 +4152,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef fp = LLVMBuildCall2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, open_args, 2, "fp");
+            emit_fopen_check(g, fp, "cannot read file\n");
             /* seek to end, get size */
             LLVMValueRef seek_end_args[] = { fp, LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 2, 0) };
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
@@ -4185,6 +4209,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef fp = LLVMBuildCall2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, open_args, 2, "fp");
+            emit_fopen_check(g, fp, "cannot write file\n");
             LLVMValueRef fputs_args[] = { content_arg, fp };
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fputs_fn, fputs_args, 2, "");
@@ -4298,6 +4323,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef fp = LLVMBuildCall2(g->builder,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fopen_fn, open_args, 2, "fp");
+            emit_fopen_check(g, fp, "cannot write file\n");
             LLVMValueRef fputs_args[] = { content_arg, fp };
             LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
                 fputs_fn, fputs_args, 2, "");
