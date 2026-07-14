@@ -63,6 +63,19 @@ class App {
     int lastClickId;
     int lastClickMs;
     bool doubleClickNow;
+    // Touch/pointer gesture state. On a press we snapshot the target id, the
+    // pointer position and the wall-clock time; on release we derive a swipe
+    // direction from the travel, and while held PollLongPress() reports a
+    // long-press once the hold passes the threshold without much movement.
+    // Single-finger touch arrives as a synthesized mouse sequence, so these
+    // work on touchscreens without any runtime change (multi-touch/pinch would
+    // need real WM_TOUCH / XInput2 support in the C runtime).
+    int pressStartX;
+    int pressStartY;
+    int pressStartMs;
+    int pressStartId;
+    bool longPressFired;
+    int swipeDir;
     // Deferred overlay popups (Select/SelectBox/Dropdown/Menu option lists).
     // They run AFTER the main content pass so they both paint above it and
     // register their hit regions last (making them the top-most target). Data,
@@ -133,6 +146,12 @@ class App {
         app.lastClickId = -1;
         app.lastClickMs = 0;
         app.doubleClickNow = false;
+        app.pressStartX = 0;
+        app.pressStartY = 0;
+        app.pressStartMs = 0;
+        app.pressStartId = -1;
+        app.longPressFired = false;
+        app.swipeDir = 0;
         app.overlays = new List<OverlayPopup>();
         app.isDark = false;
         app.isTopmost = false;
@@ -786,6 +805,7 @@ class App {
             focus.SetPressed(hitId);
             focus.SetFocused(hitId);
             pressTargetId = hitId;
+            NotePressStart(hitId, mouseX, mouseY);
             needsRedraw = true;
         }
 
@@ -796,6 +816,7 @@ class App {
             // hit regions (popups included, top-most wins) before BeginFrame
             // clears them, so exactly one widget sees Ui.Clicked this frame.
             clickTargetId = hitTester.HitTest(mouseX, mouseY);
+            NoteRelease(mouseX, mouseY);
             NoteClickTarget(clickTargetId);
             focus.ClearPress();
             needsRedraw = true;
@@ -912,6 +933,7 @@ class App {
             focus.SetPressed(hitId);
             focus.SetFocused(hitId);
             pressTargetId = hitId;
+            NotePressStart(hitId, mouseX, mouseY);
             needsRedraw = true;
         }
 
@@ -919,6 +941,7 @@ class App {
             mouseX = window.EventX();
             mouseY = window.EventY();
             clickTargetId = hitTester.HitTest(mouseX, mouseY);
+            NoteRelease(mouseX, mouseY);
             NoteClickTarget(clickTargetId);
             focus.ClearPress();
             needsRedraw = true;
@@ -1048,5 +1071,61 @@ class App {
         }
         lastClickId = id;
         lastClickMs = t;
+    }
+
+    /// Snapshots the press target/position/time so gestures (swipe, long-press)
+    /// can be derived from the press onward. Called from the mouse-down paths.
+    void NotePressStart(int id, int x, int y) {
+        pressStartId = id;
+        pressStartX = x;
+        pressStartY = y;
+        pressStartMs = Window.GetTickMs();
+        longPressFired = false;
+        swipeDir = 0;
+    }
+
+    /// Derives a swipe direction from the press-to-release travel: 0 none,
+    /// 1 left, 2 right, 3 up, 4 down. Called from the mouse-up paths, so it is
+    /// valid to read (via SwipeDir) on a release frame.
+    void NoteRelease(int x, int y) {
+        int dx = x - pressStartX;
+        int dy = y - pressStartY;
+        int adx = dx; if (adx < 0) { adx = -adx; }
+        int ady = dy; if (ady < 0) { ady = -ady; }
+        swipeDir = 0;
+        if (adx >= 48 || ady >= 48) {
+            if (adx >= ady) {
+                if (dx < 0) { swipeDir = 1; } else { swipeDir = 2; }
+            } else {
+                if (dy < 0) { swipeDir = 3; } else { swipeDir = 4; }
+            }
+        }
+    }
+
+    /// Swipe direction resolved on the current release frame (see NoteRelease).
+    int SwipeDir() { return swipeDir; }
+    /// The widget the in-flight gesture started on (press target).
+    int SwipeTarget() { return pressStartId; }
+
+    /// Reports a long press on `id` once the pointer has been held on it past
+    /// the threshold without moving far. Arms a low-cadence follow-up frame
+    /// while holding so the timer advances even with no further input; returns
+    /// true exactly once per press. Movement beyond a small slop cancels it
+    /// (the gesture is then a drag/swipe, not a long press).
+    bool PollLongPress(int id) {
+        if (longPressFired) { return false; }
+        if (focus.pressedId != id) { return false; }
+        if (pressStartId != id) { return false; }
+        int mdx = mouseX - pressStartX; if (mdx < 0) { mdx = -mdx; }
+        int mdy = mouseY - pressStartY; if (mdy < 0) { mdy = -mdy; }
+        if (mdx > 12 || mdy > 12) { longPressFired = true; return false; }
+        int t = Window.GetTickMs();
+        if ((t - pressStartMs) >= 500) {
+            longPressFired = true;
+            RequestRedraw();
+            return true;
+        }
+        RequestAnimationFrame(80);
+        return false;
     }
 }
