@@ -388,6 +388,25 @@ add_test(NAME conformance_minic
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
+#      clang-compile + run + diff stdout, and verify malformed input fails
+#      closed (non-zero, no .ll). clang is optional -- without it the stdout
+#      stage is skipped and the harness still proves gen1 builds and emits IR. ----
+find_program(SELFHOST_CLANG NAMES clang)
+add_test(NAME selfhost_gen1
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.out
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
+    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_gen1.ll
+    -DCLANG=${SELFHOST_CLANG}
+    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan
+    -DBADLL=${CMAKE_BINARY_DIR}/selfhost_bad.ll
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
+set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
+
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----
 # These programs import Gui modules that reference [DllImport("zan_gui")], so the
 # produced executable must link zan_gui. zanc resolves [DllImport] libs against
