@@ -376,6 +376,7 @@ class Irgen {
         H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
+        H("@.msg.unhandled = private unnamed_addr constant [21 x i8] c\"Unhandled exception\\0A\\00\"");
         EmitArcRuntime();
         EmitListRuntime();
         EmitSbRuntime();
@@ -1133,8 +1134,27 @@ class Irgen {
         L("entry:");
         L("  store i32 %argc, i32* @__zan_argc");
         L("  store i8** %argv, i8*** @__zan_argv");
+        // Install a root exception handler so an uncaught throw prints a
+        // message and exits 1 instead of longjmp-ing through an empty stack.
+        string rbuf = NT(); L("  " + rbuf + " = alloca [32 x i64]");
+        string rbp = NT(); L("  " + rbp + " = bitcast [32 x i64]* " + rbuf + " to i8*");
+        string rsp = NT(); L("  " + rsp + " = load i64, i64* @__exc_sp");
+        string rslot = NT(); L("  " + rslot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + rsp);
+        L("  store i8* " + rbp + ", i8** " + rslot);
+        string rsp1 = NT(); L("  " + rsp1 + " = add i64 " + rsp + ", 1");
+        L("  store i64 " + rsp1 + ", i64* @__exc_sp");
+        string rfp = NT(); L("  " + rfp + " = call i8* @llvm.frameaddress.p0(i32 0)");
+        string rr = NT(); L("  " + rr + " = call i32 @_setjmp(i8* " + rbp + ", i8* " + rfp + ")");
+        string rc = NT(); L("  " + rc + " = icmp ne i32 " + rr + ", 0");
+        int lbody = NL(); int lcatch = NL();
+        L("  br i1 " + rc + ", label %L" + lcatch + ", label %L" + lbody);
+        Label(lbody);
         L("  call void @" + owner + "_Main()");
         L("  ret i32 0");
+        Label(lcatch);
+        string mp = NT(); L("  " + mp + " = getelementptr inbounds [21 x i8], [21 x i8]* @.msg.unhandled, i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + mp + ")");
+        L("  ret i32 1");
         L("}");
     }
 
