@@ -391,11 +391,162 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
         }
     }
 
+    /* Vibrancy: push each blurred pixel's saturation up (~1.4x) so the frosted
+     * backdrop keeps the colour of the wallpaper behind it -- the hallmark of
+     * Apple-style glass -- instead of washing out to a flat grey once a
+     * translucent tint is laid over it. Luma-preserving so brightness holds. */
     for (int j = 0; j < rh; j++) {
         u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-        for (int i = 0; i < rw; i++) row[i] = a[j * rw + i];
+        for (int i = 0; i < rw; i++) {
+            u32 px = a[j * rw + i];
+            int rr = (int)((px >> 16) & 0xFF);
+            int gg = (int)((px >> 8) & 0xFF);
+            int bb = (int)(px & 0xFF);
+            int luma = (rr * 77 + gg * 150 + bb * 29) >> 8;
+            rr = luma + (rr - luma) * 7 / 5;
+            gg = luma + (gg - luma) * 7 / 5;
+            bb = luma + (bb - luma) * 7 / 5;
+            rr = clamp_i(rr, 0, 255);
+            gg = clamp_i(gg, 0, 255);
+            bb = clamp_i(bb, 0, 255);
+            row[i] = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+        }
     }
     free(a); free(b);
+}
+
+/* --- Frosted-glass blur cache ---------------------------------------------
+ * Live Gaussian blur is the dominant per-frame cost under the glass theme: an
+ * on-screen animation (spinner, toast) repaints the whole page, and every glass
+ * panel re-blurs its otherwise-static backdrop. Each slot snapshots the blurred
+ * output so animation-only frames (dirty==0, geometry unchanged) restore the
+ * cached pixels with a plain copy instead of recomputing the blur. The caller
+ * passes dirty==1 whenever the content behind the glass may have changed
+ * (input, scroll, resize, theme) and a stable slot id per glass surface. */
+#define ZAN_BLUR_CACHE_SLOTS 64
+typedef struct {
+    int valid;
+    int x0, y0, rw, rh, r;
+    u32 *pixels;
+    size_t cap;
+} zan_blur_cache_t;
+static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
+
+EXPORT void zan_gui_blur_rect_cached(i64 surface_id, i64 x, i64 y, i64 w,
+                                     i64 h, i64 radius, i64 slot, i64 dirty) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    if (slot < 0 || slot >= ZAN_BLUR_CACHE_SLOTS) {
+        zan_gui_blur_rect(surface_id, x, y, w, h, radius);
+        return;
+    }
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    int r = (int)radius;
+    if (r < 1) return;
+    if (r > 40) r = 40;
+
+    zan_blur_cache_t *c = &g_blur_cache[slot];
+    size_t n = (size_t)rw * (size_t)rh;
+
+    /* Reuse path: same geometry, not dirtied -> restore cached blurred pixels
+     * over the (freshly redrawn, identical) backdrop without re-blurring. */
+    if (!dirty && c->valid && c->pixels
+        && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
+        && c->r == r) {
+        for (int j = 0; j < rh; j++) {
+            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+            u32 *src = c->pixels + (size_t)j * rw;
+            for (int i = 0; i < rw; i++) row[i] = src[i];
+        }
+        return;
+    }
+
+    /* Recompute in place (identical clamping), then snapshot into the slot. */
+    zan_gui_blur_rect(surface_id, x, y, w, h, radius);
+    if (c->cap < n) {
+        u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
+        if (!np) { c->valid = 0; return; }
+        c->pixels = np;
+        c->cap = n;
+    }
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        u32 *dst = c->pixels + (size_t)j * rw;
+        for (int i = 0; i < rw; i++) dst[i] = row[i];
+    }
+    c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
+    c->valid = 1;
+}
+
+/* --- Static-backdrop snapshot cache ---------------------------------------
+ * Even with the blur cached, an on-screen animation still re-paints the whole
+ * page every frame -- and under glass the wallpaper (a gradient plus several
+ * large alpha-blended blobs) is by far the most expensive part of that. These
+ * slots snapshot a region's pixels after it is drawn; on animation-only frames
+ * the caller restores the snapshot with a single copy instead of re-painting
+ * the backdrop. Geometry must match (else restore reports failure and the
+ * caller repaints normally, e.g. after a resize). */
+#define ZAN_SNAP_CACHE_SLOTS 8
+static zan_blur_cache_t g_snap_cache[ZAN_SNAP_CACHE_SLOTS];
+
+EXPORT void zan_gui_snapshot_rect(i64 surface_id, i64 x, i64 y, i64 w,
+                                  i64 h, i64 slot) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    zan_blur_cache_t *c = &g_snap_cache[slot];
+    size_t n = (size_t)rw * (size_t)rh;
+    if (c->cap < n) {
+        u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
+        if (!np) { c->valid = 0; return; }
+        c->pixels = np;
+        c->cap = n;
+    }
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        u32 *dst = c->pixels + (size_t)j * rw;
+        for (int i = 0; i < rw; i++) dst[i] = row[i];
+    }
+    c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = 0;
+    c->valid = 1;
+}
+
+EXPORT i64 zan_gui_restore_rect(i64 surface_id, i64 x, i64 y, i64 w,
+                                i64 h, i64 slot) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return 0;
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return 0;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return 0;
+    zan_blur_cache_t *c = &g_snap_cache[slot];
+    if (!c->valid || !c->pixels
+        || c->x0 != x0 || c->y0 != y0 || c->rw != rw || c->rh != rh) {
+        return 0;
+    }
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        u32 *src = c->pixels + (size_t)j * rw;
+        for (int i = 0; i < rw; i++) row[i] = src[i];
+    }
+    return 1;
 }
 
 EXPORT void zan_gui_draw_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color, i64 thickness) {

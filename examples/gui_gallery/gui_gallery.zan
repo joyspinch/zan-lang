@@ -223,6 +223,14 @@ class Gallery {
     static ScrollView detailView;
     // Content height measured on the previous frame (fed back to the view).
     static SignalInt detailContentH;
+    // Visible detail viewport bounds (set each frame by RenderDetail) so the
+    // glass backdrop blur can be clamped to it -- BlurRect ignores the clip
+    // rect, so without this a scrolled card would smear pixels above/below.
+    static int detailClipTop;
+    static int detailClipBottom;
+    // Wall-clock of the last mouse-motion-driven repaint, used to throttle
+    // hover refreshes so dragging the pointer never spins the CPU.
+    static int lastMotionMs;
     static ScrollView navView;
     static TabBar tbLine;
     static TabBar tbCard;
@@ -362,15 +370,11 @@ class Gallery {
         List<string> themeNames = new List<string>();
         themeNames.Add("Dark");
         themeNames.Add("Light");
-        themeNames.Add("Nord");
-        themeNames.Add("Dracula");
-        themeNames.Add("One Dark");
-        themeNames.Add("GitHub");
-        themeNames.Add("Solarized");
-        themeNames.Add("Office");
-        themeNames.Add("AI Gradient");
-        themeNames.Add("Aurora");
-        themeNames.Add("Glass");
+        themeNames.Add("Liquid Glass");
+        themeNames.Add("Neumorphism");
+        themeNames.Add("Neon");
+        themeNames.Add("Brutalism");
+        themeNames.Add("Chinese");
         app.SetThemeMenu(themeNames, 0).Add(Gallery.OnThemeChange);
         // Optional deep-link: `gallery_test.exe <ComponentName>` lands directly
         // on that component (used for screenshot/verification and handy nav).
@@ -392,15 +396,12 @@ class Gallery {
                 string a = Environment.ArgAt(ti);
                 if (a == "light") { Gallery.SelectTheme(app, 1); }
                 else if (a == "dark") { Gallery.SelectTheme(app, 0); }
-                else if (a == "nord") { Gallery.SelectTheme(app, 2); }
-                else if (a == "dracula") { Gallery.SelectTheme(app, 3); }
-                else if (a == "onedark") { Gallery.SelectTheme(app, 4); }
-                else if (a == "github") { Gallery.SelectTheme(app, 5); }
-                else if (a == "solarized") { Gallery.SelectTheme(app, 6); }
-                else if (a == "office") { Gallery.SelectTheme(app, 7); }
-                else if (a == "aigradient") { Gallery.SelectTheme(app, 8); }
-                else if (a == "aurora") { Gallery.SelectTheme(app, 9); }
-                else if (a == "glass") { Gallery.SelectTheme(app, 10); }
+                else if (a == "liquidglass") { Gallery.SelectTheme(app, 2); }
+                else if (a == "glass") { Gallery.SelectTheme(app, 2); }
+                else if (a == "neumorph") { Gallery.SelectTheme(app, 3); }
+                else if (a == "neon") { Gallery.SelectTheme(app, 4); }
+                else if (a == "brutalism") { Gallery.SelectTheme(app, 5); }
+                else if (a == "chinese") { Gallery.SelectTheme(app, 6); }
                 ti = ti + 1;
             }
             if (Environment.ArgCount() > 1 && Environment.ArgAt(1) == "open") {
@@ -453,9 +454,20 @@ class Gallery {
             // press, release, wheel, keys) rather than only when the framework
             // flags a repaint. ProcessEvent blocks when idle, so this doesn't spin.
             int ek = app.window.EventKind();
-            bool inputEv = ek == 1 || ek == 2 || ek == 3
-                || ek == 13 || ek == 4 || ek == 6;
-            if (!app.needsRedraw && !inputEv) { continue; }
+            // Press / release / wheel / focus always force a repaint. Pointer
+            // motion (ek==1) only needs one when the framework already flagged
+            // a change (hover crossed a hit region, a drag is in progress) --
+            // but the gallery also draws mouse-driven hover on elements it
+            // hit-tests inline (code tabs, icon grid), so still refresh on
+            // motion, throttled to ~30fps so moving the pointer over a busy
+            // page (or the glass theme's per-frame blur) can't peg the CPU.
+            bool inputEv = ek == 2 || ek == 3 || ek == 13 || ek == 4 || ek == 6;
+            if (!app.needsRedraw && !inputEv) {
+                if (ek != 1) { continue; }
+                int nowMotion = Window.GetTickMs();
+                if (nowMotion - Gallery.lastMotionMs < 33) { continue; }
+                Gallery.lastMotionMs = nowMotion;
+            }
             app.BeginFrame();
             // Pure immediate-mode page: every preview widget is rebuilt each
             // frame, so rewind the widget-id counter here to keep ids stable
@@ -521,21 +533,72 @@ class Gallery {
     /// Installs the preset for index `i` (see the themeNames order).
     static void ApplyThemeIndex(App app, int i) {
         if (i == 1) { app.ApplyTheme(Theme.Light(), false); }
-        else if (i == 2) { app.ApplyTheme(Theme.Nord(), true); }
-        else if (i == 3) { app.ApplyTheme(Theme.Dracula(), true); }
-        else if (i == 4) { app.ApplyTheme(Theme.OneDark(), true); }
-        else if (i == 5) { app.ApplyTheme(Theme.Github(), false); }
-        else if (i == 6) { app.ApplyTheme(Theme.Solarized(), false); }
-        else if (i == 7) { app.ApplyTheme(Theme.Office(), false); }
-        else if (i == 8) { app.ApplyTheme(Theme.AiGradient(), true); }
-        else if (i == 9) { app.ApplyTheme(Theme.Aurora(), true); }
-        else if (i == 10) { app.ApplyTheme(Theme.Glass(), true); }
+        else if (i == 2) { app.ApplyTheme(Theme.LiquidGlass(), true); }
+        else if (i == 3) { app.ApplyTheme(Theme.Neumorph(), false); }
+        else if (i == 4) { app.ApplyTheme(Theme.Neon(), true); }
+        else if (i == 5) { app.ApplyTheme(Theme.Brutalist(), false); }
+        else if (i == 6) { app.ApplyTheme(Theme.Chinese(), false); }
         else { app.ApplyTheme(Theme.Dark(), true); }
     }
 
     // ------------------------------------------------------------------
     // Layout
     // ------------------------------------------------------------------
+
+    /// One soft wallpaper glow: concentric translucent disks of a single hue
+    /// that build up to a bright centre with a feathered edge (no hard circle
+    /// rim), so the blurred glass panels above pick up real colour.
+    static void GlassBlob(Canvas c, int cx, int cy, int r, int cr, int cg, int cb) {
+        c.FillCircle(cx, cy, r, Theme.Rgba(cr, cg, cb, 28));
+        c.FillCircle(cx, cy, r * 72 / 100, Theme.Rgba(cr, cg, cb, 36));
+        c.FillCircle(cx, cy, r * 46 / 100, Theme.Rgba(cr, cg, cb, 48));
+        c.FillCircle(cx, cy, r * 24 / 100, Theme.Rgba(cr, cg, cb, 58));
+    }
+
+    /// One soft glow, coloured from a packed ARGB theme accent.
+    static void DriftBlob(Canvas c, int cx, int cy, int r, int color) {
+        int cr = (color / 65536) % 256;
+        int cg = (color / 256) % 256;
+        int cb = color % 256;
+        Gallery.GlassBlob(c, cx, cy, r, cr, cg, cb);
+    }
+
+    /// Richer wallpaper for the non-glass gradient presets (Gradient/Aurora):
+    /// a few big soft colour blobs over the vertical gradient so the backdrop
+    /// has depth instead of a flat ramp. Colours come from the theme's own
+    /// accents so each preset keeps its identity. Painted once per redraw (no
+    /// continuous animation -- that pegged the software renderer).
+    static void GradientWallpaper(App app, Canvas c, Theme t, Rect area) {
+        int ax = area.x;
+        int ay = area.y;
+        int aw = area.width;
+        int ah = area.height;
+        int r = app.Scale(340);
+        Gallery.DriftBlob(c, ax + aw * 20 / 100, ay + ah * 24 / 100, r, t.primary);
+        Gallery.DriftBlob(c, ax + aw * 74 / 100, ay + ah * 18 / 100, r, t.info);
+        Gallery.DriftBlob(c, ax + aw * 82 / 100, ay + ah * 72 / 100, r, t.success);
+        Gallery.DriftBlob(c, ax + aw * 30 / 100, ay + ah * 84 / 100, r, t.error);
+    }
+
+    /// Paints an iOS-style multi-colour wallpaper over the glass gradient.
+    static void GlassWallpaper(App app, Canvas c, Rect area) {
+        int ax = area.x;
+        int ay = area.y;
+        int aw = area.width;
+        int ah = area.height;
+        Gallery.GlassBlob(c, ax + aw * 14 / 100, ay + ah * 20 / 100,
+                          app.Scale(320), 128, 96, 245);
+        Gallery.GlassBlob(c, ax + aw * 40 / 100, ay + ah * 34 / 100,
+                          app.Scale(300), 236, 120, 175);
+        Gallery.GlassBlob(c, ax + aw * 78 / 100, ay + ah * 16 / 100,
+                          app.Scale(320), 96, 156, 255);
+        Gallery.GlassBlob(c, ax + aw * 62 / 100, ay + ah * 72 / 100,
+                          app.Scale(340), 240, 112, 196);
+        Gallery.GlassBlob(c, ax + aw * 30 / 100, ay + ah * 86 / 100,
+                          app.Scale(300), 96, 222, 208);
+        Gallery.GlassBlob(c, ax + aw * 90 / 100, ay + ah * 58 / 100,
+                          app.Scale(280), 156, 120, 250);
+    }
 
     static void Render(App app) {
         Canvas c = app.canvas;
@@ -545,8 +608,30 @@ class Gallery {
         int h = c.Height();
         Rect area = Rect.Create(0, top, w, h - top);
         if (t.gradient != 0) {
-            c.FillVGrad(area.x, area.y, area.width, area.height,
-                t.bgGradTop, t.bgGradBottom);
+            // The gradient + wallpaper blobs are static and, under glass, the
+            // most expensive thing on screen. On animation-only frames (a
+            // spinner ticking over an unchanged backdrop) restore the cached
+            // pixels with one copy instead of re-painting them; only re-paint
+            // (and re-snapshot) when the backdrop may have changed.
+            bool restored = false;
+            if (!app.BackdropDirty()) {
+                restored = c.RestoreRect(area.x, area.y,
+                    area.width, area.height, 0);
+            }
+            if (!restored) {
+                c.FillVGrad(area.x, area.y, area.width, area.height,
+                    t.bgGradTop, t.bgGradBottom);
+                // Under the frosted-glass theme, scatter a few soft colour
+                // blobs over the gradient so it reads as a real wallpaper --
+                // this gives the backdrop blur something to soften, so glass
+                // panels frost visible colour instead of a flat gradient.
+                if (t.glass != 0) {
+                    Gallery.GlassWallpaper(app, c, area);
+                } else {
+                    Gallery.GradientWallpaper(app, c, t, area);
+                }
+                c.SnapshotRect(area.x, area.y, area.width, area.height, 0);
+            }
         } else {
             c.FillRect(area.x, area.y, area.width, area.height, t.bgPrimary);
         }
@@ -722,6 +807,8 @@ class Gallery {
         int contentTop = area.y + app.Scale(26);
         int viewBottom = area.y + area.height - app.Scale(8);
         int viewH = viewBottom - contentTop;
+        Gallery.detailClipTop = contentTop;
+        Gallery.detailClipBottom = viewBottom;
         List<Demo> demos = Gallery.EffectiveDemos(e);
 
         int bodyLineH = Canvas.FontHeight(t.fontSizeMedium) + app.Scale(4);
@@ -1093,8 +1180,32 @@ class Gallery {
     static int RenderPreview(App app, Canvas c, Theme t, string name,
             int x, int y, int w, int previewHUnscaled) {
         int h = Gallery.PreviewBoxH(app, name, previewHUnscaled, w);
-        c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
-        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        if (t.glass != 0) {
+            // Real frosted glass: blur the wallpaper behind the box (clamped to
+            // the scroll viewport so it never smears the fixed header), then a
+            // light translucent tint + white frost veil + top sheen + rim.
+            int by = y;
+            int bh = h;
+            if (by < Gallery.detailClipTop) {
+                bh = bh - (Gallery.detailClipTop - by);
+                by = Gallery.detailClipTop;
+            }
+            if (by + bh > Gallery.detailClipBottom) {
+                bh = Gallery.detailClipBottom - by;
+            }
+            if (bh > 0) {
+                c.BlurRectCached(x, by, w, bh, app.Scale(22),
+                    app.NextBlurSlot(), app.BackdropDirty());
+            }
+            c.FillRoundRect(x, y, w, h, app.Scale(6), Layer.Fade(t.bgSecondary, 300));
+            c.FillRoundRect(x, y, w, h, app.Scale(6), Layer.Fade(t.textPrimary, 40));
+            c.FillRoundRect(x, y, w, app.Scale(2), app.Scale(6),
+                            Layer.Fade(t.textPrimary, 140));
+            c.DrawRect(x, y, w, h, Layer.Fade(t.textPrimary, 85), 1);
+        } else {
+            c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+            c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        }
         c.DrawText(x + app.Scale(12), y + app.Scale(9), "LIVE STATES",
             t.textTertiary, t.fontSizeSmall);
         // Floating/interactive components are drawn later in the deferred

@@ -87,6 +87,16 @@ class App {
     // at a low cadence rather than busy-rendering the whole page at 60fps.
     int animNextMs;
 
+    // True when the current frame processed a real OS event (input, resize,
+    // etc). A pure animation repaint (spinner tick, easing step) wakes with no
+    // event, leaving the backdrop behind glass unchanged so its blur/wallpaper
+    // can be served from cache. See BackdropDirty().
+    bool backdropDirty;
+
+    // Per-frame counter handing each glass surface a stable blur-cache slot in
+    // draw order. Reset in BeginFrame; incremented by NextBlurSlot().
+    int blurSlotSeq;
+
     static App Create(string title, int width, int height) {
         App app = new App();
         app.window = Window.Create(title, width, height);
@@ -135,6 +145,8 @@ class App {
         app.lastFrameMs = app.nowMs;
         app.lastPresentMs = 0;
         app.animNextMs = -1;
+        app.backdropDirty = true;
+        app.blurSlotSeq = 0;
         app.canvas = Canvas.Create(width, height);
         // Reset the UI-thread dispatch queue up front (on the UI thread) so
         // App.Post is safe the moment any background worker is spawned.
@@ -264,7 +276,17 @@ class App {
         int W = c.Width();
         int hbar = titlebarH;
 
-        c.FillRect(0, 0, W, hbar, t.bgSecondary);
+        // Under the frosted-glass skin the title bar frosts the content behind
+        // it too (blur + translucent themed tint + faint white sheen), so the
+        // chrome matches the glass body instead of sitting on a flat opaque bar.
+        if (t.glass != 0) {
+            c.BlurRectCached(0, 0, W, hbar, Scale(22),
+                NextBlurSlot(), BackdropDirty());
+            c.FillRect(0, 0, W, hbar, 200 * 16777216 + (t.bgSecondary % 16777216));
+            c.FillRect(0, 0, W, hbar, 26 * 16777216 + (t.textPrimary % 16777216));
+        } else {
+            c.FillRect(0, 0, W, hbar, t.bgSecondary);
+        }
         c.FillRect(0, hbar - 1, W, 1, t.divider);
 
         int pad = t.paddingLarge;
@@ -297,11 +319,11 @@ class App {
         bool maxH = focus.IsHovered(maxId);
         bool closeH = focus.IsHovered(closeId);
 
-        // Windows-accurate caption hovers: a neutral grey overlay for the
-        // ordinary buttons (subtle white wash in dark mode, subtle black wash in
-        // light mode) and the signature red for close.
-        int capHover = 0xFFE9E9E9;
-        if (isDark) { capHover = 0xFF3D3D3D; }
+        // Caption hover wash follows the active theme's own hover token so the
+        // window controls stay coordinated with every skin (a translucent wash
+        // over glass/gradient, the themed grey on light/dark) instead of a
+        // fixed grey. Close keeps the signature Windows red.
+        int capHover = t.bgHover;
         int closeRed = 0xFFE81123;
         if (showThemeButton && themeH) {
             c.FillRect(themeX, 0, bw, hbar, capHover);
@@ -435,6 +457,23 @@ class App {
     void RequestAnimationFrame(int minIntervalMs) {
         int due = Window.GetTickMs() + minIntervalMs;
         if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
+    }
+
+    /// True when the content behind glass surfaces may have changed this frame
+    /// (any OS input / resize / theme), false when the frame is a pure
+    /// animation tick over an unchanged backdrop. Glass surfaces pass this to
+    /// Canvas.BlurRectCached so spinners/toasts reuse the cached blur.
+    bool BackdropDirty() {
+        return backdropDirty;
+    }
+
+    /// Hands out the next stable per-frame blur-cache slot (draw order). Slots
+    /// beyond the cache capacity fall back to an uncached blur.
+    int NextBlurSlot() {
+        int s = blurSlotSeq;
+        blurSlotSeq = blurSlotSeq + 1;
+        if (s > 63) { return -1; }
+        return s;
     }
 
     /// Report the focused text widget's caret (client-area px) so the IME
@@ -665,6 +704,12 @@ class App {
         DrainPosts();
 
         int kind = window.EventKind();
+
+        // A pure animation repaint wakes with no OS event (kind 0): the content
+        // behind glass is unchanged, so its blur + the static wallpaper can be
+        // restored from cache. Any real event (input/resize/etc) marks the
+        // backdrop dirty so it is recomputed this frame.
+        backdropDirty = (kind != 0);
 
         if (kind == 8) {
             isRunning = false;
@@ -917,6 +962,8 @@ class App {
         // Clear any throttled-animation deadline too; still-live animations
         // (spinners etc.) re-arm it via RequestAnimationFrame during render.
         animNextMs = -1;
+        // Hand glass surfaces stable blur-cache slots again from the top.
+        blurSlotSeq = 0;
         wheelCapW = 0;
         wheelCapH = 0;
         hitTester.Clear();
@@ -945,6 +992,24 @@ class App {
 
     /// True while a popup layer is active this frame.
     bool HasOverlays() { return overlays.Count > 0; }
+
+    /// Registers a hit region that swallows clicks over [x,y,w,h] so a modal /
+    /// popup surface blocks the widgets beneath it. The HitTester is
+    /// last-registered-wins and overlays paint after the page content, so
+    /// calling this while drawing the backdrop -- and BEFORE the overlay's own
+    /// buttons register -- makes the blocker win everywhere except on those
+    /// buttons. Returns the blocker id.
+    int BlockHitsRect(int x, int y, int w, int h) {
+        int id = focus.AllocId();
+        hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+        return id;
+    }
+
+    /// Full-window BlockHitsRect: the standard scrim for a modal overlay whose
+    /// dimmed backdrop covers the whole window.
+    int BlockHitsBelow() {
+        return BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
+    }
 
     /// Id of the widget the current click (mouse-up) landed on, or -1.
     int ClickTarget() { return clickTargetId; }
