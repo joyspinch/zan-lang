@@ -193,6 +193,57 @@ class UiEvent {
 }
 
 /// <summary>
+/// A reusable bundle of the common per-widget events. A retained widget embeds
+/// one <c>WidgetEvents</c> field and calls <see cref="Fire"/> once per frame
+/// (after it has rendered / registered its hit region) instead of re-deriving
+/// every transition by hand, so application code reads declaratively:
+/// <code>
+/// btn.On.Enter += () =&gt; { ... };
+/// btn.On.Click += () =&gt; { ... };
+/// </code>
+/// Touch-safe: on a touchscreen a single touch arrives as a synthesized mouse
+/// sequence, so <c>Click</c> == tap and <c>MouseDown</c>/<c>MouseUp</c> bracket
+/// the touch; there is no real hover, so <c>Enter</c>/<c>Leave</c> only bracket
+/// the press and never fire spuriously.
+/// </summary>
+class WidgetEvents {
+    UiEvent Click;
+    UiEvent DoubleClick;
+    UiEvent MouseDown;
+    UiEvent MouseUp;
+    UiEvent Enter;
+    UiEvent Leave;
+    UiEvent Focus;
+    UiEvent Blur;
+
+    static WidgetEvents Create() {
+        WidgetEvents e = new WidgetEvents();
+        e.Click = UiEvent.Create();
+        e.DoubleClick = UiEvent.Create();
+        e.MouseDown = UiEvent.Create();
+        e.MouseUp = UiEvent.Create();
+        e.Enter = UiEvent.Create();
+        e.Leave = UiEvent.Create();
+        e.Focus = UiEvent.Create();
+        e.Blur = UiEvent.Create();
+        return e;
+    }
+
+    /// Raises every registered handler whose condition holds for `id` this
+    /// frame. Call once per frame after the widget registered its hit region.
+    void Fire(App app, int id) {
+        Click.RaiseIf(Ui.Clicked(app, id));
+        DoubleClick.RaiseIf(Ui.DoubleClicked(app, id));
+        MouseDown.RaiseIf(Ui.PressedDown(app, id));
+        MouseUp.RaiseIf(Ui.Clicked(app, id));
+        Enter.RaiseIf(Ui.Entered(app, id));
+        Leave.RaiseIf(Ui.Left(app, id));
+        Focus.RaiseIf(Ui.FocusGained(app, id));
+        Blur.RaiseIf(Ui.FocusLost(app, id));
+    }
+}
+
+/// <summary>
 /// Monotonic source of stable, per-instance widget ids. A retained widget
 /// grabs one in its factory (Create) so its identity is fixed for its whole
 /// lifetime, regardless of sibling widgets appearing or disappearing between
@@ -243,6 +294,13 @@ class FocusManager {
     int focusedId;
     int hoveredId;
     int pressedId;
+    // Snapshot of the three ids as they stood at the end of the previous
+    // rendered frame. RollFrame() (called from App.PresentFrame) copies the
+    // live ids into these, so a widget can detect enter/leave and focus/blur
+    // transitions this frame by comparing IsHovered(id) with WasHovered(id).
+    int prevFocusedId;
+    int prevHoveredId;
+    int prevPressedId;
     int nextId;
     // Ids of focusable widgets in the order they registered this frame, so Tab
     // / Shift+Tab can move focus to the next/previous one. Rebuilt each frame.
@@ -253,6 +311,9 @@ class FocusManager {
         fm.focusedId = -1;
         fm.hoveredId = -1;
         fm.pressedId = -1;
+        fm.prevFocusedId = -1;
+        fm.prevHoveredId = -1;
+        fm.prevPressedId = -1;
         fm.nextId = 0;
         fm.tabOrder = new List<int>();
         return fm;
@@ -302,6 +363,19 @@ class FocusManager {
     bool IsFocused(int id) { return focusedId == id; }
     bool IsHovered(int id) { return hoveredId == id; }
     bool IsPressed(int id) { return pressedId == id; }
+
+    bool WasFocused(int id) { return prevFocusedId == id; }
+    bool WasHovered(int id) { return prevHoveredId == id; }
+    bool WasPressed(int id) { return prevPressedId == id; }
+
+    /// Snapshots the live ids as the "previous frame" baseline. Called once
+    /// per rendered frame (App.PresentFrame) after widgets have queried their
+    /// enter/leave/focus transitions for this frame.
+    void RollFrame() {
+        prevFocusedId = focusedId;
+        prevHoveredId = hoveredId;
+        prevPressedId = pressedId;
+    }
 
     void SetFocused(int id) { focusedId = id; }
     void SetHovered(int id) { hoveredId = id; }
