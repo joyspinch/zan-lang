@@ -1,0 +1,174 @@
+using System;
+using System.Threading;
+
+namespace Gui.Reactive;
+
+/// <summary>A parameterless callback used by events and the dispatcher.</summary>
+delegate void Action();
+
+/// <summary>
+/// A UI-thread dispatch queue. Background threads enqueue work via Post/Invoke;
+/// the UI thread drains and runs it once per frame via Drain(). This is what
+/// makes event callbacks and property writes cross-thread-safe: work raised off
+/// the UI thread is marshalled back onto it instead of touching UI state from
+/// another thread.
+/// </summary>
+class Dispatcher {
+    List<Action> queue;
+    int lockHandle;
+    int uiThreadId;
+
+    /// <summary>Creates a dispatcher owned by the calling (UI) thread.</summary>
+    static Dispatcher Create() {
+        Dispatcher d = new Dispatcher();
+        d.queue = new List<Action>();
+        d.lockHandle = Mutex.Create();
+        d.uiThreadId = Thread.CurrentId();
+        return d;
+    }
+
+    /// <summary>True when called from the thread that created the dispatcher.</summary>
+    bool IsUiThread() {
+        return Thread.CurrentId() == this.uiThreadId;
+    }
+
+    /// <summary>Queues work to run on the UI thread. Safe from any thread.</summary>
+    void Post(Action work) {
+        Mutex.Lock(this.lockHandle);
+        this.queue.Add(work);
+        Mutex.Unlock(this.lockHandle);
+    }
+
+    /// <summary>
+    /// Runs work on the UI thread: immediately if already on it, otherwise
+    /// marshalled via Post so the caller never mutates UI state cross-thread.
+    /// </summary>
+    void Invoke(Action work) {
+        if (IsUiThread()) {
+            work();
+        } else {
+            Post(work);
+        }
+    }
+
+    /// <summary>
+    /// Drains all queued work and runs it on the current (UI) thread. Call once
+    /// per frame from the UI/event loop. Returns the number of items run.
+    /// </summary>
+    int Drain() {
+        Mutex.Lock(this.lockHandle);
+        List<Action> pending = this.queue;
+        this.queue = new List<Action>();
+        Mutex.Unlock(this.lockHandle);
+        int ran = 0;
+        int i = 0;
+        while (i < pending.Count) {
+            Action work = pending[i];
+            work();
+            ran = ran + 1;
+            i = i + 1;
+        }
+        return ran;
+    }
+}
+
+/// <summary>Holds the subscribers for a single named event.</summary>
+class EventSlot {
+    List<Action> handlers;
+
+    static EventSlot Create() {
+        EventSlot s = new EventSlot();
+        s.handlers = new List<Action>();
+        return s;
+    }
+}
+
+/// <summary>
+/// A C#-style event aggregator. Components subscribe delegates to named events
+/// with On() and raise them with Emit(). When a Dispatcher is attached every
+/// handler runs on the UI thread automatically, so raising an event from a
+/// worker thread is safe.
+/// </summary>
+class EventHub {
+    List<string> names;
+    List<EventSlot> slotList;
+    Dispatcher dispatcher;
+
+    /// <summary>
+    /// Creates a hub. Pass a Dispatcher for automatic UI-thread delivery, or
+    /// null to invoke handlers synchronously on the calling thread.
+    /// </summary>
+    static EventHub Create(Dispatcher d) {
+        EventHub h = new EventHub();
+        h.names = new List<string>();
+        h.slotList = new List<EventSlot>();
+        h.dispatcher = d;
+        return h;
+    }
+
+    int IndexOf(string evt) {
+        int i = 0;
+        while (i < this.names.Count) {
+            if (this.names[i] == evt) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    EventSlot SlotFor(string evt) {
+        int idx = this.IndexOf(evt);
+        if (idx >= 0) {
+            return this.slotList[idx];
+        }
+        EventSlot s = EventSlot.Create();
+        this.names.Add(evt);
+        this.slotList.Add(s);
+        return s;
+    }
+
+    /// <summary>Subscribes a handler to an event (like `evt += handler`).</summary>
+    void On(string evt, Action handler) {
+        this.SlotFor(evt).handlers.Add(handler);
+    }
+
+    /// <summary>Number of handlers currently subscribed to an event.</summary>
+    int CountFor(string evt) {
+        int idx = this.IndexOf(evt);
+        if (idx < 0) {
+            return 0;
+        }
+        return this.slotList[idx].handlers.Count;
+    }
+
+    /// <summary>Removes all handlers for an event.</summary>
+    void Clear(string evt) {
+        int idx = this.IndexOf(evt);
+        if (idx >= 0) {
+            this.slotList[idx].handlers = new List<Action>();
+        }
+    }
+
+    /// <summary>
+    /// Raises an event, invoking every subscriber. With a Dispatcher attached
+    /// handlers are marshalled to the UI thread; otherwise they run inline.
+    /// </summary>
+    void Emit(string evt) {
+        int idx = this.IndexOf(evt);
+        if (idx < 0) {
+            return;
+        }
+        List<Action> hs = this.slotList[idx].handlers;
+        int i = 0;
+        while (i < hs.Count) {
+            Action h = hs[i];
+            if (this.dispatcher != null) {
+                this.dispatcher.Invoke(h);
+            } else {
+                h();
+            }
+            i = i + 1;
+        }
+    }
+}
