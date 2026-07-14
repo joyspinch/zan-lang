@@ -70,6 +70,12 @@ class App {
     int nowMs;
     int lastFrameMs;
     int lastPresentMs;
+    // Wall-clock deadline (ms) at which a *throttled* animation wants its next
+    // repaint, or -1 when none is pending. Looping animations (e.g. a loading
+    // spinner) register here via RequestAnimationFrame instead of
+    // RequestRedraw, so the event loop sleeps between frames and repaints them
+    // at a low cadence rather than busy-rendering the whole page at 60fps.
+    int animNextMs;
 
     static App Create(string title, int width, int height) {
         App app = new App();
@@ -113,6 +119,7 @@ class App {
         app.nowMs = Window.GetTickMs();
         app.lastFrameMs = app.nowMs;
         app.lastPresentMs = 0;
+        app.animNextMs = -1;
         app.canvas = Canvas.Create(width, height);
         // Reset the UI-thread dispatch queue up front (on the UI thread) so
         // App.Post is safe the moment any background worker is spawned.
@@ -344,6 +351,18 @@ class App {
         needsRedraw = true;
     }
 
+    /// Requests a *throttled* repaint for a looping animation: the next frame
+    /// is scheduled at most `minIntervalMs` from now, and the event loop sleeps
+    /// (idle, no CPU) until then instead of busy-rendering at 60fps. Unlike
+    /// RequestRedraw this does not force an immediate frame, so a permanently
+    /// animating widget (a spinner, a skeleton shimmer) repaints the page at a
+    /// low cadence. An earlier deadline always wins if several animations are
+    /// live in the same frame. Input still wakes the loop promptly.
+    void RequestAnimationFrame(int minIntervalMs) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
+    }
+
     /// Report the focused text widget's caret (client-area px) so the IME
     /// composition/candidate window follows the cursor instead of pinning to
     /// the window origin. Called each frame by Input/TextArea while focused.
@@ -477,15 +496,20 @@ class App {
     }
 
     /// Blend two packed RGB colors by permille p (0..1000), returning an opaque
-    /// (0xFF alpha) color. Channels are extracted with %256 so it is robust to
-    /// colors stored as negative signed ints.
+    /// (0xFF alpha) color. Robust to colors stored as negative signed ints.
     static int LerpColor(int c0, int c1, int p) {
-        int r0 = (c0 / 65536) % 256; if (r0 < 0) { r0 = r0 + 256; }
-        int g0 = (c0 / 256) % 256;   if (g0 < 0) { g0 = g0 + 256; }
-        int b0 = c0 % 256;           if (b0 < 0) { b0 = b0 + 256; }
-        int r1 = (c1 / 65536) % 256; if (r1 < 0) { r1 = r1 + 256; }
-        int g1 = (c1 / 256) % 256;   if (g1 < 0) { g1 = g1 + 256; }
-        int b1 = c1 % 256;           if (b1 < 0) { b1 = b1 + 256; }
+        // Packed 0xAARRGGBB colors are stored as signed ints, so any color with
+        // a 0xFF alpha is negative. Extract the low 24 RGB bits with a floored
+        // modulo first (truncating `c / 65536` would mis-decode negatives, e.g.
+        // white -1 would read as pure blue), then split the positive value.
+        int rgb0 = c0 % 16777216; if (rgb0 < 0) { rgb0 = rgb0 + 16777216; }
+        int rgb1 = c1 % 16777216; if (rgb1 < 0) { rgb1 = rgb1 + 16777216; }
+        int r0 = rgb0 / 65536;
+        int g0 = (rgb0 / 256) % 256;
+        int b0 = rgb0 % 256;
+        int r1 = rgb1 / 65536;
+        int g1 = (rgb1 / 256) % 256;
+        int b1 = rgb1 % 256;
         int r = r0 + (r1 - r0) * p / 1000;
         int g = g0 + (g1 - g0) * p / 1000;
         int b = b0 + (b1 - b0) * p / 1000;
@@ -533,6 +557,27 @@ class App {
             int since = Window.GetTickMs() - lastPresentMs;
             if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
             result = window.PollEvent();
+        } else if (animNextMs >= 0) {
+            // A throttled animation (e.g. a loading spinner) wants its next
+            // frame at animNextMs. Sleep (idle) until then instead of busy-
+            // rendering the whole page at 60fps, but poll in short slices so
+            // OS input still wakes the loop promptly. When the deadline is
+            // reached, flag a repaint and fall through with no pending event.
+            result = 1;
+            bool waiting = true;
+            while (waiting) {
+                int now = Window.GetTickMs();
+                if (now >= animNextMs) {
+                    needsRedraw = true;
+                    waiting = false;
+                } else {
+                    int remain = animNextMs - now;
+                    if (remain > 15) { remain = 15; }
+                    Window.SleepMs(remain);
+                    result = window.PollEvent();
+                    if (result != 1) { waiting = false; }
+                }
+            }
         } else {
             result = window.WaitEvent();
         }
@@ -795,6 +840,9 @@ class App {
         // Clear the redraw flag at frame start; handlers invoked during this
         // frame may set it again to request an immediate follow-up repaint.
         needsRedraw = false;
+        // Clear any throttled-animation deadline too; still-live animations
+        // (spinners etc.) re-arm it via RequestAnimationFrame during render.
+        animNextMs = -1;
         wheelCapW = 0;
         wheelCapH = 0;
         hitTester.Clear();

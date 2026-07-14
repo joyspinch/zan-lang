@@ -536,6 +536,115 @@ static HFONT get_or_create_font(int size) {
     return g_fonts[slot];
 }
 
+/* --- Rasterised text-run cache -------------------------------------------
+ * zan_gui_draw_text is called many times per frame (one call per token/word)
+ * and, while scrolling, with the *same* strings every frame -- only the Y
+ * position moves. GDI-rendering each call (DIB alloc + TextOutW + GdiFlush)
+ * then dominates CPU. Cache the white-on-black coverage bitmap keyed by
+ * (text, size); the draw colour is applied at composite time, so it is not
+ * part of the key and the same glyph run is reused for any colour. Entries
+ * persist across frames, so scrolling only re-blits cached masks. */
+typedef struct {
+    char *text;   /* UTF-8 key; NULL marks an empty slot */
+    int   size;
+    int   tw, th;
+    u32  *bits;   /* tw*th ARGB coverage straight from GDI */
+    uint64_t used;   /* LRU tick */
+} zan_text_cache_t;
+
+#define ZAN_TEXT_CACHE_CAP 1024
+#define ZAN_TEXT_CACHE_PROBE 8
+static zan_text_cache_t g_tcache[ZAN_TEXT_CACHE_CAP];
+static uint64_t g_tcache_clock = 0;
+
+static uint64_t zan_text_hash(const char *s, int size) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)(unsigned)size;
+    h *= 1099511628211ULL;
+    return h;
+}
+
+/* Returns a cache entry whose bits hold the coverage mask, or NULL on error. */
+static zan_text_cache_t *zan_text_cache_get(const char *text, int size) {
+    uint64_t h = zan_text_hash(text, size);
+    int base = (int)(h % ZAN_TEXT_CACHE_CAP);
+    zan_text_cache_t *victim = NULL;
+    for (int i = 0; i < ZAN_TEXT_CACHE_PROBE; i++) {
+        zan_text_cache_t *e = &g_tcache[(base + i) % ZAN_TEXT_CACHE_CAP];
+        if (e->text && e->size == size && strcmp(e->text, text) == 0) {
+            e->used = ++g_tcache_clock;
+            return e;
+        }
+        if (!e->text && !victim) victim = e;
+    }
+    if (!victim) {
+        uint64_t best = ~0ULL;
+        for (int i = 0; i < ZAN_TEXT_CACHE_PROBE; i++) {
+            zan_text_cache_t *e = &g_tcache[(base + i) % ZAN_TEXT_CACHE_CAP];
+            if (e->used <= best) { best = e->used; victim = e; }
+        }
+    }
+
+    /* Miss: rasterise white text on black to capture the coverage mask. */
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wtext) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
+    int text_len = wlen - 1;
+
+    HFONT font = get_or_create_font(size);
+    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+    SIZE ts;
+    GetTextExtentPoint32W(g_text_dc, wtext, text_len, &ts);
+    int tw = ts.cx + 2;
+    int th = ts.cy + 2;
+    if (tw <= 0 || th <= 0) {
+        free(wtext); SelectObject(g_text_dc, old_font); return NULL;
+    }
+
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = tw;
+    bmi.bmiHeader.biHeight = -th;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void *dbits = NULL;
+    HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &dbits, NULL, 0);
+    if (!hbmp) { free(wtext); SelectObject(g_text_dc, old_font); return NULL; }
+    HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
+    memset(dbits, 0, (size_t)(tw * th * 4));
+    SetTextColor(g_text_dc, RGB(255, 255, 255));
+    TextOutW(g_text_dc, 0, 0, wtext, text_len);
+    GdiFlush();
+
+    u32 *copy = (u32 *)malloc((size_t)(tw * th) * sizeof(u32));
+    if (copy) memcpy(copy, dbits, (size_t)(tw * th) * sizeof(u32));
+
+    SelectObject(g_text_dc, old_bmp);
+    SelectObject(g_text_dc, old_font);
+    DeleteObject(hbmp);
+    free(wtext);
+    if (!copy) return NULL;
+
+    if (victim->text) { free(victim->text); victim->text = NULL; }
+    if (victim->bits) { free(victim->bits); victim->bits = NULL; }
+    size_t klen = strlen(text) + 1;
+    victim->text = (char *)malloc(klen);
+    if (!victim->text) { free(copy); return NULL; }
+    memcpy(victim->text, text, klen);
+    victim->size = size;
+    victim->tw = tw;
+    victim->th = th;
+    victim->bits = copy;
+    victim->used = ++g_tcache_clock;
+    return victim;
+}
+
 EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
                               const char *text, i64 color, i64 font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
@@ -547,53 +656,20 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
 
     ensure_text_dc();
 
-    /* Convert text to wide string */
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
-    int text_len = wlen - 1;
-
-    /* Measure text */
-    HFONT font = get_or_create_font(size);
-    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
-    SIZE text_size;
-    GetTextExtentPoint32W(g_text_dc, wtext, text_len, &text_size);
-
-    int tw = text_size.cx + 2;
-    int th = text_size.cy + 2;
-    if (tw <= 0 || th <= 0) { free(wtext); SelectObject(g_text_dc, old_font); return; }
-
-    /* Create a temporary bitmap for text rendering */
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = tw;
-    bmi.bmiHeader.biHeight = -th;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void *bits = NULL;
-    HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!hbmp) { free(wtext); SelectObject(g_text_dc, old_font); return; }
-
-    HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
-    /* Clear to black */
-    memset(bits, 0, (size_t)(tw * th * 4));
-
-    /* Draw white text on black background to get alpha mask */
-    SetTextColor(g_text_dc, RGB(255, 255, 255));
-    TextOutW(g_text_dc, 0, 0, wtext, text_len);
-    GdiFlush();
+    zan_text_cache_t *e = zan_text_cache_get(text, size);
+    if (!e || !e->bits) return;
+    int tw = e->tw;
+    int th = e->th;
+    u32 *src = e->bits;
 
     /* Extract color components */
     u32 cr = ((u32)color >> 16) & 0xFF;
     u32 cg = ((u32)color >> 8) & 0xFF;
     u32 cb = (u32)color & 0xFF;
-
-    /* Composite text using per-channel ClearType coverage for sharp rendering */
-    u32 *src = (u32 *)bits;
     u32 ca = ((u32)color >> 24) & 0xFF;
     if (ca == 0) ca = 255; /* treat 0 alpha as opaque for text */
+
+    /* Composite cached coverage using per-channel ClearType AA. */
     for (int py = 0; py < th; py++) {
         int dst_y = (int)y + py;
         if (dst_y < s->clip_y0 || dst_y >= s->clip_y1) continue;
@@ -620,11 +696,6 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
             s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
         }
     }
-
-    SelectObject(g_text_dc, old_bmp);
-    SelectObject(g_text_dc, old_font);
-    DeleteObject(hbmp);
-    free(wtext);
 }
 
 EXPORT i64 zan_gui_measure_text(const char *text, i64 font_size) {
