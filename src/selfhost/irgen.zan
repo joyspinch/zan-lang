@@ -1039,7 +1039,7 @@ class Irgen {
         curRet = MapType(m.type);
         bool stat = IsStatic(m);
         curHasThis = !stat;
-        string sig = "define " + curRet + " @" + cls.sval + "_" + m.sval + "(";
+        string sig = "define " + curRet + " @" + MethodSym(cls.sval, m) + "(";
         int np = 0;
         if (!stat) {
             sig = sig + "%" + cls.sval + "* %this";
@@ -1292,6 +1292,103 @@ class Irgen {
             c = BaseClassOf(c);
         }
         return "";
+    }
+
+    // Number of methods named `name` declared directly in `cls`.
+    int MethodCount(Node cls, string name) {
+        if (cls == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // A type name reduced to a symbol-safe tag for overload mangling.
+    string TypeTag(Node t) {
+        if (t == null) { return "v"; }
+        if (t.sval == "") { return "v"; }
+        return t.sval;
+    }
+
+    // The LLVM symbol for a method. Non-overloaded names stay `Owner_Name`
+    // (so all existing output -- including the self-host fixed point, which
+    // has no overloads -- is unchanged); an overloaded name gains an arity and
+    // per-parameter-type suffix so each overload is a distinct definition.
+    string MethodSym(string owner, Node m) {
+        Node oc = binder.FindType(owner);
+        if (MethodCount(oc, m.sval) <= 1) { return owner + "_" + m.sval; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(owner);
+        sb.Append("_");
+        sb.Append(m.sval);
+        sb.Append("__");
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                sb.Append("_");
+                sb.Append(TypeTag(p.type));
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // Select the method named `name` in `cls` for a call passing `argc`
+    // positional arguments. With a single candidate the behaviour is identical
+    // to FindMethod (arity is not consulted, so default-argument calls still
+    // resolve). With several overloads, an exact parameter-count match wins,
+    // then a required..total range match, else the first declared.
+    Node ResolveMethod(Node cls, string name, int argc) {
+        if (cls == null) { return null; }
+        Node only = null;
+        int cnt = 0;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) { cnt = cnt + 1; only = m; }
+            i = i + 1;
+        }
+        if (cnt <= 1) { return only; }
+        Node exact = null;
+        Node rng = null;
+        i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) {
+                int tot = 0;
+                int req = 0;
+                int j = 0;
+                while (j < m.kids.Count) {
+                    if (m.kids[j].kind == AK.Param()) {
+                        tot = tot + 1;
+                        if (m.kids[j].b == null) { req = req + 1; }
+                    }
+                    j = j + 1;
+                }
+                if (tot == argc && exact == null) { exact = m; }
+                if (argc >= req && argc <= tot && rng == null) { rng = m; }
+            }
+            i = i + 1;
+        }
+        if (exact != null) { return exact; }
+        if (rng != null) { return rng; }
+        return only;
+    }
+
+    // Like ResolveMethod but walks base classes, matching FindMethodUp.
+    Node ResolveMethodUp(Node cls, string name, int argc) {
+        Node c = cls;
+        while (c != null) {
+            Node m = ResolveMethod(c, name, argc);
+            if (m != null) { return m; }
+            c = BaseClassOf(c);
+        }
+        return null;
     }
 
     // vtable slot method names, base classes first
@@ -2017,7 +2114,7 @@ class Irgen {
             thisOp = bc;
         }
         Node pty = ParamTypeNode(m, 0);
-        L("  call void @" + owner + "_set_" + name + "(%" + owner + "* " + thisOp
+        L("  call void @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
             + ", " + MapType(pty) + " " + CallArg(v, pty) + ")");
         return true;
     }
@@ -2930,7 +3027,9 @@ class Irgen {
 
     ExprVal EmitStaticCall(string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
-        Node m = binder.FindMethod(cls, name);
+        Node m = ResolveMethod(cls, name, e.kids.Count);
+        string sym = clsName + "_" + name;
+        if (m != null) { sym = MethodSym(clsName, m); }
         string rt = "i64";
         if (m != null) { rt = MapType(m.type); }
         string args = "";
@@ -2944,11 +3043,11 @@ class Irgen {
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + clsName + "_" + name + "(" + args + ")");
+            L("  call void @" + sym + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + clsName + "_" + name + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, m.type); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);
@@ -2968,11 +3067,11 @@ class Irgen {
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + owner + "_" + m.sval + "(" + args + ")");
+            L("  call void @" + MethodSym(owner, m) + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + owner + "_" + m.sval + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + MethodSym(owner, m) + "(" + args + ")");
         if (IsErasedType(m.type)) { return FromSlot(t, m.type); }
         AddTemp(t, m.type);
         return new ExprVal(t, m.type);
@@ -2980,12 +3079,14 @@ class Irgen {
 
     ExprVal EmitInstanceCall(ExprVal recv, string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
-        Node m = FindMethodUp(cls, name);
+        Node m = ResolveMethodUp(cls, name, e.kids.Count);
         if (m != null && IsPolyClass(cls) && VSlotIndex(cls, name) >= 0) {
             return EmitVirtualCall(recv, cls, name, m, e);
         }
         string owner = MethodOwner(cls, name);
         if (owner == "") { owner = clsName; }
+        string sym = owner + "_" + name;
+        if (m != null) { sym = MethodSym(owner, m); }
         string thisOp = recv.op;
         if (owner != clsName) {
             string bc = NT();
@@ -3004,11 +3105,11 @@ class Irgen {
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + owner + "_" + name + "(" + args + ")");
+            L("  call void @" + sym + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + owner + "_" + name + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);
