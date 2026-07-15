@@ -1,0 +1,248 @@
+using System;
+
+namespace Game.Rts.Formats;
+
+/// <summary>
+/// A single <c>key = value</c> entry inside an INI section. Both parts are
+/// stored already trimmed of surrounding whitespace.
+/// </summary>
+class IniEntry {
+    string key;
+    string content;
+
+    static IniEntry Create(string key, string content) {
+        IniEntry entry = new IniEntry();
+        entry.key = key;
+        entry.content = content;
+        return entry;
+    }
+
+    string Key() { return this.key; }
+    string Value() { return this.content; }
+    void SetValue(string content) { this.content = content; }
+}
+
+/// <summary>
+/// An INI <c>[section]</c> holding ordered key/value entries. Repeated keys use
+/// last-wins semantics, matching how the Westwood engines resolve overrides.
+/// </summary>
+class IniSection {
+    string name;
+    List<IniEntry> entries;
+
+    static IniSection Create(string name) {
+        IniSection section = new IniSection();
+        section.name = name;
+        section.entries = new List<IniEntry>();
+        return section;
+    }
+
+    string Name() { return this.name; }
+    int Count() { return this.entries.Count; }
+    IniEntry EntryAt(int index) { return this.entries[index]; }
+
+    /// <summary>Index of <paramref name="key"/>, or -1 when it is absent.</summary>
+    int IndexOf(string key) {
+        int i = 0;
+        while (i < this.entries.Count) {
+            if (this.entries[i].Key() == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    bool Contains(string key) { return this.IndexOf(key) >= 0; }
+
+    /// <summary>Sets <paramref name="key"/>, overwriting any existing content.</summary>
+    void Set(string key, string content) {
+        int index = this.IndexOf(key);
+        if (index >= 0) {
+            this.entries[index].SetValue(content);
+        } else {
+            this.entries.Add(IniEntry.Create(key, content));
+        }
+    }
+
+    string GetOr(string key, string fallback) {
+        int index = this.IndexOf(key);
+        if (index < 0) { return fallback; }
+        return this.entries[index].Value();
+    }
+
+    string Get(string key) { return this.GetOr(key, ""); }
+
+    int GetIntOr(string key, int fallback) {
+        int index = this.IndexOf(key);
+        if (index < 0) { return fallback; }
+        return Convert.ToInt32(this.entries[index].Value());
+    }
+
+    bool GetBoolOr(string key, bool fallback) {
+        int index = this.IndexOf(key);
+        if (index < 0) { return fallback; }
+        return IniParser.ParseBool(this.entries[index].Value(), fallback);
+    }
+}
+
+/// <summary>
+/// A parsed INI document: an ordered set of named sections with convenience
+/// lookups. Section and key access never exposes raw parser state, so callers
+/// stay decoupled from the on-disk format.
+/// </summary>
+class IniDocument {
+    List<IniSection> sections;
+
+    static IniDocument Create() {
+        IniDocument document = new IniDocument();
+        document.sections = new List<IniSection>();
+        return document;
+    }
+
+    int Count() { return this.sections.Count; }
+    IniSection SectionAt(int index) { return this.sections[index]; }
+
+    int IndexOfSection(string name) {
+        int i = 0;
+        while (i < this.sections.Count) {
+            if (this.sections[i].Name() == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    bool ContainsSection(string name) { return this.IndexOfSection(name) >= 0; }
+
+    /// <summary>The section named <paramref name="name"/>, or null.</summary>
+    IniSection Section(string name) {
+        int index = this.IndexOfSection(name);
+        if (index < 0) { return null; }
+        return this.sections[index];
+    }
+
+    /// <summary>Returns the section, creating and appending it when missing.</summary>
+    IniSection Require(string name) {
+        int index = this.IndexOfSection(name);
+        if (index >= 0) { return this.sections[index]; }
+        IniSection section = IniSection.Create(name);
+        this.sections.Add(section);
+        return section;
+    }
+
+    string GetOr(string section, string key, string fallback) {
+        IniSection target = this.Section(section);
+        if (target == null) { return fallback; }
+        return target.GetOr(key, fallback);
+    }
+
+    string Get(string section, string key) { return this.GetOr(section, key, ""); }
+
+    int GetIntOr(string section, string key, int fallback) {
+        IniSection target = this.Section(section);
+        if (target == null) { return fallback; }
+        return target.GetIntOr(key, fallback);
+    }
+
+    bool GetBoolOr(string section, string key, bool fallback) {
+        IniSection target = this.Section(section);
+        if (target == null) { return fallback; }
+        return target.GetBoolOr(key, fallback);
+    }
+}
+
+/// <summary>
+/// A clean-room parser for Westwood-style INI text (RA2/Yuri rules, art and map
+/// files). It recognizes <c>[section]</c> headers and <c>key = value</c> pairs,
+/// ignores blank lines, and treats <c>;</c> as starting a comment. Keys before
+/// the first section header are ignored, matching engine behavior.
+/// </summary>
+class IniParser {
+    static bool IsSpace(string c) {
+        return c == " " || c == "\t" || c == "\r" || c == "\n";
+    }
+
+    /// <summary>Removes leading and trailing whitespace from <paramref name="content"/>.</summary>
+    static string TrimEdges(string content) {
+        int start = 0;
+        int end = content.Length;
+        while (start < end && IniParser.IsSpace(content.Substring(start, 1))) {
+            start = start + 1;
+        }
+        while (end > start && IniParser.IsSpace(content.Substring(end - 1, 1))) {
+            end = end - 1;
+        }
+        return content.Substring(start, end - start);
+    }
+
+    /// <summary>Index of the first occurrence of single-char <paramref name="ch"/>, else -1.</summary>
+    static int IndexOfChar(string s, string ch) {
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == ch) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>Drops an inline <c>;</c> comment, returning the code portion.</summary>
+    static string StripComment(string line) {
+        int index = IniParser.IndexOfChar(line, ";");
+        if (index < 0) { return line; }
+        return line.Substring(0, index);
+    }
+
+    /// <summary>
+    /// Interprets a content as a boolean. Recognizes yes/true/on/1 as true and
+    /// no/false/off/0 as false (case-insensitive on the first letter, as the
+    /// engines do); anything else returns <paramref name="fallback"/>.
+    /// </summary>
+    static bool ParseBool(string content, bool fallback) {
+        string v = IniParser.TrimEdges(content);
+        if (v.Length == 0) { return fallback; }
+        string head = v.Substring(0, 1);
+        if (head == "1" || head == "y" || head == "Y" || head == "t" || head == "T") {
+            return true;
+        }
+        if (head == "0" || head == "n" || head == "N" || head == "f" || head == "F") {
+            return false;
+        }
+        return fallback;
+    }
+
+    /// <summary>Parses INI <paramref name="text"/> into an <see cref="IniDocument"/>.</summary>
+    static IniDocument Parse(string text) {
+        IniDocument document = IniDocument.Create();
+        IniSection current = null;
+        int n = text.Length;
+        int lineStart = 0;
+        int i = 0;
+        while (i <= n) {
+            bool newline = false;
+            if (i < n) { newline = text.Substring(i, 1) == "\n"; }
+            if (i == n || newline) {
+                string raw = text.Substring(lineStart, i - lineStart);
+                string line = IniParser.TrimEdges(IniParser.StripComment(raw));
+                if (line.Length > 0) {
+                    string first = line.Substring(0, 1);
+                    if (first == "[") {
+                        int close = IniParser.IndexOfChar(line, "]");
+                        if (close > 1) {
+                            string name = IniParser.TrimEdges(line.Substring(1, close - 1));
+                            current = document.Require(name);
+                        }
+                    } else if (current != null) {
+                        int eq = IniParser.IndexOfChar(line, "=");
+                        if (eq >= 0) {
+                            string key = IniParser.TrimEdges(line.Substring(0, eq));
+                            string content =
+                                IniParser.TrimEdges(line.Substring(eq + 1, line.Length - (eq + 1)));
+                            if (key.Length > 0) { current.Set(key, content); }
+                        }
+                    }
+                }
+                lineStart = i + 1;
+            }
+            i = i + 1;
+        }
+        return document;
+    }
+}
