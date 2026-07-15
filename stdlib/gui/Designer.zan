@@ -66,6 +66,7 @@ class Designer {
     bool dragFromPalette;
     bool dragMoved;
     int dragKind;     // field type being dragged out of the palette
+    string dragCustomKind; // custom component tag when dragKind == 100
     int dragIndex;    // source row index when reordering
     int dropIndex;    // computed insertion index
     int dropY;        // y of the insertion indicator
@@ -116,6 +117,7 @@ class Designer {
         d.showReset = true;
         d.dragging = false;
         d.dragFromPalette = false;
+        d.dragCustomKind = "";
         d.dragMoved = false;
         d.dragKind = 0;
         d.dragIndex = -1;
@@ -201,6 +203,23 @@ class Designer {
         inspTab = 0;
         if (f.IsContainer()) { activeContainer = f; }
         msg = "added " + FormField.TypeName(ftype);
+    }
+
+    /// Adds a discovered project custom component (by its CustomComponents tag)
+    /// to the form / active container, mirroring AddField for built-ins.
+    void AddCustomField(string kind) {
+        FormField f = FormField.NewCustom(kind, seq);
+        seq = seq + 1;
+        if (activeContainer != null) {
+            f.childTab = 0;
+            if (activeContainer.ftype == 36) { f.childTab = activeContainer.uiState.Get(); }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = "added " + kind;
     }
 
     bool ContainsRef(List<FormField> lst, FormField target) {
@@ -496,6 +515,7 @@ class Designer {
         iy = PaletteGroup(app, c, t, "Display+", 40, 47, ix, iy, iw);
         iy = PaletteGroup(app, c, t, "Feedback+", 47, 53, ix, iy, iw);
         iy = PaletteGroup(app, c, t, "More", 53, 55, ix, iy, iw);
+        iy = CustomPaletteGroup(app, c, t, ix, iy, iw);
         c.PopClip();
 
         if (maxScroll > 0) {
@@ -517,6 +537,8 @@ class Designer {
         h = h + PaletteGroupH(app, 7);   // Display+
         h = h + PaletteGroupH(app, 6);   // Feedback+
         h = h + PaletteGroupH(app, 2);   // More
+        int nc = CustomComponents.Kinds().Count;
+        if (nc > 0) { h = h + PaletteGroupH(app, nc); }  // Custom
         return h + app.Scale(8);
     }
 
@@ -573,6 +595,54 @@ class Designer {
             col = col + 1;
             if (col == cols) { col = 0; iy = iy + rowStep; }
             ft = ft + 1;
+        }
+        if (col != 0) { iy = iy + rowStep; }
+        return iy + app.Scale(10);
+    }
+
+    /// Palette group for project custom components discovered at build time
+    /// (CustomComponents). Renders one tile per component (using its declared
+    /// icon); clicking adds it, dragging drops it onto the form. Empty when the
+    /// project defines no custom components, so nothing shows by default.
+    int CustomPaletteGroup(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        List<string> kinds = CustomComponents.Kinds();
+        if (kinds.Count == 0) { return iy; }
+        int fs = t.fontSizeSmall;
+        if (PalVisible(app, iy, app.Scale(14))) {
+            c.DrawText(ix, iy, "Custom", t.textSecondary, fs);
+        }
+        iy = iy + app.Scale(18);
+        int cols = 4;
+        int gapx = app.Scale(4);
+        int tileW = (iw - (cols - 1) * gapx) / cols;
+        int tileH = app.Scale(34);
+        int rowStep = tileH + app.Scale(6);
+        int ek = app.window.EventKind();
+        int k = 0;
+        int col = 0;
+        while (k < kinds.Count) {
+            int bx = ix + col * (tileW + gapx);
+            if (PalVisible(app, iy, tileH)) {
+                if (!preview && ek == 2 && !dragging
+                    && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    dragging = true;
+                    dragFromPalette = true;
+                    dragMoved = false;
+                    dragKind = 100;
+                    dragCustomKind = kinds[k];
+                    dragMouseX = app.mouseX;
+                    dragMouseY = app.mouseY;
+                }
+                string icon = CustomComponents.IconOf(kinds[k]);
+                if (icon == "") { icon = "puzzle"; }
+                Button b = Button.WithIcon("", icon);
+                b.SetSize(2);
+                int id = b.Render(app, bx, iy, tileW);
+                if (Button.WasClicked(app, id) && !dragMoved) { AddCustomField(kinds[k]); }
+            }
+            col = col + 1;
+            if (col == cols) { col = 0; iy = iy + rowStep; }
+            k = k + 1;
         }
         if (col != 0) { iy = iy + rowStep; }
         return iy + app.Scale(10);
@@ -905,7 +975,15 @@ class Designer {
         if (dragFromPalette) {
             if (activeContainer != null) {
                 // Drop into the active container (its active tab for Tabs).
-                AddField(dragKind);
+                if (dragKind == 100) { AddCustomField(dragCustomKind); }
+                else { AddField(dragKind); }
+            } else if (dragKind == 100) {
+                FormField nf = FormField.NewCustom(dragCustomKind, seq);
+                seq = seq + 1;
+                InsertFieldAt(dropIndex, nf);
+                sel = nf;
+                inspTab = 0;
+                msg = "added " + dragCustomKind;
             } else {
                 FormField nf = FormField.New(dragKind, seq);
                 seq = seq + 1;
@@ -1201,6 +1279,17 @@ class Designer {
         int fs = t.fontSizeSmall;
         int ft = f.ftype;
 
+        if (ft == 100) {                     // project custom component
+            int bh = line + app.Scale(8);
+            c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, t.bgSecondary);
+            c.DrawRect(x, y, w, bh, t.primary, 1);
+            string icon = CustomComponents.IconOf(f.customKind);
+            if (icon == "") { icon = "puzzle"; }
+            Icon.DrawCenteredIn(c, icon, x + app.Scale(6), y, app.Scale(20), bh,
+                app.Scale(13), t.primary);
+            c.DrawText(x + app.Scale(30), y + (bh - fs) / 2, f.customKind, t.textSecondary, fs);
+            return;
+        }
         if (ft == 15) {                      // title / heading
             Typography.Heading(app, x, y, f.label, 4);
             return;
@@ -1634,7 +1723,9 @@ class Designer {
 
     void RenderFieldProps(App app, Canvas c, Theme t, FormField f, int ix, int iy, int iw) {
         int fs = t.fontSizeSmall;
-        c.DrawText(ix, iy, "FIELD  ·  " + FormField.TypeName(f.ftype), t.textTertiary, fs);
+        string tn = FormField.TypeName(f.ftype);
+        if (f.ftype == 100) { tn = f.customKind; }
+        c.DrawText(ix, iy, "FIELD  ·  " + tn, t.textTertiary, fs);
         iy = iy + app.Scale(20);
 
         iy = LabeledInput(app, c, t, "Label", labelInput, ix, iy, iw);
@@ -1943,6 +2034,9 @@ class Designer {
         string p = Indent(depth);
         string o = "";
         o = o + p + "\"type\": " + Convert.ToString(f.ftype) + ",\n";
+        if (f.ftype == 100) {
+            o = o + p + "\"custom\": \"" + JEsc(f.customKind) + "\",\n";
+        }
         o = o + p + "\"label\": \"" + JEsc(f.label) + "\",\n";
         o = o + p + "\"name\": \"" + JEsc(f.fname) + "\",\n";
         o = o + p + "\"placeholder\": \"" + JEsc(f.placeholder) + "\",\n";
@@ -2015,6 +2109,8 @@ class Designer {
                     FormField cur = stack[stack.Count - 1];
                     if (LineKey(ln, "type")) {
                         cur.ftype = JInt(JAfter(ln));
+                    } else if (LineKey(ln, "custom")) {
+                        cur.customKind = JStr(JAfter(ln));
                     } else if (LineKey(ln, "label")) {
                         cur.label = JStr(JAfter(ln));
                     } else if (LineKey(ln, "name")) {
