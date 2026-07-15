@@ -1308,6 +1308,47 @@ int main(int argc, char **argv) {
             }
         }
 
+#ifdef __APPLE__
+        /* macOS: Homebrew installs into a non-default prefix, so system deps
+         * pulled in by [DllImport] (unixODBC's libodbc for System.Data / the
+         * ORM, libpq for System.Data.Postgres, ...) are not on the linker's
+         * default search path. Add the standard Homebrew lib dirs - including
+         * keg-only formulae like libpq - but only those that actually exist,
+         * so a missing prefix never emits a "directory not found" warning.
+         * This lets DB/ORM programs link on a stock Homebrew machine without
+         * the user having to set ZAN_LIB_PATH by hand. */
+        {
+            char home_lib[512]; home_lib[0] = '\0';
+            char home_pq[512];  home_pq[0] = '\0';
+            const char *home = getenv("HOME");
+            if (home && *home) {
+                snprintf(home_lib, sizeof(home_lib), "%s/.homebrew/lib", home);
+                snprintf(home_pq, sizeof(home_pq),
+                         "%s/.homebrew/opt/libpq/lib", home);
+            }
+            const char *mac_lib_dirs[] = {
+                home_lib[0] ? home_lib : NULL,
+                "/opt/homebrew/lib",
+                "/usr/local/lib",
+                home_pq[0] ? home_pq : NULL,
+                "/opt/homebrew/opt/libpq/lib",
+                "/usr/local/opt/libpq/lib",
+                NULL,
+            };
+            for (int ci = 0; mac_lib_dirs[ci]; ci++) {
+                if (zan_lib_ndirs >= 16) break;
+                if (!mac_lib_dirs[ci][0]) continue;
+                if (access(mac_lib_dirs[ci], F_OK) != 0) continue;
+                int dup = 0;
+                for (int dj = 0; dj < zan_lib_ndirs; dj++)
+                    if (strcmp(zan_lib_dirs[dj], mac_lib_dirs[ci]) == 0) { dup = 1; break; }
+                if (dup) continue;
+                snprintf(zan_lib_dirs[zan_lib_ndirs++], sizeof(zan_lib_dirs[0]),
+                         "%s", mac_lib_dirs[ci]);
+            }
+        }
+#endif
+
         /* ---- native stdlib drivers ------------------------------------
          * Third-party drivers (libpq, sqlite3, SDL3 bridges, ...) are NOT
          * present on an
@@ -1365,8 +1406,16 @@ int main(int argc, char **argv) {
                 else
                     snprintf(linkdir, sizeof(linkdir), "%s", driver_dirs[d]);
                 if (zan_lib_ndirs < 16 && strlen(linkdir) < sizeof(zan_lib_dirs[0])) {
-                    snprintf(zan_lib_dirs[zan_lib_ndirs++], sizeof(zan_lib_dirs[0]),
-                             "%s", linkdir);
+                    /* Prepend, not append: a bundled driver must take link-search
+                     * precedence over the auto-added Homebrew/system fallback dirs.
+                     * Otherwise a keg-only Homebrew libpq is linked in place of the
+                     * shipped driver, and its absolute install-name defeats the
+                     * @rpath bundling (the published exe would look for the driver
+                     * at the developer's Homebrew path instead of beside itself). */
+                    memmove(&zan_lib_dirs[1], &zan_lib_dirs[0],
+                            (size_t)zan_lib_ndirs * sizeof(zan_lib_dirs[0]));
+                    snprintf(zan_lib_dirs[0], sizeof(zan_lib_dirs[0]), "%s", linkdir);
+                    zan_lib_ndirs++;
                 }
             }
         }
@@ -1562,6 +1611,19 @@ int main(int argc, char **argv) {
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
                      " -L\"%s\" -Wl,-rpath,\"%s\"", zan_lib_dirs[di], zan_lib_dirs[di]);
         }
+        /* Runtime search path relative to the executable, so a --publish build
+         * whose driver dylibs are copied next to the exe stays self-contained
+         * even after the whole directory is relocated to the target machine. */
+        if (used_driver_count > 0) {
+            size_t cur = strlen(link_cmd);
+#ifdef __APPLE__
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " -Wl,-rpath,@loader_path");
+#else
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " -Wl,-rpath,'$ORIGIN'");
+#endif
+        }
         /* Windows-only system import libraries have no counterpart on
          * Unix (their functionality is provided through the cross-platform
          * zan_gui native library instead), so skip them here - mirroring the
@@ -1627,14 +1689,16 @@ int main(int argc, char **argv) {
                 snprintf(drv, sizeof(drv), "%.*s",
                          used_driver_len[d], used_drivers[d]);
 
-                /* candidate runtime file names for this driver */
-                char cands[4][128]; int ncand = 0;
+                /* candidate runtime file names for this driver. The cap must
+                 * cover a driver's whole dependency closure (e.g. libpq ships
+                 * libpq + its OpenSSL and Kerberos dylibs -> 8 files). */
+                char cands[16][128]; int ncand = 0;
                 char manifest[1200];
                 snprintf(manifest, sizeof(manifest), "%s/%s.bundle", driver_dir, drv);
                 FILE *mf = fopen(manifest, "rb");
                 if (mf) {
                     char line[128];
-                    while (ncand < 4 && fgets(line, sizeof(line), mf)) {
+                    while (ncand < 16 && fgets(line, sizeof(line), mf)) {
                         size_t l = strlen(line);
                         while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'
                                          || line[l-1] == ' ' || line[l-1] == '\t'))

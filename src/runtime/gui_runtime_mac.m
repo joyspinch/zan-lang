@@ -11,6 +11,7 @@
  */
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
+#import <WebKit/WebKit.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,9 @@ typedef uint32_t u32;
 
 /* Implemented in gui_runtime.c; not part of the [DllImport] ABI. */
 extern u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride);
+
+/* Defined below; used by the client-side title-bar metrics helpers. */
+i64 zan_gui_get_dpi_scale(void);
 
 #define EXPORT __attribute__((visibility("default")))
 
@@ -94,14 +98,41 @@ static int evq_pop(void) {
 @implementation ZanView
 - (BOOL)isFlipped { return YES; }          /* top-left origin, matches surface */
 - (BOOL)acceptsFirstResponder { return YES; }
+/* The window is borderless and draws its own title bar, so no part of the
+ * content view should trigger the system "drag anywhere" behavior; window
+ * dragging is initiated explicitly from the caption region (see decode_event). */
+- (BOOL)mouseDownCanMoveWindow { return NO; }
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
     if (!frame) return;
     CGContextRef ctx = (CGContextRef)[[NSGraphicsContext currentContext] CGContext];
     if (!ctx) return;
+    /* The surface uses a top-left origin (row 0 = top), but Core Graphics blits
+     * images bottom-up; flip the CTM so row 0 lands at the top of this flipped
+     * view instead of the bottom. */
+    CGContextSaveGState(ctx);
+    CGContextTranslateCTM(ctx, 0, self.bounds.size.height);
+    CGContextScaleCTM(ctx, 1.0, -1.0);
     CGContextDrawImage(ctx, self.bounds, frame);
+    CGContextRestoreGState(ctx);
 }
 @end
+
+/* Borderless windows are not key/main by default; allow both so the app still
+ * receives keyboard focus and looks active without a native title bar. */
+@interface ZanWindow : NSWindow
+@end
+@implementation ZanWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
+/* Client-side title-bar metrics (borderless window). The app draws its own
+ * caption; these mirror the X11 backend so the draggable caption region and
+ * the (non-draggable) caption-button cluster line up with what Zan paints. */
+static int g_caption_btn_count = 5;
+static int zan_titlebar_h(void) { return (int)(32 * zan_gui_get_dpi_scale() / 100); }
+static int zan_caption_btn_w(void) { return (int)(46 * zan_gui_get_dpi_scale() / 100); }
 
 /* Window delegate: surfaces resize (kind 7) and close (kind 8) events, which
  * do not flow through -nextEventMatchingMask:, so the app can relayout and
@@ -140,9 +171,13 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         if (!g_delegate) g_delegate = [[ZanDelegate alloc] init];
 
         NSRect rect = NSMakeRect(0, 0, (CGFloat)width, (CGFloat)height);
-        NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                           NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
-        NSWindow *window = [[NSWindow alloc] initWithContentRect:rect
+        /* Borderless: the app paints its own title bar/caption buttons, matching
+         * the Win32 (WS_POPUP) and X11 (override caption) backends. Keep the
+         * resizable/miniaturizable capabilities so edge-resize still works. */
+        NSUInteger style = NSWindowStyleMaskBorderless |
+                           NSWindowStyleMaskMiniaturizable |
+                           NSWindowStyleMaskResizable;
+        NSWindow *window = [[ZanWindow alloc] initWithContentRect:rect
                                                styleMask:style
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
@@ -151,6 +186,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         [window setContentView:view];
         [window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
         [window setDelegate:g_delegate];          /* one delegate serves all windows */
+        [window setMovableByWindowBackground:NO]; /* dragging is caption-driven */
         if (title) {
             [window setTitle:[NSString stringWithUTF8String:title]];
         }
@@ -274,13 +310,31 @@ static void decode_event(NSEvent *ev) {
     long lx = (long)local.x, ly = (long)local.y;
 
     switch (type) {
+    case NSEventTypeApplicationDefined:
+        /* A wake posted from a background thread or a WebKit navigation
+         * callback: deliver an empty (kind 0) event so pump() returns and the
+         * app runs DrainPosts()/repaints (matches Win32/X11 Wake semantics). */
+        evq_push(0, 0, 0, 0, 0, 0);
+        break;
     case NSEventTypeMouseMoved:
     case NSEventTypeLeftMouseDragged:
     case NSEventTypeRightMouseDragged:
     case NSEventTypeOtherMouseDragged:
         evq_push(1, lx, ly, 0, 0, mods);
         break;
-    case NSEventTypeLeftMouseDown:  evq_push(2, lx, ly, 0, 0, mods); break;
+    case NSEventTypeLeftMouseDown: {
+        /* Caption drag: mirror the Win32/X11 WM_NCHITTEST logic. A press in the
+         * title-bar strip that is left of the caption-button cluster drags the
+         * window natively and is not delivered as a client click; presses over
+         * the buttons or below the caption fall through as ordinary clicks. */
+        int capW = g_caption_btn_count * zan_caption_btn_w();
+        if (mw && ly >= 0 && ly < zan_titlebar_h() && lx < mw->w - capW) {
+            [win performWindowDragWithEvent:ev];
+            break;
+        }
+        evq_push(2, lx, ly, 0, 0, mods);
+        break;
+    }
     case NSEventTypeRightMouseDown: evq_push(2, lx, ly, 1, 0, mods); break;
     case NSEventTypeOtherMouseDown: evq_push(2, lx, ly, 2, 0, mods); break;
     case NSEventTypeLeftMouseUp:    evq_push(3, lx, ly, 0, 0, mods); break;
@@ -471,7 +525,7 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
                 for (int py = 0; py < th; py++) {
                     int dy = (int)y + py;
                     if (dy < 0 || dy >= sh) continue;
-                    int sy = th - 1 - py;
+                    int sy = py;
                     for (int px = 0; px < tw; px++) {
                         int dx = (int)x + px;
                         if (dx < 0 || dx >= sw) continue;
@@ -536,6 +590,15 @@ EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw || !mw->view) return zan_gui_window_height();
     return (i64)[mw->view bounds].size.height;
+}
+
+/* ---- client-side title-bar metrics (borderless window) ---- */
+
+EXPORT i64 zan_gui_titlebar_height(void) { return (i64)zan_titlebar_h(); }
+EXPORT i64 zan_gui_caption_button_width(void) { return (i64)zan_caption_btn_w(); }
+EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+    if (count >= 0 && count <= 8) g_caption_btn_count = (int)count;
+    return 0;
 }
 
 /* ---- present: blit the software surface to the window ---- */
@@ -642,6 +705,411 @@ EXPORT i64 zan_gui_get_dpi_scale(void) {
                           : [[NSScreen mainScreen] backingScaleFactor];
         if (scale <= 0) scale = 1.0;
         return (i64)(scale * 100.0 + 0.5);
+    }
+}
+
+/* Report the caret position (client-area px) so an IME's composition/candidate
+ * windows can follow the cursor. Stored for parity with the Win32/X11 backends;
+ * macOS text entry currently flows through the shared software path, so this is
+ * advisory and does not reposition a live composition session. */
+static int g_ime_x = 0;
+static int g_ime_y = 0;
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
+    g_ime_x = (int)x;
+    g_ime_y = (int)y;
+}
+
+/* ========================================================================
+ * Embedded WebView (WKWebView).
+ *
+ * Each web view is a WKWebView added as a subview of a window's (flipped)
+ * content view, so its frame uses the same top-left client coordinates the
+ * software renderer draws in. A per-view navigation delegate tracks the last
+ * request URL, the last HTTP response status, and bumps a navigation counter
+ * on each finished/failed load so the Zan widget can react by polling. Cookie
+ * access and JavaScript evaluation use WebKit's asynchronous APIs; because the
+ * Zan event loop calls these from the main thread we drive them to completion
+ * by spinning the run loop (with a timeout) rather than blocking on a
+ * semaphore, which would deadlock the main queue.
+ * ======================================================================== */
+#define ZAN_MAX_WEBVIEWS 32
+
+@class ZanWebViewDelegate;
+
+typedef struct {
+    int used;
+    WKWebView *wv;
+    ZanWebViewDelegate *delegate;
+    NSWindow *ownerWindow;
+    long navSeq;      /* incremented on each finished/failed navigation */
+    int lastStatus;   /* last HTTP response status code (0 if none) */
+    char *urlBuf;
+    char *titleBuf;
+    char *lastReqBuf;
+    char *evalBuf;
+    char *cookieBuf;
+} zan_webview_t;
+
+static zan_webview_t g_webviews[ZAN_MAX_WEBVIEWS];
+
+@interface ZanWebViewDelegate : NSObject <WKNavigationDelegate>
+@property (nonatomic) int slot;
+@end
+
+@implementation ZanWebViewDelegate
+- (void)webView:(WKWebView *)wv
+    decidePolicyForNavigationAction:(WKNavigationAction *)action
+                    decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    (void)wv;
+    NSURL *u = action.request.URL;
+    if (u && self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) {
+        zan_webview_t *w = &g_webviews[self.slot];
+        const char *s = [[u absoluteString] UTF8String];
+        char *nb = strdup(s ? s : "");
+        if (nb) { free(w->lastReqBuf); w->lastReqBuf = nb; }
+    }
+    decisionHandler(WKNavigationActionPolicyAllow);
+}
+- (void)webView:(WKWebView *)wv
+    decidePolicyForNavigationResponse:(WKNavigationResponse *)response
+                      decisionHandler:(void (^)(WKNavigationResponsePolicy))decisionHandler {
+    (void)wv;
+    if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS &&
+        [response.response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response.response;
+        g_webviews[self.slot].lastStatus = (int)http.statusCode;
+    }
+    decisionHandler(WKNavigationResponsePolicyAllow);
+}
+- (void)webView:(WKWebView *)wv
+    didStartProvisionalNavigation:(WKNavigation *)navigation {
+    (void)wv; (void)navigation;
+    /* Loading began: bump so the app repaints (URL/loading state changed). */
+    if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) g_webviews[self.slot].navSeq++;
+    zan_gui_wake();
+}
+- (void)webView:(WKWebView *)wv didCommitNavigation:(WKNavigation *)navigation {
+    (void)wv; (void)navigation;
+    if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) g_webviews[self.slot].navSeq++;
+    zan_gui_wake();
+}
+- (void)webView:(WKWebView *)wv didFinishNavigation:(WKNavigation *)navigation {
+    (void)wv; (void)navigation;
+    if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) g_webviews[self.slot].navSeq++;
+    zan_gui_wake();
+}
+- (void)webView:(WKWebView *)wv
+    didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    (void)wv; (void)navigation; (void)error;
+    if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) g_webviews[self.slot].navSeq++;
+    zan_gui_wake();
+}
+- (void)webView:(WKWebView *)wv
+    didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    (void)wv; (void)navigation; (void)error;
+    if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) g_webviews[self.slot].navSeq++;
+    zan_gui_wake();
+}
+- (void)webView:(WKWebView *)wv didReceiveServerRedirectForProvisionalNavigation:(WKNavigation *)navigation {
+    (void)wv; (void)navigation;
+    if (self.slot >= 0 && self.slot < ZAN_MAX_WEBVIEWS) g_webviews[self.slot].navSeq++;
+    zan_gui_wake();
+}
+@end
+
+static WKWebView *wv_get(i64 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return nil;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    return w->used ? w->wv : nil;
+}
+
+/* Copy s into the given per-view buffer slot and return it (valid until the
+ * next call for that slot's field). */
+static const char *wv_store(char **slot, const char *s) {
+    char *nb = strdup(s ? s : "");
+    if (!nb) return "";
+    free(*slot);
+    *slot = nb;
+    return *slot;
+}
+
+/* Spin the main run loop until *done or the timeout elapses. Used to bridge
+ * WebKit's async cookie/JS APIs to a synchronous ABI without deadlocking. */
+static void wv_spin(volatile BOOL *done, double timeout) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (!*done && [deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop]
+            runMode:NSDefaultRunLoopMode
+            beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
+}
+
+EXPORT i64 zan_gui_webview_create(i64 hwnd_val) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw || !mw->view) return 0;
+    int slot = -1;
+    for (int i = 0; i < ZAN_MAX_WEBVIEWS; i++) {
+        if (!g_webviews[i].used) { slot = i; break; }
+    }
+    if (slot < 0) return 0;
+    @autoreleasepool {
+        WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+        WKWebView *wv = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)
+                                           configuration:cfg];
+        [cfg release];
+        ZanWebViewDelegate *d = [[ZanWebViewDelegate alloc] init];
+        d.slot = slot;
+        wv.navigationDelegate = d;   /* weak; the +1 from alloc keeps it alive */
+        [wv setHidden:YES];
+        [mw->view addSubview:wv];    /* view retains wv; keep our +1 too */
+
+        zan_webview_t *w = &g_webviews[slot];
+        w->used = 1;
+        w->wv = wv;
+        w->delegate = d;
+        w->ownerWindow = mw->window;
+        w->navSeq = 0;
+        w->lastStatus = 0;
+        w->urlBuf = NULL;
+        w->titleBuf = NULL;
+        w->lastReqBuf = NULL;
+        w->evalBuf = NULL;
+        w->cookieBuf = NULL;
+    }
+    return (i64)(slot + 1);
+}
+
+EXPORT void zan_gui_webview_destroy(i64 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used) return;
+    @autoreleasepool {
+        if (w->wv) {
+            w->wv.navigationDelegate = nil;
+            [w->wv removeFromSuperview]; /* drop the superview's retain */
+            [w->wv release];             /* drop our create-time retain */
+        }
+        if (w->delegate) [w->delegate release];
+    }
+    free(w->urlBuf);
+    free(w->titleBuf);
+    free(w->lastReqBuf);
+    free(w->evalBuf);
+    free(w->cookieBuf);
+    memset(w, 0, sizeof(*w));
+}
+
+EXPORT void zan_gui_webview_set_frame(i64 h, i64 x, i64 y, i64 w, i64 hh) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    [wv setFrame:NSMakeRect((CGFloat)x, (CGFloat)y, (CGFloat)w, (CGFloat)hh)];
+}
+
+EXPORT void zan_gui_webview_set_visible(i64 h, i64 visible) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    [wv setHidden:(visible ? NO : YES)];
+}
+
+EXPORT void zan_gui_webview_navigate(i64 h, const char *url) {
+    WKWebView *wv = wv_get(h);
+    if (!wv || !url || !*url) return;
+    @autoreleasepool {
+        NSString *s = [NSString stringWithUTF8String:url];
+        NSURL *u = [NSURL URLWithString:s];
+        if (!u || ![u scheme]) {
+            u = [NSURL URLWithString:[@"https://" stringByAppendingString:s]];
+        }
+        if (u) [wv loadRequest:[NSURLRequest requestWithURL:u]];
+    }
+}
+
+EXPORT void zan_gui_webview_load_html(i64 h, const char *html, const char *base_url) {
+    WKWebView *wv = wv_get(h);
+    if (!wv || !html) return;
+    @autoreleasepool {
+        NSString *body = [NSString stringWithUTF8String:html];
+        NSURL *base = (base_url && *base_url)
+                          ? [NSURL URLWithString:[NSString stringWithUTF8String:base_url]]
+                          : nil;
+        [wv loadHTMLString:(body ? body : @"") baseURL:base];
+    }
+}
+
+EXPORT void zan_gui_webview_back(i64 h) {
+    WKWebView *wv = wv_get(h);
+    if (wv && [wv canGoBack]) [wv goBack];
+}
+
+EXPORT void zan_gui_webview_forward(i64 h) {
+    WKWebView *wv = wv_get(h);
+    if (wv && [wv canGoForward]) [wv goForward];
+}
+
+EXPORT void zan_gui_webview_reload(i64 h) {
+    WKWebView *wv = wv_get(h);
+    if (wv) [wv reload];
+}
+
+EXPORT void zan_gui_webview_stop(i64 h) {
+    WKWebView *wv = wv_get(h);
+    if (wv) [wv stopLoading];
+}
+
+EXPORT i64 zan_gui_webview_can_go_back(i64 h) {
+    WKWebView *wv = wv_get(h);
+    return (wv && [wv canGoBack]) ? 1 : 0;
+}
+
+EXPORT i64 zan_gui_webview_can_go_forward(i64 h) {
+    WKWebView *wv = wv_get(h);
+    return (wv && [wv canGoForward]) ? 1 : 0;
+}
+
+EXPORT i64 zan_gui_webview_is_loading(i64 h) {
+    WKWebView *wv = wv_get(h);
+    return (wv && [wv isLoading]) ? 1 : 0;
+}
+
+EXPORT i64 zan_gui_webview_nav_seq(i64 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return 0;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    return w->used ? (i64)w->navSeq : 0;
+}
+
+EXPORT i64 zan_gui_webview_last_status(i64 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return 0;
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    return w->used ? (i64)w->lastStatus : 0;
+}
+
+EXPORT const char *zan_gui_webview_get_url(i64 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used || !w->wv) return "";
+    @autoreleasepool {
+        NSURL *u = w->wv.URL;
+        const char *s = u ? [[u absoluteString] UTF8String] : "";
+        return wv_store(&w->urlBuf, s);
+    }
+}
+
+EXPORT const char *zan_gui_webview_get_title(i64 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used || !w->wv) return "";
+    @autoreleasepool {
+        NSString *t = w->wv.title;
+        const char *s = t ? [t UTF8String] : "";
+        return wv_store(&w->titleBuf, s);
+    }
+}
+
+EXPORT const char *zan_gui_webview_last_request(i64 h) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used) return "";
+    return w->lastReqBuf ? w->lastReqBuf : "";
+}
+
+EXPORT const char *zan_gui_webview_eval(i64 h, const char *js) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used || !w->wv || !js) return "";
+    @autoreleasepool {
+        NSString *script = [NSString stringWithUTF8String:js];
+        __block BOOL done = NO;
+        __block NSString *out = nil;
+        [w->wv evaluateJavaScript:(script ? script : @"")
+                completionHandler:^(id result, NSError *error) {
+            if (!error && result && result != [NSNull null]) {
+                out = [[NSString stringWithFormat:@"%@", result] retain];
+            }
+            done = YES;
+        }];
+        wv_spin(&done, 3.0);
+        const char *s = out ? [out UTF8String] : "";
+        const char *ret = wv_store(&w->evalBuf, s);
+        if (out) [out release];
+        return ret;
+    }
+}
+
+EXPORT const char *zan_gui_webview_get_cookies(i64 h, const char *url) {
+    if (h < 1 || h > ZAN_MAX_WEBVIEWS) return "";
+    zan_webview_t *w = &g_webviews[(int)h - 1];
+    if (!w->used || !w->wv) return "";
+    @autoreleasepool {
+        NSString *filterHost = nil;
+        if (url && *url) {
+            NSURL *u = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
+            filterHost = u ? [u host] : nil;
+        }
+        WKHTTPCookieStore *store =
+            w->wv.configuration.websiteDataStore.httpCookieStore;
+        __block BOOL done = NO;
+        __block NSArray<NSHTTPCookie *> *cookies = nil;
+        [store getAllCookies:^(NSArray<NSHTTPCookie *> *result) {
+            cookies = [result retain];
+            done = YES;
+        }];
+        wv_spin(&done, 3.0);
+        NSMutableString *acc = [NSMutableString string];
+        for (NSHTTPCookie *c in cookies) {
+            if (filterHost) {
+                NSString *dom = [c domain];
+                NSString *bare = [dom hasPrefix:@"."] ? [dom substringFromIndex:1] : dom;
+                if (!([filterHost isEqualToString:dom] ||
+                      [filterHost isEqualToString:bare] ||
+                      [filterHost hasSuffix:bare])) {
+                    continue;
+                }
+            }
+            if ([acc length] > 0) [acc appendString:@"; "];
+            [acc appendFormat:@"%@=%@", [c name], [c value]];
+        }
+        if (cookies) [cookies release];
+        return wv_store(&w->cookieBuf, [acc UTF8String]);
+    }
+}
+
+EXPORT void zan_gui_webview_set_cookie(i64 h, const char *url,
+                                       const char *name, const char *value) {
+    WKWebView *wv = wv_get(h);
+    if (!wv || !url || !name) return;
+    @autoreleasepool {
+        NSURL *u = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
+        NSString *host = u ? [u host] : nil;
+        if (!host) return;
+        NSString *path = ([u path] && [[u path] length] > 0) ? [u path] : @"/";
+        NSDictionary *props = @{
+            NSHTTPCookieName: [NSString stringWithUTF8String:name],
+            NSHTTPCookieValue: [NSString stringWithUTF8String:(value ? value : "")],
+            NSHTTPCookieDomain: host,
+            NSHTTPCookiePath: path
+        };
+        NSHTTPCookie *cookie = [NSHTTPCookie cookieWithProperties:props];
+        if (!cookie) return;
+        WKHTTPCookieStore *store =
+            wv.configuration.websiteDataStore.httpCookieStore;
+        __block BOOL done = NO;
+        [store setCookie:cookie completionHandler:^{ done = YES; }];
+        wv_spin(&done, 3.0);
+    }
+}
+
+EXPORT void zan_gui_webview_clear_cookies(i64 h) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    @autoreleasepool {
+        WKWebsiteDataStore *ds = wv.configuration.websiteDataStore;
+        NSSet *types = [NSSet setWithObject:WKWebsiteDataTypeCookies];
+        __block BOOL done = NO;
+        [ds removeDataOfTypes:types
+                modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
+            completionHandler:^{ done = YES; }];
+        wv_spin(&done, 3.0);
     }
 }
 
