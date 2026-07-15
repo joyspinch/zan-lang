@@ -1502,8 +1502,12 @@ int main(int argc, char **argv) {
             link_ret = (int)_spawnv(_P_WAIT, ld_path, argv);
         } else {
             char link_cmd[4096];
+            /* 256 MB stack: the self-hosted compiler recurses deeply. Mirrors
+             * the bundled-ld branch above; without it a clang-linked zanc
+             * overflows the default 1 MB Windows stack when self-compiling. */
             snprintf(link_cmd, sizeof(link_cmd),
-                     "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\"%s",
+                     "clang --target=x86_64-w64-windows-gnu \"%s\" -o \"%s\" "
+                     "-Wl,--stack,268435456%s",
                      obj_tmp, obj_path, publish_mode ? " -O2 -s" : "");
             if (rt_io_obj) {
                 size_t cur = strlen(link_cmd);
