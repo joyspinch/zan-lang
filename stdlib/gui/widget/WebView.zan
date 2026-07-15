@@ -1,0 +1,275 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// Embedded native web view (browser control).
+///
+/// Backed by a platform browser engine through the zan_gui runtime: a real
+/// WKWebView on macOS, a placeholder elsewhere (Windows/Linux backends return
+/// no handle, so IsSupported() is false and Render paints an in-canvas notice
+/// instead of embedding a live browser).
+///
+/// The native view is a sibling layer that floats above the software-rendered
+/// surface, so drive it every frame from the owning region:
+///   WebView web = WebView.Create();
+///   web.NavComplete += () => { ... };   // fires when a load finishes
+///   web.Navigate("https://example.com");
+///   // per frame, for the visible tab:
+///   web.Render(app, x, y, w, h);
+///   // per frame, for hidden tabs:
+///   web.Hide();
+///
+/// Common browser features are exposed: history (Back/Forward/Reload/Stop),
+/// URL + title monitoring (reactive Url()/Title() signals + NavComplete),
+/// the last request URL and HTTP status, JavaScript evaluation (Eval, the
+/// general escape hatch for reading request params / response bodies) and
+/// cookie access (GetCookies/SetCookie/ClearCookies).
+class WebView {
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_create(int hwnd);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_destroy(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_set_frame(int h, int x, int y, int w, int hh);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_set_visible(int h, int visible);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_navigate(int h, string url);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_load_html(int h, string html, string baseUrl);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_back(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_forward(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_reload(int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_stop(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_can_go_back(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_can_go_forward(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_is_loading(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_nav_seq(int h);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_webview_last_status(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_get_url(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_get_title(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_last_request(int h);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_eval(int h, string js);
+    [DllImport("zan_gui")]
+    static extern string zan_gui_webview_get_cookies(int h, string url);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_set_cookie(int h, string url, string cookieName, string cookieValue);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_webview_clear_cookies(int h);
+
+    int handle;        // native webview handle (0 = not yet created / unsupported)
+    bool created;      // native create attempted
+    bool supported;    // native backend produced a live webview
+    int lastNavSeq;    // last navigation counter observed (URL-change monitor)
+    string pendingUrl; // navigate requested before native creation
+    string pendingHtml;
+    string pendingBase;
+
+    SignalString url;
+    SignalString title;
+
+    /// Fires when a navigation finishes (or fails), i.e. the current URL/title
+    /// may have changed. Reactive Url()/Title() are updated just before it.
+    UiEvent NavComplete;
+
+    static WebView Create() {
+        WebView w = new WebView();
+        w.handle = 0;
+        w.created = false;
+        w.supported = true;
+        w.lastNavSeq = 0;
+        w.pendingUrl = "";
+        w.pendingHtml = "";
+        w.pendingBase = "";
+        w.url = SignalString.Create("");
+        w.title = SignalString.Create("");
+        w.NavComplete = UiEvent.Create();
+        return w;
+    }
+
+    void EnsureCreated(App app) {
+        if (created) { return; }
+        created = true;
+        handle = WebView.zan_gui_webview_create(app.window.GetHandle());
+        if (handle == 0) {
+            supported = false;
+            return;
+        }
+        supported = true;
+        if (pendingUrl != "") {
+            WebView.zan_gui_webview_navigate(handle, pendingUrl);
+            pendingUrl = "";
+        } else if (pendingHtml != "") {
+            WebView.zan_gui_webview_load_html(handle, pendingHtml, pendingBase);
+            pendingHtml = "";
+            pendingBase = "";
+        }
+    }
+
+    /// True when a live native web view is available on this platform.
+    bool IsSupported() { return supported; }
+
+    /// Reactive current URL / document title (updated on each navigation).
+    SignalString Url() { return url; }
+    SignalString Title() { return title; }
+    string CurrentUrl() { return url.Get(); }
+    string CurrentTitle() { return title.Get(); }
+
+    /// Navigates to a URL. A bare host (no scheme) is treated as https://.
+    void Navigate(string target) {
+        string u = WebView.Normalize(target);
+        if (!created || !supported) {
+            pendingUrl = u;
+            pendingHtml = "";
+            return;
+        }
+        WebView.zan_gui_webview_navigate(handle, u);
+    }
+
+    /// Loads an in-memory HTML string (baseUrl resolves relative links; "" ok).
+    void LoadHtml(string html, string baseUrl) {
+        if (!created || !supported) {
+            pendingHtml = html;
+            pendingBase = baseUrl;
+            pendingUrl = "";
+            return;
+        }
+        WebView.zan_gui_webview_load_html(handle, html, baseUrl);
+    }
+
+    void Back() { if (supported && handle != 0) { WebView.zan_gui_webview_back(handle); } }
+    void Forward() { if (supported && handle != 0) { WebView.zan_gui_webview_forward(handle); } }
+    void Reload() { if (supported && handle != 0) { WebView.zan_gui_webview_reload(handle); } }
+    void Stop() { if (supported && handle != 0) { WebView.zan_gui_webview_stop(handle); } }
+
+    bool CanGoBack() {
+        if (!supported || handle == 0) { return false; }
+        return WebView.zan_gui_webview_can_go_back(handle) != 0;
+    }
+    bool CanGoForward() {
+        if (!supported || handle == 0) { return false; }
+        return WebView.zan_gui_webview_can_go_forward(handle) != 0;
+    }
+    bool IsLoading() {
+        if (!supported || handle == 0) { return false; }
+        return WebView.zan_gui_webview_is_loading(handle) != 0;
+    }
+
+    /// HTTP status code of the last response (0 if none / non-HTTP).
+    int LastStatus() {
+        if (!supported || handle == 0) { return 0; }
+        return WebView.zan_gui_webview_last_status(handle);
+    }
+    /// URL of the most recent navigation request seen by the view.
+    string LastRequest() {
+        if (!supported || handle == 0) { return ""; }
+        return WebView.zan_gui_webview_last_request(handle);
+    }
+
+    /// Runs JavaScript in the page and returns its result stringified ("" on
+    /// error / no result). Use it to read request parameters, DOM state or a
+    /// response body fetched from the page.
+    string Eval(string js) {
+        if (!supported || handle == 0) { return ""; }
+        return WebView.zan_gui_webview_eval(handle, js);
+    }
+
+    /// Cookies for `url` serialized as "name=value; name2=value2" ("" if none).
+    /// Pass "" to get every cookie in the store.
+    string GetCookies(string forUrl) {
+        if (!supported || handle == 0) { return ""; }
+        return WebView.zan_gui_webview_get_cookies(handle, forUrl);
+    }
+    /// Sets a cookie on the store for `url`'s host (path defaults to "/").
+    void SetCookie(string forUrl, string cookieName, string cookieValue) {
+        if (supported && handle != 0) {
+            WebView.zan_gui_webview_set_cookie(handle, forUrl, cookieName, cookieValue);
+        }
+    }
+    /// Clears all cookies from the shared store.
+    void ClearCookies() {
+        if (supported && handle != 0) { WebView.zan_gui_webview_clear_cookies(handle); }
+    }
+
+    /// Hides the native view (call for tabs/panes that are not on screen).
+    void Hide() {
+        if (created && supported && handle != 0) {
+            WebView.zan_gui_webview_set_visible(handle, 0);
+        }
+    }
+
+    /// Destroys the native view and releases its resources.
+    void Destroy() {
+        if (created && supported && handle != 0) {
+            WebView.zan_gui_webview_destroy(handle);
+        }
+        handle = 0;
+        created = false;
+    }
+
+    /// Places the native view at the given client-area rect and shows it, then
+    /// polls for navigation changes (updating Url()/Title() and raising
+    /// NavComplete). On platforms without a native web view it paints an
+    /// in-canvas placeholder covering the same rect.
+    int Render(App app, int x, int y, int w, int h) {
+        EnsureCreated(app);
+        if (!supported) {
+            WebView.PaintPlaceholder(app, x, y, w, h);
+            return handle;
+        }
+        WebView.zan_gui_webview_set_frame(handle, x, y, w, h);
+        WebView.zan_gui_webview_set_visible(handle, 1);
+
+        int seq = WebView.zan_gui_webview_nav_seq(handle);
+        if (seq != lastNavSeq) {
+            lastNavSeq = seq;
+            url.Set(WebView.zan_gui_webview_get_url(handle));
+            title.Set(WebView.zan_gui_webview_get_title(handle));
+            NavComplete.Raise();
+            app.RequestRedraw();
+        }
+        return handle;
+    }
+
+    static void PaintPlaceholder(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, t.borderWidth);
+        Icon.DrawCenteredIn(c, "globe", x, y - app.Scale(28),
+            w, h, t.iconSizeLarge, t.textTertiary);
+        c.DrawTextCentered(x, y + app.Scale(18), w, h,
+            "WebView needs a native backend (available on macOS)",
+            t.textSecondary, t.fontSizeMedium);
+    }
+
+    static string Normalize(string target) {
+        if (target == "") { return ""; }
+        if (WebView.HasScheme(target)) { return target; }
+        return "https://" + target;
+    }
+
+    static bool HasScheme(string s) {
+        int n = s.Length;
+        int i = 0;
+        while (i + 2 < n) {
+            if (s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/') { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+}
