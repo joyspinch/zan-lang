@@ -203,6 +203,28 @@ zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name) {
     return scope_find(b->current_scope, name);
 }
 
+/* ---- generic type-parameter scopes ---- */
+
+zan_scope_t *zan_binder_push_type_params(zan_binder_t *b, zan_ast_list_t *type_params) {
+    zan_scope_t *saved = b->current_scope;
+    if (!type_params || type_params->count == 0) return saved;
+    b->current_scope = scope_new(b->arena, saved);
+    for (int i = 0; i < type_params->count; i++) {
+        zan_ast_node_t *tp = type_params->items[i];
+        if (!tp || tp->kind != AST_IDENTIFIER) continue;
+        zan_type_t *tp_type = make_type(b->arena, TYPE_TYPE_PARAM,
+                                        tp->ident.name.str, tp->ident.name.len);
+        zan_symbol_t *tp_sym = make_symbol(b->arena, SYM_TYPE_PARAM,
+                                           tp->ident.name, tp_type, tp, 0);
+        scope_add(b->arena, b->current_scope, tp_sym);
+    }
+    return saved;
+}
+
+void zan_binder_restore_scope(zan_binder_t *b, zan_scope_t *saved) {
+    b->current_scope = saved;
+}
+
 /* ---- binding passes ---- */
 
 static zan_sym_kind_t ast_kind_to_sym_kind(zan_ast_kind_t kind) {
@@ -242,6 +264,11 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
                 continue;
             }
             zan_type_t *type = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
+            /* Generic delegates (delegate R Name<T,...>(...)): register the
+             * type params in a temporary scope so T resolves while binding the
+             * delegate's signature. */
+            zan_scope_t *dsaved = zan_binder_push_type_params(
+                b, &node->method_decl.type_params);
             /* resolve delegate return type */
             type->delegate_ret_type = node->method_decl.return_type
                 ? zan_binder_resolve_type(b, node->method_decl.return_type)
@@ -259,6 +286,9 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
             } else {
                 type->delegate_param_types = NULL;
             }
+            /* restore the enclosing scope so the delegate symbol itself is
+             * registered where it is visible (not in the temp type-param scope). */
+            zan_binder_restore_scope(b, dsaved);
             zan_symbol_t *sym = make_symbol(b->arena, SYM_DELEGATE,
                 name, type, node, node->method_decl.modifiers);
             type->sym = sym;
@@ -346,12 +376,15 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             break;
         }
         case AST_METHOD_DECL: {
+            /* Generic methods (static R M<T,...>(...)): register method type
+             * params in a temp scope so T resolves in the return type, param
+             * types, and (via the AST) the body. Erased to i64 at codegen. */
+            zan_scope_t *m_saved = zan_binder_push_type_params(
+                b, &member->method_decl.type_params);
             zan_type_t *ret_type = zan_binder_resolve_type(b, member->method_decl.return_type);
             zan_symbol_t *method_sym = make_symbol(b->arena, SYM_METHOD,
                 member->method_decl.name, ret_type, member,
                 member->method_decl.modifiers);
-            scope_add(b->arena, b->current_scope, method_sym);
-            symbol_add_member(b->arena, type_sym, method_sym);
 
             /* bind parameters */
             for (int j = 0; j < member->method_decl.params.count; j++) {
@@ -361,6 +394,11 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                     param->param.name, param_type, param, 0);
                 symbol_add_member(b->arena, method_sym, param_sym);
             }
+
+            /* restore enclosing scope; the method symbol lives at class scope. */
+            zan_binder_restore_scope(b, m_saved);
+            scope_add(b->arena, b->current_scope, method_sym);
+            symbol_add_member(b->arena, type_sym, method_sym);
             break;
         }
         case AST_CONSTRUCTOR_DECL: {

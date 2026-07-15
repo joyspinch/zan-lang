@@ -1028,6 +1028,11 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
     case TYPE_CHAR:   return LLVMInt64TypeInContext(g->ctx);
+    /* Generic type parameters are erased to a uniform 64-bit slot: every Zan
+     * value (int/long/char/enum, pointers for string/object/class, and
+     * bit-cast doubles) fits in 64 bits, matching the List/Dict slot and the
+     * i64-based lambda/delegate ABI. */
+    case TYPE_TYPE_PARAM: return LLVMInt64TypeInContext(g->ctx);
     case TYPE_STRING: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_OBJECT: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_ENUM:
@@ -6945,9 +6950,29 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         local_scope_init(&lambda_locals, g->arena);
         for (int k = 0; k < pc; k++) {
             zan_ast_node_t *param = expr->lambda.params.items[k];
-            LLVMValueRef alloc = LLVMBuildAlloca(g->builder, i64, "lp");
-            LLVMBuildStore(g->builder, LLVMGetParam(lambda_fn, (unsigned)k), alloc);
-            local_add(&lambda_locals, param->param.name, alloc, g->binder->type_int);
+            /* Values cross the i64-erased delegate ABI. When a parameter is
+             * explicitly typed as a reference type (class/string), recover that
+             * type and its pointer representation so member access works inside
+             * the body; scalar params keep the plain i64 slot. */
+            LLVMTypeRef local_llvm = i64;
+            zan_type_t *local_zt = g->binder->type_int;
+            if (param->param.type) {
+                zan_type_t *pty = zan_binder_resolve_type(g->binder, param->param.type);
+                if (pty && pty->kind != TYPE_ERROR) {
+                    LLVMTypeRef mapped = map_type(g, pty);
+                    if (LLVMGetTypeKind(mapped) == LLVMPointerTypeKind) {
+                        local_llvm = mapped;
+                        local_zt = pty;
+                    }
+                }
+            }
+            LLVMValueRef alloc = LLVMBuildAlloca(g->builder, local_llvm, "lp");
+            LLVMValueRef incoming = LLVMGetParam(lambda_fn, (unsigned)k);
+            if (local_llvm != i64) {
+                incoming = LLVMBuildIntToPtr(g->builder, incoming, local_llvm, "lp.ptr");
+            }
+            LLVMBuildStore(g->builder, incoming, alloc);
+            local_add(&lambda_locals, param->param.name, alloc, local_zt);
         }
 
         if (expr->lambda.body) {
@@ -8612,6 +8637,25 @@ typedef struct {
     int             sub_base;       /* frame index of the first sub-task slot */
 } method_body_work_t;
 
+/* Make an enclosing generic type's and a generic method's type parameters
+ * resolvable (as TYPE_TYPE_PARAM → i64) while resolving that method's signature
+ * and emitting its body. Returns the scope to hand to zan_binder_restore_scope. */
+static zan_scope_t *irgen_enter_generic_scope(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                              zan_ast_node_t *member) {
+    zan_scope_t *saved = g->binder->current_scope;
+    if (type_sym && type_sym->decl &&
+        (type_sym->decl->kind == AST_CLASS_DECL ||
+         type_sym->decl->kind == AST_STRUCT_DECL ||
+         type_sym->decl->kind == AST_INTERFACE_DECL ||
+         type_sym->decl->kind == AST_ENUM_DECL)) {
+        zan_binder_push_type_params(g->binder, &type_sym->decl->type_decl.type_params);
+    }
+    if (member && member->kind == AST_METHOD_DECL) {
+        zan_binder_push_type_params(g->binder, &member->method_decl.type_params);
+    }
+    return saved;
+}
+
 static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
     /* Size an upper bound for the deferred body work list. */
     int work_cap = 0;
@@ -8739,6 +8783,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 param_offset = 1;
             }
 
+            zan_scope_t *sig_saved = irgen_enter_generic_scope(g, type_sym, member);
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
@@ -8750,6 +8795,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
                     : g->binder->type_void);
             LLVMTypeRef llvm_ret = map_type(g, ret_type);
+            zan_binder_restore_scope(g->binder, sig_saved);
             /* async methods lower to a heap frame + ramp + resume (see
              * docs/ASYNC_CPS_DESIGN.md); ctors are never async. */
             bool is_async = !is_ctor && (member->method_decl.modifiers & MOD_ASYNC) != 0;
@@ -8879,6 +8925,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         LLVMTypeRef llvm_ret = work[w].llvm_ret;
         zan_type_t *ret_type = work[w].ret_type;
         LLVMValueRef this_alloca = NULL;
+
+        /* Generic methods: keep their type parameters resolvable while the body
+         * resolves local/new/cast types (erased to i64). */
+        zan_scope_t *body_saved = irgen_enter_generic_scope(g, type_sym, member);
 
         /* async method: emit ramp (allocate frame, stash params, hand out the
          * task handle) + resume (state-machine entry running the body). See
@@ -9045,6 +9095,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             g->current_async_sub_next = saved_sub_next;
             g->current_async_slots = saved_slots;
             g->current_async_slot_count = saved_slot_count;
+            zan_binder_restore_scope(g->binder, body_saved);
             free(param_types);
             continue;
         }
@@ -9141,6 +9192,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_this = saved_this;
         g->current_type_sym = saved_type_sym;
         g->current_fn_body = saved_fn_body;
+        zan_binder_restore_scope(g->binder, body_saved);
         free(param_types);
     }
 

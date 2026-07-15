@@ -358,11 +358,18 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     if (!method->method_decl.body) return;
 
+    /* Generic methods: make their type parameters resolvable while checking the
+     * return type and body (they are erased to i64 at codegen). */
+    zan_scope_t *m_saved = zan_binder_push_type_params(
+        c->binder, &method->method_decl.type_params);
+
     zan_type_t *saved = c->current_return_type;
     c->current_return_type = zan_binder_resolve_type(c->binder,
                                                       method->method_decl.return_type);
     zan_checker_check_stmt(c, method->method_decl.body);
     c->current_return_type = saved;
+
+    zan_binder_restore_scope(c->binder, m_saved);
 }
 
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
@@ -375,6 +382,11 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
             continue;
         }
 
+        /* Generic types: make the type's own type parameters resolvable while
+         * checking all of its members. */
+        zan_scope_t *t_saved = zan_binder_push_type_params(
+            c->binder, &decl->type_decl.type_params);
+
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             if (member->kind == AST_METHOD_DECL ||
@@ -383,5 +395,7 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
                 check_method_body(c, member);
             }
         }
+
+        zan_binder_restore_scope(c->binder, t_saved);
     }
 }

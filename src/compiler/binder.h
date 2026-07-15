@@ -117,4 +117,12 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit);
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
 
+/* Generic support: temporarily make a list of type-parameter identifiers
+ * (AST_IDENTIFIER nodes, e.g. a method's or type's `type_params`) resolvable as
+ * TYPE_TYPE_PARAM. Push before resolving/checking/emitting a generic member's
+ * signature and body, then restore with the returned saved scope. Type
+ * parameters are erased to a uniform 64-bit slot at codegen (see map_type). */
+zan_scope_t *zan_binder_push_type_params(zan_binder_t *b, zan_ast_list_t *type_params);
+void zan_binder_restore_scope(zan_binder_t *b, zan_scope_t *saved);
+
 #endif /* ZAN_BINDER_H */
