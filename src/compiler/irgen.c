@@ -2725,6 +2725,36 @@ static LLVMValueRef coerce_generic_result(zan_irgen_t *g, LLVMValueRef result,
     return result;
 }
 
+/* For a call to a static generic method whose return type is a bare type
+ * parameter (e.g. `static T Id<T>(T v)`), recover the concrete return type by
+ * matching that type parameter against a parameter declared with the same
+ * name and taking the inferred type of the corresponding argument. Returns the
+ * concrete type, or NULL when it cannot be determined / does not apply. */
+static zan_type_t *subst_static_generic_ret(zan_irgen_t *g,
+                                            zan_symbol_t *method_sym,
+                                            zan_ast_node_t *call,
+                                            local_scope_t *locals) {
+    if (!method_sym || !call) return NULL;
+    zan_type_t *rt = method_sym->type;
+    if (!rt || rt->kind != TYPE_TYPE_PARAM) return NULL;
+    zan_ast_node_t *decl = method_sym->decl;
+    if (!decl || decl->kind != AST_METHOD_DECL) return NULL;
+    int n = decl->method_decl.params.count;
+    if (n > call->call.args.count) n = call->call.args.count;
+    for (int i = 0; i < n; i++) {
+        zan_ast_node_t *param = decl->method_decl.params.items[i];
+        zan_ast_node_t *pt = param->param.type;
+        if (pt && pt->kind == AST_TYPE_REF && pt->type_ref.type_args.count == 0 &&
+            !pt->type_ref.is_array &&
+            pt->type_ref.name.len == rt->name.len &&
+            memcmp(pt->type_ref.name.str, rt->name.str, (size_t)rt->name.len) == 0) {
+            zan_type_t *at = infer_expr_type(g, call->call.args.items[i], locals);
+            if (at && at->kind != TYPE_TYPE_PARAM) return at;
+        }
+    }
+    return NULL;
+}
+
 /* When the receiver's static type is a concrete instantiation of a user generic
  * class that has a registered specialized method, return the specialized
  * function (and its type via *out_ty); otherwise return the erased function
@@ -6055,9 +6085,13 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 for (int k = 0; k < argc; k++) {
                                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
+                                coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                zan_type_t *gret = subst_static_generic_ret(g, method_sym, expr, locals);
+                                if (gret)
+                                    result = emit_boundary_coerce(g, result, map_type(g, gret));
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {
@@ -6144,9 +6178,13 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 for (int k = 0; k < argc; k++) {
                                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
+                                coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                zan_type_t *gret = subst_static_generic_ret(g, method_sym, expr, locals);
+                                if (gret)
+                                    result = emit_boundary_coerce(g, result, map_type(g, gret));
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {

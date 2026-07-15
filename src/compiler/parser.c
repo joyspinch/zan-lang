@@ -502,6 +502,51 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     }
 }
 
+/* Token-level lookahead: with p->current on '<', decide whether it opens an
+ * explicit generic method type-argument list of a call, i.e. the matching '>'
+ * is immediately followed by '('. Restricts the inner tokens to things that can
+ * appear in a type so that relational expressions like `a < b` are left alone.
+ * Saves and restores lexer + token state; builds no AST. */
+static bool is_generic_call_args(zan_parser_t *p) {
+    zan_lexer_t saved_lex = *p->lex;
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    bool result = false;
+    bool bail = false;
+    int depth = 0;
+    while (!bail) {
+        zan_token_kind_t k = p->current.kind;
+        if (k == TK_EOF) break;
+        if (k == TK_LESS) { depth++; parser_advance(p); continue; }
+        if (k == TK_GREATER) {
+            depth--; parser_advance(p);
+            if (depth == 0) { result = (p->current.kind == TK_LPAREN); break; }
+            continue;
+        }
+        if (k == TK_GREATER_GREATER) {
+            depth -= 2; parser_advance(p);
+            if (depth <= 0) {
+                result = (depth == 0) && (p->current.kind == TK_LPAREN);
+                break;
+            }
+            continue;
+        }
+        switch (k) {
+        case TK_IDENT: case TK_DOT: case TK_COMMA:
+        case TK_LBRACKET: case TK_RBRACKET: case TK_QUESTION:
+        case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
+        case TK_FLOAT: case TK_DOUBLE: case TK_BOOL: case TK_CHAR:
+        case TK_STRING: case TK_VOID: case TK_OBJECT: case TK_NINT:
+            parser_advance(p); break;
+        default: bail = true; break;
+        }
+    }
+    *p->lex = saved_lex;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return result;
+}
+
 /* postfix: call, member access, index, ++, --, object initializer */
 static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     zan_ast_node_t *expr = parse_primary(p);
@@ -538,6 +583,23 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
 
     for (;;) {
         zan_loc_t loc = p->current.loc;
+
+        if (parser_check(p, TK_LESS) &&
+            (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS) &&
+            is_generic_call_args(p)) {
+            /* explicit generic method type arguments: Name<T,...>(args).
+             * Generics are erased, so parse and discard the type arguments;
+             * the following '(' builds the call as usual. */
+            parser_advance(p); /* '<' */
+            while (!parser_check(p, TK_GREATER) &&
+                   !parser_check(p, TK_GREATER_GREATER) &&
+                   !parser_check(p, TK_EOF)) {
+                parse_type_ref(p);
+                if (!parser_match(p, TK_COMMA)) break;
+            }
+            parser_expect_gt(p);
+            continue;
+        }
 
         if (parser_match(p, TK_DOT)) {
             if (!parser_check(p, TK_IDENT)) {
@@ -1669,13 +1731,28 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
             zan_ast_node_t *ret_type = parse_type_ref(p);
             parser_expect(p, TK_IDENT);
             zan_istr_t dname = p->previous.str_val;
+            /* optional generic type parameters: delegate R Name<T, ...>(...) */
+            zan_ast_list_t dtype_params;
+            zan_ast_list_init(&dtype_params);
+            if (parser_match(p, TK_LESS)) {
+                while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
+                    if (parser_check(p, TK_IDENT)) {
+                        parser_advance(p);
+                        zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
+                        tp->ident.name = p->previous.str_val;
+                        zan_ast_list_push(&dtype_params, tp, p->arena);
+                    }
+                    if (!parser_match(p, TK_COMMA)) break;
+                }
+                parser_expect(p, TK_GREATER);
+            }
             zan_ast_list_t dparams = parse_param_list(p);
             parser_expect(p, TK_SEMICOLON);
             zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
             ddecl->method_decl.name = dname;
             ddecl->method_decl.return_type = ret_type;
             ddecl->method_decl.params = dparams;
-            zan_ast_list_init(&ddecl->method_decl.type_params);
+            ddecl->method_decl.type_params = dtype_params;
             ddecl->method_decl.body = NULL;
             ddecl->method_decl.modifiers = mods;
             ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
