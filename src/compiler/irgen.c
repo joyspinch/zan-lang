@@ -2270,12 +2270,116 @@ static void emit_vtables(zan_irgen_t *g) {
     }
 }
 
+/* Reinterpret/convert a value to a target LLVM type across the generic
+ * erased-pointer boundary. A generic type parameter T lowers to an opaque
+ * pointer, so a value-type argument (i64/double/i1) passed where T is expected
+ * — and the reverse, a T-typed field/return consumed as a concrete value —
+ * must be bit-reinterpreted (mirrors the List<T> slot store/load). Matching
+ * types pass through unchanged, so non-generic code is never affected. */
+static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target);
+
+static LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v,
+                                         LLVMTypeRef target) {
+    if (!v || !target) return v;
+    LLVMTypeRef vt = LLVMTypeOf(v);
+    if (vt == target) return v;
+    LLVMTypeKind vk = LLVMGetTypeKind(vt);
+    LLVMTypeKind tk = LLVMGetTypeKind(target);
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+
+    if (tk == LLVMPointerTypeKind) {
+        if (vk == LLVMPointerTypeKind)
+            return LLVMBuildBitCast(g->builder, v, target, "bc.pp");
+        if (vk == LLVMIntegerTypeKind) {
+            if (LLVMGetIntTypeWidth(vt) < 64)
+                v = LLVMBuildSExt(g->builder, v, i64, "bc.ext");
+            return LLVMBuildIntToPtr(g->builder, v, target, "bc.ip");
+        }
+        if (vk == LLVMFloatTypeKind) {
+            LLVMValueRef iv = LLVMBuildBitCast(g->builder, v, i32, "bc.fi");
+            return LLVMBuildIntToPtr(g->builder, iv, target, "bc.ip");
+        }
+        if (vk == LLVMDoubleTypeKind) {
+            LLVMValueRef iv = LLVMBuildBitCast(g->builder, v, i64, "bc.di");
+            return LLVMBuildIntToPtr(g->builder, iv, target, "bc.ip");
+        }
+    } else if (tk == LLVMIntegerTypeKind) {
+        if (vk == LLVMPointerTypeKind)
+            return LLVMBuildPtrToInt(g->builder, v, target, "bc.pi");
+        if (vk == LLVMIntegerTypeKind)
+            return coerce_int_to(g, v, target);
+    } else if (tk == LLVMFloatTypeKind) {
+        if (vk == LLVMPointerTypeKind) {
+            LLVMValueRef iv = LLVMBuildPtrToInt(g->builder, v, i32, "bc.pi");
+            return LLVMBuildBitCast(g->builder, iv, target, "bc.if");
+        }
+        if (vk == LLVMDoubleTypeKind)
+            return LLVMBuildFPTrunc(g->builder, v, target, "bc.fptr");
+    } else if (tk == LLVMDoubleTypeKind) {
+        if (vk == LLVMPointerTypeKind) {
+            LLVMValueRef iv = LLVMBuildPtrToInt(g->builder, v, i64, "bc.pi");
+            return LLVMBuildBitCast(g->builder, iv, target, "bc.id");
+        }
+        if (vk == LLVMFloatTypeKind)
+            return LLVMBuildFPExt(g->builder, v, target, "bc.fpext");
+    }
+    return v;
+}
+
+/* Coerce each argument to the callee's declared parameter type (generic
+ * erased-pointer boundary). No-op when types already agree. */
+static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
+                                  LLVMValueRef *call_args, int argc) {
+    unsigned npt = LLVMCountParamTypes(fn_type);
+    if (npt == 0 || argc <= 0) return;
+    LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)npt, sizeof(LLVMTypeRef));
+    LLVMGetParamTypes(fn_type, pts);
+    int n = (argc < (int)npt) ? argc : (int)npt;
+    for (int i = 0; i < n; i++)
+        call_args[i] = emit_boundary_coerce(g, call_args[i], pts[i]);
+    free(pts);
+}
+
+/* If `t` is a generic type parameter of `recv`'s instantiated class, resolve it
+ * to the corresponding concrete type argument (e.g. T -> int for Box<int>);
+ * otherwise return `t` unchanged. */
+static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv) {
+    if (!t || t->kind != TYPE_TYPE_PARAM || !recv || !recv->sym) return t;
+    zan_ast_node_t *decl = recv->sym->decl;
+    if (!decl) return t;
+    zan_ast_list_t *tps = &decl->type_decl.type_params;
+    for (int i = 0; i < tps->count && i < recv->type_arg_count; i++) {
+        zan_ast_node_t *tp = tps->items[i];
+        if (tp->kind != AST_IDENTIFIER) continue;
+        if (tp->ident.name.len == t->name.len &&
+            memcmp(tp->ident.name.str, t->name.str, (size_t)t->name.len) == 0)
+            return recv->type_args[i];
+    }
+    return t;
+}
+
+/* Coerce a call result from the erased opaque pointer back to the concrete
+ * type when the callee's declared return type is a generic type parameter of
+ * the receiver's instantiated class. No-op otherwise. */
+static LLVMValueRef coerce_generic_result(zan_irgen_t *g, LLVMValueRef result,
+                                          zan_symbol_t *method_sym,
+                                          zan_type_t *recv) {
+    if (!result || !method_sym || !recv) return result;
+    zan_type_t *rt = subst_type_param(method_sym->type, recv);
+    if (rt && rt != method_sym->type)
+        return emit_boundary_coerce(g, result, map_type(g, rt));
+    return result;
+}
+
 /* Emit a call that dispatches through the object's vtable when the target is a
  * virtual/override method invoked on a class instance; otherwise a plain
  * static call. `static_sym` is the receiver's *declared* type. */
 static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
         zan_symbol_t *method_sym, LLVMValueRef static_fn, LLVMTypeRef fn_type,
         LLVMValueRef *call_args, int argc, const char *cn) {
+    coerce_args_to_params(g, fn_type, call_args, argc);
     if (static_sym && method_sym &&
         (method_sym->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE)) &&
         class_has_virtual_methods(static_sym) && argc >= 1 && call_args[0] &&
@@ -5539,6 +5643,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
                                 LLVMValueRef result = emit_dispatch_call(g, type_sym, method_sym,
                                     g->functions[fi].fn, g->functions[fi].fn_type, call_args, argc, cn);
+                                result = coerce_generic_result(g, result, method_sym, local->type);
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     emit_release_owned_call_temp(g, expr->call.args.items[k],
                                         call_args[k + 1], locals);
@@ -5609,6 +5714,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
                             LLVMValueRef result = emit_dispatch_call(g, recv_cls, method_sym,
                                 g->functions[fi].fn, g->functions[fi].fn_type, call_args, argc, cn);
+                            result = coerce_generic_result(g, result, method_sym,
+                                infer_expr_type(g, callee->member.object, locals));
                             emit_release_owned_call_temp(g, callee->member.object, recv_val, locals);
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -6075,7 +6182,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             LLVMValueRef field_ptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
                             LLVMTypeRef field_type = fsym ? map_type(g, fsym->type) : LLVMInt64TypeInContext(g->ctx);
-                            return LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval");
+                            LLVMValueRef fv = LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval");
+                            if (fsym) {
+                                zan_type_t *ct = subst_type_param(fsym->type, local->type);
+                                if (ct != fsym->type) fv = emit_boundary_coerce(g, fv, map_type(g, ct));
+                            }
+                            return fv;
                         }
                     }
                 }
@@ -6097,7 +6209,13 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         zan_symbol_t *fsym = get_field_sym(cls, expr->member.name);
                         LLVMTypeRef ft = fsym ? map_type(g, fsym->type)
                                               : LLVMInt64TypeInContext(g->ctx);
-                        return LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                        LLVMValueRef gfv = LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                        if (fsym) {
+                            zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
+                            zan_type_t *ct = subst_type_param(fsym->type, rct);
+                            if (ct != fsym->type) gfv = emit_boundary_coerce(g, gfv, map_type(g, ct));
+                        }
+                        return gfv;
                     }
                 }
             }
@@ -6437,6 +6555,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             for (int k = 0; k < expr->new_expr.args.count; k++) {
                                 call_args[k + 1] = emit_expr(g, expr->new_expr.args.items[k], locals);
                             }
+                            coerce_args_to_params(g, g->ctors[ci].fn_type, call_args, argc);
                             LLVMBuildCall2(g->builder, g->ctors[ci].fn_type,
                                 g->ctors[ci].fn, call_args, (unsigned)argc, "");
                             for (int k = 0; k < expr->new_expr.args.count; k++) {
