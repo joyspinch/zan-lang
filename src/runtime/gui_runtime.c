@@ -3315,7 +3315,15 @@ EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
  * in-canvas placeholder instead of embedding a live browser.
  * ======================================================================== */
 #if !defined(ZAN_GUI_COCOA)
-EXPORT i64 zan_gui_webview_create(i64 hwnd) { (void)hwnd; return 0; }
+/* profile_id selects a per-account isolation profile (see WebView.zan). When a
+ * real backend is added here it should map profile_id to that engine's data
+ * partitioning: on Windows a WebView2 per-profile user-data folder (distinct
+ * CreateCoreWebView2EnvironmentWithOptions userDataFolder, or ICoreWebView2Profile
+ * on newer runtimes); on Linux a WebKitGTK WebKitWebsiteDataManager with a
+ * per-profile base data/cache directory. Until then it is a no-op stub. */
+EXPORT i64 zan_gui_webview_create(i64 hwnd, const char *profile_id) {
+    (void)hwnd; (void)profile_id; return 0;
+}
 EXPORT void zan_gui_webview_destroy(i64 h) { (void)h; }
 EXPORT void zan_gui_webview_set_frame(i64 h, i64 x, i64 y, i64 w, i64 hh) {
     (void)h; (void)x; (void)y; (void)w; (void)hh;
