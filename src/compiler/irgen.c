@@ -6335,8 +6335,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
                 }
                 LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
+                const char *gcn = (LLVMGetTypeKind(LLVMGetReturnType(fn_type)) == LLVMVoidTypeKind) ? "" : "gcall";
                 LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
-                    global_fn, call_args, (unsigned)argc, "gcall");
+                    global_fn, call_args, (unsigned)argc, gcn);
                 int consumes_free_arg =
                     argc == 1 && call_consumes_free_arg(global_fn);
                 if (consumes_free_arg) {
