@@ -792,6 +792,50 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, loc);
 }
 
+/* Scan document text for whole-word occurrences of `word`, skipping string and
+ * char literals and line/block comments so matches are real code references. */
+static int find_text_references(const char *text, const char *word,
+                                size_t *offsets, int max) {
+    int count = 0;
+    size_t wlen = strlen(word);
+    if (wlen == 0) return 0;
+    size_t i = 0;
+    while (text[i] && count < max) {
+        char c = text[i];
+        if (c == '/' && text[i + 1] == '/') {
+            i += 2;
+            while (text[i] && text[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && text[i + 1] == '*') {
+            i += 2;
+            while (text[i] && !(text[i] == '*' && text[i + 1] == '/')) i++;
+            if (text[i]) i += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            char q = c;
+            i++;
+            while (text[i] && text[i] != q) {
+                if (text[i] == '\\' && text[i + 1]) i++;
+                i++;
+            }
+            if (text[i]) i++;
+            continue;
+        }
+        if (is_ident_char(c) && (i == 0 || !is_ident_char(text[i - 1]))) {
+            size_t j = i;
+            while (text[j] && is_ident_char(text[j])) j++;
+            if ((j - i) == wlen && strncmp(text + i, word, wlen) == 0)
+                offsets[count++] = i;
+            i = j;
+            continue;
+        }
+        i++;
+    }
+    return count;
+}
+
 /* NEW: Find all references handler */
 static void handle_references(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
@@ -807,22 +851,16 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_arr()); return; }
 
-    intellisense_t *is = (intellisense_t *)malloc(sizeof(*is));
-    if (!is) { send_response(s, id, json_new_arr()); return; }
-    intel_init(is);
-    intel_parse_file(is, uri, doc->text, strlen(doc->text));
-
-    goto_def_t refs[64];
-    int ref_count = intel_find_references(is, word, refs, 64);
-    free(is);
+    size_t offsets[512];
+    int ref_count = find_text_references(doc->text, word, offsets, 512);
 
     json_value *arr = json_new_arr();
     for (int i = 0; i < ref_count; i++) {
         int rl, rc;
-        offset_to_linecol(doc->text, refs[i].col, &rl, &rc);
+        offset_to_linecol(doc->text, (int)offsets[i], &rl, &rc);
 
         json_value *loc = json_new_obj();
-        json_obj_set(loc, "uri", json_new_str(refs[i].file[0] ? refs[i].file : uri));
+        json_obj_set(loc, "uri", json_new_str(uri));
         json_value *range = json_new_obj();
         json_value *start = json_new_obj();
         json_value *endp  = json_new_obj();
