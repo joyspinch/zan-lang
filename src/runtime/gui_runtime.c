@@ -16,7 +16,10 @@
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <imm.h>
-#pragma comment(lib, "shcore.lib")
+/* Shcore.lib is intentionally NOT linked statically: Shcore.dll only exists on
+ * Windows 8.1+, so a static import makes the executable fail to load on Windows
+ * 7. SetProcessDpiAwareness is resolved dynamically instead (see
+ * zan_enable_dpi_awareness). Dwmapi is Vista+ and present on Windows 7. */
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -990,112 +993,6 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
     return (i64)tm.tmHeight;
 }
 
-/* ---- Icon font glyph rendering (crisp, aligned) ----
- * Uses "Segoe MDL2 Assets" (present on Win10/11) so icons are real font
- * glyphs instead of hand-drawn vectors: sharp edges + consistent metrics. */
-static HFONT g_icon_font = NULL;
-static int g_icon_font_size = 0;
-
-static HFONT get_or_create_icon_font(int size) {
-    if (g_icon_font && g_icon_font_size == size) return g_icon_font;
-    if (g_icon_font) DeleteObject(g_icon_font);
-    g_icon_font = CreateFontW(
-        -size, 0, 0, 0,
-        FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_TT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        L"Segoe MDL2 Assets"
-    );
-    g_icon_font_size = size;
-    return g_icon_font;
-}
-
-/* Draw a single icon-font glyph (codepoint) centered inside a `box` square at
- * (x,y), tinted `color`. */
-EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box, i64 color, i64 codepoint) {
-    if (surface_id < 0 || surface_id >= g_surface_count) return;
-    zan_surface_t *s = g_surfaces[surface_id];
-    if (!s) return;
-
-    int bx = (int)box;
-    if (bx < 8) bx = 8;
-    /* Glyph em slightly smaller than the box so it visually fits. */
-    int fsize = bx * 8 / 10;
-    if (fsize < 8) fsize = 8;
-
-    ensure_text_dc();
-    HFONT font = get_or_create_icon_font(fsize);
-    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
-
-    wchar_t wtext[2];
-    wtext[0] = (wchar_t)codepoint;
-    wtext[1] = 0;
-
-    SIZE ts;
-    GetTextExtentPoint32W(g_text_dc, wtext, 1, &ts);
-    int tw = ts.cx + 2;
-    int th = ts.cy + 2;
-    if (tw <= 0 || th <= 0) { SelectObject(g_text_dc, old_font); return; }
-
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = tw;
-    bmi.bmiHeader.biHeight = -th;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void *bits = NULL;
-    HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!hbmp) { SelectObject(g_text_dc, old_font); return; }
-    HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
-    memset(bits, 0, (size_t)(tw * th * 4));
-    SetTextColor(g_text_dc, RGB(255, 255, 255));
-    TextOutW(g_text_dc, 0, 0, wtext, 1);
-    GdiFlush();
-
-    /* Center the glyph bitmap within the box. */
-    int ox = (int)x + (bx - tw) / 2;
-    int oy = (int)y + (bx - th) / 2;
-
-    u32 cr = ((u32)color >> 16) & 0xFF;
-    u32 cg = ((u32)color >> 8) & 0xFF;
-    u32 cb = (u32)color & 0xFF;
-    u32 ca = ((u32)color >> 24) & 0xFF;
-    if (ca == 0) ca = 255;
-
-    u32 *src = (u32 *)bits;
-    for (int py = 0; py < th; py++) {
-        int dst_y = oy + py;
-        if (dst_y < s->clip_y0 || dst_y >= s->clip_y1) continue;
-        for (int px = 0; px < tw; px++) {
-            int dst_x = ox + px;
-            if (dst_x < s->clip_x0 || dst_x >= s->clip_x1) continue;
-            u32 sp = src[py * tw + px];
-            u32 sr = (sp >> 16) & 0xFF;
-            u32 sg = (sp >> 8) & 0xFF;
-            u32 sb = sp & 0xFF;
-            if (sr == 0 && sg == 0 && sb == 0) continue;
-            int idx = dst_y * s->stride + dst_x;
-            u32 dp = s->pixels[idx];
-            u32 dr = (dp >> 16) & 0xFF;
-            u32 dg = (dp >> 8) & 0xFF;
-            u32 db = dp & 0xFF;
-            u32 ar = sr * ca / 255;
-            u32 ag = sg * ca / 255;
-            u32 ab = sb * ca / 255;
-            u32 or_ = (cr * ar + dr * (255 - ar)) / 255;
-            u32 og = (cg * ag + dg * (255 - ag)) / 255;
-            u32 ob = (cb * ab + db * (255 - ab)) / 255;
-            s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
-        }
-    }
-
-    SelectObject(g_text_dc, old_bmp);
-    SelectObject(g_text_dc, old_font);
-    DeleteObject(hbmp);
-}
 
 /* ========================================================================
  * Win32 Window Shell
@@ -1353,11 +1250,37 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* Enable DPI awareness without a static Shcore.dll dependency so the binary
+ * still loads on Windows 7. Prefer per-monitor awareness (SetProcessDpiAwareness,
+ * Shcore.dll, Windows 8.1+); fall back to system-DPI awareness
+ * (SetProcessDPIAware, user32.dll, Vista+) when Shcore is unavailable. */
+static void zan_enable_dpi_awareness(void) {
+    HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+    if (shcore) {
+        typedef HRESULT (WINAPI *SetProcessDpiAwarenessFn)(PROCESS_DPI_AWARENESS);
+        SetProcessDpiAwarenessFn set_awareness =
+            (SetProcessDpiAwarenessFn)GetProcAddress(shcore, "SetProcessDpiAwareness");
+        if (set_awareness) {
+            set_awareness(PROCESS_PER_MONITOR_DPI_AWARE);
+            FreeLibrary(shcore);
+            return;
+        }
+        FreeLibrary(shcore);
+    }
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
+        SetProcessDPIAwareFn set_aware =
+            (SetProcessDPIAwareFn)GetProcAddress(user32, "SetProcessDPIAware");
+        if (set_aware) set_aware();
+    }
+}
+
 EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
     static int registered = 0;
     static int dpi_set = 0;
     if (!dpi_set) {
-        SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+        zan_enable_dpi_awareness();
         dpi_set = 1;
     }
     if (!registered) {
@@ -2683,7 +2606,9 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
 
 #endif /* software bitmap text */
 
-#if !defined(_WIN32)
+/* Icon glyphs are rendered as scalable vector primitives on every platform so
+ * they look identical across Windows/macOS/Linux and need no icon font (Segoe
+ * MDL2 Assets only exists on Windows 10+, so a font path would break Win7). */
 static void icon_line(i64 s, int x0, int y0, int x1, int y1,
                       u32 color, int thickness) {
     zan_gui_draw_line(s, x0, y0, x1, y1, color, thickness);
@@ -2744,6 +2669,45 @@ static void icon_star(i64 s, int cx, int cy, int radius,
         py = ny;
     }
     icon_line(s, px, py, first_x, first_y, color, thickness);
+}
+
+/* Even-odd point-in-polygon test (ray cast). */
+static int icon_pt_in_poly(int n, const int *px, const int *py, int x, int y) {
+    int inside = 0;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        if (((py[i] > y) != (py[j] > y)) &&
+            (x < (px[j] - px[i]) * (y - py[i]) /
+                     (py[j] - py[i]) + px[i])) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+/* Solid five-point star (for the "filled" star icon). */
+static void icon_fill_star(i64 s, int cx, int cy, int radius, u32 color) {
+    const double pi = 3.14159265358979323846;
+    int px[10], py[10];
+    for (int i = 0; i < 10; i++) {
+        double a = -pi / 2.0 + (double)i * pi / 5.0;
+        int rr = (i & 1) ? radius * 2 / 5 : radius;
+        px[i] = cx + (int)(cos(a) * rr);
+        py[i] = cy + (int)(sin(a) * rr);
+    }
+    for (int yy = cy - radius; yy <= cy + radius; yy++) {
+        int run = 0, startx = 0;
+        for (int xx = cx - radius; xx <= cx + radius; xx++) {
+            if (icon_pt_in_poly(10, px, py, xx, yy)) {
+                if (!run) { run = 1; startx = xx; }
+            } else if (run) {
+                zan_gui_fill_rect(s, startx, yy, xx - startx, 1, color);
+                run = 0;
+            }
+        }
+        if (run) {
+            zan_gui_fill_rect(s, startx, yy, cx + radius - startx + 1, 1, color);
+        }
+    }
 }
 
 EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
@@ -2867,7 +2831,10 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
         icon_line(surface_id, cx, cy - pad / 2, cx, cy + pad / 2, c, thick);
         zan_gui_fill_circle(surface_id, cx, y1 - pad / 2, thick, c);
         break;
-    case 0xE735: case 0xE734:
+    case 0xE735: /* filled star */
+        icon_fill_star(surface_id, cx, cy, w / 2, c);
+        break;
+    case 0xE734: /* empty star */
         icon_star(surface_id, cx, cy, w / 2, c, thick);
         break;
     case 0xEB51:
@@ -3027,11 +2994,33 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
         zan_gui_fill_circle(surface_id, cx + pad, cy - pad, thick + 1, c);
         zan_gui_fill_circle(surface_id, cx, cy + pad, thick + 1, c);
         break;
+    case 0xF101: /* chevron-down */
+        icon_line(surface_id, x0, cy - h / 6, cx, cy + h / 6, c, thick);
+        icon_line(surface_id, cx, cy + h / 6, x1, cy - h / 6, c, thick);
+        break;
+    case 0xF103: /* chevron-up */
+        icon_line(surface_id, x0, cy + h / 6, cx, cy - h / 6, c, thick);
+        icon_line(surface_id, cx, cy - h / 6, x1, cy + h / 6, c, thick);
+        break;
+    case 0xF102: /* chevron-right */
+        icon_line(surface_id, cx - w / 6, y0, cx + w / 6, cy, c, thick);
+        icon_line(surface_id, cx + w / 6, cy, cx - w / 6, y1, c, thick);
+        break;
+    case 0xF104: /* chevron-left */
+        icon_line(surface_id, cx + w / 6, y0, cx - w / 6, cy, c, thick);
+        icon_line(surface_id, cx - w / 6, cy, cx + w / 6, y1, c, thick);
+        break;
+    case 0xE774: /* globe: circle + equator + meridian + latitude lines */
+        icon_circle(surface_id, cx, cy, w / 2, c, thick);
+        icon_line(surface_id, x0, cy, x1, cy, c, thick);
+        icon_line(surface_id, cx, y0, cx, y1, c, thick);
+        icon_line(surface_id, cx - w / 3, cy - h / 4, cx + w / 3, cy - h / 4, c, thick);
+        icon_line(surface_id, cx - w / 3, cy + h / 4, cx + w / 3, cy + h / 4, c, thick);
+        break;
     default:
         break;
     }
 }
-#endif
 
 #ifdef __linux__
 /* ---- window management (EWMH / Xlib) ---- */
@@ -3278,9 +3267,9 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
 /* ========================================================================
  * Portable / fallback shims for functions native only to Win32.
  * ========================================================================
- * Client-side-decoration metrics are a Win32 concept; on X11/macOS the window
- * manager owns the title bar, so these report 0. write_file is portable. */
-#if !defined(_WIN32) && !defined(__linux__)
+ * The Win32, X11 and Cocoa backends all draw their own client-side title bar
+ * and supply these; only the headless/no-op fallback reports 0. */
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
@@ -3311,4 +3300,56 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on;
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT const char *zan_gui_get_clipboard(void) { return ""; }
 EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
+#endif
+
+/* ========================================================================
+ * Embedded WebView (native browser control).
+ *
+ * A real, navigable web view is a heavyweight, per-platform native control
+ * (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux). Only the
+ * macOS backend (gui_runtime_mac.m, ZAN_GUI_COCOA) currently implements it, as
+ * a WKWebView subview of the window's content view with cookie access, a
+ * navigation delegate (URL/title/status monitoring) and JavaScript eval.
+ * Everywhere else these are no-op stubs: zan_gui_webview_create returns 0 so
+ * the Zan WebView widget can detect the lack of native support and paint an
+ * in-canvas placeholder instead of embedding a live browser.
+ * ======================================================================== */
+#if !defined(ZAN_GUI_COCOA)
+EXPORT i64 zan_gui_webview_create(i64 hwnd) { (void)hwnd; return 0; }
+EXPORT void zan_gui_webview_destroy(i64 h) { (void)h; }
+EXPORT void zan_gui_webview_set_frame(i64 h, i64 x, i64 y, i64 w, i64 hh) {
+    (void)h; (void)x; (void)y; (void)w; (void)hh;
+}
+EXPORT void zan_gui_webview_set_visible(i64 h, i64 visible) {
+    (void)h; (void)visible;
+}
+EXPORT void zan_gui_webview_navigate(i64 h, const char *url) {
+    (void)h; (void)url;
+}
+EXPORT void zan_gui_webview_load_html(i64 h, const char *html, const char *base_url) {
+    (void)h; (void)html; (void)base_url;
+}
+EXPORT void zan_gui_webview_back(i64 h) { (void)h; }
+EXPORT void zan_gui_webview_forward(i64 h) { (void)h; }
+EXPORT void zan_gui_webview_reload(i64 h) { (void)h; }
+EXPORT void zan_gui_webview_stop(i64 h) { (void)h; }
+EXPORT i64 zan_gui_webview_can_go_back(i64 h) { (void)h; return 0; }
+EXPORT i64 zan_gui_webview_can_go_forward(i64 h) { (void)h; return 0; }
+EXPORT i64 zan_gui_webview_is_loading(i64 h) { (void)h; return 0; }
+EXPORT i64 zan_gui_webview_nav_seq(i64 h) { (void)h; return 0; }
+EXPORT i64 zan_gui_webview_last_status(i64 h) { (void)h; return 0; }
+EXPORT const char *zan_gui_webview_get_url(i64 h) { (void)h; return ""; }
+EXPORT const char *zan_gui_webview_get_title(i64 h) { (void)h; return ""; }
+EXPORT const char *zan_gui_webview_last_request(i64 h) { (void)h; return ""; }
+EXPORT const char *zan_gui_webview_eval(i64 h, const char *js) {
+    (void)h; (void)js; return "";
+}
+EXPORT const char *zan_gui_webview_get_cookies(i64 h, const char *url) {
+    (void)h; (void)url; return "";
+}
+EXPORT void zan_gui_webview_set_cookie(i64 h, const char *url,
+                                       const char *name, const char *value) {
+    (void)h; (void)url; (void)name; (void)value;
+}
+EXPORT void zan_gui_webview_clear_cookies(i64 h) { (void)h; }
 #endif
