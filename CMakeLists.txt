@@ -152,7 +152,7 @@ if(WIN32)
         add_custom_command(TARGET zanc POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                     -DMINGW_ROOT=${ZAN_MINGW_ROOT}
-                    -DDEST=$<TARGET_FILE_DIR:zanc>/toolchain
+                    -DDEST=$<TARGET_FILE_DIR:zanc>
                     -P ${CMAKE_SOURCE_DIR}/cmake/bundle_toolchain.cmake
             COMMENT "Assembling self-contained MinGW linking toolchain"
             VERBATIM)
@@ -167,15 +167,23 @@ endif()
 set(LINUX_MUSL_SYS "${CMAKE_SOURCE_DIR}/toolchain/linux-musl")
 if(EXISTS "${LINUX_MUSL_SYS}/libc.a")
     add_custom_command(TARGET zanc POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/toolchain/linux-musl
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/linux-musl
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${LINUX_MUSL_SYS}/crt1.o" "${LINUX_MUSL_SYS}/crti.o"
                 "${LINUX_MUSL_SYS}/crtn.o" "${LINUX_MUSL_SYS}/libc.a"
                 "${LINUX_MUSL_SYS}/zanrt_io.o"
-                $<TARGET_FILE_DIR:zanc>/toolchain/linux-musl/
+                $<TARGET_FILE_DIR:zanc>/linux-musl/
         COMMENT "Copying Linux musl sysroot for cross-compilation"
         VERBATIM)
 endif()
+
+# ---- Native database drivers (publish-time bundling) ----
+# Each native DB driver now lives inside the stdlib module that owns it
+# (e.g. stdlib/System/Data/Sqlite/drivers/<target>/), so it travels with stdlib
+# and needs no separate staging next to zanc: zanc resolves it from
+# <stdlib_root>/<module>/drivers/<target>/. Driver binaries are gitignored and
+# dropped in per target by the developer / release-assembly step; only the
+# layout + manifests are tracked.
 
 
 # ---- Language Server (M8) ----
@@ -228,7 +236,7 @@ set(ZAN_GUI_AVAILABLE FALSE)
 if(ZAN_BUILD_GUI)
     if(WIN32)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c)
-        target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore)
+        target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32)
         set(ZAN_GUI_AVAILABLE TRUE)
     elseif(APPLE)
         # Real Cocoa backend (Objective-C) + shared software renderer. The C file
@@ -237,7 +245,7 @@ if(ZAN_BUILD_GUI)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m)
         set_source_files_properties(src/runtime/gui_runtime.c
             PROPERTIES COMPILE_DEFINITIONS ZAN_GUI_COCOA)
-        target_link_libraries(zan_gui PRIVATE m "-framework Cocoa")
+        target_link_libraries(zan_gui PRIVATE m "-framework Cocoa" "-framework CoreText")
         set(ZAN_GUI_AVAILABLE TRUE)
     else()
         find_package(X11)
@@ -245,6 +253,13 @@ if(ZAN_BUILD_GUI)
             add_library(zan_gui SHARED src/runtime/gui_runtime.c)
             target_include_directories(zan_gui PRIVATE ${X11_INCLUDE_DIR})
             target_link_libraries(zan_gui PRIVATE ${X11_LIBRARIES} m)
+            find_package(Freetype QUIET)
+            find_package(Fontconfig QUIET)
+            if(Freetype_FOUND AND Fontconfig_FOUND)
+                target_compile_definitions(zan_gui PRIVATE ZAN_GUI_FREETYPE)
+                target_link_libraries(zan_gui PRIVATE
+                    Freetype::Freetype Fontconfig::Fontconfig)
+            endif()
             set(ZAN_GUI_AVAILABLE TRUE)
         else()
             message(WARNING "libX11 not found; skipping zan_gui (Gui conformance tests will be disabled)")
@@ -253,9 +268,9 @@ if(ZAN_BUILD_GUI)
 endif()
 
 # ---- IDE ----
-# The IDE is built from src/ide_zan/ide_demo.zan using the Zan compiler (zanc).
-# It is compiled separately: zanc src/ide_zan/ide_demo.zan -o build/ide_demo.exe
-# The old C-based zan-ide target has been removed in favour of ide_demo.
+# The IDE is built from src/ide_zan/ZanIDE.zan using the Zan compiler (zanc).
+# It is compiled separately: zanc src/ide_zan/ZanIDE.zan -o build/ZanIDE.exe
+# The old C-based zan-ide target has been removed in favour of ZanIDE.
 
 # ---- Tests ----
 enable_testing()
@@ -330,6 +345,11 @@ endforeach()
 # still catching *new* leaks; fixing such a leak flips its test to failing, a
 # reminder to drop it from the allow-list below.
 set(_known_leaky)
+if(NOT WIN32)
+  # POSIX dirent names are assembled incrementally and remain reachable from
+  # the returned list until collection ownership gains recursive ARC release.
+  list(APPEND _known_leaky crossplat_stdlib)
+endif()
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   add_test(NAME leakcheck_${_name}
@@ -368,6 +388,60 @@ add_test(NAME conformance_minic
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
+#      clang-compile + run + diff stdout, and verify malformed input fails
+#      closed (non-zero, no .ll). clang is optional -- without it the stdout
+#      stage is skipped and the harness still proves gen1 builds and emits IR. ----
+find_program(SELFHOST_CLANG NAMES clang)
+add_test(NAME selfhost_gen1
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+    -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.out
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
+    -DOUTLL=${CMAKE_BINARY_DIR}/selfhost_gen1.ll
+    -DCLANG=${SELFHOST_CLANG}
+    -DBADPROG=${CMAKE_SOURCE_DIR}/tests/diag/bad_member.zan
+    -DBADLL=${CMAKE_BINARY_DIR}/selfhost_bad.ll
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
+set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
+
+# ---- Self-hosting fixed point: full gen0->gen1->gen2->gen3 closure, asserting
+#      g2.ll == g3.ll byte-for-byte. Requires clang to link the emitted IR, so
+#      it is only registered when clang is found; the Windows link step needs a
+#      large stack reservation (matching what the host bakes into its own link).
+#      Skipped automatically wherever clang is absent. ----
+if(SELFHOST_CLANG)
+  if(WIN32)
+    # Reserve a large stack so gen2 (which self-compiles into g3.ll) does not
+    # overflow. The flag depends on the linker clang drives: MSVC-targeting
+    # clang uses lld-link (/STACK:N); mingw clang uses GNU ld (--stack N).
+    execute_process(COMMAND ${SELFHOST_CLANG} -print-target-triple
+                    OUTPUT_VARIABLE _clang_triple
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_clang_triple MATCHES "msvc")
+      set(_fixedpoint_stack "-Xlinker;/STACK:268435456")
+    else()
+      set(_fixedpoint_stack "-Wl,--stack,268435456")
+    endif()
+  else()
+    set(_fixedpoint_stack "")
+  endif()
+  add_test(NAME selfhost_fixed_point
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+      -DCLANG=${SELFHOST_CLANG}
+      -DGEN1=${CMAKE_BINARY_DIR}/fixedpoint_gen1${_exe_ext}
+      -DGEN2=${CMAKE_BINARY_DIR}/fixedpoint_gen2${_exe_ext}
+      -DG2LL=${CMAKE_BINARY_DIR}/fixedpoint_g2.ll
+      -DG3LL=${CMAKE_BINARY_DIR}/fixedpoint_g3.ll
+      "-DSTACK_ARGS=${_fixedpoint_stack}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_fixedpoint.cmake)
+  set_tests_properties(selfhost_fixed_point PROPERTIES TIMEOUT 1200)
+endif()
+
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----
 # These programs import Gui modules that reference [DllImport("zan_gui")], so the
 # produced executable must link zan_gui. zanc resolves [DllImport] libs against
@@ -376,6 +450,39 @@ add_test(NAME conformance_minic
 # only zanc, so it passes -DZAN_BUILD_GUI_TESTS=OFF.
 option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" ON)
 if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
+  add_executable(zan_gui_runtime_test tests/runtime/gui_runtime_test.c)
+  target_link_libraries(zan_gui_runtime_test PRIVATE zan_gui)
+  add_test(NAME runtime_gui COMMAND zan_gui_runtime_test)
+
+  if(UNIX AND NOT APPLE)
+    find_program(XVFB_RUN_EXECUTABLE xvfb-run)
+    if(XVFB_RUN_EXECUTABLE)
+      add_executable(zan_gui_x11_test tests/runtime/gui_x11_test.c)
+      target_link_libraries(zan_gui_x11_test PRIVATE zan_gui ${X11_LIBRARIES})
+      add_test(NAME runtime_gui_x11
+        COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_x11_test>)
+      set_tests_properties(runtime_gui_x11 PROPERTIES TIMEOUT 15)
+
+      # Borderless-window caption hit-testing needs synthetic pointer events.
+      if(X11_XTest_FOUND)
+        add_executable(zan_gui_titlebar_test tests/runtime/gui_titlebar_test.c)
+        target_link_libraries(zan_gui_titlebar_test
+          PRIVATE zan_gui ${X11_LIBRARIES} ${X11_XTest_LIB})
+        add_test(NAME runtime_gui_titlebar
+          COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_titlebar_test>)
+        set_tests_properties(runtime_gui_titlebar PROPERTIES TIMEOUT 20)
+
+        # Multi-window event routing also drives synthetic pointer events.
+        add_executable(zan_gui_multiwindow_test tests/runtime/gui_multiwindow_test.c)
+        target_link_libraries(zan_gui_multiwindow_test
+          PRIVATE zan_gui ${X11_LIBRARIES} ${X11_XTest_LIB})
+        add_test(NAME runtime_gui_multiwindow
+          COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:zan_gui_multiwindow_test>)
+        set_tests_properties(runtime_gui_multiwindow PROPERTIES TIMEOUT 20)
+      endif()
+    endif()
+  endif()
+
   add_test(NAME conformance_gui_stack
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -396,7 +503,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(conformance_gui_stack conformance_gui_text PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 

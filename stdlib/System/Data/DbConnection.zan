@@ -32,7 +32,8 @@ class DbProvider {
 }
 
 /// <summary>
-/// Universal database connection built on the ODBC driver manager (odbc32).
+/// Universal database connection built on the platform ODBC driver manager
+/// (odbc32 on Windows, unixODBC on Linux/macOS).
 ///
 /// Any engine that ships an ODBC driver is reachable: SQL Server, Oracle,
 /// MySQL/MariaDB/TiDB/OceanBase, PostgreSQL, ClickHouse, QuestDB, Firebird,
@@ -59,9 +60,10 @@ class DbConnection {
     bool connected;
     string lastError;
 
-    // --- ODBC (odbc32) FFI ---
+    // --- ODBC driver-manager FFI ---
     // The ODBC manager exposes a uniform buffer-based API (SQLGetData), so one
     // implementation serves every engine that provides an ODBC driver.
+    #if WINDOWS
     [DllImport("odbc32")]
     static extern int SQLAllocHandle(int handleType, int inputHandle, string outputHandle);
 
@@ -100,6 +102,46 @@ class DbConnection {
 
     [DllImport("odbc32")]
     static extern int SQLFreeStmt(int stmt, int option);
+    #else
+    [DllImport("odbc")]
+    static extern int SQLAllocHandle(int handleType, int inputHandle, string outputHandle);
+
+    [DllImport("odbc")]
+    static extern int SQLSetEnvAttr(int env, int attr, int valuePtr, int strLen);
+
+    [DllImport("odbc")]
+    static extern int SQLDriverConnect(int dbc, int hwnd, string inConn, int inLen,
+        string outConn, int outBufLen, string outLenPtr, int completion);
+
+    [DllImport("odbc")]
+    static extern int SQLExecDirect(int stmt, string sql, int textLength);
+
+    [DllImport("odbc")]
+    static extern int SQLNumResultCols(int stmt, string colCountPtr);
+
+    [DllImport("odbc")]
+    static extern int SQLDescribeCol(int stmt, int colNum, string colName, int bufLen,
+        string nameLenPtr, string typePtr, string sizePtr, string decPtr, string nullPtr);
+
+    [DllImport("odbc")]
+    static extern int SQLFetch(int stmt);
+
+    [DllImport("odbc")]
+    static extern int SQLGetData(int stmt, int colNum, int targetType, string buf,
+        int bufLen, string strLenOrIndPtr);
+
+    [DllImport("odbc")]
+    static extern int SQLRowCount(int stmt, string rowCountPtr);
+
+    [DllImport("odbc")]
+    static extern int SQLFreeHandle(int handleType, int handle);
+
+    [DllImport("odbc")]
+    static extern int SQLDisconnect(int dbc);
+
+    [DllImport("odbc")]
+    static extern int SQLFreeStmt(int stmt, int option);
+    #endif
 
     // --- C runtime ---
     [DllImport("crt")]
@@ -155,6 +197,10 @@ class DbConnection {
     /// <summary>Copies a NUL-terminated C buffer into a Zan string.</summary>
     static string BufToString(string buf, int max) {
         return buf.Substring(0, ScanNul(buf, max));
+    }
+
+    static bool OdbcSuccess(int rc) {
+        return rc == 0 || rc == 1;
     }
 
     // ============================================================
@@ -286,17 +332,31 @@ class DbConnection {
         // Allocate environment handle (SQL_HANDLE_ENV = 1).
         string pEnv = calloc(8, 1);
         int rc = SQLAllocHandle(1, 0, pEnv);
-        if (rc < 0) { free(pEnv); conn.lastError = "SQLAllocHandle(ENV) failed"; return conn; }
+        if (!OdbcSuccess(rc)) {
+            free(pEnv);
+            conn.lastError = "SQLAllocHandle(ENV) failed";
+            return conn;
+        }
         int envH = HandleFromBuf(pEnv);
         free(pEnv);
 
         // SQL_ATTR_ODBC_VERSION = 200, SQL_OV_ODBC3 = 3.
-        SQLSetEnvAttr(envH, 200, 3, 0);
+        rc = SQLSetEnvAttr(envH, 200, 3, 0);
+        if (!OdbcSuccess(rc)) {
+            SQLFreeHandle(1, envH);
+            conn.lastError = "SQLSetEnvAttr failed";
+            return conn;
+        }
 
         // Allocate connection handle (SQL_HANDLE_DBC = 2).
         string pDbc = calloc(8, 1);
         rc = SQLAllocHandle(2, envH, pDbc);
-        if (rc < 0) { free(pDbc); conn.lastError = "SQLAllocHandle(DBC) failed"; return conn; }
+        if (!OdbcSuccess(rc)) {
+            free(pDbc);
+            SQLFreeHandle(1, envH);
+            conn.lastError = "SQLAllocHandle(DBC) failed";
+            return conn;
+        }
         int dbcH = HandleFromBuf(pDbc);
         free(pDbc);
 
@@ -307,11 +367,13 @@ class DbConnection {
         free(outConn);
         free(pOutLen);
 
-        if (rc == 0 || rc == 1) {
+        if (OdbcSuccess(rc)) {
             conn.env = envH;
             conn.handle = dbcH;
             conn.connected = true;
         } else {
+            SQLFreeHandle(2, dbcH);
+            SQLFreeHandle(1, envH);
             conn.lastError = "SQLDriverConnect failed";
         }
         return conn;
@@ -325,7 +387,7 @@ class DbConnection {
     int AllocStmt() {
         string pStmt = calloc(8, 1);
         int rc = SQLAllocHandle(3, this.handle, pStmt);
-        if (rc < 0) { free(pStmt); return 0; }
+        if (!OdbcSuccess(rc)) { free(pStmt); return 0; }
         int stmt = HandleFromBuf(pStmt);
         free(pStmt);
         return stmt;
@@ -338,7 +400,7 @@ class DbConnection {
         if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return -1; }
 
         int rc = SQLExecDirect(stmt, sql, -3);   // SQL_NTS
-        if (rc < 0) {
+        if (!OdbcSuccess(rc)) {
             this.lastError = "SQLExecDirect failed";
             SQLFreeHandle(3, stmt);
             return -1;
@@ -366,7 +428,7 @@ class DbConnection {
         if (stmt == 0) { this.lastError = "SQLAllocHandle(STMT) failed"; return result; }
 
         int rc = SQLExecDirect(stmt, sql, -3);   // SQL_NTS
-        if (rc < 0) {
+        if (!OdbcSuccess(rc)) {
             this.lastError = "SQLExecDirect failed";
             SQLFreeHandle(3, stmt);
             return result;

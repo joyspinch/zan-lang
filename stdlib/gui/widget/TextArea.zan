@@ -1,0 +1,267 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// Multiline text input (textarea).
+///
+/// A retained component (create once, keep across frames) bound to a
+/// SignalString. It owns caret movement, newline editing, its own viewport
+/// clipping and vertical scrolling (mouse wheel + an auto-hidden scrollbar,
+/// and it keeps the caret in view while typing) — so a call site is just:
+///
+///   TextArea notes = TextArea.Create("Write something...");   // once
+///   notes.Change += () => { ... };                            // C#-style
+///   notes.Render(app, x, y, w, h);                            // each frame
+///   string value = notes.GetText();
+///
+/// It has a stable identity (focus survives sibling/popup churn), the framework
+/// resolves its focus/click, and it reports the caret so the IME composition
+/// window follows the cursor. For read-only code display / syntax features use
+/// CodeEditor; this is the plain editable multi-line field.
+/// </summary>
+class TextArea {
+    SignalString model;
+    string hint;
+    int cursorPos;
+    int scrollY;
+    int wid;
+    /// Fires whenever the text changes (C#-style: `area.Change += h;`).
+    UiEvent Change;
+
+    static TextArea Create(string hintText) {
+        return TextArea.Bind(SignalString.Create(""), hintText);
+    }
+
+    static TextArea Bind(SignalString sig, string hintText) {
+        TextArea a = new TextArea();
+        a.model = sig;
+        a.hint = hintText;
+        a.cursorPos = 0;
+        a.scrollY = 0;
+        a.wid = WidgetId.Next();
+        a.Change = UiEvent.Create();
+        return a;
+    }
+
+    string GetText() {
+        return model.Get();
+    }
+
+    void SetText(string v) {
+        model.Set(v);
+        cursorPos = v.Length;
+    }
+
+    void ClampCursor() {
+        string txt = model.Get();
+        if (cursorPos > txt.Length) { cursorPos = txt.Length; }
+        if (cursorPos < 0) { cursorPos = 0; }
+    }
+
+    int LineStartAbs(List<string> lines, int line) {
+        int s = 0;
+        int i = 0;
+        while (i < line) {
+            s = s + lines[i].Length + 1;
+            i = i + 1;
+        }
+        return s;
+    }
+
+    void HandleInput(App app) {
+        this.ClampCursor();
+        int kind = app.window.EventKind();
+        string txt = model.Get();
+
+        if (kind == 6) {
+            int code = app.window.EventKeyCode();
+            if (code == 8) {
+                if (cursorPos > 0) {
+                    int start = Text.PrevCharStart(txt, cursorPos);
+                    model.Set(Text.DeleteBefore(txt, cursorPos));
+                    cursorPos = start;
+                    Change.Raise();
+                    app.RequestRedraw();
+                }
+            } else if (code == 13) {
+                model.Set(Text.InsertAt(txt, cursorPos, "\n"));
+                cursorPos = cursorPos + 1;
+                Change.Raise();
+                app.RequestRedraw();
+            } else if (code == 9) {
+                model.Set(Text.InsertAt(txt, cursorPos, "  "));
+                cursorPos = cursorPos + 2;
+                Change.Raise();
+                app.RequestRedraw();
+            } else {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0) {
+                    model.Set(Text.InsertAt(txt, cursorPos, ch));
+                    cursorPos = cursorPos + ch.Length;
+                    Change.Raise();
+                    app.RequestRedraw();
+                }
+            }
+        } else if (kind == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 37) {
+                if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); }
+                app.RequestRedraw();
+            } else if (kc == 39) {
+                if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); }
+                app.RequestRedraw();
+            } else if (kc == 38 || kc == 40) {
+                List<string> lines = CodeEditor.SplitLines(txt);
+                List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
+                int caretLine = pre.Count - 1;
+                int caretCol = pre[caretLine].Length;
+                int target = caretLine - 1;
+                if (kc == 40) { target = caretLine + 1; }
+                if (target >= 0 && target < lines.Count) {
+                    int col = caretCol;
+                    if (col > lines[target].Length) { col = lines[target].Length; }
+                    cursorPos = this.LineStartAbs(lines, target) + col;
+                    app.RequestRedraw();
+                }
+            } else if (kc == 36) {
+                List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
+                cursorPos = cursorPos - pre[pre.Count - 1].Length;
+                app.RequestRedraw();
+            } else if (kc == 35) {
+                List<string> lines = CodeEditor.SplitLines(txt);
+                List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
+                int caretLine = pre.Count - 1;
+                cursorPos = this.LineStartAbs(lines, caretLine) + lines[caretLine].Length;
+                app.RequestRedraw();
+            } else if (kc == 46) {
+                if (cursorPos < txt.Length) {
+                    model.Set(Text.RemoveAt(txt, cursorPos));
+                    Change.Raise();
+                    app.RequestRedraw();
+                }
+            }
+        }
+    }
+
+    int Render(App app, int x, int y, int w, int h) {
+        int id = wid;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        app.focus.RegisterFocusable(id);
+        bool hovered = app.focus.IsHovered(id);
+        bool focused = app.focus.IsFocused(id);
+
+        if (focused) { this.HandleInput(app); }
+
+        string txt = model.Get();
+        this.ClampCursor();
+
+        int borderColor = t.borderPrimary;
+        if (focused) { borderColor = t.borderFocus; }
+        if (hovered && !focused) { borderColor = t.borderHover; }
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, h, borderColor, 1);
+
+        int pad = t.paddingSmall;
+        int innerX = x + pad;
+        int innerY = y + pad;
+        int innerW = w - pad * 2;
+        int innerH = h - pad * 2;
+        int lineH = Canvas.FontHeight(t.fontSizeMedium) + app.Scale(4);
+
+        List<string> lines = CodeEditor.SplitLines(txt);
+        int contentH = lines.Count * lineH;
+
+        // Caret line/column via the split-prefix trick.
+        List<string> pre = CodeEditor.SplitLines(Text.Left(txt, cursorPos));
+        int caretLine = pre.Count - 1;
+        string caretPrefix = pre[caretLine];
+
+        // Keep the caret in view (only while focused / actively editing).
+        if (focused) {
+            int caretTop = caretLine * lineH;
+            if (caretTop < scrollY) { scrollY = caretTop; }
+            if (caretTop + lineH > scrollY + innerH) {
+                scrollY = caretTop + lineH - innerH;
+            }
+        }
+
+        bool overBox = app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
+        if (overBox && app.window.EventKind() == 13) {
+            app.CaptureWheel(x, y, w, h);
+            int d = app.window.EventKeyCode();
+            scrollY = scrollY - d * app.scrollSpeed / 120;
+            app.RequestRedraw();
+        }
+        int maxScroll = contentH - innerH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (scrollY > maxScroll) { scrollY = maxScroll; }
+        if (scrollY < 0) { scrollY = 0; }
+
+        c.PushClip(innerX, innerY, innerW, innerH);
+        if (txt == "" && !focused) {
+            c.DrawText(innerX, innerY, hint, t.textTertiary, t.fontSizeMedium);
+        } else {
+            int i = 0;
+            while (i < lines.Count) {
+                int ly = innerY + i * lineH - scrollY;
+                if (ly + lineH > innerY && ly < innerY + innerH) {
+                    c.DrawText(innerX, ly, lines[i], t.textPrimary, t.fontSizeMedium);
+                }
+                i = i + 1;
+            }
+            if (focused) {
+                int caretX = innerX + Canvas.MeasureText(caretPrefix, t.fontSizeMedium);
+                int caretY = innerY + caretLine * lineH - scrollY;
+                int fh = Canvas.FontHeight(t.fontSizeMedium);
+                c.FillRect(caretX, caretY, 1, fh, t.primary);
+                // Keep the IME composition window at the caret.
+                app.SetImeCaret(caretX, caretY + fh);
+            }
+        }
+        c.PopClip();
+
+        // Vertical scrollbar when the content overflows (clamped + clipped).
+        if (contentH > innerH && innerH > 0) {
+            int barW = app.Scale(6);
+            int bx = x + w - barW - app.Scale(2);
+            int minThumb = app.Scale(24);
+            if (minThumb > innerH) { minThumb = innerH; }
+            int thumbH = innerH * innerH / contentH;
+            if (thumbH < minThumb) { thumbH = minThumb; }
+            if (thumbH > innerH) { thumbH = innerH; }
+            int travel = innerH - thumbH;
+            if (travel < 0) { travel = 0; }
+            int thumbY = innerY;
+            if (maxScroll > 0) { thumbY = innerY + scrollY * travel / maxScroll; }
+            if (thumbY < innerY) { thumbY = innerY; }
+            if (thumbY + thumbH > innerY + innerH) { thumbY = innerY + innerH - thumbH; }
+            c.PushClip(innerX, innerY, innerW, innerH);
+            c.FillRoundRect(bx, innerY, barW, innerH, barW / 2, t.bgTertiary);
+            c.FillRoundRect(bx, thumbY, barW, thumbH, barW / 2, t.scrollbar);
+            c.PopClip();
+        }
+
+        app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 1));
+
+        // Single-consumer click: place the caret when this area is the click
+        // target resolved by the framework.
+        if (Ui.Clicked(app, id)) {
+            int relY = app.mouseY - innerY + scrollY;
+            int line = relY / lineH;
+            if (line < 0) { line = 0; }
+            if (line >= lines.Count) { line = lines.Count - 1; }
+            int relX = app.mouseX - innerX;
+            int col = CodeEditor.ColFromX(lines[line], relX, t.fontSizeMedium);
+            cursorPos = this.LineStartAbs(lines, line) + col;
+            this.ClampCursor();
+            app.RequestRedraw();
+        }
+
+        return id;
+    }
+}

@@ -4,27 +4,54 @@ using Gui;
 namespace Gui.Widget;
 
 /// Single-line text input with a caret, placeholder and reactive binding.
+///
+/// Retained, C#-style widget: it has a stable identity (so focus survives
+/// sibling/popup churn), the framework resolves focus/click for it, and it
+/// exposes delegate events:
+///     Input name = Input.Bind(model, "your name");
+///     name.Change += () => { ... };   // fires on every edit
+///     name.Submit += () => { ... };   // fires on Enter
+///     name.Render(app, x, y, w, h);
 /// When focused it consumes keyboard events (printable chars, Backspace,
-/// Delete, Left/Right/Home/End) and edits its bound SignalString in place, so
-/// it is a fully working text field rather than a display-only box.
-class Input {
+/// Delete, Left/Right/Home/End) and edits its bound SignalString in place, and
+/// reports the caret position to the framework so the IME composition window
+/// follows the cursor.
+class Input : Control {
     SignalString model;
     string hint;
     int cursorPos;
+    int wid;
+    /// Fires whenever the text changes (C#-style: `inp.Change += h;`).
+    UiEvent Change;
+    /// Fires when Enter is pressed while focused.
+    UiEvent Submit;
+
+    /// Shared initialiser for the immediate-mode factories and the retained
+    /// constructor: sets up the Control base (docks top so an appended input
+    /// auto-snaps) then the input-specific state.
+    void InitInput(SignalString sig, string hintText) {
+        this.InitControl("input", 1);
+        model = sig;
+        hint = hintText;
+        cursorPos = 0;
+        wid = WidgetId.Next();
+        Change = UiEvent.Create();
+        Submit = UiEvent.Create();
+    }
+
+    /// Retained-mode constructor: `Input name = new Input("Your name");`
+    Input(string hintText) {
+        InitInput(SignalString.Create(""), hintText);
+    }
 
     static Input Create(string hintText) {
-        Input inp = new Input();
-        inp.model = SignalString.Create("");
-        inp.hint = hintText;
-        inp.cursorPos = 0;
+        Input inp = new Input(hintText);
         return inp;
     }
 
     static Input Bind(SignalString sig, string hintText) {
-        Input inp = new Input();
+        Input inp = new Input(hintText);
         inp.model = sig;
-        inp.hint = hintText;
-        inp.cursorPos = 0;
         return inp;
     }
 
@@ -48,31 +75,36 @@ class Input {
             int code = app.window.EventKeyCode();
             if (code == 8) {
                 if (cursorPos > 0) {
-                    model.Set(Text.RemoveAt(txt, cursorPos - 1));
-                    cursorPos = cursorPos - 1;
+                    int start = Text.PrevCharStart(txt, cursorPos);
+                    model.Set(Text.DeleteBefore(txt, cursorPos));
+                    cursorPos = start;
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             } else if (code == 13) {
-                // ignore newline in single-line input
+                Submit.Raise();
+                app.RequestRedraw();
             } else if (code == 9) {
-                // ignore tab
+                // ignore tab (handled by framework focus traversal)
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
                     model.Set(Text.InsertAt(txt, cursorPos, ch));
-                    cursorPos = cursorPos + 1;
+                    cursorPos = cursorPos + ch.Length;
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             }
         } else if (kind == 4) {
             int kc = app.window.EventKeyCode();
-            if (kc == 37) { if (cursorPos > 0) { cursorPos = cursorPos - 1; } app.RequestRedraw(); }
-            else if (kc == 39) { if (cursorPos < txt.Length) { cursorPos = cursorPos + 1; } app.RequestRedraw(); }
+            if (kc == 37) { if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); } app.RequestRedraw(); }
+            else if (kc == 39) { if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); } app.RequestRedraw(); }
             else if (kc == 36) { cursorPos = 0; app.RequestRedraw(); }
             else if (kc == 35) { cursorPos = txt.Length; app.RequestRedraw(); }
             else if (kc == 46) {
                 if (cursorPos < txt.Length) {
                     model.Set(Text.RemoveAt(txt, cursorPos));
+                    Change.Raise();
                     app.RequestRedraw();
                 }
             }
@@ -80,10 +112,11 @@ class Input {
     }
 
     int Render(App app, int x, int y, int w, int h) {
-        int id = app.focus.AllocId();
+        int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
 
+        app.focus.RegisterFocusable(id);
         bool hovered = app.focus.IsHovered(id);
         bool focused = app.focus.IsFocused(id);
 
@@ -99,30 +132,95 @@ class Input {
         c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
         c.DrawRect(x, y, w, h, borderColor, 1);
 
+        int pad = t.paddingSmall;
+        int innerX = x + pad;
+        int innerW = w - pad * 2;
+        if (innerW < 0) { innerW = 0; }
         int textY = y + (h - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+
+        int caretW = 0;
+        if (txt != "") {
+            caretW = Canvas.MeasureText(Text.Left(txt, cursorPos), t.fontSizeMedium);
+        }
+        int scrollX = 0;
+        if (caretW > innerW) { scrollX = caretW - innerW; }
+
+        c.PushClip(innerX, y, innerW, h);
         if (txt == "") {
-            c.DrawText(x + t.paddingSmall, textY, hint, t.textTertiary, t.fontSizeMedium);
+            c.DrawText(innerX, textY, hint, t.textTertiary, t.fontSizeMedium);
         } else {
-            c.DrawText(x + t.paddingSmall, textY, txt, t.textPrimary, t.fontSizeMedium);
+            c.DrawText(innerX - scrollX, textY, txt, t.textPrimary, t.fontSizeMedium);
         }
 
         if (focused) {
-            string upto = Text.Left(txt, cursorPos);
-            int cursorX = x + t.paddingSmall + Canvas.MeasureText(upto, t.fontSizeMedium);
+            int cursorX = innerX - scrollX + caretW;
             int cursorH = Canvas.FontHeight(t.fontSizeMedium);
             c.FillRect(cursorX, textY, 1, cursorH, t.primary);
+            // Keep the IME composition window at the caret.
+            app.SetImeCaret(cursorX, textY + cursorH);
         }
+        c.PopClip();
 
         app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 1));
 
-        if (app.window.EventKind() == 3) {
-            if (app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
-                int rel = app.mouseX - (x + t.paddingSmall);
-                cursorPos = CodeEditor.ColFromX(txt, rel, t.fontSizeMedium);
-                app.RequestRedraw();
-            }
+        // Single-consumer click: place the caret when this input is the click
+        // target resolved by the framework.
+        if (Ui.Clicked(app, id)) {
+            int rel = app.mouseX - (x + t.paddingSmall) + scrollX;
+            cursorPos = CodeEditor.ColFromX(txt, rel, t.fontSizeMedium);
+            app.RequestRedraw();
         }
 
+        On.Fire(app, id);
         return id;
+    }
+
+    // --- Designer / serialization model ---
+
+    override string Kind() { return "Input"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("hint", "Placeholder"));
+        ps.Add(PropSpec.Text("text", "Text"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "text" || key == "value") { return model.Get(); }
+        if (key == "hint" || key == "placeholder") { return hint; }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "text" || key == "value") { SetText(val); }
+        else if (key == "hint" || key == "placeholder") { hint = val; }
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("Submit");
+        return e;
+    }
+
+    /// Routes the input's own semantic events (Change/Submit) to their UiEvent
+    /// fields; everything else falls through to the common bundle on `On`.
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "Submit") { Submit.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // --- Retained-mode hooks (Control) ---
+
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        prefH = t.heightMedium;
+        prefW = app.Scale(220);
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
     }
 }

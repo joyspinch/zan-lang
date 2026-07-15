@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -271,23 +272,45 @@ static void method_call_context(const char *text, size_t offset,
     *active_param = 0;
 
     int paren_depth = 0;
-    int commas = 0;
     size_t i = offset;
+    bool found = false;
 
-    /* scan backward to find the opening ( */
+    /* scan backward to find the opening ( of the enclosing call */
     while (i > 0) {
         i--;
         if (text[i] == ')') paren_depth++;
         else if (text[i] == '(') {
-            if (paren_depth == 0) break;
+            if (paren_depth == 0) { found = true; break; }
             paren_depth--;
-        } else if (text[i] == ',' && paren_depth == 0) {
-            commas++;
         }
     }
-    *active_param = commas;
+    if (!found) return;
 
-    if (i == 0) return;
+    /* Count the argument index at the cursor by scanning forward from the '('
+     * and counting only top-level commas: commas nested in (), [], {}, generic
+     * <...>, or inside string/char literals do not separate arguments. */
+    {
+        int depth = 0;
+        int commas = 0;
+        for (size_t j = i + 1; j < offset; j++) {
+            char ch = text[j];
+            if (ch == '"' || ch == '\'') {
+                char q = ch;
+                j++;
+                while (j < offset && text[j] != q) {
+                    if (text[j] == '\\') j++;
+                    j++;
+                }
+                continue;
+            }
+            if (ch == '(' || ch == '[' || ch == '{') depth++;
+            else if (ch == ')' || ch == ']' || ch == '}') { if (depth > 0) depth--; }
+            else if (ch == '<' && is_ident_char(text[j - 1])) depth++;
+            else if (ch == '>' && depth > 0) depth--;
+            else if (ch == ',' && depth == 0) commas++;
+        }
+        *active_param = commas;
+    }
 
     /* extract method name before the '(' */
     size_t end = i;
@@ -497,6 +520,13 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     json_arr_add(ca_kinds, json_new_str("source.organizeImports"));
     json_obj_set(code_action, "codeActionKinds", ca_kinds);
     json_obj_set(caps, "codeActionProvider", code_action);
+
+    /* Execute-command: memory leak check */
+    json_value *exec_cmd = json_new_obj();
+    json_value *cmd_list = json_new_arr();
+    json_arr_add(cmd_list, json_new_str("zan.checkLeaks"));
+    json_obj_set(exec_cmd, "commands", cmd_list);
+    json_obj_set(caps, "executeCommandProvider", exec_cmd);
 
     json_value *result = json_new_obj();
     json_obj_set(result, "capabilities", caps);
@@ -770,6 +800,50 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, loc);
 }
 
+/* Scan document text for whole-word occurrences of `word`, skipping string and
+ * char literals and line/block comments so matches are real code references. */
+static int find_text_references(const char *text, const char *word,
+                                size_t *offsets, int max) {
+    int count = 0;
+    size_t wlen = strlen(word);
+    if (wlen == 0) return 0;
+    size_t i = 0;
+    while (text[i] && count < max) {
+        char c = text[i];
+        if (c == '/' && text[i + 1] == '/') {
+            i += 2;
+            while (text[i] && text[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && text[i + 1] == '*') {
+            i += 2;
+            while (text[i] && !(text[i] == '*' && text[i + 1] == '/')) i++;
+            if (text[i]) i += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            char q = c;
+            i++;
+            while (text[i] && text[i] != q) {
+                if (text[i] == '\\' && text[i + 1]) i++;
+                i++;
+            }
+            if (text[i]) i++;
+            continue;
+        }
+        if (is_ident_char(c) && (i == 0 || !is_ident_char(text[i - 1]))) {
+            size_t j = i;
+            while (text[j] && is_ident_char(text[j])) j++;
+            if ((j - i) == wlen && strncmp(text + i, word, wlen) == 0)
+                offsets[count++] = i;
+            i = j;
+            continue;
+        }
+        i++;
+    }
+    return count;
+}
+
 /* NEW: Find all references handler */
 static void handle_references(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
@@ -785,22 +859,16 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_arr()); return; }
 
-    intellisense_t *is = (intellisense_t *)malloc(sizeof(*is));
-    if (!is) { send_response(s, id, json_new_arr()); return; }
-    intel_init(is);
-    intel_parse_file(is, uri, doc->text, strlen(doc->text));
-
-    goto_def_t refs[64];
-    int ref_count = intel_find_references(is, word, refs, 64);
-    free(is);
+    size_t offsets[512];
+    int ref_count = find_text_references(doc->text, word, offsets, 512);
 
     json_value *arr = json_new_arr();
     for (int i = 0; i < ref_count; i++) {
         int rl, rc;
-        offset_to_linecol(doc->text, refs[i].col, &rl, &rc);
+        offset_to_linecol(doc->text, (int)offsets[i], &rl, &rc);
 
         json_value *loc = json_new_obj();
-        json_obj_set(loc, "uri", json_new_str(refs[i].file[0] ? refs[i].file : uri));
+        json_obj_set(loc, "uri", json_new_str(uri));
         json_value *range = json_new_obj();
         json_value *start = json_new_obj();
         json_value *endp  = json_new_obj();
@@ -1070,6 +1138,187 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
     send_response(s, id, actions);
 }
 
+/* ========================= leak checking ============================ */
+
+/* Convert a file:// URI to a native filesystem path. */
+static void uri_to_fspath(const char *uri, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!uri) return;
+    const char *p = uri;
+    if (strncmp(p, "file:///", 8) == 0) p += 8;       /* file:///C:/... */
+    else if (strncmp(p, "file://", 7) == 0) p += 7;   /* file://host/... */
+    size_t o = 0;
+    while (*p && o + 1 < cap) {
+        if (p[0] == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = { p[1], p[2], 0 };
+            out[o++] = (char)strtol(hex, NULL, 16);
+            p += 3;
+            continue;
+        }
+#ifdef _WIN32
+        out[o++] = (*p == '/') ? '\\' : *p;
+#else
+        out[o++] = *p;
+#endif
+        p++;
+    }
+    out[o] = '\0';
+}
+
+/* Compile the given source with --check-leaks, run it, and publish any
+ * reported leak sites as diagnostics. This surfaces the compiler's runtime
+ * ARC leak report (objects still reachable at exit) inside the editor. */
+static void run_leak_check(lsp_server_t *s, const char *uri) {
+    char src[1024];
+    uri_to_fspath(uri, src, sizeof(src));
+    if (!src[0]) return;
+
+    char zanc[1024];
+    if (s->workspace_root[0]) {
+#ifdef _WIN32
+        snprintf(zanc, sizeof(zanc), "%s\\build\\zanc.exe", s->workspace_root);
+#else
+        snprintf(zanc, sizeof(zanc), "%s/build/zanc", s->workspace_root);
+#endif
+    } else {
+        snprintf(zanc, sizeof(zanc), "zanc");
+    }
+
+    char out_exe[1100];
+#ifdef _WIN32
+    snprintf(out_exe, sizeof(out_exe), "%s.leakcheck.exe", src);
+#else
+    snprintf(out_exe, sizeof(out_exe), "%s.leakcheck", src);
+#endif
+
+    /* Redirect the compiler's own stdout/stderr to null: this server's stdout
+     * carries the framed LSP protocol and must not be polluted. */
+    /* On Windows, cmd /c strips the first and last quote of the whole command
+     * line, so the entire command must be wrapped in an extra pair of quotes
+     * to keep the individually-quoted paths intact. */
+    char build_cmd[4096];
+    snprintf(build_cmd, sizeof(build_cmd),
+#ifdef _WIN32
+             "\"\"%s\" \"%s\" -o \"%s\" --auto-stdlib --check-leaks >nul 2>&1\"",
+#else
+             "\"%s\" \"%s\" -o \"%s\" --auto-stdlib --check-leaks >/dev/null 2>&1",
+#endif
+             zanc, src, out_exe);
+
+    json_value *arr = json_new_arr();
+    char summary[256] = {0};
+
+    if (system(build_cmd) == 0) {
+        char run_cmd[1200];
+        snprintf(run_cmd, sizeof(run_cmd),
+#ifdef _WIN32
+                 "\"\"%s\" 2>&1\"",
+#else
+                 "\"%s\" 2>&1",
+#endif
+                 out_exe);
+#ifdef _WIN32
+        FILE *fp = _popen(run_cmd, "r");
+#else
+        FILE *fp = popen(run_cmd, "r");
+#endif
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "memory leak detected")) {
+                    strncpy(summary, line, sizeof(summary) - 1);
+                    char *nl = strchr(summary, '\n');
+                    if (nl) *nl = '\0';
+                    continue;
+                }
+                const char *at = strstr(line, "allocated at ");
+                if (!at) continue;
+                at += strlen("allocated at ");
+                /* strip trailing newline */
+                char loc[1024];
+                strncpy(loc, at, sizeof(loc) - 1);
+                loc[sizeof(loc) - 1] = '\0';
+                char *nl = strpbrk(loc, "\r\n");
+                if (nl) *nl = '\0';
+                /* parse trailing :line:col from the right (path may contain ':') */
+                char *c2 = strrchr(loc, ':');
+                if (!c2) continue;
+                *c2 = '\0';
+                char *c1 = strrchr(loc, ':');
+                if (!c1) continue;
+                *c1 = '\0';
+                int dline = atoi(c1 + 1);
+                int dcol  = atoi(c2 + 1);
+                if (dline < 1) dline = 1;
+                if (dcol  < 1) dcol  = 1;
+
+                json_value *d = json_new_obj();
+                json_value *range = json_new_obj();
+                json_value *start = json_new_obj();
+                json_value *endp  = json_new_obj();
+                json_obj_set(start, "line", json_new_num(dline - 1));
+                json_obj_set(start, "character", json_new_num(dcol - 1));
+                json_obj_set(endp, "line", json_new_num(dline - 1));
+                json_obj_set(endp, "character", json_new_num(dcol));
+                json_obj_set(range, "start", start);
+                json_obj_set(range, "end", endp);
+                json_obj_set(d, "range", range);
+                json_obj_set(d, "severity", json_new_num(2)); /* Warning */
+                json_obj_set(d, "source", json_new_str("zan-leakcheck"));
+                json_obj_set(d, "message",
+                    json_new_str("memory leak: object allocated here is still "
+                                 "reachable at program exit (possible ARC cycle)"));
+                json_arr_add(arr, d);
+            }
+#ifdef _WIN32
+            _pclose(fp);
+#else
+            pclose(fp);
+#endif
+        }
+        remove(out_exe);
+    }
+
+    /* publish (an empty array clears previous leak diagnostics) */
+    json_value *params = json_new_obj();
+    json_obj_set(params, "uri", json_new_str(uri));
+    json_obj_set(params, "diagnostics", arr);
+    json_value *note = json_new_obj();
+    json_obj_set(note, "jsonrpc", json_new_str("2.0"));
+    json_obj_set(note, "method", json_new_str("textDocument/publishDiagnostics"));
+    json_obj_set(note, "params", params);
+    char *payload = json_serialize(note);
+    rpc_write_message(s->out, payload);
+    free(payload);
+    json_free(note);
+
+    if (summary[0]) {
+        json_value *mparams = json_new_obj();
+        json_obj_set(mparams, "type", json_new_num(2)); /* Warning */
+        json_obj_set(mparams, "message", json_new_str(summary));
+        json_value *mnote = json_new_obj();
+        json_obj_set(mnote, "jsonrpc", json_new_str("2.0"));
+        json_obj_set(mnote, "method", json_new_str("window/showMessage"));
+        json_obj_set(mnote, "params", mparams);
+        char *mp = json_serialize(mnote);
+        rpc_write_message(s->out, mp);
+        free(mp);
+        json_free(mnote);
+    }
+}
+
+static void handle_execute_command(lsp_server_t *s, json_value *id, json_value *params) {
+    const char *command = json_get_str(json_obj_get(params, "command"));
+    if (command && strcmp(command, "zan.checkLeaks") == 0) {
+        json_value *args = json_obj_get(params, "arguments");
+        const char *uri = NULL;
+        if (args && json_arr_count(args) > 0)
+            uri = json_get_str(json_arr_at(args, 0));
+        if (uri) run_leak_check(s, uri);
+    }
+    send_response(s, id, json_new_null());
+}
+
 /* ============================ dispatch =============================== */
 
 static void dispatch(lsp_server_t *s, json_value *msg) {
@@ -1104,6 +1353,8 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
         handle_document_symbol(s, id, params);
     } else if (strcmp(method, "textDocument/codeAction") == 0) {
         handle_code_action(s, id, params);
+    } else if (strcmp(method, "workspace/executeCommand") == 0) {
+        handle_execute_command(s, id, params);
     } else if (strcmp(method, "shutdown") == 0) {
         s->shutdown_requested = true;
         send_response(s, id, json_new_null());

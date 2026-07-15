@@ -1,23 +1,57 @@
 using System;
+using System.IO;
 
 namespace System.Diagnostics;
 
 /// <summary>
 /// Cross-platform process launcher with output capture.
-/// Uses _popen/_pclose on Windows, popen/pclose on Linux.
+/// Uses _popen/_pclose on Windows, popen/pclose on POSIX (Linux/macOS).
+///
+/// SECURITY: RunCapture / Run / PipeOpen execute their argument through the
+/// system shell (cmd.exe or /bin/sh -c), so shell metacharacters in the command
+/// are interpreted. NEVER build these commands from untrusted or unsanitised
+/// input -- doing so allows command injection. Pass only trusted, fully
+/// controlled command strings. (A shell-free, argv-based launcher is the safe
+/// choice for untrusted arguments and is a planned addition.)
 /// </summary>
 class Process {
     #if WINDOWS
-    [DllImport("msvcrt", EntryPoint = "_popen")]
+    [DllImport("crt", EntryPoint = "_popen")]
     static extern int plat_popen(string cmd, string mode);
 
-    [DllImport("msvcrt", EntryPoint = "_pclose")]
+    [DllImport("crt", EntryPoint = "_pclose")]
     static extern int plat_pclose(int fp);
-    #elif LINUX
-    [DllImport("libc", EntryPoint = "popen")]
+
+    // Win32 primitives for launching child processes without flashing a console
+    // window. _popen/system attach a console to GUI-subsystem programs, so the
+    // IDE and other windowed apps route through CreateProcess + CREATE_NO_WINDOW.
+    [DllImport("crt")] static extern string strcpy(string dest, string src);
+    [DllImport("crt")] static extern string strcat(string dest, string src);
+    [DllImport("crt")] static extern int strlen(string s);
+    [DllImport("crt", EntryPoint = "memset")] static extern int wmemset(string dst, int val, int n);
+
+    [DllImport("kernel32", EntryPoint = "CreateProcessA")]
+    static extern int WinCreateProcess(int appName, string cmdLine, int pa, int ta,
+                                       int inherit, int flags, int env, int curDir,
+                                       string si, string pi);
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(int handle, int ms);
+    [DllImport("kernel32", EntryPoint = "GetExitCodeProcess")]
+    static extern int WinGetExitCodeProcess(int handle, string codeBuf);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(int handle);
+    [DllImport("kernel32", EntryPoint = "GetTempPathA")]
+    static extern int WinGetTempPath(int bufLen, string buf);
+    [DllImport("kernel32", EntryPoint = "GetTickCount")]
+    static extern int WinGetTickCount();
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    static extern int WinGetCurrentProcessId();
+    #else
+    // Linux, macOS and other POSIX systems all expose popen/pclose in libc.
+    [DllImport("crt", EntryPoint = "popen")]
     static extern int plat_popen(string cmd, string mode);
 
-    [DllImport("libc", EntryPoint = "pclose")]
+    [DllImport("crt", EntryPoint = "pclose")]
     static extern int plat_pclose(int fp);
     #endif
 
@@ -43,8 +77,77 @@ class Process {
         return plat_pclose(fp);
     }
 
+    #if WINDOWS
+    // Reads a little-endian HANDLE (8 bytes) out of a PROCESS_INFORMATION buffer.
+    static int WinHandleAt(string pi, int off) {
+        int h = 0;
+        int mul = 1;
+        int k = 0;
+        while (k < 8) {
+            h = h + (pi[off + k] & 255) * mul;
+            mul = mul * 256;
+            k = k + 1;
+        }
+        return h;
+    }
+
+    // Launches `command` through cmd.exe with no console window. When `waitFor`
+    // is set, waits for completion and returns the child exit code; otherwise
+    // returns 0 after a successful launch (or -1 if the launch failed).
+    static int WinSpawn(string command, bool waitFor) {
+        string cmdline = calloc(strlen(command) + 16, 1);
+        strcpy(cmdline, "cmd.exe /c ");
+        strcat(cmdline, command);
+        string si = calloc(128, 1);
+        wmemset(si, 104, 1);                // STARTUPINFOA.cb = sizeof(STARTUPINFOA)
+        string pi = calloc(32, 1);
+        int CREATE_NO_WINDOW = 134217728;   // 0x08000000
+        int ok = WinCreateProcess(0, cmdline, 0, 0, 0, CREATE_NO_WINDOW, 0, 0, si, pi);
+        int code = 0 - 1;
+        if (ok != 0) {
+            int hProc = WinHandleAt(pi, 0);
+            int hThread = WinHandleAt(pi, 8);
+            code = 0;
+            if (waitFor) {
+                WinWaitForSingleObject(hProc, 0 - 1);   // INFINITE
+                string cb = calloc(8, 1);
+                WinGetExitCodeProcess(hProc, cb);
+                code = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
+                free(cb);
+            }
+            WinCloseHandle(hProc);
+            WinCloseHandle(hThread);
+        }
+        free(cmdline);
+        free(si);
+        free(pi);
+        return code;
+    }
+
+    // Runs `cmd` hidden, redirecting stdout+stderr to a temp file, then reads it.
+    static List<string> WinCapture(string cmd) {
+        string tmpDir = calloc(4096, 1);
+        WinGetTempPath(4096, tmpDir);
+        int tick = WinGetTickCount();
+        int pid = WinGetCurrentProcessId();
+        string tmp = tmpDir + "zan_cap_" + pid + "_" + tick + ".tmp";
+        string full = "(" + cmd + ") > \"" + tmp + "\" 2>&1";
+        WinSpawn(full, true);
+        List<string> lines = new List<string>();
+        if (File.Exists(tmp)) {
+            lines = SplitLines(File.ReadAllText(tmp));
+            File.Delete(tmp);
+        }
+        free(tmpDir);
+        return lines;
+    }
+    #endif
+
     /// <summary>Runs a command and captures stdout+stderr as lines.</summary>
     static List<string> RunCapture(string cmd) {
+        #if WINDOWS
+        return WinCapture(cmd);
+        #else
         List<string> lines = new List<string>();
         string full = "(" + cmd + ") 2>&1";
         int fp = PipeOpen(full, "r");
@@ -62,9 +165,11 @@ class Process {
             } else {
                 sb.Append(buf);
             }
+            free(buf);
         }
         PipeClose(fp);
         return SplitLines(sb.ToString());
+        #endif
     }
 
     /// <summary>Runs a command and captures output (wrapper).</summary>
@@ -73,9 +178,27 @@ class Process {
         return result;
     }
 
-    /// <summary>Runs a command and returns the exit code.</summary>
+    /// <summary>Runs a command via the system shell and returns the exit code.
+    /// SECURITY: invokes a shell; never pass untrusted input (injection risk).</summary>
     static int Run(string cmd) {
+        #if WINDOWS
+        return WinSpawn(cmd, true);
+        #else
         return system(cmd);
+        #endif
+    }
+
+    /// <summary>Launches a command WITHOUT waiting for it to finish, returning
+    /// immediately (0 on a successful launch). Useful for long-running or modal
+    /// child processes (e.g. a native file/folder picker) so the caller's UI can
+    /// keep pumping messages instead of freezing until the child exits.
+    /// SECURITY: invokes a shell; never pass untrusted input (injection risk).</summary>
+    static int RunDetached(string cmd) {
+        #if WINDOWS
+        return WinSpawn(cmd, false);
+        #else
+        return system("(" + cmd + ") >/dev/null 2>&1 &");
+        #endif
     }
 
     /// <summary>Splits text on newlines.</summary>

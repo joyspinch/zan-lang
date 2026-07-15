@@ -3,8 +3,14 @@ using System;
 namespace System.Threading;
 
 /// <summary>
+/// A parameterless thread entry point. Assign a lambda or a static method
+/// group: <c>Thread.Start(() =&gt; { ... })</c> or <c>Thread.Start(Worker)</c>.
+/// </summary>
+delegate void ThreadStart();
+
+/// <summary>
 /// Cross-platform thread and synchronization primitives.
-/// Uses Win32 API on Windows, pthreads (libc) on Linux/macOS.
+/// Uses Win32 API on Windows, pthreads (in libc) on POSIX (Linux/macOS).
 /// </summary>
 class Thread {
     #if WINDOWS
@@ -13,19 +19,32 @@ class Thread {
 
     [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
     static extern int PlatGetCurrentThreadId();
-    #elif LINUX
-    [DllImport("libc", EntryPoint = "usleep")]
+    #else
+    [DllImport("crt", EntryPoint = "usleep")]
     static extern int PlatUsleep(int microseconds);
 
-    [DllImport("libc", EntryPoint = "getpid")]
+    [DllImport("crt", EntryPoint = "getpid")]
     static extern int PlatGetPid();
     #endif
+
+    [DllImport("crt", EntryPoint = "zan_thread_start")]
+    static extern int PlatThreadStart(ThreadStart body);
+
+    /// <summary>
+    /// Runs <paramref name="body"/> on a new detached background thread and
+    /// returns immediately. The delegate must be non-capturing (operate on
+    /// static/shared state); use atomics or App.Post to hand results back to
+    /// another thread safely. Returns true if the thread was started.
+    /// </summary>
+    static bool Start(ThreadStart body) {
+        return Thread.PlatThreadStart(body) != 0;
+    }
 
     /// <summary>Sleeps the current thread for the specified milliseconds.</summary>
     static void Sleep(int milliseconds) {
         #if WINDOWS
         PlatSleep(milliseconds);
-        #elif LINUX
+        #else
         PlatUsleep(milliseconds * 1000);
         #endif
     }
@@ -34,7 +53,7 @@ class Thread {
     static int CurrentId() {
         #if WINDOWS
         return PlatGetCurrentThreadId();
-        #elif LINUX
+        #else
         return PlatGetPid();
         #endif
     }
@@ -61,23 +80,23 @@ class Mutex {
 
     [DllImport("kernel32", EntryPoint = "CloseHandle")]
     static extern int WinCloseHandle(int handle);
-    #elif LINUX
-    [DllImport("libc", EntryPoint = "calloc")]
+    #else
+    [DllImport("crt", EntryPoint = "calloc")]
     static extern string PthreadCalloc(int count, int size);
 
-    [DllImport("libc", EntryPoint = "free")]
+    [DllImport("crt", EntryPoint = "free")]
     static extern void PthreadFree(string ptr);
 
-    [DllImport("libpthread", EntryPoint = "pthread_mutex_init")]
+    [DllImport("crt", EntryPoint = "pthread_mutex_init")]
     static extern int PthreadMutexInit(string mutex, string attr);
 
-    [DllImport("libpthread", EntryPoint = "pthread_mutex_lock")]
+    [DllImport("crt", EntryPoint = "pthread_mutex_lock")]
     static extern int PthreadMutexLock(string mutex);
 
-    [DllImport("libpthread", EntryPoint = "pthread_mutex_unlock")]
+    [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
     static extern int PthreadMutexUnlock(string mutex);
 
-    [DllImport("libpthread", EntryPoint = "pthread_mutex_destroy")]
+    [DllImport("crt", EntryPoint = "pthread_mutex_destroy")]
     static extern int PthreadMutexDestroy(string mutex);
     #endif
 
@@ -97,7 +116,7 @@ class Mutex {
     static void Destroy(int handle) {
         WinCloseHandle(handle);
     }
-    #elif LINUX
+    #else
     static string Create() {
         string mtx = PthreadCalloc(1, 64);
         PthreadMutexInit(mtx, "");
@@ -135,23 +154,39 @@ class Semaphore {
 
     [DllImport("kernel32", EntryPoint = "CloseHandle")]
     static extern int WinCloseHandle(int handle);
-    #elif LINUX
-    [DllImport("libc", EntryPoint = "calloc")]
+    #elif MACOS
+    // macOS has no unnamed POSIX semaphores (sem_init sets ENOSYS and returns
+    // -1), so use a GCD dispatch semaphore. The opaque dispatch_semaphore_t
+    // pointer is carried as a string handle, matching the Linux sem_t*
+    // convention below. dispatch_* lives in libSystem, which -lc resolves.
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_create")]
+    static extern string MacSemCreate(int initValue);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    static extern int MacSemWait(string sem, int timeout);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_signal")]
+    static extern int MacSemSignal(string sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_release")]
+    static extern void MacSemRelease(string sem);
+    #else
+    [DllImport("crt", EntryPoint = "calloc")]
     static extern string SemCalloc(int count, int size);
 
-    [DllImport("libc", EntryPoint = "free")]
+    [DllImport("crt", EntryPoint = "free")]
     static extern void SemFree(string ptr);
 
-    [DllImport("libpthread", EntryPoint = "sem_init")]
+    [DllImport("crt", EntryPoint = "sem_init")]
     static extern int SemInit(string sem, int pshared, int initValue);
 
-    [DllImport("libpthread", EntryPoint = "sem_wait")]
+    [DllImport("crt", EntryPoint = "sem_wait")]
     static extern int SemWait(string sem);
 
-    [DllImport("libpthread", EntryPoint = "sem_post")]
+    [DllImport("crt", EntryPoint = "sem_post")]
     static extern int SemPost(string sem);
 
-    [DllImport("libpthread", EntryPoint = "sem_destroy")]
+    [DllImport("crt", EntryPoint = "sem_destroy")]
     static extern int SemDestroy(string sem);
     #endif
 
@@ -171,7 +206,23 @@ class Semaphore {
     static void Destroy(int handle) {
         WinCloseHandle(handle);
     }
-    #elif LINUX
+    #elif MACOS
+    static string Create(int initialCount, int maxCount) {
+        return MacSemCreate(initialCount);
+    }
+
+    static void Wait(string handle) {
+        MacSemWait(handle, -1);   // -1 == DISPATCH_TIME_FOREVER
+    }
+
+    static void Release(string handle) {
+        MacSemSignal(handle);
+    }
+
+    static void Destroy(string handle) {
+        MacSemRelease(handle);
+    }
+    #else
     static string Create(int initialCount, int maxCount) {
         string sem = SemCalloc(1, 64);
         SemInit(sem, 0, initialCount);
@@ -200,24 +251,32 @@ class Stopwatch {
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetTickCount64")]
     static extern int WinGetTickCount64();
-    #elif LINUX
-    [DllImport("libc", EntryPoint = "clock_gettime")]
-    static extern int LinuxClockGettime(int clk_id, string tp);
+    #else
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    static extern int ClockGettime(int clk_id, string tp);
 
-    [DllImport("libc", EntryPoint = "calloc")]
+    [DllImport("crt", EntryPoint = "calloc")]
     static extern string StopwatchCalloc(int count, int size);
 
-    [DllImport("libc", EntryPoint = "free")]
+    [DllImport("crt", EntryPoint = "free")]
     static extern void StopwatchFree(string ptr);
+
+    // CLOCK_MONOTONIC has a different numeric value per platform: 1 on Linux,
+    // 6 on macOS (where clk_id 1 is not a valid clock and would fail).
+    #if MACOS
+    static int MonotonicClockId() { return 6; }
+    #else
+    static int MonotonicClockId() { return 1; }
+    #endif
     #endif
 
     /// <summary>Returns current tick count in milliseconds.</summary>
     static int GetMilliseconds() {
         #if WINDOWS
         return WinGetTickCount64();
-        #elif LINUX
+        #else
         string tp = StopwatchCalloc(1, 16);
-        LinuxClockGettime(1, tp);
+        ClockGettime(MonotonicClockId(), tp);
         int sec = tp[0] | (tp[1] << 8) | (tp[2] << 16) | (tp[3] << 24);
         int nsec = tp[8] | (tp[9] << 8) | (tp[10] << 16) | (tp[11] << 24);
         StopwatchFree(tp);

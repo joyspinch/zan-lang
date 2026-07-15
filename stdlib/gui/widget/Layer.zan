@@ -1,0 +1,869 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// Retained state for a floating layer. It backs two shapes:
+///   kind 0 -- a draggable "page" window (layui `layer` page/iframe style):
+///             owns geometry, drag state and min/max/restore.
+///   kind 1 -- a centered modal dialog (alert / confirm), dimmed backdrop,
+///             icon + title + body + action row.
+///   kind 2 -- a centered prompt dialog: like a confirm plus a text input.
+/// state: 0 normal, 1 maximized, 2 minimized (windows only).
+class LayerState {
+    string title;
+    string body;
+    int x;
+    int y;
+    int w;
+    int h;
+    // Saved normal geometry, so restore from maximize/minimize returns here.
+    int sx;
+    int sy;
+    int sw;
+    int sh;
+    int state;
+    bool open;
+    bool dragging;
+    int grabDx;
+    int grabDy;
+    // Whether to draw the footer action row (OK / Cancel).
+    bool footer;
+    // Last footer action: 0 none, 1 confirm, 2 cancel, 3 close(X).
+    int action;
+    // --- unified layer additions ---
+    int kind;            // 0 window, 1 dialog, 2 prompt
+    bool modal;          // draw a dimmed backdrop and center the layer
+    int dtype;           // dialog icon: 0 info, 1 success, 2 warning, 3 error
+    bool twoButtons;     // confirm/prompt (OK+Cancel) vs alert (OK only)
+    string okText;
+    string cancelText;
+    Input promptInput;   // text field for kind 2 (null otherwise)
+    int openMs;          // wall-clock ms the layer was opened (entrance anim)
+
+    static LayerState Create(string title, int x, int y, int w, int h) {
+        LayerState s = new LayerState();
+        s.title = title;
+        s.body = "";
+        s.x = x;
+        s.y = y;
+        s.w = w;
+        s.h = h;
+        s.sx = x;
+        s.sy = y;
+        s.sw = w;
+        s.sh = h;
+        s.state = 0;
+        s.open = false;
+        s.dragging = false;
+        s.grabDx = 0;
+        s.grabDy = 0;
+        s.footer = true;
+        s.action = 0;
+        s.kind = 0;
+        s.modal = false;
+        s.dtype = 0;
+        s.twoButtons = true;
+        s.okText = "OK";
+        s.cancelText = "Cancel";
+        s.promptInput = null;
+        s.openMs = 0;
+        return s;
+    }
+
+    /// A centered modal confirm dialog (OK + Cancel). dtype picks the icon.
+    static LayerState Confirm(string title, string body, int dtype) {
+        LayerState s = LayerState.Create(title, 0, 0, 420, 200);
+        s.body = body;
+        s.kind = 1;
+        s.modal = true;
+        s.dtype = dtype;
+        s.twoButtons = true;
+        return s;
+    }
+
+    /// A centered modal alert dialog (single OK button).
+    static LayerState Alert(string title, string body, int dtype) {
+        LayerState s = LayerState.Confirm(title, body, dtype);
+        s.twoButtons = false;
+        return s;
+    }
+
+    /// A centered modal prompt dialog with a text input (OK + Cancel).
+    static LayerState Prompt(string title, string hint) {
+        LayerState s = LayerState.Create(title, 0, 0, 420, 220);
+        s.kind = 2;
+        s.modal = true;
+        s.dtype = 0;
+        s.twoButtons = true;
+        s.promptInput = Input.Create(hint);
+        return s;
+    }
+
+    void Open() {
+        open = true;
+        action = 0;
+        openMs = Window.GetTickMs();
+        if (state == 2) { state = 0; }
+    }
+
+    /// Text the user typed into a prompt layer (empty when there is no input).
+    string PromptText() {
+        if (promptInput == null) { return ""; }
+        return promptInput.GetText();
+    }
+}
+
+/// A transient queued item (toast / notification). The queue owns its birth
+/// time so it can fade in, live for `lifeMs`, then fade out; `curY`/`curX`
+/// carry the eased on-screen position so the stack collapses smoothly when an
+/// earlier item is removed.
+class ToastItem {
+    string text;
+    int type;
+    int bornMs;
+    int lifeMs;
+    bool closing;
+    int closeMs;
+    int curY;
+    int curX;
+
+    static ToastItem Create(string text, int type, int lifeMs) {
+        ToastItem it = new ToastItem();
+        it.text = text;
+        it.type = type;
+        it.bornMs = Window.GetTickMs();
+        it.lifeMs = lifeMs;
+        it.closing = false;
+        it.closeMs = 0;
+        it.curY = 0 - 99999;
+        it.curX = 0 - 99999;
+        return it;
+    }
+}
+
+/// The unified overlay layer -- a single component that covers every popup need
+/// (layui `layer` style): draggable page windows, modal alert/confirm/prompt
+/// dialogs, a top-centered message toast queue, corner notifications, a loading
+/// mask, anchored tips and a full-screen photo carousel. All animate on open /
+/// close and are drawn in the deferred overlay pass so they float above the
+/// page content.
+class Layer {
+    // ---- transient queues (lazily created) ----
+    static List<ToastItem> toasts;
+    static List<ToastItem> notifs;
+
+    static void EnsureQueues() {
+        if (Layer.toasts == null) { Layer.toasts = new List<ToastItem>(); }
+        if (Layer.notifs == null) { Layer.notifs = new List<ToastItem>(); }
+    }
+
+    static int Clamp01(int v) {
+        if (v < 0) { return 0; }
+        if (v > 1000) { return 1000; }
+        return v;
+    }
+
+    /// Scales the alpha of an opaque packed color to `a` permille (0..1000),
+    /// so a widget can fade in/out by drawing every element through this.
+    static int Fade(int color, int a) {
+        if (a >= 1000) { return color; }
+        if (a < 0) { a = 0; }
+        int rgb = color % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        int na = 255 * a / 1000;
+        return na * 16777216 + rgb;
+    }
+
+    /// Fills an overlay panel body. Under a frosted-glass theme (and once the
+    /// panel has settled, a >= 900) it blurs the backdrop behind the panel and
+    /// lays a translucent tint + a hairline top sheen over it; otherwise it is a
+    /// plain (optionally fading) opaque fill. `a` is the permille fade alpha.
+    static void GlassFill(App app, int x, int y, int w, int h,
+                          int radius, int color, int a) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (t.glass != 0 && a >= 900) {
+            // Strong backdrop blur + a light translucent tint so the frosted
+            // wallpaper clearly shows through, plus a hairline top sheen and a
+            // soft white rim -- the hallmark of Apple-style liquid glass.
+            c.BlurRectCached(x, y, w, h, app.Scale(30),
+                app.NextBlurSlot(), app.BackdropDirty());
+            // Lighter tint (was 460) so the saturated, blurred wallpaper reads
+            // through as colour instead of a muddy dark slab...
+            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, 320));
+            // ...a soft white frost veil for the milky glass quality...
+            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 45));
+            // ...a brighter specular top sheen...
+            c.FillRoundRect(x, y, w, app.Scale(2), radius,
+                            Layer.Fade(t.textPrimary, 150));
+            // ...and a crisp white rim -- the hallmark of Apple liquid glass.
+            c.DrawRect(x, y, w, h, Layer.Fade(t.textPrimary, 90), 1);
+        } else {
+            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, a));
+        }
+    }
+
+    // ================================================================
+    // Message toast queue (top-centered, auto-dismiss, collapses upward)
+    // ================================================================
+
+    /// Enqueues a transient top-centered toast. type: 1 default, 2 info,
+    /// 3 success, 4 warning, 5 error.
+    static void Msg(string text, int type) {
+        Layer.EnsureQueues();
+        Layer.toasts.Add(ToastItem.Create(text, type, 3000));
+    }
+
+    /// Draws + advances the toast queue. Call once per frame in the overlay
+    /// pass. Items fade/slide in from just above their slot, live briefly, then
+    /// fade out; survivors ease upward to close the gap.
+    static void RenderToasts(App app) {
+        Layer.EnsureQueues();
+        Theme t = app.theme;
+        int now = Window.GetTickMs();
+
+        int i = 0;
+        while (i < Layer.toasts.Count) {
+            ToastItem it = Layer.toasts[i];
+            if (it.closing && now - it.closeMs >= 240) {
+                Layer.toasts.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+
+        int h = t.heightMedium;
+        int gap = app.Scale(8);
+        int slotH = h + gap;
+        int topY = app.titlebarH + app.Scale(10);
+        int n = Layer.toasts.Count;
+        int j = 0;
+        while (j < n) {
+            ToastItem it = Layer.toasts[j];
+            if (!it.closing && now - it.bornMs >= it.lifeMs) {
+                it.closing = true;
+                it.closeMs = now;
+            }
+            int ty = topY + j * slotH;
+            if (it.curY < 0 - 9000) { it.curY = ty - app.Scale(14); }
+            else { it.curY = it.curY + (ty - it.curY) / 3; }
+
+            int enterP = App.Ease(Layer.Clamp01((now - it.bornMs) * 1000 / 220));
+            int exitP = 0;
+            if (it.closing) {
+                exitP = App.Ease(Layer.Clamp01((now - it.closeMs) * 1000 / 240));
+            }
+            int a = enterP * (1000 - exitP) / 1000;
+            Layer.DrawToast(app, it.curY, a, it.text, it.type);
+            j = j + 1;
+        }
+        if (n > 0) { app.RequestAnimationFrame(16); }
+    }
+
+    static void DrawToast(App app, int y, int a, string text, int mtype) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int accent = t.textSecondary;
+        string iconName = "info";
+        if (mtype == 2) { accent = t.info; iconName = "info"; }
+        if (mtype == 3) { accent = t.success; iconName = "success"; }
+        if (mtype == 4) { accent = t.warning; iconName = "warning"; }
+        if (mtype == 5) { accent = t.error; iconName = "error"; }
+
+        int ico = t.iconSizeSmall;
+        int h = t.heightMedium;
+        int textW = Canvas.MeasureText(text, t.fontSizeMedium);
+        int w = t.paddingMedium * 2 + ico + t.gapSmall + textW;
+        int x = (c.Width() - w) / 2;
+
+        int sh = 34 * a / 1000;
+        c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, sh * 16777216);
+        Layer.GlassFill(app, x, y, w, h, t.borderRadiusMedium, t.bgPrimary, a);
+        c.DrawRect(x, y, w, h, Layer.Fade(t.borderSecondary, a), 1);
+        Icon.DrawCenteredIn(c, iconName, x + t.paddingMedium, y, ico, h, ico,
+                            Layer.Fade(accent, a));
+        c.DrawText(x + t.paddingMedium + ico + t.gapSmall,
+                   y + (h - Canvas.FontHeight(t.fontSizeMedium)) / 2,
+                   text, Layer.Fade(t.textPrimary, a), t.fontSizeMedium);
+    }
+
+    // ================================================================
+    // Notification queue (top-right corner, auto-dismiss, collapses up)
+    // ================================================================
+
+    /// Enqueues a corner notification. type: 1 default, 2 info, 3 success,
+    /// 4 warning, 5 error.
+    static void Notify(string title, int type) {
+        Layer.EnsureQueues();
+        Layer.notifs.Add(ToastItem.Create(title, type, 4000));
+    }
+
+    static void RenderNotifs(App app) {
+        Layer.EnsureQueues();
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int now = Window.GetTickMs();
+
+        int i = 0;
+        while (i < Layer.notifs.Count) {
+            ToastItem it = Layer.notifs[i];
+            if (it.closing && now - it.closeMs >= 260) {
+                Layer.notifs.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+
+        int w = app.Scale(300);
+        int h = t.heightLarge + t.paddingSmall;
+        int gap = app.Scale(10);
+        int slotH = h + gap;
+        int margin = app.Scale(16);
+        int tx = c.Width() - w - margin;
+        int topY = app.titlebarH + app.Scale(12);
+        int n = Layer.notifs.Count;
+        int j = 0;
+        while (j < n) {
+            ToastItem it = Layer.notifs[j];
+            if (!it.closing && now - it.bornMs >= it.lifeMs) {
+                it.closing = true;
+                it.closeMs = now;
+            }
+            int ty = topY + j * slotH;
+            if (it.curY < 0 - 9000) { it.curY = ty; }
+            else { it.curY = it.curY + (ty - it.curY) / 3; }
+
+            int enterP = App.Ease(Layer.Clamp01((now - it.bornMs) * 1000 / 240));
+            int exitP = 0;
+            if (it.closing) {
+                exitP = App.Ease(Layer.Clamp01((now - it.closeMs) * 1000 / 260));
+            }
+            int a = enterP * (1000 - exitP) / 1000;
+            int cx = tx + (1000 - a) * app.Scale(24) / 1000;
+            Layer.DrawNotifyCard(app, cx, it.curY, w, a, it.text, it.type);
+            j = j + 1;
+        }
+        if (n > 0) { app.RequestAnimationFrame(16); }
+    }
+
+    /// Draws a notification card (opaque). Reused as a static preview renderer.
+    static void DrawNotify(App app, int x, int y, int w, string message, int ntype) {
+        Layer.DrawNotifyCard(app, x, y, w, 1000, message, ntype);
+    }
+
+    static void DrawNotifyCard(App app, int x, int y, int w, int a,
+                               string message, int ntype) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int h = t.heightLarge + t.paddingSmall;
+
+        int sh = 34 * a / 1000;
+        c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, sh * 16777216);
+        Layer.GlassFill(app, x, y, w, h, t.borderRadiusMedium, t.bgPrimary, a);
+        c.DrawRect(x, y, w, h, Layer.Fade(t.borderSecondary, a), 1);
+
+        int barColor = t.primary;
+        string iconName = "info";
+        if (ntype == 2) { barColor = t.info; iconName = "info"; }
+        if (ntype == 3) { barColor = t.success; iconName = "success"; }
+        if (ntype == 4) { barColor = t.warning; iconName = "warning"; }
+        if (ntype == 5) { barColor = t.error; iconName = "error"; }
+        c.FillRect(x, y, 3, h, Layer.Fade(barColor, a));
+
+        Icon.DrawCenteredIn(c, iconName, x + t.paddingMedium, y,
+                            t.iconSizeMedium, h, t.iconSizeMedium,
+                            Layer.Fade(barColor, a));
+        c.DrawText(x + t.paddingMedium + t.iconSizeMedium + t.gapSmall,
+                   y + (h - Canvas.FontHeight(t.fontSizeMedium)) / 2,
+                   message, Layer.Fade(t.textPrimary, a), t.fontSizeMedium);
+    }
+
+    // ================================================================
+    // Loading mask + anchored tip
+    // ================================================================
+
+    /// A loading mask over a region: a dimmed rounded panel with a centered
+    /// spinner and an optional caption.
+    static void RenderLoad(App app, int x, int y, int w, int h, string tip) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusLarge, t.overlay);
+        app.BlockHitsRect(x, y, w, h);
+        Spin.WithTip(app, x, y, w, h, tip);
+    }
+
+    /// A small anchored tip bubble (delegates to the shared Tooltip visual).
+    static void Tips(App app, int anchorX, int anchorY, string text) {
+        Tooltip.Render(app, anchorX, anchorY, text);
+    }
+
+    // ================================================================
+    // Static compatibility helpers (drop-in for the removed wrappers)
+    // ================================================================
+
+    /// Centered modal surface with a title bar + close button. Returns the
+    /// close-button hit id. (Drop-in for the former Modal.Render.)
+    static int Modal(App app, int w, int h, string title) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        c.FillRect(0, 0, c.Width(), c.Height(), t.overlay);
+        app.BlockHitsBelow();
+        int x = (c.Width() - w) / 2;
+        int y = (c.Height() - h) / 2;
+
+        c.FillRoundRect(x + 2, y + 3, w, h, t.borderRadiusLarge, t.shadowColor);
+        c.FillRoundRect(x, y, w, h, t.borderRadiusLarge, t.bgPrimary);
+
+        if (title != "") {
+            c.DrawText(x + t.paddingLarge, y + t.paddingLarge, title,
+                       t.textPrimary, t.fontSizeLarge);
+            c.FillRect(x + 1, y + t.paddingLarge + t.heightMedium, w - 2, 1, t.divider);
+        }
+
+        int closeId = app.focus.AllocId();
+        int closeX = x + w - t.heightMedium;
+        int closeY = y;
+        if (app.focus.IsHovered(closeId)) {
+            c.FillRoundRect(closeX, closeY, t.heightMedium, t.heightMedium,
+                            t.borderRadiusLarge, t.bgHover);
+        }
+        Icon.DrawCenteredIn(c, "close", closeX, closeY, t.heightMedium,
+                            t.heightMedium, t.iconSizeSmall, t.textSecondary);
+        app.hitTester.Register(
+            HitRegion.Create(closeId, closeX, closeY, t.heightMedium, t.heightMedium, 0));
+        return closeId;
+    }
+
+    /// A small confirmation popover anchored below a trigger. Returns 0 none,
+    /// 1 confirm, 2 cancel. (Drop-in for the former Popconfirm.Render.)
+    static int DrawPopconfirm(App app, int anchorX, int anchorY, string message,
+                              string okText, string cancelText) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int ico = t.iconSizeSmall;
+        int msgW = Canvas.MeasureText(message, t.fontSizeMedium);
+        int pad = t.paddingMedium;
+        int w = pad * 2 + ico + t.gapSmall + msgW;
+        int bw = app.Scale(64);
+        int minW = pad * 2 + bw * 2 + t.gapSmall;
+        if (w < minW) { w = minW; }
+        int h = pad * 2 + Canvas.FontHeight(t.fontSizeMedium) + t.gapMedium + t.heightSmall;
+
+        int x = anchorX - w / 2;
+        int y = anchorY + app.Scale(8);
+        if (x < app.Scale(4)) { x = app.Scale(4); }
+
+        int notch = app.Scale(6);
+        c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, t.shadowColor);
+        Layer.GlassFill(app, x, y, w, h, t.borderRadiusMedium, t.bgPrimary, 1000);
+        c.DrawRect(x, y, w, h, t.borderSecondary, 1);
+        Tooltip.TriUp(c, anchorX, y - notch, notch, notch, t.bgPrimary);
+        app.BlockHitsRect(x, y, w, h);
+
+        Icon.Draw(c, "warning", x + pad, y + pad, ico, t.warning);
+        c.DrawText(x + pad + ico + t.gapSmall, y + pad, message, t.textPrimary, t.fontSizeMedium);
+
+        int by = y + h - t.heightSmall - pad;
+        int okX = x + w - pad - bw;
+        int cancelX = okX - t.gapSmall - bw;
+
+        int result = 0;
+        int cancelId = Button.Styled(cancelText, 1, 1).Render(app, cancelX, by, bw);
+        if (Button.WasClicked(app, cancelId)) { result = 2; }
+        int okId = Button.Primary(okText).Render(app, okX, by, bw);
+        if (Button.WasClicked(app, okId)) { result = 1; }
+        return result;
+    }
+
+    // ================================================================
+    // Full-screen photo carousel (layui `photos` layer)
+    // ================================================================
+
+    /// Full-screen dimmed photo viewer wrapping the shared Carousel. Returns
+    /// true the frame its close button is clicked.
+    static bool RenderPhotos(App app, List<string> slides, SignalInt idx,
+                             CarouselAnim anim) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        int top = app.titlebarH;
+
+        c.FillRect(0, top, W, H - top, 0xE6000000);
+        app.BlockHitsRect(0, top, W, H - top);
+
+        int pw = W * 7 / 10;
+        int ph = (H - top) * 7 / 10;
+        int px = (W - pw) / 2;
+        int py = top + ((H - top) - ph) / 2;
+
+        int first = Carousel.RenderAnimated(app, px, py, pw, ph, slides, idx, anim);
+        Carousel.HandleClick(app, first, slides.Count, idx);
+
+        c.DrawText(px, py - app.Scale(28),
+                   "Photo " + Convert.ToString(idx.Get() + 1) + " / "
+                   + Convert.ToString(slides.Count), 0xFFFFFFFF, t.fontSizeMedium);
+
+        int bw = app.Scale(36);
+        int bx = px + pw - bw;
+        int byy = py - app.Scale(42);
+        if (byy < top + app.Scale(6)) { byy = top + app.Scale(6); }
+        int closeId = app.focus.AllocId();
+        bool hover = Layer.Inside(app.mouseX, app.mouseY, bx, byy, bw, bw);
+        int chip = 0x40FFFFFF;
+        if (hover) { chip = 0x66FFFFFF; }
+        c.FillRoundRect(bx, byy, bw, bw, bw / 2, chip);
+        Icon.DrawCenteredIn(c, "close", bx, byy, bw, bw, t.iconSizeSmall, 0xFFFFFFFF);
+        app.hitTester.Register(HitRegion.Create(closeId, bx, byy, bw, bw, 0));
+        if (app.window.EventKind() == 3
+            && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            return true;
+        }
+        return false;
+    }
+
+    // ================================================================
+    // Draggable page windows + modal dialogs
+    // ================================================================
+
+    static int BarH(App app) {
+        return app.theme.heightLarge;
+    }
+
+    static int FooterH(App app) {
+        return app.theme.heightMedium + app.Scale(20);
+    }
+
+    static int BtnW(App app) {
+        return app.Scale(46);
+    }
+
+    /// Absolute Y where the caller's body content should begin for state `s`.
+    static int BodyTop(App app, LayerState s) {
+        int top = app.titlebarH;
+        if (s.state == 1) { return top + Layer.BarH(app) + app.Scale(16); }
+        return s.y + Layer.BarH(app) + app.Scale(16);
+    }
+
+    /// Absolute X where body content should begin.
+    static int BodyLeft(App app, LayerState s) {
+        if (s.state == 1) { return app.Scale(20); }
+        return s.x + app.Scale(20);
+    }
+
+    static bool Inside(int mx, int my, int x, int y, int w, int h) {
+        return mx >= x && mx < x + w && my >= y && my < y + h;
+    }
+
+    /// Effective on-screen bounds of `s` (accounts for maximize / minimize),
+    /// written into a 4-element int list [x, y, w, h].
+    static void Bounds(App app, LayerState s, List<int> outv) {
+        int top = app.titlebarH;
+        int bar = Layer.BarH(app);
+        int ex = s.x; int ey = s.y; int ew = s.w; int eh = s.h;
+        if (s.state == 1) {
+            ex = 0; ey = top; ew = app.canvas.Width(); eh = app.canvas.Height() - top;
+        } else if (s.state == 2) {
+            ew = app.Scale(260); eh = bar;
+        }
+        outv.Add(ex); outv.Add(ey); outv.Add(ew); outv.Add(eh);
+    }
+
+    static bool Contains(App app, LayerState s, int mx, int my) {
+        List<int> b = new List<int>();
+        Layer.Bounds(app, s, b);
+        return Layer.Inside(mx, my, b[0], b[1], b[2], b[3]);
+    }
+
+    /// Entrance progress (permille) since the layer opened; re-arms the anim
+    /// clock while it is still easing in.
+    static int Entrance(App app, LayerState s) {
+        if (s.openMs <= 0) { return 1000; }
+        int el = Window.GetTickMs() - s.openMs;
+        int p = App.Ease(Layer.Clamp01(el * 1000 / 180));
+        if (p < 1000) { app.RequestAnimationFrame(16); }
+        return p;
+    }
+
+    /// Draws a stack of page windows back-to-front (last = top-most). Clicking
+    /// any window raises it; only the top-most under the pointer (or the one
+    /// being dragged) consumes mouse events.
+    static void RenderStack(App app, List<LayerState> list) {
+        int ek = app.window.EventKind();
+        int mx = app.mouseX;
+        int my = app.mouseY;
+
+        int drag = 0 - 1;
+        int j = 0;
+        while (j < list.Count) {
+            if (list[j].dragging) { drag = j; }
+            j = j + 1;
+        }
+
+        int active = drag;
+        if (active < 0) {
+            int i = list.Count - 1;
+            while (i >= 0) {
+                LayerState s = list[i];
+                if (s.open && Layer.Contains(app, s, mx, my)) { active = i; i = 0 - 1; }
+                else { i = i - 1; }
+            }
+        }
+
+        if (ek == 2 && active >= 0 && active < list.Count - 1) {
+            LayerState s = list[active];
+            list.RemoveAt(active);
+            list.Add(s);
+            active = list.Count - 1;
+        }
+
+        int k = 0;
+        while (k < list.Count) {
+            Layer.RenderActive(app, list[k], k == active);
+            k = k + 1;
+        }
+    }
+
+    static void Render(App app, LayerState s) {
+        Layer.RenderActive(app, s, true);
+    }
+
+    static void RenderActive(App app, LayerState s, bool active) {
+        if (!s.open) { return; }
+        if (s.modal) { Layer.RenderDialog(app, s); return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int W = c.Width();
+        int H = c.Height();
+        int top = app.titlebarH;
+        int bar = Layer.BarH(app);
+        int rad = t.borderRadiusLarge;
+
+        int ex = s.x;
+        int ey = s.y;
+        int ew = s.w;
+        int eh = s.h;
+        if (s.state == 1) {
+            ex = 0; ey = top; ew = W; eh = H - top;
+        } else if (s.state == 2) {
+            ew = app.Scale(260); eh = bar;
+        }
+
+        // Entrance: rise + settle.
+        int entP = Layer.Entrance(app, s);
+        ey = ey - (1000 - entP) * app.Scale(10) / 1000;
+
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        int ek = app.window.EventKind();
+
+        int bw = Layer.BtnW(app);
+        int closeX = ex + ew - bw;
+        int maxX = closeX - bw;
+        int minX = maxX - bw;
+
+        if (!active) { ek = 0; }
+
+        if (ek == 2 && s.state == 0
+            && Layer.Inside(mx, my, ex, ey, ew - bw * 3, bar)) {
+            s.dragging = true;
+            s.grabDx = mx - s.x;
+            s.grabDy = my - s.y;
+        }
+        if (ek == 1 && s.dragging) {
+            s.x = mx - s.grabDx;
+            s.y = my - s.grabDy;
+            if (s.y < top) { s.y = top; }
+            if (s.y > H - bar) { s.y = H - bar; }
+            if (s.x < bar - ew) { s.x = bar - ew; }
+            if (s.x > W - bar) { s.x = W - bar; }
+            ex = s.x; ey = s.y;
+            closeX = ex + ew - bw; maxX = closeX - bw; minX = maxX - bw;
+            app.RequestRedraw();
+        }
+        if (ek == 3 && s.dragging) { s.dragging = false; }
+
+        if (ek == 3) {
+            if (Layer.Inside(mx, my, closeX, ey, bw, bar)) {
+                s.open = false;
+                return;
+            } else if (Layer.Inside(mx, my, maxX, ey, bw, bar)) {
+                if (s.state == 1) {
+                    s.state = 0;
+                    s.x = s.sx; s.y = s.sy; s.w = s.sw; s.h = s.sh;
+                } else {
+                    if (s.state == 0) { s.sx = s.x; s.sy = s.y; s.sw = s.w; s.sh = s.h; }
+                    s.state = 1;
+                }
+                app.RequestRedraw();
+            } else if (Layer.Inside(mx, my, minX, ey, bw, bar)) {
+                if (s.state == 2) {
+                    s.state = 0;
+                } else {
+                    if (s.state == 0) { s.sx = s.x; s.sy = s.y; s.sw = s.w; s.sh = s.h; }
+                    s.state = 2;
+                }
+                app.RequestRedraw();
+            }
+        }
+
+        c.FillRoundRect(ex - app.Scale(1), ey + app.Scale(6), ew + app.Scale(2),
+                        eh, rad + app.Scale(4), 0x22000000);
+        c.FillRoundRect(ex + app.Scale(1), ey + app.Scale(3), ew - app.Scale(2),
+                        eh, rad + app.Scale(2), 0x33000000);
+
+        Layer.GlassFill(app, ex, ey, ew, eh, rad, t.bgPrimary, 1000);
+
+        c.FillRoundRect(ex, ey, ew, bar, rad, t.bgSecondary);
+        c.FillRect(ex, ey + bar - rad, ew, rad, t.bgSecondary);
+        c.FillRect(ex, ey + bar - app.Scale(2), ew, app.Scale(2), t.primary);
+
+        int icoS = t.iconSizeSmall;
+        Icon.Draw(c, "grid", ex + app.Scale(14),
+                  ey + (bar - icoS) / 2, icoS, t.primary);
+        c.DrawText(ex + app.Scale(14) + icoS + t.gapSmall,
+                   ey + (bar - Canvas.FontHeight(t.fontSizeMedium)) / 2,
+                   s.title, t.textPrimary, t.fontSizeMedium);
+
+        int gl = t.iconSizeCaption + app.Scale(2);
+        string minGlyph = "minimize";
+        if (s.state == 2) { minGlyph = "restore"; }
+        string maxGlyph = "maximize";
+        if (s.state == 1) { maxGlyph = "restore"; }
+        Layer.CapButton(app, minX, ey, bw, bar, minGlyph, gl, false);
+        Layer.CapButton(app, maxX, ey, bw, bar, maxGlyph, gl, false);
+        Layer.CapButton(app, closeX, ey, bw, bar, "close", gl, true);
+
+        if (s.state != 2) {
+            int footH = 0;
+            if (s.footer) { footH = Layer.FooterH(app); }
+            int bodyBottom = ey + eh - footH;
+            c.PushClip(ex + 1, ey + bar, ew - 2, bodyBottom - (ey + bar));
+            int bx = ex + app.Scale(20);
+            int byy = ey + bar + app.Scale(16);
+            if (s.body != "") {
+                c.DrawText(bx, byy, s.body, t.textPrimary, t.fontSizeMedium);
+            }
+            if (s.action == 1) {
+                Label.Secondary(app, bx, byy + app.Scale(28), "confirmed");
+            } else if (s.action == 2) {
+                Label.Secondary(app, bx, byy + app.Scale(28), "cancelled");
+            }
+            c.PopClip();
+
+            if (s.footer) {
+                int fy = ey + eh - footH;
+                c.FillRect(ex + 1, fy, ew - 2, 1, t.divider);
+                int fbw = app.Scale(84);
+                int pad = app.Scale(16);
+                int okX = ex + ew - pad - fbw;
+                int cancelX = okX - t.gapMedium - fbw;
+                int fby = fy + (footH - t.heightMedium) / 2;
+                int cancelId = Button.Styled(s.cancelText, 1, 1).Render(app, cancelX, fby, fbw);
+                if (Button.WasClicked(app, cancelId)) { s.action = 2; }
+                int okId = Button.Primary(s.okText).Render(app, okX, fby, fbw);
+                if (Button.WasClicked(app, okId)) { s.action = 1; }
+            }
+        }
+    }
+
+    /// Centered modal dialog: alert / confirm / prompt. Sets s.action to
+    /// 1 (OK), 2 (Cancel) or 3 (close X); the caller reads it and closes.
+    static void RenderDialog(App app, LayerState s) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        int rad = t.borderRadiusLarge;
+
+        int entP = Layer.Entrance(app, s);
+
+        int w = app.Scale(s.w);
+        int h = app.Scale(s.h);
+        int x = (W - w) / 2;
+        int y = (H - h) / 2 - (1000 - entP) * app.Scale(12) / 1000;
+
+        // Dimmed backdrop. Swallow clicks below it so the modal is truly modal
+        // (a click on the dim / dialog body no longer falls through to the page).
+        c.FillRect(0, 0, W, H, t.overlay);
+        app.BlockHitsBelow();
+
+        c.FillRoundRect(x + 2, y + 3, w, h, rad, t.shadowColor);
+        Layer.GlassFill(app, x, y, w, h, rad, t.bgPrimary, 1000);
+
+        int accent = t.info;
+        string iconName = "info";
+        if (s.dtype == 1) { accent = t.success; iconName = "success"; }
+        if (s.dtype == 2) { accent = t.warning; iconName = "warning"; }
+        if (s.dtype == 3) { accent = t.error; iconName = "error"; }
+
+        int pad = t.paddingLarge;
+        int ico = t.iconSizeLarge;
+        Icon.Draw(c, iconName, x + pad, y + pad, ico, accent);
+        c.DrawText(x + pad + ico + t.gapMedium, y + pad, s.title,
+                   t.textPrimary, t.fontSizeLarge);
+
+        int bodyY = y + pad + ico + t.gapMedium;
+        if (s.body != "") {
+            c.DrawText(x + pad + ico + t.gapMedium, bodyY, s.body,
+                       t.textSecondary, t.fontSizeMedium);
+        }
+
+        if (s.kind == 2 && s.promptInput != null) {
+            int iy = bodyY + app.Scale(30);
+            s.promptInput.Render(app, x + pad, iy, w - pad * 2, t.heightMedium);
+        }
+
+        int bw = app.Scale(88);
+        int gap = t.gapMedium;
+        int by = y + h - t.heightMedium - pad;
+        int okX = x + w - pad - bw;
+        int cancelX = okX - gap - bw;
+
+        if (s.twoButtons) {
+            int cancelId = Button.Create(s.cancelText).Render(app, cancelX, by, bw);
+            if (Button.WasClicked(app, cancelId)) { s.action = 2; }
+        }
+        int okId = Button.Primary(s.okText).Render(app, okX, by, bw);
+        if (Button.WasClicked(app, okId)) { s.action = 1; }
+
+        int closeId = app.focus.AllocId();
+        int closeX = x + w - t.heightMedium;
+        int closeY = y;
+        if (app.focus.IsHovered(closeId)) {
+            c.FillRoundRect(closeX, closeY, t.heightMedium, t.heightMedium,
+                            t.borderRadiusLarge, t.bgHover);
+        }
+        Icon.DrawCenteredIn(c, "close", closeX, closeY, t.heightMedium,
+                            t.heightMedium, t.iconSizeSmall, t.textSecondary);
+        app.hitTester.Register(
+            HitRegion.Create(closeId, closeX, closeY, t.heightMedium, t.heightMedium, 0));
+        if (app.window.EventKind() == 3
+            && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            s.action = 3;
+        }
+    }
+
+    /// One inset caption button with a rounded hover chip and a centered glyph.
+    static void CapButton(App app, int x, int y, int w, int h,
+                          string glyph, int gl, bool danger) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool hover = Layer.Inside(app.mouseX, app.mouseY, x, y, w, h);
+        int inset = app.Scale(5);
+        int col = t.textSecondary;
+        if (hover) {
+            int chip = t.bgHover;
+            if (danger) { chip = 0xFFE81123; col = 0xFFFFFFFF; }
+            else { col = t.textPrimary; }
+            c.FillRoundRect(x + inset, y + inset, w - inset * 2, h - inset * 2,
+                            t.borderRadiusMedium, chip);
+        }
+        Icon.DrawCenteredIn(c, glyph, x, y, w, h, gl, col);
+    }
+}

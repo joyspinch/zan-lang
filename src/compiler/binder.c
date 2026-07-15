@@ -166,18 +166,35 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         return b->type_error;
     }
 
-    /* carry generic arguments (e.g. List<Node>, Dict<K,V>) onto the fresh
-     * built-in generic type so codegen can recover the element type. */
-    if ((istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
-         istr_eq(name, "Dictionary", 10)) &&
-        type_ref->type_ref.type_args.count > 0) {
-        int nargs = type_ref->type_ref.type_args.count;
-        base->type_args = (zan_type_t **)zan_arena_alloc(
-            b->arena, sizeof(zan_type_t *) * (size_t)nargs);
-        base->type_arg_count = nargs;
-        for (int i = 0; i < nargs; i++) {
-            base->type_args[i] = zan_binder_resolve_type(
-                b, type_ref->type_ref.type_args.items[i]);
+    /* carry generic arguments (e.g. List<Node>, Dict<K,V>, Box<int>) so codegen
+     * and the checker can recover concrete element/argument types. Built-in
+     * List/Dict use a fresh `make_type` above, but a user generic type resolves
+     * to the *shared* class-symbol type; mutating that would let one
+     * instantiation (Box<int>) clobber another (Box<string>), so copy it into a
+     * fresh instantiation type first. */
+    if (type_ref->type_ref.type_args.count > 0) {
+        bool builtin_generic = istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
+                               istr_eq(name, "Dictionary", 10);
+        bool user_generic = !builtin_generic &&
+            (base->kind == TYPE_CLASS || base->kind == TYPE_STRUCT ||
+             base->kind == TYPE_INTERFACE);
+        if (builtin_generic || user_generic) {
+            int nargs = type_ref->type_ref.type_args.count;
+            zan_type_t *inst = base;
+            if (user_generic) {
+                inst = make_type(b->arena, base->kind, base->name.str, base->name.len);
+                inst->sym = base->sym;
+                inst->base_type = base->base_type;
+                inst->element_type = base->element_type;
+            }
+            inst->type_args = (zan_type_t **)zan_arena_alloc(
+                b->arena, sizeof(zan_type_t *) * (size_t)nargs);
+            inst->type_arg_count = nargs;
+            for (int i = 0; i < nargs; i++) {
+                inst->type_args[i] = zan_binder_resolve_type(
+                    b, type_ref->type_ref.type_args.items[i]);
+            }
+            base = inst;
         }
     }
 
@@ -201,6 +218,31 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
 
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name) {
     return scope_find(b->current_scope, name);
+}
+
+/* Register every declared generic type parameter (class Box<T> -> T) in the
+ * root scope so that it stays resolvable after per-type binding scopes are torn
+ * down. The later checker and irgen passes re-resolve method signatures / local
+ * declarations against the root scope; without this they would report a bogus
+ * "undefined type 'T'". Type parameters all erase to the same representation
+ * (an opaque pointer), so a name shared by two classes' <T> is harmless. */
+static void register_type_params(zan_binder_t *b, zan_ast_list_t *decls) {
+    for (int i = 0; i < decls->count; i++) {
+        zan_ast_node_t *decl = decls->items[i];
+        if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL &&
+            decl->kind != AST_INTERFACE_DECL && decl->kind != AST_ENUM_DECL) {
+            continue;
+        }
+        for (int j = 0; j < decl->type_decl.type_params.count; j++) {
+            zan_ast_node_t *tp = decl->type_decl.type_params.items[j];
+            if (scope_find(b->current_scope, tp->ident.name)) continue;
+            zan_type_t *tp_type = make_type(b->arena, TYPE_TYPE_PARAM,
+                                            tp->ident.name.str, tp->ident.name.len);
+            zan_symbol_t *tp_sym = make_symbol(b->arena, SYM_TYPE_PARAM,
+                                               tp->ident.name, tp_type, tp, 0);
+            scope_add(b->arena, b->current_scope, tp_sym);
+        }
+    }
 }
 
 /* ---- binding passes ---- */
@@ -410,4 +452,7 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
             bind_members(b, decl);
         }
     }
+
+    /* keep generic type parameters resolvable for the checker / irgen passes */
+    register_type_params(b, &unit->comp_unit.decls);
 }

@@ -1,0 +1,264 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>SM2 public-key cryptography (GB/T 32918 / GM/T 0003) over the
+/// standard 256-bit prime curve, built on BigInt. Provides key derivation
+/// (d*G), the SM2 digital signature (sign/verify with the ZA user hash), and
+/// SM2 public-key encryption in C1C3C2 form. Points are held in Jacobian
+/// coordinates so only one modular inverse is needed per scalar multiply.</summary>
+class Sm2 {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    static string PHEX  = "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFF";
+    static string AHEX  = "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFC";
+    static string BHEX  = "28E9FA9E9D9F5E344D5A9E4BCF6509A7F39789F515AB8F92DDBCBD414D940E93";
+    static string NHEX  = "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123";
+    static string GXHEX = "32C4AE2C1F1981195F9904466A39C9948FE30BBFF2660BE1715A4589334C74C7";
+    static string GYHEX = "BC3736A2F4F6779C59BDCEE36B692153D0A9877CC62A474002DF32E52139F0A0";
+
+    static BigInt P;
+    static BigInt A;
+    static BigInt B;
+    static BigInt N;
+    static BigInt GX;
+    static BigInt GY;
+    static bool ready = false;
+
+    static BigInt hb(string h) { return BigInt.FromBytesBE(Hex.Decode(h), h.Length / 2); }
+
+    static void init() {
+        if (ready) { return; }
+        P = hb(PHEX); A = hb(AHEX); B = hb(BHEX); N = hb(NHEX);
+        GX = hb(GXHEX); GY = hb(GYHEX);
+        ready = true;
+    }
+
+    static BigInt fromInt(int v) {
+        string b = calloc(5, 1);
+        b[0] = (v >> 24) & 255; b[1] = (v >> 16) & 255; b[2] = (v >> 8) & 255; b[3] = v & 255;
+        BigInt r = BigInt.FromBytesBE(b, 4);
+        free(b);
+        return r;
+    }
+
+    // field arithmetic mod P
+    static BigInt fadd(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, y), P); }
+    static BigInt fsub(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, BigInt.sub(P, y)), P); }
+    static BigInt fmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), P); }
+    static BigInt fsqr(BigInt x) { return fmul(x, x); }
+    static BigInt finv(BigInt x) { return BigInt.ModInverse(x, P); }
+
+    // scalar arithmetic mod N
+    static BigInt nmod(BigInt x) { return BigInt.mod(x, N); }
+    static BigInt nsub(BigInt x, BigInt y) { return BigInt.mod(BigInt.add(x, BigInt.sub(N, BigInt.mod(y, N))), N); }
+    static BigInt nmul(BigInt x, BigInt y) { return BigInt.mod(BigInt.mul(x, y), N); }
+    static BigInt ninv(BigInt x) { return BigInt.ModInverse(x, N); }
+
+    // Jacobian point as [X, Y, Z]; infinity has Z == 0
+    static List<BigInt> pt(BigInt x, BigInt y, BigInt z) { List<BigInt> r = new List<BigInt>(); r.Add(x); r.Add(y); r.Add(z); return r; }
+    static List<BigInt> inf() { return pt(BigInt.one(), BigInt.one(), BigInt.zero()); }
+    static bool isInf(List<BigInt> Pt) { return Pt[2].isZero(); }
+
+    static List<BigInt> jdouble(List<BigInt> Pt) {
+        if (isInf(Pt)) { return Pt; }
+        BigInt X1 = Pt[0]; BigInt Y1 = Pt[1]; BigInt Z1 = Pt[2];
+        BigInt delta = fsqr(Z1);
+        BigInt gamma = fsqr(Y1);
+        BigInt beta = fmul(X1, gamma);
+        BigInt alpha = fmul(fromInt(3), fmul(fsub(X1, delta), fadd(X1, delta)));
+        BigInt X3 = fsub(fsqr(alpha), fmul(fromInt(8), beta));
+        BigInt Z3 = fsub(fsub(fsqr(fadd(Y1, Z1)), gamma), delta);
+        BigInt Y3 = fsub(fmul(alpha, fsub(fmul(fromInt(4), beta), X3)), fmul(fromInt(8), fsqr(gamma)));
+        return pt(X3, Y3, Z3);
+    }
+
+    static List<BigInt> jadd(List<BigInt> Pa, List<BigInt> Qa) {
+        if (isInf(Pa)) { return Qa; }
+        if (isInf(Qa)) { return Pa; }
+        BigInt X1 = Pa[0]; BigInt Y1 = Pa[1]; BigInt Z1 = Pa[2];
+        BigInt X2 = Qa[0]; BigInt Y2 = Qa[1]; BigInt Z2 = Qa[2];
+        BigInt Z1Z1 = fsqr(Z1); BigInt Z2Z2 = fsqr(Z2);
+        BigInt U1 = fmul(X1, Z2Z2); BigInt U2 = fmul(X2, Z1Z1);
+        BigInt S1 = fmul(Y1, fmul(Z2, Z2Z2)); BigInt S2 = fmul(Y2, fmul(Z1, Z1Z1));
+        BigInt H = fsub(U2, U1); BigInt r = fsub(S2, S1);
+        if (H.isZero()) {
+            if (r.isZero()) { return jdouble(Pa); }
+            return inf();
+        }
+        BigInt HH = fsqr(H); BigInt HHH = fmul(H, HH); BigInt V = fmul(U1, HH);
+        BigInt X3 = fsub(fsub(fsqr(r), HHH), fmul(fromInt(2), V));
+        BigInt Y3 = fsub(fmul(r, fsub(V, X3)), fmul(S1, HHH));
+        BigInt Z3 = fmul(fmul(Z1, Z2), H);
+        return pt(X3, Y3, Z3);
+    }
+
+    static List<BigInt> scalarMul(BigInt k, List<BigInt> Pt) {
+        List<BigInt> R = inf();
+        int i = k.bitLength() - 1;
+        while (i >= 0) {
+            R = jdouble(R);
+            if (k.getBit(i) == 1) { R = jadd(R, Pt); }
+            i = i - 1;
+        }
+        return R;
+    }
+
+    // returns [x, y] affine, or null-ish inf() (Z==0) if point at infinity
+    static List<BigInt> toAffine(List<BigInt> Pt) {
+        if (isInf(Pt)) { return pt(BigInt.zero(), BigInt.zero(), BigInt.zero()); }
+        BigInt zinv = finv(Pt[2]);
+        BigInt zinv2 = fsqr(zinv);
+        BigInt x = fmul(Pt[0], zinv2);
+        BigInt y = fmul(Pt[1], fmul(zinv2, zinv));
+        return pt(x, y, BigInt.one());
+    }
+
+    static List<BigInt> gPoint() { return pt(GX, GY, BigInt.one()); }
+
+    /// <summary>Derives the public key point from a private key scalar.
+    /// Returns [x, y] as affine coordinates.</summary>
+    static List<BigInt> PublicKey(BigInt d) {
+        init();
+        return toAffine(scalarMul(d, gPoint()));
+    }
+
+    static void writeBE32(string dst, int off, BigInt v) {
+        string b = v.ToBytesBE(32);
+        int i = 0; while (i < 32) { dst[off + i] = b[i] & 255; i = i + 1; }
+    }
+
+    /// <summary>SM3-based ZA||M digest e used by SM2 signing (id default
+    /// "1234567812345678" is supplied by the caller as bytes).</summary>
+    static BigInt computeE(string id, int idLen, string msg, int msgLen, BigInt px, BigInt py) {
+        init();
+        int entBits = idLen * 8;
+        int zLen = 2 + idLen + 32 * 6;
+        string zin = calloc(zLen + 1, 1);
+        zin[0] = (entBits >> 8) & 255; zin[1] = entBits & 255;
+        int i = 0; while (i < idLen) { zin[2 + i] = id[i] & 255; i = i + 1; }
+        int off = 2 + idLen;
+        writeBE32(zin, off, A); writeBE32(zin, off + 32, B);
+        writeBE32(zin, off + 64, GX); writeBE32(zin, off + 96, GY);
+        writeBE32(zin, off + 128, px); writeBE32(zin, off + 160, py);
+        string za = Sm3.Hash(zin, zLen);
+        free(zin);
+        string ein = calloc(32 + msgLen + 1, 1);
+        i = 0; while (i < 32) { ein[i] = za[i] & 255; i = i + 1; }
+        i = 0; while (i < msgLen) { ein[32 + i] = msg[i] & 255; i = i + 1; }
+        string eh = Sm3.Hash(ein, 32 + msgLen);
+        free(ein); free(za);
+        BigInt e = BigInt.FromBytesBE(eh, 32);
+        free(eh);
+        return e;
+    }
+
+    /// <summary>SM2 signature. e is the ZA||M digest; k is a per-signature secret
+    /// in [1, n-1]. Writes r into out[0..31] and s into out[32..63].</summary>
+    static void Sign(BigInt e, BigInt d, BigInt k, string outSig) {
+        init();
+        List<BigInt> P1 = toAffine(scalarMul(k, gPoint()));
+        BigInt r = nmod(BigInt.add(e, P1[0]));
+        BigInt inv1d = ninv(nmod(BigInt.add(BigInt.one(), d)));
+        BigInt s = nmul(inv1d, nsub(k, nmul(r, d)));
+        writeBE32(outSig, 0, r);
+        writeBE32(outSig, 32, s);
+    }
+
+    /// <summary>Verifies an SM2 signature (r,s) over digest e against public
+    /// key (px,py). Returns true if valid.</summary>
+    static bool Verify(BigInt e, BigInt px, BigInt py, BigInt r, BigInt s) {
+        init();
+        if (BigInt.cmp(r, BigInt.one()) < 0 || BigInt.cmp(r, N) >= 0) { return false; }
+        if (BigInt.cmp(s, BigInt.one()) < 0 || BigInt.cmp(s, N) >= 0) { return false; }
+        BigInt t = nmod(BigInt.add(r, s));
+        if (t.isZero()) { return false; }
+        List<BigInt> pub = pt(px, py, BigInt.one());
+        List<BigInt> P1 = jadd(scalarMul(s, gPoint()), scalarMul(t, pub));
+        List<BigInt> aff = toAffine(P1);
+        if (isInf(P1)) { return false; }
+        BigInt R = nmod(BigInt.add(e, aff[0]));
+        return BigInt.cmp(R, r) == 0;
+    }
+
+    // KDF from GB/T 32918.4
+    static string kdf(string z, int zLen, int klen) {
+        string outb = calloc(klen + 1, 1);
+        int ct = 1; int pos = 0;
+        while (pos < klen) {
+            string buf = calloc(zLen + 4 + 1, 1);
+            int i = 0; while (i < zLen) { buf[i] = z[i] & 255; i = i + 1; }
+            buf[zLen] = (ct >> 24) & 255; buf[zLen+1] = (ct >> 16) & 255;
+            buf[zLen+2] = (ct >> 8) & 255; buf[zLen+3] = ct & 255;
+            string h = Sm3.Hash(buf, zLen + 4);
+            int j = 0;
+            while (j < 32 && pos < klen) { outb[pos] = h[j] & 255; pos = pos + 1; j = j + 1; }
+            free(buf); free(h);
+            ct = ct + 1;
+        }
+        return outb;
+    }
+
+    /// <summary>SM2 public-key encrypt (C1C3C2, with a 0x04 prefix on C1).
+    /// k is a per-message secret. outLen[0] receives the ciphertext length.</summary>
+    static string Encrypt(string msg, int msgLen, BigInt px, BigInt py, BigInt k, List<int> outLen) {
+        init();
+        List<BigInt> C1 = toAffine(scalarMul(k, gPoint()));
+        List<BigInt> pub = pt(px, py, BigInt.one());
+        List<BigInt> kP = toAffine(scalarMul(k, pub));
+        string z = calloc(65, 1);
+        writeBE32(z, 0, kP[0]); writeBE32(z, 32, kP[1]);
+        string t = kdf(z, 64, msgLen);
+
+        int total = 1 + 64 + 32 + msgLen;
+        string outb = calloc(total + 1, 1);
+        outb[0] = 4;
+        writeBE32(outb, 1, C1[0]); writeBE32(outb, 33, C1[1]);
+        // C3 = SM3(x2 || M || y2)
+        string c3in = calloc(64 + msgLen + 1, 1);
+        writeBE32(c3in, 0, kP[0]);
+        int i = 0; while (i < msgLen) { c3in[32 + i] = msg[i] & 255; i = i + 1; }
+        writeBE32(c3in, 32 + msgLen, kP[1]);
+        string c3 = Sm3.Hash(c3in, 64 + msgLen);
+        i = 0; while (i < 32) { outb[65 + i] = c3[i] & 255; i = i + 1; }
+        // C2 = M xor t
+        i = 0; while (i < msgLen) { outb[97 + i] = (msg[i] & 255) ^ (t[i] & 255); i = i + 1; }
+        free(z); free(t); free(c3in); free(c3);
+        outLen[0] = total;
+        return outb;
+    }
+
+    /// <summary>SM2 decrypt of a C1C3C2 ciphertext (0x04-prefixed C1). Returns the
+    /// plaintext; outLen[0] receives its length (-1 if the C3 check fails).</summary>
+    static string Decrypt(string cph, int cphLen, BigInt d, List<int> outLen) {
+        init();
+        int msgLen = cphLen - 97;
+        BigInt x1 = BigInt.FromBytesBE(sliceBE(cph, 1), 32);
+        BigInt y1 = BigInt.FromBytesBE(sliceBE(cph, 33), 32);
+        List<BigInt> C1 = pt(x1, y1, BigInt.one());
+        List<BigInt> kP = toAffine(scalarMul(d, C1));
+        string z = calloc(65, 1);
+        writeBE32(z, 0, kP[0]); writeBE32(z, 32, kP[1]);
+        string t = kdf(z, 64, msgLen);
+        string m = calloc(msgLen + 1, 1);
+        int i = 0; while (i < msgLen) { m[i] = (cph[97 + i] & 255) ^ (t[i] & 255); i = i + 1; }
+        // verify C3
+        string c3in = calloc(64 + msgLen + 1, 1);
+        writeBE32(c3in, 0, kP[0]);
+        i = 0; while (i < msgLen) { c3in[32 + i] = m[i] & 255; i = i + 1; }
+        writeBE32(c3in, 32 + msgLen, kP[1]);
+        string c3 = Sm3.Hash(c3in, 64 + msgLen);
+        int diff = 0;
+        i = 0; while (i < 32) { diff = diff | ((c3[i] & 255) ^ (cph[65 + i] & 255)); i = i + 1; }
+        free(z); free(t); free(c3in); free(c3);
+        if (diff == 0) { outLen[0] = msgLen; } else { outLen[0] = -1; }
+        return m;
+    }
+
+    static string sliceBE(string src, int off) {
+        string b = calloc(33, 1);
+        int i = 0; while (i < 32) { b[i] = src[off + i] & 255; i = i + 1; }
+        return b;
+    }
+}

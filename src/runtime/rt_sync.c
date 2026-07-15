@@ -412,6 +412,109 @@ static void zan_shared_table_free(zan_shared_table *table) {
     free(table);
 }
 
+/* ---- Thread spawn: run a Zan delegate on a new detached OS thread ---- */
+
+typedef void (*zan_thread_body_fn)(void);
+
+#ifdef _WIN32
+static DWORD WINAPI zan_thread_trampoline(LPVOID arg) {
+    zan_thread_body_fn body = (zan_thread_body_fn)arg;
+    if (body) body();
+    return 0;
+}
+
+int64_t zan_thread_start(void *body) {
+    if (!body) return 0;
+    HANDLE h = CreateThread(NULL, 0, zan_thread_trampoline, body, 0, NULL);
+    if (!h) return 0;
+    CloseHandle(h); /* detach: the worker runs to completion on its own */
+    return 1;
+}
+#else
+static void *zan_thread_trampoline(void *arg) {
+    zan_thread_body_fn body = (zan_thread_body_fn)arg;
+    if (body) body();
+    return NULL;
+}
+
+int64_t zan_thread_start(void *body) {
+    if (!body) return 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, zan_thread_trampoline, body) != 0) return 0;
+    pthread_detach(t);
+    return 1;
+}
+#endif
+
+/* ---- UI-thread dispatch queue (Control.Invoke equivalent) --------------
+ * A fixed-capacity ring of Zan delegate function pointers. Background threads
+ * enqueue with zan_dispatch_post(); the UI thread drains with
+ * zan_dispatch_take() once per frame and invokes each on the UI thread. Only
+ * the raw function pointer crosses the thread boundary here — no Zan heap
+ * object is allocated off-thread — so the ARC runtime is never touched from a
+ * background thread. The queue itself is guarded by an OS mutex. */
+
+#define ZAN_DISPATCH_CAP 1024
+static void *g_dispatch_ring[ZAN_DISPATCH_CAP];
+static int g_dispatch_head = 0;
+static int g_dispatch_tail = 0;
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_dispatch_cs;
+static int g_dispatch_ready = 0;
+static void zan_dispatch_lock(void) { EnterCriticalSection(&g_dispatch_cs); }
+static void zan_dispatch_unlock(void) { LeaveCriticalSection(&g_dispatch_cs); }
+#else
+static pthread_mutex_t g_dispatch_mx = PTHREAD_MUTEX_INITIALIZER;
+static void zan_dispatch_lock(void) { pthread_mutex_lock(&g_dispatch_mx); }
+static void zan_dispatch_unlock(void) { pthread_mutex_unlock(&g_dispatch_mx); }
+#endif
+
+/* Initialise the queue on the UI thread before any worker is spawned. */
+void zan_dispatch_init(void) {
+#ifdef _WIN32
+    if (!g_dispatch_ready) {
+        InitializeCriticalSection(&g_dispatch_cs);
+        g_dispatch_ready = 1;
+    }
+#endif
+    zan_dispatch_lock();
+    g_dispatch_head = 0;
+    g_dispatch_tail = 0;
+    zan_dispatch_unlock();
+}
+
+/* Enqueue a delegate to run on the UI thread. Thread-safe. Returns 1 on
+ * success, 0 if the delegate was null or the queue was full. */
+int64_t zan_dispatch_post(void *fn) {
+    if (!fn) return 0;
+#ifdef _WIN32
+    if (!g_dispatch_ready) zan_dispatch_init();
+#endif
+    int64_t ok = 0;
+    zan_dispatch_lock();
+    int next = (g_dispatch_tail + 1) % ZAN_DISPATCH_CAP;
+    if (next != g_dispatch_head) {
+        g_dispatch_ring[g_dispatch_tail] = fn;
+        g_dispatch_tail = next;
+        ok = 1;
+    }
+    zan_dispatch_unlock();
+    return ok;
+}
+
+/* Pop the next queued delegate (UI thread), or NULL when the queue is empty. */
+void *zan_dispatch_take(void) {
+    void *fn = NULL;
+    zan_dispatch_lock();
+    if (g_dispatch_head != g_dispatch_tail) {
+        fn = g_dispatch_ring[g_dispatch_head];
+        g_dispatch_head = (g_dispatch_head + 1) % ZAN_DISPATCH_CAP;
+    }
+    zan_dispatch_unlock();
+    return fn;
+}
+
 int64_t zan_atomic_int_create(int64_t initial_value) {
     zan_atomic_int *atomic = (zan_atomic_int *)malloc(sizeof(*atomic));
     if (!atomic) return 0;

@@ -1,0 +1,623 @@
+using System;
+using System.Data;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+
+namespace System.Data.MySql;
+
+/// <summary>
+/// Native, coroutine-ized MySQL / MariaDB client that speaks the MySQL wire
+/// protocol directly over Zan's asynchronous sockets -- no libmariadb, no ODBC,
+/// no native database DLL. Every network step (connect, handshake, auth, query,
+/// result) suspends on the IO reactor via <c>Socket.RecvOv</c> /
+/// <c>Socket.SendAsync</c>, so a query never blocks the worker thread and many
+/// connections make progress on one thread.
+///
+/// Authentication implements <c>caching_sha2_password</c> fast-auth (the MySQL
+/// 8.x default), computed with a pure-Zan <see cref="Sha256"/>:
+///   token = SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce )
+/// The server's credential cache is primed after any successful login, so
+/// fast-auth applies to every subsequent connection. On a cold cache the
+/// server demands full authentication: the client fetches the server's RSA
+/// public key, XORs the NUL-terminated password with the handshake nonce, and
+/// sends it RSA-OAEP(SHA-1) encrypted -- all in pure Zan.
+///
+/// Packets are built and parsed as raw byte buffers (Zan strings used as byte
+/// arrays), which is binary-safe with embedded NUL bytes.
+///
+/// Usage:
+///   MySqlConnection db = await MySqlConnection.OpenParamsAsync(
+///       "127.0.0.1", 3306, "test", "root", "secret");
+///   int n = await db.ExecuteAsync("INSERT INTO t VALUES (1,'a')");
+///   DbResult r = await db.QueryAsync("SELECT id, name FROM t");
+///   db.Close();
+/// </summary>
+class MySqlConnection {
+    int sock;
+    bool connected;
+    string lastError;
+    int lastLen;        // payload length of the most recently read packet
+    int lastSeq;        // sequence id of the most recently read packet
+    int lastAffected;   // affected rows / row count of the last statement
+    bool hadError;      // whether the last statement returned an ERR packet
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+
+    MySqlConnection() {
+        this.sock = -1;
+        this.connected = false;
+        this.lastError = "";
+        this.lastLen = 0;
+        this.lastSeq = 0;
+        this.lastAffected = 0;
+        this.hadError = false;
+    }
+
+    // ============================================================
+    // Byte / packet helpers
+    // ============================================================
+
+    /// <summary>Reads exactly <paramref name="need"/> bytes into
+    /// <paramref name="dst"/> at <paramref name="off"/>, suspending on the IO
+    /// reactor between partial reads. Returns bytes actually read (&lt; need on
+    /// peer close).</summary>
+    async int recvExact(string dst, int off, int need) {
+        int got = 0;
+        string tmp = calloc(need + 1, 1);
+        while (got < need) {
+            int n = await Socket.RecvOv(this.sock, tmp, need - got);
+            if (n <= 0) { free(tmp); return got; }
+            int j = 0;
+            while (j < n) { dst[off + got + j] = tmp[j] & 255; j = j + 1; }
+            got = got + n;
+        }
+        free(tmp);
+        return got;
+    }
+
+    /// <summary>Reads one protocol packet, returning its payload as a freshly
+    /// allocated buffer (NUL-terminated at the payload length). Sets
+    /// <c>lastLen</c> / <c>lastSeq</c>. Returns null on connection close.</summary>
+    async string readPacket() {
+        string hdr = calloc(5, 1);
+        int got = await this.recvExact(hdr, 0, 4);
+        if (got < 4) { this.lastLen = -1; free(hdr); return null; }
+        int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
+        this.lastSeq = hdr[3] & 255;
+        free(hdr);
+        this.lastLen = len;
+        string pay = calloc(len + 1, 1);
+        if (len > 0) {
+            int g2 = await this.recvExact(pay, 0, len);
+            if (g2 < len) { this.lastLen = -1; free(pay); return null; }
+        }
+        return pay;
+    }
+
+    /// <summary>Writes one protocol packet (4-byte header + payload) with the
+    /// given sequence id. Binary-safe (length-carried send).</summary>
+    async int writePacket(string payload, int len, int seq) {
+        string buf = calloc(len + 5, 1);
+        buf[0]=len&255; buf[1]=(len>>8)&255; buf[2]=(len>>16)&255; buf[3]=seq&255;
+        int i = 0;
+        while (i < len) { buf[i+4] = payload[i] & 255; i = i + 1; }
+        int r = await Socket.SendAsync(this.sock, buf, len + 4);
+        free(buf);
+        return r;
+    }
+
+    /// <summary>Copies <paramref name="len"/> bytes from a buffer into a new
+    /// Zan string.</summary>
+    static string bytesToStr(string buf, int off, int len) {
+        if (len <= 0) { return ""; }
+        string t = calloc(len + 1, 1);
+        int i = 0;
+        while (i < len) { t[i] = buf[off+i] & 255; i = i + 1; }
+        string s = t.Substring(0, len);
+        free(t);
+        return s;
+    }
+
+    /// <summary>Decodes a length-encoded integer at cursor <c>cur[0]</c>,
+    /// advancing it. Returns -1 for the NULL marker (0xFB).</summary>
+    static int readLenenc(string buf, List<int> cur) {
+        int p = cur[0];
+        int b0 = buf[p] & 255;
+        if (b0 < 251) { cur[0] = p + 1; return b0; }
+        if (b0 == 252) { cur[0] = p + 3; return (buf[p+1]&255)|((buf[p+2]&255)<<8); }
+        if (b0 == 253) { cur[0] = p + 4; return (buf[p+1]&255)|((buf[p+2]&255)<<8)|((buf[p+3]&255)<<16); }
+        if (b0 == 254) {
+            int v = 0; int i = 0;
+            while (i < 8) { v = v | ((buf[p+1+i]&255) << (8*i)); i = i + 1; }
+            cur[0] = p + 9; return v;
+        }
+        cur[0] = p + 1; return -1;
+    }
+
+    /// <summary>Decodes a length-encoded string at cursor <c>cur[0]</c>,
+    /// advancing it. NULL (0xFB) yields "".</summary>
+    static string readLenencStr(string buf, List<int> cur) {
+        int b0 = buf[cur[0]] & 255;
+        if (b0 == 251) { cur[0] = cur[0] + 1; return ""; }
+        int len = readLenenc(buf, cur);
+        int p = cur[0];
+        cur[0] = p + len;
+        return bytesToStr(buf, p, len);
+    }
+
+    bool isEof(string pkt) {
+        return (pkt[0] & 255) == 254 && this.lastLen < 9;
+    }
+
+    // ============================================================
+    // Authentication
+    // ============================================================
+
+    /// <summary>caching_sha2_password fast-auth scramble:
+    /// SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce ). Returns a 32-byte
+    /// buffer (caller frees).</summary>
+    static string scramble41(string pw, string nonce20) {
+        string a = Sha256.Hash(pw, pw.Length);
+        string b = Sha256.Hash(a, 32);
+        string cat = calloc(53, 1);
+        int i = 0;
+        while (i < 32) { cat[i] = b[i] & 255; i = i + 1; }
+        i = 0;
+        while (i < 20) { cat[32 + i] = nonce20[i] & 255; i = i + 1; }
+        string c = Sha256.Hash(cat, 52);
+        free(cat);
+        string tok = calloc(33, 1);
+        i = 0;
+        while (i < 32) { tok[i] = (a[i] ^ c[i]) & 255; i = i + 1; }
+        free(a);
+        free(b);
+        free(c);
+        return tok;
+    }
+
+    /// <summary>mysql_native_password scramble:
+    /// SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) ). Returns a 20-byte
+    /// buffer (caller frees).</summary>
+    static string scrambleNative(string pw, string nonce20) {
+        string a = Sha1.Hash(pw, pw.Length);
+        string b = Sha1.Hash(a, 20);
+        string cat = calloc(41, 1);
+        int i = 0;
+        while (i < 20) { cat[i] = nonce20[i] & 255; i = i + 1; }
+        i = 0;
+        while (i < 20) { cat[20 + i] = b[i] & 255; i = i + 1; }
+        string c = Sha1.Hash(cat, 40);
+        free(cat);
+        string tok = calloc(21, 1);
+        i = 0;
+        while (i < 20) { tok[i] = (a[i] ^ c[i]) & 255; i = i + 1; }
+        free(a);
+        free(b);
+        free(c);
+        return tok;
+    }
+
+    static string authToken(string plugin, string pw, string nonce20, List<int> outLen) {
+        if (pw.Length == 0) {
+            outLen[0] = 0;
+            return calloc(1, 1);
+        }
+        if (plugin == "caching_sha2_password") {
+            outLen[0] = 32;
+            return scramble41(pw, nonce20);
+        }
+        if (plugin == "mysql_native_password") {
+            outLen[0] = 20;
+            return scrambleNative(pw, nonce20);
+        }
+        outLen[0] = -1;
+        return null;
+    }
+
+    // ============================================================
+    // caching_sha2_password full authentication (cold cache)
+    // ============================================================
+
+    static string genSeed(int n) {
+        // OS CSPRNG (cross-platform); seeds RSA-OAEP for full authentication.
+        return RandomNumberGenerator.GetBytes(n);
+    }
+
+    /// <summary>Finds needle in haystack starting at <paramref name="from"/>;
+    /// returns the index or -1.</summary>
+    static int findSub(string h, int hlen, string ndl, int nlen, int from) {
+        int i = from;
+        while (i + nlen <= hlen) {
+            int j = 0; bool ok = true;
+            while (j < nlen) { if ((h[i + j] & 255) != (ndl[j] & 255)) { ok = false; break; } j = j + 1; }
+            if (ok) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>Extracts the DER SubjectPublicKeyInfo from a PEM public key.
+    /// outLen[0] receives the DER length; returns null if no PEM body found.</summary>
+    static string pemToDer(string pem, int pemLen, List<int> outLen) {
+        int begin = findSub(pem, pemLen, "-----BEGIN", 10, 0);
+        if (begin < 0) { return null; }
+        int hb = begin;
+        while (hb < pemLen && (pem[hb] & 255) != 10) { hb = hb + 1; }
+        hb = hb + 1;
+        int end = findSub(pem, pemLen, "-----END", 8, hb);
+        if (end < 0) { end = pemLen; }
+        int blen = end - hb;
+        string b64 = calloc(blen + 1, 1);
+        int i = 0; while (i < blen) { b64[i] = pem[hb + i] & 255; i = i + 1; }
+        List<int> dl = new List<int>(); dl.Add(0);
+        string der = Base64.Decode(b64, dl);
+        free(b64);
+        outLen[0] = dl[0];
+        return der;
+    }
+
+    /// <summary>Reads a DER length at cursor c[0], advancing c[0] past it.</summary>
+    static int readDerLen(string der, List<int> c) {
+        int b = der[c[0]] & 255; c[0] = c[0] + 1;
+        if (b < 128) { return b; }
+        int nb = b - 128;
+        int v = 0; int i = 0;
+        while (i < nb) { v = (v << 8) | (der[c[0]] & 255); c[0] = c[0] + 1; i = i + 1; }
+        return v;
+    }
+
+    /// <summary>Parses an RSA SubjectPublicKeyInfo and encrypts <paramref name="obf"/>
+    /// with RSA OAEP-SHA1 (MySQL full-auth padding). kOut[0] receives the modulus
+    /// byte length (== ciphertext length).</summary>
+    static string fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
+        List<int> c = new List<int>(); c.Add(0);
+        c[0] = c[0] + 1; readDerLen(der, c);                       // outer SEQUENCE
+        c[0] = c[0] + 1; int algLen = readDerLen(der, c); c[0] = c[0] + algLen;  // skip AlgorithmIdentifier
+        c[0] = c[0] + 1; readDerLen(der, c);                       // BIT STRING
+        c[0] = c[0] + 1;                                           // unused-bits byte (0x00)
+        c[0] = c[0] + 1; readDerLen(der, c);                       // inner SEQUENCE (RSAPublicKey)
+        c[0] = c[0] + 1; int nLen = readDerLen(der, c);            // INTEGER modulus
+        int origStart = c[0]; int origLen = nLen;
+        int nStart = origStart; int useLen = origLen;
+        if ((der[nStart] & 255) == 0) { nStart = nStart + 1; useLen = useLen - 1; }
+        c[0] = origStart + origLen;
+        c[0] = c[0] + 1; int eLen = readDerLen(der, c);            // INTEGER exponent
+        int eStart = c[0];
+        string nBuf = calloc(useLen + 1, 1);
+        int i = 0; while (i < useLen) { nBuf[i] = der[nStart + i] & 255; i = i + 1; }
+        string eBuf = calloc(eLen + 1, 1);
+        i = 0; while (i < eLen) { eBuf[i] = der[eStart + i] & 255; i = i + 1; }
+        string cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
+        free(nBuf); free(eBuf);
+        kOut[0] = useLen;
+        return cph;
+    }
+
+    // ============================================================
+    // Connect
+    // ============================================================
+
+    /// <summary>Opens a coroutine-ized MySQL/MariaDB connection using the native
+    /// wire protocol.</summary>
+    static async MySqlConnection OpenParamsAsync(string host, int port,
+            string database, string user, string password) {
+        Socket.Initialize();
+        MySqlConnection conn = new MySqlConnection();
+        bool ok = await conn.doConnect(host, port, database, user, password);
+        conn.connected = ok;
+        return conn;
+    }
+
+    async bool doConnect(string host, int port, string db, string user, string pw) {
+        this.sock = Socket.CreateTcp();
+        if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
+        Socket.SetNonBlocking(this.sock);
+        await Socket.ConnectAsync(this.sock, host, port);
+
+        // --- read + parse handshake (packet seq 0) ---
+        string hs = await this.readPacket();
+        if (hs == null) { this.lastError = "no handshake from server"; return false; }
+        int proto = hs[0] & 255;
+        if (proto == 255) {
+            int code = (hs[1]&255)|((hs[2]&255)<<8);
+            this.lastError = "handshake err " + Convert.ToString(code) + ": "
+                + bytesToStr(hs, 3, this.lastLen - 3);
+            free(hs); return false;
+        }
+        int p = 1;
+        while ((hs[p] & 255) != 0) { p = p + 1; }   // server version (NUL-terminated)
+        p = p + 1;
+        p = p + 4;                                    // thread id
+        string nonce = calloc(21, 1);
+        int i = 0;
+        while (i < 8) { nonce[i] = hs[p+i] & 255; i = i + 1; }
+        p = p + 8;
+        p = p + 1;                                    // filler
+        int capLow = (hs[p]&255)|((hs[p+1]&255)<<8);
+        p = p + 2;                                    // capability flags (lower)
+        p = p + 1;                                    // charset
+        p = p + 2;                                    // status flags
+        int capHigh = (hs[p]&255)|((hs[p+1]&255)<<8);
+        int serverCaps = capLow | (capHigh << 16);
+        p = p + 2;                                    // capability flags (upper)
+        int authlen = hs[p] & 255; p = p + 1;         // auth-plugin-data length
+        p = p + 10;                                   // reserved
+        int part2 = authlen - 8;
+        if (part2 < 13) { part2 = 13; }
+        int copy2 = part2;
+        if (copy2 > 12) { copy2 = 12; }
+        i = 0;
+        while (i < copy2) { nonce[8+i] = hs[p+i] & 255; i = i + 1; }
+        p = p + part2;
+        string plugin = "mysql_native_password";
+        if ((serverCaps & 524288) != 0 && p < this.lastLen) {
+            int pluginEnd = p;
+            while (pluginEnd < this.lastLen && (hs[pluginEnd] & 255) != 0) {
+                pluginEnd = pluginEnd + 1;
+            }
+            if (pluginEnd > p) { plugin = bytesToStr(hs, p, pluginEnd - p); }
+        }
+        free(hs);
+
+        // --- build + send handshake response (seq 1) ---
+        // Capabilities: LONG_PASSWORD | LONG_FLAG | PROTOCOL_41 | TRANSACTIONS
+        //             | SECURE_CONNECTION | PLUGIN_AUTH
+        int caps = 1 | 4 | 512 | 8192 | 32768 | 524288;
+        bool hasDb = db.Length > 0;
+        if (hasDb) { caps = caps | 8; }              // CLIENT_CONNECT_WITH_DB
+        List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
+        string token = authToken(plugin, pw, nonce, tokenLenOut);
+        int tokenLen = tokenLenOut[0];
+        if (token == null || tokenLen < 0) {
+            this.lastError = "unsupported auth plugin: " + plugin;
+            free(nonce);
+            return false;
+        }
+        int userLen = user.Length;
+        int respLen = 4 + 4 + 1 + 23 + userLen + 1 + 1 + tokenLen;
+        if (hasDb) { respLen = respLen + db.Length + 1; }
+        respLen = respLen + plugin.Length + 1;
+        string resp = calloc(respLen + 1, 1);
+        int q = 0;
+        resp[q]=caps&255; resp[q+1]=(caps>>8)&255; resp[q+2]=(caps>>16)&255; resp[q+3]=(caps>>24)&255; q=q+4;
+        resp[q]=0; resp[q+1]=0; resp[q+2]=0; resp[q+3]=1; q=q+4;   // max packet 16M
+        resp[q]=45; q=q+1;                                          // charset utf8mb4_general_ci
+        q = q + 23;                                                 // 23-byte filler (zeros)
+        i = 0; while (i < userLen) { resp[q+i] = user[i] & 255; i = i + 1; } q = q + userLen;
+        resp[q]=0; q=q+1;
+        resp[q]=tokenLen; q=q+1;                                    // auth response length
+        i = 0; while (i < tokenLen) { resp[q+i] = token[i] & 255; i = i + 1; } q = q + tokenLen;
+        free(token);
+        if (hasDb) {
+            i = 0; while (i < db.Length) { resp[q+i] = db[i] & 255; i = i + 1; } q = q + db.Length;
+            resp[q]=0; q=q+1;
+        }
+        i = 0; while (i < plugin.Length) { resp[q+i] = plugin[i] & 255; i = i + 1; } q = q + plugin.Length;
+        resp[q]=0; q=q+1;
+        await this.writePacket(resp, respLen, 1);
+        free(resp);
+
+        // --- auth result ---
+        while (true) {
+            string r = await this.readPacket();
+            if (r == null) { this.lastError = "connection closed during auth"; free(nonce); return false; }
+            int b0 = r[0] & 255;
+            if (b0 == 0) { free(r); free(nonce); return true; }         // OK -> authenticated
+            if (b0 == 255) {
+                int code = (r[1]&255)|((r[2]&255)<<8);
+                this.lastError = "auth err " + Convert.ToString(code) + ": "
+                    + bytesToStr(r, 9, this.lastLen - 9);
+                free(r); free(nonce); return false;
+            }
+            if (b0 == 1) {
+                int more = r[1] & 255;
+                free(r);
+                if (more == 3) { continue; }                             // fast_auth_success -> OK follows
+                if (more == 4) {
+                    // perform_full_authentication: request the server's RSA public
+                    // key, then send (password XOR nonce) encrypted with OAEP-SHA1.
+                    string req = calloc(2, 1); req[0] = 2;               // request_public_key
+                    await this.writePacket(req, 1, this.lastSeq + 1);
+                    free(req);
+                    string pk = await this.readPacket();
+                    if (pk == null) { this.lastError = "no RSA public key from server"; free(nonce); return false; }
+                    int pemLen = this.lastLen - 1;                        // skip leading 0x01
+                    string pem = calloc(pemLen + 1, 1);
+                    i = 0; while (i < pemLen) { pem[i] = pk[1 + i] & 255; i = i + 1; }
+                    free(pk);
+                    List<int> derLen = new List<int>(); derLen.Add(0);
+                    string der = pemToDer(pem, pemLen, derLen);
+                    if (der == null) { this.lastError = "bad RSA public key PEM"; free(pem); free(nonce); return false; }
+                    free(pem);
+                    int pwLen = pw.Length;
+                    int obfLen = pwLen + 1;                               // include trailing NUL
+                    string obf = calloc(obfLen + 1, 1);
+                    i = 0; while (i < obfLen) { obf[i] = (pw[i] & 255) ^ (nonce[i % 20] & 255); i = i + 1; }
+                    string seed = genSeed(20);
+                    if (seed == null) {
+                        this.lastError = "secure RNG unavailable for full-auth";
+                        free(der); free(obf); free(nonce); return false;
+                    }
+                    List<int> kOut = new List<int>(); kOut.Add(0);
+                    string cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
+                    free(der); free(obf); free(seed);
+                    await this.writePacket(cipher, kOut[0], this.lastSeq + 1);
+                    free(cipher);
+                    continue;                                            // OK / ERR follows
+                }
+                this.lastError = "unexpected auth-more-data " + Convert.ToString(more);
+                free(nonce); return false;
+            }
+            if (b0 == 254) {
+                int pluginEnd = 1;
+                while (pluginEnd < this.lastLen && (r[pluginEnd] & 255) != 0) {
+                    pluginEnd = pluginEnd + 1;
+                }
+                string switchPlugin = bytesToStr(r, 1, pluginEnd - 1);
+                int nonceStart = pluginEnd + 1;
+                int switchNonceLen = this.lastLen - nonceStart;
+                if (switchNonceLen > 20) { switchNonceLen = 20; }
+                string switchNonce = calloc(21, 1);
+                i = 0;
+                while (i < switchNonceLen) {
+                    switchNonce[i] = r[nonceStart + i] & 255;
+                    i = i + 1;
+                }
+                free(r);
+                List<int> switchLenOut = new List<int>(); switchLenOut.Add(0);
+                string switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
+                int switchLen = switchLenOut[0];
+                if (switchToken == null || switchLen < 0) {
+                    this.lastError = "unsupported auth-switch plugin: " + switchPlugin;
+                    free(switchNonce);
+                    free(nonce);
+                    return false;
+                }
+                free(nonce);
+                nonce = switchNonce;
+                await this.writePacket(switchToken, switchLen, this.lastSeq + 1);
+                free(switchToken);
+                continue;
+            }
+            free(r);
+            this.lastError = "unexpected auth packet " + Convert.ToString(b0);
+            free(nonce); return false;
+        }
+        return false;
+    }
+
+    // ============================================================
+    // Query / Execute
+    // ============================================================
+
+    async int comQuery(string sql) {
+        int len = sql.Length + 1;
+        string pay = calloc(len + 1, 1);
+        pay[0] = 3;    // COM_QUERY
+        int i = 0;
+        while (i < sql.Length) { pay[i+1] = sql[i] & 255; i = i + 1; }
+        int r = await this.writePacket(pay, len, 0);
+        free(pay);
+        return r;
+    }
+
+    /// <summary>Runs a query and returns the full result set. For non-SELECT
+    /// statements the result is empty and affected rows are recorded.</summary>
+    async DbResult QueryAsync(string sql) {
+        DbResult result = DbResult.Create();
+        this.hadError = false;
+        this.lastAffected = 0;
+        if (!this.connected) {
+            this.hadError = true;
+            this.lastError = "not connected";
+            return result;
+        }
+        await this.comQuery(sql);
+        string first = await this.readPacket();
+        if (first == null) {
+            this.hadError = true;
+            this.lastError = "connection closed";
+            this.connected = false;
+            return result;
+        }
+        int b0 = first[0] & 255;
+        if (b0 == 255) {
+            int code = (first[1]&255)|((first[2]&255)<<8);
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + bytesToStr(first, 9, this.lastLen - 9);
+            this.hadError = true;
+            free(first);
+            return result;
+        }
+        if (b0 == 0 || b0 == 254) {
+            // OK packet (no result set): affected rows is a lenenc int at offset 1.
+            List<int> cur = new List<int>(); cur.Add(1);
+            this.lastAffected = readLenenc(first, cur);
+            free(first);
+            return result;
+        }
+        // Result set: first packet is the column count (lenenc).
+        List<int> cc = new List<int>(); cc.Add(0);
+        int ncols = readLenenc(first, cc);
+        free(first);
+        result.SetColumnCount(ncols);
+        int c = 0;
+        while (c < ncols) {
+            string cd = await this.readPacket();
+            List<int> cur = new List<int>(); cur.Add(0);
+            readLenencStr(cd, cur);   // catalog
+            readLenencStr(cd, cur);   // schema
+            readLenencStr(cd, cur);   // table
+            readLenencStr(cd, cur);   // org_table
+            result.AddColumnName(readLenencStr(cd, cur));  // name
+            free(cd);
+            c = c + 1;
+        }
+        string colEof = await this.readPacket();   // EOF terminating column defs
+        if (colEof != null) { free(colEof); }
+        int rowCount = 0;
+        while (true) {
+            string row = await this.readPacket();
+            if (row == null) { break; }
+            if (this.isEof(row)) { free(row); break; }
+            List<int> cur = new List<int>(); cur.Add(0);
+            List<string> outRow = new List<string>();
+            c = 0;
+            while (c < ncols) {
+                outRow.Add(readLenencStr(row, cur));
+                c = c + 1;
+            }
+            result.AddRow(outRow);
+            free(row);
+            rowCount = rowCount + 1;
+        }
+        this.lastAffected = rowCount;
+        return result;
+    }
+
+    /// <summary>Runs a non-query statement and returns affected rows (-1 on error).</summary>
+    async int ExecuteAsync(string sql) {
+        if (!this.connected) {
+            this.lastError = "not connected";
+            return -1;
+        }
+        DbResult r = await this.QueryAsync(sql);
+        if (this.hadError) {
+            return -1;
+        }
+        return this.lastAffected;
+    }
+
+    /// <summary>First column of the first row as a string ("" if empty).</summary>
+    async string ExecuteScalarAsync(string sql) {
+        DbResult r = await this.QueryAsync(sql);
+        if (r.RowCount() > 0) {
+            return r.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// <summary>Last error message recorded on this connection.</summary>
+    string GetError() {
+        return this.lastError;
+    }
+
+    /// <summary>Whether the connection is open.</summary>
+    bool IsConnected() {
+        return this.connected;
+    }
+
+    /// <summary>Closes the connection.</summary>
+    void Close() {
+        if (this.connected || this.sock >= 0) {
+            Socket.Close(this.sock);
+            this.connected = false;
+            this.sock = -1;
+        }
+    }
+}

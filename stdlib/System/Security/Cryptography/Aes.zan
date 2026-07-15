@@ -1,0 +1,292 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>AES (FIPS-197) block cipher with CBC and CTR modes. Supports
+/// 128/192/256-bit keys. Pure Zan, byte-oriented (no T-tables). The S-box is
+/// stored as hex and decoded once; the inverse S-box is derived from it.</summary>
+class Aes {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    static string SBOX_HEX() {
+        return "637c777bf26b6fc53001672bfed7ab76"
+             + "ca82c97dfa5947f0add4a2af9ca472c0"
+             + "b7fd9326363ff7cc34a5e5f171d83115"
+             + "04c723c31896059a071280e2eb27b275"
+             + "09832c1a1b6e5aa0523bd6b329e32f84"
+             + "53d100ed20fcb15b6acbbe394a4c58cf"
+             + "d0efaafb434d338545f9027f503c9fa8"
+             + "51a3408f929d38f5bcb6da2110fff3d2"
+             + "cd0c13ec5f974417c4a77e3d645d1973"
+             + "60814fdc222a908846eeb814de5e0bdb"
+             + "e0323a0a4906245cc2d3ac629195e479"
+             + "e7c8376d8dd54ea96c56f4ea657aae08"
+             + "ba78252e1ca6b4c6e8dd741f4bbd8b8a"
+             + "703eb5664803f60e613557b986c11d9e"
+             + "e1f8981169d98e949b1e87e9ce5528df"
+             + "8ca1890dbfe6426841992d0fb054bb16";
+    }
+
+    static string sbox;
+    static string inv;
+    static bool ready = false;
+
+    static void init() {
+        if (ready) { return; }
+        sbox = Hex.Decode(SBOX_HEX());
+        inv = calloc(257, 1);
+        int i = 0;
+        while (i < 256) { inv[sbox[i] & 255] = i; i = i + 1; }
+        ready = true;
+    }
+
+    static int xtime(int x) {
+        int r = (x << 1) & 255;
+        if ((x & 128) != 0) { r = r ^ 27; }
+        return r;
+    }
+
+    static int gmul(int a, int b) {
+        int p = 0; int i = 0;
+        while (i < 8) {
+            if ((b & 1) != 0) { p = p ^ a; }
+            int hi = a & 128;
+            a = (a << 1) & 255;
+            if (hi != 0) { a = a ^ 27; }
+            b = b >> 1;
+            i = i + 1;
+        }
+        return p & 255;
+    }
+
+    /// <summary>Expands a key into (Nr+1)*16 round-key bytes. Returns the buffer;
+    /// <paramref name="nrOut"/>[0] receives the round count.</summary>
+    static string expandKey(string key, int keyLen, List<int> nrOut) {
+        init();
+        int nk = keyLen / 4;
+        int nr = nk + 6;
+        nrOut[0] = nr;
+        int total = 16 * (nr + 1);
+        string rk = calloc(total + 1, 1);
+        int i = 0;
+        while (i < keyLen) { rk[i] = key[i] & 255; i = i + 1; }
+        int rcon = 1;
+        i = keyLen;
+        while (i < total) {
+            int t0 = rk[i-4]&255; int t1 = rk[i-3]&255; int t2 = rk[i-2]&255; int t3 = rk[i-1]&255;
+            if ((i % keyLen) == 0) {
+                int tmp = t0;
+                t0 = (sbox[t1]&255) ^ rcon;
+                t1 = sbox[t2]&255;
+                t2 = sbox[t3]&255;
+                t3 = sbox[tmp]&255;
+                rcon = xtime(rcon);
+            } else if (keyLen == 32 && (i % keyLen) == 16) {
+                t0 = sbox[t0]&255; t1 = sbox[t1]&255; t2 = sbox[t2]&255; t3 = sbox[t3]&255;
+            }
+            rk[i]   = (rk[i-keyLen]&255)   ^ t0;
+            rk[i+1] = (rk[i-keyLen+1]&255) ^ t1;
+            rk[i+2] = (rk[i-keyLen+2]&255) ^ t2;
+            rk[i+3] = (rk[i-keyLen+3]&255) ^ t3;
+            i = i + 4;
+        }
+        return rk;
+    }
+
+    static void addRoundKey(string st, string rk, int round) {
+        int i = 0;
+        while (i < 16) { st[i] = (st[i]&255) ^ (rk[round*16+i]&255); i = i + 1; }
+    }
+
+    static void encryptBlock(string st, string rk, int nr) {
+        addRoundKey(st, rk, 0);
+        int r = 1;
+        while (r < nr) {
+            int i = 0; while (i < 16) { st[i] = sbox[st[i]&255]&255; i = i + 1; }   // SubBytes
+            shiftRows(st);
+            mixColumns(st);
+            addRoundKey(st, rk, r);
+            r = r + 1;
+        }
+        int j = 0; while (j < 16) { st[j] = sbox[st[j]&255]&255; j = j + 1; }
+        shiftRows(st);
+        addRoundKey(st, rk, nr);
+    }
+
+    static void decryptBlock(string st, string rk, int nr) {
+        addRoundKey(st, rk, nr);
+        int r = nr - 1;
+        while (r >= 1) {
+            invShiftRows(st);
+            int i = 0; while (i < 16) { st[i] = inv[st[i]&255]&255; i = i + 1; }
+            addRoundKey(st, rk, r);
+            invMixColumns(st);
+            r = r - 1;
+        }
+        invShiftRows(st);
+        int j = 0; while (j < 16) { st[j] = inv[st[j]&255]&255; j = j + 1; }
+        addRoundKey(st, rk, 0);
+    }
+
+    static void shiftRows(string st) {
+        string t = calloc(17, 1);
+        int c = 0;
+        while (c < 4) {
+            int r = 0;
+            while (r < 4) { t[c*4+r] = st[(((c+r)%4)*4)+r]&255; r = r + 1; }
+            c = c + 1;
+        }
+        int i = 0; while (i < 16) { st[i] = t[i]&255; i = i + 1; }
+        free(t);
+    }
+
+    static void invShiftRows(string st) {
+        string t = calloc(17, 1);
+        int c = 0;
+        while (c < 4) {
+            int r = 0;
+            while (r < 4) { t[c*4+r] = st[((((c-r)%4)+4)%4)*4+r]&255; r = r + 1; }
+            c = c + 1;
+        }
+        int i = 0; while (i < 16) { st[i] = t[i]&255; i = i + 1; }
+        free(t);
+    }
+
+    static void mixColumns(string st) {
+        int c = 0;
+        while (c < 4) {
+            int a0=st[c*4]&255; int a1=st[c*4+1]&255; int a2=st[c*4+2]&255; int a3=st[c*4+3]&255;
+            st[c*4]   = (xtime(a0) ^ (xtime(a1)^a1) ^ a2 ^ a3) & 255;
+            st[c*4+1] = (a0 ^ xtime(a1) ^ (xtime(a2)^a2) ^ a3) & 255;
+            st[c*4+2] = (a0 ^ a1 ^ xtime(a2) ^ (xtime(a3)^a3)) & 255;
+            st[c*4+3] = ((xtime(a0)^a0) ^ a1 ^ a2 ^ xtime(a3)) & 255;
+            c = c + 1;
+        }
+    }
+
+    static void invMixColumns(string st) {
+        int c = 0;
+        while (c < 4) {
+            int a0=st[c*4]&255; int a1=st[c*4+1]&255; int a2=st[c*4+2]&255; int a3=st[c*4+3]&255;
+            st[c*4]   = (gmul(a0,14)^gmul(a1,11)^gmul(a2,13)^gmul(a3,9)) & 255;
+            st[c*4+1] = (gmul(a0,9)^gmul(a1,14)^gmul(a2,11)^gmul(a3,13)) & 255;
+            st[c*4+2] = (gmul(a0,13)^gmul(a1,9)^gmul(a2,14)^gmul(a3,11)) & 255;
+            st[c*4+3] = (gmul(a0,11)^gmul(a1,13)^gmul(a2,9)^gmul(a3,14)) & 255;
+            c = c + 1;
+        }
+    }
+
+    /// <summary>Encrypts a single 16-byte block (ECB). For testing / building
+    /// other modes. Returns a fresh 16-byte buffer.</summary>
+    static string EncryptBlockEcb(string key, int keyLen, string in16) {
+        List<int> nr = new List<int>(); nr.Add(0);
+        string rk = expandKey(key, keyLen, nr);
+        string st = calloc(17, 1);
+        int i = 0; while (i < 16) { st[i] = in16[i]&255; i = i + 1; }
+        encryptBlock(st, rk, nr[0]);
+        free(rk);
+        return st;
+    }
+
+    static string DecryptBlockEcb(string key, int keyLen, string in16) {
+        List<int> nr = new List<int>(); nr.Add(0);
+        string rk = expandKey(key, keyLen, nr);
+        string st = calloc(17, 1);
+        int i = 0; while (i < 16) { st[i] = in16[i]&255; i = i + 1; }
+        decryptBlock(st, rk, nr[0]);
+        free(rk);
+        return st;
+    }
+
+    /// <summary>AES-CBC encrypt with PKCS#7 padding. Returns ciphertext;
+    /// <paramref name="outLen"/>[0] receives its length.</summary>
+    static string EncryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
+        List<int> nr = new List<int>(); nr.Add(0);
+        string rk = expandKey(key, keyLen, nr);
+        int padVal = 16 - (len % 16);
+        int total = len + padVal;
+        string outb = calloc(total + 1, 1);
+        string prev = calloc(17, 1);
+        int i = 0; while (i < 16) { prev[i] = iv[i]&255; i = i + 1; }
+        int off = 0;
+        while (off < total) {
+            string st = calloc(17, 1);
+            int j = 0;
+            while (j < 16) {
+                int b;
+                if (off + j < len) { b = data[off+j]&255; } else { b = padVal; }
+                st[j] = (b ^ (prev[j]&255)) & 255;
+                j = j + 1;
+            }
+            encryptBlock(st, rk, nr[0]);
+            j = 0; while (j < 16) { outb[off+j] = st[j]&255; prev[j] = st[j]&255; j = j + 1; }
+            free(st);
+            off = off + 16;
+        }
+        free(prev); free(rk);
+        outLen[0] = total;
+        return outb;
+    }
+
+    /// <summary>AES-CBC decrypt, stripping PKCS#7 padding. Returns plaintext;
+    /// <paramref name="outLen"/>[0] receives its length.</summary>
+    static string DecryptCbc(string key, int keyLen, string iv, string data, int len, List<int> outLen) {
+        List<int> nr = new List<int>(); nr.Add(0);
+        string rk = expandKey(key, keyLen, nr);
+        string outb = calloc(len + 1, 1);
+        string prev = calloc(17, 1);
+        int i = 0; while (i < 16) { prev[i] = iv[i]&255; i = i + 1; }
+        int off = 0;
+        while (off < len) {
+            string st = calloc(17, 1);
+            int j = 0; while (j < 16) { st[j] = data[off+j]&255; j = j + 1; }
+            string cipher = calloc(17, 1);
+            j = 0; while (j < 16) { cipher[j] = st[j]&255; j = j + 1; }
+            decryptBlock(st, rk, nr[0]);
+            j = 0;
+            while (j < 16) { outb[off+j] = (st[j]&255) ^ (prev[j]&255); j = j + 1; }
+            j = 0; while (j < 16) { prev[j] = cipher[j]&255; j = j + 1; }
+            free(st); free(cipher);
+            off = off + 16;
+        }
+        free(prev); free(rk);
+        int plen = len;
+        if (len > 0) {
+            int padVal = outb[len-1]&255;
+            if (padVal >= 1 && padVal <= 16) { plen = len - padVal; }
+        }
+        outLen[0] = plen;
+        return outb;
+    }
+
+    /// <summary>AES-CTR (encrypt == decrypt). <paramref name="iv"/> is the 16-byte
+    /// initial counter block. Returns a buffer of exactly <paramref name="len"/>
+    /// bytes.</summary>
+    static string Ctr(string key, int keyLen, string iv, string data, int len) {
+        List<int> nr = new List<int>(); nr.Add(0);
+        string rk = expandKey(key, keyLen, nr);
+        string outb = calloc(len + 1, 1);
+        string ctr = calloc(17, 1);
+        int i = 0; while (i < 16) { ctr[i] = iv[i]&255; i = i + 1; }
+        int off = 0;
+        while (off < len) {
+            string ks = calloc(17, 1);
+            int j = 0; while (j < 16) { ks[j] = ctr[j]&255; j = j + 1; }
+            encryptBlock(ks, rk, nr[0]);
+            j = 0;
+            while (j < 16 && off + j < len) { outb[off+j] = (data[off+j]&255) ^ (ks[j]&255); j = j + 1; }
+            free(ks);
+            int c = 15;
+            while (c >= 0) {
+                int v = (ctr[c]&255) + 1;
+                ctr[c] = v & 255;
+                if (v < 256) { break; }
+                c = c - 1;
+            }
+            off = off + 16;
+        }
+        free(ctr); free(rk);
+        return outb;
+    }
+}

@@ -342,9 +342,9 @@ void L(string s) { body = body + s + "\n"; }   // O(n) copy per call
 
 Because strings are immutable, every `body = body + s` allocated a fresh buffer
 and copied the entire IR emitted so far, and the bootstrap subset has no
-`free`, so none of the intermediate buffers were released. Assembling a 744 KB
-module therefore cost O(n²) time and memory. Self-compiling the compiler peaked
-at **~13 GB**.
+`free`, so none of the intermediate buffers were released. Assembling a
+multi-megabyte module therefore cost O(n²) time and memory. Self-compiling the
+compiler peaked at **~13 GB**.
 
 ### 6.2 Fix: a real `StringBuilder`
 
@@ -364,7 +364,7 @@ size) instead of O(output size²).
 
 | Metric | Before (`string +`) | After (`StringBuilder`) |
 |--------|---------------------|-------------------------|
-| Peak RSS, self-compile (~744 KB IR) | ~13 GB | **22.8 MB** |
+| Peak RSS, self-compile (~2.0 MB IR) | ~13 GB | tens of MB |
 | Append complexity | O(n) per call, O(n²) total | O(1) amortised, O(n) total |
 
 The three-generation bootstrap fixpoint is preserved: `gen0 → gen1 → g2.ll`,

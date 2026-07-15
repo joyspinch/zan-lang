@@ -1,0 +1,178 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+/// Headless end-to-end check of the JSON->UI pipeline: parse a layout document
+/// into a retained Control tree, register a named handler, wire `on<Event>`
+/// names to Actions, then fire the button's Click to prove the handler runs.
+/// No window is opened (console build), so it verifies the loader/registry
+/// logic independently of rendering.
+class JsonUiTest {
+    static int fired;
+
+    static void OnSave() {
+        JsonUiTest.fired = JsonUiTest.fired + 1;
+        Console.WriteLine("HANDLER_FIRED");
+    }
+
+    static void Main() {
+        JsonUiTest.fired = 0;
+        string src = "{ \"type\": \"Column\", \"gap\": 12, \"pad\": 20, \"children\": [ { \"type\": \"H1\", \"text\": \"Profile\" }, { \"type\": \"Label\", \"text\": \"Name\", \"variant\": 1 }, { \"type\": \"Button\", \"name\": \"saveBtn\", \"text\": \"Save\", \"onClick\": \"save\" } ] }";
+
+        UiDoc ui = UiDoc.FromJson(src);
+        ui.Handle("save", JsonUiTest.OnSave);
+        ui.Wire();
+
+        Control root = ui.Root();
+        Console.WriteLine("root " + root.Kind());
+        Console.WriteLine("children " + Convert.ToString(root.ChildCount()));
+
+        Control btn = root.Find("saveBtn");
+        if (btn == null) { Console.WriteLine("NO_BUTTON"); return; }
+        Console.WriteLine("btn " + btn.Kind() + " onClick=" + btn.GetHandler("Click"));
+
+        // Firing the button's common Click event should invoke OnSave, proving
+        // the on* name resolved through the registry and attached via BindEvent.
+        btn.On.Click.Raise();
+        Console.WriteLine("fired " + Convert.ToString(JsonUiTest.fired));
+        if (JsonUiTest.fired == 1) { Console.WriteLine("UIDOC_OK"); }
+
+        // Two-way binding round trip: an Input bound to `user.name`. Seeding
+        // from the model pushes state -> control; editing + SyncToModel pushes
+        // control -> state (dotted PathGet/PathSet).
+        string src2 = "{ \"type\": \"Column\", \"children\": [ { \"type\": \"Input\", \"name\": \"nm\", \"bind\": \"user.name\", \"hint\": \"Name\" } ] }";
+        UiDoc ui2 = UiDoc.FromJson(src2);
+        JsonValue m = JsonValue.Parse("{ \"user\": { \"name\": \"Ann\" } }");
+        ui2.Bind(m);
+        ui2.SyncFromModel();
+        Control nm = ui2.Root().Find("nm");
+        if (nm == null) { Console.WriteLine("NO_INPUT"); return; }
+        string seeded = nm.GetProp("value");
+        Console.WriteLine("seed " + seeded);
+        nm.SetProp("value", "Bob");
+        ui2.SyncToModel();
+        string wb = m.PathGet("user.name").AsString("");
+        Console.WriteLine("wb " + wb);
+        if (seeded == "Ann" && wb == "Bob") { Console.WriteLine("BIND_OK"); }
+
+        // Bool binding round trip on a Switch bound to `agree`.
+        string src3 = "{ \"type\": \"Column\", \"children\": [ { \"type\": \"Switch\", \"name\": \"ag\", \"bind\": \"agree\" } ] }";
+        UiDoc ui3 = UiDoc.FromJson(src3);
+        JsonValue m3 = JsonValue.Parse("{ \"agree\": true }");
+        ui3.Bind(m3);
+        ui3.SyncFromModel();
+        Control ag = ui3.Root().Find("ag");
+        if (ag == null) { Console.WriteLine("NO_SWITCH"); return; }
+        string sSeed = ag.GetProp("value");
+        ag.SetProp("value", "false");
+        ui3.SyncToModel();
+        string sWb = m3.PathGet("agree").AsString("");
+        Console.WriteLine("sw " + sSeed + "->" + sWb);
+        if (sSeed == "true" && sWb == "false") { Console.WriteLine("BIND_BOOL_OK"); }
+
+        // Int binding round trip on a Slider bound to `volume`.
+        string src4 = "{ \"type\": \"Column\", \"children\": [ { \"type\": \"Slider\", \"name\": \"vol\", \"min\": 0, \"max\": 100, \"bind\": \"volume\" } ] }";
+        UiDoc ui4 = UiDoc.FromJson(src4);
+        JsonValue m4 = JsonValue.Parse("{ \"volume\": 30 }");
+        ui4.Bind(m4);
+        ui4.SyncFromModel();
+        Control vol = ui4.Root().Find("vol");
+        if (vol == null) { Console.WriteLine("NO_SLIDER"); return; }
+        string vSeed = vol.GetProp("value");
+        vol.SetProp("value", "75");
+        ui4.SyncToModel();
+        string vWb = m4.PathGet("volume").AsString("");
+        Console.WriteLine("vol " + vSeed + "->" + vWb);
+        if (vSeed == "30" && vWb == "75") { Console.WriteLine("BIND_INT_OK"); }
+
+        // Select (index) binding round trip on `role`, with a JSON options list.
+        string src5 = "{ \"type\": \"Column\", \"children\": [ { \"type\": \"Select\", \"name\": \"role\", \"options\": [\"Admin\", \"Editor\", \"Viewer\"], \"bind\": \"role\" } ] }";
+        UiDoc ui5 = UiDoc.FromJson(src5);
+        JsonValue m5 = JsonValue.Parse("{ \"role\": 2 }");
+        ui5.Bind(m5);
+        ui5.SyncFromModel();
+        Control role = ui5.Root().Find("role");
+        if (role == null) { Console.WriteLine("NO_SELECT"); return; }
+        string rSeed = role.GetProp("value");
+        role.SetProp("value", "1");
+        ui5.SyncToModel();
+        string rWb = m5.PathGet("role").AsString("");
+        Console.WriteLine("role " + rSeed + "->" + rWb);
+        if (rSeed == "2" && rWb == "1") { Console.WriteLine("BIND_SELECT_OK"); }
+
+        // Typed write-back: the bool/number leaves must keep their JSON type
+        // (not collapse to strings) after SyncToModel.
+        bool boolKept = m3.PathGet("agree").IsBool();
+        bool numKept = m4.PathGet("volume").IsNumber() && m5.PathGet("role").IsNumber();
+        Console.WriteLine("typed bool=" + Convert.ToString(boolKept) + " num=" + Convert.ToString(numKept));
+        if (boolKept && numKept) { Console.WriteLine("BIND_TYPED_OK"); }
+
+        // CSS-like cascade: type < class < inline specificity.
+        string styleSrc = "{ \"Input\": { \"hint\": \"typed\" }, \".big\": { \"hint\": \"BIG\" } }";
+        string uiSrc = "{ \"type\": \"Column\", \"children\": [ { \"type\": \"Input\", \"name\": \"a\" }, { \"type\": \"Input\", \"name\": \"b\", \"class\": \"big\" }, { \"type\": \"Input\", \"name\": \"c\", \"class\": \"big\", \"hint\": \"inline\" } ] }";
+        UiDoc us = UiDoc.FromJsonStyled(uiSrc, styleSrc);
+        string ha = us.Root().Find("a").GetProp("hint");
+        string hb = us.Root().Find("b").GetProp("hint");
+        string hc = us.Root().Find("c").GetProp("hint");
+        Console.WriteLine("style a=" + ha + " b=" + hb + " c=" + hc);
+        if (ha == "typed" && hb == "BIG" && hc == "inline") { Console.WriteLine("STYLE_OK"); }
+
+        // A Checkbox publishes both label/text and value. Binding must update
+        // only value, never overwrite the visible label with "true"/"false".
+        string src6 = "{ \"type\": \"Checkbox\", \"name\": \"terms\", \"label\": \"Accept terms\", \"bind\": \"accepted\" }";
+        UiDoc ui6 = UiDoc.FromJson(src6);
+        JsonValue m6 = JsonValue.Parse("{ \"accepted\": true }");
+        ui6.Bind(m6);
+        ui6.SyncFromModel();
+        Control terms = ui6.Root();
+        string termsLabel = terms.GetProp("label");
+        string termsValue = terms.GetProp("value");
+        terms.SetProp("value", "false");
+        ui6.SyncToModel();
+        bool termsTyped = m6.PathGet("accepted").IsBool();
+        Console.WriteLine("checkbox " + termsLabel + " " + termsValue);
+        if (termsLabel == "Accept terms" && termsValue == "true" && termsTyped) {
+            Console.WriteLine("BIND_CHECKBOX_OK");
+        }
+
+        // Object-form bind supports an explicit property, which lets custom
+        // components expose a model property other than value/text.
+        string src7 = "{ \"type\": \"Button\", \"name\": \"caption\", \"text\": \"Old\", \"bind\": { \"path\": \"caption\", \"prop\": \"text\" } }";
+        UiDoc ui7 = UiDoc.FromJson(src7);
+        JsonValue m7 = JsonValue.Parse("{ \"caption\": \"Save\" }");
+        ui7.Bind(m7);
+        ui7.SyncFromModel();
+        Control caption = ui7.Root();
+        string captionSeed = caption.GetProp("text");
+        caption.SetProp("text", "Done");
+        ui7.SyncToModel();
+        string captionWb = m7.PathGet("caption").AsString("");
+        Console.WriteLine("bindprop " + captionSeed + "->" + captionWb);
+        if (captionSeed == "Save" && captionWb == "Done") { Console.WriteLine("BIND_PROP_OK"); }
+
+        // Generic Control serialization now reconstructs all data widgets and
+        // preserves binding metadata alongside widget properties.
+        Control slider = ControlFactory.Create("Slider");
+        slider.SetProp("min", "10");
+        slider.SetProp("max", "90");
+        slider.SetProp("value", "40");
+        slider.bindPath = "settings.volume";
+        slider.bindProp = "value";
+        Control slider2 = Serialize.Load(Serialize.Save(slider));
+        bool serOk = slider2.Kind() == "Slider"
+            && slider2.GetProp("min") == "10"
+            && slider2.GetProp("max") == "90"
+            && slider2.GetProp("value") == "40"
+            && slider2.bindPath == "settings.volume"
+            && slider2.bindProp == "value";
+        if (serOk) { Console.WriteLine("SERIALIZE_WIDGET_OK"); }
+
+        // Structural JSON keys that used to be reserved-but-ignored now drive
+        // the retained layout model.
+        UiDoc layout = UiDoc.FromJson("{ \"type\": \"Panel\", \"padding\": 8, \"children\": [ { \"type\": \"Label\", \"name\": \"left\", \"dock\": \"left\", \"width\": 120, \"text\": \"Nav\" } ] }");
+        Control left = layout.Root().Find("left");
+        bool layoutOk = layout.Root().padL == 8 && left.dock == Dock.Left() && left.prefW == 120;
+        if (layoutOk) { Console.WriteLine("LAYOUT_JSON_OK"); }
+    }
+}

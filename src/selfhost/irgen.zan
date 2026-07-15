@@ -376,6 +376,11 @@ class Irgen {
         H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
+        H("@.fmt.gnl = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"");
+        H("@.fmt.gn = private unnamed_addr constant [3 x i8] c\"%g\\00\"");
+        H("@.msg.unhandled = private unnamed_addr constant [21 x i8] c\"Unhandled exception\\0A\\00\"");
+        H("@.msg.rderr = private unnamed_addr constant [18 x i8] c\"cannot read file\\0A\\00\"");
+        H("@.msg.wrerr = private unnamed_addr constant [19 x i8] c\"cannot write file\\0A\\00\"");
         EmitArcRuntime();
         EmitListRuntime();
         EmitSbRuntime();
@@ -1036,7 +1041,7 @@ class Irgen {
         curRet = MapType(m.type);
         bool stat = IsStatic(m);
         curHasThis = !stat;
-        string sig = "define " + curRet + " @" + cls.sval + "_" + m.sval + "(";
+        string sig = "define " + curRet + " @" + MethodSym(cls.sval, m) + "(";
         int np = 0;
         if (!stat) {
             sig = sig + "%" + cls.sval + "* %this";
@@ -1118,6 +1123,24 @@ class Irgen {
         L("}");
     }
 
+    // Emit: if `cond` (an i1) holds, print `msg` and exit(1) -- never falling
+    // through with an invalid result. Shared by every I/O return-value check.
+    void EmitAbortIf(string cond, string msg, int len) {
+        int lf = NL(); int lk = NL();
+        L("  br i1 " + cond + ", label %L" + lf + ", label %L" + lk);
+        Label(lf);
+        string em = NT(); L("  " + em + " = getelementptr inbounds [" + len + " x i8], [" + len + " x i8]* " + msg + ", i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + em + ")");
+        L("  call void @exit(i32 1)");
+        L("  unreachable");
+        Label(lk);
+    }
+
+    void EmitFopenCheck(string fp, string msg, int len) {
+        string np = NT(); L("  " + np + " = icmp eq i8* " + fp + ", null");
+        EmitAbortIf(np, msg, len);
+    }
+
     void GenMainWrapper(Node unit) {
         string owner = "";
         int i = 0;
@@ -1133,8 +1156,27 @@ class Irgen {
         L("entry:");
         L("  store i32 %argc, i32* @__zan_argc");
         L("  store i8** %argv, i8*** @__zan_argv");
+        // Install a root exception handler so an uncaught throw prints a
+        // message and exits 1 instead of longjmp-ing through an empty stack.
+        string rbuf = NT(); L("  " + rbuf + " = alloca [32 x i64]");
+        string rbp = NT(); L("  " + rbp + " = bitcast [32 x i64]* " + rbuf + " to i8*");
+        string rsp = NT(); L("  " + rsp + " = load i64, i64* @__exc_sp");
+        string rslot = NT(); L("  " + rslot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + rsp);
+        L("  store i8* " + rbp + ", i8** " + rslot);
+        string rsp1 = NT(); L("  " + rsp1 + " = add i64 " + rsp + ", 1");
+        L("  store i64 " + rsp1 + ", i64* @__exc_sp");
+        string rfp = NT(); L("  " + rfp + " = call i8* @llvm.frameaddress.p0(i32 0)");
+        string rr = NT(); L("  " + rr + " = call i32 @_setjmp(i8* " + rbp + ", i8* " + rfp + ")");
+        string rc = NT(); L("  " + rc + " = icmp ne i32 " + rr + ", 0");
+        int lbody = NL(); int lcatch = NL();
+        L("  br i1 " + rc + ", label %L" + lcatch + ", label %L" + lbody);
+        Label(lbody);
         L("  call void @" + owner + "_Main()");
         L("  ret i32 0");
+        Label(lcatch);
+        string mp = NT(); L("  " + mp + " = getelementptr inbounds [21 x i8], [21 x i8]* @.msg.unhandled, i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + mp + ")");
+        L("  ret i32 1");
         L("}");
     }
 
@@ -1217,6 +1259,12 @@ class Irgen {
             L("  " + t + " = bitcast " + vt + " " + v.op + " to " + llty);
             return t;
         }
+        // implicit integer -> double promotion (e.g. `double x = 5;`)
+        if (vt == "i64" && llty == "double") {
+            string t = NT();
+            L("  " + t + " = sitofp i64 " + v.op + " to double");
+            return t;
+        }
         return v.op;
     }
 
@@ -1255,6 +1303,188 @@ class Irgen {
             c = BaseClassOf(c);
         }
         return "";
+    }
+
+    // Number of methods named `name` declared directly in `cls`.
+    int MethodCount(Node cls, string name) {
+        if (cls == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // A type name reduced to a symbol-safe tag for overload mangling.
+    string TypeTag(Node t) {
+        if (t == null) { return "v"; }
+        if (t.sval == "") { return "v"; }
+        return t.sval;
+    }
+
+    // The LLVM symbol for a method. Non-overloaded names stay `Owner_Name`
+    // (so all existing output -- including the self-host fixed point, which
+    // has no overloads -- is unchanged); an overloaded name gains an arity and
+    // per-parameter-type suffix so each overload is a distinct definition.
+    string MethodSym(string owner, Node m) {
+        Node oc = binder.FindType(owner);
+        if (MethodCount(oc, m.sval) <= 1) { return owner + "_" + m.sval; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(owner);
+        sb.Append("_");
+        sb.Append(m.sval);
+        sb.Append("__");
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                sb.Append("_");
+                sb.Append(TypeTag(p.type));
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // ---- non-emitting argument typer (for overload resolution only) ----
+    // Yields the static type of an argument expression without generating any
+    // IR. Returns null when the type cannot be determined; callers treat that
+    // as "compatible with anything" so nothing is mis-resolved.
+    Node ArgTypeNode(Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return MkType("int"); }
+        if (k == AK.FloatLit()) { return MkType("double"); }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.ThisExpr()) { return MkType(curClass); }
+        if (k == AK.CastExpr()) { return e.type; }
+        if (k == AK.NewExpr()) { return e.type; }
+        if (k == AK.IsExpr()) { return MkType("bool"); }
+        if (k == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locType[li]; }
+            return FieldType(binder.FindType(curClass), e.sval);
+        }
+        if (k == AK.MemberAccess()) {
+            Node cls = ClassOf(ArgTypeNode(e.a));
+            if (cls != null) { return FieldType(cls, e.sval); }
+            return null;
+        }
+        if (k == AK.Unary()) { if (e.op == TK.Bang()) { return MkType("bool"); } return ArgTypeNode(e.a); }
+        if (k == AK.PostfixUnary()) { return ArgTypeNode(e.a); }
+        if (k == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq() || op == TK.AmpAmp() || op == TK.PipePipe()) {
+                return MkType("bool");
+            }
+            Node lt = ArgTypeNode(e.a);
+            Node rt = ArgTypeNode(e.b);
+            if (IsStr(lt) || IsStr(rt)) { return MkType("string"); }
+            if (lt != null) { return lt; }
+            return rt;
+        }
+        if (k == AK.Index()) {
+            Node ot = ArgTypeNode(e.a);
+            if (ot != null) {
+                if (IsListType(ot)) { return ListElem(ot); }
+                if (ot.sval == "string") { return MkType("char"); }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    string ArgTag(Node e) { Node t = ArgTypeNode(e); if (t == null) { return ""; } return t.sval; }
+
+    // How well candidate `m` fits the call `e`: +1 for matching the caller's
+    // static/instance context, +4 for each exact argument-type match, -1 for a
+    // known mismatch (an implicit conversion may still apply, so it is not
+    // disqualifying). Unknown argument types are neutral.
+    int ScoreCand(Node m, Node e, int argc, bool wantStatic) {
+        int score = 0;
+        if (IsStatic(m) == wantStatic) { score = score + 1; }
+        int a = 0;
+        while (a < argc) {
+            string at = ArgTag(e.kids[a]);
+            if (at != "") {
+                if (at == TypeTag(ParamTypeNode(m, a))) { score = score + 4; }
+                else { score = score - 1; }
+            }
+            a = a + 1;
+        }
+        return score;
+    }
+
+    // Select the method named `name` in `cls` for the call `e`. With a single
+    // candidate the behaviour is unchanged (arity is not consulted, so
+    // default-argument calls still resolve, and the self-host fixed point --
+    // which has no overloads -- emits byte-identical IR). With several
+    // overloads we keep those whose arity admits the call, then pick the best
+    // argument-type match for the caller's static/instance context; an empty
+    // candidate set or a tie is a diagnostic.
+    Node ResolveMethod(Node cls, string name, Node e, bool wantStatic) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) { cands.Add(m); }
+            i = i + 1;
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        int argc = e.kids.Count;
+        List<Node> fit = new List<Node>();
+        i = 0;
+        while (i < cands.Count) {
+            Node m = cands[i];
+            int tot = 0; int req = 0; int j = 0;
+            while (j < m.kids.Count) {
+                if (m.kids[j].kind == AK.Param()) { tot = tot + 1; if (m.kids[j].b == null) { req = req + 1; } }
+                j = j + 1;
+            }
+            if (argc >= req && argc <= tot) { fit.Add(m); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) {
+            diags.Error("no overload of '" + name + "' takes " + argc + " argument(s)", e.line, e.col);
+            return cands[0];
+        }
+        if (fit.Count == 1) { return fit[0]; }
+        bool anyNamed = false;
+        i = 0;
+        while (i < e.kids.Count) { if (e.kids[i].sval2 != "") { anyNamed = true; } i = i + 1; }
+        if (anyNamed) { return fit[0]; }
+        int mx = -2000000000;
+        List<int> sc = new List<int>();
+        i = 0;
+        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, wantStatic); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
+        int cntMax = 0;
+        Node best = fit[0];
+        i = 0;
+        while (i < fit.Count) {
+            if (sc[i] == mx) { if (cntMax == 0) { best = fit[i]; } cntMax = cntMax + 1; }
+            i = i + 1;
+        }
+        if (cntMax > 1) { diags.Error("ambiguous call to overloaded '" + name + "'", e.line, e.col); }
+        return best;
+    }
+
+    // Like ResolveMethod but walks base classes, matching FindMethodUp.
+    Node ResolveMethodUp(Node cls, string name, Node e, bool wantStatic) {
+        Node c = cls;
+        while (c != null) {
+            Node m = ResolveMethod(c, name, e, wantStatic);
+            if (m != null) { return m; }
+            c = BaseClassOf(c);
+        }
+        return null;
     }
 
     // vtable slot method names, base classes first
@@ -1561,6 +1791,7 @@ class Irgen {
         if (e == null) { return new ExprVal("0", MkType("int")); }
         int k = e.kind;
         if (k == AK.IntLit()) { return new ExprVal("" + e.ival, MkType("int")); }
+        if (k == AK.FloatLit()) { return new ExprVal(e.sval, MkType("double")); }
         if (k == AK.BoolLit()) { return new ExprVal("" + e.ival, MkType("bool")); }
         if (k == AK.CharLit()) { return new ExprVal("" + e.ival, MkType("char")); }
         if (k == AK.StringLit()) { return GenStr(e.sval); }
@@ -1632,6 +1863,11 @@ class Irgen {
             return new ExprVal(z, MkType("bool"));
         }
         if (e.op == TK.Minus()) {
+            if (IsDbl(v.ty)) {
+                string t = NT();
+                L("  " + t + " = fneg double " + v.op);
+                return new ExprVal(t, MkType("double"));
+            }
             string t = NT();
             L("  " + t + " = sub i64 0, " + v.op);
             return new ExprVal(t, MkType("int"));
@@ -1642,6 +1878,14 @@ class Irgen {
     ExprVal GenPostfix(Node e) {
         // x++ / x-- : return old value, update slot
         ExprVal cur = GenExpr(e.a);
+        if (IsDbl(cur.ty)) {
+            string t = NT();
+            string opn = "fadd";
+            if (e.op == TK.MinusMinus()) { opn = "fsub"; }
+            L("  " + t + " = " + opn + " double " + cur.op + ", 1.0");
+            StoreTo(e.a, new ExprVal(t, MkType("double")));
+            return cur;
+        }
         string t = NT();
         string opn = "add";
         if (e.op == TK.MinusMinus()) { opn = "sub"; }
@@ -1669,6 +1913,34 @@ class Irgen {
     }
 
     bool IsStr(Node ty) { if (ty == null) { return false; } return ty.sval == "string"; }
+    // True for a value lowered to LLVM `double` (both double and float here).
+    bool IsDbl(Node ty) { if (ty == null) { return false; } return ty.sval == "double" || ty.sval == "float"; }
+
+    // Floating-point counterparts of ArithOp/CmpOp for `double` operands.
+    string FArithOp(int op) {
+        if (op == TK.Plus()) { return "fadd"; }
+        if (op == TK.Minus()) { return "fsub"; }
+        if (op == TK.Star()) { return "fmul"; }
+        if (op == TK.Slash()) { return "fdiv"; }
+        if (op == TK.Percent()) { return "frem"; }
+        return "";
+    }
+    string FCmpOp(int op) {
+        if (op == TK.EqEq()) { return "oeq"; }
+        if (op == TK.BangEq()) { return "one"; }
+        if (op == TK.Less()) { return "olt"; }
+        if (op == TK.Greater()) { return "ogt"; }
+        if (op == TK.LessEq()) { return "ole"; }
+        if (op == TK.GreaterEq()) { return "oge"; }
+        return "";
+    }
+    // Materialise `v` as an LLVM `double`, widening an integer operand via sitofp.
+    string AsDouble(ExprVal v) {
+        if (IsDbl(v.ty)) { return v.op; }
+        string t = NT();
+        L("  " + t + " = sitofp i64 " + v.op + " to double");
+        return t;
+    }
 
     bool IsFoldOp(int op) {
         return op == TK.Plus() || op == TK.Minus() || op == TK.Star() || op == TK.Slash() || op == TK.Percent();
@@ -1751,6 +2023,25 @@ class Irgen {
         // user-defined operator overloading takes precedence for class operands
         ExprVal ov = TryOpOverload(op, a, b);
         if (ov != null) { return ov; }
+        // floating-point arithmetic/comparison (string `+` concatenation wins)
+        if ((IsDbl(a.ty) || IsDbl(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty))) {
+            string da = AsDouble(a);
+            string db = AsDouble(b);
+            string fop = FArithOp(op);
+            if (fop != "") {
+                string t = NT();
+                L("  " + t + " = " + fop + " double " + da + ", " + db);
+                return new ExprVal(t, MkType("double"));
+            }
+            string fcp = FCmpOp(op);
+            if (fcp != "") {
+                string c = NT();
+                L("  " + c + " = fcmp " + fcp + " double " + da + ", " + db);
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+        }
         // addition: concatenate when either operand is a string, else integer add
         if (op == TK.Plus()) {
             if (IsStr(a.ty) || IsStr(b.ty)) {
@@ -1852,6 +2143,19 @@ class Irgen {
     // coerce a value to i8* string form (numbers via snprintf)
     string ToCStr(ExprVal v) {
         if (IsStr(v.ty)) { return v.op; }
+        // double -> string (via snprintf "%g")
+        if (IsDbl(v.ty)) {
+            string dneed = NT();
+            L("  " + dneed + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
+            string dneed64 = NT();
+            L("  " + dneed64 + " = sext i32 " + dneed + " to i64");
+            string dbsz = NT();
+            L("  " + dbsz + " = add i64 " + dneed64 + ", 1");
+            string dbuf = NT();
+            L("  " + dbuf + " = call i8* @malloc(i64 " + dbsz + ")");
+            L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + dbuf + ", i64 " + dbsz + ", i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
+            return dbuf;
+        }
         // integer -> string
         string need = NT();
         L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.fmt.nn, i64 0, i64 0), i64 " + v.op + ")");
@@ -1891,6 +2195,19 @@ class Irgen {
             ExprVal cc = StrConcat(ToCStr(cur), ToCStr(r));
             StoreTo(e.a, cc);
             return cc;
+        }
+        if (IsDbl(cur.ty) || IsDbl(r.ty)) {
+            string da = AsDouble(cur);
+            string db = AsDouble(r);
+            string fopn = "fadd";
+            if (e.op == TK.MinusEq()) { fopn = "fsub"; }
+            if (e.op == TK.StarEq()) { fopn = "fmul"; }
+            if (e.op == TK.SlashEq()) { fopn = "fdiv"; }
+            string ft = NT();
+            L("  " + ft + " = " + fopn + " double " + da + ", " + db);
+            ExprVal fnv = new ExprVal(ft, MkType("double"));
+            StoreTo(e.a, fnv);
+            return fnv;
         }
         string opn = "add";
         if (e.op == TK.MinusEq()) { opn = "sub"; }
@@ -1980,7 +2297,7 @@ class Irgen {
             thisOp = bc;
         }
         Node pty = ParamTypeNode(m, 0);
-        L("  call void @" + owner + "_set_" + name + "(%" + owner + "* " + thisOp
+        L("  call void @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
             + ", " + MapType(pty) + " " + CallArg(v, pty) + ")");
         return true;
     }
@@ -2014,6 +2331,11 @@ class Irgen {
     string ToSlot(ExprVal v, Node elemTy) {
         string lt = MapType(elemTy);
         if (lt == "i64") { return v.op; }
+        if (lt == "double") {
+            string tb = NT();
+            L("  " + tb + " = bitcast double " + v.op + " to i64");
+            return tb;
+        }
         if (v.op == "null") { return "0"; }
         string t = NT();
         L("  " + t + " = ptrtoint " + lt + " " + v.op + " to i64");
@@ -2024,6 +2346,10 @@ class Irgen {
         string lt = MapType(elemTy);
         if (lt == "i64") { return new ExprVal(slot, elemTy); }
         string t = NT();
+        if (lt == "double") {
+            L("  " + t + " = bitcast i64 " + slot + " to double");
+            return new ExprVal(t, elemTy);
+        }
         L("  " + t + " = inttoptr i64 " + slot + " to " + lt);
         return new ExprVal(t, elemTy);
     }
@@ -2326,8 +2652,23 @@ class Irgen {
     // ---- cast ----
     ExprVal GenCast(Node e) {
         ExprVal v = GenExpr(e.b);
-        // numeric casts are all i64 in this model; just retag
-        return new ExprVal(v.op, e.type);
+        Node tgt = e.type;
+        bool toD = IsDbl(tgt);
+        bool fromD = IsDbl(v.ty);
+        // int -> double
+        if (toD && !fromD && MapType(v.ty) == "i64") {
+            string t = NT();
+            L("  " + t + " = sitofp i64 " + v.op + " to double");
+            return new ExprVal(t, tgt);
+        }
+        // double -> int (truncating toward zero)
+        if (fromD && !toD && MapType(tgt) == "i64") {
+            string t = NT();
+            L("  " + t + " = fptosi double " + v.op + " to i64");
+            return new ExprVal(t, tgt);
+        }
+        // remaining numeric casts are all i64 in this model; just retag
+        return new ExprVal(v.op, tgt);
     }
 
     // switch expression:  subj switch { pat => e, _ => e }. Constant patterns
@@ -2716,15 +3057,22 @@ class Irgen {
                 ExprVal path = GenExpr(e.kids[0]);
                 string rb = NT(); L("  " + rb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_rb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + rb + ")");
-                L("  call i32 @fseek(i8* " + fp + ", i64 0, i32 2)");
+                EmitFopenCheck(fp, "@.msg.rderr", 18);
+                string se0 = NT(); L("  " + se0 + " = call i32 @fseek(i8* " + fp + ", i64 0, i32 2)");
+                string se0c = NT(); L("  " + se0c + " = icmp ne i32 " + se0 + ", 0"); EmitAbortIf(se0c, "@.msg.rderr", 18);
                 string sz = NT(); L("  " + sz + " = call i64 @ftell(i8* " + fp + ")");
-                L("  call i32 @fseek(i8* " + fp + ", i64 0, i32 0)");
+                string szc = NT(); L("  " + szc + " = icmp slt i64 " + sz + ", 0"); EmitAbortIf(szc, "@.msg.rderr", 18);
+                string se1 = NT(); L("  " + se1 + " = call i32 @fseek(i8* " + fp + ", i64 0, i32 0)");
+                string se1c = NT(); L("  " + se1c + " = icmp ne i32 " + se1 + ", 0"); EmitAbortIf(se1c, "@.msg.rderr", 18);
                 string bsz = NT(); L("  " + bsz + " = add i64 " + sz + ", 1");
                 string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
-                L("  call i64 @fread(i8* " + buf + ", i64 1, i64 " + sz + ", i8* " + fp + ")");
+                string bufc = NT(); L("  " + bufc + " = icmp eq i8* " + buf + ", null"); EmitAbortIf(bufc, "@.msg.rderr", 18);
+                string got = NT(); L("  " + got + " = call i64 @fread(i8* " + buf + ", i64 1, i64 " + sz + ", i8* " + fp + ")");
+                string gotc = NT(); L("  " + gotc + " = icmp ne i64 " + got + ", " + sz); EmitAbortIf(gotc, "@.msg.rderr", 18);
                 string ep = NT(); L("  " + ep + " = getelementptr i8, i8* " + buf + ", i64 " + sz);
                 L("  store i8 0, i8* " + ep);
-                L("  call i32 @fclose(i8* " + fp + ")");
+                string rc = NT(); L("  " + rc + " = call i32 @fclose(i8* " + fp + ")");
+                string rcc = NT(); L("  " + rcc + " = icmp ne i32 " + rc + ", 0"); EmitAbortIf(rcc, "@.msg.rderr", 18);
                 return new ExprVal(buf, MkType("string"));
             }
             if (cn == "File" && mn == "WriteAllText") {
@@ -2732,9 +3080,12 @@ class Irgen {
                 ExprVal content = GenExpr(e.kids[1]);
                 string wb = NT(); L("  " + wb + " = getelementptr inbounds [2 x i8], [2 x i8]* @.mode_wb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + wb + ")");
+                EmitFopenCheck(fp, "@.msg.wrerr", 19);
                 string ln = NT(); L("  " + ln + " = call i64 @strlen(i8* " + content.op + ")");
-                L("  call i64 @fwrite(i8* " + content.op + ", i64 1, i64 " + ln + ", i8* " + fp + ")");
-                L("  call i32 @fclose(i8* " + fp + ")");
+                string wr = NT(); L("  " + wr + " = call i64 @fwrite(i8* " + content.op + ", i64 1, i64 " + ln + ", i8* " + fp + ")");
+                string wrc = NT(); L("  " + wrc + " = icmp ne i64 " + wr + ", " + ln); EmitAbortIf(wrc, "@.msg.wrerr", 19);
+                string wrcl = NT(); L("  " + wrcl + " = call i32 @fclose(i8* " + fp + ")");
+                string wrclc = NT(); L("  " + wrclc + " = icmp ne i32 " + wrcl + ", 0"); EmitAbortIf(wrclc, "@.msg.wrerr", 19);
                 return new ExprVal("0", MkType("void"));
             }
         }
@@ -2751,6 +3102,12 @@ class Irgen {
                 string gp = NT();
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + arg.op + ")");
+            } else if (has && IsDbl(arg.ty)) {
+                string fg = "@.fmt.gn"; int fl = 3;
+                if (nl) { fg = "@.fmt.gnl"; fl = 4; }
+                string gp = NT();
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", double " + arg.op + ")");
             } else {
                 string fg = "@.fmt.nn"; int fl = 5;
                 if (nl) { fg = "@.fmt.nl"; fl = 6; }
@@ -2859,6 +3216,10 @@ class Irgen {
             i = i + 1;
         }
         int np = pnames.Count;
+        if (e.kids.Count > np) {
+            diags.Error("too many arguments to '" + m.sval + "' (expected "
+                + np + ", got " + e.kids.Count + ")", e.line, e.col);
+        }
         bool anyNamed = false;
         int j = 0;
         while (j < e.kids.Count) { if (e.kids[j].sval2 != "") { anyNamed = true; } j = j + 1; }
@@ -2882,7 +3243,11 @@ class Irgen {
         while (k < np) {
             if (slots[k] == null) {
                 if (pdefault[k] != null) { slots[k] = pdefault[k]; }
-                else { Node z = new Node(AK.IntLit()); z.ival = 0; slots[k] = z; }
+                else {
+                    diags.Error("missing required argument for parameter '"
+                        + pnames[k] + "' of '" + m.sval + "'", e.line, e.col);
+                    Node z = new Node(AK.IntLit()); z.ival = 0; slots[k] = z;
+                }
             }
             k = k + 1;
         }
@@ -2891,7 +3256,9 @@ class Irgen {
 
     ExprVal EmitStaticCall(string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
-        Node m = binder.FindMethod(cls, name);
+        Node m = ResolveMethod(cls, name, e, true);
+        string sym = clsName + "_" + name;
+        if (m != null) { sym = MethodSym(clsName, m); }
         string rt = "i64";
         if (m != null) { rt = MapType(m.type); }
         string args = "";
@@ -2905,11 +3272,11 @@ class Irgen {
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + clsName + "_" + name + "(" + args + ")");
+            L("  call void @" + sym + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + clsName + "_" + name + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, m.type); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);
@@ -2929,11 +3296,11 @@ class Irgen {
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + owner + "_" + m.sval + "(" + args + ")");
+            L("  call void @" + MethodSym(owner, m) + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + owner + "_" + m.sval + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + MethodSym(owner, m) + "(" + args + ")");
         if (IsErasedType(m.type)) { return FromSlot(t, m.type); }
         AddTemp(t, m.type);
         return new ExprVal(t, m.type);
@@ -2941,12 +3308,14 @@ class Irgen {
 
     ExprVal EmitInstanceCall(ExprVal recv, string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
-        Node m = FindMethodUp(cls, name);
+        Node m = ResolveMethodUp(cls, name, e, false);
         if (m != null && IsPolyClass(cls) && VSlotIndex(cls, name) >= 0) {
             return EmitVirtualCall(recv, cls, name, m, e);
         }
         string owner = MethodOwner(cls, name);
         if (owner == "") { owner = clsName; }
+        string sym = owner + "_" + name;
+        if (m != null) { sym = MethodSym(owner, m); }
         string thisOp = recv.op;
         if (owner != clsName) {
             string bc = NT();
@@ -2965,11 +3334,11 @@ class Irgen {
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + owner + "_" + name + "(" + args + ")");
+            L("  call void @" + sym + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + owner + "_" + name + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);

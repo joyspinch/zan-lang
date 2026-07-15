@@ -1,0 +1,336 @@
+using System;
+
+namespace Game.Legend2;
+
+class Legend2ItemInstance {
+    Legend2ItemDefinition definition;
+    int quantity;
+
+    static Legend2ItemInstance Create(
+        Legend2ItemDefinition definition,
+        int quantity
+    ) {
+        Legend2ItemInstance item = new Legend2ItemInstance();
+        item.definition = definition;
+        item.quantity = quantity;
+        return item;
+    }
+
+    Legend2ItemDefinition Definition() { return this.definition; }
+    int Quantity() { return this.quantity; }
+    bool IsEmpty() { return this.quantity <= 0; }
+
+    int Add(int count) {
+        if (count <= 0) { return 0; }
+        int room = this.definition.MaxStack() - this.quantity;
+        int added = count;
+        if (added > room) { added = room; }
+        this.quantity = this.quantity + added;
+        return added;
+    }
+
+    int Remove(int count) {
+        if (count <= 0) { return 0; }
+        int removed = count;
+        if (removed > this.quantity) { removed = this.quantity; }
+        this.quantity = this.quantity - removed;
+        return removed;
+    }
+}
+
+/// <summary>Stacking slot inventory used by actors and bag controls.</summary>
+class Legend2Inventory {
+    int capacity;
+    List<Legend2ItemInstance> slots;
+
+    static Legend2Inventory Create(int capacity) {
+        Legend2Inventory inventory = new Legend2Inventory();
+        inventory.capacity = Legend2Math.Max(1, capacity);
+        inventory.slots = new List<Legend2ItemInstance>();
+        return inventory;
+    }
+
+    int Capacity() { return this.capacity; }
+    int SlotCount() { return this.slots.Count; }
+    Legend2ItemInstance SlotAt(int index) { return this.slots[index]; }
+    bool IsFull() { return this.slots.Count >= this.capacity; }
+
+    int QuantityOf(string itemId) {
+        int total = 0;
+        int i = 0;
+        while (i < this.slots.Count) {
+            if (this.slots[i].Definition().Id() == itemId) {
+                total = total + this.slots[i].Quantity();
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    Legend2ItemInstance Find(string itemId) {
+        int i = 0;
+        while (i < this.slots.Count) {
+            if (this.slots[i].Definition().Id() == itemId) {
+                return this.slots[i];
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    int Add(Legend2ItemDefinition definition, int count) {
+        if (definition == null || count <= 0) { return 0; }
+        int remaining = count;
+        int i = 0;
+        while (i < this.slots.Count && remaining > 0) {
+            Legend2ItemInstance item = this.slots[i];
+            if (item.Definition().Id() == definition.Id()) {
+                remaining = remaining - item.Add(remaining);
+            }
+            i = i + 1;
+        }
+        while (remaining > 0 && this.slots.Count < this.capacity) {
+            int stack = remaining;
+            if (stack > definition.MaxStack()) { stack = definition.MaxStack(); }
+            this.slots.Add(Legend2ItemInstance.Create(definition, stack));
+            remaining = remaining - stack;
+        }
+        return count - remaining;
+    }
+
+    bool Remove(string itemId, int count) {
+        if (count <= 0 || this.QuantityOf(itemId) < count) { return false; }
+        int remaining = count;
+        int i = this.slots.Count - 1;
+        while (i >= 0 && remaining > 0) {
+            Legend2ItemInstance item = this.slots[i];
+            if (item.Definition().Id() == itemId) {
+                remaining = remaining - item.Remove(remaining);
+                if (item.IsEmpty()) { this.slots.RemoveAt(i); }
+            }
+            i = i - 1;
+        }
+        return true;
+    }
+}
+
+class Legend2Equipment {
+    List<string> slots;
+    List<Legend2ItemDefinition> items;
+
+    static Legend2Equipment Create() {
+        Legend2Equipment equipment = new Legend2Equipment();
+        equipment.slots = new List<string>();
+        equipment.items = new List<Legend2ItemDefinition>();
+        return equipment;
+    }
+
+    int IndexOf(string slot) {
+        int i = 0;
+        while (i < this.slots.Count) {
+            if (this.slots[i] == slot) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    Legend2ItemDefinition Get(string slot) {
+        int index = this.IndexOf(slot);
+        if (index < 0) { return null; }
+        return this.items[index];
+    }
+
+    bool Equip(
+        string slot,
+        Legend2ItemDefinition definition,
+        Legend2Inventory inventory
+    ) {
+        if (slot == null || slot == "" || definition == null || inventory == null) {
+            return false;
+        }
+        if (definition.Category() != Legend2ItemCategory.Equipment()) {
+            return false;
+        }
+        if (!inventory.Remove(definition.Id(), 1)) { return false; }
+
+        int index = this.IndexOf(slot);
+        if (index >= 0) {
+            Legend2ItemDefinition old = this.items[index];
+            int restored = inventory.Add(old, 1);
+            if (restored != 1) {
+                inventory.Add(definition, 1);
+                return false;
+            }
+            this.items[index] = definition;
+        } else {
+            this.slots.Add(slot);
+            this.items.Add(definition);
+        }
+        return true;
+    }
+
+    bool Unequip(string slot, Legend2Inventory inventory) {
+        int index = this.IndexOf(slot);
+        if (index < 0 || inventory == null) { return false; }
+        Legend2ItemDefinition old = this.items[index];
+        if (inventory.Add(old, 1) != 1) { return false; }
+        this.slots.RemoveAt(index);
+        this.items.RemoveAt(index);
+        return true;
+    }
+
+    int Count() { return this.slots.Count; }
+    string SlotNameAt(int index) { return this.slots[index]; }
+    Legend2ItemDefinition ItemAt(int index) { return this.items[index]; }
+
+    Legend2Attributes Attributes() {
+        Legend2Attributes attributes = Legend2Attributes.Create();
+        int i = 0;
+        while (i < this.items.Count) {
+            attributes.AddModifiersFrom(this.items[i].Attributes());
+            i = i + 1;
+        }
+        return attributes;
+    }
+}
+
+class Legend2Cooldowns {
+    List<string> names;
+    List<int> remaining;
+    List<int> durations;
+
+    static Legend2Cooldowns Create() {
+        Legend2Cooldowns cooldowns = new Legend2Cooldowns();
+        cooldowns.names = new List<string>();
+        cooldowns.remaining = new List<int>();
+        cooldowns.durations = new List<int>();
+        return cooldowns;
+    }
+
+    int IndexOf(string name) {
+        int i = 0;
+        while (i < this.names.Count) {
+            if (this.names[i] == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void Start(string name, int milliseconds) {
+        if (name == null || name == "" || milliseconds <= 0) { return; }
+        int index = this.IndexOf(name);
+        if (index < 0) {
+            this.names.Add(name);
+            this.remaining.Add(milliseconds);
+            this.durations.Add(milliseconds);
+        } else {
+            this.remaining[index] = milliseconds;
+            this.durations[index] = milliseconds;
+        }
+    }
+
+    bool IsReady(string name) {
+        int index = this.IndexOf(name);
+        return index < 0 || this.remaining[index] <= 0;
+    }
+
+    int Remaining(string name) {
+        int index = this.IndexOf(name);
+        if (index < 0) { return 0; }
+        return this.remaining[index];
+    }
+
+    int Progress(string name) {
+        int index = this.IndexOf(name);
+        if (index < 0 || this.remaining[index] <= 0) { return 100; }
+        int duration = this.durations[index];
+        if (duration <= 0) { return 100; }
+        return (duration - this.remaining[index]) * 100 / duration;
+    }
+
+    void Tick(int deltaMilliseconds) {
+        if (deltaMilliseconds <= 0) { return; }
+        int i = this.names.Count - 1;
+        while (i >= 0) {
+            this.remaining[i] = this.remaining[i] - deltaMilliseconds;
+            if (this.remaining[i] <= 0) {
+                this.names.RemoveAt(i);
+                this.remaining.RemoveAt(i);
+                this.durations.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+    }
+}
+
+/// <summary>Small deterministic RNG suitable for replays and tests.</summary>
+class Legend2Random {
+    int state;
+
+    static Legend2Random Create(int seed) {
+        Legend2Random random = new Legend2Random();
+        random.state = seed & 2147483647;
+        if (random.state == 0) { random.state = 1; }
+        return random;
+    }
+
+    int Next() {
+        this.state = (this.state * 1103515245 + 12345) & 2147483647;
+        return this.state;
+    }
+
+    int NextPercent() { return this.Next() % 100 + 1; }
+}
+
+class Legend2Combat {
+    static int GridDistance(Legend2Actor left, Legend2Actor right) {
+        int dx = left.GridX() - right.GridX();
+        int dy = left.GridY() - right.GridY();
+        if (dx < 0) { dx = -dx; }
+        if (dy < 0) { dy = -dy; }
+        return Legend2Math.Max(dx, dy);
+    }
+
+    static bool IsValidTarget(
+        Legend2Actor caster,
+        Legend2Actor target,
+        string targetFaction
+    ) {
+        if (caster == null || target == null || !target.IsAlive()) { return false; }
+        if (targetFaction == Legend2Faction.Any()) { return true; }
+        if (targetFaction == Legend2Faction.Friendly()) {
+            return caster.Faction() == target.Faction();
+        }
+        if (targetFaction == Legend2Faction.Hostile()) {
+            return caster.Faction() != target.Faction();
+        }
+        return target.Faction() == targetFaction;
+    }
+
+    static int HitChance(Legend2Actor caster, Legend2Actor target) {
+        Legend2Attributes source = caster.EffectiveAttributes();
+        Legend2Attributes destination = target.EffectiveAttributes();
+        double denominator = source.Accuracy() + destination.Evasion();
+        if (denominator <= 0.0) { return 100; }
+        int chance = (int)(source.Accuracy() / denominator * 100.0);
+        return Legend2Math.Clamp(chance, 0, 100);
+    }
+
+    static double Damage(
+        Legend2Actor caster,
+        Legend2Actor target,
+        Legend2SkillDefinition skill,
+        bool critical
+    ) {
+        Legend2Attributes source = caster.EffectiveAttributes();
+        Legend2Attributes destination = target.EffectiveAttributes();
+        double attack = source.GetCustom("attack");
+        double defense = destination.GetCustom("defense");
+        double damage = attack * skill.DamageFactor() - defense;
+        if (damage < 1.0) { damage = 1.0; }
+        if (critical) {
+            damage = damage * source.CriticalDamage() / 100.0;
+        }
+        return damage;
+    }
+}

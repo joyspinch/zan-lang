@@ -1,0 +1,320 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// High-level, self-contained select / dropdown.
+///
+/// Retained (create once, keep across frames). A single Render() draws the
+/// trigger AND the popup, and owns open/close, the option list, single- or
+/// multi-selection, an optional clear button, size and status variants, and a
+/// self-scrolling popup (mouse wheel + scrollbar + clipping) when the option
+/// list is long — so the call site is just:
+///
+///   SelectBox city = SelectBox.Create("Pick a city");   // once
+///   city.AddOption("London"); city.AddOption("Paris");
+///
+///   city.Render(app, x, y, w);                           // each frame
+///   int i = city.Selected();          // -1 if none
+///   string text = city.Text();
+///
+/// Multi-select: SelectBox.Multi(hint) + IsChosen(i). Fluent config:
+///   SelectBox.Create(hint).Clearable(true).Size(SelectBox.Large())
+///                         .Status(SelectBox.Error())
+/// </summary>
+class SelectBox {
+    List<string> options;
+    List<bool> chosen;
+    int selected;
+    string hint;
+    bool multi;
+    bool clearable;
+    bool open;
+    int scrollY;
+    int size;
+    int status;
+    int maxVisible;
+
+    static int Small() { return 0; }
+    static int Medium() { return 1; }
+    static int Large() { return 2; }
+
+    static int Normal() { return 0; }
+    static int Success() { return 1; }
+    static int Warning() { return 2; }
+    static int Error() { return 3; }
+
+    static SelectBox Make(string hintText, bool isMulti) {
+        SelectBox s = new SelectBox();
+        s.options = new List<string>();
+        s.chosen = new List<bool>();
+        s.selected = 0 - 1;
+        s.hint = hintText;
+        s.multi = isMulti;
+        s.clearable = false;
+        s.open = false;
+        s.scrollY = 0;
+        s.size = 1;
+        s.status = 0;
+        s.maxVisible = 6;
+        return s;
+    }
+
+    static SelectBox Create(string hintText) {
+        return SelectBox.Make(hintText, false);
+    }
+
+    static SelectBox Multi(string hintText) {
+        return SelectBox.Make(hintText, true);
+    }
+
+    void AddOption(string label) {
+        options.Add(label);
+        chosen.Add(false);
+    }
+
+    SelectBox Clearable(bool v) {
+        clearable = v;
+        return this;
+    }
+
+    SelectBox Size(int v) {
+        size = v;
+        return this;
+    }
+
+    SelectBox Status(int v) {
+        status = v;
+        return this;
+    }
+
+    int Selected() {
+        return selected;
+    }
+
+    bool IsChosen(int i) {
+        if (i < 0 || i >= chosen.Count) { return false; }
+        return chosen[i];
+    }
+
+    bool HasValue() {
+        if (multi) {
+            int i = 0;
+            while (i < chosen.Count) {
+                if (chosen[i]) { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        return selected >= 0 && selected < options.Count;
+    }
+
+    void Clear() {
+        selected = 0 - 1;
+        int i = 0;
+        while (i < chosen.Count) {
+            chosen[i] = false;
+            i = i + 1;
+        }
+    }
+
+    string Text() {
+        if (multi) {
+            string acc = "";
+            int i = 0;
+            while (i < options.Count) {
+                if (chosen[i]) {
+                    if (acc != "") { acc = acc + ", "; }
+                    acc = acc + options[i];
+                }
+                i = i + 1;
+            }
+            return acc;
+        }
+        if (selected >= 0 && selected < options.Count) { return options[selected]; }
+        return "";
+    }
+
+    int HeadHeight(Theme t) {
+        if (size == 0) { return t.heightSmall; }
+        if (size == 2) { return t.heightLarge; }
+        return t.heightMedium;
+    }
+
+    int FontSize(Theme t) {
+        if (size == 0) { return t.fontSizeSmall; }
+        if (size == 2) { return t.fontSizeLarge; }
+        return t.fontSizeMedium;
+    }
+
+    int StatusBorder(Theme t, bool hot) {
+        if (status == 1) { return t.success; }
+        if (status == 2) { return t.warning; }
+        if (status == 3) { return t.error; }
+        if (hot) { return t.borderHover; }
+        return t.borderPrimary;
+    }
+
+    void Render(App app, int x, int y, int w) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int h = this.HeadHeight(t);
+        int fs = this.FontSize(t);
+        int optH = h;
+
+        int ek = app.window.EventKind();
+        int eb = app.window.EventButton();
+        bool leftUp = ek == 3 && eb == 0;
+
+        bool overHead = app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
+
+        // Popup geometry (below the trigger).
+        int visRows = options.Count;
+        if (visRows > maxVisible) { visRows = maxVisible; }
+        int viewH = visRows * optH;
+        int contentH = options.Count * optH;
+        int popX = x;
+        int popY = y + h + app.Scale(4);
+
+        bool overPopup = open && app.mouseX >= popX && app.mouseX < popX + w
+            && app.mouseY >= popY && app.mouseY < popY + viewH;
+
+        // Clear button geometry (left of the arrow) when there is a value.
+        int arrowSlot = t.paddingLarge + t.iconSizeSmall;
+        int clearX = x + w - arrowSlot - t.iconSizeSmall - t.paddingSmall;
+        bool showClear = clearable && this.HasValue() && overHead;
+        bool overClear = showClear && app.mouseX >= clearX
+            && app.mouseX < clearX + t.iconSizeSmall;
+
+        // ---- trigger ----
+        int border = this.StatusBorder(t, overHead || open);
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, h, border, 1);
+
+        int textY = y + (h - Canvas.FontHeight(fs)) / 2;
+        int headMaxW = w - t.paddingSmall - arrowSlot - t.paddingSmall;
+        if (showClear) { headMaxW = headMaxW - t.iconSizeSmall - t.paddingSmall; }
+        string shown = this.Text();
+        if (shown == "") {
+            c.DrawText(x + t.paddingSmall, textY,
+                Ellipsis.Fit(hint, headMaxW, fs), t.textTertiary, fs);
+        } else {
+            c.DrawText(x + t.paddingSmall, textY,
+                Ellipsis.Fit(shown, headMaxW, fs), t.textPrimary, fs);
+        }
+
+        if (showClear) {
+            int cc = t.textTertiary;
+            if (overClear) { cc = t.error; }
+            Icon.DrawCenteredIn(c, "close", clearX, y, t.iconSizeSmall, h,
+                t.iconSizeSmall, cc);
+        }
+        Icon.DrawCenteredIn(c, "arrow-down", x + w - arrowSlot, y,
+            t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
+
+        // ---- input ----
+        if (leftUp) {
+            if (open) {
+                if (overPopup) {
+                    int rel = app.mouseY - popY + scrollY;
+                    int idx = rel / optH;
+                    if (idx >= 0 && idx < options.Count) {
+                        if (multi) {
+                            chosen[idx] = !chosen[idx];
+                        } else {
+                            selected = idx;
+                            open = false;
+                        }
+                        app.RequestRedraw();
+                    }
+                } else {
+                    // Click on the header or anywhere outside closes.
+                    open = false;
+                    app.RequestRedraw();
+                }
+            } else {
+                if (overClear) {
+                    this.Clear();
+                    app.RequestRedraw();
+                } else if (overHead) {
+                    open = true;
+                    scrollY = 0;
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        if (!open) { return; }
+
+        // ---- popup ----
+        int maxScroll = contentH - viewH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (overPopup) {
+            app.CaptureWheel(popX, popY, w, viewH);
+            if (ek == 13) {
+                int d = app.window.EventKeyCode();
+                scrollY = scrollY - d * app.scrollSpeed / 120;
+                app.RequestRedraw();
+            }
+        }
+        if (scrollY > maxScroll) { scrollY = maxScroll; }
+        if (scrollY < 0) { scrollY = 0; }
+
+        c.FillRoundRect(popX + 1, popY + 2, w, viewH, t.borderRadiusMedium, t.shadowColor);
+        c.FillRoundRect(popX, popY, w, viewH, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(popX, popY, w, viewH, t.borderPrimary, 1);
+        app.BlockHitsRect(popX, popY, w, viewH);
+
+        c.PushClip(popX, popY, w, viewH);
+        int i = 0;
+        while (i < options.Count) {
+            int oy = popY + i * optH - scrollY;
+            if (oy + optH > popY && oy < popY + viewH) {
+                bool overRow = overPopup && app.mouseX >= popX && app.mouseX < popX + w
+                    && app.mouseY >= oy && app.mouseY < oy + optH;
+                bool isSel = false;
+                if (multi) { isSel = chosen[i]; }
+                else { isSel = i == selected; }
+
+                if (States.HasBg(overRow, false, isSel, false)) {
+                    c.FillRect(popX + 1, oy, w - 2, optH,
+                        States.Bg(t, overRow, false, isSel, false));
+                }
+                int tc = States.Text(t, isSel, false);
+                int oMaxW = w - t.paddingSmall - arrowSlot - t.paddingSmall;
+                c.DrawText(popX + t.paddingSmall,
+                    oy + (optH - Canvas.FontHeight(fs)) / 2,
+                    Ellipsis.Fit(options[i], oMaxW, fs), tc, fs);
+                if (isSel) {
+                    Icon.DrawCenteredIn(c, "check", popX + w - arrowSlot, oy,
+                        t.iconSizeSmall, optH, t.iconSizeSmall, t.primary);
+                }
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+
+        // Popup scrollbar (clipped to the popup, clamped to its track).
+        if (contentH > viewH && viewH > 0) {
+            int barW = app.Scale(6);
+            int bx = popX + w - barW - app.Scale(2);
+            int minThumb = app.Scale(24);
+            if (minThumb > viewH) { minThumb = viewH; }
+            int thumbH = viewH * viewH / contentH;
+            if (thumbH < minThumb) { thumbH = minThumb; }
+            if (thumbH > viewH) { thumbH = viewH; }
+            int travel = viewH - thumbH;
+            if (travel < 0) { travel = 0; }
+            int thumbY = popY;
+            if (maxScroll > 0) { thumbY = popY + scrollY * travel / maxScroll; }
+            if (thumbY < popY) { thumbY = popY; }
+            if (thumbY + thumbH > popY + viewH) { thumbY = popY + viewH - thumbH; }
+            c.PushClip(popX, popY, w, viewH);
+            c.FillRoundRect(bx, thumbY, barW, thumbH, barW / 2, t.scrollbar);
+            c.PopClip();
+        }
+    }
+}

@@ -350,7 +350,34 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                 current_class[nlen] = '\0';
                 class_brace = brace_depth;
 
-                add_symbol_ex(is, current_class, NULL, current_ns, NULL, filepath,
+                /* Capture the first base type after optional generic params
+                 * and a ':' so member completion can walk the inheritance
+                 * chain. Stored in the class symbol's type_name field. */
+                char base[128] = {0};
+                {
+                    const char *q = p;
+                    while (q < end && (*q == ' ' || *q == '\t')) q++;
+                    if (q < end && *q == '<') {
+                        int a = 1; q++;
+                        while (q < end && a > 0) {
+                            if (*q == '<') a++;
+                            else if (*q == '>') a--;
+                            q++;
+                        }
+                    }
+                    while (q < end && (*q == ' ' || *q == '\t')) q++;
+                    if (q < end && *q == ':') {
+                        q++;
+                        while (q < end && (*q == ' ' || *q == '\t')) q++;
+                        const char *b = q;
+                        while (q < end && (isalnum((unsigned char)*q) || *q == '_' || *q == '.')) q++;
+                        int blen = (int)(q - b);
+                        if (blen > 127) blen = 127;
+                        if (blen > 0) { memcpy(base, b, (size_t)blen); base[blen] = '\0'; }
+                    }
+                }
+
+                add_symbol_ex(is, current_class, base[0] ? base : NULL, current_ns, NULL, filepath,
                              last_doc_comment[0] ? last_doc_comment : NULL,
                              kind, line_num, (int)(name - content), false, 0);
                 last_doc_comment[0] = '\0';
@@ -446,12 +473,18 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                         char params_buf[256] = {0};
                         int pb_len = 0;
                         int paren = 1;
+                        int nest = 0;
                         p++;
                         const char *params_start = p;
                         while (p < end && paren > 0) {
                             if (*p == '(') paren++;
                             else if (*p == ')') paren--;
-                            else if (*p == ',' && paren == 1) param_count++;
+                            else if (*p == '[' || *p == '{') nest++;
+                            else if (*p == ']' || *p == '}') { if (nest > 0) nest--; }
+                            else if (*p == '<' && p > params_start &&
+                                     (isalnum((unsigned char)p[-1]) || p[-1] == '_')) nest++;
+                            else if (*p == '>' && nest > 0) nest--;
+                            else if (*p == ',' && paren == 1 && nest == 0) param_count++;
                             if (*p == '\n') line_num++;
                             p++;
                         }
@@ -592,6 +625,19 @@ const char *intel_resolve_type(intellisense_t *is, const char *var_name) {
     return NULL;
 }
 
+/* Return the base type of a user-defined class/struct, or NULL. */
+static const char *class_base(intellisense_t *is, const char *cls) {
+    for (int i = 0; i < is->symbol_count; i++) {
+        isym_t *sym = &is->symbols[i];
+        if ((sym->kind == ISYM_CLASS || sym->kind == ISYM_STRUCT ||
+             sym->kind == ISYM_INTERFACE) &&
+            strcmp(sym->name, cls) == 0) {
+            return sym->type_name[0] ? sym->type_name : NULL;
+        }
+    }
+    return NULL;
+}
+
 /* Complete members of a given type */
 int intel_complete_members(intellisense_t *is, const char *type_name,
                            const char *prefix) {
@@ -600,30 +646,45 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
 
     size_t plen = prefix ? strlen(prefix) : 0;
 
-    /* Check user-defined type members first */
-    for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-        isym_t *sym = &is->symbols[i];
-        if (sym->parent[0] == '\0') continue;
-        if (strcmp(sym->parent, type_name) != 0) continue;
-        if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
-            sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
-            continue;
+    /* Check user-defined type members, walking the inheritance chain so
+     * inherited members from base classes are offered too. */
+    const char *cls = type_name;
+    int guard = 0;
+    while (cls && cls[0] && guard < 16 &&
+           is->completion_count < INTEL_MAX_COMPLETIONS) {
+        for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            isym_t *sym = &is->symbols[i];
+            if (sym->parent[0] == '\0') continue;
+            if (strcmp(sym->parent, cls) != 0) continue;
+            if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
+                sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
+                continue;
 
-        if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
+            if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
 
-        completion_t *c = &is->completions[is->completion_count++];
-        strncpy(c->label, sym->name, sizeof(c->label) - 1);
-        if (sym->kind == ISYM_METHOD)
-            snprintf(c->insert_text, sizeof(c->insert_text), "%s(", sym->name);
-        else
-            strncpy(c->insert_text, sym->name, sizeof(c->insert_text) - 1);
-        if (sym->signature[0])
-            strncpy(c->detail, sym->signature, sizeof(c->detail) - 1);
-        else
-            snprintf(c->detail, sizeof(c->detail), "%s.%s : %s", type_name, sym->name, sym->type_name);
-        strncpy(c->doc, sym->doc, sizeof(c->doc) - 1);
-        c->kind = sym->kind;
-        c->sort_priority = 0;
+            /* skip members already added (e.g. overridden in a derived class) */
+            bool dup = false;
+            for (int k = 0; k < is->completion_count; k++) {
+                if (strcmp(is->completions[k].label, sym->name) == 0) { dup = true; break; }
+            }
+            if (dup) continue;
+
+            completion_t *c = &is->completions[is->completion_count++];
+            strncpy(c->label, sym->name, sizeof(c->label) - 1);
+            if (sym->kind == ISYM_METHOD)
+                snprintf(c->insert_text, sizeof(c->insert_text), "%s(", sym->name);
+            else
+                strncpy(c->insert_text, sym->name, sizeof(c->insert_text) - 1);
+            if (sym->signature[0])
+                strncpy(c->detail, sym->signature, sizeof(c->detail) - 1);
+            else
+                snprintf(c->detail, sizeof(c->detail), "%s.%s : %s", cls, sym->name, sym->type_name);
+            strncpy(c->doc, sym->doc, sizeof(c->doc) - 1);
+            c->kind = sym->kind;
+            c->sort_priority = (guard == 0) ? 0 : 1;
+        }
+        cls = class_base(is, cls);
+        guard++;
     }
 
     /* Check stdlib classes */
@@ -939,17 +1000,35 @@ signature_info_t intel_signature_help(intellisense_t *is, const char *method_nam
             memcpy(params_copy, pstart, (size_t)plen2);
             params_copy[plen2] = '\0';
 
-            /* Split by commas */
+            /* Split by top-level commas (ignore commas nested in generics,
+             * arrays/blocks, or parentheses so param types like
+             * Dictionary<string,int> stay intact). */
             char *tok = params_copy;
             while (*tok && sig.param_count < INTEL_MAX_PARAMS) {
                 while (*tok == ' ') tok++;
-                char *comma = strchr(tok, ',');
+                char *comma = NULL;
+                int nest = 0;
+                for (char *q = tok; *q; q++) {
+                    if (*q == '(' || *q == '[' || *q == '{') nest++;
+                    else if (*q == ')' || *q == ']' || *q == '}') { if (nest > 0) nest--; }
+                    else if (*q == '<' && q > tok &&
+                             (isalnum((unsigned char)q[-1]) || q[-1] == '_')) nest++;
+                    else if (*q == '>' && nest > 0) nest--;
+                    else if (*q == ',' && nest == 0) { comma = q; break; }
+                }
                 int tlen = comma ? (int)(comma - tok) : (int)strlen(tok);
                 if (tlen > 0) {
                     char param_str[128];
                     if (tlen > 127) tlen = 127;
                     memcpy(param_str, tok, (size_t)tlen);
                     param_str[tlen] = '\0';
+
+                    /* drop a default value if present ("Type name = expr") */
+                    char *eq = strchr(param_str, '=');
+                    if (eq) {
+                        while (eq > param_str && eq[-1] == ' ') eq--;
+                        *eq = '\0';
+                    }
 
                     /* split "Type name" */
                     char *space = strrchr(param_str, ' ');

@@ -1,0 +1,2315 @@
+using System;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+
+// Zan GUI component gallery.
+//
+// A NaiveUI-style component showcase: a scrollable component navigation on the
+// left, and a detail pane on the right with a short description, a live preview
+// of the component's real states, and a copyable code snippet showing the exact
+// current API. Click "Copy" to place the snippet on the clipboard.
+//
+// Run it from the IDE (Run / F5) or:
+//   zanc --emit-ir examples/gui_gallery/gui_gallery.zan > gallery.ll
+//   clang gallery.ll -o gallery <gui link args>
+
+/// One catalog entry: which category it belongs to, its display name, a short
+/// description, and the code snippet shown (and copied) in the detail pane.
+class Comp {
+    string category;
+    string name;
+    string desc;
+    string code;
+    // Optional JSON config version of the snippet (the data-driven form of the
+    // same demo). Empty when a component has no JSON representation yet.
+    string json;
+    // Multiple demo cards for this component (Naive-UI style). When empty the
+    // page falls back to a single card built from desc/code/json.
+    List<Demo> demos;
+    // Bottom-of-page API documentation.
+    List<ApiRow> props;
+    List<ApiRow> events;
+
+    // Memoised wrap of the page description (fontSizeMedium), rebuilt only when
+    // the content width or font size changes -- see Demo.EnsureCache.
+    string descSig;
+    List<string> descLines;
+
+    static Comp Create(string category, string name, string desc, string code) {
+        Comp e = new Comp();
+        e.category = category;
+        e.name = name;
+        e.desc = desc;
+        e.code = code;
+        e.json = "";
+        e.demos = new List<Demo>();
+        e.props = new List<ApiRow>();
+        e.events = new List<ApiRow>();
+        e.descSig = "";
+        return e;
+    }
+
+    /// Wrapped page-description lines, recomputed only when (width, font) change.
+    List<string> DescLines(int cw, int fs) {
+        string sig = Convert.ToString(cw) + "|" + Convert.ToString(fs);
+        if (sig != descSig) {
+            descSig = sig;
+            descLines = Gallery.WrapText(desc, cw, fs);
+        }
+        return descLines;
+    }
+
+    Comp AddDemo(string title, string desc, string previewId, int previewH,
+            string code, string json) {
+        demos.Add(Demo.Create(title, desc, previewId, previewH, code, json));
+        return this;
+    }
+
+    Comp AddProp(string name, string type, string deflt, string desc) {
+        props.Add(ApiRow.Create(name, type, deflt, desc));
+        return this;
+    }
+
+    Comp AddEvent(string name, string sig, string desc) {
+        events.Add(ApiRow.Create(name, sig, "", desc));
+        return this;
+    }
+
+    static Comp CreateJson(string category, string name, string desc,
+            string code, string json) {
+        Comp e = Comp.Create(category, name, desc, code);
+        e.json = json;
+        return e;
+    }
+}
+
+/// One row in a component's API table: a property (name/type/default/desc) or
+/// an event (name = event, type = signature, deflt unused).
+class ApiRow {
+    string name;
+    string type;
+    string deflt;
+    string desc;
+
+    static ApiRow Create(string name, string type, string deflt, string desc) {
+        ApiRow r = new ApiRow();
+        r.name = name;
+        r.type = type;
+        r.deflt = deflt;
+        r.desc = desc;
+        return r;
+    }
+}
+
+/// One demo card on a component page: a titled block with its own description,
+/// a live preview (keyed by previewId), and its own Zan / JSON snippets.
+class Demo {
+    string title;
+    string desc;
+    string previewId;
+    int previewH;   // unscaled preview box height
+    string code;
+    string json;
+    // Active code tab for THIS card only: 0 = Zan, 1 = JSON. Each card owns
+    // its own tab so toggling one demo's JSON view leaves the others alone.
+    int tab;
+
+    // --- Per-frame render cache -------------------------------------------
+    // Wrapping the description and tokenising the code snippet for syntax
+    // highlighting are pure functions of (content width, code tab, font size),
+    // yet they were recomputed every frame. Memoise them here and only rebuild
+    // when one of those inputs changes (window resize, DPI/theme, tab switch).
+    // Demo objects are retained in Comp.demos, so the cache survives frames.
+    // Highlight spans are stored flat (segText/segColor across all lines, with
+    // segPerLine giving each line's span count) to avoid nested generics.
+    string cacheSig;
+    string cacheSrc;
+    List<string> cacheDescLines;
+    List<string> cacheCodeLines;
+    List<string> cacheSegText;
+    List<int> cacheSegColor;
+    List<int> cacheSegPerLine;
+
+    static Demo Create(string title, string desc, string previewId,
+            int previewH, string code, string json) {
+        Demo d = new Demo();
+        d.title = title;
+        d.desc = desc;
+        d.previewId = previewId;
+        d.previewH = previewH;
+        d.code = code;
+        d.json = json;
+        d.tab = 0;
+        d.cacheSig = "";
+        return d;
+    }
+
+    /// Rebuilds the wrap/highlight cache when (width, tab, font size) change.
+    /// Idempotent within a frame, so callers can invoke it freely.
+    void EnsureCache(App app, Theme t, int cw, int tab) {
+        int fs = t.fontSizeSmall;
+        string sig = Convert.ToString(cw) + "|" + Convert.ToString(tab)
+            + "|" + Convert.ToString(fs) + "|" + Convert.ToString(t.bgPrimary);
+        if (sig == cacheSig) { return; }
+        cacheSig = sig;
+
+        cacheDescLines = Gallery.WrapText(desc, cw, fs);
+
+        string src = code;
+        if (tab == 1) {
+            if (json != "") { src = json; }
+            else { src = "// This demo has no JSON config version yet."; }
+        }
+        cacheSrc = src;
+        cacheCodeLines = CodeEditor.SplitLines(src);
+        cacheSegText = new List<string>();
+        cacheSegColor = new List<int>();
+        cacheSegPerLine = new List<int>();
+        int ci = 0;
+        while (ci < cacheCodeLines.Count) {
+            List<string> segT = new List<string>();
+            List<int> segC = new List<int>();
+            CodeEditor.HighlightSpans(cacheCodeLines[ci], t.info, t.success,
+                t.warning, t.textTertiary, t.primary, t.textPrimary, segT, segC);
+            int si = 0;
+            while (si < segT.Count) {
+                cacheSegText.Add(segT[si]);
+                cacheSegColor.Add(segC[si]);
+                si = si + 1;
+            }
+            cacheSegPerLine.Add(segT.Count);
+            ci = ci + 1;
+        }
+    }
+}
+
+class Gallery {
+    // Shared demo state. Only the selected component's preview renders each
+    // frame, so a single set of signals is enough to drive every interactive
+    // example.
+    static SignalBool demoBool;
+    static SignalInt demoInt;
+    static Input demoInput;
+    static TextArea demoArea;
+    static SelectBox demoSelect;
+    static SelectBox demoMulti;
+    static SelectBox demoLong;
+    static Select demoSelectLow;
+    static VirtualList demoVList;
+    static CarouselAnim demoCarousel;
+    static SignalInt demoCarBasic;
+    static SignalInt demoCar2;
+    static CarouselAnim carAnim2;
+
+    // Delegate/event demo state. Retained buttons register their handlers once
+    // with the C#-style `Click += handler`; a background Thread reports progress
+    // back to the UI thread through app.Post, which mutates these signals on the
+    // UI thread.
+    static App app;
+    static SignalInt evtValue;
+    static SignalBool evtRunning;
+    static Button evtButton;
+    static Button evtStartButton;
+    static int evtClicks;
+
+    // Showcase navigation / scroll state.
+    static SignalInt selected;
+    static SignalInt navScroll;
+    static SignalInt codeScroll;
+    // Active code tab: 0 = Zan API, 1 = JSON config.
+    static SignalInt codeTab;
+    // The detail page is a scroll container that owns wheel/clip/scrollbar.
+    static ScrollView detailView;
+    // Content height measured on the previous frame (fed back to the view).
+    static SignalInt detailContentH;
+    // Visible detail viewport bounds (set each frame by RenderDetail) so the
+    // glass backdrop blur can be clamped to it -- BlurRect ignores the clip
+    // rect, so without this a scrolled card would smear pixels above/below.
+    static int detailClipTop;
+    static int detailClipBottom;
+    // Wall-clock of the last mouse-motion-driven repaint, used to throttle
+    // hover refreshes so dragging the pointer never spins the CPU.
+    static int lastMotionMs;
+    static ScrollView navView;
+    static TabBar tbLine;
+    static TabBar tbCard;
+    static TabBar tbSeg;
+    static List<Comp> comps;
+
+    // Read-only code selection (line/col anchor..focus into the current
+    // snippet's split lines). selDrag is true while the mouse button is held.
+    static bool selHas;
+    static bool selDrag;
+    // Retained state for the deferred-overlay / interactive demos.
+    static string copiedIcon;
+    static DataTableState demoTableState;
+    // Retained state for the unified Layer demo: draggable windows, the modal
+    // alert/confirm/prompt dialogs, plus the loading / tips / photos toggles.
+    static List<LayerState> demoLayers;
+    static int layerSeq;
+    static LayerState dlgAlert;
+    static LayerState dlgConfirm;
+    static LayerState dlgPrompt;
+    static SignalBool tipsOn;
+    static SignalBool photosOpen;
+    static int loadStartMs;
+    static SignalInt photoIdx;
+    static CarouselAnim photoAnim;
+    static List<string> photoSlides;
+    static string popupResult;
+    static int selAL;
+    static int selAC;
+    static int selFL;
+    static int selFC;
+    static int copiedFrame;
+
+    // Reusable visual component designer (framework component).
+    static Designer designer;
+
+    static void Main() {
+        App app = App.CreateDark("Zan GUI Components", 1120, 720);
+        Gallery.demoBool = SignalBool.Create(true);
+        Gallery.demoInt = SignalInt.Create(1);
+        Gallery.demoInput = Input.Bind(SignalString.Create("Zan"), "type here");
+        Gallery.demoArea = TextArea.Bind(
+            SignalString.Create("Multiline input.\nType, press Enter for a new line,\nuse arrows / Home / End to move.\nIt scrolls itself when it overflows."),
+            "Write something...");
+        Gallery.demoSelect = SelectBox.Create("Pick a status").Clearable(true);
+        Gallery.demoSelect.AddOption("Default");
+        Gallery.demoSelect.AddOption("Success");
+        Gallery.demoSelect.AddOption("Warning");
+        Gallery.demoSelect.AddOption("Error");
+        Gallery.demoMulti = SelectBox.Multi("Pick languages");
+        Gallery.demoMulti.AddOption("Zan");
+        Gallery.demoMulti.AddOption("C");
+        Gallery.demoMulti.AddOption("Rust");
+        Gallery.demoMulti.AddOption("Go");
+        Gallery.demoLong = SelectBox.Create("Long list (scrolls)");
+        Gallery.demoLong.AddOption("January");
+        Gallery.demoLong.AddOption("February");
+        Gallery.demoLong.AddOption("March");
+        Gallery.demoLong.AddOption("April");
+        Gallery.demoLong.AddOption("May");
+        Gallery.demoLong.AddOption("June");
+        Gallery.demoLong.AddOption("July");
+        Gallery.demoLong.AddOption("August");
+        Gallery.demoLong.AddOption("September");
+        Gallery.demoLong.AddOption("October");
+        Gallery.demoLong.AddOption("November");
+        Gallery.demoLong.AddOption("December");
+        Gallery.demoCarousel = CarouselAnim.Create();
+        Gallery.demoCarBasic = SignalInt.Create(0);
+        Gallery.demoCar2 = SignalInt.Create(0);
+        Gallery.carAnim2 = CarouselAnim.Create();
+        Gallery.demoVList = VirtualList.Create();
+        int vli = 0;
+        while (vli < 2000) {
+            Gallery.demoVList.Add("Row " + Convert.ToString(vli + 1) + " · virtualized");
+            vli = vli + 1;
+        }
+        Gallery.selected = SignalInt.Create(0);
+        Gallery.navScroll = SignalInt.Create(0);
+        Gallery.codeTab = SignalInt.Create(0);
+        Gallery.detailView = ScrollView.Create();
+        Gallery.detailView.SetEdgeInset(true);
+        Gallery.detailContentH = SignalInt.Create(0);
+        Gallery.codeScroll = SignalInt.Create(0);
+        Gallery.navView = ScrollView.Create();
+        Gallery.tbLine = TabBar.Create(TabBar.Line());
+        Gallery.tbLine.Add("Overview", false);
+        Gallery.tbLine.Add("API", false);
+        Gallery.tbLine.Add("Examples", false);
+        Gallery.tbSeg = TabBar.Create(TabBar.Segment());
+        Gallery.tbSeg.Add("Day", false);
+        Gallery.tbSeg.Add("Week", false);
+        Gallery.tbSeg.Add("Month", false);
+        // Card style with closable tabs and enough tabs to overflow the demo
+        // width, so the chevrons/wheel scrolling and the right-click menu show.
+        Gallery.tbCard = TabBar.Create(TabBar.Card());
+        Gallery.tbCard.Add("index.zan", true);
+        Gallery.tbCard.Add("parser.c", true);
+        Gallery.tbCard.Add("irgen.c", true);
+        Gallery.tbCard.Add("Render.zan", true);
+        Gallery.tbCard.Add("ScrollView.zan", true);
+        Gallery.tbCard.Add("Tabs.zan", true);
+        Gallery.selHas = false;
+        Gallery.selDrag = false;
+        List<string> lowOpts = new List<string>();
+        lowOpts.Add("Default"); lowOpts.Add("Success"); lowOpts.Add("Warning");
+        Gallery.demoSelectLow = Select.Bind(lowOpts, Gallery.demoInt, "Choose a state");
+        Gallery.copiedIcon = "";
+        Gallery.demoTableState = DataTableState.Create();
+        Gallery.demoLayers = new List<LayerState>();
+        Gallery.layerSeq = 0;
+        Gallery.dlgAlert = LayerState.Alert("Notice", "Your changes have been saved.", 1);
+        Gallery.dlgConfirm = LayerState.Confirm("Please confirm", "Delete this item permanently?", 2);
+        Gallery.dlgPrompt = LayerState.Prompt("Rename item", "new name");
+        Gallery.tipsOn = SignalBool.Create(false);
+        Gallery.photosOpen = SignalBool.Create(false);
+        Gallery.loadStartMs = 0;
+        Gallery.photoIdx = SignalInt.Create(0);
+        Gallery.photoAnim = CarouselAnim.Create();
+        Gallery.photoSlides = new List<string>();
+        Gallery.photoSlides.Add("Aurora");
+        Gallery.photoSlides.Add("Canyon");
+        Gallery.photoSlides.Add("Harbor");
+        Gallery.photoSlides.Add("Meadow");
+        Gallery.photoSlides.Add("Skyline");
+        Gallery.popupResult = "";
+        Gallery.copiedFrame = 0;
+        Gallery.designer = Designer.Create();
+        Gallery.designer.Seed(app);
+        Gallery.comps = new List<Comp>();
+        Gallery.BuildComps(Gallery.comps);
+
+        // Title-bar skin picker is now a built-in window feature: App.Create/
+        // CreateDark call EnableSkins() so the theme caption button is the
+        // shared Theme.PresetNames dropdown and App applies the pick itself.
+        Gallery.app = app;
+        // Optional deep-link: `gallery_test.exe <ComponentName>` lands directly
+        // on that component (used for screenshot/verification and handy nav).
+        if (Environment.ArgCount() > 0) {
+            string want = Environment.ArgAt(0);
+            int ci = 0;
+            while (ci < Gallery.comps.Count) {
+                if (Gallery.comps[ci].name == want) {
+                    Gallery.selected.Set(ci);
+                    ci = Gallery.comps.Count;
+                } else {
+                    ci = ci + 1;
+                }
+            }
+            // Second arg "open" pre-opens the selected popup demo so its
+            // open state can be captured for verification screenshots.
+            int ti = 0;
+            while (ti < Environment.ArgCount()) {
+                string a = Environment.ArgAt(ti);
+                if (a == "light") { Gallery.SelectTheme(app, 1); }
+                else if (a == "dark") { Gallery.SelectTheme(app, 0); }
+                else if (a == "liquidglass") { Gallery.SelectTheme(app, 2); }
+                else if (a == "custom") { Gallery.designer.ScrollPaletteToEnd(); }
+                else if (a == "glass") { Gallery.SelectTheme(app, 2); }
+                else if (a == "neumorph") { Gallery.SelectTheme(app, 3); }
+                else if (a == "neon") { Gallery.SelectTheme(app, 4); }
+                else if (a == "brutalism") { Gallery.SelectTheme(app, 5); }
+                else if (a == "chinese") { Gallery.SelectTheme(app, 6); }
+                ti = ti + 1;
+            }
+            if (Environment.ArgCount() > 1 && Environment.ArgAt(1) == "open") {
+                if (want == "Layer") {
+                    string st = "window";
+                    if (Environment.ArgCount() > 2) { st = Environment.ArgAt(2); }
+                    if (st == "alert") { Gallery.dlgAlert.Open(); }
+                    else if (st == "confirm") { Gallery.dlgConfirm.Open(); }
+                    else if (st == "prompt") { Gallery.dlgPrompt.Open(); }
+                    else if (st == "msg") {
+                        Layer.Msg("Saved successfully", 3);
+                        Layer.Msg("Unsaved changes", 4);
+                        Layer.Msg("Network error", 5);
+                    } else if (st == "notify") {
+                        Layer.Notify("Build completed", 3);
+                        Layer.Notify("New version available", 2);
+                    } else if (st == "load") {
+                        Gallery.loadStartMs = Window.GetTickMs();
+                    } else if (st == "tips") {
+                        Gallery.tipsOn.Set(true);
+                    } else if (st == "photos") {
+                        Gallery.photosOpen.Set(true);
+                    } else {
+                        Gallery.SpawnLayer(app);
+                        if (st == "two") { Gallery.SpawnLayer(app); }
+                    }
+                }
+            }
+        }
+
+        // Delegate/event demo wiring: keep the app handle for background threads
+        // and register the click handler once (retained, like OnClick += ...).
+        Gallery.app = app;
+        Gallery.evtValue = SignalInt.Create(0);
+        Gallery.evtRunning = SignalBool.Create(false);
+        Gallery.evtClicks = 0;
+        Gallery.evtButton = Button.Primary("Click me");
+        Gallery.evtButton.Click += Gallery.OnDemoClick;
+        Gallery.evtStartButton = Button.Primary("Start background task");
+        Gallery.evtStartButton.Click += Gallery.StartTask;
+
+        app.Show();
+        // Freeze the id baseline after all retained ids (chrome etc.) exist, so
+        // the per-frame ResetFrame() below never reissues one of them.
+        WidgetId.Mark();
+        while (app.isRunning) {
+            if (!app.ProcessEvent()) { break; }
+            // The gallery handles wheel scrolling and code selection inside its
+            // own Render pass, so it must paint on every input event (motion,
+            // press, release, wheel, keys) rather than only when the framework
+            // flags a repaint. ProcessEvent blocks when idle, so this doesn't spin.
+            int ek = app.window.EventKind();
+            // Press / release / wheel / focus always force a repaint. Pointer
+            // motion (ek==1) only needs one when the framework already flagged
+            // a change (hover crossed a hit region, a drag is in progress) --
+            // but the gallery also draws mouse-driven hover on elements it
+            // hit-tests inline (code tabs, icon grid), so still refresh on
+            // motion, throttled to ~30fps so moving the pointer over a busy
+            // page (or the glass theme's per-frame blur) can't peg the CPU.
+            bool inputEv = ek == 2 || ek == 3 || ek == 13 || ek == 4 || ek == 6;
+            if (!app.needsRedraw && !inputEv) {
+                if (ek != 1) { continue; }
+                int nowMotion = Window.GetTickMs();
+                if (nowMotion - Gallery.lastMotionMs < 33) { continue; }
+                Gallery.lastMotionMs = nowMotion;
+            }
+            app.BeginFrame();
+            // Pure immediate-mode page: every preview widget is rebuilt each
+            // frame, so rewind the widget-id counter here to keep ids stable
+            // across frames -- otherwise hover/press/click never match the
+            // pointer target the framework resolved on the previous frame.
+            WidgetId.ResetFrame();
+            Gallery.Render(app);
+            app.RenderChrome("Zan GUI Components");
+            app.PresentFrame();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Delegate / thread-safe event demo callbacks
+    // ------------------------------------------------------------------
+
+    // Handler registered with `button.Click += ...`. Fires on the UI thread.
+    static void OnDemoClick() {
+        Gallery.evtClicks = Gallery.evtClicks + 1;
+    }
+
+    // Click handler registered on the EventHub. Spawns a background worker
+    // thread once (ignored while one is already running).
+    static void StartTask() {
+        if (!Gallery.evtRunning.Get()) {
+            Gallery.evtValue.Set(0);
+            Gallery.evtRunning.Set(true);
+            Thread.Start(Gallery.EventsWorker);
+        }
+    }
+
+    // Runs on a background OS thread: it must NOT touch UI state directly, so it
+    // hands each update back to the UI thread with app.Post (Control.Invoke).
+    static void EventsWorker() {
+        int i = 0;
+        while (i < 5) {
+            Thread.Sleep(140);
+            Gallery.app.Post(Gallery.Tick);
+            i = i + 1;
+        }
+        Gallery.app.Post(Gallery.Finish);
+    }
+
+    // These run on the UI thread when the queue is drained each frame.
+    static void Tick() { Gallery.evtValue.Set(Gallery.evtValue.Get() + 1); }
+    static void Finish() { Gallery.evtRunning.Set(false); }
+
+    // ------------------------------------------------------------------
+    // Theme switching
+    // ------------------------------------------------------------------
+
+    /// Programmatic switch (deep-link args): applies the built-in skin and keeps
+    /// the title-bar picker model in sync (App owns the index -> Theme mapping).
+    static void SelectTheme(App app, int i) {
+        app.ApplySkin(i);
+    }
+
+    // ------------------------------------------------------------------
+    // Layout
+    // ------------------------------------------------------------------
+
+    static void Render(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int top = app.titlebarH;
+        int w = c.Width();
+        int h = c.Height();
+        Rect area = Rect.Create(0, top, w, h - top);
+        // Themed backdrop (gradient/glass wallpaper or flat fill) is a built-in
+        // window feature now, so every window renders skins identically.
+        app.RenderBackground(area.x, area.y, area.width, area.height, 0);
+
+        int sw = app.Scale(272);
+        Rect content = Rect.Create(0, top, w, h - top);
+        Gallery.RenderNav(app, c, t, content, sw);
+        Gallery.RenderDetail(app, c, t, content, sw);
+    }
+
+    /// Left navigation: category headers interleaved with clickable component
+    /// rows, wheel-scrollable, with the active row highlighted.
+    static void RenderNav(App app, Canvas c, Theme t, Rect area, int sw) {
+        c.FillRect(area.x, area.y, sw, area.height, t.bgSecondary);
+        c.FillRect(area.x + sw - 1, area.y, 1, area.height, t.divider);
+
+        int pad = app.Scale(14);
+        c.DrawText(area.x + pad, area.y + app.Scale(14), "COMPONENTS",
+            t.textTertiary, t.fontSizeSmall);
+        c.DrawText(area.x + pad, area.y + app.Scale(32),
+            Convert.ToString(Gallery.comps.Count) + " widgets",
+            t.textDisabled, t.fontSizeSmall);
+
+        // Build display rows: -1 marks a category header row.
+        List<int> rowComp = new List<int>();
+        List<string> rowText = new List<string>();
+        string lastCat = "";
+        int i = 0;
+        while (i < Gallery.comps.Count) {
+            Comp e = Gallery.comps[i];
+            if (e.category != lastCat) {
+                rowComp.Add(0 - 1);
+                rowText.Add(e.category);
+                lastCat = e.category;
+            }
+            rowComp.Add(i);
+            rowText.Add(e.name);
+            i = i + 1;
+        }
+
+        int listTop = area.y + app.Scale(54);
+        int listBottom = area.y + area.height - app.Scale(8);
+        int rowH = app.Scale(26);
+        int viewH = listBottom - listTop;
+        int contentH = rowComp.Count * rowH;
+
+        // The ScrollView owns wheel handling, clipping and the scrollbar; the
+        // list just draws every row at its natural position minus the returned
+        // offset and lets the container clip whatever falls outside.
+        Rect view = Rect.Create(area.x, listTop, sw, viewH);
+        int dy = Gallery.navView.Begin(app, view, contentH);
+
+        int sel = Gallery.selected.Get();
+        bool click = app.window.EventKind() == 3;
+        int sx = area.x + pad;
+        int swid = sw - pad * 2;
+        int idx = 0;
+        while (idx < rowComp.Count) {
+            int ry = listTop + idx * rowH - dy;
+            if (ry + rowH > listTop && ry < listBottom) {
+                int d = rowComp[idx];
+                if (d < 0) {
+                    c.DrawText(sx, ry + app.Scale(8), rowText[idx],
+                        t.textTertiary, t.fontSizeSmall);
+                } else {
+                    bool selRow = d == sel;
+                    bool hot = app.mouseX >= area.x && app.mouseX < area.x + sw
+                        && app.mouseY >= listTop && app.mouseY < listBottom
+                        && app.mouseY >= ry && app.mouseY < ry + rowH;
+                    if (selRow) {
+                        c.FillRoundRect(sx - app.Scale(4), ry,
+                            swid + app.Scale(8), rowH - app.Scale(2),
+                            app.Scale(4), t.primary);
+                    } else if (hot) {
+                        c.FillRoundRect(sx - app.Scale(4), ry,
+                            swid + app.Scale(8), rowH - app.Scale(2),
+                            app.Scale(4), t.bgHover);
+                    }
+                    int tc = t.textPrimary;
+                    if (selRow) { tc = t.textInverse; }
+                    c.DrawText(sx + app.Scale(8), ry + app.Scale(5),
+                        rowText[idx], tc, t.fontSizeSmall);
+                    if (click && hot) {
+                        Gallery.selected.Set(d);
+                        Gallery.codeScroll.Set(0);
+                        Gallery.detailView.ScrollTo(0);
+                        Gallery.selHas = false;
+                        Gallery.selDrag = false;
+                        app.RequestRedraw();
+                    }
+                }
+            }
+            idx = idx + 1;
+        }
+
+        Gallery.navView.End(app, view);
+    }
+
+    /// Effective demo cards for a component: its own list, or a single card
+    /// synthesised from the legacy desc/code/json fields.
+    static List<Demo> EffectiveDemos(Comp e) {
+        if (e.demos.Count > 0) { return e.demos; }
+        // Synthesise the single card once and retain it on the Comp. Building a
+        // fresh Demo each frame would reset its per-card tab (and render cache)
+        // every frame, so toggling Zan/JSON would never stick.
+        e.demos.Add(Demo.Create("Basic usage", "", e.name,
+            Gallery.PreviewHeight(e.name), e.code, e.json));
+        return e.demos;
+    }
+
+    static int CardCodeH(App app, Theme t, Demo d, int tab) {
+        string src = d.code;
+        if (tab == 1) {
+            if (d.json != "") { src = d.json; }
+            else { src = "// x"; }
+        }
+        int lineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
+        return app.Scale(28) + CodeEditor.SplitLines(src).Count * lineH
+            + app.Scale(16);
+    }
+
+    static int DescBlockH(App app, Theme t, string desc, int cw) {
+        if (desc == "") { return 0; }
+        int lineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
+        return Gallery.WrapText(desc, cw, t.fontSizeSmall).Count * lineH;
+    }
+
+    static int CardH(App app, Theme t, Demo d, int cw, int tab) {
+        int h = app.Scale(22);
+        int db = Gallery.DescBlockH(app, t, d.desc, cw);
+        if (db > 0) { h = h + db + app.Scale(4); }
+        h = h + app.Scale(10) + app.Scale(d.previewH) + app.Scale(12)
+            + Gallery.CardCodeH(app, t, d, tab);
+        return h;
+    }
+
+    static int TableH(App app, Theme t, List<ApiRow> rows) {
+        if (rows.Count == 0) { return 0; }
+        return app.Scale(30) + app.Scale(26) + rows.Count * app.Scale(24)
+            + app.Scale(16);
+    }
+
+    /// Exact laid-out height of one demo card, matching the draw order in
+    /// RenderDetail. Reads the wrap/highlight cache (call EnsureCache first),
+    /// so it is cheap enough to run for every card each frame -- it lets the
+    /// detail page cull off-screen cards instead of drawing then clipping them.
+    static int DemoCardHeight(App app, Theme t, Demo d, int cw) {
+        int lineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
+        int h = app.Scale(22);
+        if (d.desc != "") {
+            h = h + d.cacheDescLines.Count * lineH + app.Scale(4);
+        }
+        h = h + app.Scale(10)
+            + Gallery.PreviewBoxH(app, d.previewId, d.previewH, cw)
+            + app.Scale(12);
+        int panelH = app.Scale(28) + d.cacheCodeLines.Count * lineH
+            + app.Scale(16);
+        h = h + panelH + app.Scale(26);
+        return h;
+    }
+
+    /// Right detail pane: scrollable Naive-UI style page -- title, page
+    /// description, a stack of demo cards (each with its own preview and
+    /// Zan/JSON code), and Properties / Events API tables at the bottom.
+    static void RenderDetail(App app, Canvas c, Theme t, Rect area, int sw) {
+        int sel = Gallery.selected.Get();
+        if (sel < 0 || sel >= Gallery.comps.Count) { return; }
+        Comp e = Gallery.comps[sel];
+
+        int cx = area.x + sw + app.Scale(28);
+        int cw = area.x + area.width - app.Scale(28) - cx - app.Scale(14);
+        if (cw < app.Scale(220)) { cw = app.Scale(220); }
+        int contentTop = area.y + app.Scale(26);
+        int viewBottom = area.y + area.height - app.Scale(8);
+        int viewH = viewBottom - contentTop;
+        Gallery.detailClipTop = contentTop;
+        Gallery.detailClipBottom = viewBottom;
+        List<Demo> demos = Gallery.EffectiveDemos(e);
+
+        int bodyLineH = Canvas.FontHeight(t.fontSizeMedium) + app.Scale(4);
+        List<string> pl = e.DescLines(cw, t.fontSizeMedium);
+
+        // The whole page lives inside a ScrollView: that parent container owns
+        // the wheel, the clip and the scrollbar and shows it automatically when
+        // the content (measured last frame) overflows the viewport -- demos and
+        // previews never handle scrolling themselves.
+        int clipX = cx - app.Scale(12);
+        Rect view = Rect.Create(clipX, contentTop,
+            area.x + area.width - clipX, viewH);
+        int scroll = Gallery.detailView.Begin(app, view,
+            Gallery.detailContentH.Get());
+        int yy = contentTop - scroll;
+
+        c.DrawText(cx, yy, e.category, t.info, t.fontSizeSmall);
+        yy = yy + app.Scale(20);
+        c.DrawText(cx, yy, e.name, t.textPrimary, t.fontSizeLarge);
+        yy = yy + app.Scale(30);
+        c.FillRect(cx, yy, cw, 1, t.divider);
+        yy = yy + app.Scale(16);
+        int pi = 0;
+        while (pi < pl.Count) {
+            c.DrawText(cx, yy, pl[pi], t.textSecondary, t.fontSizeMedium);
+            yy = yy + bodyLineH;
+            pi = pi + 1;
+        }
+        yy = yy + app.Scale(14);
+
+        int overlayPX = 0; int overlayPY = 0; int overlayPW = 0;
+        bool haveOverlay = false;
+        int dj = 0;
+        while (dj < demos.Count) {
+            Demo d = demos[dj];
+            d.EnsureCache(app, t, cw, d.tab);
+            int cardTop = yy;
+            int cardBottom = cardTop + Gallery.DemoCardHeight(app, t, d, cw);
+            // Viewport culling: a card fully above/below the visible area still
+            // costs one GDI text render + alpha blend per DrawText if drawn, so
+            // skip its draws entirely and just advance past it. This keeps
+            // scrolling cheap regardless of how many cards the page has.
+            if (cardBottom >= contentTop && cardTop <= viewBottom) {
+                c.DrawText(cx, yy, d.title, t.textPrimary, t.fontSizeMedium);
+                yy = yy + app.Scale(22);
+                if (d.desc != "") {
+                    int dLineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
+                    List<string> dl = d.cacheDescLines;
+                    int ddi = 0;
+                    while (ddi < dl.Count) {
+                        c.DrawText(cx, yy, dl[ddi], t.textSecondary,
+                            t.fontSizeSmall);
+                        yy = yy + dLineH;
+                        ddi = ddi + 1;
+                    }
+                    yy = yy + app.Scale(4);
+                }
+                yy = yy + app.Scale(10);
+                int pvY = yy;
+                Gallery.RenderPreview(app, c, t, d.previewId, cx, pvY, cw,
+                    d.previewH);
+                if (Gallery.IsOverlayComp(d.previewId)) {
+                    overlayPX = cx; overlayPY = pvY; overlayPW = cw;
+                    haveOverlay = true;
+                }
+                yy = yy + Gallery.PreviewBoxH(app, d.previewId, d.previewH, cw)
+                    + app.Scale(12);
+                Gallery.RenderCardCode(app, c, t, d, cx, yy, cw, d.tab);
+            }
+            yy = cardBottom;
+            dj = dj + 1;
+        }
+
+        int propsH = Gallery.TableH(app, t, e.props);
+        if (propsH > 0 && yy + propsH >= contentTop && yy <= viewBottom) {
+            Gallery.RenderApiTable(app, c, t, "Properties", e.props, true,
+                cx, yy, cw);
+        }
+        yy = yy + propsH;
+        int eventsH = Gallery.TableH(app, t, e.events);
+        if (eventsH > 0 && yy + eventsH >= contentTop && yy <= viewBottom) {
+            Gallery.RenderApiTable(app, c, t, "Events", e.events, false,
+                cx, yy, cw);
+        }
+        yy = yy + eventsH;
+        yy = yy + app.Scale(20);
+
+        int contentH = yy - (contentTop - scroll);
+        Gallery.detailView.End(app, view);
+
+        int prevH = Gallery.detailContentH.Get();
+        if (contentH != prevH) {
+            Gallery.detailContentH.Set(contentH);
+            app.RequestRedraw();
+        }
+
+        if (haveOverlay) {
+            Gallery.RenderOverlay(app, c, t, e.name, overlayPX, overlayPY,
+                overlayPW);
+        }
+    }
+
+    /// Bottom API table (Properties or Events). Returns the y below the table.
+    static int RenderApiTable(App app, Canvas c, Theme t, string title,
+            List<ApiRow> rows, bool isProps, int cx, int yy, int cw) {
+        if (rows.Count == 0) { return yy; }
+        c.DrawText(cx, yy, title, t.textPrimary, t.fontSizeMedium);
+        yy = yy + app.Scale(30);
+        int fh = t.fontSizeSmall;
+        int nameX = cx + app.Scale(6);
+        int col1 = cx + cw * 24 / 100;
+        int col2 = cx + cw * 44 / 100;
+        int descX = cx + cw * 62 / 100;
+        if (!isProps) { descX = cx + cw * 44 / 100; }
+        c.FillRect(cx, yy, cw, app.Scale(26), t.bgSecondary);
+        c.DrawText(nameX, yy + app.Scale(6), "Name", t.textTertiary, fh);
+        if (isProps) {
+            c.DrawText(col1 + app.Scale(6), yy + app.Scale(6), "Type",
+                t.textTertiary, fh);
+            c.DrawText(col2 + app.Scale(6), yy + app.Scale(6), "Default",
+                t.textTertiary, fh);
+        } else {
+            c.DrawText(col1 + app.Scale(6), yy + app.Scale(6), "Signature",
+                t.textTertiary, fh);
+        }
+        c.DrawText(descX + app.Scale(6), yy + app.Scale(6), "Description",
+            t.textTertiary, fh);
+        yy = yy + app.Scale(26);
+        int rowH = app.Scale(24);
+        int ri = 0;
+        while (ri < rows.Count) {
+            ApiRow r = rows[ri];
+            if (ri % 2 == 1) { c.FillRect(cx, yy, cw, rowH, t.bgSecondary); }
+            c.DrawText(nameX, yy + app.Scale(5), r.name, t.textPrimary, fh);
+            c.DrawText(col1 + app.Scale(6), yy + app.Scale(5), r.type,
+                t.info, fh);
+            if (isProps) {
+                c.DrawText(col2 + app.Scale(6), yy + app.Scale(5), r.deflt,
+                    t.textSecondary, fh);
+            }
+            c.DrawText(descX + app.Scale(6), yy + app.Scale(5), r.desc,
+                t.textSecondary, fh);
+            yy = yy + rowH;
+            ri = ri + 1;
+        }
+        return yy + app.Scale(16);
+    }
+
+    /// Per-card code panel: Zan / JSON tabs, a Copy button (copies the active
+    /// tab), line-number gutter and syntax highlighting. Sized to fit all lines
+    /// (the whole page scrolls, so the panel never needs its own scrollbar).
+    static int RenderCardCode(App app, Canvas c, Theme t, Demo d,
+            int cx, int cy, int cw, int tab) {
+        d.EnsureCache(app, t, cw, tab);
+        string src = d.cacheSrc;
+        List<string> codeLines = d.cacheCodeLines;
+        int fs = t.fontSizeSmall;
+        int codeLineH = Canvas.FontHeight(fs) + app.Scale(4);
+        int hdrH = app.Scale(28);
+        int panelH = hdrH + codeLines.Count * codeLineH + app.Scale(16);
+        c.FillRoundRect(cx, cy, cw, panelH, app.Scale(6), t.bgSecondary);
+        c.DrawRect(cx, cy, cw, panelH, t.borderPrimary, 1);
+        c.FillRect(cx, cy + hdrH, cw, 1, t.divider);
+
+        int gnW = Canvas.MeasureText(Convert.ToString(codeLines.Count), fs);
+        int gutterW = gnW + app.Scale(20);
+        int textX = cx + gutterW + app.Scale(8);
+        int codeY0 = cy + hdrH + app.Scale(8);
+        c.FillRect(cx + 1, cy + hdrH + 1, gutterW, panelH - hdrH - 2, t.bgTertiary);
+
+        int tabY = cy + app.Scale(4);
+        int tabH = app.Scale(20);
+        int t0W = app.Scale(46);
+        int t1W = app.Scale(52);
+        int t0X = cx + app.Scale(8);
+        int t1X = t0X + t0W + app.Scale(4);
+        Gallery.DrawCodeTab(app, c, t, "Zan", t0X, tabY, t0W, tabH, tab == 0);
+        Gallery.DrawCodeTab(app, c, t, "JSON", t1X, tabY, t1W, tabH, tab == 1);
+        if (app.window.EventKind() == 3) {
+            if (app.mouseX >= t0X && app.mouseX < t0X + t0W
+                && app.mouseY >= tabY && app.mouseY < tabY + tabH) {
+                d.tab = 0; app.RequestRedraw();
+            } else if (app.mouseX >= t1X && app.mouseX < t1X + t1W
+                && app.mouseY >= tabY && app.mouseY < tabY + tabH) {
+                d.tab = 1; app.RequestRedraw();
+            }
+        }
+
+        int cpW = app.Scale(74);
+        int cpH = app.Scale(20);
+        int cpX = cx + cw - cpW - app.Scale(8);
+        int cpY = cy + app.Scale(4);
+        bool cpHot = app.mouseX >= cpX && app.mouseX < cpX + cpW
+            && app.mouseY >= cpY && app.mouseY < cpY + cpH;
+        int cpBg = t.primary;
+        if (cpHot) { cpBg = t.primaryHover; }
+        c.FillRoundRect(cpX, cpY, cpW, cpH, app.Scale(3), cpBg);
+        Icon.Draw(c, "copy", cpX + app.Scale(8), cpY + app.Scale(4),
+            app.Scale(12), 0xFFFFFFFF);
+        c.DrawText(cpX + app.Scale(24), cpY + app.Scale(3), "Copy",
+            0xFFFFFFFF, fs);
+        if (app.window.EventKind() == 3 && cpHot) {
+            Clipboard.SetText(src);
+            app.RequestRedraw();
+        }
+
+        int codeY = codeY0;
+        int ci = 0;
+        int segBase = 0;
+        while (ci < codeLines.Count) {
+            c.DrawText(cx + gutterW - gnW - app.Scale(6), codeY,
+                Convert.ToString(ci + 1), t.textTertiary, fs);
+            // Cached highlight spans for this line: [segBase, segBase+n).
+            int n = d.cacheSegPerLine[ci];
+            int sx = textX;
+            int si = 0;
+            while (si < n) {
+                string seg = d.cacheSegText[segBase + si];
+                c.DrawText(sx, codeY, seg, d.cacheSegColor[segBase + si], fs);
+                sx = sx + Canvas.MeasureText(seg, fs);
+                si = si + 1;
+            }
+            segBase = segBase + n;
+            codeY = codeY + codeLineH;
+            ci = ci + 1;
+        }
+        return panelH;
+    }
+
+    /// A small pill tab in the code panel header (Zan / JSON switch).
+    static void DrawCodeTab(App app, Canvas c, Theme t, string label,
+            int x, int y, int w, int h, bool active) {
+        bool hot = app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
+        int bg = 0xFF2D2D30;
+        int fg = t.textTertiary;
+        if (active) { bg = 0xFF0E639C; fg = 0xFFFFFFFF; }
+        else if (hot) { bg = 0xFF3E3E42; fg = 0xFFFFFFFF; }
+        c.FillRoundRect(x, y, w, h, app.Scale(3), bg);
+        int tw = Canvas.MeasureText(label, t.fontSizeSmall);
+        c.DrawText(x + (w - tw) / 2, y + app.Scale(3), label, fg, t.fontSizeSmall);
+    }
+
+    /// Maps a mouse y to a code line index (clamped to the snippet).
+    static int HitLine(List<string> lines, int scroll, int my,
+            int codeY0, int lineH) {
+        int hl = scroll + (my - codeY0) / lineH;
+        if (hl < 0) { hl = 0; }
+        if (hl >= lines.Count) { hl = lines.Count - 1; }
+        return hl;
+    }
+
+    /// True when the current selection spans at least one character.
+    static bool SelNonEmpty() {
+        if (Gallery.selAL != Gallery.selFL) { return true; }
+        return Gallery.selAC != Gallery.selFC;
+    }
+
+    /// Extracts the selected substring from the split snippet lines.
+    static string SelectedText(List<string> lines) {
+        int sL = Gallery.selAL; int sC = Gallery.selAC;
+        int eL = Gallery.selFL; int eC = Gallery.selFC;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            sL = Gallery.selFL; sC = Gallery.selFC;
+            eL = Gallery.selAL; eC = Gallery.selAC;
+        }
+        if (sL < 0) { sL = 0; }
+        if (eL >= lines.Count) { eL = lines.Count - 1; }
+        if (sL == eL) {
+            string only = lines[sL];
+            if (sC < 0) { sC = 0; }
+            if (eC > only.Length) { eC = only.Length; }
+            return only.Substring(sC, eC - sC);
+        }
+        string first = lines[sL];
+        if (sC < 0) { sC = 0; }
+        string res = first.Substring(sC, first.Length - sC);
+        int i = sL + 1;
+        while (i < eL) {
+            res = res + "\n" + lines[i];
+            i = i + 1;
+        }
+        string last = lines[eL];
+        if (eC > last.Length) { eC = last.Length; }
+        res = res + "\n" + last.Substring(0, eC);
+        return res;
+    }
+
+    // ------------------------------------------------------------------
+    // Live previews (real widget states for the selected component)
+    // ------------------------------------------------------------------
+
+    /// Preview box height (unscaled) for a component: complex widgets that
+    /// need more vertical room get a taller box so they aren't clipped.
+    static void StateSwatch(App app, int x, int y, int w, int h, string label,
+            bool hov, bool pr, bool sel, bool dis) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium,
+            States.Bg(t, hov, pr, sel, dis));
+        c.DrawRect(x, y, w, h, States.Border(t, hov, pr, false, dis), 1);
+        if (sel) { c.FillRect(x, y, app.Scale(3), h, States.Accent(t)); }
+        c.DrawTextCentered(x, y, w, h, label, States.Text(t, sel, dis), t.fontSizeSmall);
+    }
+
+    /// One Ellipsis demo row: a fixed-width guide box with the text truncated to
+    /// fit, plus the pixel width label to its right.
+    static void EllipsisRow(App app, int x, int y, int w, string text) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.DrawRect(x, y - app.Scale(2), w, app.Scale(24), t.borderSecondary, 1);
+        Ellipsis.Render(app, x + app.Scale(5), y + app.Scale(3), w - app.Scale(10), text);
+        Label.Secondary(app, x + w + app.Scale(10), y + app.Scale(3),
+            Convert.ToString(w) + "px");
+    }
+
+    static int PreviewHeight(string name) {
+        if (name == "Button") { return 470; }
+        if (name == "Icon") { return 360; }
+        if (name == "States") { return 150; }
+        if (name == "TabBar") { return 220; }
+        if (name == "TextArea") { return 190; }
+        if (name == "SelectBox") { return 240; }
+        if (name == "VirtualList") { return 210; }
+        if (name == "ClickEvent") { return 120; }
+        if (name == "DataTable") { return 200; }
+        if (name == "PivotTable") { return 200; }
+        if (name == "Chart") { return 210; }
+        if (name == "Alert") { return 300; }
+        if (name == "Ellipsis") { return 180; }
+        if (name == "Timeline") { return 190; }
+        if (name == "TreeView") { return 190; }
+        if (name == "Collapse") { return 190; }
+        if (name == "Table") { return 180; }
+        if (name == "Carousel") { return 300; }
+        if (name == "Layer") { return 360; }
+        if (name == "Menu") { return 190; }
+        if (name == "Steps") { return 170; }
+        if (name == "Ribbon") { return 180; }
+        if (name == "TabView") { return 190; }
+        if (name == "Wizard") { return 210; }
+        if (name == "Split") { return 180; }
+        if (name == "Result") { return 190; }
+        if (name == "Progress") { return 210; }
+        if (name == "Compose") { return 230; }
+        if (name == "Designer") { return 860; }
+        return 150;
+    }
+
+    /// Scaled (device-px) height of a demo's preview box for a given card width.
+    /// Most previews are a fixed design height, but content that wraps to a
+    /// width-dependent number of rows (the Icon gallery grid) must grow taller
+    /// as the window narrows, otherwise its lower rows spill past the fixed box
+    /// and get clipped. Callers use this for both layout and the drawn frame so
+    /// the box, the card height and the grid always agree.
+    static int PreviewBoxH(App app, string name, int previewHUnscaled, int w) {
+        if (name == "Icon") {
+            int cell = app.Scale(62);
+            int gcols = (w - app.Scale(24)) / cell;
+            if (gcols < 1) { gcols = 1; }
+            int n = Icon.Names().Count;
+            int rows = (n + gcols - 1) / gcols;
+            if (rows < 1) { rows = 1; }
+            return app.Scale(34) + rows * cell + app.Scale(12);
+        }
+        return app.Scale(previewHUnscaled);
+    }
+
+    static int RenderPreview(App app, Canvas c, Theme t, string name,
+            int x, int y, int w, int previewHUnscaled) {
+        int h = Gallery.PreviewBoxH(app, name, previewHUnscaled, w);
+        if (t.glass != 0) {
+            // Real frosted glass: blur the wallpaper behind the box (clamped to
+            // the scroll viewport so it never smears the fixed header), then a
+            // light translucent tint + white frost veil + top sheen + rim.
+            int by = y;
+            int bh = h;
+            if (by < Gallery.detailClipTop) {
+                bh = bh - (Gallery.detailClipTop - by);
+                by = Gallery.detailClipTop;
+            }
+            if (by + bh > Gallery.detailClipBottom) {
+                bh = Gallery.detailClipBottom - by;
+            }
+            if (bh > 0) {
+                c.BlurRectCached(x, by, w, bh, app.Scale(22),
+                    app.NextBlurSlot(), app.BackdropDirty());
+            }
+            c.FillRoundRect(x, y, w, h, app.Scale(6), Layer.Fade(t.bgSecondary, 300));
+            c.FillRoundRect(x, y, w, h, app.Scale(6), Layer.Fade(t.textPrimary, 40));
+            c.FillRoundRect(x, y, w, app.Scale(2), app.Scale(6),
+                            Layer.Fade(t.textPrimary, 140));
+            c.DrawRect(x, y, w, h, Layer.Fade(t.textPrimary, 85), 1);
+        } else {
+            c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+            c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        }
+        c.DrawText(x + app.Scale(12), y + app.Scale(9), "LIVE STATES",
+            t.textTertiary, t.fontSizeSmall);
+        // Floating/interactive components are drawn later in the deferred
+        // overlay pass (above the code panel); the base pass only frames them.
+        if (Gallery.IsOverlayComp(name)) { return h; }
+        // Clip every base demo to the preview box so nothing bleeds into the
+        // title, description or the code panel below (fixes the overflow and
+        // scroll "see-through" artifacts).
+        c.PushClip(x, y, w, h);
+        int px = x + app.Scale(18);
+        int py = y + app.Scale(48);
+        bool rendered = true;
+        if (name == "Button.types") {
+            int bw = app.Scale(92);
+            int gap = app.Scale(10);
+            int step = bw + gap;
+            int cur = y + app.Scale(34);
+            Button.Create("Default").Render(app, px, cur, bw);
+            Button.Typed("Primary", 1).Render(app, px + step, cur, bw);
+            Button.Typed("Info", 2).Render(app, px + 2 * step, cur, bw);
+            Button.Typed("Success", 3).Render(app, px + 3 * step, cur, bw);
+            Button.Typed("Warning", 4).Render(app, px + 4 * step, cur, bw);
+            Button.Typed("Error", 5).Render(app, px + 5 * step, cur, bw);
+        } else if (name == "Button.styles") {
+            int bw = app.Scale(92);
+            int gap = app.Scale(10);
+            int step = bw + gap;
+            int cur = y + app.Scale(34);
+            Button.Styled("Solid", 1, 0).Render(app, px, cur, bw);
+            Button.Styled("Outline", 1, 1).Render(app, px + step, cur, bw);
+            Button.Styled("Text", 1, 2).Render(app, px + 2 * step, cur, bw);
+            Button.Styled("Dashed", 1, 3).Render(app, px + 3 * step, cur, bw);
+            Button.Secondary("Secondary", 1).Render(app, px + 4 * step, cur, bw);
+            Button.Ghost("Ghost", 1).Render(app, px + 5 * step, cur, bw);
+        } else if (name == "Button.secondary") {
+            int bw = app.Scale(92);
+            int gap = app.Scale(10);
+            int step = bw + gap;
+            int cur = y + app.Scale(34);
+            Button.Secondary("Default", 0).Render(app, px, cur, bw);
+            Button.Secondary("Primary", 1).Render(app, px + step, cur, bw);
+            Button.Secondary("Info", 2).Render(app, px + 2 * step, cur, bw);
+            Button.Secondary("Success", 3).Render(app, px + 3 * step, cur, bw);
+            Button.Secondary("Warning", 4).Render(app, px + 4 * step, cur, bw);
+            Button.Secondary("Error", 5).Render(app, px + 5 * step, cur, bw);
+        } else if (name == "Button.states") {
+            int bw = app.Scale(92);
+            int gap = app.Scale(10);
+            int step = bw + gap;
+            int cur = y + app.Scale(34);
+            Button.Loading("Loading", 1).Render(app, px, cur, bw);
+            Button bldg = Button.Loading("", 3);
+            bldg.SetCircle(true);
+            bldg.Render(app, px + step, cur, t.heightMedium);
+            Button bdis = Button.Create("Disabled");
+            bdis.SetDisabled(true);
+            bdis.Render(app, px + step + t.heightMedium + gap, cur, bw);
+            Button.Colored("Pink", 0xFFE91E63).Render(app,
+                px + step + t.heightMedium + gap + step, cur, bw);
+            Button.Colored("Teal", 0xFF13C2C2).Render(app,
+                px + step + t.heightMedium + gap + 2 * step, cur, bw);
+        } else if (name == "Button.shapes") {
+            int bw = app.Scale(92);
+            int gap = app.Scale(10);
+            int step = bw + gap;
+            int cur = y + app.Scale(34);
+            Button.Round("Round", 1).Render(app, px, cur, bw);
+            Button.IconTextTyped("Save", "save", 3).Render(app, px + step, cur, bw);
+            Button.IconTyped("plus", 1).Render(app, px + 2 * step, cur, t.heightMedium);
+            Button.IconTyped("settings", 0).Render(app,
+                px + 2 * step + t.heightMedium + gap, cur, t.heightMedium);
+        } else if (name == "Button.sizes") {
+            int cur = y + app.Scale(34);
+            Button btn = Button.Create("Tiny"); btn.SetSize(0);
+            btn.Render(app, px, cur, app.Scale(64));
+            Button bsm = Button.Create("Small"); bsm.SetSize(1);
+            bsm.Render(app, px + app.Scale(74), cur, app.Scale(78));
+            Button.Create("Medium").Render(app, px + app.Scale(162), cur, app.Scale(92));
+            Button blg = Button.Create("Large"); blg.SetSize(3);
+            blg.Render(app, px + app.Scale(264), cur, app.Scale(104));
+        } else if (name == "Button.group") {
+            int cur = y + app.Scale(34);
+            ButtonGroup g1 = ButtonGroup.Create(1);
+            g1.Add("Left"); g1.Add("Middle"); g1.Add("Right");
+            g1.Render(app, px, cur);
+            ButtonGroup g2 = ButtonGroup.Create(2).Outline(true);
+            g2.Add("Day"); g2.Add("Week"); g2.Add("Month"); g2.Add("Year");
+            g2.Render(app, px + app.Scale(240), cur);
+        } else if (name == "Icon") {
+            List<string> icons = Icon.Names();
+            int cell = app.Scale(62);
+            int iconSz = app.Scale(22);
+            int gcols = (w - app.Scale(24)) / cell;
+            if (gcols < 1) { gcols = 1; }
+            bool iconClick = app.window.EventKind() == 3;
+            int gx0 = x + app.Scale(12);
+            int gy0 = y + app.Scale(34);
+            int gi = 0;
+            while (gi < icons.Count) {
+                int gr = gi / gcols;
+                int gc = gi % gcols;
+                int gx = gx0 + gc * cell;
+                int gy = gy0 + gr * cell;
+                bool hot = app.mouseX >= gx && app.mouseX < gx + cell
+                    && app.mouseY >= gy && app.mouseY < gy + cell;
+                if (hot) {
+                    c.FillRoundRect(gx, gy, cell - app.Scale(4), cell - app.Scale(4),
+                        app.Scale(4), t.bgHover);
+                }
+                Icon.DrawCenteredIn(c, icons[gi], gx, gy + app.Scale(6),
+                    cell - app.Scale(4), iconSz, iconSz, t.textPrimary);
+                c.DrawTextCentered(gx, gy + iconSz + app.Scale(12), cell - app.Scale(4),
+                    Canvas.FontHeight(t.fontSizeSmall),
+                    Ellipsis.Fit(icons[gi], cell - app.Scale(6), t.fontSizeSmall),
+                    t.textTertiary, t.fontSizeSmall);
+                if (hot && iconClick) {
+                    Clipboard.SetText("Icon.Draw(c, \"" + icons[gi] + "\", x, y, 24, color);");
+                    Gallery.copiedIcon = icons[gi];
+                    app.RequestRedraw();
+                }
+                gi = gi + 1;
+            }
+            if (Gallery.copiedIcon != "") {
+                c.DrawText(x + app.Scale(110), y + app.Scale(9),
+                    "copied  Icon.Draw(c, \"" + Gallery.copiedIcon + "\", ...)",
+                    t.success, t.fontSizeSmall);
+            }
+        } else if (name == "Label") {
+            Label.Title(app, px, py - app.Scale(12), "Title");
+            Label.Render(app, px, py + app.Scale(22), "Default label");
+            Label.Secondary(app, px + app.Scale(170), py + app.Scale(22), "Secondary");
+        } else if (name == "Typography") {
+            Typography.Heading(app, px, py - app.Scale(16), "Heading", 2);
+            Typography.Paragraph(app, px, py + app.Scale(30), "Readable paragraph text for application content.");
+        } else if (name == "Input") {
+            Gallery.demoInput.Render(app, px, py, app.Scale(260), t.heightMedium);
+        } else if (name == "TextArea") {
+            Gallery.demoArea.Render(app, px, py - app.Scale(20), app.Scale(360), app.Scale(120));
+        } else if (name == "Checkbox") {
+            int id = Checkbox.Render(app, px, py, "Checked", Gallery.demoBool);
+            Checkbox.HandleClick(app, id, Gallery.demoBool);
+        } else if (name == "Radio") {
+            int r0 = Radio.Render(app, px, py, "Option A", Gallery.demoInt, 0);
+            int r1 = Radio.Render(app, px + app.Scale(130), py, "Option B", Gallery.demoInt, 1);
+            Radio.HandleClick(app, r0, Gallery.demoInt, 0);
+            Radio.HandleClick(app, r1, Gallery.demoInt, 1);
+        } else if (name == "Switch") {
+            int id = Switch.Render(app, px, py, Gallery.demoBool);
+            Switch.HandleClick(app, id, Gallery.demoBool);
+            Label.Render(app, px + app.Scale(62), py + app.Scale(6), "Interactive state");
+        } else if (name == "Slider") {
+            Slider.Render(app, px, py, app.Scale(300), 0, 100, Gallery.demoInt);
+            Label.Secondary(app, px + app.Scale(320), py, Convert.ToString(Gallery.demoInt.Get()));
+        } else if (name == "Rate") {
+            int id = Rate.Render(app, px, py, Gallery.demoInt, 5);
+            Rate.HandleClick(app, id, 5, Gallery.demoInt);
+        } else if (name == "Tabs") {
+            List<string> tabs = new List<string>();
+            tabs.Add("Overview"); tabs.Add("API"); tabs.Add("Examples");
+            int id = Tabs.Render(app, px, py, app.Scale(420), tabs, Gallery.demoInt);
+            Tabs.HandleClick(app, id, tabs.Count, Gallery.demoInt);
+        } else if (name == "TabBar") {
+            Label.Secondary(app, px, py - app.Scale(24), "Line");
+            Gallery.tbLine.Render(app, px, py, app.Scale(360));
+            Label.Secondary(app, px, py + app.Scale(40) - app.Scale(24), "Segment");
+            Gallery.tbSeg.Render(app, px, py + app.Scale(40), app.Scale(240));
+            Label.Secondary(app, px, py + app.Scale(88) - app.Scale(24),
+                "Card · closable · overflow (wheel / chevrons) · right-click");
+            Gallery.tbCard.Render(app, px, py + app.Scale(88), app.Scale(300));
+        } else if (name == "Steps") {
+            List<string> steps = new List<string>();
+            steps.Add("Details"); steps.Add("Review"); steps.Add("Done");
+            Steps.Render(app, px, py, w - app.Scale(36), steps, Gallery.demoInt);
+        } else if (name == "Breadcrumb") {
+            List<string> crumbs = new List<string>();
+            crumbs.Add("Home"); crumbs.Add("Components"); crumbs.Add("Breadcrumb");
+            Breadcrumb.Render(app, px, py, crumbs);
+        } else if (name == "Menu") {
+            List<string> menuItems = new List<string>();
+            menuItems.Add("Overview"); menuItems.Add("Settings");
+            int id = Menu.RenderVertical(app, px, py - app.Scale(20), app.Scale(220), py + app.Scale(74), app.Scale(36), menuItems, Gallery.demoInt, 0);
+            Menu.HandleClick(app, id, menuItems.Count, Gallery.demoInt);
+        } else if (name == "PageHeader") {
+            PageHeader.Render(app, px, py - app.Scale(16), w - app.Scale(36), "Component page", "Title, subtitle and back action");
+        } else if (name == "Pagination") {
+            int id = Pagination.Render(app, px, py, 12, Gallery.demoInt);
+            Pagination.HandleClick(app, id, 12, Gallery.demoInt);
+        } else if (name == "Card") {
+            Card.Render(app, px, py - app.Scale(12), app.Scale(360), app.Scale(96), "Card");
+            Label.Render(app, px + app.Scale(14), Card.ContentY(py - app.Scale(12), t), "Card content and actions");
+        } else if (name == "Panel") {
+            Rect content = Panel.Section(app, px, py - app.Scale(20), w - app.Scale(36), app.Scale(96), "Panel title");
+            Label.Render(app, content.x, content.y, "Panel content");
+        } else if (name == "Tag") {
+            Tag.Render(app, px, py, "Default", 0);
+            Tag.Render(app, px + app.Scale(100), py, "Success", 1);
+            Tag.Render(app, px + app.Scale(200), py, "Warning", 2);
+            Tag.Render(app, px + app.Scale(300), py, "Error", 3);
+        } else if (name == "Avatar.text") {
+            Avatar.Render(app, px, py, app.Scale(32), "A");
+            Avatar.Render(app, px + app.Scale(60), py, app.Scale(42), "Z");
+            Avatar.Render(app, px + app.Scale(130), py, app.Scale(52), "GK");
+        } else if (name == "Avatar.icon") {
+            Avatar.RenderWithIcon(app, px, py, app.Scale(42), "user");
+            Avatar.RenderWithIcon(app, px + app.Scale(72), py, app.Scale(42), "settings");
+        } else if (name == "Badge.dot") {
+            Badge.Dot(app, px + app.Scale(10), py + app.Scale(10));
+            Label.Secondary(app, px + app.Scale(30), py + app.Scale(4), "unread / active");
+        } else if (name == "Badge.count") {
+            Badge.Count(app, px + app.Scale(20), py, 5);
+            Badge.Count(app, px + app.Scale(90), py, 12);
+            Badge.Count(app, px + app.Scale(170), py, 99);
+        } else if (name == "Statistic") {
+            Statistic.Render(app, px, py, "Active users", "12,480");
+        } else if (name == "Timeline") {
+            List<string> titles = new List<string>();
+            titles.Add("Created"); titles.Add("Published");
+            List<string> descs = new List<string>();
+            descs.Add("Project initialized"); descs.Add("Executable generated");
+            Timeline.Render(app, px, py - app.Scale(24), titles, descs);
+        } else if (name == "VirtualList") {
+            Gallery.demoVList.Render(app, px, py - app.Scale(16), app.Scale(300), app.Scale(150));
+            Label.Secondary(app, px + app.Scale(320), py - app.Scale(16),
+                "2000 rows · only visible ones drawn");
+            Label.Render(app, px + app.Scale(320), py + app.Scale(12),
+                Gallery.demoVList.SelectedText());
+        } else if (name == "ListView") {
+            List<string> items = new List<string>();
+            items.Add("Alpha"); items.Add("Beta"); items.Add("Gamma");
+            ListView.Render(app, px, py - app.Scale(16), app.Scale(260), items);
+        } else if (name == "Table") {
+            List<string> columns = new List<string>();
+            columns.Add("Name"); columns.Add("Status");
+            List<int> widths = new List<int>();
+            widths.Add(app.Scale(200)); widths.Add(app.Scale(140));
+            Table.RenderHeader(app, px, py - app.Scale(16), columns, widths);
+            List<string> cells = new List<string>();
+            cells.Add("Zan"); cells.Add("Ready");
+            Table.RenderRow(app, px, py - app.Scale(16) + t.heightMedium, cells, widths, true);
+        } else if (name == "PivotTable") {
+            List<DataRow> rows = new List<DataRow>();
+            DataRow p0 = DataRow.Create();
+            p0.Push("North"); p0.Push("2026"); p0.Push("42"); rows.Add(p0);
+            DataRow p1 = DataRow.Create();
+            p1.Push("South"); p1.Push("2026"); p1.Push("35"); rows.Add(p1);
+            PivotConfig cfg = PivotConfig.Create(0, 1, 2, 0);
+            PivotTable.Render(app, px, py - app.Scale(20), w - app.Scale(36), app.Scale(100), rows, cfg);
+        } else if (name == "TreeView") {
+            List<TreeNode> nodes = new List<TreeNode>();
+            nodes.Add(TreeNode.Dir("src", 0, true));
+            nodes.Add(TreeNode.FileIcon("main.zan", 1, "file"));
+            TreeView.Render(app, Rect.Create(px, py - app.Scale(20), app.Scale(280), app.Scale(100)), nodes, Gallery.demoInt, 0);
+        } else if (name == "Collapse") {
+            List<string> heads = new List<string>();
+            heads.Add("General"); heads.Add("Advanced");
+            List<string> content = new List<string>();
+            content.Add("General settings"); content.Add("Advanced settings");
+            int id = Collapse.Render(app, px, py - app.Scale(20), w - app.Scale(36), heads, content, Gallery.demoInt);
+            Collapse.HandleClick(app, id, heads.Count, Gallery.demoInt);
+        } else if (name == "Carousel.basic") {
+            List<string> slides = new List<string>();
+            slides.Add("First slide"); slides.Add("Second slide"); slides.Add("Third slide");
+            int id = Carousel.Render(app, px, py - app.Scale(10), w - app.Scale(36), app.Scale(110), slides, Gallery.demoCarBasic);
+            Carousel.HandleClick(app, id, slides.Count, Gallery.demoCarBasic);
+        } else if (name == "Carousel.anim") {
+            List<string> slides = new List<string>();
+            slides.Add("Overview"); slides.Add("Metrics"); slides.Add("Reports"); slides.Add("Settings");
+            int id = Carousel.RenderAnimated(app, px, py - app.Scale(10), w - app.Scale(36), app.Scale(110), slides, Gallery.demoInt, Gallery.demoCarousel);
+            Carousel.HandleClick(app, id, slides.Count, Gallery.demoInt);
+        } else if (name == "Carousel.many") {
+            List<string> slides = new List<string>();
+            slides.Add("Aurora"); slides.Add("Canyon"); slides.Add("Harbor");
+            slides.Add("Meadow"); slides.Add("Skyline"); slides.Add("Tundra");
+            int id = Carousel.RenderAnimated(app, px, py - app.Scale(10), w - app.Scale(36), app.Scale(110), slides, Gallery.demoCar2, Gallery.carAnim2);
+            Carousel.HandleClick(app, id, slides.Count, Gallery.demoCar2);
+        } else if (name == "Chart.line" || name == "Chart.area"
+                || name == "Chart.bar") {
+            List<string> labels = new List<string>();
+            labels.Add("Q1"); labels.Add("Q2"); labels.Add("Q3"); labels.Add("Q4");
+            List<int> rev = new List<int>();
+            rev.Add(12); rev.Add(28); rev.Add(20); rev.Add(35);
+            List<int> cost = new List<int>();
+            cost.Add(8); cost.Add(14); cost.Add(16); cost.Add(22);
+            List<ChartSeries> series = new List<ChartSeries>();
+            series.Add(ChartSeries.Create("Revenue", rev, t.primary));
+            series.Add(ChartSeries.Create("Cost", cost, Chart.Palette(t, 1)));
+            int cX = x + app.Scale(14);
+            int cY = y + app.Scale(30);
+            int cW = w - app.Scale(28);
+            int cH = app.Scale(170);
+            if (name == "Chart.line") {
+                Chart.Line(app, cX, cY, cW, cH, "Quarterly revenue", labels, series);
+            } else if (name == "Chart.area") {
+                Chart.Area(app, cX, cY, cW, cH, "Quarterly revenue", labels, series);
+            } else {
+                Chart.Bar(app, cX, cY, cW, cH, "Quarterly revenue", labels, series);
+            }
+        } else if (name == "Chart.pie" || name == "Chart.donut") {
+            List<int> parts = new List<int>();
+            parts.Add(45); parts.Add(30); parts.Add(25);
+            List<string> pnames = new List<string>();
+            pnames.Add("Zan"); pnames.Add("C"); pnames.Add("Rust");
+            int cX = x + app.Scale(14);
+            int cY = y + app.Scale(30);
+            int cW = w - app.Scale(28);
+            int cH = app.Scale(170);
+            if (name == "Chart.pie") {
+                Chart.Pie(app, cX, cY, cW, cH, "Language share", pnames, parts);
+            } else {
+                Chart.Donut(app, cX, cY, cW, cH, "Language share", pnames, parts);
+            }
+        } else if (name == "Chart.scatter") {
+            List<int> xs = new List<int>();
+            xs.Add(5); xs.Add(12); xs.Add(18); xs.Add(24); xs.Add(31); xs.Add(40);
+            List<int> ys = new List<int>();
+            ys.Add(8); ys.Add(14); ys.Add(11); ys.Add(26); ys.Add(22); ys.Add(34);
+            Chart.Scatter(app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(170), "Samples", xs, ys, t.primary);
+        } else if (name == "Ellipsis") {
+            string longText = "A very long component description that will not fit a narrow column";
+            Gallery.EllipsisRow(app, px, py - app.Scale(6), app.Scale(160), longText);
+            Gallery.EllipsisRow(app, px, py + app.Scale(30), app.Scale(280), longText);
+            Gallery.EllipsisRow(app, px, py + app.Scale(66), app.Scale(440), longText);
+        } else if (name == "Empty") {
+            Empty.Render(app, px, py - app.Scale(24), w - app.Scale(36), app.Scale(100), "No data");
+        } else if (name == "States") {
+            int sw2 = app.Scale(84);
+            int sh = app.Scale(40);
+            int gap = app.Scale(10);
+            Gallery.StateSwatch(app, px + 0 * (sw2 + gap), py, sw2, sh, "Normal", false, false, false, false);
+            Gallery.StateSwatch(app, px + 1 * (sw2 + gap), py, sw2, sh, "Hover", true, false, false, false);
+            Gallery.StateSwatch(app, px + 2 * (sw2 + gap), py, sw2, sh, "Pressed", false, true, false, false);
+            Gallery.StateSwatch(app, px + 3 * (sw2 + gap), py, sw2, sh, "Selected", false, false, true, false);
+            Gallery.StateSwatch(app, px + 4 * (sw2 + gap), py, sw2, sh, "Disabled", false, false, false, true);
+            int fx = px + 5 * (sw2 + gap);
+            c.FillRoundRect(fx, py, sw2, sh, t.borderRadiusMedium, States.Bg(t, false, false, false, false));
+            c.DrawRect(fx, py, sw2, sh, States.Border(t, false, false, true, false), 2);
+            c.DrawTextCentered(fx, py, sw2, sh, "Focus", t.textPrimary, t.fontSizeSmall);
+        } else if (name == "Divider") {
+            Divider.RenderText(app, px, py, w - app.Scale(36), "Section", 0);
+        } else if (name == "Progress.line") {
+            int barW = w - app.Scale(120);
+            Progress.RenderText(app, px, py - app.Scale(6), barW, 72, 0);
+            Progress.RenderText(app, px, py + app.Scale(24), barW, 45, 2);
+            Progress.RenderText(app, px, py + app.Scale(54), barW, 90, 3);
+            Progress.RenderText(app, px, py + app.Scale(84), barW, 30, 4);
+        } else if (name == "Progress.circle") {
+            int rr = app.Scale(34);
+            int rcy = py + app.Scale(24);
+            Progress.Circle(app, px + app.Scale(50), rcy, rr, 72, 0);
+            Progress.Circle(app, px + app.Scale(150), rcy, rr, 90, 3);
+            Progress.Circle(app, px + app.Scale(250), rcy, rr, 45, 4);
+        } else if (name == "Alert") {
+            int aw = w - app.Scale(36);
+            int aay = py - app.Scale(20);
+            int step = Alert.Height(app, true) + app.Scale(10);
+            Alert.Render(app, px, aay, aw, "Heads up", "Additional context for the info alert.", 2);
+            Alert.Render(app, px, aay + step, aw, "Build succeeded", "The executable is ready.", 3);
+            Alert.Render(app, px, aay + step * 2, aw, "Low disk space", "", 4);
+            Alert.Render(app, px, aay + step * 3, aw, "Deployment failed", "Check the logs for details.", 5);
+        } else if (name == "Result") {
+            Result.Render(app, px, py - app.Scale(30), w - app.Scale(36), 1, "Operation complete", "The requested action succeeded.");
+        } else if (name == "Tooltip") {
+            int btnW = app.Scale(130);
+            Button.Create("Hover target").Render(app, px, py, btnW);
+            Tooltip.Render(app, px + btnW / 2, py, "Helpful context");
+        } else if (name == "Spin.plain") {
+            Spin.Render(app, px + app.Scale(26), py + app.Scale(24), app.Scale(14), t.primary);
+            Spin.Render(app, px + app.Scale(80), py + app.Scale(24), app.Scale(20), t.primary);
+            Spin.Render(app, px + app.Scale(150), py + app.Scale(24), app.Scale(28), t.info);
+        } else if (name == "Spin.tip") {
+            Spin.WithTip(app, px, py - app.Scale(20), app.Scale(300), app.Scale(110), "Loading data...");
+        } else if (name == "Loading") {
+            Loading.Render(app, px + app.Scale(30), py + app.Scale(24), app.Scale(18));
+        } else if (name == "Skeleton") {
+            Skeleton.Circle(app, px + app.Scale(20), py + app.Scale(20), app.Scale(20));
+            Skeleton.Text(app, px + app.Scale(58), py, app.Scale(260));
+            Skeleton.Rect(app, px + app.Scale(58), py + app.Scale(30), app.Scale(180), app.Scale(14));
+        } else if (name == "FloatButton") {
+            FloatButton.Render(app, px, py - app.Scale(8), app.Scale(48), "plus", 1);
+            FloatButton.Render(app, px + app.Scale(72), py - app.Scale(8), app.Scale(48), "edit", 0);
+        } else if (name == "Scrollbar") {
+            c.FillRoundRect(px, py - app.Scale(16), app.Scale(280), app.Scale(96), app.Scale(4), t.bgPrimary);
+            Scrollbar.RenderVertical(app, px + app.Scale(270), py - app.Scale(16), app.Scale(96), app.Scale(360), app.Scale(96));
+        } else if (name == "TabView") {
+            List<string> labels = new List<string>();
+            labels.Add("main.zan"); labels.Add("gui.zan"); labels.Add("README");
+            int th = TabView.Height(app);
+            TabHit hit = TabView.Render(app, px, py - app.Scale(16),
+                w - app.Scale(36), th, labels, Gallery.demoInt, true);
+            TabView.Apply(hit, labels, Gallery.demoInt, "untitled");
+        } else if (name == "Ribbon") {
+            List<RibbonCmd> cmds = new List<RibbonCmd>();
+            cmds.Add(RibbonCmd.Group("file", "New"));
+            cmds.Add(RibbonCmd.Create("folder", "Open"));
+            cmds.Add(RibbonCmd.Create("save", "Save"));
+            cmds.Add(RibbonCmd.Group("play", "Run"));
+            cmds.Add(RibbonCmd.Create("bug", "Debug"));
+            Ribbon.Render(app, px, py - app.Scale(20),
+                w - app.Scale(36), Ribbon.Height(app), cmds);
+        } else if (name == "Wizard") {
+            List<string> names = new List<string>();
+            names.Add("Console app"); names.Add("GUI app"); names.Add("Library");
+            List<string> icons = new List<string>();
+            icons.Add("terminal"); icons.Add("window"); icons.Add("package");
+            Wizard.RenderList(app, px, py - app.Scale(24),
+                app.Scale(300), app.Scale(140), names, icons, Gallery.demoInt);
+        } else if (name == "Split") {
+            int halfW = (w - app.Scale(44)) / 2;
+            c.FillRoundRect(px, py - app.Scale(16), halfW, app.Scale(110),
+                app.Scale(4), t.bgPrimary);
+            Label.Secondary(app, px + app.Scale(12), py + app.Scale(4), "First pane");
+            int rx = px + halfW + app.Scale(8);
+            c.FillRect(rx, py - app.Scale(16), app.Scale(4), app.Scale(110), t.primary);
+            c.FillRoundRect(rx + app.Scale(8), py - app.Scale(16), halfW,
+                app.Scale(110), app.Scale(4), t.bgPrimary);
+            Label.Secondary(app, rx + app.Scale(20), py + app.Scale(4), "Second pane");
+        } else if (name == "FilePicker") {
+            Button.Primary("Choose file...").Render(app, px, py, app.Scale(150));
+            Label.Secondary(app, px, py + app.Scale(40),
+                "Opens a modal file dialog (see the code below).");
+        } else if (name == "CodeEditor") {
+            Label.Render(app, px, py - app.Scale(12),
+                "The code panel below is a read-only CodeEditor view.");
+            Label.Secondary(app, px, py + app.Scale(16),
+                "CodeEditor powers this IDE's editor: highlighting,");
+            Label.Secondary(app, px, py + app.Scale(38),
+                "line numbers, selection, completion and diagnostics.");
+        } else if (name == "ClickEvent") {
+            Gallery.evtButton.Render(app, px, py - app.Scale(8), app.Scale(200));
+            Label.Render(app, px, py + app.Scale(34),
+                "Click fired on the UI thread · count: "
+                    + Convert.ToString(Gallery.evtClicks));
+            Label.Secondary(app, px, py + app.Scale(62),
+                "registered once with  button.Click += handler");
+        } else if (name == "Events") {
+            Gallery.evtStartButton.Render(app, px, py - app.Scale(8), app.Scale(210));
+            Label.Render(app, px, py + app.Scale(34),
+                "Ticks posted from worker thread: "
+                    + Convert.ToString(Gallery.evtValue.Get()));
+            if (Gallery.evtRunning.Get()) {
+                Label.Secondary(app, px, py + app.Scale(62),
+                    "running - app.Post marshals each tick to the UI thread");
+            } else {
+                Label.Secondary(app, px, py + app.Scale(62),
+                    "idle - click to spawn a Thread that reports back safely");
+            }
+        } else {
+            rendered = false;
+        }
+        if (!rendered) {
+            Icon.Draw(c, "code", px, py, app.Scale(30), t.primary);
+            c.DrawText(px + app.Scale(46), py, "Overlay / interactive component", t.textPrimary, t.fontSizeMedium);
+            c.DrawText(px + app.Scale(46), py + app.Scale(28), "Copy the API example below to use it.", t.textSecondary, t.fontSizeSmall);
+        }
+        c.PopClip();
+        return h;
+    }
+
+    /// Components whose live demo floats outside the preview box (dropdowns,
+    /// menus, popovers, a table with a filter panel). They are drawn in the
+    /// deferred overlay pass so their popups sit above the code panel.
+    static bool IsOverlayComp(string name) {
+        if (name == "Select") { return true; }
+        if (name == "SelectBox") { return true; }
+        if (name == "Dropdown") { return true; }
+        if (name == "Popover") { return true; }
+        if (name == "DataTable") { return true; }
+        if (name == "Layer") { return true; }
+        if (name == "Designer") { return true; }
+        return false;
+    }
+
+    static void RenderOverlay(App app, Canvas c, Theme t, string name,
+            int x, int y, int w) {
+        int px = x + app.Scale(18);
+        int py = y + app.Scale(48);
+        if (name == "SelectBox") {
+            Label.Secondary(app, px, py - app.Scale(24), "single · clearable");
+            Gallery.demoSelect.Render(app, px, py, app.Scale(180));
+            Label.Secondary(app, px + app.Scale(200), py - app.Scale(24), "multi-select");
+            Gallery.demoMulti.Render(app, px + app.Scale(200), py, app.Scale(180));
+            Label.Secondary(app, px + app.Scale(400), py - app.Scale(24), "long · scrolls");
+            Gallery.demoLong.Render(app, px + app.Scale(400), py, app.Scale(180));
+        } else if (name == "Select") {
+            // Retained instance: owns its open state and defers the option list
+            // to the framework overlay layer (draws above the code panel, one
+            // centralized dispatch). No manual hit-testing here.
+            Gallery.demoSelectLow.Render(app, px, py, app.Scale(220), t.heightMedium);
+            Label.Secondary(app, px, py + t.heightMedium + app.Scale(10),
+                "click to open · Change fires on select");
+        } else if (name == "Dropdown") {
+            Dropdown.RenderTrigger(app, px, py, app.Scale(150),
+                t.heightMedium, "Actions", true);
+            List<string> items = new List<string>();
+            items.Add("Edit"); items.Add("Delete");
+            Dropdown.RenderMenu(app, px + app.Scale(166), py, app.Scale(160), items);
+        } else if (name == "Popover") {
+            Popover.Render(app, px + app.Scale(140), py + app.Scale(6),
+                app.Scale(280), app.Scale(96), "Popover",
+                "Anchored explanatory content.");
+        } else if (name == "DataTable") {
+            List<DataColumn> cols = new List<DataColumn>();
+            cols.Add(DataColumn.Text("Name", app.Scale(160)));
+            cols.Add(DataColumn.Numeric("Score", app.Scale(100)));
+            List<DataRow> rows = new List<DataRow>();
+            DataRow row = DataRow.Create();
+            row.Push("Zan"); row.Push("98"); rows.Add(row);
+            DataRow row2 = DataRow.Create();
+            row2.Push("Lang"); row2.Push("87"); rows.Add(row2);
+            DataTable.Render(app, px, py - app.Scale(20), w - app.Scale(36),
+                app.Scale(110), cols, rows, Gallery.demoTableState);
+        } else if (name == "Compose") {
+            // Fluent retained-mode composition: a titled card holding a column
+            // of a label, a progress bar and a row of buttons — all nested with
+            // With(), auto-docked and auto-measured.
+            Panel card = new Panel("card");
+            card.Titled("Create account");
+            card.Add(
+                Panel.Column().Gap(app.Scale(10))
+                    .With(new Label("Fill in the details below.").Variant(1))
+                    .With(new Progress(66, 3))
+                    .With(Panel.Row().Gap(app.Scale(10))
+                        .With(Button.Create("Cancel"))
+                        .With(Button.Primary("Save"))));
+            // Round-trip through the serializer: what you see is rebuilt from the
+            // saved document, proving save/load preserves the whole tree + props.
+            string doc = Serialize.Save(card);
+            Control loaded = Serialize.Load(doc);
+            loaded.MeasureTree(app);
+            loaded.Arrange(px, py - app.Scale(8), w - app.Scale(36), app.Scale(190));
+            loaded.RenderTree(app);
+        } else if (name == "Designer") {
+            Gallery.designer.Render(app, x, y, w, app.Scale(Gallery.PreviewHeight(name)));
+        } else if (name == "Layer") {
+            Gallery.RenderLayerDemo(app, t, px, py, w);
+        }
+    }
+
+    /// The unified Layer demo: a layui-style grid of trigger buttons that open
+    /// every overlay flavour, then the active layers drawn above everything.
+    static void RenderLayerDemo(App app, Theme t, int px, int py, int w) {
+        int bx = px;
+        int by = py;
+        int bw = app.Scale(118);
+        int bh = t.heightMedium;
+        int gap = app.Scale(10);
+        int rowGap = app.Scale(34);
+
+        Label.Secondary(app, bx, by - app.Scale(22), "Dialogs");
+        int a1 = Button.Create("Alert").Render(app, bx, by, bw);
+        if (Button.WasClicked(app, a1)) { Gallery.dlgAlert.Open(); }
+        int a2 = Button.Create("Confirm").Render(app, bx + (bw + gap), by, bw);
+        if (Button.WasClicked(app, a2)) { Gallery.dlgConfirm.Open(); }
+        int a3 = Button.Create("Prompt").Render(app, bx + (bw + gap) * 2, by, bw);
+        if (Button.WasClicked(app, a3)) { Gallery.dlgPrompt.Open(); }
+        by = by + bh + rowGap;
+
+        Label.Secondary(app, bx, by - app.Scale(22),
+            "Message toasts · queue, auto-dismiss, collapse upward");
+        int m1 = Button.Create("Success msg").Render(app, bx, by, bw);
+        if (Button.WasClicked(app, m1)) { Layer.Msg("Saved successfully", 3); }
+        int m2 = Button.Create("Warning msg").Render(app, bx + (bw + gap), by, bw);
+        if (Button.WasClicked(app, m2)) { Layer.Msg("Unsaved changes", 4); }
+        int m3 = Button.Create("Error msg").Render(app, bx + (bw + gap) * 2, by, bw);
+        if (Button.WasClicked(app, m3)) { Layer.Msg("Network error", 5); }
+        by = by + bh + rowGap;
+
+        Label.Secondary(app, bx, by - app.Scale(22), "Notification · loading · tips");
+        int n1 = Button.Create("Notify").Render(app, bx, by, bw);
+        if (Button.WasClicked(app, n1)) { Layer.Notify("Build completed", 3); }
+        int n2 = Button.Create("Loading").Render(app, bx + (bw + gap), by, bw);
+        if (Button.WasClicked(app, n2)) { Gallery.loadStartMs = Window.GetTickMs(); }
+        int tipsX = bx + (bw + gap) * 2;
+        bool tipsNow = Gallery.tipsOn.Get();
+        string tlbl = "Tips";
+        if (tipsNow) { tlbl = "Hide tips"; }
+        int n3 = Button.Create(tlbl).Render(app, tipsX, by, bw);
+        if (Button.WasClicked(app, n3)) { Gallery.tipsOn.Set(!tipsNow); }
+        int tipAX = tipsX + bw / 2;
+        int tipAY = by + bh;
+        by = by + bh + rowGap;
+
+        Label.Secondary(app, bx, by - app.Scale(22),
+            "Draggable windows · full-screen photo carousel");
+        int w1 = Button.Primary("Open window").Render(app, bx, by, bw);
+        if (Button.WasClicked(app, w1)) { Gallery.SpawnLayer(app); }
+        int w2 = Button.Create("Photos").Render(app, bx + (bw + gap), by, bw);
+        if (Button.WasClicked(app, w2)) {
+            Gallery.photoIdx.Set(0);
+            Gallery.photosOpen.Set(true);
+        }
+        Gallery.PopupHint(app, bx + (bw + gap) * 2, by);
+
+        // ---- active layers (drawn above the buttons and the code panel) ----
+        Layer.RenderStack(app, Gallery.demoLayers);
+
+        if (Gallery.dlgAlert.open) {
+            Layer.Render(app, Gallery.dlgAlert);
+            if (Gallery.dlgAlert.action != 0) {
+                Gallery.dlgAlert.open = false;
+                Gallery.popupResult = "alert: OK";
+            }
+        }
+        if (Gallery.dlgConfirm.open) {
+            Layer.Render(app, Gallery.dlgConfirm);
+            int ca = Gallery.dlgConfirm.action;
+            if (ca == 1) { Gallery.dlgConfirm.open = false; Gallery.popupResult = "confirm: yes"; }
+            else if (ca == 2 || ca == 3) { Gallery.dlgConfirm.open = false; Gallery.popupResult = "confirm: no"; }
+        }
+        if (Gallery.dlgPrompt.open) {
+            Layer.Render(app, Gallery.dlgPrompt);
+            int pa = Gallery.dlgPrompt.action;
+            if (pa == 1) {
+                Gallery.dlgPrompt.open = false;
+                Gallery.popupResult = "prompt: " + Gallery.dlgPrompt.PromptText();
+            } else if (pa == 2 || pa == 3) {
+                Gallery.dlgPrompt.open = false;
+                Gallery.popupResult = "prompt: cancelled";
+            }
+        }
+
+        if (Gallery.loadStartMs > 0) {
+            int el = Window.GetTickMs() - Gallery.loadStartMs;
+            if (el >= 3000) {
+                Gallery.loadStartMs = 0;
+                Gallery.popupResult = "loading: done";
+            } else {
+                Layer.RenderLoad(app, px - app.Scale(6), py - app.Scale(6),
+                    w - app.Scale(24), app.Scale(300), "Loading data...");
+                app.RequestAnimationFrame(16);
+            }
+        }
+
+        if (Gallery.tipsOn.Get()) {
+            Layer.Tips(app, tipAX, tipAY, "This is a tip bubble.");
+        }
+
+        if (Gallery.photosOpen.Get()) {
+            bool close = Layer.RenderPhotos(app, Gallery.photoSlides,
+                Gallery.photoIdx, Gallery.photoAnim);
+            if (close) { Gallery.photosOpen.Set(false); }
+        }
+
+        Layer.RenderToasts(app);
+        Layer.RenderNotifs(app);
+    }
+
+    /// Spawns a new floating Layer window, cascaded down-right from the last
+    /// one so several are visibly stacked. Each is independent and draggable.
+    static void SpawnLayer(App app) {
+        int n = Gallery.layerSeq;
+        Gallery.layerSeq = n + 1;
+        int off = (n % 6) * app.Scale(28);
+        LayerState win = LayerState.Create(
+            "Window " + Convert.ToString(n + 1),
+            app.Scale(360) + off, app.Scale(150) + off,
+            app.Scale(400), app.Scale(230));
+        win.body = "Drag the title bar. Click a window to raise it.";
+        win.Open();
+        Gallery.demoLayers.Add(win);
+    }
+
+    /// Shows the last popup action beneath the trigger button in a demo.
+    static void PopupHint(App app, int px, int py) {
+        if (Gallery.popupResult != "") {
+            Label.Secondary(app, px, py + app.Scale(46), "last: " + Gallery.popupResult);
+        } else {
+            Label.Secondary(app, px, py + app.Scale(46), "click the button to open");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Text wrapping helper
+    // ------------------------------------------------------------------
+
+    static List<string> WrapText(string text, int width, int fontSize) {
+        List<string> lines = new List<string>();
+        string cur = "";
+        string word = "";
+        int i = 0;
+        while (i <= text.Length) {
+            string ch = "";
+            if (i < text.Length) { ch = text.Substring(i, 1); }
+            if (i == text.Length || ch == " ") {
+                string trial = cur;
+                if (trial != "") { trial = trial + " "; }
+                trial = trial + word;
+                if (Canvas.MeasureText(trial, fontSize) > width && cur != "") {
+                    lines.Add(cur);
+                    cur = word;
+                } else {
+                    cur = trial;
+                }
+                word = "";
+            } else {
+                word = word + ch;
+            }
+            i = i + 1;
+        }
+        if (cur != "") { lines.Add(cur); }
+        if (lines.Count == 0) { lines.Add(""); }
+        return lines;
+    }
+
+    // ------------------------------------------------------------------
+    // Catalog
+    // ------------------------------------------------------------------
+
+    static Comp Add(List<Comp> list, string cat, string name, string desc, string code) {
+        Comp e = Comp.Create(cat, name, desc, code);
+        list.Add(e);
+        return e;
+    }
+
+    static Comp AddJson(List<Comp> list, string cat, string name, string desc,
+            string code, string json) {
+        Comp e = Comp.CreateJson(cat, name, desc, code, json);
+        list.Add(e);
+        return e;
+    }
+
+    static void BuildComps(List<Comp> list) {
+        Gallery.BuildBasic(list);
+        Gallery.BuildDataEntry(list);
+        Gallery.BuildDataDisplay(list);
+        Gallery.BuildFeedback(list);
+        Gallery.BuildNavigation(list);
+        Gallery.BuildLayout(list);
+        Gallery.BuildEvents(list);
+    }
+
+    static void BuildEvents(List<Comp> list) {
+        Gallery.Add(list, "Events", "ClickEvent",
+            "Widgets expose C#-style events. Register handlers with the delegate += operator (lambda or method group); the handler fires from inside Render on the UI thread, so it is always safe to touch UI state -- no id polling. Use -= to remove one, or myEvent.Post() to raise from a worker thread (marshals each handler to the UI thread).",
+            "Button save = Button.Create(\"Save\");   // retained\nsave.Click += () => { Console.WriteLine(\"saved\"); };\nsave.Click += Store.Commit;             // method group\n// each frame:\nsave.Render(app, 40, 80, 120);          // fires Click on click\n// remove: save.Click -= Store.Commit;");
+        Gallery.Add(list, "Events", "Events",
+            "C#-style delegates and thread-safe events. A retained Button registers its handler once with  Click += StartTask; a background Thread reports progress back through app.Post, which runs the delegate on the UI thread (the Control.Invoke equivalent) so widget state is never touched off-thread.",
+            "// Retained button: register the handler once, like C# OnClick += ...\nButton start = Button.Primary(\"Start background task\");\nstart.Click += StartTask;        // method group (Action)\n\n// each frame:\nstart.Render(app, 40, 80, 210);  // fires Click on click\n\nstatic void StartTask() {\n    Thread.Start(Worker);       // real OS thread\n}\n\n// Runs off the UI thread: hand results back with app.Post.\nstatic void Worker() {\n    Thread.Sleep(140);\n    app.Post(() => { value.Set(value.Get() + 1); });\n}");
+    }
+
+    static void BuildLayout(List<Comp> list) {
+        Gallery.Add(list, "Layout", "Split",
+            "A draggable split view. Create it over an area with the first pane size bound to a SignalInt, then draw into its two rects.",
+            "SignalInt firstW = SignalInt.Create(240);\nRect area = Rect.Create(0, top, w, h - top);\nSplit s = Split.Vertical(app, area, firstW, 160, 200);\n// draw into s.first and s.second each frame")
+            .AddProp("firstW", "SignalInt", "-", "First pane size (two-way, drag updates it).")
+            .AddProp("minFirst", "int", "-", "Minimum size of the first pane.")
+            .AddProp("minSecond", "int", "-", "Minimum size of the second pane.")
+            .AddEvent("first / second", "Rect", "The two pane rectangles to draw into.");
+        Gallery.Add(list, "Layout", "TabView",
+            "An editor-style tab strip with an optional add button. Render returns a TabHit; Apply switches, closes or adds tabs.",
+            "List<string> labels = new List<string>();\nlabels.Add(\"main.zan\"); labels.Add(\"gui.zan\");\nSignalInt active = SignalInt.Create(0);\nint h = TabView.Height(app);\nTabHit hit = TabView.Render(app, 0, top, w, h, labels, active, true);\nTabView.Apply(hit, labels, active, \"untitled\");")
+            .AddProp("labels", "List<string>", "-", "Open tab labels.")
+            .AddProp("active", "SignalInt", "-", "Active tab index (two-way).")
+            .AddProp("addButton", "bool", "false", "Show the trailing + button.")
+            .AddEvent("Render(...)", "TabHit", "Apply() then switches, closes or adds a tab.");
+        Gallery.Add(list, "Layout", "Ribbon",
+            "An Office-style command band of icon-over-label buttons with group separators. Render returns the clicked command index or -1.",
+            "List<RibbonCmd> cmds = new List<RibbonCmd>();\ncmds.Add(RibbonCmd.Group(\"file\", \"New\"));\ncmds.Add(RibbonCmd.Create(\"folder\", \"Open\"));\ncmds.Add(RibbonCmd.Create(\"save\", \"Save\"));\nint cmd = Ribbon.Render(app, 0, top, w, Ribbon.Height(app), cmds);\nif (cmd == 0) {\n    // New\n}")
+            .AddProp("cmds", "List<RibbonCmd>", "-", "Commands; Group() starts a separated group.")
+            .AddEvent("Render(...)", "int", "Returns the clicked command index, or -1.");
+        Gallery.Add(list, "Layout", "Wizard",
+            "A categorized launcher list (e.g. project templates) with a selected index bound to a SignalInt.",
+            "List<string> names = new List<string>();\nnames.Add(\"Console app\"); names.Add(\"GUI app\");\nList<string> icons = new List<string>();\nicons.Add(\"terminal\"); icons.Add(\"window\");\nSignalInt sel = SignalInt.Create(0);\nWizard.RenderList(app, 40, 60, 300, 160, names, icons, sel);")
+            .AddProp("names", "List<string>", "-", "Entry labels.")
+            .AddProp("icons", "List<string>", "-", "Per-entry icon names.")
+            .AddProp("sel", "SignalInt", "-", "Selected entry index (two-way).");
+        Gallery.Add(list, "Layout", "FilePicker",
+            "A modal open/save/folder dialog. Begin a session, render its content each frame, and read the chosen path when it closes.",
+            "FilePicker fp = FilePicker.Create();\nfp.BeginOpenFile(\"\", \".zan\", \"Open file\");\n// each frame while open:\nfp.RenderContent(app);\nif (!fp.IsOpen()) {\n    string path = fp.SelectedPath();\n}")
+            .AddProp("mode", "BeginOpenFile/Save/Folder", "-", "Which dialog to start.")
+            .AddProp("filter", "string", "-", "Extension filter, e.g. \".zan\".")
+            .AddProp("title", "string", "-", "Dialog title.")
+            .AddEvent("IsOpen()", "bool", "False once the user confirms or cancels.")
+            .AddEvent("SelectedPath()", "string", "The chosen path after it closes.");
+        Gallery.Add(list, "Layout", "CodeEditor",
+            "The full text editor widget: Zan syntax highlighting, line numbers, multi-cursor, selection, autocomplete and inline diagnostics.",
+            "CodeEditor ed = new CodeEditor();\ned.SetText(\"class Main {\\n}\\n\");\nRect area = Rect.Create(0, top, w, h - top);\ned.Render(app, area);\nstring src = ed.GetText();")
+            .AddProp("area", "Rect", "-", "Editor bounds (Render).")
+            .AddProp("text", "string", "-", "Buffer contents (SetText/GetText).")
+            .AddEvent("GetText()", "string", "The current edited source.");
+    }
+
+    static void BuildBasic(List<Comp> list) {
+        Comp bt = Comp.Create("Basic", "Button",
+            "Button.Create builds a button; Render(app, x, y, width) draws it and returns its id; Button.WasClicked(app, id) reports a click this frame. Every look is a factory/config on the component -- types, styles, secondary, ghost, loading, shapes and sizes -- so demos only compose, no custom drawing.", "");
+        bt.AddDemo("Types", "Six semantic types via Button.Typed(text, type). Type 0=default,1=primary,2=info,3=success,4=warning,5=error.", "Button.types", 78,
+            "int bw = 92; int gap = 10; int step = bw + gap; int y = 40;\nButton.Create(\"Default\").Render(app, 0, y, bw);\nButton.Typed(\"Primary\", 1).Render(app, step, y, bw);\nButton.Typed(\"Info\", 2).Render(app, 2 * step, y, bw);\nButton.Typed(\"Success\", 3).Render(app, 3 * step, y, bw);\nButton.Typed(\"Warning\", 4).Render(app, 4 * step, y, bw);\nButton.Typed(\"Error\", 5).Render(app, 5 * step, y, bw);",
+            "[\n  { \"kind\": \"Button\", \"text\": \"Default\", \"type\": \"default\" },\n  { \"kind\": \"Button\", \"text\": \"Primary\", \"type\": \"primary\" },\n  { \"kind\": \"Button\", \"text\": \"Info\",    \"type\": \"info\" },\n  { \"kind\": \"Button\", \"text\": \"Success\", \"type\": \"success\" },\n  { \"kind\": \"Button\", \"text\": \"Warning\", \"type\": \"warning\" },\n  { \"kind\": \"Button\", \"text\": \"Error\",   \"type\": \"error\" }\n]");
+        bt.AddDemo("Styles", "Button.Styled(text, type, style) picks the fill treatment: 0=solid,1=outline,2=text,3=dashed. Secondary and Ghost are their own factories.", "Button.styles", 78,
+            "int bw = 92; int gap = 10; int step = bw + gap; int y = 40;\nButton.Styled(\"Solid\", 1, 0).Render(app, 0, y, bw);\nButton.Styled(\"Outline\", 1, 1).Render(app, step, y, bw);\nButton.Styled(\"Text\", 1, 2).Render(app, 2 * step, y, bw);\nButton.Styled(\"Dashed\", 1, 3).Render(app, 3 * step, y, bw);\nButton.Secondary(\"Secondary\", 1).Render(app, 4 * step, y, bw);\nButton.Ghost(\"Ghost\", 1).Render(app, 5 * step, y, bw);",
+            "[\n  { \"kind\": \"Button\", \"text\": \"Solid\",     \"type\": \"primary\", \"style\": \"solid\" },\n  { \"kind\": \"Button\", \"text\": \"Outline\",   \"type\": \"primary\", \"style\": \"outline\" },\n  { \"kind\": \"Button\", \"text\": \"Text\",      \"type\": \"primary\", \"style\": \"text\" },\n  { \"kind\": \"Button\", \"text\": \"Dashed\",    \"type\": \"primary\", \"style\": \"dashed\" },\n  { \"kind\": \"Button\", \"text\": \"Secondary\", \"type\": \"primary\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Ghost\",     \"type\": \"primary\", \"ghost\": true }\n]");
+        bt.AddDemo("Secondary buttons", "A subtly tinted fill with type-colored text -- Button.Secondary(text, type) -- for lower-emphasis actions.", "Button.secondary", 78,
+            "int bw = 92; int gap = 10; int step = bw + gap; int y = 40;\nButton.Secondary(\"Default\", 0).Render(app, 0, y, bw);\nButton.Secondary(\"Primary\", 1).Render(app, step, y, bw);\nButton.Secondary(\"Info\", 2).Render(app, 2 * step, y, bw);\nButton.Secondary(\"Success\", 3).Render(app, 3 * step, y, bw);\nButton.Secondary(\"Warning\", 4).Render(app, 4 * step, y, bw);\nButton.Secondary(\"Error\", 5).Render(app, 5 * step, y, bw);",
+            "[\n  { \"kind\": \"Button\", \"text\": \"Default\", \"type\": \"default\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Primary\", \"type\": \"primary\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Info\",    \"type\": \"info\",    \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Success\", \"type\": \"success\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Warning\", \"type\": \"warning\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Error\",   \"type\": \"error\",   \"secondary\": true }\n]");
+        bt.AddDemo("Loading, disabled & custom color", "Loading shows a built-in spinner and ignores clicks; SetDisabled greys it out; Button.Colored(text, argb) paints any brand color.", "Button.states", 78,
+            "int bw = 92; int gap = 10; int step = bw + gap; int y = 40; int h = 34;\nButton.Loading(\"Loading\", 1).Render(app, 0, y, bw);\nButton.Loading(\"\", 3).SetCircle(true).Render(app, step, y, h);\nButton.Create(\"Disabled\").SetDisabled(true).Render(app, step + h + gap, y, bw);\nButton.Colored(\"Pink\", 0xFFE91E63).Render(app, 2 * step + h + gap, y, bw);\nButton.Colored(\"Teal\", 0xFF13C2C2).Render(app, 3 * step + h + gap, y, bw);",
+            "[\n  { \"kind\": \"Button\", \"text\": \"Loading\",  \"type\": \"primary\", \"loading\": true },\n  { \"kind\": \"Button\", \"text\": \"\",         \"type\": \"success\", \"loading\": true, \"circle\": true },\n  { \"kind\": \"Button\", \"text\": \"Disabled\", \"type\": \"default\", \"disabled\": true },\n  { \"kind\": \"Button\", \"text\": \"Pink\",     \"color\": \"#E91E63\" },\n  { \"kind\": \"Button\", \"text\": \"Teal\",     \"color\": \"#13C2C2\" }\n]");
+        bt.AddDemo("Icons & shapes", "Round(text,type), IconTextTyped(text,icon,type) for icon+label, and IconTyped(icon,type) for icon-only square buttons.", "Button.shapes", 78,
+            "int bw = 92; int gap = 10; int step = bw + gap; int y = 40; int h = 34;\nButton.Round(\"Round\", 1).Render(app, 0, y, bw);\nButton.IconTextTyped(\"Save\", \"save\", 3).Render(app, step, y, bw);\nButton.IconTyped(\"plus\", 1).Render(app, 2 * step, y, h);\nButton.IconTyped(\"settings\", 0).Render(app, 2 * step + h + gap, y, h);",
+            "[\n  { \"kind\": \"Button\", \"text\": \"Round\", \"type\": \"primary\", \"round\": true },\n  { \"kind\": \"Button\", \"text\": \"Save\",  \"type\": \"success\", \"icon\": \"save\" },\n  { \"kind\": \"Button\", \"text\": \"\",      \"type\": \"primary\", \"icon\": \"plus\" },\n  { \"kind\": \"Button\", \"text\": \"\",      \"type\": \"default\", \"icon\": \"settings\" }\n]");
+        bt.AddDemo("Sizes", "SetSize(size) scales the control: 0=tiny,1=small,2=medium (default),3=large.", "Button.sizes", 78,
+            "int y = 40;\nButton.Create(\"Tiny\").SetSize(0).Render(app, 0, y, 64);\nButton.Create(\"Small\").SetSize(1).Render(app, 74, y, 78);\nButton.Create(\"Medium\").SetSize(2).Render(app, 162, y, 92);\nButton.Create(\"Large\").SetSize(3).Render(app, 264, y, 104);",
+            "[\n  { \"kind\": \"Button\", \"text\": \"Tiny\",   \"size\": \"tiny\" },\n  { \"kind\": \"Button\", \"text\": \"Small\",  \"size\": \"small\" },\n  { \"kind\": \"Button\", \"text\": \"Medium\", \"size\": \"medium\" },\n  { \"kind\": \"Button\", \"text\": \"Large\",  \"size\": \"large\" }\n]");
+        bt.AddDemo("Button group", "ButtonGroup.Create(type) welds buttons together with shared borders (rounded only on the outer corners). Add(label) appends a segment; Outline(true) for an outlined group; Render returns the clicked index or -1.", "Button.group", 78,
+            "ButtonGroup g = ButtonGroup.Create(1);\ng.Add(\"Left\"); g.Add(\"Middle\"); g.Add(\"Right\");\nint hit = g.Render(app, 0, 40);   // clicked index, or -1\n\nButtonGroup seg = ButtonGroup.Create(2).Outline(true);\nseg.Add(\"Day\"); seg.Add(\"Week\"); seg.Add(\"Month\"); seg.Add(\"Year\");\nseg.Render(app, 240, 40);",
+            "[\n  { \"kind\": \"ButtonGroup\", \"type\": \"primary\",\n    \"buttons\": [\"Left\", \"Middle\", \"Right\"] },\n  { \"kind\": \"ButtonGroup\", \"type\": \"info\", \"outline\": true,\n    \"buttons\": [\"Day\", \"Week\", \"Month\", \"Year\"] }\n]");
+        bt.AddProp("text", "string", "\"\"", "Button label.");
+        bt.AddProp("icon", "string", "\"\"", "Optional leading icon name.");
+        bt.AddProp("type", "int", "0", "0 default,1 primary,2 info,3 success,4 warning,5 error.");
+        bt.AddProp("style", "int", "0", "0 solid,1 outline,2 text,3 dashed.");
+        bt.AddProp("size", "int", "2", "0 tiny,1 small,2 medium,3 large.");
+        bt.AddProp("secondary", "bool", "false", "Tinted low-emphasis fill.");
+        bt.AddProp("ghost", "bool", "false", "Transparent fill, colored border+text.");
+        bt.AddProp("loading", "bool", "false", "Show spinner and ignore clicks.");
+        bt.AddProp("round", "bool", "false", "Fully rounded pill shape.");
+        bt.AddProp("circle", "bool", "false", "Square icon-only circular button.");
+        bt.AddProp("disabled", "bool", "false", "Non-interactive, greyed out.");
+        bt.AddProp("customColor", "int", "0", "ARGB brand color (Button.Colored).");
+        bt.AddEvent("Click", "() => void", "Fires once per frame the button is clicked (unless disabled/loading).");
+        list.Add(bt);
+        Gallery.Add(list, "Basic", "Label",
+            "Labels draw static text in several styles: normal, Title and Secondary.",
+            "Label.Title(app, 40, 40, \"A big title\");\nLabel.Render(app, 40, 74, \"Normal text\");\nLabel.Secondary(app, 40, 104, \"subtle caption\");")
+            .AddProp("text", "string", "-", "The text to draw.")
+            .AddProp("variant", "Title/Render/Secondary", "Render", "Style factory to call.");
+        Gallery.Add(list, "Basic", "Typography",
+            "Headings and paragraphs for documentation and application content.",
+            "Typography.Heading(app, 40, 40, \"Heading\", 2);\nTypography.Paragraph(app, 40, 84, \"Readable body text.\");")
+            .AddProp("text", "string", "-", "Heading / paragraph text.")
+            .AddProp("level", "int", "-", "Heading level (Heading).");
+        Gallery.Add(list, "Basic", "Divider",
+            "Separate content with a plain line or a labelled divider.",
+            "Divider.Render(app, 40, 80, 420);\nDivider.RenderText(app, 40, 120, 420, \"Section\", 0);")
+            .AddProp("w", "int", "-", "Line width in px.")
+            .AddProp("label", "string", "-", "Inline text (RenderText).")
+            .AddProp("align", "int", "0", "Label alignment: 0 left, 1 center, 2 right.");
+        Gallery.Add(list, "Basic", "Icon",
+            "Draw a named vector icon at a given size and colour.",
+            "Icon.Draw(app.canvas, \"check\", 40, 60, 24, app.theme.primary);")
+            .AddProp("name", "string", "-", "Icon name (see the grid above).")
+            .AddProp("size", "int", "-", "Glyph size in px.")
+            .AddProp("color", "int", "-", "ARGB stroke/fill color.")
+            .AddEvent("Names()", "List<string>", "All available icon names.");
+        Gallery.Add(list, "Basic", "States",
+            "Canonical interaction-state colours shared by every component via the States helper. Precedence: disabled > pressed > selected > hovered > normal. Use it so widgets tint states identically instead of hand-picking theme fields.",
+            "int bg = States.Bg(t, hovered, pressed, selected, disabled);\nint fg = States.Text(t, selected, disabled);\nint bd = States.Border(t, hovered, pressed, focused, disabled);\nc.FillRoundRect(x, y, w, h, t.borderRadiusMedium, bg);\nc.DrawRect(x, y, w, h, bd, 1);")
+            .AddProp("hovered", "bool", "false", "Pointer is over the widget.")
+            .AddProp("pressed", "bool", "false", "Being pressed.")
+            .AddProp("selected", "bool", "false", "Currently selected/active.")
+            .AddProp("focused", "bool", "false", "Has keyboard focus (Border).")
+            .AddProp("disabled", "bool", "false", "Non-interactive; wins precedence.");
+    }
+
+    static void BuildDataEntry(List<Comp> list) {
+        Comp inp = Comp.Create("Data Entry", "Input",
+            "A single-line text field bound to a SignalString. Bind() gives it a hint and a two-way value; Render(app, x, y, w, h) draws it and owns focus, caret movement and text editing; GetText()/SetText() read and replace the value.", "");
+        inp.AddDemo("Basic", "Bind to a SignalString, Render each frame, then read GetText().",
+            "Input", 120,
+            "Input name = Input.Bind(SignalString.Create(\"\"), \"your name\");\nname.Render(app, 40, 40, 260, 34);\nstring value = name.GetText();", "");
+        inp.AddProp("hint", "string", "\"\"", "Placeholder shown while the field is empty.");
+        inp.AddProp("model", "SignalString", "-", "Two-way bound text value (Bind).");
+        inp.AddProp("w", "int", "-", "Field width in pixels (Render argument).");
+        inp.AddProp("h", "int", "-", "Field height in pixels (Render argument).");
+        list.Add(inp);
+        Gallery.Add(list, "Data Entry", "TextArea",
+            "Multiline text input. Owns caret movement (arrows / Home / End), newline editing (Enter) and its own viewport clipping + vertical scrolling (mouse wheel and an auto scrollbar; it keeps the caret in view). Binds to a SignalString.",
+            "TextArea notes = TextArea.Create(\"Write something...\");\nnotes.Render(app, 40, 80, 360, 120);\nstring value = notes.GetText();")
+            .AddProp("hint", "string", "\"\"", "Placeholder shown while empty.")
+            .AddProp("model", "SignalString", "-", "Two-way bound text (Bind).")
+            .AddProp("w", "int", "-", "Box width in px (Render).")
+            .AddProp("h", "int", "-", "Box height in px (Render).");
+        Gallery.Add(list, "Data Entry", "Checkbox",
+            "Checkbox binds to a SignalBool. Call Render then HandleClick to toggle it.",
+            "SignalBool agree = SignalBool.Create(false);\nint id = Checkbox.Render(app, 40, 80, \"I agree\", agree);\nCheckbox.HandleClick(app, id, agree);\nif (agree.Get()) {\n    // enabled\n}")
+            .AddProp("label", "string", "\"\"", "Text drawn next to the box.")
+            .AddProp("model", "SignalBool", "-", "Checked state (two-way).")
+            .AddEvent("Change", "HandleClick(app, id, model)", "Toggles model when the row is clicked.");
+        Gallery.Add(list, "Data Entry", "Radio",
+            "Radio buttons share one SignalInt; each has a distinct option value.",
+            "SignalInt choice = SignalInt.Create(0);\nint a = Radio.Render(app, 40, 80, \"Option A\", choice, 0);\nint b = Radio.Render(app, 40, 110, \"Option B\", choice, 1);\nRadio.HandleClick(app, a, choice, 0);\nRadio.HandleClick(app, b, choice, 1);")
+            .AddProp("label", "string", "\"\"", "Text drawn next to the dot.")
+            .AddProp("model", "SignalInt", "-", "Shared selected value across the group.")
+            .AddProp("value", "int", "-", "This option's value.")
+            .AddEvent("Change", "HandleClick(app, id, model, value)", "Sets model to value when clicked.");
+        Gallery.Add(list, "Data Entry", "Switch",
+            "A toggle switch bound to a SignalBool.",
+            "SignalBool on = SignalBool.Create(true);\nint id = Switch.Render(app, 40, 80, on);\nSwitch.HandleClick(app, id, on);")
+            .AddProp("model", "SignalBool", "-", "On/off state (two-way).")
+            .AddEvent("Change", "HandleClick(app, id, model)", "Flips model when clicked.");
+        Gallery.Add(list, "Data Entry", "Slider",
+            "Slider.Render(app, x, y, width, min, max, model) edits a SignalInt within a range.",
+            "SignalInt volume = SignalInt.Create(50);\nSlider.Render(app, 40, 80, 200, 0, 100, volume);")
+            .AddProp("width", "int", "-", "Track width in px.")
+            .AddProp("min", "int", "-", "Range minimum.")
+            .AddProp("max", "int", "-", "Range maximum.")
+            .AddProp("model", "SignalInt", "-", "Bound value within [min, max].")
+            .AddEvent("Change", "() => void", "Dragging or clicking the track updates model.");
+        Gallery.Add(list, "Data Entry", "Select",
+            "Retained dropdown. Bind() gives it a stable identity; it owns its open state and defers the option list to the framework overlay layer, so the popup always draws above later content. Change fires on select (C#-style delegate).",
+            "List<string> opts = new List<string>();\nopts.Add(\"Red\"); opts.Add(\"Green\"); opts.Add(\"Blue\");\nSignalInt sel = SignalInt.Create(0);\nSelect color = Select.Bind(opts, sel, \"pick a color\");\ncolor.Change += () => { /* sel.Get() changed */ };\n// each frame:\ncolor.Render(app, 40, 80, 200, 28);")
+            .AddProp("options", "List<string>", "-", "Choices shown in the popup.")
+            .AddProp("model", "SignalInt", "-", "Selected option index.")
+            .AddProp("hint", "string", "\"\"", "Placeholder when nothing is chosen.")
+            .AddEvent("Change", "() => void", "Fires when the selected option changes.");
+        Gallery.Add(list, "Data Entry", "SelectBox",
+            "High-level select. Owns open/close, the popup (with its own clipping + scrolling for long lists), single- or multi-selection, an optional clear button, plus size and status variants. One Render() call does everything.",
+            "SelectBox city = SelectBox.Create(\"Pick a city\").Clearable(true);\ncity.AddOption(\"London\"); city.AddOption(\"Paris\");\ncity.Render(app, 40, 80, 200);\nint i = city.Selected();      // -1 if none\n// multi-select: SelectBox.Multi(hint) + city.IsChosen(i)")
+            .AddProp("hint", "string", "\"\"", "Placeholder text.")
+            .AddProp("clearable", "bool", "false", "Show a clear button (Clearable).")
+            .AddProp("multi", "bool", "false", "Multi-selection (SelectBox.Multi).")
+            .AddProp("options", "List<string>", "-", "Added via AddOption.")
+            .AddEvent("Selected()", "int", "Current selection index, or -1 if none.");
+        Gallery.Add(list, "Data Entry", "Rate",
+            "An interactive star rating bound to a SignalInt.",
+            "SignalInt rating = SignalInt.Create(3);\nint id = Rate.Render(app, 40, 60, rating, 5);\nRate.HandleClick(app, id, 5, rating);")
+            .AddProp("model", "SignalInt", "-", "Current rating (0..count).")
+            .AddProp("count", "int", "5", "Number of stars.")
+            .AddEvent("Change", "HandleClick(app, id, count, model)", "Sets model to the clicked star.");
+    }
+
+    static void BuildDataDisplay(List<Comp> list) {
+        Gallery.Add(list, "Data Display", "Card",
+            "Card draws a titled panel. Card.ContentY gives the y where your content should start.",
+            "Card.Render(app, 40, 40, 260, 160, \"Profile\");\nint cy = Card.ContentY(40, app.theme);\nLabel.Render(app, 56, cy, \"Card body goes here\");")
+            .AddProp("title", "string", "-", "Header text.")
+            .AddProp("w", "int", "-", "Card width in px.")
+            .AddProp("h", "int", "-", "Card height in px.")
+            .AddEvent("ContentY(y, theme)", "int", "Y where your body content should start.");
+        Gallery.Add(list, "Data Display", "Panel",
+            "Create card, section or coloured surface rectangles for custom content.",
+            "Rect content = Panel.Section(app, 40, 60, 420, 220, \"Panel title\");\nLabel.Render(app, content.x, content.y, \"Inside the panel\");")
+            .AddProp("title", "string", "-", "Section title.")
+            .AddProp("w", "int", "-", "Panel width in px.")
+            .AddProp("h", "int", "-", "Panel height in px.")
+            .AddEvent("Section(...)", "Rect", "Returns the inner content rectangle.");
+        Gallery.Add(list, "Data Display", "Compose",
+            "Fluent retained-mode composition: containers nest children with .With(a).With(b), auto-docked along a Column/Row flow and auto-measured, so building trees needs no hand-computed x/y/w/h.",
+            "Panel card = new Panel(\"card\");\ncard.Titled(\"Create account\");\ncard.Add(\n    Panel.Column().Gap(10)\n        .With(new Label(\"Fill in the details below.\").Variant(1))\n        .With(new Progress(66, 3))\n        .With(Panel.Row().Gap(10)\n            .With(Button.Create(\"Cancel\"))\n            .With(Button.Primary(\"Save\"))));\n// each frame:\ncard.MeasureTree(app);\ncard.Arrange(x, y, w, h);\ncard.RenderTree(app);")
+            .AddProp("Titled(text)", "builder", "-", "Give a container a title.")
+            .AddProp("Column()/Row()", "builder", "-", "Flow direction for children.")
+            .AddProp("Gap(px)", "builder", "0", "Space between children.")
+            .AddProp("With(child)", "builder", "-", "Append a child node.");
+        Gallery.Add(list, "Data Display", "Designer",
+            "A reusable FormCreate-style form builder (stdlib Gui.Designer). Click a field type in the left palette to append a labelled row; click a row to select it; reorder/delete it from the toolbar. The right inspector switches between per-field properties (label, name, placeholder, required, options, change handler) and form-level config (label position, size, label width, required star, submit/reset buttons, submit handler). Save/Load round-trips the whole form (config + ordered fields + options + handlers); Preview hides the editing chrome.",
+            "// once\nDesigner d = Designer.Create();\nd.Seed(app);\n// each frame\nd.Render(app, x, y, w, h);\n\n// each row is a FormField control carrying what to collect:\nFormField f = FormField.New(6, 0);   // 6 = select\nf.SetProp(\"label\", \"Category\");\nf.SetProp(\"options\", \"News|Blog|Docs\");")
+            .AddProp("fields", "List<FormField>", "-", "Ordered rows the form collects.")
+            .AddProp("labelPosition", "int", "0", "Label placement (top/left).")
+            .AddProp("size", "int", "1", "Control size for all fields.")
+            .AddEvent("Save()/Load()", "string", "Round-trip the whole form definition.");
+        Gallery.Add(list, "Data Display", "Tag",
+            "Tag draws a small coloured label. The last argument selects the colour variant.",
+            "Tag.Render(app, 40, 80, \"Default\", 0);\nTag.Render(app, 140, 80, \"Success\", 1);\nTag.Render(app, 240, 80, \"Warning\", 2);\nTag.Render(app, 340, 80, \"Error\", 3);")
+            .AddProp("text", "string", "-", "Tag label.")
+            .AddProp("variant", "int", "0", "0 default, 1 success, 2 warning, 3 error.");
+        Comp av = Comp.Create("Data Display", "Avatar",
+            "A circular avatar showing either a text initial or a named icon. size sets the diameter.", "");
+        av.AddDemo("Initials", "Avatar.Render(app, x, y, size, text) centres an initial; pass a larger size for a bigger circle.", "Avatar.text", 130,
+            "Avatar.Render(app, 40, 40, 32, \"A\");\nAvatar.Render(app, 100, 40, 42, \"Z\");\nAvatar.Render(app, 170, 40, 52, \"GK\");", "");
+        av.AddDemo("Icon", "Avatar.RenderWithIcon(app, x, y, size, icon) draws a named icon instead of text.", "Avatar.icon", 130,
+            "Avatar.RenderWithIcon(app, 40, 40, 42, \"user\");\nAvatar.RenderWithIcon(app, 112, 40, 42, \"settings\");", "");
+        av.AddProp("size", "int", "-", "Diameter in px.");
+        av.AddProp("text", "string", "-", "Initial shown (Render).");
+        av.AddProp("icon", "string", "-", "Icon name (RenderWithIcon).");
+        list.Add(av);
+        Comp bg = Comp.Create("Data Display", "Badge",
+            "A small status marker placed next to another control: a plain dot or a numeric count.", "");
+        bg.AddDemo("Dot", "Badge.Dot(app, x, y) marks an unread or active state without a number.", "Badge.dot", 120,
+            "Badge.Dot(app, 40, 40);", "");
+        bg.AddDemo("Count", "Badge.Count(app, x, y, n) shows a number; large values are capped with a plus.", "Badge.count", 120,
+            "Badge.Count(app, 40, 40, 5);\nBadge.Count(app, 100, 40, 12);\nBadge.Count(app, 170, 40, 99);", "");
+        bg.AddProp("count", "int", "-", "Number shown (Count); Dot() has no count.");
+        list.Add(bg);
+        Gallery.Add(list, "Data Display", "Statistic",
+            "Show a highlighted numeric value with a descriptive label.",
+            "Statistic.Render(app, 40, 60, \"Active users\", \"12,480\");")
+            .AddProp("label", "string", "-", "Descriptive caption.")
+            .AddProp("value", "string", "-", "Highlighted value.");
+        Gallery.Add(list, "Data Display", "Timeline",
+            "Display ordered events with titles and descriptions.",
+            "List<string> titles = new List<string>();\ntitles.Add(\"Created\"); titles.Add(\"Published\");\nList<string> descs = new List<string>();\ndescs.Add(\"Project initialized\"); descs.Add(\"Executable generated\");\nTimeline.Render(app, 40, 60, titles, descs);")
+            .AddProp("titles", "List<string>", "-", "Per-event titles.")
+            .AddProp("descs", "List<string>", "-", "Per-event descriptions.");
+        Gallery.Add(list, "Data Display", "ListView",
+            "Render a compact vertical list of strings.",
+            "List<string> items = new List<string>();\nitems.Add(\"Alpha\"); items.Add(\"Beta\");\nListView.Render(app, 40, 60, 280, items);")
+            .AddProp("w", "int", "-", "List width in px.")
+            .AddProp("items", "List<string>", "-", "Row labels.");
+        Gallery.Add(list, "Data Display", "VirtualList",
+            "High-level virtualized list: a fixed-height viewport over an arbitrarily large item list that draws ONLY the visible rows (constant cost for 100k rows). Owns pixel scrolling, the scrollbar and hover/selection by composing a ScrollView. Use this instead of ListView for large data.",
+            "VirtualList list = VirtualList.Create();\nlist.SetItems(rows);         // any number of rows\nlist.Render(app, 40, 60, 300, 150);\nint sel = list.Selected();   // -1 if none\nint hit = list.TakeActivated(); // clicked row, or -1")
+            .AddProp("items", "List<string>", "-", "Rows (SetItems); any size.")
+            .AddProp("w", "int", "-", "Viewport width in px.")
+            .AddProp("h", "int", "-", "Viewport height in px.")
+            .AddEvent("Selected()", "int", "Selected row index, or -1.")
+            .AddEvent("TakeActivated()", "int", "Row clicked this frame, or -1.");
+        Gallery.Add(list, "Data Display", "Table",
+            "Render a lightweight table header and striped rows.",
+            "List<string> cols = new List<string>();\ncols.Add(\"Name\"); cols.Add(\"Status\");\nList<int> widths = new List<int>();\nwidths.Add(220); widths.Add(120);\nTable.RenderHeader(app, 40, 60, cols, widths);\nList<string> cells = new List<string>();\ncells.Add(\"Zan\"); cells.Add(\"Ready\");\nTable.RenderRow(app, 40, 60 + app.theme.heightMedium, cells, widths, true);")
+            .AddProp("cols/cells", "List<string>", "-", "Header labels / row cells.")
+            .AddProp("widths", "List<int>", "-", "Per-column widths in px.")
+            .AddProp("striped", "bool", "false", "Alternate-row background (RenderRow).");
+        Gallery.Add(list, "Data Display", "DataTable",
+            "A stateful table with typed columns, sorting, filtering and CSV export.",
+            "List<DataColumn> cols = new List<DataColumn>();\ncols.Add(DataColumn.Text(\"Name\", 180));\ncols.Add(DataColumn.Numeric(\"Score\", 100));\nList<DataRow> rows = new List<DataRow>();\nDataRow row = DataRow.Create();\nrow.Push(\"Zan\"); row.Push(\"98\"); rows.Add(row);\nDataTableState state = DataTableState.Create();\nDataTable.Render(app, 40, 60, 520, 260, cols, rows, state);")
+            .AddProp("cols", "List<DataColumn>", "-", "Typed columns (Text/Numeric).")
+            .AddProp("rows", "List<DataRow>", "-", "Row data (Push per cell).")
+            .AddProp("state", "DataTableState", "-", "Sort/filter state (retained).")
+            .AddEvent("sort / filter", "via state", "Header clicks mutate state and re-order rows.");
+        Gallery.Add(list, "Data Display", "PivotTable",
+            "Summarize rows by configured row, column and value fields.",
+            "PivotConfig cfg = PivotConfig.Create(0, 1, 2, 0);\nList<DataRow> rows = new List<DataRow>();\nPivotTable.Render(app, 40, 60, 560, 280, rows, cfg);")
+            .AddProp("cfg", "PivotConfig", "-", "Row/column/value fields + aggregation.")
+            .AddProp("rows", "List<DataRow>", "-", "Source rows to summarize.");
+        Gallery.Add(list, "Data Display", "TreeView",
+            "Render expandable directory and file nodes with scrolling and selection.",
+            "List<TreeNode> nodes = new List<TreeNode>();\nnodes.Add(TreeNode.Dir(\"src\", 0, true));\nnodes.Add(TreeNode.FileIcon(\"main.zan\", 1, \"file\"));\nSignalInt selected = SignalInt.Create(1);\nTreeView.Render(app, Rect.Create(40, 60, 320, 280), nodes, selected, 0);")
+            .AddProp("nodes", "List<TreeNode>", "-", "Dir/file nodes with depth.")
+            .AddProp("selected", "SignalInt", "-", "Selected node index (two-way).")
+            .AddEvent("select", "via selected", "Clicking a node updates selected.");
+        Gallery.Add(list, "Data Display", "Collapse",
+            "Display expandable sections controlled by a SignalInt open index.",
+            "List<string> heads = new List<string>();\nheads.Add(\"General\"); heads.Add(\"Advanced\");\nList<string> content = new List<string>();\ncontent.Add(\"General settings\"); content.Add(\"Advanced settings\");\nSignalInt open = SignalInt.Create(0);\nint first = Collapse.Render(app, 40, 60, 420, heads, content, open);\nCollapse.HandleClick(app, first, heads.Count, open);")
+            .AddProp("heads", "List<string>", "-", "Section headers.")
+            .AddProp("content", "List<string>", "-", "Section bodies.")
+            .AddProp("open", "SignalInt", "-", "Index of the expanded section.")
+            .AddEvent("Change", "HandleClick(...)", "Clicking a header sets the open index.");
+        Comp car = Comp.Create("Data Display", "Carousel",
+            "A slide panel with prev/next arrows and indicator dots, driven by a SignalInt active index. Carousel.Render swaps slides instantly; Carousel.RenderAnimated slides the outgoing/incoming panels horizontally via a caller-owned CarouselAnim. Arrows and dots are wired with Carousel.HandleClick. For an immersive full-screen viewer, wrap it in Layer.RenderPhotos.", "");
+        car.AddDemo("Basic", "Carousel.Render(app, x, y, w, h, slides, idx) draws the current slide with arrows + dots; the index jumps instantly.", "Carousel.basic", 150,
+            "List<string> slides = new List<string>();\nslides.Add(\"First\"); slides.Add(\"Second\"); slides.Add(\"Third\");\nSignalInt idx = SignalInt.Create(0);\nint id = Carousel.Render(app, 40, 60, 460, 150, slides, idx);\nCarousel.HandleClick(app, id, slides.Count, idx);", "");
+        car.AddDemo("Animated slide", "Carousel.RenderAnimated slides between panels. Pass a CarouselAnim so the transition survives immediate-mode frames.", "Carousel.anim", 150,
+            "CarouselAnim anim = CarouselAnim.Create();\nint id = Carousel.RenderAnimated(app, 40, 60, 460, 150, slides, idx, anim);\nCarousel.HandleClick(app, id, slides.Count, idx);", "");
+        car.AddDemo("Many slides", "The indicator dots scale to the slide count; the active dot widens. Handy for a gallery of images or steps.", "Carousel.many", 150,
+            "// six labelled slides -- dots grow with the count:\nCarousel.RenderAnimated(app, 40, 60, 460, 150, slides, idx, anim);", "");
+        car.AddProp("slides", "List<string>", "-", "Slide labels (one panel each).");
+        car.AddProp("idx", "SignalInt", "-", "Active slide index (two-way).");
+        car.AddProp("anim", "CarouselAnim", "-", "Caller-owned slide-transition state (RenderAnimated).");
+        car.AddEvent("Change", "HandleClick(...)", "Arrows / dots advance the active slide.");
+        list.Add(car);
+        Comp ch = Comp.Create("Data Display", "Chart",
+            "A family of static chart renderers over ChartSeries data. Category charts (Line, Area, Bar) share (labels, List<ChartSeries>); part-of-whole charts (Pie, Donut) take (names, values); Scatter plots (xs, ys) on numeric axes. Every call is a single X.Render(app, x, y, w, h, title, ...) -- no retained chart state.", "");
+        ch.AddDemo("Line", "Chart.Line(app, x, y, w, h, title, labels, series) plots one polyline per series over shared category labels.", "Chart.line", 210,
+            "List<string> labels = new List<string>();\nlabels.Add(\"Q1\"); labels.Add(\"Q2\"); labels.Add(\"Q3\"); labels.Add(\"Q4\");\nList<int> rev = new List<int>();\nrev.Add(12); rev.Add(28); rev.Add(20); rev.Add(35);\nList<ChartSeries> series = new List<ChartSeries>();\nseries.Add(ChartSeries.Create(\"Revenue\", rev, app.theme.primary));\nChart.Line(app, 40, 40, 480, 200, \"Quarterly revenue\", labels, series);", "");
+        ch.AddDemo("Area", "Chart.Area fills under each line -- same data shape as Line.", "Chart.area", 210,
+            "Chart.Area(app, 40, 40, 480, 200, \"Quarterly revenue\", labels, series);", "");
+        ch.AddDemo("Bar", "Chart.Bar draws grouped vertical bars, one group per label.", "Chart.bar", 210,
+            "Chart.Bar(app, 40, 40, 480, 200, \"Quarterly revenue\", labels, series);", "");
+        ch.AddDemo("Pie", "Chart.Pie(app, x, y, w, h, title, names, values) shows part-of-whole slices.", "Chart.pie", 210,
+            "List<int> parts = new List<int>();\nparts.Add(45); parts.Add(30); parts.Add(25);\nList<string> names = new List<string>();\nnames.Add(\"Zan\"); names.Add(\"C\"); names.Add(\"Rust\");\nChart.Pie(app, 40, 40, 480, 200, \"Language share\", names, parts);", "");
+        ch.AddDemo("Donut", "Chart.Donut is a pie with a hollow centre.", "Chart.donut", 210,
+            "Chart.Donut(app, 40, 40, 480, 200, \"Language share\", names, parts);", "");
+        ch.AddDemo("Scatter", "Chart.Scatter(app, x, y, w, h, title, xs, ys, color) plots (x, y) points on value axes.", "Chart.scatter", 210,
+            "List<int> xs = new List<int>();\nxs.Add(5); xs.Add(12); xs.Add(18); xs.Add(24);\nList<int> ys = new List<int>();\nys.Add(8); ys.Add(14); ys.Add(11); ys.Add(26);\nChart.Scatter(app, 40, 40, 480, 200, \"Samples\", xs, ys, app.theme.primary);", "");
+        ch.AddProp("title", "string", "\"\"", "Heading drawn top-left; \"\" hides it.");
+        ch.AddProp("labels", "List<string>", "-", "Category axis labels (Line/Area/Bar).");
+        ch.AddProp("series", "List<ChartSeries>", "-", "Named value series with colours (Line/Area/Bar).");
+        ch.AddProp("names", "List<string>", "-", "Slice labels (Pie/Donut).");
+        ch.AddProp("values", "List<int>", "-", "Slice / point values (Pie/Donut/Scatter).");
+        ch.AddProp("color", "int", "-", "ARGB point colour (Scatter).");
+        list.Add(ch);
+        Gallery.Add(list, "Data Display", "Ellipsis",
+            "Measure and truncate long text so it fits a fixed width.",
+            "string shown = Ellipsis.Fit(\"A very long file name.zan\", 160, app.theme.fontSizeMedium);\nEllipsis.Render(app, 40, 60, 160, shown);")
+            .AddProp("text", "string", "-", "Full text to truncate.")
+            .AddProp("w", "int", "-", "Max width in px.")
+            .AddEvent("Fit(text, w, fs)", "string", "Returns the text truncated with an ellipsis.");
+        Gallery.Add(list, "Data Display", "Empty",
+            "Display a clear empty-state placeholder when no data is available.",
+            "Empty.Render(app, 40, 60, 420, 180, \"No records yet\");")
+            .AddProp("w", "int", "-", "Placeholder width in px.")
+            .AddProp("h", "int", "-", "Placeholder height in px.")
+            .AddProp("message", "string", "-", "Empty-state caption.");
+    }
+
+    static void BuildFeedback(List<Comp> list) {
+        Gallery.Add(list, "Feedback", "Alert",
+            "Alert shows an inline banner with a title, message and type (0 info, 1 success, 2 warning, 3 error).",
+            "Alert.Render(app, 40, 80, 360, \"Saved\", \"Your changes were saved.\", 1);")
+            .AddProp("w", "int", "-", "Banner width in px.")
+            .AddProp("title", "string", "-", "Bold heading.")
+            .AddProp("message", "string", "-", "Body text.")
+            .AddProp("type", "int", "0", "0 info, 1 success, 2 warning, 3 error.");
+        Comp pr = Comp.Create("Feedback", "Progress",
+            "Progress indicators. A line bar shows a labelled percentage; a ring gauge shows the same value as a circle. type selects the colour (0 default, 2 info, 3 success, 4 warning).", "");
+        pr.AddDemo("Line", "Progress.RenderText(app, x, y, w, percent, type) draws a labelled horizontal bar.", "Progress.line", 170,
+            "Progress.RenderText(app, 40, 40, 300, 72, 0);\nProgress.RenderText(app, 40, 70, 300, 45, 2);\nProgress.RenderText(app, 40, 100, 300, 90, 3);", "");
+        pr.AddDemo("Circle", "Progress.Circle(app, cx, cy, radius, percent, type) draws a ring gauge.", "Progress.circle", 150,
+            "Progress.Circle(app, 90, 70, 34, 72, 0);\nProgress.Circle(app, 190, 70, 34, 90, 3);\nProgress.Circle(app, 290, 70, 34, 45, 4);", "");
+        pr.AddProp("w", "int", "-", "Bar width in px (line).");
+        pr.AddProp("radius", "int", "-", "Ring radius in px (circle).");
+        pr.AddProp("percent", "int", "-", "Filled fraction, 0-100.");
+        pr.AddProp("type", "int", "0", "Colour: 0 default, 2 info, 3 success, 4 warning.");
+        list.Add(pr);
+        Gallery.Add(list, "Feedback", "Result",
+            "Show a success, warning or error result with a title and description.",
+            "Result.Render(app, 40, 60, 460, 1, \"Published\", \"The executable is ready.\");")
+            .AddProp("w", "int", "-", "Block width in px.")
+            .AddProp("status", "int", "0", "0 success, 1 warning, 2 error.")
+            .AddProp("title", "string", "-", "Result heading.")
+            .AddProp("desc", "string", "-", "Supporting description.");
+        Comp sp = Comp.Create("Feedback", "Spin",
+            "An animated spinner, on its own at any size or centred over a region with a caption.", "");
+        sp.AddDemo("Spinner", "Spin.Render(app, cx, cy, radius, color) draws a bare spinner.", "Spin.plain", 130,
+            "Spin.Render(app, 60, 50, 14, app.theme.primary);\nSpin.Render(app, 120, 50, 20, app.theme.primary);\nSpin.Render(app, 190, 50, 28, app.theme.info);", "");
+        sp.AddDemo("With tip", "Spin.WithTip(app, x, y, w, h, tip) centres a spinner and caption inside a box.", "Spin.tip", 150,
+            "Spin.WithTip(app, 40, 40, 300, 110, \"Loading data...\");", "");
+        sp.AddProp("radius", "int", "-", "Spinner radius in px.");
+        sp.AddProp("color", "int", "-", "ARGB stroke color.");
+        sp.AddProp("tip", "string", "\"\"", "Caption below the spinner (WithTip).");
+        list.Add(sp);
+        Gallery.Add(list, "Feedback", "Loading",
+            "Draw an animated loading indicator.",
+            "Loading.Render(app, 80, 80, 18);")
+            .AddProp("radius", "int", "-", "Indicator radius in px.");
+        Gallery.Add(list, "Feedback", "Skeleton",
+            "Compose rectangle, circle and text placeholders while content loads.",
+            "Skeleton.Circle(app, 60, 80, 20);\nSkeleton.Text(app, 96, 62, 240);\nSkeleton.Rect(app, 96, 90, 180, 14);")
+            .AddProp("Circle(x, y, r)", "helper", "-", "Round placeholder.")
+            .AddProp("Text(x, y, w)", "helper", "-", "Single text-line placeholder.")
+            .AddProp("Rect(x, y, w, h)", "helper", "-", "Rectangular block placeholder.");
+        Gallery.Add(list, "Feedback", "Tooltip",
+            "Tooltip draws a small floating hint anchored at a point.",
+            "Tooltip.Render(app, 120, 80, \"More information\");")
+            .AddProp("text", "string", "-", "Hint text shown in the bubble.");
+        Gallery.Add(list, "Feedback", "Popover",
+            "Display titled explanatory content next to an anchor.",
+            "Popover.Render(app, 180, 80, 260, 140, \"Details\", \"Additional information\");")
+            .AddProp("w", "int", "-", "Popover width in px.")
+            .AddProp("h", "int", "-", "Popover height in px.")
+            .AddProp("title", "string", "-", "Heading.")
+            .AddProp("content", "string", "-", "Body text.");
+        Gallery.Add(list, "Feedback", "Dropdown",
+            "Combine a trigger button with an anchored menu of actions.",
+            "int trigger = Dropdown.RenderTrigger(app, 40, 60, 160, 34, \"Actions\", true);\nList<string> items = new List<string>();\nitems.Add(\"Edit\"); items.Add(\"Delete\");\nint chosen = Dropdown.RenderMenu(app, 40, 98, 180, items);")
+            .AddProp("label", "string", "-", "Trigger button text.")
+            .AddProp("items", "List<string>", "-", "Menu actions.")
+            .AddEvent("RenderMenu(...)", "int", "Returns the chosen action index, or -1.");
+        Gallery.Add(list, "Feedback", "Layer",
+            "The unified overlay component (layui `layer` style): one API for every popup. Message toasts and corner notifications are animated auto-dismissing queues that collapse upward; Alert / Confirm / Prompt are centered modal dialogs; Load is a masked spinner; Tips is an anchored bubble; draggable windows (min / max / restore / close) act as page layers; Photos is a full-screen image carousel. Every layer animates on open.",
+            "// transient queues (auto-dismiss + animate):\nLayer.Msg(\"Saved successfully\", 3);\nLayer.Notify(\"Build completed\", 3);\n// centered modal dialogs:\nLayerState ask = LayerState.Confirm(\"Delete?\", \"This cannot be undone.\", 2);\nask.Open();\nLayerState edit = LayerState.Prompt(\"Rename\", \"new name\");\nedit.Open();\n// draggable page window:\nLayerState win = LayerState.Create(\"Window\", 360, 150, 400, 230);\nwin.Open();\nwins.Add(win);\n// each frame, in the overlay pass:\nLayer.RenderStack(app, wins);\nLayer.Render(app, ask);\nLayer.RenderToasts(app);\nLayer.RenderNotifs(app);")
+            .AddProp("Msg(text, type)", "void", "-", "Queue a top-centered toast (auto-dismisses).")
+            .AddProp("Notify(title, type)", "void", "-", "Queue a corner notification.")
+            .AddProp("RenderLoad(x,y,w,h,tip)", "void", "-", "Masked spinner over a region.")
+            .AddProp("Tips(ax, ay, text)", "void", "-", "Anchored tip bubble.")
+            .AddProp("RenderPhotos(slides,idx,anim)", "bool", "-", "Full-screen carousel; true on close.")
+            .AddProp("type", "int", "1", "1 default, 2 info, 3 success, 4 warning, 5 error.")
+            .AddEvent("LayerState.Alert/Confirm/Prompt", "LayerState", "Build a centered modal dialog; read state.action (1 OK, 2 cancel, 3 close).")
+            .AddEvent("RenderStack(wins)", "void", "Draw the z-ordered, draggable window stack.");
+        Gallery.Add(list, "Feedback", "FloatButton",
+            "A compact circular floating action button with an icon.",
+            "int id = FloatButton.Render(app, 520, 360, 48, \"plus\", 1);\nif (Ui.Clicked(app, id)) {\n    // create an item\n}")
+            .AddProp("size", "int", "-", "Button diameter in px.")
+            .AddProp("icon", "string", "-", "Icon name.")
+            .AddProp("type", "int", "0", "Color type.")
+            .AddEvent("Click", "Ui.Clicked(app, id)", "True the frame the button is clicked.");
+    }
+
+    static void BuildNavigation(List<Comp> list) {
+        Gallery.Add(list, "Navigation", "Tabs",
+            "Tabs render a row of labels; the active tab index is a SignalInt.",
+            "List<string> labels = new List<string>();\nlabels.Add(\"General\"); labels.Add(\"Advanced\");\nSignalInt active = SignalInt.Create(0);\nint first = Tabs.Render(app, 40, 40, 400, labels, active);\nTabs.HandleClick(app, first, labels.Count, active);")
+            .AddProp("w", "int", "-", "Row width in px.")
+            .AddProp("labels", "List<string>", "-", "Tab titles.")
+            .AddProp("active", "SignalInt", "-", "Active tab index (two-way).")
+            .AddEvent("Change", "HandleClick(...)", "Clicking a tab sets active.");
+        Gallery.Add(list, "Navigation", "TabBar",
+            "High-level, self-contained tab bar. Owns its tab list, active index, closable tabs, horizontal overflow (mouse wheel + chevrons) and a right-click context menu (Close / Close others / Close all). Styles: Line, Card, Segment. One Render() call draws and handles everything.",
+            "TabBar tabs = TabBar.Create(TabBar.Card());\ntabs.Add(\"Overview\", false);   // (label, closable)\ntabs.Add(\"Details\", true);\n// each frame:\ntabs.Render(app, 40, 40, 360);\nint now = tabs.Active();\nint closed = tabs.TakeClosed(); // index removed, or -1")
+            .AddProp("style", "int", "-", "Line, Card or Segment.")
+            .AddProp("tabs", "(label, closable)", "-", "Added via Add().")
+            .AddEvent("Active()", "int", "Current active tab index.")
+            .AddEvent("TakeClosed()", "int", "Tab removed this frame, or -1.");
+        Gallery.Add(list, "Navigation", "Steps",
+            "Show progress through a sequence of labeled steps.",
+            "List<string> labels = new List<string>();\nlabels.Add(\"Details\"); labels.Add(\"Review\"); labels.Add(\"Done\");\nSignalInt current = SignalInt.Create(1);\nSteps.Render(app, 40, 60, 520, labels, current);")
+            .AddProp("w", "int", "-", "Row width in px.")
+            .AddProp("labels", "List<string>", "-", "Step titles.")
+            .AddProp("current", "SignalInt", "-", "Index of the active step.");
+        Gallery.Add(list, "Navigation", "Breadcrumb",
+            "Show the current location as a sequence of navigation labels.",
+            "List<string> items = new List<string>();\nitems.Add(\"Home\"); items.Add(\"Projects\"); items.Add(\"Zan\");\nBreadcrumb.Render(app, 40, 60, items);")
+            .AddProp("items", "List<string>", "-", "Path segments, root first.");
+        Gallery.Add(list, "Navigation", "Menu",
+            "A vertical application menu with a SignalInt active item.",
+            "List<string> labels = new List<string>();\nlabels.Add(\"Home\"); labels.Add(\"Settings\");\nSignalInt active = SignalInt.Create(0);\nint first = Menu.RenderVertical(app, 40, 60, 220, 300, 36, labels, active, 0);\nMenu.HandleClick(app, first, labels.Count, active);")
+            .AddProp("labels", "List<string>", "-", "Menu item labels.")
+            .AddProp("active", "SignalInt", "-", "Active item index (two-way).")
+            .AddProp("rowH", "int", "-", "Row height in px.")
+            .AddEvent("Change", "HandleClick(...)", "Clicking an item sets active.");
+        Gallery.Add(list, "Navigation", "PageHeader",
+            "Render a page title, subtitle and back action.",
+            "int backId = PageHeader.Render(app, 40, 40, 520, \"Components\", \"GUI reference\");")
+            .AddProp("w", "int", "-", "Header width in px.")
+            .AddProp("title", "string", "-", "Page title.")
+            .AddProp("subtitle", "string", "-", "Secondary line.")
+            .AddEvent("Render(...)", "int", "Returns the back-action id (use Ui.Clicked).");
+        Gallery.Add(list, "Navigation", "Pagination",
+            "Navigate pages with a SignalInt current page.",
+            "SignalInt page = SignalInt.Create(1);\nint id = Pagination.Render(app, 40, 60, 12, page);\nPagination.HandleClick(app, id, 12, page);")
+            .AddProp("total", "int", "-", "Number of pages.")
+            .AddProp("page", "SignalInt", "-", "Current page (two-way).")
+            .AddEvent("Change", "HandleClick(...)", "Clicking a page sets page.");
+        Gallery.Add(list, "Navigation", "Scrollbar",
+            "Draw a vertical scrollbar for a custom scrollable surface.",
+            "Scrollbar.RenderVertical(app, 500, 60, 240, 900, 120);")
+            .AddProp("viewH", "int", "-", "Visible viewport height in px.")
+            .AddProp("contentH", "int", "-", "Total content height in px.")
+            .AddProp("offset", "int", "-", "Current scroll offset in px.");
+    }
+}

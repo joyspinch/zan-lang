@@ -3,28 +3,157 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// Progress bar with type variants.
+/// Progress indicator with type variants.
 /// Types: default(1), info(2), success(3), warning(4), error(5)
-class Progress {
+/// Shapes: a linear track bar (Render / RenderText) or a circular ring
+/// (Circle), both optionally annotated with the numeric percentage.
+class Progress : Control {
+    int percent;
+    int ptype;
+    /// 0 = linear bar, 1 = circular ring.
+    int shape;
+
+    void InitProgress(int pct, int pt) {
+        this.InitControl("progress", 1);
+        percent = pct;
+        ptype = pt;
+        shape = 0;
+    }
+
+    /// Retained-mode constructor: `Progress p = new Progress(60, 3);`
+    Progress(int pct, int pt) {
+        InitProgress(pct, pt);
+    }
+
+    void SetPercent(int pct) {
+        percent = pct;
+    }
+
+    /// Switch this instance to the circular ring shape (chainable).
+    Progress Ring() {
+        shape = 1;
+        return this;
+    }
+
+    override string Kind() { return "Progress"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Int("percent", "Percent"));
+        PropSpec ty = PropSpec.Enum("type", "Type", new List<string>());
+        ty.Option("default"); ty.Option("info"); ty.Option("success");
+        ty.Option("warning"); ty.Option("error");
+        ps.Add(ty);
+        PropSpec sh = PropSpec.Enum("shape", "Shape", new List<string>());
+        sh.Option("bar"); sh.Option("ring");
+        ps.Add(sh);
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "percent") { return Convert.ToString(percent); }
+        if (key == "type") { return Convert.ToString(ptype); }
+        if (key == "shape") { return Convert.ToString(shape); }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "percent") { percent = Convert.ToInt32(val); }
+        else if (key == "type") { ptype = Convert.ToInt32(val); }
+        else if (key == "shape") { shape = Convert.ToInt32(val); }
+    }
+
+    override void OnMeasure(App app) {
+        if (shape == 1) {
+            prefH = app.Scale(72);
+            prefW = app.Scale(72);
+        } else {
+            prefH = app.Scale(8);
+            prefW = app.Scale(200);
+        }
+    }
+
+    override void OnPaint(App app) {
+        if (shape == 1) {
+            int r = app.Scale(36);
+            Progress.Circle(app, bx + r, by + r, r, percent, ptype);
+        } else {
+            Progress.RenderText(app, bx, by, bw, percent, ptype);
+        }
+    }
+
+    /// Resolves the fill color for a progress type.
+    static int FillColor(Theme t, int ptype) {
+        if (ptype == 2) { return t.info; }
+        if (ptype == 3) { return t.success; }
+        if (ptype == 4) { return t.warning; }
+        if (ptype == 5) { return t.error; }
+        return t.primary;
+    }
+
+    static int Clamp(int percent) {
+        if (percent < 0) { return 0; }
+        if (percent > 100) { return 100; }
+        return percent;
+    }
+
     static void Render(App app, int x, int y, int width, int percent, int ptype) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
         int trackH = app.Scale(8);
         int radius = trackH / 2;
-        int fillW = percent * width / 100;
-        if (fillW < 0) { fillW = 0; }
-        if (fillW > width) { fillW = width; }
+        int pct = Progress.Clamp(percent);
+        int fillW = pct * width / 100;
 
         c.FillRoundRect(x, y, width, trackH, radius, t.bgTertiary);
-
-        int fillColor = t.primary;
-        if (ptype == 2) { fillColor = t.info; }
-        if (ptype == 3) { fillColor = t.success; }
-        if (ptype == 4) { fillColor = t.warning; }
-        if (ptype == 5) { fillColor = t.error; }
         if (fillW > 0) {
-            c.FillRoundRect(x, y, fillW, trackH, radius, fillColor);
+            c.FillRoundRect(x, y, fillW, trackH, radius, Progress.FillColor(t, ptype));
         }
+    }
+
+    /// Linear bar with the numeric percentage drawn to its right, vertically
+    /// centered on the track (leaves room for a trailing "100%").
+    static void RenderText(App app, int x, int y, int width, int percent, int ptype) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int pct = Progress.Clamp(percent);
+        int fs = t.fontSizeSmall;
+        int labelW = Canvas.MeasureText("100%", fs) + t.gapSmall;
+        int barW = width - labelW;
+        if (barW < app.Scale(20)) { barW = width; labelW = 0; }
+
+        int trackH = app.Scale(8);
+        Progress.Render(app, x, y, barW, pct, ptype);
+        if (labelW > 0) {
+            int ty = y + (trackH - Canvas.FontHeight(fs)) / 2;
+            c.DrawText(x + barW + t.gapSmall, ty, Convert.ToString(pct) + "%",
+                       t.textSecondary, fs);
+        }
+    }
+
+    /// Circular ring gauge centered at (cx, cy) with the percentage in the
+    /// middle. The unfilled remainder shows as a faint track ring.
+    static void Circle(App app, int cx, int cy, int radius, int percent, int ptype) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int pct = Progress.Clamp(percent);
+        int rOuter = radius;
+        int rInner = radius - app.Scale(7);
+        if (rInner < 1) { rInner = 1; }
+
+        // Track ring, then the filled arc from 12 o'clock clockwise.
+        c.FillSector(cx, cy, rInner, rOuter, 0, 360, t.bgTertiary);
+        int sweep = 360 * pct / 100;
+        if (sweep > 0) {
+            c.FillSector(cx, cy, rInner, rOuter, 0, sweep, Progress.FillColor(t, ptype));
+        }
+
+        string label = Convert.ToString(pct) + "%";
+        int fs = t.fontSizeMedium;
+        c.DrawTextCentered(cx - radius, cy - radius, radius * 2, radius * 2,
+                           label, t.textPrimary, fs);
     }
 }

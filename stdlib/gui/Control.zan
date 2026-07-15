@@ -1,0 +1,568 @@
+using System;
+
+namespace Gui;
+
+/// Retained-mode component tree (coexists with the immediate-mode widgets).
+///
+/// Every node is a `Control`: it has a stable `name`, a parent, an ordered list
+/// of children, a dock hint, and a resolved bounds rect. Containers append
+/// children with `Add`; any node can locate a descendant with `Find(name)`.
+/// Layout is WinForms-style docking (see `Arrange`): docked children snap to an
+/// edge and consume space in insertion order, a `Fill` child takes what remains,
+/// and `Manual` children sit at an explicit offset inside the parent. Drawing is
+/// polymorphic — subclasses override `OnPaint` and the framework recurses via
+/// `Paint`, clipping each subtree to its parent's box so content cannot bleed
+/// out (reuses the native clip stack).
+///
+/// NOTE: the base method names are deliberately unusual (Paint/Arrange/
+/// MeasureTree/InitControl/OnPaint/OnMeasure) so they never collide with a
+/// widget's own methods when a widget subclasses Control — the compiler resolves
+/// calls by name only (no overloading), so a base name reused by a subclass with
+/// a different signature would miscompile.
+class Control {
+    string name;
+    /// 0 manual, 1 top, 2 bottom, 3 left, 4 right, 5 fill.
+    int dock;
+    /// Auto-flow for children added via With(): 0 none, 1 column, 2 row.
+    /// A container (see Panel.Column/Row) sets this so each With() child docks
+    /// along the flow axis automatically.
+    int layout;
+    /// When true this node should grow to fill the remaining main-axis space of
+    /// its flow parent (dock == fill), overriding the flow's default docking.
+    bool grow;
+    /// Preferred main-axis extent used while docking (height for top/bottom,
+    /// width for left/right). Ignored for a Fill child. A widget's OnMeasure
+    /// typically sets these from the theme.
+    int prefW;
+    int prefH;
+    /// Manual offset inside the parent content box when dock == 0.
+    int mx;
+    int my;
+    int padL;
+    int padT;
+    int padR;
+    int padB;
+    int gap;
+    bool visible;
+    /// Resolved bounds in canvas coordinates (set by Arrange).
+    int bx;
+    int by;
+    int bw;
+    int bh;
+    Control parent;
+    List<Control> children;
+    /// Event-handler bindings for the designer/serializer: parallel lists mapping
+    /// an event name (see Events()) to a handler identifier. Empty when unbound.
+    List<string> evtKeys;
+    List<string> evtVals;
+    /// Common per-widget event bundle (pointer/focus/keyboard/touch/drag),
+    /// inherited by every control. A widget wires it by calling On.Fire(app, id)
+    /// once per frame after it registered its hit region (widgets keep their own
+    /// stable id, so Control does not allocate one here).
+    WidgetEvents On;
+    /// Lifecycle events fired by RenderTree: Paint every frame this node paints,
+    /// Resize when its resolved size changed, Show/Hide on a visibility flip.
+    UiEvent Paint;
+    UiEvent Resize;
+    UiEvent Show;
+    UiEvent Hide;
+    int lastBw;
+    int lastBh;
+    bool lastVisible;
+    bool everLaidOut;
+    /// Optional dotted state path this control is bound to (JSON `bind`), used
+    /// by UiDoc to sync the control's value with a state entity. Empty = none.
+    string bindPath;
+    /// Optional control property used by the binding. Empty selects the
+    /// control's canonical `value`/`text` property automatically.
+    string bindProp;
+    string bindSnapshot;
+    /// Optional style class (JSON `class`), used by a StyleSheet to cascade
+    /// declarations onto this control by `.class` selector. Empty = none.
+    string styleClass;
+
+    /// Base initialiser every subclass calls from its factory/constructor.
+    void InitControl(string n, int d) {
+        name = n;
+        dock = d;
+        prefW = 0;
+        prefH = 0;
+        mx = 0;
+        my = 0;
+        padL = 0;
+        padT = 0;
+        padR = 0;
+        padB = 0;
+        gap = 0;
+        visible = true;
+        bx = 0;
+        by = 0;
+        bw = 0;
+        bh = 0;
+        parent = null;
+        children = new List<Control>();
+        evtKeys = new List<string>();
+        evtVals = new List<string>();
+        On = WidgetEvents.Create();
+        Paint = UiEvent.Create();
+        Resize = UiEvent.Create();
+        Show = UiEvent.Create();
+        Hide = UiEvent.Create();
+        lastBw = 0;
+        lastBh = 0;
+        lastVisible = false;
+        everLaidOut = false;
+        layout = 0;
+        grow = false;
+        bindPath = "";
+        bindProp = "";
+        bindSnapshot = "";
+        styleClass = "";
+    }
+
+    /// Fires the common event bundle for this node against `id`. Widgets call
+    /// this once per frame after registering their hit region; equivalent to
+    /// On.Fire(app, id) but keeps the call site uniform.
+    void FireOn(App app, int id) {
+        On.Fire(app, id);
+    }
+
+    Control Dock(int d) {
+        dock = d;
+        return this;
+    }
+
+    Control Prefer(int w, int h) {
+        prefW = w;
+        prefH = h;
+        return this;
+    }
+
+    Control Place(int x, int y) {
+        mx = x;
+        my = y;
+        return this;
+    }
+
+    Control Pad(int p) {
+        padL = p;
+        padT = p;
+        padR = p;
+        padB = p;
+        return this;
+    }
+
+    Control Padding(int top, int right, int bottom, int left) {
+        padT = top;
+        padR = right;
+        padB = bottom;
+        padL = left;
+        return this;
+    }
+
+    Control Gap(int g) {
+        gap = g;
+        return this;
+    }
+
+    Control SetShown(bool v) {
+        visible = v;
+        return this;
+    }
+
+    /// Appends a child (auto-docked). Returns the child so callers can keep a
+    /// handle inline, e.g. `Button b = panel.Add(save)`.
+    Control Add(Control c) {
+        c.parent = this;
+        children.Add(c);
+        return c;
+    }
+
+    /// Fluent child append: adds `c` and returns THIS container (not the child),
+    /// so several children can be chained — `panel.With(a).With(b).With(c)`. If
+    /// this node has a flow layout (column/row) the child is auto-docked along
+    /// the flow axis unless it opted into Grow().
+    Control With(Control c) {
+        if (layout != 0 && !c.grow) {
+            if (layout == 2) { c.dock = 3; } else { c.dock = 1; }
+        }
+        c.parent = this;
+        children.Add(c);
+        return this;
+    }
+
+    /// Marks this node to fill the remaining main-axis space of its flow parent.
+    Control Grow() {
+        grow = true;
+        dock = 5;
+        return this;
+    }
+
+    Control DockTop() { dock = 1; return this; }
+    Control DockBottom() { dock = 2; return this; }
+    Control DockLeft() { dock = 3; return this; }
+    Control DockRight() { dock = 4; return this; }
+    Control DockFill() { dock = 5; return this; }
+    Control DockManual() { dock = 0; return this; }
+
+    /// Fluent id setter, so a node built inline can still be located later with
+    /// Find() or targeted by the designer/serializer.
+    Control Named(string n) {
+        name = n;
+        return this;
+    }
+
+    int IndexOf(Control c) {
+        int i = 0;
+        while (i < children.Count) {
+            if (children[i] == c) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Detaches a child (no-op if not a child of this node).
+    void Remove(Control c) {
+        int idx = IndexOf(c);
+        if (idx >= 0) {
+            children.RemoveAt(idx);
+            c.parent = null;
+        }
+    }
+
+    /// Inserts a child at a position, clamped into range. Reparents `c`.
+    void InsertAt(int idx, Control c) {
+        int at = idx;
+        if (at < 0) { at = 0; }
+        if (at > children.Count) { at = children.Count; }
+        c.parent = this;
+        children.Insert(at, c);
+    }
+
+    /// Moves an existing child to a new index (for designer drag-reorder).
+    void MoveChild(Control c, int to) {
+        int idx = IndexOf(c);
+        if (idx < 0) { return; }
+        children.RemoveAt(idx);
+        int at = to;
+        if (at < 0) { at = 0; }
+        if (at > children.Count) { at = children.Count; }
+        children.Insert(at, c);
+    }
+
+    /// The deepest visible descendant whose resolved bounds contain the point,
+    /// preferring later (top-most) children. Used for designer hit-selection.
+    Control HitTest(int x, int y) {
+        if (!visible) { return null; }
+        if (x < bx || y < by || x >= bx + bw || y >= by + bh) { return null; }
+        int i = children.Count - 1;
+        while (i >= 0) {
+            Control hit = children[i].HitTest(x, y);
+            if (hit != null) { return hit; }
+            i = i - 1;
+        }
+        return this;
+    }
+
+    /// Depth-first search by name, including this node. Returns null if absent.
+    Control Find(string n) {
+        if (name == n) {
+            return this;
+        }
+        int i = 0;
+        while (i < children.Count) {
+            Control r = children[i].Find(n);
+            if (r != null) {
+                return r;
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    int ChildCount() {
+        return children.Count;
+    }
+
+    /// The handler bound to `evt`, or "" if none. Used by the event inspector.
+    string GetHandler(string evt) {
+        int i = 0;
+        while (i < evtKeys.Count) {
+            if (evtKeys[i] == evt) { return evtVals[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Binds (or rebinds) a handler identifier to `evt`.
+    void SetHandler(string evt, string h) {
+        int i = 0;
+        while (i < evtKeys.Count) {
+            if (evtKeys[i] == evt) { evtVals[i] = h; return; }
+            i = i + 1;
+        }
+        evtKeys.Add(evt);
+        evtVals.Add(h);
+    }
+
+    /// Lets a node set its preferred size from the theme, bottom-up (children
+    /// first). Subclasses override OnMeasure. Runs before Arrange.
+    void MeasureTree(App app) {
+        int i = 0;
+        while (i < children.Count) {
+            children[i].MeasureTree(app);
+            i = i + 1;
+        }
+        OnMeasure(app);
+    }
+
+    static int FitSize(int requested, int available) {
+        if (requested < 0) { return 0; }
+        if (available < 0) { return 0; }
+        if (requested > available) { return available; }
+        return requested;
+    }
+
+    static int FitGap(int requested, int available) {
+        if (requested < 0 || available <= 0) { return 0; }
+        if (requested > available) { return available; }
+        return requested;
+    }
+
+    /// Computes bounds for this node and, via docking, for its subtree.
+    void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        bx = px;
+        by = py;
+        bw = pw;
+        bh = ph;
+        int cx = px + padL;
+        int cy = py + padT;
+        int cw = pw - padL - padR;
+        int ch = ph - padT - padB;
+        if (cw < 0) { cw = 0; }
+        if (ch < 0) { ch = 0; }
+        int i = 0;
+        while (i < children.Count) {
+            Control c = children[i];
+            if (c.visible) {
+                if (c.dock == 1) {
+                    int hh = Control.FitSize(c.prefH, ch);
+                    c.Arrange(cx, cy, cw, hh);
+                    int restH = ch - hh;
+                    int gh = Control.FitGap(gap, restH);
+                    cy = cy + hh + gh;
+                    ch = restH - gh;
+                } else if (c.dock == 2) {
+                    int hh = Control.FitSize(c.prefH, ch);
+                    c.Arrange(cx, cy + ch - hh, cw, hh);
+                    int restH = ch - hh;
+                    int gh = Control.FitGap(gap, restH);
+                    ch = restH - gh;
+                } else if (c.dock == 3) {
+                    int ww = Control.FitSize(c.prefW, cw);
+                    c.Arrange(cx, cy, ww, ch);
+                    int restW = cw - ww;
+                    int gw = Control.FitGap(gap, restW);
+                    cx = cx + ww + gw;
+                    cw = restW - gw;
+                } else if (c.dock == 4) {
+                    int ww = Control.FitSize(c.prefW, cw);
+                    c.Arrange(cx + cw - ww, cy, ww, ch);
+                    int restW = cw - ww;
+                    int gw = Control.FitGap(gap, restW);
+                    cw = restW - gw;
+                } else if (c.dock == 5) {
+                    c.Arrange(cx, cy, cw, ch);
+                } else {
+                    int ww = c.prefW;
+                    int hh = c.prefH;
+                    if (ww < 0) { ww = 0; }
+                    if (hh < 0) { hh = 0; }
+                    c.Arrange(cx + c.mx, cy + c.my, ww, hh);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Draws this node's own visuals. Base draws nothing; subclasses override.
+    virtual void OnPaint(App app) {
+    }
+
+    /// Sets prefW/prefH from content/theme. Base is a no-op; leaves override.
+    virtual void OnMeasure(App app) {
+    }
+
+    // --- Designer / serialization model (uniform, cast-free via virtuals) ---
+
+    /// Stable type tag used to reconstruct this node (see ControlFactory). Every
+    /// concrete widget overrides it; the base tag is only a fallback.
+    virtual string Kind() {
+        return "Control";
+    }
+
+    /// Widget-specific editable properties for the inspector and serializer.
+    /// Common geometry (dock/pad/gap/size/pos/name) is handled by Serialize, so
+    /// this returns only the properties unique to the widget. Base has none.
+    virtual List<PropSpec> Props() {
+        return new List<PropSpec>();
+    }
+
+    /// The common event names every control exposes (pointer/focus/keyboard/
+    /// touch/drag/lifecycle), in inspector order. Widgets prepend these to their
+    /// own semantic events in Events().
+    static List<string> CommonEvents() {
+        List<string> e = new List<string>();
+        e.Add("Click");
+        e.Add("DoubleClick");
+        e.Add("RightClick");
+        e.Add("MouseDown");
+        e.Add("MouseUp");
+        e.Add("Enter");
+        e.Add("Leave");
+        e.Add("Move");
+        e.Add("Wheel");
+        e.Add("Focus");
+        e.Add("Blur");
+        e.Add("KeyDown");
+        e.Add("KeyUp");
+        e.Add("KeyPress");
+        e.Add("Tap");
+        e.Add("LongPress");
+        e.Add("Swipe");
+        e.Add("DragStart");
+        e.Add("Drag");
+        e.Add("Drop");
+        e.Add("Resize");
+        e.Add("Show");
+        e.Add("Hide");
+        return e;
+    }
+
+    /// Declared event names for the designer's event inspector. Base returns the
+    /// common bundle; widgets override to append their own semantic events (and
+    /// still include CommonEvents()).
+    virtual List<string> Events() {
+        return Control.CommonEvents();
+    }
+
+    /// Subscribes a resolved Action to the named event. The base maps the common
+    /// bundle (Click/Enter/.../Drop) onto `On`; widgets override to also route
+    /// their own semantic events (Change/Submit/RowClick/...) to the right
+    /// UiEvent field, then call the base for the common set. Used by the JSON
+    /// loader to attach `on<Event>` handlers resolved through the registry.
+    virtual void BindEvent(string evt, Action a) {
+        On.AddByName(evt, a);
+    }
+
+    /// Reads a property by key as text. Base knows nothing; widgets override for
+    /// the keys they publish in Props().
+    virtual string GetProp(string key) {
+        return "";
+    }
+
+    /// Writes a property by key from text. Base ignores; widgets override.
+    virtual void SetProp(string key, string val) {
+    }
+
+    /// Renders the subtree: self, then children clipped to this node's box so a
+    /// child cannot paint outside its parent (native clip stack). Named
+    /// RenderTree (not Paint) because several widgets already declare a static
+    /// Paint and the compiler resolves method calls by name only.
+    void RenderTree(App app) {
+        if (!visible) {
+            if (lastVisible && Hide.Count() > 0) { Hide.Raise(); }
+            lastVisible = false;
+            return;
+        }
+        if (!lastVisible && everLaidOut && Show.Count() > 0) { Show.Raise(); }
+        lastVisible = true;
+        OnPaint(app);
+        if (Paint.Count() > 0) { Paint.Raise(); }
+        if (everLaidOut && (bw != lastBw || bh != lastBh) && Resize.Count() > 0) {
+            Resize.Raise();
+        }
+        lastBw = bw;
+        lastBh = bh;
+        everLaidOut = true;
+        if (children.Count > 0) {
+            app.canvas.PushClip(bx, by, bw, bh);
+            int i = 0;
+            while (i < children.Count) {
+                children[i].RenderTree(app);
+                i = i + 1;
+            }
+            app.canvas.PopClip();
+        }
+    }
+}
+
+/// Root of a retained-mode UI: the window itself as a component. Owns the App
+/// and drives the frame loop, laying out and rendering the whole tree each
+/// frame beneath the title-bar chrome.
+class Form : Control {
+    App app;
+    string title;
+
+    /// Builds the backing window + app. The tree can be assembled and laid out
+    /// before Run() is called.
+    static Form Create(string title, int width, int height) {
+        Form f = new Form();
+        f.InitControl(title, 5);
+        f.title = title;
+        f.app = App.Create(title, width, height);
+        return f;
+    }
+
+    static Form CreateDark(string title, int width, int height) {
+        Form f = Form.Create(title, width, height);
+        f.app.SetDark(true);
+        return f;
+    }
+
+    App GetApp() {
+        return app;
+    }
+
+    /// Measures, lays out and paints the whole tree once into the current frame,
+    /// below the chrome. Exposed so a hand-rolled loop can compose it.
+    void RenderFrame(App a) {
+        int top = a.ContentTop();
+        int W = a.canvas.Width();
+        int H = a.canvas.Height();
+        this.MeasureTree(a);
+        this.Arrange(0, top, W, H - top);
+        this.RenderTree(a);
+    }
+
+    /// Standard retained-mode loop: process events, lay out, render tree, draw
+    /// chrome, present.
+    void Run() {
+        app.Show();
+        while (app.isRunning) {
+            if (!app.ProcessEvent()) {
+                break;
+            }
+            if (!app.needsRedraw) {
+                continue;
+            }
+            app.BeginFrame();
+            RenderFrame(app);
+            app.RenderChrome(title);
+            app.PresentFrame();
+        }
+    }
+}
+
+/// Named dock values, so trees read `.Dock(Dock.Top())` instead of a magic
+/// number. (The language has no static-field constants, hence static methods.)
+class Dock {
+    static int Manual() { return 0; }
+    static int Top() { return 1; }
+    static int Bottom() { return 2; }
+    static int Left() { return 3; }
+    static int Right() { return 4; }
+    static int Fill() { return 5; }
+}

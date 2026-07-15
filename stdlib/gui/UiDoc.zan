@@ -1,0 +1,403 @@
+using System;
+using System.Json;
+using Gui.Widget;
+
+namespace Gui;
+
+/// A JSON-defined UI document: parses a layout tree into retained Controls,
+/// keeps the handler-name registry and (optionally) a bound state model, then
+/// wires each `on<Event>` name to the matching Action and runs a window.
+///
+///   UiDoc ui = UiDoc.FromJson(src);
+///   ui.Handle("save", MyPage.Save);
+///   ui.Bind(model);              // JSON state entity (optional)
+///   ui.Run("Settings", 420, 380);
+///
+/// Structure keys: `type`, `children`, `name`, plus layout hints `gap`, `pad`,
+/// `grow`, `visible`. Any other non-`on*` key is applied through the control's
+/// SetProp (so widget props stay in one place). `on<Event>` keys store a handler
+/// name that Wire() resolves through the registry and attaches via BindEvent.
+class UiDoc {
+    Control root;
+    HandlerRegistry handlers;
+    JsonValue model;
+    StyleSheet sheet;
+
+    static UiDoc Create() {
+        UiDoc d = new UiDoc();
+        d.root = null;
+        d.handlers = HandlerRegistry.Create();
+        d.model = null;
+        d.sheet = null;
+        return d;
+    }
+
+    /// Parses a JSON UI document and builds the retained control tree.
+    static UiDoc FromJson(string src) {
+        UiDoc d = UiDoc.Create();
+        JsonValue tree = JsonValue.Parse(src);
+        d.root = UiDoc.BuildWith(tree, null);
+        return d;
+    }
+
+    /// Parses a JSON UI document together with a CSS-like stylesheet, cascading
+    /// the sheet's declarations onto every node as it is built.
+    static UiDoc FromJsonStyled(string src, string styleSrc) {
+        UiDoc d = UiDoc.Create();
+        d.sheet = StyleSheet.FromJson(styleSrc);
+        JsonValue tree = JsonValue.Parse(src);
+        d.root = UiDoc.BuildWith(tree, d.sheet);
+        return d;
+    }
+
+    Control Root() { return root; }
+
+    /// Registers the Action for a handler name referenced by the document.
+    UiDoc Handle(string name, Action a) {
+        handlers.Set(name, a);
+        return this;
+    }
+
+    /// Attaches a JSON state entity for two-way binding by `bind` path.
+    UiDoc Bind(JsonValue m) {
+        model = m;
+        return this;
+    }
+
+    // ---- tree construction --------------------------------------------------
+
+    /// Builds a control (and its subtree) from a JSON object node.
+    static Control Build(JsonValue node) {
+        return UiDoc.BuildWith(node, null);
+    }
+
+    /// Builds a control (and its subtree), cascading `sheet` onto each node
+    /// before its inline properties so inline values always win.
+    static Control BuildWith(JsonValue node, StyleSheet sheet) {
+        if (node == null || !node.IsObject()) { return new Panel("panel"); }
+        string type = node.Str("type", "Panel");
+        Control c = UiDoc.Make(type, node);
+
+        if (node.Has("class")) { c.styleClass = node.Str("class", ""); }
+        // Stylesheet cascade first; inline props below override it.
+        if (sheet != null) {
+            sheet.Apply(c, type, c.styleClass, node.Str("name", ""));
+        }
+
+        if (node.Has("gap")) { c.gap = node.Int("gap", 0); }
+        if (node.Has("pad")) { c.Pad(node.Int("pad", 0)); }
+        if (node.Has("padding")) { c.Pad(node.Int("padding", 0)); }
+        if (node.Has("dock")) {
+            JsonValue dv = node.Get("dock");
+            if (dv.IsNumber()) {
+                c.dock = dv.AsInt(0);
+            } else {
+                c.dock = UiDoc.DockValue(dv.AsString(""));
+            }
+        }
+        if (node.Has("x")) { c.mx = node.Int("x", 0); }
+        if (node.Has("y")) { c.my = node.Int("y", 0); }
+        if (node.Has("width")) { c.prefW = node.Int("width", c.prefW); }
+        if (node.Has("height")) { c.prefH = node.Int("height", c.prefH); }
+        if (node.Has("grow") && node.Bool("grow", false)) { c.Grow(); }
+        if (node.Has("visible")) { c.visible = node.Bool("visible", true); }
+        if (node.Has("bind")) {
+            JsonValue bv = node.Get("bind");
+            if (bv != null && bv.IsObject()) {
+                c.bindPath = bv.Str("path", "");
+                c.bindProp = bv.Str("prop", "");
+            } else {
+                c.bindPath = node.Str("bind", "");
+            }
+        }
+        if (node.Has("bindProp")) { c.bindProp = node.Str("bindProp", ""); }
+
+        // Remaining keys: `on<Event>` handler names vs. widget props (SetProp).
+        List<string> events = c.Events();
+        int i = 0;
+        while (i < node.Count()) {
+            string k = node.KeyAt(i);
+            JsonValue v = node.ValAt(i);
+            if (!UiDoc.IsReserved(k)) {
+                string ename = UiDoc.HandlerEvent(k, events);
+                if (ename != "") {
+                    c.SetHandler(ename, v.AsString(""));
+                } else {
+                    c.SetProp(k, UiDoc.Scalar(v));
+                }
+            }
+            i = i + 1;
+        }
+
+        // `name` last: several widgets' SetProp("text") also assign `name`, so
+        // an explicit id must win over the text-derived one.
+        if (node.Has("name")) { c.name = node.Str("name", c.name); }
+
+        if (node.Has("children")) {
+            JsonValue kids = node.Get("children");
+            if (kids != null && kids.IsArray()) {
+                int j = 0;
+                while (j < kids.Count()) {
+                    c.Add(UiDoc.BuildWith(kids.At(j), sheet));
+                    j = j + 1;
+                }
+            }
+        }
+        return c;
+    }
+
+    /// Instantiates the concrete control for a `type` tag, seeding the props a
+    /// constructor needs (text/value). Unknown types fall back to a panel so a
+    /// malformed document still loads.
+    static Control Make(string type, JsonValue node) {
+        if (type == "Column") { return Panel.Column(); }
+        if (type == "Row") { return Panel.Row(); }
+        if (type == "Panel" || type == "Card") { return new Panel("panel"); }
+        if (type == "Label" || type == "Text") {
+            return new Label(node.Str("text", ""));
+        }
+        if (type == "H1" || type == "Title") {
+            Label l = new Label(node.Str("text", ""));
+            l.variant = 4;
+            return l;
+        }
+        if (type == "Button") { return new Button(node.Str("text", "Button")); }
+        if (type == "Input" || type == "TextBox") {
+            return new Input(node.Str("hint", ""));
+        }
+        if (type == "Switch") { return new Switch(); }
+        if (type == "Checkbox") {
+            return new Checkbox(node.Str("label", node.Str("text", "")));
+        }
+        if (type == "Radio") {
+            return new Radio(SignalInt.Create(0),
+                             node.Int("option", 0),
+                             node.Str("label", node.Str("text", "")));
+        }
+        if (type == "Slider") {
+            return new Slider(node.Int("min", 0),
+                              node.Int("max", 100),
+                              SignalInt.Create(node.Int("value", 0)));
+        }
+        if (type == "Select" || type == "Dropdown") {
+            List<string> opts = new List<string>();
+            JsonValue arr = node.Get("options");
+            if (arr != null && arr.IsArray()) {
+                int oi = 0;
+                while (oi < arr.Count()) {
+                    opts.Add(arr.At(oi).AsString(""));
+                    oi = oi + 1;
+                }
+            }
+            return new Select(opts, node.Str("hint", ""));
+        }
+        if (type == "Progress") { return new Progress(node.Int("value", 0), 1); }
+        // Project components discovered at build time (scan_components.ps1) so a
+        // JSON `type` like "MyChart" instantiates the user's class.
+        Control cc = CustomComponents.Create(type);
+        if (cc != null) { return cc; }
+        return new Panel("panel");
+    }
+
+    /// Structural keys handled explicitly by Build (not forwarded to SetProp).
+    static bool IsReserved(string k) {
+        return k == "type" || k == "children" || k == "name"
+            || k == "gap" || k == "pad" || k == "padding"
+            || k == "dock" || k == "grow" || k == "visible"
+            || k == "bind" || k == "bindProp" || k == "class" || k == "options"
+            || k == "x" || k == "y" || k == "width" || k == "height";
+    }
+
+    static int DockValue(string text) {
+        if (text == "top" || text == "Top") { return Dock.Top(); }
+        if (text == "bottom" || text == "Bottom") { return Dock.Bottom(); }
+        if (text == "left" || text == "Left") { return Dock.Left(); }
+        if (text == "right" || text == "Right") { return Dock.Right(); }
+        if (text == "fill" || text == "Fill") { return Dock.Fill(); }
+        return Dock.Manual();
+    }
+
+    /// If `k` is an `on<Event>` key whose event is one this control declares,
+    /// returns the event name (e.g. "onClick" -> "Click"); otherwise "". Uses
+    /// the control's own Events() so props like "options" are never mistaken
+    /// for handlers, without needing char-case helpers.
+    static string HandlerEvent(string k, List<string> events) {
+        if (k.Length < 3) { return ""; }
+        if (k.Substring(0, 2) != "on") { return ""; }
+        string ename = k.Substring(2, k.Length - 2);
+        if (events.Contains(ename)) { return ename; }
+        return "";
+    }
+
+    /// Renders a scalar JSON value as the text SetProp expects.
+    static string Scalar(JsonValue v) {
+        if (v.IsString()) { return v.AsString(""); }
+        if (v.IsNumber()) { return v.AsString(""); }
+        if (v.IsBool()) { if (v.AsBool(false)) { return "true"; } return "false"; }
+        return "";
+    }
+
+    // ---- handler wiring -----------------------------------------------------
+
+    /// Resolves every stored `on<Event>` handler name to its registered Action
+    /// and subscribes it to the control's event. Walk the whole tree.
+    void Wire() {
+        if (root != null) { WireNode(root); }
+    }
+
+    void WireNode(Control c) {
+        int i = 0;
+        while (i < c.evtKeys.Count) {
+            string evt = c.evtKeys[i];
+            string hname = c.evtVals[i];
+            if (hname != "" && handlers.Has(hname)) {
+                Action a = handlers.Get(hname);
+                c.BindEvent(evt, a);
+            }
+            i = i + 1;
+        }
+        int j = 0;
+        while (j < c.children.Count) {
+            WireNode(c.children[j]);
+            j = j + 1;
+        }
+    }
+
+    // ---- run ----------------------------------------------------------------
+
+    /// Wires handlers, then opens a window and drives the retained frame loop
+    /// with the document tree filling the content area.
+    /// Pushes the bound state entity's values into each control that declares a
+    /// `bind` path (state -> UI). Widgets that don't publish "value"/"text" via
+    /// SetProp simply ignore the write, so this is safe for every control type.
+    void SyncFromModel() {
+        if (model == null || root == null) { return; }
+        SyncFromNode(root);
+    }
+
+    /// True when the control publishes an editable property named `key`
+    /// (via its Props() list). Used to route a bound scalar to the control's
+    /// canonical property instead of blindly writing both "value" and "text".
+    static bool HasProp(Control c, string key) {
+        List<PropSpec> ps = c.Props();
+        int i = 0;
+        while (i < ps.Count) {
+            if (ps[i].key == key) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void SyncFromNode(Control c) {
+        if (c.bindPath != "") {
+            JsonValue v = model.PathGet(c.bindPath);
+            if (v != null) {
+                string s = v.AsString("");
+                if (c.bindProp != "") {
+                    c.SetProp(c.bindProp, s);
+                } else if (UiDoc.HasProp(c, "value")) {
+                    c.SetProp("value", s);
+                } else if (UiDoc.HasProp(c, "text")) {
+                    c.SetProp("text", s);
+                } else {
+                    c.SetProp("value", s);
+                }
+            }
+        }
+        int j = 0;
+        while (j < c.children.Count) {
+            SyncFromNode(c.children[j]);
+            j = j + 1;
+        }
+    }
+
+    /// Reads each bound control's current value back into the state entity
+    /// (UI -> state), so `ToJson()`/save reflects edits.
+    void SyncToModel() {
+        if (model == null || root == null) { return; }
+        SyncToNode(root);
+    }
+
+    string BoundValue(Control c) {
+        if (c.bindProp != "") { return c.GetProp(c.bindProp); }
+        if (UiDoc.HasProp(c, "value")) { return c.GetProp("value"); }
+        if (UiDoc.HasProp(c, "text")) { return c.GetProp("text"); }
+        string s = c.GetProp("value");
+        if (s == "") { s = c.GetProp("text"); }
+        return s;
+    }
+
+    void CaptureBindings(Control c) {
+        if (c.bindPath != "") { c.bindSnapshot = BoundValue(c); }
+        int i = 0;
+        while (i < c.children.Count) {
+            CaptureBindings(c.children[i]);
+            i = i + 1;
+        }
+    }
+
+    void SyncChangedNode(Control c) {
+        if (c.bindPath != "") {
+            string s = BoundValue(c);
+            if (s != c.bindSnapshot) { WriteBoundValue(c, s); }
+        }
+        int i = 0;
+        while (i < c.children.Count) {
+            SyncChangedNode(c.children[i]);
+            i = i + 1;
+        }
+    }
+
+    void WriteBoundValue(Control c, string s) {
+        JsonValue cur = model.PathGet(c.bindPath);
+        if (cur != null && cur.IsBool()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
+        } else if (cur != null && cur.IsNumber()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewNum(s));
+        } else {
+            model.PathSet(c.bindPath, s);
+        }
+    }
+
+    void SyncToNode(Control c) {
+        if (c.bindPath != "") {
+            string s = BoundValue(c);
+            // Preserve the existing leaf's JSON type on write-back so a bool
+            // stays a bool and a number stays a number instead of everything
+            // collapsing to a string. Falls back to a string leaf when the
+            // path is new / untyped.
+            WriteBoundValue(c, s);
+        }
+        int j = 0;
+        while (j < c.children.Count) {
+            SyncToNode(c.children[j]);
+            j = j + 1;
+        }
+    }
+
+    void Run(string title, int w, int h) {
+        Wire();
+        SyncFromModel();
+        Form f = Form.Create(title, w, h);
+        if (root != null) {
+            root.dock = 5;
+            f.Add(root);
+        }
+
+        // Drive the retained loop here so bindings stay live in both
+        // directions instead of only copying state once at startup.
+        App app = f.GetApp();
+        app.Show();
+        while (app.isRunning) {
+            if (!app.ProcessEvent()) { break; }
+            if (!app.needsRedraw) { continue; }
+            app.BeginFrame();
+            SyncFromModel();
+            if (root != null) { CaptureBindings(root); }
+            f.RenderFrame(app);
+            if (root != null) { SyncChangedNode(root); }
+            app.RenderChrome(title);
+            app.PresentFrame();
+        }
+    }
+}

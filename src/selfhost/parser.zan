@@ -9,16 +9,35 @@ namespace Zan;
 class Parser {
     public List<Token> toks;
     public int pos;
+    public Diags diags;
+    public int lastErrPos;
 
-    public Parser(List<Token> t) { toks = t; pos = 0; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; }
 
-    Token Cur() { return toks[pos]; }
-    int K() { return toks[pos].kind; }
+    // All token access is end-of-input safe: once pos runs off the end we keep
+    // returning the trailing Eof token so a truncated or malformed source can
+    // never index past the token list (which used to be an access violation).
+    Token Cur() { if (pos < toks.Count) { return toks[pos]; } return toks[toks.Count - 1]; }
+    int K() { if (pos < toks.Count) { return toks[pos].kind; } return TK.Eof(); }
     int K1() { if (pos + 1 < toks.Count) { return toks[pos + 1].kind; } return TK.Eof(); }
-    Token Next() { Token t = toks[pos]; pos = pos + 1; return t; }
+    Token Next() { Token t = Cur(); if (pos < toks.Count) { pos = pos + 1; } return t; }
     bool At(int k) { return K() == k; }
     bool Eat(int k) { if (K() == k) { pos = pos + 1; return true; } return false; }
-    void Expect(int k) { if (!Eat(k)) { pos = pos + 1; } }
+    // On mismatch: record a diagnostic and advance one token (bounded, never
+    // past Eof) so the parser makes forward progress and re-synchronises
+    // instead of silently swallowing the error or spinning.
+    void Expect(int k) {
+        if (Eat(k)) { return; }
+        // Suppress cascading errors at the same position (panic mode): only the
+        // first mismatch at a given token is reported until the parser advances.
+        if (pos != lastErrPos) {
+            Token c = Cur();
+            if (K() == TK.Eof()) { diags.Error("syntax error: unexpected end of file", c.line, c.col); }
+            else { diags.Error("syntax error: unexpected '" + c.text + "'", c.line, c.col); }
+            lastErrPos = pos;
+        }
+        if (K() != TK.Eof()) { pos = pos + 1; }
+    }
 
     bool IsTypeKeyword(int k) {
         if (k == TK.Int()) { return true; }

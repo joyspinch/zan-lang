@@ -16,10 +16,26 @@ namespace Gui;
 /// </summary>
 class Ui {
     /// True on the frame the primary mouse button is released over `id`
-    /// (i.e. a click completed on the widget).
+    /// (i.e. a click completed on the widget). Uses the click target the App
+    /// resolved once (top-most widget under the pointer, popups included), so
+    /// a click is delivered to exactly one widget instead of every widget that
+    /// re-reads the raw event — fixing occlusion/double-handling.
     static bool Clicked(App app, int id) {
         if (app.window.EventKind() != 3) { return false; }
-        return app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+        return app.ClickTarget() == id;
+    }
+
+    /// True on the frame a press (mouse-down) landed on `id` (top-most target).
+    static bool PressedDown(App app, int id) {
+        if (app.window.EventKind() != 2) { return false; }
+        return app.PressTarget() == id;
+    }
+
+    /// True on a mouse-down this frame that landed on something other than
+    /// `id` — popups use it to dismiss themselves on an outside click.
+    static bool PressedOutside(App app, int id) {
+        if (app.window.EventKind() != 2) { return false; }
+        return app.PressTarget() != id;
     }
 
     /// True while the pointer is over the widget.
@@ -57,5 +73,153 @@ class Ui {
     /// True on any left mouse-button press this frame.
     static bool MousePressed(App app) {
         return app.window.EventKind() == 2;
+    }
+
+    // ---- transition + keyboard + touch events -------------------------------
+    // These compare the live focus/hover state against the previous rendered
+    // frame's snapshot (FocusManager.RollFrame, called in App.PresentFrame),
+    // so each fires on exactly the frame the state flips.
+
+    /// True on the frame the pointer first moves onto `id` (mouse-enter). On a
+    /// touchscreen this collapses onto the press, since touch has no hover.
+    static bool Entered(App app, int id) {
+        return app.focus.IsHovered(id) && !app.focus.WasHovered(id);
+    }
+
+    /// True on the frame the pointer first leaves `id` (mouse-leave).
+    static bool Left(App app, int id) {
+        return !app.focus.IsHovered(id) && app.focus.WasHovered(id);
+    }
+
+    /// True on the frame `id` gains keyboard focus.
+    static bool FocusGained(App app, int id) {
+        return app.focus.IsFocused(id) && !app.focus.WasFocused(id);
+    }
+
+    /// True on the frame `id` loses keyboard focus.
+    static bool FocusLost(App app, int id) {
+        return !app.focus.IsFocused(id) && app.focus.WasFocused(id);
+    }
+
+    /// True on the frame a double click / double tap completes on `id`
+    /// (two clicks on the same widget within the double-click window).
+    static bool DoubleClicked(App app, int id) {
+        if (app.window.EventKind() != 3) { return false; }
+        if (!app.DoubleClickNow()) { return false; }
+        return app.ClickTarget() == id;
+    }
+
+    /// The key code of a key-down event this frame, or 0 when none. (Event
+    /// kind 4 is a key press; the code is the platform virtual-key value.)
+    static int KeyDown(App app) {
+        if (app.window.EventKind() != 4) { return 0; }
+        return app.window.EventKeyCode();
+    }
+
+    /// True when a key with the given code was pressed this frame.
+    static bool KeyPressed(App app, int code) {
+        return Ui.KeyDown(app) == code;
+    }
+
+    /// Touch/pointer tap: equivalent to a completed click on `id`. Named for
+    /// touch code clarity; single-finger taps arrive as synthesized clicks.
+    static bool Tapped(App app, int id) {
+        return Ui.Clicked(app, id);
+    }
+
+    /// Direction of a swipe/flick completed on this release frame: 0 none,
+    /// 1 left, 2 right, 3 up, 4 down. Works with mouse drag and single touch.
+    static int Swipe(App app) {
+        if (app.window.EventKind() != 3) { return 0; }
+        return app.SwipeDir();
+    }
+
+    /// True when a swipe in direction `dir` (1 left / 2 right / 3 up / 4 down)
+    /// completed on the widget the gesture started on, `id`.
+    static bool SwipedOn(App app, int id, int dir) {
+        if (app.window.EventKind() != 3) { return false; }
+        return app.SwipeTarget() == id && app.SwipeDir() == dir;
+    }
+
+    /// True on the frame a long press / long touch fires on `id` (held past the
+    /// threshold without moving far). Fires once per press.
+    static bool LongPressed(App app, int id) {
+        return app.PollLongPress(id);
+    }
+
+    // ---- pointer up / move / wheel ------------------------------------------
+
+    /// True on the frame the button is released after the press began on `id`
+    /// (mouse-up delivered to the press owner, even if the pointer drifted off).
+    static bool MouseUpOn(App app, int id) {
+        if (app.window.EventKind() != 3) { return false; }
+        return app.SwipeTarget() == id;
+    }
+
+    /// True on a frame the pointer moved while hovering `id` (mouse-move).
+    static bool MovedOver(App app, int id) {
+        if (app.window.EventKind() != 1) { return false; }
+        return app.focus.IsHovered(id);
+    }
+
+    /// True on a mouse-wheel frame while the pointer is over `id`. Read the
+    /// signed notches with WheelDelta(app) (>0 up / away from user).
+    static bool Wheeled(App app, int id) {
+        if (app.window.EventKind() != 13) { return false; }
+        return app.focus.IsHovered(id);
+    }
+
+    /// Signed wheel delta for this frame (0 when not a wheel frame). The runtime
+    /// packs the notch count into the key-code slot on a wheel event.
+    static int WheelDelta(App app) {
+        if (app.window.EventKind() != 13) { return 0; }
+        return app.window.EventKeyCode();
+    }
+
+    // ---- keyboard (focused target) ------------------------------------------
+
+    /// True when a key went down this frame and `id` holds focus. Read the code
+    /// with KeyDown(app).
+    static bool KeyDownOn(App app, int id) {
+        if (app.window.EventKind() != 4) { return false; }
+        return app.focus.IsFocused(id);
+    }
+
+    /// Key-up on the focused widget. The current native runtime does not emit a
+    /// key-up event kind, so this is a stub (always false) until the SDL3 event
+    /// pump lands; the API + designer entry exist so no wiring changes later.
+    static bool KeyUpOn(App app, int id) {
+        return false;
+    }
+
+    // ---- right button / context menu ----------------------------------------
+
+    /// Secondary (right) button click on `id`. The current native runtime only
+    /// synthesizes the primary button, so this is a stub (always false) until
+    /// the SDL3 backend reports button indices; API + designer entry exist now.
+    static bool RightClicked(App app, int id) {
+        return false;
+    }
+
+    // ---- gesture / drag (single-pointer synthesized) ------------------------
+
+    /// True on release when any swipe direction completed on the widget the
+    /// gesture started on, `id`.
+    static bool SwipedAny(App app, int id) {
+        if (app.window.EventKind() != 3) { return false; }
+        return app.SwipeTarget() == id && app.SwipeDir() != 0;
+    }
+
+    /// True while `id` is the pressed target and the pointer is moving (drag in
+    /// progress). Pair with DragStart (press) / Drop (release).
+    static bool Dragging(App app, int id) {
+        if (app.window.EventKind() != 1) { return false; }
+        return app.focus.IsPressed(id);
+    }
+
+    /// True on release after a press that began on `id` (drop / drag end).
+    static bool Dropped(App app, int id) {
+        if (app.window.EventKind() != 3) { return false; }
+        return app.SwipeTarget() == id;
     }
 }

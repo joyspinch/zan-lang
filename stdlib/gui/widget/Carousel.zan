@@ -3,6 +3,26 @@ using Gui;
 
 namespace Gui.Widget;
 
+/// Per-carousel transition state. Owned by the caller so the slide animation
+/// survives across immediate-mode frames. Create once: `CarouselAnim.Create()`.
+class CarouselAnim {
+    int shown;
+    int from;
+    int startFrame;
+    bool animating;
+    int dir;
+
+    static CarouselAnim Create() {
+        CarouselAnim a = new CarouselAnim();
+        a.shown = 0;
+        a.from = 0;
+        a.startFrame = 0;
+        a.animating = false;
+        a.dir = 1;
+        return a;
+    }
+}
+
 /// Carousel: a slide panel with prev/next arrows and indicator dots.
 /// Id layout: prev = firstId, next = firstId+1, dots = firstId+2 .. firstId+1+count.
 class Carousel {
@@ -15,29 +35,27 @@ class Carousel {
         return t.success;
     }
 
-    static int Render(App app, int x, int y, int w, int h, List<string> slides, SignalInt idx) {
-        int prevId = app.focus.AllocId();
-        int nextId = app.focus.AllocId();
-        int count = slides.Count;
-        int i = 0;
-        while (i < count) {
-            app.focus.AllocId();
-            i = i + 1;
-        }
-
+    /// Draws one slide (body + centered label) at an arbitrary x, used both for
+    /// the static path and for the two panels during a transition.
+    static void Slide(App app, int x, int y, int w, int h, List<string> slides, int i) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int cur = idx.Get();
-        if (cur < 0) { cur = 0; }
-        if (cur >= count) { cur = count - 1; }
-
-        // Slide body
-        c.FillRoundRect(x, y, w, h, t.borderRadiusLarge, SlideColor(t, cur));
+        // Clip to the slide box so a long label can't spill past its edges.
+        c.PushClip(x, y, w, h);
+        c.FillRoundRect(x, y, w, h, t.borderRadiusLarge, SlideColor(t, i));
         int fs = t.fontSizeHuge;
-        int tw = Canvas.MeasureText(slides[cur], fs);
-        c.DrawText(x + (w - tw) / 2, y + (h - Canvas.FontHeight(fs)) / 2, slides[cur], t.textInverse, fs);
+        int tw = Canvas.MeasureText(slides[i], fs);
+        c.DrawText(x + (w - tw) / 2, y + (h - Canvas.FontHeight(fs)) / 2,
+                   slides[i], t.textInverse, fs);
+        c.PopClip();
+    }
 
-        // Prev / next arrows
+    /// Draws the arrows + dots chrome and registers their hit regions.
+    static void Chrome(App app, int prevId, int x, int y, int w, int h,
+                       int count, int cur) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
         int ab = t.heightMedium;
         int ay = y + (h - ab) / 2;
         int prevX = x + t.paddingMedium;
@@ -49,15 +67,14 @@ class Carousel {
         Icon.DrawCenteredIn(c, "arrow-left", prevX, ay, ab, ab, gl, t.textInverse);
         Icon.DrawCenteredIn(c, "arrow-right", nextX, ay, ab, ab, gl, t.textInverse);
         app.hitTester.Register(HitRegion.Create(prevId, prevX, ay, ab, ab, 0));
-        app.hitTester.Register(HitRegion.Create(nextId, nextX, ay, ab, ab, 0));
+        app.hitTester.Register(HitRegion.Create(prevId + 1, nextX, ay, ab, ab, 0));
 
-        // Indicator dots
         int dot = t.gapSmall;
         int dotGap = t.gapSmall;
         int dotsW = count * dot + (count - 1) * dotGap;
         int dx = x + (w - dotsW) / 2;
         int dy = y + h - t.paddingLarge;
-        i = 0;
+        int i = 0;
         while (i < count) {
             int dcolor = t.overlay;
             int dw = dot;
@@ -67,6 +84,80 @@ class Carousel {
             dx = dx + dw + dotGap;
             i = i + 1;
         }
+    }
+
+    static int Render(App app, int x, int y, int w, int h, List<string> slides, SignalInt idx) {
+        int prevId = app.focus.AllocId();
+        int nextId = app.focus.AllocId();
+        int count = slides.Count;
+        int i = 0;
+        while (i < count) {
+            app.focus.AllocId();
+            i = i + 1;
+        }
+
+        int cur = idx.Get();
+        if (cur < 0) { cur = 0; }
+        if (cur >= count) { cur = count - 1; }
+
+        Carousel.Slide(app, x, y, w, h, slides, cur);
+        Carousel.Chrome(app, prevId, x, y, w, h, count, cur);
+        return prevId;
+    }
+
+    /// Like Render but slides the outgoing and incoming panels horizontally when
+    /// the active index changes. Pass a caller-owned CarouselAnim.
+    static int RenderAnimated(App app, int x, int y, int w, int h,
+                              List<string> slides, SignalInt idx, CarouselAnim anim) {
+        int prevId = app.focus.AllocId();
+        int nextId = app.focus.AllocId();
+        int count = slides.Count;
+        int i = 0;
+        while (i < count) {
+            app.focus.AllocId();
+            i = i + 1;
+        }
+
+        Canvas c = app.canvas;
+        int cur = idx.Get();
+        if (cur < 0) { cur = 0; }
+        if (cur >= count) { cur = count - 1; }
+
+        // Kick off a transition when the target index changes.
+        if (!anim.animating && anim.shown != cur) {
+            anim.from = anim.shown;
+            anim.animating = true;
+            anim.startFrame = app.frameCount;
+            if (cur == (anim.from - 1 + count) % count) { anim.dir = 0 - 1; }
+            else { anim.dir = 1; }
+        }
+
+        int dur = 10;
+        int prog = 1000;
+        if (anim.animating) {
+            int elapsed = app.frameCount - anim.startFrame;
+            prog = elapsed * 1000 / dur;
+            if (prog >= 1000) {
+                prog = 1000;
+                anim.animating = false;
+                anim.shown = cur;
+            }
+        }
+
+        c.PushClip(x, y, w, h);
+        if (anim.animating) {
+            int shift = w * prog / 1000;
+            int outX = x - anim.dir * shift;
+            int inX = outX + anim.dir * w;
+            Carousel.Slide(app, outX, y, w, h, slides, anim.from);
+            Carousel.Slide(app, inX, y, w, h, slides, cur);
+        } else {
+            Carousel.Slide(app, x, y, w, h, slides, cur);
+        }
+        c.PopClip();
+
+        Carousel.Chrome(app, prevId, x, y, w, h, count, cur);
+        if (anim.animating) { app.RequestRedraw(); }
         return prevId;
     }
 

@@ -51,6 +51,34 @@ static zan_ast_node_t *parser_error_node(zan_parser_t *p) {
     return zan_ast_new(p->arena, AST_INT_LITERAL, p->current.loc);
 }
 
+/* Consume the '>' that closes a generic argument list.
+ *
+ * The lexer greedily forms '>>' / '>>=' tokens, but inside nested generics
+ * (e.g. `Box<Box<int>>`) each level needs its own closing '>'. When the
+ * current token is such a compound token, split off a single '>' and rewrite
+ * the current token to hold the remainder so the enclosing level can consume
+ * it in turn, without advancing the underlying lexer. */
+static void parser_expect_gt(zan_parser_t *p) {
+    switch (p->current.kind) {
+    case TK_GREATER:
+        parser_advance(p);
+        return;
+    case TK_GREATER_GREATER:
+        p->current.kind = TK_GREATER;
+        p->current.loc.col += 1;
+        return;
+    case TK_GREATER_GREATER_EQ:
+        p->current.kind = TK_GREATER_EQ;
+        p->current.loc.col += 1;
+        return;
+    default:
+        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                      "expected '%s', got '%s'",
+                      zan_token_kind_name(TK_GREATER),
+                      zan_token_kind_name(p->current.kind));
+    }
+}
+
 /* forward declarations */
 static zan_ast_node_t *parse_expression(zan_parser_t *p);
 static zan_ast_node_t *parse_statement(zan_parser_t *p);
@@ -132,7 +160,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             zan_ast_list_push(&type_node->type_ref.type_args, arg, p->arena);
             if (!parser_match(p, TK_COMMA)) break;
         }
-        parser_expect(p, TK_GREATER);
+        parser_expect_gt(p);
     }
 
     /* array: T[] */
@@ -179,6 +207,84 @@ static uint32_t parse_modifiers(zan_parser_t *p) {
 }
 
 /* ---- expressions (Pratt-style precedence climbing) ---- */
+
+/* Lookahead used to disambiguate a parenthesized group from a lambda
+ * parameter list. With p->current sitting on '(', returns true when the
+ * matching ')' is immediately followed by '=>'. Token-level only: it saves
+ * and restores the lexer + current/previous tokens and allocates no AST,
+ * so it emits no diagnostics. */
+static bool paren_is_lambda(zan_parser_t *p) {
+    zan_lexer_t saved_lex = *p->lex;
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    int depth = 0;
+    bool result = false;
+    while (p->current.kind != TK_EOF) {
+        if (p->current.kind == TK_LPAREN) {
+            depth++;
+        } else if (p->current.kind == TK_RPAREN) {
+            depth--;
+            if (depth == 0) {
+                result = (zan_lexer_peek(p->lex).kind == TK_ARROW);
+                break;
+            }
+        }
+        parser_advance(p);
+    }
+    *p->lex = saved_lex;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return result;
+}
+
+/* A single lambda parameter: either an untyped bare identifier (when the
+ * identifier is directly followed by ',' or ')') or a typed `Type name`. */
+static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
+    zan_loc_t loc = p->current.loc;
+    if (parser_check(p, TK_IDENT)) {
+        zan_token_kind_t after = zan_lexer_peek(p->lex).kind;
+        if (after == TK_COMMA || after == TK_RPAREN) {
+            parser_advance(p);
+            zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
+            pn->param.name = p->previous.str_val;
+            pn->param.type = NULL;
+            pn->param.default_val = NULL;
+            return pn;
+        }
+    }
+    zan_ast_node_t *type = parse_type_ref(p);
+    zan_istr_t name = {0};
+    if (parser_check(p, TK_IDENT)) {
+        parser_advance(p);
+        name = p->previous.str_val;
+    }
+    zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
+    pn->param.name = name;
+    pn->param.type = type;
+    pn->param.default_val = NULL;
+    return pn;
+}
+
+/* Parse a parenthesized lambda: `( params ) => body`, with p->current on '('.
+ * The body is a block when it starts with '{', otherwise a single expression. */
+static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
+    zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, loc);
+    zan_ast_list_init(&n->lambda.params);
+    parser_expect(p, TK_LPAREN);
+    while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
+        zan_ast_node_t *param = parse_lambda_param(p);
+        zan_ast_list_push(&n->lambda.params, param, p->arena);
+        if (!parser_match(p, TK_COMMA)) break;
+    }
+    parser_expect(p, TK_RPAREN);
+    parser_expect(p, TK_ARROW);
+    if (parser_check(p, TK_LBRACE)) {
+        n->lambda.body = parse_block(p);
+    } else {
+        n->lambda.body = parse_expression(p);
+    }
+    return n;
+}
 
 static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
@@ -271,7 +377,8 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             parser_advance(p); /* ident */
             zan_istr_t param_name = p->previous.str_val;
             parser_advance(p); /* => */
-            zan_ast_node_t *body = parse_expression(p);
+            zan_ast_node_t *body = parser_check(p, TK_LBRACE)
+                ? parse_block(p) : parse_expression(p);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, loc);
             zan_ast_list_init(&n->lambda.params);
             zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
@@ -288,6 +395,12 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_LPAREN: {
+        /* Lambda with a parenthesized parameter list: () =>, (a, b) =>,
+         * (int x) => ... — detected by a matching ')' followed by '=>'. Must
+         * be checked before the cast rule so typed params like (int x) work. */
+        if (paren_is_lambda(p)) {
+            return parse_lambda_paren(p, loc);
+        }
         /* C-style cast: (PrimitiveType) unary — primitive keywords cannot
          * begin a parenthesized expression, so this is unambiguous. */
         switch (zan_lexer_peek(p->lex).kind) {
@@ -602,6 +715,35 @@ static zan_ast_node_t *parse_expression(zan_parser_t *p) {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
         zan_ast_node_t *right = parse_expression(p);
+
+        /* Desugar compound assignment `lhs OP= rhs` into `lhs = lhs OP rhs`.
+         * irgen has no dedicated compound-assign path, so lowering here fixes
+         * +=/-=/... for scalars and strings and, because `+` already dispatches
+         * to a class's op_add, lets operator-overloaded types drive `+=`
+         * (e.g. `btn.Click += handler`). */
+        zan_token_kind_t base = TK_EOF;
+        switch (op) {
+        case TK_PLUS_EQ:            base = TK_PLUS; break;
+        case TK_MINUS_EQ:           base = TK_MINUS; break;
+        case TK_STAR_EQ:            base = TK_STAR; break;
+        case TK_SLASH_EQ:           base = TK_SLASH; break;
+        case TK_PERCENT_EQ:         base = TK_PERCENT; break;
+        case TK_AMP_EQ:             base = TK_AMP; break;
+        case TK_PIPE_EQ:            base = TK_PIPE; break;
+        case TK_CARET_EQ:           base = TK_CARET; break;
+        case TK_LESS_LESS_EQ:       base = TK_LESS_LESS; break;
+        case TK_GREATER_GREATER_EQ: base = TK_GREATER_GREATER; break;
+        default: break;
+        }
+        if (base != TK_EOF) {
+            zan_ast_node_t *bin = zan_ast_new(p->arena, AST_BINARY, loc);
+            bin->binary.op = base;
+            bin->binary.left = expr;
+            bin->binary.right = right;
+            right = bin;
+            op = TK_EQ;
+        }
+
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_ASSIGNMENT, loc);
         n->binary.op = op;
         n->binary.left = expr;

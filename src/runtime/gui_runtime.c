@@ -15,10 +15,12 @@
 #include <rpc.h>
 #include <shellscalingapi.h>
 #include <dwmapi.h>
+#include <imm.h>
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "imm32.lib")
 /* When ZAN_GUI_STATIC is defined the runtime is compiled into a static archive
  * and linked directly into the executable (no zan_gui.dll dependency). The lib
  * pragmas above are honored by lld-link even in that mode, so the Win32 system
@@ -32,8 +34,19 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
+#include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#include <poll.h>
 #include <time.h>
+#include <locale.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#ifdef ZAN_GUI_FREETYPE
+#include <fontconfig/fontconfig.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#endif
 #define EXPORT __attribute__((visibility("default")))
 #else
 #define EXPORT __attribute__((visibility("default")))
@@ -53,6 +66,15 @@ typedef struct {
     int width;
     int height;
     int stride;
+    /* Active clip window (x1/y1 exclusive) enforced by every pixel write, so
+     * scroll containers can bound their content to a viewport. clip_stack holds
+     * saved windows for nested PushClip/PopClip (4 ints per level, 16 levels). */
+    int clip_x0;
+    int clip_y0;
+    int clip_x1;
+    int clip_y1;
+    int clip_stack[64];
+    int clip_depth;
 } zan_surface_t;
 
 static zan_surface_t *g_surfaces[64];
@@ -86,15 +108,32 @@ static u32 blend_over(u32 dst, u32 src) {
     return (255u << 24) | (or_ << 16) | (og << 8) | ob;
 }
 
+/* Reset the clip window to the whole surface (frame start / new surface). */
+static void clip_reset_full(zan_surface_t *s) {
+    s->clip_x0 = 0;
+    s->clip_y0 = 0;
+    s->clip_x1 = s->width;
+    s->clip_y1 = s->height;
+    s->clip_depth = 0;
+}
+
+/* True when (x,y) lies outside the surface or the active clip window. */
+static int clipped_out(zan_surface_t *s, int x, int y) {
+    if (x < 0 || x >= s->width || y < 0 || y >= s->height) return 1;
+    if (x < s->clip_x0 || x >= s->clip_x1) return 1;
+    if (y < s->clip_y0 || y >= s->clip_y1) return 1;
+    return 0;
+}
+
 static void set_pixel(zan_surface_t *s, int x, int y, u32 color) {
-    if (x < 0 || x >= s->width || y < 0 || y >= s->height) return;
+    if (clipped_out(s, x, y)) return;
     int idx = y * s->stride + x;
     s->pixels[idx] = blend_over(s->pixels[idx], color);
 }
 
 /* Set pixel with coverage alpha applied on top of color's own alpha */
 static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage) {
-    if (x < 0 || x >= s->width || y < 0 || y >= s->height) return;
+    if (clipped_out(s, x, y)) return;
     if (coverage <= 0) return;
     if (coverage > 255) coverage = 255;
     u32 a = ((color >> 24) & 0xFF) * (u32)coverage / 255;
@@ -120,6 +159,7 @@ EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
     s->width = (int)width;
     s->height = (int)height;
     s->stride = (int)width;
+    clip_reset_full(s);
     /* malloc (not calloc): every frame starts with zan_gui_clear covering the
      * whole surface, so zero-init is wasted work — and on large windows the
      * per-resize zeroing of ~32MB was a noticeable hitch during drag-resize. */
@@ -152,7 +192,7 @@ EXPORT i64 zan_gui_surface_height(i64 id) {
 /* Internal (not part of the [DllImport] ABI): expose a surface's raw ARGB
  * buffer to a native platform backend compiled as a separate TU (e.g. the
  * macOS Cocoa .m file), which cannot see the static g_surfaces table. */
-const u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride) {
+u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride) {
     if (id < 0 || id >= g_surface_count || !g_surfaces[id]) return NULL;
     zan_surface_t *s = g_surfaces[id];
     if (w) *w = s->width;
@@ -165,10 +205,66 @@ EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
+    /* A frame begins with clear(), so drop any clip left set by the last one. */
+    clip_reset_full(s);
     u32 c = (u32)color;
     g_bg_color = c;
     int count = s->width * s->height;
     for (int i = 0; i < count; i++) s->pixels[i] = c;
+}
+
+/* Intersect the clip window with (x,y,w,h) and save the previous window so a
+ * matching zan_gui_pop_clip restores it. Nested pushes can only shrink. */
+EXPORT void zan_gui_push_clip(i64 surface_id, i64 x, i64 y, i64 w, i64 h) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int cap = (int)(sizeof(s->clip_stack) / sizeof(s->clip_stack[0]));
+    if (s->clip_depth * 4 + 4 <= cap) {
+        s->clip_stack[s->clip_depth * 4 + 0] = s->clip_x0;
+        s->clip_stack[s->clip_depth * 4 + 1] = s->clip_y0;
+        s->clip_stack[s->clip_depth * 4 + 2] = s->clip_x1;
+        s->clip_stack[s->clip_depth * 4 + 3] = s->clip_y1;
+        s->clip_depth++;
+    }
+    int nx0 = (int)x;
+    int ny0 = (int)y;
+    int nx1 = (int)x + (int)w;
+    int ny1 = (int)y + (int)h;
+    if (nx0 < s->clip_x0) nx0 = s->clip_x0;
+    if (ny0 < s->clip_y0) ny0 = s->clip_y0;
+    if (nx1 > s->clip_x1) nx1 = s->clip_x1;
+    if (ny1 > s->clip_y1) ny1 = s->clip_y1;
+    if (nx1 < nx0) nx1 = nx0;
+    if (ny1 < ny0) ny1 = ny0;
+    s->clip_x0 = nx0;
+    s->clip_y0 = ny0;
+    s->clip_x1 = nx1;
+    s->clip_y1 = ny1;
+}
+
+/* Restore the clip window saved by the most recent zan_gui_push_clip. */
+EXPORT void zan_gui_pop_clip(i64 surface_id) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    if (s->clip_depth > 0) {
+        s->clip_depth--;
+        s->clip_x0 = s->clip_stack[s->clip_depth * 4 + 0];
+        s->clip_y0 = s->clip_stack[s->clip_depth * 4 + 1];
+        s->clip_x1 = s->clip_stack[s->clip_depth * 4 + 2];
+        s->clip_y1 = s->clip_stack[s->clip_depth * 4 + 3];
+    } else {
+        clip_reset_full(s);
+    }
+}
+
+/* Drop all clip windows and clip to the whole surface again. */
+EXPORT void zan_gui_reset_clip(i64 surface_id) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    clip_reset_full(s);
 }
 
 EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color) {
@@ -191,6 +287,266 @@ EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 co
             for (int px = x0; px < x1; px++)
                 set_pixel(s, px, py, c);
     }
+}
+
+/* Vertical linear gradient fill: each row is a lerp between color_top (at y)
+ * and color_bottom (at y+h-1). Opaque; used for modern gradient wallpapers
+ * (AI / Aurora / Glass backdrops). Single pass, no allocation. */
+EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
+                               i64 color_top, i64 color_bottom) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rh = (int)h;
+    if (rh < 1) rh = 1;
+    int denom = rh > 1 ? rh - 1 : 1;
+    u32 ct = (u32)color_top, cb = (u32)color_bottom;
+    int tr = (ct >> 16) & 0xFF, tg = (ct >> 8) & 0xFF, tb = ct & 0xFF;
+    int mr = (cb >> 16) & 0xFF, mg = (cb >> 8) & 0xFF, mb = cb & 0xFF;
+    for (int py = y0; py < y1; py++) {
+        int num = py - (int)y;
+        if (num < 0) num = 0;
+        if (num > rh - 1) num = rh - 1;
+        int rr = tr + (mr - tr) * num / denom;
+        int gg = tg + (mg - tg) * num / denom;
+        int bb = tb + (mb - tb) * num / denom;
+        u32 c = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+        u32 *row = s->pixels + py * s->stride;
+        for (int px = x0; px < x1; px++) row[px] = c;
+    }
+}
+
+/* Backdrop blur: separable box blur (3 passes ~ Gaussian) over a rectangular
+ * region, in place. Used to render frosted-glass panels — draw the backdrop,
+ * blur the region behind a panel, then overlay a translucent tint. Alpha is
+ * forced opaque (the backdrop under an overlay is opaque). Edge samples are
+ * clamped to the region. Cost is O(passes * area), independent of radius. */
+EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 radius) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    int r = (int)radius;
+    if (r < 1) return;
+    if (r > 40) r = 40;
+
+    size_t n = (size_t)rw * (size_t)rh;
+    u32 *a = (u32 *)malloc(n * sizeof(u32));
+    u32 *b = (u32 *)malloc(n * sizeof(u32));
+    if (!a || !b) { free(a); free(b); return; }
+
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        for (int i = 0; i < rw; i++) a[j * rw + i] = row[i];
+    }
+
+    int win = 2 * r + 1;
+    for (int p = 0; p < 3; p++) {
+        /* horizontal: a -> b */
+        for (int j = 0; j < rh; j++) {
+            u32 *src = a + j * rw;
+            u32 *dst = b + j * rw;
+            int sr = 0, sg = 0, sb = 0;
+            for (int k = -r; k <= r; k++) {
+                int ii = clamp_i(k, 0, rw - 1);
+                u32 px = src[ii];
+                sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
+            }
+            for (int i = 0; i < rw; i++) {
+                dst[i] = 0xFF000000u | ((u32)(sr / win) << 16)
+                       | ((u32)(sg / win) << 8) | (u32)(sb / win);
+                u32 pa = src[clamp_i(i + r + 1, 0, rw - 1)];
+                u32 ps = src[clamp_i(i - r, 0, rw - 1)];
+                sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+                sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
+                sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
+            }
+        }
+        /* vertical: b -> a */
+        for (int i = 0; i < rw; i++) {
+            int sr = 0, sg = 0, sb = 0;
+            for (int k = -r; k <= r; k++) {
+                int jj = clamp_i(k, 0, rh - 1);
+                u32 px = b[jj * rw + i];
+                sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
+            }
+            for (int j = 0; j < rh; j++) {
+                a[j * rw + i] = 0xFF000000u | ((u32)(sr / win) << 16)
+                              | ((u32)(sg / win) << 8) | (u32)(sb / win);
+                u32 pa = b[clamp_i(j + r + 1, 0, rh - 1) * rw + i];
+                u32 ps = b[clamp_i(j - r, 0, rh - 1) * rw + i];
+                sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+                sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
+                sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
+            }
+        }
+    }
+
+    /* Vibrancy: push each blurred pixel's saturation up (~1.4x) so the frosted
+     * backdrop keeps the colour of the wallpaper behind it -- the hallmark of
+     * Apple-style glass -- instead of washing out to a flat grey once a
+     * translucent tint is laid over it. Luma-preserving so brightness holds. */
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        for (int i = 0; i < rw; i++) {
+            u32 px = a[j * rw + i];
+            int rr = (int)((px >> 16) & 0xFF);
+            int gg = (int)((px >> 8) & 0xFF);
+            int bb = (int)(px & 0xFF);
+            int luma = (rr * 77 + gg * 150 + bb * 29) >> 8;
+            rr = luma + (rr - luma) * 7 / 5;
+            gg = luma + (gg - luma) * 7 / 5;
+            bb = luma + (bb - luma) * 7 / 5;
+            rr = clamp_i(rr, 0, 255);
+            gg = clamp_i(gg, 0, 255);
+            bb = clamp_i(bb, 0, 255);
+            row[i] = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+        }
+    }
+    free(a); free(b);
+}
+
+/* --- Frosted-glass blur cache ---------------------------------------------
+ * Live Gaussian blur is the dominant per-frame cost under the glass theme: an
+ * on-screen animation (spinner, toast) repaints the whole page, and every glass
+ * panel re-blurs its otherwise-static backdrop. Each slot snapshots the blurred
+ * output so animation-only frames (dirty==0, geometry unchanged) restore the
+ * cached pixels with a plain copy instead of recomputing the blur. The caller
+ * passes dirty==1 whenever the content behind the glass may have changed
+ * (input, scroll, resize, theme) and a stable slot id per glass surface. */
+#define ZAN_BLUR_CACHE_SLOTS 64
+typedef struct {
+    int valid;
+    int x0, y0, rw, rh, r;
+    u32 *pixels;
+    size_t cap;
+} zan_blur_cache_t;
+static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
+
+EXPORT void zan_gui_blur_rect_cached(i64 surface_id, i64 x, i64 y, i64 w,
+                                     i64 h, i64 radius, i64 slot, i64 dirty) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    if (slot < 0 || slot >= ZAN_BLUR_CACHE_SLOTS) {
+        zan_gui_blur_rect(surface_id, x, y, w, h, radius);
+        return;
+    }
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    int r = (int)radius;
+    if (r < 1) return;
+    if (r > 40) r = 40;
+
+    zan_blur_cache_t *c = &g_blur_cache[slot];
+    size_t n = (size_t)rw * (size_t)rh;
+
+    /* Reuse path: same geometry, not dirtied -> restore cached blurred pixels
+     * over the (freshly redrawn, identical) backdrop without re-blurring. */
+    if (!dirty && c->valid && c->pixels
+        && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
+        && c->r == r) {
+        for (int j = 0; j < rh; j++) {
+            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+            u32 *src = c->pixels + (size_t)j * rw;
+            for (int i = 0; i < rw; i++) row[i] = src[i];
+        }
+        return;
+    }
+
+    /* Recompute in place (identical clamping), then snapshot into the slot. */
+    zan_gui_blur_rect(surface_id, x, y, w, h, radius);
+    if (c->cap < n) {
+        u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
+        if (!np) { c->valid = 0; return; }
+        c->pixels = np;
+        c->cap = n;
+    }
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        u32 *dst = c->pixels + (size_t)j * rw;
+        for (int i = 0; i < rw; i++) dst[i] = row[i];
+    }
+    c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
+    c->valid = 1;
+}
+
+/* --- Static-backdrop snapshot cache ---------------------------------------
+ * Even with the blur cached, an on-screen animation still re-paints the whole
+ * page every frame -- and under glass the wallpaper (a gradient plus several
+ * large alpha-blended blobs) is by far the most expensive part of that. These
+ * slots snapshot a region's pixels after it is drawn; on animation-only frames
+ * the caller restores the snapshot with a single copy instead of re-painting
+ * the backdrop. Geometry must match (else restore reports failure and the
+ * caller repaints normally, e.g. after a resize). */
+#define ZAN_SNAP_CACHE_SLOTS 8
+static zan_blur_cache_t g_snap_cache[ZAN_SNAP_CACHE_SLOTS];
+
+EXPORT void zan_gui_snapshot_rect(i64 surface_id, i64 x, i64 y, i64 w,
+                                  i64 h, i64 slot) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return;
+    zan_blur_cache_t *c = &g_snap_cache[slot];
+    size_t n = (size_t)rw * (size_t)rh;
+    if (c->cap < n) {
+        u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
+        if (!np) { c->valid = 0; return; }
+        c->pixels = np;
+        c->cap = n;
+    }
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        u32 *dst = c->pixels + (size_t)j * rw;
+        for (int i = 0; i < rw; i++) dst[i] = row[i];
+    }
+    c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = 0;
+    c->valid = 1;
+}
+
+EXPORT i64 zan_gui_restore_rect(i64 surface_id, i64 x, i64 y, i64 w,
+                                i64 h, i64 slot) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return 0;
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return 0;
+    int x0 = clamp_i((int)x, 0, s->width);
+    int y0 = clamp_i((int)y, 0, s->height);
+    int x1 = clamp_i((int)(x + w), 0, s->width);
+    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int rw = x1 - x0, rh = y1 - y0;
+    if (rw <= 0 || rh <= 0) return 0;
+    zan_blur_cache_t *c = &g_snap_cache[slot];
+    if (!c->valid || !c->pixels
+        || c->x0 != x0 || c->y0 != y0 || c->rw != rw || c->rh != rh) {
+        return 0;
+    }
+    for (int j = 0; j < rh; j++) {
+        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+        u32 *src = c->pixels + (size_t)j * rw;
+        for (int i = 0; i < rw; i++) row[i] = src[i];
+    }
+    return 1;
 }
 
 EXPORT void zan_gui_draw_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color, i64 thickness) {
@@ -440,7 +796,117 @@ static HFONT get_or_create_font(int size) {
     return g_fonts[slot];
 }
 
-EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y, const char *text, i64 color, i64 font_size) {
+/* --- Rasterised text-run cache -------------------------------------------
+ * zan_gui_draw_text is called many times per frame (one call per token/word)
+ * and, while scrolling, with the *same* strings every frame -- only the Y
+ * position moves. GDI-rendering each call (DIB alloc + TextOutW + GdiFlush)
+ * then dominates CPU. Cache the white-on-black coverage bitmap keyed by
+ * (text, size); the draw colour is applied at composite time, so it is not
+ * part of the key and the same glyph run is reused for any colour. Entries
+ * persist across frames, so scrolling only re-blits cached masks. */
+typedef struct {
+    char *text;   /* UTF-8 key; NULL marks an empty slot */
+    int   size;
+    int   tw, th;
+    u32  *bits;   /* tw*th ARGB coverage straight from GDI */
+    uint64_t used;   /* LRU tick */
+} zan_text_cache_t;
+
+#define ZAN_TEXT_CACHE_CAP 1024
+#define ZAN_TEXT_CACHE_PROBE 8
+static zan_text_cache_t g_tcache[ZAN_TEXT_CACHE_CAP];
+static uint64_t g_tcache_clock = 0;
+
+static uint64_t zan_text_hash(const char *s, int size) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint64_t)(*p);
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)(unsigned)size;
+    h *= 1099511628211ULL;
+    return h;
+}
+
+/* Returns a cache entry whose bits hold the coverage mask, or NULL on error. */
+static zan_text_cache_t *zan_text_cache_get(const char *text, int size) {
+    uint64_t h = zan_text_hash(text, size);
+    int base = (int)(h % ZAN_TEXT_CACHE_CAP);
+    zan_text_cache_t *victim = NULL;
+    for (int i = 0; i < ZAN_TEXT_CACHE_PROBE; i++) {
+        zan_text_cache_t *e = &g_tcache[(base + i) % ZAN_TEXT_CACHE_CAP];
+        if (e->text && e->size == size && strcmp(e->text, text) == 0) {
+            e->used = ++g_tcache_clock;
+            return e;
+        }
+        if (!e->text && !victim) victim = e;
+    }
+    if (!victim) {
+        uint64_t best = ~0ULL;
+        for (int i = 0; i < ZAN_TEXT_CACHE_PROBE; i++) {
+            zan_text_cache_t *e = &g_tcache[(base + i) % ZAN_TEXT_CACHE_CAP];
+            if (e->used <= best) { best = e->used; victim = e; }
+        }
+    }
+
+    /* Miss: rasterise white text on black to capture the coverage mask. */
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wtext) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
+    int text_len = wlen - 1;
+
+    HFONT font = get_or_create_font(size);
+    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+    SIZE ts;
+    GetTextExtentPoint32W(g_text_dc, wtext, text_len, &ts);
+    int tw = ts.cx + 2;
+    int th = ts.cy + 2;
+    if (tw <= 0 || th <= 0) {
+        free(wtext); SelectObject(g_text_dc, old_font); return NULL;
+    }
+
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = tw;
+    bmi.bmiHeader.biHeight = -th;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void *dbits = NULL;
+    HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &dbits, NULL, 0);
+    if (!hbmp) { free(wtext); SelectObject(g_text_dc, old_font); return NULL; }
+    HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
+    memset(dbits, 0, (size_t)(tw * th * 4));
+    SetTextColor(g_text_dc, RGB(255, 255, 255));
+    TextOutW(g_text_dc, 0, 0, wtext, text_len);
+    GdiFlush();
+
+    u32 *copy = (u32 *)malloc((size_t)(tw * th) * sizeof(u32));
+    if (copy) memcpy(copy, dbits, (size_t)(tw * th) * sizeof(u32));
+
+    SelectObject(g_text_dc, old_bmp);
+    SelectObject(g_text_dc, old_font);
+    DeleteObject(hbmp);
+    free(wtext);
+    if (!copy) return NULL;
+
+    if (victim->text) { free(victim->text); victim->text = NULL; }
+    if (victim->bits) { free(victim->bits); victim->bits = NULL; }
+    size_t klen = strlen(text) + 1;
+    victim->text = (char *)malloc(klen);
+    if (!victim->text) { free(copy); return NULL; }
+    memcpy(victim->text, text, klen);
+    victim->size = size;
+    victim->tw = tw;
+    victim->th = th;
+    victim->bits = copy;
+    victim->used = ++g_tcache_clock;
+    return victim;
+}
+
+EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
+                              const char *text, i64 color, i64 font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !text || !*text) return;
@@ -450,59 +916,26 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y, const char *text, i6
 
     ensure_text_dc();
 
-    /* Convert text to wide string */
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
-    int text_len = wlen - 1;
-
-    /* Measure text */
-    HFONT font = get_or_create_font(size);
-    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
-    SIZE text_size;
-    GetTextExtentPoint32W(g_text_dc, wtext, text_len, &text_size);
-
-    int tw = text_size.cx + 2;
-    int th = text_size.cy + 2;
-    if (tw <= 0 || th <= 0) { free(wtext); SelectObject(g_text_dc, old_font); return; }
-
-    /* Create a temporary bitmap for text rendering */
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = tw;
-    bmi.bmiHeader.biHeight = -th;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void *bits = NULL;
-    HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!hbmp) { free(wtext); SelectObject(g_text_dc, old_font); return; }
-
-    HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
-    /* Clear to black */
-    memset(bits, 0, (size_t)(tw * th * 4));
-
-    /* Draw white text on black background to get alpha mask */
-    SetTextColor(g_text_dc, RGB(255, 255, 255));
-    TextOutW(g_text_dc, 0, 0, wtext, text_len);
-    GdiFlush();
+    zan_text_cache_t *e = zan_text_cache_get(text, size);
+    if (!e || !e->bits) return;
+    int tw = e->tw;
+    int th = e->th;
+    u32 *src = e->bits;
 
     /* Extract color components */
     u32 cr = ((u32)color >> 16) & 0xFF;
     u32 cg = ((u32)color >> 8) & 0xFF;
     u32 cb = (u32)color & 0xFF;
-
-    /* Composite text using per-channel ClearType coverage for sharp rendering */
-    u32 *src = (u32 *)bits;
     u32 ca = ((u32)color >> 24) & 0xFF;
     if (ca == 0) ca = 255; /* treat 0 alpha as opaque for text */
+
+    /* Composite cached coverage using per-channel ClearType AA. */
     for (int py = 0; py < th; py++) {
         int dst_y = (int)y + py;
-        if (dst_y < 0 || dst_y >= s->height) continue;
+        if (dst_y < s->clip_y0 || dst_y >= s->clip_y1) continue;
         for (int px = 0; px < tw; px++) {
             int dst_x = (int)x + px;
-            if (dst_x < 0 || dst_x >= s->width) continue;
+            if (dst_x < s->clip_x0 || dst_x >= s->clip_x1) continue;
             u32 sp = src[py * tw + px];
             u32 sr = (sp >> 16) & 0xFF;
             u32 sg = (sp >> 8) & 0xFF;
@@ -523,11 +956,6 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y, const char *text, i6
             s->pixels[idx] = (255u << 24) | (or_ << 16) | (og << 8) | ob;
         }
     }
-
-    SelectObject(g_text_dc, old_bmp);
-    SelectObject(g_text_dc, old_font);
-    DeleteObject(hbmp);
-    free(wtext);
 }
 
 EXPORT i64 zan_gui_measure_text(const char *text, i64 font_size) {
@@ -640,10 +1068,10 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box, i64 color, 
     u32 *src = (u32 *)bits;
     for (int py = 0; py < th; py++) {
         int dst_y = oy + py;
-        if (dst_y < 0 || dst_y >= s->height) continue;
+        if (dst_y < s->clip_y0 || dst_y >= s->clip_y1) continue;
         for (int px = 0; px < tw; px++) {
             int dst_x = ox + px;
-            if (dst_x < 0 || dst_x >= s->width) continue;
+            if (dst_x < s->clip_x0 || dst_x >= s->clip_x1) continue;
             u32 sp = src[py * tw + px];
             u32 sr = (sp >> 16) & 0xFF;
             u32 sg = (sp >> 8) & 0xFF;
@@ -726,9 +1154,49 @@ static int g_btn_w = 46;
  * area (clickable) rather than draggable caption. */
 static int g_caption_btn_count = 5;
 
+/* Caret position (client-area px) reported by the focused text widget so the
+ * IME composition + candidate windows follow the cursor instead of pinning to
+ * the window origin. Updated from Zan via zan_gui_set_ime_pos each frame. */
+static int g_ime_x = 0;
+static int g_ime_y = 0;
+
+/* Move the active input context's composition + candidate windows to the caret.
+ * Safe to call whenever; no-op if the window has no IMM context. */
+static void zan_ime_reposition(HWND hwnd) {
+    HIMC himc = ImmGetContext(hwnd);
+    if (!himc) { return; }
+    COMPOSITIONFORM cf;
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos.x = g_ime_x;
+    cf.ptCurrentPos.y = g_ime_y;
+    ImmSetCompositionWindow(himc, &cf);
+    CANDIDATEFORM cand;
+    cand.dwIndex = 0;
+    cand.dwStyle = CFS_CANDIDATEPOS;
+    cand.ptCurrentPos.x = g_ime_x;
+    cand.ptCurrentPos.y = g_ime_y;
+    cand.rcArea.left = 0;
+    cand.rcArea.top = 0;
+    cand.rcArea.right = 0;
+    cand.rcArea.bottom = 0;
+    ImmSetCandidateWindow(himc, &cand);
+    ImmReleaseContext(hwnd, himc);
+}
+
 static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     g_event_hwnd = hwnd;
     switch (msg) {
+    case WM_IME_STARTCOMPOSITION:
+        /* Position the composition window at the caret before the IME draws it,
+         * then let DefWindowProc run the normal composition handling. */
+        zan_ime_reposition(hwnd);
+        break;
+    case WM_IME_COMPOSITION:
+        zan_ime_reposition(hwnd);
+        break;
+    case WM_IME_SETCONTEXT:
+        zan_ime_reposition(hwnd);
+        break;
     case WM_DESTROY:
         g_pending_event[0] = 8;
         g_has_event = 1;
@@ -808,11 +1276,18 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_pending_event[4] = (int)wp;
         g_has_event = 1;
         return 0;
-    case WM_MOUSEWHEEL:
+    case WM_MOUSEWHEEL: {
+        POINT wheel_pt = {
+            (int)(short)LOWORD(lp), (int)(short)HIWORD(lp)
+        };
+        ScreenToClient(hwnd, &wheel_pt);
+        g_pending_event[1] = wheel_pt.x;
+        g_pending_event[2] = wheel_pt.y;
         g_pending_event[0] = 13;
         g_pending_event[4] = GET_WHEEL_DELTA_WPARAM(wp);
         g_has_event = 1;
         return 0;
+    }
     case WM_NCCALCSIZE:
         /* Remove the standard window frame so the client area covers the whole
          * window (custom, themeable title bar). Keep the frame inset when
@@ -930,7 +1405,34 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         NULL, NULL, GetModuleHandleW(NULL), NULL
     );
     free(wtitle);
-    if (!g_main_hwnd) { g_main_hwnd = hwnd; }
+    if (!g_main_hwnd) {
+        g_main_hwnd = hwnd;
+    } else {
+        RECT parent_rect;
+        RECT child_rect;
+        if (GetWindowRect(g_main_hwnd, &parent_rect) &&
+            GetWindowRect(hwnd, &child_rect)) {
+            int child_w = child_rect.right - child_rect.left;
+            int child_h = child_rect.bottom - child_rect.top;
+            int x = parent_rect.left +
+                ((parent_rect.right - parent_rect.left) - child_w) / 2;
+            int y = parent_rect.top +
+                ((parent_rect.bottom - parent_rect.top) - child_h) / 2;
+            MONITORINFO monitor = { sizeof(MONITORINFO) };
+            HMONITOR hm = MonitorFromWindow(
+                g_main_hwnd, MONITOR_DEFAULTTONEAREST);
+            if (GetMonitorInfoW(hm, &monitor)) {
+                if (x < monitor.rcWork.left) x = monitor.rcWork.left;
+                if (y < monitor.rcWork.top) y = monitor.rcWork.top;
+                if (x + child_w > monitor.rcWork.right)
+                    x = monitor.rcWork.right - child_w;
+                if (y + child_h > monitor.rcWork.bottom)
+                    y = monitor.rcWork.bottom - child_h;
+            }
+            SetWindowPos(hwnd, NULL, x, y, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     /* Restore the system drop shadow on the borderless window. Extending the
      * DWM frame by a 1px sheet re-enables the shadow + rounded corners while
      * WM_NCCALCSIZE still hides the standard frame. */
@@ -1020,6 +1522,14 @@ EXPORT i64 zan_gui_wait_event(void) {
     if (GetMessageW(&msg, NULL, 0, 0) <= 0) return -1;
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
+    return 0;
+}
+
+/* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
+ * PostMessageW is documented thread-safe, so this is callable from any
+ * thread. The posted WM_NULL carries no event; wait_event returns kind 0. */
+EXPORT i64 zan_gui_wake(void) {
+    if (g_main_hwnd) { PostMessageW(g_main_hwnd, WM_NULL, 0, 0); }
     return 0;
 }
 
@@ -1129,6 +1639,14 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
     return 0;
 }
 
+/* Report the caret position (client-area px) so the IME composition/candidate
+ * windows follow the cursor. Called each frame by the focused text widget. */
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
+    g_ime_x = (int)x;
+    g_ime_y = (int)y;
+    if (g_event_hwnd) { zan_ime_reposition(g_event_hwnd); }
+}
+
 /* Read CF_UNICODETEXT from the Windows clipboard as a UTF-8 string. Returns a
  * pointer valid until the next call (the previous buffer is freed each time),
  * or "" when the clipboard holds no text. The Zan `string` ABI is a plain
@@ -1189,22 +1707,143 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
 
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
-static GC g_gc = 0;
+/* Self-pipe used to wake a UI thread blocked in wait_event from another
+ * thread (Xlib is not thread-safe, so we can't post an X event off-thread;
+ * writing a byte to a pipe that wait_event also polls is safe). */
+static int g_wake_pipe[2] = { -1, -1 };
 static int g_pending_event_linux[8];
-static int g_has_event_linux = 0;
 static int g_win_w = 0, g_win_h = 0;
 static char *g_clip_text_linux = NULL;
+static char *g_clip_read_linux = NULL;
+static Cursor g_cursors_linux[8];
+static XIM g_xim = NULL;
+static XIC g_xic = NULL;
+
+/* Client-side decoration metrics for the borderless window with an app-drawn
+ * title bar, mirroring the Win32 backend. */
+static int g_scale_linux = 100;
+static int g_titlebar_h_l = 32;
+static int g_btn_w_l = 46;
+static int g_caption_btn_count_l = 5;
+
+/* Per-window state so one process can drive several top-level windows. The
+ * globals above still track the primary window for process-wide operations
+ * (clipboard, cursor, input method) and single-window size queries. */
+#define ZAN_MAX_WINDOWS 16
+typedef struct {
+    Window xid;
+    GC gc;
+    XIC xic;
+    Pixmap backbuf;
+    int backbuf_w, backbuf_h;
+    int w, h;
+} zan_lwin_t;
+static zan_lwin_t g_lwins[ZAN_MAX_WINDOWS];
+static int g_lwin_count = 0;
+static Window g_primary_win = 0;
+/* xid of the window the event currently being decoded originated from. */
+static Window g_evwin_linux = 0;
+
+static zan_lwin_t *lwin_find(Window xid) {
+    for (int i = 0; i < g_lwin_count; i++)
+        if (g_lwins[i].xid == xid) return &g_lwins[i];
+    return NULL;
+}
+
+i64 zan_gui_get_dpi_scale(void);
+i64 zan_gui_is_maximized(i64 hwnd_val);
+
+/* Decoded-event queue: a single XEvent can yield several ABI events (a key
+ * press -> keyDown + textInput; a wheel button -> scroll), so decoded events
+ * are buffered and drained one per poll/wait call, mirroring the Win32 message
+ * queue. Slots: [kind, x, y, button, keycode, mods, 0, 0]. */
+#define ZAN_EVQ_CAP 64
+static int g_evq_linux[ZAN_EVQ_CAP][8];
+static int g_evq_head_linux = 0, g_evq_tail_linux = 0;
+
+static void evq_push_linux(int kind, int x, int y, int button, int keycode, int mods) {
+    int next = (g_evq_tail_linux + 1) % ZAN_EVQ_CAP;
+    if (next == g_evq_head_linux) return; /* queue full: drop */
+    int *e = g_evq_linux[g_evq_tail_linux];
+    e[0] = kind; e[1] = x; e[2] = y; e[3] = button;
+    e[4] = keycode; e[5] = mods; e[6] = (int)g_evwin_linux; e[7] = 0;
+    g_evq_tail_linux = next;
+}
+
+static int evq_pop_linux(void) {
+    if (g_evq_head_linux == g_evq_tail_linux) return 0;
+    memcpy(g_pending_event_linux, g_evq_linux[g_evq_head_linux],
+           sizeof(g_pending_event_linux));
+    g_evq_head_linux = (g_evq_head_linux + 1) % ZAN_EVQ_CAP;
+    return 1;
+}
+
+/* Decode one UTF-8 scalar, advancing *p past it. */
+static unsigned x11_utf8_next(const char **p) {
+    const unsigned char *s = (const unsigned char *)*p;
+    unsigned cp = *s;
+    if (cp < 0x80) { *p += 1; return cp; }
+    else if ((cp >> 5) == 0x6) { cp = ((cp & 0x1F) << 6) | (s[1] & 0x3F); *p += 2; }
+    else if ((cp >> 4) == 0xE) { cp = ((cp & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); *p += 3; }
+    else if ((cp >> 3) == 0x1E) { cp = ((cp & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); *p += 4; }
+    else { *p += 1; }
+    return cp;
+}
+
+/* X11 modifier state -> Win32 encoding (bit0=Ctrl, bit1=Shift, bit2=Alt). */
+static int x11_mods(unsigned int state) {
+    int m = 0;
+    if (state & ControlMask) m |= 1;
+    if (state & ShiftMask)   m |= 2;
+    if (state & Mod1Mask)    m |= 4;
+    return m;
+}
+
+/* X keysym -> Windows VK code the Zan `Keys` constants use. */
+static int x11_vk_from_keysym(KeySym ks) {
+    switch (ks) {
+    case XK_Escape:    return 27;
+    case XK_Return:
+    case XK_KP_Enter:  return 13;
+    case XK_Tab:       return 9;
+    case XK_BackSpace: return 8;
+    case XK_Delete:    return 46;
+    case XK_Left:      return 37;
+    case XK_Up:        return 38;
+    case XK_Right:     return 39;
+    case XK_Down:      return 40;
+    case XK_Home:      return 36;
+    case XK_End:       return 35;
+    case XK_Prior:     return 33; /* PageUp */
+    case XK_Next:      return 34; /* PageDown */
+    case XK_space:     return 32;
+    case XK_F1:        return 112;
+    case XK_F2:        return 113;
+    case XK_F5:        return 116;
+    case XK_F11:       return 122;
+    case XK_Shift_L:
+    case XK_Shift_R:   return 16;
+    case XK_Control_L:
+    case XK_Control_R: return 17;
+    case XK_Alt_L:
+    case XK_Alt_R:     return 18;
+    default: break;
+    }
+    if (ks >= XK_a && ks <= XK_z) return (int)(ks - XK_a + 'A');
+    if ((ks >= XK_A && ks <= XK_Z) || (ks >= XK_0 && ks <= XK_9)) return (int)ks;
+    return (int)ks;
+}
 
 static Atom x11_atom(const char *name) { return XInternAtom(g_display, name, False); }
 
 /* Toggle/set an EWMH _NET_WM_STATE property via the window manager.
  * action: 0 = remove, 1 = add, 2 = toggle. state2 may be 0. */
-static void x11_wm_state(Atom state1, Atom state2, long action) {
-    if (!g_display || !g_x11_window) return;
+static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
+    if (!g_display || !win) return;
     XEvent xev;
     memset(&xev, 0, sizeof(xev));
     xev.type = ClientMessage;
-    xev.xclient.window = g_x11_window;
+    xev.xclient.window = win;
     xev.xclient.message_type = x11_atom("_NET_WM_STATE");
     xev.xclient.format = 32;
     xev.xclient.data.l[0] = action;
@@ -1214,6 +1853,80 @@ static void x11_wm_state(Atom state1, Atom state2, long action) {
     XSendEvent(g_display, DefaultRootWindow(g_display), False,
                SubstructureNotifyMask | SubstructureRedirectMask, &xev);
     XFlush(g_display);
+}
+
+/* _NET_WM_MOVERESIZE directions. */
+#define ZAN_NWMR_TOPLEFT     0
+#define ZAN_NWMR_TOP         1
+#define ZAN_NWMR_TOPRIGHT    2
+#define ZAN_NWMR_RIGHT       3
+#define ZAN_NWMR_BOTTOMRIGHT 4
+#define ZAN_NWMR_BOTTOM      5
+#define ZAN_NWMR_BOTTOMLEFT  6
+#define ZAN_NWMR_LEFT        7
+#define ZAN_NWMR_MOVE        8
+
+/* Remove window-manager decorations via the Motif hint so the app can draw its
+ * own title bar (matching the Win32 borderless window). */
+static void x11_set_borderless(Window win) {
+    if (!g_display || !win) return;
+    struct {
+        unsigned long flags, functions, decorations;
+        long input_mode;
+        unsigned long status;
+    } hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = (1L << 1); /* MWM_HINTS_DECORATIONS */
+    hints.decorations = 0;
+    Atom a = x11_atom("_MOTIF_WM_HINTS");
+    XChangeProperty(g_display, win, a, a, 32, PropModeReplace,
+                    (unsigned char *)&hints, 5);
+}
+
+/* Ask the window manager to start an interactive move/resize, so the app-drawn
+ * caption and resize borders behave like real ones. */
+static void x11_start_moveresize(Window win, int x_root, int y_root, int direction) {
+    if (!g_display || !win) return;
+    XUngrabPointer(g_display, CurrentTime);
+    XEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = ClientMessage;
+    xev.xclient.window = win;
+    xev.xclient.message_type = x11_atom("_NET_WM_MOVERESIZE");
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = x_root;
+    xev.xclient.data.l[1] = y_root;
+    xev.xclient.data.l[2] = direction;
+    xev.xclient.data.l[3] = 1; /* button 1 */
+    xev.xclient.data.l[4] = 1; /* source indication: application */
+    XSendEvent(g_display, DefaultRootWindow(g_display), False,
+               SubstructureNotifyMask | SubstructureRedirectMask, &xev);
+    XFlush(g_display);
+}
+
+/* Map a left press to a move/resize direction, mirroring the Win32
+ * WM_NCHITTEST logic: 8px resize borders plus a draggable caption that excludes
+ * the caption-button cluster. Returns -1 for an ordinary client click. */
+static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
+    int w = lw->w, h = lw->h;
+    int capW = g_caption_btn_count_l * g_btn_w_l;
+    int inCaptionDrag = (y < g_titlebar_h_l && x < w - capW);
+    if (zan_gui_is_maximized((i64)lw->xid)) {
+        return inCaptionDrag ? ZAN_NWMR_MOVE : -1;
+    }
+    int b = 8 * g_scale_linux / 100;
+    if (b < 4) b = 4;
+    int left = x < b, right = x >= w - b, top = y < b, bottom = y >= h - b;
+    if (top && left) return ZAN_NWMR_TOPLEFT;
+    if (top && right) return ZAN_NWMR_TOPRIGHT;
+    if (bottom && left) return ZAN_NWMR_BOTTOMLEFT;
+    if (bottom && right) return ZAN_NWMR_BOTTOMRIGHT;
+    if (left) return ZAN_NWMR_LEFT;
+    if (right) return ZAN_NWMR_RIGHT;
+    if (top) return ZAN_NWMR_TOP;
+    if (bottom) return ZAN_NWMR_BOTTOM;
+    if (inCaptionDrag) return ZAN_NWMR_MOVE;
+    return -1;
 }
 
 /* Serve a clipboard paste request from another client (we own CLIPBOARD). */
@@ -1246,76 +1959,209 @@ static void x11_serve_selection(XSelectionRequestEvent *req) {
     XFlush(g_display);
 }
 
-/* Translate a raw XEvent into the flat g_pending_event_linux slots. */
+/* Decode a raw XEvent into zero or more queued ABI events. */
 static void x11_translate_event(XEvent *ev) {
+    g_evwin_linux = ev->xany.window;
     switch (ev->type) {
     case MotionNotify:
-        g_pending_event_linux[0] = 1;
-        g_pending_event_linux[1] = ev->xmotion.x;
-        g_pending_event_linux[2] = ev->xmotion.y;
+        evq_push_linux(1, ev->xmotion.x, ev->xmotion.y, 0, 0,
+                       x11_mods(ev->xmotion.state));
         break;
     case ButtonPress:
-        g_pending_event_linux[0] = 2;
-        g_pending_event_linux[1] = ev->xbutton.x;
-        g_pending_event_linux[2] = ev->xbutton.y;
-        g_pending_event_linux[3] = ev->xbutton.button - 1;
+        /* Buttons 4/5 are the vertical wheel; report them as scroll (kind 13)
+         * with a Win32-style +/-120 delta. Buttons 6/7 (horizontal) have no
+         * ABI and are ignored. */
+        if (ev->xbutton.button == 4 || ev->xbutton.button == 5) {
+            int delta = ev->xbutton.button == 4 ? 120 : -120;
+            evq_push_linux(13, ev->xbutton.x, ev->xbutton.y, 0, delta,
+                           x11_mods(ev->xbutton.state));
+        } else if (ev->xbutton.button == 6 || ev->xbutton.button == 7) {
+            /* horizontal wheel: ignored */
+        } else if (ev->xbutton.button == 1) {
+            /* Honor the app-drawn caption and resize borders by delegating to
+             * the WM, mirroring Win32 WM_NCHITTEST. Presses over content or the
+             * caption buttons fall through as ordinary clicks. */
+            zan_lwin_t *bw = lwin_find(ev->xbutton.window);
+            int dir = bw ? x11_caption_hit(bw, ev->xbutton.x, ev->xbutton.y) : -1;
+            if (dir >= 0) {
+                x11_start_moveresize(ev->xbutton.window,
+                                     ev->xbutton.x_root, ev->xbutton.y_root, dir);
+            } else {
+                evq_push_linux(2, ev->xbutton.x, ev->xbutton.y, 0, 0,
+                               x11_mods(ev->xbutton.state));
+            }
+        } else {
+            evq_push_linux(2, ev->xbutton.x, ev->xbutton.y,
+                           (int)ev->xbutton.button - 1, 0,
+                           x11_mods(ev->xbutton.state));
+        }
         break;
     case ButtonRelease:
-        g_pending_event_linux[0] = 3;
-        g_pending_event_linux[1] = ev->xbutton.x;
-        g_pending_event_linux[2] = ev->xbutton.y;
-        g_pending_event_linux[3] = ev->xbutton.button - 1;
+        if (ev->xbutton.button >= 4 && ev->xbutton.button <= 7) break;
+        evq_push_linux(3, ev->xbutton.x, ev->xbutton.y,
+                       (int)ev->xbutton.button - 1, 0,
+                       x11_mods(ev->xbutton.state));
         break;
-    case KeyPress:
-        g_pending_event_linux[0] = 4;
-        g_pending_event_linux[4] = (int)XLookupKeysym(&ev->xkey, 0);
+    case KeyPress: {
+        int mods = x11_mods(ev->xkey.state);
+        KeySym ks = 0;
+        char buf[32];
+        int n;
+        zan_lwin_t *kw = lwin_find(ev->xkey.window);
+        XIC xic = (kw && kw->xic) ? kw->xic : g_xic;
+        if (xic) {
+            Status st = 0;
+            n = Xutf8LookupString(xic, &ev->xkey, buf, sizeof(buf) - 1, &ks, &st);
+        } else {
+            n = XLookupString(&ev->xkey, buf, sizeof(buf) - 1, &ks, NULL);
+        }
+        evq_push_linux(4, 0, 0, 0, x11_vk_from_keysym(ks), mods);
+        /* Emit a WM_CHAR-style text event for each decoded character. X already
+         * folds Ctrl combos to control codes (e.g. Ctrl+C -> 0x03) and delivers
+         * Backspace/Tab/Enter as 8/9/13, exactly like Win32 WM_CHAR; the widgets
+         * rely on those integer codes for both typing and shortcuts. */
+        if (n > 0) {
+            buf[n] = '\0';
+            const char *p = buf;
+            while (*p) {
+                unsigned cp = x11_utf8_next(&p);
+                if (cp != 0 && cp != 127)
+                    evq_push_linux(6, 0, 0, 0, (int)cp, mods);
+            }
+        }
         break;
-    case KeyRelease:
-        g_pending_event_linux[0] = 5;
-        g_pending_event_linux[4] = (int)XLookupKeysym(&ev->xkey, 0);
+    }
+    case KeyRelease: {
+        KeySym ks = XLookupKeysym(&ev->xkey, 0);
+        evq_push_linux(5, 0, 0, 0, x11_vk_from_keysym(ks),
+                       x11_mods(ev->xkey.state));
         break;
-    case ConfigureNotify:
-        g_pending_event_linux[0] = 7;
-        g_win_w = ev->xconfigure.width;
-        g_win_h = ev->xconfigure.height;
-        g_pending_event_linux[1] = g_win_w;
-        g_pending_event_linux[2] = g_win_h;
+    }
+    case ConfigureNotify: {
+        zan_lwin_t *cw = lwin_find(ev->xconfigure.window);
+        if (cw && (ev->xconfigure.width != cw->w ||
+                   ev->xconfigure.height != cw->h)) {
+            cw->w = ev->xconfigure.width;
+            cw->h = ev->xconfigure.height;
+            if (ev->xconfigure.window == g_primary_win) {
+                g_win_w = cw->w;
+                g_win_h = cw->h;
+            }
+            evq_push_linux(7, cw->w, cw->h, 0, 0, 0);
+        }
         break;
+    }
+    case Expose: {
+        /* Re-blit the last frame from the window's back buffer so uncover/move
+         * never leaves stale or blank content. */
+        zan_lwin_t *ew = lwin_find(ev->xexpose.window);
+        if (ew && ew->backbuf)
+            XCopyArea(g_display, ew->backbuf, ew->xid, ew->gc, 0, 0,
+                      (unsigned)ew->backbuf_w, (unsigned)ew->backbuf_h, 0, 0);
+        break;
+    }
     case ClientMessage:
-        g_pending_event_linux[0] = 8;
+        evq_push_linux(8, 0, 0, 0, 0, 0);
         break;
     }
 }
 
 EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
-    g_display = XOpenDisplay(NULL);
-    if (!g_display) return 0;
+    if (!g_display) {
+        g_display = XOpenDisplay(NULL);
+        if (!g_display) return 0;
+        /* Input method for UTF-8 text input (also enables IME preedit); opened
+         * once per display and shared by every window's input context. */
+        setlocale(LC_ALL, "");
+        XSetLocaleModifiers("");
+        g_xim = XOpenIM(g_display, NULL, NULL, NULL);
+        if (g_wake_pipe[0] < 0 && pipe(g_wake_pipe) == 0) {
+            fcntl(g_wake_pipe[0], F_SETFL, O_NONBLOCK);
+            fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
+            fcntl(g_wake_pipe[0], F_SETFD, FD_CLOEXEC);
+            fcntl(g_wake_pipe[1], F_SETFD, FD_CLOEXEC);
+        }
+    }
+    if (g_lwin_count >= ZAN_MAX_WINDOWS) return 0;
 
     int screen = DefaultScreen(g_display);
-    g_x11_window = XCreateSimpleWindow(g_display, RootWindow(g_display, screen),
+    Window xid = XCreateSimpleWindow(g_display, RootWindow(g_display, screen),
         0, 0, (unsigned)width, (unsigned)height, 0,
         BlackPixel(g_display, screen), WhitePixel(g_display, screen));
 
-    XStoreName(g_display, g_x11_window, title);
-    XSelectInput(g_display, g_x11_window,
+    XStoreName(g_display, xid, title);
+    XSelectInput(g_display, xid,
         ExposureMask | KeyPressMask | KeyReleaseMask |
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
         StructureNotifyMask);
 
     Atom wm_delete = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(g_display, g_x11_window, &wm_delete, 1);
+    XSetWMProtocols(g_display, xid, &wm_delete, 1);
 
-    g_gc = XCreateGC(g_display, g_x11_window, 0, NULL);
-    g_win_w = (int)width;
-    g_win_h = (int)height;
+    XIC xic = NULL;
+    if (g_xim) {
+        xic = XCreateIC(g_xim,
+            XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+            XNClientWindow, xid,
+            XNFocusWindow, xid,
+            NULL);
+        if (xic) XSetICFocus(xic);
+    }
+    GC gc = XCreateGC(g_display, xid, 0, NULL);
 
-    return (i64)g_x11_window;
+    zan_lwin_t *w = &g_lwins[g_lwin_count++];
+    w->xid = xid;
+    w->gc = gc;
+    w->xic = xic;
+    w->backbuf = 0;
+    w->backbuf_w = 0;
+    w->backbuf_h = 0;
+    w->w = (int)width;
+    w->h = (int)height;
+
+    if (!g_primary_win) {
+        /* First window drives process-wide operations (clipboard, cursor) and
+         * the client-side title-bar metrics computed once from its DPI. */
+        g_primary_win = xid;
+        g_x11_window = xid;
+        g_xic = xic;
+        g_win_w = (int)width;
+        g_win_h = (int)height;
+        g_scale_linux = (int)zan_gui_get_dpi_scale();
+        g_titlebar_h_l = 32 * g_scale_linux / 100;
+        g_btn_w_l = 46 * g_scale_linux / 100;
+    } else {
+        XWindowAttributes parent_attr;
+        Window child = 0;
+        int parent_x = 0;
+        int parent_y = 0;
+        Window root = RootWindow(g_display, screen);
+        if (XGetWindowAttributes(g_display, g_primary_win, &parent_attr) &&
+            XTranslateCoordinates(g_display, g_primary_win, root, 0, 0,
+                                  &parent_x, &parent_y, &child)) {
+            int x = parent_x + (parent_attr.width - (int)width) / 2;
+            int y = parent_y + (parent_attr.height - (int)height) / 2;
+            int screen_w = DisplayWidth(g_display, screen);
+            int screen_h = DisplayHeight(g_display, screen);
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x + (int)width > screen_w) x = screen_w - (int)width;
+            if (y + (int)height > screen_h) y = screen_h - (int)height;
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            XMoveWindow(g_display, xid, x, y);
+        }
+    }
+    /* Borderless window with app-drawn title bar (matches the Win32 backend). */
+    x11_set_borderless(xid);
+
+    return (i64)xid;
 }
 
 EXPORT i64 zan_gui_show_window(i64 win) {
-    (void)win;
-    if (g_display && g_x11_window) {
-        XMapWindow(g_display, g_x11_window);
+    Window xid = win ? (Window)(intptr_t)win : g_x11_window;
+    if (g_display && xid) {
+        XMapWindow(g_display, xid);
         XFlush(g_display);
     }
     return 0;
@@ -1323,27 +2169,63 @@ EXPORT i64 zan_gui_show_window(i64 win) {
 
 EXPORT i64 zan_gui_wait_event(void) {
     if (!g_display) return -1;
-    g_has_event_linux = 0;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
+    if (evq_pop_linux()) return 0;
 
+    int xfd = ConnectionNumber(g_display);
     XEvent ev;
     for (;;) {
-        XNextEvent(g_display, &ev);
-        if (ev.type == SelectionRequest) {
-            x11_serve_selection(&ev.xselectionrequest);
-            continue;
+        /* Drain any X events already buffered in the client before blocking. */
+        while (XPending(g_display) > 0) {
+            XNextEvent(g_display, &ev);
+            if (ev.type == SelectionRequest) {
+                x11_serve_selection(&ev.xselectionrequest);
+                continue;
+            }
+            if (XFilterEvent(&ev, None)) continue;
+            x11_translate_event(&ev);
+            if (evq_pop_linux()) return 0;
         }
-        break;
+        /* Block until the X connection or the wake pipe becomes readable. */
+        struct pollfd fds[2];
+        fds[0].fd = xfd; fds[0].events = POLLIN; fds[0].revents = 0;
+        int nfds = 1;
+        if (g_wake_pipe[0] >= 0) {
+            fds[1].fd = g_wake_pipe[0]; fds[1].events = POLLIN; fds[1].revents = 0;
+            nfds = 2;
+        }
+        int pr = poll(fds, (nfds_t)nfds, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (nfds == 2 && (fds[1].revents & POLLIN)) {
+            char buf[64];
+            while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) { }
+            /* Return a benign empty frame (kind 0) so the caller drains its
+             * dispatch queue. Any pending X events are handled next loop. */
+            return 0;
+        }
+        /* X connection readable: loop back to XPending/XNextEvent. */
     }
-    x11_translate_event(&ev);
-    g_has_event_linux = 1;
+}
+
+/* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
+ * write() is async-signal-safe and thread-safe, so this is callable from any
+ * thread even though Xlib is not. */
+EXPORT i64 zan_gui_wake(void) {
+    if (g_wake_pipe[1] >= 0) {
+        char b = 1;
+        ssize_t n = write(g_wake_pipe[1], &b, 1);
+        (void)n;
+    }
     return 0;
 }
 
 EXPORT i64 zan_gui_poll_event(void) {
     if (!g_display) return -1;
-    g_has_event_linux = 0;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
+    if (evq_pop_linux()) return 0;
     for (;;) {
         if (XPending(g_display) <= 0) return 1;
         XEvent ev;
@@ -1352,9 +2234,9 @@ EXPORT i64 zan_gui_poll_event(void) {
             x11_serve_selection(&ev.xselectionrequest);
             continue;
         }
+        if (XFilterEvent(&ev, None)) continue;
         x11_translate_event(&ev);
-        g_has_event_linux = 1;
-        return 0;
+        if (evq_pop_linux()) return 0;
     }
 }
 
@@ -1368,40 +2250,77 @@ EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event_linux[5]; }
 EXPORT i64 zan_gui_window_width(void)  { return g_win_w; }
 EXPORT i64 zan_gui_window_height(void) { return g_win_h; }
 
-EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(intptr_t)g_x11_window; }
-EXPORT i64 zan_gui_client_width(i64 hwnd_val)  { (void)hwnd_val; return g_win_w; }
-EXPORT i64 zan_gui_client_height(i64 hwnd_val) { (void)hwnd_val; return g_win_h; }
+EXPORT i64 zan_gui_event_hwnd(void)    { return (i64)(unsigned)g_pending_event_linux[6]; }
+EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+    zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
+    return w ? w->w : g_win_w;
+}
+EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+    zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
+    return w ? w->h : g_win_h;
+}
 
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     if (!g_display) return 1;
+    zan_lwin_t *w = lwin_find((Window)(intptr_t)hwnd_val);
+    if (!w && g_lwin_count > 0) w = &g_lwins[0];
+    if (!w) return 1;
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
     zan_surface_t *s = g_surfaces[surface_id];
 
-    XImage *img = XCreateImage(g_display, DefaultVisual(g_display, DefaultScreen(g_display)),
-        24, ZPixmap, 0, (char *)s->pixels, (unsigned)s->width, (unsigned)s->height, 32, 0);
+    int screen = DefaultScreen(g_display);
+    unsigned depth = (unsigned)DefaultDepth(g_display, screen);
+
+    /* Blit through the window's own off-screen Pixmap (double buffering) so
+     * resizes and expose events never show a half-drawn or torn frame. */
+    if (!w->backbuf || w->backbuf_w != s->width || w->backbuf_h != s->height) {
+        if (w->backbuf) XFreePixmap(g_display, w->backbuf);
+        w->backbuf = XCreatePixmap(g_display, w->xid,
+                                   (unsigned)s->width, (unsigned)s->height, depth);
+        w->backbuf_w = s->width;
+        w->backbuf_h = s->height;
+    }
+
+    XImage *img = XCreateImage(g_display, DefaultVisual(g_display, screen),
+        depth, ZPixmap, 0, (char *)s->pixels, (unsigned)s->width, (unsigned)s->height, 32, 0);
     if (img) {
         img->byte_order = LSBFirst;
-        XPutImage(g_display, g_x11_window, g_gc, img, 0, 0, 0, 0,
+        XPutImage(g_display, w->backbuf, w->gc, img, 0, 0, 0, 0,
                   (unsigned)s->width, (unsigned)s->height);
         img->data = NULL;
         XDestroyImage(img);
+        XCopyArea(g_display, w->backbuf, w->xid, w->gc, 0, 0,
+                  (unsigned)s->width, (unsigned)s->height, 0, 0);
     }
     XFlush(g_display);
     return 0;
 }
 
 EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
-    (void)hwnd_val;
-    if (g_display && g_x11_window) {
-        XStoreName(g_display, g_x11_window, title);
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (g_display && xid) {
+        XStoreName(g_display, xid, title);
         XFlush(g_display);
     }
     return 0;
 }
 
 EXPORT i64 zan_gui_set_cursor(i64 cursor_type) {
-    /* TODO: X11 cursor support */
-    (void)cursor_type;
+    if (!g_display || g_lwin_count == 0) return 1;
+    int slot = (int)cursor_type;
+    if (slot < 0 || slot >= 8) slot = 0;
+    if (!g_cursors_linux[slot]) {
+        unsigned int shape = XC_left_ptr;
+        if (slot == 1) shape = XC_hand2;
+        else if (slot == 2) shape = XC_xterm;
+        else if (slot == 3) shape = XC_sb_h_double_arrow;
+        else if (slot == 4) shape = XC_sb_v_double_arrow;
+        else if (slot == 5) shape = XC_crosshair;
+        g_cursors_linux[slot] = XCreateFontCursor(g_display, shape);
+    }
+    for (int i = 0; i < g_lwin_count; i++)
+        XDefineCursor(g_display, g_lwins[i].xid, g_cursors_linux[slot]);
+    XFlush(g_display);
     return 0;
 }
 
@@ -1421,11 +2340,9 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
 #endif /* __linux__ */
 
 /* ========================================================================
- * Software bitmap-font text rendering, shared by all non-Windows backends
- * (Windows draws text via its own path above). Depends only on the shared
- * software surface, so Linux (X11) and macOS (Cocoa) render text identically.
+ * Software bitmap-font fallback for non-Windows/non-Cocoa backends.
  * ======================================================================== */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(ZAN_GUI_COCOA)
 /* Fallback bitmap font for software text rendering */
 static const unsigned char zan_font_6x10[96][10] = {
     /* space (32) */ {0},
@@ -1529,7 +2446,39 @@ static const unsigned char zan_font_6x10[96][10] = {
     {0x00,0x00,0x08,0x15,0x02,0x00,0x00,0x00,0x00,0x00},
 };
 
-EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y, const char *text, i64 color, i64 font_size) {
+static u32 utf8_next(const char **text) {
+    const unsigned char *p = (const unsigned char *)*text;
+    if (!*p) return 0;
+    if (*p < 0x80) {
+        *text += 1;
+        return *p;
+    }
+    if ((*p & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+        u32 cp = ((u32)(p[0] & 0x1F) << 6) | (u32)(p[1] & 0x3F);
+        *text += 2;
+        return cp >= 0x80 ? cp : 0xFFFD;
+    }
+    if ((*p & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 &&
+        (p[2] & 0xC0) == 0x80) {
+        u32 cp = ((u32)(p[0] & 0x0F) << 12) |
+                 ((u32)(p[1] & 0x3F) << 6) | (u32)(p[2] & 0x3F);
+        *text += 3;
+        return cp >= 0x800 ? cp : 0xFFFD;
+    }
+    if ((*p & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
+        (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+        u32 cp = ((u32)(p[0] & 0x07) << 18) |
+                 ((u32)(p[1] & 0x3F) << 12) |
+                 ((u32)(p[2] & 0x3F) << 6) | (u32)(p[3] & 0x3F);
+        *text += 4;
+        return cp >= 0x10000 && cp <= 0x10FFFF ? cp : 0xFFFD;
+    }
+    *text += 1;
+    return 0xFFFD;
+}
+
+static void bitmap_draw_text(i64 surface_id, i64 x, i64 y,
+                             const char *text, i64 color, i64 font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !text) return;
@@ -1539,8 +2488,8 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y, const char *text, i6
     int cx = (int)x;
     int cy_base = (int)y;
     while (*text) {
-        unsigned char ch = (unsigned char)*text;
-        if (ch < 32 || ch > 127) { cx += 6 * scale; text++; continue; }
+        u32 cp = utf8_next(&text);
+        unsigned char ch = (cp >= 32 && cp <= 127) ? (unsigned char)cp : '?';
         int idx = ch - 32;
         for (int row = 0; row < 10; row++) {
             unsigned char bits = zan_font_6x10[idx][row];
@@ -1553,50 +2502,559 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y, const char *text, i6
             }
         }
         cx += 6 * scale;
-        text++;
     }
 }
 
-EXPORT i64 zan_gui_measure_text(const char *text, i64 font_size) {
+static i64 bitmap_measure_text(const char *text, i64 font_size) {
     if (!text) return 0;
     int scale = (int)font_size / 10;
     if (scale < 1) scale = 1;
     int len = 0;
-    while (*text) { len++; text++; }
+    while (*text) { utf8_next(&text); len++; }
     return (i64)(len * 6 * scale);
 }
 
-EXPORT i64 zan_gui_font_height(i64 font_size) {
+static i64 bitmap_font_height(i64 font_size) {
     int scale = (int)font_size / 10;
     if (scale < 1) scale = 1;
     return (i64)(10 * scale);
 }
 
-EXPORT void zan_gui_draw_icon(i64 s, i64 x, i64 y, i64 b, i64 c, i64 cp) { (void)s;(void)x;(void)y;(void)b;(void)c;(void)cp; }
-#endif /* !_WIN32 (shared software text) */
+#ifdef ZAN_GUI_FREETYPE
+static FT_Library g_ft_library;
+static FT_Face g_ft_face;
+static int g_ft_state;
+
+static int ft_prepare(int font_size) {
+    if (g_ft_state == 0) {
+        g_ft_state = -1;
+        if (!FcInit() || FT_Init_FreeType(&g_ft_library) != 0) return 0;
+        FcPattern *pattern = FcNameParse((const FcChar8 *)"sans");
+        if (!pattern) return 0;
+        FcConfigSubstitute(NULL, pattern, FcMatchPattern);
+        FcDefaultSubstitute(pattern);
+        FcResult result;
+        FcPattern *match = FcFontMatch(NULL, pattern, &result);
+        FcPatternDestroy(pattern);
+        if (!match) return 0;
+        FcChar8 *path = NULL;
+        int found = FcPatternGetString(match, FC_FILE, 0, &path) == FcResultMatch;
+        if (!found || FT_New_Face(g_ft_library, (const char *)path, 0,
+                                  &g_ft_face) != 0) {
+            FcPatternDestroy(match);
+            return 0;
+        }
+        FcPatternDestroy(match);
+        g_ft_state = 1;
+    }
+    if (g_ft_state != 1) return 0;
+    if (font_size < 8) font_size = 8;
+    return FT_Set_Pixel_Sizes(g_ft_face, 0, (FT_UInt)font_size) == 0;
+}
+
+#define ZAN_FT_FB_MAX 8
+static FT_Face g_ft_fb[ZAN_FT_FB_MAX];
+static int g_ft_fb_count = 0;
+
+/* Return a face that can render `cp` at `font_size`, discovering a fallback
+ * font via fontconfig when the primary "sans" face lacks the glyph (e.g. CJK).
+ * Discovered faces are cached; falls back to the primary face when no better
+ * match exists. */
+static FT_Face ft_face_for_cp(u32 cp, int font_size) {
+    if (FT_Get_Char_Index(g_ft_face, cp)) return g_ft_face;
+    for (int i = 0; i < g_ft_fb_count; i++) {
+        if (g_ft_fb[i] && FT_Get_Char_Index(g_ft_fb[i], cp)) {
+            FT_Set_Pixel_Sizes(g_ft_fb[i], 0, (FT_UInt)font_size);
+            return g_ft_fb[i];
+        }
+    }
+    if (g_ft_fb_count < ZAN_FT_FB_MAX) {
+        FcCharSet *charset = FcCharSetCreate();
+        FcCharSetAddChar(charset, cp);
+        FcPattern *pat = FcPatternCreate();
+        FcPatternAddCharSet(pat, FC_CHARSET, charset);
+        FcPatternAddBool(pat, FC_SCALABLE, FcTrue);
+        FcConfigSubstitute(NULL, pat, FcMatchPattern);
+        FcDefaultSubstitute(pat);
+        FcResult res;
+        FcPattern *match = FcFontMatch(NULL, pat, &res);
+        FcPatternDestroy(pat);
+        FcCharSetDestroy(charset);
+        if (match) {
+            FcChar8 *path = NULL;
+            FT_Face face = NULL;
+            if (FcPatternGetString(match, FC_FILE, 0, &path) == FcResultMatch &&
+                FT_New_Face(g_ft_library, (const char *)path, 0, &face) == 0) {
+                g_ft_fb[g_ft_fb_count++] = face;
+                FcPatternDestroy(match);
+                FT_Set_Pixel_Sizes(face, 0, (FT_UInt)font_size);
+                return face;
+            }
+            FcPatternDestroy(match);
+        }
+    }
+    return g_ft_face;
+}
+
+static void ft_draw_text(i64 surface_id, i64 x, i64 y,
+                         const char *text, i64 color, int font_size) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !text) return;
+    int pen_x = (int)x;
+    int baseline = (int)y +
+                   (int)(g_ft_face->size->metrics.ascender >> 6);
+    while (*text) {
+        u32 cp = utf8_next(&text);
+        FT_Face face = ft_face_for_cp(cp, font_size);
+        FT_UInt glyph = FT_Get_Char_Index(face, cp);
+        if (!glyph) glyph = FT_Get_Char_Index(face, '?');
+        if (glyph && FT_Load_Glyph(face, glyph, FT_LOAD_RENDER) == 0) {
+            FT_GlyphSlot slot = face->glyph;
+            FT_Bitmap *bitmap = &slot->bitmap;
+            int ox = pen_x + slot->bitmap_left;
+            int oy = baseline - slot->bitmap_top;
+            int pitch = bitmap->pitch;
+            for (int py = 0; py < (int)bitmap->rows; py++) {
+                const unsigned char *row =
+                    pitch >= 0
+                        ? bitmap->buffer + py * pitch
+                        : bitmap->buffer +
+                              ((int)bitmap->rows - 1 - py) * (-pitch);
+                for (int px = 0; px < (int)bitmap->width; px++) {
+                    int coverage = 0;
+                    if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY)
+                        coverage = row[px];
+                    else if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO)
+                        coverage = (row[px >> 3] & (0x80 >> (px & 7)))
+                                       ? 255
+                                       : 0;
+                    else if (bitmap->pixel_mode == FT_PIXEL_MODE_BGRA)
+                        coverage = row[px * 4 + 3];
+                    if (coverage)
+                        set_pixel_aa(s, ox + px, oy + py,
+                                     (u32)color, coverage);
+                }
+            }
+            pen_x += (int)(slot->advance.x >> 6);
+        }
+    }
+}
+
+static i64 ft_measure_text(const char *text, int font_size) {
+    int width = 0;
+    while (text && *text) {
+        u32 cp = utf8_next(&text);
+        FT_Face face = ft_face_for_cp(cp, font_size);
+        FT_UInt glyph = FT_Get_Char_Index(face, cp);
+        if (!glyph) glyph = FT_Get_Char_Index(face, '?');
+        if (glyph && FT_Load_Glyph(face, glyph, FT_LOAD_DEFAULT) == 0)
+            width += (int)(face->glyph->advance.x >> 6);
+    }
+    return width;
+}
+#endif
+
+EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
+                              const char *text, i64 color, i64 font_size) {
+#ifdef ZAN_GUI_FREETYPE
+    if (ft_prepare((int)font_size)) {
+        ft_draw_text(surface_id, x, y, text, color, (int)font_size);
+        return;
+    }
+#endif
+    bitmap_draw_text(surface_id, x, y, text, color, font_size);
+}
+
+EXPORT i64 zan_gui_measure_text(const char *text, i64 font_size) {
+#ifdef ZAN_GUI_FREETYPE
+    if (ft_prepare((int)font_size)) return ft_measure_text(text, (int)font_size);
+#endif
+    return bitmap_measure_text(text, font_size);
+}
+
+EXPORT i64 zan_gui_font_height(i64 font_size) {
+#ifdef ZAN_GUI_FREETYPE
+    if (ft_prepare((int)font_size))
+        return (i64)(g_ft_face->size->metrics.height >> 6);
+#endif
+    return bitmap_font_height(font_size);
+}
+
+#endif /* software bitmap text */
+
+#if !defined(_WIN32)
+static void icon_line(i64 s, int x0, int y0, int x1, int y1,
+                      u32 color, int thickness) {
+    zan_gui_draw_line(s, x0, y0, x1, y1, color, thickness);
+}
+
+static void icon_circle(i64 s, int cx, int cy, int radius,
+                        u32 color, int thickness) {
+    const double pi = 3.14159265358979323846;
+    int segments = radius > 12 ? 24 : 16;
+    int px = cx + radius, py = cy;
+    for (int i = 1; i <= segments; i++) {
+        double a = 2.0 * pi * (double)i / (double)segments;
+        int nx = cx + (int)(cos(a) * radius);
+        int ny = cy + (int)(sin(a) * radius);
+        icon_line(s, px, py, nx, ny, color, thickness);
+        px = nx;
+        py = ny;
+    }
+}
+
+static void icon_arrow(i64 s, int x0, int y0, int x1, int y1,
+                       u32 color, int thickness) {
+    icon_line(s, x0, y0, x1, y1, color, thickness);
+    int dx = x1 - x0, dy = y1 - y0;
+    int wing = (abs(dx) + abs(dy)) / 4;
+    if (wing < 3) wing = 3;
+    if (abs(dx) >= abs(dy)) {
+        int sign = dx >= 0 ? 1 : -1;
+        icon_line(s, x1, y1, x1 - sign * wing, y1 - wing,
+                  color, thickness);
+        icon_line(s, x1, y1, x1 - sign * wing, y1 + wing,
+                  color, thickness);
+    } else {
+        int sign = dy >= 0 ? 1 : -1;
+        icon_line(s, x1, y1, x1 - wing, y1 - sign * wing,
+                  color, thickness);
+        icon_line(s, x1, y1, x1 + wing, y1 - sign * wing,
+                  color, thickness);
+    }
+}
+
+static void icon_star(i64 s, int cx, int cy, int radius,
+                      u32 color, int thickness) {
+    const double pi = 3.14159265358979323846;
+    int px = 0, py = 0, first_x = 0, first_y = 0;
+    for (int i = 0; i < 10; i++) {
+        double a = -pi / 2.0 + (double)i * pi / 5.0;
+        int rr = (i & 1) ? radius * 2 / 5 : radius;
+        int nx = cx + (int)(cos(a) * rr);
+        int ny = cy + (int)(sin(a) * rr);
+        if (i == 0) {
+            first_x = nx;
+            first_y = ny;
+        } else {
+            icon_line(s, px, py, nx, ny, color, thickness);
+        }
+        px = nx;
+        py = ny;
+    }
+    icon_line(s, px, py, first_x, first_y, color, thickness);
+}
+
+EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
+                              i64 color, i64 codepoint) {
+    int size = (int)box;
+    if (size < 8) size = 8;
+    int pad = size / 6;
+    int x0 = (int)x + pad, y0 = (int)y + pad;
+    int x1 = (int)x + size - pad, y1 = (int)y + size - pad;
+    int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    int w = x1 - x0, h = y1 - y0;
+    int thick = size / 10;
+    if (thick < 1) thick = 1;
+    u32 c = (u32)color;
+
+    switch ((int)codepoint) {
+    case 0xE8BB: case 0xEA39:
+        icon_line(surface_id, x0, y0, x1, y1, c, thick);
+        icon_line(surface_id, x1, y0, x0, y1, c, thick);
+        break;
+    case 0xE921: case 0xE738:
+        icon_line(surface_id, x0, cy, x1, cy, c, thick);
+        break;
+    case 0xE922:
+        zan_gui_draw_rect(surface_id, x0, y0, w, h, c, thick);
+        break;
+    case 0xE923: case 0xE8C8:
+        zan_gui_draw_rect(surface_id, x0 + pad / 2, y0, w - pad / 2,
+                          h - pad / 2, c, thick);
+        zan_gui_draw_rect(surface_id, x0, y0 + pad / 2, w - pad / 2,
+                          h - pad / 2, c, thick);
+        break;
+    case 0xE73E: case 0xE930:
+        icon_line(surface_id, x0, cy, cx - pad / 3, y1, c, thick);
+        icon_line(surface_id, cx - pad / 3, y1, x1, y0, c, thick);
+        break;
+    case 0xE710:
+        icon_line(surface_id, x0, cy, x1, cy, c, thick);
+        icon_line(surface_id, cx, y0, cx, y1, c, thick);
+        break;
+    case 0xE76B:
+        icon_arrow(surface_id, x1, cy, x0, cy, c, thick);
+        break;
+    case 0xE76C:
+        icon_arrow(surface_id, x0, cy, x1, cy, c, thick);
+        break;
+    case 0xE70E: case 0xE898:
+        icon_arrow(surface_id, cx, y1, cx, y0, c, thick);
+        break;
+    case 0xE70D: case 0xE896:
+        icon_arrow(surface_id, cx, y0, cx, y1, c, thick);
+        break;
+    case 0xE721:
+        icon_circle(surface_id, cx - pad / 2, cy - pad / 2,
+                    w / 3, c, thick);
+        icon_line(surface_id, cx + pad / 2, cy + pad / 2,
+                  x1, y1, c, thick);
+        break;
+    case 0xE713:
+        icon_circle(surface_id, cx, cy, w / 4, c, thick);
+        for (int i = 0; i < 8; i++) {
+            double a = 3.14159265358979323846 * (double)i / 4.0;
+            int ax = cx + (int)(cos(a) * w / 3);
+            int ay = cy + (int)(sin(a) * h / 3);
+            int bx = cx + (int)(cos(a) * w / 2);
+            int by = cy + (int)(sin(a) * h / 2);
+            icon_line(surface_id, ax, ay, bx, by, c, thick);
+        }
+        break;
+    case 0xE77B:
+        zan_gui_fill_circle(surface_id, cx, y0 + h / 4, w / 6, c);
+        zan_gui_fill_sector(surface_id, cx, y1, 0, w / 2,
+                            270, 450, c);
+        break;
+    case 0xEA8F:
+        icon_circle(surface_id, cx, cy, w / 3, c, thick);
+        zan_gui_fill_rect(surface_id, x0, cy, w, h / 3, c);
+        zan_gui_fill_circle(surface_id, cx, y1, thick, c);
+        break;
+    case 0xE7C3:
+        zan_gui_draw_rect(surface_id, x0, y0, w, h, c, thick);
+        icon_line(surface_id, x1 - w / 3, y0,
+                  x1, y0 + h / 3, c, thick);
+        break;
+    case 0xE8B7:
+        zan_gui_draw_rect(surface_id, x0, y0 + h / 4, w,
+                          h * 3 / 4, c, thick);
+        icon_line(surface_id, x0, y0 + h / 4, cx, y0 + h / 4, c, thick);
+        icon_line(surface_id, x0, y0 + h / 4, x0 + w / 4, y0, c, thick);
+        icon_line(surface_id, x0 + w / 4, y0, cx, y0, c, thick);
+        break;
+    case 0xE80F:
+        icon_line(surface_id, x0, cy, cx, y0, c, thick);
+        icon_line(surface_id, cx, y0, x1, cy, c, thick);
+        icon_line(surface_id, x0 + pad / 2, cy - pad / 2,
+                  x0 + pad / 2, y1, c, thick);
+        icon_line(surface_id, x1 - pad / 2, cy - pad / 2,
+                  x1 - pad / 2, y1, c, thick);
+        icon_line(surface_id, x0 + pad / 2, y1,
+                  x1 - pad / 2, y1, c, thick);
+        break;
+    case 0xE74D:
+        zan_gui_draw_rect(surface_id, x0 + pad / 2, y0 + pad,
+                          w - pad, h - pad, c, thick);
+        icon_line(surface_id, x0, y0 + pad / 2, x1, y0 + pad / 2, c, thick);
+        icon_line(surface_id, cx - pad, y0, cx + pad, y0, c, thick);
+        break;
+    case 0xE70F:
+        icon_line(surface_id, x0, y1, x1, y0, c, thick + 1);
+        icon_line(surface_id, x0, y1, x0 + pad, y1, c, thick);
+        break;
+    case 0xE946:
+        icon_circle(surface_id, cx, cy, w / 2, c, thick);
+        zan_gui_fill_circle(surface_id, cx, y0 + h / 4, thick, c);
+        icon_line(surface_id, cx, cy - pad / 3, cx, y1 - pad / 3, c, thick);
+        break;
+    case 0xE7BA:
+        icon_line(surface_id, cx, y0, x0, y1, c, thick);
+        icon_line(surface_id, x0, y1, x1, y1, c, thick);
+        icon_line(surface_id, x1, y1, cx, y0, c, thick);
+        icon_line(surface_id, cx, cy - pad / 2, cx, cy + pad / 2, c, thick);
+        zan_gui_fill_circle(surface_id, cx, y1 - pad / 2, thick, c);
+        break;
+    case 0xE735: case 0xE734:
+        icon_star(surface_id, cx, cy, w / 2, c, thick);
+        break;
+    case 0xEB51:
+        icon_line(surface_id, x0, cy - pad, cx, y1, c, thick);
+        icon_line(surface_id, cx, y1, x1, cy - pad, c, thick);
+        icon_circle(surface_id, x0 + w / 4, cy - pad, w / 4, c, thick);
+        icon_circle(surface_id, x1 - w / 4, cy - pad, w / 4, c, thick);
+        break;
+    case 0xE8E1:
+        zan_gui_draw_rect(surface_id, x0 + w / 4, cy - pad,
+                          w * 3 / 4, h / 2 + pad, c, thick);
+        icon_line(surface_id, x0 + w / 4, cy, x0, cy, c, thick + 1);
+        icon_line(surface_id, x0, cy, x0, y1, c, thick + 1);
+        break;
+    case 0xE787:
+        zan_gui_draw_rect(surface_id, x0, y0 + pad / 2, w,
+                          h - pad / 2, c, thick);
+        icon_line(surface_id, x0, y0 + h / 3, x1, y0 + h / 3, c, thick);
+        icon_line(surface_id, x0 + pad, y0, x0 + pad, y0 + pad, c, thick);
+        icon_line(surface_id, x1 - pad, y0, x1 - pad, y0 + pad, c, thick);
+        break;
+    case 0xE823:
+        icon_circle(surface_id, cx, cy, w / 2, c, thick);
+        icon_line(surface_id, cx, cy, cx, y0 + pad, c, thick);
+        icon_line(surface_id, cx, cy, x1 - pad, cy, c, thick);
+        break;
+    case 0xEB9F:
+        zan_gui_draw_rect(surface_id, x0, y0, w, h, c, thick);
+        zan_gui_fill_circle(surface_id, x1 - pad, y0 + pad, thick + 1, c);
+        icon_line(surface_id, x0 + pad, y1 - pad,
+                  cx, cy, c, thick);
+        icon_line(surface_id, cx, cy, x1 - pad, y1 - pad, c, thick);
+        break;
+    case 0xE72C: case 0xE7A7: case 0xE7A6:
+        icon_circle(surface_id, cx, cy, w / 2, c, thick);
+        icon_arrow(surface_id, x1, cy, x1 - pad, y0, c, thick);
+        break;
+    case 0xE712:
+        zan_gui_fill_circle(surface_id, x0 + pad, cy, thick + 1, c);
+        zan_gui_fill_circle(surface_id, cx, cy, thick + 1, c);
+        zan_gui_fill_circle(surface_id, x1 - pad, cy, thick + 1, c);
+        break;
+    case 0xE700:
+        icon_line(surface_id, x0, y0 + pad, x1, y0 + pad, c, thick);
+        icon_line(surface_id, x0, cy, x1, cy, c, thick);
+        icon_line(surface_id, x0, y1 - pad, x1, y1 - pad, c, thick);
+        break;
+    case 0xE7B3:
+        icon_line(surface_id, x0, cy, cx, y0 + pad, c, thick);
+        icon_line(surface_id, cx, y0 + pad, x1, cy, c, thick);
+        icon_line(surface_id, x1, cy, cx, y1 - pad, c, thick);
+        icon_line(surface_id, cx, y1 - pad, x0, cy, c, thick);
+        zan_gui_fill_circle(surface_id, cx, cy, w / 8, c);
+        break;
+    case 0xE72E:
+        zan_gui_draw_rect(surface_id, x0, cy - pad / 2,
+                          w, h / 2 + pad / 2, c, thick);
+        icon_circle(surface_id, cx, cy - pad / 2, w / 4, c, thick);
+        break;
+    case 0xE715:
+        zan_gui_draw_rect(surface_id, x0, y0, w, h, c, thick);
+        icon_line(surface_id, x0, y0, cx, cy, c, thick);
+        icon_line(surface_id, cx, cy, x1, y0, c, thick);
+        break;
+    case 0xE706:
+        icon_circle(surface_id, cx, cy, w / 4, c, thick);
+        for (int i = 0; i < 8; i++) {
+            double a = 3.14159265358979323846 * (double)i / 4.0;
+            icon_line(surface_id,
+                      cx + (int)(cos(a) * w / 3),
+                      cy + (int)(sin(a) * h / 3),
+                      cx + (int)(cos(a) * w / 2),
+                      cy + (int)(sin(a) * h / 2), c, thick);
+        }
+        break;
+    case 0xE708:
+        icon_circle(surface_id, cx, cy, w / 2, c, thick);
+        icon_circle(surface_id, cx + pad, cy - pad, w / 2, c, thick);
+        break;
+    case 0xE718: case 0xE77A:
+        zan_gui_fill_circle(surface_id, cx, y0 + h / 3, w / 4, c);
+        icon_line(surface_id, cx, cy, cx, y1, c, thick);
+        break;
+    case 0xE71C:
+        icon_line(surface_id, x0, y0, x1, y0, c, thick);
+        icon_line(surface_id, x1, y0, cx + pad / 2, cy, c, thick);
+        icon_line(surface_id, cx + pad / 2, cy,
+                  cx + pad / 2, y1, c, thick);
+        break;
+    case 0xE8CB:
+        icon_arrow(surface_id, x0 + pad, y1, x0 + pad, y0, c, thick);
+        icon_arrow(surface_id, x1 - pad, y0, x1 - pad, y1, c, thick);
+        break;
+    case 0xE80A: case 0xF0E2: case 0xE8A1:
+        zan_gui_draw_rect(surface_id, x0, y0, w, h, c, thick);
+        icon_line(surface_id, cx, y0, cx, y1, c, thick);
+        icon_line(surface_id, x0, cy, x1, cy, c, thick);
+        break;
+    case 0xE768:
+        icon_line(surface_id, x0 + pad, y0, x0 + pad, y1, c, thick);
+        icon_line(surface_id, x0 + pad, y0, x1, cy, c, thick);
+        icon_line(surface_id, x1, cy, x0 + pad, y1, c, thick);
+        break;
+    case 0xE769:
+        zan_gui_fill_rect(surface_id, x0 + pad, y0, thick * 2, h, c);
+        zan_gui_fill_rect(surface_id, x1 - pad - thick * 2, y0,
+                          thick * 2, h, c);
+        break;
+    case 0xE71A:
+        zan_gui_fill_rect(surface_id, x0, y0, w, h, c);
+        break;
+    case 0xEBE8:
+        icon_circle(surface_id, cx, cy, w / 3, c, thick);
+        icon_line(surface_id, x0, y0, x0 + pad, cy, c, thick);
+        icon_line(surface_id, x1, y0, x1 - pad, cy, c, thick);
+        icon_line(surface_id, x0, y1, x0 + pad, cy, c, thick);
+        icon_line(surface_id, x1, y1, x1 - pad, cy, c, thick);
+        break;
+    case 0xE943:
+        icon_line(surface_id, cx - pad, y0, x0, cy, c, thick);
+        icon_line(surface_id, x0, cy, cx - pad, y1, c, thick);
+        icon_line(surface_id, cx + pad, y0, x1, cy, c, thick);
+        icon_line(surface_id, x1, cy, cx + pad, y1, c, thick);
+        break;
+    case 0xE74E:
+        zan_gui_draw_rect(surface_id, x0, y0, w, h, c, thick);
+        zan_gui_draw_rect(surface_id, x0 + pad, y0, w - 2 * pad,
+                          h / 3, c, thick);
+        zan_gui_draw_rect(surface_id, x0 + pad, cy, w - 2 * pad,
+                          h / 3, c, thick);
+        break;
+    case 0xE8C6:
+        icon_line(surface_id, x0, y0, x1, y1, c, thick);
+        icon_line(surface_id, x1, y0, x0, y1, c, thick);
+        icon_circle(surface_id, x0 + pad, y1 - pad, pad, c, thick);
+        icon_circle(surface_id, x1 - pad, y1 - pad, pad, c, thick);
+        break;
+    case 0xE77F:
+        zan_gui_draw_rect(surface_id, x0, y0 + pad, w, h - pad, c, thick);
+        zan_gui_draw_rect(surface_id, cx - pad, y0, pad * 2,
+                          pad * 2, c, thick);
+        break;
+    case 0xE8B3:
+        zan_gui_draw_rect(surface_id, x0, y0, w, h, c, thick);
+        zan_gui_draw_rect(surface_id, x0 + pad, y0 + pad,
+                          w - 2 * pad, h - 2 * pad, c, thick);
+        break;
+    case 0xE8D2:
+        icon_line(surface_id, x0, y1, cx, y0, c, thick);
+        icon_line(surface_id, cx, y0, x1, y1, c, thick);
+        icon_line(surface_id, x0 + pad, cy + pad,
+                  x1 - pad, cy + pad, c, thick);
+        break;
+    case 0xE790:
+        icon_circle(surface_id, cx, cy, w / 2, c, thick);
+        zan_gui_fill_circle(surface_id, cx - pad, cy - pad, thick + 1, c);
+        zan_gui_fill_circle(surface_id, cx + pad, cy - pad, thick + 1, c);
+        zan_gui_fill_circle(surface_id, cx, cy + pad, thick + 1, c);
+        break;
+    default:
+        break;
+    }
+}
+#endif
 
 #ifdef __linux__
 /* ---- window management (EWMH / Xlib) ---- */
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (g_display && g_x11_window) {
-        XIconifyWindow(g_display, g_x11_window, DefaultScreen(g_display));
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (g_display && xid) {
+        XIconifyWindow(g_display, xid, DefaultScreen(g_display));
         XFlush(g_display);
     }
     return 0;
 }
 
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
-    (void)hwnd_val;
-    x11_wm_state(x11_atom("_NET_WM_STATE_MAXIMIZED_VERT"),
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    x11_wm_state(xid, x11_atom("_NET_WM_STATE_MAXIMIZED_VERT"),
                  x11_atom("_NET_WM_STATE_MAXIMIZED_HORZ"), 2 /* toggle */);
     return 0;
 }
 
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (!g_display || !g_x11_window) return 0;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!g_display || !xid) return 0;
     Atom vert = x11_atom("_NET_WM_STATE_MAXIMIZED_VERT");
     Atom horz = x11_atom("_NET_WM_STATE_MAXIMIZED_HORZ");
     Atom actual_type;
@@ -1604,7 +3062,7 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     unsigned long nitems = 0, bytes_after = 0;
     unsigned char *prop = NULL;
     int found_v = 0, found_h = 0;
-    if (XGetWindowProperty(g_display, g_x11_window, x11_atom("_NET_WM_STATE"),
+    if (XGetWindowProperty(g_display, xid, x11_atom("_NET_WM_STATE"),
                            0, 64, False, XA_ATOM, &actual_type, &actual_format,
                            &nitems, &bytes_after, &prop) == Success && prop) {
         Atom *states = (Atom *)prop;
@@ -1618,18 +3076,58 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
 }
 
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
-    (void)hwnd_val;
-    x11_wm_state(x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    x11_wm_state(xid, x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
+    return 0;
+}
+
+/* ---- client-side title-bar metrics (borderless window) ---- */
+EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
+EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w_l; }
+EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+    if (count >= 0 && count <= 8) { g_caption_btn_count_l = (int)count; }
     return 0;
 }
 
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
-    (void)hwnd_val;
-    if (g_display && g_x11_window) {
-        XDestroyWindow(g_display, g_x11_window);
-        XFlush(g_display);
-        g_x11_window = 0;
+    if (!g_display) return 0;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    zan_lwin_t *w = lwin_find(xid);
+    if (w) {
+        if (w->backbuf) XFreePixmap(g_display, w->backbuf);
+        if (w->gc) XFreeGC(g_display, w->gc);
+        if (w->xic) XDestroyIC(w->xic);
+        XDestroyWindow(g_display, w->xid);
+        int idx = (int)(w - g_lwins);
+        g_lwins[idx] = g_lwins[--g_lwin_count];
     }
+    if (xid == g_primary_win) {
+        /* Promote another window to primary so process-wide ops keep working. */
+        g_primary_win = g_lwin_count ? g_lwins[0].xid : 0;
+        g_x11_window = g_primary_win;
+        if (g_lwin_count) {
+            g_xic = g_lwins[0].xic;
+            g_win_w = g_lwins[0].w;
+            g_win_h = g_lwins[0].h;
+        } else {
+            g_xic = NULL;
+        }
+    }
+    if (g_lwin_count == 0) {
+        /* Last window gone: tear down shared resources. */
+        for (int i = 0; i < 8; i++) {
+            if (g_cursors_linux[i]) {
+                XFreeCursor(g_display, g_cursors_linux[i]);
+                g_cursors_linux[i] = 0;
+            }
+        }
+        if (g_xim) { XCloseIM(g_xim); g_xim = NULL; }
+        free(g_clip_text_linux);
+        g_clip_text_linux = NULL;
+        free(g_clip_read_linux);
+        g_clip_read_linux = NULL;
+    }
+    XFlush(g_display);
     return 0;
 }
 
@@ -1655,12 +3153,92 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
     return 0;
 }
 
-/* Return the text we currently own on the CLIPBOARD selection. Fetching a
- * selection owned by another X client requires an async XConvertSelection /
- * SelectionNotify round-trip; that is not wired up here, so cross-application
- * paste on X11 falls back to the last text this process copied. */
+typedef struct {
+    Atom selection;
+    Window requestor;
+} x11_selection_match_t;
+
+static Bool x11_selection_notify(Display *display, XEvent *event, XPointer arg) {
+    (void)display;
+    x11_selection_match_t *match = (x11_selection_match_t *)arg;
+    return event->type == SelectionNotify &&
+           event->xselection.selection == match->selection &&
+           event->xselection.requestor == match->requestor;
+}
+
+static int x11_read_selection(Atom selection, Atom target, char **out) {
+    Atom property = x11_atom("ZAN_GUI_CLIPBOARD");
+    XDeleteProperty(g_display, g_x11_window, property);
+    XConvertSelection(g_display, selection, target, property,
+                      g_x11_window, CurrentTime);
+    XFlush(g_display);
+
+    i64 deadline = zan_gui_get_tick_ms() + 1000;
+    x11_selection_match_t match = { selection, g_x11_window };
+    for (;;) {
+        XEvent ev;
+        while (XCheckTypedEvent(g_display, SelectionRequest, &ev)) {
+            x11_serve_selection(&ev.xselectionrequest);
+        }
+        if (XCheckIfEvent(g_display, &ev, x11_selection_notify,
+                          (XPointer)&match)) {
+            if (ev.xselection.property == None) return 0;
+            Atom actual_type = None;
+            int actual_format = 0;
+            unsigned long nitems = 0, bytes_after = 0;
+            unsigned char *data = NULL;
+            int rc = XGetWindowProperty(
+                g_display, g_x11_window, property, 0, 4 * 1024 * 1024,
+                True, AnyPropertyType, &actual_type, &actual_format,
+                &nitems, &bytes_after, &data);
+            if (rc != Success || !data || actual_format != 8 ||
+                actual_type == x11_atom("INCR") || bytes_after != 0) {
+                if (data) XFree(data);
+                return 0;
+            }
+            char *copy = (char *)malloc((size_t)nitems + 1);
+            if (!copy) {
+                XFree(data);
+                return 0;
+            }
+            memcpy(copy, data, (size_t)nitems);
+            copy[nitems] = '\0';
+            XFree(data);
+            *out = copy;
+            return 1;
+        }
+
+        i64 remain = deadline - zan_gui_get_tick_ms();
+        if (remain <= 0) return 0;
+        struct pollfd pfd;
+        pfd.fd = ConnectionNumber(g_display);
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int wait_ms = remain > 1000 ? 1000 : (int)remain;
+        if (poll(&pfd, 1, wait_ms) < 0) return 0;
+    }
+}
+
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
+    /* X11 IME (XIM over-the-spot) not wired yet; accept + ignore. */
+    (void)x; (void)y;
+}
+
 EXPORT const char *zan_gui_get_clipboard(void) {
-    return g_clip_text_linux ? g_clip_text_linux : "";
+    if (!g_display || !g_x11_window) return "";
+    Atom clipboard = x11_atom("CLIPBOARD");
+    Window owner = XGetSelectionOwner(g_display, clipboard);
+    if (owner == g_x11_window)
+        return g_clip_text_linux ? g_clip_text_linux : "";
+    if (owner == None) return "";
+
+    char *text = NULL;
+    if (!x11_read_selection(clipboard, x11_atom("UTF8_STRING"), &text) &&
+        !x11_read_selection(clipboard, XA_STRING, &text))
+        return "";
+    free(g_clip_read_linux);
+    g_clip_read_linux = text;
+    return g_clip_read_linux;
 }
 #endif /* __linux__ */
 
@@ -1677,6 +3255,7 @@ EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_wait_event(void) { return -1; }
 EXPORT i64 zan_gui_poll_event(void) { return -1; }
+EXPORT i64 zan_gui_wake(void) { return 0; }
 EXPORT i64 zan_gui_event_kind(void) { return 0; }
 EXPORT i64 zan_gui_event_x(void) { return 0; }
 EXPORT i64 zan_gui_event_y(void) { return 0; }
@@ -1701,10 +3280,15 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
  * ========================================================================
  * Client-side-decoration metrics are a Win32 concept; on X11/macOS the window
  * manager owns the title bar, so these report 0. write_file is portable. */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__linux__)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
+#endif
+
+/* write_file is portable across every non-Win32 backend (X11, Cocoa and the
+ * no-op fallback all need it), so it lives outside the CSD-metrics guard. */
+#if !defined(_WIN32)
 EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     FILE *f = fopen(path, "wb");
     if (!f) return 1;
@@ -1726,4 +3310,5 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT const char *zan_gui_get_clipboard(void) { return ""; }
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
 #endif

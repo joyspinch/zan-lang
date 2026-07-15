@@ -4,14 +4,111 @@ using Gui;
 namespace Gui.Widget;
 
 /// Checkbox with check icon and reactive bool binding.
-class Checkbox {
-    static int Render(App app, int x, int y, string label, SignalBool model) {
-        int id = app.focus.AllocId();
+///
+/// Two ways to use it:
+///  * C#-style retained instance with a delegate event:
+///      Checkbox agree = Checkbox.Bind("I agree", model);
+///      agree.Change += () => { ... };   // fires on every toggle
+///      agree.Render(app, x, y);
+///  * legacy immediate-mode static (kept for existing callers):
+///      int id = Checkbox.Render(app, x, y, "I agree", model);
+///      Checkbox.HandleClick(app, id, model);
+class Checkbox : Control {
+    string label;
+    SignalBool model;
+    int wid;
+    /// Fires whenever the checked state toggles (C#-style: `cb.Change += h;`).
+    UiEvent Change;
+
+    void InitCheckbox(string lbl, SignalBool m) {
+        this.InitControl(lbl, 1);
+        label = lbl;
+        model = m;
+        wid = WidgetId.Next();
+        Change = UiEvent.Create();
+    }
+
+    /// Retained-mode constructor: `Checkbox agree = new Checkbox("I agree");`
+    Checkbox(string lbl) {
+        InitCheckbox(lbl, SignalBool.Create(false));
+    }
+
+    static Checkbox Bind(string label, SignalBool model) {
+        Checkbox cb = new Checkbox(label);
+        cb.model = model;
+        return cb;
+    }
+
+    static Checkbox Create(string label) {
+        return new Checkbox(label);
+    }
+
+    bool IsChecked() { return model.Get(); }
+    void SetChecked(bool v) { model.Set(v); }
+
+    /// Retained render: draws, dispatches its own click/keyboard toggle and
+    /// raises Change. Returns the widget id.
+    int Render(App app, int x, int y) {
+        int id = wid;
+        Checkbox.Paint(app, id, x, y, label, model.Get());
+        app.focus.RegisterFocusable(id);
+
+        bool fire = Ui.Clicked(app, id);
+        if (Ui.Focused(app, id) && app.window.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 32 || kc == 13) { fire = true; }
+        }
+        if (fire) {
+            model.Toggle();
+            Change.Raise();
+            app.RequestRedraw();
+        }
+        On.Fire(app, id);
+        return id;
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("Toggle");
+        return e;
+    }
+
+    override string Kind() { return "Checkbox"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("label", "Label"));
+        ps.Add(PropSpec.Bool("value", "Checked"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "value" || key == "checked") {
+            if (model.Get()) { return "true"; }
+            return "false";
+        }
+        if (key == "label" || key == "text") { return label; }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "value" || key == "checked") { model.Set(val == "true"); }
+        else if (key == "label" || key == "text") { label = val; }
+    }
+
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change" || evt == "Toggle") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    /// Draws the box + label and registers the hit region. Shared by the
+    /// retained and legacy paths so both look identical.
+    static int Paint(App app, int id, int x, int y, string label, bool isChecked) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
         bool hovered = app.focus.IsHovered(id);
-        bool isChecked = model.Get();
         int boxSize = app.Scale(18);
         int gap = app.Scale(8);
         int totalH = t.heightMedium;
@@ -53,6 +150,11 @@ class Checkbox {
         return id;
     }
 
+    static int Render(App app, int x, int y, string label, SignalBool model) {
+        int id = app.focus.AllocId();
+        return Checkbox.Paint(app, id, x, y, label, model.Get());
+    }
+
     static void HandleClick(App app, int id, SignalBool model) {
         if (app.window.EventKind() == 3) {
             if (app.hitTester.HitTest(app.mouseX, app.mouseY) == id) {
@@ -60,5 +162,17 @@ class Checkbox {
                 app.RequestRedraw();
             }
         }
+    }
+
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        prefH = t.heightMedium;
+        int boxSize = app.Scale(18);
+        int gp = app.Scale(8);
+        prefW = boxSize + gp + Canvas.MeasureText(label, t.fontSizeMedium);
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by);
     }
 }

@@ -13,6 +13,9 @@ class Socket {
     [DllImport("crt", EntryPoint = "zan_io_socket_recv")]
     static extern int ReactorRecv(int sock, string buf, int len, int flags);
 
+    [DllImport("crt", EntryPoint = "zan_io_socket_ready")]
+    static extern int ReactorReady(int sock, int writeReady);
+
     // ---- Platform-specific DllImport ----
     #if WINDOWS
     [DllImport("ws2_32", EntryPoint = "WSAStartup")]
@@ -52,9 +55,6 @@ class Socket {
     static extern int ioctlsocket(int s, int cmd, string argp);
 
     [DllImport("ws2_32")]
-    static extern int select(int nfds, string readfds, string writefds, string exceptfds, string timeout);
-
-    [DllImport("ws2_32")]
     static extern int sendto(int s, string buf, int len, int flags, string to, int tolen);
 
     [DllImport("ws2_32")]
@@ -75,61 +75,58 @@ class Socket {
     [DllImport("ws2_32")]
     static extern int gethostbyname(string name);
     #elif LINUX || MACOS
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int socket(int af, int type, int protocol);
 
-    [DllImport("libc", EntryPoint = "close")]
+    [DllImport("crt", EntryPoint = "close")]
     static extern int closesocket(int fd);
 
-    [DllImport("libc", EntryPoint = "send")]
+    [DllImport("crt", EntryPoint = "send")]
     static extern int winsend(int fd, string buf, int len, int flags);
 
-    [DllImport("libc", EntryPoint = "recv")]
+    [DllImport("crt", EntryPoint = "recv")]
     static extern int winrecv(int fd, string buf, int len, int flags);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int bind(int fd, string addr, int addrlen);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int listen(int fd, int backlog);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int accept(int fd, string addr, string addrlen);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int connect(int fd, string addr, int addrlen);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int setsockopt(int fd, int level, int optname, string optval, int optlen);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int ioctl(int fd, int request, string argp);
 
-    [DllImport("libc")]
-    static extern int select(int nfds, string readfds, string writefds, string exceptfds, string timeout);
-
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int sendto(int fd, string buf, int len, int flags, string to, int tolen);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int recvfrom(int fd, string buf, int len, int flags, string from, string fromlen);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int htons(int hostshort);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int htonl(int hostlong);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int ntohs(int netshort);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int inet_addr(string cp);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int gethostbyname(string name);
 
-    [DllImport("libc")]
+    [DllImport("crt")]
     static extern int fcntl(int fd, int cmd, int arg);
     #endif
 
@@ -203,6 +200,20 @@ class Socket {
         setsockopt(sock, 1, 2, optval, 4);
         #elif MACOS
         setsockopt(sock, 65535, 4, optval, 4);
+        #endif
+        free(optval);
+    }
+
+    /// <summary>Enables SO_BROADCAST on a socket (platform-correct constants).</summary>
+    static void SetBroadcast(int sock) {
+        string optval = calloc(4, 1);
+        optval[0] = 1;
+        #if WINDOWS
+        setsockopt(sock, 65535, 32, optval, 4);
+        #elif LINUX
+        setsockopt(sock, 1, 6, optval, 4);
+        #elif MACOS
+        setsockopt(sock, 65535, 32, optval, 4);
         #endif
         free(optval);
     }
@@ -445,71 +456,11 @@ class Socket {
 
     /// <summary>Checks if a socket is readable using select() with zero timeout.</summary>
     static bool IsReadable(int sock) {
-        #if WINDOWS
-        string readfds = calloc(520, 1);
-        readfds[0] = 1;
-        readfds[8] = sock & 255;
-        readfds[9] = (sock >> 8) & 255;
-        readfds[10] = (sock >> 16) & 255;
-        readfds[11] = (sock >> 24) & 255;
-        string emptyw = calloc(8, 1);
-        string emptye = calloc(8, 1);
-        string timeout = calloc(8, 1);
-        int result = select(0, readfds, emptyw, emptye, timeout);
-        free(readfds);
-        free(emptyw);
-        free(emptye);
-        free(timeout);
-        return result > 0;
-        #elif LINUX || MACOS
-        string readfds = calloc(128, 1);
-        int byteIdx = sock / 8;
-        int bitIdx = sock % 8;
-        readfds[byteIdx] = 1 << bitIdx;
-        string emptyw = calloc(128, 1);
-        string emptye = calloc(128, 1);
-        string timeout = calloc(16, 1);
-        int result = select(sock + 1, readfds, emptyw, emptye, timeout);
-        free(readfds);
-        free(emptyw);
-        free(emptye);
-        free(timeout);
-        return result > 0;
-        #endif
+        return ReactorReady(sock, 0) > 0;
     }
 
     /// <summary>Checks if a socket is writable using select() with zero timeout.</summary>
     static bool IsWritable(int sock) {
-        #if WINDOWS
-        string writefds = calloc(520, 1);
-        writefds[0] = 1;
-        writefds[8] = sock & 255;
-        writefds[9] = (sock >> 8) & 255;
-        writefds[10] = (sock >> 16) & 255;
-        writefds[11] = (sock >> 24) & 255;
-        string emptyr = calloc(8, 1);
-        string emptye = calloc(8, 1);
-        string timeout = calloc(8, 1);
-        int result = select(0, emptyr, writefds, emptye, timeout);
-        free(writefds);
-        free(emptyr);
-        free(emptye);
-        free(timeout);
-        return result > 0;
-        #elif LINUX || MACOS
-        string writefds = calloc(128, 1);
-        int byteIdx = sock / 8;
-        int bitIdx = sock % 8;
-        writefds[byteIdx] = 1 << bitIdx;
-        string emptyr = calloc(128, 1);
-        string emptye = calloc(128, 1);
-        string timeout = calloc(16, 1);
-        int result = select(sock + 1, emptyr, writefds, emptye, timeout);
-        free(writefds);
-        free(emptyr);
-        free(emptye);
-        free(timeout);
-        return result > 0;
-        #endif
+        return ReactorReady(sock, 1) > 0;
     }
 }

@@ -1,0 +1,397 @@
+using System;
+
+namespace System.Json;
+
+/// <summary>
+/// A parsed JSON value tree (object / array / string / number / bool / null).
+///
+/// Unlike the flat key-scanner in JsonParser, this is a real recursive model so
+/// nested documents (a UI layout tree, a state entity) can be walked. Build it
+/// with <see cref="Parse"/>; read scalars with As*/typed field helpers; walk
+/// objects with Get/Has and arrays with At/Count.
+///
+/// kind: 0 null, 1 bool, 2 number, 3 string, 4 array, 5 object.
+/// </summary>
+class JsonValue {
+    int kind;
+    bool boolVal;
+    string numRaw;
+    string strVal;
+    List<JsonValue> items;
+    List<string> keys;
+    List<JsonValue> vals;
+
+    static JsonValue NewNull() {
+        JsonValue v = new JsonValue();
+        v.kind = 0;
+        return v;
+    }
+
+    static JsonValue NewBool(bool b) {
+        JsonValue v = new JsonValue();
+        v.kind = 1;
+        v.boolVal = b;
+        return v;
+    }
+
+    static JsonValue NewNum(string raw) {
+        JsonValue v = new JsonValue();
+        v.kind = 2;
+        v.numRaw = raw;
+        return v;
+    }
+
+    static JsonValue NewStr(string s) {
+        JsonValue v = new JsonValue();
+        v.kind = 3;
+        v.strVal = s;
+        return v;
+    }
+
+    static JsonValue NewArray() {
+        JsonValue v = new JsonValue();
+        v.kind = 4;
+        v.items = new List<JsonValue>();
+        return v;
+    }
+
+    static JsonValue NewObject() {
+        JsonValue v = new JsonValue();
+        v.kind = 5;
+        v.keys = new List<string>();
+        v.vals = new List<JsonValue>();
+        return v;
+    }
+
+    bool IsNull() { return kind == 0; }
+    bool IsBool() { return kind == 1; }
+    bool IsNumber() { return kind == 2; }
+    bool IsString() { return kind == 3; }
+    bool IsArray() { return kind == 4; }
+    bool IsObject() { return kind == 5; }
+
+    // ---- object access ---------------------------------------------------
+
+    /// Appends a key/value pair (object). Does not de-duplicate.
+    void Put(string key, JsonValue v) {
+        keys.Add(key);
+        vals.Add(v);
+    }
+
+    bool Has(string key) {
+        if (kind != 5) { return false; }
+        int i = 0;
+        while (i < keys.Count) {
+            if (keys[i] == key) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// The value for `key`, or null when absent / not an object.
+    JsonValue Get(string key) {
+        if (kind != 5) { return null; }
+        int i = 0;
+        while (i < keys.Count) {
+            if (keys[i] == key) { return vals[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// Replaces the value for `key` if present, else appends it (object).
+    void Set(string key, JsonValue v) {
+        int i = 0;
+        while (i < keys.Count) {
+            if (keys[i] == key) { vals[i] = v; return; }
+            i = i + 1;
+        }
+        keys.Add(key);
+        vals.Add(v);
+    }
+
+    /// Resolves a dotted path ("user.name") from this object, or null if any
+    /// segment is missing / not an object. Used for two-way `bind` lookups.
+    JsonValue PathGet(string path) {
+        JsonValue cur = this;
+        int start = 0;
+        int i = 0;
+        while (i <= path.Length) {
+            bool end = i == path.Length;
+            bool dot = false;
+            if (!end) { dot = path.Substring(i, 1) == "."; }
+            if (end || dot) {
+                string seg = path.Substring(start, i - start);
+                if (cur == null) { return null; }
+                cur = cur.Get(seg);
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return cur;
+    }
+
+    /// Writes a scalar string down a dotted path, creating intermediate objects
+    /// and the leaf as needed, so a bound control can push edits back to state.
+    void PathSet(string path, string val) {
+        PathSetValue(path, JsonValue.NewStr(val));
+    }
+
+    /// Like PathSet but writes an arbitrary JsonValue leaf, so a bound control
+    /// can preserve the value's JSON type (bool / number / string) on
+    /// write-back instead of stringifying everything.
+    void PathSetValue(string path, JsonValue leaf) {
+        JsonValue cur = this;
+        int start = 0;
+        int i = 0;
+        while (i <= path.Length) {
+            bool end = i == path.Length;
+            bool dot = false;
+            if (!end) { dot = path.Substring(i, 1) == "."; }
+            if (end || dot) {
+                string seg = path.Substring(start, i - start);
+                if (end) {
+                    cur.Set(seg, leaf);
+                } else {
+                    JsonValue next = cur.Get(seg);
+                    if (next == null || !next.IsObject()) {
+                        next = JsonValue.NewObject();
+                        cur.Set(seg, next);
+                    }
+                    cur = next;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // ---- array access ----------------------------------------------------
+
+    void Append(JsonValue v) { items.Add(v); }
+
+    /// Element count (array elements or object entries; 0 otherwise).
+    int Count() {
+        if (kind == 4) { return items.Count; }
+        if (kind == 5) { return keys.Count; }
+        return 0;
+    }
+
+    JsonValue At(int i) { return items[i]; }
+
+    /// The i-th object key (for iterating an object).
+    string KeyAt(int i) { return keys[i]; }
+    JsonValue ValAt(int i) { return vals[i]; }
+
+    // ---- scalar readers with defaults ------------------------------------
+
+    static int Digit(string ch) {
+        if (ch == "0") { return 0; }
+        if (ch == "1") { return 1; }
+        if (ch == "2") { return 2; }
+        if (ch == "3") { return 3; }
+        if (ch == "4") { return 4; }
+        if (ch == "5") { return 5; }
+        if (ch == "6") { return 6; }
+        if (ch == "7") { return 7; }
+        if (ch == "8") { return 8; }
+        if (ch == "9") { return 9; }
+        return -1;
+    }
+
+    /// Parses the leading (optionally signed) integer part of a numeric token,
+    /// stopping at a '.'/'e'. Avoids Convert exceptions on "60.0"/"1e3".
+    static int IntOf(string t) {
+        int n = t.Length;
+        int i = 0;
+        bool neg = false;
+        if (n > 0 && t.Substring(0, 1) == "-") { neg = true; i = 1; }
+        int acc = 0;
+        while (i < n) {
+            int d = JsonValue.Digit(t.Substring(i, 1));
+            if (d < 0) { break; }
+            acc = acc * 10 + d;
+            i = i + 1;
+        }
+        if (neg) { return 0 - acc; }
+        return acc;
+    }
+
+    string AsString(string dflt) {
+        if (kind == 3) { return strVal; }
+        if (kind == 2) { return numRaw; }
+        if (kind == 1) { if (boolVal) { return "true"; } return "false"; }
+        return dflt;
+    }
+
+    int AsInt(int dflt) {
+        if (kind == 2) { return JsonValue.IntOf(numRaw); }
+        if (kind == 1) { if (boolVal) { return 1; } return 0; }
+        if (kind == 3) { return JsonValue.IntOf(strVal); }
+        return dflt;
+    }
+
+    bool AsBool(bool dflt) {
+        if (kind == 1) { return boolVal; }
+        if (kind == 2) { return JsonValue.IntOf(numRaw) != 0; }
+        if (kind == 3) { return strVal == "true"; }
+        return dflt;
+    }
+
+    // ---- typed field helpers (object + key) ------------------------------
+
+    string Str(string key, string dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsString(dflt);
+    }
+
+    int Int(string key, int dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsInt(dflt);
+    }
+
+    bool Bool(string key, bool dflt) {
+        JsonValue v = Get(key);
+        if (v == null) { return dflt; }
+        return v.AsBool(dflt);
+    }
+
+    // ---- parse -----------------------------------------------------------
+
+    /// Parses a JSON document into a value tree. On malformed input returns
+    /// whatever parsed so far (best-effort; UI docs are authored/tool-emitted).
+    static JsonValue Parse(string src) {
+        JsonReader r = JsonReader.Of(src);
+        return r.ReadValue();
+    }
+}
+
+/// A cursor over the source string driving JsonValue.Parse (Zan has no
+/// ref/out params, so the position lives on this object).
+class JsonReader {
+    string s;
+    int pos;
+    int len;
+
+    static JsonReader Of(string src) {
+        JsonReader r = new JsonReader();
+        r.s = src;
+        r.pos = 0;
+        r.len = src.Length;
+        return r;
+    }
+
+    string Cur() {
+        if (pos >= len) { return ""; }
+        return s.Substring(pos, 1);
+    }
+
+    void SkipWs() {
+        while (pos < len) {
+            string c = s.Substring(pos, 1);
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+                pos = pos + 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    JsonValue ReadValue() {
+        SkipWs();
+        string c = Cur();
+        if (c == "{") { return ReadObject(); }
+        if (c == "[") { return ReadArray(); }
+        if (c == "\"") { return JsonValue.NewStr(ReadString()); }
+        if (c == "t" || c == "f") { return ReadBool(); }
+        if (c == "n") { pos = pos + 4; return JsonValue.NewNull(); }
+        return ReadNumber();
+    }
+
+    JsonValue ReadObject() {
+        JsonValue obj = JsonValue.NewObject();
+        pos = pos + 1;                 // consume '{'
+        SkipWs();
+        if (Cur() == "}") { pos = pos + 1; return obj; }
+        while (pos < len) {
+            SkipWs();
+            string key = ReadString();
+            SkipWs();
+            if (Cur() == ":") { pos = pos + 1; }
+            JsonValue v = ReadValue();
+            obj.Put(key, v);
+            SkipWs();
+            string c = Cur();
+            if (c == ",") { pos = pos + 1; }
+            else if (c == "}") { pos = pos + 1; return obj; }
+            else { return obj; }
+        }
+        return obj;
+    }
+
+    JsonValue ReadArray() {
+        JsonValue arr = JsonValue.NewArray();
+        pos = pos + 1;                 // consume '['
+        SkipWs();
+        if (Cur() == "]") { pos = pos + 1; return arr; }
+        while (pos < len) {
+            JsonValue v = ReadValue();
+            arr.Append(v);
+            SkipWs();
+            string c = Cur();
+            if (c == ",") { pos = pos + 1; }
+            else if (c == "]") { pos = pos + 1; return arr; }
+            else { return arr; }
+        }
+        return arr;
+    }
+
+    /// Reads a quoted string starting at the opening quote; decodes the common
+    /// escapes. Leaves pos just past the closing quote.
+    string ReadString() {
+        string outp = "";
+        if (Cur() != "\"") { return outp; }
+        pos = pos + 1;                 // consume opening quote
+        while (pos < len) {
+            string c = s.Substring(pos, 1);
+            if (c == "\"") { pos = pos + 1; return outp; }
+            if (c == "\\" && pos + 1 < len) {
+                string n = s.Substring(pos + 1, 1);
+                if (n == "n") { outp = outp + "\n"; }
+                else if (n == "t") { outp = outp + "\t"; }
+                else if (n == "r") { outp = outp + "\r"; }
+                else if (n == "\"") { outp = outp + "\""; }
+                else if (n == "\\") { outp = outp + "\\"; }
+                else if (n == "/") { outp = outp + "/"; }
+                else { outp = outp + n; }
+                pos = pos + 2;
+            } else {
+                outp = outp + c;
+                pos = pos + 1;
+            }
+        }
+        return outp;
+    }
+
+    JsonValue ReadBool() {
+        if (Cur() == "t") { pos = pos + 4; return JsonValue.NewBool(true); }
+        pos = pos + 5;                 // "false"
+        return JsonValue.NewBool(false);
+    }
+
+    JsonValue ReadNumber() {
+        int start = pos;
+        while (pos < len) {
+            string c = s.Substring(pos, 1);
+            if (c == "-" || c == "+" || c == "." || c == "e" || c == "E"
+                || JsonValue.Digit(c) >= 0) {
+                pos = pos + 1;
+            } else {
+                return JsonValue.NewNum(s.Substring(start, pos - start));
+            }
+        }
+        return JsonValue.NewNum(s.Substring(start, pos - start));
+    }
+}

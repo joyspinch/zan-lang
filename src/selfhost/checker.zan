@@ -2,17 +2,248 @@ using System;
 using System.Collections;
 namespace Zan;
 
-// Checker: light semantic pass over the bound AST. Validates that every type
-// reference resolves to a primitive, a builtin generic, or a declared type,
-// and reports positioned diagnostics. Mirrors the resolution portion of
-// src/compiler/checker.c for the bootstrap subset. This is deliberately
-// conservative: it flags unknown types rather than performing full inference,
-// which the irgen phase handles on demand.
+// Checker: semantic pass over the bound AST. Beyond resolving every type
+// reference (primitive, builtin generic, type parameter or declared type) it
+// walks method/constructor bodies with a typed lexical scope and a light
+// expression typer so that it can reject the illegal programs that the
+// resolution-only pass used to wave through:
+//   * local variables, parameters and other bindings are tracked with types;
+//   * identifiers used in value positions must resolve to a local, parameter,
+//     field/method of the enclosing type, a known type or an enum member;
+//   * a member access / call on a value of a *known* user type must name a
+//     real field, method or property of that type (walking base classes);
+//   * a call must pass an argument count some overload accepts;
+//   * `return` must carry a value in a non-void method and must not in a void
+//     one; a static method may not use `this` or an instance field;
+//   * break/continue may only appear inside a loop or switch;
+//   * a parameter name may not be declared twice in one signature.
+//
+// The typer is deliberately conservative: when it cannot determine a type it
+// yields null and the dependent check is skipped, so standard-library calls
+// (Console, File, Math, ...) whose receiver types the bootstrap binder does
+// not track are never mis-flagged. Mirrors src/compiler/checker.c for the
+// bootstrap subset while being strictly more thorough.
 class Checker {
     public Binder binder;
     public Diags diags;
 
-    public Checker(Binder b, Diags d) { binder = b; diags = d; }
+    Node curClass;              // type declaration whose body is being checked
+    Node curRet;                // return type of the current method (null=void)
+    bool curVoid;               // is the current method void / a constructor
+    bool curStatic;             // is the current method static
+    int loopDepth;              // enclosing loop/switch nesting
+    List<string> scopeName;     // value names currently in scope
+    List<Node> scopeType;       // parallel declared/inferred types (may be null)
+
+    public Checker(Binder b, Diags d) {
+        binder = b; diags = d; curClass = null; curRet = null;
+        curVoid = true; curStatic = false; loopDepth = 0;
+        scopeName = new List<string>(); scopeType = new List<Node>();
+    }
+
+    Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
+    bool HasMod(Node m, int flag) { return (m.mods / flag) - ((m.mods / flag) / 2) * 2 == 1; }
+
+    // ---- lexical scope ----
+    int ScopeMark() { return scopeName.Count; }
+    void ScopeTrim(int to) {
+        List<string> nn = new List<string>();
+        List<Node> nt = new List<Node>();
+        int i = 0;
+        while (i < to) { nn.Add(scopeName[i]); nt.Add(scopeType[i]); i = i + 1; }
+        scopeName = nn; scopeType = nt;
+    }
+    void ScopeAdd(string name, Node ty) {
+        if (name != "") { scopeName.Add(name); scopeType.Add(ty); }
+    }
+    int ScopeIdx(string name) {
+        int i = scopeName.Count - 1;
+        while (i >= 0) { if (scopeName[i] == name) { return i; } i = i - 1; }
+        return -1;
+    }
+    bool ScopeHas(string name) { return ScopeIdx(name) >= 0; }
+
+    // ---- type-directed lookup, walking base classes ----
+    Node FieldUp(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node f = binder.FindField(c, name);
+            if (f != null) { return f; }
+            c = binder.FindType(c.sval2);
+        }
+        return null;
+    }
+    Node MethodUp(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node m = binder.FindMethod(c, name);
+            if (m != null) { return m; }
+            c = binder.FindType(c.sval2);
+        }
+        return null;
+    }
+    // A field, method or property accessor named `name`, up the base chain.
+    bool HasMember(Node cls, string name) {
+        if (FieldUp(cls, name) != null) { return true; }
+        if (MethodUp(cls, name) != null) { return true; }
+        if (MethodUp(cls, "get_" + name) != null) { return true; }
+        if (MethodUp(cls, "set_" + name) != null) { return true; }
+        return false;
+    }
+
+    // The user class/struct declaration a type refers to, or null.
+    Node ClassOf(Node t) {
+        if (t == null) { return null; }
+        Node d = binder.FindType(t.sval);
+        if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return d; }
+        return null;
+    }
+
+    bool IsEnumMember(string name) {
+        int i = 0;
+        while (i < binder.types.Count) {
+            Node t = binder.types[i];
+            if (t.kind == AK.EnumDecl()) {
+                int j = 0;
+                while (j < t.kids.Count) {
+                    Node m = t.kids[j];
+                    if (m.kind == AK.EnumMember() && m.sval == name) { return true; }
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool KnownValue(string name) {
+        if (name == "") { return true; }
+        if (name == "value") { return true; }
+        if (ScopeHas(name)) { return true; }
+        if (FieldUp(curClass, name) != null) { return true; }
+        if (MethodUp(curClass, name) != null) { return true; }
+        if (binder.IsPrimitive(name)) { return true; }
+        if (binder.IsBuiltinGeneric(name)) { return true; }
+        if (binder.IsTypeParam(name)) { return true; }
+        if (binder.FindType(name) != null) { return true; }
+        if (IsEnumMember(name)) { return true; }
+        return false;
+    }
+
+    // ---- overload arity ----
+    // True if some method named `name` (up the base chain) can accept `argc`
+    // positional arguments, or if any candidate is an extension method (whose
+    // receiver shifts the count) -- in which case we do not second-guess it.
+    bool AcceptsArgc(Node cls, string name, int argc) {
+        Node c = cls;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name) {
+                    if (m.ival == 1) { return true; }
+                    int tot = 0; int req = 0;
+                    int j = 0;
+                    while (j < m.kids.Count) {
+                        if (m.kids[j].kind == AK.Param()) {
+                            tot = tot + 1;
+                            if (m.kids[j].b == null) { req = req + 1; }
+                        }
+                        j = j + 1;
+                    }
+                    if (argc >= req && argc <= tot) { return true; }
+                }
+                i = i + 1;
+            }
+            c = binder.FindType(c.sval2);
+        }
+        return false;
+    }
+
+    // ---- expression typer (null == unknown) ----
+    Node InferType(Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return MkType("int"); }
+        if (k == AK.FloatLit()) { return MkType("double"); }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.NullLit()) { return null; }
+        if (k == AK.ThisExpr()) { if (curClass != null) { return MkType(curClass.sval); } return null; }
+        if (k == AK.Ident()) {
+            int si = ScopeIdx(e.sval);
+            if (si >= 0) { return scopeType[si]; }
+            Node f = FieldUp(curClass, e.sval);
+            if (f != null) { return f.type; }
+            return null;
+        }
+        if (k == AK.CastExpr()) { return e.type; }
+        if (k == AK.NewExpr()) { return e.type; }
+        if (k == AK.IsExpr()) { return MkType("bool"); }
+        if (k == AK.Unary()) {
+            if (e.op == TK.Bang()) { return MkType("bool"); }
+            return InferType(e.a);
+        }
+        if (k == AK.PostfixUnary()) { return InferType(e.a); }
+        if (k == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq() || op == TK.AmpAmp() || op == TK.PipePipe()) {
+                return MkType("bool");
+            }
+            Node lt = InferType(e.a);
+            Node rt = InferType(e.b);
+            if (IsStr(lt) || IsStr(rt)) { return MkType("string"); }
+            if (lt != null) { return lt; }
+            return rt;
+        }
+        if (k == AK.Index()) {
+            Node ot = InferType(e.a);
+            if (ot != null) {
+                if (ot.sval == "List" && ot.kids.Count > 0) { return ot.kids[0]; }
+                if (ot.sval == "string") { return MkType("char"); }
+                if (ot.ival == 1) { Node el = MkType(ot.sval); el.kids = ot.kids; return el; }
+            }
+            return null;
+        }
+        if (k == AK.MemberAccess()) {
+            Node ot = InferType(e.a);
+            Node cls = ClassOf(ot);
+            if (cls != null) {
+                Node f = FieldUp(cls, e.sval);
+                if (f != null) { return f.type; }
+                Node g = MethodUp(cls, "get_" + e.sval);
+                if (g != null) { return g.type; }
+            }
+            return null;
+        }
+        if (k == AK.Call()) {
+            Node callee = e.a;
+            if (callee != null && callee.kind == AK.Ident()) {
+                Node m = MethodUp(curClass, callee.sval);
+                if (m != null) { return m.type; }
+                return null;
+            }
+            if (callee != null && callee.kind == AK.MemberAccess()) {
+                Node ot = InferType(callee.a);
+                Node cls = ClassOf(ot);
+                if (cls != null) {
+                    Node m = MethodUp(cls, callee.sval);
+                    if (m != null) { return m.type; }
+                }
+                return null;
+            }
+            return null;
+        }
+        if (k == AK.SwitchExpr()) {
+            if (e.kids.Count > 0) { return InferType(e.kids[0].b); }
+            return null;
+        }
+        return null;
+    }
+
+    bool IsStr(Node t) { return t != null && t.sval == "string"; }
 
     // A type node resolves if its base name is known. Generic args are checked
     // recursively.
@@ -38,6 +269,7 @@ class Checker {
     }
 
     void CheckClass(Node cls) {
+        curClass = cls;
         if (cls.sval2 != "") {
             if (binder.FindType(cls.sval2) == null) {
                 diags.Error("unknown base type '" + cls.sval2 + "'", cls.line, cls.col);
@@ -47,19 +279,321 @@ class Checker {
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
             if (m.kind == AK.FieldDecl()) { CheckType(m.type); }
-            else if (m.kind == AK.MethodDecl()) { CheckMethod(m); }
-            else if (m.kind == AK.CtorDecl()) { CheckMethod(m); }
+            else if (m.kind == AK.MethodDecl()) { CheckMethod(m, false); }
+            else if (m.kind == AK.CtorDecl()) { CheckMethod(m, true); }
             i = i + 1;
         }
+        curClass = null;
     }
 
-    void CheckMethod(Node m) {
+    void CheckMethod(Node m, bool ctor) {
         if (m.type != null) { CheckType(m.type); }
+        scopeName = new List<string>(); scopeType = new List<Node>();
+        loopDepth = 0;
+        curRet = m.type;
+        curVoid = ctor || m.type == null || m.type.sval == "void";
+        curStatic = !ctor && HasMod(m, MOD.Static());
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
-            if (p.kind == AK.Param()) { CheckType(p.type); }
+            if (p.kind == AK.Param()) {
+                CheckType(p.type);
+                if (ScopeHas(p.sval)) {
+                    diags.Error("duplicate parameter '" + p.sval + "'", p.line, p.col);
+                }
+                ScopeAdd(p.sval, p.type);
+            }
             i = i + 1;
         }
+        CheckStmt(m.d);
+        if (!curVoid && m.d != null && !DefinitelyReturns(m.d)) {
+            diags.Error("not all code paths return a value in '" + m.sval + "'", m.line, m.col);
+        }
+    }
+
+    // ---- control-flow: does a statement definitely return/throw? ----
+    // Over-approximates "returns" (favours reporting nothing) so a real
+    // fall-through is caught without flagging exhaustive constructs.
+    bool IsTrueLit(Node e) { return e != null && e.kind == AK.BoolLit() && e.ival == 1; }
+
+    bool HasBreak(Node n) {
+        if (n == null) { return false; }
+        int k = n.kind;
+        if (k == AK.BreakStmt()) { return true; }
+        // nested loops / switch capture their own breaks
+        if (k == AK.WhileStmt() || k == AK.ForStmt() || k == AK.ForeachStmt() || k == AK.SwitchStmt()) { return false; }
+        if (HasBreak(n.a) || HasBreak(n.b) || HasBreak(n.c) || HasBreak(n.d)) { return true; }
+        int i = 0;
+        while (i < n.kids.Count) { if (HasBreak(n.kids[i])) { return true; } i = i + 1; }
+        return false;
+    }
+
+    bool DefinitelyReturns(Node n) {
+        if (n == null) { return false; }
+        int k = n.kind;
+        if (k == AK.ReturnStmt() || k == AK.ThrowStmt()) { return true; }
+        if (k == AK.Block()) {
+            if (n.kids.Count == 0) { return false; }
+            return DefinitelyReturns(n.kids[n.kids.Count - 1]);
+        }
+        if (k == AK.IfStmt()) {
+            return n.c != null && DefinitelyReturns(n.b) && DefinitelyReturns(n.c);
+        }
+        if (k == AK.WhileStmt()) { return IsTrueLit(n.a) && !HasBreak(n.b); }
+        if (k == AK.SwitchStmt()) {
+            bool hasDefault = false;
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node c = n.kids[i];
+                if (c.a == null) { hasDefault = true; }
+                if (!DefinitelyReturns(c.b)) { return false; }
+                i = i + 1;
+            }
+            return hasDefault;
+        }
+        if (k == AK.TryStmt()) {
+            if (DefinitelyReturns(n.c)) { return true; }
+            if (n.b == null) { return DefinitelyReturns(n.a); }
+            return DefinitelyReturns(n.a) && DefinitelyReturns(n.b.a);
+        }
+        return false;
+    }
+
+    // ---- statements ----
+    void CheckStmt(Node n) {
+        if (n == null) { return; }
+        int k = n.kind;
+        if (k == AK.Block()) {
+            int mark = ScopeMark();
+            int i = 0;
+            while (i < n.kids.Count) { CheckStmt(n.kids[i]); i = i + 1; }
+            ScopeTrim(mark);
+            return;
+        }
+        if (k == AK.VarDecl()) {
+            CheckType(n.type);
+            CheckExpr(n.b);
+            Node ty = n.type;
+            if (ty == null) { ty = InferType(n.b); }
+            ScopeAdd(n.sval, ty);
+            return;
+        }
+        if (k == AK.DeconDecl()) {
+            CheckExpr(n.b);
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node p = n.kids[i];
+                CheckType(p.type);
+                ScopeAdd(p.sval, p.type);
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.ExprStmt()) { CheckExpr(n.a); return; }
+        if (k == AK.ReturnStmt()) {
+            CheckExpr(n.a);
+            if (n.a != null && curVoid) {
+                diags.Error("cannot return a value from a void method", n.line, n.col);
+            }
+            if (n.a == null && !curVoid) {
+                diags.Error("must return a value", n.line, n.col);
+            }
+            return;
+        }
+        if (k == AK.ThrowStmt()) { CheckExpr(n.a); return; }
+        if (k == AK.IfStmt()) {
+            CheckExpr(n.a);
+            int m1 = ScopeMark(); CheckStmt(n.b); ScopeTrim(m1);
+            int m2 = ScopeMark(); CheckStmt(n.c); ScopeTrim(m2);
+            return;
+        }
+        if (k == AK.WhileStmt()) {
+            CheckExpr(n.a);
+            loopDepth = loopDepth + 1;
+            int m = ScopeMark(); CheckStmt(n.b); ScopeTrim(m);
+            loopDepth = loopDepth - 1;
+            return;
+        }
+        if (k == AK.ForStmt()) {
+            int mark = ScopeMark();
+            CheckStmt(n.a);
+            CheckExpr(n.b);
+            CheckExpr(n.c);
+            loopDepth = loopDepth + 1;
+            CheckStmt(n.d);
+            loopDepth = loopDepth - 1;
+            ScopeTrim(mark);
+            return;
+        }
+        if (k == AK.ForeachStmt()) {
+            int mark = ScopeMark();
+            CheckType(n.type);
+            CheckExpr(n.b);
+            Node et = n.type;
+            if (et == null) {
+                Node ct = InferType(n.b);
+                if (ct != null && ct.sval == "List" && ct.kids.Count > 0) { et = ct.kids[0]; }
+            }
+            ScopeAdd(n.sval, et);
+            loopDepth = loopDepth + 1;
+            CheckStmt(n.c);
+            loopDepth = loopDepth - 1;
+            ScopeTrim(mark);
+            return;
+        }
+        if (k == AK.BreakStmt() || k == AK.ContinueStmt()) {
+            if (loopDepth == 0) {
+                diags.Error("break/continue outside of loop or switch", n.line, n.col);
+            }
+            return;
+        }
+        if (k == AK.SwitchStmt()) {
+            CheckExpr(n.a);
+            loopDepth = loopDepth + 1;
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node c = n.kids[i];
+                CheckExpr(c.a);
+                int m = ScopeMark(); CheckStmt(c.b); ScopeTrim(m);
+                i = i + 1;
+            }
+            loopDepth = loopDepth - 1;
+            return;
+        }
+        if (k == AK.TryStmt()) {
+            int m1 = ScopeMark(); CheckStmt(n.a); ScopeTrim(m1);
+            if (n.b != null) {
+                Node cc = n.b;
+                CheckType(cc.type);
+                int m2 = ScopeMark();
+                ScopeAdd(cc.sval, cc.type);
+                CheckStmt(cc.a);
+                ScopeTrim(m2);
+            }
+            int m3 = ScopeMark(); CheckStmt(n.c); ScopeTrim(m3);
+            return;
+        }
+    }
+
+    // ---- expressions ----
+    // The object of a member access / callee of a call is not flagged as an
+    // undefined identifier: it may name a stdlib type or namespace.
+    void CheckObj(Node n) {
+        if (n == null) { return; }
+        if (n.kind == AK.Ident()) { return; }
+        CheckExpr(n);
+    }
+
+    void CheckExpr(Node n) {
+        if (n == null) { return; }
+        int k = n.kind;
+        if (k == AK.Ident()) {
+            if (!KnownValue(n.sval)) {
+                diags.Error("undefined identifier '" + n.sval + "'", n.line, n.col);
+            } else if (curStatic && !ScopeHas(n.sval)) {
+                Node f = FieldUp(curClass, n.sval);
+                if (f != null && !HasMod(f, MOD.Static())) {
+                    diags.Error("cannot access instance field '" + n.sval + "' from a static method", n.line, n.col);
+                }
+            }
+            return;
+        }
+        if (k == AK.ThisExpr()) {
+            if (curStatic) { diags.Error("'this' cannot be used in a static method", n.line, n.col); }
+            return;
+        }
+        if (k == AK.MemberAccess()) { CheckMember(n); return; }
+        if (k == AK.Call()) { CheckCall(n); return; }
+        if (k == AK.Binary() || k == AK.Assignment()) { CheckExpr(n.a); CheckExpr(n.b); return; }
+        if (k == AK.Unary() || k == AK.PostfixUnary()) { CheckExpr(n.a); return; }
+        if (k == AK.Index()) { CheckExpr(n.a); CheckExpr(n.b); return; }
+        if (k == AK.NewExpr()) {
+            CheckType(n.type);
+            CheckExpr(n.b);
+            int i = 0;
+            while (i < n.kids.Count) { CheckExpr(n.kids[i]); i = i + 1; }
+            return;
+        }
+        if (k == AK.CastExpr()) { CheckType(n.type); CheckExpr(n.b); return; }
+        if (k == AK.IsExpr()) {
+            CheckExpr(n.a);
+            CheckType(n.type);
+            ScopeAdd(n.sval, n.type);
+            return;
+        }
+        if (k == AK.Conditional()) { CheckExpr(n.a); CheckExpr(n.b); CheckExpr(n.c); return; }
+        if (k == AK.Lambda()) {
+            int mark = ScopeMark();
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node p = n.kids[i];
+                if (p.kind == AK.Param()) { ScopeAdd(p.sval, p.type); }
+                i = i + 1;
+            }
+            CheckExpr(n.a);
+            CheckStmt(n.d);
+            ScopeTrim(mark);
+            return;
+        }
+        if (k == AK.SwitchExpr()) {
+            CheckExpr(n.a);
+            int i = 0;
+            while (i < n.kids.Count) {
+                Node arm = n.kids[i];
+                CheckExpr(arm.a);
+                CheckExpr(arm.c);
+                CheckExpr(arm.b);
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.TupleExpr()) {
+            int i = 0;
+            while (i < n.kids.Count) { CheckExpr(n.kids[i]); i = i + 1; }
+            return;
+        }
+    }
+
+    void CheckMember(Node n) {
+        CheckObj(n.a);
+        Node ot = InferType(n.a);
+        Node cls = ClassOf(ot);
+        if (cls != null && !HasMember(cls, n.sval)) {
+            diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
+        }
+    }
+
+    void CheckCall(Node n) {
+        Node callee = n.a;
+        bool hasNamed = false;
+        int i = 0;
+        while (i < n.kids.Count) {
+            if (n.kids[i].sval2 != "") { hasNamed = true; }
+            CheckExpr(n.kids[i]);
+            i = i + 1;
+        }
+        int argc = n.kids.Count;
+        if (callee != null && callee.kind == AK.Ident()) {
+            // bare call: resolve against the enclosing type's methods
+            Node cands = MethodUp(curClass, callee.sval);
+            if (cands != null && !hasNamed && !AcceptsArgc(curClass, callee.sval, argc)) {
+                diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
+            }
+            return;
+        }
+        if (callee != null && callee.kind == AK.MemberAccess()) {
+            CheckObj(callee.a);
+            Node ot = InferType(callee.a);
+            Node cls = ClassOf(ot);
+            if (cls != null) {
+                if (!HasMember(cls, callee.sval)) {
+                    diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);
+                } else if (MethodUp(cls, callee.sval) != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
+                    diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
+                }
+            }
+            return;
+        }
+        CheckObj(callee);
     }
 }

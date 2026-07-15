@@ -1,19 +1,396 @@
 using System;
+using System.Threading;
 
 namespace Gui;
+
+/// <summary>
+/// A parameterless GUI event handler, like a C# <c>Action</c> / <c>EventHandler</c>.
+/// Assign a lambda (<c>() =&gt; { ... }</c>) or a static method group.
+/// </summary>
+delegate void Action();
+
+/// <summary>
+/// Thin wrapper over the runtime UI-thread dispatch queue. Background threads
+/// call <see cref="Post"/> to hand a delegate back to the UI thread; the UI
+/// thread drains it once per frame (see <c>App.Post</c> / <c>App.DrainPosts</c>).
+/// The queue itself is guarded by an OS mutex inside the runtime, so posting is
+/// safe from any thread and never touches the Zan heap off-thread.
+/// </summary>
+class Dispatcher {
+    [DllImport("crt", EntryPoint = "zan_dispatch_init")]
+    static extern void PlatInit();
+
+    [DllImport("crt", EntryPoint = "zan_dispatch_post")]
+    static extern int PlatPost(Action handler);
+
+    [DllImport("crt", EntryPoint = "zan_dispatch_take")]
+    static extern Action PlatTake();
+
+    /// <summary>Resets the queue. Call once on the UI thread before spawning workers.</summary>
+    static void Init() { Dispatcher.PlatInit(); }
+
+    /// <summary>Enqueues a delegate to run on the UI thread. Thread-safe.</summary>
+    static bool Post(Action handler) { return Dispatcher.PlatPost(handler) != 0; }
+
+    /// <summary>Pops the next queued delegate (UI thread) or null when empty.</summary>
+    static Action Take() { return Dispatcher.PlatTake(); }
+}
+
+/// <summary>
+/// A retained, multicast event registry that layers C#-style delegate events
+/// over the immediate-mode widgets. Register handlers once (before the frame
+/// loop) against a stable integer key, then bridge the immediate-mode click
+/// each frame with <see cref="RaiseIf"/>:
+/// <code>
+/// EventHub hub = EventHub.Create();
+/// hub.On(BTN_SAVE, () =&gt; { ... });   // like  OnClick += handler
+/// // per frame:
+/// int id = Button.Render(app, x, y, "Save");
+/// hub.RaiseIf(BTN_SAVE, Ui.Clicked(app, id));
+/// </code>
+/// Multiple <see cref="On"/> calls for the same key are all invoked (multicast);
+/// <see cref="Off"/> clears them (like <c>OnClick -= handler</c> for the whole key).
+/// </summary>
+class EventHub {
+    List<int> keys;
+    List<Action> handlers;
+
+    static EventHub Create() {
+        EventHub h = new EventHub();
+        h.keys = new List<int>();
+        h.handlers = new List<Action>();
+        return h;
+    }
+
+    /// <summary>Appends a handler for an event key (like <c>event += handler</c>).</summary>
+    void On(int key, Action handler) {
+        keys.Add(key);
+        handlers.Add(handler);
+    }
+
+    /// <summary>Removes every handler registered for a key (like clearing an event).</summary>
+    void Off(int key) {
+        int i = keys.Count - 1;
+        while (i >= 0) {
+            if (keys[i] == key) {
+                keys.RemoveAt(i);
+                handlers.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+    }
+
+    /// <summary>How many handlers are registered for a key.</summary>
+    int Count(int key) {
+        int n = 0;
+        int i = 0;
+        while (i < keys.Count) {
+            if (keys[i] == key) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// <summary>Invokes every handler registered for a key (multicast).</summary>
+    void Raise(int key) {
+        int i = 0;
+        while (i < keys.Count) {
+            if (keys[i] == key) {
+                Action h = handlers[i];
+                h();
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Invokes handlers for a key only when <paramref name="fire"/> is true
+    /// (e.g. pass <c>Ui.Clicked(app, id)</c> to fire on click).</summary>
+    void RaiseIf(int key, bool fire) {
+        if (fire) { Raise(key); }
+    }
+}
+
+/// <summary>
+/// A C#-style multicast event. Unlike <see cref="EventHub"/> (keyed, polled),
+/// a UiEvent is a first-class field on a widget that supports the delegate
+/// <c>+=</c> / <c>-=</c> operators, so registering a handler reads exactly like
+/// C#:
+/// <code>
+/// Button save = Button.Create("Save");   // retained
+/// save.Click += () =&gt; { Console.WriteLine("saved"); };
+/// save.Click += Store.Commit;            // method group
+/// // per frame:
+/// save.Render(app, x, y, 120);           // fires Click on click
+/// </code>
+/// Built-in widget events are raised from inside <c>Render</c>, i.e. on the UI
+/// thread, so handlers are always safe to touch the UI. To raise from a worker
+/// thread, use <see cref="Post"/>, which marshals every handler back onto the
+/// UI-thread dispatch queue.
+/// </summary>
+class UiEvent {
+    List<Action> handlers;
+
+    static UiEvent Create() {
+        UiEvent e = new UiEvent();
+        e.handlers = new List<Action>();
+        return e;
+    }
+
+    /// Operator backing <c>event += handler</c> (append, multicast).
+    static UiEvent op_add(UiEvent self, Action handler) {
+        self.handlers.Add(handler);
+        return self;
+    }
+
+    /// Operator backing <c>event -= handler</c> (removes the most recent
+    /// identical registration; a no-op if it was never added).
+    static UiEvent op_sub(UiEvent self, Action handler) {
+        int i = self.handlers.Count - 1;
+        while (i >= 0) {
+            if (self.handlers[i] == handler) {
+                self.handlers.RemoveAt(i);
+                return self;
+            }
+            i = i - 1;
+        }
+        return self;
+    }
+
+    /// Register a handler (same as <c>+=</c>).
+    void Add(Action handler) { handlers.Add(handler); }
+
+    /// Drop every handler.
+    void Clear() { handlers = new List<Action>(); }
+
+    /// Number of registered handlers.
+    int Count() { return handlers.Count; }
+
+    /// Invoke every handler on the current thread.
+    void Raise() {
+        int i = 0;
+        while (i < handlers.Count) {
+            Action h = handlers[i];
+            h();
+            i = i + 1;
+        }
+    }
+
+    /// Invoke handlers only when <paramref name="fire"/> is true.
+    void RaiseIf(bool fire) {
+        if (fire) { this.Raise(); }
+    }
+
+    /// Marshal every handler onto the UI-thread dispatch queue. Safe to call
+    /// from any thread; handlers run later on the UI thread (see App.DrainPosts).
+    void Post() {
+        int i = 0;
+        while (i < handlers.Count) {
+            Action h = handlers[i];
+            Dispatcher.Post(h);
+            i = i + 1;
+        }
+    }
+}
+
+/// <summary>
+/// A reusable bundle of the common per-widget events. A retained widget embeds
+/// one <c>WidgetEvents</c> field and calls <see cref="Fire"/> once per frame
+/// (after it has rendered / registered its hit region) instead of re-deriving
+/// every transition by hand, so application code reads declaratively:
+/// <code>
+/// btn.On.Enter += () =&gt; { ... };
+/// btn.On.Click += () =&gt; { ... };
+/// </code>
+/// Touch-safe: on a touchscreen a single touch arrives as a synthesized mouse
+/// sequence, so <c>Click</c> == tap and <c>MouseDown</c>/<c>MouseUp</c> bracket
+/// the touch; there is no real hover, so <c>Enter</c>/<c>Leave</c> only bracket
+/// the press and never fire spuriously.
+/// </summary>
+class WidgetEvents {
+    // Pointer.
+    UiEvent Click;
+    UiEvent DoubleClick;
+    UiEvent RightClick;
+    UiEvent MouseDown;
+    UiEvent MouseUp;
+    UiEvent Enter;
+    UiEvent Leave;
+    UiEvent Move;
+    UiEvent Wheel;
+    // Focus + keyboard.
+    UiEvent Focus;
+    UiEvent Blur;
+    UiEvent KeyDown;
+    UiEvent KeyUp;
+    UiEvent KeyPress;
+    // Touch / gesture.
+    UiEvent Tap;
+    UiEvent LongPress;
+    UiEvent Swipe;
+    // Drag + drop (single-pointer synthesized).
+    UiEvent DragStart;
+    UiEvent Drag;
+    UiEvent Drop;
+
+    static WidgetEvents Create() {
+        WidgetEvents e = new WidgetEvents();
+        e.Click = UiEvent.Create();
+        e.DoubleClick = UiEvent.Create();
+        e.RightClick = UiEvent.Create();
+        e.MouseDown = UiEvent.Create();
+        e.MouseUp = UiEvent.Create();
+        e.Enter = UiEvent.Create();
+        e.Leave = UiEvent.Create();
+        e.Move = UiEvent.Create();
+        e.Wheel = UiEvent.Create();
+        e.Focus = UiEvent.Create();
+        e.Blur = UiEvent.Create();
+        e.KeyDown = UiEvent.Create();
+        e.KeyUp = UiEvent.Create();
+        e.KeyPress = UiEvent.Create();
+        e.Tap = UiEvent.Create();
+        e.LongPress = UiEvent.Create();
+        e.Swipe = UiEvent.Create();
+        e.DragStart = UiEvent.Create();
+        e.Drag = UiEvent.Create();
+        e.Drop = UiEvent.Create();
+        return e;
+    }
+
+    /// Subscribes `a` to the common event named `evt` (as returned by
+    /// Control.CommonEvents / used by the designer's `on<Event>` JSON keys).
+    /// Unknown names are ignored so a document referencing a widget-specific
+    /// event (wired elsewhere) does not fault here. Returns true when matched.
+    bool AddByName(string evt, Action a) {
+        if (evt == "Click") { Click.Add(a); return true; }
+        if (evt == "DoubleClick") { DoubleClick.Add(a); return true; }
+        if (evt == "RightClick") { RightClick.Add(a); return true; }
+        if (evt == "MouseDown") { MouseDown.Add(a); return true; }
+        if (evt == "MouseUp") { MouseUp.Add(a); return true; }
+        if (evt == "Enter") { Enter.Add(a); return true; }
+        if (evt == "Leave") { Leave.Add(a); return true; }
+        if (evt == "Move") { Move.Add(a); return true; }
+        if (evt == "Wheel") { Wheel.Add(a); return true; }
+        if (evt == "Focus") { Focus.Add(a); return true; }
+        if (evt == "Blur") { Blur.Add(a); return true; }
+        if (evt == "KeyDown") { KeyDown.Add(a); return true; }
+        if (evt == "KeyUp") { KeyUp.Add(a); return true; }
+        if (evt == "KeyPress") { KeyPress.Add(a); return true; }
+        if (evt == "Tap") { Tap.Add(a); return true; }
+        if (evt == "LongPress") { LongPress.Add(a); return true; }
+        if (evt == "Swipe") { Swipe.Add(a); return true; }
+        if (evt == "DragStart") { DragStart.Add(a); return true; }
+        if (evt == "Drag") { Drag.Add(a); return true; }
+        if (evt == "Drop") { Drop.Add(a); return true; }
+        return false;
+    }
+
+    /// Raises every registered handler whose condition holds for `id` this
+    /// frame. Call once per frame after the widget registered its hit region.
+    /// Rare / poll-driven events (move, wheel, key, gesture, drag) are gated on
+    /// having a listener so idle widgets pay nothing.
+    void Fire(App app, int id) {
+        Click.RaiseIf(Ui.Clicked(app, id));
+        DoubleClick.RaiseIf(Ui.DoubleClicked(app, id));
+        MouseDown.RaiseIf(Ui.PressedDown(app, id));
+        MouseUp.RaiseIf(Ui.MouseUpOn(app, id));
+        Enter.RaiseIf(Ui.Entered(app, id));
+        Leave.RaiseIf(Ui.Left(app, id));
+        Focus.RaiseIf(Ui.FocusGained(app, id));
+        Blur.RaiseIf(Ui.FocusLost(app, id));
+        Tap.RaiseIf(Ui.Tapped(app, id));
+        if (RightClick.Count() > 0) { RightClick.RaiseIf(Ui.RightClicked(app, id)); }
+        if (Move.Count() > 0) { Move.RaiseIf(Ui.MovedOver(app, id)); }
+        if (Wheel.Count() > 0) { Wheel.RaiseIf(Ui.Wheeled(app, id)); }
+        if (KeyDown.Count() > 0) { KeyDown.RaiseIf(Ui.KeyDownOn(app, id)); }
+        if (KeyUp.Count() > 0) { KeyUp.RaiseIf(Ui.KeyUpOn(app, id)); }
+        if (KeyPress.Count() > 0) { KeyPress.RaiseIf(Ui.KeyDownOn(app, id)); }
+        if (Swipe.Count() > 0) { Swipe.RaiseIf(Ui.SwipedAny(app, id)); }
+        if (DragStart.Count() > 0) { DragStart.RaiseIf(Ui.PressedDown(app, id)); }
+        if (Drag.Count() > 0) { Drag.RaiseIf(Ui.Dragging(app, id)); }
+        if (Drop.Count() > 0) { Drop.RaiseIf(Ui.Dropped(app, id)); }
+        // Only poll the long-press timer when someone is listening: the poll
+        // arms low-cadence follow-up frames while held, so skipping it keeps
+        // idle/press CPU untouched for widgets that don't use long-press.
+        if (LongPress.Count() > 0) {
+            LongPress.RaiseIf(Ui.LongPressed(app, id));
+        }
+    }
+}
+
+/// <summary>
+/// Monotonic source of stable, per-instance widget ids. A retained widget
+/// grabs one in its factory (Create) so its identity is fixed for its whole
+/// lifetime, regardless of sibling widgets appearing or disappearing between
+/// frames (a popup opening no longer renumbers everything after it). Ids start
+/// high so they never collide with the legacy per-frame positional ids handed
+/// out by <see cref="FocusManager.AllocId"/>.
+/// </summary>
+class WidgetId {
+    static int seq;
+    static int frameBase;
+
+    /// A fresh, process-unique widget id (stable for the caller's lifetime).
+    static int Next() {
+        seq = seq + 1;
+        return 1000000 + seq;
+    }
+
+    /// Records the current counter as the per-frame baseline. Immediate-mode
+    /// apps call this once, after every *retained* widget id has been allocated
+    /// (chrome, persistent controls), so ResetFrame() rewinds only to here and
+    /// never reissues an id already owned by a retained widget.
+    static void Mark() {
+        frameBase = seq;
+    }
+
+    /// Rewinds the id counter to the frame baseline (see Mark). Pure
+    /// immediate-mode UIs (which re-create their widgets every frame) call this
+    /// once per frame so a widget drawn in the same order gets the *same* id
+    /// across frames -- otherwise the ever-increasing counter hands each
+    /// rebuilt widget a new id and hover/press/click (all keyed by id) never
+    /// match the pointer target the framework resolved on the previous frame.
+    /// Retained-widget apps must NOT call this.
+    static void ResetFrame() {
+        seq = frameBase;
+    }
+
+    /// Reserves `n` consecutive stable ids and returns the first. Widgets that
+    /// register several hit regions (e.g. each star of a Rate) use this so
+    /// their sub-ids stay contiguous and stable across frames.
+    static int Block(int n) {
+        int first = 1000000 + seq + 1;
+        seq = seq + n;
+        return first;
+    }
+}
 
 class FocusManager {
     int focusedId;
     int hoveredId;
     int pressedId;
+    // Snapshot of the three ids as they stood at the end of the previous
+    // rendered frame. RollFrame() (called from App.PresentFrame) copies the
+    // live ids into these, so a widget can detect enter/leave and focus/blur
+    // transitions this frame by comparing IsHovered(id) with WasHovered(id).
+    int prevFocusedId;
+    int prevHoveredId;
+    int prevPressedId;
     int nextId;
+    // Ids of focusable widgets in the order they registered this frame, so Tab
+    // / Shift+Tab can move focus to the next/previous one. Rebuilt each frame.
+    List<int> tabOrder;
 
     static FocusManager Create() {
         FocusManager fm = new FocusManager();
         fm.focusedId = -1;
         fm.hoveredId = -1;
         fm.pressedId = -1;
+        fm.prevFocusedId = -1;
+        fm.prevHoveredId = -1;
+        fm.prevPressedId = -1;
         fm.nextId = 0;
+        fm.tabOrder = new List<int>();
         return fm;
     }
 
@@ -25,11 +402,55 @@ class FocusManager {
 
     void ResetIds() {
         nextId = 0;
+        tabOrder = new List<int>();
+    }
+
+    /// A focusable widget records itself each frame (in render order) so keyboard
+    /// Tab traversal has a stable, layout-ordered ring to walk.
+    void RegisterFocusable(int id) {
+        tabOrder.Add(id);
+    }
+
+    int IndexOf(int id) {
+        int i = 0;
+        while (i < tabOrder.Count) {
+            if (tabOrder[i] == id) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Moves focus to the next focusable widget (wraps). `dir` is +1 for Tab,
+    /// -1 for Shift+Tab. No-op when nothing focusable rendered.
+    void FocusStep(int dir) {
+        if (tabOrder.Count == 0) { return; }
+        int idx = IndexOf(focusedId);
+        if (idx < 0) {
+            if (dir >= 0) { focusedId = tabOrder[0]; }
+            else { focusedId = tabOrder[tabOrder.Count - 1]; }
+            return;
+        }
+        int n = tabOrder.Count;
+        int next = (idx + dir + n) % n;
+        focusedId = tabOrder[next];
     }
 
     bool IsFocused(int id) { return focusedId == id; }
     bool IsHovered(int id) { return hoveredId == id; }
     bool IsPressed(int id) { return pressedId == id; }
+
+    bool WasFocused(int id) { return prevFocusedId == id; }
+    bool WasHovered(int id) { return prevHoveredId == id; }
+    bool WasPressed(int id) { return prevPressedId == id; }
+
+    /// Snapshots the live ids as the "previous frame" baseline. Called once
+    /// per rendered frame (App.PresentFrame) after widgets have queried their
+    /// enter/leave/focus transitions for this frame.
+    void RollFrame() {
+        prevFocusedId = focusedId;
+        prevHoveredId = hoveredId;
+        prevPressedId = pressedId;
+    }
 
     void SetFocused(int id) { focusedId = id; }
     void SetHovered(int id) { hoveredId = id; }
@@ -106,5 +527,175 @@ class HitTester {
             i = i + 1;
         }
         return -1;
+    }
+}
+
+/// <summary>
+/// A framework-owned floating option-list popup (used by Select / SelectBox /
+/// Dropdown / Menu). Zan delegates can't capture locals or bind `this`, so a
+/// popup is described as *data*: the widget hands one to <c>App.AddOverlay</c>
+/// during the main pass, and <c>App.RunOverlays</c> draws + dispatches it AFTER
+/// all content, so it always paints above everything and owns the top-most hit
+/// regions (HitTester is last-registered-wins). Selecting an option writes the
+/// bound model, raises <see cref="onChange"/> and closes the popup; a press
+/// anywhere else closes it (single, centralized dispatch — no per-widget event
+/// scraping, no z-order hacks in application code).
+/// </summary>
+class OverlayPopup {
+    int x;
+    int y;
+    int w;
+    List<string> options;
+    int baseId;
+    SignalInt model;
+    int triggerId;
+    SignalBool openFlag;
+    SignalInt scrollModel;
+    UiEvent onChange;
+
+    static OverlayPopup OptionList(int x, int y, int w, List<string> options,
+                                   int baseId, SignalInt model, int triggerId,
+                                   SignalBool openFlag, SignalInt scrollModel,
+                                   UiEvent onChange) {
+        OverlayPopup p = new OverlayPopup();
+        p.x = x;
+        p.y = y;
+        p.w = w;
+        p.options = options;
+        p.baseId = baseId;
+        p.model = model;
+        p.triggerId = triggerId;
+        p.openFlag = openFlag;
+        p.scrollModel = scrollModel;
+        p.onChange = onChange;
+        return p;
+    }
+
+    void Render(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int count = options.Count;
+        int optH = t.heightMedium;
+        int totalH = count * optH;
+        int margin = app.Scale(4);
+        int popupW = w;
+        int maxW = c.Width() - margin * 2;
+        if (maxW < 1) { maxW = 1; }
+        if (popupW < app.Scale(48)) { popupW = app.Scale(48); }
+        if (popupW > maxW) { popupW = maxW; }
+        int popupX = x;
+        if (popupX + popupW > c.Width() - margin) {
+            popupX = c.Width() - margin - popupW;
+        }
+        if (popupX < margin) { popupX = margin; }
+
+        int maxViewH = optH * 8;
+        int availableH = c.Height() - margin * 2;
+        if (availableH < 1) { availableH = 1; }
+        if (maxViewH > availableH) { maxViewH = availableH; }
+        int viewH = totalH;
+        if (viewH > maxViewH) { viewH = maxViewH; }
+        int popupY = y;
+        if (popupY + viewH > c.Height() - margin) {
+            popupY = y - viewH - t.heightMedium - app.Scale(8);
+        }
+        if (popupY < margin) { popupY = c.Height() - margin - viewH; }
+        if (popupY < margin) { popupY = margin; }
+
+        int maxScroll = totalH - viewH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        int scrollY = scrollModel.Get();
+        int selectedIdx = model.Get();
+        if (scrollY == 0 && selectedIdx * optH >= viewH) {
+            scrollY = selectedIdx * optH - viewH + optH;
+        }
+        if (scrollY < 0) { scrollY = 0; }
+        if (scrollY > maxScroll) { scrollY = maxScroll; }
+
+        bool pointerInside = app.mouseX >= popupX && app.mouseX < popupX + popupW
+            && app.mouseY >= popupY && app.mouseY < popupY + viewH;
+        if (app.window.EventKind() == 13 && pointerInside && maxScroll > 0) {
+            int oldScroll = scrollY;
+            scrollY = scrollY - app.window.EventKeyCode() * optH / 120;
+            if (scrollY < 0) { scrollY = 0; }
+            if (scrollY > maxScroll) { scrollY = maxScroll; }
+            if (scrollY != oldScroll) {
+                scrollModel.Set(scrollY);
+                app.RequestRedraw();
+            }
+        }
+        app.CaptureWheel(popupX, popupY, popupW, viewH);
+
+        // Shadow + body.
+        app.BlockHitsBelow();
+        c.FillRoundRect(popupX + 1, popupY + 2, popupW, viewH, t.borderRadiusMedium, t.shadowColor);
+        c.FillRoundRect(popupX, popupY, popupW, viewH, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(popupX, popupY, popupW, viewH, t.borderPrimary, 1);
+        app.BlockHitsRect(popupX, popupY, popupW, viewH);
+
+        c.PushClip(popupX, popupY, popupW, viewH);
+        int i = 0;
+        while (i < count) {
+            int optId = baseId + i;
+            int optY = popupY + i * optH - scrollY;
+            if (optY + optH > popupY && optY < popupY + viewH) {
+                bool hovered = app.focus.IsHovered(optId);
+                bool selected = i == selectedIdx;
+                if (hovered) { c.FillRect(popupX + 1, optY, popupW - 2, optH, t.bgHover); }
+                int textColor = t.textPrimary;
+                if (selected) { textColor = t.primary; }
+                int optMaxW = popupW - t.paddingSmall - t.paddingLarge - t.iconSizeSmall - t.paddingSmall;
+                c.DrawText(popupX + t.paddingSmall, optY + (optH - Canvas.FontHeight(t.fontSizeMedium)) / 2,
+                           Ellipsis.Fit(options[i], optMaxW, t.fontSizeMedium), textColor, t.fontSizeMedium);
+                if (selected) {
+                    Icon.DrawCenteredIn(c, "check", popupX + popupW - t.paddingLarge - t.iconSizeSmall,
+                                        optY, t.iconSizeSmall, optH, t.iconSizeSmall, t.primary);
+                }
+                app.hitTester.Register(HitRegion.Create(optId, popupX, optY, popupW, optH, 0));
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+        if (maxScroll > 0 && viewH > 0) {
+            int barW = app.Scale(5);
+            int thumbH = viewH * viewH / totalH;
+            int minThumb = app.Scale(18);
+            if (thumbH < minThumb) { thumbH = minThumb; }
+            if (thumbH > viewH) { thumbH = viewH; }
+            int travel = viewH - thumbH;
+            int thumbY = popupY;
+            if (maxScroll > 0) { thumbY = popupY + scrollY * travel / maxScroll; }
+            c.FillRoundRect(popupX + popupW - barW - app.Scale(2), thumbY,
+                            barW, thumbH, barW / 2, t.scrollbar);
+        }
+
+        // Centralized dispatch: choose on a click that landed on an option
+        // (resolved against last frame's regions, which already had the popup
+        // on top), and dismiss on a press anywhere outside popup + trigger.
+        int kind = app.window.EventKind();
+        if (kind == 3) {
+            int hit = app.ClickTarget();
+            if (hit >= baseId && hit < baseId + count) {
+                int idx = hit - baseId;
+                if (idx != model.Get()) {
+                    model.Set(idx);
+                    onChange.Raise();
+                }
+                openFlag.Set(false);
+                app.RequestRedraw();
+            }
+        }
+        if (kind == 2) {
+            int pt = app.PressTarget();
+            bool insideOption = pt >= baseId && pt < baseId + count;
+            if (pt != triggerId && !insideOption) {
+                openFlag.Set(false);
+                app.RequestRedraw();
+            }
+        }
+        if (kind == 4 && app.window.EventKeyCode() == 27) {
+            openFlag.Set(false);
+            app.RequestRedraw();
+        }
     }
 }

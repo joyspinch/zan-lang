@@ -1,0 +1,190 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>GB/T 32907-2016 SM4 (Chinese national block cipher): 128-bit block,
+/// 128-bit key, 32 rounds. Provides single-block ECB plus CBC and CTR modes.
+/// Pure Zan; the S-box is stored as hex and decoded once.</summary>
+class Sm4 {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    static string SBOX_HEX() {
+        return "d690e9fecce13db716b614c228fb2c05"
+             + "2b679a762abe04c3aa44132649860699"
+             + "9c4250f491ef987a33540b43edcfac62"
+             + "e4b31ca9c908e89580df94fa758f3fa6"
+             + "4707a7fcf37317ba83593c19e6854fa8"
+             + "686b81b27164da8bf8eb0f4b70569d35"
+             + "1e240e5e6358d1a225227c3b01217887"
+             + "d40046579fd327524c3602e7a0c4c89e"
+             + "eabf8ad240c738b5a3f7f2cef96115a1"
+             + "e0ae5da49b341a55ad933230f58cb1e3"
+             + "1df6e22e8266ca60c02923ab0d534e6f"
+             + "d5db3745defd8e2f03ff6a726d6c5b51"
+             + "8d1baf92bbddbc7f11d95c411f105ad8"
+             + "0ac13188a5cd7bbd2d74d012b8e5b4b0"
+             + "8969974a0c96777e65b9f109c56ec684"
+             + "18f07dec3adc4d2079ee5f3ed7cb3948";
+    }
+
+    static string sbox;
+    static bool ready = false;
+
+    static void init() {
+        if (ready) { return; }
+        sbox = Hex.Decode(SBOX_HEX());
+        ready = true;
+    }
+
+    static int tau(int a) {
+        return (((sbox[(a>>24)&255]&255)<<24) | ((sbox[(a>>16)&255]&255)<<16)
+              | ((sbox[(a>>8)&255]&255)<<8)  | (sbox[a&255]&255)) & 4294967295;
+    }
+    static int lTrans(int b) {
+        return (b ^ Bits.Rotl32(b,2) ^ Bits.Rotl32(b,10) ^ Bits.Rotl32(b,18) ^ Bits.Rotl32(b,24)) & 4294967295;
+    }
+    static int lpTrans(int b) {
+        return (b ^ Bits.Rotl32(b,13) ^ Bits.Rotl32(b,23)) & 4294967295;
+    }
+
+    // CK[i] byte j = ((4i + j) * 7) mod 256 (GB/T 32907-2016).
+    static List<int> ckTable() {
+        List<int> ck = new List<int>();
+        int i = 0;
+        while (i < 32) {
+            int w = 0; int j = 0;
+            while (j < 4) { w = ((w << 8) | (((4*i + j) * 7) & 255)) & 4294967295; j = j + 1; }
+            ck.Add(w);
+            i = i + 1;
+        }
+        return ck;
+    }
+
+    /// <summary>Derives the 32 round keys. If <paramref name="forDecrypt"/> the
+    /// order is reversed.</summary>
+    static List<int> keySchedule(string key, bool forDecrypt) {
+        init();
+        List<int> fk = new List<int>();
+        fk.Add(0xa3b1bac6); fk.Add(0x56aa3350); fk.Add(0x677d9197); fk.Add(0xb27022dc);
+        List<int> ck = ckTable();
+        List<int> k = new List<int>();
+        int i = 0;
+        while (i < 4) {
+            int w = (((key[i*4]&255)<<24)|((key[i*4+1]&255)<<16)|((key[i*4+2]&255)<<8)|(key[i*4+3]&255)) & 4294967295;
+            k.Add((w ^ fk[i]) & 4294967295);
+            i = i + 1;
+        }
+        List<int> rk = new List<int>();
+        i = 0;
+        while (i < 32) {
+            int t = (k[i+1] ^ k[i+2] ^ k[i+3] ^ ck[i]) & 4294967295;
+            int nk = (k[i] ^ lpTrans(tau(t))) & 4294967295;
+            k.Add(nk);
+            rk.Add(nk);
+            i = i + 1;
+        }
+        if (forDecrypt) {
+            List<int> rev = new List<int>();
+            i = 31;
+            while (i >= 0) { rev.Add(rk[i]); i = i - 1; }
+            return rev;
+        }
+        return rk;
+    }
+
+    static void cryptBlock(string in16, string out16, List<int> rk) {
+        List<int> x = new List<int>();
+        int i = 0;
+        while (i < 4) {
+            x.Add((((in16[i*4]&255)<<24)|((in16[i*4+1]&255)<<16)|((in16[i*4+2]&255)<<8)|(in16[i*4+3]&255)) & 4294967295);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 32) {
+            int t = (x[i+1] ^ x[i+2] ^ x[i+3] ^ rk[i]) & 4294967295;
+            x.Add((x[i] ^ lTrans(tau(t))) & 4294967295);
+            i = i + 1;
+        }
+        // output = X35,X34,X33,X32
+        int j = 0;
+        while (j < 4) {
+            int v = x[35 - j];
+            out16[j*4]   = (v>>24)&255;
+            out16[j*4+1] = (v>>16)&255;
+            out16[j*4+2] = (v>>8)&255;
+            out16[j*4+3] = v&255;
+            j = j + 1;
+        }
+    }
+
+    /// <summary>Encrypts a single 16-byte block. Returns a fresh 16-byte buffer.</summary>
+    static string EncryptBlock(string key, string in16) {
+        List<int> rk = keySchedule(key, false);
+        string o = calloc(17, 1);
+        cryptBlock(in16, o, rk);
+        return o;
+    }
+
+    /// <summary>Decrypts a single 16-byte block. Returns a fresh 16-byte buffer.</summary>
+    static string DecryptBlock(string key, string in16) {
+        List<int> rk = keySchedule(key, true);
+        string o = calloc(17, 1);
+        cryptBlock(in16, o, rk);
+        return o;
+    }
+
+    /// <summary>SM4-CBC encrypt with PKCS#7 padding.</summary>
+    static string EncryptCbc(string key, string iv, string data, int len, List<int> outLen) {
+        List<int> rk = keySchedule(key, false);
+        int padVal = 16 - (len % 16);
+        int total = len + padVal;
+        string outb = calloc(total + 1, 1);
+        string prev = calloc(17, 1);
+        int i = 0; while (i < 16) { prev[i] = iv[i]&255; i = i + 1; }
+        int off = 0;
+        while (off < total) {
+            string blk = calloc(17, 1);
+            int j = 0;
+            while (j < 16) {
+                int b; if (off+j < len) { b = data[off+j]&255; } else { b = padVal; }
+                blk[j] = (b ^ (prev[j]&255)) & 255;
+                j = j + 1;
+            }
+            string ob = calloc(17, 1);
+            cryptBlock(blk, ob, rk);
+            j = 0; while (j < 16) { outb[off+j] = ob[j]&255; prev[j] = ob[j]&255; j = j + 1; }
+            free(blk); free(ob);
+            off = off + 16;
+        }
+        free(prev);
+        outLen[0] = total;
+        return outb;
+    }
+
+    /// <summary>SM4-CBC decrypt, stripping PKCS#7 padding.</summary>
+    static string DecryptCbc(string key, string iv, string data, int len, List<int> outLen) {
+        List<int> rk = keySchedule(key, true);
+        string outb = calloc(len + 1, 1);
+        string prev = calloc(17, 1);
+        int i = 0; while (i < 16) { prev[i] = iv[i]&255; i = i + 1; }
+        int off = 0;
+        while (off < len) {
+            string blk = calloc(17, 1);
+            int j = 0; while (j < 16) { blk[j] = data[off+j]&255; j = j + 1; }
+            string ob = calloc(17, 1);
+            cryptBlock(blk, ob, rk);
+            j = 0; while (j < 16) { outb[off+j] = (ob[j]&255) ^ (prev[j]&255); prev[j] = blk[j]&255; j = j + 1; }
+            free(blk); free(ob);
+            off = off + 16;
+        }
+        free(prev);
+        int plen = len;
+        if (len > 0) {
+            int padVal = outb[len-1]&255;
+            if (padVal >= 1 && padVal <= 16) { plen = len - padVal; }
+        }
+        outLen[0] = plen;
+        return outb;
+    }
+}

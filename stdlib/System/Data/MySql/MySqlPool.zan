@@ -1,0 +1,123 @@
+using System;
+using System.Data;
+
+namespace System.Data.MySql;
+
+/// <summary>
+/// Coroutine-aware connection pool for <see cref="MySqlConnection"/>.
+///
+/// Connections are opened lazily up to <c>maxSize</c> and reused across
+/// coroutines. When every connection is checked out and the cap is reached,
+/// <see cref="AcquireAsync"/> suspends the calling coroutine (via the timer
+/// reactor) instead of blocking the worker thread, resuming once a connection
+/// is returned with <see cref="Release"/>. Because both opening a connection
+/// and running queries are already coroutine-ized on the IO reactor, the whole
+/// acquire/query/release cycle stays non-blocking.
+///
+/// The pool relies on the cooperative single-thread-per-scheduler model: the
+/// free-list is only touched between await points, so no lock is required.
+///
+/// Usage:
+///   MySqlPool pool = MySqlPool.Create("127.0.0.1", 3306, "test", "root", "secret", 8);
+///   MySqlConnection db = await pool.AcquireAsync();
+///   DbResult r = await db.QueryAsync("SELECT 1");
+///   pool.Release(db);
+///   pool.Close();
+/// </summary>
+class MySqlPool {
+    string host;
+    int port;
+    string database;
+    string user;
+    string password;
+    int maxSize;
+    List<MySqlConnection> idle;
+    int liveCount;      // total opened connections (idle + checked out)
+    bool closed;
+
+    MySqlPool(string host, int port, string database, string user,
+            string password, int maxSize) {
+        this.host = host;
+        this.port = port;
+        this.database = database;
+        this.user = user;
+        this.password = password;
+        this.maxSize = maxSize;
+        this.idle = new List<MySqlConnection>();
+        this.liveCount = 0;
+        this.closed = false;
+    }
+
+    /// <summary>Creates a pool bound to a MySQL/MariaDB endpoint.</summary>
+    static MySqlPool Create(string host, int port, string database,
+            string user, string password, int maxSize) {
+        return new MySqlPool(host, port, database, user, password, maxSize);
+    }
+
+    /// <summary>Checks out a connection: reuses an idle one, opens a new one if
+    /// under the cap, otherwise suspends the coroutine until one is released.</summary>
+    async MySqlConnection AcquireAsync() {
+        while (true) {
+            if (this.idle.Count > 0) {
+                int last = this.idle.Count - 1;
+                MySqlConnection c = this.idle[last];
+                this.idle.RemoveAt(last);
+                return c;
+            }
+            if (this.liveCount < this.maxSize) {
+                this.liveCount = this.liveCount + 1;
+                MySqlConnection c = await MySqlConnection.OpenParamsAsync(
+                    this.host, this.port, this.database, this.user, this.password);
+                if (!c.IsConnected()) {
+                    this.liveCount = this.liveCount - 1;
+                }
+                return c;
+            }
+            await Task.Delay(1);
+        }
+        return null;
+    }
+
+    /// <summary>Returns a connection to the pool. A broken or post-Close()
+    /// connection is closed and dropped instead of being pooled.</summary>
+    void Release(MySqlConnection c) {
+        if (c == null) {
+            return;
+        }
+        if (this.closed || !c.IsConnected()) {
+            if (c.IsConnected()) {
+                c.Close();
+            }
+            if (this.liveCount > 0) {
+                this.liveCount = this.liveCount - 1;
+            }
+            return;
+        }
+        this.idle.Add(c);
+    }
+
+    /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
+    int IdleCount() {
+        return this.idle.Count;
+    }
+
+    /// <summary>Total live connections (idle + checked out).</summary>
+    int LiveCount() {
+        return this.liveCount;
+    }
+
+    /// <summary>Closes all idle connections and marks the pool closed. Connections
+    /// still checked out are closed when they are released.</summary>
+    void Close() {
+        this.closed = true;
+        while (this.idle.Count > 0) {
+            int last = this.idle.Count - 1;
+            MySqlConnection c = this.idle[last];
+            this.idle.RemoveAt(last);
+            c.Close();
+            if (this.liveCount > 0) {
+                this.liveCount = this.liveCount - 1;
+            }
+        }
+    }
+}

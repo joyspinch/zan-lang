@@ -1,0 +1,410 @@
+using System;
+using System.Net.Sockets;
+using System.Data.Redis;
+
+namespace System.Data.Redis;
+
+/// <summary>
+/// Coroutine-ized Redis client speaking RESP (RESP2) over the async IO reactor.
+///
+/// Every network operation suspends to the stackless reactor via the async
+/// <see cref="Socket"/> layer (non-blocking connect / send / recv), so thousands
+/// of Redis calls can be in flight on a single worker without blocking a thread
+/// -- the same model as the HTTP/WebSocket stack. This is deliberately
+/// dependency-free: RESP is a line protocol, so no native client library is
+/// needed.
+///
+/// Usage:
+///   RedisClient r = await RedisClient.ConnectAsync("127.0.0.1", 6379);
+///   await r.SetAsync("name", "Alice");
+///   string v = await r.GetAsync("name");     // "Alice"
+///   int n = await r.DelAsync("name");        // 1
+///   RedisReply pong = await r.CommandAsync2("PING", "");   // +PONG
+///   r.Close();
+///
+/// Binary safety: bulk *replies* are parsed by explicit byte length, so values
+/// containing NUL bytes are returned intact (use RedisReply.len). Command
+/// *arguments* are measured with strlen, so argument values should not contain
+/// embedded NUL bytes.
+/// </summary>
+class RedisClient {
+    int sock;
+    string host;
+    int port;
+    bool connected;
+    string lastError;
+
+    // Receive buffer with explicit [head, tail) valid window so RESP replies can
+    // be parsed byte-exact (binary-safe) rather than relying on NUL termination.
+    string inbuf;
+    int incap;
+    int inhead;
+    int intail;
+    string tmp;      // fixed staging buffer for each recv syscall
+    int tmpcap;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    [DllImport("crt")]
+    static extern int strlen(string str);
+
+    RedisClient() {
+        this.sock = -1;
+        this.host = "";
+        this.port = 6379;
+        this.connected = false;
+        this.lastError = "";
+        this.inbuf = null;
+        this.incap = 0;
+        this.inhead = 0;
+        this.intail = 0;
+        this.tmp = null;
+        this.tmpcap = 16384;
+    }
+
+    /// <summary>Connects to a Redis server, suspending on the IO reactor until
+    /// the (non-blocking) connection is established.</summary>
+    static async RedisClient ConnectAsync(string host, int port) {
+        Socket.Initialize();
+        RedisClient c = new RedisClient();
+        c.host = host;
+        c.port = port;
+        c.sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(c.sock);
+        await Socket.ConnectAsync(c.sock, host, port);
+        c.connected = true;
+        c.incap = 16384;
+        c.inbuf = calloc(c.incap + 1, 1);
+        c.inhead = 0;
+        c.intail = 0;
+        c.tmp = calloc(c.tmpcap + 1, 1);
+        return c;
+    }
+
+    /// <summary>Closes the connection and releases buffers.</summary>
+    void Close() {
+        if (this.connected) {
+            Socket.Close(this.sock);
+            this.connected = false;
+            this.sock = -1;
+        }
+        // The scratch buffers are raw (calloc) blocks -- kept off the ARC heap
+        // because the IO reactor pins the recv buffer across suspension -- so
+        // they must be freed explicitly rather than by dropping the reference.
+        if (this.inbuf != null) {
+            free(this.inbuf);
+            this.inbuf = null;
+        }
+        if (this.tmp != null) {
+            free(this.tmp);
+            this.tmp = null;
+        }
+    }
+
+    /// <summary>Copies <paramref name="len"/> bytes out of the receive buffer
+    /// starting at <paramref name="start"/> into a fresh NUL-terminated string.
+    /// Binary-safe: copies by index, so embedded NUL bytes survive.</summary>
+    string sliceBytes(int start, int len) {
+        return this.inbuf.Substring(start, len);
+    }
+
+    /// <summary>Ensures the receive buffer can hold <paramref name="extra"/> more
+    /// bytes past the tail, compacting then growing as needed.</summary>
+    void ensureRoom(int extra) {
+        if (this.intail + extra <= this.incap) {
+            return;
+        }
+        if (this.inhead > 0) {
+            int span = this.intail - this.inhead;
+            int k = 0;
+            while (k < span) {
+                this.inbuf[k] = this.inbuf[this.inhead + k];
+                k = k + 1;
+            }
+            this.inhead = 0;
+            this.intail = span;
+        }
+        if (this.intail + extra <= this.incap) {
+            return;
+        }
+        int ncap = this.incap * 2;
+        while (this.intail + extra > ncap) {
+            ncap = ncap * 2;
+        }
+        string nb = calloc(ncap + 1, 1);
+        int j = 0;
+        while (j < this.intail) {
+            nb[j] = this.inbuf[j];
+            j = j + 1;
+        }
+        free(this.inbuf);
+        this.inbuf = nb;
+        this.incap = ncap;
+    }
+
+    /// <summary>Receives one chunk from the socket into the buffer. Returns the
+    /// byte count (0 on peer close). Suspends on the reactor until readable.</summary>
+    async int fillMore() {
+        int n = await Socket.RecvIntoAsync(this.sock, this.tmp, this.tmpcap);
+        if (n <= 0) {
+            return 0;
+        }
+        this.ensureRoom(n);
+        int k = 0;
+        while (k < n) {
+            this.inbuf[this.intail + k] = this.tmp[k];
+            k = k + 1;
+        }
+        this.intail = this.intail + n;
+        return n;
+    }
+
+    /// <summary>Ensures at least <paramref name="need"/> bytes are buffered,
+    /// pulling from the socket as required. Returns false on peer close.</summary>
+    async bool ensureAvailable(int need) {
+        while ((this.intail - this.inhead) < need) {
+            int got = await this.fillMore();
+            if (got == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Reads one CRLF-terminated line (excluding the CRLF) starting at
+    /// the head cursor, pulling more data as needed. Returns null on peer
+    /// close.</summary>
+    async string readLine() {
+        int scan = this.inhead;
+        while (true) {
+            while (scan + 1 < this.intail) {
+                if (this.inbuf[scan] == 13 && this.inbuf[scan + 1] == 10) {
+                    int lineLen = scan - this.inhead;
+                    string line = this.sliceBytes(this.inhead, lineLen);
+                    this.inhead = scan + 2;
+                    return line;
+                }
+                scan = scan + 1;
+            }
+            int got = await this.fillMore();
+            if (got == 0) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Reads exactly <paramref name="n"/> bytes of bulk payload followed
+    /// by a trailing CRLF, advancing the head cursor past both.</summary>
+    async string readBulk(int n) {
+        bool ok = await this.ensureAvailable(n + 2);
+        if (!ok) {
+            return null;
+        }
+        string data = this.sliceBytes(this.inhead, n);
+        this.inhead = this.inhead + n + 2;
+        return data;
+    }
+
+    /// <summary>Parses one complete RESP reply from the stream (recursively for
+    /// arrays), suspending on the reactor whenever more bytes are needed.</summary>
+    async RedisReply readReply() {
+        string line = await this.readLine();
+        RedisReply r = new RedisReply();
+        if (line == null) {
+            r.kind = RedisReply.ERROR;
+            r.str = "connection closed";
+            return r;
+        }
+        int prefix = line[0];
+        string rest = line.Substring(1);
+        if (prefix == 43) {                 // '+' simple string
+            r.kind = RedisReply.STR;
+            r.str = rest;
+            r.len = strlen(rest);
+            return r;
+        }
+        if (prefix == 45) {                 // '-' error
+            r.kind = RedisReply.ERROR;
+            r.str = rest;
+            r.len = strlen(rest);
+            return r;
+        }
+        if (prefix == 58) {                 // ':' integer
+            r.kind = RedisReply.INT;
+            r.integer = Convert.ToInt(rest);
+            return r;
+        }
+        if (prefix == 36) {                 // '$' bulk string
+            int blen = Convert.ToInt(rest);
+            if (blen < 0) {
+                r.kind = RedisReply.NIL;
+                return r;
+            }
+            string data = await this.readBulk(blen);
+            r.kind = RedisReply.BULK;
+            r.str = data;
+            r.len = blen;
+            return r;
+        }
+        if (prefix == 42) {                 // '*' array
+            int count = Convert.ToInt(rest);
+            if (count < 0) {
+                r.kind = RedisReply.NIL;
+                return r;
+            }
+            r.kind = RedisReply.ARRAY;
+            r.items = new List<RedisReply>();
+            int i = 0;
+            while (i < count) {
+                RedisReply child = await this.readReply();
+                r.items.Add(child);
+                i = i + 1;
+            }
+            return r;
+        }
+        r.kind = RedisReply.ERROR;
+        r.str = "protocol error: " + line;
+        return r;
+    }
+
+    /// <summary>Encodes <paramref name="args"/> as a RESP array of bulk strings
+    /// and sends it. Argument lengths are measured with strlen.</summary>
+    async int sendArgs(List<string> args) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("*");
+        sb.Append(Convert.ToString(args.Count));
+        sb.Append("\r\n");
+        int i = 0;
+        while (i < args.Count) {
+            string a = args[i];
+            sb.Append("$");
+            sb.Append(Convert.ToString(strlen(a)));
+            sb.Append("\r\n");
+            sb.Append(a);
+            sb.Append("\r\n");
+            i = i + 1;
+        }
+        string payload = sb.ToString();
+        int sent = await Socket.SendAsync(this.sock, payload, strlen(payload));
+        return sent;
+    }
+
+    /// <summary>Sends a command (argument vector) and awaits its reply.</summary>
+    async RedisReply CommandAsync(List<string> args) {
+        int _s = await this.sendArgs(args);
+        RedisReply r = await this.readReply();
+        if (r.IsError()) {
+            this.lastError = r.str;
+        }
+        return r;
+    }
+
+    /// <summary>Convenience: one-argument command (e.g. PING).</summary>
+    async RedisReply CommandAsync1(string a0) {
+        List<string> args = new List<string>();
+        args.Add(a0);
+        RedisReply r = await this.CommandAsync(args);
+        return r;
+    }
+
+    /// <summary>Convenience: two-argument command (e.g. GET key).</summary>
+    async RedisReply CommandAsync2(string a0, string a1) {
+        List<string> args = new List<string>();
+        args.Add(a0);
+        args.Add(a1);
+        RedisReply r = await this.CommandAsync(args);
+        return r;
+    }
+
+    /// <summary>Convenience: three-argument command (e.g. SET key value).</summary>
+    async RedisReply CommandAsync3(string a0, string a1, string a2) {
+        List<string> args = new List<string>();
+        args.Add(a0);
+        args.Add(a1);
+        args.Add(a2);
+        RedisReply r = await this.CommandAsync(args);
+        return r;
+    }
+
+    /// <summary>PING; returns true if the server replies PONG.</summary>
+    async bool PingAsync() {
+        RedisReply r = await this.CommandAsync1("PING");
+        return r.AsString() == "PONG";
+    }
+
+    /// <summary>Authenticates with a password. Returns true on +OK.</summary>
+    async bool AuthAsync(string password) {
+        RedisReply r = await this.CommandAsync2("AUTH", password);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>Selects a logical database index. Returns true on +OK.</summary>
+    async bool SelectAsync(int index) {
+        RedisReply r = await this.CommandAsync2("SELECT", Convert.ToString(index));
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>SET key value. Returns true on +OK.</summary>
+    async bool SetAsync(string key, string val) {
+        RedisReply r = await this.CommandAsync3("SET", key, val);
+        return r.AsString() == "OK";
+    }
+
+    /// <summary>GET key. Returns the value, or empty string when the key is
+    /// missing (nil). Use <see cref="GetReplyAsync"/> to distinguish nil from an
+    /// empty value.</summary>
+    async string GetAsync(string key) {
+        RedisReply r = await this.CommandAsync2("GET", key);
+        if (r.IsNil()) {
+            return "";
+        }
+        return r.AsString();
+    }
+
+    /// <summary>GET key, returning the raw reply so callers can tell an
+    /// empty-string value apart from a missing key (nil).</summary>
+    async RedisReply GetReplyAsync(string key) {
+        RedisReply r = await this.CommandAsync2("GET", key);
+        return r;
+    }
+
+    /// <summary>DEL key. Returns the number of keys removed (0 or 1).</summary>
+    async int DelAsync(string key) {
+        RedisReply r = await this.CommandAsync2("DEL", key);
+        return r.AsInt();
+    }
+
+    /// <summary>EXISTS key. Returns 1 if present, 0 otherwise.</summary>
+    async int ExistsAsync(string key) {
+        RedisReply r = await this.CommandAsync2("EXISTS", key);
+        return r.AsInt();
+    }
+
+    /// <summary>INCR key. Returns the value after increment.</summary>
+    async int IncrAsync(string key) {
+        RedisReply r = await this.CommandAsync2("INCR", key);
+        return r.AsInt();
+    }
+
+    /// <summary>EXPIRE key seconds. Returns 1 if the timeout was set.</summary>
+    async int ExpireAsync(string key, int seconds) {
+        RedisReply r = await this.CommandAsync3("EXPIRE", key,
+                                                Convert.ToString(seconds));
+        return r.AsInt();
+    }
+
+    /// <summary>Returns the last server error message seen, if any.</summary>
+    string GetLastError() {
+        return this.lastError;
+    }
+
+    /// <summary>Returns true if connected.</summary>
+    bool IsConnected() {
+        return this.connected;
+    }
+}

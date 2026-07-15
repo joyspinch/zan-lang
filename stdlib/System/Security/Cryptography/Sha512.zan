@@ -1,0 +1,119 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>SHA-512 (FIPS 180-4) in pure Zan. Operates on 64-bit lanes held in
+/// Zan's signed 64-bit ints; additions wrap mod 2^64 and every right shift uses
+/// the logical Bits.Shr64 / Bits.Rotr64 helpers. Message length is limited to a
+/// 64-bit bit-count (high 64 bits of the 128-bit field are always zero).</summary>
+class Sha512 {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    static string KHEX = "428a2f98d728ae227137449123ef65cdb5c0fbcfec4d3b2fe9b5dba58189dbbc3956c25bf348b53859f111f1b605d019923f82a4af194f9bab1c5ed5da6d8118d807aa98a303024212835b0145706fbe243185be4ee4b28c550c7dc3d5ffb4e272be5d74f27b896f80deb1fe3b1696b19bdc06a725c71235c19bf174cf692694e49b69c19ef14ad2efbe4786384f25e30fc19dc68b8cd5b5240ca1cc77ac9c652de92c6f592b02754a7484aa6ea6e4835cb0a9dcbd41fbd476f988da831153b5983e5152ee66dfaba831c66d2db43210b00327c898fb213fbf597fc7beef0ee4c6e00bf33da88fc2d5a79147930aa72506ca6351e003826f142929670a0e6e7027b70a8546d22ffc2e1b21385c26c9264d2c6dfc5ac42aed53380d139d95b3df650a73548baf63de766a0abb3c77b2a881c2c92e47edaee692722c851482353ba2bfe8a14cf10364a81a664bbc423001c24b8b70d0f89791c76c51a30654be30d192e819d6ef5218d69906245565a910f40e35855771202a106aa07032bbd1b819a4c116b8d2d0c81e376c085141ab532748774cdf8eeb9934b0bcb5e19b48a8391c0cb3c5c95a634ed8aa4ae3418acb5b9cca4f7763e373682e6ff3d6b2b8a3748f82ee5defb2fc78a5636f43172f6084c87814a1f0ab728cc702081a6439ec90befffa23631e28a4506cebde82bde9bef9a3f7b2c67915c67178f2e372532bca273eceea26619cd186b8c721c0c207eada7dd6cde0eb1ef57d4f7fee6ed17806f067aa72176fba0a637dc5a2c898a6113f9804bef90dae1b710b35131c471b28db77f523047d8432caab7b40c724933c9ebe0a15c9bebc431d67c49c100d4c4cc5d4becb3e42b6597f299cfc657e2a5fcb6fab3ad6faec6c44198c4a475817";
+    static string HHEX = "6a09e667f3bcc908bb67ae8584caa73b3c6ef372fe94f82ba54ff53a5f1d36f1510e527fade682d19b05688c2b3e6c1f1f83d9abfb41bd6b5be0cd19137e2179";
+
+    static List<int> K;
+    static List<int> H0;
+    static bool ready = false;
+
+    static int word64(string h, int idx) {
+        // parse 16 hex chars at byte-offset idx*16 into a 64-bit word
+        int v = 0; int i = 0; int bo = idx * 16;
+        while (i < 16) {
+            int c = h[bo + i] & 255;
+            int d = 0;
+            if (c >= 48 && c <= 57) { d = c - 48; }
+            else { d = c - 97 + 10; }
+            v = (v << 4) | d;
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static void init() {
+        if (ready) { return; }
+        K = new List<int>();
+        int i = 0; while (i < 80) { K.Add(word64(KHEX, i)); i = i + 1; }
+        H0 = new List<int>();
+        i = 0; while (i < 8) { H0.Add(word64(HHEX, i)); i = i + 1; }
+        ready = true;
+    }
+
+    static int s0(int x) { return Bits.Rotr64(x,1) ^ Bits.Rotr64(x,8) ^ Bits.Shr64(x,7); }
+    static int s1(int x) { return Bits.Rotr64(x,19) ^ Bits.Rotr64(x,61) ^ Bits.Shr64(x,6); }
+    static int bigS0(int x) { return Bits.Rotr64(x,28) ^ Bits.Rotr64(x,34) ^ Bits.Rotr64(x,39); }
+    static int bigS1(int x) { return Bits.Rotr64(x,14) ^ Bits.Rotr64(x,18) ^ Bits.Rotr64(x,41); }
+
+    /// <summary>Computes the 64-byte SHA-512 digest of the first
+    /// <paramref name="len"/> bytes of <paramref name="msg"/>.</summary>
+    static string Hash(string msg, int len) {
+        init();
+        // padded length: multiple of 128, with 16-byte length trailer
+        int totalBlocks = ((len + 16) / 128) + 1;
+        int padded = totalBlocks * 128;
+        string m = calloc(padded + 1, 1);
+        int i = 0;
+        while (i < len) { m[i] = msg[i] & 255; i = i + 1; }
+        m[len] = 0x80;
+        // 128-bit big-endian bit length; only low 64 bits used
+        int bitLen = len * 8;
+        int j = 0;
+        while (j < 8) {
+            m[padded - 1 - j] = Bits.Shr64(bitLen, 8 * j) & 255;
+            j = j + 1;
+        }
+
+        List<int> h = new List<int>();
+        i = 0; while (i < 8) { h.Add(H0[i]); i = i + 1; }
+
+        List<int> w = new List<int>();
+        i = 0; while (i < 80) { w.Add(0); i = i + 1; }
+
+        int blk = 0;
+        while (blk < totalBlocks) {
+            int t = 0;
+            while (t < 16) {
+                int off = blk * 128 + t * 8;
+                int v = 0; int b = 0;
+                while (b < 8) { v = (v << 8) | (m[off + b] & 255); b = b + 1; }
+                w[t] = v;
+                t = t + 1;
+            }
+            t = 16;
+            while (t < 80) {
+                w[t] = w[t-16] + s0(w[t-15]) + w[t-7] + s1(w[t-2]);
+                t = t + 1;
+            }
+            int a = h[0]; int bb = h[1]; int c = h[2]; int d = h[3];
+            int e = h[4]; int f = h[5]; int g = h[6]; int hh = h[7];
+            t = 0;
+            while (t < 80) {
+                int ch = (e & f) ^ ((~e) & g);
+                int temp1 = hh + bigS1(e) + ch + K[t] + w[t];
+                int maj = (a & bb) ^ (a & c) ^ (bb & c);
+                int temp2 = bigS0(a) + maj;
+                hh = g; g = f; f = e; e = d + temp1;
+                d = c; c = bb; bb = a; a = temp1 + temp2;
+                t = t + 1;
+            }
+            h[0] = h[0] + a; h[1] = h[1] + bb; h[2] = h[2] + c; h[3] = h[3] + d;
+            h[4] = h[4] + e; h[5] = h[5] + f; h[6] = h[6] + g; h[7] = h[7] + hh;
+            blk = blk + 1;
+        }
+        free(m);
+
+        string outb = calloc(65, 1);
+        i = 0;
+        while (i < 8) {
+            int wv = h[i];
+            int b = 0;
+            while (b < 8) {
+                outb[i * 8 + b] = Bits.Shr64(wv, 8 * (7 - b)) & 255;
+                b = b + 1;
+            }
+            i = i + 1;
+        }
+        return outb;
+    }
+}

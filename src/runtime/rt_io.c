@@ -38,6 +38,7 @@
  * reactor has no dependency on rt_sched. */
 #if !defined(_WIN32)
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -173,6 +174,25 @@ int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
     return (int64_t)recv((SOCKET)fd, (char *)buf, (int)len, (int)flags);
 #else
     return (int64_t)recv((int)fd, buf, (size_t)len, (int)flags);
+#endif
+}
+
+int64_t zan_io_socket_ready(int64_t fd, int64_t write_ready) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    struct timeval timeout = {0, 0};
+#if defined(_WIN32)
+    SOCKET sock = (SOCKET)fd;
+    if (sock == INVALID_SOCKET) return -1;
+    FD_SET(sock, &fds);
+    return (int64_t)select(0, write_ready ? NULL : &fds,
+                          write_ready ? &fds : NULL, NULL, &timeout);
+#else
+    if (fd < 0 || fd >= FD_SETSIZE) return -1;
+    int sock = (int)fd;
+    FD_SET(sock, &fds);
+    return (int64_t)select(sock + 1, write_ready ? NULL : &fds,
+                          write_ready ? &fds : NULL, NULL, &timeout);
 #endif
 }
 

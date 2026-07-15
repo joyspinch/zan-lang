@@ -1,7 +1,8 @@
 $ErrorActionPreference = "Stop"
-Set-Location 'd:\project\zan-lang\build'
-$src = 'd:\project\zan-lang\examples\text_test.zan'
-$dep = 'd:\project\zan-lang\stdlib\Gui\Text.zan'
+$root = Split-Path -Parent $PSScriptRoot
+Set-Location (Join-Path $root 'build')
+$src = Join-Path $root 'examples\text_test.zan'
+$dep = Join-Path $root 'stdlib\Gui\Text.zan'
 $ir = & .\zanc.exe --emit-ir $src $dep
 if ($LASTEXITCODE -ne 0) { Write-Output "IR_FAILED"; $ir; exit 1 }
 [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "text_test.ll"), $ir)

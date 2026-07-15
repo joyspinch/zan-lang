@@ -1,0 +1,299 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>Arbitrary-precision non-negative integer using 32-bit limbs stored
+/// little-endian (limb 0 is least significant) in a List&lt;int&gt;. Enough for
+/// RSA and SM2: comparison, add/sub/mul, Montgomery modular exponentiation, and
+/// modular inverse. Products of two limbs stay within 64 bits, and all high-word
+/// extraction uses logical (not arithmetic) shifts via Bits.Shr64.</summary>
+class BigInt {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+
+    List<int> d;   // limbs, little-endian, base 2^32; trimmed (no high zero limbs)
+
+    static BigInt make(List<int> limbs) {
+        BigInt b = new BigInt();
+        b.d = limbs;
+        b.trim();
+        return b;
+    }
+
+    void trim() {
+        while (this.d.Count > 1 && this.d[this.d.Count - 1] == 0) {
+            this.d.RemoveAt(this.d.Count - 1);
+        }
+    }
+
+    int count() { return this.d.Count; }
+    int limb(int i) { if (i < this.d.Count) { return this.d[i] & 4294967295; } return 0; }
+    bool isZero() { return this.d.Count == 1 && this.d[0] == 0; }
+
+    static BigInt zero() { List<int> z = new List<int>(); z.Add(0); return make(z); }
+    static BigInt one()  { List<int> z = new List<int>(); z.Add(1); return make(z); }
+
+    /// <summary>Builds a BigInt from a big-endian byte buffer.</summary>
+    static BigInt FromBytesBE(string buf, int len) {
+        List<int> limbs = new List<int>();
+        int i = len - 1;
+        int shift = 0; int cur = 0;
+        while (i >= 0) {
+            cur = cur | ((buf[i] & 255) << shift);
+            shift = shift + 8;
+            if (shift == 32) { limbs.Add(cur & 4294967295); cur = 0; shift = 0; }
+            i = i - 1;
+        }
+        if (shift > 0) { limbs.Add(cur & 4294967295); }
+        if (limbs.Count == 0) { limbs.Add(0); }
+        return make(limbs);
+    }
+
+    /// <summary>Serializes to a big-endian buffer of exactly <paramref name="outLen"/>
+    /// bytes (left-padded with zeros; high bytes truncated if too small).</summary>
+    string ToBytesBE(int outLen) {
+        string outb = calloc(outLen + 1, 1);
+        int i = 0;
+        while (i < outLen) {
+            int byteIndex = i;                       // 0 = most significant
+            int pos = outLen - 1 - byteIndex;        // byte position from LSB
+            int limbIdx = pos / 4;
+            int within = (pos % 4) * 8;
+            int v = (this.limb(limbIdx) >> within) & 255;
+            outb[byteIndex] = v;
+            i = i + 1;
+        }
+        return outb;
+    }
+
+    static int cmp(BigInt a, BigInt b) {
+        int na = a.count(); int nb = b.count();
+        if (na != nb) { if (na > nb) { return 1; } return -1; }
+        int i = na - 1;
+        while (i >= 0) {
+            int x = a.limb(i); int y = b.limb(i);
+            if (x != y) { if (x > y) { return 1; } return -1; }
+            i = i - 1;
+        }
+        return 0;
+    }
+
+    static BigInt add(BigInt a, BigInt b) {
+        int n = a.count(); if (b.count() > n) { n = b.count(); }
+        List<int> r = new List<int>();
+        int carry = 0; int i = 0;
+        while (i < n) {
+            int s = a.limb(i) + b.limb(i) + carry;
+            r.Add(s & 4294967295);
+            carry = Bits.Shr64(s, 32);
+            i = i + 1;
+        }
+        if (carry != 0) { r.Add(carry & 4294967295); }
+        return make(r);
+    }
+
+    // requires a >= b
+    static BigInt sub(BigInt a, BigInt b) {
+        List<int> r = new List<int>();
+        int borrow = 0; int i = 0; int n = a.count();
+        while (i < n) {
+            int s = a.limb(i) - b.limb(i) - borrow;
+            if (s < 0) { s = s + 4294967296; borrow = 1; } else { borrow = 0; }
+            r.Add(s & 4294967295);
+            i = i + 1;
+        }
+        return make(r);
+    }
+
+    static BigInt mul(BigInt a, BigInt b) {
+        int na = a.count(); int nb = b.count();
+        List<int> r = new List<int>();
+        int i = 0; while (i < na + nb) { r.Add(0); i = i + 1; }
+        i = 0;
+        while (i < na) {
+            int carry = 0; int j = 0; int ai = a.limb(i);
+            while (j < nb) {
+                int cur = (r[i+j] & 4294967295) + ai * b.limb(j) + carry;
+                r[i+j] = cur & 4294967295;
+                carry = Bits.Shr64(cur, 32);
+                j = j + 1;
+            }
+            r[i+nb] = (r[i+nb] & 4294967295) + carry;
+            i = i + 1;
+        }
+        return make(r);
+    }
+
+    // -n[0]^{-1} mod 2^32
+    static int montInv(int n0) {
+        int inv = 1; int i = 0;
+        while (i < 5) {
+            int t = (n0 * inv) & 4294967295;
+            t = (2 - t) & 4294967295;
+            inv = (inv * t) & 4294967295;
+            i = i + 1;
+        }
+        return (4294967296 - inv) & 4294967295;
+    }
+
+    // Montgomery product: a * b * R^{-1} mod n, R = 2^(32k). Requires a,b < n.
+    static BigInt montMul(BigInt a, BigInt b, BigInt n, int n0inv) {
+        int k = n.count();
+        List<int> t = new List<int>();
+        int z = 0; while (z < k + 2) { t.Add(0); z = z + 1; }
+        int i = 0;
+        while (i < k) {
+            int carry = 0; int bi = b.limb(i); int j = 0;
+            while (j < k) {
+                int cur = (t[j] & 4294967295) + a.limb(j) * bi + carry;
+                t[j] = cur & 4294967295;
+                carry = Bits.Shr64(cur, 32);
+                j = j + 1;
+            }
+            int cur2 = (t[k] & 4294967295) + carry;
+            t[k] = cur2 & 4294967295;
+            t[k+1] = Bits.Shr64(cur2, 32);
+
+            int m = ((t[0] & 4294967295) * n0inv) & 4294967295;
+            int c2 = (t[0] & 4294967295) + m * n.limb(0);
+            carry = Bits.Shr64(c2, 32);
+            j = 1;
+            while (j < k) {
+                int cur = (t[j] & 4294967295) + m * n.limb(j) + carry;
+                t[j-1] = cur & 4294967295;
+                carry = Bits.Shr64(cur, 32);
+                j = j + 1;
+            }
+            int c3 = (t[k] & 4294967295) + carry;
+            t[k-1] = c3 & 4294967295;
+            t[k] = (t[k+1] & 4294967295) + Bits.Shr64(c3, 32);
+            t[k+1] = 0;
+            i = i + 1;
+        }
+        List<int> rl = new List<int>();
+        int q = 0; while (q < k) { rl.Add(t[q] & 4294967295); q = q + 1; }
+        rl.Add(t[k] & 4294967295);
+        BigInt res = make(rl);
+        if (cmp(res, n) >= 0) { res = sub(res, n); }
+        return res;
+    }
+
+    // 2^(bits) mod n via repeated doubling
+    static BigInt pow2mod(int bits, BigInt n) {
+        BigInt x = one();
+        int i = 0;
+        while (i < bits) {
+            x = add(x, x);
+            if (cmp(x, n) >= 0) { x = sub(x, n); }
+            i = i + 1;
+        }
+        return x;
+    }
+
+    int bitLength() {
+        int hi = this.count() - 1;
+        int top = this.limb(hi);
+        int bits = hi * 32; int t = top;
+        while (t > 0) { bits = bits + 1; t = Bits.Shr64(t, 1); }
+        if (bits == 0) { return 1; }
+        return bits;
+    }
+
+    int getBit(int idx) {
+        int limbIdx = idx / 32; int within = idx % 32;
+        return Bits.Shr64(this.limb(limbIdx), within) & 1;
+    }
+
+    /// <summary>Modular exponentiation base^exp mod n (n must be odd). Requires
+    /// base &lt; n.</summary>
+    static BigInt ModPow(BigInt g, BigInt exp, BigInt n) {
+        if (n.isZero()) { return zero(); }
+        int k = n.count();
+        int n0inv = montInv(n.limb(0));
+        BigInt r2 = pow2mod(64 * k, n);            // R^2 mod n
+        BigInt baseM = montMul(g, r2, n, n0inv);    // base * R mod n
+        BigInt result = pow2mod(32 * k, n);         // R mod n (== 1 in Mont domain)
+        int bits = exp.bitLength();
+        int i = bits - 1;
+        while (i >= 0) {
+            result = montMul(result, result, n, n0inv);
+            if (exp.getBit(i) == 1) { result = montMul(result, baseM, n, n0inv); }
+            i = i - 1;
+        }
+        BigInt one1 = one();
+        return montMul(result, one1, n, n0inv);     // convert out of Mont domain
+    }
+
+    /// <summary>Modular inverse a^{-1} mod m via the binary extended GCD.
+    /// Returns zero if not invertible.</summary>
+    static BigInt ModInverse(BigInt a, BigInt m) {
+        // Fermat is not general (m may be non-prime); use extended Euclid on
+        // signed magnitudes represented as (value, negative?) pairs.
+        BigInt oldR = a; BigInt r = m;
+        BigInt oldS = one(); BigInt s = zero();
+        bool oldSneg = false; bool sneg = false;
+        while (!r.isZero()) {
+            List<BigInt> qr = divmod(oldR, r);
+            BigInt q = qr[0]; BigInt rem = qr[1];
+            oldR = r; r = rem;
+            // (oldS, s) = (s, oldS - q*s)
+            BigInt qs = mul(q, s);
+            BigInt ns; bool nsneg;
+            // oldS - q*s with signs
+            List<bool> sgn = new List<bool>();
+            ns = subSigned(oldS, oldSneg, qs, sneg, sgn);
+            nsneg = sgn[0];
+            oldS = s; oldSneg = sneg;
+            s = ns; sneg = nsneg;
+        }
+        if (cmp(oldR, one()) != 0) { return zero(); }   // gcd != 1
+        if (oldSneg) { return sub(m, mod(oldS, m)); }
+        return mod(oldS, m);
+    }
+
+    // signed subtraction a(sign aneg) - b(sign bneg); returns magnitude, sign in out[0]
+    static BigInt subSigned(BigInt a, bool aneg, BigInt b, bool bneg, List<bool> outNeg) {
+        if (aneg == bneg) {
+            // a - b when same sign: magnitude difference
+            int c = cmp(a, b);
+            if (c >= 0) { outNeg.Add(aneg); return sub(a, b); }
+            outNeg.Add(!aneg); return sub(b, a);
+        }
+        // different signs: a - b = a + |b| with a's sign
+        outNeg.Add(aneg);
+        return add(a, b);
+    }
+
+    // schoolbook long division: returns [quotient, remainder]
+    static List<BigInt> divmod(BigInt a, BigInt b) {
+        List<BigInt> outp = new List<BigInt>();
+        if (cmp(a, b) < 0) { outp.Add(zero()); outp.Add(a); return outp; }
+        BigInt q = zero(); BigInt rem = zero();
+        int bits = a.bitLength();
+        int i = bits - 1;
+        while (i >= 0) {
+            rem = add(rem, rem);                    // rem <<= 1
+            if (a.getBit(i) == 1) { rem = add(rem, one()); }
+            if (cmp(rem, b) >= 0) {
+                rem = sub(rem, b);
+                q = setBit(q, i);
+            }
+            i = i - 1;
+        }
+        outp.Add(q); outp.Add(rem);
+        return outp;
+    }
+
+    static BigInt mod(BigInt a, BigInt m) {
+        List<BigInt> qr = divmod(a, m);
+        return qr[1];
+    }
+
+    static BigInt setBit(BigInt x, int idx) {
+        int limbIdx = idx / 32; int within = idx % 32;
+        List<int> l = new List<int>();
+        int i = 0; int need = limbIdx + 1;
+        while (i < x.count() || i < need) { l.Add(x.limb(i)); i = i + 1; }
+        l[limbIdx] = (l[limbIdx] | (1 << within)) & 4294967295;
+        return make(l);
+    }
+}

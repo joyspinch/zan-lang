@@ -1,0 +1,204 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// A NaiveUI-style attached button group: several buttons welded together with
+/// shared borders (rounded only on the group's outer corners) and 1px dividers
+/// between segments. Horizontal or vertical. All colours come from the theme so
+/// it tracks skin changes automatically.
+///
+///   ButtonGroup g = ButtonGroup.Create(1);   // primary
+///   g.Add("Left"); g.Add("Middle"); g.Add("Right");
+///   int hit = g.Render(app, 40, 60);          // clicked index, or -1
+/// </summary>
+class ButtonGroup {
+    List<string> labels;
+    List<int> ids;
+    int btnType;
+    int btnStyle;
+    int size;
+    bool vertical;
+
+    static ButtonGroup Create(int type) {
+        ButtonGroup g = new ButtonGroup();
+        g.labels = new List<string>();
+        g.ids = new List<int>();
+        g.btnType = type;
+        g.btnStyle = 0;
+        g.size = 2;
+        g.vertical = false;
+        return g;
+    }
+
+    ButtonGroup Add(string label) {
+        labels.Add(label);
+        ids.Add(WidgetId.Next());
+        return this;
+    }
+
+    ButtonGroup Outline(bool o) { if (o) { btnStyle = 1; } else { btnStyle = 0; } return this; }
+    ButtonGroup Vertical(bool v) { vertical = v; return this; }
+    ButtonGroup SetSize(int s) { size = s; return this; }
+
+    int TypeColor(Theme t) {
+        if (btnType == 1) { return t.primary; }
+        if (btnType == 2) { return t.info; }
+        if (btnType == 3) { return t.success; }
+        if (btnType == 4) { return t.warning; }
+        if (btnType == 5) { return t.error; }
+        return t.textPrimary;
+    }
+
+    int Height(Theme t) {
+        if (size == 0) { return t.heightTiny; }
+        if (size == 1) { return t.heightSmall; }
+        if (size == 3) { return t.heightLarge; }
+        return t.heightMedium;
+    }
+
+    int FontSz(Theme t) {
+        if (size == 0) { return t.fontSizeTiny; }
+        if (size == 1) { return t.fontSizeSmall; }
+        if (size == 3) { return t.fontSizeLarge; }
+        return t.fontSizeMedium;
+    }
+
+    int Render(App app, int x, int y) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int h = Height(t);
+        int fs = FontSz(t);
+        int radius = t.borderRadiusMedium;
+        int tc = TypeColor(t);
+        int n = labels.Count;
+        int clicked = 0 - 1;
+
+        int cursor = 0;
+        int i = 0;
+        while (i < n) {
+            int id = ids[i];
+            int fsz = fs;
+            int segLen = Canvas.MeasureText(labels[i], fsz) + t.paddingMedium * 2;
+            int sx = x;
+            int sy = y;
+            int sw = segLen;
+            int sh = h;
+            if (vertical) { sy = y + cursor; sw = SegMaxW(t, fsz); }
+            else { sx = x + cursor; }
+
+            bool hovered = app.focus.IsHovered(id);
+            bool pressed = app.focus.IsPressed(id);
+
+            int fill = tc;
+            int fg = t.textInverse;
+            if (btnStyle == 1) {
+                fill = t.bgPrimary;
+                fg = tc;
+                if (btnType == 0) { fg = t.textPrimary; }
+                if (pressed) { fill = App.LerpColor(t.bgPrimary, tc, 55); }
+                else if (hovered) { fill = App.LerpColor(t.bgPrimary, tc, 28); }
+            } else {
+                if (btnType == 0) {
+                    fill = t.bgPrimary; fg = t.textPrimary;
+                    if (pressed) { fill = t.bgActive; }
+                    else if (hovered) { fill = t.bgHover; }
+                } else {
+                    if (pressed) { fill = App.LerpColor(tc, 4278190080, 150); }
+                    else if (hovered) { fill = App.LerpColor(tc, 4294967295, 150); }
+                }
+            }
+
+            bool first = (i == 0);
+            bool last = (i == n - 1);
+            FillSeg(c, sx, sy, sw, sh, radius, fill, first, last);
+
+            int textY = sy + (sh - Canvas.FontHeight(fsz)) / 2;
+            int textX = sx + (sw - Canvas.MeasureText(labels[i], fsz)) / 2;
+            c.DrawText(textX, textY, labels[i], fg, fsz);
+
+            if (btnStyle == 1) {
+                // Outer rounded border for the whole group, drawn per-segment
+                // with square inner edges via the same end-cap trick.
+                StrokeSeg(c, sx, sy, sw, sh, radius, tc, first, last, vertical);
+            }
+
+            // Divider between adjacent segments.
+            if (!last) {
+                int dv = App.LerpColor(tc, 4278190080, 60);
+                if (btnStyle == 1 || btnType == 0) { dv = t.borderPrimary; }
+                if (vertical) { c.FillRect(sx, sy + sh - 1, sw, 1, dv); }
+                else { c.FillRect(sx + sw - 1, sy, 1, sh, dv); }
+            }
+
+            app.hitTester.Register(HitRegion.Create(id, sx, sy, sw, sh, 0));
+            app.focus.RegisterFocusable(id);
+            if (Ui.Clicked(app, id)) { clicked = i; }
+
+            if (vertical) { cursor = cursor + sh; }
+            else { cursor = cursor + sw; }
+            i = i + 1;
+        }
+        return clicked;
+    }
+
+    int SegMaxW(Theme t, int fs) {
+        int m = 0;
+        int i = 0;
+        while (i < labels.Count) {
+            int w = Canvas.MeasureText(labels[i], fs) + t.paddingMedium * 2;
+            if (w > m) { m = w; }
+            i = i + 1;
+        }
+        return m;
+    }
+
+    /// Fill a segment, rounding only the group's outer corners.
+    void FillSeg(Canvas c, int x, int y, int w, int h, int r, int col,
+            bool first, bool last) {
+        if (first && last) {
+            c.FillRoundRect(x, y, w, h, r, col);
+            return;
+        }
+        if (vertical) {
+            if (first) {
+                c.FillRoundRect(x, y, w, h, r, col);
+                c.FillRect(x, y + h - r, w, r, col);
+            } else if (last) {
+                c.FillRoundRect(x, y, w, h, r, col);
+                c.FillRect(x, y, w, r, col);
+            } else {
+                c.FillRect(x, y, w, h, col);
+            }
+            return;
+        }
+        if (first) {
+            c.FillRoundRect(x, y, w, h, r, col);
+            c.FillRect(x + w - r, y, r, h, col);
+        } else if (last) {
+            c.FillRoundRect(x, y, w, h, r, col);
+            c.FillRect(x, y, r, h, col);
+        } else {
+            c.FillRect(x, y, w, h, col);
+        }
+    }
+
+    /// Outline stroke for a segment (outer corners rounded).
+    void StrokeSeg(Canvas c, int x, int y, int w, int h, int r, int col,
+            bool first, bool last, bool vert) {
+        if (first && last) { c.DrawRect(x, y, w, h, col, 1); return; }
+        // Top and bottom edges always present.
+        c.FillRect(x, y, w, 1, col);
+        c.FillRect(x, y + h - 1, w, 1, col);
+        if (!vert) {
+            if (first) { c.FillRect(x, y, 1, h, col); }
+            if (last) { c.FillRect(x + w - 1, y, 1, h, col); }
+        } else {
+            c.FillRect(x, y, 1, h, col);
+            c.FillRect(x + w - 1, y, 1, h, col);
+            if (first) { c.FillRect(x, y, w, 1, col); }
+            if (last) { c.FillRect(x, y + h - 1, w, 1, col); }
+        }
+    }
+}

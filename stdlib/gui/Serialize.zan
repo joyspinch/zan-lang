@@ -1,0 +1,205 @@
+using System;
+
+namespace Gui;
+
+/// A mutable index into the line list, so recursive ReadNode calls advance a
+/// single shared cursor (Zan has no ref/out parameters).
+class ParseCursor {
+    int pos;
+    ParseCursor() { pos = 0; }
+}
+
+/// Round-trips a Control tree to/from a compact text document, preserving the
+/// parent/child relationships (preorder with an explicit child count) plus each
+/// node's geometry and its widget-specific properties (via GetProp/SetProp).
+///
+/// One node per line, tab-separated:
+///   kind name dock padL padT padR padB gap mx my prefW prefH nChildren nProps
+///   [propKey propVal]* nEvents [evtName handlerId]* bindPath bindProp class
+/// Values are escaped so tabs/newlines/backslashes survive; children follow in
+/// preorder immediately after their parent.
+class Serialize {
+    static string Esc(string s) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") { r = r + "\\\\"; }
+            else if (ch == "\t") { r = r + "\\t"; }
+            else if (ch == "\n") { r = r + "\\n"; }
+            else { r = r + ch; }
+            i = i + 1;
+        }
+        return r;
+    }
+
+    static string Unesc(string s) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\" && i + 1 < s.Length) {
+                string n = s.Substring(i + 1, 1);
+                if (n == "n") { r = r + "\n"; }
+                else if (n == "t") { r = r + "\t"; }
+                else { r = r + n; }
+                i = i + 2;
+            } else {
+                r = r + ch;
+                i = i + 1;
+            }
+        }
+        return r;
+    }
+
+    static void WriteNode(Control c, List<string> lines) {
+        List<PropSpec> ps = c.Props();
+        string line = Serialize.Esc(c.Kind());
+        line = line + "\t" + Serialize.Esc(c.name);
+        line = line + "\t" + Convert.ToString(c.dock);
+        line = line + "\t" + Convert.ToString(c.padL);
+        line = line + "\t" + Convert.ToString(c.padT);
+        line = line + "\t" + Convert.ToString(c.padR);
+        line = line + "\t" + Convert.ToString(c.padB);
+        line = line + "\t" + Convert.ToString(c.gap);
+        line = line + "\t" + Convert.ToString(c.mx);
+        line = line + "\t" + Convert.ToString(c.my);
+        line = line + "\t" + Convert.ToString(c.prefW);
+        line = line + "\t" + Convert.ToString(c.prefH);
+        line = line + "\t" + Convert.ToString(c.children.Count);
+        line = line + "\t" + Convert.ToString(ps.Count);
+        int i = 0;
+        while (i < ps.Count) {
+            string k = ps[i].key;
+            line = line + "\t" + Serialize.Esc(k) + "\t" + Serialize.Esc(c.GetProp(k));
+            i = i + 1;
+        }
+        line = line + "\t" + Convert.ToString(c.evtKeys.Count);
+        int ei = 0;
+        while (ei < c.evtKeys.Count) {
+            line = line + "\t" + Serialize.Esc(c.evtKeys[ei])
+                + "\t" + Serialize.Esc(c.evtVals[ei]);
+            ei = ei + 1;
+        }
+        line = line + "\t" + Serialize.Esc(c.bindPath);
+        line = line + "\t" + Serialize.Esc(c.bindProp);
+        line = line + "\t" + Serialize.Esc(c.styleClass);
+        lines.Add(line);
+        int j = 0;
+        while (j < c.children.Count) {
+            Serialize.WriteNode(c.children[j], lines);
+            j = j + 1;
+        }
+    }
+
+    static string Save(Control root) {
+        List<string> lines = new List<string>();
+        Serialize.WriteNode(root, lines);
+        string outp = "";
+        int i = 0;
+        while (i < lines.Count) {
+            if (i > 0) { outp = outp + "\n"; }
+            outp = outp + lines[i];
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    static List<string> SplitLines(string s) {
+        List<string> outl = new List<string>();
+        int start = 0;
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == "\n") {
+                outl.Add(s.Substring(start, i - start));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        outl.Add(s.Substring(start, s.Length - start));
+        return outl;
+    }
+
+    static List<string> SplitFields(string line) {
+        List<string> outf = new List<string>();
+        int start = 0;
+        int i = 0;
+        while (i < line.Length) {
+            if (line.Substring(i, 1) == "\t") {
+                outf.Add(line.Substring(start, i - start));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        outf.Add(line.Substring(start, line.Length - start));
+        return outf;
+    }
+
+    static Control ReadNode(List<string> lines, ParseCursor cur) {
+        int idx = cur.pos;
+        cur.pos = idx + 1;
+        List<string> f = Serialize.SplitFields(lines[idx]);
+        string kind = Serialize.Unesc(f[0]);
+        Control c = ControlFactory.Create(kind);
+        c.name = Serialize.Unesc(f[1]);
+        c.dock = Convert.ToInt32(f[2]);
+        c.padL = Convert.ToInt32(f[3]);
+        c.padT = Convert.ToInt32(f[4]);
+        c.padR = Convert.ToInt32(f[5]);
+        c.padB = Convert.ToInt32(f[6]);
+        c.gap = Convert.ToInt32(f[7]);
+        c.mx = Convert.ToInt32(f[8]);
+        c.my = Convert.ToInt32(f[9]);
+        c.prefW = Convert.ToInt32(f[10]);
+        c.prefH = Convert.ToInt32(f[11]);
+        int childCount = Convert.ToInt32(f[12]);
+        int propCount = Convert.ToInt32(f[13]);
+        int p = 0;
+        int fi = 14;
+        while (p < propCount) {
+            string k = Serialize.Unesc(f[fi]);
+            string v = Serialize.Unesc(f[fi + 1]);
+            c.SetProp(k, v);
+            fi = fi + 2;
+            p = p + 1;
+        }
+        // Event bindings (appended after props; absent in older documents).
+        if (fi < f.Count) {
+            int evtCount = Convert.ToInt32(f[fi]);
+            fi = fi + 1;
+            int e = 0;
+            while (e < evtCount) {
+                string ek = Serialize.Unesc(f[fi]);
+                string ev = Serialize.Unesc(f[fi + 1]);
+                c.SetHandler(ek, ev);
+                fi = fi + 2;
+                e = e + 1;
+            }
+        }
+        if (fi < f.Count) {
+            c.bindPath = Serialize.Unesc(f[fi]);
+            fi = fi + 1;
+        }
+        if (fi < f.Count) {
+            c.bindProp = Serialize.Unesc(f[fi]);
+            fi = fi + 1;
+        }
+        if (fi < f.Count) {
+            c.styleClass = Serialize.Unesc(f[fi]);
+        }
+        int ch = 0;
+        while (ch < childCount) {
+            Control kid = Serialize.ReadNode(lines, cur);
+
+            c.Add(kid);
+            ch = ch + 1;
+        }
+        return c;
+    }
+
+    static Control Load(string text) {
+        List<string> lines = Serialize.SplitLines(text);
+        ParseCursor cur = new ParseCursor();
+        return Serialize.ReadNode(lines, cur);
+    }
+}

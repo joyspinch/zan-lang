@@ -1,0 +1,203 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// <summary>
+/// A self-managing vertical scroll container.
+///
+/// Create one and keep it across frames; it owns its scroll offset, consumes
+/// the mouse wheel while the pointer is inside, clips its content to the
+/// viewport, and draws (and drag-handles) a scrollbar only when the content
+/// overflows. Callers never register a scrollbar or track scroll state:
+///
+///   // once, next to your other state:
+///   ScrollView nav = ScrollView.Create();
+///
+///   // each frame:
+///   Rect area = Rect.Create(x, y, w, h);
+///   int dy = nav.Begin(app, area, contentHeight);
+///   // draw items at their natural Y minus dy; anything outside `area`
+///   // is clipped automatically.
+///   nav.End(app, area);
+/// </summary>
+class ScrollView {
+    int offset;
+    int viewH;
+    int contentH;
+    int barW;
+    bool edgeInset;
+    bool dragging;
+    int dragMouseY0;
+    int dragOffset0;
+
+    static ScrollView Create() {
+        ScrollView s = new ScrollView();
+        s.offset = 0;
+        s.viewH = 0;
+        s.contentH = 0;
+        s.barW = 8;
+        s.edgeInset = false;
+        s.dragging = false;
+        s.dragMouseY0 = 0;
+        s.dragOffset0 = 0;
+        return s;
+    }
+
+    /// Pull the scrollbar in from the right so it clears the window's resize
+    /// border (only needed for a view flush against the window edge, e.g. the
+    /// detail pane -- the nav list keeps the default flush position).
+    void SetEdgeInset(bool v) {
+        edgeInset = v;
+    }
+
+    /// Current scroll position in pixels.
+    int Offset() {
+        return offset;
+    }
+
+    /// Largest valid scroll offset for the last measured viewport/content.
+    int MaxOffset() {
+        int m = contentH - viewH;
+        if (m < 0) { m = 0; }
+        return m;
+    }
+
+    /// True when content is taller than the viewport (scrollbar is shown).
+    bool Overflowing() {
+        return contentH > viewH;
+    }
+
+    /// Programmatically scroll to a pixel offset (clamped next frame).
+    void ScrollTo(int y) {
+        offset = y;
+        if (offset < 0) { offset = 0; }
+    }
+
+    /// <summary>
+    /// Begin a frame: measure the viewport, apply the mouse wheel, clamp the
+    /// offset and clip drawing to `area`. Returns the number of pixels content
+    /// should be shifted up — subtract it from each item's natural Y.
+    /// </summary>
+    int Begin(App app, Rect area, int contentHeight) {
+        viewH = area.height;
+        contentH = contentHeight;
+
+        bool inside = app.mouseX >= area.x && app.mouseX < area.x + area.width
+            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+
+        if (inside) {
+            // Claim the wheel so the page (and any outer container) does not
+            // also scroll while the pointer is over this viewport.
+            app.CaptureWheel(area.x, area.y, area.width, area.height);
+            if (app.window.EventKind() == 13) {
+                int d = app.window.EventKeyCode();
+                int before = offset;
+                offset = offset - d * app.scrollSpeed / 120;
+                if (offset != before) { app.RequestRedraw(); }
+            }
+        }
+
+        int mo = contentH - viewH;
+        if (mo < 0) { mo = 0; }
+        if (offset > mo) { offset = mo; }
+        if (offset < 0) { offset = 0; }
+
+        app.canvas.PushClip(area.x, area.y, area.width, area.height);
+        return offset;
+    }
+
+    /// <summary>
+    /// End a frame: release the viewport clip and, when content overflows, draw
+    /// the scrollbar and process thumb dragging. Pass the same Rect as Begin.
+    /// </summary>
+    void End(App app, Rect area) {
+        app.canvas.PopClip();
+
+        if (contentH <= viewH) {
+            dragging = false;
+            return;
+        }
+
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        // A view flush against the window edge insets the bar past the ~8px
+        // resize border so a press starts a thumb drag instead of a window
+        // resize; other views keep the original 2px gap.
+        int bw = app.Scale(barW);
+        int inset = app.Scale(2);
+        if (edgeInset) { inset = app.Scale(10); }
+        int by = area.y;
+        int bh = area.height;
+        if (bh <= 0) { dragging = false; return; }
+
+        // Never let the bar spill past the left edge of a very narrow view.
+        if (bw > area.width) { bw = area.width; }
+        if (bw < 1) { bw = 1; }
+        int bx = area.x + area.width - bw - inset;
+        if (bx < area.x) { bx = area.x; }
+
+        int minThumb = app.Scale(24);
+        if (minThumb > bh) { minThumb = bh; }
+        int thumbH = bh * bh / contentH;
+        if (thumbH < minThumb) { thumbH = minThumb; }
+        if (thumbH > bh) { thumbH = bh; }
+        int mo = contentH - viewH;
+        if (mo < 0) { mo = 0; }
+        int travel = bh - thumbH;
+        if (travel < 0) { travel = 0; }
+
+        int thumbY = by;
+        if (mo > 0) { thumbY = by + offset * travel / mo; }
+        if (thumbY < by) { thumbY = by; }
+        if (thumbY + thumbH > by + bh) { thumbY = by + bh - thumbH; }
+
+        bool overThumb = app.mouseX >= bx && app.mouseX < bx + bw
+            && app.mouseY >= thumbY && app.mouseY < thumbY + thumbH;
+        bool overBar = app.mouseX >= bx && app.mouseX < bx + bw
+            && app.mouseY >= by && app.mouseY < by + bh;
+
+        if (!dragging && Ui.MousePressed(app) && overBar) {
+            // Clicking the track (not the thumb) jumps the thumb to the pointer
+            // and then drags from there -- so the whole bar is grabbable.
+            if (!overThumb && travel > 0) {
+                int want = app.mouseY - by - thumbH / 2;
+                int off = want * mo / travel;
+                if (off < 0) { off = 0; }
+                if (off > mo) { off = mo; }
+                offset = off;
+                app.RequestRedraw();
+            }
+            dragging = true;
+            dragMouseY0 = app.mouseY;
+            dragOffset0 = offset;
+        }
+
+        if (dragging) {
+            int dyPix = app.mouseY - dragMouseY0;
+            int off = dragOffset0;
+            if (travel > 0) { off = dragOffset0 + dyPix * mo / travel; }
+            if (off < 0) { off = 0; }
+            if (off > mo) { off = mo; }
+            if (off != offset) {
+                offset = off;
+                app.RequestRedraw();
+            }
+            if (Ui.MouseReleased(app)) { dragging = false; }
+            thumbY = by;
+            if (mo > 0) { thumbY = by + offset * travel / mo; }
+        }
+
+        int thumbColor = t.scrollbar;
+        if (dragging || overThumb) { thumbColor = t.scrollbarHover; }
+
+        int half = bw / 2;
+        // Clip the bar to the viewport so it can never paint past the view's
+        // bounds, whatever geometry the caller passed.
+        c.PushClip(area.x, area.y, area.width, area.height);
+        c.FillRoundRect(bx, by, bw, bh, half, t.bgTertiary);
+        c.FillRoundRect(bx, thumbY, bw, thumbH, half, thumbColor);
+        c.PopClip();
+    }
+}

@@ -7,7 +7,7 @@ namespace Gui.Widget;
 /// Types: default(0), primary(1), info(2), success(3), warning(4), error(5)
 /// Styles: solid(0), outline(1), text(2), dashed(3)
 /// Sizes: tiny(0), small(1), medium(2), large(3)
-class Button {
+class Button : Control {
     string text;
     string icon;
     int btnType;
@@ -17,18 +17,45 @@ class Button {
     bool round;
     bool circle;
     bool block;
+    bool loading;
+    bool ghost;
+    bool secondary;
+    int customColor;
+    int wid;
+    /// Fires on the frame the button is clicked (C#-style: `btn.Click += h;`).
+    /// The common bundle (Enter/Leave/MouseDown/...) is inherited as Control.On.
+    UiEvent Click;
+
+    /// Shared initialiser for both the immediate-mode factory (Create) and the
+    /// retained-mode constructor. Sets up the Control base (name = label, docks
+    /// to the top by default so an appended button auto-snaps) then the
+    /// button-specific state.
+    void InitButton(string label) {
+        this.InitControl(label, 1);
+        text = label;
+        icon = "";
+        btnType = 0;
+        btnStyle = 0;
+        size = 2;
+        disabled = false;
+        round = false;
+        circle = false;
+        block = false;
+        loading = false;
+        ghost = false;
+        secondary = false;
+        customColor = 0;
+        wid = WidgetId.Next();
+        Click = UiEvent.Create();
+    }
+
+    /// Retained-mode constructor: `Button save = new Button("Save");`
+    Button(string label) {
+        InitButton(label);
+    }
 
     static Button Create(string text) {
-        Button b = new Button();
-        b.text = text;
-        b.icon = "";
-        b.btnType = 0;
-        b.btnStyle = 0;
-        b.size = 2;
-        b.disabled = false;
-        b.round = false;
-        b.circle = false;
-        b.block = false;
+        Button b = new Button(text);
         return b;
     }
 
@@ -74,6 +101,35 @@ class Button {
         return b;
     }
 
+    /// Secondary: a subtly tinted fill with type-colored text.
+    static Button Secondary(string text, int type) {
+        Button b = Button.Typed(text, type);
+        b.secondary = true;
+        return b;
+    }
+
+    /// Ghost: transparent fill with a type-colored border + text (reads on any
+    /// background).
+    static Button Ghost(string text, int type) {
+        Button b = Button.Typed(text, type);
+        b.ghost = true;
+        return b;
+    }
+
+    /// Loading: shows an animated spinner and ignores clicks until cleared.
+    static Button Loading(string text, int type) {
+        Button b = Button.Typed(text, type);
+        b.loading = true;
+        return b;
+    }
+
+    /// Custom color: a solid button painted from an arbitrary ARGB base color.
+    static Button Colored(string text, int color) {
+        Button b = Button.Create(text);
+        b.customColor = color;
+        return b;
+    }
+
     static Button IconTyped(string iconName, int type) {
         Button b = Button.IconOnly(iconName);
         b.btnType = type;
@@ -94,6 +150,22 @@ class Button {
     Button SetCircle(bool c) { circle = c; return this; }
     Button SetBlock(bool b) { block = b; return this; }
     Button SetIcon(string i) { icon = i; return this; }
+    Button SetText(string s) { text = s; return this; }
+    Button SetLoading(bool l) { loading = l; return this; }
+    Button SetGhost(bool g) { ghost = g; return this; }
+    Button SetSecondary(bool s) { secondary = s; return this; }
+    Button SetColor(int col) { customColor = col; return this; }
+
+    /// The button's semantic accent color for its type (default falls back to
+    /// the primary text color so tinted/ghost/text styles still read).
+    int TypeColor(Theme t) {
+        if (btnType == 1) { return t.primary; }
+        if (btnType == 2) { return t.info; }
+        if (btnType == 3) { return t.success; }
+        if (btnType == 4) { return t.warning; }
+        if (btnType == 5) { return t.error; }
+        return t.textPrimary;
+    }
 
     int GetHeight(Theme t) {
         if (size == 0) { return t.heightTiny; }
@@ -110,7 +182,7 @@ class Button {
     }
 
     int Render(App app, int x, int y, int w) {
-        int id = app.focus.AllocId();
+        int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
 
@@ -163,13 +235,66 @@ class Button {
         }
 
         if (disabled) {
-            bgColor = t.bgDisabled;
-            fgColor = t.textDisabled;
-            borderColor = t.borderSecondary;
+            // A disabled button keeps a clearly visible muted, filled shape in
+            // both light and dark themes. bgDisabled/borderSecondary blend into
+            // the surrounding panel and read as an empty outline, so fill with
+            // the (opaque) border-grey and derive a readable-but-muted text and
+            // a subtle edge from it -- guaranteed contrast against any page.
+            bgColor = t.borderPrimary;
+            fgColor = App.LerpColor(t.borderPrimary, t.textPrimary, 110);
+            borderColor = App.LerpColor(t.borderPrimary, t.textPrimary, 45);
         }
 
-        // Render by style
-        if (btnStyle == 1) {
+        int tc = TypeColor(t);
+
+        // Skin shells drawn BEHIND the button fill. Neo-brutalism casts a solid
+        // offset drop shadow; neumorphism lays a light top-left + dark
+        // bottom-right pair so the same-coloured control reads as raised (or
+        // inset while pressed).
+        if (t.brutal == 1) {
+            int boff = app.Scale(4);
+            c.FillRoundRect(x + boff, y + boff, w, h, radius, t.shadowColor);
+        } else if (t.neu == 1 && !disabled) {
+            int noff = app.Scale(4);
+            int lite = App.LerpColor(t.bgPrimary, 4294967295, 70);
+            int dark = App.LerpColor(t.bgPrimary, 4278190080, 45);
+            if (pressed) {
+                c.FillRoundRect(x - noff, y - noff, w, h, radius, dark);
+                c.FillRoundRect(x + noff, y + noff, w, h, radius, lite);
+            } else {
+                c.FillRoundRect(x - noff, y - noff, w, h, radius, lite);
+                c.FillRoundRect(x + noff, y + noff, w, h, radius, dark);
+            }
+        }
+
+        // Modifier variants override the type/style palette resolved above.
+        // Custom color: solid button from an arbitrary base color.
+        if (customColor != 0 && !disabled) {
+            bgColor = customColor;
+            fgColor = t.textInverse;
+            if (pressed) { bgColor = App.LerpColor(customColor, 4278190080, 150); }
+            else if (hovered) { bgColor = App.LerpColor(customColor, 4294967295, 150); }
+            borderColor = bgColor;
+        }
+
+        // Render by style / variant
+        if ((ghost || secondary || customColor != 0) && !disabled) {
+            if (customColor != 0) {
+                c.FillRoundRect(x, y, w, h, radius, bgColor);
+            } else if (secondary) {
+                int sbg = App.LerpColor(t.bgPrimary, tc, 90);
+                if (pressed) { sbg = App.LerpColor(t.bgPrimary, tc, 200); }
+                else if (hovered) { sbg = App.LerpColor(t.bgPrimary, tc, 150); }
+                c.FillRoundRect(x, y, w, h, radius, sbg);
+                fgColor = tc;
+            } else {
+                // Ghost: transparent fill, type-colored border + text.
+                if (pressed) { c.FillRoundRect(x, y, w, h, radius, Chart.WithAlpha(tc, 55)); }
+                else if (hovered) { c.FillRoundRect(x, y, w, h, radius, Chart.WithAlpha(tc, 30)); }
+                c.DrawRect(x, y, w, h, tc, 1);
+                fgColor = tc;
+            }
+        } else if (btnStyle == 1) {
             // Outline
             int outlineColor = borderColor;
             if (!disabled && btnType > 0) { fgColor = outlineColor; }
@@ -184,26 +309,65 @@ class Button {
             if (hovered && !disabled) { c.FillRoundRect(x, y, w, h, radius, t.bgHover); }
             if (pressed && !disabled) { c.FillRoundRect(x, y, w, h, radius, t.bgActive); }
         } else if (btnStyle == 3) {
-            // Dashed outline
-            c.FillRoundRect(x, y, w, h, radius, t.bgPrimary);
-            c.DrawRect(x, y, w, h, borderColor, 1);
+            // Dashed outline: same palette as the outline style (transparent
+            // fill + type-colored text/edge). The dark textInverse resolved for
+            // solid types is unreadable on the light fill, so adopt the border
+            // color for the label just like the outline branch does.
+            int dbg = t.bgPrimary;
+            if (!disabled && btnType > 0) { fgColor = borderColor; }
+            if (hovered && !disabled) { dbg = t.bgHover; }
+            if (pressed && !disabled) { dbg = t.bgActive; }
+            c.FillRoundRect(x, y, w, h, radius, dbg);
+            // Real dashed edge so the "dashed" style is visibly distinct from
+            // the solid outline: short segments stepped along each side.
+            int dl = app.Scale(6);
+            int dg = app.Scale(4);
+            int dstep = dl + dg;
+            if (dstep < 1) { dstep = 1; }
+            int hx = x;
+            while (hx < x + w) {
+                int seg = dl;
+                if (hx + seg > x + w) { seg = x + w - hx; }
+                c.FillRect(hx, y, seg, 1, borderColor);
+                c.FillRect(hx, y + h - 1, seg, 1, borderColor);
+                hx = hx + dstep;
+            }
+            int vy = y;
+            while (vy < y + h) {
+                int seg = dl;
+                if (vy + seg > y + h) { seg = y + h - vy; }
+                c.FillRect(x, vy, 1, seg, borderColor);
+                c.FillRect(x + w - 1, vy, 1, seg, borderColor);
+                vy = vy + dstep;
+            }
         } else {
             // Solid (default)
             c.FillRoundRect(x, y, w, h, radius, bgColor);
             if (btnType == 0) { c.DrawRect(x, y, w, h, borderColor, 1); }
         }
 
-        // Content (icon + text), centered. Button glyphs read ~1.33x the text
-        // size (NaiveUI proportion) so icon buttons don't look undersized.
+        // Neo-brutalism outlines every button with a thick hard black border.
+        if (t.brutal == 1) {
+            c.DrawRect(x, y, w, h, t.borderPrimary, t.borderWidth);
+        }
+
+        // Content (icon/spinner + text), centered. Button glyphs read ~1.33x
+        // the text size (NaiveUI proportion) so icon buttons don't look small.
         int contentW = 0;
         int iconSize = fontSize * 4 / 3;
-        if (icon != "") { contentW = contentW + iconSize; }
-        if (icon != "" && text != "") { contentW = contentW + t.gapSmall; }
+        bool lead = loading || icon != "";
+        if (lead) { contentW = contentW + iconSize; }
+        if (lead && text != "") { contentW = contentW + t.gapSmall; }
         if (text != "") { contentW = contentW + Canvas.MeasureText(text, fontSize); }
 
         int cx = x + (w - contentW) / 2;
         int iconY = y + (h - iconSize) / 2;
-        if (icon != "") {
+        if (loading) {
+            c.PushClip(x, y, w, h);
+            Spin.Render(app, cx + iconSize / 2, y + h / 2, iconSize / 2, fgColor);
+            c.PopClip();
+            cx = cx + iconSize + t.gapSmall;
+        } else if (icon != "") {
             Icon.Draw(c, icon, cx, iconY, iconSize, fgColor);
             cx = cx + iconSize + t.gapSmall;
         }
@@ -212,12 +376,100 @@ class Button {
             c.DrawText(cx, textY, text, fgColor, fontSize);
         }
 
-        app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+        if (!disabled && !loading) {
+            app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+            app.focus.RegisterFocusable(id);
+            bool fire = Ui.Clicked(app, id);
+            // Keyboard activation: Enter/Space on the focused button.
+            if (Ui.Focused(app, id) && app.window.EventKind() == 4) {
+                int kc = app.window.EventKeyCode();
+                if (kc == 13 || kc == 32) { fire = true; app.RequestRedraw(); }
+            }
+            Click.RaiseIf(fire);
+            On.Fire(app, id);
+        }
         return id;
     }
 
     static bool WasClicked(App app, int id) {
         if (app.window.EventKind() != 3) { return false; }
         return app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+    }
+
+    // --- Designer / serialization model ---
+
+    override string Kind() { return "Button"; }
+
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("text", "Text"));
+        ps.Add(PropSpec.Text("icon", "Icon"));
+        PropSpec ty = PropSpec.Enum("type", "Type", new List<string>());
+        ty.Option("default"); ty.Option("primary"); ty.Option("info");
+        ty.Option("success"); ty.Option("warning"); ty.Option("error");
+        ps.Add(ty);
+        PropSpec st = PropSpec.Enum("style", "Style", new List<string>());
+        st.Option("solid"); st.Option("outline"); st.Option("text"); st.Option("dashed");
+        ps.Add(st);
+        ps.Add(PropSpec.Bool("disabled", "Disabled"));
+        ps.Add(PropSpec.Bool("round", "Round"));
+        ps.Add(PropSpec.Bool("secondary", "Secondary"));
+        ps.Add(PropSpec.Bool("ghost", "Ghost"));
+        ps.Add(PropSpec.Bool("loading", "Loading"));
+        return ps;
+    }
+
+    override string GetProp(string key) {
+        if (key == "text") { return text; }
+        if (key == "icon") { return icon; }
+        if (key == "type") { return Convert.ToString(btnType); }
+        if (key == "style") { return Convert.ToString(btnStyle); }
+        if (key == "disabled") { if (disabled) { return "true"; } return "false"; }
+        if (key == "round") { if (round) { return "true"; } return "false"; }
+        if (key == "secondary") { if (secondary) { return "true"; } return "false"; }
+        if (key == "ghost") { if (ghost) { return "true"; } return "false"; }
+        if (key == "loading") { if (loading) { return "true"; } return "false"; }
+        return "";
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "text") { text = val; name = val; }
+        else if (key == "icon") { icon = val; }
+        else if (key == "type") { btnType = Convert.ToInt32(val); }
+        else if (key == "style") { btnStyle = Convert.ToInt32(val); }
+        else if (key == "disabled") { disabled = (val == "true"); }
+        else if (key == "round") { round = (val == "true"); }
+        else if (key == "secondary") { secondary = (val == "true"); }
+        else if (key == "ghost") { ghost = (val == "true"); }
+        else if (key == "loading") { loading = (val == "true"); }
+    }
+
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Click");
+        return e;
+    }
+
+    // --- Retained-mode hooks (Control) ---
+
+    /// Preferred size from the theme + content, so docking/auto-layout can size
+    /// the button without hand-computed coordinates.
+    override void OnMeasure(App app) {
+        Theme t = app.theme;
+        int fontSize = GetFontSize(t);
+        prefH = GetHeight(t);
+        int textW = 0;
+        if (text != "") { textW = Canvas.MeasureText(text, fontSize); }
+        int iconW = 0;
+        if (icon != "") { iconW = fontSize * 4 / 3 + t.gapSmall; }
+        int w = textW + iconW + t.paddingMedium * 2;
+        if (circle) { w = prefH; }
+        prefW = w;
+    }
+
+    /// Retained paint reuses the immediate renderer at the resolved bounds, so
+    /// drawing, hit-testing and the Click event all stay in one place.
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw);
     }
 }

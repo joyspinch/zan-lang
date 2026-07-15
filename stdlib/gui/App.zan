@@ -24,6 +24,27 @@ class App {
     int sidebarContentHeight;
     bool isDark;
     bool isTopmost;
+    bool showThemeButton;
+    bool showPinButton;
+    bool showMinimizeButton;
+    bool showMaximizeButton;
+    // Title-bar theme picker. When themeNames is non-empty the theme caption
+    // button opens a dropdown menu listing these presets (a "color" glyph)
+    // instead of toggling dark/light; themeMenuChange fires on a new pick and
+    // themeMenuModel carries the chosen index. The option ids live in a stable
+    // high WidgetId block so they never collide with the caption button ids.
+    List<string> themeNames;
+    SignalInt themeMenuModel;
+    SignalBool themeMenuOpen;
+    SignalInt themeMenuScroll;
+    int themeMenuBaseId;
+    UiEvent themeMenuChange;
+    // Built-in skin switching: when autoSkins is on the title-bar theme button
+    // is a menu of Theme.PresetNames and App applies the picked preset itself
+    // (no per-app handler). appliedSkin is the index last applied so RenderChrome
+    // detects a new pick each frame. Every window gets this by default.
+    bool autoSkins;
+    int appliedSkin;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
     // frame — e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
@@ -32,6 +53,44 @@ class App {
     int wheelCapY;
     int wheelCapW;
     int wheelCapH;
+    bool blocksInputBelow;
+    bool inputBlockPrevious;
+
+    // --- Event delegation ---
+    // Target of the current mouse event, resolved once per event in
+    // ProcessEvent against the PREVIOUS frame's complete hit regions (which
+    // already include popups/overlays on top). Widgets ask Ui.Clicked/Pressed
+    // whether they are this target, so a click is delivered to exactly one
+    // widget — the top-most one under the pointer — instead of every widget
+    // that happens to re-read the raw event during its own render.
+    int clickTargetId;
+    int pressTargetId;
+    // Double-click / double-tap detection. lastClickId + lastClickMs record the
+    // most recent completed click; doubleClickNow is a one-frame flag set when a
+    // second click lands on the same id within the double-click window. Read via
+    // DoubleClickNow() / Ui.DoubleClicked.
+    int lastClickId;
+    int lastClickMs;
+    bool doubleClickNow;
+    // Touch/pointer gesture state. On a press we snapshot the target id, the
+    // pointer position and the wall-clock time; on release we derive a swipe
+    // direction from the travel, and while held PollLongPress() reports a
+    // long-press once the hold passes the threshold without much movement.
+    // Single-finger touch arrives as a synthesized mouse sequence, so these
+    // work on touchscreens without any runtime change (multi-touch/pinch would
+    // need real WM_TOUCH / XInput2 support in the C runtime).
+    int pressStartX;
+    int pressStartY;
+    int pressStartMs;
+    int pressStartId;
+    bool longPressFired;
+    int swipeDir;
+    // Deferred overlay popups (Select/SelectBox/Dropdown/Menu option lists).
+    // They run AFTER the main content pass so they both paint above it and
+    // register their hit regions last (making them the top-most target). Data,
+    // not callbacks, because Zan delegates can't capture locals / bind `this`.
+    // Collected during a frame, drained by RunOverlays, cleared in BeginFrame.
+    List<OverlayPopup> overlays;
 
     // --- Animation clock ---
     // Per-key tween state. Widgets call AnimTo()/AnimPx() each frame with a
@@ -50,6 +109,22 @@ class App {
     int nowMs;
     int lastFrameMs;
     int lastPresentMs;
+    // Wall-clock deadline (ms) at which a *throttled* animation wants its next
+    // repaint, or -1 when none is pending. Looping animations (e.g. a loading
+    // spinner) register here via RequestAnimationFrame instead of
+    // RequestRedraw, so the event loop sleeps between frames and repaints them
+    // at a low cadence rather than busy-rendering the whole page at 60fps.
+    int animNextMs;
+
+    // True when the current frame processed a real OS event (input, resize,
+    // etc). A pure animation repaint (spinner tick, easing step) wakes with no
+    // event, leaving the backdrop behind glass unchanged so its blur/wallpaper
+    // can be served from cache. See BackdropDirty().
+    bool backdropDirty;
+
+    // Per-frame counter handing each glass surface a stable blur-cache slot in
+    // draw order. Reset in BeginFrame; incremented by NextBlurSlot().
+    int blurSlotSeq;
 
     static App Create(string title, int width, int height) {
         App app = new App();
@@ -75,8 +150,34 @@ class App {
         app.wheelCapY = 0;
         app.wheelCapW = 0;
         app.wheelCapH = 0;
+        app.blocksInputBelow = false;
+        app.inputBlockPrevious = false;
+        app.clickTargetId = -1;
+        app.pressTargetId = -1;
+        app.lastClickId = -1;
+        app.lastClickMs = 0;
+        app.doubleClickNow = false;
+        app.pressStartX = 0;
+        app.pressStartY = 0;
+        app.pressStartMs = 0;
+        app.pressStartId = -1;
+        app.longPressFired = false;
+        app.swipeDir = 0;
+        app.overlays = new List<OverlayPopup>();
         app.isDark = false;
         app.isTopmost = false;
+        app.showThemeButton = true;
+        app.showPinButton = true;
+        app.showMinimizeButton = true;
+        app.showMaximizeButton = true;
+        app.themeNames = new List<string>();
+        app.themeMenuModel = SignalInt.Create(0);
+        app.themeMenuOpen = SignalBool.Create(false);
+        app.themeMenuScroll = SignalInt.Create(0);
+        app.themeMenuBaseId = 0;
+        app.themeMenuChange = UiEvent.Create();
+        app.autoSkins = false;
+        app.appliedSkin = -1;
         app.animKeys = new List<int>();
         app.animVals = new List<int>();
         app.animTarget = new List<int>();
@@ -86,7 +187,18 @@ class App {
         app.nowMs = Window.GetTickMs();
         app.lastFrameMs = app.nowMs;
         app.lastPresentMs = 0;
+        app.animNextMs = -1;
+        app.backdropDirty = true;
+        app.blurSlotSeq = 0;
         app.canvas = Canvas.Create(width, height);
+        // Reset the UI-thread dispatch queue up front (on the UI thread) so
+        // App.Post is safe the moment any background worker is spawned.
+        Dispatcher.Init();
+        // Every window gets the built-in skin picker in its title bar by
+        // default (light window -> "Light" preselected). The id block is
+        // allocated now, before any app WidgetId.Mark, so option ids stay
+        // stable. Apps that persisted a skin just call EnableSkins(index).
+        app.EnableSkins(1);
         return app;
     }
 
@@ -94,6 +206,7 @@ class App {
         App app = App.Create(title, width, height);
         app.theme = Theme.Dark();
         app.isDark = true;
+        app.EnableSkins(0);
         return app;
     }
 
@@ -102,6 +215,182 @@ class App {
         isDark = dark;
         if (dark) { theme = Theme.Dark(); } else { theme = Theme.Light(); }
         theme.ScaleByDpi(dpiScale);
+        needsRedraw = true;
+    }
+
+    /// Installs an arbitrary theme preset (re-applying DPI scaling). `dark`
+    /// controls dark-appropriate chrome details (caption hover wash, etc.).
+    void ApplyTheme(Theme t, bool dark) {
+        isDark = dark;
+        theme = t;
+        theme.ScaleByDpi(dpiScale);
+        needsRedraw = true;
+    }
+
+    /// Turns the title-bar theme button into the built-in skin picker
+    /// (Theme.PresetNames) and has App apply the chosen preset itself — no
+    /// per-app change handler or switch statement. Every window enables this by
+    /// default (see Create); call again to preselect a persisted skin. `index`
+    /// must be the skin whose theme is already active so the first frame does
+    /// not re-apply it. Idempotent: the stable id block is allocated once.
+    void EnableSkins(int index) {
+        autoSkins = true;
+        themeNames = Theme.PresetNames();
+        if (themeMenuBaseId == 0) {
+            themeMenuBaseId = WidgetId.Block(themeNames.Count);
+        }
+        themeMenuModel.Set(index);
+        appliedSkin = index;
+        showThemeButton = true;
+        window.SetCaptionButtons(ChromeButtonCount());
+        needsRedraw = true;
+    }
+
+    void EnableSkins() { this.EnableSkins(0); }
+
+    /// Applies built-in skin `i` (Theme.PresetAt) with its dark-chrome flag and
+    /// records it as the active skin so the picker stays in sync.
+    void ApplySkin(int i) {
+        this.ApplyTheme(Theme.PresetAt(i), Theme.PresetDark(i));
+        themeMenuModel.Set(i);
+        appliedSkin = i;
+    }
+
+    /// When the built-in skin picker's selection changed (user pick), applies
+    /// it. Called each frame start so content and chrome repaint together.
+    void SyncSkin() {
+        if (autoSkins && themeMenuModel.Get() != appliedSkin) {
+            this.ApplySkin(themeMenuModel.Get());
+        }
+    }
+
+    // ---- themed window backdrop (built-in, shared by every window) ---------
+    // The wallpaper that makes gradient/glass/neon skins read as real: a
+    // vertical gradient plus soft colour blobs the frosted panels blur. Lives
+    // in the framework so the IDE, the gallery and any window render identical
+    // skins — apps just call RenderBackground behind their content.
+
+    /// One soft wallpaper glow: nested translucent disks feathering to a bright
+    /// centre (no hard rim), giving the backdrop blur real colour to soften.
+    void BackdropBlob(int cx, int cy, int r, int cr, int cg, int cb) {
+        Canvas c = canvas;
+        c.FillCircle(cx, cy, r, Theme.Rgba(cr, cg, cb, 28));
+        c.FillCircle(cx, cy, r * 72 / 100, Theme.Rgba(cr, cg, cb, 36));
+        c.FillCircle(cx, cy, r * 46 / 100, Theme.Rgba(cr, cg, cb, 48));
+        c.FillCircle(cx, cy, r * 24 / 100, Theme.Rgba(cr, cg, cb, 58));
+    }
+
+    /// A soft glow coloured from a packed ARGB theme accent.
+    void BackdropDrift(int cx, int cy, int r, int color) {
+        int cr = (color / 65536) % 256;
+        int cg = (color / 256) % 256;
+        int cb = color % 256;
+        this.BackdropBlob(cx, cy, r, cr, cg, cb);
+    }
+
+    /// Colour blobs from the theme's own accents over the vertical gradient
+    /// (non-glass gradient presets) so the ramp reads as a wallpaper.
+    void BackdropGradientWallpaper(int ax, int ay, int aw, int ah) {
+        Theme t = theme;
+        int r = this.Scale(340);
+        this.BackdropDrift(ax + aw * 20 / 100, ay + ah * 24 / 100, r, t.primary);
+        this.BackdropDrift(ax + aw * 74 / 100, ay + ah * 18 / 100, r, t.info);
+        this.BackdropDrift(ax + aw * 82 / 100, ay + ah * 72 / 100, r, t.success);
+        this.BackdropDrift(ax + aw * 30 / 100, ay + ah * 84 / 100, r, t.error);
+    }
+
+    /// iOS-style multi-colour wallpaper for the frosted-glass presets.
+    void BackdropGlassWallpaper(int ax, int ay, int aw, int ah) {
+        this.BackdropBlob(ax + aw * 14 / 100, ay + ah * 20 / 100,
+            this.Scale(320), 128, 96, 245);
+        this.BackdropBlob(ax + aw * 40 / 100, ay + ah * 34 / 100,
+            this.Scale(300), 236, 120, 175);
+        this.BackdropBlob(ax + aw * 78 / 100, ay + ah * 16 / 100,
+            this.Scale(320), 96, 156, 255);
+        this.BackdropBlob(ax + aw * 62 / 100, ay + ah * 72 / 100,
+            this.Scale(340), 240, 112, 196);
+        this.BackdropBlob(ax + aw * 30 / 100, ay + ah * 86 / 100,
+            this.Scale(300), 96, 222, 208);
+        this.BackdropBlob(ax + aw * 90 / 100, ay + ah * 58 / 100,
+            this.Scale(280), 156, 120, 250);
+    }
+
+    /// Paints the active skin's window backdrop into [x,y,w,h]: a gradient +
+    /// soft colour blobs for gradient/glass presets (so frosted panels blur
+    /// real colour), otherwise a flat bgPrimary fill. Cached per redraw —
+    /// animation-only frames restore the pixels with one copy instead of
+    /// repainting the (expensive) blobs. `slot` is a snapshot cache slot the
+    /// caller reserves for its backdrop.
+    void RenderBackground(int x, int y, int w, int h, int slot) {
+        Canvas c = canvas;
+        Theme t = theme;
+        if (t.gradient != 0) {
+            bool restored = false;
+            if (!this.BackdropDirty()) {
+                restored = c.RestoreRect(x, y, w, h, slot);
+            }
+            if (!restored) {
+                c.FillVGrad(x, y, w, h, t.bgGradTop, t.bgGradBottom);
+                if (t.glass != 0) {
+                    this.BackdropGlassWallpaper(x, y, w, h);
+                } else {
+                    this.BackdropGradientWallpaper(x, y, w, h);
+                }
+                c.SnapshotRect(x, y, w, h, slot);
+            }
+        } else {
+            c.FillRect(x, y, w, h, t.bgPrimary);
+        }
+    }
+
+    int ChromeButtonCount() {
+        int count = 1;
+        if (showThemeButton) { count = count + 1; }
+        if (showPinButton) { count = count + 1; }
+        if (showMinimizeButton) { count = count + 1; }
+        if (showMaximizeButton) { count = count + 1; }
+        return count;
+    }
+
+    void SetChromeButtons(
+        bool themeButton,
+        bool pinButton,
+        bool minimizeButton,
+        bool maximizeButton
+    ) {
+        showThemeButton = themeButton;
+        showPinButton = pinButton;
+        showMinimizeButton = minimizeButton;
+        showMaximizeButton = maximizeButton;
+        window.SetCaptionButtons(ChromeButtonCount());
+        needsRedraw = true;
+    }
+
+    /// Turns the title-bar theme caption button into a dropdown menu that lists
+    /// `names` (e.g. skin presets) instead of a plain dark/light toggle, and
+    /// keeps it in the ORIGINAL caption-button slot so it stays non-draggable.
+    /// Add a handler to the returned event to react to a pick, then read
+    /// ThemeMenuIndex(). Call once, before WidgetId.Mark(), so the option-id
+    /// block is stable for the app's lifetime.
+    UiEvent SetThemeMenu(List<string> names, int index) {
+        themeNames = names;
+        themeMenuModel.Set(index);
+        themeMenuBaseId = WidgetId.Block(names.Count);
+        showThemeButton = true;
+        window.SetCaptionButtons(ChromeButtonCount());
+        needsRedraw = true;
+        return themeMenuChange;
+    }
+
+    /// True when the title-bar theme button acts as a preset menu.
+    bool ThemeMenuMode() { return themeNames.Count > 0; }
+
+    /// Index currently selected in the title-bar theme menu.
+    int ThemeMenuIndex() { return themeMenuModel.Get(); }
+
+    /// Sync the menu selection without firing the change event (deep links).
+    void SetThemeMenuIndex(int i) {
+        themeMenuModel.Set(i);
         needsRedraw = true;
     }
 
@@ -120,9 +409,22 @@ class App {
         captionBtnW = Window.CaptionButtonWidth();
         if (titlebarH < 24) { titlebarH = Scale(32); }
         if (captionBtnW < 24) { captionBtnW = Scale(46); }
-        // Chrome draws 5 caption buttons (theme, pin, min, max, close); tell the
-        // runtime so the draggable title-bar region excludes all of them.
-        window.SetCaptionButtons(5);
+        window.SetCaptionButtons(ChromeButtonCount());
+    }
+
+    /// Shows the window and runs the standard event loop until it closes,
+    /// painting just the title-bar chrome each frame. A one-call convenience
+    /// for simple windows; to draw your own content, drive the
+    /// BeginFrame / RenderChrome / PresentFrame loop directly instead.
+    void Run(string title) {
+        Show();
+        while (isRunning) {
+            if (!ProcessEvent()) { break; }
+            if (!needsRedraw) { continue; }
+            BeginFrame();
+            RenderChrome(title);
+            PresentFrame();
+        }
     }
 
     /// Height reserved by the custom title bar; content should start below it.
@@ -139,7 +441,17 @@ class App {
         int W = c.Width();
         int hbar = titlebarH;
 
-        c.FillRect(0, 0, W, hbar, t.bgSecondary);
+        // Under the frosted-glass skin the title bar frosts the content behind
+        // it too (blur + translucent themed tint + faint white sheen), so the
+        // chrome matches the glass body instead of sitting on a flat opaque bar.
+        if (t.glass != 0) {
+            c.BlurRectCached(0, 0, W, hbar, Scale(22),
+                NextBlurSlot(), BackdropDirty());
+            c.FillRect(0, 0, W, hbar, 200 * 16777216 + (t.bgSecondary % 16777216));
+            c.FillRect(0, 0, W, hbar, 26 * 16777216 + (t.textPrimary % 16777216));
+        } else {
+            c.FillRect(0, 0, W, hbar, t.bgSecondary);
+        }
         c.FillRect(0, hbar - 1, W, 1, t.divider);
 
         int pad = t.paddingLarge;
@@ -148,13 +460,17 @@ class App {
         int txtY = (hbar - Canvas.FontHeight(t.fontSizeMedium)) / 2;
         c.DrawText(pad + brand + t.gapSmall, txtY, title, t.textPrimary, t.fontSizeMedium);
 
-        // Right cluster, left->right: theme, pin, minimize, maximize, close.
         int bw = captionBtnW;
-        int themeX = W - bw * 5;
-        int pinX = W - bw * 4;
-        int minX = W - bw * 3;
-        int maxX = W - bw * 2;
         int closeX = W - bw;
+        int nextX = closeX;
+        int maxX = -bw;
+        int minX = -bw;
+        int pinX = -bw;
+        int themeX = -bw;
+        if (showMaximizeButton) { nextX = nextX - bw; maxX = nextX; }
+        if (showMinimizeButton) { nextX = nextX - bw; minX = nextX; }
+        if (showPinButton) { nextX = nextX - bw; pinX = nextX; }
+        if (showThemeButton) { nextX = nextX - bw; themeX = nextX; }
 
         int themeId = focus.AllocId();
         int pinId = focus.AllocId();
@@ -168,78 +484,198 @@ class App {
         bool maxH = focus.IsHovered(maxId);
         bool closeH = focus.IsHovered(closeId);
 
-        // Windows-accurate caption hovers: a neutral grey overlay for the
-        // ordinary buttons (subtle white wash in dark mode, subtle black wash in
-        // light mode) and the signature red for close.
-        int capHover = 0xFFE9E9E9;
-        if (isDark) { capHover = 0xFF3D3D3D; }
+        // Caption hover wash follows the active theme's own hover token so the
+        // window controls stay coordinated with every skin (a translucent wash
+        // over glass/gradient, the themed grey on light/dark) instead of a
+        // fixed grey. Close keeps the signature Windows red.
+        int capHover = t.bgHover;
         int closeRed = 0xFFE81123;
-        if (themeH) { c.FillRect(themeX, 0, bw, hbar, capHover); }
-        if (pinH) { c.FillRect(pinX, 0, bw, hbar, capHover); }
-        if (minH) { c.FillRect(minX, 0, bw, hbar, capHover); }
-        if (maxH) { c.FillRect(maxX, 0, bw, hbar, capHover); }
+        if (showThemeButton && themeH) {
+            c.FillRect(themeX, 0, bw, hbar, capHover);
+        }
+        if (showPinButton && pinH) {
+            c.FillRect(pinX, 0, bw, hbar, capHover);
+        }
+        if (showMinimizeButton && minH) {
+            c.FillRect(minX, 0, bw, hbar, capHover);
+        }
+        if (showMaximizeButton && maxH) {
+            c.FillRect(maxX, 0, bw, hbar, capHover);
+        }
         if (closeH) { c.FillRect(closeX, 0, bw, hbar, closeRed); }
 
         // Caption glyphs render at the small "caption" size (~11px) that Windows
         // and WeChat use — thin and crisp rather than chunky — and are centered
         // in each 46-wide button for a refined, balanced title bar.
-        int gl = t.iconSizeCaption * 2;
+        int gl = (t.iconSizeCaption * 6) / 5;
         int gcolor = t.textSecondary;
 
-        // Theme toggle: sun in light mode, moon in dark mode.
+        // Theme control: a "color" palette glyph when it opens a preset menu,
+        // otherwise the classic sun/moon dark-light toggle.
         int themeColor = gcolor;
-        if (themeH) { themeColor = t.textPrimary; }
+        if (themeH || (this.ThemeMenuMode() && themeMenuOpen.Get())) {
+            themeColor = t.textPrimary;
+        }
         string themeIcon = "moon";
         if (isDark) { themeIcon = "sun"; }
-        Icon.DrawCenteredIn(c, themeIcon, themeX, 0, bw, hbar, gl, themeColor);
+        if (this.ThemeMenuMode()) { themeIcon = "color"; }
+        if (showThemeButton) {
+            Icon.DrawCenteredIn(
+                c, themeIcon, themeX, 0, bw, hbar, gl, themeColor);
+        }
 
         // Pin (always-on-top): accent color + filled glyph when active.
         int pinColor = gcolor;
         if (pinH) { pinColor = t.textPrimary; }
         string pinIcon = "pin";
         if (isTopmost) { pinIcon = "unpin"; pinColor = t.primary; }
-        Icon.DrawCenteredIn(c, pinIcon, pinX, 0, bw, hbar, gl, pinColor);
+        if (showPinButton) {
+            Icon.DrawCenteredIn(
+                c, pinIcon, pinX, 0, bw, hbar, gl, pinColor);
+        }
 
         int minColor = gcolor;
         if (minH) { minColor = t.textPrimary; }
-        Icon.DrawCenteredIn(c, "minimize", minX, 0, bw, hbar, gl, minColor);
+        if (showMinimizeButton) {
+            Icon.DrawCenteredIn(
+                c, "minimize", minX, 0, bw, hbar, gl, minColor);
+        }
 
         string maxName = "maximize";
         if (window.IsMaximized()) { maxName = "restore"; }
         int maxColor = gcolor;
         if (maxH) { maxColor = t.textPrimary; }
-        Icon.DrawCenteredIn(c, maxName, maxX, 0, bw, hbar, gl, maxColor);
+        if (showMaximizeButton) {
+            Icon.DrawCenteredIn(
+                c, maxName, maxX, 0, bw, hbar, gl, maxColor);
+        }
 
         int xcolor = gcolor;
         if (closeH) { xcolor = 0xFFFFFFFF; }
         Icon.DrawCenteredIn(c, "close", closeX, 0, bw, hbar, gl, xcolor);
 
-        hitTester.Register(HitRegion.Create(themeId, themeX, 0, bw, hbar, 3));
-        hitTester.Register(HitRegion.Create(pinId, pinX, 0, bw, hbar, 3));
-        hitTester.Register(HitRegion.Create(minId, minX, 0, bw, hbar, 3));
-        hitTester.Register(HitRegion.Create(maxId, maxX, 0, bw, hbar, 3));
+        if (showThemeButton) {
+            hitTester.Register(
+                HitRegion.Create(themeId, themeX, 0, bw, hbar, 3));
+        }
+        if (showPinButton) {
+            hitTester.Register(
+                HitRegion.Create(pinId, pinX, 0, bw, hbar, 3));
+        }
+        if (showMinimizeButton) {
+            hitTester.Register(
+                HitRegion.Create(minId, minX, 0, bw, hbar, 3));
+        }
+        if (showMaximizeButton) {
+            hitTester.Register(
+                HitRegion.Create(maxId, maxX, 0, bw, hbar, 3));
+        }
         hitTester.Register(HitRegion.Create(closeId, closeX, 0, bw, hbar, 3));
 
         if (window.EventKind() == 3) {
             int hit = hitTester.HitTest(mouseX, mouseY);
-            if (hit == themeId) {
-                SetDark(!isDark);
-            } else if (hit == pinId) {
+            if (showThemeButton && hit == themeId) {
+                if (this.ThemeMenuMode()) {
+                    if (!themeMenuOpen.Get()) { themeMenuScroll.Set(0); }
+                    themeMenuOpen.Set(!themeMenuOpen.Get());
+                    needsRedraw = true;
+                } else {
+                    SetDark(!isDark);
+                }
+            } else if (showPinButton && hit == pinId) {
                 isTopmost = !isTopmost;
                 window.SetTopmost(isTopmost);
                 needsRedraw = true;
-            } else if (hit == minId) {
+            } else if (showMinimizeButton && hit == minId) {
                 window.Minimize();
-            } else if (hit == maxId) {
+            } else if (showMaximizeButton && hit == maxId) {
                 window.ToggleMaximize();
             } else if (hit == closeId) {
                 window.Close();
             }
         }
+
+        // Defer the preset menu to the overlay layer so it drops above all
+        // content and its option hit regions win the z-order. Right-align the
+        // menu under the caption button; nudge it in if it would clip the edge.
+        if (this.ThemeMenuMode() && themeMenuOpen.Get()) {
+            int menuW = Scale(168);
+            int mx = themeX + bw - menuW;
+            if (mx < Scale(4)) { mx = Scale(4); }
+            int my = hbar + Scale(2);
+            AddOverlay(OverlayPopup.OptionList(mx, my, menuW, themeNames,
+                themeMenuBaseId, themeMenuModel, themeId, themeMenuOpen,
+                themeMenuScroll, themeMenuChange));
+        }
     }
 
     void RequestRedraw() {
         needsRedraw = true;
+    }
+
+    /// Requests a *throttled* repaint for a looping animation: the next frame
+    /// is scheduled at most `minIntervalMs` from now, and the event loop sleeps
+    /// (idle, no CPU) until then instead of busy-rendering at 60fps. Unlike
+    /// RequestRedraw this does not force an immediate frame, so a permanently
+    /// animating widget (a spinner, a skeleton shimmer) repaints the page at a
+    /// low cadence. An earlier deadline always wins if several animations are
+    /// live in the same frame. Input still wakes the loop promptly.
+    void RequestAnimationFrame(int minIntervalMs) {
+        int due = Window.GetTickMs() + minIntervalMs;
+        if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
+    }
+
+    /// True when the content behind glass surfaces may have changed this frame
+    /// (any OS input / resize / theme), false when the frame is a pure
+    /// animation tick over an unchanged backdrop. Glass surfaces pass this to
+    /// Canvas.BlurRectCached so spinners/toasts reuse the cached blur.
+    bool BackdropDirty() {
+        return backdropDirty;
+    }
+
+    /// Hands out the next stable per-frame blur-cache slot (draw order). Slots
+    /// beyond the cache capacity fall back to an uncached blur.
+    int NextBlurSlot() {
+        int s = blurSlotSeq;
+        blurSlotSeq = blurSlotSeq + 1;
+        if (s > 63) { return -1; }
+        return s;
+    }
+
+    /// Report the focused text widget's caret (client-area px) so the IME
+    /// composition/candidate window follows the cursor instead of pinning to
+    /// the window origin. Called each frame by Input/TextArea while focused.
+    void SetImeCaret(int x, int y) {
+        Ime.SetCaret(x, y);
+    }
+
+    /// <summary>
+    /// Marshals a delegate onto this window's UI thread — the equivalent of
+    /// C#'s <c>Control.Invoke</c>/<c>BeginInvoke</c>. Safe to call from any
+    /// thread: the delegate is queued (under an OS mutex in the runtime) and
+    /// runs on the UI thread at the start of the next frame, after which a
+    /// repaint is requested. A background worker uses this to hand results back
+    /// without touching UI state off-thread.
+    /// </summary>
+    void Post(Action handler) {
+        Dispatcher.Post(handler);
+        // Wake the loop if it is blocked in WaitEvent so the queued work runs
+        // promptly instead of waiting for the next input event.
+        window.Wake();
+    }
+
+    /// <summary>
+    /// Runs every delegate queued via <see cref="Post"/> on the UI thread and
+    /// requests a repaint if any ran. Called automatically each event-loop
+    /// iteration by ProcessEvent; a hand-rolled loop can also call it directly.
+    /// </summary>
+    void DrainPosts() {
+        Action handler = Dispatcher.Take();
+        while (handler != null) {
+            handler();
+            needsRedraw = true;
+            handler = Dispatcher.Take();
+        }
     }
 
     /// Finds the row index for an animation key, or -1. Rows are appended by
@@ -339,15 +775,20 @@ class App {
     }
 
     /// Blend two packed RGB colors by permille p (0..1000), returning an opaque
-    /// (0xFF alpha) color. Channels are extracted with %256 so it is robust to
-    /// colors stored as negative signed ints.
+    /// (0xFF alpha) color. Robust to colors stored as negative signed ints.
     static int LerpColor(int c0, int c1, int p) {
-        int r0 = (c0 / 65536) % 256; if (r0 < 0) { r0 = r0 + 256; }
-        int g0 = (c0 / 256) % 256;   if (g0 < 0) { g0 = g0 + 256; }
-        int b0 = c0 % 256;           if (b0 < 0) { b0 = b0 + 256; }
-        int r1 = (c1 / 65536) % 256; if (r1 < 0) { r1 = r1 + 256; }
-        int g1 = (c1 / 256) % 256;   if (g1 < 0) { g1 = g1 + 256; }
-        int b1 = c1 % 256;           if (b1 < 0) { b1 = b1 + 256; }
+        // Packed 0xAARRGGBB colors are stored as signed ints, so any color with
+        // a 0xFF alpha is negative. Extract the low 24 RGB bits with a floored
+        // modulo first (truncating `c / 65536` would mis-decode negatives, e.g.
+        // white -1 would read as pure blue), then split the positive value.
+        int rgb0 = c0 % 16777216; if (rgb0 < 0) { rgb0 = rgb0 + 16777216; }
+        int rgb1 = c1 % 16777216; if (rgb1 < 0) { rgb1 = rgb1 + 16777216; }
+        int r0 = rgb0 / 65536;
+        int g0 = (rgb0 / 256) % 256;
+        int b0 = rgb0 % 256;
+        int r1 = rgb1 / 65536;
+        int g1 = (rgb1 / 256) % 256;
+        int b1 = rgb1 % 256;
         int r = r0 + (r1 - r0) * p / 1000;
         int g = g0 + (g1 - g0) * p / 1000;
         int b = b0 + (b1 - b0) * p / 1000;
@@ -395,6 +836,27 @@ class App {
             int since = Window.GetTickMs() - lastPresentMs;
             if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
             result = window.PollEvent();
+        } else if (animNextMs >= 0) {
+            // A throttled animation (e.g. a loading spinner) wants its next
+            // frame at animNextMs. Sleep (idle) until then instead of busy-
+            // rendering the whole page at 60fps, but poll in short slices so
+            // OS input still wakes the loop promptly. When the deadline is
+            // reached, flag a repaint and fall through with no pending event.
+            result = 1;
+            bool waiting = true;
+            while (waiting) {
+                int now = Window.GetTickMs();
+                if (now >= animNextMs) {
+                    needsRedraw = true;
+                    waiting = false;
+                } else {
+                    int remain = animNextMs - now;
+                    if (remain > 15) { remain = 15; }
+                    Window.SleepMs(remain);
+                    result = window.PollEvent();
+                    if (result != 1) { waiting = false; }
+                }
+            }
         } else {
             result = window.WaitEvent();
         }
@@ -403,7 +865,17 @@ class App {
             return false;
         }
 
+        // Run any work marshalled from background threads on the UI thread.
+        // A Wake() delivers an empty (kind 0) event solely to trigger this.
+        DrainPosts();
+
         int kind = window.EventKind();
+
+        // A pure animation repaint wakes with no OS event (kind 0): the content
+        // behind glass is unchanged, so its blur + the static wallpaper can be
+        // restored from cache. Any real event (input/resize/etc) marks the
+        // backdrop dirty so it is recomputed this frame.
+        backdropDirty = (kind != 0);
 
         if (kind == 8) {
             isRunning = false;
@@ -469,18 +941,46 @@ class App {
             int hitId = hitTester.HitTest(mouseX, mouseY);
             focus.SetPressed(hitId);
             focus.SetFocused(hitId);
+            pressTargetId = hitId;
+            NotePressStart(hitId, mouseX, mouseY);
             needsRedraw = true;
         }
 
         if (kind == 3) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            // Resolve the click target against the still-intact previous-frame
+            // hit regions (popups included, top-most wins) before BeginFrame
+            // clears them, so exactly one widget sees Ui.Clicked this frame.
+            clickTargetId = hitTester.HitTest(mouseX, mouseY);
+            NoteRelease(mouseX, mouseY);
+            NoteClickTarget(clickTargetId);
             focus.ClearPress();
+            needsRedraw = true;
+        }
+
+        // Tab / Shift+Tab move keyboard focus through the focusable ring built
+        // last frame (see FocusManager.RegisterFocusable).
+        if (kind == 4 && window.EventKeyCode() == 9) {
+            if (!this.HasOverlays() && !blocksInputBelow) {
+                int dir = 1;
+                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+                focus.FocusStep(dir);
+            }
             needsRedraw = true;
         }
 
         if (kind == 13) {
             int delta = window.EventKeyCode();
             int viewH = canvas.Height() - titlebarH;
-            if (splitX > 0 && mouseX < splitX) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            if (this.HasOverlays() || blocksInputBelow) {
+                // Popups and modal scrims own this input frame. Let their
+                // render path consume the wheel instead of moving content
+                // underneath the floating surface.
+                needsRedraw = true;
+            } else if (splitX > 0 && mouseX < splitX) {
                 // Scroll the sidebar when the pointer is over it.
                 int oldS = sidebarScrollY;
                 sidebarScrollY = sidebarScrollY - delta * scrollSpeed / 120;
@@ -576,24 +1076,49 @@ class App {
             int hitId = hitTester.HitTest(mouseX, mouseY);
             focus.SetPressed(hitId);
             focus.SetFocused(hitId);
+            pressTargetId = hitId;
+            NotePressStart(hitId, mouseX, mouseY);
             needsRedraw = true;
         }
 
         if (kind == 3) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
+            clickTargetId = hitTester.HitTest(mouseX, mouseY);
+            NoteRelease(mouseX, mouseY);
+            NoteClickTarget(clickTargetId);
             focus.ClearPress();
             needsRedraw = true;
         }
 
+        if (kind == 4 && window.EventKeyCode() == 9) {
+            if (!this.HasOverlays() && !blocksInputBelow) {
+                int dir = 1;
+                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+                focus.FocusStep(dir);
+            }
+            needsRedraw = true;
+        }
+
         if (kind == 13) {
+            mouseX = window.EventX();
+            mouseY = window.EventY();
             int delta = window.EventKeyCode();
             int viewH = canvas.Height() - titlebarH;
-            int oldScroll = scrollY;
-            scrollY = scrollY - delta * scrollSpeed / 120;
-            if (scrollY < 0) { scrollY = 0; }
-            int maxScroll = contentHeight - viewH;
-            if (maxScroll < 0) { maxScroll = 0; }
-            if (scrollY > maxScroll) { scrollY = maxScroll; }
-            if (scrollY != oldScroll) { needsRedraw = true; }
+            if (this.HasOverlays() || blocksInputBelow) {
+                needsRedraw = true;
+            } else if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
+                && mouseY >= wheelCapY && mouseY < wheelCapY + wheelCapH) {
+                needsRedraw = true;
+            } else {
+                int oldScroll = scrollY;
+                scrollY = scrollY - delta * scrollSpeed / 120;
+                if (scrollY < 0) { scrollY = 0; }
+                int maxScroll = contentHeight - viewH;
+                if (maxScroll < 0) { maxScroll = 0; }
+                if (scrollY > maxScroll) { scrollY = maxScroll; }
+                if (scrollY != oldScroll) { needsRedraw = true; }
+            }
         }
 
         if (kind == 6 || kind == 4) { needsRedraw = true; }
@@ -601,12 +1126,22 @@ class App {
     }
 
     void PresentFrame() {
+        // Draw + dispatch popups last so they sit above all content and own the
+        // top-most hit regions (framework-owned overlay/z-order layer).
+        RunOverlays();
         window.Present(canvas);
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
+        // Snapshot hover/focus/press as this frame's "previous" baseline so the
+        // next rendered frame can detect enter/leave and focus/blur transitions
+        // (Ui.Entered/Left/FocusGained/FocusLost).
+        focus.RollFrame();
     }
 
     void BeginFrame() {
+        // Apply a freshly-picked built-in skin before anything paints, so the
+        // whole window (content + chrome) redraws in the new theme this frame.
+        this.SyncSkin();
         // Advance the animation clock. AnimTo() uses (nowMs - lastFrameMs) as
         // the elapsed step so eases run at a wall-clock rate regardless of fps.
         lastFrameMs = nowMs;
@@ -614,10 +1149,140 @@ class App {
         // Clear the redraw flag at frame start; handlers invoked during this
         // frame may set it again to request an immediate follow-up repaint.
         needsRedraw = false;
+        // Clear any throttled-animation deadline too; still-live animations
+        // (spinners etc.) re-arm it via RequestAnimationFrame during render.
+        animNextMs = -1;
+        // Hand glass surfaces stable blur-cache slots again from the top.
+        blurSlotSeq = 0;
         wheelCapW = 0;
         wheelCapH = 0;
+        inputBlockPrevious = blocksInputBelow;
+        blocksInputBelow = false;
         hitTester.Clear();
         focus.ResetIds();
+        overlays = new List<OverlayPopup>();
         canvas.Clear(theme.bgPrimary);
+    }
+
+    /// Queues a popup to be painted and dispatched after the main content pass,
+    /// so it sits above everything and owns the top-most hit regions. See
+    /// <see cref="RunOverlays"/>.
+    void AddOverlay(OverlayPopup p) {
+        overlays.Add(p);
+    }
+
+    /// Draws + dispatches every overlay registered this frame, in registration
+    /// order. Call once, right after the main render and before PresentFrame.
+    void RunOverlays() {
+        int i = 0;
+        while (i < overlays.Count) {
+            OverlayPopup p = overlays[i];
+            p.Render(this);
+            i = i + 1;
+        }
+    }
+
+    /// True while a popup layer is active this frame.
+    bool HasOverlays() { return overlays.Count > 0; }
+
+    /// Registers a hit region that swallows clicks over [x,y,w,h] so a modal /
+    /// popup surface blocks the widgets beneath it. The HitTester is
+    /// last-registered-wins and overlays paint after the page content, so
+    /// calling this while drawing the backdrop -- and BEFORE the overlay's own
+    /// buttons register -- makes the blocker win everywhere except on those
+    /// buttons. Returns the blocker id.
+    int BlockHitsRect(int x, int y, int w, int h) {
+        int id = focus.AllocId();
+        hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+        return id;
+    }
+
+    /// Full-window BlockHitsRect: the standard scrim for a modal overlay whose
+    /// dimmed backdrop covers the whole window.
+    int BlockHitsBelow() {
+        bool firstBlock = !blocksInputBelow;
+        blocksInputBelow = true;
+        int id = BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
+        if (firstBlock && !inputBlockPrevious) { focus.SetFocused(id); }
+        return id;
+    }
+
+    /// Id of the widget the current click (mouse-up) landed on, or -1.
+    int ClickTarget() { return clickTargetId; }
+
+    /// Id of the widget the current press (mouse-down) landed on, or -1.
+    int PressTarget() { return pressTargetId; }
+
+    /// True on the frame a completed click is the second of a double click on
+    /// the same widget within the double-click window (see Ui.DoubleClicked).
+    bool DoubleClickNow() { return doubleClickNow; }
+
+    /// Records a completed click on `id` and flags a double click when it
+    /// repeats on the same id within 400 ms. Called from the mouse-up paths.
+    void NoteClickTarget(int id) {
+        int t = Window.GetTickMs();
+        if (id >= 0 && id == lastClickId && (t - lastClickMs) <= 400) {
+            doubleClickNow = true;
+        } else {
+            doubleClickNow = false;
+        }
+        lastClickId = id;
+        lastClickMs = t;
+    }
+
+    /// Snapshots the press target/position/time so gestures (swipe, long-press)
+    /// can be derived from the press onward. Called from the mouse-down paths.
+    void NotePressStart(int id, int x, int y) {
+        pressStartId = id;
+        pressStartX = x;
+        pressStartY = y;
+        pressStartMs = Window.GetTickMs();
+        longPressFired = false;
+        swipeDir = 0;
+    }
+
+    /// Derives a swipe direction from the press-to-release travel: 0 none,
+    /// 1 left, 2 right, 3 up, 4 down. Called from the mouse-up paths, so it is
+    /// valid to read (via SwipeDir) on a release frame.
+    void NoteRelease(int x, int y) {
+        int dx = x - pressStartX;
+        int dy = y - pressStartY;
+        int adx = dx; if (adx < 0) { adx = -adx; }
+        int ady = dy; if (ady < 0) { ady = -ady; }
+        swipeDir = 0;
+        if (adx >= 48 || ady >= 48) {
+            if (adx >= ady) {
+                if (dx < 0) { swipeDir = 1; } else { swipeDir = 2; }
+            } else {
+                if (dy < 0) { swipeDir = 3; } else { swipeDir = 4; }
+            }
+        }
+    }
+
+    /// Swipe direction resolved on the current release frame (see NoteRelease).
+    int SwipeDir() { return swipeDir; }
+    /// The widget the in-flight gesture started on (press target).
+    int SwipeTarget() { return pressStartId; }
+
+    /// Reports a long press on `id` once the pointer has been held on it past
+    /// the threshold without moving far. Arms a low-cadence follow-up frame
+    /// while holding so the timer advances even with no further input; returns
+    /// true exactly once per press. Movement beyond a small slop cancels it
+    /// (the gesture is then a drag/swipe, not a long press).
+    bool PollLongPress(int id) {
+        if (longPressFired) { return false; }
+        if (focus.pressedId != id) { return false; }
+        if (pressStartId != id) { return false; }
+        int mdx = mouseX - pressStartX; if (mdx < 0) { mdx = -mdx; }
+        int mdy = mouseY - pressStartY; if (mdy < 0) { mdy = -mdy; }
+        if (mdx > 12 || mdy > 12) { longPressFired = true; return false; }
+        int t = Window.GetTickMs();
+        if ((t - pressStartMs) >= 500) {
+            longPressFired = true;
+            RequestRedraw();
+            return true;
+        }
+        RequestAnimationFrame(80);
+        return false;
     }
 }

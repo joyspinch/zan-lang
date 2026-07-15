@@ -7,6 +7,16 @@
 extern "C" {
 #endif
 
+/* Spawn a new detached OS thread that runs the given Zan delegate (a no-arg
+ * function pointer). Returns 1 on success, 0 on failure. */
+int64_t zan_thread_start(void *body);
+
+/* UI-thread dispatch queue: post a delegate from any thread, drain on the UI
+ * thread. */
+void zan_dispatch_init(void);
+int64_t zan_dispatch_post(void *fn);
+void *zan_dispatch_take(void);
+
 int64_t zan_atomic_int_create(int64_t initial_value);
 void zan_atomic_int_destroy(int64_t handle);
 int64_t zan_atomic_int_load(int64_t handle);

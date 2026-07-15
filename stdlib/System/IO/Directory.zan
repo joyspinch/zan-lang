@@ -3,32 +3,83 @@ using System;
 namespace System.IO;
 
 /// <summary>
-/// Directory operations using Win32 API.
+/// Directory operations. Uses the Win32 API on Windows and POSIX
+/// opendir/readdir/mkdir on Linux and macOS. The struct dirent field offsets
+/// read by readdir differ between glibc and Darwin, so they are selected per
+/// target (see direntTypeOffset/direntNameOffset).
 /// </summary>
 class Directory {
-    [DllImport("kernel32", EntryPoint = "GetFileAttributesA")]
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
     static extern int WinGetFileAttributes(string path);
 
-    [DllImport("kernel32", EntryPoint = "CreateDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "CreateDirectoryW")]
     static extern int WinCreateDirectory(string path, int secAttrs);
 
-    [DllImport("kernel32", EntryPoint = "RemoveDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "RemoveDirectoryW")]
     static extern int WinRemoveDirectory(string path);
 
-    [DllImport("kernel32", EntryPoint = "GetCurrentDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "GetCurrentDirectoryW")]
     static extern int WinGetCurrentDirectory(int bufLen, string buf);
 
-    [DllImport("kernel32", EntryPoint = "SetCurrentDirectoryA")]
+    [DllImport("kernel32", EntryPoint = "SetCurrentDirectoryW")]
     static extern int WinSetCurrentDirectory(string path);
 
-    [DllImport("kernel32", EntryPoint = "FindFirstFileA")]
+    [DllImport("kernel32", EntryPoint = "FindFirstFileW")]
     static extern int WinFindFirstFile(string pattern, string findData);
 
-    [DllImport("kernel32", EntryPoint = "FindNextFileA")]
+    [DllImport("kernel32", EntryPoint = "FindNextFileW")]
     static extern int WinFindNextFile(int handle, string findData);
 
     [DllImport("kernel32", EntryPoint = "FindClose")]
     static extern int WinFindClose(int handle);
+    [DllImport("kernel32", EntryPoint = "GetLogicalDrives")]
+    static extern int WinGetLogicalDrives();
+
+    [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
+    static extern int WinToWide(
+        int codePage,
+        int flags,
+        string source,
+        int sourceLength,
+        string output,
+        int outputLength
+    );
+
+    [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
+    static extern int WinToUtf8(
+        int codePage,
+        int flags,
+        string source,
+        int sourceLength,
+        string output,
+        int outputLength,
+        string defaultChar,
+        string usedDefaultChar
+    );
+    #else
+    // POSIX directory + filesystem primitives (libc).
+    [DllImport("crt", EntryPoint = "opendir")]
+    static extern int opendir(string name);
+
+    [DllImport("crt", EntryPoint = "readdir")]
+    static extern string readdir(int dirp);
+
+    [DllImport("crt", EntryPoint = "closedir")]
+    static extern int closedir(int dirp);
+
+    [DllImport("crt", EntryPoint = "mkdir")]
+    static extern int mkdir(string path, int mode);
+
+    [DllImport("crt", EntryPoint = "rmdir")]
+    static extern int rmdir(string path);
+
+    [DllImport("crt", EntryPoint = "chdir")]
+    static extern int chdir(string path);
+
+    [DllImport("crt", EntryPoint = "getcwd")]
+    static extern string getcwd(string buf, int size);
+    #endif
 
     [DllImport("crt")]
     static extern string calloc(int count, int size);
@@ -45,119 +96,305 @@ class Directory {
     [DllImport("crt")]
     static extern int strlen(string str);
 
+    #if WINDOWS
+    static string winWide(string text) {
+        int count = WinToWide(65001, 0, text, -1, null, 0);
+        if (count <= 0) { return null; }
+        string wide = calloc(count, 2);
+        WinToWide(65001, 0, text, -1, wide, count);
+        return wide;
+    }
+
+    static string winUtf8(string wide) {
+        int count = WinToUtf8(
+            65001, 0, wide, -1, null, 0, null, null);
+        if (count <= 0) { return ""; }
+        string text = calloc(count, 1);
+        WinToUtf8(
+            65001, 0, wide, -1, text, count, null, null);
+        return text;
+    }
+
+    static int winAttributesUtf8(string path) {
+        string wide = winWide(path);
+        if (wide == null) { return -1; }
+        int attrs = WinGetFileAttributes(wide);
+        free(wide);
+        return attrs;
+    }
+    #endif
+
+    /// <summary>Checks a UTF-8 path without using the ANSI Windows API.</summary>
+    static bool ExistsUtf8(string path) {
+        #if WINDOWS
+        int attrs = winAttributesUtf8(path);
+        if (attrs == -1 || attrs == 4294967295) { return false; }
+        return (attrs & 16) != 0;
+        #else
+        return Exists(path);
+        #endif
+    }
+
+    /// <summary>Checks whether a UTF-8 path names a regular file.</summary>
+    static bool FileExistsUtf8(string path) {
+        #if WINDOWS
+        int attrs = winAttributesUtf8(path);
+        if (attrs == -1 || attrs == 4294967295) { return false; }
+        return (attrs & 16) == 0;
+        #else
+        return File.Exists(path);
+        #endif
+    }
+
+    /// <summary>Creates a directory whose path is encoded as UTF-8.</summary>
+    static void CreateDirectoryUtf8(string path) {
+        #if WINDOWS
+        string wide = winWide(path);
+        if (wide != null) {
+            WinCreateDirectory(wide, 0);
+            free(wide);
+        }
+        #else
+        CreateDirectory(path);
+        #endif
+    }
+
+    static List<string> GetRootsUtf8() {
+        List<string> roots = new List<string>();
+        #if WINDOWS
+        int mask = WinGetLogicalDrives();
+        string letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        int i = 0;
+        while (i < 26) {
+            if ((mask & 1) != 0) {
+                roots.Add(letters.Substring(i, 1) + ":/");
+            }
+            mask = mask / 2;
+            i = i + 1;
+        }
+        #else
+        roots.Add("/");
+        #endif
+        return roots;
+    }
+
     /// <summary>Checks whether a directory exists.</summary>
     static bool Exists(string path) {
-        int attrs = WinGetFileAttributes(path);
-        if (attrs == -1) { return false; }
+        #if WINDOWS
+        int attrs = winAttributesUtf8(path);
+        // GetFileAttributesW returns the 32-bit DWORD INVALID_FILE_ATTRIBUTES
+        // (0xFFFFFFFF) on failure. Widened to a 64-bit int it reads as
+        // 4294967295 rather than -1, so test both forms.
+        if (attrs == -1 || attrs == 4294967295) { return false; }
         return (attrs & 16) != 0;
+        #else
+        int d = opendir(path);
+        if (d == 0) { return false; }
+        closedir(d);
+        return true;
+        #endif
     }
 
     /// <summary>Creates a directory at the specified path.</summary>
     static void CreateDirectory(string path) {
-        WinCreateDirectory(path, 0);
+        #if WINDOWS
+        string wide = winWide(path);
+        if (wide != null) {
+            WinCreateDirectory(wide, 0);
+            free(wide);
+        }
+        #else
+        mkdir(path, 511);   // 0o777, subject to umask
+        #endif
     }
 
     /// <summary>Deletes an empty directory.</summary>
     static void Delete(string path) {
-        WinRemoveDirectory(path);
+        #if WINDOWS
+        string wide = winWide(path);
+        if (wide != null) {
+            WinRemoveDirectory(wide);
+            free(wide);
+        }
+        #else
+        rmdir(path);
+        #endif
     }
 
     /// <summary>Gets the current working directory.</summary>
     static string GetCurrentDirectory() {
+        #if WINDOWS
+        string wide = calloc(4096, 2);
+        WinGetCurrentDirectory(4096, wide);
+        string buf = winUtf8(wide);
+        free(wide);
+        #else
         string buf = calloc(4096, 1);
-        WinGetCurrentDirectory(4096, buf);
+        getcwd(buf, 4096);
+        #endif
         return buf;
     }
 
     /// <summary>Sets the current working directory.</summary>
     static void SetCurrentDirectory(string path) {
-        WinSetCurrentDirectory(path);
+        #if WINDOWS
+        string wide = winWide(path);
+        if (wide != null) {
+            WinSetCurrentDirectory(wide);
+            free(wide);
+        }
+        #else
+        chdir(path);
+        #endif
     }
 
-    /// <summary>Lists files in a directory (non-recursive).</summary>
-    static List<string> GetFiles(string path) {
+    #if WINDOWS
+    // Reads cFileName from a WIN32_FIND_DATAW buffer (UTF-16 at byte +44).
+    static string winName(string findData) {
+        string wideName = findData.Substring(44, 520);
+        return winUtf8(wideName);
+    }
+
+    static List<string> winList(
+        string path,
+        bool wantDirs,
+        bool includeHidden
+    ) {
         List<string> result = new List<string>();
         int plen = strlen(path);
         string pattern = calloc(plen + 3, 1);
         strcpy(pattern, path);
         strcat(pattern, "\\*");
-        string findData = calloc(328, 1);
-        int handle = WinFindFirstFile(pattern, findData);
+        string widePattern = winWide(pattern);
+        string findData = calloc(592, 1);
+        int handle = -1;
+        if (widePattern != null) {
+            handle = WinFindFirstFile(widePattern, findData);
+        }
         if (handle != -1) {
-            string fname = calloc(260, 1);
-            int j = 0;
-            while (j < 259) {
-                string ch = findData.Substring(44 + j, 1);
-                if (ch == "\0") { break; }
-                fname = fname + ch;
-                j = j + 1;
-            }
-            int dwAttrs = findData[0] + findData[1] * 256 + findData[2] * 65536 + findData[3] * 16777216;
-            if ((dwAttrs & 16) == 0 && fname != "." && fname != "..") {
-                result.Add(fname);
-            }
-            while (WinFindNextFile(handle, findData) != 0) {
-                string fname2 = calloc(260, 1);
-                int k = 0;
-                while (k < 259) {
-                    string ch2 = findData.Substring(44 + k, 1);
-                    if (ch2 == "\0") { break; }
-                    fname2 = fname2 + ch2;
-                    k = k + 1;
+            bool more = true;
+            while (more) {
+                string fname = winName(findData);
+                int attrs = findData[0] + findData[1] * 256 + findData[2] * 65536 + findData[3] * 16777216;
+                bool isDir = (attrs & 16) != 0;
+                bool hidden = (attrs & 2) != 0;
+                if (fname != "." && fname != ".."
+                    && isDir == wantDirs
+                    && (includeHidden || !hidden)) {
+                    result.Add(fname);
                 }
-                int attrs2 = findData[0] + findData[1] * 256 + findData[2] * 65536 + findData[3] * 16777216;
-                if ((attrs2 & 16) == 0 && fname2 != "." && fname2 != "..") {
-                    result.Add(fname2);
-                }
+                if (WinFindNextFile(handle, findData) == 0) { more = false; }
             }
             WinFindClose(handle);
         }
+        if (widePattern != null) { free(widePattern); }
         free(pattern);
         free(findData);
         return result;
+    }
+    #else
+    // struct dirent layout differs by platform:
+    //   Linux (glibc): d_ino(8) d_off(8) d_reclen(2) d_type@18 d_name@19
+    //   macOS (Darwin): d_ino(8) d_seekoff(8) d_reclen(2) d_namlen(2)
+    //                   d_type@20 d_name@21
+    #if MACOS
+    static int direntTypeOffset() { return 20; }
+    static int direntNameOffset() { return 21; }
+    #else
+    static int direntTypeOffset() { return 18; }
+    static int direntNameOffset() { return 19; }
+    #endif
+
+    // Reads the NUL-terminated d_name from a struct dirent*.
+    static string posixName(string ent) {
+        int nameOff = direntNameOffset();
+        string name = "";
+        int j = 0;
+        while (j < 255) {
+            string ch = ent.Substring(nameOff + j, 1);
+            if (ch == "\0") { break; }
+            name = name + ch;
+            j = j + 1;
+        }
+        return name;
+    }
+
+    static List<string> posixList(
+        string path,
+        bool wantDirs,
+        bool includeHidden
+    ) {
+        List<string> result = new List<string>();
+        int d = opendir(path);
+        if (d == 0) { return result; }
+        string ent = readdir(d);
+        while (ent != null) {
+            string name = posixName(ent);
+            if (name != "" && name != "." && name != "..") {
+                bool hidden = name.Substring(0, 1) == ".";
+                int dtype = ent[direntTypeOffset()] & 255;   // d_type
+                bool isDir = false;
+                if (dtype == 4) {            // DT_DIR
+                    isDir = true;
+                } else if (dtype == 0) {     // DT_UNKNOWN: probe the entry
+                    string full = calloc(strlen(path) + name.Length + 2, 1);
+                    strcpy(full, path);
+                    strcat(full, "/");
+                    strcat(full, name);
+                    int sub = opendir(full);
+                    if (sub != 0) { isDir = true; closedir(sub); }
+                    free(full);
+                }
+                if (isDir == wantDirs
+                    && (includeHidden || !hidden)) {
+                    result.Add(name);
+                }
+            }
+            ent = readdir(d);
+        }
+        closedir(d);
+        return result;
+    }
+    #endif
+
+    /// <summary>Lists files in a directory (non-recursive).</summary>
+    static List<string> GetFiles(string path) {
+        #if WINDOWS
+        return winList(path, false, true);
+        #else
+        return posixList(path, false, true);
+        #endif
     }
 
     /// <summary>Lists subdirectories in a directory.</summary>
     static List<string> GetDirectories(string path) {
-        List<string> result = new List<string>();
-        int plen = strlen(path);
-        string pattern = calloc(plen + 3, 1);
-        strcpy(pattern, path);
-        strcat(pattern, "\\*");
-        string findData = calloc(328, 1);
-        int handle = WinFindFirstFile(pattern, findData);
-        if (handle != -1) {
-            string fname = calloc(260, 1);
-            int j = 0;
-            while (j < 259) {
-                string ch = findData.Substring(44 + j, 1);
-                if (ch == "\0") { break; }
-                fname = fname + ch;
-                j = j + 1;
-            }
-            int dwAttrs = findData[0] + findData[1] * 256 + findData[2] * 65536 + findData[3] * 16777216;
-            if ((dwAttrs & 16) != 0 && fname != "." && fname != "..") {
-                result.Add(fname);
-            }
-            while (WinFindNextFile(handle, findData) != 0) {
-                string fname2 = calloc(260, 1);
-                int k = 0;
-                while (k < 259) {
-                    string ch2 = findData.Substring(44 + k, 1);
-                    if (ch2 == "\0") { break; }
-                    fname2 = fname2 + ch2;
-                    k = k + 1;
-                }
-                int attrs2 = findData[0] + findData[1] * 256 + findData[2] * 65536 + findData[3] * 16777216;
-                if ((attrs2 & 16) != 0 && fname2 != "." && fname2 != "..") {
-                    result.Add(fname2);
-                }
-            }
-            WinFindClose(handle);
-        }
-        free(pattern);
-        free(findData);
-        return result;
+        #if WINDOWS
+        return winList(path, true, true);
+        #else
+        return posixList(path, true, true);
+        #endif
+    }
+
+    static List<string> GetFilesFiltered(
+        string path,
+        bool includeHidden
+    ) {
+        #if WINDOWS
+        return winList(path, false, includeHidden);
+        #else
+        return posixList(path, false, includeHidden);
+        #endif
+    }
+
+    static List<string> GetDirectoriesFiltered(
+        string path,
+        bool includeHidden
+    ) {
+        #if WINDOWS
+        return winList(path, true, includeHidden);
+        #else
+        return posixList(path, true, includeHidden);
+        #endif
     }
 
     /// <summary>Creates all directories in a path recursively.</summary>
