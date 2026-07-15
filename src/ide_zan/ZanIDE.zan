@@ -15,6 +15,10 @@ class Tpl {
     string desc;
     string kind;
     string src;
+    string type;
+    string target;
+    string entry;
+    int order;
 
     static Tpl Make(string cat, string name, string icon, string kind, string desc) {
         Tpl t = new Tpl();
@@ -24,6 +28,10 @@ class Tpl {
         t.kind = kind;
         t.desc = desc;
         t.src = "";
+        t.type = "console";
+        t.target = "exe";
+        t.entry = "src/main.zan";
+        t.order = 100;
         return t;
     }
 }
@@ -338,6 +346,17 @@ class ZanIDE {
         string a = ZanIDE.ExeDir() + "/examples";
         if (Directory.Exists(a)) { return a; }
         string b = ZanIDE.ExeDir() + "/../examples";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// Shipped project templates. Published next to the IDE as <ExeDir>/templates
+    /// (scripts/publish_ide.ps1); when running from the build tree it sits one
+    /// level up at the repo root. Returns "" when neither exists.
+    static string TemplatesDir() {
+        string a = ZanIDE.ExeDir() + "/templates";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.ExeDir() + "/../templates";
         if (Directory.Exists(b)) { return b; }
         return "";
     }
@@ -2300,30 +2319,84 @@ class ZanIDE {
 
     // ---- template catalog ----
 
-    /// The built-in project templates, grouped by category. Category labels here
-    /// must match the New Project wizard's category list exactly.
+    /// The built-in project templates. Data-driven: each lives in its own folder
+    /// under TemplatesDir() with a template.manifest, so templates can be edited
+    /// or added without rebuilding the IDE. Category labels in the manifests must
+    /// match the New Project wizard's category list exactly. Falls back to a
+    /// small hardcoded set only if that directory is missing (broken install).
     static List<Tpl> BuiltinTemplates() {
+        string dir = ZanIDE.TemplatesDir();
+        if (dir == "") { return ZanIDE.BuiltinTemplatesFallback(); }
+        List<Tpl> ts = new List<Tpl>();
+        List<string> subs = Directory.GetDirectories(dir);
+        int i = 0;
+        while (i < subs.Count) {
+            string tdir = dir + "/" + subs[i];
+            string mpath = tdir + "/template.manifest";
+            if (File.Exists(mpath)) {
+                Tpl t = ZanIDE.TplFromManifest(File.ReadAllText(mpath));
+                t.src = tdir;
+                ts.Add(t);
+            }
+            i = i + 1;
+        }
+        if (ts.Count == 0) { return ZanIDE.BuiltinTemplatesFallback(); }
+        return ZanIDE.SortTemplates(ts);
+    }
+
+    /// Builds a template descriptor from its manifest, honouring the current UI
+    /// language (name.zh / desc.zh override name / desc when 中文 is active).
+    static Tpl TplFromManifest(string m) {
+        string cat = ZanIDE.ManifestField(m, "category", "Custom");
+        string name = ZanIDE.ManifestField(m, "name", "Template");
+        string icon = ZanIDE.ManifestField(m, "icon", "file");
+        string kind = ZanIDE.ManifestField(m, "kind", "console");
+        string desc = ZanIDE.ManifestField(m, "desc", "");
+        if (ZanIDE.uiLang == 1) {
+            name = ZanIDE.ManifestField(m, "name.zh", name);
+            desc = ZanIDE.ManifestField(m, "desc.zh", desc);
+        }
+        Tpl t = Tpl.Make(cat, name, icon, kind, desc);
+        t.type = ZanIDE.ManifestField(m, "type", "console");
+        t.target = ZanIDE.ManifestField(m, "target", "exe");
+        t.entry = ZanIDE.ManifestField(m, "entry", "src/main.zan");
+        t.order = ZanIDE.ParseInt(ZanIDE.ManifestField(m, "order", "100"));
+        return t;
+    }
+
+    /// Orders templates by their manifest "order" field (selection sort; the
+    /// consumed marker mutates the shared Tpl instance, which is safe because
+    /// the catalog is rebuilt fresh whenever the wizard opens).
+    static List<Tpl> SortTemplates(List<Tpl> src) {
+        List<Tpl> outp = new List<Tpl>();
+        int k = 0;
+        while (k < src.Count) {
+            int best = -1;
+            int j = 0;
+            while (j < src.Count) {
+                Tpl tj = src[j];
+                if (tj.order >= 0) {
+                    if (best == -1 || tj.order < src[best].order) { best = j; }
+                }
+                j = j + 1;
+            }
+            Tpl chosen = src[best];
+            outp.Add(chosen);
+            chosen.order = -1;
+            k = k + 1;
+        }
+        return outp;
+    }
+
+    /// Hardcoded fallback catalog, used only when no templates ship on disk.
+    static List<Tpl> BuiltinTemplatesFallback() {
         List<Tpl> ts = new List<Tpl>();
         ts.Add(Tpl.Make("Console", ZanIDE.T("Hello World", "Hello World"), "menu", "console",
             ZanIDE.T("Minimal console program that prints a line of text.", "最小控制台程序，打印一行文本。")));
-        ts.Add(Tpl.Make("Console", ZanIDE.T("Command-line Args", "命令行参数"), "menu", "console-args",
-            ZanIDE.T("Console program that reads command-line arguments.", "读取命令行参数的控制台程序。")));
-        ts.Add(Tpl.Make("Console", ZanIDE.T("Multi-file Project", "多文件项目"), "copy", "console-multi",
-            ZanIDE.T("Console project split into main + utils source files.", "拆分为 main + utils 源文件的控制台项目。")));
         ts.Add(Tpl.Make("Library", ZanIDE.T("Class Library", "类库"), "grid", "dll-class",
             ZanIDE.T("A reusable library of classes, compiled to a DLL.", "可复用的类库，编译为 DLL。")));
-        ts.Add(Tpl.Make("Library", ZanIDE.T("Export DLL", "导出 DLL"), "copy", "dll-export",
-            ZanIDE.T("A DLL exposing functions callable from other programs.", "导出可供其他程序调用函数的 DLL。")));
         ts.Add(Tpl.Make("Window App", ZanIDE.T("Empty Window", "空窗口"), "maximize", "gui-empty",
             ZanIDE.T("A blank window app built on the Gui standard library.", "基于 Gui 标准库的空白窗口程序。")));
-        ts.Add(Tpl.Make("Window App", ZanIDE.T("Component Showcase", "组件展示"), "grid", "gui-components",
-            ZanIDE.T("A window with panels/toolbars from the Gui components.", "带 Gui 组件面板/工具栏的窗口。")));
-        ts.Add(Tpl.Make("WebView", ZanIDE.T("WebView Window", "WebView 窗口"), "folder", "webview",
-            ZanIDE.T("A window that hosts web content (needs a WebView runtime).", "承载网页内容的窗口（需要 WebView 运行时）。")));
-        ts.Add(Tpl.Make("Server", ZanIDE.T("HTTP Server", "HTTP 服务器"), "arrow-right", "server",
-            ZanIDE.T("A minimal HTTP server skeleton.", "最小 HTTP 服务器骨架。")));
-        ts.Add(Tpl.Make("Server", ZanIDE.T("TCP Echo Server", "TCP 回显服务器"), "refresh", "server-tcp",
-            ZanIDE.T("A minimal TCP echo server skeleton.", "最小 TCP 回显服务器骨架。")));
         return ts;
     }
 
@@ -2456,47 +2529,26 @@ class ZanIDE {
 
     /// Scaffolds a new project from a template descriptor; returns its directory.
     /// platforms is a comma-separated target-platform id list written to zan.proj.
+    /// File-based templates are materialized by copying their on-disk folder and
+    /// substituting {{NAME}}; the gui-* forms and custom templates keep their
+    /// dedicated generators. type/target/entry come from the template manifest.
     static string CreateProjectT(Tpl tpl, string parent, string name, string platforms, List<string> log) {
         string dir = parent + "/" + name;
         Directory.CreateDirectoryRecursive(dir);
         Directory.CreateDirectoryRecursive(dir + "/src");
 
-        string typeName = "console";
-        string target = "exe";
-        string entry = "src/main.zan";
         string kind = tpl.kind;
 
-        if (kind == "console") {
-            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleTemplate(name));
-        } else if (kind == "console-args") {
-            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleArgsTemplate(name));
-        } else if (kind == "console-multi") {
-            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleTemplate(name));
-            File.WriteAllText(dir + "/src/utils.zan",
-                "using System;\n\nclass Utils {\n    static int Add(int a, int b) { return a + b; }\n}\n");
-        } else if (kind == "dll-class") {
-            typeName = "library"; target = "dll"; entry = "src/lib.zan";
-            File.WriteAllText(dir + "/src/lib.zan", ZanIDE.LibraryTemplate(name));
-        } else if (kind == "dll-export") {
-            typeName = "library"; target = "dll"; entry = "src/lib.zan";
-            File.WriteAllText(dir + "/src/lib.zan", ZanIDE.DllExportTemplate(name));
+        if (kind == "custom") {
+            ZanIDE.CopyTree(tpl.src, dir);
         } else if (kind == "gui-empty") {
-            typeName = "gui"; target = "exe"; entry = "src/" + name + ".zan";
             ZanIDE.WriteFormProject(dir, name, 0);
         } else if (kind == "gui-components") {
-            typeName = "gui"; target = "exe"; entry = "src/" + name + ".zan";
             ZanIDE.WriteFormProject(dir, name, 1);
-        } else if (kind == "webview") {
-            typeName = "gui"; target = "exe";
-            File.WriteAllText(dir + "/src/main.zan", ZanIDE.WebViewTemplate(name));
-        } else if (kind == "server") {
-            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ServerHttpTemplate(name));
-        } else if (kind == "server-tcp") {
-            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ServerTcpTemplate(name));
-        } else if (kind == "custom") {
-            ZanIDE.CopyTree(tpl.src, dir);
+        } else if (tpl.src != "" && Directory.Exists(tpl.src)) {
+            ZanIDE.CopyTemplateTree(tpl.src, dir, name);
         } else {
-            typeName = "empty";
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.FallbackBody(name));
         }
 
         if (!File.Exists(dir + "/README.md")) {
@@ -2504,11 +2556,12 @@ class ZanIDE {
                 "# " + name + "\n\nGenerated by the Zan IDE (template: " + tpl.name + ").\n");
         }
         if (kind != "custom") {
+            string entry = ZanIDE.ReplaceAll(tpl.entry, "{{NAME}}", name);
             File.WriteAllText(dir + "/zan.proj",
-                "name = " + name + "\ntype = " + typeName + "\nentry = " + entry
-                + "\ntarget = " + target + "\nplatform = " + platforms + "\n");
+                "name = " + name + "\ntype = " + tpl.type + "\nentry = " + entry
+                + "\ntarget = " + tpl.target + "\nplatform = " + platforms + "\n");
         }
-        log.Add("> Created " + typeName + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
+        log.Add("> Created " + tpl.type + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
         return dir;
     }
 
@@ -2607,42 +2660,57 @@ class ZanIDE {
         }
     }
 
-    // ---- template bodies ----
+    // ---- template helpers ----
 
-    static string ConsoleTemplate(string name) {
+    /// Replaces every occurrence of `from` in `s` with `to`.
+    static string ReplaceAll(string s, string from, string to) {
+        if (from.Length == 0) { return s; }
+        string outp = "";
+        int i = 0;
+        int n = s.Length;
+        int fl = from.Length;
+        while (i < n) {
+            if (i + fl <= n && s.Substring(i, fl) == from) {
+                outp = outp + to;
+                i = i + fl;
+            } else {
+                outp = outp + s.Substring(i, 1);
+                i = i + 1;
+            }
+        }
+        return outp;
+    }
+
+    /// Recursively copies a template folder into a new project, substituting
+    /// {{NAME}} in both file contents and file names, skipping the manifest.
+    static void CopyTemplateTree(string srcDir, string dstDir, string name) {
+        Directory.CreateDirectory(dstDir);
+        List<string> files = Directory.GetFiles(srcDir);
+        int i = 0;
+        while (i < files.Count) {
+            string fn = files[i];
+            if (fn != "template.manifest" && fn != "manifest.txt") {
+                string body = ZanIDE.ReplaceAll(File.ReadAllText(srcDir + "/" + fn), "{{NAME}}", name);
+                File.WriteAllText(dstDir + "/" + ZanIDE.ReplaceAll(fn, "{{NAME}}", name), body);
+            }
+            i = i + 1;
+        }
+        List<string> subs = Directory.GetDirectories(srcDir);
+        int j = 0;
+        while (j < subs.Count) {
+            ZanIDE.CopyTemplateTree(srcDir + "/" + subs[j],
+                dstDir + "/" + ZanIDE.ReplaceAll(subs[j], "{{NAME}}", name), name);
+            j = j + 1;
+        }
+    }
+
+    /// Minimal program body used only when a template ships no source on disk.
+    static string FallbackBody(string name) {
         return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
     }
 
     static string GuiTemplate(string name) {
         return "using System;\nusing Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 800, 600);\n        // app.Run drives the whole window loop (events + redraw + chrome);\n        // use the BeginFrame/PresentFrame loop directly to draw custom content.\n        app.Run(\"" + name + "\");\n    }\n}\n";
-    }
-
-    static string LibraryTemplate(string name) {
-        return "using System;\n\n/// " + name + " library.\nclass " + name + " {\n    static int Version() { return 1; }\n}\n";
-    }
-
-    static string ConsoleArgsTemplate(string name) {
-        return "using System;\n\nclass Program {\n    static void Main() {\n        // TODO: read and parse command-line arguments here.\n        Console.WriteLine(\"" + name + ": pass arguments on the command line\");\n    }\n}\n";
-    }
-
-    static string DllExportTemplate(string name) {
-        return "using System;\n\n/// Functions exported from this library for use by other programs.\nclass " + name + " {\n    static int Add(int a, int b) { return a + b; }\n    static int Version() { return 1; }\n}\n";
-    }
-
-    static string GuiComponentsTemplate(string name) {
-        return "using System;\nusing Gui;\nusing Gui.Widget;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 900, 640);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            Canvas c = app.canvas;\n            int w = c.Width();\n            int h = c.Height();\n            int top = app.titlebarH;\n            Rect box = Panel.Section(app, 20, top + 20, w - 40, h - top - 40, \"" + name + "\");\n            c.DrawText(box.x + 12, box.y + 12, \"Build your UI from Gui components here.\", app.theme.textPrimary, app.theme.fontSizeMedium);\n            app.RenderChrome(\"" + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
-    }
-
-    static string WebViewTemplate(string name) {
-        return "using System;\nusing Gui;\n\n// WebView window skeleton. Hosting real web content needs a WebView2\n// runtime binding; this placeholder window stands in until that lands.\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 1000, 700);\n        app.Run(\"WebView: " + name + "\");\n    }\n}\n";
-    }
-
-    static string ServerHttpTemplate(string name) {
-        return "using System;\n\n// HTTP server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " listening on http://localhost:8080\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
-    }
-
-    static string ServerTcpTemplate(string name) {
-        return "using System;\n\n// TCP echo server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " TCP echo server on :9000\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
     }
 
     static string FileTemplateBody(int kind, string name) {

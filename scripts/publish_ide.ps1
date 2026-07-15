@@ -13,6 +13,7 @@
 #                          to itself in this same folder)
 #     stdlib\             standard library sources (zanc auto-includes from here)
 #     examples\           a few sample programs opened by the IDE's Examples pane
+#     templates\          built-in New Project templates (data-driven, editable)
 #     README.txt          prerequisites + how to run
 #
 # Prerequisite on the target machine: an LLVM toolchain (clang, llvm-lib) on
@@ -108,6 +109,16 @@ if (Test-Path $examples) {
     Copy-Item $examples (Join-Path $dist 'examples') -Recurse
 }
 
+# ---- copy the built-in project templates (data-driven; read at runtime) ----
+# The IDE scans <ExeDir>\templates for template.manifest folders, so editing or
+# adding a template needs no rebuild. Keep this folder next to ZanIDE.exe.
+$templates = Join-Path $root 'templates'
+if (Test-Path $templates) {
+    Copy-Item $templates (Join-Path $dist 'templates') -Recurse
+} else {
+    Write-Output "PUBLISH_WARN: templates\ missing; New Project will use the built-in fallback set"
+}
+
 # ---- release readme ----
 Write-Output "[4/4] Writing README.txt ..."
 $readme = @"
@@ -130,6 +141,9 @@ Contents
   stdlib\        Standard library sources. zanc auto-includes the .zan files
                  it needs from here; keep this folder next to ZanIDE.exe.
   examples\      Sample programs shown in the IDE's Examples pane (optional).
+  templates\     Built-in New Project templates (one folder each, with a
+                 template.manifest). Edit or drop in your own folders to add
+                 templates -- no rebuild needed.
 
 Requirement
   None for normal use: zanc links via the bundled toolchain\ folder, so no
