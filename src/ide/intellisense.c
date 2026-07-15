@@ -350,7 +350,34 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                 current_class[nlen] = '\0';
                 class_brace = brace_depth;
 
-                add_symbol_ex(is, current_class, NULL, current_ns, NULL, filepath,
+                /* Capture the first base type after optional generic params
+                 * and a ':' so member completion can walk the inheritance
+                 * chain. Stored in the class symbol's type_name field. */
+                char base[128] = {0};
+                {
+                    const char *q = p;
+                    while (q < end && (*q == ' ' || *q == '\t')) q++;
+                    if (q < end && *q == '<') {
+                        int a = 1; q++;
+                        while (q < end && a > 0) {
+                            if (*q == '<') a++;
+                            else if (*q == '>') a--;
+                            q++;
+                        }
+                    }
+                    while (q < end && (*q == ' ' || *q == '\t')) q++;
+                    if (q < end && *q == ':') {
+                        q++;
+                        while (q < end && (*q == ' ' || *q == '\t')) q++;
+                        const char *b = q;
+                        while (q < end && (isalnum((unsigned char)*q) || *q == '_' || *q == '.')) q++;
+                        int blen = (int)(q - b);
+                        if (blen > 127) blen = 127;
+                        if (blen > 0) { memcpy(base, b, (size_t)blen); base[blen] = '\0'; }
+                    }
+                }
+
+                add_symbol_ex(is, current_class, base[0] ? base : NULL, current_ns, NULL, filepath,
                              last_doc_comment[0] ? last_doc_comment : NULL,
                              kind, line_num, (int)(name - content), false, 0);
                 last_doc_comment[0] = '\0';
@@ -598,6 +625,19 @@ const char *intel_resolve_type(intellisense_t *is, const char *var_name) {
     return NULL;
 }
 
+/* Return the base type of a user-defined class/struct, or NULL. */
+static const char *class_base(intellisense_t *is, const char *cls) {
+    for (int i = 0; i < is->symbol_count; i++) {
+        isym_t *sym = &is->symbols[i];
+        if ((sym->kind == ISYM_CLASS || sym->kind == ISYM_STRUCT ||
+             sym->kind == ISYM_INTERFACE) &&
+            strcmp(sym->name, cls) == 0) {
+            return sym->type_name[0] ? sym->type_name : NULL;
+        }
+    }
+    return NULL;
+}
+
 /* Complete members of a given type */
 int intel_complete_members(intellisense_t *is, const char *type_name,
                            const char *prefix) {
@@ -606,30 +646,45 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
 
     size_t plen = prefix ? strlen(prefix) : 0;
 
-    /* Check user-defined type members first */
-    for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-        isym_t *sym = &is->symbols[i];
-        if (sym->parent[0] == '\0') continue;
-        if (strcmp(sym->parent, type_name) != 0) continue;
-        if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
-            sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
-            continue;
+    /* Check user-defined type members, walking the inheritance chain so
+     * inherited members from base classes are offered too. */
+    const char *cls = type_name;
+    int guard = 0;
+    while (cls && cls[0] && guard < 16 &&
+           is->completion_count < INTEL_MAX_COMPLETIONS) {
+        for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            isym_t *sym = &is->symbols[i];
+            if (sym->parent[0] == '\0') continue;
+            if (strcmp(sym->parent, cls) != 0) continue;
+            if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
+                sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
+                continue;
 
-        if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
+            if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
 
-        completion_t *c = &is->completions[is->completion_count++];
-        strncpy(c->label, sym->name, sizeof(c->label) - 1);
-        if (sym->kind == ISYM_METHOD)
-            snprintf(c->insert_text, sizeof(c->insert_text), "%s(", sym->name);
-        else
-            strncpy(c->insert_text, sym->name, sizeof(c->insert_text) - 1);
-        if (sym->signature[0])
-            strncpy(c->detail, sym->signature, sizeof(c->detail) - 1);
-        else
-            snprintf(c->detail, sizeof(c->detail), "%s.%s : %s", type_name, sym->name, sym->type_name);
-        strncpy(c->doc, sym->doc, sizeof(c->doc) - 1);
-        c->kind = sym->kind;
-        c->sort_priority = 0;
+            /* skip members already added (e.g. overridden in a derived class) */
+            bool dup = false;
+            for (int k = 0; k < is->completion_count; k++) {
+                if (strcmp(is->completions[k].label, sym->name) == 0) { dup = true; break; }
+            }
+            if (dup) continue;
+
+            completion_t *c = &is->completions[is->completion_count++];
+            strncpy(c->label, sym->name, sizeof(c->label) - 1);
+            if (sym->kind == ISYM_METHOD)
+                snprintf(c->insert_text, sizeof(c->insert_text), "%s(", sym->name);
+            else
+                strncpy(c->insert_text, sym->name, sizeof(c->insert_text) - 1);
+            if (sym->signature[0])
+                strncpy(c->detail, sym->signature, sizeof(c->detail) - 1);
+            else
+                snprintf(c->detail, sizeof(c->detail), "%s.%s : %s", cls, sym->name, sym->type_name);
+            strncpy(c->doc, sym->doc, sizeof(c->doc) - 1);
+            c->kind = sym->kind;
+            c->sort_priority = (guard == 0) ? 0 : 1;
+        }
+        cls = class_base(is, cls);
+        guard++;
     }
 
     /* Check stdlib classes */
