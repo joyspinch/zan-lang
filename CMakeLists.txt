@@ -414,7 +414,17 @@ set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
 #      Skipped automatically wherever clang is absent. ----
 if(SELFHOST_CLANG)
   if(WIN32)
-    set(_fixedpoint_stack "-Xlinker;/STACK:268435456")
+    # Reserve a large stack so gen2 (which self-compiles into g3.ll) does not
+    # overflow. The flag depends on the linker clang drives: MSVC-targeting
+    # clang uses lld-link (/STACK:N); mingw clang uses GNU ld (--stack N).
+    execute_process(COMMAND ${SELFHOST_CLANG} -print-target-triple
+                    OUTPUT_VARIABLE _clang_triple
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_clang_triple MATCHES "msvc")
+      set(_fixedpoint_stack "-Xlinker;/STACK:268435456")
+    else()
+      set(_fixedpoint_stack "-Wl,--stack,268435456")
+    endif()
   else()
     set(_fixedpoint_stack "")
   endif()
