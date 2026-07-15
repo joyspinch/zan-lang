@@ -47,6 +47,27 @@ static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
     g->function_count++;
 }
 
+/* Guard a malloc result inside runtime allocator `fn`: if it is null, print
+ * "out of memory" and exit(1) rather than returning a header-offset pointer
+ * into a null allocation (which would later be dereferenced). */
+static void emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef isnull = LLVMBuildICmp(g->builder, LLVMIntEQ, raw,
+        LLVMConstPointerNull(i8ptr), "oom");
+    LLVMBasicBlockRef oom_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom.ok");
+    LLVMBuildCondBr(g->builder, isnull, oom_bb, ok_bb);
+    LLVMPositionBuilderAtEnd(g->builder, oom_bb);
+    LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, "out of memory\n", "oomtxt");
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "oomfmt");
+    LLVMValueRef pargs[] = { fmt, text };
+    LLVMBuildCall2(g->builder, g->printf_type, g->fn_printf, pargs, 2, "");
+    LLVMValueRef code = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0);
+    LLVMBuildCall2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
+    LLVMBuildUnreachable(g->builder);
+    LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+}
+
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
@@ -848,6 +869,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef total = LLVMBuildAdd(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = LLVMBuildCall2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
+        emit_oom_check(g, g->rt_alloc, raw);
         /* refcount = 1 at raw[0..7] */
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
@@ -892,6 +914,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef total = LLVMBuildAdd(g->builder, size, LLVMConstInt(i64, 16, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = LLVMBuildCall2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
+        emit_oom_check(g, g->rt_str_alloc, raw);
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
         LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
@@ -2528,18 +2551,14 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
     emit_rc_release_for_type(g, type, old);
 }
 
-/* Emit an unconditional guard for a fopen result: if `fp` is null, print
- * `msg` and exit(1), then continue in a fresh block. Unlike
- * emit_runtime_check this always fires -- file I/O errors are not optional
- * and must fail cleanly instead of dereferencing a null FILE*. */
-static void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg) {
+/* Emit: when `cond` (an i1) is true at runtime, print `msg` and exit(1), then
+ * continue in a fresh block. Shared by fopen and every other I/O return-value
+ * guard so a failed syscall never falls through with an invalid result. */
+static void emit_io_abort_if(zan_irgen_t *g, LLVMValueRef cond, const char *msg) {
     if (!g->current_fn) return;
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef isnull = LLVMBuildICmp(g->builder, LLVMIntEQ, fp,
-        LLVMConstPointerNull(i8ptr), "fp.isnull");
     LLVMBasicBlockRef fail_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "io.fail");
     LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "io.cont");
-    LLVMBuildCondBr(g->builder, isnull, fail_bb, cont_bb);
+    LLVMBuildCondBr(g->builder, cond, fail_bb, cont_bb);
     LLVMPositionBuilderAtEnd(g->builder, fail_bb);
     LLVMValueRef text = LLVMBuildGlobalStringPtr(g->builder, msg, "ioerr");
     LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%s", "ioerr_fmt");
@@ -2549,6 +2568,14 @@ static void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg) {
     LLVMBuildCall2(g->builder, g->exit_type, g->fn_exit, &code, 1, "");
     LLVMBuildUnreachable(g->builder);
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+}
+
+static void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg) {
+    if (!g->current_fn) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef isnull = LLVMBuildICmp(g->builder, LLVMIntEQ, fp,
+        LLVMConstPointerNull(i8ptr), "fp.isnull");
+    emit_io_abort_if(g, isnull, msg);
 }
 
 /* Emit a runtime guard: when `is_error` is true at runtime, print
@@ -4155,27 +4182,37 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             emit_fopen_check(g, fp, "cannot read file\n");
             /* seek to end, get size */
             LLVMValueRef seek_end_args[] = { fp, LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 2, 0) };
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
-                fseek_fn, seek_end_args, 3, "");
+            LLVMValueRef se_end = LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
+                fseek_fn, seek_end_args, 3, "se_end");
+            emit_io_abort_if(g, LLVMBuildICmp(g->builder, LLVMIntNE, se_end, LLVMConstInt(i32, 0, 0), "se_end.err"),
+                "cannot read file\n");
             LLVMValueRef size = LLVMBuildCall2(g->builder,
                 LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0), ftell_fn, &fp, 1, "sz");
+            emit_io_abort_if(g, LLVMBuildICmp(g->builder, LLVMIntSLT, size, LLVMConstInt(i64, 0, 0), "sz.err"),
+                "cannot read file\n");
             /* seek back to start */
             LLVMValueRef seek_start_args[] = { fp, LLVMConstInt(i64, 0, 0), LLVMConstInt(i32, 0, 0) };
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
-                fseek_fn, seek_start_args, 3, "");
+            LLVMValueRef se_start = LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0),
+                fseek_fn, seek_start_args, 3, "se_start");
+            emit_io_abort_if(g, LLVMBuildICmp(g->builder, LLVMIntNE, se_start, LLVMConstInt(i32, 0, 0), "se_start.err"),
+                "cannot read file\n");
             /* allocate buffer (size+1 for null terminator) */
             LLVMValueRef buf_size = LLVMBuildAdd(g->builder, size, LLVMConstInt(i64, 1, 0), "bsz");
             LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
-            /* read file */
+            /* read file; require the full byte count */
             LLVMValueRef fread_args[] = { buf, LLVMConstInt(i64, 1, 0), size, fp };
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr }, 4, 0),
-                fread_fn, fread_args, 4, "");
+            LLVMValueRef got = LLVMBuildCall2(g->builder, LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64, i8ptr }, 4, 0),
+                fread_fn, fread_args, 4, "got");
+            emit_io_abort_if(g, LLVMBuildICmp(g->builder, LLVMIntNE, got, size, "got.err"),
+                "cannot read file\n");
             /* null terminate */
             LLVMValueRef end_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), buf, &size, 1, "end");
             LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 0, 0), end_ptr);
             /* close */
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-                fclose_fn, &fp, 1, "");
+            LLVMValueRef rd_close = LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                fclose_fn, &fp, 1, "rd_close");
+            emit_io_abort_if(g, LLVMBuildICmp(g->builder, LLVMIntNE, rd_close, LLVMConstInt(i32, 0, 0), "rd_close.err"),
+                "cannot read file\n");
             emit_release_owned_call_temp(g, path_ast, path_arg, locals);
             return buf;
         }
@@ -4211,10 +4248,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 fopen_fn, open_args, 2, "fp");
             emit_fopen_check(g, fp, "cannot write file\n");
             LLVMValueRef fputs_args[] = { content_arg, fp };
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
-                fputs_fn, fputs_args, 2, "");
-            LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
-                fclose_fn, &fp, 1, "");
+            LLVMValueRef put = LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
+                fputs_fn, fputs_args, 2, "put");
+            emit_io_abort_if(g, LLVMBuildICmp(g->builder, LLVMIntSLT, put, LLVMConstInt(i32, 0, 0), "put.err"),
+                "cannot write file\n");
+            LLVMValueRef wr_close = LLVMBuildCall2(g->builder, LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                fclose_fn, &fp, 1, "wr_close");
+            emit_io_abort_if(g, LLVMBuildICmp(g->builder, LLVMIntNE, wr_close, LLVMConstInt(i32, 0, 0), "wr_close.err"),
+                "cannot write file\n");
             emit_release_owned_call_temp(g, path_ast, path_arg, locals);
             emit_release_owned_call_temp(g, content_ast, content_arg, locals);
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);

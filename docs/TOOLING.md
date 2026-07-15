@@ -110,8 +110,8 @@ zan: memory leak detected: 2 object(s) still reachable at exit
 ```
 
 Correct programs whose objects are all released report nothing, so the check
-is free of false positives. See `src/self/rt_divzero.zan` and
-`src/self/rt_leak.zan` for runnable examples.
+is free of false positives. See `tests/leakprobe/` and `tests/runtime/` for
+runnable examples.
 
 ## Test suite & deterministic codegen
 
@@ -119,8 +119,9 @@ is free of false positives. See `src/self/rt_divzero.zan` and
 
 - **conformance** — each `tests/conformance/*.zan` is compiled, run, and its
   stdout diffed against a golden `.out`.
-- **selfhost** — the bootstrap-compiler stages in `src/self/` are compiled and
-  run, with golden outputs.
+- **selfhost** — the C host compiles the entire self-hosted compiler
+  (`src/selfhost/*.zan`) into gen1, which then lowers a real program
+  (`tests/selfhost/prog1.zan`) to LLVM IR (`tests/run_selfhost.cmake`).
 - **determinism** — every conformance and self-host program is compiled to LLVM
   IR *twice*, and the two emissions must be byte-for-byte identical.
 

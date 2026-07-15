@@ -407,6 +407,31 @@ add_test(NAME selfhost_gen1
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
 set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
 
+# ---- Self-hosting fixed point: full gen0->gen1->gen2->gen3 closure, asserting
+#      g2.ll == g3.ll byte-for-byte. Requires clang to link the emitted IR, so
+#      it is only registered when clang is found; the Windows link step needs a
+#      large stack reservation (matching what the host bakes into its own link).
+#      Skipped automatically wherever clang is absent. ----
+if(SELFHOST_CLANG)
+  if(WIN32)
+    set(_fixedpoint_stack "-Xlinker;/STACK:268435456")
+  else()
+    set(_fixedpoint_stack "")
+  endif()
+  add_test(NAME selfhost_fixed_point
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+      -DCLANG=${SELFHOST_CLANG}
+      -DGEN1=${CMAKE_BINARY_DIR}/fixedpoint_gen1${_exe_ext}
+      -DGEN2=${CMAKE_BINARY_DIR}/fixedpoint_gen2${_exe_ext}
+      -DG2LL=${CMAKE_BINARY_DIR}/fixedpoint_g2.ll
+      -DG3LL=${CMAKE_BINARY_DIR}/fixedpoint_g3.ll
+      "-DSTACK_ARGS=${_fixedpoint_stack}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_fixedpoint.cmake)
+  set_tests_properties(selfhost_fixed_point PROPERTIES TIMEOUT 1200)
+endif()
+
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----
 # These programs import Gui modules that reference [DllImport("zan_gui")], so the
 # produced executable must link zan_gui. zanc resolves [DllImport] libs against
