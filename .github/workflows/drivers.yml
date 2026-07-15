@@ -48,7 +48,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config ninja-build patchelf unzip curl \
             libpq-dev \
-            libx11-dev libxext-dev libwayland-dev libgbm-dev \
+            libx11-dev libxext-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxfixes-dev libxinerama-dev libxss-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libgbm-dev libdrm-dev \
             libgl1-mesa-dev libasound2-dev libpulse-dev
 
       - name: Build SDL3 from source
@@ -114,18 +116,27 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install deps
-        run: brew install sdl3 libpq sqlite cmake pkg-config llvm@17
-
-      - name: Build zan_sdl3 bridge
-        run: |
-          export LLVM_DIR="$(brew --prefix llvm@17)/lib/cmake/llvm"
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" -DZAN_BUILD_SDL3=ON
-          cmake --build build --target zan_sdl3 -j
+        run: brew install sdl3 libpq sqlite pkg-config
 
       - name: Stage SDL3 driver
         run: |
-          export PATH="$(brew --prefix)/bin:$PATH"
-          BUILD_DIR="$PWD/build" bash scripts/stage_sdl3_macos.sh "${{ matrix.target }}"
+          set -eux
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix sdl3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          DEST="stdlib/SDL3/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST"
+          xcrun clang -O2 -fPIC -dynamiclib -install_name @rpath/libzan_sdl3.dylib \
+            -o "$DEST/libzan_sdl3.dylib" stdlib/SDL3/native/zan_sdl3.c \
+            $(pkg-config --cflags sdl3) $(pkg-config --libs sdl3) -lm
+          cp -L "$(pkg-config --variable=libdir sdl3)/libSDL3.0.dylib" "$DEST/libSDL3.0.dylib"
+          chmod u+w "$DEST/libSDL3.0.dylib"
+          SDLDEP="$(otool -L "$DEST/libzan_sdl3.dylib" | awk '/libSDL3/{print $1; exit}')"
+          install_name_tool -change "$SDLDEP" @rpath/libSDL3.0.dylib "$DEST/libzan_sdl3.dylib"
+          install_name_tool -id @rpath/libSDL3.0.dylib "$DEST/libSDL3.0.dylib"
+          install_name_tool -add_rpath @loader_path "$DEST/libzan_sdl3.dylib" || true
+          codesign --force --sign - "$DEST/libSDL3.0.dylib"
+          codesign --force --sign - "$DEST/libzan_sdl3.dylib"
+          printf 'libzan_sdl3.dylib\nlibSDL3.0.dylib\n' > "$DEST/zan_sdl3.bundle"
+          otool -L "$DEST/libzan_sdl3.dylib"
 
       - name: Stage SQLite driver
         run: |
@@ -161,6 +172,9 @@ jobs:
           - { target: win-x64,   msystem: MINGW64,    prefix: mingw-w64-x86_64 }
           - { target: win-arm64, msystem: CLANGARM64, prefix: mingw-w64-clang-aarch64 }
     runs-on: ${{ matrix.target == 'win-arm64' && 'windows-11-arm' || 'windows-latest' }}
+    # win-arm64 SDL3 packaging is not yet reliably available in MSYS2; keep the
+    # job best-effort so it never blocks the other targets.
+    continue-on-error: ${{ matrix.target == 'win-arm64' }}
     defaults:
       run:
         shell: msys2 {0}
