@@ -550,11 +550,13 @@ class OverlayPopup {
     SignalInt model;
     int triggerId;
     SignalBool openFlag;
+    SignalInt scrollModel;
     UiEvent onChange;
 
     static OverlayPopup OptionList(int x, int y, int w, List<string> options,
                                    int baseId, SignalInt model, int triggerId,
-                                   SignalBool openFlag, UiEvent onChange) {
+                                   SignalBool openFlag, SignalInt scrollModel,
+                                   UiEvent onChange) {
         OverlayPopup p = new OverlayPopup();
         p.x = x;
         p.y = y;
@@ -564,6 +566,7 @@ class OverlayPopup {
         p.model = model;
         p.triggerId = triggerId;
         p.openFlag = openFlag;
+        p.scrollModel = scrollModel;
         p.onChange = onChange;
         return p;
     }
@@ -574,30 +577,96 @@ class OverlayPopup {
         int count = options.Count;
         int optH = t.heightMedium;
         int totalH = count * optH;
+        int margin = app.Scale(4);
+        int popupW = w;
+        int maxW = c.Width() - margin * 2;
+        if (maxW < 1) { maxW = 1; }
+        if (popupW < app.Scale(48)) { popupW = app.Scale(48); }
+        if (popupW > maxW) { popupW = maxW; }
+        int popupX = x;
+        if (popupX + popupW > c.Width() - margin) {
+            popupX = c.Width() - margin - popupW;
+        }
+        if (popupX < margin) { popupX = margin; }
+
+        int maxViewH = optH * 8;
+        int availableH = c.Height() - margin * 2;
+        if (availableH < 1) { availableH = 1; }
+        if (maxViewH > availableH) { maxViewH = availableH; }
+        int viewH = totalH;
+        if (viewH > maxViewH) { viewH = maxViewH; }
+        int popupY = y;
+        if (popupY + viewH > c.Height() - margin) {
+            popupY = y - viewH - t.heightMedium - app.Scale(8);
+        }
+        if (popupY < margin) { popupY = c.Height() - margin - viewH; }
+        if (popupY < margin) { popupY = margin; }
+
+        int maxScroll = totalH - viewH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        int scrollY = scrollModel.Get();
+        int selectedIdx = model.Get();
+        if (scrollY == 0 && selectedIdx * optH >= viewH) {
+            scrollY = selectedIdx * optH - viewH + optH;
+        }
+        if (scrollY < 0) { scrollY = 0; }
+        if (scrollY > maxScroll) { scrollY = maxScroll; }
+
+        bool pointerInside = app.mouseX >= popupX && app.mouseX < popupX + popupW
+            && app.mouseY >= popupY && app.mouseY < popupY + viewH;
+        if (app.window.EventKind() == 13 && pointerInside && maxScroll > 0) {
+            int oldScroll = scrollY;
+            scrollY = scrollY - app.window.EventKeyCode() * optH / 120;
+            if (scrollY < 0) { scrollY = 0; }
+            if (scrollY > maxScroll) { scrollY = maxScroll; }
+            if (scrollY != oldScroll) {
+                scrollModel.Set(scrollY);
+                app.RequestRedraw();
+            }
+        }
+        app.CaptureWheel(popupX, popupY, popupW, viewH);
 
         // Shadow + body.
-        c.FillRoundRect(x + 1, y + 2, w, totalH, t.borderRadiusMedium, t.shadowColor);
-        c.FillRoundRect(x, y, w, totalH, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(x, y, w, totalH, t.borderPrimary, 1);
+        app.BlockHitsBelow();
+        c.FillRoundRect(popupX + 1, popupY + 2, popupW, viewH, t.borderRadiusMedium, t.shadowColor);
+        c.FillRoundRect(popupX, popupY, popupW, viewH, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(popupX, popupY, popupW, viewH, t.borderPrimary, 1);
+        app.BlockHitsRect(popupX, popupY, popupW, viewH);
 
-        int selectedIdx = model.Get();
+        c.PushClip(popupX, popupY, popupW, viewH);
         int i = 0;
         while (i < count) {
             int optId = baseId + i;
-            int optY = y + i * optH;
-            bool hovered = app.focus.IsHovered(optId);
-            bool selected = i == selectedIdx;
-            if (hovered) { c.FillRect(x + 1, optY, w - 2, optH, t.bgHover); }
-            int textColor = t.textPrimary;
-            if (selected) { textColor = t.primary; }
-            int optMaxW = w - t.paddingSmall - t.paddingLarge - t.iconSizeSmall - t.paddingSmall;
-            c.DrawText(x + t.paddingSmall, optY + (optH - Canvas.FontHeight(t.fontSizeMedium)) / 2,
-                       Ellipsis.Fit(options[i], optMaxW, t.fontSizeMedium), textColor, t.fontSizeMedium);
-            if (selected) {
-                Icon.DrawCenteredIn(c, "check", x + w - t.paddingLarge - t.iconSizeSmall, optY, t.iconSizeSmall, optH, t.iconSizeSmall, t.primary);
+            int optY = popupY + i * optH - scrollY;
+            if (optY + optH > popupY && optY < popupY + viewH) {
+                bool hovered = app.focus.IsHovered(optId);
+                bool selected = i == selectedIdx;
+                if (hovered) { c.FillRect(popupX + 1, optY, popupW - 2, optH, t.bgHover); }
+                int textColor = t.textPrimary;
+                if (selected) { textColor = t.primary; }
+                int optMaxW = popupW - t.paddingSmall - t.paddingLarge - t.iconSizeSmall - t.paddingSmall;
+                c.DrawText(popupX + t.paddingSmall, optY + (optH - Canvas.FontHeight(t.fontSizeMedium)) / 2,
+                           Ellipsis.Fit(options[i], optMaxW, t.fontSizeMedium), textColor, t.fontSizeMedium);
+                if (selected) {
+                    Icon.DrawCenteredIn(c, "check", popupX + popupW - t.paddingLarge - t.iconSizeSmall,
+                                        optY, t.iconSizeSmall, optH, t.iconSizeSmall, t.primary);
+                }
+                app.hitTester.Register(HitRegion.Create(optId, popupX, optY, popupW, optH, 0));
             }
-            app.hitTester.Register(HitRegion.Create(optId, x, optY, w, optH, 0));
             i = i + 1;
+        }
+        c.PopClip();
+        if (maxScroll > 0 && viewH > 0) {
+            int barW = app.Scale(5);
+            int thumbH = viewH * viewH / totalH;
+            int minThumb = app.Scale(18);
+            if (thumbH < minThumb) { thumbH = minThumb; }
+            if (thumbH > viewH) { thumbH = viewH; }
+            int travel = viewH - thumbH;
+            int thumbY = popupY;
+            if (maxScroll > 0) { thumbY = popupY + scrollY * travel / maxScroll; }
+            c.FillRoundRect(popupX + popupW - barW - app.Scale(2), thumbY,
+                            barW, thumbH, barW / 2, t.scrollbar);
         }
 
         // Centralized dispatch: choose on a click that landed on an option
@@ -623,6 +692,10 @@ class OverlayPopup {
                 openFlag.Set(false);
                 app.RequestRedraw();
             }
+        }
+        if (kind == 4 && app.window.EventKeyCode() == 27) {
+            openFlag.Set(false);
+            app.RequestRedraw();
         }
     }
 }

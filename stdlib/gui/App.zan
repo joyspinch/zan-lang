@@ -36,6 +36,7 @@ class App {
     List<string> themeNames;
     SignalInt themeMenuModel;
     SignalBool themeMenuOpen;
+    SignalInt themeMenuScroll;
     int themeMenuBaseId;
     UiEvent themeMenuChange;
     // Built-in skin switching: when autoSkins is on the title-bar theme button
@@ -52,6 +53,8 @@ class App {
     int wheelCapY;
     int wheelCapW;
     int wheelCapH;
+    bool blocksInputBelow;
+    bool inputBlockPrevious;
 
     // --- Event delegation ---
     // Target of the current mouse event, resolved once per event in
@@ -147,6 +150,8 @@ class App {
         app.wheelCapY = 0;
         app.wheelCapW = 0;
         app.wheelCapH = 0;
+        app.blocksInputBelow = false;
+        app.inputBlockPrevious = false;
         app.clickTargetId = -1;
         app.pressTargetId = -1;
         app.lastClickId = -1;
@@ -168,6 +173,7 @@ class App {
         app.themeNames = new List<string>();
         app.themeMenuModel = SignalInt.Create(0);
         app.themeMenuOpen = SignalBool.Create(false);
+        app.themeMenuScroll = SignalInt.Create(0);
         app.themeMenuBaseId = 0;
         app.themeMenuChange = UiEvent.Create();
         app.autoSkins = false;
@@ -570,6 +576,7 @@ class App {
             int hit = hitTester.HitTest(mouseX, mouseY);
             if (showThemeButton && hit == themeId) {
                 if (this.ThemeMenuMode()) {
+                    if (!themeMenuOpen.Get()) { themeMenuScroll.Set(0); }
                     themeMenuOpen.Set(!themeMenuOpen.Get());
                     needsRedraw = true;
                 } else {
@@ -598,7 +605,7 @@ class App {
             int my = hbar + Scale(2);
             AddOverlay(OverlayPopup.OptionList(mx, my, menuW, themeNames,
                 themeMenuBaseId, themeMenuModel, themeId, themeMenuOpen,
-                themeMenuChange));
+                themeMenuScroll, themeMenuChange));
         }
     }
 
@@ -955,9 +962,11 @@ class App {
         // Tab / Shift+Tab move keyboard focus through the focusable ring built
         // last frame (see FocusManager.RegisterFocusable).
         if (kind == 4 && window.EventKeyCode() == 9) {
-            int dir = 1;
-            if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
-            focus.FocusStep(dir);
+            if (!this.HasOverlays() && !blocksInputBelow) {
+                int dir = 1;
+                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+                focus.FocusStep(dir);
+            }
             needsRedraw = true;
         }
 
@@ -966,7 +975,12 @@ class App {
             int viewH = canvas.Height() - titlebarH;
             mouseX = window.EventX();
             mouseY = window.EventY();
-            if (splitX > 0 && mouseX < splitX) {
+            if (this.HasOverlays() || blocksInputBelow) {
+                // Popups and modal scrims own this input frame. Let their
+                // render path consume the wheel instead of moving content
+                // underneath the floating surface.
+                needsRedraw = true;
+            } else if (splitX > 0 && mouseX < splitX) {
                 // Scroll the sidebar when the pointer is over it.
                 int oldS = sidebarScrollY;
                 sidebarScrollY = sidebarScrollY - delta * scrollSpeed / 120;
@@ -1078,9 +1092,11 @@ class App {
         }
 
         if (kind == 4 && window.EventKeyCode() == 9) {
-            int dir = 1;
-            if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
-            focus.FocusStep(dir);
+            if (!this.HasOverlays() && !blocksInputBelow) {
+                int dir = 1;
+                if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
+                focus.FocusStep(dir);
+            }
             needsRedraw = true;
         }
 
@@ -1089,7 +1105,9 @@ class App {
             mouseY = window.EventY();
             int delta = window.EventKeyCode();
             int viewH = canvas.Height() - titlebarH;
-            if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
+            if (this.HasOverlays() || blocksInputBelow) {
+                needsRedraw = true;
+            } else if (mouseX >= wheelCapX && mouseX < wheelCapX + wheelCapW
                 && mouseY >= wheelCapY && mouseY < wheelCapY + wheelCapH) {
                 needsRedraw = true;
             } else {
@@ -1138,6 +1156,8 @@ class App {
         blurSlotSeq = 0;
         wheelCapW = 0;
         wheelCapH = 0;
+        inputBlockPrevious = blocksInputBelow;
+        blocksInputBelow = false;
         hitTester.Clear();
         focus.ResetIds();
         overlays = new List<OverlayPopup>();
@@ -1180,7 +1200,11 @@ class App {
     /// Full-window BlockHitsRect: the standard scrim for a modal overlay whose
     /// dimmed backdrop covers the whole window.
     int BlockHitsBelow() {
-        return BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
+        bool firstBlock = !blocksInputBelow;
+        blocksInputBelow = true;
+        int id = BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
+        if (firstBlock && !inputBlockPrevious) { focus.SetFocused(id); }
+        return id;
     }
 
     /// Id of the widget the current click (mouse-up) landed on, or -1.

@@ -86,9 +86,31 @@ class UiDoc {
 
         if (node.Has("gap")) { c.gap = node.Int("gap", 0); }
         if (node.Has("pad")) { c.Pad(node.Int("pad", 0)); }
+        if (node.Has("padding")) { c.Pad(node.Int("padding", 0)); }
+        if (node.Has("dock")) {
+            JsonValue dv = node.Get("dock");
+            if (dv.IsNumber()) {
+                c.dock = dv.AsInt(0);
+            } else {
+                c.dock = UiDoc.DockValue(dv.AsString(""));
+            }
+        }
+        if (node.Has("x")) { c.mx = node.Int("x", 0); }
+        if (node.Has("y")) { c.my = node.Int("y", 0); }
+        if (node.Has("width")) { c.prefW = node.Int("width", c.prefW); }
+        if (node.Has("height")) { c.prefH = node.Int("height", c.prefH); }
         if (node.Has("grow") && node.Bool("grow", false)) { c.Grow(); }
         if (node.Has("visible")) { c.visible = node.Bool("visible", true); }
-        if (node.Has("bind")) { c.bindPath = node.Str("bind", ""); }
+        if (node.Has("bind")) {
+            JsonValue bv = node.Get("bind");
+            if (bv != null && bv.IsObject()) {
+                c.bindPath = bv.Str("path", "");
+                c.bindProp = bv.Str("prop", "");
+            } else {
+                c.bindPath = node.Str("bind", "");
+            }
+        }
+        if (node.Has("bindProp")) { c.bindProp = node.Str("bindProp", ""); }
 
         // Remaining keys: `on<Event>` handler names vs. widget props (SetProp).
         List<string> events = c.Events();
@@ -182,7 +204,17 @@ class UiDoc {
         return k == "type" || k == "children" || k == "name"
             || k == "gap" || k == "pad" || k == "padding"
             || k == "dock" || k == "grow" || k == "visible"
-            || k == "bind" || k == "class" || k == "options";
+            || k == "bind" || k == "bindProp" || k == "class" || k == "options"
+            || k == "x" || k == "y" || k == "width" || k == "height";
+    }
+
+    static int DockValue(string text) {
+        if (text == "top" || text == "Top") { return Dock.Top(); }
+        if (text == "bottom" || text == "Bottom") { return Dock.Bottom(); }
+        if (text == "left" || text == "Left") { return Dock.Left(); }
+        if (text == "right" || text == "Right") { return Dock.Right(); }
+        if (text == "fill" || text == "Fill") { return Dock.Fill(); }
+        return Dock.Manual();
     }
 
     /// If `k` is an `on<Event>` key whose event is one this control declares,
@@ -243,13 +275,33 @@ class UiDoc {
         SyncFromNode(root);
     }
 
+    /// True when the control publishes an editable property named `key`
+    /// (via its Props() list). Used to route a bound scalar to the control's
+    /// canonical property instead of blindly writing both "value" and "text".
+    static bool HasProp(Control c, string key) {
+        List<PropSpec> ps = c.Props();
+        int i = 0;
+        while (i < ps.Count) {
+            if (ps[i].key == key) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     void SyncFromNode(Control c) {
         if (c.bindPath != "") {
             JsonValue v = model.PathGet(c.bindPath);
             if (v != null) {
                 string s = v.AsString("");
-                c.SetProp("value", s);
-                c.SetProp("text", s);
+                if (c.bindProp != "") {
+                    c.SetProp(c.bindProp, s);
+                } else if (UiDoc.HasProp(c, "value")) {
+                    c.SetProp("value", s);
+                } else if (UiDoc.HasProp(c, "text")) {
+                    c.SetProp("text", s);
+                } else {
+                    c.SetProp("value", s);
+                }
             }
         }
         int j = 0;
@@ -266,22 +318,55 @@ class UiDoc {
         SyncToNode(root);
     }
 
+    string BoundValue(Control c) {
+        if (c.bindProp != "") { return c.GetProp(c.bindProp); }
+        if (UiDoc.HasProp(c, "value")) { return c.GetProp("value"); }
+        if (UiDoc.HasProp(c, "text")) { return c.GetProp("text"); }
+        string s = c.GetProp("value");
+        if (s == "") { s = c.GetProp("text"); }
+        return s;
+    }
+
+    void CaptureBindings(Control c) {
+        if (c.bindPath != "") { c.bindSnapshot = BoundValue(c); }
+        int i = 0;
+        while (i < c.children.Count) {
+            CaptureBindings(c.children[i]);
+            i = i + 1;
+        }
+    }
+
+    void SyncChangedNode(Control c) {
+        if (c.bindPath != "") {
+            string s = BoundValue(c);
+            if (s != c.bindSnapshot) { WriteBoundValue(c, s); }
+        }
+        int i = 0;
+        while (i < c.children.Count) {
+            SyncChangedNode(c.children[i]);
+            i = i + 1;
+        }
+    }
+
+    void WriteBoundValue(Control c, string s) {
+        JsonValue cur = model.PathGet(c.bindPath);
+        if (cur != null && cur.IsBool()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
+        } else if (cur != null && cur.IsNumber()) {
+            model.PathSetValue(c.bindPath, JsonValue.NewNum(s));
+        } else {
+            model.PathSet(c.bindPath, s);
+        }
+    }
+
     void SyncToNode(Control c) {
         if (c.bindPath != "") {
-            string s = c.GetProp("value");
-            if (s == "") { s = c.GetProp("text"); }
+            string s = BoundValue(c);
             // Preserve the existing leaf's JSON type on write-back so a bool
             // stays a bool and a number stays a number instead of everything
             // collapsing to a string. Falls back to a string leaf when the
             // path is new / untyped.
-            JsonValue cur = model.PathGet(c.bindPath);
-            if (cur != null && cur.IsBool()) {
-                model.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
-            } else if (cur != null && cur.IsNumber()) {
-                model.PathSetValue(c.bindPath, JsonValue.NewNum(s));
-            } else {
-                model.PathSet(c.bindPath, s);
-            }
+            WriteBoundValue(c, s);
         }
         int j = 0;
         while (j < c.children.Count) {
@@ -298,6 +383,21 @@ class UiDoc {
             root.dock = 5;
             f.Add(root);
         }
-        f.Run();
+
+        // Drive the retained loop here so bindings stay live in both
+        // directions instead of only copying state once at startup.
+        App app = f.GetApp();
+        app.Show();
+        while (app.isRunning) {
+            if (!app.ProcessEvent()) { break; }
+            if (!app.needsRedraw) { continue; }
+            app.BeginFrame();
+            SyncFromModel();
+            if (root != null) { CaptureBindings(root); }
+            f.RenderFrame(app);
+            if (root != null) { SyncChangedNode(root); }
+            app.RenderChrome(title);
+            app.PresentFrame();
+        }
     }
 }
