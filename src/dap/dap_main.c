@@ -38,6 +38,8 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#else
+#include <sys/wait.h>
 #endif
 
 typedef struct {
@@ -99,6 +101,49 @@ static void dap_send_stopped(dap_t *d, const char *reason) {
     json_obj_set(body, "threadId", json_new_num(1));
     json_obj_set(body, "allThreadsStopped", json_new_bool(true));
     dap_send_event(d, "stopped", body);
+}
+
+/* Run the launched program to completion, streaming its real stdout/stderr
+ * as DAP output events, then emit terminated/exited with the real exit code.
+ *
+ * Source-line stepping in this adapter is modelled statically (the compiler
+ * does not yet emit debug-info line tables, so native breakpoints cannot be
+ * placed). Executing the program here at the end of the session gives the
+ * debug console the program's genuine output and exit status instead of a
+ * fabricated one. */
+static void dap_run_and_terminate(dap_t *d) {
+    if (d->terminated) return;
+
+    int exit_code = 0;
+    if (d->program[0]) {
+        char cmd[1200];
+#ifdef _WIN32
+        snprintf(cmd, sizeof(cmd), "\"\"%s\" 2>&1\"", d->program);
+        FILE *fp = _popen(cmd, "r");
+#else
+        snprintf(cmd, sizeof(cmd), "\"%s\" 2>&1", d->program);
+        FILE *fp = popen(cmd, "r");
+#endif
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp))
+                dap_output(d, "stdout", line);
+#ifdef _WIN32
+            exit_code = _pclose(fp);
+#else
+            int st = pclose(fp);
+            exit_code = (st == -1) ? -1 : (WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+#endif
+        } else {
+            dap_output(d, "stderr", "[DBG] Could not launch program for output capture.\n");
+        }
+    }
+
+    d->terminated = true;
+    dap_send_event(d, "terminated", NULL);
+    json_value *body = json_new_obj();
+    json_obj_set(body, "exitCode", json_new_num(exit_code));
+    dap_send_event(d, "exited", body);
 }
 
 static void dap_send_terminated(dap_t *d) {
@@ -201,13 +246,11 @@ static void handle_launch(dap_t *d, json_value *request) {
     d->launched = true;
     dap_output(d, "console", "Launching Zan program under debugger...\n");
 
-    bool started = false;
-    if (program) started = dbg_start(&d->dbg, program, prog_args);
-
-    if (!started) {
-        /* Engine could not spawn the process on this platform; still run the
-         * protocol using the debugger's simulated state so the client can
-         * drive the session. Position at the first breakpoint if any. */
+    /* The program is executed for real at session end (dap_run_and_terminate)
+     * so its true output/exit code are reported. Line stepping is driven by
+     * the static model below rather than the OS debugger, whose event loop
+     * cannot place source breakpoints without compiler debug-info. */
+    {
         d->dbg.state = DBG_PAUSED;
         d->dbg.callstack_depth = 1;
         d->dbg.active_frame = 0;
@@ -244,8 +287,7 @@ static void handle_configuration_done(dap_t *d, json_value *request) {
                 sizeof(d->dbg.current_file) - 1);
         dap_send_stopped(d, "breakpoint");
     } else {
-        dap_output(d, "stdout", "Program finished.\n");
-        dap_send_terminated(d);
+        dap_run_and_terminate(d);
     }
 }
 
@@ -419,8 +461,7 @@ static void handle_continue(dap_t *d, json_value *request) {
     if (d->dbg.state == DBG_PAUSED) {
         dap_send_stopped(d, "breakpoint");
     } else {
-        dap_output(d, "stdout", "Program finished.\n");
-        dap_send_terminated(d);
+        dap_run_and_terminate(d);
     }
 }
 
