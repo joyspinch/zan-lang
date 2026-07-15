@@ -271,23 +271,45 @@ static void method_call_context(const char *text, size_t offset,
     *active_param = 0;
 
     int paren_depth = 0;
-    int commas = 0;
     size_t i = offset;
+    bool found = false;
 
-    /* scan backward to find the opening ( */
+    /* scan backward to find the opening ( of the enclosing call */
     while (i > 0) {
         i--;
         if (text[i] == ')') paren_depth++;
         else if (text[i] == '(') {
-            if (paren_depth == 0) break;
+            if (paren_depth == 0) { found = true; break; }
             paren_depth--;
-        } else if (text[i] == ',' && paren_depth == 0) {
-            commas++;
         }
     }
-    *active_param = commas;
+    if (!found) return;
 
-    if (i == 0) return;
+    /* Count the argument index at the cursor by scanning forward from the '('
+     * and counting only top-level commas: commas nested in (), [], {}, generic
+     * <...>, or inside string/char literals do not separate arguments. */
+    {
+        int depth = 0;
+        int commas = 0;
+        for (size_t j = i + 1; j < offset; j++) {
+            char ch = text[j];
+            if (ch == '"' || ch == '\'') {
+                char q = ch;
+                j++;
+                while (j < offset && text[j] != q) {
+                    if (text[j] == '\\') j++;
+                    j++;
+                }
+                continue;
+            }
+            if (ch == '(' || ch == '[' || ch == '{') depth++;
+            else if (ch == ')' || ch == ']' || ch == '}') { if (depth > 0) depth--; }
+            else if (ch == '<' && is_ident_char(text[j - 1])) depth++;
+            else if (ch == '>' && depth > 0) depth--;
+            else if (ch == ',' && depth == 0) commas++;
+        }
+        *active_param = commas;
+    }
 
     /* extract method name before the '(' */
     size_t end = i;
