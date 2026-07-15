@@ -38,6 +38,12 @@ class App {
     SignalBool themeMenuOpen;
     int themeMenuBaseId;
     UiEvent themeMenuChange;
+    // Built-in skin switching: when autoSkins is on the title-bar theme button
+    // is a menu of Theme.PresetNames and App applies the picked preset itself
+    // (no per-app handler). appliedSkin is the index last applied so RenderChrome
+    // detects a new pick each frame. Every window gets this by default.
+    bool autoSkins;
+    int appliedSkin;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
     // frame — e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
@@ -164,6 +170,8 @@ class App {
         app.themeMenuOpen = SignalBool.Create(false);
         app.themeMenuBaseId = 0;
         app.themeMenuChange = UiEvent.Create();
+        app.autoSkins = false;
+        app.appliedSkin = -1;
         app.animKeys = new List<int>();
         app.animVals = new List<int>();
         app.animTarget = new List<int>();
@@ -180,6 +188,11 @@ class App {
         // Reset the UI-thread dispatch queue up front (on the UI thread) so
         // App.Post is safe the moment any background worker is spawned.
         Dispatcher.Init();
+        // Every window gets the built-in skin picker in its title bar by
+        // default (light window -> "Light" preselected). The id block is
+        // allocated now, before any app WidgetId.Mark, so option ids stay
+        // stable. Apps that persisted a skin just call EnableSkins(index).
+        app.EnableSkins(1);
         return app;
     }
 
@@ -187,6 +200,7 @@ class App {
         App app = App.Create(title, width, height);
         app.theme = Theme.Dark();
         app.isDark = true;
+        app.EnableSkins(0);
         return app;
     }
 
@@ -205,6 +219,122 @@ class App {
         theme = t;
         theme.ScaleByDpi(dpiScale);
         needsRedraw = true;
+    }
+
+    /// Turns the title-bar theme button into the built-in skin picker
+    /// (Theme.PresetNames) and has App apply the chosen preset itself — no
+    /// per-app change handler or switch statement. Every window enables this by
+    /// default (see Create); call again to preselect a persisted skin. `index`
+    /// must be the skin whose theme is already active so the first frame does
+    /// not re-apply it. Idempotent: the stable id block is allocated once.
+    void EnableSkins(int index) {
+        autoSkins = true;
+        themeNames = Theme.PresetNames();
+        if (themeMenuBaseId == 0) {
+            themeMenuBaseId = WidgetId.Block(themeNames.Count);
+        }
+        themeMenuModel.Set(index);
+        appliedSkin = index;
+        showThemeButton = true;
+        window.SetCaptionButtons(ChromeButtonCount());
+        needsRedraw = true;
+    }
+
+    void EnableSkins() { this.EnableSkins(0); }
+
+    /// Applies built-in skin `i` (Theme.PresetAt) with its dark-chrome flag and
+    /// records it as the active skin so the picker stays in sync.
+    void ApplySkin(int i) {
+        this.ApplyTheme(Theme.PresetAt(i), Theme.PresetDark(i));
+        themeMenuModel.Set(i);
+        appliedSkin = i;
+    }
+
+    /// When the built-in skin picker's selection changed (user pick), applies
+    /// it. Called each frame start so content and chrome repaint together.
+    void SyncSkin() {
+        if (autoSkins && themeMenuModel.Get() != appliedSkin) {
+            this.ApplySkin(themeMenuModel.Get());
+        }
+    }
+
+    // ---- themed window backdrop (built-in, shared by every window) ---------
+    // The wallpaper that makes gradient/glass/neon skins read as real: a
+    // vertical gradient plus soft colour blobs the frosted panels blur. Lives
+    // in the framework so the IDE, the gallery and any window render identical
+    // skins — apps just call RenderBackground behind their content.
+
+    /// One soft wallpaper glow: nested translucent disks feathering to a bright
+    /// centre (no hard rim), giving the backdrop blur real colour to soften.
+    void BackdropBlob(int cx, int cy, int r, int cr, int cg, int cb) {
+        Canvas c = canvas;
+        c.FillCircle(cx, cy, r, Theme.Rgba(cr, cg, cb, 28));
+        c.FillCircle(cx, cy, r * 72 / 100, Theme.Rgba(cr, cg, cb, 36));
+        c.FillCircle(cx, cy, r * 46 / 100, Theme.Rgba(cr, cg, cb, 48));
+        c.FillCircle(cx, cy, r * 24 / 100, Theme.Rgba(cr, cg, cb, 58));
+    }
+
+    /// A soft glow coloured from a packed ARGB theme accent.
+    void BackdropDrift(int cx, int cy, int r, int color) {
+        int cr = (color / 65536) % 256;
+        int cg = (color / 256) % 256;
+        int cb = color % 256;
+        this.BackdropBlob(cx, cy, r, cr, cg, cb);
+    }
+
+    /// Colour blobs from the theme's own accents over the vertical gradient
+    /// (non-glass gradient presets) so the ramp reads as a wallpaper.
+    void BackdropGradientWallpaper(int ax, int ay, int aw, int ah) {
+        Theme t = theme;
+        int r = this.Scale(340);
+        this.BackdropDrift(ax + aw * 20 / 100, ay + ah * 24 / 100, r, t.primary);
+        this.BackdropDrift(ax + aw * 74 / 100, ay + ah * 18 / 100, r, t.info);
+        this.BackdropDrift(ax + aw * 82 / 100, ay + ah * 72 / 100, r, t.success);
+        this.BackdropDrift(ax + aw * 30 / 100, ay + ah * 84 / 100, r, t.error);
+    }
+
+    /// iOS-style multi-colour wallpaper for the frosted-glass presets.
+    void BackdropGlassWallpaper(int ax, int ay, int aw, int ah) {
+        this.BackdropBlob(ax + aw * 14 / 100, ay + ah * 20 / 100,
+            this.Scale(320), 128, 96, 245);
+        this.BackdropBlob(ax + aw * 40 / 100, ay + ah * 34 / 100,
+            this.Scale(300), 236, 120, 175);
+        this.BackdropBlob(ax + aw * 78 / 100, ay + ah * 16 / 100,
+            this.Scale(320), 96, 156, 255);
+        this.BackdropBlob(ax + aw * 62 / 100, ay + ah * 72 / 100,
+            this.Scale(340), 240, 112, 196);
+        this.BackdropBlob(ax + aw * 30 / 100, ay + ah * 86 / 100,
+            this.Scale(300), 96, 222, 208);
+        this.BackdropBlob(ax + aw * 90 / 100, ay + ah * 58 / 100,
+            this.Scale(280), 156, 120, 250);
+    }
+
+    /// Paints the active skin's window backdrop into [x,y,w,h]: a gradient +
+    /// soft colour blobs for gradient/glass presets (so frosted panels blur
+    /// real colour), otherwise a flat bgPrimary fill. Cached per redraw —
+    /// animation-only frames restore the pixels with one copy instead of
+    /// repainting the (expensive) blobs. `slot` is a snapshot cache slot the
+    /// caller reserves for its backdrop.
+    void RenderBackground(int x, int y, int w, int h, int slot) {
+        Canvas c = canvas;
+        Theme t = theme;
+        if (t.gradient != 0) {
+            bool restored = false;
+            if (!this.BackdropDirty()) {
+                restored = c.RestoreRect(x, y, w, h, slot);
+            }
+            if (!restored) {
+                c.FillVGrad(x, y, w, h, t.bgGradTop, t.bgGradBottom);
+                if (t.glass != 0) {
+                    this.BackdropGlassWallpaper(x, y, w, h);
+                } else {
+                    this.BackdropGradientWallpaper(x, y, w, h);
+                }
+                c.SnapshotRect(x, y, w, h, slot);
+            }
+        } else {
+            c.FillRect(x, y, w, h, t.bgPrimary);
+        }
     }
 
     int ChromeButtonCount() {
@@ -991,6 +1121,9 @@ class App {
     }
 
     void BeginFrame() {
+        // Apply a freshly-picked built-in skin before anything paints, so the
+        // whole window (content + chrome) redraws in the new theme this frame.
+        this.SyncSkin();
         // Advance the animation clock. AnimTo() uses (nowMs - lastFrameMs) as
         // the elapsed step so eases run at a wall-clock rate regardless of fps.
         lastFrameMs = nowMs;

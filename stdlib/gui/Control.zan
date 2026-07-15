@@ -55,6 +55,24 @@ class Control {
     /// an event name (see Events()) to a handler identifier. Empty when unbound.
     List<string> evtKeys;
     List<string> evtVals;
+    /// Common per-widget event bundle (pointer/focus/keyboard/touch/drag),
+    /// inherited by every control. A widget wires it by calling On.Fire(app, id)
+    /// once per frame after it registered its hit region (widgets keep their own
+    /// stable id, so Control does not allocate one here).
+    WidgetEvents On;
+    /// Lifecycle events fired by RenderTree: Paint every frame this node paints,
+    /// Resize when its resolved size changed, Show/Hide on a visibility flip.
+    UiEvent Paint;
+    UiEvent Resize;
+    UiEvent Show;
+    UiEvent Hide;
+    int lastBw;
+    int lastBh;
+    bool lastVisible;
+    bool everLaidOut;
+    /// Optional dotted state path this control is bound to (JSON `bind`), used
+    /// by UiDoc to sync the control's value with a state entity. Empty = none.
+    string bindPath;
 
     /// Base initialiser every subclass calls from its factory/constructor.
     void InitControl(string n, int d) {
@@ -78,8 +96,25 @@ class Control {
         children = new List<Control>();
         evtKeys = new List<string>();
         evtVals = new List<string>();
+        On = WidgetEvents.Create();
+        Paint = UiEvent.Create();
+        Resize = UiEvent.Create();
+        Show = UiEvent.Create();
+        Hide = UiEvent.Create();
+        lastBw = 0;
+        lastBh = 0;
+        lastVisible = false;
+        everLaidOut = false;
         layout = 0;
         grow = false;
+        bindPath = "";
+    }
+
+    /// Fires the common event bundle for this node against `id`. Widgets call
+    /// this once per frame after registering their hit region; equivalent to
+    /// On.Fire(app, id) but keeps the call site uniform.
+    void FireOn(App app, int id) {
+        On.Fire(app, id);
     }
 
     Control Dock(int d) {
@@ -332,10 +367,51 @@ class Control {
         return new List<PropSpec>();
     }
 
-    /// Declared event names for the designer's event inspector. Base has none;
-    /// widgets that expose C#-style events (e.g. Button.Click) override this.
+    /// The common event names every control exposes (pointer/focus/keyboard/
+    /// touch/drag/lifecycle), in inspector order. Widgets prepend these to their
+    /// own semantic events in Events().
+    static List<string> CommonEvents() {
+        List<string> e = new List<string>();
+        e.Add("Click");
+        e.Add("DoubleClick");
+        e.Add("RightClick");
+        e.Add("MouseDown");
+        e.Add("MouseUp");
+        e.Add("Enter");
+        e.Add("Leave");
+        e.Add("Move");
+        e.Add("Wheel");
+        e.Add("Focus");
+        e.Add("Blur");
+        e.Add("KeyDown");
+        e.Add("KeyUp");
+        e.Add("KeyPress");
+        e.Add("Tap");
+        e.Add("LongPress");
+        e.Add("Swipe");
+        e.Add("DragStart");
+        e.Add("Drag");
+        e.Add("Drop");
+        e.Add("Resize");
+        e.Add("Show");
+        e.Add("Hide");
+        return e;
+    }
+
+    /// Declared event names for the designer's event inspector. Base returns the
+    /// common bundle; widgets override to append their own semantic events (and
+    /// still include CommonEvents()).
     virtual List<string> Events() {
-        return new List<string>();
+        return Control.CommonEvents();
+    }
+
+    /// Subscribes a resolved Action to the named event. The base maps the common
+    /// bundle (Click/Enter/.../Drop) onto `On`; widgets override to also route
+    /// their own semantic events (Change/Submit/RowClick/...) to the right
+    /// UiEvent field, then call the base for the common set. Used by the JSON
+    /// loader to attach `on<Event>` handlers resolved through the registry.
+    virtual void BindEvent(string evt, Action a) {
+        On.AddByName(evt, a);
     }
 
     /// Reads a property by key as text. Base knows nothing; widgets override for
@@ -354,9 +430,20 @@ class Control {
     /// Paint and the compiler resolves method calls by name only.
     void RenderTree(App app) {
         if (!visible) {
+            if (lastVisible && Hide.Count() > 0) { Hide.Raise(); }
+            lastVisible = false;
             return;
         }
+        if (!lastVisible && everLaidOut && Show.Count() > 0) { Show.Raise(); }
+        lastVisible = true;
         OnPaint(app);
+        if (Paint.Count() > 0) { Paint.Raise(); }
+        if (everLaidOut && (bw != lastBw || bh != lastBh) && Resize.Count() > 0) {
+            Resize.Raise();
+        }
+        lastBw = bw;
+        lastBh = bh;
+        everLaidOut = true;
         if (children.Count > 0) {
             app.canvas.PushClip(bx, by, bw, bh);
             int i = 0;
