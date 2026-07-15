@@ -12,6 +12,7 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
 #import <WebKit/WebKit.h>
+#include <objc/message.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -844,7 +845,54 @@ static void wv_spin(volatile BOOL *done, double timeout) {
     }
 }
 
-EXPORT i64 zan_gui_webview_create(i64 hwnd_val) {
+/* Per-profile website data stores for multi-account isolation. WebViews that
+ * pass the same non-empty profileId share one store (same cookies/session);
+ * different profileIds get separate stores, so several accounts stay logged in
+ * at once. ""/NULL uses the shared default persistent store (legacy behavior).
+ * The dictionary retains each store for the process lifetime and keys the
+ * cache so a repeated profileId reuses its store. */
+static NSMutableDictionary<NSString *, WKWebsiteDataStore *> *g_wv_profiles = nil;
+
+/* Derive a stable, well-formed (v4-shaped) UUID from an arbitrary profile id so
+ * a human-readable id maps to a persistent per-identifier data store. */
+static NSUUID *wv_uuid_from_string(NSString *s) {
+    const char *b = [s UTF8String];
+    if (!b) b = "";
+    uint64_t h1 = 1469598103934665603ULL, h2 = 1099511628211ULL;
+    for (const char *p = b; *p; p++) {
+        h1 = (h1 ^ (unsigned char)*p) * 1099511628211ULL;
+        h2 = (h2 ^ (unsigned char)*p) * 1469598103934665603ULL;
+    }
+    unsigned char u[16];
+    memcpy(u, &h1, 8);
+    memcpy(u + 8, &h2, 8);
+    u[6] = (unsigned char)((u[6] & 0x0F) | 0x40); /* version 4 */
+    u[8] = (unsigned char)((u[8] & 0x3F) | 0x80); /* RFC 4122 variant */
+    return [[[NSUUID alloc] initWithUUIDBytes:u] autorelease];
+}
+
+static WKWebsiteDataStore *wv_store_for_profile(const char *profile_id) {
+    if (!profile_id || !*profile_id) return [WKWebsiteDataStore defaultDataStore];
+    NSString *pid = [NSString stringWithUTF8String:profile_id];
+    if (!pid || pid.length == 0) return [WKWebsiteDataStore defaultDataStore];
+    if (!g_wv_profiles) g_wv_profiles = [[NSMutableDictionary alloc] init];
+    WKWebsiteDataStore *ds = [g_wv_profiles objectForKey:pid];
+    if (ds) return ds;
+    /* Persistent per-identifier stores need macOS 14+. Resolve the selector at
+     * runtime so this compiles against older SDKs too; fall back to an
+     * in-memory (still per-profile isolated) store otherwise. */
+    SEL sel = NSSelectorFromString(@"dataStoreForIdentifier:");
+    if ([WKWebsiteDataStore respondsToSelector:sel]) {
+        WKWebsiteDataStore *(*mk)(id, SEL, NSUUID *) =
+            (WKWebsiteDataStore *(*)(id, SEL, NSUUID *))objc_msgSend;
+        ds = mk([WKWebsiteDataStore class], sel, wv_uuid_from_string(pid));
+    }
+    if (!ds) ds = [WKWebsiteDataStore nonPersistentDataStore];
+    if (ds) [g_wv_profiles setObject:ds forKey:pid];
+    return ds ? ds : [WKWebsiteDataStore defaultDataStore];
+}
+
+EXPORT i64 zan_gui_webview_create(i64 hwnd_val, const char *profile_id) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 0;
@@ -855,6 +903,8 @@ EXPORT i64 zan_gui_webview_create(i64 hwnd_val) {
     if (slot < 0) return 0;
     @autoreleasepool {
         WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+        WKWebsiteDataStore *ds = wv_store_for_profile(profile_id);
+        if (ds) cfg.websiteDataStore = ds;
         WKWebView *wv = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)
                                            configuration:cfg];
         [cfg release];
@@ -1121,11 +1171,6 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
         [pb setString:(s ? s : @"") forType:NSPasteboardTypeString];
     }
     return 0;
-}
-
-EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
-    (void)x;
-    (void)y;
 }
 
 /* Read the general pasteboard's text as UTF-8. Mirrors the Windows/X11 ABI:
