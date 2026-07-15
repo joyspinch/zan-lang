@@ -226,21 +226,39 @@ zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name) {
  * declarations against the root scope; without this they would report a bogus
  * "undefined type 'T'". Type parameters all erase to the same representation
  * (an opaque pointer), so a name shared by two classes' <T> is harmless. */
+static void register_type_param_list(zan_binder_t *b, zan_ast_list_t *tps) {
+    for (int j = 0; j < tps->count; j++) {
+        zan_ast_node_t *tp = tps->items[j];
+        if (tp->kind != AST_IDENTIFIER) continue;
+        if (scope_find(b->current_scope, tp->ident.name)) continue;
+        zan_type_t *tp_type = make_type(b->arena, TYPE_TYPE_PARAM,
+                                        tp->ident.name.str, tp->ident.name.len);
+        zan_symbol_t *tp_sym = make_symbol(b->arena, SYM_TYPE_PARAM,
+                                           tp->ident.name, tp_type, tp, 0);
+        scope_add(b->arena, b->current_scope, tp_sym);
+    }
+}
+
 static void register_type_params(zan_binder_t *b, zan_ast_list_t *decls) {
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *decl = decls->items[i];
+        /* delegate declarations may themselves be generic: delegate R F<T>(...) */
+        if (decl->kind == AST_DELEGATE_DECL) {
+            register_type_param_list(b, &decl->method_decl.type_params);
+            continue;
+        }
         if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL &&
             decl->kind != AST_INTERFACE_DECL && decl->kind != AST_ENUM_DECL) {
             continue;
         }
-        for (int j = 0; j < decl->type_decl.type_params.count; j++) {
-            zan_ast_node_t *tp = decl->type_decl.type_params.items[j];
-            if (scope_find(b->current_scope, tp->ident.name)) continue;
-            zan_type_t *tp_type = make_type(b->arena, TYPE_TYPE_PARAM,
-                                            tp->ident.name.str, tp->ident.name.len);
-            zan_symbol_t *tp_sym = make_symbol(b->arena, SYM_TYPE_PARAM,
-                                               tp->ident.name, tp_type, tp, 0);
-            scope_add(b->arena, b->current_scope, tp_sym);
+        register_type_param_list(b, &decl->type_decl.type_params);
+        /* method-level type parameters (static T Id<T>(...)) share the same
+         * erased-pointer representation as class type parameters, so registering
+         * their names globally keeps them resolvable in signatures and bodies. */
+        for (int m = 0; m < decl->type_decl.members.count; m++) {
+            zan_ast_node_t *member = decl->type_decl.members.items[m];
+            if (member->kind == AST_METHOD_DECL)
+                register_type_param_list(b, &member->method_decl.type_params);
         }
     }
 }
@@ -284,6 +302,9 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
                 continue;
             }
             zan_type_t *type = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
+            /* a generic delegate (delegate R F<T>(...)) must have its type
+             * parameters in scope while resolving its own signature */
+            register_type_param_list(b, &node->method_decl.type_params);
             /* resolve delegate return type */
             type->delegate_ret_type = node->method_decl.return_type
                 ? zan_binder_resolve_type(b, node->method_decl.return_type)
@@ -388,6 +409,8 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             break;
         }
         case AST_METHOD_DECL: {
+            /* generic method: make its type params resolvable in the signature */
+            register_type_param_list(b, &member->method_decl.type_params);
             zan_type_t *ret_type = zan_binder_resolve_type(b, member->method_decl.return_type);
             zan_symbol_t *method_sym = make_symbol(b->arena, SYM_METHOD,
                 member->method_decl.name, ret_type, member,
