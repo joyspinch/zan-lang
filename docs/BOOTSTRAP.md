@@ -123,5 +123,36 @@ automatically when clang is absent (`tests/run_fixedpoint.cmake`).
 - **Diagnostics** are basic (limited positions, no recovery).
 - **No optimization**: the emitted IR is naive.
 
+### Generics, numeric and equality semantics
+
+- **Nested generic close (`>>`).** The lexer greedily forms the compound
+  `>>` / `>>=` operator tokens, so a nested type argument list such as
+  `Box<Box<int>>` closes two levels with a single token. The host parser
+  splits this virtually at the parse site (`parser_expect_gt` in
+  `src/compiler/parser.c`): the first `>` closes the inner list and the token
+  is rewritten to a single `>` for the enclosing level, without disturbing the
+  lexer. Nested generics therefore parse and compile; note that value storage
+  through *nested erased* generic slots (e.g. reading back a `List<List<int>>`
+  element) is still incomplete.
+- **`double` in the self-hosted compiler.** `gen1` now lowers `double`
+  end-to-end: float literals, `fadd`/`fsub`/`fmul`/`fdiv`/`frem` arithmetic,
+  `fcmp` comparisons, `fneg`, compound assignment, `int`↔`double` casts
+  (`sitofp`/`fptosi`), implicit int→double promotion, `%g` printing and
+  string concatenation. Combined with the erased-slot `bitcast double <-> i64`
+  boundary, `Box<double>` passes through `gen1`.
+- **`bool` printing.** A `bool` is an LLVM `i1`; when widened to `i64` for
+  numeric formatting it is **zero-extended** (`zext`), not sign-extended, so
+  `true` prints as `1` rather than `-1` (`sext i1 1` is all-ones = `-1`).
+  Other narrow integers keep signed widening (`sext`).
+- **Monomorphized generics keep the erased LLVM ABI.** User-generic
+  specialization only specializes the function *body*; signatures still pass
+  and return values through the erased `i64` slot ABI (they are not rewritten
+  to concrete-typed parameters). Value types are packed/unpacked at the slot
+  boundary (`ptrtoint`/`inttoptr`, or `bitcast` for `double`).
+- **Content equality is intrinsic only for `string`.** The built-in equality
+  intrinsic performs a `strcmp` for strings; equality of user-defined
+  reference types remains whatever that type's own logic defines (identity, or
+  a user `op_eq`). There is no universal structural-equality intrinsic.
+
 (The emitter uses a `StringBuilder`, so IR assembly is O(output size); see
 `docs/PERFORMANCE.md` for the memory history.)

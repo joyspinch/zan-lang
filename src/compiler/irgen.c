@@ -3129,6 +3129,19 @@ static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
     return LLVMBuildTrunc(g->builder, v, target, "trunc");
 }
 
+/* Widen a narrow integer to i64 for numeric formatting/printing. Signed
+ * integers are sign-extended, but i1 (bool) is zero-extended so that `true`
+ * formats as 1 rather than -1 (sext of an i1 set to 1 yields all-ones). */
+static LLVMValueRef emit_widen_i64_for_print(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef vt = LLVMTypeOf(v);
+    if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind) return v;
+    unsigned w = LLVMGetIntTypeWidth(vt);
+    if (w >= 64) return v;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    if (w == 1) return LLVMBuildZExt(g->builder, v, i64, "bext");
+    return LLVMBuildSExt(g->builder, v, i64, "ext");
+}
+
 static LLVMValueRef emit_string_alloc_rc(zan_irgen_t *g, LLVMValueRef payload_size) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef thirty_one = LLVMConstInt(i64, 31, 0);
@@ -3219,8 +3232,7 @@ static LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
         arg = val;
     } else {
         fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
-        arg = val;
-        if (LLVMGetIntTypeWidth(vt) < 64) arg = LLVMBuildSExt(g->builder, val, i64, "ext");
+        arg = emit_widen_i64_for_print(g, val);
     }
     LLVMValueRef tmp_sz = LLVMConstInt(i64, 1024, 0);
     LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8, tmp_sz, "fmt.tmp");
@@ -4248,11 +4260,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMBuildCall2(g->builder, fn_type, g->rt_print_double, &arg, 1, "");
                 } else {
                     /* ensure integer arg is i64 for print_int */
-                    if (LLVMGetTypeKind(arg_type) == LLVMIntegerTypeKind &&
-                        LLVMGetIntTypeWidth(arg_type) < 64) {
-                        arg = LLVMBuildSExt(g->builder, arg,
-                                            LLVMInt64TypeInContext(g->ctx), "ext");
-                    }
+                    arg = emit_widen_i64_for_print(g, arg);
                     LLVMTypeRef fn_type = LLVMFunctionType(
                         LLVMVoidTypeInContext(g->ctx),
                         (LLVMTypeRef[]){ LLVMInt64TypeInContext(g->ctx) },
@@ -4290,11 +4298,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMBuildCall2(g->builder, printf_type, printf_fn, args, 2, "");
                 } else {
                     LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "wfmt_i");
-                    LLVMValueRef int_arg = arg;
-                    if (LLVMGetTypeKind(arg_type) == LLVMIntegerTypeKind &&
-                        LLVMGetIntTypeWidth(arg_type) < 64) {
-                        int_arg = LLVMBuildSExt(g->builder, arg, LLVMInt64TypeInContext(g->ctx), "ext");
-                    }
+                    LLVMValueRef int_arg = emit_widen_i64_for_print(g, arg);
                     LLVMValueRef args[] = { fmt, int_arg };
                     LLVMBuildCall2(g->builder, printf_type, printf_fn, args, 2, "");
                 }
@@ -4524,10 +4528,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             }
                         } else {
                             fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "itoa_fmt");
-                            if (atk == LLVMIntegerTypeKind &&
-                                LLVMGetIntTypeWidth(LLVMTypeOf(arg)) < 64) {
-                                num_arg = LLVMBuildSExt(g->builder, arg, i64, "ext");
-                            }
+                            num_arg = emit_widen_i64_for_print(g, arg);
                         }
                         LLVMValueRef sn_args[] = { buf, LLVMConstInt(i64, 32, 0), fmt, num_arg };
                         LLVMBuildCall2(g->builder,

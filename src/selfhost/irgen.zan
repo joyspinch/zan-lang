@@ -376,6 +376,8 @@ class Irgen {
         H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
+        H("@.fmt.gnl = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"");
+        H("@.fmt.gn = private unnamed_addr constant [3 x i8] c\"%g\\00\"");
         H("@.msg.unhandled = private unnamed_addr constant [21 x i8] c\"Unhandled exception\\0A\\00\"");
         H("@.msg.rderr = private unnamed_addr constant [18 x i8] c\"cannot read file\\0A\\00\"");
         H("@.msg.wrerr = private unnamed_addr constant [19 x i8] c\"cannot write file\\0A\\00\"");
@@ -1257,6 +1259,12 @@ class Irgen {
             L("  " + t + " = bitcast " + vt + " " + v.op + " to " + llty);
             return t;
         }
+        // implicit integer -> double promotion (e.g. `double x = 5;`)
+        if (vt == "i64" && llty == "double") {
+            string t = NT();
+            L("  " + t + " = sitofp i64 " + v.op + " to double");
+            return t;
+        }
         return v.op;
     }
 
@@ -1783,6 +1791,7 @@ class Irgen {
         if (e == null) { return new ExprVal("0", MkType("int")); }
         int k = e.kind;
         if (k == AK.IntLit()) { return new ExprVal("" + e.ival, MkType("int")); }
+        if (k == AK.FloatLit()) { return new ExprVal(e.sval, MkType("double")); }
         if (k == AK.BoolLit()) { return new ExprVal("" + e.ival, MkType("bool")); }
         if (k == AK.CharLit()) { return new ExprVal("" + e.ival, MkType("char")); }
         if (k == AK.StringLit()) { return GenStr(e.sval); }
@@ -1854,6 +1863,11 @@ class Irgen {
             return new ExprVal(z, MkType("bool"));
         }
         if (e.op == TK.Minus()) {
+            if (IsDbl(v.ty)) {
+                string t = NT();
+                L("  " + t + " = fneg double " + v.op);
+                return new ExprVal(t, MkType("double"));
+            }
             string t = NT();
             L("  " + t + " = sub i64 0, " + v.op);
             return new ExprVal(t, MkType("int"));
@@ -1864,6 +1878,14 @@ class Irgen {
     ExprVal GenPostfix(Node e) {
         // x++ / x-- : return old value, update slot
         ExprVal cur = GenExpr(e.a);
+        if (IsDbl(cur.ty)) {
+            string t = NT();
+            string opn = "fadd";
+            if (e.op == TK.MinusMinus()) { opn = "fsub"; }
+            L("  " + t + " = " + opn + " double " + cur.op + ", 1.0");
+            StoreTo(e.a, new ExprVal(t, MkType("double")));
+            return cur;
+        }
         string t = NT();
         string opn = "add";
         if (e.op == TK.MinusMinus()) { opn = "sub"; }
@@ -1891,6 +1913,34 @@ class Irgen {
     }
 
     bool IsStr(Node ty) { if (ty == null) { return false; } return ty.sval == "string"; }
+    // True for a value lowered to LLVM `double` (both double and float here).
+    bool IsDbl(Node ty) { if (ty == null) { return false; } return ty.sval == "double" || ty.sval == "float"; }
+
+    // Floating-point counterparts of ArithOp/CmpOp for `double` operands.
+    string FArithOp(int op) {
+        if (op == TK.Plus()) { return "fadd"; }
+        if (op == TK.Minus()) { return "fsub"; }
+        if (op == TK.Star()) { return "fmul"; }
+        if (op == TK.Slash()) { return "fdiv"; }
+        if (op == TK.Percent()) { return "frem"; }
+        return "";
+    }
+    string FCmpOp(int op) {
+        if (op == TK.EqEq()) { return "oeq"; }
+        if (op == TK.BangEq()) { return "one"; }
+        if (op == TK.Less()) { return "olt"; }
+        if (op == TK.Greater()) { return "ogt"; }
+        if (op == TK.LessEq()) { return "ole"; }
+        if (op == TK.GreaterEq()) { return "oge"; }
+        return "";
+    }
+    // Materialise `v` as an LLVM `double`, widening an integer operand via sitofp.
+    string AsDouble(ExprVal v) {
+        if (IsDbl(v.ty)) { return v.op; }
+        string t = NT();
+        L("  " + t + " = sitofp i64 " + v.op + " to double");
+        return t;
+    }
 
     bool IsFoldOp(int op) {
         return op == TK.Plus() || op == TK.Minus() || op == TK.Star() || op == TK.Slash() || op == TK.Percent();
@@ -1973,6 +2023,25 @@ class Irgen {
         // user-defined operator overloading takes precedence for class operands
         ExprVal ov = TryOpOverload(op, a, b);
         if (ov != null) { return ov; }
+        // floating-point arithmetic/comparison (string `+` concatenation wins)
+        if ((IsDbl(a.ty) || IsDbl(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty))) {
+            string da = AsDouble(a);
+            string db = AsDouble(b);
+            string fop = FArithOp(op);
+            if (fop != "") {
+                string t = NT();
+                L("  " + t + " = " + fop + " double " + da + ", " + db);
+                return new ExprVal(t, MkType("double"));
+            }
+            string fcp = FCmpOp(op);
+            if (fcp != "") {
+                string c = NT();
+                L("  " + c + " = fcmp " + fcp + " double " + da + ", " + db);
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+        }
         // addition: concatenate when either operand is a string, else integer add
         if (op == TK.Plus()) {
             if (IsStr(a.ty) || IsStr(b.ty)) {
@@ -2074,6 +2143,19 @@ class Irgen {
     // coerce a value to i8* string form (numbers via snprintf)
     string ToCStr(ExprVal v) {
         if (IsStr(v.ty)) { return v.op; }
+        // double -> string (via snprintf "%g")
+        if (IsDbl(v.ty)) {
+            string dneed = NT();
+            L("  " + dneed + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
+            string dneed64 = NT();
+            L("  " + dneed64 + " = sext i32 " + dneed + " to i64");
+            string dbsz = NT();
+            L("  " + dbsz + " = add i64 " + dneed64 + ", 1");
+            string dbuf = NT();
+            L("  " + dbuf + " = call i8* @malloc(i64 " + dbsz + ")");
+            L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + dbuf + ", i64 " + dbsz + ", i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
+            return dbuf;
+        }
         // integer -> string
         string need = NT();
         L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.fmt.nn, i64 0, i64 0), i64 " + v.op + ")");
@@ -2113,6 +2195,19 @@ class Irgen {
             ExprVal cc = StrConcat(ToCStr(cur), ToCStr(r));
             StoreTo(e.a, cc);
             return cc;
+        }
+        if (IsDbl(cur.ty) || IsDbl(r.ty)) {
+            string da = AsDouble(cur);
+            string db = AsDouble(r);
+            string fopn = "fadd";
+            if (e.op == TK.MinusEq()) { fopn = "fsub"; }
+            if (e.op == TK.StarEq()) { fopn = "fmul"; }
+            if (e.op == TK.SlashEq()) { fopn = "fdiv"; }
+            string ft = NT();
+            L("  " + ft + " = " + fopn + " double " + da + ", " + db);
+            ExprVal fnv = new ExprVal(ft, MkType("double"));
+            StoreTo(e.a, fnv);
+            return fnv;
         }
         string opn = "add";
         if (e.op == TK.MinusEq()) { opn = "sub"; }
@@ -2557,8 +2652,23 @@ class Irgen {
     // ---- cast ----
     ExprVal GenCast(Node e) {
         ExprVal v = GenExpr(e.b);
-        // numeric casts are all i64 in this model; just retag
-        return new ExprVal(v.op, e.type);
+        Node tgt = e.type;
+        bool toD = IsDbl(tgt);
+        bool fromD = IsDbl(v.ty);
+        // int -> double
+        if (toD && !fromD && MapType(v.ty) == "i64") {
+            string t = NT();
+            L("  " + t + " = sitofp i64 " + v.op + " to double");
+            return new ExprVal(t, tgt);
+        }
+        // double -> int (truncating toward zero)
+        if (fromD && !toD && MapType(tgt) == "i64") {
+            string t = NT();
+            L("  " + t + " = fptosi double " + v.op + " to i64");
+            return new ExprVal(t, tgt);
+        }
+        // remaining numeric casts are all i64 in this model; just retag
+        return new ExprVal(v.op, tgt);
     }
 
     // switch expression:  subj switch { pat => e, _ => e }. Constant patterns
@@ -2992,6 +3102,12 @@ class Irgen {
                 string gp = NT();
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + arg.op + ")");
+            } else if (has && IsDbl(arg.ty)) {
+                string fg = "@.fmt.gn"; int fl = 3;
+                if (nl) { fg = "@.fmt.gnl"; fl = 4; }
+                string gp = NT();
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", double " + arg.op + ")");
             } else {
                 string fg = "@.fmt.nn"; int fl = 5;
                 if (nl) { fg = "@.fmt.nl"; fl = 6; }

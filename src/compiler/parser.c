@@ -51,6 +51,34 @@ static zan_ast_node_t *parser_error_node(zan_parser_t *p) {
     return zan_ast_new(p->arena, AST_INT_LITERAL, p->current.loc);
 }
 
+/* Consume the '>' that closes a generic argument list.
+ *
+ * The lexer greedily forms '>>' / '>>=' tokens, but inside nested generics
+ * (e.g. `Box<Box<int>>`) each level needs its own closing '>'. When the
+ * current token is such a compound token, split off a single '>' and rewrite
+ * the current token to hold the remainder so the enclosing level can consume
+ * it in turn, without advancing the underlying lexer. */
+static void parser_expect_gt(zan_parser_t *p) {
+    switch (p->current.kind) {
+    case TK_GREATER:
+        parser_advance(p);
+        return;
+    case TK_GREATER_GREATER:
+        p->current.kind = TK_GREATER;
+        p->current.loc.col += 1;
+        return;
+    case TK_GREATER_GREATER_EQ:
+        p->current.kind = TK_GREATER_EQ;
+        p->current.loc.col += 1;
+        return;
+    default:
+        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                      "expected '%s', got '%s'",
+                      zan_token_kind_name(TK_GREATER),
+                      zan_token_kind_name(p->current.kind));
+    }
+}
+
 /* forward declarations */
 static zan_ast_node_t *parse_expression(zan_parser_t *p);
 static zan_ast_node_t *parse_statement(zan_parser_t *p);
@@ -132,7 +160,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             zan_ast_list_push(&type_node->type_ref.type_args, arg, p->arena);
             if (!parser_match(p, TK_COMMA)) break;
         }
-        parser_expect(p, TK_GREATER);
+        parser_expect_gt(p);
     }
 
     /* array: T[] */
