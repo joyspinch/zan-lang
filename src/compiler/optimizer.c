@@ -255,7 +255,12 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
     while (fn) {
-        LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+        /* LLVMGetFirstBasicBlock returns NULL for declarations (extern
+         * [DllImport] targets, runtime decls, not-yet-defined generic
+         * instantiations); LLVMGetEntryBasicBlock would instead deref the
+         * empty block list and hand back a bogus block, so walking its
+         * instructions faults. Use the first block and skip bodyless fns. */
+        LLVMBasicBlockRef entry = LLVMGetFirstBasicBlock(fn);
         if (entry) {
             LLVMValueRef inst = LLVMGetFirstInstruction(entry);
             while (inst) {
