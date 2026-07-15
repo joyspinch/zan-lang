@@ -1,6 +1,6 @@
-# Game.Legend2
+# Game.Arpg
 
-`Game.Legend2` is a typed Zan component RPG library based on the public Dream
+`Game.Arpg` is a typed Zan component RPG library based on the public Dream
 Mod 3 documentation. It is a clean implementation and does not load or embed
 the original engine.
 
@@ -8,32 +8,32 @@ the original engine.
 
 ```zan
 using System;
-using Game.Legend2;
+using Game.Arpg;
 
 namespace MyGame;
 
 class Bootstrap {
-    static Legend2Engine Create() {
-        Legend2Config config = Legend2Config.Create();
+    static ArpgEngine Create() {
+        ArpgConfig config = ArpgConfig.Create();
         config.SetTitle("My Legend");
         config.SetSize(1280, 720);
-        config.SetScreenMode(Legend2ScreenMode.Scale());
+        config.SetScreenMode(ArpgScreenMode.Scale());
 
-        Legend2Project project = Legend2Project.Create();
+        ArpgProject project = ArpgProject.Create();
 
-        Legend2ActorDefinition hero =
-            Legend2ActorDefinition.Create("hero", "Hero");
+        ArpgActorDefinition hero =
+            ArpgActorDefinition.Create("hero", "Hero");
         hero.SetDefaultPlayer(true);
         hero.Attributes().SetMaxHp(100.0);
         project.AddActor(hero);
 
-        Legend2MapDefinition start =
-            Legend2MapDefinition.Create("start", 64, 64);
+        ArpgMapDefinition start =
+            ArpgMapDefinition.Create("start", 64, 64);
         start.SetDefaultMap(true);
         start.SetInitialPosition(10, 10, 0);
         project.AddMap(start);
 
-        Legend2Engine engine = Legend2Engine.Create(config);
+        ArpgEngine engine = ArpgEngine.Create(config);
         if (!engine.LoadProject(project)) {
             return null;
         }
@@ -43,7 +43,7 @@ class Bootstrap {
 ```
 
 Call `project.Validate()` to collect every error and warning before creating a
-window. `Legend2Engine.Start()` also validates the App configuration and loaded
+window. `ArpgEngine.Start()` also validates the App configuration and loaded
 project.
 
 ## Manifest workflow
@@ -75,12 +75,12 @@ Create a typed component and register it in the manifest:
 ```
 
 `component` supports `map`, `actor`, `item`, `skill`, `buff`, `window`,
-`growth`, and `prefab`. It creates a `Register(Legend2Project)` factory,
+`growth`, and `prefab`. It creates a `Register(ArpgProject)` factory,
 updates `legend2.project.json`, validates the project and regenerates the Zan
 project source and `legend2.sources.txt`. Use `-Factory` to choose a custom
 fully qualified factory type and `-Force` to replace an existing component.
 
-The default output is `MyGame\Generated\Legend2Project.g.zan`. The generated
+The default output is `MyGame\Generated\ArpgProject.g.zan`. The generated
 class exposes `CreateConfig()`, `CreateProject()` and `CreateEngine()`.
 
 Manifest shape:
@@ -127,8 +127,8 @@ MyGame.Components.StartMap.Register(project);
 ```
 
 The component file should therefore expose a static
-`Register(Legend2Project project)` method that creates and adds its typed
-definition. Without `factory`, the file is tracked in `Legend2Registry` only.
+`Register(ArpgProject project)` method that creates and adds its typed
+definition. Without `factory`, the file is tracked in `ArpgRegistry` only.
 
 Generation also writes `Generated\legend2.sources.txt`. It contains the
 generated source followed by all component and extension-script files that
@@ -146,18 +146,18 @@ $sources = Get-Content .\MyGame\Generated\legend2.sources.txt |
 
 ## Gameplay runtime
 
-`Legend2World` provides the live RPG operations:
+`ArpgWorld` provides the live RPG operations:
 
 ```zan
-Legend2World world = engine.World();
+ArpgWorld world = engine.World();
 world.EnterDefaultMap();
 
-Legend2Actor player = world.Player();
+ArpgActor player = world.Player();
 world.AddItem(player, "potion", 5);
 world.UseItem(player, "potion");
 world.EquipItem(player, "iron-sword", "weapon");
 
-Legend2SkillCastResult result =
+ArpgSkillCastResult result =
     world.CastSkill(player, "slash", world.ActorAt(1));
 world.Update(16);
 world.TryUsePortal(player);
@@ -202,15 +202,15 @@ cooldowns and Buffs, while replacing map-local NPC instances.
 
 ## Screen modes
 
-- `Legend2ScreenMode.Fixed()` (`0`): fixed-size window.
-- `Legend2ScreenMode.Scale()` (`1`): resizable window with scaled logical view.
-- `Legend2ScreenMode.ResizeWorld()` (`2`): resizable native-size view.
-- `Legend2ScreenMode.TransparentBorderless()` (`3`): borderless host prepared
+- `ArpgScreenMode.Fixed()` (`0`): fixed-size window.
+- `ArpgScreenMode.Scale()` (`1`): resizable window with scaled logical view.
+- `ArpgScreenMode.ResizeWorld()` (`2`): resizable native-size view.
+- `ArpgScreenMode.TransparentBorderless()` (`3`): borderless host prepared
   for color-key presentation; platform transparency still requires SDL bridge
   support.
 
 ## Native runtime
 
-Importing `Game.Legend2` also imports the SDL3 host. On Windows, native
+Importing `Game.Arpg` also imports the SDL3 host. On Windows, native
 executables need `zan_sdl3.dll` and `SDL3.dll` from
 `stdlib/SDL3/drivers/win-x64` available beside the executable or on `PATH`.

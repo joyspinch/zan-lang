@@ -1,4 +1,4 @@
-# Game.Legend2 architecture
+# Game.Arpg architecture
 
 This module uses the published Dream Mod 3 documentation as a domain reference,
 not as a binary or source dependency. The implementation keeps the component
@@ -11,14 +11,14 @@ model while exposing typed Zan APIs.
    extension scripts.
 3. `Map`, `Entity`, `Combat` and `Presentation` contain immutable definitions
    for maps, actors, items, skills, buffs, growth, windows and prefabs.
-4. `Legend2Project` is the validated component database. Cross references such
+4. `ArpgProject` is the validated component database. Cross references such
    as actor skills, map spawns and portals are checked before startup.
 5. `Runtime` owns inventory stacks, equipment slots, cooldowns, deterministic
    random numbers and the default hit/damage calculations.
-6. `Legend2World` owns live actor instances, combat operations, Buff updates
+6. `ArpgWorld` owns live actor instances, combat operations, Buff updates
    and current-map state.
-7. `Legend2Scheduler` implements named one-shot and repeating events.
-8. `Legend2Engine` owns SDL3 lifecycle, input translation, fixed frame pacing
+7. `ArpgScheduler` implements named one-shot and repeating events.
+8. `ArpgEngine` owns SDL3 lifecycle, input translation, fixed frame pacing
    and the bridge between project data and live world state.
 
 Definitions are intentionally independent from serialization. A project can be
@@ -53,5 +53,5 @@ Deferred to dedicated subsystems:
 - audio/music, tweening, networking and SQLite facades;
 - loading legacy Lua component files directly.
 
-The SDL3 layer owns platform I/O. Legend2 public gameplay APIs do not expose raw
+The SDL3 layer owns platform I/O. Arpg public gameplay APIs do not expose raw
 SDL handles.

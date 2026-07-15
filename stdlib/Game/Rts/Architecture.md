@@ -1,4 +1,4 @@
-# Game.Ra2 architecture
+# Game.Rts architecture
 
 The library is a modern, clean-room RA2-compatible runtime. It does not patch
 or embed the original game executable and it does not redistribute original
