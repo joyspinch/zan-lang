@@ -44,18 +44,29 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
                      /etc/apt/sources.list.d/azure-cli.list \
                      /etc/apt/sources.list.d/azure-cli.sources || true
-          # The arm64 runners intermittently cannot reach ports.ubuntu.com over
-          # IPv6; force IPv4 so the driver deps download reliably.
-          echo 'Acquire::ForceIPv4 "true";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null
+          # The arm64 runners hit ports.ubuntu.com over a flaky link: `update`
+          # succeeds but the .deb fetches drop mid-transfer. Force IPv4, give apt
+          # generous per-file retries, and wrap the install in a retry loop.
+          sudo tee /etc/apt/apt.conf.d/99net-resilience >/dev/null <<'EOF'
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "8";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          EOF
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config ninja-build patchelf unzip curl \
-            libpq-dev \
-            libx11-dev libxext-dev libxcursor-dev libxrandr-dev libxi-dev \
-            libxfixes-dev libxinerama-dev libxss-dev libxkbcommon-dev \
-            libxtst-dev \
-            libwayland-dev wayland-protocols libgbm-dev libdrm-dev \
-            libgl1-mesa-dev libasound2-dev libpulse-dev
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get install -y --no-install-recommends --fix-missing \
+              build-essential cmake pkg-config ninja-build patchelf unzip curl \
+              libpq-dev \
+              libx11-dev libxext-dev libxcursor-dev libxrandr-dev libxi-dev \
+              libxfixes-dev libxinerama-dev libxss-dev libxkbcommon-dev \
+              libxtst-dev \
+              libwayland-dev wayland-protocols libgbm-dev libdrm-dev \
+              libgl1-mesa-dev libasound2-dev libpulse-dev && break
+            echo "apt-get install attempt $attempt failed; retrying in 15s"
+            sleep 15
+            sudo apt-get update || true
+          done
 
       - name: Build SDL3 from source
         run: |
@@ -202,8 +213,10 @@ jobs:
           # SDL3 bridge
           SDEST="stdlib/SDL3/drivers/${{ matrix.target }}"
           mkdir -p "$SDEST"
+          # msys2 has no pkg-config here (and the mingw pkg-config package is
+          # unavailable for CLANGARM64), so link SDL3 directly from $MINGW_PREFIX.
           cc -O2 -shared -o "$SDEST/zan_sdl3.dll" stdlib/SDL3/native/zan_sdl3.c \
-            $(pkg-config --cflags --libs sdl3) \
+            -I"$P/include" -L"$P/lib" -lSDL3 \
             -Wl,--out-implib,"$SDEST/libzan_sdl3.dll.a" -static-libgcc
           cp "$P/bin/SDL3.dll" "$SDEST/SDL3.dll"
           printf 'zan_sdl3.dll\nSDL3.dll\n' > "$SDEST/zan_sdl3.bundle"
