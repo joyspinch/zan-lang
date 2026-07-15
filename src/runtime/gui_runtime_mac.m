@@ -40,6 +40,7 @@ typedef struct {
     NSWindow *window;
     NSView   *view;
     int w, h;
+    NSView   *glassFx; /* NSVisualEffectView while native glass is on, else nil */
 } zan_mwin_t;
 static zan_mwin_t g_mwins[ZAN_MAX_WINDOWS];
 static int g_mwin_count = 0;
@@ -217,6 +218,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         mw->view = view;
         mw->w = (int)width;
         mw->h = (int)height;
+        mw->glassFx = nil;
         return (i64)(intptr_t)window;
     }
 }
@@ -228,6 +230,63 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
     @autoreleasepool {
         [NSApp activateIgnoringOtherApps:YES];
         [mw->window makeKeyAndOrderFront:nil];
+    }
+    return 0;
+}
+
+/* Native glass (macOS vibrancy): make the window non-opaque with a clear
+ * background and slot an NSVisualEffectView behind the drawing view. Wherever
+ * the surface is transparent (the app clears it under a glass theme), the
+ * system vibrancy material shows through -- the macOS counterpart of Win11
+ * acrylic, behind the same Gui.Native.Window.EnableGlass API. tint is unused:
+ * macOS derives the material tint from the system appearance. */
+EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+    (void)tint_argb;
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    @autoreleasepool {
+        NSWindow *win = mw->window;
+        ZanView *view = (ZanView *)mw->view;
+        [win setOpaque:NO];
+        [win setBackgroundColor:[NSColor clearColor]];
+        if (!mw->glassFx) {
+            NSVisualEffectView *fx =
+                [[NSVisualEffectView alloc] initWithFrame:[view frame]];
+            [fx setMaterial:NSVisualEffectMaterialUnderWindowBackground];
+            [fx setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+            [fx setState:NSVisualEffectStateActive];
+            [fx setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+            /* Re-parent: the effect view becomes the content view and the
+             * drawing view sits on top so its transparent pixels reveal it. */
+            [win setContentView:fx];
+            [view setFrame:[fx bounds]];
+            [view setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+            [fx addSubview:view];
+            mw->glassFx = fx;
+        }
+        [view setNeedsDisplay:YES];
+    }
+    return 0;
+}
+
+/* Revert to an opaque window: pull the drawing view back out as the content
+ * view and drop the vibrancy material. */
+EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    @autoreleasepool {
+        NSWindow *win = mw->window;
+        ZanView *view = (ZanView *)mw->view;
+        if (mw->glassFx) {
+            [view removeFromSuperview];
+            [win setContentView:view];
+            mw->glassFx = nil;
+        }
+        [win setOpaque:YES];
+        [win setBackgroundColor:[NSColor windowBackgroundColor]];
+        [view setNeedsDisplay:YES];
     }
     return 0;
 }

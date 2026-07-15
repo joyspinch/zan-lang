@@ -45,6 +45,12 @@ class App {
     // detects a new pick each frame. Every window gets this by default.
     bool autoSkins;
     int appliedSkin;
+    // True while the OS is compositing a real translucent backdrop (Win11
+    // acrylic / macOS vibrancy / Linux compositor blur) behind this window.
+    // Set by ApplyTheme when a glass skin is active. When on, the frame is
+    // cleared transparent and the in-app wallpaper is skipped so the blurred
+    // desktop shows through the gaps.
+    bool glassNative;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
     // frame — e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
@@ -224,7 +230,25 @@ class App {
         isDark = dark;
         theme = t;
         theme.ScaleByDpi(dpiScale);
+        // A frosted-glass skin asks the window for a real OS translucent
+        // backdrop; any other skin keeps the window opaque.
+        if (t.glass != 0) {
+            glassNative = true;
+            window.EnableGlass(this.GlassTint());
+        } else {
+            if (glassNative) { window.DisableGlass(); }
+            glassNative = false;
+        }
         needsRedraw = true;
+    }
+
+    /// Packed ARGB tint handed to the OS glass compositor: the active skin's
+    /// primary background colour at ~59% alpha so the blurred desktop keeps
+    /// colour and body presence while text stays readable.
+    int GlassTint() {
+        int rgb = theme.bgPrimary % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        return 150 * 16777216 + rgb;
     }
 
     /// Turns the title-bar theme button into the built-in skin picker
@@ -274,10 +298,17 @@ class App {
     /// centre (no hard rim), giving the backdrop blur real colour to soften.
     void BackdropBlob(int cx, int cy, int r, int cr, int cg, int cb) {
         Canvas c = canvas;
-        c.FillCircle(cx, cy, r, Theme.Rgba(cr, cg, cb, 28));
-        c.FillCircle(cx, cy, r * 72 / 100, Theme.Rgba(cr, cg, cb, 36));
-        c.FillCircle(cx, cy, r * 46 / 100, Theme.Rgba(cr, cg, cb, 48));
-        c.FillCircle(cx, cy, r * 24 / 100, Theme.Rgba(cr, cg, cb, 58));
+        // Smooth radial feather instead of a few hard rings: many faint,
+        // equal-alpha concentric steps from the rim inward. Coverage rises
+        // gently toward the centre, so overlaps blend into one soft light
+        // bloom (no visible "target" rings) and stays light/airy.
+        int steps = 20;
+        int i = steps;
+        while (i > 0) {
+            int rr = r * i / steps;
+            c.FillCircle(cx, cy, rr, Theme.Rgba(cr, cg, cb, 9));
+            i = i - 1;
+        }
     }
 
     /// A soft glow coloured from a packed ARGB theme accent.
@@ -324,6 +355,24 @@ class App {
     void RenderBackground(int x, int y, int w, int h, int slot) {
         Canvas c = canvas;
         Theme t = theme;
+        // Native glass: the window is a flat semi-transparent sheet (cleared in
+        // BeginFrame) over the OS-blurred desktop. Add a soft top-down light
+        // sheen so the glass reads with depth (brighter near the top) like real
+        // acrylic instead of a flat slab.
+        if (glassNative) {
+            int hi = t.textPrimary % 16777216;
+            if (hi < 0) { hi = hi + 16777216; }
+            int bands = 18;
+            int bh = h / 3 / bands;
+            if (bh < 1) { bh = 1; }
+            int i = 0;
+            while (i < bands) {
+                int a = 15 - (15 * i / bands);
+                c.FillRect(x, y + i * bh, w, bh, a * 16777216 + hi);
+                i = i + 1;
+            }
+            return;
+        }
         if (t.gradient != 0) {
             bool restored = false;
             if (!this.BackdropDirty()) {
@@ -593,6 +642,15 @@ class App {
             } else if (hit == closeId) {
                 window.Close();
             }
+        }
+
+        // A native-glass (layered) window has no OS drop-shadow, so its edge can
+        // vanish into a similar wallpaper. Stroke a subtle rim around the whole
+        // window plus a brighter top highlight so the bounds stay clear.
+        if (glassNative) {
+            int H = c.Height();
+            c.DrawRect(0, 0, W, H, 130 * 16777216 + (t.textPrimary % 16777216), 1);
+            c.FillRect(0, 0, W, 1, 70 * 16777216 + (t.textPrimary % 16777216));
         }
 
         // Defer the preset menu to the overlay layer so it drops above all
@@ -1161,7 +1219,18 @@ class App {
         hitTester.Clear();
         focus.ResetIds();
         overlays = new List<OverlayPopup>();
-        canvas.Clear(theme.bgPrimary);
+        if (glassNative) {
+            // Frosted sheet: clear the whole window to a *semi-transparent* tint
+            // (not fully transparent) so the OS backdrop shows through evenly
+            // blurred while the window stays a solid, bordered glass panel. A
+            // fully transparent clear left the window looking see-through/washed
+            // (and borderless) over light backgrounds.
+            int rgb = theme.bgPrimary % 16777216;
+            if (rgb < 0) { rgb = rgb + 16777216; }
+            canvas.Clear(198 * 16777216 + rgb);
+        } else {
+            canvas.Clear(theme.bgPrimary);
+        }
     }
 
     /// Queues a popup to be painted and dispatched after the main content pass,
