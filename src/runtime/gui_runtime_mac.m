@@ -655,6 +655,11 @@ EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
     return 0;
 }
 
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
+    (void)x;
+    (void)y;
+}
+
 /* Read the general pasteboard's text as UTF-8. Mirrors the Windows/X11 ABI:
  * returns a NUL-terminated i8* valid until the next call (the previous buffer
  * is freed each time), or "" when the pasteboard holds no text. */
