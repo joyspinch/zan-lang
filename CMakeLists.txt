@@ -267,6 +267,28 @@ if(ZAN_BUILD_GUI)
     endif()
 endif()
 
+# Native SDL3 runtime used by the SDL3 + Game.* stdlib via
+# [DllImport("zan_sdl3")]: windowing, 2D renderer, input, timing and the
+# SDL_GPU sprite pipeline (Metal/Vulkan/D3D12). Requires SDL3 (>= 3.2) located
+# through pkg-config. On Windows use scripts/stage_sdl3.ps1 (MinGW) instead.
+option(ZAN_BUILD_SDL3 "Build the native zan_sdl3 runtime library" ON)
+set(ZAN_SDL3_AVAILABLE FALSE)
+if(ZAN_BUILD_SDL3 AND NOT WIN32)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(SDL3 QUIET sdl3)
+    endif()
+    if(SDL3_FOUND)
+        add_library(zan_sdl3 SHARED stdlib/SDL3/native/zan_sdl3.c)
+        target_include_directories(zan_sdl3 PRIVATE ${SDL3_INCLUDE_DIRS})
+        target_link_directories(zan_sdl3 PRIVATE ${SDL3_LIBRARY_DIRS})
+        target_link_libraries(zan_sdl3 PRIVATE ${SDL3_LIBRARIES} m)
+        set(ZAN_SDL3_AVAILABLE TRUE)
+    else()
+        message(WARNING "SDL3 (sdl3.pc) not found; skipping zan_sdl3 runtime")
+    endif()
+endif()
+
 # ---- IDE ----
 # The IDE is built from src/ide_zan/ZanIDE.zan using the Zan compiler (zanc).
 # It is compiled separately: zanc src/ide_zan/ZanIDE.zan -o build/ZanIDE.exe
