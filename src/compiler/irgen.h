@@ -88,6 +88,44 @@ struct zan_irgen {
     } ctors[256];
     int ctor_count;
 
+    /* generic monomorphization: specialized copies of a user generic class's
+     * methods/constructors, one per concrete instantiation (e.g. HashSet<string>).
+     * Signatures are IDENTICAL to the erased versions (type params still lower to
+     * the erased representation); the only behavioural difference is that the
+     * body is emitted with `cur_inst` set, so intrinsic element comparisons
+     * (List/Dict) substitute the type parameter to its concrete argument and use
+     * content equality (e.g. strcmp) instead of erased identity. Routing a call
+     * to a specialized symbol is therefore a pure symbol swap. */
+    zan_type_t *cur_inst;   /* active instantiation while emitting a specialized
+                             * body (a class type carrying concrete type_args);
+                             * NULL when emitting erased/non-generic code. */
+    struct zan_generic_fn {
+        zan_symbol_t *msym;      /* the (erased) generic method symbol */
+        zan_type_t  **args;      /* concrete type args of the instantiation */
+        int           argc;
+        LLVMValueRef  fn;
+        LLVMTypeRef   fn_type;
+    } *generic_fns;
+    int generic_fn_count;
+    int generic_fn_cap;
+    struct zan_generic_ctor {
+        zan_symbol_t *type_sym;
+        zan_type_t  **args;
+        int           argc;
+        int           param_count;
+        LLVMValueRef  fn;
+        LLVMTypeRef   fn_type;
+    } *generic_ctors;
+    int generic_ctor_count;
+    int generic_ctor_cap;
+    /* distinct concrete instantiations discovered in the unit (worklist seed) */
+    struct zan_generic_inst {
+        zan_symbol_t *type_sym;  /* the generic class/struct symbol */
+        zan_type_t   *inst;      /* instantiation type (sym + concrete type_args) */
+    } *generic_insts;
+    int generic_inst_count;
+    int generic_inst_cap;
+
     /* ARC runtime functions */
     LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
     LLVMValueRef rt_release;     /* zan_rt_release(void*) */

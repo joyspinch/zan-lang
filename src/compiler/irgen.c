@@ -1034,6 +1034,15 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->functions = NULL;
     g->function_count = 0;
     g->function_cap = 0;
+    free(g->generic_fns);
+    g->generic_fns = NULL;
+    g->generic_fn_count = g->generic_fn_cap = 0;
+    free(g->generic_ctors);
+    g->generic_ctors = NULL;
+    g->generic_ctor_count = g->generic_ctor_cap = 0;
+    free(g->generic_insts);
+    g->generic_insts = NULL;
+    g->generic_inst_count = g->generic_inst_cap = 0;
 }
 
 /* ---- type mapping ---- */
@@ -2360,6 +2369,349 @@ static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv) {
     return t;
 }
 
+/* Structural equality of two resolved types, used to match a call site's
+ * concrete type arguments against a discovered instantiation. Compares kind +
+ * simple name + (recursively) generic type arguments; arrays/nullable compare
+ * their element type. Good enough for the closed set of types that appear as
+ * generic arguments (builtins, user classes/structs, nested generics). */
+static bool types_equal(zan_type_t *a, zan_type_t *b) {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->name.len != b->name.len ||
+        (a->name.len && memcmp(a->name.str, b->name.str, (size_t)a->name.len) != 0))
+        return false;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+        return types_equal(a->element_type, b->element_type);
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!types_equal(a->type_args[i], b->type_args[i])) return false;
+    return true;
+}
+
+static bool type_arglists_equal(zan_type_t **a, int an, zan_type_t **b, int bn) {
+    if (an != bn) return false;
+    for (int i = 0; i < an; i++)
+        if (!types_equal(a[i], b[i])) return false;
+    return true;
+}
+
+/* True when `t` mentions no unresolved generic type parameter (directly or in a
+ * type argument / element type) — i.e. it is a fully concrete instantiation. */
+static bool type_is_concrete(zan_type_t *t) {
+    if (!t) return false;
+    if (t->kind == TYPE_TYPE_PARAM || t->kind == TYPE_ERROR) return false;
+    if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE)
+        return type_is_concrete(t->element_type);
+    for (int i = 0; i < t->type_arg_count; i++)
+        if (!type_is_concrete(t->type_args[i])) return false;
+    return true;
+}
+
+/* Substitute a type parameter to its concrete argument using the instantiation
+ * currently being specialized (`g->cur_inst`); no-op when not specializing or
+ * when `t` is not one of this instantiation's parameters. */
+static zan_type_t *concretize(zan_irgen_t *g, zan_type_t *t) {
+    if (!g->cur_inst) return t;
+    return subst_type_param(t, g->cur_inst);
+}
+
+/* A user generic class/struct is one declaring at least one type parameter and
+ * not a built-in intrinsic (List/Dict/StringBuilder handled elsewhere). */
+static bool is_user_generic_sym(zan_symbol_t *sym) {
+    if (!sym || !sym->decl) return false;
+    zan_ast_node_t *d = sym->decl;
+    if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) return false;
+    return d->type_decl.type_params.count > 0;
+}
+
+static void add_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
+                           zan_type_t **args, int argc,
+                           LLVMValueRef fn, LLVMTypeRef fn_type) {
+    if (g->generic_fn_count >= g->generic_fn_cap) {
+        int ncap = g->generic_fn_cap ? g->generic_fn_cap * 2 : 64;
+        g->generic_fns = realloc(g->generic_fns,
+                                 (size_t)ncap * sizeof(*g->generic_fns));
+        g->generic_fn_cap = ncap;
+    }
+    g->generic_fns[g->generic_fn_count].msym = msym;
+    g->generic_fns[g->generic_fn_count].args = args;
+    g->generic_fns[g->generic_fn_count].argc = argc;
+    g->generic_fns[g->generic_fn_count].fn = fn;
+    g->generic_fns[g->generic_fn_count].fn_type = fn_type;
+    g->generic_fn_count++;
+}
+
+/* Find the specialized function for `msym` at the instantiation carrying
+ * `args`; NULL when none was emitted (caller falls back to the erased fn). */
+static LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
+                                    zan_type_t **args, int argc,
+                                    LLVMTypeRef *out_fn_type) {
+    if (!msym || argc <= 0 || !args) return NULL;
+    for (int i = 0; i < g->generic_fn_count; i++) {
+        if (g->generic_fns[i].msym == msym &&
+            type_arglists_equal(g->generic_fns[i].args, g->generic_fns[i].argc,
+                                args, argc)) {
+            if (out_fn_type) *out_fn_type = g->generic_fns[i].fn_type;
+            return g->generic_fns[i].fn;
+        }
+    }
+    return NULL;
+}
+
+static void add_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
+                             zan_type_t **args, int argc, int param_count,
+                             LLVMValueRef fn, LLVMTypeRef fn_type) {
+    if (g->generic_ctor_count >= g->generic_ctor_cap) {
+        int ncap = g->generic_ctor_cap ? g->generic_ctor_cap * 2 : 64;
+        g->generic_ctors = realloc(g->generic_ctors,
+                                   (size_t)ncap * sizeof(*g->generic_ctors));
+        g->generic_ctor_cap = ncap;
+    }
+    g->generic_ctors[g->generic_ctor_count].type_sym = type_sym;
+    g->generic_ctors[g->generic_ctor_count].args = args;
+    g->generic_ctors[g->generic_ctor_count].argc = argc;
+    g->generic_ctors[g->generic_ctor_count].param_count = param_count;
+    g->generic_ctors[g->generic_ctor_count].fn = fn;
+    g->generic_ctors[g->generic_ctor_count].fn_type = fn_type;
+    g->generic_ctor_count++;
+}
+
+static LLVMValueRef find_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
+                                      zan_type_t **args, int argc,
+                                      int param_count, LLVMTypeRef *out_fn_type) {
+    if (!type_sym || argc <= 0 || !args) return NULL;
+    for (int i = 0; i < g->generic_ctor_count; i++) {
+        if (g->generic_ctors[i].type_sym == type_sym &&
+            g->generic_ctors[i].param_count == param_count &&
+            type_arglists_equal(g->generic_ctors[i].args, g->generic_ctors[i].argc,
+                                args, argc)) {
+            if (out_fn_type) *out_fn_type = g->generic_ctors[i].fn_type;
+            return g->generic_ctors[i].fn;
+        }
+    }
+    return NULL;
+}
+
+/* Record a distinct concrete instantiation of a user generic class. */
+static void add_generic_inst(zan_irgen_t *g, zan_type_t *inst) {
+    if (!inst || !inst->sym || inst->type_arg_count <= 0) return;
+    if (!is_user_generic_sym(inst->sym)) return;
+    if (!type_is_concrete(inst)) return;
+    for (int i = 0; i < g->generic_inst_count; i++)
+        if (g->generic_insts[i].type_sym == inst->sym &&
+            type_arglists_equal(g->generic_insts[i].inst->type_args,
+                                g->generic_insts[i].inst->type_arg_count,
+                                inst->type_args, inst->type_arg_count))
+            return; /* already recorded */
+    if (g->generic_inst_count >= g->generic_inst_cap) {
+        int ncap = g->generic_inst_cap ? g->generic_inst_cap * 2 : 32;
+        g->generic_insts = realloc(g->generic_insts,
+                                   (size_t)ncap * sizeof(*g->generic_insts));
+        g->generic_inst_cap = ncap;
+    }
+    g->generic_insts[g->generic_inst_count].type_sym = inst->sym;
+    g->generic_insts[g->generic_inst_count].inst = inst;
+    g->generic_inst_count++;
+}
+
+/* Append a readable, LLVM-symbol-safe token for a concrete type argument
+ * (e.g. `string`, `int`, or `List_string` for a nested generic). */
+static void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t) {
+    if (!t) return;
+    if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) {
+        mangle_type_token(buf, n, off, t->element_type);
+        int w = snprintf(buf + (*off < n ? *off : n), (*off < n) ? n - *off : 0, "A");
+        if (w > 0) *off += (size_t)w;
+        return;
+    }
+    int w = snprintf(buf + (*off < n ? *off : n), (*off < n) ? n - *off : 0,
+                     "%.*s", (int)t->name.len, t->name.str);
+    if (w > 0) *off += (size_t)w;
+    for (int i = 0; i < t->type_arg_count; i++) {
+        w = snprintf(buf + (*off < n ? *off : n), (*off < n) ? n - *off : 0, "_");
+        if (w > 0) *off += (size_t)w;
+        mangle_type_token(buf, n, off, t->type_args[i]);
+    }
+}
+
+/* Build the function-name suffix for an instantiation, e.g. HashSet<string>
+ * yields "$string" and Pair<int,string> yields "$int$string". */
+static void mangle_inst_suffix(char *buf, size_t n, zan_type_t *inst) {
+    size_t off = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < inst->type_arg_count; i++) {
+        int w = snprintf(buf + (off < n ? off : n), (off < n) ? n - off : 0, "$");
+        if (w > 0) off += (size_t)w;
+        mangle_type_token(buf, n, &off, inst->type_args[i]);
+    }
+    if (off < n) buf[off] = '\0'; else buf[n - 1] = '\0';
+}
+
+/* ---- generic instantiation discovery (monomorphization worklist seed) ----
+ * Walk the whole compilation unit resolving every declared / constructed type,
+ * recording each fully concrete instantiation of a user generic class. Types
+ * mentioning a still-erased type parameter (e.g. List<T> inside a generic body)
+ * resolve non-concrete and are ignored. */
+static void collect_inst_type(zan_irgen_t *g, zan_type_t *t) {
+    if (!t) return;
+    add_generic_inst(g, t);
+    if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE)
+        collect_inst_type(g, t->element_type);
+    for (int i = 0; i < t->type_arg_count; i++)
+        collect_inst_type(g, t->type_args[i]);
+}
+
+static void collect_inst_typeref(zan_irgen_t *g, zan_ast_node_t *tref) {
+    if (!tref || tref->kind != AST_TYPE_REF) return;
+    collect_inst_type(g, zan_binder_resolve_type(g->binder, tref));
+}
+
+static void collect_inst_stmt(zan_irgen_t *g, zan_ast_node_t *st);
+
+static void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
+    if (!e) return;
+    switch (e->kind) {
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        collect_inst_expr(g, e->binary.left);
+        collect_inst_expr(g, e->binary.right);
+        break;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        collect_inst_expr(g, e->unary.operand);
+        break;
+    case AST_AWAIT_EXPR:
+        collect_inst_expr(g, e->await_expr.expr);
+        break;
+    case AST_CALL:
+        collect_inst_expr(g, e->call.callee);
+        for (int i = 0; i < e->call.args.count; i++)
+            collect_inst_expr(g, e->call.args.items[i]);
+        break;
+    case AST_MEMBER_ACCESS:
+        collect_inst_expr(g, e->member.object);
+        break;
+    case AST_INDEX:
+        collect_inst_expr(g, e->index.object);
+        collect_inst_expr(g, e->index.index);
+        break;
+    case AST_CONDITIONAL:
+        collect_inst_expr(g, e->conditional.cond);
+        collect_inst_expr(g, e->conditional.then_expr);
+        collect_inst_expr(g, e->conditional.else_expr);
+        break;
+    case AST_NEW_EXPR:
+        collect_inst_typeref(g, e->new_expr.type);
+        for (int i = 0; i < e->new_expr.args.count; i++)
+            collect_inst_expr(g, e->new_expr.args.items[i]);
+        break;
+    case AST_CAST_EXPR:
+        collect_inst_typeref(g, e->cast.type);
+        collect_inst_expr(g, e->cast.expr);
+        break;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        collect_inst_typeref(g, e->type_test.type);
+        collect_inst_expr(g, e->type_test.expr);
+        break;
+    default:
+        break;
+    }
+}
+
+static void collect_inst_stmt(zan_irgen_t *g, zan_ast_node_t *st) {
+    if (!st) return;
+    switch (st->kind) {
+    case AST_BLOCK:
+        for (int i = 0; i < st->block.stmts.count; i++)
+            collect_inst_stmt(g, st->block.stmts.items[i]);
+        break;
+    case AST_VAR_DECL:
+        collect_inst_typeref(g, st->var_decl.type);
+        collect_inst_expr(g, st->var_decl.initializer);
+        break;
+    case AST_EXPR_STMT:
+        collect_inst_expr(g, st->expr_stmt.expr);
+        break;
+    case AST_RETURN_STMT:
+        collect_inst_expr(g, st->ret.value);
+        break;
+    case AST_IF_STMT:
+        collect_inst_expr(g, st->if_stmt.cond);
+        collect_inst_stmt(g, st->if_stmt.then_body);
+        collect_inst_stmt(g, st->if_stmt.else_body);
+        break;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        collect_inst_expr(g, st->while_stmt.cond);
+        collect_inst_stmt(g, st->while_stmt.body);
+        break;
+    case AST_FOR_STMT:
+        collect_inst_stmt(g, st->for_stmt.init);
+        collect_inst_expr(g, st->for_stmt.cond);
+        collect_inst_expr(g, st->for_stmt.step);
+        collect_inst_stmt(g, st->for_stmt.body);
+        break;
+    case AST_FOREACH_STMT:
+        collect_inst_typeref(g, st->foreach_stmt.var_type);
+        collect_inst_expr(g, st->foreach_stmt.collection);
+        collect_inst_stmt(g, st->foreach_stmt.body);
+        break;
+    case AST_THROW_STMT:
+        collect_inst_expr(g, st->throw_stmt.value);
+        break;
+    case AST_TRY_STMT:
+        collect_inst_stmt(g, st->try_stmt.try_body);
+        for (int i = 0; i < st->try_stmt.catches.count; i++)
+            collect_inst_stmt(g, st->try_stmt.catches.items[i]->catch_clause.body);
+        collect_inst_stmt(g, st->try_stmt.finally_body);
+        break;
+    case AST_SWITCH_STMT:
+        collect_inst_expr(g, st->switch_stmt.expr);
+        for (int i = 0; i < st->switch_stmt.cases.count; i++)
+            collect_inst_stmt(g, st->switch_stmt.cases.items[i]->switch_case.body);
+        break;
+    default:
+        break;
+    }
+}
+
+static void collect_inst_member(zan_irgen_t *g, zan_ast_node_t *member) {
+    if (!member) return;
+    if (member->kind == AST_METHOD_DECL) {
+        for (int k = 0; k < member->method_decl.params.count; k++)
+            collect_inst_typeref(g, member->method_decl.params.items[k]->param.type);
+        collect_inst_typeref(g, member->method_decl.return_type);
+        collect_inst_stmt(g, member->method_decl.body);
+    } else if (member->kind == AST_CONSTRUCTOR_DECL) {
+        for (int k = 0; k < member->method_decl.params.count; k++)
+            collect_inst_typeref(g, member->method_decl.params.items[k]->param.type);
+        collect_inst_stmt(g, member->method_decl.body);
+    } else if (member->kind == AST_FIELD_DECL) {
+        collect_inst_typeref(g, member->field_decl.type);
+    }
+}
+
+/* Repeatedly scan until no new instantiation appears, so a concrete generic
+ * used only inside another specialized generic's body (transitive) is found. */
+static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    int prev = -1;
+    int guard = 0;
+    while (g->generic_inst_count != prev && guard++ < 64) {
+        prev = g->generic_inst_count;
+        for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+            zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+            if (decl->kind == AST_CLASS_DECL || decl->kind == AST_STRUCT_DECL ||
+                decl->kind == AST_INTERFACE_DECL) {
+                for (int j = 0; j < decl->type_decl.members.count; j++)
+                    collect_inst_member(g, decl->type_decl.members.items[j]);
+            }
+        }
+    }
+}
+
 /* Coerce a call result from the erased opaque pointer back to the concrete
  * type when the callee's declared return type is a generic type parameter of
  * the receiver's instantiated class. No-op otherwise. */
@@ -2371,6 +2723,28 @@ static LLVMValueRef coerce_generic_result(zan_irgen_t *g, LLVMValueRef result,
     if (rt && rt != method_sym->type)
         return emit_boundary_coerce(g, result, map_type(g, rt));
     return result;
+}
+
+/* When the receiver's static type is a concrete instantiation of a user generic
+ * class that has a registered specialized method, return the specialized
+ * function (and its type via *out_ty); otherwise return the erased function
+ * unchanged. Signatures are identical, so this is a pure symbol swap. */
+static LLVMValueRef route_generic_method(zan_irgen_t *g, zan_type_t *recv_ty,
+                                         zan_symbol_t *method_sym,
+                                         LLVMValueRef erased_fn,
+                                         LLVMTypeRef erased_ty,
+                                         LLVMTypeRef *out_ty) {
+    if (out_ty) *out_ty = erased_ty;
+    if (!recv_ty || recv_ty->type_arg_count <= 0 || !recv_ty->sym) return erased_fn;
+    if (!is_user_generic_sym(recv_ty->sym)) return erased_fn;
+    LLVMTypeRef st = NULL;
+    LLVMValueRef sfn = find_generic_fn(g, method_sym, recv_ty->type_args,
+                                       recv_ty->type_arg_count, &st);
+    if (sfn) {
+        if (out_ty) *out_ty = st;
+        return sfn;
+    }
+    return erased_fn;
 }
 
 /* Emit a call that dispatches through the object's vtable when the target is a
@@ -5148,6 +5522,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     /* compare: for ints use ==, for strings use strcmp */
                     LLVMValueRef eq;
                     zan_type_t *elem_type = ltype->type_arg_count > 0 ? ltype->type_args[0] : NULL;
+                    /* Under monomorphization, a List<T> field of the generic
+                     * class being specialized carries the erased type param T;
+                     * substitute it to the concrete instantiation argument so
+                     * reference elements (e.g. string) use content equality. */
+                    elem_type = concretize(g, elem_type);
                     if (elem_type && elem_type->kind == TYPE_STRING) {
                         LLVMValueRef sval = LLVMBuildIntToPtr(g->builder, val, i8ptr, "sptr");
                         LLVMValueRef cmp_args[] = { sval, search };
@@ -5216,6 +5595,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef val = LLVMBuildLoad2(g->builder, i64, slot, "sv");
                     LLVMValueRef eq;
                     zan_type_t *elem_type = ltype->type_arg_count > 0 ? ltype->type_args[0] : NULL;
+                    /* Under monomorphization, a List<T> field of the generic
+                     * class being specialized carries the erased type param T;
+                     * substitute it to the concrete instantiation argument so
+                     * reference elements (e.g. string) use content equality. */
+                    elem_type = concretize(g, elem_type);
                     if (elem_type && elem_type->kind == TYPE_STRING) {
                         LLVMValueRef sval = LLVMBuildIntToPtr(g->builder, val, i8ptr, "sptr");
                         LLVMValueRef cmp_args[] = { sval, search };
@@ -5640,9 +6024,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
-                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
+                                LLVMTypeRef mft = g->functions[fi].fn_type;
+                                LLVMValueRef mfn = route_generic_method(g, local->type,
+                                    method_sym, g->functions[fi].fn, mft, &mft);
+                                const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "mcall";
                                 LLVMValueRef result = emit_dispatch_call(g, type_sym, method_sym,
-                                    g->functions[fi].fn, g->functions[fi].fn_type, call_args, argc, cn);
+                                    mfn, mft, call_args, argc, cn);
                                 result = coerce_generic_result(g, result, method_sym, local->type);
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -5711,11 +6098,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
                             }
-                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "mcall";
+                            zan_type_t *recv_ty = infer_expr_type(g, callee->member.object, locals);
+                            LLVMTypeRef mft = g->functions[fi].fn_type;
+                            LLVMValueRef mfn = route_generic_method(g, recv_ty,
+                                method_sym, g->functions[fi].fn, mft, &mft);
+                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "mcall";
                             LLVMValueRef result = emit_dispatch_call(g, recv_cls, method_sym,
-                                g->functions[fi].fn, g->functions[fi].fn_type, call_args, argc, cn);
-                            result = coerce_generic_result(g, result, method_sym,
-                                infer_expr_type(g, callee->member.object, locals));
+                                mfn, mft, call_args, argc, cn);
+                            result = coerce_generic_result(g, result, method_sym, recv_ty);
                             emit_release_owned_call_temp(g, callee->member.object, recv_val, locals);
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -5850,11 +6240,15 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             for (int k = 0; k < argc; k++) {
                                 call_args[k + extra] = emit_expr(g, expr->call.args.items[k], locals);
                             }
-                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "bcall";
+                            /* self-call inside a specialized variant stays in
+                             * the same instantiation (receiver is `this`). */
+                            LLVMTypeRef mft = g->functions[fi].fn_type;
+                            LLVMValueRef mfn = route_generic_method(g, g->cur_inst,
+                                method_sym, g->functions[fi].fn, mft, &mft);
+                            const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "bcall";
                             LLVMValueRef result = emit_dispatch_call(g,
                                 is_static ? NULL : g->current_type_sym, method_sym,
-                                g->functions[fi].fn, g->functions[fi].fn_type,
-                                call_args, argc + extra, cn);
+                                mfn, mft, call_args, argc + extra, cn);
                             int consumes_free_arg =
                                 argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                             if (consumes_free_arg) {
@@ -6546,25 +6940,39 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             LLVMBuildBitCast(g->builder, vtg, i8ptr_vt, "vt.i8"), vpf0);
                     }
 
-                    /* look for constructor */
-                    for (int ci = 0; ci < g->ctor_count; ci++) {
-                        if (g->ctors[ci].type_sym == sym) {
-                            int argc = expr->new_expr.args.count + 1;
-                            LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
-                            call_args[0] = alloca; /* this ptr */
-                            for (int k = 0; k < expr->new_expr.args.count; k++) {
-                                call_args[k + 1] = emit_expr(g, expr->new_expr.args.items[k], locals);
+                    /* look for constructor. For a concrete instantiation of a
+                     * user generic class, prefer the specialized constructor so
+                     * the body runs with the instantiation context. */
+                    zan_type_t *new_inst = zan_binder_resolve_type(g->binder, expr->new_expr.type);
+                    LLVMValueRef ctor_fn = NULL;
+                    LLVMTypeRef ctor_ft = NULL;
+                    if (new_inst && new_inst->type_arg_count > 0)
+                        ctor_fn = find_generic_ctor(g, sym, new_inst->type_args,
+                                                    new_inst->type_arg_count,
+                                                    expr->new_expr.args.count, &ctor_ft);
+                    if (!ctor_fn) {
+                        for (int ci = 0; ci < g->ctor_count; ci++) {
+                            if (g->ctors[ci].type_sym == sym) {
+                                ctor_fn = g->ctors[ci].fn;
+                                ctor_ft = g->ctors[ci].fn_type;
+                                break;
                             }
-                            coerce_args_to_params(g, g->ctors[ci].fn_type, call_args, argc);
-                            LLVMBuildCall2(g->builder, g->ctors[ci].fn_type,
-                                g->ctors[ci].fn, call_args, (unsigned)argc, "");
-                            for (int k = 0; k < expr->new_expr.args.count; k++) {
-                                emit_release_owned_call_temp(g, expr->new_expr.args.items[k],
-                                    call_args[k + 1], locals);
-                            }
-                            free(call_args);
-                            break;
                         }
+                    }
+                    if (ctor_fn) {
+                        int argc = expr->new_expr.args.count + 1;
+                        LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
+                        call_args[0] = alloca; /* this ptr */
+                        for (int k = 0; k < expr->new_expr.args.count; k++) {
+                            call_args[k + 1] = emit_expr(g, expr->new_expr.args.items[k], locals);
+                        }
+                        coerce_args_to_params(g, ctor_ft, call_args, argc);
+                        LLVMBuildCall2(g->builder, ctor_ft, ctor_fn, call_args, (unsigned)argc, "");
+                        for (int k = 0; k < expr->new_expr.args.count; k++) {
+                            emit_release_owned_call_temp(g, expr->new_expr.args.items[k],
+                                call_args[k + 1], locals);
+                        }
+                        free(call_args);
                     }
 
                     /* if no constructor, handle field initializers */
@@ -8770,15 +9178,32 @@ typedef struct {
     async_local_t  *alocals;       /* named scalar locals held in the frame */
     int             alocal_count;
     int             sub_base;       /* frame index of the first sub-task slot */
+    zan_type_t     *cur_inst;       /* instantiation being specialized, or NULL */
 } method_body_work_t;
 
+/* Count how many discovered instantiations exist for a given generic type. */
+static int generic_variant_count(zan_irgen_t *g, zan_symbol_t *type_sym) {
+    int n = 0;
+    for (int i = 0; i < g->generic_inst_count; i++)
+        if (g->generic_insts[i].type_sym == type_sym) n++;
+    return n;
+}
+
 static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
-    /* Size an upper bound for the deferred body work list. */
+    /* Discover every concrete instantiation of a user generic class up front so
+     * Pass A can emit one specialized variant per instantiation (in addition to
+     * the erased variant). */
+    discover_generic_insts(g, unit);
+
+    /* Size an upper bound for the deferred body work list, counting the erased
+     * variant plus one per discovered instantiation for generic types. */
     int work_cap = 0;
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
         if (decl->kind == AST_CLASS_DECL || decl->kind == AST_STRUCT_DECL) {
-            work_cap += decl->type_decl.members.count;
+            zan_symbol_t *ts = zan_binder_lookup(g->binder, decl->type_decl.name);
+            int variants = 1 + (ts ? generic_variant_count(g, ts) : 0);
+            work_cap += decl->type_decl.members.count * variants;
         }
     }
     method_body_work_t *work = NULL;
@@ -8796,10 +9221,36 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         zan_symbol_t *type_sym = zan_binder_lookup(g->binder, decl->type_decl.name);
         if (!type_sym) continue;
 
+        /* Emit one variant per (erased + each concrete instantiation). The
+         * erased variant (cur_variant == NULL) keeps the existing symbol names
+         * and registration; specialized variants add a name suffix and register
+         * into the generic fn/ctor tables. Signatures are identical across
+         * variants (type parameters still lower to the erased representation);
+         * only the body differs, via g->cur_inst set in Pass B. */
+        zan_type_t *variants[64];
+        int nvar = 0;
+        variants[nvar++] = NULL;
+        if (is_user_generic_sym(type_sym)) {
+            for (int gi = 0; gi < g->generic_inst_count && nvar < 64; gi++)
+                if (g->generic_insts[gi].type_sym == type_sym)
+                    variants[nvar++] = g->generic_insts[gi].inst;
+        }
+
+        for (int vi = 0; vi < nvar; vi++) {
+        zan_type_t *cur_variant = variants[vi];
+        char vsuffix[256];
+        vsuffix[0] = '\0';
+        if (cur_variant) mangle_inst_suffix(vsuffix, sizeof(vsuffix), cur_variant);
+
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
             if (member->kind != AST_METHOD_DECL && !is_ctor) continue;
+            /* extern/DllImport methods have no generic body: only the erased
+             * variant declares them. */
+            if (cur_variant && member->kind == AST_METHOD_DECL &&
+                member->method_decl.extern_lib.str && !member->method_decl.body)
+                continue;
 
             /* [DllImport] extern methods: generate extern declaration, skip body */
             if (member->kind == AST_METHOD_DECL && member->method_decl.extern_lib.str &&
@@ -8874,15 +9325,19 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             if (is_static && member->method_decl.name.len == 4 &&
                 memcmp(member->method_decl.name.str, "Main", 4) == 0) continue;
 
-            /* build function name: TypeName_MethodName or TypeName_ctor */
+            /* build function name: TypeName_MethodName or TypeName_ctor,
+             * plus a per-instantiation suffix (e.g. HashSet_Add$string) for a
+             * specialized variant so it does not collide with the erased one. */
             char fn_name[512];
             if (is_ctor) {
-                snprintf(fn_name, sizeof(fn_name), "%.*s_ctor",
-                         (int)decl->type_decl.name.len, decl->type_decl.name.str);
-            } else {
-                snprintf(fn_name, sizeof(fn_name), "%.*s_%.*s",
+                snprintf(fn_name, sizeof(fn_name), "%.*s_ctor%s",
                          (int)decl->type_decl.name.len, decl->type_decl.name.str,
-                         (int)member->method_decl.name.len, member->method_decl.name.str);
+                         vsuffix);
+            } else {
+                snprintf(fn_name, sizeof(fn_name), "%.*s_%.*s%s",
+                         (int)decl->type_decl.name.len, decl->type_decl.name.str,
+                         (int)member->method_decl.name.len, member->method_decl.name.str,
+                         vsuffix);
             }
 
             /* build function type */
@@ -8987,9 +9442,16 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             }
 
             /* register in function/ctor table. For async methods the ramp is
-             * the callable symbol (a call site receives the task handle). */
+             * the callable symbol (a call site receives the task handle). The
+             * erased variant registers in the ordinary tables; a specialized
+             * variant registers in the generic tables keyed by (sym, args) so a
+             * concrete call site can route to it. */
             if (is_ctor) {
-                if (g->ctor_count < 256) {
+                if (cur_variant) {
+                    add_generic_ctor(g, type_sym, cur_variant->type_args,
+                                     cur_variant->type_arg_count, param_count,
+                                     fn, fn_type);
+                } else if (g->ctor_count < 256) {
                     g->ctors[g->ctor_count].type_sym = type_sym;
                     g->ctors[g->ctor_count].fn = fn;
                     g->ctors[g->ctor_count].fn_type = fn_type;
@@ -8998,7 +9460,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 }
             } else {
                 zan_symbol_t *method_sym = method_sym_for_decl(type_sym, member);
-                irgen_register_function(g, method_sym, fn, fn_type);
+                if (cur_variant) {
+                    add_generic_fn(g, method_sym, cur_variant->type_args,
+                                   cur_variant->type_arg_count, fn, fn_type);
+                } else {
+                    irgen_register_function(g, method_sym, fn, fn_type);
+                }
             }
 
             /* defer body emission to Pass B so calls may forward-reference
@@ -9020,11 +9487,13 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 work[work_count].alocals = a_locals;
                 work[work_count].alocal_count = a_local_count;
                 work[work_count].sub_base = a_sub_base;
+                work[work_count].cur_inst = cur_variant;
                 work_count++;
             } else {
                 free(param_types);
             }
         }
+        } /* end variant loop */
     }
 
     /* Pass B: emit every deferred body now that all functions are declared. */
@@ -9039,6 +9508,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         LLVMTypeRef llvm_ret = work[w].llvm_ret;
         zan_type_t *ret_type = work[w].ret_type;
         LLVMValueRef this_alloca = NULL;
+        /* Activate the instantiation context for a specialized variant so that
+         * intrinsic element comparisons in this body substitute the type
+         * parameter to its concrete argument (NULL for erased/non-generic). */
+        g->cur_inst = work[w].cur_inst;
 
         /* async method: emit ramp (allocate frame, stash params, hand out the
          * task handle) + resume (state-machine entry running the body). See
@@ -9304,6 +9777,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         free(param_types);
     }
 
+    g->cur_inst = NULL;
     free(work);
 }
 
