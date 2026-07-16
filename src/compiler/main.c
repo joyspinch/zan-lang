@@ -817,6 +817,10 @@ static void print_usage(void) {
     fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
     fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
     fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
+    fprintf(stderr, "  --subsystem <s>  PE subsystem: console (default) or windows (GUI, Win only)\n");
+    fprintf(stderr, "  -L<dir>/--libpath <dir>  Add a native library search directory\n");
+    fprintf(stderr, "  --link-lib <name>  Link an extra native library (-> -l<name>)\n");
+    fprintf(stderr, "  --link-input <f>   Link an extra object/resource/library file\n");
     fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
     fprintf(stderr, "  --version, -v    Print version and exit\n");
     fprintf(stderr, "  --help, -h       Show this help and exit\n");
@@ -857,6 +861,14 @@ int main(int argc, char **argv) {
     const char *target_name = NULL; /* --target <name|triple>; NULL = host */
     bool link_static_drivers = false; /* --link-mode static; default shared */
     const char *driver_dir_override = NULL; /* --driver-dir */
+    /* Extra native link inputs, so the IDE (and callers) can produce GUI/native
+     * executables through zanc's own self-contained linker instead of shelling
+     * out to clang: --subsystem <console|windows>, repeatable --link-input
+     * <obj|res|lib>, --link-lib <name> (-> -l<name>) and -L<dir> / --libpath. */
+    const char *link_subsystem = NULL;
+    const char *extra_link_inputs[32]; int extra_link_input_count = 0;
+    const char *extra_link_libs[32];   int extra_link_lib_count = 0;
+    const char *extra_lib_paths[16];   int extra_lib_path_count = 0;
     /* Resolved stdlib root, hoisted so the native-driver block (which lives
      * outside the stdlib-discovery scope) can root driver dirs at
      * <stdlib_root>/<module>/drivers/<target>/. Empty when no stdlib is used. */
@@ -911,6 +923,20 @@ int main(int argc, char **argv) {
             opt_level = 2;
         } else if (strcmp(argv[i], "-O3") == 0) {
             opt_level = 3;
+        } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
+            link_subsystem = argv[++i];
+        } else if (strcmp(argv[i], "--link-input") == 0 && i + 1 < argc) {
+            if (extra_link_input_count < 32) extra_link_inputs[extra_link_input_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --link-input (max 32)\n"); return 1; }
+        } else if (strcmp(argv[i], "--link-lib") == 0 && i + 1 < argc) {
+            if (extra_link_lib_count < 32) extra_link_libs[extra_link_lib_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --link-lib (max 32)\n"); return 1; }
+        } else if (strcmp(argv[i], "--libpath") == 0 && i + 1 < argc) {
+            if (extra_lib_path_count < 16) extra_lib_paths[extra_lib_path_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --libpath (max 16)\n"); return 1; }
+        } else if (strncmp(argv[i], "-L", 2) == 0 && argv[i][2] != '\0') {
+            if (extra_lib_path_count < 16) extra_lib_paths[extra_lib_path_count++] = argv[i] + 2;
+            else { fprintf(stderr, "error: too many -L dirs (max 16)\n"); return 1; }
         } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
             if (pp_define_count < 64) pp_defines[pp_define_count++] = argv[i] + 2;
         } else if (argv[i][0] != '-') {
@@ -1525,7 +1551,7 @@ int main(int argc, char **argv) {
             /* Invoke the bundled GNU ld (mingw binutils) directly. The system
              * import/static libs have circular references, so wrap them in
              * --start-group/--end-group for ld's single-pass resolver. */
-            const char *argv[80];
+            const char *argv[160];
             int a = 0;
             argv[a++] = ld_path;
             argv[a++] = "-m";      argv[a++] = "i386pep";
@@ -1533,19 +1559,39 @@ int main(int argc, char **argv) {
             /* 256 MB stack: the self-hosted compiler recurses deeply. */
             argv[a++] = "--stack"; argv[a++] = "268435456";
             if (publish_mode) argv[a++] = "-s";
+            /* GUI apps: hide the console window (still entered via main). */
+            if (link_subsystem && strcmp(link_subsystem, "windows") == 0) {
+                argv[a++] = "--subsystem"; argv[a++] = "windows";
+            }
             argv[a++] = "-o";      argv[a++] = obj_path;
             argv[a++] = crt2;
             argv[a++] = crtbeg;
             argv[a++] = lflag;
             char ldirbufs[16][520];
-            for (int di = 0; di < zan_lib_ndirs && a < 60; di++) {
+            for (int di = 0; di < zan_lib_ndirs && a < 120; di++) {
                 snprintf(ldirbufs[di], sizeof(ldirbufs[di]), "-L%s", zan_lib_dirs[di]);
                 argv[a++] = ldirbufs[di];
+            }
+            /* caller-supplied library search dirs (-L / --libpath) */
+            char elpbufs[16][520];
+            for (int di = 0; di < extra_lib_path_count && a < 120; di++) {
+                snprintf(elpbufs[di], sizeof(elpbufs[di]), "-L%s", extra_lib_paths[di]);
+                argv[a++] = elpbufs[di];
             }
             argv[a++] = obj_tmp;
             if (rt_io_obj) argv[a++] = rt_io_obj;
             if (rt_sync_obj) argv[a++] = rt_sync_obj;
+            /* caller-supplied objects/resources (--link-input) */
+            for (int ei = 0; ei < extra_link_input_count && a < 130; ei++)
+                argv[a++] = extra_link_inputs[ei];
             argv[a++] = "--start-group";
+            /* caller-supplied libraries (--link-lib), inside the group so they
+             * can resolve against and be resolved by the system libs. */
+            char elibbufs[32][160]; int neb = 0;
+            for (int ei = 0; ei < extra_link_lib_count && a < 140 && neb < 32; ei++) {
+                snprintf(elibbufs[neb], sizeof(elibbufs[neb]), "-l%s", extra_link_libs[ei]);
+                argv[a++] = elibbufs[neb++];
+            }
             argv[a++] = "-lmingw32"; argv[a++] = "-lgcc";
             argv[a++] = "-lmoldname"; argv[a++] = "-lmingwex";
             argv[a++] = "-lmsvcrt";   argv[a++] = "-lkernel32";
@@ -1554,7 +1600,7 @@ int main(int argc, char **argv) {
             if (rt_io_obj) argv[a++] = "-lws2_32";
             /* extern [DllImport] libraries (skip those already in the CRT) */
             char libbufs[24][128]; int nb = 0;
-            for (int li = 0; li < irgen.extern_lib_count && a < 68 && nb < 24; li++) {
+            for (int li = 0; li < irgen.extern_lib_count && a < 150 && nb < 24; li++) {
                 int nlen;
                 const char *nm = zan_dllimport_lname(
                     irgen.extern_libs[li].str,
@@ -1587,6 +1633,22 @@ int main(int argc, char **argv) {
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 size_t cur = strlen(link_cmd);
                 snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", zan_lib_dirs[di]);
+            }
+            if (link_subsystem && strcmp(link_subsystem, "windows") == 0) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -Wl,--subsystem,windows");
+            }
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -L\"%s\"", extra_lib_paths[di]);
+            }
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", extra_link_inputs[ei]);
+            }
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                size_t cur = strlen(link_cmd);
+                snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%s", extra_link_libs[ei]);
             }
             for (int li = 0; li < irgen.extern_lib_count; li++) {
                 int nlen;
@@ -1667,6 +1729,21 @@ int main(int argc, char **argv) {
             if (!name) continue;
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%.*s", name_len, name);
+        }
+        /* caller-supplied link inputs (--libpath / --link-input / --link-lib);
+         * --subsystem is Windows-only and ignored here. */
+        for (int di = 0; di < extra_lib_path_count; di++) {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " -L\"%s\" -Wl,-rpath,\"%s\"", extra_lib_paths[di], extra_lib_paths[di]);
+        }
+        for (int ei = 0; ei < extra_link_input_count; ei++) {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", extra_link_inputs[ei]);
+        }
+        for (int ei = 0; ei < extra_link_lib_count; ei++) {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " -l%s", extra_link_libs[ei]);
         }
         link_ret = system(link_cmd);
 #endif
