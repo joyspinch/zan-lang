@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Diagnostics;
+using System.Json;
 using Gui;
 using Gui.Widget;
 
@@ -15,10 +16,6 @@ class Tpl {
     string desc;
     string kind;
     string src;
-    string type;
-    string target;
-    string entry;
-    int order;
 
     static Tpl Make(string cat, string name, string icon, string kind, string desc) {
         Tpl t = new Tpl();
@@ -28,10 +25,6 @@ class Tpl {
         t.kind = kind;
         t.desc = desc;
         t.src = "";
-        t.type = "console";
-        t.target = "exe";
-        t.entry = "src/main.zan";
-        t.order = 100;
         return t;
     }
 }
@@ -214,6 +207,7 @@ class ZanIDE {
         cmds.Add(RibbonCmd.Create("grid", ZanIDE.T("Config", "配置")));
         cmds.Add(RibbonCmd.Create("settings", ZanIDE.T("Settings", "设置")));
         cmds.Add(RibbonCmd.Create("info", ZanIDE.T("Help", "帮助")));
+        cmds.Add(RibbonCmd.Create("grid", ZanIDE.T("Form Builder", "表单设计器")));
         return cmds;
     }
 
@@ -295,6 +289,74 @@ class ZanIDE {
             ZanIDE.EditorThemeColor(themeIdx, 4), ZanIDE.EditorThemeColor(themeIdx, 5));
     }
 
+    // ---- Editor Settings dialog: JSON declarative + two-way binding ----
+    // The Settings modal is described as a JSON UiDoc bound to a JsonValue model
+    // {themeIdx, font, lang}. Handlers are parameterless Actions resolved by the
+    // registry, so button clicks flip these static flags which Run() consumes.
+    static bool setDone;
+    static bool setResetFont;
+
+    static void OnSettingsDone() { ZanIDE.setDone = true; }
+    static void OnSettingsResetFont() { ZanIDE.setResetFont = true; }
+
+    /// Escapes a label for embedding as a JSON string literal.
+    static string JsonEsc(string s) {
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") { outp = outp + "\\\\"; }
+            else if (ch == "\"") { outp = outp + "\\\""; }
+            else { outp = outp + ch; }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Builds the Settings modal as a JSON UiDoc document: a title, the color
+    /// theme preview cards (custom ThemeCard component, one per preset, all
+    /// two-way bound to model.themeIdx), a font-size slider + live readout, a
+    /// segmented language chooser (Segment component bound to model.lang), and
+    /// the Default / Done buttons.
+    static string SettingsDocJson() {
+        string s = "{ \"type\":\"Column\", \"pad\":18, \"gap\":8, \"children\":[";
+        s = s + "{ \"type\":\"Title\", \"dock\":\"top\", \"height\":34, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Editor Settings", "编辑器设置")) + "\" },";
+        s = s + "{ \"type\":\"Label\", \"variant\":2, \"dock\":\"top\", \"height\":20, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Color Theme", "配色主题")) + "\" },";
+        int i = 0;
+        while (i < ZanIDE.EditorThemeCount()) {
+            s = s + "{ \"type\":\"ThemeCard\", \"index\":" + Convert.ToString(i)
+                + ", \"dock\":\"top\", \"height\":38, \"bind\":\"themeIdx\" },";
+            i = i + 1;
+        }
+        s = s + "{ \"type\":\"Label\", \"variant\":2, \"dock\":\"top\", \"height\":20, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Font Size", "字体大小")) + "\" },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":34, \"gap\":10, \"children\":[";
+        s = s + "{ \"type\":\"Slider\", \"min\":9, \"max\":30, \"bind\":\"font\", \"dock\":\"left\", \"width\":300 },";
+        s = s + "{ \"type\":\"Label\", \"dock\":\"left\", \"width\":44, \"bind\":{\"path\":\"font\",\"prop\":\"text\"} },";
+        s = s + "{ \"type\":\"Label\", \"dock\":\"left\", \"width\":24, \"text\":\"px\" },";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"resetFont\", \"dock\":\"left\", \"width\":100, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Default", "默认")) + "\" } ] },";
+        s = s + "{ \"type\":\"Label\", \"variant\":2, \"dock\":\"top\", \"height\":20, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Language", "界面语言")) + "\" },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":34, \"gap\":8, \"children\":[";
+        int j = 0;
+        while (j < ZanIDE.LangCount()) {
+            s = s + "{ \"type\":\"Segment\", \"index\":" + Convert.ToString(j)
+                + ", \"label\":\"" + ZanIDE.JsonEsc(ZanIDE.LangName(j))
+                + "\", \"dock\":\"left\", \"width\":130, \"bind\":\"lang\" }";
+            j = j + 1;
+            if (j < ZanIDE.LangCount()) { s = s + ","; }
+        }
+        s = s + "] },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":40, \"gap\":10, \"children\":[";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"done\", \"dock\":\"right\", \"width\":120, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Done", "完成")) + "\" } ] }";
+        s = s + "] }";
+        return s;
+    }
+
     /// Converts Windows backslashes to forward slashes, the IDE-internal path
     /// form (Windows file APIs accept either separator).
     static string NormSlashes(string p) {
@@ -346,17 +408,6 @@ class ZanIDE {
         string a = ZanIDE.ExeDir() + "/examples";
         if (Directory.Exists(a)) { return a; }
         string b = ZanIDE.ExeDir() + "/../examples";
-        if (Directory.Exists(b)) { return b; }
-        return "";
-    }
-
-    /// Shipped project templates. Published next to the IDE as <ExeDir>/templates
-    /// (scripts/publish_ide.ps1); when running from the build tree it sits one
-    /// level up at the repo root. Returns "" when neither exists.
-    static string TemplatesDir() {
-        string a = ZanIDE.ExeDir() + "/templates";
-        if (Directory.Exists(a)) { return a; }
-        string b = ZanIDE.ExeDir() + "/../templates";
         if (Directory.Exists(b)) { return b; }
         return "";
     }
@@ -708,6 +759,10 @@ class ZanIDE {
         int edThemeIdx = ZanIDE.ReadEditorTheme();
         int edFontPx = ZanIDE.ReadEditorFont();
         int defFontPx = app.theme.fontSizeMedium;
+        // The Settings modal is a JSON-declarative UiDoc bound to this model;
+        // both are built once when the dialog opens and torn down on close.
+        UiDoc setUi = null;
+        JsonValue setModel = null;
 
         // ---- Help / Docs browser state ----
         // The docs page is a real tab (path sentinel "@docs"). docsSearch filters
@@ -751,6 +806,11 @@ class ZanIDE {
 
         // ---- Designer state ----
         bool designerMode = false;
+        // Reusable, component-based form/window Designer (stdlib Gui.Designer),
+        // hosted in the "@builder" tab. Self-contained palette + canvas +
+        // inspector; opened from the Form Builder ribbon command.
+        Designer formBuilder = Designer.Create();
+        formBuilder.Seed(app);
         List<string> dNames = new List<string>();
         List<int> dX = new List<int>();
         List<int> dY = new List<int>();
@@ -1201,6 +1261,18 @@ class ZanIDE {
                     }
                     lastActive = 0 - 1;
                     app.RequestRedraw();
+                } else if (rc == 15) {
+                    // Open the reusable form/window Designer component (a real
+                    // "@builder" tab), mirroring the @start/@docs special tabs.
+                    int bi = ZanIDE.FindTabByPath(tabPaths, "@builder");
+                    if (bi >= 0) {
+                        activeTab.Set(bi);
+                    } else {
+                        tabNames.Add(ZanIDE.T("Form Builder", "表单设计器")); tabBodies.Add(""); tabPaths.Add("@builder");
+                        activeTab.Set(tabNames.Count - 1);
+                    }
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
                 }
 
                 // ---- Debug toolbar (when debugging) ----
@@ -1446,6 +1518,7 @@ class ZanIDE {
                 Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
                 bool activeIsStart = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@start");
                 bool activeIsDocs = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@docs");
+                bool activeIsBuilder = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@builder");
                 if (designerMode) {
                     // Bind the designer to the active .zform tab. On first display of
                     // a form (path change) load its controls from the tab body.
@@ -1509,6 +1582,8 @@ class ZanIDE {
                         app, c, t, edRect, docsSearch,
                         docsSel, docsScroll, docsCodeScroll, docsDemoBool,
                         docsDemoInt, docsDemoInput, log);
+                } else if (activeIsBuilder) {
+                    formBuilder.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
                 } else if (activeIsStart) {
                     List<string> spFiles = ZanIDE.ListZanFiles(root + "/src");
                     int sact = ZanIDE.RenderStartPage(app, c, t, edRect, spFiles, startNewProjBtn, startNewFileBtn);
@@ -1583,7 +1658,7 @@ class ZanIDE {
                 }
 
                 // ---- Find / Replace / GoToLine overlay ----
-                if (findMode > 0 && !designerMode && !activeIsStart && !activeIsDocs) {
+                if (findMode > 0 && !designerMode && !activeIsStart && !activeIsDocs && !activeIsBuilder) {
                     int fpH = app.Scale(36);
                     if (findMode == 2) { fpH = app.Scale(68); }
                     int fpW = app.Scale(360);
@@ -1899,7 +1974,7 @@ class ZanIDE {
 
                 // Top-level editor context menu overlay (drawn last so nothing
                 // paints over it), then bridge its host commands.
-                if (!designerMode && !activeIsStart && !activeIsDocs) {
+                if (!designerMode && !activeIsStart && !activeIsDocs && !activeIsBuilder) {
                     editor.RenderCtxMenu(app);
                     string ecmd = editor.TakeCommand();
                     if (ecmd == "find") { findMode = 1; app.RequestRedraw(); }
@@ -1985,26 +2060,70 @@ class ZanIDE {
                     }
                 }
 
-                // Editor settings overlay (modal, topmost): color theme + font.
+                // Editor settings overlay (modal, topmost): color theme + font +
+                // language. Migrated to a JSON-declarative UiDoc with two-way
+                // binding: the model {themeIdx, font, lang} is edited by the
+                // ThemeCard/Slider/Segment controls and read back each frame.
                 if (setOpen) {
-                    List<int> st = new List<int>();
-                    st.Add(edThemeIdx); st.Add(edFontPx); st.Add(defFontPx); st.Add(ZanIDE.uiLang);
-                    int sAct = ZanIDE.RenderSettingsDialog(app, st);
-                    edThemeIdx = st[0];
-                    edFontPx = st[1];
-                    if (st[3] != ZanIDE.uiLang) {
+                    if (setUi == null) {
+                        setModel = JsonValue.NewObject();
+                        setModel.Set("themeIdx", JsonValue.NewNum(Convert.ToString(edThemeIdx)));
+                        setModel.Set("font", JsonValue.NewNum(
+                            Convert.ToString(ZanIDE.EditorFontOr(edFontPx, defFontPx))));
+                        setModel.Set("lang", JsonValue.NewNum(Convert.ToString(ZanIDE.uiLang)));
+                        setUi = UiDoc.FromJson(ZanIDE.SettingsDocJson()).Bind(setModel);
+                        setUi.Handle("done", ZanIDE.OnSettingsDone);
+                        setUi.Handle("resetFont", ZanIDE.OnSettingsResetFont);
+                        setUi.Wire();
+                        ZanIDE.setDone = false;
+                        ZanIDE.setResetFont = false;
+                    }
+
+                    Canvas sc = app.canvas;
+                    Theme stheme = app.theme;
+                    int SW = sc.Width();
+                    int SH = sc.Height();
+                    sc.FillRect(0, 0, SW, SH, stheme.overlay);
+                    app.BlockHitsBelow();
+                    int sw = app.Scale(560);
+                    int sh = app.Scale(600);
+                    int sx = (SW - sw) / 2;
+                    int sy = (SH - sh) / 2;
+                    sc.FillRoundRect(sx + 2, sy + 3, sw, sh, app.Scale(6), stheme.shadowColor);
+                    Panel.FillSurface(app, sx, sy, sw, sh, stheme.bgPrimary);
+                    setUi.RenderInto(app, sx, sy, sw, sh);
+
+                    if (ZanIDE.setResetFont) {
+                        setModel.Set("font", JsonValue.NewNum(Convert.ToString(defFontPx)));
+                        edFontPx = 0;
+                        ZanIDE.setResetFont = false;
+                        app.RequestRedraw();
+                    }
+                    edThemeIdx = setModel.PathGet("themeIdx").AsInt(edThemeIdx);
+                    int boundFontPx = setModel.PathGet("font").AsInt(
+                        ZanIDE.EditorFontOr(edFontPx, defFontPx));
+                    if (edFontPx != 0 || boundFontPx != defFontPx) {
+                        edFontPx = boundFontPx;
+                    }
+                    int newLang = setModel.PathGet("lang").AsInt(ZanIDE.uiLang);
+                    if (newLang != ZanIDE.uiLang) {
                         // Language changed live: relabel the ribbon immediately.
-                        ZanIDE.uiLang = st[3];
+                        ZanIDE.uiLang = newLang;
                         Wizard.lang = ZanIDE.uiLang;
                         cmds = ZanIDE.BuildRibbon();
                         lastActive = 0 - 1;
+                        // Rebuild the doc so its own labels follow the new language.
+                        setUi = null;
                         app.RequestRedraw();
                     }
-                    if (sAct == 1) {
+                    if (ZanIDE.setDone) {
                         ZanIDE.WriteEditorPrefs(edThemeIdx, edFontPx);
                         log.Add("> Editor theme: " + ZanIDE.EditorThemeName(edThemeIdx)
                             + "; font " + Convert.ToString(ZanIDE.EditorFontOr(edFontPx, defFontPx)) + "px.");
                         setOpen = false;
+                        setUi = null;
+                        setModel = null;
+                        ZanIDE.setDone = false;
                         app.RequestRedraw();
                     }
                 }
@@ -2319,84 +2438,30 @@ class ZanIDE {
 
     // ---- template catalog ----
 
-    /// The built-in project templates. Data-driven: each lives in its own folder
-    /// under TemplatesDir() with a template.manifest, so templates can be edited
-    /// or added without rebuilding the IDE. Category labels in the manifests must
-    /// match the New Project wizard's category list exactly. Falls back to a
-    /// small hardcoded set only if that directory is missing (broken install).
+    /// The built-in project templates, grouped by category. Category labels here
+    /// must match the New Project wizard's category list exactly.
     static List<Tpl> BuiltinTemplates() {
-        string dir = ZanIDE.TemplatesDir();
-        if (dir == "") { return ZanIDE.BuiltinTemplatesFallback(); }
-        List<Tpl> ts = new List<Tpl>();
-        List<string> subs = Directory.GetDirectories(dir);
-        int i = 0;
-        while (i < subs.Count) {
-            string tdir = dir + "/" + subs[i];
-            string mpath = tdir + "/template.manifest";
-            if (File.Exists(mpath)) {
-                Tpl t = ZanIDE.TplFromManifest(File.ReadAllText(mpath));
-                t.src = tdir;
-                ts.Add(t);
-            }
-            i = i + 1;
-        }
-        if (ts.Count == 0) { return ZanIDE.BuiltinTemplatesFallback(); }
-        return ZanIDE.SortTemplates(ts);
-    }
-
-    /// Builds a template descriptor from its manifest, honouring the current UI
-    /// language (name.zh / desc.zh override name / desc when 中文 is active).
-    static Tpl TplFromManifest(string m) {
-        string cat = ZanIDE.ManifestField(m, "category", "Custom");
-        string name = ZanIDE.ManifestField(m, "name", "Template");
-        string icon = ZanIDE.ManifestField(m, "icon", "file");
-        string kind = ZanIDE.ManifestField(m, "kind", "console");
-        string desc = ZanIDE.ManifestField(m, "desc", "");
-        if (ZanIDE.uiLang == 1) {
-            name = ZanIDE.ManifestField(m, "name.zh", name);
-            desc = ZanIDE.ManifestField(m, "desc.zh", desc);
-        }
-        Tpl t = Tpl.Make(cat, name, icon, kind, desc);
-        t.type = ZanIDE.ManifestField(m, "type", "console");
-        t.target = ZanIDE.ManifestField(m, "target", "exe");
-        t.entry = ZanIDE.ManifestField(m, "entry", "src/main.zan");
-        t.order = ZanIDE.ParseInt(ZanIDE.ManifestField(m, "order", "100"));
-        return t;
-    }
-
-    /// Orders templates by their manifest "order" field (selection sort; the
-    /// consumed marker mutates the shared Tpl instance, which is safe because
-    /// the catalog is rebuilt fresh whenever the wizard opens).
-    static List<Tpl> SortTemplates(List<Tpl> src) {
-        List<Tpl> outp = new List<Tpl>();
-        int k = 0;
-        while (k < src.Count) {
-            int best = -1;
-            int j = 0;
-            while (j < src.Count) {
-                Tpl tj = src[j];
-                if (tj.order >= 0) {
-                    if (best == -1 || tj.order < src[best].order) { best = j; }
-                }
-                j = j + 1;
-            }
-            Tpl chosen = src[best];
-            outp.Add(chosen);
-            chosen.order = -1;
-            k = k + 1;
-        }
-        return outp;
-    }
-
-    /// Hardcoded fallback catalog, used only when no templates ship on disk.
-    static List<Tpl> BuiltinTemplatesFallback() {
         List<Tpl> ts = new List<Tpl>();
         ts.Add(Tpl.Make("Console", ZanIDE.T("Hello World", "Hello World"), "menu", "console",
             ZanIDE.T("Minimal console program that prints a line of text.", "最小控制台程序，打印一行文本。")));
+        ts.Add(Tpl.Make("Console", ZanIDE.T("Command-line Args", "命令行参数"), "menu", "console-args",
+            ZanIDE.T("Console program that reads command-line arguments.", "读取命令行参数的控制台程序。")));
+        ts.Add(Tpl.Make("Console", ZanIDE.T("Multi-file Project", "多文件项目"), "copy", "console-multi",
+            ZanIDE.T("Console project split into main + utils source files.", "拆分为 main + utils 源文件的控制台项目。")));
         ts.Add(Tpl.Make("Library", ZanIDE.T("Class Library", "类库"), "grid", "dll-class",
             ZanIDE.T("A reusable library of classes, compiled to a DLL.", "可复用的类库，编译为 DLL。")));
+        ts.Add(Tpl.Make("Library", ZanIDE.T("Export DLL", "导出 DLL"), "copy", "dll-export",
+            ZanIDE.T("A DLL exposing functions callable from other programs.", "导出可供其他程序调用函数的 DLL。")));
         ts.Add(Tpl.Make("Window App", ZanIDE.T("Empty Window", "空窗口"), "maximize", "gui-empty",
             ZanIDE.T("A blank window app built on the Gui standard library.", "基于 Gui 标准库的空白窗口程序。")));
+        ts.Add(Tpl.Make("Window App", ZanIDE.T("Component Showcase", "组件展示"), "grid", "gui-components",
+            ZanIDE.T("A window with panels/toolbars from the Gui components.", "带 Gui 组件面板/工具栏的窗口。")));
+        ts.Add(Tpl.Make("WebView", ZanIDE.T("WebView Window", "WebView 窗口"), "folder", "webview",
+            ZanIDE.T("A window that hosts web content (needs a WebView runtime).", "承载网页内容的窗口（需要 WebView 运行时）。")));
+        ts.Add(Tpl.Make("Server", ZanIDE.T("HTTP Server", "HTTP 服务器"), "arrow-right", "server",
+            ZanIDE.T("A minimal HTTP server skeleton.", "最小 HTTP 服务器骨架。")));
+        ts.Add(Tpl.Make("Server", ZanIDE.T("TCP Echo Server", "TCP 回显服务器"), "refresh", "server-tcp",
+            ZanIDE.T("A minimal TCP echo server skeleton.", "最小 TCP 回显服务器骨架。")));
         return ts;
     }
 
@@ -2529,26 +2594,47 @@ class ZanIDE {
 
     /// Scaffolds a new project from a template descriptor; returns its directory.
     /// platforms is a comma-separated target-platform id list written to zan.proj.
-    /// File-based templates are materialized by copying their on-disk folder and
-    /// substituting {{NAME}}; the gui-* forms and custom templates keep their
-    /// dedicated generators. type/target/entry come from the template manifest.
     static string CreateProjectT(Tpl tpl, string parent, string name, string platforms, List<string> log) {
         string dir = parent + "/" + name;
         Directory.CreateDirectoryRecursive(dir);
         Directory.CreateDirectoryRecursive(dir + "/src");
 
+        string typeName = "console";
+        string target = "exe";
+        string entry = "src/main.zan";
         string kind = tpl.kind;
 
-        if (kind == "custom") {
-            ZanIDE.CopyTree(tpl.src, dir);
+        if (kind == "console") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleTemplate(name));
+        } else if (kind == "console-args") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleArgsTemplate(name));
+        } else if (kind == "console-multi") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleTemplate(name));
+            File.WriteAllText(dir + "/src/utils.zan",
+                "using System;\n\nclass Utils {\n    static int Add(int a, int b) { return a + b; }\n}\n");
+        } else if (kind == "dll-class") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", ZanIDE.LibraryTemplate(name));
+        } else if (kind == "dll-export") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", ZanIDE.DllExportTemplate(name));
         } else if (kind == "gui-empty") {
+            typeName = "gui"; target = "exe"; entry = "src/" + name + ".zan";
             ZanIDE.WriteFormProject(dir, name, 0);
         } else if (kind == "gui-components") {
+            typeName = "gui"; target = "exe"; entry = "src/" + name + ".zan";
             ZanIDE.WriteFormProject(dir, name, 1);
-        } else if (tpl.src != "" && Directory.Exists(tpl.src)) {
-            ZanIDE.CopyTemplateTree(tpl.src, dir, name);
+        } else if (kind == "webview") {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.WebViewTemplate(name));
+        } else if (kind == "server") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ServerHttpTemplate(name));
+        } else if (kind == "server-tcp") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ServerTcpTemplate(name));
+        } else if (kind == "custom") {
+            ZanIDE.CopyTree(tpl.src, dir);
         } else {
-            File.WriteAllText(dir + "/src/main.zan", ZanIDE.FallbackBody(name));
+            typeName = "empty";
         }
 
         if (!File.Exists(dir + "/README.md")) {
@@ -2556,12 +2642,11 @@ class ZanIDE {
                 "# " + name + "\n\nGenerated by the Zan IDE (template: " + tpl.name + ").\n");
         }
         if (kind != "custom") {
-            string entry = ZanIDE.ReplaceAll(tpl.entry, "{{NAME}}", name);
             File.WriteAllText(dir + "/zan.proj",
-                "name = " + name + "\ntype = " + tpl.type + "\nentry = " + entry
-                + "\ntarget = " + tpl.target + "\nplatform = " + platforms + "\n");
+                "name = " + name + "\ntype = " + typeName + "\nentry = " + entry
+                + "\ntarget = " + target + "\nplatform = " + platforms + "\n");
         }
-        log.Add("> Created " + tpl.type + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
+        log.Add("> Created " + typeName + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
         return dir;
     }
 
@@ -2660,57 +2745,42 @@ class ZanIDE {
         }
     }
 
-    // ---- template helpers ----
+    // ---- template bodies ----
 
-    /// Replaces every occurrence of `from` in `s` with `to`.
-    static string ReplaceAll(string s, string from, string to) {
-        if (from.Length == 0) { return s; }
-        string outp = "";
-        int i = 0;
-        int n = s.Length;
-        int fl = from.Length;
-        while (i < n) {
-            if (i + fl <= n && s.Substring(i, fl) == from) {
-                outp = outp + to;
-                i = i + fl;
-            } else {
-                outp = outp + s.Substring(i, 1);
-                i = i + 1;
-            }
-        }
-        return outp;
-    }
-
-    /// Recursively copies a template folder into a new project, substituting
-    /// {{NAME}} in both file contents and file names, skipping the manifest.
-    static void CopyTemplateTree(string srcDir, string dstDir, string name) {
-        Directory.CreateDirectory(dstDir);
-        List<string> files = Directory.GetFiles(srcDir);
-        int i = 0;
-        while (i < files.Count) {
-            string fn = files[i];
-            if (fn != "template.manifest" && fn != "manifest.txt") {
-                string body = ZanIDE.ReplaceAll(File.ReadAllText(srcDir + "/" + fn), "{{NAME}}", name);
-                File.WriteAllText(dstDir + "/" + ZanIDE.ReplaceAll(fn, "{{NAME}}", name), body);
-            }
-            i = i + 1;
-        }
-        List<string> subs = Directory.GetDirectories(srcDir);
-        int j = 0;
-        while (j < subs.Count) {
-            ZanIDE.CopyTemplateTree(srcDir + "/" + subs[j],
-                dstDir + "/" + ZanIDE.ReplaceAll(subs[j], "{{NAME}}", name), name);
-            j = j + 1;
-        }
-    }
-
-    /// Minimal program body used only when a template ships no source on disk.
-    static string FallbackBody(string name) {
+    static string ConsoleTemplate(string name) {
         return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
     }
 
     static string GuiTemplate(string name) {
         return "using System;\nusing Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 800, 600);\n        // app.Run drives the whole window loop (events + redraw + chrome);\n        // use the BeginFrame/PresentFrame loop directly to draw custom content.\n        app.Run(\"" + name + "\");\n    }\n}\n";
+    }
+
+    static string LibraryTemplate(string name) {
+        return "using System;\n\n/// " + name + " library.\nclass " + name + " {\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string ConsoleArgsTemplate(string name) {
+        return "using System;\n\nclass Program {\n    static void Main() {\n        // TODO: read and parse command-line arguments here.\n        Console.WriteLine(\"" + name + ": pass arguments on the command line\");\n    }\n}\n";
+    }
+
+    static string DllExportTemplate(string name) {
+        return "using System;\n\n/// Functions exported from this library for use by other programs.\nclass " + name + " {\n    static int Add(int a, int b) { return a + b; }\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string GuiComponentsTemplate(string name) {
+        return "using System;\nusing Gui;\nusing Gui.Widget;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 900, 640);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            Canvas c = app.canvas;\n            int w = c.Width();\n            int h = c.Height();\n            int top = app.titlebarH;\n            Rect box = Panel.Section(app, 20, top + 20, w - 40, h - top - 40, \"" + name + "\");\n            c.DrawText(box.x + 12, box.y + 12, \"Build your UI from Gui components here.\", app.theme.textPrimary, app.theme.fontSizeMedium);\n            app.RenderChrome(\"" + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string WebViewTemplate(string name) {
+        return "using System;\nusing Gui;\n\n// WebView window skeleton. Hosting real web content needs a WebView2\n// runtime binding; this placeholder window stands in until that lands.\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 1000, 700);\n        app.Run(\"WebView: " + name + "\");\n    }\n}\n";
+    }
+
+    static string ServerHttpTemplate(string name) {
+        return "using System;\n\n// HTTP server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " listening on http://localhost:8080\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
+    }
+
+    static string ServerTcpTemplate(string name) {
+        return "using System;\n\n// TCP echo server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " TCP echo server on :9000\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
     }
 
     static string FileTemplateBody(int kind, string name) {
@@ -2828,7 +2898,7 @@ class ZanIDE {
         }
         string activePath = paths[a];
         string p = activePath;
-        if (p == "" || p == "@start" || p == "@docs") {
+        if (p == "" || p == "@start" || p == "@docs" || p == "@builder") {
             log.Add("> Nothing to run (open and save a source file first).");
             return;
         }
@@ -3226,139 +3296,6 @@ class ZanIDE {
         int action = 0;
         if (Button.WasClicked(app, pubId)) { action = 1; }
         else if (Button.WasClicked(app, canId)) { action = 2; }
-        return action;
-    }
-
-    /// Renders the modal Editor Settings dialog (color theme + font size).
-    /// st = [themeIdx, fontPx, defFontPx]; themeIdx/fontPx are updated in place.
-    /// Returns 0 (stay open) or 1 (Done/close).
-    static int RenderSettingsDialog(App app, List<int> st) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int W = c.Width();
-        int H = c.Height();
-        c.FillRect(0, 0, W, H, t.overlay);
-        app.BlockHitsBelow();
-
-        int w = app.Scale(520);
-        int h = app.Scale(520);
-        int x = (W - w) / 2;
-        int y = (H - h) / 2;
-        c.FillRoundRect(x + 2, y + 3, w, h, app.Scale(6), t.shadowColor);
-        Panel.FillSurface(app, x, y, w, h, t.bgPrimary);
-
-        int pad = app.Scale(18);
-        c.DrawText(x + pad, y + pad, ZanIDE.T("Editor Settings", "编辑器设置"), t.textPrimary, t.fontSizeLarge);
-        c.FillRect(x + 1, y + app.Scale(52), w - 2, 1, t.divider);
-        c.DrawText(x + pad, y + app.Scale(62), ZanIDE.T("Color Theme", "配色主题"), t.textSecondary, t.fontSizeSmall);
-
-        bool click = app.window.EventKind() == 3;
-        int action = 0;
-
-        int rowH = app.Scale(42);
-        int cardH = rowH - app.Scale(4);
-        int listX = x + pad;
-        int listY = y + app.Scale(84);
-        int listW = w - pad - pad;
-        int i = 0;
-        while (i < ZanIDE.EditorThemeCount()) {
-            int ry = listY + i * rowH;
-            bool selected = st[0] == i;
-            if (selected) {
-                c.FillRoundRect(listX, ry, listW, cardH, app.Scale(4), t.bgActive);
-                c.DrawRect(listX, ry, listW, cardH, t.primary, 1);
-            } else {
-                c.FillRoundRect(listX, ry, listW, cardH, app.Scale(4), t.bgSecondary);
-            }
-            int lblY = ry + app.Scale(3);
-            c.DrawText(listX + app.Scale(10), lblY, ZanIDE.EditorThemeName(i), t.textPrimary, t.fontSizeMedium);
-            // Colored preview tokens for this preset.
-            int pvX = listX + app.Scale(10);
-            int pvY = ry + app.Scale(19);
-            int fs = t.fontSizeSmall;
-            c.DrawText(pvX, pvY, "class", ZanIDE.EditorThemeColor(i, 0), fs);
-            pvX = pvX + Canvas.MeasureText("class ", fs);
-            c.DrawText(pvX, pvY, "App", ZanIDE.EditorThemeColor(i, 1), fs);
-            pvX = pvX + Canvas.MeasureText("App ", fs);
-            c.DrawText(pvX, pvY, "\"hi\"", ZanIDE.EditorThemeColor(i, 2), fs);
-            pvX = pvX + Canvas.MeasureText("\"hi\" ", fs);
-            c.DrawText(pvX, pvY, "42", ZanIDE.EditorThemeColor(i, 4), fs);
-            pvX = pvX + Canvas.MeasureText("42 ", fs);
-            c.DrawText(pvX, pvY, "// note", ZanIDE.EditorThemeColor(i, 3), fs);
-            ZanIDE.HandRegion(app, listX, ry, listW, cardH);
-            if (click && app.mouseX >= listX && app.mouseX < listX + listW
-                && app.mouseY >= ry && app.mouseY < ry + cardH) {
-                st[0] = i;
-                app.RequestRedraw();
-            }
-            i = i + 1;
-        }
-
-        // ---- Font size stepper ----
-        int fY = listY + ZanIDE.EditorThemeCount() * rowH + app.Scale(10);
-        c.DrawText(listX, fY, ZanIDE.T("Font Size", "字体大小"), t.textSecondary, t.fontSizeSmall);
-        int cur = ZanIDE.EditorFontOr(st[1], st[2]);
-        int btn = app.Scale(30);
-        int minusX = listX + app.Scale(90);
-        int plusX = minusX + btn + app.Scale(64);
-        int fbY = fY - app.Scale(6);
-        int minusId = Button.Create("-").SetSize(1).Render(app, minusX, fbY, btn);
-        c.DrawText(minusX + btn + app.Scale(18), fbY + app.Scale(7), Convert.ToString(cur) + "px", t.textPrimary, t.fontSizeMedium);
-        int plusId = Button.Create("+").SetSize(1).Render(app, plusX, fbY, btn);
-        int resetX = plusX + btn + app.Scale(16);
-        int resetW = app.Scale(84);
-        int resetId = Button.Create(ZanIDE.T("Default", "默认")).SetSize(1).Render(app, resetX, fbY, resetW);
-        if (Button.WasClicked(app, minusId)) {
-            int nv = cur - 1;
-            if (nv < 9) { nv = 9; }
-            st[1] = nv;
-            app.RequestRedraw();
-        } else if (Button.WasClicked(app, plusId)) {
-            int nv = cur + 1;
-            if (nv > 30) { nv = 30; }
-            st[1] = nv;
-            app.RequestRedraw();
-        } else if (Button.WasClicked(app, resetId)) {
-            st[1] = 0;
-            app.RequestRedraw();
-        }
-
-        // ---- Language toggle (one-click EN / 中文) ----
-        int lgY = fY + app.Scale(46);
-        c.DrawText(listX, lgY, ZanIDE.T("Language", "语言"), t.textSecondary, t.fontSizeSmall);
-        int segX = listX + app.Scale(90);
-        int segY = lgY - app.Scale(6);
-        int segH = app.Scale(30);
-        int li = 0;
-        while (li < ZanIDE.LangCount()) {
-            int segW = app.Scale(120);
-            int sx = segX + li * (segW + app.Scale(8));
-            bool lsel = st[3] == li;
-            if (lsel) {
-                c.FillRoundRect(sx, segY, segW, segH, app.Scale(4), t.bgActive);
-                c.DrawRect(sx, segY, segW, segH, t.primary, 1);
-            } else {
-                c.FillRoundRect(sx, segY, segW, segH, app.Scale(4), t.bgSecondary);
-            }
-            c.DrawText(sx + app.Scale(12), segY + app.Scale(8), ZanIDE.LangName(li), t.textPrimary, t.fontSizeSmall);
-            ZanIDE.HandRegion(app, sx, segY, segW, segH);
-            if (click && app.mouseX >= sx && app.mouseX < sx + segW
-                && app.mouseY >= segY && app.mouseY < segY + segH) {
-                st[3] = li;
-                app.RequestRedraw();
-            }
-            li = li + 1;
-        }
-
-        // ---- Done button ----
-        int dbH = app.Scale(30);
-        int dbW = app.Scale(100);
-        int dbX = x + w - pad - dbW;
-        int dbYb = y + h - dbH - t.paddingLarge;
-        int doneId = Button.Primary(ZanIDE.T("Done", "完成")).Render(app, dbX, dbYb, dbW);
-        if (Button.WasClicked(app, doneId)) {
-            action = 1;
-        }
         return action;
     }
 
@@ -4529,7 +4466,7 @@ class ZanIDE {
         if (a < 0 || a >= tabPaths.Count) { return false; }
         string activePath = tabPaths[a];
         string p = activePath;
-        if (p == "" || p == "@start" || p == "@docs") {
+        if (p == "" || p == "@start" || p == "@docs" || p == "@builder") {
             log.Add("> [Debug] Open a source file first.");
             return false;
         }

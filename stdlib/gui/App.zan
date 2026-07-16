@@ -45,6 +45,12 @@ class App {
     // detects a new pick each frame. Every window gets this by default.
     bool autoSkins;
     int appliedSkin;
+    // True while the OS is compositing a real translucent backdrop (Win11
+    // acrylic / macOS vibrancy / Linux compositor blur) behind this window.
+    // Set by ApplyTheme when a glass skin is active. When on, the frame is
+    // cleared transparent and the in-app wallpaper is skipped so the blurred
+    // desktop shows through the gaps.
+    bool glassNative;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
     // frame — e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
@@ -65,6 +71,12 @@ class App {
     // that happens to re-read the raw event during its own render.
     int clickTargetId;
     int pressTargetId;
+    // Secondary (right) mouse-button targets, resolved the same way as the
+    // primary click/press targets but kept separate so a right-click never
+    // trips Ui.Clicked or steals keyboard focus. Read via RightClickTarget()
+    // / RightPressTarget() (see Ui.RightClicked).
+    int rightClickTargetId;
+    int rightPressTargetId;
     // Double-click / double-tap detection. lastClickId + lastClickMs record the
     // most recent completed click; doubleClickNow is a one-frame flag set when a
     // second click lands on the same id within the double-click window. Read via
@@ -154,6 +166,8 @@ class App {
         app.inputBlockPrevious = false;
         app.clickTargetId = -1;
         app.pressTargetId = -1;
+        app.rightClickTargetId = -1;
+        app.rightPressTargetId = -1;
         app.lastClickId = -1;
         app.lastClickMs = 0;
         app.doubleClickNow = false;
@@ -224,7 +238,25 @@ class App {
         isDark = dark;
         theme = t;
         theme.ScaleByDpi(dpiScale);
+        // A frosted-glass skin asks the window for a real OS translucent
+        // backdrop; any other skin keeps the window opaque.
+        if (t.glass != 0) {
+            glassNative = true;
+            window.EnableGlass(this.GlassTint());
+        } else {
+            if (glassNative) { window.DisableGlass(); }
+            glassNative = false;
+        }
         needsRedraw = true;
+    }
+
+    /// Packed ARGB tint handed to the OS glass compositor: the active skin's
+    /// primary background colour at ~59% alpha so the blurred desktop keeps
+    /// colour and body presence while text stays readable.
+    int GlassTint() {
+        int rgb = theme.bgPrimary % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        return 150 * 16777216 + rgb;
     }
 
     /// Turns the title-bar theme button into the built-in skin picker
@@ -274,10 +306,17 @@ class App {
     /// centre (no hard rim), giving the backdrop blur real colour to soften.
     void BackdropBlob(int cx, int cy, int r, int cr, int cg, int cb) {
         Canvas c = canvas;
-        c.FillCircle(cx, cy, r, Theme.Rgba(cr, cg, cb, 28));
-        c.FillCircle(cx, cy, r * 72 / 100, Theme.Rgba(cr, cg, cb, 36));
-        c.FillCircle(cx, cy, r * 46 / 100, Theme.Rgba(cr, cg, cb, 48));
-        c.FillCircle(cx, cy, r * 24 / 100, Theme.Rgba(cr, cg, cb, 58));
+        // Smooth radial feather instead of a few hard rings: many faint,
+        // equal-alpha concentric steps from the rim inward. Coverage rises
+        // gently toward the centre, so overlaps blend into one soft light
+        // bloom (no visible "target" rings) and stays light/airy.
+        int steps = 20;
+        int i = steps;
+        while (i > 0) {
+            int rr = r * i / steps;
+            c.FillCircle(cx, cy, rr, Theme.Rgba(cr, cg, cb, 9));
+            i = i - 1;
+        }
     }
 
     /// A soft glow coloured from a packed ARGB theme accent.
@@ -324,6 +363,24 @@ class App {
     void RenderBackground(int x, int y, int w, int h, int slot) {
         Canvas c = canvas;
         Theme t = theme;
+        // Native glass: the window is a flat semi-transparent sheet (cleared in
+        // BeginFrame) over the OS-blurred desktop. Add a soft top-down light
+        // sheen so the glass reads with depth (brighter near the top) like real
+        // acrylic instead of a flat slab.
+        if (glassNative) {
+            int hi = t.textPrimary % 16777216;
+            if (hi < 0) { hi = hi + 16777216; }
+            int bands = 18;
+            int bh = h / 3 / bands;
+            if (bh < 1) { bh = 1; }
+            int i = 0;
+            while (i < bands) {
+                int a = 15 - (15 * i / bands);
+                c.FillRect(x, y + i * bh, w, bh, a * 16777216 + hi);
+                i = i + 1;
+            }
+            return;
+        }
         if (t.gradient != 0) {
             bool restored = false;
             if (!this.BackdropDirty()) {
@@ -593,6 +650,15 @@ class App {
             } else if (hit == closeId) {
                 window.Close();
             }
+        }
+
+        // A native-glass (layered) window has no OS drop-shadow, so its edge can
+        // vanish into a similar wallpaper. Stroke a subtle rim around the whole
+        // window plus a brighter top highlight so the bounds stay clear.
+        if (glassNative) {
+            int H = c.Height();
+            c.DrawRect(0, 0, W, H, 130 * 16777216 + (t.textPrimary % 16777216), 1);
+            c.FillRect(0, 0, W, 1, 70 * 16777216 + (t.textPrimary % 16777216));
         }
 
         // Defer the preset menu to the overlay layer so it drops above all
@@ -874,8 +940,16 @@ class App {
         // A pure animation repaint wakes with no OS event (kind 0): the content
         // behind glass is unchanged, so its blur + the static wallpaper can be
         // restored from cache. Any real event (input/resize/etc) marks the
-        // backdrop dirty so it is recomputed this frame.
-        backdropDirty = (kind != 0);
+        // backdrop dirty so it is recomputed this frame -- EXCEPT a pure hover
+        // move (kind 1 with no button held). Moving the pointer never changes
+        // the pixels behind glass: the wallpaper is static and hover highlights
+        // paint on foreground widgets over the glass, not behind it. Re-blurring
+        // the whole chrome every time the cursor crosses a widget is what made
+        // the frosted theme feel sluggish, so hover reuses the cached blur +
+        // wallpaper snapshot. A held drag (pressedId >= 0) may scroll/select
+        // content behind glass, so it still dirties the backdrop.
+        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
+        backdropDirty = (kind != 0) && !hoverOnly;
 
         if (kind == 8) {
             isRunning = false;
@@ -939,23 +1013,38 @@ class App {
             mouseX = window.EventX();
             mouseY = window.EventY();
             int hitId = hitTester.HitTest(mouseX, mouseY);
-            focus.SetPressed(hitId);
-            focus.SetFocused(hitId);
-            pressTargetId = hitId;
-            NotePressStart(hitId, mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                // Secondary button: record the target for Ui.RightClicked but
+                // leave the primary focus/press state untouched, so a right
+                // click never steals keyboard focus or arms a primary click.
+                rightPressTargetId = hitId;
+            } else {
+                focus.SetPressed(hitId);
+                focus.SetFocused(hitId);
+                pressTargetId = hitId;
+                NotePressStart(hitId, mouseX, mouseY);
+            }
             needsRedraw = true;
         }
 
         if (kind == 3) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            // Resolve the click target against the still-intact previous-frame
-            // hit regions (popups included, top-most wins) before BeginFrame
-            // clears them, so exactly one widget sees Ui.Clicked this frame.
-            clickTargetId = hitTester.HitTest(mouseX, mouseY);
-            NoteRelease(mouseX, mouseY);
-            NoteClickTarget(clickTargetId);
-            focus.ClearPress();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                // Secondary button release: resolve the right-click target only;
+                // the primary click target stays untouched so Ui.Clicked stays
+                // quiet on a right click.
+                rightClickTargetId = hitId;
+            } else {
+                // Resolve the click target against the still-intact previous-frame
+                // hit regions (popups included, top-most wins) before BeginFrame
+                // clears them, so exactly one widget sees Ui.Clicked this frame.
+                clickTargetId = hitId;
+                NoteRelease(mouseX, mouseY);
+                NoteClickTarget(clickTargetId);
+                focus.ClearPress();
+            }
             needsRedraw = true;
         }
 
@@ -1011,7 +1100,7 @@ class App {
         // Typed character (WM_CHAR) / key down: repaint so focused text fields
         // (e.g. the DataTable filter search box) can consume the keystroke this
         // frame. The event slot still holds the char for widgets to read.
-        if (kind == 6 || kind == 4) {
+        if (kind == 6 || kind == 4 || kind == 5) {
             needsRedraw = true;
         }
 
@@ -1074,20 +1163,29 @@ class App {
             mouseX = window.EventX();
             mouseY = window.EventY();
             int hitId = hitTester.HitTest(mouseX, mouseY);
-            focus.SetPressed(hitId);
-            focus.SetFocused(hitId);
-            pressTargetId = hitId;
-            NotePressStart(hitId, mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                rightPressTargetId = hitId;
+            } else {
+                focus.SetPressed(hitId);
+                focus.SetFocused(hitId);
+                pressTargetId = hitId;
+                NotePressStart(hitId, mouseX, mouseY);
+            }
             needsRedraw = true;
         }
 
         if (kind == 3) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            clickTargetId = hitTester.HitTest(mouseX, mouseY);
-            NoteRelease(mouseX, mouseY);
-            NoteClickTarget(clickTargetId);
-            focus.ClearPress();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                rightClickTargetId = hitId;
+            } else {
+                clickTargetId = hitId;
+                NoteRelease(mouseX, mouseY);
+                NoteClickTarget(clickTargetId);
+                focus.ClearPress();
+            }
             needsRedraw = true;
         }
 
@@ -1121,7 +1219,7 @@ class App {
             }
         }
 
-        if (kind == 6 || kind == 4) { needsRedraw = true; }
+        if (kind == 6 || kind == 4 || kind == 5) { needsRedraw = true; }
         return true;
     }
 
@@ -1161,7 +1259,18 @@ class App {
         hitTester.Clear();
         focus.ResetIds();
         overlays = new List<OverlayPopup>();
-        canvas.Clear(theme.bgPrimary);
+        if (glassNative) {
+            // Frosted sheet: clear the whole window to a *semi-transparent* tint
+            // (not fully transparent) so the OS backdrop shows through evenly
+            // blurred while the window stays a solid, bordered glass panel. A
+            // fully transparent clear left the window looking see-through/washed
+            // (and borderless) over light backgrounds.
+            int rgb = theme.bgPrimary % 16777216;
+            if (rgb < 0) { rgb = rgb + 16777216; }
+            canvas.Clear(198 * 16777216 + rgb);
+        } else {
+            canvas.Clear(theme.bgPrimary);
+        }
     }
 
     /// Queues a popup to be painted and dispatched after the main content pass,
@@ -1212,6 +1321,12 @@ class App {
 
     /// Id of the widget the current press (mouse-down) landed on, or -1.
     int PressTarget() { return pressTargetId; }
+
+    /// Id of the widget the current secondary (right) click landed on, or -1.
+    int RightClickTarget() { return rightClickTargetId; }
+
+    /// Id of the widget the current secondary (right) press landed on, or -1.
+    int RightPressTarget() { return rightPressTargetId; }
 
     /// True on the frame a completed click is the second of a double click on
     /// the same widget within the double-click window (see Ui.DoubleClicked).
