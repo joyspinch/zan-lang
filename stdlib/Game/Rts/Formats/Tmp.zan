@@ -1,0 +1,124 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Rts.Formats;
+
+// Header of a single tile within a TMP(TS) template. The base graphic is an
+// isometric diamond; a few gameplay fields (height/terrain/ramp) are exposed.
+class TmpTile {
+    int x;
+    int y;
+    int height;
+    int terrainType;
+    int rampType;
+    int offset;
+
+    int X() { return this.x; }
+    int Y() { return this.y; }
+    int Height() { return this.height; }
+    int TerrainType() { return this.terrainType; }
+    int RampType() { return this.rampType; }
+    int Offset() { return this.offset; }
+    bool IsEmpty() { return this.offset == 0; }
+}
+
+// Parses a TMP(TS) terrain template as used by Tiberian Sun / Red Alert 2.
+// Pixels are 8-bit palette indices (0 = transparent); the base graphic of each
+// tile is a centered isometric diamond of tileWidth x tileHeight. Depth and
+// "extra" (cliff) data are skipped here. Clean-room: tests synthesize tiles.
+//
+// Layout (little-endian):
+//   header    : blocksX(u32), blocksY(u32), tileWidth(u32), tileHeight(u32)
+//   directory : u32 offset per tile (0 = empty)
+//   tile      : 52-byte header, then base pixels (tileWidth*tileHeight/2),
+//               then depth pixels; base rows are runs 4,8,.. centered, growing
+//               by 4 while row < height/2-1 then shrinking by 4.
+class TmpTemplate {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    string data;
+    int length;
+    int blocksX;
+    int blocksY;
+    int tileWidth;
+    int tileHeight;
+    List<TmpTile> tiles;
+
+    static TmpTemplate Parse(string data, int length) {
+        TmpTemplate t = new TmpTemplate();
+        t.data = data;
+        t.length = length;
+        t.tiles = new List<TmpTile>();
+
+        BinaryReader r = BinaryReader.FromBuffer(data, length);
+        t.blocksX = (int)r.ReadU32();
+        t.blocksY = (int)r.ReadU32();
+        t.tileWidth = (int)r.ReadU32();
+        t.tileHeight = (int)r.ReadU32();
+
+        int count = t.blocksX * t.blocksY;
+        int i = 0;
+        while (i < count) {
+            int off = (int)r.ReadU32();
+            TmpTile tile = new TmpTile();
+            tile.offset = off;
+            if (off != 0) {
+                int save = r.Position();
+                r.Seek(off);
+                tile.x = r.ReadI32();
+                tile.y = r.ReadI32();
+                r.Seek(off + 40);        // past extra offsets/coords/flags
+                tile.height = r.ReadU8();
+                tile.terrainType = r.ReadU8();
+                tile.rampType = r.ReadU8();
+                r.Seek(save);
+            }
+            t.tiles.Add(tile);
+            i = i + 1;
+        }
+        return t;
+    }
+
+    int BlocksX() { return this.blocksX; }
+    int BlocksY() { return this.blocksY; }
+    int TileWidth() { return this.tileWidth; }
+    int TileHeight() { return this.tileHeight; }
+    int TileCount() { return this.tiles.Count; }
+
+    TmpTile TileAt(int index) {
+        if (index < 0 || index >= this.tiles.Count) { return null; }
+        return this.tiles[index];
+    }
+
+    // Decode a tile's base graphic into a tileWidth*tileHeight index buffer
+    // (0 = transparent outside the diamond).
+    string DecodeTile(int index) {
+        TmpTile tile = this.TileAt(index);
+        int cx = this.tileWidth;
+        int cy = this.tileHeight;
+        string outBuf = TmpTemplate.calloc(cx * cy + 1, 1);
+        if (tile == null || tile.IsEmpty()) { return outBuf; }
+
+        BinaryReader r = BinaryReader.FromBuffer(this.data, this.length);
+        r.Seek(tile.Offset() + 52);
+
+        int width = 4;
+        int j = 0;
+        while (j < cy) {
+            int start = j * cx + (cx - width) / 2;
+            int k = 0;
+            while (k < width) {
+                outBuf[start + k] = (char)r.ReadU8();
+                k = k + 1;
+            }
+            if (j < cy / 2 - 1) {
+                width = width + 4;
+            } else {
+                width = width - 4;
+            }
+            j = j + 1;
+        }
+        return outBuf;
+    }
+}
