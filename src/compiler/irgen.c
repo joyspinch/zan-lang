@@ -15,6 +15,11 @@
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitWriter.h>
 #include <llvm-c/DebugInfo.h>
+#if defined(__has_include)
+#if __has_include(<llvm/Config/llvm-config.h>)
+#include <llvm/Config/llvm-config.h>
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -219,7 +224,14 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
         /*AlwaysPreserve*/ 1, LLVMDIFlagZero, /*AlignInBits*/ 0);
     LLVMMetadataRef expr = LLVMDIBuilderCreateExpression(g->di_builder, NULL, 0);
     LLVMMetadataRef dl = LLVMDIBuilderCreateDebugLocation(g->ctx, line, 0, sp, NULL);
+    /* The debug-record API (LLVMDIBuilderInsertDeclareRecordAtEnd) is LLVM 19+;
+     * LLVM 18 and earlier only provide the intrinsic-based InsertDeclareAtEnd.
+     * Both take the same arguments, so select by version. */
+#if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR < 19
+    LLVMDIBuilderInsertDeclareAtEnd(g->di_builder, storage, var, expr, dl, bb);
+#else
     LLVMDIBuilderInsertDeclareRecordAtEnd(g->di_builder, storage, var, expr, dl, bb);
+#endif
 }
 
 /* The active codegen context, set for the duration of zan_irgen_emit so the
