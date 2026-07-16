@@ -1,0 +1,199 @@
+using System;
+using SDL3;
+
+namespace Game.Arpg;
+
+/// <summary>SDL3 application host for the typed Arpg component engine.</summary>
+class ArpgEngine {
+    ArpgConfig config;
+    ArpgProject project;
+    ArpgRegistry registry;
+    ArpgEvents events;
+    ArpgGameplayEvents gameplayEvents;
+    ArpgScheduler scheduler;
+    ArpgWorld world;
+    ArpgDiagnostics diagnostics;
+    SdlWindow window;
+    SdlRenderer renderer;
+    bool running;
+    int lastTick;
+
+    static ArpgEngine Create(ArpgConfig config) {
+        ArpgEngine engine = new ArpgEngine();
+        engine.config = config;
+        engine.project = ArpgProject.Create();
+        engine.registry = engine.project.Registry();
+        engine.events = ArpgEvents.Create();
+        engine.gameplayEvents = ArpgGameplayEvents.Create();
+        engine.scheduler = ArpgScheduler.Create();
+        engine.world = ArpgWorld.CreateWithEvents(
+            engine.project, engine.events, engine.gameplayEvents);
+        engine.diagnostics = ArpgDiagnostics.Create();
+        engine.running = false;
+        engine.lastTick = 0;
+        return engine;
+    }
+
+    ArpgConfig Config() { return this.config; }
+    ArpgProject Project() { return this.project; }
+    ArpgRegistry Registry() { return this.registry; }
+    ArpgEvents Events() { return this.events; }
+    ArpgGameplayEvents GameplayEvents() { return this.gameplayEvents; }
+    ArpgScheduler Scheduler() { return this.scheduler; }
+    ArpgWorld World() { return this.world; }
+    ArpgDiagnostics Diagnostics() { return this.diagnostics; }
+    bool IsRunning() { return this.running; }
+
+    bool LoadProject(ArpgProject project) {
+        if (project == null) { return false; }
+        ArpgDiagnostics result = project.Validate();
+        this.diagnostics = result;
+        if (result.HasErrors()) { return false; }
+        this.project = project;
+        this.registry = project.Registry();
+        this.world = ArpgWorld.CreateWithEvents(
+            project, this.events, this.gameplayEvents);
+        return true;
+    }
+
+    ArpgDiagnostics Validate() {
+        ArpgDiagnostics result = this.config.Validate();
+        result.Append(this.project.Validate());
+        if (this.config.DefaultFont() != ""
+            && !this.registry.HasResource(this.config.DefaultFont())) {
+            result.AddError(
+                "L2APP007",
+                "app.defaultFont",
+                "Default font resource id was not found.");
+        }
+        this.diagnostics = result;
+        return result;
+    }
+
+    bool Start(string arguments) {
+        if (this.running) { return true; }
+        if (this.Validate().HasErrors()) { return false; }
+        if (!this.events.RaiseStarting(arguments)) { return false; }
+        if (!Sdl.Init(SdlInit.Game())) { return false; }
+
+        int flags = SdlWindowFlags.HighPixelDensity();
+        if (this.config.ScreenMode() == ArpgScreenMode.Scale()
+            || this.config.ScreenMode() == ArpgScreenMode.ResizeWorld()) {
+            flags = flags + SdlWindowFlags.Resizable();
+        }
+        if (this.config.ScreenMode() == ArpgScreenMode.TransparentBorderless()) {
+            flags = flags + SdlWindowFlags.Borderless();
+        }
+        this.window = SdlWindow.Create(
+            this.config.Title(), this.config.Width(), this.config.Height(), flags);
+        if (!this.window.IsValid()) {
+            Sdl.Quit();
+            return false;
+        }
+
+        this.renderer = SdlRenderer.Create(this.window);
+        if (!this.renderer.IsValid()) {
+            this.window.Close();
+            Sdl.Quit();
+            return false;
+        }
+
+        this.renderer.SetVSync(this.config.VerticalSync());
+        if (this.config.ScreenMode() == ArpgScreenMode.Scale()) {
+            this.renderer.SetLogicalSize(
+                this.config.Width(),
+                this.config.Height(),
+                SdlLogicalPresentation.Stretch());
+        }
+        this.running = true;
+        this.lastTick = Sdl.Ticks();
+        this.events.RaiseStarted();
+        return true;
+    }
+
+    void PumpEvents() {
+        while (SdlEvent.Poll()) {
+            int type = SdlEvent.Type();
+            if (SdlEvent.IsQuit()) {
+                if (this.events.RaiseClosing()) {
+                    this.running = false;
+                }
+            } else if (type == SdlEventType.WindowFocusGained()) {
+                this.events.RaiseFocusChanged(true);
+            } else if (type == SdlEventType.WindowFocusLost()) {
+                this.events.RaiseFocusChanged(false);
+            } else if (type == SdlEventType.WindowMinimized()) {
+                this.events.RaiseWindowStateChanged(1);
+            } else if (type == SdlEventType.WindowMaximized()) {
+                this.events.RaiseWindowStateChanged(2);
+            } else if (type == SdlEventType.WindowRestored()) {
+                this.events.RaiseWindowStateChanged(3);
+            } else if (type == SdlEventType.WindowResized()) {
+                this.events.RaiseSizeChanged(SdlEvent.Data1(), SdlEvent.Data2());
+            } else if (type == SdlEventType.KeyDown()) {
+                if (this.config.RepeatKeys() || !SdlEvent.IsRepeat()) {
+                    int modifiers = SdlEvent.Keymod();
+                    this.events.RaiseKeyDown(
+                        SdlEvent.Keycode(),
+                        SdlKeymod.HasAlt(modifiers),
+                        SdlKeymod.HasShift(modifiers),
+                        SdlKeymod.HasControl(modifiers));
+                }
+            } else if (type == SdlEventType.KeyUp()) {
+                int modifiers = SdlEvent.Keymod();
+                this.events.RaiseKeyUp(
+                    SdlEvent.Keycode(),
+                    SdlKeymod.HasAlt(modifiers),
+                    SdlKeymod.HasShift(modifiers),
+                    SdlKeymod.HasControl(modifiers));
+            }
+        }
+    }
+
+    int Update() {
+        int now = Sdl.Ticks();
+        int delta = now - this.lastTick;
+        if (delta < 0) { delta = 0; }
+        this.lastTick = now;
+        this.scheduler.Tick(delta);
+        this.world.Update(delta);
+        return delta;
+    }
+
+    void Render() {
+        if (this.renderer == null) { return; }
+        this.renderer.SetColor(
+            this.config.BackgroundRed(),
+            this.config.BackgroundGreen(),
+            this.config.BackgroundBlue(),
+            this.config.BackgroundAlpha());
+        this.renderer.Clear();
+        this.renderer.Present();
+    }
+
+    bool Run(string arguments) {
+        if (!this.Start(arguments)) { return false; }
+        int frameDuration = 1000 / ArpgMath.Max(1, this.config.FrameRate());
+        while (this.running) {
+            int frameStart = Sdl.Ticks();
+            this.PumpEvents();
+            this.Update();
+            this.Render();
+            if (!this.config.VerticalSync()) {
+                int spent = Sdl.Ticks() - frameStart;
+                if (spent < frameDuration) {
+                    Sdl.Delay(frameDuration - spent);
+                }
+            }
+        }
+        this.Stop();
+        return true;
+    }
+
+    void Stop() {
+        this.running = false;
+        if (this.renderer != null) { this.renderer.Close(); }
+        if (this.window != null) { this.window.Close(); }
+        Sdl.Quit();
+    }
+}
