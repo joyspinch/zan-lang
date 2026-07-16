@@ -200,9 +200,9 @@ add_executable(zan-lsp
     src/compiler/parser.c
     src/compiler/binder.c
     src/compiler/checker.c
-    src/ide/intellisense.c
+    src/lsp/intellisense.c
 )
-target_include_directories(zan-lsp PRIVATE src/compiler src/common src/ide)
+target_include_directories(zan-lsp PRIVATE src/compiler src/common src/lsp)
 if(MSVC)
     target_compile_definitions(zan-lsp PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
@@ -216,9 +216,9 @@ add_executable(zan-dap
     src/dap/dap_main.c
     src/common/json.c
     src/common/rpc.c
-    src/ide/debugger.c
+    src/dap/debugger.c
 )
-target_include_directories(zan-dap PRIVATE src/common src/ide)
+target_include_directories(zan-dap PRIVATE src/common src/dap)
 if(MSVC)
     target_compile_definitions(zan-dap PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
