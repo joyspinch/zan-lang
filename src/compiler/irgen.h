@@ -7,6 +7,7 @@
 #include "ast.h"
 #include "binder.h"
 #include <llvm-c/Core.h>
+#include <llvm-c/DebugInfo.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 
@@ -241,6 +242,16 @@ struct zan_irgen {
     bool mt_scheduler;        /* --async-workers: skip the inline single-thread
                                * coroutine driver and link the multi-worker one
                                * from the zanrt_io_mt reactor object instead. */
+
+    /* DWARF debug info (opt-in via `zanc -g`). When emit_debug is false these
+     * remain NULL and no debug metadata is produced (default/--publish builds
+     * are unchanged). See the di_* helpers in irgen.c. */
+    bool             emit_debug;
+    LLVMDIBuilderRef di_builder;
+    LLVMMetadataRef  di_cu;
+    LLVMMetadataRef  di_files[256]; /* DIFile per source file_id */
+    uint32_t         di_cur_line;   /* source line of the statement in progress */
+    uint32_t         di_cur_file;   /* its file_id (for local-variable declares) */
 
     /* ARC: nesting depth of the statement currently being emitted, counting
      * only control-flow bodies (if/loop/switch/try). A class-typed local is

@@ -815,6 +815,7 @@ static void print_usage(void) {
     fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
     fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
     fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
+    fprintf(stderr, "  -g, --debug      Emit DWARF debug info for source-level debugging (forces -O0)\n");
     fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
     fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
     fprintf(stderr, "  --subsystem <s>  PE subsystem: console (default) or windows (GUI, Win only)\n");
@@ -852,6 +853,7 @@ int main(int argc, char **argv) {
     bool check_leaks = false;
     bool runtime_checks = true;
     bool publish_mode = false;
+    bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
     bool mt_scheduler = false;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
@@ -887,6 +889,8 @@ int main(int argc, char **argv) {
             runtime_checks = false;
         } else if (strcmp(argv[i], "--publish") == 0) {
             publish_mode = true;
+        } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--debug") == 0) {
+            debug_info = true;
         } else if (strcmp(argv[i], "--async-workers") == 0 ||
                    strcmp(argv[i], "--mt") == 0) {
             /* Use the multi-worker coroutine scheduler: async programs run
@@ -1219,6 +1223,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     irgen.runtime_checks = runtime_checks;
+    irgen.emit_debug = debug_info;
 
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");
@@ -1234,6 +1239,13 @@ int main(int argc, char **argv) {
         effective_opt = (zan_opt_level_t)opt_level;
     } else if (publish_mode) {
         effective_opt = ZAN_OPT_FULL; /* O2 for --publish */
+    }
+    /* Optimization reorders/folds instructions and drops locals, which makes
+     * DWARF line tables and variable locations unreliable. Debug builds stay at
+     * -O0 so single-stepping and breakpoints map faithfully to source. */
+    if (debug_info && effective_opt > ZAN_OPT_NONE) {
+        fprintf(stderr, "note: -g forces -O0 (debug info is emitted unoptimized)\n");
+        effective_opt = ZAN_OPT_NONE;
     }
     if (effective_opt > ZAN_OPT_NONE) {
         zan_opt_report_t opt_report = zan_optimize(&irgen, &binder, effective_opt);
