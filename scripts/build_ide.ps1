@@ -6,7 +6,7 @@ Set-Location $root
 # The native GUI runtime is now built with ZAN_GUI_SDL so the IDE window is an
 # SDL3 window driven by the same stack games use. Locate the staged SDL3 mingw
 # devel package (headers) and synthesize an MSVC import lib (SDL3.lib) from the
-# driver DLL â€” mirrors scripts\build_gui_sdl_smoke.ps1.
+# driver DLL â€?mirrors scripts\build_gui_sdl_smoke.ps1.
 $driverDir = Join-Path $root "stdlib\SDL3\drivers\win-x64"
 $cache = Get-ChildItem "$env:TEMP" -Filter "zan-sdl3-*" -Directory `
     | Sort-Object Name -Descending | Select-Object -First 1
