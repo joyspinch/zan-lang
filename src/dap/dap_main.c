@@ -20,9 +20,9 @@
  *   - Variable modification (setVariable)
  *   - Multiple scopes (Locals, Watch)
  *
- * Runtime process control is delegated to the debugger engine (Windows
- * CreateProcess-based; a simulated stepping model elsewhere), while this
- * adapter provides the full protocol surface.
+ * Runtime process control is delegated to the debugger engine, which drives a
+ * real gdb in machine-interface mode (the compiler emits DWARF via `zanc -g`),
+ * so breakpoints, stepping, stack frames and variables are genuine.
  *
  * Usage: zan-dap           (communicates over stdin/stdout)
  */
@@ -47,6 +47,7 @@ typedef struct {
     FILE      *out;
     int        seq;              /* outgoing message sequence */
     char       program[1024];    /* launched executable */
+    char       prog_args[1024];  /* inferior arguments */
     char       source_file[1024];/* main source file (for stack frames) */
     bool       terminated;
     bool       launched;
@@ -103,42 +104,17 @@ static void dap_send_stopped(dap_t *d, const char *reason) {
     dap_send_event(d, "stopped", body);
 }
 
-/* Run the launched program to completion, streaming its real stdout/stderr
- * as DAP output events, then emit terminated/exited with the real exit code.
- *
- * Source-line stepping in this adapter is modelled statically (the compiler
- * does not yet emit debug-info line tables, so native breakpoints cannot be
- * placed). Executing the program here at the end of the session gives the
- * debug console the program's genuine output and exit status instead of a
- * fabricated one. */
-static void dap_run_and_terminate(dap_t *d) {
-    if (d->terminated) return;
-
-    int exit_code = 0;
-    if (d->program[0]) {
-        char cmd[1200];
-#ifdef _WIN32
-        snprintf(cmd, sizeof(cmd), "\"\"%s\" 2>&1\"", d->program);
-        FILE *fp = _popen(cmd, "r");
-#else
-        snprintf(cmd, sizeof(cmd), "\"%s\" 2>&1", d->program);
-        FILE *fp = popen(cmd, "r");
-#endif
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp))
-                dap_output(d, "stdout", line);
-#ifdef _WIN32
-            exit_code = _pclose(fp);
-#else
-            int st = pclose(fp);
-            exit_code = (st == -1) ? -1 : (WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-#endif
-        } else {
-            dap_output(d, "stderr", "[DBG] Could not launch program for output capture.\n");
-        }
+/* Flush any buffered engine output (inferior stdout + debug notes) to the
+ * client's debug console, then reset the buffer. */
+static void dap_flush_output(dap_t *d) {
+    if (d->dbg.output_len > 0) {
+        dap_output(d, "stdout", d->dbg.output);
+        dbg_clear_output(&d->dbg);
     }
+}
 
+static void dap_terminate_with_code(dap_t *d, int exit_code) {
+    if (d->terminated) return;
     d->terminated = true;
     dap_send_event(d, "terminated", NULL);
     json_value *body = json_new_obj();
@@ -146,13 +122,23 @@ static void dap_run_and_terminate(dap_t *d) {
     dap_send_event(d, "exited", body);
 }
 
-static void dap_send_terminated(dap_t *d) {
-    if (d->terminated) return;
-    d->terminated = true;
-    dap_send_event(d, "terminated", NULL);
-    json_value *body = json_new_obj();
-    json_obj_set(body, "exitCode", json_new_num(0));
-    dap_send_event(d, "exited", body);
+/* Map a gdb/MI stop reason to a DAP `stopped` reason. */
+static const char *dap_stop_reason(const char *mi) {
+    if (!mi || !mi[0]) return "breakpoint";
+    if (strncmp(mi, "breakpoint", 10) == 0) return "breakpoint";
+    if (strstr(mi, "stepping-range") || strstr(mi, "finished")) return "step";
+    if (strstr(mi, "watchpoint")) return "data breakpoint";
+    if (strstr(mi, "signal")) return "exception";
+    return "breakpoint";
+}
+
+/* After an execution command: report the resulting stop or termination. */
+static void dap_report_stop(dap_t *d) {
+    dap_flush_output(d);
+    if (d->dbg.state == DBG_PAUSED)
+        dap_send_stopped(d, dap_stop_reason(d->dbg.stop_reason));
+    else
+        dap_terminate_with_code(d, d->dbg.last_exit_code);
 }
 
 /* ============================== handlers ============================= */
@@ -240,55 +226,26 @@ static void handle_launch(dap_t *d, json_value *request) {
     const char *prog_args = json_get_str(json_obj_get(args, "args"));
     bool stop_on_entry = (bool)json_get_num(json_obj_get(args, "stopOnEntry"), 0);
 
+    const char *gdb_path = json_get_str(json_obj_get(args, "gdbPath"));
+
     if (program) strncpy(d->program, program, sizeof(d->program) - 1);
+    if (prog_args) strncpy(d->prog_args, prog_args, sizeof(d->prog_args) - 1);
+    if (gdb_path && gdb_path[0]) dbg_set_gdb_path(&d->dbg, gdb_path);
     d->dbg.break_on_entry = stop_on_entry;
 
     d->launched = true;
-    dap_output(d, "console", "Launching Zan program under debugger...\n");
+    dap_output(d, "console", "Launching Zan program under gdb...\n");
 
-    /* The program is executed for real at session end (dap_run_and_terminate)
-     * so its true output/exit code are reported. Line stepping is driven by
-     * the static model below rather than the OS debugger, whose event loop
-     * cannot place source breakpoints without compiler debug-info. */
-    {
-        d->dbg.state = DBG_PAUSED;
-        d->dbg.callstack_depth = 1;
-        d->dbg.active_frame = 0;
-        strncpy(d->dbg.callstack[0].function_name, "Main",
-                sizeof(d->dbg.callstack[0].function_name) - 1);
-        strncpy(d->dbg.callstack[0].file, d->source_file,
-                sizeof(d->dbg.callstack[0].file) - 1);
-        d->dbg.callstack[0].line = d->dbg.bp_count ? d->dbg.breakpoints[0].line : 1;
-        strncpy(d->dbg.current_file, d->source_file,
-                sizeof(d->dbg.current_file) - 1);
-        d->dbg.current_line = d->dbg.callstack[0].line;
-    }
-
+    /* The program is actually started at configurationDone, once the client
+     * has delivered its breakpoints. */
     dap_send_response(d, request, true, NULL);
 }
 
 static void handle_configuration_done(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    /* If breakpoints are set, report an initial stop; otherwise the program
-     * "runs" and terminates. */
-    if (d->dbg.bp_count > 0) {
-        d->dbg.state = DBG_PAUSED;
-        if (d->dbg.callstack_depth == 0) {
-            d->dbg.callstack_depth = 1;
-            d->dbg.active_frame = 0;
-            strncpy(d->dbg.callstack[0].function_name, "Main",
-                    sizeof(d->dbg.callstack[0].function_name) - 1);
-            strncpy(d->dbg.callstack[0].file, d->source_file,
-                    sizeof(d->dbg.callstack[0].file) - 1);
-        }
-        d->dbg.callstack[0].line = d->dbg.breakpoints[0].line;
-        d->dbg.current_line = d->dbg.breakpoints[0].line;
-        strncpy(d->dbg.current_file, d->source_file,
-                sizeof(d->dbg.current_file) - 1);
-        dap_send_stopped(d, "breakpoint");
-    } else {
-        dap_run_and_terminate(d);
-    }
+    /* Breakpoints have now been delivered; launch the inferior under gdb. */
+    dbg_start(&d->dbg, d->program, d->prog_args[0] ? d->prog_args : NULL);
+    dap_report_stop(d);
 }
 
 static void handle_threads(dap_t *d, json_value *request) {
@@ -456,52 +413,37 @@ static void handle_continue(dap_t *d, json_value *request) {
     json_obj_set(body, "allThreadsContinued", json_new_bool(true));
     dap_send_response(d, request, true, body);
     dbg_continue(&d->dbg);
-
-    /* Check if we hit another breakpoint */
-    if (d->dbg.state == DBG_PAUSED) {
-        dap_send_stopped(d, "breakpoint");
-    } else {
-        dap_run_and_terminate(d);
-    }
+    dap_report_stop(d);
 }
 
 static void handle_next(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
     dbg_step_over(&d->dbg);
-    if (d->dbg.callstack_depth > 0)
-        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
-            d->dbg.current_line;
-    dap_send_stopped(d, "step");
+    dap_report_stop(d);
 }
 
 static void handle_step_in(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
     dbg_step_into(&d->dbg);
-    if (d->dbg.callstack_depth > 0)
-        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
-            d->dbg.current_line;
-    dap_send_stopped(d, "step");
+    dap_report_stop(d);
 }
 
 static void handle_step_out(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
     dbg_step_out(&d->dbg);
-    if (d->dbg.callstack_depth > 0)
-        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
-            d->dbg.current_line;
-    dap_send_stopped(d, "step");
+    dap_report_stop(d);
 }
 
 static void handle_pause(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    d->dbg.state = DBG_PAUSED;
+    /* Synchronous MI backend has no async-interrupt path yet; acknowledge. */
     dap_send_stopped(d, "pause");
 }
 
 static void handle_disconnect(dap_t *d, json_value *request) {
     dbg_stop(&d->dbg);
     dap_send_response(d, request, true, NULL);
-    dap_send_terminated(d);
+    dap_terminate_with_code(d, d->dbg.last_exit_code);
 }
 
 /* ============================== dispatch ============================= */

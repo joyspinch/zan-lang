@@ -611,6 +611,27 @@ foreach(_case ${_golden_cases})
   endif()
 endforeach()
 
+# ---- DAP integration test (real gdb-backed debug session) ----
+add_executable(dap_integration_test
+    tests/dap/dap_integration_test.c
+)
+set_target_properties(dap_integration_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(WIN32)
+    target_compile_definitions(dap_integration_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME dap_integration
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DDAP=$<TARGET_FILE:zan-dap>
+    -DHARNESS=$<TARGET_FILE:dap_integration_test>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/dbgtarget${_exe_ext}
+    -DZANC_ARGS=--auto-stdlib
+    -P ${CMAKE_SOURCE_DIR}/tests/run_dap.cmake)
+
 # ---- zanpkg (package manager CLI) ----
 add_executable(zanpkg
     src/pkg/zanpkg_main.c
