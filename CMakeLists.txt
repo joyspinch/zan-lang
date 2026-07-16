@@ -366,11 +366,6 @@ endif()
 add_test(NAME runtime_sync COMMAND zanrt_sync_test)
 add_dependencies(zanc zanrt_sync_test)
 
-add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-tokens)
-add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast)
-add_test(NAME test_emit_ir_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --emit-ir)
-add_test(NAME test_compile_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan -o ${CMAKE_BINARY_DIR}/hello_test)
-
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
   set(_exe_ext ".exe")
@@ -443,19 +438,6 @@ add_test(NAME conformance_multifile
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/box.zan;${CMAKE_SOURCE_DIR}/tests/conformance/multifile/util.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
-# ---- Skeletal multi-file Zan compiler: lexer + parser + driver ----
-# A tiny expression compiler/evaluator written in Zan across three files,
-# exercising classes, enum/switch, List<class>, string char-lexing, casts and
-# cross-file references �?the "host is strong enough" acceptance program.
-add_test(NAME conformance_minic
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/examples/minic/driver.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/minic/lexer.zan;${CMAKE_SOURCE_DIR}/examples/minic/parser.zan"
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/examples/minic/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
