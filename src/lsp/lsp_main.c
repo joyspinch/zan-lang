@@ -29,6 +29,7 @@
 #include "checker.h"
 
 #include "intellisense.h"
+#include "zan_version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -533,7 +534,7 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
 
     json_value *info = json_new_obj();
     json_obj_set(info, "name", json_new_str("zan-lsp"));
-    json_obj_set(info, "version", json_new_str("0.3.0"));
+    json_obj_set(info, "version", json_new_str(ZAN_VERSION));
     json_obj_set(result, "serverInfo", info);
 
     send_response(s, id, result);

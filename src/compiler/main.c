@@ -14,6 +14,7 @@
 #include "irgen.h"
 #include "optimizer.h"
 #include "crosscomp.h"
+#include "zan_version.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -797,27 +798,43 @@ static const char *zan_path_basename(const char *p) {
     return b;
 }
 
+static void print_usage(void) {
+    fprintf(stderr, "Zan Compiler v%s\n", ZAN_VERSION);
+    fprintf(stderr, "Usage: zanc <source.zan> [options]\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -o <output>     Output file\n");
+    fprintf(stderr, "  --dump-tokens   Dump lexer tokens\n");
+    fprintf(stderr, "  --dump-ast      Dump parse tree\n");
+    fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
+    fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit\n");
+    fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
+    fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
+    fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
+    fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
+    fprintf(stderr, "  --driver-dir <d> Override the bundled native driver directory\n");
+    fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
+    fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
+    fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
+    fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
+    fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
+    fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
+    fprintf(stderr, "  --version, -v    Print version and exit\n");
+    fprintf(stderr, "  --help, -h       Show this help and exit\n");
+}
+
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("zanc %s\n", ZAN_VERSION);
+            return 0;
+        }
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage();
+            return 0;
+        }
+    }
     if (argc < 2) {
-        fprintf(stderr, "Zan Compiler v0.1.0\n");
-        fprintf(stderr, "Usage: zanc <source.zan> [options]\n");
-        fprintf(stderr, "Options:\n");
-        fprintf(stderr, "  -o <output>     Output file\n");
-        fprintf(stderr, "  --dump-tokens   Dump lexer tokens\n");
-        fprintf(stderr, "  --dump-ast      Dump parse tree\n");
-        fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
-        fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit\n");
-        fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
-        fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
-        fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
-        fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
-        fprintf(stderr, "  --driver-dir <d> Override the bundled native driver directory\n");
-        fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
-        fprintf(stderr, "  --auto-stdlib    Automatically find and include stdlib .zan files\n");
-        fprintf(stderr, "  -O0/-O1/-O2/-O3  Set optimization level (default: O0, --publish: O2)\n");
-        fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
-        fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
-        fprintf(stderr, "  -D<name>[=value] Define preprocessor symbol\n");
+        print_usage();
         return 1;
     }
 

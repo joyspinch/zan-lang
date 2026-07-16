@@ -11,6 +11,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# ---- Version (single source of truth: the root VERSION file) ----
+# Every binary reports this string (zanc --version, LSP serverInfo, About box).
+# Edit VERSION only; the generated zan_version.h propagates it into the build.
+file(READ "${CMAKE_SOURCE_DIR}/VERSION" ZAN_VERSION)
+string(STRIP "${ZAN_VERSION}" ZAN_VERSION)
+configure_file(
+    "${CMAKE_SOURCE_DIR}/cmake/zan_version.h.in"
+    "${CMAKE_BINARY_DIR}/generated/zan_version.h" @ONLY)
+include_directories("${CMAKE_BINARY_DIR}/generated")
+message(STATUS "Zan version: ${ZAN_VERSION}")
+
 # ---- Find LLVM ----
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
