@@ -39,8 +39,10 @@ class Tpl {
 ///   * New ("New File"): a modal wizard with file templates (Program / Class /
 ///     GUI Window / Interface / Empty).
 ///   * Explorer tree scanned from disk; click a file to open it in a tab.
-///   * Save writes to disk; Build/Run/Publish invoke zanc (+clang) via Process
-///     and stream output to the Output panel.
+///   * Save writes to disk; Build/Run/Publish invoke zanc via Process and
+///     stream output to the Output panel. Console/library targets link with
+///     zanc's own bundled linker (no external clang/LLVM needed); GUI targets
+///     still route through clang to link the native GUI runtime.
 class ZanIDE {
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
@@ -486,6 +488,27 @@ class ZanIDE {
         cand = ZanIDE.ExeDir() + "/zanrt_sync.obj";
         if (File.Exists(cand)) { return " \"" + cand + "\""; }
         return "";
+    }
+
+    /// Produces `exe` from `inputs`, picking the linker path by target kind.
+    /// Non-GUI targets link through zanc's OWN bundled linker (the GNU ld
+    /// shipped in toolchain\), so Build/Run/Debug/Publish need no external
+    /// clang or LLVM on the machine -- the IDE is as self-contained as the CLI
+    /// (verified: with clang/gcc/ld off PATH, `zanc <src> -o app.exe` still
+    /// links and runs). GUI targets still route the emitted IR through clang to
+    /// link the MSVC-ABI native GUI runtime (zan_gui.lib); unifying that onto
+    /// the bundled linker is tracked separately. `ll` is the scratch IR path
+    /// used only by the GUI/clang branch. `publish` adds `--publish`
+    /// (optimize + strip) for the self-contained path.
+    static string CompileToExe(string root, string p, string inputs, string ll, string exe, bool publish) {
+        if (!ZanIDE.IsGuiTarget(root, p)) {
+            string pub = "";
+            if (publish) { pub = " --publish"; }
+            return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"";
+        }
+        return ZanIDE.ZancCmd() + " --emit-ir " + inputs + " > \"" + ll + "\""
+            + " && clang \"" + ll + "\" -o \"" + exe + "\""
+            + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
     }
 
     /// Reads a `key = value` field from the project's zan.proj, or "" if absent.
@@ -2826,12 +2849,9 @@ class ZanIDE {
         string ll = bd + "/.zanrun.ll";
         string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
         if (File.Exists(exe)) { File.Delete(exe); }
-        string z = ZanIDE.ZancCmd();
         string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
         bool isGui = ZanIDE.IsGuiTarget(root, p);
-        string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\""
-            + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
         if (!isGui) { cmd = cmd + " && \"" + exe + "\""; }
         log.Add("> Running " + p + " ...");
         List<string> outp = Process.RunCapture(cmd);
@@ -2986,10 +3006,8 @@ class ZanIDE {
         Process.Run("pkill -f zanhot_run >/dev/null 2>&1");
         Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
         #endif
-        string z = ZanIDE.ZancCmd();
         string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
-        string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
         log.Add("> [Hot] Rebuilding ...");
         List<string> outp = Process.RunCapture(cmd);
         ZanIDE.AppendAll(log, outp);
@@ -3017,10 +3035,8 @@ class ZanIDE {
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zanpub.ll";
         string exe = root + "/publish/" + Path.GetFileName(root) + ".exe";
-        string z = ZanIDE.ZancCmd();
         string inputs = ZanIDE.ProjectInputs(ZanIDE.DirOf(p), p, "");
-        string cmd = z + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, true);
         log.Add("> Publishing console exe ...");
         List<string> outp = Process.RunCapture(cmd);
         ZanIDE.AppendAll(log, outp);
@@ -3085,8 +3101,7 @@ class ZanIDE {
         if (sel.Count > 0 && sel[0] == 1) {
             string exe = root + "/publish/" + baseName + "-windows-x64.exe";
             string ll = bd + "/.zanpub_x64.ll";
-            string cmd = zc + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
+            string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, true);
             log.Add("> Publishing windows-x64 ...");
             List<string> outp = Process.RunCapture(cmd);
             ZanIDE.AppendAll(log, outp);
@@ -4395,10 +4410,7 @@ class ZanIDE {
         string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
         if (File.Exists(exe)) { File.Delete(exe); }
         string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
-        string buildCmd = ZanIDE.ZancCmd()
-            + " --emit-ir " + inputs + " > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\""
-            + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
+        string buildCmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
         log.Add("> [Debug] Building " + p + " ...");
         List<string> buildOut = Process.RunCapture(buildCmd);
         ZanIDE.AppendAll(log, buildOut);
@@ -4440,8 +4452,7 @@ class ZanIDE {
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zandbg.ll";
         string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
-        string buildCmd = ZanIDE.ZancCmd() + " --emit-ir \"" + p + "\" > \"" + ll + "\""
-            + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ZanIDE.RtSyncArg();
+        string buildCmd = ZanIDE.CompileToExe(root, p, "\"" + p + "\"", ll, exe, false);
         log.Add("> [Debug] Building ...");
         List<string> buildOut = Process.RunCapture(buildCmd);
         int bo = 0;
@@ -4756,8 +4767,9 @@ class ZanIDE {
             Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
             #endif
             string inputs = ZanIDE.ProjectInputs(gatherDir, probe, curPath);
-            string buildCmd = ZanIDE.ZancCmd() + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.RtSyncArg();
+            // Self-contained: zanc's bundled linker auto-includes the sync
+            // runtime, so the debug probe builds with no external clang.
+            string buildCmd = ZanIDE.ZancCmd() + " " + inputs + " -o \"" + exe + "\"";
             List<string> buildOut = Process.RunCapture(buildCmd);
             if (File.Exists(exe)) {
                 runOut = Process.RunCapture("\"" + exe + "\"");
