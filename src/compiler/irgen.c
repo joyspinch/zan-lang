@@ -3941,6 +3941,38 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return seq;
         }
 
+        /* string ordering: route `<`/`<=`/`>`/`>=` on strings through strcmp
+         * and compare its result against 0. Without this the operands (i8*)
+         * would be compared as raw pointer addresses rather than by content. */
+        if ((expr->binary.op == TK_LESS || expr->binary.op == TK_LESS_EQ ||
+             expr->binary.op == TK_GREATER || expr->binary.op == TK_GREATER_EQ) &&
+            both_ptr && str_operand &&
+            expr->binary.left->kind != AST_NULL_LITERAL &&
+            expr->binary.right->kind != AST_NULL_LITERAL) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMValueRef cmp_args[] = { left, right };
+            LLVMValueRef r = LLVMBuildCall2(g->builder,
+                LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
+                g->fn_strcmp, cmp_args, 2, "scmp");
+            LLVMIntPredicate pred =
+                expr->binary.op == TK_LESS       ? LLVMIntSLT :
+                expr->binary.op == TK_LESS_EQ    ? LLVMIntSLE :
+                expr->binary.op == TK_GREATER    ? LLVMIntSGT :
+                                                   LLVMIntSGE;
+            LLVMValueRef sord = LLVMBuildICmp(g->builder, pred,
+                r, LLVMConstInt(i32t, 0, 0), "sord");
+            if (is_string_expr(g, expr->binary.left, locals) &&
+                expr_yields_owned_rc_value(g, expr->binary.left, locals)) {
+                emit_string_release(g, left);
+            }
+            if (is_string_expr(g, expr->binary.right, locals) &&
+                expr_yields_owned_rc_value(g, expr->binary.right, locals)) {
+                emit_string_release(g, right);
+            }
+            return sord;
+        }
+
         LLVMTypeRef left_type = LLVMTypeOf(left);
         bool is_float = (LLVMGetTypeKind(left_type) == LLVMDoubleTypeKind ||
                          LLVMGetTypeKind(left_type) == LLVMFloatTypeKind);
