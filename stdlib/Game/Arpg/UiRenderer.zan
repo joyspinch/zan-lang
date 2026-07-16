@@ -3,17 +3,46 @@ using SDL3;
 
 namespace Game.Arpg;
 
+delegate int ArpgTextMeasured(string text, int fontSize);
+delegate int ArpgFontHeightMeasured(int fontSize);
+delegate void ArpgTextDrawn(
+    SdlRenderer renderer,
+    string text,
+    ArpgColor color,
+    int fontSize,
+    int x,
+    int y,
+    int width,
+    int height,
+    int angle);
+
 class ArpgUiRenderer {
     ArpgRegistry registry;
     List<string> textureIds;
     List<SdlTexture> textures;
+    ArpgTextMeasured textMeasured;
+    ArpgFontHeightMeasured fontHeightMeasured;
+    ArpgTextDrawn textDrawn;
 
     static ArpgUiRenderer Create(ArpgRegistry registry) {
         ArpgUiRenderer renderer = new ArpgUiRenderer();
         renderer.registry = registry;
         renderer.textureIds = new List<string>();
         renderer.textures = new List<SdlTexture>();
+        renderer.textMeasured = null;
+        renderer.fontHeightMeasured = null;
+        renderer.textDrawn = null;
         return renderer;
+    }
+
+    void SetTextBackend(
+        ArpgTextMeasured measure,
+        ArpgFontHeightMeasured fontHeight,
+        ArpgTextDrawn draw
+    ) {
+        this.textMeasured = measure;
+        this.fontHeightMeasured = fontHeight;
+        this.textDrawn = draw;
     }
 
     string ResourceFile(string id) {
@@ -43,6 +72,14 @@ class ArpgUiRenderer {
         this.textureIds.Add(id);
         this.textures.Add(texture);
         return texture;
+    }
+
+    ArpgColor ApplyOpacity(ArpgColor color, double opacity) {
+        return ArpgColor.Create(
+            color.Red(),
+            color.Green(),
+            color.Blue(),
+            (int)((double)color.Alpha() * opacity));
     }
 
     void Fill(
@@ -93,6 +130,261 @@ class ArpgUiRenderer {
         }
     }
 
+    void TransformedResource(
+        SdlRenderer renderer,
+        string resourceId,
+        int x,
+        int y,
+        int width,
+        int height,
+        double opacity,
+        int angle
+    ) {
+        SdlTexture texture = this.Texture(renderer, resourceId);
+        if (texture != null) {
+            texture.SetOpacity((int)(opacity * 255.0));
+            renderer.DrawTextureRotated(
+                texture, x, y, width, height, angle);
+            texture.SetOpacity(255);
+        }
+    }
+
+    void Circle(
+        SdlRenderer renderer,
+        ArpgColor fillColor,
+        ArpgColor borderColor,
+        int borderWidth,
+        int centerX,
+        int centerY,
+        int radius
+    ) {
+        if (radius <= 0) { return; }
+        int y = -radius;
+        while (y <= radius) {
+            int x = radius;
+            while (x > 0 && x * x + y * y > radius * radius) {
+                x = x - 1;
+            }
+            if (fillColor.Alpha() > 0) {
+                renderer.SetColor(
+                    fillColor.Red(),
+                    fillColor.Green(),
+                    fillColor.Blue(),
+                    fillColor.Alpha());
+                renderer.DrawLine(
+                    centerX - x, centerY + y,
+                    centerX + x, centerY + y);
+            }
+            if (borderColor.Alpha() > 0 && borderWidth > 0) {
+                int innerRadius = radius - borderWidth;
+                int inner = 0;
+                if (innerRadius > 0) {
+                    inner = innerRadius;
+                    while (inner > 0
+                        && inner * inner + y * y
+                            > innerRadius * innerRadius) {
+                        inner = inner - 1;
+                    }
+                }
+                renderer.SetColor(
+                    borderColor.Red(),
+                    borderColor.Green(),
+                    borderColor.Blue(),
+                    borderColor.Alpha());
+                renderer.DrawLine(
+                    centerX - x, centerY + y,
+                    centerX - inner, centerY + y);
+                renderer.DrawLine(
+                    centerX + inner, centerY + y,
+                    centerX + x, centerY + y);
+            }
+            y = y + 1;
+        }
+    }
+
+    void NineSlice(
+        SdlRenderer renderer,
+        ArpgNineSlice slice,
+        int x,
+        int y,
+        int width,
+        int height
+    ) {
+        if (slice == null) { return; }
+        int left = ArpgMath.Clamp(slice.LeftWidth(), 0, width);
+        int top = ArpgMath.Clamp(slice.TopHeight(), 0, height);
+        int right = ArpgMath.Clamp(slice.RightWidth(), 0, width - left);
+        int bottom = ArpgMath.Clamp(
+            slice.BottomHeight(), 0, height - top);
+        int centerWidth = width - left - right;
+        int centerHeight = height - top - bottom;
+
+        this.Resource(renderer, slice.TopLeft(), x, y, left, top);
+        this.Resource(
+            renderer, slice.Top(), x + left, y, centerWidth, top);
+        this.Resource(
+            renderer, slice.TopRight(), x + width - right, y, right, top);
+        this.Resource(
+            renderer, slice.Left(), x, y + top, left, centerHeight);
+        this.Resource(
+            renderer, slice.Center(),
+            x + left, y + top, centerWidth, centerHeight);
+        this.Resource(
+            renderer, slice.Right(),
+            x + width - right, y + top, right, centerHeight);
+        this.Resource(
+            renderer, slice.BottomLeft(),
+            x, y + height - bottom, left, bottom);
+        this.Resource(
+            renderer, slice.Bottom(),
+            x + left, y + height - bottom, centerWidth, bottom);
+        this.Resource(
+            renderer, slice.BottomRight(),
+            x + width - right, y + height - bottom, right, bottom);
+    }
+
+    int MeasureText(string text, int fontSize) {
+        ArpgTextMeasured measure = this.textMeasured;
+        if (measure != null) { return measure(text, fontSize); }
+        return ArpgTextMetrics.Measure(text, fontSize);
+    }
+
+    int FontHeight(int fontSize) {
+        ArpgFontHeightMeasured measure = this.fontHeightMeasured;
+        if (measure != null) { return measure(fontSize); }
+        return fontSize;
+    }
+
+    void DrawFallbackText(
+        SdlRenderer renderer,
+        string text,
+        ArpgColor color,
+        int fontSize,
+        int x,
+        int y
+    ) {
+        int index = 0;
+        int cursor = x;
+        int glyphHeight = ArpgMath.Max(1, fontSize - 2);
+        renderer.SetColor(
+            color.Red(), color.Green(), color.Blue(), color.Alpha());
+        while (index < text.Length) {
+            int next = ArpgTextMetrics.NextUtf8(text, index);
+            if (next > text.Length) { next = text.Length; }
+            string glyph = text.Substring(index, next - index);
+            int glyphWidth = ArpgTextMetrics.GlyphWidth(glyph, fontSize);
+            if (glyph != " " && glyph != "\t") {
+                renderer.DrawRect(
+                    cursor, y + 1,
+                    ArpgMath.Max(1, glyphWidth - 2), glyphHeight);
+                renderer.DrawLine(
+                    cursor + 1, y + glyphHeight / 2,
+                    cursor + ArpgMath.Max(1, glyphWidth - 3),
+                    y + glyphHeight / 2);
+            }
+            cursor = cursor + glyphWidth;
+            index = next;
+        }
+    }
+
+    void DrawText(
+        SdlRenderer renderer,
+        string text,
+        ArpgColor color,
+        int fontSize,
+        int x,
+        int y,
+        int width,
+        int height,
+        int angle
+    ) {
+        if (text == "" || color.Alpha() == 0) { return; }
+        ArpgTextDrawn draw = this.textDrawn;
+        if (draw != null) {
+            draw(
+                renderer, text, color, fontSize,
+                x, y, width, height, angle);
+            return;
+        }
+        this.DrawFallbackText(
+            renderer, text, color, fontSize, x, y);
+    }
+
+    void RenderDocument(
+        SdlRenderer renderer,
+        ArpgRichTextDocument document,
+        ArpgColor defaultColor,
+        int fontSize,
+        int horizontalAlign,
+        int verticalAlign,
+        bool wrap,
+        int lineSpacing,
+        double opacity,
+        int x,
+        int y,
+        int width,
+        int height,
+        int angle
+    ) {
+        ArpgRichTextLayout layout = ArpgRichTextLayouter.Layout(
+            document, width, fontSize, lineSpacing, wrap, horizontalAlign);
+        int offsetY = 0;
+        if (verticalAlign == ArpgTextAlign.Center()) {
+            offsetY = ArpgMath.Max(0, (height - layout.Height()) / 2);
+        } else if (verticalAlign == ArpgTextAlign.End()) {
+            offsetY = ArpgMath.Max(0, height - layout.Height());
+        }
+
+        int i = 0;
+        while (i < layout.ItemCount()) {
+            ArpgRichTextLayoutItem item = layout.ItemAt(i);
+            ArpgRichTextRun run = document.RunAt(item.RunIndex());
+            int itemX = x + item.X();
+            int itemY = y + offsetY + item.Y();
+            ArpgColor background = this.ApplyOpacity(
+                run.Style().Background(), opacity);
+            this.Fill(
+                renderer, background,
+                itemX, itemY, item.Width(), item.Height());
+            if (run.Kind() == ArpgRichTextRunKind.Text()) {
+                ArpgColor textColor = run.Style().Color();
+                if (run.IsLink()
+                    && run.Link().NormalColor().Alpha() > 0) {
+                    textColor = run.Link().NormalColor();
+                } else if (textColor.Red() == 255
+                    && textColor.Green() == 255
+                    && textColor.Blue() == 255
+                    && textColor.Alpha() == 255) {
+                    textColor = defaultColor;
+                }
+                this.DrawText(
+                    renderer, item.Text(),
+                    this.ApplyOpacity(textColor, opacity),
+                    fontSize, itemX, itemY,
+                    item.Width(), item.Height(), angle);
+                if (run.IsLink() && run.Link().Style() == 1) {
+                    ArpgColor linkColor = this.ApplyOpacity(
+                        textColor, opacity);
+                    renderer.SetColor(
+                        linkColor.Red(), linkColor.Green(),
+                        linkColor.Blue(), linkColor.Alpha());
+                    renderer.DrawLine(
+                        itemX, itemY + item.Height() - 1,
+                        itemX + item.Width(),
+                        itemY + item.Height() - 1);
+                }
+            } else if (run.Kind() == ArpgRichTextRunKind.Image()
+                || run.Kind() == ArpgRichTextRunKind.Animation()
+                || run.Kind() == ArpgRichTextRunKind.Item()) {
+                this.TransformedResource(
+                    renderer, run.Resource(),
+                    itemX, itemY, item.Width(), item.Height(),
+                    opacity, angle);
+            }
+            i = i + 1;
+        }
+    }
+
     void RenderNode(
         SdlRenderer renderer,
         ArpgNode node,
@@ -100,16 +392,71 @@ class ArpgUiRenderer {
         int y
     ) {
         if (!node.Visible()) { return; }
-        int nodeX = x + node.X();
-        int nodeY = y + node.Y();
+        int width = (int)((double)node.Width() * node.ScaleX());
+        int height = (int)((double)node.Height() * node.ScaleY());
+        int nodeX = x + node.X()
+            - (int)((double)width * node.AnchorX());
+        int nodeY = y + node.Y()
+            - (int)((double)height * node.AnchorY());
+        ArpgColor background = this.ApplyOpacity(
+            node.BackgroundColor(), node.Opacity());
+        ArpgColor color = this.ApplyOpacity(
+            node.Color(), node.Opacity());
+        ArpgColor border = this.ApplyOpacity(
+            node.BorderColor(), node.Opacity());
         this.Fill(
-            renderer, node.BackgroundColor(),
-            nodeX, nodeY, node.Width(), node.Height());
-        if (node.Kind() == ArpgNodeKind.Sprite()) {
-            this.Resource(
+            renderer, background,
+            nodeX, nodeY, width, height);
+        if (node.NineSlice() != null) {
+            this.NineSlice(
+                renderer, node.NineSlice(),
+                nodeX, nodeY, width, height);
+        } else if (node.Kind() == ArpgNodeKind.Sprite()
+            || node.Kind() == ArpgNodeKind.Animation()) {
+            this.TransformedResource(
                 renderer, node.Resource(),
-                nodeX, nodeY, node.Width(), node.Height());
+                nodeX, nodeY, width, height,
+                node.Opacity(), node.Angle());
+        } else if (node.Kind() == ArpgNodeKind.Circle()) {
+            int radius = node.Radius();
+            if (radius <= 0) {
+                radius = ArpgMath.Max(1, ArpgMath.Max(width, height) / 2);
+            }
+            this.Circle(
+                renderer, color, border, node.BorderWidth(),
+                nodeX + width / 2, nodeY + height / 2, radius);
+        } else if (node.Kind() == ArpgNodeKind.Rectangle()) {
+            this.Fill(renderer, color, nodeX, nodeY, width, height);
         }
+        if (node.Kind() == ArpgNodeKind.Text()
+            || node.Kind() == ArpgNodeKind.ArtText()) {
+            if (node.Kind() == ArpgNodeKind.ArtText()
+                && node.OutlineColor().Alpha() > 0) {
+                ArpgColor outline = this.ApplyOpacity(
+                    node.OutlineColor(), node.Opacity());
+                this.DrawText(
+                    renderer, node.Content(), outline, node.FontSize(),
+                    nodeX - 1, nodeY, width, height, node.Angle());
+                this.DrawText(
+                    renderer, node.Content(), outline, node.FontSize(),
+                    nodeX + 1, nodeY, width, height, node.Angle());
+                this.DrawText(
+                    renderer, node.Content(), outline, node.FontSize(),
+                    nodeX, nodeY - 1, width, height, node.Angle());
+                this.DrawText(
+                    renderer, node.Content(), outline, node.FontSize(),
+                    nodeX, nodeY + 1, width, height, node.Angle());
+            }
+            this.RenderDocument(
+                renderer, node.Document(), node.Color(),
+                node.FontSize(),
+                node.HorizontalAlign(), node.VerticalAlign(),
+                node.Wrap(), node.LineSpacing(), node.Opacity(),
+                nodeX, nodeY, width, height, node.Angle());
+        }
+        this.Border(
+            renderer, border, node.BorderWidth(),
+            nodeX, nodeY, width, height);
     }
 
     void RenderControl(
@@ -119,17 +466,80 @@ class ArpgUiRenderer {
         int y
     ) {
         if (!control.Visible()) { return; }
-        int controlX = x + control.X();
-        int controlY = y + control.Y();
+        int width = (int)((double)control.Width() * control.ScaleX());
+        int height = (int)((double)control.Height() * control.ScaleY());
+        int controlX = x + control.X()
+            - (int)((double)width * control.AnchorX());
+        int controlY = y + control.Y()
+            - (int)((double)height * control.AnchorY());
+        ArpgColor background = this.ApplyOpacity(
+            control.BackgroundColor(), control.Opacity());
         this.Fill(
-            renderer, control.BackgroundColor(),
-            controlX, controlY, control.Width(), control.Height());
-        this.Resource(
-            renderer, control.Resource(),
-            controlX, controlY, control.Width(), control.Height());
+            renderer, background,
+            controlX, controlY, width, height);
+        if (control.NineSlice() != null) {
+            this.NineSlice(
+                renderer, control.NineSlice(),
+                controlX, controlY, width, height);
+        } else {
+            this.TransformedResource(
+                renderer, control.Resource(),
+                controlX, controlY, width, height,
+                control.Opacity(), control.Angle());
+        }
+        if (control.Kind() == ArpgControlKind.ProgressBar()) {
+            int progressWidth = (int)((double)width * control.Progress());
+            this.Fill(
+                renderer,
+                this.ApplyOpacity(control.TextColor(), control.Opacity()),
+                controlX, controlY, progressWidth, height);
+        }
+        if (!control.Enabled()) {
+            this.Fill(
+                renderer,
+                this.ApplyOpacity(
+                    control.DisabledColor(), control.Opacity()),
+                controlX, controlY, width, height);
+        } else if (control.Pressed()) {
+            this.Fill(
+                renderer,
+                this.ApplyOpacity(
+                    control.PressedColor(), control.Opacity()),
+                controlX, controlY, width, height);
+        } else if (control.Hovered()) {
+            this.Fill(
+                renderer,
+                this.ApplyOpacity(
+                    control.HoverColor(), control.Opacity()),
+                controlX, controlY, width, height);
+        }
+        if (control.Kind() == ArpgControlKind.Label()
+            || control.Kind() == ArpgControlKind.Button()
+            || control.Kind() == ArpgControlKind.TextBox()
+            || control.Kind() == ArpgControlKind.RichTextBox()) {
+            ArpgRichTextDocument contentDocument = control.Document();
+            if (control.Kind() == ArpgControlKind.Button()
+                && control.Title() != "") {
+                contentDocument = ArpgRichTextDocument.Create(
+                    control.Title());
+                ArpgRichTextRun titleRun = ArpgRichTextRun.Create(
+                    ArpgRichTextRunKind.Text(),
+                    ArpgRichTextStyle.Default(), null);
+                titleRun.SetText(control.Title());
+                contentDocument.Add(titleRun);
+            }
+            this.RenderDocument(
+                renderer, contentDocument, control.TextColor(),
+                control.FontSize(),
+                control.HorizontalAlign(), control.VerticalAlign(),
+                control.Wrap(), control.LineSpacing(), control.Opacity(),
+                controlX, controlY, width, height, control.Angle());
+        }
         this.Border(
-            renderer, control.BorderColor(), control.BorderWidth(),
-            controlX, controlY, control.Width(), control.Height());
+            renderer,
+            this.ApplyOpacity(control.BorderColor(), control.Opacity()),
+            control.BorderWidth(),
+            controlX, controlY, width, height);
         List<bool> rendered = new List<bool>();
         int i = 0;
         while (i < control.NodeCount()) {
@@ -137,6 +547,9 @@ class ArpgUiRenderer {
             i = i + 1;
         }
         int pass = 0;
+        if (control.Clip()) {
+            renderer.SetClip(controlX, controlY, width, height);
+        }
         while (pass < control.NodeCount()) {
             int best = -1;
             i = 0;
@@ -156,6 +569,7 @@ class ArpgUiRenderer {
             }
             pass = pass + 1;
         }
+        if (control.Clip()) { renderer.ResetClip(); }
     }
 
     void RenderWindow(SdlRenderer renderer, ArpgWindow window) {

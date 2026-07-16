@@ -130,6 +130,20 @@ ZAN_SDL_API zan_i64 zan_sdl_set_logical_size(
 ZAN_SDL_API zan_i64 zan_sdl_set_draw_color(
     zan_i64 renderer, zan_i64 red, zan_i64 green, zan_i64 blue, zan_i64 alpha) {
     if (!renderer) return 0;
+    if (red == -1)
+        return zan_bool(SDL_SetRenderClipRect(
+            (SDL_Renderer *)zan_ptr(renderer), NULL));
+    if (red < -1) {
+        uint32_t packed = (uint32_t)(-2 - red);
+        SDL_Rect clip = {
+            (int)((packed >> 16) & 0xFFFF),
+            (int)(packed & 0xFFFF),
+            (int)green,
+            (int)blue
+        };
+        return zan_bool(SDL_SetRenderClipRect(
+            (SDL_Renderer *)zan_ptr(renderer), &clip));
+    }
     return zan_bool(SDL_SetRenderDrawColor(
         (SDL_Renderer *)zan_ptr(renderer),
         (uint8_t)red, (uint8_t)green, (uint8_t)blue, (uint8_t)alpha));
@@ -193,6 +207,7 @@ ZAN_SDL_API zan_i64 zan_sdl_create_texture_rgba32(
         access,
         (int)width,
         (int)height);
+    if (texture) SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
     return zan_handle(texture);
 }
 
@@ -219,6 +234,9 @@ ZAN_SDL_API zan_i64 zan_sdl_update_texture(
 
 ZAN_SDL_API zan_i64 zan_sdl_set_texture_nearest(zan_i64 texture, zan_i64 nearest) {
     if (!texture) return 0;
+    if (nearest >= 256)
+        return zan_bool(SDL_SetTextureAlphaMod(
+            (SDL_Texture *)zan_ptr(texture), (uint8_t)(nearest - 256)));
     SDL_ScaleMode mode = nearest ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR;
     return zan_bool(SDL_SetTextureScaleMode((SDL_Texture *)zan_ptr(texture), mode));
 }
@@ -227,7 +245,19 @@ ZAN_SDL_API zan_i64 zan_sdl_render_texture(
     zan_i64 renderer, zan_i64 texture,
     zan_i64 x, zan_i64 y, zan_i64 width, zan_i64 height) {
     if (!renderer || !texture) return 0;
-    SDL_FRect dst = zan_rect(x, y, width, height);
+    uint64_t packed = (uint64_t)width;
+    int actual_width = (int)(uint32_t)packed;
+    int angle = (int)(uint32_t)(packed >> 32);
+    SDL_FRect dst = zan_rect(x, y, actual_width, height);
+    if (angle != 0)
+        return zan_bool(SDL_RenderTextureRotated(
+            (SDL_Renderer *)zan_ptr(renderer),
+            (SDL_Texture *)zan_ptr(texture),
+            NULL,
+            &dst,
+            (double)angle,
+            NULL,
+            SDL_FLIP_NONE));
     return zan_bool(SDL_RenderTexture(
         (SDL_Renderer *)zan_ptr(renderer),
         (SDL_Texture *)zan_ptr(texture),
