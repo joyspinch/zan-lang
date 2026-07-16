@@ -30,12 +30,14 @@ if(WORKDIR)
     COMMAND ${OUT_EXE}
     WORKING_DIRECTORY ${WORKDIR}
     RESULT_VARIABLE run_rc
-    OUTPUT_VARIABLE actual)
+    OUTPUT_VARIABLE actual
+    ENCODING UTF-8)
 else()
   execute_process(
     COMMAND ${OUT_EXE}
     RESULT_VARIABLE run_rc
-    OUTPUT_VARIABLE actual)
+    OUTPUT_VARIABLE actual
+    ENCODING UTF-8)
 endif()
 if(NOT run_rc EQUAL 0)
   message(FATAL_ERROR "program exited with ${run_rc}\noutput:\n${actual}")

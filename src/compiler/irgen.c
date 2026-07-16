@@ -9417,6 +9417,23 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     LLVMPositionBuilderAtEnd(g->builder, entry);
     di_clear(g);
 
+    /* On Windows, switch the console code page to UTF-8 (65001) so that
+     * non-ASCII output (e.g. CJK text) renders correctly instead of being
+     * decoded with the legacy OEM/ANSI codepage. Our string data is UTF-8, and
+     * this only affects console handles (a no-op when stdout is a pipe/file),
+     * so redirected output keeps its raw UTF-8 bytes. */
+    if (g->target_is_windows) {
+        LLVMTypeRef uintt = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef setcp_type = LLVMFunctionType(uintt, (LLVMTypeRef[]){ uintt }, 1, 0);
+        LLVMValueRef fn_set_out = LLVMGetNamedFunction(g->mod, "SetConsoleOutputCP");
+        if (!fn_set_out) fn_set_out = LLVMAddFunction(g->mod, "SetConsoleOutputCP", setcp_type);
+        LLVMValueRef fn_set_in = LLVMGetNamedFunction(g->mod, "SetConsoleCP");
+        if (!fn_set_in) fn_set_in = LLVMAddFunction(g->mod, "SetConsoleCP", setcp_type);
+        LLVMValueRef cp_utf8 = LLVMConstInt(uintt, 65001, 0);
+        LLVMBuildCall2(g->builder, setcp_type, fn_set_out, &cp_utf8, 1, "");
+        LLVMBuildCall2(g->builder, setcp_type, fn_set_in, &cp_utf8, 1, "");
+    }
+
     /* stash argc/argv into module globals for Environment.* builtins */
     LLVMValueRef g_argc = LLVMGetNamedGlobal(g->mod, "__zan_argc");
     if (!g_argc) {
