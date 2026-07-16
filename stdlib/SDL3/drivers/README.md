@@ -6,6 +6,10 @@
 stdlib/SDL3/drivers/<target>/
 ```
 
+`Game.Arpg.ArpgUiRenderer` uses this bundle. The drivers workflow builds and
+uploads each compiled target bundle as a GitHub Actions artifact; tagged driver
+builds also publish the same bundles on the GitHub Release.
+
 The Windows x64 bundle contains:
 
 ```text
@@ -42,8 +46,7 @@ executable.
   (`SDL_GetVersion` == 3.4.10; the bridge `dlopen`s and exports the
   `zan_gpu_*` ABI).
 
-The `*.dylib` / `*.so` / `*.dll` binaries are git-ignored per target; only the
-committed `zan_sdl3.bundle` manifest records what to bundle. Each platform
-directory must export the same `zan_sdl_*` / `zan_gpu_*` ABI. Linux (Vulkan)
-and Windows (D3D12) native builds are still pending; macOS Metal (arm64 native,
-x64 under Rosetta) is currently verified.
+Compiled binaries and `zan_sdl3.bundle` manifests are committed per target so
+the stdlib works without a separate artifact download. The drivers workflow
+refreshes the bundles. Each platform directory must export the same
+`zan_sdl_*` / `zan_gpu_*` ABI.

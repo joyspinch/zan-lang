@@ -25,8 +25,8 @@ override with `--driver-dir`. `<target>` mirrors the cross-compile toolchain
 names. See the SQLite driver README for link-mode details — the behavior is
 identical.
 
-## Binaries are not committed
+## Committed bundles
 
-Only the layout + `pq.bundle` manifests are tracked; the driver binaries
-themselves are gitignored (see `.gitignore`) and dropped in per target by the
-developer / release-assembly step.
+The manifests and compiled driver binaries are tracked per target so the
+stdlib works without a separate artifact download. The drivers workflow
+refreshes these bundles.
