@@ -1,0 +1,172 @@
+name: release
+
+# Build the self-contained Zan IDE / toolchain bundle for each platform and,
+# on a version tag, attach the archives + SHA256SUMS to a GitHub Release.
+#
+# Triggers:
+#   - workflow_dispatch : build + package on demand (artifacts only)
+#   - push tags v*      : build + package + publish a GitHub Release
+#   - pull_request (this file): validate build + package without releasing
+#
+# Layout produced per platform mirrors docs/RELEASE.md:
+#   <bundle>/ ZanIDE[.exe] (Windows only, for now) + <gui runtime>
+#             toolchain/{zanc, zan-lsp, zan-dap, zanpkg, zanfmt, zandoc, ...}
+#             stdlib/ templates/ examples/ README.txt VERSION
+#
+# NOTE: the IDE binary itself is currently Windows-only (clang-cl + SDL3). The
+# Linux/macOS bundles ship the compiler + CLIs + stdlib as an SDK until the
+# cross-platform IDE build recipe (docs/RELEASE.md 5.2) lands.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/release.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  # --------------------------------------------------------------- Linux ----
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "17.0"
+          cached: true
+      - run: echo "LLVM_DIR=$LLVM_PATH/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+      - name: Install deps
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list \
+                     /etc/apt/sources.list.d/azure-cli.sources || true
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Build toolchain
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" \
+            -DZAN_BUILD_GUI=OFF -DZAN_BUILD_SDL3=OFF -DZAN_BUILD_GUI_TESTS=OFF
+          cmake --build build -j --target zanc zan-lsp zan-dap zanpkg zanfmt zandoc
+
+      - name: Package bundle
+        run: bash scripts/package_bundle.sh linux ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zan-ide-linux-${{ matrix.arch }}
+          path: out/*.tar.gz*
+
+  # --------------------------------------------------------------- macOS ----
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-14 }
+          - { arch: x64,   runner: macos-13 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM + deps
+        run: |
+          brew install llvm@17 ninja
+          echo "LLVM_DIR=$(brew --prefix llvm@17)/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+      - name: Build toolchain
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$LLVM_DIR" \
+            -DZAN_BUILD_GUI=OFF -DZAN_BUILD_SDL3=OFF -DZAN_BUILD_GUI_TESTS=OFF
+          cmake --build build -j --target zanc zan-lsp zan-dap zanpkg zanfmt zandoc
+
+      - name: Package bundle
+        run: bash scripts/package_bundle.sh macos ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zan-ide-macos-${{ matrix.arch }}
+          path: out/*.tar.gz*
+
+  # ------------------------------------------------------------- Windows ----
+  # Full IDE bundle: reproduces the local build (clang-cl + LLVM + staged SDL3 +
+  # bundled MinGW linker), then build_ide.ps1 + publish_ide.ps1.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM (libs + clang-cl/llvm-rc)
+        run: choco install llvm --no-progress -y
+      - name: Install MinGW (bundled linker source for self-contained zanc)
+        run: choco install mingw --no-progress -y
+
+      - name: Configure + build toolchain (clang-cl)
+        shell: pwsh
+        run: |
+          $llvm = "C:/Program Files/LLVM"
+          $mingw = (Split-Path -Parent (Split-Path -Parent (Get-Command gcc).Source))
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_LINKER=lld-link -DLLVM_DIR="$llvm/lib/cmake/llvm" `
+            -DZAN_MINGW_ROOT="$mingw"
+          cmake --build build -j
+
+      - name: Build IDE
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts\build_ide.ps1
+
+      - name: Publish self-contained bundle
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1 -SkipBuild
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $v = (Get-Content VERSION).Trim()
+          New-Item -ItemType Directory -Force out | Out-Null
+          $name = "zan-ide-$v-win-x64"
+          Rename-Item dist $name
+          Compress-Archive -Path $name -DestinationPath "out/$name.zip"
+          (Get-FileHash "out/$name.zip" -Algorithm SHA256).Hash + "  $name.zip" |
+            Set-Content "out/$name.zip.sha256"
+          Rename-Item $name dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zan-ide-win-x64
+          path: out/*
+
+  # ------------------------------------------------------------- Release ----
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out }
+      - name: Collect + aggregate checksums
+        run: |
+          cd out
+          find . -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec mv {} . \;
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt 2>/dev/null || \
+            shasum -a 256 *.zip *.tar.gz > SHA256SUMS.txt
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.zip
+            out/*.tar.gz
+            out/SHA256SUMS.txt
