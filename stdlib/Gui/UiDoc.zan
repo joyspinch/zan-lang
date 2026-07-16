@@ -133,10 +133,6 @@ class UiDoc {
         // an explicit id must win over the text-derived one.
         if (node.Has("name")) { c.name = node.Str("name", c.name); }
 
-        if (c.bindPath != "" && c.bindProp == "") {
-            c.bindProp = UiDoc.DefaultBindProp(c);
-        }
-
         if (node.Has("children")) {
             JsonValue kids = node.Get("children");
             if (kids != null && kids.IsArray()) {
@@ -292,26 +288,21 @@ class UiDoc {
         return false;
     }
 
-    static string DefaultBindProp(Control c) {
-        if (UiDoc.HasProp(c, "value")) { return "value"; }
-        if (UiDoc.HasProp(c, "text")) { return "text"; }
-        return "";
-    }
-
     void SyncFromNode(Control c) {
         if (c.bindPath != "") {
             JsonValue v = model.PathGet(c.bindPath);
             if (v != null) {
                 string s = v.AsString("");
                 if (c.bindProp != "") {
-                    if (c.GetProp(c.bindProp) != s) {
-                        c.SetProp(c.bindProp, s);
-                    }
+                    c.SetProp(c.bindProp, s);
+                } else if (UiDoc.HasProp(c, "value")) {
+                    c.SetProp("value", s);
+                } else if (UiDoc.HasProp(c, "text")) {
+                    c.SetProp("text", s);
                 } else {
                     c.SetProp("value", s);
                 }
             }
-            c.bindSnapshot = BoundValue(c);
         }
         int j = 0;
         while (j < c.children.Count) {
@@ -334,6 +325,15 @@ class UiDoc {
         string s = c.GetProp("value");
         if (s == "") { s = c.GetProp("text"); }
         return s;
+    }
+
+    void CaptureBindings(Control c) {
+        if (c.bindPath != "") { c.bindSnapshot = BoundValue(c); }
+        int i = 0;
+        while (i < c.children.Count) {
+            CaptureBindings(c.children[i]);
+            i = i + 1;
+        }
     }
 
     void SyncChangedNode(Control c) {
@@ -375,14 +375,20 @@ class UiDoc {
         }
     }
 
-    /// Renders the document inside an existing frame with live bindings.
+    /// Renders the document into an arbitrary sub-rectangle of a frame that a
+    /// host (e.g. the IDE) has already begun, instead of taking over the whole
+    /// window via Run(). Call once per frame after App.BeginFrame(): it pushes
+    /// state -> UI, lays the tree out at (x,y,w,h), paints it (widgets handle
+    /// their own input during paint), then captures UI -> state. Handlers must
+    /// be wired once up front with Wire().
     void RenderInto(App app, int x, int y, int w, int h) {
-        SyncFromModel();
         if (root == null) { return; }
+        SyncFromModel();
+        CaptureBindings(root);
         root.MeasureTree(app);
         root.Arrange(x, y, w, h);
         root.RenderTree(app);
-        if (model != null) { SyncChangedNode(root); }
+        SyncChangedNode(root);
     }
 
     void Run(string title, int w, int h) {
@@ -403,8 +409,9 @@ class UiDoc {
             if (!app.needsRedraw) { continue; }
             app.BeginFrame();
             SyncFromModel();
+            if (root != null) { CaptureBindings(root); }
             f.RenderFrame(app);
-            if (model != null && root != null) { SyncChangedNode(root); }
+            if (root != null) { SyncChangedNode(root); }
             app.RenderChrome(title);
             app.PresentFrame();
         }

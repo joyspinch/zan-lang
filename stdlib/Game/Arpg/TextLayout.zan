@@ -1,0 +1,262 @@
+using System;
+
+namespace Game.Arpg;
+
+class ArpgRichTextLayoutItem {
+    int runIndex;
+    int line;
+    string text;
+    int x;
+    int y;
+    int width;
+    int height;
+
+    static ArpgRichTextLayoutItem Create(
+        int runIndex,
+        int line,
+        string text,
+        int x,
+        int y,
+        int width,
+        int height
+    ) {
+        ArpgRichTextLayoutItem item = new ArpgRichTextLayoutItem();
+        item.runIndex = runIndex;
+        item.line = line;
+        item.text = text;
+        item.x = x;
+        item.y = y;
+        item.width = width;
+        item.height = height;
+        return item;
+    }
+
+    int RunIndex() { return this.runIndex; }
+    int Line() { return this.line; }
+    string Text() { return this.text; }
+    int X() { return this.x; }
+    int Y() { return this.y; }
+    int Width() { return this.width; }
+    int Height() { return this.height; }
+    void OffsetX(int offset) { this.x = this.x + offset; }
+}
+
+class ArpgRichTextLayout {
+    List<ArpgRichTextLayoutItem> items;
+    int width;
+    int height;
+    int lineCount;
+
+    static ArpgRichTextLayout Create() {
+        ArpgRichTextLayout layout = new ArpgRichTextLayout();
+        layout.items = new List<ArpgRichTextLayoutItem>();
+        layout.width = 0;
+        layout.height = 0;
+        layout.lineCount = 0;
+        return layout;
+    }
+
+    int ItemCount() { return this.items.Count; }
+    ArpgRichTextLayoutItem ItemAt(int index) {
+        return this.items[index];
+    }
+    int Width() { return this.width; }
+    int Height() { return this.height; }
+    int LineCount() { return this.lineCount; }
+
+    void Add(ArpgRichTextLayoutItem item) { this.items.Add(item); }
+    void SetSize(int width, int height, int lineCount) {
+        this.width = width;
+        this.height = height;
+        this.lineCount = lineCount;
+    }
+}
+
+class ArpgTextMetrics {
+    static int NextUtf8(string text, int index) {
+        int first = text[index] & 255;
+        if (first < 128) { return index + 1; }
+        if (first < 224) { return index + 2; }
+        if (first < 240) { return index + 3; }
+        return index + 4;
+    }
+
+    static int GlyphWidth(string glyph, int fontSize) {
+        if (glyph.Length == 1) {
+            string ch = glyph.Substring(0, 1);
+            if (ch == " " || ch == "\t") {
+                return ArpgMath.Max(1, fontSize / 3);
+            }
+            return ArpgMath.Max(1, fontSize * 3 / 5);
+        }
+        return fontSize;
+    }
+
+    static int Measure(string text, int fontSize) {
+        int width = 0;
+        int index = 0;
+        while (index < text.Length) {
+            int next = NextUtf8(text, index);
+            if (next > text.Length) { next = text.Length; }
+            width = width + GlyphWidth(
+                text.Substring(index, next - index), fontSize);
+            index = next;
+        }
+        return width;
+    }
+}
+
+class ArpgRichTextLayouter {
+    static ArpgRichTextLayout Layout(
+        ArpgRichTextDocument document,
+        int availableWidth,
+        int fontSize,
+        int lineSpacing,
+        bool wrap,
+        int horizontalAlign
+    ) {
+        ArpgRichTextLayout layout = ArpgRichTextLayout.Create();
+        List<int> lineWidths = new List<int>();
+        int line = 0;
+        int x = 0;
+        int y = 0;
+        int lineHeight = ArpgMath.Max(1, fontSize);
+        int maximumWidth = availableWidth;
+        if (maximumWidth <= 0) { maximumWidth = 2147483647; }
+
+        int runIndex = 0;
+        while (runIndex < document.RunCount()) {
+            ArpgRichTextRun run = document.RunAt(runIndex);
+            if (run.Kind() == ArpgRichTextRunKind.LineBreak()) {
+                lineWidths.Add(x);
+                line = line + 1;
+                x = 0;
+                y = y + lineHeight + lineSpacing;
+                lineHeight = ArpgMath.Max(1, fontSize);
+            } else if (run.Kind() == ArpgRichTextRunKind.WrapWidth()) {
+                if (run.Width() > 0) { maximumWidth = run.Width(); }
+            } else if (run.Kind() == ArpgRichTextRunKind.Text()) {
+                int index = 0;
+                int segmentStart = 0;
+                int segmentWidth = 0;
+                string runText = run.Text();
+                string glyph = "";
+                while (index < runText.Length) {
+                    int next = ArpgTextMetrics.NextUtf8(runText, index);
+                    if (next > runText.Length) {
+                        next = runText.Length;
+                    }
+                    glyph = runText.Substring(
+                        index, next - index);
+                    int glyphWidth = ArpgTextMetrics.GlyphWidth(
+                        glyph, fontSize);
+                    if (glyph == "\n") {
+                        if (index > segmentStart) {
+                            string lineText = runText.Substring(
+                                segmentStart, index - segmentStart);
+                            ArpgRichTextLayoutItem lineItem =
+                                ArpgRichTextLayoutItem.Create(
+                                runIndex, line,
+                                lineText,
+                                x, y, segmentWidth, lineHeight);
+                            layout.Add(lineItem);
+                            x = x + segmentWidth;
+                        }
+                        lineWidths.Add(x);
+                        line = line + 1;
+                        x = 0;
+                        y = y + lineHeight + lineSpacing;
+                        lineHeight = ArpgMath.Max(1, fontSize);
+                        segmentStart = next;
+                        segmentWidth = 0;
+                    } else if (wrap
+                        && x + segmentWidth + glyphWidth > maximumWidth
+                        && x + segmentWidth > 0) {
+                        if (index > segmentStart) {
+                            string wrapText = runText.Substring(
+                                segmentStart, index - segmentStart);
+                            ArpgRichTextLayoutItem wrapItem =
+                                ArpgRichTextLayoutItem.Create(
+                                runIndex, line,
+                                wrapText,
+                                x, y, segmentWidth, lineHeight);
+                            layout.Add(wrapItem);
+                        }
+                        lineWidths.Add(x + segmentWidth);
+                        line = line + 1;
+                        x = 0;
+                        y = y + lineHeight + lineSpacing;
+                        lineHeight = ArpgMath.Max(1, fontSize);
+                        segmentStart = index;
+                        segmentWidth = glyphWidth;
+                    } else {
+                        segmentWidth = segmentWidth + glyphWidth;
+                    }
+                    index = next;
+                }
+                if (segmentStart < runText.Length) {
+                    string tailText = runText.Substring(segmentStart);
+                    ArpgRichTextLayoutItem tailItem =
+                        ArpgRichTextLayoutItem.Create(
+                        runIndex, line, tailText,
+                        x, y, segmentWidth, lineHeight);
+                    layout.Add(tailItem);
+                    x = x + segmentWidth;
+                }
+            } else {
+                int width = run.Width();
+                int height = run.Height();
+                if (width <= 0) { width = fontSize; }
+                if (height <= 0) { height = fontSize; }
+                if (run.Kind() == ArpgRichTextRunKind.Spacer()) {
+                    height = lineHeight;
+                }
+                if (wrap && x + width > maximumWidth && x > 0) {
+                    lineWidths.Add(x);
+                    line = line + 1;
+                    x = 0;
+                    y = y + lineHeight + lineSpacing;
+                    lineHeight = ArpgMath.Max(1, fontSize);
+                }
+                if (height > lineHeight) { lineHeight = height; }
+                ArpgRichTextLayoutItem resourceItem =
+                    ArpgRichTextLayoutItem.Create(
+                    runIndex, line, "", x + run.OffsetX(),
+                    y + run.OffsetY(), width, height);
+                layout.Add(resourceItem);
+                x = x + width;
+            }
+            runIndex = runIndex + 1;
+        }
+
+        lineWidths.Add(x);
+        int contentWidth = 0;
+        int i = 0;
+        while (i < lineWidths.Count) {
+            if (lineWidths[i] > contentWidth) {
+                contentWidth = lineWidths[i];
+            }
+            i = i + 1;
+        }
+
+        if (availableWidth > 0
+            && horizontalAlign != ArpgTextAlign.Start()) {
+            i = 0;
+            while (i < layout.ItemCount()) {
+                ArpgRichTextLayoutItem item = layout.ItemAt(i);
+                int offset = availableWidth - lineWidths[item.Line()];
+                if (horizontalAlign == ArpgTextAlign.Center()) {
+                    offset = offset / 2;
+                }
+                item.OffsetX(ArpgMath.Max(0, offset));
+                i = i + 1;
+            }
+        }
+
+        layout.SetSize(
+            contentWidth,
+            y + lineHeight,
+            line + 1);
+        return layout;
+    }
+}

@@ -21,4 +21,4 @@ On Windows, run:
 
 This downloads the pinned official SDL release, builds `zan_sdl3.dll`, and
 stages the runtime and import libraries under
-`stdlib/SDL3/drivers/win-x64/`. Driver binaries are intentionally gitignored.
+`stdlib/SDL3/drivers/win-x64/`. Driver binaries are committed per target.

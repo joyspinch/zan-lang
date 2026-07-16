@@ -1,0 +1,101 @@
+// Exercises the Game.Rts.Formats SHP(TS) parser/decoder on an in-memory sprite
+// with two frames: frame 0 uses format 3 (row RLE-zero, incl. transparent runs)
+// and frame 1 uses format 1 (uncompressed). Clean-room: the sprite is synthesized
+// here, no original assets are embedded.
+using System;
+using Game.Rts.Formats;
+
+namespace T;
+
+class W {
+    string buf;
+    int pos;
+
+    static W On(string buf) {
+        W w = new W();
+        w.buf = buf;
+        w.pos = 0;
+        return w;
+    }
+    void U8(int v) {
+        this.buf[this.pos] = (char)(v & 0xFF);
+        this.pos = this.pos + 1;
+    }
+    void U16(int v) {
+        this.U8(v & 0xFF);
+        this.U8((v >> 8) & 0xFF);
+    }
+    void U32(int v) {
+        this.U16(v & 0xFFFF);
+        this.U16((v >> 16) & 0xFFFF);
+    }
+    int Pos() { return this.pos; }
+    void SeekTo(int p) { this.pos = p; }
+}
+
+class Program {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    static string Row(ShpImage s, int frame, int y, int w) {
+        string px = s.DecodeFrame(frame);
+        string line = "";
+        int x = 0;
+        while (x < w) {
+            if (x > 0) { line = line + ","; }
+            line = line + Convert.ToString(px[y * w + x] & 0xFF);
+            x = x + 1;
+        }
+        return line;
+    }
+
+    static void Main() {
+        // 4x2 sprite, 2 frames. Header 8 + 2*24 frame headers = 56.
+        int frame0Off = 56;
+        // frame0 (format 3): row0 = 5,0,0,7 -> [05 00 02 07] len=4 -> word 6
+        //                    row1 = 0,0,3,0 -> [00 02 03 00 01] len=5 -> word 7
+        // frame0 data = 2+4 + 2+5 = 13 bytes
+        int frame1Off = frame0Off + 13;   // 69
+
+        string buf = calloc(256, 1);
+        W w = W.On(buf);
+
+        // header
+        w.U16(0);      // zero
+        w.U16(4);      // width
+        w.U16(2);      // height
+        w.U16(2);      // frame count
+
+        // frame header 0 (format 3)
+        w.U16(0); w.U16(0); w.U16(4); w.U16(2);
+        w.U32(3); w.U32(0); w.U32(0); w.U32(frame0Off);
+        // frame header 1 (format 1)
+        w.U16(0); w.U16(0); w.U16(4); w.U16(2);
+        w.U32(1); w.U32(0); w.U32(0); w.U32(frame1Off);
+
+        // frame 0 data (format 3)
+        w.SeekTo(frame0Off);
+        w.U16(6); w.U8(5); w.U8(0); w.U8(2); w.U8(7);
+        w.U16(7); w.U8(0); w.U8(2); w.U8(3); w.U8(0); w.U8(1);
+
+        // frame 1 data (format 1, uncompressed 4x2)
+        w.SeekTo(frame1Off);
+        w.U8(1); w.U8(2); w.U8(3); w.U8(4);
+        w.U8(5); w.U8(6); w.U8(7); w.U8(8);
+
+        ShpImage s = ShpImage.Parse(buf, 256);
+        Console.WriteLine("w=" + Convert.ToString(s.Width()));
+        Console.WriteLine("h=" + Convert.ToString(s.Height()));
+        Console.WriteLine("frames=" + Convert.ToString(s.FrameCount()));
+        Console.WriteLine("f0fmt=" + Convert.ToString(s.FrameAt(0).Format()));
+        Console.WriteLine("f1fmt=" + Convert.ToString(s.FrameAt(1).Format()));
+        Console.WriteLine("f0r0=" + Program.Row(s, 0, 0, 4));
+        Console.WriteLine("f0r1=" + Program.Row(s, 0, 1, 4));
+        Console.WriteLine("f1r0=" + Program.Row(s, 1, 0, 4));
+        Console.WriteLine("f1r1=" + Program.Row(s, 1, 1, 4));
+
+        free(buf);
+    }
+}
