@@ -10,7 +10,14 @@ Set-Location $root
 $driverDir = Join-Path $root "stdlib\SDL3\drivers\win-x64"
 $cache = Get-ChildItem "$env:TEMP" -Filter "zan-sdl3-*" -Directory `
     | Sort-Object Name -Descending | Select-Object -First 1
-if (-not $cache) { Write-Output "SDL3_STAGE_MISSING"; exit 1 }
+if (-not $cache) {
+    Write-Output "SDL3 devel package not staged; running stage_sdl3.ps1 ..."
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "stage_sdl3.ps1")
+    if ($LASTEXITCODE -ne 0) { Write-Output "SDL3_STAGE_FAILED"; exit 1 }
+    $cache = Get-ChildItem "$env:TEMP" -Filter "zan-sdl3-*" -Directory `
+        | Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $cache) { Write-Output "SDL3_STAGE_MISSING"; exit 1 }
+}
 $pkg = Join-Path $cache.FullName ((Get-ChildItem $cache.FullName -Filter "SDL3-*" -Directory | Select-Object -First 1).Name)
 $pkg = Join-Path $pkg "x86_64-w64-mingw32"
 $inc = Join-Path $pkg "include"
