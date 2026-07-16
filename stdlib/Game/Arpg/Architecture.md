@@ -26,7 +26,8 @@ model while exposing typed Zan APIs.
 10. `RichText` converts evaluated content into typed text, image, animation,
     item, spacing, wrapping and hyperlink runs.
 11. `UiRuntime` owns the DM-style graphical window/control/node tree,
-    hit-testing, focus, dragging, event bubbling and SDL rendering.
+    hit-testing, focus, dragging and event bubbling; `UiRenderer` adapts it
+    to SDL rendering.
 
 Definitions are intentionally independent from serialization. A project can be
 assembled in Zan, generated from `legend2.project.json`, or supplied by a future
