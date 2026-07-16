@@ -1,0 +1,310 @@
+using System;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+
+namespace Game.Dm;
+
+// Parsed DM3 WebSocketClient 地址 (ws:// or wss://). Splits scheme / host /
+// port / path; the port defaults to 80 (ws) or 443 (wss) when omitted.
+class WsUrl {
+    string scheme;
+    string host;
+    int port;
+    string path;
+    bool secure;
+
+    static int DigitsToInt(string s, int start, int end) {
+        int v = 0;
+        int i = start;
+        while (i < end) {
+            int c = s[i] & 0xFF;
+            if (c < 48 || c > 57) { return v; }
+            v = v * 10 + (c - 48);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static WsUrl Parse(string url) {
+        WsUrl u = new WsUrl();
+        u.scheme = "ws";
+        u.secure = false;
+        u.port = 80;
+        u.path = "/";
+        u.host = "";
+
+        int len = url.Length;
+        int idx = 0;
+        // scheme: "wss://" = w s s : / /  ;  "ws://" = w s : / /
+        if (len >= 6 && (url[0] & 0xFF) == 119 && (url[1] & 0xFF) == 115 &&
+            (url[2] & 0xFF) == 115 && (url[3] & 0xFF) == 58 &&
+            (url[4] & 0xFF) == 47 && (url[5] & 0xFF) == 47) {
+            u.scheme = "wss";
+            u.secure = true;
+            u.port = 443;
+            idx = 6;
+        } else if (len >= 5 && (url[0] & 0xFF) == 119 && (url[1] & 0xFF) == 115 &&
+                   (url[2] & 0xFF) == 58 && (url[3] & 0xFF) == 47 && (url[4] & 0xFF) == 47) {
+            idx = 5;
+        }
+
+        // authority runs until the first '/' (or end)
+        int slash = idx;
+        while (slash < len && (url[slash] & 0xFF) != 47) { slash = slash + 1; }
+
+        // split authority into host[:port]
+        int colon = idx;
+        bool hasColon = false;
+        int j = idx;
+        while (j < slash) {
+            if ((url[j] & 0xFF) == 58) { colon = j; hasColon = true; break; }
+            j = j + 1;
+        }
+        if (hasColon) {
+            u.host = url.Substring(idx, colon - idx);
+            u.port = WsUrl.DigitsToInt(url, colon + 1, slash);
+        } else {
+            u.host = url.Substring(idx, slash - idx);
+        }
+
+        if (slash < len) {
+            u.path = url.Substring(slash, len - slash);
+        }
+        return u;
+    }
+
+    string Scheme() { return this.scheme; }
+    string Host() { return this.host; }
+    int Port() { return this.port; }
+    string Path() { return this.path; }
+    bool Secure() { return this.secure; }
+}
+
+// A DM3 table-format message keyed by a 通信标识 (cid). Framed on the wire as a
+// length-prefixed record so the DmTcpClient/DmTcpServer pairing can recover
+// message boundaries over a stream. This is a clean-room framing (u32 payload
+// length + u32 cid + body), not the proprietary DM3 wire encoding.
+class DmMessage {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    int cid;
+    string body;
+    int bodyLen;
+
+    static DmMessage Of(int cid, string body, int bodyLen) {
+        DmMessage m = new DmMessage();
+        m.cid = cid;
+        m.body = body;
+        m.bodyLen = bodyLen;
+        return m;
+    }
+
+    static DmMessage Text(int cid, string body) {
+        return DmMessage.Of(cid, body, body.Length);
+    }
+
+    int Cid() { return this.cid; }
+    string Body() { return this.body; }
+    int BodyLength() { return this.bodyLen; }
+
+    // Total encoded size: 4 (length) + 4 (cid) + body.
+    int FrameLength() { return 8 + this.bodyLen; }
+
+    string Encode() {
+        int total = 8 + this.bodyLen;
+        string buf = DmMessage.calloc(total + 1, 1);
+        int payload = 4 + this.bodyLen;   // bytes following the length field
+        buf[0] = (char)((payload >> 24) & 0xFF);
+        buf[1] = (char)((payload >> 16) & 0xFF);
+        buf[2] = (char)((payload >> 8) & 0xFF);
+        buf[3] = (char)(payload & 0xFF);
+        buf[4] = (char)((this.cid >> 24) & 0xFF);
+        buf[5] = (char)((this.cid >> 16) & 0xFF);
+        buf[6] = (char)((this.cid >> 8) & 0xFF);
+        buf[7] = (char)(this.cid & 0xFF);
+        int i = 0;
+        while (i < this.bodyLen) {
+            buf[8 + i] = this.body[i];
+            i = i + 1;
+        }
+        return buf;
+    }
+
+    // Decodes the first framed record at the front of `buf`; returns null if
+    // fewer than the declared bytes are present.
+    static DmMessage Decode(string buf, int len) {
+        if (len < 8) { return null; }
+        int payload = ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16) |
+                      ((buf[2] & 0xFF) << 8) | (buf[3] & 0xFF);
+        int total = 4 + payload;
+        if (len < total) { return null; }
+        int cid = ((buf[4] & 0xFF) << 24) | ((buf[5] & 0xFF) << 16) |
+                  ((buf[6] & 0xFF) << 8) | (buf[7] & 0xFF);
+        int bodyLen = payload - 4;
+        string body = DmMessage.calloc(bodyLen + 1, 1);
+        int i = 0;
+        while (i < bodyLen) {
+            body[i] = buf[8 + i];
+            i = i + 1;
+        }
+        return DmMessage.Of(cid, body, bodyLen);
+    }
+}
+
+// Live TCP client runtime for the DM3 DmTcpClient component. Binds a
+// TcpClientConfig to a real reactor-driven socket and exchanges length-framed
+// DmMessages.
+class DmTcpClientRuntime {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    TcpClientConfig config;
+    int sock;
+    bool connected;
+    string recvBuf;
+
+    static DmTcpClientRuntime FromConfig(TcpClientConfig config) {
+        DmTcpClientRuntime c = new DmTcpClientRuntime();
+        c.config = config;
+        c.sock = -1;
+        c.connected = false;
+        c.recvBuf = null;
+        return c;
+    }
+
+    // Wraps an already-accepted server-side socket.
+    static DmTcpClientRuntime FromSocket(TcpClientConfig config, int sock) {
+        DmTcpClientRuntime c = new DmTcpClientRuntime();
+        c.config = config;
+        c.sock = sock;
+        c.connected = true;
+        c.recvBuf = null;
+        return c;
+    }
+
+    bool IsConnected() { return this.connected; }
+    int Handle() { return this.sock; }
+
+    async void ConnectAsync() {
+        Socket.Initialize();
+        this.sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(this.sock);
+        int _rc = await AsyncSocket.Connect(this.sock, this.config.Ip(), this.config.Port());
+        this.connected = true;
+    }
+
+    async int SendMessageAsync(DmMessage message) {
+        string buf = message.Encode();
+        int n = await AsyncSocket.Send(this.sock, buf, message.FrameLength());
+        free(buf);
+        return n;
+    }
+
+    // Receives one framed message (assumes a single small message arrives in one
+    // read, which holds for the loopback/control traffic tested here).
+    async DmMessage ReceiveMessageAsync() {
+        int cap = this.config.MessageLength();
+        if (this.recvBuf == null) {
+            this.recvBuf = calloc(cap + 1, 1);
+        }
+        int n = await AsyncSocket.ReceiveInto(this.sock, this.recvBuf, cap);
+        if (n <= 0) {
+            this.connected = false;
+            return null;
+        }
+        return DmMessage.Decode(this.recvBuf, n);
+    }
+
+    void Close() {
+        if (this.connected) {
+            Socket.Close(this.sock);
+            this.connected = false;
+            this.sock = -1;
+        }
+        if (this.recvBuf != null) {
+            free(this.recvBuf);
+            this.recvBuf = null;
+        }
+    }
+}
+
+// Live TCP server runtime for the DM3 Server.lua (DmTcpServer). Binds a
+// ServerConfig to a listening socket and accepts DmTcpClient connections.
+class DmTcpServerRuntime {
+    ServerConfig config;
+    int listener;
+    bool running;
+
+    static async DmTcpServerRuntime StartAsync(ServerConfig config, string bindHost) {
+        Socket.Initialize();
+        DmTcpServerRuntime s = new DmTcpServerRuntime();
+        s.config = config;
+        s.listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(s.listener);
+        Socket.Bind(s.listener, bindHost, config.Port());
+        Socket.Listen(s.listener, 16);
+        Socket.SetNonBlocking(s.listener);
+        s.running = true;
+        return s;
+    }
+
+    async int AcceptAsync() {
+        int client = await AsyncSocket.Accept(this.listener);
+        Socket.SetNonBlocking(client);
+        return client;
+    }
+
+    bool IsRunning() { return this.running; }
+    int Port() { return this.config.Port(); }
+
+    void Stop() {
+        if (this.running) {
+            Socket.Close(this.listener);
+            this.running = false;
+        }
+    }
+}
+
+// Live WebSocket client runtime for the DM3 WebSocketClient component. Parses
+// the config 地址 and delegates the RFC 6455 handshake/framing to
+// System.Net.WebSocket.WebSocketClient.
+class DmWebSocketRuntime {
+    WebSocketClientConfig config;
+    WsUrl url;
+    WebSocketClient ws;
+    bool connected;
+
+    static DmWebSocketRuntime FromConfig(WebSocketClientConfig config) {
+        DmWebSocketRuntime r = new DmWebSocketRuntime();
+        r.config = config;
+        r.url = WsUrl.Parse(config.Url());
+        r.connected = false;
+        return r;
+    }
+
+    WsUrl Url() { return this.url; }
+    bool IsConnected() { return this.connected; }
+
+    async void ConnectAsync() {
+        this.ws = await WebSocketClient.ConnectAsync(this.url.Host(), this.url.Port(), this.url.Path());
+        this.connected = this.ws.IsConnected();
+    }
+
+    async void SendText(string text) {
+        await this.ws.SendText(text);
+    }
+
+    async string RecvText() {
+        return await this.ws.RecvText();
+    }
+
+    async void Close() {
+        if (this.connected) {
+            await this.ws.Close();
+            this.connected = false;
+        }
+    }
+}

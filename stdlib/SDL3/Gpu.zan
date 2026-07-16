@@ -1,0 +1,159 @@
+using System;
+
+namespace SDL3;
+
+/// <summary>
+/// ABI-safe native bridge for the SDL_GPU sprite pipeline (Metal/Vulkan/D3D12).
+///
+/// All handles and coordinates are 64-bit integers so the ABI matches the rest
+/// of <see cref="SdlNative"/>; pixel buffers are passed as raw byte strings.
+/// </summary>
+class SdlGpuNative {
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_create(int window);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_create_offscreen(int width, int height);
+
+    [DllImport("zan_sdl3")]
+    static extern void zan_gpu_destroy(int handle);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_load_texture(int handle, int width, int height, string pixels);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_solid_texture(int handle, int width, int height);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_load_bmp(int handle, string path);
+
+    [DllImport("zan_sdl3")]
+    static extern void zan_gpu_free_texture(int handle, int texture);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_texture_width(int texture);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_texture_height(int texture);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_begin(int handle, int red, int green, int blue, int alpha);
+
+    [DllImport("zan_sdl3")]
+    static extern void zan_gpu_draw(int handle, int texture,
+        int dstX, int dstY, int dstW, int dstH,
+        int srcX, int srcY, int srcW, int srcH,
+        int red, int green, int blue, int alpha);
+
+    [DllImport("zan_sdl3")]
+    static extern void zan_gpu_end(int handle);
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_gpu_read_pixel(int handle, int x, int y);
+}
+
+/// <summary>A GPU texture owned by an <see cref="SdlGpu"/> context.</summary>
+class SdlGpuTexture {
+    int context;
+    int handle;
+
+    bool IsValid() { return this.handle != 0; }
+    int Handle() { return this.handle; }
+    int Width() { return SdlGpuNative.zan_gpu_texture_width(this.handle); }
+    int Height() { return SdlGpuNative.zan_gpu_texture_height(this.handle); }
+
+    void Free() {
+        if (this.handle != 0) {
+            SdlGpuNative.zan_gpu_free_texture(this.context, this.handle);
+            this.handle = 0;
+        }
+    }
+}
+
+/// <summary>
+/// SDL_GPU sprite renderer: acquires a swapchain (or an offscreen target),
+/// batches textured quads per frame and submits them to the GPU. The backend
+/// (Metal on macOS, Vulkan on Linux, D3D12 on Windows) is chosen by SDL.
+/// </summary>
+class SdlGpu {
+    int handle;
+
+    /// <summary>Creates a GPU context that presents to <paramref name="window"/>.</summary>
+    static SdlGpu Create(SdlWindow window) {
+        SdlGpu gpu = new SdlGpu();
+        gpu.handle = SdlGpuNative.zan_gpu_create(window.Handle());
+        return gpu;
+    }
+
+    /// <summary>Creates a windowless context that renders into a width x height
+    /// target readable via <see cref="ReadPixel"/>. Useful for headless tests.</summary>
+    static SdlGpu CreateOffscreen(int width, int height) {
+        SdlGpu gpu = new SdlGpu();
+        gpu.handle = SdlGpuNative.zan_gpu_create_offscreen(width, height);
+        return gpu;
+    }
+
+    bool IsValid() { return this.handle != 0; }
+    int Handle() { return this.handle; }
+
+    /// <summary>Uploads tightly packed RGBA32 pixels as a sampler texture.</summary>
+    SdlGpuTexture LoadTexture(int width, int height, string pixels) {
+        SdlGpuTexture tex = new SdlGpuTexture();
+        tex.context = this.handle;
+        tex.handle = SdlGpuNative.zan_gpu_load_texture(this.handle, width, height, pixels);
+        return tex;
+    }
+
+    /// <summary>Creates a solid white texture; tint it via the draw color.</summary>
+    SdlGpuTexture SolidTexture(int width, int height) {
+        SdlGpuTexture tex = new SdlGpuTexture();
+        tex.context = this.handle;
+        tex.handle = SdlGpuNative.zan_gpu_solid_texture(this.handle, width, height);
+        return tex;
+    }
+
+    /// <summary>Loads a BMP file, converting it to RGBA32.</summary>
+    SdlGpuTexture LoadBmp(string path) {
+        SdlGpuTexture tex = new SdlGpuTexture();
+        tex.context = this.handle;
+        tex.handle = SdlGpuNative.zan_gpu_load_bmp(this.handle, path);
+        return tex;
+    }
+
+    /// <summary>Begins a frame and sets the clear color (0-255 per channel).</summary>
+    bool Begin(int red, int green, int blue, int alpha) {
+        return SdlGpuNative.zan_gpu_begin(this.handle, red, green, blue, alpha) != 0;
+    }
+
+    /// <summary>Draws the whole texture into the destination rectangle, tinted.</summary>
+    void Draw(SdlGpuTexture texture, int x, int y, int width, int height,
+              int red, int green, int blue, int alpha) {
+        SdlGpuNative.zan_gpu_draw(this.handle, texture.Handle(),
+            x, y, width, height, 0, 0, 0, 0, red, green, blue, alpha);
+    }
+
+    /// <summary>Draws a source region (in texture pixels) into the destination
+    /// rectangle, tinted. A source width/height of 0 means the whole texture.</summary>
+    void DrawRegion(SdlGpuTexture texture,
+                    int dstX, int dstY, int dstW, int dstH,
+                    int srcX, int srcY, int srcW, int srcH,
+                    int red, int green, int blue, int alpha) {
+        SdlGpuNative.zan_gpu_draw(this.handle, texture.Handle(),
+            dstX, dstY, dstW, dstH, srcX, srcY, srcW, srcH, red, green, blue, alpha);
+    }
+
+    /// <summary>Submits the batched frame to the GPU.</summary>
+    void End() { SdlGpuNative.zan_gpu_end(this.handle); }
+
+    /// <summary>Reads a pixel from the last offscreen frame, packed 0xRRGGBBAA.</summary>
+    int ReadPixel(int x, int y) {
+        return SdlGpuNative.zan_gpu_read_pixel(this.handle, x, y);
+    }
+
+    void Destroy() {
+        if (this.handle != 0) {
+            SdlGpuNative.zan_gpu_destroy(this.handle);
+            this.handle = 0;
+        }
+    }
+}

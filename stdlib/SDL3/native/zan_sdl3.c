@@ -325,3 +325,490 @@ ZAN_SDL_API zan_i64 zan_sdl_key_down(zan_i64 scancode) {
     if (!state || scancode < 0 || scancode >= count) return 0;
     return zan_bool(state[(int)scancode]);
 }
+
+/* ===================================================================
+ * SDL_GPU sprite-batch renderer.
+ *
+ * Higher-level Game.Core/Game.Render code binds these through
+ * [DllImport("zan_sdl3")]. The frame model is:
+ *   ctx = zan_gpu_create(window)
+ *   loop:
+ *     zan_gpu_begin(ctx, clear rgba)
+ *     zan_gpu_draw(ctx, tex, dst rect, uv rect, tint rgba)  // batched
+ *     zan_gpu_end(ctx)                                       // upload+submit
+ *
+ * Draws are accumulated on the CPU and flushed in one render pass, grouped
+ * into runs of the same texture to minimize state changes. Vertex positions
+ * are in framebuffer pixels; the shader maps them to NDC via the drawable
+ * size pushed as a vertex uniform.
+ *
+ * Shaders are provided as Metal Shading Language, so the GPU path is active
+ * on the Metal backend today. SPIR-V (Vulkan/Linux) and DXIL (D3D12/Windows)
+ * variants can be added to enable those backends; until then zan_gpu_create
+ * returns 0 on non-Metal drivers and callers fall back to the 2D renderer.
+ * =================================================================== */
+
+static const char *ZAN_GPU_VS_MSL =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VIn { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; float4 col [[attribute(2)]]; };\n"
+    "struct VOut { float4 pos [[position]]; float2 uv; float4 col; };\n"
+    "struct U { float2 screen; };\n"
+    "vertex VOut vmain(VIn in [[stage_in]], constant U& u [[buffer(0)]]) {\n"
+    "  VOut o;\n"
+    "  float2 n = float2(in.pos.x / u.screen.x * 2.0 - 1.0, 1.0 - in.pos.y / u.screen.y * 2.0);\n"
+    "  o.pos = float4(n, 0.0, 1.0);\n"
+    "  o.uv = in.uv; o.col = in.col;\n"
+    "  return o;\n"
+    "}\n";
+
+static const char *ZAN_GPU_FS_MSL =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VOut { float4 pos [[position]]; float2 uv; float4 col; };\n"
+    "fragment float4 fmain(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {\n"
+    "  return tex.sample(smp, in.uv) * in.col;\n"
+    "}\n";
+
+typedef struct { float x, y, u, v, r, g, b, a; } ZanGpuVertex;
+typedef struct { SDL_GPUTexture *tex; int first; int count; } ZanGpuDraw;
+/* A loaded texture carries its pixel size so draws can specify source
+ * rectangles in pixels (atlas-friendly) and the bridge derives UVs. */
+typedef struct { SDL_GPUTexture *tex; int w, h; } ZanGpuTex;
+
+typedef struct {
+    SDL_GPUDevice *device;
+    SDL_Window *window;
+    SDL_GPUGraphicsPipeline *pipeline;
+    SDL_GPUSampler *sampler;
+    SDL_GPUBuffer *vbuf;
+    Uint32 vbuf_cap;                 /* capacity in vertices */
+    ZanGpuVertex *verts; int vcount, vcap;
+    ZanGpuDraw *draws;   int dcount, dcap;
+    SDL_GPUCommandBuffer *cmd;       /* per-frame */
+    SDL_GPUTexture *swap;            /* per-frame swapchain image */
+    Uint32 fb_w, fb_h;
+    float cr, cg, cb, ca;
+    /* Offscreen mode: render into a fixed target and read pixels back on the
+     * CPU. Enables headless GPU verification with no window/display server. */
+    int offscreen;
+    SDL_GPUTexture *offtex;
+    SDL_GPUTransferBuffer *readbuf;
+    unsigned char *cpu;
+    Uint32 off_w, off_h;
+} ZanGpuCtx;
+
+static SDL_GPUShader *zan_gpu_shader(
+    SDL_GPUDevice *dev, const char *code, const char *entry,
+    SDL_GPUShaderStage stage, Uint32 samplers, Uint32 uniforms) {
+    SDL_GPUShaderCreateInfo ci;
+    memset(&ci, 0, sizeof(ci));
+    ci.code = (const Uint8 *)code; ci.code_size = strlen(code);
+    ci.entrypoint = entry; ci.format = SDL_GPU_SHADERFORMAT_MSL;
+    ci.stage = stage; ci.num_samplers = samplers; ci.num_uniform_buffers = uniforms;
+    return SDL_CreateGPUShader(dev, &ci);
+}
+
+/* Build the sprite pipeline for the given color target format (swapchain
+ * format for windowed contexts, R8G8B8A8 for offscreen). */
+static SDL_GPUGraphicsPipeline *zan_gpu_make_pipeline(
+    SDL_GPUDevice *dev, SDL_GPUTextureFormat fmt) {
+    SDL_GPUShader *vs = zan_gpu_shader(dev, ZAN_GPU_VS_MSL, "vmain",
+        SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+    SDL_GPUShader *fs = zan_gpu_shader(dev, ZAN_GPU_FS_MSL, "fmain",
+        SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
+    if (!vs || !fs) {
+        if (vs) SDL_ReleaseGPUShader(dev, vs);
+        if (fs) SDL_ReleaseGPUShader(dev, fs);
+        return NULL;
+    }
+    SDL_GPUVertexBufferDescription vbd;
+    memset(&vbd, 0, sizeof(vbd));
+    vbd.slot = 0; vbd.pitch = sizeof(ZanGpuVertex);
+    vbd.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+    SDL_GPUVertexAttribute attrs[3];
+    memset(attrs, 0, sizeof(attrs));
+    attrs[0].location = 0; attrs[0].buffer_slot = 0; attrs[0].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2; attrs[0].offset = 0;
+    attrs[1].location = 1; attrs[1].buffer_slot = 0; attrs[1].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2; attrs[1].offset = 8;
+    attrs[2].location = 2; attrs[2].buffer_slot = 0; attrs[2].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4; attrs[2].offset = 16;
+
+    SDL_GPUColorTargetDescription ctd;
+    memset(&ctd, 0, sizeof(ctd));
+    ctd.format = fmt;
+    ctd.blend_state.enable_blend = true;
+    ctd.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+    ctd.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+    ctd.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+    ctd.blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+    ctd.blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+    ctd.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+
+    SDL_GPUGraphicsPipelineCreateInfo pci;
+    memset(&pci, 0, sizeof(pci));
+    pci.vertex_shader = vs; pci.fragment_shader = fs;
+    pci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pci.vertex_input_state.vertex_buffer_descriptions = &vbd;
+    pci.vertex_input_state.num_vertex_buffers = 1;
+    pci.vertex_input_state.vertex_attributes = attrs;
+    pci.vertex_input_state.num_vertex_attributes = 3;
+    pci.target_info.color_target_descriptions = &ctd;
+    pci.target_info.num_color_targets = 1;
+    SDL_GPUGraphicsPipeline *pipe = SDL_CreateGPUGraphicsPipeline(dev, &pci);
+    SDL_ReleaseGPUShader(dev, vs);
+    SDL_ReleaseGPUShader(dev, fs);
+    return pipe;
+}
+
+static SDL_GPUSampler *zan_gpu_make_sampler(SDL_GPUDevice *dev) {
+    SDL_GPUSamplerCreateInfo sci;
+    memset(&sci, 0, sizeof(sci));
+    sci.min_filter = SDL_GPU_FILTER_NEAREST; sci.mag_filter = SDL_GPU_FILTER_NEAREST;
+    sci.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sci.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    return SDL_CreateGPUSampler(dev, &sci);
+}
+
+static void zan_gpu_alloc(ZanGpuCtx *ctx) {
+    ctx->vcap = 4096; ctx->verts = (ZanGpuVertex *)SDL_malloc(sizeof(ZanGpuVertex) * ctx->vcap);
+    ctx->dcap = 256;  ctx->draws = (ZanGpuDraw *)SDL_malloc(sizeof(ZanGpuDraw) * ctx->dcap);
+    ctx->vbuf_cap = 4096;
+    SDL_GPUBufferCreateInfo bci;
+    memset(&bci, 0, sizeof(bci));
+    bci.usage = SDL_GPU_BUFFERUSAGE_VERTEX; bci.size = sizeof(ZanGpuVertex) * ctx->vbuf_cap;
+    ctx->vbuf = SDL_CreateGPUBuffer(ctx->device, &bci);
+}
+
+ZAN_SDL_API zan_i64 zan_gpu_create(zan_i64 window) {
+    SDL_Window *win = (SDL_Window *)zan_ptr(window);
+    if (!win) return 0;
+    SDL_GPUDevice *dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, NULL);
+    if (!dev) return 0;
+    if (!SDL_ClaimWindowForGPUDevice(dev, win)) { SDL_DestroyGPUDevice(dev); return 0; }
+    SDL_GPUTextureFormat fmt = SDL_GetGPUSwapchainTextureFormat(dev, win);
+    SDL_GPUGraphicsPipeline *pipe = zan_gpu_make_pipeline(dev, fmt);
+    if (!pipe) { SDL_ReleaseWindowFromGPUDevice(dev, win); SDL_DestroyGPUDevice(dev); return 0; }
+    ZanGpuCtx *ctx = (ZanGpuCtx *)SDL_calloc(1, sizeof(ZanGpuCtx));
+    ctx->device = dev; ctx->window = win; ctx->pipeline = pipe;
+    ctx->sampler = zan_gpu_make_sampler(dev);
+    zan_gpu_alloc(ctx);
+    return zan_handle(ctx);
+}
+
+/* Windowless GPU context that renders into a WxH target read back on the CPU;
+ * for headless verification and offscreen composition. */
+ZAN_SDL_API zan_i64 zan_gpu_create_offscreen(zan_i64 width, zan_i64 height) {
+    if (width <= 0 || height <= 0) return 0;
+    SDL_GPUDevice *dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, NULL);
+    if (!dev) return 0;
+    SDL_GPUGraphicsPipeline *pipe =
+        zan_gpu_make_pipeline(dev, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM);
+    if (!pipe) { SDL_DestroyGPUDevice(dev); return 0; }
+    ZanGpuCtx *ctx = (ZanGpuCtx *)SDL_calloc(1, sizeof(ZanGpuCtx));
+    ctx->device = dev; ctx->pipeline = pipe;
+    ctx->sampler = zan_gpu_make_sampler(dev);
+    zan_gpu_alloc(ctx);
+    ctx->offscreen = 1; ctx->off_w = (Uint32)width; ctx->off_h = (Uint32)height;
+    SDL_GPUTextureCreateInfo tci;
+    memset(&tci, 0, sizeof(tci));
+    tci.type = SDL_GPU_TEXTURETYPE_2D;
+    tci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    tci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    tci.width = ctx->off_w; tci.height = ctx->off_h;
+    tci.layer_count_or_depth = 1; tci.num_levels = 1;
+    ctx->offtex = SDL_CreateGPUTexture(dev, &tci);
+    SDL_GPUTransferBufferCreateInfo dn;
+    memset(&dn, 0, sizeof(dn));
+    dn.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD; dn.size = ctx->off_w * ctx->off_h * 4;
+    ctx->readbuf = SDL_CreateGPUTransferBuffer(dev, &dn);
+    ctx->cpu = (unsigned char *)SDL_calloc(1, ctx->off_w * ctx->off_h * 4);
+    return zan_handle(ctx);
+}
+
+/* Read one pixel from the last offscreen frame, packed as 0xRRGGBBAA. */
+ZAN_SDL_API zan_i64 zan_gpu_read_pixel(zan_i64 handle, zan_i64 x, zan_i64 y) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx || !ctx->offscreen || !ctx->cpu) return 0;
+    if (x < 0 || y < 0 || (Uint32)x >= ctx->off_w || (Uint32)y >= ctx->off_h) return 0;
+    unsigned char *p = ctx->cpu + ((size_t)((Uint32)y * ctx->off_w + (Uint32)x)) * 4;
+    return ((zan_i64)p[0] << 24) | ((zan_i64)p[1] << 16) |
+           ((zan_i64)p[2] << 8) | (zan_i64)p[3];
+}
+
+ZAN_SDL_API void zan_gpu_destroy(zan_i64 handle) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx) return;
+    if (ctx->vbuf) SDL_ReleaseGPUBuffer(ctx->device, ctx->vbuf);
+    if (ctx->sampler) SDL_ReleaseGPUSampler(ctx->device, ctx->sampler);
+    if (ctx->pipeline) SDL_ReleaseGPUGraphicsPipeline(ctx->device, ctx->pipeline);
+    if (ctx->offtex) SDL_ReleaseGPUTexture(ctx->device, ctx->offtex);
+    if (ctx->readbuf) SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->readbuf);
+    if (ctx->window) SDL_ReleaseWindowFromGPUDevice(ctx->device, ctx->window);
+    if (ctx->device) SDL_DestroyGPUDevice(ctx->device);
+    SDL_free(ctx->cpu); SDL_free(ctx->verts); SDL_free(ctx->draws); SDL_free(ctx);
+}
+
+/* Create a sampler texture from tightly packed RGBA32 pixels. */
+static SDL_GPUTexture *zan_gpu_make_texture(
+    ZanGpuCtx *ctx, int width, int height, const void *pixels) {
+    if (!ctx || !pixels || width <= 0 || height <= 0) return NULL;
+    SDL_GPUTextureCreateInfo tci;
+    memset(&tci, 0, sizeof(tci));
+    tci.type = SDL_GPU_TEXTURETYPE_2D;
+    tci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    tci.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    tci.width = (Uint32)width; tci.height = (Uint32)height;
+    tci.layer_count_or_depth = 1; tci.num_levels = 1;
+    SDL_GPUTexture *tex = SDL_CreateGPUTexture(ctx->device, &tci);
+    if (!tex) return NULL;
+
+    Uint32 bytes = (Uint32)(width * height * 4);
+    SDL_GPUTransferBufferCreateInfo up;
+    memset(&up, 0, sizeof(up));
+    up.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD; up.size = bytes;
+    SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(ctx->device, &up);
+    void *map = SDL_MapGPUTransferBuffer(ctx->device, tb, false);
+    memcpy(map, pixels, bytes);
+    SDL_UnmapGPUTransferBuffer(ctx->device, tb);
+
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
+    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureTransferInfo tti;
+    memset(&tti, 0, sizeof(tti));
+    tti.transfer_buffer = tb; tti.offset = 0;
+    tti.pixels_per_row = (Uint32)width; tti.rows_per_layer = (Uint32)height;
+    SDL_GPUTextureRegion reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.texture = tex; reg.w = (Uint32)width; reg.h = (Uint32)height; reg.d = 1;
+    SDL_UploadToGPUTexture(cp, &tti, &reg, false);
+    SDL_EndGPUCopyPass(cp);
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    SDL_WaitForGPUFences(ctx->device, true, &fence, 1);
+    SDL_ReleaseGPUFence(ctx->device, fence);
+    SDL_ReleaseGPUTransferBuffer(ctx->device, tb);
+    return tex;
+}
+
+static zan_i64 zan_gpu_wrap(SDL_GPUTexture *tex, int w, int h) {
+    if (!tex) return 0;
+    ZanGpuTex *t = (ZanGpuTex *)SDL_malloc(sizeof(ZanGpuTex));
+    t->tex = tex; t->w = w; t->h = h;
+    return zan_handle(t);
+}
+
+ZAN_SDL_API zan_i64 zan_gpu_load_texture(
+    zan_i64 handle, zan_i64 width, zan_i64 height, const void *pixels) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    return zan_gpu_wrap(zan_gpu_make_texture(ctx, (int)width, (int)height, pixels),
+                        (int)width, (int)height);
+}
+
+/* Solid white WxH texture; tint it via zan_gpu_draw color to get any color. */
+ZAN_SDL_API zan_i64 zan_gpu_solid_texture(zan_i64 handle, zan_i64 width, zan_i64 height) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx || width <= 0 || height <= 0) return 0;
+    size_t bytes = (size_t)(width * height * 4);
+    unsigned char *px = (unsigned char *)SDL_malloc(bytes);
+    memset(px, 0xFF, bytes);
+    SDL_GPUTexture *tex = zan_gpu_make_texture(ctx, (int)width, (int)height, px);
+    SDL_free(px);
+    return zan_gpu_wrap(tex, (int)width, (int)height);
+}
+
+/* Load a BMP file as an RGBA sampler texture. */
+ZAN_SDL_API zan_i64 zan_gpu_load_bmp(zan_i64 handle, const char *path) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx || !path) return 0;
+    SDL_Surface *s = SDL_LoadBMP(path);
+    if (!s) return 0;
+    SDL_Surface *rgba = SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGBA32);
+    SDL_DestroySurface(s);
+    if (!rgba) return 0;
+    SDL_GPUTexture *tex = NULL;
+    int tw = rgba->w, th = rgba->h;
+    if (rgba->pitch == rgba->w * 4) {
+        tex = zan_gpu_make_texture(ctx, rgba->w, rgba->h, rgba->pixels);
+    } else {
+        unsigned char *packed = (unsigned char *)SDL_malloc((size_t)rgba->w * rgba->h * 4);
+        for (int y = 0; y < rgba->h; y++)
+            memcpy(packed + (size_t)y * rgba->w * 4,
+                   (unsigned char *)rgba->pixels + (size_t)y * rgba->pitch,
+                   (size_t)rgba->w * 4);
+        tex = zan_gpu_make_texture(ctx, rgba->w, rgba->h, packed);
+        SDL_free(packed);
+    }
+    SDL_DestroySurface(rgba);
+    return zan_gpu_wrap(tex, tw, th);
+}
+
+ZAN_SDL_API void zan_gpu_free_texture(zan_i64 handle, zan_i64 texture) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
+    if (ctx && t) {
+        if (t->tex) SDL_ReleaseGPUTexture(ctx->device, t->tex);
+        SDL_free(t);
+    }
+}
+
+ZAN_SDL_API zan_i64 zan_gpu_texture_width(zan_i64 texture) {
+    ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
+    return t ? t->w : 0;
+}
+
+ZAN_SDL_API zan_i64 zan_gpu_texture_height(zan_i64 texture) {
+    ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
+    return t ? t->h : 0;
+}
+
+ZAN_SDL_API zan_i64 zan_gpu_begin(
+    zan_i64 handle, zan_i64 r, zan_i64 g, zan_i64 b, zan_i64 a) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx) return 0;
+    ctx->cmd = SDL_AcquireGPUCommandBuffer(ctx->device);
+    if (!ctx->cmd) return 0;
+    if (ctx->offscreen) {
+        ctx->swap = ctx->offtex; ctx->fb_w = ctx->off_w; ctx->fb_h = ctx->off_h;
+    } else {
+        ctx->swap = NULL; ctx->fb_w = 0; ctx->fb_h = 0;
+        SDL_WaitAndAcquireGPUSwapchainTexture(ctx->cmd, ctx->window,
+            &ctx->swap, &ctx->fb_w, &ctx->fb_h);
+    }
+    ctx->vcount = 0; ctx->dcount = 0;
+    ctx->cr = (float)r / 255.0f; ctx->cg = (float)g / 255.0f;
+    ctx->cb = (float)b / 255.0f; ctx->ca = (float)a / 255.0f;
+    return 1;
+}
+
+static void zan_gpu_push_vertex(
+    ZanGpuCtx *ctx, float x, float y, float u, float v,
+    float r, float g, float b, float a) {
+    ZanGpuVertex *vv = &ctx->verts[ctx->vcount++];
+    vv->x = x; vv->y = y; vv->u = u; vv->v = v;
+    vv->r = r; vv->g = g; vv->b = b; vv->a = a;
+}
+
+/* Draw texture region (sx,sy,sw,sh in source pixels; sw<=0 means whole
+ * texture) into the destination rect (dx,dy,dw,dh in framebuffer pixels),
+ * multiplied by the r,g,b,a tint (0-255). */
+ZAN_SDL_API void zan_gpu_draw(
+    zan_i64 handle, zan_i64 texture,
+    zan_i64 dx, zan_i64 dy, zan_i64 dw, zan_i64 dh,
+    zan_i64 sx, zan_i64 sy, zan_i64 sw, zan_i64 sh,
+    zan_i64 r, zan_i64 g, zan_i64 b, zan_i64 a) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx) return;
+    ZanGpuTex *t = (ZanGpuTex *)zan_ptr(texture);
+    if (!t || !t->tex) return;
+    SDL_GPUTexture *tex = t->tex;
+    if (ctx->vcount + 6 > ctx->vcap) {
+        ctx->vcap *= 2;
+        ctx->verts = (ZanGpuVertex *)SDL_realloc(ctx->verts, sizeof(ZanGpuVertex) * ctx->vcap);
+    }
+    float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+    if (sw > 0 && sh > 0 && t->w > 0 && t->h > 0) {
+        u0 = (float)sx / (float)t->w; v0 = (float)sy / (float)t->h;
+        u1 = (float)(sx + sw) / (float)t->w; v1 = (float)(sy + sh) / (float)t->h;
+    }
+    float fr = (float)r / 255.0f, fg = (float)g / 255.0f;
+    float fb = (float)b / 255.0f, fa = (float)a / 255.0f;
+    float x0 = (float)dx, y0 = (float)dy, x1 = (float)(dx + dw), y1 = (float)(dy + dh);
+    int base = ctx->vcount;
+    zan_gpu_push_vertex(ctx, x0, y0, u0, v0, fr, fg, fb, fa);
+    zan_gpu_push_vertex(ctx, x1, y0, u1, v0, fr, fg, fb, fa);
+    zan_gpu_push_vertex(ctx, x0, y1, u0, v1, fr, fg, fb, fa);
+    zan_gpu_push_vertex(ctx, x0, y1, u0, v1, fr, fg, fb, fa);
+    zan_gpu_push_vertex(ctx, x1, y0, u1, v0, fr, fg, fb, fa);
+    zan_gpu_push_vertex(ctx, x1, y1, u1, v1, fr, fg, fb, fa);
+    if (ctx->dcount > 0 && ctx->draws[ctx->dcount - 1].tex == tex) {
+        ctx->draws[ctx->dcount - 1].count += 6;
+    } else {
+        if (ctx->dcount + 1 > ctx->dcap) {
+            ctx->dcap *= 2;
+            ctx->draws = (ZanGpuDraw *)SDL_realloc(ctx->draws, sizeof(ZanGpuDraw) * ctx->dcap);
+        }
+        ctx->draws[ctx->dcount].tex = tex;
+        ctx->draws[ctx->dcount].first = base;
+        ctx->draws[ctx->dcount].count = 6;
+        ctx->dcount++;
+    }
+}
+
+ZAN_SDL_API void zan_gpu_end(zan_i64 handle) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx || !ctx->cmd) return;
+    if (!ctx->swap) { SDL_SubmitGPUCommandBuffer(ctx->cmd); ctx->cmd = NULL; return; }
+
+    SDL_GPUTransferBuffer *tb = NULL;
+    if (ctx->vcount > 0) {
+        if ((Uint32)ctx->vcount > ctx->vbuf_cap) {
+            SDL_ReleaseGPUBuffer(ctx->device, ctx->vbuf);
+            while ((Uint32)ctx->vcount > ctx->vbuf_cap) ctx->vbuf_cap *= 2;
+            SDL_GPUBufferCreateInfo bci;
+            memset(&bci, 0, sizeof(bci));
+            bci.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
+            bci.size = sizeof(ZanGpuVertex) * ctx->vbuf_cap;
+            ctx->vbuf = SDL_CreateGPUBuffer(ctx->device, &bci);
+        }
+        Uint32 bytes = (Uint32)(ctx->vcount * (int)sizeof(ZanGpuVertex));
+        SDL_GPUTransferBufferCreateInfo up;
+        memset(&up, 0, sizeof(up));
+        up.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD; up.size = bytes;
+        tb = SDL_CreateGPUTransferBuffer(ctx->device, &up);
+        void *map = SDL_MapGPUTransferBuffer(ctx->device, tb, false);
+        memcpy(map, ctx->verts, bytes);
+        SDL_UnmapGPUTransferBuffer(ctx->device, tb);
+        SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(ctx->cmd);
+        SDL_GPUTransferBufferLocation loc;
+        memset(&loc, 0, sizeof(loc));
+        loc.transfer_buffer = tb; loc.offset = 0;
+        SDL_GPUBufferRegion reg;
+        memset(&reg, 0, sizeof(reg));
+        reg.buffer = ctx->vbuf; reg.offset = 0; reg.size = bytes;
+        SDL_UploadToGPUBuffer(cp, &loc, &reg, false);
+        SDL_EndGPUCopyPass(cp);
+    }
+
+    SDL_GPUColorTargetInfo cti;
+    memset(&cti, 0, sizeof(cti));
+    cti.texture = ctx->swap;
+    cti.clear_color.r = ctx->cr; cti.clear_color.g = ctx->cg;
+    cti.clear_color.b = ctx->cb; cti.clear_color.a = ctx->ca;
+    cti.load_op = SDL_GPU_LOADOP_CLEAR; cti.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(ctx->cmd, &cti, 1, NULL);
+    if (ctx->vcount > 0) {
+        SDL_BindGPUGraphicsPipeline(rp, ctx->pipeline);
+        SDL_GPUBufferBinding vbb; vbb.buffer = ctx->vbuf; vbb.offset = 0;
+        SDL_BindGPUVertexBuffers(rp, 0, &vbb, 1);
+        float screen[2] = {(float)ctx->fb_w, (float)ctx->fb_h};
+        SDL_PushGPUVertexUniformData(ctx->cmd, 0, screen, sizeof(screen));
+        for (int i = 0; i < ctx->dcount; i++) {
+            SDL_GPUTextureSamplerBinding tsb;
+            tsb.texture = ctx->draws[i].tex; tsb.sampler = ctx->sampler;
+            SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
+            SDL_DrawGPUPrimitives(rp, ctx->draws[i].count, 1, ctx->draws[i].first, 0);
+        }
+    }
+    SDL_EndGPURenderPass(rp);
+
+    if (ctx->offscreen) {
+        SDL_GPUCopyPass *cp2 = SDL_BeginGPUCopyPass(ctx->cmd);
+        SDL_GPUTextureRegion dreg;
+        memset(&dreg, 0, sizeof(dreg));
+        dreg.texture = ctx->offtex; dreg.w = ctx->off_w; dreg.h = ctx->off_h; dreg.d = 1;
+        SDL_GPUTextureTransferInfo dti;
+        memset(&dti, 0, sizeof(dti));
+        dti.transfer_buffer = ctx->readbuf; dti.offset = 0;
+        dti.pixels_per_row = ctx->off_w; dti.rows_per_layer = ctx->off_h;
+        SDL_DownloadFromGPUTexture(cp2, &dreg, &dti);
+        SDL_EndGPUCopyPass(cp2);
+        SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(ctx->cmd);
+        SDL_WaitForGPUFences(ctx->device, true, &fence, 1);
+        SDL_ReleaseGPUFence(ctx->device, fence);
+        void *m = SDL_MapGPUTransferBuffer(ctx->device, ctx->readbuf, false);
+        if (m) memcpy(ctx->cpu, m, ctx->off_w * ctx->off_h * 4);
+        SDL_UnmapGPUTransferBuffer(ctx->device, ctx->readbuf);
+    } else {
+        SDL_SubmitGPUCommandBuffer(ctx->cmd);
+    }
+    if (tb) SDL_ReleaseGPUTransferBuffer(ctx->device, tb);
+    ctx->cmd = NULL; ctx->swap = NULL;
+}

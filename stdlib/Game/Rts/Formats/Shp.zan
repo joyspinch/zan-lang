@@ -1,0 +1,129 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Rts.Formats;
+
+// One frame of a SHP(TS) sprite. Coordinates are the frame's placement inside
+// the sprite's bounding box; format selects the on-disk encoding.
+class ShpFrame {
+    int x;
+    int y;
+    int width;
+    int height;
+    int format;   // 1 = uncompressed, 2 = row-raw, 3 = row RLE-zero
+    int offset;   // byte offset of the frame's pixel data in the file
+
+    int X() { return this.x; }
+    int Y() { return this.y; }
+    int Width() { return this.width; }
+    int Height() { return this.height; }
+    int Format() { return this.format; }
+    int Offset() { return this.offset; }
+    bool IsEmpty() { return this.offset == 0 || this.width == 0 || this.height == 0; }
+}
+
+// Parses a SHP(TS) sprite as used by Tiberian Sun / Red Alert 2. Pixels are
+// 8-bit palette indices (index 0 = transparent); pair with a Palette to get
+// RGB. Clean-room: no original sprites are embedded; tests synthesize frames.
+//
+// Layout (little-endian):
+//   header      : zero(u16), width(u16), height(u16), frameCount(u16)
+//   frameHeader : x(u16), y(u16), w(u16), h(u16),
+//                 format(u32, low byte used), unknown(u32), zero(u32), offset(u32)
+//   frame data  : format 1 = w*h raw bytes;
+//                 format 2/3 = per row: rowLen(u16, incl. the 2 length bytes)
+//                              then rowLen-2 bytes (format 3 uses zero-RLE:
+//                              a 0 byte is followed by a transparent run count).
+class ShpImage {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    string data;
+    int length;
+    int width;
+    int height;
+    int frameCount;
+    List<ShpFrame> frames;
+
+    static ShpImage Parse(string data, int length) {
+        ShpImage s = new ShpImage();
+        s.data = data;
+        s.length = length;
+        s.frames = new List<ShpFrame>();
+
+        BinaryReader r = BinaryReader.FromBuffer(data, length);
+        r.Skip(2);                         // zero
+        s.width = r.ReadU16();
+        s.height = r.ReadU16();
+        s.frameCount = r.ReadU16();
+
+        int i = 0;
+        while (i < s.frameCount) {
+            ShpFrame f = new ShpFrame();
+            f.x = r.ReadU16();
+            f.y = r.ReadU16();
+            f.width = r.ReadU16();
+            f.height = r.ReadU16();
+            f.format = (int)(r.ReadU32() & 0xFF);
+            r.Skip(4);                     // unknown
+            r.Skip(4);                     // zero
+            f.offset = (int)r.ReadU32();
+            s.frames.Add(f);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    int Width() { return this.width; }
+    int Height() { return this.height; }
+    int FrameCount() { return this.frames.Count; }
+
+    ShpFrame FrameAt(int index) {
+        if (index < 0 || index >= this.frames.Count) { return null; }
+        return this.frames[index];
+    }
+
+    // Decode a frame to a width*height buffer of palette indices (0 = transparent).
+    string DecodeFrame(int index) {
+        ShpFrame f = this.FrameAt(index);
+        if (f == null) { return ""; }
+        int w = f.Width();
+        int h = f.Height();
+        string outBuf = ShpImage.calloc(w * h + 1, 1);
+        if (f.IsEmpty()) { return outBuf; }
+
+        BinaryReader r = BinaryReader.FromBuffer(this.data, this.length);
+        r.Seek(f.Offset());
+
+        if (f.Format() == 1) {
+            int i = 0;
+            int total = w * h;
+            while (i < total) {
+                outBuf[i] = (char)r.ReadU8();
+                i = i + 1;
+            }
+            return outBuf;
+        }
+
+        int y = 0;
+        while (y < h) {
+            int rowLen = r.ReadU16();
+            int rowDataStart = r.Position();
+            int remaining = rowLen - 2;
+            int x = 0;
+            while (r.Position() < rowDataStart + remaining && x < w) {
+                int b = r.ReadU8();
+                if (f.Format() == 3 && b == 0) {
+                    int count = r.ReadU8();
+                    x = x + count;         // transparent run (buffer already 0)
+                } else {
+                    outBuf[y * w + x] = (char)b;
+                    x = x + 1;
+                }
+            }
+            r.Seek(rowDataStart + remaining);
+            y = y + 1;
+        }
+        return outBuf;
+    }
+}

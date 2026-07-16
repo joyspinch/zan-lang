@@ -1626,6 +1626,8 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
 
 static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 static zan_type_t *container_elem_type(zan_type_t *t);
+static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
+                                      zan_ast_node_t *call, local_scope_t *locals);
 
 /* Best-effort static test for whether an expression yields a `string` value.
  * Used to route `+` to concatenation and `==`/`!=` to strcmp rather than raw
@@ -1771,7 +1773,10 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
                 if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
                     zan_symbol_t *m = get_method_sym(ts, callee->member.name);
-                    if (m) return m->type;
+                    if (m) {
+                        zan_type_t *gr = generic_method_ret(g, m, e, locals);
+                        return gr ? gr : m->type;
+                    }
                 }
             }
             /* static: Namespace.Path.ClassName.Method() -- the object is a
@@ -1782,7 +1787,10 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                     zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->member.name);
                     if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
                         zan_symbol_t *m = get_method_sym(ts, callee->member.name);
-                        if (m) return m->type;
+                        if (m) {
+                            zan_type_t *gr = generic_method_ret(g, m, e, locals);
+                            return gr ? gr : m->type;
+                        }
                     }
                 }
             }
@@ -2367,6 +2375,44 @@ static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv) {
             return recv->type_args[i];
     }
     return t;
+}
+
+/* For a call to a generic method (one declaring its own <T,...>), determine the
+ * concrete return type at this call site when the declared return type is one
+ * of those type parameters. Uses explicit type arguments (f<int>(...)) when
+ * present, otherwise infers from the argument bound to that type parameter.
+ * Returns NULL when the method is non-generic or its return type is not a bare
+ * type parameter (e.g. bool / List<T>), in which case no boundary coercion of
+ * the erased-pointer result is required. */
+static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
+                                      zan_ast_node_t *call, local_scope_t *locals) {
+    if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return NULL;
+    if (!call || call->kind != AST_CALL) return NULL;
+    zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
+    if (tps->count == 0) return NULL;
+    zan_ast_node_t *ret_ref = msym->decl->method_decl.return_type;
+    if (!ret_ref || ret_ref->kind != AST_TYPE_REF) return NULL;
+    zan_istr_t rn = ret_ref->type_ref.name;
+    int which = -1;
+    for (int i = 0; i < tps->count; i++) {
+        zan_istr_t tn = tps->items[i]->ident.name;
+        if (tn.len == rn.len && memcmp(tn.str, rn.str, (size_t)rn.len) == 0) {
+            which = i;
+            break;
+        }
+    }
+    if (which < 0) return NULL;
+    if (call->call.type_args.count > which)
+        return zan_binder_resolve_type(g->binder, call->call.type_args.items[which]);
+    zan_ast_list_t *params = &msym->decl->method_decl.params;
+    for (int j = 0; j < params->count && j < call->call.args.count; j++) {
+        zan_ast_node_t *pref = params->items[j]->param.type;
+        if (pref && pref->kind == AST_TYPE_REF &&
+            pref->type_ref.name.len == rn.len &&
+            memcmp(pref->type_ref.name.str, rn.str, (size_t)rn.len) == 0)
+            return infer_expr_type(g, call->call.args.items[j], locals);
+    }
+    return NULL;
 }
 
 /* Structural equality of two resolved types, used to match a call site's
@@ -6056,8 +6102,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
+                                coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                zan_type_t *gret = generic_method_ret(g, method_sym, expr, locals);
+                                if (gret) result = emit_boundary_coerce(g, result, map_type(g, gret));
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {
@@ -6145,8 +6194,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
+                                coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                                 LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                                zan_type_t *gret = generic_method_ret(g, method_sym, expr, locals);
+                                if (gret) result = emit_boundary_coerce(g, result, map_type(g, gret));
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {
@@ -6283,8 +6335,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
                 }
                 LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
+                const char *gcn = (LLVMGetTypeKind(LLVMGetReturnType(fn_type)) == LLVMVoidTypeKind) ? "" : "gcall";
                 LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
-                    global_fn, call_args, (unsigned)argc, "gcall");
+                    global_fn, call_args, (unsigned)argc, gcn);
                 int consumes_free_arg =
                     argc == 1 && call_consumes_free_arg(global_fn);
                 if (consumes_free_arg) {
@@ -8589,9 +8642,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         break;
     }
 
-    case AST_EXPR_STMT:
-        emit_expr(g, stmt->expr_stmt.expr, locals);
+    case AST_EXPR_STMT: {
+        zan_ast_node_t *e = stmt->expr_stmt.expr;
+        LLVMValueRef ev = emit_expr(g, e, locals);
+        /* A discarded expression statement whose value is a freshly owned (+1)
+         * rc reference must release it, or it leaks. This covers fluent method
+         * chains used as statements (e.g. `builder.Add(x);` where Add returns
+         * `this`) and bare `new`/call results. Assignments and non-call
+         * expressions are not owned (expr_yields_owned_rc_value == 0). */
+        if (ev && LLVMGetTypeKind(LLVMTypeOf(ev)) == LLVMPointerTypeKind &&
+            expr_yields_owned_rc_value(g, e, locals)) {
+            zan_type_t *et = infer_expr_type(g, e, locals);
+            if (et && is_rc_managed_type(et)) {
+                emit_rc_release_for_type(g, et, ev);
+            }
+        }
         break;
+    }
 
     case AST_RETURN_STMT:
         /* Inside an async $resume body, `return e` completes the state machine:
