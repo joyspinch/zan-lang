@@ -141,6 +141,17 @@ class App {
     // draw order. Reset in BeginFrame; incremented by NextBlurSlot().
     int blurSlotSeq;
 
+    // Wallpaper-backdrop cache invalidation. The gradient + soft colour blobs
+    // are static: they depend only on the window size and the active skin, not
+    // on content/scroll/typing. bgThemeGen bumps on every theme change; the
+    // backdrop snapshot records the gen it was painted with (bgSnapGen) so it
+    // is restored with a cheap pixel copy on EVERY frame (not just non-dirty
+    // ones) until the size or skin actually changes. Repainting the ~80 large
+    // feathered blobs each dirty frame is what made glass/gradient skins janky
+    // while scrolling or typing.
+    int bgThemeGen;
+    int bgSnapGen;
+
     static App Create(string title, int width, int height) {
         App app = new App();
         app.window = Window.Create(title, width, height);
@@ -210,6 +221,10 @@ class App {
         app.animNextMs = -1;
         app.backdropDirty = true;
         app.blurSlotSeq = 0;
+        // gen != snapGen so the wallpaper is painted (and snapshotted) once up
+        // front, then restored from cache until the skin/size changes.
+        app.bgThemeGen = 1;
+        app.bgSnapGen = 0;
         app.canvas = Canvas.Create(width, height);
         // Reset the UI-thread dispatch queue up front (on the UI thread) so
         // App.Post is safe the moment any background worker is spawned.
@@ -251,6 +266,7 @@ class App {
         // software-rendered here. Always drop any layered style if it was set.
         if (glassNative) { window.DisableGlass(); }
         glassNative = false;
+        bgThemeGen = bgThemeGen + 1;
         needsRedraw = true;
     }
 
@@ -386,8 +402,14 @@ class App {
             return;
         }
         if (t.gradient != 0) {
+            // The wallpaper (gradient + soft blobs) is static per skin+size, so
+            // restore it from the snapshot on every frame -- including dirty
+            // ones -- as long as the skin generation matches. Only a skin change
+            // (bgThemeGen bumped) or a resize (RestoreRect geometry mismatch)
+            // forces the expensive repaint. This keeps glass/gradient skins
+            // smooth while scrolling or typing instead of re-blobbing per frame.
             bool restored = false;
-            if (!this.BackdropDirty()) {
+            if (bgSnapGen == bgThemeGen) {
                 restored = c.RestoreRect(x, y, w, h, slot);
             }
             if (!restored) {
@@ -398,6 +420,7 @@ class App {
                     this.BackdropGradientWallpaper(x, y, w, h);
                 }
                 c.SnapshotRect(x, y, w, h, slot);
+                bgSnapGen = bgThemeGen;
             }
         } else {
             c.FillRect(x, y, w, h, t.bgPrimary);
@@ -919,6 +942,7 @@ class App {
     void SetTheme(Theme t) {
         theme = t;
         theme.ScaleByDpi(dpiScale);
+        bgThemeGen = bgThemeGen + 1;
         needsRedraw = true;
     }
 
