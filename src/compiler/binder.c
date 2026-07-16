@@ -302,26 +302,6 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
                 continue;
             }
             zan_type_t *type = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
-            /* a generic delegate (delegate R F<T>(...)) must have its type
-             * parameters in scope while resolving its own signature */
-            register_type_param_list(b, &node->method_decl.type_params);
-            /* resolve delegate return type */
-            type->delegate_ret_type = node->method_decl.return_type
-                ? zan_binder_resolve_type(b, node->method_decl.return_type)
-                : b->type_void;
-            /* resolve delegate parameter types */
-            int pc = node->method_decl.params.count;
-            type->delegate_param_count = pc;
-            if (pc > 0) {
-                type->delegate_param_types = (zan_type_t **)zan_arena_alloc(
-                    b->arena, sizeof(zan_type_t *) * (size_t)pc);
-                for (int j = 0; j < pc; j++) {
-                    zan_ast_node_t *param = node->method_decl.params.items[j];
-                    type->delegate_param_types[j] = zan_binder_resolve_type(b, param->param.type);
-                }
-            } else {
-                type->delegate_param_types = NULL;
-            }
             zan_symbol_t *sym = make_symbol(b->arena, SYM_DELEGATE,
                 name, type, node, node->method_decl.modifiers);
             type->sym = sym;
@@ -351,6 +331,36 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
             type->base_type = NULL;
 
             scope_add(b->arena, b->current_scope, sym);
+        }
+    }
+
+    /* Resolve delegate signatures only after every named type is registered.
+     * This permits delegates to reference classes declared later or in another
+     * source file within the same compilation. */
+    for (int i = 0; i < decls->count; i++) {
+        zan_ast_node_t *node = decls->items[i];
+        if (node->kind != AST_DELEGATE_DECL) continue;
+
+        zan_symbol_t *sym = scope_find(b->current_scope, node->method_decl.name);
+        if (!sym || sym->decl != node) continue;
+        zan_type_t *type = sym->type;
+
+        register_type_param_list(b, &node->method_decl.type_params);
+        type->delegate_ret_type = node->method_decl.return_type
+            ? zan_binder_resolve_type(b, node->method_decl.return_type)
+            : b->type_void;
+        int pc = node->method_decl.params.count;
+        type->delegate_param_count = pc;
+        if (pc > 0) {
+            type->delegate_param_types = (zan_type_t **)zan_arena_alloc(
+                b->arena, sizeof(zan_type_t *) * (size_t)pc);
+            for (int j = 0; j < pc; j++) {
+                zan_ast_node_t *param = node->method_decl.params.items[j];
+                type->delegate_param_types[j] =
+                    zan_binder_resolve_type(b, param->param.type);
+            }
+        } else {
+            type->delegate_param_types = NULL;
         }
     }
 }
