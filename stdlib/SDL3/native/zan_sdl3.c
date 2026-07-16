@@ -265,6 +265,88 @@ ZAN_SDL_API zan_i64 zan_sdl_render_texture(
         &dst));
 }
 
+/* ---- 2D render backend extensions (render targets, blend, clip) ----
+ * These thin wrappers expose the SDL_Renderer features a GPU-accelerated GUI
+ * canvas needs: offscreen render targets (for downsample blur), source-region
+ * texture draws (atlas/scaled blit), scissor clipping and blend modes. They
+ * work on every SDL_Renderer backend (D3D11/D3D12/Metal/Vulkan/OpenGL) with no
+ * custom shaders, so the cross-platform GPU path is active today. */
+
+static SDL_BlendMode zan_blend_mode(zan_i64 mode) {
+    if (mode == 0) return SDL_BLENDMODE_NONE;
+    if (mode == 2) return SDL_BLENDMODE_ADD;
+    if (mode == 3) return SDL_BLENDMODE_MOD;
+    return SDL_BLENDMODE_BLEND;
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_create_target_texture(
+    zan_i64 renderer, zan_i64 width, zan_i64 height) {
+    if (!renderer) return 0;
+    SDL_Texture *texture = SDL_CreateTexture(
+        (SDL_Renderer *)zan_ptr(renderer),
+        SDL_PIXELFORMAT_RGBA32,
+        SDL_TEXTUREACCESS_TARGET,
+        (int)width, (int)height);
+    if (texture) SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+    return zan_handle(texture);
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_set_render_target(zan_i64 renderer, zan_i64 texture) {
+    if (!renderer) return 0;
+    SDL_Texture *tex = texture ? (SDL_Texture *)zan_ptr(texture) : NULL;
+    return zan_bool(SDL_SetRenderTarget((SDL_Renderer *)zan_ptr(renderer), tex));
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_render_texture_region(
+    zan_i64 renderer, zan_i64 texture,
+    zan_i64 sx, zan_i64 sy, zan_i64 sw, zan_i64 sh,
+    zan_i64 dx, zan_i64 dy, zan_i64 dw, zan_i64 dh) {
+    if (!renderer || !texture) return 0;
+    SDL_FRect src = zan_rect(sx, sy, sw, sh);
+    SDL_FRect dst = zan_rect(dx, dy, dw, dh);
+    return zan_bool(SDL_RenderTexture(
+        (SDL_Renderer *)zan_ptr(renderer),
+        (SDL_Texture *)zan_ptr(texture), &src, &dst));
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_set_texture_alpha(zan_i64 texture, zan_i64 alpha) {
+    if (!texture) return 0;
+    return zan_bool(SDL_SetTextureAlphaMod(
+        (SDL_Texture *)zan_ptr(texture), (Uint8)alpha));
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_set_texture_color(
+    zan_i64 texture, zan_i64 red, zan_i64 green, zan_i64 blue) {
+    if (!texture) return 0;
+    return zan_bool(SDL_SetTextureColorMod(
+        (SDL_Texture *)zan_ptr(texture), (Uint8)red, (Uint8)green, (Uint8)blue));
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_set_texture_blend(zan_i64 texture, zan_i64 mode) {
+    if (!texture) return 0;
+    return zan_bool(SDL_SetTextureBlendMode(
+        (SDL_Texture *)zan_ptr(texture), zan_blend_mode(mode)));
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_set_draw_blend(zan_i64 renderer, zan_i64 mode) {
+    if (!renderer) return 0;
+    return zan_bool(SDL_SetRenderDrawBlendMode(
+        (SDL_Renderer *)zan_ptr(renderer), zan_blend_mode(mode)));
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_set_render_clip(
+    zan_i64 renderer, zan_i64 x, zan_i64 y, zan_i64 width, zan_i64 height) {
+    if (!renderer) return 0;
+    SDL_Rect rect;
+    rect.x = (int)x; rect.y = (int)y; rect.w = (int)width; rect.h = (int)height;
+    return zan_bool(SDL_SetRenderClipRect((SDL_Renderer *)zan_ptr(renderer), &rect));
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_clear_render_clip(zan_i64 renderer) {
+    if (!renderer) return 0;
+    return zan_bool(SDL_SetRenderClipRect((SDL_Renderer *)zan_ptr(renderer), NULL));
+}
+
 ZAN_SDL_API zan_i64 zan_sdl_poll_event(void) {
     return zan_bool(SDL_PollEvent(&zan_last_event));
 }

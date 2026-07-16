@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Diagnostics;
+using System.Json;
 using Gui;
 using Gui.Widget;
 
@@ -278,6 +279,74 @@ class ZanIDE {
             ZanIDE.EditorThemeColor(themeIdx, 0), ZanIDE.EditorThemeColor(themeIdx, 1),
             ZanIDE.EditorThemeColor(themeIdx, 2), ZanIDE.EditorThemeColor(themeIdx, 3),
             ZanIDE.EditorThemeColor(themeIdx, 4), ZanIDE.EditorThemeColor(themeIdx, 5));
+    }
+
+    // ---- Editor Settings dialog: JSON declarative + two-way binding ----
+    // The Settings modal is described as a JSON UiDoc bound to a JsonValue model
+    // {themeIdx, font, lang}. Handlers are parameterless Actions resolved by the
+    // registry, so button clicks flip these static flags which Run() consumes.
+    static bool setDone;
+    static bool setResetFont;
+
+    static void OnSettingsDone() { ZanIDE.setDone = true; }
+    static void OnSettingsResetFont() { ZanIDE.setResetFont = true; }
+
+    /// Escapes a label for embedding as a JSON string literal.
+    static string JsonEsc(string s) {
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") { outp = outp + "\\\\"; }
+            else if (ch == "\"") { outp = outp + "\\\""; }
+            else { outp = outp + ch; }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Builds the Settings modal as a JSON UiDoc document: a title, the color
+    /// theme preview cards (custom ThemeCard component, one per preset, all
+    /// two-way bound to model.themeIdx), a font-size slider + live readout, a
+    /// segmented language chooser (Segment component bound to model.lang), and
+    /// the Default / Done buttons.
+    static string SettingsDocJson() {
+        string s = "{ \"type\":\"Column\", \"pad\":18, \"gap\":8, \"children\":[";
+        s = s + "{ \"type\":\"Title\", \"dock\":\"top\", \"height\":34, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Editor Settings", "编辑器设置")) + "\" },";
+        s = s + "{ \"type\":\"Label\", \"variant\":2, \"dock\":\"top\", \"height\":20, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Color Theme", "配色主题")) + "\" },";
+        int i = 0;
+        while (i < ZanIDE.EditorThemeCount()) {
+            s = s + "{ \"type\":\"ThemeCard\", \"index\":" + Convert.ToString(i)
+                + ", \"dock\":\"top\", \"height\":38, \"bind\":\"themeIdx\" },";
+            i = i + 1;
+        }
+        s = s + "{ \"type\":\"Label\", \"variant\":2, \"dock\":\"top\", \"height\":20, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Font Size", "字体大小")) + "\" },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":34, \"gap\":10, \"children\":[";
+        s = s + "{ \"type\":\"Slider\", \"min\":9, \"max\":30, \"bind\":\"font\", \"dock\":\"left\", \"width\":300 },";
+        s = s + "{ \"type\":\"Label\", \"dock\":\"left\", \"width\":44, \"bind\":{\"path\":\"font\",\"prop\":\"text\"} },";
+        s = s + "{ \"type\":\"Label\", \"dock\":\"left\", \"width\":24, \"text\":\"px\" },";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"resetFont\", \"dock\":\"left\", \"width\":100, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Default", "默认")) + "\" } ] },";
+        s = s + "{ \"type\":\"Label\", \"variant\":2, \"dock\":\"top\", \"height\":20, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Language", "界面语言")) + "\" },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":34, \"gap\":8, \"children\":[";
+        int j = 0;
+        while (j < ZanIDE.LangCount()) {
+            s = s + "{ \"type\":\"Segment\", \"index\":" + Convert.ToString(j)
+                + ", \"label\":\"" + ZanIDE.JsonEsc(ZanIDE.LangName(j))
+                + "\", \"dock\":\"left\", \"width\":130, \"bind\":\"lang\" }";
+            j = j + 1;
+            if (j < ZanIDE.LangCount()) { s = s + ","; }
+        }
+        s = s + "] },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":40, \"gap\":10, \"children\":[";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"done\", \"dock\":\"right\", \"width\":120, \"text\":\""
+            + ZanIDE.JsonEsc(ZanIDE.T("Done", "完成")) + "\" } ] }";
+        s = s + "] }";
+        return s;
     }
 
     /// Converts Windows backslashes to forward slashes, the IDE-internal path
@@ -725,6 +794,11 @@ class ZanIDE {
 
         // ---- Designer state ----
         bool designerMode = false;
+        // Reusable, component-based form/window Designer (stdlib Gui.Designer),
+        // hosted in the "@builder" tab. Self-contained palette + canvas +
+        // inspector; opened from the Form Builder ribbon command.
+        Designer formBuilder = Designer.Create();
+        formBuilder.Seed(app);
         List<string> dNames = new List<string>();
         List<int> dX = new List<int>();
         List<int> dY = new List<int>();
@@ -1105,45 +1179,17 @@ class ZanIDE {
                     dlg.Show();
                     dlgMode = 3;
                 } else if (rc == 9) {
-                    // Open the form designer (C#-style .zform files). If a code-behind
-                    // is active, open its sibling .zform; otherwise open/create Form1.zform.
-                    int actR = activeTab.Get();
-                    string formP = "";
-                    if (actR >= 0 && actR < tabPaths.Count) {
-                        string ap = tabPaths[actR];
-                        if (ZanIDE.IsFormPath(ap)) {
-                            formP = ap;
-                        } else if (ap.Length > 4 && ap.Substring(ap.Length - 4, 4) == ".zan") {
-                            string cand = ap.Substring(0, ap.Length - 4) + ".zform";
-                            if (File.Exists(cand)) { formP = cand; }
-                        }
-                    }
-                    if (formP == "") {
-                        formP = root + "/src/Form1.zform";
-                        Directory.CreateDirectory(root + "/src");
-                        if (!File.Exists(formP)) {
-                            List<string> fen = new List<string>();
-                            List<string> fet = new List<string>();
-                            List<int> fex = new List<int>();
-                            List<int> fey = new List<int>();
-                            List<int> few = new List<int>();
-                            List<int> feh = new List<int>();
-                            List<string> fanc = new List<string>();
-                            List<string> fdok = new List<string>();
-                            File.WriteAllText(formP, ZanIDE.SerializeForm("Form1", fen, fet, fex, fey, few, feh, fanc, fdok, 800, 600));
-                            string fcb = root + "/src/Form1.zan";
-                            if (!File.Exists(fcb)) {
-                                File.WriteAllText(fcb, ZanIDE.BuildCodeBehind("Form1", fen, fet, fex, fey, few, feh, 800, 600));
-                            }
-                        }
-                    }
-                    int fti = ZanIDE.FindTabByPath(tabPaths, formP);
-                    if (fti >= 0) {
-                        activeTab.Set(fti);
+                    // Open the reusable form/window Designer component (a real
+                    // "@builder" tab), mirroring the @start/@docs special tabs.
+                    // This replaces the old coordinate-based .zform designer as
+                    // the primary Designer entry point.
+                    int bi = ZanIDE.FindTabByPath(tabPaths, "@builder");
+                    if (bi >= 0) {
+                        activeTab.Set(bi);
                     } else {
-                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, formP, Path.GetFileName(formP));
+                        tabNames.Add(ZanIDE.T("Designer", "设计器")); tabBodies.Add(""); tabPaths.Add("@builder");
+                        activeTab.Set(tabNames.Count - 1);
                     }
-                    loadedFormPath = "";
                     lastActive = 0 - 1;
                     app.RequestRedraw();
                 } else if (rc == 10) {
@@ -1434,6 +1480,7 @@ class ZanIDE {
                 Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
                 bool activeIsStart = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@start");
                 bool activeIsDocs = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@docs");
+                bool activeIsBuilder = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@builder");
                 if (designerMode) {
                     // Bind the designer to the active .zform tab. On first display of
                     // a form (path change) load its controls from the tab body.
@@ -1497,6 +1544,8 @@ class ZanIDE {
                         app, c, t, edRect, docsSearch,
                         docsSel, docsScroll, docsCodeScroll, docsDemoBool,
                         docsDemoInt, docsDemoInput, log);
+                } else if (activeIsBuilder) {
+                    formBuilder.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
                 } else if (activeIsStart) {
                     List<string> spFiles = ZanIDE.ListZanFiles(root + "/src");
                     int sact = ZanIDE.RenderStartPage(app, c, t, edRect, spFiles, startNewProjBtn, startNewFileBtn);
@@ -1571,7 +1620,7 @@ class ZanIDE {
                 }
 
                 // ---- Find / Replace / GoToLine overlay ----
-                if (findMode > 0 && !designerMode && !activeIsStart && !activeIsDocs) {
+                if (findMode > 0 && !designerMode && !activeIsStart && !activeIsDocs && !activeIsBuilder) {
                     int fpH = app.Scale(36);
                     if (findMode == 2) { fpH = app.Scale(68); }
                     int fpW = app.Scale(360);
@@ -1887,7 +1936,7 @@ class ZanIDE {
 
                 // Top-level editor context menu overlay (drawn last so nothing
                 // paints over it), then bridge its host commands.
-                if (!designerMode && !activeIsStart && !activeIsDocs) {
+                if (!designerMode && !activeIsStart && !activeIsDocs && !activeIsBuilder) {
                     editor.RenderCtxMenu(app);
                     string ecmd = editor.TakeCommand();
                     if (ecmd == "find") { findMode = 1; app.RequestRedraw(); }
@@ -2768,7 +2817,7 @@ class ZanIDE {
         }
         string activePath = paths[a];
         string p = activePath;
-        if (p == "" || p == "@start" || p == "@docs") {
+        if (p == "" || p == "@start" || p == "@docs" || p == "@builder") {
             log.Add("> Nothing to run (open and save a source file first).");
             return;
         }
@@ -4336,7 +4385,7 @@ class ZanIDE {
         if (a < 0 || a >= tabPaths.Count) { return false; }
         string activePath = tabPaths[a];
         string p = activePath;
-        if (p == "" || p == "@start" || p == "@docs") {
+        if (p == "" || p == "@start" || p == "@docs" || p == "@builder") {
             log.Add("> [Debug] Open a source file first.");
             return false;
         }

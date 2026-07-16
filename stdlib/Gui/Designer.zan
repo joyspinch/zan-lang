@@ -11,7 +11,7 @@ namespace Gui;
 /// WinForms / element-plus form designers, but without touching coordinates.
 ///
 /// Surface:
-///   * a toolbar (Save / Load / Export / Preview / Clear, plus move-up /
+///   * a toolbar (JSON drawer / Preview / Clear, plus move-up /
 ///     move-down / delete acting on the selected field),
 ///   * a categorised field palette on the left (click a type to append a row),
 ///   * the vertical form preview in the centre (label + required star + a preview
@@ -101,6 +101,35 @@ class Designer {
     SignalString submitSig;
     Input submitInput;
 
+    // Root window (the outermost component being designed): its own properties
+    // and event handlers. Edited by the inspector whenever no child is selected.
+    SignalString winTitleSig;
+    Input winTitleInput;
+    int winW;
+    int winH;
+    bool winResizable;
+    bool winTool;
+    bool winCenter;
+    bool winGlass;
+    List<string> winEvtNames;      // window event -> handler (parallel lists)
+    List<string> winEvtHandlers;
+    string winEvtEditing;          // which window event the handler box edits
+
+    // Component palette filter (search box) + inspector scroll state.
+    SignalString filterSig;
+    Input filterInput;
+    int inspScroll;
+    int inspContentH;
+
+    // Editable JSON drawer: the single source-of-truth text box for the design
+    // (replaces the old opaque Save/Load/Export buttons). Editing it and
+    // pressing Apply rebuilds the design; opening it dumps the current design.
+    SignalString jsonSig;
+    TextArea jsonArea;
+    bool jsonOpen;
+    bool evtRootPrev;              // last event-tab target was the window root
+    FormField evtSelPrev;         // last event-tab component target
+
     static Designer Create() {
         Designer d = new Designer();
         d.fields = new List<FormField>();
@@ -108,7 +137,7 @@ class Designer {
         d.selPrev = null;
         d.doc = "";
         d.msg = "click a field type on the left to add a row";
-        d.inspTab = 1;
+        d.inspTab = 0;
         d.preview = false;
         d.seq = 0;
         d.activeContainer = null;
@@ -119,8 +148,8 @@ class Designer {
         d.formSize = 1;
         d.labelWidth = 92;
         d.hideStar = false;
-        d.showSubmit = true;
-        d.showReset = true;
+        d.showSubmit = false;
+        d.showReset = false;
         d.dragging = false;
         d.dragFromPalette = false;
         d.dragCustomKind = "";
@@ -155,6 +184,26 @@ class Designer {
         d.formNameInput = Input.Bind(d.formNameSig, "form name");
         d.submitSig = SignalString.Create("");
         d.submitInput = Input.Bind(d.submitSig, "handler");
+        d.winTitleSig = SignalString.Create("Tool Window");
+        d.winTitleInput = Input.Bind(d.winTitleSig, "window title");
+        d.winW = 480;
+        d.winH = 360;
+        d.winResizable = true;
+        d.winTool = true;
+        d.winCenter = true;
+        d.winGlass = false;
+        d.winEvtNames = new List<string>();
+        d.winEvtHandlers = new List<string>();
+        d.winEvtEditing = "";
+        d.filterSig = SignalString.Create("");
+        d.filterInput = Input.Bind(d.filterSig, "filter…");
+        d.inspScroll = 0;
+        d.inspContentH = 0;
+        d.evtRootPrev = false;
+        d.evtSelPrev = null;
+        d.jsonSig = SignalString.Create("");
+        d.jsonArea = TextArea.Bind(d.jsonSig, "paste or edit the design JSON, then Apply");
+        d.jsonOpen = false;
         return d;
     }
 
@@ -196,7 +245,7 @@ class Designer {
         activeContainer = null;
         sel = null;
         selPrev = null;
-        inspTab = 1;
+        inspTab = 0;
     }
 
     // --- Field mutation ------------------------------------------------------
@@ -397,7 +446,11 @@ class Designer {
 
         hoverFt = -1;
         RenderToolbar(app, c, t, canX, top, canW, barH);
-        RenderForm(app, c, t, canX, bodyY, canW, bodyH);
+        if (jsonOpen) {
+            RenderJsonPanel(app, c, t, canX, bodyY, canW, bodyH);
+        } else {
+            RenderForm(app, c, t, canX, bodyY, canW, bodyH);
+        }
         RenderPalette(app, c, t, palX, bodyY, palW, bodyH);
         RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH);
         RenderStatus(app, c, t, palX, bot + app.Scale(4), inspX + inspW - palX);
@@ -439,28 +492,52 @@ class Designer {
 
     // --- Toolbar -------------------------------------------------------------
 
+    /// The editable JSON drawer shown in place of the canvas when JSON is on.
+    /// The text box IS the document: Apply rebuilds the design from it,
+    /// Regenerate re-dumps the current design into it.
+    void RenderJsonPanel(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int pad = app.Scale(12);
+        int ix = x + pad;
+        int iw = w - pad * 2;
+        int iy = y + app.Scale(10);
+        c.DrawText(ix, iy, "DESIGN JSON  ·  edit then Apply", t.textTertiary, fs);
+        iy = iy + app.Scale(24);
+        int btnH = app.Scale(30);
+        int taH = y + h - iy - btnH - app.Scale(20);
+        if (taH < app.Scale(80)) { taH = app.Scale(80); }
+        jsonArea.Render(app, ix, iy, iw, taH);
+        int by = iy + taH + app.Scale(8);
+        int applyId = Button.Primary("Apply").Render(app, ix, by, app.Scale(80));
+        if (Button.WasClicked(app, applyId)) {
+            LoadJson(jsonSig.Get());
+            msg = "loaded " + Convert.ToString(fields.Count) + " components from JSON";
+        }
+        int dumpId = Button.Create("Regenerate").Render(app, ix + app.Scale(88), by, app.Scale(104));
+        if (Button.WasClicked(app, dumpId)) {
+            jsonArea.SetText(SaveJson());
+            msg = "regenerated JSON from the current design";
+        }
+        int closeId = Button.Create("Close").Render(app, ix + iw - app.Scale(70), by, app.Scale(70));
+        if (Button.WasClicked(app, closeId)) { jsonOpen = false; }
+    }
+
     void RenderToolbar(App app, Canvas c, Theme t, int tx, int ty, int tw, int th) {
         int bw = app.Scale(50);
         int g = app.Scale(6);
         int bx = tx;
-        int sId = Button.Primary("Save").Render(app, bx, ty, bw);
-        if (Button.WasClicked(app, sId)) {
-            doc = SaveJson();
-            msg = "saved JSON (" + Convert.ToString(doc.Length) + " chars)";
+        // Single JSON drawer toggle. Opening it dumps the current design so the
+        // box always reflects what's on the canvas; editing + Apply loads it.
+        int jType = 0;
+        if (jsonOpen) { jType = 3; }
+        int jId = Button.Typed("JSON", jType).Render(app, bx, ty, bw + app.Scale(4));
+        if (Button.WasClicked(app, jId)) {
+            jsonOpen = !jsonOpen;
+            if (jsonOpen) { jsonArea.SetText(SaveJson()); }
         }
-        bx = bx + bw + g;
-        int lId = Button.Create("Load").Render(app, bx, ty, bw);
-        if (Button.WasClicked(app, lId) && doc != "") {
-            LoadJson(doc);
-            msg = "loaded " + Convert.ToString(fields.Count) + " fields from JSON";
-        }
-        bx = bx + bw + g;
-        int eId = Button.Create("Export").Render(app, bx, ty, bw + app.Scale(8));
-        if (Button.WasClicked(app, eId)) {
-            doc = SaveJson();
-            msg = "exported " + Convert.ToString(fields.Count) + " fields to JSON";
-        }
-        bx = bx + bw + app.Scale(8) + g;
+        bx = bx + bw + app.Scale(4) + g;
         int pType = 0;
         if (preview) { pType = 3; }
         int pId = Button.Typed("Preview", pType).Render(app, bx, ty, bw + app.Scale(12));
@@ -493,14 +570,21 @@ class Designer {
         c.FillRoundRect(px, py, pw, ph, app.Scale(6), t.bgSecondary);
         c.DrawRect(px, py, pw, ph, t.borderPrimary, 1);
 
-        // The palette holds more components than fit at once, so it scrolls
-        // internally. Claim the wheel while the pointer is over it (otherwise
-        // the whole page scrolls) and clamp the offset to the content height.
-        int contentH = PaletteContentH(app);
-        int maxScroll = contentH - ph;
+        // Filter / search box, fixed at the top of the palette.
+        int fpad = app.Scale(8);
+        filterInput.Render(app, px + fpad, py + app.Scale(7), pw - fpad * 2, app.Scale(28));
+        string q = filterSig.Get();
+        int headH = app.Scale(42);
+        int bodyY = py + headH;
+        int bodyH = ph - headH;
+
+        // The palette scrolls internally: claim the wheel while the pointer is
+        // over the body (otherwise the whole page scrolls) and clamp the offset.
+        int contentH = PaletteContentH(app, q);
+        int maxScroll = contentH - bodyH;
         if (maxScroll < 0) { maxScroll = 0; }
-        if (InRect(app.mouseX, app.mouseY, px, py, pw, ph)) {
-            bool ownsWheel = app.CaptureWheel(px, py, pw, ph);
+        if (InRect(app.mouseX, app.mouseY, px, bodyY, pw, bodyH)) {
+            bool ownsWheel = app.CaptureWheel(px, bodyY, pw, bodyH);
             if (ownsWheel) {
                 int delta = app.window.EventKeyCode();
                 paletteScroll = paletteScroll - delta * app.Scale(40) / 120;
@@ -510,39 +594,122 @@ class Designer {
         if (paletteScroll < 0) { paletteScroll = 0; }
         if (paletteScroll > maxScroll) { paletteScroll = maxScroll; }
 
-        c.PushClip(px + 1, py + 1, pw - 2, ph - 2);
-        palClipTop = py + 1;
-        palClipBot = py + ph - 1;
+        c.PushClip(px + 1, bodyY, pw - 2, bodyH);
+        palClipTop = bodyY;
+        palClipBot = bodyY + bodyH;
         int ix = px + app.Scale(8);
         int iw = pw - app.Scale(16);
         if (maxScroll > 0) { iw = iw - app.Scale(6); }
-        int iy = py + app.Scale(8) - paletteScroll;
-        if (PalVisible(app, iy, app.Scale(14))) {
-            c.DrawText(ix, iy, "COMPONENTS", t.textTertiary, fs);
-        }
-        iy = iy + app.Scale(20);
+        int iy = bodyY + app.Scale(8) - paletteScroll;
 
-        iy = PaletteGroup(app, c, t, "Basic", 0, 8, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "Advanced", 8, 15, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "Layout", 15, 18, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "Display", 18, 28, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "Feedback", 28, 34, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "Navigation", 34, 40, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "Display+", 40, 47, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "Feedback+", 47, 53, ix, iy, iw);
-        iy = PaletteGroup(app, c, t, "More", 53, 55, ix, iy, iw);
-        iy = CustomPaletteGroup(app, c, t, ix, iy, iw);
+        if (q != "") {
+            iy = PaletteFiltered(app, c, t, q, ix, iy, iw);
+        } else {
+            if (PalVisible(app, iy, app.Scale(14))) {
+                c.DrawText(ix, iy, "COMPONENTS", t.textTertiary, fs);
+            }
+            iy = iy + app.Scale(20);
+            iy = PaletteGroup(app, c, t, "Basic", 0, 8, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "Advanced", 8, 15, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "Layout", 15, 18, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "Display", 18, 28, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "Feedback", 28, 34, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "Navigation", 34, 40, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "Display+", 40, 47, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "Feedback+", 47, 53, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, "More", 53, 55, ix, iy, iw);
+            iy = CustomPaletteGroup(app, c, t, ix, iy, iw);
+        }
         c.PopClip();
 
         if (maxScroll > 0) {
-            Scrollbar.RenderVertical(app, px + pw - app.Scale(7), py + 1,
-                ph - 2, contentH, paletteScroll);
+            Scrollbar.RenderVertical(app, px + pw - app.Scale(7), bodyY,
+                bodyH, contentH, paletteScroll);
         }
+    }
+
+    /// True when a field type's key or display name contains the filter query.
+    bool MatchesFilter(int ft, string q) {
+        if (q == "") { return true; }
+        return Designer.Contains(FormField.TypeKey(ft), q)
+            || Designer.Contains(FormField.TypeName(ft), q);
+    }
+
+    /// Flat search results grid shown while the filter box is non-empty: every
+    /// built-in component whose name matches, in one 4-across grid.
+    int PaletteFiltered(App app, Canvas c, Theme t, string q, int ix, int iy, int iw) {
+        int fs = t.fontSizeSmall;
+        List<int> hits = new List<int>();
+        int ft = 0;
+        while (ft < 55) {
+            if (MatchesFilter(ft, q)) { hits.Add(ft); }
+            ft = ft + 1;
+        }
+        if (PalVisible(app, iy, app.Scale(14))) {
+            c.DrawText(ix, iy, "MATCHES (" + Convert.ToString(hits.Count) + ")", t.textTertiary, fs);
+        }
+        iy = iy + app.Scale(20);
+        if (hits.Count == 0) {
+            if (PalVisible(app, iy, app.Scale(16))) {
+                c.DrawText(ix, iy, "No components match.", t.textSecondary, fs);
+            }
+            return iy + app.Scale(24);
+        }
+        int cols = 4;
+        int gapx = app.Scale(4);
+        int tileW = (iw - (cols - 1) * gapx) / cols;
+        int tileH = app.Scale(34);
+        int rowStep = tileH + app.Scale(6);
+        int ek = app.window.EventKind();
+        int hi = 0;
+        int col = 0;
+        while (hi < hits.Count) {
+            int fft = hits[hi];
+            int bx = ix + col * (tileW + gapx);
+            if (PalVisible(app, iy, tileH)) {
+                if (!preview && ek == 2 && !dragging
+                    && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    dragging = true;
+                    dragFromPalette = true;
+                    dragMoved = false;
+                    dragKind = fft;
+                    dragMouseX = app.mouseX;
+                    dragMouseY = app.mouseY;
+                }
+                Button b = Button.WithIcon("", FieldIcon(fft));
+                b.SetSize(2);
+                int id = b.Render(app, bx, iy, tileW);
+                if (Button.WasClicked(app, id) && !dragMoved) { AddField(fft); }
+                if (!dragging && InRect(app.mouseX, app.mouseY, bx, iy, tileW, tileH)) {
+                    hoverFt = fft;
+                    hoverX = ix + iw + app.Scale(10);
+                    hoverY = iy;
+                    app.RequestRedraw();
+                }
+            }
+            col = col + 1;
+            if (col == cols) { col = 0; iy = iy + rowStep; }
+            hi = hi + 1;
+        }
+        if (col != 0) { iy = iy + rowStep; }
+        return iy + app.Scale(10);
     }
 
     /// Total pixel height of all palette groups, mirroring the layout in
     /// RenderPalette / PaletteGroup so scrolling can be clamped correctly.
-    int PaletteContentH(App app) {
+    int PaletteContentH(App app, string q) {
+        if (q != "") {
+            int m = 0;
+            int ft = 0;
+            while (ft < 55) {
+                if (MatchesFilter(ft, q)) { m = m + 1; }
+                ft = ft + 1;
+            }
+            int fh = app.Scale(8) + app.Scale(20);
+            if (m > 0) { fh = fh + PaletteGroupH(app, m); }
+            else { fh = fh + app.Scale(24); }
+            return fh + app.Scale(8);
+        }
         int h = app.Scale(8) + app.Scale(20);
         h = h + PaletteGroupH(app, 8);   // Basic
         h = h + PaletteGroupH(app, 7);   // Advanced
@@ -709,7 +876,6 @@ class Designer {
             h = h + rowH + app.Scale(6);
             i = rowEnd;
         }
-        if (showSubmit || showReset) { h = h + app.Scale(4) + app.Scale(36); }
         return h + pad;
     }
 
@@ -973,18 +1139,6 @@ class Designer {
             app.RequestRedraw();
         }
 
-        if ((showSubmit || showReset) && FormVisible(fy + app.Scale(4), app.Scale(34))) {
-            fy = fy + app.Scale(4);
-            int bx = fx;
-            if (labelPos != 2) { bx = fx + app.Scale(labelWidth) + app.Scale(10); }
-            if (showSubmit) {
-                Button.Primary("Submit").Render(app, bx, fy, app.Scale(84));
-                bx = bx + app.Scale(84) + app.Scale(8);
-            }
-            if (showReset) {
-                Button.Create("Reset").Render(app, bx, fy, app.Scale(72));
-            }
-        }
         c.PopClip();
 
         if (maxScroll > 0) {
@@ -1693,30 +1847,66 @@ class Designer {
         int fs = t.fontSizeSmall;
         c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
         c.DrawRect(x, y, w, h, t.borderPrimary, 1);
-        c.PushClip(x + 1, y + 1, w - 2, h - 2);
         int ix = x + app.Scale(12);
         int iw = w - app.Scale(24);
-        int iy = y + app.Scale(10);
+
+        // Fixed header: which object is being edited + the Properties / Events
+        // tab pair. The target is the selected component, or the root Window
+        // when nothing is selected.
+        bool root = (sel == null);
+        int hy = y + app.Scale(10);
+        string target = "WINDOW  ·  " + winTitleSig.Get();
+        if (!root) {
+            string tn = FormField.TypeName(sel.ftype);
+            if (sel.ftype == 100) { tn = sel.customKind; }
+            target = "COMPONENT  ·  " + tn;
+        }
+        c.DrawText(ix, hy, Ellipsis.Fit(target, iw, fs), t.textTertiary, fs);
+        hy = hy + app.Scale(18);
 
         int tabW = (iw - app.Scale(6)) / 2;
-        int fType = 0; if (inspTab == 0) { fType = 1; }
-        int mType = 0; if (inspTab == 1) { mType = 1; }
-        int fId = Button.Typed("Field", fType).Render(app, ix, iy, tabW);
-        int mId = Button.Typed("Form", mType).Render(app, ix + tabW + app.Scale(6), iy, tabW);
-        if (Button.WasClicked(app, fId)) { inspTab = 0; }
-        if (Button.WasClicked(app, mId)) { inspTab = 1; }
-        iy = iy + app.Scale(38);
+        int pType = 0; if (inspTab == 0) { pType = 1; }
+        int eType = 0; if (inspTab == 1) { eType = 1; }
+        int pId = Button.Typed("Properties", pType).Render(app, ix, hy, tabW);
+        int eId = Button.Typed("Events", eType).Render(app, ix + tabW + app.Scale(6), hy, tabW);
+        if (Button.WasClicked(app, pId) && inspTab != 0) { inspTab = 0; inspScroll = 0; }
+        if (Button.WasClicked(app, eId) && inspTab != 1) { inspTab = 1; inspScroll = 0; }
+        hy = hy + app.Scale(38);
 
+        // Scrollable body. Content height is measured from the previous frame
+        // (inspContentH) so tall property / grouped-event lists can scroll.
+        int bodyY = hy;
+        int bodyH = y + h - bodyY - app.Scale(8);
+        int maxScroll = inspContentH - bodyH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (InRect(app.mouseX, app.mouseY, x, bodyY, w, bodyH)) {
+            if (app.CaptureWheel(x, bodyY, w, bodyH)) {
+                int delta = app.window.EventKeyCode();
+                inspScroll = inspScroll - delta * app.Scale(40) / 120;
+                app.RequestRedraw();
+            }
+        }
+        if (inspScroll < 0) { inspScroll = 0; }
+        if (inspScroll > maxScroll) { inspScroll = maxScroll; }
+
+        c.PushClip(x + 1, bodyY, w - 2, bodyH);
+        int iy = bodyY - inspScroll;
+        int startY = iy;
         if (inspTab == 1) {
-            RenderFormConfig(app, c, t, ix, iy, iw);
-        } else if (sel == null) {
-            c.DrawText(ix, iy, "Select a field row, or use the", t.textSecondary, fs);
-            c.DrawText(ix, iy + app.Scale(16), "Form tab for form settings.", t.textSecondary, fs);
+            iy = RenderEventsTab(app, c, t, ix, iy, iw);
+        } else if (root) {
+            iy = RenderWindowProps(app, c, t, ix, iy, iw);
         } else {
             SyncEditors(sel);
-            RenderFieldProps(app, c, t, sel, ix, iy, iw);
+            iy = RenderFieldProps(app, c, t, sel, ix, iy, iw);
         }
+        inspContentH = iy - startY;
         c.PopClip();
+
+        if (maxScroll > 0) {
+            Scrollbar.RenderVertical(app, x + w - app.Scale(7), bodyY,
+                bodyH, inspContentH, inspScroll);
+        }
     }
 
     void SyncEditors(FormField f) {
@@ -1750,13 +1940,10 @@ class Designer {
         return "On" + id + ev;
     }
 
-    void RenderFieldProps(App app, Canvas c, Theme t, FormField f, int ix, int iy, int iw) {
+    /// Properties tab for the selected component (no events — those live on the
+    /// Events tab). Returns the y after the last row so the body can scroll.
+    int RenderFieldProps(App app, Canvas c, Theme t, FormField f, int ix, int iy, int iw) {
         int fs = t.fontSizeSmall;
-        string tn = FormField.TypeName(f.ftype);
-        if (f.ftype == 100) { tn = f.customKind; }
-        c.DrawText(ix, iy, "FIELD  ·  " + tn, t.textTertiary, fs);
-        iy = iy + app.Scale(20);
-
         iy = LabeledInput(app, c, t, "Label", labelInput, ix, iy, iw);
         f.label = labelSig.Get();
         iy = LabeledInput(app, c, t, "Name", nameInput, ix, iy, iw);
@@ -1822,90 +2009,215 @@ class Designer {
             }
             iy = iy + app.Scale(38);
         }
-
-        // ---- EVENTS: common (inherited) + type-specific, each assignable to a
-        // named handler; "new" auto-suggests a delegate method name ----
-        iy = iy + app.Scale(6);
-        c.DrawText(ix, iy, "EVENTS", t.textTertiary, fs);
-        iy = iy + app.Scale(20);
-
-        List<string> evs = f.Events();
-        if (evtEditing == "" && evs.Count > 0) {
-            evtEditing = evs[0];
-            evtSig.Set(f.GetHandler(evtEditing));
-        }
-        int rowH = app.Scale(26);
-        int ei = 0;
-        while (ei < evs.Count) {
-            string ev = evs[ei];
-            bool editing = ev == evtEditing;
-            if (editing) {
-                c.FillRoundRect(ix - app.Scale(4), iy - app.Scale(2),
-                    iw + app.Scale(8), rowH, app.Scale(4), t.bgActive);
-            }
-            c.DrawText(ix, iy + app.Scale(5), ev, t.textPrimary, fs);
-            string h = f.GetHandler(ev);
-            string hv = h;
-            int hColor = t.textTertiary;
-            if (hv == "") { hv = "—"; } else { hColor = t.success; }
-            c.DrawText(ix + app.Scale(96), iy + app.Scale(5),
-                Ellipsis.Fit(hv, iw - app.Scale(184), fs), hColor, fs);
-            int edId = SmallBtn(app, "edit", 0, ix + iw - app.Scale(84), iy, app.Scale(40));
-            if (Button.WasClicked(app, edId)) {
-                evtEditing = ev;
-                evtSig.Set(f.GetHandler(ev));
-            }
-            int crId = SmallBtn(app, "new", 1, ix + iw - app.Scale(40), iy, app.Scale(40));
-            if (Button.WasClicked(app, crId)) {
-                evtEditing = ev;
-                string suggested = Designer.SuggestHandler(f, ev);
-                f.SetHandler(ev, suggested);
-                evtSig.Set(suggested);
-            }
-            iy = iy + rowH + app.Scale(4);
-            ei = ei + 1;
-        }
-
-        iy = iy + app.Scale(6);
-        c.DrawText(ix, iy, "on " + evtEditing + " +=", t.textTertiary, fs);
-        iy = iy + app.Scale(18);
-        evtInput.Render(app, ix, iy, iw, app.Scale(28));
-        if (evtEditing != "") { f.SetHandler(evtEditing, evtSig.Get()); }
+        return iy + app.Scale(4);
     }
 
-    void RenderFormConfig(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+    /// Properties tab for the root Window: window chrome (title/size/flags) plus
+    /// the shared layout defaults applied to labelled input rows placed inside.
+    int RenderWindowProps(App app, Canvas c, Theme t, int ix, int iy, int iw) {
         int fs = t.fontSizeSmall;
-        c.DrawText(ix, iy, "FORM", t.textTertiary, fs);
+        c.DrawText(ix, iy, "WINDOW", t.textTertiary, fs);
         iy = iy + app.Scale(20);
 
-        iy = LabeledInput(app, c, t, "Name", formNameInput, ix, iy, iw);
+        iy = LabeledInput(app, c, t, "Title", winTitleInput, ix, iy, iw);
 
+        winW = IntRow(app, c, t, "Width", winW, 20, ix, iy, iw);
+        iy = iy + app.Scale(36);
+        winH = IntRow(app, c, t, "Height", winH, 20, ix, iy, iw);
+        iy = iy + app.Scale(36);
+
+        winResizable = ToggleRow(app, c, t, "Resizable", winResizable, ix, iy, iw);
+        iy = iy + app.Scale(34);
+        winTool = ToggleRow(app, c, t, "Tool window", winTool, ix, iy, iw);
+        iy = iy + app.Scale(34);
+        winCenter = ToggleRow(app, c, t, "Center on show", winCenter, ix, iy, iw);
+        iy = iy + app.Scale(34);
+        winGlass = ToggleRow(app, c, t, "Frosted glass", winGlass, ix, iy, iw);
+        iy = iy + app.Scale(40);
+
+        c.DrawText(ix, iy, "LAYOUT", t.textTertiary, fs);
+        iy = iy + app.Scale(20);
         List<string> posOpts = new List<string>();
         posOpts.Add("Left"); posOpts.Add("Right"); posOpts.Add("Top");
         labelPos = SegRow(app, c, t, "Label position", posOpts, labelPos, ix, iy, iw);
         iy = iy + app.Scale(54);
-
         List<string> szOpts = new List<string>();
         szOpts.Add("Large"); szOpts.Add("Default"); szOpts.Add("Small");
-        formSize = SegRow(app, c, t, "Form size", szOpts, formSize, ix, iy, iw);
+        formSize = SegRow(app, c, t, "Control size", szOpts, formSize, ix, iy, iw);
         iy = iy + app.Scale(54);
-
         labelWidth = IntRow(app, c, t, "Label width", labelWidth, 8, ix, iy, iw);
         iy = iy + app.Scale(36);
-
         bool showStar = !hideStar;
         showStar = ToggleRow(app, c, t, "Required star", showStar, ix, iy, iw);
         hideStar = !showStar;
-        iy = iy + app.Scale(34);
-
-        showSubmit = ToggleRow(app, c, t, "Submit button", showSubmit, ix, iy, iw);
-        iy = iy + app.Scale(34);
-        showReset = ToggleRow(app, c, t, "Reset button", showReset, ix, iy, iw);
         iy = iy + app.Scale(40);
+        return iy;
+    }
 
-        c.DrawText(ix, iy, "On submit +=", t.textTertiary, fs);
+    /// Events tab: every event of the current target (window root or selected
+    /// component), grouped by category (Pointer / Keyboard / Focus / Drag /
+    /// Lifecycle / Value) and scrollable, with an inline handler editor.
+    int RenderEventsTab(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        int fs = t.fontSizeSmall;
+        bool root = (sel == null);
+        List<string> evs = Designer.WindowEventNames();
+        if (!root) { evs = sel.Events(); }
+
+        // Re-seed the shared handler editor whenever the target changes.
+        bool tgtChanged = (root != evtRootPrev) || (!root && sel != evtSelPrev);
+        evtRootPrev = root;
+        evtSelPrev = sel;
+        if (root) {
+            if (tgtChanged || !evs.Contains(winEvtEditing)) {
+                if (evs.Count > 0) { winEvtEditing = evs[0]; } else { winEvtEditing = ""; }
+                evtSig.Set(WinGetHandler(winEvtEditing));
+            }
+        } else {
+            if (tgtChanged || !evs.Contains(evtEditing)) {
+                if (evs.Count > 0) { evtEditing = evs[0]; } else { evtEditing = ""; }
+                evtSig.Set(sel.GetHandler(evtEditing));
+            }
+        }
+
+        int rowH = app.Scale(26);
+        List<string> groups = Designer.EventGroups();
+        int gi = 0;
+        while (gi < groups.Count) {
+            string grp = groups[gi];
+            int cnt = 0;
+            int ck = 0;
+            while (ck < evs.Count) {
+                if (Designer.EventCategory(evs[ck]) == grp) { cnt = cnt + 1; }
+                ck = ck + 1;
+            }
+            if (cnt > 0) {
+                c.DrawText(ix, iy, grp + "  (" + Convert.ToString(cnt) + ")", t.textSecondary, fs);
+                iy = iy + app.Scale(20);
+                int ei = 0;
+                while (ei < evs.Count) {
+                    string ev = evs[ei];
+                    if (Designer.EventCategory(ev) == grp) {
+                        string cur;
+                        if (root) { cur = winEvtEditing; } else { cur = evtEditing; }
+                        if (ev == cur) {
+                            c.FillRoundRect(ix - app.Scale(4), iy - app.Scale(2),
+                                iw + app.Scale(8), rowH, app.Scale(4), t.bgActive);
+                        }
+                        c.DrawText(ix, iy + app.Scale(5), ev, t.textPrimary, fs);
+                        string h;
+                        if (root) { h = WinGetHandler(ev); } else { h = sel.GetHandler(ev); }
+                        string hv = h;
+                        int hColor = t.textTertiary;
+                        if (hv == "") { hv = "—"; } else { hColor = t.success; }
+                        c.DrawText(ix + app.Scale(92), iy + app.Scale(5),
+                            Ellipsis.Fit(hv, iw - app.Scale(180), fs), hColor, fs);
+                        int edId = SmallBtn(app, "edit", 0, ix + iw - app.Scale(84), iy, app.Scale(40));
+                        if (Button.WasClicked(app, edId)) {
+                            if (root) { winEvtEditing = ev; evtSig.Set(WinGetHandler(ev)); }
+                            else { evtEditing = ev; evtSig.Set(sel.GetHandler(ev)); }
+                        }
+                        int crId = SmallBtn(app, "new", 1, ix + iw - app.Scale(40), iy, app.Scale(40));
+                        if (Button.WasClicked(app, crId)) {
+                            if (root) {
+                                winEvtEditing = ev;
+                                string sug = "OnWindow" + ev;
+                                WinSetHandler(ev, sug);
+                                evtSig.Set(sug);
+                            } else {
+                                evtEditing = ev;
+                                string sug = Designer.SuggestHandler(sel, ev);
+                                sel.SetHandler(ev, sug);
+                                evtSig.Set(sug);
+                            }
+                        }
+                        iy = iy + rowH + app.Scale(4);
+                    }
+                    ei = ei + 1;
+                }
+                iy = iy + app.Scale(8);
+            }
+            gi = gi + 1;
+        }
+
+        string editEv;
+        if (root) { editEv = winEvtEditing; } else { editEv = evtEditing; }
+        iy = iy + app.Scale(2);
+        c.DrawText(ix, iy, "on " + editEv + " +=", t.textTertiary, fs);
         iy = iy + app.Scale(18);
-        submitInput.Render(app, ix, iy, iw, app.Scale(28));
+        evtInput.Render(app, ix, iy, iw, app.Scale(28));
+        if (editEv != "") {
+            if (root) { WinSetHandler(editEv, evtSig.Get()); }
+            else { sel.SetHandler(editEv, evtSig.Get()); }
+        }
+        return iy + app.Scale(38);
+    }
+
+    /// The root Window's designable events (lifecycle / size / focus / keyboard).
+    static List<string> WindowEventNames() {
+        List<string> e = new List<string>();
+        e.Add("Load"); e.Add("Show"); e.Add("Hide"); e.Add("Closing"); e.Add("Close");
+        e.Add("Resize"); e.Add("Move"); e.Add("Minimize"); e.Add("Maximize"); e.Add("Restore");
+        e.Add("Activate"); e.Add("Deactivate");
+        e.Add("KeyDown"); e.Add("KeyUp");
+        return e;
+    }
+
+    string WinGetHandler(string ev) {
+        int i = 0;
+        while (i < winEvtNames.Count) {
+            if (winEvtNames[i] == ev) { return winEvtHandlers[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    void WinSetHandler(string ev, string h) {
+        int i = 0;
+        while (i < winEvtNames.Count) {
+            if (winEvtNames[i] == ev) { winEvtHandlers[i] = h; return; }
+            i = i + 1;
+        }
+        winEvtNames.Add(ev);
+        winEvtHandlers.Add(h);
+    }
+
+    /// Logical category for an event name, so the Events tab can group a long
+    /// event list under readable headings instead of overflowing.
+    static string EventCategory(string ev) {
+        if (ev == "Click" || ev == "DoubleClick" || ev == "RightClick"
+            || ev == "MouseDown" || ev == "MouseUp" || ev == "Enter"
+            || ev == "Leave" || ev == "Move" || ev == "Wheel" || ev == "Tap"
+            || ev == "LongPress" || ev == "Swipe" || ev == "Hover") { return "Pointer"; }
+        if (ev == "KeyDown" || ev == "KeyUp" || ev == "KeyPress") { return "Keyboard"; }
+        if (ev == "Focus" || ev == "Blur" || ev == "Activate"
+            || ev == "Deactivate") { return "Focus"; }
+        if (ev == "DragStart" || ev == "Drag" || ev == "DragEnd" || ev == "Drop"
+            || ev == "DragEnter" || ev == "DragLeave") { return "Drag & Drop"; }
+        if (ev == "Resize" || ev == "Show" || ev == "Hide" || ev == "Open"
+            || ev == "Close" || ev == "Closing" || ev == "Load"
+            || ev == "Minimize" || ev == "Maximize" || ev == "Restore") { return "Lifecycle"; }
+        return "Value & Data";
+    }
+
+    /// Category display order for the Events tab.
+    static List<string> EventGroups() {
+        List<string> g = new List<string>();
+        g.Add("Pointer"); g.Add("Keyboard"); g.Add("Focus");
+        g.Add("Drag & Drop"); g.Add("Lifecycle"); g.Add("Value & Data");
+        return g;
+    }
+
+    /// Case-sensitive substring test used by the palette filter (which matches
+    /// against the lowercase type key, so a lowercase query is enough).
+    static bool Contains(string hay, string needle) {
+        if (needle.Length == 0) { return true; }
+        if (hay.Length < needle.Length) { return false; }
+        int i = 0;
+        while (i + needle.Length <= hay.Length) {
+            if (hay.Substring(i, needle.Length) == needle) { return true; }
+            i = i + 1;
+        }
+        return false;
     }
 
     // --- Inspector row helpers ----------------------------------------------

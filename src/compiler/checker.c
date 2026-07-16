@@ -160,9 +160,15 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_CALL: {
-        zan_checker_check_expr(c, expr->call.callee);
+        zan_type_t *callee_type =
+            zan_checker_check_expr(c, expr->call.callee);
         for (int i = 0; i < expr->call.args.count; i++) {
             zan_checker_check_expr(c, expr->call.args.items[i]);
+        }
+        if (callee_type && callee_type->kind == TYPE_DELEGATE) {
+            return callee_type->delegate_ret_type
+                ? callee_type->delegate_ret_type
+                : c->binder->type_void;
         }
         /* Resolve the callee's return type when the function/method symbol
          * is in scope. Fall back to type_error (NOT void) for unresolved

@@ -52,7 +52,7 @@ class App {
     // desktop shows through the gaps.
     bool glassNative;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
-    // frame â€” e.g. a DataTable body with its own internal row scroll. When the
+    // frame â€?e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
     // drives the widget instead. Reset every frame in BeginFrame.
     int wheelCapX;
@@ -70,10 +70,16 @@ class App {
     // ProcessEvent against the PREVIOUS frame's complete hit regions (which
     // already include popups/overlays on top). Widgets ask Ui.Clicked/Pressed
     // whether they are this target, so a click is delivered to exactly one
-    // widget â€” the top-most one under the pointer â€” instead of every widget
+    // widget â€?the top-most one under the pointer â€?instead of every widget
     // that happens to re-read the raw event during its own render.
     int clickTargetId;
     int pressTargetId;
+    // Secondary (right) mouse-button targets, resolved the same way as the
+    // primary click/press targets but kept separate so a right-click never
+    // trips Ui.Clicked or steals keyboard focus. Read via RightClickTarget()
+    // / RightPressTarget() (see Ui.RightClicked).
+    int rightClickTargetId;
+    int rightPressTargetId;
     // Double-click / double-tap detection. lastClickId + lastClickMs record the
     // most recent completed click; doubleClickNow is a one-frame flag set when a
     // second click lands on the same id within the double-click window. Read via
@@ -135,6 +141,17 @@ class App {
     // draw order. Reset in BeginFrame; incremented by NextBlurSlot().
     int blurSlotSeq;
 
+    // Wallpaper-backdrop cache invalidation. The gradient + soft colour blobs
+    // are static: they depend only on the window size and the active skin, not
+    // on content/scroll/typing. bgThemeGen bumps on every theme change; the
+    // backdrop snapshot records the gen it was painted with (bgSnapGen) so it
+    // is restored with a cheap pixel copy on EVERY frame (not just non-dirty
+    // ones) until the size or skin actually changes. Repainting the ~80 large
+    // feathered blobs each dirty frame is what made glass/gradient skins janky
+    // while scrolling or typing.
+    int bgThemeGen;
+    int bgSnapGen;
+
     static App Create(string title, int width, int height) {
         App app = new App();
         app.window = Window.Create(title, width, height);
@@ -166,6 +183,8 @@ class App {
         app.inputBlockPrevious = false;
         app.clickTargetId = -1;
         app.pressTargetId = -1;
+        app.rightClickTargetId = -1;
+        app.rightPressTargetId = -1;
         app.lastClickId = -1;
         app.lastClickMs = 0;
         app.doubleClickNow = false;
@@ -202,6 +221,10 @@ class App {
         app.animNextMs = -1;
         app.backdropDirty = true;
         app.blurSlotSeq = 0;
+        // gen != snapGen so the wallpaper is painted (and snapshotted) once up
+        // front, then restored from cache until the skin/size changes.
+        app.bgThemeGen = 1;
+        app.bgSnapGen = 0;
         app.canvas = Canvas.Create(width, height);
         // Reset the UI-thread dispatch queue up front (on the UI thread) so
         // App.Post is safe the moment any background worker is spawned.
@@ -236,15 +259,14 @@ class App {
         isDark = dark;
         theme = t;
         theme.ScaleByDpi(dpiScale);
-        // A frosted-glass skin asks the window for a real OS translucent
-        // backdrop; any other skin keeps the window opaque.
-        if (t.glass != 0) {
-            glassNative = true;
-            window.EnableGlass(this.GlassTint());
-        } else {
-            if (glassNative) { window.DisableGlass(); }
-            glassNative = false;
-        }
+        // Frosted glass is rendered in-app: a software blur over the themed
+        // wallpaper on an opaque window. A native OS-acrylic (layered) window
+        // was tried but it altered the look and made the window resize itself
+        // (UpdateLayeredWindow drove the window size), so glass skins stay
+        // software-rendered here. Always drop any layered style if it was set.
+        if (glassNative) { window.DisableGlass(); }
+        glassNative = false;
+        bgThemeGen = bgThemeGen + 1;
         needsRedraw = true;
     }
 
@@ -258,7 +280,7 @@ class App {
     }
 
     /// Turns the title-bar theme button into the built-in skin picker
-    /// (Theme.PresetNames) and has App apply the chosen preset itself â€” no
+    /// (Theme.PresetNames) and has App apply the chosen preset itself â€?no
     /// per-app change handler or switch statement. Every window enables this by
     /// default (see Create); call again to preselect a persisted skin. `index`
     /// must be the skin whose theme is already active so the first frame does
@@ -298,7 +320,7 @@ class App {
     // The wallpaper that makes gradient/glass/neon skins read as real: a
     // vertical gradient plus soft colour blobs the frosted panels blur. Lives
     // in the framework so the IDE, the gallery and any window render identical
-    // skins â€” apps just call RenderBackground behind their content.
+    // skins â€?apps just call RenderBackground behind their content.
 
     /// One soft wallpaper glow: nested translucent disks feathering to a bright
     /// centre (no hard rim), giving the backdrop blur real colour to soften.
@@ -354,7 +376,7 @@ class App {
 
     /// Paints the active skin's window backdrop into [x,y,w,h]: a gradient +
     /// soft colour blobs for gradient/glass presets (so frosted panels blur
-    /// real colour), otherwise a flat bgPrimary fill. Cached per redraw â€”
+    /// real colour), otherwise a flat bgPrimary fill. Cached per redraw â€?
     /// animation-only frames restore the pixels with one copy instead of
     /// repainting the (expensive) blobs. `slot` is a snapshot cache slot the
     /// caller reserves for its backdrop.
@@ -380,8 +402,14 @@ class App {
             return;
         }
         if (t.gradient != 0) {
+            // The wallpaper (gradient + soft blobs) is static per skin+size, so
+            // restore it from the snapshot on every frame -- including dirty
+            // ones -- as long as the skin generation matches. Only a skin change
+            // (bgThemeGen bumped) or a resize (RestoreRect geometry mismatch)
+            // forces the expensive repaint. This keeps glass/gradient skins
+            // smooth while scrolling or typing instead of re-blobbing per frame.
             bool restored = false;
-            if (!this.BackdropDirty()) {
+            if (bgSnapGen == bgThemeGen) {
                 restored = c.RestoreRect(x, y, w, h, slot);
             }
             if (!restored) {
@@ -392,6 +420,7 @@ class App {
                     this.BackdropGradientWallpaper(x, y, w, h);
                 }
                 c.SnapshotRect(x, y, w, h, slot);
+                bgSnapGen = bgThemeGen;
             }
         } else {
             c.FillRect(x, y, w, h, t.bgPrimary);
@@ -560,7 +589,7 @@ class App {
         if (closeH) { c.FillRect(closeX, 0, bw, hbar, closeRed); }
 
         // Caption glyphs render at the small "caption" size (~11px) that Windows
-        // and WeChat use â€” thin and crisp rather than chunky â€” and are centered
+        // and WeChat use â€?thin and crisp rather than chunky â€?and are centered
         // in each 46-wide button for a refined, balanced title bar.
         int gl = (t.iconSizeCaption * 6) / 5;
         int gcolor = t.textSecondary;
@@ -722,7 +751,7 @@ class App {
     }
 
     /// <summary>
-    /// Marshals a delegate onto this window's UI thread â€” the equivalent of
+    /// Marshals a delegate onto this window's UI thread â€?the equivalent of
     /// C#'s <c>Control.Invoke</c>/<c>BeginInvoke</c>. Safe to call from any
     /// thread: the delegate is queued (under an OS mutex in the runtime) and
     /// runs on the UI thread at the start of the next frame, after which a
@@ -867,6 +896,20 @@ class App {
         return 4278190080 + r * 65536 + g * 256 + b;
     }
 
+    /// Scales a packed color's existing alpha channel by permille p (0..1000),
+    /// keeping its RGB. p=1000 returns the color unchanged; p=0 makes it fully
+    /// transparent. Works for both opaque colors and ones that already carry an
+    /// alpha (e.g. glass tokens), so a fill/overlay can fade in and out. Robust
+    /// to the signed-int color packing (see LerpColor).
+    static int ScaleAlpha(int color, int p) {
+        if (p >= 1000) { return color; }
+        if (p < 0) { p = 0; }
+        int rgb = color % 16777216; if (rgb < 0) { rgb = rgb + 16777216; }
+        int a = (color - rgb) / 16777216; if (a < 0) { a = a + 256; }
+        a = a * p / 1000;
+        return rgb + a * 16777216;
+    }
+
     /// A scrollable widget calls this during render to claim the wheel while
     /// hovered. The last hovered claim is the owner on the next input frame, so
     /// a nested view consumes the wheel without also scrolling its parent.
@@ -899,12 +942,13 @@ class App {
     void SetTheme(Theme t) {
         theme = t;
         theme.ScaleByDpi(dpiScale);
+        bgThemeGen = bgThemeGen + 1;
         needsRedraw = true;
     }
 
     bool ProcessEvent() {
         // If a repaint is already pending (e.g. a click handler changed state
-        // mid-frame), don't block waiting for the next OS event â€” poll so the
+        // mid-frame), don't block waiting for the next OS event â€?poll so the
         // new state paints immediately. Otherwise block until an event arrives.
         int result;
         if (needsRedraw) {
@@ -953,8 +997,16 @@ class App {
         // A pure animation repaint wakes with no OS event (kind 0): the content
         // behind glass is unchanged, so its blur + the static wallpaper can be
         // restored from cache. Any real event (input/resize/etc) marks the
-        // backdrop dirty so it is recomputed this frame.
-        backdropDirty = (kind != 0);
+        // backdrop dirty so it is recomputed this frame -- EXCEPT a pure hover
+        // move (kind 1 with no button held). Moving the pointer never changes
+        // the pixels behind glass: the wallpaper is static and hover highlights
+        // paint on foreground widgets over the glass, not behind it. Re-blurring
+        // the whole chrome every time the cursor crosses a widget is what made
+        // the frosted theme feel sluggish, so hover reuses the cached blur +
+        // wallpaper snapshot. A held drag (pressedId >= 0) may scroll/select
+        // content behind glass, so it still dirties the backdrop.
+        bool hoverOnly = (kind == 1) && (focus.pressedId < 0);
+        backdropDirty = (kind != 0) && !hoverOnly;
 
         if (kind == 8) {
             isRunning = false;
@@ -963,7 +1015,7 @@ class App {
 
         // Keep the render surface locked to the real window size. Maximize/restore
         // sends WM_SIZE synchronously (inside ShowWindow), and the one-shot resize
-        // event can be cleared before we read it â€” so drive the surface from the
+        // event can be cleared before we read it â€?so drive the surface from the
         // persistent window dimensions, not the transient kind==7 event. This
         // guarantees Present() blits 1:1 (never stretched/blurry) and that layout
         // + hit-testing use the same coordinate space as the mouse.
@@ -974,7 +1026,7 @@ class App {
                 canvas.Destroy();
                 canvas = Canvas.Create(curW, curH);
                 // Clamp scroll to the new viewport instead of snapping to the
-                // top â€” resizing shouldn't jump the user's scroll position.
+                // top â€?resizing shouldn't jump the user's scroll position.
                 int viewH = curH - titlebarH;
                 int maxScroll = contentHeight - viewH;
                 if (maxScroll < 0) { maxScroll = 0; }
@@ -1018,23 +1070,38 @@ class App {
             mouseX = window.EventX();
             mouseY = window.EventY();
             int hitId = hitTester.HitTest(mouseX, mouseY);
-            focus.SetPressed(hitId);
-            focus.SetFocused(hitId);
-            pressTargetId = hitId;
-            NotePressStart(hitId, mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                // Secondary button: record the target for Ui.RightClicked but
+                // leave the primary focus/press state untouched, so a right
+                // click never steals keyboard focus or arms a primary click.
+                rightPressTargetId = hitId;
+            } else {
+                focus.SetPressed(hitId);
+                focus.SetFocused(hitId);
+                pressTargetId = hitId;
+                NotePressStart(hitId, mouseX, mouseY);
+            }
             needsRedraw = true;
         }
 
         if (kind == 3) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            // Resolve the click target against the still-intact previous-frame
-            // hit regions (popups included, top-most wins) before BeginFrame
-            // clears them, so exactly one widget sees Ui.Clicked this frame.
-            clickTargetId = hitTester.HitTest(mouseX, mouseY);
-            NoteRelease(mouseX, mouseY);
-            NoteClickTarget(clickTargetId);
-            focus.ClearPress();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                // Secondary button release: resolve the right-click target only;
+                // the primary click target stays untouched so Ui.Clicked stays
+                // quiet on a right click.
+                rightClickTargetId = hitId;
+            } else {
+                // Resolve the click target against the still-intact previous-frame
+                // hit regions (popups included, top-most wins) before BeginFrame
+                // clears them, so exactly one widget sees Ui.Clicked this frame.
+                clickTargetId = hitId;
+                NoteRelease(mouseX, mouseY);
+                NoteClickTarget(clickTargetId);
+                focus.ClearPress();
+            }
             needsRedraw = true;
         }
 
@@ -1090,7 +1157,7 @@ class App {
         // Typed character (WM_CHAR) / key down: repaint so focused text fields
         // (e.g. the DataTable filter search box) can consume the keystroke this
         // frame. The event slot still holds the char for widgets to read.
-        if (kind == 6 || kind == 4) {
+        if (kind == 6 || kind == 4 || kind == 5) {
             needsRedraw = true;
         }
 
@@ -1154,20 +1221,29 @@ class App {
             mouseX = window.EventX();
             mouseY = window.EventY();
             int hitId = hitTester.HitTest(mouseX, mouseY);
-            focus.SetPressed(hitId);
-            focus.SetFocused(hitId);
-            pressTargetId = hitId;
-            NotePressStart(hitId, mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                rightPressTargetId = hitId;
+            } else {
+                focus.SetPressed(hitId);
+                focus.SetFocused(hitId);
+                pressTargetId = hitId;
+                NotePressStart(hitId, mouseX, mouseY);
+            }
             needsRedraw = true;
         }
 
         if (kind == 3) {
             mouseX = window.EventX();
             mouseY = window.EventY();
-            clickTargetId = hitTester.HitTest(mouseX, mouseY);
-            NoteRelease(mouseX, mouseY);
-            NoteClickTarget(clickTargetId);
-            focus.ClearPress();
+            int hitId = hitTester.HitTest(mouseX, mouseY);
+            if (window.EventButton() == 1) {
+                rightClickTargetId = hitId;
+            } else {
+                clickTargetId = hitId;
+                NoteRelease(mouseX, mouseY);
+                NoteClickTarget(clickTargetId);
+                focus.ClearPress();
+            }
             needsRedraw = true;
         }
 
@@ -1201,7 +1277,7 @@ class App {
             }
         }
 
-        if (kind == 6 || kind == 4) { needsRedraw = true; }
+        if (kind == 6 || kind == 4 || kind == 5) { needsRedraw = true; }
         return true;
     }
 
@@ -1306,6 +1382,12 @@ class App {
 
     /// Id of the widget the current press (mouse-down) landed on, or -1.
     int PressTarget() { return pressTargetId; }
+
+    /// Id of the widget the current secondary (right) click landed on, or -1.
+    int RightClickTarget() { return rightClickTargetId; }
+
+    /// Id of the widget the current secondary (right) press landed on, or -1.
+    int RightPressTarget() { return rightPressTargetId; }
 
     /// True on the frame a completed click is the second of a double click on
     /// the same widget within the double-click window (see Ui.DoubleClicked).

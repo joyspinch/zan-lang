@@ -1,5 +1,5 @@
 /*
- * zan_gui runtime â€” software 2D renderer with anti-aliasing + system font rendering
+ * zan_gui runtime â€?software 2D renderer with anti-aliasing + system font rendering
  * Cross-platform: Win32 (full), X11 (Linux), Cocoa stubs (macOS)
  */
 
@@ -34,11 +34,16 @@
 #define EXPORT __declspec(dllexport)
 #endif
 #elif defined(__linux__)
+/* X11 headers back the native Linux window shell; the unified SDL backend
+ * (ZAN_GUI_SDL) owns windowing instead, so they are not needed (and the build
+ * need not depend on libX11-dev) in that configuration. */
+#if !defined(ZAN_GUI_SDL)
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#endif
 #include <poll.h>
 #include <time.h>
 #include <locale.h>
@@ -53,6 +58,18 @@
 #define EXPORT __attribute__((visibility("default")))
 #else
 #define EXPORT __attribute__((visibility("default")))
+#endif
+
+/* Unified cross-platform windowing backend. When ZAN_GUI_SDL is defined the
+ * per-platform window shells (Win32/X11/Cocoa) are compiled out and a single
+ * SDL3-based shell drives windowing, input and present â€?the same SDL3 stack
+ * the Game.* stdlib uses, so the IDE and games share one window/render path.
+ * The software rasterizer and system-font text rendering are unchanged; only
+ * the OS window, event pump and present go through SDL. */
+#ifdef ZAN_GUI_SDL
+#define SDL_MAIN_HANDLED
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 #endif
 
 #include "../common/host_oom.h"
@@ -179,7 +196,7 @@ EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
     s->stride = (int)width;
     clip_reset_full(s);
     /* malloc (not calloc): every frame starts with zan_gui_clear covering the
-     * whole surface, so zero-init is wasted work â€” and on large windows the
+     * whole surface, so zero-init is wasted work â€?and on large windows the
      * per-resize zeroing of ~32MB was a noticeable hitch during drag-resize. */
     s->pixels = (u32 *)malloc((size_t)(width * height) * sizeof(u32));
     g_surfaces[id] = s;
@@ -339,7 +356,7 @@ EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
 }
 
 /* Backdrop blur: separable box blur (3 passes ~ Gaussian) over a rectangular
- * region, in place. Used to render frosted-glass panels â€” draw the backdrop,
+ * region, in place. Used to render frosted-glass panels â€?draw the backdrop,
  * blur the region behind a panel, then overlay a translucent tint. Alpha is
  * forced opaque (the backdrop under an overlay is opaque). Edge samples are
  * clamped to the region. Cost is O(passes * area), independent of radius. */
@@ -357,51 +374,81 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
     if (r < 1) return;
     if (r > 40) r = 40;
 
-    size_t n = (size_t)rw * (size_t)rh;
-    u32 *a = (u32 *)malloc(n * sizeof(u32));
-    u32 *b = (u32 *)malloc(n * sizeof(u32));
+    /* Downsampled frosted blur. Box-blurring at full resolution is the
+     * dominant glass cost; for the large radii glass uses we downscale the
+     * region, blur the small copy, then bilinearly upscale. Visually identical
+     * for frost, but the blur runs on ~1/(ds*ds) of the pixels. */
+    int ds = 1;
+    if (r >= 12) { ds = 4; } else if (r >= 6) { ds = 2; }
+    int dw = (rw + ds - 1) / ds;
+    int dh = (rh + ds - 1) / ds;
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    size_t dn = (size_t)dw * (size_t)dh;
+    u32 *a = (u32 *)malloc(dn * sizeof(u32));
+    u32 *b = (u32 *)malloc(dn * sizeof(u32));
     if (!a || !b) { free(a); free(b); return; }
 
-    for (int j = 0; j < rh; j++) {
-        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-        for (int i = 0; i < rw; i++) a[j * rw + i] = row[i];
+    /* Downsample: average each ds x ds source block into one small pixel. */
+    for (int dj = 0; dj < dh; dj++) {
+        int sy0 = dj * ds;
+        int sy1 = sy0 + ds; if (sy1 > rh) sy1 = rh;
+        for (int di = 0; di < dw; di++) {
+            int sx0 = di * ds;
+            int sx1 = sx0 + ds; if (sx1 > rw) sx1 = rw;
+            int sr = 0, sg = 0, sb = 0, cnt = 0;
+            for (int yy = sy0; yy < sy1; yy++) {
+                u32 *row = s->pixels + (y0 + yy) * s->stride + x0;
+                for (int xx = sx0; xx < sx1; xx++) {
+                    u32 px = row[xx];
+                    sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
+                    cnt++;
+                }
+            }
+            if (cnt < 1) cnt = 1;
+            a[dj * dw + di] = 0xFF000000u | ((u32)(sr / cnt) << 16)
+                            | ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
+        }
     }
 
-    int win = 2 * r + 1;
-    for (int p = 0; p < 3; p++) {
+    /* Box blur the small copy (2 passes at reduced radius approximate the
+     * former 3 full-res passes). */
+    int rr = r / ds; if (rr < 1) rr = 1;
+    int win = 2 * rr + 1;
+    for (int p = 0; p < 2; p++) {
         /* horizontal: a -> b */
-        for (int j = 0; j < rh; j++) {
-            u32 *src = a + j * rw;
-            u32 *dst = b + j * rw;
+        for (int j = 0; j < dh; j++) {
+            u32 *src = a + j * dw;
+            u32 *dst = b + j * dw;
             int sr = 0, sg = 0, sb = 0;
-            for (int k = -r; k <= r; k++) {
-                int ii = clamp_i(k, 0, rw - 1);
+            for (int k = -rr; k <= rr; k++) {
+                int ii = clamp_i(k, 0, dw - 1);
                 u32 px = src[ii];
                 sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
             }
-            for (int i = 0; i < rw; i++) {
+            for (int i = 0; i < dw; i++) {
                 dst[i] = 0xFF000000u | ((u32)(sr / win) << 16)
                        | ((u32)(sg / win) << 8) | (u32)(sb / win);
-                u32 pa = src[clamp_i(i + r + 1, 0, rw - 1)];
-                u32 ps = src[clamp_i(i - r, 0, rw - 1)];
+                u32 pa = src[clamp_i(i + rr + 1, 0, dw - 1)];
+                u32 ps = src[clamp_i(i - rr, 0, dw - 1)];
                 sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
                 sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
                 sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
             }
         }
         /* vertical: b -> a */
-        for (int i = 0; i < rw; i++) {
+        for (int i = 0; i < dw; i++) {
             int sr = 0, sg = 0, sb = 0;
-            for (int k = -r; k <= r; k++) {
-                int jj = clamp_i(k, 0, rh - 1);
-                u32 px = b[jj * rw + i];
+            for (int k = -rr; k <= rr; k++) {
+                int jj = clamp_i(k, 0, dh - 1);
+                u32 px = b[jj * dw + i];
                 sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
             }
-            for (int j = 0; j < rh; j++) {
-                a[j * rw + i] = 0xFF000000u | ((u32)(sr / win) << 16)
+            for (int j = 0; j < dh; j++) {
+                a[j * dw + i] = 0xFF000000u | ((u32)(sr / win) << 16)
                               | ((u32)(sg / win) << 8) | (u32)(sb / win);
-                u32 pa = b[clamp_i(j + r + 1, 0, rh - 1) * rw + i];
-                u32 ps = b[clamp_i(j - r, 0, rh - 1) * rw + i];
+                u32 pa = b[clamp_i(j + rr + 1, 0, dh - 1) * dw + i];
+                u32 ps = b[clamp_i(j - rr, 0, dh - 1) * dw + i];
                 sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
                 sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
                 sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
@@ -409,25 +456,60 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
         }
     }
 
-    /* Vibrancy: push each blurred pixel's saturation up (~1.4x) so the frosted
-     * backdrop keeps the colour of the wallpaper behind it -- the hallmark of
-     * Apple-style glass -- instead of washing out to a flat grey once a
-     * translucent tint is laid over it. Luma-preserving so brightness holds. */
-    for (int j = 0; j < rh; j++) {
-        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-        for (int i = 0; i < rw; i++) {
-            u32 px = a[j * rw + i];
-            int rr = (int)((px >> 16) & 0xFF);
-            int gg = (int)((px >> 8) & 0xFF);
-            int bb = (int)(px & 0xFF);
-            int luma = (rr * 77 + gg * 150 + bb * 29) >> 8;
-            rr = luma + (rr - luma) * 7 / 5;
-            gg = luma + (gg - luma) * 7 / 5;
-            bb = luma + (bb - luma) * 7 / 5;
-            rr = clamp_i(rr, 0, 255);
-            gg = clamp_i(gg, 0, 255);
-            bb = clamp_i(bb, 0, 255);
-            row[i] = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+    /* Vibrancy (luma-preserving ~1.4x saturation) on the small copy so the
+     * frost keeps the wallpaper's colour instead of washing to grey. */
+    for (int i = 0; i < (int)dn; i++) {
+        u32 px = a[i];
+        int rc = (int)((px >> 16) & 0xFF);
+        int gc = (int)((px >> 8) & 0xFF);
+        int bc = (int)(px & 0xFF);
+        int luma = (rc * 77 + gc * 150 + bc * 29) >> 8;
+        rc = luma + (rc - luma) * 7 / 5;
+        gc = luma + (gc - luma) * 7 / 5;
+        bc = luma + (bc - luma) * 7 / 5;
+        a[i] = 0xFF000000u | ((u32)clamp_i(rc, 0, 255) << 16)
+             | ((u32)clamp_i(gc, 0, 255) << 8) | (u32)clamp_i(bc, 0, 255);
+    }
+
+    /* Upscale the small blurred copy back into the surface region. */
+    if (ds == 1) {
+        for (int j = 0; j < rh; j++) {
+            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+            u32 *src = a + j * dw;
+            for (int i = 0; i < rw; i++) row[i] = src[i];
+        }
+    } else {
+        /* Bilinear: sample the small copy at each full-res pixel centre
+         * (fixed-point, 8 fractional bits). */
+        for (int j = 0; j < rh; j++) {
+            int fy = ((j * 2 + 1) * 256) / (ds * 2) - 128;
+            if (fy < 0) fy = 0;
+            int gy = fy >> 8; int wy = fy & 255;
+            if (gy > dh - 1) { gy = dh - 1; wy = 0; }
+            int gy1 = gy + 1; if (gy1 > dh - 1) gy1 = dh - 1;
+            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+            for (int i = 0; i < rw; i++) {
+                int fx = ((i * 2 + 1) * 256) / (ds * 2) - 128;
+                if (fx < 0) fx = 0;
+                int gx = fx >> 8; int wx = fx & 255;
+                if (gx > dw - 1) { gx = dw - 1; wx = 0; }
+                int gx1 = gx + 1; if (gx1 > dw - 1) gx1 = dw - 1;
+                u32 p00 = a[gy * dw + gx];
+                u32 p01 = a[gy * dw + gx1];
+                u32 p10 = a[gy1 * dw + gx];
+                u32 p11 = a[gy1 * dw + gx1];
+                int w00 = (256 - wx) * (256 - wy);
+                int w01 = wx * (256 - wy);
+                int w10 = (256 - wx) * wy;
+                int w11 = wx * wy;
+                int rC = ((int)((p00 >> 16) & 0xFF) * w00 + (int)((p01 >> 16) & 0xFF) * w01
+                        + (int)((p10 >> 16) & 0xFF) * w10 + (int)((p11 >> 16) & 0xFF) * w11) >> 16;
+                int gC = ((int)((p00 >> 8) & 0xFF) * w00 + (int)((p01 >> 8) & 0xFF) * w01
+                        + (int)((p10 >> 8) & 0xFF) * w10 + (int)((p11 >> 8) & 0xFF) * w11) >> 16;
+                int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01
+                        + (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >> 16;
+                row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+            }
         }
     }
     free(a); free(b);
@@ -594,7 +676,7 @@ EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
 
     /* Fill the interior as three rects that EXCLUDE the four r*r corner squares,
      * then draw each corner as a quarter circle over just its square. Every
-     * pixel is thus written exactly once â€” filling the interior and full corner
+     * pixel is thus written exactly once â€?filling the interior and full corner
      * circles would double-blend their overlap and darken corners for
      * translucent fills. */
     int xl = ix + r, xr = ix + iw - r;      /* inner corner-zone boundaries */
@@ -771,7 +853,7 @@ EXPORT void *zan_gui_get_pixels(i64 surface_id) {
 }
 
 /* ========================================================================
- * Text Rendering â€” Platform-specific (Win32: GDI, Linux: Xft/fallback)
+ * Text Rendering â€?Platform-specific (Win32: GDI, Linux: Xft/fallback)
  * ======================================================================== */
 
 #ifdef _WIN32
@@ -1012,6 +1094,9 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
 /* ========================================================================
  * Win32 Window Shell
  * ======================================================================== */
+/* Compiled out when the unified SDL backend owns windowing (see ZAN_GUI_SDL
+ * shell below); the Win32 GDI *text* rendering above still builds. */
+#if !defined(ZAN_GUI_SDL)
 
 static HWND g_main_hwnd = NULL;
 /* Source window of the most recently reported event, so an app that owns more
@@ -1033,7 +1118,7 @@ static int g_window_width = 0, g_window_height = 0;
  * through the gaps while opaque widgets/text stay crisp.
  *
  * Robustness: the present hands UpdateLayeredWindow a NULL destination point
- * so it only updates the *content*, never the window position â€” the OS keeps
+ * so it only updates the *content*, never the window position â€?the OS keeps
  * ownership of where the window is. That is what makes a title-bar drag stay
  * in sync (an earlier version repositioned the window on every present from a
  * stale GetWindowRect, which fought the modal move loop and left the content
@@ -1177,7 +1262,7 @@ static void blit_surface_to_hwnd(HWND hwnd, zan_surface_t *s) {
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
-    /* Blit the last frame crisply at 1:1 (never stretched â€” stretching looks
+    /* Blit the last frame crisply at 1:1 (never stretched â€?stretching looks
      * rubbery/blurry during a drag-resize). Any client area beyond the frame is
      * filled with the canvas background so a grow-resize shows solid bg in the
      * new region until the app thread repaints it crisply. */
@@ -1798,13 +1883,554 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     return 0;
 }
 
+#endif /* !ZAN_GUI_SDL (Win32 window shell) */
+
 #endif /* _WIN32 */
+
+/* ========================================================================
+ * Unified SDL3 Window Shell  (ZAN_GUI_SDL)
+ * ------------------------------------------------------------------------
+ * A single cross-platform windowing/event/present backend built on SDL3 â€?
+ * the same stack the Game.* stdlib uses via zan_sdl3, so the IDE window is an
+ * SDL window unified with games. The software rasterizer still paints into a
+ * CPU surface; here that surface is uploaded to a per-window streaming texture
+ * and presented through the SDL renderer (D3D11/Metal/Vulkan/GL, chosen by
+ * SDL). The exported ABI is byte-for-byte the one Gui.Window imports, so no
+ * Zan code changes. Borderless chrome + drag/resize is delivered through
+ * SDL_SetWindowHitTest, mirroring the old WM_NCHITTEST regions. Event codes,
+ * VK keycodes and modifier bits match the Win32 encoding Gui/App.zan expects.
+ * ======================================================================== */
+
+#ifdef ZAN_GUI_SDL
+
+/* Borderless-window chrome metrics (device px), reported to Zan so its custom
+ * title bar and caption-button hit regions line up with the drag/resize
+ * regions the hit-test below carves out. */
+static int g_dpi = 96;
+static int g_titlebar_h = 32;
+static int g_btn_w = 46;
+static int g_caption_btn_count = 5;
+
+/* Last reported event, in the shared int[8] protocol:
+ * [0]=kind [1]=x [2]=y [3]=button [4]=keycode/char/delta [5]=modifiers. */
+static int g_pending_event[8];
+static SDL_Window *g_event_win = NULL; /* window that produced g_pending_event */
+static SDL_Window *g_main_win = NULL;  /* first window: closing it quits */
+static int g_window_width = 0, g_window_height = 0; /* last-resized size (px) */
+static int g_sdl_ready = 0;
+static int g_quit = 0;
+static Uint32 g_wake_event = 0; /* user event type posted by zan_gui_wake */
+static int g_ime_x = 0, g_ime_y = 0;
+
+/* Per-window renderer + streaming texture registry. The handle handed back to
+ * Zan is the SDL_Window* (cast to i64), exactly like the Win32 HWND was. */
+typedef struct {
+    SDL_Window   *win;
+    SDL_Renderer *ren;
+    SDL_Texture  *tex;
+    int           tw, th; /* current texture size */
+} zan_sdl_win_t;
+#define ZAN_SDL_MAX_WIN 32
+static zan_sdl_win_t g_wins[ZAN_SDL_MAX_WIN];
+static int g_win_count = 0;
+
+static zan_sdl_win_t *sdl_find(SDL_Window *w) {
+    for (int i = 0; i < g_win_count; i++)
+        if (g_wins[i].win == w) return &g_wins[i];
+    return NULL;
+}
+
+/* --- internal event queue: one SDL event may yield 0..N zan events (e.g. an
+ * IME text commit expands to one kind-6 per codepoint). ------------------- */
+typedef struct { int e[8]; SDL_Window *win; } zan_zev_t;
+#define ZAN_ZQ_CAP 512
+static zan_zev_t g_zq[ZAN_ZQ_CAP];
+static int g_zq_head = 0, g_zq_tail = 0;
+
+static int zq_empty(void) { return g_zq_head == g_zq_tail; }
+
+static void zq_push(int kind, int x, int y, int button, int code, int mods,
+                    SDL_Window *win) {
+    /* Coalesce mouse-move floods: unlike Win32 (which collapses WM_MOUSEMOVE),
+     * SDL emits one motion event per sample, so a fast drag can enqueue
+     * hundreds. The app consumes one event per ~16ms frame, so an un-coalesced
+     * backlog makes the UI (and hover highlights) lag seconds behind the
+     * cursor. If the last unconsumed event is also a plain move on the same
+     * window, overwrite it with the newer position instead of enqueuing. */
+    if (kind == 1 && !zq_empty()) {
+        int last = (g_zq_tail + ZAN_ZQ_CAP - 1) % ZAN_ZQ_CAP;
+        zan_zev_t *p = &g_zq[last];
+        if (p->e[0] == 1 && p->win == win) {
+            p->e[1] = x; p->e[2] = y; p->e[5] = mods;
+            return;
+        }
+    }
+    int next = (g_zq_tail + 1) % ZAN_ZQ_CAP;
+    if (next == g_zq_head) return; /* full: drop oldest-safe (never overwrite) */
+    zan_zev_t *z = &g_zq[g_zq_tail];
+    z->e[0] = kind; z->e[1] = x; z->e[2] = y; z->e[3] = button;
+    z->e[4] = code; z->e[5] = mods; z->e[6] = 0; z->e[7] = 0;
+    z->win = win;
+    g_zq_tail = next;
+}
+
+/* Pop the front zan event into the reported slots. Caller checks !zq_empty. */
+static void zq_pop(void) {
+    zan_zev_t *z = &g_zq[g_zq_head];
+    for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
+    g_event_win = z->win;
+    g_zq_head = (g_zq_head + 1) % ZAN_ZQ_CAP;
+}
+
+/* Map an SDL keycode to the Win32 virtual-key code Gui/Keys expects. Letters
+ * and digits share their ASCII value with VK codes; the rest are switched. */
+static int sdl_key_to_vk(SDL_Keycode k) {
+    if (k >= 'a' && k <= 'z') return 65 + (int)(k - 'a'); /* VK 'A'..'Z' */
+    if (k >= '0' && k <= '9') return (int)k;              /* VK '0'..'9' */
+    switch (k) {
+        case SDLK_ESCAPE:    return 27;
+        case SDLK_RETURN:    return 13;
+        case SDLK_KP_ENTER:  return 13;
+        case SDLK_TAB:       return 9;
+        case SDLK_BACKSPACE: return 8;
+        case SDLK_DELETE:    return 46;
+        case SDLK_INSERT:    return 45;
+        case SDLK_LEFT:      return 37;
+        case SDLK_UP:        return 38;
+        case SDLK_RIGHT:     return 39;
+        case SDLK_DOWN:      return 40;
+        case SDLK_HOME:      return 36;
+        case SDLK_END:       return 35;
+        case SDLK_PAGEUP:    return 33;
+        case SDLK_PAGEDOWN:  return 34;
+        case SDLK_SPACE:     return 32;
+        case SDLK_F1:  return 112; case SDLK_F2:  return 113;
+        case SDLK_F3:  return 114; case SDLK_F4:  return 115;
+        case SDLK_F5:  return 116; case SDLK_F6:  return 117;
+        case SDLK_F7:  return 118; case SDLK_F8:  return 119;
+        case SDLK_F9:  return 120; case SDLK_F10: return 121;
+        case SDLK_F11: return 122; case SDLK_F12: return 123;
+        default:             return (k < 128) ? (int)k : 0;
+    }
+}
+
+static int sdl_mods_to_bits(SDL_Keymod m) {
+    int r = 0;
+    if (m & SDL_KMOD_CTRL)  r |= 1;
+    if (m & SDL_KMOD_SHIFT) r |= 2;
+    if (m & SDL_KMOD_ALT)   r |= 4;
+    return r;
+}
+
+static int cur_mod_bits(void) { return sdl_mods_to_bits(SDL_GetModState()); }
+
+/* Decode one UTF-8 codepoint from s (advancing *i); returns -1 at end. */
+static int sdl_utf8_next(const char *s, int *i) {
+    unsigned char c = (unsigned char)s[*i];
+    if (c == 0) return -1;
+    int cp, n;
+    if (c < 0x80)      { cp = c;        n = 1; }
+    else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
+    else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
+    else               { cp = c & 0x07; n = 4; }
+    for (int k = 1; k < n; k++) {
+        unsigned char cc = (unsigned char)s[*i + k];
+        if ((cc & 0xC0) != 0x80) { n = k; break; }
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    *i += n;
+    return cp;
+}
+
+/* Translate one SDL event into 0..N queued zan events. */
+static void sdl_translate(const SDL_Event *e) {
+    switch (e->type) {
+        case SDL_EVENT_QUIT:
+            zq_push(8, 0, 0, 0, 0, 0, g_main_win);
+            g_quit = 1;
+            break;
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED: {
+            SDL_Window *w = SDL_GetWindowFromID(e->window.windowID);
+            zq_push(8, 0, 0, 0, 0, 0, w);
+            if (w == g_main_win) g_quit = 1;
+            break;
+        }
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
+            SDL_Window *w = SDL_GetWindowFromID(e->window.windowID);
+            int pw = 0, ph = 0;
+            if (w) SDL_GetWindowSizeInPixels(w, &pw, &ph);
+            if (pw > 0 && ph > 0) { g_window_width = pw; g_window_height = ph; }
+            zq_push(7, pw, ph, 0, 0, 0, w);
+            break;
+        }
+        case SDL_EVENT_MOUSE_MOTION: {
+            SDL_Window *w = SDL_GetWindowFromID(e->motion.windowID);
+            zq_push(1, (int)e->motion.x, (int)e->motion.y, 0, 0,
+                    cur_mod_bits(), w);
+            break;
+        }
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP: {
+            SDL_Window *w = SDL_GetWindowFromID(e->button.windowID);
+            int btn = (e->button.button == SDL_BUTTON_RIGHT) ? 1 : 0;
+            int kind = (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN) ? 2 : 3;
+            zq_push(kind, (int)e->button.x, (int)e->button.y, btn, 0,
+                    cur_mod_bits(), w);
+            break;
+        }
+        case SDL_EVENT_MOUSE_WHEEL: {
+            SDL_Window *w = SDL_GetWindowFromID(e->wheel.windowID);
+            /* Report a Win32-style Â±120 delta so Gui/App's /120 math holds. */
+            int delta = (int)(e->wheel.y * 120.0f);
+            zq_push(13, (int)e->wheel.mouse_x, (int)e->wheel.mouse_y, 0,
+                    delta, cur_mod_bits(), w);
+            break;
+        }
+        case SDL_EVENT_KEY_DOWN: {
+            SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
+            zq_push(4, 0, 0, 0, sdl_key_to_vk(e->key.key),
+                    sdl_mods_to_bits(e->key.mod), w);
+            break;
+        }
+        case SDL_EVENT_KEY_UP: {
+            SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
+            zq_push(5, 0, 0, 0, sdl_key_to_vk(e->key.key),
+                    sdl_mods_to_bits(e->key.mod), w);
+            break;
+        }
+        case SDL_EVENT_TEXT_INPUT: {
+            SDL_Window *w = SDL_GetWindowFromID(e->text.windowID);
+            const char *txt = e->text.text;
+            int i = 0, cp;
+            /* One kind-6 (WM_CHAR-equivalent) per codepoint of the commit. */
+            while ((cp = sdl_utf8_next(txt, &i)) > 0)
+                zq_push(6, 0, 0, 0, cp, 0, w);
+            break;
+        }
+        default:
+            /* g_wake_event and everything else: no zan event. */
+            break;
+    }
+}
+
+/* Borderless drag/resize regions â€?the SDL analogue of WM_NCHITTEST: an 8px
+ * (DPI-scaled) resize border, a draggable caption strip minus the caption
+ * button cluster on the right, everything else client. */
+static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
+                                                 const SDL_Point *area,
+                                                 void *data) {
+    (void)data;
+    int W = 0, H = 0;
+    SDL_GetWindowSize(win, &W, &H);
+    int x = area->x, y = area->y;
+    int b = 8 * g_dpi / 96;
+    int maxed = (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
+    int inButtons = (y < g_titlebar_h &&
+                     x >= W - g_caption_btn_count * g_btn_w);
+    if (!maxed && !inButtons) {
+        int left = x < b, right = x >= W - b, top = y < b, bottom = y >= H - b;
+        if (top && left)     return SDL_HITTEST_RESIZE_TOPLEFT;
+        if (top && right)    return SDL_HITTEST_RESIZE_TOPRIGHT;
+        if (bottom && left)  return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+        if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+        if (left)   return SDL_HITTEST_RESIZE_LEFT;
+        if (right)  return SDL_HITTEST_RESIZE_RIGHT;
+        if (top)    return SDL_HITTEST_RESIZE_TOP;
+        if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+    }
+    if (inButtons) return SDL_HITTEST_NORMAL;
+    if (y < g_titlebar_h) return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
+static void zan_sdl_ensure_init(void) {
+    if (g_sdl_ready) return;
+    SDL_SetMainReady();
+    if (!SDL_Init(SDL_INIT_VIDEO)) return;
+    float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    if (scale <= 0.0f) scale = 1.0f;
+    g_dpi = (int)(scale * 96.0f + 0.5f);
+    g_titlebar_h = 32 * g_dpi / 96;
+    g_btn_w = 46 * g_dpi / 96;
+    g_wake_event = SDL_RegisterEvents(1);
+    g_sdl_ready = 1;
+}
+
+EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
+    zan_sdl_ensure_init();
+    if (!g_sdl_ready || g_win_count >= ZAN_SDL_MAX_WIN) return 0;
+
+    int w = (int)width * g_dpi / 96;
+    int h = (int)height * g_dpi / 96;
+    SDL_WindowFlags flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_RESIZABLE |
+                            SDL_WINDOW_HIDDEN;
+    SDL_Window *win = SDL_CreateWindow(title ? title : "", w, h, flags);
+    if (!win) return 0;
+    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
+    if (!ren) { SDL_DestroyWindow(win); return 0; }
+    /* App paces its own frames (needsRedraw + 16ms sleep); leave VSync off so a
+     * present never blocks the UI thread up to a refresh interval. */
+    SDL_SetRenderVSync(ren, 0);
+    SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
+
+    zan_sdl_win_t *rec = &g_wins[g_win_count++];
+    rec->win = win; rec->ren = ren; rec->tex = NULL; rec->tw = rec->th = 0;
+
+    if (!g_main_win) {
+        g_main_win = win;
+        g_window_width = w; g_window_height = h;
+    } else {
+        /* Center a secondary window (dialog) over the main window, clamped to
+         * the display's usable area â€?mirrors the Win32 dialog placement. */
+        int mx = 0, my = 0, mw = 0, mh = 0;
+        SDL_GetWindowPosition(g_main_win, &mx, &my);
+        SDL_GetWindowSize(g_main_win, &mw, &mh);
+        int x = mx + (mw - w) / 2, y = my + (mh - h) / 2;
+        SDL_Rect ub;
+        if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &ub)) {
+            if (x < ub.x) x = ub.x;
+            if (y < ub.y) y = ub.y;
+            if (x + w > ub.x + ub.w) x = ub.x + ub.w - w;
+            if (y + h > ub.y + ub.h) y = ub.y + ub.h - h;
+        }
+        SDL_SetWindowPosition(win, x, y);
+    }
+    return (i64)(intptr_t)win;
+}
+
+EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win) return 1;
+    SDL_ShowWindow(win);
+    SDL_RaiseWindow(win);
+    /* Route typed text (incl. IME commits) to this window. */
+    SDL_StartTextInput(win);
+    return 0;
+}
+
+EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
+    SDL_MinimizeWindow((SDL_Window *)(intptr_t)hwnd_val);
+    return 0;
+}
+
+EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(win);
+    else SDL_MaximizeWindow(win);
+    return 0;
+}
+
+EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    zq_push(8, 0, 0, 0, 0, 0, win);
+    if (win == g_main_win) g_quit = 1;
+    return 0;
+}
+
+EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    return (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
+}
+
+EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
+EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
+
+EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+    if (count >= 0 && count <= 8) g_caption_btn_count = (int)count;
+    return 0;
+}
+
+EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
+    SDL_SetWindowAlwaysOnTop((SDL_Window *)(intptr_t)hwnd_val, on ? true : false);
+    return 0;
+}
+
+/* Drain every SDL event currently available into the zan queue. Motion events
+ * coalesce in zq_push, so this collapses a burst of samples to the single
+ * latest position and, crucially, never leaves motion piling up in SDL's own
+ * queue between frames (which is what starved the one-event-per-frame app). */
+static void sdl_drain(void) {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) sdl_translate(&e);
+}
+
+EXPORT i64 zan_gui_poll_event(void) {
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (!g_sdl_ready) return 1;
+    sdl_drain();
+    if (zq_empty()) return (g_quit) ? -1 : 1;
+    zq_pop();
+    return 0;
+}
+
+EXPORT i64 zan_gui_wait_event(void) {
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (!g_sdl_ready) return -1;
+    if (zq_empty()) {
+        SDL_Event e;
+        if (!SDL_WaitEvent(&e)) return -1;
+        sdl_translate(&e);
+        sdl_drain(); /* fold in anything already waiting behind it */
+    }
+    if (!zq_empty()) zq_pop(); /* else leaves kind 0 (e.g. a wake) */
+    return 0;
+}
+
+EXPORT i64 zan_gui_wake(void) {
+    if (!g_sdl_ready) return 0;
+    SDL_Event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = g_wake_event;
+    SDL_PushEvent(&ev);
+    return 0;
+}
+
+EXPORT i64 zan_gui_event_kind(void)    { return g_pending_event[0]; }
+EXPORT i64 zan_gui_event_x(void)       { return g_pending_event[1]; }
+EXPORT i64 zan_gui_event_y(void)       { return g_pending_event[2]; }
+EXPORT i64 zan_gui_event_button(void)  { return g_pending_event[3]; }
+EXPORT i64 zan_gui_event_keycode(void) { return g_pending_event[4]; }
+EXPORT i64 zan_gui_event_mods(void)    { return g_pending_event[5]; }
+
+EXPORT i64 zan_gui_window_width(void)  { return g_window_width; }
+EXPORT i64 zan_gui_window_height(void) { return g_window_height; }
+
+EXPORT i64 zan_gui_event_hwnd(void) { return (i64)(intptr_t)g_event_win; }
+
+EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    int w = 0, h = 0;
+    if (!win || !SDL_GetWindowSizeInPixels(win, &w, &h)) return 0;
+    return w;
+}
+
+EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    int w = 0, h = 0;
+    if (!win || !SDL_GetWindowSizeInPixels(win, &w, &h)) return 0;
+    return h;
+}
+
+EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (surface_id < 0 || surface_id >= g_surface_count ||
+        !g_surfaces[surface_id]) return 1;
+    zan_sdl_win_t *rec = sdl_find(win);
+    if (!rec) return 1;
+    zan_surface_t *s = g_surfaces[surface_id];
+    g_last_surface = surface_id;
+
+    if (!rec->tex || rec->tw != s->width || rec->th != s->height) {
+        if (rec->tex) SDL_DestroyTexture(rec->tex);
+        rec->tex = SDL_CreateTexture(rec->ren, SDL_PIXELFORMAT_ARGB8888,
+                                     SDL_TEXTUREACCESS_STREAMING,
+                                     s->width, s->height);
+        if (!rec->tex) return 1;
+        SDL_SetTextureScaleMode(rec->tex, SDL_SCALEMODE_NEAREST);
+        rec->tw = s->width; rec->th = s->height;
+    }
+    SDL_UpdateTexture(rec->tex, NULL, s->pixels, s->width * 4);
+
+    /* Clear the (possibly larger) window to the canvas background so a live
+     * grow-resize shows solid bg rather than stretched/garbage pixels, then
+     * blit the frame 1:1 â€?never stretched. */
+    SDL_SetRenderDrawColor(rec->ren, (g_bg_color >> 16) & 0xFF,
+                           (g_bg_color >> 8) & 0xFF, g_bg_color & 0xFF, 255);
+    SDL_RenderClear(rec->ren);
+    SDL_FRect dst = { 0.0f, 0.0f, (float)s->width, (float)s->height };
+    SDL_RenderTexture(rec->ren, rec->tex, NULL, &dst);
+    SDL_RenderPresent(rec->ren);
+    return 0;
+}
+
+EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
+    SDL_SetWindowTitle((SDL_Window *)(intptr_t)hwnd_val, title ? title : "");
+    return 0;
+}
+
+EXPORT i64 zan_gui_set_cursor(i64 cursor_type) {
+    static SDL_Cursor *cache[6];
+    static int made = 0;
+    if (!made) {
+        cache[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
+        cache[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
+        cache[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_WAIT);
+        cache[3] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
+        cache[4] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
+        cache[5] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
+        made = 1;
+    }
+    int t = (int)cursor_type;
+    if (t < 0 || t > 5) t = 0;
+    if (cache[t]) SDL_SetCursor(cache[t]);
+    return 0;
+}
+
+EXPORT i64 zan_gui_get_dpi_scale(void) { return (i64)(g_dpi * 100 / 96); }
+
+EXPORT i64 zan_gui_get_tick_ms(void) { return (i64)SDL_GetTicks(); }
+
+EXPORT void zan_gui_sleep_ms(i64 ms) { if (ms > 0) SDL_Delay((Uint32)ms); }
+
+EXPORT i64 zan_gui_set_clipboard(const char *utf8) {
+    if (!utf8) return -1;
+    return SDL_SetClipboardText(utf8) ? 0 : -1;
+}
+
+EXPORT const char *zan_gui_get_clipboard(void) {
+    static char *g_clip_buf = NULL;
+    if (!SDL_HasClipboardText()) return "";
+    char *t = SDL_GetClipboardText(); /* SDL-allocated, must SDL_free */
+    if (!t) return "";
+    size_t n = strlen(t);
+    char *nb = (char *)malloc(n + 1);
+    if (!nb) { SDL_free(t); return ""; }
+    memcpy(nb, t, n + 1);
+    SDL_free(t);
+    free(g_clip_buf);
+    g_clip_buf = nb;
+    return g_clip_buf;
+}
+
+EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
+    g_ime_x = (int)x; g_ime_y = (int)y;
+    SDL_Window *win = g_event_win ? g_event_win : g_main_win;
+    if (win) {
+        SDL_Rect r = { (int)x, (int)y, 1, g_titlebar_h };
+        SDL_SetTextInputArea(win, &r, 0);
+    }
+}
+
+/* Native OS glass has no portable SDL equivalent; the software frosted-glass
+ * baked into the surface still renders. These stay as safe no-ops so themes
+ * that toggle glass keep working under the unified backend. */
+EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+    (void)hwnd_val; (void)tint_argb; return 0;
+}
+EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 0; }
+
+EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
+    if (!path || !utf8) return -1;
+    SDL_IOStream *io = SDL_IOFromFile(path, "wb");
+    if (!io) return -1;
+    static const unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };
+    SDL_WriteIO(io, bom, 3);
+    size_t len = strlen(utf8);
+    size_t wr = (len > 0) ? SDL_WriteIO(io, utf8, len) : 0;
+    SDL_CloseIO(io);
+    return (wr == len) ? 0 : -1;
+}
+
+#endif /* ZAN_GUI_SDL */
 
 /* ========================================================================
  * Linux X11 Window Shell
  * ======================================================================== */
 
-#ifdef __linux__
+/* Compiled out when the unified SDL backend owns windowing (ZAN_GUI_SDL); the
+ * shared software rasterizer and FreeType/software text above still build. */
+#if defined(__linux__) && !defined(ZAN_GUI_SDL)
 
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
@@ -2438,7 +3064,7 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
     req.tv_nsec = (long)((ms % 1000) * 1000000L);
     nanosleep(&req, NULL);
 }
-#endif /* __linux__ */
+#endif /* __linux__ && !ZAN_GUI_SDL (X11 window shell) */
 
 /* ========================================================================
  * Software bitmap-font fallback for non-Windows/non-Cocoa backends.
@@ -3200,7 +3826,7 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
     }
 }
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(ZAN_GUI_SDL)
 /* ---- window management (EWMH / Xlib) ---- */
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
@@ -3437,7 +4063,7 @@ EXPORT const char *zan_gui_get_clipboard(void) {
     g_clip_read_linux = text;
     return g_clip_read_linux;
 }
-#endif /* __linux__ */
+#endif /* __linux__ && !ZAN_GUI_SDL (X11 window management) */
 
 /* ========================================================================
  * macOS (and other non-Windows, non-Linux) windowing.
@@ -3445,8 +4071,9 @@ EXPORT const char *zan_gui_get_clipboard(void) {
  * When ZAN_GUI_COCOA is defined the real Cocoa backend in gui_runtime_mac.m
  * provides these; otherwise they are no-op stubs so the library still links.
  * Text rendering is the shared software path above, so it is omitted here.
- * ======================================================================== */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+ * The unified SDL backend (ZAN_GUI_SDL) supplies real implementations, so the
+ * stubs are compiled out there too. */
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 
 EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
@@ -3477,15 +4104,16 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
  * ========================================================================
  * The Win32, X11 and Cocoa backends all draw their own client-side title bar
  * and supply these; only the headless/no-op fallback reports 0. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
 #endif
 
 /* write_file is portable across every non-Win32 backend (X11, Cocoa and the
- * no-op fallback all need it), so it lives outside the CSD-metrics guard. */
-#if !defined(_WIN32)
+ * no-op fallback all need it), so it lives outside the CSD-metrics guard. The
+ * SDL backend supplies its own (SDL_IOStream) write_file. */
+#if !defined(_WIN32) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     FILE *f = fopen(path, "wb");
     if (!f) return 1;
@@ -3499,7 +4127,7 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
  * macOS (NSVisualEffectView) and Linux (compositor blur) get real backends in
  * their own sections; any other target links a no-op so the cross-platform
  * Gui.Native.Window.EnableGlass entry points resolve everywhere. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     (void)hwnd_val; (void)tint_argb; return 1;
 }
@@ -3509,7 +4137,7 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 1; }
 /* Window management: X11 has real implementations in the __linux__ branch
  * above; the Cocoa backend (ZAN_GUI_COCOA) provides them on macOS. Any other
  * non-Windows target falls back to no-ops. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
