@@ -200,6 +200,52 @@ System prompt codes follow the documented App contract: `1` skill cooldown,
 `TryUsePortal` preserves the player instance, including inventory, equipment,
 cooldowns and Buffs, while replacing map-local NPC instances.
 
+## Graphical controls and data binding
+
+DM-style controls live in `Game.Arpg` rather than `Gui`. They are rendered and
+hit-tested in game coordinates and can contain text or sprite prefab nodes:
+
+```zan
+ArpgDataSource status = ArpgDataSource.Create();
+status.SetText("name", "Hero");
+status.SetNumber("hp", 80.0);
+status.SetNumber("maxhp", 100.0);
+
+ArpgNodeDefinition caption = ArpgNodeDefinition.Create(
+    "caption", ArpgNodeKind.Text(), 8, 8, 180, 24);
+caption.SetContent("&name&", false);
+caption.SetMouseEvents(true);
+
+ArpgControlDefinition box = ArpgControlDefinition.Create(
+    "status", ArpgControlKind.RichTextBox(), 20, 20, 240, 80);
+box.SetDataSource(status);
+box.SetMouseEvents(true);
+box.SetContent(
+    "#Y&name&#W {if &hp& > 0}&hp&/&maxhp&{else}defeated{end}",
+    true);
+box.AddNode(caption);
+
+ArpgWindowDefinition hud = ArpgWindowDefinition.Create("hud", 300, 120);
+hud.SetVisibleByDefault(true);
+hud.AddControl(box);
+project.AddWindow(hud);
+```
+
+If a control or node has no explicit data source, `ArpgUiRuntime` evaluates it
+against the current player's live values. Nested paths such as
+`&属性.攻击&` resolve through `ArpgDataSource.SetNumber("属性.攻击", ...)`.
+Templates support nested `if`, `elseif`, `else` and `end` blocks.
+
+`ArpgRichText.Parse` evaluates templates first and then emits typed runs for
+color/font/background changes, images, animations, spacing, wrapping, items
+and `#@trigger@label@` links. Link activation is delivered to both the control
+handler and `engine.Events().OnRichTextLink(...)`.
+
+Pointer events are dispatched from the highest graphical window and control to
+the highest node under the cursor. A node can consume the event; otherwise it
+bubbles through its control to the window. `engine.Ui()` exposes live windows,
+controls, evaluated content and RichText documents.
+
 ## Screen modes
 
 - `ArpgScreenMode.Fixed()` (`0`): fixed-size window.

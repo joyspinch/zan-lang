@@ -53,4 +53,4 @@ The Windows x64 driver bundle is implemented and tested. Linux and macOS use
 the same `zan_sdl_*` bridge ABI but still need native driver assembly scripts.
 
 Run `scripts/stage_sdl3.ps1` after cloning or when updating SDL. Native binaries
-are not committed to Git.
+are committed with the stdlib for supported targets.

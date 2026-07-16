@@ -1,0 +1,512 @@
+using System;
+using System.Text;
+
+namespace Game.Arpg;
+
+class ArpgValueKind {
+    static int Null() { return 0; }
+    static int Text() { return 1; }
+    static int Number() { return 2; }
+    static int Boolean() { return 3; }
+    static int Object() { return 4; }
+}
+
+/// <summary>Dynamic value tree used by game controls and template expressions.</summary>
+class ArpgValue {
+    int kind;
+    string textValue;
+    double numberValue;
+    bool boolValue;
+    List<string> keys;
+    List<ArpgValue> values;
+
+    static ArpgValue Null() {
+        ArpgValue newValue = new ArpgValue();
+        newValue.kind = ArpgValueKind.Null();
+        newValue.textValue = "";
+        newValue.keys = new List<string>();
+        newValue.values = new List<ArpgValue>();
+        return newValue;
+    }
+
+    static ArpgValue Text(string text) {
+        ArpgValue newValue = Null();
+        newValue.kind = ArpgValueKind.Text();
+        newValue.textValue = text;
+        return newValue;
+    }
+
+    static ArpgValue Number(double number) {
+        ArpgValue newValue = Null();
+        newValue.kind = ArpgValueKind.Number();
+        newValue.numberValue = number;
+        return newValue;
+    }
+
+    static ArpgValue Integer(int number) {
+        return Number((double)number);
+    }
+
+    static ArpgValue Boolean(bool enabled) {
+        ArpgValue newValue = Null();
+        newValue.kind = ArpgValueKind.Boolean();
+        newValue.boolValue = enabled;
+        return newValue;
+    }
+
+    static ArpgValue Object() {
+        ArpgValue newValue = Null();
+        newValue.kind = ArpgValueKind.Object();
+        return newValue;
+    }
+
+    int Kind() { return this.kind; }
+    bool IsNull() { return this.kind == ArpgValueKind.Null(); }
+    bool IsObject() { return this.kind == ArpgValueKind.Object(); }
+
+    string AsText() {
+        if (this.kind == ArpgValueKind.Text()) { return this.textValue; }
+        if (this.kind == ArpgValueKind.Number()) {
+            return Convert.ToString(this.numberValue);
+        }
+        if (this.kind == ArpgValueKind.Boolean()) {
+            if (this.boolValue) { return "true"; }
+            return "false";
+        }
+        return "";
+    }
+
+    double AsNumber() {
+        if (this.kind == ArpgValueKind.Number()) { return this.numberValue; }
+        if (this.kind == ArpgValueKind.Boolean()) {
+            if (this.boolValue) { return 1.0; }
+            return 0.0;
+        }
+        if (this.kind == ArpgValueKind.Text()) {
+            return Encoding.ParseDouble(this.textValue);
+        }
+        return 0.0;
+    }
+
+    bool AsBoolean() {
+        if (this.kind == ArpgValueKind.Boolean()) { return this.boolValue; }
+        if (this.kind == ArpgValueKind.Number()) { return this.numberValue != 0.0; }
+        if (this.kind == ArpgValueKind.Text()) {
+            return this.textValue != ""
+                && this.textValue != "0"
+                && this.textValue != "false";
+        }
+        return false;
+    }
+
+    int IndexOf(string key) {
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (this.keys[i] == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void Set(string key, ArpgValue newValue) {
+        if (this.kind != ArpgValueKind.Object()) {
+            this.kind = ArpgValueKind.Object();
+            this.keys = new List<string>();
+            this.values = new List<ArpgValue>();
+        }
+        int index = this.IndexOf(key);
+        if (index < 0) {
+            this.keys.Add(key);
+            this.values.Add(newValue);
+        } else {
+            this.values[index] = newValue;
+        }
+    }
+
+    void SetText(string key, string newValue) { this.Set(key, Text(newValue)); }
+    void SetNumber(string key, double newValue) { this.Set(key, Number(newValue)); }
+    void SetInteger(string key, int newValue) { this.Set(key, Integer(newValue)); }
+    void SetBoolean(string key, bool newValue) { this.Set(key, Boolean(newValue)); }
+
+    ArpgValue Get(string key) {
+        if (this.kind != ArpgValueKind.Object()) { return null; }
+        int index = this.IndexOf(key);
+        if (index < 0) { return null; }
+        return this.values[index];
+    }
+
+    int Count() { return this.keys.Count; }
+    string KeyAt(int index) { return this.keys[index]; }
+    ArpgValue ValueAt(int index) { return this.values[index]; }
+
+    static int DotAt(string path) {
+        int i = 0;
+        while (i < path.Length) {
+            if (path.Substring(i, 1) == ".") { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    ArpgValue Resolve(string path) {
+        if (path == null || path == "") { return this; }
+        int dot = DotAt(path);
+        if (dot < 0) { return this.Get(path); }
+        ArpgValue child = this.Get(path.Substring(0, dot));
+        if (child == null) { return null; }
+        return child.Resolve(path.Substring(dot + 1));
+    }
+
+    void SetPath(string path, ArpgValue newValue) {
+        int dot = DotAt(path);
+        if (dot < 0) {
+            this.Set(path, newValue);
+            return;
+        }
+        string head = path.Substring(0, dot);
+        ArpgValue child = this.Get(head);
+        if (child == null || !child.IsObject()) {
+            child = Object();
+            this.Set(head, child);
+        }
+        child.SetPath(path.Substring(dot + 1), newValue);
+    }
+}
+
+/// <summary>Mutable key/newValue source evaluated by game UI templates every frame.</summary>
+class ArpgDataSource {
+    ArpgValue root;
+    int revision;
+
+    static ArpgDataSource Create() {
+        ArpgDataSource source = new ArpgDataSource();
+        source.root = ArpgValue.Object();
+        source.revision = 0;
+        return source;
+    }
+
+    ArpgValue Root() { return this.root; }
+    int Revision() { return this.revision; }
+
+    void Set(string path, ArpgValue newValue) {
+        this.root.SetPath(path, newValue);
+        this.revision = this.revision + 1;
+    }
+
+    void SetText(string path, string newValue) {
+        this.Set(path, ArpgValue.Text(newValue));
+    }
+
+    void SetNumber(string path, double newValue) {
+        this.Set(path, ArpgValue.Number(newValue));
+    }
+
+    void SetInteger(string path, int newValue) {
+        this.Set(path, ArpgValue.Integer(newValue));
+    }
+
+    void SetBoolean(string path, bool newValue) {
+        this.Set(path, ArpgValue.Boolean(newValue));
+    }
+
+    ArpgValue Resolve(string path) { return this.root.Resolve(path); }
+}
+
+class ArpgTemplateTerminator {
+    static int None() { return 0; }
+    static int ElseIf() { return 1; }
+    static int Else() { return 2; }
+    static int End() { return 3; }
+}
+
+class ArpgTemplateSection {
+    string text;
+    int terminator;
+    string condition;
+
+    static ArpgTemplateSection Create(
+        string text,
+        int terminator,
+        string condition
+    ) {
+        ArpgTemplateSection section = new ArpgTemplateSection();
+        section.text = text;
+        section.terminator = terminator;
+        section.condition = condition;
+        return section;
+    }
+
+    string Text() { return this.text; }
+    int Terminator() { return this.terminator; }
+    string Condition() { return this.condition; }
+}
+
+class ArpgTemplateParser {
+    string input;
+    ArpgValue source;
+    int position;
+
+    static ArpgTemplateParser Create(string input, ArpgValue source) {
+        ArpgTemplateParser parser = new ArpgTemplateParser();
+        parser.input = input;
+        parser.source = source;
+        parser.position = 0;
+        return parser;
+    }
+
+    static bool StartsAt(string text, int position, string prefix) {
+        if (position < 0 || position + prefix.Length > text.Length) {
+            return false;
+        }
+        return text.Substring(position, prefix.Length) == prefix;
+    }
+
+    static string Trim(string text) {
+        int start = 0;
+        int end = text.Length;
+        bool scanning = true;
+        while (start < end && scanning) {
+            string ch = text.Substring(start, 1);
+            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") {
+                start = start + 1;
+            } else {
+                scanning = false;
+            }
+        }
+        scanning = true;
+        while (end > start && scanning) {
+            string ch = text.Substring(end - 1, 1);
+            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") {
+                end = end - 1;
+            } else {
+                scanning = false;
+            }
+        }
+        return text.Substring(start, end - start);
+    }
+
+    int Find(string token, int start) {
+        int i = start;
+        while (i + token.Length <= this.input.Length) {
+            if (this.input.Substring(i, token.Length) == token) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static int FindOperator(string expression, string token) {
+        int i = 0;
+        while (i + token.Length <= expression.Length) {
+            if (expression.Substring(i, token.Length) == token) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static bool LooksNumeric(string text) {
+        if (text == null || text == "") { return false; }
+        int i = 0;
+        bool digit = false;
+        if (text.Substring(0, 1) == "-" || text.Substring(0, 1) == "+") {
+            i = 1;
+        }
+        while (i < text.Length) {
+            string ch = text.Substring(i, 1);
+            if (ch >= "0" && ch <= "9") {
+                digit = true;
+            } else if (ch != ".") {
+                return false;
+            }
+            i = i + 1;
+        }
+        return digit;
+    }
+
+    ArpgValue Operand(string token) {
+        string newValue = Trim(token);
+        if (newValue.Length >= 2
+            && newValue.Substring(0, 1) == "&"
+            && newValue.Substring(newValue.Length - 1, 1) == "&") {
+            ArpgValue resolved = this.source.Resolve(
+                newValue.Substring(1, newValue.Length - 2));
+            if (resolved == null) { return ArpgValue.Null(); }
+            return resolved;
+        }
+        if (newValue.Length >= 2) {
+            string first = newValue.Substring(0, 1);
+            string last = newValue.Substring(newValue.Length - 1, 1);
+            if ((first == "'" && last == "'")
+                || (first == "\"" && last == "\"")) {
+                return ArpgValue.Text(newValue.Substring(1, newValue.Length - 2));
+            }
+        }
+        if (newValue == "true") { return ArpgValue.Boolean(true); }
+        if (newValue == "false") { return ArpgValue.Boolean(false); }
+        if (LooksNumeric(newValue)) {
+            return ArpgValue.Number(Encoding.ParseDouble(newValue));
+        }
+        return ArpgValue.Text(newValue);
+    }
+
+    bool Compare(string leftToken, string rightToken, string operation) {
+        ArpgValue left = this.Operand(leftToken);
+        ArpgValue right = this.Operand(rightToken);
+        bool numeric = left.Kind() == ArpgValueKind.Number()
+            || right.Kind() == ArpgValueKind.Number();
+        if (operation == "==") {
+            if (numeric) { return left.AsNumber() == right.AsNumber(); }
+            return left.AsText() == right.AsText();
+        }
+        if (operation == "!=") {
+            if (numeric) { return left.AsNumber() != right.AsNumber(); }
+            return left.AsText() != right.AsText();
+        }
+        if (operation == ">") { return left.AsNumber() > right.AsNumber(); }
+        if (operation == ">=") { return left.AsNumber() >= right.AsNumber(); }
+        if (operation == "<") { return left.AsNumber() < right.AsNumber(); }
+        if (operation == "<=") { return left.AsNumber() <= right.AsNumber(); }
+        return false;
+    }
+
+    bool EvaluateCondition(string expression) {
+        string newValue = Trim(expression);
+        string operation = "";
+        int index = FindOperator(newValue, ">=");
+        if (index >= 0) {
+            operation = ">=";
+        } else {
+            index = FindOperator(newValue, "<=");
+            if (index >= 0) {
+                operation = "<=";
+            } else {
+                index = FindOperator(newValue, "==");
+                if (index >= 0) {
+                    operation = "==";
+                } else {
+                    index = FindOperator(newValue, "!=");
+                    if (index >= 0) {
+                        operation = "!=";
+                    } else {
+                        index = FindOperator(newValue, ">");
+                        if (index >= 0) {
+                            operation = ">";
+                        } else {
+                            index = FindOperator(newValue, "<");
+                            if (index >= 0) { operation = "<"; }
+                        }
+                    }
+                }
+            }
+        }
+        if (index < 0) { return this.Operand(newValue).AsBoolean(); }
+        return this.Compare(
+            newValue.Substring(0, index),
+            newValue.Substring(index + operation.Length),
+            operation);
+    }
+
+    string ParseConditional(string condition) {
+        ArpgTemplateSection section = this.ParseSection();
+        bool selected = this.EvaluateCondition(condition);
+        string result = "";
+        if (selected) { result = section.Text(); }
+
+        while (section.Terminator() == ArpgTemplateTerminator.ElseIf()) {
+            string branchCondition = section.Condition();
+            section = this.ParseSection();
+            if (!selected && this.EvaluateCondition(branchCondition)) {
+                result = section.Text();
+                selected = true;
+            }
+        }
+        if (section.Terminator() == ArpgTemplateTerminator.Else()) {
+            section = this.ParseSection();
+            if (!selected) { result = section.Text(); }
+        }
+        return result;
+    }
+
+    ArpgTemplateSection ParseSection() {
+        StringBuilder output = new StringBuilder();
+        while (this.position < this.input.Length) {
+            if (StartsAt(this.input, this.position, "{elseif ")) {
+                int close = this.Find("}", this.position + 8);
+                if (close < 0) {
+                    output.Append(this.input.Substring(this.position));
+                    this.position = this.input.Length;
+                    return ArpgTemplateSection.Create(
+                        output.ToString(),
+                        ArpgTemplateTerminator.None(),
+                        "");
+                }
+                string condition = this.input.Substring(
+                    this.position + 8, close - this.position - 8);
+                this.position = close + 1;
+                return ArpgTemplateSection.Create(
+                    output.ToString(),
+                    ArpgTemplateTerminator.ElseIf(),
+                    condition);
+            }
+            if (StartsAt(this.input, this.position, "{else}")) {
+                this.position = this.position + 6;
+                return ArpgTemplateSection.Create(
+                    output.ToString(), ArpgTemplateTerminator.Else(), "");
+            }
+            if (StartsAt(this.input, this.position, "{end}")) {
+                this.position = this.position + 5;
+                return ArpgTemplateSection.Create(
+                    output.ToString(), ArpgTemplateTerminator.End(), "");
+            }
+            if (StartsAt(this.input, this.position, "{if ")) {
+                int close = this.Find("}", this.position + 4);
+                if (close < 0) {
+                    output.Append(this.input.Substring(this.position));
+                    this.position = this.input.Length;
+                    return ArpgTemplateSection.Create(
+                        output.ToString(),
+                        ArpgTemplateTerminator.None(),
+                        "");
+                }
+                string condition = this.input.Substring(
+                    this.position + 4, close - this.position - 4);
+                this.position = close + 1;
+                output.Append(this.ParseConditional(condition));
+            } else if (this.input.Substring(this.position, 1) == "&") {
+                int close = this.Find("&", this.position + 1);
+                if (close < 0) {
+                    output.Append("&");
+                    this.position = this.position + 1;
+                } else {
+                    string path = this.input.Substring(
+                        this.position + 1, close - this.position - 1);
+                    ArpgValue resolved = this.source.Resolve(path);
+                    if (resolved != null) { output.Append(resolved.AsText()); }
+                    this.position = close + 1;
+                }
+            } else {
+                output.Append(this.input.Substring(this.position, 1));
+                this.position = this.position + 1;
+            }
+        }
+        return ArpgTemplateSection.Create(
+            output.ToString(), ArpgTemplateTerminator.None(), "");
+    }
+}
+
+class ArpgTemplate {
+    static string Evaluate(string template, ArpgDataSource source) {
+        if (template == null || template == "") { return ""; }
+        ArpgValue root = ArpgValue.Object();
+        if (source != null) { root = source.Root(); }
+        ArpgTemplateParser parser = ArpgTemplateParser.Create(template, root);
+        return parser.ParseSection().Text();
+    }
+
+    static string EvaluateValue(string template, ArpgValue source) {
+        if (template == null || template == "") { return ""; }
+        ArpgValue root = source;
+        if (root == null) { root = ArpgValue.Object(); }
+        ArpgTemplateParser parser = ArpgTemplateParser.Create(template, root);
+        return parser.ParseSection().Text();
+    }
+}
