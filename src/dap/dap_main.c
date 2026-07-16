@@ -24,7 +24,13 @@
  * real gdb in machine-interface mode (the compiler emits DWARF via `zanc -g`),
  * so breakpoints, stepping, stack frames and variables are genuine.
  *
- * Usage: zan-dap           (communicates over stdin/stdout)
+ * Usage:
+ *   zan-dap                (communicates over stdin/stdout)
+ *   zan-dap --port <N>     (listens on 127.0.0.1:<N> for a single DAP client)
+ *
+ * The TCP server mode exists for clients that cannot easily drive a child
+ * process over bidirectional pipes (e.g. the self-hosted Zan IDE, which speaks
+ * DAP through the standard-library TCP socket layer).
  */
 #include "json.h"
 #include "rpc.h"
@@ -38,8 +44,18 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET dap_sock_t;
+#define DAP_INVALID_SOCK INVALID_SOCKET
 #else
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+typedef int dap_sock_t;
+#define DAP_INVALID_SOCK (-1)
 #endif
 
 typedef struct {
@@ -51,7 +67,70 @@ typedef struct {
     char       source_file[1024];/* main source file (for stack frames) */
     bool       terminated;
     bool       launched;
+    bool       use_sock;         /* true when framing over a TCP socket */
+    dap_sock_t sock;             /* connected client socket (server mode) */
 } dap_t;
+
+/* ---- TCP transport (server mode) -------------------------------------- */
+
+static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
+    int sent = 0;
+    while (sent < n) {
+        int r = (int)send(s, buf + sent, n - sent, 0);
+        if (r <= 0) return false;
+        sent += r;
+    }
+    return true;
+}
+
+/* Read one Content-Length framed message from the socket (headers scanned a
+ * byte at a time; body read in bulk). Returns a malloc'd NUL-terminated body,
+ * or NULL on disconnect. */
+static char *rpc_read_message_sock(dap_sock_t s) {
+    char line[512];
+    long content_length = -1;
+    for (;;) {
+        int len = 0;
+        for (;;) {
+            char c;
+            int r = (int)recv(s, &c, 1, 0);
+            if (r <= 0) return NULL;
+            if (len < (int)sizeof(line) - 1) line[len++] = c;
+            if (c == '\n') break;
+        }
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            len--;
+        line[len] = '\0';
+        if (len == 0) break; /* blank line -> end of headers */
+        const char *prefix = "content-length:";
+        bool match = true;
+        for (int i = 0; prefix[i]; i++) {
+            char lc = line[i];
+            if (lc >= 'A' && lc <= 'Z') lc = (char)(lc - 'A' + 'a');
+            if (lc != prefix[i]) { match = false; break; }
+        }
+        if (match) content_length = strtol(line + strlen(prefix), NULL, 10);
+    }
+    if (content_length < 0 || content_length > (64 * 1024 * 1024)) return NULL;
+    char *body = (char *)malloc((size_t)content_length + 1);
+    if (!body) return NULL;
+    long got = 0;
+    while (got < content_length) {
+        int r = (int)recv(s, body + got, (int)(content_length - got), 0);
+        if (r <= 0) { free(body); return NULL; }
+        got += r;
+    }
+    body[content_length] = '\0';
+    return body;
+}
+
+static void rpc_write_message_sock(dap_sock_t s, const char *payload) {
+    char header[64];
+    int hn = snprintf(header, sizeof(header),
+                      "Content-Length: %zu\r\n\r\n", strlen(payload));
+    sock_send_all(s, header, hn);
+    sock_send_all(s, payload, (int)strlen(payload));
+}
 
 /* Reference ids used by scopes/variables. */
 #define VARREF_LOCALS  1000
@@ -62,7 +141,10 @@ typedef struct {
 static void dap_send(dap_t *d, json_value *msg) {
     json_obj_set(msg, "seq", json_new_num(d->seq++));
     char *payload = json_serialize(msg);
-    rpc_write_message(d->out, payload);
+    if (d->use_sock)
+        rpc_write_message_sock(d->sock, payload);
+    else
+        rpc_write_message(d->out, payload);
     free(payload);
     json_free(msg);
 }
@@ -475,20 +557,70 @@ static void dispatch(dap_t *d, json_value *request) {
     else                                            dap_send_response(d, request, true, NULL);
 }
 
-int main(void) {
+/* Listen on 127.0.0.1:port and accept a single client. Returns the connected
+ * socket, or DAP_INVALID_SOCK on failure. */
+static dap_sock_t dap_listen_accept(int port) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return DAP_INVALID_SOCK;
+#endif
+    dap_sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == DAP_INVALID_SOCK) return DAP_INVALID_SOCK;
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(ls, 1) != 0) {
+#ifdef _WIN32
+        closesocket(ls);
+#else
+        close(ls);
+#endif
+        return DAP_INVALID_SOCK;
+    }
+    dap_sock_t cs = accept(ls, NULL, NULL);
+#ifdef _WIN32
+    closesocket(ls);
+#else
+    close(ls);
+#endif
+    return cs;
+}
+
+int main(int argc, char **argv) {
+    int port = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
+            port = atoi(argv[++i]);
+    }
+
     dap_t d;
     memset(&d, 0, sizeof(d));
     dbg_init(&d.dbg);
     d.out = stdout;
     d.seq = 1;
 
+    if (port > 0) {
+        d.sock = dap_listen_accept(port);
+        if (d.sock == DAP_INVALID_SOCK) {
+            fprintf(stderr, "zan-dap: failed to listen on port %d\n", port);
+            return 1;
+        }
+        d.use_sock = true;
+    } else {
 #ifdef _WIN32
-    _setmode(_fileno(stdin), _O_BINARY);
-    _setmode(_fileno(stdout), _O_BINARY);
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    }
 
     for (;;) {
-        char *body = rpc_read_message(stdin);
+        char *body = d.use_sock ? rpc_read_message_sock(d.sock)
+                                : rpc_read_message(stdin);
         if (!body) break;
 
         json_value *msg = json_parse(body);
@@ -505,5 +637,10 @@ int main(void) {
     }
 
     dbg_stop(&d.dbg);
+#ifdef _WIN32
+    if (d.use_sock) { closesocket(d.sock); WSACleanup(); }
+#else
+    if (d.use_sock) close(d.sock);
+#endif
     return 0;
 }

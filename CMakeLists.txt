@@ -232,6 +232,10 @@ add_executable(zan-dap
 target_include_directories(zan-dap PRIVATE src/common src/dap)
 if(MSVC)
     target_compile_definitions(zan-dap PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(WIN32)
+    # TCP server transport (--port) uses winsock.
+    target_link_libraries(zan-dap PRIVATE ws2_32)
 else()
     target_link_libraries(zan-dap PRIVATE m)
 endif()
