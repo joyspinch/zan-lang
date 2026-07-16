@@ -30,8 +30,8 @@ target reads the driver built for that target. `zanc` derives this path as
   next to the executable.
 - **static**: link the archive from `<target>/static/` directly into the exe.
 
-## Binaries are not committed
+## Committed bundles
 
-Only the layout + `sqlite3.bundle` manifests are tracked; the driver binaries
-themselves are gitignored (see `.gitignore`) and dropped in per target by the
-developer / release-assembly step.
+The manifests and compiled driver binaries are tracked per target so the
+stdlib works without a separate artifact download. The drivers workflow
+refreshes these bundles.

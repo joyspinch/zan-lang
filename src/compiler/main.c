@@ -1359,9 +1359,10 @@ int main(int argc, char **argv) {
          * and which module owns each is discovered from the stdlib tree's
          * `drivers/driver.manifest` files (see zan_discover_drivers), not
          * hardcoded here. Its directory is added to the link search path so
-         * both dev builds and publishes resolve the driver, and on `--publish`
-         * (shared mode) the driver's runtime shared libraries are copied next
-         * to the produced executable. */
+         * both dev builds and publishes resolve the driver. On Windows the
+         * runtime libraries are always copied next to the executable because
+         * there is no rpath equivalent; other targets copy them on
+         * `--publish`. */
         zan_driver_registry_t driver_reg;
         zan_discover_drivers(resolved_stdlib_root, &driver_reg);
         char driver_dirs[16][1024];
@@ -1665,16 +1666,18 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* ---- bundle native driver runtime libraries (publish, shared) ----
+        /* ---- bundle native driver runtime libraries (shared) ------------
          * Copy each used driver's runtime shared libraries next to the produced
-         * executable so the published program runs without the driver being
-         * pre-installed on the target. The set of files per driver is taken
+         * executable for published programs and for all Windows builds, where
+         * a linked DLL must be available beside the executable at launch. The
+         * set of files per driver is taken
          * from an optional manifest "<driver_dir>/<driver>.bundle" (one file
          * name per line - lets a driver ship its own dependencies, e.g. libpq
          * with the OpenSSL DLLs); absent a manifest, common default file names
          * are tried. Static linking folds the driver into the exe, so nothing
          * is copied there. */
-        if (publish_mode && !link_static_drivers && used_driver_count > 0) {
+        if ((publish_mode || target.os == ZAN_OS_WINDOWS) &&
+            !link_static_drivers && used_driver_count > 0) {
             char outdir[1024];
             snprintf(outdir, sizeof(outdir), "%s", obj_path);
             { char *s1 = strrchr(outdir, '/'); char *s2 = strrchr(outdir, '\\');
