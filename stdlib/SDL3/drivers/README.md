@@ -6,6 +6,10 @@
 stdlib/SDL3/drivers/<target>/
 ```
 
+`Game.Arpg.ArpgUiRenderer` uses this bundle. The drivers workflow builds and
+uploads each compiled target bundle as a GitHub Actions artifact; tagged driver
+builds also publish the same bundles on the GitHub Release.
+
 The Windows x64 bundle contains:
 
 ```text
