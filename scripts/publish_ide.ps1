@@ -108,6 +108,41 @@ $guiLib = Join-Path $b 'zan_gui.lib'
 if (Test-Path $guiLib) { Copy-Item $guiLib (Join-Path $distTc 'zan_gui.lib') }
 else { Write-Output "PUBLISH_WARN: build\zan_gui.lib missing; GUI projects will not link" }
 
+# ---- bundle the native debugger (gdb) so debugging is out-of-the-box ----
+# zan-dap resolves gdb next to itself first (toolchain\debugger\bin\gdb.exe),
+# so a published IDE debugs with no system install. Source it from ZAN_GDB_DIR
+# or a TDM-GCC install; copy gdb.exe plus the DLLs it needs to run.
+$gdbSrcDir = $env:ZAN_GDB_DIR
+if (-not $gdbSrcDir -or -not (Test-Path (Join-Path $gdbSrcDir 'gdb.exe'))) {
+    $gdbSrcDir = 'C:\TDM-GCC-64\bin'
+}
+$gdbExe = Join-Path $gdbSrcDir 'gdb.exe'
+if (Test-Path $gdbExe) {
+    $dbgBin = Join-Path $distTc 'debugger\bin'
+    New-Item -ItemType Directory -Path $dbgBin -Force | Out-Null
+    Copy-Item $gdbExe (Join-Path $dbgBin 'gdb.exe')
+    # gdb.exe links against the MinGW runtime DLLs shipped in the same bin dir;
+    # copy them so the bundled debugger runs on a machine with no TDM-GCC.
+    foreach ($dll in (Get-ChildItem $gdbSrcDir -Filter '*.dll' -File -ErrorAction SilentlyContinue)) {
+        Copy-Item $dll.FullName (Join-Path $dbgBin $dll.Name) -Force
+    }
+    # Verify the relocated gdb actually runs. Some distributions (e.g. TDM-GCC)
+    # ship a launcher stub that bakes in its install path and cannot be moved;
+    # shipping that would give a broken debugger. If the copy fails to run,
+    # drop the bundle so zan-dap falls back to a system/known gdb instead.
+    $bundledGdb = Join-Path $dbgBin 'gdb.exe'
+    $gdbOk = $false
+    try { & $bundledGdb --version *> $null; $gdbOk = ($LASTEXITCODE -eq 0) } catch { $gdbOk = $false }
+    if ($gdbOk) {
+        Write-Output "Bundled gdb from $gdbSrcDir -> toolchain\debugger\bin"
+    } else {
+        Remove-Item (Join-Path $distTc 'debugger') -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Output "PUBLISH_WARN: gdb at $gdbSrcDir is not relocatable; not bundling (zan-dap will use a system/known gdb)"
+    }
+} else {
+    Write-Output "PUBLISH_WARN: gdb.exe not found (set ZAN_GDB_DIR); debugging will need a system gdb/ZAN_GDB"
+}
+
 # ---- copy a small set of example programs, if present ----
 $examples = Join-Path $root 'examples'
 if (Test-Path $examples) {
@@ -140,6 +175,8 @@ Contents
                    zanpkg/zanfmt/zandoc    package / format / doc CLIs
                    ld.exe, mingw\          bundled linker + MinGW-w64 runtime
                    linux-musl\             sysroot for --target linux-* builds
+                   debugger\bin\gdb.exe    bundled native debugger (used by
+                                           zan-dap; no system gdb needed)
                    zanrt_io*, zanrt_sync*  runtime objects
                  The IDE locates zanc here, and zanc finds its linker / sysroot
                  next to itself in this same folder, so producing an .exe needs

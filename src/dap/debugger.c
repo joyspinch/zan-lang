@@ -23,6 +23,9 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <errno.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 /* ======================================================================
@@ -248,15 +251,54 @@ static void mi_exec(debugger_t *dbg, const char *cmd) {
     }
 }
 
-/* Resolve the gdb executable to use. */
+/* Directory holding the running executable (zan-dap), with no trailing sep. */
+static void mi_exe_dir(char *out, size_t outsz) {
+    out[0] = '\0';
+#ifdef _WIN32
+    GetModuleFileNameA(NULL, out, (DWORD)outsz);
+    { char *s = strrchr(out, '\\'); if (s) *s = '\0'; }
+#elif defined(__APPLE__)
+    { uint32_t sz = (uint32_t)outsz;
+      if (_NSGetExecutablePath(out, &sz) != 0) out[0] = '\0';
+      char *s = strrchr(out, '/'); if (s) *s = '\0'; }
+#else
+    { ssize_t n = readlink("/proc/self/exe", out, outsz - 1);
+      if (n > 0) { out[n] = '\0'; char *s = strrchr(out, '/'); if (s) *s = '\0'; } }
+#endif
+}
+
+static bool mi_file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) { fclose(f); return true; }
+    return false;
+}
+
+/* Resolve the gdb executable to use. Preference order: explicit path set by
+ * the adapter, the ZAN_GDB env override, a gdb bundled inside the toolchain
+ * next to zan-dap (so a published IDE debugs without any system install),
+ * then platform-known locations, then bare "gdb" on PATH. */
 static void mi_resolve_gdb(debugger_t *dbg, char *out, int size) {
     if (dbg->gdb_path[0]) { snprintf(out, (size_t)size, "%s", dbg->gdb_path); return; }
     const char *env = getenv("ZAN_GDB");
     if (env && env[0]) { snprintf(out, (size_t)size, "%s", env); return; }
+
+    char dir[1024];
+    mi_exe_dir(dir, sizeof(dir));
+    if (dir[0]) {
+#ifdef _WIN32
+        const char *rel[] = { "\\gdb.exe", "\\debugger\\bin\\gdb.exe", "\\debugger\\gdb.exe" };
+#else
+        const char *rel[] = { "/gdb", "/debugger/bin/gdb", "/debugger/gdb" };
+#endif
+        for (size_t i = 0; i < sizeof(rel) / sizeof(rel[0]); i++) {
+            char cand[1200];
+            snprintf(cand, sizeof(cand), "%s%s", dir, rel[i]);
+            if (mi_file_exists(cand)) { snprintf(out, (size_t)size, "%s", cand); return; }
+        }
+    }
 #ifdef _WIN32
     const char *known = "C:\\TDM-GCC-64\\bin\\gdb.exe";
-    FILE *f = fopen(known, "rb");
-    if (f) { fclose(f); snprintf(out, (size_t)size, "%s", known); return; }
+    if (mi_file_exists(known)) { snprintf(out, (size_t)size, "%s", known); return; }
     snprintf(out, (size_t)size, "gdb.exe");
 #else
     snprintf(out, (size_t)size, "gdb");
@@ -632,6 +674,9 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
     mi_command(dbg, "-gdb-set mi-async off", res, sizeof(res));
     mi_command(dbg, "-gdb-set confirm off", res, sizeof(res));
     mi_command(dbg, "-gdb-set print pretty off", res, sizeof(res));
+    /* Launch the inferior directly rather than via a shell, so a bundled gdb
+     * works without sh/cmd on PATH (avoids "CreateProcess failed"). */
+    mi_command(dbg, "-gdb-set startup-with-shell off", res, sizeof(res));
 
     if (args && args[0]) {
         char cmd[1200];
