@@ -1349,17 +1349,34 @@ class ZanIDE {
                     ctxTarget = trRight; app.RequestRedraw();
                 }
 
-                // Section 2: Structure (code outline of the active file).
+                // Section 2: Structure / Components. Shows a code outline for
+                // source tabs, and the form's component tree in the designer.
                 int stY = tr.y + explorerH;
                 c.FillRect(tr.x, stY, tr.width, 1, t.divider);
-                c.DrawText(tr.x + t.paddingMedium, stY + t.paddingSmall, ZanIDE.T("STRUCTURE", "结构"), t.textTertiary, t.fontSizeSmall);
-                // Rebuild the outline only when the active buffer changes, so
-                // typing/clicking stays cheap on large files.
-                string curSrc = editor.GetText();
-                string newSig = Convert.ToString(activeTab.Get()) + ":" + Convert.ToString(curSrc.Length);
+                string stTitle = ZanIDE.T("STRUCTURE", "结构");
+                if (designerMode) { stTitle = ZanIDE.T("COMPONENTS", "组件"); }
+                c.DrawText(tr.x + t.paddingMedium, stY + t.paddingSmall, stTitle, t.textTertiary, t.fontSizeSmall);
+                // Rebuild the tree only when the active buffer/form changes so
+                // typing and clicking stay cheap. The signature prefix (C/F)
+                // also flips the panel between code outline and components.
+                int stActTab = activeTab.Get();
+                string newSig = "";
+                if (designerMode) {
+                    newSig = "F:" + Convert.ToString(stActTab) + ":" + Convert.ToString(dNames.Count);
+                } else {
+                    string curSrc = editor.GetText();
+                    newSig = "C:" + Convert.ToString(stActTab) + ":" + Convert.ToString(curSrc.Length);
+                    if (newSig != structSig) { structTree = ZanIDE.BuildOutline(curSrc); }
+                }
                 if (newSig != structSig) {
                     structSig = newSig;
-                    structTree = ZanIDE.BuildOutline(curSrc);
+                    if (designerMode) {
+                        string sfn = "Form";
+                        if (stActTab >= 0 && stActTab < tabPaths.Count) {
+                            sfn = ZanIDE.FormBaseName(tabPaths[stActTab]);
+                        }
+                        structTree = ZanIDE.BuildComponentTree(sfn, dTypes, dNames);
+                    }
                     structSel.Set(0 - 1);
                     lastStructSel = 0 - 1;
                 }
@@ -1391,15 +1408,21 @@ class ZanIDE {
                 } else {
                     TreeView.Render(app, stArea, structTree, structSel, stSc);
                 }
-                // Clicking an outline symbol jumps the editor to its line.
+                // Clicking a node navigates: an outline symbol jumps the editor
+                // to its line; a component selects that control in the designer.
                 int stSelV = structSel.Get();
                 if (stSelV != lastStructSel) {
                     lastStructSel = stSelV;
                     if (stSelV >= 0 && stSelV < structTree.Count) {
-                        int gln = ZanIDE.OutlineLineOf(structTree[stSelV].path);
-                        if (gln >= 0) {
-                            pendingGotoLine = gln; pendingGotoCol = 0;
-                            app.RequestRedraw();
+                        if (designerMode) {
+                            int ci = ZanIDE.OutlineLineOf(structTree[stSelV].path);
+                            if (ci >= 0) { dSel.Set(ci); app.RequestRedraw(); }
+                        } else {
+                            int gln = ZanIDE.OutlineLineOf(structTree[stSelV].path);
+                            if (gln >= 0) {
+                                pendingGotoLine = gln; pendingGotoCol = 0;
+                                app.RequestRedraw();
+                            }
                         }
                     }
                 }
@@ -3689,6 +3712,40 @@ class ZanIDE {
             }
             depth = depth + ZanIDE.OutlineBraceDelta(raw);
             if (depth < 0) { depth = 0; }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// A small icon hint for a designer control type.
+    static string ComponentIcon(string type) {
+        if (type == "Label") { return "font"; }
+        if (type == "Button") { return "grid"; }
+        if (type == "Input" || type == "TextBox" || type == "TextArea") { return "edit"; }
+        if (type == "Checkbox" || type == "Radio" || type == "Switch") { return "check"; }
+        if (type == "Image") { return "image"; }
+        if (type == "Table" || type == "Grid" || type == "TreeView") { return "table"; }
+        return "layout";
+    }
+
+    /// Builds the designer component tree: the form as the root node with each
+    /// placed control as a child (label "name : Type"). A child's `path`
+    /// carries its 0-based control index so a click can select it on the
+    /// design surface. The control model is a flat surface, so the tree is one
+    /// level deep by construction.
+    static List<TreeNode> BuildComponentTree(string formName, List<string> dTypes,
+                                             List<string> dNames) {
+        List<TreeNode> outp = new List<TreeNode>();
+        TreeNode root = TreeNode.Dir(formName, 0, true);
+        root.icon = "layout";
+        root.path = "@form";
+        outp.Add(root);
+        int i = 0;
+        while (i < dNames.Count && i < dTypes.Count) {
+            TreeNode n = TreeNode.FileIcon(dNames[i] + " : " + dTypes[i], 1,
+                ZanIDE.ComponentIcon(dTypes[i]));
+            n.path = Convert.ToString(i);
+            outp.Add(n);
             i = i + 1;
         }
         return outp;
