@@ -2864,6 +2864,47 @@ static int call_consumes_free_arg(LLVMValueRef callee) {
 static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
                                          local_scope_t *locals);
 
+static LLVMValueRef emit_delegate_call(zan_irgen_t *g,
+                                       zan_type_t *delegate_type,
+                                       LLVMValueRef fn_ptr,
+                                       zan_ast_node_t *call,
+                                       local_scope_t *locals) {
+    int pc = delegate_type->delegate_param_count;
+    LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
+        (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
+    for (int k = 0; k < pc; k++) {
+        param_types[k] = map_type(
+            g, delegate_type->delegate_param_types[k]);
+    }
+    LLVMTypeRef ret = delegate_type->delegate_ret_type
+        ? map_type(g, delegate_type->delegate_ret_type)
+        : LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef fn_type = LLVMFunctionType(
+        ret, param_types, (unsigned)pc, 0);
+    int argc = call->call.args.count;
+    LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+        (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+    for (int k = 0; k < argc; k++) {
+        call_args[k] = emit_expr(
+            g, call->call.args.items[k], locals);
+        if (k < pc) {
+            call_args[k] = emit_boundary_coerce(
+                g, call_args[k], param_types[k]);
+        }
+    }
+    const char *name =
+        LLVMGetTypeKind(ret) == LLVMVoidTypeKind ? "" : "dlgcall";
+    LLVMValueRef result = LLVMBuildCall2(
+        g->builder, fn_type, fn_ptr, call_args, (unsigned)argc, name);
+    for (int k = 0; k < argc; k++) {
+        emit_release_owned_call_temp(
+            g, call->call.args.items[k], call_args[k], locals);
+    }
+    free(call_args);
+    free(param_types);
+    return result;
+}
+
 static void emit_leak_report_support(zan_irgen_t *g) {
     if (!g->check_leaks || g->fn_report_leaks) return;
     /* void __zan_report_leaks(void): at program exit, if any ARC object is
@@ -5999,6 +6040,22 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         }
 
 
+        /* Delegate invocation. Unlike methods, a delegate callee can be a
+         * local, an implicit/explicit instance field, a static field or a
+         * nested field expression. Resolve the callee's value type first and
+         * emit one indirect-call path for all of those forms. */
+        {
+            zan_type_t *delegate_type =
+                infer_expr_type(g, expr->call.callee, locals);
+            if (delegate_type &&
+                delegate_type->kind == TYPE_DELEGATE) {
+                LLVMValueRef fn_ptr =
+                    emit_expr(g, expr->call.callee, locals);
+                return emit_delegate_call(
+                    g, delegate_type, fn_ptr, expr, locals);
+            }
+        }
+
                 /* user-defined method call: obj.Method(args) or Type.StaticMethod(args) */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
@@ -6171,42 +6228,6 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         /* bare function name call: Compute(21) → look up in current class then global */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
             zan_istr_t fn_name = expr->call.callee->ident.name;
-
-            /* delegate variable invocation: handler(args) where handler is a local
-             * of delegate type → load function pointer and do indirect call */
-            {
-                local_var_t *lv = local_find(locals, fn_name);
-                if (lv && lv->type && lv->type->kind == TYPE_DELEGATE) {
-                    LLVMTypeRef fn_ptr_type = map_type(g, lv->type);
-                    LLVMValueRef fn_ptr = LLVMBuildLoad2(g->builder, fn_ptr_type, lv->alloca, "dlg_ptr");
-                    int pc = lv->type->delegate_param_count;
-                    LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
-                        (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
-                    for (int k = 0; k < pc; k++) {
-                        param_types[k] = map_type(g, lv->type->delegate_param_types[k]);
-                    }
-                    LLVMTypeRef ret = lv->type->delegate_ret_type
-                        ? map_type(g, lv->type->delegate_ret_type)
-                        : LLVMVoidTypeInContext(g->ctx);
-                    LLVMTypeRef fn_type = LLVMFunctionType(ret, param_types, (unsigned)pc, 0);
-                    int argc = expr->call.args.count;
-                    LLVMValueRef *call_args = (LLVMValueRef *)calloc(
-                        (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
-                    for (int k = 0; k < argc; k++) {
-                        call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
-                    }
-                    const char *cn = (LLVMGetTypeKind(ret) == LLVMVoidTypeKind) ? "" : "dlgcall";
-                    LLVMValueRef result = LLVMBuildCall2(g->builder, fn_type,
-                        fn_ptr, call_args, (unsigned)argc, cn);
-                    for (int k = 0; k < argc; k++) {
-                        emit_release_owned_call_temp(g, expr->call.args.items[k],
-                            call_args[k], locals);
-                    }
-                    free(call_args);
-                    free(param_types);
-                    return result;
-                }
-            }
 
             /* try current class methods first */
             if (g->current_type_sym) {

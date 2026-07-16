@@ -97,18 +97,33 @@ static u32 pack_argb(int r, int g, int b, int a) {
     return ((u32)a << 24) | ((u32)r << 16) | ((u32)g << 8) | (u32)b;
 }
 
-/* Alpha blend src over dst */
+/* Alpha blend src over dst (straight-alpha, both stored non-premultiplied).
+ * The dst==opaque fast path is bit-identical to the original opaque-only
+ * compositor; the general path also accumulates the destination alpha so a
+ * surface that was cleared transparent (for OS glass show-through) keeps a
+ * meaningful alpha channel the layered-window present can hand to the DWM. */
 static u32 blend_over(u32 dst, u32 src) {
     u32 sa = (src >> 24) & 0xFF;
     if (sa == 255) return src;
     if (sa == 0)   return dst;
     u32 sr = (src >> 16) & 0xFF, sg = (src >> 8) & 0xFF, sb = src & 0xFF;
     u32 dr = (dst >> 16) & 0xFF, dg = (dst >> 8) & 0xFF, db = dst & 0xFF;
+    u32 da = (dst >> 24) & 0xFF;
     u32 inv_sa = 255 - sa;
-    u32 or_ = (sr * sa + dr * inv_sa) / 255;
-    u32 og = (sg * sa + dg * inv_sa) / 255;
-    u32 ob = (sb * sa + db * inv_sa) / 255;
-    return (255u << 24) | (or_ << 16) | (og << 8) | ob;
+    if (da == 255) {
+        u32 or_ = (sr * sa + dr * inv_sa) / 255;
+        u32 og = (sg * sa + dg * inv_sa) / 255;
+        u32 ob = (sb * sa + db * inv_sa) / 255;
+        return (255u << 24) | (or_ << 16) | (og << 8) | ob;
+    }
+    /* General source-over on a possibly-transparent destination. */
+    u32 da2 = da * inv_sa / 255;
+    u32 oa = sa + da2;
+    if (oa == 0) return 0;
+    u32 or_ = (sr * sa + dr * da2) / oa;
+    u32 og = (sg * sa + dg * da2) / oa;
+    u32 ob = (sb * sa + db * da2) / oa;
+    return (oa << 24) | (or_ << 16) | (og << 8) | ob;
 }
 
 /* Reset the clip window to the whole surface (frame start / new surface). */
@@ -1010,8 +1025,150 @@ static int g_window_width = 0, g_window_height = 0;
  * WM_SIZE/WM_PAINT so a maximize/resize fills the new client area immediately
  * instead of flashing black. g_bg_color: last frame's clear color, used to fill
  * the newly-exposed margin during a live resize. Both declared near the top. */
+/* --- Windows 10/11 acrylic backdrop --------------------------------------
+ * When enabled, the window becomes a layered window presented with per-pixel
+ * alpha (UpdateLayeredWindow) and the DWM composites a real blurred+tinted
+ * acrylic of whatever is behind it wherever the surface alpha is < 255. The
+ * app clears the surface transparent under a glass theme, so the desktop shows
+ * through the gaps while opaque widgets/text stay crisp.
+ *
+ * Robustness: the present hands UpdateLayeredWindow a NULL destination point
+ * so it only updates the *content*, never the window position — the OS keeps
+ * ownership of where the window is. That is what makes a title-bar drag stay
+ * in sync (an earlier version repositioned the window on every present from a
+ * stale GetWindowRect, which fought the modal move loop and left the content
+ * torn/offset after a drag). */
+enum {
+    ZAN_ACCENT_DISABLED = 0,
+    ZAN_ACCENT_ENABLE_BLURBEHIND = 3,
+    ZAN_ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+};
+typedef struct {
+    int AccentState;
+    int AccentFlags;
+    unsigned int GradientColor; /* AABBGGRR */
+    int AnimationId;
+} ZAN_ACCENT_POLICY;
+typedef struct {
+    int Attrib;      /* WCA_ACCENT_POLICY == 19 */
+    void *pvData;
+    size_t cbData;
+} ZAN_WINCOMPATTRDATA;
+typedef BOOL (WINAPI *ZAN_pSetWCA)(HWND, ZAN_WINCOMPATTRDATA *);
+
+static int g_glass_on = 0;
+static u32 g_glass_tint = 0; /* ARGB from Zan (0 -> a light default) */
+
+static void acrylic_apply(HWND hwnd, int state, u32 tint_argb) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+    ZAN_pSetWCA setWCA = (ZAN_pSetWCA)(void *)
+        GetProcAddress(user32, "SetWindowCompositionAttribute");
+    if (!setWCA) return;
+    u32 a = (tint_argb >> 24) & 0xFF, r = (tint_argb >> 16) & 0xFF;
+    u32 g = (tint_argb >> 8) & 0xFF, b = tint_argb & 0xFF;
+    ZAN_ACCENT_POLICY accent;
+    accent.AccentState = state;
+    accent.AccentFlags = 0;
+    accent.GradientColor = (a << 24) | (b << 16) | (g << 8) | r; /* -> ABGR */
+    accent.AnimationId = 0;
+    ZAN_WINCOMPATTRDATA data;
+    data.Attrib = 19; /* WCA_ACCENT_POLICY */
+    data.pvData = &accent;
+    data.cbData = sizeof(accent);
+    setWCA(hwnd, &data);
+}
+
+/* Present a layered window: build a premultiplied top-down BGRA DIB from the
+ * straight-alpha surface and hand it to the DWM via UpdateLayeredWindow. The
+ * memory DC + DIB section are cached across frames (rebuilt only when the
+ * surface size changes) so a live drag/animation doesn't churn GDI objects. */
+static HDC g_lw_mem = NULL;
+static HBITMAP g_lw_dib = NULL;
+static HGDIOBJ g_lw_old = NULL;
+static u32 *g_lw_bits = NULL;
+static int g_lw_w = 0, g_lw_h = 0;
+
+static void present_layered(HWND hwnd, zan_surface_t *s) {
+    if (g_lw_mem == NULL || g_lw_w != s->width || g_lw_h != s->height) {
+        if (g_lw_mem) {
+            SelectObject(g_lw_mem, g_lw_old);
+            DeleteObject(g_lw_dib);
+            DeleteDC(g_lw_mem);
+        }
+        HDC screen = GetDC(NULL);
+        g_lw_mem = CreateCompatibleDC(screen);
+        ReleaseDC(NULL, screen);
+        BITMAPINFO bmi = {0};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = s->width;
+        bmi.bmiHeader.biHeight = -(int)s->height; /* top-down */
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void *bits = NULL;
+        g_lw_dib = CreateDIBSection(g_lw_mem, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (!g_lw_dib) { DeleteDC(g_lw_mem); g_lw_mem = NULL; return; }
+        g_lw_old = SelectObject(g_lw_mem, g_lw_dib);
+        g_lw_bits = (u32 *)bits;
+        g_lw_w = s->width;
+        g_lw_h = s->height;
+    }
+    u32 *d = g_lw_bits;
+    int n = s->width * s->height;
+    for (int i = 0; i < n; i++) {
+        u32 p = s->pixels[i];
+        u32 a = (p >> 24) & 0xFF;
+        u32 r = (p >> 16) & 0xFF, g = (p >> 8) & 0xFF, b = p & 0xFF;
+        /* premultiply for AC_SRC_ALPHA */
+        r = r * a / 255; g = g * a / 255; b = b * a / 255;
+        d[i] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    HDC screen = GetDC(NULL);
+    SIZE sz = { s->width, s->height };
+    POINT ptSrc = { 0, 0 };
+    BLENDFUNCTION bf; bf.BlendOp = AC_SRC_OVER; bf.BlendFlags = 0;
+    bf.SourceConstantAlpha = 255; bf.AlphaFormat = AC_SRC_ALPHA;
+    /* pptDst = NULL: keep the OS-managed window position (never reposition on a
+     * content update), so a drag never tears/offsets the window. */
+    UpdateLayeredWindow(hwnd, screen, NULL, &sz, g_lw_mem, &ptSrc, 0, &bf, ULW_ALPHA);
+    ReleaseDC(NULL, screen);
+}
+
+/* Enable native glass on a window. tint_argb: ARGB tint (alpha ~0x40-0xA0
+ * reads as frost strength). Idempotent; safe to call every theme change. */
+EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    if (!hwnd) return 1;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (!(ex & WS_EX_LAYERED)) {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+    }
+    g_glass_tint = (u32)tint_argb;
+    acrylic_apply(hwnd, ZAN_ACCENT_ENABLE_ACRYLICBLURBEHIND, g_glass_tint);
+    g_glass_on = 1;
+    /* Present the current frame immediately so the layered window has valid
+     * content the moment the style flips (otherwise it can flash empty). */
+    if (g_last_surface >= 0 && g_last_surface < g_surface_count
+        && g_surfaces[g_last_surface])
+        present_layered(hwnd, g_surfaces[g_last_surface]);
+    return 0;
+}
+
+/* Disable native glass and drop the layered style, back to opaque GDI present. */
+EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    if (!hwnd) return 1;
+    acrylic_apply(hwnd, ZAN_ACCENT_DISABLED, 0);
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+    g_glass_on = 0;
+    return 0;
+}
+
 static void blit_surface_to_hwnd(HWND hwnd, zan_surface_t *s) {
     if (!s) return;
+    if (g_glass_on) { present_layered(hwnd, s); return; }
     HDC hdc = GetDC(hwnd);
     BITMAPINFO bmi = {0};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1101,13 +1258,32 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * secondary window (dialog) just reports kind 8 for its own hwnd. */
         if (hwnd == g_main_hwnd) { PostQuitMessage(0); }
         return 0;
+    case WM_ENTERSIZEMOVE:
+        /* Full acrylic re-blurs the desktop on every move, so dragging can
+         * stutter. Downgrade to plain blur-behind for the modal move/size loop:
+         * it is far cheaper (smooth drag) yet still frosts the backdrop so the
+         * window never looks see-through, then restore full acrylic on release. */
+        if (g_glass_on) {
+            acrylic_apply(hwnd, ZAN_ACCENT_ENABLE_BLURBEHIND, g_glass_tint);
+        }
+        break;
+    case WM_EXITSIZEMOVE:
+        if (g_glass_on) {
+            acrylic_apply(hwnd, ZAN_ACCENT_ENABLE_ACRYLICBLURBEHIND, g_glass_tint);
+            /* Re-present the current frame at the settled position so the
+             * layered content is fresh and correctly aligned after the drag. */
+            if (g_last_surface >= 0 && g_last_surface < g_surface_count)
+                present_layered(hwnd, g_surfaces[g_last_surface]);
+        }
+        break;
     case WM_SIZE:
         g_window_width = LOWORD(lp);
         g_window_height = HIWORD(lp);
         /* Fill the resized client area now (last frame at 1:1 + bg-colored
          * margin) so a maximize/drag doesn't flash black before the app thread
-         * repaints crisply. */
-        if (g_last_surface >= 0 && g_last_surface < g_surface_count)
+         * repaints crisply. Skipped under native glass: a layered present here
+         * would fight the resize with the old surface size. */
+        if (!g_glass_on && g_last_surface >= 0 && g_last_surface < g_surface_count)
             blit_surface_to_hwnd(hwnd, g_surfaces[g_last_surface]);
         g_pending_event[0] = 7;
         g_pending_event[1] = g_window_width;
@@ -1233,8 +1409,10 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
         /* Repaint from the last frame so OS-driven invalidations (move, uncover,
-         * DWM) never leave the client black between app repaints. */
-        if (g_last_surface >= 0 && g_last_surface < g_surface_count)
+         * DWM) never leave the client black between app repaints. A layered
+         * (glass) window keeps its own composited bitmap, so WM_PAINT need not
+         * re-present it. */
+        if (!g_glass_on && g_last_surface >= 0 && g_last_surface < g_surface_count)
             blit_surface_to_hwnd(hwnd, g_surfaces[g_last_surface]);
         EndPaint(hwnd, &ps);
         return 0;
@@ -3120,6 +3298,36 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     return 0;
 }
 
+/* Native glass on Linux: ask a compositing WM (KWin, or picom via rules) to
+ * blur whatever is behind the window by setting the de-facto standard
+ * _KDE_NET_WM_BLUR_BEHIND_REGION property. An empty region means "blur the
+ * whole window". The blur is only *visible* where the window is translucent,
+ * which requires a 32-bit ARGB visual plus a running compositor; without those
+ * the hint is a harmless no-op. tint is unused (the compositor owns the tint).
+ * This is the Linux side of the same Gui.Native.Window.EnableGlass API. */
+EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+    (void)tint_argb;
+    if (!g_display) return 1;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    if (!xid) return 1;
+    Atom blur = x11_atom("_KDE_NET_WM_BLUR_BEHIND_REGION");
+    long empty = 0;
+    XChangeProperty(g_display, xid, blur, XA_CARDINAL, 32,
+                    PropModeReplace, (unsigned char *)&empty, 0);
+    XFlush(g_display);
+    return 0;
+}
+
+EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
+    if (!g_display) return 1;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    if (!xid) return 1;
+    Atom blur = x11_atom("_KDE_NET_WM_BLUR_BEHIND_REGION");
+    XDeleteProperty(g_display, xid, blur);
+    XFlush(g_display);
+    return 0;
+}
+
 EXPORT i64 zan_gui_get_dpi_scale(void) {
     if (!g_display) return 100;
     int screen = DefaultScreen(g_display);
@@ -3287,6 +3495,17 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
 }
 #endif
 
+/* Native translucent glass. Windows has the DWM-acrylic implementation above.
+ * macOS (NSVisualEffectView) and Linux (compositor blur) get real backends in
+ * their own sections; any other target links a no-op so the cross-platform
+ * Gui.Native.Window.EnableGlass entry points resolve everywhere. */
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
+    (void)hwnd_val; (void)tint_argb; return 1;
+}
+EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 1; }
+#endif
+
 /* Window management: X11 has real implementations in the __linux__ branch
  * above; the Cocoa backend (ZAN_GUI_COCOA) provides them on macOS. Any other
  * non-Windows target falls back to no-ops. */
@@ -3315,7 +3534,15 @@ EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) { (void)x; (void)y; }
  * in-canvas placeholder instead of embedding a live browser.
  * ======================================================================== */
 #if !defined(ZAN_GUI_COCOA)
-EXPORT i64 zan_gui_webview_create(i64 hwnd) { (void)hwnd; return 0; }
+/* profile_id selects a per-account isolation profile (see WebView.zan). When a
+ * real backend is added here it should map profile_id to that engine's data
+ * partitioning: on Windows a WebView2 per-profile user-data folder (distinct
+ * CreateCoreWebView2EnvironmentWithOptions userDataFolder, or ICoreWebView2Profile
+ * on newer runtimes); on Linux a WebKitGTK WebKitWebsiteDataManager with a
+ * per-profile base data/cache directory. Until then it is a no-op stub. */
+EXPORT i64 zan_gui_webview_create(i64 hwnd, const char *profile_id) {
+    (void)hwnd; (void)profile_id; return 0;
+}
 EXPORT void zan_gui_webview_destroy(i64 h) { (void)h; }
 EXPORT void zan_gui_webview_set_frame(i64 h, i64 x, i64 y, i64 w, i64 hh) {
     (void)h; (void)x; (void)y; (void)w; (void)hh;
