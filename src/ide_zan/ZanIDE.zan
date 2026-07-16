@@ -866,6 +866,15 @@ class ZanIDE {
         int lastExSel = -1;
         SignalInt exTreeScrollY = SignalInt.Create(0);
 
+        // STRUCTURE (code outline): types + their members for the active code
+        // file, rebuilt only when the buffer signature changes so navigation
+        // stays cheap. Clicking a member jumps the editor to its line.
+        List<TreeNode> structTree = new List<TreeNode>();
+        SignalInt structSel = SignalInt.Create(-1);
+        int lastStructSel = -1;
+        SignalInt structScrollY = SignalInt.Create(0);
+        string structSig = "@none";
+
         int lastPresent = 0;
         while (app.isRunning) {
             FilePicker.lang = ZanIDE.uiLang;
@@ -1302,8 +1311,9 @@ class ZanIDE {
                 Rect tr = cols.first;
                 ZanIDE.ShellSurface(app, tr.x, tr.y, tr.width, tr.height, 0, t.bgTertiary);
                 int sectionH = app.Scale(24);
-                int explorerH = (tr.height * 55) / 100;
-                int exampleH = tr.height - explorerH;
+                int explorerH = (tr.height * 40) / 100;
+                int structH = (tr.height * 32) / 100;
+                int exampleH = tr.height - explorerH - structH;
 
                 // Section 1: Explorer
                 c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, ZanIDE.T("EXPLORER", "资源管理器"), t.textTertiary, t.fontSizeSmall);
@@ -1339,8 +1349,63 @@ class ZanIDE {
                     ctxTarget = trRight; app.RequestRedraw();
                 }
 
-                // Section 2: Examples (collapsible tree, click a leaf to open)
-                int exY = tr.y + explorerH;
+                // Section 2: Structure (code outline of the active file).
+                int stY = tr.y + explorerH;
+                c.FillRect(tr.x, stY, tr.width, 1, t.divider);
+                c.DrawText(tr.x + t.paddingMedium, stY + t.paddingSmall, ZanIDE.T("STRUCTURE", "结构"), t.textTertiary, t.fontSizeSmall);
+                // Rebuild the outline only when the active buffer changes, so
+                // typing/clicking stays cheap on large files.
+                string curSrc = editor.GetText();
+                string newSig = Convert.ToString(activeTab.Get()) + ":" + Convert.ToString(curSrc.Length);
+                if (newSig != structSig) {
+                    structSig = newSig;
+                    structTree = ZanIDE.BuildOutline(curSrc);
+                    structSel.Set(0 - 1);
+                    lastStructSel = 0 - 1;
+                }
+                Rect stArea = Rect.Create(tr.x, stY + sectionH, tr.width, structH - sectionH);
+                int stRowH = TreeView.RowHeight(app);
+                int stVis = stArea.height / stRowH;
+                if (stVis < 1) { stVis = 1; }
+                int stContentH = TreeView.ContentHeight(app, structTree);
+                int stMaxScroll = stContentH - stVis * stRowH;
+                if (stMaxScroll < 0) { stMaxScroll = 0; }
+                int stSc = structScrollY.Get();
+                bool ownsStructWheel = app.CaptureWheel(stArea.x, stArea.y, stArea.width, stArea.height);
+                if (ownsStructWheel) {
+                    int std2 = app.window.EventKeyCode();
+                    int ststep = std2 / 120;
+                    if (ststep == 0) {
+                        if (std2 > 0) { ststep = 1; }
+                        else if (std2 < 0) { ststep = 0 - 1; }
+                    }
+                    stSc = stSc - ststep * stRowH;
+                    app.RequestRedraw();
+                }
+                if (stSc > stMaxScroll) { stSc = stMaxScroll; }
+                if (stSc < 0) { stSc = 0; }
+                structScrollY.Set(stSc);
+                if (structTree.Count == 0) {
+                    c.DrawText(stArea.x + t.paddingMedium, stArea.y + t.paddingSmall,
+                        ZanIDE.T("No symbols", "无符号"), t.textTertiary, t.fontSizeSmall);
+                } else {
+                    TreeView.Render(app, stArea, structTree, structSel, stSc);
+                }
+                // Clicking an outline symbol jumps the editor to its line.
+                int stSelV = structSel.Get();
+                if (stSelV != lastStructSel) {
+                    lastStructSel = stSelV;
+                    if (stSelV >= 0 && stSelV < structTree.Count) {
+                        int gln = ZanIDE.OutlineLineOf(structTree[stSelV].path);
+                        if (gln >= 0) {
+                            pendingGotoLine = gln; pendingGotoCol = 0;
+                            app.RequestRedraw();
+                        }
+                    }
+                }
+
+                // Section 3: Examples (collapsible tree, click a leaf to open)
+                int exY = tr.y + explorerH + structH;
                 c.FillRect(tr.x, exY, tr.width, 1, t.divider);
                 c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, ZanIDE.T("EXAMPLES", "示例"), t.textTertiary, t.fontSizeSmall);
                 Rect exArea = Rect.Create(tr.x, exY + sectionH, tr.width, exampleH - sectionH);
@@ -3459,6 +3524,191 @@ class ZanIDE {
             k = k + 1;
         }
         return 0 - 1;
+    }
+
+    /// Net brace-nesting change contributed by one source line, ignoring
+    /// braces inside string/char literals or after a `//` line comment.
+    static int OutlineBraceDelta(string line) {
+        int delta = 0;
+        bool inStr = false;
+        bool inChar = false;
+        int i = 0;
+        while (i < line.Length) {
+            string ch = line.Substring(i, 1);
+            if (inStr) {
+                if (ch == "\\") { i = i + 1; }
+                else if (ch == "\"") { inStr = false; }
+            } else if (inChar) {
+                if (ch == "\\") { i = i + 1; }
+                else if (ch == "'") { inChar = false; }
+            } else {
+                if (ch == "/" && i + 1 < line.Length && line.Substring(i + 1, 1) == "/") {
+                    return delta;
+                } else if (ch == "\"") { inStr = true; }
+                else if (ch == "'") { inChar = true; }
+                else if (ch == "{") { delta = delta + 1; }
+                else if (ch == "}") { delta = delta - 1; }
+            }
+            i = i + 1;
+        }
+        return delta;
+    }
+
+    /// True when `ch` is an identifier character. Uses a whitelist lookup
+    /// rather than string range comparisons, which are unreliable here.
+    static bool OutlineIsIdentChar(string ch) {
+        string ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        return ZanIDE.OutlineFind(ok, ch) >= 0;
+    }
+
+    /// Leading identifier of a token ("Foo<T>" -> "Foo", "bar;" -> "bar").
+    static string OutlineIdent(string tok) {
+        string outp = "";
+        int i = 0;
+        while (i < tok.Length) {
+            string ch = tok.Substring(i, 1);
+            if (ZanIDE.OutlineIsIdentChar(ch)) { outp = outp + ch; }
+            else { break; }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Index of the first occurrence of single-char `ch` in `s`, or -1.
+    static int OutlineFind(string s, string ch) {
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == ch) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// The type name declared on `s` (class/struct/enum/interface), or "".
+    static string OutlineTypeName(string s) {
+        List<string> toks = ZanIDE.SplitSpaces(s);
+        int i = 0;
+        while (i < toks.Count) {
+            string tk = toks[i];
+            if (tk == "class" || tk == "struct" || tk == "enum" || tk == "interface") {
+                if (i + 1 < toks.Count) { return ZanIDE.OutlineIdent(toks[i + 1]); }
+                return "";
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// "Name()" when `s` is a method/ctor definition header, else "".
+    static string OutlineMethodName(string s) {
+        int paren = ZanIDE.OutlineFind(s, "(");
+        if (paren <= 0) { return ""; }
+        string header = s.Substring(0, paren);
+        if (ZanIDE.OutlineFind(header, "=") >= 0) { return ""; }
+        string rt = ZanIDE.RTrimS(s);
+        if (rt.Length == 0) { return ""; }
+        string last = rt.Substring(rt.Length - 1, 1);
+        if (last != "{" && last != ")") { return ""; }
+        List<string> toks = ZanIDE.SplitSpaces(header);
+        if (toks.Count < 2) { return ""; }
+        string name = ZanIDE.OutlineIdent(toks[toks.Count - 1]);
+        if (name == "") { return ""; }
+        if (name == "if" || name == "while" || name == "for" || name == "foreach"
+            || name == "switch" || name == "catch" || name == "lock" || name == "using") {
+            return "";
+        }
+        return name + "()";
+    }
+
+    /// The field name when `s` is a field declaration, else "".
+    static string OutlineFieldName(string s) {
+        string rt = ZanIDE.RTrimS(s);
+        if (rt.Length == 0) { return ""; }
+        if (rt.Substring(rt.Length - 1, 1) != ";") { return ""; }
+        string decl = rt.Substring(0, rt.Length - 1);
+        int eq = ZanIDE.OutlineFind(decl, "=");
+        if (eq >= 0) { decl = decl.Substring(0, eq); }
+        if (ZanIDE.OutlineFind(decl, "(") >= 0) { return ""; }
+        List<string> toks = ZanIDE.SplitSpaces(decl);
+        if (toks.Count < 2) { return ""; }
+        string first = toks[0];
+        if (first == "return" || first == "using" || first == "namespace"
+            || first == "throw" || first == "break" || first == "continue"
+            || first == "case" || first == "default") {
+            return "";
+        }
+        return ZanIDE.OutlineIdent(toks[toks.Count - 1]);
+    }
+
+    /// Builds a navigable code-structure outline of a source buffer for the
+    /// IDE's STRUCTURE panel: each top-level type becomes an expandable node
+    /// whose children are the type's direct methods and fields. Each node's
+    /// `path` carries the 0-based line to jump to. Best-effort and brace-depth
+    /// driven, so it stays responsive on large files without a full parse.
+    static List<TreeNode> BuildOutline(string body) {
+        List<TreeNode> outp = new List<TreeNode>();
+        List<string> ls = CodeEditor.SplitLines(body);
+        int depth = 0;
+        int bodyDepth = 0 - 1;
+        int i = 0;
+        while (i < ls.Count) {
+            string raw = ls[i];
+            string s = CodeEditor.LTrim(raw);
+            int startDepth = depth;
+            bool isComment = false;
+            if (s.Length >= 1 && s.Substring(0, 1) == "*") { isComment = true; }
+            if (s.Length >= 2) {
+                string p2 = s.Substring(0, 2);
+                if (p2 == "//" || p2 == "/*") { isComment = true; }
+            }
+            if (!isComment) {
+                if (startDepth == 0) {
+                    string tn = ZanIDE.OutlineTypeName(s);
+                    if (tn != "") {
+                        TreeNode n = TreeNode.Dir(tn, 0, true);
+                        n.icon = "code";
+                        n.path = Convert.ToString(i);
+                        outp.Add(n);
+                        bodyDepth = 1;
+                    }
+                } else if (bodyDepth >= 0 && startDepth == bodyDepth) {
+                    string mn = ZanIDE.OutlineMethodName(s);
+                    if (mn != "") {
+                        TreeNode n = TreeNode.FileIcon(mn, 1, "play");
+                        n.path = Convert.ToString(i);
+                        outp.Add(n);
+                    } else {
+                        string fn = ZanIDE.OutlineFieldName(s);
+                        if (fn != "") {
+                            TreeNode n = TreeNode.FileIcon(fn, 1, "minus");
+                            n.path = Convert.ToString(i);
+                            outp.Add(n);
+                        }
+                    }
+                }
+            }
+            depth = depth + ZanIDE.OutlineBraceDelta(raw);
+            if (depth < 0) { depth = 0; }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Parses a decimal line index previously stored in a TreeNode.path by
+    /// BuildOutline; returns -1 when the node carries no line.
+    static int OutlineLineOf(string path) {
+        if (path == "") { return 0 - 1; }
+        string digits = "0123456789";
+        int val = 0;
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            int d = ZanIDE.OutlineFind(digits, ch);
+            if (d < 0) { return 0 - 1; }
+            val = val * 10 + d;
+            i = i + 1;
+        }
+        return val;
     }
 
     /// Recursively collects every .zan file path under `dir`.
