@@ -1125,16 +1125,13 @@ static void present_layered(HWND hwnd, zan_surface_t *s) {
         d[i] = (a << 24) | (r << 16) | (g << 8) | b;
     }
     HDC screen = GetDC(NULL);
+    SIZE sz = { s->width, s->height };
     POINT ptSrc = { 0, 0 };
     BLENDFUNCTION bf; bf.BlendOp = AC_SRC_OVER; bf.BlendFlags = 0;
     bf.SourceConstantAlpha = 255; bf.AlphaFormat = AC_SRC_ALPHA;
-    /* pptDst = NULL and psize = NULL: only refresh the layered content bitmap;
-     * never move or resize the window from a content update. Passing the surface
-     * size as psize made UpdateLayeredWindow force the window to the surface size
-     * on every present, which fought user resizes (rubbery drag) and shrank a
-     * maximized glass window (client < window) -- i.e. "glass resizes the window".
-     * Window size is driven solely by CreateWindow / WM_SIZE (resize borders). */
-    UpdateLayeredWindow(hwnd, screen, NULL, NULL, g_lw_mem, &ptSrc, 0, &bf, ULW_ALPHA);
+    /* pptDst = NULL: keep the OS-managed window position (never reposition on a
+     * content update), so a drag never tears/offsets the window. */
+    UpdateLayeredWindow(hwnd, screen, NULL, &sz, g_lw_mem, &ptSrc, 0, &bf, ULW_ALPHA);
     ReleaseDC(NULL, screen);
 }
 
