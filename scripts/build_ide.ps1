@@ -57,6 +57,16 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 clang -O2 -std=c11 -I src\runtime -c src\runtime\rt_sync.c -o build\zanrt_sync_ide.obj
 if ($LASTEXITCODE -ne 0) { Write-Output "SYNC_COMPILE_FAILED"; exit 1 }
 
+# ---- application icon resource --------------------------------------------
+# The IDE links a Windows .res for its exe/taskbar icon. Compile it from
+# assets\zan.rc so a clean build tree (with no build\zan_icon.res yet) links.
+$iconRes = Join-Path $root "build\zan_icon.res"
+if (-not (Test-Path $iconRes)) {
+    Write-Output "Compiling application icon (assets\zan.rc -> build\zan_icon.res) ..."
+    & llvm-rc /fo $iconRes /I (Join-Path $root "assets") (Join-Path $root "assets\zan.rc")
+    if ($LASTEXITCODE -ne 0) { Write-Output "ICON_RC_FAILED"; exit 1 }
+}
+
 $registryPath = Join-Path $root "stdlib\Gui\CustomComponents.zan"
 $registryOriginal = [System.IO.File]::ReadAllText($registryPath)
 $failed = $false

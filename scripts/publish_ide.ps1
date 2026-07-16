@@ -64,6 +64,11 @@ Write-Output "[3/4] Copying IDE + compiler + stdlib ..."
 $distTc = Join-Path $dist 'toolchain'
 New-Item -ItemType Directory -Path $distTc | Out-Null
 Copy-Item $ideExe (Join-Path $dist 'ZanIDE.exe')
+# The IDE window is an SDL3 window (built with ZAN_GUI_SDL), so SDL3.dll must
+# ship beside ZanIDE.exe or the published IDE fails to start.
+$sdlDll = Join-Path $b 'SDL3.dll'
+if (Test-Path $sdlDll) { Copy-Item $sdlDll (Join-Path $dist 'SDL3.dll') }
+else { Write-Output "PUBLISH_FAILED: build\SDL3.dll missing (IDE needs it to run)"; exit 1 }
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 
 # Everything the compiler needs travels together in dist\toolchain, laid out
@@ -127,6 +132,7 @@ Zan IDE - self-contained release
 
 Contents
   ZanIDE.exe     The Zan IDE.
+  SDL3.dll       SDL3 runtime the IDE window uses; keep it next to ZanIDE.exe.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
                    zan-lsp.exe             language server (for external editors)
