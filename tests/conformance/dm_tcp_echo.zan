@@ -1,0 +1,55 @@
+// End-to-end loopback round-trip of the Game.Dm TCP runtime: a DmTcpServer
+// accepts one connection and echoes the framed record it receives; a
+// DmTcpClient connects, sends a cid-keyed DmMessage and reads the echo back,
+// verifying the cid + body survive the real socket + framing path.
+// Uses only loopback OS sockets (no external driver), like the async echo test.
+using System;
+using System.Net.Sockets;
+using Game.Dm;
+
+class Program {
+    static int PORT = 54620;
+    static int gotCid = 0;
+    static string gotBody = "";
+    static bool done = false;
+
+    static async void Serve(DmTcpServerRuntime server) {
+        int clientSock = await server.AcceptAsync();
+        TcpClientConfig scfg = TcpClientConfig.Create("peer", "127.0.0.1", PORT);
+        DmTcpClientRuntime conn = DmTcpClientRuntime.FromSocket(scfg, clientSock);
+        DmMessage msg = await conn.ReceiveMessageAsync();
+        // Echo the same cid/body straight back.
+        int _n = await conn.SendMessageAsync(DmMessage.Text(msg.Cid(), msg.Body()));
+        conn.Close();
+    }
+
+    static async void Client() {
+        TcpClientConfig cfg = TcpClientConfig.Create("link", "127.0.0.1", PORT);
+        DmTcpClientRuntime client = DmTcpClientRuntime.FromConfig(cfg);
+        await client.ConnectAsync();
+        int _s = await client.SendMessageAsync(DmMessage.Text(2048, "state-sync"));
+        DmMessage reply = await client.ReceiveMessageAsync();
+        gotCid = reply.Cid();
+        gotBody = reply.Body();
+        client.Close();
+        done = true;
+    }
+
+    static async int Run() {
+        ServerConfig scfg = ServerConfig.Create("dm-server", PORT);
+        DmTcpServerRuntime server = await DmTcpServerRuntime.StartAsync(scfg, "127.0.0.1");
+        Task.Spawn(Serve(server));
+        Task.Spawn(Client());
+        while (!done) {
+            await Task.Delay(5);
+        }
+        server.Stop();
+        Console.WriteLine("cid=" + Convert.ToString(gotCid));
+        Console.WriteLine("body=" + gotBody);
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
