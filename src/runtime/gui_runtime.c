@@ -1946,6 +1946,20 @@ static int zq_empty(void) { return g_zq_head == g_zq_tail; }
 
 static void zq_push(int kind, int x, int y, int button, int code, int mods,
                     SDL_Window *win) {
+    /* Coalesce mouse-move floods: unlike Win32 (which collapses WM_MOUSEMOVE),
+     * SDL emits one motion event per sample, so a fast drag can enqueue
+     * hundreds. The app consumes one event per ~16ms frame, so an un-coalesced
+     * backlog makes the UI (and hover highlights) lag seconds behind the
+     * cursor. If the last unconsumed event is also a plain move on the same
+     * window, overwrite it with the newer position instead of enqueuing. */
+    if (kind == 1 && !zq_empty()) {
+        int last = (g_zq_tail + ZAN_ZQ_CAP - 1) % ZAN_ZQ_CAP;
+        zan_zev_t *p = &g_zq[last];
+        if (p->e[0] == 1 && p->win == win) {
+            p->e[1] = x; p->e[2] = y; p->e[5] = mods;
+            return;
+        }
+    }
     int next = (g_zq_tail + 1) % ZAN_ZQ_CAP;
     if (next == g_zq_head) return; /* full: drop oldest-safe (never overwrite) */
     zan_zev_t *z = &g_zq[g_zq_tail];
@@ -2227,16 +2241,20 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     return 0;
 }
 
+/* Drain every SDL event currently available into the zan queue. Motion events
+ * coalesce in zq_push, so this collapses a burst of samples to the single
+ * latest position and, crucially, never leaves motion piling up in SDL's own
+ * queue between frames (which is what starved the one-event-per-frame app). */
+static void sdl_drain(void) {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) sdl_translate(&e);
+}
+
 EXPORT i64 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     if (!g_sdl_ready) return 1;
-    while (zq_empty()) {
-        SDL_Event e;
-        if (!SDL_PollEvent(&e)) {
-            return (g_quit) ? -1 : 1;
-        }
-        sdl_translate(&e);
-    }
+    sdl_drain();
+    if (zq_empty()) return (g_quit) ? -1 : 1;
     zq_pop();
     return 0;
 }
@@ -2244,10 +2262,12 @@ EXPORT i64 zan_gui_poll_event(void) {
 EXPORT i64 zan_gui_wait_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     if (!g_sdl_ready) return -1;
-    if (!zq_empty()) { zq_pop(); return 0; }
-    SDL_Event e;
-    if (!SDL_WaitEvent(&e)) return -1;
-    sdl_translate(&e);
+    if (zq_empty()) {
+        SDL_Event e;
+        if (!SDL_WaitEvent(&e)) return -1;
+        sdl_translate(&e);
+        sdl_drain(); /* fold in anything already waiting behind it */
+    }
     if (!zq_empty()) zq_pop(); /* else leaves kind 0 (e.g. a wake) */
     return 0;
 }
