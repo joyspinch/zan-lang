@@ -1,0 +1,111 @@
+// Exercises the Game.Rts.Formats CSF (Westwood string table) parser on an
+// in-memory buffer: header fields, label/value pairs, bit-complemented UTF-16LE
+// values re-encoded to UTF-8 (incl. a 2-byte code point). Clean-room: the table
+// is synthesized here, no original strings are embedded.
+using System;
+using Game.Rts.Formats;
+
+namespace T;
+
+class W {
+    [DllImport("crt")]
+    static extern int strlen(string s);
+
+    string buf;
+    int pos;
+
+    static W On(string buf) {
+        W w = new W();
+        w.buf = buf;
+        w.pos = 0;
+        return w;
+    }
+
+    void U8(int v) {
+        this.buf[this.pos] = (char)(v & 0xFF);
+        this.pos = this.pos + 1;
+    }
+    void U32(int v) {
+        this.U8(v & 0xFF);
+        this.U8((v >> 8) & 0xFF);
+        this.U8((v >> 16) & 0xFF);
+        this.U8((v >> 24) & 0xFF);
+    }
+    void Magic(int a, int b, int c, int d) {
+        this.U8(a); this.U8(b); this.U8(c); this.U8(d);
+    }
+    void Ascii(string s) {
+        int i = 0;
+        int n = strlen(s);
+        while (i < n) { this.U8(s[i] & 0xFF); i = i + 1; }
+    }
+    // One UTF-16LE code unit, stored bit-complemented.
+    void Unit(int cu) {
+        this.U8((cu & 0xFF) ^ 0xFF);
+        this.U8(((cu >> 8) & 0xFF) ^ 0xFF);
+    }
+    void Label(string label) {
+        this.Magic(0x20, 0x4C, 0x42, 0x4C);   // " LBL"
+        this.U32(1);                           // one string pair
+        this.U32(strlen(label));
+        this.Ascii(label);
+    }
+    void ValueHeader(int codeUnits) {
+        this.Magic(0x20, 0x52, 0x54, 0x53);   // " RTS"
+        this.U32(codeUnits);
+    }
+    void ValueAscii(string s) {
+        int n = strlen(s);
+        this.ValueHeader(n);
+        int i = 0;
+        while (i < n) { this.Unit(s[i] & 0xFF); i = i + 1; }
+    }
+}
+
+class Program {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    static void Main() {
+        string buf = calloc(1024, 1);
+        W w = W.On(buf);
+
+        w.Magic(0x20, 0x46, 0x53, 0x43);   // " FSC"
+        w.U32(3);      // version
+        w.U32(3);      // label count
+        w.U32(3);      // string count
+        w.U32(0);      // unused
+        w.U32(0);      // language (English)
+
+        w.Label("GUI:OK");
+        w.ValueAscii("OK");
+        w.Label("GUI:Cancel");
+        w.ValueAscii("Cancel");
+        // A value with a non-ASCII BMP code point (U+00E9 'é') to exercise the
+        // 2-byte UTF-8 path: c a f é
+        w.Label("TXT:Accent");
+        w.ValueHeader(4);
+        w.Unit(99); w.Unit(97); w.Unit(102); w.Unit(233);
+
+        CsfTable t = CsfTable.Parse(buf, 1024);
+        Console.WriteLine("version=" + Convert.ToString(t.Version()));
+        Console.WriteLine("language=" + Convert.ToString(t.Language()));
+        Console.WriteLine("labels=" + Convert.ToString(t.LabelCount()));
+        Console.WriteLine("strings=" + Convert.ToString(t.StringCount()));
+        Console.WriteLine("count=" + Convert.ToString(t.Count()));
+        Console.WriteLine("e0=" + t.EntryAt(0).Label());
+        Console.WriteLine("ok=" + t.Lookup("GUI:OK"));
+        Console.WriteLine("cancel=" + t.Lookup("GUI:Cancel"));
+        Console.WriteLine("accent=" + t.Lookup("TXT:Accent"));
+        string miss = t.Lookup("NOPE");
+        if (miss == null) {
+            Console.WriteLine("missing=null");
+        } else {
+            Console.WriteLine("missing=" + miss);
+        }
+
+        free(buf);
+    }
+}

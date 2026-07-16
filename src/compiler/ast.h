@@ -131,6 +131,7 @@ struct zan_ast_node {
         struct {
             zan_ast_node_t *callee;
             zan_ast_list_t args;
+            zan_ast_list_t type_args; /* explicit generic args: f<int>(...) */
         } call;
 
         /* member access: expr.name */

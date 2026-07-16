@@ -1,0 +1,145 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Rts.Formats;
+
+// A single label -> value binding from a Westwood CSF string table. A label may
+// carry several strings in the file; only the first (the one the engine uses)
+// is retained here.
+class CsfEntry {
+    string label;
+    string text;
+
+    static CsfEntry Of(string label, string text) {
+        CsfEntry e = new CsfEntry();
+        e.label = label;
+        e.text = text;
+        return e;
+    }
+
+    string Label() { return this.label; }
+    string Text() { return this.text; }
+}
+
+// Parses a Westwood CSF (Compiled String File) string table as used by
+// Tiberian Sun / Red Alert 2 for localized UI text.
+//
+// Layout (little-endian):
+//   header  : " FSC" magic, version, labelCount, stringCount, unused, language
+//   label   : " LBL" magic, pairCount, labelLen, label[labelLen]
+//   value   : " RTS" (or "WRTS") magic, valueLen, utf16le[valueLen]
+//             (WRTS also has a trailing extraLen + ascii[extraLen])
+//
+// Each value byte is stored bit-complemented on disk; the code units are
+// UTF-16LE and are re-encoded to UTF-8 here. Clean-room: no original strings
+// are embedded; tests build their own tables.
+class CsfTable {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    int version;
+    int language;
+    int labelCount;
+    int stringCount;
+    List<CsfEntry> entries;
+
+    static CsfTable Parse(string data, int length) {
+        CsfTable t = new CsfTable();
+        t.entries = new List<CsfEntry>();
+        BinaryReader r = BinaryReader.FromBuffer(data, length);
+
+        r.Skip(4);                    // " FSC" magic
+        t.version = (int)r.ReadU32();
+        t.labelCount = (int)r.ReadU32();
+        t.stringCount = (int)r.ReadU32();
+        r.Skip(4);                    // unused
+        t.language = (int)r.ReadU32();
+
+        int li = 0;
+        while (li < t.labelCount) {
+            r.Skip(4);                // " LBL" magic
+            int pairCount = (int)r.ReadU32();
+            int labelLen = r.ReadI32();
+            string label = CsfTable.ReadAscii(r, labelLen);
+
+            string firstValue = "";
+            int pi = 0;
+            while (pi < pairCount) {
+                int typeTag = r.ReadU8();  // ' ' (0x20) for RTS, 'W' (0x57) for WRTS
+                r.Skip(3);                 // "RTS"
+                bool wide = typeTag == 87;
+                int valueLen = r.ReadI32();
+                string val = CsfTable.ReadValue(r, valueLen);
+                if (pi == 0) { firstValue = val; }
+                if (wide) {
+                    int extraLen = r.ReadI32();
+                    r.Skip(extraLen);
+                }
+                pi = pi + 1;
+            }
+            t.entries.Add(CsfEntry.Of(label, firstValue));
+            li = li + 1;
+        }
+        return t;
+    }
+
+    static string ReadAscii(BinaryReader r, int len) {
+        string buf = CsfTable.calloc(len + 1, 1);
+        int i = 0;
+        while (i < len) {
+            buf[i] = (char)r.ReadU8();
+            i = i + 1;
+        }
+        return buf;
+    }
+
+    // Decode valueLen UTF-16LE code units (each byte bit-complemented on disk)
+    // into a UTF-8 string.
+    static string ReadValue(BinaryReader r, int valueLen) {
+        string buf = CsfTable.calloc(valueLen * 3 + 1, 1);
+        int outp = 0;
+        int i = 0;
+        while (i < valueLen) {
+            int lo = (r.ReadU8() ^ 0xFF) & 0xFF;
+            int hi = (r.ReadU8() ^ 0xFF) & 0xFF;
+            int cu = (hi << 8) | lo;
+            if (cu < 0x80) {
+                buf[outp] = (char)cu;
+                outp = outp + 1;
+            } else if (cu < 0x800) {
+                buf[outp] = (char)(0xC0 | (cu >> 6));
+                buf[outp + 1] = (char)(0x80 | (cu & 0x3F));
+                outp = outp + 2;
+            } else {
+                buf[outp] = (char)(0xE0 | (cu >> 12));
+                buf[outp + 1] = (char)(0x80 | ((cu >> 6) & 0x3F));
+                buf[outp + 2] = (char)(0x80 | (cu & 0x3F));
+                outp = outp + 3;
+            }
+            i = i + 1;
+        }
+        return buf;
+    }
+
+    int Version() { return this.version; }
+    int Language() { return this.language; }
+    int LabelCount() { return this.labelCount; }
+    int StringCount() { return this.stringCount; }
+    int Count() { return this.entries.Count; }
+
+    CsfEntry EntryAt(int index) {
+        if (index < 0 || index >= this.entries.Count) { return null; }
+        return this.entries[index];
+    }
+
+    string Lookup(string label) {
+        int i = 0;
+        while (i < this.entries.Count) {
+            if (this.entries[i].Label() == label) {
+                return this.entries[i].Text();
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+}

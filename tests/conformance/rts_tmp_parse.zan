@@ -1,0 +1,104 @@
+// Exercises the Game.Rts.Formats TMP(TS) parser/decoder on an in-memory
+// template: 2 tiles (one real 8x4 diamond, one empty). Verifies the isometric
+// diamond unpack (centered runs 4,8,4,0) and per-tile header fields.
+// Clean-room: the template is synthesized here, no original assets are embedded.
+using System;
+using Game.Rts.Formats;
+
+namespace T;
+
+class W {
+    string buf;
+    int pos;
+
+    static W On(string buf) {
+        W w = new W();
+        w.buf = buf;
+        w.pos = 0;
+        return w;
+    }
+    void U8(int v) {
+        this.buf[this.pos] = (char)(v & 0xFF);
+        this.pos = this.pos + 1;
+    }
+    void U16(int v) { this.U8(v & 0xFF); this.U8((v >> 8) & 0xFF); }
+    void U32(int v) { this.U16(v & 0xFFFF); this.U16((v >> 16) & 0xFFFF); }
+    int Pos() { return this.pos; }
+    void SeekTo(int p) { this.pos = p; }
+}
+
+class Program {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    static string Row(TmpTemplate t, int tile, int y, int w) {
+        string px = t.DecodeTile(tile);
+        string line = "";
+        int x = 0;
+        while (x < w) {
+            if (x > 0) { line = line + ","; }
+            line = line + Convert.ToString(px[y * w + x] & 0xFF);
+            x = x + 1;
+        }
+        return line;
+    }
+
+    static void Main() {
+        // 2x1 template, tile size 8x4. Header 16 + directory 8 = 24.
+        int tile0Off = 24;
+        string buf = calloc(512, 1);
+        W w = W.On(buf);
+
+        // file header
+        w.U32(2);   // blocksX
+        w.U32(1);   // blocksY
+        w.U32(8);   // tileWidth
+        w.U32(4);   // tileHeight
+        // directory
+        w.U32(tile0Off);   // tile 0
+        w.U32(0);          // tile 1 (empty)
+
+        // tile 0 header (52 bytes)
+        w.SeekTo(tile0Off);
+        w.U32(3);   // x
+        w.U32(5);   // y
+        w.U32(0); w.U32(0); w.U32(0);        // extra_ofs, z_ofs, extra_z_ofs
+        w.U32(0); w.U32(0); w.U32(0); w.U32(0); // extra x/y/w/h
+        w.U32(0);   // flags (no extra data)
+        // 12 bytes: height, terrain, ramp, radar l(3), radar r(3), pad(3)
+        w.U8(2);    // height
+        w.U8(7);    // terrain type
+        w.U8(1);    // ramp type
+        w.U8(0); w.U8(0); w.U8(0);
+        w.U8(0); w.U8(0); w.U8(0);
+        w.U8(0); w.U8(0); w.U8(0);
+        // base pixels: rows 4,8,4,0 -> 16 bytes, values 1..16
+        int v = 1;
+        while (v <= 16) { w.U8(v); v = v + 1; }
+        // depth pixels: 16 zero bytes (ignored by decoder)
+        int d = 0;
+        while (d < 16) { w.U8(0); d = d + 1; }
+
+        TmpTemplate t = TmpTemplate.Parse(buf, 512);
+        Console.WriteLine("bx=" + Convert.ToString(t.BlocksX()));
+        Console.WriteLine("by=" + Convert.ToString(t.BlocksY()));
+        Console.WriteLine("tw=" + Convert.ToString(t.TileWidth()));
+        Console.WriteLine("th=" + Convert.ToString(t.TileHeight()));
+        Console.WriteLine("tiles=" + Convert.ToString(t.TileCount()));
+        Console.WriteLine("t0empty=" + Convert.ToString(t.TileAt(0).IsEmpty()));
+        Console.WriteLine("t1empty=" + Convert.ToString(t.TileAt(1).IsEmpty()));
+        Console.WriteLine("t0x=" + Convert.ToString(t.TileAt(0).X()));
+        Console.WriteLine("t0y=" + Convert.ToString(t.TileAt(0).Y()));
+        Console.WriteLine("t0h=" + Convert.ToString(t.TileAt(0).Height()));
+        Console.WriteLine("t0terrain=" + Convert.ToString(t.TileAt(0).TerrainType()));
+        Console.WriteLine("t0ramp=" + Convert.ToString(t.TileAt(0).RampType()));
+        Console.WriteLine("t0r0=" + Program.Row(t, 0, 0, 8));
+        Console.WriteLine("t0r1=" + Program.Row(t, 0, 1, 8));
+        Console.WriteLine("t0r2=" + Program.Row(t, 0, 2, 8));
+        Console.WriteLine("t0r3=" + Program.Row(t, 0, 3, 8));
+
+        free(buf);
+    }
+}

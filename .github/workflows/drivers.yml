@@ -1,0 +1,270 @@
+name: drivers
+
+# Builds the native driver bundles (SDL3, SQLite, PostgreSQL/libpq) for every
+# supported target on its own native runner, then uploads each per-target
+# directory as an artifact. The repository only tracks the *.bundle manifests;
+# the binaries themselves are produced here and are never committed.
+#
+# On a tag push the per-target bundles are also attached to a GitHub Release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*', 'drivers-*']
+  pull_request:
+    paths:
+      - '.github/workflows/drivers.yml'
+      - 'stdlib/SDL3/**'
+      - 'stdlib/System/Data/**'
+      - 'scripts/stage_*'
+
+permissions:
+  contents: write
+
+env:
+  SDL3_VERSION: '3.4.10'
+  SQLITE_URL: 'https://sqlite.org/2024/sqlite-amalgamation-3460100.zip'
+  SQLITE_DIR: 'sqlite-amalgamation-3460100'
+
+jobs:
+  # ---------------------------------------------------------------- Linux ----
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64,   runner: ubuntu-latest }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/azure-cli.list \
+                     /etc/apt/sources.list.d/azure-cli.sources || true
+          # The arm64 runners hit ports.ubuntu.com over a flaky link: `update`
+          # succeeds but the .deb fetches drop mid-transfer. Force IPv4, give apt
+          # generous per-file retries, and wrap the install in a retry loop.
+          sudo tee /etc/apt/apt.conf.d/99net-resilience >/dev/null <<'EOF'
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "8";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          EOF
+          sudo apt-get update
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get install -y --no-install-recommends --fix-missing \
+              build-essential cmake pkg-config ninja-build patchelf unzip curl \
+              libpq-dev \
+              libx11-dev libxext-dev libxcursor-dev libxrandr-dev libxi-dev \
+              libxfixes-dev libxinerama-dev libxss-dev libxkbcommon-dev \
+              libxtst-dev \
+              libwayland-dev wayland-protocols libgbm-dev libdrm-dev \
+              libgl1-mesa-dev libasound2-dev libpulse-dev && break
+            echo "apt-get install attempt $attempt failed; retrying in 15s"
+            sleep 15
+            sudo apt-get update || true
+          done
+
+      - name: Build SDL3 from source
+        run: |
+          set -eux
+          curl -fsSL -o sdl.tar.gz \
+            "https://github.com/libsdl-org/SDL/releases/download/release-${SDL3_VERSION}/SDL3-${SDL3_VERSION}.tar.gz"
+          tar xzf sdl.tar.gz
+          cmake -S "SDL3-${SDL3_VERSION}" -B sdlbuild -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+            -DSDL_TEST_LIBRARY=OFF -DCMAKE_INSTALL_PREFIX="$PWD/sdlinst"
+          cmake --build sdlbuild
+          cmake --install sdlbuild
+
+      - name: Stage SDL3 driver
+        run: |
+          set -eux
+          export PKG_CONFIG_PATH="$PWD/sdlinst/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          DEST="stdlib/SDL3/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST"
+          cc -O2 -fPIC -shared -Wl,-soname,libzan_sdl3.so \
+            -o "$DEST/libzan_sdl3.so" stdlib/SDL3/native/zan_sdl3.c \
+            $(pkg-config --cflags sdl3) $(pkg-config --libs sdl3) -lm
+          cp -L "$(pkg-config --variable=libdir sdl3)/libSDL3.so.0" "$DEST/libSDL3.so.0"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libzan_sdl3.so"
+          printf 'libzan_sdl3.so\nlibSDL3.so.0\n' > "$DEST/zan_sdl3.bundle"
+          ldd "$DEST/libzan_sdl3.so" || true
+
+      - name: Stage SQLite driver
+        run: |
+          set -eux
+          curl -fsSL -o sq.zip "$SQLITE_URL" && unzip -q sq.zip
+          DEST="stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST/static"
+          cc -O2 -fPIC -shared -Wl,-soname,libsqlite3.so \
+            -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_RTREE \
+            -o "$DEST/libsqlite3.so" "$SQLITE_DIR/sqlite3.c" -lpthread -ldl -lm
+          cc -O2 -fPIC -c -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1 \
+            -DSQLITE_ENABLE_RTREE -o sqlite3.o "$SQLITE_DIR/sqlite3.c"
+          ar rcs "$DEST/static/libsqlite3.a" sqlite3.o
+
+      - name: Stage PostgreSQL (libpq) driver
+        run: bash scripts/stage_libpq_linux.sh "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drivers-${{ matrix.target }}
+          path: |
+            stdlib/SDL3/drivers/${{ matrix.target }}/
+            stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}/
+            stdlib/System/Data/Postgres/drivers/${{ matrix.target }}/
+
+  # ---------------------------------------------------------------- macOS ----
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: macos-arm64, runner: macos-14 }
+          - { target: macos-x64,   runner: macos-13 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: brew install sdl3 libpq sqlite pkg-config
+
+      - name: Stage SDL3 driver
+        run: |
+          set -eux
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix sdl3)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          DEST="stdlib/SDL3/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST"
+          xcrun clang -O2 -fPIC -dynamiclib -install_name @rpath/libzan_sdl3.dylib \
+            -o "$DEST/libzan_sdl3.dylib" stdlib/SDL3/native/zan_sdl3.c \
+            $(pkg-config --cflags sdl3) $(pkg-config --libs sdl3) -lm
+          cp -L "$(pkg-config --variable=libdir sdl3)/libSDL3.0.dylib" "$DEST/libSDL3.0.dylib"
+          chmod u+w "$DEST/libSDL3.0.dylib"
+          SDLDEP="$(otool -L "$DEST/libzan_sdl3.dylib" | awk '/libSDL3/{print $1; exit}')"
+          install_name_tool -change "$SDLDEP" @rpath/libSDL3.0.dylib "$DEST/libzan_sdl3.dylib"
+          install_name_tool -id @rpath/libSDL3.0.dylib "$DEST/libSDL3.0.dylib"
+          install_name_tool -add_rpath @loader_path "$DEST/libzan_sdl3.dylib" || true
+          codesign --force --sign - "$DEST/libSDL3.0.dylib"
+          codesign --force --sign - "$DEST/libzan_sdl3.dylib"
+          printf 'libzan_sdl3.dylib\nlibSDL3.0.dylib\n' > "$DEST/zan_sdl3.bundle"
+          otool -L "$DEST/libzan_sdl3.dylib"
+
+      - name: Stage SQLite driver
+        run: |
+          set -eux
+          curl -fsSL -o sq.zip "$SQLITE_URL" && unzip -q sq.zip
+          DEST="stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST/static"
+          xcrun clang -O2 -fPIC -dynamiclib -install_name @rpath/libsqlite3.dylib \
+            -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_RTREE \
+            -o "$DEST/libsqlite3.dylib" "$SQLITE_DIR/sqlite3.c"
+          xcrun clang -O2 -fPIC -c -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1 \
+            -DSQLITE_ENABLE_RTREE -o sqlite3.o "$SQLITE_DIR/sqlite3.c"
+          ar rcs "$DEST/static/libsqlite3.a" sqlite3.o
+          codesign --force --sign - "$DEST/libsqlite3.dylib"
+
+      - name: Stage PostgreSQL (libpq) driver
+        run: bash scripts/stage_libpq_macos.sh "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drivers-${{ matrix.target }}
+          path: |
+            stdlib/SDL3/drivers/${{ matrix.target }}/
+            stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}/
+            stdlib/System/Data/Postgres/drivers/${{ matrix.target }}/
+
+  # -------------------------------------------------------------- Windows ----
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: win-x64,   msystem: MINGW64,    prefix: mingw-w64-x86_64 }
+          - { target: win-arm64, msystem: CLANGARM64, prefix: mingw-w64-clang-aarch64 }
+    runs-on: ${{ matrix.target == 'win-arm64' && 'windows-11-arm' || 'windows-latest' }}
+    # win-arm64 SDL3 packaging is not yet reliably available in MSYS2; keep the
+    # job best-effort so it never blocks the other targets.
+    continue-on-error: ${{ matrix.target == 'win-arm64' }}
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            ${{ matrix.prefix }}-gcc
+            ${{ matrix.prefix }}-sdl3
+            ${{ matrix.prefix }}-sqlite3
+            ${{ matrix.prefix }}-postgresql
+
+      - name: Stage drivers (SDL3 + SQLite + libpq)
+        run: |
+          set -eux
+          P="$(cygpath -u "$MINGW_PREFIX")"
+          # SDL3 bridge
+          SDEST="stdlib/SDL3/drivers/${{ matrix.target }}"
+          mkdir -p "$SDEST"
+          # msys2 has no pkg-config here (and the mingw pkg-config package is
+          # unavailable for CLANGARM64), so link SDL3 directly from $MINGW_PREFIX.
+          cc -O2 -shared -o "$SDEST/zan_sdl3.dll" stdlib/SDL3/native/zan_sdl3.c \
+            -I"$P/include" -L"$P/lib" -lSDL3 \
+            -Wl,--out-implib,"$SDEST/libzan_sdl3.dll.a" -static-libgcc
+          cp "$P/bin/SDL3.dll" "$SDEST/SDL3.dll"
+          printf 'zan_sdl3.dll\nSDL3.dll\n' > "$SDEST/zan_sdl3.bundle"
+          # SQLite: mingw ships this as libsqlite3-0.dll, but the driver
+          # manifest loads "sqlite3", so stage it as sqlite3.dll.
+          QDEST="stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}"
+          mkdir -p "$QDEST"
+          SQLSRC=""
+          for c in "$P"/bin/libsqlite3*.dll "$P"/bin/sqlite3.dll; do
+            [ -f "$c" ] && { SQLSRC="$c"; break; }
+          done
+          [ -n "$SQLSRC" ] || { echo "sqlite3 dll not found in $P/bin" >&2; exit 1; }
+          cp "$SQLSRC" "$QDEST/sqlite3.dll"
+          [ -f "$P/lib/libsqlite3.dll.a" ] && cp "$P/lib/libsqlite3.dll.a" "$QDEST/" || true
+          # libpq + closure: copy the DLLs libpq depends on (ldd within msys2)
+          GDEST="stdlib/System/Data/Postgres/drivers/${{ matrix.target }}"
+          mkdir -p "$GDEST"
+          PQSRC=""
+          for c in "$P"/bin/libpq.dll "$P"/bin/libpq*.dll; do
+            [ -f "$c" ] && { PQSRC="$c"; break; }
+          done
+          [ -n "$PQSRC" ] || { echo "libpq dll not found in $P/bin" >&2; exit 1; }
+          cp "$PQSRC" "$GDEST/libpq.dll"
+          ldd "$PQSRC" | awk '{print $3}' \
+            | grep -iE "/mingw|/clang" | while read -r dep; do
+              [ -f "$dep" ] && cp -n "$dep" "$GDEST/" || true
+            done || true
+          { echo libpq.dll; ls "$GDEST" | grep -viE '^(libpq\.dll|pq\.bundle)$' | sort || true; } > "$GDEST/pq.bundle"
+          ls -la "$SDEST" "$QDEST" "$GDEST"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drivers-${{ matrix.target }}
+          path: |
+            stdlib/SDL3/drivers/${{ matrix.target }}/
+            stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}/
+            stdlib/System/Data/Postgres/drivers/${{ matrix.target }}/
+
+  # -------------------------------------------------------------- Release ----
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Zip per-target bundles
+        run: cd dist && for d in drivers-*; do zip -r "../$d.zip" "$d"; done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: '*.zip'
