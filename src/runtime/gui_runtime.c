@@ -1,5 +1,5 @@
 /*
- * zan_gui runtime â€?software 2D renderer with anti-aliasing + system font rendering
+ * zan_gui runtime â€” software 2D renderer with anti-aliasing + system font rendering
  * Cross-platform: Win32 (full), X11 (Linux), Cocoa stubs (macOS)
  */
 
@@ -62,7 +62,7 @@
 
 /* Unified cross-platform windowing backend. When ZAN_GUI_SDL is defined the
  * per-platform window shells (Win32/X11/Cocoa) are compiled out and a single
- * SDL3-based shell drives windowing, input and present â€?the same SDL3 stack
+ * SDL3-based shell drives windowing, input and present â€” the same SDL3 stack
  * the Game.* stdlib uses, so the IDE and games share one window/render path.
  * The software rasterizer and system-font text rendering are unchanged; only
  * the OS window, event pump and present go through SDL. */
@@ -196,7 +196,7 @@ EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
     s->stride = (int)width;
     clip_reset_full(s);
     /* malloc (not calloc): every frame starts with zan_gui_clear covering the
-     * whole surface, so zero-init is wasted work â€?and on large windows the
+     * whole surface, so zero-init is wasted work â€” and on large windows the
      * per-resize zeroing of ~32MB was a noticeable hitch during drag-resize. */
     s->pixels = (u32 *)malloc((size_t)(width * height) * sizeof(u32));
     g_surfaces[id] = s;
@@ -356,7 +356,7 @@ EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
 }
 
 /* Backdrop blur: separable box blur (3 passes ~ Gaussian) over a rectangular
- * region, in place. Used to render frosted-glass panels â€?draw the backdrop,
+ * region, in place. Used to render frosted-glass panels â€” draw the backdrop,
  * blur the region behind a panel, then overlay a translucent tint. Alpha is
  * forced opaque (the backdrop under an overlay is opaque). Edge samples are
  * clamped to the region. Cost is O(passes * area), independent of radius. */
@@ -676,7 +676,7 @@ EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
 
     /* Fill the interior as three rects that EXCLUDE the four r*r corner squares,
      * then draw each corner as a quarter circle over just its square. Every
-     * pixel is thus written exactly once â€?filling the interior and full corner
+     * pixel is thus written exactly once â€” filling the interior and full corner
      * circles would double-blend their overlap and darken corners for
      * translucent fills. */
     int xl = ix + r, xr = ix + iw - r;      /* inner corner-zone boundaries */
@@ -853,7 +853,7 @@ EXPORT void *zan_gui_get_pixels(i64 surface_id) {
 }
 
 /* ========================================================================
- * Text Rendering â€?Platform-specific (Win32: GDI, Linux: Xft/fallback)
+ * Text Rendering â€” Platform-specific (Win32: GDI, Linux: Xft/fallback)
  * ======================================================================== */
 
 #ifdef _WIN32
@@ -1118,7 +1118,7 @@ static int g_window_width = 0, g_window_height = 0;
  * through the gaps while opaque widgets/text stay crisp.
  *
  * Robustness: the present hands UpdateLayeredWindow a NULL destination point
- * so it only updates the *content*, never the window position â€?the OS keeps
+ * so it only updates the *content*, never the window position â€” the OS keeps
  * ownership of where the window is. That is what makes a title-bar drag stay
  * in sync (an earlier version repositioned the window on every present from a
  * stale GetWindowRect, which fought the modal move loop and left the content
@@ -1262,7 +1262,7 @@ static void blit_surface_to_hwnd(HWND hwnd, zan_surface_t *s) {
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
-    /* Blit the last frame crisply at 1:1 (never stretched â€?stretching looks
+    /* Blit the last frame crisply at 1:1 (never stretched â€” stretching looks
      * rubbery/blurry during a drag-resize). Any client area beyond the frame is
      * filled with the canvas background so a grow-resize shows solid bg in the
      * new region until the app thread repaints it crisply. */
@@ -1674,7 +1674,8 @@ EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
 /* Set the number of caption buttons so the draggable caption region excludes
  * exactly the button cluster on the right. */
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count = (int)count; }
     return 0;
 }
@@ -1890,7 +1891,7 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
 /* ========================================================================
  * Unified SDL3 Window Shell  (ZAN_GUI_SDL)
  * ------------------------------------------------------------------------
- * A single cross-platform windowing/event/present backend built on SDL3 â€?
+ * A single cross-platform windowing/event/present backend built on SDL3 â€”
  * the same stack the Game.* stdlib uses via zan_sdl3, so the IDE window is an
  * SDL window unified with games. The software rasterizer still paints into a
  * CPU surface; here that surface is uploaded to a per-window streaming texture
@@ -1928,7 +1929,11 @@ typedef struct {
     SDL_Window   *win;
     SDL_Renderer *ren;
     SDL_Texture  *tex;
-    int           tw, th; /* current texture size */
+    int           tw, th;  /* current texture size */
+    int           closed;  /* 1 once zan_gui_close_window hid it (pending free) */
+    int           caption_btns; /* caption buttons this window draws (per-window
+                                 * so a dialog with fewer buttons never corrupts
+                                 * the main window's draggable/hit regions) */
 } zan_sdl_win_t;
 #define ZAN_SDL_MAX_WIN 32
 static zan_sdl_win_t g_wins[ZAN_SDL_MAX_WIN];
@@ -1938,6 +1943,28 @@ static zan_sdl_win_t *sdl_find(SDL_Window *w) {
     for (int i = 0; i < g_win_count; i++)
         if (g_wins[i].win == w) return &g_wins[i];
     return NULL;
+}
+
+/* Destroy any window a prior zan_gui_close_window marked closed, freeing its
+ * renderer/texture/window and compacting the registry so the 32-slot pool is
+ * reclaimed. Win32 destroyed a window synchronously on WM_CLOSE; SDL defers to
+ * here (called when the app is no longer inside that window's frame -- i.e. at
+ * the next create/present) so we never free a window mid-use. */
+static void sdl_reclaim_closed(void) {
+    int i = 0;
+    while (i < g_win_count) {
+        if (g_wins[i].closed) {
+            SDL_Window *w = g_wins[i].win;
+            if (g_wins[i].tex) SDL_DestroyTexture(g_wins[i].tex);
+            if (g_wins[i].ren) SDL_DestroyRenderer(g_wins[i].ren);
+            if (w) SDL_DestroyWindow(w);
+            if (g_event_win == w) g_event_win = NULL;
+            for (int j = i + 1; j < g_win_count; j++) g_wins[j - 1] = g_wins[j];
+            g_win_count--;
+        } else {
+            i++;
+        }
+    }
 }
 
 /* --- internal event queue: one SDL event may yield 0..N zan events (e.g. an
@@ -2050,9 +2077,17 @@ static void sdl_translate(const SDL_Event *e) {
             g_quit = 1;
             break;
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED: {
+            /* OS-initiated close (e.g. Alt+F4 on a borderless window). Same
+             * handling as an app-driven Close(): quit on the main window, hide
+             * + reclaim a secondary one so it disappears instead of lingering. */
             SDL_Window *w = SDL_GetWindowFromID(e->window.windowID);
             zq_push(8, 0, 0, 0, 0, 0, w);
-            if (w == g_main_win) g_quit = 1;
+            if (w == g_main_win) {
+                g_quit = 1;
+            } else {
+                zan_sdl_win_t *rec = sdl_find(w);
+                if (rec && !rec->closed) { SDL_HideWindow(w); rec->closed = 1; }
+            }
             break;
         }
         case SDL_EVENT_WINDOW_RESIZED:
@@ -2114,7 +2149,7 @@ static void sdl_translate(const SDL_Event *e) {
     }
 }
 
-/* Borderless drag/resize regions â€?the SDL analogue of WM_NCHITTEST: an 8px
+/* Borderless drag/resize regions â€” the SDL analogue of WM_NCHITTEST: an 8px
  * (DPI-scaled) resize border, a draggable caption strip minus the caption
  * button cluster on the right, everything else client. */
 static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
@@ -2126,8 +2161,10 @@ static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
     int x = area->x, y = area->y;
     int b = 8 * g_dpi / 96;
     int maxed = (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
+    zan_sdl_win_t *rec = sdl_find(win);
+    int nbtn = rec ? rec->caption_btns : g_caption_btn_count;
     int inButtons = (y < g_titlebar_h &&
-                     x >= W - g_caption_btn_count * g_btn_w);
+                     x >= W - nbtn * g_btn_w);
     if (!maxed && !inButtons) {
         int left = x < b, right = x >= W - b, top = y < b, bottom = y >= H - b;
         if (top && left)     return SDL_HITTEST_RESIZE_TOPLEFT;
@@ -2159,6 +2196,7 @@ static void zan_sdl_ensure_init(void) {
 
 EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
     zan_sdl_ensure_init();
+    sdl_reclaim_closed(); /* free windows a previous Close() hid, reclaim slots */
     if (!g_sdl_ready || g_win_count >= ZAN_SDL_MAX_WIN) return 0;
 
     int w = (int)width * g_dpi / 96;
@@ -2176,13 +2214,15 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
 
     zan_sdl_win_t *rec = &g_wins[g_win_count++];
     rec->win = win; rec->ren = ren; rec->tex = NULL; rec->tw = rec->th = 0;
+    rec->closed = 0;
+    rec->caption_btns = g_caption_btn_count;
 
     if (!g_main_win) {
         g_main_win = win;
         g_window_width = w; g_window_height = h;
     } else {
         /* Center a secondary window (dialog) over the main window, clamped to
-         * the display's usable area â€?mirrors the Win32 dialog placement. */
+         * the display's usable area â€” mirrors the Win32 dialog placement. */
         int mx = 0, my = 0, mw = 0, mh = 0;
         SDL_GetWindowPosition(g_main_win, &mx, &my);
         SDL_GetWindowSize(g_main_win, &mw, &mh);
@@ -2223,8 +2263,21 @@ EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
 
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    /* Deliver the close (kind 8) so the owning App drops the window, mirroring
+     * the async Win32 WM_CLOSE. Closing the main window quits the app; a
+     * secondary window (dialog) must actually disappear -- SDL won't destroy it
+     * for us the way Win32/X11 did -- so hide it now and mark it for reclaim on
+     * the next create (the app is done with it once it has processed kind 8). */
     zq_push(8, 0, 0, 0, 0, 0, win);
-    if (win == g_main_win) g_quit = 1;
+    if (win == g_main_win) {
+        g_quit = 1;
+    } else {
+        zan_sdl_win_t *rec = sdl_find(win);
+        if (rec && !rec->closed) {
+            SDL_HideWindow(win);
+            rec->closed = 1;
+        }
+    }
     return 0;
 }
 
@@ -2236,8 +2289,14 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
-    if (count >= 0 && count <= 8) g_caption_btn_count = (int)count;
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    if (count < 0 || count > 8) return 0;
+    /* Record per-window so each window's hit-test excludes exactly its own
+     * caption cluster; a dialog with fewer buttons no longer leaves the main
+     * window's drag/close regions wrong. Keep the global as a create default. */
+    g_caption_btn_count = (int)count;
+    zan_sdl_win_t *rec = sdl_find((SDL_Window *)(intptr_t)hwnd_val);
+    if (rec) rec->caption_btns = (int)count;
     return 0;
 }
 
@@ -2334,7 +2393,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
 
     /* Clear the (possibly larger) window to the canvas background so a live
      * grow-resize shows solid bg rather than stretched/garbage pixels, then
-     * blit the frame 1:1 â€?never stretched. */
+     * blit the frame 1:1 â€” never stretched. */
     SDL_SetRenderDrawColor(rec->ren, (g_bg_color >> 16) & 0xFF,
                            (g_bg_color >> 8) & 0xFF, g_bg_color & 0xFF, 255);
     SDL_RenderClear(rec->ren);
@@ -3877,7 +3936,8 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
 /* ---- client-side title-bar metrics (borderless window) ---- */
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w_l; }
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count_l = (int)count; }
     return 0;
 }
@@ -4107,7 +4167,7 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) { (void)hwnd_val; (void)count; return 0; }
 #endif
 
 /* write_file is portable across every non-Win32 backend (X11, Cocoa and the
