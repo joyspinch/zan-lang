@@ -2,7 +2,7 @@
 # Stage the macOS SDL3 driver bundle into stdlib/SDL3/drivers/<target>/.
 #
 # Mirrors the libpq macOS bundle: the per-target directory holds the native
-# dylibs (gitignored) plus a committed `zan_sdl3.bundle` manifest that
+# dylibs plus a committed `zan_sdl3.bundle` manifest that
 # `zanc --publish` reads to copy the runtime next to the published binary.
 # All install names are rewritten to @rpath so the published bundle is
 # relocatable (the publish step adds an @loader_path rpath).
