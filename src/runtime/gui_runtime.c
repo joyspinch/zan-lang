@@ -1917,6 +1917,7 @@ static int g_caption_btn_count = 5;
 static int g_pending_event[8];
 static SDL_Window *g_event_win = NULL; /* window that produced g_pending_event */
 static SDL_Window *g_main_win = NULL;  /* first window: closing it quits */
+static bool g_mouse_captured = false;  /* holding a client-widget drag */
 static int g_window_width = 0, g_window_height = 0; /* last-resized size (px) */
 static int g_sdl_ready = 0;
 static int g_quit = 0;
@@ -2051,6 +2052,12 @@ static int sdl_mods_to_bits(SDL_Keymod m) {
 
 static int cur_mod_bits(void) { return sdl_mods_to_bits(SDL_GetModState()); }
 
+/* Defined below; used by the event translator to decide whether a press should
+ * capture the mouse (client widget) or hand off to the OS move/resize loop. */
+static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
+                                                 const SDL_Point *area,
+                                                 void *data);
+
 /* Decode one UTF-8 codepoint from s (advancing *i); returns -1 at end. */
 static int sdl_utf8_next(const char *s, int *i) {
     unsigned char c = (unsigned char)s[*i];
@@ -2101,6 +2108,13 @@ static void sdl_translate(const SDL_Event *e) {
         }
         case SDL_EVENT_MOUSE_MOTION: {
             SDL_Window *w = SDL_GetWindowFromID(e->motion.windowID);
+            /* Safety net: if capture is somehow still held with no button down
+             * (e.g. an OS move/resize loop swallowed the button-up), drop it so
+             * the pointer can't get stuck captured. */
+            if (g_mouse_captured && (e->motion.state & SDL_BUTTON_LMASK) == 0) {
+                SDL_CaptureMouse(false);
+                g_mouse_captured = false;
+            }
             zq_push(1, (int)e->motion.x, (int)e->motion.y, 0, 0,
                     cur_mod_bits(), w);
             break;
@@ -2111,12 +2125,25 @@ static void sdl_translate(const SDL_Event *e) {
             int btn = (e->button.button == SDL_BUTTON_RIGHT) ? 1 : 0;
             int down = (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
             int kind = down ? 2 : 3;
-            /* Mirror Win32 SetCapture/ReleaseCapture: while the primary button
-             * is held, keep delivering motion (and the eventual button-up) even
-             * after the pointer leaves the window, so slider/scrollbar/selection
-             * drags track the cursor live and widgets never get stuck pressed. */
-            if (e->button.button == SDL_BUTTON_LEFT)
-                SDL_CaptureMouse(down ? true : false);
+            /* Mirror Win32 SetCapture/ReleaseCapture so a held widget drag
+             * (slider/scrollbar/selection) keeps getting motion + the button-up
+             * even after the pointer leaves the window. Only capture when the
+             * press lands on a client widget (SDL_HITTEST_NORMAL): a press on
+             * the draggable caption or a resize border starts an OS modal
+             * move/resize loop that swallows the button-up, which would leave
+             * the mouse captured forever and break all later input routing. */
+            if (e->button.button == SDL_BUTTON_LEFT) {
+                if (down) {
+                    SDL_Point p = { (int)e->button.x, (int)e->button.y };
+                    if (w && zan_sdl_hittest(w, &p, NULL) == SDL_HITTEST_NORMAL) {
+                        SDL_CaptureMouse(true);
+                        g_mouse_captured = true;
+                    }
+                } else if (g_mouse_captured) {
+                    SDL_CaptureMouse(false);
+                    g_mouse_captured = false;
+                }
+            }
             zq_push(kind, (int)e->button.x, (int)e->button.y, btn, 0,
                     cur_mod_bits(), w);
             break;
@@ -2228,6 +2255,23 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
      * present never blocks the UI thread up to a refresh interval. */
     SDL_SetRenderVSync(ren, 0);
     SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
+
+#ifdef _WIN32
+    /* A borderless SDL window loses the OS drop shadow. SDL keeps WS_THICKFRAME
+     * on a resizable window and hides the frame via WM_NCCALCSIZE, so extending
+     * the DWM frame by a 1px sheet on the native HWND re-enables the system
+     * shadow (and Win11 rounded corners) -- the same trick the old Win32 shell
+     * used. The 1px is fully covered by the presented texture. */
+    {
+        HWND hwnd = (HWND)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(win),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        if (hwnd) {
+            MARGINS m = {0, 0, 0, 1};
+            DwmExtendFrameIntoClientArea(hwnd, &m);
+        }
+    }
+#endif
 
     zan_sdl_win_t *rec = &g_wins[g_win_count++];
     rec->win = win; rec->ren = ren; rec->tex = NULL; rec->tw = rec->th = 0;
