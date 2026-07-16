@@ -1,0 +1,293 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Dm;
+
+// RGBA color used by DM3 config (背景色 etc.), matching the engine's
+// RGBA(r,g,b,a) helper. Kept local to Game.Dm so config parsing has no
+// dependency on the SDL3 render backend.
+class DmColor {
+    int r;
+    int g;
+    int b;
+    int a;
+
+    static DmColor Rgba(int r, int g, int b, int a) {
+        DmColor c = new DmColor();
+        c.r = r; c.g = g; c.b = b; c.a = a;
+        return c;
+    }
+    static DmColor Rgb(int r, int g, int b) { return DmColor.Rgba(r, g, b, 255); }
+
+    int R() { return this.r; }
+    int G() { return this.g; }
+    int B() { return this.b; }
+    int A() { return this.a; }
+}
+
+// Port of the DM3 (Dream Mod 3.0) engine's App.lua startup configuration.
+// App.lua is a project's entry file; these typed structures mirror its
+// documented 配置项 (config items). Field names are English with the original
+// Chinese doc name kept in a comment so a port stays traceable to the source.
+
+// 屏幕适配 (screen adaptation) modes.
+enum ScreenScale {
+    None,        // 0 无适配
+    Stretch,     // 1 窗口可拉伸, 画面缩放
+    SyncSize,    // 2 窗口可拉伸, 画面同步屏幕宽高
+    Transparent  // 3 无边框透明窗口, 背景颜色作为透明关键色
+}
+
+// 资源表 entry: { 标识 = "", 文件 = "" }
+class DmResource {
+    string id;    // 标识
+    string file;  // 文件
+
+    static DmResource Of(string id, string file) {
+        DmResource r = new DmResource();
+        r.id = id;
+        r.file = file;
+        return r;
+    }
+
+    string Id() { return this.id; }
+    string File() { return this.file; }
+}
+
+// 扩展属性 entry: a named numeric attribute applied game-wide.
+class DmAttr {
+    string name;   // 属性名 (e.g. 攻击, 防御)
+    int amount;    // 默认值
+
+    static DmAttr Of(string name, int amount) {
+        DmAttr a = new DmAttr();
+        a.name = name;
+        a.amount = amount;
+        return a;
+    }
+
+    string Name() { return this.name; }
+    int Value() { return this.amount; }
+}
+
+// 掉落物 (ground drop rendering).
+class DropItemConfig {
+    string shadowImage;   // 影子底图: static image resource id
+    string blinkAnim;     // 闪烁动画: blink animation, action name fixed to "default"
+    string font;          // 字体: ground name font
+    int letterSpacing;    // 间距
+    int lineSpacing;      // 行距
+    DmColor background;     // 背景色, default RGBA(0,0,0,100)
+
+    static DropItemConfig Create() {
+        DropItemConfig d = new DropItemConfig();
+        d.shadowImage = "";
+        d.blinkAnim = "";
+        d.font = "";
+        d.letterSpacing = 0;
+        d.lineSpacing = 0;
+        d.background = DmColor.Rgba(0, 0, 0, 100);
+        return d;
+    }
+}
+
+// 状态图标 (on-screen status icon strip).
+class StatusIconConfig {
+    int x;             // 起始坐标 x
+    int y;             // 起始坐标 y
+    int width;         // 宽度
+    int height;        // 高度
+    int columns;       // 列数: icons per row before wrapping
+    int letterSpacing; // 间距: gap between icons
+    int lineSpacing;   // 行距: gap between rows
+    bool leftAlign;    // 左对齐: left-to-right when true
+    string font;       // 字体: title font
+    int fontSpacing;   // 字体间距
+    bool topmost;      // 置顶: draw on the very top layer
+    int titleOffsetY;  // 标题偏移: title y offset, default 0
+
+    static StatusIconConfig Create() {
+        StatusIconConfig s = new StatusIconConfig();
+        s.x = 0; s.y = 0; s.width = 0; s.height = 0;
+        s.columns = 1;
+        s.letterSpacing = 0; s.lineSpacing = 0;
+        s.leftAlign = true;
+        s.font = "";
+        s.fontSpacing = 0;
+        s.topmost = false;
+        s.titleOffsetY = 0;
+        return s;
+    }
+}
+
+// 道具格子 数量标签 mode (数量标签.模式).
+enum CountLabelMode {
+    BottomRight, // 0 右下对齐 (default)
+    TopLeft,     // 1 左上对齐
+    Hidden       // 2 不显示
+}
+
+// 道具格子 (default item slot appearance).
+class ItemSlotConfig {
+    string background;       // 底图: slot background image resource id
+    string countFont;        // 数量标签.字体
+    int countSpacing;        // 数量标签.间距
+    int countMargin;         // 数量标签.边距, default 2
+    CountLabelMode countMode; // 数量标签.模式, default 0 (右下对齐)
+
+    static ItemSlotConfig Create() {
+        ItemSlotConfig s = new ItemSlotConfig();
+        s.background = "";
+        s.countFont = "";
+        s.countSpacing = 0;
+        s.countMargin = 2;
+        s.countMode = CountLabelMode.BottomRight;
+        return s;
+    }
+}
+
+// 装备套装 (equipment set): parts and per-count bonus effects.
+class EquipSet {
+    string name;              // 名称: unique set name
+    List<string> parts;       // 部件: item names in the set
+    List<List<DmAttr>> effects; // 效果: effects[i] applies when (i+1) parts equipped
+
+    static EquipSet Create(string name) {
+        EquipSet e = new EquipSet();
+        e.name = name;
+        e.parts = new List<string>();
+        e.effects = new List<List<DmAttr>>();
+        return e;
+    }
+
+    EquipSet AddPart(string itemName) {
+        this.parts.Add(itemName);
+        return this;
+    }
+
+    // Append the effect list activated at the next part-count threshold.
+    EquipSet AddEffect(List<DmAttr> effect) {
+        this.effects.Add(effect);
+        return this;
+    }
+
+    string Name() { return this.name; }
+    int PartCount() { return this.parts.Count; }
+    int EffectTiers() { return this.effects.Count; }
+}
+
+// The DM3 engine's 10 built-in base attributes (基础属性).
+class BaseAttrs {
+    static List<string> Names() {
+        List<string> names = new List<string>();
+        names.Add("hp");
+        names.Add("mp");
+        names.Add("maxhp");
+        names.Add("maxmp");
+        names.Add("命中");       // hit
+        names.Add("躲避");       // dodge
+        names.Add("暴击");       // crit chance
+        names.Add("暴伤");       // crit damage, default 150 => 1.5x
+        names.Add("移动速度");   // move speed, percentage
+        names.Add("攻击速度");   // attack speed, percentage
+        return names;
+    }
+
+    static int Count() { return 10; }
+}
+
+// App.lua 配置项 (startup config).
+class AppConfig {
+    string title;             // 游戏标题: windows window title
+    int screenWidth;          // 屏幕宽度
+    int screenHeight;         // 屏幕高度
+    int fps;                  // 屏幕帧率, default 60
+    bool vsync;               // 垂直同步, default false
+    DmColor background;         // 背景颜色, default RGBA(0,...); transparent key in mode 3
+    ScreenScale screenScale;  // 屏幕适配
+    bool repeatKey;           // 重复按键, default false
+    string defaultFont;       // 默认字体 (required)
+
+    List<DmResource> resources;   // 资源表
+    List<DmAttr> extraAttrs;      // 扩展属性 (numeric only, applied game-wide)
+    List<string> extComponents;   // 扩展组件: component .lua files
+    List<string> extScripts;      // 扩展脚本: loaded before component init
+    List<EquipSet> equipSets;     // 装备套装
+
+    DropItemConfig dropItem;      // 掉落物
+    StatusIconConfig statusIcon;  // 状态图标
+    ItemSlotConfig itemSlot;      // 道具格子
+
+    static AppConfig Create() {
+        AppConfig a = new AppConfig();
+        a.title = "";
+        a.screenWidth = 0;
+        a.screenHeight = 0;
+        a.fps = 60;
+        a.vsync = false;
+        a.background = DmColor.Rgba(0, 0, 0, 255);
+        a.screenScale = ScreenScale.None;
+        a.repeatKey = false;
+        a.defaultFont = "";
+        a.resources = new List<DmResource>();
+        a.extraAttrs = new List<DmAttr>();
+        a.extComponents = new List<string>();
+        a.extScripts = new List<string>();
+        a.equipSets = new List<EquipSet>();
+        a.dropItem = DropItemConfig.Create();
+        a.statusIcon = StatusIconConfig.Create();
+        a.itemSlot = ItemSlotConfig.Create();
+        return a;
+    }
+
+    AppConfig SetTitle(string title) { this.title = title; return this; }
+    AppConfig SetScreen(int width, int height) {
+        this.screenWidth = width;
+        this.screenHeight = height;
+        return this;
+    }
+    AppConfig SetFps(int fps) { this.fps = fps; return this; }
+    AppConfig SetVsync(bool on) { this.vsync = on; return this; }
+    AppConfig SetBackground(DmColor c) { this.background = c; return this; }
+    AppConfig SetScreenScale(ScreenScale mode) { this.screenScale = mode; return this; }
+    AppConfig SetRepeatKey(bool on) { this.repeatKey = on; return this; }
+    AppConfig SetDefaultFont(string font) { this.defaultFont = font; return this; }
+
+    AppConfig AddResource(string id, string file) {
+        this.resources.Add(DmResource.Of(id, file));
+        return this;
+    }
+    AppConfig AddExtraAttr(string name, int amount) {
+        this.extraAttrs.Add(DmAttr.Of(name, amount));
+        return this;
+    }
+    AppConfig AddComponent(string path) { this.extComponents.Add(path); return this; }
+    AppConfig AddScript(string path) { this.extScripts.Add(path); return this; }
+    AppConfig AddEquipSet(EquipSet suit) { this.equipSets.Add(suit); return this; }
+
+    // 默认字体 is required; a config is only valid once it and a screen size
+    // are set. Returns true when the minimum startup fields are present.
+    bool IsValid() {
+        if (this.defaultFont.Length == 0) { return false; }
+        if (this.screenWidth <= 0 || this.screenHeight <= 0) { return false; }
+        return true;
+    }
+
+    string Title() { return this.title; }
+    int ScreenWidth() { return this.screenWidth; }
+    int ScreenHeight() { return this.screenHeight; }
+    int Fps() { return this.fps; }
+    bool Vsync() { return this.vsync; }
+    DmColor Background() { return this.background; }
+    ScreenScale ScreenScaleMode() { return this.screenScale; }
+    bool RepeatKey() { return this.repeatKey; }
+    string DefaultFont() { return this.defaultFont; }
+    int ResourceCount() { return this.resources.Count; }
+    int ExtraAttrCount() { return this.extraAttrs.Count; }
+    int ComponentCount() { return this.extComponents.Count; }
+    int ScriptCount() { return this.extScripts.Count; }
+    int EquipSetCount() { return this.equipSets.Count; }
+    DropItemConfig DropItem() { return this.dropItem; }
+    StatusIconConfig StatusIcon() { return this.statusIcon; }
+    ItemSlotConfig ItemSlot() { return this.itemSlot; }
+}

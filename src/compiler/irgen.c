@@ -8642,9 +8642,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         break;
     }
 
-    case AST_EXPR_STMT:
-        emit_expr(g, stmt->expr_stmt.expr, locals);
+    case AST_EXPR_STMT: {
+        zan_ast_node_t *e = stmt->expr_stmt.expr;
+        LLVMValueRef ev = emit_expr(g, e, locals);
+        /* A discarded expression statement whose value is a freshly owned (+1)
+         * rc reference must release it, or it leaks. This covers fluent method
+         * chains used as statements (e.g. `builder.Add(x);` where Add returns
+         * `this`) and bare `new`/call results. Assignments and non-call
+         * expressions are not owned (expr_yields_owned_rc_value == 0). */
+        if (ev && LLVMGetTypeKind(LLVMTypeOf(ev)) == LLVMPointerTypeKind &&
+            expr_yields_owned_rc_value(g, e, locals)) {
+            zan_type_t *et = infer_expr_type(g, e, locals);
+            if (et && is_rc_managed_type(et)) {
+                emit_rc_release_for_type(g, et, ev);
+            }
+        }
         break;
+    }
 
     case AST_RETURN_STMT:
         /* Inside an async $resume body, `return e` completes the state machine:
