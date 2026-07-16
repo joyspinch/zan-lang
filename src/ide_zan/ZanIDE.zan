@@ -172,13 +172,6 @@ class ZanIDE {
         return en;
     }
 
-    static int LangCount() { return 2; }
-
-    static string LangName(int i) {
-        if (i == 1) { return "简体中文"; }
-        return "English";
-    }
-
     static int ReadUiLang() {
         string f = ZanIDE.EditorPrefsPath();
         if (!File.Exists(f)) { return 0; }
@@ -684,11 +677,11 @@ class ZanIDE {
         // ---- Editor appearance (color theme + font size) ----
         // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
         // is the code font size (0 = follow the UI theme). Persisted to editor.cfg.
-        bool setOpen = false;
         bool cfgOpen = false;
         int edThemeIdx = ZanIDE.ReadEditorTheme();
         int edFontPx = ZanIDE.ReadEditorFont();
         int defFontPx = app.theme.fontSizeMedium;
+        EditorSettingsWindow settingsWindow = null;
 
         // ---- Help / Docs browser state ----
         // The docs page is a real tab (path sentinel "@docs"). docsSearch filters
@@ -783,6 +776,7 @@ class ZanIDE {
         int lastPresent = 0;
         while (app.isRunning) {
             FilePicker.lang = ZanIDE.uiLang;
+            pathPicker.ApplySkin(app.ThemeMenuIndex());
             // One shared event pump drives BOTH the main window and any open
             // wizard child window. Poll (to keep animating) when either needs a
             // repaint; otherwise block until the OS delivers an event.
@@ -790,6 +784,9 @@ class ZanIDE {
             if (!pathPicker.IsOpen() && app.needsRedraw) { want = true; }
             if (!pathPicker.IsOpen() && dlg != null) {
                 if (dlg.needsRedraw) { want = true; }
+            }
+            if (!pathPicker.IsOpen() && settingsWindow != null) {
+                if (settingsWindow.NeedsRedraw()) { want = true; }
             }
             int r;
             if (want) {
@@ -805,7 +802,11 @@ class ZanIDE {
             int kind = app.window.EventKind();
 
             if (kind == 8) {
-                if (pathPicker.OwnsWindow(evh)) {
+                if (settingsWindow != null
+                    && settingsWindow.OwnsWindow(evh)) {
+                    settingsWindow.ApplyEvent(evh);
+                    app.RequestRedraw();
+                } else if (pathPicker.OwnsWindow(evh)) {
                     pathPicker.ApplyEvent(evh);
                 } else if (!pathPicker.IsOpen()) {
                     // Close: only the main window quits the app; a wizard window
@@ -825,8 +826,10 @@ class ZanIDE {
             } else {
                 app.ApplyEvent(evh);
                 if (dlg != null) { dlg.ApplyEvent(evh); }
+                if (settingsWindow != null) {
+                    settingsWindow.ApplyEvent(evh);
+                }
             }
-
             // The form designer is bound to .zform tabs (C#-style form files):
             // the active tab's extension decides whether the designer or the code
             // editor is shown, rather than a global toggle.
@@ -1169,8 +1172,12 @@ class ZanIDE {
                     }
                     app.RequestRedraw();
                 } else if (rc == 13) {
-                    setOpen = true;
-                    app.RequestRedraw();
+                    if (settingsWindow == null
+                        || !settingsWindow.IsOpen()) {
+                        settingsWindow = EditorSettingsWindow.Open(
+                            app, edThemeIdx, edFontPx,
+                            ZanIDE.uiLang, defFontPx);
+                    }
                 } else if (rc == 14) {
                     // Open the Help / documentation browser (a real "@docs" tab).
                     int di = ZanIDE.FindTabByPath(tabPaths, "@docs");
@@ -1254,9 +1261,9 @@ class ZanIDE {
                 int treeMaxScroll = treeContentH - treeVis * treeRowH;
                 if (treeMaxScroll < 0) { treeMaxScroll = 0; }
                 int tScroll = treeScrollY.Get();
-                if (app.window.EventKind() == 13
-                    && app.mouseX >= treeArea.x && app.mouseX < treeArea.x + treeArea.width
-                    && app.mouseY >= treeArea.y && app.mouseY < treeArea.y + treeArea.height) {
+                bool ownsTreeWheel = app.CaptureWheel(
+                    treeArea.x, treeArea.y, treeArea.width, treeArea.height);
+                if (ownsTreeWheel) {
                     int td = app.window.EventKeyCode();
                     int step = td / 120;
                     if (step == 0) {
@@ -1287,9 +1294,9 @@ class ZanIDE {
                 int exMaxScroll = exContentH - exVis * exRowH;
                 if (exMaxScroll < 0) { exMaxScroll = 0; }
                 int exSc = exTreeScrollY.Get();
-                if (app.window.EventKind() == 13
-                    && app.mouseX >= exArea.x && app.mouseX < exArea.x + exArea.width
-                    && app.mouseY >= exArea.y && app.mouseY < exArea.y + exArea.height) {
+                bool ownsExampleWheel = app.CaptureWheel(
+                    exArea.x, exArea.y, exArea.width, exArea.height);
+                if (ownsExampleWheel) {
                     int exd = app.window.EventKeyCode();
                     int exstep = exd / 120;
                     if (exstep == 0) {
@@ -1696,9 +1703,9 @@ class ZanIDE {
                     int coMaxScroll = coView.Count - coMaxRows;
                     if (coMaxScroll < 0) { coMaxScroll = 0; }
                     // Mouse wheel scrolls through output history (wheel up = older).
-                    if (botTab == 0 && app.window.EventKind() == 13
-                        && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
-                        && app.mouseY >= coContentY && app.mouseY < coContentY + coContentH) {
+                    bool ownsOutputWheel = app.CaptureWheel(
+                        orr.x, coContentY, orr.width, coContentH);
+                    if (botTab == 0 && ownsOutputWheel) {
                         int wd = app.window.EventKeyCode();
                         int wstep = wd / 120;
                         if (wstep == 0) {
@@ -1966,30 +1973,6 @@ class ZanIDE {
                     }
                 }
 
-                // Editor settings overlay (modal, topmost): color theme + font.
-                if (setOpen) {
-                    List<int> st = new List<int>();
-                    st.Add(edThemeIdx); st.Add(edFontPx); st.Add(defFontPx); st.Add(ZanIDE.uiLang);
-                    int sAct = ZanIDE.RenderSettingsDialog(app, st);
-                    edThemeIdx = st[0];
-                    edFontPx = st[1];
-                    if (st[3] != ZanIDE.uiLang) {
-                        // Language changed live: relabel the ribbon immediately.
-                        ZanIDE.uiLang = st[3];
-                        Wizard.lang = ZanIDE.uiLang;
-                        cmds = ZanIDE.BuildRibbon();
-                        lastActive = 0 - 1;
-                        app.RequestRedraw();
-                    }
-                    if (sAct == 1) {
-                        ZanIDE.WriteEditorPrefs(edThemeIdx, edFontPx);
-                        log.Add("> Editor theme: " + ZanIDE.EditorThemeName(edThemeIdx)
-                            + "; font " + Convert.ToString(ZanIDE.EditorFontOr(edFontPx, defFontPx)) + "px.");
-                        setOpen = false;
-                        app.RequestRedraw();
-                    }
-                }
-
                 // Project configuration overlay (modal): icon + static resources.
                 if (cfgOpen) {
                     int cAct = ZanIDE.RenderProjectConfigDialog(app, root, log);
@@ -2084,6 +2067,31 @@ class ZanIDE {
                             dlg.RequestRedraw();
                         }
                     }
+                }
+            }
+
+            if (settingsWindow != null) {
+                settingsWindow.Render();
+                edThemeIdx = settingsWindow.ThemeIndex();
+                edFontPx = settingsWindow.FontSize();
+                if (settingsWindow.TakeLanguageChanged()) {
+                    ZanIDE.uiLang = settingsWindow.Language();
+                    Wizard.lang = ZanIDE.uiLang;
+                    cmds = ZanIDE.BuildRibbon();
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
+                }
+                if (settingsWindow.TakeSaved()) {
+                    ZanIDE.WriteEditorPrefs(edThemeIdx, edFontPx);
+                    log.Add("> Editor theme: "
+                        + ZanIDE.EditorThemeName(edThemeIdx)
+                        + "; font " + Convert.ToString(
+                            ZanIDE.EditorFontOr(edFontPx, defFontPx))
+                        + "px.");
+                    app.RequestRedraw();
+                }
+                if (!settingsWindow.IsOpen()) {
+                    settingsWindow = null;
                 }
             }
 
@@ -3158,139 +3166,6 @@ class ZanIDE {
         int action = 0;
         if (Button.WasClicked(app, pubId)) { action = 1; }
         else if (Button.WasClicked(app, canId)) { action = 2; }
-        return action;
-    }
-
-    /// Renders the modal Editor Settings dialog (color theme + font size).
-    /// st = [themeIdx, fontPx, defFontPx]; themeIdx/fontPx are updated in place.
-    /// Returns 0 (stay open) or 1 (Done/close).
-    static int RenderSettingsDialog(App app, List<int> st) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int W = c.Width();
-        int H = c.Height();
-        c.FillRect(0, 0, W, H, t.overlay);
-        app.BlockHitsBelow();
-
-        int w = app.Scale(520);
-        int h = app.Scale(520);
-        int x = (W - w) / 2;
-        int y = (H - h) / 2;
-        c.FillRoundRect(x + 2, y + 3, w, h, app.Scale(6), t.shadowColor);
-        Panel.FillSurface(app, x, y, w, h, t.bgPrimary);
-
-        int pad = app.Scale(18);
-        c.DrawText(x + pad, y + pad, ZanIDE.T("Editor Settings", "编辑器设置"), t.textPrimary, t.fontSizeLarge);
-        c.FillRect(x + 1, y + app.Scale(52), w - 2, 1, t.divider);
-        c.DrawText(x + pad, y + app.Scale(62), ZanIDE.T("Color Theme", "配色主题"), t.textSecondary, t.fontSizeSmall);
-
-        bool click = app.window.EventKind() == 3;
-        int action = 0;
-
-        int rowH = app.Scale(42);
-        int cardH = rowH - app.Scale(4);
-        int listX = x + pad;
-        int listY = y + app.Scale(84);
-        int listW = w - pad - pad;
-        int i = 0;
-        while (i < ZanIDE.EditorThemeCount()) {
-            int ry = listY + i * rowH;
-            bool selected = st[0] == i;
-            if (selected) {
-                c.FillRoundRect(listX, ry, listW, cardH, app.Scale(4), t.bgActive);
-                c.DrawRect(listX, ry, listW, cardH, t.primary, 1);
-            } else {
-                c.FillRoundRect(listX, ry, listW, cardH, app.Scale(4), t.bgSecondary);
-            }
-            int lblY = ry + app.Scale(3);
-            c.DrawText(listX + app.Scale(10), lblY, ZanIDE.EditorThemeName(i), t.textPrimary, t.fontSizeMedium);
-            // Colored preview tokens for this preset.
-            int pvX = listX + app.Scale(10);
-            int pvY = ry + app.Scale(19);
-            int fs = t.fontSizeSmall;
-            c.DrawText(pvX, pvY, "class", ZanIDE.EditorThemeColor(i, 0), fs);
-            pvX = pvX + Canvas.MeasureText("class ", fs);
-            c.DrawText(pvX, pvY, "App", ZanIDE.EditorThemeColor(i, 1), fs);
-            pvX = pvX + Canvas.MeasureText("App ", fs);
-            c.DrawText(pvX, pvY, "\"hi\"", ZanIDE.EditorThemeColor(i, 2), fs);
-            pvX = pvX + Canvas.MeasureText("\"hi\" ", fs);
-            c.DrawText(pvX, pvY, "42", ZanIDE.EditorThemeColor(i, 4), fs);
-            pvX = pvX + Canvas.MeasureText("42 ", fs);
-            c.DrawText(pvX, pvY, "// note", ZanIDE.EditorThemeColor(i, 3), fs);
-            ZanIDE.HandRegion(app, listX, ry, listW, cardH);
-            if (click && app.mouseX >= listX && app.mouseX < listX + listW
-                && app.mouseY >= ry && app.mouseY < ry + cardH) {
-                st[0] = i;
-                app.RequestRedraw();
-            }
-            i = i + 1;
-        }
-
-        // ---- Font size stepper ----
-        int fY = listY + ZanIDE.EditorThemeCount() * rowH + app.Scale(10);
-        c.DrawText(listX, fY, ZanIDE.T("Font Size", "字体大小"), t.textSecondary, t.fontSizeSmall);
-        int cur = ZanIDE.EditorFontOr(st[1], st[2]);
-        int btn = app.Scale(30);
-        int minusX = listX + app.Scale(90);
-        int plusX = minusX + btn + app.Scale(64);
-        int fbY = fY - app.Scale(6);
-        int minusId = Button.Create("-").SetSize(1).Render(app, minusX, fbY, btn);
-        c.DrawText(minusX + btn + app.Scale(18), fbY + app.Scale(7), Convert.ToString(cur) + "px", t.textPrimary, t.fontSizeMedium);
-        int plusId = Button.Create("+").SetSize(1).Render(app, plusX, fbY, btn);
-        int resetX = plusX + btn + app.Scale(16);
-        int resetW = app.Scale(84);
-        int resetId = Button.Create(ZanIDE.T("Default", "默认")).SetSize(1).Render(app, resetX, fbY, resetW);
-        if (Button.WasClicked(app, minusId)) {
-            int nv = cur - 1;
-            if (nv < 9) { nv = 9; }
-            st[1] = nv;
-            app.RequestRedraw();
-        } else if (Button.WasClicked(app, plusId)) {
-            int nv = cur + 1;
-            if (nv > 30) { nv = 30; }
-            st[1] = nv;
-            app.RequestRedraw();
-        } else if (Button.WasClicked(app, resetId)) {
-            st[1] = 0;
-            app.RequestRedraw();
-        }
-
-        // ---- Language toggle (one-click EN / 中文) ----
-        int lgY = fY + app.Scale(46);
-        c.DrawText(listX, lgY, ZanIDE.T("Language", "语言"), t.textSecondary, t.fontSizeSmall);
-        int segX = listX + app.Scale(90);
-        int segY = lgY - app.Scale(6);
-        int segH = app.Scale(30);
-        int li = 0;
-        while (li < ZanIDE.LangCount()) {
-            int segW = app.Scale(120);
-            int sx = segX + li * (segW + app.Scale(8));
-            bool lsel = st[3] == li;
-            if (lsel) {
-                c.FillRoundRect(sx, segY, segW, segH, app.Scale(4), t.bgActive);
-                c.DrawRect(sx, segY, segW, segH, t.primary, 1);
-            } else {
-                c.FillRoundRect(sx, segY, segW, segH, app.Scale(4), t.bgSecondary);
-            }
-            c.DrawText(sx + app.Scale(12), segY + app.Scale(8), ZanIDE.LangName(li), t.textPrimary, t.fontSizeSmall);
-            ZanIDE.HandRegion(app, sx, segY, segW, segH);
-            if (click && app.mouseX >= sx && app.mouseX < sx + segW
-                && app.mouseY >= segY && app.mouseY < segY + segH) {
-                st[3] = li;
-                app.RequestRedraw();
-            }
-            li = li + 1;
-        }
-
-        // ---- Done button ----
-        int dbH = app.Scale(30);
-        int dbW = app.Scale(100);
-        int dbX = x + w - pad - dbW;
-        int dbYb = y + h - dbH - t.paddingLarge;
-        int doneId = Button.Primary(ZanIDE.T("Done", "完成")).Render(app, dbX, dbYb, dbW);
-        if (Button.WasClicked(app, doneId)) {
-            action = 1;
-        }
         return action;
     }
 
@@ -6061,7 +5936,8 @@ class ZanIDE {
         int sw = app.Scale(268);
         c.FillRect(area.x, area.y, sw, area.height, t.bgSecondary);
         c.FillRect(area.x + sw - 1, area.y, 1, area.height, t.divider);
-        app.CaptureWheel(area.x, area.y, sw, area.height);
+        bool ownsDocsWheel = app.CaptureWheel(
+            area.x, area.y, sw, area.height);
 
         // Search box.
         int sx = area.x + app.Scale(12);
@@ -6111,9 +5987,7 @@ class ZanIDE {
         if (visRows < 1) { visRows = 1; }
 
         // Mouse-wheel scroll over the sidebar.
-        if (app.window.EventKind() == 13
-            && app.mouseX >= area.x && app.mouseX < area.x + sw
-            && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+        if (ownsDocsWheel) {
             int delta = app.window.EventKeyCode();
             int step = delta / 120;
             if (step == 0) { if (delta > 0) { step = 1; } else if (delta < 0) { step = 0 - 1; } }
@@ -6229,10 +6103,8 @@ class ZanIDE {
         if (visibleCodeLines < 1) { visibleCodeLines = 1; }
         int maxCodeScroll = codeLines.Count - visibleCodeLines;
         if (maxCodeScroll < 0) { maxCodeScroll = 0; }
-        app.CaptureWheel(cx, cy, cw, panelH);
-        if (app.window.EventKind() == 13
-            && app.mouseX >= cx && app.mouseX < cx + cw
-            && app.mouseY >= cy && app.mouseY < cy + panelH) {
+        bool ownsCodeWheel = app.CaptureWheel(cx, cy, cw, panelH);
+        if (ownsCodeWheel) {
             int delta = app.window.EventKeyCode();
             int step = delta / 120;
             if (step == 0) {
@@ -7116,7 +6988,8 @@ class ZanIDE {
         int mx = app.mouseX;
         int my = app.mouseY;
         bool over = mx >= x && mx < x + w && my >= y && my < y + h;
-        if (app.window.EventKind() == 13 && over) {
+        bool ownsWheel = app.CaptureWheel(x, y, w, h);
+        if (over && ownsWheel) {
             int delta = app.window.EventKeyCode();
             int step = delta / 120;
             if (step == 0) {
