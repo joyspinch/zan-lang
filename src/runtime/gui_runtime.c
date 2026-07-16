@@ -2109,9 +2109,26 @@ static void sdl_translate(const SDL_Event *e) {
         case SDL_EVENT_MOUSE_BUTTON_UP: {
             SDL_Window *w = SDL_GetWindowFromID(e->button.windowID);
             int btn = (e->button.button == SDL_BUTTON_RIGHT) ? 1 : 0;
-            int kind = (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN) ? 2 : 3;
+            int down = (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+            int kind = down ? 2 : 3;
+            /* Mirror Win32 SetCapture/ReleaseCapture: while the primary button
+             * is held, keep delivering motion (and the eventual button-up) even
+             * after the pointer leaves the window, so slider/scrollbar/selection
+             * drags track the cursor live and widgets never get stuck pressed. */
+            if (e->button.button == SDL_BUTTON_LEFT)
+                SDL_CaptureMouse(down ? true : false);
             zq_push(kind, (int)e->button.x, (int)e->button.y, btn, 0,
                     cur_mod_bits(), w);
+            break;
+        }
+        case SDL_EVENT_WINDOW_MOUSE_LEAVE: {
+            /* Clear widget hover when the pointer leaves the window. Skipped
+             * while a button is held: that drag still owns the pointer via the
+             * capture above and must keep tracking. */
+            if (SDL_GetMouseState(NULL, NULL) == 0) {
+                SDL_Window *w = SDL_GetWindowFromID(e->window.windowID);
+                zq_push(1, -1, -1, 0, 0, cur_mod_bits(), w);
+            }
             break;
         }
         case SDL_EVENT_MOUSE_WHEEL: {
