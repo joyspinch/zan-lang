@@ -11,7 +11,7 @@ namespace Gui;
 /// WinForms / element-plus form designers, but without touching coordinates.
 ///
 /// Surface:
-///   * a toolbar (Save / Load / Export / Preview / Clear, plus move-up /
+///   * a toolbar (JSON drawer / Preview / Clear, plus move-up /
 ///     move-down / delete acting on the selected field),
 ///   * a categorised field palette on the left (click a type to append a row),
 ///   * the vertical form preview in the centre (label + required star + a preview
@@ -120,6 +120,13 @@ class Designer {
     Input filterInput;
     int inspScroll;
     int inspContentH;
+
+    // Editable JSON drawer: the single source-of-truth text box for the design
+    // (replaces the old opaque Save/Load/Export buttons). Editing it and
+    // pressing Apply rebuilds the design; opening it dumps the current design.
+    SignalString jsonSig;
+    TextArea jsonArea;
+    bool jsonOpen;
     bool evtRootPrev;              // last event-tab target was the window root
     FormField evtSelPrev;         // last event-tab component target
 
@@ -194,6 +201,9 @@ class Designer {
         d.inspContentH = 0;
         d.evtRootPrev = false;
         d.evtSelPrev = null;
+        d.jsonSig = SignalString.Create("");
+        d.jsonArea = TextArea.Bind(d.jsonSig, "paste or edit the design JSON, then Apply");
+        d.jsonOpen = false;
         return d;
     }
 
@@ -436,7 +446,11 @@ class Designer {
 
         hoverFt = -1;
         RenderToolbar(app, c, t, canX, top, canW, barH);
-        RenderForm(app, c, t, canX, bodyY, canW, bodyH);
+        if (jsonOpen) {
+            RenderJsonPanel(app, c, t, canX, bodyY, canW, bodyH);
+        } else {
+            RenderForm(app, c, t, canX, bodyY, canW, bodyH);
+        }
         RenderPalette(app, c, t, palX, bodyY, palW, bodyH);
         RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH);
         RenderStatus(app, c, t, palX, bot + app.Scale(4), inspX + inspW - palX);
@@ -478,28 +492,52 @@ class Designer {
 
     // --- Toolbar -------------------------------------------------------------
 
+    /// The editable JSON drawer shown in place of the canvas when JSON is on.
+    /// The text box IS the document: Apply rebuilds the design from it,
+    /// Regenerate re-dumps the current design into it.
+    void RenderJsonPanel(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int pad = app.Scale(12);
+        int ix = x + pad;
+        int iw = w - pad * 2;
+        int iy = y + app.Scale(10);
+        c.DrawText(ix, iy, "DESIGN JSON  ·  edit then Apply", t.textTertiary, fs);
+        iy = iy + app.Scale(24);
+        int btnH = app.Scale(30);
+        int taH = y + h - iy - btnH - app.Scale(20);
+        if (taH < app.Scale(80)) { taH = app.Scale(80); }
+        jsonArea.Render(app, ix, iy, iw, taH);
+        int by = iy + taH + app.Scale(8);
+        int applyId = Button.Primary("Apply").Render(app, ix, by, app.Scale(80));
+        if (Button.WasClicked(app, applyId)) {
+            LoadJson(jsonSig.Get());
+            msg = "loaded " + Convert.ToString(fields.Count) + " components from JSON";
+        }
+        int dumpId = Button.Create("Regenerate").Render(app, ix + app.Scale(88), by, app.Scale(104));
+        if (Button.WasClicked(app, dumpId)) {
+            jsonArea.SetText(SaveJson());
+            msg = "regenerated JSON from the current design";
+        }
+        int closeId = Button.Create("Close").Render(app, ix + iw - app.Scale(70), by, app.Scale(70));
+        if (Button.WasClicked(app, closeId)) { jsonOpen = false; }
+    }
+
     void RenderToolbar(App app, Canvas c, Theme t, int tx, int ty, int tw, int th) {
         int bw = app.Scale(50);
         int g = app.Scale(6);
         int bx = tx;
-        int sId = Button.Primary("Save").Render(app, bx, ty, bw);
-        if (Button.WasClicked(app, sId)) {
-            doc = SaveJson();
-            msg = "saved JSON (" + Convert.ToString(doc.Length) + " chars)";
+        // Single JSON drawer toggle. Opening it dumps the current design so the
+        // box always reflects what's on the canvas; editing + Apply loads it.
+        int jType = 0;
+        if (jsonOpen) { jType = 3; }
+        int jId = Button.Typed("JSON", jType).Render(app, bx, ty, bw + app.Scale(4));
+        if (Button.WasClicked(app, jId)) {
+            jsonOpen = !jsonOpen;
+            if (jsonOpen) { jsonArea.SetText(SaveJson()); }
         }
-        bx = bx + bw + g;
-        int lId = Button.Create("Load").Render(app, bx, ty, bw);
-        if (Button.WasClicked(app, lId) && doc != "") {
-            LoadJson(doc);
-            msg = "loaded " + Convert.ToString(fields.Count) + " fields from JSON";
-        }
-        bx = bx + bw + g;
-        int eId = Button.Create("Export").Render(app, bx, ty, bw + app.Scale(8));
-        if (Button.WasClicked(app, eId)) {
-            doc = SaveJson();
-            msg = "exported " + Convert.ToString(fields.Count) + " fields to JSON";
-        }
-        bx = bx + bw + app.Scale(8) + g;
+        bx = bx + bw + app.Scale(4) + g;
         int pType = 0;
         if (preview) { pType = 3; }
         int pId = Button.Typed("Preview", pType).Render(app, bx, ty, bw + app.Scale(12));
