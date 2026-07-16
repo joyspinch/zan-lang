@@ -34,11 +34,16 @@
 #define EXPORT __declspec(dllexport)
 #endif
 #elif defined(__linux__)
+/* X11 headers back the native Linux window shell; the unified SDL backend
+ * (ZAN_GUI_SDL) owns windowing instead, so they are not needed (and the build
+ * need not depend on libX11-dev) in that configuration. */
+#if !defined(ZAN_GUI_SDL)
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#endif
 #include <poll.h>
 #include <time.h>
 #include <locale.h>
@@ -2020,7 +2025,7 @@ static int sdl_mods_to_bits(SDL_Keymod m) {
 static int cur_mod_bits(void) { return sdl_mods_to_bits(SDL_GetModState()); }
 
 /* Decode one UTF-8 codepoint from s (advancing *i); returns -1 at end. */
-static int utf8_next(const char *s, int *i) {
+static int sdl_utf8_next(const char *s, int *i) {
     unsigned char c = (unsigned char)s[*i];
     if (c == 0) return -1;
     int cp, n;
@@ -2099,7 +2104,7 @@ static void sdl_translate(const SDL_Event *e) {
             const char *txt = e->text.text;
             int i = 0, cp;
             /* One kind-6 (WM_CHAR-equivalent) per codepoint of the commit. */
-            while ((cp = utf8_next(txt, &i)) > 0)
+            while ((cp = sdl_utf8_next(txt, &i)) > 0)
                 zq_push(6, 0, 0, 0, cp, 0, w);
             break;
         }
@@ -2423,7 +2428,9 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
  * Linux X11 Window Shell
  * ======================================================================== */
 
-#ifdef __linux__
+/* Compiled out when the unified SDL backend owns windowing (ZAN_GUI_SDL); the
+ * shared software rasterizer and FreeType/software text above still build. */
+#if defined(__linux__) && !defined(ZAN_GUI_SDL)
 
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
@@ -3057,7 +3064,7 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
     req.tv_nsec = (long)((ms % 1000) * 1000000L);
     nanosleep(&req, NULL);
 }
-#endif /* __linux__ */
+#endif /* __linux__ && !ZAN_GUI_SDL (X11 window shell) */
 
 /* ========================================================================
  * Software bitmap-font fallback for non-Windows/non-Cocoa backends.
@@ -3819,7 +3826,7 @@ EXPORT void zan_gui_draw_icon(i64 surface_id, i64 x, i64 y, i64 box,
     }
 }
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(ZAN_GUI_SDL)
 /* ---- window management (EWMH / Xlib) ---- */
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
@@ -4056,7 +4063,7 @@ EXPORT const char *zan_gui_get_clipboard(void) {
     g_clip_read_linux = text;
     return g_clip_read_linux;
 }
-#endif /* __linux__ */
+#endif /* __linux__ && !ZAN_GUI_SDL (X11 window management) */
 
 /* ========================================================================
  * macOS (and other non-Windows, non-Linux) windowing.
@@ -4064,8 +4071,9 @@ EXPORT const char *zan_gui_get_clipboard(void) {
  * When ZAN_GUI_COCOA is defined the real Cocoa backend in gui_runtime_mac.m
  * provides these; otherwise they are no-op stubs so the library still links.
  * Text rendering is the shared software path above, so it is omitted here.
- * ======================================================================== */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+ * The unified SDL backend (ZAN_GUI_SDL) supplies real implementations, so the
+ * stubs are compiled out there too. */
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 
 EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
@@ -4096,15 +4104,16 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
  * ========================================================================
  * The Win32, X11 and Cocoa backends all draw their own client-side title bar
  * and supply these; only the headless/no-op fallback reports 0. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
 #endif
 
 /* write_file is portable across every non-Win32 backend (X11, Cocoa and the
- * no-op fallback all need it), so it lives outside the CSD-metrics guard. */
-#if !defined(_WIN32)
+ * no-op fallback all need it), so it lives outside the CSD-metrics guard. The
+ * SDL backend supplies its own (SDL_IOStream) write_file. */
+#if !defined(_WIN32) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     FILE *f = fopen(path, "wb");
     if (!f) return 1;
@@ -4118,7 +4127,7 @@ EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
  * macOS (NSVisualEffectView) and Linux (compositor blur) get real backends in
  * their own sections; any other target links a no-op so the cross-platform
  * Gui.Native.Window.EnableGlass entry points resolve everywhere. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     (void)hwnd_val; (void)tint_argb; return 1;
 }
@@ -4128,7 +4137,7 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 1; }
 /* Window management: X11 has real implementations in the __linux__ branch
  * above; the Cocoa backend (ZAN_GUI_COCOA) provides them on macOS. Any other
  * non-Windows target falls back to no-ops. */
-#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA)
+#if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }

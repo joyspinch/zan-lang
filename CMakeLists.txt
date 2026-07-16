@@ -232,12 +232,45 @@ endif()
 # as a shared library so its platform system deps (X11 / user32+gdi32) are
 # self-contained and Zan programs only need `-lzan_gui`.
 option(ZAN_BUILD_GUI "Build the native zan_gui runtime library" ON)
+# Unified SDL3 windowing shell: when ON, Linux/macOS drive windowing, input and
+# present through SDL3 (the same stack as zan_sdl3 / Game.*) instead of the
+# native X11/Cocoa shells, so the IDE and games share one window/render path.
+# The software rasterizer and text rendering are unchanged. Default OFF keeps
+# the native X11/Cocoa backends (and their conformance tests) as the tested
+# path; Windows enables it separately via scripts/build_ide.ps1.
+option(ZAN_GUI_SDL "Use the unified SDL3 windowing backend for zan_gui (Linux/macOS)" OFF)
 set(ZAN_GUI_AVAILABLE FALSE)
 if(ZAN_BUILD_GUI)
     if(WIN32)
         add_library(zan_gui SHARED src/runtime/gui_runtime.c)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32)
         set(ZAN_GUI_AVAILABLE TRUE)
+    elseif(ZAN_GUI_SDL)
+        # SDL owns the window/event pump/present; the shared software rasterizer
+        # draws every widget into one CPU surface shown as a streaming texture.
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(SDL3 QUIET sdl3)
+        endif()
+        if(SDL3_FOUND)
+            add_library(zan_gui SHARED src/runtime/gui_runtime.c)
+            target_compile_definitions(zan_gui PRIVATE ZAN_GUI_SDL)
+            target_include_directories(zan_gui PRIVATE ${SDL3_INCLUDE_DIRS})
+            target_link_directories(zan_gui PRIVATE ${SDL3_LIBRARY_DIRS})
+            target_link_libraries(zan_gui PRIVATE ${SDL3_LIBRARIES} m)
+            # Text still uses the shared FreeType path where available (Linux);
+            # elsewhere it falls back to the built-in software bitmap font.
+            find_package(Freetype QUIET)
+            find_package(Fontconfig QUIET)
+            if(Freetype_FOUND AND Fontconfig_FOUND)
+                target_compile_definitions(zan_gui PRIVATE ZAN_GUI_FREETYPE)
+                target_link_libraries(zan_gui PRIVATE
+                    Freetype::Freetype Fontconfig::Fontconfig)
+            endif()
+            set(ZAN_GUI_AVAILABLE TRUE)
+        else()
+            message(WARNING "ZAN_GUI_SDL requested but SDL3 (sdl3.pc) not found; skipping zan_gui")
+        endif()
     elseif(APPLE)
         # Real Cocoa backend (Objective-C) + shared software renderer. The C file
         # is compiled with ZAN_GUI_COCOA so its macOS stub branch is disabled and
@@ -476,7 +509,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   target_link_libraries(zan_gui_runtime_test PRIVATE zan_gui)
   add_test(NAME runtime_gui COMMAND zan_gui_runtime_test)
 
-  if(UNIX AND NOT APPLE)
+  if(UNIX AND NOT APPLE AND NOT ZAN_GUI_SDL)
     find_program(XVFB_RUN_EXECUTABLE xvfb-run)
     if(XVFB_RUN_EXECUTABLE)
       add_executable(zan_gui_x11_test tests/runtime/gui_x11_test.c)
