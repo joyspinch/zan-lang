@@ -2,8 +2,44 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-Write-Output "[0/2] Rebuilding native GUI runtime (multi-window)..."
-clang -O2 -DZAN_GUI_STATIC -c src\runtime\gui_runtime.c -o build\zan_gui_static.obj
+# ---- SDL3 windowing backend (unified with Game.*) -------------------------
+# The native GUI runtime is now built with ZAN_GUI_SDL so the IDE window is an
+# SDL3 window driven by the same stack games use. Locate the staged SDL3 mingw
+# devel package (headers) and synthesize an MSVC import lib (SDL3.lib) from the
+# driver DLL — mirrors scripts\build_gui_sdl_smoke.ps1.
+$driverDir = Join-Path $root "stdlib\SDL3\drivers\win-x64"
+$cache = Get-ChildItem "$env:TEMP" -Filter "zan-sdl3-*" -Directory `
+    | Sort-Object Name -Descending | Select-Object -First 1
+if (-not $cache) { Write-Output "SDL3_STAGE_MISSING"; exit 1 }
+$pkg = Join-Path $cache.FullName ((Get-ChildItem $cache.FullName -Filter "SDL3-*" -Directory | Select-Object -First 1).Name)
+$pkg = Join-Path $pkg "x86_64-w64-mingw32"
+$inc = Join-Path $pkg "include"
+
+$sdlLib = Join-Path $driverDir "SDL3.lib"
+if (!(Test-Path $sdlLib)) {
+    Write-Output "Generating SDL3.lib import library from SDL3.dll ..."
+    $dll = Join-Path $driverDir "SDL3.dll"
+    $def = Join-Path $driverDir "SDL3.def"
+    $dump = & llvm-objdump -p $dll
+    $names = @()
+    $inExports = $false
+    foreach ($line in $dump) {
+        if ($line -match "Export Table:") { $inExports = $true; continue }
+        if ($inExports) {
+            $m = [regex]::Match($line, "^\s+\d+\s+0x[0-9a-fA-F]+\s+(\S+)\s*$")
+            if ($m.Success) { $names += $m.Groups[1].Value }
+        }
+    }
+    if ($names.Count -eq 0) { Write-Output "SDL3_DEF_EMPTY"; exit 1 }
+    "LIBRARY SDL3.dll`nEXPORTS" | Set-Content -Encoding ascii $def
+    $names | ForEach-Object { $_ } | Add-Content -Encoding ascii $def
+    & llvm-dlltool -m i386:x86-64 -d $def -l $sdlLib -D "SDL3.dll"
+    if ($LASTEXITCODE -ne 0) { Write-Output "SDL3_DLLTOOL_FAILED"; exit 1 }
+    Write-Output "Wrote $sdlLib ($($names.Count) exports)"
+}
+
+Write-Output "[0/2] Rebuilding native GUI runtime (SDL3 windowing)..."
+clang -O2 -DZAN_GUI_STATIC -DZAN_GUI_SDL "-I$inc" -c src\runtime\gui_runtime.c -o build\zan_gui_static.obj
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
 llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
@@ -42,8 +78,10 @@ try {
         [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "ZanIDE.ll"), $ir)
         clang ZanIDE.ll zanrt_sync_ide.obj zan_icon.res -o ZanIDE.exe -O2 `
             -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS `
-            -Xlinker /ENTRY:mainCRTStartup -lzan_gui -llegacy_stdio_definitions
+            -Xlinker /ENTRY:mainCRTStartup -lzan_gui "$sdlLib" -llegacy_stdio_definitions
         if ($LASTEXITCODE -ne 0) { throw "LINK_FAILED code=$LASTEXITCODE" }
+        Copy-Item -LiteralPath (Join-Path $driverDir "SDL3.dll") `
+            -Destination (Join-Path (Get-Location) "SDL3.dll") -Force
     } finally {
         Pop-Location
     }
