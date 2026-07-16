@@ -357,51 +357,81 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
     if (r < 1) return;
     if (r > 40) r = 40;
 
-    size_t n = (size_t)rw * (size_t)rh;
-    u32 *a = (u32 *)malloc(n * sizeof(u32));
-    u32 *b = (u32 *)malloc(n * sizeof(u32));
+    /* Downsampled frosted blur. Box-blurring at full resolution is the
+     * dominant glass cost; for the large radii glass uses we downscale the
+     * region, blur the small copy, then bilinearly upscale. Visually identical
+     * for frost, but the blur runs on ~1/(ds*ds) of the pixels. */
+    int ds = 1;
+    if (r >= 12) { ds = 4; } else if (r >= 6) { ds = 2; }
+    int dw = (rw + ds - 1) / ds;
+    int dh = (rh + ds - 1) / ds;
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    size_t dn = (size_t)dw * (size_t)dh;
+    u32 *a = (u32 *)malloc(dn * sizeof(u32));
+    u32 *b = (u32 *)malloc(dn * sizeof(u32));
     if (!a || !b) { free(a); free(b); return; }
 
-    for (int j = 0; j < rh; j++) {
-        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-        for (int i = 0; i < rw; i++) a[j * rw + i] = row[i];
+    /* Downsample: average each ds x ds source block into one small pixel. */
+    for (int dj = 0; dj < dh; dj++) {
+        int sy0 = dj * ds;
+        int sy1 = sy0 + ds; if (sy1 > rh) sy1 = rh;
+        for (int di = 0; di < dw; di++) {
+            int sx0 = di * ds;
+            int sx1 = sx0 + ds; if (sx1 > rw) sx1 = rw;
+            int sr = 0, sg = 0, sb = 0, cnt = 0;
+            for (int yy = sy0; yy < sy1; yy++) {
+                u32 *row = s->pixels + (y0 + yy) * s->stride + x0;
+                for (int xx = sx0; xx < sx1; xx++) {
+                    u32 px = row[xx];
+                    sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
+                    cnt++;
+                }
+            }
+            if (cnt < 1) cnt = 1;
+            a[dj * dw + di] = 0xFF000000u | ((u32)(sr / cnt) << 16)
+                            | ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
+        }
     }
 
-    int win = 2 * r + 1;
-    for (int p = 0; p < 3; p++) {
+    /* Box blur the small copy (2 passes at reduced radius approximate the
+     * former 3 full-res passes). */
+    int rr = r / ds; if (rr < 1) rr = 1;
+    int win = 2 * rr + 1;
+    for (int p = 0; p < 2; p++) {
         /* horizontal: a -> b */
-        for (int j = 0; j < rh; j++) {
-            u32 *src = a + j * rw;
-            u32 *dst = b + j * rw;
+        for (int j = 0; j < dh; j++) {
+            u32 *src = a + j * dw;
+            u32 *dst = b + j * dw;
             int sr = 0, sg = 0, sb = 0;
-            for (int k = -r; k <= r; k++) {
-                int ii = clamp_i(k, 0, rw - 1);
+            for (int k = -rr; k <= rr; k++) {
+                int ii = clamp_i(k, 0, dw - 1);
                 u32 px = src[ii];
                 sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
             }
-            for (int i = 0; i < rw; i++) {
+            for (int i = 0; i < dw; i++) {
                 dst[i] = 0xFF000000u | ((u32)(sr / win) << 16)
                        | ((u32)(sg / win) << 8) | (u32)(sb / win);
-                u32 pa = src[clamp_i(i + r + 1, 0, rw - 1)];
-                u32 ps = src[clamp_i(i - r, 0, rw - 1)];
+                u32 pa = src[clamp_i(i + rr + 1, 0, dw - 1)];
+                u32 ps = src[clamp_i(i - rr, 0, dw - 1)];
                 sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
                 sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
                 sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
             }
         }
         /* vertical: b -> a */
-        for (int i = 0; i < rw; i++) {
+        for (int i = 0; i < dw; i++) {
             int sr = 0, sg = 0, sb = 0;
-            for (int k = -r; k <= r; k++) {
-                int jj = clamp_i(k, 0, rh - 1);
-                u32 px = b[jj * rw + i];
+            for (int k = -rr; k <= rr; k++) {
+                int jj = clamp_i(k, 0, dh - 1);
+                u32 px = b[jj * dw + i];
                 sr += (px >> 16) & 0xFF; sg += (px >> 8) & 0xFF; sb += px & 0xFF;
             }
-            for (int j = 0; j < rh; j++) {
-                a[j * rw + i] = 0xFF000000u | ((u32)(sr / win) << 16)
+            for (int j = 0; j < dh; j++) {
+                a[j * dw + i] = 0xFF000000u | ((u32)(sr / win) << 16)
                               | ((u32)(sg / win) << 8) | (u32)(sb / win);
-                u32 pa = b[clamp_i(j + r + 1, 0, rh - 1) * rw + i];
-                u32 ps = b[clamp_i(j - r, 0, rh - 1) * rw + i];
+                u32 pa = b[clamp_i(j + rr + 1, 0, dh - 1) * dw + i];
+                u32 ps = b[clamp_i(j - rr, 0, dh - 1) * dw + i];
                 sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
                 sg += (int)((pa >> 8) & 0xFF)  - (int)((ps >> 8) & 0xFF);
                 sb += (int)(pa & 0xFF)         - (int)(ps & 0xFF);
@@ -409,25 +439,60 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
         }
     }
 
-    /* Vibrancy: push each blurred pixel's saturation up (~1.4x) so the frosted
-     * backdrop keeps the colour of the wallpaper behind it -- the hallmark of
-     * Apple-style glass -- instead of washing out to a flat grey once a
-     * translucent tint is laid over it. Luma-preserving so brightness holds. */
-    for (int j = 0; j < rh; j++) {
-        u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-        for (int i = 0; i < rw; i++) {
-            u32 px = a[j * rw + i];
-            int rr = (int)((px >> 16) & 0xFF);
-            int gg = (int)((px >> 8) & 0xFF);
-            int bb = (int)(px & 0xFF);
-            int luma = (rr * 77 + gg * 150 + bb * 29) >> 8;
-            rr = luma + (rr - luma) * 7 / 5;
-            gg = luma + (gg - luma) * 7 / 5;
-            bb = luma + (bb - luma) * 7 / 5;
-            rr = clamp_i(rr, 0, 255);
-            gg = clamp_i(gg, 0, 255);
-            bb = clamp_i(bb, 0, 255);
-            row[i] = 0xFF000000u | ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+    /* Vibrancy (luma-preserving ~1.4x saturation) on the small copy so the
+     * frost keeps the wallpaper's colour instead of washing to grey. */
+    for (int i = 0; i < (int)dn; i++) {
+        u32 px = a[i];
+        int rc = (int)((px >> 16) & 0xFF);
+        int gc = (int)((px >> 8) & 0xFF);
+        int bc = (int)(px & 0xFF);
+        int luma = (rc * 77 + gc * 150 + bc * 29) >> 8;
+        rc = luma + (rc - luma) * 7 / 5;
+        gc = luma + (gc - luma) * 7 / 5;
+        bc = luma + (bc - luma) * 7 / 5;
+        a[i] = 0xFF000000u | ((u32)clamp_i(rc, 0, 255) << 16)
+             | ((u32)clamp_i(gc, 0, 255) << 8) | (u32)clamp_i(bc, 0, 255);
+    }
+
+    /* Upscale the small blurred copy back into the surface region. */
+    if (ds == 1) {
+        for (int j = 0; j < rh; j++) {
+            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+            u32 *src = a + j * dw;
+            for (int i = 0; i < rw; i++) row[i] = src[i];
+        }
+    } else {
+        /* Bilinear: sample the small copy at each full-res pixel centre
+         * (fixed-point, 8 fractional bits). */
+        for (int j = 0; j < rh; j++) {
+            int fy = ((j * 2 + 1) * 256) / (ds * 2) - 128;
+            if (fy < 0) fy = 0;
+            int gy = fy >> 8; int wy = fy & 255;
+            if (gy > dh - 1) { gy = dh - 1; wy = 0; }
+            int gy1 = gy + 1; if (gy1 > dh - 1) gy1 = dh - 1;
+            u32 *row = s->pixels + (y0 + j) * s->stride + x0;
+            for (int i = 0; i < rw; i++) {
+                int fx = ((i * 2 + 1) * 256) / (ds * 2) - 128;
+                if (fx < 0) fx = 0;
+                int gx = fx >> 8; int wx = fx & 255;
+                if (gx > dw - 1) { gx = dw - 1; wx = 0; }
+                int gx1 = gx + 1; if (gx1 > dw - 1) gx1 = dw - 1;
+                u32 p00 = a[gy * dw + gx];
+                u32 p01 = a[gy * dw + gx1];
+                u32 p10 = a[gy1 * dw + gx];
+                u32 p11 = a[gy1 * dw + gx1];
+                int w00 = (256 - wx) * (256 - wy);
+                int w01 = wx * (256 - wy);
+                int w10 = (256 - wx) * wy;
+                int w11 = wx * wy;
+                int rC = ((int)((p00 >> 16) & 0xFF) * w00 + (int)((p01 >> 16) & 0xFF) * w01
+                        + (int)((p10 >> 16) & 0xFF) * w10 + (int)((p11 >> 16) & 0xFF) * w11) >> 16;
+                int gC = ((int)((p00 >> 8) & 0xFF) * w00 + (int)((p01 >> 8) & 0xFF) * w01
+                        + (int)((p10 >> 8) & 0xFF) * w10 + (int)((p11 >> 8) & 0xFF) * w11) >> 16;
+                int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01
+                        + (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >> 16;
+                row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+            }
         }
     }
     free(a); free(b);
