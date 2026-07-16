@@ -2473,9 +2473,13 @@ EXPORT i64 zan_gui_set_cursor(i64 cursor_type) {
     static SDL_Cursor *cache[6];
     static int made = 0;
     if (!made) {
+        /* Index order must match the Win32 zan_gui_set_cursor mapping, since
+         * Gui/App feeds the same cursor id to both backends:
+         * 0=arrow 1=hand(clickable) 2=I-beam(text) 3=EW 4=NS 5=crosshair.
+         * (Previously 1/2 were TEXT/WAIT, so buttons showed an I-beam.) */
         cache[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
-        cache[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
-        cache[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_WAIT);
+        cache[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+        cache[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
         cache[3] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
         cache[4] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
         cache[5] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
