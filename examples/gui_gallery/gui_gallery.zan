@@ -114,6 +114,10 @@ class Demo {
     // Active code tab for THIS card only: 0 = Zan, 1 = JSON. Each card owns
     // its own tab so toggling one demo's JSON view leaves the others alone.
     int tab;
+    // Stable identity for this card, so the shared code-selection state knows
+    // which single code box owns the current selection (no cross-box bleed).
+    static int seq;
+    int uid;
 
     // --- Per-frame render cache -------------------------------------------
     // Wrapping the description and tokenising the code snippet for syntax
@@ -141,6 +145,8 @@ class Demo {
         d.code = code;
         d.json = json;
         d.tab = 0;
+        d.uid = Demo.seq;
+        Demo.seq = Demo.seq + 1;
         d.cacheSig = "";
         return d;
     }
@@ -248,6 +254,10 @@ class Gallery {
     // snippet's split lines). selDrag is true while the mouse button is held.
     static bool selHas;
     static bool selDrag;
+    // uid of the Demo whose code box currently owns the selection (-1 = none),
+    // combined with the tab so a Zan/JSON switch doesn't reuse stale offsets.
+    static int selOwner;
+    static int selTab;
     // Retained state for the deferred-overlay / interactive demos.
     static string copiedIcon;
     static DataTableState demoTableState;
@@ -1324,10 +1334,12 @@ class Gallery {
             cpIconSz, 0xFFFFFFFF);
         c.DrawText(cpContentX + cpIconSz + cpGap,
             cpY + (cpH - Canvas.FontHeight(fs)) / 2, "Copy", 0xFFFFFFFF, fs);
+        // This code box owns the selection only if its uid+tab match.
+        bool selMine = Gallery.selOwner == d.uid && Gallery.selTab == tab;
         if (app.window.EventKind() == 3 && cpHot) {
             // Copy the current selection when there is one, else the whole snippet.
             string toCopy = src;
-            if (Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(codeLines); }
+            if (selMine && Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(codeLines); }
             Clipboard.SetText(toCopy);
             app.RequestRedraw();
         }
@@ -1346,19 +1358,22 @@ class Gallery {
             Gallery.selAL = ll; Gallery.selAC = cc;
             Gallery.selFL = ll; Gallery.selFC = cc;
             Gallery.selDrag = true;
+            Gallery.selOwner = d.uid; Gallery.selTab = tab;
+            selMine = true;
             app.RequestRedraw();
-        } else if (ek == 1 && Gallery.selDrag) {
+        } else if (ek == 1 && Gallery.selDrag && selMine) {
             int ll = Gallery.HitLine(codeLines, 0, app.mouseY, codeY0, codeLineH);
             int cc = Gallery.ColAt(codeLines[ll], fs, app.mouseX - textX);
             Gallery.selFL = ll; Gallery.selFC = cc;
             app.RequestRedraw();
-        } else if (ek == 3 && Gallery.selDrag) {
+        } else if (ek == 3 && Gallery.selDrag && selMine) {
             Gallery.selDrag = false;
             app.RequestRedraw();
         }
 
         // Normalised selection bounds (start <= end) for the highlight pass.
-        bool showSel = Gallery.SelNonEmpty();
+        // Only the owning box (matching uid+tab) paints the highlight.
+        bool showSel = selMine && Gallery.SelNonEmpty();
         int nl0 = Gallery.selAL; int nc0 = Gallery.selAC;
         int nl1 = Gallery.selFL; int nc1 = Gallery.selFC;
         if (nl1 < nl0 || (nl1 == nl0 && nc1 < nc0)) {
@@ -2057,28 +2072,74 @@ class Gallery {
             int cW = w - app.Scale(28);
             int cH = app.Scale(170);
             ChartOptions co = ChartOptions.Line();
-            if (name == "Chart.area") { co = ChartOptions.Area(); }
-            else if (name == "Chart.smooth") { co = ChartOptions.Smooth(); }
-            else if (name == "Chart.bar") { co = ChartOptions.Bar(); co.showValues = true; }
-            else if (name == "Chart.stacked") { co = ChartOptions.Stacked(); }
-            ChartView cv = ChartView.Of(cm, co);
+            int ck = 8110;
+            if (name == "Chart.area") { co = ChartOptions.Area(); ck = 8111; }
+            else if (name == "Chart.smooth") { co = ChartOptions.Smooth(); ck = 8112; }
+            else if (name == "Chart.bar") { co = ChartOptions.Bar(); co.showValues = true; ck = 8113; }
+            else if (name == "Chart.stacked") { co = ChartOptions.Stacked(); ck = 8114; }
+            ChartView cv = ChartView.Keyed(cm, co, ck);
             cv.Render(app, cX, cY, cW, cH);
-        } else if (name == "Chart.pie" || name == "Chart.donut") {
-            List<int> parts = new List<int>();
-            parts.Add(45); parts.Add(30); parts.Add(25);
-            ChartModel cm = ChartModel.Create("Language share");
+        } else if (name == "Chart.pie") {
+            // Part-of-whole charts are small: show pie + donut side by side
+            // (two per row) instead of one stretched across the full width.
             List<int> p0 = new List<int>(); p0.Add(45);
             List<int> p1 = new List<int>(); p1.Add(30);
             List<int> p2 = new List<int>(); p2.Add(25);
-            cm.Add("Zan", p0); cm.Add("C", p1); cm.Add("Rust", p2);
-            int cX = x + app.Scale(14);
             int cY = y + app.Scale(30);
-            int cW = w - app.Scale(28);
             int cH = app.Scale(170);
-            ChartOptions co = ChartOptions.Pie();
-            if (name == "Chart.donut") { co = ChartOptions.Donut(); }
-            ChartView cv = ChartView.Of(cm, co);
-            cv.Render(app, cX, cY, cW, cH);
+            int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
+            int c0X = x + app.Scale(14);
+            int c1X = c0X + halfW + app.Scale(12);
+
+            ChartModel pm = ChartModel.Create("Language share");
+            pm.Add("Zan", p0); pm.Add("C", p1); pm.Add("Rust", p2);
+            ChartView.Keyed(pm, ChartOptions.Pie(), 8120).Render(app, c0X, cY, halfW, cH);
+
+            ChartModel dm = ChartModel.Create("Language share");
+            List<int> d0 = new List<int>(); d0.Add(45);
+            List<int> d1 = new List<int>(); d1.Add(30);
+            List<int> d2 = new List<int>(); d2.Add(25);
+            dm.Add("Zan", d0); dm.Add("C", d1); dm.Add("Rust", d2);
+            ChartView.Keyed(dm, ChartOptions.Donut(), 8121).Render(app, c1X, cY, halfW, cH);
+        } else if (name == "Chart.radial") {
+            // Gauge + radial-bars, two per row (both are compact by nature).
+            int cY = y + app.Scale(30);
+            int cH = app.Scale(170);
+            int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
+            int c0X = x + app.Scale(14);
+            int c1X = c0X + halfW + app.Scale(12);
+
+            ChartModel gm = ChartModel.Create("CPU load");
+            List<int> gv = new List<int>(); gv.Add(72);
+            gm.AddColored("load", gv, t.primary);
+            ChartOptions go = ChartOptions.Gauge();
+            go.gaugeMax = 100;
+            ChartView.Keyed(gm, go, 8130).Render(app, c0X, cY, halfW, cH);
+
+            ChartModel rm = ChartModel.Create("Quota used");
+            List<int> r0 = new List<int>(); r0.Add(80);
+            List<int> r1 = new List<int>(); r1.Add(55);
+            List<int> r2 = new List<int>(); r2.Add(30);
+            rm.Add("CPU", r0); rm.Add("RAM", r1); rm.Add("Disk", r2);
+            ChartOptions ro = ChartOptions.RadialBars();
+            ro.gaugeMax = 100;
+            ChartView.Keyed(rm, ro, 8131).Render(app, c1X, cY, halfW, cH);
+        } else if (name == "Chart.heatmap") {
+            ChartModel hm = ChartModel.Create("Weekly activity");
+            hm.AddLabel("Mon"); hm.AddLabel("Tue"); hm.AddLabel("Wed");
+            hm.AddLabel("Thu"); hm.AddLabel("Fri"); hm.AddLabel("Sat"); hm.AddLabel("Sun");
+            List<int> wk1 = new List<int>();
+            wk1.Add(12); wk1.Add(35); wk1.Add(50); wk1.Add(28); wk1.Add(64); wk1.Add(18); wk1.Add(8);
+            List<int> wk2 = new List<int>();
+            wk2.Add(40); wk2.Add(22); wk2.Add(70); wk2.Add(90); wk2.Add(55); wk2.Add(30); wk2.Add(15);
+            List<int> wk3 = new List<int>();
+            wk3.Add(5); wk3.Add(60); wk3.Add(45); wk3.Add(38); wk3.Add(80); wk3.Add(52); wk3.Add(20);
+            hm.AddColored("Team A", wk1, t.primary);
+            hm.AddColored("Team B", wk2, Chart.Palette(t, 2));
+            hm.AddColored("Team C", wk3, Chart.Palette(t, 4));
+            ChartView.Keyed(hm, ChartOptions.Heatmap(), 8140).Render(
+                app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(170));
         } else if (name == "Chart.json") {
             // The exact same chart, driven entirely by a JSON data document
             // instead of imperative Add() calls (color 0 = auto palette).
@@ -2089,7 +2150,7 @@ class Gallery {
             ChartModel cm = ChartModel.FromJson(doc);
             ChartOptions co = ChartOptions.Smooth();
             co.showValues = false;
-            ChartView cv = ChartView.Of(cm, co);
+            ChartView cv = ChartView.Keyed(cm, co, 8115);
             cv.Render(app, x + app.Scale(14), y + app.Scale(30),
                 w - app.Scale(28), app.Scale(170));
         } else if (name == "Chart.scatter") {
@@ -3170,10 +3231,12 @@ class Gallery {
         ch.AddDemo("From JSON", "Parse a data document into a ChartModel (color 0 = auto palette) and render it -- no imperative Add() calls. Ideal for server- or file-driven dashboards.", "Chart.json", 210,
             "string doc = \"{\\\"title\\\":\\\"Monthly active users\\\",\\\"labels\\\":[...],\\\"series\\\":[...] }\";\nChartModel m = ChartModel.FromJson(doc);\nChartView.Of(m, ChartOptions.Smooth()).Render(app, 40, 40, 480, 200);",
             "{\n  \"title\": \"Monthly active users\",\n  \"labels\": [\"Jan\", \"Feb\", \"Mar\", \"Apr\", \"May\", \"Jun\"],\n  \"series\": [\n    { \"name\": \"Web\", \"color\": 0, \"values\": [30, 45, 38, 60, 72, 85] },\n    { \"name\": \"Mobile\", \"color\": 0, \"values\": [20, 32, 40, 52, 64, 80] }\n  ]\n}");
-        ch.AddDemo("Pie", "ChartOptions.Pie() renders each single-value series as a part-of-whole slice; the sweep grows in on first render.", "Chart.pie", 210,
-            "ChartModel m = ChartModel.Create(\"Language share\");\nm.Add(\"Zan\", new List<int>{ 45 });\nm.Add(\"C\", new List<int>{ 30 });\nm.Add(\"Rust\", new List<int>{ 25 });\nChartView.Of(m, ChartOptions.Pie()).Render(app, 40, 40, 480, 200);", "");
-        ch.AddDemo("Donut", "ChartOptions.Donut() is a pie with a hollow centre (opts.donutPct sets the inner radius).", "Chart.donut", 210,
-            "ChartView.Of(m, ChartOptions.Donut()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Pie & Donut", "Part-of-whole charts are compact, so lay them two-per-row instead of stretching one across the width. ChartOptions.Pie()/Donut() render each single-value series as a slice; the sweep grows in on first render and the donut prints the total in its hole.", "Chart.pie", 210,
+            "ChartModel m = ChartModel.Create(\"Language share\");\nm.Add(\"Zan\", new List<int>{ 45 });\nm.Add(\"C\", new List<int>{ 30 });\nm.Add(\"Rust\", new List<int>{ 25 });\n// two per row: pie on the left, donut on the right\nChartView.Of(m, ChartOptions.Pie()).Render(app, 40, 40, 236, 200);\nChartView.Of(m, ChartOptions.Donut()).Render(app, 288, 40, 236, 200);", "");
+        ch.AddDemo("Gauge & Radial", "Gauge (half-ring speedometer) and RadialBars (concentric progress rings) are KPI charts -- also two-per-row. opts.gaugeMax sets full scale; each ring/needle sweeps in with the intro animation.", "Chart.radial", 210,
+            "ChartModel g = ChartModel.Create(\"CPU load\");\ng.AddColored(\"load\", new List<int>{ 72 }, t.primary);\nChartOptions go = ChartOptions.Gauge(); go.gaugeMax = 100;\nChartView.Of(g, go).Render(app, 40, 40, 236, 200);\n\nChartModel r = ChartModel.Create(\"Quota used\");\nr.Add(\"CPU\", new List<int>{ 80 }); r.Add(\"RAM\", new List<int>{ 55 }); r.Add(\"Disk\", new List<int>{ 30 });\nChartView.Of(r, ChartOptions.RadialBars()).Render(app, 288, 40, 236, 200);", "");
+        ch.AddDemo("Heatmap", "A heatmap maps each series to a row and each value index to a column, colouring every cell by intensity (min->max ramps bgTertiary -> the series colour). Cells fade in with the intro animation. Good for calendars / correlation grids.", "Chart.heatmap", 210,
+            "ChartModel m = ChartModel.Create(\"Weekly activity\");\nm.AddLabel(\"Mon\"); /* ...Sun */\nm.AddColored(\"Team A\", new List<int>{ 12, 35, 50, 28, 64, 18, 8 }, t.primary);\nm.AddColored(\"Team B\", new List<int>{ 40, 22, 70, 90, 55, 30, 15 }, Chart.Palette(t, 2));\nChartView.Of(m, ChartOptions.Heatmap()).Render(app, 40, 40, 480, 200);", "");
         ch.AddDemo("Scatter", "A scatter ChartModel carries x/y point arrays (AddPoint) rendered on value axes.", "Chart.scatter", 210,
             "ChartModel m = ChartModel.Create(\"Samples\");\nm.AddPoint(5, 8); m.AddPoint(12, 14); m.AddPoint(18, 11);\nChartView.Of(m, ChartOptions.Scatter()).Render(app, 40, 40, 480, 200);", "");
         ch.AddProp("model", "ChartModel", "-", "Typed data: title, labels, series (or scatter x/y). Build in code or via ChartModel.FromJson.");

@@ -547,6 +547,9 @@ class ChartType {
     static int Pie()        { return 5; }
     static int Donut()      { return 6; }
     static int Scatter()    { return 7; }
+    static int Gauge()      { return 8; }
+    static int RadialBars() { return 9; }
+    static int Heatmap()    { return 10; }
 }
 
 /// Declarative render options for a ChartView. A single strongly-typed config
@@ -567,6 +570,7 @@ class ChartOptions {
     bool rounded;     // rounded bar caps
     int animMs;       // intro animation duration (ms)
     int donutPct;     // donut inner radius as a % of the outer (donut)
+    int gaugeMax;     // full-scale value for Gauge / RadialBars (default 100)
 
     static ChartOptions Create() {
         ChartOptions o = new ChartOptions();
@@ -582,6 +586,7 @@ class ChartOptions {
         o.rounded = true;
         o.animMs = 650;
         o.donutPct = 55;
+        o.gaugeMax = 100;
         return o;
     }
 
@@ -601,6 +606,9 @@ class ChartOptions {
     static ChartOptions Pie()     { return ChartOptions.Of(5); }
     static ChartOptions Donut()   { return ChartOptions.Of(6); }
     static ChartOptions Scatter() { return ChartOptions.Of(7); }
+    static ChartOptions Gauge()   { return ChartOptions.Of(8); }
+    static ChartOptions RadialBars() { return ChartOptions.Of(9); }
+    static ChartOptions Heatmap() { return ChartOptions.Of(10); }
 }
 
 /// Strongly-typed chart data entity. Holds the title, the category axis labels
@@ -708,6 +716,10 @@ class ChartModel {
 class ChartView {
     ChartModel model;
     ChartOptions options;
+    // Stable per-chart animation key. Defaults to a fresh WidgetId, but callers
+    // in an immediate-mode / virtualized list (where widget-id order churns as
+    // rows scroll in and out) should pass a caller-owned stable key via Keyed()
+    // so the grow-in intro is not re-seeded to 0 every frame.
     int wid;
 
     static ChartView Of(ChartModel m, ChartOptions o) {
@@ -715,6 +727,15 @@ class ChartView {
         v.model = m;
         v.options = o;
         v.wid = WidgetId.Next();
+        return v;
+    }
+
+    /// Bind a model + options with a caller-owned stable animation key.
+    static ChartView Keyed(ChartModel m, ChartOptions o, int key) {
+        ChartView v = new ChartView();
+        v.model = m;
+        v.options = o;
+        v.wid = key;
         return v;
     }
 
@@ -745,6 +766,12 @@ class ChartView {
             ChartView.DrawPie(app, x, y, w, h, model, options.donutPct, g);
         } else if (k == 7) {
             ChartView.DrawScatter(app, x, y, w, h, model, t.primary, g);
+        } else if (k == 8) {
+            ChartView.DrawGauge(app, x, y, w, h, model, options, g);
+        } else if (k == 9) {
+            ChartView.DrawRadialBars(app, x, y, w, h, model, options, g);
+        } else if (k == 10) {
+            ChartView.DrawHeatmap(app, x, y, w, h, model, options, g);
         } else if (k == 2 || k == 3 || k == 4) {
             ChartView.DrawBars(app, x, y, w, h, model, options, g);
         } else {
@@ -1001,22 +1028,86 @@ class ChartView {
 
     static void DrawPie(App app, int x, int y, int w, int h,
                         ChartModel m, int innerPct, int g) {
-        List<string> names = new List<string>();
-        List<int> values = new List<int>();
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderPrimary, 1);
+        int top = y + pad;
+        if (m.title.Length > 0) {
+            c.DrawText(x + pad, top, m.title, t.textPrimary, t.fontSizeLarge);
+        }
+        top = top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+
+        // Totals come from the FULL data (not g-scaled) so the pie geometry is
+        // stable; the grow-in is a radial sweep to sweepMax degrees. This avoids
+        // integer division collapsing small early-frame values to 0 (which used
+        // to leave the whole chart blank).
+        int total = 0;
         int i = 0;
         while (i < m.series.Count) {
-            names.Add(m.series[i].name);
+            List<int> vs = m.series[i].values;
             int v = 0;
-            if (m.series[i].values.Count > 0) { v = m.series[i].values[0]; }
-            values.Add(v);
+            if (vs.Count > 0) { v = vs[0]; }
+            total = total + v;
             i = i + 1;
         }
-        // Grow: sweep the visible slices from 0 to their full angle. Reuse the
-        // static PieCore by scaling values by g (angles are proportional).
-        List<int> grown = new List<int>();
+        if (total <= 0) { return; }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (areaH / 2 < rOuter) { rOuter = areaH / 2; }
+        if (rOuter < app.Scale(10)) { rOuter = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int rInner = rOuter * innerPct / 100;
+        int sweepMax = 360 * g / 1000;
+
+        int acc = 0;
+        int k = 0;
+        while (k < m.series.Count) {
+            List<int> vs = m.series[k].values;
+            int v = 0;
+            if (vs.Count > 0) { v = vs[0]; }
+            int a0 = acc * 360 / total;
+            int a1 = (acc + v) * 360 / total;
+            int aEnd = a1;
+            if (aEnd > sweepMax) { aEnd = sweepMax; }
+            if (aEnd > a0) {
+                c.FillSector(cx, cy, rInner, rOuter, a0, aEnd, m.series[k].color);
+            }
+            acc = acc + v;
+            k = k + 1;
+        }
+
+        // Donut centre caption: the running total, so the hole is informative.
+        if (rInner > app.Scale(18)) {
+            string tot = Convert.ToString(total);
+            int tw = Canvas.MeasureText(tot, t.fontSizeLarge);
+            c.DrawText(cx - tw / 2, cy - Canvas.FontHeight(t.fontSizeLarge) / 2,
+                tot, t.textPrimary, t.fontSizeLarge);
+        }
+
+        // Legend: swatch + name + percent (always drawn).
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
         int j = 0;
-        while (j < values.Count) { grown.Add(values[j] * g / 1000); j = j + 1; }
-        Chart.PieCore(app, x, y, w, h, m.title, names, grown, innerPct);
+        while (j < m.series.Count) {
+            List<int> vs = m.series[j].values;
+            int v = 0;
+            if (vs.Count > 0) { v = vs[0]; }
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, m.series[j].color);
+            int pct = v * 100 / total;
+            string lbl = m.series[j].name + "  " + Convert.ToString(pct) + "%";
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
     }
 
     // ---- scatter (point radius grows with g) ----
@@ -1024,6 +1115,225 @@ class ChartView {
     static void DrawScatter(App app, int x, int y, int w, int h,
                             ChartModel m, int color, int g) {
         Chart.Scatter(app, x, y, w, h, m.title, m.scatterX, m.scatterY, color);
+    }
+
+    // ---- shared panel chrome: bg + border + title, returns content top y ----
+
+    static int PanelHead(App app, int x, int y, int w, int h, string title) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+    }
+
+    // ---- gauge (half-ring speedometer; sweep grows with g) ----
+
+    static void DrawGauge(App app, int x, int y, int w, int h,
+                          ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        int val = 0;
+        if (m.series.Count > 0) {
+            List<int> vs0 = m.series[0].values;
+            if (vs0.Count > 0) { val = vs0[0]; }
+        }
+        int max = o.gaugeMax;
+        if (max <= 0) { max = 100; }
+        if (val < 0) { val = 0; }
+        if (val > max) { val = max; }
+        int color = t.primary;
+        if (m.series.Count > 0) { color = m.series[0].color; }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (rOuter > areaH - app.Scale(16)) { rOuter = areaH - app.Scale(16); }
+        if (rOuter < app.Scale(20)) { rOuter = app.Scale(20); }
+        int cx = x + w / 2;
+        int cy = top + rOuter;
+        int ring = rOuter * 32 / 100;
+        int rInner = rOuter - ring;
+
+        // Track (top semicircle split into left/right halves to avoid 0/360 wrap)
+        c.FillSector(cx, cy, rInner, rOuter, 270, 360, t.bgTertiary);
+        c.FillSector(cx, cy, rInner, rOuter, 0, 90, t.bgTertiary);
+
+        // Value arc, swept clockwise from the left (270 deg) and animated by g.
+        int sweep = 180 * val / max;
+        sweep = sweep * g / 1000;
+        int leftDeg = sweep;
+        if (leftDeg > 90) { leftDeg = 90; }
+        if (leftDeg > 0) {
+            c.FillSector(cx, cy, rInner, rOuter, 270, 270 + leftDeg, color);
+        }
+        if (sweep > 90) {
+            c.FillSector(cx, cy, rInner, rOuter, 0, sweep - 90, color);
+        }
+
+        // Big centred value + 0 / max end labels.
+        string vs = Convert.ToString(val);
+        int tw = Canvas.MeasureText(vs, t.fontSizeLarge);
+        c.DrawText(cx - tw / 2, cy - Canvas.FontHeight(t.fontSizeLarge) - app.Scale(2),
+            vs, t.textPrimary, t.fontSizeLarge);
+        c.DrawText(cx - rOuter, cy + app.Scale(4), "0", t.textTertiary, t.fontSizeSmall);
+        string mxs = Convert.ToString(max);
+        int mw = Canvas.MeasureText(mxs, t.fontSizeSmall);
+        c.DrawText(cx + rOuter - mw, cy + app.Scale(4), mxs, t.textTertiary, t.fontSizeSmall);
+    }
+
+    // ---- radial bars (concentric progress rings; sweep grows with g) ----
+
+    static void DrawRadialBars(App app, int x, int y, int w, int h,
+                               ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        int max = o.gaugeMax;
+        if (max <= 0) { max = 100; }
+        int n = m.series.Count;
+        if (n < 1) { return; }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rMax = areaW / 2;
+        if (areaH / 2 < rMax) { rMax = areaH / 2; }
+        if (rMax < app.Scale(20)) { rMax = app.Scale(20); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+
+        int band = rMax * 70 / 100 / n;
+        int gap = band * 22 / 100;
+        int i = 0;
+        while (i < n) {
+            int ringOuter = rMax - i * band;
+            int ringInner = ringOuter - band + gap;
+            if (ringInner < 0) { ringInner = 0; }
+            List<int> vsi = m.series[i].values;
+            int val = 0;
+            if (vsi.Count > 0) { val = vsi[0]; }
+            if (val < 0) { val = 0; }
+            if (val > max) { val = max; }
+            c.FillSector(cx, cy, ringInner, ringOuter, 0, 360, t.bgTertiary);
+            int sweep = 360 * val / max;
+            sweep = sweep * g / 1000;
+            if (sweep > 0) {
+                c.FillSector(cx, cy, ringInner, ringOuter, 0, sweep, m.series[i].color);
+            }
+            i = i + 1;
+        }
+
+        // Legend: swatch + name + value.
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        int j = 0;
+        while (j < n) {
+            List<int> vsj = m.series[j].values;
+            int val = 0;
+            if (vsj.Count > 0) { val = vsj[0]; }
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, m.series[j].color);
+            string lbl = m.series[j].name + "  " + Convert.ToString(val);
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
+    }
+
+    // ---- heatmap (row=series, col=value index; intensity fades in with g) ----
+
+    static void DrawHeatmap(App app, int x, int y, int w, int h,
+                            ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        int rows = m.series.Count;
+        if (rows < 1) { return; }
+        int cols = 0;
+        int r = 0;
+        while (r < rows) {
+            List<int> vr = m.series[r].values;
+            if (vr.Count > cols) { cols = vr.Count; }
+            r = r + 1;
+        }
+        if (cols < 1) { return; }
+
+        // Global min/max for the colour ramp.
+        List<int> v0 = m.series[0].values;
+        int lo = 0;
+        if (v0.Count > 0) { lo = v0[0]; }
+        int hi = lo;
+        r = 0;
+        while (r < rows) {
+            List<int> vr = m.series[r].values;
+            int cc = 0;
+            while (cc < vr.Count) {
+                int v = vr[cc];
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+                cc = cc + 1;
+            }
+            r = r + 1;
+        }
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+
+        int rowLabelW = app.Scale(56);
+        int colHeadH = app.Scale(16);
+        int gridX = x + pad + rowLabelW;
+        int gridY = top + colHeadH;
+        int gridW = w - pad * 2 - rowLabelW;
+        int gridH = (y + h - pad) - gridY;
+        int cellW = gridW / cols;
+        int cellH = gridH / rows;
+        if (cellW < 1 || cellH < 1) { return; }
+        int cellGap = app.Scale(2);
+
+        // Column headers (category labels).
+        int ci = 0;
+        while (ci < cols) {
+            if (ci < m.labels.Count) {
+                c.DrawTextCentered(gridX + ci * cellW, top, cellW, colHeadH,
+                    m.labels[ci], t.textTertiary, t.fontSizeSmall);
+            }
+            ci = ci + 1;
+        }
+
+        r = 0;
+        while (r < rows) {
+            // Row label (series name).
+            c.DrawText(x + pad, gridY + r * cellH + (cellH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                m.series[r].name, t.textSecondary, t.fontSizeSmall);
+            List<int> vr = m.series[r].values;
+            int cc = 0;
+            while (cc < cols) {
+                int v = lo;
+                if (cc < vr.Count) { v = vr[cc]; }
+                int inten = (v - lo) * 1000 / span;
+                inten = inten * g / 1000;
+                int cellCol = App.LerpColor(t.bgTertiary, m.series[r].color, inten);
+                int bx = gridX + cc * cellW;
+                int by = gridY + r * cellH;
+                c.FillRoundRect(bx, by, cellW - cellGap, cellH - cellGap,
+                    t.borderRadiusSmall, cellCol);
+                cc = cc + 1;
+            }
+            r = r + 1;
+        }
     }
 
     // ---- hover crosshair + value tooltip (cartesian charts) ----
