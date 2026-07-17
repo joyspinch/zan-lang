@@ -182,6 +182,7 @@ class Demo {
             ci = ci + 1;
         }
     }
+
 }
 
 class Gallery {
@@ -1044,14 +1045,68 @@ class Gallery {
         c.DrawText(cpContentX + cpIconSz + cpGap,
             cpY + (cpH - Canvas.FontHeight(fs)) / 2, "Copy", 0xFFFFFFFF, fs);
         if (app.window.EventKind() == 3 && cpHot) {
-            Clipboard.SetText(src);
+            // Copy the current selection when there is one, else the whole snippet.
+            string toCopy = src;
+            if (Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(codeLines); }
+            Clipboard.SetText(toCopy);
             app.RequestRedraw();
+        }
+
+        // Drag to select text in the code body: press sets the anchor, moving
+        // with the button held extends the selection, release finalises it.
+        int textTop = codeY0;
+        int textBottom = codeY0 + codeLines.Count * codeLineH;
+        int ek = app.window.EventKind();
+        bool inCode = !app.PointerCaptured()
+            && app.mouseX >= cx && app.mouseX < cx + cw
+            && app.mouseY >= textTop && app.mouseY < textBottom;
+        if (ek == 2 && inCode) {
+            int ll = Gallery.HitLine(codeLines, 0, app.mouseY, codeY0, codeLineH);
+            int cc = Gallery.ColAt(codeLines[ll], fs, app.mouseX - textX);
+            Gallery.selAL = ll; Gallery.selAC = cc;
+            Gallery.selFL = ll; Gallery.selFC = cc;
+            Gallery.selDrag = true;
+            app.RequestRedraw();
+        } else if (ek == 1 && Gallery.selDrag) {
+            int ll = Gallery.HitLine(codeLines, 0, app.mouseY, codeY0, codeLineH);
+            int cc = Gallery.ColAt(codeLines[ll], fs, app.mouseX - textX);
+            Gallery.selFL = ll; Gallery.selFC = cc;
+            app.RequestRedraw();
+        } else if (ek == 3 && Gallery.selDrag) {
+            Gallery.selDrag = false;
+            app.RequestRedraw();
+        }
+
+        // Normalised selection bounds (start <= end) for the highlight pass.
+        bool showSel = Gallery.SelNonEmpty();
+        int nl0 = Gallery.selAL; int nc0 = Gallery.selAC;
+        int nl1 = Gallery.selFL; int nc1 = Gallery.selFC;
+        if (nl1 < nl0 || (nl1 == nl0 && nc1 < nc0)) {
+            nl0 = Gallery.selFL; nc0 = Gallery.selFC;
+            nl1 = Gallery.selAL; nc1 = Gallery.selAC;
         }
 
         int codeY = codeY0;
         int ci = 0;
         int segBase = 0;
         while (ci < codeLines.Count) {
+            // Selection highlight behind this line's text.
+            if (showSel && ci >= nl0 && ci <= nl1) {
+                int lineLen = codeLines[ci].Length;
+                int sc = 0;
+                if (ci == nl0) { sc = nc0; }
+                int ec = lineLen;
+                if (ci == nl1) { ec = nc1; }
+                if (sc < 0) { sc = 0; }
+                if (sc > lineLen) { sc = lineLen; }
+                if (ec > lineLen) { ec = lineLen; }
+                if (ec < sc) { ec = sc; }
+                int hx0 = textX + Canvas.MeasureText(codeLines[ci].Substring(0, sc), fs);
+                int hx1 = textX + Canvas.MeasureText(codeLines[ci].Substring(0, ec), fs);
+                if (hx1 < hx0 + app.Scale(2)) { hx1 = hx0 + app.Scale(4); }
+                c.FillRect(hx0, codeY - app.Scale(1), hx1 - hx0,
+                    codeLineH, 0x553B82F6);
+            }
             c.DrawText(cx + gutterW - gnW - app.Scale(6), codeY,
                 Convert.ToString(ci + 1), t.textTertiary, fs);
             // Cached highlight spans for this line: [segBase, segBase+n).
@@ -1095,6 +1150,22 @@ class Gallery {
         if (hl < 0) { hl = 0; }
         if (hl >= lines.Count) { hl = lines.Count - 1; }
         return hl;
+    }
+
+    /// Maps a horizontal offset (px, relative to the text origin) to a caret
+    /// column inside `line`, snapping to the nearer character boundary.
+    static int ColAt(string line, int fs, int localX) {
+        if (localX <= 0) { return 0; }
+        int n = line.Length;
+        int col = 0;
+        int prevW = 0;
+        while (col < n) {
+            int w = Canvas.MeasureText(line.Substring(0, col + 1), fs);
+            if (localX < (prevW + w) / 2) { return col; }
+            prevW = w;
+            col = col + 1;
+        }
+        return n;
     }
 
     /// True when the current selection spans at least one character.
