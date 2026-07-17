@@ -1,9 +1,21 @@
 param(
     [string]$Version = "3.4.12",
-    [string]$Compiler = "C:\TDM-GCC-64\bin\x86_64-w64-mingw32-gcc.exe"
+    [string]$Compiler = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+# Resolve the MinGW C compiler used to build the SDL3 bridge DLL. Prefer an
+# explicit -Compiler, then a local TDM-GCC install, then any MinGW gcc on PATH
+# (e.g. the msys2/choco mingw used in CI).
+if (-not $Compiler) {
+    $Compiler = "C:\TDM-GCC-64\bin\x86_64-w64-mingw32-gcc.exe"
+    if (-not (Test-Path -LiteralPath $Compiler)) {
+        $cc = Get-Command x86_64-w64-mingw32-gcc, gcc -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+        if ($cc) { $Compiler = $cc.Source }
+    }
+}
 
 $root = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $root "stdlib\SDL3\native\zan_sdl3.c"
