@@ -1246,6 +1246,10 @@ static bool class_has_virtual_methods(zan_symbol_t *sym) {
             return true;
         }
     }
+    /* a class implementing an interface needs a field-0 vtable pointer to serve
+     * as a runtime type tag for interface (tag) dispatch, even with no virtual
+     * methods of its own. */
+    if (sym->type && sym->type->interface_count > 0) return true;
     /* check base class */
     if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
         return class_has_virtual_methods(sym->type->base_type->sym);
@@ -1854,6 +1858,22 @@ static zan_symbol_t *expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e,
     zan_type_t *t = infer_expr_type(g, e, locals);
     if (t && (t->kind == TYPE_CLASS || t->kind == TYPE_STRUCT)) return t->sym;
     return NULL;
+}
+
+/* True when class `cls` (or one of its base classes) declares `iface` — or an
+ * interface that itself extends `iface` — in its implements list. */
+static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {
+    if (!cls || !cls->type || !iface) return false;
+    for (int i = 0; i < cls->type->interface_count; i++) {
+        zan_type_t *it = cls->type->interfaces[i];
+        if (!it || !it->sym) continue;
+        if (it->sym == iface) return true;
+        if (it->sym != cls && class_implements_iface(it->sym, iface)) return true;
+    }
+    if (cls->type->base_type && cls->type->base_type->sym &&
+        cls->type->base_type->sym != cls)
+        return class_implements_iface(cls->type->base_type->sym, iface);
+    return false;
 }
 
 static bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method) {
@@ -6355,6 +6375,107 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             return result;
                         }
                     }
+                }
+            }
+        }
+
+        /* interface method dispatch: <expr>.Method(args) where <expr>'s static
+         * type is an interface. The concrete class is unknown at compile time,
+         * so compare the object's field-0 vtable pointer (a per-class tag)
+         * against every class implementing the interface and call the matching
+         * implementation. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_type_t *obj_ty = infer_expr_type(g, callee->member.object, locals);
+            if (obj_ty && obj_ty->kind == TYPE_INTERFACE && obj_ty->sym && g->current_fn) {
+                zan_symbol_t *iface = obj_ty->sym;
+                zan_symbol_t *iface_m = resolve_overload(iface, callee->member.name,
+                                                         expr->call.args.count);
+                if (iface_m) {
+                    LLVMContextRef c = g->ctx;
+                    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+                    zan_type_t *rty = NULL;
+                    if (iface_m->decl && iface_m->decl->kind == AST_METHOD_DECL &&
+                        iface_m->decl->method_decl.return_type)
+                        rty = zan_binder_resolve_type(g->binder,
+                                  iface_m->decl->method_decl.return_type);
+                    bool has_res = rty && rty->kind != TYPE_VOID;
+                    LLVMTypeRef res_ty = has_res ? map_type(g, rty) : NULL;
+
+                    int uargc = expr->call.args.count;
+                    /* emit receiver + argument values once, before branching */
+                    LLVMValueRef recv = emit_expr(g, callee->member.object, locals);
+                    LLVMValueRef *avals = (LLVMValueRef *)calloc((size_t)(uargc > 0 ? uargc : 1),
+                                                                sizeof(LLVMValueRef));
+                    for (int k = 0; k < uargc; k++)
+                        avals[k] = emit_arg_typed(g, expr->call.args.items[k],
+                                                  method_param_type(g, iface_m, k), locals);
+                    LLVMValueRef recv_pp = LLVMBuildBitCast(g->builder, recv,
+                                              LLVMPointerType(i8ptr, 0), "ifc.recvpp");
+                    LLVMValueRef tag = LLVMBuildLoad2(g->builder, i8ptr, recv_pp, "ifc.tag");
+
+                    LLVMBasicBlockRef merge = LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.merge");
+                    int cap = g->struct_type_count + 1;
+                    LLVMValueRef *phi_vals = (LLVMValueRef *)calloc((size_t)cap, sizeof(LLVMValueRef));
+                    LLVMBasicBlockRef *phi_bbs = (LLVMBasicBlockRef *)calloc((size_t)cap, sizeof(LLVMBasicBlockRef));
+                    int np = 0;
+
+                    for (int si = 0; si < g->struct_type_count; si++) {
+                        zan_symbol_t *cls = g->struct_types[si].sym;
+                        if (!cls || !class_implements_iface(cls, iface)) continue;
+                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc);
+                        if (!impl_m) continue;
+                        LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
+                        for (int fi = 0; fi < g->function_count; fi++)
+                            if (g->functions[fi].sym == impl_m) {
+                                ifn = g->functions[fi].fn; ifnty = g->functions[fi].fn_type; break;
+                            }
+                        if (!ifn || !ifnty) continue;
+
+                        LLVMBasicBlockRef callbb = LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.call");
+                        LLVMBasicBlockRef nextbb = LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.next");
+                        LLVMValueRef tagc = LLVMConstBitCast(get_vtable_global(g, cls), i8ptr);
+                        LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntEQ, tag, tagc, "ifc.eq");
+                        LLVMBuildCondBr(g->builder, cmp, callbb, nextbb);
+
+                        LLVMPositionBuilderAtEnd(g->builder, callbb);
+                        unsigned npar = LLVMCountParamTypes(ifnty);
+                        LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
+                        LLVMGetParamTypes(ifnty, pts);
+                        int cargc = uargc + 1;
+                        LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
+                        ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, recv, pts[0], "ifc.this") : recv;
+                        for (int k = 0; k < uargc; k++)
+                            ca[k + 1] = (k + 1 < (int)npar)
+                                ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];
+                        const char *cn = has_res ? "ifccall" : "";
+                        LLVMValueRef r = LLVMBuildCall2(g->builder, ifnty, ifn, ca, (unsigned)cargc, cn);
+                        if (has_res) {
+                            r = emit_boundary_coerce(g, r, res_ty);
+                            phi_vals[np] = r; phi_bbs[np] = LLVMGetInsertBlock(g->builder); np++;
+                        }
+                        LLVMBuildBr(g->builder, merge);
+                        free(ca); free(pts);
+                        LLVMPositionBuilderAtEnd(g->builder, nextbb);
+                    }
+
+                    /* no matching class: yield a null/zero result */
+                    if (has_res) {
+                        phi_vals[np] = LLVMConstNull(res_ty);
+                        phi_bbs[np] = LLVMGetInsertBlock(g->builder); np++;
+                    }
+                    LLVMBuildBr(g->builder, merge);
+                    LLVMPositionBuilderAtEnd(g->builder, merge);
+                    LLVMValueRef result;
+                    if (has_res) {
+                        LLVMValueRef phi = LLVMBuildPhi(g->builder, res_ty, "ifc.res");
+                        LLVMAddIncoming(phi, phi_vals, phi_bbs, (unsigned)np);
+                        result = phi;
+                    } else {
+                        result = LLVMConstInt(LLVMInt32TypeInContext(c), 0, 0);
+                    }
+                    free(avals); free(phi_vals); free(phi_bbs);
+                    return result;
                 }
             }
         }
