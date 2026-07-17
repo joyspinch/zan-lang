@@ -117,14 +117,27 @@ class Tabs {
     int closedIndex;
     int addedIndex;
 
-    bool menuOpen;
+    SignalBool menuOpen;
     int menuTab;
     int menuX;
     int menuY;
+    SignalInt menuAction;
+    SignalInt menuSub;
+    int menuBaseId;
 
     UiEvent TabChanged;
     UiEvent TabClosed;
     UiEvent TabAdded;
+
+    /// UI language for the built-in context-menu labels (0 = English,
+    /// 1 = 简体中文). The host sets this before rendering so the menu follows
+    /// the app language.
+    static int lang;
+
+    static string TT(string en, string zh) {
+        if (Tabs.lang == 1) { return zh; }
+        return en;
+    }
 
     static int Line() { return 0; }
     static int Card() { return 1; }
@@ -154,10 +167,13 @@ class Tabs {
         b.changedIndex = 0 - 1;
         b.closedIndex = 0 - 1;
         b.addedIndex = 0 - 1;
-        b.menuOpen = false;
+        b.menuOpen = SignalBool.Create(false);
         b.menuTab = 0;
         b.menuX = 0;
         b.menuY = 0;
+        b.menuAction = SignalInt.Create(0 - 1);
+        b.menuSub = SignalInt.Create(0 - 1);
+        b.menuBaseId = WidgetId.Block(256);
         b.TabChanged = UiEvent.Create();
         b.TabClosed = UiEvent.Create();
         b.TabAdded = UiEvent.Create();
@@ -241,7 +257,7 @@ class Tabs {
     int TabWidth(App app, int i) {
         Theme t = app.theme;
         int w = Canvas.MeasureText(labels[i], t.fontSizeMedium) + t.paddingLarge * 2;
-        if (closable[i]) { w = w + app.Scale(18); }
+        if (closable[i]) { w = w + app.Scale(18) + app.Scale(6); }
         return w;
     }
 
@@ -270,7 +286,9 @@ class Tabs {
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
         bool leftUp = ek == 3 && eb == 0;
-        bool rightDown = ek == 2 && eb == 1;
+        bool rightUp = ek == 3 && eb == 1;
+
+        this.ApplyMenuAction();
 
         // The "+" add button is a fixed trailing control (outside the scrolled
         // viewport); overflow chevrons sit just left of it when needed.
@@ -344,7 +362,7 @@ class Tabs {
                 && app.mouseY >= y && app.mouseY < y + tabH;
 
             int closeW = app.Scale(18);
-            int closeX = tabX + tw - closeW;
+            int closeX = tabX + tw - closeW - app.Scale(6);
             bool overClose = closable[i] && overTab
                 && app.mouseX >= closeX && app.mouseX < closeX + closeW;
 
@@ -374,7 +392,7 @@ class Tabs {
             int tc = States.TextMuted(t, overTab, isActive, false);
             if (style == 2 && isActive) { tc = t.textPrimary; }
             int labelW = tw;
-            if (closable[i]) { labelW = tw - closeW; }
+            if (closable[i]) { labelW = tw - closeW - app.Scale(6); }
             c.DrawTextCentered(tabX, y, labelW, tabH, labels[i], tc, t.fontSizeMedium);
 
             if (closable[i]) {
@@ -392,18 +410,19 @@ class Tabs {
                 c.FillRect(tabX, y + tabH - 2, tw, 2, t.primary);
             }
 
-            if (!menuOpen) {
+            if (rightUp && overTab) {
+                menuOpen.Set(true);
+                menuTab = i;
+                menuX = app.mouseX;
+                menuY = app.mouseY;
+                menuSub.Set(0 - 1);
+                app.RequestRedraw();
+            } else if (!menuOpen.Get()) {
                 if (leftUp && overClose) {
                     this.CloseAt(i);
                     app.RequestRedraw();
                 } else if (leftUp && overTab) {
                     this.Select(i);
-                    app.RequestRedraw();
-                } else if (rightDown && overTab) {
-                    menuOpen = true;
-                    menuTab = i;
-                    menuX = app.mouseX;
-                    menuY = app.mouseY;
                     app.RequestRedraw();
                 }
             }
@@ -426,7 +445,7 @@ class Tabs {
                 addColor = t.primary;
             }
             Icon.DrawCenteredIn(c, "plus", ax, y, addW, tabH, t.iconSizeSmall, addColor);
-            if (leftUp && overAdd && !menuOpen) {
+            if (leftUp && overAdd && !menuOpen.Get()) {
                 this.AddNew();
                 app.RequestRedraw();
             }
@@ -445,7 +464,7 @@ class Tabs {
                 t.iconSizeSmall, t.textSecondary);
             Icon.DrawCenteredIn(c, "chevron-right", rx, y, chevW, tabH,
                 t.iconSizeSmall, t.textSecondary);
-            if (leftUp && !menuOpen) {
+            if (leftUp && !menuOpen.Get()) {
                 if (overL) {
                     scroll = scroll - app.Scale(80);
                     if (scroll < 0) { scroll = 0; }
@@ -458,9 +477,7 @@ class Tabs {
             }
         }
 
-        if (menuOpen) {
-            this.RenderMenu(app, leftUp);
-        }
+        this.EmitMenu(app);
     }
 
     /// Vertical rail: a column of full-width tab rows, active item highlighted
@@ -475,6 +492,7 @@ class Tabs {
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
         bool leftUp = ek == 3 && eb == 0;
+        bool rightUp = ek == 3 && eb == 1;
 
         if (style == 0) {
             c.FillRect(x + w - 1, y, 1, h, t.divider);
@@ -534,7 +552,14 @@ class Tabs {
                     t.iconSizeSmall, icoColor);
             }
 
-            if (!menuOpen) {
+            if (rightUp && overRow) {
+                menuOpen.Set(true);
+                menuTab = i;
+                menuX = app.mouseX;
+                menuY = app.mouseY;
+                menuSub.Set(0 - 1);
+                app.RequestRedraw();
+            } else if (!menuOpen.Get()) {
                 if (leftUp && overClose) {
                     this.CloseAt(i);
                     app.RequestRedraw();
@@ -560,7 +585,7 @@ class Tabs {
             Icon.DrawCenteredIn(c, "plus", x + app.Scale(4), rowY, app.Scale(20), rowH,
                 t.iconSizeSmall, addColor);
             c.DrawText(x + app.Scale(28), ty, "New tab", addColor, t.fontSizeMedium);
-            if (leftUp && overAdd && !menuOpen) {
+            if (leftUp && overAdd && !menuOpen.Get()) {
                 this.AddNew();
                 app.RequestRedraw();
             }
@@ -569,70 +594,67 @@ class Tabs {
         c.PopClip();
     }
 
-    void RenderMenu(App app, bool leftUp) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-
-        int itemH = app.Scale(30);
-        int mw = app.Scale(150);
-        int pad = app.Scale(4);
-
-        List<string> items = new List<string>();
-        items.Add("Close");
-        items.Add("Close others");
-        items.Add("Close all");
-
-        int mh = items.Count * itemH + pad * 2;
-        int mx = menuX;
-        int my = menuY;
-
-        c.FillRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.borderPrimary, 1);
-        app.BlockHitsRect(mx, my, mw, mh);
-
-        int picked = 0 - 1;
-
-        int i = 0;
-        while (i < items.Count) {
-            int iy = my + pad + i * itemH;
-            bool over = app.mouseX >= mx && app.mouseX < mx + mw
-                && app.mouseY >= iy && app.mouseY < iy + itemH;
-            if (over) {
-                c.FillRoundRect(mx + pad, iy, mw - pad * 2, itemH,
-                    t.borderRadiusSmall, t.bgHover);
+    /// Applies the action chosen from the context menu on a previous frame. The
+    /// overlay writes the picked index into menuAction during the deferred
+    /// overlay pass (after Render), so it is consumed here at the next frame.
+    void ApplyMenuAction() {
+        int picked = menuAction.Get();
+        if (picked < 0) { return; }
+        menuAction.Set(0 - 1);
+        if (picked == 0) {
+            this.CloseAt(menuTab);
+        } else if (picked == 1) {
+            string keep = "";
+            bool keepClose = false;
+            if (menuTab >= 0 && menuTab < labels.Count) {
+                keep = labels[menuTab];
+                keepClose = closable[menuTab];
             }
-            int ty = iy + (itemH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
-            c.DrawText(mx + pad * 3, ty, items[i], t.textPrimary, t.fontSizeMedium);
-            if (leftUp && over) { picked = i; }
-            i = i + 1;
-        }
-
-        if (leftUp) {
-            if (picked == 0) {
-                this.CloseAt(menuTab);
-            } else if (picked == 1) {
-                string keep = "";
-                bool keepClose = false;
-                if (menuTab >= 0 && menuTab < labels.Count) {
-                    keep = labels[menuTab];
-                    keepClose = closable[menuTab];
-                }
-                labels = new List<string>();
-                closable = new List<bool>();
-                if (keep != "") {
-                    labels.Add(keep);
-                    closable.Add(keepClose);
-                }
-                active = 0;
-                closedIndex = menuTab;
-            } else if (picked == 2) {
-                labels = new List<string>();
-                closable = new List<bool>();
-                active = 0;
-                closedIndex = 0;
+            labels = new List<string>();
+            closable = new List<bool>();
+            if (keep != "") {
+                labels.Add(keep);
+                closable.Add(keepClose);
             }
-            menuOpen = false;
-            app.RequestRedraw();
+            active = 0;
+            closedIndex = menuTab;
+        } else if (picked == 2) {
+            labels = new List<string>();
+            closable = new List<bool>();
+            active = 0;
+            closedIndex = 0;
+        } else if (picked == 3) {
+            this.AddNew();
+        } else if (picked == 4) {
+            if (menuTab >= 0 && menuTab < labels.Count) {
+                labels.Add(labels[menuTab]);
+                closable.Add(true);
+                active = labels.Count - 1;
+                addedIndex = active;
+            }
         }
+    }
+
+    /// Enqueues the tab context menu on the framework overlay layer so it always
+    /// paints above later content and closes on an outside press. The menu opens
+    /// on right-button-up so the opening event is a release (kind 3), never the
+    /// press (kind 2) the overlay treats as an outside-click dismissal. Uses the
+    /// shared rich menu component (icons, a group header, a separator and a
+    /// submenu).
+    void EmitMenu(App app) {
+        if (!menuOpen.Get()) { return; }
+        List<MenuItem> items = new List<MenuItem>();
+        items.Add(MenuItem.Header(Tabs.TT("This tab", "当前标签")));
+        items.Add(MenuItem.Shortcut(Tabs.TT("Close", "关闭"), "close",
+            "Ctrl+W", 0));
+        items.Add(MenuItem.Item(Tabs.TT("Close others", "关闭其他"), "minus", 1));
+        items.Add(MenuItem.Item(Tabs.TT("Close all", "关闭全部"), "trash", 2));
+        items.Add(MenuItem.Separator());
+        List<MenuItem> sub = new List<MenuItem>();
+        sub.Add(MenuItem.Item(Tabs.TT("New tab", "新建标签"), "plus", 3));
+        sub.Add(MenuItem.Item(Tabs.TT("Duplicate", "复制标签"), "copy", 4));
+        items.Add(MenuItem.Submenu(Tabs.TT("New", "新建"), "file", sub));
+        app.AddOverlay(OverlayPopup.RichMenu(menuX, menuY, items,
+            menuBaseId, menuAction, menuOpen, menuSub));
     }
 }

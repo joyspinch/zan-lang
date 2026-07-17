@@ -119,4 +119,210 @@ class Ribbon {
         }
         return -1;
     }
+
+    // ------------------------------------------------------------------
+    // Office-style tabbed ribbon: a tab strip over a band of named groups,
+    // each group mixing large (icon-over-label) and small (icon+label row)
+    // commands with a group caption underneath.
+    // ------------------------------------------------------------------
+
+    static int TabStripHeight(App app) { return app.Scale(30); }
+
+    static int HeightTabbed(App app) {
+        return Ribbon.TabStripHeight(app) + app.Scale(96);
+    }
+
+    /// Draws the tab strip plus the active band and returns the global index of
+    /// the command clicked this frame (counting items across all groups in
+    /// order), or -1 if none. `activeTab` is two-way.
+    static int RenderTabbed(App app, int x, int y, int w, List<string> tabs,
+                            SignalInt activeTab, List<RibbonGroup> groups) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int stripH = Ribbon.TabStripHeight(app);
+        int total = 0;
+        int gi = 0;
+        while (gi < groups.Count) { total = total + groups[gi].items.Count; gi = gi + 1; }
+
+        int stripId = app.focus.AllocId();
+        int ti = 1;
+        while (ti < tabs.Count) { app.focus.AllocId(); ti = ti + 1; }
+        int firstId = app.focus.AllocId();
+        int ii = 1;
+        while (ii < total) { app.focus.AllocId(); ii = ii + 1; }
+
+        // ---- tab strip ----
+        c.FillRect(x, y, w, stripH, t.bgTertiary);
+        int active = activeTab.Get();
+        int tx = x + t.paddingSmall;
+        int k = 0;
+        while (k < tabs.Count) {
+            int tabId = stripId + k;
+            int tw = Canvas.MeasureText(tabs[k], t.fontSizeMedium) + t.paddingLarge * 2;
+            bool isActive = k == active;
+            int hv = Ui.HoverLevel(app, tabId);
+            int tc = t.textSecondary;
+            if (isActive) {
+                c.FillRect(tx, y, tw, stripH, t.bgSecondary);
+                c.FillRect(tx, y, tw, app.Scale(2), t.primary);
+                tc = t.primary;
+            } else if (hv > 0) {
+                c.FillRect(tx, y, tw, stripH, App.ScaleAlpha(t.bgHover, hv));
+                tc = t.textPrimary;
+            }
+            c.DrawTextCentered(tx, y, tw, stripH, tabs[k], tc, t.fontSizeMedium);
+            app.hitTester.Register(HitRegion.Create(tabId, tx, y, tw, stripH, 0));
+            if (app.window.EventKind() == 3
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == tabId) {
+                activeTab.Set(k);
+                app.RequestRedraw();
+            }
+            tx = tx + tw;
+            k = k + 1;
+        }
+
+        // ---- band ----
+        int by = y + stripH;
+        int bh = Ribbon.HeightTabbed(app) - stripH;
+        c.FillRect(x, by, w, bh, t.bgSecondary);
+        c.FillRect(x, by + bh - 1, w, 1, t.divider);
+
+        int titleH = app.Scale(16);
+        int contentTop = by + t.paddingSmall;
+        int contentH = bh - titleH - t.paddingSmall * 2;
+
+        int cx = x + t.paddingSmall;
+        int clicked = 0 - 1;
+        int baseIdx = 0;
+        int g = 0;
+        while (g < groups.Count) {
+            RibbonGroup grp = groups[g];
+            int groupStartX = cx;
+
+            // small commands stack 3-high per column; large take a full column.
+            int sIdx = 0;
+            int j = 0;
+            while (j < grp.items.Count) {
+                RibbonItem it = grp.items[j];
+                int id = firstId + baseIdx + j;
+                if (it.small) {
+                    int colW = app.Scale(104);
+                    int rowH = contentH / 3;
+                    int rx = cx;
+                    int ry = contentTop + (sIdx % 3) * rowH;
+                    Ribbon.PaintItem(app, id, it, rx, ry, colW, rowH, true);
+                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
+                    sIdx = sIdx + 1;
+                    if (sIdx % 3 == 0) { cx = cx + colW; }
+                } else {
+                    // flush any partial small column first
+                    if (sIdx % 3 != 0) { cx = cx + app.Scale(104); sIdx = 0; }
+                    int lw = app.Scale(64);
+                    Ribbon.PaintItem(app, id, it, cx, contentTop, lw, contentH, false);
+                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
+                    cx = cx + lw;
+                }
+                j = j + 1;
+            }
+            if (sIdx % 3 != 0) { cx = cx + app.Scale(104); }
+
+            // group caption + trailing separator
+            c.DrawTextCentered(groupStartX, by + bh - titleH - t.paddingTiny,
+                cx - groupStartX, titleH, grp.title, t.textTertiary, t.fontSizeSmall);
+            cx = cx + t.paddingSmall;
+            c.FillRect(cx, by + t.paddingSmall, 1, bh - t.paddingSmall * 2, t.divider);
+            cx = cx + t.paddingSmall + 1;
+
+            baseIdx = baseIdx + grp.items.Count;
+            g = g + 1;
+        }
+        return clicked;
+    }
+
+    static void PaintItem(App app, int id, RibbonItem it, int x, int y, int w, int h,
+                          bool small) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int hv = 0;
+        int pv = 0;
+        if (it.enabled) { hv = Ui.HoverLevel(app, id); pv = Ui.PressLevel(app, id); }
+        if (hv > 0) {
+            c.FillRoundRect(x, y, w, h, t.borderRadiusSmall, App.ScaleAlpha(t.bgHover, hv));
+        }
+        if (pv > 0) {
+            c.FillRoundRect(x, y, w, h, t.borderRadiusSmall, App.ScaleAlpha(t.bgActive, pv));
+        }
+        int color = App.LerpColor(t.textSecondary, t.primary, hv);
+        if (!it.enabled) { color = t.textDisabled; }
+
+        if (small) {
+            int isz = t.iconSizeSmall;
+            int iy = y + (h - isz) / 2;
+            Icon.DrawCenteredIn(c, it.icon, x + app.Scale(4), iy, isz, isz, isz, color);
+            int tx = x + app.Scale(4) + isz + t.gapSmall;
+            int ty = y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+            c.DrawText(tx, ty, it.label, color, t.fontSizeSmall);
+        } else {
+            int isz = t.iconSizeLarge;
+            int labelH = Canvas.FontHeight(t.fontSizeSmall);
+            int blockH = isz + t.paddingTiny + labelH;
+            int iy = y + (h - blockH) / 2;
+            Icon.DrawCenteredIn(c, it.icon, x, iy, w, isz, isz, color);
+            c.DrawTextCentered(x, iy + isz + t.paddingTiny, w, labelH, it.label,
+                color, t.fontSizeSmall);
+        }
+        if (it.enabled) {
+            app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+        }
+    }
+
+    static bool ItemClicked(App app, int id, RibbonItem it) {
+        if (!it.enabled) { return false; }
+        return app.window.EventKind() == 3
+            && app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+    }
+}
+
+/// One command inside an Office-style ribbon group. `small` renders the compact
+/// icon+label row form (three stack per column); otherwise it is a large
+/// icon-over-label button.
+class RibbonItem {
+    string icon;
+    string label;
+    bool small;
+    bool enabled;
+
+    static RibbonItem Large(string icon, string label) {
+        RibbonItem r = new RibbonItem();
+        r.icon = icon;
+        r.label = label;
+        r.small = false;
+        r.enabled = true;
+        return r;
+    }
+
+    static RibbonItem Small(string icon, string label) {
+        RibbonItem r = RibbonItem.Large(icon, label);
+        r.small = true;
+        return r;
+    }
+
+    RibbonItem Disable() { enabled = false; return this; }
+}
+
+/// A named group of ribbon commands, drawn as a captioned cluster separated
+/// from its neighbours by a vertical rule.
+class RibbonGroup {
+    string title;
+    List<RibbonItem> items;
+
+    static RibbonGroup Create(string title) {
+        RibbonGroup g = new RibbonGroup();
+        g.title = title;
+        g.items = new List<RibbonItem>();
+        return g;
+    }
+
+    RibbonGroup Add(RibbonItem it) { items.Add(it); return this; }
 }

@@ -542,6 +542,82 @@ class HitTester {
 }
 
 /// <summary>
+/// One entry of a rich context menu (see <see cref="OverlayPopup.RichMenu"/>).
+/// `kind`: 0 = clickable item, 1 = separator, 2 = group header, 3 = submenu
+/// parent (its `children` open in a side panel on hover). `action` is the value
+/// written back to the caller's result signal when a leaf item is chosen.
+/// </summary>
+class MenuItem {
+    int kind;
+    string label;
+    string icon;
+    string shortcut;
+    int action;
+    bool disabled;
+    List<MenuItem> children;
+
+    static MenuItem Item(string label, string icon, int action) {
+        MenuItem m = new MenuItem();
+        m.kind = 0;
+        m.label = label;
+        m.icon = icon;
+        m.shortcut = "";
+        m.action = action;
+        m.disabled = false;
+        m.children = new List<MenuItem>();
+        return m;
+    }
+
+    static MenuItem Shortcut(string label, string icon, string sc, int action) {
+        MenuItem m = MenuItem.Item(label, icon, action);
+        m.shortcut = sc;
+        return m;
+    }
+
+    static MenuItem Disabled(string label, string icon, int action) {
+        MenuItem m = MenuItem.Item(label, icon, action);
+        m.disabled = true;
+        return m;
+    }
+
+    static MenuItem Separator() {
+        MenuItem m = new MenuItem();
+        m.kind = 1;
+        m.label = "";
+        m.icon = "";
+        m.shortcut = "";
+        m.action = 0 - 1;
+        m.disabled = false;
+        m.children = new List<MenuItem>();
+        return m;
+    }
+
+    static MenuItem Header(string label) {
+        MenuItem m = new MenuItem();
+        m.kind = 2;
+        m.label = label;
+        m.icon = "";
+        m.shortcut = "";
+        m.action = 0 - 1;
+        m.disabled = false;
+        m.children = new List<MenuItem>();
+        return m;
+    }
+
+    static MenuItem Submenu(string label, string icon, List<MenuItem> children) {
+        MenuItem m = new MenuItem();
+        m.kind = 3;
+        m.label = label;
+        m.icon = icon;
+        m.shortcut = "";
+        m.action = 0 - 1;
+        m.disabled = false;
+        m.children = children;
+        return m;
+    }
+}
+
+/// <summary>
 /// A framework-owned floating option-list popup (used by Select / SelectBox /
 /// Dropdown / Menu). Zan delegates can't capture locals or bind `this`, so a
 /// popup is described as *data*: the widget hands one to <c>App.AddOverlay</c>
@@ -564,6 +640,36 @@ class OverlayPopup {
     SignalInt scrollModel;
     UiEvent onChange;
     bool showCheck;
+
+    // Rich context-menu mode (icons / separators / group headers / submenus).
+    bool rich;
+    List<MenuItem> menuItems;
+    SignalInt result;
+    SignalInt subOpen;
+
+    /// A rich context menu: a floating panel of `items` (see MenuItem) that
+    /// supports icons, separators, group headers and one level of hover-opened
+    /// submenus. The chosen leaf `action` is written to `result`; the panel
+    /// closes on choice, outside press or Escape. `baseId` must be a stable
+    /// block of at least 256 ids (WidgetId.Block(256)).
+    static OverlayPopup RichMenu(int x, int y, List<MenuItem> items, int baseId,
+                                 SignalInt result, SignalBool openFlag,
+                                 SignalInt subOpen) {
+        OverlayPopup p = new OverlayPopup();
+        p.rich = true;
+        p.x = x;
+        p.y = y;
+        p.w = 0;
+        p.options = new List<string>();
+        p.menuItems = items;
+        p.baseId = baseId;
+        p.result = result;
+        p.openFlag = openFlag;
+        p.subOpen = subOpen;
+        p.triggerId = 0 - 1;
+        p.showCheck = false;
+        return p;
+    }
 
     static OverlayPopup OptionList(int x, int y, int w, List<string> options,
                                    int baseId, SignalInt model, int triggerId,
@@ -598,6 +704,10 @@ class OverlayPopup {
     }
 
     void Render(App app) {
+        if (rich) {
+            this.RenderRich(app);
+            return;
+        }
         Canvas c = app.canvas;
         Theme t = app.theme;
         int count = options.Count;
@@ -722,6 +832,257 @@ class OverlayPopup {
         }
         if (kind == 4 && app.window.EventKeyCode() == 27) {
             openFlag.Set(false);
+            app.RequestRedraw();
+        }
+    }
+
+    /// Panel width for a rich item list: widest label plus the icon column and
+    /// a right gutter (shortcut text / submenu chevron), clamped to a minimum.
+    static int RichWidth(App app, List<MenuItem> items) {
+        Theme t = app.theme;
+        int padH = app.Scale(8);
+        int iconCol = t.iconSizeSmall + app.Scale(10);
+        int maxLbl = 0;
+        int maxRight = 0;
+        int i = 0;
+        while (i < items.Count) {
+            MenuItem m = items[i];
+            if (m.kind == 0 || m.kind == 2 || m.kind == 3) {
+                int lw = Canvas.MeasureText(m.label, t.fontSizeMedium);
+                if (lw > maxLbl) { maxLbl = lw; }
+            }
+            if (m.kind == 0 && m.shortcut != "") {
+                int sw = Canvas.MeasureText(m.shortcut, t.fontSizeSmall);
+                if (sw > maxRight) { maxRight = sw; }
+            }
+            if (m.kind == 3 && t.iconSizeSmall > maxRight) { maxRight = t.iconSizeSmall; }
+            i = i + 1;
+        }
+        int w = padH + iconCol + maxLbl + app.Scale(24) + maxRight + padH;
+        int minW = app.Scale(168);
+        if (w < minW) { w = minW; }
+        return w;
+    }
+
+    /// Panel height for a rich item list (separators and headers are shorter
+    /// than clickable rows).
+    static int RichHeight(App app, List<MenuItem> items) {
+        Theme t = app.theme;
+        int rowH = t.heightMedium;
+        int sepH = app.Scale(9);
+        int hdrH = app.Scale(24);
+        int h = app.Scale(6) * 2;
+        int i = 0;
+        while (i < items.Count) {
+            int k = items[i].kind;
+            if (k == 1) { h = h + sepH; }
+            else if (k == 2) { h = h + hdrH; }
+            else { h = h + rowH; }
+            i = i + 1;
+        }
+        return h;
+    }
+
+    /// Y offset (within the panel) of the item at `upto`, walking row kinds.
+    static int RichRowTop(App app, List<MenuItem> items, int upto, int startY) {
+        Theme t = app.theme;
+        int rowH = t.heightMedium;
+        int sepH = app.Scale(9);
+        int hdrH = app.Scale(24);
+        int yy = startY;
+        int i = 0;
+        while (i < upto) {
+            int k = items[i].kind;
+            if (k == 1) { yy = yy + sepH; }
+            else if (k == 2) { yy = yy + hdrH; }
+            else { yy = yy + rowH; }
+            i = i + 1;
+        }
+        return yy;
+    }
+
+    /// Draws one rich menu panel (icons / separators / headers / submenu
+    /// chevrons) at (px,py) and registers a hit id `idBase + rowIndex` for each
+    /// clickable / submenu row. Returns the row index the cursor is over, or -1.
+    static int PaintRichPanel(App app, List<MenuItem> items, int px, int py,
+                              int pw, int ph, int idBase) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rowH = t.heightMedium;
+        int sepH = app.Scale(9);
+        int hdrH = app.Scale(24);
+        int padV = app.Scale(6);
+        int padH = app.Scale(8);
+        int iconCol = t.iconSizeSmall + app.Scale(10);
+
+        c.FillRoundRect(px + 1, py + 3, pw, ph, t.borderRadiusMedium, t.shadowColor);
+        c.FillRoundRect(px, py, pw, ph, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRoundRect(px, py, pw, ph, t.borderRadiusMedium, t.borderPrimary, 1);
+        app.BlockHitsRect(px, py, pw, ph);
+
+        int hoverRow = 0 - 1;
+        int rowY = py + padV;
+        int i = 0;
+        while (i < items.Count) {
+            MenuItem m = items[i];
+            if (m.kind == 1) {
+                c.FillRect(px + padH, rowY + sepH / 2, pw - padH * 2, 1, t.borderPrimary);
+                rowY = rowY + sepH;
+            } else if (m.kind == 2) {
+                int ty = rowY + (hdrH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+                c.DrawText(px + padH, ty, m.label, t.textTertiary, t.fontSizeSmall);
+                rowY = rowY + hdrH;
+            } else {
+                bool hovered = app.mouseX >= px && app.mouseX < px + pw
+                    && app.mouseY >= rowY && app.mouseY < rowY + rowH;
+                int fg = t.textPrimary;
+                if (m.disabled) { fg = t.textTertiary; }
+                if (hovered && !m.disabled) {
+                    c.FillRect(px + 1, rowY, pw - 2, rowH, t.bgHover);
+                }
+                if (m.icon != "") {
+                    Icon.DrawCenteredIn(c, m.icon, px + padH, rowY,
+                        t.iconSizeSmall, rowH, t.iconSizeSmall, fg);
+                }
+                int ty = rowY + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+                c.DrawText(px + padH + iconCol, ty, m.label, fg, t.fontSizeMedium);
+                if (m.kind == 3) {
+                    Icon.DrawCenteredIn(c, "chevron-right",
+                        px + pw - padH - t.iconSizeSmall, rowY,
+                        t.iconSizeSmall, rowH, t.iconSizeSmall, fg);
+                } else if (m.shortcut != "") {
+                    int sw = Canvas.MeasureText(m.shortcut, t.fontSizeSmall);
+                    c.DrawText(px + pw - padH - sw, ty, m.shortcut,
+                        t.textTertiary, t.fontSizeSmall);
+                }
+                if (hovered) { hoverRow = i; }
+                app.hitTester.Register(HitRegion.Create(idBase + i, px, rowY, pw, rowH, 0));
+                rowY = rowY + rowH;
+            }
+            i = i + 1;
+        }
+        return hoverRow;
+    }
+
+    void RenderRich(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<MenuItem> items = menuItems;
+        int n = items.Count;
+        int margin = app.Scale(4);
+        int cw = c.Width();
+        int ch = c.Height();
+
+        int pw = OverlayPopup.RichWidth(app, items);
+        int ph = OverlayPopup.RichHeight(app, items);
+        int px = x;
+        if (px + pw > cw - margin) { px = cw - margin - pw; }
+        if (px < margin) { px = margin; }
+        int py = y;
+        if (py + ph > ch - margin) { py = ch - margin - ph; }
+        if (py < margin) { py = margin; }
+
+        app.BlockHitsBelow();
+        int overRow = OverlayPopup.PaintRichPanel(app, items, px, py, pw, ph, baseId);
+
+        // Track which submenu (if any) is open. Open on hover of a submenu
+        // parent; keep open while the cursor is over the parent or its child
+        // panel; close when the cursor is over a different (non-submenu) row.
+        int curSub = subOpen.Get();
+        bool overParentSub = overRow >= 0 && overRow < n && items[overRow].kind == 3;
+        bool overOtherRow = overRow >= 0 && !overParentSub;
+
+        int childX = 0;
+        int childY = 0;
+        int childW = 0;
+        int childH = 0;
+        bool haveChild = false;
+        if (curSub >= 0 && curSub < n && items[curSub].kind == 3) {
+            List<MenuItem> kids = items[curSub].children;
+            childW = OverlayPopup.RichWidth(app, kids);
+            childH = OverlayPopup.RichHeight(app, kids);
+            childX = px + pw - app.Scale(4);
+            if (childX + childW > cw - margin) { childX = px - childW + app.Scale(4); }
+            childY = OverlayPopup.RichRowTop(app, items, curSub, py + app.Scale(6));
+            if (childY + childH > ch - margin) { childY = ch - margin - childH; }
+            if (childY < margin) { childY = margin; }
+            haveChild = true;
+        }
+        bool overChild = haveChild
+            && app.mouseX >= childX && app.mouseX < childX + childW
+            && app.mouseY >= childY && app.mouseY < childY + childH;
+
+        int newSub = curSub;
+        if (overParentSub) { newSub = overRow; }
+        else if (overChild) { newSub = curSub; }
+        else if (overOtherRow) { newSub = 0 - 1; }
+        if (newSub != curSub) {
+            subOpen.Set(newSub);
+            app.RequestRedraw();
+        }
+
+        int childOver = 0 - 1;
+        int cx = 0;
+        int cy = 0;
+        int cwd = 0;
+        int chd = 0;
+        bool childOpen = false;
+        if (newSub >= 0 && newSub < n && items[newSub].kind == 3) {
+            List<MenuItem> ck = items[newSub].children;
+            cwd = OverlayPopup.RichWidth(app, ck);
+            chd = OverlayPopup.RichHeight(app, ck);
+            cx = px + pw - app.Scale(4);
+            if (cx + cwd > cw - margin) { cx = px - cwd + app.Scale(4); }
+            cy = OverlayPopup.RichRowTop(app, items, newSub, py + app.Scale(6));
+            if (cy + chd > ch - margin) { cy = ch - margin - chd; }
+            if (cy < margin) { cy = margin; }
+            childOver = OverlayPopup.PaintRichPanel(app, ck, cx, cy, cwd, chd,
+                baseId + 128);
+            childOpen = true;
+        }
+
+        // Interaction is geometry-driven (right-click targets never populate the
+        // primary click/press ids). A leaf activates on left mouse-up over its
+        // row; a click outside both panels (or Escape) dismisses. The menu is
+        // anchored at the opening point, so the opening right-release lands
+        // inside it and never self-dismisses.
+        int kind = app.window.EventKind();
+        int btn = app.window.EventButton();
+        bool inMain = app.mouseX >= px && app.mouseX < px + pw
+            && app.mouseY >= py && app.mouseY < py + ph;
+        bool inChild = childOpen
+            && app.mouseX >= cx && app.mouseX < cx + cwd
+            && app.mouseY >= cy && app.mouseY < cy + chd;
+
+        if (kind == 3 && btn == 0) {
+            if (childOpen && childOver >= 0
+                && childOver < items[newSub].children.Count) {
+                MenuItem hcm = items[newSub].children[childOver];
+                if (hcm.kind == 0 && !hcm.disabled) {
+                    result.Set(hcm.action);
+                    openFlag.Set(false);
+                    subOpen.Set(0 - 1);
+                    app.RequestRedraw();
+                }
+            } else if (overRow >= 0 && overRow < n) {
+                MenuItem hm = items[overRow];
+                if (hm.kind == 0 && !hm.disabled) {
+                    result.Set(hm.action);
+                    openFlag.Set(false);
+                    subOpen.Set(0 - 1);
+                    app.RequestRedraw();
+                }
+            }
+        }
+        bool leftEvt = (kind == 2 || kind == 3) && btn == 0;
+        if (leftEvt && !inMain && !inChild) {
+            openFlag.Set(false);
+            subOpen.Set(0 - 1);
+            app.RequestRedraw();
+        }
+        if (kind == 4 && app.window.EventKeyCode() == 27) {
+            openFlag.Set(false);
+            subOpen.Set(0 - 1);
             app.RequestRedraw();
         }
     }
