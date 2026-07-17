@@ -108,19 +108,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM (libs + clang-cl/llvm-rc)
-        run: choco install llvm --no-progress -y
+      # find_package(LLVM CONFIG) needs the LLVM dev files (headers, import libs
+      # and LLVMConfig.cmake). The chocolatey `llvm` package and the
+      # LLVM-*-win64.exe installer ship only the clang toolchain (no libs/cmake),
+      # so use the official clang+llvm MSVC archive, which is the full dev
+      # distribution and also provides clang-cl/lld-link/llvm-rc. Pinned to the
+      # LLVM version used for local IDE builds.
+      - name: Install LLVM (dev libs + clang-cl, MSVC ABI)
+        shell: pwsh
+        run: |
+          $ver = "20.1.8"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/clang+llvm-$ver-x86_64-pc-windows-msvc.tar.xz"
+          curl.exe -L --retry 3 --retry-all-errors -o llvm.tar.xz $url
+          New-Item -ItemType Directory -Force llvm-dist | Out-Null
+          tar -xf llvm.tar.xz -C llvm-dist --strip-components=1
+          Remove-Item llvm.tar.xz
+          if (-not (Test-Path llvm-dist/lib/cmake/llvm/LLVMConfig.cmake)) {
+            throw "LLVMConfig.cmake missing from the LLVM archive"
+          }
+          "LLVM_ROOT=$PWD/llvm-dist" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$PWD/llvm-dist/bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Install MinGW (bundled linker source for self-contained zanc)
         run: choco install mingw --no-progress -y
 
       - name: Configure + build toolchain (clang-cl)
         shell: pwsh
         run: |
-          $llvm = "C:/Program Files/LLVM"
           $mingw = (Split-Path -Parent (Split-Path -Parent (Get-Command gcc).Source))
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_LINKER=lld-link -DLLVM_DIR="$llvm/lib/cmake/llvm" `
+            -DCMAKE_LINKER=lld-link -DLLVM_DIR="$env:LLVM_ROOT/lib/cmake/llvm" `
             -DZAN_MINGW_ROOT="$mingw"
           cmake --build build -j
 
