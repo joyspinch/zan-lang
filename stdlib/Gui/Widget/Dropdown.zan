@@ -4,11 +4,90 @@ using Gui;
 namespace Gui.Widget;
 
 /// Dropdown: a trigger button that opens a menu of action items.
-/// The caller owns the open/closed state and calls RenderMenu when open.
-class Dropdown {
-    /// Draws the trigger button. Returns its hit id.
-    static int RenderTrigger(App app, int x, int y, int w, int h, string label, bool open) {
-        int id = app.focus.AllocId();
+///
+/// C#-style retained instance — owns its open state and defers the action list
+/// to the framework overlay layer, so the popup always draws above later
+/// content, dims/blocks everything beneath it (no parent/child click-through)
+/// and closes on an outside press or Esc — all through one centralized
+/// dispatch:
+///     Dropdown menu = Dropdown.Create("Actions", items);
+///     menu.Change += () => { int a = menu.Chosen(); ... };
+///     menu.Render(app, x, y, w, h);
+/// Legacy immediate-mode statics (RenderTrigger + RenderMenu) are kept for
+/// callers that drive the open state themselves.
+class Dropdown : Control {
+    List<string> items;
+    string label;
+    int wid;
+    int optBaseId;
+    SignalBool open;
+    SignalInt chosen;
+    SignalInt popupScroll;
+    /// Fires when an action is chosen (C#-style: `menu.Change += h;`).
+    UiEvent Change;
+
+    void InitDropdown(List<string> its, string lbl) {
+        this.InitControl("dropdown", 1);
+        items = its;
+        label = lbl;
+        wid = WidgetId.Next();
+        optBaseId = WidgetId.Block(its.Count);
+        open = SignalBool.Create(false);
+        chosen = SignalInt.Create(-1);
+        popupScroll = SignalInt.Create(0);
+        Change = UiEvent.Create();
+    }
+
+    /// Retained-mode constructor: `Dropdown d = Dropdown.Create("Actions", items);`
+    Dropdown(List<string> its, string lbl) {
+        InitDropdown(its, lbl);
+    }
+
+    static Dropdown Create(string label, List<string> items) {
+        return new Dropdown(items, label);
+    }
+
+    /// Index of the last chosen action, or -1.
+    int Chosen() { return chosen.Get(); }
+    bool IsOpen() { return open.Get(); }
+
+    int Render(App app, int x, int y, int w, int h) {
+        int id = wid;
+        Dropdown.PaintTrigger(app, id, x, y, w, h, label, open.Get());
+        app.focus.RegisterFocusable(id);
+
+        bool toggle = Ui.Clicked(app, id);
+        if (Ui.Focused(app, id) && app.window.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 13 || kc == 32) { toggle = true; }
+        }
+        if (toggle) {
+            if (!open.Get()) { popupScroll.Set(0); }
+            open.Set(!open.Get());
+            app.RequestRedraw();
+        }
+
+        // Defer the action list to the framework overlay layer.
+        if (open.Get()) {
+            int py = y + h + app.Scale(4);
+            app.AddOverlay(OverlayPopup.Menu(x, py, w, items,
+                optBaseId, chosen, id, open, popupScroll, Change));
+        }
+        On.Fire(app, id);
+        return id;
+    }
+
+    override void OnMeasure(App app) {
+        prefH = app.theme.heightMedium;
+        prefW = app.Scale(160);
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
+    }
+
+    /// Draws the trigger button chrome with the given id.
+    static void PaintTrigger(App app, int id, int x, int y, int w, int h, string label, bool open) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
@@ -17,16 +96,23 @@ class Dropdown {
         int border = App.LerpColor(t.borderPrimary, t.borderHover, hv);
 
         c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(x, y, w, h, border, 1);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, border, 1);
         int textY = y + (h - Canvas.FontHeight(t.fontSizeMedium)) / 2;
         c.DrawText(x + t.paddingMedium, textY, label, t.textPrimary, t.fontSizeMedium);
         Icon.DrawCenteredIn(c, "chevron-down", x + w - t.paddingLarge - t.iconSizeSmall, y, t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
 
-        app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 4));
+        app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+    }
+
+    /// Legacy immediate-mode trigger. Returns its hit id.
+    static int RenderTrigger(App app, int x, int y, int w, int h, string label, bool open) {
+        int id = app.focus.AllocId();
+        Dropdown.PaintTrigger(app, id, x, y, w, h, label, open);
         return id;
     }
 
-    /// Draws the open menu of items and returns the first item's hit id.
+    /// Legacy immediate-mode menu (caller owns open state). Draws the open menu
+    /// of items and returns the first item's hit id.
     static int RenderMenu(App app, int x, int y, int w, List<string> items) {
         int firstId = app.focus.AllocId();
         int count = items.Count;
@@ -43,7 +129,7 @@ class Dropdown {
 
         c.FillRoundRect(x + 1, y + 2, w, totalH, t.borderRadiusMedium, t.shadowColor);
         c.FillRoundRect(x, y, w, totalH, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(x, y, w, totalH, t.borderPrimary, 1);
+        c.DrawRoundRect(x, y, w, totalH, t.borderRadiusMedium, t.borderPrimary, 1);
         app.BlockHitsRect(x, y, w, totalH);
 
         i = 0;

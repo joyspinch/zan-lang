@@ -307,10 +307,10 @@ EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 co
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     u32 c = (u32)color;
-    int x0 = clamp_i((int)x, 0, s->width);
-    int y0 = clamp_i((int)y, 0, s->height);
-    int x1 = clamp_i((int)(x + w), 0, s->width);
-    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int x0 = clamp_i((int)x, s->clip_x0, s->clip_x1);
+    int y0 = clamp_i((int)y, s->clip_y0, s->clip_y1);
+    int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
+    int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
     u32 sa = (c >> 24) & 0xFF;
     if (sa == 255) {
         for (int py = y0; py < y1; py++) {
@@ -332,10 +332,10 @@ EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
-    int x0 = clamp_i((int)x, 0, s->width);
-    int y0 = clamp_i((int)y, 0, s->height);
-    int x1 = clamp_i((int)(x + w), 0, s->width);
-    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int x0 = clamp_i((int)x, s->clip_x0, s->clip_x1);
+    int y0 = clamp_i((int)y, s->clip_y0, s->clip_y1);
+    int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
+    int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
     int rh = (int)h;
     if (rh < 1) rh = 1;
     int denom = rh > 1 ? rh - 1 : 1;
@@ -697,12 +697,63 @@ EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
         int ccx = cc[ci][0], ccy = cc[ci][1];
         for (int py = zy[ci]; py < zy[ci] + r; py++) {
             for (int px = zx[ci]; px < zx[ci] + r; px++) {
-                double ddx = px - ccx, ddy = py - ccy;
+                double ddx = (double)(px - ccx);
+                double ddy = (double)(py - ccy);
                 double dist = sqrt(ddx*ddx + ddy*ddy);
-                double cov = r + 0.5 - dist;
+                if (dist <= (double)r - 0.5) {
+                    set_pixel(s, px, py, c);
+                } else if (dist <= (double)r + 0.5) {
+                    set_pixel_aa(s, px, py, c, (int)(((double)r + 0.5 - dist) * 255.0));
+                }
+            }
+        }
+    }
+}
+
+/* Anti-aliased stroked rounded rectangle. Straight edges are crisp (solid
+ * fill_rect between the corners); the four corner arcs are anti-aliased rings
+ * that share the fill's corner centres/radius so the border hugs a matching
+ * fill_rounded_rect exactly instead of the old square DrawRect outline. */
+EXPORT void zan_gui_draw_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 radius, i64 color, i64 thickness) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    u32 c = (u32)color;
+    int ix = (int)x, iy = (int)y, iw = (int)w, ih = (int)h;
+    int r = (int)radius, th = (int)thickness;
+    if (th < 1) th = 1;
+    if (r <= 0) { zan_gui_draw_rect(surface_id, x, y, w, h, color, thickness); return; }
+    if (r > iw/2) r = iw/2;
+    if (r > ih/2) r = ih/2;
+    if (th > r) th = r;
+
+    int xl = ix + r, xr = ix + iw - r;
+    int yt = iy + r, yb = iy + ih - r;
+    /* straight edges (exclude the r-wide corner zones) */
+    zan_gui_fill_rect(surface_id, xl, iy, iw - 2*r, th, color);              /* top    */
+    zan_gui_fill_rect(surface_id, xl, iy + ih - th, iw - 2*r, th, color);    /* bottom */
+    zan_gui_fill_rect(surface_id, ix, yt, th, ih - 2*r, color);             /* left   */
+    zan_gui_fill_rect(surface_id, ix + iw - th, yt, th, ih - 2*r, color);   /* right  */
+
+    int cc[4][2] = {
+        {xl, yt}, {xr - 1, yt}, {xl, yb - 1}, {xr - 1, yb - 1}
+    };
+    int zx[4] = {ix, xr, ix, xr};
+    int zy[4] = {iy, iy, yb, yb};
+    double rin = (double)r - (double)th;   /* inner arc radius */
+    for (int ci = 0; ci < 4; ci++) {
+        int ccx = cc[ci][0], ccy = cc[ci][1];
+        for (int py = zy[ci]; py < zy[ci] + r; py++) {
+            for (int px = zx[ci]; px < zx[ci] + r; px++) {
+                double ddx = (double)(px - ccx);
+                double ddy = (double)(py - ccy);
+                double dist = sqrt(ddx*ddx + ddy*ddy);
+                double outerCov = (double)r + 0.5 - dist;        /* 1 inside outer edge */
+                double innerCov = dist - (rin - 0.5);            /* 1 outside inner edge */
+                double cov = outerCov < innerCov ? outerCov : innerCov;
                 if (cov <= 0.0) continue;
-                if (cov > 1.0) cov = 1.0;
-                set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+                if (cov >= 1.0) set_pixel(s, px, py, c);
+                else set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
             }
         }
     }
@@ -2089,8 +2140,25 @@ static void sdl_translate(const SDL_Event *e) {
         }
         case SDL_EVENT_KEY_DOWN: {
             SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
-            zq_push(4, 0, 0, 0, sdl_key_to_vk(e->key.key),
-                    sdl_mods_to_bits(e->key.mod), w);
+            int vk = sdl_key_to_vk(e->key.key);
+            int kmods = sdl_mods_to_bits(e->key.mod);
+            zq_push(4, 0, 0, 0, vk, kmods, w);
+            /* SDL's TEXT_INPUT event never delivers control characters,
+             * but the widget layer was built on the Win32 WM_CHAR contract
+             * (Backspace=8, Enter=13, Ctrl+letter=1..26, Ctrl+/=31).
+             * Synthesize the matching kind-6 char event so text widgets
+             * (Input / TextArea / CodeEditor) keep editing under SDL3. */
+            {
+                int ctrl = (e->key.mod & SDL_KMOD_CTRL) != 0;
+                int ch = 0;
+                if (e->key.key == SDLK_BACKSPACE) ch = 8;
+                else if (e->key.key == SDLK_RETURN ||
+                         e->key.key == SDLK_KP_ENTER) ch = 13;
+                else if (ctrl && e->key.key >= 'a' && e->key.key <= 'z')
+                    ch = (int)(e->key.key - 'a' + 1);
+                else if (ctrl && e->key.key == '/') ch = 31;
+                if (ch != 0) zq_push(6, 0, 0, 0, ch, kmods, w);
+            }
             break;
         }
         case SDL_EVENT_KEY_UP: {
@@ -2173,6 +2241,21 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
      * present never blocks the UI thread up to a refresh interval. */
     SDL_SetRenderVSync(ren, 0);
     SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
+#ifdef _WIN32
+    /* SDL borderless windows strip the native frame and with it the DWM drop
+     * shadow. Re-extend a 1px frame into the client area so the compositor
+     * paints the standard window shadow -- matches the old Win32 shell and the
+     * IDE. The frame stays invisible because the window is borderless. */
+    {
+        HWND hwnd = (HWND)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(win),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        if (hwnd) {
+            MARGINS m = { 1, 1, 1, 1 };
+            DwmExtendFrameIntoClientArea(hwnd, &m);
+        }
+    }
+#endif
 
     zan_sdl_win_t *rec = &g_wins[g_win_count++];
     rec->win = win; rec->ren = ren; rec->tex = NULL; rec->tw = rec->th = 0;
@@ -2354,8 +2437,8 @@ EXPORT i64 zan_gui_set_cursor(i64 cursor_type) {
     static int made = 0;
     if (!made) {
         cache[0] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
-        cache[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
-        cache[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_WAIT);
+        cache[1] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+        cache[2] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
         cache[3] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
         cache[4] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
         cache[5] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);

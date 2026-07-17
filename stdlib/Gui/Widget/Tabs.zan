@@ -3,8 +3,14 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// Tab bar with reactive int binding for active index.
-class Tabs {
+/// Low-level immediate-mode tab strip with a reactive int binding for the
+/// active index. Draws a single row of labels with a sliding underline; the
+/// caller owns the labels list and the active-index signal. Used by the form
+/// designer and simple inline tab rows.
+///
+///   int first = TabStrip.Render(app, x, y, w, labels, active);
+///   TabStrip.HandleClick(app, first, labels.Count, active);
+class TabStrip {
     static int Render(App app, int x, int y, int totalWidth, List<string> labels, SignalInt model) {
         int firstId = app.focus.AllocId();
         Canvas c = app.canvas;
@@ -34,8 +40,6 @@ class Tabs {
             bool hovered = app.focus.IsHovered(tabId);
             bool active = i == activeIndex;
 
-            // Fade the hover background in/out (non-active tabs only). Painting
-            // the page background at e=0 is a visual no-op.
             int hTarget = 0;
             if (hovered && !active) { hTarget = 1000; }
             int he = app.AnimTo(1000000 + tabId, hTarget, 120);
@@ -54,9 +58,6 @@ class Tabs {
             i = i + 1;
         }
 
-        // Single underline indicator that slides/stretches to the active tab.
-        // A fixed-duration smoothstep glide (ease-in-out) reads smoother than an
-        // exponential decay, whose long low-velocity tail can look steppy.
         int indX = app.AnimTo(600000 + firstId, activeX, 200);
         int indW = app.AnimTo(800000 + firstId, activeW, 200);
         c.FillRect(indX, y + tabH - 2, indW, 2, t.primary);
@@ -76,80 +77,103 @@ class Tabs {
 }
 
 /// <summary>
-/// High-level, self-contained tab bar.
+/// High-level, self-contained tab component (an enhanced TabView).
 ///
 /// A retained component (create once, keep across frames) that owns its tab
-/// list, active index, closable state, horizontal overflow scrolling, and a
-/// right-click context menu. A single Render() call draws the bar AND handles
-/// all interaction — no separate HandleClick, hit-id bookkeeping, or scrollbar
-/// wiring at the call site:
+/// list, active index, closable state and a right-click context menu. It draws
+/// only the tab HEADER (the strip of labels); the caller renders the active
+/// page into a separate body region, so the header and the page area are fully
+/// decoupled and each can be placed independently:
 ///
 ///   // once:
-///   TabBar tabs = TabBar.Create(TabBar.Card());
-///   tabs.Add("Overview", false);   // (label, closable)
+///   Tabs tabs = Tabs.Create(Tabs.Card());   // or Tabs.CreateVertical(...)
+///   tabs.SetShowAdd(true);                   // trailing "+" button
+///   tabs.Add("Overview", false);             // (label, closable)
 ///   tabs.Add("Details", true);
 ///
-///   // each frame:
-///   tabs.Render(app, x, y, width);
-///   int now = tabs.Active();           // current index
-///   int closed = tabs.TakeClosed();    // index removed this frame, or -1
+///   // each frame — header:
+///   tabs.Render(app, x, y, width);           // horizontal
+///   // tabs.RenderVertical(app, x, y, w, h); // vertical rail
+///   // ...then draw your own page for tabs.Active() in the body region.
+///
+///   int now   = tabs.Active();
+///   int added = tabs.TakeAdded();    // index appended this frame, or -1
+///   int shut  = tabs.TakeClosed();   // index removed this frame, or -1
 ///
 /// Styles: Line (underline), Card (raised tab), Segment (pill group).
+/// Orientation: Horizontal (top strip) or Vertical (side rail).
 /// </summary>
-class TabBar {
+class Tabs {
     List<string> labels;
     List<bool> closable;
     int active;
     int style;
-    int scrollX;
+    int orient;
+    bool showAdd;
+    int scroll;
+    bool follow;
 
     int changedIndex;
     int closedIndex;
+    int addedIndex;
 
     bool menuOpen;
     int menuTab;
     int menuX;
     int menuY;
 
-    /// Fires when the active tab changes (read Active()).
     UiEvent TabChanged;
-    /// Fires when a tab is closed (read ClosedIndex()).
     UiEvent TabClosed;
+    UiEvent TabAdded;
 
     static int Line() { return 0; }
     static int Card() { return 1; }
     static int Segment() { return 2; }
 
-    static TabBar Create(int style) {
-        TabBar b = new TabBar();
+    static int Horizontal() { return 0; }
+    static int Vertical() { return 1; }
+
+    static Tabs Create(int style) {
+        return Tabs.Make(style, 0);
+    }
+
+    static Tabs CreateVertical(int style) {
+        return Tabs.Make(style, 1);
+    }
+
+    static Tabs Make(int style, int orient) {
+        Tabs b = new Tabs();
         b.labels = new List<string>();
         b.closable = new List<bool>();
         b.active = 0;
         b.style = style;
-        b.scrollX = 0;
+        b.orient = orient;
+        b.showAdd = false;
+        b.scroll = 0;
+        b.follow = false;
         b.changedIndex = 0 - 1;
         b.closedIndex = 0 - 1;
+        b.addedIndex = 0 - 1;
         b.menuOpen = false;
         b.menuTab = 0;
         b.menuX = 0;
         b.menuY = 0;
         b.TabChanged = UiEvent.Create();
         b.TabClosed = UiEvent.Create();
+        b.TabAdded = UiEvent.Create();
         return b;
     }
+
+    void SetShowAdd(bool on) { showAdd = on; }
 
     void Add(string label, bool canClose) {
         labels.Add(label);
         closable.Add(canClose);
     }
 
-    int Count() {
-        return labels.Count;
-    }
+    int Count() { return labels.Count; }
 
-    int Active() {
-        return active;
-    }
+    int Active() { return active; }
 
     string ActiveLabel() {
         if (active < 0 || active >= labels.Count) { return ""; }
@@ -161,28 +185,40 @@ class TabBar {
         if (i != active) {
             active = i;
             changedIndex = i;
+            follow = true;
             TabChanged.Raise();
         }
     }
 
-    /// Index closed this frame (or -1), without clearing (see TakeClosed()).
-    int ClosedIndex() {
-        return closedIndex;
-    }
+    int ClosedIndex() { return closedIndex; }
 
-    /// Returns the index selected this frame (or -1), then clears it.
     int TakeChanged() {
         int r = changedIndex;
         changedIndex = 0 - 1;
         return r;
     }
 
-    /// Returns the index closed this frame (or -1), then clears it. The tab is
-    /// already removed from this bar; use it to drop any parallel per-tab state.
     int TakeClosed() {
         int r = closedIndex;
         closedIndex = 0 - 1;
         return r;
+    }
+
+    int TakeAdded() {
+        int r = addedIndex;
+        addedIndex = 0 - 1;
+        return r;
+    }
+
+    void AddNew() {
+        int n = labels.Count + 1;
+        labels.Add("Tab " + Convert.ToString(n));
+        closable.Add(true);
+        active = labels.Count - 1;
+        addedIndex = active;
+        changedIndex = active;
+        follow = true;
+        TabAdded.Raise();
     }
 
     void CloseAt(int i) {
@@ -193,7 +229,13 @@ class TabBar {
         if (active > i) { active = active - 1; }
         if (active >= labels.Count) { active = labels.Count - 1; }
         if (active < 0) { active = 0; }
+        follow = true;
         TabClosed.Raise();
+    }
+
+    /// Header height for a horizontal bar (also the row height in a rail).
+    int HeaderHeight(App app) {
+        return app.theme.heightMedium;
     }
 
     int TabWidth(App app, int i) {
@@ -214,46 +256,75 @@ class TabBar {
     }
 
     void Render(App app, int x, int y, int totalWidth) {
+        if (orient == 1) {
+            this.RenderVertical(app, x, y, totalWidth, this.HeaderHeight(app) * (labels.Count + 1));
+            return;
+        }
         Canvas c = app.canvas;
         Theme t = app.theme;
 
         int tabH = t.heightMedium;
         int count = labels.Count;
+        int addW = tabH;
 
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
         bool leftUp = ek == 3 && eb == 0;
         bool rightDown = ek == 2 && eb == 1;
 
+        // The "+" add button is a fixed trailing control (outside the scrolled
+        // viewport); overflow chevrons sit just left of it when needed.
+        int addReserve = 0;
+        if (showAdd) { addReserve = addW; }
         int contentW = this.ContentWidth(app);
-        bool overflow = contentW > totalWidth;
+        bool overflow = contentW > (totalWidth - addReserve);
 
-        // Reserve room on the right for scroll chevrons when overflowing.
         int chevW = tabH;
-        int viewW = totalWidth;
-        if (overflow) { viewW = totalWidth - chevW * 2; }
+        int viewW = totalWidth - addReserve;
+        if (overflow) { viewW = viewW - chevW * 2; }
         if (viewW < 0) { viewW = 0; }
 
-        int maxScroll = contentW - viewW;
+        // Keep a small trailing gap so the last/active tab never butts flush
+        // against the overflow chevrons.
+        int endPad = app.Scale(8);
+        int maxScroll = contentW - viewW + endPad;
+        if (!overflow) { maxScroll = 0; }
         if (maxScroll < 0) { maxScroll = 0; }
 
         bool overBar = app.mouseX >= x && app.mouseX < x + totalWidth
             && app.mouseY >= y && app.mouseY < y + tabH;
 
-        // Mouse wheel scrolls the strip horizontally while hovered.
         bool ownsWheel = false;
         if (overflow && overBar) {
             ownsWheel = app.CaptureWheel(x, y, totalWidth, tabH);
         }
         if (ownsWheel && ek == 13) {
             int d = app.window.EventKeyCode();
-            scrollX = scrollX - d * app.scrollSpeed / 120;
+            scroll = scroll - d * app.scrollSpeed / 120;
+            follow = false;
             app.RequestRedraw();
         }
-        if (scrollX > maxScroll) { scrollX = maxScroll; }
-        if (scrollX < 0) { scrollX = 0; }
+        // Auto-scroll the active tab into view when it changed this frame
+        // (selection, add, close). Manual wheel/chevron scrolling clears the
+        // flag so the user can freely roam the strip.
+        if (follow && overflow) {
+            int accum = 0;
+            int aStart = 0;
+            int aEnd = 0;
+            int fi = 0;
+            while (fi < count) {
+                int fw = this.TabWidth(app, fi);
+                if (fi == active) { aStart = accum; aEnd = accum + fw; }
+                accum = accum + fw;
+                fi = fi + 1;
+            }
+            if (scroll > aStart) { scroll = aStart; }
+            if (scroll < aEnd - viewW + endPad) { scroll = aEnd - viewW + endPad; }
+        }
+        follow = false;
+        if (scroll > maxScroll) { scroll = maxScroll; }
+        if (scroll < 0) { scroll = 0; }
 
-        // Style background.
         if (style == 2) {
             c.FillRoundRect(x, y, totalWidth, tabH, t.borderRadiusMedium, t.bgTertiary);
         } else {
@@ -262,7 +333,7 @@ class TabBar {
 
         c.PushClip(x, y, viewW, tabH);
 
-        int tabX = x - scrollX;
+        int tabX = x - scroll;
         int i = 0;
         while (i < count) {
             int tw = this.TabWidth(app, i);
@@ -272,25 +343,21 @@ class TabBar {
                 && app.mouseX >= x && app.mouseX < x + viewW
                 && app.mouseY >= y && app.mouseY < y + tabH;
 
-            // Close button geometry (right side of the tab).
             int closeW = app.Scale(18);
             int closeX = tabX + tw - closeW;
             bool overClose = closable[i] && overTab
                 && app.mouseX >= closeX && app.mouseX < closeX + closeW;
 
-            // ---- paint by style ----
             if (style == 1) {
-                // Card: raised rounded tab; active uses the page bg + border.
                 int cardBg = t.bgSecondary;
                 if (isActive) { cardBg = t.bgPrimary; }
                 else if (overTab) { cardBg = t.bgHover; }
                 c.FillRoundRect(tabX + 2, y + 2, tw - 4, tabH - 2,
                     t.borderRadiusMedium, cardBg);
                 if (isActive) {
-                    c.DrawRect(tabX + 2, y + 2, tw - 4, tabH - 2, t.borderPrimary, 1);
+                    c.DrawRoundRect(tabX + 2, y + 2, tw - 4, tabH - 2, t.borderRadiusMedium, t.borderPrimary, 1);
                 }
             } else if (style == 2) {
-                // Segment: pill highlight behind the active item.
                 if (isActive) {
                     c.FillRoundRect(tabX + 3, y + 3, tw - 6, tabH - 6,
                         t.borderRadiusSmall, t.bgPrimary);
@@ -299,20 +366,17 @@ class TabBar {
                         t.borderRadiusSmall, t.bgHover);
                 }
             } else {
-                // Line: hover tint only.
                 if (overTab && !isActive) {
                     c.FillRect(tabX, y, tw, tabH, t.bgHover);
                 }
             }
 
-            // Label.
             int tc = States.TextMuted(t, overTab, isActive, false);
             if (style == 2 && isActive) { tc = t.textPrimary; }
             int labelW = tw;
             if (closable[i]) { labelW = tw - closeW; }
             c.DrawTextCentered(tabX, y, labelW, tabH, labels[i], tc, t.fontSizeMedium);
 
-            // Close affordance.
             if (closable[i]) {
                 int icoColor = t.textTertiary;
                 if (overClose) {
@@ -324,12 +388,10 @@ class TabBar {
                     t.iconSizeSmall, icoColor);
             }
 
-            // Active underline for the Line style.
             if (style == 0 && isActive) {
                 c.FillRect(tabX, y + tabH - 2, tw, 2, t.primary);
             }
 
-            // ---- input (suppressed while the context menu is open) ----
             if (!menuOpen) {
                 if (leftUp && overClose) {
                     this.CloseAt(i);
@@ -352,7 +414,24 @@ class TabBar {
 
         c.PopClip();
 
-        // Overflow chevrons.
+        // Fixed trailing "+" add button (always visible, right edge).
+        if (showAdd) {
+            int ax = x + totalWidth - addW;
+            bool overAdd = app.mouseX >= ax && app.mouseX < ax + addW
+                && app.mouseY >= y && app.mouseY < y + tabH;
+            int addColor = t.textSecondary;
+            if (overAdd) {
+                c.FillRoundRect(ax + 3, y + 3, addW - 6, tabH - 6,
+                    t.borderRadiusSmall, t.bgHover);
+                addColor = t.primary;
+            }
+            Icon.DrawCenteredIn(c, "plus", ax, y, addW, tabH, t.iconSizeSmall, addColor);
+            if (leftUp && overAdd && !menuOpen) {
+                this.AddNew();
+                app.RequestRedraw();
+            }
+        }
+
         if (overflow) {
             int lx = x + viewW;
             int rx = x + viewW + chevW;
@@ -362,27 +441,132 @@ class TabBar {
                 && app.mouseY >= y && app.mouseY < y + tabH;
             if (overL) { c.FillRect(lx, y, chevW, tabH, t.bgHover); }
             if (overR) { c.FillRect(rx, y, chevW, tabH, t.bgHover); }
-            Icon.DrawCenteredIn(c, "arrow-left", lx, y, chevW, tabH,
+            Icon.DrawCenteredIn(c, "chevron-left", lx, y, chevW, tabH,
                 t.iconSizeSmall, t.textSecondary);
-            Icon.DrawCenteredIn(c, "arrow-right", rx, y, chevW, tabH,
+            Icon.DrawCenteredIn(c, "chevron-right", rx, y, chevW, tabH,
                 t.iconSizeSmall, t.textSecondary);
             if (leftUp && !menuOpen) {
                 if (overL) {
-                    scrollX = scrollX - app.Scale(80);
-                    if (scrollX < 0) { scrollX = 0; }
+                    scroll = scroll - app.Scale(80);
+                    if (scroll < 0) { scroll = 0; }
                     app.RequestRedraw();
                 } else if (overR) {
-                    scrollX = scrollX + app.Scale(80);
-                    if (scrollX > maxScroll) { scrollX = maxScroll; }
+                    scroll = scroll + app.Scale(80);
+                    if (scroll > maxScroll) { scroll = maxScroll; }
                     app.RequestRedraw();
                 }
             }
         }
 
-        // Context menu overlay.
         if (menuOpen) {
             this.RenderMenu(app, leftUp);
         }
+    }
+
+    /// Vertical rail: a column of full-width tab rows, active item highlighted
+    /// on the left. The caller draws the page to the right of the rail.
+    void RenderVertical(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int rowH = t.heightMedium;
+        int count = labels.Count;
+
+        int ek = app.window.EventKind();
+        int eb = app.window.EventButton();
+        bool leftUp = ek == 3 && eb == 0;
+
+        if (style == 0) {
+            c.FillRect(x + w - 1, y, 1, h, t.divider);
+        }
+
+        c.PushClip(x, y, w, h);
+
+        int rowY = y;
+        int i = 0;
+        while (i < count) {
+            bool isActive = i == active;
+            bool overRow = app.mouseX >= x && app.mouseX < x + w
+                && app.mouseY >= rowY && app.mouseY < rowY + rowH;
+
+            int closeW = app.Scale(18);
+            int closeX = x + w - closeW - app.Scale(4);
+            bool overClose = closable[i] && overRow
+                && app.mouseX >= closeX && app.mouseX < closeX + closeW;
+
+            if (style == 1) {
+                int cardBg = t.bgSecondary;
+                if (isActive) { cardBg = t.bgPrimary; }
+                else if (overRow) { cardBg = t.bgHover; }
+                c.FillRoundRect(x + 2, rowY + 2, w - 4, rowH - 4, t.borderRadiusMedium, cardBg);
+                if (isActive) {
+                    c.DrawRoundRect(x + 2, rowY + 2, w - 4, rowH - 4, t.borderRadiusMedium, t.borderPrimary, 1);
+                }
+            } else if (style == 2) {
+                if (isActive) {
+                    c.FillRoundRect(x + 3, rowY + 3, w - 6, rowH - 6, t.borderRadiusSmall, t.bgPrimary);
+                    c.DrawRoundRect(x + 3, rowY + 3, w - 6, rowH - 6, t.borderRadiusSmall, t.borderPrimary, 1);
+                } else if (overRow) {
+                    c.FillRoundRect(x + 3, rowY + 3, w - 6, rowH - 6, t.borderRadiusSmall, t.bgHover);
+                }
+            } else {
+                if (isActive) {
+                    c.FillRect(x, rowY, w, rowH, t.bgActive);
+                    c.FillRect(x, rowY, app.Scale(3), rowH, t.primary);
+                } else if (overRow) {
+                    c.FillRect(x, rowY, w, rowH, t.bgHover);
+                }
+            }
+
+            int tc = States.TextMuted(t, overRow, isActive, false);
+            if (style == 2 && isActive) { tc = t.textPrimary; }
+            int ty = rowY + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.DrawText(x + t.paddingLarge, ty, labels[i], tc, t.fontSizeMedium);
+
+            if (closable[i]) {
+                int icoColor = t.textTertiary;
+                if (overClose) {
+                    c.FillRoundRect(closeX, rowY + (rowH - closeW) / 2, closeW, closeW,
+                        t.borderRadiusSmall, t.bgActive);
+                    icoColor = t.error;
+                }
+                Icon.DrawCenteredIn(c, "close", closeX, rowY, closeW, rowH,
+                    t.iconSizeSmall, icoColor);
+            }
+
+            if (!menuOpen) {
+                if (leftUp && overClose) {
+                    this.CloseAt(i);
+                    app.RequestRedraw();
+                } else if (leftUp && overRow) {
+                    this.Select(i);
+                    app.RequestRedraw();
+                }
+            }
+
+            rowY = rowY + rowH;
+            i = i + 1;
+        }
+
+        if (showAdd) {
+            bool overAdd = app.mouseX >= x && app.mouseX < x + w
+                && app.mouseY >= rowY && app.mouseY < rowY + rowH;
+            int addColor = t.textSecondary;
+            if (overAdd) {
+                c.FillRoundRect(x + 3, rowY + 3, w - 6, rowH - 6, t.borderRadiusSmall, t.bgHover);
+                addColor = t.primary;
+            }
+            int ty = rowY + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            Icon.DrawCenteredIn(c, "plus", x + app.Scale(4), rowY, app.Scale(20), rowH,
+                t.iconSizeSmall, addColor);
+            c.DrawText(x + app.Scale(28), ty, "New tab", addColor, t.fontSizeMedium);
+            if (leftUp && overAdd && !menuOpen) {
+                this.AddNew();
+                app.RequestRedraw();
+            }
+        }
+
+        c.PopClip();
     }
 
     void RenderMenu(App app, bool leftUp) {
@@ -403,10 +587,9 @@ class TabBar {
         int my = menuY;
 
         c.FillRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(mx, my, mw, mh, t.borderPrimary, 1);
+        c.DrawRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.borderPrimary, 1);
+        app.BlockHitsRect(mx, my, mw, mh);
 
-        bool inside = app.mouseX >= mx && app.mouseX < mx + mw
-            && app.mouseY >= my && app.mouseY < my + mh;
         int picked = 0 - 1;
 
         int i = 0;
@@ -428,7 +611,6 @@ class TabBar {
             if (picked == 0) {
                 this.CloseAt(menuTab);
             } else if (picked == 1) {
-                // Keep only the menu tab.
                 string keep = "";
                 bool keepClose = false;
                 if (menuTab >= 0 && menuTab < labels.Count) {
@@ -449,7 +631,6 @@ class TabBar {
                 active = 0;
                 closedIndex = 0;
             }
-            // Any click (on an item or outside) dismisses the menu.
             menuOpen = false;
             app.RequestRedraw();
         }

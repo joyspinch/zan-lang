@@ -196,6 +196,10 @@ class Gallery {
     static SelectBox demoMulti;
     static SelectBox demoLong;
     static Select demoSelectLow;
+    static Dropdown demoDropdown;
+    static Popover demoPopover;
+    static FilePicker filePicker;
+    static string pickerResult;
     static VirtualList demoVList;
     static CarouselAnim demoCarousel;
     static SignalInt demoCarBasic;
@@ -232,9 +236,10 @@ class Gallery {
     // hover refreshes so dragging the pointer never spins the CPU.
     static int lastMotionMs;
     static ScrollView navView;
-    static TabBar tbLine;
-    static TabBar tbCard;
-    static TabBar tbSeg;
+    static Tabs tbLine;
+    static Tabs tbCard;
+    static Tabs tbSeg;
+    static Tabs tbVert;
     static List<Comp> comps;
 
     // Read-only code selection (line/col anchor..focus into the current
@@ -252,6 +257,11 @@ class Gallery {
     static LayerState dlgConfirm;
     static LayerState dlgPrompt;
     static SignalBool tipsOn;
+    static SignalBool tipClickOn;
+    static SignalInt pagePill;
+    static SignalInt pageSmall;
+    static SignalInt pageSimple;
+    static SignalInt scrollOff;
     static SignalBool photosOpen;
     static int loadStartMs;
     static SignalInt photoIdx;
@@ -316,28 +326,43 @@ class Gallery {
         Gallery.detailContentH = SignalInt.Create(0);
         Gallery.codeScroll = SignalInt.Create(0);
         Gallery.navView = ScrollView.Create();
-        Gallery.tbLine = TabBar.Create(TabBar.Line());
+        Gallery.tbLine = Tabs.Create(Tabs.Line());
         Gallery.tbLine.Add("Overview", false);
         Gallery.tbLine.Add("API", false);
         Gallery.tbLine.Add("Examples", false);
-        Gallery.tbSeg = TabBar.Create(TabBar.Segment());
+        Gallery.tbSeg = Tabs.Create(Tabs.Segment());
         Gallery.tbSeg.Add("Day", false);
         Gallery.tbSeg.Add("Week", false);
         Gallery.tbSeg.Add("Month", false);
-        // Card style with closable tabs and enough tabs to overflow the demo
-        // width, so the chevrons/wheel scrolling and the right-click menu show.
-        Gallery.tbCard = TabBar.Create(TabBar.Card());
+        // Card style: closable tabs + a trailing "+" to add tabs, with enough
+        // tabs to overflow the demo width (chevrons / wheel scroll / right-click
+        // context menu all reachable).
+        Gallery.tbCard = Tabs.Create(Tabs.Card());
+        Gallery.tbCard.SetShowAdd(true);
         Gallery.tbCard.Add("index.zan", true);
         Gallery.tbCard.Add("parser.c", true);
         Gallery.tbCard.Add("irgen.c", true);
         Gallery.tbCard.Add("Render.zan", true);
         Gallery.tbCard.Add("ScrollView.zan", true);
         Gallery.tbCard.Add("Tabs.zan", true);
+        // Vertical rail: header strip on the side, page content drawn separately.
+        Gallery.tbVert = Tabs.CreateVertical(Tabs.Line());
+        Gallery.tbVert.Add("Files", false);
+        Gallery.tbVert.Add("Search", false);
+        Gallery.tbVert.Add("Source Control", false);
+        Gallery.tbVert.Add("Run", false);
         Gallery.selHas = false;
         Gallery.selDrag = false;
         List<string> lowOpts = new List<string>();
         lowOpts.Add("Default"); lowOpts.Add("Success"); lowOpts.Add("Warning");
         Gallery.demoSelectLow = Select.Bind(lowOpts, Gallery.demoInt, "Choose a state");
+        List<string> ddItems = new List<string>();
+        ddItems.Add("Edit"); ddItems.Add("Duplicate"); ddItems.Add("Delete");
+        Gallery.demoDropdown = Dropdown.Create("Actions", ddItems);
+        Gallery.demoPopover = Popover.Create("More info",
+            "Popover", "Anchored, word-wrapped content that stays on screen and blocks clicks to the widgets beneath it.", app.Scale(260));
+        Gallery.filePicker = FilePicker.Create();
+        Gallery.pickerResult = "";
         Gallery.copiedIcon = "";
         Gallery.demoTableState = DataTableState.Create();
         Gallery.demoLayers = new List<LayerState>();
@@ -346,6 +371,11 @@ class Gallery {
         Gallery.dlgConfirm = LayerState.Confirm("Please confirm", "Delete this item permanently?", 2);
         Gallery.dlgPrompt = LayerState.Prompt("Rename item", "new name");
         Gallery.tipsOn = SignalBool.Create(false);
+        Gallery.tipClickOn = SignalBool.Create(false);
+        Gallery.pagePill = SignalInt.Create(2);
+        Gallery.pageSmall = SignalInt.Create(3);
+        Gallery.pageSimple = SignalInt.Create(1);
+        Gallery.scrollOff = SignalInt.Create(0);
         Gallery.photosOpen = SignalBool.Create(false);
         Gallery.loadStartMs = 0;
         Gallery.photoIdx = SignalInt.Create(0);
@@ -439,35 +469,101 @@ class Gallery {
         // the per-frame ResetFrame() below never reissues one of them.
         WidgetId.Mark();
         while (app.isRunning) {
-            if (!app.ProcessEvent()) { break; }
-            // The gallery handles wheel scrolling and code selection inside its
-            // own Render pass, so it must paint on every input event (motion,
-            // press, release, wheel, keys) rather than only when the framework
-            // flags a repaint. ProcessEvent blocks when idle, so this doesn't spin.
-            int ek = app.window.EventKind();
-            // Press / release / wheel / focus always force a repaint. Pointer
-            // motion (ek==1) only needs one when the framework already flagged
-            // a change (hover crossed a hit region, a drag is in progress) --
-            // but the gallery also draws mouse-driven hover on elements it
-            // hit-tests inline (code tabs, icon grid), so still refresh on
-            // motion, throttled to ~30fps so moving the pointer over a busy
-            // page (or the glass theme's per-frame blur) can't peg the CPU.
-            bool inputEv = ek == 2 || ek == 3 || ek == 13 || ek == 4 || ek == 6;
-            if (!app.needsRedraw && !inputEv) {
-                if (ek != 1) { continue; }
-                int nowMotion = Window.GetTickMs();
-                if (nowMotion - Gallery.lastMotionMs < 33) { continue; }
-                Gallery.lastMotionMs = nowMotion;
+            // One shared event pump drives BOTH the main window and the
+            // FilePicker's child dialog window (open/save file/folder). Poll (to
+            // keep animating) when either wants a repaint; otherwise block.
+            Gallery.filePicker.ApplySkin(app.ThemeMenuIndex());
+            int r;
+            if (Gallery.filePicker.NeedsRedraw()
+                || (!Gallery.filePicker.IsOpen() && app.needsRedraw)) {
+                int since = Window.GetTickMs() - app.lastPresentMs;
+                if (app.lastPresentMs > 0 && since < 16) {
+                    Window.SleepMs(16 - since);
+                }
+                r = app.window.PollEvent();
+            } else if (!Gallery.filePicker.IsOpen() && app.animNextMs >= 0) {
+                // A throttled animation (spinner/skeleton) wants its next frame;
+                // idle until the deadline, but poll in slices so input still
+                // wakes the loop promptly.
+                r = 1;
+                bool waiting = true;
+                while (waiting) {
+                    int now = Window.GetTickMs();
+                    if (now >= app.animNextMs) {
+                        app.RequestRedraw();
+                        waiting = false;
+                    } else {
+                        int remain = app.animNextMs - now;
+                        if (remain > 15) { remain = 15; }
+                        Window.SleepMs(remain);
+                        r = app.window.PollEvent();
+                        if (r != 1) { waiting = false; }
+                    }
+                }
+            } else {
+                r = app.window.WaitEvent();
             }
-            app.BeginFrame();
-            // Pure immediate-mode page: every preview widget is rebuilt each
-            // frame, so rewind the widget-id counter here to keep ids stable
-            // across frames -- otherwise hover/press/click never match the
-            // pointer target the framework resolved on the previous frame.
-            WidgetId.ResetFrame();
-            Gallery.Render(app);
-            app.RenderChrome("Zan GUI Components");
-            app.PresentFrame();
+            if (r < 0) { break; }
+            app.DrainPosts();
+
+            int evh = Window.EventHwnd();
+            int kind = app.window.EventKind();
+
+            if (kind == 8) {
+                if (Gallery.filePicker.OwnsWindow(evh)) {
+                    Gallery.filePicker.ApplyEvent(evh);
+                } else if (evh == app.WindowHandle()) {
+                    break;
+                }
+            } else if (Gallery.filePicker.IsOpen()
+                       || Gallery.filePicker.OwnsWindow(evh)) {
+                // The dialog owns this input frame; route it there and leave the
+                // main window untouched (no click-through to the gallery).
+                Gallery.filePicker.ApplyEvent(evh);
+            } else {
+                // The gallery handles wheel scrolling and code selection inside
+                // its own Render pass, so it paints on every input event rather
+                // than only when the framework flags a repaint. Pointer motion
+                // (kind 1) is throttled to ~30fps so moving over a busy page (or
+                // the glass theme's per-frame blur) can't peg the CPU.
+                bool inputEv = kind == 2 || kind == 3 || kind == 13
+                    || kind == 4 || kind == 6;
+                bool doFrame = true;
+                if (!app.needsRedraw && !inputEv) {
+                    if (kind != 1) {
+                        doFrame = false;
+                    } else {
+                        int nowMotion = Window.GetTickMs();
+                        if (nowMotion - Gallery.lastMotionMs < 33) {
+                            doFrame = false;
+                        } else {
+                            Gallery.lastMotionMs = nowMotion;
+                        }
+                    }
+                }
+                app.ApplyEvent(evh);
+                if (doFrame) {
+                    app.BeginFrame();
+                    // Pure immediate-mode page: every preview widget is rebuilt
+                    // each frame, so rewind the widget-id counter here to keep
+                    // ids stable across frames -- otherwise hover/press/click
+                    // never match the pointer target resolved last frame.
+                    WidgetId.ResetFrame();
+                    Gallery.Render(app);
+                    app.RenderChrome("Zan GUI Components");
+                    app.PresentFrame();
+                }
+            }
+
+            // Paint the dialog window (if open) and harvest its result.
+            Gallery.filePicker.RenderWindow();
+            int pr = Gallery.filePicker.TakeResult();
+            if (pr == 1) {
+                Gallery.pickerResult = Gallery.filePicker.SelectedPath();
+                app.RequestRedraw();
+            } else if (pr == 2) {
+                app.RequestRedraw();
+            }
         }
     }
 
@@ -1024,7 +1120,7 @@ class Gallery {
         if (name == "Button") { return 470; }
         if (name == "Icon") { return 360; }
         if (name == "States") { return 150; }
-        if (name == "TabBar") { return 220; }
+        if (name == "Tabs") { return 400; }
         if (name == "TextArea") { return 190; }
         if (name == "SelectBox") { return 240; }
         if (name == "VirtualList") { return 210; }
@@ -1034,14 +1130,18 @@ class Gallery {
         if (name == "Chart") { return 210; }
         if (name == "Alert") { return 300; }
         if (name == "Ellipsis") { return 180; }
-        if (name == "Timeline") { return 190; }
+        if (name == "Timeline") { return 240; }
         if (name == "TreeView") { return 190; }
         if (name == "Collapse") { return 190; }
         if (name == "Table") { return 180; }
         if (name == "Carousel") { return 300; }
         if (name == "Layer") { return 360; }
         if (name == "Menu") { return 190; }
-        if (name == "Steps") { return 170; }
+        if (name == "Steps") { return 420; }
+        if (name == "Tooltip") { return 500; }
+        if (name == "Pagination") { return 300; }
+        if (name == "Scrollbar") { return 180; }
+        if (name == "FilePicker") { return 220; }
         if (name == "Ribbon") { return 180; }
         if (name == "TabView") { return 190; }
         if (name == "Wizard") { return 210; }
@@ -1258,26 +1358,55 @@ class Gallery {
             int id = Rate.Render(app, px, py, Gallery.demoInt, 5);
             Rate.HandleClick(app, id, 5, Gallery.demoInt);
         } else if (name == "Tabs") {
-            List<string> tabs = new List<string>();
-            tabs.Add("Overview"); tabs.Add("API"); tabs.Add("Examples");
-            int id = Tabs.Render(app, px, py, app.Scale(420), tabs, Gallery.demoInt);
-            Tabs.HandleClick(app, id, tabs.Count, Gallery.demoInt);
-        } else if (name == "TabBar") {
-            Label.Secondary(app, px, py - app.Scale(24), "Line");
+            // Retained Tabs component (enhanced TabView): header strip + a
+            // separately drawn page area. Multiple styles, sizes, orientations.
+            Label.Secondary(app, px, py - app.Scale(24), "Line · underline");
             Gallery.tbLine.Render(app, px, py, app.Scale(360));
-            Label.Secondary(app, px, py + app.Scale(40) - app.Scale(24), "Segment");
-            Gallery.tbSeg.Render(app, px, py + app.Scale(40), app.Scale(240));
-            Label.Secondary(app, px, py + app.Scale(88) - app.Scale(24),
-                "Card · closable · overflow (wheel / chevrons) · right-click");
-            Gallery.tbCard.Render(app, px, py + app.Scale(88), app.Scale(300));
+            Label.Secondary(app, px, py + app.Scale(68) - app.Scale(24), "Segment · pill group");
+            Gallery.tbSeg.Render(app, px, py + app.Scale(68), app.Scale(240));
+            Label.Secondary(app, px, py + app.Scale(136) - app.Scale(24),
+                "Card · closable · add (+) · overflow (wheel / chevrons) · right-click");
+            Gallery.tbCard.Render(app, px, py + app.Scale(136), app.Scale(320));
+
+            // Vertical rail with its own page region drawn by the caller —
+            // header and page are fully decoupled.
+            int vy = py + app.Scale(210);
+            int railW = app.Scale(150);
+            int railH = Gallery.tbVert.HeaderHeight(app) * Gallery.tbVert.Count();
+            Gallery.tbVert.RenderVertical(app, px, vy, railW, railH);
+            int pageX = px + railW + app.Scale(16);
+            int pageW = app.Scale(300);
+            Rect page = Panel.Section(app, pageX, vy, pageW, railH, Gallery.tbVert.ActiveLabel());
+            Label.Secondary(app, page.x, page.y, "Active page: " + Gallery.tbVert.ActiveLabel());
         } else if (name == "Steps") {
-            List<string> steps = new List<string>();
-            steps.Add("Details"); steps.Add("Review"); steps.Add("Done");
-            Steps.Render(app, px, py, w - app.Scale(36), steps, Gallery.demoInt);
+            // WYSIWYG: retained instances laid out by a column — no coordinates.
+            Steps s1 = new Steps(Gallery.demoInt);
+            s1.AddStep("Details"); s1.AddStep("Review"); s1.AddStep("Done");
+            Steps s2 = new Steps(SignalInt.Create(1));
+            s2.AddStep("Upload"); s2.AddStep("Verify"); s2.AddStep("Publish");
+            s2.Error(1);
+            Steps s3 = new Steps(SignalInt.Create(1));
+            s3.AddStepDesc("Account", "Email and password");
+            s3.AddStepDesc("Profile", "Name and avatar");
+            s3.AddStepDesc("Finish", "Review and submit");
+            s3.Vertical();
+            Panel col = Panel.Column().Gap(app.Scale(12));
+            col.With(new Label("Horizontal · bound current step").Variant(1));
+            col.With(s1);
+            col.With(new Label("Error state").Variant(1));
+            col.With(s2);
+            col.With(new Label("Vertical · with descriptions").Variant(1));
+            col.With(s3);
+            col.MeasureTree(app);
+            col.Arrange(px, py - app.Scale(20), w - app.Scale(36), app.Scale(380));
+            col.RenderTree(app);
         } else if (name == "Breadcrumb") {
-            List<string> crumbs = new List<string>();
-            crumbs.Add("Home"); crumbs.Add("Components"); crumbs.Add("Breadcrumb");
-            Breadcrumb.Render(app, px, py, crumbs);
+            // WYSIWYG: a retained Breadcrumb instance, auto-measured/placed.
+            Breadcrumb bc = new Breadcrumb();
+            bc.AddItem("Home"); bc.AddItem("Components"); bc.AddItem("Breadcrumb");
+            bc.MeasureTree(app);
+            bc.Arrange(px, py, w - app.Scale(36), Canvas.FontHeight(t.fontSizeMedium));
+            bc.RenderTree(app);
         } else if (name == "Menu") {
             List<string> menuItems = new List<string>();
             menuItems.Add("Overview"); menuItems.Add("Settings");
@@ -1286,8 +1415,25 @@ class Gallery {
         } else if (name == "PageHeader") {
             PageHeader.Render(app, px, py - app.Scale(16), w - app.Scale(36), "Component page", "Title, subtitle and back action");
         } else if (name == "Pagination") {
+            // Multiple styles, each bound to its own current-page signal.
+            Label.Secondary(app, px, py - app.Scale(18), "Default · windowed with ellipses");
             int id = Pagination.Render(app, px, py, 12, Gallery.demoInt);
             Pagination.HandleClick(app, id, 12, Gallery.demoInt);
+
+            int r2 = py + app.Scale(58);
+            Label.Secondary(app, px, r2 - app.Scale(18), "Pill · rounded buttons");
+            int id2 = Pagination.RenderPill(app, px, r2, 12, Gallery.pagePill);
+            Pagination.HandleClick(app, id2, 12, Gallery.pagePill);
+
+            int r3 = py + app.Scale(116);
+            Label.Secondary(app, px, r3 - app.Scale(18), "Small · compact size");
+            int id3 = Pagination.RenderSmall(app, px, r3, 12, Gallery.pageSmall);
+            Pagination.HandleClick(app, id3, 12, Gallery.pageSmall);
+
+            int r4 = py + app.Scale(168);
+            Label.Secondary(app, px, r4 - app.Scale(18), "Simple · prev / total / next");
+            int id4 = Pagination.RenderSimple(app, px, r4, 12, Gallery.pageSimple);
+            Pagination.HandleClickSimple(app, id4, 12, Gallery.pageSimple);
         } else if (name == "Card") {
             Card.Render(app, px, py - app.Scale(12), app.Scale(360), app.Scale(96), "Card");
             Label.Render(app, px + app.Scale(14), Card.ContentY(py - app.Scale(12), t), "Card content and actions");
@@ -1316,11 +1462,10 @@ class Gallery {
         } else if (name == "Statistic") {
             Statistic.Render(app, px, py, "Active users", "12,480");
         } else if (name == "Timeline") {
-            List<string> titles = new List<string>();
-            titles.Add("Created"); titles.Add("Published");
-            List<string> descs = new List<string>();
-            descs.Add("Project initialized"); descs.Add("Executable generated");
-            Timeline.Render(app, px, py - app.Scale(24), titles, descs);
+            List<TimelineItem> items = new List<TimelineItem>();
+            items.Add(TimelineItem.Create("09:00", "Created", "Project initialized"));
+            items.Add(TimelineItem.Create("12:30", "Published", "Executable generated"));
+            Timeline.Render(app, px, py - app.Scale(24), items);
         } else if (name == "VirtualList") {
             Gallery.demoVList.Render(app, px, py - app.Scale(16), app.Scale(300), app.Scale(150));
             Label.Secondary(app, px + app.Scale(320), py - app.Scale(16),
@@ -1464,9 +1609,47 @@ class Gallery {
         } else if (name == "Result") {
             Result.Render(app, px, py - app.Scale(30), w - app.Scale(36), 1, "Operation complete", "The requested action succeeded.");
         } else if (name == "Tooltip") {
-            int btnW = app.Scale(130);
-            Button.Create("Hover target").Render(app, px, py, btnW);
-            Tooltip.Render(app, px + btnW / 2, py, "Helpful context");
+            // Triggers: hover shows the tip while the pointer is over the target;
+            // click toggles it. Both drive the same Tooltip.RenderAt renderer.
+            Label.Secondary(app, px, py - app.Scale(28), "Triggers · hover / click");
+            int bw = app.Scale(120);
+            int hoverId = Button.Create("Hover me").Render(app, px, py, bw);
+            if (app.focus.IsHovered(hoverId)) {
+                Tooltip.RenderAt(app, px + bw / 2, py, "Shown on hover", 0, 0);
+            }
+            int clickX = px + bw + app.Scale(16);
+            int clickId = Button.Create("Click me").Render(app, clickX, py, bw);
+            if (Button.WasClicked(app, clickId)) {
+                Gallery.tipClickOn.Set(!Gallery.tipClickOn.Get());
+            }
+            if (Gallery.tipClickOn.Get()) {
+                Tooltip.RenderAt(app, clickX + bw / 2, py, "Toggled by click", 1, 0);
+            }
+
+            // Placements: four widely-spaced anchors, each always-on so all four
+            // sides are visible at once without overlapping.
+            int rowY = py + app.Scale(120);
+            Label.Secondary(app, px, rowY - app.Scale(30), "Placements · top / bottom / left / right");
+            int dot = app.Scale(7);
+            int pw = w - app.Scale(52);
+            int p0 = px + app.Scale(30);
+            int pstep = pw / 4;
+            c.FillCircle(p0, rowY, dot, t.primary);
+            Tooltip.RenderAt(app, p0, rowY - dot, "Top", 0, 0);
+            c.FillCircle(p0 + pstep, rowY, dot, t.primary);
+            Tooltip.RenderAt(app, p0 + pstep, rowY + dot, "Bottom", 1, 0);
+            c.FillCircle(p0 + pstep * 2, rowY, dot, t.primary);
+            Tooltip.RenderAt(app, p0 + pstep * 2 - dot, rowY, "Left", 2, 0);
+            c.FillCircle(p0 + pstep * 3, rowY, dot, t.primary);
+            Tooltip.RenderAt(app, p0 + pstep * 3 + dot, rowY, "Right", 3, 0);
+
+            // Long text: wraps automatically; a scrollbar appears past the cap.
+            int longY = py + app.Scale(250);
+            Label.Secondary(app, px, longY - app.Scale(8), "Long text · auto-wrap + scrollbar");
+            c.FillCircle(p0, longY + app.Scale(18), dot, t.info);
+            Tooltip.RenderAt(app, p0 + dot, longY + app.Scale(18),
+                "Long text wraps automatically onto multiple lines. When it grows past the height cap a scrollbar appears on the right so nothing is clipped away, and the bubble still stays fully on screen no matter which edge it is near.",
+                3, app.Scale(140));
         } else if (name == "Spin.plain") {
             Spin.Render(app, px + app.Scale(26), py + app.Scale(24), app.Scale(14), t.primary);
             Spin.Render(app, px + app.Scale(80), py + app.Scale(24), app.Scale(20), t.primary);
@@ -1483,8 +1666,29 @@ class Gallery {
             FloatButton.Render(app, px, py - app.Scale(8), app.Scale(48), "plus", 1);
             FloatButton.Render(app, px + app.Scale(72), py - app.Scale(8), app.Scale(48), "edit", 0);
         } else if (name == "Scrollbar") {
-            c.FillRoundRect(px, py - app.Scale(16), app.Scale(280), app.Scale(96), app.Scale(4), t.bgPrimary);
-            Scrollbar.RenderVertical(app, px + app.Scale(270), py - app.Scale(16), app.Scale(96), app.Scale(360), app.Scale(96));
+            // Interactive: drag the thumb or click the track to scroll the list.
+            int vx = px;
+            int vy = py - app.Scale(16);
+            int vw = app.Scale(300);
+            int vh = app.Scale(130);
+            int rowH = app.Scale(28);
+            int contentH = rowH * 16;
+            c.FillRoundRect(vx, vy, vw, vh, app.Scale(4), t.bgPrimary);
+            c.DrawRoundRect(vx, vy, vw, vh, app.Scale(4), t.borderPrimary, 1);
+            int off = Gallery.scrollOff.Get();
+            int mo = contentH - vh;
+            if (mo < 0) { mo = 0; }
+            if (off > mo) { off = mo; }
+            c.PushClip(vx, vy, vw - app.Scale(16), vh);
+            int ri = 0;
+            while (ri < 16) {
+                int ry = vy + ri * rowH - off + app.Scale(6);
+                Label.Render(app, vx + app.Scale(14), ry, "List row " + Convert.ToString(ri + 1));
+                ri = ri + 1;
+            }
+            c.PopClip();
+            Scrollbar.RenderVerticalScroll(app, vx + vw - app.Scale(13), vy,
+                vh, vh, contentH, Gallery.scrollOff);
         } else if (name == "TabView") {
             List<string> labels = new List<string>();
             labels.Add("main.zan"); labels.Add("gui.zan"); labels.Add("README");
@@ -1519,9 +1723,37 @@ class Gallery {
                 app.Scale(110), app.Scale(4), t.bgPrimary);
             Label.Secondary(app, rx + app.Scale(20), py + app.Scale(4), "Second pane");
         } else if (name == "FilePicker") {
-            Button.Primary("Choose file...").Render(app, px, py, app.Scale(150));
-            Label.Secondary(app, px, py + app.Scale(40),
-                "Opens a modal file dialog (see the code below).");
+            // Live: each button opens the real modal dialog window; the chosen
+            // path is read back from TakeResult() in the main loop.
+            int fbw = app.Scale(150);
+            int fbh = t.heightMedium;
+            int fgap = app.Scale(10);
+            int ofId = Button.Create("Open file...").Render(app, px, py, fbw);
+            if (Button.WasClicked(app, ofId)) {
+                Gallery.filePicker.BeginOpenFile("", ".zan", "Open file");
+            }
+            int odId = Button.Create("Open folder...").Render(app, px + fbw + fgap, py, fbw);
+            if (Button.WasClicked(app, odId)) {
+                Gallery.filePicker.BeginFolder("", "Open folder");
+            }
+            int fr2 = py + fbh + fgap;
+            int sfId = Button.Create("Save file...").Render(app, px, fr2, fbw);
+            if (Button.WasClicked(app, sfId)) {
+                Gallery.filePicker.BeginSaveFile("", ".zan", "untitled.zan", "Save file");
+            }
+            int sdId = Button.Create("Save to folder...").Render(app, px + fbw + fgap, fr2, fbw);
+            if (Button.WasClicked(app, sdId)) {
+                Gallery.filePicker.BeginFolder("", "Save to folder");
+            }
+            int fry = fr2 + fbh + app.Scale(16);
+            if (Gallery.pickerResult != "") {
+                Label.Render(app, px, fry, "Selected path:");
+                Label.Secondary(app, px, fry + app.Scale(20),
+                    Ellipsis.Fit(Gallery.pickerResult, w - app.Scale(52), t.fontSizeMedium));
+            } else {
+                Label.Secondary(app, px, fry,
+                    "No selection yet -- click a button to open a dialog.");
+            }
         } else if (name == "CodeEditor") {
             Label.Render(app, px, py - app.Scale(12),
                 "The code panel below is a read-only CodeEditor view.");
@@ -1593,15 +1825,15 @@ class Gallery {
             Label.Secondary(app, px, py + t.heightMedium + app.Scale(10),
                 "click to open · Change fires on select");
         } else if (name == "Dropdown") {
-            Dropdown.RenderTrigger(app, px, py, app.Scale(150),
-                t.heightMedium, "Actions", true);
-            List<string> items = new List<string>();
-            items.Add("Edit"); items.Add("Delete");
-            Dropdown.RenderMenu(app, px + app.Scale(166), py, app.Scale(160), items);
+            // Retained: click to open; the menu defers to the overlay layer so
+            // it draws on top, blocks click-through and closes on outside press.
+            Gallery.demoDropdown.Render(app, px, py, app.Scale(160), t.heightMedium);
+            Label.Secondary(app, px, py + t.heightMedium + app.Scale(10),
+                "click to open · Change fires on choose");
         } else if (name == "Popover") {
-            Popover.Render(app, px + app.Scale(140), py + app.Scale(6),
-                app.Scale(280), app.Scale(96), "Popover",
-                "Anchored explanatory content.");
+            // Retained: click the trigger to open an anchored, word-wrapped,
+            // click-blocking panel that closes on an outside press or Esc.
+            Gallery.demoPopover.Render(app, px, py, app.Scale(150), t.heightMedium);
         } else if (name == "DataTable") {
             List<DataColumn> cols = new List<DataColumn>();
             cols.Add(DataColumn.Text("Name", app.Scale(160)));
@@ -1869,8 +2101,8 @@ class Gallery {
             .AddProp("icons", "List<string>", "-", "Per-entry icon names.")
             .AddProp("sel", "SignalInt", "-", "Selected entry index (two-way).");
         Gallery.Add(list, "Layout", "FilePicker",
-            "A modal open/save/folder dialog. Begin a session, render its content each frame, and read the chosen path when it closes.",
-            "FilePicker fp = FilePicker.Create();\nfp.BeginOpenFile(\"\", \".zan\", \"Open file\");\n// each frame while open:\nfp.RenderContent(app);\nif (!fp.IsOpen()) {\n    string path = fp.SelectedPath();\n}")
+            "A modal open/save/folder dialog in its own OS window. Begin a session, route its window events in your loop, and read the chosen path from TakeResult().",
+            "FilePicker fp = FilePicker.Create();\n// start any of the four modes on a click:\nfp.BeginOpenFile(\"\", \".zan\", \"Open file\");\nfp.BeginFolder(\"\", \"Open folder\");\nfp.BeginSaveFile(\"\", \".zan\", \"untitled.zan\", \"Save file\");\nfp.BeginFolder(\"\", \"Save to folder\");\n\n// in the event loop, route the dialog's own window:\nint evh = Window.EventHwnd();\nif (fp.IsOpen() || fp.OwnsWindow(evh)) {\n    fp.ApplyEvent(evh);\n} else {\n    app.ApplyEvent(evh);\n}\nfp.RenderWindow();\nif (fp.TakeResult() == 1) {\n    string path = fp.SelectedPath();\n}")
             .AddProp("mode", "BeginOpenFile/Save/Folder", "-", "Which dialog to start.")
             .AddProp("filter", "string", "-", "Extension filter, e.g. \".zan\".")
             .AddProp("title", "string", "-", "Dialog title.")
@@ -2081,7 +2313,7 @@ class Gallery {
             .AddProp("value", "string", "-", "Highlighted value.");
         Gallery.Add(list, "Data Display", "Timeline",
             "Display ordered events with titles and descriptions.",
-            "List<string> titles = new List<string>();\ntitles.Add(\"Created\"); titles.Add(\"Published\");\nList<string> descs = new List<string>();\ndescs.Add(\"Project initialized\"); descs.Add(\"Executable generated\");\nTimeline.Render(app, 40, 60, titles, descs);")
+            "List<TimelineItem> items = new List<TimelineItem>();\nitems.Add(TimelineItem.Create(\"09:00\", \"Created\", \"Project initialized\"));\nitems.Add(TimelineItem.Create(\"12:30\", \"Published\", \"Executable generated\"));\nTimeline.Render(app, 40, 60, items);")
             .AddProp("titles", "List<string>", "-", "Per-event titles.")
             .AddProp("descs", "List<string>", "-", "Per-event descriptions.");
         Gallery.Add(list, "Data Display", "ListView",
@@ -2223,22 +2455,25 @@ class Gallery {
             .AddProp("Text(x, y, w)", "helper", "-", "Single text-line placeholder.")
             .AddProp("Rect(x, y, w, h)", "helper", "-", "Rectangular block placeholder.");
         Gallery.Add(list, "Feedback", "Tooltip",
-            "Tooltip draws a small floating hint anchored at a point.",
-            "Tooltip.Render(app, 120, 80, \"More information\");")
-            .AddProp("text", "string", "-", "Hint text shown in the bubble.");
+            "A floating hint anchored to a point. Four placements (Top/Bottom/Left/Right, auto-flipping near a screen edge), automatic word wrapping when a max width is given, and a scrollbar when the wrapped text is taller than the height cap. Show it from any trigger: on hover, or toggled by a click.",
+            "// hover trigger:\nint id = Button.Create(\"Hover me\").Render(app, 40, 60, 120);\nif (app.focus.IsHovered(id)) {\n    Tooltip.RenderAt(app, 100, 60, \"Shown on hover\", Tooltip.Top(), 0);\n}\n// click trigger (toggle a SignalBool):\nif (Button.WasClicked(app, clickId)) { open.Set(!open.Get()); }\nif (open.Get()) { Tooltip.RenderAt(app, x, y, \"Toggled\", Tooltip.Bottom(), 0); }\n// long text: pass a max width (px) to wrap; a scrollbar appears past the cap:\nTooltip.RenderAt(app, x, y, longText, Tooltip.Right(), 190);")
+            .AddProp("text", "string", "-", "Hint text shown in the bubble.")
+            .AddProp("placement", "int", "Top()", "Top / Bottom / Left / Right (auto-flips near an edge).")
+            .AddProp("maxW", "int", "0", "Wrap width in px; 0 = single line.");
         Gallery.Add(list, "Feedback", "Popover",
-            "Display titled explanatory content next to an anchor.",
-            "Popover.Render(app, 180, 80, 260, 140, \"Details\", \"Additional information\");")
-            .AddProp("w", "int", "-", "Popover width in px.")
-            .AddProp("h", "int", "-", "Popover height in px.")
+            "Retained popover. Owns its open state and paints in the overlay pass, so the panel draws above other content, blocks clicks to the widgets beneath it (no click-through), word-wraps its body, clamps to the window on every edge and closes on an outside press or Esc.",
+            "Popover pop = Popover.Create(\"More info\", \"Title\", \"Body text that wraps.\", 260);\n// each frame (in the overlay pass so it sits on top):\npop.Render(app, x, y, w, h);")
             .AddProp("title", "string", "-", "Heading.")
-            .AddProp("content", "string", "-", "Body text.");
+            .AddProp("body", "string", "-", "Word-wrapped body text.")
+            .AddProp("w", "int", "-", "Panel width in px (clamped to the window).")
+            .AddEvent("open / close", "click / outside / Esc", "Trigger toggles; outside press or Esc closes.");
         Gallery.Add(list, "Feedback", "Dropdown",
-            "Combine a trigger button with an anchored menu of actions.",
-            "int trigger = Dropdown.RenderTrigger(app, 40, 60, 160, 34, \"Actions\", true);\nList<string> items = new List<string>();\nitems.Add(\"Edit\"); items.Add(\"Delete\");\nint chosen = Dropdown.RenderMenu(app, 40, 98, 180, items);")
+            "Retained dropdown. Owns its open state and defers the action list to the framework overlay layer, so the menu always draws on top, blocks clicks to the widgets beneath it (no click-through) and closes on an outside press or Esc. Change fires on choose; Chosen() is the picked index.",
+            "List<string> items = new List<string>();\nitems.Add(\"Edit\"); items.Add(\"Duplicate\"); items.Add(\"Delete\");\nDropdown menu = Dropdown.Create(\"Actions\", items);\nmenu.Change += () => { int a = menu.Chosen(); ... };\n// each frame:\nmenu.Render(app, x, y, w, h);")
             .AddProp("label", "string", "-", "Trigger button text.")
             .AddProp("items", "List<string>", "-", "Menu actions.")
-            .AddEvent("RenderMenu(...)", "int", "Returns the chosen action index, or -1.");
+            .AddProp("Chosen()", "int", "-", "Index of the last chosen action, or -1.")
+            .AddEvent("Change", "menu.Change += h", "Fires when an action is chosen.");
         Gallery.Add(list, "Feedback", "Layer",
             "The unified overlay component (layui `layer` style): one API for every popup. Message toasts and corner notifications are animated auto-dismissing queues that collapse upward; Alert / Confirm / Prompt are centered modal dialogs; Load is a masked spinner; Tips is an anchored bubble; draggable windows (min / max / restore / close) act as page layers; Photos is a full-screen image carousel. Every layer animates on open.",
             "// transient queues (auto-dismiss + animate):\nLayer.Msg(\"Saved successfully\", 3);\nLayer.Notify(\"Build completed\", 3);\n// centered modal dialogs:\nLayerState ask = LayerState.Confirm(\"Delete?\", \"This cannot be undone.\", 2);\nask.Open();\nLayerState edit = LayerState.Prompt(\"Rename\", \"new name\");\nedit.Open();\n// draggable page window:\nLayerState win = LayerState.Create(\"Window\", 360, 150, 400, 230);\nwin.Open();\nwins.Add(win);\n// each frame, in the overlay pass:\nLayer.RenderStack(app, wins);\nLayer.Render(app, ask);\nLayer.RenderToasts(app);\nLayer.RenderNotifs(app);")
@@ -2261,29 +2496,26 @@ class Gallery {
 
     static void BuildNavigation(List<Comp> list) {
         Gallery.Add(list, "Navigation", "Tabs",
-            "Tabs render a row of labels; the active tab index is a SignalInt.",
-            "List<string> labels = new List<string>();\nlabels.Add(\"General\"); labels.Add(\"Advanced\");\nSignalInt active = SignalInt.Create(0);\nint first = Tabs.Render(app, 40, 40, 400, labels, active);\nTabs.HandleClick(app, first, labels.Count, active);")
-            .AddProp("w", "int", "-", "Row width in px.")
-            .AddProp("labels", "List<string>", "-", "Tab titles.")
-            .AddProp("active", "SignalInt", "-", "Active tab index (two-way).")
-            .AddEvent("Change", "HandleClick(...)", "Clicking a tab sets active.");
-        Gallery.Add(list, "Navigation", "TabBar",
-            "High-level, self-contained tab bar. Owns its tab list, active index, closable tabs, horizontal overflow (mouse wheel + chevrons) and a right-click context menu (Close / Close others / Close all). Styles: Line, Card, Segment. One Render() call draws and handles everything.",
-            "TabBar tabs = TabBar.Create(TabBar.Card());\ntabs.Add(\"Overview\", false);   // (label, closable)\ntabs.Add(\"Details\", true);\n// each frame:\ntabs.Render(app, 40, 40, 360);\nint now = tabs.Active();\nint closed = tabs.TakeClosed(); // index removed, or -1")
+            "Retained, self-contained tab component (an enhanced TabView). Owns its tab list, active index and closable state; draws only the header strip so the caller renders the active page into a separate region. Styles: Line, Card, Segment. Orientation: horizontal top strip or vertical side rail. Supports add (+), close, right-click context menu (Close / Close others / Close all) and horizontal overflow (mouse wheel + chevrons).",
+            "Tabs tabs = Tabs.Create(Tabs.Card());   // or Tabs.CreateVertical(...)\ntabs.SetShowAdd(true);                   // trailing \"+\" button\ntabs.Add(\"Overview\", false);             // (label, closable)\ntabs.Add(\"Details\", true);\n// each frame - header only:\ntabs.Render(app, 40, 40, 360);           // or RenderVertical(app, x, y, w, h)\n// ...then draw your own page for tabs.Active() in the body region.\nint now   = tabs.Active();\nint added = tabs.TakeAdded();            // index appended, or -1\nint shut  = tabs.TakeClosed();           // index removed, or -1")
             .AddProp("style", "int", "-", "Line, Card or Segment.")
+            .AddProp("orient", "int", "-", "Horizontal or Vertical.")
             .AddProp("tabs", "(label, closable)", "-", "Added via Add().")
             .AddEvent("Active()", "int", "Current active tab index.")
+            .AddEvent("TakeAdded()", "int", "Tab appended this frame, or -1.")
             .AddEvent("TakeClosed()", "int", "Tab removed this frame, or -1.");
         Gallery.Add(list, "Navigation", "Steps",
             "Show progress through a sequence of labeled steps.",
-            "List<string> labels = new List<string>();\nlabels.Add(\"Details\"); labels.Add(\"Review\"); labels.Add(\"Done\");\nSignalInt current = SignalInt.Create(1);\nSteps.Render(app, 40, 60, 520, labels, current);")
-            .AddProp("w", "int", "-", "Row width in px.")
-            .AddProp("labels", "List<string>", "-", "Step titles.")
-            .AddProp("current", "SignalInt", "-", "Index of the active step.");
+            "// Retained: auto-measured/placed by its parent container -- no coordinates.\nSteps s = new Steps(SignalInt.Create(1));\ns.AddStep(\"Details\"); s.AddStep(\"Review\"); s.AddStep(\"Done\");\npanel.Add(s);\n// variants (fluent):\ns.Vertical();          // stack top-to-bottom\ns.Error(1);            // mark step 1 as errored (red !)\ns.AddStepDesc(\"Account\", \"Email and password\"); // step + description")
+            .AddProp("current", "SignalInt", "-", "Index of the active step (constructor).")
+            .AddProp("AddStep(label)", "void", "-", "Append a step.")
+            .AddProp("AddStepDesc(label, desc)", "void", "-", "Append a step with a description line.")
+            .AddProp("Vertical()", "Steps", "horizontal", "Stack vertically instead.")
+            .AddProp("Error(i)", "Steps", "-1", "Mark step i as errored.");
         Gallery.Add(list, "Navigation", "Breadcrumb",
             "Show the current location as a sequence of navigation labels.",
-            "List<string> items = new List<string>();\nitems.Add(\"Home\"); items.Add(\"Projects\"); items.Add(\"Zan\");\nBreadcrumb.Render(app, 40, 60, items);")
-            .AddProp("items", "List<string>", "-", "Path segments, root first.");
+            "// Retained: chevron separators, vertically centred, auto-placed.\nBreadcrumb bc = new Breadcrumb();\nbc.AddItem(\"Home\"); bc.AddItem(\"Projects\"); bc.AddItem(\"Zan\");\npanel.Add(bc);")
+            .AddProp("AddItem(label)", "void", "-", "Append a path segment (root first).");
         Gallery.Add(list, "Navigation", "Menu",
             "A vertical application menu with a SignalInt active item.",
             "List<string> labels = new List<string>();\nlabels.Add(\"Home\"); labels.Add(\"Settings\");\nSignalInt active = SignalInt.Create(0);\nint first = Menu.RenderVertical(app, 40, 60, 220, 300, 36, labels, active, 0);\nMenu.HandleClick(app, first, labels.Count, active);")
@@ -2299,16 +2531,19 @@ class Gallery {
             .AddProp("subtitle", "string", "-", "Secondary line.")
             .AddEvent("Render(...)", "int", "Returns the back-action id (use Ui.Clicked).");
         Gallery.Add(list, "Navigation", "Pagination",
-            "Navigate pages with a SignalInt current page.",
-            "SignalInt page = SignalInt.Create(1);\nint id = Pagination.Render(app, 40, 60, 12, page);\nPagination.HandleClick(app, id, 12, page);")
+            "Navigate pages with a SignalInt current page. Styles: Render (windowed numbers with ellipses), RenderPill (rounded), RenderSmall (compact) and RenderSimple (prev / total / next).",
+            "SignalInt page = SignalInt.Create(1);\n// pick a style:\nint id = Pagination.Render(app, 40, 60, 12, page);       // windowed numbers\n// int id = Pagination.RenderPill(app, 40, 60, 12, page);  // rounded\n// int id = Pagination.RenderSmall(app, 40, 60, 12, page); // compact\nPagination.HandleClick(app, id, 12, page);\n// the minimal style has its own click handler:\nint sid = Pagination.RenderSimple(app, 40, 100, 12, page);\nPagination.HandleClickSimple(app, sid, 12, page);")
             .AddProp("total", "int", "-", "Number of pages.")
             .AddProp("page", "SignalInt", "-", "Current page (two-way).")
+            .AddProp("RenderPill / RenderSmall", "int", "-", "Rounded / compact styles (use HandleClick).")
+            .AddProp("RenderSimple", "int", "-", "prev / total / next (use HandleClickSimple).")
             .AddEvent("Change", "HandleClick(...)", "Clicking a page sets page.");
         Gallery.Add(list, "Navigation", "Scrollbar",
-            "Draw a vertical scrollbar for a custom scrollable surface.",
-            "Scrollbar.RenderVertical(app, 500, 60, 240, 900, 120);")
+            "A vertical scrollbar for a custom scrollable surface. RenderVerticalScroll is interactive: drag the thumb or click the track (the thumb centres on the pointer) to update a bound scroll-offset signal. RenderVertical is the static, display-only variant.",
+            "SignalInt off = SignalInt.Create(0);\n// clip + draw your content shifted up by off.Get(), then:\nScrollbar.RenderVerticalScroll(app, x, y, barH, viewH, contentH, off);\n// static (display-only):\nScrollbar.RenderVertical(app, x, y, barH, contentH, off.Get());")
             .AddProp("viewH", "int", "-", "Visible viewport height in px.")
             .AddProp("contentH", "int", "-", "Total content height in px.")
-            .AddProp("offset", "int", "-", "Current scroll offset in px.");
+            .AddProp("offset", "SignalInt", "-", "Bound scroll offset (RenderVerticalScroll updates it).")
+            .AddEvent("Drag / click", "RenderVerticalScroll", "Updates offset in [0, contentH - viewH].");
     }
 }
