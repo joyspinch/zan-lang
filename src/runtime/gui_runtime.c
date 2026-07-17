@@ -1713,6 +1713,11 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     return 0;
 }
 
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
+    DestroyWindow((HWND)(intptr_t)hwnd_val);
+    return 0;
+}
+
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     WINDOWPLACEMENT wpl; wpl.length = sizeof(wpl);
@@ -2287,6 +2292,35 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
     if (!win) return 1;
     SDL_ShowWindow(win);
     SDL_RaiseWindow(win);
+#ifdef _WIN32
+    /* SDL_RaiseWindow does not reliably steal the OS foreground for a
+     * borderless secondary window, so mouse/keyboard input keeps routing
+     * to whatever window was active (usually the parent below). Force the
+     * activation the way a normal dialog would, so the child owns input. */
+    {
+        HWND chwnd = (HWND)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(win),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        if (chwnd) {
+            /* Windows blocks SetForegroundWindow from a thread that does
+             * not own the current foreground; briefly attach to the active
+             * window's input thread so the activation is allowed. */
+            HWND fg = GetForegroundWindow();
+            DWORD fgTid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+            DWORD myTid = GetCurrentThreadId();
+            if (fgTid && fgTid != myTid) {
+                AttachThreadInput(myTid, fgTid, TRUE);
+            }
+            SetForegroundWindow(chwnd);
+            SetActiveWindow(chwnd);
+            SetFocus(chwnd);
+            BringWindowToTop(chwnd);
+            if (fgTid && fgTid != myTid) {
+                AttachThreadInput(myTid, fgTid, FALSE);
+            }
+        }
+    }
+#endif
     /* Route typed text (incl. IME commits) to this window. */
     SDL_StartTextInput(win);
     return 0;
@@ -2308,6 +2342,31 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     zq_push(8, 0, 0, 0, 0, 0, win);
     if (win == g_main_win) g_quit = 1;
+    return 0;
+}
+
+/* Actually tear down a (non-main) window: SDL_close_window only enqueues a
+ * kind-8 event so the app can react; the owner calls this once it has fully
+ * unwound its state, so a dialog does not linger on screen as an orphan. */
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win || win == g_main_win) return 1;
+    /* Drop any still-queued events aimed at this window so a later pop
+     * never dereferences a destroyed SDL_Window. */
+    for (int i = g_zq_head; i != g_zq_tail; i = (i + 1) % ZAN_ZQ_CAP) {
+        if (g_zq[i].win == win) { g_zq[i].e[0] = 0; g_zq[i].win = NULL; }
+    }
+    if (g_event_win == win) g_event_win = NULL;
+    zan_sdl_win_t *rec = sdl_find(win);
+    if (rec) {
+        if (rec->tex) SDL_DestroyTexture(rec->tex);
+        if (rec->ren) SDL_DestroyRenderer(rec->ren);
+        SDL_DestroyWindow(rec->win);
+        int idx = (int)(rec - g_wins);
+        g_wins[idx] = g_wins[--g_win_count];
+    } else {
+        SDL_DestroyWindow(win);
+    }
     return 0;
 }
 
@@ -4007,6 +4066,11 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     return 0;
 }
 
+/* On Linux close_window already destroys the X window synchronously, so the
+ * owner-driven destroy is a no-op kept for FFI symbol parity across
+ * backends. */
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+
 /* Native glass on Linux: ask a compositing WM (KWin, or picom via rules) to
  * blur whatever is behind the window by setting the de-facto standard
  * _KDE_NET_WM_BLUR_BEHIND_REGION property. An empty region means "blur the
@@ -4223,6 +4287,7 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 1; }
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }

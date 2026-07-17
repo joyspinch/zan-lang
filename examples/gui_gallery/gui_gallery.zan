@@ -200,6 +200,7 @@ class Gallery {
     static Popover demoPopover;
     static FilePicker filePicker;
     static string pickerResult;
+    static string pendingPicker;
     static VirtualList demoVList;
     static CarouselAnim demoCarousel;
     static SignalInt demoCarBasic;
@@ -262,6 +263,7 @@ class Gallery {
     static SignalInt pageSmall;
     static SignalInt pageSimple;
     static SignalInt scrollOff;
+    static SignalInt tipScroll;
     static SignalBool photosOpen;
     static int loadStartMs;
     static SignalInt photoIdx;
@@ -273,6 +275,8 @@ class Gallery {
     static int selFL;
     static int selFC;
     static int copiedFrame;
+    // Interactive Tag demo: closable chips the user can remove (x) or append (+ Add).
+    static List<string> demoTags;
 
     // Reusable visual component designer (framework component).
     static Designer designer;
@@ -353,6 +357,9 @@ class Gallery {
         Gallery.tbVert.Add("Run", false);
         Gallery.selHas = false;
         Gallery.selDrag = false;
+        Gallery.demoTags = new List<string>();
+        Gallery.demoTags.Add("Design"); Gallery.demoTags.Add("Frontend");
+        Gallery.demoTags.Add("Urgent");
         List<string> lowOpts = new List<string>();
         lowOpts.Add("Default"); lowOpts.Add("Success"); lowOpts.Add("Warning");
         Gallery.demoSelectLow = Select.Bind(lowOpts, Gallery.demoInt, "Choose a state");
@@ -363,6 +370,7 @@ class Gallery {
             "Popover", "Anchored, word-wrapped content that stays on screen and blocks clicks to the widgets beneath it.", app.Scale(260));
         Gallery.filePicker = FilePicker.Create();
         Gallery.pickerResult = "";
+        Gallery.pendingPicker = "";
         Gallery.copiedIcon = "";
         Gallery.demoTableState = DataTableState.Create();
         Gallery.demoLayers = new List<LayerState>();
@@ -376,6 +384,7 @@ class Gallery {
         Gallery.pageSmall = SignalInt.Create(3);
         Gallery.pageSimple = SignalInt.Create(1);
         Gallery.scrollOff = SignalInt.Create(0);
+        Gallery.tipScroll = SignalInt.Create(0);
         Gallery.photosOpen = SignalBool.Create(false);
         Gallery.loadStartMs = 0;
         Gallery.photoIdx = SignalInt.Create(0);
@@ -449,6 +458,13 @@ class Gallery {
                         Gallery.SpawnLayer(app);
                         if (st == "two") { Gallery.SpawnLayer(app); }
                     }
+                } else if (want == "FilePicker") {
+                    Gallery.pendingPicker = "file";
+                    if (Environment.ArgCount() > 2) {
+                        Gallery.pendingPicker = Environment.ArgAt(2);
+                    }
+                } else if (want == "Dropdown") {
+                    Gallery.demoDropdown.Open();
                 }
             }
         }
@@ -468,6 +484,25 @@ class Gallery {
         // Freeze the id baseline after all retained ids (chrome etc.) exist, so
         // the per-frame ResetFrame() below never reissues one of them.
         WidgetId.Mark();
+        // Deep-link dialog opens are deferred to here: paint the main window once
+        // so it owns the OS foreground, then open the child so its show-time
+        // focus grab succeeds (opening before the parent is foreground lets the
+        // parent steal focus straight back).
+        if (Gallery.pendingPicker != "") {
+            app.BeginFrame();
+            WidgetId.ResetFrame();
+            Gallery.Render(app);
+            app.RenderChrome("Zan GUI Components");
+            app.PresentFrame();
+            if (Gallery.pendingPicker == "folder") {
+                Gallery.filePicker.BeginFolder("", "Open folder");
+            } else if (Gallery.pendingPicker == "save") {
+                Gallery.filePicker.BeginSaveFile("", ".zan", "untitled.zan", "Save file");
+            } else {
+                Gallery.filePicker.BeginOpenFile("", ".zan", "Open file");
+            }
+            Gallery.pendingPicker = "";
+        }
         while (app.isRunning) {
             // One shared event pump drives BOTH the main window and the
             // FilePicker's child dialog window (open/save file/folder). Poll (to
@@ -689,7 +724,8 @@ class Gallery {
                         t.textTertiary, t.fontSizeSmall);
                 } else {
                     bool selRow = d == sel;
-                    bool hot = app.mouseX >= area.x && app.mouseX < area.x + sw
+                    bool hot = !app.PointerCaptured()
+                        && app.mouseX >= area.x && app.mouseX < area.x + sw
                         && app.mouseY >= listTop && app.mouseY < listBottom
                         && app.mouseY >= ry && app.mouseY < ry + rowH;
                     if (selRow) {
@@ -978,7 +1014,7 @@ class Gallery {
         int t1X = t0X + t0W + app.Scale(4);
         Gallery.DrawCodeTab(app, c, t, "Zan", t0X, tabY, t0W, tabH, tab == 0);
         Gallery.DrawCodeTab(app, c, t, "JSON", t1X, tabY, t1W, tabH, tab == 1);
-        if (app.window.EventKind() == 3) {
+        if (app.window.EventKind() == 3 && !app.PointerCaptured()) {
             if (app.mouseX >= t0X && app.mouseX < t0X + t0W
                 && app.mouseY >= tabY && app.mouseY < tabY + tabH) {
                 d.tab = 0; app.RequestRedraw();
@@ -992,15 +1028,21 @@ class Gallery {
         int cpH = app.Scale(20);
         int cpX = cx + cw - cpW - app.Scale(8);
         int cpY = cy + app.Scale(4);
-        bool cpHot = app.mouseX >= cpX && app.mouseX < cpX + cpW
+        bool cpHot = !app.PointerCaptured()
+            && app.mouseX >= cpX && app.mouseX < cpX + cpW
             && app.mouseY >= cpY && app.mouseY < cpY + cpH;
         int cpBg = t.primary;
         if (cpHot) { cpBg = t.primaryHover; }
         c.FillRoundRect(cpX, cpY, cpW, cpH, app.Scale(3), cpBg);
-        Icon.Draw(c, "copy", cpX + app.Scale(8), cpY + app.Scale(4),
-            app.Scale(12), 0xFFFFFFFF);
-        c.DrawText(cpX + app.Scale(24), cpY + app.Scale(3), "Copy",
-            0xFFFFFFFF, fs);
+        // Icon + label vertically centered as one group in the pill.
+        int cpIconSz = app.Scale(13);
+        int cpTxtW = Canvas.MeasureText("Copy", fs);
+        int cpGap = app.Scale(6);
+        int cpContentX = cpX + (cpW - (cpIconSz + cpGap + cpTxtW)) / 2;
+        Icon.Draw(c, "copy", cpContentX, cpY + (cpH - cpIconSz) / 2,
+            cpIconSz, 0xFFFFFFFF);
+        c.DrawText(cpContentX + cpIconSz + cpGap,
+            cpY + (cpH - Canvas.FontHeight(fs)) / 2, "Copy", 0xFFFFFFFF, fs);
         if (app.window.EventKind() == 3 && cpHot) {
             Clipboard.SetText(src);
             app.RequestRedraw();
@@ -1032,7 +1074,8 @@ class Gallery {
     /// A small pill tab in the code panel header (Zan / JSON switch).
     static void DrawCodeTab(App app, Canvas c, Theme t, string label,
             int x, int y, int w, int h, bool active) {
-        bool hot = app.mouseX >= x && app.mouseX < x + w
+        bool hot = !app.PointerCaptured()
+            && app.mouseX >= x && app.mouseX < x + w
             && app.mouseY >= y && app.mouseY < y + h;
         int bg = 0xFF2D2D30;
         int fg = t.textTertiary;
@@ -1040,7 +1083,9 @@ class Gallery {
         else if (hot) { bg = 0xFF3E3E42; fg = 0xFFFFFFFF; }
         c.FillRoundRect(x, y, w, h, app.Scale(3), bg);
         int tw = Canvas.MeasureText(label, t.fontSizeSmall);
-        c.DrawText(x + (w - tw) / 2, y + app.Scale(3), label, fg, t.fontSizeSmall);
+        c.DrawText(x + (w - tw) / 2,
+            y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2, label,
+            fg, t.fontSizeSmall);
     }
 
     /// Maps a mouse y to a code line index (clamped to the snippet).
@@ -1128,7 +1173,7 @@ class Gallery {
         if (name == "DataTable") { return 200; }
         if (name == "PivotTable") { return 200; }
         if (name == "Chart") { return 210; }
-        if (name == "Alert") { return 300; }
+        if (name == "Alert") { return 360; }
         if (name == "Ellipsis") { return 180; }
         if (name == "Timeline") { return 240; }
         if (name == "TreeView") { return 190; }
@@ -1146,7 +1191,8 @@ class Gallery {
         if (name == "TabView") { return 190; }
         if (name == "Wizard") { return 210; }
         if (name == "Split") { return 180; }
-        if (name == "Result") { return 190; }
+        if (name == "Result") { return 210; }
+        if (name == "Tag") { return 170; }
         if (name == "Progress") { return 210; }
         if (name == "Compose") { return 230; }
         if (name == "Designer") { return 860; }
@@ -1304,7 +1350,8 @@ class Gallery {
                 int gc = gi % gcols;
                 int gx = gx0 + gc * cell;
                 int gy = gy0 + gr * cell;
-                bool hot = app.mouseX >= gx && app.mouseX < gx + cell
+                bool hot = !app.PointerCaptured()
+                    && app.mouseX >= gx && app.mouseX < gx + cell
                     && app.mouseY >= gy && app.mouseY < gy + cell;
                 if (hot) {
                     c.FillRoundRect(gx, gy, cell - app.Scale(4), cell - app.Scale(4),
@@ -1438,13 +1485,44 @@ class Gallery {
             Card.Render(app, px, py - app.Scale(12), app.Scale(360), app.Scale(96), "Card");
             Label.Render(app, px + app.Scale(14), Card.ContentY(py - app.Scale(12), t), "Card content and actions");
         } else if (name == "Panel") {
-            Rect content = Panel.Section(app, px, py - app.Scale(20), w - app.Scale(36), app.Scale(96), "Panel title");
-            Label.Render(app, content.x, content.y, "Panel content");
+            // Panel is a titleless container surface (fill + border + padding);
+            // use Card when you want a titled header. Both share FillSurface.
+            Rect content = Panel.Card(app, px, py - app.Scale(20), w - app.Scale(36), app.Scale(96));
+            Label.Render(app, content.x, content.y, "Titleless container surface");
+            Label.Secondary(app, content.x, content.y + app.Scale(26),
+                "Group content here; reach for Card when a header is needed.");
         } else if (name == "Tag") {
+            // Row 1: colour variants.
             Tag.Render(app, px, py, "Default", 0);
-            Tag.Render(app, px + app.Scale(100), py, "Success", 1);
-            Tag.Render(app, px + app.Scale(200), py, "Warning", 2);
-            Tag.Render(app, px + app.Scale(300), py, "Error", 3);
+            Tag.Render(app, px + app.Scale(84), py, "Primary", 1);
+            Tag.Render(app, px + app.Scale(168), py, "Info", 2);
+            Tag.Render(app, px + app.Scale(240), py, "Success", 3);
+            Tag.Render(app, px + app.Scale(330), py, "Warning", 4);
+            Tag.Render(app, px + app.Scale(426), py, "Error", 5);
+            // Row 2: interactive closable chips + an "+ Add" action.
+            Label.Secondary(app, px, py + app.Scale(30), "Closable · click x to remove, + Add to append");
+            int ty2 = py + app.Scale(54);
+            int tx = px;
+            int ti = 0;
+            while (ti < Gallery.demoTags.Count) {
+                string tg = Gallery.demoTags[ti];
+                int cid = Tag.RenderClosable(app, tx, ty2, tg, 1);
+                int tgw = Canvas.MeasureText(tg, t.fontSizeSmall) + t.paddingSmall * 2 + app.Scale(16);
+                if (Ui.Clicked(app, cid)) {
+                    Gallery.demoTags.RemoveAt(ti);
+                    app.RequestRedraw();
+                } else {
+                    tx = tx + tgw + app.Scale(8);
+                    ti = ti + 1;
+                }
+            }
+            Button addBtn = Button.Styled("+ Add", 1, 1);
+            addBtn.SetSize(1);
+            int abId = addBtn.Render(app, tx, ty2 - app.Scale(2), app.Scale(64));
+            if (Button.WasClicked(app, abId)) {
+                Gallery.demoTags.Add("Tag " + Convert.ToString(Gallery.demoTags.Count + 1));
+                app.RequestRedraw();
+            }
         } else if (name == "Avatar.text") {
             Avatar.Render(app, px, py, app.Scale(32), "A");
             Avatar.Render(app, px + app.Scale(60), py, app.Scale(42), "Z");
@@ -1569,8 +1647,6 @@ class Gallery {
             Gallery.EllipsisRow(app, px, py - app.Scale(6), app.Scale(160), longText);
             Gallery.EllipsisRow(app, px, py + app.Scale(30), app.Scale(280), longText);
             Gallery.EllipsisRow(app, px, py + app.Scale(66), app.Scale(440), longText);
-        } else if (name == "Empty") {
-            Empty.Render(app, px, py - app.Scale(24), w - app.Scale(36), app.Scale(100), "No data");
         } else if (name == "States") {
             int sw2 = app.Scale(84);
             int sh = app.Scale(40);
@@ -1601,13 +1677,19 @@ class Gallery {
         } else if (name == "Alert") {
             int aw = w - app.Scale(36);
             int aay = py - app.Scale(20);
-            int step = Alert.Height(app, true) + app.Scale(10);
+            // Uniform banner height + equal outer gaps for every type variant.
+            int step = Alert.Height(app, true) + app.Scale(12);
             Alert.Render(app, px, aay, aw, "Heads up", "Additional context for the info alert.", 2);
             Alert.Render(app, px, aay + step, aw, "Build succeeded", "The executable is ready.", 3);
-            Alert.Render(app, px, aay + step * 2, aw, "Low disk space", "", 4);
+            Alert.Render(app, px, aay + step * 2, aw, "Low disk space", "Free up room before the next build.", 4);
             Alert.Render(app, px, aay + step * 3, aw, "Deployment failed", "Check the logs for details.", 5);
         } else if (name == "Result") {
-            Result.Render(app, px, py - app.Scale(30), w - app.Scale(36), 1, "Operation complete", "The requested action succeeded.");
+            // Every status side by side: success / warning / error.
+            int rw = (w - app.Scale(36)) / 3;
+            int rya = py - app.Scale(20);
+            Result.Render(app, px, rya, rw, 1, "Success", "Changes saved.");
+            Result.Render(app, px + rw, rya, rw, 2, "Warning", "Review the config.");
+            Result.Render(app, px + rw * 2, rya, rw, 3, "Error", "The build failed.");
         } else if (name == "Tooltip") {
             // Triggers: hover shows the tip while the pointer is over the target;
             // click toggles it. Both drive the same Tooltip.RenderAt renderer.
@@ -1643,13 +1725,26 @@ class Gallery {
             c.FillCircle(p0 + pstep * 3, rowY, dot, t.primary);
             Tooltip.RenderAt(app, p0 + pstep * 3 + dot, rowY, "Right", 3, 0);
 
-            // Long text: wraps automatically; a scrollbar appears past the cap.
+            // Long text: wraps automatically; a scrollbar appears past the cap
+            // and the wheel scrolls the bubble content while the pointer is over it.
             int longY = py + app.Scale(250);
-            Label.Secondary(app, px, longY - app.Scale(8), "Long text · auto-wrap + scrollbar");
+            Label.Secondary(app, px, longY - app.Scale(8), "Long text · auto-wrap + wheel scroll");
             c.FillCircle(p0, longY + app.Scale(18), dot, t.info);
-            Tooltip.RenderAt(app, p0 + dot, longY + app.Scale(18),
-                "Long text wraps automatically onto multiple lines. When it grows past the height cap a scrollbar appears on the right so nothing is clipped away, and the bubble still stays fully on screen no matter which edge it is near.",
-                3, app.Scale(140));
+            string longTip = "Long text wraps automatically onto multiple lines. When it grows past the height cap a scrollbar appears on the right and the mouse wheel scrolls the content while the pointer is over the bubble, so nothing is clipped away and the bubble still stays fully on screen no matter which edge it is near.";
+            int tipMaxW = app.Scale(140);
+            int tipAX = p0 + dot;
+            int tipAY = longY + app.Scale(18);
+            Rect tipBox = Tooltip.BoxRect(app, tipAX, tipAY, longTip, 3, tipMaxW);
+            if (app.CaptureWheel(tipBox.x, tipBox.y, tipBox.width, tipBox.height)) {
+                int wd = app.window.EventKeyCode();
+                int cur = Gallery.tipScroll.Get() - wd * app.Scale(24) / 120;
+                int tmax = Tooltip.MaxScroll(app, longTip, tipMaxW);
+                if (cur < 0) { cur = 0; }
+                if (cur > tmax) { cur = tmax; }
+                Gallery.tipScroll.Set(cur);
+                app.RequestRedraw();
+            }
+            Tooltip.RenderScroll(app, tipAX, tipAY, longTip, 3, tipMaxW, Gallery.tipScroll.Get());
         } else if (name == "Spin.plain") {
             Spin.Render(app, px + app.Scale(26), py + app.Scale(24), app.Scale(14), t.primary);
             Spin.Render(app, px + app.Scale(80), py + app.Scale(24), app.Scale(20), t.primary);
@@ -2263,12 +2358,10 @@ class Gallery {
             .AddProp("h", "int", "-", "Card height in px.")
             .AddEvent("ContentY(y, theme)", "int", "Y where your body content should start.");
         Gallery.Add(list, "Data Display", "Panel",
-            "Create card, section or coloured surface rectangles for custom content.",
-            "Rect content = Panel.Section(app, 40, 60, 420, 220, \"Panel title\");\nLabel.Render(app, content.x, content.y, \"Inside the panel\");")
-            .AddProp("title", "string", "-", "Section title.")
-            .AddProp("w", "int", "-", "Panel width in px.")
-            .AddProp("h", "int", "-", "Panel height in px.")
-            .AddEvent("Section(...)", "Rect", "Returns the inner content rectangle.");
+            "Panel is a titleless container surface (fill + border + padding) for grouping content. Use Card when you need a titled surface with a header divider. As a retained Control it auto-sizes and needs no coordinates.",
+            "// retained: nest content, no x/y/w/h\nPanel box = new Panel(\"section\");\nbox.With(new Label(\"Grouped content\"));\nbox.With(new Button(\"Action\"));\n// or immediate: returns the padded inner rect\nRect inner = Panel.Card(app, x, y, w, h);\nLabel.Render(app, inner.x, inner.y, \"Inside the panel\");")
+            .AddProp("With(child)", "builder", "-", "Append a child (retained mode).")
+            .AddEvent("Card(app,x,y,w,h)", "Rect", "Paints a titleless surface; returns the inner content rect.");
         Gallery.Add(list, "Data Display", "Compose",
             "Fluent retained-mode composition: containers nest children with .With(a).With(b), auto-docked along a Column/Row flow and auto-measured, so building trees needs no hand-computed x/y/w/h.",
             "Panel card = new Panel(\"card\");\ncard.Titled(\"Create account\");\ncard.Add(\n    Panel.Column().Gap(10)\n        .With(new Label(\"Fill in the details below.\").Variant(1))\n        .With(new Progress(66, 3))\n        .With(Panel.Row().Gap(10)\n            .With(Button.Create(\"Cancel\"))\n            .With(Button.Primary(\"Save\"))));\n// each frame:\ncard.MeasureTree(app);\ncard.Arrange(x, y, w, h);\ncard.RenderTree(app);")
@@ -2284,10 +2377,11 @@ class Gallery {
             .AddProp("size", "int", "1", "Control size for all fields.")
             .AddEvent("Save()/Load()", "string", "Round-trip the whole form definition.");
         Gallery.Add(list, "Data Display", "Tag",
-            "Tag draws a small coloured label. The last argument selects the colour variant.",
-            "Tag.Render(app, 40, 80, \"Default\", 0);\nTag.Render(app, 140, 80, \"Success\", 1);\nTag.Render(app, 240, 80, \"Warning\", 2);\nTag.Render(app, 340, 80, \"Error\", 3);")
+            "Tag draws a small coloured chip. The last argument selects the colour variant (0 default, 1 primary, 2 info, 3 success, 4 warning, 5 error). RenderClosable adds an x and returns its hit id so you can remove the tag on click.",
+            "Tag.Render(app, x, y, \"Primary\", 1);\n// closable + add:\nint xid = Tag.RenderClosable(app, x, y, tag, 1);\nif (Ui.Clicked(app, xid)) { tags.RemoveAt(i); }\n// append a new chip from a button\nif (Button.WasClicked(app, addId)) { tags.Add(\"New\"); }")
             .AddProp("text", "string", "-", "Tag label.")
-            .AddProp("variant", "int", "0", "0 default, 1 success, 2 warning, 3 error.");
+            .AddProp("variant", "int", "0", "0 default, 1 primary, 2 info, 3 success, 4 warning, 5 error.")
+            .AddEvent("RenderClosable(...)", "int", "Draws an x; returns the close hit id for Ui.Clicked.");
         Comp av = Comp.Create("Data Display", "Avatar",
             "A circular avatar showing either a text initial or a named icon. size sets the diameter.", "");
         av.AddDemo("Initials", "Avatar.Render(app, x, y, size, text) centres an initial; pass a larger size for a bigger circle.", "Avatar.text", 130,
@@ -2400,22 +2494,16 @@ class Gallery {
             .AddProp("text", "string", "-", "Full text to truncate.")
             .AddProp("w", "int", "-", "Max width in px.")
             .AddEvent("Fit(text, w, fs)", "string", "Returns the text truncated with an ellipsis.");
-        Gallery.Add(list, "Data Display", "Empty",
-            "Display a clear empty-state placeholder when no data is available.",
-            "Empty.Render(app, 40, 60, 420, 180, \"No records yet\");")
-            .AddProp("w", "int", "-", "Placeholder width in px.")
-            .AddProp("h", "int", "-", "Placeholder height in px.")
-            .AddProp("message", "string", "-", "Empty-state caption.");
     }
 
     static void BuildFeedback(List<Comp> list) {
         Gallery.Add(list, "Feedback", "Alert",
-            "Alert shows an inline banner with a title, message and type (0 info, 1 success, 2 warning, 3 error).",
-            "Alert.Render(app, 40, 80, 360, \"Saved\", \"Your changes were saved.\", 1);")
+            "Alert shows an inline banner with a title, optional message and type (0/1 default, 2 info, 3 success, 4 warning, 5 error). Height is content-derived with symmetric padding so banners stay uniform. As a retained Control it needs no coordinates.",
+            "// retained, auto-sized:\nnew Alert(\"Saved\", \"Your changes were saved.\", 3);\n// immediate:\nAlert.Render(app, x, y, w, \"Saved\", \"Your changes were saved.\", 3);")
             .AddProp("w", "int", "-", "Banner width in px.")
             .AddProp("title", "string", "-", "Bold heading.")
             .AddProp("message", "string", "-", "Body text.")
-            .AddProp("type", "int", "0", "0 info, 1 success, 2 warning, 3 error.");
+            .AddProp("type", "int", "0", "0/1 default, 2 info, 3 success, 4 warning, 5 error.");
         Comp pr = Comp.Create("Feedback", "Progress",
             "Progress indicators. A line bar shows a labelled percentage; a ring gauge shows the same value as a circle. type selects the colour (0 default, 2 info, 3 success, 4 warning).", "");
         pr.AddDemo("Line", "Progress.RenderText(app, x, y, w, percent, type) draws a labelled horizontal bar.", "Progress.line", 170,
@@ -2428,10 +2516,10 @@ class Gallery {
         pr.AddProp("type", "int", "0", "Colour: 0 default, 2 info, 3 success, 4 warning.");
         list.Add(pr);
         Gallery.Add(list, "Feedback", "Result",
-            "Show a success, warning or error result with a title and description.",
-            "Result.Render(app, 40, 60, 460, 1, \"Published\", \"The executable is ready.\");")
+            "A centered status block (icon + title + description) for full-page outcomes. status: 0 info, 1 success, 2 warning, 3 error. As a retained Control it needs no coordinates.",
+            "// retained, auto-sized:\nnew Result(1, \"Published\", \"The executable is ready.\");\n// immediate:\nResult.Render(app, x, y, w, 1, \"Published\", \"The executable is ready.\");")
             .AddProp("w", "int", "-", "Block width in px.")
-            .AddProp("status", "int", "0", "0 success, 1 warning, 2 error.")
+            .AddProp("status", "int", "0", "0 info, 1 success, 2 warning, 3 error.")
             .AddProp("title", "string", "-", "Result heading.")
             .AddProp("desc", "string", "-", "Supporting description.");
         Comp sp = Comp.Create("Feedback", "Spin",

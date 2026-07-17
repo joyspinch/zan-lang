@@ -102,12 +102,13 @@ class Tooltip {
         return lines;
     }
 
-    /// Rich anchored tooltip: opaque dark bubble with word-wrapped body, one of
-    /// four placements (auto-flips when it would leave the screen) and a
-    /// scrollbar indicator when the wrapped text is taller than the height cap.
-    /// `anchorX`/`anchorY` is the point the notch should touch.
-    static void RenderAt(App app, int anchorX, int anchorY, string text,
-                         int placement, int maxW) {
+    static int TipCapH(App app) { return app.Scale(148); }
+
+    /// Resolves the on-screen bubble rectangle (origin + capped size) for the
+    /// given anchor/placement/width, applying the same edge flip + clamp used
+    /// when painting. Callers use this to hit-test wheel input for scrolling.
+    static Rect BoxRect(App app, int anchorX, int anchorY, string text,
+                        int placement, int maxW) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = t.fontSizeSmall;
@@ -127,17 +128,14 @@ class Tooltip {
         }
         int boxW = textW + pad * 2;
         int fullH = lines.Count * lineH + pad * 2;
-        int maxBoxH = app.Scale(148);
-        bool scroll = fullH > maxBoxH;
+        int maxBoxH = Tooltip.TipCapH(app);
         int boxH = fullH;
-        if (scroll) { boxH = maxBoxH; }
+        if (boxH > maxBoxH) { boxH = maxBoxH; }
 
         int top = app.titlebarH;
         int cw = c.Width();
         int chh = c.Height();
 
-        // Resolve placement to a box origin, flipping to the opposite side when
-        // there is not enough room.
         int bx = 0;
         int by = 0;
         int place = placement;
@@ -165,11 +163,61 @@ class Tooltip {
             by = anchorY - boxH / 2;
         }
 
-        // Keep the whole bubble on screen.
         if (bx < margin) { bx = margin; }
         if (bx + boxW > cw - margin) { bx = cw - margin - boxW; }
         if (by < top) { by = top; }
         if (by + boxH > chh - margin) { by = chh - margin - boxH; }
+
+        return Rect.Create(bx, by, boxW, boxH);
+    }
+
+    /// Max scroll offset (px) for a tip: 0 when the content fits the height cap.
+    static int MaxScroll(App app, string text, int maxW) {
+        int fs = app.theme.fontSizeSmall;
+        int pad = app.Scale(8);
+        int lineH = Canvas.FontHeight(fs);
+        List<string> lines = Tooltip.WrapLines(text, fs, maxW);
+        int fullH = lines.Count * lineH + pad * 2;
+        int m = fullH - Tooltip.TipCapH(app);
+        if (m < 0) { m = 0; }
+        return m;
+    }
+
+    /// Rich anchored tooltip: opaque dark bubble with word-wrapped body, one of
+    /// four placements (auto-flips when it would leave the screen) and a
+    /// scrollbar when the wrapped text is taller than the height cap.
+    /// `anchorX`/`anchorY` is the point the notch should touch. `scrollOff` is
+    /// the vertical scroll amount (clamped to [0, MaxScroll]).
+    static void RenderScroll(App app, int anchorX, int anchorY, string text,
+                             int placement, int maxW, int scrollOff) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int pad = app.Scale(8);
+        int lineH = Canvas.FontHeight(fs);
+        int notch = app.Scale(6);
+
+        List<string> lines = Tooltip.WrapLines(text, fs, maxW);
+        int fullH = lines.Count * lineH + pad * 2;
+        Rect box = Tooltip.BoxRect(app, anchorX, anchorY, text, placement, maxW);
+        int bx = box.x;
+        int by = box.y;
+        int boxW = box.width;
+        int boxH = box.height;
+        bool scroll = fullH > boxH;
+
+        // Re-derive the resolved placement for the notch from the box position.
+        int place = placement;
+        if (by + boxH <= anchorY) { place = 0; }
+        else if (by >= anchorY) { place = 1; }
+        else if (bx + boxW <= anchorX) { place = 2; }
+        else { place = 3; }
+
+        int off = scrollOff;
+        int maxOff = fullH - boxH;
+        if (maxOff < 0) { maxOff = 0; }
+        if (off > maxOff) { off = maxOff; }
+        if (off < 0) { off = 0; }
 
         int bg = 0xFF1F2430;        // opaque dark slate (readable over anything)
         int border = 0xFF3A4150;
@@ -190,14 +238,15 @@ class Tooltip {
             Tooltip.TriLeft(c, bx - notch, anchorY, notch, notch, bg);
         }
 
-        // Clip the text to the (possibly capped) content area and draw lines.
+        // Clip the text to the (possibly capped) content area and draw lines
+        // shifted up by the scroll offset.
         int innerX = bx + pad;
         int innerY = by + pad;
         int innerW = boxW - pad * 2;
         int innerH = boxH - pad * 2;
         c.PushClip(innerX, innerY, innerW, innerH);
-        int ty = innerY;
-        li = 0;
+        int ty = innerY - off;
+        int li = 0;
         while (li < lines.Count) {
             c.DrawText(innerX, ty, lines[li], fg, fs);
             ty = ty + lineH;
@@ -205,7 +254,7 @@ class Tooltip {
         }
         c.PopClip();
 
-        // Scrollbar indicator when the content is taller than the cap.
+        // Scrollbar with a thumb positioned by the scroll offset.
         if (scroll) {
             int barW = app.Scale(3);
             int barX = bx + boxW - barW - app.Scale(3);
@@ -213,9 +262,18 @@ class Tooltip {
             int barH = boxH - pad * 2;
             int thumbH = barH * innerH / (fullH - pad * 2);
             if (thumbH < app.Scale(16)) { thumbH = app.Scale(16); }
+            int travel = barH - thumbH;
+            int thumbY = barY;
+            if (maxOff > 0) { thumbY = barY + travel * off / maxOff; }
             c.FillRoundRect(barX, barY, barW, barH, barW / 2, 0x33FFFFFF);
-            c.FillRoundRect(barX, barY, barW, thumbH, barW / 2, 0x88FFFFFF);
+            c.FillRoundRect(barX, thumbY, barW, thumbH, barW / 2, 0x88FFFFFF);
         }
+    }
+
+    /// Anchored tooltip without scrolling (offset 0). Kept for existing callers.
+    static void RenderAt(App app, int anchorX, int anchorY, string text,
+                         int placement, int maxW) {
+        Tooltip.RenderScroll(app, anchorX, anchorY, text, placement, maxW, 0);
     }
 
     /// Opaque two-line tooltip: a bold title over a muted description.
