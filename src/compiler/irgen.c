@@ -1587,6 +1587,8 @@ static zan_ast_node_t *name_path_head(zan_ast_node_t *node) {
 /* Resolve the declared type of an `obj.field` member access so that element
  * indexing on struct/class array fields (e.g. `b.data[i]`) can determine the
  * element LLVM type. Returns NULL when the field/type cannot be resolved. */
+static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
+
 static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_ast_node_t *member) {
     if (!member || member->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = member->member.object;
@@ -1620,6 +1622,18 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
         g && g->current_type_sym) {
         zan_symbol_t *fsym = get_field_sym(g->current_type_sym, member->member.name);
         if (fsym) return fsym->type;
+    }
+    /* General case: the object is any expression whose static type is a
+     * class/struct — e.g. `arr[i].field`, `a.b.field`, `make().field`. Infer
+     * the object's type and look the field up on it. This is what lets chained
+     * subscripts like `arr[i].values[j]` recover the element type (without it
+     * the AST_INDEX codegen falls back to a zero constant). */
+    {
+        zan_type_t *ot = infer_expr_type(g, obj, locals);
+        if (ot && ot->sym) {
+            zan_symbol_t *fsym = get_field_sym(ot->sym, member->member.name);
+            if (fsym) return fsym->type;
+        }
     }
     return NULL;
 }
