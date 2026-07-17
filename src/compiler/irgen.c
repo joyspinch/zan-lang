@@ -1473,6 +1473,9 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
         } else if (val_k == LLVMIntegerTypeKind &&
                    LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64) {
             stored = LLVMBuildSExt(g->builder, stored, slot_ty, "slot.sx");
+        } else if (val_k == LLVMDoubleTypeKind) {
+            /* double element packed into an i64 slot: bitcast, not fptoint. */
+            stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");
         }
     }
     LLVMBuildStore(g->builder, stored, slot_ptr);
@@ -6860,12 +6863,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx, 1, "ep");
             LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
-            /* reinterpret pointer (class/string) elements: slots hold i64. */
+            /* reinterpret non-integer elements: slots physically hold an i64,
+             * so pointer (class/string) elements need inttoptr and floating
+             * (double) elements need a bitcast back to the value type. */
             zan_type_t *et = container_elem_type(arr_type);
             if (et) {
                 LLVMTypeRef m = map_type(g, et);
-                if (LLVMGetTypeKind(m) == LLVMPointerTypeKind)
+                LLVMTypeKind mk = LLVMGetTypeKind(m);
+                if (mk == LLVMPointerTypeKind)
                     return LLVMBuildIntToPtr(g->builder, raw, m, "elp");
+                if (mk == LLVMDoubleTypeKind)
+                    return LLVMBuildBitCast(g->builder, raw, m, "elf");
             }
             return raw;
         }
