@@ -11,8 +11,44 @@ class Parser {
     public int pos;
     public Diags diags;
     public int lastErrPos;
+    public bool attrDll;      // last ParseAttrs saw [DllImport]
+    public string attrEntry;  // DllImport EntryPoint override ("" if none)
 
-    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; }
+    public Parser(List<Token> t, Diags d) { toks = t; pos = 0; diags = d; lastErrPos = -1; attrDll = false; attrEntry = ""; }
+
+    bool HasModBit(int mods, int bit) { return (mods / bit) - ((mods / bit) / 2) * 2 == 1; }
+
+    // Attributes: [DllImport("lib")] / [DllImport("lib", EntryPoint="n")] /
+    // [StructLayout(...)] / [Group(...)] ... DllImport marks the following
+    // method as an extern C-ABI import (the library is linked by the build);
+    // all other attributes are skipped.
+    void ParseAttrs() {
+        attrDll = false;
+        attrEntry = "";
+        while (At(TK.LBracket())) {
+            Next(); // [
+            if (At(TK.Ident()) && Cur().text == "DllImport") {
+                attrDll = true;
+                Next();
+                if (Eat(TK.LParen())) {
+                    if (At(TK.StringLit())) { Next(); }
+                    while (Eat(TK.Comma())) {
+                        if (At(TK.Ident()) && Cur().text == "EntryPoint") {
+                            Next();
+                            Eat(TK.Eq());
+                            if (At(TK.StringLit())) { attrEntry = Next().text; }
+                        } else {
+                            while (!At(TK.RParen()) && !At(TK.Comma()) && !At(TK.Eof())) { Next(); }
+                        }
+                    }
+                    Expect(TK.RParen());
+                }
+            } else {
+                while (!At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
+            }
+            Expect(TK.RBracket());
+        }
+    }
 
     // All token access is end-of-input safe: once pos runs off the end we keep
     // returning the trailing Eof token so a truncated or malformed source can
@@ -146,6 +182,7 @@ class Parser {
             else if (k == TK.Override()) { m = m + MOD.Override(); Next(); }
             else if (k == TK.Abstract()) { m = m + MOD.Abstract(); Next(); }
             else if (k == TK.Readonly()) { m = m + MOD.Readonly(); Next(); }
+            else if (k == TK.Ident() && Cur().text == "extern") { m = m + MOD.Extern(); Next(); }
             else if (k == TK.Sealed()) { Next(); }
             else if (k == TK.Const()) { Next(); }
             else { return m; }
@@ -191,14 +228,30 @@ class Parser {
     }
 
     Node ParseTypeDecl() {
+        ParseAttrs();
         int mods = ParseMods();
         int k = K();
         if (k == TK.Class() || k == TK.Struct()) { return ParseClass(mods, k); }
         if (k == TK.Interface()) { return ParseInterface(mods); }
         if (k == TK.Enum()) { return ParseEnum(mods); }
+        if (k == TK.Ident() && Cur().text == "delegate") { return ParseDelegate(mods); }
         // unknown: skip token to make progress
         Next();
         return null;
+    }
+
+    // delegate <ret> Name [<T,...>] ( params ) ;  -- registered as a named
+    // delegate type (lowered like Func/Action: a closure pointer).
+    Node ParseDelegate(int mods) {
+        Next(); // 'delegate'
+        Node d = new Node(AK.DelegateDecl());
+        d.mods = mods;
+        d.type = ParseType(); // return type
+        if (At(TK.Ident())) { d.sval = Next().text; }
+        if (At(TK.Less())) { while (!At(TK.Greater()) && !At(TK.Eof())) { Next(); } Expect(TK.Greater()); }
+        ParseParams(d);
+        Expect(TK.Semicolon());
+        return d;
     }
 
     // An interface is modelled as an abstract class: no fields, every method is
@@ -287,7 +340,21 @@ class Parser {
     }
 
     Node ParseMember(string className) {
+        ParseAttrs();
+        bool wantExtern = attrDll;
+        string entry = attrEntry;
         int mods = ParseMods();
+        // destructor / finalizer:  ~Name() { ... }  (~ is lexed as Bang)
+        if (At(TK.Bang())) {
+            Next(); // '~'
+            Node dtor = new Node(AK.MethodDecl());
+            dtor.mods = mods;
+            dtor.sval = "__dtor";
+            if (At(TK.Ident())) { Next(); }
+            ParseParams(dtor);
+            if (At(TK.LBrace())) { dtor.d = ParseBlock(); } else { Expect(TK.Semicolon()); }
+            return dtor;
+        }
         // constructor: Name '('
         if (At(TK.Ident()) && Cur().text == className && K1() == TK.LParen()) {
             Node ctor = new Node(AK.CtorDecl());
@@ -317,6 +384,10 @@ class Parser {
             ParseParams(member);
             if (At(TK.LBrace())) { member.d = ParseBlock(); }
             else { Expect(TK.Semicolon()); }
+            if ((wantExtern || HasModBit(mods, MOD.Extern())) && member.d == null) {
+                if (!HasModBit(member.mods, MOD.Extern())) { member.mods = member.mods + MOD.Extern(); }
+                if (entry != "") { member.sval2 = entry; } else { member.sval2 = member.sval; }
+            }
             return member;
         }
         // property:  T Name { get; set; } | { get {..} set {..} } | => expr;
@@ -632,8 +703,23 @@ class Parser {
         return left;
     }
     Node ParseAnd() {
+        Node left = ParseBitOr();
+        while (At(TK.AmpAmp())) { int op = Next().kind; Node r = ParseBitOr(); left = Bin(op, left, r); }
+        return left;
+    }
+    Node ParseBitOr() {
+        Node left = ParseBitXor();
+        while (At(TK.Pipe())) { int op = Next().kind; Node r = ParseBitXor(); left = Bin(op, left, r); }
+        return left;
+    }
+    Node ParseBitXor() {
+        Node left = ParseBitAnd();
+        while (At(TK.Caret())) { int op = Next().kind; Node r = ParseBitAnd(); left = Bin(op, left, r); }
+        return left;
+    }
+    Node ParseBitAnd() {
         Node left = ParseEq();
-        while (At(TK.AmpAmp())) { int op = Next().kind; Node r = ParseEq(); left = Bin(op, left, r); }
+        while (At(TK.Amp())) { int op = Next().kind; Node r = ParseEq(); left = Bin(op, left, r); }
         return left;
     }
     Node ParseEq() {
