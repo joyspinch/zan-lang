@@ -1,0 +1,414 @@
+using System;
+
+namespace Gui;
+
+/// Fx — declarative, opt-in motion effects for widgets and skins.
+///
+/// Every effect is a self-contained static that draws *inside* the rect it is
+/// given (it PushClips where it could bleed) so turning one on never shifts
+/// layout or paints over neighbouring controls. Time-based effects read the
+/// frame clock (App.nowMs) and re-arm the animation frame themselves, so a
+/// caller just opts in once per frame:
+///
+///     Fx.BorderGlow(app, x, y, w, h, radius, t.primary, 2600, 220);
+///     Fx.Specular(app, id, x, y, w, h, radius, 0xFFFFFFFF);
+///
+/// Effects are configured with a small FxOptions bag (below) so a component can
+/// expose "which effects are on" the same declarative way ChartOptions does.
+class Fx {
+
+    // ---- periodic time bases (integer, no trig) --------------------------
+
+    /// Repeating 0..1000 sawtooth over `periodMs` (linear ramp, wraps to 0).
+    static int Saw(App app, int periodMs) {
+        if (periodMs <= 0) { return 0; }
+        int m = app.nowMs % periodMs;
+        if (m < 0) { m = m + periodMs; }
+        return m * 1000 / periodMs;
+    }
+
+    /// Smooth 0..1000..0 "breathing" pulse over `periodMs` (eased triangle).
+    static int Pulse(App app, int periodMs) {
+        int s = Fx.Saw(app, periodMs);
+        int tri = s * 2;
+        if (tri > 1000) { tri = 2000 - tri; }
+        return App.Ease(tri);
+    }
+
+    /// Integer square root (floor). Used for cursor-to-border distance so the
+    /// specular rim light can fall off smoothly with real distance.
+    static int Isqrt(int n) {
+        if (n <= 0) { return 0; }
+        int x = n;
+        int y = (x + 1) / 2;
+        while (y < x) {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        return x;
+    }
+
+    // ---- soft point glow (layered discs approximate a radial falloff) ----
+
+    /// A soft luminous glow centred at (cx,cy): a smooth radial bloom (native
+    /// FillRadial) that fades from `maxAlpha` (0..255) at the core to 0 at `r`.
+    static void PointGlow(Canvas c, int cx, int cy, int r, int color, int maxAlpha) {
+        if (r <= 0 || maxAlpha <= 0) { return; }
+        c.FillRadial(cx, cy, r, color, maxAlpha);
+    }
+
+    // ---- border glow (reactbits "border-glow"): a comet of light travelling
+    // around the rounded rect, leaving a fading tail, over a faint static rim.
+
+    static void BorderGlow(App app, int x, int y, int w, int h,
+                           int radius, int color, int periodMs, int intensity) {
+        Canvas c = app.canvas;
+        int per = 2 * (w + h);
+        if (per <= 0) { return; }
+        int head = Fx.Saw(app, periodMs) * per / 1000;
+        int gr = app.Scale(3);           // thin: about the border line width
+        // The whole border carries a faint constant rim glow; a long, soft hump
+        // of brightness sweeps around it, fading smoothly on BOTH sides of its
+        // centre so it reads as a gliding light — not a solid segment crawling.
+        int half = per / 2;
+        int reach = per * 30 / 100;      // half-length of the bright sweep
+        if (reach < 1) { reach = 1; }
+        int rim = intensity * 12 / 100; // faint always-on rim
+        int steps = per / app.Scale(4);
+        if (steps < 48) { steps = 48; }
+        if (steps > 200) { steps = 200; }
+        int i = 0;
+        while (i < steps) {
+            int d = i * per / steps;
+            // symmetric perimeter distance from the sweep centre, 0..half.
+            int dd = ((d - head) % per + per) % per;
+            if (dd > half) { dd = per - dd; }
+            int a = rim;
+            if (dd < reach) {
+                int p = App.Ease((reach - dd) * 1000 / reach);
+                a = rim + (intensity - rim) * p / 1000;
+            }
+            if (a > 0) {
+                int px = x; int py = y;
+                if (d < w) {
+                    px = x + d; py = y;
+                } else if (d < w + h) {
+                    px = x + w; py = y + (d - w);
+                } else if (d < w + h + w) {
+                    px = x + w - (d - w - h); py = y + h;
+                } else {
+                    px = x; py = y + h - (d - w - h - w);
+                }
+                c.FillRadial(px, py, gr, color, a);
+            }
+            i = i + 1;
+        }
+        app.RequestAnimationFrame(33);
+    }
+
+    // ---- specular / spotlight (reactbits "specular-button" & magic-bento):
+    // a soft highlight inside the widget that follows the cursor, faded by the
+    // eased hover level so it slides in and out smoothly. Clipped to the rect.
+
+    static void Specular(App app, int id, int x, int y, int w, int h,
+                         int radius, int color) {
+        int hv = Ui.HoverLevel(app, id);
+        Fx.SpecularBorderHv(app, x, y, w, h, radius, color, hv);
+    }
+
+    /// Specular "running light" (reactbits specular-button): a tight bright dot
+    /// with a short glowing tail glides continuously around the border over a
+    /// faint constant rim. Clipped to the rect so it sits on the border and
+    /// never spills onto neighbours or buries the label.
+    static void SpecularRun(App app, int x, int y, int w, int h,
+                            int radius, int color, int periodMs) {
+        Canvas c = app.canvas;
+        int per = 2 * (w + h);
+        if (per <= 0) { return; }
+        int head = Fx.Saw(app, periodMs) * per / 1000;
+        int half = per / 2;
+        int reach = per * 11 / 100;      // short, tight bright dot
+        if (reach < 1) { reach = 1; }
+        int rim = 20;                   // faint always-on rim
+        int gr = app.Scale(7);
+        int steps = per / app.Scale(5);
+        if (steps < 40) { steps = 40; }
+        if (steps > 260) { steps = 260; }
+        c.PushClip(x, y, w, h);
+        int i = 0;
+        while (i < steps) {
+            int d = i * per / steps;
+            int dd = ((d - head) % per + per) % per;
+            if (dd > half) { dd = per - dd; }
+            int a = rim;
+            if (dd < reach) {
+                int p = App.Ease((reach - dd) * 1000 / reach);
+                a = rim + (215 - rim) * p / 1000;
+            }
+            if (a > 0) {
+                int px = x; int py = y;
+                if (d < w) {
+                    px = x + d; py = y;
+                } else if (d < w + h) {
+                    px = x + w; py = y + (d - w);
+                } else if (d < w + h + w) {
+                    px = x + w - (d - w - h); py = y + h;
+                } else {
+                    px = x; py = y + h - (d - w - h - w);
+                }
+                c.FillRadial(px, py, gr, color, a);
+            }
+            i = i + 1;
+        }
+        // white-hot pinpoint at the head.
+        int hx = x; int hy = y;
+        if (head < w) { hx = x + head; hy = y; }
+        else if (head < w + h) { hx = x + w; hy = y + (head - w); }
+        else if (head < w + h + w) { hx = x + w - (head - w - h); hy = y + h; }
+        else { hx = x; hy = y + h - (head - w - h - w); }
+        c.FillRadial(hx, hy, gr * 6 / 10, App.LerpColor(color, 4294967295, 700), 235);
+        c.PopClip();
+        app.RequestAnimationFrame(16);
+    }
+
+    /// Cursor-tracking specular (reactbits "specular-button"): a small bright
+    /// arc of the border nearest the cursor lights up, plus a symmetric arc on
+    /// the diametrically-opposite side, both fading smoothly to the sides. `hv`
+    /// (0..1000) eases the pair in on hover. Clipped to the rect so the light
+    /// sits on the border and never spills onto neighbours or the label.
+    static void SpecularBorderHv(App app, int x, int y, int w, int h,
+                                 int radius, int color, int hv) {
+        if (hv <= 0) { return; }
+        Canvas c = app.canvas;
+        int mx = app.mouseX; int my = app.mouseY;
+        int per = 2 * (w + h);
+        if (per <= 0) { return; }
+        int half = per / 2;
+        int reach = per * 15 / 100;         // arc half-length
+        if (reach < 1) { reach = 1; }
+        int gr = app.Scale(5);              // small, tight dot
+        int steps = per / app.Scale(5);
+        if (steps < 48) { steps = 48; }
+        if (steps > 260) { steps = 260; }
+        // Perimeter position of the point closest to the cursor.
+        int md = 0; int best = per * per;
+        int j = 0;
+        while (j < steps) {
+            int d = j * per / steps;
+            int px = x; int py = y;
+            if (d < w) { px = x + d; py = y; }
+            else if (d < w + h) { px = x + w; py = y + (d - w); }
+            else if (d < w + h + w) { px = x + w - (d - w - h); py = y + h; }
+            else { px = x; py = y + h - (d - w - h - w); }
+            int dx = px - mx; int dy = py - my;
+            int dd = dx * dx + dy * dy;
+            if (dd < best) { best = dd; md = d; }
+            j = j + 1;
+        }
+        int opp = (md + half) % per;
+        c.PushClip(x, y, w, h);
+        int i = 0;
+        while (i < steps) {
+            int d = i * per / steps;
+            int a = 0;
+            int e1 = ((d - md) % per + per) % per; if (e1 > half) { e1 = per - e1; }
+            int e2 = ((d - opp) % per + per) % per; if (e2 > half) { e2 = per - e2; }
+            int near = e1; if (e2 < near) { near = e2; }
+            if (near < reach) {
+                int p = App.Ease((reach - near) * 1000 / reach);
+                a = 210 * p / 1000 * hv / 1000;
+            }
+            if (a > 0) {
+                int px = x; int py = y;
+                if (d < w) { px = x + d; py = y; }
+                else if (d < w + h) { px = x + w; py = y + (d - w); }
+                else if (d < w + h + w) { px = x + w - (d - w - h); py = y + h; }
+                else { px = x; py = y + h - (d - w - h - w); }
+                c.FillRadial(px, py, gr, color, a);
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+        // Cursor-driven only: no self-scheduled frames, so a still pointer costs
+        // zero repaints. The light updates on pointer-move events.
+    }
+
+    /// Cursor-follow spotlight gated by an eased level `hv` (0..1000). Reach and
+    /// peak alpha scale with hv; nothing draws at rest. Clipped to the rect so a
+    /// glow near an edge can't spill onto neighbours.
+    static void SpotlightHv(App app, int x, int y, int w, int h,
+                            int color, int reach, int maxAlpha, int hv) {
+        if (hv <= 0) { return; }
+        Canvas c = app.canvas;
+        int mx = app.mouseX; int my = app.mouseY;
+        if (mx < x) { mx = x; } if (mx > x + w) { mx = x + w; }
+        if (my < y) { my = y; } if (my > y + h) { my = y + h; }
+        int a = maxAlpha * hv / 1000;
+        int r = reach * (600 + 400 * hv / 1000) / 1000;
+        c.PushClip(x, y, w, h);
+        Fx.PointGlow(c, mx, my, r, color, a);
+        c.PopClip();
+        app.RequestAnimationFrame(33);
+    }
+
+    // ---- card motion variants (opt-in, drawn inside a clipped rect so they
+    // never shift layout, cover the title/body, or spill onto neighbours) ---
+
+    /// Sheen: a soft diagonal band of light glides across the card on a loop,
+    /// like a reflection glancing off glass. Draw before the content.
+    static void CardSheen(App app, int x, int y, int w, int h, int color, int periodMs) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int span = w + h + h;                       // travel incl. off-screen ends
+        int pos = Fx.Saw(app, periodMs) * span / 1000 - h;  // 45-degree sweep
+        int gr = app.Scale(22);
+        int col = App.LerpColor(color, 4294967295, 600);
+        int steps = h / app.Scale(18);
+        if (steps < 5) { steps = 5; }
+        int i = 0;
+        while (i <= steps) {
+            int yy = y + h * i / steps;
+            int xx = x + pos + (yy - y);             // 45-degree band
+            Fx.PointGlow(c, xx, yy, gr, col, 28);
+            i = i + 1;
+        }
+        c.PopClip();
+        app.RequestAnimationFrame(40);
+    }
+
+    /// Aurora: a few big, very soft colour blobs drift and breathe behind the
+    /// content -- a calm living gradient. Very low alpha; draw before content.
+    static void CardAurora(App app, int x, int y, int w, int h, int color) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int r = (w + h) / 6;
+        int n = 3;
+        int i = 0;
+        while (i < n) {
+            int px = x + w * ((Fx.Saw(app, 11000 + i * 2600) + i * 300) % 1000) / 1000;
+            int py = y + h * Fx.Pulse(app, 7000 + i * 1900) / 1000;
+            int col = App.LerpColor(color, 4294967295, i * 250);
+            int a = 24 + 22 * Fx.Pulse(app, 5200 + i * 800) / 1000;
+            Fx.PointGlow(c, px, py, r, col, a);
+            i = i + 1;
+        }
+        c.PopClip();
+        app.RequestAnimationFrame(50);
+    }
+
+    /// Breathing rim: the whole border gently pulses in brightness (no travel),
+    /// a slow inhale/exhale. Light sits on the border only, clipped inside.
+    static void CardBreath(App app, int x, int y, int w, int h, int color, int periodMs) {
+        Canvas c = app.canvas;
+        int per = 2 * (w + h);
+        if (per <= 0) { return; }
+        int gr = app.Scale(4);
+        int a = 26 + 96 * Fx.Pulse(app, periodMs) / 1000;
+        int steps = per / app.Scale(5);
+        if (steps < 48) { steps = 48; }
+        if (steps > 200) { steps = 200; }
+        c.PushClip(x, y, w, h);
+        int i = 0;
+        while (i < steps) {
+            int d = i * per / steps;
+            int px = x; int py = y;
+            if (d < w) { px = x + d; py = y; }
+            else if (d < w + h) { px = x + w; py = y + (d - w); }
+            else if (d < w + h + w) { px = x + w - (d - w - h); py = y + h; }
+            else { px = x; py = y + h - (d - w - h - w); }
+            c.FillRadial(px, py, gr, color, a);
+            i = i + 1;
+        }
+        c.PopClip();
+        app.RequestAnimationFrame(50);
+    }
+
+    /// Rising motes: small soft dots drift slowly upward and wrap, like embers
+    /// or dust caught in light. Clipped inside the card; decorative backdrop.
+    static void CardMotes(App app, int x, int y, int w, int h, int color) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int n = 7;
+        int gr = app.Scale(4);
+        int i = 0;
+        while (i < n) {
+            int cx = x + w * (i * 1000 / n + 500 / n) / 1000;
+            int rise = (Fx.Saw(app, 6000 + i * 1300) + i * 140) % 1000;
+            int cy = y + h - h * rise / 1000;
+            int a = 38 + 60 * Fx.Pulse(app, 3000 + i * 700) / 1000;
+            Fx.PointGlow(c, cx, cy, gr, color, a);
+            i = i + 1;
+        }
+        c.PopClip();
+        app.RequestAnimationFrame(50);
+    }
+
+    // ---- animated skin backgrounds --------------------------------------
+
+    /// Light pillars: a few soft vertical light columns that slowly drift and
+    /// breathe across the region. Drawn as vertical gradients over the fill.
+    static void BgLightPillar(App app, int x, int y, int w, int h, int color) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int n = 5;
+        int i = 0;
+        while (i < n) {
+            // each pillar drifts at its own phase/speed and breathes in alpha.
+            int ph = Fx.Saw(app, 9000 + i * 1700);
+            int cx = x + w * ((ph + i * 1000 / n) % 1000) / 1000;
+            int pw = w / 7;
+            int breathe = Fx.Pulse(app, 4200 + i * 900);
+            int a = 22 + 42 * breathe / 1000;
+            int col = Chart.WithAlpha(color, a);
+            // triangular column: fade to transparent at the edges via 3 bands.
+            c.FillVGrad(cx - pw / 2, y, pw, h, Chart.WithAlpha(color, 0), col);
+            i = i + 1;
+        }
+        c.PopClip();
+        app.RequestAnimationFrame(50);
+    }
+
+    /// Floating lines: thin diagonal strands slowly scrolling upward, wrapping
+    /// around the region — a calm animated backdrop.
+    static void BgFloatingLines(App app, int x, int y, int w, int h, int color) {
+        Canvas c = app.canvas;
+        c.PushClip(x, y, w, h);
+        int gap = app.Scale(46);
+        if (gap < 12) { gap = 12; }
+        int span = h + w;
+        int drift = Fx.Saw(app, 7000) * gap / 1000;
+        int d = -w;
+        while (d < span) {
+            int off = d + drift;
+            int breathe = Fx.Pulse(app, 5200);
+            int a = 14 + 26 * breathe / 1000;
+            // diagonal (45°) line from the top edge down to the left edge.
+            int x0 = x + off; int y0 = y;
+            int x1 = x + off - h; int y1 = y + h;
+            c.DrawLine(x0, y0, x1, y1, Chart.WithAlpha(color, a), 1);
+            d = d + gap;
+        }
+        c.PopClip();
+        app.RequestAnimationFrame(50);
+    }
+}
+
+/// Declarative per-widget effect toggles, mirroring the ChartOptions pattern so
+/// a component can be given "which motion is on" as data rather than code.
+class FxOptions {
+    bool ripple;       // click ripple
+    bool specular;     // cursor-follow highlight on hover
+    bool borderGlow;   // travelling border light
+    int  glowColor;    // 0 = use theme primary
+    int  glowPeriodMs; // border-glow travel period
+
+    static FxOptions Create() {
+        FxOptions o = new FxOptions();
+        o.ripple = true;
+        o.specular = false;
+        o.borderGlow = false;
+        o.glowColor = 0;
+        o.glowPeriodMs = 2600;
+        return o;
+    }
+}

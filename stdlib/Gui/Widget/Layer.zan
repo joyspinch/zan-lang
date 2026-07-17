@@ -44,6 +44,12 @@ class LayerState {
     string cancelText;
     Input promptInput;   // text field for kind 2 (null otherwise)
     int openMs;          // wall-clock ms the layer was opened (entrance anim)
+    // Window model for kind-0 page windows:
+    //   false -- SIMULATED: drawn inside the parent canvas; it is a page layer,
+    //            so it is clamped and can never be dragged outside the parent.
+    //   true  -- CHILD: hosted in its own OS window (handled by the caller's
+    //            event loop, like FilePicker); no in-canvas clamping applies.
+    bool childWindow;
 
     static LayerState Create(string title, int x, int y, int w, int h) {
         LayerState s = new LayerState();
@@ -76,7 +82,15 @@ class LayerState {
         s.cancelText = "Cancel";
         s.promptInput = null;
         s.openMs = 0;
+        s.childWindow = false;
         return s;
+    }
+
+    /// Fluent selector for the window model of a kind-0 page window:
+    /// false = simulated (in-canvas, clamped), true = real child OS window.
+    LayerState AsChildWindow(bool on) {
+        childWindow = on;
+        return this;
     }
 
     /// A centered modal confirm dialog (OK + Cancel). dtype picks the icon.
@@ -534,7 +548,7 @@ class Layer {
         Icon.DrawCenteredIn(c, "close", bx, byy, bw, bw, t.iconSizeSmall, 0xFFFFFFFF);
         app.hitTester.Register(HitRegion.Create(closeId, bx, byy, bw, bw, 0));
         if (app.window.EventKind() == 3
-            && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            && app.ClickTarget() == closeId) {
             return true;
         }
         return false;
@@ -681,6 +695,12 @@ class Layer {
         int maxX = closeX - bw;
         int minX = maxX - bw;
 
+        // Opaque to the pointer: swallow every hit over the whole layer rect so
+        // page widgets behind it don't also react (the "see-through layer" bug).
+        // Registered first, so the caption buttons below and any component the
+        // app draws into the body afterwards register later and win over it.
+        app.BlockHitsRect(ex, ey, ew, eh);
+
         app.hitTester.Register(HitRegion.Create(
             s.barId, ex, ey, ew - bw * 3, bar, 5));
         app.hitTester.Register(HitRegion.Create(
@@ -703,10 +723,24 @@ class Layer {
         if (ek == 1 && s.dragging) {
             s.x = mx - s.grabDx;
             s.y = my - s.grabDy;
-            if (s.y < top) { s.y = top; }
-            if (s.y > H - bar) { s.y = H - bar; }
-            if (s.x < bar - ew) { s.x = bar - ew; }
-            if (s.x > W - bar) { s.x = W - bar; }
+            // A simulated (in-canvas) window is a page layer, so keep it WHOLLY
+            // inside the parent client area: it can never be dragged past any
+            // edge. A child OS window is not clamped here (the OS owns it).
+            if (s.childWindow) {
+                if (s.y < top) { s.y = top; }
+                if (s.y > H - bar) { s.y = H - bar; }
+                if (s.x < bar - ew) { s.x = bar - ew; }
+                if (s.x > W - bar) { s.x = W - bar; }
+            } else {
+                int clampMaxX = W - ew;
+                int clampMaxY = H - eh;
+                if (clampMaxX < 0) { clampMaxX = 0; }
+                if (clampMaxY < top) { clampMaxY = top; }
+                if (s.x < 0) { s.x = 0; }
+                if (s.x > clampMaxX) { s.x = clampMaxX; }
+                if (s.y < top) { s.y = top; }
+                if (s.y > clampMaxY) { s.y = clampMaxY; }
+            }
             ex = s.x; ey = s.y;
             closeX = ex + ew - bw; maxX = closeX - bw; minX = maxX - bw;
             app.RequestRedraw();
@@ -882,7 +916,7 @@ class Layer {
         app.hitTester.Register(
             HitRegion.Create(closeId, closeX, closeY, t.heightMedium, t.heightMedium, 0));
         if (app.window.EventKind() == 3
-            && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            && app.ClickTarget() == closeId) {
             s.action = 3;
         }
     }

@@ -781,6 +781,43 @@ EXPORT void zan_gui_fill_circle(i64 surface_id, i64 cx, i64 cy, i64 radius, i64 
     }
 }
 
+/* Soft radial glow: a filled disc whose alpha fades smoothly from `inner_a`
+ * (0..255) at the centre to 0 at `radius`, so it reads as a luminous bloom
+ * rather than a hard-edged disc. Only the low 24 bits of `color` (RGB) are
+ * used; `inner_a` drives the peak alpha. The falloff is a smoothstep raised to
+ * a higher power to keep a bright, tight core with a long soft tail -- this is
+ * the building block for specular highlights, spotlights and border glow. */
+EXPORT void zan_gui_fill_radial(i64 surface_id, i64 cx, i64 cy, i64 radius,
+                                i64 color, i64 inner_a) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int r = (int)radius;
+    if (r <= 0) return;
+    int icx = (int)cx, icy = (int)cy;
+    u32 rgb = (u32)color & 0x00FFFFFFu;
+    int peak = (int)inner_a;
+    if (peak > 255) peak = 255;
+    if (peak <= 0) return;
+    int r2 = r * r;
+    /* Integer squared-distance falloff (no per-pixel sqrt/double): t is 256 at
+     * the centre and 0 at the edge, squared for a bright tight core and a soft
+     * tail. This is called hundreds of times per animated frame, so the hot
+     * loop stays entirely in integer math. */
+    for (int dy = -r; dy <= r; dy++) {
+        int py = icy + dy;
+        int dy2 = dy * dy;
+        for (int dx = -r; dx <= r; dx++) {
+            int d2 = dx * dx + dy2;
+            if (d2 >= r2) continue;
+            int t = ((r2 - d2) << 8) / r2;
+            int a = (peak * t * t) >> 16;
+            if (a <= 0) continue;
+            set_pixel(s, icx + dx, py, ((u32)a << 24) | rgb);
+        }
+    }
+}
+
 /* Anti-aliased filled ring sector (pie / donut slice). Angles in degrees with
  * 0 at 12 o'clock, increasing clockwise. r_inner=0 gives a solid pie slice. */
 EXPORT void zan_gui_fill_sector(i64 surface_id, i64 cx, i64 cy, i64 r_inner, i64 r_outer,
@@ -2220,6 +2257,10 @@ static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
 static void zan_sdl_ensure_init(void) {
     if (g_sdl_ready) return;
     SDL_SetMainReady();
+    /* Deliver the click that raises/focuses a background window instead of
+     * swallowing it, so a button clicked while the window is inactive fires on
+     * the first click rather than needing a second (focus-then-click). */
+    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return;
     float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (scale <= 0.0f) scale = 1.0f;

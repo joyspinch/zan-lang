@@ -1413,7 +1413,12 @@ static int is_rc_collection_type(zan_type_t *t) {
  * user class instances plus the refcounted collections List/StringBuilder; not
  * string/int/struct/enum, and not the header-less Dict). */
 static int is_arc_managed_type(zan_type_t *t) {
-    if (!t || t->kind != TYPE_CLASS) return 0;
+    if (!t) return 0;
+    /* An interface-typed value is a heap class pointer carrying the same rc
+     * header; retain/release apply, and release_dyn dispatches on the object's
+     * recorded concrete type, so it is ARC-managed exactly like a class ref. */
+    if (t->kind == TYPE_INTERFACE) return 1;
+    if (t->kind != TYPE_CLASS) return 0;
     if (is_builtin_collection_type(t)) return is_rc_collection_type(t);
     return 1;
 }
@@ -1543,8 +1548,11 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
     if (g->check_leaks) {
         char site_buf[600];
         const char *sfile = g->src_file ? g->src_file : "<unknown>";
-        snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
-                 sfile, expr->loc.line, expr->loc.col);
+        const char *knm = (coll_kind == 2) ? "StringBuilder" : "List";
+        int elen = (elem_type && elem_type->name.len) ? elem_type->name.len : 1;
+        const char *estr = (elem_type && elem_type->name.len) ? elem_type->name.str : "?";
+        snprintf(site_buf, sizeof(site_buf), "%s:%u:%u [%s<%.*s>]",
+                 sfile, expr->loc.line, expr->loc.col, knm, elen, estr);
         site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
     }
     LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
@@ -2116,6 +2124,8 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
         int idx = fi++;
         zan_type_t *ft = m->type;
         if (!ft) continue;
+        /* weak fields are non-owning back-references: never released here. */
+        if (m->modifiers & MOD_WEAK) continue;
         if (ft->kind == TYPE_STRING) {
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef s = LLVMBuildLoad2(b, i8ptr, fp, "fs");
@@ -3152,9 +3162,12 @@ static void emit_rc_capture_local(zan_irgen_t *g, zan_type_t *type,
  * occupant (fields are zero-initialised at object allocation). */
 static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
                                 LLVMValueRef field_ptr, LLVMValueRef v,
-                                zan_ast_node_t *rhs, local_scope_t *locals) {
+                                zan_ast_node_t *rhs, local_scope_t *locals,
+                                int is_weak) {
     LLVMTypeRef vt = LLVMTypeOf(v);
-    if (LLVMGetTypeKind(vt) != LLVMPointerTypeKind) {
+    /* weak field: non-owning store, no retain of new / release of old, so a
+     * parent<->child back-reference does not form an ARC-uncollectable cycle. */
+    if (is_weak || LLVMGetTypeKind(vt) != LLVMPointerTypeKind) {
         LLVMBuildStore(g->builder, v, field_ptr);
         return;
     }
@@ -3909,7 +3922,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     expr->binary.left->ident.name);
                 LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs);
                 if (fs->type && is_rc_managed_type(fs->type)) {
-                    emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals);
+                    emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals,
+                                        (fs->modifiers & MOD_WEAK) ? 1 : 0);
                 } else {
                     LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                               : LLVMInt64TypeInContext(g->ctx);
@@ -3946,7 +3960,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             }
                         }
                         if (fsym && fsym->type && is_rc_managed_type(fsym->type)) {
-                            emit_rc_store_field(g, fsym->type, fptr, right, expr->binary.right, locals);
+                            emit_rc_store_field(g, fsym->type, fptr, right, expr->binary.right, locals,
+                                                (fsym->modifiers & MOD_WEAK) ? 1 : 0);
                         } else {
                             LLVMBuildStore(g->builder, right, fptr);
                         }
@@ -4184,7 +4199,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     if (gv) {
                         if (fs->type && is_rc_managed_type(fs->type)) {
                             emit_rc_store_field(g, fs->type, gv, right,
-                                                expr->binary.right, locals);
+                                                expr->binary.right, locals,
+                                                (fs->modifiers & MOD_WEAK) ? 1 : 0);
                         } else {
                             LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                                       : LLVMInt64TypeInContext(g->ctx);
@@ -4205,7 +4221,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, struct_ptr, (unsigned)fi, "fld");
                             zan_symbol_t *afsym = get_field_sym(local->type->sym, expr->binary.left->member.name);
                             if (afsym && afsym->type && is_rc_managed_type(afsym->type)) {
-                                emit_rc_store_field(g, afsym->type, fptr, right, expr->binary.right, locals);
+                                emit_rc_store_field(g, afsym->type, fptr, right, expr->binary.right, locals,
+                                                    (afsym->modifiers & MOD_WEAK) ? 1 : 0);
                             } else {
                                 LLVMBuildStore(g->builder, right, fptr);
                             }
@@ -4228,7 +4245,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 obj_val, (unsigned)fi, "gfld");
                             zan_symbol_t *gfsym = get_field_sym(cls, expr->binary.left->member.name);
                             if (gfsym && gfsym->type && is_rc_managed_type(gfsym->type)) {
-                                emit_rc_store_field(g, gfsym->type, fptr, right, expr->binary.right, locals);
+                                emit_rc_store_field(g, gfsym->type, fptr, right, expr->binary.right, locals,
+                                                    (gfsym->modifiers & MOD_WEAK) ? 1 : 0);
                             } else {
                                 LLVMBuildStore(g->builder, right, fptr);
                             }
@@ -9541,7 +9559,8 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 if (!gv) continue;
                 LLVMValueRef v = emit_expr(g, m->field_decl.initializer, sf_locals);
                 if (fs->type && is_rc_managed_type(fs->type)) {
-                    emit_rc_store_field(g, fs->type, gv, v, m->field_decl.initializer, sf_locals);
+                    emit_rc_store_field(g, fs->type, gv, v, m->field_decl.initializer, sf_locals,
+                                        (fs->modifiers & MOD_WEAK) ? 1 : 0);
                 } else {
                     LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                               : LLVMInt64TypeInContext(g->ctx);
