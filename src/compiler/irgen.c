@@ -1555,6 +1555,17 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
+/* Emit a lambda literal, typing its parameters/return from `expected` (the
+ * target delegate type) when the lambda omits annotations. Without this the
+ * params default to `int`, so a class-typed parameter cannot resolve fields.
+ * `expected` may be NULL/non-delegate, in which case i64/int defaults apply. */
+static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
+                                      zan_type_t *expected, local_scope_t *locals);
+/* Resolve the declared type of a method's idx-th parameter (NULL if unknown). */
+static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx);
+/* Emit a call argument, typing a bare lambda from the target delegate param. */
+static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
+                                   zan_type_t *ptype, local_scope_t *locals);
 
 /* async/await CPS helpers (defined below; forward-declared for use in the
  * AST_AWAIT_EXPR case of emit_expr). Frame header field indices are shared
@@ -6245,7 +6256,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                     call_args[0] = local->alloca;
                                 }
                                 for (int k = 0; k < expr->call.args.count; k++) {
-                                    call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
+                                    call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
+                                        method_param_type(g, method_sym, k), locals);
                                 }
                                 LLVMTypeRef mft = g->functions[fi].fn_type;
                                 LLVMValueRef mfn = route_generic_method(g, local->type,
@@ -6275,7 +6287,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 int argc = expr->call.args.count;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
                                 for (int k = 0; k < argc; k++) {
-                                    call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                                    call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
+                                        method_param_type(g, method_sym, k), locals);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
@@ -6322,7 +6335,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                              * expression (field load, index, call, ...). */
                             call_args[0] = recv_val;
                             for (int k = 0; k < expr->call.args.count; k++) {
-                                call_args[k + 1] = emit_expr(g, expr->call.args.items[k], locals);
+                                call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
+                                    method_param_type(g, method_sym, k), locals);
                             }
                             zan_type_t *recv_ty = infer_expr_type(g, callee->member.object, locals);
                             LLVMTypeRef mft = g->functions[fi].fn_type;
@@ -6367,7 +6381,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 int argc = expr->call.args.count;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
                                 for (int k = 0; k < argc; k++) {
-                                    call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                                    call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
+                                        method_param_type(g, method_sym, k), locals);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
@@ -7194,8 +7209,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 int fi = get_field_index(sym, arg->binary.left->ident.name);
                                 if (fi >= 0) {
                                     LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, alloca, (unsigned)fi, "finit");
-                                    LLVMValueRef fval = emit_expr(g, arg->binary.right, locals);
                                     zan_symbol_t *fsym = get_field_sym(sym, arg->binary.left->ident.name);
+                                    LLVMValueRef fval =
+                                        (fsym && fsym->type && fsym->type->kind == TYPE_DELEGATE &&
+                                         arg->binary.right->kind == AST_LAMBDA)
+                                            ? emit_lambda_typed(g, arg->binary.right, fsym->type, locals)
+                                            : emit_expr(g, arg->binary.right, locals);
                                     if (fsym && fsym->type) {
                                         LLVMTypeRef target_t = map_type(g, fsym->type);
                                         LLVMTypeRef val_t = LLVMTypeOf(fval);
@@ -7685,77 +7704,123 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return sub;
     }
 
-    case AST_LAMBDA: {
-        /* lambda expression — generate anonymous function */
-        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-        int pc = expr->lambda.params.count;
-        LLVMTypeRef *param_types = (LLVMTypeRef *)calloc((size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
-        for (int k = 0; k < pc; k++) {
-            param_types[k] = i64;
-        }
-        LLVMTypeRef ret_type = i64;
-        LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, (unsigned)pc, 0);
-
-        char lname[64];
-        static int lambda_id = 0;
-        snprintf(lname, sizeof(lname), "lambda_%d", lambda_id++);
-        LLVMValueRef lambda_fn = LLVMAddFunction(g->mod, lname, fn_type);
-
-        /* emit lambda body */
-        LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
-        LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "entry");
-        LLVMPositionBuilderAtEnd(g->builder, entry);
-
-        /* The body must emit into the lambda's own function: control-flow
-         * blocks append to current_fn and `return` coerces to current_fn_ret.
-         * Lambdas are non-capturing (no `this`/enclosing locals), so clear the
-         * instance/async context while keeping the enclosing type for static
-         * member access. */
-        LLVMValueRef saved_fn = g->current_fn;
-        LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
-        LLVMValueRef saved_this = g->current_this;
-        LLVMValueRef saved_async_frame = g->current_async_frame;
-        g->current_fn = lambda_fn;
-        g->current_fn_ret_type = ret_type;
-        g->current_this = NULL;
-        g->current_async_frame = NULL;
-
-        local_scope_t lambda_locals;
-        local_scope_init(&lambda_locals, g->arena);
-        for (int k = 0; k < pc; k++) {
-            zan_ast_node_t *param = expr->lambda.params.items[k];
-            LLVMValueRef alloc = LLVMBuildAlloca(g->builder, i64, "lp");
-            LLVMBuildStore(g->builder, LLVMGetParam(lambda_fn, (unsigned)k), alloc);
-            local_add(&lambda_locals, param->param.name, alloc, g->binder->type_int);
-        }
-
-        if (expr->lambda.body) {
-            if (expr->lambda.body->kind == AST_BLOCK) {
-                emit_stmt(g, expr->lambda.body, &lambda_locals);
-                if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-                    LLVMBuildRet(g->builder, LLVMConstInt(i64, 0, 0));
-                }
-            } else {
-                LLVMValueRef result = emit_expr(g, expr->lambda.body, &lambda_locals);
-                result = coerce_to_i64(g, result);
-                LLVMBuildRet(g->builder, result);
-            }
-        } else {
-            LLVMBuildRet(g->builder, LLVMConstInt(i64, 0, 0));
-        }
-
-        g->current_fn = saved_fn;
-        g->current_fn_ret_type = saved_fn_ret;
-        g->current_this = saved_this;
-        g->current_async_frame = saved_async_frame;
-        LLVMPositionBuilderAtEnd(g->builder, saved_bb);
-        free(param_types);
-        return lambda_fn;
-    }
+    case AST_LAMBDA:
+        return emit_lambda_typed(g, expr, NULL, locals);
 
     default:
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     }
+}
+
+static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
+                                      zan_type_t *expected, local_scope_t *locals) {
+    (void)locals; /* lambdas are non-capturing */
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    int pc = expr->lambda.params.count;
+    bool exp_delegate = expected && expected->kind == TYPE_DELEGATE;
+
+    /* Resolve each parameter's zan type: prefer an explicit annotation on the
+     * lambda, otherwise borrow it from the target delegate signature. */
+    zan_type_t **ptypes = (zan_type_t **)calloc((size_t)(pc > 0 ? pc : 1), sizeof(zan_type_t *));
+    LLVMTypeRef *param_types = (LLVMTypeRef *)calloc((size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
+    for (int k = 0; k < pc; k++) {
+        zan_ast_node_t *param = expr->lambda.params.items[k];
+        zan_type_t *pt = NULL;
+        if (param->param.type) {
+            pt = zan_binder_resolve_type(g->binder, param->param.type);
+        }
+        if (!pt && exp_delegate && k < expected->delegate_param_count) {
+            pt = expected->delegate_param_types[k];
+        }
+        ptypes[k] = pt;
+        param_types[k] = pt ? map_type(g, pt) : i64;
+    }
+    zan_type_t *rett = exp_delegate ? expected->delegate_ret_type : NULL;
+    LLVMTypeRef ret_type = rett ? map_type(g, rett) : i64;
+    bool ret_void = rett && rett->kind == TYPE_VOID;
+    if (ret_void) ret_type = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef fn_type = LLVMFunctionType(ret_type, param_types, (unsigned)pc, 0);
+
+    char lname[64];
+    static int lambda_id = 0;
+    snprintf(lname, sizeof(lname), "lambda_%d", lambda_id++);
+    LLVMValueRef lambda_fn = LLVMAddFunction(g->mod, lname, fn_type);
+
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+
+    /* The body must emit into the lambda's own function: control-flow blocks
+     * append to current_fn and `return` coerces to current_fn_ret. Lambdas are
+     * non-capturing (no `this`/enclosing locals), so clear the instance/async
+     * context while keeping the enclosing type for static member access. */
+    LLVMValueRef saved_fn = g->current_fn;
+    LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+    LLVMValueRef saved_this = g->current_this;
+    LLVMValueRef saved_async_frame = g->current_async_frame;
+    g->current_fn = lambda_fn;
+    g->current_fn_ret_type = ret_type;
+    g->current_this = NULL;
+    g->current_async_frame = NULL;
+
+    local_scope_t lambda_locals;
+    local_scope_init(&lambda_locals, g->arena);
+    for (int k = 0; k < pc; k++) {
+        zan_ast_node_t *param = expr->lambda.params.items[k];
+        LLVMTypeRef lt = param_types[k];
+        LLVMValueRef alloc = LLVMBuildAlloca(g->builder, lt, "lp");
+        LLVMBuildStore(g->builder, LLVMGetParam(lambda_fn, (unsigned)k), alloc);
+        local_add(&lambda_locals, param->param.name, alloc,
+                  ptypes[k] ? ptypes[k] : g->binder->type_int);
+    }
+
+    if (expr->lambda.body && expr->lambda.body->kind == AST_BLOCK) {
+        emit_stmt(g, expr->lambda.body, &lambda_locals);
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+            if (ret_void) LLVMBuildRetVoid(g->builder);
+            else LLVMBuildRet(g->builder, LLVMConstNull(ret_type));
+        }
+    } else if (expr->lambda.body) {
+        LLVMValueRef result = emit_expr(g, expr->lambda.body, &lambda_locals);
+        if (ret_void) {
+            LLVMBuildRetVoid(g->builder);
+        } else if (rett) {
+            result = emit_boundary_coerce(g, result, ret_type);
+            LLVMBuildRet(g->builder, result);
+        } else {
+            result = coerce_to_i64(g, result);
+            LLVMBuildRet(g->builder, result);
+        }
+    } else {
+        if (ret_void) LLVMBuildRetVoid(g->builder);
+        else LLVMBuildRet(g->builder, LLVMConstNull(ret_type));
+    }
+
+    g->current_fn = saved_fn;
+    g->current_fn_ret_type = saved_fn_ret;
+    g->current_this = saved_this;
+    g->current_async_frame = saved_async_frame;
+    LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    free(param_types);
+    free(ptypes);
+    return lambda_fn;
+}
+
+static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx) {
+    if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return NULL;
+    zan_ast_list_t *params = &msym->decl->method_decl.params;
+    if (idx < 0 || idx >= params->count) return NULL;
+    zan_ast_node_t *p = params->items[idx];
+    if (!p || !p->param.type) return NULL;
+    return zan_binder_resolve_type(g->binder, p->param.type);
+}
+
+static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
+                                   zan_type_t *ptype, local_scope_t *locals) {
+    if (arg && arg->kind == AST_LAMBDA && ptype && ptype->kind == TYPE_DELEGATE) {
+        return emit_lambda_typed(g, arg, ptype, locals);
+    }
+    return emit_expr(g, arg, locals);
 }
 
 /* ---- async/await CPS lowering helpers ---- */
@@ -8763,7 +8828,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (arc_own) LLVMBuildStore(g->builder, LLVMConstNull(llvm_type), alloca);
 
         if (stmt->var_decl.initializer) {
-            LLVMValueRef init_val = emit_expr(g, stmt->var_decl.initializer, locals);
+            LLVMValueRef init_val =
+                (type && type->kind == TYPE_DELEGATE &&
+                 stmt->var_decl.initializer->kind == AST_LAMBDA)
+                    ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
+                    : emit_expr(g, stmt->var_decl.initializer, locals);
             if (arc_own) {
                 emit_rc_capture_local(g, type, alloca, init_val, stmt->var_decl.initializer, locals);
             } else {
