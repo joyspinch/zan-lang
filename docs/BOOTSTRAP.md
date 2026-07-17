@@ -25,6 +25,23 @@ compiler) need not be byte-identical, because gen0 and gen1 are two different
 implementations of codegen. The invariant is `gen2 == gen3`, i.e. the
 self-hosted backend has reached a fixed point.
 
+## Policy: the self-hosted compiler is authoritative
+
+`src/selfhost/*.zan` is the source of truth for the language. The C host
+(`src/compiler/`) exists only to *bootstrap* gen1 and to run in CI where clang
+may be absent; it is **not** the reference semantics.
+
+- Fix language bugs and add language features in the self-hosted compiler first
+  (`parser.zan` / `checker.zan` / `irgen.zan` / ...), and gate them with the
+  `selfhost_gen1` program test and the `selfhost_fixed_point` closure.
+- Touch the C host **only when necessary** -- typically to keep it able to
+  compile the self-hosted sources (so the two implementations agree closely
+  enough for the bootstrap to run). When the C host and the self-host disagree,
+  the self-host wins and the C host is brought in line, not the other way round.
+- Every behavioural fix should come with coverage that exercises the
+  *self-hosted* compiler (extend `tests/selfhost/prog1.zan`, which runs through
+  gen1), not only the C-host conformance suite.
+
 ## Architecture
 
 `src/selfhost/` mirrors the module structure of the C host in `src/compiler/`:

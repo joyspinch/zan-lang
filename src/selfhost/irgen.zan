@@ -2584,6 +2584,16 @@ class Irgen {
             string t = NT();
             string ow = "0"; if (ArcManaged(ListElem(ty))) { ow = "1"; }
             L("  " + t + " = call i8* @zlist_new(i64 " + ow + ")");
+            if (e.ival == 2) {
+                // collection initializer: append each item
+                int j = 0;
+                while (j < e.kids.Count) {
+                    ExprVal iv = GenExpr(e.kids[j]);
+                    string sv = ToSlot(iv, ListElem(ty));
+                    L("  call void @zlist_add(i8* " + t + ", i64 " + sv + ")");
+                    j = j + 1;
+                }
+            }
             AddTemp(t, ty);
             return new ExprVal(t, ty);
         }
@@ -2619,9 +2629,11 @@ class Irgen {
             L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
             L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + cn + "_vtable to i8*), i8** " + vtp0);
         }
-        // call ctor if present
+        // call ctor if present. With an object initializer (ival == 2) the kids
+        // are `Field = value` pairs, not ctor args, so only a parameterless ctor
+        // is invoked and the field stores follow.
         Node ctor = binder.FindCtor(cls);
-        if (ctor != null) {
+        if (ctor != null && e.ival != 2) {
             string args = "%" + cn + "* " + obj;
             int i = 0;
             while (i < e.kids.Count) {
@@ -2631,10 +2643,34 @@ class Irgen {
                 i = i + 1;
             }
             L("  call void @" + cn + "_ctor(" + args + ")");
+        } else if (ctor != null && e.ival == 2 && CtorParamCount(ctor) == 0) {
+            L("  call void @" + cn + "_ctor(%" + cn + "* " + obj + ")");
+        }
+        // object initializer: store each `Field = value` into the instance
+        if (e.ival == 2) {
+            int j = 0;
+            while (j < e.kids.Count) {
+                Node it = e.kids[j];
+                if (it.kind == AK.Assignment() && it.a != null
+                    && it.a.kind == AK.Ident()) {
+                    ExprVal fv = GenExpr(it.b);
+                    StoreField(obj, cn, it.a.sval, fv);
+                }
+                j = j + 1;
+            }
         }
         // preserve generic type arguments (ty may carry <...>) for the result
         AddTemp(obj, ty);
         return new ExprVal(obj, ty);
+    }
+
+    int CtorParamCount(Node ctor) {
+        int n = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            if (ctor.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
     }
 
     Node CtorParamType(Node ctor, int argIdx) {
