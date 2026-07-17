@@ -135,10 +135,28 @@ typedef struct {
     bool            break_on_entry;     /* pause at program start */
     bool            break_on_exception; /* pause on unhandled exceptions */
     bool            skip_stdlib;        /* don't step into stdlib */
+
+    /* GDB/MI backend (machine-interface driver over a gdb child process) */
+    char            gdb_path[512];      /* explicit gdb path (else $ZAN_GDB/auto) */
+    char            program_path[1024]; /* program currently under debug */
+    char            mi_buf[65536];      /* buffered gdb stdout (MI records) */
+    int             mi_buf_len;
+    int             mi_token;           /* monotonically increasing MI token */
+    int             last_exit_code;     /* inferior exit code */
+#ifdef _WIN32
+    void           *gdb_in_w;           /* HANDLE: gdb stdin (write end) */
+    void           *gdb_out_r;          /* HANDLE: gdb stdout (read end) */
+    void           *gdb_proc;           /* HANDLE: gdb process */
+#else
+    int             gdb_in_fd;          /* gdb stdin (write end) */
+    int             gdb_out_fd;         /* gdb stdout (read end) */
+    int             gdb_pid;            /* gdb child pid */
+#endif
 } debugger_t;
 
 /* Initialize debugger */
 void dbg_init(debugger_t *dbg);
+void dbg_set_gdb_path(debugger_t *dbg, const char *path);
 
 /* Start debugging a program */
 bool dbg_start(debugger_t *dbg, const char *program, const char *args);
