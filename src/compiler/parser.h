@@ -13,6 +13,7 @@ struct zan_parser {
     zan_diag_t *diag;
     zan_token_t current;
     zan_token_t previous;
+    int expr_depth; /* current expression recursion depth (stack-overflow guard) */
 };
 
 void zan_parser_init(zan_parser_t *p, zan_lexer_t *lex, zan_arena_t *arena,

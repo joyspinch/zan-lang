@@ -20,11 +20,17 @@
  *   - Variable modification (setVariable)
  *   - Multiple scopes (Locals, Watch)
  *
- * Runtime process control is delegated to the debugger engine (Windows
- * CreateProcess-based; a simulated stepping model elsewhere), while this
- * adapter provides the full protocol surface.
+ * Runtime process control is delegated to the debugger engine, which drives a
+ * real gdb in machine-interface mode (the compiler emits DWARF via `zanc -g`),
+ * so breakpoints, stepping, stack frames and variables are genuine.
  *
- * Usage: zan-dap           (communicates over stdin/stdout)
+ * Usage:
+ *   zan-dap                (communicates over stdin/stdout)
+ *   zan-dap --port <N>     (listens on 127.0.0.1:<N> for a single DAP client)
+ *
+ * The TCP server mode exists for clients that cannot easily drive a child
+ * process over bidirectional pipes (e.g. the self-hosted Zan IDE, which speaks
+ * DAP through the standard-library TCP socket layer).
  */
 #include "json.h"
 #include "rpc.h"
@@ -38,8 +44,18 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET dap_sock_t;
+#define DAP_INVALID_SOCK INVALID_SOCKET
 #else
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+typedef int dap_sock_t;
+#define DAP_INVALID_SOCK (-1)
 #endif
 
 typedef struct {
@@ -47,10 +63,74 @@ typedef struct {
     FILE      *out;
     int        seq;              /* outgoing message sequence */
     char       program[1024];    /* launched executable */
+    char       prog_args[1024];  /* inferior arguments */
     char       source_file[1024];/* main source file (for stack frames) */
     bool       terminated;
     bool       launched;
+    bool       use_sock;         /* true when framing over a TCP socket */
+    dap_sock_t sock;             /* connected client socket (server mode) */
 } dap_t;
+
+/* ---- TCP transport (server mode) -------------------------------------- */
+
+static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
+    int sent = 0;
+    while (sent < n) {
+        int r = (int)send(s, buf + sent, n - sent, 0);
+        if (r <= 0) return false;
+        sent += r;
+    }
+    return true;
+}
+
+/* Read one Content-Length framed message from the socket (headers scanned a
+ * byte at a time; body read in bulk). Returns a malloc'd NUL-terminated body,
+ * or NULL on disconnect. */
+static char *rpc_read_message_sock(dap_sock_t s) {
+    char line[512];
+    long content_length = -1;
+    for (;;) {
+        int len = 0;
+        for (;;) {
+            char c;
+            int r = (int)recv(s, &c, 1, 0);
+            if (r <= 0) return NULL;
+            if (len < (int)sizeof(line) - 1) line[len++] = c;
+            if (c == '\n') break;
+        }
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            len--;
+        line[len] = '\0';
+        if (len == 0) break; /* blank line -> end of headers */
+        const char *prefix = "content-length:";
+        bool match = true;
+        for (int i = 0; prefix[i]; i++) {
+            char lc = line[i];
+            if (lc >= 'A' && lc <= 'Z') lc = (char)(lc - 'A' + 'a');
+            if (lc != prefix[i]) { match = false; break; }
+        }
+        if (match) content_length = strtol(line + strlen(prefix), NULL, 10);
+    }
+    if (content_length < 0 || content_length > (64 * 1024 * 1024)) return NULL;
+    char *body = (char *)malloc((size_t)content_length + 1);
+    if (!body) return NULL;
+    long got = 0;
+    while (got < content_length) {
+        int r = (int)recv(s, body + got, (int)(content_length - got), 0);
+        if (r <= 0) { free(body); return NULL; }
+        got += r;
+    }
+    body[content_length] = '\0';
+    return body;
+}
+
+static void rpc_write_message_sock(dap_sock_t s, const char *payload) {
+    char header[64];
+    int hn = snprintf(header, sizeof(header),
+                      "Content-Length: %zu\r\n\r\n", strlen(payload));
+    sock_send_all(s, header, hn);
+    sock_send_all(s, payload, (int)strlen(payload));
+}
 
 /* Reference ids used by scopes/variables. */
 #define VARREF_LOCALS  1000
@@ -61,7 +141,10 @@ typedef struct {
 static void dap_send(dap_t *d, json_value *msg) {
     json_obj_set(msg, "seq", json_new_num(d->seq++));
     char *payload = json_serialize(msg);
-    rpc_write_message(d->out, payload);
+    if (d->use_sock)
+        rpc_write_message_sock(d->sock, payload);
+    else
+        rpc_write_message(d->out, payload);
     free(payload);
     json_free(msg);
 }
@@ -103,42 +186,17 @@ static void dap_send_stopped(dap_t *d, const char *reason) {
     dap_send_event(d, "stopped", body);
 }
 
-/* Run the launched program to completion, streaming its real stdout/stderr
- * as DAP output events, then emit terminated/exited with the real exit code.
- *
- * Source-line stepping in this adapter is modelled statically (the compiler
- * does not yet emit debug-info line tables, so native breakpoints cannot be
- * placed). Executing the program here at the end of the session gives the
- * debug console the program's genuine output and exit status instead of a
- * fabricated one. */
-static void dap_run_and_terminate(dap_t *d) {
-    if (d->terminated) return;
-
-    int exit_code = 0;
-    if (d->program[0]) {
-        char cmd[1200];
-#ifdef _WIN32
-        snprintf(cmd, sizeof(cmd), "\"\"%s\" 2>&1\"", d->program);
-        FILE *fp = _popen(cmd, "r");
-#else
-        snprintf(cmd, sizeof(cmd), "\"%s\" 2>&1", d->program);
-        FILE *fp = popen(cmd, "r");
-#endif
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp))
-                dap_output(d, "stdout", line);
-#ifdef _WIN32
-            exit_code = _pclose(fp);
-#else
-            int st = pclose(fp);
-            exit_code = (st == -1) ? -1 : (WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-#endif
-        } else {
-            dap_output(d, "stderr", "[DBG] Could not launch program for output capture.\n");
-        }
+/* Flush any buffered engine output (inferior stdout + debug notes) to the
+ * client's debug console, then reset the buffer. */
+static void dap_flush_output(dap_t *d) {
+    if (d->dbg.output_len > 0) {
+        dap_output(d, "stdout", d->dbg.output);
+        dbg_clear_output(&d->dbg);
     }
+}
 
+static void dap_terminate_with_code(dap_t *d, int exit_code) {
+    if (d->terminated) return;
     d->terminated = true;
     dap_send_event(d, "terminated", NULL);
     json_value *body = json_new_obj();
@@ -146,13 +204,23 @@ static void dap_run_and_terminate(dap_t *d) {
     dap_send_event(d, "exited", body);
 }
 
-static void dap_send_terminated(dap_t *d) {
-    if (d->terminated) return;
-    d->terminated = true;
-    dap_send_event(d, "terminated", NULL);
-    json_value *body = json_new_obj();
-    json_obj_set(body, "exitCode", json_new_num(0));
-    dap_send_event(d, "exited", body);
+/* Map a gdb/MI stop reason to a DAP `stopped` reason. */
+static const char *dap_stop_reason(const char *mi) {
+    if (!mi || !mi[0]) return "breakpoint";
+    if (strncmp(mi, "breakpoint", 10) == 0) return "breakpoint";
+    if (strstr(mi, "stepping-range") || strstr(mi, "finished")) return "step";
+    if (strstr(mi, "watchpoint")) return "data breakpoint";
+    if (strstr(mi, "signal")) return "exception";
+    return "breakpoint";
+}
+
+/* After an execution command: report the resulting stop or termination. */
+static void dap_report_stop(dap_t *d) {
+    dap_flush_output(d);
+    if (d->dbg.state == DBG_PAUSED)
+        dap_send_stopped(d, dap_stop_reason(d->dbg.stop_reason));
+    else
+        dap_terminate_with_code(d, d->dbg.last_exit_code);
 }
 
 /* ============================== handlers ============================= */
@@ -240,55 +308,26 @@ static void handle_launch(dap_t *d, json_value *request) {
     const char *prog_args = json_get_str(json_obj_get(args, "args"));
     bool stop_on_entry = (bool)json_get_num(json_obj_get(args, "stopOnEntry"), 0);
 
+    const char *gdb_path = json_get_str(json_obj_get(args, "gdbPath"));
+
     if (program) strncpy(d->program, program, sizeof(d->program) - 1);
+    if (prog_args) strncpy(d->prog_args, prog_args, sizeof(d->prog_args) - 1);
+    if (gdb_path && gdb_path[0]) dbg_set_gdb_path(&d->dbg, gdb_path);
     d->dbg.break_on_entry = stop_on_entry;
 
     d->launched = true;
-    dap_output(d, "console", "Launching Zan program under debugger...\n");
+    dap_output(d, "console", "Launching Zan program under gdb...\n");
 
-    /* The program is executed for real at session end (dap_run_and_terminate)
-     * so its true output/exit code are reported. Line stepping is driven by
-     * the static model below rather than the OS debugger, whose event loop
-     * cannot place source breakpoints without compiler debug-info. */
-    {
-        d->dbg.state = DBG_PAUSED;
-        d->dbg.callstack_depth = 1;
-        d->dbg.active_frame = 0;
-        strncpy(d->dbg.callstack[0].function_name, "Main",
-                sizeof(d->dbg.callstack[0].function_name) - 1);
-        strncpy(d->dbg.callstack[0].file, d->source_file,
-                sizeof(d->dbg.callstack[0].file) - 1);
-        d->dbg.callstack[0].line = d->dbg.bp_count ? d->dbg.breakpoints[0].line : 1;
-        strncpy(d->dbg.current_file, d->source_file,
-                sizeof(d->dbg.current_file) - 1);
-        d->dbg.current_line = d->dbg.callstack[0].line;
-    }
-
+    /* The program is actually started at configurationDone, once the client
+     * has delivered its breakpoints. */
     dap_send_response(d, request, true, NULL);
 }
 
 static void handle_configuration_done(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    /* If breakpoints are set, report an initial stop; otherwise the program
-     * "runs" and terminates. */
-    if (d->dbg.bp_count > 0) {
-        d->dbg.state = DBG_PAUSED;
-        if (d->dbg.callstack_depth == 0) {
-            d->dbg.callstack_depth = 1;
-            d->dbg.active_frame = 0;
-            strncpy(d->dbg.callstack[0].function_name, "Main",
-                    sizeof(d->dbg.callstack[0].function_name) - 1);
-            strncpy(d->dbg.callstack[0].file, d->source_file,
-                    sizeof(d->dbg.callstack[0].file) - 1);
-        }
-        d->dbg.callstack[0].line = d->dbg.breakpoints[0].line;
-        d->dbg.current_line = d->dbg.breakpoints[0].line;
-        strncpy(d->dbg.current_file, d->source_file,
-                sizeof(d->dbg.current_file) - 1);
-        dap_send_stopped(d, "breakpoint");
-    } else {
-        dap_run_and_terminate(d);
-    }
+    /* Breakpoints have now been delivered; launch the inferior under gdb. */
+    dbg_start(&d->dbg, d->program, d->prog_args[0] ? d->prog_args : NULL);
+    dap_report_stop(d);
 }
 
 static void handle_threads(dap_t *d, json_value *request) {
@@ -456,52 +495,37 @@ static void handle_continue(dap_t *d, json_value *request) {
     json_obj_set(body, "allThreadsContinued", json_new_bool(true));
     dap_send_response(d, request, true, body);
     dbg_continue(&d->dbg);
-
-    /* Check if we hit another breakpoint */
-    if (d->dbg.state == DBG_PAUSED) {
-        dap_send_stopped(d, "breakpoint");
-    } else {
-        dap_run_and_terminate(d);
-    }
+    dap_report_stop(d);
 }
 
 static void handle_next(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
     dbg_step_over(&d->dbg);
-    if (d->dbg.callstack_depth > 0)
-        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
-            d->dbg.current_line;
-    dap_send_stopped(d, "step");
+    dap_report_stop(d);
 }
 
 static void handle_step_in(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
     dbg_step_into(&d->dbg);
-    if (d->dbg.callstack_depth > 0)
-        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
-            d->dbg.current_line;
-    dap_send_stopped(d, "step");
+    dap_report_stop(d);
 }
 
 static void handle_step_out(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
     dbg_step_out(&d->dbg);
-    if (d->dbg.callstack_depth > 0)
-        d->dbg.callstack[d->dbg.active_frame >= 0 ? d->dbg.active_frame : 0].line =
-            d->dbg.current_line;
-    dap_send_stopped(d, "step");
+    dap_report_stop(d);
 }
 
 static void handle_pause(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    d->dbg.state = DBG_PAUSED;
+    /* Synchronous MI backend has no async-interrupt path yet; acknowledge. */
     dap_send_stopped(d, "pause");
 }
 
 static void handle_disconnect(dap_t *d, json_value *request) {
     dbg_stop(&d->dbg);
     dap_send_response(d, request, true, NULL);
-    dap_send_terminated(d);
+    dap_terminate_with_code(d, d->dbg.last_exit_code);
 }
 
 /* ============================== dispatch ============================= */
@@ -533,20 +557,70 @@ static void dispatch(dap_t *d, json_value *request) {
     else                                            dap_send_response(d, request, true, NULL);
 }
 
-int main(void) {
+/* Listen on 127.0.0.1:port and accept a single client. Returns the connected
+ * socket, or DAP_INVALID_SOCK on failure. */
+static dap_sock_t dap_listen_accept(int port) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return DAP_INVALID_SOCK;
+#endif
+    dap_sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == DAP_INVALID_SOCK) return DAP_INVALID_SOCK;
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(ls, 1) != 0) {
+#ifdef _WIN32
+        closesocket(ls);
+#else
+        close(ls);
+#endif
+        return DAP_INVALID_SOCK;
+    }
+    dap_sock_t cs = accept(ls, NULL, NULL);
+#ifdef _WIN32
+    closesocket(ls);
+#else
+    close(ls);
+#endif
+    return cs;
+}
+
+int main(int argc, char **argv) {
+    int port = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
+            port = atoi(argv[++i]);
+    }
+
     dap_t d;
     memset(&d, 0, sizeof(d));
     dbg_init(&d.dbg);
     d.out = stdout;
     d.seq = 1;
 
+    if (port > 0) {
+        d.sock = dap_listen_accept(port);
+        if (d.sock == DAP_INVALID_SOCK) {
+            fprintf(stderr, "zan-dap: failed to listen on port %d\n", port);
+            return 1;
+        }
+        d.use_sock = true;
+    } else {
 #ifdef _WIN32
-    _setmode(_fileno(stdin), _O_BINARY);
-    _setmode(_fileno(stdout), _O_BINARY);
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    }
 
     for (;;) {
-        char *body = rpc_read_message(stdin);
+        char *body = d.use_sock ? rpc_read_message_sock(d.sock)
+                                : rpc_read_message(stdin);
         if (!body) break;
 
         json_value *msg = json_parse(body);
@@ -563,5 +637,10 @@ int main(void) {
     }
 
     dbg_stop(&d.dbg);
+#ifdef _WIN32
+    if (d.use_sock) { closesocket(d.sock); WSACleanup(); }
+#else
+    if (d.use_sock) close(d.sock);
+#endif
     return 0;
 }

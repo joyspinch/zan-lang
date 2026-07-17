@@ -14,9 +14,230 @@
 #include "diag.h"
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitWriter.h>
+#include <llvm-c/DebugInfo.h>
+#if defined(__has_include)
+#if __has_include(<llvm/Config/llvm-config.h>)
+#include <llvm/Config/llvm-config.h>
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#define zan_getcwd _getcwd
+#else
+#include <unistd.h>
+#define zan_getcwd getcwd
+#endif
+
+/* ---------------------------------------------------------------------------
+ * DWARF debug information (opt-in via `zanc -g`).
+ *
+ * Emits DWARF line tables and one DISubprogram per emitted LLVM function so a
+ * standard source-level debugger (gdb/lldb, driven by zan-dap) can set source
+ * breakpoints, produce accurate call stacks and step through Zan code. Debug
+ * metadata is only created when g->emit_debug is set, so default and --publish
+ * builds are byte-for-byte unchanged.
+ *
+ * Subprograms are created lazily the first time a statement location is set for
+ * a function, keyed off the LLVM function currently under the builder. The only
+ * verifier-critical invariant is that an instruction's !dbg scope must belong to
+ * the function containing it; since the builder keeps a *persistent* current
+ * location, we clear it (di_clear) whenever we begin emitting a different
+ * function's body, so instructions in synthetic/prologue positions never inherit
+ * a neighbouring function's scope. Sloppy locations *within* one function are
+ * harmless (same subprogram). */
+static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id);
+
+static void di_ensure(zan_irgen_t *g) {
+    if (!g->emit_debug || g->di_builder) return;
+    g->di_builder = LLVMCreateDIBuilder(g->mod);
+
+    /* Module flags required for a debugger to consume the info. DWARF (not
+     * CodeView) because Zan links Windows binaries with the bundled GNU ld
+     * (windows-gnu ABI), which gdb reads. */
+    LLVMContextRef c = g->ctx;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
+    LLVMAddModuleFlag(g->mod, LLVMModuleFlagBehaviorWarning,
+                      "Debug Info Version", 18,
+                      LLVMValueAsMetadata(LLVMConstInt(i32, 3, 0)));
+    LLVMAddModuleFlag(g->mod, LLVMModuleFlagBehaviorWarning,
+                      "Dwarf Version", 13,
+                      LLVMValueAsMetadata(LLVMConstInt(i32, 4, 0)));
+
+    LLVMMetadataRef file = di_file_for(g, 0);
+    const char *producer = "zanc";
+    g->di_cu = LLVMDIBuilderCreateCompileUnit(
+        g->di_builder, LLVMDWARFSourceLanguageC, file,
+        producer, strlen(producer),
+        /*isOptimized*/ 0, /*Flags*/ "", 0, /*RuntimeVer*/ 0,
+        /*SplitName*/ "", 0, LLVMDWARFEmissionFull,
+        /*DWOId*/ 0, /*SplitDebugInlining*/ 0,
+        /*DebugInfoForProfiling*/ 0, /*SysRoot*/ "", 0, /*SDK*/ "", 0);
+}
+
+static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
+    if (!g->emit_debug) return NULL;
+    if (file_id >= 256) file_id = 0;
+    if (g->di_files[file_id]) return g->di_files[file_id];
+    if (!g->di_builder) g->di_builder = LLVMCreateDIBuilder(g->mod);
+
+    const char *path = NULL;
+    if (g->diag && file_id < (uint32_t)g->diag->file_count && g->diag->file_names)
+        path = g->diag->file_names[file_id];
+    if (!path || !path[0]) path = g->src_file ? g->src_file : "<unknown>.zan";
+
+    /* Split into directory + filename so comp_dir lets the debugger resolve
+     * relative source paths. */
+    char dir[1024];
+    if (path[0] == '/' || (path[0] && path[1] == ':')) {
+        /* absolute: keep the leading directory portion */
+        const char *slash = strrchr(path, '/');
+        const char *bslash = strrchr(path, '\\');
+        const char *cut = slash > bslash ? slash : bslash;
+        if (cut) {
+            size_t n = (size_t)(cut - path);
+            if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+            memcpy(dir, path, n);
+            dir[n] = '\0';
+            path = cut + 1;
+        } else {
+            dir[0] = '\0';
+        }
+    } else if (!zan_getcwd(dir, sizeof(dir))) {
+        dir[0] = '\0';
+    }
+
+    LLVMMetadataRef f = LLVMDIBuilderCreateFile(
+        g->di_builder, path, strlen(path), dir, strlen(dir));
+    g->di_files[file_id] = f;
+    return f;
+}
+
+/* Return the DISubprogram of the function currently under the builder, creating
+ * it lazily (keyed off the LLVM function) the first time it is needed. */
+static LLVMMetadataRef di_ensure_sp(zan_irgen_t *g, uint32_t file_id, unsigned line) {
+    if (!g->emit_debug || !g->builder) return NULL;
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
+    if (!bb) return NULL;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(bb);
+    if (!fn) return NULL;
+    di_ensure(g);
+    LLVMMetadataRef sp = LLVMGetSubprogram(fn);
+    if (sp) return sp;
+    size_t nlen = 0;
+    const char *name = LLVMGetValueName2(fn, &nlen);
+    if (!name || nlen == 0) { name = "fn"; nlen = 2; }
+    LLVMMetadataRef file = di_file_for(g, file_id);
+    LLVMMetadataRef subty = LLVMDIBuilderCreateSubroutineType(
+        g->di_builder, file, NULL, 0, LLVMDIFlagZero);
+    unsigned l = line ? line : 1;
+    sp = LLVMDIBuilderCreateFunction(
+        g->di_builder, file, name, nlen, name, nlen, file, l, subty,
+        /*IsLocalToUnit*/ 0, /*IsDefinition*/ 1, /*ScopeLine*/ l,
+        LLVMDIFlagZero, /*IsOptimized*/ 0);
+    LLVMSetSubprogram(fn, sp);
+    return sp;
+}
+
+/* Clear the builder's current debug location. MUST be called when beginning to
+ * emit a new function's body so prologue/synthetic instructions do not inherit a
+ * neighbouring function's DISubprogram scope (a hard verifier error). No-op
+ * unless debug info is enabled. */
+static void di_clear(zan_irgen_t *g) {
+    if (!g->emit_debug || !g->builder) return;
+    LLVMSetCurrentDebugLocation2(g->builder, NULL);
+    g->di_cur_line = 0;
+    g->di_cur_file = 0;
+}
+
+/* Attach a source location (and, lazily, a DISubprogram) to the function
+ * currently under the builder. Called once per statement from emit_stmt. */
+static void di_set_loc(zan_irgen_t *g, zan_loc_t loc) {
+    if (!g->emit_debug || !g->builder) return;
+    LLVMMetadataRef sp = di_ensure_sp(g, loc.file_id, loc.line);
+    if (!sp) return;
+    g->di_cur_line = loc.line;
+    g->di_cur_file = loc.file_id;
+    unsigned line = loc.line ? loc.line : 1;
+    LLVMMetadataRef dl = LLVMDIBuilderCreateDebugLocation(
+        g->ctx, line, loc.col, sp, NULL);
+    LLVMSetCurrentDebugLocation2(g->builder, dl);
+}
+
+/* Map an LLVM storage type to a DIType for a local/parameter. Returns NULL for
+ * aggregates (struct/array by value), whose contents we do not describe yet, so
+ * the caller skips emitting a declare rather than showing wrong bytes. */
+static LLVMMetadataRef di_type_from_llvm(zan_irgen_t *g, LLVMTypeRef ty) {
+    LLVMTypeKind k = LLVMGetTypeKind(ty);
+    switch (k) {
+    case LLVMIntegerTypeKind: {
+        unsigned w = LLVMGetIntTypeWidth(ty);
+        if (w == 1)
+            return LLVMDIBuilderCreateBasicType(g->di_builder, "bool", 4, 8,
+                                                /*DW_ATE_boolean*/ 0x02,
+                                                LLVMDIFlagZero);
+        char nm[16];
+        int n = snprintf(nm, sizeof(nm), "i%u", w);
+        return LLVMDIBuilderCreateBasicType(g->di_builder, nm, (size_t)n, w,
+                                            /*DW_ATE_signed*/ 0x05,
+                                            LLVMDIFlagZero);
+    }
+    case LLVMDoubleTypeKind:
+        return LLVMDIBuilderCreateBasicType(g->di_builder, "f64", 3, 64,
+                                            /*DW_ATE_float*/ 0x04, LLVMDIFlagZero);
+    case LLVMFloatTypeKind:
+        return LLVMDIBuilderCreateBasicType(g->di_builder, "f32", 3, 32,
+                                            /*DW_ATE_float*/ 0x04, LLVMDIFlagZero);
+    case LLVMPointerTypeKind: {
+        LLVMMetadataRef byte = LLVMDIBuilderCreateBasicType(
+            g->di_builder, "byte", 4, 8, /*DW_ATE_unsigned_char*/ 0x08,
+            LLVMDIFlagZero);
+        return LLVMDIBuilderCreatePointerType(g->di_builder, byte, 64, 0, 0,
+                                              "ptr", 3);
+    }
+    default:
+        return NULL;
+    }
+}
+
+/* Emit an llvm.dbg.declare tying a named source variable to its stack slot, so
+ * the debugger can list and read it. `storage` must be an alloca (frame-resident
+ * async locals and non-alloca slots are skipped). Called for every local scope
+ * entry via local_add; g comes from the file-static emit context. */
+static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage) {
+    if (!g || !g->emit_debug || !g->builder) return;
+    if (!storage || !LLVMIsAAllocaInst(storage)) return;
+    if (name.len == 0 || !name.str) return;
+    LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
+    if (!bb) return;
+    LLVMMetadataRef sp = di_ensure_sp(g, g->di_cur_file, g->di_cur_line);
+    if (!sp) return;
+    LLVMMetadataRef ty = di_type_from_llvm(g, LLVMGetAllocatedType(storage));
+    if (!ty) return; /* aggregate: not described yet */
+    LLVMMetadataRef file = di_file_for(g, g->di_cur_file);
+    unsigned line = g->di_cur_line ? g->di_cur_line : 1;
+    LLVMMetadataRef var = LLVMDIBuilderCreateAutoVariable(
+        g->di_builder, sp, name.str, name.len, file, line, ty,
+        /*AlwaysPreserve*/ 1, LLVMDIFlagZero, /*AlignInBits*/ 0);
+    LLVMMetadataRef expr = LLVMDIBuilderCreateExpression(g->di_builder, NULL, 0);
+    LLVMMetadataRef dl = LLVMDIBuilderCreateDebugLocation(g->ctx, line, 0, sp, NULL);
+    /* The debug-record API (LLVMDIBuilderInsertDeclareRecordAtEnd) is LLVM 19+;
+     * LLVM 18 and earlier only provide the intrinsic-based InsertDeclareAtEnd.
+     * Both take the same arguments, so select by version. */
+#if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR < 19
+    LLVMDIBuilderInsertDeclareAtEnd(g->di_builder, storage, var, expr, dl, bb);
+#else
+    LLVMDIBuilderInsertDeclareRecordAtEnd(g->di_builder, storage, var, expr, dl, bb);
+#endif
+}
+
+/* The active codegen context, set for the duration of zan_irgen_emit so the
+ * g-free local_add can forward variables to di_declare_var. Codegen is
+ * single-threaded per module, so a file-static is safe here. */
+static zan_irgen_t *g_di_emit_ctx = NULL;
 
 #include "../common/host_oom.h"
 /* Maximum number of distinct `new` allocation sites tracked for per-site
@@ -89,6 +310,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->ctx = LLVMContextCreate();
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
     g->builder = LLVMCreateBuilderInContext(g->ctx);
+
+    /* Debug info off by default; the driver flips emit_debug on for `-g` before
+     * calling zan_irgen_emit. */
+    g->emit_debug = false;
+    g->di_builder = NULL;
+    g->di_cu = NULL;
+    memset(g->di_files, 0, sizeof(g->di_files));
+    g->di_cur_line = 0;
+    g->di_cur_file = 0;
 
     /* runtime-diagnostics defaults */
     g->src_file = module_name;
@@ -1355,6 +1585,9 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].arc_owned = 0;
     scope->vars[scope->count].arr_len = NULL;
     scope->count++;
+    /* Record the variable for the debugger (no-op unless building with -g). The
+     * emit context supplies the compiler state; local_add itself is g-free. */
+    di_declare_var(g_di_emit_ctx, name, alloca);
 }
 
 static LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name) {
@@ -2038,6 +2271,7 @@ static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
  * RC-managed fields when it is about to hit zero, then hand off to
  * zan_rt_release for the decrement + free. */
 static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValueRef fn) {
+    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
@@ -2097,6 +2331,7 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
  * free. Peeking the refcount keeps buffer release aliasing-safe. */
 static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
                                           zan_type_t *elem_type, LLVMValueRef fn) {
+    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
@@ -3716,6 +3951,38 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 emit_string_release(g, right);
             }
             return seq;
+        }
+
+        /* string ordering: route `<`/`<=`/`>`/`>=` on strings through strcmp
+         * and compare its result against 0. Without this the operands (i8*)
+         * would be compared as raw pointer addresses rather than by content. */
+        if ((expr->binary.op == TK_LESS || expr->binary.op == TK_LESS_EQ ||
+             expr->binary.op == TK_GREATER || expr->binary.op == TK_GREATER_EQ) &&
+            both_ptr && str_operand &&
+            expr->binary.left->kind != AST_NULL_LITERAL &&
+            expr->binary.right->kind != AST_NULL_LITERAL) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMValueRef cmp_args[] = { left, right };
+            LLVMValueRef r = LLVMBuildCall2(g->builder,
+                LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
+                g->fn_strcmp, cmp_args, 2, "scmp");
+            LLVMIntPredicate pred =
+                expr->binary.op == TK_LESS       ? LLVMIntSLT :
+                expr->binary.op == TK_LESS_EQ    ? LLVMIntSLE :
+                expr->binary.op == TK_GREATER    ? LLVMIntSGT :
+                                                   LLVMIntSGE;
+            LLVMValueRef sord = LLVMBuildICmp(g->builder, pred,
+                r, LLVMConstInt(i32t, 0, 0), "sord");
+            if (is_string_expr(g, expr->binary.left, locals) &&
+                expr_yields_owned_rc_value(g, expr->binary.left, locals)) {
+                emit_string_release(g, left);
+            }
+            if (is_string_expr(g, expr->binary.right, locals) &&
+                expr_yields_owned_rc_value(g, expr->binary.right, locals)) {
+                emit_string_release(g, right);
+            }
+            return sord;
         }
 
         LLVMTypeRef left_type = LLVMTypeOf(left);
@@ -7569,6 +7836,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
         LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, entry);
+        di_clear(g); /* prologue: lambda body's first stmt sets its own scope */
 
         /* The body must emit into the lambda's own function: control-flow
          * blocks append to current_fn and `return` coerces to current_fn_ret.
@@ -7613,6 +7881,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         g->current_this = saved_this;
         g->current_async_frame = saved_async_frame;
         LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+        di_clear(g); /* back in the enclosing fn: drop the lambda's scope */
         free(param_types);
         return lambda_fn;
     }
@@ -8361,6 +8630,10 @@ static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm) {
 
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
+
+    /* Attach this statement's source location for DWARF line tables (no-op
+     * unless `-g`). Lazily creates the enclosing function's DISubprogram. */
+    di_set_loc(g, stmt->loc);
 
     /* ARC: track control-flow nesting so class locals declared inside a
      * conditional/loop body (whose stack slot does not dominate the exit) are
@@ -9154,6 +9427,24 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
 
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, main_fn, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    di_clear(g);
+
+    /* On Windows, switch the console code page to UTF-8 (65001) so that
+     * non-ASCII output (e.g. CJK text) renders correctly instead of being
+     * decoded with the legacy OEM/ANSI codepage. Our string data is UTF-8, and
+     * this only affects console handles (a no-op when stdout is a pipe/file),
+     * so redirected output keeps its raw UTF-8 bytes. */
+    if (g->target_is_windows) {
+        LLVMTypeRef uintt = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef setcp_type = LLVMFunctionType(uintt, (LLVMTypeRef[]){ uintt }, 1, 0);
+        LLVMValueRef fn_set_out = LLVMGetNamedFunction(g->mod, "SetConsoleOutputCP");
+        if (!fn_set_out) fn_set_out = LLVMAddFunction(g->mod, "SetConsoleOutputCP", setcp_type);
+        LLVMValueRef fn_set_in = LLVMGetNamedFunction(g->mod, "SetConsoleCP");
+        if (!fn_set_in) fn_set_in = LLVMAddFunction(g->mod, "SetConsoleCP", setcp_type);
+        LLVMValueRef cp_utf8 = LLVMConstInt(uintt, 65001, 0);
+        LLVMBuildCall2(g->builder, setcp_type, fn_set_out, &cp_utf8, 1, "");
+        LLVMBuildCall2(g->builder, setcp_type, fn_set_in, &cp_utf8, 1, "");
+    }
 
     /* stash argc/argv into module globals for Environment.* builtins */
     LLVMValueRef g_argc = LLVMGetNamedGlobal(g->mod, "__zan_argc");
@@ -9618,6 +9909,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             /* ---- ramp ---- */
             LLVMBasicBlockRef ramp_entry = LLVMAppendBasicBlockInContext(g->ctx, ramp_fn, "entry");
             LLVMPositionBuilderAtEnd(g->builder, ramp_entry);
+            di_clear(g);
             LLVMTypeRef malloc_ty = LLVMGlobalGetValueType(g->fn_malloc);
             LLVMValueRef fsize = LLVMSizeOf(frame_type);
             LLVMValueRef raw = LLVMBuildCall2(g->builder, malloc_ty, g->fn_malloc, &fsize, 1, "frame.raw");
@@ -9657,6 +9949,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             /* ---- resume ---- */
             LLVMBasicBlockRef res_entry = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "entry");
             LLVMPositionBuilderAtEnd(g->builder, res_entry);
+            di_clear(g);
             LLVMValueRef fparam = LLVMGetParam(resume_fn, 0);
             LLVMValueRef sframe = LLVMBuildBitCast(g->builder, fparam, frame_ptr_ty, "frame");
 
@@ -9773,6 +10066,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
         LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, entry);
+        di_clear(g);
 
         local_scope_t *locals = local_scope_new(g->arena);
 
@@ -9872,6 +10166,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return ZAN_ERROR;
+    g_di_emit_ctx = g; /* so local_add can forward variables to di_declare_var */
 
     /* Pass 1: register all struct/class types */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -9908,6 +10203,7 @@ done:
     ;
     /* Synthesise per-class release functions now that every class type has
      * been registered (Pass 1) and referenced (Passes 2/3). */
+    di_clear(g); /* the following are synthetic fns; no user source scope */
     emit_all_class_releases(g);
     emit_site_dtor_table(g);
     emit_vtables(g);
@@ -9916,6 +10212,11 @@ done:
      * checks diagnostics before codegen, so surface it here. */
     if (zan_diag_has_errors(g->diag)) {
         return ZAN_ERROR;
+    }
+    /* Finalize DWARF metadata (resolves temporary nodes) before verification. */
+    if (g->emit_debug && g->di_builder) {
+        LLVMSetCurrentDebugLocation2(g->builder, NULL);
+        LLVMDIBuilderFinalize(g->di_builder);
     }
     /* verify module */
     char *error = NULL;
