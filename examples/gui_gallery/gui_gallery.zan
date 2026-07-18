@@ -14,6 +14,34 @@ using Gui.Widget;
 //   zanc --emit-ir examples/gui_gallery/gui_gallery.zan > gallery.ll
 //   clang gallery.ll -o gallery <gui link args>
 
+/// Virtual data source for the large-data DataTable demo.
+///
+/// Cells are generated on demand from their (row, col) coordinates, so the
+/// source stores NO per-cell data — memory is O(1) in the row count. A real
+/// app would instead read these from columnar typed arrays, a file, or a DB.
+class BigDataSource : DataSource {
+    int rowCount;
+    int colCount;
+
+    static BigDataSource Create(int rows, int cols) {
+        BigDataSource s = new BigDataSource();
+        s.rowCount = rows;
+        s.colCount = cols;
+        return s;
+    }
+
+    override int RowCount() { return this.rowCount; }
+
+    override int CellNum(int row, int col) {
+        return ((row + col * 13) % 97) * 37 % 1000;
+    }
+
+    override string CellText(int row, int col) {
+        if (col == 0) { return "Row " + Convert.ToString(row + 1); }
+        return Convert.ToString(((row + col * 13) % 97) * 37 % 1000);
+    }
+}
+
 /// One catalog entry: which category it belongs to, its display name, a short
 /// description, and the code snippet shown (and copied) in the detail pane.
 class Comp {
@@ -261,9 +289,12 @@ class Gallery {
     // Retained state for the deferred-overlay / interactive demos.
     static string copiedIcon;
     static DataTableState demoTableState;
-    static DataTableState bigTableState;    // 1M-row demo (built on first visit)
+    static DataTableState bigTableState;    // large-data demo
     static List<DataColumn> bigCols;
-    static List<DataRow> bigRows;
+    static BigDataSource bigSource;         // virtual source (no per-row storage)
+    static Select bigRowsSelect;            // row-count picker (a "setting")
+    static SignalInt bigRowsSel;
+    static int bigRowCount;
     static int bigBuildMs;
     // Retained state for the unified Layer demo: draggable windows, the modal
     // alert/confirm/prompt dialogs, plus the loading / tips / photos toggles.
@@ -422,9 +453,16 @@ class Gallery {
         Gallery.copiedIcon = "";
         Gallery.demoTableState = DataTableState.Create();
         Gallery.bigTableState = DataTableState.Create();
+        Gallery.bigTableState.showSummary = true;
         Gallery.bigCols = null;
-        Gallery.bigRows = null;
+        Gallery.bigSource = null;
+        Gallery.bigRowCount = 0;
         Gallery.bigBuildMs = 0;
+        Gallery.bigRowsSel = SignalInt.Create(2);
+        List<string> bigRowOpts = new List<string>();
+        bigRowOpts.Add("100,000"); bigRowOpts.Add("500,000");
+        bigRowOpts.Add("1,000,000"); bigRowOpts.Add("5,000,000");
+        Gallery.bigRowsSelect = Select.Bind(bigRowOpts, Gallery.bigRowsSel, "rows");
         Gallery.demoLayers = new List<LayerState>();
         Gallery.layerSeq = 0;
         Gallery.dlgAlert = LayerState.Alert("Notice", "Your changes have been saved.", 1);
@@ -752,6 +790,14 @@ class Gallery {
     static string T(string en, string zh) {
         if (Gallery.lang.Get() == 1) { return zh; }
         return en;
+    }
+
+    /// Map the row-count picker index to a row count for the large-data demo.
+    static int BigRowCountFor(int idx) {
+        if (idx == 0) { return 100000; }
+        if (idx == 1) { return 500000; }
+        if (idx == 3) { return 5000000; }
+        return 1000000;
     }
 
     /// Switch language and rebuild the catalog so descriptions, snippets and
@@ -1558,7 +1604,6 @@ class Gallery {
         if (name == "SelectBox") { return 240; }
         if (name == "VirtualList") { return 210; }
         if (name == "ClickEvent") { return 120; }
-        if (name == "DataTable") { return 200; }
         if (name == "DataTable 1M") { return 430; }
         if (name == "PivotTable") { return 200; }
         if (name == "Chart") { return 210; }
@@ -2674,7 +2719,6 @@ class Gallery {
         if (name == "SelectBox") { return true; }
         if (name == "Dropdown") { return true; }
         if (name == "Popover") { return true; }
-        if (name == "DataTable") { return true; }
         if (name == "DataTable 1M") { return true; }
         if (name == "Layer") { return true; }
         if (name == "Designer") { return true; }
@@ -2709,69 +2753,62 @@ class Gallery {
             // Retained: click the trigger to open an anchored, word-wrapped,
             // click-blocking panel that closes on an outside press or Esc.
             Gallery.demoPopover.Render(app, px, py, app.Scale(150), t.heightMedium);
-        } else if (name == "DataTable") {
-            List<DataColumn> cols = new List<DataColumn>();
-            cols.Add(DataColumn.Text("Name", app.Scale(160)));
-            cols.Add(DataColumn.Numeric("Score", app.Scale(100)));
-            List<DataRow> rows = new List<DataRow>();
-            DataRow row = DataRow.Create();
-            row.Push("Zan"); row.Push("98"); rows.Add(row);
-            DataRow row2 = DataRow.Create();
-            row2.Push("Lang"); row2.Push("87"); rows.Add(row2);
-            DataTable.Render(app, px, py - app.Scale(20), w - app.Scale(36),
-                app.Scale(110), cols, rows, Gallery.demoTableState);
         } else if (name == "DataTable 1M") {
-            // Big-data demo: 1,000,000 rows x 70 columns, built once on first
-            // visit. Rows are virtualised (only the visible window is drawn)
-            // and columns pan via the horizontal scrollbar / Shift+wheel, so
-            // the per-frame cost is independent of the data size.
-            if (Gallery.bigRows == null) {
-                int bt0 = Window.GetTickMs();
+            // Big-data demo backed by a virtual DataSource: cells are supplied
+            // on demand for the visible window only, so the grid stores NO rows
+            // and memory stays flat regardless of the row count (a List<DataRow>
+            // of 70M string cells would cost ~1.8 GB; the virtual source costs a
+            // few MB for the sort-order index). Row count is a live setting.
+            int want = Gallery.BigRowCountFor(Gallery.bigRowsSel.Get());
+            if (Gallery.bigCols == null) {
                 Gallery.bigCols = new List<DataColumn>();
                 int bci = 0;
                 while (bci < 70) {
-                    string bt = Gallery.T("Col ", "列 ")
-                        + Convert.ToString(bci + 1);
+                    string bt = Gallery.T("Col ", "列 ") + Convert.ToString(bci + 1);
                     if (bci == 0) {
                         Gallery.bigCols.Add(DataColumn.Text(bt, app.Scale(96)));
+                    } else if (bci == 1) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 1;   // Σ
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 2) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 2;   // avg
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 3) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 3;   // min
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 4) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 4;   // max
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 5) {
+                        // Derived total: Σcol1 as a percent of Σcol2 — computed
+                        // from the cached aggregates, so it costs O(1) and never
+                        // rescans the rows.
+                        Gallery.bigCols.Add(DataColumn.Derived(
+                            Gallery.T("%1/2", "占比1/2"), app.Scale(96), 0, 1, 2));
                     } else {
                         Gallery.bigCols.Add(DataColumn.Numeric(bt, app.Scale(96)));
                     }
                     bci = bci + 1;
                 }
-                List<string> bpool = new List<string>();
-                int bpi = 0;
-                while (bpi < 97) {
-                    bpool.Add(Convert.ToString(bpi * 37 % 1000));
-                    bpi = bpi + 1;
-                }
-                Gallery.bigRows = new List<DataRow>();
-                int bri = 0;
-                // Cells reference a small shared string pool: formatting one
-                // million per-row strings here would be slow (and each native
-                // format call costs stack), while a real app would load or
-                // format its data outside the render loop anyway. The built-in
-                // row-number column supplies the 1..1,000,000 numbering.
-                while (bri < 1000000) {
-                    DataRow br = DataRow.Create();
-                    int bcj = 0;
-                    while (bcj < 70) {
-                        br.Push(bpool[(bri + bcj * 13) % 97]);
-                        bcj = bcj + 1;
-                    }
-                    Gallery.bigRows.Add(br);
-                    bri = bri + 1;
-                }
+            }
+            if (Gallery.bigSource == null || Gallery.bigRowCount != want) {
+                int bt0 = Window.GetTickMs();
+                Gallery.bigRowCount = want;
+                Gallery.bigSource = BigDataSource.Create(want, 70);
+                Gallery.bigTableState.dirty = true;
                 Gallery.bigBuildMs = Window.GetTickMs() - bt0;
             }
-            Label.Secondary(app, px, py - app.Scale(24),
-                Gallery.T("1,000,000 rows x 70 cols · built in ",
-                    "1,000,000 行 x 70 列 · 构建耗时 ")
-                + Convert.ToString(Gallery.bigBuildMs)
-                + Gallery.T(" ms · wheel scrolls rows, Shift+wheel / bottom bar pans columns",
-                    " ms · 滚轮翻行，Shift+滚轮/底部滑条横向移动"));
-            DataTable.Render(app, px, py, w - app.Scale(36),
-                app.Scale(360), Gallery.bigCols, Gallery.bigRows,
+            Gallery.bigRowsSelect.Render(app, px, py - app.Scale(26), app.Scale(150), t.heightMedium);
+            Label.Secondary(app, px + app.Scale(162), py - app.Scale(22),
+                Convert.ToString(Gallery.bigRowCount)
+                + Gallery.T(" rows x 70 cols · virtual source, flat memory · wheel scrolls rows, Shift+wheel pans columns",
+                    " 行 x 70 列 · 虚拟数据源，内存恒定 · 滚轮翻行，Shift+滚轮横向移动"));
+            DataTable.RenderSource(app, px, py + app.Scale(12), w - app.Scale(36),
+                app.Scale(336), Gallery.bigCols, Gallery.bigSource,
                 Gallery.bigTableState);
         } else if (name == "Compose") {
             // Fluent retained-mode composition: a titled card holding a column
@@ -3304,20 +3341,13 @@ class Gallery {
             .AddProp("cols/cells", "List<string>", "-", "Header labels / row cells.")
             .AddProp("widths", "List<int>", "-", "Per-column widths in px.")
             .AddProp("striped", "bool", "false", "Alternate-row background (RenderRow).");
-        Gallery.Add(list, "Data Display", "DataTable",
-            Gallery.T("A stateful table with typed columns, sorting, filtering and CSV export.",
-                "带状态的表格，支持类型化列、排序、筛选与 CSV 导出。"),
-            "List<DataColumn> cols = new List<DataColumn>{ DataColumn.Text(\"Name\", 180), DataColumn.Numeric(\"Score\", 100) };\nList<DataRow> rows = new List<DataRow>();\nDataRow row = DataRow.Create();\nrow.Push(\"Zan\"); row.Push(\"98\"); rows.Add(row);\nDataTableState state = DataTableState.Create();\nDataTable.Render(app, 40, 60, 520, 260, cols, rows, state);")
-            .AddProp("cols", "List<DataColumn>", "-", "Typed columns (Text/Numeric).")
-            .AddProp("rows", "List<DataRow>", "-", "Row data (Push per cell).")
-            .AddProp("state", "DataTableState", "-", "Sort/filter state (retained).")
-            .AddEvent("sort / filter", "via state", "Header clicks mutate state and re-order rows.");
         Gallery.Add(list, "Data Display", "DataTable 1M",
-            Gallery.T("The same DataTable under 1,000,000 rows x 70 columns: virtualised rows plus a horizontally scrolling column window keep every frame constant-cost.",
-                "同一个 DataTable 承载 100 万行 x 70 列：行虚拟化 + 列横向滚动窗口，每帧开销恒定，与数据量无关。"),
-            "// 1M rows render at constant cost: only the visible ~20 rows x ~12\n// columns are drawn each frame. Wheel scrolls rows; Shift+wheel or the\n// bottom scrollbar pans columns horizontally.\nList<DataRow> rows = new List<DataRow>();\nint i = 0;\nwhile (i < 1000000) {\n    DataRow r = DataRow.Create();\n    // ... push 70 cells ...\n    rows.Add(r);\n    i = i + 1;\n}\nDataTable.Render(app, x, y, w, h, cols, rows, state);")
-            .AddProp("rows", "List<DataRow>", "-", "1,000,000 rows; only the visible window is drawn.")
+            Gallery.T("A DataTable over millions of rows x 70 columns via a virtual DataSource: cells are fetched on demand for the visible window, so memory stays flat and every frame is constant-cost. Sorting uses typed keys; the summary row totals in one pass with derived columns computed from the aggregates.",
+                "通过虚拟数据源承载数百万行 x 70 列的 DataTable：仅按需取可见窗口的单元格，内存恒定、每帧开销恒定。排序使用类型化键；合计行一趟汇总，派生列直接由聚合值计算。"),
+            "// Subclass DataSource and feed cells on demand — the grid stores no\n// rows, so memory is O(1) in the row count (vs ~1.8 GB for 70M string\n// cells). CellNum returns the typed sort/aggregate key (no string parse).\nclass BigSource : DataSource {\n    int rows;\n    override int RowCount() { return this.rows; }\n    override int CellNum(int row, int col) { return /* value */ 0; }\n    override string CellText(int row, int col) { return /* text */ \"\"; }\n}\nDataTable.RenderSource(app, x, y, w, h, cols, source, state);")
+            .AddProp("source", "DataSource", "-", "Virtual source: RowCount/CellText/CellNum, no row storage.")
             .AddProp("cols", "List<DataColumn>", "-", "70 columns; pans via scrollX (Shift+wheel / bar).")
+            .AddProp("summary", "DataColumn.summary / Derived", "0", "Per-column total; Derived columns compute from other aggregates.")
             .AddEvent("scroll", "state.scrollRow / scrollX", "Virtual row + horizontal column window.");
         Gallery.Add(list, "Data Display", "PivotTable",
             Gallery.T("Summarize rows by configured row, column and value fields.",
