@@ -297,6 +297,42 @@ static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
 static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
+    /* LINQ query: `from x in src [where c]... select e` — `from` is
+     * contextual, committed only when `in` follows the range variable */
+    if (p->current.kind == TK_IDENT && p->current.str_val.len == 4 &&
+        memcmp(p->current.str_val.str, "from", 4) == 0 &&
+        zan_lexer_peek(p->lex).kind == TK_IDENT) {
+        zan_lexer_t saved_lex = *p->lex;
+        zan_token_t saved_cur = p->current;
+        zan_token_t saved_prev = p->previous;
+        parser_advance(p); /* from */
+        parser_advance(p); /* var */
+        if (p->current.kind == TK_IN) {
+            zan_istr_t qvar = p->previous.str_val;
+            parser_advance(p); /* in */
+            zan_ast_node_t *n = zan_ast_new(p->arena, AST_QUERY_EXPR, loc);
+            n->query.var = qvar;
+            n->query.source = parse_expression(p);
+            zan_ast_list_init(&n->query.wheres);
+            while (parser_match(p, TK_WHERE))
+                zan_ast_list_push(&n->query.wheres, parse_expression(p),
+                                  p->arena);
+            if (p->current.kind == TK_IDENT && p->current.str_val.len == 6 &&
+                memcmp(p->current.str_val.str, "select", 6) == 0) {
+                parser_advance(p);
+                n->query.select = parse_expression(p);
+            } else {
+                zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                              "expected 'select' in query expression");
+                n->query.select = parser_error_node(p);
+            }
+            return n;
+        }
+        *p->lex = saved_lex;
+        p->current = saved_cur;
+        p->previous = saved_prev;
+    }
+
     switch (p->current.kind) {
     case TK_INT_LIT: {
         parser_advance(p);

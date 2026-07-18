@@ -1856,6 +1856,19 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     }
     case AST_THIS_EXPR:
         return g->current_type_sym ? g->current_type_sym->type : NULL;
+    case AST_QUERY_EXPR: {
+        /* query yields List<select-type>; the range var is briefly registered
+         * (type only) so the projection can be inferred through it */
+        zan_type_t *src_ty = infer_expr_type(g, e->query.source, locals);
+        zan_type_t *elem = container_elem_type(src_ty);
+        if (!elem) elem = g->binder->type_int;
+        int mark = locals->count;
+        local_add(locals, e->query.var, NULL, elem);
+        zan_type_t *sel = infer_expr_type(g, e->query.select, locals);
+        locals->count = mark;
+        if (!sel) sel = elem;
+        return zan_binder_make_list_type(g->binder, sel);
+    }
     case AST_MEMBER_ACCESS: {
         /* static field: ClassName.StaticField (class name, not a local). */
         if (e->member.object->kind == AST_IDENTIFIER &&
@@ -3009,7 +3022,8 @@ static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
 /* A value already carrying an owned (+1) reference we may take over as-is;
  * anything else is a borrowed load that must be retained on capture. */
 static int expr_yields_owned_ref(zan_ast_node_t *e) {
-    return e && (e->kind == AST_NEW_EXPR || e->kind == AST_CALL);
+    return e && (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
+                 e->kind == AST_QUERY_EXPR);
 }
 
 static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
@@ -3020,7 +3034,8 @@ static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
-    if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL) return 1;
+    if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
+        e->kind == AST_QUERY_EXPR) return 1;
     /* An awaited async call yields a freshly owned (+1) reference: the callee's
      * async `return` always retains the result before completing (see the
      * AST_RETURN_STMT async path), so the awaiter receives +1 and must NOT
@@ -7524,6 +7539,132 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+    }
+
+    case AST_QUERY_EXPR: {
+        /* from x in src [where c]... select e — lowered to an eager loop that
+         * filters and projects into a fresh List<sel> */
+        static int query_counter = 0;
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        int mark = locals->count;
+
+        LLVMValueRef collection = emit_expr(g, expr->query.source, locals);
+        zan_type_t *src_ty = infer_expr_type(g, expr->query.source, locals);
+        zan_type_t *elem = container_elem_type(src_ty);
+        if (!elem) elem = g->binder->type_int;
+        LLVMTypeRef elem_llvm = map_type(g, elem);
+
+        /* select type, inferred with the range var briefly in scope */
+        local_add(locals, expr->query.var, NULL, elem);
+        zan_type_t *sel = infer_expr_type(g, expr->query.select, locals);
+        locals->count = mark;
+        if (!sel) sel = elem;
+
+        /* result list: synthesize and emit `new List<sel>()` */
+        zan_ast_node_t *sel_tr = zan_ast_new(g->arena, AST_TYPE_REF, expr->loc);
+        sel_tr->type_ref.name = sel->name;
+        zan_ast_list_init(&sel_tr->type_ref.type_args);
+        zan_ast_node_t *list_tr = zan_ast_new(g->arena, AST_TYPE_REF, expr->loc);
+        list_tr->type_ref.name = (zan_istr_t){"List", 4};
+        zan_ast_list_init(&list_tr->type_ref.type_args);
+        zan_ast_list_push(&list_tr->type_ref.type_args, sel_tr, g->arena);
+        zan_ast_node_t *new_list = zan_ast_new(g->arena, AST_NEW_EXPR, expr->loc);
+        new_list->new_expr.type = list_tr;
+        new_list->new_expr.is_array = false;
+        zan_ast_list_init(&new_list->new_expr.args);
+        LLVMValueRef list_val = emit_expr(g, new_list, locals);
+
+        /* hidden local holding the result so a synthetic `__q.Add(e)` call
+         * resolves through the normal List.Add path */
+        char qbuf[32];
+        snprintf(qbuf, sizeof(qbuf), "__q%d", query_counter++);
+        char *qn = zan_arena_strdup(g->arena, qbuf, strlen(qbuf));
+        zan_istr_t qname = {qn, (int)strlen(qn)};
+        LLVMValueRef list_alloc = LLVMBuildAlloca(g->builder, LLVMTypeOf(list_val), "q");
+        LLVMBuildStore(g->builder, list_val, list_alloc);
+        local_add(locals, qname, list_alloc,
+                  zan_binder_make_list_type(g->binder, sel));
+
+        /* iteration state */
+        LLVMValueRef col = LLVMBuildBitCast(g->builder, collection,
+            LLVMPointerType(g->list_struct_type, 0), "qcol");
+        LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            col, 0, "qcntp");
+        LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "qcnt");
+        LLVMValueRef data_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            col, 2, "qdatap");
+        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+            data_ptr, "qdata");
+        LLVMValueRef idx_alloc = LLVMBuildAlloca(g->builder, i64, "qi");
+        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
+        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, elem_llvm, "qv");
+        local_add(locals, expr->query.var, iter_alloc, elem);
+
+        LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.cond");
+        LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.body");
+        LLVMBasicBlockRef inc_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.inc");
+        LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.end");
+
+        LLVMBuildBr(g->builder, cond_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+        LLVMValueRef idx_val = LLVMBuildLoad2(g->builder, i64, idx_alloc, "qiv");
+        LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSLT, idx_val, count, "qcmp");
+        LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, body_bb);
+        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_val, 1, "qep");
+        LLVMValueRef ev = LLVMBuildLoad2(g->builder, i64, elem_ptr, "qelem");
+        LLVMTypeKind ek = LLVMGetTypeKind(elem_llvm);
+        if (ek == LLVMPointerTypeKind)
+            ev = LLVMBuildIntToPtr(g->builder, ev, elem_llvm, "qelp");
+        else if (ek == LLVMDoubleTypeKind)
+            ev = LLVMBuildBitCast(g->builder, ev, elem_llvm, "qelf");
+        else if (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(elem_llvm) < 64)
+            ev = LLVMBuildTrunc(g->builder, ev, elem_llvm, "qelt");
+        LLVMBuildStore(g->builder, ev, iter_alloc);
+
+        /* where clauses: any false condition skips to the increment */
+        for (int wi = 0; wi < expr->query.wheres.count; wi++) {
+            LLVMValueRef c = emit_expr(g, expr->query.wheres.items[wi], locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(c)) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(LLVMTypeOf(c)) != 1)
+                c = LLVMBuildICmp(g->builder, LLVMIntNE, c,
+                                  LLVMConstNull(LLVMTypeOf(c)), "qw");
+            LLVMBasicBlockRef pass_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, fn, "q.pass");
+            LLVMBuildCondBr(g->builder, c, pass_bb, inc_bb);
+            LLVMPositionBuilderAtEnd(g->builder, pass_bb);
+        }
+
+        /* __q.Add(select) through the normal lowering */
+        zan_ast_node_t *qid = zan_ast_new(g->arena, AST_IDENTIFIER, expr->loc);
+        qid->ident.name = qname;
+        zan_ast_node_t *madd = zan_ast_new(g->arena, AST_MEMBER_ACCESS, expr->loc);
+        madd->member.object = qid;
+        madd->member.name = (zan_istr_t){"Add", 3};
+        madd->member.null_cond = 0;
+        zan_ast_node_t *addcall = zan_ast_new(g->arena, AST_CALL, expr->loc);
+        addcall->call.callee = madd;
+        zan_ast_list_init(&addcall->call.args);
+        zan_ast_list_init(&addcall->call.type_args);
+        zan_ast_list_push(&addcall->call.args, expr->query.select, g->arena);
+        emit_expr(g, addcall, locals);
+        LLVMBuildBr(g->builder, inc_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, inc_bb);
+        LLVMValueRef next = LLVMBuildAdd(g->builder,
+            LLVMBuildLoad2(g->builder, i64, idx_alloc, "qi2"),
+            LLVMConstInt(i64, 1, 0), "qnext");
+        LLVMBuildStore(g->builder, next, idx_alloc);
+        LLVMBuildBr(g->builder, cond_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        emit_release_owned_call_temp(g, expr->query.source, collection, locals);
+        locals->count = mark;
+        (void)i8ptr;
+        return list_val;
     }
 
     case AST_NEW_EXPR: {

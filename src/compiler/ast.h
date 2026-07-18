@@ -93,6 +93,7 @@ typedef enum {
     AST_LOCK_STMT,    /* lock (expr) body */
     AST_GOTO_STMT,    /* goto label; */
     AST_LABEL_STMT,   /* label: */
+    AST_QUERY_EXPR,   /* from x in src where c ... select e */
 
     AST__COUNT,
 } zan_ast_kind_t;
@@ -333,6 +334,14 @@ struct zan_ast_node {
             zan_ast_node_t *expr;
             zan_ast_node_t *body;
         } lock_stmt;
+
+        /* from var in source where c1 where c2 select proj */
+        struct {
+            zan_istr_t var;
+            zan_ast_node_t *source;
+            zan_ast_list_t wheres;
+            zan_ast_node_t *select;
+        } query;
 
         /* parameter */
         struct {

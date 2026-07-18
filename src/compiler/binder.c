@@ -129,6 +129,15 @@ static bool istr_eq(zan_istr_t a, const char *b, int len) {
     return a.len == len && memcmp(a.str, b, (size_t)len) == 0;
 }
 
+zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem) {
+    zan_type_t *t = make_type(b->arena, TYPE_CLASS, "List", 4);
+    t->type_args =
+        (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
+    t->type_args[0] = elem;
+    t->type_arg_count = 1;
+    return t;
+}
+
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref || type_ref->kind != AST_TYPE_REF) {
         return b->type_error;
