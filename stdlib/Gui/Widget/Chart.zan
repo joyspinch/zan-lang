@@ -26,6 +26,37 @@ class ChartFrame {
     int plotH;
 }
 
+/// Virtual, pull-based data source for charts — the chart never has to own the
+/// raw point arrays, so a series of millions of points costs no per-cell object
+/// allocation (mirrors DataTable's DataSource). Subclass it and read points on
+/// demand from your own columnar/typed storage, or wrap an in-memory
+/// List<ChartSeries> with SeriesListSource.
+class ChartSource {
+    virtual int SeriesCount() { return 0; }
+    virtual string SeriesName(int s) { return ""; }
+    virtual int SeriesColor(int s) { return 0; }   // 0 = auto (palette)
+    virtual int PointCount(int s) { return 0; }
+    virtual int ValueAt(int s, int i) { return 0; }
+}
+
+/// Adapter that exposes an existing List<ChartSeries> as a ChartSource, so the
+/// high-performance path accepts plain in-memory data with no restructuring.
+class SeriesListSource : ChartSource {
+    List<ChartSeries> series;
+
+    static SeriesListSource Of(List<ChartSeries> series) {
+        SeriesListSource s = new SeriesListSource();
+        s.series = series;
+        return s;
+    }
+
+    override int SeriesCount() { return this.series.Count; }
+    override string SeriesName(int s) { return this.series[s].name; }
+    override int SeriesColor(int s) { return this.series[s].color; }
+    override int PointCount(int s) { return this.series[s].values.Count; }
+    override int ValueAt(int s, int i) { return this.series[s].values[i]; }
+}
+
 /// ECharts-inspired chart library built on the raw Canvas primitives:
 /// line, area, grouped/stacked/horizontal bars, pie, donut and scatter.
 /// Integer maths, category + value axes, gridlines, legend, per-series colors.
@@ -636,6 +667,34 @@ class ChartModel {
         m.series = new List<ChartSeries>();
         m.scatterX = new List<int>();
         m.scatterY = new List<int>();
+        return m;
+    }
+
+    /// Build a model straight from ready data — no imperative Add* calls.
+    /// Pass the category labels and the series lists you already have.
+    static ChartModel Of(string title, List<string> labels, List<ChartSeries> series) {
+        ChartModel m = new ChartModel();
+        m.title = title;
+        m.labels = labels;
+        m.series = series;
+        m.scatterX = new List<int>();
+        m.scatterY = new List<int>();
+        return m;
+    }
+
+    /// Single-series convenience: a title, labels and one value list.
+    static ChartModel OfValues(string title, List<string> labels,
+                               string name, List<int> values) {
+        List<ChartSeries> s = new List<ChartSeries>();
+        s.Add(ChartSeries.Create(name, values, 0));
+        return ChartModel.Of(title, labels, s);
+    }
+
+    /// Scatter convenience: a title and parallel x/y point lists.
+    static ChartModel OfPoints(string title, List<int> xs, List<int> ys) {
+        ChartModel m = ChartModel.Create(title);
+        m.scatterX = xs;
+        m.scatterY = ys;
         return m;
     }
 
@@ -1389,5 +1448,247 @@ class ChartView {
             si = si + 1;
         }
         app.RequestRedraw();
+    }
+}
+
+/// Cached min/max decimation for the high-performance chart path. Hold one per
+/// big chart (like DataTableState); call Invalidate() when the underlying data
+/// changes. ChartBig fills it lazily and reuses it across frames.
+class ChartState {
+    int version;        // caller bumps (via Invalidate) when the data changes
+    int builtVersion;   // data version the cache was built at
+    int builtW;         // widget width the cache was built for
+    int builtSeries;    // series count the cache was built for
+    int cols;           // widest per-series column count in the cache
+    int axisLo;         // resolved value-axis bounds
+    int axisHi;
+    List<List<int>> colMin;   // per series: min value per decimated column
+    List<List<int>> colMax;   // per series: max value per decimated column
+
+    static ChartState Create() {
+        ChartState s = new ChartState();
+        s.version = 1;
+        s.builtVersion = 0;
+        s.builtW = -1;
+        s.builtSeries = -1;
+        s.cols = 0;
+        s.axisLo = 0;
+        s.axisHi = 0;
+        s.colMin = new List<List<int>>();
+        s.colMax = new List<List<int>>();
+        return s;
+    }
+
+    /// Mark the cache stale so the next render re-decimates the source.
+    void Invalidate() { this.version = this.version + 1; }
+}
+
+/// High-performance renderer for a virtual ChartSource. Each series is reduced
+/// to a min/max envelope of at most ~plot-width columns, cached in a ChartState
+/// and rebuilt only when the data version or width changes — so a line/area of
+/// millions of points draws in O(width) per frame instead of O(points), and the
+/// chart never owns a point-per-object array. Usage:
+///
+///   ChartState st = ChartState.Create();          // once, kept by the caller
+///   ChartBig.Render(app, st, mySource, ChartOptions.Area(), x, y, w, h, "CPU");
+class ChartBig {
+
+    static bool NeedsRebuild(ChartState st, ChartSource src, int w) {
+        if (st.builtVersion != st.version) { return true; }
+        if (st.builtW != w) { return true; }
+        if (st.builtSeries != src.SeriesCount()) { return true; }
+        return false;
+    }
+
+    // Decimate every series into ~`target` min/max columns. Append-only build
+    // (no indexed list writes) — safe and fast at any optimization level; runs
+    // once per data/size change, O(total points).
+    static void Build(ChartState st, ChartSource src, int target) {
+        if (target < 2) { target = 2; }
+        st.colMin = new List<List<int>>();
+        st.colMax = new List<List<int>>();
+        int ns = src.SeriesCount();
+        int lo = 0;
+        int hi = 0;
+        bool seen = false;
+        int cols = 0;
+
+        int s = 0;
+        while (s < ns) {
+            int n = src.PointCount(s);
+            List<int> mn = new List<int>();
+            List<int> mx = new List<int>();
+            if (n > 0) {
+                int C = target;
+                if (C > n) { C = n; }
+                int curCol = 0;
+                int cMin = src.ValueAt(s, 0);
+                int cMax = cMin;
+                int i = 1;
+                while (i < n) {
+                    int col = i * C / n;
+                    int v = src.ValueAt(s, i);
+                    if (col != curCol) {
+                        mn.Add(cMin);
+                        mx.Add(cMax);
+                        curCol = col;
+                        cMin = v;
+                        cMax = v;
+                    } else {
+                        if (v < cMin) { cMin = v; }
+                        if (v > cMax) { cMax = v; }
+                    }
+                    i = i + 1;
+                }
+                mn.Add(cMin);
+                mx.Add(cMax);
+            }
+
+            int j = 0;
+            while (j < mn.Count) {
+                int a = mn[j];
+                int b = mx[j];
+                if (!seen) { lo = a; hi = b; seen = true; }
+                if (a < lo) { lo = a; }
+                if (b > hi) { hi = b; }
+                j = j + 1;
+            }
+            if (mn.Count > cols) { cols = mn.Count; }
+            st.colMin.Add(mn);
+            st.colMax.Add(mx);
+            s = s + 1;
+        }
+
+        st.cols = cols;
+        int axisLo = lo;
+        if (axisLo > 0) { axisLo = 0; }   // zero-anchor when all non-negative
+        int axisHi = Chart.NiceMax(hi);
+        if (axisHi <= axisLo) { axisHi = axisLo + 1; }
+        st.axisLo = axisLo;
+        st.axisHi = axisHi;
+    }
+
+    static int DrawHead(App app, int x, int y, int w, int h, string title, ChartSource src) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        int lx = x + w - pad;
+        int sw = app.Scale(12);
+        int si = src.SeriesCount() - 1;
+        while (si >= 0) {
+            string nm = src.SeriesName(si);
+            int tw = Canvas.MeasureText(nm, t.fontSizeSmall);
+            lx = lx - tw;
+            c.DrawText(lx, top + app.Scale(2), nm, t.textSecondary, t.fontSizeSmall);
+            int col = src.SeriesColor(si);
+            if (col == 0) { col = Chart.Palette(t, si); }
+            lx = lx - app.Scale(6) - sw;
+            c.FillRoundRect(lx, top + app.Scale(3), sw, sw, t.borderRadiusSmall, col);
+            lx = lx - app.Scale(14);
+            si = si - 1;
+        }
+        return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+    }
+
+    /// Draw the source as a decimated line/area chart into the given rect.
+    static void Render(App app, ChartState st, ChartSource src, ChartOptions o,
+                       int x, int y, int w, int h, string title) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+
+        // One decimated column per horizontal pixel of the widget is an upper
+        // bound on the plot width, so the cache is independent of the gutter.
+        if (ChartBig.NeedsRebuild(st, src, w)) {
+            ChartBig.Build(st, src, w);
+            st.builtVersion = st.version;
+            st.builtW = w;
+            st.builtSeries = src.SeriesCount();
+        }
+
+        int plotTop = ChartBig.DrawHead(app, x, y, w, h, title, src);
+
+        int leftGut = Canvas.MeasureText(Convert.ToString(st.axisHi), axisFs) + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        int span = st.axisHi - st.axisLo;
+        if (span < 1) { span = 1; }
+
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, t.divider);
+            int val = st.axisLo + span * k / ticks;
+            string vs = Convert.ToString(val);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, gy - Canvas.FontHeight(axisFs) / 2, vs, t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+
+        int ns = src.SeriesCount();
+        if (st.cols < 1) { return; }
+        int baseY = plotY + plotH;
+        int g = 1000;
+        if (o.animate) { g = app.AnimIntro(5200000 + w, o.animMs); }
+
+        int s = 0;
+        while (s < ns) {
+            int color = src.SeriesColor(s);
+            if (color == 0) { color = Chart.Palette(t, s); }
+            List<int> mn = st.colMin[s];
+            List<int> mx = st.colMax[s];
+            int cn = mn.Count;
+            int fillTop = Chart.WithAlpha(color, 120);
+            int fillBot = Chart.WithAlpha(color, 12);
+
+            int cc = 0;
+            int prevX = plotX;
+            int prevY = baseY;
+            bool first = true;
+            while (cc < cn) {
+                int px = plotX + cc * plotW / cn;
+                int vTop = mx[cc] * g / 1000;
+                int vBot = mn[cc] * g / 1000;
+                int yTop = plotY + plotH - (vTop - st.axisLo) * plotH / span;
+                int yBot = plotY + plotH - (vBot - st.axisLo) * plotH / span;
+                if (o.area) {
+                    if (o.gradient) {
+                        c.FillVGrad(px, yTop, 1, baseY - yTop, fillTop, fillBot);
+                    } else {
+                        c.FillRect(px, yTop, 1, baseY - yTop, Chart.WithAlpha(color, 56));
+                    }
+                }
+                c.FillRect(px, yTop, 1, yBot - yTop + 1, color);
+                if (!first) { c.DrawLine(prevX, prevY, px, yTop, color, app.Scale(1)); }
+                prevX = px;
+                prevY = yTop;
+                first = false;
+                cc = cc + 1;
+            }
+            s = s + 1;
+        }
+
+        int total = 0;
+        int ci = 0;
+        while (ci < ns) { total = total + src.PointCount(ci); ci = ci + 1; }
+        string cap = Convert.ToString(total) + " pts";
+        int cw = Canvas.MeasureText(cap, axisFs);
+        c.DrawText(x + w - pad - cw, y + h - pad - Canvas.FontHeight(axisFs), cap, t.textTertiary, axisFs);
     }
 }
