@@ -11,6 +11,7 @@
  */
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
+#import <QuartzCore/QuartzCore.h>
 #import <WebKit/WebKit.h>
 #include <objc/message.h>
 #include <stdint.h>
@@ -94,6 +95,13 @@ static int evq_pop(void) {
 @interface ZanView : NSView {
 @public
     CGImageRef frame;
+    /* Double-buffered pixel storage for the layer-contents present path: the
+     * CGImage handed to Core Animation wraps one buffer while the next frame
+     * is copied into the other, so a deferred GPU upload never reads pixels
+     * that are being overwritten. */
+    void *backing[2];
+    size_t backingSize;
+    int backingIdx;
 }
 @end
 
@@ -185,6 +193,17 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
                                                    defer:NO];
         ZanView *view = [[ZanView alloc] initWithFrame:rect];
         view->frame = NULL;
+        view->backing[0] = NULL;
+        view->backing[1] = NULL;
+        view->backingSize = 0;
+        view->backingIdx = 0;
+        /* Layer-backed: present hands the frame to Core Animation as
+         * layer.contents, so colour conversion and compositing run on the GPU
+         * in the WindowServer instead of a CPU drawRect blit. */
+        [view setWantsLayer:YES];
+        view.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
+        view.layer.contentsGravity = kCAGravityResize;
+        view.layer.opaque = NO;
         [window setContentView:view];
         [window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
         [window setDelegate:g_delegate];          /* one delegate serves all windows */
@@ -702,21 +721,48 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     if (!pixels || w <= 0 || h <= 0) return 1;
 
     @autoreleasepool {
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        /* One memcpy into a stable buffer, then wrap it zero-copy in a CGImage
+         * tagged sRGB (matches the surface's colour values, so no per-pixel
+         * CPU conversion) and hand it to the view's layer. */
+        size_t need = (size_t)stride * 4 * (size_t)h;
+        if (view->backingSize != need) {
+            free(view->backing[0]);
+            free(view->backing[1]);
+            view->backing[0] = malloc(need);
+            view->backing[1] = malloc(need);
+            view->backingSize = need;
+        }
+        view->backingIdx = 1 - view->backingIdx;
+        void *dst = view->backing[view->backingIdx];
+        if (!dst) return 1;
+        memcpy(dst, pixels, need);
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         /* Surface pixels are 0xAARRGGBB in memory (little-endian bytes B,G,R,A);
          * interpret as premultiplied ARGB via 32-little byte order. */
         CGBitmapInfo info = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
-        CGContextRef bmp = CGBitmapContextCreate((void *)pixels, (size_t)w, (size_t)h,
-                                                 8, (size_t)stride * 4, cs, info);
-        CGImageRef img = bmp ? CGBitmapContextCreateImage(bmp) : NULL;
+        CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, dst, need, NULL);
+        CGImageRef img = dp ? CGImageCreate((size_t)w, (size_t)h, 8, 32,
+                                            (size_t)stride * 4, cs, info, dp,
+                                            NULL, false,
+                                            kCGRenderingIntentDefault)
+                            : NULL;
+        if (dp) CGDataProviderRelease(dp);
+        CGColorSpaceRelease(cs);
         if (img) {
             if (view->frame) CGImageRelease(view->frame);
             view->frame = img;             /* retained; released on next present */
-            [view setNeedsDisplay:YES];
-            [view displayIfNeeded];
+            CALayer *layer = [view layer];
+            if (layer) {
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                layer.contentsScale = [[view window] backingScaleFactor];
+                layer.contents = (__bridge id)img;
+                [CATransaction commit];
+            } else {
+                [view setNeedsDisplay:YES];
+                [view displayIfNeeded];
+            }
         }
-        if (bmp) CGContextRelease(bmp);
-        CGColorSpaceRelease(cs);
     }
     return 0;
 }
