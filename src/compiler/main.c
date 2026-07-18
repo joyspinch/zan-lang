@@ -1129,6 +1129,7 @@ int main(int argc, char **argv) {
     }
 
     if (!zan_diag_has_errors(diag)) {
+        zan_parser_merge_partials(ast, arena, diag);
         zan_parser_desugar_events(ast, arena, diag);
     }
 

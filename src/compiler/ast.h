@@ -411,6 +411,7 @@ struct zan_ast_node {
 #define MOD_UNSAFE    0x1000
 #define MOD_WEAK      0x2000
 #define MOD_EVENT     0x4000
+#define MOD_PARTIAL   0x8000
 
 /* ---- utility functions ---- */
 

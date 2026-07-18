@@ -2126,6 +2126,16 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
 
         uint32_t mods = parse_modifiers(p);
 
+        /* `partial` is contextual: only a modifier right before a type kw */
+        if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
+            memcmp(p->current.str_val.str, "partial", 7) == 0) {
+            zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
+            if (nk == TK_CLASS || nk == TK_STRUCT || nk == TK_INTERFACE) {
+                parser_advance(p);
+                mods |= MOD_PARTIAL;
+            }
+        }
+
         if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
             parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
             zan_ast_node_t *decl = parse_type_decl(p, mods);
@@ -2277,6 +2287,51 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
     for (int i = 0; i < gu->comp_unit.decls.count; i++)
         zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[i],
                           arena);
+}
+
+/* Merge `partial` type declarations: members and bases of later parts are
+ * appended to the first part of the same name/kind, and later parts are
+ * dropped from the unit. Runs before binding, so the rest of the pipeline
+ * only ever sees one declaration per type. */
+void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
+                               zan_diag_t *diag) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    zan_ast_list_t *decls = &unit->comp_unit.decls;
+    int out = 0;
+    for (int di = 0; di < decls->count; di++) {
+        zan_ast_node_t *d = decls->items[di];
+        zan_ast_node_t *first = NULL;
+        if ((d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL ||
+             d->kind == AST_INTERFACE_DECL) &&
+            (d->type_decl.modifiers & MOD_PARTIAL)) {
+            for (int fi = 0; fi < out; fi++) {
+                zan_ast_node_t *e = decls->items[fi];
+                if (e->kind == d->kind &&
+                    (e->type_decl.modifiers & MOD_PARTIAL) &&
+                    e->type_decl.name.len == d->type_decl.name.len &&
+                    memcmp(e->type_decl.name.str, d->type_decl.name.str,
+                           (size_t)d->type_decl.name.len) == 0) {
+                    first = e;
+                    break;
+                }
+            }
+        }
+        if (first) {
+            for (int mi = 0; mi < d->type_decl.members.count; mi++)
+                zan_ast_list_push(&first->type_decl.members,
+                                  d->type_decl.members.items[mi], arena);
+            for (int bi = 0; bi < d->type_decl.bases.count; bi++)
+                zan_ast_list_push(&first->type_decl.bases,
+                                  d->type_decl.bases.items[bi], arena);
+            for (int wi = 0; wi < d->type_decl.where_clauses.count; wi++)
+                zan_ast_list_push(&first->type_decl.where_clauses,
+                                  d->type_decl.where_clauses.items[wi], arena);
+        } else {
+            decls->items[out++] = d;
+        }
+    }
+    decls->count = out;
+    (void)diag;
 }
 
 void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
