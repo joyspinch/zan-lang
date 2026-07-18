@@ -620,14 +620,40 @@ class DataTable {
         return true;
     }
 
+    // Filter predicate over only the columns known to have an active filter.
+    static bool RowPassesActive(DataTableState st, DataSource src, List<int> af, int row) {
+        int a = 0;
+        while (a < af.Count) {
+            int c = af[a];
+            if (!DataTable.CellPasses(st.filters[c], src.CellText(row, c))) { return false; }
+            a = a + 1;
+        }
+        return true;
+    }
+
     static void Recompute(DataTableState st, List<DataColumn> cols, DataSource src) {
         if (!st.dirty) { return; }
         st.order.Clear();
-        int i = 0;
         int nrows = src.RowCount();
-        while (i < nrows) {
-            if (DataTable.RowPasses(st, cols, src, i)) { st.order.Add(i); }
-            i = i + 1;
+
+        // Collect the columns that actually have an active filter (usually none).
+        // The common no-filter case then skips the O(rows * cols) predicate scan
+        // entirely — a big win when re-sorting a million unfiltered rows.
+        List<int> af = new List<int>();
+        int fc = 0;
+        while (fc < cols.Count) {
+            if (st.filters[fc].Active()) { af.Add(fc); }
+            fc = fc + 1;
+        }
+
+        int i = 0;
+        if (af.Count == 0) {
+            while (i < nrows) { st.order.Add(i); i = i + 1; }
+        } else {
+            while (i < nrows) {
+                if (DataTable.RowPassesActive(st, src, af, i)) { st.order.Add(i); }
+                i = i + 1;
+            }
         }
         if (st.sortCol >= 0 && st.sortCol < cols.Count) {
             DataTable.SortOrder(st, cols, src);
@@ -684,23 +710,34 @@ class DataTable {
             col = col + 1;
         }
 
-        // ---- single pass over the visible rows ----
-        int k = 0;
-        while (k < n) {
-            int srcRow = st.order[k];
-            int bi = 0;
-            while (bi < baseCols.Count) {
-                int bc = baseCols[bi];
-                int v = src.CellNum(srcRow, bc);
-                sumV[bc] = sumV[bc] + v;
-                if (k == 0) { minV[bc] = v; maxV[bc] = v; }
+        // ---- accumulate every base column over the visible rows ----
+        // Accumulation is kept in scalars and written back to the per-column
+        // lists ONCE (outside the row loop): index-writing a list inside a hot
+        // million-iteration loop hits a -O0 codegen bug that leaks stack. This
+        // still costs one CellNum read per (base column, row) — the same total
+        // work as a single interleaved pass — and only the aggregated columns
+        // are ever scanned.
+        int bi = 0;
+        while (bi < baseCols.Count) {
+            int bc = baseCols[bi];
+            int s = 0;
+            int mn = 0;
+            int mx = 0;
+            int k = 0;
+            while (k < n) {
+                int v = src.CellNum(st.order[k], bc);
+                s = s + v;
+                if (k == 0) { mn = v; mx = v; }
                 else {
-                    if (v < minV[bc]) { minV[bc] = v; }
-                    if (v > maxV[bc]) { maxV[bc] = v; }
+                    if (v < mn) { mn = v; }
+                    if (v > mx) { mx = v; }
                 }
-                bi = bi + 1;
+                k = k + 1;
             }
-            k = k + 1;
+            sumV[bc] = s;
+            minV[bc] = mn;
+            maxV[bc] = mx;
+            bi = bi + 1;
         }
 
         // resolve each column's raw aggregate value (base first, then derived so
