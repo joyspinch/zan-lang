@@ -28,10 +28,11 @@ interface IUiRenderer {
     void PopClip();
     void FillRect(int x, int y, int w, int h, int r, int g, int b, int a);
     void DrawBorder(int x, int y, int w, int h, int t, int r, int g, int b, int a);
-    // Text/sprite are drawn as measured placeholders here; a glyph atlas /
-    // resource texture cache plugs in per backend without changing callers.
+    // Text is rasterized from the shared PixelFont glyph set; DrawSprite takes
+    // the widget's image resource id so a backend with a decoder (GPU) can blit
+    // a cached texture, while decoder-less backends fall back to a tint block.
     void DrawText(string text, int x, int y, int r, int g, int b, int a);
-    void DrawSprite(int x, int y, int w, int h, int angle, int alpha);
+    void DrawSprite(string image, int x, int y, int w, int h, int angle, int alpha);
     void EndFrame();
     long Metric();
 }
@@ -90,10 +91,41 @@ class SoftwareUiRenderer : IUiRenderer {
         this.FillRect(x + w - t, y, t, h, r, g, b, a);
     }
     void DrawText(string text, int x, int y, int r, int g, int b, int a) {
-        this.FillRect(x, y, text.Length * 6, 8, r, g, b, a);
+        if (text == null) { return; }
+        int cx = x;
+        int i = 0;
+        while (i < text.Length) {
+            int cp = text[i] & 255;
+            int ry = 0;
+            while (ry < 8) {
+                int mask = PixelFont.Row(cp, ry);
+                int rx = 0;
+                while (rx < 8) {
+                    if ((mask & (1 << (7 - rx))) != 0) {
+                        this.Blend(cx + rx, y + ry, r, g, b, a);
+                    }
+                    rx = rx + 1;
+                }
+                ry = ry + 1;
+            }
+            cx = cx + PixelFont.Advance();
+            i = i + 1;
+        }
     }
-    void DrawSprite(int x, int y, int w, int h, int angle, int alpha) {
-        this.FillRect(x, y, w, h, 200, 80, 60, alpha);
+    // No image decoder on the CPU path: render a deterministic tint block whose
+    // hue is derived from the resource id so distinct sprites stay visually
+    // distinguishable. The GPU backend blits the real cached texture.
+    void DrawSprite(string image, int x, int y, int w, int h, int angle, int alpha) {
+        int seed = 0;
+        if (image != null) {
+            int i = 0;
+            while (i < image.Length) { seed = seed + (image[i] & 255); i = i + 1; }
+        }
+        int r = 120 + (seed * 37) % 120;
+        int g = 90 + (seed * 53) % 120;
+        int b = 80 + (seed * 29) % 120;
+        this.FillRect(x, y, w, h, r, g, b, alpha);
+        this.DrawBorder(x, y, w, h, 1, 20, 24, 32, alpha);
     }
     void EndFrame() { }
     long Metric() {
@@ -129,8 +161,10 @@ class HeadlessUiRenderer : IUiRenderer {
     void DrawText(string text, int x, int y, int r, int g, int b, int a) {
         this.metric = this.metric + (long)(text.Length + x + y + r + g + b + a);
     }
-    void DrawSprite(int x, int y, int w, int h, int angle, int alpha) {
-        this.metric = this.metric + (long)(x + y + w + h + angle + alpha);
+    void DrawSprite(string image, int x, int y, int w, int h, int angle, int alpha) {
+        int imgLen = 0;
+        if (image != null) { imgLen = image.Length; }
+        this.metric = this.metric + (long)(imgLen + x + y + w + h + angle + alpha);
     }
     void EndFrame() { }
     long Metric() { return this.metric; }
@@ -208,7 +242,7 @@ class WidgetPainter {
             ui.DrawBorder(x, y, w, h, 1, 60, 66, 84, a);
         } else if (kind == "图片框"             // image box
                 || kind == "动画框") {          // anim box
-            ui.DrawSprite(x, y, w, h, 0, a);
+            ui.DrawSprite(s.Image(), x, y, w, h, s.Angle(), a);
         } else if (kind == "容器") {                // container
             ui.FillRect(x, y, w, h, 18, 20, 28, a);
             ui.DrawBorder(x, y, w, h, 1, 54, 60, 78, a);
