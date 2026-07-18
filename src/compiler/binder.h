@@ -32,6 +32,10 @@ typedef enum {
     TYPE_SHORT,
     TYPE_INT,
     TYPE_LONG,
+    TYPE_SBYTE,
+    TYPE_USHORT,
+    TYPE_UINT,
+    TYPE_ULONG,
     TYPE_FLOAT,
     TYPE_DOUBLE,
     TYPE_CHAR,
@@ -104,6 +108,10 @@ struct zan_binder {
     zan_type_t *type_short;
     zan_type_t *type_int;
     zan_type_t *type_long;
+    zan_type_t *type_sbyte;
+    zan_type_t *type_ushort;
+    zan_type_t *type_uint;
+    zan_type_t *type_ulong;
     zan_type_t *type_float;
     zan_type_t *type_double;
     zan_type_t *type_char;

@@ -31,6 +31,7 @@ static bool type_is_numeric(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
     case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG:
+    case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT: case TYPE_ULONG:
     case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_NINT:
         return true;
     default:
@@ -41,7 +42,9 @@ static bool type_is_numeric(zan_type_t *t) {
 static bool type_is_integral(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
-    case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG: case TYPE_NINT:
+    case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG:
+    case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT: case TYPE_ULONG:
+    case TYPE_NINT:
         return true;
     default:
         return false;
@@ -52,6 +55,7 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
     if (!a || !b_type) return b->type_error;
     if (a->kind == TYPE_DOUBLE || b_type->kind == TYPE_DOUBLE) return b->type_double;
     if (a->kind == TYPE_FLOAT  || b_type->kind == TYPE_FLOAT)  return b->type_float;
+    if (a->kind == TYPE_ULONG  || b_type->kind == TYPE_ULONG)  return b->type_ulong;
     if (a->kind == TYPE_LONG   || b_type->kind == TYPE_LONG)   return b->type_long;
     return b->type_int;
 }

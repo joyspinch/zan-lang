@@ -43,6 +43,7 @@ struct zan_irgen {
     /* runtime function declarations */
     LLVMValueRef rt_println;   /* zan_rt_println(const char*) */
     LLVMValueRef rt_print_int; /* zan_rt_print_int(int64) */
+    LLVMValueRef rt_print_uint; /* zan_rt_print_uint(uint64) */
     LLVMValueRef rt_print_double; /* zan_rt_print_double(double) */
 
     /* C library functions for string interpolation */

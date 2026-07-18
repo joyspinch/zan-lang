@@ -124,6 +124,10 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     case TK_LONG:   name.str = "long";   name.len = 4; break;
     case TK_SHORT:  name.str = "short";  name.len = 5; break;
     case TK_BYTE:   name.str = "byte";   name.len = 4; break;
+    case TK_UINT:   name.str = "uint";   name.len = 4; break;
+    case TK_ULONG:  name.str = "ulong";  name.len = 5; break;
+    case TK_USHORT: name.str = "ushort"; name.len = 6; break;
+    case TK_SBYTE:  name.str = "sbyte";  name.len = 5; break;
     case TK_FLOAT:  name.str = "float";  name.len = 5; break;
     case TK_DOUBLE: name.str = "double"; name.len = 6; break;
     case TK_BOOL:   name.str = "bool";   name.len = 4; break;
@@ -429,6 +433,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
          * begin a parenthesized expression, so this is unambiguous. */
         switch (zan_lexer_peek(p->lex).kind) {
         case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
+        case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
         case TK_DOUBLE: case TK_FLOAT: case TK_BOOL: case TK_CHAR: {
             parser_advance(p); /* ( */
             zan_ast_node_t *ctype = parse_type_ref(p);
@@ -567,6 +572,7 @@ static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
 static bool is_type_kw(zan_token_kind_t k) {
     switch (k) {
     case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
+    case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
     case TK_FLOAT: case TK_DOUBLE: case TK_BOOL: case TK_CHAR:
     case TK_STRING: case TK_VOID: case TK_OBJECT: case TK_NINT:
         return true;
@@ -930,6 +936,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
     /* type keyword followed by identifier */
     switch (p->current.kind) {
     case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
+    case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
     case TK_FLOAT: case TK_DOUBLE: case TK_BOOL: case TK_CHAR:
     case TK_STRING: case TK_VOID: case TK_OBJECT: case TK_NINT:
         return true;

@@ -159,6 +159,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMBuildCall2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
+    /* declare zan_rt_print_uint(uint64) — unsigned (%llu) println for ulong */
+    g->rt_print_uint = LLVMAddFunction(g->mod, "zan_rt_print_uint", pint_type);
+
+    LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, puint_entry);
+    LLVMValueRef uint_fmt = LLVMBuildGlobalStringPtr(g->builder, "%llu\n", "uint_fmt");
+    LLVMValueRef uargs[] = { uint_fmt, LLVMGetParam(g->rt_print_uint, 0) };
+    LLVMBuildCall2(g->builder, printf_type, printf_fn, uargs, 2, "");
+    LLVMBuildRetVoid(g->builder);
+
     /* declare zan_rt_print_double(double) */
     LLVMTypeRef pdbl_args[] = { LLVMDoubleTypeInContext(g->ctx) };
     LLVMTypeRef pdbl_type = LLVMFunctionType(
@@ -1056,6 +1066,10 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_SHORT:  return LLVMInt16TypeInContext(g->ctx);
     case TYPE_INT:    return LLVMInt64TypeInContext(g->ctx);
     case TYPE_LONG:   return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_SBYTE:  return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_USHORT: return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_UINT:   return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_ULONG:  return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NINT:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
@@ -1907,12 +1921,34 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
          * owned string; other binary operators produce non-rc scalars. */
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals))
             return g->binder->type_string;
-        return NULL;
+        switch (e->binary.op) {
+        case TK_PLUS: case TK_MINUS: case TK_STAR: case TK_SLASH:
+        case TK_PERCENT: case TK_AMP: case TK_PIPE: case TK_CARET:
+        case TK_LESS_LESS: case TK_GREATER_GREATER: {
+            zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
+            zan_type_t *rt = infer_expr_type(g, e->binary.right, locals);
+            if ((lt && lt->kind == TYPE_ULONG) || (rt && rt->kind == TYPE_ULONG))
+                return g->binder->type_ulong;
+            return NULL;
+        }
+        default:
+            return NULL;
+        }
     case AST_TYPEOF_EXPR:
+    case AST_STRING_INTERP:
         return g->binder->type_string;
+    case AST_CAST_EXPR:
+        return zan_binder_resolve_type(g->binder, e->cast.type);
     default:
         return NULL;
     }
+}
+
+/* True when an expression's static type is the unsigned 64-bit `ulong`,
+ * which selects unsigned division/remainder/shift/compare and %llu output. */
+static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && t->kind == TYPE_ULONG;
 }
 
 /* Class/struct symbol of an expression's static type, or NULL. */
@@ -4041,6 +4077,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         /* reconcile mixed-width integer operands (e.g. i32 int vs i64 length) */
         coerce_int_pair(g, &left, &right);
 
+        /* ulong operands select unsigned division/remainder/shift/compare */
+        bool is_unsigned = !is_float &&
+            (expr_is_ulong(g, expr->binary.left, locals) ||
+             expr_is_ulong(g, expr->binary.right, locals));
+
         switch (expr->binary.op) {
         case TK_PLUS:
             return is_float ? LLVMBuildFAdd(g->builder, left, right, "add")
@@ -4058,7 +4099,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, right, zero, "divz");
                 emit_runtime_check(g, is_zero, expr->loc, "division by zero");
             }
-            return LLVMBuildSDiv(g->builder, left, right, "div");
+            return is_unsigned ? LLVMBuildUDiv(g->builder, left, right, "div")
+                               : LLVMBuildSDiv(g->builder, left, right, "div");
         case TK_PERCENT:
             if (is_float) return LLVMBuildFRem(g->builder, left, right, "rem");
             {
@@ -4066,7 +4108,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, right, zero, "remz");
                 emit_runtime_check(g, is_zero, expr->loc, "division by zero (modulo)");
             }
-            return LLVMBuildSRem(g->builder, left, right, "rem");
+            return is_unsigned ? LLVMBuildURem(g->builder, left, right, "rem")
+                               : LLVMBuildSRem(g->builder, left, right, "rem");
         case TK_AMP:
             return LLVMBuildAnd(g->builder, left, right, "and");
         case TK_PIPE:
@@ -4076,7 +4119,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         case TK_LESS_LESS:
             return LLVMBuildShl(g->builder, left, right, "shl");
         case TK_GREATER_GREATER:
-            return LLVMBuildAShr(g->builder, left, right, "shr");
+            return is_unsigned ? LLVMBuildLShr(g->builder, left, right, "shr")
+                               : LLVMBuildAShr(g->builder, left, right, "shr");
         case TK_EQ_EQ:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOEQ, left, right, "eq")
                             : LLVMBuildICmp(g->builder, LLVMIntEQ, left, right, "eq");
@@ -4085,16 +4129,16 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             : LLVMBuildICmp(g->builder, LLVMIntNE, left, right, "ne");
         case TK_LESS:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOLT, left, right, "lt")
-                            : LLVMBuildICmp(g->builder, LLVMIntSLT, left, right, "lt");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntULT : LLVMIntSLT, left, right, "lt");
         case TK_GREATER:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOGT, left, right, "gt")
-                            : LLVMBuildICmp(g->builder, LLVMIntSGT, left, right, "gt");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntUGT : LLVMIntSGT, left, right, "gt");
         case TK_LESS_EQ:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOLE, left, right, "le")
-                            : LLVMBuildICmp(g->builder, LLVMIntSLE, left, right, "le");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntULE : LLVMIntSLE, left, right, "le");
         case TK_GREATER_EQ:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOGE, left, right, "ge")
-                            : LLVMBuildICmp(g->builder, LLVMIntSGE, left, right, "ge");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntUGE : LLVMIntSGE, left, right, "ge");
         case TK_QUESTION_QUESTION: {
             /* ?? null coalescing: if left != 0/null, use left, else right */
             LLVMValueRef is_null;
@@ -4673,7 +4717,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMVoidTypeInContext(g->ctx),
                         (LLVMTypeRef[]){ LLVMInt64TypeInContext(g->ctx) },
                         1, 0);
-                    LLVMBuildCall2(g->builder, fn_type, g->rt_print_int, &arg, 1, "");
+                    LLVMValueRef print_fn = expr_is_ulong(g, arg_ast, locals)
+                        ? g->rt_print_uint : g->rt_print_int;
+                    LLVMBuildCall2(g->builder, fn_type, print_fn, &arg, 1, "");
                 }
                 emit_release_owned_call_temp(g, arg_ast, arg, locals);
             }
@@ -4705,7 +4751,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef args[] = { fmt, dbl_arg };
                     LLVMBuildCall2(g->builder, printf_type, printf_fn, args, 2, "");
                 } else {
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "wfmt_i");
+                    LLVMValueRef fmt = expr_is_ulong(g, arg_ast, locals)
+                        ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "wfmt_u")
+                        : LLVMBuildGlobalStringPtr(g->builder, "%lld", "wfmt_i");
                     LLVMValueRef int_arg = emit_widen_i64_for_print(g, arg);
                     LLVMValueRef args[] = { fmt, int_arg };
                     LLVMBuildCall2(g->builder, printf_type, printf_fn, args, 2, "");
@@ -7023,12 +7071,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     lens[i] = needed64;
                     owns[i] = 1;
                 } else {
-                    /* integer types — format with %lld */
+                    /* integer types — format with %lld (%llu for ulong) */
                     LLVMValueRef val64 = val;
                     if (LLVMGetIntTypeWidth(vt) < 64) {
                         val64 = LLVMBuildSExt(g->builder, val, i64, "ext");
                     }
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
+                    LLVMValueRef fmt = expr_is_ulong(g, part, locals)
+                        ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "ufmt")
+                        : LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
                     LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
                     LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
                     LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, val64 };
@@ -7744,6 +7794,30 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         zan_type_t *tt = zan_binder_resolve_type(g->binder, expr->cast.type);
         LLVMTypeRef target = tt ? map_type(g, tt) : LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef src = LLVMTypeOf(val);
+        /* Unsigned/small targets share the i64 representation, so their cast
+         * semantics are wrap-to-width masks (zero-extend for uint/ushort,
+         * sign-extend from 8 bits for sbyte) applied on the i64 value. */
+        if (tt && LLVMGetTypeKind(src) == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(src) == 64) {
+            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+            switch (tt->kind) {
+            case TYPE_UINT:
+                return LLVMBuildAnd(g->builder, val,
+                    LLVMConstInt(i64t, 0xFFFFFFFFull, 0), "cast.u32");
+            case TYPE_USHORT:
+                return LLVMBuildAnd(g->builder, val,
+                    LLVMConstInt(i64t, 0xFFFFull, 0), "cast.u16");
+            case TYPE_SBYTE: {
+                LLVMValueRef sh = LLVMConstInt(i64t, 56, 0);
+                LLVMValueRef up = LLVMBuildShl(g->builder, val, sh, "cast.i8.l");
+                return LLVMBuildAShr(g->builder, up, sh, "cast.i8");
+            }
+            case TYPE_ULONG:
+                return val;
+            default:
+                break;
+            }
+        }
         if (src == target) return val;
         LLVMTypeKind sk = LLVMGetTypeKind(src);
         LLVMTypeKind tk = LLVMGetTypeKind(target);
