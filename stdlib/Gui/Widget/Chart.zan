@@ -710,22 +710,15 @@ class Chart {
             List<int> vs = s.values;
 
             if (filled) {
-                int fillc = Chart.WithAlpha(s.color, 56);
+                List<int> fx = new List<int>();
+                List<int> fy = new List<int>();
                 int i = 0;
-                while (i + 1 < n && i + 1 < vs.Count) {
-                    int x0 = f.plotX + i * step + half;
-                    int y0 = f.plotY + f.plotH - (vs[i] * f.plotH / maxV);
-                    int x1 = f.plotX + (i + 1) * step + half;
-                    int y1 = f.plotY + f.plotH - (vs[i + 1] * f.plotH / maxV);
-                    int px = x0;
-                    while (px <= x1) {
-                        int yy = y0;
-                        if (x1 > x0) { yy = y0 + (y1 - y0) * (px - x0) / (x1 - x0); }
-                        c.FillRect(px, yy, 1, baseY - yy, fillc);
-                        px = px + 1;
-                    }
+                while (i < n && i < vs.Count) {
+                    fx.Add(f.plotX + i * step + half);
+                    fy.Add(f.plotY + f.plotH - (vs[i] * f.plotH / maxV));
                     i = i + 1;
                 }
+                ChartView.FillUnder(c, fx, fy, baseY, s.color, false, 56, 56);
             }
 
             int prevX = 0;
@@ -1570,18 +1563,20 @@ class ChartView {
 
     // ---- polyline (straight or Catmull-Rom smoothed) ----
 
-    static void PolyLine(Canvas c, List<int> px, List<int> py,
-                         bool smooth, int color, int th) {
+    // Expand raw points into a dense polyline (straight-through, or a
+    // Catmull-Rom curve). The fill and the stroke both consume this same path
+    // so a filled area's top edge follows the identical curve as its outline
+    // (no gap between a smooth stroke and a straight-segment fill).
+    static void BuildPath(List<int> px, List<int> py, bool smooth,
+                          List<int> ox, List<int> oy) {
         int n = px.Count;
-        if (n < 2) { return; }
-        if (!smooth) {
+        if (n < 1) { return; }
+        if (!smooth || n < 3) {
             int i = 0;
-            while (i + 1 < n) {
-                c.DrawLine(px[i], py[i], px[i + 1], py[i + 1], color, th);
-                i = i + 1;
-            }
+            while (i < n) { ox.Add(px[i]); oy.Add(py[i]); i = i + 1; }
             return;
         }
+        ox.Add(px[0]); oy.Add(py[0]);
         int seg = 0;
         while (seg + 1 < n) {
             int p0 = seg - 1; if (p0 < 0) { p0 = 0; }
@@ -1590,8 +1585,7 @@ class ChartView {
             int x1 = px[seg]; int y1 = py[seg];
             int x2 = px[seg + 1]; int y2 = py[seg + 1];
             int x3 = px[p3]; int y3 = py[p3];
-            int steps = 14;
-            int prevx = x1; int prevy = y1;
+            int steps = 24;
             int s = 1;
             while (s <= steps) {
                 int tt = s * 1000 / steps;
@@ -1605,11 +1599,73 @@ class ChartView {
                     + (y2 - y0) * tt / 1000
                     + (2 * y0 - 5 * y1 + 4 * y2 - y3) * tt2 / 1000
                     + (0 - y0 + 3 * y1 - 3 * y2 + y3) * tt3 / 1000) / 2;
-                c.DrawLine(prevx, prevy, qx, qy, color, th);
-                prevx = qx; prevy = qy;
+                ox.Add(qx); oy.Add(qy);
                 s = s + 1;
             }
             seg = seg + 1;
+        }
+    }
+
+    // Fill the region between a dense (left-to-right) path and baseY, giving the
+    // top edge sub-pixel anti-aliased coverage. The interior is filled with
+    // solid 1px columns; the single boundary row of each column is blended with
+    // fractional coverage so the top reads as a smooth curve, not a staircase.
+    // Columns are half-open [x0,x1) so segment seams are not double-blended.
+    static void FillUnder(Canvas c, List<int> ox, List<int> oy, int baseY,
+                          int color, bool gradient, int topA, int botA) {
+        int cnt = ox.Count;
+        if (cnt < 2) { return; }
+        int ii = 0;
+        while (ii + 1 < cnt) {
+            int ax0 = ox[ii]; int ay0 = oy[ii];
+            int ax1 = ox[ii + 1]; int ay1 = oy[ii + 1];
+            if (ax1 > ax0) {
+                int pxc = ax0;
+                while (pxc < ax1) {
+                    int yyF = ay0 * 256 + (ay1 - ay0) * (pxc - ax0) * 256 / (ax1 - ax0);
+                    ChartView.FillColumnAA(c, pxc, yyF, baseY, color, gradient, topA, botA, 56);
+                    pxc = pxc + 1;
+                }
+            }
+            ii = ii + 1;
+        }
+        // final column at the last vertex (half-open loop skips it)
+        ChartView.FillColumnAA(c, ox[cnt - 1], oy[cnt - 1] * 256, baseY,
+                               color, gradient, topA, botA, 56);
+    }
+
+    // One anti-aliased fill column. yyF is the fractional top in 1/256 px;
+    // solidA is the flat (non-gradient) fill alpha.
+    static void FillColumnAA(Canvas c, int px, int yyF, int baseY,
+                             int color, bool gradient, int topA, int botA, int solidA) {
+        int iy = yyF / 256;
+        int frac = yyF - iy * 256;      // 0..255 : part of row iy above the fill
+        int cover = 256 - frac;         // coverage of boundary row iy by the fill
+        int solidTop = iy + 1;
+        if (baseY > solidTop) {
+            if (gradient) {
+                c.FillVGrad(px, solidTop, 1, baseY - solidTop,
+                    Chart.WithAlpha(color, topA), Chart.WithAlpha(color, botA));
+            } else {
+                c.FillRect(px, solidTop, 1, baseY - solidTop, Chart.WithAlpha(color, solidA));
+            }
+        }
+        if (iy >= 0 && iy < baseY) {
+            int edgeA = solidA;
+            if (gradient) { edgeA = topA; }
+            c.FillRect(px, iy, 1, 1, Chart.WithAlpha(color, edgeA * cover / 256));
+        }
+    }
+
+    static void PolyLine(Canvas c, List<int> px, List<int> py,
+                         bool smooth, int color, int th) {
+        List<int> ox = new List<int>();
+        List<int> oy = new List<int>();
+        ChartView.BuildPath(px, py, smooth, ox, oy);
+        int i = 0;
+        while (i + 1 < ox.Count) {
+            c.DrawLine(ox[i], oy[i], ox[i + 1], oy[i + 1], color, th);
+            i = i + 1;
         }
     }
 
@@ -1683,29 +1739,15 @@ class ChartView {
                 j = j + 1;
             }
 
+            // Build the (optionally smoothed) path once; the fill and the
+            // stroke share the identical curve so the filled top follows the
+            // stroke exactly with an anti-aliased edge.
+            List<int> pathX = new List<int>();
+            List<int> pathY = new List<int>();
+            ChartView.BuildPath(pxs, pys, o.smooth, pathX, pathY);
+
             if (o.area) {
-                int cnt = pxs.Count;
-                int topA = 150;
-                int botA = 16;
-                int ii = 0;
-                while (ii + 1 < cnt) {
-                    int ax0 = pxs[ii]; int ay0 = pys[ii];
-                    int ax1 = pxs[ii + 1]; int ay1 = pys[ii + 1];
-                    int pxc = ax0;
-                    while (pxc <= ax1) {
-                        int yy = ay0;
-                        if (ax1 > ax0) { yy = ay0 + (ay1 - ay0) * (pxc - ax0) / (ax1 - ax0); }
-                        int colTop = Chart.WithAlpha(s.color, topA);
-                        if (o.gradient) {
-                            int colBot = Chart.WithAlpha(s.color, botA);
-                            c.FillVGrad(pxc, yy, 1, baseY - yy, colTop, colBot);
-                        } else {
-                            c.FillRect(pxc, yy, 1, baseY - yy, Chart.WithAlpha(s.color, 56));
-                        }
-                        pxc = pxc + 1;
-                    }
-                    ii = ii + 1;
-                }
+                ChartView.FillUnder(c, pathX, pathY, baseY, s.color, o.gradient, 150, 16);
             }
 
             if (o.stepped) {
@@ -1716,7 +1758,11 @@ class ChartView {
                     sp = sp + 1;
                 }
             } else {
-                ChartView.PolyLine(c, pxs, pys, o.smooth, s.color, th);
+                int pli = 0;
+                while (pli + 1 < pathX.Count) {
+                    c.DrawLine(pathX[pli], pathY[pli], pathX[pli + 1], pathY[pli + 1], s.color, th);
+                    pli = pli + 1;
+                }
             }
 
             int m2 = 0;
@@ -2393,24 +2439,24 @@ class ChartView {
                 botY.Add(f.plotY + f.plotH - (prevG * f.plotH / maxV));
                 j = j + 1;
             }
-            int fillTop = Chart.WithAlpha(s.color, 150);
-            int fillBot = Chart.WithAlpha(s.color, 40);
             int ii = 0;
             while (ii + 1 < n) {
                 int ax0 = f.plotX + ii * step + half;
                 int ax1 = f.plotX + (ii + 1) * step + half;
                 int pxc = ax0;
-                while (pxc <= ax1) {
+                while (pxc < ax1) {
                     int tt = 0;
                     if (ax1 > ax0) { tt = (pxc - ax0) * 1000 / (ax1 - ax0); }
-                    int ty = topY[ii] + (topY[ii + 1] - topY[ii]) * tt / 1000;
+                    int tyF = topY[ii] * 256 + (topY[ii + 1] - topY[ii]) * tt * 256 / 1000;
                     int by = botY[ii] + (botY[ii + 1] - botY[ii]) * tt / 1000;
-                    if (o.gradient) { c.FillVGrad(pxc, ty, 1, by - ty, fillTop, fillBot); }
-                    else { c.FillRect(pxc, ty, 1, by - ty, Chart.WithAlpha(s.color, 90)); }
+                    ChartView.FillColumnAA(c, pxc, tyF, by, s.color, o.gradient, 150, 40, 90);
                     pxc = pxc + 1;
                 }
                 ii = ii + 1;
             }
+            int lastx = f.plotX + (n - 1) * step + half;
+            ChartView.FillColumnAA(c, lastx, topY[n - 1] * 256, botY[n - 1],
+                                   s.color, o.gradient, 150, 40, 90);
             int k2 = 0;
             while (k2 + 1 < n) {
                 int x0 = f.plotX + k2 * step + half;
