@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("audit", "test", "stats")]
+    [ValidateSet("audit", "test", "stats", "coverage")]
     [string]$Action = "audit"
 )
 
@@ -71,8 +71,68 @@ function Invoke-ZgmTests {
     Write-Output ("DIRECT_ZANC_PASS=" + $passed + "/" + $cases.Count)
 }
 
+function Get-ZgmCoverage {
+    $areas = @(
+        [pscustomobject]@{
+            Area = "App 配置与系统事件"
+            Status = "Zan 原生完成"
+            Entry = "AppConfig / ZgmEvents"
+            Tests = "zgm_app_config, zgm_ui_events"
+        }
+        [pscustomobject]@{
+            Area = "地图、角色、战斗、AI"
+            Status = "Zan 原生完成"
+            Entry = "ZgmWorld / ZgmCamera / ZgmPath"
+            Tests = "zgm_map_runtime, zgm_ai_runtime, zgm_skill_runtime"
+        }
+        [pscustomobject]@{
+            Area = "窗口、控件、节点、预制体"
+            Status = "Zan 原生完成"
+            Entry = "ZgmUiRuntime / Widget / Node / Prefab"
+            Tests = "zgm_ui_* , zgm_widgets, zgm_nodes, zgm_prefab_*"
+        }
+        [pscustomobject]@{
+            Area = "富文本、模板、补间、菜单、全局"
+            Status = "Zan 原生完成"
+            Entry = "RichText / TemplateVars / Tween / Menu / Globals"
+            Tests = "zgm_text, zgm_tween, zgm_engine_runtime"
+        }
+        [pscustomobject]@{
+            Area = "SQLite、本地存档、项目校验"
+            Status = "Zan 本土化完成"
+            Entry = "Game.Zgm.Data / ZgmProject.Validate"
+            Tests = "zgm_database, zgm_save_repository, zgm_project_validation"
+        }
+        [pscustomobject]@{
+            Area = "TCP、WebSocket、服务端基础类型"
+            Status = "已有基础实现"
+            Entry = "NetRuntime / ServerConfig / ServerEvents"
+            Tests = "zgm_net, zgm_net_runtime"
+        }
+        [pscustomobject]@{
+            Area = "Lua/App.lua 与 Lua/Server.lua 兼容层"
+            Status = "明确不做"
+            Entry = "使用 Zan 原生 API 替代"
+            Tests = "不适用"
+        }
+        [pscustomobject]@{
+            Area = "真实渲染器、音频后端、可视化编辑器"
+            Status = "适配器边界"
+            Entry = "消费 ZgmWorld / ZgmUiRuntime 状态"
+            Tests = "不属于 Game.Zgm 核心"
+        }
+    )
+    $areas | Format-Table -AutoSize
+}
+
 if ($Action -eq "stats") {
     Get-ZgmStats | Format-List
+    exit 0
+}
+
+if ($Action -eq "coverage") {
+    Get-ZgmStats | Format-List
+    Get-ZgmCoverage
     exit 0
 }
 
