@@ -317,6 +317,7 @@ struct zan_ast_node {
             zan_ast_node_t *default_val;
             int is_params; /* trailing `params T[]` variadic parameter */
             int by_ref;    /* 0 = by value, 1 = `ref`, 2 = `out` */
+            int is_this;   /* leading `this T recv` extension-method receiver */
         } param;
 
         /* by-reference call argument: `ref x`, `out x`, `out T x` */

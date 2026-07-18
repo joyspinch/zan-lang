@@ -1309,6 +1309,14 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
 static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
+    /* `this` modifier on the first parameter marks an extension method:
+     * `static R M(this T recv, ...)` is callable as `recv.M(...)`. */
+    int is_this = 0;
+    if (parser_check(p, TK_THIS)) {
+        parser_advance(p);
+        is_this = 1;
+    }
+
     /* contextual `params` modifier: `params T[] rest`. The variadic bundle is
      * lowered as List<T> so the callee has Count and normal indexing. */
     int is_params = 0;
@@ -1353,6 +1361,7 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     param->param.default_val = default_val;
     param->param.is_params = is_params;
     param->param.by_ref = by_ref;
+    param->param.is_this = is_this;
     return param;
 }
 

@@ -1809,6 +1809,35 @@ static zan_type_t *dict_value_type(zan_type_t *t) {
     return t->type_args[1];
 }
 
+/* Extension method lookup: a static method whose first parameter is declared
+ * `this T` extends T; `recv.M(args)` resolves to it when no instance method
+ * matches. Matches on method name, arity, and the receiver's static type. */
+static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
+                                           zan_istr_t name, int argc) {
+    if (!recv_ty) return NULL;
+    for (int fi = 0; fi < g->function_count; fi++) {
+        zan_symbol_t *m = g->functions[fi].sym;
+        if (!m || m->kind != SYM_METHOD || !m->decl ||
+            m->decl->kind != AST_METHOD_DECL)
+            continue;
+        if (m->name.len != name.len ||
+            memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+            continue;
+        zan_ast_list_t *ps = &m->decl->method_decl.params;
+        if (ps->count != argc + 1) continue;
+        zan_ast_node_t *p0 = ps->items[0];
+        if (!p0 || p0->kind != AST_PARAM || !p0->param.is_this) continue;
+        zan_type_t *pt = zan_binder_resolve_type(g->binder, p0->param.type);
+        if (!pt || pt->kind != recv_ty->kind) continue;
+        if ((pt->kind == TYPE_CLASS || pt->kind == TYPE_STRUCT ||
+             pt->kind == TYPE_INTERFACE || pt->kind == TYPE_ENUM) &&
+            pt->sym != recv_ty->sym)
+            continue;
+        return m;
+    }
+    return NULL;
+}
+
 /* Best-effort static inference of an expression's Zan type, composed over
  * identifiers, `this`, field access and element indexing so that patterns like
  * `list[i].field` or `a.b[i].c` resolve their class/struct symbol. */
@@ -1909,6 +1938,10 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_symbol_t *m = get_method_sym(rt->sym, callee->member.name);
                 if (m) return m->type;
             }
+            /* extension method: recv.M(args) returns the static method's type */
+            zan_symbol_t *xm = find_extension_method(g, rt, callee->member.name,
+                                                     e->call.args.count);
+            if (xm) return xm->type;
         }
         return NULL;
     }
@@ -6885,6 +6918,41 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 return result;
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        /* extension method call: recv.M(args) lowers to the static method
+         * Ext.M(recv, args) whose first parameter is declared `this T`. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_type_t *recv_ty = infer_expr_type(g, callee->member.object, locals);
+            zan_symbol_t *method_sym =
+                find_extension_method(g, recv_ty, callee->member.name,
+                                      expr->call.args.count);
+            if (method_sym) {
+                for (int fi = 0; fi < g->function_count; fi++) {
+                    if (g->functions[fi].sym == method_sym) {
+                        int argc = expr->call.args.count + 1;
+                        LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
+                        call_args[0] = emit_arg_typed(g, callee->member.object,
+                            method_param_type(g, method_sym, 0), locals);
+                        for (int k = 0; k < expr->call.args.count; k++) {
+                            call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
+                                method_param_type(g, method_sym, k + 1), locals);
+                        }
+                        const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "extcall";
+                        coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
+                        LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
+                            g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                        emit_release_owned_call_temp(g, callee->member.object, call_args[0], locals);
+                        for (int k = 0; k < expr->call.args.count; k++) {
+                            emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                call_args[k + 1], locals);
+                        }
+                        free(call_args);
+                        return result;
                     }
                 }
             }
