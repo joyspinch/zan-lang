@@ -12,6 +12,7 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurface.h>
 #import <WebKit/WebKit.h>
 #include <objc/message.h>
 #include <stdint.h>
@@ -95,12 +96,13 @@ static int evq_pop(void) {
 @interface ZanView : NSView {
 @public
     CGImageRef frame;
-    /* Double-buffered pixel storage for the layer-contents present path: the
-     * CGImage handed to Core Animation wraps one buffer while the next frame
-     * is copied into the other, so a deferred GPU upload never reads pixels
-     * that are being overwritten. */
-    void *backing[2];
-    size_t backingSize;
+    /* Double-buffered IOSurfaces for the layer-contents present path: CA can
+     * hand an IOSurface straight to the WindowServer/GPU, so presenting is
+     * one memcpy with no CPU pixel-format or colour conversion. The frame
+     * being displayed wraps one surface while the next frame is copied into
+     * the other. */
+    IOSurfaceRef iosurf[2];
+    int ioW, ioH;
     int backingIdx;
 }
 @end
@@ -193,9 +195,10 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
                                                    defer:NO];
         ZanView *view = [[ZanView alloc] initWithFrame:rect];
         view->frame = NULL;
-        view->backing[0] = NULL;
-        view->backing[1] = NULL;
-        view->backingSize = 0;
+        view->iosurf[0] = NULL;
+        view->iosurf[1] = NULL;
+        view->ioW = 0;
+        view->ioH = 0;
         view->backingIdx = 0;
         /* Layer-backed: present hands the frame to Core Animation as
          * layer.contents, so colour conversion and compositing run on the GPU
@@ -772,47 +775,44 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     if (!pixels || w <= 0 || h <= 0) return 1;
 
     @autoreleasepool {
-        /* One memcpy into a stable buffer, then wrap it zero-copy in a CGImage
-         * tagged sRGB (matches the surface's colour values, so no per-pixel
-         * CPU conversion) and hand it to the view's layer. */
-        size_t need = (size_t)stride * 4 * (size_t)h;
-        if (view->backingSize != need) {
-            free(view->backing[0]);
-            free(view->backing[1]);
-            view->backing[0] = malloc(need);
-            view->backing[1] = malloc(need);
-            view->backingSize = need;
+        if (view->ioW != w || view->ioH != h ||
+            !view->iosurf[0] || !view->iosurf[1]) {
+            for (int i = 0; i < 2; i++) {
+                if (view->iosurf[i]) { CFRelease(view->iosurf[i]); view->iosurf[i] = NULL; }
+                NSDictionary *props = @{
+                    (__bridge NSString *)kIOSurfaceWidth: @(w),
+                    (__bridge NSString *)kIOSurfaceHeight: @(h),
+                    (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
+                    (__bridge NSString *)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+                };
+                view->iosurf[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            }
+            view->ioW = w;
+            view->ioH = h;
         }
         view->backingIdx = 1 - view->backingIdx;
-        void *dst = view->backing[view->backingIdx];
-        if (!dst) return 1;
-        memcpy(dst, pixels, need);
-        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-        /* Surface pixels are 0xAARRGGBB in memory (little-endian bytes B,G,R,A);
-         * interpret as premultiplied ARGB via 32-little byte order. */
-        CGBitmapInfo info = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
-        CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, dst, need, NULL);
-        CGImageRef img = dp ? CGImageCreate((size_t)w, (size_t)h, 8, 32,
-                                            (size_t)stride * 4, cs, info, dp,
-                                            NULL, false,
-                                            kCGRenderingIntentDefault)
-                            : NULL;
-        if (dp) CGDataProviderRelease(dp);
-        CGColorSpaceRelease(cs);
-        if (img) {
-            if (view->frame) CGImageRelease(view->frame);
-            view->frame = img;             /* retained; released on next present */
-            CALayer *layer = [view layer];
-            if (layer) {
-                [CATransaction begin];
-                [CATransaction setDisableActions:YES];
-                layer.contentsScale = [[view window] backingScaleFactor];
-                layer.contents = (__bridge id)img;
-                [CATransaction commit];
-            } else {
-                [view setNeedsDisplay:YES];
-                [view displayIfNeeded];
-            }
+        IOSurfaceRef surf = view->iosurf[view->backingIdx];
+        if (!surf) return 1;
+        /* Surface pixels are 0xAARRGGBB in memory (little-endian bytes
+         * B,G,R,A) which is exactly IOSurface 'BGRA'; row-copy into the
+         * surface and hand it to the layer -- the WindowServer composites it
+         * on the GPU with no CPU format/colour conversion. */
+        IOSurfaceLock(surf, 0, NULL);
+        uint8_t *dst = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+        size_t dbpr = IOSurfaceGetBytesPerRow(surf);
+        size_t sbpr = (size_t)stride * 4;
+        size_t row = (size_t)w * 4;
+        for (int py = 0; py < h; py++)
+            memcpy(dst + (size_t)py * dbpr,
+                   (const uint8_t *)pixels + (size_t)py * sbpr, row);
+        IOSurfaceUnlock(surf, 0, NULL);
+        CALayer *layer = [view layer];
+        if (layer) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            layer.contentsScale = [[view window] backingScaleFactor];
+            layer.contents = (__bridge id)surf;
+            [CATransaction commit];
         }
     }
     return 0;
