@@ -377,7 +377,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
 
 EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
         [NSApp activateIgnoringOtherApps:YES];
@@ -395,7 +395,7 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
 EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     (void)tint_argb;
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
         NSWindow *win = mw->window;
@@ -426,7 +426,7 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
  * view and drop the vibrancy material. */
 EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
         NSWindow *win = mw->window;
@@ -445,7 +445,7 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
 
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count == 1) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count == 1) mw = &g_mwins[0];
     if (!mw) return 0;
     @autoreleasepool {
         ZanView *view = (ZanView *)mw->view;
@@ -882,14 +882,17 @@ EXPORT i64 zan_gui_window_height(void) {
     if (g_mwin_count == 0 || !g_mwins[0].view) return 0;
     return (i64)[g_mwins[0].view bounds].size.height;
 }
+/* A stale handle (window already closed) reports 0, never another window's
+ * size: falling back to g_mwins[0] made a closing dialog resize its canvas to
+ * the primary window's dimensions and present one parent-sized frame. */
 EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw || !mw->view) return zan_gui_window_width();
+    if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_width() : 0;
     return (i64)[mw->view bounds].size.width;
 }
 EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw || !mw->view) return zan_gui_window_height();
+    if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_height() : 0;
     return (i64)[mw->view bounds].size.height;
 }
 
@@ -909,7 +912,7 @@ EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
 
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 1;
     ZanView *view = (ZanView *)mw->view;
     int w = 0, h = 0, stride = 0;
@@ -964,7 +967,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
 
 EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw && title) {
         @autoreleasepool { [mw->window setTitle:[NSString stringWithUTF8String:title]]; }
     }
@@ -998,21 +1001,21 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) { @autoreleasepool { [mw->window miniaturize:nil]; } }
     return 0;
 }
 
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) { @autoreleasepool { [mw->window zoom:nil]; } }
     return 0;
 }
 
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
     return [mw->window isZoomed] ? 1 : 0;
 }
@@ -1021,7 +1024,7 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
  * occluded by other windows); ambient animations pause while this reports 0. */
 EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
     @autoreleasepool {
         if ([mw->window isMiniaturized]) return 0;
@@ -1032,7 +1035,7 @@ EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
 
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) {
         [mw->window setLevel:(on ? NSFloatingWindowLevel : NSNormalWindowLevel)];
     }
@@ -1232,7 +1235,7 @@ static WKWebsiteDataStore *wv_store_for_profile(const char *profile_id) {
 
 EXPORT i64 zan_gui_webview_create(i64 hwnd_val, const char *profile_id) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 0;
     int slot = -1;
     for (int i = 0; i < ZAN_MAX_WEBVIEWS; i++) {
