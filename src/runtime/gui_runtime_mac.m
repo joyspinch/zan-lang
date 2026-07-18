@@ -45,6 +45,7 @@ typedef struct {
     NSWindow *window;
     NSView   *view;
     int w, h;
+    int caption_btns; /* per-window caption-button count for the drag hit-test */
     NSView   *glassFx; /* NSVisualEffectView while native glass is on, else nil */
 } zan_mwin_t;
 static zan_mwin_t g_mwins[ZAN_MAX_WINDOWS];
@@ -368,6 +369,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         mw->view = view;
         mw->w = (int)width;
         mw->h = (int)height;
+        mw->caption_btns = 5;
         mw->glassFx = nil;
         return (i64)(intptr_t)window;
     }
@@ -542,7 +544,7 @@ static void decode_event(NSEvent *ev) {
          * title-bar strip that is left of the caption-button cluster drags the
          * window natively and is not delivered as a client click; presses over
          * the buttons or below the caption fall through as ordinary clicks. */
-        int capW = g_caption_btn_count * zan_caption_btn_w();
+        int capW = (mw ? mw->caption_btns : g_caption_btn_count) * zan_caption_btn_w();
         if (mw && ly >= 0 && ly < zan_titlebar_h() && lx < mw->w - capW) {
             [win performWindowDragWithEvent:ev];
             break;
@@ -895,8 +897,11 @@ EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
 
 EXPORT i64 zan_gui_titlebar_height(void) { return (i64)zan_titlebar_h(); }
 EXPORT i64 zan_gui_caption_button_width(void) { return (i64)zan_caption_btn_w(); }
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
-    if (count >= 0 && count <= 8) g_caption_btn_count = (int)count;
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    if (count < 0 || count > 8) return 0;
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (mw) mw->caption_btns = (int)count;
+    else g_caption_btn_count = (int)count;
     return 0;
 }
 
