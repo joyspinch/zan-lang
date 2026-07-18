@@ -30,6 +30,7 @@ class Irgen {
     public List<Node> locType;
     public List<string> locReg;
     public int locSeq;
+    public int qdotSeq;
     public string curLbl;
     public int brkTarget;
     public int contTarget;
@@ -64,6 +65,7 @@ class Irgen {
         locType = new List<Node>();
         locReg = new List<string>();
         locSeq = 0;
+        qdotSeq = 0;
         curAsync = false; usesAsync = false; usesDirList = false;
         mgTargets = new List<string>();
         curLbl = "entry";
@@ -950,6 +952,8 @@ class Irgen {
     void ReleaseLocalsFrom(int from) {
         int i = from;
         while (i < locName.Count) {
+            // __qdot temps hold a borrowed `?.` receiver: not owned, never released
+            if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { i = i + 1; continue; }
             if (ArcManaged(locType[i])) {
                 string lt = MapType(locType[i]);
                 string t = NT();
@@ -2689,11 +2693,14 @@ class Irgen {
         while (i < cands.Count) {
             Node m = cands[i];
             int tot = 0; int req = 0; int j = 0;
+            Node lastP = null;
             while (j < m.kids.Count) {
-                if (m.kids[j].kind == AK.Param()) { tot = tot + 1; if (m.kids[j].b == null) { req = req + 1; } }
+                if (m.kids[j].kind == AK.Param()) { tot = tot + 1; if (m.kids[j].b == null) { req = req + 1; } lastP = m.kids[j]; }
                 j = j + 1;
             }
+            bool vparams = lastP != null && lastP.op == 1;
             if (argc >= req && argc <= tot) { fit.Add(m); }
+            else if (vparams && argc >= req - 1) { fit.Add(m); }
             i = i + 1;
         }
         if (fit.Count == 0) {
@@ -3063,13 +3070,21 @@ class Irgen {
         if (k == AK.PostfixUnary()) { return GenPostfix(e); }
         if (k == AK.Binary()) { return GenBinary(e); }
         if (k == AK.Assignment()) { return GenAssign(e); }
-        if (k == AK.Call()) { return GenCall(e); }
+        if (k == AK.Call()) {
+            if (e.a != null && e.a.kind == AK.MemberAccess() && e.a.ival == 1) {
+                return GenNullCond(e, e.a);
+            }
+            return GenCall(e);
+        }
         if (k == AK.Lambda()) { return GenLambda(e); }
         if (k == AK.SwitchExpr()) { return GenSwitchExpr(e); }
         if (k == AK.Conditional()) { return GenConditional(e); }
         if (k == AK.TupleExpr()) { return GenTuple(e); }
         if (k == AK.IsExpr()) { return GenIs(e); }
-        if (k == AK.MemberAccess()) { return GenMember(e); }
+        if (k == AK.MemberAccess()) {
+            if (e.ival == 1) { return GenNullCond(e, e); }
+            return GenMember(e);
+        }
         if (k == AK.Index()) { return GenIndex(e); }
         if (k == AK.NewExpr()) { return GenNew(e); }
         if (k == AK.CastExpr()) { return GenCast(e); }
@@ -3952,6 +3967,56 @@ class Irgen {
     }
 
     // ---- member access (field / .Length / .Count) ----
+    // Null-conditional `a?.b` / `a?.M(...)`: evaluate the receiver once, bind
+    // it to a synthetic local, and only evaluate the member/call when it is
+    // non-null; a null receiver yields the result type's zero value. The
+    // member node is temporarily rewired to read the synthetic local so the
+    // ordinary member/call codegen applies unchanged, then restored.
+    ExprVal GenNullCond(Node full, Node qmem) {
+        ExprVal obj = GenExpr(qmem.a);
+        string ot = MapType(obj.ty);
+        if (!IsPtrLL(ot)) {
+            qmem.ival = 0;
+            ExprVal pv = GenExpr(full);
+            qmem.ival = 1;
+            return pv;
+        }
+        qdotSeq = qdotSeq + 1;
+        string nm = "__qdot" + qdotSeq;
+        string reg = AddLocal(nm, obj.ty);
+        L("  " + reg + " = alloca " + ot);
+        L("  store " + ot + " " + obj.op + ", " + ot + "* " + reg);
+        Node ident = new Node(AK.Ident());
+        ident.sval = nm; ident.line = qmem.line; ident.col = qmem.col;
+        Node saved = qmem.a;
+        qmem.a = ident; qmem.ival = 0;
+        int lthen = NL(); int lend = NL();
+        string isn = NT();
+        L("  " + isn + " = icmp eq " + ot + " " + obj.op + ", null");
+        string bpre = curLbl;
+        L("  br i1 " + isn + ", label %L" + lend + ", label %L" + lthen);
+        Label(lthen);
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        ExprVal v = GenExpr(full);
+        EmitArcRetain(v.op, v.ty);
+        EmitTempReleases();
+        stmtTemps = svT; stmtTempTypes = svTT;
+        qmem.a = saved; qmem.ival = 1;
+        string bthen = curLbl;
+        L("  br label %L" + lend);
+        Label(lend);
+        string vt = MapType(v.ty);
+        if (vt == "void") { return new ExprVal("0", MkType("int")); }
+        string dflt = "0";
+        if (IsPtrLL(vt)) { dflt = "null"; }
+        if (vt == "double") { dflt = "0.0"; }
+        string r = NT();
+        L("  " + r + " = phi " + vt + " [ " + dflt + ", %" + bpre + " ], [ " + v.op + ", %" + bthen + " ]");
+        AddTemp(r, v.ty);
+        return new ExprVal(r, v.ty);
+    }
+
     ExprVal GenMember(Node e) {
         if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0) {
             Node tc = binder.FindType(e.a.sval);
@@ -4983,6 +5048,45 @@ class Irgen {
             i = i + 1;
         }
         int np = pnames.Count;
+        // `params T[] rest` tail: bundle extra positional args into a List<T>
+        // collection-initializer node (the parameter type is already List<T>).
+        // A single trailing List value (or explicit `new List<T>{...}`) passes
+        // through unpacked.
+        Node lastParam = null;
+        i = m.kids.Count - 1;
+        while (i >= 0) {
+            if (m.kids[i].kind == AK.Param()) { lastParam = m.kids[i]; break; }
+            i = i - 1;
+        }
+        if (lastParam != null && lastParam.op == 1 && np > 0) {
+            bool named0 = false;
+            int q = 0;
+            while (q < e.kids.Count) { if (e.kids[q].sval2 != "") { named0 = true; } q = q + 1; }
+            if (!named0 && e.kids.Count >= np - 1) {
+                bool passthrough = false;
+                if (e.kids.Count == np) {
+                    Node la = e.kids[np - 1];
+                    if (la.kind == AK.NewExpr()) { passthrough = true; }
+                    if (la.kind == AK.Ident()) {
+                        int li = LocalIdx(la.sval);
+                        if (li >= 0 && IsListType(locType[li])) { passthrough = true; }
+                    }
+                }
+                if (!passthrough) {
+                    Node packed = new Node(AK.NewExpr());
+                    packed.ival = 2;
+                    packed.type = lastParam.type;
+                    packed.line = e.line; packed.col = e.col;
+                    int w = np - 1;
+                    while (w < e.kids.Count) { packed.Add(e.kids[w]); w = w + 1; }
+                    List<Node> outk = new List<Node>();
+                    w = 0;
+                    while (w < np - 1) { outk.Add(e.kids[w]); w = w + 1; }
+                    outk.Add(packed);
+                    return outk;
+                }
+            }
+        }
         if (e.kids.Count > np) {
             diags.Error("too many arguments to '" + m.sval + "' (expected "
                 + np + ", got " + e.kids.Count + ")", e.line, e.col);

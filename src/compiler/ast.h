@@ -80,6 +80,9 @@ typedef enum {
     AST_GENERIC_TYPE,
     AST_QUALIFIED_NAME,
 
+    /* `ref x` / `out x` / `out T x` call argument */
+    AST_REF_ARG,
+
     /* misc */
     AST_ATTRIBUTE,
     AST_ENUM_MEMBER,
@@ -134,10 +137,11 @@ struct zan_ast_node {
             zan_ast_list_t type_args; /* explicit generic args: f<int>(...) */
         } call;
 
-        /* member access: expr.name */
+        /* member access: expr.name (null_cond: `expr?.name`) */
         struct {
             zan_ast_node_t *object;
             zan_istr_t name;
+            int null_cond;
         } member;
 
         /* index: expr[idx] */
@@ -311,7 +315,16 @@ struct zan_ast_node {
             zan_istr_t name;
             zan_ast_node_t *type;
             zan_ast_node_t *default_val;
+            int is_params; /* trailing `params T[]` variadic parameter */
+            int by_ref;    /* 0 = by value, 1 = `ref`, 2 = `out` */
         } param;
+
+        /* by-reference call argument: `ref x`, `out x`, `out T x` */
+        struct {
+            zan_ast_node_t *expr;      /* the referenced lvalue (identifier) */
+            zan_ast_node_t *decl_type; /* non-NULL for inline `out T x` decl */
+            int is_out;
+        } ref_arg;
 
         /* type reference */
         struct {

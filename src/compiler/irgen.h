@@ -32,6 +32,9 @@ struct zan_irgen {
     LLVMValueRef current_fn;
     LLVMTypeRef current_fn_ret_type;
 
+    /* unique-name counter for null-conditional (`?.`) receiver temps */
+    int qdot_counter;
+
     /* current 'this' context for method bodies */
     LLVMValueRef current_this;       /* alloca for 'this' pointer */
     zan_symbol_t *current_type_sym;  /* type symbol for 'this' */

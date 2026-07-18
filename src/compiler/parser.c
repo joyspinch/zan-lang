@@ -502,6 +502,44 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     }
 }
 
+static bool is_type_kw(zan_token_kind_t k);
+
+/* A call argument: an expression, or a by-reference `ref x` / `out x` /
+ * `out T x` argument (the latter declares a fresh local at the call site). */
+static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
+    if (!parser_check(p, TK_REF) && !parser_check(p, TK_OUT)) {
+        return parse_expression(p);
+    }
+    zan_loc_t loc = p->current.loc;
+    int is_out = parser_check(p, TK_OUT);
+    parser_advance(p);
+    zan_ast_node_t *n = zan_ast_new(p->arena, AST_REF_ARG, loc);
+    n->ref_arg.is_out = is_out;
+    n->ref_arg.decl_type = NULL;
+    if (is_out && is_type_kw(p->current.kind)) {
+        n->ref_arg.decl_type = parse_type_ref(p);
+        zan_ast_node_t *id = zan_ast_new(p->arena, AST_IDENTIFIER, p->current.loc);
+        id->ident.name = p->current.str_val;
+        parser_expect(p, TK_IDENT);
+        n->ref_arg.expr = id;
+        return n;
+    }
+    zan_ast_node_t *e = parse_expression(p);
+    if (is_out && e->kind == AST_IDENTIFIER && parser_check(p, TK_IDENT)) {
+        /* `out Foo x`: the expression parsed was actually the type name */
+        zan_ast_node_t *ty = zan_ast_new(p->arena, AST_TYPE_REF, e->loc);
+        ty->type_ref.name = e->ident.name;
+        zan_ast_list_init(&ty->type_ref.type_args);
+        n->ref_arg.decl_type = ty;
+        zan_ast_node_t *id = zan_ast_new(p->arena, AST_IDENTIFIER, p->current.loc);
+        id->ident.name = p->current.str_val;
+        parser_advance(p);
+        e = id;
+    }
+    n->ref_arg.expr = e;
+    return n;
+}
+
 static bool is_type_kw(zan_token_kind_t k) {
     switch (k) {
     case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
@@ -586,7 +624,9 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     for (;;) {
         zan_loc_t loc = p->current.loc;
 
-        if (parser_match(p, TK_DOT)) {
+        if (parser_check(p, TK_DOT) || parser_check(p, TK_QUESTION_DOT)) {
+            int null_cond = parser_check(p, TK_QUESTION_DOT);
+            parser_advance(p);
             if (!parser_check(p, TK_IDENT)) {
                 zan_diag_emit(p->diag, DIAG_ERROR, loc, "expected member name after '.'");
                 break;
@@ -595,6 +635,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_MEMBER_ACCESS, loc);
             n->member.object = expr;
             n->member.name = p->previous.str_val;
+            n->member.null_cond = null_cond;
             expr = n;
         } else if (parser_match(p, TK_LPAREN)) {
             /* function call */
@@ -603,7 +644,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             zan_ast_list_init(&n->call.args);
             zan_ast_list_init(&n->call.type_args);
             while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
-                zan_ast_node_t *arg = parse_expression(p);
+                zan_ast_node_t *arg = parse_call_arg(p);
                 zan_ast_list_push(&n->call.args, arg, p->arena);
                 if (!parser_match(p, TK_COMMA)) break;
             }
@@ -626,7 +667,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             parser_expect_gt(p);
             parser_expect(p, TK_LPAREN);
             while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
-                zan_ast_node_t *arg = parse_expression(p);
+                zan_ast_node_t *arg = parse_call_arg(p);
                 zan_ast_list_push(&n->call.args, arg, p->arena);
                 if (!parser_match(p, TK_COMMA)) break;
             }
@@ -1236,7 +1277,33 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
 
 static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
+
+    /* contextual `params` modifier: `params T[] rest`. The variadic bundle is
+     * lowered as List<T> so the callee has Count and normal indexing. */
+    int is_params = 0;
+    if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
+        memcmp(p->current.str_val.str, "params", 6) == 0) {
+        parser_advance(p);
+        is_params = 1;
+    }
+
+    /* `ref` / `out` by-reference parameter */
+    int by_ref = 0;
+    if (parser_check(p, TK_REF)) { parser_advance(p); by_ref = 1; }
+    else if (parser_check(p, TK_OUT)) { parser_advance(p); by_ref = 2; }
+
     zan_ast_node_t *type = parse_type_ref(p);
+    if (is_params && type && type->kind == AST_TYPE_REF && type->type_ref.is_array) {
+        zan_ast_node_t *elem = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+        elem->type_ref.name = type->type_ref.name;
+        zan_ast_list_init(&elem->type_ref.type_args);
+        zan_ast_node_t *lst = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+        lst->type_ref.name.str = "List";
+        lst->type_ref.name.len = 4;
+        zan_ast_list_init(&lst->type_ref.type_args);
+        zan_ast_list_push(&lst->type_ref.type_args, elem, p->arena);
+        type = lst;
+    }
 
     zan_istr_t name = {0};
     if (parser_check(p, TK_IDENT)) {
@@ -1253,6 +1320,8 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     param->param.name = name;
     param->param.type = type;
     param->param.default_val = default_val;
+    param->param.is_params = is_params;
+    param->param.by_ref = by_ref;
     return param;
 }
 
