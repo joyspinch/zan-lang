@@ -1234,6 +1234,23 @@ static zan_ast_node_t *parse_try_stmt(zan_parser_t *p) {
 }
 
 static zan_ast_node_t *parse_statement(zan_parser_t *p) {
+    /* `yield` is contextual: only `yield return expr;` / `yield break;` are
+     * statements, so identifiers named `yield` keep working elsewhere. */
+    if (p->current.kind == TK_IDENT && p->current.str_val.len == 5 &&
+        memcmp(p->current.str_val.str, "yield", 5) == 0) {
+        zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
+        if (nk == TK_RETURN || nk == TK_BREAK) {
+            zan_loc_t loc = p->current.loc;
+            parser_advance(p); /* yield */
+            parser_advance(p); /* return / break */
+            zan_ast_node_t *n = zan_ast_new(p->arena, AST_YIELD_STMT, loc);
+            n->yield_stmt.value =
+                (nk == TK_RETURN) ? parse_expression(p) : NULL;
+            parser_expect(p, TK_SEMICOLON);
+            return n;
+        }
+    }
+
     switch (p->current.kind) {
     case TK_LBRACE:
         return parse_block(p);
@@ -1415,6 +1432,157 @@ static zan_ast_list_t parse_param_list(zan_parser_t *p) {
     parser_expect(p, TK_RPAREN);
 
     return params;
+}
+
+/* ---- yield desugaring ----
+ *
+ * Iterator methods are lowered eagerly: a method containing `yield` gets a
+ * hidden `List<T> __yield` accumulator, each `yield return e` appends to it,
+ * `yield break` returns it early, and the method returns the finished list
+ * (its `IEnumerable<T>` return type is rewritten to `List<T>`, which foreach
+ * already iterates). */
+
+static bool stmt_contains_yield(zan_ast_node_t *s);
+
+static bool list_contains_yield(zan_ast_list_t *l) {
+    for (int i = 0; i < l->count; i++)
+        if (stmt_contains_yield(l->items[i])) return true;
+    return false;
+}
+
+static bool stmt_contains_yield(zan_ast_node_t *s) {
+    if (!s) return false;
+    switch (s->kind) {
+    case AST_YIELD_STMT:   return true;
+    case AST_BLOCK:        return list_contains_yield(&s->block.stmts);
+    case AST_IF_STMT:      return stmt_contains_yield(s->if_stmt.then_body) ||
+                                  stmt_contains_yield(s->if_stmt.else_body);
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT: return stmt_contains_yield(s->while_stmt.body);
+    case AST_FOR_STMT:     return stmt_contains_yield(s->for_stmt.body);
+    case AST_FOREACH_STMT: return stmt_contains_yield(s->foreach_stmt.body);
+    case AST_TRY_STMT:
+        if (stmt_contains_yield(s->try_stmt.try_body)) return true;
+        for (int i = 0; i < s->try_stmt.catches.count; i++)
+            if (stmt_contains_yield(s->try_stmt.catches.items[i]->catch_clause.body))
+                return true;
+        return stmt_contains_yield(s->try_stmt.finally_body);
+    case AST_SWITCH_STMT:
+        for (int i = 0; i < s->switch_stmt.cases.count; i++)
+            if (stmt_contains_yield(s->switch_stmt.cases.items[i]->switch_case.body))
+                return true;
+        return false;
+    default: return false;
+    }
+}
+
+static zan_ast_node_t *make_yield_ident(zan_parser_t *p, zan_loc_t loc) {
+    zan_ast_node_t *id = zan_ast_new(p->arena, AST_IDENTIFIER, loc);
+    id->ident.name = (zan_istr_t){"__yield", 7};
+    return id;
+}
+
+static void rewrite_yield_stmt(zan_parser_t *p, zan_ast_node_t **slot) {
+    zan_ast_node_t *s = *slot;
+    if (!s) return;
+    switch (s->kind) {
+    case AST_YIELD_STMT: {
+        if (s->yield_stmt.value) {
+            /* __yield.Add(value); */
+            zan_ast_node_t *mem = zan_ast_new(p->arena, AST_MEMBER_ACCESS, s->loc);
+            mem->member.object = make_yield_ident(p, s->loc);
+            mem->member.name = (zan_istr_t){"Add", 3};
+            mem->member.null_cond = 0;
+            zan_ast_node_t *call = zan_ast_new(p->arena, AST_CALL, s->loc);
+            call->call.callee = mem;
+            zan_ast_list_init(&call->call.args);
+            zan_ast_list_init(&call->call.type_args);
+            zan_ast_list_push(&call->call.args, s->yield_stmt.value, p->arena);
+            zan_ast_node_t *es = zan_ast_new(p->arena, AST_EXPR_STMT, s->loc);
+            es->expr_stmt.expr = call;
+            *slot = es;
+        } else {
+            /* return __yield; */
+            zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, s->loc);
+            ret->ret.value = make_yield_ident(p, s->loc);
+            *slot = ret;
+        }
+        return;
+    }
+    case AST_BLOCK:
+        for (int i = 0; i < s->block.stmts.count; i++)
+            rewrite_yield_stmt(p, &s->block.stmts.items[i]);
+        return;
+    case AST_IF_STMT:
+        rewrite_yield_stmt(p, &s->if_stmt.then_body);
+        rewrite_yield_stmt(p, &s->if_stmt.else_body);
+        return;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        rewrite_yield_stmt(p, &s->while_stmt.body);
+        return;
+    case AST_FOR_STMT:
+        rewrite_yield_stmt(p, &s->for_stmt.body);
+        return;
+    case AST_FOREACH_STMT:
+        rewrite_yield_stmt(p, &s->foreach_stmt.body);
+        return;
+    case AST_TRY_STMT:
+        rewrite_yield_stmt(p, &s->try_stmt.try_body);
+        for (int i = 0; i < s->try_stmt.catches.count; i++)
+            rewrite_yield_stmt(p, &s->try_stmt.catches.items[i]->catch_clause.body);
+        rewrite_yield_stmt(p, &s->try_stmt.finally_body);
+        return;
+    case AST_SWITCH_STMT:
+        for (int i = 0; i < s->switch_stmt.cases.count; i++)
+            rewrite_yield_stmt(p, &s->switch_stmt.cases.items[i]->switch_case.body);
+        return;
+    default: return;
+    }
+}
+
+static void desugar_yield_method(zan_parser_t *p, zan_ast_node_t *m) {
+    zan_ast_node_t *body = m->method_decl.body;
+    if (!body || !stmt_contains_yield(body)) return;
+    zan_ast_node_t *rt = m->method_decl.return_type;
+    if (!rt || rt->kind != AST_TYPE_REF || rt->type_ref.type_args.count != 1) {
+        zan_diag_emit(p->diag, DIAG_ERROR, m->loc,
+                      "iterator method '%.*s' must return IEnumerable<T> or List<T>",
+                      (int)m->method_decl.name.len, m->method_decl.name.str);
+        return;
+    }
+    rt->type_ref.name = (zan_istr_t){"List", 4};
+
+    zan_ast_node_t *list_type = zan_ast_new(p->arena, AST_TYPE_REF, m->loc);
+    list_type->type_ref.name = (zan_istr_t){"List", 4};
+    list_type->type_ref.type_args = rt->type_ref.type_args;
+    list_type->type_ref.is_nullable = false;
+    list_type->type_ref.is_array = false;
+
+    zan_ast_node_t *nw = zan_ast_new(p->arena, AST_NEW_EXPR, m->loc);
+    nw->new_expr.type = list_type;
+    zan_ast_list_init(&nw->new_expr.args);
+    nw->new_expr.is_array = false;
+
+    zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, m->loc);
+    decl->var_decl.name = (zan_istr_t){"__yield", 7};
+    decl->var_decl.type = NULL;
+    decl->var_decl.initializer = nw;
+    decl->var_decl.is_const = false;
+    decl->var_decl.is_let = false;
+
+    rewrite_yield_stmt(p, &m->method_decl.body);
+    body = m->method_decl.body;
+
+    zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, m->loc);
+    ret->ret.value = make_yield_ident(p, m->loc);
+
+    zan_ast_list_t old = body->block.stmts;
+    zan_ast_list_init(&body->block.stmts);
+    zan_ast_list_push(&body->block.stmts, decl, p->arena);
+    for (int i = 0; i < old.count; i++)
+        zan_ast_list_push(&body->block.stmts, old.items[i], p->arena);
+    zan_ast_list_push(&body->block.stmts, ret, p->arena);
 }
 
 static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
@@ -1656,6 +1824,7 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         n->method_decl.extern_lib = dll_import_lib;
         n->method_decl.entry_point = dll_entry_point;
         n->method_decl.where_clauses = wheres;
+        desugar_yield_method(p, n);
         return n;
     }
 

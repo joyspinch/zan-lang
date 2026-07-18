@@ -9824,6 +9824,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* evaluate collection */
         LLVMValueRef collection = emit_expr(g, stmt->foreach_stmt.collection, locals);
 
+        /* element type: declared loop-var type, else inferred from collection */
+        zan_type_t *elem_type = NULL;
+        if (stmt->foreach_stmt.var_type)
+            elem_type = zan_binder_resolve_type(g->binder, stmt->foreach_stmt.var_type);
+        if (!elem_type || elem_type->kind == TYPE_ERROR)
+            elem_type = container_elem_type(
+                infer_expr_type(g, stmt->foreach_stmt.collection, locals));
+        if (!elem_type) elem_type = g->binder->type_int;
+        LLVMTypeRef elem_llvm = map_type(g, elem_type);
+
         /* get count: field 0 of List struct */
         LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
             collection, 0, "cnt_ptr");
@@ -9840,8 +9850,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
 
         /* iteration variable */
-        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, i64, "fv");
-        local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, g->binder->type_int);
+        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, elem_llvm, "fv");
+        local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, elem_type);
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.cond");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.body");
@@ -9854,9 +9864,18 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
-        /* load current element */
+        /* load current element; slots physically hold an i64, so pointer
+         * (class/string) elements need inttoptr, doubles a bitcast, and
+         * narrower integers a trunc back to the value type */
         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_val, 1, "ep");
         LLVMValueRef elem = LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
+        LLVMTypeKind ek = LLVMGetTypeKind(elem_llvm);
+        if (ek == LLVMPointerTypeKind)
+            elem = LLVMBuildIntToPtr(g->builder, elem, elem_llvm, "elp");
+        else if (ek == LLVMDoubleTypeKind)
+            elem = LLVMBuildBitCast(g->builder, elem, elem_llvm, "elf");
+        else if (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(elem_llvm) < 64)
+            elem = LLVMBuildTrunc(g->builder, elem, elem_llvm, "elt");
         LLVMBuildStore(g->builder, elem, iter_alloc);
 
         emit_stmt(g, stmt->foreach_stmt.body, locals);
@@ -9874,6 +9893,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        /* an owned temporary collection (e.g. iterating a call result) is
+         * consumed by the loop and released once iteration ends */
+        emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
+                                     collection, locals);
         break;
     }
 

@@ -89,6 +89,7 @@ typedef enum {
     AST_CATCH_CLAUSE,
     AST_SWITCH_CASE,
     AST_WHERE_CLAUSE, /* generic constraint: where T : C1, C2 */
+    AST_YIELD_STMT,   /* yield return expr; / yield break; (desugared in parser) */
 
     AST__COUNT,
 } zan_ast_kind_t;
@@ -318,6 +319,11 @@ struct zan_ast_node {
             zan_istr_t param_name;
             zan_ast_list_t constraints; /* AST_TYPE_REF list */
         } where_clause;
+
+        /* yield return expr; (value set) or yield break; (value NULL) */
+        struct {
+            zan_ast_node_t *value;
+        } yield_stmt;
 
         /* parameter */
         struct {
