@@ -559,6 +559,84 @@ static CTFontRef zan_font(i64 font_size) {
     return CTFontCreateWithName(CFSTR(".AppleSystemUIFont"), size, NULL);
 }
 
+static CTLineRef zan_text_line(const char *utf8, CTFontRef font);
+
+/* Rendered text-run cache. CoreText layout + rasterization (font parsing,
+ * glyph lookup, mask fill) dominates a full-page redraw, and UI strings repeat
+ * across frames, so cache the finished coverage mask per (string, font size).
+ * Direct-mapped by FNV hash; a collision simply re-renders and replaces. */
+typedef struct {
+    char *key;              /* strdup'ed string, NULL = empty slot */
+    i64 font_size;
+    int tw, th;             /* mask dimensions */
+    double width;           /* typographic width (for measure) */
+    unsigned char *mask;    /* tw*th coverage bytes (may be NULL: measure-only) */
+} zan_text_entry_t;
+
+#define ZAN_TEXT_CACHE_SLOTS 1024
+static zan_text_entry_t g_text_cache[ZAN_TEXT_CACHE_SLOTS];
+
+static unsigned int zan_text_hash(const char *s, i64 font_size) {
+    unsigned int h = 2166136261u;
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    h ^= (unsigned int)font_size * 2654435761u;
+    return h % ZAN_TEXT_CACHE_SLOTS;
+}
+
+/* Returns the cache slot for (utf8, font_size), rendering the coverage mask on
+ * a miss (or when a measure-only entry needs pixels and need_mask is set).
+ * Returns NULL when the string renders to an empty box. */
+static zan_text_entry_t *zan_text_lookup(const char *utf8, i64 font_size,
+                                         bool need_mask) {
+    unsigned int slot = zan_text_hash(utf8, font_size);
+    zan_text_entry_t *e = &g_text_cache[slot];
+    if (e->key && e->font_size == font_size && strcmp(e->key, utf8) == 0 &&
+        (!need_mask || e->mask))
+        return e;
+
+    CTFontRef font = zan_font(font_size);
+    CTLineRef line = zan_text_line(utf8, font);
+    if (!line) {
+        if (font) CFRelease(font);
+        return NULL;
+    }
+    CGFloat ascent = 0, descent = 0, leading = 0;
+    double measured = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
+    int tw = (int)ceil(measured) + 2;
+    int th = (int)ceil(ascent + descent + leading) + 2;
+    unsigned char *mask = NULL;
+    if (need_mask && tw > 0 && th > 0) {
+        mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+        CGContextRef ctx = CGBitmapContextCreate(
+            mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
+            cs, (CGBitmapInfo)kCGImageAlphaNone);
+        if (ctx) {
+            CGContextSetGrayFillColor(ctx, 1.0, 1.0);
+            CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+            CTLineDraw(line, ctx);
+            CGContextFlush(ctx);
+            CGContextRelease(ctx);
+        } else {
+            free(mask);
+            mask = NULL;
+        }
+        CGColorSpaceRelease(cs);
+    }
+    CFRelease(line);
+    CFRelease(font);
+
+    free(e->key);
+    free(e->mask);
+    e->key = strdup(utf8);
+    e->font_size = font_size;
+    e->tw = tw;
+    e->th = th;
+    e->width = measured;
+    e->mask = mask;
+    return e;
+}
+
 static CTLineRef zan_text_line(const char *utf8, CTFontRef font) {
     if (!utf8 || !*utf8 || !font) return NULL;
     CFStringRef text = CFStringCreateWithCString(
@@ -607,76 +685,49 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
     if (!pixels || !utf8 || !*utf8) return;
 
     @autoreleasepool {
-        CTFontRef font = zan_font(font_size);
-        CTLineRef line = zan_text_line(utf8, font);
-        if (!line) {
-            if (font) CFRelease(font);
-            return;
-        }
-        CGFloat ascent = 0, descent = 0, leading = 0;
-        double measured =
-            CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
-        int tw = (int)ceil(measured) + 2;
-        int th = (int)ceil(ascent + descent + leading) + 2;
-        if (tw > 0 && th > 0) {
-            unsigned char *mask =
-                (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-            CGContextRef ctx = CGBitmapContextCreate(
-                mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
-                cs, (CGBitmapInfo)kCGImageAlphaNone);
-            if (ctx) {
-                CGContextSetGrayFillColor(ctx, 1.0, 1.0);
-                CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
-                CTLineDraw(line, ctx);
-                CGContextFlush(ctx);
-                for (int py = 0; py < th; py++) {
-                    int dy = (int)y + py;
-                    if (dy < 0 || dy >= sh) continue;
-                    int sy = py;
-                    for (int px = 0; px < tw; px++) {
-                        int dx = (int)x + px;
-                        if (dx < 0 || dx >= sw) continue;
-                        unsigned int coverage = mask[sy * tw + px];
-                        if (!coverage) continue;
-                        int index = dy * stride + dx;
-                        pixels[index] =
-                            zan_blend(pixels[index], (u32)color, coverage);
-                    }
-                }
-                CGContextRelease(ctx);
+        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, true);
+        if (!e || !e->mask) return;
+        int tw = e->tw, th = e->th;
+        const unsigned char *mask = e->mask;
+        for (int py = 0; py < th; py++) {
+            int dy = (int)y + py;
+            if (dy < 0 || dy >= sh) continue;
+            for (int px = 0; px < tw; px++) {
+                int dx = (int)x + px;
+                if (dx < 0 || dx >= sw) continue;
+                unsigned int coverage = mask[py * tw + px];
+                if (!coverage) continue;
+                int index = dy * stride + dx;
+                pixels[index] = zan_blend(pixels[index], (u32)color, coverage);
             }
-            CGColorSpaceRelease(cs);
-            free(mask);
         }
-        CFRelease(line);
-        CFRelease(font);
     }
 }
 
 EXPORT i64 zan_gui_measure_text(const char *utf8, i64 font_size) {
     if (!utf8 || !*utf8) return 0;
     @autoreleasepool {
-        CTFontRef font = zan_font(font_size);
-        CTLineRef line = zan_text_line(utf8, font);
-        if (!line) {
-            if (font) CFRelease(font);
-            return 0;
-        }
-        double width = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
-        CFRelease(line);
-        CFRelease(font);
-        return (i64)ceil(width);
+        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, false);
+        if (!e) return 0;
+        return (i64)ceil(e->width);
     }
 }
 
 EXPORT i64 zan_gui_font_height(i64 font_size) {
+    /* Font metrics never change per size; memoise so hot layout paths skip
+     * the CTFont create/parse round trip. */
+    enum { MAXSZ = 128 };
+    static i64 cached[MAXSZ];
+    int idx = (font_size > 0 && font_size < MAXSZ) ? (int)font_size : -1;
+    if (idx >= 0 && cached[idx]) return cached[idx];
     CTFontRef font = zan_font(font_size);
     if (!font) return 0;
     CGFloat height = CTFontGetAscent(font) + CTFontGetDescent(font) +
                      CTFontGetLeading(font);
     CFRelease(font);
-    return (i64)ceil(height);
+    i64 r = (i64)ceil(height);
+    if (idx >= 0) cached[idx] = r;
+    return r;
 }
 
 /* ---- geometry ---- */
