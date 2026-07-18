@@ -22,3 +22,7 @@ On Windows, run:
 This downloads the pinned official SDL release, builds `zan_sdl3.dll`, and
 stages the runtime and import libraries under
 `stdlib/SDL3/drivers/win-x64/`. Driver binaries are committed per target.
+
+Image decoding uses the vendored `stb_image.h` v2.30 implementation. It keeps
+PNG/JPEG decoding inside the ABI bridge, so Zan game code can load production
+RGBA assets without adding a second native runtime dependency.
