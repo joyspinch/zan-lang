@@ -4003,7 +4003,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
          * look for a static op_add/op_sub/etc method and call it. */
         {
             zan_type_t *ltype = infer_expr_type(g, expr->binary.left, locals);
-            if (ltype && ltype->kind == TYPE_CLASS && ltype->sym) {
+            /* comparisons against the null literal stay reference compares,
+             * so an op_eq body can null-check without recursing into itself */
+            int null_cmp = expr->binary.left->kind == AST_NULL_LITERAL ||
+                           expr->binary.right->kind == AST_NULL_LITERAL;
+            if (!null_cmp && ltype && ltype->kind == TYPE_CLASS && ltype->sym) {
                 const char *op_name = NULL;
                 switch (expr->binary.op) {
                 case TK_PLUS:       op_name = "op_add"; break;

@@ -85,6 +85,9 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p);
 static zan_ast_node_t *parse_block(zan_parser_t *p);
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p);
 static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers);
+static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
+                             zan_ast_list_t *params, zan_arena_t *arena,
+                             zan_diag_t *diag);
 static zan_ast_node_t *parse_unary(zan_parser_t *p);
 
 /* ---- qualified name: a.b.c ---- */
@@ -2136,6 +2139,19 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
             }
         }
 
+        /* `record Name(T a, ...);` is contextual and lowers to a class */
+        if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
+            memcmp(p->current.str_val.str, "record", 6) == 0 &&
+            zan_lexer_peek(p->lex).kind == TK_IDENT) {
+            parser_advance(p); /* record */
+            parser_expect(p, TK_IDENT);
+            zan_istr_t rname = p->previous.str_val;
+            zan_ast_list_t rparams = parse_param_list(p);
+            parser_expect(p, TK_SEMICOLON);
+            gen_record_class(unit, rname, &rparams, p->arena, p->diag);
+            continue;
+        }
+
         if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
             parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
             zan_ast_node_t *decl = parse_type_decl(p, mods);
@@ -2275,6 +2291,89 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
         ");\n"
         "            i = i + 1;\n"
         "        }\n"
+        "    }\n"
+        "}\n");
+
+    char *gsrc = zan_arena_strdup(arena, src, (size_t)n);
+    zan_lexer_t lex;
+    zan_lexer_init(&lex, gsrc, (size_t)n, 0, arena, diag);
+    zan_parser_t gp;
+    zan_parser_init(&gp, &lex, arena, diag);
+    zan_ast_node_t *gu = zan_parser_parse(&gp);
+    for (int i = 0; i < gu->comp_unit.decls.count; i++)
+        zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[i],
+                          arena);
+}
+
+/* Lower `record Name(T1 A, T2 B);` into a class with public fields, a
+ * positional constructor, field-wise op_eq/op_neq value equality, and a
+ * C#-style ToString. */
+static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
+                             zan_ast_list_t *params, zan_arena_t *arena,
+                             zan_diag_t *diag) {
+    char src[8192];
+    char nm[256];
+    int n = 0;
+    snprintf(nm, sizeof(nm), "%.*s", (int)rname.len, rname.str);
+    n += snprintf(src + n, sizeof(src) - (size_t)n, "class %s {\n", nm);
+    for (int i = 0; i < params->count; i++) {
+        zan_ast_node_t *pp = params->items[i];
+        n += snprintf(src + n, sizeof(src) - (size_t)n, "    public ");
+        n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
+        n += snprintf(src + n, sizeof(src) - (size_t)n, " %.*s;\n",
+                      (int)pp->param.name.len, pp->param.name.str);
+    }
+    n += snprintf(src + n, sizeof(src) - (size_t)n, "    public %s(", nm);
+    for (int i = 0; i < params->count; i++) {
+        zan_ast_node_t *pp = params->items[i];
+        if (i > 0) n += snprintf(src + n, sizeof(src) - (size_t)n, ", ");
+        n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
+        n += snprintf(src + n, sizeof(src) - (size_t)n, " %.*s",
+                      (int)pp->param.name.len, pp->param.name.str);
+    }
+    n += snprintf(src + n, sizeof(src) - (size_t)n, ") {\n");
+    for (int i = 0; i < params->count; i++) {
+        zan_ast_node_t *pp = params->items[i];
+        n += snprintf(src + n, sizeof(src) - (size_t)n,
+                      "        this.%.*s = %.*s;\n",
+                      (int)pp->param.name.len, pp->param.name.str,
+                      (int)pp->param.name.len, pp->param.name.str);
+    }
+    n += snprintf(src + n, sizeof(src) - (size_t)n,
+        "    }\n"
+        "    static bool op_eq(%s l, %s r) {\n"
+        "        if (l == null) { return r == null; }\n"
+        "        if (r == null) { return false; }\n"
+        "        return true", nm, nm);
+    for (int i = 0; i < params->count; i++) {
+        zan_ast_node_t *pp = params->items[i];
+        n += snprintf(src + n, sizeof(src) - (size_t)n,
+                      " && l.%.*s == r.%.*s",
+                      (int)pp->param.name.len, pp->param.name.str,
+                      (int)pp->param.name.len, pp->param.name.str);
+    }
+    n += snprintf(src + n, sizeof(src) - (size_t)n,
+        ";\n"
+        "    }\n"
+        "    static bool op_neq(%s l, %s r) { return !(l == r); }\n"
+        "    public string ToString() {\n"
+        "        return \"%s {\"", nm, nm, nm);
+    for (int i = 0; i < params->count; i++) {
+        zan_ast_node_t *pp = params->items[i];
+        zan_ast_node_t *pt = pp->param.type;
+        int is_str = pt && pt->kind == AST_TYPE_REF && !pt->type_ref.is_array &&
+                     pt->type_ref.name.len == 6 &&
+                     memcmp(pt->type_ref.name.str, "string", 6) == 0;
+        n += snprintf(src + n, sizeof(src) - (size_t)n,
+                      " + \"%s %.*s = \" + %s%.*s%s",
+                      i > 0 ? "," : "",
+                      (int)pp->param.name.len, pp->param.name.str,
+                      is_str ? "" : "Convert.ToString(",
+                      (int)pp->param.name.len, pp->param.name.str,
+                      is_str ? "" : ")");
+    }
+    n += snprintf(src + n, sizeof(src) - (size_t)n,
+        " + \" }\";\n"
         "    }\n"
         "}\n");
 
