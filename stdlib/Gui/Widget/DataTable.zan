@@ -176,6 +176,7 @@ class DataTableState {
     List<ColFilter> filters;
     int openMenu;
     int scrollRow;
+    int scrollX;               // horizontal pixel offset into the data columns
     int resizeCol;
     int resizeStartX;
     int resizeStartW;
@@ -256,6 +257,7 @@ class DataTableState {
         s.filters = new List<ColFilter>();
         s.openMenu = -1;
         s.scrollRow = 0;
+        s.scrollX = 0;
         s.resizeCol = -1;
         s.resizeStartX = 0;
         s.resizeStartW = 0;
@@ -1037,26 +1039,24 @@ class DataTable {
         while (ci < st.colWidths.Count) { dataW = dataW + st.colWidths[ci]; ci = ci + 1; }
         int totalW = numW + selW + dataW;
 
-        // Fit-to-width: when the columns' natural total exceeds the available
-        // band, shrink every column proportionally so the whole grid always
-        // stays inside [x, clipRight] — no column or cell ever spills past the
-        // table's own border. Manual resize edits the *base* widths; the
-        // displayed widths are re-derived from them each frame.
+        // Columns keep their natural widths; when the total exceeds the
+        // available band the data region pans horizontally (st.scrollX) and
+        // only the visible column window is drawn — so wide tables scroll
+        // instead of squeezing every column into the viewport.
         int availData = clipRight - (x + numW + selW);
         if (availData < app.Scale(80)) { availData = app.Scale(80); }
         st.dispW.Clear();
         int di = 0;
-        if (dataW > availData && dataW > 0) {
-            while (di < st.colWidths.Count) {
-                st.dispW.Add(st.colWidths[di] * availData / dataW);
-                di = di + 1;
-            }
-        } else {
-            while (di < st.colWidths.Count) {
-                st.dispW.Add(st.colWidths[di]);
-                di = di + 1;
-            }
+        while (di < st.colWidths.Count) {
+            st.dispW.Add(st.colWidths[di]);
+            di = di + 1;
         }
+        int maxScrollX = dataW - availData;
+        if (maxScrollX < 0) { maxScrollX = 0; }
+        if (st.scrollX > maxScrollX) { st.scrollX = maxScrollX; }
+        if (st.scrollX < 0) { st.scrollX = 0; }
+        int firstDataX = x + numW + selW;
+        int dataViewW = clipRight - firstDataX;
 
         // outer border
         c.FillRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, t.bgPrimary);
@@ -1102,20 +1102,29 @@ class DataTable {
             c.FillRect(hx, y, 1, headerH, gridColor);
         }
 
+        c.PushClip(firstDataX, y, dataViewW, headerH);
         int i = 0;
-        while (i < cols.Count) {
+        int hcl = firstDataX - st.scrollX;
+        while (i < cols.Count && hcl < clipRight) {
             DataColumn col = cols[i];
             int cw = st.dispW[i];
-            int drawW = cw;
-            if (hx + drawW > clipRight) { drawW = clipRight - hx; }
-            if (drawW < app.Scale(8)) { break; }
-            bool lastCol = drawW < cw;
+            if (hcl + cw <= firstDataX) {
+                hcl = hcl + cw;
+                i = i + 1;
+            } else {
+            hx = hcl;
+            // visible slice of this column (for hit regions / hover fill)
+            int visX = hx;
+            if (visX < firstDataX) { visX = firstDataX; }
+            int visR = hx + cw;
+            if (visR > clipRight) { visR = clipRight; }
+            int visW = visR - visX;
             int titleId = app.focus.AllocId();
             bool hHover = app.focus.IsHovered(titleId);
-            if (hHover) { c.FillRect(hx, y, drawW, headerH, t.bgHover); }
+            if (hHover) { c.FillRect(visX, y, visW, headerH, t.bgHover); }
 
             int pad = t.paddingSmall;
-            int availTitle = drawW - pad * 2 - menuIconW;
+            int availTitle = cw - pad * 2 - menuIconW;
             string ht = DataTable.Truncate(col.title, fs, availTitle);
             int ty = y + (headerH - Canvas.FontHeight(fs)) / 2;
             c.DrawText(hx + pad, ty, ht, t.textSecondary, fs);
@@ -1135,9 +1144,9 @@ class DataTable {
             // stay stable across frames regardless of the icon's visibility.
             if (col.filterable || col.sortable) {
                 int menuId = app.focus.AllocId();
-                int mIx = hx + drawW - menuIconW - app.Scale(2);
+                int mIx = hx + cw - menuIconW - app.Scale(2);
                 bool active = st.filters[i].Active();
-                bool cellHover = app.mouseX >= hx && app.mouseX < hx + drawW
+                bool cellHover = app.mouseX >= visX && app.mouseX < visR
                                  && app.mouseY >= y && app.mouseY < y + headerH;
                 bool showIcon = active || cellHover || st.openMenu == i;
                 if (showIcon) {
@@ -1166,7 +1175,9 @@ class DataTable {
             }
 
             // title click => cycle sort
-            app.hitTester.Register(HitRegion.Create(titleId, hx, y, drawW - menuIconW, headerH, 0));
+            int titleW = visW - menuIconW;
+            if (titleW < 0) { titleW = 0; }
+            app.hitTester.Register(HitRegion.Create(titleId, visX, y, titleW, headerH, 0));
             if (col.sortable && app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.ClickTarget() == titleId) {
                 st.hitCol = i;
                 st.HeaderClick.Raise();
@@ -1181,7 +1192,7 @@ class DataTable {
             // resize handle (right border)
             int rzId = app.focus.AllocId();
             int rzW = app.Scale(6);
-            int rzX = hx + drawW - rzW / 2;
+            int rzX = hx + cw - rzW / 2;
             app.hitTester.Register(HitRegion.Create(rzId, rzX, y, rzW, headerH, 0));
             if (app.window.EventKind() == 2 && app.window.EventButton() == 0 && app.PressTarget() == rzId) {
                 st.resizeCol = i;
@@ -1199,11 +1210,12 @@ class DataTable {
                 }
             }
 
-            hx = hx + drawW;
-            c.FillRect(hx, y, 1, headerH, gridColor);
-            if (lastCol) { break; }
+            c.FillRect(hx + cw, y, 1, headerH, gridColor);
+            hcl = hcl + cw;
             i = i + 1;
+            }
         }
+        c.PopClip();
         c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
 
         // ---------------- body (virtualised) ----------------
@@ -1302,23 +1314,24 @@ class DataTable {
                 cx2 = cx2 + selW;
             }
 
+            c.PushClip(firstDataX, ry, dataViewW, rowH);
             int cc = 0;
-            while (cc < cols.Count) {
+            int ccl = firstDataX - st.scrollX;
+            while (cc < cols.Count && ccl < clipRight) {
                 int cw = st.dispW[cc];
-                int cdrawW = cw;
-                if (cx2 + cdrawW > clipRight) { cdrawW = clipRight - cx2; }
-                if (cdrawW < app.Scale(8)) { break; }
-                if (rowInRange && cc >= rgC0 && cc <= rgC1) {
-                    c.FillRect(cx2, ry, cdrawW, rowH, t.bgActive);
+                if (ccl + cw > firstDataX) {
+                    if (rowInRange && cc >= rgC0 && cc <= rgC1) {
+                        c.FillRect(ccl, ry, cw, rowH, t.bgActive);
+                    }
+                    int cfLo = 0;
+                    int cfHi = 0;
+                    if (cc < st.cfMin.Count) { cfLo = st.cfMin[cc]; cfHi = st.cfMax[cc]; }
+                    DataTable.DrawCell(app, cols[cc], row.At(cc), ccl, ry, cw, rowH, cfLo, cfHi);
                 }
-                int cfLo = 0;
-                int cfHi = 0;
-                if (cc < st.cfMin.Count) { cfLo = st.cfMin[cc]; cfHi = st.cfMax[cc]; }
-                DataTable.DrawCell(app, cols[cc], row.At(cc), cx2, ry, cdrawW, rowH, cfLo, cfHi);
-                cx2 = cx2 + cdrawW;
-                if (cdrawW < cw) { break; }
+                ccl = ccl + cw;
                 cc = cc + 1;
             }
+            c.PopClip();
 
             c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
             r = r + 1;
@@ -1338,7 +1351,6 @@ class DataTable {
         // ---------------- body pointer interaction ----------------
         // Map the pointer to an order-position row and a data column purely from
         // geometry (works for range-extend / reorder even outside hit regions).
-        int firstDataX = x + numW + selW;
         int ptrOi = -1;
         if (app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH && app.mouseX >= x && app.mouseX < clipRight) {
             int rr2 = (app.mouseY - bodyTop) / rowH;
@@ -1346,7 +1358,7 @@ class DataTable {
         }
         int ptrCol = -1;
         if (ptrOi >= 0 && app.mouseX >= firstDataX) {
-            int colL = firstDataX;
+            int colL = firstDataX - st.scrollX;
             int cci = 0;
             while (cci < cols.Count) {
                 int cwv = st.dispW[cci];
@@ -1482,28 +1494,29 @@ class DataTable {
             if (st.showRowNum || st.showSelect) {
                 c.DrawTextCentered(x, sumY, numW + selW, summaryH, "Σ", t.textTertiary, t.fontSizeSmall);
             }
+            c.PushClip(firstDataX, sumY, dataViewW, summaryH);
             int sc = 0;
-            while (sc < cols.Count) {
+            sx = firstDataX - st.scrollX;
+            while (sc < cols.Count && sx < clipRight) {
                 int cw = st.dispW[sc];
-                int cdrawW = cw;
-                if (sx + cdrawW > clipRight) { cdrawW = clipRight - sx; }
-                if (cdrawW < app.Scale(8)) { break; }
-                string stxt = "";
-                if (sc < st.summaryText.Count) { stxt = st.summaryText[sc]; }
-                if (stxt.Length > 0) {
-                    int pad = t.paddingSmall;
-                    string shown = DataTable.Truncate(stxt, fs, cdrawW - pad * 2);
-                    int tw = Canvas.MeasureText(shown, fs);
-                    int tx = sx + pad;
-                    if (cols[sc].align == 2) { tx = sx + cdrawW - pad - tw; }
-                    else if (cols[sc].align == 1) { tx = sx + (cdrawW - tw) / 2; }
-                    int ty = sumY + (summaryH - Canvas.FontHeight(fs)) / 2;
-                    c.DrawText(tx, ty, shown, t.textPrimary, fs);
+                if (sx + cw > firstDataX) {
+                    string stxt = "";
+                    if (sc < st.summaryText.Count) { stxt = st.summaryText[sc]; }
+                    if (stxt.Length > 0) {
+                        int pad = t.paddingSmall;
+                        string shown = DataTable.Truncate(stxt, fs, cw - pad * 2);
+                        int tw = Canvas.MeasureText(shown, fs);
+                        int tx = sx + pad;
+                        if (cols[sc].align == 2) { tx = sx + cw - pad - tw; }
+                        else if (cols[sc].align == 1) { tx = sx + (cw - tw) / 2; }
+                        int ty = sumY + (summaryH - Canvas.FontHeight(fs)) / 2;
+                        c.DrawText(tx, ty, shown, t.textPrimary, fs);
+                    }
                 }
-                sx = sx + cdrawW;
-                if (cdrawW < cw) { break; }
+                sx = sx + cw;
                 sc = sc + 1;
             }
+            c.PopClip();
         }
 
         // ---------------- pager footer (reuses the Pagination widget) ----------------
@@ -1558,6 +1571,32 @@ class DataTable {
             }
         }
 
+        // ---------------- horizontal scrollbar ----------------
+        if (maxScrollX > 0) {
+            int hbH = app.Scale(8);
+            int hbY = bodyTop + bodyH - hbH - app.Scale(2);
+            int htrackX = firstDataX + app.Scale(2);
+            int htrackW = dataViewW - app.Scale(4);
+            int thumbW = htrackW * availData / dataW;
+            if (thumbW < app.Scale(24)) { thumbW = app.Scale(24); }
+            int thumbX = htrackX + (htrackW - thumbW) * st.scrollX / maxScrollX;
+            int hbId = app.focus.AllocId();
+            bool hbHover = app.focus.IsHovered(hbId);
+            int hbColor = t.scrollbar;
+            if (hbHover || app.focus.pressedId == hbId) { hbColor = t.scrollbarHover; }
+            c.FillRoundRect(thumbX, hbY, thumbW, hbH, hbH / 2, hbColor);
+            app.hitTester.Register(HitRegion.Create(hbId, htrackX, hbY, htrackW, hbH, 0));
+            if (app.focus.pressedId == hbId) {
+                int rel = app.mouseX - htrackX - thumbW / 2;
+                int denom = htrackW - thumbW;
+                if (denom < 1) { denom = 1; }
+                int ns = rel * maxScrollX / denom;
+                if (ns < 0) { ns = 0; }
+                if (ns > maxScrollX) { ns = maxScrollX; }
+                if (ns != st.scrollX) { st.scrollX = ns; app.RequestRedraw(); }
+            }
+        }
+
         // ---------------- mouse-wheel scrolls the table body ----------------
         // Claim the wheel while the pointer is over the body so the surrounding
         // page doesn't scroll instead, then advance the virtual row window.
@@ -1565,7 +1604,17 @@ class DataTable {
         if (visRows > 0) {
             ownsBodyWheel = app.CaptureWheel(x, bodyTop, viewW, bodyH);
         }
-        if (st.openMenu < 0 && ownsBodyWheel) {
+        if (st.openMenu < 0 && ownsBodyWheel
+            && maxScrollX > 0 && (app.window.EventMods() & 2) != 0) {
+            // Shift+wheel pans the columns horizontally.
+            int hDelta = app.window.EventKeyCode();
+            int hStep = hDelta / 120;
+            if (hStep == 0) { if (hDelta > 0) { hStep = 1; } else if (hDelta < 0) { hStep = 0 - 1; } }
+            int nsx = st.scrollX - hStep * app.Scale(48);
+            if (nsx < 0) { nsx = 0; }
+            if (nsx > maxScrollX) { nsx = maxScrollX; }
+            if (nsx != st.scrollX) { st.scrollX = nsx; app.RequestRedraw(); }
+        } else if (st.openMenu < 0 && ownsBodyWheel) {
             if (total > visRows) {
                 int delta = app.window.EventKeyCode();
                 int step = delta / 120;
@@ -1807,7 +1856,7 @@ class DataTable {
         int menuH = app.Scale(348);
 
         // anchor under the column, clamp fully inside the window
-        int mx = x + numW + selW;
+        int mx = x + numW + selW - st.scrollX;
         int k = 0;
         while (k < mi) { mx = mx + st.dispW[k]; k = k + 1; }
         if (mx + menuW > x + viewW) { mx = x + viewW - menuW; }

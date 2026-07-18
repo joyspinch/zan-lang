@@ -261,6 +261,10 @@ class Gallery {
     // Retained state for the deferred-overlay / interactive demos.
     static string copiedIcon;
     static DataTableState demoTableState;
+    static DataTableState bigTableState;    // 1M-row demo (built on first visit)
+    static List<DataColumn> bigCols;
+    static List<DataRow> bigRows;
+    static int bigBuildMs;
     // Retained state for the unified Layer demo: draggable windows, the modal
     // alert/confirm/prompt dialogs, plus the loading / tips / photos toggles.
     static List<LayerState> demoLayers;
@@ -417,6 +421,10 @@ class Gallery {
         Gallery.pendingPicker = "";
         Gallery.copiedIcon = "";
         Gallery.demoTableState = DataTableState.Create();
+        Gallery.bigTableState = DataTableState.Create();
+        Gallery.bigCols = null;
+        Gallery.bigRows = null;
+        Gallery.bigBuildMs = 0;
         Gallery.demoLayers = new List<LayerState>();
         Gallery.layerSeq = 0;
         Gallery.dlgAlert = LayerState.Alert("Notice", "Your changes have been saved.", 1);
@@ -1551,6 +1559,7 @@ class Gallery {
         if (name == "VirtualList") { return 210; }
         if (name == "ClickEvent") { return 120; }
         if (name == "DataTable") { return 200; }
+        if (name == "DataTable 1M") { return 430; }
         if (name == "PivotTable") { return 200; }
         if (name == "Chart") { return 210; }
         if (name == "Alert") { return 360; }
@@ -2666,6 +2675,7 @@ class Gallery {
         if (name == "Dropdown") { return true; }
         if (name == "Popover") { return true; }
         if (name == "DataTable") { return true; }
+        if (name == "DataTable 1M") { return true; }
         if (name == "Layer") { return true; }
         if (name == "Designer") { return true; }
         return false;
@@ -2710,6 +2720,59 @@ class Gallery {
             row2.Push("Lang"); row2.Push("87"); rows.Add(row2);
             DataTable.Render(app, px, py - app.Scale(20), w - app.Scale(36),
                 app.Scale(110), cols, rows, Gallery.demoTableState);
+        } else if (name == "DataTable 1M") {
+            // Big-data demo: 1,000,000 rows x 70 columns, built once on first
+            // visit. Rows are virtualised (only the visible window is drawn)
+            // and columns pan via the horizontal scrollbar / Shift+wheel, so
+            // the per-frame cost is independent of the data size.
+            if (Gallery.bigRows == null) {
+                int bt0 = Window.GetTickMs();
+                Gallery.bigCols = new List<DataColumn>();
+                int bci = 0;
+                while (bci < 70) {
+                    string bt = Gallery.T("Col ", "列 ")
+                        + Convert.ToString(bci + 1);
+                    if (bci == 0) {
+                        Gallery.bigCols.Add(DataColumn.Text(bt, app.Scale(96)));
+                    } else {
+                        Gallery.bigCols.Add(DataColumn.Numeric(bt, app.Scale(96)));
+                    }
+                    bci = bci + 1;
+                }
+                List<string> bpool = new List<string>();
+                int bpi = 0;
+                while (bpi < 97) {
+                    bpool.Add(Convert.ToString(bpi * 37 % 1000));
+                    bpi = bpi + 1;
+                }
+                Gallery.bigRows = new List<DataRow>();
+                int bri = 0;
+                // Cells reference a small shared string pool: formatting one
+                // million per-row strings here would be slow (and each native
+                // format call costs stack), while a real app would load or
+                // format its data outside the render loop anyway. The built-in
+                // row-number column supplies the 1..1,000,000 numbering.
+                while (bri < 1000000) {
+                    DataRow br = DataRow.Create();
+                    int bcj = 0;
+                    while (bcj < 70) {
+                        br.Push(bpool[(bri + bcj * 13) % 97]);
+                        bcj = bcj + 1;
+                    }
+                    Gallery.bigRows.Add(br);
+                    bri = bri + 1;
+                }
+                Gallery.bigBuildMs = Window.GetTickMs() - bt0;
+            }
+            Label.Secondary(app, px, py - app.Scale(24),
+                Gallery.T("1,000,000 rows x 70 cols · built in ",
+                    "1,000,000 行 x 70 列 · 构建耗时 ")
+                + Convert.ToString(Gallery.bigBuildMs)
+                + Gallery.T(" ms · wheel scrolls rows, Shift+wheel / bottom bar pans columns",
+                    " ms · 滚轮翻行，Shift+滚轮/底部滑条横向移动"));
+            DataTable.Render(app, px, py, w - app.Scale(36),
+                app.Scale(360), Gallery.bigCols, Gallery.bigRows,
+                Gallery.bigTableState);
         } else if (name == "Compose") {
             // Fluent retained-mode composition: a titled card holding a column
             // of a label, a progress bar and a row of buttons — all nested with
@@ -3249,6 +3312,13 @@ class Gallery {
             .AddProp("rows", "List<DataRow>", "-", "Row data (Push per cell).")
             .AddProp("state", "DataTableState", "-", "Sort/filter state (retained).")
             .AddEvent("sort / filter", "via state", "Header clicks mutate state and re-order rows.");
+        Gallery.Add(list, "Data Display", "DataTable 1M",
+            Gallery.T("The same DataTable under 1,000,000 rows x 70 columns: virtualised rows plus a horizontally scrolling column window keep every frame constant-cost.",
+                "同一个 DataTable 承载 100 万行 x 70 列：行虚拟化 + 列横向滚动窗口，每帧开销恒定，与数据量无关。"),
+            "// 1M rows render at constant cost: only the visible ~20 rows x ~12\n// columns are drawn each frame. Wheel scrolls rows; Shift+wheel or the\n// bottom scrollbar pans columns horizontally.\nList<DataRow> rows = new List<DataRow>();\nint i = 0;\nwhile (i < 1000000) {\n    DataRow r = DataRow.Create();\n    // ... push 70 cells ...\n    rows.Add(r);\n    i = i + 1;\n}\nDataTable.Render(app, x, y, w, h, cols, rows, state);")
+            .AddProp("rows", "List<DataRow>", "-", "1,000,000 rows; only the visible window is drawn.")
+            .AddProp("cols", "List<DataColumn>", "-", "70 columns; pans via scrollX (Shift+wheel / bar).")
+            .AddEvent("scroll", "state.scrollRow / scrollX", "Virtual row + horizontal column window.");
         Gallery.Add(list, "Data Display", "PivotTable",
             Gallery.T("Summarize rows by configured row, column and value fields.",
                 "按配置的行、列与值字段对数据进行汇总透视。"),
