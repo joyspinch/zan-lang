@@ -154,6 +154,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "ulong",  5)) base = b->type_ulong;
     else if (istr_eq(name, "float",  5)) base = b->type_float;
     else if (istr_eq(name, "double", 6)) base = b->type_double;
+    /* decimal: mapped to double (no 128-bit decimal representation yet) */
+    else if (istr_eq(name, "decimal", 7)) base = b->type_double;
     else if (istr_eq(name, "char",   4)) base = b->type_char;
     else if (istr_eq(name, "string", 6)) base = b->type_string;
     else if (istr_eq(name, "object", 6)) base = b->type_object;
