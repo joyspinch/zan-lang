@@ -162,6 +162,12 @@ class Demo {
     List<string> cacheSegText;
     List<int> cacheSegColor;
     List<int> cacheSegPerLine;
+    // Real source-line number for each (possibly wrapped) display line, or 0 for
+    // a soft-wrap continuation row so the gutter only numbers real lines.
+    List<int> cacheLineNo;
+    // Gutter width chosen in EnsureCache (from the source line count) so the
+    // wrap width and the render pass agree on where text starts.
+    int cacheGutterW;
 
     static Demo Create(string title, string desc, string previewId,
             int previewH, string code, string json) {
@@ -196,25 +202,92 @@ class Demo {
             else { src = "// This demo has no JSON config version yet."; }
         }
         cacheSrc = src;
-        cacheCodeLines = CodeEditor.SplitLines(src);
+        List<string> srcLines = CodeEditor.SplitLines(src);
+        cacheCodeLines = new List<string>();
         cacheSegText = new List<string>();
         cacheSegColor = new List<int>();
         cacheSegPerLine = new List<int>();
+        cacheLineNo = new List<int>();
+
+        int gnW = Canvas.MeasureText(Convert.ToString(srcLines.Count), fs);
+        cacheGutterW = gnW + app.Scale(20);
+        // Width available for code text; wrap long lines to fit instead of
+        // letting them run past the panel edge. Small margin avoids overshoot
+        // from per-glyph vs whole-run measurement rounding.
+        int maxTextW = cw - cacheGutterW - app.Scale(8) - app.Scale(10);
+        if (maxTextW < app.Scale(80)) { maxTextW = app.Scale(80); }
+
         int ci = 0;
-        while (ci < cacheCodeLines.Count) {
+        while (ci < srcLines.Count) {
             List<string> segT = new List<string>();
             List<int> segC = new List<int>();
-            CodeEditor.HighlightSpans(cacheCodeLines[ci], t.info, t.success,
+            CodeEditor.HighlightSpans(srcLines[ci], t.info, t.success,
                 t.warning, t.textTertiary, t.primary, t.textPrimary, segT, segC);
-            int si = 0;
-            while (si < segT.Count) {
-                cacheSegText.Add(segT[si]);
-                cacheSegColor.Add(segC[si]);
-                si = si + 1;
-            }
-            cacheSegPerLine.Add(segT.Count);
+            WrapCode(fs, maxTextW, ci + 1, segT, segC);
             ci = ci + 1;
         }
+    }
+
+    /// Emits one source line as one or more display rows that each fit within
+    /// maxW. The first row carries the real line number; wrapped continuation
+    /// rows carry 0. Highlight segments are split at the wrap point, preserving
+    /// colour. Appends to the cache* lists in place.
+    void WrapCode(int fs, int maxW, int lineNo,
+            List<string> segT, List<int> segC) {
+        string curText = "";
+        List<string> curSegT = new List<string>();
+        List<int> curSegC = new List<int>();
+        int curW = 0;
+        bool first = true;
+
+        int gi = 0;
+        while (gi < segT.Count) {
+            string s = segT[gi];
+            int col = segC[gi];
+            int p = 0;
+            int slen = s.Length;
+            while (p < slen) {
+                int start = p;
+                while (p < slen) {
+                    int chW = Canvas.MeasureText(s.Substring(p, 1), fs);
+                    if (curW + chW > maxW && curW > 0) { break; }
+                    curW = curW + chW;
+                    p = p + 1;
+                }
+                if (p > start) {
+                    string piece = s.Substring(start, p - start);
+                    curSegT.Add(piece);
+                    curSegC.Add(col);
+                    curText = curText + piece;
+                }
+                if (p < slen) {
+                    // Line is full: flush this display row and start a new one.
+                    Demo.FlushRow(this, curText, curSegT, curSegC, first, lineNo);
+                    first = false;
+                    curText = "";
+                    curSegT = new List<string>();
+                    curSegC = new List<int>();
+                    curW = 0;
+                }
+            }
+            gi = gi + 1;
+        }
+        // Always emit the final (or only, possibly empty) row.
+        Demo.FlushRow(this, curText, curSegT, curSegC, first, lineNo);
+    }
+
+    static void FlushRow(Demo d, string text, List<string> segT,
+            List<int> segC, bool first, int lineNo) {
+        d.cacheCodeLines.Add(text);
+        int k = 0;
+        while (k < segT.Count) {
+            d.cacheSegText.Add(segT[k]);
+            d.cacheSegColor.Add(segC[k]);
+            k = k + 1;
+        }
+        d.cacheSegPerLine.Add(segT.Count);
+        if (first) { d.cacheLineNo.Add(lineNo); }
+        else { d.cacheLineNo.Add(0); }
     }
 
 }
@@ -1359,8 +1432,7 @@ class Gallery {
         c.DrawRect(cx, cy, cw, panelH, t.borderPrimary, 1);
         c.FillRect(cx, cy + hdrH, cw, 1, t.divider);
 
-        int gnW = Canvas.MeasureText(Convert.ToString(codeLines.Count), fs);
-        int gutterW = gnW + app.Scale(20);
+        int gutterW = d.cacheGutterW;
         int textX = cx + gutterW + app.Scale(8);
         int codeY0 = cy + hdrH + app.Scale(8);
         c.FillRect(cx + 1, cy + hdrH + 1, gutterW, panelH - hdrH - 2, t.bgTertiary);
@@ -1470,8 +1542,13 @@ class Gallery {
                 c.FillRect(hx0, codeY - app.Scale(1), hx1 - hx0,
                     codeLineH, 0x553B82F6);
             }
-            c.DrawText(cx + gutterW - gnW - app.Scale(6), codeY,
-                Convert.ToString(ci + 1), t.textTertiary, fs);
+            int lno = d.cacheLineNo[ci];
+            if (lno > 0) {
+                string lnoS = Convert.ToString(lno);
+                int lnoW = Canvas.MeasureText(lnoS, fs);
+                c.DrawText(cx + gutterW - lnoW - app.Scale(6), codeY,
+                    lnoS, t.textTertiary, fs);
+            }
             // Cached highlight spans for this line: [segBase, segBase+n).
             int n = d.cacheSegPerLine[ci];
             int sx = textX;
