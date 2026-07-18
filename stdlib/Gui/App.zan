@@ -158,12 +158,14 @@ class App {
     // wallpaper snapshot and re-arms a throttled animation frame.
     bool fxEnabled;
 
-    // Wall-clock deadline pacing how often glass surfaces re-blur while an
-    // animated backdrop runs. Re-blurring every effect tick is the dominant
-    // animation cost on large windows, so glass refreshes at ~5fps and the
-    // cheap particle layer keeps the higher effect cadence in between.
-    int fxBlurNextMs;
-    bool fxBlurFrame;
+    // Animated-backdrop fast path. The effect layer is composited on top of
+    // the finished frame in PresentFrame, which also snapshots the frame
+    // *without* the effect (slot 7). A pure effect tick then costs one
+    // full-frame restore + a few dozen small fills + present -- no widget
+    // re-render, no glass re-blur. fxNextMs is the next tick deadline (-1 =
+    // none); fxSnapValid says slot 7 holds the current frame.
+    int fxNextMs;
+    bool fxSnapValid;
 
     static App Create(string title, int width, int height) {
         App app = new App();
@@ -233,8 +235,8 @@ class App {
         app.lastPresentMs = 0;
         app.animNextMs = -1;
         app.fxEnabled = true;
-        app.fxBlurNextMs = 0;
-        app.fxBlurFrame = false;
+        app.fxNextMs = -1;
+        app.fxSnapValid = false;
         app.backdropDirty = true;
         app.blurSlotSeq = 0;
         // gen != snapGen so the wallpaper is painted (and snapshotted) once up
@@ -441,12 +443,6 @@ class App {
         } else {
             c.FillRect(x, y, w, h, t.bgPrimary);
         }
-        // Signature skin motion: painted over the cached static wallpaper so
-        // animation ticks cost one snapshot copy + a few dozen small fills.
-        if (this.FxActive()) {
-            BackdropFx.Render(c, t.fx, x, y, w, h, Window.GetTickMs(), t, dpiScale);
-            this.RequestAnimationFrame(BackdropFx.IntervalMs(t.fx));
-        }
     }
 
     /// True when the active skin's animated backdrop effect is running.
@@ -457,7 +453,28 @@ class App {
     /// Enables/disables the animated backdrop effect for this window's skins.
     void SetBackdropFx(bool on) {
         fxEnabled = on;
+        fxSnapValid = false;
+        if (!on) { fxNextMs = -1; }
         needsRedraw = true;
+    }
+
+    /// Pure effect tick: restores the snapshot of the last fully rendered
+    /// frame, re-composites the skin effect on top and presents. Returns false
+    /// (caller falls back to a full render) when no valid snapshot exists,
+    /// e.g. after a resize.
+    bool FxPresent() {
+        if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
+        Canvas fc = canvas;
+        if (!fc.RestoreRect(0, 0, fc.Width(), fc.Height(), 7)) {
+            fxSnapValid = false;
+            return false;
+        }
+        BackdropFx.Render(fc, theme.fx, 0, 0, fc.Width(), fc.Height(),
+                          Window.GetTickMs(), theme, dpiScale);
+        window.Present(canvas);
+        lastPresentMs = Window.GetTickMs();
+        fxNextMs = lastPresentMs + BackdropFx.IntervalMs(theme.fx);
+        return true;
     }
 
     int ChromeButtonCount() {
@@ -756,7 +773,6 @@ class App {
     /// animation tick over an unchanged backdrop. Glass surfaces pass this to
     /// Canvas.BlurRectCached so spinners/toasts reuse the cached blur.
     bool BackdropDirty() {
-        if (this.FxActive() && fxBlurFrame) { return true; }
         return backdropDirty;
     }
 
@@ -1027,21 +1043,32 @@ class App {
             int since = Window.GetTickMs() - lastPresentMs;
             if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
             result = window.PollEvent();
-        } else if (animNextMs >= 0) {
-            // A throttled animation (e.g. a loading spinner) wants its next
-            // frame at animNextMs. Sleep (idle) until then instead of busy-
-            // rendering the whole page at 60fps, but poll in short slices so
-            // OS input still wakes the loop promptly. When the deadline is
-            // reached, flag a repaint and fall through with no pending event.
+        } else if (animNextMs >= 0 || fxNextMs >= 0) {
+            // A throttled animation (spinner at animNextMs) and/or the skin
+            // effect layer (fxNextMs) wants a future frame. Sleep (idle) until
+            // the earliest deadline instead of busy-rendering at 60fps, but
+            // poll in short slices so OS input still wakes the loop promptly.
+            // An effect-only deadline is served by FxPresent (single restore +
+            // re-composite, no page render); everything else flags a repaint.
             result = 1;
             bool waiting = true;
             while (waiting) {
                 int now = Window.GetTickMs();
-                if (now >= animNextMs) {
-                    needsRedraw = true;
-                    waiting = false;
+                int deadline = animNextMs;
+                if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
+                    deadline = fxNextMs;
+                }
+                if (deadline < 0) { waiting = false; }
+                else if (now >= deadline) {
+                    bool fxOnly = animNextMs < 0 || now < animNextMs;
+                    if (fxOnly && this.FxPresent()) {
+                        // Presented in place; keep sleeping to the next tick.
+                    } else {
+                        needsRedraw = true;
+                        waiting = false;
+                    }
                 } else {
-                    int remain = animNextMs - now;
+                    int remain = deadline - now;
                     if (remain > 15) { remain = 15; }
                     Window.SleepMs(remain);
                     result = window.PollEvent();
@@ -1353,6 +1380,19 @@ class App {
         // Draw + dispatch popups last so they sit above all content and own the
         // top-most hit regions (framework-owned overlay/z-order layer).
         RunOverlays();
+        // Signature skin motion: snapshot the finished frame (slot 7), then
+        // composite the effect layer on top. Later pure effect ticks restore
+        // the snapshot and re-composite (FxPresent) without re-rendering.
+        if (this.FxActive()) {
+            Canvas fc = canvas;
+            fc.SnapshotRect(0, 0, fc.Width(), fc.Height(), 7);
+            fxSnapValid = true;
+            BackdropFx.Render(fc, theme.fx, 0, 0, fc.Width(), fc.Height(),
+                              Window.GetTickMs(), theme, dpiScale);
+            fxNextMs = Window.GetTickMs() + BackdropFx.IntervalMs(theme.fx);
+        } else {
+            fxNextMs = -1;
+        }
         window.Present(canvas);
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
@@ -1376,12 +1416,8 @@ class App {
         // Clear any throttled-animation deadline too; still-live animations
         // (spinners etc.) re-arm it via RequestAnimationFrame during render.
         animNextMs = -1;
-        // Pace glass re-blur under animated backdrops (see fxBlurNextMs).
-        fxBlurFrame = false;
-        if (this.FxActive() && nowMs >= fxBlurNextMs) {
-            fxBlurFrame = true;
-            fxBlurNextMs = nowMs + 200;
-        }
+        // The frame is being re-rendered, so the slot-7 fx snapshot is stale.
+        fxSnapValid = false;
         // Hand glass surfaces stable blur-cache slots again from the top.
         blurSlotSeq = 0;
         wheelOwnerOrder = wheelCapOrder;
