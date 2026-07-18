@@ -188,6 +188,19 @@ class Chart {
     // title/legend band so callers can lay out the plot area beneath it.
     static int DrawPanel(App app, int x, int y, int w, int h, string title,
                          List<ChartSeries> series) {
+        return Chart.DrawPanelI(app, x, y, w, h, title, series, 0);
+    }
+
+    // Legend hidden-state key for series `si` of interaction id `wid`.
+    static int LegendKey(int wid, int si) { return 6000000 + wid * 64 + si; }
+
+    // Panel + interactive legend. When wid != 0 each swatch is a hit region:
+    // clicking toggles that series' visibility (persisted in the App state map
+    // keyed by wid), and the resolved hidden flag is written back onto the
+    // series so every downstream renderer skips it. A hidden series is drawn
+    // dimmed with a strike so it can be brought back.
+    static int DrawPanelI(App app, int x, int y, int w, int h, string title,
+                          List<ChartSeries> series, int wid) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
@@ -206,13 +219,44 @@ class Chart {
         int lgY = y + pad;
         int si = series.Count - 1;
         while (si >= 0) {
+            // Resolve persisted visibility first so both the legend and the
+            // plot agree this frame.
+            bool hid = series[si].hidden;
+            if (wid != 0) {
+                hid = app.StateGet(Chart.LegendKey(wid, si), 0) == 1;
+            }
+
             string nm = series[si].name;
             int tw = Canvas.MeasureText(nm, t.fontSizeSmall);
-            lx = lx - tw;
-            c.DrawText(lx, lgY + app.Scale(2), nm, t.textSecondary, t.fontSizeSmall);
-            lx = lx - app.Scale(6) - sw;
-            c.FillRoundRect(lx, lgY + app.Scale(3), sw, sw, t.borderRadiusSmall, series[si].color);
-            lx = lx - app.Scale(14);
+            int rowLeft = lx - tw - app.Scale(6) - sw;
+            int swatchX = lx - tw - app.Scale(6) - sw;
+
+            int txtCol = t.textSecondary;
+            int swCol = series[si].color;
+            if (hid) { txtCol = t.textTertiary; swCol = t.borderPrimary; }
+
+            c.DrawText(lx - tw, lgY + app.Scale(2), nm, txtCol, t.fontSizeSmall);
+            c.FillRoundRect(swatchX, lgY + app.Scale(3), sw, sw, t.borderRadiusSmall, swCol);
+            if (hid) {
+                int my = lgY + app.Scale(2) + Canvas.FontHeight(t.fontSizeSmall) / 2;
+                c.FillRect(lx - tw, my, tw, 1, t.textTertiary);
+            }
+
+            if (wid != 0) {
+                int hitId = app.focus.AllocId();
+                app.hitTester.Register(HitRegion.Create(hitId, rowLeft,
+                    lgY, (lx) - rowLeft, sw + app.Scale(4), 3));
+                if (Ui.Clicked(app, hitId)) {
+                    int nv = 1;
+                    if (hid) { nv = 0; }
+                    app.StateSet(Chart.LegendKey(wid, si), nv);
+                    hid = (nv == 1);
+                    app.RequestRedraw();
+                }
+            }
+
+            series[si].hidden = hid;
+            lx = rowLeft - app.Scale(14);
             si = si - 1;
         }
 
@@ -902,6 +946,7 @@ class ChartOptions {
     int gridRight;
     int gridTop;
     int gridBottom;
+    int iwid;         // interaction key (set per-frame by ChartView.Render); 0 = none
 
     // Sentinel meaning "derive this bound from the data".
     static int Auto() { return 0 - 2000000000; }
@@ -937,6 +982,7 @@ class ChartOptions {
         o.gridRight = 0 - 1;
         o.gridTop = 0 - 1;
         o.gridBottom = 0 - 1;
+        o.iwid = 0;
         return o;
     }
 
@@ -1244,6 +1290,10 @@ class ChartView {
         int g = 1000;
         if (options.animate) { g = app.AnimIntro(5000000 + wid, options.animMs); }
 
+        // Publish the stable interaction key so DrawPanel can wire an
+        // interactive legend (click a swatch to show/hide that series).
+        options.iwid = wid;
+
         int k = options.kind;
         if (k == 5) {
             ChartView.DrawPie(app, x, y, w, h, model, 0, g);
@@ -1335,7 +1385,7 @@ class ChartView {
         List<ChartSeries> series = m.series;
         List<string> labels = m.labels;
         int maxV = Chart.NiceMax(Chart.MaxOf(series));
-        int plotTop = Chart.DrawPanel(app, x, y, w, h, m.title, series);
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
         ChartFrame f = Chart.BuildAxes(app, x, y, w, h, plotTop, labels, o, series);
 
         int n = labels.Count;
@@ -1456,7 +1506,7 @@ class ChartView {
 
         int leftData = 0 - 1;
         if (o.kind == 3) { leftData = Chart.MaxStack(series, n); }
-        int plotTop = Chart.DrawPanel(app, x, y, w, h, m.title, series);
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
         ChartFrame f = Chart.BuildAxesR(app, x, y, w, h, plotTop, labels, o, series, leftData, 0 - 1);
         int maxV = f.leftMax;
         if (n < 1 || ns < 1) { return; }
@@ -1923,10 +1973,16 @@ class ChartView {
         int gx = f.plotX + idx * step + half;
         c.FillRect(gx, f.plotY, 1, f.plotH, t.borderHover);
 
-        // Tooltip card: category label + each series value + swatch.
+        // Tooltip card: category label + each *visible* series value + swatch.
         int fs = t.fontSizeSmall;
         int lh = Canvas.FontHeight(fs) + app.Scale(4);
-        int rows = series.Count + 1;
+        int vis = 0;
+        int cs = 0;
+        while (cs < series.Count) {
+            if (!series[cs].hidden) { vis = vis + 1; }
+            cs = cs + 1;
+        }
+        int rows = vis + 1;
         int boxW = app.Scale(120);
         int boxH = rows * lh + app.Scale(10);
         int bx = gx + app.Scale(10);
@@ -1941,15 +1997,17 @@ class ChartView {
         int si = 0;
         while (si < series.Count) {
             ChartSeries s = series[si];
-            int sw = app.Scale(9);
-            c.FillRoundRect(bx + app.Scale(8), ty + app.Scale(2), sw, sw,
-                t.borderRadiusSmall, s.color);
-            int v = 0;
-            if (idx < s.values.Count) { v = s.values[idx]; }
-            string line = s.name + "  " + Convert.ToString(v);
-            c.DrawText(bx + app.Scale(8) + sw + app.Scale(6), ty, line,
-                t.textSecondary, fs);
-            ty = ty + lh;
+            if (!s.hidden) {
+                int sw = app.Scale(9);
+                c.FillRoundRect(bx + app.Scale(8), ty + app.Scale(2), sw, sw,
+                    t.borderRadiusSmall, s.color);
+                int v = 0;
+                if (idx < s.values.Count) { v = s.values[idx]; }
+                string line = s.name + "  " + Convert.ToString(v);
+                c.DrawText(bx + app.Scale(8) + sw + app.Scale(6), ty, line,
+                    t.textSecondary, fs);
+                ty = ty + lh;
+            }
             si = si + 1;
         }
         app.RequestRedraw();
@@ -2008,7 +2066,7 @@ class ChartView {
         }
         int n = labels.Count;
         int maxV = Chart.NiceMax(Chart.MaxStack(series, n));
-        int plotTop = Chart.DrawPanel(app, x, y, w, h, m.title, series);
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
         ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
         if (n < 1 || maxV < 1) { return; }
         int step = f.plotW / n;
@@ -2298,7 +2356,7 @@ class ChartView {
             if (m.series[ci].color == 0) { m.series[ci].color = Chart.Palette(t, ci); }
             ci = ci + 1;
         }
-        int top = Chart.DrawPanel(app, x, y, w, h, m.title, m.series);
+        int top = Chart.DrawPanelI(app, x, y, w, h, m.title, m.series, o.iwid);
         int n = m.labels.Count;
         if (n < 1 && m.series.Count > 0) { n = m.series[0].values.Count; }
         if (n < 1) { return; }
