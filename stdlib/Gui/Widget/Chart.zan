@@ -194,6 +194,116 @@ class Chart {
     // Legend hidden-state key for series `si` of interaction id `wid`.
     static int LegendKey(int wid, int si) { return 6000000 + wid * 64 + si; }
 
+    // dataZoom window state keys (permille 0..1000 of the category range).
+    static int ZoomLoKey(int wid) { return 7000000 + wid * 2; }
+    static int ZoomHiKey(int wid) { return 7000000 + wid * 2 + 1; }
+
+    // Resolve the zoom window to an inclusive category index range [i0,i1].
+    static int ZoomI0(App app, int wid, int n) {
+        int lo = app.StateGet(Chart.ZoomLoKey(wid), 0);
+        int i0 = lo * (n - 1) / 1000;
+        if (i0 < 0) { i0 = 0; }
+        if (i0 > n - 1) { i0 = n - 1; }
+        return i0;
+    }
+    static int ZoomI1(App app, int wid, int n) {
+        int hi = app.StateGet(Chart.ZoomHiKey(wid), 1000);
+        int i1 = hi * (n - 1) / 1000;
+        if (i1 < 0) { i1 = 0; }
+        if (i1 > n - 1) { i1 = n - 1; }
+        int i0 = Chart.ZoomI0(app, wid, n);
+        if (i1 < i0) { i1 = i0; }
+        return i1;
+    }
+
+    // A shallow window [i0,i1] of every series (values sliced, metadata kept).
+    static List<ChartSeries> Window(List<ChartSeries> series, int i0, int i1) {
+        List<ChartSeries> outp = new List<ChartSeries>();
+        int s = 0;
+        while (s < series.Count) {
+            ChartSeries src = series[s];
+            List<int> vs = new List<int>();
+            int i = i0;
+            while (i <= i1 && i < src.values.Count) { vs.Add(src.values[i]); i = i + 1; }
+            ChartSeries d = ChartSeries.Create(src.name, vs, src.color);
+            d.axisIndex = src.axisIndex;
+            d.kind = src.kind;
+            d.hidden = src.hidden;
+            outp.Add(d);
+            s = s + 1;
+        }
+        return outp;
+    }
+
+    static List<string> WindowLabels(List<string> labels, int i0, int i1) {
+        List<string> outp = new List<string>();
+        int i = i0;
+        while (i <= i1 && i < labels.Count) { outp.Add(labels[i]); i = i + 1; }
+        return outp;
+    }
+
+    // Draw the dataZoom range slider and process handle drags. Two handles set
+    // the window bounds (permille); dragging the selected band pans it. The
+    // window is persisted in the App state map keyed by wid.
+    static void DrawZoomBar(App app, int plotX, int plotW, int barY, int barH,
+                            int wid, int n) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        if (plotW < 4 || n < 2) { return; }
+
+        int lo = app.StateGet(Chart.ZoomLoKey(wid), 0);
+        int hi = app.StateGet(Chart.ZoomHiKey(wid), 1000);
+
+        int hw = app.Scale(6);
+        int loX = plotX + lo * plotW / 1000;
+        int hiX = plotX + hi * plotW / 1000;
+
+        // track + selected window
+        c.FillRoundRect(plotX, barY, plotW, barH, t.borderRadiusSmall, t.bgSecondary);
+        c.FillRect(loX, barY, hiX - loX, barH, t.bgHover);
+        c.DrawRect(loX, barY, hiX - loX, barH, t.borderHover, 1);
+
+        // handles
+        c.FillRoundRect(loX - hw, barY, hw * 2, barH, t.borderRadiusSmall, t.primary);
+        c.FillRoundRect(hiX - hw, barY, hw * 2, barH, t.borderRadiusSmall, t.primary);
+
+        int loId = app.focus.AllocId();
+        int hiId = app.focus.AllocId();
+        int bandId = app.focus.AllocId();
+        app.hitTester.Register(HitRegion.Create(loId, loX - hw, barY, hw * 2, barH, 3));
+        app.hitTester.Register(HitRegion.Create(hiId, hiX - hw, barY, hw * 2, barH, 3));
+        app.hitTester.Register(HitRegion.Create(bandId, loX + hw, barY, hiX - loX - hw * 2, barH, 3));
+
+        int mxPm = (app.mouseX - plotX) * 1000 / plotW;
+        if (mxPm < 0) { mxPm = 0; }
+        if (mxPm > 1000) { mxPm = 1000; }
+        int minGap = 1000 / (n - 1);
+        if (minGap < 20) { minGap = 20; }
+
+        if (Ui.Pressed(app, loId)) {
+            lo = mxPm;
+            if (lo > hi - minGap) { lo = hi - minGap; }
+            if (lo < 0) { lo = 0; }
+            app.StateSet(Chart.ZoomLoKey(wid), lo);
+            app.RequestRedraw();
+        } else if (Ui.Pressed(app, hiId)) {
+            hi = mxPm;
+            if (hi < lo + minGap) { hi = lo + minGap; }
+            if (hi > 1000) { hi = 1000; }
+            app.StateSet(Chart.ZoomHiKey(wid), hi);
+            app.RequestRedraw();
+        } else if (Ui.Pressed(app, bandId)) {
+            // pan: keep the band width, center it on the pointer
+            int width = hi - lo;
+            int nlo = mxPm - width / 2;
+            if (nlo < 0) { nlo = 0; }
+            if (nlo + width > 1000) { nlo = 1000 - width; }
+            app.StateSet(Chart.ZoomLoKey(wid), nlo);
+            app.StateSet(Chart.ZoomHiKey(wid), nlo + width);
+            app.RequestRedraw();
+        }
+    }
+
     // Panel + interactive legend. When wid != 0 each swatch is a hit region:
     // clicking toggles that series' visibility (persisted in the App state map
     // keyed by wid), and the resolved hidden flag is written back onto the
@@ -947,6 +1057,7 @@ class ChartOptions {
     int gridTop;
     int gridBottom;
     int iwid;         // interaction key (set per-frame by ChartView.Render); 0 = none
+    bool zoom;        // show a dataZoom range slider below cartesian charts
 
     // Sentinel meaning "derive this bound from the data".
     static int Auto() { return 0 - 2000000000; }
@@ -983,6 +1094,7 @@ class ChartOptions {
         o.gridTop = 0 - 1;
         o.gridBottom = 0 - 1;
         o.iwid = 0;
+        o.zoom = false;
         return o;
     }
 
@@ -1384,9 +1496,26 @@ class ChartView {
         Canvas c = app.canvas;
         List<ChartSeries> series = m.series;
         List<string> labels = m.labels;
+
+        // dataZoom: window the categories to the persisted range and reserve a
+        // strip at the bottom for the range slider.
+        int zoomH = 0;
+        int fullN = labels.Count;
+        if (o.zoom && o.iwid != 0 && fullN > 1) {
+            int i0 = Chart.ZoomI0(app, o.iwid, fullN);
+            int i1 = Chart.ZoomI1(app, o.iwid, fullN);
+            series = Chart.Window(series, i0, i1);
+            labels = Chart.WindowLabels(labels, i0, i1);
+            zoomH = app.Scale(24);
+        }
+
         int maxV = Chart.NiceMax(Chart.MaxOf(series));
         int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
-        ChartFrame f = Chart.BuildAxes(app, x, y, w, h, plotTop, labels, o, series);
+        ChartFrame f = Chart.BuildAxes(app, x, y, w, h - zoomH, plotTop, labels, o, series);
+        if (zoomH > 0) {
+            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
+                app.Scale(12), o.iwid, fullN);
+        }
 
         int n = labels.Count;
         if (n < 1) { return; }
@@ -1494,8 +1623,6 @@ class ChartView {
         Theme t = app.theme;
         List<ChartSeries> series = m.series;
         List<string> labels = m.labels;
-        int n = labels.Count;
-        int ns = series.Count;
 
         if (o.horizontal) {
             // Delegate the horizontal layout to the existing renderer, then the
@@ -1504,10 +1631,28 @@ class ChartView {
             return;
         }
 
+        // dataZoom: window the categories and reserve a bottom strip.
+        int zoomH = 0;
+        int fullN = labels.Count;
+        if (o.zoom && o.iwid != 0 && fullN > 1) {
+            int wi0 = Chart.ZoomI0(app, o.iwid, fullN);
+            int wi1 = Chart.ZoomI1(app, o.iwid, fullN);
+            series = Chart.Window(series, wi0, wi1);
+            labels = Chart.WindowLabels(labels, wi0, wi1);
+            zoomH = app.Scale(24);
+        }
+
+        int n = labels.Count;
+        int ns = series.Count;
+
         int leftData = 0 - 1;
         if (o.kind == 3) { leftData = Chart.MaxStack(series, n); }
         int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
-        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h, plotTop, labels, o, series, leftData, 0 - 1);
+        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, labels, o, series, leftData, 0 - 1);
+        if (zoomH > 0) {
+            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
+                app.Scale(12), o.iwid, fullN);
+        }
         int maxV = f.leftMax;
         if (n < 1 || ns < 1) { return; }
 
