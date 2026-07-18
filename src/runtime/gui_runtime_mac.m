@@ -306,6 +306,11 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     return 0;
 }
 
+/* On macOS close_window already tears the NSWindow down synchronously, so the
+ * owner-driven destroy is a no-op kept for FFI symbol parity across
+ * backends. */
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+
 /* ---- event pump ---- */
 
 /* Map Cocoa modifier flags to the Win32 encoding the cross-platform widgets
