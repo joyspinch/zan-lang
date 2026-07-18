@@ -9467,19 +9467,27 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     }
 
     case AST_THROW_STMT: {
-        /* throw expr; — release ARC locals, print error, and exit */
+        /* throw expr; — print the thrown message, release ARC locals, exit */
         LLVMValueRef val = emit_expr(g, stmt->throw_stmt.value, locals);
-        /* ARC cleanup: release all managed locals before aborting */
-        release_all_arc_locals(g, locals);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-            "Unhandled exception\n", "exfmt");
-        LLVMValueRef args[] = { fmt };
         LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
         if (printf_fn) {
-            LLVMBuildCall2(g->builder, LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
-                &i8ptr, 1, 1), printf_fn, args, 1, "");
+            LLVMTypeRef printf_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
+                &i8ptr, 1, 1);
+            if (LLVMTypeOf(val) == i8ptr) {
+                LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                    "Unhandled exception: %s\n", "exfmt");
+                LLVMValueRef args[] = { fmt, val };
+                LLVMBuildCall2(g->builder, printf_ty, printf_fn, args, 2, "");
+            } else {
+                LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                    "Unhandled exception\n", "exfmt");
+                LLVMValueRef args[] = { fmt };
+                LLVMBuildCall2(g->builder, printf_ty, printf_fn, args, 1, "");
+            }
         }
+        /* ARC cleanup: release all managed locals before aborting */
+        release_all_arc_locals(g, locals);
         /* call exit(1) */
         LLVMTypeRef exit_args[] = { LLVMInt32TypeInContext(g->ctx) };
         LLVMTypeRef exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
