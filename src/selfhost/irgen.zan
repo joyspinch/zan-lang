@@ -3335,6 +3335,16 @@ class Irgen {
                 return new ExprVal(z, MkType("bool"));
             }
         }
+        // A chain of 3+ string `+` parts is emitted as one flattened
+        // allocation instead of pairwise (see StrConcatN). Only chains whose
+        // string-ness is provable (a string literal or string-typed local in
+        // the subtree) are flattened; anything else keeps the pairwise
+        // path that decides from the evaluated operand types.
+        if (op == TK.Plus() && IsStrChain(e)) {
+            List<Node> parts = new List<Node>();
+            CollectConcat(e, parts);
+            if (parts.Count > 2) { return StrConcatN(parts); }
+        }
         ExprVal a = GenExpr(e.a);
         ExprVal b = GenExpr(e.b);
         // user-defined operator overloading takes precedence for class operands
@@ -3511,6 +3521,74 @@ class Irgen {
         L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
         L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.fmt.nn, i64 0, i64 0), i64 " + v.op + ")");
         return buf;
+    }
+
+    // True when `e` provably yields a string: a string literal, or a `+`
+    // with a provably-string side.
+    bool StrNodeish(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.StringLit()) { return true; }
+        if (e.kind == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return IsStr(locType[li]); }
+            return false;
+        }
+        if (e.kind == AK.Binary() && e.op == TK.Plus()) {
+            return StrNodeish(e.a) || StrNodeish(e.b);
+        }
+        return false;
+    }
+
+    // A concatenation-chain link: `+` whose either side is provably string.
+    bool IsStrChain(Node e) {
+        if (e == null) { return false; }
+        if (e.kind != AK.Binary() || e.op != TK.Plus()) { return false; }
+        return StrNodeish(e.a) || StrNodeish(e.b);
+    }
+
+    // Collect the leaves of a `+` concatenation chain in evaluation order.
+    // A sub-tree that is not itself a provable string chain stays one leaf
+    // (it is evaluated with its own semantics, e.g. numeric addition).
+    void CollectConcat(Node e, List<Node> outParts) {
+        if (outParts.Count < 40 && IsStrChain(e)) {
+            CollectConcat(e.a, outParts);
+            CollectConcat(e.b, outParts);
+        } else {
+            outParts.Add(e);
+        }
+    }
+
+    // n-way concatenation with a single allocation: sum the part lengths,
+    // malloc once, memcpy each part in order and NUL-terminate. Replaces the
+    // O(n^2) copying of emitting a chain pairwise.
+    ExprVal StrConcatN(List<Node> parts) {
+        List<string> vals = new List<string>();
+        List<string> lens = new List<string>();
+        string tot = "1";
+        int i = 0;
+        while (i < parts.Count) {
+            ExprVal v = GenExpr(parts[i]);
+            string s = ToCStr(v);
+            vals.Add(s);
+            string ln = NT(); L("  " + ln + " = call i64 @strlen(i8* " + s + ")");
+            lens.Add(ln);
+            string nt = NT(); L("  " + nt + " = add i64 " + tot + ", " + ln);
+            tot = nt;
+            i = i + 1;
+        }
+        string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + tot + ")");
+        string off = "0";
+        i = 0;
+        while (i < parts.Count) {
+            string dst = NT(); L("  " + dst + " = getelementptr i8, i8* " + buf + ", i64 " + off);
+            L("  call i8* @memcpy(i8* " + dst + ", i8* " + vals[i] + ", i64 " + lens[i] + ")");
+            string no = NT(); L("  " + no + " = add i64 " + off + ", " + lens[i]);
+            off = no;
+            i = i + 1;
+        }
+        string endp = NT(); L("  " + endp + " = getelementptr i8, i8* " + buf + ", i64 " + off);
+        L("  store i8 0, i8* " + endp);
+        return new ExprVal(buf, MkType("string"));
     }
 
     ExprVal StrConcat(string a, string b) {

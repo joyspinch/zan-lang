@@ -3423,6 +3423,74 @@ static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef
     return buf;
 }
 
+/* True when `e` is a string-yielding `+` node (either operand is a string),
+ * i.e. a link of a concatenation chain. */
+static bool is_str_concat_node(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    return e && e->kind == AST_BINARY && e->binary.op == TK_PLUS &&
+        (is_string_expr(g, e->binary.left, locals) ||
+         is_string_expr(g, e->binary.right, locals));
+}
+
+/* Collect the leaves of a `+` concatenation chain in evaluation order.
+ * Stops descending once `ops` is nearly full; an overflowing sub-chain is
+ * kept as a single leaf and flattened again when it is itself emitted. */
+static void collect_concat_ops(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals,
+                               zan_ast_node_t **ops, int *n, int max) {
+    if (*n < max - 1 && is_str_concat_node(g, e, locals)) {
+        collect_concat_ops(g, e->binary.left, locals, ops, n, max);
+        collect_concat_ops(g, e->binary.right, locals, ops, n, max);
+    } else {
+        ops[(*n)++] = e;
+    }
+}
+
+/* Emit an n-way string concatenation as a single allocation: sum the operand
+ * lengths, allocate once, memcpy each part in order and NUL-terminate.
+ * Replaces the O(n^2) copying of emitting a chain pairwise. */
+static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
+                                      local_scope_t *locals) {
+    enum { MAXOPS = 48 };
+    zan_ast_node_t *ops[MAXOPS];
+    int n = 0;
+    collect_concat_ops(g, expr, locals, ops, &n, MAXOPS);
+
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+    LLVMTypeRef strlen_type = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+    if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_type);
+
+    LLVMValueRef vals[MAXOPS];
+    LLVMValueRef lens[MAXOPS];
+    bool owned[MAXOPS];
+    LLVMValueRef total = LLVMConstInt(i64t, 1, 0); /* NUL */
+    for (int i = 0; i < n; i++) {
+        LLVMValueRef v = emit_expr(g, ops[i], locals);
+        LLVMValueRef s = emit_to_cstr(g, v);
+        vals[i] = s;
+        owned[i] = !is_string_expr(g, ops[i], locals) ||
+                   expr_yields_owned_rc_value(g, ops[i], locals);
+        lens[i] = LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &s, 1, "cl");
+        total = LLVMBuildAdd(g->builder, total, lens[i], "ct");
+    }
+    LLVMValueRef buf = emit_string_alloc_rc(g, total);
+    LLVMValueRef off = LLVMConstInt(i64t, 0, 0);
+    for (int i = 0; i < n; i++) {
+        LLVMValueRef dst = LLVMBuildGEP2(g->builder, i8t, buf, &off, 1, "dst");
+        LLVMBuildCall2(g->builder, memcpy_type, memcpy_fn,
+            (LLVMValueRef[]){ dst, vals[i], lens[i] }, 3, "");
+        off = LLVMBuildAdd(g->builder, off, lens[i], "off");
+    }
+    LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8t, buf, &off, 1, "end");
+    LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0, 0), endp);
+    for (int i = 0; i < n; i++) {
+        if (owned[i]) emit_string_release(g, vals[i]);
+    }
+    return buf;
+}
+
 /* Return the internal `__zan_co_reap` step function, creating it once per
  * module. It matches zan_co_step_t (void(i8*)) and simply frees the frame it is
  * handed. A detached (Task.Spawn) coroutine has no awaiter to hand its frame
@@ -3685,6 +3753,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMBasicBlockRef bbs[] = { left_bb, rhs_end };
             LLVMAddIncoming(phi, vals, bbs, 2);
             return phi;
+        }
+
+        /* A chain of 3+ string `+` parts is emitted as one flattened
+         * allocation instead of pairwise (see emit_str_concat_n). */
+        if (expr->binary.op == TK_PLUS && is_str_concat_node(g, expr, locals) &&
+            (is_str_concat_node(g, expr->binary.left, locals) ||
+             is_str_concat_node(g, expr->binary.right, locals))) {
+            return emit_str_concat_n(g, expr, locals);
         }
 
         LLVMValueRef left = emit_expr(g, expr->binary.left, locals);
