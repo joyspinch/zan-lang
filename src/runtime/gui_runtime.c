@@ -456,7 +456,7 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
         }
     }
 
-    /* Vibrancy (luma-preserving ~1.4x saturation) on the small copy so the
+    /* Vibrancy (luma-preserving ~1.6x saturation) on the small copy so the
      * frost keeps the wallpaper's colour instead of washing to grey. */
     for (int i = 0; i < (int)dn; i++) {
         u32 px = a[i];
@@ -464,19 +464,28 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
         int gc = (int)((px >> 8) & 0xFF);
         int bc = (int)(px & 0xFF);
         int luma = (rc * 77 + gc * 150 + bc * 29) >> 8;
-        rc = luma + (rc - luma) * 7 / 5;
-        gc = luma + (gc - luma) * 7 / 5;
-        bc = luma + (bc - luma) * 7 / 5;
+        rc = luma + (rc - luma) * 8 / 5;
+        gc = luma + (gc - luma) * 8 / 5;
+        bc = luma + (bc - luma) * 8 / 5;
         a[i] = 0xFF000000u | ((u32)clamp_i(rc, 0, 255) << 16)
              | ((u32)clamp_i(gc, 0, 255) << 8) | (u32)clamp_i(bc, 0, 255);
     }
 
-    /* Upscale the small blurred copy back into the surface region. */
+    /* Upscale the small blurred copy back into the surface region, adding a
+     * static fine grain (position-hashed +/-3 luma) so the frost reads as
+     * acrylic texture instead of a perfectly smooth plastic sheet. */
     if (ds == 1) {
         for (int j = 0; j < rh; j++) {
             u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             u32 *src = a + j * dw;
-            for (int i = 0; i < rw; i++) row[i] = src[i];
+            for (int i = 0; i < rw; i++) {
+                u32 px = src[i];
+                int nz = ((((x0 + i) * 197 + (y0 + j) * 173) >> 3) % 7) - 3;
+                int rC = clamp_i((int)((px >> 16) & 0xFF) + nz, 0, 255);
+                int gC = clamp_i((int)((px >> 8) & 0xFF) + nz, 0, 255);
+                int bC = clamp_i((int)(px & 0xFF) + nz, 0, 255);
+                row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+            }
         }
     } else {
         /* Bilinear: sample the small copy at each full-res pixel centre
@@ -508,6 +517,10 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
                         + (int)((p10 >> 8) & 0xFF) * w10 + (int)((p11 >> 8) & 0xFF) * w11) >> 16;
                 int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01
                         + (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >> 16;
+                int nz = ((((x0 + i) * 197 + (y0 + j) * 173) >> 3) % 7) - 3;
+                rC = clamp_i(rC + nz, 0, 255);
+                gC = clamp_i(gC + nz, 0, 255);
+                bC = clamp_i(bC + nz, 0, 255);
                 row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
             }
         }

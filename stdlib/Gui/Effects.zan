@@ -1,0 +1,268 @@
+using System;
+
+namespace Gui;
+
+/// Animated window-backdrop effects ("living skins"). Each built-in skin can
+/// carry a signature motion layer (Theme.fx) that App.RenderBackground paints
+/// over the static wallpaper snapshot on throttled animation frames:
+/// star-field drift (Dark), aurora glow drift (Liquid Glass), a lightfall of
+/// falling neon beams (Neon), ink-wash wisps (Chinese), falling petals
+/// (Sakura) and digital rain (Matrix).
+///
+/// All effects are stateless: every particle's position is a pure function of
+/// the wall clock and a per-particle hash, so a throttled/irregular frame
+/// cadence never desyncs the motion and no per-frame integration state is
+/// kept. Rendering uses only cheap Canvas primitives (small fills, 1-glyph
+/// text) so the software renderer stays smooth at the ~15-25fps effect tick.
+class BackdropFx {
+    // Effect kinds stored in Theme.fx (0 = static skin, no motion).
+    static int KindStars()     { return 1; }
+    static int KindAurora()    { return 2; }
+    static int KindLightfall() { return 3; }
+    static int KindInk()       { return 4; }
+    static int KindPetals()    { return 5; }
+    static int KindRain()      { return 6; }
+
+    /// Repaint cadence for a kind (ms between animation frames). Slow ambient
+    /// effects tick lazily; fast ones (lightfall, rain) tick a bit quicker.
+    static int IntervalMs(int kind) {
+        if (kind == BackdropFx.KindLightfall()) { return 50; }
+        if (kind == BackdropFx.KindRain())      { return 66; }
+        if (kind == BackdropFx.KindPetals())    { return 66; }
+        if (kind == BackdropFx.KindAurora())    { return 90; }
+        if (kind == BackdropFx.KindInk())       { return 120; }
+        return 80;
+    }
+
+    // ---- deterministic per-particle randomness ------------------------------
+
+    /// Small integer hash: repeatable pseudo-random value from (i, salt),
+    /// always non-negative.
+    static int Hash(int i, int salt) {
+        int h = i * 374761393 + salt * 668265263;
+        h = (h / 8192 + h) % 2147483647;
+        if (h < 0) { h = -h; }
+        return h;
+    }
+
+    /// sin(deg) * 1000 via a coarse integer table (10-degree steps, linearly
+    /// interpolated). Plenty for ambient sway; avoids float math in the
+    /// otherwise all-int GUI stack.
+    static int Sin1000(int deg) {
+        int d = deg % 360;
+        if (d < 0) { d = d + 360; }
+        int sign = 1;
+        if (d >= 180) { d = d - 180; sign = -1; }
+        if (d > 90) { d = 180 - d; }
+        // quarter-wave table at 10-degree steps: sin(0..90)*1000
+        List<int> q = new List<int>();
+        q.Add(0); q.Add(174); q.Add(342); q.Add(500); q.Add(643);
+        q.Add(766); q.Add(866); q.Add(940); q.Add(985); q.Add(1000);
+        int idx = d / 10;
+        int frac = d % 10;
+        int a = q[idx];
+        int b = 1000;
+        if (idx < 9) { b = q[idx + 1]; }
+        return sign * (a + (b - a) * frac / 10);
+    }
+
+    /// Paints effect `kind` into [x,y,w,h]. `now` is Window.GetTickMs();
+    /// `dpi` is the App dpi scale percent (100 = 1x) used to size particles.
+    static void Render(Canvas c, int kind, int x, int y, int w, int h,
+                       int now, Theme t, int dpi) {
+        if (w <= 0 || h <= 0) { return; }
+        c.PushClip(x, y, w, h);
+        if (kind == BackdropFx.KindStars())     { BackdropFx.Stars(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindAurora())    { BackdropFx.Aurora(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindLightfall()) { BackdropFx.Lightfall(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindInk())       { BackdropFx.Ink(c, x, y, w, h, now, dpi); }
+        if (kind == BackdropFx.KindPetals())    { BackdropFx.Petals(c, x, y, w, h, now, t, dpi); }
+        if (kind == BackdropFx.KindRain())      { BackdropFx.Rain(c, x, y, w, h, now, t, dpi); }
+        c.PopClip();
+    }
+
+    static int Px(int v, int dpi) {
+        int r = v * dpi / 100;
+        if (r < 1) { r = 1; }
+        return r;
+    }
+
+    // ---- Stars (Dark): drifting, twinkling star field -----------------------
+    static void Stars(Canvas c, int x, int y, int w, int h, int now,
+                      Theme t, int dpi) {
+        int n = 70;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 11);
+            int hy = BackdropFx.Hash(i, 23);
+            // Slow diagonal drift, wrapping across the area.
+            int spd = 4 + hx % 7;                       // px/s downward
+            int px = x + (hx + now / 400) % w;          // ~2.5 px/s sideways
+            int py = y + (hy + now * spd / 1000) % h;
+            // Twinkle: alpha oscillates on a per-star phase.
+            int tw = BackdropFx.Sin1000(now / 12 + hx % 360);
+            int alpha = 90 + tw * 70 / 1000;
+            int size = 1 + hy % 2;
+            if (dpi > 140) { size = size + 1; }
+            int hi = t.textPrimary % 16777216;
+            if (hi < 0) { hi = hi + 16777216; }
+            c.FillRect(px, py, size, size, alpha * 16777216 + hi);
+            // A few larger stars get a faint halo.
+            if (i % 9 == 0) {
+                c.FillCircle(px, py, size + 2, 18 * 16777216 + hi);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ---- Aurora (Liquid Glass): soft glow orbs on slow orbits ---------------
+    static void AuroraGlow(Canvas c, int cx, int cy, int r,
+                           int cr, int cg, int cb) {
+        int steps = 10;
+        int i = steps;
+        while (i > 0) {
+            c.FillCircle(cx, cy, r * i / steps, Theme.Rgba(cr, cg, cb, 8));
+            i = i - 1;
+        }
+    }
+
+    static void Aurora(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int r = BackdropFx.Px(130, dpi);
+        int i = 0;
+        while (i < 3) {
+            // Lissajous-style orbit around a per-glow anchor.
+            int ax = x + w * (22 + i * 28) / 100;
+            int ay = y + h * (30 + (i * 37) % 45) / 100;
+            int sp = 20 + i * 7;   // slower phase per glow
+            int ox = BackdropFx.Sin1000(now / sp + i * 120) * (w / 9) / 1000;
+            int oy = BackdropFx.Sin1000(now / (sp + 9) + 90 + i * 80) * (h / 8) / 1000;
+            if (i == 0) { BackdropFx.AuroraGlow(c, ax + ox, ay + oy, r, 120, 150, 255); }
+            if (i == 1) { BackdropFx.AuroraGlow(c, ax + ox, ay + oy, r, 245, 110, 190); }
+            if (i == 2) { BackdropFx.AuroraGlow(c, ax + ox, ay + oy, r, 90, 225, 205); }
+            i = i + 1;
+        }
+    }
+
+    // ---- Lightfall (Neon): falling beams of light (reactbits-style) ---------
+    static void Lightfall(Canvas c, int x, int y, int w, int h, int now,
+                          Theme t, int dpi) {
+        int n = 14;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 41);
+            int hy = BackdropFx.Hash(i, 57);
+            int bx = x + hx % w;
+            int len = BackdropFx.Px(90 + hy % 150, dpi);
+            int spd = 120 + hx % 160;                   // px/s fall speed
+            int span = h + len;
+            int head = y + (hy + now * spd / 1000) % span - len;
+            int color = t.primary;                      // cyan
+            if (i % 3 == 1) { color = t.error; }        // pink
+            if (i % 3 == 2) { color = t.info; }         // violet
+            int rgb = color % 16777216;
+            if (rgb < 0) { rgb = rgb + 16777216; }
+            int bw = BackdropFx.Px(2, dpi);
+            // Beam: stacked segments fading toward the tail.
+            int segs = 10;
+            int k = 0;
+            while (k < segs) {
+                int sy = head - len * (k + 1) / segs;
+                int sh = len / segs + 1;
+                int alpha = 80 - k * 8;
+                c.FillRect(bx, sy, bw, sh, alpha * 16777216 + rgb);
+                k = k + 1;
+            }
+            // Bright head with a small glow.
+            c.FillCircle(bx + bw / 2, head, bw + 2, 60 * 16777216 + rgb);
+            c.FillRect(bx, head - BackdropFx.Px(10, dpi), bw,
+                       BackdropFx.Px(10, dpi), 150 * 16777216 + rgb);
+            i = i + 1;
+        }
+    }
+
+    // ---- Ink (Chinese): drifting ink-wash wisps ------------------------------
+    static void Ink(Canvas c, int x, int y, int w, int h, int now, int dpi) {
+        int r = BackdropFx.Px(120, dpi);
+        int n = 4;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 71);
+            int span = w + r * 2;
+            int cx = x + (hx + now * (6 + i * 3) / 1000) % span - r;
+            int cy = y + h * (18 + i * 22) / 100
+                   + BackdropFx.Sin1000(now / 40 + i * 90) * BackdropFx.Px(12, dpi) / 1000;
+            int steps = 8;
+            int k = steps;
+            while (k > 0) {
+                c.FillCircle(cx, cy, r * k / steps, Theme.Rgba(70, 62, 52, 4));
+                k = k - 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // ---- Petals (Sakura): falling cherry-blossom petals ----------------------
+    static void Petals(Canvas c, int x, int y, int w, int h, int now,
+                       Theme t, int dpi) {
+        int n = 26;
+        int i = 0;
+        while (i < n) {
+            int hx = BackdropFx.Hash(i, 83);
+            int hy = BackdropFx.Hash(i, 97);
+            int spd = 28 + hx % 34;                     // px/s fall speed
+            int margin = BackdropFx.Px(24, dpi);
+            int span = h + margin * 2;
+            int py = y + (hy + now * spd / 1000) % span - margin;
+            int sway = BackdropFx.Sin1000(now / 9 + hx % 360)
+                     * BackdropFx.Px(16, dpi) / 1000;
+            int px = x + hx % w + sway;
+            int r = BackdropFx.Px(3, dpi) + hy % 4;
+            // Two offset disks read as a tumbling petal; the offset breathes
+            // with a per-petal phase so the shape appears to rotate.
+            int spin = BackdropFx.Sin1000(now / 6 + hy % 360) * r / 1000;
+            c.FillCircle(px, py, r, Theme.Rgba(238, 140, 170, 170));
+            c.FillCircle(px + spin + 1, py + 1, r - 1, Theme.Rgba(252, 190, 208, 190));
+            i = i + 1;
+        }
+    }
+
+    // ---- Rain (Matrix): digital glyph rain -----------------------------------
+    static void Rain(Canvas c, int x, int y, int w, int h, int now,
+                     Theme t, int dpi) {
+        List<string> glyphs = new List<string>();
+        glyphs.Add("0"); glyphs.Add("1"); glyphs.Add("7"); glyphs.Add("2");
+        glyphs.Add("X"); glyphs.Add("Z"); glyphs.Add("$"); glyphs.Add("#");
+        glyphs.Add("K"); glyphs.Add("R"); glyphs.Add("+"); glyphs.Add("=");
+        glyphs.Add("<"); glyphs.Add(">"); glyphs.Add("|"); glyphs.Add("*");
+        int colw = BackdropFx.Px(18, dpi);
+        int rowh = BackdropFx.Px(16, dpi);
+        int cols = w / colw;
+        if (cols < 1) { cols = 1; }
+        int rows = h / rowh + 1;
+        int trail = 8;
+        int fs = BackdropFx.Px(12, dpi);
+        int col = 0;
+        while (col < cols) {
+            int hc = BackdropFx.Hash(col, 113);
+            // Draw only ~2/3 of the columns so the rain reads sparse.
+            if (hc % 3 != 0) {
+                int spd = 5 + hc % 8;                   // rows/s
+                int cycle = rows + trail;
+                int head = (hc + now * spd / 1000) % cycle;
+                int k = 0;
+                while (k < trail) {
+                    int row = head - k;
+                    if (row >= 0 && row < rows) {
+                        int gi = BackdropFx.Hash(col * 131 + row, 127) % glyphs.Count;
+                        int alpha = 150;
+                        if (k > 0) { alpha = 80 - k * 9; }
+                        c.DrawText(x + col * colw, y + row * rowh, glyphs[gi],
+                                   Theme.Rgba(57, 255, 90, alpha), fs);
+                    }
+                    k = k + 1;
+                }
+            }
+            col = col + 1;
+        }
+    }
+}
