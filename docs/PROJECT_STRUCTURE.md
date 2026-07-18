@@ -53,19 +53,17 @@ zan-lang/
 │   │   ├── rt_channel.c               # Typed channels
 │   │   └── rt_panic.c                  # Panic handler (OOB, overflow)
 │   │
-│   └── ide/                            # IDE (C11 + Zan GUI stdlib)
-│       ├── CMakeLists.txt
-│       ├── ide_main.c                  # IDE entry point
-│       ├── editor/                     # Text editor core
-│       │   ├── buffer.c                # Piece-table text buffer
-│       │   ├── cursor.c                # Cursor and selection
-│       │   ├── highlight.c             # Syntax highlighting
-│       │   └── undo.c                  # Undo/redo stack
-│       ├── project/                    # Project management
-│       │   ├── tree.c                  # File tree
-│       │   └── build.c                 # Build integration
-│       └── debug/                      # Debugger integration
-│           └── debugger.c              # LLDB/WinDbg bridge
+│   ├── lsp/                            # Language Server (LSP over stdio)
+│   │   ├── lsp_main.c                  # LSP server entry point
+│   │   └── intellisense.c/h            # Completion / analysis engine
+│   │
+│   ├── dap/                            # Debug Adapter (DAP over stdio)
+│   │   ├── dap_main.c                  # DAP server entry point
+│   │   └── debugger.c/h                # Debugger engine
+│   │
+│   └── ide_zan/                        # IDE — self-hosted, written in Zan
+│       ├── ZanIDE.zan                  # IDE application (compiled by zanc)
+│       └── components/                 # Reusable Zan UI components
 │
 ├── stdlib/                             # Standard library (Zan source)
 │   ├── System/
@@ -276,13 +274,17 @@ build/                                  # Out-of-source build dir
 ├── Debug/
 │   ├── bin/
 │   │   ├── zanc                        # Compiler executable
-│   │   └── zan-ide                     # IDE executable
+│   │   ├── zan-lsp                     # Language server
+│   │   ├── zan-dap                     # Debug adapter
+│   │   └── ZanIDE                      # IDE executable (from src/ide_zan)
 │   └── lib/
 │       └── libzan_rt.a                 # Runtime static library
 └── Release/
     ├── bin/
     │   ├── zanc
-    │   └── zan-ide
+    │   ├── zan-lsp
+    │   ├── zan-dap
+    │   └── ZanIDE
     └── lib/
         └── libzan_rt.a
 ```

@@ -84,7 +84,8 @@ if(CLANG AND EXPECTED)
   execute_process(
     COMMAND ${_prog_exe}
     RESULT_VARIABLE run_rc
-    OUTPUT_VARIABLE run_out)
+    OUTPUT_VARIABLE run_out
+    ENCODING UTF-8)
   if(NOT run_rc EQUAL 0)
     message(FATAL_ERROR "gen1-compiled ${PROG} exited with ${run_rc}\noutput:\n${run_out}")
   endif()

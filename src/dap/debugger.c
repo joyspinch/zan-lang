@@ -674,6 +674,9 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
     mi_command(dbg, "-gdb-set mi-async off", res, sizeof(res));
     mi_command(dbg, "-gdb-set confirm off", res, sizeof(res));
     mi_command(dbg, "-gdb-set print pretty off", res, sizeof(res));
+    /* Launch the inferior directly rather than via a shell, so a bundled gdb
+     * works without sh/cmd on PATH (avoids "CreateProcess failed"). */
+    mi_command(dbg, "-gdb-set startup-with-shell off", res, sizeof(res));
 
     if (args && args[0]) {
         char cmd[1200];

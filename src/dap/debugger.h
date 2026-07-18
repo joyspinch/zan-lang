@@ -131,6 +131,24 @@ typedef struct {
     int             child_pid;
 #endif
 
+    /* GDB/MI backend: the real debugger is driven by spawning gdb in machine
+     * interface mode and exchanging MI commands over redirected pipes. */
+#ifdef _WIN32
+    void           *gdb_in_w;   /* HANDLE: write end of gdb's stdin */
+    void           *gdb_out_r;  /* HANDLE: read end of gdb's stdout */
+    void           *gdb_proc;   /* HANDLE: the gdb process */
+#else
+    int             gdb_in_fd;  /* write end of gdb's stdin */
+    int             gdb_out_fd; /* read end of gdb's stdout */
+    int             gdb_pid;
+#endif
+    char            gdb_path[512];  /* resolved gdb executable */
+    char            program_path[1024];
+    int             mi_token;       /* monotonically increasing MI command token */
+    char            mi_buf[8192];   /* leftover bytes between line reads */
+    int             mi_buf_len;
+    int             last_exit_code;
+
     /* settings */
     bool            break_on_entry;     /* pause at program start */
     bool            break_on_exception; /* pause on unhandled exceptions */
@@ -153,6 +171,10 @@ typedef struct {
     int             gdb_pid;            /* gdb child pid */
 #endif
 } debugger_t;
+
+/* Override the gdb executable used by the backend (else it is auto-detected
+ * from PATH / bundled toolchain / known install locations). */
+void dbg_set_gdb_path(debugger_t *dbg, const char *path);
 
 /* Initialize debugger */
 void dbg_init(debugger_t *dbg);

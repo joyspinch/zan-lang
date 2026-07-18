@@ -57,6 +57,16 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 clang -O2 -std=c11 -I src\runtime -c src\runtime\rt_sync.c -o build\zanrt_sync_ide.obj
 if ($LASTEXITCODE -ne 0) { Write-Output "SYNC_COMPILE_FAILED"; exit 1 }
 
+# ---- application icon resource --------------------------------------------
+# The IDE links a Windows .res for its exe/taskbar icon. Compile it from
+# assets\zan.rc so a clean build tree (with no build\zan_icon.res yet) links.
+$iconRes = Join-Path $root "build\zan_icon.res"
+if (-not (Test-Path $iconRes)) {
+    Write-Output "Compiling application icon (assets\zan.rc -> build\zan_icon.res) ..."
+    & llvm-rc /fo $iconRes /I (Join-Path $root "assets") (Join-Path $root "assets\zan.rc")
+    if ($LASTEXITCODE -ne 0) { Write-Output "ICON_RC_FAILED"; exit 1 }
+}
+
 $registryPath = Join-Path $root "stdlib\Gui\CustomComponents.zan"
 $registryOriginal = [System.IO.File]::ReadAllText($registryPath)
 $failed = $false
@@ -85,7 +95,7 @@ try {
         [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "ZanIDE.ll"), $ir)
         clang ZanIDE.ll zanrt_sync_ide.obj zan_icon.res -o ZanIDE.exe -O2 `
             -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS `
-            -Xlinker /ENTRY:mainCRTStartup -lzan_gui "$sdlLib" -llegacy_stdio_definitions
+            -Xlinker /ENTRY:mainCRTStartup -lzan_gui "$sdlLib" -llegacy_stdio_definitions -lws2_32
         if ($LASTEXITCODE -ne 0) { throw "LINK_FAILED code=$LASTEXITCODE" }
         Copy-Item -LiteralPath (Join-Path $driverDir "SDL3.dll") `
             -Destination (Join-Path (Get-Location) "SDL3.dll") -Force

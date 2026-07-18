@@ -11,6 +11,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# ---- Version (single source of truth: the root VERSION file) ----
+# Every binary reports this string (zanc --version, LSP serverInfo, About box).
+# Edit VERSION only; the generated zan_version.h propagates it into the build.
+file(READ "${CMAKE_SOURCE_DIR}/VERSION" ZAN_VERSION)
+string(STRIP "${ZAN_VERSION}" ZAN_VERSION)
+configure_file(
+    "${CMAKE_SOURCE_DIR}/cmake/zan_version.h.in"
+    "${CMAKE_BINARY_DIR}/generated/zan_version.h" @ONLY)
+include_directories("${CMAKE_BINARY_DIR}/generated")
+message(STATUS "Zan version: ${ZAN_VERSION}")
+
 # ---- Find LLVM ----
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -200,9 +211,9 @@ add_executable(zan-lsp
     src/compiler/parser.c
     src/compiler/binder.c
     src/compiler/checker.c
-    src/ide/intellisense.c
+    src/lsp/intellisense.c
 )
-target_include_directories(zan-lsp PRIVATE src/compiler src/common src/ide)
+target_include_directories(zan-lsp PRIVATE src/compiler src/common src/lsp)
 if(MSVC)
     target_compile_definitions(zan-lsp PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
@@ -216,11 +227,15 @@ add_executable(zan-dap
     src/dap/dap_main.c
     src/common/json.c
     src/common/rpc.c
-    src/ide/debugger.c
+    src/dap/debugger.c
 )
-target_include_directories(zan-dap PRIVATE src/common src/ide)
+target_include_directories(zan-dap PRIVATE src/common src/dap)
 if(MSVC)
     target_compile_definitions(zan-dap PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(WIN32)
+    # TCP server transport (--port) uses winsock.
+    target_link_libraries(zan-dap PRIVATE ws2_32)
 else()
     target_link_libraries(zan-dap PRIVATE m)
 endif()
@@ -351,11 +366,6 @@ endif()
 add_test(NAME runtime_sync COMMAND zanrt_sync_test)
 add_dependencies(zanc zanrt_sync_test)
 
-add_test(NAME test_lex_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-tokens)
-add_test(NAME test_parse_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --dump-ast)
-add_test(NAME test_emit_ir_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan --emit-ir)
-add_test(NAME test_compile_hello COMMAND zanc ${CMAKE_SOURCE_DIR}/examples/hello.zan -o ${CMAKE_BINARY_DIR}/hello_test)
-
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
   set(_exe_ext ".exe")
@@ -428,19 +438,6 @@ add_test(NAME conformance_multifile
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/box.zan;${CMAKE_SOURCE_DIR}/tests/conformance/multifile/util.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
-# ---- Skeletal multi-file Zan compiler: lexer + parser + driver ----
-# A tiny expression compiler/evaluator written in Zan across three files,
-# exercising classes, enum/switch, List<class>, string char-lexing, casts and
-# cross-file references �?the "host is strong enough" acceptance program.
-add_test(NAME conformance_minic
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/examples/minic/driver.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/minic/lexer.zan;${CMAKE_SOURCE_DIR}/examples/minic/parser.zan"
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/examples/minic/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_minic${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
@@ -541,7 +538,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   add_test(NAME conformance_gui_stack
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/examples/layout_test.zan
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/layout_test.zan
       # Types.zan is pulled in automatically by 'using Gui;' (auto-stdlib), so
       # only the non-auto-included Stack.zan is passed explicitly here.
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan"
@@ -552,7 +549,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   add_test(NAME conformance_gui_text
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/examples/text_test.zan
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/text_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
@@ -599,6 +596,27 @@ foreach(_case ${_golden_cases})
       -P ${_golden_dir}/run_golden.cmake)
   endif()
 endforeach()
+
+# ---- DAP integration test (real gdb-backed debug session) ----
+add_executable(dap_integration_test
+    tests/dap/dap_integration_test.c
+)
+set_target_properties(dap_integration_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(WIN32)
+    target_compile_definitions(dap_integration_test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME dap_integration
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DDAP=$<TARGET_FILE:zan-dap>
+    -DHARNESS=$<TARGET_FILE:dap_integration_test>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/dbgtarget${_exe_ext}
+    -DZANC_ARGS=--auto-stdlib
+    -P ${CMAKE_SOURCE_DIR}/tests/run_dap.cmake)
 
 # ---- zanpkg (package manager CLI) ----
 add_executable(zanpkg

@@ -663,8 +663,31 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     return expr;
 }
 
-/* unary: !x, -x, ~x, ++x, --x */
+/* Cap on expression recursion depth. Every expression-parsing cycle (nested
+ * parentheses, call/index arguments, prefix-operator chains, ternaries, ...)
+ * passes through parse_unary, so bounding it here bounds the whole recursive
+ * descent and turns pathological nesting (e.g. thousands of '(' or '!') into a
+ * diagnostic instead of a stack overflow. The limit is far beyond any
+ * hand-written or normally-generated expression. */
+#define ZAN_PARSER_MAX_EXPR_DEPTH 256
+
+static zan_ast_node_t *parse_unary_inner(zan_parser_t *p);
+
+/* unary: !x, -x, ~x, ++x, --x (with a recursion-depth guard) */
 static zan_ast_node_t *parse_unary(zan_parser_t *p) {
+    if (p->expr_depth >= ZAN_PARSER_MAX_EXPR_DEPTH) {
+        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                      "expression nesting too deep (max %d)",
+                      ZAN_PARSER_MAX_EXPR_DEPTH);
+        return parser_error_node(p);
+    }
+    p->expr_depth++;
+    zan_ast_node_t *n = parse_unary_inner(p);
+    p->expr_depth--;
+    return n;
+}
+
+static zan_ast_node_t *parse_unary_inner(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
     /* await expression: await expr */
