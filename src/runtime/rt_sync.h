@@ -11,6 +11,11 @@ extern "C" {
  * function pointer). Returns 1 on success, 0 on failure. */
 int64_t zan_thread_start(void *body);
 
+/* `lock (obj)` statement monitor: process-wide recursive mutex (coarser than
+ * C#'s per-object monitor; the object argument is currently unused). */
+void zan_monitor_enter(void *obj);
+void zan_monitor_exit(void *obj);
+
 /* UI-thread dispatch queue: post a delegate from any thread, drain on the UI
  * thread. */
 void zan_dispatch_init(void);

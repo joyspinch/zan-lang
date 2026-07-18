@@ -213,6 +213,14 @@ struct zan_irgen {
     LLVMTypeRef  rt_io_pump_timeout_type;
     bool         uses_socket_async; /* set when a socket await is lowered */
     bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
+    /* goto/label support: label blocks keyed by (function, name), created on
+     * first reference from either the label statement or a goto */
+    struct {
+        zan_istr_t        name;
+        LLVMValueRef      fn;
+        LLVMBasicBlockRef bb;
+    } goto_labels[256];
+    int goto_label_count;
     /* set while emitting an async function's $resume body: the current heap
      * frame pointer and its struct type, so `return` stores into the frame's
      * result slot + notifies the awaiter instead of a plain ret. NULL when not

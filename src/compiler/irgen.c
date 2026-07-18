@@ -9158,6 +9158,25 @@ static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm) {
 
 /* ---- statement codegen ---- */
 
+/* Find or create the basic block for a goto label in the current function. */
+static LLVMBasicBlockRef irgen_goto_label(zan_irgen_t *g, zan_istr_t name) {
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    for (int i = 0; i < g->goto_label_count; i++) {
+        if (g->goto_labels[i].fn == fn &&
+            g->goto_labels[i].name.len == name.len &&
+            memcmp(g->goto_labels[i].name.str, name.str,
+                   (size_t)name.len) == 0)
+            return g->goto_labels[i].bb;
+    }
+    if (g->goto_label_count >= 256) return NULL;
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "label");
+    g->goto_labels[g->goto_label_count].name = name;
+    g->goto_labels[g->goto_label_count].fn = fn;
+    g->goto_labels[g->goto_label_count].bb = bb;
+    g->goto_label_count++;
+    return bb;
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
@@ -9897,6 +9916,55 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * consumed by the loop and released once iteration ends */
         emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
                                      collection, locals);
+        break;
+    }
+
+    case AST_LOCK_STMT: {
+        /* lock (expr) body — enter/exit the runtime monitor around the body */
+        g->uses_sync_runtime = true;
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef mon_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                              &i8ptr, 1, 0);
+        LLVMValueRef enter_fn = LLVMGetNamedFunction(g->mod, "zan_monitor_enter");
+        if (!enter_fn)
+            enter_fn = LLVMAddFunction(g->mod, "zan_monitor_enter", mon_ty);
+        LLVMValueRef exit_fn = LLVMGetNamedFunction(g->mod, "zan_monitor_exit");
+        if (!exit_fn)
+            exit_fn = LLVMAddFunction(g->mod, "zan_monitor_exit", mon_ty);
+
+        LLVMValueRef obj = emit_expr(g, stmt->lock_stmt.expr, locals);
+        LLVMTypeRef ot = LLVMTypeOf(obj);
+        if (LLVMGetTypeKind(ot) == LLVMIntegerTypeKind)
+            obj = LLVMBuildIntToPtr(g->builder, obj, i8ptr, "lockp");
+        else if (LLVMGetTypeKind(ot) == LLVMPointerTypeKind && ot != i8ptr)
+            obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "lockp");
+        LLVMBuildCall2(g->builder, mon_ty, enter_fn, &obj, 1, "");
+        emit_stmt(g, stmt->lock_stmt.body, locals);
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildCall2(g->builder, mon_ty, exit_fn, &obj, 1, "");
+        break;
+    }
+
+    case AST_LABEL_STMT: {
+        LLVMBasicBlockRef bb = irgen_goto_label(g, stmt->ident.name);
+        if (!bb) break;
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildBr(g->builder, bb);
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        break;
+    }
+
+    case AST_GOTO_STMT: {
+        LLVMValueRef gfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        LLVMBasicBlockRef bb = irgen_goto_label(g, stmt->ident.name);
+        if (!bb) break;
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildBr(g->builder, bb);
+        /* anything after an unconditional goto is unreachable; park in a
+         * fresh block so subsequent emission stays well-formed */
+        LLVMBasicBlockRef cont =
+            LLVMAppendBasicBlockInContext(g->ctx, gfn, "goto.cont");
+        LLVMPositionBuilderAtEnd(g->builder, cont);
         break;
     }
 

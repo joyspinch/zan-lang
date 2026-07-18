@@ -387,6 +387,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
     case AST_BREAK_STMT:
     case AST_CONTINUE_STMT:
+    case AST_GOTO_STMT:
+    case AST_LABEL_STMT:
+        break;
+
+    case AST_LOCK_STMT:
+        zan_checker_check_expr(c, stmt->lock_stmt.expr);
+        zan_checker_check_stmt(c, stmt->lock_stmt.body);
         break;
 
     case AST_SWITCH_STMT: {

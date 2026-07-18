@@ -447,6 +447,49 @@ int64_t zan_thread_start(void *body) {
 }
 #endif
 
+/* ---- lock-statement monitor ---------------------------------------------
+ * Backs the `lock (obj) { ... }` statement. A single process-wide recursive
+ * mutex serializes all lock statements: coarser than C#'s per-object monitor
+ * but preserves mutual exclusion and allows re-entry. */
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_monitor_cs;
+static INIT_ONCE g_monitor_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK zan_monitor_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_monitor_cs);
+    return TRUE;
+}
+void zan_monitor_enter(void *obj) {
+    (void)obj;
+    InitOnceExecuteOnce(&g_monitor_once, zan_monitor_init, NULL, NULL);
+    EnterCriticalSection(&g_monitor_cs);
+}
+void zan_monitor_exit(void *obj) {
+    (void)obj;
+    LeaveCriticalSection(&g_monitor_cs);
+}
+#else
+static pthread_mutex_t g_monitor_mx;
+static pthread_once_t g_monitor_once = PTHREAD_ONCE_INIT;
+static void zan_monitor_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_monitor_mx, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+void zan_monitor_enter(void *obj) {
+    (void)obj;
+    pthread_once(&g_monitor_once, zan_monitor_init);
+    pthread_mutex_lock(&g_monitor_mx);
+}
+void zan_monitor_exit(void *obj) {
+    (void)obj;
+    pthread_mutex_unlock(&g_monitor_mx);
+}
+#endif
+
 /* ---- UI-thread dispatch queue (Control.Invoke equivalent) --------------
  * A fixed-capacity ring of Zan delegate function pointers. Background threads
  * enqueue with zan_dispatch_post(); the UI thread drains with

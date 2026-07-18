@@ -130,6 +130,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     case TK_SBYTE:  name.str = "sbyte";  name.len = 5; break;
     case TK_FLOAT:  name.str = "float";  name.len = 5; break;
     case TK_DOUBLE: name.str = "double"; name.len = 6; break;
+    case TK_DECIMAL: name.str = "decimal"; name.len = 7; break;
     case TK_BOOL:   name.str = "bool";   name.len = 4; break;
     case TK_CHAR:   name.str = "char";   name.len = 4; break;
     case TK_STRING: name.str = "string"; name.len = 6; break;
@@ -434,7 +435,8 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         switch (zan_lexer_peek(p->lex).kind) {
         case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
         case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
-        case TK_DOUBLE: case TK_FLOAT: case TK_BOOL: case TK_CHAR: {
+        case TK_DOUBLE: case TK_FLOAT: case TK_DECIMAL:
+        case TK_BOOL: case TK_CHAR: {
             parser_advance(p); /* ( */
             zan_ast_node_t *ctype = parse_type_ref(p);
             parser_expect(p, TK_RPAREN);
@@ -573,7 +575,7 @@ static bool is_type_kw(zan_token_kind_t k) {
     switch (k) {
     case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
     case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
-    case TK_FLOAT: case TK_DOUBLE: case TK_BOOL: case TK_CHAR:
+    case TK_FLOAT: case TK_DOUBLE: case TK_DECIMAL: case TK_BOOL: case TK_CHAR:
     case TK_STRING: case TK_VOID: case TK_OBJECT: case TK_NINT:
         return true;
     default:
@@ -937,7 +939,7 @@ static bool looks_like_var_decl(zan_parser_t *p) {
     switch (p->current.kind) {
     case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
     case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
-    case TK_FLOAT: case TK_DOUBLE: case TK_BOOL: case TK_CHAR:
+    case TK_FLOAT: case TK_DOUBLE: case TK_DECIMAL: case TK_BOOL: case TK_CHAR:
     case TK_STRING: case TK_VOID: case TK_OBJECT: case TK_NINT:
         return true;
     case TK_IDENT: {
@@ -1251,6 +1253,17 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         }
     }
 
+    /* `name:` at statement position is a goto label */
+    if (p->current.kind == TK_IDENT && zan_lexer_peek(p->lex).kind == TK_COLON) {
+        zan_loc_t loc = p->current.loc;
+        parser_advance(p); /* name */
+        zan_istr_t lname = p->previous.str_val;
+        parser_advance(p); /* : */
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_LABEL_STMT, loc);
+        n->ident.name = lname;
+        return n;
+    }
+
     switch (p->current.kind) {
     case TK_LBRACE:
         return parse_block(p);
@@ -1289,6 +1302,57 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return parse_switch_stmt(p);
     case TK_TRY:
         return parse_try_stmt(p);
+    case TK_LOCK: {
+        /* lock (expr) body */
+        zan_loc_t loc = p->current.loc;
+        parser_advance(p);
+        parser_expect(p, TK_LPAREN);
+        zan_ast_node_t *expr = parse_expression(p);
+        parser_expect(p, TK_RPAREN);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_LOCK_STMT, loc);
+        n->lock_stmt.expr = expr;
+        n->lock_stmt.body = parse_statement(p);
+        return n;
+    }
+    case TK_GOTO: {
+        zan_loc_t loc = p->current.loc;
+        parser_advance(p);
+        parser_expect(p, TK_IDENT);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_GOTO_STMT, loc);
+        n->ident.name = p->previous.str_val;
+        parser_expect(p, TK_SEMICOLON);
+        return n;
+    }
+    case TK_UNSAFE:
+        /* unsafe { ... } — everything is "unsafe" here; just run the block */
+        parser_advance(p);
+        return parse_block(p);
+    case TK_FIXED: {
+        /* fixed (T name = expr) body — no GC to pin against, so this is a
+         * scoped alias: { T name = expr; body } */
+        zan_loc_t loc = p->current.loc;
+        parser_advance(p);
+        parser_expect(p, TK_LPAREN);
+        zan_ast_node_t *type = parse_type_ref(p);
+        parser_match(p, TK_STAR); /* tolerate pointer-style `T*` */
+        parser_expect(p, TK_IDENT);
+        zan_istr_t vname = p->previous.str_val;
+        parser_expect(p, TK_EQ);
+        zan_ast_node_t *init = parse_expression(p);
+        parser_expect(p, TK_RPAREN);
+        zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
+        decl->var_decl.name = vname;
+        decl->var_decl.type = type;
+        decl->var_decl.initializer = init;
+        decl->var_decl.is_const = false;
+        decl->var_decl.is_let = false;
+        zan_ast_node_t *body = parse_statement(p);
+        zan_ast_node_t *blk = zan_ast_new(p->arena, AST_BLOCK, loc);
+        zan_ast_list_init(&blk->block.stmts);
+        zan_ast_list_push(&blk->block.stmts, decl, p->arena);
+        zan_ast_list_push(&blk->block.stmts, body, p->arena);
+        return blk;
+    }
     case TK_DO: {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);

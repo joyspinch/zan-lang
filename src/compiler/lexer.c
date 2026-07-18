@@ -37,13 +37,16 @@ static const keyword_entry_t s_keywords[] = {
     {"default",   TK_DEFAULT},
     {"delegate",  TK_DELEGATE},
     {"do",        TK_DO},
+    {"decimal",   TK_DECIMAL},
     {"double",    TK_DOUBLE},
     {"else",      TK_ELSE},
     {"enum",      TK_ENUM},
     {"extern",    TK_EXTERN},
     {"false",     TK_FALSE},
     {"finally",   TK_FINALLY},
+    {"fixed",     TK_FIXED},
     {"float",     TK_FLOAT},
+    {"goto",      TK_GOTO},
     {"for",       TK_FOR},
     {"foreach",   TK_FOREACH},
     {"get",       TK_GET},
@@ -54,6 +57,7 @@ static const keyword_entry_t s_keywords[] = {
     {"internal",  TK_INTERNAL},
     {"is",        TK_IS},
     {"let",       TK_LET},
+    {"lock",      TK_LOCK},
     {"long",      TK_LONG},
     {"namespace", TK_NAMESPACE},
     {"new",       TK_NEW},
@@ -670,8 +674,9 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         }
     }
 
-    /* suffix */
-    if (lexer_peek_ch(lex) == 'f' || lexer_peek_ch(lex) == 'F') {
+    /* suffix: f/F (float), m/M (decimal, mapped to double) */
+    if (lexer_peek_ch(lex) == 'f' || lexer_peek_ch(lex) == 'F' ||
+        lexer_peek_ch(lex) == 'm' || lexer_peek_ch(lex) == 'M') {
         is_float = true;
         lexer_advance(lex);
     }
@@ -681,7 +686,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     size_t bi = 0;
     for (size_t i = start; i < lex->pos && bi < 127; i++) {
         char ch = lex->source[i];
-        if (ch != '_' && ch != 'f' && ch != 'F') {
+        if (ch != '_' && ch != 'f' && ch != 'F' && ch != 'm' && ch != 'M') {
             buf[bi++] = ch;
         }
     }
