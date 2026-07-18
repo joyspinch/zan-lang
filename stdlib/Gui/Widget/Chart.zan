@@ -373,6 +373,42 @@ class Chart {
         return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
     }
 
+    // Shaded markArea band [markLo, markHi] on the left axis (drawn behind the
+    // series). No-op unless both bounds are set.
+    static void DrawMarkArea(App app, ChartFrame f, ChartOptions o) {
+        if (o.markLo == ChartOptions.Auto() || o.markHi == ChartOptions.Auto()) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int y0 = f.YOf(o.markHi, 0);
+        int y1 = f.YOf(o.markLo, 0);
+        if (y1 < y0) { int tmp = y0; y0 = y1; y1 = tmp; }
+        c.FillRect(f.plotX, y0, f.plotW, y1 - y0, Chart.WithAlpha(t.primary, 28));
+    }
+
+    // Horizontal threshold line at markLine on the left axis, with an optional
+    // right-aligned label (drawn on top of the series).
+    static void DrawMarkLine(App app, ChartFrame f, ChartOptions o) {
+        if (o.markLine == ChartOptions.Auto()) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int my = f.YOf(o.markLine, 0);
+        // dashed line
+        int dx = f.plotX;
+        int dash = app.Scale(6);
+        while (dx < f.plotX + f.plotW) {
+            int seg = dash;
+            if (dx + seg > f.plotX + f.plotW) { seg = f.plotX + f.plotW - dx; }
+            c.FillRect(dx, my, seg, 1, t.error);
+            dx = dx + dash * 2;
+        }
+        if (o.markLabel.Length > 0) {
+            int fs = t.fontSizeSmall;
+            int lw = Canvas.MeasureText(o.markLabel, fs);
+            c.DrawText(f.plotX + f.plotW - lw, my - Canvas.FontHeight(fs) - app.Scale(1),
+                o.markLabel, t.error, fs);
+        }
+    }
+
     // Cartesian frame with value gridlines (left) + category labels (bottom).
     static ChartFrame DrawFrame(App app, int x, int y, int w, int h, int plotTop,
                                 List<string> labels, int maxV) {
@@ -1058,6 +1094,11 @@ class ChartOptions {
     int gridBottom;
     int iwid;         // interaction key (set per-frame by ChartView.Render); 0 = none
     bool zoom;        // show a dataZoom range slider below cartesian charts
+    int markLine;     // draw a horizontal threshold line at this left-axis value (Auto = none)
+    string markLabel; // label shown at the markLine
+    int markLo;       // shaded markArea band [markLo, markHi] on the left axis (Auto = none)
+    int markHi;
+    bool pieLabels;   // draw percentage labels on pie/donut slices
 
     // Sentinel meaning "derive this bound from the data".
     static int Auto() { return 0 - 2000000000; }
@@ -1095,6 +1136,11 @@ class ChartOptions {
         o.gridBottom = 0 - 1;
         o.iwid = 0;
         o.zoom = false;
+        o.markLine = ChartOptions.Auto();
+        o.markLabel = "";
+        o.markLo = ChartOptions.Auto();
+        o.markHi = ChartOptions.Auto();
+        o.pieLabels = false;
         return o;
     }
 
@@ -1408,9 +1454,9 @@ class ChartView {
 
         int k = options.kind;
         if (k == 5) {
-            ChartView.DrawPie(app, x, y, w, h, model, 0, g);
+            ChartView.DrawPie(app, x, y, w, h, model, 0, g, options.pieLabels);
         } else if (k == 6) {
-            ChartView.DrawPie(app, x, y, w, h, model, options.donutPct, g);
+            ChartView.DrawPie(app, x, y, w, h, model, options.donutPct, g, options.pieLabels);
         } else if (k == 7) {
             ChartView.DrawScatter(app, x, y, w, h, model, t.primary, g);
         } else if (k == 8) {
@@ -1516,6 +1562,7 @@ class ChartView {
             Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
                 app.Scale(12), o.iwid, fullN);
         }
+        Chart.DrawMarkArea(app, f, o);
 
         int n = labels.Count;
         if (n < 1) { return; }
@@ -1610,6 +1657,7 @@ class ChartView {
             si = si + 1;
         }
 
+        Chart.DrawMarkLine(app, f, o);
         if (o.showTooltip) {
             ChartView.CartesianTooltip(app, f, labels, series, maxV, step, half);
         }
@@ -1653,6 +1701,7 @@ class ChartView {
             Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
                 app.Scale(12), o.iwid, fullN);
         }
+        Chart.DrawMarkArea(app, f, o);
         int maxV = f.leftMax;
         if (n < 1 || ns < 1) { return; }
 
@@ -1748,6 +1797,7 @@ class ChartView {
             }
         }
 
+        Chart.DrawMarkLine(app, f, o);
         if (o.showTooltip && o.kind != 3) {
             ChartView.CartesianTooltip(app, f, labels, series, maxV, step, step / 2);
         }
@@ -1788,7 +1838,7 @@ class ChartView {
     // ---- pie / donut (sweep grows with g) ----
 
     static void DrawPie(App app, int x, int y, int w, int h,
-                        ChartModel m, int innerPct, int g) {
+                        ChartModel m, int innerPct, int g, bool sliceLabels) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
@@ -1842,6 +1892,33 @@ class ChartView {
             }
             acc = acc + v;
             k = k + 1;
+        }
+
+        // Optional on-slice percentage labels, placed at the sector mid-angle.
+        if (sliceLabels) {
+            int rLbl = (rInner + rOuter) / 2;
+            if (rInner < app.Scale(4)) { rLbl = rOuter * 62 / 100; }
+            int acc2 = 0;
+            int p = 0;
+            while (p < m.series.Count) {
+                List<int> vs2 = m.series[p].values;
+                int v2 = 0;
+                if (vs2.Count > 0) { v2 = vs2[0]; }
+                int a0 = acc2 * 360 / total;
+                int a1 = (acc2 + v2) * 360 / total;
+                int pct = v2 * 100 / total;
+                if (a1 <= sweepMax && pct >= 4) {
+                    int mid = (a0 + a1) / 2;
+                    int lxp = cx + ChartView.CosDeg(mid) * rLbl / 1000;
+                    int lyp = cy + ChartView.SinDeg(mid) * rLbl / 1000;
+                    string pl = Convert.ToString(pct) + "%";
+                    int pw = Canvas.MeasureText(pl, t.fontSizeSmall);
+                    c.DrawText(lxp - pw / 2, lyp - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                        pl, 4294967295, t.fontSizeSmall);
+                }
+                acc2 = acc2 + v2;
+                p = p + 1;
+            }
         }
 
         // Donut centre caption: the running total, so the hole is informative.
