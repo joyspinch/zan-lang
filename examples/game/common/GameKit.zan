@@ -1,0 +1,390 @@
+// GameKit — shared, self-contained helpers for the examples/game products.
+// SDL-based (games always run on the SDL backend). No dependency on the ZGM UI
+// stack; the bitmap font is embedded here so each game is standalone.
+using System;
+using System.IO;
+using SDL3;
+
+namespace GameKit;
+
+// Embedded 8x8 ASCII glyph atlas (codepoints 32..126), hex-encoded, 8 row-bytes
+// per glyph; bit 7 is the leftmost column. Decoded once on first use.
+class Font {
+    static int[] rows;
+    static bool ready;
+
+    static int Advance() { return 6; }
+
+    static string Data() {
+        return "000000000000000000202020202000200050500000000000002828f850f8504000007840603808700060a0e8205828180070404060b8987800202000000000001020202020202010202020101020202000683030680000000000002020f820200000000000000020000000000070000000000000000000200008101020204040007c444c5464447c007030303030307800701808102040780070181830080870001030305010f8100070404070181870003040407048487000781010102020200070484870484870007048487808187000000020000000200000002000000020000000186060180000000000f800f800000000c03838c000007018102020002000007048b8a8b84000203050505878880070484870484870003840404040403800705848484858700078404078404078007840407840404000384040984848300048484878484848007820202020207800301010101010f00048506060505048004040404040407800c8d8d8b8a88888004848686858585800705848c8485870007048487040404000705848c84858700070585870504848007040403008087000f820202020202000484848484848700088484850503020008888a8b8585858004850302070488800885870202020200078081020204078302020202020203000404020201010086000000000000060003048000000000000000000000000000020000000000000000000700878487840404070484848700000003840404038080808785808587800000070487840781820207820202020000000785808587840404070484848482000006020202078100000701010101040404058707050486020202020202038000000f8a8a8a8a800000070484848480000007048484870000000704848487000000078584858780000003820000000000000704030187000002078202020380000004848485878000000484850302000000088a82858500000004830205048000000484850302000000078102000781820206020202018202020202020202060202018202020600000000060180000";
+    }
+
+    static int HexVal(int ch) {
+        if (ch >= 48 && ch <= 57) { return ch - 48; }
+        if (ch >= 97 && ch <= 102) { return ch - 97 + 10; }
+        if (ch >= 65 && ch <= 70) { return ch - 65 + 10; }
+        return 0;
+    }
+
+    static void Ensure() {
+        if (Font.ready) { return; }
+        string hex = Font.Data();
+        int n = hex.Length / 2;
+        Font.rows = new int[n];
+        int i = 0;
+        while (i < n) {
+            int hi = Font.HexVal(hex[i * 2] & 255);
+            int lo = Font.HexVal(hex[i * 2 + 1] & 255);
+            Font.rows[i] = hi * 16 + lo;
+            i = i + 1;
+        }
+        Font.ready = true;
+    }
+
+    static int Row(int codepoint, int row) {
+        Font.Ensure();
+        if (codepoint < 32 || codepoint > 126) { return 0; }
+        if (row < 0 || row >= 8) { return 0; }
+        return Font.rows[(codepoint - 32) * 8 + row];
+    }
+
+    static int Measure(string text, int scale) {
+        if (text == null) { return 0; }
+        if (scale < 1) { scale = 1; }
+        return text.Length * Font.Advance() * scale;
+    }
+}
+
+// Smooth anti-aliased TrueType font baked to a texture atlas (white glyphs,
+// tinted at draw time via SetColor). Falls back to the bitmap Font if the
+// atlas assets are missing. Assets: examples/game/common/assets/font.png + .txt
+class GlyphFont {
+    static SdlTexture atlas;
+    static bool tried;
+    static bool ok;
+    static int cellW;
+    static int cellH;
+    static int cols;
+    static int[] adv;   // advance width per glyph (codepoints 32..126)
+
+    static int NextInt(string s, int[] pos) {
+        int i = pos[0];
+        int n = s.Length;
+        bool started = false;
+        while (i < n && !started) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { started = true; }
+            else { i = i + 1; }
+        }
+        int v = 0;
+        bool any = false;
+        bool done = false;
+        while (i < n && !done) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { done = true; }
+        }
+        pos[0] = i;
+        if (!any) { return -1; }
+        return v;
+    }
+
+    static bool Ready(SdlRenderer r) {
+        if (GlyphFont.tried) { return GlyphFont.ok; }
+        GlyphFont.tried = true;
+        if (!File.Exists("examples/game/common/assets/font.txt")) { return false; }
+        SdlTexture t = SdlTexture.LoadImage(r, "examples/game/common/assets/font.png");
+        if (t == null || !t.IsValid()) { return false; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        string meta = File.ReadAllText("examples/game/common/assets/font.txt");
+        int[] pos = new int[1];
+        pos[0] = 0;
+        GlyphFont.cellW = GlyphFont.NextInt(meta, pos);
+        GlyphFont.cellH = GlyphFont.NextInt(meta, pos);
+        GlyphFont.cols = GlyphFont.NextInt(meta, pos);
+        int pad = GlyphFont.NextInt(meta, pos);
+        GlyphFont.adv = new int[95];
+        int i = 0;
+        while (i < 95) {
+            int a = GlyphFont.NextInt(meta, pos);
+            if (a < 0) { a = GlyphFont.cellW; }
+            GlyphFont.adv[i] = a;
+            i = i + 1;
+        }
+        GlyphFont.atlas = t;
+        GlyphFont.ok = true;
+        return true;
+    }
+
+    static int Measure(string text, int scale) {
+        if (text == null) { return 0; }
+        int w = 0;
+        int i = 0;
+        while (i < text.Length) {
+            int gi = (text[i] & 255) - 32;
+            if (gi < 0 || gi >= 95) { gi = 0; }
+            w = w + GlyphFont.adv[gi] * scale / 6;
+            i = i + 1;
+        }
+        return w;
+    }
+
+    static void Draw(SdlRenderer r, string text, int x, int y, int scale,
+                     int cr, int cg, int cb, int ca) {
+        GlyphFont.atlas.SetColor(cr, cg, cb);
+        GlyphFont.atlas.SetOpacity(ca);
+        int pen = x;
+        int dw = GlyphFont.cellW * scale / 6;
+        int dh = GlyphFont.cellH * scale / 6;
+        int i = 0;
+        while (i < text.Length) {
+            int gi = (text[i] & 255) - 32;
+            if (gi >= 0 && gi < 95) {
+                int col = gi % GlyphFont.cols;
+                int row = gi / GlyphFont.cols;
+                r.DrawTextureRegion(GlyphFont.atlas, col * GlyphFont.cellW,
+                    row * GlyphFont.cellH, GlyphFont.cellW, GlyphFont.cellH,
+                    pen, y, dw, dh);
+                pen = pen + GlyphFont.adv[gi] * scale / 6;
+            } else {
+                pen = pen + GlyphFont.adv[0] * scale / 6;
+            }
+            i = i + 1;
+        }
+        GlyphFont.atlas.ResetColor();
+        GlyphFont.atlas.SetOpacity(255);
+    }
+}
+
+// Host: a DPI/resolution-proof window + renderer. Windowed by default (F11 or
+// the game's toggle switches to fullscreen); the game always draws to a fixed
+// logical canvas that the renderer letterbox-scales to the window/screen, so
+// gameplay math is resolution-independent and looks correct on any DPI.
+class Host {
+    SdlWindow window;
+    SdlRenderer r;
+    int logicalW;
+    int logicalH;
+    bool running;
+    bool fullscreen;
+
+    static Host Create(string title, int logicalW, int logicalH) {
+        Sdl.Init(SdlInit.Video() + SdlInit.Events());
+        Host h = new Host();
+        // Windowed by default at the logical size (centered by SDL), resizable
+        // and high-DPI aware so it looks right on 4K without being oversized.
+        h.window = SdlWindow.Create(title, logicalW, logicalH,
+            SdlWindowFlags.Resizable() + SdlWindowFlags.HighPixelDensity());
+        h.r = SdlRenderer.Create(h.window);
+        h.r.SetBlend(1);
+        h.r.SetVSync(true);
+        h.r.SetLogicalSize(logicalW, logicalH,
+            SdlLogicalPresentation.Letterbox());
+        h.logicalW = logicalW;
+        h.logicalH = logicalH;
+        h.running = true;
+        h.fullscreen = false;
+        return h;
+    }
+
+    SdlRenderer Renderer() { return this.r; }
+    int Width() { return this.logicalW; }
+    int Height() { return this.logicalH; }
+    bool Running() { return this.running; }
+    void Quit() { this.running = false; }
+
+    void ToggleFullscreen() {
+        this.fullscreen = !this.fullscreen;
+        this.window.SetFullscreen(this.fullscreen);
+    }
+    bool IsFullscreen() { return this.fullscreen; }
+
+    int MouseX() { return this.r.LogicalX(SdlEvent.MouseX(), SdlEvent.MouseY()); }
+    int MouseY() { return this.r.LogicalY(SdlEvent.MouseX(), SdlEvent.MouseY()); }
+
+    void Begin(int cr, int cg, int cb) {
+        this.r.SetColor(cr, cg, cb, 255);
+        this.r.Clear();
+    }
+    void End() { this.r.Present(); }
+
+    void Close() {
+        this.window.Close();
+        Sdl.Quit();
+    }
+}
+
+// Deterministic xorshift RNG (seedable for reproducible shuffles/AI).
+class Rng {
+    long state;
+
+    static Rng Seed(long s) {
+        Rng g = new Rng();
+        if (s == 0) { s = 88172645463325252; }
+        g.state = s;
+        return g;
+    }
+
+    long NextLong() {
+        long x = this.state;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        this.state = x;
+        return x;
+    }
+
+    int Next() {
+        long v = this.NextLong();
+        if (v < 0) { v = -v; }
+        return (int)(v & 2147483647);
+    }
+
+    // Uniform integer in [lo, hi).
+    int Range(int lo, int hi) {
+        if (hi <= lo) { return lo; }
+        return lo + this.Next() % (hi - lo);
+    }
+}
+
+// Integer drawing helpers not provided by the SDL wrapper.
+class Draw {
+    static int Isqrt(int n) {
+        if (n <= 0) { return 0; }
+        int x = n;
+        int y = (x + 1) / 2;
+        while (y < x) {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        return x;
+    }
+
+    static void FillCircle(SdlRenderer r, int cx, int cy, int rad,
+                           int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        r.SetColor(cr, cg, cb, ca);
+        int dy = -rad;
+        while (dy <= rad) {
+            int dx = Draw.Isqrt(rad * rad - dy * dy);
+            r.FillRect(cx - dx, cy + dy, dx * 2 + 1, 1);
+            dy = dy + 1;
+        }
+    }
+
+    static void RingRect(SdlRenderer r, int x, int y, int w, int h, int t,
+                         int cr, int cg, int cb, int ca) {
+        r.SetColor(cr, cg, cb, ca);
+        r.FillRect(x, y, w, t);
+        r.FillRect(x, y + h - t, w, t);
+        r.FillRect(x, y, t, h);
+        r.FillRect(x + w - t, y, t, h);
+    }
+
+    static bool PointIn(int px, int py, int x, int y, int w, int h) {
+        return px >= x && px < x + w && py >= y && py < y + h;
+    }
+}
+
+// Talker: dynamic emotional commentary (praise / taunt / neutral banks).
+// Reused across games to raise the "emotional value" — mostly praise, with
+// playful jabs. Say() picks a random line from a bank and holds it on screen.
+class Talker {
+    List<string> praise;
+    List<string> taunt;
+    List<string> neutral;
+    List<string> hype;
+    string current;
+    int kind;
+    long until;
+    Rng rng;
+
+    static Talker Create(Rng rng) {
+        Talker t = new Talker();
+        t.praise = new List<string>();
+        t.taunt = new List<string>();
+        t.neutral = new List<string>();
+        t.hype = new List<string>();
+        t.current = "";
+        t.kind = 2;
+        t.until = 0;
+        t.rng = rng;
+        return t;
+    }
+
+    // bank: 0 praise, 1 taunt, 2 neutral, 3 hype
+    void Add(int bank, string line) {
+        if (bank == 0) { this.praise.Add(line); }
+        else if (bank == 1) { this.taunt.Add(line); }
+        else if (bank == 3) { this.hype.Add(line); }
+        else { this.neutral.Add(line); }
+    }
+
+    List<string> Bank(int bank) {
+        if (bank == 0) { return this.praise; }
+        if (bank == 1) { return this.taunt; }
+        if (bank == 3) { return this.hype; }
+        return this.neutral;
+    }
+
+    void Say(int bank, int nowMs, int holdMs) {
+        List<string> b = this.Bank(bank);
+        if (b.Count == 0) { return; }
+        this.current = b[this.rng.Range(0, b.Count)];
+        this.kind = bank;
+        this.until = (long)nowMs + (long)holdMs;
+    }
+
+    void SayExact(int bank, string line, int nowMs, int holdMs) {
+        this.current = line;
+        this.kind = bank;
+        this.until = (long)nowMs + (long)holdMs;
+    }
+
+    string Current(int nowMs) {
+        if ((long)nowMs > this.until) { return ""; }
+        return this.current;
+    }
+
+    int Kind() { return this.kind; }
+}
+
+class Text {
+    static void Draw(SdlRenderer r, string text, int x, int y, int scale,
+                     int cr, int cg, int cb, int ca) {
+        if (text == null) { return; }
+        if (scale < 1) { scale = 1; }
+        if (GlyphFont.Ready(r)) {
+            GlyphFont.Draw(r, text, x, y, scale, cr, cg, cb, ca);
+            return;
+        }
+        r.SetColor(cr, cg, cb, ca);
+        int cx = x;
+        int i = 0;
+        while (i < text.Length) {
+            int cp = text[i] & 255;
+            int ry = 0;
+            while (ry < 8) {
+                int mask = Font.Row(cp, ry);
+                int rx = 0;
+                while (rx < 8) {
+                    if ((mask & (1 << (7 - rx))) != 0) {
+                        r.FillRect(cx + rx * scale, y + ry * scale, scale, scale);
+                    }
+                    rx = rx + 1;
+                }
+                ry = ry + 1;
+            }
+            cx = cx + Font.Advance() * scale;
+            i = i + 1;
+        }
+    }
+
+    static void DrawCentered(SdlRenderer r, string text, int centerX, int y,
+                             int scale, int cr, int cg, int cb, int ca) {
+        int w = Font.Measure(text, scale);
+        if (GlyphFont.Ready(r)) { w = GlyphFont.Measure(text, scale); }
+        Text.Draw(r, text, centerX - w / 2, y, scale, cr, cg, cb, ca);
+    }
+}
