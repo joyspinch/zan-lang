@@ -112,6 +112,11 @@ class Parser {
         if (k == TK.Object()) { return true; }
         if (k == TK.Byte()) { return true; }
         if (k == TK.Short()) { return true; }
+        if (k == TK.Uint()) { return true; }
+        if (k == TK.Ulong()) { return true; }
+        if (k == TK.Ushort()) { return true; }
+        if (k == TK.Sbyte()) { return true; }
+        if (k == TK.Decimal()) { return true; }
         return false;
     }
 
@@ -127,6 +132,12 @@ class Parser {
         if (k == TK.Object()) { return "object"; }
         if (k == TK.Byte()) { return "byte"; }
         if (k == TK.Short()) { return "short"; }
+        if (k == TK.Uint()) { return "uint"; }
+        if (k == TK.Ulong()) { return "ulong"; }
+        if (k == TK.Ushort()) { return "ushort"; }
+        if (k == TK.Sbyte()) { return "sbyte"; }
+        // decimal is mapped to double throughout the compiler
+        if (k == TK.Decimal()) { return "double"; }
         return "int";
     }
 
@@ -210,6 +221,7 @@ class Parser {
             else if (k == TK.Async()) { m = m + MOD.Async(); Next(); }
             else if (k == TK.Ident() && Cur().text == "extern") { m = m + MOD.Extern(); Next(); }
             else if (k == TK.Ident() && Cur().text == "weak") { m = m + MOD.Weak(); Next(); }
+            else if (k == TK.Ident() && Cur().text == "partial") { m = m + MOD.Partial(); Next(); }
             else if (k == TK.Sealed()) { Next(); }
             else if (k == TK.Const()) { Next(); }
             else { return m; }
@@ -225,7 +237,267 @@ class Parser {
             else if (k == TK.Namespace()) { ParseNamespace(unit); }
             else { Node d = ParseTypeDecl(); if (d != null) { unit.Add(d); } }
         }
+        MergePartials(unit);
+        DesugarEvents(unit);
+        DesugarIterators(unit);
         return unit;
+    }
+
+    // Iterator methods are lowered eagerly: a method containing `yield` gets a
+    // hidden `List<T> __yield` accumulator, each `yield return e` appends to it,
+    // `yield break` returns it early, and the method returns the finished list
+    // (its IEnumerable<T> return type is rewritten to List<T>, which foreach
+    // already iterates). Mirrors the C host desugar_yield.
+    void DesugarIterators(Node unit) {
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node m = d.kids[mi];
+                    if (m.kind == AK.MethodDecl() && m.d != null) { DesugarYieldMethod(m); }
+                    mi = mi + 1;
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    bool StmtHasYield(Node s) {
+        if (s == null) { return false; }
+        if (s.kind == AK.YieldStmt()) { return true; }
+        if (StmtHasYield(s.a)) { return true; }
+        if (StmtHasYield(s.b)) { return true; }
+        if (StmtHasYield(s.c)) { return true; }
+        if (StmtHasYield(s.d)) { return true; }
+        int i = 0;
+        while (i < s.kids.Count) { if (StmtHasYield(s.kids[i])) { return true; } i = i + 1; }
+        return false;
+    }
+
+    Node YieldIdent() {
+        Node id = new Node(AK.Ident());
+        id.sval = "__yield";
+        return id;
+    }
+
+    Node RewriteYieldOne(Node s) {
+        if (s == null) { return null; }
+        if (s.kind == AK.YieldStmt()) {
+            if (s.a != null) {
+                Node mem = new Node(AK.MemberAccess());
+                mem.a = YieldIdent(); mem.sval = "Add"; mem.line = s.line; mem.col = s.col;
+                Node call = new Node(AK.Call());
+                call.a = mem; call.Add(s.a); call.line = s.line; call.col = s.col;
+                Node es = new Node(AK.ExprStmt());
+                es.a = call; es.line = s.line; es.col = s.col;
+                return es;
+            }
+            Node ret = new Node(AK.ReturnStmt());
+            ret.a = YieldIdent(); ret.line = s.line; ret.col = s.col;
+            return ret;
+        }
+        RewriteYields(s);
+        return s;
+    }
+
+    void RewriteYields(Node s) {
+        if (s == null) { return; }
+        int k = s.kind;
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) { s.kids[i] = RewriteYieldOne(s.kids[i]); i = i + 1; }
+        } else if (k == AK.IfStmt()) {
+            s.b = RewriteYieldOne(s.b);
+            s.c = RewriteYieldOne(s.c);
+        } else if (k == AK.WhileStmt()) {
+            s.b = RewriteYieldOne(s.b);
+        } else if (k == AK.ForStmt()) {
+            s.d = RewriteYieldOne(s.d);
+        } else if (k == AK.ForeachStmt()) {
+            s.c = RewriteYieldOne(s.c);
+        } else if (k == AK.TryStmt()) {
+            s.a = RewriteYieldOne(s.a);
+            if (s.b != null) { s.b.a = RewriteYieldOne(s.b.a); }
+            s.c = RewriteYieldOne(s.c);
+        } else if (k == AK.SwitchStmt()) {
+            int i = 0;
+            while (i < s.kids.Count) { Node c = s.kids[i]; c.b = RewriteYieldOne(c.b); i = i + 1; }
+        }
+    }
+
+    void DesugarYieldMethod(Node m) {
+        Node body = m.d;
+        if (!StmtHasYield(body)) { return; }
+        Node rt = m.type;
+        if (rt == null) { return; }
+        // rewrite IEnumerable<T> / List<T> return type to List<T>
+        rt.sval = "List";
+        // build accumulator initializer: new List<T>()
+        Node lt = new Node(AK.TypeRef());
+        lt.sval = "List";
+        int i = 0;
+        while (i < rt.kids.Count) { lt.Add(rt.kids[i]); i = i + 1; }
+        if (lt.kids.Count > 0) { lt.a = lt.kids[0]; }
+        Node nw = new Node(AK.NewExpr());
+        nw.type = lt;
+        Node decl = new Node(AK.VarDecl());
+        decl.sval = "__yield";
+        decl.type = null;
+        decl.b = nw;
+        RewriteYields(body);
+        Node ret = new Node(AK.ReturnStmt());
+        ret.a = YieldIdent();
+        List<Node> old = body.kids;
+        List<Node> nk = new List<Node>();
+        nk.Add(decl);
+        int j = 0;
+        while (j < old.Count) { nk.Add(old[j]); j = j + 1; }
+        nk.Add(ret);
+        body.kids = nk;
+    }
+
+    bool ContainsStr(List<string> xs, string s) {
+        int i = 0;
+        while (i < xs.Count) { if (xs[i] == s) { return true; } i = i + 1; }
+        return false;
+    }
+
+    Node FindDelegate(Node unit, string name) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.DelegateDecl() && d.sval == name) { return d; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // `event D E;` fields lower to a generated multicast holder class
+    // `__Event_D` backed by a List<D>; its op_add/op_sub drive the `E += h` /
+    // `E -= h` compound-assignment desugar, E.Invoke(..) raises the event and
+    // E.Count() reports the handler count. Mirrors the C host desugar_events.
+    void DesugarEvents(Node unit) {
+        List<string> gen = new List<string>();
+        int origCount = unit.kids.Count;
+        int di = 0;
+        while (di < origCount) {
+            Node d = unit.kids[di];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node m = d.kids[mi];
+                    if (m.kind == AK.FieldDecl() && HasModBit(m.mods, MOD.Event()) && m.type != null) {
+                        string dn = m.type.sval;
+                        Node ddecl = FindDelegate(unit, dn);
+                        if (ddecl != null) {
+                            string hn = "__Event_" + dn;
+                            if (!ContainsStr(gen, hn)) {
+                                GenEventHolder(unit, ddecl, dn, hn);
+                                gen.Add(hn);
+                            }
+                            m.type.sval = hn;
+                        }
+                    }
+                    mi = mi + 1;
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    void GenEventHolder(Node unit, Node ddecl, string dn, string hn) {
+        string s = "class " + hn + " {\n";
+        s = s + "    List<" + dn + "> hs;\n";
+        s = s + "    static " + hn + " op_add(" + hn + " self, " + dn + " h) {\n";
+        s = s + "        " + hn + " r = self;\n";
+        s = s + "        if (r == null) { r = new " + hn + "(); r.hs = new List<" + dn + ">(); }\n";
+        s = s + "        r.hs.Add(h);\n";
+        s = s + "        return r;\n";
+        s = s + "    }\n";
+        s = s + "    static " + hn + " op_sub(" + hn + " self, " + dn + " h) {\n";
+        s = s + "        if (self == null) { return self; }\n";
+        s = s + "        int i = self.hs.Count - 1;\n";
+        s = s + "        while (i >= 0) {\n";
+        s = s + "            if (self.hs[i] == h) { self.hs.RemoveAt(i); return self; }\n";
+        s = s + "            i = i - 1;\n";
+        s = s + "        }\n";
+        s = s + "        return self;\n";
+        s = s + "    }\n";
+        s = s + "    int Count() { return hs.Count; }\n";
+        s = s + "    void Invoke(";
+        int i = 0;
+        while (i < ddecl.kids.Count) {
+            Node p = ddecl.kids[i];
+            if (p.kind == AK.Param()) {
+                if (i > 0) { s = s + ", "; }
+                s = s + TypeName(p.type) + " a" + i;
+            }
+            i = i + 1;
+        }
+        s = s + ") {\n";
+        s = s + "        int i = 0;\n";
+        s = s + "        while (i < hs.Count) {\n";
+        s = s + "            " + dn + " d = hs[i];\n";
+        s = s + "            d(";
+        i = 0;
+        while (i < ddecl.kids.Count) {
+            Node p = ddecl.kids[i];
+            if (p.kind == AK.Param()) {
+                if (i > 0) { s = s + ", "; }
+                s = s + "a" + i;
+            }
+            i = i + 1;
+        }
+        s = s + ");\n";
+        s = s + "            i = i + 1;\n";
+        s = s + "        }\n";
+        s = s + "    }\n";
+        s = s + "}\n";
+        Lexer lx = new Lexer(s);
+        List<Token> gt = lx.Run();
+        Parser gp = new Parser(gt, diags);
+        Node gu = gp.ParseUnit();
+        int j = 0;
+        while (j < gu.kids.Count) { unit.Add(gu.kids[j]); j = j + 1; }
+    }
+
+    // Merge `partial` type declarations: members (and base) of later parts are
+    // appended to the first part of the same kind/name, later parts dropped.
+    // Runs before binding so the rest of the pipeline sees one decl per type.
+    void MergePartials(Node unit) {
+        List<Node> merged = new List<Node>();
+        int di = 0;
+        while (di < unit.kids.Count) {
+            Node d = unit.kids[di];
+            Node first = null;
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && HasModBit(d.mods, MOD.Partial())) {
+                int fi = 0;
+                while (fi < merged.Count) {
+                    Node e = merged[fi];
+                    if (e.kind == d.kind && HasModBit(e.mods, MOD.Partial()) && e.sval == d.sval) {
+                        first = e;
+                        fi = merged.Count;
+                    } else {
+                        fi = fi + 1;
+                    }
+                }
+            }
+            if (first != null) {
+                int mi = 0;
+                while (mi < d.kids.Count) {
+                    Node km = d.kids[mi];
+                    if (km.kind != AK.TypeParam()) { first.Add(km); }
+                    mi = mi + 1;
+                }
+                if (first.sval2 == "" && d.sval2 != "") { first.sval2 = d.sval2; }
+            } else {
+                merged.Add(d);
+            }
+            di = di + 1;
+        }
+        unit.kids = merged;
     }
 
     Node ParseUsing() {
@@ -262,9 +534,82 @@ class Parser {
         if (k == TK.Interface()) { return ParseInterface(mods); }
         if (k == TK.Enum()) { return ParseEnum(mods); }
         if (k == TK.Ident() && Cur().text == "delegate") { return ParseDelegate(mods); }
+        if (k == TK.Ident() && Cur().text == "record" && K1() == TK.Ident()) { return ParseRecord(); }
         // unknown: skip token to make progress
         Next();
         return null;
+    }
+
+    // `record Name(T a, ...);` is contextual and lowers to a class with public
+    // fields, a positional constructor, field-wise op_eq/op_ne value equality
+    // and a C#-style ToString. Mirrors the C host's gen_record_class: build the
+    // class source and re-parse it, then return the generated class decl.
+    Node ParseRecord() {
+        Next(); // record
+        string nm = "";
+        if (At(TK.Ident())) { nm = Next().text; }
+        Node ps = new Node(AK.MethodDecl());
+        ParseParams(ps);
+        Expect(TK.Semicolon());
+        string src = BuildRecordSrc(nm, ps);
+        Lexer lx = new Lexer(src);
+        List<Token> gt = lx.Run();
+        Parser gp = new Parser(gt, diags);
+        Node gu = gp.ParseUnit();
+        if (gu.kids.Count > 0) { return gu.kids[0]; }
+        return null;
+    }
+
+    string BuildRecordSrc(string nm, Node ps) {
+        string s = "class " + nm + " {\n";
+        int i = 0;
+        while (i < ps.kids.Count) {
+            Node p = ps.kids[i];
+            s = s + "    public " + TypeName(p.type) + " " + p.sval + ";\n";
+            i = i + 1;
+        }
+        s = s + "    public " + nm + "(";
+        i = 0;
+        while (i < ps.kids.Count) {
+            Node p = ps.kids[i];
+            if (i > 0) { s = s + ", "; }
+            s = s + TypeName(p.type) + " " + p.sval;
+            i = i + 1;
+        }
+        s = s + ") {\n";
+        i = 0;
+        while (i < ps.kids.Count) {
+            Node p = ps.kids[i];
+            s = s + "        this." + p.sval + " = " + p.sval + ";\n";
+            i = i + 1;
+        }
+        s = s + "    }\n";
+        s = s + "    static bool op_eq(" + nm + " l, " + nm + " r) {\n";
+        s = s + "        if (l == null) { return r == null; }\n";
+        s = s + "        if (r == null) { return false; }\n";
+        s = s + "        return true";
+        i = 0;
+        while (i < ps.kids.Count) {
+            Node p = ps.kids[i];
+            s = s + " && l." + p.sval + " == r." + p.sval;
+            i = i + 1;
+        }
+        s = s + ";\n    }\n";
+        s = s + "    static bool op_ne(" + nm + " l, " + nm + " r) { return !(l == r); }\n";
+        s = s + "    public string ToString() {\n";
+        s = s + "        return \"" + nm + " {\"";
+        i = 0;
+        while (i < ps.kids.Count) {
+            Node p = ps.kids[i];
+            string sep = " "; if (i > 0) { sep = ", "; }
+            s = s + " + \"" + sep + p.sval + " = \" + ";
+            bool isStr = p.type != null && p.type.sval == "string" && p.type.ival != 1;
+            if (isStr) { s = s + p.sval; }
+            else { s = s + "Convert.ToString(" + p.sval + ")"; }
+            i = i + 1;
+        }
+        s = s + " + \" }\";\n    }\n}\n";
+        return s;
     }
 
     // delegate <ret> Name [<T,...>] ( params ) ;  -- registered as a named
@@ -293,6 +638,7 @@ class Parser {
             if (At(TK.Ident())) { cls.sval2 = Next().text; }
             while (Eat(TK.Comma())) { if (At(TK.Ident())) { Next(); } }
         }
+        SkipWhereClauses();
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
             Node m = ParseMember(cls.sval);
@@ -329,6 +675,7 @@ class Parser {
             if (At(TK.Ident())) { cls.sval2 = Next().text; }
             while (Eat(TK.Comma())) { if (At(TK.Ident())) { Next(); } }
         }
+        SkipWhereClauses();
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
             Node m = ParseMember(cls.sval);
@@ -336,6 +683,19 @@ class Parser {
         }
         Expect(TK.RBrace());
         return cls;
+    }
+
+    // Generic constraint clauses `where T : C1, C2 ...`. Generics are erased in
+    // this compiler, so constraints are parsed and discarded; skip each clause
+    // up to the body opener (`{`/`=>`/`;`) or the next `where`.
+    void SkipWhereClauses() {
+        while (At(TK.Ident()) && Cur().text == "where") {
+            Next();
+            while (!At(TK.LBrace()) && !At(TK.Arrow()) && !At(TK.Semicolon()) && !At(TK.Eof())
+                   && !(At(TK.Ident()) && Cur().text == "where")) {
+                Next();
+            }
+        }
     }
 
     // Add a parsed member, splicing property-desugar groups (kind Block).
@@ -371,6 +731,9 @@ class Parser {
         bool wantExtern = attrDll;
         string entry = attrEntry;
         int mods = ParseMods();
+        // `event` is contextual: a field modifier only when introducing an
+        // event field (`event D E;`), so identifiers named `event` still work.
+        if (At(TK.Ident()) && Cur().text == "event" && K1() == TK.Ident()) { Next(); mods = mods + MOD.Event(); }
         // destructor / finalizer:  ~Name() { ... }  (~ is lexed as Bang)
         if (At(TK.Bang())) {
             Next(); // '~'
@@ -420,6 +783,7 @@ class Parser {
         if (At(TK.LParen())) {
             member.kind = AK.MethodDecl();
             ParseParams(member);
+            SkipWhereClauses();
             if (At(TK.LBrace())) { member.d = ParseBlock(); }
             else { Expect(TK.Semicolon()); }
             if ((wantExtern || HasModBit(mods, MOD.Extern())) && member.d == null) {
@@ -561,6 +925,67 @@ class Parser {
 
     Node ParseStmtInner() {
         int k = K();
+        // `yield` is contextual: only `yield return e;` / `yield break;` are
+        // statements, so identifiers named `yield` keep working elsewhere.
+        if (k == TK.Ident() && Cur().text == "yield" && (K1() == TK.Return() || K1() == TK.Break())) {
+            Next(); // yield
+            int nk = Next().kind; // return / break
+            Node y = new Node(AK.YieldStmt());
+            if (nk == TK.Return()) { y.a = ParseExpr(); }
+            Expect(TK.Semicolon());
+            return y;
+        }
+        // contextual `unsafe { ... }`: no unsafe semantics, just run the block.
+        if (k == TK.Ident() && Cur().text == "unsafe" && K1() == TK.LBrace()) {
+            Next();
+            return ParseBlock();
+        }
+        // contextual `lock (e) body`: single-threaded, so evaluate e then run
+        // the body (lowered to a block).
+        if (k == TK.Ident() && Cur().text == "lock" && K1() == TK.LParen()) {
+            Next();
+            Expect(TK.LParen());
+            Node le = ParseExpr();
+            Expect(TK.RParen());
+            Node lockBody = ParseStmt();
+            Node lblk = new Node(AK.Block());
+            Node les = new Node(AK.ExprStmt());
+            les.a = le;
+            lblk.Add(les);
+            lblk.Add(lockBody);
+            return lblk;
+        }
+        // contextual `fixed (T v = e) body`: nothing to pin, so declare v then
+        // run the body (lowered to a block).
+        if (k == TK.Ident() && Cur().text == "fixed" && K1() == TK.LParen()) {
+            Next();
+            Expect(TK.LParen());
+            Node fvd = new Node(AK.VarDecl());
+            fvd.type = ParseType();
+            if (At(TK.Ident())) { fvd.sval = Next().text; }
+            if (Eat(TK.Eq())) { fvd.b = ParseExpr(); }
+            Expect(TK.RParen());
+            Node fixBody = ParseStmt();
+            Node fblk = new Node(AK.Block());
+            fblk.Add(fvd);
+            fblk.Add(fixBody);
+            return fblk;
+        }
+        // contextual `goto label;`
+        if (k == TK.Ident() && Cur().text == "goto" && K1() == TK.Ident()) {
+            Next();
+            Node g = new Node(AK.GotoStmt());
+            g.sval = Next().text;
+            Expect(TK.Semicolon());
+            return g;
+        }
+        // goto label definition:  name:
+        if (k == TK.Ident() && K1() == TK.Colon()) {
+            Node lab = new Node(AK.LabelStmt());
+            lab.sval = Next().text;
+            Expect(TK.Colon());
+            return lab;
+        }
         if (k == TK.LBrace()) { return ParseBlock(); }
         if (k == TK.If()) { return ParseIf(); }
         if (k == TK.While()) { return ParseWhile(); }
@@ -749,7 +1174,35 @@ class Parser {
         return false;
     }
 
+    // LINQ query: `from x in src [where c]... select e`. `from` is contextual,
+    // committed only once `in` follows the range variable.
+    Node ParseQuery() {
+        int save = pos;
+        Next(); // from
+        string qv = Next().text; // range var
+        if (!At(TK.In())) { pos = save; return null; }
+        Next(); // in
+        Node q = new Node(AK.QueryExpr());
+        q.sval = qv;
+        q.a = ParseExpr();
+        while (At(TK.Ident()) && Cur().text == "where") {
+            Next();
+            q.Add(ParseExpr());
+        }
+        if (At(TK.Ident()) && Cur().text == "select") {
+            Next();
+            q.b = ParseExpr();
+        } else {
+            diags.Error("expected 'select' in query expression", Cur().line, Cur().col);
+        }
+        return q;
+    }
+
     Node ParseAssign() {
+        if (At(TK.Ident()) && Cur().text == "from" && K1() == TK.Ident()) {
+            Node q = ParseQuery();
+            if (q != null) { return q; }
+        }
         Node left = ParseCoalesce();
         // conditional:  cond ? a : b  (right-associative, above assignment)
         if (At(TK.Question())) {
@@ -1026,8 +1479,51 @@ class Parser {
         return r;
     }
 
+    // Canonical display name of a parsed type-ref, matching the C host's
+    // render_type_ref_name (used by typeof).
+    string TypeName(Node t) {
+        string s = t.sval;
+        if (t.kids.Count > 0) {
+            s = s + "<";
+            int i = 0;
+            while (i < t.kids.Count) {
+                if (i > 0) { s = s + ", "; }
+                s = s + TypeName(t.kids[i]);
+                i = i + 1;
+            }
+            s = s + ">";
+        }
+        if (t.ival == 1) { s = s + "[]"; }
+        if (t.op == 1) { s = s + "?"; }
+        return s;
+    }
+
     Node ParsePrimaryInner() {
         int k = K();
+        // typeof(T) folds to the type's display name string.
+        if (k == TK.Ident() && Cur().text == "typeof" && K1() == TK.LParen()) {
+            Next(); Next(); // typeof (
+            Node ty = ParseType();
+            Expect(TK.RParen());
+            Node n = new Node(AK.StringLit());
+            n.sval = TypeName(ty);
+            return n;
+        }
+        // nameof(x) / nameof(a.b.c) folds to the trailing identifier string.
+        if (k == TK.Ident() && Cur().text == "nameof" && K1() == TK.LParen()) {
+            Next(); Next(); // nameof (
+            string nm = "";
+            if (IsTypeKeyword(K())) { nm = TypeKeywordName(K()); Next(); }
+            else if (At(TK.Ident())) { nm = Next().text; }
+            while (At(TK.Dot()) || At(TK.QDot())) {
+                Next();
+                if (At(TK.Ident())) { nm = Next().text; }
+            }
+            Expect(TK.RParen());
+            Node n = new Node(AK.StringLit());
+            n.sval = nm;
+            return n;
+        }
         if (k == TK.IntLit()) { Node n = new Node(AK.IntLit()); n.ival = Next().intVal; return n; }
         if (k == TK.FloatLit()) { Node n = new Node(AK.FloatLit()); n.sval = Next().text; return n; }
         if (k == TK.StringLit()) { Node n = new Node(AK.StringLit()); n.sval = Next().text; return n; }

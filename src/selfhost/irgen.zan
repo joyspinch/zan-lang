@@ -54,6 +54,8 @@ class Irgen {
     public bool curAsyncThis;
     public int curAsyncThisSlot;
     public Node curAsyncThisTy;
+    public List<string> gotoNames; // per-function goto label name -> id
+    public List<int> gotoIds;
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -182,7 +184,7 @@ class Irgen {
     bool IsPrimValue(Node t) {
         if (t == null) { return false; }
         string n = t.sval;
-        return n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "double" || n == "float";
+        return n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "double" || n == "float" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte";
     }
 
     bool IsNullableValue(Node t) { return IsNullable(t) && IsPrimValue(t); }
@@ -219,7 +221,7 @@ class Irgen {
         if (n == "void") { return "void"; }
         if (n == "string") { return "i8*"; }
         if (n == "double" || n == "float") { return "double"; }
-        if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short") { return "i64"; }
+        if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte") { return "i64"; }
         if (n == "object" || n == "var") { return "i8*"; }
         if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
         if (n == "StringBuilder") { return "i8*"; }
@@ -566,6 +568,8 @@ class Irgen {
         H("@.fmt.sn = private unnamed_addr constant [3 x i8] c\"%s\\00\"");
         H("@.fmt.gnl = private unnamed_addr constant [4 x i8] c\"%g\\0A\\00\"");
         H("@.fmt.gn = private unnamed_addr constant [3 x i8] c\"%g\\00\"");
+        H("@.fmt.unl = private unnamed_addr constant [6 x i8] c\"%llu\\0A\\00\"");
+        H("@.fmt.unn = private unnamed_addr constant [5 x i8] c\"%llu\\00\"");
         H("@.msg.unhandled = private unnamed_addr constant [25 x i8] c\"Unhandled exception: %s\\0A\\00\"");
         H("@.msg.exnil = private unnamed_addr constant [13 x i8] c\"(no message)\\00\"");
         H("@.msg.rderr = private unnamed_addr constant [18 x i8] c\"cannot read file\\0A\\00\"");
@@ -1295,6 +1299,22 @@ class Irgen {
         stmtTemps = new List<string>();
         stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
+        gotoNames = new List<string>();
+        gotoIds = new List<int>();
+    }
+
+    // Resolve a goto label name to a stable per-function label id, allocating
+    // one on first use so forward references (goto before label) work.
+    int LabelId(string name) {
+        int i = 0;
+        while (i < gotoNames.Count) {
+            if (gotoNames[i] == name) { return gotoIds[i]; }
+            i = i + 1;
+        }
+        int id = NL();
+        gotoNames.Add(name);
+        gotoIds.Add(id);
+        return id;
     }
 
     bool IsAsync(Node m) {
@@ -2412,6 +2432,14 @@ class Irgen {
     // ---- statements ----
     void GenStmt(Node s) {
         if (s == null) { return; }
+        // A label is a branch target, so it must be emitted even when the
+        // current block is already terminated (e.g. code after a goto).
+        if (s.kind == AK.LabelStmt()) {
+            int lid = LabelId(s.sval);
+            if (!term) { L("  br label %L" + lid); }
+            Label(lid);
+            return;
+        }
         if (term) { return; }
         int k = s.kind;
         if (IsAwaitStmt(s)) { GenAwaitStmt(s); return; }
@@ -2470,6 +2498,10 @@ class Irgen {
             if (brkTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + brkTarget); term = true; }
         } else if (k == AK.ContinueStmt()) {
             if (contTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + contTarget); term = true; }
+        } else if (k == AK.GotoStmt()) {
+            int gid = LabelId(s.sval);
+            L("  br label %L" + gid);
+            term = true;
         } else {
             GenExpr(s);
         }
@@ -2820,7 +2852,23 @@ class Irgen {
                 EmitArcRetain(sv, ty);
             }
         } else {
-            if (ArcManaged(ty)) { L("  store " + lt + " null, " + lt + "* " + reg); }
+            Node sd = binder.FindType(ty.sval);
+            if (sd != null && sd.kind == AK.StructDecl() && ty.ival == 0 && !IsNullable(ty)) {
+                // value struct default-initialised: allocate zeroed storage so
+                // field accesses operate on real memory (calloc zeroes fields).
+                string cn = ty.sval;
+                string szp = NT();
+                L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
+                string szi = NT();
+                L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
+                string raw = NT();
+                L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*))");
+                string obj = NT();
+                L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
+                L("  store " + lt + " " + obj + ", " + lt + "* " + reg);
+            } else if (ArcManaged(ty)) {
+                L("  store " + lt + " null, " + lt + "* " + reg);
+            }
         }
     }
 
@@ -2898,6 +2946,108 @@ class Irgen {
         TrimLocals(forScope);
         brkTarget = sb; contTarget = sc;
         loopScopeBase = sls;
+    }
+
+    // Infer the projected element type of a query's `select` expression, with
+    // the range variable resolving to the source element type.
+    Node QueryElem(Node sel, string qv, Node elemTy) {
+        if (sel == null) { return elemTy; }
+        int k = sel.kind;
+        if (k == AK.IntLit()) { return MkType("int"); }
+        if (k == AK.FloatLit()) { return MkType("double"); }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.CastExpr()) { return sel.type; }
+        if (k == AK.NewExpr()) { return sel.type; }
+        if (k == AK.Ident()) {
+            if (sel.sval == qv) { return elemTy; }
+            int li = LocalIdx(sel.sval);
+            if (li >= 0) { return locType[li]; }
+            return elemTy;
+        }
+        if (k == AK.Unary()) {
+            if (sel.op == TK.Bang()) { return MkType("bool"); }
+            return QueryElem(sel.a, qv, elemTy);
+        }
+        if (k == AK.Binary()) {
+            int op = sel.op;
+            if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq() || op == TK.AmpAmp() || op == TK.PipePipe()) {
+                return MkType("bool");
+            }
+            Node lt = QueryElem(sel.a, qv, elemTy);
+            Node rt = QueryElem(sel.b, qv, elemTy);
+            if (IsStr(lt) || IsStr(rt)) { return MkType("string"); }
+            if (lt != null) { return lt; }
+            return rt;
+        }
+        if (k == AK.MemberAccess()) {
+            if (sel.sval == "Length" || sel.sval == "Count") { return MkType("int"); }
+            return MkType("int");
+        }
+        return elemTy;
+    }
+
+    // from x in src [where c]... select e — an eager loop that filters and
+    // projects each element into a fresh List<sel>. Mirrors the C host lowering.
+    ExprVal GenQuery(Node e) {
+        int qScope = locName.Count;
+        ExprVal coll = GenExpr(e.a);
+        Node srcElem = ListElem(coll.ty);
+        if (srcElem == null) { srcElem = MkType("int"); }
+        string selt = MapType(srcElem);
+        Node resElem = QueryElem(e.b, e.sval, srcElem);
+        Node resListTy = MkType("List");
+        resListTy.a = resElem; resListTy.Add(resElem);
+        string ow = "0"; if (ArcManaged(resElem)) { ow = "1"; }
+        string list = NT();
+        L("  " + list + " = call i8* @zlist_new(i64 " + ow + ")");
+        if (!IsListType(coll.ty)) { AddTemp(list, resListTy); return new ExprVal(list, resListTy); }
+        string idx = NT();
+        L("  " + idx + " = alloca i64");
+        L("  store i64 0, i64* " + idx);
+        string ereg = AddLocal(e.sval, srcElem);
+        L("  " + ereg + " = alloca " + selt);
+        if (ArcManaged(srcElem)) { L("  store " + selt + " null, " + selt + "* " + ereg); }
+        int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string iv = NT();
+        L("  " + iv + " = load i64, i64* " + idx);
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + coll.op + ")");
+        string c = NT();
+        L("  " + c + " = icmp slt i64 " + iv + ", " + cnt);
+        L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        Label(lb);
+        string slot = NT();
+        L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
+        ExprVal ev = FromSlot(slot, srcElem);
+        L("  store " + selt + " " + ev.op + ", " + selt + "* " + ereg);
+        int wi = 0;
+        while (wi < e.kids.Count) {
+            string wc = GenCond(e.kids[wi]);
+            int lkeep = NL();
+            L("  br i1 " + wc + ", label %L" + lkeep + ", label %L" + linc);
+            Label(lkeep);
+            wi = wi + 1;
+        }
+        ExprVal sel = GenExpr(e.b);
+        string sv = ToSlot(sel, resElem);
+        L("  call void @zlist_add(i8* " + list + ", i64 " + sv + ")");
+        L("  br label %L" + linc);
+        Label(linc);
+        string iv2 = NT();
+        L("  " + iv2 + " = load i64, i64* " + idx);
+        string inc = NT();
+        L("  " + inc + " = add i64 " + iv2 + ", 1");
+        L("  store i64 " + inc + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        TrimLocals(qScope);
+        AddTemp(list, resListTy);
+        return new ExprVal(list, resListTy);
     }
 
     // foreach (T x in coll) body  — lowered as an indexed walk over List<T>
@@ -3059,7 +3209,7 @@ class Irgen {
         if (e == null) { return new ExprVal("0", MkType("int")); }
         int k = e.kind;
         if (k == AK.IntLit()) { return new ExprVal("" + e.ival, MkType("int")); }
-        if (k == AK.FloatLit()) { return new ExprVal(e.sval, MkType("double")); }
+        if (k == AK.FloatLit()) { return new ExprVal(FloatConst(e.sval), MkType("double")); }
         if (k == AK.BoolLit()) { return new ExprVal("" + e.ival, MkType("bool")); }
         if (k == AK.CharLit()) { return new ExprVal("" + e.ival, MkType("char")); }
         if (k == AK.StringLit()) { return GenStr(e.sval); }
@@ -3085,6 +3235,7 @@ class Irgen {
             if (e.ival == 1) { return GenNullCond(e, e); }
             return GenMember(e);
         }
+        if (k == AK.QueryExpr()) { return GenQuery(e); }
         if (k == AK.Index()) { return GenIndex(e); }
         if (k == AK.NewExpr()) { return GenNew(e); }
         if (k == AK.CastExpr()) { return GenCast(e); }
@@ -3203,8 +3354,36 @@ class Irgen {
         if (op == TK.GreaterEq()) { return "sge"; }
         return "";
     }
+    // Unsigned integer comparison predicates (for ulong operands).
+    string UCmpOp(int op) {
+        if (op == TK.EqEq()) { return "eq"; }
+        if (op == TK.BangEq()) { return "ne"; }
+        if (op == TK.Less()) { return "ult"; }
+        if (op == TK.Greater()) { return "ugt"; }
+        if (op == TK.LessEq()) { return "ule"; }
+        if (op == TK.GreaterEq()) { return "uge"; }
+        return "";
+    }
+
+    // A valid LLVM floating constant: ensure a decimal point / exponent so
+    // integer-looking literals (e.g. the `3` from `3m`) are emitted as doubles.
+    string FloatConst(string s) {
+        if (s == "") { return "0.0"; }
+        int i = 0;
+        bool hasDot = false;
+        while (i < s.Length) {
+            int c = (int)s[i];
+            if (c == 46 || c == 101 || c == 69) { hasDot = true; }
+            i = i + 1;
+        }
+        if (hasDot) { return s; }
+        return s + ".0";
+    }
 
     bool IsStr(Node ty) { if (ty == null) { return false; } return ty.sval == "string"; }
+    // ulong is the one integer type whose value can set the high bit of the i64
+    // slot, so it selects unsigned division/remainder/shift/compare and %llu.
+    bool IsUlong(Node ty) { if (ty == null) { return false; } return ty.sval == "ulong"; }
     // True for a value lowered to LLVM `double` (both double and float here).
     bool IsDbl(Node ty) { if (ty == null) { return false; } return ty.sval == "double" || ty.sval == "float"; }
 
@@ -3362,6 +3541,9 @@ class Irgen {
         }
         ExprVal a = GenExpr(e.a);
         ExprVal b = GenExpr(e.b);
+        // ulong operands select unsigned div/rem/shift/compare and carry the
+        // unsigned type through so results print with %llu.
+        bool uns = IsUlong(a.ty) || IsUlong(b.ty);
         // user-defined operator overloading takes precedence for class operands
         ExprVal ov = TryOpOverload(op, a, b);
         if (ov != null) { return ov; }
@@ -3391,6 +3573,7 @@ class Irgen {
             }
             string t = NT();
             L("  " + t + " = add i64 " + a.op + ", " + b.op);
+            if (uns) { return new ExprVal(t, MkType("ulong")); }
             return new ExprVal(t, MkType("int"));
         }
         if (op == TK.EqEq() || op == TK.BangEq()) {
@@ -3435,11 +3618,18 @@ class Irgen {
             if (op == TK.Plus() && a.op == "0") { return b; }
             if ((op == TK.Star() || op == TK.Slash()) && b.op == "1") { return a; }
             if (op == TK.Star() && a.op == "1") { return b; }
+            if (uns) {
+                if (op == TK.Slash()) { ar = "udiv"; }
+                else if (op == TK.Percent()) { ar = "urem"; }
+                else if (op == TK.GreaterGreater()) { ar = "lshr"; }
+            }
             string t = NT();
             L("  " + t + " = " + ar + " i64 " + a.op + ", " + b.op);
+            if (uns) { return new ExprVal(t, MkType("ulong")); }
             return new ExprVal(t, MkType("int"));
         }
         string cp = CmpOp(op);
+        if (uns) { cp = UCmpOp(op); }
         if (cp != "") {
             // lexicographic ordering for strings (matches ==/!= strcmp handling)
             if (IsStr(a.ty) && IsStr(b.ty)) {
@@ -3525,16 +3715,18 @@ class Irgen {
             L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + dbuf + ", i64 " + dbsz + ", i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
             return dbuf;
         }
-        // integer -> string
+        // integer -> string ("%llu" for ulong so the high bit prints unsigned)
+        string ifmt = "@.fmt.nn";
+        if (IsUlong(v.ty)) { ifmt = "@.fmt.unn"; }
         string need = NT();
-        L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.fmt.nn, i64 0, i64 0), i64 " + v.op + ")");
+        L("  " + need + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
         string need64 = NT();
         L("  " + need64 + " = sext i32 " + need + " to i64");
         string bsz = NT();
         L("  " + bsz + " = add i64 " + need64 + ", 1");
         string buf = NT();
         L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
-        L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.fmt.nn, i64 0, i64 0), i64 " + v.op + ")");
+        L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
         return buf;
     }
 
@@ -4272,6 +4464,29 @@ class Irgen {
             L("  " + t + " = fptosi double " + v.op + " to i64");
             return new ExprVal(t, tgt);
         }
+        // unsigned / small-width targets share the i64 slot, so their cast is a
+        // wrap-to-width mask (zero-extend for uint/ushort, sign-extend from 8
+        // bits for sbyte) applied to the i64 value.
+        if (!toD && !fromD && tgt != null && MapType(v.ty) == "i64") {
+            string tn = tgt.sval;
+            if (tn == "uint") {
+                string t = NT();
+                L("  " + t + " = and i64 " + v.op + ", 4294967295");
+                return new ExprVal(t, tgt);
+            }
+            if (tn == "ushort") {
+                string t = NT();
+                L("  " + t + " = and i64 " + v.op + ", 65535");
+                return new ExprVal(t, tgt);
+            }
+            if (tn == "sbyte") {
+                string s1 = NT();
+                L("  " + s1 + " = shl i64 " + v.op + ", 56");
+                string s2 = NT();
+                L("  " + s2 + " = ashr i64 " + s1 + ", 56");
+                return new ExprVal(s2, tgt);
+            }
+        }
         // remaining numeric casts are all i64 in this model; just retag
         return new ExprVal(v.op, tgt);
     }
@@ -4889,6 +5104,10 @@ class Irgen {
             } else {
                 string fg = "@.fmt.nn"; int fl = 5;
                 if (nl) { fg = "@.fmt.nl"; fl = 6; }
+                if (has && IsUlong(arg.ty)) {
+                    fg = "@.fmt.unn"; fl = 5;
+                    if (nl) { fg = "@.fmt.unl"; fl = 6; }
+                }
                 string gp = NT();
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
                 string a0 = "0"; if (has) { a0 = arg.op; }
