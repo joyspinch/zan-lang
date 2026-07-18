@@ -1128,6 +1128,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!zan_diag_has_errors(diag)) {
+        zan_parser_desugar_events(ast, arena, diag);
+    }
+
     if (do_dump_ast) {
         if (!zan_diag_has_errors(diag)) {
             dump_ast_node(ast, 0);

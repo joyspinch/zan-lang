@@ -19,4 +19,9 @@ void zan_parser_init(zan_parser_t *p, zan_lexer_t *lex, zan_arena_t *arena,
                      zan_diag_t *diag);
 zan_ast_node_t *zan_parser_parse(zan_parser_t *p);
 
+/* Lower `event D E;` fields into generated multicast holder classes.
+ * Runs on the merged compilation unit after all files are parsed. */
+void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
+                               zan_diag_t *diag);
+
 #endif /* ZAN_PARSER_H */

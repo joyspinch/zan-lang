@@ -1464,6 +1464,14 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
 
     uint32_t mods = parse_modifiers(p);
     if (dll_import_lib.str) mods |= MOD_EXTERN;
+    /* `event` is contextual: only a modifier when introducing an event field
+     * (`event D E;`), so identifiers named `event` keep working elsewhere. */
+    if (parser_check(p, TK_IDENT) && p->current.str_val.len == 5 &&
+        memcmp(p->current.str_val.str, "event", 5) == 0 &&
+        zan_lexer_peek(p->lex).kind == TK_IDENT) {
+        parser_advance(p);
+        mods |= MOD_EVENT;
+    }
     zan_loc_t loc = p->current.loc;
 
     /* destructor: ~ClassName() { } */
@@ -1937,4 +1945,147 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
     }
 
     return unit;
+}
+
+/* ---- event desugaring ----
+ *
+ * `event D E;` fields are lowered to a generated multicast holder class
+ * `__Event_D` backed by a `List<D>`. Its `op_add`/`op_sub` operators drive
+ * the compound-assignment desugar (`E += h` becomes `E = E + h`), so event
+ * subscription needs no dedicated codegen; `E.Invoke(...)` raises the event
+ * and `E.Count()` reports the handler count. The holder is materialized
+ * lazily inside op_add, matching C#'s null-until-subscribed field events. */
+
+static zan_ast_node_t *find_delegate_decl(zan_ast_node_t *unit, zan_istr_t name) {
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[i];
+        if (d->kind == AST_DELEGATE_DECL &&
+            d->method_decl.name.len == name.len &&
+            memcmp(d->method_decl.name.str, name.str, (size_t)name.len) == 0)
+            return d;
+    }
+    return NULL;
+}
+
+static int tref_write(char *buf, int cap, zan_ast_node_t *t) {
+    int n = 0;
+    if (!t || t->kind != AST_TYPE_REF) return 0;
+    n += snprintf(buf + n, (size_t)(cap - n), "%.*s",
+                  (int)t->type_ref.name.len, t->type_ref.name.str);
+    if (t->type_ref.type_args.count > 0) {
+        n += snprintf(buf + n, (size_t)(cap - n), "<");
+        for (int i = 0; i < t->type_ref.type_args.count; i++) {
+            if (i > 0) n += snprintf(buf + n, (size_t)(cap - n), ", ");
+            n += tref_write(buf + n, cap - n, t->type_ref.type_args.items[i]);
+        }
+        n += snprintf(buf + n, (size_t)(cap - n), ">");
+    }
+    if (t->type_ref.is_array) n += snprintf(buf + n, (size_t)(cap - n), "[]");
+    if (t->type_ref.is_nullable) n += snprintf(buf + n, (size_t)(cap - n), "?");
+    return n;
+}
+
+static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
+                             const char *dname, const char *hname,
+                             zan_arena_t *arena, zan_diag_t *diag) {
+    char src[8192];
+    int n = 0;
+    n += snprintf(src + n, sizeof(src) - (size_t)n,
+        "class %s {\n"
+        "    List<%s> hs;\n"
+        "    static %s op_add(%s self, %s h) {\n"
+        "        %s r = self;\n"
+        "        if (r == null) { r = new %s(); r.hs = new List<%s>(); }\n"
+        "        r.hs.Add(h);\n"
+        "        return r;\n"
+        "    }\n"
+        "    static %s op_sub(%s self, %s h) {\n"
+        "        if (self == null) { return self; }\n"
+        "        int i = self.hs.Count - 1;\n"
+        "        while (i >= 0) {\n"
+        "            if (self.hs[i] == h) { self.hs.RemoveAt(i); return self; }\n"
+        "            i = i - 1;\n"
+        "        }\n"
+        "        return self;\n"
+        "    }\n"
+        "    int Count() { return hs.Count; }\n"
+        "    void Invoke(",
+        hname, dname, hname, hname, dname, hname, hname, dname,
+        hname, hname, dname);
+    for (int i = 0; i < ddecl->method_decl.params.count; i++) {
+        zan_ast_node_t *pp = ddecl->method_decl.params.items[i];
+        if (i > 0) n += snprintf(src + n, sizeof(src) - (size_t)n, ", ");
+        n += tref_write(src + n, (int)sizeof(src) - n, pp->param.type);
+        n += snprintf(src + n, sizeof(src) - (size_t)n, " a%d", i);
+    }
+    n += snprintf(src + n, sizeof(src) - (size_t)n,
+        ") {\n"
+        "        int i = 0;\n"
+        "        while (i < hs.Count) {\n"
+        "            %s d = hs[i];\n"
+        "            d(", dname);
+    for (int i = 0; i < ddecl->method_decl.params.count; i++) {
+        n += snprintf(src + n, sizeof(src) - (size_t)n, "%sa%d",
+                      i > 0 ? ", " : "", i);
+    }
+    n += snprintf(src + n, sizeof(src) - (size_t)n,
+        ");\n"
+        "            i = i + 1;\n"
+        "        }\n"
+        "    }\n"
+        "}\n");
+
+    char *gsrc = zan_arena_strdup(arena, src, (size_t)n);
+    zan_lexer_t lex;
+    zan_lexer_init(&lex, gsrc, (size_t)n, 0, arena, diag);
+    zan_parser_t gp;
+    zan_parser_init(&gp, &lex, arena, diag);
+    zan_ast_node_t *gu = zan_parser_parse(&gp);
+    for (int i = 0; i < gu->comp_unit.decls.count; i++)
+        zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[i],
+                          arena);
+}
+
+void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
+                               zan_diag_t *diag) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    const char *generated[64];
+    int generated_count = 0;
+    int decl_count = unit->comp_unit.decls.count;
+    for (int di = 0; di < decl_count; di++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[di];
+        if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL) continue;
+        for (int mi = 0; mi < d->type_decl.members.count; mi++) {
+            zan_ast_node_t *m = d->type_decl.members.items[mi];
+            if (m->kind != AST_FIELD_DECL || !(m->field_decl.modifiers & MOD_EVENT))
+                continue;
+            zan_ast_node_t *tr = m->field_decl.type;
+            if (!tr || tr->kind != AST_TYPE_REF || tr->type_ref.type_args.count) {
+                zan_diag_emit(diag, DIAG_ERROR, m->loc,
+                              "event field requires a non-generic delegate type");
+                continue;
+            }
+            zan_ast_node_t *ddecl = find_delegate_decl(unit, tr->type_ref.name);
+            if (!ddecl) {
+                zan_diag_emit(diag, DIAG_ERROR, m->loc,
+                              "event type '%.*s' is not a declared delegate",
+                              (int)tr->type_ref.name.len, tr->type_ref.name.str);
+                continue;
+            }
+            char dname[256], hname[280];
+            snprintf(dname, sizeof(dname), "%.*s",
+                     (int)tr->type_ref.name.len, tr->type_ref.name.str);
+            snprintf(hname, sizeof(hname), "__Event_%s", dname);
+            int already = 0;
+            for (int gi = 0; gi < generated_count; gi++)
+                if (strcmp(generated[gi], hname) == 0) { already = 1; break; }
+            if (!already && generated_count < 64) {
+                gen_event_holder(unit, ddecl, dname, hname, arena, diag);
+                generated[generated_count++] =
+                    zan_arena_strdup(arena, hname, strlen(hname));
+            }
+            char *hn = zan_arena_strdup(arena, hname, strlen(hname));
+            tr->type_ref.name = (zan_istr_t){hn, (uint32_t)strlen(hname)};
+        }
+    }
 }
