@@ -172,6 +172,11 @@ class App {
     // none); fxSnapValid says slot 7 holds the current frame.
     int fxNextMs;
     bool fxSnapValid;
+    // Pixel rects (x,y,w,h quads) the effect layer touched in the last
+    // composited frame; the next effect tick repairs just these from the
+    // slot-7 snapshot instead of restoring the whole frame. null = unknown
+    // (repair falls back to a full-frame restore once).
+    List<int> fxDamage;
 
     static App Create(string title, int width, int height) {
         App app = new App();
@@ -246,6 +251,7 @@ class App {
         app.fxEnabled = true;
         app.fxNextMs = -1;
         app.fxSnapValid = false;
+        app.fxDamage = null;
         app.backdropDirty = true;
         app.blurSlotSeq = 0;
         // gen != snapGen so the wallpaper is painted (and snapshotted) once up
@@ -485,13 +491,36 @@ class App {
     /// e.g. after a resize.
     bool FxPresent() {
         if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
+        if (!window.IsVisible()) {
+            // The window cannot be seen (minimized or fully covered): stop
+            // ticking so a hidden window costs no CPU. Any event -- including
+            // the visibility-change wake -- re-arms the effect (ProcessEvent /
+            // ApplyEvent).
+            fxNextMs = -1;
+            return true;
+        }
         Canvas fc = canvas;
-        if (!fc.RestoreRect(0, 0, fc.Width(), fc.Height(), 7)) {
+        bool ok;
+        if (fxDamage == null) {
+            ok = fc.RestoreRect(0, 0, fc.Width(), fc.Height(), 7);
+        } else {
+            // Repair only the pixels the previous effect frame touched: a few
+            // hundred tiny copies instead of a full-frame restore.
+            ok = true;
+            int i = 0;
+            while (ok && i + 3 < fxDamage.Count) {
+                ok = fc.RestoreSubRect(fxDamage[i], fxDamage[i + 1],
+                                       fxDamage[i + 2], fxDamage[i + 3], 7);
+                i = i + 4;
+            }
+        }
+        if (!ok) {
             fxSnapValid = false;
             return false;
         }
         BackdropFx.Render(fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
                           Window.GetTickMs(), theme, dpiScale);
+        fxDamage = BackdropFx.TakeDamage();
         window.Present(canvas);
         lastPresentMs = Window.GetTickMs();
         fxNextMs = lastPresentMs + BackdropFx.IntervalMs(this.EffectiveFx());
@@ -1272,6 +1301,13 @@ class App {
             needsRedraw = true;
         }
 
+        // Resume a paused ambient effect once the window can be seen again
+        // (FxPresent parks fxNextMs at -1 while hidden; the visibility-change
+        // wake, like any event, lands here and re-arms it).
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()) {
+            fxNextMs = Window.GetTickMs();
+        }
+
         return true;
     }
 
@@ -1389,6 +1425,14 @@ class App {
         }
 
         if (kind == 6 || kind == 4 || kind == 5) { needsRedraw = true; }
+
+        // Resume a paused ambient effect once the window can be seen again
+        // (FxPresent parks fxNextMs at -1 while hidden; the visibility-change
+        // wake, like any event, lands here and re-arms it).
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()) {
+            fxNextMs = Window.GetTickMs();
+        }
+
         return true;
     }
 
@@ -1405,7 +1449,9 @@ class App {
             fxSnapValid = true;
             BackdropFx.Render(fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
                               Window.GetTickMs(), theme, dpiScale);
+            fxDamage = BackdropFx.TakeDamage();
             fxNextMs = Window.GetTickMs() + BackdropFx.IntervalMs(this.EffectiveFx());
+            if (!window.IsVisible()) { fxNextMs = -1; }
         } else {
             fxNextMs = -1;
         }

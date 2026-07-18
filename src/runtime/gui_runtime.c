@@ -236,6 +236,24 @@ u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride) {
     return s->pixels;
 }
 
+/* Internal (not part of the [DllImport] ABI): expose the surface's active
+ * clip window so platform backends that rasterize text/glyphs themselves
+ * (e.g. the macOS CoreText path) honour PushClip like the shared renderer. */
+void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0, int *x1, int *y1) {
+    if (id < 0 || id >= g_surface_count || !g_surfaces[id]) {
+        if (x0) *x0 = 0;
+        if (y0) *y0 = 0;
+        if (x1) *x1 = 0;
+        if (y1) *y1 = 0;
+        return;
+    }
+    zan_surface_t *s = g_surfaces[id];
+    if (x0) *x0 = s->clip_x0;
+    if (y0) *y0 = s->clip_y0;
+    if (x1) *x1 = s->clip_x1;
+    if (y1) *y1 = s->clip_y1;
+}
+
 EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -662,6 +680,36 @@ EXPORT i64 zan_gui_restore_rect(i64 surface_id, i64 x, i64 y, i64 w,
     return 1;
 }
 
+/* Restores just the part of slot `slot` that intersects [x,y,w,h]. Unlike
+ * zan_gui_restore_rect the rect need not match the snapshot's geometry, so a
+ * caller can repair many small damaged regions (e.g. the previous animation
+ * frame's particles) without copying the whole snapshot back. Returns 1 while
+ * the slot holds a valid snapshot for this surface size, 0 otherwise. */
+EXPORT i64 zan_gui_restore_sub_rect(i64 surface_id, i64 x, i64 y, i64 w,
+                                    i64 h, i64 slot) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return 0;
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return 0;
+    zan_blur_cache_t *c = &g_snap_cache[slot];
+    if (!c->valid || !c->pixels) return 0;
+    int x0 = clamp_i((int)x, c->x0, c->x0 + c->rw);
+    int y0 = clamp_i((int)y, c->y0, c->y0 + c->rh);
+    int x1 = clamp_i((int)(x + w), c->x0, c->x0 + c->rw);
+    int y1 = clamp_i((int)(y + h), c->y0, c->y0 + c->rh);
+    x0 = clamp_i(x0, 0, s->width);
+    y0 = clamp_i(y0, 0, s->height);
+    x1 = clamp_i(x1, 0, s->width);
+    y1 = clamp_i(y1, 0, s->height);
+    if (x1 <= x0 || y1 <= y0) return 1;
+    for (int j = y0; j < y1; j++) {
+        u32 *row = s->pixels + j * s->stride + x0;
+        u32 *src = c->pixels + (size_t)(j - c->y0) * c->rw + (x0 - c->x0);
+        for (int i = 0; i < x1 - x0; i++) row[i] = src[i];
+    }
+    return 1;
+}
+
 EXPORT void zan_gui_draw_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color, i64 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -698,26 +746,27 @@ EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
     zan_gui_fill_rect(surface_id, ix, yt, iw, ih - 2*r, color);      /* middle    */
     zan_gui_fill_rect(surface_id, xl, yb, iw - 2*r, r, color);        /* bottom band */
 
-    int cc[4][2] = {
-        {xl, yt},         /* TL, square px<xl, py<yt   */
-        {xr - 1, yt},     /* TR, square px>=xr, py<yt  */
-        {xl, yb - 1},     /* BL, square px<xl, py>=yb  */
-        {xr - 1, yb - 1}  /* BR, square px>=xr, py>=yb */
+    /* Corner arcs: sample each pixel centre against the continuous corner
+     * centre so all four corners share the same geometry (integer centres
+     * biased TL/BR corners by half a pixel and read as lumpy edges). */
+    double cc[4][2] = {
+        {xl, yt},     /* TL, square px<xl, py<yt   */
+        {xr, yt},     /* TR, square px>=xr, py<yt  */
+        {xl, yb},     /* BL, square px<xl, py>=yb  */
+        {xr, yb}      /* BR, square px>=xr, py>=yb */
     };
     int zx[4] = {ix, xr, ix, xr};
     int zy[4] = {iy, iy, yb, yb};
     for (int ci = 0; ci < 4; ci++) {
-        int ccx = cc[ci][0], ccy = cc[ci][1];
+        double ccx = cc[ci][0], ccy = cc[ci][1];
         for (int py = zy[ci]; py < zy[ci] + r; py++) {
             for (int px = zx[ci]; px < zx[ci] + r; px++) {
-                double ddx = (double)(px - ccx);
-                double ddy = (double)(py - ccy);
+                double ddx = (double)px + 0.5 - ccx;
+                double ddy = (double)py + 0.5 - ccy;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
-                if (dist <= (double)r - 0.5) {
-                    set_pixel(s, px, py, c);
-                } else if (dist <= (double)r + 0.5) {
-                    set_pixel_aa(s, px, py, c, (int)(((double)r + 0.5 - dist) * 255.0));
-                }
+                double cov = (double)r - dist + 0.5;
+                if (cov >= 1.0) set_pixel(s, px, py, c);
+                else if (cov > 0.0) set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
             }
         }
     }
@@ -748,18 +797,18 @@ EXPORT void zan_gui_draw_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
     zan_gui_fill_rect(surface_id, ix, yt, th, ih - 2*r, color);             /* left   */
     zan_gui_fill_rect(surface_id, ix + iw - th, yt, th, ih - 2*r, color);   /* right  */
 
-    int cc[4][2] = {
-        {xl, yt}, {xr - 1, yt}, {xl, yb - 1}, {xr - 1, yb - 1}
+    double cc[4][2] = {
+        {xl, yt}, {xr, yt}, {xl, yb}, {xr, yb}
     };
     int zx[4] = {ix, xr, ix, xr};
     int zy[4] = {iy, iy, yb, yb};
     double rin = (double)r - (double)th;   /* inner arc radius */
     for (int ci = 0; ci < 4; ci++) {
-        int ccx = cc[ci][0], ccy = cc[ci][1];
+        double ccx = cc[ci][0], ccy = cc[ci][1];
         for (int py = zy[ci]; py < zy[ci] + r; py++) {
             for (int px = zx[ci]; px < zx[ci] + r; px++) {
-                double ddx = (double)(px - ccx);
-                double ddy = (double)(py - ccy);
+                double ddx = (double)px + 0.5 - ccx;
+                double ddy = (double)py + 0.5 - ccy;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
                 double outerCov = (double)r + 0.5 - dist;        /* 1 inside outer edge */
                 double innerCov = dist - (rin - 0.5);            /* 1 outside inner edge */
@@ -1775,6 +1824,14 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     return 0;
 }
 
+/* 1 while the window can be seen (not minimized/hidden); ambient animations
+ * pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) return 0;
+    return 1;
+}
+
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
@@ -2451,6 +2508,16 @@ EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     return (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
+}
+
+/* 1 while the window can be seen (not minimized/hidden/occluded); ambient
+ * animations pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    SDL_WindowFlags f = SDL_GetWindowFlags(win);
+    if (f & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED))
+        return 0;
+    return 1;
 }
 
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
@@ -4156,6 +4223,19 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     return (found_v && found_h) ? 1 : 0;
 }
 
+/* 1 while the window can be seen (not iconified/unmapped); ambient
+ * animations pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!g_display || !xid) return 0;
+    XWindowAttributes attrs;
+    if (XGetWindowAttributes(g_display, xid, &attrs)
+        && attrs.map_state != IsViewable) {
+        return 0;
+    }
+    return 1;
+}
+
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     x11_wm_state(xid, x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
@@ -4438,6 +4518,7 @@ EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT const char *zan_gui_get_clipboard(void) { return ""; }

@@ -27,9 +27,12 @@ typedef uint32_t u32;
 
 /* Implemented in gui_runtime.c; not part of the [DllImport] ABI. */
 extern u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride);
+extern void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0,
+                                          int *x1, int *y1);
 
 /* Defined below; used by the client-side title-bar metrics helpers. */
 i64 zan_gui_get_dpi_scale(void);
+i64 zan_gui_wake(void);
 
 #define EXPORT __attribute__((visibility("default")))
 
@@ -91,9 +94,20 @@ static int evq_pop(void) {
     return 1;
 }
 
+/* Defined with the event pump below; needed by ZanView's key handling. */
+static long zan_mods(NSUInteger f);
+
+/* Caret position in client-area (surface) pixels, reported by the app via
+ * zan_gui_set_ime_pos so the IME candidate window can follow the cursor. */
+static int g_ime_x = 0;
+static int g_ime_y = 0;
+/* Non-zero while an IME composition (marked text) is active; the event pump
+ * suppresses raw key/char delivery so widgets don't see composition keys. */
+static int g_ime_composing = 0;
+
 /* Custom content view that blits its own last-presented CGImage, so each
  * window renders independently. */
-@interface ZanView : NSView {
+@interface ZanView : NSView <NSTextInputClient> {
 @public
     CGImageRef frame;
     /* Double-buffered IOSurfaces for the layer-contents present path: CA can
@@ -104,6 +118,7 @@ static int evq_pop(void) {
     IOSurfaceRef iosurf[2];
     int ioW, ioH;
     int backingIdx;
+    NSString *imeMarked;    /* active IME composition text, nil when none */
 }
 @end
 
@@ -128,6 +143,103 @@ static int evq_pop(void) {
     CGContextDrawImage(ctx, self.bounds, frame);
     CGContextRestoreGState(ctx);
 }
+
+/* ---- text input / IME (NSTextInputClient) ----
+ * Key events are routed through the view's input context so macOS input
+ * methods (pinyin, kana, ...) can compose: marked text tracks the in-progress
+ * composition (the IME draws its own candidate window at
+ * firstRectForCharacterRange, fed from zan_gui_set_ime_pos), and committed
+ * text arrives via insertText: as WM_CHAR-style kind-6 events -- the same
+ * shape the Win32 backend produces. */
+- (void)keyDown:(NSEvent *)ev {
+    /* Cmd/Ctrl shortcuts are delivered as control codes by decode_event and
+     * must not be eaten by the input context. */
+    if (zan_mods([ev modifierFlags]) & 1) return;
+    NSTextInputContext *ic = [self inputContext];
+    /* The event pump drives the run loop manually, so make sure the context
+     * is the active one before handing it the key event; otherwise the IME
+     * never engages. */
+    [ic activate];
+    if ([ic handleEvent:ev]) return;
+    /* No input method took the event: deliver printable characters directly
+     * (decode_event already pushed the key-down and control keys). */
+    NSString *chars = [ev characters];
+    for (NSUInteger i = 0; i < [chars length]; i++) {
+        unichar u = [chars characterAtIndex:i];
+        if (u >= 32 && u != 127 && !(u >= 0xF700 && u <= 0xF8FF))
+            evq_push(6, 0, 0, 0, (long)u, 0);
+    }
+}
+
+- (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    (void)replacementRange;
+    NSString *s = [string isKindOfClass:[NSAttributedString class]]
+        ? [string string] : (NSString *)string;
+    for (NSUInteger i = 0; i < [s length]; i++) {
+        unichar u = [s characterAtIndex:i];
+        if (u >= 32 && u != 127 && !(u >= 0xF700 && u <= 0xF8FF))
+            evq_push(6, 0, 0, 0, (long)u, 0);
+    }
+    [self unmarkText];
+}
+
+- (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange
+     replacementRange:(NSRange)replacementRange {
+    (void)selectedRange; (void)replacementRange;
+    NSString *s = [string isKindOfClass:[NSAttributedString class]]
+        ? [string string] : (NSString *)string;
+    [imeMarked release];
+    imeMarked = [s length] ? [s copy] : nil;
+    g_ime_composing = imeMarked != nil;
+}
+
+- (void)unmarkText {
+    [imeMarked release];
+    imeMarked = nil;
+    g_ime_composing = 0;
+}
+
+- (BOOL)hasMarkedText { return imeMarked != nil; }
+
+- (NSRange)markedRange {
+    return imeMarked ? NSMakeRange(0, [imeMarked length])
+                     : NSMakeRange(NSNotFound, 0);
+}
+
+- (NSRange)selectedRange { return NSMakeRange(NSNotFound, 0); }
+
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range
+                                                actualRange:(NSRangePointer)actual {
+    (void)range; (void)actual;
+    return nil;
+}
+
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText {
+    return [NSArray array];
+}
+
+/* Anchor the IME candidate window at the app-reported caret position
+ * (surface pixels -> view points -> screen). */
+- (NSRect)firstRectForCharacterRange:(NSRange)range
+                         actualRange:(NSRangePointer)actual {
+    (void)range;
+    if (actual) *actual = NSMakeRange(0, 0);
+    CGFloat scale = [[self window] backingScaleFactor];
+    if (scale <= 0) scale = 1.0;
+    NSRect r = NSMakeRect(g_ime_x / scale, g_ime_y / scale, 1,
+                          20.0 * zan_gui_get_dpi_scale() / 100.0 / scale);
+    r = [self convertRect:r toView:nil];
+    return [[self window] convertRectToScreen:r];
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    (void)point;
+    return 0;
+}
+
+/* Control keys (Enter/Tab/Backspace/arrows) already reach widgets through
+ * decode_event's key-down path; nothing extra to synthesize here. */
+- (void)doCommandBySelector:(SEL)selector { (void)selector; }
 @end
 
 /* Borderless windows are not key/main by default; allow both so the app still
@@ -169,6 +281,21 @@ static int zan_caption_btn_w(void) { return (int)(46 * zan_gui_get_dpi_scale() /
     evq_push(8, 0, 0, 0, 0, 0);
     return NO; /* let the app decide when to quit rather than tearing down */
 }
+/* Visibility changes (occluded by other windows, miniaturized, restored) wake
+ * the event pump with an empty (kind 0) event so the app can pause or resume
+ * its ambient backdrop animation (see zan_gui_window_visible). */
+- (void)windowDidChangeOcclusionState:(NSNotification *)note {
+    NSWindow *win = [note object];
+    g_evt_win = (long)(intptr_t)win;
+    evq_push(0, 0, 0, 0, 0, 0);
+    zan_gui_wake();
+}
+- (void)windowDidMiniaturize:(NSNotification *)note {
+    [self windowDidChangeOcclusionState:note];
+}
+- (void)windowDidDeminiaturize:(NSNotification *)note {
+    [self windowDidChangeOcclusionState:note];
+}
 @end
 
 static ZanDelegate *g_delegate = nil;
@@ -208,6 +335,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         view.layer.contentsGravity = kCAGravityResize;
         view.layer.opaque = NO;
         [window setContentView:view];
+        [window makeFirstResponder:view];        /* key/IME input lands on the view */
         [window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
         [window setDelegate:g_delegate];          /* one delegate serves all windows */
         [window setMovableByWindowBackground:NO]; /* dragging is caption-driven */
@@ -436,12 +564,17 @@ static void decode_event(NSEvent *ev) {
         break;
     }
     case NSEventTypeKeyDown: {
+        /* While an IME composition is active the input method owns the
+         * keyboard: it consumes letters/Backspace/Enter to edit the marked
+         * text and commits via insertText:, so widgets must not see the raw
+         * keys. (sendEvent -> keyDown -> inputContext runs after this.) */
+        if (g_ime_composing) break;
         long vk = zan_vk_from_keycode([ev keyCode]);
         if (vk == 0) vk = zan_vk_from_chars([ev charactersIgnoringModifiers]);
         evq_push(4, 0, 0, 0, vk, mods);
-        /* Emit a WM_CHAR-style text event so widgets receive the same integer
-         * codes as on Win32 (typing, Backspace/Tab/Enter, and Ctrl/Cmd
-         * shortcuts as ASCII control codes). */
+        /* Emit WM_CHAR-style text events for control keys so widgets receive
+         * the same integer codes as on Win32. Printable text is delivered by
+         * the view's insertText: (IME-composed or plain) instead. */
         if (mods & 1) {
             /* Ctrl or Cmd held: deliver a control code (Ctrl+A..Z => 1..26,
              * Ctrl+/ => 31) since Cocoa's -characters does not fold these. */
@@ -457,19 +590,14 @@ static void decode_event(NSEvent *ev) {
         } else if (vk == 8) {
             /* Backspace: Cocoa reports 0x7F in -characters; deliver 8 like Win32. */
             evq_push(6, 0, 0, 0, 8, mods);
-        } else {
-            NSString *chars = [ev characters];
-            for (NSUInteger i = 0; i < [chars length]; i++) {
-                unichar u = [chars characterAtIndex:i];
-                /* printable text plus Tab(9)/Enter(13); skip DEL and the
-                 * 0xF700-0xF8FF private range Cocoa uses for function keys. */
-                if (u < 0xF700 && ((u >= 32 && u != 127) || u == 9 || u == 13))
-                    evq_push(6, 0, 0, 0, (long)u, mods);
-            }
+        } else if (vk == 9 || vk == 13) {
+            /* Tab/Enter arrive as chars on Win32 too. */
+            evq_push(6, 0, 0, 0, vk, mods);
         }
         break;
     }
     case NSEventTypeKeyUp: {
+        if (g_ime_composing) break;
         long vk = zan_vk_from_keycode([ev keyCode]);
         if (vk == 0) vk = zan_vk_from_chars([ev charactersIgnoringModifiers]);
         evq_push(5, 0, 0, 0, vk, mods);
@@ -687,17 +815,26 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
     u32 *pixels = zan_gui_internal_surface_data(surface_id, &sw, &sh, &stride);
     if (!pixels || !utf8 || !*utf8) return;
 
+    /* Honour the surface's active clip window (PushClip) like the shared
+     * renderer does, so glyphs never spill outside a scrolled/nested parent. */
+    int cx0 = 0, cy0 = 0, cx1 = sw, cy1 = sh;
+    zan_gui_internal_surface_clip(surface_id, &cx0, &cy0, &cx1, &cy1);
+
     @autoreleasepool {
         zan_text_entry_t *e = zan_text_lookup(utf8, font_size, true);
         if (!e || !e->mask) return;
         int tw = e->tw, th = e->th;
         const unsigned char *mask = e->mask;
+        /* The mask carries 1px of padding on every side (the line is drawn at
+         * (1, descent+1)); blit at (x-1, y-1) so the typographic box lands
+         * exactly at (x, y) like the GDI path, keeping icon/text rows that
+         * centre on font_height visually centred. */
         for (int py = 0; py < th; py++) {
-            int dy = (int)y + py;
-            if (dy < 0 || dy >= sh) continue;
+            int dy = (int)y + py - 1;
+            if (dy < cy0 || dy >= cy1 || dy < 0 || dy >= sh) continue;
             for (int px = 0; px < tw; px++) {
-                int dx = (int)x + px;
-                if (dx < 0 || dx >= sw) continue;
+                int dx = (int)x + px - 1;
+                if (dx < cx0 || dx >= cx1 || dx < 0 || dx >= sw) continue;
                 unsigned int coverage = mask[py * tw + px];
                 if (!coverage) continue;
                 int index = dy * stride + dx;
@@ -875,6 +1012,19 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     return [mw->window isZoomed] ? 1 : 0;
 }
 
+/* 1 while any part of the window can be seen (not miniaturized and not fully
+ * occluded by other windows); ambient animations pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 0;
+    @autoreleasepool {
+        if ([mw->window isMiniaturized]) return 0;
+        return ([mw->window occlusionState] & NSWindowOcclusionStateVisible)
+            ? 1 : 0;
+    }
+}
+
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
@@ -898,8 +1048,6 @@ EXPORT i64 zan_gui_get_dpi_scale(void) {
  * windows can follow the cursor. Stored for parity with the Win32/X11 backends;
  * macOS text entry currently flows through the shared software path, so this is
  * advisory and does not reposition a live composition session. */
-static int g_ime_x = 0;
-static int g_ime_y = 0;
 EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
     g_ime_x = (int)x;
     g_ime_y = (int)y;
