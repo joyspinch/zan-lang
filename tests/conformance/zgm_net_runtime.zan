@@ -1,0 +1,90 @@
+// Exercises the driver-free parts of the Game.Zgm network runtime:
+//   - WsUrl parsing (ws/wss, default + explicit ports, path)
+//   - ZgmMessage length-prefixed framing round-trip (cid + body preserved)
+//   - config -> runtime wiring (ZgmTcpClient reports disconnected before connect)
+// No sockets/drivers are used, so this is deterministic and cross-platform.
+using System;
+using System.Net.Sockets;
+using Game.Zgm;
+
+namespace T;
+
+class Program {
+    static int started;
+    static int stopped;
+    static int starting;
+    static int stopping;
+
+    static bool OnStarting(string bindHost) {
+        Program.starting = Program.starting + 1;
+        return bindHost == "127.0.0.1";
+    }
+    static void OnStarted(ServerConfig config, string bindHost) {
+        Program.started = Program.started + 1;
+    }
+    static bool OnStopping() {
+        Program.stopping = Program.stopping + 1;
+        return true;
+    }
+    static void OnStopped(ServerConfig config) {
+        Program.stopped = Program.stopped + 1;
+    }
+    static void Main() {
+        WsUrl a = WsUrl.Parse("ws://127.0.0.1:9000/game");
+        Console.WriteLine("a=" + a.Scheme() + "|" + a.Host() + "|" + Convert.ToString(a.Port()) + "|" + a.Path() + "|" + Convert.ToString(a.Secure()));
+
+        WsUrl b = WsUrl.Parse("wss://zgm.example.com/socket");
+        Console.WriteLine("b=" + b.Scheme() + "|" + b.Host() + "|" + Convert.ToString(b.Port()) + "|" + b.Path() + "|" + Convert.ToString(b.Secure()));
+
+        WsUrl c = WsUrl.Parse("ws://host");
+        Console.WriteLine("c=" + c.Scheme() + "|" + c.Host() + "|" + Convert.ToString(c.Port()) + "|" + c.Path());
+
+        // Framing round-trip.
+        ZgmMessage m = ZgmMessage.Text(4097, "hello-zgm");
+        Console.WriteLine("frameLen=" + Convert.ToString(m.FrameLength()));
+        string wire = m.Encode();
+        ZgmMessage back = ZgmMessage.Decode(wire, m.FrameLength());
+        Console.WriteLine("cid=" + Convert.ToString(back.Cid()));
+        Console.WriteLine("bodyLen=" + Convert.ToString(back.BodyLength()));
+        Console.WriteLine("body=" + back.Body());
+
+        // Short buffer -> incomplete frame -> null.
+        ZgmMessage none = ZgmMessage.Decode(wire, 4);
+        Console.WriteLine("partial=" + Convert.ToString(none == null));
+
+        // Config -> runtime wiring.
+        TcpClientConfig cfg = TcpClientConfig.Create("link", "10.0.0.5", 7000);
+        ZgmTcpClientRuntime rt = ZgmTcpClientRuntime.FromConfig(cfg);
+        Console.WriteLine("preconnect=" + Convert.ToString(rt.IsConnected()));
+
+        WebSocketClientConfig wcfg = WebSocketClientConfig.Create("ws");
+        wcfg.SetUrl("wss://relay.zgm:8443/live");
+        ZgmWebSocketRuntime wrt = ZgmWebSocketRuntime.FromConfig(wcfg);
+        Console.WriteLine("wsurl=" + wrt.Url().Host() + ":" + Convert.ToString(wrt.Url().Port()) + wrt.Url().Path());
+        Console.WriteLine("wspre=" + Convert.ToString(wrt.IsConnected()));
+
+        ServerConfig server = ServerConfig.Create("server", 17001)
+            .SetMessageLength(4096);
+        Console.WriteLine("serverLimit=" + Convert.ToString(
+            server.MessageLength()));
+        Console.WriteLine("serverClientType=1");
+
+        ZgmServerEvents events = ZgmServerEvents.Create();
+        events.OnStarting(Program.OnStarting);
+        events.OnStarted(Program.OnStarted);
+        events.OnStopping(Program.OnStopping);
+        events.OnStopped(Program.OnStopped);
+        Console.WriteLine("serverStarting="
+            + Convert.ToString(events.RaiseStarting("127.0.0.1")));
+        events.RaiseStarted(server, "127.0.0.1");
+        Console.WriteLine("serverStopping="
+            + Convert.ToString(events.RaiseStopping()));
+        events.RaiseStopped(server);
+        Console.WriteLine(
+            "serverEvents=" + Convert.ToString(Program.starting)
+            + "," + Convert.ToString(Program.started)
+            + "," + Convert.ToString(Program.stopping)
+            + "," + Convert.ToString(Program.stopped));
+
+    }
+}

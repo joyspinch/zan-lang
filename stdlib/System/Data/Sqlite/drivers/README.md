@@ -12,7 +12,7 @@ program.
 System/Data/Sqlite/drivers/
   <target>/                 # win-x64, linux-x64, linux-arm64, macos-x64, macos-arm64
     sqlite3.bundle          # manifest: runtime files to copy next to the exe (one per line)
-    sqlite3.dll             # (Windows) runtime shared library
+    libsqlite3-0.dll        # (Windows) runtime shared library
     libsqlite3.dll.a        # (Windows) import library used at link time
     libsqlite3.so           # (Linux)   runtime shared library (also used at link time)
     static/

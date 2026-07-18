@@ -1767,7 +1767,8 @@ EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
 /* Set the number of caption buttons so the draggable caption region excludes
  * exactly the button cluster on the right. */
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count = (int)count; }
     return 0;
 }
@@ -2022,6 +2023,7 @@ typedef struct {
     SDL_Renderer *ren;
     SDL_Texture  *tex;
     int           tw, th; /* current texture size */
+    int           cap_btns; /* caption buttons this window draws (per-window) */
 } zan_sdl_win_t;
 #define ZAN_SDL_MAX_WIN 32
 static zan_sdl_win_t g_wins[ZAN_SDL_MAX_WIN];
@@ -2236,8 +2238,10 @@ static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
     int x = area->x, y = area->y;
     int b = 8 * g_dpi / 96;
     int maxed = (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
+    zan_sdl_win_t *hrec = sdl_find(win);
+    int cbc = hrec ? hrec->cap_btns : g_caption_btn_count;
     int inButtons = (y < g_titlebar_h &&
-                     x >= W - g_caption_btn_count * g_btn_w);
+                     x >= W - cbc * g_btn_w);
     if (!maxed && !inButtons) {
         int left = x < b, right = x >= W - b, top = y < b, bottom = y >= H - b;
         if (top && left)     return SDL_HITTEST_RESIZE_TOPLEFT;
@@ -2305,6 +2309,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
 
     zan_sdl_win_t *rec = &g_wins[g_win_count++];
     rec->win = win; rec->ren = ren; rec->tex = NULL; rec->tw = rec->th = 0;
+    rec->cap_btns = g_caption_btn_count;
 
     if (!g_main_win) {
         g_main_win = win;
@@ -2419,8 +2424,11 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w; }
 
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
-    if (count >= 0 && count <= 8) g_caption_btn_count = (int)count;
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    if (count < 0 || count > 8) return 0;
+    zan_sdl_win_t *rec = sdl_find((SDL_Window *)(intptr_t)hwnd_val);
+    if (rec) rec->cap_btns = (int)count;
+    else g_caption_btn_count = (int)count;
     return 0;
 }
 
@@ -4060,7 +4068,8 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
 /* ---- client-side title-bar metrics (borderless window) ---- */
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
 EXPORT i64 zan_gui_caption_button_width(void) { return g_btn_w_l; }
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count_l = (int)count; }
     return 0;
 }
@@ -4295,7 +4304,7 @@ EXPORT void zan_gui_sleep_ms(i64 ms) { (void)ms; }
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i64 zan_gui_titlebar_height(void) { return 0; }
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) { (void)count; return 0; }
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) { (void)hwnd_val; (void)count; return 0; }
 #endif
 
 /* write_file is portable across every non-Win32 backend (X11, Cocoa and the

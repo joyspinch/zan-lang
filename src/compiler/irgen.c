@@ -3779,6 +3779,21 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return seq;
         }
 
+        /* Pointer equality (incl. `== null`): compare the raw pointers, then
+         * release owned call-result temps so `obj.Get() != null` does not leak
+         * the +1 value the callee returned. */
+        if ((expr->binary.op == TK_EQ_EQ || expr->binary.op == TK_BANG_EQ) && both_ptr) {
+            LLVMValueRef rcast = right;
+            if (LLVMTypeOf(right) != LLVMTypeOf(left))
+                rcast = LLVMBuildBitCast(g->builder, right, LLVMTypeOf(left), "pcast");
+            LLVMValueRef pcmp = LLVMBuildICmp(g->builder,
+                expr->binary.op == TK_EQ_EQ ? LLVMIntEQ : LLVMIntNE,
+                left, rcast, "pcmp");
+            emit_release_owned_call_temp(g, expr->binary.left, left, locals);
+            emit_release_owned_call_temp(g, expr->binary.right, right, locals);
+            return pcmp;
+        }
+
         LLVMTypeRef left_type = LLVMTypeOf(left);
         bool is_float = (LLVMGetTypeKind(left_type) == LLVMDoubleTypeKind ||
                          LLVMGetTypeKind(left_type) == LLVMFloatTypeKind);
@@ -5250,6 +5265,39 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMBuildZExt(g->builder, result, i64, "dex");
+        }
+
+        /* Environment.ExeDir() — directory containing the running executable
+         * (runtime helper zan_exe_dir_into fills an rc string buffer). */
+        if (is_call_to(expr, "Environment", "ExeDir") && expr->call.args.count == 0) {
+            g->uses_sync_runtime = true;
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 1024, 0));
+            LLVMTypeRef ft = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_exe_dir_into");
+            if (!fn) fn = LLVMAddFunction(g->mod, "zan_exe_dir_into", ft);
+            LLVMValueRef args2[] = { buf, LLVMConstInt(i64, 1024, 0) };
+            LLVMBuildCall2(g->builder, ft, fn, args2, 2, "");
+            return buf;
+        }
+
+        /* Directory.ListNames(pattern) — '\n'-joined file names matching a
+         * glob (runtime helper zan_dir_list_into fills an rc string buffer). */
+        if (is_call_to(expr, "Directory", "ListNames") && expr->call.args.count == 1) {
+            g->uses_sync_runtime = true;
+            LLVMValueRef pat = emit_expr(g, expr->call.args.items[0], locals);
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 65536, 0));
+            LLVMTypeRef ft = LLVMFunctionType(i64,
+                (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_dir_list_into");
+            if (!fn) fn = LLVMAddFunction(g->mod, "zan_dir_list_into", ft);
+            LLVMValueRef args3[] = { pat, buf, LLVMConstInt(i64, 65536, 0) };
+            LLVMBuildCall2(g->builder, ft, fn, args3, 3, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], pat, locals);
+            return buf;
         }
 
         /* Directory.CreateDirectory(path) */
@@ -9512,6 +9560,23 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     }
     LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 0), g_argc);
     LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 1), g_argv);
+
+    /* Programs emit UTF-8 bytes; the Windows console defaults to the legacy
+     * OEM/ANSI code page, which renders CJK/accented output as mojibake.
+     * Switch the console to UTF-8 (65001). Only affects console rendering:
+     * output redirected to a pipe/file keeps its raw UTF-8 bytes. */
+    if (g->target_is_windows) {
+        LLVMValueRef set_out_cp = LLVMGetNamedFunction(g->mod, "SetConsoleOutputCP");
+        LLVMTypeRef setcp_type = LLVMFunctionType(i32ty, (LLVMTypeRef[]){ i32ty }, 1, 0);
+        if (!set_out_cp)
+            set_out_cp = LLVMAddFunction(g->mod, "SetConsoleOutputCP", setcp_type);
+        LLVMValueRef set_in_cp = LLVMGetNamedFunction(g->mod, "SetConsoleCP");
+        if (!set_in_cp)
+            set_in_cp = LLVMAddFunction(g->mod, "SetConsoleCP", setcp_type);
+        LLVMValueRef utf8cp = LLVMConstInt(i32ty, 65001, 0);
+        LLVMBuildCall2(g->builder, setcp_type, set_out_cp, &utf8cp, 1, "");
+        LLVMBuildCall2(g->builder, setcp_type, set_in_cp, &utf8cp, 1, "");
+    }
 
     g->current_fn = main_fn;
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);

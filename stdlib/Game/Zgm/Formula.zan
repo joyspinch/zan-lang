@@ -1,0 +1,239 @@
+using System;
+
+namespace Game.Zgm;
+
+// Small integer expression evaluator for ZGM skill formulas. It deliberately
+// accepts a constrained, typed expression language instead of interpreting
+// Lua: numbers, a./b. attributes, + - * / ^, parentheses and min/max/clamp.
+class ZgmFormula {
+    string text;
+    int index;
+    bool valid;
+    ZgmAttributes leftAttrs;
+    ZgmAttributes rightAttrs;
+
+    static ZgmFormula Create(
+        string text,
+        ZgmAttributes leftAttrs,
+        ZgmAttributes rightAttrs
+    ) {
+        ZgmFormula formula = new ZgmFormula();
+        formula.text = text;
+        formula.index = 0;
+        formula.valid = true;
+        formula.leftAttrs = leftAttrs;
+        formula.rightAttrs = rightAttrs;
+        return formula;
+    }
+
+    bool IsValid() { return this.valid; }
+
+    int Current() {
+        if (this.index >= this.text.Length) { return -1; }
+        return this.text[this.index] & 255;
+    }
+
+    void SkipSpace() {
+        while (this.index < this.text.Length) {
+            int c = this.text[this.index] & 255;
+            if (c != 32 && c != 9 && c != 10 && c != 13) { return; }
+            this.index = this.index + 1;
+        }
+    }
+
+    bool Match(int expected) {
+        this.SkipSpace();
+        if (this.Current() != expected) { return false; }
+        this.index = this.index + 1;
+        return true;
+    }
+
+    int ParseNumber() {
+        this.SkipSpace();
+        int start = this.index;
+        int result = 0;
+        while (this.index < this.text.Length) {
+            int c = this.text[this.index] & 255;
+            if (c < 48 || c > 57) { break; }
+            result = result * 10 + c - 48;
+            this.index = this.index + 1;
+        }
+        if (this.index == start) {
+            this.valid = false;
+            return 0;
+        }
+        return result;
+    }
+
+    bool IsNameChar(int c) {
+        return c >= 48 && c <= 57
+            || c >= 65 && c <= 90
+            || c >= 97 && c <= 122
+            || c == 46 || c == 95
+            || c >= 128;
+    }
+
+    string ParseName() {
+        this.SkipSpace();
+        int start = this.index;
+        while (this.index < this.text.Length
+            && this.IsNameChar(this.text[this.index] & 255)) {
+            this.index = this.index + 1;
+        }
+        if (this.index == start) {
+            this.valid = false;
+            return "";
+        }
+        return this.text.Substring(start, this.index - start);
+    }
+
+    int Attribute(string name) {
+        if (name.Length > 2
+            && name.Substring(0, 2) == "a."
+            && this.leftAttrs != null) {
+            return this.leftAttrs.Get(
+                name.Substring(2, name.Length - 2));
+        }
+        if (name.Length > 2
+            && name.Substring(0, 2) == "b."
+            && this.rightAttrs != null) {
+            return this.rightAttrs.Get(
+                name.Substring(2, name.Length - 2));
+        }
+        this.valid = false;
+        return 0;
+    }
+
+    int ParsePrimary() {
+        this.SkipSpace();
+        int c = this.Current();
+        if (c == 40) {
+            this.index = this.index + 1;
+            int result = this.ParseAddSub();
+            if (!this.Match(41)) { this.valid = false; }
+            return result;
+        }
+        if (c >= 48 && c <= 57) {
+            return this.ParseNumber();
+        }
+
+        string name = this.ParseName();
+        if (!this.valid) { return 0; }
+        this.SkipSpace();
+        if (this.Current() != 40) {
+            return this.Attribute(name);
+        }
+
+        this.index = this.index + 1;
+        int first = this.ParseAddSub();
+        if (name == "min") {
+            if (!this.Match(44)) { this.valid = false; return 0; }
+            int second = this.ParseAddSub();
+            if (!this.Match(41)) { this.valid = false; return 0; }
+            if (first < second) { return first; }
+            return second;
+        }
+        if (name == "max") {
+            if (!this.Match(44)) { this.valid = false; return 0; }
+            int second = this.ParseAddSub();
+            if (!this.Match(41)) { this.valid = false; return 0; }
+            if (first > second) { return first; }
+            return second;
+        }
+        if (name == "clamp") {
+            if (!this.Match(44)) { this.valid = false; return 0; }
+            int minimum = this.ParseAddSub();
+            if (!this.Match(44)) { this.valid = false; return 0; }
+            int maximum = this.ParseAddSub();
+            if (!this.Match(41)) { this.valid = false; return 0; }
+            if (first < minimum) { return minimum; }
+            if (first > maximum) { return maximum; }
+            return first;
+        }
+
+        this.valid = false;
+        return 0;
+    }
+
+    int ParseUnary() {
+        this.SkipSpace();
+        if (this.Match(45)) { return -this.ParseUnary(); }
+        if (this.Match(43)) { return this.ParseUnary(); }
+        return this.ParsePrimary();
+    }
+
+    int Power(int baseValue, int exponent) {
+        if (exponent < 0) {
+            this.valid = false;
+            return 0;
+        }
+        int result = 1;
+        int i = 0;
+        while (i < exponent) {
+            result = result * baseValue;
+            i = i + 1;
+        }
+        return result;
+    }
+
+    int ParsePower() {
+        int result = this.ParseUnary();
+        while (true) {
+            this.SkipSpace();
+            if (this.Current() != 94) { return result; }
+            this.index = this.index + 1;
+            int exponent = this.ParseUnary();
+            result = this.Power(result, exponent);
+        }
+        return result;
+    }
+
+    int ParseMulDiv() {
+        int result = this.ParsePower();
+        while (true) {
+            this.SkipSpace();
+            int c = this.Current();
+            if (c == 42) {
+                this.index = this.index + 1;
+                result = result * this.ParsePower();
+            } else if (c == 47) {
+                this.index = this.index + 1;
+                int divisor = this.ParsePower();
+                if (divisor == 0) {
+                    this.valid = false;
+                    result = 0;
+                } else {
+                    result = result / divisor;
+                }
+            } else {
+                return result;
+            }
+        }
+        return result;
+    }
+
+    int ParseAddSub() {
+        int result = this.ParseMulDiv();
+        while (true) {
+            this.SkipSpace();
+            int c = this.Current();
+            if (c == 43) {
+                this.index = this.index + 1;
+                result = result + this.ParseMulDiv();
+            } else if (c == 45) {
+                this.index = this.index + 1;
+                result = result - this.ParseMulDiv();
+            } else {
+                return result;
+            }
+        }
+        return result;
+    }
+
+    int Evaluate() {
+        int result = this.ParseAddSub();
+        this.SkipSpace();
+        if (this.index < this.text.Length) { this.valid = false; }
+        return result;
+    }
+}

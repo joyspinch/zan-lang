@@ -50,6 +50,10 @@ int64_t zan_shared_table_exists(int64_t handle, const char *key);
 int64_t zan_shared_table_count(int64_t handle);
 void zan_shared_table_clear(int64_t handle);
 
+/* filesystem helpers for the compiler driver */
+long long zan_exe_dir_into(char *out, long long cap);
+long long zan_dir_list_into(const char *pattern, char *out, long long cap);
+
 #ifdef __cplusplus
 }
 #endif

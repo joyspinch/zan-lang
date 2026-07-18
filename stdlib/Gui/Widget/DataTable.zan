@@ -237,6 +237,19 @@ class DataTableState {
     UiEvent SelectionChanged;  // the selected-row set changed
     UiEvent ColumnResize;      // a column width changed by dragging (read HitCol)
     UiEvent ScrollChanged;     // the virtual row window scrolled (read ScrollTop)
+    UiEvent HeaderRightClick;  // right-click on a header cell (read HitCol)
+    UiEvent ColumnResizeStart; // a column resize drag began (read HitCol)
+    UiEvent ColumnResizeEnd;   // a column resize drag ended (read HitCol)
+    UiEvent FilterChanged;     // a column set-filter was applied or cleared (read HitCol)
+    UiEvent RowRightClick;     // right-click on a body row (read HitRow/HitOrderIndex)
+    UiEvent CellRightClick;    // right-click on a data cell (read HitRow/HitCol)
+    UiEvent CellDoubleClick;   // double-click on a data cell (read HitRow/HitCol)
+    UiEvent RowReorder;        // a row was drag-reordered (read ReorderFrom/ReorderTo)
+    UiEvent RowEnter;          // pointer entered a body row (read HoverOrderIndex/HitRow)
+    UiEvent RowLeave;          // pointer left the previously hovered row (read HoverOrderIndex)
+    int hoverOrder;            // order-index of the row under the pointer (-1 none)
+    int reorderFrom;           // order-index a row was dragged from (RowReorder)
+    int reorderTo;             // order-index a row was dropped to (RowReorder)
     int hitRow;                // data-row index of the last row/cell interaction
     int hitOrder;              // order-position (post sort/filter) of that row
     int hitCol;                // column index of the last header/cell interaction
@@ -304,6 +317,19 @@ class DataTableState {
         s.SelectionChanged = UiEvent.Create();
         s.ColumnResize = UiEvent.Create();
         s.ScrollChanged = UiEvent.Create();
+        s.HeaderRightClick = UiEvent.Create();
+        s.ColumnResizeStart = UiEvent.Create();
+        s.ColumnResizeEnd = UiEvent.Create();
+        s.FilterChanged = UiEvent.Create();
+        s.RowRightClick = UiEvent.Create();
+        s.CellRightClick = UiEvent.Create();
+        s.CellDoubleClick = UiEvent.Create();
+        s.RowReorder = UiEvent.Create();
+        s.RowEnter = UiEvent.Create();
+        s.RowLeave = UiEvent.Create();
+        s.hoverOrder = -1;
+        s.reorderFrom = -1;
+        s.reorderTo = -1;
         s.hitRow = -1;
         s.hitOrder = -1;
         s.hitCol = -1;
@@ -323,6 +349,9 @@ class DataTableState {
     int EditRow() { return editRow; }
     int EditCol() { return editCol; }
     string EditValue() { return editVal; }
+    int HoverOrderIndex() { return hoverOrder; }
+    int ReorderFrom() { return reorderFrom; }
+    int ReorderTo() { return reorderTo; }
 }
 
 /// Enterprise-style data grid: fixed row-number & selection columns, sortable
@@ -1178,6 +1207,15 @@ class DataTable {
                 app.RequestRedraw();
             }
 
+            // right-click on a header cell => HeaderRightClick
+            if (app.window.EventKind() == 2 && app.window.EventButton() == 1
+                && app.mouseX >= hx && app.mouseX < hx + drawW
+                && app.mouseY >= y && app.mouseY < y + headerH) {
+                st.hitCol = i;
+                st.HeaderRightClick.Raise();
+                app.RequestRedraw();
+            }
+
             // resize handle (right border)
             int rzId = app.focus.AllocId();
             int rzW = app.Scale(6);
@@ -1187,6 +1225,8 @@ class DataTable {
                 st.resizeCol = i;
                 st.resizeStartX = app.mouseX;
                 st.resizeStartW = st.colWidths[i];
+                st.hitCol = i;
+                st.ColumnResizeStart.Raise();
             }
             if (st.resizeCol == i && app.focus.pressedId == rzId) {
                 int nw = st.resizeStartW + (app.mouseX - st.resizeStartX);
@@ -1197,6 +1237,12 @@ class DataTable {
                     st.ColumnResize.Raise();
                     app.RequestRedraw();
                 }
+            }
+
+            if (st.resizeCol == i && app.window.EventKind() == 3 && app.window.EventButton() == 0) {
+                st.hitCol = i;
+                st.resizeCol = -1;
+                st.ColumnResizeEnd.Raise();
             }
 
             hx = hx + drawW;
@@ -1354,6 +1400,19 @@ class DataTable {
                 else { colL = colL + cwv; cci = cci + 1; }
             }
         }
+        if (!st.ctxOpen && st.openMenu < 0 && ptrOi != st.hoverOrder) {
+            if (st.hoverOrder >= 0) {
+                st.hitOrder = st.hoverOrder;
+                st.RowLeave.Raise();
+            }
+            st.hoverOrder = ptrOi;
+            if (ptrOi >= 0) {
+                st.hitOrder = ptrOi;
+                st.hitRow = st.order[ptrOi];
+                st.RowEnter.Raise();
+            }
+            app.RequestRedraw();
+        }
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
         int emods = app.window.EventMods();
@@ -1406,7 +1465,10 @@ class DataTable {
             if (st.rangeDrag) { st.rangeDrag = false; app.RequestRedraw(); }
             if (st.dragRow >= 0) {
                 if (st.dragMoved && ptrOi >= 0 && ptrOi != st.dragRow) {
+                    st.reorderFrom = st.dragRow;
+                    st.reorderTo = ptrOi;
                     DataTable.MoveOrder(st, st.dragRow, ptrOi);
+                    st.RowReorder.Raise();
                     st.sortCol = -1;   // manual order — drop any active sort
                     app.RequestRedraw();
                 } else if (!st.dragMoved) {
@@ -1446,6 +1508,10 @@ class DataTable {
             st.hitOrder = ptrOi;
             st.hitRow = st.order[ptrOi];
             st.RowDoubleClick.Raise();
+            if (ptrCol >= 0) {
+                st.hitCol = ptrCol;
+                st.CellDoubleClick.Raise();
+            }
         }
 
         // right press => context menu
@@ -1461,6 +1527,13 @@ class DataTable {
                     st.selected[ri] = true;
                     st.selAnchor = ptrOi;
                 }
+            }
+            if (ptrOi >= 0) {
+                st.hitOrder = ptrOi;
+                st.hitRow = st.order[ptrOi];
+                st.hitCol = ptrCol;
+                st.RowRightClick.Raise();
+                if (ptrCol >= 0) { st.CellRightClick.Raise(); }
             }
             st.ctxOpen = true;
             st.ctxX = app.mouseX;
@@ -1896,7 +1969,7 @@ class DataTable {
             app.hitTester.Register(HitRegion.Create(allId, mx + pad, cy, menuW - pad * 2, itemH, 0));
             if (app.window.EventKind() == 3 && app.ClickTarget() == allId) {
                 f.hidden.Clear();
-                st.dirty = true; app.RequestRedraw();
+                st.dirty = true; st.hitCol = mi; st.FilterChanged.Raise(); app.RequestRedraw();
             }
             cy = cy + itemH;
 
@@ -1940,7 +2013,7 @@ class DataTable {
                 c.DrawText(listX + app.Scale(22), cy + (itemH - Canvas.FontHeight(fs)) / 2, label, t.textPrimary, fs);
                 app.hitTester.Register(HitRegion.Create(vId, listX, cy, itemW, itemH, 0));
                 if (app.window.EventKind() == 3 && app.ClickTarget() == vId) {
-                    f.Toggle(v); st.dirty = true; app.RequestRedraw();
+                    f.Toggle(v); st.dirty = true; st.hitCol = mi; st.FilterChanged.Raise(); app.RequestRedraw();
                 }
                 cy = cy + itemH;
                 r2 = r2 + 1;
@@ -2050,6 +2123,7 @@ class DataTable {
                 f.batchExact = st.batchExactFlag == 1;
                 f.batchKeep = keepClick;
                 st.dirty = true;
+                st.hitCol = mi; st.FilterChanged.Raise();
                 app.RequestRedraw();
             }
         }
@@ -2069,6 +2143,7 @@ class DataTable {
             st.batchExactFlag = 0;
             st.editFocus = 0;
             st.dirty = true;
+            st.hitCol = mi; st.FilterChanged.Raise();
             app.RequestRedraw();
         }
         if (closeClick) { st.openMenu = -1; app.RequestRedraw(); }

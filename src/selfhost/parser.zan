@@ -56,6 +56,27 @@ class Parser {
     Token Cur() { if (pos < toks.Count) { return toks[pos]; } return toks[toks.Count - 1]; }
     int K() { if (pos < toks.Count) { return toks[pos].kind; } return TK.Eof(); }
     int K1() { if (pos + 1 < toks.Count) { return toks[pos + 1].kind; } return TK.Eof(); }
+    // True when the current and next tokens are physically adjacent (no gap),
+    // used to recognise ">>" from two ">" tokens without breaking "List<List<int>>".
+    bool AdjNext() {
+        if (pos + 1 >= toks.Count) { return false; }
+        Token a = toks[pos];
+        Token b = toks[pos + 1];
+        return b.line == a.line && b.col == a.col + 1;
+    }
+    int K2() { if (pos + 2 < toks.Count) { return toks[pos + 2].kind; } return TK.Eof(); }
+    // adjacency between the tokens at pos+i and pos+i+1.
+    bool AdjAt(int i) {
+        if (pos + i + 1 >= toks.Count) { return false; }
+        Token a = toks[pos + i];
+        Token b = toks[pos + i + 1];
+        return b.line == a.line && b.col == a.col + 1;
+    }
+    // ">>=": three adjacent ">" ">" "=" tokens (kept out of the lexer so nested
+    // generics like List<List<int>> still parse).
+    bool IsShrEq() {
+        return At(TK.Greater()) && K1() == TK.GreaterEq() && AdjAt(0);
+    }
     Token Next() { Token t = Cur(); if (pos < toks.Count) { pos = pos + 1; } return t; }
     bool At(int k) { return K() == k; }
     bool Eat(int k) { if (K() == k) { pos = pos + 1; return true; } return false; }
@@ -182,7 +203,9 @@ class Parser {
             else if (k == TK.Override()) { m = m + MOD.Override(); Next(); }
             else if (k == TK.Abstract()) { m = m + MOD.Abstract(); Next(); }
             else if (k == TK.Readonly()) { m = m + MOD.Readonly(); Next(); }
+            else if (k == TK.Async()) { m = m + MOD.Async(); Next(); }
             else if (k == TK.Ident() && Cur().text == "extern") { m = m + MOD.Extern(); Next(); }
+            else if (k == TK.Ident() && Cur().text == "weak") { m = m + MOD.Weak(); Next(); }
             else if (k == TK.Sealed()) { Next(); }
             else if (k == TK.Const()) { Next(); }
             else { return m; }
@@ -368,6 +391,7 @@ class Parser {
         Node member = new Node(AK.FieldDecl());
         member.mods = mods;
         member.type = type;
+        if (HasModBit(mods, MOD.Weak())) { type.mods = type.mods + MOD.Weak(); }
         if (At(TK.Ident())) { member.sval = Next().text; }
         // operator overload:  T operator <sym> ( ... ) { ... }
         if (member.sval == "operator") {
@@ -378,6 +402,16 @@ class Parser {
             if (At(TK.LBrace())) { member.d = ParseBlock(); }
             else { Expect(TK.Semicolon()); }
             return member;
+        }
+        // generic method type params:  Name <T, ...> ( ... )
+        if (At(TK.Less()) && member.sval != "operator") {
+            Next();
+            while (!At(TK.Greater()) && !At(TK.Eof())) {
+                if (At(TK.Ident())) { Node mtp = new Node(AK.TypeParam()); mtp.sval = Next().text; member.Add(mtp); }
+                else { Next(); }
+                Eat(TK.Comma());
+            }
+            Expect(TK.Greater());
         }
         if (At(TK.LParen())) {
             member.kind = AK.MethodDecl();
@@ -500,7 +534,16 @@ class Parser {
         return blk;
     }
 
+    // Stamp the start-of-construct source position onto nodes that would
+    // otherwise default to 0:0, so diagnostics point at real locations.
     Node ParseStmt() {
+        Token pt = Cur();
+        Node r = ParseStmtInner();
+        if (r != null && r.line == 0) { r.line = pt.line; r.col = pt.col; }
+        return r;
+    }
+
+    Node ParseStmtInner() {
         int k = K();
         if (k == TK.LBrace()) { return ParseBlock(); }
         if (k == TK.If()) { return ParseIf(); }
@@ -682,17 +725,58 @@ class Parser {
         if (k == TK.MinusEq()) { return true; }
         if (k == TK.StarEq()) { return true; }
         if (k == TK.SlashEq()) { return true; }
+        if (k == TK.PercentEq()) { return true; }
+        if (k == TK.AmpEq()) { return true; }
+        if (k == TK.PipeEq()) { return true; }
+        if (k == TK.CaretEq()) { return true; }
+        if (k == TK.LessLessEq()) { return true; }
         return false;
     }
 
     Node ParseAssign() {
-        Node left = ParseOr();
+        Node left = ParseCoalesce();
+        // conditional:  cond ? a : b  (right-associative, above assignment)
+        if (At(TK.Question())) {
+            Next();
+            Node t = ParseAssign();
+            Expect(TK.Colon());
+            Node f = ParseAssign();
+            Node cn = new Node(AK.Conditional());
+            cn.a = left; cn.b = t; cn.c = f;
+            cn.line = left.line; cn.col = left.col;
+            return cn;
+        }
+        if (At(TK.QQ()) && K1() == TK.Eq()) {
+            Next(); Next();
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = TK.QQEq(); n.a = left; n.b = right;
+            return n;
+        }
+        if (IsShrEq()) {
+            Next(); Next();
+            Node right = ParseAssign();
+            Node n = new Node(AK.Assignment());
+            n.op = TK.GreaterGreaterEq(); n.a = left; n.b = right;
+            return n;
+        }
         if (IsAssignOp(K())) {
             int op = Next().kind;
             Node right = ParseAssign();
             Node n = new Node(AK.Assignment());
             n.op = op; n.a = left; n.b = right;
             return n;
+        }
+        return left;
+    }
+
+    // null-coalescing "a ?? b": lower precedence than || , right-associative.
+    Node ParseCoalesce() {
+        Node left = ParseOr();
+        if (At(TK.QQ()) && K1() != TK.Eq()) {
+            int op = Next().kind;
+            Node right = ParseCoalesce();
+            return Bin(op, left, right);
         }
         return left;
     }
@@ -728,9 +812,13 @@ class Parser {
         return left;
     }
     Node ParseRel() {
-        Node left = ParseAdd();
+        Node left = ParseShift();
         while (At(TK.Less()) || At(TK.Greater()) || At(TK.LessEq()) || At(TK.GreaterEq())) {
-            int op = Next().kind; Node r = ParseAdd(); left = Bin(op, left, r);
+            // ">>" (two adjacent ">") is a shift, handled in ParseShift; here a
+            // lone ">"/"<" etc. is relational.
+            if (At(TK.Greater()) && K1() == TK.Greater() && AdjNext()) { break; }
+            if (IsShrEq()) { break; }
+            int op = Next().kind; Node r = ParseShift(); left = Bin(op, left, r);
         }
         // type pattern:  x is T  |  x is T name
         if (At(TK.Is())) {
@@ -740,6 +828,18 @@ class Parser {
             ie.type = ParseType();
             if (At(TK.Ident())) { ie.sval = Next().text; }
             left = ie;
+        }
+        return left;
+    }
+    Node ParseShift() {
+        Node left = ParseAdd();
+        while (true) {
+            if (At(TK.LessLess())) { int op = Next().kind; Node r = ParseAdd(); left = Bin(op, left, r); }
+            else if (At(TK.Greater()) && K1() == TK.Greater() && AdjNext() && !IsShrEq()) {
+                Next(); Next();
+                Node r = ParseAdd();
+                left = Bin(TK.GreaterGreater(), left, r);
+            } else { break; }
         }
         return left;
     }
@@ -761,6 +861,20 @@ class Parser {
     }
 
     Node ParseUnary() {
+        Token pt = Cur();
+        Node r = ParseUnaryInner();
+        if (r != null && r.line == 0) { r.line = pt.line; r.col = pt.col; }
+        return r;
+    }
+
+    Node ParseUnaryInner() {
+        if (At(TK.Await())) {
+            Token aw = Next();
+            Node n = new Node(AK.AwaitExpr());
+            n.a = ParseUnary();
+            n.line = aw.line; n.col = aw.col;
+            return n;
+        }
         int k = K();
         if (k == TK.Bang() || k == TK.Minus() || k == TK.Plus()) {
             int op = Next().kind;
@@ -809,6 +923,26 @@ class Parser {
         return n;
     }
 
+    // Disambiguate "Name<...>(": treat "<" as generic type args only when a
+    // balanced angle-bracket run made of type-like tokens is immediately
+    // followed by "(". Otherwise it is a relational operator.
+    bool LooksLikeGenericCall() {
+        int i = pos + 1;
+        int depth = 1;
+        while (i < toks.Count && depth > 0) {
+            int kk = toks[i].kind;
+            if (kk == TK.Less()) { depth = depth + 1; }
+            else if (kk == TK.Greater()) { depth = depth - 1; }
+            else if (kk == TK.Ident() || IsTypeKeyword(kk) || kk == TK.Comma()
+                     || kk == TK.Dot() || kk == TK.LBracket() || kk == TK.RBracket()
+                     || kk == TK.Question()) { }
+            else { return false; }
+            i = i + 1;
+        }
+        if (depth != 0) { return false; }
+        return i < toks.Count && toks[i].kind == TK.LParen();
+    }
+
     Node ParsePostfix() {
         Node e = ParsePrimary();
         while (true) {
@@ -816,25 +950,37 @@ class Parser {
             if (k == TK.Dot()) {
                 Next();
                 Node m = new Node(AK.MemberAccess());
-                m.a = e;
+                m.a = e; m.line = e.line; m.col = e.col;
                 if (At(TK.Ident())) { m.sval = Next().text; }
                 else { m.sval = Next().text; }
                 e = m;
+            } else if (k == TK.Less() && LooksLikeGenericCall()) {
+                // generic method call:  Name<TypeArgs>(args). Erasure is uniform,
+                // so the explicit type args are consumed and discarded here; the
+                // following "(" is picked up as a normal call on the next pass.
+                Next();
+                int gdepth = 1;
+                while (gdepth > 0 && !At(TK.Eof())) {
+                    int gk = K();
+                    if (gk == TK.Less()) { gdepth = gdepth + 1; }
+                    else if (gk == TK.Greater()) { gdepth = gdepth - 1; }
+                    Next();
+                }
             } else if (k == TK.LParen()) {
                 Node call = new Node(AK.Call());
-                call.a = e;
+                call.a = e; call.line = e.line; call.col = e.col;
                 ParseArgs(call);
                 e = call;
             } else if (k == TK.LBracket()) {
                 Next();
                 Node idx = new Node(AK.Index());
-                idx.a = e; idx.b = ParseExpr();
+                idx.a = e; idx.line = e.line; idx.col = e.col; idx.b = ParseExpr();
                 Expect(TK.RBracket());
                 e = idx;
             } else if (k == TK.PlusPlus() || k == TK.MinusMinus()) {
                 int op = Next().kind;
                 Node pf = new Node(AK.PostfixUnary());
-                pf.op = op; pf.a = e;
+                pf.op = op; pf.a = e; pf.line = e.line; pf.col = e.col;
                 e = pf;
             } else {
                 return e;
@@ -857,6 +1003,13 @@ class Parser {
     }
 
     Node ParsePrimary() {
+        Token pt = Cur();
+        Node r = ParsePrimaryInner();
+        if (r != null && r.line == 0) { r.line = pt.line; r.col = pt.col; }
+        return r;
+    }
+
+    Node ParsePrimaryInner() {
         int k = K();
         if (k == TK.IntLit()) { Node n = new Node(AK.IntLit()); n.ival = Next().intVal; return n; }
         if (k == TK.FloatLit()) { Node n = new Node(AK.FloatLit()); n.sval = Next().text; return n; }
