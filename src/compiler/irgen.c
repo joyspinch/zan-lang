@@ -68,6 +68,35 @@ static void emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
+/* On Windows, guard an about-to-be-dereferenced string header pointer (obj-8,
+ * the STRING_MAGIC slot) against freed/unmapped pages. The tolerant retain and
+ * release probe [obj-8] to decide whether a pointer is a managed string; for a
+ * bare buffer (e.g. a [DllImport] calloc result typed as string) that was
+ * manually free()d, the page may already be unmapped, so the probe load itself
+ * would fault. If IsBadReadPtr(ptr8, 8) is true we treat the pointer as
+ * non-managed and branch to ret_bb. kernel32 is always linked on Windows, so
+ * no extra runtime object is required. On Windows this leaves the builder
+ * positioned in a fresh "readable" block; elsewhere it is a no-op. */
+static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
+                                   LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb) {
+    if (!g->target_is_windows) return;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef args[] = { i8p, i64t };
+    LLVMTypeRef fnty = LLVMFunctionType(i32t, args, 2, 0);
+    LLVMValueRef isbad = LLVMGetNamedFunction(g->mod, "IsBadReadPtr");
+    if (!isbad) isbad = LLVMAddFunction(g->mod, "IsBadReadPtr", fnty);
+    LLVMValueRef cargs[] = { ptr8, LLVMConstInt(i64t, 8, 0) };
+    LLVMValueRef bad = LLVMBuildCall2(g->builder, fnty, isbad, cargs, 2, "badread");
+    LLVMValueRef isbadnz = LLVMBuildICmp(g->builder, LLVMIntNE, bad,
+        LLVMConstInt(i32t, 0, 0), "isbadnz");
+    LLVMBasicBlockRef readable_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "readable");
+    LLVMBuildCondBr(g->builder, isbadnz, ret_bb, readable_bb);
+    LLVMPositionBuilderAtEnd(g->builder, readable_bb);
+}
+
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
@@ -958,6 +987,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
         LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)-8, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
+        emit_header_read_guard(g, g->rt_str_retain, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
         LLVMValueRef has_magic = LLVMBuildICmp(g->builder, LLVMIntEQ, magic,
@@ -996,6 +1026,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
         LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)-8, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
+        emit_header_read_guard(g, g->rt_str_release, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
         LLVMValueRef has_magic = LLVMBuildICmp(g->builder, LLVMIntEQ, magic,
@@ -3822,6 +3853,7 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMPositionBuilderAtEnd(g->builder, merge_bb);
     LLVMTypeRef vt = LLVMTypeOf(v);
     if (LLVMGetTypeKind(vt) == LLVMVoidTypeKind) {
+        emit_release_owned_call_temp(g, saved_obj, obj, locals);
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     }
     LLVMValueRef phi = LLVMBuildPhi(g->builder, vt, "qdot");
@@ -3829,6 +3861,9 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef vals[] = { dflt, v };
     LLVMBasicBlockRef bbs[] = { entry_bb, then_end };
     LLVMAddIncoming(phi, vals, bbs, 2);
+    /* an owned receiver temp (e.g. `M()?.x`, where M returns +1) is consumed
+     * by this access; the class release helper is null-safe */
+    emit_release_owned_call_temp(g, saved_obj, obj, locals);
     return phi;
 }
 
@@ -5011,9 +5046,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             LLVMTypeRef atoi_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                             atoi_fn = LLVMAddFunction(g->mod, "atoi", atoi_type);
                         }
-                        return LLVMBuildCall2(g->builder,
+                        LLVMValueRef parsed = LLVMBuildCall2(g->builder,
                             LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                             atoi_fn, &arg, 1, "atoi");
+                        emit_release_owned_call_temp(
+                            g, expr->call.args.items[0], arg, locals);
+                        return parsed;
                     }
                     if (method_name.len == 8 && memcmp(method_name.str, "ToString", 8) == 0 &&
                         expr->call.args.count == 1) {
@@ -7267,7 +7305,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef strlen_type = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 /* strlen returns i64; `int` is i64 so return it directly. */
-                return LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
+                LLVMValueRef len = LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
+                emit_release_owned_call_temp(g, expr->member.object, obj_val, locals);
+                return len;
             }
         }
 
@@ -7426,6 +7466,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
              * field value (the array data pointer) and recover its element
              * type from the field declaration. */
             arr_type = member_access_field_type(g, locals, expr->index.object);
+            if (arr_type) {
+                arr_ptr = emit_expr(g, expr->index.object, locals);
+                if (arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
+                    is_list = 1;
+                }
+            }
+        } else {
+            /* General case: the base is any other expression that produces an
+             * array/string/list value — e.g. a method call `foo()[i]`, a
+             * parenthesized expression, or a nested index `a[i][j]`. Without
+             * this, arr_ptr stays NULL and the whole access silently folds to
+             * the constant 0 below. Evaluate the base value and recover its
+             * element/container type from the expression. */
+            arr_type = infer_expr_type(g, expr->index.object, locals);
             if (arr_type) {
                 arr_ptr = emit_expr(g, expr->index.object, locals);
                 if (arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
