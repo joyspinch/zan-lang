@@ -372,11 +372,29 @@ class ZgmWidgetData {
     }
 }
 
+class ZgmListRow {
+    List<string> values;
+
+    static ZgmListRow Create() {
+        ZgmListRow row = new ZgmListRow();
+        row.values = new List<string>();
+        return row;
+    }
+    ZgmListRow Add(string text) {
+        this.values.Add(text);
+        return this;
+    }
+    int ValueCount() { return this.values.Count; }
+    string ValueAt(int index) { return this.values[index]; }
+}
+
 class ZgmWidgetBinding {
     string windowName;
     string widgetName;
     string mode;
     string sourceName;
+    string sourceKind;
+    string sourceId;
     string valueAttr;
     string maximumAttr;
     string limitCategory;
@@ -393,6 +411,8 @@ class ZgmWidgetBinding {
         binding.widgetName = widgetName;
         binding.mode = mode;
         binding.sourceName = "";
+        binding.sourceKind = "";
+        binding.sourceId = "";
         binding.valueAttr = "";
         binding.maximumAttr = "";
         binding.limitCategory = "";
@@ -414,14 +434,24 @@ class ZgmWidgetState {
     int height;
     bool visible;
     bool enabled;
+    bool focused;
     bool selected;
     string text;
+    int caret;
     int position;
     double alpha;
     double scaleX;
     double scaleY;
     int angle;
     ZgmWidgetData data;
+    List<ZgmListRow> rows;
+    int selectedIndex;
+    int activePage;
+    int scrollPosition;
+    bool expanded;
+    int mapCellX;
+    int mapCellY;
+    double mapZoom;
 
     static ZgmWidgetState Create(string windowName, Widget config) {
         ZgmWidgetState state = new ZgmWidgetState();
@@ -432,15 +462,25 @@ class ZgmWidgetState {
         state.width = config.Width();
         state.height = config.Height();
         state.visible = config.DefaultVisible();
-        state.enabled = true;
-        state.selected = false;
-        state.text = "";
-        state.position = 0;
+        state.enabled = config.InitialEnabled();
+        state.focused = false;
+        state.selected = config.InitialSelected();
+        state.text = config.InitialText();
+        state.caret = state.text.Length;
+        state.position = config.ControlPosition();
         state.alpha = 1.0;
         state.scaleX = 1.0;
         state.scaleY = 1.0;
         state.angle = 0;
         state.data = ZgmWidgetData.Create();
+        state.rows = new List<ZgmListRow>();
+        state.selectedIndex = config.InitialIndex();
+        state.activePage = config.InitialPage();
+        state.scrollPosition = 0;
+        state.expanded = false;
+        state.mapCellX = 0;
+        state.mapCellY = 0;
+        state.mapZoom = 1.0;
         return state;
     }
     Widget Config() { return this.config; }
@@ -453,11 +493,22 @@ class ZgmWidgetState {
     int Height() { return this.height; }
     bool Visible() { return this.visible; }
     bool Enabled() { return this.enabled; }
+    bool Focused() { return this.focused; }
     bool Selected() { return this.selected; }
     string Text() { return this.text; }
+    int Caret() { return this.caret; }
     int Position() { return this.position; }
     double Alpha() { return this.alpha; }
     ZgmWidgetData Data() { return this.data; }
+    int SelectedIndex() { return this.selectedIndex; }
+    int ActivePage() { return this.activePage; }
+    int ScrollPosition() { return this.scrollPosition; }
+    bool Expanded() { return this.expanded; }
+    int MapCellX() { return this.mapCellX; }
+    int MapCellY() { return this.mapCellY; }
+    double MapZoom() { return this.mapZoom; }
+    int RowCount() { return this.rows.Count; }
+    ZgmListRow RowAt(int index) { return this.rows[index]; }
     void SetPosition(int x, int y) { this.x = x; this.y = y; }
     void SetSize(int width, int height) {
         this.width = width;
@@ -465,12 +516,39 @@ class ZgmWidgetState {
     }
     void SetVisible(bool visible) { this.visible = visible; }
     void SetEnabled(bool enabled) { this.enabled = enabled; }
+    void SetFocused(bool focused) { this.focused = focused; }
     void SetSelected(bool selected) { this.selected = selected; }
-    void SetText(string text) { this.text = text; }
+    void SetText(string text) {
+        if (text == null) { text = ""; }
+        this.text = text;
+        this.caret = text.Length;
+    }
+    void SetCaret(int caret) {
+        if (caret < 0) { caret = 0; }
+        if (caret > this.text.Length) { caret = this.text.Length; }
+        this.caret = caret;
+    }
     void SetRangePosition(int position) { this.position = position; }
     void ClearData() { this.data.Clear(); }
+    void SetSelectedIndex(int index) { this.selectedIndex = index; }
+    void SetActivePage(int index) { this.activePage = index; }
+    void SetScrollPosition(int position) {
+        this.scrollPosition = ZgmMath.Max(0, position);
+    }
+    void SetExpanded(bool expanded) { this.expanded = expanded; }
+    void SetMapView(int cellX, int cellY, double zoom) {
+        this.mapCellX = cellX;
+        this.mapCellY = cellY;
+        this.mapZoom = zoom;
+    }
+    void ClearRows() { this.rows = new List<ZgmListRow>(); }
+    void AddRow(ZgmListRow row) {
+        if (row != null) { this.rows.Add(row); }
+    }
+    void SetRowSelection(int index) { this.selectedIndex = index; }
     bool HitTest(int x, int y) {
         return this.visible && this.enabled
+            && !this.config.ClickThrough()
             && x >= this.x && y >= this.y
             && x < this.x + this.width
             && y < this.y + this.height;
@@ -706,6 +784,9 @@ class ZgmUiRuntime {
     ZgmWindowState dragWindow;
     int pointerX;
     int pointerY;
+    int screenWidth;
+    int screenHeight;
+    int windowState;
 
     static ZgmUiRuntime Create(
         ZgmProject project,
@@ -726,6 +807,9 @@ class ZgmUiRuntime {
         ui.dragWindow = null;
         ui.pointerX = 0;
         ui.pointerY = 0;
+        ui.screenWidth = project.App().ScreenWidth();
+        ui.screenHeight = project.App().ScreenHeight();
+        ui.windowState = 3;
         int i = 0;
         while (i < project.WindowCount()) {
             ui.windows.Add(ZgmWindowState.Create(project.WindowAt(i)));
@@ -781,6 +865,287 @@ class ZgmUiRuntime {
         return false;
     }
     ZgmWidgetState FocusedWidget() { return this.focused; }
+    int ScreenWidth() { return this.screenWidth; }
+    int ScreenHeight() { return this.screenHeight; }
+    int WindowState() { return this.windowState; }
+    bool SetWindowState(int state) {
+        if (state < 1 || state > 3) { return false; }
+        this.windowState = state;
+        this.events.RaiseWindowStateChanged(state);
+        return true;
+    }
+    bool ActivateRichTextLink(
+        string windowName,
+        string widgetName,
+        string link
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "文本框"
+            || link == null || link == "") {
+            return false;
+        }
+        this.events.RaiseRichTextLink(
+            windowName, widgetName, link);
+        return true;
+    }
+    bool ShowSystemPrompt(int code, string message) {
+        if (message == null) { message = ""; }
+        return this.events.RaiseSystemPrompt(code, message);
+    }
+    void DispatchCustomEvent(
+        string source,
+        string name,
+        string payload
+    ) {
+        this.events.RaiseCustomEvent(source, name, payload);
+    }
+    bool SetWidgetVisible(
+        string windowName,
+        string widgetName,
+        bool visible
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null) { return false; }
+        widget.SetVisible(visible);
+        if (!visible && widget == this.focused) {
+            this.SetFocus("", "");
+        }
+        return true;
+    }
+    bool SetWidgetEnabled(
+        string windowName,
+        string widgetName,
+        bool enabled
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null) { return false; }
+        widget.SetEnabled(enabled);
+        if (!enabled && widget == this.focused) {
+            this.SetFocus("", "");
+        }
+        return true;
+    }
+    bool SetWidgetText(
+        string windowName,
+        string widgetName,
+        string text
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null) { return false; }
+        widget.SetText(text);
+        this.events.RaiseWidgetEvent(
+            windowName, widgetName, "文本变化", widget.Text());
+        return true;
+    }
+    bool SetWindowPosition(string name, int x, int y) {
+        ZgmWindowState window = this.FindWindow(name);
+        if (window == null) { return false; }
+        window.SetPosition(x, y);
+        return true;
+    }
+    bool SetFocus(string windowName, string widgetName) {
+        ZgmWidgetState next = null;
+        if (windowName != "" || widgetName != "") {
+            next = this.FindWidget(windowName, widgetName);
+            if (next == null) { return false; }
+            if (!next.Visible() || !next.Enabled()) { return false; }
+        }
+        if (next == this.focused) { return true; }
+        ZgmWidgetState previous = this.focused;
+        if (previous != null) {
+            previous.SetFocused(false);
+            this.events.RaiseFocusChanged(false);
+            this.events.RaiseWidgetEvent(
+                previous.WindowName(), previous.Name(), "失去焦点", "");
+        }
+        this.focused = next;
+        if (next != null) {
+            next.SetFocused(true);
+            this.events.RaiseFocusChanged(true);
+            this.events.RaiseWidgetEvent(
+                next.WindowName(), next.Name(), "获得焦点", "");
+        }
+        return true;
+    }
+    bool Resize(int width, int height) {
+        if (width <= 0 || height <= 0) { return false; }
+        this.screenWidth = width;
+        this.screenHeight = height;
+        this.events.RaiseSizeChanged(width, height);
+        return true;
+    }
+    bool SetProgressPosition(
+        string windowName,
+        string widgetName,
+        int position
+    ) {
+        return this.SetRangeWidgetPosition(
+            windowName, widgetName, "进度条", position);
+    }
+    bool SetSliderPosition(
+        string windowName,
+        string widgetName,
+        int position
+    ) {
+        return this.SetRangeWidgetPosition(
+            windowName, widgetName, "滑块条", position);
+    }
+    bool SetScrollbarPosition(
+        string windowName,
+        string widgetName,
+        int position
+    ) {
+        return this.SetRangeWidgetPosition(
+            windowName, widgetName, "滚动条", position);
+    }
+    bool SetRangeWidgetPosition(
+        string windowName,
+        string widgetName,
+        string kind,
+        int position
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != kind) { return false; }
+        int minimum = widget.Config().ControlMin();
+        int maximum = widget.Config().ControlMax();
+        if (minimum > maximum) {
+            int swap = minimum;
+            minimum = maximum;
+            maximum = swap;
+        }
+        if (position < minimum) { position = minimum; }
+        if (position > maximum) { position = maximum; }
+        widget.SetRangePosition(position);
+        this.events.RaiseWidgetEvent(
+            windowName, widgetName, "数值变化",
+            Convert.ToString(position));
+        return true;
+    }
+    bool SetEditText(string windowName, string widgetName, string text) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "输入框") {
+            return false;
+        }
+        if (widget.Config().InputReadOnly()) { return false; }
+        if (text == null) { text = ""; }
+        int maximum = widget.Config().InputMaxLength();
+        if (maximum > 0 && text.Length > maximum) {
+            text = text.Substring(0, maximum);
+        }
+        if (widget.Config().InputNumeric()
+            && !this.IsNumericInput(text)) {
+            return false;
+        }
+        widget.SetText(text);
+        this.events.RaiseWidgetEvent(
+            windowName, widgetName, "文本变化", text);
+        return true;
+    }
+    bool IsNumericInput(string text) {
+        if (text == null || text.Length == 0) { return true; }
+        int dotCount = 0;
+        int i = 0;
+        while (i < text.Length) {
+            int code = text[i] & 255;
+            bool digit = code >= 48 && code <= 57;
+            bool sign = code == 45 && i == 0;
+            bool dot = code == 46 && dotCount == 0;
+            if (!digit && !sign && !dot) { return false; }
+            if (code == 46) { dotCount = dotCount + 1; }
+            i = i + 1;
+        }
+        return true;
+    }
+    bool TextInput(string text) {
+        ZgmWidgetState widget = this.focused;
+        if (widget == null || widget.Kind() != "输入框"
+            || widget.Config().InputReadOnly()) {
+            return false;
+        }
+        if (text == null || text.Length == 0) { return false; }
+        bool changed = false;
+        int i = 0;
+        while (i < text.Length) {
+            string part = text.Substring(i, 1);
+            int code = text[i] & 255;
+            if ((!widget.Config().InputMultiline())
+                && (code == 10 || code == 13)) {
+                i = i + 1;
+                continue;
+            }
+            if (widget.Config().InputNumeric()
+                && !this.IsNumericInput(widget.Text() + part)) {
+                i = i + 1;
+                continue;
+            }
+            int maximum = widget.Config().InputMaxLength();
+            if (maximum > 0 && widget.Text().Length >= maximum) {
+                break;
+            }
+            widget.SetText(widget.Text() + part);
+            changed = true;
+            i = i + 1;
+        }
+        if (changed) {
+            this.events.RaiseWidgetEvent(
+                widget.WindowName(), widget.Name(), "文本变化",
+                widget.Text());
+        }
+        return changed;
+    }
+    bool KeyDown(int keycode, bool alt, bool shift, bool control) {
+        this.events.RaiseKeyDown(keycode, alt, shift, control);
+        ZgmWidgetState widget = this.focused;
+        if (widget == null || widget.Kind() != "输入框"
+            || widget.Config().InputReadOnly()) {
+            return widget != null;
+        }
+        if (keycode == 8) {
+            if (widget.Text().Length == 0) { return true; }
+            widget.SetText(widget.Text().Substring(
+                0, widget.Text().Length - 1));
+            this.events.RaiseWidgetEvent(
+                widget.WindowName(), widget.Name(), "文本变化",
+                widget.Text());
+            return true;
+        }
+        if (keycode == 13) {
+            if (widget.Config().InputMultiline()) {
+                return this.TextInput("\n");
+            }
+            this.events.RaiseWidgetEvent(
+                widget.WindowName(), widget.Name(), "提交",
+                widget.Text());
+            return true;
+        }
+        return true;
+    }
+    bool KeyUp(int keycode, bool alt, bool shift, bool control) {
+        this.events.RaiseKeyUp(keycode, alt, shift, control);
+        return this.focused != null;
+    }
+    string RequestItemTooltip(string itemName, string current) {
+        if (current == null) { current = ""; }
+        if (current == "") {
+            ItemConfig item = this.project.FindItem(itemName);
+            if (item != null) { current = item.Tooltip(); }
+        }
+        return this.events.RaiseItemTooltip(itemName, current);
+    }
+    string RequestSkillTooltip(string skillName, string current) {
+        if (current == null) { current = ""; }
+        if (current == "") {
+            SkillConfig skill = this.project.FindSkill(skillName);
+            if (skill != null) { current = skill.Tooltip(); }
+        }
+        return this.events.RaiseSkillTooltip(skillName, current);
+    }
     ZgmWindowState FindWindow(string name) {
         int i = 0;
         while (i < this.windows.Count) {
@@ -793,6 +1158,145 @@ class ZgmUiRuntime {
         ZgmWindowState window = this.FindWindow(windowName);
         if (window == null) { return null; }
         return window.FindWidget(widgetName);
+    }
+    bool SetCheckBox(
+        string windowName,
+        string widgetName,
+        bool checked
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "选择框") {
+            return false;
+        }
+        int group = widget.Config().SelectionGroup();
+        if (checked && group > 0) {
+            ZgmWindowState window = this.FindWindow(windowName);
+            int i = 0;
+            while (i < window.WidgetCount()) {
+                ZgmWidgetState other = window.WidgetAt(i);
+                if (other != widget
+                    && other.Kind() == "选择框"
+                    && other.Config().SelectionGroup() == group) {
+                    other.SetSelected(false);
+                }
+                i = i + 1;
+            }
+        }
+        widget.SetSelected(checked);
+        return true;
+    }
+    bool ToggleCheckBox(string windowName, string widgetName) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "选择框") {
+            return false;
+        }
+        return this.SetCheckBox(
+            windowName, widgetName, !widget.Selected());
+    }
+    bool SetComboSelection(
+        string windowName,
+        string widgetName,
+        int index
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "组合框"
+            || index < 0 || index >= widget.Config().OptionCount()) {
+            return false;
+        }
+        widget.SetSelectedIndex(index);
+        widget.SetExpanded(false);
+        return true;
+    }
+    bool ToggleCombo(string windowName, string widgetName) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "组合框") {
+            return false;
+        }
+        widget.SetExpanded(!widget.Expanded());
+        return true;
+    }
+    bool SetTabPage(
+        string windowName,
+        string widgetName,
+        int index
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "选择夹"
+            || index < 0 || index >= widget.Config().PageCount()) {
+            return false;
+        }
+        widget.SetActivePage(index);
+        return true;
+    }
+    bool SetWidgetScroll(
+        string windowName,
+        string widgetName,
+        int position
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null) { return false; }
+        widget.SetScrollPosition(position);
+        return true;
+    }
+    bool ClearListRows(string windowName, string widgetName) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "列表框") {
+            return false;
+        }
+        widget.ClearRows();
+        widget.SetRowSelection(-1);
+        return true;
+    }
+    bool AddListRow(
+        string windowName,
+        string widgetName,
+        ZgmListRow row
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "列表框"
+            || row == null) {
+            return false;
+        }
+        widget.AddRow(row);
+        return true;
+    }
+    bool SetListSelection(
+        string windowName,
+        string widgetName,
+        int index
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "列表框"
+            || index < -1 || index >= widget.RowCount()) {
+            return false;
+        }
+        widget.SetRowSelection(index);
+        return true;
+    }
+    bool SetMapBoxView(
+        string windowName,
+        string widgetName,
+        int cellX,
+        int cellY,
+        double zoom
+    ) {
+        ZgmWidgetState widget = this.FindWidget(
+            windowName, widgetName);
+        if (widget == null || widget.Kind() != "地图框") {
+            return false;
+        }
+        if (zoom <= 0.0) { zoom = 1.0; }
+        widget.SetMapView(cellX, cellY, zoom);
+        return true;
     }
     int BindingCount() { return this.bindings.Count; }
     bool RemoveWidgetBinding(string windowName, string widgetName) {
@@ -902,6 +1406,8 @@ class ZgmUiRuntime {
         ZgmWidgetBinding binding = ZgmWidgetBinding.Create(
             windowName, widgetName, "quick");
         binding.sourceName = sourceKind + ":" + sourceName;
+        binding.sourceKind = sourceKind;
+        binding.sourceId = sourceName;
         this.bindings.Add(binding);
         this.ApplyWidgetBinding(binding);
         return true;
@@ -1080,15 +1586,10 @@ class ZgmUiRuntime {
             widget.Data().SetBag(
                 hero.Id(), matchingCount, hero.Inventory().Capacity());
         } else if (binding.Mode() == "quick") {
-            int separator = binding.sourceName.IndexOf(":");
-            if (separator < 0) {
-                widget.ClearData();
-                return;
-            }
-            string sourceKind = binding.sourceName.Substring(0, separator);
-            string sourceName = binding.sourceName.Substring(separator + 1);
-            if (sourceKind == "技能") {
-                SkillConfig skill = this.project.FindSkill(sourceName);
+            if (binding.sourceKind == "技能"
+                || binding.sourceKind == "skill") {
+                SkillConfig skill = this.project.FindSkill(
+                    binding.sourceId);
                 if (skill != null) {
                     widget.Data().SetSkill(
                         skill,
@@ -1098,7 +1599,8 @@ class ZgmUiRuntime {
                         hero.Id());
                 }
             } else {
-                ItemConfig item = this.project.FindItem(sourceName);
+                ItemConfig item = this.project.FindItem(
+                    binding.sourceId);
                 if (item != null) {
                     widget.Data().SetItem(
                         item,
@@ -1113,6 +1615,26 @@ class ZgmUiRuntime {
         int i = 0;
         while (i < this.bindings.Count) {
             this.ApplyWidgetBinding(this.bindings[i]);
+            i = i + 1;
+        }
+    }
+    void RefreshMapWidgets() {
+        ZgmActor hero = this.world.Hero();
+        ZgmCamera camera = this.world.Camera();
+        if (hero == null) { return; }
+        double zoom = 1.0;
+        if (camera != null) { zoom = camera.Zoom(); }
+        int i = 0;
+        while (i < this.windows.Count) {
+            ZgmWindowState window = this.windows[i];
+            int w = 0;
+            while (w < window.WidgetCount()) {
+                ZgmWidgetState widget = window.WidgetAt(w);
+                if (widget.Kind() == "地图框") {
+                    widget.SetMapView(hero.X(), hero.Y(), zoom);
+                }
+                w = w + 1;
+            }
             i = i + 1;
         }
     }
@@ -1132,6 +1654,10 @@ class ZgmUiRuntime {
         ZgmWindowState window = this.FindWindow(name);
         if (window == null) { return false; }
         window.Close();
+        if (this.focused != null
+            && this.focused.WindowName() == name) {
+            this.SetFocus("", "");
+        }
         this.events.RaiseCustomEvent(name, "关闭", "");
         return true;
     }
@@ -1139,6 +1665,11 @@ class ZgmUiRuntime {
         ZgmWindowState window = this.FindWindow(name);
         if (window == null) { return false; }
         window.Toggle();
+        if (!window.Visible()
+            && this.focused != null
+            && this.focused.WindowName() == name) {
+            this.SetFocus("", "");
+        }
         this.events.RaiseCustomEvent(name, "开关", "");
         return true;
     }
@@ -1164,6 +1695,7 @@ class ZgmUiRuntime {
             i = i + 1;
         }
         this.RefreshWidgetBindings();
+        this.RefreshMapWidgets();
     }
     ZgmWindowState HitWindow(int x, int y) {
         int i = this.windows.Count - 1;
@@ -1181,12 +1713,16 @@ class ZgmUiRuntime {
         this.pointerY = y;
         ZgmWindowState window = this.HitWindow(x, y);
         if (window == null) {
-            this.focused = null;
+            this.SetFocus("", "");
             this.pressed = null;
             return false;
         }
         ZgmWidgetState widget = window.HitWidget(x, y);
-        this.focused = widget;
+        if (widget != null) {
+            this.SetFocus(window.Name(), widget.Name());
+        } else {
+            this.SetFocus("", "");
+        }
         this.pressed = widget;
         if (widget == null && window.Config().Movable()) {
             this.dragWindow = window;
@@ -1216,8 +1752,12 @@ class ZgmUiRuntime {
         if (window != null) { widget = window.HitWidget(x, y); }
         bool activate = widget != null && widget == this.pressed;
         if (activate) {
-            if (widget.Kind() == "按钮" || widget.Kind() == "选择框") {
+            if (widget.Kind() == "按钮") {
                 widget.SetSelected(!widget.Selected());
+            } else if (widget.Kind() == "选择框") {
+                this.ToggleCheckBox(window.Name(), widget.Name());
+            } else if (widget.Kind() == "组合框") {
+                this.ToggleCombo(window.Name(), widget.Name());
             }
             this.events.RaiseWidgetEvent(
                 window.Name(), widget.Name(), "单击", "");

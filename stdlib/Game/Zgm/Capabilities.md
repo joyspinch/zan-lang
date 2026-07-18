@@ -83,14 +83,43 @@ to a project `Skin`, and participate in the same tween property surface as
 windows, widgets and regular nodes.
 
 `ZgmUiRuntime` also provides renderer-neutral hero bindings for progress bars,
-role display boxes, skill slots, item slots and bag widgets. Register a binding
+role display boxes, skill slots, quick slots, item slots and bag widgets. Register a binding
 with `BindHeroProgress`, `BindHeroShowBox`, `BindHeroSkillBox`,
-`BindHeroItemBox` or `BindHeroBagBox`; `Update` refreshes values, cooldowns,
-quantities and learned state from the live `ZgmActor`. Bag data is not copied
+`BindHeroItemBox`, `BindHeroBagBox` or `BindHeroQuickBox`; `Update` refreshes
+values, cooldowns, quantities and learned state from the live `ZgmActor`.
+Bag data is not copied
 into a second inventory: `BoundBagSlotCount`, `BoundBagItemNameAt` and
 `BoundBagQuantityAt` read the filtered `ZgmInventory` view directly. This keeps
 the standard library localized to Zan's typed runtime rather than mirroring
 DM3's renderer-specific widget internals.
+
+Common control interaction is also exposed by the typed UI runtime:
+`SetCheckBox` enforces positive radio groups, `ToggleCombo` and
+`SetComboSelection` control dropdown state, `SetTabPage` changes the active
+page, `AddListRow`/`SetListSelection` manage list data, and
+`SetMapBoxView` overrides a minimap view. Map widgets otherwise follow the
+live hero cell and camera zoom during `Update`.
+
+Input and window lifecycle are also exposed without a Lua event loop:
+`SetFocus` and `FocusedWidget` manage focus transitions, `KeyDown`/`KeyUp`
+forward keyboard events, `TextInput` and `SetEditText` update localized edit
+box state with read-only, numeric, multiline and length-limit rules, and
+`Resize` raises the typed size event. `SetProgressPosition`,
+`SetSliderPosition` and `SetScrollbarPosition` clamp range values against the
+control configuration and raise a `数值变化` widget event. `RequestItemTooltip`
+and `RequestSkillTooltip` provide configuration defaults before invoking the
+application tooltip handlers.
+
+`SetWindowState` emits renderer-neutral minimized/maximized/restored states
+(`1/2/3`), while `ActivateRichTextLink` validates a rich-text widget and emits
+the typed link callback with the link identifier.
+
+`ShowSystemPrompt` and `DispatchCustomEvent` expose the corresponding typed
+system/custom event paths. `SetWidgetVisible`, `SetWidgetEnabled` and
+`SetWidgetText` mutate renderer-neutral widget state; hiding or disabling the
+focused widget clears focus first. `SetWindowPosition` moves a live window
+without rebuilding its widget states, and closing or hiding that window clears
+focus when necessary.
 
 NPCs with `NpcConfig.SetBehavior(aiLevel, autoCounter)` and `aiLevel > 0`
 receive a fixed 100ms AI tick. The current localized behavior finds the nearest
@@ -106,6 +135,10 @@ cooldowns, resources and target validation still go through the normal
 The standard library executes component semantics but intentionally does not
 hard-code a renderer, audio mixer, input backend or project file format.
 
+`scripts/zgm_tool.ps1 coverage` prints the current capability boundary and its
+representative direct-`zanc` tests. It distinguishes completed Zan-native
+areas from adapter-bound areas and the intentionally excluded Lua layers.
+
 - A renderer consumes `ZgmWorld` and `ZgmUiRuntime` state.
 - An audio adapter consumes `ZgmMusic` state and component sound bindings.
 - Editors and build tools construct `ZgmProject` directly or generate Zan code.
@@ -118,7 +151,8 @@ hard-code a renderer, audio mixer, input backend or project file format.
   every program to link the native SQLite driver.
 - `ZgmSaveRepository` is the ZGM-local persistence layer on top of the generic
   SQLite connection. It owns the save-slot schema and snapshot/item
-  serialization; applications do not need to rebuild those SQL tables.
+  serialization, exposes slot enumeration, and applications do not need to
+  rebuild those SQL tables.
 - `App.lua` and `Server.lua` are not loaded or interpreted as source files.
   Their functional areas are implemented as typed ZGM configuration and
   runtime APIs; a future migration tool, if needed, belongs in a separate

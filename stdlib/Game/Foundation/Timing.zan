@@ -1,0 +1,183 @@
+using System;
+
+namespace Game.Foundation;
+
+/// <summary>
+/// Deterministic fixed-step accumulator. Simulation code consumes Step()
+/// repeatedly while HasStep() is true and renders with Alpha() interpolation.
+/// </summary>
+class FixedStepClock {
+    int stepMilliseconds;
+    int maxStepsPerFrame;
+    int accumulator;
+    int pendingSteps;
+    bool paused;
+    double timeScale;
+
+    static FixedStepClock Create(int stepMilliseconds, int maxStepsPerFrame) {
+        FixedStepClock clock = new FixedStepClock();
+        clock.stepMilliseconds = stepMilliseconds;
+        if (clock.stepMilliseconds <= 0) { clock.stepMilliseconds = 16; }
+        clock.maxStepsPerFrame = maxStepsPerFrame;
+        if (clock.maxStepsPerFrame <= 0) { clock.maxStepsPerFrame = 5; }
+        clock.accumulator = 0;
+        clock.pendingSteps = 0;
+        clock.paused = false;
+        clock.timeScale = 1.0;
+        return clock;
+    }
+
+    int Advance(int deltaMilliseconds) {
+        this.pendingSteps = 0;
+        if (this.paused || deltaMilliseconds <= 0) { return 0; }
+
+        int scaled = (int)((double)deltaMilliseconds * this.timeScale);
+        int maximum = this.stepMilliseconds * this.maxStepsPerFrame;
+        if (scaled > maximum) { scaled = maximum; }
+        this.accumulator = this.accumulator + scaled;
+
+        while (this.accumulator >= this.stepMilliseconds
+            && this.pendingSteps < this.maxStepsPerFrame) {
+            this.accumulator = this.accumulator - this.stepMilliseconds;
+            this.pendingSteps = this.pendingSteps + 1;
+        }
+        return this.pendingSteps;
+    }
+
+    bool HasStep() { return this.pendingSteps > 0; }
+
+    int ConsumeStep() {
+        if (this.pendingSteps <= 0) { return 0; }
+        this.pendingSteps = this.pendingSteps - 1;
+        return this.stepMilliseconds;
+    }
+
+    int StepMilliseconds() { return this.stepMilliseconds; }
+    int PendingSteps() { return this.pendingSteps; }
+
+    double Alpha() {
+        return (double)this.accumulator / (double)this.stepMilliseconds;
+    }
+
+    void SetPaused(bool paused) { this.paused = paused; }
+    bool Paused() { return this.paused; }
+
+    void SetTimeScale(double scale) {
+        if (scale < 0.0) { scale = 0.0; }
+        if (scale > 8.0) { scale = 8.0; }
+        this.timeScale = scale;
+    }
+
+    double TimeScale() { return this.timeScale; }
+
+    void Reset() {
+        this.accumulator = 0;
+        this.pendingSteps = 0;
+    }
+}
+
+/// <summary>A reusable one-shot or repeating millisecond timer.</summary>
+class GameTimer {
+    int duration;
+    int remaining;
+    bool repeating;
+    bool running;
+    int triggers;
+
+    static GameTimer Once(int durationMilliseconds) {
+        return GameTimer.Create(durationMilliseconds, false);
+    }
+
+    static GameTimer Repeating(int intervalMilliseconds) {
+        return GameTimer.Create(intervalMilliseconds, true);
+    }
+
+    static GameTimer Create(int durationMilliseconds, bool repeating) {
+        GameTimer timer = new GameTimer();
+        timer.duration = durationMilliseconds;
+        if (timer.duration <= 0) { timer.duration = 1; }
+        timer.remaining = timer.duration;
+        timer.repeating = repeating;
+        timer.running = true;
+        timer.triggers = 0;
+        return timer;
+    }
+
+    int Tick(int deltaMilliseconds) {
+        this.triggers = 0;
+        if (!this.running || deltaMilliseconds <= 0) { return 0; }
+        this.remaining = this.remaining - deltaMilliseconds;
+        while (this.remaining <= 0 && this.running) {
+            this.triggers = this.triggers + 1;
+            if (this.repeating) {
+                this.remaining = this.remaining + this.duration;
+            } else {
+                this.remaining = 0;
+                this.running = false;
+            }
+        }
+        return this.triggers;
+    }
+
+    void Restart() {
+        this.remaining = this.duration;
+        this.running = true;
+        this.triggers = 0;
+    }
+
+    void Stop() { this.running = false; }
+    bool Running() { return this.running; }
+    int Remaining() { return this.remaining; }
+    int Duration() { return this.duration; }
+    int Triggers() { return this.triggers; }
+}
+
+/// <summary>
+/// Small reproducible random source with exposed state for save games,
+/// deterministic replays and network synchronization.
+/// </summary>
+class DeterministicRandom {
+    int state;
+
+    static DeterministicRandom Create(int seed) {
+        DeterministicRandom random = new DeterministicRandom();
+        random.state = seed;
+        if (random.state == 0) { random.state = 1; }
+        return random;
+    }
+
+    int NextRaw() {
+        this.state =
+            this.state * 6364136223846793005 + 1442695040888963407;
+        return this.state;
+    }
+
+    int Next() {
+        int result = this.NextRaw();
+        if (result < 0) { result = -result; }
+        if (result < 0) { result = 0; }
+        return result;
+    }
+
+    int NextBelow(int bound) {
+        if (bound <= 0) { return 0; }
+        int result = this.Next();
+        return result - (result / bound) * bound;
+    }
+
+    int Between(int minimum, int maximumExclusive) {
+        if (maximumExclusive <= minimum) { return minimum; }
+        return minimum + this.NextBelow(maximumExclusive - minimum);
+    }
+
+    double NextDouble() {
+        return (double)this.NextBelow(1000000) / 1000000.0;
+    }
+
+    int State() { return this.state; }
+
+    void Restore(int state) {
+        this.state = state;
+        if (this.state == 0) { this.state = 1; }
+    }
+}

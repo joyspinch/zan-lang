@@ -1,0 +1,257 @@
+// Compile-time adaptive UI rendering backend prototype.
+//
+// The GUI/widget code is written ONCE against the IUiRenderer interface.
+// The concrete backend is chosen at COMPILE TIME via a preprocessor define,
+// so a build only pulls in SDL3/GPU when it actually asks for it:
+//
+//   zanc ui_backend_demo.zan -DUI_GPU       ... SDL3 GPU-accelerated backend
+//   zanc ui_backend_demo.zan -DUI_SOFTWARE  ... pure-CPU software rasterizer
+//   zanc ui_backend_demo.zan                ... headless no-op (tools/CI)
+//
+// Only the UI_GPU build references the SDL3 namespace (guarded by #if), so
+// non-GPU builds neither compile nor link SDL3.
+
+using System;
+#if UI_GPU
+using SDL3;
+#endif
+
+namespace UiKit;
+
+// ---- backend-agnostic contract -------------------------------------------
+// Real Widget/UiRuntime would walk its tree and emit these calls. It never
+// mentions SDL, pixels, or GPU -- only this interface.
+interface IUiRenderer {
+    string BackendName();
+    bool GpuAccelerated();
+    // Register a solid sprite once; animate it later by transform only.
+    int RegisterSprite(int w, int h, int r, int g, int b);
+    void BeginFrame(int r, int g, int b);
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a);
+    void DrawSprite(int id, int x, int y, int angle, int alpha);
+    void EndFrame();
+    // Backend-independent signature of what was drawn (for verification).
+    long Metric();
+}
+
+// ==========================================================================
+#if UI_GPU
+// ---- GPU backend: SDL3, cached textures, transform-only animation ---------
+class SdlUiRenderer : IUiRenderer {
+    SdlWindow window;
+    SdlRenderer renderer;
+    List<SdlTexture> sprites;
+    long metric;
+
+    static SdlUiRenderer Create(int width, int height) {
+        SdlUiRenderer self = new SdlUiRenderer();
+        Sdl.Init(SdlInit.Video());
+        self.window = SdlWindow.Create("UiKit", width, height, SdlWindowFlags.Hidden());
+        self.renderer = SdlRenderer.Create(self.window);
+        self.sprites = new List<SdlTexture>();
+        self.metric = 0;
+        return self;
+    }
+
+    string BackendName() { return "sdl-gpu"; }
+    bool GpuAccelerated() { return true; }
+
+    int RegisterSprite(int w, int h, int r, int g, int b) {
+        // Rasterize the sprite ONCE into a GPU texture; animation is pure
+        // GPU transform afterwards (no per-frame CPU pixel work).
+        SdlTexture tex = SdlTexture.CreateTarget(this.renderer, w, h);
+        tex.SetColor(r, g, b);
+        this.sprites.Add(tex);
+        return this.sprites.Count - 1;
+    }
+
+    void BeginFrame(int r, int g, int b) {
+        this.renderer.SetColor(r, g, b, 255);
+        this.renderer.Clear();
+    }
+
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a) {
+        this.renderer.SetColor(r, g, b, a);
+        this.renderer.FillRect(x, y, w, h);
+        this.metric = this.metric + (long)(x + y + w + h + r + g + b + a);
+    }
+
+    void DrawSprite(int id, int x, int y, int angle, int alpha) {
+        SdlTexture tex = this.sprites[id];
+        tex.SetOpacity(alpha);
+        this.renderer.DrawTextureRotated(
+            tex, x, y, 32, 32, angle);
+        this.metric = this.metric + (long)(id + x + y + angle + alpha);
+    }
+
+    void EndFrame() { this.renderer.Present(); }
+    long Metric() { return this.metric; }
+}
+#endif
+
+// ==========================================================================
+#if UI_SOFTWARE
+// ---- Software backend: pure-CPU rasterizer into a pixel buffer ------------
+class UiSoftSprite {
+    int w; int h; int r; int g; int b;
+}
+
+class SoftwareUiRenderer : IUiRenderer {
+    int width; int height;
+    int[] buffer;              // packed 0xRRGGBB per pixel
+    List<UiSoftSprite> sprites;
+
+    static SoftwareUiRenderer Create(int width, int height) {
+        SoftwareUiRenderer self = new SoftwareUiRenderer();
+        self.width = width;
+        self.height = height;
+        self.buffer = new int[width * height];
+        self.sprites = new List<UiSoftSprite>();
+        return self;
+    }
+
+    string BackendName() { return "software-cpu"; }
+    bool GpuAccelerated() { return false; }
+
+    int RegisterSprite(int w, int h, int r, int g, int b) {
+        UiSoftSprite s = new UiSoftSprite { w = w, h = h, r = r, g = g, b = b };
+        this.sprites.Add(s);
+        return this.sprites.Count - 1;
+    }
+
+    void Blend(int px, int py, int r, int g, int b, int a) {
+        if (px < 0 || py < 0 || px >= this.width || py >= this.height) { return; }
+        int idx = py * this.width + px;
+        int old = this.buffer[idx];
+        int or = (old >> 16) & 255;
+        int og = (old >> 8) & 255;
+        int ob = old & 255;
+        int nr = (r * a + or * (255 - a)) / 255;
+        int ng = (g * a + og * (255 - a)) / 255;
+        int nb = (b * a + ob * (255 - a)) / 255;
+        this.buffer[idx] = ((nr & 255) << 16) | ((ng & 255) << 8) | (nb & 255);
+    }
+
+    void BeginFrame(int r, int g, int b) {
+        int packed = ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+        int i = 0;
+        int total = this.width * this.height;
+        while (i < total) { this.buffer[i] = packed; i = i + 1; }
+    }
+
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a) {
+        int yy = 0;
+        while (yy < h) {
+            int xx = 0;
+            while (xx < w) { this.Blend(x + xx, y + yy, r, g, b, a); xx = xx + 1; }
+            yy = yy + 1;
+        }
+    }
+
+    void DrawSprite(int id, int x, int y, int angle, int alpha) {
+        UiSoftSprite s = this.sprites[id];
+        this.FillRect(x, y, s.w, s.h, s.r, s.g, s.b, alpha);
+    }
+
+    void EndFrame() { }
+
+    long Metric() {
+        long sum = 0;
+        int i = 0;
+        int total = this.width * this.height;
+        while (i < total) { sum = sum + (long)this.buffer[i]; i = i + 1; }
+        return sum;
+    }
+}
+#endif
+
+// ==========================================================================
+// Headless is the default when neither UI_GPU nor UI_SOFTWARE is defined.
+#if UI_GPU
+#elif UI_SOFTWARE
+#else
+// ---- Headless backend: no window, records a draw signature ----------------
+class HeadlessUiRenderer : IUiRenderer {
+    long metric;
+    int spriteCount;
+
+    static HeadlessUiRenderer Create(int width, int height) {
+        HeadlessUiRenderer self = new HeadlessUiRenderer();
+        self.metric = (long)(width + height);
+        self.spriteCount = 0;
+        return self;
+    }
+
+    string BackendName() { return "headless"; }
+    bool GpuAccelerated() { return false; }
+
+    int RegisterSprite(int w, int h, int r, int g, int b) {
+        this.metric = this.metric + (long)(w + h + r + g + b);
+        this.spriteCount = this.spriteCount + 1;
+        return this.spriteCount - 1;
+    }
+
+    void BeginFrame(int r, int g, int b) {
+        this.metric = this.metric + (long)(r + g + b);
+    }
+
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a) {
+        this.metric = this.metric + (long)(x + y + w + h + r + g + b + a);
+    }
+
+    void DrawSprite(int id, int x, int y, int angle, int alpha) {
+        this.metric = this.metric + (long)(id + x + y + angle + alpha);
+    }
+
+    void EndFrame() { }
+    long Metric() { return this.metric; }
+}
+#endif
+
+// ---- compile-time backend factory ----------------------------------------
+class UiBackend {
+    static IUiRenderer Create(int width, int height) {
+#if UI_GPU
+        return SdlUiRenderer.Create(width, height);
+#elif UI_SOFTWARE
+        return SoftwareUiRenderer.Create(width, height);
+#else
+        return HeadlessUiRenderer.Create(width, height);
+#endif
+    }
+}
+
+// ---- ONE GUI codepath, backend-agnostic ----------------------------------
+class Demo {
+    // A tiny "widget scene": a panel + an animated sprite row. This is the
+    // only place UI is described; it works on every backend unchanged.
+    static void RenderScene(IUiRenderer ui, int sprite, int frame) {
+        ui.BeginFrame(16, 16, 24);
+        ui.FillRect(8, 8, 240, 48, 40, 44, 60, 255);      // title bar
+        int i = 0;
+        while (i < 6) {
+            int x = 16 + i * 36;
+            int y = 80 + ((frame + i * 10) % 40);          // bob animation
+            int angle = (frame * 6 + i * 15) % 360;        // spin
+            int alpha = 120 + ((frame + i * 8) % 135);     // fade
+            ui.DrawSprite(sprite, x, y, angle, alpha);
+            i = i + 1;
+        }
+        ui.EndFrame();
+    }
+
+    static void Main() {
+        IUiRenderer ui = UiBackend.Create(256, 160);
+        Console.WriteLine("backend=" + ui.BackendName());
+        int accel = 0;
+        if (ui.GpuAccelerated()) { accel = 1; }
+        Console.WriteLine("gpu=" + Convert.ToString(accel));
+        int sprite = ui.RegisterSprite(32, 32, 200, 80, 60);
+        int frame = 0;
+        while (frame < 30) {
+            Demo.RenderScene(ui, sprite, frame);
+            frame = frame + 1;
+        }
+        Console.WriteLine("metric=" + Convert.ToString(ui.Metric()));
+    }
+}

@@ -1,0 +1,265 @@
+using System;
+
+namespace Game.Board;
+
+class TurnState {
+    int playerCount;
+    int currentPlayer;
+    int round;
+    string phase;
+    bool finished;
+    int winner;
+
+    static TurnState Create(int playerCount) {
+        TurnState turn = new TurnState();
+        turn.playerCount = playerCount;
+        if (turn.playerCount < 1) { turn.playerCount = 1; }
+        turn.currentPlayer = 0;
+        turn.round = 1;
+        turn.phase = "play";
+        turn.finished = false;
+        turn.winner = -1;
+        return turn;
+    }
+
+    void NextPlayer() {
+        if (this.finished) { return; }
+        this.currentPlayer = this.currentPlayer + 1;
+        if (this.currentPlayer >= this.playerCount) {
+            this.currentPlayer = 0;
+            this.round = this.round + 1;
+        }
+    }
+
+    void Finish(int winner) {
+        this.finished = true;
+        this.winner = winner;
+        this.phase = "finished";
+    }
+
+    TurnState Clone() {
+        TurnState clone = TurnState.Create(this.playerCount);
+        clone.currentPlayer = this.currentPlayer;
+        clone.round = this.round;
+        clone.phase = this.phase;
+        clone.finished = this.finished;
+        clone.winner = this.winner;
+        return clone;
+    }
+
+    int PlayerCount() { return this.playerCount; }
+    int CurrentPlayer() { return this.currentPlayer; }
+    int Round() { return this.round; }
+    string Phase() { return this.phase; }
+    bool Finished() { return this.finished; }
+    int Winner() { return this.winner; }
+    void SetPhase(string phase) { this.phase = phase; }
+    void SetCurrentPlayer(int player) {
+        if (player >= 0 && player < this.playerCount) {
+            this.currentPlayer = player;
+        }
+    }
+}
+
+/// <summary>
+/// Serializable player intent. Rules own the meaning of Type, Value and
+/// Payload; the standard fields cover grid moves and card/ability commands.
+/// </summary>
+class BoardCommand {
+    string type;
+    int player;
+    int fromX;
+    int fromY;
+    int toX;
+    int toY;
+    int amount;
+    string payload;
+    int sequence;
+
+    static BoardCommand Place(int player, int x, int y, int cellValue) {
+        return BoardCommand.Create(
+            "place", player, -1, -1, x, y, cellValue, "");
+    }
+
+    static BoardCommand Move(
+        int player,
+        int fromX,
+        int fromY,
+        int toX,
+        int toY
+    ) {
+        return BoardCommand.Create(
+            "move", player, fromX, fromY, toX, toY, 0, "");
+    }
+
+    static BoardCommand Action(
+        string type,
+        int player,
+        int amount,
+        string payload
+    ) {
+        return BoardCommand.Create(
+            type, player, -1, -1, -1, -1, amount, payload);
+    }
+
+    static BoardCommand Create(
+        string type,
+        int player,
+        int fromX,
+        int fromY,
+        int toX,
+        int toY,
+        int amount,
+        string payload
+    ) {
+        BoardCommand command = new BoardCommand();
+        command.type = type;
+        command.player = player;
+        command.fromX = fromX;
+        command.fromY = fromY;
+        command.toX = toX;
+        command.toY = toY;
+        command.amount = amount;
+        command.payload = payload;
+        command.sequence = 0;
+        return command;
+    }
+
+    string Type() { return this.type; }
+    int Player() { return this.player; }
+    int FromX() { return this.fromX; }
+    int FromY() { return this.fromY; }
+    int ToX() { return this.toX; }
+    int ToY() { return this.toY; }
+    int Value() { return this.amount; }
+    string Payload() { return this.payload; }
+    int Sequence() { return this.sequence; }
+    void SetSequence(int sequence) { this.sequence = sequence; }
+}
+
+class BoardReplayEntry {
+    BoardCommand command;
+    int stateHash;
+
+    static BoardReplayEntry Create(BoardCommand command, int stateHash) {
+        BoardReplayEntry entry = new BoardReplayEntry();
+        entry.command = command;
+        entry.stateHash = stateHash;
+        return entry;
+    }
+
+    BoardCommand Command() { return this.command; }
+    int StateHash() { return this.stateHash; }
+}
+
+class BoardCommandLog {
+    List<BoardReplayEntry> entries;
+
+    static BoardCommandLog Create() {
+        BoardCommandLog log = new BoardCommandLog();
+        log.entries = new List<BoardReplayEntry>();
+        return log;
+    }
+
+    void Add(BoardCommand command, int stateHash) {
+        this.entries.Add(BoardReplayEntry.Create(command, stateHash));
+    }
+
+    void Truncate(int count) {
+        if (count < 0) { count = 0; }
+        while (this.entries.Count > count) {
+            this.entries.RemoveAt(this.entries.Count - 1);
+        }
+    }
+
+    int Count() { return this.entries.Count; }
+    BoardReplayEntry At(int index) { return this.entries[index]; }
+    void Clear() { this.entries.Clear(); }
+}
+
+interface IBoardRules {
+    bool Validate(BoardMatch match, BoardCommand command);
+    bool Apply(BoardMatch match, BoardCommand command);
+}
+
+class BoardSnapshot {
+    GridBoard board;
+    TurnState turn;
+    int sequence;
+
+    static BoardSnapshot Create(
+        GridBoard board,
+        TurnState turn,
+        int sequence
+    ) {
+        BoardSnapshot snapshot = new BoardSnapshot();
+        snapshot.board = board.Clone();
+        snapshot.turn = turn.Clone();
+        snapshot.sequence = sequence;
+        return snapshot;
+    }
+
+    GridBoard Board() { return this.board; }
+    TurnState Turn() { return this.turn; }
+    int Sequence() { return this.sequence; }
+}
+
+class BoardMatch {
+    GridBoard board;
+    TurnState turn;
+    IBoardRules rules;
+    BoardCommandLog log;
+    int sequence;
+
+    static BoardMatch Create(
+        GridBoard board,
+        int playerCount,
+        IBoardRules rules
+    ) {
+        BoardMatch match = new BoardMatch();
+        match.board = board;
+        match.turn = TurnState.Create(playerCount);
+        match.rules = rules;
+        match.log = BoardCommandLog.Create();
+        match.sequence = 0;
+        return match;
+    }
+
+    bool TryApply(BoardCommand command) {
+        if (command == null || this.rules == null || this.turn.Finished()) {
+            return false;
+        }
+        if (command.Player() != this.turn.CurrentPlayer()) { return false; }
+        if (!this.rules.Validate(this, command)) { return false; }
+        if (!this.rules.Apply(this, command)) { return false; }
+        this.sequence = this.sequence + 1;
+        command.SetSequence(this.sequence);
+        this.log.Add(command, this.Hash());
+        return true;
+    }
+
+    BoardSnapshot Snapshot() {
+        return BoardSnapshot.Create(this.board, this.turn, this.sequence);
+    }
+
+    void Restore(BoardSnapshot snapshot) {
+        if (snapshot == null) { return; }
+        this.board = snapshot.Board().Clone();
+        this.turn = snapshot.Turn().Clone();
+        this.sequence = snapshot.Sequence();
+        this.log.Truncate(this.sequence);
+    }
+
+    int Hash() {
+        int hash = this.board.Hash();
+        hash = hash * 31 + this.turn.CurrentPlayer();
+        hash = hash * 31 + this.turn.Round();
+        hash = hash * 31 + this.sequence;
+        return hash;
+    }
+
+    GridBoard Board() { return this.board; }
+    TurnState Turn() { return this.turn; }
+    BoardCommandLog Log() { return this.log; }
+    int Sequence() { return this.sequence; }
+}
