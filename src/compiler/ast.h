@@ -88,6 +88,7 @@ typedef enum {
     AST_ENUM_MEMBER,
     AST_CATCH_CLAUSE,
     AST_SWITCH_CASE,
+    AST_WHERE_CLAUSE, /* generic constraint: where T : C1, C2 */
 
     AST__COUNT,
 } zan_ast_kind_t;
@@ -288,6 +289,7 @@ struct zan_ast_node {
             zan_ast_list_t members;
             uint32_t modifiers;
             bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
+            zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
         } type_decl;
 
         /* method / constructor */
@@ -300,6 +302,7 @@ struct zan_ast_node {
             uint32_t modifiers;
             zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
             zan_istr_t entry_point;  /* DllImport entry point override, {NULL,0} if none */
+            zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
         } method_decl;
 
         /* field */
@@ -309,6 +312,12 @@ struct zan_ast_node {
             zan_ast_node_t *initializer;
             uint32_t modifiers;
         } field_decl;
+
+        /* generic constraint clause: where T : C1, C2 */
+        struct {
+            zan_istr_t param_name;
+            zan_ast_list_t constraints; /* AST_TYPE_REF list */
+        } where_clause;
 
         /* parameter */
         struct {

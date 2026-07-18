@@ -1306,6 +1306,43 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
 
 /* ---- class / struct members ---- */
 
+/* `where T : C1, C2 ...` generic constraint clauses. Reference/value/ctor
+ * constraints (`class`, `struct`, `new()`) are accepted but not recorded;
+ * named type constraints are collected for the checker to enforce. */
+static void parse_where_clauses(zan_parser_t *p, zan_ast_list_t *out) {
+    while (parser_check(p, TK_WHERE)) {
+        parser_advance(p);
+        zan_loc_t loc = p->current.loc;
+        zan_istr_t pname = {NULL, 0};
+        if (parser_check(p, TK_IDENT)) {
+            parser_advance(p);
+            pname = p->previous.str_val;
+        } else {
+            zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                          "expected type parameter name after 'where'");
+        }
+        parser_expect(p, TK_COLON);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_WHERE_CLAUSE, loc);
+        n->where_clause.param_name = pname;
+        zan_ast_list_init(&n->where_clause.constraints);
+        do {
+            if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT)) {
+                parser_advance(p);
+                continue;
+            }
+            if (parser_check(p, TK_NEW)) {
+                parser_advance(p);
+                parser_expect(p, TK_LPAREN);
+                parser_expect(p, TK_RPAREN);
+                continue;
+            }
+            zan_ast_node_t *cons = parse_type_ref(p);
+            zan_ast_list_push(&n->where_clause.constraints, cons, p->arena);
+        } while (parser_match(p, TK_COMMA));
+        zan_ast_list_push(out, n, p->arena);
+    }
+}
+
 static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
@@ -1581,6 +1618,10 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
 
         zan_ast_list_t params = parse_param_list(p);
 
+        zan_ast_list_t wheres;
+        zan_ast_list_init(&wheres);
+        parse_where_clauses(p, &wheres);
+
         zan_ast_node_t *body = NULL;
         if (parser_check(p, TK_LBRACE)) {
             body = parse_block(p);
@@ -1606,6 +1647,7 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         n->method_decl.modifiers = mods;
         n->method_decl.extern_lib = dll_import_lib;
         n->method_decl.entry_point = dll_entry_point;
+        n->method_decl.where_clauses = wheres;
         return n;
     }
 
@@ -1709,6 +1751,11 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
         } while (parser_match(p, TK_COMMA));
     }
 
+    /* generic constraints: where T : C1, C2 */
+    zan_ast_list_t wheres;
+    zan_ast_list_init(&wheres);
+    parse_where_clauses(p, &wheres);
+
     /* body */
     zan_ast_list_t members;
     zan_ast_list_init(&members);
@@ -1755,6 +1802,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     n->type_decl.bases = bases;
     n->type_decl.members = members;
     n->type_decl.modifiers = modifiers;
+    n->type_decl.where_clauses = wheres;
     return n;
 }
 
