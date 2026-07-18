@@ -482,6 +482,30 @@ static i64 pump(bool wait) {
 EXPORT i64 zan_gui_wait_event(void) { return pump(true); }
 EXPORT i64 zan_gui_poll_event(void) { return pump(false); }
 
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on quit. Lets an animation loop idle
+ * in the kernel (nextEventMatchingMask blocks) until either input arrives or
+ * its next frame deadline -- far cheaper than poll + sleep slices. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    if (g_mwin_count == 0) return -1;
+    if (evq_pop()) return 0;
+    memset(g_evt, 0, sizeof(g_evt));
+    if (ms < 0) ms = 0;
+    @autoreleasepool {
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:(double)ms / 1000.0];
+        for (;;) {
+            NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                             untilDate:until
+                                                inMode:NSDefaultRunLoopMode
+                                               dequeue:YES];
+            if (!ev) return 1;             /* deadline reached */
+            decode_event(ev);
+            [NSApp sendEvent:ev];
+            if (evq_pop()) return 0;
+        }
+    }
+}
+
 /* Wake a UI thread blocked in pump() from another thread so it can drain the
  * dispatch queue. Posting an application-defined NSEvent is thread-safe. */
 EXPORT i64 zan_gui_wake(void) {

@@ -1817,6 +1817,30 @@ EXPORT i64 zan_gui_wait_event(void) {
     return 0;
 }
 
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on quit. Lets an animation loop idle
+ * in the kernel until either input arrives or its next frame deadline. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    g_has_event = 0;
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (ms < 0) ms = 0;
+    DWORD start = GetTickCount();
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return -1;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if (g_has_event) return 0;
+        }
+        DWORD elapsed = GetTickCount() - start;
+        if (elapsed >= (DWORD)ms) return 1;
+        DWORD wr = MsgWaitForMultipleObjects(0, NULL, FALSE,
+                                             (DWORD)ms - elapsed, QS_ALLINPUT);
+        if (wr == WAIT_TIMEOUT) return 1;
+    }
+}
+
 /* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
  * PostMessageW is documented thread-safe, so this is callable from any
  * thread. The posted WM_NULL carries no event; wait_event returns kind 0. */
@@ -2470,6 +2494,24 @@ EXPORT i64 zan_gui_wait_event(void) {
         sdl_drain(); /* fold in anything already waiting behind it */
     }
     if (!zq_empty()) zq_pop(); /* else leaves kind 0 (e.g. a wake) */
+    return 0;
+}
+
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on quit. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (!g_sdl_ready) return -1;
+    if (zq_empty()) {
+        SDL_Event e;
+        if (!SDL_WaitEventTimeout(&e, (Sint32)(ms < 0 ? 0 : ms))) {
+            return (g_quit) ? -1 : 1;
+        }
+        sdl_translate(&e);
+        sdl_drain();
+    }
+    if (zq_empty()) return (g_quit) ? -1 : 1;
+    zq_pop();
     return 0;
 }
 
@@ -3130,6 +3172,56 @@ EXPORT i64 zan_gui_wait_event(void) {
             return 0;
         }
         /* X connection readable: loop back to XPending/XNextEvent. */
+    }
+}
+
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on error. Lets an animation loop idle
+ * in the kernel until either input arrives or its next frame deadline. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    if (!g_display) return -1;
+    memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
+    if (evq_pop_linux()) return 0;
+
+    int xfd = ConnectionNumber(g_display);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    XEvent ev;
+    for (;;) {
+        while (XPending(g_display) > 0) {
+            XNextEvent(g_display, &ev);
+            if (ev.type == SelectionRequest) {
+                x11_serve_selection(&ev.xselectionrequest);
+                continue;
+            }
+            if (XFilterEvent(&ev, None)) continue;
+            x11_translate_event(&ev);
+            if (evq_pop_linux()) return 0;
+        }
+        struct timespec tn;
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        long elapsed = (tn.tv_sec - t0.tv_sec) * 1000
+                     + (tn.tv_nsec - t0.tv_nsec) / 1000000;
+        long remain = (long)ms - elapsed;
+        if (remain <= 0) return 1;
+        struct pollfd fds[2];
+        fds[0].fd = xfd; fds[0].events = POLLIN; fds[0].revents = 0;
+        int nfds = 1;
+        if (g_wake_pipe[0] >= 0) {
+            fds[1].fd = g_wake_pipe[0]; fds[1].events = POLLIN; fds[1].revents = 0;
+            nfds = 2;
+        }
+        int pr = poll(fds, (nfds_t)nfds, (int)remain);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pr == 0) return 1;
+        if (nfds == 2 && (fds[1].revents & POLLIN)) {
+            char buf[64];
+            while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) { }
+            return 0;
+        }
     }
 }
 
@@ -4279,6 +4371,7 @@ EXPORT const char *zan_gui_get_clipboard(void) {
 EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_wait_event(void) { return -1; }
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) { (void)ms; return -1; }
 EXPORT i64 zan_gui_poll_event(void) { return -1; }
 EXPORT i64 zan_gui_wake(void) { return 0; }
 EXPORT i64 zan_gui_event_kind(void) { return 0; }
