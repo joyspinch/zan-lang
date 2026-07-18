@@ -371,6 +371,30 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return zan_ast_new(p->arena, AST_BASE_EXPR, loc);
     }
     case TK_IDENT: {
+        /* contextual keyword: nameof(expr) — folds to a string literal */
+        if (p->current.str_val.len == 6 &&
+            memcmp(p->current.str_val.str, "nameof", 6) == 0 &&
+            zan_lexer_peek(p->lex).kind == TK_LPAREN) {
+            parser_advance(p); /* nameof */
+            parser_expect(p, TK_LPAREN);
+            zan_ast_node_t *arg = parse_expression(p);
+            parser_expect(p, TK_RPAREN);
+            zan_istr_t name = {NULL, 0};
+            if (arg->kind == AST_IDENTIFIER) {
+                name = arg->ident.name;
+            } else if (arg->kind == AST_MEMBER_ACCESS) {
+                name = arg->member.name;
+            }
+            if (!name.str) {
+                zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                              "nameof argument must be an identifier or member access");
+                name.str = "";
+                name.len = 0;
+            }
+            zan_ast_node_t *n = zan_ast_new(p->arena, AST_STRING_LITERAL, loc);
+            n->str_val = name;
+            return n;
+        }
         /* check for lambda: x => expr */
         zan_token_t peek = zan_lexer_peek(p->lex);
         if (peek.kind == TK_ARROW) {

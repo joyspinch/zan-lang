@@ -1691,6 +1691,36 @@ static zan_type_t *container_elem_type(zan_type_t *t);
 static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
                                       zan_ast_node_t *call, local_scope_t *locals);
 
+/* Render a type reference's display name (with generic args, [] and ?). */
+static int render_type_ref_name(const zan_ast_node_t *t, char *buf, int cap) {
+    int n = 0;
+    if (t && t->kind == AST_TYPE_REF && cap > 1) {
+        int len = (int)t->type_ref.name.len;
+        if (len > cap - n - 1) len = cap - n - 1;
+        memcpy(buf + n, t->type_ref.name.str, (size_t)len);
+        n += len;
+        if (t->type_ref.type_args.count > 0) {
+            if (n < cap - 1) buf[n++] = '<';
+            for (int i = 0; i < t->type_ref.type_args.count; i++) {
+                if (i > 0) {
+                    if (n < cap - 1) buf[n++] = ',';
+                    if (n < cap - 1) buf[n++] = ' ';
+                }
+                n += render_type_ref_name(t->type_ref.type_args.items[i],
+                                          buf + n, cap - n);
+            }
+            if (n < cap - 1) buf[n++] = '>';
+        }
+        if (t->type_ref.is_array) {
+            if (n < cap - 1) buf[n++] = '[';
+            if (n < cap - 1) buf[n++] = ']';
+        }
+        if (t->type_ref.is_nullable && n < cap - 1) buf[n++] = '?';
+    }
+    if (cap > 0) buf[n] = 0;
+    return n;
+}
+
 /* Best-effort static test for whether an expression yields a `string` value.
  * Used to route `+` to concatenation and `==`/`!=` to strcmp rather than raw
  * pointer arithmetic/comparison. Reference (class) values are NOT strings. */
@@ -1699,6 +1729,7 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
     switch (e->kind) {
     case AST_STRING_LITERAL:
     case AST_STRING_INTERP:
+    case AST_TYPEOF_EXPR:
         return true;
     case AST_IDENTIFIER: {
         local_var_t *l = local_find(locals, e->ident.name);
@@ -1877,6 +1908,8 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals))
             return g->binder->type_string;
         return NULL;
+    case AST_TYPEOF_EXPR:
+        return g->binder->type_string;
     default:
         return NULL;
     }
@@ -7742,8 +7775,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_TYPEOF_EXPR: {
-        /* typeof(x) — return type name as string */
-        return emit_string_literal_rc(g, (zan_istr_t){ "object", 6 });
+        /* typeof(T) — the type's display name as a string */
+        char buf[256];
+        int len = render_type_ref_name(expr->cast.type, buf, (int)sizeof(buf));
+        char *copy = zan_arena_strdup(g->arena, buf, (size_t)len);
+        return emit_string_literal_rc(g, (zan_istr_t){ copy, (uint32_t)len });
     }
 
     case AST_THIS_EXPR: {
