@@ -909,12 +909,29 @@ EXPORT void zan_gui_fill_sector(i64 surface_id, i64 cx, i64 cy, i64 r_inner, i64
             /* angle of this pixel: 0 at top, clockwise, in [0,360) */
             double ang = atan2((double)dx, (double)(-dy)) * 180.0 / PI;
             if (ang < 0.0) ang += 360.0;
-            /* test membership allowing the sweep to exceed 360 via wrap */
-            int inside = 0;
-            if (ang >= a0 && ang <= a1) inside = 1;
-            else if ((ang + 360.0) >= a0 && (ang + 360.0) <= a1) inside = 1;
-            if (!inside) continue;
-            int cov = (int)(radCov * 255.0);
+            /* Angular coverage: anti-alias the two radial (start/end) edges of
+             * the sweep so slice sides are smooth, not stair-stepped. One pixel
+             * of arc length subtends ~ (0.5/dist) radians; convert to degrees
+             * and ramp coverage across that half-pixel band on each edge. Skip
+             * for full turns so the closing seam does not double-darken. */
+            double angCov = 1.0;
+            double sweep = a1 - a0;
+            if (sweep < 360.0) {
+                double aa = ang;
+                double dpix = 45.0;
+                if (dist > 0.5) dpix = (0.5 / dist) * 180.0 / PI;
+                if (aa < a0 - dpix) aa += 360.0;
+                double dLo = aa - a0;   /* >0 inside from the start edge */
+                double dHi = a1 - aa;   /* >0 inside from the end edge   */
+                if (dLo <= -dpix || dHi <= -dpix) continue; /* fully outside */
+                double covLo = (dLo + dpix) / (2.0 * dpix);
+                double covHi = (dHi + dpix) / (2.0 * dpix);
+                if (covLo > 1.0) covLo = 1.0; if (covLo < 0.0) covLo = 0.0;
+                if (covHi > 1.0) covHi = 1.0; if (covHi < 0.0) covHi = 0.0;
+                angCov = covLo * covHi;
+                if (angCov <= 0.0) continue;
+            }
+            int cov = (int)(radCov * angCov * 255.0);
             if (cov >= 255) set_pixel(s, icx + dx, icy + dy, c);
             else set_pixel_aa(s, icx + dx, icy + dy, c, cov);
         }
