@@ -210,8 +210,12 @@ bool zan_incr_save(zan_incr_cache_t *cache) {
         }
     }
 
-    fclose(f);
-    return true;
+    /* A short write (e.g. a full disk) leaves a truncated manifest that would
+     * be silently treated as valid on the next run; surface it as failure so
+     * the cache is regenerated instead of trusting a partial file. */
+    bool ok = (ferror(f) == 0);
+    if (fclose(f) != 0) ok = false;
+    return ok;
 }
 
 /* ---- rebuild detection ---- */
