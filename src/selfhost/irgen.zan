@@ -16,6 +16,10 @@ class ExprVal {
 // stored via ptrtoint / read back via inttoptr).
 class Irgen {
     public Binder binder;
+    // The gen1 IR is compiled and run on the same host as this compiler, so
+    // OS-specific runtime shims (console code page, timers, sleep) follow the
+    // host platform: a drive-letter ExeDir means Windows, else POSIX.
+    public bool hostWin;
     public Diags diags;
     public StringBuilder head;
     public StringBuilder body;
@@ -529,6 +533,8 @@ class Irgen {
 
     // ---- driver ----
     public string Gen(Node unit) {
+        string exeDir = Environment.ExeDir();
+        hostWin = exeDir.Length >= 2 && exeDir.Substring(1, 1) == ":";
         CollectTParams(unit);
         H("declare i32 @printf(i8*, ...)");
         H("declare i8* @malloc(i64)");
@@ -548,8 +554,10 @@ class Irgen {
         H("declare i64 @fwrite(i8*, i64, i64, i8*)");
         H("declare i32 @fclose(i8*)");
         H("declare i32 @_setjmp(i8*, i8*)");
-        H("declare i32 @SetConsoleOutputCP(i32)");
-        H("declare i32 @SetConsoleCP(i32)");
+        if (hostWin) {
+            H("declare i32 @SetConsoleOutputCP(i32)");
+            H("declare i32 @SetConsoleCP(i32)");
+        }
         H("declare void @longjmp(i8*, i32)");
         H("declare i8* @llvm.frameaddress.p0(i32)");
         H("declare void @exit(i32)");
@@ -2070,28 +2078,62 @@ class Irgen {
         H("declare void @zan_io_wait_co(i64, i32, i8*, void(i8*)*)");
         H("declare void @zan_io_recv_co(i64, i8*, i32, i8*, void(i8*)*, i64*)");
         H("declare void @zan_io_accept_co(i64, i8*, void(i8*)*, i64*)");
-        if (!ExternSeen("GetTickCount64")) { externDecls.Add("GetTickCount64"); H("declare i64 @GetTickCount64()"); }
-        if (!ExternSeen("Sleep")) { externDecls.Add("Sleep"); H("declare void @Sleep(i64)"); }
+        if (hostWin) {
+            if (!ExternSeen("GetTickCount64")) { externDecls.Add("GetTickCount64"); H("declare i64 @GetTickCount64()"); }
+            if (!ExternSeen("Sleep")) { externDecls.Add("Sleep"); H("declare void @Sleep(i64)"); }
+        } else {
+            if (!ExternSeen("gettimeofday")) { externDecls.Add("gettimeofday"); H("declare i32 @gettimeofday(i8*, i8*)"); }
+            if (!ExternSeen("usleep")) { externDecls.Add("usleep"); H("declare i32 @usleep(i32)"); }
+        }
         H("%co_node = type { i8*, i8*, i8* }");
         H("%co_timer = type { i8*, i64, i8*, i8* }");
         H("@co_head = global i8* null");
         H("@co_tail = global i8* null");
         H("@co_timers = global i8* null");
-        H("define internal i64 @__zan_co_now_ms() {");
-        H("entry:");
-        H("  %n = call i64 @GetTickCount64()");
-        H("  ret i64 %n");
-        H("}");
-        H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
-        H("entry:");
-        H("  %pos = icmp sgt i64 %timeout, 0");
-        H("  br i1 %pos, label %sleep, label %ret");
-        H("sleep:");
-        H("  call void @Sleep(i64 %timeout)");
-        H("  br label %ret");
-        H("ret:");
-        H("  ret i32 0");
-        H("}");
+        if (hostWin) {
+            H("define internal i64 @__zan_co_now_ms() {");
+            H("entry:");
+            H("  %n = call i64 @GetTickCount64()");
+            H("  ret i64 %n");
+            H("}");
+            H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
+            H("entry:");
+            H("  %pos = icmp sgt i64 %timeout, 0");
+            H("  br i1 %pos, label %sleep, label %ret");
+            H("sleep:");
+            H("  call void @Sleep(i64 %timeout)");
+            H("  br label %ret");
+            H("ret:");
+            H("  ret i32 0");
+            H("}");
+        } else {
+            H("define internal i64 @__zan_co_now_ms() {");
+            H("entry:");
+            H("  %tv = alloca [2 x i64]");
+            H("  %tvp = bitcast [2 x i64]* %tv to i8*");
+            H("  call i32 @gettimeofday(i8* %tvp, i8* null)");
+            H("  %secp = getelementptr [2 x i64], [2 x i64]* %tv, i64 0, i64 0");
+            H("  %usecp = getelementptr [2 x i64], [2 x i64]* %tv, i64 0, i64 1");
+            H("  %sec = load i64, i64* %secp");
+            H("  %usec = load i64, i64* %usecp");
+            H("  %ms1 = mul i64 %sec, 1000");
+            H("  %ms2 = sdiv i64 %usec, 1000");
+            H("  %n = add i64 %ms1, %ms2");
+            H("  ret i64 %n");
+            H("}");
+            H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
+            H("entry:");
+            H("  %pos = icmp sgt i64 %timeout, 0");
+            H("  br i1 %pos, label %sleep, label %ret");
+            H("sleep:");
+            H("  %us64 = mul i64 %timeout, 1000");
+            H("  %us = trunc i64 %us64 to i32");
+            H("  call i32 @usleep(i32 %us)");
+            H("  br label %ret");
+            H("ret:");
+            H("  ret i32 0");
+            H("}");
+        }
         H("define weak i32 @zan_io_pump() {");
         H("entry:");
         H("  %w = call i32 @zan_io_pump_timeout(i64 -1)");
@@ -2399,8 +2441,10 @@ class Irgen {
         // Programs emit UTF-8 bytes; switch the Windows console to code page
         // 65001 so CJK/accented output renders instead of mojibake. Redirected
         // output (pipe/file) keeps its raw UTF-8 bytes.
-        L("  call i32 @SetConsoleOutputCP(i32 65001)");
-        L("  call i32 @SetConsoleCP(i32 65001)");
+        if (hostWin) {
+            L("  call i32 @SetConsoleOutputCP(i32 65001)");
+            L("  call i32 @SetConsoleCP(i32 65001)");
+        }
         // Install a root exception handler so an uncaught throw prints a
         // message and exits 1 instead of longjmp-ing through an empty stack.
         string rbuf = NT(); L("  " + rbuf + " = alloca [32 x i64]");
