@@ -39,6 +39,12 @@ class App {
     SignalInt themeMenuScroll;
     int themeMenuBaseId;
     UiEvent themeMenuChange;
+    // Appearance-drawer extras: a forced backdrop-effect kind (-1 = follow the
+    // skin) and an accent colour override (0 = skin default), both applied on
+    // top of whichever preset is active.
+    int fxKindOverride;
+    int accentOverride;
+    SignalInt themeDrawerTab;
     // Built-in skin switching: when autoSkins is on the title-bar theme button
     // is a menu of Theme.PresetNames and App applies the picked preset itself
     // (no per-app handler). appliedSkin is the index last applied so RenderChrome
@@ -52,7 +58,7 @@ class App {
     // desktop shows through the gaps.
     bool glassNative;
     // Rect (in canvas coords) that wants to consume mouse-wheel events this
-    // frame â€?e.g. a DataTable body with its own internal row scroll. When the
+    // frame ï¿½ï¿½?e.g. a DataTable body with its own internal row scroll. When the
     // pointer is inside it, ProcessEvent suppresses page scrolling so the wheel
     // drives the widget instead. Reset every frame in BeginFrame.
     int wheelCapX;
@@ -70,7 +76,7 @@ class App {
     // ProcessEvent against the PREVIOUS frame's complete hit regions (which
     // already include popups/overlays on top). Widgets ask Ui.Clicked/Pressed
     // whether they are this target, so a click is delivered to exactly one
-    // widget â€?the top-most one under the pointer â€?instead of every widget
+    // widget ï¿½ï¿½?the top-most one under the pointer ï¿½ï¿½?instead of every widget
     // that happens to re-read the raw event during its own render.
     int clickTargetId;
     int pressTargetId;
@@ -152,6 +158,26 @@ class App {
     int bgThemeGen;
     int bgSnapGen;
 
+    // Animated backdrop effects (Theme.fx / Gui.BackdropFx). On by default;
+    // SetBackdropFx(false) turns a window's skin motion off. When the active
+    // skin carries an effect, RenderBackground layers it over the static
+    // wallpaper snapshot and re-arms a throttled animation frame.
+    bool fxEnabled;
+
+    // Animated-backdrop fast path. The effect layer is composited on top of
+    // the finished frame in PresentFrame, which also snapshots the frame
+    // *without* the effect (slot 7). A pure effect tick then costs one
+    // full-frame restore + a few dozen small fills + present -- no widget
+    // re-render, no glass re-blur. fxNextMs is the next tick deadline (-1 =
+    // none); fxSnapValid says slot 7 holds the current frame.
+    int fxNextMs;
+    bool fxSnapValid;
+    // Pixel rects (x,y,w,h quads) the effect layer touched in the last
+    // composited frame; the next effect tick repairs just these from the
+    // slot-7 snapshot instead of restoring the whole frame. null = unknown
+    // (repair falls back to a full-frame restore once).
+    List<int> fxDamage;
+
     static App Create(string title, int width, int height) {
         App app = new App();
         app.window = Window.Create(title, width, height);
@@ -207,6 +233,9 @@ class App {
         app.themeMenuScroll = SignalInt.Create(0);
         app.themeMenuBaseId = 0;
         app.themeMenuChange = UiEvent.Create();
+        app.fxKindOverride = 0 - 1;
+        app.accentOverride = 0;
+        app.themeDrawerTab = SignalInt.Create(0);
         app.autoSkins = false;
         app.appliedSkin = -1;
         app.animKeys = new List<int>();
@@ -219,6 +248,10 @@ class App {
         app.lastFrameMs = app.nowMs;
         app.lastPresentMs = 0;
         app.animNextMs = -1;
+        app.fxEnabled = true;
+        app.fxNextMs = -1;
+        app.fxSnapValid = false;
+        app.fxDamage = null;
         app.backdropDirty = true;
         app.blurSlotSeq = 0;
         // gen != snapGen so the wallpaper is painted (and snapshotted) once up
@@ -280,7 +313,7 @@ class App {
     }
 
     /// Turns the title-bar theme button into the built-in skin picker
-    /// (Theme.PresetNames) and has App apply the chosen preset itself â€?no
+    /// (Theme.PresetNames) and has App apply the chosen preset itself ï¿½ï¿½?no
     /// per-app change handler or switch statement. Every window enables this by
     /// default (see Create); call again to preselect a persisted skin. `index`
     /// must be the skin whose theme is already active so the first frame does
@@ -289,7 +322,7 @@ class App {
         autoSkins = true;
         themeNames = Theme.PresetNames();
         if (themeMenuBaseId == 0) {
-            themeMenuBaseId = WidgetId.Block(themeNames.Count);
+            themeMenuBaseId = WidgetId.Block(themeNames.Count + 24);
         }
         themeMenuModel.Set(index);
         appliedSkin = index;
@@ -304,6 +337,11 @@ class App {
     /// records it as the active skin so the picker stays in sync.
     void ApplySkin(int i) {
         this.ApplyTheme(Theme.PresetAt(i), Theme.PresetDark(i));
+        if (accentOverride != 0) {
+            theme.primary = accentOverride;
+            theme.borderFocus = accentOverride;
+            theme.borderHover = accentOverride;
+        }
         themeMenuModel.Set(i);
         appliedSkin = i;
     }
@@ -320,7 +358,7 @@ class App {
     // The wallpaper that makes gradient/glass/neon skins read as real: a
     // vertical gradient plus soft colour blobs the frosted panels blur. Lives
     // in the framework so the IDE, the gallery and any window render identical
-    // skins â€?apps just call RenderBackground behind their content.
+    // skins ï¿½ï¿½?apps just call RenderBackground behind their content.
 
     /// One soft wallpaper glow: nested translucent disks feathering to a bright
     /// centre (no hard rim), giving the backdrop blur real colour to soften.
@@ -376,7 +414,7 @@ class App {
 
     /// Paints the active skin's window backdrop into [x,y,w,h]: a gradient +
     /// soft colour blobs for gradient/glass presets (so frosted panels blur
-    /// real colour), otherwise a flat bgPrimary fill. Cached per redraw â€?
+    /// real colour), otherwise a flat bgPrimary fill. Cached per redraw ï¿½ï¿½?
     /// animation-only frames restore the pixels with one copy instead of
     /// repainting the (expensive) blobs. `slot` is a snapshot cache slot the
     /// caller reserves for its backdrop.
@@ -425,6 +463,68 @@ class App {
         } else {
             c.FillRect(x, y, w, h, t.bgPrimary);
         }
+    }
+
+    /// The backdrop-effect kind in force: the drawer's override when set,
+    /// otherwise the active skin's own effect. 0 = none.
+    int EffectiveFx() {
+        if (fxKindOverride >= 0) { return fxKindOverride; }
+        return theme.fx;
+    }
+
+    /// True when the active skin's animated backdrop effect is running.
+    bool FxActive() {
+        return fxEnabled && this.EffectiveFx() != 0 && !glassNative;
+    }
+
+    /// Enables/disables the animated backdrop effect for this window's skins.
+    void SetBackdropFx(bool on) {
+        fxEnabled = on;
+        fxSnapValid = false;
+        if (!on) { fxNextMs = -1; }
+        needsRedraw = true;
+    }
+
+    /// Pure effect tick: restores the snapshot of the last fully rendered
+    /// frame, re-composites the skin effect on top and presents. Returns false
+    /// (caller falls back to a full render) when no valid snapshot exists,
+    /// e.g. after a resize.
+    bool FxPresent() {
+        if (!fxSnapValid || !this.FxActive()) { fxNextMs = -1; return false; }
+        if (!window.IsVisible()) {
+            // The window cannot be seen (minimized or fully covered): stop
+            // ticking so a hidden window costs no CPU. Any event -- including
+            // the visibility-change wake -- re-arms the effect (ProcessEvent /
+            // ApplyEvent).
+            fxNextMs = -1;
+            return true;
+        }
+        Canvas fc = canvas;
+        bool ok;
+        if (fxDamage == null) {
+            ok = fc.RestoreRect(0, 0, fc.Width(), fc.Height(), 7);
+        } else {
+            // Repair only the pixels the previous effect frame touched: a few
+            // hundred tiny copies instead of a full-frame restore.
+            ok = true;
+            int i = 0;
+            while (ok && i + 3 < fxDamage.Count) {
+                ok = fc.RestoreSubRect(fxDamage[i], fxDamage[i + 1],
+                                       fxDamage[i + 2], fxDamage[i + 3], 7);
+                i = i + 4;
+            }
+        }
+        if (!ok) {
+            fxSnapValid = false;
+            return false;
+        }
+        BackdropFx.Render(fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
+                          Window.GetTickMs(), theme, dpiScale);
+        fxDamage = BackdropFx.TakeDamage();
+        window.Present(canvas);
+        lastPresentMs = Window.GetTickMs();
+        fxNextMs = lastPresentMs + BackdropFx.IntervalMs(this.EffectiveFx());
+        return true;
     }
 
     int ChromeButtonCount() {
@@ -589,7 +689,7 @@ class App {
         if (closeH) { c.FillRect(closeX, 0, bw, hbar, closeRed); }
 
         // Caption glyphs render at the small "caption" size (~11px) that Windows
-        // and WeChat use â€?thin and crisp rather than chunky â€?and are centered
+        // and WeChat use ï¿½ï¿½?thin and crisp rather than chunky ï¿½ï¿½?and are centered
         // in each 46-wide button for a refined, balanced title bar.
         int gl = (t.iconSizeCaption * 33) / 25;
         int gcolor = t.textSecondary;
@@ -692,13 +792,8 @@ class App {
         // content and its option hit regions win the z-order. Right-align the
         // menu under the caption button; nudge it in if it would clip the edge.
         if (this.ThemeMenuMode() && themeMenuOpen.Get()) {
-            int menuW = Scale(168);
-            int mx = themeX + bw - menuW;
-            if (mx < Scale(4)) { mx = Scale(4); }
-            int my = hbar + Scale(2);
-            AddOverlay(OverlayPopup.OptionList(mx, my, menuW, themeNames,
-                themeMenuBaseId, themeMenuModel, themeId, themeMenuOpen,
-                themeMenuScroll, themeMenuChange));
+            AddOverlay(OverlayPopup.ThemeDrawer(themeMenuBaseId, themeId,
+                themeMenuOpen, themeMenuScroll));
         }
     }
 
@@ -751,7 +846,7 @@ class App {
     }
 
     /// <summary>
-    /// Marshals a delegate onto this window's UI thread â€?the equivalent of
+    /// Marshals a delegate onto this window's UI thread ï¿½ï¿½?the equivalent of
     /// C#'s <c>Control.Invoke</c>/<c>BeginInvoke</c>. Safe to call from any
     /// thread: the delegate is queued (under an OS mutex in the runtime) and
     /// runs on the UI thread at the start of the next frame, after which a
@@ -799,6 +894,24 @@ class App {
         animDur.Add(durMs);
     }
 
+    /// Persistent per-key integer state (reuses the animation KV store as a
+    /// generic retained-state map). Lets immediate-mode widgets whose model is
+    /// rebuilt every frame keep interaction state (legend show/hide, dataZoom
+    /// range, ...) keyed by a stable id. StateSet snaps the value with no tween.
+    int StateGet(int key, int dflt) {
+        int idx = AnimIndex(key);
+        if (idx < 0) { return dflt; }
+        return animVals[idx];
+    }
+
+    void StateSet(int key, int val) {
+        int idx = AnimIndex(key);
+        if (idx < 0) { AnimAdd(key, val, val, 1); return; }
+        animVals[idx] = val;
+        animTarget[idx] = val;
+        animFrom[idx] = val;
+    }
+
     /// Time-based eased tween of a per-key value (permille, 0..1000) toward
     /// `target` over `durMs`, returning the *already eased* current value (do
     /// NOT wrap in Ease again). Progress is (now - start)/duration so motion is
@@ -815,6 +928,40 @@ class App {
             animTarget[idx] = target;
             animStart[idx] = nowMs;
             animDur[idx] = durMs;
+        }
+        int from = animFrom[idx];
+        int tgt = animTarget[idx];
+        if (from == tgt) { animVals[idx] = tgt; return tgt; }
+        int dur = animDur[idx];
+        if (dur < 1) { dur = 1; }
+        int elapsed = nowMs - animStart[idx];
+        if (elapsed < 0) { elapsed = 0; }
+        int p = elapsed * 1000 / dur;
+        if (p > 1000) { p = 1000; }
+        int e = App.Ease(p);
+        int val = from + (tgt - from) * e / 1000;
+        animVals[idx] = val;
+        if (p < 1000) { needsRedraw = true; } else { animVals[idx] = tgt; }
+        return animVals[idx];
+    }
+
+    /// One-shot intro tween: eases a per-key value from 0 up to 1000 over
+    /// `durMs` on first sighting, then holds at 1000. Unlike AnimTo (which snaps
+    /// to its target on the first frame) this always plays the grow-in, so a
+    /// chart, bar or card can animate up from its baseline the first time it is
+    /// drawn. Keeps requesting repaints until it settles. Returns the eased
+    /// 0..1000 progress.
+    int AnimIntro(int key, int durMs) {
+        int idx = AnimIndex(key);
+        if (idx < 0) {
+            animKeys.Add(key);
+            animVals.Add(0);
+            animTarget.Add(1000);
+            animFrom.Add(0);
+            animStart.Add(nowMs);
+            animDur.Add(durMs);
+            needsRedraw = true;
+            return 0;
         }
         int from = animFrom[idx];
         int tgt = animTarget[idx];
@@ -948,7 +1095,7 @@ class App {
 
     bool ProcessEvent() {
         // If a repaint is already pending (e.g. a click handler changed state
-        // mid-frame), don't block waiting for the next OS event â€?poll so the
+        // mid-frame), don't block waiting for the next OS event ï¿½ï¿½?poll so the
         // new state paints immediately. Otherwise block until an event arrives.
         int result;
         if (needsRedraw) {
@@ -959,24 +1106,35 @@ class App {
             int since = Window.GetTickMs() - lastPresentMs;
             if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
             result = window.PollEvent();
-        } else if (animNextMs >= 0) {
-            // A throttled animation (e.g. a loading spinner) wants its next
-            // frame at animNextMs. Sleep (idle) until then instead of busy-
-            // rendering the whole page at 60fps, but poll in short slices so
-            // OS input still wakes the loop promptly. When the deadline is
-            // reached, flag a repaint and fall through with no pending event.
+        } else if (animNextMs >= 0 || fxNextMs >= 0) {
+            // A throttled animation (spinner at animNextMs) and/or the skin
+            // effect layer (fxNextMs) wants a future frame. Sleep (idle) until
+            // the earliest deadline instead of busy-rendering at 60fps, but
+            // poll in short slices so OS input still wakes the loop promptly.
+            // An effect-only deadline is served by FxPresent (single restore +
+            // re-composite, no page render); everything else flags a repaint.
             result = 1;
             bool waiting = true;
             while (waiting) {
                 int now = Window.GetTickMs();
-                if (now >= animNextMs) {
-                    needsRedraw = true;
-                    waiting = false;
+                int deadline = animNextMs;
+                if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
+                    deadline = fxNextMs;
+                }
+                if (deadline < 0) { waiting = false; }
+                else if (now >= deadline) {
+                    bool fxOnly = animNextMs < 0 || now < animNextMs;
+                    if (fxOnly && this.FxPresent()) {
+                        // Presented in place; keep waiting for the next tick.
+                    } else {
+                        needsRedraw = true;
+                        waiting = false;
+                    }
                 } else {
-                    int remain = animNextMs - now;
-                    if (remain > 15) { remain = 15; }
-                    Window.SleepMs(remain);
-                    result = window.PollEvent();
+                    // Idle in the kernel until input or the deadline: a single
+                    // blocking wait, not poll + sleep slices, so waiting for
+                    // the next animation frame costs no CPU.
+                    result = window.WaitEventTimeout(deadline - now);
                     if (result != 1) { waiting = false; }
                 }
             }
@@ -1015,7 +1173,7 @@ class App {
 
         // Keep the render surface locked to the real window size. Maximize/restore
         // sends WM_SIZE synchronously (inside ShowWindow), and the one-shot resize
-        // event can be cleared before we read it â€?so drive the surface from the
+        // event can be cleared before we read it ï¿½ï¿½?so drive the surface from the
         // persistent window dimensions, not the transient kind==7 event. This
         // guarantees Present() blits 1:1 (never stretched/blurry) and that layout
         // + hit-testing use the same coordinate space as the mouse.
@@ -1026,7 +1184,7 @@ class App {
                 canvas.Destroy();
                 canvas = Canvas.Create(curW, curH);
                 // Clamp scroll to the new viewport instead of snapping to the
-                // top â€?resizing shouldn't jump the user's scroll position.
+                // top ï¿½ï¿½?resizing shouldn't jump the user's scroll position.
                 int viewH = curH - titlebarH;
                 int maxScroll = contentHeight - viewH;
                 if (maxScroll < 0) { maxScroll = 0; }
@@ -1161,6 +1319,13 @@ class App {
             needsRedraw = true;
         }
 
+        // Resume a paused ambient effect once the window can be seen again
+        // (FxPresent parks fxNextMs at -1 while hidden; the visibility-change
+        // wake, like any event, lands here and re-arms it).
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()) {
+            fxNextMs = Window.GetTickMs();
+        }
+
         return true;
     }
 
@@ -1278,6 +1443,14 @@ class App {
         }
 
         if (kind == 6 || kind == 4 || kind == 5) { needsRedraw = true; }
+
+        // Resume a paused ambient effect once the window can be seen again
+        // (FxPresent parks fxNextMs at -1 while hidden; the visibility-change
+        // wake, like any event, lands here and re-arms it).
+        if (fxSnapValid && fxNextMs < 0 && this.FxActive() && window.IsVisible()) {
+            fxNextMs = Window.GetTickMs();
+        }
+
         return true;
     }
 
@@ -1285,6 +1458,21 @@ class App {
         // Draw + dispatch popups last so they sit above all content and own the
         // top-most hit regions (framework-owned overlay/z-order layer).
         RunOverlays();
+        // Signature skin motion: snapshot the finished frame (slot 7), then
+        // composite the effect layer on top. Later pure effect ticks restore
+        // the snapshot and re-composite (FxPresent) without re-rendering.
+        if (this.FxActive()) {
+            Canvas fc = canvas;
+            fc.SnapshotRect(0, 0, fc.Width(), fc.Height(), 7);
+            fxSnapValid = true;
+            BackdropFx.Render(fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
+                              Window.GetTickMs(), theme, dpiScale);
+            fxDamage = BackdropFx.TakeDamage();
+            fxNextMs = Window.GetTickMs() + BackdropFx.IntervalMs(this.EffectiveFx());
+            if (!window.IsVisible()) { fxNextMs = -1; }
+        } else {
+            fxNextMs = -1;
+        }
         window.Present(canvas);
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
@@ -1308,6 +1496,8 @@ class App {
         // Clear any throttled-animation deadline too; still-live animations
         // (spinners etc.) re-arm it via RequestAnimationFrame during render.
         animNextMs = -1;
+        // The frame is being re-rendered, so the slot-7 fx snapshot is stale.
+        fxSnapValid = false;
         // Hand glass surfaces stable blur-cache slots again from the top.
         blurSlotSeq = 0;
         wheelOwnerOrder = wheelCapOrder;

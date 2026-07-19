@@ -643,6 +643,8 @@ class OverlayPopup {
 
     // Rich context-menu mode (icons / separators / group headers / submenus).
     bool rich;
+    // Appearance-drawer mode (framework skin/effects/accent settings panel).
+    bool themeDrawerMode;
     List<MenuItem> menuItems;
     SignalInt result;
     SignalInt subOpen;
@@ -667,6 +669,27 @@ class OverlayPopup {
         p.openFlag = openFlag;
         p.subOpen = subOpen;
         p.triggerId = 0 - 1;
+        p.showCheck = false;
+        return p;
+    }
+
+    /// The appearance drawer: a right-docked settings panel with the skin
+    /// list, a one-tap animation on/off switch, a backdrop-effect picker and
+    /// accent-colour swatches. `baseId` must be a stable block of at least
+    /// PresetCount + 24 ids; state lives on App (themeMenuModel,
+    /// fxKindOverride, accentOverride, fxEnabled).
+    static OverlayPopup ThemeDrawer(int baseId, int triggerId,
+                                    SignalBool openFlag, SignalInt scrollModel) {
+        OverlayPopup p = new OverlayPopup();
+        p.themeDrawerMode = true;
+        p.x = 0;
+        p.y = 0;
+        p.w = 0;
+        p.options = new List<string>();
+        p.baseId = baseId;
+        p.triggerId = triggerId;
+        p.openFlag = openFlag;
+        p.scrollModel = scrollModel;
         p.showCheck = false;
         return p;
     }
@@ -706,6 +729,10 @@ class OverlayPopup {
     void Render(App app) {
         if (rich) {
             this.RenderRich(app);
+            return;
+        }
+        if (themeDrawerMode) {
+            this.RenderThemeDrawer(app);
             return;
         }
         Canvas c = app.canvas;
@@ -834,6 +861,348 @@ class OverlayPopup {
             openFlag.Set(false);
             app.RequestRedraw();
         }
+    }
+
+    /// Draws the appearance drawer (see ThemeDrawer) and dispatches its
+    /// clicks. All state is read from / written to App so the drawer itself
+    /// stays stateless between frames.
+    void RenderThemeDrawer(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int count = app.themeNames.Count;
+        int dw = app.Scale(264);
+        int top = app.ContentTop();
+        int dx = c.Width() - dw;
+        int dh = c.Height() - top;
+        int pad = t.paddingLarge;
+        int rowH = t.heightMedium;
+        int fs = t.fontSizeMedium;
+
+        int idToggle = baseId + count;
+        int idKind0 = baseId + count + 1;   // 7 rows: follow + 6 kinds
+        int idAcc0 = baseId + count + 8;    // 7 swatches: default + 6 colours
+        int idClose = baseId + count + 15;
+        int idTab0 = baseId + count + 16;   // 2 tabs
+
+        List<string> kinds = new List<string>();
+        kinds.Add("Follow skin");
+        kinds.Add("Stars");
+        kinds.Add("Aurora");
+        kinds.Add("Lightfall");
+        kinds.Add("Ink wash");
+        kinds.Add("Petals");
+        kinds.Add("Digital rain");
+
+        List<int> accents = new List<int>();
+        accents.Add(0);                          // skin default
+        accents.Add(Theme.Rgb(59, 130, 246));    // blue
+        accents.Add(Theme.Rgb(139, 92, 246));    // violet
+        accents.Add(Theme.Rgb(236, 72, 153));    // pink
+        accents.Add(Theme.Rgb(16, 185, 129));    // green
+        accents.Add(Theme.Rgb(245, 158, 11));    // amber
+        accents.Add(Theme.Rgb(239, 68, 68));     // red
+
+        int tab = app.themeDrawerTab.Get();
+        int headerH = app.Scale(46);
+        int tabsH = app.Scale(40);
+        int cardW = (dw - pad * 3) / 2;
+        int cardH = app.Scale(64);
+        int rows = (count + 1) / 2;
+        int swatch = app.Scale(26);
+        int swGap = app.Scale(8);
+
+        int contentH = 0;
+        if (tab == 0) {
+            contentH = pad + rowH                       // Skin header
+                + rows * (cardH + pad)
+                + rowH                                  // Accent header
+                + swatch + pad;
+        } else {
+            contentH = pad + rowH * 2                   // switch row + gap
+                + rowH                                  // header
+                + kinds.Count * rowH + pad;
+        }
+
+        int viewY = top + headerH + tabsH;
+        int viewH = dh - headerH - tabsH;
+        int maxScroll = contentH - viewH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        int scrollY = scrollModel.Get();
+        if (scrollY < 0) { scrollY = 0; }
+        if (scrollY > maxScroll) { scrollY = maxScroll; }
+        bool ownsWheel = app.CaptureWheel(dx, viewY, dw, viewH);
+        if (ownsWheel && maxScroll > 0) {
+            int oldScroll = scrollY;
+            scrollY = scrollY - app.window.EventKeyCode() * rowH / 120;
+            if (scrollY < 0) { scrollY = 0; }
+            if (scrollY > maxScroll) { scrollY = maxScroll; }
+            if (scrollY != oldScroll) {
+                scrollModel.Set(scrollY);
+                app.RequestRedraw();
+            }
+        }
+
+        app.BlockHitsBelow();
+        c.FillRect(dx - app.Scale(6), top, app.Scale(6), dh,
+                   Theme.Rgba(0, 0, 0, 26));
+        if (t.glass != 0) {
+            Layer.GlassFill(app, dx, top, dw, dh, 0, t.bgPrimary, 1000);
+        } else {
+            c.FillRect(dx, top, dw, dh, t.bgPrimary);
+        }
+        c.FillRect(dx, top, 1, dh, t.borderPrimary);
+        app.BlockHitsRect(dx, top, dw, dh);
+
+        // ---- header: title + round close button ----
+        int titleY = top + (headerH - Canvas.FontHeight(t.fontSizeLarge)) / 2;
+        c.DrawText(dx + pad, titleY, "Theme", t.textPrimary, t.fontSizeLarge);
+        int cbtn = app.Scale(26);
+        int cbx = dx + dw - pad - cbtn;
+        int cby = top + (headerH - cbtn) / 2;
+        bool closeHov = app.focus.IsHovered(idClose);
+        int closeBg = t.bgSecondary;
+        if (closeHov) { closeBg = t.bgHover; }
+        c.FillCircle(cbx + cbtn / 2, cby + cbtn / 2, cbtn / 2, closeBg);
+        Icon.DrawCenteredIn(c, "close", cbx, cby, cbtn, cbtn,
+                            t.iconSizeSmall, t.textSecondary);
+        app.hitTester.Register(HitRegion.Create(idClose, cbx, cby, cbtn, cbtn, 0));
+
+        // ---- segmented tabs ----
+        int segX = dx + pad;
+        int segW = dw - pad * 2;
+        int segY = top + headerH;
+        int segH = tabsH - app.Scale(10);
+        c.FillRoundRect(segX, segY, segW, segH, segH / 2, t.bgSecondary);
+        int tabW = segW / 2;
+        int ti = 0;
+        while (ti < 2) {
+            int tx = segX + ti * tabW;
+            string lbl = "Style";
+            if (ti == 1) { lbl = "Motion"; }
+            bool active = tab == ti;
+            bool hov = app.focus.IsHovered(idTab0 + ti);
+            if (active) {
+                c.FillRoundRect(tx + app.Scale(3), segY + app.Scale(3),
+                                tabW - app.Scale(6), segH - app.Scale(6),
+                                (segH - app.Scale(6)) / 2, t.bgPrimary);
+                c.DrawRoundRect(tx + app.Scale(3), segY + app.Scale(3),
+                                tabW - app.Scale(6), segH - app.Scale(6),
+                                (segH - app.Scale(6)) / 2, t.primary, 1);
+            } else if (hov) {
+                c.FillRoundRect(tx + app.Scale(3), segY + app.Scale(3),
+                                tabW - app.Scale(6), segH - app.Scale(6),
+                                (segH - app.Scale(6)) / 2, t.bgHover);
+            }
+            int lc = t.textSecondary;
+            if (active) { lc = t.primary; }
+            int lw = Canvas.MeasureText(lbl, fs);
+            c.DrawText(tx + (tabW - lw) / 2,
+                       segY + (segH - Canvas.FontHeight(fs)) / 2, lbl, lc, fs);
+            app.hitTester.Register(
+                HitRegion.Create(idTab0 + ti, tx, segY, tabW, segH, 0));
+            ti = ti + 1;
+        }
+
+        c.PushClip(dx, viewY, dw, viewH);
+        int yy = viewY + pad - scrollY;
+
+        if (tab == 0) {
+            yy = this.DrawerSection(app, dx, yy, dw, "Skin");
+            // 2-column grid of preset cards with live colour previews.
+            int i = 0;
+            while (i < count) {
+                int col = i % 2;
+                int row = i / 2;
+                int cx = dx + pad + col * (cardW + pad);
+                int cy = yy + row * (cardH + pad);
+                Theme pt = Theme.PresetAt(i);
+                int optId = baseId + i;
+                bool hovered = app.focus.IsHovered(optId);
+                bool selected = i == app.themeMenuModel.Get();
+                c.FillRoundRect(cx, cy, cardW, cardH, t.borderRadiusMedium,
+                                pt.bgPrimary);
+                // mini preview: sidebar bar + two content lines + accent dot
+                c.FillRoundRect(cx + app.Scale(8), cy + app.Scale(8),
+                                app.Scale(14), cardH - app.Scale(30),
+                                app.Scale(3), pt.bgSecondary);
+                c.FillRoundRect(cx + app.Scale(28), cy + app.Scale(10),
+                                cardW - app.Scale(40), app.Scale(6),
+                                app.Scale(3), pt.bgActive);
+                c.FillRoundRect(cx + app.Scale(28), cy + app.Scale(22),
+                                cardW - app.Scale(56), app.Scale(6),
+                                app.Scale(3), pt.bgSecondary);
+                c.FillCircle(cx + cardW - app.Scale(14), cy + app.Scale(14),
+                             app.Scale(5), pt.primary);
+                c.DrawText(cx + app.Scale(8),
+                           cy + cardH - app.Scale(6) - Canvas.FontHeight(t.fontSizeSmall),
+                           app.themeNames[i], pt.textPrimary, t.fontSizeSmall);
+                if (selected) {
+                    c.DrawRoundRect(cx, cy, cardW, cardH, t.borderRadiusMedium,
+                                    t.primary, 2);
+                } else if (hovered) {
+                    c.DrawRoundRect(cx, cy, cardW, cardH, t.borderRadiusMedium,
+                                    t.borderHover, 1);
+                } else {
+                    c.DrawRoundRect(cx, cy, cardW, cardH, t.borderRadiusMedium,
+                                    t.borderPrimary, 1);
+                }
+                i = i + 1;
+            }
+            yy = yy + rows * (cardH + pad);
+            // register grid hits (after drawing so ids stay in draw order)
+            i = 0;
+            while (i < count) {
+                int col = i % 2;
+                int row = i / 2;
+                int cx = dx + pad + col * (cardW + pad);
+                int cy = yy - rows * (cardH + pad) + row * (cardH + pad);
+                app.hitTester.Register(
+                    HitRegion.Create(baseId + i, cx, cy, cardW, cardH, 0));
+                i = i + 1;
+            }
+
+            yy = this.DrawerSection(app, dx, yy, dw, "Accent");
+            i = 0;
+            while (i < accents.Count) {
+                int optId = idAcc0 + i;
+                int sx = dx + pad + i * (swatch + swGap);
+                int colr = accents[i];
+                if (colr == 0) { colr = t.bgActive; }
+                bool hovered = app.focus.IsHovered(optId);
+                bool selected = app.accentOverride == accents[i];
+                if (hovered && !selected) {
+                    c.DrawCircle(sx + swatch / 2, yy + swatch / 2,
+                                 swatch / 2 + app.Scale(2), t.borderHover, 1);
+                }
+                c.FillCircle(sx + swatch / 2, yy + swatch / 2, swatch / 2, colr);
+                if (accents[i] == 0) {
+                    c.DrawCircle(sx + swatch / 2, yy + swatch / 2, swatch / 2,
+                                 t.borderPrimary, 1);
+                }
+                if (selected) {
+                    c.DrawCircle(sx + swatch / 2, yy + swatch / 2,
+                                 swatch / 2 + app.Scale(2), t.primary, 2);
+                    Icon.DrawCenteredIn(c, "check", sx, yy, swatch, swatch,
+                                        t.iconSizeSmall, t.textInverse);
+                }
+                app.hitTester.Register(
+                    HitRegion.Create(optId, sx, yy, swatch, swatch, 0));
+                i = i + 1;
+            }
+            yy = yy + swatch;
+        } else {
+            // ---- Motion tab ----
+            bool tglHov = app.focus.IsHovered(idToggle);
+            if (tglHov) { c.FillRect(dx + 1, yy, dw - 2, rowH, t.bgHover); }
+            c.DrawText(dx + pad, yy + (rowH - Canvas.FontHeight(fs)) / 2,
+                       "Animations", t.textPrimary, fs);
+            int pillW = app.Scale(40);
+            int pillH = app.Scale(22);
+            int px = dx + dw - pad - pillW;
+            int py = yy + (rowH - pillH) / 2;
+            int pillBg = t.bgActive;
+            if (app.fxEnabled) { pillBg = t.primary; }
+            c.FillRoundRect(px, py, pillW, pillH, pillH / 2, pillBg);
+            int knob = pillH - app.Scale(6);
+            int kx = px + app.Scale(3);
+            if (app.fxEnabled) { kx = px + pillW - knob - app.Scale(3); }
+            c.FillCircle(kx + knob / 2, py + pillH / 2, knob / 2,
+                         Theme.Rgb(255, 255, 255));
+            app.hitTester.Register(
+                HitRegion.Create(idToggle, dx, yy, dw, rowH, 0));
+            yy = yy + rowH * 2;
+
+            yy = this.DrawerSection(app, dx, yy - rowH, dw, "Backdrop effect");
+            int i = 0;
+            while (i < kinds.Count) {
+                int optId = idKind0 + i;
+                int kindVal = i;                 // 1..6 = BackdropFx kinds
+                if (i == 0) { kindVal = 0 - 1; } // follow skin
+                bool hovered = app.focus.IsHovered(optId);
+                bool selected = app.fxKindOverride == kindVal;
+                if (hovered) { c.FillRect(dx + 1, yy, dw - 2, rowH, t.bgHover); }
+                // radio dot
+                int rr = app.Scale(7);
+                int rcx = dx + pad + rr;
+                int rcy = yy + rowH / 2;
+                if (selected) {
+                    c.DrawCircle(rcx, rcy, rr, t.primary, 2);
+                    c.FillCircle(rcx, rcy, rr - app.Scale(3), t.primary);
+                } else {
+                    c.DrawCircle(rcx, rcy, rr, t.borderSecondary, 1);
+                }
+                int tc = t.textPrimary;
+                if (selected) { tc = t.primary; }
+                c.DrawText(dx + pad + rr * 2 + app.Scale(10),
+                           yy + (rowH - Canvas.FontHeight(fs)) / 2,
+                           kinds[i], tc, fs);
+                app.hitTester.Register(
+                    HitRegion.Create(optId, dx, yy, dw, rowH, 0));
+                yy = yy + rowH;
+                i = i + 1;
+            }
+        }
+        c.PopClip();
+
+        // ---- dispatch ----
+        int kind = app.window.EventKind();
+        if (kind == 3) {
+            int hit = app.ClickTarget();
+            if (hit >= baseId && hit < baseId + count) {
+                app.themeMenuModel.Set(hit - baseId);
+                app.RequestRedraw();
+            } else if (hit == idToggle) {
+                app.SetBackdropFx(!app.fxEnabled);
+            } else if (hit >= idKind0 && hit < idKind0 + kinds.Count) {
+                int ki = hit - idKind0;
+                int kv = ki;
+                if (ki == 0) { kv = 0 - 1; }
+                app.fxKindOverride = kv;
+                app.SetBackdropFx(app.fxEnabled);
+            } else if (hit >= idAcc0 && hit < idAcc0 + accents.Count) {
+                app.accentOverride = accents[hit - idAcc0];
+                app.ApplySkin(app.appliedSkin);
+                app.RequestRedraw();
+            } else if (hit == idTab0 || hit == idTab0 + 1) {
+                app.themeDrawerTab.Set(hit - idTab0);
+                scrollModel.Set(0);
+                app.RequestRedraw();
+            } else if (hit == idClose) {
+                openFlag.Set(false);
+                app.RequestRedraw();
+            }
+        }
+        if (kind == 2) {
+            int pt = app.PressTarget();
+            bool inside = pt >= baseId && pt < baseId + count + 24;
+            bool insidePanel = app.mouseX >= dx && app.mouseY >= top;
+            if (pt != triggerId && !inside && !insidePanel) {
+                openFlag.Set(false);
+                app.RequestRedraw();
+            }
+        }
+        if (kind == 4 && app.window.EventKeyCode() == 27) {
+            openFlag.Set(false);
+            app.RequestRedraw();
+        }
+    }
+
+    /// A centred drawer section header with divider lines on both sides
+    /// ("---- Label ----"). Returns the y below the header.
+    int DrawerSection(App app, int dx, int yy, int dw, string label) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingLarge;
+        int rowH = t.heightMedium;
+        int lw = Canvas.MeasureText(label, t.fontSizeSmall);
+        int cy = yy + rowH / 2;
+        int lx = dx + (dw - lw) / 2;
+        c.FillRect(dx + pad, cy, lx - app.Scale(10) - dx - pad, 1, t.borderPrimary);
+        c.FillRect(lx + lw + app.Scale(10), cy,
+                   dx + dw - pad - lx - lw - app.Scale(10), 1, t.borderPrimary);
+        c.DrawText(lx, cy - Canvas.FontHeight(t.fontSizeSmall) / 2, label,
+                   t.textSecondary, t.fontSizeSmall);
+        return yy + rowH;
     }
 
     /// Panel width for a rich item list: widest label plus the icon column and

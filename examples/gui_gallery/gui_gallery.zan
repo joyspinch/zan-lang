@@ -14,6 +14,34 @@ using Gui.Widget;
 //   zanc --emit-ir examples/gui_gallery/gui_gallery.zan > gallery.ll
 //   clang gallery.ll -o gallery <gui link args>
 
+/// Virtual data source for the large-data DataTable demo.
+///
+/// Cells are generated on demand from their (row, col) coordinates, so the
+/// source stores NO per-cell data — memory is O(1) in the row count. A real
+/// app would instead read these from columnar typed arrays, a file, or a DB.
+class BigDataSource : DataSource {
+    int rowCount;
+    int colCount;
+
+    static BigDataSource Create(int rows, int cols) {
+        BigDataSource s = new BigDataSource();
+        s.rowCount = rows;
+        s.colCount = cols;
+        return s;
+    }
+
+    override int RowCount() { return this.rowCount; }
+
+    override int CellNum(int row, int col) {
+        return ((row + col * 13) % 97) * 37 % 1000;
+    }
+
+    override string CellText(int row, int col) {
+        if (col == 0) { return "Row " + Convert.ToString(row + 1); }
+        return Convert.ToString(((row + col * 13) % 97) * 37 % 1000);
+    }
+}
+
 /// One catalog entry: which category it belongs to, its display name, a short
 /// description, and the code snippet shown (and copied) in the detail pane.
 class Comp {
@@ -114,6 +142,10 @@ class Demo {
     // Active code tab for THIS card only: 0 = Zan, 1 = JSON. Each card owns
     // its own tab so toggling one demo's JSON view leaves the others alone.
     int tab;
+    // Stable identity for this card, so the shared code-selection state knows
+    // which single code box owns the current selection (no cross-box bleed).
+    static int seq;
+    int uid;
 
     // --- Per-frame render cache -------------------------------------------
     // Wrapping the description and tokenising the code snippet for syntax
@@ -130,6 +162,12 @@ class Demo {
     List<string> cacheSegText;
     List<int> cacheSegColor;
     List<int> cacheSegPerLine;
+    // Real source-line number for each (possibly wrapped) display line, or 0 for
+    // a soft-wrap continuation row so the gutter only numbers real lines.
+    List<int> cacheLineNo;
+    // Gutter width chosen in EnsureCache (from the source line count) so the
+    // wrap width and the render pass agree on where text starts.
+    int cacheGutterW;
 
     static Demo Create(string title, string desc, string previewId,
             int previewH, string code, string json) {
@@ -141,6 +179,8 @@ class Demo {
         d.code = code;
         d.json = json;
         d.tab = 0;
+        d.uid = Demo.seq;
+        Demo.seq = Demo.seq + 1;
         d.cacheSig = "";
         return d;
     }
@@ -162,25 +202,92 @@ class Demo {
             else { src = "// This demo has no JSON config version yet."; }
         }
         cacheSrc = src;
-        cacheCodeLines = CodeEditor.SplitLines(src);
+        List<string> srcLines = CodeEditor.SplitLines(src);
+        cacheCodeLines = new List<string>();
         cacheSegText = new List<string>();
         cacheSegColor = new List<int>();
         cacheSegPerLine = new List<int>();
+        cacheLineNo = new List<int>();
+
+        int gnW = Canvas.MeasureText(Convert.ToString(srcLines.Count), fs);
+        cacheGutterW = gnW + app.Scale(20);
+        // Width available for code text; wrap long lines to fit instead of
+        // letting them run past the panel edge. Small margin avoids overshoot
+        // from per-glyph vs whole-run measurement rounding.
+        int maxTextW = cw - cacheGutterW - app.Scale(8) - app.Scale(10);
+        if (maxTextW < app.Scale(80)) { maxTextW = app.Scale(80); }
+
         int ci = 0;
-        while (ci < cacheCodeLines.Count) {
+        while (ci < srcLines.Count) {
             List<string> segT = new List<string>();
             List<int> segC = new List<int>();
-            CodeEditor.HighlightSpans(cacheCodeLines[ci], t.info, t.success,
+            CodeEditor.HighlightSpans(srcLines[ci], t.info, t.success,
                 t.warning, t.textTertiary, t.primary, t.textPrimary, segT, segC);
-            int si = 0;
-            while (si < segT.Count) {
-                cacheSegText.Add(segT[si]);
-                cacheSegColor.Add(segC[si]);
-                si = si + 1;
-            }
-            cacheSegPerLine.Add(segT.Count);
+            WrapCode(fs, maxTextW, ci + 1, segT, segC);
             ci = ci + 1;
         }
+    }
+
+    /// Emits one source line as one or more display rows that each fit within
+    /// maxW. The first row carries the real line number; wrapped continuation
+    /// rows carry 0. Highlight segments are split at the wrap point, preserving
+    /// colour. Appends to the cache* lists in place.
+    void WrapCode(int fs, int maxW, int lineNo,
+            List<string> segT, List<int> segC) {
+        string curText = "";
+        List<string> curSegT = new List<string>();
+        List<int> curSegC = new List<int>();
+        int curW = 0;
+        bool first = true;
+
+        int gi = 0;
+        while (gi < segT.Count) {
+            string s = segT[gi];
+            int col = segC[gi];
+            int p = 0;
+            int slen = s.Length;
+            while (p < slen) {
+                int start = p;
+                while (p < slen) {
+                    int chW = Canvas.MeasureText(s.Substring(p, 1), fs);
+                    if (curW + chW > maxW && curW > 0) { break; }
+                    curW = curW + chW;
+                    p = p + 1;
+                }
+                if (p > start) {
+                    string piece = s.Substring(start, p - start);
+                    curSegT.Add(piece);
+                    curSegC.Add(col);
+                    curText = curText + piece;
+                }
+                if (p < slen) {
+                    // Line is full: flush this display row and start a new one.
+                    Demo.FlushRow(this, curText, curSegT, curSegC, first, lineNo);
+                    first = false;
+                    curText = "";
+                    curSegT = new List<string>();
+                    curSegC = new List<int>();
+                    curW = 0;
+                }
+            }
+            gi = gi + 1;
+        }
+        // Always emit the final (or only, possibly empty) row.
+        Demo.FlushRow(this, curText, curSegT, curSegC, first, lineNo);
+    }
+
+    static void FlushRow(Demo d, string text, List<string> segT,
+            List<int> segC, bool first, int lineNo) {
+        d.cacheCodeLines.Add(text);
+        int k = 0;
+        while (k < segT.Count) {
+            d.cacheSegText.Add(segT[k]);
+            d.cacheSegColor.Add(segC[k]);
+            k = k + 1;
+        }
+        d.cacheSegPerLine.Add(segT.Count);
+        if (first) { d.cacheLineNo.Add(lineNo); }
+        else { d.cacheLineNo.Add(0); }
     }
 
 }
@@ -248,9 +355,20 @@ class Gallery {
     // snippet's split lines). selDrag is true while the mouse button is held.
     static bool selHas;
     static bool selDrag;
+    // uid of the Demo whose code box currently owns the selection (-1 = none),
+    // combined with the tab so a Zan/JSON switch doesn't reuse stale offsets.
+    static int selOwner;
+    static int selTab;
     // Retained state for the deferred-overlay / interactive demos.
     static string copiedIcon;
     static DataTableState demoTableState;
+    static DataTableState bigTableState;    // large-data demo
+    static List<DataColumn> bigCols;
+    static BigDataSource bigSource;         // virtual source (no per-row storage)
+    static Select bigRowsSelect;            // row-count picker (a "setting")
+    static SignalInt bigRowsSel;
+    static int bigRowCount;
+    static int bigBuildMs;
     // Retained state for the unified Layer demo: draggable windows, the modal
     // alert/confirm/prompt dialogs, plus the loading / tips / photos toggles.
     static List<LayerState> demoLayers;
@@ -407,6 +525,17 @@ class Gallery {
         Gallery.pendingPicker = "";
         Gallery.copiedIcon = "";
         Gallery.demoTableState = DataTableState.Create();
+        Gallery.bigTableState = DataTableState.Create();
+        Gallery.bigTableState.showSummary = true;
+        Gallery.bigCols = null;
+        Gallery.bigSource = null;
+        Gallery.bigRowCount = 0;
+        Gallery.bigBuildMs = 0;
+        Gallery.bigRowsSel = SignalInt.Create(2);
+        List<string> bigRowOpts = new List<string>();
+        bigRowOpts.Add("100,000"); bigRowOpts.Add("500,000");
+        bigRowOpts.Add("1,000,000"); bigRowOpts.Add("5,000,000");
+        Gallery.bigRowsSelect = Select.Bind(bigRowOpts, Gallery.bigRowsSel, "rows");
         Gallery.demoLayers = new List<LayerState>();
         Gallery.layerSeq = 0;
         Gallery.dlgAlert = LayerState.Alert("Notice", "Your changes have been saved.", 1);
@@ -581,22 +710,33 @@ class Gallery {
                     Window.SleepMs(16 - since);
                 }
                 r = app.window.PollEvent();
-            } else if (!Gallery.filePicker.IsOpen() && app.animNextMs >= 0) {
-                // A throttled animation (spinner/skeleton) wants its next frame;
-                // idle until the deadline, but poll in slices so input still
-                // wakes the loop promptly.
+            } else if (!Gallery.filePicker.IsOpen()
+                       && (app.animNextMs >= 0 || app.fxNextMs >= 0)) {
+                // A throttled animation (spinner/skeleton) and/or the skin
+                // effect layer wants its next frame; idle until the earliest
+                // deadline, but poll in slices so input still wakes the loop
+                // promptly. An effect-only tick is served in place by
+                // App.FxPresent (frame-snapshot restore + re-composite).
                 r = 1;
                 bool waiting = true;
                 while (waiting) {
                     int now = Window.GetTickMs();
-                    if (now >= app.animNextMs) {
-                        app.RequestRedraw();
-                        waiting = false;
+                    int deadline = app.animNextMs;
+                    if (deadline < 0
+                        || (app.fxNextMs >= 0 && app.fxNextMs < deadline)) {
+                        deadline = app.fxNextMs;
+                    }
+                    if (deadline < 0) { waiting = false; }
+                    else if (now >= deadline) {
+                        bool fxOnly = app.animNextMs < 0 || now < app.animNextMs;
+                        if (!(fxOnly && app.FxPresent())) {
+                            app.RequestRedraw();
+                            waiting = false;
+                        }
                     } else {
-                        int remain = app.animNextMs - now;
-                        if (remain > 15) { remain = 15; }
-                        Window.SleepMs(remain);
-                        r = app.window.PollEvent();
+                        // Single kernel wait until input or the deadline (no
+                        // poll + sleep slices; idle waiting costs no CPU).
+                        r = app.window.WaitEventTimeout(deadline - now);
                         if (r != 1) { waiting = false; }
                     }
                 }
@@ -615,10 +755,13 @@ class Gallery {
                 } else if (evh == app.WindowHandle()) {
                     break;
                 }
-            } else if (Gallery.filePicker.IsOpen()
-                       || Gallery.filePicker.OwnsWindow(evh)) {
-                // The dialog owns this input frame; route it there and leave the
-                // main window untouched (no click-through to the gallery).
+            } else if (Gallery.filePicker.OwnsWindow(evh)) {
+                // Route each input frame to whichever window OWNS it (by native
+                // hwnd), not merely to the dialog whenever it is open. Native
+                // events already carry their originating window, and each App
+                // only acts on its own (App.ApplyEvent ignores foreign hwnds),
+                // so the parent stays fully responsive while the child dialog is
+                // open and there is still no cross-window click-through.
                 Gallery.filePicker.ApplyEvent(evh);
             } else {
                 // The gallery handles wheel scrolling and code selection inside
@@ -720,6 +863,14 @@ class Gallery {
     static string T(string en, string zh) {
         if (Gallery.lang.Get() == 1) { return zh; }
         return en;
+    }
+
+    /// Map the row-count picker index to a row count for the large-data demo.
+    static int BigRowCountFor(int idx) {
+        if (idx == 0) { return 100000; }
+        if (idx == 1) { return 500000; }
+        if (idx == 3) { return 5000000; }
+        return 1000000;
     }
 
     /// Switch language and rebuild the catalog so descriptions, snippets and
@@ -1281,8 +1432,7 @@ class Gallery {
         c.DrawRect(cx, cy, cw, panelH, t.borderPrimary, 1);
         c.FillRect(cx, cy + hdrH, cw, 1, t.divider);
 
-        int gnW = Canvas.MeasureText(Convert.ToString(codeLines.Count), fs);
-        int gutterW = gnW + app.Scale(20);
+        int gutterW = d.cacheGutterW;
         int textX = cx + gutterW + app.Scale(8);
         int codeY0 = cy + hdrH + app.Scale(8);
         c.FillRect(cx + 1, cy + hdrH + 1, gutterW, panelH - hdrH - 2, t.bgTertiary);
@@ -1324,10 +1474,12 @@ class Gallery {
             cpIconSz, 0xFFFFFFFF);
         c.DrawText(cpContentX + cpIconSz + cpGap,
             cpY + (cpH - Canvas.FontHeight(fs)) / 2, "Copy", 0xFFFFFFFF, fs);
+        // This code box owns the selection only if its uid+tab match.
+        bool selMine = Gallery.selOwner == d.uid && Gallery.selTab == tab;
         if (app.window.EventKind() == 3 && cpHot) {
             // Copy the current selection when there is one, else the whole snippet.
             string toCopy = src;
-            if (Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(codeLines); }
+            if (selMine && Gallery.SelNonEmpty()) { toCopy = Gallery.SelectedText(codeLines); }
             Clipboard.SetText(toCopy);
             app.RequestRedraw();
         }
@@ -1346,19 +1498,22 @@ class Gallery {
             Gallery.selAL = ll; Gallery.selAC = cc;
             Gallery.selFL = ll; Gallery.selFC = cc;
             Gallery.selDrag = true;
+            Gallery.selOwner = d.uid; Gallery.selTab = tab;
+            selMine = true;
             app.RequestRedraw();
-        } else if (ek == 1 && Gallery.selDrag) {
+        } else if (ek == 1 && Gallery.selDrag && selMine) {
             int ll = Gallery.HitLine(codeLines, 0, app.mouseY, codeY0, codeLineH);
             int cc = Gallery.ColAt(codeLines[ll], fs, app.mouseX - textX);
             Gallery.selFL = ll; Gallery.selFC = cc;
             app.RequestRedraw();
-        } else if (ek == 3 && Gallery.selDrag) {
+        } else if (ek == 3 && Gallery.selDrag && selMine) {
             Gallery.selDrag = false;
             app.RequestRedraw();
         }
 
         // Normalised selection bounds (start <= end) for the highlight pass.
-        bool showSel = Gallery.SelNonEmpty();
+        // Only the owning box (matching uid+tab) paints the highlight.
+        bool showSel = selMine && Gallery.SelNonEmpty();
         int nl0 = Gallery.selAL; int nc0 = Gallery.selAC;
         int nl1 = Gallery.selFL; int nc1 = Gallery.selFC;
         if (nl1 < nl0 || (nl1 == nl0 && nc1 < nc0)) {
@@ -1387,8 +1542,13 @@ class Gallery {
                 c.FillRect(hx0, codeY - app.Scale(1), hx1 - hx0,
                     codeLineH, 0x553B82F6);
             }
-            c.DrawText(cx + gutterW - gnW - app.Scale(6), codeY,
-                Convert.ToString(ci + 1), t.textTertiary, fs);
+            int lno = d.cacheLineNo[ci];
+            if (lno > 0) {
+                string lnoS = Convert.ToString(lno);
+                int lnoW = Canvas.MeasureText(lnoS, fs);
+                c.DrawText(cx + gutterW - lnoW - app.Scale(6), codeY,
+                    lnoS, t.textTertiary, fs);
+            }
             // Cached highlight spans for this line: [segBase, segBase+n).
             int n = d.cacheSegPerLine[ci];
             int sx = textX;
@@ -1521,7 +1681,7 @@ class Gallery {
         if (name == "SelectBox") { return 240; }
         if (name == "VirtualList") { return 210; }
         if (name == "ClickEvent") { return 120; }
-        if (name == "DataTable") { return 200; }
+        if (name == "DataTable 1M") { return 430; }
         if (name == "PivotTable") { return 200; }
         if (name == "Chart") { return 210; }
         if (name == "Alert") { return 360; }
@@ -1548,6 +1708,7 @@ class Gallery {
         if (name == "Tag") { return 170; }
         if (name == "Progress") { return 210; }
         if (name == "Compose") { return 230; }
+        if (name == "Card") { return 420; }
         if (name == "Designer") { return 860; }
         return 150;
     }
@@ -1639,6 +1800,13 @@ class Gallery {
             row.With(Button.Styled("Dashed", 1, 3));
             row.With(Button.Secondary("Secondary", 1));
             row.With(Button.Ghost("Ghost", 1));
+            Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
+        } else if (name == "Button.specular") {
+            Panel row = Panel.Row().Gap(app.Scale(10));
+            row.With(Button.Specular("Hover me", 1));
+            row.With(Button.Specular("Success", 3));
+            row.With(Button.Specular("Error", 5));
+            row.With(Button.Specular("Default", 0));
             Gallery.LayoutIn(app, row, px, y + app.Scale(34), w - app.Scale(36), app.Scale(34));
         } else if (name == "Button.secondary") {
             Panel row = Panel.Row().Gap(app.Scale(10));
@@ -1833,8 +2001,51 @@ class Gallery {
             int id4 = Pagination.RenderSimple(app, px, r4, 12, Gallery.pageSimple);
             Pagination.HandleClickSimple(app, id4, 12, Gallery.pageSimple);
         } else if (name == "Card") {
-            Card.Render(app, px, py - app.Scale(12), app.Scale(360), app.Scale(96), "Card");
-            Label.Render(app, px + app.Scale(14), Card.ContentY(py - app.Scale(12), t), "Card content and actions");
+            int cy0 = py - app.Scale(12);
+            int cw = app.Scale(380);
+            int ch = app.Scale(150);
+            int lx = app.Scale(14);
+            // Row 1, card 1 — reactbits "border-glow", via the declarative
+            // FxOptions config (Card.RenderFx / card.WithFx(o)).
+            FxOptions fxGlow = FxOptions.Create();
+            fxGlow.borderGlow = true;
+            Card.RenderFx(app, px, cy0, cw, ch, "BorderGlow", fxGlow);
+            Label.Render(app, px + lx, Card.ContentY(cy0, t), "Animated border light");
+            // Row 1, card 2 — magic-bento spotlight: a soft glow follows the cursor.
+            int px2 = px + cw + app.Scale(24);
+            int id2 = app.focus.AllocId();
+            Card.Render(app, px2, cy0, cw, ch, "Spotlight");
+            Label.Render(app, px2 + lx, Card.ContentY(cy0, t), "Hover — light follows cursor");
+            int hv2 = Ui.HoverLevel(app, id2);
+            Fx.SpotlightHv(app, px2, cy0, cw, ch, t.primary, app.Scale(120), 90, hv2);
+            app.hitTester.Register(HitRegion.Create(id2, px2, cy0, cw, ch, 0));
+            // Row 2 — four opt-in card motion variants, each clipped in-bounds.
+            int ry = cy0 + ch + app.Scale(22);
+            int cw2 = app.Scale(184);
+            int g2 = app.Scale(16);
+            int rh = app.Scale(150);
+            int cxa = px;
+            FxOptions fxSheen = FxOptions.Create();
+            fxSheen.sheen = true;
+            fxSheen.glowPeriodMs = 1600;
+            Card.RenderFx(app, cxa, ry, cw2, rh, "Sheen", fxSheen);
+            Label.Render(app, cxa + lx, Card.ContentY(ry, t), "Diagonal sheen");
+            int cxb = cxa + cw2 + g2;
+            FxOptions fxAur = FxOptions.Create();
+            fxAur.aurora = true;
+            Card.RenderFx(app, cxb, ry, cw2, rh, "Aurora", fxAur);
+            Label.Render(app, cxb + lx, Card.ContentY(ry, t), "Drifting aurora");
+            int cxc = cxb + cw2 + g2;
+            FxOptions fxBr = FxOptions.Create();
+            fxBr.breath = true;
+            fxBr.glowPeriodMs = 2800;
+            Card.RenderFx(app, cxc, ry, cw2, rh, "Breath", fxBr);
+            Label.Render(app, cxc + lx, Card.ContentY(ry, t), "Breathing rim");
+            int cxd = cxc + cw2 + g2;
+            FxOptions fxMo = FxOptions.Create();
+            fxMo.motes = true;
+            Card.RenderFx(app, cxd, ry, cw2, rh, "Motes", fxMo);
+            Label.Render(app, cxd + lx, Card.ContentY(ry, t), "Rising motes");
         } else if (name == "Panel") {
             // Panel is a titleless container surface (fill + border + padding);
             // use Card when you want a titled header. Both share FillSurface.
@@ -2042,41 +2253,102 @@ class Gallery {
             int id = Carousel.RenderAnimated(app, px, py - app.Scale(10), w - app.Scale(36), app.Scale(110), slides, Gallery.demoCar2, Gallery.carAnim2);
             Carousel.HandleClick(app, id, slides.Count, Gallery.demoCar2);
         } else if (name == "Chart.line" || name == "Chart.area"
-                || name == "Chart.bar") {
-            List<string> labels = new List<string>();
-            labels.Add("Q1"); labels.Add("Q2"); labels.Add("Q3"); labels.Add("Q4");
+                || name == "Chart.bar" || name == "Chart.smooth"
+                || name == "Chart.stacked") {
             List<int> rev = new List<int>();
             rev.Add(12); rev.Add(28); rev.Add(20); rev.Add(35);
             List<int> cost = new List<int>();
             cost.Add(8); cost.Add(14); cost.Add(16); cost.Add(22);
-            List<ChartSeries> series = new List<ChartSeries>();
-            series.Add(ChartSeries.Create("Revenue", rev, t.primary));
-            series.Add(ChartSeries.Create("Cost", cost, Chart.Palette(t, 1)));
+            ChartModel cm = ChartModel.Create("Quarterly revenue");
+            cm.AddLabel("Q1"); cm.AddLabel("Q2"); cm.AddLabel("Q3"); cm.AddLabel("Q4");
+            cm.AddColored("Revenue", rev, t.primary);
+            cm.AddColored("Cost", cost, Chart.Palette(t, 1));
             int cX = x + app.Scale(14);
             int cY = y + app.Scale(30);
             int cW = w - app.Scale(28);
             int cH = app.Scale(170);
-            if (name == "Chart.line") {
-                Chart.Line(app, cX, cY, cW, cH, "Quarterly revenue", labels, series);
-            } else if (name == "Chart.area") {
-                Chart.Area(app, cX, cY, cW, cH, "Quarterly revenue", labels, series);
-            } else {
-                Chart.Bar(app, cX, cY, cW, cH, "Quarterly revenue", labels, series);
-            }
-        } else if (name == "Chart.pie" || name == "Chart.donut") {
-            List<int> parts = new List<int>();
-            parts.Add(45); parts.Add(30); parts.Add(25);
-            List<string> pnames = new List<string>();
-            pnames.Add("Zan"); pnames.Add("C"); pnames.Add("Rust");
-            int cX = x + app.Scale(14);
+            ChartOptions co = ChartOptions.Line();
+            int ck = 8110;
+            if (name == "Chart.area") { co = ChartOptions.Area(); ck = 8111; }
+            else if (name == "Chart.smooth") { co = ChartOptions.Smooth(); ck = 8112; }
+            else if (name == "Chart.bar") { co = ChartOptions.Bar(); co.showValues = true; ck = 8113; }
+            else if (name == "Chart.stacked") { co = ChartOptions.Stacked(); ck = 8114; }
+            ChartView cv = ChartView.Keyed(cm, co, ck);
+            cv.Render(app, cX, cY, cW, cH);
+        } else if (name == "Chart.pie") {
+            // Part-of-whole charts are small: show pie + donut side by side
+            // (two per row) instead of one stretched across the full width.
+            List<int> p0 = new List<int>(); p0.Add(45);
+            List<int> p1 = new List<int>(); p1.Add(30);
+            List<int> p2 = new List<int>(); p2.Add(25);
             int cY = y + app.Scale(30);
-            int cW = w - app.Scale(28);
             int cH = app.Scale(170);
-            if (name == "Chart.pie") {
-                Chart.Pie(app, cX, cY, cW, cH, "Language share", pnames, parts);
-            } else {
-                Chart.Donut(app, cX, cY, cW, cH, "Language share", pnames, parts);
-            }
+            int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
+            int c0X = x + app.Scale(14);
+            int c1X = c0X + halfW + app.Scale(12);
+
+            ChartModel pm = ChartModel.Create("Language share");
+            pm.Add("Zan", p0); pm.Add("C", p1); pm.Add("Rust", p2);
+            ChartView.Keyed(pm, ChartOptions.Pie(), 8120).Render(app, c0X, cY, halfW, cH);
+
+            ChartModel dm = ChartModel.Create("Language share");
+            List<int> d0 = new List<int>(); d0.Add(45);
+            List<int> d1 = new List<int>(); d1.Add(30);
+            List<int> d2 = new List<int>(); d2.Add(25);
+            dm.Add("Zan", d0); dm.Add("C", d1); dm.Add("Rust", d2);
+            ChartView.Keyed(dm, ChartOptions.Donut(), 8121).Render(app, c1X, cY, halfW, cH);
+        } else if (name == "Chart.radial") {
+            // Gauge + radial-bars, two per row (both are compact by nature).
+            int cY = y + app.Scale(30);
+            int cH = app.Scale(170);
+            int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
+            int c0X = x + app.Scale(14);
+            int c1X = c0X + halfW + app.Scale(12);
+
+            ChartModel gm = ChartModel.Create("CPU load");
+            List<int> gv = new List<int>(); gv.Add(72);
+            gm.AddColored("load", gv, t.primary);
+            ChartOptions go = ChartOptions.Gauge();
+            go.gaugeMax = 100;
+            ChartView.Keyed(gm, go, 8130).Render(app, c0X, cY, halfW, cH);
+
+            ChartModel rm = ChartModel.Create("Quota used");
+            List<int> r0 = new List<int>(); r0.Add(80);
+            List<int> r1 = new List<int>(); r1.Add(55);
+            List<int> r2 = new List<int>(); r2.Add(30);
+            rm.Add("CPU", r0); rm.Add("RAM", r1); rm.Add("Disk", r2);
+            ChartOptions ro = ChartOptions.RadialBars();
+            ro.gaugeMax = 100;
+            ChartView.Keyed(rm, ro, 8131).Render(app, c1X, cY, halfW, cH);
+        } else if (name == "Chart.heatmap") {
+            ChartModel hm = ChartModel.Create("Weekly activity");
+            hm.AddLabel("Mon"); hm.AddLabel("Tue"); hm.AddLabel("Wed");
+            hm.AddLabel("Thu"); hm.AddLabel("Fri"); hm.AddLabel("Sat"); hm.AddLabel("Sun");
+            List<int> wk1 = new List<int>();
+            wk1.Add(12); wk1.Add(35); wk1.Add(50); wk1.Add(28); wk1.Add(64); wk1.Add(18); wk1.Add(8);
+            List<int> wk2 = new List<int>();
+            wk2.Add(40); wk2.Add(22); wk2.Add(70); wk2.Add(90); wk2.Add(55); wk2.Add(30); wk2.Add(15);
+            List<int> wk3 = new List<int>();
+            wk3.Add(5); wk3.Add(60); wk3.Add(45); wk3.Add(38); wk3.Add(80); wk3.Add(52); wk3.Add(20);
+            hm.AddColored("Team A", wk1, t.primary);
+            hm.AddColored("Team B", wk2, Chart.Palette(t, 2));
+            hm.AddColored("Team C", wk3, Chart.Palette(t, 4));
+            ChartView.Keyed(hm, ChartOptions.Heatmap(), 8140).Render(
+                app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.json") {
+            // The exact same chart, driven entirely by a JSON data document
+            // instead of imperative Add() calls (color 0 = auto palette).
+            string doc = "{\"title\":\"Monthly active users\","
+                + "\"labels\":[\"Jan\",\"Feb\",\"Mar\",\"Apr\",\"May\",\"Jun\"],"
+                + "\"series\":[{\"name\":\"Web\",\"color\":0,\"values\":[30,45,38,60,72,85]},"
+                + "{\"name\":\"Mobile\",\"color\":0,\"values\":[20,32,40,52,64,80]}]}";
+            ChartModel cm = ChartModel.FromJson(doc);
+            ChartOptions co = ChartOptions.Smooth();
+            co.showValues = false;
+            ChartView cv = ChartView.Keyed(cm, co, 8115);
+            cv.Render(app, x + app.Scale(14), y + app.Scale(30),
+                w - app.Scale(28), app.Scale(170));
         } else if (name == "Chart.scatter") {
             List<int> xs = new List<int>();
             xs.Add(5); xs.Add(12); xs.Add(18); xs.Add(24); xs.Add(31); xs.Add(40);
@@ -2084,6 +2356,216 @@ class Gallery {
             ys.Add(8); ys.Add(14); ys.Add(11); ys.Add(26); ys.Add(22); ys.Add(34);
             Chart.Scatter(app, x + app.Scale(14), y + app.Scale(30),
                 w - app.Scale(28), app.Scale(170), "Samples", xs, ys, t.primary);
+        } else if (name == "Chart.step") {
+            List<string> labs = new List<string>();
+            labs.Add("Mon"); labs.Add("Tue"); labs.Add("Wed"); labs.Add("Thu");
+            labs.Add("Fri"); labs.Add("Sat"); labs.Add("Sun");
+            List<int> rq = new List<int>();
+            rq.Add(10); rq.Add(14); rq.Add(12); rq.Add(20); rq.Add(18); rq.Add(26); rq.Add(24);
+            ChartModel sm = ChartModel.OfValues("Requests/s", labs, "req", rq);
+            ChartView.Keyed(sm, ChartOptions.StepLine(), 8150).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.stackedarea") {
+            List<string> labs = new List<string>();
+            labs.Add("Jan"); labs.Add("Feb"); labs.Add("Mar");
+            labs.Add("Apr"); labs.Add("May"); labs.Add("Jun");
+            List<int> web = new List<int>();
+            web.Add(30); web.Add(45); web.Add(38); web.Add(60); web.Add(72); web.Add(85);
+            List<int> mob = new List<int>();
+            mob.Add(20); mob.Add(32); mob.Add(40); mob.Add(52); mob.Add(64); mob.Add(80);
+            List<int> api = new List<int>();
+            api.Add(10); api.Add(18); api.Add(22); api.Add(30); api.Add(28); api.Add(40);
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Web", web, 0));
+            ss.Add(ChartSeries.Create("Mobile", mob, 0));
+            ss.Add(ChartSeries.Create("API", api, 0));
+            ChartModel am = ChartModel.Of("Traffic", labs, ss);
+            ChartView.Keyed(am, ChartOptions.StackedArea(), 8151).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.candle") {
+            List<Candle> cs = new List<Candle>();
+            cs.Add(Candle.Of(100, 115, 95, 110));
+            cs.Add(Candle.Of(110, 120, 104, 106));
+            cs.Add(Candle.Of(106, 112, 100, 111));
+            cs.Add(Candle.Of(111, 130, 109, 128));
+            cs.Add(Candle.Of(128, 132, 118, 121));
+            cs.Add(Candle.Of(121, 126, 112, 114));
+            cs.Add(Candle.Of(114, 140, 113, 138));
+            cs.Add(Candle.Of(138, 145, 132, 134));
+            cs.Add(Candle.Of(134, 136, 122, 125));
+            cs.Add(Candle.Of(125, 150, 124, 148));
+            ChartModel cmd = ChartModel.OfCandles("AAPL daily", new List<string>(), cs);
+            ChartView.Keyed(cmd, ChartOptions.Candles(), 8152).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.bubble") {
+            List<Bubble> bs = new List<Bubble>();
+            bs.Add(Bubble.Of(10, 20, 4));
+            bs.Add(Bubble.Of(22, 34, 16));
+            bs.Add(Bubble.Of(35, 18, 36));
+            bs.Add(Bubble.Of(48, 52, 9));
+            bs.Add(Bubble.Of(60, 40, 25));
+            bs.Add(Bubble.Of(72, 66, 49));
+            bs.Add(Bubble.Of(85, 30, 12));
+            ChartView.Keyed(ChartModel.OfBubbles("Weighted samples", bs), ChartOptions.Bubbles(), 8153).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.box") {
+            List<string> labs = new List<string>();
+            labs.Add("v1"); labs.Add("v2"); labs.Add("v3"); labs.Add("v4");
+            List<BoxItem> bx = new List<BoxItem>();
+            bx.Add(BoxItem.Of(10, 25, 40, 55, 70));
+            bx.Add(BoxItem.Of(20, 35, 45, 60, 85));
+            bx.Add(BoxItem.Of(15, 30, 38, 50, 65));
+            bx.Add(BoxItem.Of(25, 42, 55, 68, 90));
+            ChartView.Keyed(ChartModel.OfBoxes("Latency (ms)", labs, bx), ChartOptions.BoxPlot(), 8154).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.error") {
+            List<string> labs = new List<string>();
+            labs.Add("A"); labs.Add("B"); labs.Add("C"); labs.Add("D"); labs.Add("E");
+            List<ErrorItem> es = new List<ErrorItem>();
+            es.Add(ErrorItem.Of(40, 6));
+            es.Add(ErrorItem.Of(55, 8));
+            es.Add(ErrorItem.Of(48, 5));
+            es.Add(ErrorItem.Of(66, 10));
+            es.Add(ErrorItem.Of(60, 7));
+            ChartView.Keyed(ChartModel.OfErrors("Measurement", labs, es), ChartOptions.ErrorBars(), 8155).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.polar") {
+            List<string> labs = new List<string>();
+            labs.Add("Speed"); labs.Add("Power"); labs.Add("Range");
+            labs.Add("Agility"); labs.Add("Armor"); labs.Add("Cost");
+            List<int> mx = new List<int>();
+            mx.Add(80); mx.Add(60); mx.Add(90); mx.Add(70); mx.Add(50); mx.Add(65);
+            List<int> my = new List<int>();
+            my.Add(60); my.Add(85); my.Add(55); my.Add(80); my.Add(75); my.Add(50);
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Model X", mx, 0));
+            ss.Add(ChartSeries.Create("Model Y", my, 0));
+            ChartView.Keyed(ChartModel.Of("Comparison", labs, ss), ChartOptions.Polar(), 8156).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.funnel") {
+            // Funnel + pyramid side by side (two per row), same stage data.
+            List<int> v0 = new List<int>(); v0.Add(1000);
+            List<int> v1 = new List<int>(); v1.Add(640);
+            List<int> v2 = new List<int>(); v2.Add(380);
+            List<int> v3 = new List<int>(); v3.Add(120);
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Visits", v0, 0));
+            ss.Add(ChartSeries.Create("Signups", v1, 0));
+            ss.Add(ChartSeries.Create("Trials", v2, 0));
+            ss.Add(ChartSeries.Create("Paid", v3, 0));
+            ChartModel fm = ChartModel.Of("Conversion", new List<string>(), ss);
+            int cY = y + app.Scale(30);
+            int cH = app.Scale(170);
+            int halfW = (w - app.Scale(28) - app.Scale(12)) / 2;
+            int c0X = x + app.Scale(14);
+            int c1X = c0X + halfW + app.Scale(12);
+            ChartView.Keyed(fm, ChartOptions.Funnel(), 8157).Render(app, c0X, cY, halfW, cH);
+            ChartView.Keyed(fm, ChartOptions.Pyramid(), 8158).Render(app, c1X, cY, halfW, cH);
+        } else if (name == "Chart.rose") {
+            List<int> a0 = new List<int>(); a0.Add(45);
+            List<int> a1 = new List<int>(); a1.Add(72);
+            List<int> a2 = new List<int>(); a2.Add(30);
+            List<int> a3 = new List<int>(); a3.Add(58);
+            List<int> a4 = new List<int>(); a4.Add(25);
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Mon", a0, 0));
+            ss.Add(ChartSeries.Create("Tue", a1, 0));
+            ss.Add(ChartSeries.Create("Wed", a2, 0));
+            ss.Add(ChartSeries.Create("Thu", a3, 0));
+            ss.Add(ChartSeries.Create("Fri", a4, 0));
+            ChartView.Keyed(ChartModel.Of("Daily volume", new List<string>(), ss), ChartOptions.Rose(), 8159).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.dualaxis") {
+            List<string> labs = new List<string>();
+            labs.Add("Jan"); labs.Add("Feb"); labs.Add("Mar");
+            labs.Add("Apr"); labs.Add("May"); labs.Add("Jun");
+            List<int> rev = new List<int>();
+            rev.Add(120); rev.Add(160); rev.Add(140); rev.Add(220); rev.Add(260); rev.Add(300);
+            List<int> mgn = new List<int>();
+            mgn.Add(18); mgn.Add(24); mgn.Add(21); mgn.Add(30); mgn.Add(38); mgn.Add(44);
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Revenue", rev, 0));
+            ss.Add(ChartSeries.AsKind("Margin %", mgn, Chart.Rgb(250, 200, 88), ChartType.Line()));
+            ss[1].axisIndex = 1;
+            ChartOptions o = ChartOptions.Bar();
+            o.yTitle = "Revenue";
+            o.y2Title = "Margin %";
+            o.xTitle = "2024";
+            ChartView.Keyed(ChartModel.Of("Revenue vs margin", labs, ss), o, 8160).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.reversed") {
+            List<string> labs = new List<string>();
+            labs.Add("W1"); labs.Add("W2"); labs.Add("W3"); labs.Add("W4"); labs.Add("W5");
+            List<int> rk = new List<int>();
+            rk.Add(8); rk.Add(5); rk.Add(6); rk.Add(3); rk.Add(1);
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Rank", rk, 0));
+            ChartOptions o = ChartOptions.Line();
+            o.yReversed = true;
+            o.yMinFixed = 1;
+            o.yMaxFixed = 10;
+            o.yTitle = "Position";
+            ChartView.Keyed(ChartModel.Of("Search ranking (1 = top)", labs, ss), o, 8161).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.zoom") {
+            List<string> labs = new List<string>();
+            List<int> vv = new List<int>();
+            int zi = 0;
+            while (zi < 60) {
+                labs.Add("D" + Convert.ToString(zi + 1));
+                int bval = 100 + zi * 3;
+                int wob = (zi * 37) % 60;
+                vv.Add(bval + wob);
+                zi = zi + 1;
+            }
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Daily active", vv, 0));
+            ChartOptions o = ChartOptions.Area();
+            o.zoom = true;
+            o.smooth = true;
+            ChartView.Keyed(ChartModel.Of("60-day trend (drag the slider)", labs, ss), o, 8162).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(190));
+        } else if (name == "Chart.marks") {
+            List<string> labs = new List<string>{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+            List<int> vv = new List<int>{ 42, 55, 61, 48, 73, 88, 66 };
+            List<ChartSeries> ss = new List<ChartSeries>();
+            ss.Add(ChartSeries.Create("Latency ms", vv, 0));
+            ChartOptions o = ChartOptions.Line();
+            o.smooth = true;
+            o.markLine = 60;
+            o.markLabel = "SLA 60ms";
+            o.markLo = 70;
+            o.markHi = 90;
+            ChartView.Keyed(ChartModel.Of("Response time vs SLA", labs, ss), o, 8163).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(170));
+        } else if (name == "Chart.pielabels") {
+            List<ChartSeries> ss = new List<ChartSeries>();
+            List<string> noLabels = new List<string>();
+            ss.Add(ChartSeries.Create("Chrome", new List<int>{ 63 }, Chart.Rgb(84, 112, 198)));
+            ss.Add(ChartSeries.Create("Safari", new List<int>{ 19 }, Chart.Rgb(145, 204, 117)));
+            ss.Add(ChartSeries.Create("Edge", new List<int>{ 11 }, Chart.Rgb(250, 200, 88)));
+            ss.Add(ChartSeries.Create("Firefox", new List<int>{ 7 }, Chart.Rgb(238, 102, 102)));
+            ChartOptions o = ChartOptions.Donut();
+            o.pieLabels = true;
+            ChartView.Keyed(ChartModel.Of("Browser share", noLabels, ss), o, 8164).Render(
+                app, x + app.Scale(14), y + app.Scale(30), w - app.Scale(28), app.Scale(180));
+        } else if (name == "Chart.dataset") {
+            // One dataset, two charts: bar picks two dims, line picks a third.
+            List<string> dims = new List<string>{ "Sales", "Cost", "Profit" };
+            List<List<int>> cols = new List<List<int>>();
+            cols.Add(new List<int>{ 120, 132, 101, 134, 90, 160 });
+            cols.Add(new List<int>{ 80, 95, 70, 88, 60, 105 });
+            cols.Add(new List<int>{ 40, 37, 31, 46, 30, 55 });
+            List<string> cats = new List<string>{ "Jan", "Feb", "Mar", "Apr", "May", "Jun" };
+            ChartDataset ds = ChartDataset.WithCats(dims, cols, cats);
+
+            int half = (w - app.Scale(42)) / 2;
+            ChartView.Keyed(ds.EncodeNamed("Sales vs Cost", new List<string>{ "Sales", "Cost" }),
+                ChartOptions.Bar(), 8165).Render(
+                app, x + app.Scale(14), y + app.Scale(30), half, app.Scale(180));
+            ChartView.Keyed(ds.EncodeNamed("Profit", new List<string>{ "Profit" }),
+                ChartOptions.Area(), 8166).Render(
+                app, x + app.Scale(28) + half, y + app.Scale(30), half, app.Scale(180));
         } else if (name == "Ellipsis") {
             string longText = "A very long component description that will not fit a narrow column";
             Gallery.EllipsisRow(app, px, py - app.Scale(6), app.Scale(160), longText);
@@ -2524,7 +3006,7 @@ class Gallery {
         if (name == "SelectBox") { return true; }
         if (name == "Dropdown") { return true; }
         if (name == "Popover") { return true; }
-        if (name == "DataTable") { return true; }
+        if (name == "DataTable 1M") { return true; }
         if (name == "Layer") { return true; }
         if (name == "Designer") { return true; }
         return false;
@@ -2558,17 +3040,63 @@ class Gallery {
             // Retained: click the trigger to open an anchored, word-wrapped,
             // click-blocking panel that closes on an outside press or Esc.
             Gallery.demoPopover.Render(app, px, py, app.Scale(150), t.heightMedium);
-        } else if (name == "DataTable") {
-            List<DataColumn> cols = new List<DataColumn>();
-            cols.Add(DataColumn.Text("Name", app.Scale(160)));
-            cols.Add(DataColumn.Numeric("Score", app.Scale(100)));
-            List<DataRow> rows = new List<DataRow>();
-            DataRow row = DataRow.Create();
-            row.Push("Zan"); row.Push("98"); rows.Add(row);
-            DataRow row2 = DataRow.Create();
-            row2.Push("Lang"); row2.Push("87"); rows.Add(row2);
-            DataTable.Render(app, px, py - app.Scale(20), w - app.Scale(36),
-                app.Scale(110), cols, rows, Gallery.demoTableState);
+        } else if (name == "DataTable 1M") {
+            // Big-data demo backed by a virtual DataSource: cells are supplied
+            // on demand for the visible window only, so the grid stores NO rows
+            // and memory stays flat regardless of the row count (a List<DataRow>
+            // of 70M string cells would cost ~1.8 GB; the virtual source costs a
+            // few MB for the sort-order index). Row count is a live setting.
+            int want = Gallery.BigRowCountFor(Gallery.bigRowsSel.Get());
+            if (Gallery.bigCols == null) {
+                Gallery.bigCols = new List<DataColumn>();
+                int bci = 0;
+                while (bci < 70) {
+                    string bt = Gallery.T("Col ", "列 ") + Convert.ToString(bci + 1);
+                    if (bci == 0) {
+                        Gallery.bigCols.Add(DataColumn.Text(bt, app.Scale(96)));
+                    } else if (bci == 1) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 1;   // Σ
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 2) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 2;   // avg
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 3) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 3;   // min
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 4) {
+                        DataColumn sc = DataColumn.Numeric(bt, app.Scale(96));
+                        sc.summary = 4;   // max
+                        Gallery.bigCols.Add(sc);
+                    } else if (bci == 5) {
+                        // Derived total: Σcol1 as a percent of Σcol2 — computed
+                        // from the cached aggregates, so it costs O(1) and never
+                        // rescans the rows.
+                        Gallery.bigCols.Add(DataColumn.Derived(
+                            Gallery.T("%1/2", "占比1/2"), app.Scale(96), 0, 1, 2));
+                    } else {
+                        Gallery.bigCols.Add(DataColumn.Numeric(bt, app.Scale(96)));
+                    }
+                    bci = bci + 1;
+                }
+            }
+            if (Gallery.bigSource == null || Gallery.bigRowCount != want) {
+                int bt0 = Window.GetTickMs();
+                Gallery.bigRowCount = want;
+                Gallery.bigSource = BigDataSource.Create(want, 70);
+                Gallery.bigTableState.dirty = true;
+                Gallery.bigBuildMs = Window.GetTickMs() - bt0;
+            }
+            Gallery.bigRowsSelect.Render(app, px, py - app.Scale(26), app.Scale(150), t.heightMedium);
+            Label.Secondary(app, px + app.Scale(162), py - app.Scale(22),
+                Convert.ToString(Gallery.bigRowCount)
+                + Gallery.T(" rows x 70 cols · virtual source, flat memory · wheel scrolls rows, Shift+wheel pans columns",
+                    " 行 x 70 列 · 虚拟数据源，内存恒定 · 滚轮翻行，Shift+滚轮横向移动"));
+            DataTable.RenderSource(app, px, py + app.Scale(12), w - app.Scale(36),
+                app.Scale(336), Gallery.bigCols, Gallery.bigSource,
+                Gallery.bigTableState);
         } else if (name == "Compose") {
             // Fluent retained-mode composition: a titled card holding a column
             // of a label, a progress bar and a row of buttons — all nested with
@@ -2637,7 +3165,10 @@ class Gallery {
         int n3 = Button.Create(tlbl).Render(app, tipsX, by, bw);
         if (Button.WasClicked(app, n3)) { Gallery.tipsOn.Set(!tipsNow); }
         int tipAX = tipsX + bw / 2;
-        int tipAY = by + bh;
+        // Anchor the tip to the button's TOP edge so the top-placed bubble sits
+        // above the whole button (notch touching the top edge) instead of
+        // growing up from the bottom edge and covering the label.
+        int tipAY = by;
         by = by + bh + rowGap;
 
         Label.Secondary(app, bx, by - app.Scale(22),
@@ -2836,9 +3367,9 @@ class Gallery {
             .AddProp("nameInput / locInput", "Input", "-", "Retained name / location fields.")
             .AddEvent("Render(...)", "int", "0 none, 1 create, 2 cancel/close.");
         Gallery.Add(list, "Layout", "FilePicker",
-            Gallery.T("A modal open/save/folder dialog in its own OS window. Begin a session, route its window events in your loop, and read the chosen path from TakeResult().",
-                "在独立系统窗口中弹出的模态“打开/保存/选择文件夹”对话框。开启一个会话，在事件循环中转发它的窗口事件，再从 TakeResult() 读取所选路径。"),
-            "FilePicker fp = FilePicker.Create();\n// open with several extension filters (label + pattern list):\nList<string> labels = new List<string>{ \"Zan source (*.zan)\", \"Text (*.txt;*.md)\", \"All files (*.*)\" };\nList<string> pats = new List<string>{ \".zan\", \".txt;.md\", \"\" };\nfp.BeginOpenFileFilters(\"\", labels, pats, \"Open file\");\n\n// in the event loop, route the dialog's own window:\nint evh = Window.EventHwnd();\nif (fp.IsOpen() || fp.OwnsWindow(evh)) {\n    fp.ApplyEvent(evh);\n} else {\n    app.ApplyEvent(evh);\n}\nfp.RenderWindow();\nif (fp.TakeResult() == 1) {\n    string path = fp.SelectedPath();\n}")
+            Gallery.T("An open/save/folder dialog in its own OS window. Begin a session, route its window events in your loop, and read the chosen path from TakeResult(). Route each event to whichever window owns it (by hwnd) so the parent stays responsive while the dialog is open.",
+                "在独立系统窗口中弹出的“打开/保存/选择文件夹”对话框。开启一个会话，在事件循环中转发它的窗口事件，再从 TakeResult() 读取所选路径。按 hwnd 把每个事件分派给对应窗口，这样对话框打开时父窗口仍可正常响应。"),
+            "FilePicker fp = FilePicker.Create();\n// open with several extension filters (label + pattern list):\nList<string> labels = new List<string>{ \"Zan source (*.zan)\", \"Text (*.txt;*.md)\", \"All files (*.*)\" };\nList<string> pats = new List<string>{ \".zan\", \".txt;.md\", \"\" };\nfp.BeginOpenFileFilters(\"\", labels, pats, \"Open file\");\n\n// in the event loop, route by the OWNING window (native hwnd) so the parent\n// keeps responding while the dialog is open -- do NOT gate on fp.IsOpen():\nint evh = Window.EventHwnd();\nif (fp.OwnsWindow(evh)) {\n    fp.ApplyEvent(evh);\n} else {\n    app.ApplyEvent(evh);\n}\nfp.RenderWindow();\nif (fp.TakeResult() == 1) {\n    string path = fp.SelectedPath();\n}")
             .AddProp("mode", "BeginOpenFile/Filters/Save/Folder", "-", "Which dialog to start.")
             .AddProp("filters", "List<string>", "-", "Label + pattern lists (e.g. \".txt;.md\").")
             .AddProp("title", "string", "-", "Dialog title.")
@@ -2862,6 +3393,9 @@ class Gallery {
         bt.AddDemo("Styles", "Button.Styled(text, type, style) picks the fill treatment: 0=solid,1=outline,2=text,3=dashed. Secondary and Ghost are their own factories.", "Button.styles", 78,
             "Panel row = Panel.Row().Gap(10);\nrow.With(Button.Styled(\"Solid\", 1, 0))\n   .With(Button.Styled(\"Outline\", 1, 1))\n   .With(Button.Styled(\"Text\", 1, 2))\n   .With(Button.Styled(\"Dashed\", 1, 3))\n   .With(Button.Secondary(\"Secondary\", 1))\n   .With(Button.Ghost(\"Ghost\", 1));\nform.Add(row);",
             "[\n  { \"kind\": \"Button\", \"text\": \"Solid\",     \"type\": \"primary\", \"style\": \"solid\" },\n  { \"kind\": \"Button\", \"text\": \"Outline\",   \"type\": \"primary\", \"style\": \"outline\" },\n  { \"kind\": \"Button\", \"text\": \"Text\",      \"type\": \"primary\", \"style\": \"text\" },\n  { \"kind\": \"Button\", \"text\": \"Dashed\",    \"type\": \"primary\", \"style\": \"dashed\" },\n  { \"kind\": \"Button\", \"text\": \"Secondary\", \"type\": \"primary\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Ghost\",     \"type\": \"primary\", \"ghost\": true }\n]");
+        bt.AddDemo("流光效果 (cursor-driven)", "Opt-in border light -- Button.Specular(text, type). A small symmetric pair of glints rides the button's border, brightest at the edge nearest the cursor and mirrored on the opposite side; it moves only when the pointer moves (no auto-spin, zero repaints when still), stays on the border so it never covers the label, and is clipped to the button so nothing spills onto neighbours.", "Button.specular", 78,
+            "Panel row = Panel.Row().Gap(10);\nrow.With(Button.Specular(\"Hover me\", 1))\n   .With(Button.Specular(\"Success\", 3))\n   .With(Button.Specular(\"Error\", 5))\n   .With(Button.Specular(\"Default\", 0));\nform.Add(row);",
+            "[\n  { \"kind\": \"Button\", \"text\": \"Hover me\", \"type\": \"primary\", \"specular\": true },\n  { \"kind\": \"Button\", \"text\": \"Success\",  \"type\": \"success\", \"specular\": true },\n  { \"kind\": \"Button\", \"text\": \"Error\",    \"type\": \"error\",   \"specular\": true }\n]");
         bt.AddDemo("Secondary buttons", "A subtly tinted fill with type-colored text -- Button.Secondary(text, type) -- for lower-emphasis actions.", "Button.secondary", 78,
             "Panel row = Panel.Row().Gap(10);\nrow.With(Button.Secondary(\"Default\", 0))\n   .With(Button.Secondary(\"Primary\", 1))\n   .With(Button.Secondary(\"Info\", 2))\n   .With(Button.Secondary(\"Success\", 3))\n   .With(Button.Secondary(\"Warning\", 4))\n   .With(Button.Secondary(\"Error\", 5));\nform.Add(row);",
             "[\n  { \"kind\": \"Button\", \"text\": \"Default\", \"type\": \"default\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Primary\", \"type\": \"primary\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Info\",    \"type\": \"info\",    \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Success\", \"type\": \"success\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Warning\", \"type\": \"warning\", \"secondary\": true },\n  { \"kind\": \"Button\", \"text\": \"Error\",   \"type\": \"error\",   \"secondary\": true }\n]");
@@ -3006,8 +3540,8 @@ class Gallery {
 
     static void BuildDataDisplay(List<Comp> list) {
         Gallery.Add(list, "Data Display", "Card",
-            Gallery.T("Card draws a titled panel. Card.ContentY gives the y where your content should start.",
-                "Card 绘制带标题的面板。Card.ContentY 给出内容应当起始的 y 坐标。"),
+            Gallery.T("Card draws a titled panel. Card.ContentY gives the y where your content should start. The preview shows opt-in motion effects that all draw clipped inside the card so they never shift layout or spill onto neighbours: BorderGlow (travelling border comet), Spotlight (cursor-follow glow), Sheen (diagonal light sweep), Aurora (drifting soft blobs), Breath (breathing rim) and Motes (rising dust).",
+                "Card 绘制带标题的面板。Card.ContentY 给出内容应当起始的 y 坐标。预览展示了可选的动效，全部裁剪在卡片内部绘制，不会挤动布局或溢出到相邻组件：BorderGlow(边框流光)、Spotlight(跟随光标)、Sheen(斜向扫光)、Aurora(漂移柔光)、Breath(呼吸边框)、Motes(上升光尘)。"),
             "Card.Render(app, 40, 40, 260, 160, \"Profile\");\nint cy = Card.ContentY(40, app.theme);\nLabel.Render(app, 56, cy, \"Card body goes here\");")
             .AddProp("title", "string", "-", "Header text.")
             .AddProp("w", "int", "-", "Card width in px.")
@@ -3094,14 +3628,14 @@ class Gallery {
             .AddProp("cols/cells", "List<string>", "-", "Header labels / row cells.")
             .AddProp("widths", "List<int>", "-", "Per-column widths in px.")
             .AddProp("striped", "bool", "false", "Alternate-row background (RenderRow).");
-        Gallery.Add(list, "Data Display", "DataTable",
-            Gallery.T("A stateful table with typed columns, sorting, filtering and CSV export.",
-                "带状态的表格，支持类型化列、排序、筛选与 CSV 导出。"),
-            "List<DataColumn> cols = new List<DataColumn>{ DataColumn.Text(\"Name\", 180), DataColumn.Numeric(\"Score\", 100) };\nList<DataRow> rows = new List<DataRow>();\nDataRow row = DataRow.Create();\nrow.Push(\"Zan\"); row.Push(\"98\"); rows.Add(row);\nDataTableState state = DataTableState.Create();\nDataTable.Render(app, 40, 60, 520, 260, cols, rows, state);")
-            .AddProp("cols", "List<DataColumn>", "-", "Typed columns (Text/Numeric).")
-            .AddProp("rows", "List<DataRow>", "-", "Row data (Push per cell).")
-            .AddProp("state", "DataTableState", "-", "Sort/filter state (retained).")
-            .AddEvent("sort / filter", "via state", "Header clicks mutate state and re-order rows.");
+        Gallery.Add(list, "Data Display", "DataTable 1M",
+            Gallery.T("A DataTable over millions of rows x 70 columns via a virtual DataSource: cells are fetched on demand for the visible window, so memory stays flat and every frame is constant-cost. Sorting uses typed keys; the summary row totals in one pass with derived columns computed from the aggregates.",
+                "通过虚拟数据源承载数百万行 x 70 列的 DataTable：仅按需取可见窗口的单元格，内存恒定、每帧开销恒定。排序使用类型化键；合计行一趟汇总，派生列直接由聚合值计算。"),
+            "// Subclass DataSource and feed cells on demand — the grid stores no\n// rows, so memory is O(1) in the row count (vs ~1.8 GB for 70M string\n// cells). CellNum returns the typed sort/aggregate key (no string parse).\nclass BigSource : DataSource {\n    int rows;\n    override int RowCount() { return this.rows; }\n    override int CellNum(int row, int col) { return /* value */ 0; }\n    override string CellText(int row, int col) { return /* text */ \"\"; }\n}\nDataTable.RenderSource(app, x, y, w, h, cols, source, state);")
+            .AddProp("source", "DataSource", "-", "Virtual source: RowCount/CellText/CellNum, no row storage.")
+            .AddProp("cols", "List<DataColumn>", "-", "70 columns; pans via scrollX (Shift+wheel / bar).")
+            .AddProp("summary", "DataColumn.summary / Derived", "0", "Per-column total; Derived columns compute from other aggregates.")
+            .AddEvent("scroll", "state.scrollRow / scrollX", "Virtual row + horizontal column window.");
         Gallery.Add(list, "Data Display", "PivotTable",
             Gallery.T("Summarize rows by configured row, column and value fields.",
                 "按配置的行、列与值字段对数据进行汇总透视。"),
@@ -3140,25 +3674,67 @@ class Gallery {
         car.AddEvent("Change", "HandleClick(...)", "Arrows / dots advance the active slide.");
         list.Add(car);
         Comp ch = Comp.Create("Data Display", "Chart",
-            "A family of static chart renderers over ChartSeries data. Category charts (Line, Area, Bar) share (labels, List<ChartSeries>); part-of-whole charts (Pie, Donut) take (names, values); Scatter plots (xs, ys) on numeric axes. Every call is a single X.Render(app, x, y, w, h, title, ...) -- no retained chart state.", "");
-        ch.AddDemo("Line", "Chart.Line(app, x, y, w, h, title, labels, series) plots one polyline per series over shared category labels.", "Chart.line", 210,
-            "List<string> labels = new List<string>{ \"Q1\", \"Q2\", \"Q3\", \"Q4\" };\nList<int> rev = new List<int>{ 12, 28, 20, 35 };\nList<ChartSeries> series = new List<ChartSeries>{ ChartSeries.Create(\"Revenue\", rev, app.theme.primary) };\nChart.Line(app, 40, 40, 480, 200, \"Quarterly revenue\", labels, series);", "");
-        ch.AddDemo("Area", "Chart.Area fills under each line -- same data shape as Line.", "Chart.area", 210,
-            "Chart.Area(app, 40, 40, 480, 200, \"Quarterly revenue\", labels, series);", "");
-        ch.AddDemo("Bar", "Chart.Bar draws grouped vertical bars, one group per label.", "Chart.bar", 210,
-            "Chart.Bar(app, 40, 40, 480, 200, \"Quarterly revenue\", labels, series);", "");
-        ch.AddDemo("Pie", "Chart.Pie(app, x, y, w, h, title, names, values) shows part-of-whole slices.", "Chart.pie", 210,
-            "List<int> parts = new List<int>{ 45, 30, 25 };\nList<string> names = new List<string>{ \"Zan\", \"C\", \"Rust\" };\nChart.Pie(app, 40, 40, 480, 200, \"Language share\", names, parts);", "");
-        ch.AddDemo("Donut", "Chart.Donut is a pie with a hollow centre.", "Chart.donut", 210,
-            "Chart.Donut(app, 40, 40, 480, 200, \"Language share\", names, parts);", "");
-        ch.AddDemo("Scatter", "Chart.Scatter(app, x, y, w, h, title, xs, ys, color) plots (x, y) points on value axes.", "Chart.scatter", 210,
-            "List<int> xs = new List<int>{ 5, 12, 18, 24 };\nList<int> ys = new List<int>{ 8, 14, 11, 26 };\nChart.Scatter(app, 40, 40, 480, 200, \"Samples\", xs, ys, app.theme.primary);", "");
-        ch.AddProp("title", "string", "\"\"", "Heading drawn top-left; \"\" hides it.");
-        ch.AddProp("labels", "List<string>", "-", "Category axis labels (Line/Area/Bar).");
-        ch.AddProp("series", "List<ChartSeries>", "-", "Named value series with colours (Line/Area/Bar).");
-        ch.AddProp("names", "List<string>", "-", "Slice labels (Pie/Donut).");
-        ch.AddProp("values", "List<int>", "-", "Slice / point values (Pie/Donut/Scatter).");
-        ch.AddProp("color", "int", "-", "ARGB point colour (Scatter).");
+            "Componentized charts (LiveCharts-style): bind a strongly-typed ChartModel (title + labels + ChartSeries, or scatter x/y) to a declarative ChartOptions, then ChartView.Of(model, opts).Render(app, x, y, w, h). Data can be built in code (ChartModel.Create().Add(...)) or parsed from a JSON document (ChartModel.FromJson) so the same chart is code- or data-driven. ChartView plays a grow-in intro, draws gradient/smoothed series and an optional hover crosshair + value tooltip. Beyond the cartesian/pie basics it covers step line, stacked area, candlestick (OHLC), bubble, box plot, error bars, polar/radar, funnel/pyramid and rose -- each bound with a strongly-typed complete-data constructor (ChartModel.OfCandles/OfBubbles/OfBoxes/OfErrors or List<Candle>/Bubble/BoxItem/ErrorItem) so you just pass data, never Add per point. Dense series decimate to plot width (ChartBig / candlestick bucketing / bubble striding) to stay fast on huge data. The one-shot static Chart.Line/Bar/Pie/... renderers remain for quick draws.", "");
+        ch.AddDemo("Line", "A ChartView with ChartOptions.Line() plots one polyline per series over the model's shared category labels, animating up on first render.", "Chart.line", 210,
+            "ChartModel m = ChartModel.Create(\"Quarterly revenue\");\nm.AddLabel(\"Q1\"); m.AddLabel(\"Q2\"); m.AddLabel(\"Q3\"); m.AddLabel(\"Q4\");\nm.Add(\"Revenue\", new List<int>{ 12, 28, 20, 35 });\nm.Add(\"Cost\", new List<int>{ 8, 14, 16, 22 });\nChartView.Of(m, ChartOptions.Line()).Render(app, 40, 40, 480, 200);",
+            "{\n  \"title\": \"Quarterly revenue\",\n  \"labels\": [\"Q1\", \"Q2\", \"Q3\", \"Q4\"],\n  \"series\": [\n    { \"name\": \"Revenue\", \"color\": 0, \"values\": [12, 28, 20, 35] },\n    { \"name\": \"Cost\", \"color\": 0, \"values\": [8, 14, 16, 22] }\n  ]\n}");
+        ch.AddDemo("Area", "ChartOptions.Area() fills a vertical gradient under each line -- same ChartModel shape as Line.", "Chart.area", 210,
+            "ChartView.Of(m, ChartOptions.Area()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Smooth", "ChartOptions.Smooth() draws Catmull-Rom curved lines with a gradient area fill for a softer, LiveCharts-like look.", "Chart.smooth", 210,
+            "ChartView.Of(m, ChartOptions.Smooth()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Bar", "ChartOptions.Bar() draws grouped, rounded, gradient-filled vertical bars. Set opts.showValues = true to label bar tops.", "Chart.bar", 210,
+            "ChartOptions o = ChartOptions.Bar();\no.showValues = true;\nChartView.Of(m, o).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Stacked", "ChartOptions.Stacked() stacks the series per category into a single bar.", "Chart.stacked", 210,
+            "ChartView.Of(m, ChartOptions.Stacked()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("From JSON", "Parse a data document into a ChartModel (color 0 = auto palette) and render it -- no imperative Add() calls. Ideal for server- or file-driven dashboards.", "Chart.json", 210,
+            "string doc = \"{\\\"title\\\":\\\"Monthly active users\\\",\\\"labels\\\":[...],\\\"series\\\":[...] }\";\nChartModel m = ChartModel.FromJson(doc);\nChartView.Of(m, ChartOptions.Smooth()).Render(app, 40, 40, 480, 200);",
+            "{\n  \"title\": \"Monthly active users\",\n  \"labels\": [\"Jan\", \"Feb\", \"Mar\", \"Apr\", \"May\", \"Jun\"],\n  \"series\": [\n    { \"name\": \"Web\", \"color\": 0, \"values\": [30, 45, 38, 60, 72, 85] },\n    { \"name\": \"Mobile\", \"color\": 0, \"values\": [20, 32, 40, 52, 64, 80] }\n  ]\n}");
+        ch.AddDemo("Pie & Donut", "Part-of-whole charts are compact, so lay them two-per-row instead of stretching one across the width. ChartOptions.Pie()/Donut() render each single-value series as a slice; the sweep grows in on first render and the donut prints the total in its hole.", "Chart.pie", 210,
+            "ChartModel m = ChartModel.Create(\"Language share\");\nm.Add(\"Zan\", new List<int>{ 45 });\nm.Add(\"C\", new List<int>{ 30 });\nm.Add(\"Rust\", new List<int>{ 25 });\n// two per row: pie on the left, donut on the right\nChartView.Of(m, ChartOptions.Pie()).Render(app, 40, 40, 236, 200);\nChartView.Of(m, ChartOptions.Donut()).Render(app, 288, 40, 236, 200);", "");
+        ch.AddDemo("Gauge & Radial", "Gauge (half-ring speedometer) and RadialBars (concentric progress rings) are KPI charts -- also two-per-row. opts.gaugeMax sets full scale; each ring/needle sweeps in with the intro animation.", "Chart.radial", 210,
+            "ChartModel g = ChartModel.Create(\"CPU load\");\ng.AddColored(\"load\", new List<int>{ 72 }, t.primary);\nChartOptions go = ChartOptions.Gauge(); go.gaugeMax = 100;\nChartView.Of(g, go).Render(app, 40, 40, 236, 200);\n\nChartModel r = ChartModel.Create(\"Quota used\");\nr.Add(\"CPU\", new List<int>{ 80 }); r.Add(\"RAM\", new List<int>{ 55 }); r.Add(\"Disk\", new List<int>{ 30 });\nChartView.Of(r, ChartOptions.RadialBars()).Render(app, 288, 40, 236, 200);", "");
+        ch.AddDemo("Heatmap", "A heatmap maps each series to a row and each value index to a column, colouring every cell by intensity (min->max ramps bgTertiary -> the series colour). Cells fade in with the intro animation. Good for calendars / correlation grids.", "Chart.heatmap", 210,
+            "ChartModel m = ChartModel.Create(\"Weekly activity\");\nm.AddLabel(\"Mon\"); /* ...Sun */\nm.AddColored(\"Team A\", new List<int>{ 12, 35, 50, 28, 64, 18, 8 }, t.primary);\nm.AddColored(\"Team B\", new List<int>{ 40, 22, 70, 90, 55, 30, 15 }, Chart.Palette(t, 2));\nChartView.Of(m, ChartOptions.Heatmap()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Scatter", "A scatter ChartModel carries x/y point arrays (AddPoint) rendered on value axes.", "Chart.scatter", 210,
+            "ChartModel m = ChartModel.Create(\"Samples\");\nm.AddPoint(5, 8); m.AddPoint(12, 14); m.AddPoint(18, 11);\nChartView.Of(m, ChartOptions.Scatter()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Step line", "ChartOptions.StepLine() draws staircase connectors (value holds then steps) -- good for discrete/state-over-time data. Bind ready data with ChartModel.OfValues, no Add calls.", "Chart.step", 210,
+            "List<int> req = new List<int>{ 10, 14, 12, 20, 18, 26, 24 };\nChartModel m = ChartModel.OfValues(\"Requests/s\", labels, \"req\", req);\nChartView.Of(m, ChartOptions.StepLine()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Stacked area", "ChartOptions.StackedArea() stacks each series on the previous one as filled bands (cumulative). Pass the series list straight to ChartModel.Of.", "Chart.stackedarea", 210,
+            "List<ChartSeries> s = new List<ChartSeries>{ ChartSeries.Create(\"Web\", web, 0), ChartSeries.Create(\"Mobile\", mob, 0) };\nChartView.Of(ChartModel.Of(\"Traffic\", labels, s), ChartOptions.StackedArea()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Candlestick", "Financial OHLC bars from a List<Candle>. For huge histories the renderer buckets to plot width (first open / last close / bucket high-low), so a million bars still draw at O(width).", "Chart.candle", 210,
+            "List<Candle> bars = new List<Candle>{ Candle.Of(100,115,95,110), Candle.Of(110,120,104,106) };\nChartView.Of(ChartModel.OfCandles(\"AAPL\", labels, bars), ChartOptions.Candles()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Bubble", "Weighted scatter from a List<Bubble> (x, y, weight); the bubble radius scales with sqrt(weight). Dense data is strided down to plot width.", "Chart.bubble", 210,
+            "List<Bubble> pts = new List<Bubble>{ Bubble.Of(10,20,4), Bubble.Of(35,18,36) };\nChartView.Of(ChartModel.OfBubbles(\"Samples\", pts), ChartOptions.Bubbles()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Box plot", "Box-and-whisker stats from a List<BoxItem> (lo, q1, median, q3, hi) -- box spans the quartiles, a line marks the median, whiskers reach min/max.", "Chart.box", 210,
+            "List<BoxItem> b = new List<BoxItem>{ BoxItem.Of(10,25,40,55,70), BoxItem.Of(20,35,45,60,85) };\nChartView.Of(ChartModel.OfBoxes(\"Latency\", labels, b), ChartOptions.BoxPlot()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Error bars", "Value +/- margin from a List<ErrorItem> (y, err): a line through the points plus vertical caps for the error range.", "Chart.error", 210,
+            "List<ErrorItem> e = new List<ErrorItem>{ ErrorItem.Of(40,6), ErrorItem.Of(55,8) };\nChartView.Of(ChartModel.OfErrors(\"Measurement\", labels, e), ChartOptions.ErrorBars()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Polar / radar", "ChartOptions.Polar() draws each series as a closed polygon over angular category spokes with concentric rings -- a radar/spider chart. Bind the series with ChartModel.Of.", "Chart.polar", 210,
+            "List<ChartSeries> s = new List<ChartSeries>{ ChartSeries.Create(\"Model X\", mx, 0), ChartSeries.Create(\"Model Y\", my, 0) };\nChartView.Of(ChartModel.Of(\"Comparison\", labels, s), ChartOptions.Polar()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Funnel / pyramid", "Descending stages as centered trapezoids. Each single-value series is a stage (name + value); ChartOptions.Pyramid() flips it narrow-at-top.", "Chart.funnel", 210,
+            "List<ChartSeries> s = new List<ChartSeries>{ ChartSeries.Create(\"Visits\", v(1000), 0), ChartSeries.Create(\"Paid\", v(120), 0) };\nChartView.Of(ChartModel.Of(\"Conversion\", noLabels, s), ChartOptions.Funnel()).Render(app, 40, 40, 236, 200);", "");
+        ch.AddDemo("Rose / nightingale", "ChartOptions.Rose() gives every stage an equal angular sector whose radius scales with its value (a Nightingale rose diagram).", "Chart.rose", 210,
+            "List<ChartSeries> s = new List<ChartSeries>{ ChartSeries.Create(\"Mon\", v(45), 0), ChartSeries.Create(\"Tue\", v(72), 0) };\nChartView.Of(ChartModel.Of(\"Daily volume\", noLabels, s), ChartOptions.Rose()).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Dual axis + mixed", "Second value axis (ChartSeries.OnAxis / .axisIndex=1) with a line drawn over bars via ChartSeries.AsKind(name, vs, color, ChartType.Line()). Axis titles set through options.", "Chart.dualaxis", 210,
+            "List<ChartSeries> s = new List<ChartSeries>{ ChartSeries.Create(\"Revenue\", rev, 0), ChartSeries.AsKind(\"Margin %\", mgn, C, ChartType.Line()) };\ns[1].axisIndex = 1;\nChartOptions o = ChartOptions.Bar(); o.y2Title = \"Margin %\";\nChartView.Of(ChartModel.Of(\"Revenue vs margin\", labels, s), o).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Axis: fixed + reversed", "Fixed value bounds (o.yMinFixed / o.yMaxFixed) and a reversed axis (o.yReversed) so rank 1 sits at the top -- plus an axis title.", "Chart.reversed", 210,
+            "ChartOptions o = ChartOptions.Line();\no.yReversed = true; o.yMinFixed = 1; o.yMaxFixed = 10;\nChartView.Of(ChartModel.Of(\"Search ranking (1 = top)\", labels, s), o).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("dataZoom slider", "Set o.zoom = true to get a range slider below the plot: drag either handle to resize the visible window or drag the band to pan. The window is kept per-chart, and only the selected categories are drawn. Click a legend swatch on any chart to show/hide that series.", "Chart.zoom", 250,
+            "ChartOptions o = ChartOptions.Area();\no.zoom = true;\nChartView.Of(ChartModel.Of(\"60-day trend\", labels, s), o).Render(app, 40, 40, 480, 220);", "");
+        ch.AddDemo("markLine / markArea", "o.markLine draws a labelled dashed threshold at a value; o.markLo / o.markHi shade a target band behind the series. Both map through the shared left axis.", "Chart.marks", 210,
+            "ChartOptions o = ChartOptions.Line();\no.markLine = 60; o.markLabel = \"SLA 60ms\";\no.markLo = 70; o.markHi = 90;\nChartView.Of(ChartModel.Of(\"Response time vs SLA\", labels, s), o).Render(app, 40, 40, 480, 200);", "");
+        ch.AddDemo("Pie percentage labels", "o.pieLabels = true draws each slice's share on the slice (in addition to the legend). Works for pie and donut.", "Chart.pielabels", 220,
+            "ChartOptions o = ChartOptions.Donut();\no.pieLabels = true;\nChartView.Of(ChartModel.Of(\"Browser share\", noLabels, s), o).Render(app, 40, 40, 480, 210);", "");
+        ch.AddDemo("Dataset + encode", "ECharts-style ChartDataset holds named dimensions column-major once; each chart selects dimensions via EncodeNamed / EncodeBy -- no copying or reshaping. Here one dataset drives a grouped bar and an area chart.", "Chart.dataset", 220,
+            "ChartDataset ds = ChartDataset.WithCats(dims, cols, cats);\nds.EncodeNamed(\"Sales vs Cost\", new List<string>{ \"Sales\", \"Cost\" });\nds.EncodeNamed(\"Profit\", new List<string>{ \"Profit\" });", "");
+        ch.AddProp("model", "ChartModel", "-", "Typed data: title, labels, series (or scatter x/y). Build in code or via ChartModel.FromJson.");
+        ch.AddProp("options", "ChartOptions", "-", "Declarative presentation: kind, smooth, area, gradient, showValues, showTooltip, animate, ...");
+        ch.AddProp("kind", "int", "0", "Chart family from ChartType.* (Line/Area/Bar/StackedBar/HBar/Pie/Donut/Scatter).");
+        ch.AddProp("smooth", "bool", "false", "Catmull-Rom curved lines (line family).");
+        ch.AddProp("gradient", "bool", "true", "Vertical gradient fills for areas / bars.");
+        ch.AddProp("showValues", "bool", "false", "Draw value labels on points / bar tops.");
+        ch.AddProp("showTooltip", "bool", "true", "Hover crosshair + value tooltip (cartesian charts).");
+        ch.AddProp("animate", "bool", "true", "Grow-in intro animation on first render.");
         list.Add(ch);
         Gallery.Add(list, "Data Display", "Ellipsis",
             Gallery.T("Measure and truncate long text so it fits a fixed width.",

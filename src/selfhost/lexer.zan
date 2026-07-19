@@ -12,8 +12,174 @@ class Lexer {
     public int line;
     public int col;
 
+    // Preprocessor state (mirrors src/compiler/lexer.c): a define table and a
+    // nested #if/#else conditional stack. Only the target-platform macros the
+    // stdlib tests are predefined.
+    public List<string> ppName;
+    public List<int> ppActive;   // this frame emits tokens (accounts for ancestors)
+    public List<int> ppParent;   // enclosing region was active when frame pushed
+    public List<int> ppTaken;    // some branch of this frame has been taken
+    public int ppTop;            // logical conditional-stack depth (no List.RemoveAt)
+    string peSrc; int pePos; int peN;   // scratch for #if expression evaluation
+
     public Lexer(string s) {
         src = s; pos = 0; n = s.Length; line = 1; col = 1;
+        ppName = new List<string>();
+        ppActive = new List<int>();
+        ppParent = new List<int>();
+        ppTaken = new List<int>();
+        ppTop = 0;
+        peSrc = ""; pePos = 0; peN = 0;
+        ppName.Add("WINDOWS"); ppName.Add("WIN32"); ppName.Add("X86_64"); ppName.Add("ZAN");
+    }
+
+    bool PpIsDef(string name) {
+        int i = 0;
+        while (i < ppName.Count) { if (ppName[i] == name) { return true; } i = i + 1; }
+        return false;
+    }
+    void PpDefine(string name) { if (!PpIsDef(name)) { ppName.Add(name); } }
+    void PpUndef(string name) {
+        int i = 0;
+        while (i < ppName.Count) {
+            if (ppName[i] == name) { ppName[i] = ""; return; }  // tombstone (no RemoveAt)
+            i = i + 1;
+        }
+    }
+    void PpPush(int pa, int c, int t) {
+        if (ppTop < ppActive.Count) { ppActive[ppTop] = c; ppParent[ppTop] = pa; ppTaken[ppTop] = t; }
+        else { ppActive.Add(c); ppParent.Add(pa); ppTaken.Add(t); }
+        ppTop = ppTop + 1;
+    }
+    void PpPop() { if (ppTop > 0) { ppTop = ppTop - 1; } }
+    bool PpActiveNow() {
+        if (ppTop == 0) { return true; }
+        return ppActive[ppTop - 1] == 1;
+    }
+
+    // ---- #if expression evaluation (bare ident = defined?1:0, ints, defined(),
+    // !, &&, ||, ==, != and parentheses) ----
+    int PeEval(string s) { peSrc = s; pePos = 0; peN = s.Length; return PeOr(); }
+    void PeWs() { while (pePos < peN && (peSrc[pePos] == ' ' || peSrc[pePos] == '\t')) { pePos = pePos + 1; } }
+    int PeCh() { if (pePos < peN) { return (int)peSrc[pePos]; } return 0; }
+    int PeCh1() { if (pePos + 1 < peN) { return (int)peSrc[pePos + 1]; } return 0; }
+    bool PeEat2(int a, int b) {
+        PeWs();
+        if (PeCh() == a && PeCh1() == b) { pePos = pePos + 2; return true; }
+        return false;
+    }
+    int PeOr() {
+        int v = PeAnd();
+        while (PeEat2(124, 124)) { int r = PeAnd(); if (v != 0 || r != 0) { v = 1; } else { v = 0; } }
+        return v;
+    }
+    int PeAnd() {
+        int v = PeEq();
+        while (PeEat2(38, 38)) { int r = PeEq(); if (v != 0 && r != 0) { v = 1; } else { v = 0; } }
+        return v;
+    }
+    int PeEq() {
+        int v = PeUnary();
+        while (true) {
+            if (PeEat2(61, 61)) { int r = PeUnary(); if (v == r) { v = 1; } else { v = 0; } }
+            else if (PeEat2(33, 61)) { int r = PeUnary(); if (v != r) { v = 1; } else { v = 0; } }
+            else { return v; }
+        }
+    }
+    int PeUnary() {
+        PeWs();
+        if (PeCh() == 33 && PeCh1() != 61) { pePos = pePos + 1; int v = PeUnary(); if (v == 0) { return 1; } return 0; }
+        return PePrimary();
+    }
+    int PePrimary() {
+        PeWs();
+        int c = PeCh();
+        if (c == 40) { pePos = pePos + 1; int v = PeOr(); PeWs(); if (PeCh() == 41) { pePos = pePos + 1; } return v; }
+        if (c >= 48 && c <= 57) {
+            int v = 0;
+            while (pePos < peN && PeCh() >= 48 && PeCh() <= 57) { v = v * 10 + (PeCh() - 48); pePos = pePos + 1; }
+            return v;
+        }
+        // identifier
+        int start = pePos;
+        while (pePos < peN && (IsAlnum(PeCh()))) { pePos = pePos + 1; }
+        if (pePos == start) { return 0; }
+        string id = peSrc.Substring(start, pePos - start);
+        if (id == "defined") {
+            PeWs();
+            bool paren = false;
+            if (PeCh() == 40) { paren = true; pePos = pePos + 1; PeWs(); }
+            int s2 = pePos;
+            while (pePos < peN && IsAlnum(PeCh())) { pePos = pePos + 1; }
+            string nm = peSrc.Substring(s2, pePos - s2);
+            if (paren) { PeWs(); if (PeCh() == 41) { pePos = pePos + 1; } }
+            if (PpIsDef(nm)) { return 1; }
+            return 0;
+        }
+        if (PpIsDef(id)) { return 1; }
+        return 0;
+    }
+
+    // Consume a `#...` directive line (the leading '#' is already consumed) and
+    // update the define table / conditional stack.
+    void Directive() {
+        // directive keyword
+        while (pos < n && (Peek() == 32 || Peek() == 9)) { Adv(); }
+        int ds = pos;
+        while (pos < n && IsAlpha(Peek())) { Adv(); }
+        string dir = src.Substring(ds, pos - ds);
+        // rest of line (argument text)
+        while (pos < n && (Peek() == 32 || Peek() == 9)) { Adv(); }
+        int rs = pos;
+        while (pos < n && Peek() != 10) { Adv(); }
+        string rest = src.Substring(rs, pos - rs);
+        if (dir == "if") {
+            int pa = 0; if (PpActiveNow()) { pa = 1; }
+            int c = 0; if (pa == 1 && PeEval(rest) != 0) { c = 1; }
+            PpPush(pa, c, c);
+        } else if (dir == "ifdef" || dir == "ifndef") {
+            int pa = 0; if (PpActiveNow()) { pa = 1; }
+            string nm = PpTrim(rest);
+            bool def = PpIsDef(nm);
+            if (dir == "ifndef") { def = !def; }
+            int c = 0; if (pa == 1 && def) { c = 1; }
+            PpPush(pa, c, c);
+        } else if (dir == "elif") {
+            int top = ppTop - 1;
+            if (top >= 0) {
+                if (ppTaken[top] == 0 && ppParent[top] == 1 && PeEval(rest) != 0) { ppActive[top] = 1; ppTaken[top] = 1; }
+                else { ppActive[top] = 0; }
+            }
+        } else if (dir == "else") {
+            int top = ppTop - 1;
+            if (top >= 0) {
+                if (ppParent[top] == 1 && ppTaken[top] == 0) { ppActive[top] = 1; ppTaken[top] = 1; }
+                else { ppActive[top] = 0; }
+            }
+        } else if (dir == "endif") {
+            PpPop();
+        } else if (dir == "define") {
+            if (PpActiveNow()) {
+                string nm = PpFirstWord(rest);
+                if (nm != "") { PpDefine(nm); }
+            }
+        } else if (dir == "undef") {
+            if (PpActiveNow()) { string nm = PpFirstWord(rest); if (nm != "") { PpUndef(nm); } }
+        }
+    }
+
+    string PpTrim(string s) {
+        int a = 0; int b = s.Length;
+        while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == 13)) { a = a + 1; }
+        while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == 13)) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+    string PpFirstWord(string s) {
+        int a = 0; int m = s.Length;
+        while (a < m && (s[a] == ' ' || s[a] == '\t')) { a = a + 1; }
+        int b = a;
+        while (b < m && IsAlnum((int)s[b])) { b = b + 1; }
+        return s.Substring(a, b - a);
     }
 
     int Peek() { if (pos < n) { return (int)src[pos]; } return 0; }
@@ -251,7 +417,9 @@ class Lexer {
                 return toks;
             }
             int c = Peek();
-            if (c == 36 && Peek2() == 34) { InterpStr(toks, sl, sc); }
+            if (c == 35) { Adv(); Directive(); }               // '#' preprocessor line
+            else if (!PpActiveNow()) { while (pos < n && Peek() != 10) { Adv(); } }
+            else if (c == 36 && Peek2() == 34) { InterpStr(toks, sl, sc); }
             else if (IsAlpha(c)) { toks.Add(Ident(sl, sc)); }
             else if (IsDigit(c)) { toks.Add(Number(sl, sc)); }
             else if (c == 34) { toks.Add(Str(sl, sc)); }
