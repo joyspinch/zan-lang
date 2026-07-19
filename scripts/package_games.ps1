@@ -88,8 +88,10 @@ foreach ($game in $Games) {
     if (Test-Path -LiteralPath $stage) { Remove-Item -Recurse -Force $stage }
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
+    # Release build: -DPUBLISH arms the tamper defense (dev builds stay
+    # debuggable); --publish optimizes and strips debug info.
     $gameExe = Join-Path $stage "game.exe"
-    & $zanc $src $kit --auto-stdlib -o $gameExe
+    & $zanc $src $kit --auto-stdlib --publish -DPUBLISH -o $gameExe
     if ($LASTEXITCODE -ne 0) { throw "$game compilation failed." }
     [PkgRes]::SetGuiSubsystem($gameExe)
 
