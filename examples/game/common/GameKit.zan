@@ -3,6 +3,7 @@
 // stack; the bitmap font is embedded here so each game is standalone.
 using System;
 using System.IO;
+using System.Security;
 using SDL3;
 
 namespace GameKit;
@@ -194,6 +195,13 @@ class GlyphFont {
 // logical canvas that the renderer letterbox-scales to the window/screen, so
 // gameplay math is resolution-independent and looks correct on any DPI.
 class Host {
+    #if WINDOWS
+    // SDL_RestoreWindow isn't in the zan_sdl3 bridge; call SDL3 directly so F11
+    // un-maximizes back to the original window size instead of a maximized one.
+    [DllImport("SDL3", EntryPoint = "SDL_RestoreWindow")]
+    static extern int SdlRestoreWindow(int win);
+    #endif
+
     SdlWindow window;
     SdlRenderer r;
     SdlTexture canvas;   // 3x supersample target; downsampled on present
@@ -201,6 +209,7 @@ class Host {
     int logicalH;
     bool running;
     bool fullscreen;
+    bool ignoreMax;   // swallow the maximize event fired when leaving fullscreen
 
     static Host Create(string title, int logicalW, int logicalH) {
         Sdl.Init(SdlInit.Video() + SdlInit.Events());
@@ -227,10 +236,12 @@ class Host {
         // anti-aliasing on any window size (logical presentation alone only
         // scales coordinates and leaves jagged edges).
         h.canvas = SdlTexture.CreateTarget(h.r, logicalW * f, logicalH * f);
+        Sprite.Bake(h.r);
         h.logicalW = logicalW;
         h.logicalH = logicalH;
         h.running = true;
         h.fullscreen = false;
+        Guard.Arm();
         return h;
     }
 
@@ -243,8 +254,30 @@ class Host {
     void ToggleFullscreen() {
         this.fullscreen = !this.fullscreen;
         this.window.SetFullscreen(this.fullscreen);
+        // Leaving fullscreen restores the previous (maximized) state, which
+        // re-fires WindowMaximized; swallow that one and un-maximize so F11
+        // returns to the original window size instead of snapping back.
+        if (!this.fullscreen) {
+            this.ignoreMax = true;
+            #if WINDOWS
+            Host.SdlRestoreWindow(this.window.Handle());
+            #endif
+        }
     }
     bool IsFullscreen() { return this.fullscreen; }
+
+    // The OS maximize button enters borderless fullscreen (same as F11), so a
+    // maximized game never shows a title bar.
+    void OnWindowEvent(int type) {
+        if (type == SdlEventType.WindowMaximized()) {
+            if (this.ignoreMax) { this.ignoreMax = false; return; }
+            if (!this.fullscreen) {
+                this.fullscreen = true;
+                this.window.SetFullscreen(true);
+            }
+        }
+        if (type == SdlEventType.WindowRestored()) { this.ignoreMax = false; }
+    }
 
     int MouseX() {
         return this.r.LogicalX(SdlEvent.MouseX(), SdlEvent.MouseY())
@@ -270,11 +303,91 @@ class Host {
             this.r.DrawTexture(this.canvas, 0, 0, this.logicalW, this.logicalH);
         }
         this.r.Present();
+        Guard.Check();
     }
 
     void Close() {
         this.window.Close();
         Sdl.Quit();
+    }
+}
+
+// Pre-baked disc sprites. FillCircle rasterizes one FillRect per native
+// scanline, which is very expensive for the hundreds of large circles a
+// frame that worm bodies / orbs / particles need. Sprite.Ball draws the same
+// visual as a single tinted textured quad from a white disc baked once into
+// a render-target texture; Sprite.Glow is a soft radial-falloff halo.
+class Sprite {
+    static SdlTexture disc;
+    static SdlTexture glow;
+    static bool baked;
+
+    static int R() { return 96; }   // baked radius, native px
+
+    static void Bake(SdlRenderer r) {
+        if (Sprite.baked) { return; }
+        Sprite.baked = true;
+        int br = Sprite.R();
+        int side = br * 2 + 2;
+        SdlTexture d = SdlTexture.CreateTarget(r, side, side);
+        if (d == null || !d.IsValid()) { return; }
+        r.SetTarget(d);
+        r.SetBlend(0);
+        r.SetColor(255, 255, 255, 0);
+        r.Clear();
+        r.SetColor(255, 255, 255, 255);
+        int dy = -br;
+        while (dy <= br) {
+            int dx = Draw.Isqrt(br * br - dy * dy);
+            r.FillRectRaw(br + 1 - dx, br + 1 + dy, dx * 2 + 1, 1);
+            dy = dy + 1;
+        }
+        d.SetBlendMode(1);
+        SdlTexture g = SdlTexture.CreateTarget(r, side, side);
+        if (g != null && g.IsValid()) {
+            r.SetTarget(g);
+            r.SetColor(255, 255, 255, 0);
+            r.Clear();
+            // radial falloff: stack translucent discs from the rim inward
+            r.SetBlend(1);
+            int ring = br;
+            while (ring >= 4) {
+                r.SetColor(255, 255, 255, 26);
+                int ry = -ring;
+                while (ry <= ring) {
+                    int rx = Draw.Isqrt(ring * ring - ry * ry);
+                    r.FillRectRaw(br + 1 - rx, br + 1 + ry, rx * 2 + 1, 1);
+                    ry = ry + 1;
+                }
+                ring = ring - br / 12;
+            }
+            g.SetBlendMode(1);
+            Sprite.glow = g;
+        }
+        r.SetBlend(1);
+        r.ResetTarget();
+        Sprite.disc = d;
+    }
+
+    // Solid tinted disc, one draw call. Falls back to scanline FillCircle if
+    // baking failed (e.g. render targets unsupported).
+    static void Ball(SdlRenderer r, int cx, int cy, int rad,
+                     int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        if (Sprite.disc == null) { Draw.FillCircle(r, cx, cy, rad, cr, cg, cb, ca); return; }
+        Sprite.disc.SetColor(cr, cg, cb);
+        Sprite.disc.SetOpacity(ca);
+        r.DrawTexture(Sprite.disc, cx - rad, cy - rad, rad * 2, rad * 2);
+    }
+
+    // Soft halo disc (alpha fades toward the rim), one draw call.
+    static void Glow(SdlRenderer r, int cx, int cy, int rad,
+                     int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        if (Sprite.glow == null) { Sprite.Ball(r, cx, cy, rad, cr, cg, cb, ca); return; }
+        Sprite.glow.SetColor(cr, cg, cb);
+        Sprite.glow.SetOpacity(ca);
+        r.DrawTexture(Sprite.glow, cx - rad, cy - rad, rad * 2, rad * 2);
     }
 }
 

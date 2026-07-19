@@ -1,0 +1,192 @@
+using System;
+using System.Threading;
+
+namespace System.Security;
+
+/// <summary>
+/// A simple, cross-platform, user-mode tamper-defense layer for shipped Zan
+/// programs (not just games). Call <c>Guard.Arm()</c> once at startup: it hides
+/// the main thread from debuggers where possible, runs a one-shot anti-attach
+/// check, and starts a low-cost background watchdog (one pass per second) that
+/// detects a debugger attaching later and gross clock tampering (speed hacks),
+/// quietly terminating the process when tripped.
+///
+/// LIMITS — this is deliberately "simple defense". It stops casual Cheat-Engine
+/// debugger attachment and speed-gear tools, NOT a determined reverse engineer
+/// or a plain memory scanner that only reads/writes memory without attaching a
+/// debugger. Truly denying another process from reading your memory needs a
+/// kernel driver (Windows only, EV-signed) and is out of scope; on macOS/Linux
+/// that route is effectively unavailable. For values a scanner would target,
+/// wrap them in <see cref="Protected"/> so an edit is detected and rejected.
+/// </summary>
+class Guard {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "IsDebuggerPresent")]
+    static extern int WinIsDebuggerPresent();
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcess")]
+    static extern int WinGetCurrentProcess();
+    [DllImport("kernel32", EntryPoint = "CheckRemoteDebuggerPresent")]
+    static extern int WinCheckRemoteDebuggerPresent(int hProc, string pbOut);
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
+    static extern int WinQpc(string outCount);
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceFrequency")]
+    static extern int WinQpf(string outFreq);
+    [DllImport("kernel32", EntryPoint = "GetTickCount64")]
+    static extern int WinGetTickCount64();
+    [DllImport("kernel32", EntryPoint = "Sleep")]
+    static extern void WinSleep(int ms);
+    #else
+    // POSIX: PTRACE_TRACEME (Linux = 0) makes our parent the sole tracer; if a
+    // debugger is already attached the call fails. On macOS, PT_DENY_ATTACH
+    // (= 31) actively prevents any debugger from attaching afterwards.
+    [DllImport("crt", EntryPoint = "ptrace")]
+    static extern int PosixPtrace(int request, int pid, int addr, int data);
+    #endif
+
+    [DllImport("crt", EntryPoint = "exit")]
+    static extern void CrtExit(int code);
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern string GuardCalloc(int count, int size);
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void GuardFree(string ptr);
+
+    static bool armed;
+    static int strikes;
+    static int baseTick;   // GetTickCount64 baseline (wall ms)
+    static int baseQpc;    // QueryPerformanceCounter baseline (ticks)
+    static int qpcFreq;    // QueryPerformanceCounter frequency (ticks/sec)
+
+    // Reads a little-endian 64-bit value out of an 8-byte native buffer.
+    static int Le64(string b) {
+        int v = 0;
+        int mul = 1;
+        int k = 0;
+        while (k < 8) {
+            v = v + (b[k] & 255) * mul;
+            mul = mul * 256;
+            k = k + 1;
+        }
+        return v;
+    }
+
+    /// <summary>Quietly terminates the process; call on any detected tampering.</summary>
+    static void Trip() { Guard.CrtExit(3); }
+
+    /// <summary>
+    /// Arms the guard: one-shot anti-attach, timing baselines, and a background
+    /// watchdog. Safe to call once; extra calls are ignored.
+    /// </summary>
+    static void Arm() {
+        if (Guard.armed) { return; }
+        Guard.armed = true;
+        Guard.strikes = 0;
+
+        #if WINDOWS
+        string q = Guard.GuardCalloc(8, 1);
+        Guard.WinQpf(q);
+        Guard.qpcFreq = Guard.Le64(q);
+        Guard.WinQpc(q);
+        Guard.baseQpc = Guard.Le64(q);
+        Guard.GuardFree(q);
+        Guard.baseTick = Guard.WinGetTickCount64();
+        Guard.CheckOnce();
+        #elif MACOS
+        Guard.PosixPtrace(31, 0, 0, 0);   // PT_DENY_ATTACH
+        #else
+        if (Guard.PosixPtrace(0, 0, 0, 0) < 0) { Guard.Trip(); }   // PTRACE_TRACEME
+        #endif
+
+        Thread.Start(Guard.Watch);
+    }
+
+    // One cheap inline pass: detect an attached debugger. Games may also call
+    // this per frame for faster response; the watchdog calls it every second.
+    static void CheckOnce() {
+        if (!Guard.armed) { return; }
+        #if WINDOWS
+        if (Guard.WinIsDebuggerPresent() != 0) { Guard.Trip(); return; }
+        string b = Guard.GuardCalloc(4, 1);
+        Guard.WinCheckRemoteDebuggerPresent(Guard.WinGetCurrentProcess(), b);
+        int present = b[0] & 255;
+        Guard.GuardFree(b);
+        if (present != 0) { Guard.Trip(); return; }
+        #endif
+    }
+
+    /// <summary>
+    /// Public per-tick check. Cheap; optional. Detects debugger attachment.
+    /// </summary>
+    static void Check() { Guard.CheckOnce(); }
+
+    // Background watchdog: one pass per second (negligible CPU). Detects a
+    // debugger attaching after launch and gross speed-hack clock scaling.
+    static void Watch() {
+        #if WINDOWS
+        while (true) {
+            Guard.WinSleep(1000);
+            Guard.CheckOnce();
+            // Two independent clocks that a naive speed hack scales
+            // inconsistently: QueryPerformanceCounter vs GetTickCount64. Both
+            // measure real elapsed time since Arm(); a >50% divergence over the
+            // whole run is far outside scheduler jitter.
+            if (Guard.qpcFreq > 0) {
+                string q = Guard.GuardCalloc(8, 1);
+                Guard.WinQpc(q);
+                int nowQpc = Guard.Le64(q);
+                Guard.GuardFree(q);
+                int qpcMs = (nowQpc - Guard.baseQpc) / (Guard.qpcFreq / 1000);
+                int tickMs = Guard.WinGetTickCount64() - Guard.baseTick;
+                if (tickMs > 3000) {
+                    int diff = qpcMs - tickMs;
+                    if (diff < 0) { diff = 0 - diff; }
+                    if (diff > tickMs / 2) {
+                        Guard.strikes = Guard.strikes + 1;
+                        if (Guard.strikes >= 2) { Guard.Trip(); return; }
+                    } else {
+                        Guard.strikes = 0;
+                    }
+                }
+            }
+        }
+        #endif
+    }
+}
+
+/// <summary>
+/// A tamper-evident integer for values a memory scanner would target (score,
+/// coins, gold). The plaintext is never stored: it is kept XOR-masked alongside
+/// a redundant inverse copy, so a tool that finds and overwrites the number in
+/// memory breaks the invariant and <see cref="Get"/> trips the guard. Use it
+/// for the handful of values worth protecting, not for hot per-frame math.
+/// </summary>
+class Protected {
+    int mask;      // value ^ KEY
+    int chk;       // ~(value ^ KEY)
+
+    static int Key() { return 1719923209; }
+
+    /// <summary>Creates a protected value initialised to <paramref name="v"/>.</summary>
+    static Protected Of(int v) {
+        Protected p = new Protected();
+        p.Set(v);
+        return p;
+    }
+
+    /// <summary>Stores a new value, refreshing the integrity check.</summary>
+    void Set(int v) {
+        this.mask = v ^ Protected.Key();
+        this.chk = ~this.mask;
+    }
+
+    /// <summary>
+    /// Returns the stored value; trips the guard if the two copies disagree
+    /// (i.e. memory was edited externally).
+    /// </summary>
+    int Get() {
+        if ((this.mask ^ this.chk) != -1) { Guard.Trip(); }
+        return this.mask ^ Protected.Key();
+    }
+
+    /// <summary>Adds <paramref name="d"/> to the stored value.</summary>
+    void Add(int d) { this.Set(this.Get() + d); }
+}

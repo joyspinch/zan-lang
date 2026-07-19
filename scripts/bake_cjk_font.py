@@ -20,6 +20,7 @@ import sys
 from PIL import Image, ImageDraw, ImageFont
 
 FONT_CANDIDATES = [
+    os.environ.get("ZAN_CJK_FONT", ""),
     "C:/Windows/Fonts/msyhbd.ttc",
     "C:/Windows/Fonts/msyh.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",

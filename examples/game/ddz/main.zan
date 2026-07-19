@@ -1,0 +1,1259 @@
+// 斗地主 -- a lantern-lit village card table. Full 54-card game vs two local
+// AI farmers/landlord: bidding (1/2/3分), singles/pairs/triples with kickers,
+// straights, pair-straights, bombs and rockets, bomb multipliers, bean bank
+// with win-streak fire, and a landlord crown. Cards are drawn as crisp vector
+// cards with smooth TTF ranks (no pixel text); the table is a gpt-image-2
+// generated tavern scene. F11 borderless fullscreen, Esc back/exit.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Ddz;
+
+class DdzProfile {
+    int beans;
+    int wins;
+    int losses;
+    int streak;
+    int bestStreak;
+    bool loaded;
+
+    static string Path() { return "ddz_profile.txt"; }
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fb) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return DdzProfile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fb;
+    }
+    static DdzProfile Load() {
+        DdzProfile p = new DdzProfile();
+        p.beans = 200;
+        if (!File.Exists(DdzProfile.Path())) { return p; }
+        List<string> lines = File.ReadAllLines(DdzProfile.Path());
+        p.beans = DdzProfile.ReadKey(lines, "beans", 200);
+        p.wins = DdzProfile.ReadKey(lines, "wins", 0);
+        p.losses = DdzProfile.ReadKey(lines, "losses", 0);
+        p.streak = DdzProfile.ReadKey(lines, "streak", 0);
+        p.bestStreak = DdzProfile.ReadKey(lines, "bestStreak", 0);
+        return p;
+    }
+    void Save() {
+        string s = "beans=" + this.beans + "\nwins=" + this.wins
+            + "\nlosses=" + this.losses + "\nstreak=" + this.streak
+            + "\nbestStreak=" + this.bestStreak + "\n";
+        File.WriteAllText(DdzProfile.Path(), s);
+    }
+    string Title() {
+        if (this.beans >= 3000) { return "地主王"; }
+        if (this.beans >= 1500) { return "庄园主"; }
+        if (this.beans >= 800) { return "掌柜"; }
+        if (this.beans >= 400) { return "佃户"; }
+        return "长工";
+    }
+}
+
+class DdzPopup {
+    int x; int y; string text; int bornAt; int cr; int cg; int cb;
+}
+class DdzParticle {
+    int x; int y; int vx; int vy; int bornAt; int cr; int cg; int cb;
+}
+
+// combo types: 0 none, 1 single, 2 pair, 3 triple, 4 triple+1, 5 triple+2,
+// 6 straight, 7 pair straight, 8 bomb, 9 rocket
+class Combo {
+    int type;
+    int key;     // dominant value
+    int len;     // straight length / pair-straight pairs
+    List<int> cards;
+    static Combo None() { Combo c = new Combo(); c.type = 0; c.cards = new List<int>(); return c; }
+}
+
+class DdzGame {
+    Host host;
+    SdlRenderer r;
+    DdzProfile prof;
+    Rng rng;
+
+    // card encoding: value*4 + suit; value 3..15 (15=2), 16*4=small joker, 17*4=big joker
+    List<int> hand0;      // player (bottom)
+    List<int> hand1;      // right AI
+    List<int> hand2;      // left AI
+    List<int> bottom;     // 3 landlord cards
+    bool[] sel;           // selection flags parallel to hand0
+    int scene;            // 0 menu, 1 bidding, 2 play, 3 over
+    int landlord;         // 0/1/2
+    int bid;              // 1..3
+    int bidTurn;
+    int bidBest;
+    int bidBestWho;
+    int bidCount;
+    int turn;             // whose move
+    int lastWho;          // who owns the current table combo (-1 free lead)
+    Combo table;          // combo to beat
+    Combo shown0; Combo shown1; Combo shown2;   // last played per seat (for display)
+    bool passed1; bool passed2; bool passed0;
+    int mult;             // bombs double
+    int winner;           // 1 you win beans, 2 you lose
+    int deltaBeans;
+    int aiActAt;
+    int mouseX;
+    int mouseY;
+    int toastAt;
+    string toastText;
+    List<DdzPopup> pops;
+    List<DdzParticle> parts;
+    SdlTexture menuBg;
+    SdlTexture titleTex;
+    SdlTexture tableBg;
+    SdlTexture cardBack;
+    SdlTexture avatarL;
+    SdlTexture avatarR;
+    SdlTexture avatarMe;
+    SdlTexture cardFace;
+    SdlTexture pipSpade;
+    SdlTexture pipHeart;
+    SdlTexture pipDiamond;
+    SdlTexture pipClub;
+    SdlTexture jokerSmall;
+    SdlTexture jokerBig;
+    bool texTried;
+    bool demo;
+    int demoAt;
+    int diff;             // 0 easy, 1 normal, 2 hard
+    int deadline;         // player turn countdown (ms timestamp)
+
+    static DdzGame Create(Host h) {
+        DdzGame g = new DdzGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = DdzProfile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 97531246);
+        g.scene = 0;
+        g.mouseX = 640;
+        g.mouseY = 360;
+        g.pops = new List<DdzPopup>();
+        g.parts = new List<DdzParticle>();
+        g.toastAt = -9999;
+        g.table = Combo.None();
+        g.diff = 1;
+        g.demo = File.Exists("ddz_demo.txt");
+        if (g.demo) { g.StartRound(Sdl.Ticks()); }
+        return g;
+    }
+
+    void EnsureTex() {
+        if (this.texTried) { return; }
+        this.texTried = true;
+        this.menuBg = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/menu_bg.png");
+        this.titleTex = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/title.png");
+        this.tableBg = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/table_bg.png");
+        this.cardBack = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/card_back.png");
+        this.avatarL = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/avatar_left.png");
+        this.avatarR = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/avatar_right.png");
+        this.avatarMe = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/avatar_me.png");
+        this.cardFace = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/card_face.png");
+        this.pipSpade = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/pip_spade.png");
+        this.pipHeart = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/pip_heart.png");
+        this.pipDiamond = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/pip_diamond.png");
+        this.pipClub = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/pip_club.png");
+        this.jokerSmall = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/joker_small.png");
+        this.jokerBig = DdzGame.LoadTex(this.r, "examples/game/ddz/assets/joker_big.png");
+    }
+    static SdlTexture LoadTex(SdlRenderer r, string path) {
+        string p = Assets.Find(path);
+        if (!File.Exists(p)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, p);
+        if (t == null || !t.IsValid()) { return null; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        return t;
+    }
+
+    void Toast(string t, int now) { this.toastText = t; this.toastAt = now; }
+    void AddPop(int px, int py, string t, int now, int cr, int cg, int cb) {
+        if (this.pops.Count > 12) { this.pops.RemoveAt(0); }
+        DdzPopup p = new DdzPopup();
+        p.x = px; p.y = py; p.text = t; p.bornAt = now;
+        p.cr = cr; p.cg = cg; p.cb = cb;
+        this.pops.Add(p);
+    }
+    void Burst(int px, int py, int n, int now, int cr, int cg, int cb) {
+        if (this.parts.Count > 200) { return; }
+        int i = 0;
+        while (i < n) {
+            DdzParticle p = new DdzParticle();
+            p.x = px * 256; p.y = py * 256;
+            int a = this.rng.Range(0, 16);
+            int spd = 60 + this.rng.Range(0, 170);
+            int ux = 0; int uy = 0;
+            int q = a % 4;
+            if (q == 0) { ux = 256; uy = (a / 4 - 2) * 128; }
+            if (q == 1) { ux = -256; uy = (a / 4 - 2) * 128; }
+            if (q == 2) { uy = 256; ux = (a / 4 - 2) * 128; }
+            if (q == 3) { uy = -256; ux = (a / 4 - 2) * 128; }
+            p.vx = ux * spd / 256;
+            p.vy = uy * spd / 256;
+            p.bornAt = now;
+            p.cr = cr; p.cg = cg; p.cb = cb;
+            this.parts.Add(p);
+            i = i + 1;
+        }
+    }
+
+    // ----- deal ------------------------------------------------------------
+
+    static int Val(int card) { return card / 4; }
+
+    void SortHand(List<int> h) {
+        int i = 1;
+        while (i < h.Count) {
+            int c = h[i];
+            int j = i - 1;
+            while (j >= 0 && h[j] > c) { h[j + 1] = h[j]; j = j - 1; }
+            h[j + 1] = c;
+            i = i + 1;
+        }
+    }
+
+    void StartRound(int now) {
+        List<int> deck = new List<int>();
+        int v = 3;
+        while (v <= 15) {
+            int s = 0;
+            while (s < 4) { deck.Add(v * 4 + s); s = s + 1; }
+            v = v + 1;
+        }
+        deck.Add(64);   // small joker (16*4)
+        deck.Add(68);   // big joker (17*4)
+        int i = deck.Count - 1;
+        while (i > 0) {
+            int j = this.rng.Range(0, i + 1);
+            int t = deck[i]; deck[i] = deck[j]; deck[j] = t;
+            i = i - 1;
+        }
+        this.hand0 = new List<int>();
+        this.hand1 = new List<int>();
+        this.hand2 = new List<int>();
+        this.bottom = new List<int>();
+        i = 0;
+        while (i < 51) {
+            if (i % 3 == 0) { this.hand0.Add(deck[i]); }
+            if (i % 3 == 1) { this.hand1.Add(deck[i]); }
+            if (i % 3 == 2) { this.hand2.Add(deck[i]); }
+            i = i + 1;
+        }
+        this.bottom.Add(deck[51]); this.bottom.Add(deck[52]); this.bottom.Add(deck[53]);
+        this.SortHand(this.hand0);
+        this.SortHand(this.hand1);
+        this.SortHand(this.hand2);
+        this.sel = new bool[20];
+        this.scene = 1;
+        this.bid = 0;
+        this.bidBest = 0;
+        this.bidBestWho = -1;
+        this.bidCount = 0;
+        this.bidTurn = this.rng.Range(0, 3);
+        this.mult = 1;
+        this.winner = 0;
+        this.table = Combo.None();
+        this.shown0 = Combo.None(); this.shown1 = Combo.None(); this.shown2 = Combo.None();
+        this.lastWho = -1;
+        this.pops = new List<DdzPopup>();
+        this.parts = new List<DdzParticle>();
+        this.Toast("叫分开始，谁是地主？", now);
+        this.aiActAt = now + 700;
+        if (this.demo) { this.demoAt = now + 400; }
+    }
+
+    // ----- bidding ---------------------------------------------------------
+
+    int HandStrength(List<int> h) {
+        int s = 0;
+        int i = 0;
+        int[] cnt = new int[18];
+        while (i < h.Count) {
+            int v = DdzGame.Val(h[i]);
+            cnt[v] = cnt[v] + 1;
+            if (v == 15) { s = s + 6; }
+            if (v == 14) { s = s + 3; }
+            if (v == 16) { s = s + 8; }
+            if (v == 17) { s = s + 10; }
+            i = i + 1;
+        }
+        int v2 = 3;
+        while (v2 <= 15) {
+            if (cnt[v2] == 4) { s = s + 14; }
+            if (cnt[v2] == 3) { s = s + 4; }
+            v2 = v2 + 1;
+        }
+        if (cnt[16] > 0 && cnt[17] > 0) { s = s + 10; }
+        return s;
+    }
+
+    void AiBid(int now) {
+        List<int> h = this.hand1;
+        if (this.bidTurn == 2) { h = this.hand2; }
+        int s = this.HandStrength(h);
+        int want = 0;
+        if (s >= 34) { want = 3; }
+        else if (s >= 26) { want = 2; }
+        else if (s >= 18) { want = 1; }
+        if (want <= this.bidBest) { want = 0; }
+        this.ApplyBid(this.bidTurn, want, now);
+    }
+
+    void ApplyBid(int who, int score, int now) {
+        string name = "你";
+        if (who == 1) { name = "右家"; }
+        if (who == 2) { name = "左家"; }
+        if (score > 0) {
+            this.Toast(name + " 叫 " + score + " 分", now);
+            this.bidBest = score;
+            this.bidBestWho = who;
+        } else {
+            this.Toast(name + " 不叫", now);
+        }
+        this.bidCount = this.bidCount + 1;
+        if (this.bidBest == 3 || this.bidCount >= 3) {
+            if (this.bidBestWho < 0) {
+                this.Toast("无人叫地主，重新发牌", now);
+                this.StartRound(now);
+                return;
+            }
+            this.BecomeLandlord(this.bidBestWho, now);
+            return;
+        }
+        this.bidTurn = (this.bidTurn + 1) % 3;
+        this.aiActAt = now + 700;
+    }
+
+    void BecomeLandlord(int who, int now) {
+        this.landlord = who;
+        this.bid = this.bidBest;
+        List<int> h = this.hand0;
+        if (who == 1) { h = this.hand1; }
+        if (who == 2) { h = this.hand2; }
+        int i = 0;
+        while (i < 3) { h.Add(this.bottom[i]); i = i + 1; }
+        this.SortHand(h);
+        this.scene = 2;
+        this.turn = who;
+        this.deadline = now + 25000;
+        this.lastWho = -1;
+        this.table = Combo.None();
+        string name = "你";
+        if (who == 1) { name = "右家"; }
+        if (who == 2) { name = "左家"; }
+        this.Toast(name + " 成为地主，亮底牌！", now);
+        this.aiActAt = now + 900;
+        if (this.demo) { this.demoAt = now + 600; }
+    }
+
+    // ----- combo classification ---------------------------------------------
+
+    static Combo Classify(List<int> cards) {
+        Combo no = Combo.None();
+        int n = cards.Count;
+        if (n == 0) { return no; }
+        int[] cnt = new int[18];
+        int i = 0;
+        while (i < n) { int v = DdzGame.Val(cards[i]); cnt[v] = cnt[v] + 1; i = i + 1; }
+        Combo c = new Combo();
+        c.cards = cards;
+        if (n == 1) { c.type = 1; c.key = DdzGame.Val(cards[0]); return c; }
+        if (n == 2) {
+            if (cnt[16] == 1 && cnt[17] == 1) { c.type = 9; c.key = 17; return c; }
+            if (cnt[DdzGame.Val(cards[0])] == 2) { c.type = 2; c.key = DdzGame.Val(cards[0]); return c; }
+            return no;
+        }
+        // count distribution
+        int trip = -1; int quad = -1; int pairV = -1; int single = -1;
+        int distinct = 0;
+        int v2 = 3;
+        while (v2 <= 17) {
+            if (cnt[v2] > 0) { distinct = distinct + 1; }
+            if (cnt[v2] == 4) { quad = v2; }
+            if (cnt[v2] == 3) { trip = v2; }
+            if (cnt[v2] == 2) { pairV = v2; }
+            if (cnt[v2] == 1) { single = v2; }
+            v2 = v2 + 1;
+        }
+        if (n == 3) { if (trip >= 0) { c.type = 3; c.key = trip; return c; } return no; }
+        if (n == 4) {
+            if (quad >= 0) { c.type = 8; c.key = quad; return c; }
+            if (trip >= 0) { c.type = 4; c.key = trip; return c; }
+            return no;
+        }
+        if (n == 5 && trip >= 0 && pairV >= 0) { c.type = 5; c.key = trip; return c; }
+        // straight: n>=5 all distinct consecutive, top <= A
+        if (n >= 5 && distinct == n) {
+            int lo = 0; int hi = 0;
+            v2 = 3;
+            while (v2 <= 14) {
+                if (cnt[v2] > 0) { if (lo == 0) { lo = v2; } hi = v2; }
+                if (cnt[v2] > 1 || (v2 > 14 && cnt[v2] > 0)) { return no; }
+                v2 = v2 + 1;
+            }
+            if (cnt[15] > 0 || cnt[16] > 0 || cnt[17] > 0) { return no; }
+            if (hi - lo + 1 == n) { c.type = 6; c.key = hi; c.len = n; return c; }
+            return no;
+        }
+        // pair straight: n even >=6, all pairs consecutive, top <= A
+        if (n >= 6 && n % 2 == 0) {
+            int lo = 0; int hi = 0; bool ok = true;
+            v2 = 3;
+            while (v2 <= 17) {
+                if (cnt[v2] > 0) {
+                    if (cnt[v2] != 2 || v2 > 14) { ok = false; }
+                    if (lo == 0) { lo = v2; }
+                    hi = v2;
+                }
+                v2 = v2 + 1;
+            }
+            if (ok && (hi - lo + 1) * 2 == n) { c.type = 7; c.key = hi; c.len = n / 2; return c; }
+        }
+        return no;
+    }
+
+    static bool Beats(Combo a, Combo b) {
+        // does a beat table combo b?
+        if (a.type == 0) { return false; }
+        if (b.type == 0) { return true; }
+        if (a.type == 9) { return true; }
+        if (b.type == 9) { return false; }
+        if (a.type == 8 && b.type != 8) { return true; }
+        if (b.type == 8 && a.type != 8) { return false; }
+        if (a.type != b.type) { return false; }
+        if ((a.type == 6 || a.type == 7) && a.len != b.len) { return false; }
+        return a.key > b.key;
+    }
+
+    // ----- AI move search ---------------------------------------------------
+
+    // builds candidate combos from hand h that beat 'tbl' (or any lead if tbl.type==0)
+    List<Combo> Candidates(List<int> h, Combo tbl) {
+        List<Combo> res = new List<Combo>();
+        int[] cnt = new int[18];
+        int i = 0;
+        while (i < h.Count) { cnt[DdzGame.Val(h[i])] = cnt[DdzGame.Val(h[i])] + 1; i = i + 1; }
+        // helper: collect k cards of value v
+        int v = 3;
+        while (v <= 17) {
+            if (cnt[v] >= 1) { this.AddCand(res, h, v, 1, tbl); }
+            if (cnt[v] >= 2) { this.AddCand(res, h, v, 2, tbl); }
+            if (cnt[v] >= 3) { this.AddCand(res, h, v, 3, tbl); this.AddTripKick(res, h, v, cnt, tbl); }
+            if (cnt[v] >= 4) { this.AddCand(res, h, v, 4, tbl); }
+            v = v + 1;
+        }
+        // rocket
+        if (cnt[16] > 0 && cnt[17] > 0) {
+            List<int> cs = new List<int>();
+            cs.Add(64); cs.Add(68);
+            Combo c = DdzGame.Classify(cs);
+            if (DdzGame.Beats(c, tbl)) { res.Add(c); }
+        }
+        // straights
+        int len = 5;
+        while (len <= 12) {
+            int lo = 3;
+            while (lo + len - 1 <= 14) {
+                bool ok = true;
+                int k = 0;
+                while (k < len) { if (cnt[lo + k] < 1) { ok = false; k = len; } k = k + 1; }
+                if (ok) {
+                    List<int> cs = new List<int>();
+                    k = 0;
+                    while (k < len) { cs.Add(this.PickCard(h, lo + k, cs)); k = k + 1; }
+                    Combo c = DdzGame.Classify(cs);
+                    if (c.type == 6 && DdzGame.Beats(c, tbl)) { res.Add(c); }
+                }
+                lo = lo + 1;
+            }
+            len = len + 1;
+        }
+        // pair straights
+        len = 3;
+        while (len <= 8) {
+            int lo = 3;
+            while (lo + len - 1 <= 14) {
+                bool ok = true;
+                int k = 0;
+                while (k < len) { if (cnt[lo + k] < 2) { ok = false; k = len; } k = k + 1; }
+                if (ok) {
+                    List<int> cs = new List<int>();
+                    k = 0;
+                    while (k < len) {
+                        cs.Add(this.PickCard(h, lo + k, cs));
+                        cs.Add(this.PickCard(h, lo + k, cs));
+                        k = k + 1;
+                    }
+                    Combo c = DdzGame.Classify(cs);
+                    if (c.type == 7 && DdzGame.Beats(c, tbl)) { res.Add(c); }
+                }
+                lo = lo + 1;
+            }
+            len = len + 1;
+        }
+        return res;
+    }
+
+    int PickCard(List<int> h, int v, List<int> used) {
+        int i = 0;
+        while (i < h.Count) {
+            int card = h[i];
+            if (DdzGame.Val(card) == v) {
+                bool taken = false;
+                int j = 0;
+                while (j < used.Count) { if (used[j] == card) { taken = true; j = used.Count; } j = j + 1; }
+                if (!taken) { return card; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void AddCand(List<Combo> res, List<int> h, int v, int k, Combo tbl) {
+        List<int> cs = new List<int>();
+        int i = 0;
+        while (i < k) { cs.Add(this.PickCard(h, v, cs)); i = i + 1; }
+        Combo c = DdzGame.Classify(cs);
+        if (c.type != 0 && DdzGame.Beats(c, tbl)) { res.Add(c); }
+    }
+
+    void AddTripKick(List<Combo> res, List<int> h, int v, int[] cnt, Combo tbl) {
+        // triple + smallest single / smallest pair
+        int kick = 3;
+        while (kick <= 17) {
+            if (kick != v && cnt[kick] >= 1) {
+                List<int> cs = new List<int>();
+                int i = 0;
+                while (i < 3) { cs.Add(this.PickCard(h, v, cs)); i = i + 1; }
+                cs.Add(this.PickCard(h, kick, cs));
+                Combo c = DdzGame.Classify(cs);
+                if (c.type == 4 && DdzGame.Beats(c, tbl)) { res.Add(c); kick = 18; }
+            }
+            kick = kick + 1;
+        }
+        kick = 3;
+        while (kick <= 15) {
+            if (kick != v && cnt[kick] >= 2) {
+                List<int> cs = new List<int>();
+                int i = 0;
+                while (i < 3) { cs.Add(this.PickCard(h, v, cs)); i = i + 1; }
+                cs.Add(this.PickCard(h, kick, cs));
+                cs.Add(this.PickCard(h, kick, cs));
+                Combo c = DdzGame.Classify(cs);
+                if (c.type == 5 && DdzGame.Beats(c, tbl)) { res.Add(c); kick = 18; }
+            }
+            kick = kick + 1;
+        }
+    }
+
+    Combo AiChoose(int who, int now) {
+        List<int> h = this.hand1;
+        if (who == 2) { h = this.hand2; }
+        bool leading = this.lastWho < 0 || this.lastWho == who;
+        Combo tbl = this.table;
+        if (leading) { tbl = Combo.None(); }
+        List<Combo> cands = this.Candidates(h, tbl);
+        if (cands.Count == 0) { return Combo.None(); }
+        // easy AI: plays timidly and passes often
+        if (this.diff == 0) {
+            if (!leading && this.rng.Range(0, 10) < 4) { return Combo.None(); }
+            Combo pick = null;
+            int ws = 1000000;
+            int wi = 0;
+            while (wi < cands.Count) {
+                Combo c = cands[wi];
+                int s = c.key * 10 + c.cards.Count;
+                if (c.type >= 8) { s = s + 5000; }
+                if (s < ws) { ws = s; pick = c; }
+                wi = wi + 1;
+            }
+            if (!leading && pick != null && pick.type >= 8 && this.rng.Range(0, 10) < 8) { return Combo.None(); }
+            return pick;
+        }
+        // don't beat your own partner's winning-looking play unless landlord differs
+        if (!leading && this.lastWho != who) {
+            bool partner = (who != this.landlord) && (this.lastWho != this.landlord) && (this.lastWho != 0 || this.landlord == 0);
+            bool lastIsPartner = (who != this.landlord) && (this.lastWho != this.landlord);
+            if (lastIsPartner && this.table.key >= 12 && this.table.type <= 2) { return Combo.None(); }
+        }
+        // choose the cheapest useful combo; avoid bombs unless needed or hand small
+        Combo best = null;
+        int bestScore = -1000000;
+        int i = 0;
+        while (i < cands.Count) {
+            Combo c = cands[i];
+            int s = 0;
+            s = s - c.key * 6;
+            s = s + c.cards.Count * 30;                 // shed more cards
+            if (c.type == 8) { s = s - 400; }           // hold bombs
+            if (c.type == 9) { s = s - 600; }
+            if (c.key >= 15) { s = s - 90; }            // hold 2s / jokers
+            if (h.Count <= 6) { s = s + c.cards.Count * 60; }
+            if (this.diff == 2) {
+                // hard AI: sheds long combos early, endgame aggression
+                s = s + c.cards.Count * 25;
+                if (h.Count <= 9) { s = s + c.cards.Count * 50; }
+            }
+            if (s > bestScore) { bestScore = s; best = c; }
+            i = i + 1;
+        }
+        // reluctance to bomb over small stuff
+        if (!leading && best != null && (best.type == 8 || best.type == 9)) {
+            List<int> other = this.hand0;
+            int oppMin = this.hand0.Count;
+            if (this.landlord != 0) {
+                // as farmer, bomb mostly to stop the landlord
+                int hold = 8;
+                if (this.diff == 2) { hold = 5; }
+                if (this.lastWho != this.landlord && this.rng.Range(0, 10) < hold) { return Combo.None(); }
+            }
+            if (this.diff == 2 && this.landlord == 0 && this.hand0.Count <= 5) {
+                // hard AI bombs to stop a landlord about to go out
+            } else if (this.diff == 2 && !leading && this.table.cards.Count < 2 && this.table.key < 14) {
+                return Combo.None();
+            }
+        }
+        return best;
+    }
+
+    // ----- applying plays ---------------------------------------------------
+
+    void RemoveCards(List<int> h, List<int> cs) {
+        int i = 0;
+        while (i < cs.Count) {
+            int j = 0;
+            while (j < h.Count) {
+                if (h[j] == cs[i]) { h.RemoveAt(j); j = h.Count; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    void PlayCombo(int who, Combo c, int now) {
+        List<int> h = this.hand0;
+        if (who == 1) { h = this.hand1; }
+        if (who == 2) { h = this.hand2; }
+        this.RemoveCards(h, c.cards);
+        this.table = c;
+        this.lastWho = who;
+        if (who == 0) { this.shown0 = c; this.sel = new bool[20]; }
+        if (who == 1) { this.shown1 = c; }
+        if (who == 2) { this.shown2 = c; }
+        if (c.type == 8) {
+            this.mult = this.mult * 2;
+            this.Toast("炸弹！倍数 x" + this.mult, now);
+            this.Burst(640, 330, 46, now, 255, 150, 60);
+        }
+        if (c.type == 9) {
+            this.mult = this.mult * 2;
+            this.Toast("王炸！！倍数 x" + this.mult, now);
+            this.Burst(640, 330, 60, now, 255, 90, 90);
+        }
+        if (h.Count == 2) {
+            string name = "你只剩";
+            if (who == 1) { name = "右家只剩"; }
+            if (who == 2) { name = "左家只剩"; }
+            this.Toast(name + " 2 张牌！", now);
+        }
+        if (h.Count == 1) {
+            string name = "你只剩";
+            if (who == 1) { name = "右家只剩"; }
+            if (who == 2) { name = "左家只剩"; }
+            this.Toast(name + " 1 张牌！！", now);
+        }
+        if (h.Count == 0) { this.Finish(who, now); return; }
+        this.NextTurn(now);
+    }
+
+    void PassTurn(int who, int now) {
+        if (who == 0) { this.shown0 = Combo.None(); }
+        if (who == 1) { this.shown1 = Combo.None(); }
+        if (who == 2) { this.shown2 = Combo.None(); }
+        this.NextTurn(now);
+    }
+
+    void NextTurn(int now) {
+        this.turn = (this.turn + 1) % 3;
+        if (this.turn == this.lastWho) {
+            // everyone passed; the owner leads again
+            this.table = Combo.None();
+        }
+        this.aiActAt = now + 650 + this.rng.Range(0, 500);
+        this.deadline = now + 25000;
+        if (this.demo) { this.demoAt = now + 420; }
+    }
+
+    void Finish(int who, int now) {
+        bool youWin = false;
+        if (this.landlord == 0) { youWin = (who == 0); }
+        else { youWin = (who != this.landlord); }
+        int pot = this.bid * 10 * this.mult;
+        if (this.landlord == 0) { pot = pot * 2; }   // landlord stakes double
+        this.deltaBeans = pot;
+        if (youWin) {
+            this.prof.beans = this.prof.beans + pot;
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.bestStreak) { this.prof.bestStreak = this.prof.streak; }
+            this.winner = 1;
+            this.Burst(640, 300, 70, now, 255, 210, 100);
+        } else {
+            this.prof.beans = this.prof.beans - pot;
+            if (this.prof.beans < 0) { this.prof.beans = 0; }
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            this.winner = 2;
+        }
+        this.prof.Save();
+        this.scene = 3;
+    }
+
+    // ----- player input ------------------------------------------------------
+
+    List<int> Selected() {
+        List<int> cs = new List<int>();
+        int i = 0;
+        while (i < this.hand0.Count) {
+            if (this.sel[i]) { cs.Add(this.hand0[i]); }
+            i = i + 1;
+        }
+        return cs;
+    }
+
+    void TryPlaySelected(int now) {
+        if (this.turn != 0 || this.scene != 2) { return; }
+        List<int> cs = this.Selected();
+        if (cs.Count == 0) { this.Toast("先选牌再出", now); return; }
+        Combo c = DdzGame.Classify(cs);
+        if (c.type == 0) { this.Toast("不是合法牌型", now); return; }
+        bool leading = this.lastWho < 0 || this.lastWho == 0;
+        if (!leading && !DdzGame.Beats(c, this.table)) { this.Toast("压不过上家", now); return; }
+        this.PlayCombo(0, c, now);
+    }
+
+    void TryPass(int now) {
+        if (this.turn != 0 || this.scene != 2) { return; }
+        bool leading = this.lastWho < 0 || this.lastWho == 0;
+        if (leading) { this.Toast("你先出，不能不出", now); return; }
+        this.sel = new bool[20];
+        this.PassTurn(0, now);
+    }
+
+    bool AnySelected() {
+        int i = 0;
+        while (i < this.hand0.Count) {
+            if (this.sel[i]) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void ClearSelection(int now) {
+        if (this.turn != 0 || this.scene != 2) { return; }
+        if (!this.AnySelected()) { this.Toast("没有选中的牌", now); return; }
+        this.sel = new bool[20];
+    }
+
+    // hand fan geometry: returns x of card i
+    int HandX(int i, int count) {
+        int cw = 96;
+        int gap = 52;
+        if (count > 14) { gap = 46; }
+        int total = (count - 1) * gap + cw;
+        return 640 - total / 2 + i * gap;
+    }
+
+    void OnDown(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            if (Draw.PointIn(cx, cy, 430, 330, 420, 84)) { this.StartRound(now); }
+            if (Draw.PointIn(cx, cy, 430, 452, 130, 54)) { this.diff = 0; }
+            if (Draw.PointIn(cx, cy, 575, 452, 130, 54)) { this.diff = 1; }
+            if (Draw.PointIn(cx, cy, 720, 452, 130, 54)) { this.diff = 2; }
+            return;
+        }
+        if (this.scene == 3) {
+            if (Draw.PointIn(cx, cy, 420, 430, 210, 60)) { this.StartRound(now); return; }
+            if (Draw.PointIn(cx, cy, 650, 430, 210, 60)) { this.scene = 0; return; }
+            return;
+        }
+        if (this.scene == 1) {
+            if (this.bidTurn == 0) {
+                if (Draw.PointIn(cx, cy, 380, 600, 116, 56)) { this.ApplyBid(0, 0, now); return; }
+                if (Draw.PointIn(cx, cy, 512, 600, 116, 56) && this.bidBest < 1) { this.ApplyBid(0, 1, now); return; }
+                if (Draw.PointIn(cx, cy, 644, 600, 116, 56) && this.bidBest < 2) { this.ApplyBid(0, 2, now); return; }
+                if (Draw.PointIn(cx, cy, 776, 600, 116, 56)) { this.ApplyBid(0, 3, now); return; }
+            }
+            return;
+        }
+        // scene 2
+        if (this.turn == 0) {
+            if (Draw.PointIn(cx, cy, 425, 508, 130, 54)) { this.TryPlaySelected(now); return; }
+            if (Draw.PointIn(cx, cy, 575, 508, 130, 54)) { this.TryPass(now); return; }
+            if (Draw.PointIn(cx, cy, 725, 508, 130, 54)) { this.ClearSelection(now); return; }
+        }
+        // card picking (topmost card wins: scan from right)
+        int n = this.hand0.Count;
+        int i = n - 1;
+        while (i >= 0) {
+            int x = this.HandX(i, n);
+            int y = 578;
+            if (this.sel[i]) { y = y - 36; }
+            int w = 96;
+            if (i < n - 1) { w = this.HandX(i + 1, n) - x; }
+            if (Draw.PointIn(cx, cy, x, y, w, 130)) {
+                this.sel[i] = !this.sel[i];
+                return;
+            }
+            i = i - 1;
+        }
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } return; }
+        if (sc == 40 && this.scene == 2) { this.TryPlaySelected(now); }
+        if (sc == 44 && this.scene == 2) { this.TryPass(now); }
+        if (sc == 6 && this.scene == 2) { this.ClearSelection(now); }
+        if (this.scene == 3 && sc == 40) { this.StartRound(now); }
+    }
+
+    void Tick(int now) {
+        if (this.scene == 1 && this.bidTurn != 0 && now >= this.aiActAt) {
+            this.AiBid(now);
+            return;
+        }
+        if (this.scene == 1 && this.bidTurn == 0 && this.demo && now >= this.demoAt) {
+            int want = 0;
+            int s = this.HandStrength(this.hand0);
+            if (s >= 18) { want = 3; }
+            this.ApplyBid(0, want, now);
+            return;
+        }
+        if (this.scene == 2 && this.turn != 0 && now >= this.aiActAt) {
+            Combo c = this.AiChoose(this.turn, now);
+            bool leading = this.lastWho < 0 || this.lastWho == this.turn;
+            if (c == null || c.type == 0) {
+                if (leading) {
+                    // must play something: smallest single
+                    List<int> h = this.hand1;
+                    if (this.turn == 2) { h = this.hand2; }
+                    List<int> cs = new List<int>();
+                    cs.Add(h[0]);
+                    this.PlayCombo(this.turn, DdzGame.Classify(cs), now);
+                } else {
+                    string name = "右家";
+                    if (this.turn == 2) { name = "左家"; }
+                    this.Toast(name + " 不出", now);
+                    this.PassTurn(this.turn, now);
+                }
+            } else {
+                this.PlayCombo(this.turn, c, now);
+            }
+            return;
+        }
+        if (this.scene == 2 && this.turn == 0 && !this.demo && now >= this.deadline) {
+            // countdown expired: auto-play smallest single when leading, else pass
+            bool leading = this.lastWho < 0 || this.lastWho == 0;
+            this.sel = new bool[20];
+            if (leading) {
+                List<int> cs = new List<int>();
+                cs.Add(this.hand0[0]);
+                this.Toast("超时，自动出最小单张", now);
+                this.PlayCombo(0, DdzGame.Classify(cs), now);
+            } else {
+                this.Toast("超时，自动不出", now);
+                this.PassTurn(0, now);
+            }
+            return;
+        }
+        if (this.scene == 2 && this.turn == 0 && this.demo && now >= this.demoAt) {
+            bool leading = this.lastWho < 0 || this.lastWho == 0;
+            Combo tbl = this.table;
+            if (leading) { tbl = Combo.None(); }
+            List<Combo> cands = this.Candidates(this.hand0, tbl);
+            if (cands.Count == 0) {
+                if (leading) { return; }
+                this.PassTurn(0, now);
+            } else {
+                Combo best = cands[0];
+                int bs = -1000000;
+                int i = 0;
+                while (i < cands.Count) {
+                    Combo c = cands[i];
+                    int s = 0 - c.key * 6 + c.cards.Count * 30;
+                    if (c.type >= 8) { s = s - 500; }
+                    if (s > bs) { bs = s; best = c; }
+                    i = i + 1;
+                }
+                this.PlayCombo(0, best, now);
+            }
+        }
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    static string RankName(int v) {
+        if (v == 11) { return "J"; }
+        if (v == 12) { return "Q"; }
+        if (v == 13) { return "K"; }
+        if (v == 14) { return "A"; }
+        if (v == 15) { return "2"; }
+        if (v == 16) { return "王"; }
+        if (v == 17) { return "王"; }
+        return "" + v;
+    }
+
+    SdlTexture PipTex(int suit) {
+        if (suit == 0) { return this.pipSpade; }
+        if (suit == 1) { return this.pipHeart; }
+        if (suit == 2) { return this.pipDiamond; }
+        return this.pipClub;
+    }
+
+    void DrawCard(int x, int y, int card, bool raised) {
+        int v = DdzGame.Val(card);
+        int suit = card % 4;
+        Draw.RoundRectFill(this.r, x + 3, y + 5, 96, 130, 10, 20, 12, 8, 110);
+        if (this.cardFace != null) {
+            this.r.DrawTexture(this.cardFace, x, y, 96, 130);
+        } else {
+            Draw.RoundRectFill(this.r, x, y, 96, 130, 10, 250, 246, 238, 255);
+            Draw.RingRect(this.r, x, y, 96, 130, 2, 205, 194, 176, 255);
+        }
+        if (raised) { Draw.RingRect(this.r, x, y, 96, 130, 2, 255, 190, 80, 255); }
+        int cr = 40; int cg = 40; int cb = 48;
+        if (v == 16) { cr = 90; cg = 90; cb = 110; }
+        else if (v == 17) { cr = 200; cg = 60; cb = 44; }
+        else if (suit == 1 || suit == 2) { cr = 200; cg = 60; cb = 44; }
+        if (v >= 16) {
+            SdlTexture jk = this.jokerSmall;
+            if (v == 17) { jk = this.jokerBig; }
+            Text.Draw(this.r, "王", x + 10, y + 8, 3, cr, cg, cb, 255);
+            if (v == 16) { Text.Draw(this.r, "小", x + 12, y + 52, 2, 90, 90, 110, 255); }
+            if (v == 17) { Text.Draw(this.r, "大", x + 12, y + 52, 2, 200, 60, 44, 255); }
+            if (jk != null) { this.r.DrawTexture(jk, x + 36, y + 32, 54, 86); }
+            return;
+        }
+        Text.Draw(this.r, DdzGame.RankName(v), x + 10, y + 8, 3, cr, cg, cb, 255);
+        SdlTexture pip = this.PipTex(suit);
+        if (pip != null) {
+            this.r.DrawTexture(pip, x + 12, y + 46, 22, 22);
+            this.r.DrawTexture(pip, x + 40, y + 70, 46, 46);
+            return;
+        }
+        // vector fallback pip
+        int px = x + 22; int py = y + 66;
+        if (suit == 0) {
+            Draw.FillCircle(this.r, px - 5, py, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px + 5, py, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px, py - 7, 7, cr, cg, cb, 255);
+            this.r.SetColor(cr, cg, cb, 255);
+            this.r.FillRect(px - 2, py, 4, 12);
+        } else if (suit == 1) {
+            Draw.FillCircle(this.r, px - 5, py - 3, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px + 5, py - 3, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px, py + 6, 7, cr, cg, cb, 255);
+        } else if (suit == 2) {
+            Draw.FillCircle(this.r, px, py - 7, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px - 6, py + 2, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px + 6, py + 2, 6, cr, cg, cb, 255);
+            this.r.SetColor(cr, cg, cb, 255);
+            this.r.FillRect(px - 2, py + 2, 4, 10);
+        } else {
+            Draw.FillCircle(this.r, px, py - 5, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px, py + 5, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px - 5, py, 6, cr, cg, cb, 255);
+            Draw.FillCircle(this.r, px + 5, py, 6, cr, cg, cb, 255);
+        }
+    }
+
+    void DrawCardBack(int x, int y) {
+        Draw.RoundRectFill(this.r, x + 2, y + 4, 76, 104, 9, 20, 12, 8, 110);
+        if (this.cardBack != null) {
+            this.r.DrawTexture(this.cardBack, x, y, 76, 104);
+            return;
+        }
+        Draw.RoundRectFill(this.r, x, y, 76, 104, 9, 70, 40, 100, 255);
+        Draw.RingRect(this.r, x, y, 76, 104, 2, 140, 100, 190, 255);
+        Draw.FillCircle(this.r, x + 38, y + 52, 22, 110, 70, 160, 255);
+        Draw.FillCircle(this.r, x + 38, y + 52, 12, 160, 110, 220, 255);
+    }
+
+    void DrawShown(Combo c, int cx, int cy) {
+        if (c == null || c.type == 0) { return; }
+        int n = c.cards.Count;
+        int gap = 34;
+        int total = (n - 1) * gap + 96;
+        int x = cx - total / 2;
+        int i = 0;
+        while (i < n) {
+            this.DrawCard(x + i * gap, cy, c.cards[i], false);
+            i = i + 1;
+        }
+    }
+
+    void DrawSeat(int who, int x, int y, int count) {
+        string name = "右家";
+        SdlTexture face = this.avatarR;
+        if (who == 2) { name = "左家"; face = this.avatarL; }
+        Draw.RoundRectFill(this.r, x, y, 190, 96, 12, 40, 28, 16, 210);
+        Draw.RingRect(this.r, x, y, 190, 96, 2, 214, 178, 120, 90);
+        int tx = x + 18;
+        if (face != null) {
+            Draw.RoundRectFill(this.r, x + 10, y + 12, 72, 72, 10, 26, 18, 10, 255);
+            this.r.DrawTexture(face, x + 12, y + 14, 68, 68);
+            Draw.RingRect(this.r, x + 10, y + 12, 72, 72, 2, 214, 178, 120, 150);
+            tx = x + 94;
+        }
+        Text.Draw(this.r, name, tx, y + 14, 2, 240, 224, 195, 255);
+        if (this.scene >= 2 && this.landlord == who) {
+            Text.Draw(this.r, "地主", tx, y + 40, 2, 255, 200, 90, 255);
+        }
+        Text.Draw(this.r, "余 " + count + " 张", tx, y + 64, 2, 200, 190, 170, 255);
+    }
+
+    void DrawTable(int now) {
+        this.EnsureTex();
+        this.host.Begin(26, 18, 12);
+        if (this.tableBg != null) {
+            this.r.DrawTexture(this.tableBg, 0, 0, 1280, 720);
+            this.r.SetColor(14, 10, 6, 60);
+            this.r.FillRect(0, 0, 1280, 720);
+        } else if (this.menuBg != null) {
+            Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+            this.r.SetColor(18, 12, 8, 170);
+            this.r.FillRect(0, 0, 1280, 720);
+        }
+        Draw.FillCircle(this.r, 640, 340, 460, 255, 190, 110, 12);
+        // seats
+        this.DrawSeat(2, 30, 60, this.hand2.Count);
+        this.DrawSeat(1, 1060, 60, this.hand1.Count);
+        // opponent card backs
+        int i = 0;
+        int show1 = this.hand1.Count;
+        if (show1 > 6) { show1 = 6; }
+        while (i < show1) { this.DrawCardBack(1120, 170 + i * 34); i = i + 1; }
+        i = 0;
+        int show2 = this.hand2.Count;
+        if (show2 > 6) { show2 = 6; }
+        while (i < show2) { this.DrawCardBack(84, 170 + i * 34); i = i + 1; }
+        // bottom cards (visible after bidding)
+        if (this.scene >= 2) {
+            i = 0;
+            while (i < 3) {
+                this.DrawCard(544 + i * 68, 24, this.bottom[i], false);
+                i = i + 1;
+            }
+        }
+        // last plays
+        this.DrawShown(this.shown2, 400, 240);
+        this.DrawShown(this.shown1, 880, 240);
+        this.DrawShown(this.shown0, 640, 360);
+        // your hand
+        if (this.scene >= 1) {
+            int n = this.hand0.Count;
+            i = 0;
+            while (i < n) {
+                int x = this.HandX(i, n);
+                int y = 578;
+                if (this.scene == 2 && this.sel[i]) { y = y - 36; }
+                this.DrawCard(x, y, this.hand0[i], this.scene == 2 && this.sel[i]);
+                i = i + 1;
+            }
+            if (this.avatarMe != null) {
+                Draw.RoundRectFill(this.r, 30, 520, 72, 72, 10, 26, 18, 10, 255);
+                this.r.DrawTexture(this.avatarMe, 32, 522, 68, 68);
+                Draw.RingRect(this.r, 30, 520, 72, 72, 2, 214, 178, 120, 150);
+            }
+            if (this.scene >= 2 && this.landlord == 0) {
+                Text.Draw(this.r, "地主 · 你", 110, 546, 2, 255, 200, 90, 255);
+            }
+        }
+        // status strip
+        Draw.RoundRectFill(this.r, 20, 662, 560, 46, 10, 30, 22, 14, 190);
+        Text.Draw(this.r, this.prof.Title() + " · 豆 " + this.prof.beans
+            + " · 连胜 " + this.prof.streak
+            + " · 倍数 x" + this.mult + " · 底分 " + this.bid, 40, 672, 2, 230, 214, 185, 255);
+        // action buttons
+        if (this.scene == 2 && this.turn == 0) {
+            Ui.Button(this.r, this.mouseX, this.mouseY, 425, 508, 130, 54, "出牌", 2, 1);
+            Ui.Button(this.r, this.mouseX, this.mouseY, 575, 508, 130, 54, "不出", 2, 0);
+            Ui.Button(this.r, this.mouseX, this.mouseY, 725, 508, 130, 54, "取消", 2, 0);
+            if (!this.demo) {
+                int left = (this.deadline - now + 999) / 1000;
+                if (left < 0) { left = 0; }
+                int tr = 255; int tg = 214; int tb = 150;
+                if (left <= 5) { tg = 110; tb = 90; }
+                Text.DrawCenteredShadow(this.r, "倒计时 " + left + " 秒", 640, 478, 2, tr, tg, tb, 2);
+            }
+        }
+        if (this.scene == 2 && this.turn != 0) {
+            string nm = "右家思考中…";
+            if (this.turn == 2) { nm = "左家思考中…"; }
+            Text.DrawCenteredShadow(this.r, nm, 640, 522, 2, 255, 214, 150, 2);
+        }
+        if (this.scene == 1) {
+            Text.DrawCenteredShadow(this.r, "叫分：谁当地主？", 640, 470, 3, 255, 218, 160, 2);
+            if (this.bidTurn == 0) {
+                Ui.Button(this.r, this.mouseX, this.mouseY, 380, 600, 116, 56, "不叫", 2, 0);
+                int k1 = 1; if (this.bidBest >= 1) { k1 = 0; }
+                int k2 = 1; if (this.bidBest >= 2) { k2 = 0; }
+                Ui.Button(this.r, this.mouseX, this.mouseY, 512, 600, 116, 56, "1 分", 2, k1);
+                Ui.Button(this.r, this.mouseX, this.mouseY, 644, 600, 116, 56, "2 分", 2, k2);
+                Ui.Button(this.r, this.mouseX, this.mouseY, 776, 600, 116, 56, "3 分", 2, 1);
+            } else {
+                string nm = "右家考虑中…";
+                if (this.bidTurn == 2) { nm = "左家考虑中…"; }
+                Text.DrawCenteredShadow(this.r, nm, 640, 620, 2, 230, 214, 185, 2);
+            }
+        }
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    void DrawFx(int now) {
+        int i = 0;
+        while (i < this.parts.Count) {
+            DdzParticle p = this.parts[i];
+            int age = now - p.bornAt;
+            if (age > 900) { this.parts.RemoveAt(i); continue; }
+            int px = (p.x + p.vx * age / 4) / 256;
+            int py = (p.y + p.vy * age / 4) / 256 + age * age / 26000;
+            int alpha = 235 - age * 235 / 900;
+            Draw.FillCircle(this.r, px, py, 3, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < this.pops.Count) {
+            DdzPopup p = this.pops[i];
+            int age = now - p.bornAt;
+            if (age > 1400) { this.pops.RemoveAt(i); continue; }
+            int alpha = 255 - age * 255 / 1400;
+            Text.DrawCentered(this.r, p.text, p.x, p.y - age / 14, 2, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        if (now - this.toastAt < 2200) {
+            Text.DrawCenteredShadow(this.r, this.toastText, 640, 452, 2, 255, 224, 150, 2);
+        }
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureTex();
+        this.host.Begin(24, 16, 10);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+        this.r.SetColor(14, 10, 6, 120);
+        this.r.FillRect(0, 0, 1280, 720);
+        if (this.titleTex != null) {
+            this.r.DrawTexture(this.titleTex, 640 - 300, 30, 600, 200);
+        } else {
+            Text.DrawCenteredShadow(this.r, "斗地主", 640, 70, 9, 245, 232, 205, 4);
+        }
+        Text.DrawCenteredShadow(this.r, "叫分抢庄 · 炸弹翻倍 · 连胜赢豆", 640, 244, 3, 255, 218, 160, 3);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 330, 420, 84, "开始斗地主", 3, 1);
+        Text.DrawCenteredShadow(this.r, "难度", 640, 430, 2, 230, 212, 182, 2);
+        int kE = 0; int kN = 0; int kH = 0;
+        if (this.diff == 0) { kE = 1; }
+        if (this.diff == 1) { kN = 1; }
+        if (this.diff == 2) { kH = 1; }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 452, 130, 54, "简单", 2, kE);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 575, 452, 130, 54, "普通", 2, kN);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 720, 452, 130, 54, "困难", 2, kH);
+        Text.DrawCenteredShadow(this.r, this.prof.Title() + " · 豆 " + this.prof.beans
+            + " · 胜 " + this.prof.wins + " 负 " + this.prof.losses
+            + " · 最长连胜 " + this.prof.bestStreak, 640, 668, 2, 230, 212, 182, 2);
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawTableBase(now);
+        this.r.SetColor(12, 10, 6, 165);
+        this.r.FillRect(0, 0, 1280, 720);
+        int by = 190;
+        Draw.RoundRectFill(this.r, 390, by, 500, 320, 20, 36, 26, 14, 245);
+        Draw.RingRect(this.r, 390, by, 500, 320, 2, 214, 178, 120, 140);
+        if (this.winner == 1) {
+            Text.DrawCenteredShadow(this.r, "胜利！赢 " + this.deltaBeans + " 豆", 640, by + 34, 5, 255, 218, 110, 3);
+            string cheer = "手气正旺，再来一局！";
+            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！豆子滚滚来"; }
+            Text.DrawCentered(this.r, cheer, 640, by + 120, 3, 150, 230, 190, 255);
+        } else {
+            Text.DrawCenteredShadow(this.r, "惜败，输 " + this.deltaBeans + " 豆", 640, by + 34, 5, 235, 165, 150, 3);
+            Text.DrawCentered(this.r, "记牌回想一下，翻盘就在下局", 640, by + 120, 3, 225, 210, 190, 255);
+        }
+        Text.DrawCentered(this.r, "豆 " + this.prof.beans + " · 倍数 x" + this.mult, 640, by + 170, 2, 230, 214, 185, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 420, by + 240, 210, 60, "再来一局", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 650, by + 240, 210, 60, "回到菜单", 3, 0);
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    // table without Begin/End so the over screen can overlay it
+    void DrawTableBase(int now) {
+        this.EnsureTex();
+        this.host.Begin(26, 18, 12);
+        if (this.tableBg != null) {
+            this.r.DrawTexture(this.tableBg, 0, 0, 1280, 720);
+            this.r.SetColor(14, 10, 6, 60);
+            this.r.FillRect(0, 0, 1280, 720);
+        } else if (this.menuBg != null) {
+            Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+            this.r.SetColor(18, 12, 8, 170);
+            this.r.FillRect(0, 0, 1280, 720);
+        }
+        this.DrawSeat(2, 30, 60, this.hand2.Count);
+        this.DrawSeat(1, 1060, 60, this.hand1.Count);
+        this.DrawShown(this.shown0, 640, 360);
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 3) { this.DrawOver(now); }
+        else { this.DrawTable(now); }
+    }
+}
+
+class DdzApp {
+    static void Main() {
+        Host h = Host.Create("斗地主", 1280, 720);
+        DdzGame g = DdzGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                h.OnWindowEvent(ty);
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { h.ToggleFullscreen(); }
+                    else if (!SdlEvent.IsRepeat()) { g.OnKey(sc, now); }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        g.mouseX = h.MouseX();
+                        g.mouseY = h.MouseY();
+                        g.OnDown(g.mouseX, g.mouseY, now);
+                    }
+                }
+            }
+            g.Tick(now);
+            g.Render(now);   // vsync-paced by the renderer
+        }
+        h.Close();
+    }
+}
