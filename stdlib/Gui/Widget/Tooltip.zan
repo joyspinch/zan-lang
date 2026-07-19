@@ -3,9 +3,16 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// Tooltip popup anchored to a point, with a small pointer notch. Prefers to
-/// sit above the anchor; flips below when there is not enough room on top.
+/// Tooltip popup anchored to a point, with a small pointer notch. Supports four
+/// placements (top / bottom / left / right), automatic word wrapping for long
+/// text, and a height cap with a scrollbar indicator when the wrapped content
+/// overflows.
 class Tooltip {
+    static int Top() { return 0; }
+    static int Bottom() { return 1; }
+    static int Left() { return 2; }
+    static int Right() { return 3; }
+
     // Filled triangle pointing down (wide base on top at `topY`, apex below).
     static void TriDown(Canvas c, int cx, int topY, int half, int h, int color) {
         int r = 0;
@@ -28,9 +35,248 @@ class Tooltip {
         }
     }
 
-    /// Opaque two-line tooltip: a bold title over a muted description. Used by
-    /// component palettes where the tip sits over other widgets and must stay
-    /// fully readable (the translucent `Render` variant bleeds text through).
+    // Filled triangle pointing left (apex at `leftX`, wide base to the right).
+    static void TriLeft(Canvas c, int leftX, int cy, int half, int w, int color) {
+        int r = 0;
+        while (r < w) {
+            int hh = half * r / w;
+            if (hh < 1) { hh = 1; }
+            c.FillRect(leftX + r, cy - hh, 1, hh * 2, color);
+            r = r + 1;
+        }
+    }
+
+    // Filled triangle pointing right (apex at `leftX`+w, wide base at left).
+    static void TriRight(Canvas c, int leftX, int cy, int half, int w, int color) {
+        int r = 0;
+        while (r < w) {
+            int hh = half - half * r / w;
+            if (hh < 1) { hh = 1; }
+            c.FillRect(leftX + r, cy - hh, 1, hh * 2, color);
+            r = r + 1;
+        }
+    }
+
+    /// Greedily word-wraps `text` so each line fits within `maxW` pixels. Long
+    /// words with no spaces are hard-broken by character.
+    static List<string> WrapLines(string text, int fs, int maxW) {
+        List<string> lines = new List<string>();
+        if (maxW <= 0) { lines.Add(text); return lines; }
+        int n = text.Length;
+        string cur = "";
+        string word = "";
+        int i = 0;
+        while (i <= n) {
+            string ch = "";
+            if (i < n) { ch = text.Substring(i, 1); }
+            if (i == n || ch == " " || ch == "\n") {
+                string cand = cur;
+                if (cur == "") { cand = word; } else { cand = cur + " " + word; }
+                if (Canvas.MeasureText(cand, fs) <= maxW) {
+                    cur = cand;
+                } else {
+                    if (cur != "") { lines.Add(cur); }
+                    // Hard-break the word if it alone exceeds maxW.
+                    while (Canvas.MeasureText(word, fs) > maxW && word.Length > 1) {
+                        int lo = 1;
+                        int hi = word.Length;
+                        while (lo < hi) {
+                            int mid = (lo + hi + 1) / 2;
+                            if (Canvas.MeasureText(word.Substring(0, mid), fs) <= maxW) { lo = mid; }
+                            else { hi = mid - 1; }
+                        }
+                        lines.Add(word.Substring(0, lo));
+                        word = word.Substring(lo, word.Length - lo);
+                    }
+                    cur = word;
+                }
+                word = "";
+                if (ch == "\n") { lines.Add(cur); cur = ""; }
+            } else {
+                word = word + ch;
+            }
+            i = i + 1;
+        }
+        if (cur != "") { lines.Add(cur); }
+        if (lines.Count == 0) { lines.Add(""); }
+        return lines;
+    }
+
+    static int TipCapH(App app) { return app.Scale(148); }
+
+    /// Resolves the on-screen bubble rectangle (origin + capped size) for the
+    /// given anchor/placement/width, applying the same edge flip + clamp used
+    /// when painting. Callers use this to hit-test wheel input for scrolling.
+    static Rect BoxRect(App app, int anchorX, int anchorY, string text,
+                        int placement, int maxW) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int pad = app.Scale(8);
+        int lineH = Canvas.FontHeight(fs);
+        int notch = app.Scale(6);
+        int gap = app.Scale(6);
+        int margin = app.Scale(4);
+
+        List<string> lines = Tooltip.WrapLines(text, fs, maxW);
+        int textW = 0;
+        int li = 0;
+        while (li < lines.Count) {
+            int lw = Canvas.MeasureText(lines[li], fs);
+            if (lw > textW) { textW = lw; }
+            li = li + 1;
+        }
+        int boxW = textW + pad * 2;
+        int fullH = lines.Count * lineH + pad * 2;
+        int maxBoxH = Tooltip.TipCapH(app);
+        int boxH = fullH;
+        if (boxH > maxBoxH) { boxH = maxBoxH; }
+
+        int top = app.titlebarH;
+        int cw = c.Width();
+        int chh = c.Height();
+
+        int bx = 0;
+        int by = 0;
+        int place = placement;
+        if (place == 0) {
+            if (anchorY - gap - notch - boxH < top) { place = 1; }
+        } else if (place == 1) {
+            if (anchorY + gap + notch + boxH > chh - margin) { place = 0; }
+        } else if (place == 2) {
+            if (anchorX - gap - notch - boxW < margin) { place = 3; }
+        } else if (place == 3) {
+            if (anchorX + gap + notch + boxW > cw - margin) { place = 2; }
+        }
+
+        if (place == 0) {
+            bx = anchorX - boxW / 2;
+            by = anchorY - gap - notch - boxH;
+        } else if (place == 1) {
+            bx = anchorX - boxW / 2;
+            by = anchorY + gap + notch;
+        } else if (place == 2) {
+            bx = anchorX - gap - notch - boxW;
+            by = anchorY - boxH / 2;
+        } else {
+            bx = anchorX + gap + notch;
+            by = anchorY - boxH / 2;
+        }
+
+        if (bx < margin) { bx = margin; }
+        if (bx + boxW > cw - margin) { bx = cw - margin - boxW; }
+        if (by < top) { by = top; }
+        if (by + boxH > chh - margin) { by = chh - margin - boxH; }
+
+        return Rect.Create(bx, by, boxW, boxH);
+    }
+
+    /// Max scroll offset (px) for a tip: 0 when the content fits the height cap.
+    static int MaxScroll(App app, string text, int maxW) {
+        int fs = app.theme.fontSizeSmall;
+        int pad = app.Scale(8);
+        int lineH = Canvas.FontHeight(fs);
+        List<string> lines = Tooltip.WrapLines(text, fs, maxW);
+        int fullH = lines.Count * lineH + pad * 2;
+        int m = fullH - Tooltip.TipCapH(app);
+        if (m < 0) { m = 0; }
+        return m;
+    }
+
+    /// Rich anchored tooltip: opaque dark bubble with word-wrapped body, one of
+    /// four placements (auto-flips when it would leave the screen) and a
+    /// scrollbar when the wrapped text is taller than the height cap.
+    /// `anchorX`/`anchorY` is the point the notch should touch. `scrollOff` is
+    /// the vertical scroll amount (clamped to [0, MaxScroll]).
+    static void RenderScroll(App app, int anchorX, int anchorY, string text,
+                             int placement, int maxW, int scrollOff) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = t.fontSizeSmall;
+        int pad = app.Scale(8);
+        int lineH = Canvas.FontHeight(fs);
+        int notch = app.Scale(6);
+
+        List<string> lines = Tooltip.WrapLines(text, fs, maxW);
+        int fullH = lines.Count * lineH + pad * 2;
+        Rect box = Tooltip.BoxRect(app, anchorX, anchorY, text, placement, maxW);
+        int bx = box.x;
+        int by = box.y;
+        int boxW = box.width;
+        int boxH = box.height;
+        bool scroll = fullH > boxH;
+
+        // Re-derive the resolved placement for the notch from the box position.
+        int place = placement;
+        if (by + boxH <= anchorY) { place = 0; }
+        else if (by >= anchorY) { place = 1; }
+        else if (bx + boxW <= anchorX) { place = 2; }
+        else { place = 3; }
+
+        int off = scrollOff;
+        int maxOff = fullH - boxH;
+        if (maxOff < 0) { maxOff = 0; }
+        if (off > maxOff) { off = maxOff; }
+        if (off < 0) { off = 0; }
+
+        int bg = 0xFF1F2430;        // opaque dark slate (readable over anything)
+        int border = 0xFF3A4150;
+        int fg = 0xFFF2F5FA;
+
+        c.FillRoundRect(bx + 1, by + 3, boxW, boxH, t.borderRadiusSmall, t.shadowColor);
+        c.FillRoundRect(bx, by, boxW, boxH, t.borderRadiusSmall, bg);
+        c.DrawRoundRect(bx, by, boxW, boxH, t.borderRadiusSmall, border, 1);
+
+        // Pointer notch on the side facing the anchor.
+        if (place == 0) {
+            Tooltip.TriDown(c, anchorX, by + boxH, notch, notch, bg);
+        } else if (place == 1) {
+            Tooltip.TriUp(c, anchorX, by - notch, notch, notch, bg);
+        } else if (place == 2) {
+            Tooltip.TriRight(c, bx + boxW, anchorY, notch, notch, bg);
+        } else {
+            Tooltip.TriLeft(c, bx - notch, anchorY, notch, notch, bg);
+        }
+
+        // Clip the text to the (possibly capped) content area and draw lines
+        // shifted up by the scroll offset.
+        int innerX = bx + pad;
+        int innerY = by + pad;
+        int innerW = boxW - pad * 2;
+        int innerH = boxH - pad * 2;
+        c.PushClip(innerX, innerY, innerW, innerH);
+        int ty = innerY - off;
+        int li = 0;
+        while (li < lines.Count) {
+            c.DrawText(innerX, ty, lines[li], fg, fs);
+            ty = ty + lineH;
+            li = li + 1;
+        }
+        c.PopClip();
+
+        // Scrollbar with a thumb positioned by the scroll offset.
+        if (scroll) {
+            int barW = app.Scale(3);
+            int barX = bx + boxW - barW - app.Scale(3);
+            int barY = by + pad;
+            int barH = boxH - pad * 2;
+            int thumbH = barH * innerH / (fullH - pad * 2);
+            if (thumbH < app.Scale(16)) { thumbH = app.Scale(16); }
+            int travel = barH - thumbH;
+            int thumbY = barY;
+            if (maxOff > 0) { thumbY = barY + travel * off / maxOff; }
+            c.FillRoundRect(barX, barY, barW, barH, barW / 2, 0x33FFFFFF);
+            c.FillRoundRect(barX, thumbY, barW, thumbH, barW / 2, 0x88FFFFFF);
+        }
+    }
+
+    /// Anchored tooltip without scrolling (offset 0). Kept for existing callers.
+    static void RenderAt(App app, int anchorX, int anchorY, string text,
+                         int placement, int maxW) {
+        Tooltip.RenderScroll(app, anchorX, anchorY, text, placement, maxW, 0);
+    }
+
+    /// Opaque two-line tooltip: a bold title over a muted description.
     static void RenderRich(App app, int x, int y, string title, string desc) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -55,43 +301,14 @@ class Tooltip {
 
         c.FillRoundRect(x + 1, y + 3, boxW, boxH, t.borderRadiusSmall, t.shadowColor);
         c.FillRoundRect(x, y, boxW, boxH, t.borderRadiusSmall, bg);
-        c.DrawRect(x, y, boxW, boxH, border, 1);
+        c.DrawRoundRect(x, y, boxW, boxH, t.borderRadiusSmall, border, 1);
         c.DrawText(x + pad, y + pad, title, titleColor, fs);
         c.DrawText(x + pad, y + pad + lh + app.Scale(4), desc, descColor, fs);
     }
 
+    /// Simple single-line tip above the anchor (flips below when cramped). Kept
+    /// for existing callers; delegates to the placement-aware renderer.
     static void Render(App app, int anchorX, int anchorY, string text) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-
-        int tw = Canvas.MeasureText(text, t.fontSizeSmall) + app.Scale(16);
-        int th = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(10);
-        int notch = app.Scale(5);
-        int gap = app.Scale(6);
-
-        int tx = anchorX - tw / 2;
-        if (tx < app.Scale(4)) { tx = app.Scale(4); }
-        if (tx + tw > c.Width() - app.Scale(4)) {
-            tx = c.Width() - app.Scale(4) - tw;
-        }
-        int bgColor = -939524096; // rgba(0,0,0,0.75)
-
-        bool below = false;
-        int ty = anchorY - th - gap - notch;
-        if (ty < app.titlebarH) { below = true; ty = anchorY + gap + notch; }
-        if (ty + th > c.Height() - app.Scale(4)) {
-            below = false;
-            ty = c.Height() - app.Scale(4) - th;
-        }
-
-        c.FillRoundRect(tx + 1, ty + 2, tw, th, t.borderRadiusSmall, t.shadowColor);
-        c.FillRoundRect(tx, ty, tw, th, t.borderRadiusSmall, bgColor);
-        c.DrawTextCentered(tx, ty, tw, th, text, t.textInverse, t.fontSizeSmall);
-
-        if (below) {
-            Tooltip.TriUp(c, anchorX, ty - notch, notch, notch, bgColor);
-        } else {
-            Tooltip.TriDown(c, anchorX, ty + th, notch, notch, bgColor);
-        }
+        Tooltip.RenderAt(app, anchorX, anchorY, text, 0, 0);
     }
 }

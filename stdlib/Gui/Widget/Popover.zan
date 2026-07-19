@@ -3,29 +3,159 @@ using Gui;
 
 namespace Gui.Widget;
 
-/// A floating panel anchored below a point, with a small pointer notch.
-/// Render this in the deferred overlay pass so it draws above other widgets.
-class Popover {
-    static void Render(App app, int anchorX, int anchorY, int w, int h, string title, string body) {
+/// A floating panel anchored to a point, with a small pointer notch and
+/// automatic word-wrapped body text.
+///
+/// C#-style retained instance — owns its open state and paints in the deferred
+/// overlay pass, so it draws above other widgets, blocks input to everything
+/// beneath it (no parent/child click-through) and closes on an outside press or
+/// Esc:
+///     Popover pop = Popover.Create("Details", "Title", "Body text.", 280);
+///     pop.Render(app, x, y, w, h);
+/// The static Render(...) is the immediate-mode variant (caller owns state).
+class Popover : Control {
+    string trigLabel;
+    string title;
+    string body;
+    int panelW;
+    int trigId;
+    SignalBool open;
+
+    void InitPopover(string trig, string ti, string bo, int w) {
+        this.InitControl("popover", 1);
+        trigLabel = trig;
+        title = ti;
+        body = bo;
+        panelW = w;
+        trigId = WidgetId.Next();
+        open = SignalBool.Create(false);
+    }
+
+    /// Retained-mode constructor.
+    Popover(string trig, string ti, string bo, int w) {
+        InitPopover(trig, ti, bo, w);
+    }
+
+    static Popover Create(string trigLabel, string title, string body, int w) {
+        return new Popover(trigLabel, title, body, w);
+    }
+
+    bool IsOpen() { return open.Get(); }
+
+    int Render(App app, int x, int y, int w, int h) {
+        Dropdown.PaintTrigger(app, trigId, x, y, w, h, trigLabel, open.Get());
+        app.focus.RegisterFocusable(trigId);
+
+        if (Ui.Clicked(app, trigId)) {
+            open.Set(!open.Get());
+            app.RequestRedraw();
+        }
+
+        if (open.Get()) {
+            // Scrim blocks every widget beneath the popover (no click-through);
+            // the panel then registers its own blocker on top.
+            app.BlockHitsBelow();
+            int panelId = Popover.PaintPanel(app, x + w / 2, y + h,
+                panelW, title, body);
+
+            // Close on an outside press or Esc; a press on the trigger toggles.
+            int kind = app.window.EventKind();
+            if (kind == 2) {
+                int pt = app.PressTarget();
+                if (pt != panelId && pt != trigId) {
+                    open.Set(false);
+                    app.RequestRedraw();
+                }
+            }
+            if (kind == 4 && app.window.EventKeyCode() == 27) {
+                open.Set(false);
+                app.RequestRedraw();
+            }
+        }
+        return trigId;
+    }
+
+    override void OnMeasure(App app) {
+        prefH = app.theme.heightMedium;
+        prefW = app.Scale(120);
+    }
+
+    override void OnPaint(App app) {
+        this.Render(app, bx, by, bw, bh);
+    }
+
+    /// Draws the anchored panel (shadow, body, border, pointer notch), wrapping
+    /// the body text and clamping to the window on every edge. `anchorX` is the
+    /// pointer x, `anchorY` the y just below the trigger. Returns the blocker id
+    /// registered over the panel.
+    static int PaintPanel(App app, int anchorX, int anchorY, int w,
+                          string title, string body) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
-        int x = anchorX - w / 2;
-        int y = anchorY + app.Scale(8);
-        if (x < app.Scale(4)) { x = app.Scale(4); }
-
+        int margin = app.Scale(4);
+        int pad = t.paddingMedium;
         int notch = app.Scale(6);
+
+        if (w > c.Width() - margin * 2) { w = c.Width() - margin * 2; }
+        if (w < app.Scale(80)) { w = app.Scale(80); }
+
+        int th = 0;
+        if (title != "") { th = Canvas.FontHeight(t.fontSizeMedium) + t.gapSmall; }
+        List<string> lines = Tooltip.WrapLines(body, t.fontSizeSmall, w - pad * 2);
+        int lh = Canvas.FontHeight(t.fontSizeSmall);
+        int h = pad * 2 + th + lines.Count * lh;
+
+        // Prefer below the anchor; flip above if it would leave the window.
+        bool below = true;
+        int x = anchorX - w / 2;
+        int y = anchorY + notch + app.Scale(2);
+        if (y + h > c.Height() - margin) {
+            int above = anchorY - notch - app.Scale(2) - h
+                - t.heightMedium;
+            if (above >= margin) { y = above; below = false; }
+        }
+        if (x + w > c.Width() - margin) { x = c.Width() - margin - w; }
+        if (x < margin) { x = margin; }
+        if (y + h > c.Height() - margin) { y = c.Height() - margin - h; }
+        if (y < margin) { y = margin; }
+
         c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, t.shadowColor);
         c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(x, y, w, h, t.borderSecondary, 1);
-        Tooltip.TriUp(c, anchorX, y - notch, notch, notch, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderSecondary, 1);
+        int blockerId = app.BlockHitsRect(x, y, w, h);
 
-        int pad = t.paddingMedium;
+        // Pointer notch, clamped within the panel's rounded body.
+        int nx = anchorX;
+        if (nx < x + t.borderRadiusMedium + notch) { nx = x + t.borderRadiusMedium + notch; }
+        if (nx > x + w - t.borderRadiusMedium - notch) { nx = x + w - t.borderRadiusMedium - notch; }
+        if (below) {
+            Tooltip.TriUp(c, nx, y - notch, notch, notch, t.bgPrimary);
+        } else {
+            Tooltip.TriDown(c, nx, y + h, notch, notch, t.bgPrimary);
+        }
+
+        c.PushClip(x, y, w, h);
         int ty = y + pad;
         if (title != "") {
             c.DrawText(x + pad, ty, title, t.textPrimary, t.fontSizeMedium);
             ty = ty + Canvas.FontHeight(t.fontSizeMedium) + t.gapSmall;
         }
-        c.DrawText(x + pad, ty, body, t.textSecondary, t.fontSizeSmall);
+        int li = 0;
+        while (li < lines.Count) {
+            c.DrawText(x + pad, ty, lines[li], t.textSecondary, t.fontSizeSmall);
+            ty = ty + lh;
+            li = li + 1;
+        }
+        c.PopClip();
+        return blockerId;
+    }
+
+    /// Immediate-mode variant: caller owns visibility. `anchorX` is the pointer
+    /// x, `anchorY` the y just below the anchor. Wraps and clamps automatically;
+    /// `h` is ignored (kept for source compatibility).
+    static void Render(App app, int anchorX, int anchorY, int w, int h,
+                       string title, string body) {
+        Popover.PaintPanel(app, anchorX, anchorY, w, title, body);
     }
 }

@@ -1173,7 +1173,7 @@ class DataTable {
             int tagX = cx + pad;
             if (col.align == 1) { tagX = cx + (cw - tagW) / 2; }
             c.FillRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, t.bgSecondary);
-            c.DrawRect(tagX, tagY, tagW, tagH, tc, 1);
+            c.DrawRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, tc, 1);
             int txtY = tagY + (tagH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
             c.DrawText(tagX + pad, txtY, label, tc, t.fontSizeSmall);
             return;
@@ -1268,7 +1268,7 @@ class DataTable {
 
         // outer border
         c.FillRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(x, y, viewW, viewH, t.borderPrimary, 1);
+        c.DrawRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, t.borderPrimary, 1);
 
         // ---------------- header ----------------
         c.FillRect(x, y, viewW, headerH, t.bgSecondary);
@@ -1296,7 +1296,7 @@ class DataTable {
                 Icon.Draw(c, "check", bx + ins, by + ins, box - ins * 2, t.textInverse);
             } else {
                 c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
-                c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+                c.DrawRoundRect(bx, by, box, box, t.borderRadiusSmall, t.borderPrimary, 1);
             }
             app.hitTester.Register(HitRegion.Create(allId, hx, y, selW, headerH, 0));
             if (app.window.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
@@ -1496,7 +1496,7 @@ class DataTable {
                     Icon.Draw(c, "check", bx + ins, by + ins, box - ins * 2, t.textInverse);
                 } else {
                     c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
-                    c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+                    c.DrawRoundRect(bx, by, box, box, t.borderRadiusSmall, t.borderPrimary, 1);
                 }
                 int selId = app.focus.AllocId();
                 app.hitTester.Register(HitRegion.Create(selId, cx2, ry, selW, rowH, 0));
@@ -1564,10 +1564,12 @@ class DataTable {
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
         int emods = app.window.EventMods();
-        // While the context menu is open it is modal: swallow body events so a
-        // click on a menu item can't also start a range/selection behind it.
-        // (RenderContextMenu reads the raw event to drive item hits / dismiss.)
-        if (st.ctxOpen) { ek = 0; }
+        // While a popup (context menu or the header filter panel) is open it is
+        // modal: swallow body events so a click on the panel can't also start a
+        // range/selection behind it. The popups read the raw event to drive
+        // their own item hits / dismissal, and register a hit-blocking rect so
+        // the pointer does not fall through to widgets beneath them.
+        if (st.ctxOpen || st.openMenu >= 0) { ek = 0; }
 
         // left press
         if (ek == 2 && eb == 0 && ptrOi >= 0) {
@@ -1866,8 +1868,13 @@ class DataTable {
         if (mx < x) { mx = x; }
         if (my < y) { my = y; }
 
+        // swallow clicks over the whole menu so gaps don't fall through to the
+        // rows/widgets beneath it (item rows register their hits afterwards)
+        app.BlockHitsRect(mx, my, mw, mh);
+
+        c.FillRoundRect(mx + app.Scale(2), my + app.Scale(3), mw, mh, t.borderRadiusMedium, t.overlay);
         c.FillRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(mx, my, mw, mh, t.borderPrimary, 1);
+        c.DrawRoundRect(mx, my, mw, mh, t.borderRadiusMedium, t.borderPrimary, 1);
 
         int iy = my + app.Scale(4);
         DataTable.CtxItem(app, mx, iy, mw, ih, "复制  Copy", "Ctrl+C");
@@ -1963,7 +1970,7 @@ class DataTable {
         if (primary) { bg = t.primary; fg = t.textInverse; }
         else if (hov) { bg = t.bgHover; }
         c.FillRoundRect(bx, by, bw, bh, t.borderRadiusSmall, bg);
-        if (!primary) { c.DrawRect(bx, by, bw, bh, t.borderPrimary, 1); }
+        if (!primary) { c.DrawRoundRect(bx, by, bw, bh, t.borderRadiusSmall, t.borderPrimary, 1); }
         c.DrawTextCentered(bx, by, bw, bh, label, fg, t.fontSizeSmall);
         app.hitTester.Register(HitRegion.Create(id, bx, by, bw, bh, 0));
         return app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
@@ -1976,7 +1983,7 @@ class DataTable {
         int bc = t.borderPrimary;
         if (focused) { bc = t.borderFocus; }
         c.FillRoundRect(bx, by, bw, bh, t.borderRadiusSmall, t.bgPrimary);
-        c.DrawRect(bx, by, bw, bh, bc, 1);
+        c.DrawRoundRect(bx, by, bw, bh, t.borderRadiusSmall, bc, 1);
         int tpad = app.Scale(6);
         int ty = by + (bh - Canvas.FontHeight(fs)) / 2;
         string shown = DataTable.Truncate(text, fs, bw - tpad * 2);
@@ -2019,6 +2026,9 @@ class DataTable {
 
         // claim the wheel over the popup so the page underneath doesn't scroll
         bool ownsMenuWheel = app.CaptureWheel(mx, my, menuW, menuH);
+        // swallow clicks over the whole panel so empty areas don't fall through
+        // to the rows/widgets beneath it (panel controls register later and win)
+        app.BlockHitsRect(mx, my, menuW, menuH);
 
         // route typed keys to the focused edit field
         if (app.window.EventKind() == 6 && st.editFocus != 0) {
@@ -2049,7 +2059,7 @@ class DataTable {
         // panel
         c.FillRoundRect(mx + app.Scale(2), my + app.Scale(3), menuW, menuH, t.borderRadiusMedium, t.overlay);
         c.FillRoundRect(mx, my, menuW, menuH, t.borderRadiusMedium, t.bgPrimary);
-        c.DrawRect(mx, my, menuW, menuH, t.borderPrimary, 1);
+        c.DrawRoundRect(mx, my, menuW, menuH, t.borderRadiusMedium, t.borderPrimary, 1);
 
         // header: title + sort asc/desc
         int hy = my + app.Scale(8);
@@ -2204,7 +2214,7 @@ class DataTable {
             int abc = t.borderPrimary;
             if (st.editFocus == 3) { abc = t.borderFocus; }
             c.FillRoundRect(mx + pad, cy, menuW - pad * 2, areaH, t.borderRadiusSmall, t.bgPrimary);
-            c.DrawRect(mx + pad, cy, menuW - pad * 2, areaH, abc, 1);
+            c.DrawRoundRect(mx + pad, cy, menuW - pad * 2, areaH, t.borderRadiusSmall, abc, 1);
             app.hitTester.Register(HitRegion.Create(aId, mx + pad, cy, menuW - pad * 2, areaH, 0));
             if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == aId) { st.editFocus = 3; app.RequestRedraw(); }
             int lh = Canvas.FontHeight(fs) + app.Scale(3);
@@ -2289,7 +2299,7 @@ class DataTable {
             Icon.Draw(c, "check", bx + ins, by + ins, box - ins * 2, t.textInverse);
         } else {
             c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.bgPrimary);
-            c.DrawRect(bx, by, box, box, t.borderPrimary, 1);
+            c.DrawRoundRect(bx, by, box, box, t.borderRadiusSmall, t.borderPrimary, 1);
         }
     }
 }
