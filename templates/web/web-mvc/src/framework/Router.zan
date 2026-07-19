@@ -1,0 +1,154 @@
+using System;
+
+namespace ZanWeb;
+
+/// <summary>Request handler signature: fill the response on ctx.</summary>
+delegate void HttpHandler(HttpContext ctx);
+
+/// <summary>
+/// One registered route. The pattern is pre-split into segments at
+/// registration time, so matching a request never re-parses the pattern:
+/// "/user/{id}" -> ["user", "{id}"].
+/// </summary>
+class Route {
+    string method;
+    string pattern;
+    List<string> segs;
+    HttpHandler handler;
+    int rateLimit;      // max requests per window on this route (0 = unlimited)
+    bool needsAuth;     // route requires an authenticated principal
+    bool streamUpload;  // request body is streamed to disk, not memory
+
+    static Route Create(string method, string pattern, HttpHandler handler) {
+        Route r = new Route();
+        r.method = method;
+        r.pattern = pattern;
+        r.segs = Router.SplitPath(pattern);
+        r.handler = handler;
+        r.rateLimit = 0;
+        r.needsAuth = false;
+        r.streamUpload = false;
+        return r;
+    }
+
+    Route Limit(int maxPerWindow) { this.rateLimit = maxPerWindow; return this; }
+    Route Auth() { this.needsAuth = true; return this; }
+    Route Upload() { this.streamUpload = true; return this; }
+
+    string Key() { return this.method + " " + this.pattern; }
+}
+
+/// <summary>
+/// HTTP router with static-first matching and {param} segments. Routes are
+/// bucketed by method and static routes are checked with a direct string
+/// compare before parameterized ones, so the hot path ("/", "/api/x") is a
+/// handful of string compares with zero allocation.
+/// </summary>
+class Router {
+    List<Route> statics;   // no {param} segments: matched by full-path compare
+    List<Route> dynamics;  // contain {param} segments: matched per-segment
+
+    Router() {
+        this.statics = new List<Route>();
+        this.dynamics = new List<Route>();
+    }
+
+    static Router Create() { return new Router(); }
+
+    Route Add(string method, string pattern, HttpHandler handler) {
+        Route r = Route.Create(method, pattern, handler);
+        if (Router.IsStatic(pattern)) { this.statics.Add(r); }
+        else { this.dynamics.Add(r); }
+        return r;
+    }
+
+    Route Get(string pattern, HttpHandler handler) { return this.Add("GET", pattern, handler); }
+    Route Post(string pattern, HttpHandler handler) { return this.Add("POST", pattern, handler); }
+    Route Put(string pattern, HttpHandler handler) { return this.Add("PUT", pattern, handler); }
+    Route Delete(string pattern, HttpHandler handler) { return this.Add("DELETE", pattern, handler); }
+
+    /// <summary>Finds the route for method+path, filling ctx.routeParams.
+    /// Returns null when nothing matches. `pathMatched` is set when some route
+    /// has the path but not the method (405 vs 404).</summary>
+    Route Match(HttpContext ctx) {
+        string method = ctx.method;
+        string path = ctx.path;
+        int i = 0;
+        while (i < this.statics.Count) {
+            Route r = this.statics[i];
+            if (r.pattern == path && (r.method == method || r.method == "*")) {
+                return r;
+            }
+            i = i + 1;
+        }
+        List<string> segs = Router.SplitPath(path);
+        i = 0;
+        while (i < this.dynamics.Count) {
+            Route r = this.dynamics[i];
+            if (r.method == method || r.method == "*") {
+                if (Router.MatchSegs(r.segs, segs, ctx.routeParams)) {
+                    return r;
+                }
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    /// <summary>True when some route matches the path with a different method
+    /// (drives a 405 Method Not Allowed instead of 404).</summary>
+    bool PathExists(string path) {
+        int i = 0;
+        while (i < this.statics.Count) {
+            if (this.statics[i].pattern == path) { return true; }
+            i = i + 1;
+        }
+        List<string> segs = Router.SplitPath(path);
+        StrMap scratch = StrMap.Create();
+        i = 0;
+        while (i < this.dynamics.Count) {
+            if (Router.MatchSegs(this.dynamics[i].segs, segs, scratch)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static bool IsStatic(string pattern) {
+        int i = 0;
+        while (i < pattern.Length) {
+            if (pattern.Substring(i, 1) == "{") { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static bool MatchSegs(List<string> pat, List<string> segs, StrMap into) {
+        if (pat.Count != segs.Count) { return false; }
+        int i = 0;
+        while (i < pat.Count) {
+            string p = pat[i];
+            if (p.Length > 2 && p.Substring(0, 1) == "{"
+                && p.Substring(p.Length - 1, 1) == "}") {
+                into.Set(p.Substring(1, p.Length - 2), segs[i]);
+            } else if (p != segs[i]) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static List<string> SplitPath(string path) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        int n = path.Length;
+        while (i < n) {
+            while (i < n && path.Substring(i, 1) == "/") { i = i + 1; }
+            int e = i;
+            while (e < n && path.Substring(e, 1) != "/") { e = e + 1; }
+            if (e > i) { outp.Add(path.Substring(i, e - i)); }
+            i = e;
+        }
+        return outp;
+    }
+}

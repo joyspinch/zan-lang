@@ -1,0 +1,361 @@
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Http;
+
+namespace ZanWeb;
+
+/// <summary>
+/// The application server: coroutine-per-connection HTTP/1.1 event loop
+/// (the zan analogue of the swoole worker), wired to the Router, Hooks,
+/// RateLimiter, Sessions and the in-memory View engine.
+///
+/// Memory-safety rules baked in:
+///  - request bodies larger than maxBodyBytes are rejected with 413 before
+///    they are buffered, so an uploader cannot balloon the heap;
+///  - header blocks larger than 64KB are rejected with 431;
+///  - all per-request state lives on the HttpContext and is ARC-reclaimed
+///    when the request completes.
+/// </summary>
+class WebApp {
+    [DllImport("crt")]
+    static extern int time(int ptr);
+
+    [DllImport("crt")]
+    static extern int fopen(string path, string mode);
+
+    [DllImport("crt")]
+    static extern int fwrite(string buf, int size, int count, int fp);
+
+    [DllImport("crt")]
+    static extern int fclose(int fp);
+
+    string host;
+    int port;
+    bool running;
+    TcpListener listener;
+
+    Router router;
+    Hooks hooks;
+    View views;
+    Sessions sessions;
+    RateLimiter limiter;
+    RouteStats stats;
+
+    int maxBodyBytes;      // in-memory request body cap (413 above this)
+    int maxUploadBytes;    // streaming upload cap for .Upload() routes
+    string uploadDir;      // where streamed uploads land
+    int uploadSeq;
+    int globalLimit;       // requests/sec across all routes (0 = unlimited)
+    int totalRequests;
+    int activeConnections;
+
+    WebApp() {
+        this.host = "0.0.0.0";
+        this.port = 8080;
+        this.running = false;
+        this.router = Router.Create();
+        this.hooks = Hooks.Create();
+        this.views = null;
+        this.sessions = Sessions.Create();
+        this.limiter = RateLimiter.Create(1);
+        this.stats = RouteStats.Create();
+        this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
+        this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
+        this.uploadDir = "uploads";
+        this.uploadSeq = 0;
+        this.globalLimit = 0;
+        this.totalRequests = 0;
+        this.activeConnections = 0;
+    }
+
+    static WebApp Create(string host, int port) {
+        WebApp app = new WebApp();
+        app.host = host;
+        app.port = port;
+        return app;
+    }
+
+    // ---- configuration ----
+
+    WebApp Views(string dir) { this.views = View.LoadDir(dir); return this; }
+    WebApp MaxBody(int bytes) { this.maxBodyBytes = bytes; return this; }
+    WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
+    WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
+    WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
+    WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
+    WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
+
+    Route Get(string pattern, HttpHandler h) { return this.router.Get(pattern, h); }
+    Route Post(string pattern, HttpHandler h) { return this.router.Post(pattern, h); }
+    Route Put(string pattern, HttpHandler h) { return this.router.Put(pattern, h); }
+    Route Delete(string pattern, HttpHandler h) { return this.router.Delete(pattern, h); }
+
+    string RenderPage(string name, ViewData data) {
+        if (this.views == null) { return ""; }
+        return this.views.RenderPage(name, data);
+    }
+
+    static int NowSeconds() { return time(0); }
+
+    // ---- server loop ----
+
+    /// <summary>Runs the accept loop forever. Await this from Main so the
+    /// coroutine scheduler drives the server: `int r = await app.Start();`</summary>
+    async int Start() {
+        Socket.Initialize();
+        this.listener = TcpListener.Create(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+        Console.WriteLine("[ZanWeb] listening on http://" + this.host + ":"
+            + Convert.ToString(this.port));
+        while (this.running) {
+            int clientSock = await this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                this.activeConnections = this.activeConnections + 1;
+                Task.Spawn(HandleConnection(clientSock));
+            }
+        }
+        return 0;
+    }
+
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) { this.listener.Stop(); }
+    }
+
+    async void HandleConnection(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        // Connection-owned receive buffer. Socket.RecvIntoAsync reports the
+        // EXACT byte count received (Zan string length is strlen-based, so
+        // binary payloads containing NUL bytes must be counted at the socket
+        // level, never via .Length on the raw data).
+        string connBuf = WebApp.MakeBuffer(65536);
+        bool keepAlive = true;
+        while (keepAlive) {
+            int firstN = await Socket.RecvIntoAsync(clientSock, connBuf, 65535);
+            if (firstN <= 0) { break; }
+            string rawData = connBuf;
+
+            // Guard: header block must stay under the receive buffer (64KB).
+            // Only scanned when the first recv actually filled the buffer.
+            if (firstN >= 65000 && WebApp.FindHeaderEnd(rawData) < 0) {
+                int _s = await client.SendAsync(WebApp.SimpleResponse(431,
+                    "Request Header Fields Too Large", "header block too large"));
+                break;
+            }
+
+            HttpRequest request = HttpRequest.Parse(rawData);
+            keepAlive = request.keepAlive;
+            HttpContext ctx = HttpContext.From(request);
+            Route route = this.router.Match(ctx);
+
+            if (route != null && route.streamUpload && request.contentLength > 0) {
+                // Streaming upload: the body goes to disk in 64KB chunks --
+                // memory stays flat no matter how large the file is.
+                if (request.contentLength > this.maxUploadBytes) {
+                    int _s2 = await client.SendAsync(WebApp.SimpleResponse(413,
+                        "Payload Too Large", "upload exceeds limit"));
+                    break;
+                }
+                string tmp = await this.StreamBodyToFile(clientSock, connBuf,
+                    firstN, request);
+                if (tmp.Length == 0) {
+                    int _s3 = await client.SendAsync(WebApp.SimpleResponse(400,
+                        "Bad Request", "upload failed"));
+                    break;
+                }
+                ctx.state.Set("upload_path", tmp);
+                ctx.state.Set("upload_size", Convert.ToString(request.contentLength));
+                request.body = "";
+            } else {
+                // In-memory body: reject oversized bodies BEFORE buffering them.
+                if (request.contentLength > this.maxBodyBytes) {
+                    int _s4 = await client.SendAsync(WebApp.SimpleResponse(413,
+                        "Payload Too Large", "body exceeds limit"));
+                    break;
+                }
+                // The first recv may not contain the full body; keep reading
+                // until Content-Length is satisfied (bounded above).
+                if (request.contentLength > 0
+                    && request.body.Length < request.contentLength) {
+                    StringBuilder acc = new StringBuilder();
+                    acc.Append(request.body);
+                    int have = request.body.Length;
+                    bool ioError = false;
+                    while (have < request.contentLength && !ioError) {
+                        string more = await client.RecvAsync(65536);
+                        if (more.Length == 0) { ioError = true; }
+                        else {
+                            acc.Append(more);
+                            have = have + more.Length;
+                            if (have > this.maxBodyBytes) { ioError = true; }
+                        }
+                    }
+                    if (ioError) {
+                        int _s5 = await client.SendAsync(WebApp.SimpleResponse(400,
+                            "Bad Request", "incomplete or oversized body"));
+                        break;
+                    }
+                    request.body = acc.ToString();
+                    HttpContext.ParseFormBody(request, ctx);
+                }
+            }
+
+            string responseData = this.Dispatch(ctx, route, keepAlive);
+            int _sent = await client.SendAsync(responseData);
+            if (!keepAlive) { break; }
+        }
+        client.Close();
+        this.activeConnections = this.activeConnections - 1;
+    }
+
+    /// <summary>Streams the request body into a server-named file under
+    /// uploadDir (the client's filename is never used, so path traversal is
+    /// impossible). Every write uses explicit socket-level byte counts +
+    /// fwrite, so binary payloads with NUL bytes land intact, and only one
+    /// 64KB buffer is alive regardless of upload size. Returns "" on IO
+    /// failure.</summary>
+    async string StreamBodyToFile(int sock, string firstBuf, int firstN,
+                                  HttpRequest request) {
+        if (!Directory.Exists(this.uploadDir)) {
+            Directory.CreateDirectoryRecursive(this.uploadDir);
+        }
+        this.uploadSeq = this.uploadSeq + 1;
+        string tmp = this.uploadDir + "/upload_" + Convert.ToString(WebApp.NowSeconds())
+            + "_" + Convert.ToString(this.uploadSeq) + ".bin";
+        int fp = fopen(tmp, "wb");
+        if (fp == 0) { return ""; }
+        int total = request.contentLength;
+        int have = 0;
+        // Body bytes that arrived in the same packet as the headers: computed
+        // from the socket byte count, NOT string length (binary-safe), and
+        // copied out with an explicit-length Substring (byte-accurate memcpy).
+        int headerEnd = WebApp.FindHeaderEnd(firstBuf);
+        if (headerEnd >= 0 && firstN > headerEnd + 4) {
+            int bodyInFirst = firstN - headerEnd - 4;
+            if (bodyInFirst > total) { bodyInFirst = total; }
+            string firstChunk = firstBuf.Substring(headerEnd + 4, bodyInFirst);
+            int _w0 = fwrite(firstChunk, 1, bodyInFirst, fp);
+            have = bodyInFirst;
+        }
+        string buf = WebApp.MakeBuffer(65536);
+        while (have < total) {
+            int n = await Socket.RecvIntoAsync(sock, buf, 65535);
+            if (n <= 0) { int _c1 = fclose(fp); return ""; }
+            if (have + n > total) { n = total - have; }
+            int _w = fwrite(buf, 1, n, fp);
+            have = have + n;
+        }
+        int _c2 = fclose(fp);
+        return tmp;
+    }
+
+    /// <summary>Preallocates a reusable ARC-managed receive buffer.</summary>
+    static string MakeBuffer(int size) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < size) { sb.Append(" "); i = i + 1; }
+        return sb.ToString();
+    }
+
+    /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.</summary>
+    string Dispatch(HttpContext ctx, Route route, bool keepAlive) {
+        int startedAt = WebApp.NowSeconds();
+        this.totalRequests = this.totalRequests + 1;
+
+        // Global rate limit (per second across all routes).
+        if (this.globalLimit > 0
+            && !this.limiter.Allow("_global_", this.globalLimit, startedAt)) {
+            ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
+            ctx.Json("{\"code\":\"429\",\"msg\":\"too many requests\"}");
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        // Before-hooks may short-circuit (must write a response first).
+        if (!this.hooks.RunBefore(ctx)) {
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        if (route == null) {
+            if (this.router.PathExists(ctx.path)) {
+                ctx.Status(405, "Method Not Allowed");
+                ctx.Json("{\"code\":\"405\",\"msg\":\"method not allowed\"}");
+            } else {
+                ctx.Status(404, "Not Found");
+                ctx.Json("{\"code\":\"404\",\"msg\":\"not found\"}");
+            }
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        string routeKey = route.Key();
+
+        // Per-route rate limit.
+        if (route.rateLimit > 0
+            && !this.limiter.Allow(routeKey, route.rateLimit, startedAt)) {
+            ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
+            ctx.Json("{\"code\":\"429\",\"msg\":\"route rate limit exceeded\"}");
+            return ctx.BuildResponse(keepAlive);
+        }
+
+        // Auth guard: bearer token or session cookie must map to a user.
+        if (route.needsAuth) {
+            string uid = this.AuthUser(ctx);
+            if (uid.Length == 0) {
+                ctx.Status(401, "Unauthorized");
+                ctx.Json("{\"code\":\"401\",\"msg\":\"authentication required\"}");
+                return ctx.BuildResponse(keepAlive);
+            }
+            ctx.state.Set("uid", uid);
+        }
+
+        HttpHandler h = route.handler;
+        h(ctx);
+        if (!ctx.ended) {
+            ctx.Status(500, "Internal Server Error");
+            ctx.Json("{\"code\":\"500\",\"msg\":\"handler produced no response\"}");
+        }
+
+        int elapsed = WebApp.NowSeconds() - startedAt;
+        this.stats.Record(routeKey, elapsed * 1000);
+        this.hooks.RunAfter(ctx, elapsed * 1000);
+        return ctx.BuildResponse(keepAlive);
+    }
+
+    /// <summary>Resolves the current user from Authorization: Bearer or the
+    /// session cookie; "" when anonymous.</summary>
+    string AuthUser(HttpContext ctx) {
+        string auth = ctx.Header("Authorization");
+        if (auth.Length > 7 && auth.Substring(0, 7) == "Bearer ") {
+            return this.sessions.UserOf(auth.Substring(7));
+        }
+        string cookie = ctx.Cookie("zsession");
+        if (cookie.Length > 0) { return this.sessions.UserOf(cookie); }
+        return "";
+    }
+
+    /// <summary>Status snapshot for /api/status.</summary>
+    string StatusJson() {
+        return "{\"total_requests\":" + Convert.ToString(this.totalRequests)
+            + ",\"active_connections\":" + Convert.ToString(this.activeConnections)
+            + ",\"routes\":" + this.stats.ToJson() + "}";
+    }
+
+    static string SimpleResponse(int code, string text, string msg) {
+        string body = "{\"code\":\"" + Convert.ToString(code) + "\",\"msg\":\"" + msg + "\"}";
+        return "HTTP/1.1 " + Convert.ToString(code) + " " + text
+            + "\r\nContent-Type: application/json\r\nContent-Length: "
+            + Convert.ToString(body.Length)
+            + "\r\nConnection: close\r\n\r\n" + body;
+    }
+
+    static int FindHeaderEnd(string raw) {
+        int i = 0;
+        int n = raw.Length;
+        while (i + 4 <= n) {
+            if (raw.Substring(i, 4) == "\r\n\r\n") { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}

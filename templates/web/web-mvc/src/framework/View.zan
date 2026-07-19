@@ -1,0 +1,245 @@
+using System;
+using System.IO;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Named values for a render: string variables plus named lists of row maps
+/// (for {{#each}} blocks).
+/// </summary>
+class RowList {
+    string name;
+    List<StrMap> rows;
+
+    static RowList Create(string name) {
+        RowList rl = new RowList();
+        rl.name = name;
+        rl.rows = new List<StrMap>();
+        return rl;
+    }
+}
+
+class ViewData {
+    StrMap vars;
+    List<RowList> lists;
+
+    ViewData() {
+        this.vars = StrMap.Create();
+        this.lists = new List<RowList>();
+    }
+
+    static ViewData Create() { return new ViewData(); }
+
+    ViewData Set(string key, string val) { this.vars.Set(key, val); return this; }
+
+    List<StrMap> AddList(string name) {
+        RowList rl = RowList.Create(name);
+        this.lists.Add(rl);
+        return rl.rows;
+    }
+
+    List<StrMap> ListOf(string name) {
+        int i = 0;
+        while (i < this.lists.Count) {
+            if (this.lists[i].name == name) { return this.lists[i].rows; }
+            i = i + 1;
+        }
+        return null;
+    }
+}
+
+/// <summary>
+/// In-memory template engine. All templates under the views directory are
+/// read from disk ONCE at startup (View.LoadDir) and rendered from memory
+/// afterwards -- request handling never touches the filesystem, mirroring
+/// the "templates live in memory" design of the original swoole framework.
+///
+/// Syntax:
+///   {{name}}                  HTML-escaped variable
+///   {{{name}}}                raw (unescaped) variable
+///   {{#if name}}...{{/if}}    emitted when var is non-empty and not "0"
+///   {{#each name}}...{{/each}} repeated per row; {{key}} reads row fields
+///   layout.html + {{content}} wraps every RenderPage() body
+/// </summary>
+class View {
+    StrMap templates;      // name -> template source (in memory)
+    string dir;
+    bool devReload;        // dev only: re-read templates on each render
+
+    View() {
+        this.templates = StrMap.Create();
+        this.dir = "";
+        this.devReload = false;
+    }
+
+    /// <summary>Loads every .html under `dir` (one level) into memory.</summary>
+    static View LoadDir(string dir) {
+        View v = new View();
+        v.dir = dir;
+        v.LoadAll();
+        return v;
+    }
+
+    void LoadAll() {
+        if (!Directory.Exists(this.dir)) { return; }
+        List<string> files = Directory.GetFiles(this.dir);
+        int i = 0;
+        while (i < files.Count) {
+            string fn = files[i];
+            if (fn.Length > 5 && fn.Substring(fn.Length - 5, 5) == ".html") {
+                string name = fn.Substring(0, fn.Length - 5);
+                this.templates.Set(name, File.ReadAllText(this.dir + "/" + fn));
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Renders a template by name from the in-memory cache.</summary>
+    string Render(string name, ViewData data) {
+        if (this.devReload) { this.LoadAll(); }
+        string tpl = this.templates.Get(name);
+        if (tpl.Length == 0) { return "<!-- view not found: " + name + " -->"; }
+        return View.RenderStr(tpl, data, null);
+    }
+
+    /// <summary>Renders `name` and wraps it into layout.html ({{content}}).</summary>
+    string RenderPage(string name, ViewData data) {
+        string inner = this.Render(name, data);
+        string layout = this.templates.Get("layout");
+        if (layout.Length == 0) { return inner; }
+        return View.ReplaceOnce(View.RenderStr(layout, data, null), "{{content}}", inner);
+    }
+
+    // ---- engine core ----
+
+    static string RenderStr(string tpl, ViewData data, StrMap row) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int n = tpl.Length;
+        while (i < n) {
+            int open = View.Find(tpl, "{{", i);
+            if (open < 0) {
+                sb.Append(tpl.Substring(i, n - i));
+                return sb.ToString();
+            }
+            sb.Append(tpl.Substring(i, open - i));
+            // {{{raw}}}
+            if (open + 2 < n && tpl.Substring(open + 2, 1) == "{") {
+                int close = View.Find(tpl, "}}}", open + 3);
+                if (close < 0) { return sb.ToString(); }
+                string key = View.Trim(tpl.Substring(open + 3, close - open - 3));
+                sb.Append(View.Lookup(key, data, row));
+                i = close + 3;
+            } else {
+                int close = View.Find(tpl, "}}", open + 2);
+                if (close < 0) { return sb.ToString(); }
+                string tag = View.Trim(tpl.Substring(open + 2, close - open - 2));
+                if (tag.Length > 4 && tag.Substring(0, 4) == "#if ") {
+                    string key = View.Trim(tag.Substring(4, tag.Length - 4));
+                    int endIf = View.FindTag(tpl, "{{/if}}", close + 2);
+                    if (endIf < 0) { return sb.ToString(); }
+                    string body = tpl.Substring(close + 2, endIf - close - 2);
+                    string val = View.Lookup(key, data, row);
+                    if (val.Length > 0 && val != "0" && val != "false") {
+                        sb.Append(View.RenderStr(body, data, row));
+                    }
+                    i = endIf + 7;
+                } else if (tag.Length > 6 && tag.Substring(0, 6) == "#each ") {
+                    string key = View.Trim(tag.Substring(6, tag.Length - 6));
+                    int endEach = View.FindTag(tpl, "{{/each}}", close + 2);
+                    if (endEach < 0) { return sb.ToString(); }
+                    string body = tpl.Substring(close + 2, endEach - close - 2);
+                    List<StrMap> rows = null;
+                    if (data != null) { rows = data.ListOf(key); }
+                    if (rows != null) {
+                        int r = 0;
+                        while (r < rows.Count) {
+                            sb.Append(View.RenderStr(body, data, rows[r]));
+                            r = r + 1;
+                        }
+                    }
+                    i = endEach + 9;
+                } else if (tag == "content") {
+                    // handled by RenderPage; emit placeholder unchanged
+                    sb.Append("{{content}}");
+                    i = close + 2;
+                } else {
+                    sb.Append(View.HtmlEscape(View.Lookup(tag, data, row)));
+                    i = close + 2;
+                }
+            }
+        }
+        return sb.ToString();
+    }
+
+    static string Lookup(string key, ViewData data, StrMap row) {
+        if (row != null && row.Has(key)) { return row.Get(key); }
+        if (data != null) { return data.vars.Get(key); }
+        return "";
+    }
+
+    /// <summary>Escapes &lt; &gt; &amp; " so variables are XSS-safe by default.</summary>
+    static string HtmlEscape(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "<") { sb.Append("&lt;"); }
+            else if (ch == ">") { sb.Append("&gt;"); }
+            else if (ch == "&") { sb.Append("&amp;"); }
+            else if (ch == "\"") { sb.Append("&quot;"); }
+            else { sb.Append(ch); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static int Find(string hay, string needle, int from) {
+        int n = needle.Length;
+        int h = hay.Length;
+        int i = from;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>Finds a closing tag, skipping nested blocks of the same kind.</summary>
+    static int FindTag(string tpl, string closeTag, int from) {
+        string openPrefix = "{{#if";
+        if (closeTag == "{{/each}}") { openPrefix = "{{#each"; }
+        int depth = 0;
+        int i = from;
+        int n = tpl.Length;
+        while (i < n) {
+            int nextOpen = View.Find(tpl, openPrefix, i);
+            int nextClose = View.Find(tpl, closeTag, i);
+            if (nextClose < 0) { return -1; }
+            if (nextOpen >= 0 && nextOpen < nextClose) {
+                depth = depth + 1;
+                i = nextOpen + openPrefix.Length;
+            } else if (depth > 0) {
+                depth = depth - 1;
+                i = nextClose + closeTag.Length;
+            } else {
+                return nextClose;
+            }
+        }
+        return -1;
+    }
+
+    static string ReplaceOnce(string s, string what, string with) {
+        int p = View.Find(s, what, 0);
+        if (p < 0) { return s; }
+        return s.Substring(0, p) + with + s.Substring(p + what.Length);
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b && s.Substring(a, 1) == " ") { a = a + 1; }
+        while (b > a && s.Substring(b - 1, 1) == " ") { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+}

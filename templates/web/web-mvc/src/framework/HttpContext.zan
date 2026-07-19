@@ -1,0 +1,224 @@
+using System;
+using System.Text;
+using System.Net.Http;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Per-request context: parsed request data (query / form / route params /
+/// cookies) plus the response the handler builds (status / headers / body).
+/// One HttpContext is created per request and dropped when it is answered,
+/// so ARC reclaims everything without a request-scoped pool.
+/// </summary>
+class HttpContext {
+    HttpRequest request;
+    string method;
+    string path;
+    StrMap routeParams;
+    StrMap query;
+    StrMap form;
+    StrMap state;      // per-request scratch space for hooks (e.g. auth uid)
+
+    int status;
+    string statusText;
+    string contentType;
+    string body;
+    List<string> headers;
+    bool ended;        // a hook or handler already produced the response
+
+    HttpContext() {
+        this.method = "";
+        this.path = "";
+        this.routeParams = StrMap.Create();
+        this.query = StrMap.Create();
+        this.form = StrMap.Create();
+        this.state = StrMap.Create();
+        this.status = 200;
+        this.statusText = "OK";
+        this.contentType = "text/html; charset=utf-8";
+        this.body = "";
+        this.headers = new List<string>();
+        this.ended = false;
+    }
+
+    static HttpContext From(HttpRequest req) {
+        HttpContext ctx = new HttpContext();
+        ctx.request = req;
+        ctx.method = req.method;
+        ctx.path = req.path;
+        HttpContext.ParsePairs(req.queryString, ctx.query);
+        if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH") {
+            if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
+                HttpContext.ParsePairs(req.body, ctx.form);
+            }
+        }
+        return ctx;
+    }
+
+    /// <summary>Re-parses the form body after a multi-packet body finished
+    /// buffering (the initial parse only saw the first packet).</summary>
+    static void ParseFormBody(HttpRequest req, HttpContext ctx) {
+        if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
+            ctx.form.Clear();
+            HttpContext.ParsePairs(req.body, ctx.form);
+        }
+    }
+
+    // ---- request accessors ----
+
+    string Param(string name) { return this.routeParams.Get(name); }
+    string Query(string name) { return this.query.Get(name); }
+    string Form(string name) { return this.form.Get(name); }
+    string Body() { return this.request.body; }
+    string Header(string name) { return this.request.GetHeader(name); }
+
+    /// <summary>Reads one cookie from the Cookie header, or "".</summary>
+    string Cookie(string name) {
+        string all = this.request.GetHeader("Cookie");
+        if (all.Length == 0) { return ""; }
+        string prefix = name + "=";
+        int i = 0;
+        while (i < all.Length) {
+            // skip leading spaces / separators
+            while (i < all.Length && (all.Substring(i, 1) == " " || all.Substring(i, 1) == ";")) {
+                i = i + 1;
+            }
+            int e = i;
+            while (e < all.Length && all.Substring(e, 1) != ";") { e = e + 1; }
+            string part = all.Substring(i, e - i);
+            if (part.Length > prefix.Length && part.Substring(0, prefix.Length) == prefix) {
+                return part.Substring(prefix.Length);
+            }
+            i = e + 1;
+        }
+        return "";
+    }
+
+    bool IsAjax() {
+        string x = this.request.GetHeader("X-Requested-With");
+        return x == "XMLHttpRequest" || x == "xmlhttprequest";
+    }
+
+    // ---- response builders ----
+
+    HttpContext Status(int code, string text) {
+        this.status = code;
+        this.statusText = text;
+        return this;
+    }
+
+    HttpContext SetHeader(string name, string val) {
+        this.headers.Add(name + ": " + val);
+        return this;
+    }
+
+    HttpContext SetCookie(string name, string val, int maxAgeSeconds) {
+        this.headers.Add("Set-Cookie: " + name + "=" + val
+            + "; Max-Age=" + Convert.ToString(maxAgeSeconds) + "; Path=/; HttpOnly");
+        return this;
+    }
+
+    void Html(string html) {
+        this.contentType = "text/html; charset=utf-8";
+        this.body = html;
+        this.ended = true;
+    }
+
+    void Text(string text) {
+        this.contentType = "text/plain; charset=utf-8";
+        this.body = text;
+        this.ended = true;
+    }
+
+    void Json(string json) {
+        this.contentType = "application/json";
+        this.body = json;
+        this.ended = true;
+    }
+
+    /// <summary>Uniform API envelope: {"code":...,"msg":...,"data":...}.
+    /// data must already be a JSON value (object/array/string literal).</summary>
+    void Api(string code, string msg, string data) {
+        this.Json("{\"code\":\"" + code + "\",\"msg\":\"" + JsonStr.Escape(msg)
+            + "\",\"data\":" + data + "}");
+    }
+
+    void Redirect(string url) {
+        this.status = 302;
+        this.statusText = "Found";
+        this.headers.Add("Location: " + url);
+        this.body = "";
+        this.ended = true;
+    }
+
+    /// <summary>Serializes the response into a raw HTTP/1.1 message.</summary>
+    string BuildResponse(bool keepAlive) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 ");
+        sb.Append(Convert.ToString(this.status));
+        sb.Append(" ");
+        sb.Append(this.statusText);
+        sb.Append("\r\nContent-Type: ");
+        sb.Append(this.contentType);
+        sb.Append("\r\nContent-Length: ");
+        sb.Append(Convert.ToString(this.body.Length));
+        if (keepAlive) { sb.Append("\r\nConnection: keep-alive"); }
+        else { sb.Append("\r\nConnection: close"); }
+        sb.Append("\r\nServer: ZanWeb/0.1");
+        int i = 0;
+        while (i < this.headers.Count) {
+            sb.Append("\r\n");
+            sb.Append(this.headers[i]);
+            i = i + 1;
+        }
+        sb.Append("\r\n\r\n");
+        sb.Append(this.body);
+        return sb.ToString();
+    }
+
+    // ---- helpers ----
+
+    static bool StartsWith(string s, string prefix) {
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    /// <summary>Parses "a=1&b=2" pairs (URL-decoded) into a StrMap.</summary>
+    static void ParsePairs(string s, StrMap into) {
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            int eq = -1;
+            int e = i;
+            while (e < n && s.Substring(e, 1) != "&") {
+                if (eq < 0 && s.Substring(e, 1) == "=") { eq = e; }
+                e = e + 1;
+            }
+            if (eq > i) {
+                string k = Encoding.UrlDecode(s.Substring(i, eq - i));
+                string v = Encoding.UrlDecode(s.Substring(eq + 1, e - eq - 1));
+                into.Set(k, v);
+            }
+            i = e + 1;
+        }
+    }
+}
+
+/// <summary>Tiny JSON string escaper for building responses safely.</summary>
+class JsonStr {
+    static string Escape(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\"") { sb.Append("\\\""); }
+            else if (ch == "\\") { sb.Append("\\\\"); }
+            else if (ch == "\n") { sb.Append("\\n"); }
+            else if (ch == "\r") { sb.Append("\\r"); }
+            else if (ch == "\t") { sb.Append("\\t"); }
+            else { sb.Append(ch); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}
