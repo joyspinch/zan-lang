@@ -1,0 +1,659 @@
+// Battle City -- a complete arcade product on GameKit. Defend the base, drive a
+// tank across a destructible brick / steel / water map, shoot waves of enemy
+// tanks with simple roaming AI, clear levels, keep lives, and track a
+// persistent high-score profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace BattleCity;
+
+class Profile {
+    int high;
+    int bestLevel;
+    int games;
+
+    static string Path() { return "battlecity_save.txt"; }
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fb) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fb;
+    }
+    static Profile Load() {
+        Profile p = new Profile();
+        p.high = 0; p.bestLevel = 1; p.games = 0;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.high = Profile.ReadKey(lines, "high", 0);
+            p.bestLevel = Profile.ReadKey(lines, "bestLevel", 1);
+            p.games = Profile.ReadKey(lines, "games", 0);
+        }
+        return p;
+    }
+    void Save() {
+        string s = "high=" + this.high + "\nbestLevel=" + this.bestLevel + "\ngames=" + this.games + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+}
+
+class BcGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    int[] map;        // N*N tiles: 0 empty,1 brick,2 steel,3 base,4 water
+    // player
+    int px;
+    int py;
+    int pdir;
+    bool palive;
+    int pcd;
+    int lives;
+    // player bullet
+    bool pbAlive;
+    int pbx;
+    int pby;
+    int pbdir;
+    // enemies (max 5 alive)
+    int[] ex;
+    int[] ey;
+    int[] edir;
+    bool[] ealive;
+    int[] ecd;
+    int[] eturn;
+    // enemy bullets
+    int[] bx;
+    int[] by;
+    int[] bdir;
+    bool[] bAlive;
+    int remaining;    // enemies left to spawn this level
+    int spawnAt;
+    int scene;        // 0 menu,1 play,2 over,3 win
+    int level;
+    int score;
+    bool baseDead;
+    int mouseX;
+    int mouseY;
+    bool[] key;       // dir keys held: 0 up,1 right,2 down,3 left
+    int shake;
+    string msg;
+    int msgAt;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+    int demoTurnAt;
+
+    static int N() { return 24; }
+    static int T() { return 26; }
+    static int FX() { return 90; }
+    static int FY() { return 90; }
+    static int TS() { return 44; }
+    static int PSPD() { return 3; }
+    static int ESPD() { return 2; }
+    static int BSPD() { return 7; }
+    static int BSZ() { return 8; }
+
+    static BcGame Create(Host h) {
+        BcGame g = new BcGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 7788991);
+        g.map = new int[BcGame.N() * BcGame.N()];
+        g.ex = new int[5]; g.ey = new int[5]; g.edir = new int[5];
+        g.ealive = new bool[5]; g.ecd = new int[5]; g.eturn = new int[5];
+        g.bx = new int[5]; g.by = new int[5]; g.bdir = new int[5]; g.bAlive = new bool[5];
+        g.key = new bool[4];
+        g.scene = 0;
+        g.msg = "";
+        g.demo = File.Exists("battlecity_demo.txt");
+        if (g.demo) { g.StartGame(Sdl.Ticks()); }
+        return g;
+    }
+
+    int Dx(int d) { if (d == 1) { return 1; } if (d == 3) { return -1; } return 0; }
+    int Dy(int d) { if (d == 0) { return -1; } if (d == 2) { return 1; } return 0; }
+
+    void SetTile(int c, int r, int v) { if (c >= 0 && c < BcGame.N() && r >= 0 && r < BcGame.N()) { this.map[r * BcGame.N() + c] = v; } }
+
+    void BuildLevel(int now) {
+        int i = 0;
+        while (i < BcGame.N() * BcGame.N()) { this.map[i] = 0; i = i + 1; }
+        int N = BcGame.N();
+        // base at bottom center (2x2) with brick wall around
+        int bc = N / 2 - 1;
+        int br = N - 2;
+        this.SetTile(bc, br, 3); this.SetTile(bc + 1, br, 3);
+        this.SetTile(bc, br + 1, 3); this.SetTile(bc + 1, br + 1, 3);
+        int cc = bc - 1;
+        while (cc <= bc + 2) { this.SetTile(cc, br - 1, 1); cc = cc + 1; }
+        this.SetTile(bc - 1, br, 1); this.SetTile(bc + 2, br, 1);
+        this.SetTile(bc - 1, br + 1, 1); this.SetTile(bc + 2, br + 1, 1);
+        // brick clusters
+        int clusters = 16 + this.level * 3;
+        int k = 0;
+        while (k < clusters) {
+            int c0 = this.rng.Range(1, N - 3);
+            int r0 = this.rng.Range(2, N - 5);
+            int w = this.rng.Range(2, 5);
+            int hgt = this.rng.Range(1, 3);
+            int rr = 0;
+            while (rr < hgt) {
+                int ww = 0;
+                while (ww < w) { if (this.map[(r0 + rr) * N + (c0 + ww)] == 0) { this.SetTile(c0 + ww, r0 + rr, 1); } ww = ww + 1; }
+                rr = rr + 1;
+            }
+            k = k + 1;
+        }
+        // steel blocks
+        int steel = 4 + this.level;
+        k = 0;
+        while (k < steel) {
+            int c0 = this.rng.Range(2, N - 3);
+            int r0 = this.rng.Range(3, N - 6);
+            this.SetTile(c0, r0, 2); this.SetTile(c0 + 1, r0, 2);
+            k = k + 1;
+        }
+        // water strips
+        int water = 2 + this.level / 2;
+        k = 0;
+        while (k < water) {
+            int c0 = this.rng.Range(2, N - 5);
+            int r0 = this.rng.Range(4, N - 7);
+            int ww = 0;
+            while (ww < 3) { if (this.map[r0 * N + c0 + ww] == 0) { this.SetTile(c0 + ww, r0, 4); } ww = ww + 1; }
+            k = k + 1;
+        }
+        // clear player spawn area
+        int i2 = 0;
+        while (i2 < 4) {
+            int c = bc - 3 + i2;
+            this.SetTile(c, N - 3, 0);
+            i2 = i2 + 1;
+        }
+    }
+
+    bool Solid(int c, int r) {
+        if (c < 0 || c >= BcGame.N() || r < 0 || r >= BcGame.N()) { return true; }
+        int v = this.map[r * BcGame.N() + c];
+        return v == 1 || v == 2 || v == 3 || v == 4;
+    }
+
+    bool RectFree(int x, int y, int who, int selfIdx) {
+        int ts = BcGame.TS();
+        if (x < 0 || y < 0) { return false; }
+        if (x + ts > BcGame.N() * BcGame.T() || y + ts > BcGame.N() * BcGame.T()) { return false; }
+        int c0 = x / BcGame.T(); int c1 = (x + ts - 1) / BcGame.T();
+        int r0 = y / BcGame.T(); int r1 = (y + ts - 1) / BcGame.T();
+        int rr = r0;
+        while (rr <= r1) { int cc = c0; while (cc <= c1) { if (this.Solid(cc, rr)) { return false; } cc = cc + 1; } rr = rr + 1; }
+        // tank overlaps
+        if (who != 0 || selfIdx != -1) {
+            if (this.palive && !(who == 0)) {
+                if (this.Overlap(x, y, this.px, this.py)) { return false; }
+            }
+        }
+        int e = 0;
+        while (e < 5) {
+            if (this.ealive[e] && !(who == 1 && e == selfIdx)) {
+                if (this.Overlap(x, y, this.ex[e], this.ey[e])) { return false; }
+            }
+            e = e + 1;
+        }
+        return true;
+    }
+
+    bool Overlap(int ax, int ay, int bx2, int by2) {
+        int ts = BcGame.TS();
+        return ax < bx2 + ts && ax + ts > bx2 && ay < by2 + ts && ay + ts > by2;
+    }
+
+    void StartGame(int now) {
+        this.level = 1;
+        this.score = 0;
+        this.lives = 3;
+        this.scene = 1;
+        this.StartLevel(now);
+    }
+
+    void StartLevel(int now) {
+        this.BuildLevel(now);
+        int bc = BcGame.N() / 2 - 1;
+        this.px = (bc - 2) * BcGame.T();
+        this.py = (BcGame.N() - 3) * BcGame.T();
+        this.pdir = 0;
+        this.palive = true;
+        this.pcd = 0;
+        this.pbAlive = false;
+        this.baseDead = false;
+        int e = 0;
+        while (e < 5) { this.ealive[e] = false; this.bAlive[e] = false; e = e + 1; }
+        this.remaining = 8 + this.level * 2;
+        this.spawnAt = now + 400;
+        this.msg = "LEVEL " + this.level;
+        this.msgAt = now + 1500;
+    }
+
+    void SpawnEnemy(int now) {
+        if (this.remaining <= 0) { return; }
+        int slot = -1;
+        int e = 0;
+        while (e < 5) { if (!this.ealive[e]) { slot = e; e = 5; } e = e + 1; }
+        if (slot < 0) { return; }
+        int N = BcGame.N();
+        int[] spots = new int[3];
+        spots[0] = 0; spots[1] = N / 2 - 1; spots[2] = N - 2;
+        int tries = 0;
+        while (tries < 3) {
+            int col = spots[this.rng.Range(0, 3)];
+            int x = col * BcGame.T();
+            int y = 0;
+            if (this.RectFree(x, y, 1, slot)) {
+                this.ex[slot] = x; this.ey[slot] = y; this.edir[slot] = 2;
+                this.ealive[slot] = true; this.ecd[slot] = now + this.rng.Range(400, 1200);
+                this.eturn[slot] = now + this.rng.Range(500, 1500);
+                this.remaining = this.remaining - 1;
+                return;
+            }
+            tries = tries + 1;
+        }
+    }
+
+    void MoveTank(int who, int idx, int dir, int spd, int now) {
+        int x; int y;
+        if (who == 0) { x = this.px; y = this.py; } else { x = this.ex[idx]; y = this.ey[idx]; }
+        int nx = x + this.Dx(dir) * spd;
+        int ny = y + this.Dy(dir) * spd;
+        // snap perpendicular axis toward grid to ease cornering
+        if (dir == 0 || dir == 2) { int gx = ((x + BcGame.T() / 2) / BcGame.T()) * BcGame.T(); nx = this.SnapAxis(x, gx); ny = y + this.Dy(dir) * spd; }
+        if (dir == 1 || dir == 3) { int gy = ((y + BcGame.T() / 2) / BcGame.T()) * BcGame.T(); ny = this.SnapAxis(y, gy); nx = x + this.Dx(dir) * spd; }
+        if (this.RectFree(nx, ny, who, idx)) {
+            if (who == 0) { this.px = nx; this.py = ny; } else { this.ex[idx] = nx; this.ey[idx] = ny; }
+        } else {
+            // try pure axis move without snap
+            int ax = x + this.Dx(dir) * spd;
+            int ay = y + this.Dy(dir) * spd;
+            if (this.RectFree(ax, ay, who, idx)) { if (who == 0) { this.px = ax; this.py = ay; } else { this.ex[idx] = ax; this.ey[idx] = ay; } }
+        }
+    }
+
+    int SnapAxis(int v, int g) {
+        if (g > v) { int d = g - v; if (d > 2) { d = 2; } return v + d; }
+        if (g < v) { int d = v - g; if (d > 2) { d = 2; } return v - d; }
+        return v;
+    }
+
+    void Fire(int who, int idx, int now) {
+        int x; int y; int dir;
+        if (who == 0) {
+            if (this.pbAlive || this.pcd > now) { return; }
+            x = this.px; y = this.py; dir = this.pdir;
+            int cx = x + BcGame.TS() / 2 - BcGame.BSZ() / 2 + this.Dx(dir) * BcGame.TS() / 2;
+            int cy = y + BcGame.TS() / 2 - BcGame.BSZ() / 2 + this.Dy(dir) * BcGame.TS() / 2;
+            this.pbx = cx; this.pby = cy; this.pbdir = dir; this.pbAlive = true; this.pcd = now + 320;
+        } else {
+            if (this.bAlive[idx]) { return; }
+            x = this.ex[idx]; y = this.ey[idx]; dir = this.edir[idx];
+            int cx = x + BcGame.TS() / 2 - BcGame.BSZ() / 2 + this.Dx(dir) * BcGame.TS() / 2;
+            int cy = y + BcGame.TS() / 2 - BcGame.BSZ() / 2 + this.Dy(dir) * BcGame.TS() / 2;
+            this.bx[idx] = cx; this.by[idx] = cy; this.bdir[idx] = dir; this.bAlive[idx] = true;
+        }
+    }
+
+    // returns true if bullet should die
+    bool BulletHitMap(int cx, int cy, bool strong, int now) {
+        int c = cx / BcGame.T();
+        int r = cy / BcGame.T();
+        if (c < 0 || c >= BcGame.N() || r < 0 || r >= BcGame.N()) { return true; }
+        int v = this.map[r * BcGame.N() + c];
+        if (v == 1) { this.map[r * BcGame.N() + c] = 0; return true; }
+        if (v == 2) { return true; }
+        if (v == 3) { this.baseDead = true; this.map[r * BcGame.N() + c] = 0; return true; }
+        return false;   // water/empty: pass
+    }
+
+    void StepBullets(int now) {
+        // player bullet
+        if (this.pbAlive) {
+            int steps = 0;
+            while (steps < BcGame.BSPD() && this.pbAlive) {
+                this.pbx = this.pbx + this.Dx(this.pbdir);
+                this.pby = this.pby + this.Dy(this.pbdir);
+                int mx = this.pbx + BcGame.BSZ() / 2;
+                int my = this.pby + BcGame.BSZ() / 2;
+                if (mx < 0 || my < 0 || mx >= BcGame.N() * BcGame.T() || my >= BcGame.N() * BcGame.T()) { this.pbAlive = false; }
+                else if (this.BulletHitMap(mx, my, false, now)) { this.pbAlive = false; this.shake = now + 120; }
+                else {
+                    int e = 0;
+                    while (e < 5) {
+                        if (this.ealive[e] && this.PointInTank(mx, my, this.ex[e], this.ey[e])) {
+                            this.ealive[e] = false; this.pbAlive = false; this.score = this.score + 100; this.shake = now + 150; e = 5;
+                        }
+                        e = e + 1;
+                    }
+                }
+                steps = steps + 1;
+            }
+        }
+        // enemy bullets
+        int b = 0;
+        while (b < 5) {
+            if (this.bAlive[b]) {
+                int steps = 0;
+                while (steps < BcGame.BSPD() && this.bAlive[b]) {
+                    this.bx[b] = this.bx[b] + this.Dx(this.bdir[b]);
+                    this.by[b] = this.by[b] + this.Dy(this.bdir[b]);
+                    int mx = this.bx[b] + BcGame.BSZ() / 2;
+                    int my = this.by[b] + BcGame.BSZ() / 2;
+                    if (mx < 0 || my < 0 || mx >= BcGame.N() * BcGame.T() || my >= BcGame.N() * BcGame.T()) { this.bAlive[b] = false; }
+                    else if (this.BulletHitMap(mx, my, false, now)) { this.bAlive[b] = false; }
+                    else if (this.palive && this.PointInTank(mx, my, this.px, this.py)) { this.bAlive[b] = false; this.KillPlayer(now); }
+                    steps = steps + 1;
+                }
+            }
+            b = b + 1;
+        }
+    }
+
+    bool PointInTank(int mx, int my, int tx, int ty) {
+        return mx >= tx && mx < tx + BcGame.TS() && my >= ty && my < ty + BcGame.TS();
+    }
+
+    void KillPlayer(int now) {
+        this.palive = false;
+        this.lives = this.lives - 1;
+        this.shake = now + 300;
+        if (this.lives <= 0) { this.EndGame(now); return; }
+        int bc = BcGame.N() / 2 - 1;
+        this.px = (bc - 2) * BcGame.T();
+        this.py = (BcGame.N() - 3) * BcGame.T();
+        this.pdir = 0;
+        this.palive = true;
+        this.pbAlive = false;
+    }
+
+    void EndGame(int now) {
+        this.scene = 2;
+        this.prof.games = this.prof.games + 1;
+        if (this.score > this.prof.high) { this.prof.high = this.score; }
+        if (this.level > this.prof.bestLevel) { this.prof.bestLevel = this.level; }
+        this.prof.Save();
+    }
+
+    bool AnyEnemyAlive() {
+        int e = 0;
+        while (e < 5) { if (this.ealive[e]) { return true; } e = e + 1; }
+        return false;
+    }
+
+    void EnemyAI(int now) {
+        int e = 0;
+        while (e < 5) {
+            if (this.ealive[e]) {
+                if (now >= this.eturn[e]) {
+                    // choose a new direction, biased toward the base
+                    int d = this.rng.Range(0, 4);
+                    if (this.rng.Range(0, 3) == 0) { d = 2; }   // downward bias
+                    this.edir[e] = d;
+                    this.eturn[e] = now + this.rng.Range(500, 1600);
+                }
+                this.MoveTank(1, e, this.edir[e], BcGame.ESPD(), now);
+                if (now >= this.ecd[e]) {
+                    this.Fire(1, e, now);
+                    this.ecd[e] = now + this.rng.Range(700, 1600);
+                }
+            }
+            e = e + 1;
+        }
+    }
+
+    // ----- input -------------------------------------------------------------
+
+    void OnKey(int sc, int now, bool down) {
+        if (down) {
+            if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } }
+            if (this.scene == 0) { if (sc == 40 || sc == 44) { this.StartGame(now); } }
+            else if (this.scene == 1) {
+                if (sc == 44) { this.Fire(0, -1, now); }
+                if (sc == 21) { this.StartGame(now); }
+            }
+            else if (this.scene == 2 || this.scene == 3) { if (sc == 40 || sc == 44) { this.StartGame(now); } }
+        }
+        if (sc == 82 || sc == 26) { this.key[0] = down; }   // up / W
+        if (sc == 79 || sc == 7) { this.key[1] = down; }    // right / D
+        if (sc == 81 || sc == 22) { this.key[2] = down; }   // down / S
+        if (sc == 80 || sc == 4) { this.key[3] = down; }    // left / A
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) { if (Draw.PointIn(cx, cy, 470, 620, 340, 74)) { this.StartGame(now); } return; }
+        if (this.scene == 2 || this.scene == 3) {
+            if (Draw.PointIn(cx, cy, 400, 470, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 470, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    void PlayerControl(int now) {
+        int dir = -1;
+        if (this.key[0]) { dir = 0; }
+        else if (this.key[1]) { dir = 1; }
+        else if (this.key[2]) { dir = 2; }
+        else if (this.key[3]) { dir = 3; }
+        if (dir >= 0) { this.pdir = dir; this.MoveTank(0, -1, dir, BcGame.PSPD(), now); }
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawTank(int x, int y, int dir, int cr, int cg, int cb, int ox, int oy) {
+        int ts = BcGame.TS();
+        int gx = BcGame.FX() + x + ox;
+        int gy = BcGame.FY() + y + oy;
+        Draw.RoundRectFill(this.r, gx + 2, gy + 2, ts - 4, ts - 4, 6, cr, cg, cb, 255);
+        Draw.RingRect(this.r, gx + 2, gy + 2, ts - 4, ts - 4, 2, 20, 24, 30, 255);
+        // treads
+        this.r.SetColor(30, 32, 38, 255);
+        this.r.FillRect(gx + 2, gy + 4, 6, ts - 8);
+        this.r.FillRect(gx + ts - 8, gy + 4, 6, ts - 8);
+        // barrel
+        int bw = 8;
+        int cx = gx + ts / 2;
+        int cy = gy + ts / 2;
+        int bl = ts / 2;
+        if (dir == 0) { this.r.SetColor(230, 230, 235, 255); this.r.FillRect(cx - bw / 2, gy - 4, bw, bl); }
+        if (dir == 2) { this.r.SetColor(230, 230, 235, 255); this.r.FillRect(cx - bw / 2, cy, bw, bl + 4); }
+        if (dir == 1) { this.r.SetColor(230, 230, 235, 255); this.r.FillRect(cx, cy - bw / 2, bl + 4, bw); }
+        if (dir == 3) { this.r.SetColor(230, 230, 235, 255); this.r.FillRect(gx - 4, cy - bw / 2, bl, bw); }
+        Draw.RoundRectFill(this.r, cx - 8, cy - 8, 16, 16, 5, cr - 20, cg - 20, cb - 20, 255);
+    }
+
+    void DrawPlay(int now) {
+        int ox = 0; int oy = 0;
+        if (now < this.shake) { ox = this.rng.Range(-3, 4); oy = this.rng.Range(-3, 4); }
+        this.host.Begin(10, 12, 16);
+        int fw = BcGame.N() * BcGame.T();
+        this.r.SetColor(24, 26, 32, 255);
+        this.r.FillRect(BcGame.FX(), BcGame.FY(), fw, fw);
+        // tiles
+        int r0 = 0;
+        while (r0 < BcGame.N()) {
+            int c0 = 0;
+            while (c0 < BcGame.N()) {
+                int v = this.map[r0 * BcGame.N() + c0];
+                if (v != 0) {
+                    int x = BcGame.FX() + c0 * BcGame.T() + ox;
+                    int y = BcGame.FY() + r0 * BcGame.T() + oy;
+                    int t = BcGame.T();
+                    if (v == 1) {
+                        this.r.SetColor(150, 70, 45, 255); this.r.FillRect(x, y, t, t);
+                        this.r.SetColor(90, 45, 30, 255);
+                        this.r.FillRect(x, y + t / 2 - 1, t, 2);
+                        this.r.FillRect(x + t / 2 - 1, y, 2, t / 2);
+                        this.r.FillRect(x + t / 4, y + t / 2, 2, t / 2);
+                        this.r.FillRect(x + 3 * t / 4, y + t / 2, 2, t / 2);
+                    } else if (v == 2) {
+                        this.r.SetColor(160, 168, 180, 255); this.r.FillRect(x, y, t, t);
+                        Draw.RingRect(this.r, x + 2, y + 2, t - 4, t - 4, 2, 210, 216, 226, 255);
+                    } else if (v == 3) {
+                        this.r.SetColor(220, 200, 90, 255); this.r.FillRect(x + 2, y + 2, t - 4, t - 4);
+                        Text.DrawCentered(this.r, "*", x + t / 2, y + 4, 2, 120, 90, 30, 255);
+                    } else if (v == 4) {
+                        this.r.SetColor(40, 90, 150, 255); this.r.FillRect(x, y, t, t);
+                        this.r.SetColor(80, 140, 210, 255); this.r.FillRect(x + 3, y + 5, t - 6, 3);
+                        this.r.FillRect(x + 3, y + t - 8, t - 6, 3);
+                    }
+                }
+                c0 = c0 + 1;
+            }
+            r0 = r0 + 1;
+        }
+        Draw.RingRect(this.r, BcGame.FX(), BcGame.FY(), fw, fw, 3, 70, 78, 96, 255);
+
+        // tanks
+        if (this.palive) { this.DrawTank(this.px, this.py, this.pdir, 210, 200, 90, ox, oy); }
+        int e = 0;
+        while (e < 5) {
+            if (this.ealive[e]) { this.DrawTank(this.ex[e], this.ey[e], this.edir[e], 200, 90, 90, ox, oy); }
+            e = e + 1;
+        }
+        // bullets
+        if (this.pbAlive) { this.r.SetColor(255, 245, 180, 255); this.r.FillRect(BcGame.FX() + this.pbx + ox, BcGame.FY() + this.pby + oy, BcGame.BSZ(), BcGame.BSZ()); }
+        int b = 0;
+        while (b < 5) {
+            if (this.bAlive[b]) { this.r.SetColor(255, 170, 120, 255); this.r.FillRect(BcGame.FX() + this.bx[b] + ox, BcGame.FY() + this.by[b] + oy, BcGame.BSZ(), BcGame.BSZ()); }
+            b = b + 1;
+        }
+
+        // HUD
+        int hx = BcGame.FX() + fw + 40;
+        Text.Draw(this.r, "BATTLE CITY", hx, 100, 3, 240, 240, 250, 255);
+        Text.Draw(this.r, "SCORE", hx, 160, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, "" + this.score, hx, 182, 4, 255, 210, 90, 2);
+        Text.Draw(this.r, "LEVEL  " + this.level, hx, 250, 2, 200, 210, 225, 255);
+        Text.Draw(this.r, "LIVES  " + this.lives, hx, 278, 2, 200, 210, 225, 255);
+        Text.Draw(this.r, "ENEMIES  " + this.remaining, hx, 306, 2, 200, 130, 130, 255);
+        Text.Draw(this.r, "HIGH  " + this.prof.high, hx, 348, 2, 170, 180, 200, 255);
+        Text.Draw(this.r, "MOVE  WASD / ARROWS", hx, 420, 1, 150, 160, 180, 255);
+        Text.Draw(this.r, "FIRE  SPACE", hx, 442, 1, 150, 160, 180, 255);
+
+        if (this.msg.Length > 0 && now < this.msgAt) { Text.DrawCentered(this.r, this.msg, BcGame.FX() + fw / 2, BcGame.FY() + fw / 2, 5, 250, 220, 120, 255); }
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/battlecity/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(8, 10, 16);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+        Text.DrawCenteredShadow(this.r, "BATTLE CITY", 640, 90, 8, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "DEFEND THE BASE", 640, 200, 3, 240, 208, 130, 3);
+        Ui.Panel(this.r, 420, 300, 440, 150, 16, 18, 26, 210);
+        Text.Draw(this.r, "HIGH SCORE", 448, 322, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, "" + this.prof.high, 448, 344, 5, 255, 210, 90, 3);
+        Text.Draw(this.r, "BEST LEVEL  " + this.prof.bestLevel, 448, 410, 2, 150, 160, 180, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "WASD/arrows move, SPACE fire, F11 fullscreen", 640, 720, 2, 176, 184, 200, 2);
+        this.host.End();
+    }
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 180);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 250; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        string title = "GAME OVER";
+        int tr = 230; int tg = 120; int tb = 90;
+        if (this.scene == 3) { title = "VICTORY!"; tr = 90; tg = 210; tb = 130; }
+        Text.DrawCentered(this.r, title, 640, by + 44, 7, tr, tg, tb, 255);
+        Text.DrawCentered(this.r, "SCORE " + this.score + "    LEVEL " + this.level, 640, by + 124, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, "HIGH " + this.prof.high, 640, by + 172, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 220, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 220, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    void DemoControl(int now) {
+        if (now >= this.demoTurnAt) {
+            int d = this.rng.Range(0, 4);
+            int i = 0;
+            while (i < 4) { this.key[i] = false; i = i + 1; }
+            this.key[d] = true;
+            this.demoTurnAt = now + this.rng.Range(300, 900);
+            if (this.rng.Range(0, 2) == 0) { this.Fire(0, -1, now); }
+        }
+    }
+
+    void Tick(int now) {
+        if (this.scene != 1) { return; }
+        if (this.demo) { this.DemoControl(now); }
+        this.PlayerControl(now);
+        this.EnemyAI(now);
+        this.StepBullets(now);
+        if (this.remaining > 0 && now >= this.spawnAt) { this.SpawnEnemy(now); this.spawnAt = now + 2200; }
+        if (this.baseDead) { this.EndGame(now); return; }
+        if (this.remaining <= 0 && !this.AnyEnemyAlive()) {
+            this.level = this.level + 1;
+            this.score = this.score + 300;
+            if (this.level > this.prof.bestLevel) { this.prof.bestLevel = this.level; }
+            this.StartLevel(now);
+        }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2 || this.scene == 3) { this.DrawOver(now); }
+        else { this.DrawPlay(now); }
+    }
+}
+
+class BcApp {
+    static void Main() {
+        Host h = Host.Create("Battle City", 1280, 800);
+        BcGame g = BcGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { h.ToggleFullscreen(); }
+                    else if (!SdlEvent.IsRepeat()) { g.OnKey(sc, now, true); }
+                }
+                if (ty == SdlEventType.KeyUp()) { g.OnKey(SdlEvent.Scancode(), now, false); }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) { cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true; }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}
