@@ -133,6 +133,20 @@ class GlyphFont {
         return w;
     }
 
+    // Draw one glyph (index into the 32..126 range) at design scale; returns
+    // the pen advance.
+    static int DrawGlyph(SdlRenderer r, int gi, int x, int y, int scale) {
+        if (gi < 0 || gi >= 95) { return GlyphFont.adv[0] * scale / 6; }
+        int m = GlyphFont.atlasScale;
+        int scw = GlyphFont.cellW * m;
+        int sch = GlyphFont.cellH * m;
+        int col = gi % GlyphFont.cols;
+        int row = gi / GlyphFont.cols;
+        r.DrawTextureRegion(GlyphFont.atlas, col * scw, row * sch, scw, sch,
+            x, y, GlyphFont.cellW * scale / 6, GlyphFont.cellH * scale / 6);
+        return GlyphFont.adv[gi] * scale / 6;
+    }
+
     static void Draw(SdlRenderer r, string text, int x, int y, int scale,
                      int cr, int cg, int cb, int ca) {
         GlyphFont.atlas.SetColor(cr, cg, cb);
@@ -468,16 +482,170 @@ class Talker {
     int Kind() { return this.kind; }
 }
 
+// UTF-8 decoding over Zan's byte-indexed strings, so game text can mix ASCII
+// with CJK. Decode(s, pos) returns the codepoint at pos[0] and advances it.
+class Utf8 {
+    static int Decode(string s, int[] pos) {
+        int i = pos[0];
+        int b0 = s[i] & 255;
+        if (b0 < 128) { pos[0] = i + 1; return b0; }
+        if (b0 >= 240 && i + 3 < s.Length) {
+            int cp = ((b0 & 7) << 18) + ((s[i + 1] & 63) << 12)
+                   + ((s[i + 2] & 63) << 6) + (s[i + 3] & 63);
+            pos[0] = i + 4; return cp;
+        }
+        if (b0 >= 224 && i + 2 < s.Length) {
+            int cp = ((b0 & 15) << 12) + ((s[i + 1] & 63) << 6) + (s[i + 2] & 63);
+            pos[0] = i + 3; return cp;
+        }
+        if (b0 >= 192 && i + 1 < s.Length) {
+            int cp = ((b0 & 31) << 6) + (s[i + 1] & 63);
+            pos[0] = i + 2; return cp;
+        }
+        pos[0] = i + 1;
+        return 63;
+    }
+}
+
+// Fixed-cell CJK glyph atlas baked by scripts/bake_cjk_font.py. The metadata
+// lists the baked codepoints sorted ascending (binary-searched at draw time);
+// any codepoint not in the atlas draws as a hollow box.
+class CjkFont {
+    static SdlTexture atlas;
+    static bool tried;
+    static bool ok;
+    static int cell;    // design cell (square, layout units)
+    static int cols;
+    static int scalePx; // atlas px per design unit
+    static int[] cps;   // sorted codepoints
+
+    static bool Ready(SdlRenderer r) {
+        if (CjkFont.tried) { return CjkFont.ok; }
+        CjkFont.tried = true;
+        if (!File.Exists("examples/game/common/assets/cjk_font.txt")) { return false; }
+        SdlTexture t = SdlTexture.LoadImage(r, "examples/game/common/assets/cjk_font.png");
+        if (t == null || !t.IsValid()) { return false; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        string meta = File.ReadAllText("examples/game/common/assets/cjk_font.txt");
+        int[] pos = new int[1];
+        pos[0] = 0;
+        CjkFont.cell = GlyphFont.NextInt(meta, pos);
+        CjkFont.cols = GlyphFont.NextInt(meta, pos);
+        CjkFont.scalePx = GlyphFont.NextInt(meta, pos);
+        int n = GlyphFont.NextInt(meta, pos);
+        if (n <= 0) { return false; }
+        CjkFont.cps = new int[n];
+        int i = 0;
+        while (i < n) {
+            CjkFont.cps[i] = GlyphFont.NextInt(meta, pos);
+            i = i + 1;
+        }
+        CjkFont.atlas = t;
+        CjkFont.ok = true;
+        return true;
+    }
+
+    static int Index(int cp) {
+        int lo = 0;
+        int hi = CjkFont.cps.Length - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (CjkFont.cps[mid] == cp) { return mid; }
+            if (CjkFont.cps[mid] < cp) { lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return -1;
+    }
+
+    static int Advance(int scale) { return (CjkFont.cell + 2) * scale / 6; }
+
+    static void DrawGlyph(SdlRenderer r, int cp, int x, int y, int scale) {
+        int gi = CjkFont.Index(cp);
+        int dw = CjkFont.cell * scale / 6;
+        // vertically center within the ASCII cell height (57 design units)
+        int dy = y + (57 - CjkFont.cell) * scale / 12;
+        if (gi < 0) {
+            r.DrawRect(x + scale / 2, dy + scale / 2, dw - scale, dw - scale);
+            return;
+        }
+        int m = CjkFont.scalePx;
+        int scw = CjkFont.cell * m;
+        int col = gi % CjkFont.cols;
+        int row = gi / CjkFont.cols;
+        r.DrawTextureRegion(CjkFont.atlas, col * scw, row * scw, scw, scw,
+            x, dy, dw, dw);
+    }
+}
+
 class Text {
     static void Draw(SdlRenderer r, string text, int x, int y, int scale,
                      int cr, int cg, int cb, int ca) {
         if (text == null) { return; }
         if (scale < 1) { scale = 1; }
         if (GlyphFont.Ready(r)) {
+            if (Text.HasWide(text) && CjkFont.Ready(r)) {
+                Text.DrawMixed(r, text, x, y, scale, cr, cg, cb, ca);
+                return;
+            }
             GlyphFont.Draw(r, text, x, y, scale, cr, cg, cb, ca);
             return;
         }
         r.SetColor(cr, cg, cb, ca);
+        Text.DrawBitmap(r, text, x, y, scale);
+    }
+
+    static bool HasWide(string text) {
+        int i = 0;
+        while (i < text.Length) {
+            if ((text[i] & 255) > 127) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Mixed ASCII + CJK draw: ASCII comes from the antialiased GlyphFont
+    // atlas, everything else from the CjkFont atlas, on one shared pen.
+    static void DrawMixed(SdlRenderer r, string text, int x, int y, int scale,
+                          int cr, int cg, int cb, int ca) {
+        GlyphFont.atlas.SetColor(cr, cg, cb);
+        GlyphFont.atlas.SetOpacity(ca);
+        CjkFont.atlas.SetColor(cr, cg, cb);
+        CjkFont.atlas.SetOpacity(ca);
+        r.SetColor(cr, cg, cb, ca);
+        int pen = x;
+        int[] pos = new int[1];
+        pos[0] = 0;
+        while (pos[0] < text.Length) {
+            int cp = Utf8.Decode(text, pos);
+            if (cp >= 32 && cp <= 126) {
+                pen = pen + GlyphFont.DrawGlyph(r, cp - 32, pen, y, scale);
+            } else {
+                CjkFont.DrawGlyph(r, cp, pen, y, scale);
+                pen = pen + CjkFont.Advance(scale);
+            }
+        }
+        GlyphFont.atlas.ResetColor();
+        GlyphFont.atlas.SetOpacity(255);
+        CjkFont.atlas.ResetColor();
+        CjkFont.atlas.SetOpacity(255);
+    }
+
+    static int MeasureMixed(string text, int scale) {
+        int w = 0;
+        int[] pos = new int[1];
+        pos[0] = 0;
+        while (pos[0] < text.Length) {
+            int cp = Utf8.Decode(text, pos);
+            if (cp >= 32 && cp <= 126) {
+                w = w + GlyphFont.adv[cp - 32] * scale / 6;
+            } else {
+                w = w + CjkFont.Advance(scale);
+            }
+        }
+        return w;
+    }
+
+    static void DrawBitmap(SdlRenderer r, string text, int x, int y, int scale) {
         int cx = x;
         int i = 0;
         while (i < text.Length) {
@@ -501,13 +669,17 @@ class Text {
 
     static void DrawCentered(SdlRenderer r, string text, int centerX, int y,
                              int scale, int cr, int cg, int cb, int ca) {
-        int w = Font.Measure(text, scale);
-        if (GlyphFont.Ready(r)) { w = GlyphFont.Measure(text, scale); }
+        int w = Text.Width(r, text, scale);
         Text.Draw(r, text, centerX - w / 2, y, scale, cr, cg, cb, ca);
     }
 
     static int Width(SdlRenderer r, string text, int scale) {
-        if (GlyphFont.Ready(r)) { return GlyphFont.Measure(text, scale); }
+        if (GlyphFont.Ready(r)) {
+            if (Text.HasWide(text) && CjkFont.Ready(r)) {
+                return Text.MeasureMixed(text, scale);
+            }
+            return GlyphFont.Measure(text, scale);
+        }
         return Font.Measure(text, scale);
     }
 

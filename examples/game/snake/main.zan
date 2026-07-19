@@ -1,6 +1,7 @@
-// Snake -- a complete arcade product on GameKit. Grid movement with a buffered
-// turn queue, growth on eating, escalating speed, wall or wrap modes, a
-// self-avoiding demo AI, and a persistent high-score profile.
+// 贪吃蛇 -- arcade snake on GameKit, with AI-generated art, a Chinese UI and
+// arcade "juice": combo scoring with floating popups, a golden star bonus on a
+// timer, level-ups with a toast, screen shake on death and a new-record chase
+// bar that fills toward the saved high score.
 using System;
 using System.IO;
 using SDL3;
@@ -12,6 +13,7 @@ class Profile {
     int high;
     int longest;
     int games;
+    int bestCombo;
 
     static string Path() { return "snake_save.txt"; }
     static int ParseInt(string s, int start) {
@@ -32,19 +34,32 @@ class Profile {
     }
     static Profile Load() {
         Profile p = new Profile();
-        p.high = 0; p.longest = 3; p.games = 0;
+        p.high = 0; p.longest = 3; p.games = 0; p.bestCombo = 0;
         if (File.Exists(Profile.Path())) {
             List<string> lines = File.ReadAllLines(Profile.Path());
             p.high = Profile.ReadKey(lines, "high", 0);
             p.longest = Profile.ReadKey(lines, "longest", 3);
             p.games = Profile.ReadKey(lines, "games", 0);
+            p.bestCombo = Profile.ReadKey(lines, "combo", 0);
         }
         return p;
     }
     void Save() {
-        string s = "high=" + this.high + "\nlongest=" + this.longest + "\ngames=" + this.games + "\n";
+        string s = "high=" + this.high + "\nlongest=" + this.longest
+            + "\ngames=" + this.games + "\ncombo=" + this.bestCombo + "\n";
         File.WriteAllText(Profile.Path(), s);
     }
+}
+
+// A floating score popup ("+30 x3") that rises and fades above the eaten food.
+class Popup {
+    int x;
+    int y;
+    string text;
+    int bornAt;
+    int cr;
+    int cg;
+    int cb;
 }
 
 class SnGame {
@@ -69,8 +84,27 @@ class SnGame {
     int mouseY;
     int eatFlashAt;
     SdlTexture menuBg;
-    bool menuTried;
+    SdlTexture boardBg;
+    SdlTexture foodTex;
+    SdlTexture starTex;
+    bool texTried;
     bool demo;
+
+    // ---- juice state ----
+    int combo;         // consecutive quick eats (score multiplier)
+    int comboUntil;    // combo survives until this tick
+    int level;         // speed level, +1 every 5 foods
+    int eaten;         // foods eaten this run
+    int levelToastAt;  // "升级" toast timestamp
+    int shakeUntil;    // screen shake window after death
+    int newRecordAt;   // "新纪录" flash timestamp
+    bool wasRecord;
+    // star bonus: appears after every 5th food for a limited time
+    bool starOn;
+    int starX;
+    int starY;
+    int starUntil;
+    List<Popup> pops;
 
     static int COLS() { return 30; }
     static int ROWS() { return 22; }
@@ -88,20 +122,55 @@ class SnGame {
         g.sy = new int[SnGame.COLS() * SnGame.ROWS()];
         g.scene = 0;
         g.diff = 1;
+        g.pops = new List<Popup>();
         g.demo = File.Exists("snake_demo.txt");
         if (g.demo) { g.StartGame(Sdl.Ticks()); }
         return g;
     }
 
+    void EnsureTex() {
+        if (this.texTried) { return; }
+        this.texTried = true;
+        this.menuBg = SnGame.LoadTex(this.r, "examples/game/snake/assets/menu_bg.png");
+        this.boardBg = SnGame.LoadTex(this.r, "examples/game/snake/assets/board_bg.png");
+        this.foodTex = SnGame.LoadTex(this.r, "examples/game/snake/assets/food.png");
+        this.starTex = SnGame.LoadTex(this.r, "examples/game/snake/assets/star.png");
+    }
+    static SdlTexture LoadTex(SdlRenderer r, string path) {
+        if (!File.Exists(path)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, path);
+        if (t == null || !t.IsValid()) { return null; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        return t;
+    }
+
+    bool CellFree(int c, int rw) {
+        int i = 0;
+        while (i < this.len) { if (this.sx[i] == c && this.sy[i] == rw) { return false; } i = i + 1; }
+        if (this.starOn && this.starX == c && this.starY == rw) { return false; }
+        return true;
+    }
     void PlaceFood() {
         int guard = 0;
         while (guard < 2000) {
             int c = this.rng.Range(0, SnGame.COLS());
             int rw = this.rng.Range(0, SnGame.ROWS());
-            bool onSnake = false;
-            int i = 0;
-            while (i < this.len) { if (this.sx[i] == c && this.sy[i] == rw) { onSnake = true; i = this.len; } i = i + 1; }
-            if (!onSnake) { this.fx = c; this.fy = rw; return; }
+            if (this.CellFree(c, rw) && !(c == this.fx && rw == this.fy)) { this.fx = c; this.fy = rw; return; }
+            guard = guard + 1;
+        }
+    }
+    void PlaceStar(int now) {
+        int guard = 0;
+        while (guard < 2000) {
+            int c = this.rng.Range(0, SnGame.COLS());
+            int rw = this.rng.Range(0, SnGame.ROWS());
+            if (this.CellFree(c, rw) && !(c == this.fx && rw == this.fy)) {
+                this.starX = c; this.starY = rw;
+                this.starOn = true;
+                this.starUntil = now + 6000;
+                return;
+            }
             guard = guard + 1;
         }
     }
@@ -120,14 +189,62 @@ class SnGame {
         this.wrap = (this.diff == 0);
         this.scene = 1;
         this.stepAt = now + this.stepMs;
+        this.combo = 0;
+        this.comboUntil = 0;
+        this.level = 1;
+        this.eaten = 0;
+        this.starOn = false;
+        this.wasRecord = false;
+        this.pops = new List<Popup>();
         this.PlaceFood();
     }
 
     int Dx(int d) { if (d == 1) { return 1; } if (d == 3) { return -1; } return 0; }
     int Dy(int d) { if (d == 0) { return -1; } if (d == 2) { return 1; } return 0; }
 
+    void AddPop(int gx, int gy, string t, int now, int cr, int cg, int cb) {
+        Popup p = new Popup();
+        p.x = SnGame.FX() + gx * SnGame.CELL() + SnGame.CELL() / 2;
+        p.y = SnGame.FY() + gy * SnGame.CELL();
+        p.text = t;
+        p.bornAt = now;
+        p.cr = cr; p.cg = cg; p.cb = cb;
+        this.pops.Add(p);
+    }
+
+    void Eat(int now) {
+        // quick successive eats build the combo multiplier (max x8)
+        if (now < this.comboUntil) {
+            if (this.combo < 8) { this.combo = this.combo + 1; }
+        } else {
+            this.combo = 1;
+        }
+        this.comboUntil = now + 4500;
+        if (this.combo > this.prof.bestCombo) { this.prof.bestCombo = this.combo; }
+        int base_ = 10 + this.len / 3;
+        int gain = base_ * this.combo;
+        this.score = this.score + gain;
+        string pt = "+" + gain;
+        if (this.combo > 1) { pt = pt + "  x" + this.combo; }
+        this.AddPop(this.fx, this.fy, pt, now, 255, 210, 90);
+        this.eatFlashAt = now + 140;
+        this.eaten = this.eaten + 1;
+        // level up every 5 foods: faster steps + toast
+        if (this.eaten % 5 == 0) {
+            this.level = this.level + 1;
+            this.levelToastAt = now;
+            if (!this.starOn) { this.PlaceStar(now); }
+        }
+        if (this.stepMs > 60) { this.stepMs = this.stepMs - 3; }
+        // crossing the saved high score flashes "新纪录"
+        if (!this.wasRecord && this.prof.high > 0 && this.score > this.prof.high) {
+            this.wasRecord = true;
+            this.newRecordAt = now;
+        }
+        this.PlaceFood();
+    }
+
     void Step(int now) {
-        // apply buffered direction if not a reversal
         if (!((this.nextDir + 2) % 4 == this.dir)) { this.dir = this.nextDir; }
         int nx = this.sx[0] + this.Dx(this.dir);
         int ny = this.sy[0] + this.Dy(this.dir);
@@ -139,28 +256,35 @@ class SnGame {
         } else {
             if (nx < 0 || nx >= SnGame.COLS() || ny < 0 || ny >= SnGame.ROWS()) { this.EndGame(now); return; }
         }
-        // self collision (ignore tail tip which will move, unless growing)
         bool grow = (nx == this.fx && ny == this.fy);
         int check = this.len;
         if (!grow) { check = this.len - 1; }
         int i = 0;
         while (i < check) { if (this.sx[i] == nx && this.sy[i] == ny) { this.EndGame(now); return; } i = i + 1; }
-        // shift body
         int j = this.len;
         if (!grow) { j = this.len - 1; }
         while (j > 0) { this.sx[j] = this.sx[j - 1]; this.sy[j] = this.sy[j - 1]; j = j - 1; }
         this.sx[0] = nx; this.sy[0] = ny;
         if (grow) {
             this.len = this.len + 1;
-            this.score = this.score + 10 + this.len / 3;
-            this.eatFlashAt = now + 140;
-            if (this.stepMs > 60) { this.stepMs = this.stepMs - 3; }
-            this.PlaceFood();
+            this.Eat(now);
         }
+        // star pickup: big burst worth 50 x combo
+        if (this.starOn && nx == this.starX && ny == this.starY) {
+            this.starOn = false;
+            int mult = this.combo;
+            if (mult < 1) { mult = 1; }
+            int gain = 50 * mult;
+            this.score = this.score + gain;
+            this.AddPop(this.starX, this.starY, "星星 +" + gain, now, 255, 235, 130);
+            this.eatFlashAt = now + 200;
+        }
+        if (this.starOn && now >= this.starUntil) { this.starOn = false; }
     }
 
     void EndGame(int now) {
         this.scene = 2;
+        this.shakeUntil = now + 420;
         this.prof.games = this.prof.games + 1;
         if (this.score > this.prof.high) { this.prof.high = this.score; }
         if (this.len > this.prof.longest) { this.prof.longest = this.len; }
@@ -218,14 +342,12 @@ class SnGame {
     void DemoThink() {
         int hx = this.sx[0]; int hy = this.sy[0];
         int want = this.dir;
-        // greedy toward food
         int[] order = new int[4];
         int n = 0;
         if (this.fx > hx) { order[n] = 1; n = n + 1; }
         if (this.fx < hx) { order[n] = 3; n = n + 1; }
         if (this.fy > hy) { order[n] = 2; n = n + 1; }
         if (this.fy < hy) { order[n] = 0; n = n + 1; }
-        // append remaining dirs
         int d = 0;
         while (d < 4) {
             bool has = false; int k = 0;
@@ -249,42 +371,84 @@ class SnGame {
     // ----- rendering ---------------------------------------------------------
 
     void DrawPlay(int now) {
+        this.EnsureTex();
         this.host.Begin(12, 16, 20);
+        // death shake: decaying pseudo-random offset applied to the whole board
+        int shX = 0;
+        int shY = 0;
+        if (now < this.shakeUntil) {
+            int left = this.shakeUntil - now;
+            int amp = left / 60 + 1;
+            shX = (now * 7 % (amp * 2 + 1)) - amp;
+            shY = (now * 13 % (amp * 2 + 1)) - amp;
+        }
+        int bx = SnGame.FX() + shX;
+        int by = SnGame.FY() + shY;
         int fw = SnGame.COLS() * SnGame.CELL();
         int fh = SnGame.ROWS() * SnGame.CELL();
-        this.r.SetColor(18, 22, 28, 255);
-        this.r.FillRect(SnGame.FX(), SnGame.FY(), fw, fh);
-        // checker
+        if (this.boardBg != null) {
+            this.r.DrawTexture(this.boardBg, bx, by, fw, fh);
+            this.r.SetColor(0, 0, 0, 90);
+            this.r.FillRect(bx, by, fw, fh);
+        } else {
+            this.r.SetColor(18, 22, 28, 255);
+            this.r.FillRect(bx, by, fw, fh);
+        }
+        // faint checker so movement reads against the art
         int rr = 0;
         while (rr < SnGame.ROWS()) {
             int cc = 0;
             while (cc < SnGame.COLS()) {
                 if ((rr + cc) % 2 == 0) {
-                    this.r.SetColor(24, 30, 38, 255);
-                    this.r.FillRect(SnGame.FX() + cc * SnGame.CELL(), SnGame.FY() + rr * SnGame.CELL(), SnGame.CELL(), SnGame.CELL());
+                    this.r.SetColor(255, 255, 255, 10);
+                    this.r.FillRect(bx + cc * SnGame.CELL(), by + rr * SnGame.CELL(), SnGame.CELL(), SnGame.CELL());
                 }
                 cc = cc + 1;
             }
             rr = rr + 1;
         }
-        Draw.RingRect(this.r, SnGame.FX(), SnGame.FY(), fw, fh, 3, 70, 120, 90, 255);
+        Draw.RingRect(this.r, bx, by, fw, fh, 3, 70, 120, 90, 255);
 
-        // food
-        int fxp = SnGame.FX() + this.fx * SnGame.CELL();
-        int fyp = SnGame.FY() + this.fy * SnGame.CELL();
+        // food (AI apple sprite, pulsing on eat)
+        int fxp = bx + this.fx * SnGame.CELL();
+        int fyp = by + this.fy * SnGame.CELL();
         int pulse = 0;
         if (now < this.eatFlashAt) { pulse = 4; }
-        Draw.RoundRectFill(this.r, fxp + 5 - pulse / 2, fyp + 5 - pulse / 2, SnGame.CELL() - 10 + pulse, SnGame.CELL() - 10 + pulse, 8, 230, 90, 90, 255);
-        this.r.SetColor(120, 200, 120, 255);
-        this.r.FillRect(fxp + SnGame.CELL() / 2 - 2, fyp + 3, 4, 6);
+        if (this.foodTex != null) {
+            this.r.DrawTexture(this.foodTex, fxp + 1 - pulse / 2, fyp + 1 - pulse / 2,
+                SnGame.CELL() - 2 + pulse, SnGame.CELL() - 2 + pulse);
+        } else {
+            Draw.RoundRectFill(this.r, fxp + 5 - pulse / 2, fyp + 5 - pulse / 2, SnGame.CELL() - 10 + pulse, SnGame.CELL() - 10 + pulse, 8, 230, 90, 90, 255);
+        }
 
-        // snake
+        // star bonus with a shrinking timer ring
+        if (this.starOn) {
+            int sxp = bx + this.starX * SnGame.CELL();
+            int syp = by + this.starY * SnGame.CELL();
+            int wob = (now / 90) % 4 - 2;
+            if (wob < 0) { wob = -wob; }
+            if (this.starTex != null) {
+                this.r.DrawTexture(this.starTex, sxp - 2, syp - 2 - wob, SnGame.CELL() + 4, SnGame.CELL() + 4);
+            } else {
+                Draw.FillCircle(this.r, sxp + SnGame.CELL() / 2, syp + SnGame.CELL() / 2 - wob, SnGame.CELL() / 2, 255, 220, 90, 255);
+            }
+            int leftMs = this.starUntil - now;
+            int barW = SnGame.CELL() * leftMs / 6000;
+            if (barW > 0) {
+                this.r.SetColor(255, 235, 130, 220);
+                this.r.FillRect(sxp, syp + SnGame.CELL() + 2, barW, 3);
+            }
+        }
+
+        // snake: bright gradient head->tail
         int i = this.len - 1;
         while (i >= 0) {
-            int x = SnGame.FX() + this.sx[i] * SnGame.CELL();
-            int y = SnGame.FY() + this.sy[i] * SnGame.CELL();
-            int cr = 90; int cg = 200; int cb = 120;
-            if (i == 0) { cr = 130; cg = 235; cb = 150; }
+            int x = bx + this.sx[i] * SnGame.CELL();
+            int y = by + this.sy[i] * SnGame.CELL();
+            int fade = 0;
+            if (this.len > 1) { fade = 60 * i / this.len; }
+            int cr = 90 - fade / 2; int cg = 210 - fade; int cb = 130 - fade / 2;
+            if (i == 0) { cr = 140; cg = 245; cb = 160; }
             int t = SnGame.CELL();
             Draw.RoundRectFill(this.r, x + 2, y + 2, t - 4, t - 4, 8, cr, cg, cb, 255);
             if (i == 0) {
@@ -300,49 +464,89 @@ class SnGame {
             i = i - 1;
         }
 
-        // HUD
-        Text.Draw(this.r, "SNAKE", 190, 30, 3, 240, 240, 250, 255);
-        Text.Draw(this.r, "SCORE " + this.score, 420, 34, 3, 255, 210, 90, 255);
-        Text.Draw(this.r, "LEN " + this.len, 720, 34, 2, 150, 235, 160, 255);
-        Text.Draw(this.r, "HIGH " + this.prof.high, 900, 34, 2, 170, 180, 200, 255);
-        string md = "WALLS";
-        if (this.wrap) { md = "WRAP"; }
-        Text.Draw(this.r, md, 1080, 34, 2, 150, 160, 180, 255);
+        // floating score popups (rise + fade over 900ms)
+        int pi = this.pops.Count - 1;
+        while (pi >= 0) {
+            Popup p = this.pops[pi];
+            int age = now - p.bornAt;
+            if (age > 900) {
+                this.pops.RemoveAt(pi);
+            } else {
+                int alpha = 255 - age * 255 / 900;
+                Text.DrawCentered(this.r, p.text, p.x, p.y - age / 12, 3, p.cr, p.cg, p.cb, alpha);
+            }
+            pi = pi - 1;
+        }
+
+        // HUD (Chinese)
+        Text.Draw(this.r, "贪吃蛇", 190, 30, 3, 240, 240, 250, 255);
+        Text.Draw(this.r, "得分 " + this.score, 420, 34, 3, 255, 210, 90, 255);
+        Text.Draw(this.r, "长度 " + this.len, 740, 34, 2, 150, 235, 160, 255);
+        Text.Draw(this.r, "等级 " + this.level, 890, 34, 2, 150, 200, 235, 255);
+        string md = "撞墙模式";
+        if (this.wrap) { md = "穿墙模式"; }
+        Text.Draw(this.r, md, 1030, 34, 2, 150, 160, 180, 255);
+
+        // combo meter under the HUD: multiplier + draining time bar
+        if (this.combo > 1 && now < this.comboUntil) {
+            Text.Draw(this.r, "连击 x" + this.combo, 420, 66, 2, 255, 160, 90, 255);
+            int leftMs = this.comboUntil - now;
+            int cbw = 160 * leftMs / 4500;
+            this.r.SetColor(70, 50, 30, 255);
+            this.r.FillRect(560, 72, 160, 8);
+            this.r.SetColor(255, 160, 90, 255);
+            this.r.FillRect(560, 72, cbw, 8);
+        }
+
+        // chase bar: progress toward the saved high score keeps "one more run"
+        // pressure visible at all times
+        if (this.prof.high > 0 && !this.wasRecord) {
+            int pw = 300 * this.score / this.prof.high;
+            if (pw > 300) { pw = 300; }
+            this.r.SetColor(40, 46, 56, 255);
+            this.r.FillRect(190, 760, 300, 10);
+            this.r.SetColor(255, 210, 90, 255);
+            this.r.FillRect(190, 760, pw, 10);
+            Text.Draw(this.r, "最高分 " + this.prof.high, 500, 756, 2, 170, 180, 200, 255);
+        }
+        if (this.wasRecord && now - this.newRecordAt < 1600) {
+            int blink = (now / 150) % 2;
+            if (blink == 0) {
+                Text.DrawCenteredShadow(this.r, "新纪录！", 640, 120, 5, 255, 235, 130, 3);
+            }
+        }
+        // level-up toast
+        if (now - this.levelToastAt < 1200 && this.levelToastAt > 0) {
+            Text.DrawCenteredShadow(this.r, "升级！速度提升", 640, 170, 3, 150, 220, 255, 2);
+        }
 
         this.host.End();
     }
 
-    void EnsureMenuBg() {
-        if (this.menuTried) { return; }
-        this.menuTried = true;
-        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/snake/assets/menu_bg.png");
-        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
-        this.menuBg = t;
-    }
     void DrawMenu(int now) {
-        this.EnsureMenuBg();
+        this.EnsureTex();
         this.host.Begin(10, 16, 14);
         Ui.Backdrop(this.r, this.menuBg, 1280, 800);
-        Text.DrawCenteredShadow(this.r, "SNAKE", 640, 90, 10, 245, 238, 220, 4);
-        Text.DrawCenteredShadow(this.r, "EAT -- GROW -- DON'T CRASH", 640, 210, 3, 240, 208, 130, 3);
+        Text.DrawCenteredShadow(this.r, "贪吃蛇", 640, 80, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "吃苹果 · 变更长 · 连击拿高分", 640, 210, 3, 240, 208, 130, 3);
         Ui.Panel(this.r, 360, 300, 560, 120, 20, 24, 34, 214);
-        Text.DrawCenteredShadow(this.r, "MODE", 640, 320, 2, 190, 198, 214, 2);
+        Text.DrawCenteredShadow(this.r, "难度", 640, 312, 2, 190, 198, 214, 2);
         int i = 0;
         while (i < 3) {
-            string nm = "EASY-WRAP";
-            if (i == 1) { nm = "NORMAL"; }
-            if (i == 2) { nm = "HARD"; }
+            string nm = "简单·穿墙";
+            if (i == 1) { nm = "普通"; }
+            if (i == 2) { nm = "困难"; }
             int kind = 0;
             if (this.diff == i) { kind = 2; }
             Ui.Button(this.r, this.mouseX, this.mouseY, 400 + i * 170, 330, 150, 56, nm, 1, kind);
             i = i + 1;
         }
-        Ui.Panel(this.r, 420, 450, 440, 120, 14, 18, 26, 200);
-        Text.Draw(this.r, "HIGH SCORE", 448, 470, 2, 150, 160, 180, 255);
+        Ui.Panel(this.r, 420, 450, 440, 130, 14, 18, 26, 200);
+        Text.Draw(this.r, "最高分", 448, 468, 2, 150, 160, 180, 255);
         Text.DrawShadow(this.r, "" + this.prof.high, 448, 492, 4, 255, 210, 90, 3);
-        Text.Draw(this.r, "LONGEST  " + this.prof.longest, 448, 544, 2, 150, 160, 180, 255);
-        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "PLAY", 4, 1);
-        Text.DrawCenteredShadow(this.r, "Arrows or WASD to steer. ENTER play. F11 fullscreen.", 640, 720, 2, 176, 184, 200, 2);
+        Text.Draw(this.r, "最长 " + this.prof.longest + "   最高连击 x" + this.prof.bestCombo, 448, 548, 2, 150, 160, 180, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "开始游戏", 4, 1);
+        Text.DrawCenteredShadow(this.r, "方向键/WASD 控制 · 回车开始 · F11 全屏", 640, 720, 2, 176, 184, 200, 2);
         this.host.End();
     }
     void DrawOver(int now) {
@@ -353,11 +557,15 @@ class SnGame {
         this.r.SetColor(26, 30, 42, 245);
         this.r.FillRect(bx, by, bw, bh);
         Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
-        Text.DrawCentered(this.r, "GAME OVER", 640, by + 44, 7, 230, 120, 90, 255);
-        Text.DrawCentered(this.r, "SCORE " + this.score + "    LENGTH " + this.len, 640, by + 124, 3, 255, 210, 90, 255);
-        Text.DrawCentered(this.r, "HIGH " + this.prof.high, 640, by + 172, 2, 170, 180, 200, 255);
-        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 220, 220, 66, "PLAY AGAIN", 3, 1);
-        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 220, 200, 66, "MENU", 3, 0);
+        if (this.wasRecord) {
+            Text.DrawCentered(this.r, "新纪录！", 640, by + 44, 7, 255, 220, 100, 255);
+        } else {
+            Text.DrawCentered(this.r, "游戏结束", 640, by + 44, 7, 230, 120, 90, 255);
+        }
+        Text.DrawCentered(this.r, "得分 " + this.score + "    长度 " + this.len, 640, by + 124, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, "最高分 " + this.prof.high, 640, by + 172, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 220, 220, 66, "再来一局", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 220, 200, 66, "返回菜单", 3, 0);
         this.host.End();
     }
 
@@ -378,7 +586,7 @@ class SnGame {
 
 class SnApp {
     static void Main() {
-        Host h = Host.Create("Snake", 1280, 800);
+        Host h = Host.Create("贪吃蛇", 1280, 800);
         SnGame g = SnGame.Create(h);
         while (h.Running()) {
             int now = Sdl.Ticks();

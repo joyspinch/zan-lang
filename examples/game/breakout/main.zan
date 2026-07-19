@@ -1,6 +1,6 @@
-// Breakout -- a complete arcade product on GameKit. Mouse/keyboard paddle,
-// fixed-point ball physics with angled paddle bounce, a multi-hit brick grid,
-// escalating levels, lives, combo scoring, and a persistent high-score profile.
+// 打砖块 -- arcade breakout on GameKit with a Chinese UI, AI-generated
+// backdrops, particle bursts and floating score popups on every brick, a combo
+// multiplier with an on-screen meter, hit flashes and screen shake.
 using System;
 using System.IO;
 using SDL3;
@@ -87,8 +87,27 @@ class BoGame {
     int msgAt;
     int shake;
     SdlTexture menuBg;
+    SdlTexture boardBg;
     bool menuTried;
     bool demo;
+
+    // ---- juice state: particles + popups (fixed pools) ----
+    int[] px;       // particle x quarter-px
+    int[] py;
+    int[] pvx;
+    int[] pvy;
+    int[] pAt;      // spawn tick, 0 = free
+    int[] pcr;
+    int[] pcg;
+    int[] pcb;
+    int[] fx;       // popup x
+    int[] fy;
+    int[] fAt;
+    string[] fTxt;
+    int maxCombo;
+    int flashAt;    // brick hit flash
+    bool wasRecord;
+    int newRecordAt;
 
     static int FX() { return 40; }
     static int FY() { return 40; }
@@ -118,6 +137,9 @@ class BoGame {
         g.pw = 150;
         g.paddleX = 640 - g.pw / 2;
         g.msg = "";
+        g.px = new int[96]; g.py = new int[96]; g.pvx = new int[96]; g.pvy = new int[96];
+        g.pAt = new int[96]; g.pcr = new int[96]; g.pcg = new int[96]; g.pcb = new int[96];
+        g.fx = new int[8]; g.fy = new int[8]; g.fAt = new int[8]; g.fTxt = new string[8];
         g.demo = File.Exists("breakout_demo.txt");
         if (g.demo) { g.StartGame(Sdl.Ticks()); }
         return g;
@@ -145,7 +167,7 @@ class BoGame {
             row = row + 1;
         }
         this.ResetBall(now);
-        this.msg = "LEVEL " + this.level;
+        this.msg = "第 " + this.level + " 关";
         this.msgAt = now + 1500;
     }
 
@@ -177,8 +199,14 @@ class BoGame {
         this.level = 1;
         this.score = 0;
         this.combo = 0;
+        this.maxCombo = 0;
+        this.wasRecord = false;
         this.lives = 3;
         this.scene = 1;
+        int i = 0;
+        while (i < 96) { this.pAt[i] = 0; i = i + 1; }
+        i = 0;
+        while (i < 8) { this.fAt[i] = 0; i = i + 1; }
         this.BuildLevel(now);
     }
 
@@ -188,7 +216,7 @@ class BoGame {
         this.shake = now + 260;
         if (this.lives <= 0) { this.EndGame(now); return; }
         this.ResetBall(now);
-        this.msg = "BALL LOST -- " + this.lives + " LEFT";
+        this.msg = "球没了 -- 还剩 " + this.lives + " 条命";
         this.msgAt = now + 1400;
     }
 
@@ -200,11 +228,51 @@ class BoGame {
         this.prof.Save();
     }
 
+    void SpawnBurst(int x, int y, int now, int cr, int cg, int cb) {
+        int made = 0;
+        int i = 0;
+        while (i < 96 && made < 10) {
+            if (this.pAt[i] == 0 || now - this.pAt[i] > 500) {
+                this.px[i] = x * 4;
+                this.py[i] = y * 4;
+                this.pvx[i] = this.rng.Range(-22, 23);
+                this.pvy[i] = this.rng.Range(-30, 7);
+                this.pAt[i] = now;
+                this.pcr[i] = cr; this.pcg[i] = cg; this.pcb[i] = cb;
+                made = made + 1;
+            }
+            i = i + 1;
+        }
+    }
+    void SpawnPopup(int x, int y, string t, int now) {
+        int best = 0;
+        int i = 1;
+        while (i < 8) { if (this.fAt[i] < this.fAt[best]) { best = i; } i = i + 1; }
+        this.fx[best] = x;
+        this.fy[best] = y;
+        this.fAt[best] = now;
+        this.fTxt[best] = t;
+    }
+
     void HitBrick(int idx, int now) {
         this.hp[idx] = this.hp[idx] - 1;
         this.combo = this.combo + 1;
+        if (this.combo > this.maxCombo) { this.maxCombo = this.combo; }
         int pts = 10 * this.level + this.combo * 2;
         this.score = this.score + pts;
+        this.flashAt = now + 90;
+        int cx = BoGame.BX() + (idx % this.cols) * BoGame.CELLW() + BoGame.BW() / 2;
+        int cy = BoGame.BTOP() + (idx / this.cols) * BoGame.CELLH() + BoGame.BH() / 2;
+        int[] c = new int[3];
+        this.BrickColor(this.hp[idx] + 1, idx / this.cols, c);
+        this.SpawnBurst(cx, cy, now, c[0], c[1], c[2]);
+        string t = "+" + pts;
+        if (this.combo >= 3) { t = t + " x" + this.combo; }
+        this.SpawnPopup(cx, cy, t, now);
+        if (!this.wasRecord && this.prof.high > 0 && this.score > this.prof.high) {
+            this.wasRecord = true;
+            this.newRecordAt = now;
+        }
         if (this.hp[idx] <= 0) { this.hp[idx] = 0; this.alive = this.alive - 1; }
     }
 
@@ -349,12 +417,19 @@ class BoGame {
     }
 
     void DrawPlay(int now) {
+        this.EnsureMenuBg();
         int ox = 0;
         int oy = 0;
         if (now < this.shake) { ox = this.rng.Range(-4, 5); oy = this.rng.Range(-4, 5); }
         this.host.Begin(12, 14, 22);
-        this.r.SetColor(18, 22, 34, 255);
-        this.r.FillRect(BoGame.FX() + ox, BoGame.FY() + oy, BoGame.FW(), BoGame.FH());
+        if (this.boardBg != null) {
+            this.r.DrawTexture(this.boardBg, BoGame.FX() + ox, BoGame.FY() + oy, BoGame.FW(), BoGame.FH());
+            this.r.SetColor(0, 0, 0, 70);
+            this.r.FillRect(BoGame.FX() + ox, BoGame.FY() + oy, BoGame.FW(), BoGame.FH());
+        } else {
+            this.r.SetColor(18, 22, 34, 255);
+            this.r.FillRect(BoGame.FX() + ox, BoGame.FY() + oy, BoGame.FW(), BoGame.FH());
+        }
         Draw.RingRect(this.r, BoGame.FX() + ox, BoGame.FY() + oy, BoGame.FW(), BoGame.FH(), 3, 80, 90, 120, 255);
 
         int[] c = new int[3];
@@ -383,23 +458,67 @@ class BoGame {
         this.r.SetColor(120, 170, 240, 255);
         this.r.FillRect(this.paddleX + 6 + ox, BoGame.PADY() + 4 + oy, this.pw - 12, 5);
 
-        // ball
+        // ball (flashes white on brick hits)
         int bx = this.bxq / 16 + ox;
         int by = this.byq / 16 + oy;
+        if (now < this.flashAt) {
+            Draw.RoundRectFill(this.r, bx - 3, by - 3, BoGame.BS() + 6, BoGame.BS() + 6, 9, 255, 255, 255, 255);
+        }
         Draw.RoundRectFill(this.r, bx, by, BoGame.BS(), BoGame.BS(), 7, 250, 240, 150, 255);
 
+        // particles (gravity + fade over 500ms)
+        int pi = 0;
+        while (pi < 96) {
+            if (this.pAt[pi] > 0) {
+                int age = now - this.pAt[pi];
+                if (age > 500) {
+                    this.pAt[pi] = 0;
+                } else {
+                    int t16 = age / 16;
+                    int x = this.px[pi] / 4 + this.pvx[pi] * t16 / 8;
+                    int y = this.py[pi] / 4 + this.pvy[pi] * t16 / 8 + t16 * t16 / 10;
+                    int alpha = 255 - age * 255 / 500;
+                    this.r.SetColor(this.pcr[pi], this.pcg[pi], this.pcb[pi], alpha);
+                    this.r.FillRect(x + ox, y + oy, 5, 5);
+                }
+            }
+            pi = pi + 1;
+        }
+        // floating score popups
+        pi = 0;
+        while (pi < 8) {
+            if (this.fAt[pi] > 0) {
+                int age = now - this.fAt[pi];
+                if (age > 800) {
+                    this.fAt[pi] = 0;
+                } else {
+                    int alpha = 255 - age * 255 / 800;
+                    Text.DrawCentered(this.r, this.fTxt[pi], this.fx[pi] + ox, this.fy[pi] - age / 12 + oy, 2, 255, 220, 110, alpha);
+                }
+            }
+            pi = pi + 1;
+        }
+
         // HUD
-        Text.Draw(this.r, "SCORE " + this.score, 60, 16, 3, 240, 240, 250, 255);
-        Text.Draw(this.r, "LEVEL " + this.level, 560, 16, 3, 240, 208, 130, 255);
-        Text.Draw(this.r, "HIGH " + this.prof.high, 900, 16, 2, 170, 180, 200, 255);
+        Text.Draw(this.r, "得分 " + this.score, 60, 16, 3, 240, 240, 250, 255);
+        Text.Draw(this.r, "第 " + this.level + " 关", 560, 16, 3, 240, 208, 130, 255);
+        Text.Draw(this.r, "最高 " + this.prof.high, 900, 16, 2, 170, 180, 200, 255);
         int i = 0;
         while (i < this.lives) {
             Draw.RoundRectFill(this.r, 1120 + i * 34, 20, 26, 12, 5, 210, 220, 240, 255);
             i = i + 1;
         }
-        if (this.combo >= 3) { Text.Draw(this.r, "COMBO x" + this.combo, 60, 46, 2, 250, 210, 90, 255); }
+        if (this.combo >= 3) {
+            int cscale = 2;
+            if (this.combo >= 8) { cscale = 3; }
+            Text.Draw(this.r, "连击 x" + this.combo, 60, 46, cscale, 250, 210, 90, 255);
+        }
+        if (this.wasRecord && now - this.newRecordAt < 1600) {
+            int blink = (now / 150) % 2;
+            if (blink == 0) { Text.DrawCenteredShadow(this.r, "新纪录！", 640, 320, 5, 255, 235, 130, 3); }
+        }
 
-        if (!this.launched) { Text.DrawCentered(this.r, "CLICK / SPACE TO LAUNCH", 640, 640, 3, 240, 230, 150, 255); }
+        if (!this.launched) { Text.DrawCentered(this.r, "点击或按空格发射", 640, 640, 3, 240, 230, 150, 255); }
         if (this.msg.Length > 0 && now < this.msgAt) { Text.DrawCentered(this.r, this.msg, 640, 400, 5, 250, 220, 120, 255); }
 
         this.host.End();
@@ -411,34 +530,37 @@ class BoGame {
         SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/breakout/assets/menu_bg.png");
         if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
         this.menuBg = t;
+        SdlTexture b = SdlTexture.LoadImage(this.r, "examples/game/breakout/assets/board_bg.png");
+        if (b != null && b.IsValid()) { b.SetNearest(false); b.SetBlendMode(1); } else { b = null; }
+        this.boardBg = b;
     }
 
     void DrawMenu(int now) {
         this.EnsureMenuBg();
         this.host.Begin(10, 12, 20);
         Ui.Backdrop(this.r, this.menuBg, 1280, 800);
-        Text.DrawCenteredShadow(this.r, "BREAKOUT", 640, 82, 9, 245, 238, 220, 4);
-        Text.DrawCenteredShadow(this.r, "CLEAR EVERY BRICK", 640, 190, 3, 240, 208, 130, 3);
+        Text.DrawCenteredShadow(this.r, "打砖块", 640, 82, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "打碎所有砖块 · 连击拿高分", 640, 190, 3, 240, 208, 130, 3);
 
         Ui.Panel(this.r, 360, 300, 560, 120, 20, 24, 34, 214);
-        Text.DrawCenteredShadow(this.r, "DIFFICULTY", 640, 320, 2, 190, 198, 214, 2);
+        Text.DrawCenteredShadow(this.r, "难度", 640, 312, 2, 190, 198, 214, 2);
         int i = 0;
         while (i < 3) {
-            string nm = "EASY";
-            if (i == 1) { nm = "NORMAL"; }
-            if (i == 2) { nm = "HARD"; }
+            string nm = "简单";
+            if (i == 1) { nm = "普通"; }
+            if (i == 2) { nm = "困难"; }
             int kind = 0;
             if (this.diff == i) { kind = 2; }
             Ui.Button(this.r, this.mouseX, this.mouseY, 400 + i * 170, 330, 150, 56, nm, 2, kind);
             i = i + 1;
         }
         Ui.Panel(this.r, 420, 450, 440, 120, 14, 18, 26, 200);
-        Text.Draw(this.r, "HIGH SCORE", 448, 470, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, "最高分", 448, 470, 2, 150, 160, 180, 255);
         Text.DrawShadow(this.r, "" + this.prof.high, 448, 492, 4, 255, 210, 90, 3);
-        Text.Draw(this.r, "BEST LEVEL  " + this.prof.bestLevel, 448, 544, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, "最高关卡 " + this.prof.bestLevel, 448, 544, 2, 150, 160, 180, 255);
 
-        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "PLAY", 4, 1);
-        Text.DrawCenteredShadow(this.r, "Mouse or A/D to move. SPACE launch. F11 fullscreen.", 640, 720, 2, 176, 184, 200, 2);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "开始游戏", 4, 1);
+        Text.DrawCenteredShadow(this.r, "鼠标或 A/D 移动 · 空格发射 · F11 全屏", 640, 720, 2, 176, 184, 200, 2);
         this.host.End();
     }
 
@@ -450,11 +572,14 @@ class BoGame {
         this.r.SetColor(26, 30, 42, 245);
         this.r.FillRect(bx, by, bw, bh);
         Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
-        Text.DrawCentered(this.r, "GAME OVER", 640, by + 44, 7, 230, 120, 90, 255);
-        Text.DrawCentered(this.r, "SCORE " + this.score + "    LEVEL " + this.level, 640, by + 124, 3, 255, 210, 90, 255);
-        Text.DrawCentered(this.r, "HIGH " + this.prof.high, 640, by + 172, 2, 170, 180, 200, 255);
-        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 220, 220, 66, "PLAY AGAIN", 3, 1);
-        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 220, 200, 66, "MENU", 3, 0);
+        string title = "游戏结束";
+        int tr = 230; int tg = 120; int tb = 90;
+        if (this.wasRecord) { title = "新纪录！"; tr = 255; tg = 220; tb = 100; }
+        Text.DrawCentered(this.r, title, 640, by + 44, 7, tr, tg, tb, 255);
+        Text.DrawCentered(this.r, "得分 " + this.score + "    第 " + this.level + " 关", 640, by + 124, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, "最高分 " + this.prof.high + "    最高连击 x" + this.maxCombo, 640, by + 172, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 220, 220, 66, "再来一局", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 220, 200, 66, "返回菜单", 3, 0);
         this.host.End();
     }
 
@@ -479,7 +604,7 @@ class BoGame {
 
 class BoApp {
     static void Main() {
-        Host h = Host.Create("Breakout", 1280, 800);
+        Host h = Host.Create("打砖块", 1280, 800);
         BoGame g = BoGame.Create(h);
         while (h.Running()) {
             int now = Sdl.Ticks();
