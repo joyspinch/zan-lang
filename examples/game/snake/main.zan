@@ -1,10 +1,12 @@
-// 蛇蛇乐 -- a slither-style neon snake arena, nothing like a classic grid
-// snake. The snake glides continuously and follows the mouse (or arrow keys);
-// hold the left button / Space to boost at the cost of body length. The arena
-// is full-screen: glowing candy orbs (with a magnet pull), two AI rival worms
-// that hunt orbs and can be baited into your body, a fever meter that turns
-// the snake rainbow with double score, length-based Chinese titles, floating
-// popups and particle bursts for emotional feedback.
+// 蛇蛇乐 -- a slither-style neon snake arena on an endless toroidal canvas:
+// the world wraps at the edges (leave the top, re-enter from the bottom), so
+// there are no walls and every snake stays within a couple of screens. The
+// player follows the mouse; hold the left button / Space to boost at the cost
+// of length. Glowing candy orbs (magnet pull), hunter AI worms that chase food
+// and try to cut you off, timid snakelet prey that flees and can be eaten to
+// grow fast, a fever meter with rainbow double-score, length titles, floating
+// score popups and particle bursts. The camera follows the head; a minimap
+// shows everyone. All text uses the smooth TTF atlases (no pixel font).
 using System;
 using System.IO;
 using SDL3;
@@ -56,7 +58,7 @@ class Profile {
 
 // A glowing candy orb. Bigger orbs are worth more and glow brighter.
 class Orb {
-    int x;
+    int x;         // world px
     int y;
     int size;      // radius px, 4..9
     int hue;       // palette index
@@ -64,7 +66,7 @@ class Orb {
 }
 
 class Particle {
-    int x;         // fixed point 1/256
+    int x;         // world px, fixed point 1/256
     int y;
     int vx;        // fp px/s
     int vy;
@@ -75,7 +77,7 @@ class Particle {
 }
 
 class Popup {
-    int x;
+    int x;         // world px
     int y;
     string text;
     int bornAt;
@@ -84,18 +86,20 @@ class Popup {
     int cb;
 }
 
-// A worm: the player or an AI rival. Continuous head + trail-following body.
+// A worm on the torus: the player, a hunter rival, or a snakelet prey.
+// The head position is stored unwrapped (continuous) so the trail stays
+// smooth across seams; all rendering / collision uses wrapped coordinates.
 class Worm {
     bool alive;
-    bool isPlayer;
-    int headX;     // fixed point 1/256 px
+    int kind;      // 0 player, 1 hunter, 2 snakelet prey
+    int headX;     // fixed point 1/256 px, unwrapped
     int headY;
     int dirX;      // unit * 256
     int dirY;
     int[] pathX;
     int[] pathY;
     int pathN;
-    int[] segX;    // sampled centers, px, head first
+    int[] segX;    // sampled centers (unwrapped px), head first
     int[] segY;
     int segN;
     int length;    // target segment count
@@ -103,14 +107,17 @@ class Worm {
     int cr;        // body base color
     int cg;
     int cb;
-    int respawnAt; // AI only
-    int thinkAt;   // AI steering cadence
+    int respawnAt;
+    int thinkAt;
+    int tgtX;      // steering target point, world px (wrapped space)
+    int tgtY;
+    int tgtUntil;  // retarget deadline
 
-    static Worm Make(bool player, int cr, int cg, int cb) {
+    static Worm Make(int kind, int cr, int cg, int cb) {
         Worm w = new Worm();
-        w.isPlayer = player;
-        w.pathX = new int[8192];
-        w.pathY = new int[8192];
+        w.kind = kind;
+        w.pathX = new int[6144];
+        w.pathY = new int[6144];
         w.segX = new int[400];
         w.segY = new int[400];
         w.cr = cr; w.cg = cg; w.cb = cb;
@@ -134,6 +141,7 @@ class Worm {
             i = i - 1;
         }
         this.alive = true;
+        this.tgtUntil = 0;
         this.Sample();
     }
 
@@ -146,8 +154,8 @@ class Worm {
 
     // Steer smoothly toward target unit heading (tx,ty)*256.
     void Steer(int tx, int ty, int dt) {
-        int bl = 34 * dt / 16;
-        if (bl > 190) { bl = 190; }
+        int bl = 26 * dt / 16;
+        if (bl > 130) { bl = 130; }
         this.dirX = (this.dirX * (256 - bl) + tx * bl) / 256;
         this.dirY = (this.dirY * (256 - bl) + ty * bl) / 256;
         int dl = Worm.Isq(this.dirX * this.dirX + this.dirY * this.dirY);
@@ -162,8 +170,8 @@ class Worm {
         this.pathX[this.pathN] = this.headX;
         this.pathY[this.pathN] = this.headY;
         this.pathN = this.pathN + 1;
-        if (this.pathN >= 8192) {
-            int keep = 4096; int off = this.pathN - keep; int k = 0;
+        if (this.pathN >= 6144) {
+            int keep = 3072; int off = this.pathN - keep; int k = 0;
             while (k < keep) {
                 this.pathX[k] = this.pathX[k + off];
                 this.pathY[k] = this.pathY[k + off];
@@ -174,15 +182,14 @@ class Worm {
         this.Sample();
     }
 
-    // Body ball radius grows gently with length.
+    // Body ball radius grows with length: eat more, get visibly thicker.
     int Radius() {
-        int r = 11 + this.length / 24;
-        if (r > 20) { r = 20; }
+        int r = 10 + this.length / 14;
+        if (r > 26) { r = 26; }
         return r;
     }
 
-    // Resample body centers along the trail, spaced by ~70% of the radius so
-    // the chain reads as one continuous body.
+    // Resample body centers along the trail, spaced by ~70% of the radius.
     void Sample() {
         int want = this.length;
         if (want > 390) { want = 390; }
@@ -225,8 +232,7 @@ class SnGame {
     Rng rng;
 
     Worm me;
-    Worm foe1;
-    Worm foe2;
+    List<Worm> foes;   // hunters + snakelets
     List<Orb> orbs;
     List<Particle> parts;
     List<Popup> pops;
@@ -239,24 +245,44 @@ class SnGame {
     int mouseY;
     bool boostHeld;
     bool boostKey;
-    int drainAt;       // next boost length-drain time
-    int fever;         // 0..100 meter
+    int drainAt;
+    int fever;         // 0..100
     bool feverOn;
-    int titleTier;     // reached length-title tier
+    int titleTier;
     int toastAt;
     string toastText;
     int shakeUntil;
-    int diedAt;
     string deathBy;
     bool wasRecord;
-    int newRecordAt;
     SdlTexture menuBg;
     SdlTexture titleTex;
     bool texTried;
     bool demo;
 
-    static int W() { return 1280; }
-    static int H() { return 720; }
+    // world (torus) and view sizes, px
+    static int WW() { return 2560; }
+    static int WH() { return 1440; }
+    static int VW() { return 1280; }
+    static int VH() { return 720; }
+
+    // shortest signed delta on the torus axis of period m
+    static int WrapD(int d, int m) {
+        int v = d % m;
+        if (v < 0) { v = v + m; }
+        if (v > m / 2) { v = v - m; }
+        return v;
+    }
+    static int WrapP(int v, int m) {
+        int p = v % m;
+        if (p < 0) { p = p + m; }
+        return p;
+    }
+    // torus squared distance between world points
+    static int Dist2(int ax, int ay, int bx, int by) {
+        int dx = SnGame.WrapD(ax - bx, SnGame.WW());
+        int dy = SnGame.WrapD(ay - by, SnGame.WH());
+        return dx * dx + dy * dy;
+    }
 
     // Candy palette for orbs / fever rainbow.
     static int PalR(int i) { int m = i % 6; if (m == 0) { return 255; } if (m == 1) { return 255; } if (m == 2) { return 120; } if (m == 3) { return 90; } if (m == 4) { return 170; } return 255; }
@@ -286,9 +312,8 @@ class SnGame {
         g.r = h.Renderer();
         g.prof = Profile.Load();
         g.rng = Rng.Seed((long)Sdl.Ticks() + 987654321);
-        g.me = Worm.Make(true, 90, 235, 190);
-        g.foe1 = Worm.Make(false, 200, 120, 255);
-        g.foe2 = Worm.Make(false, 255, 160, 80);
+        g.me = Worm.Make(0, 90, 235, 190);
+        g.foes = new List<Worm>();
         g.orbs = new List<Orb>();
         g.parts = new List<Particle>();
         g.pops = new List<Popup>();
@@ -307,8 +332,9 @@ class SnGame {
         this.titleTex = SnGame.LoadTex(this.r, "examples/game/snake/assets/title.png");
     }
     static SdlTexture LoadTex(SdlRenderer r, string path) {
-        if (!File.Exists(path)) { return null; }
-        SdlTexture t = SdlTexture.LoadImage(r, path);
+        string p = Assets.Find(path);
+        if (!File.Exists(p)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, p);
         if (t == null || !t.IsValid()) { return null; }
         t.SetNearest(false);
         t.SetBlendMode(1);
@@ -319,8 +345,8 @@ class SnGame {
 
     void SpawnOrb() {
         Orb o = new Orb();
-        o.x = 40 + this.rng.Range(0, SnGame.W() - 80);
-        o.y = 40 + this.rng.Range(0, SnGame.H() - 80);
+        o.x = this.rng.Range(0, SnGame.WW());
+        o.y = this.rng.Range(0, SnGame.WH());
         o.size = 4 + this.rng.Range(0, 6);
         o.hue = this.rng.Range(0, 6);
         o.phase = this.rng.Range(0, 1000);
@@ -328,24 +354,57 @@ class SnGame {
     }
     void DropOrbAt(int px, int py, int size) {
         Orb o = new Orb();
-        o.x = px; o.y = py;
-        if (o.x < 20) { o.x = 20; }
-        if (o.x > SnGame.W() - 20) { o.x = SnGame.W() - 20; }
-        if (o.y < 20) { o.y = 20; }
-        if (o.y > SnGame.H() - 20) { o.y = SnGame.H() - 20; }
+        o.x = SnGame.WrapP(px, SnGame.WW());
+        o.y = SnGame.WrapP(py, SnGame.WH());
         o.size = size;
         o.hue = this.rng.Range(0, 6);
         o.phase = this.rng.Range(0, 1000);
         this.orbs.Add(o);
     }
 
+    void SpawnFoe(Worm w, int now) {
+        // spawn away from the player so nobody materializes on top of you
+        int guard = 0;
+        int px = 0; int py = 0;
+        while (guard < 60) {
+            px = this.rng.Range(0, SnGame.WW());
+            py = this.rng.Range(0, SnGame.WH());
+            if (SnGame.Dist2(px, py, this.me.headX / 256, this.me.headY / 256) > 500 * 500) { guard = 60; }
+            guard = guard + 1;
+        }
+        int dx = 1; int dy = 0;
+        if (this.rng.Range(0, 2) == 1) { dx = -1; }
+        if (this.rng.Range(0, 2) == 1) { dx = 0; dy = 1; if (this.rng.Range(0, 2) == 1) { dy = -1; } }
+        if (w.kind == 1) {
+            w.Spawn(px, py, dx, dy, 18 + this.rng.Range(0, 26), 168);
+        } else {
+            w.Spawn(px, py, dx, dy, 5 + this.rng.Range(0, 5), 130);
+        }
+    }
+
     void StartGame(int now) {
-        this.me.Spawn(SnGame.W() / 2, SnGame.H() / 2, 1, 0, 14, 200);
-        this.foe1.Spawn(260, 180, 0, 1, 16, 170);
-        this.foe2.Spawn(1020, 540, 0, -1, 16, 170);
-        this.orbs = new List<Orb>();
+        this.me.kind = 0;
+        this.me.Spawn(SnGame.WW() / 2, SnGame.WH() / 2, 1, 0, 14, 205);
+        this.foes = new List<Worm>();
         int i = 0;
-        while (i < 46) { this.SpawnOrb(); i = i + 1; }
+        while (i < 3) {
+            Worm w = Worm.Make(1, 200, 120, 255);
+            if (i == 1) { w.cr = 255; w.cg = 160; w.cb = 80; }
+            if (i == 2) { w.cr = 90; w.cg = 160; w.cb = 255; }
+            this.SpawnFoe(w, now);
+            this.foes.Add(w);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 5) {
+            Worm w = Worm.Make(2, 255, 220, 130);
+            this.SpawnFoe(w, now);
+            this.foes.Add(w);
+            i = i + 1;
+        }
+        this.orbs = new List<Orb>();
+        i = 0;
+        while (i < 150) { this.SpawnOrb(); i = i + 1; }
         this.parts = new List<Particle>();
         this.pops = new List<Popup>();
         this.score = 0;
@@ -368,22 +427,24 @@ class SnGame {
         this.toastAt = now;
     }
     void AddPop(int px, int py, string t, int now, int cr, int cg, int cb) {
+        if (this.pops.Count > 24) { this.pops.RemoveAt(0); }
         Popup p = new Popup();
-        p.x = px; p.y = py - 12;
+        p.x = SnGame.WrapP(px, SnGame.WW());
+        p.y = SnGame.WrapP(py, SnGame.WH());
         p.text = t;
         p.bornAt = now;
         p.cr = cr; p.cg = cg; p.cb = cb;
         this.pops.Add(p);
     }
     void Burst(int px, int py, int n, int now, int cr, int cg, int cb) {
+        if (this.parts.Count > 220) { return; }
         int i = 0;
         while (i < n) {
             Particle p = new Particle();
-            p.x = px * 256;
-            p.y = py * 256;
+            p.x = SnGame.WrapP(px, SnGame.WW()) * 256;
+            p.y = SnGame.WrapP(py, SnGame.WH()) * 256;
             int a = this.rng.Range(0, 16);
             int spd = 60 + this.rng.Range(0, 140);
-            // 16-direction star burst without trig
             int ux = 0; int uy = 0;
             int q = a % 4;
             if (q == 0) { ux = 256; uy = (a / 4 - 2) * 128; }
@@ -426,13 +487,11 @@ class SnGame {
         }
         if (!this.wasRecord && this.prof.high > 0 && this.score > this.prof.high) {
             this.wasRecord = true;
-            this.newRecordAt = now;
             this.Toast("新纪录诞生！", now);
         }
     }
 
-    void KillWorm(Worm w, int now) {
-        // an AI worm bursts into orbs along its body
+    void KillFoe(Worm w, int now, bool eaten) {
         int i = 0;
         while (i < w.segN) {
             if (i % 2 == 0) { this.DropOrbAt(w.segX[i] + this.rng.Range(-8, 17), w.segY[i] + this.rng.Range(-8, 17), 6 + this.rng.Range(0, 4)); }
@@ -440,17 +499,24 @@ class SnGame {
         }
         this.Burst(w.segX[0], w.segY[0], 14, now, w.cr, w.cg, w.cb);
         w.alive = false;
-        w.respawnAt = now + 4000;
         this.kills = this.kills + 1;
-        this.score = this.score + 40;
-        this.AddPop(w.segX[0], w.segY[0], "击败对手 +40", now, 255, 235, 130);
-        this.Toast("漂亮！对手炸成了能量豆", now);
+        int gain = w.length * 2;
+        this.score = this.score + gain;
+        if (eaten) {
+            this.me.length = this.me.length + w.length / 2;
+            w.respawnAt = now + 7000;
+            this.AddPop(w.segX[0], w.segY[0], "美餐 +" + gain, now, 255, 235, 130);
+            this.Toast("吃掉了一条小蛇！", now);
+        } else {
+            w.respawnAt = now + 5000;
+            this.AddPop(w.segX[0], w.segY[0], "击败 +" + gain, now, 255, 235, 130);
+            this.Toast("漂亮！对手炸成了能量豆", now);
+        }
     }
 
     void Die(int now, string why) {
         this.me.alive = false;
         this.scene = 2;
-        this.diedAt = now;
         this.deathBy = why;
         this.shakeUntil = now + 450;
         this.prof.games = this.prof.games + 1;
@@ -460,13 +526,13 @@ class SnGame {
         this.prof.Save();
     }
 
+    // does (hx,hy) hit w's body (segments from fromSeg on), torus metric
     bool HitsBody(Worm w, int hx, int hy, int fromSeg, int rad) {
         if (!w.alive) { return false; }
         int i = fromSeg;
         while (i < w.segN) {
-            int dx = w.segX[i] - hx; int dy = w.segY[i] - hy;
             int rr = rad + w.Radius() - 4;
-            if (dx * dx + dy * dy < rr * rr) { return true; }
+            if (SnGame.Dist2(SnGame.WrapP(w.segX[i], SnGame.WW()), SnGame.WrapP(w.segY[i], SnGame.WH()), hx, hy) < rr * rr) { return true; }
             i = i + 1;
         }
         return false;
@@ -474,67 +540,103 @@ class SnGame {
 
     void AiThink(Worm w, int now) {
         if (now < w.thinkAt) { return; }
-        w.thinkAt = now + 120;
-        int hx = w.headX / 256; int hy = w.headY / 256;
-        // nearest orb
-        int best = -1; int bd = 999999999;
-        int i = 0;
-        while (i < this.orbs.Count) {
-            Orb o = this.orbs[i];
-            int dx = o.x - hx; int dy = o.y - hy;
-            int d = dx * dx + dy * dy;
-            if (d < bd) { bd = d; best = i; }
-            i = i + 1;
+        w.thinkAt = now + 90;
+        int hx = SnGame.WrapP(w.headX / 256, SnGame.WW());
+        int hy = SnGame.WrapP(w.headY / 256, SnGame.WH());
+        int phx = SnGame.WrapP(this.me.headX / 256, SnGame.WW());
+        int phy = SnGame.WrapP(this.me.headY / 256, SnGame.WH());
+        int pd2 = SnGame.Dist2(hx, hy, phx, phy);
+
+        if (w.kind == 2) {
+            // snakelet prey: flee the player when close, otherwise wander
+            if (pd2 < 260 * 260 && this.me.alive) {
+                int fx = SnGame.WrapD(hx - phx, SnGame.WW());
+                int fy = SnGame.WrapD(hy - phy, SnGame.WH());
+                w.tgtX = SnGame.WrapP(hx + fx * 4, SnGame.WW());
+                w.tgtY = SnGame.WrapP(hy + fy * 4, SnGame.WH());
+                w.tgtUntil = now + 300;
+            } else if (now >= w.tgtUntil) {
+                w.tgtX = this.rng.Range(0, SnGame.WW());
+                w.tgtY = this.rng.Range(0, SnGame.WH());
+                w.tgtUntil = now + 2200 + this.rng.Range(0, 2000);
+            }
+        } else {
+            // hunter: lock an orb target; if bigger than the player and the
+            // player is near, aim ahead of the player's head to cut them off
+            bool intercept = false;
+            if (this.me.alive && w.length > this.me.length && pd2 < 420 * 420) { intercept = true; }
+            if (intercept) {
+                int aheadX = phx + this.me.dirX * 120 / 256;
+                int aheadY = phy + this.me.dirY * 120 / 256;
+                w.tgtX = SnGame.WrapP(aheadX, SnGame.WW());
+                w.tgtY = SnGame.WrapP(aheadY, SnGame.WH());
+                w.tgtUntil = now + 250;
+            } else if (now >= w.tgtUntil) {
+                // nearest orb (sampled: scan a slice, good enough and cheap)
+                int best = -1; int bd = 999999999;
+                int i = 0;
+                while (i < this.orbs.Count) {
+                    Orb o = this.orbs[i];
+                    int d = SnGame.Dist2(o.x, o.y, hx, hy);
+                    if (d < bd) { bd = d; best = i; }
+                    i = i + 3;
+                }
+                if (best >= 0) {
+                    w.tgtX = this.orbs[best].x;
+                    w.tgtY = this.orbs[best].y;
+                } else {
+                    w.tgtX = this.rng.Range(0, SnGame.WW());
+                    w.tgtY = this.rng.Range(0, SnGame.WH());
+                }
+                w.tgtUntil = now + 1500;
+            }
+            // avoid driving straight into the player's body just ahead
+            int probeX = SnGame.WrapP(hx + w.dirX * 70 / 256, SnGame.WW());
+            int probeY = SnGame.WrapP(hy + w.dirY * 70 / 256, SnGame.WH());
+            if (this.me.alive && this.HitsBody(this.me, probeX, probeY, 3, w.Radius())) {
+                // veer sideways
+                w.tgtX = SnGame.WrapP(hx + w.dirY * 200 / 256, SnGame.WW());
+                w.tgtY = SnGame.WrapP(hy - w.dirX * 200 / 256, SnGame.WH());
+                w.tgtUntil = now + 400;
+            }
         }
-        int vx = 0; int vy = 0;
-        if (best >= 0) {
-            vx = this.orbs[best].x - hx;
-            vy = this.orbs[best].y - hy;
-        }
-        // wall avoidance dominates near edges
-        int m = 90;
-        if (hx < m) { vx = vx + (m - hx) * 6; }
-        if (hx > SnGame.W() - m) { vx = vx - (hx - (SnGame.W() - m)) * 6; }
-        if (hy < m) { vy = vy + (m - hy) * 6; }
-        if (hy > SnGame.H() - m) { vy = vy - (hy - (SnGame.H() - m)) * 6; }
-        // shy away from the player's head
-        int pdx = this.me.headX / 256 - hx; int pdy = this.me.headY / 256 - hy;
-        int pd = pdx * pdx + pdy * pdy;
-        if (pd < 120 * 120 && pd > 0) { vx = vx - pdx; vy = vy - pdy; }
-        int vl = Worm.Isq(vx * vx + vy * vy);
-        if (vl < 1) { return; }
-        w.Steer(vx * 256 / vl, vy * 256 / vl, 120);
     }
 
-    void StepWorm(Worm w, int dt, int now) {
+    void SteerToTarget(Worm w, int dt) {
+        int hx = SnGame.WrapP(w.headX / 256, SnGame.WW());
+        int hy = SnGame.WrapP(w.headY / 256, SnGame.WH());
+        int vx = SnGame.WrapD(w.tgtX - hx, SnGame.WW());
+        int vy = SnGame.WrapD(w.tgtY - hy, SnGame.WH());
+        int vl = Worm.Isq(vx * vx + vy * vy);
+        if (vl < 12) { return; }
+        w.Steer(vx * 256 / vl, vy * 256 / vl, dt);
+    }
+
+    void StepFoe(Worm w, int dt, int now) {
         if (!w.alive) {
-            if (!w.isPlayer && now >= w.respawnAt && this.scene == 1) {
-                int px = 120 + this.rng.Range(0, SnGame.W() - 240);
-                int py = 120 + this.rng.Range(0, SnGame.H() - 240);
-                w.Spawn(px, py, 1, 0, 14 + this.rng.Range(0, 10), 170);
-            }
+            if (now >= w.respawnAt && this.scene == 1) { this.SpawnFoe(w, now); }
             return;
         }
-        if (!w.isPlayer) {
-            this.AiThink(w, now);
-            w.Advance(w.speed, dt);
-            int hx = w.headX / 256; int hy = w.headY / 256;
-            // AI eats orbs too
-            int i = this.orbs.Count - 1;
-            while (i >= 0) {
-                Orb o = this.orbs[i];
-                int dx = o.x - hx; int dy = o.y - hy;
-                int rr = w.Radius() + o.size;
-                if (dx * dx + dy * dy < rr * rr) {
-                    this.orbs.RemoveAt(i);
-                    this.SpawnOrb();
-                    w.length = w.length + 1;
-                }
-                i = i - 1;
+        this.AiThink(w, now);
+        this.SteerToTarget(w, dt);
+        w.Advance(w.speed, dt);
+        int hx = SnGame.WrapP(w.headX / 256, SnGame.WW());
+        int hy = SnGame.WrapP(w.headY / 256, SnGame.WH());
+        // foes eat orbs (hunters grow from them)
+        int i = this.orbs.Count - 1;
+        while (i >= 0) {
+            Orb o = this.orbs[i];
+            int rr = w.Radius() + o.size;
+            if (SnGame.Dist2(o.x, o.y, hx, hy) < rr * rr) {
+                this.orbs.RemoveAt(i);
+                this.SpawnOrb();
+                if (w.kind == 1) { w.length = w.length + 1; }
             }
-            // AI dies on walls or on the player's body
-            if (hx < 14 || hx > SnGame.W() - 14 || hy < 14 || hy > SnGame.H() - 14) { this.KillWorm(w, now); return; }
-            if (this.HitsBody(this.me, hx, hy, 2, w.Radius())) { this.KillWorm(w, now); return; }
+            i = i - 1;
+        }
+        // hunter dies when its head hits the player's body
+        if (this.me.alive && this.HitsBody(this.me, hx, hy, 2, w.Radius())) {
+            this.KillFoe(w, now, false);
         }
     }
 
@@ -545,18 +647,22 @@ class SnGame {
         if (dt > 50) { dt = 50; }
         if (dt == 0) { return; }
 
-        // player steering: head chases the mouse cursor
-        int hx = this.me.headX / 256; int hy = this.me.headY / 256;
+        // player steering: chase the mouse (screen center = head)
         if (this.demo) {
-            this.AiThink(this.me, now);
+            if (now >= this.me.tgtUntil) {
+                this.me.tgtX = this.rng.Range(0, SnGame.WW());
+                this.me.tgtY = this.rng.Range(0, SnGame.WH());
+                this.me.tgtUntil = now + 1600;
+            }
+            this.SteerToTarget(this.me, dt);
         } else {
-            int vx = this.mouseX - hx;
-            int vy = this.mouseY - hy;
+            int vx = this.mouseX - SnGame.VW() / 2;
+            int vy = this.mouseY - SnGame.VH() / 2;
             int vl = Worm.Isq(vx * vx + vy * vy);
-            if (vl > 14) { this.me.Steer(vx * 256 / vl, vy * 256 / vl, dt); }
+            if (vl > 18) { this.me.Steer(vx * 256 / vl, vy * 256 / vl, dt); }
         }
 
-        // boost: faster, drains one segment periodically, drops orbs behind
+        // boost
         bool boosting = (this.boostHeld || this.boostKey) && this.me.length > 12;
         int spd = this.me.speed;
         if (boosting) {
@@ -575,29 +681,37 @@ class SnGame {
             if (this.fever <= 0) { this.fever = 0; this.feverOn = false; }
         }
         this.me.Advance(spd, dt);
-        hx = this.me.headX / 256; hy = this.me.headY / 256;
+        int hx = SnGame.WrapP(this.me.headX / 256, SnGame.WW());
+        int hy = SnGame.WrapP(this.me.headY / 256, SnGame.WH());
 
-        // walls kill
-        if (hx < 12 || hx > SnGame.W() - 12 || hy < 12 || hy > SnGame.H() - 12) {
-            this.Die(now, "撞上了霓虹墙");
-            return;
+        // collisions with foes
+        int fi = 0;
+        while (fi < this.foes.Count) {
+            Worm w = this.foes[fi];
+            if (w.alive) {
+                if (w.kind == 1) {
+                    if (this.HitsBody(w, hx, hy, 1, this.me.Radius())) { this.Die(now, "撞上了对手的身体"); return; }
+                } else {
+                    if (this.HitsBody(w, hx, hy, 0, this.me.Radius())) { this.KillFoe(w, now, true); }
+                }
+            }
+            fi = fi + 1;
         }
-        // AI rival bodies kill
-        if (this.HitsBody(this.foe1, hx, hy, 1, this.me.Radius())) { this.Die(now, "撞上了紫色对手"); return; }
-        if (this.HitsBody(this.foe2, hx, hy, 1, this.me.Radius())) { this.Die(now, "撞上了橙色对手"); return; }
 
         // orb magnet + pickup
         int i = this.orbs.Count - 1;
         while (i >= 0) {
             Orb o = this.orbs[i];
-            int dx = o.x - hx; int dy = o.y - hy;
+            int dx = SnGame.WrapD(o.x - hx, SnGame.WW());
+            int dy = SnGame.WrapD(o.y - hy, SnGame.WH());
             int d2 = dx * dx + dy * dy;
             if (d2 < 78 * 78 && d2 > 4) {
                 int d = Worm.Isq(d2);
                 int pull = 260 * dt / 1000;
-                o.x = o.x - dx * pull / d;
-                o.y = o.y - dy * pull / d;
-                dx = o.x - hx; dy = o.y - hy;
+                o.x = SnGame.WrapP(o.x - dx * pull / d, SnGame.WW());
+                o.y = SnGame.WrapP(o.y - dy * pull / d, SnGame.WH());
+                dx = SnGame.WrapD(o.x - hx, SnGame.WW());
+                dy = SnGame.WrapD(o.y - hy, SnGame.WH());
                 d2 = dx * dx + dy * dy;
             }
             int rr = this.me.Radius() + o.size + 2;
@@ -605,11 +719,13 @@ class SnGame {
             i = i - 1;
         }
 
-        // fever decays slowly while not in fever
         if (!this.feverOn && this.fever > 0 && now % 3 == 0) { this.fever = this.fever - 1; }
 
-        this.StepWorm(this.foe1, dt, now);
-        this.StepWorm(this.foe2, dt, now);
+        fi = 0;
+        while (fi < this.foes.Count) {
+            this.StepFoe(this.foes[fi], dt, now);
+            fi = fi + 1;
+        }
 
         // particles
         int pi = this.parts.Count - 1;
@@ -627,86 +743,64 @@ class SnGame {
 
     // ----- rendering -------------------------------------------------------
 
-    void DrawArena(int now, int shX, int shY) {
-        // deep navy backdrop with a soft dot grid: reads "arena", not "board"
-        this.host.Begin(10, 13, 26);
-        this.r.SetColor(120, 140, 210, 26);
-        int gx = 40;
-        while (gx < SnGame.W()) {
-            int gy = 40;
-            while (gy < SnGame.H()) {
-                this.r.FillRect(gx + shX, gy + shY, 2, 2);
-                gy = gy + 40;
-            }
-            gx = gx + 40;
-        }
-        // neon boundary: two glow layers + core line
-        Draw.RingRect(this.r, 6 + shX, 6 + shY, SnGame.W() - 12, SnGame.H() - 12, 5, 90, 60, 170, 70);
-        Draw.RingRect(this.r, 9 + shX, 9 + shY, SnGame.W() - 18, SnGame.H() - 18, 2, 190, 120, 255, 200);
-    }
-
-    void DrawOrbs(int now, int shX, int shY) {
-        int i = 0;
-        while (i < this.orbs.Count) {
-            Orb o = this.orbs[i];
-            int pulse = ((now + o.phase * 7) / 90) % 6;
-            if (pulse > 3) { pulse = 6 - pulse; }
-            int cr = SnGame.PalR(o.hue); int cg = SnGame.PalG(o.hue); int cb = SnGame.PalB(o.hue);
-            int px = o.x + shX; int py = o.y + shY;
-            Draw.FillCircle(this.r, px, py, o.size + 4 + pulse / 2, cr, cg, cb, 36);
-            Draw.FillCircle(this.r, px, py, o.size + pulse / 3, cr, cg, cb, 235);
-            Draw.FillCircle(this.r, px - o.size / 3, py - o.size / 3, o.size / 3 + 1, 255, 255, 255, 170);
-            i = i + 1;
-        }
+    // world -> screen (camera centered on the player head); returns via out
+    // pattern using small arrays to keep it allocation-free per call site.
+    int camX;
+    int camY;
+    int ScrX(int wx) { return SnGame.VW() / 2 + SnGame.WrapD(wx - this.camX, SnGame.WW()); }
+    int ScrY(int wy) { return SnGame.VH() / 2 + SnGame.WrapD(wy - this.camY, SnGame.WH()); }
+    bool OnScreen(int sx, int sy, int m) {
+        return sx > -m && sx < SnGame.VW() + m && sy > -m && sy < SnGame.VH() + m;
     }
 
     void DrawWorm(Worm w, int now, int shX, int shY) {
         if (!w.alive) { return; }
         int rad = w.Radius();
-        // rainbow body during player fever
-        bool rainbow = w.isPlayer && this.feverOn;
+        bool rainbow = w.kind == 0 && this.feverOn;
         int i = w.segN - 1;
         while (i >= 0) {
-            int px = w.segX[i] + shX;
-            int py = w.segY[i] + shY;
-            int s = rad - 3 * i / (w.segN + 1);
-            int cr = w.cr; int cg = w.cg; int cb = w.cb;
-            if (rainbow) {
-                int hue = (i * 2 + now / 60) % 6;
-                cr = SnGame.PalR(hue); cg = SnGame.PalG(hue); cb = SnGame.PalB(hue);
-            } else {
-                // darker toward the tail + light candy stripe every 4th ball
-                int fade = 55 * i / (w.segN + 1);
-                cr = cr - cr * fade / 160;
-                cg = cg - cg * fade / 160;
-                cb = cb - cb * fade / 160;
-                if (i % 4 == 1) {
-                    cr = cr + (255 - cr) / 3;
-                    cg = cg + (255 - cg) / 3;
-                    cb = cb + (255 - cb) / 3;
+            int sx = this.ScrX(SnGame.WrapP(w.segX[i], SnGame.WW())) + shX;
+            int sy = this.ScrY(SnGame.WrapP(w.segY[i], SnGame.WH())) + shY;
+            if (this.OnScreen(sx, sy, 40)) {
+                int s = rad - 3 * i / (w.segN + 1);
+                int cr = w.cr; int cg = w.cg; int cb = w.cb;
+                if (rainbow) {
+                    int hue = (i * 2 + now / 60) % 6;
+                    cr = SnGame.PalR(hue); cg = SnGame.PalG(hue); cb = SnGame.PalB(hue);
+                } else {
+                    int fade = 55 * i / (w.segN + 1);
+                    cr = cr - cr * fade / 160;
+                    cg = cg - cg * fade / 160;
+                    cb = cb - cb * fade / 160;
+                    if (i % 4 == 1) {
+                        cr = cr + (255 - cr) / 3;
+                        cg = cg + (255 - cg) / 3;
+                        cb = cb + (255 - cb) / 3;
+                    }
                 }
+                if (i % 2 == 0) { Draw.FillCircle(this.r, sx, sy, s + 5, cr, cg, cb, 26); }
+                Draw.FillCircle(this.r, sx, sy, s, cr, cg, cb, 255);
+                Draw.FillCircle(this.r, sx - s / 3, sy - s / 2 + 1, s / 3, 255, 255, 255, 60);
             }
-            // glow halo then core ball then top highlight
-            Draw.FillCircle(this.r, px, py, s + 5, cr, cg, cb, 26);
-            Draw.FillCircle(this.r, px, py, s, cr, cg, cb, 255);
-            Draw.FillCircle(this.r, px - s / 3, py - s / 2 + 1, s / 3, 255, 255, 255, 60);
             i = i - 1;
         }
-        // face: big glossy eyes looking along the heading
-        int hx = w.segX[0] + shX;
-        int hy = w.segY[0] + shY;
-        int ex = w.dirY * rad / 256 / 2;
-        int ey = -w.dirX * rad / 256 / 2;
-        int lx = w.dirX * rad / 256 / 3;
-        int ly = w.dirY * rad / 256 / 3;
-        Draw.FillCircle(this.r, hx + ex + lx, hy + ey + ly, rad / 2, 255, 255, 255, 255);
-        Draw.FillCircle(this.r, hx - ex + lx, hy - ey + ly, rad / 2, 255, 255, 255, 255);
-        int px2 = w.dirX * rad / 256 / 4;
-        int py2 = w.dirY * rad / 256 / 4;
-        Draw.FillCircle(this.r, hx + ex + lx + px2, hy + ey + ly + py2, rad / 4 + 1, 30, 34, 60, 255);
-        Draw.FillCircle(this.r, hx - ex + lx + px2, hy - ey + ly + py2, rad / 4 + 1, 30, 34, 60, 255);
-        Draw.FillCircle(this.r, hx + ex + lx + px2 - 1, hy + ey + ly + py2 - 2, rad / 8 + 1, 255, 255, 255, 230);
-        Draw.FillCircle(this.r, hx - ex + lx + px2 - 1, hy - ey + ly + py2 - 2, rad / 8 + 1, 255, 255, 255, 230);
+        // eyes
+        int hsx = this.ScrX(SnGame.WrapP(w.segX[0], SnGame.WW())) + shX;
+        int hsy = this.ScrY(SnGame.WrapP(w.segY[0], SnGame.WH())) + shY;
+        if (this.OnScreen(hsx, hsy, 60)) {
+            int ex = w.dirY * rad / 256 / 2;
+            int ey = -w.dirX * rad / 256 / 2;
+            int lx = w.dirX * rad / 256 / 3;
+            int ly = w.dirY * rad / 256 / 3;
+            Draw.FillCircle(this.r, hsx + ex + lx, hsy + ey + ly, rad / 2, 255, 255, 255, 255);
+            Draw.FillCircle(this.r, hsx - ex + lx, hsy - ey + ly, rad / 2, 255, 255, 255, 255);
+            int px2 = w.dirX * rad / 256 / 4;
+            int py2 = w.dirY * rad / 256 / 4;
+            Draw.FillCircle(this.r, hsx + ex + lx + px2, hsy + ey + ly + py2, rad / 4 + 1, 30, 34, 60, 255);
+            Draw.FillCircle(this.r, hsx - ex + lx + px2, hsy - ey + ly + py2, rad / 4 + 1, 30, 34, 60, 255);
+            Draw.FillCircle(this.r, hsx + ex + lx + px2 - 1, hsy + ey + ly + py2 - 2, rad / 8 + 1, 255, 255, 255, 230);
+            Draw.FillCircle(this.r, hsx - ex + lx + px2 - 1, hsy - ey + ly + py2 - 2, rad / 8 + 1, 255, 255, 255, 230);
+        }
     }
 
     void DrawScene(int now) {
@@ -718,10 +812,48 @@ class SnGame {
             shX = (now * 7 % (amp * 2 + 1)) - amp;
             shY = (now * 13 % (amp * 2 + 1)) - amp;
         }
-        this.DrawArena(now, shX, shY);
-        this.DrawOrbs(now, shX, shY);
-        this.DrawWorm(this.foe1, now, shX, shY);
-        this.DrawWorm(this.foe2, now, shX, shY);
+        this.camX = SnGame.WrapP(this.me.headX / 256, SnGame.WW());
+        this.camY = SnGame.WrapP(this.me.headY / 256, SnGame.WH());
+
+        this.host.Begin(10, 13, 26);
+        // dot grid, drawn only inside the view (camera-aligned)
+        this.r.SetColor(120, 140, 210, 26);
+        int gx0 = this.camX - SnGame.VW() / 2;
+        int gy0 = this.camY - SnGame.VH() / 2;
+        int gx = gx0 - SnGame.WrapP(gx0, 40);
+        while (gx < gx0 + SnGame.VW() + 40) {
+            int gy = gy0 - SnGame.WrapP(gy0, 40);
+            while (gy < gy0 + SnGame.VH() + 40) {
+                this.r.FillRect(this.ScrX(SnGame.WrapP(gx, SnGame.WW())) + shX,
+                    this.ScrY(SnGame.WrapP(gy, SnGame.WH())) + shY, 2, 2);
+                gy = gy + 40;
+            }
+            gx = gx + 40;
+        }
+
+        // orbs
+        int i = 0;
+        while (i < this.orbs.Count) {
+            Orb o = this.orbs[i];
+            int sx = this.ScrX(o.x) + shX;
+            int sy = this.ScrY(o.y) + shY;
+            if (this.OnScreen(sx, sy, 24)) {
+                int pulse = ((now + o.phase * 7) / 90) % 6;
+                if (pulse > 3) { pulse = 6 - pulse; }
+                int cr = SnGame.PalR(o.hue); int cg = SnGame.PalG(o.hue); int cb = SnGame.PalB(o.hue);
+                Draw.FillCircle(this.r, sx, sy, o.size + 4 + pulse / 2, cr, cg, cb, 36);
+                Draw.FillCircle(this.r, sx, sy, o.size + pulse / 3, cr, cg, cb, 235);
+                Draw.FillCircle(this.r, sx - o.size / 3, sy - o.size / 3, o.size / 3 + 1, 255, 255, 255, 170);
+            }
+            i = i + 1;
+        }
+
+        // worms: foes below, player on top
+        int fi = 0;
+        while (fi < this.foes.Count) {
+            this.DrawWorm(this.foes[fi], now, shX, shY);
+            fi = fi + 1;
+        }
         this.DrawWorm(this.me, now, shX, shY);
 
         // particles
@@ -730,30 +862,38 @@ class SnGame {
             Particle p = this.parts[pi];
             int age = now - p.bornAt;
             int alpha = 255 - age * 255 / 700;
-            Draw.FillCircle(this.r, p.x / 256 + shX, p.y / 256 + shY, 3, p.cr, p.cg, p.cb, alpha);
+            int sx = this.ScrX(SnGame.WrapP(p.x / 256, SnGame.WW())) + shX;
+            int sy = this.ScrY(SnGame.WrapP(p.y / 256, SnGame.WH())) + shY;
+            if (this.OnScreen(sx, sy, 20)) {
+                Draw.FillCircle(this.r, sx, sy, 3, p.cr, p.cg, p.cb, alpha);
+            }
             pi = pi + 1;
         }
-        // popups
+        // floating score popups (smooth font, rise + fade)
         pi = this.pops.Count - 1;
         while (pi >= 0) {
             Popup p = this.pops[pi];
             int age = now - p.bornAt;
-            if (age > 900) {
+            if (age > 950) {
                 this.pops.RemoveAt(pi);
             } else {
-                int alpha = 255 - age * 255 / 900;
-                Text.DrawCentered(this.r, p.text, p.x, p.y - age / 12, 3, p.cr, p.cg, p.cb, alpha);
+                int alpha = 255 - age * 255 / 950;
+                int sx = this.ScrX(p.x);
+                int sy = this.ScrY(p.y);
+                if (this.OnScreen(sx, sy, 80)) {
+                    Text.DrawCentered(this.r, p.text, sx, sy - age / 10, 3, p.cr, p.cg, p.cb, alpha);
+                }
             }
             pi = pi - 1;
         }
 
-        // ---- minimal glowing HUD (no panels) ----
-        Text.DrawShadow(this.r, "" + this.score, 28, 20, 6, 255, 230, 120, 3);
-        Text.DrawShadow(this.r, SnGame.TierName(this.titleTier) + " · 长度 " + this.me.length, 30, 74, 2, 170, 220, 255, 2);
+        // ---- HUD ----
+        Text.DrawShadow(this.r, "" + this.score, 28, 18, 7, 255, 230, 120, 3);
+        Text.DrawShadow(this.r, SnGame.TierName(this.titleTier) + " · 长度 " + this.me.length, 30, 84, 2, 170, 220, 255, 2);
         if (this.kills > 0) {
-            Text.DrawShadow(this.r, "击败 " + this.kills, 30, 104, 2, 255, 170, 190, 2);
+            Text.DrawShadow(this.r, "击败 " + this.kills, 30, 114, 2, 255, 170, 190, 2);
         }
-        // fever meter, bottom center
+        // fever meter
         int fw = 300 * this.fever / 100;
         this.r.SetColor(30, 34, 60, 200);
         this.r.FillRect(490, 690, 300, 12);
@@ -774,6 +914,23 @@ class SnGame {
             if (age > 1100) { a = 255 - (age - 1100) * 255 / 400; }
             Text.DrawCentered(this.r, this.toastText, 640, 120, 4, 255, 235, 140, a);
         }
+        // minimap: the whole torus at a glance (world 16:9 -> 160x90)
+        int mmX = 1104; int mmY = 614; int mmW = 160; int mmH = 90;
+        Draw.RoundRectFill(this.r, mmX - 4, mmY - 4, mmW + 8, mmH + 8, 8, 12, 16, 34, 190);
+        Draw.RingRect(this.r, mmX - 4, mmY - 4, mmW + 8, mmH + 8, 1, 120, 130, 190, 120);
+        fi = 0;
+        while (fi < this.foes.Count) {
+            Worm w = this.foes[fi];
+            if (w.alive) {
+                int dx = SnGame.WrapP(w.segX[0], SnGame.WW()) * mmW / SnGame.WW();
+                int dy = SnGame.WrapP(w.segY[0], SnGame.WH()) * mmH / SnGame.WH();
+                int dr = 2;
+                if (w.kind == 1) { dr = 3; }
+                Draw.FillCircle(this.r, mmX + dx, mmY + dy, dr, w.cr, w.cg, w.cb, 235);
+            }
+            fi = fi + 1;
+        }
+        Draw.FillCircle(this.r, mmX + this.camX * mmW / SnGame.WW(), mmY + this.camY * mmH / SnGame.WH(), 3, 140, 255, 210, 255);
     }
 
     void DrawPlay(int now) {
@@ -792,7 +949,7 @@ class SnGame {
         } else {
             Text.DrawCenteredShadow(this.r, "蛇蛇乐", 640, 80, 9, 245, 238, 220, 4);
         }
-        Text.DrawCenteredShadow(this.r, "追着鼠标滑行 · 吞豆成长 · 猎杀对手", 640, 268, 3, 255, 214, 150, 3);
+        Text.DrawCenteredShadow(this.r, "无边画布 · 吞豆成长 · 猎食小蛇 · 智斗大蛇", 640, 268, 3, 255, 214, 150, 3);
         Ui.Button(this.r, this.mouseX, this.mouseY, 460, 380, 360, 88, "开始滑行", 4, 1);
         Text.DrawCenteredShadow(this.r, "最高分 " + this.prof.high + " · 最长 " + this.prof.longest + " · 累计击败 " + this.prof.kills, 640, 520, 2, 255, 224, 130, 2);
         Text.DrawCenteredShadow(this.r, "鼠标转向 · 按住左键/空格冲刺(消耗长度) · F11 全屏 · Esc 退出", 640, 600, 2, 185, 195, 220, 2);
@@ -815,7 +972,7 @@ class SnGame {
         Text.DrawCentered(this.r, "长度 " + this.me.length + " · 击败 " + this.kills + " · " + SnGame.TierName(this.titleTier), 640, by + 156, 2, 175, 200, 235, 255);
         string cheer = "再来一局，超越自己！";
         if (this.wasRecord) { cheer = "你就是新的贪吃王！"; }
-        if (this.kills >= 2) { cheer = "猎蛇高手，名不虚传！"; }
+        if (this.kills >= 3) { cheer = "猎蛇高手，名不虚传！"; }
         Text.DrawCentered(this.r, cheer, 640, by + 196, 2, 150, 230, 190, 255);
         Ui.Button(this.r, this.mouseX, this.mouseY, 420, by + 236, 210, 60, "再滑一次", 3, 1);
         Ui.Button(this.r, this.mouseX, this.mouseY, 650, by + 236, 210, 60, "回到菜单", 3, 0);
@@ -893,7 +1050,7 @@ class SnApp {
             }
             g.Tick(now);
             g.Render(now);
-            Sdl.Delay(10);
+            Sdl.Delay(12);
         }
         h.Close();
     }
