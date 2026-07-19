@@ -1,0 +1,1093 @@
+// Gomoku (Five in a Row) — a complete product built on GameKit.
+// Features: start menu, four AI difficulties + adaptive scaling, Minimax with
+// alpha-beta pruning and threat-pattern evaluation, drop animations, winning
+// line highlight, hover preview, and a persistent rank / win-streak profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Gomoku;
+
+// ---------------------------------------------------------------------------
+// Persistent player profile (rank points, streaks, W/L, adaptive level).
+// ---------------------------------------------------------------------------
+class Profile {
+    int rank;
+    int streak;
+    int best;
+    int wins;
+    int losses;
+    int games;
+    int level;      // 0..3 selected difficulty
+    int adaptive;   // 0/1
+
+    static string Path() { return "gomoku_save.txt"; }
+
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            int eq = -1;
+            int j = 0;
+            while (j < ln.Length) {
+                if (ln[j] == 61) { eq = j; j = ln.Length; }
+                j = j + 1;
+            }
+            if (eq > 0) {
+                string k = ln.Substring(0, eq);
+                if (k == key) { return Profile.ParseInt(ln, eq + 1); }
+            }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static int ParseInt(string s, int start) {
+        int i = start;
+        int sign = 1;
+        if (i < s.Length && s[i] == 45) { sign = -1; i = i + 1; }
+        int v = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v * sign;
+    }
+
+    static Profile Load() {
+        Profile p = new Profile();
+        p.rank = 1000;
+        p.streak = 0;
+        p.best = 0;
+        p.wins = 0;
+        p.losses = 0;
+        p.games = 0;
+        p.level = 1;
+        p.adaptive = 1;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.rank = Profile.ReadKey(lines, "rank", 1000);
+            p.streak = Profile.ReadKey(lines, "streak", 0);
+            p.best = Profile.ReadKey(lines, "best", 0);
+            p.wins = Profile.ReadKey(lines, "wins", 0);
+            p.losses = Profile.ReadKey(lines, "losses", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+            p.level = Profile.ReadKey(lines, "level", 1);
+            p.adaptive = Profile.ReadKey(lines, "adaptive", 1);
+        }
+        return p;
+    }
+
+    void Save() {
+        string s = "";
+        s = s + "rank=" + this.rank + "\n";
+        s = s + "streak=" + this.streak + "\n";
+        s = s + "best=" + this.best + "\n";
+        s = s + "wins=" + this.wins + "\n";
+        s = s + "losses=" + this.losses + "\n";
+        s = s + "games=" + this.games + "\n";
+        s = s + "level=" + this.level + "\n";
+        s = s + "adaptive=" + this.adaptive + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+
+    string TierName() {
+        int r = this.rank;
+        if (r < 900) { return "BRONZE"; }
+        if (r < 1100) { return "SILVER"; }
+        if (r < 1300) { return "GOLD"; }
+        if (r < 1500) { return "PLATINUM"; }
+        if (r < 1750) { return "DIAMOND"; }
+        return "MASTER";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Board + AI. Cells: 0 empty, 1 human (black), 2 AI (white). 15x15.
+// ---------------------------------------------------------------------------
+class Ai {
+    static int N() { return 15; }
+
+    static int Winner(int[] b) {
+        int r = 0;
+        while (r < 15) {
+            int c = 0;
+            while (c < 15) {
+                int p = b[r * 15 + c];
+                if (p != 0) {
+                    if (Ai.RunFrom(b, r, c, 1, 0, p)) { return p; }
+                    if (Ai.RunFrom(b, r, c, 0, 1, p)) { return p; }
+                    if (Ai.RunFrom(b, r, c, 1, 1, p)) { return p; }
+                    if (Ai.RunFrom(b, r, c, 1, -1, p)) { return p; }
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return 0;
+    }
+
+    static bool RunFrom(int[] b, int r, int c, int dr, int dc, int p) {
+        int k = 0;
+        while (k < 5) {
+            int rr = r + dr * k;
+            int cc = c + dc * k;
+            if (rr < 0 || rr >= 15 || cc < 0 || cc >= 15) { return false; }
+            if (b[rr * 15 + cc] != p) { return false; }
+            k = k + 1;
+        }
+        return true;
+    }
+
+    static int PatternValue(int len, int ends) {
+        if (len >= 5) { return 1000000; }
+        if (len == 4) {
+            if (ends == 2) { return 100000; }
+            if (ends == 1) { return 12000; }
+            return 0;
+        }
+        if (len == 3) {
+            if (ends == 2) { return 6000; }
+            if (ends == 1) { return 700; }
+            return 0;
+        }
+        if (len == 2) {
+            if (ends == 2) { return 300; }
+            if (ends == 1) { return 35; }
+            return 0;
+        }
+        if (len == 1) {
+            if (ends == 2) { return 12; }
+            if (ends == 1) { return 2; }
+            return 0;
+        }
+        return 0;
+    }
+
+    // Sum of threat-pattern values for player p over all maximal runs.
+    static int EvalFor(int[] b, int p) {
+        int total = 0;
+        int[] dr = new int[4];
+        int[] dc = new int[4];
+        dr[0] = 0; dc[0] = 1;
+        dr[1] = 1; dc[1] = 0;
+        dr[2] = 1; dc[2] = 1;
+        dr[3] = 1; dc[3] = -1;
+        int r = 0;
+        while (r < 15) {
+            int c = 0;
+            while (c < 15) {
+                if (b[r * 15 + c] == p) {
+                    int d = 0;
+                    while (d < 4) {
+                        int pr = r - dr[d];
+                        int pc = c - dc[d];
+                        bool isStart = true;
+                        if (pr >= 0 && pr < 15 && pc >= 0 && pc < 15) {
+                            if (b[pr * 15 + pc] == p) { isStart = false; }
+                        }
+                        if (isStart) {
+                            int len = 0;
+                            int rr = r;
+                            int cc = c;
+                            while (rr >= 0 && rr < 15 && cc >= 0 && cc < 15
+                                   && b[rr * 15 + cc] == p) {
+                                len = len + 1;
+                                rr = rr + dr[d];
+                                cc = cc + dc[d];
+                            }
+                            int ends = 0;
+                            if (pr >= 0 && pr < 15 && pc >= 0 && pc < 15) {
+                                if (b[pr * 15 + pc] == 0) { ends = ends + 1; }
+                            }
+                            if (rr >= 0 && rr < 15 && cc >= 0 && cc < 15) {
+                                if (b[rr * 15 + cc] == 0) { ends = ends + 1; }
+                            }
+                            total = total + Ai.PatternValue(len, ends);
+                        }
+                        d = d + 1;
+                    }
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return total;
+    }
+
+    // Board score from the AI's perspective (white = 2), defense-weighted.
+    static int Eval(int[] b) {
+        int me = Ai.EvalFor(b, 2);
+        int op = Ai.EvalFor(b, 1);
+        return me - op - op / 8;
+    }
+
+    static bool HasNeighbor(int[] b, int r, int c) {
+        int dr = -2;
+        while (dr <= 2) {
+            int dc = -2;
+            while (dc <= 2) {
+                int rr = r + dr;
+                int cc = c + dc;
+                if (rr >= 0 && rr < 15 && cc >= 0 && cc < 15) {
+                    if (b[rr * 15 + cc] != 0) { return true; }
+                }
+                dc = dc + 1;
+            }
+            dr = dr + 1;
+        }
+        return false;
+    }
+
+    // Fill cand[] with up to 'breadth' most promising empty cells for 'turn'.
+    // Returns the count.
+    static int Candidates(int[] b, int turn, int breadth, int[] cand) {
+        int[] idx = new int[256];
+        int[] sc = new int[256];
+        int n = 0;
+        int r = 0;
+        while (r < 15) {
+            int c = 0;
+            while (c < 15) {
+                int at = r * 15 + c;
+                if (b[at] == 0 && Ai.HasNeighbor(b, r, c)) {
+                    b[at] = turn;
+                    int s = Ai.Eval(b);
+                    b[at] = 0;
+                    if (turn == 1) { s = -s; }
+                    idx[n] = at;
+                    sc[n] = s;
+                    n = n + 1;
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        if (n == 0) { return 0; }
+        int take = breadth;
+        if (take > n) { take = n; }
+        int k = 0;
+        while (k < take) {
+            int bestI = k;
+            int j = k + 1;
+            while (j < n) {
+                if (sc[j] > sc[bestI]) { bestI = j; }
+                j = j + 1;
+            }
+            int ti = idx[bestI]; idx[bestI] = idx[k]; idx[k] = ti;
+            int ts = sc[bestI]; sc[bestI] = sc[k]; sc[k] = ts;
+            cand[k] = idx[k];
+            k = k + 1;
+        }
+        return take;
+    }
+
+    static int Search(int[] b, int depth, int alpha, int beta, int turn, int rootDepth) {
+        int w = Ai.Winner(b);
+        if (w == 2) { return 1000000 - (rootDepth - depth); }
+        if (w == 1) { return -1000000 + (rootDepth - depth); }
+        if (depth == 0) { return Ai.Eval(b); }
+
+        int[] cand = new int[64];
+        int count = Ai.Candidates(b, turn, 10, cand);
+        if (count == 0) { return Ai.Eval(b); }
+
+        if (turn == 2) {
+            int best = -2000000000;
+            int i = 0;
+            while (i < count) {
+                b[cand[i]] = 2;
+                int v = Ai.Search(b, depth - 1, alpha, beta, 1, rootDepth);
+                b[cand[i]] = 0;
+                if (v > best) { best = v; }
+                if (best > alpha) { alpha = best; }
+                if (beta <= alpha) { i = count; }
+                i = i + 1;
+            }
+            return best;
+        }
+        int best = 2000000000;
+        int i = 0;
+        while (i < count) {
+            b[cand[i]] = 1;
+            int v = Ai.Search(b, depth - 1, alpha, beta, 2, rootDepth);
+            b[cand[i]] = 0;
+            if (v < best) { best = v; }
+            if (best < beta) { beta = best; }
+            if (beta <= alpha) { i = count; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    // Immediate win / block-loss cell for player p, else -1.
+    static int TacticalMove(int[] b, int p) {
+        int r = 0;
+        while (r < 15) {
+            int c = 0;
+            while (c < 15) {
+                int at = r * 15 + c;
+                if (b[at] == 0 && Ai.HasNeighbor(b, r, c)) {
+                    b[at] = p;
+                    int w = Ai.Winner(b);
+                    b[at] = 0;
+                    if (w == p) { return at; }
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return -1;
+    }
+
+    // Best threat pattern value formed through cell 'at' for player p.
+    static int ThreatAt(int[] b, int at, int p) {
+        int r = at / 15;
+        int c = at % 15;
+        int[] dr = new int[4];
+        int[] dc = new int[4];
+        dr[0] = 0; dc[0] = 1;
+        dr[1] = 1; dc[1] = 0;
+        dr[2] = 1; dc[2] = 1;
+        dr[3] = 1; dc[3] = -1;
+        int best = 0;
+        int d = 0;
+        while (d < 4) {
+            int len = 1;
+            int rr = r + dr[d];
+            int cc = c + dc[d];
+            while (rr >= 0 && rr < 15 && cc >= 0 && cc < 15 && b[rr * 15 + cc] == p) {
+                len = len + 1; rr = rr + dr[d]; cc = cc + dc[d];
+            }
+            int endsA = 0;
+            if (rr >= 0 && rr < 15 && cc >= 0 && cc < 15) {
+                if (b[rr * 15 + cc] == 0) { endsA = 1; }
+            }
+            rr = r - dr[d];
+            cc = c - dc[d];
+            while (rr >= 0 && rr < 15 && cc >= 0 && cc < 15 && b[rr * 15 + cc] == p) {
+                len = len + 1; rr = rr - dr[d]; cc = cc - dc[d];
+            }
+            int endsB = 0;
+            if (rr >= 0 && rr < 15 && cc >= 0 && cc < 15) {
+                if (b[rr * 15 + cc] == 0) { endsB = 1; }
+            }
+            int v = Ai.PatternValue(len, endsA + endsB);
+            if (v > best) { best = v; }
+            d = d + 1;
+        }
+        return best;
+    }
+
+    // Fills win[0..4] with the 5 cells of a winning line for player p; true if found.
+    static bool FindWin(int[] b, int p, int[] win) {
+        int r = 0;
+        while (r < 15) {
+            int c = 0;
+            while (c < 15) {
+                if (b[r * 15 + c] == p) {
+                    int d = 0;
+                    while (d < 4) {
+                        int dr = 0; int dc = 0;
+                        if (d == 0) { dc = 1; }
+                        if (d == 1) { dr = 1; }
+                        if (d == 2) { dr = 1; dc = 1; }
+                        if (d == 3) { dr = 1; dc = -1; }
+                        if (Ai.RunFrom(b, r, c, dr, dc, p)) {
+                            int k = 0;
+                            while (k < 5) {
+                                win[k] = (r + dr * k) * 15 + (c + dc * k);
+                                k = k + 1;
+                            }
+                            return true;
+                        }
+                        d = d + 1;
+                    }
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return false;
+    }
+
+    static int BestMove(int[] b, int depth, int breadth, int rand, bool tactical, Rng rng) {
+        // Opening: center if the board is empty.
+        bool empty = true;
+        int t = 0;
+        while (t < 225) { if (b[t] != 0) { empty = false; t = 225; } t = t + 1; }
+        if (empty) { return 7 * 15 + 7; }
+
+        if (tactical) {
+            int win = Ai.TacticalMove(b, 2);
+            if (win >= 0) { return win; }
+            int block = Ai.TacticalMove(b, 1);
+            if (block >= 0) { return block; }
+        }
+
+        int[] cand = new int[64];
+        int count = Ai.Candidates(b, 2, breadth, cand);
+        if (count == 0) { return 7 * 15 + 7; }
+
+        int[] scores = new int[64];
+        int best = -2000000000;
+        int i = 0;
+        while (i < count) {
+            b[cand[i]] = 2;
+            int v = Ai.Search(b, depth - 1, -2000000000, 2000000000, 1, depth);
+            b[cand[i]] = 0;
+            scores[i] = v;
+            if (v > best) { best = v; }
+            i = i + 1;
+        }
+
+        // Collect near-best moves for a touch of variety on easier levels.
+        int[] pool = new int[64];
+        int pn = 0;
+        int margin = 0;
+        if (rand > 0) { margin = 400; }
+        i = 0;
+        while (i < count) {
+            if (scores[i] >= best - margin) { pool[pn] = cand[i]; pn = pn + 1; }
+            i = i + 1;
+        }
+        if (pn <= 1 || rand <= 0) {
+            i = 0;
+            while (i < count) { if (scores[i] == best) { return cand[i]; } i = i + 1; }
+            return cand[0];
+        }
+        int pick = rng.Range(0, pn);
+        return pool[pick];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Game — scenes, rendering, input, progression.
+// ---------------------------------------------------------------------------
+class GomokuGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    Talker talk;
+    int[] board;
+    int[] placed;
+    int[] winLine;
+    int turn;
+    int scene;      // 0 menu, 1 play, 2 over
+    int winner;     // 0 none, 1 human, 2 ai, 3 draw
+    int lastMove;
+    bool haveWin;
+    int aiMoveAt;
+    bool aiPending;
+    int moveCount;
+    int mouseX;
+    int mouseY;
+    int scoreDelta;
+    int winAdj;
+    int lossAdj;
+    SdlTexture boardTex;
+    SdlTexture stoneB;
+    SdlTexture stoneW;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool texTried;
+    bool demo;
+    int demoAt;
+
+    static int GX(int c) { return 92 + c * 44; }
+    static int GY(int r) { return 92 + r * 44; }
+
+    int Depth() {
+        if (this.prof.level == 0) { return 1; }
+        if (this.prof.level == 1) { return 2; }
+        return 4;
+    }
+    int Breadth() {
+        if (this.prof.level == 0) { return 8; }
+        if (this.prof.level <= 2) { return 10; }
+        return 16;
+    }
+    int Rand() {
+        if (this.prof.level == 0) { return 4; }
+        if (this.prof.level == 1) { return 1; }
+        return 0;
+    }
+    bool Tactical() { return this.prof.level >= 1; }
+
+    string LevelName() {
+        if (this.prof.level == 0) { return "EASY"; }
+        if (this.prof.level == 1) { return "NORMAL"; }
+        if (this.prof.level == 2) { return "HARD"; }
+        return "EXPERT";
+    }
+
+    static GomokuGame Create(Host h) {
+        GomokuGame g = new GomokuGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 123456789);
+        g.talk = Talker.Create(g.rng);
+        g.board = new int[225];
+        g.placed = new int[225];
+        g.winLine = new int[5];
+        g.scene = 0;
+        g.winner = 0;
+        g.lastMove = -1;
+        g.turn = 1;
+        g.mouseX = 0;
+        g.mouseY = 0;
+        g.winAdj = 0;
+        g.lossAdj = 0;
+        g.texTried = false;
+        g.SetupTalk();
+        g.demo = File.Exists("gomoku_demo.txt");
+        if (g.demo) {
+            g.StartGame(Sdl.Ticks());
+            g.demoAt = Sdl.Ticks() + 500;
+        }
+        return g;
+    }
+
+    // Attract-mode move for the "human" side (used only in demo self-play).
+    int DemoHumanPick() {
+        int w = Ai.TacticalMove(this.board, 1);
+        if (w >= 0) { return w; }
+        int blk = Ai.TacticalMove(this.board, 2);
+        if (blk >= 0) { return blk; }
+        int[] c = new int[4];
+        int n = Ai.Candidates(this.board, 1, 1, c);
+        if (n > 0) { return c[0]; }
+        return 7 * 15 + 7;
+    }
+
+    void SetupTalk() {
+        this.talk.Add(0, "Nice move!");
+        this.talk.Add(0, "Sharp play.");
+        this.talk.Add(0, "Good shape.");
+        this.talk.Add(0, "Clean and solid.");
+        this.talk.Add(0, "Ooh, I like that.");
+        this.talk.Add(1, "Hmm, bold choice...");
+        this.talk.Add(1, "AI smells blood.");
+        this.talk.Add(1, "You sure about that?");
+        this.talk.Add(1, "That one might sting.");
+        this.talk.Add(1, "The AI is grinning.");
+        this.talk.Add(2, "Your move.");
+        this.talk.Add(2, "Take your time.");
+        this.talk.Add(3, "FOUR! So close!");
+        this.talk.Add(3, "Unstoppable!");
+        this.talk.Add(3, "What a threat!");
+        this.talk.Add(3, "The crowd roars!");
+    }
+
+    void ResetBoard() {
+        int i = 0;
+        while (i < 225) { this.board[i] = 0; this.placed[i] = 0; i = i + 1; }
+        this.turn = 1;
+        this.winner = 0;
+        this.haveWin = false;
+        this.lastMove = -1;
+        this.aiPending = false;
+        this.moveCount = 0;
+        this.scoreDelta = 0;
+    }
+
+    void Place(int idx, int p, int now) {
+        this.board[idx] = p;
+        this.placed[idx] = now;
+        this.lastMove = idx;
+        this.moveCount = this.moveCount + 1;
+    }
+
+    void HumanMove(int idx, int now) {
+        this.Place(idx, 1, now);
+        if (Ai.Winner(this.board) == 1) { this.EndGame(1, now); return; }
+        // Commentary on the human move.
+        int t = Ai.ThreatAt(this.board, idx, 1);
+        if (t >= 100000) { this.talk.Say(3, now, 2600); }
+        else if (t >= 6000) { this.talk.SayExact(0, "Open three -- lovely!", now, 2200); }
+        else if (Ai.TacticalMove(this.board, 2) >= 0) {
+            this.talk.SayExact(1, "Uh oh, you left one open...", now, 2200);
+        } else if (this.rng.Range(0, 100) < 45) { this.talk.Say(0, now, 1800); }
+        if (this.moveCount >= 225) { this.EndGame(3, now); return; }
+        this.turn = 2;
+        this.aiMoveAt = now + 420;
+        this.aiPending = true;
+    }
+
+    void AiMove(int now) {
+        int before = Ai.TacticalMove(this.board, 1);
+        int idx = Ai.BestMove(this.board, this.Depth(), this.Breadth(),
+                              this.Rand(), this.Tactical(), this.rng);
+        this.Place(idx, 2, now);
+        this.aiPending = false;
+        if (Ai.Winner(this.board) == 2) { this.EndGame(2, now); return; }
+        if (before >= 0 && idx == before) {
+            this.talk.SayExact(1, "Blocked! The AI saw it coming.", now, 2000);
+        } else if (Ai.ThreatAt(this.board, idx, 2) >= 6000) {
+            this.talk.SayExact(1, "The AI is attacking now!", now, 2000);
+        }
+        if (this.moveCount >= 225) { this.EndGame(3, now); return; }
+        this.turn = 1;
+    }
+
+    void EndGame(int who, int now) {
+        this.winner = who;
+        this.scene = 2;
+        this.haveWin = false;
+        if (who == 1 || who == 2) {
+            int p = who;
+            this.haveWin = Ai.FindWin(this.board, p, this.winLine);
+        }
+        this.prof.games = this.prof.games + 1;
+        int delta = 0;
+        if (who == 1) {
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.best) { this.prof.best = this.prof.streak; }
+            delta = 18 + this.prof.level * 8;
+            int bonus = this.prof.streak;
+            if (bonus > 5) { bonus = 5; }
+            delta = delta + bonus * 3;
+            this.prof.rank = this.prof.rank + delta;
+            this.winAdj = this.winAdj + 1;
+            this.lossAdj = 0;
+            if (this.prof.streak >= 3) {
+                this.talk.SayExact(3, "WIN STREAK x" + this.prof.streak + "! On fire!", now, 4000);
+            } else {
+                this.talk.SayExact(0, "You win! Rank +" + delta, now, 4000);
+            }
+            if (this.prof.adaptive == 1 && this.winAdj >= 2 && this.prof.level < 3) {
+                this.prof.level = this.prof.level + 1;
+                this.winAdj = 0;
+                this.talk.SayExact(3, "The AI levels up. Prove yourself!", now, 4000);
+            }
+        } else if (who == 2) {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            delta = 14 - this.prof.level * 2;
+            if (delta < 6) { delta = 6; }
+            this.prof.rank = this.prof.rank - delta;
+            if (this.prof.rank < 100) { this.prof.rank = 100; }
+            delta = -delta;
+            this.lossAdj = this.lossAdj + 1;
+            this.winAdj = 0;
+            this.talk.SayExact(1, "The AI takes it. Rematch?", now, 4000);
+            if (this.prof.adaptive == 1 && this.lossAdj >= 2 && this.prof.level > 0) {
+                this.prof.level = this.prof.level - 1;
+                this.lossAdj = 0;
+                this.talk.SayExact(0, "AI eases off a touch. You got this.", now, 4000);
+            }
+        } else {
+            this.talk.SayExact(2, "A draw! Not a cell to spare.", now, 4000);
+        }
+        this.scoreDelta = delta;
+        this.prof.Save();
+    }
+
+    // Nearest empty intersection to a pixel, or -1 if too far / occupied.
+    int PickCell(int px, int py) {
+        int bestIdx = -1;
+        int bestD = 26 * 26;
+        int rr = 0;
+        while (rr < 15) {
+            int c = 0;
+            while (c < 15) {
+                int dx = px - GomokuGame.GX(c);
+                int dy = py - GomokuGame.GY(rr);
+                int d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; bestIdx = rr * 15 + c; }
+                c = c + 1;
+            }
+            rr = rr + 1;
+        }
+        return bestIdx;
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawStone(int cx, int cy, int rad, bool white, int alpha, bool ghost) {
+        if (rad < 2) { rad = 2; }
+        SdlTexture tex = this.stoneB;
+        if (white) { tex = this.stoneW; }
+        if (tex != null) {
+            int ds = rad * 9 / 4;
+            tex.SetOpacity(alpha);
+            this.r.DrawTexture(tex, cx - ds / 2, cy - ds / 2, ds, ds);
+            tex.SetOpacity(255);
+            return;
+        }
+        if (!ghost) {
+            Draw.FillCircle(this.r, cx + rad / 5, cy + rad / 4, rad, 0, 0, 0, alpha * 55 / 255);
+        }
+        int i = 0;
+        while (i <= rad) {
+            int rr = rad - i;
+            int tone = i * 210 / rad;
+            int cR; int cG; int cB;
+            if (white) {
+                cR = 150 + tone / 2; cG = 152 + tone / 2; cB = 158 + tone / 2;
+                if (cR > 255) { cR = 255; }
+                if (cG > 255) { cG = 255; }
+                if (cB > 255) { cB = 255; }
+            } else {
+                cR = 14 + tone / 2; cG = 16 + tone / 2; cB = 24 + tone / 2;
+                if (cR > 150) { cR = 150; }
+                if (cG > 152) { cG = 152; }
+                if (cB > 165) { cB = 165; }
+            }
+            Draw.FillCircle(this.r, cx - i * 3 / 8, cy - i * 3 / 8, rr, cR, cG, cB, alpha);
+            i = i + 1;
+        }
+        Draw.FillCircle(this.r, cx - rad / 3, cy - rad / 3, rad / 5, 255, 255, 255, alpha * 150 / 255);
+    }
+
+    void DrawBoard(int now) {
+        if (!this.texTried) {
+            this.texTried = true;
+            SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/gomoku/assets/board.png");
+            if (t != null && !t.IsValid()) { t = null; }
+            this.boardTex = t;
+            SdlTexture sb = SdlTexture.LoadImage(this.r, "examples/game/gomoku/assets/stone_black.png");
+            if (sb != null && sb.IsValid()) { sb.SetNearest(false); sb.SetBlendMode(1); } else { sb = null; }
+            this.stoneB = sb;
+            SdlTexture sw = SdlTexture.LoadImage(this.r, "examples/game/gomoku/assets/stone_white.png");
+            if (sw != null && sw.IsValid()) { sw.SetNearest(false); sw.SetBlendMode(1); } else { sw = null; }
+            this.stoneW = sw;
+        }
+        if (this.boardTex != null) {
+            this.r.DrawTexture(this.boardTex, 48, 48, 704, 704);
+        } else {
+            this.r.SetColor(196, 148, 84, 255);
+            this.r.FillRect(48, 48, 704, 704);
+        }
+        Draw.RingRect(this.r, 48, 48, 704, 704, 6, 46, 30, 16, 255);
+
+        this.r.SetColor(58, 40, 24, 255);
+        int i = 0;
+        while (i < 15) {
+            int x = GomokuGame.GX(i);
+            this.r.FillRect(x, GomokuGame.GY(0), 2, GomokuGame.GY(14) - GomokuGame.GY(0) + 2);
+            int y = GomokuGame.GY(i);
+            this.r.FillRect(GomokuGame.GX(0), y, GomokuGame.GX(14) - GomokuGame.GX(0) + 2, 2);
+            i = i + 1;
+        }
+        this.DrawStar(3, 3); this.DrawStar(3, 11); this.DrawStar(11, 3);
+        this.DrawStar(11, 11); this.DrawStar(7, 7);
+
+        this.DrawStones(now);
+
+        if (this.scene == 1 && this.turn == 1) {
+            int idx = this.PickCell(this.mouseX, this.mouseY);
+            if (idx >= 0 && this.board[idx] == 0) {
+                this.DrawStone(GomokuGame.GX(idx % 15), GomokuGame.GY(idx / 15), 19, false, 90, true);
+            }
+        }
+    }
+
+    void DrawStar(int r, int c) {
+        Draw.FillCircle(this.r, GomokuGame.GX(c), GomokuGame.GY(r), 4, 40, 26, 14, 255);
+    }
+
+    void DrawStones(int now) {
+        int i = 0;
+        while (i < 225) {
+            if (this.board[i] != 0) {
+                int rad = 19;
+                int alpha = 255;
+                int dt = now - this.placed[i];
+                if (dt < 170) {
+                    rad = 19 * dt / 170;
+                    if (rad < 2) { rad = 2; }
+                    alpha = 70 + 185 * dt / 170;
+                }
+                this.DrawStone(GomokuGame.GX(i % 15), GomokuGame.GY(i / 15), rad, this.board[i] == 2, alpha, false);
+            }
+            i = i + 1;
+        }
+        if (this.lastMove >= 0 && this.board[this.lastMove] != 0) {
+            int cx = GomokuGame.GX(this.lastMove % 15);
+            int cy = GomokuGame.GY(this.lastMove / 15);
+            this.r.SetColor(226, 72, 60, 255);
+            this.r.FillRect(cx - 3, cy - 3, 6, 6);
+        }
+        if (this.haveWin) {
+            int amp = (now % 600) - 300;
+            if (amp < 0) { amp = -amp; }
+            int glow = 120 + amp / 3;
+            int k = 0;
+            while (k < 5) {
+                int cx = GomokuGame.GX(this.winLine[k] % 15);
+                int cy = GomokuGame.GY(this.winLine[k] / 15);
+                Draw.RingRect(this.r, cx - 21, cy - 21, 42, 42, 3, 255, 210, 70, glow);
+                k = k + 1;
+            }
+        }
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/gomoku/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    bool Button(int x, int y, int w, int h, string label, int scale, bool selected, bool accent) {
+        int kind = 0;
+        if (selected) { kind = 2; }
+        else if (accent) { kind = 1; }
+        return Ui.Button(this.r, this.mouseX, this.mouseY, x, y, w, h, label, scale, kind);
+    }
+
+    void DrawPanelStats(int px, int py) {
+        Text.Draw(this.r, "RANK", px, py, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, this.prof.TierName() + "  " + this.prof.rank, px, py + 22, 3, 255, 210, 90, 255);
+        Text.Draw(this.r, "STREAK  " + this.prof.streak + "   BEST  " + this.prof.best, px, py + 66, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, "RECORD  " + this.prof.wins + "W  " + this.prof.losses + "L", px, py + 92, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, px, py + 118, 2, 150, 160, 180, 255);
+    }
+
+    void DrawTalk(int px, int py, int w, int now) {
+        string msg = this.talk.Current(now);
+        if (msg.Length == 0) { return; }
+        int kind = this.talk.Kind();
+        int cr = 90; int cg = 150; int cb = 220;
+        if (kind == 0) { cr = 90; cg = 200; cb = 130; }
+        if (kind == 1) { cr = 230; cg = 130; cb = 90; }
+        if (kind == 3) { cr = 250; cg = 200; cb = 70; }
+        this.r.SetColor(28, 32, 42, 235);
+        this.r.FillRect(px, py, w, 46);
+        Draw.RingRect(this.r, px, py, w, 46, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, msg, px + 14, py + 16, 2, cr, cg, cb, 255);
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(20, 24, 32);
+        this.DrawBoard(now);
+
+        int px = 792;
+        Text.Draw(this.r, "GOMOKU", px, 54, 6, 240, 240, 250, 255);
+        Text.Draw(this.r, "FIVE IN A ROW", px, 104, 2, 150, 160, 180, 255);
+
+        string status = "";
+        if (this.turn == 1) { status = "YOUR TURN (BLACK)"; }
+        else {
+            int dots = (now / 300) % 4;
+            status = "AI THINKING";
+            int d = 0;
+            while (d < dots) { status = status + "."; d = d + 1; }
+        }
+        this.r.SetColor(30, 36, 48, 255);
+        this.r.FillRect(px, 150, 420, 44);
+        int sr = 120; int sg = 200; int sb = 140;
+        if (this.turn == 2) { sr = 230; sg = 180; sb = 90; }
+        Text.Draw(this.r, status, px + 12, 164, 2, sr, sg, sb, 255);
+
+        Text.Draw(this.r, "DIFFICULTY  " + this.LevelName(), px, 214, 2, 180, 190, 210, 255);
+        Text.Draw(this.r, "MOVE  " + this.moveCount, px, 240, 2, 180, 190, 210, 255);
+
+        this.DrawPanelStats(px, 290);
+        this.DrawTalk(px, 440, 420, now);
+
+        this.Button(812, 686, 180, 54, "RESTART (R)", 2, false, false);
+        this.Button(1010, 686, 180, 54, "MENU (ESC)", 2, false, false);
+
+        this.host.End();
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(18, 22, 30);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+
+        Text.DrawCenteredShadow(this.r, "GOMOKU", 640, 72, 10, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "FIVE IN A ROW", 640, 176, 3, 240, 208, 130, 3);
+
+        // Main control card.
+        Ui.Panel(this.r, 300, 250, 680, 470, 20, 24, 34, 212);
+
+        Text.DrawCenteredShadow(this.r, "SELECT DIFFICULTY", 640, 278, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 4) {
+            string nm = "EASY";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            if (i == 3) { nm = "EXPERT"; }
+            int kind = 0;
+            if (this.prof.level == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 330 + i * 156, 310, 140, 54, nm, 2, kind);
+            i = i + 1;
+        }
+
+        string adv = "ADAPTIVE: OFF";
+        if (this.prof.adaptive == 1) { adv = "ADAPTIVE: ON"; }
+        int akind = 0;
+        if (this.prof.adaptive == 1) { akind = 1; }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 330, 382, 250, 46, adv, 2, akind);
+        Text.Draw(this.r, "AI scales to your skill", 600, 396, 2, 150, 160, 178, 255);
+
+        // Stats sub-card.
+        Ui.Panel(this.r, 330, 448, 620, 128, 14, 18, 26, 200);
+        Text.Draw(this.r, "RANK", 354, 466, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.TierName() + "  " + this.prof.rank, 354, 488, 4, 255, 210, 90, 2);
+        Text.Draw(this.r, "BEST STREAK  " + this.prof.best, 354, 540, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.wins + "W - " + this.prof.losses + "L", 720, 488, 3, 205, 214, 232, 2);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, 720, 540, 2, 150, 160, 180, 255);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 632, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "You play Black and move first.   1-4 difficulty   ENTER play   F11 fullscreen", 640, 742, 2, 176, 184, 200, 2);
+
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 170);
+        this.r.FillRect(0, 0, 1280, 800);
+
+        int bx = 320; int by = 240; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+
+        string title = "DRAW";
+        int tr = 200; int tg = 200; int tb = 210;
+        if (this.winner == 1) { title = "YOU WIN!"; tr = 90; tg = 210; tb = 130; }
+        if (this.winner == 2) { title = "AI WINS"; tr = 230; tg = 120; tb = 90; }
+        Text.DrawCentered(this.r, title, 640, by + 40, 7, tr, tg, tb, 255);
+
+        if (this.winner == 1 || this.winner == 2) {
+            string ds = "RANK " + this.scoreDelta;
+            if (this.scoreDelta > 0) { ds = "RANK +" + this.scoreDelta; }
+            Text.DrawCentered(this.r, ds, 640, by + 120, 3, 255, 210, 90, 255);
+        }
+        Text.DrawCentered(this.r, this.prof.TierName() + "  " + this.prof.rank + "    STREAK " + this.prof.streak, 640, by + 168, 2, 170, 180, 200, 255);
+
+        this.Button(400, by + 210, 220, 66, "PLAY AGAIN", 3, false, true);
+        this.Button(660, by + 210, 200, 66, "MENU", 3, false, false);
+
+        this.host.End();
+    }
+
+    // ----- input / flow ------------------------------------------------------
+
+    void StartGame(int now) {
+        this.ResetBoard();
+        this.scene = 1;
+        this.talk.SayExact(2, "Black to move -- good luck!", now, 2500);
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) {
+            if (this.scene == 0) { this.host.Quit(); }
+            else { this.scene = 0; }
+        }
+        if (sc == 21) {
+            if (this.scene != 0) { this.StartGame(now); }
+        }
+        if (this.scene == 0) {
+            if (sc == 30) { this.prof.level = 0; }
+            if (sc == 31) { this.prof.level = 1; }
+            if (sc == 32) { this.prof.level = 2; }
+            if (sc == 33) { this.prof.level = 3; }
+            if (sc == 40 || sc == 44) { this.StartGame(now); }
+        }
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 4) {
+                if (Draw.PointIn(cx, cy, 330 + i * 156, 310, 140, 54)) { this.prof.level = i; }
+                i = i + 1;
+            }
+            if (Draw.PointIn(cx, cy, 330, 382, 250, 46)) { this.prof.adaptive = 1 - this.prof.adaptive; }
+            if (Draw.PointIn(cx, cy, 470, 632, 340, 74)) { this.StartGame(now); }
+        } else if (this.scene == 1) {
+            if (Draw.PointIn(cx, cy, 812, 686, 180, 54)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 1010, 686, 180, 54)) { this.scene = 0; return; }
+            if (this.turn == 1) {
+                int idx = this.PickCell(cx, cy);
+                if (idx >= 0 && this.board[idx] == 0) { this.HumanMove(idx, now); }
+            }
+        } else {
+            if (Draw.PointIn(cx, cy, 400, 450, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 450, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    void Tick(int now) {
+        if (this.demo) {
+            if (this.scene == 2 && now >= this.demoAt) {
+                this.StartGame(now);
+                this.demoAt = now + 700;
+                return;
+            }
+            if (this.scene == 1 && this.turn == 1 && !this.aiPending && now >= this.demoAt) {
+                int idx = this.DemoHumanPick();
+                if (idx >= 0 && this.board[idx] == 0) { this.HumanMove(idx, now); }
+                this.demoAt = now + 600;
+            }
+        }
+        if (this.scene == 1 && this.turn == 2 && this.aiPending && now >= this.aiMoveAt) {
+            this.AiMove(now);
+            if (this.demo) { this.demoAt = now + 320; }
+        }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 1) { this.DrawPlay(now); }
+        else { this.DrawOver(now); }
+    }
+}
+
+class GomokuApp {
+    static void Main() {
+        Host h = Host.Create("Gomoku - Five in a Row", 1280, 800);
+        GomokuGame g = GomokuGame.Create(h);
+
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) {
+                        int sc = SdlEvent.Scancode();
+                        if (sc == 68) { h.ToggleFullscreen(); }
+                        else { g.OnKey(sc, now); }
+                    }
+                }
+                if (ty == SdlEventType.MouseMotion()) {
+                    g.mouseX = h.MouseX();
+                    g.mouseY = h.MouseY();
+                }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX();
+                        cy = h.MouseY();
+                        g.mouseX = cx;
+                        g.mouseY = cy;
+                        clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}
+

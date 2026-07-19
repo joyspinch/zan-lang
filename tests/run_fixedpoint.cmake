@@ -60,7 +60,7 @@ endif()
 # ---- clang g2.ll -> gen2 ----
 file(REMOVE ${GEN2})
 execute_process(
-  COMMAND ${CLANG} ${G2LL} -o ${GEN2} ${STACK_ARGS}
+  COMMAND ${CLANG} ${G2LL} ${RT_OBJS} -o ${GEN2} ${STACK_ARGS}
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "clang g2.ll -> gen2 failed (rc=${rc})\n${out}${err}")

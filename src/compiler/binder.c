@@ -110,6 +110,10 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
     b->type_short  = make_type(arena, TYPE_SHORT,  "short",  5);
     b->type_int    = make_type(arena, TYPE_INT,    "int",    3);
     b->type_long   = make_type(arena, TYPE_LONG,   "long",   4);
+    b->type_sbyte  = make_type(arena, TYPE_SBYTE,  "sbyte",  5);
+    b->type_ushort = make_type(arena, TYPE_USHORT, "ushort", 6);
+    b->type_uint   = make_type(arena, TYPE_UINT,   "uint",   4);
+    b->type_ulong  = make_type(arena, TYPE_ULONG,  "ulong",  5);
     b->type_float  = make_type(arena, TYPE_FLOAT,  "float",  5);
     b->type_double = make_type(arena, TYPE_DOUBLE, "double", 6);
     b->type_char   = make_type(arena, TYPE_CHAR,   "char",   4);
@@ -123,6 +127,15 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
 
 static bool istr_eq(zan_istr_t a, const char *b, int len) {
     return a.len == len && memcmp(a.str, b, (size_t)len) == 0;
+}
+
+zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem) {
+    zan_type_t *t = make_type(b->arena, TYPE_CLASS, "List", 4);
+    t->type_args =
+        (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
+    t->type_args[0] = elem;
+    t->type_arg_count = 1;
+    return t;
 }
 
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
@@ -144,8 +157,14 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "short",  5)) base = b->type_short;
     else if (istr_eq(name, "int",    3)) base = b->type_int;
     else if (istr_eq(name, "long",   4)) base = b->type_long;
+    else if (istr_eq(name, "sbyte",  5)) base = b->type_sbyte;
+    else if (istr_eq(name, "ushort", 6)) base = b->type_ushort;
+    else if (istr_eq(name, "uint",   4)) base = b->type_uint;
+    else if (istr_eq(name, "ulong",  5)) base = b->type_ulong;
     else if (istr_eq(name, "float",  5)) base = b->type_float;
     else if (istr_eq(name, "double", 6)) base = b->type_double;
+    /* decimal: mapped to double (no 128-bit decimal representation yet) */
+    else if (istr_eq(name, "decimal", 7)) base = b->type_double;
     else if (istr_eq(name, "char",   4)) base = b->type_char;
     else if (istr_eq(name, "string", 6)) base = b->type_string;
     else if (istr_eq(name, "object", 6)) base = b->type_object;

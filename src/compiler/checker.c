@@ -20,6 +20,63 @@ void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
     c->current_return_type = NULL;
 }
 
+/* ---- generic constraint checking ---- */
+
+/* True when `arg` is, implements, or derives from `cons`. */
+static bool type_satisfies_constraint(zan_type_t *arg, zan_type_t *cons) {
+    if (!arg || !cons) return true;
+    if (arg == cons) return true;
+    if (arg->sym && cons->sym && arg->sym == cons->sym) return true;
+    for (int i = 0; i < arg->interface_count; i++) {
+        if (type_satisfies_constraint(arg->interfaces[i], cons)) return true;
+    }
+    if (arg->base_type && arg->base_type != arg)
+        return type_satisfies_constraint(arg->base_type, cons);
+    return false;
+}
+
+static const char *type_name(zan_type_t *t);
+
+/* Validate each `where T : C` clause of a generic type's declaration against
+ * the instantiation's type arguments. */
+static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
+                                      zan_loc_t loc) {
+    if (!t || !t->sym || !t->sym->decl) return;
+    zan_ast_node_t *d = t->sym->decl;
+    if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL &&
+        d->kind != AST_INTERFACE_DECL)
+        return;
+    if (!t->type_args || t->type_arg_count == 0) return;
+    for (int w = 0; w < d->type_decl.where_clauses.count; w++) {
+        zan_ast_node_t *wc = d->type_decl.where_clauses.items[w];
+        int idx = -1;
+        for (int i = 0; i < d->type_decl.type_params.count; i++) {
+            zan_ast_node_t *tp = d->type_decl.type_params.items[i];
+            if (tp->ident.name.len == wc->where_clause.param_name.len &&
+                memcmp(tp->ident.name.str, wc->where_clause.param_name.str,
+                       (size_t)tp->ident.name.len) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 || idx >= t->type_arg_count) continue;
+        zan_type_t *arg = t->type_args[idx];
+        for (int k = 0; k < wc->where_clause.constraints.count; k++) {
+            zan_type_t *cons = zan_binder_resolve_type(
+                c->binder, wc->where_clause.constraints.items[k]);
+            if (!cons || cons->kind == TYPE_ERROR) continue;
+            if (!type_satisfies_constraint(arg, cons)) {
+                zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                    "type '%s' does not satisfy constraint '%s' for type parameter '%.*s' of '%s'",
+                    type_name(arg), type_name(cons),
+                    wc->where_clause.param_name.len,
+                    wc->where_clause.param_name.str,
+                    type_name(t));
+            }
+        }
+    }
+}
+
 /* ---- expression type checking ---- */
 
 static const char *type_name(zan_type_t *t) {
@@ -31,6 +88,7 @@ static bool type_is_numeric(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
     case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG:
+    case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT: case TYPE_ULONG:
     case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_NINT:
         return true;
     default:
@@ -41,7 +99,9 @@ static bool type_is_numeric(zan_type_t *t) {
 static bool type_is_integral(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
-    case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG: case TYPE_NINT:
+    case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG:
+    case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT: case TYPE_ULONG:
+    case TYPE_NINT:
         return true;
     default:
         return false;
@@ -52,6 +112,7 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
     if (!a || !b_type) return b->type_error;
     if (a->kind == TYPE_DOUBLE || b_type->kind == TYPE_DOUBLE) return b->type_double;
     if (a->kind == TYPE_FLOAT  || b_type->kind == TYPE_FLOAT)  return b->type_float;
+    if (a->kind == TYPE_ULONG  || b_type->kind == TYPE_ULONG)  return b->type_ulong;
     if (a->kind == TYPE_LONG   || b_type->kind == TYPE_LONG)   return b->type_long;
     return b->type_int;
 }
@@ -227,6 +288,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_NEW_EXPR: {
         zan_type_t *type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
+        check_generic_constraints(c, type, expr->loc);
         for (int i = 0; i < expr->new_expr.args.count; i++) {
             zan_checker_check_expr(c, expr->new_expr.args.items[i]);
         }
@@ -273,7 +335,8 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             zan_checker_check_expr(c, stmt->var_decl.initializer);
         }
         if (stmt->var_decl.type) {
-            zan_binder_resolve_type(c->binder, stmt->var_decl.type);
+            zan_type_t *dt = zan_binder_resolve_type(c->binder, stmt->var_decl.type);
+            check_generic_constraints(c, dt, stmt->loc);
         }
         break;
 
@@ -324,6 +387,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
     case AST_BREAK_STMT:
     case AST_CONTINUE_STMT:
+    case AST_GOTO_STMT:
+    case AST_LABEL_STMT:
+        break;
+
+    case AST_LOCK_STMT:
+        zan_checker_check_expr(c, stmt->lock_stmt.expr);
+        zan_checker_check_stmt(c, stmt->lock_stmt.body);
         break;
 
     case AST_SWITCH_STMT: {

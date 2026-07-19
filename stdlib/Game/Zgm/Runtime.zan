@@ -1,0 +1,1806 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Zgm;
+
+class ZgmMath {
+    static int Max(int a, int b) {
+        if (a > b) { return a; }
+        return b;
+    }
+    static int Min(int a, int b) {
+        if (a < b) { return a; }
+        return b;
+    }
+    static int Clamp(int amount, int min, int max) {
+        if (amount < min) { return min; }
+        if (amount > max) { return max; }
+        return amount;
+    }
+    static int Abs(int amount) {
+        if (amount < 0) { return -amount; }
+        return amount;
+    }
+}
+
+// Runtime attribute table for both the documented base names and custom names.
+class ZgmAttributes {
+    List<string> names;
+    List<int> amounts;
+
+    static ZgmAttributes Create() {
+        ZgmAttributes attrs = new ZgmAttributes();
+        attrs.names = new List<string>();
+        attrs.amounts = new List<int>();
+        return attrs;
+    }
+
+    int IndexOf(string name) {
+        int i = 0;
+        while (i < this.names.Count) {
+            if (this.names[i] == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    int Get(string name) {
+        int index = this.IndexOf(name);
+        if (index < 0) { return 0; }
+        return this.amounts[index];
+    }
+    void Set(string name, int amount) {
+        int index = this.IndexOf(name);
+        if (index < 0) {
+            this.names.Add(name);
+            this.amounts.Add(amount);
+        } else {
+            this.amounts[index] = amount;
+        }
+    }
+    void Add(string name, int amount) {
+        this.Set(name, this.Get(name) + amount);
+    }
+    void Apply(List<ZgmAttr> source) {
+        if (source == null) { return; }
+        int i = 0;
+        while (i < source.Count) {
+            this.Add(source[i].Name(), source[i].Value());
+            i = i + 1;
+        }
+    }
+    void ApplyPercent(List<ZgmAttr> source) {
+        if (source == null) { return; }
+        int i = 0;
+        while (i < source.Count) {
+            ZgmAttr attr = source[i];
+            int current = this.Get(attr.Name());
+            this.Add(attr.Name(), current * attr.Value() / 100);
+            i = i + 1;
+        }
+    }
+    void ApplyConfigAttrs(ItemConfig item) {
+        int i = 0;
+        while (i < item.AttrCount()) {
+            ZgmAttr attr = item.AttrAt(i);
+            this.Add(attr.Name(), attr.Value());
+            i = i + 1;
+        }
+        i = 0;
+        while (i < item.PercentAttrCount()) {
+            ZgmAttr attr = item.PercentAttrAt(i);
+            int current = this.Get(attr.Name());
+            this.Add(attr.Name(), current * attr.Value() / 100);
+            i = i + 1;
+        }
+    }
+    void ApplyBuff(BuffConfig buff) {
+        int i = 0;
+        while (i < buff.AttrCount()) {
+            ZgmAttr attr = buff.AttrAt(i);
+            this.Add(attr.Name(), attr.Value());
+            i = i + 1;
+        }
+        i = 0;
+        while (i < buff.PercentAttrCount()) {
+            ZgmAttr attr = buff.PercentAttrAt(i);
+            int current = this.Get(attr.Name());
+            this.Add(attr.Name(), current * attr.Value() / 100);
+            i = i + 1;
+        }
+    }
+    ZgmAttributes Copy() {
+        ZgmAttributes copy = ZgmAttributes.Create();
+        int i = 0;
+        while (i < this.names.Count) {
+            copy.Set(this.names[i], this.amounts[i]);
+            i = i + 1;
+        }
+        return copy;
+    }
+    int Count() { return this.names.Count; }
+    string NameAt(int index) { return this.names[index]; }
+    int AmountAt(int index) { return this.amounts[index]; }
+    void Dispose() {
+        this.names.Clear();
+        this.amounts.Clear();
+    }
+}
+
+class ZgmItemStack {
+    ItemConfig item;
+    int quantity;
+
+    static ZgmItemStack Create(ItemConfig item, int quantity) {
+        ZgmItemStack stack = new ZgmItemStack();
+        stack.item = item;
+        stack.quantity = quantity;
+        return stack;
+    }
+    ItemConfig Item() { return this.item; }
+    int Quantity() { return this.quantity; }
+    bool Empty() { return this.quantity <= 0; }
+    int Add(int count) {
+        int room = this.item.MaxStack() - this.quantity;
+        int added = ZgmMath.Min(room, ZgmMath.Max(0, count));
+        this.quantity = this.quantity + added;
+        return added;
+    }
+    int Remove(int count) {
+        int removed = ZgmMath.Min(this.quantity, ZgmMath.Max(0, count));
+        this.quantity = this.quantity - removed;
+        return removed;
+    }
+}
+
+class ZgmInventory {
+    int capacity;
+    List<ZgmItemStack> stacks;
+
+    static ZgmInventory Create(int capacity) {
+        ZgmInventory bag = new ZgmInventory();
+        bag.capacity = ZgmMath.Max(1, capacity);
+        bag.stacks = new List<ZgmItemStack>();
+        return bag;
+    }
+    int Capacity() { return this.capacity; }
+    int StackCount() { return this.stacks.Count; }
+    ZgmItemStack StackAt(int index) { return this.stacks[index]; }
+
+    int QuantityOf(string itemName) {
+        int total = 0;
+        int i = 0;
+        while (i < this.stacks.Count) {
+            if (this.stacks[i].Item().Name() == itemName) {
+                total = total + this.stacks[i].Quantity();
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+    int Add(ItemConfig item, int count) {
+        if (item == null || count <= 0) { return 0; }
+        int remaining = count;
+        int i = 0;
+        while (i < this.stacks.Count && remaining > 0) {
+            ZgmItemStack stack = this.stacks[i];
+            if (stack.Item().Name() == item.Name()) {
+                remaining = remaining - stack.Add(remaining);
+            }
+            i = i + 1;
+        }
+        while (remaining > 0 && this.stacks.Count < this.capacity) {
+            int amount = ZgmMath.Min(remaining, ZgmMath.Max(1, item.MaxStack()));
+            this.stacks.Add(ZgmItemStack.Create(item, amount));
+            remaining = remaining - amount;
+        }
+        return count - remaining;
+    }
+    bool Remove(string itemName, int count) {
+        if (count <= 0 || this.QuantityOf(itemName) < count) { return false; }
+        int remaining = count;
+        int i = this.stacks.Count - 1;
+        while (i >= 0 && remaining > 0) {
+            ZgmItemStack stack = this.stacks[i];
+            if (stack.Item().Name() == itemName) {
+                remaining = remaining - stack.Remove(remaining);
+                if (stack.Empty()) { this.stacks.RemoveAt(i); }
+            }
+            i = i - 1;
+        }
+        return remaining == 0;
+    }
+    void Clear() { this.stacks = new List<ZgmItemStack>(); }
+    void Dispose() { this.stacks.Clear(); }
+}
+
+class ZgmEquipment {
+    List<string> slots;
+    List<ItemConfig> items;
+
+    static ZgmEquipment Create() {
+        ZgmEquipment equipment = new ZgmEquipment();
+        equipment.slots = new List<string>();
+        equipment.items = new List<ItemConfig>();
+        return equipment;
+    }
+    int IndexOf(string slot) {
+        int i = 0;
+        while (i < this.slots.Count) {
+            if (this.slots[i] == slot) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    ItemConfig Get(string slot) {
+        int index = this.IndexOf(slot);
+        if (index < 0) { return null; }
+        return this.items[index];
+    }
+    int EquippedCountOf(string itemName) {
+        int count = 0;
+        int i = 0;
+        while (i < this.items.Count) {
+            if (this.items[i].Name() == itemName) {
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        return count;
+    }
+    bool HasItem(string itemName) {
+        return this.EquippedCountOf(itemName) > 0;
+    }
+    bool Equip(string slot, ItemConfig item, ZgmInventory bag) {
+        if (item == null || !item.IsEquipment() || bag == null) {
+            return false;
+        }
+        if (!bag.Remove(item.Name(), 1)) { return false; }
+        int index = this.IndexOf(slot);
+        if (index >= 0) {
+            ItemConfig old = this.items[index];
+            if (bag.Add(old, 1) != 1) {
+                bag.Add(item, 1);
+                return false;
+            }
+            this.items[index] = item;
+        } else {
+            this.slots.Add(slot);
+            this.items.Add(item);
+        }
+        return true;
+    }
+    bool Unequip(string slot, ZgmInventory bag) {
+        int index = this.IndexOf(slot);
+        if (index < 0 || bag == null) { return false; }
+        ItemConfig item = this.items[index];
+        if (bag.Add(item, 1) != 1) { return false; }
+        this.slots.RemoveAt(index);
+        this.items.RemoveAt(index);
+        return true;
+    }
+    int Count() { return this.items.Count; }
+    string SlotAt(int index) { return this.slots[index]; }
+    ItemConfig ItemAt(int index) { return this.items[index]; }
+    void Clear() {
+        this.slots = new List<string>();
+        this.items = new List<ItemConfig>();
+    }
+    void Dispose() {
+        this.slots.Clear();
+        this.items.Clear();
+    }
+}
+
+class ZgmCooldowns {
+    List<string> names;
+    List<int> remaining;
+
+    static ZgmCooldowns Create() {
+        ZgmCooldowns cooldowns = new ZgmCooldowns();
+        cooldowns.names = new List<string>();
+        cooldowns.remaining = new List<int>();
+        return cooldowns;
+    }
+    int IndexOf(string name) {
+        int i = 0;
+        while (i < this.names.Count) {
+            if (this.names[i] == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    void Start(string name, int milliseconds) {
+        if (milliseconds <= 0) { return; }
+        int index = this.IndexOf(name);
+        if (index < 0) {
+            this.names.Add(name);
+            this.remaining.Add(milliseconds);
+        } else {
+            this.remaining[index] = milliseconds;
+        }
+    }
+    bool IsReady(string name) {
+        int index = this.IndexOf(name);
+        return index < 0 || this.remaining[index] <= 0;
+    }
+    int Remaining(string name) {
+        int index = this.IndexOf(name);
+        if (index < 0) { return 0; }
+        return this.remaining[index];
+    }
+    void Tick(int deltaMilliseconds) {
+        int i = this.names.Count - 1;
+        while (i >= 0) {
+            this.remaining[i] = this.remaining[i] - deltaMilliseconds;
+            if (this.remaining[i] <= 0) {
+                this.names.RemoveAt(i);
+                this.remaining.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+    }
+    void Dispose() {
+        this.names.Clear();
+        this.remaining.Clear();
+    }
+}
+
+class ZgmBuffInstance {
+    BuffConfig config;
+    ZgmActor source;
+    int remaining;
+    int triggerElapsed;
+    bool expired;
+
+    static ZgmBuffInstance Create(BuffConfig config, ZgmActor source) {
+        ZgmBuffInstance instance = new ZgmBuffInstance();
+        instance.config = config;
+        instance.source = source;
+        instance.remaining = config.Duration();
+        instance.triggerElapsed = 0;
+        instance.expired = false;
+        return instance;
+    }
+    BuffConfig Config() { return this.config; }
+    ZgmActor Source() { return this.source; }
+    int Remaining() { return this.remaining; }
+    bool Expired() { return this.expired; }
+    void SetRemaining(int milliseconds) {
+        if (this.config.Infinite()) { return; }
+        this.remaining = ZgmMath.Max(0, milliseconds);
+        this.expired = this.remaining <= 0;
+    }
+    void DetachSource() { this.source = null; }
+
+    int Tick(int deltaMilliseconds) {
+        if (this.expired || deltaMilliseconds <= 0) { return 0; }
+        if (!this.config.Infinite()) {
+            this.remaining = this.remaining - deltaMilliseconds;
+            if (this.remaining <= 0) { this.expired = true; }
+        }
+        int interval = this.config.TriggerInterval();
+        if (interval <= 0) { return 0; }
+        this.triggerElapsed = this.triggerElapsed + deltaMilliseconds;
+        int count = 0;
+        while (this.triggerElapsed >= interval) {
+            this.triggerElapsed = this.triggerElapsed - interval;
+            count = count + 1;
+        }
+        return count;
+    }
+}
+
+class ZgmActor {
+    string id;
+    NpcConfig config;
+    AppConfig app;
+    Faction faction;
+    int x;
+    int y;
+    int direction;
+    int level;
+    int experience;
+    int hp;
+    int mp;
+    int rage;
+    ZgmAttributes baseAttrs;
+    ZgmInventory inventory;
+    ZgmEquipment equipment;
+    ZgmCooldowns cooldowns;
+    List<string> skills;
+    List<ZgmBuffInstance> buffs;
+    bool destroyed;
+    int aiElapsed;
+
+    static ZgmActor FromConfig(string id, NpcConfig config, Faction faction) {
+        ZgmActor actor = new ZgmActor();
+        actor.id = id;
+        actor.config = config;
+        actor.app = null;
+        actor.faction = faction;
+        actor.x = 0;
+        actor.y = 0;
+        actor.direction = 0;
+        actor.level = ZgmMath.Max(1, config.Level());
+        actor.experience = ZgmMath.Max(0, config.Experience());
+        actor.baseAttrs = ZgmAttributes.Create();
+        actor.baseAttrs.Set("hp", config.Hp());
+        actor.baseAttrs.Set("maxhp", config.Maxhp());
+        actor.baseAttrs.Set("mp", config.Mp());
+        actor.baseAttrs.Set("maxmp", config.Maxmp());
+        actor.baseAttrs.Set("命中", config.Hit());
+        actor.baseAttrs.Set("躲避", config.Dodge());
+        actor.baseAttrs.Set("暴击", config.Crit());
+        int i = 0;
+        while (i < config.AttrCount()) {
+            ZgmAttr attr = config.AttrAt(i);
+            actor.baseAttrs.Add(attr.Name(), attr.Value());
+            i = i + 1;
+        }
+        actor.hp = config.Hp();
+        if (actor.hp <= 0) { actor.hp = config.Maxhp(); }
+        actor.mp = config.Mp();
+        if (actor.mp <= 0) { actor.mp = config.Maxmp(); }
+        actor.rage = actor.baseAttrs.Get("怒气");
+        if (actor.rage == 0) { actor.rage = actor.baseAttrs.Get("rage"); }
+        int maxRage = actor.baseAttrs.Get("最大怒气");
+        if (maxRage <= 0) { maxRage = actor.baseAttrs.Get("maxrage"); }
+        if (maxRage <= 0) { maxRage = 100; }
+        actor.baseAttrs.Set("最大怒气", maxRage);
+        actor.baseAttrs.Set("maxrage", maxRage);
+        actor.inventory = ZgmInventory.Create(64);
+        actor.equipment = ZgmEquipment.Create();
+        actor.cooldowns = ZgmCooldowns.Create();
+        actor.skills = new List<string>();
+        actor.buffs = new List<ZgmBuffInstance>();
+        actor.destroyed = false;
+        actor.aiElapsed = 0;
+        i = 0;
+        while (i < config.SkillCount()) {
+            actor.skills.Add(config.SkillAt(i));
+            i = i + 1;
+        }
+        return actor;
+    }
+
+    string Id() { return this.id; }
+    string Name() { return this.config.Name(); }
+    string DisplayName() { return this.config.DisplayName(); }
+    NpcConfig Config() { return this.config; }
+    void SetAppConfig(AppConfig app) { this.app = app; }
+    Faction Camp() { return this.faction; }
+    int X() { return this.x; }
+    int Y() { return this.y; }
+    int Direction() { return this.direction; }
+    int Level() { return this.level; }
+    int Experience() { return this.experience; }
+    int Hp() { return this.hp; }
+    int Mp() { return this.mp; }
+    int Rage() { return this.rage; }
+    bool Alive() { return !this.destroyed && this.hp > 0; }
+    bool Destroyed() { return this.destroyed; }
+    ZgmInventory Inventory() { return this.inventory; }
+    ZgmEquipment Equipment() { return this.equipment; }
+    ZgmCooldowns Cooldowns() { return this.cooldowns; }
+    int BuffCount() { return this.buffs.Count; }
+    ZgmBuffInstance BuffAt(int index) { return this.buffs[index]; }
+
+    void SetPosition(int x, int y) { this.x = x; this.y = y; }
+    void SetDirection(int direction) { this.direction = direction; }
+    void SetLevel(int level) { this.level = ZgmMath.Max(1, level); }
+    void SetExperience(int experience) {
+        this.experience = ZgmMath.Max(0, experience);
+    }
+    int AddExperience(int amount, LevelGrowth growth) {
+        if (amount <= 0) { return 0; }
+        this.experience = this.experience + amount;
+        int gained = 0;
+        while (growth != null && this.level < growth.MaxLevel()) {
+            int need = growth.ExperienceToNext(this.level);
+            if (this.experience < need) { break; }
+            this.experience = this.experience - need;
+            this.level = this.level + 1;
+            this.ApplyGrowth(growth);
+            gained = gained + 1;
+        }
+        return gained;
+    }
+    void SetFaction(Faction faction) { this.faction = faction; }
+    bool AiEnabled() { return this.config.AiLevel() > 0; }
+    bool AiReady(int deltaMilliseconds) {
+        if (!this.AiEnabled() || deltaMilliseconds <= 0) { return false; }
+        this.aiElapsed = this.aiElapsed + deltaMilliseconds;
+        if (this.aiElapsed < 100) { return false; }
+        this.aiElapsed = this.aiElapsed - 100;
+        return true;
+    }
+
+    void ApplyGrowth(LevelGrowth growth) {
+        if (growth == null) { return; }
+        List<ZgmAttr> attrs = growth.Level(this.level);
+        if (attrs == null) { return; }
+        int i = 0;
+        while (i < attrs.Count) {
+            this.baseAttrs.Set(attrs[i].Name(), attrs[i].Value());
+            i = i + 1;
+        }
+        this.ClampVitals();
+    }
+    ZgmAttributes EffectiveAttributes() {
+        ZgmAttributes attrs = this.baseAttrs.Copy();
+        int i = 0;
+        while (i < this.equipment.Count()) {
+            attrs.ApplyConfigAttrs(this.equipment.ItemAt(i));
+            i = i + 1;
+        }
+        if (this.app != null) {
+            int s = 0;
+            while (s < this.app.EquipSetCount()) {
+                EquipSet suit = this.app.EquipSetAt(s);
+                int equipped = 0;
+                int p = 0;
+                while (p < suit.PartCount()) {
+                    equipped = equipped + this.equipment.EquippedCountOf(
+                        suit.PartAt(p));
+                    p = p + 1;
+                }
+                int tier = 0;
+                while (tier < suit.EffectTiers() && tier < equipped) {
+                    attrs.Apply(suit.EffectAt(tier));
+                    tier = tier + 1;
+                }
+                s = s + 1;
+            }
+        }
+        i = 0;
+        while (i < this.buffs.Count) {
+            attrs.ApplyBuff(this.buffs[i].Config());
+            i = i + 1;
+        }
+        attrs.Set("hp", this.hp);
+        attrs.Set("mp", this.mp);
+        attrs.Set("rage", this.rage);
+        attrs.Set("怒气", this.rage);
+        return attrs;
+    }
+    int Attribute(string name) {
+        return this.EffectiveAttributes().Get(name);
+    }
+    void ClampVitals() {
+        ZgmAttributes attrs = this.EffectiveAttributes();
+        this.hp = ZgmMath.Clamp(this.hp, 0, ZgmMath.Max(0, attrs.Get("maxhp")));
+        this.mp = ZgmMath.Clamp(this.mp, 0, ZgmMath.Max(0, attrs.Get("maxmp")));
+    }
+    bool Spend(int hp, int mp) {
+        return this.Spend(hp, mp, 0);
+    }
+    bool Spend(int hp, int mp, int rage) {
+        if (this.hp <= hp || this.mp < mp || this.rage < rage) {
+            return false;
+        }
+        this.hp = this.hp - hp;
+        this.mp = this.mp - mp;
+        this.rage = this.rage - rage;
+        return true;
+    }
+    void Restore(int hp, int mp) {
+        this.hp = this.hp + hp;
+        this.mp = this.mp + mp;
+        this.ClampVitals();
+    }
+    void SetVitals(int hp, int mp) {
+        this.hp = hp;
+        this.mp = mp;
+        this.ClampVitals();
+    }
+    void SetRage(int rage) {
+        int maxRage = this.EffectiveAttributes().Get("maxrage");
+        this.rage = ZgmMath.Clamp(rage, 0, ZgmMath.Max(0, maxRage));
+    }
+    void GainRage(int amount) {
+        this.SetRage(this.rage + amount);
+    }
+    int TakeDamage(int amount) {
+        int applied = ZgmMath.Min(this.hp, ZgmMath.Max(0, amount));
+        this.hp = this.hp - applied;
+        return applied;
+    }
+    void Revive() {
+        this.destroyed = false;
+        this.hp = ZgmMath.Max(1, this.EffectiveAttributes().Get("maxhp"));
+        this.mp = ZgmMath.Max(0, this.EffectiveAttributes().Get("maxmp"));
+    }
+    void Destroy() { this.destroyed = true; }
+
+    bool HasSkill(string name) {
+        int i = 0;
+        while (i < this.skills.Count) {
+            if (this.skills[i] == name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    int SkillCount() { return this.skills.Count; }
+    string SkillAt(int index) { return this.skills[index]; }
+    void ClearSkills() { this.skills = new List<string>(); }
+    void AddSkill(string name) {
+        if (!this.HasSkill(name)) { this.skills.Add(name); }
+    }
+    bool RemoveSkill(string name) {
+        int i = 0;
+        while (i < this.skills.Count) {
+            if (this.skills[i] == name) {
+                this.skills.RemoveAt(i);
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    ZgmBuffInstance FindBuff(string name) {
+        int i = 0;
+        while (i < this.buffs.Count) {
+            if (this.buffs[i].Config().Name() == name) { return this.buffs[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+    ZgmBuffInstance AddBuff(BuffConfig config, ZgmActor source, bool unique) {
+        if (unique) {
+            ZgmBuffInstance existing = this.FindBuff(config.Name());
+            if (existing != null) { return existing; }
+        }
+        ZgmBuffInstance instance = ZgmBuffInstance.Create(config, source);
+        this.buffs.Add(instance);
+        this.ClampVitals();
+        return instance;
+    }
+    void RemoveBuffAt(int index) {
+        this.buffs[index].DetachSource();
+        this.buffs.RemoveAt(index);
+        this.ClampVitals();
+    }
+    void Dispose() {
+        int i = 0;
+        while (i < this.buffs.Count) {
+            this.buffs[i].DetachSource();
+            i = i + 1;
+        }
+        this.buffs.Clear();
+        this.aiElapsed = 0;
+        this.skills.Clear();
+        this.inventory.Dispose();
+        this.equipment.Dispose();
+        this.cooldowns.Dispose();
+        this.baseAttrs.Dispose();
+        this.inventory = null;
+        this.equipment = null;
+        this.cooldowns = null;
+        this.baseAttrs = null;
+        this.app = null;
+        this.config = null;
+    }
+}
+
+enum ZgmSkillStatus {
+    Success,
+    UnknownSkill,
+    NotLearned,
+    InvalidTarget,
+    OutOfRange,
+    Cooldown,
+    InsufficientResources,
+    Blocked
+}
+
+class ZgmSkillResult {
+    ZgmSkillStatus status;
+    ZgmActor caster;
+    ZgmActor target;
+    SkillConfig skill;
+    bool hit;
+    bool critical;
+    int damage;
+    List<ZgmActor> targets;
+    bool pending;
+
+    static ZgmSkillResult Create(
+        ZgmSkillStatus status,
+        ZgmActor caster,
+        ZgmActor target,
+        SkillConfig skill
+    ) {
+        ZgmSkillResult result = new ZgmSkillResult();
+        result.status = status;
+        result.caster = caster;
+        result.target = target;
+        result.skill = skill;
+        result.hit = false;
+        result.critical = false;
+        result.damage = 0;
+        result.targets = new List<ZgmActor>();
+        result.pending = false;
+        return result;
+    }
+    void Resolve(bool hit, bool critical, int damage) {
+        this.hit = hit;
+        this.critical = critical;
+        this.damage = damage;
+    }
+    ZgmSkillStatus Status() { return this.status; }
+    ZgmActor Caster() { return this.caster; }
+    ZgmActor Target() { return this.target; }
+    SkillConfig Skill() { return this.skill; }
+    bool Hit() { return this.hit; }
+    bool Critical() { return this.critical; }
+    int Damage() { return this.damage; }
+    int TotalDamage() { return this.damage; }
+    int TargetCount() { return this.targets.Count; }
+    ZgmActor TargetAt(int index) { return this.targets[index]; }
+    bool Pending() { return this.pending; }
+    void SetPending(bool pending) { this.pending = pending; }
+    bool HasTarget(ZgmActor actor) {
+        int i = 0;
+        while (i < this.targets.Count) {
+            if (this.targets[i] == actor) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    void RecordDamage(
+        ZgmActor target,
+        bool hit,
+        bool critical,
+        int amount
+    ) {
+        if (hit) { this.hit = true; }
+        if (critical) { this.critical = true; }
+        if (hit && target != null && !this.HasTarget(target)) {
+            this.targets.Add(target);
+        }
+        this.damage = this.damage + amount;
+    }
+    bool Succeeded() { return this.status == ZgmSkillStatus.Success; }
+
+    void Dispose() {
+        this.targets.Clear();
+        this.targets = null;
+        this.caster = null;
+        this.target = null;
+        this.skill = null;
+    }
+}
+
+class ZgmPendingSkill {
+    int remaining;
+    ZgmSkillResult result;
+    ZgmActor caster;
+    SkillConfig skill;
+    List<ZgmActor> targets;
+    List<bool> hits;
+    List<bool> criticals;
+    List<int> damages;
+
+    static ZgmPendingSkill Create(
+        int delay,
+        ZgmSkillResult result,
+        ZgmActor caster,
+        SkillConfig skill,
+        List<ZgmActor> targets,
+        List<bool> hits,
+        List<bool> criticals,
+        List<int> damages
+    ) {
+        ZgmPendingSkill pending = new ZgmPendingSkill();
+        pending.remaining = delay;
+        pending.result = result;
+        pending.caster = caster;
+        pending.skill = skill;
+        pending.targets = targets;
+        pending.hits = hits;
+        pending.criticals = criticals;
+        pending.damages = damages;
+        return pending;
+    }
+    void Tick(int deltaMilliseconds) {
+        this.remaining = this.remaining - deltaMilliseconds;
+    }
+    bool Ready() { return this.remaining <= 0; }
+    ZgmSkillResult Result() { return this.result; }
+    ZgmActor Caster() { return this.caster; }
+    SkillConfig Skill() { return this.skill; }
+    int TargetCount() { return this.targets.Count; }
+    ZgmActor TargetAt(int index) { return this.targets[index]; }
+    bool HitAt(int index) { return this.hits[index]; }
+    bool CriticalAt(int index) { return this.criticals[index]; }
+    int DamageAt(int index) { return this.damages[index]; }
+    void Dispose() {
+        this.targets.Clear();
+        this.hits.Clear();
+        this.criticals.Clear();
+        this.damages.Clear();
+        this.targets = null;
+        this.hits = null;
+        this.criticals = null;
+        this.damages = null;
+        this.result = null;
+        this.caster = null;
+        this.skill = null;
+    }
+}
+
+class ZgmRandom {
+    int state;
+
+    static ZgmRandom Create(int seed) {
+        ZgmRandom random = new ZgmRandom();
+        random.state = seed & 2147483647;
+        if (random.state == 0) { random.state = 1; }
+        return random;
+    }
+    int NextPercent() {
+        this.state = (this.state * 1103515245 + 12345) & 2147483647;
+        return (this.state % 100) + 1;
+    }
+}
+
+class ZgmGroundItem {
+    ItemConfig item;
+    int quantity;
+    int x;
+    int y;
+    int remaining;
+
+    static ZgmGroundItem Create(
+        ItemConfig item,
+        int quantity,
+        int x,
+        int y
+    ) {
+        ZgmGroundItem ground = new ZgmGroundItem();
+        ground.item = item;
+        ground.quantity = quantity;
+        ground.x = x;
+        ground.y = y;
+        ground.remaining = item.VanishInterval();
+        return ground;
+    }
+    ItemConfig Item() { return this.item; }
+    int Quantity() { return this.quantity; }
+    int X() { return this.x; }
+    int Y() { return this.y; }
+    int Remaining() { return this.remaining; }
+    void Tick(int deltaMilliseconds) {
+        this.remaining = this.remaining - deltaMilliseconds;
+    }
+    bool Expired() { return this.remaining <= 0; }
+
+    void Dispose() {
+        this.item = null;
+    }
+}
+
+class ZgmWorld {
+    ZgmProject project;
+    ZgmEvents events;
+    ZgmGameplayEvents gameplayEvents;
+    MapConfig currentMap;
+    List<ZgmActor> actors;
+    List<ZgmGroundItem> groundItems;
+    ZgmActor hero;
+    int nextId;
+    ZgmRandom random;
+    List<ZgmPendingSkill> pendingSkills;
+    ZgmCamera camera;
+    int counterDepth;
+
+    static ZgmWorld Create(
+        ZgmProject project,
+        ZgmEvents events,
+        ZgmGameplayEvents gameplayEvents
+    ) {
+        ZgmWorld world = new ZgmWorld();
+        world.project = project;
+        world.events = events;
+        world.gameplayEvents = gameplayEvents;
+        world.currentMap = null;
+        world.actors = new List<ZgmActor>();
+        world.groundItems = new List<ZgmGroundItem>();
+        world.hero = null;
+        world.nextId = 1;
+        world.random = ZgmRandom.Create(19790327);
+        world.pendingSkills = new List<ZgmPendingSkill>();
+        world.camera = null;
+        world.counterDepth = 0;
+        return world;
+    }
+    ZgmProject Project() { return this.project; }
+    MapConfig CurrentMap() { return this.currentMap; }
+    ZgmCamera Camera() { return this.camera; }
+    ZgmActor Hero() { return this.hero; }
+    int ActorCount() { return this.actors.Count; }
+    ZgmActor ActorAt(int index) { return this.actors[index]; }
+    int GroundItemCount() { return this.groundItems.Count; }
+    ZgmGroundItem GroundItemAt(int index) { return this.groundItems[index]; }
+
+    bool EnterDefaultMap() {
+        MapConfig map = this.project.DefaultMap();
+        if (map == null) { return false; }
+        return this.EnterMap(map.Name(), null, -1);
+    }
+    bool EnterMap(string mapName, ZgmActor preservedHero, int portalId) {
+        MapConfig map = this.project.FindMap(mapName);
+        if (map == null) { return false; }
+        string previous = "";
+        if (this.currentMap != null) { previous = this.currentMap.Name(); }
+        this.currentMap = map;
+        if (this.camera != null) { this.camera.Dispose(); }
+        this.camera = ZgmCamera.Create(map);
+        int oldActorIndex = 0;
+        while (oldActorIndex < this.actors.Count) {
+            ZgmActor oldActor = this.actors[oldActorIndex];
+            if (oldActor != preservedHero) { oldActor.Dispose(); }
+            oldActorIndex = oldActorIndex + 1;
+        }
+        this.actors.Clear();
+        this.groundItems.Clear();
+        this.hero = preservedHero;
+        if (this.hero == null) {
+            NpcConfig heroConfig = this.project.Hero();
+            if (heroConfig != null) {
+                this.hero = ZgmActor.FromConfig(
+                    "hero", heroConfig, Faction.Friendly);
+                this.hero.SetAppConfig(this.project.App());
+                this.hero.ApplyGrowth(
+                    this.project.FindGrowth(heroConfig.Growth()));
+                int e = 0;
+                while (e < heroConfig.EquipCount()) {
+                    EquipSlot slot = heroConfig.EquipAt(e);
+                    ItemConfig item = this.project.FindItem(slot.ItemName());
+                    if (item != null) {
+                        this.hero.Inventory().Add(item, 1);
+                        this.hero.Equipment().Equip(
+                            slot.Slot(), item, this.hero.Inventory());
+                    }
+                    e = e + 1;
+                }
+            }
+        }
+        if (this.hero != null) {
+            this.hero.SetPosition(map.StartX(), map.StartY());
+            this.actors.Add(this.hero);
+            this.camera.Follow(this.hero);
+        }
+        int i = 0;
+        while (i < map.SpawnCount()) {
+            MapSpawn spawn = map.SpawnAt(i);
+            NpcConfig config = this.project.FindNpc(spawn.Name());
+            if (config != null) {
+                int n = 0;
+                while (n < spawn.Count()) {
+                    string id = config.Name() + "#" + Convert.ToString(this.nextId);
+                    this.nextId = this.nextId + 1;
+                    ZgmActor actor = ZgmActor.FromConfig(id, config, spawn.Camp());
+                    actor.SetAppConfig(this.project.App());
+                    actor.SetPosition(spawn.X(), spawn.Y());
+                    if (spawn.Level() > 0) { actor.SetLevel(spawn.Level()); }
+                    actor.ApplyGrowth(this.project.FindGrowth(config.Growth()));
+                    this.actors.Add(actor);
+                    n = n + 1;
+                }
+            }
+            i = i + 1;
+        }
+        this.gameplayEvents.RaiseMapChanged(previous, map.Name(), portalId);
+        return true;
+    }
+
+    ZgmActor FindActor(string id) {
+        int i = 0;
+        while (i < this.actors.Count) {
+            if (this.actors[i].Id() == id) { return this.actors[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+    bool IsOccupied(int x, int y, ZgmActor except) {
+        int i = 0;
+        while (i < this.actors.Count) {
+            ZgmActor actor = this.actors[i];
+            if (actor != except && actor.Alive()
+                && actor.X() == x && actor.Y() == y) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    ZgmActor NearestHostile(ZgmActor actor) {
+        ZgmActor nearest = null;
+        int nearestDistance = 2147483647;
+        int i = 0;
+        while (i < this.actors.Count) {
+            ZgmActor candidate = this.actors[i];
+            if (candidate != actor
+                && this.ValidTarget(actor, candidate, "敌方")) {
+                int distance = this.Distance(actor, candidate);
+                if (distance < nearestDistance) {
+                    nearest = candidate;
+                    nearestDistance = distance;
+                }
+            }
+            i = i + 1;
+        }
+        return nearest;
+    }
+    SkillConfig AiSkill(ZgmActor actor, ZgmActor target) {
+        SkillConfig best = null;
+        int bestPriority = -2147483647;
+        int i = 0;
+        while (i < actor.SkillCount()) {
+            SkillConfig skill = this.project.FindSkill(
+                actor.SkillAt(i));
+            if (skill != null && skill.AutoCastable()
+                && skill.Priority() >= bestPriority) {
+                bool inRange = skill.Target() == SkillTarget.Self;
+                if (!inRange && target != null) {
+                    int distance = this.Distance(actor, target);
+                    inRange = distance >= skill.MinRange()
+                        && distance <= skill.AttackRange();
+                }
+                if (inRange) {
+                    best = skill;
+                    bestPriority = skill.Priority();
+                }
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+    void UpdateAi(int deltaMilliseconds) {
+        int i = 0;
+        while (i < this.actors.Count) {
+            ZgmActor actor = this.actors[i];
+            if (actor != this.hero && actor.Alive()
+                && actor.AiReady(deltaMilliseconds)) {
+                ZgmActor target = this.NearestHostile(actor);
+                if (target != null) {
+                    SkillConfig skill = this.AiSkill(actor, target);
+                    bool acted = false;
+                    if (skill != null) {
+                        ZgmSkillResult result = this.CastSkill(
+                            actor, skill.Name(), target);
+                        acted = result.Status() == ZgmSkillStatus.Success;
+                    }
+                    if (!acted && this.Distance(actor, target) > 1) {
+                        ZgmPath path = this.FindPathForActor(
+                            actor, target.X(), target.Y());
+                        if (path != null && path.Count() > 0) {
+                            MapCell next = path.Next();
+                            this.MoveActor(actor, next.X(), next.Y());
+                            path.Dispose();
+                            acted = true;
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    ZgmActor CreateActor(
+        string roleName,
+        Faction faction,
+        int x,
+        int y
+    ) {
+        NpcConfig config = this.project.FindNpc(roleName);
+        if (config == null || this.currentMap == null) { return null; }
+        string id = config.Name() + "#" + Convert.ToString(this.nextId);
+        this.nextId = this.nextId + 1;
+        ZgmActor actor = ZgmActor.FromConfig(id, config, faction);
+        actor.SetAppConfig(this.project.App());
+        actor.SetPosition(x, y);
+        actor.ApplyGrowth(this.project.FindGrowth(config.Growth()));
+        this.actors.Add(actor);
+        return actor;
+    }
+    bool RemoveActor(ZgmActor actor) {
+        if (actor == null || actor == this.hero) { return false; }
+        int i = 0;
+        while (i < this.actors.Count) {
+            if (this.actors[i] == actor) {
+                actor.Destroy();
+                actor.Dispose();
+                this.actors.RemoveAt(i);
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    bool HasRestriction(ZgmActor actor, bool movement) {
+        int i = 0;
+        while (i < actor.BuffCount()) {
+            BuffConfig config = actor.BuffAt(i).Config();
+            if (movement && config.BlockMove()) { return true; }
+            if (!movement && config.BlockAttack()) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    bool MoveActor(ZgmActor actor, int x, int y) {
+        if (actor == null || this.currentMap == null || !actor.Alive()) {
+            return false;
+        }
+        if (this.HasRestriction(actor, true)
+            || !this.currentMap.IsInside(x, y)
+            || this.currentMap.IsObstacle(x, y)
+            || this.IsOccupied(x, y, actor)) {
+            return false;
+        }
+        actor.SetPosition(x, y);
+        this.RemoveConditionalBuffs(actor, 1);
+        if (actor == this.hero && this.camera != null) {
+            this.camera.Update();
+        }
+        return true;
+    }
+    ZgmPath FindPath(
+        int startX,
+        int startY,
+        int targetX,
+        int targetY
+    ) {
+        return ZgmPathfinder.Find(
+            this.currentMap,
+            startX,
+            startY,
+            targetX,
+            targetY);
+    }
+    ZgmPath FindPath(
+        int startX,
+        int startY,
+        int targetX,
+        int targetY,
+        bool diagonal
+    ) {
+        return ZgmPathfinder.Find(
+            this.currentMap,
+            startX,
+            startY,
+            targetX,
+            targetY,
+            diagonal);
+    }
+    ZgmPath FindPathForActor(
+        ZgmActor actor,
+        int targetX,
+        int targetY
+    ) {
+        return this.FindPathForActor(
+            actor, targetX, targetY, false);
+    }
+    ZgmPath FindPathForActor(
+        ZgmActor actor,
+        int targetX,
+        int targetY,
+        bool diagonal
+    ) {
+        if (actor == null || this.currentMap == null) { return null; }
+        List<MapCell> occupied = new List<MapCell>();
+        int i = 0;
+        while (i < this.actors.Count) {
+            ZgmActor other = this.actors[i];
+            if (other != actor && other.Alive()) {
+                occupied.Add(MapCell.Of(other.X(), other.Y(), 1));
+            }
+            i = i + 1;
+        }
+        ZgmPath path = ZgmPathfinder.Find(
+            this.currentMap,
+            actor.X(),
+            actor.Y(),
+            targetX,
+            targetY,
+            diagonal,
+            occupied);
+        occupied.Clear();
+        return path;
+    }
+    bool TryPortal(ZgmActor actor) {
+        if (actor == null || actor != this.hero || this.currentMap == null) {
+            return false;
+        }
+        int i = 0;
+        while (i < this.currentMap.PortalCount()) {
+            MapPortal portal = this.currentMap.PortalAt(i);
+            if (portal.X() == actor.X() && portal.Y() == actor.Y()) {
+                if (!this.EnterMap(portal.TargetMap(), actor, portal.Id())) {
+                    return false;
+                }
+                actor.SetPosition(portal.TargetX(), portal.TargetY());
+                actor.SetDirection(portal.Direction());
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    int AddItem(ZgmActor actor, string itemName, int count) {
+        if (actor == null) { return 0; }
+        ItemConfig item = this.project.FindItem(itemName);
+        if (item == null) { return 0; }
+        int added = actor.Inventory().Add(item, count);
+        this.gameplayEvents.RaiseItemChanged(
+            actor, item, actor.Inventory().QuantityOf(itemName));
+        return added;
+    }
+    bool RemoveItem(ZgmActor actor, string itemName, int count) {
+        if (actor == null) { return false; }
+        ItemConfig item = this.project.FindItem(itemName);
+        if (item == null || !actor.Inventory().Remove(itemName, count)) {
+            return false;
+        }
+        this.gameplayEvents.RaiseItemChanged(
+            actor, item, actor.Inventory().QuantityOf(itemName));
+        return true;
+    }
+    bool UseItem(ZgmActor actor, string itemName) {
+        ItemConfig item = this.project.FindItem(itemName);
+        if (actor == null || item == null || item.IsEquipment()) {
+            return false;
+        }
+        if (actor.Level() < item.LevelRequirement()) {
+            this.events.RaiseSystemPrompt(3, "Role level is too low.");
+            return false;
+        }
+        string cooldown = item.CooldownId();
+        if (cooldown != ""
+            && !actor.Cooldowns().IsReady("item:" + cooldown)) {
+            this.events.RaiseSystemPrompt(2, "Item is cooling down.");
+            return false;
+        }
+        if (!actor.Inventory().Remove(itemName, 1)) { return false; }
+        int hp = 0;
+        int mp = 0;
+        int i = 0;
+        while (i < item.AttrCount()) {
+            ZgmAttr attr = item.AttrAt(i);
+            if (attr.Name() == "hp") { hp = hp + attr.Value(); }
+            if (attr.Name() == "mp") { mp = mp + attr.Value(); }
+            i = i + 1;
+        }
+        actor.Restore(hp, mp);
+        if (cooldown != "") {
+            actor.Cooldowns().Start(
+                "item:" + cooldown, item.CooldownInterval());
+        }
+        this.gameplayEvents.RaiseItemChanged(
+            actor, item, actor.Inventory().QuantityOf(itemName));
+        this.gameplayEvents.RaiseItemUsed(actor, item);
+        return true;
+    }
+    bool EquipItem(ZgmActor actor, string itemName, string slot) {
+        ItemConfig item = this.project.FindItem(itemName);
+        if (actor == null || item == null
+            || actor.Level() < item.LevelRequirement()) {
+            return false;
+        }
+        bool result = actor.Equipment().Equip(
+            slot, item, actor.Inventory());
+        if (result) {
+            actor.ClampVitals();
+            this.gameplayEvents.RaiseItemChanged(
+                actor, item, actor.Inventory().QuantityOf(itemName));
+        }
+        return result;
+    }
+
+    ZgmGroundItem DropItem(
+        string itemName,
+        int count,
+        int x,
+        int y
+    ) {
+        ItemConfig item = this.project.FindItem(itemName);
+        if (item == null || count <= 0 || this.currentMap == null) {
+            return null;
+        }
+        if (!this.currentMap.IsInside(x, y)) { return null; }
+        if (this.currentMap.IsObstacle(x, y)
+            && !this.currentMap.ObstacleDrop()) {
+            return null;
+        }
+        ZgmGroundItem ground =
+            ZgmGroundItem.Create(item, count, x, y);
+        this.groundItems.Add(ground);
+        return ground;
+    }
+    bool Pickup(ZgmActor actor, ZgmGroundItem ground) {
+        if (actor == null || ground == null
+            || actor.X() != ground.X() || actor.Y() != ground.Y()) {
+            return false;
+        }
+        int added = actor.Inventory().Add(
+            ground.Item(), ground.Quantity());
+        if (added != ground.Quantity()) { return false; }
+        int i = 0;
+        while (i < this.groundItems.Count) {
+            if (this.groundItems[i] == ground) {
+                this.groundItems.RemoveAt(i);
+                this.gameplayEvents.RaiseItemChanged(
+                    actor,
+                    ground.Item(),
+                    actor.Inventory().QuantityOf(
+                        ground.Item().Name()));
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    void DropActorLoot(ZgmActor actor) {
+        if (actor == null) { return; }
+        NpcConfig config = actor.Config();
+        int i = 0;
+        while (i < config.DropCount()) {
+            DropEntry drop = config.DropAt(i);
+            int denominator = ZgmMath.Max(1, drop.ChanceMax());
+            bool selected = denominator == 1
+                || this.random.NextPercent() <= 100 / denominator;
+            if (selected) {
+                this.DropItem(
+                    drop.ItemName(), drop.Count(), actor.X(), actor.Y());
+            }
+            i = i + 1;
+        }
+    }
+    bool UnequipItem(ZgmActor actor, string slot) {
+        if (actor == null) { return false; }
+        ItemConfig item = actor.Equipment().Get(slot);
+        if (item == null) { return false; }
+        bool result = actor.Equipment().Unequip(slot, actor.Inventory());
+        if (result) {
+            actor.ClampVitals();
+            this.gameplayEvents.RaiseItemChanged(
+                actor, item, actor.Inventory().QuantityOf(item.Name()));
+        }
+        return result;
+    }
+
+    ZgmBuffInstance ApplyBuff(
+        ZgmActor actor,
+        string buffName,
+        ZgmActor source,
+        bool unique
+    ) {
+        BuffConfig config = this.project.FindBuff(buffName);
+        if (actor == null || config == null || !actor.Alive()) { return null; }
+        ZgmBuffInstance instance = actor.AddBuff(config, source, unique);
+        this.gameplayEvents.RaiseBuffChanged(actor, instance, true);
+        return instance;
+    }
+    bool RemoveBuff(ZgmActor actor, string buffName) {
+        if (actor == null) { return false; }
+        bool removed = false;
+        int i = actor.BuffCount() - 1;
+        while (i >= 0) {
+            ZgmBuffInstance instance = actor.BuffAt(i);
+            if (instance.Config().Name() == buffName) {
+                actor.RemoveBuffAt(i);
+                this.gameplayEvents.RaiseBuffChanged(actor, instance, false);
+                removed = true;
+            }
+            i = i - 1;
+        }
+        return removed;
+    }
+    int GainExperience(ZgmActor actor, int amount) {
+        if (actor == null || amount <= 0) { return 0; }
+        int previousLevel = actor.Level();
+        int gained = actor.AddExperience(
+            amount,
+            this.project.FindGrowth(actor.Config().Growth()));
+        this.gameplayEvents.RaiseExperienceGained(
+            actor, amount, actor.Experience());
+        if (gained > 0) {
+            this.gameplayEvents.RaiseLevelUp(
+                actor, previousLevel, actor.Level());
+        }
+        return gained;
+    }
+    void RemoveConditionalBuffs(ZgmActor actor, int condition) {
+        int i = actor.BuffCount() - 1;
+        while (i >= 0) {
+            ZgmBuffInstance instance = actor.BuffAt(i);
+            BuffConfig config = instance.Config();
+            bool remove = condition == 1 && config.ClearOnMove();
+            if (condition == 2 && config.ClearOnAttack()) { remove = true; }
+            if (condition == 3 && config.ClearOnHurt()) { remove = true; }
+            if (condition == 4 && config.ClearOnDeath()) { remove = true; }
+            if (remove) {
+                actor.RemoveBuffAt(i);
+                this.gameplayEvents.RaiseBuffChanged(actor, instance, false);
+            }
+            i = i - 1;
+        }
+    }
+
+    int Distance(ZgmActor a, ZgmActor b) {
+        return ZgmMath.Max(
+            ZgmMath.Abs(a.X() - b.X()),
+            ZgmMath.Abs(a.Y() - b.Y()));
+    }
+    int DistanceToCell(ZgmActor actor, int x, int y) {
+        return ZgmMath.Max(
+            ZgmMath.Abs(actor.X() - x),
+            ZgmMath.Abs(actor.Y() - y));
+    }
+    bool ValidTarget(ZgmActor caster, ZgmActor target, string faction) {
+        if (caster == null || target == null || !target.Alive()) { return false; }
+        if (faction == "不限") { return true; }
+        if (faction == "友方") { return caster.Camp() == target.Camp(); }
+        return caster.Camp() != target.Camp();
+    }
+    int Damage(ZgmActor caster, ZgmActor target, SkillConfig skill) {
+        int attack = caster.Attribute("攻击");
+        if (attack <= 0) { attack = 1; }
+        int defense = target.Attribute("防御");
+        int damage = attack - defense;
+        if (skill.Formula() != "") {
+            ZgmFormula formula = ZgmFormula.Create(
+                skill.Formula(),
+                caster.EffectiveAttributes(),
+                target.EffectiveAttributes());
+            damage = formula.Evaluate();
+            if (!formula.IsValid()) {
+                int denominator = attack + defense;
+                if (denominator <= 0) { denominator = 1; }
+                damage = attack * attack / denominator;
+            }
+        }
+        damage = (int)((double)damage * skill.DamageScale());
+        return ZgmMath.Max(1, damage);
+    }
+    void ApplySkillHit(
+        ZgmSkillResult result,
+        ZgmActor caster,
+        ZgmActor target,
+        SkillConfig skill,
+        bool hit,
+        bool critical,
+        int damage
+    ) {
+        if (!hit || target == null || !target.Alive()) { return; }
+        int applied = target.TakeDamage(damage);
+        result.RecordDamage(target, true, critical, applied);
+        this.gameplayEvents.RaiseActorDamaged(
+            caster, target, applied, critical);
+        int b = 0;
+        while (b < skill.BuffCount() && target.Alive()) {
+            this.ApplyBuff(
+                target, skill.BuffAt(b), caster, false);
+            b = b + 1;
+        }
+        this.RemoveConditionalBuffs(target, 3);
+        if (!target.Alive()) {
+            this.RemoveConditionalBuffs(target, 4);
+            this.gameplayEvents.RaiseActorDied(target, caster);
+            this.GainExperience(
+                caster, target.Config().ExperienceReward());
+            this.DropActorLoot(target);
+        } else {
+            this.TryAutoCounter(target, caster);
+        }
+    }
+    void TryAutoCounter(ZgmActor target, ZgmActor attacker) {
+        if (this.counterDepth > 0
+            || target == null
+            || attacker == null
+            || !target.Alive()
+            || !attacker.Alive()
+            || target.Config().AutoCounter() <= 0) {
+            return;
+        }
+        SkillConfig skill = this.AiSkill(target, attacker);
+        if (skill == null || skill.DamageDelay() > 0) { return; }
+        this.counterDepth = this.counterDepth + 1;
+        this.CastSkill(target, skill.Name(), attacker);
+        this.counterDepth = this.counterDepth - 1;
+    }
+    ZgmSkillResult Resolve(ZgmSkillResult result) {
+        this.gameplayEvents.RaiseSkillResolved(result);
+        return result;
+    }
+    ZgmSkillResult CastSkill(
+        ZgmActor caster,
+        string skillName,
+        ZgmActor target
+    ) {
+        int x = 0;
+        int y = 0;
+        bool hasCell = target != null;
+        if (target != null) {
+            x = target.X();
+            y = target.Y();
+        }
+        return this.CastSkillAtInternal(
+            caster, skillName, target, x, y, hasCell);
+    }
+    ZgmSkillResult CastSkillAt(
+        ZgmActor caster,
+        string skillName,
+        int x,
+        int y
+    ) {
+        return this.CastSkillAtInternal(
+            caster, skillName, null, x, y, true);
+    }
+    ZgmSkillResult CastSkillAtInternal(
+        ZgmActor caster,
+        string skillName,
+        ZgmActor target,
+        int x,
+        int y,
+        bool hasCell
+    ) {
+        SkillConfig skill = this.project.FindSkill(skillName);
+        if (skill == null) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.UnknownSkill, caster, target, null));
+        }
+        if (caster == null || !caster.HasSkill(skillName)) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.NotLearned, caster, target, skill));
+        }
+        if (!caster.Alive() || this.HasRestriction(caster, false)) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.Blocked, caster, target, skill));
+        }
+        if (skill.Target() == SkillTarget.Self) {
+            target = caster;
+            x = caster.X();
+            y = caster.Y();
+            hasCell = true;
+        }
+        bool validCharacterThenCell =
+            skill.Target() == SkillTarget.CharacterThenCell
+            && target != null
+            && this.ValidTarget(caster, target, skill.Faction());
+        bool actorTarget = skill.Target() == SkillTarget.Character
+            || skill.Target() == SkillTarget.Self
+            || validCharacterThenCell;
+        bool useCell = skill.Target() == SkillTarget.MouseCell
+            || (skill.Target() == SkillTarget.CharacterThenCell
+                && !validCharacterThenCell);
+        if (skill.Target() == SkillTarget.CharacterThenCell
+            && !useCell && target != null) {
+            x = target.X();
+            y = target.Y();
+            hasCell = true;
+        }
+        if (actorTarget && !this.ValidTarget(
+            caster, target, skill.Faction())) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.InvalidTarget, caster, target, skill));
+        }
+        if (useCell && !hasCell) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.InvalidTarget, caster, target, skill));
+        }
+        if (!actorTarget && !useCell) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.InvalidTarget, caster, target, skill));
+        }
+        int distance = useCell
+            ? this.DistanceToCell(caster, x, y)
+            : this.Distance(caster, target);
+        if (distance < skill.MinRange() || distance > skill.AttackRange()) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.OutOfRange, caster, target, skill));
+        }
+        string cooldown = "skill:" + skill.Name();
+        if (!caster.Cooldowns().IsReady(cooldown)) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.Cooldown, caster, target, skill));
+        }
+        if (!caster.Spend(
+            skill.CostHp(), skill.CostMp(), skill.CostRage())) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.InsufficientResources,
+                caster, target, skill));
+        }
+
+        caster.Cooldowns().Start(cooldown, skill.Interval());
+        this.RemoveConditionalBuffs(caster, 2);
+        List<ZgmActor> targets = new List<ZgmActor>();
+        int radius = ZgmMath.Max(0, skill.AreaRadius());
+        int i = 0;
+        while (i < this.actors.Count) {
+            ZgmActor candidate = this.actors[i];
+            bool selected = this.ValidTarget(
+                caster, candidate, skill.Faction());
+            if (selected) {
+                if (radius <= 0) {
+                    selected = !useCell && candidate == target;
+                } else {
+                    selected = this.DistanceToCell(
+                        candidate, x, y) <= radius;
+                }
+            }
+            if (selected) { targets.Add(candidate); }
+            i = i + 1;
+        }
+        if (radius <= 0 && actorTarget && targets.Count == 0) {
+            return this.Resolve(ZgmSkillResult.Create(
+                ZgmSkillStatus.InvalidTarget, caster, target, skill));
+        }
+        ZgmSkillResult result = ZgmSkillResult.Create(
+            ZgmSkillStatus.Success, caster, target, skill);
+        List<bool> hits = new List<bool>();
+        List<bool> criticals = new List<bool>();
+        List<int> damages = new List<int>();
+        bool anyHit = false;
+        bool anyCritical = false;
+        i = 0;
+        while (i < targets.Count) {
+            ZgmActor victim = targets[i];
+            bool hit = skill.AbsoluteHit();
+            if (!hit) {
+                int chance = ZgmMath.Clamp(
+                    caster.Attribute("命中") - victim.Attribute("躲避"),
+                    5, 100);
+                hit = this.random.NextPercent() <= chance;
+            }
+            bool critical = false;
+            int damage = 0;
+            if (hit) {
+                critical = skill.AbsoluteCrit()
+                    || this.random.NextPercent()
+                        <= ZgmMath.Clamp(
+                            caster.Attribute("暴击"), 0, 100);
+                damage = this.Damage(caster, victim, skill);
+                if (critical) {
+                    int multiplier = caster.Attribute("暴击伤害");
+                    if (multiplier <= 0) { multiplier = 150; }
+                    damage = damage * multiplier / 100;
+                }
+                anyHit = true;
+                if (critical) { anyCritical = true; }
+            }
+            hits.Add(hit);
+            criticals.Add(critical);
+            damages.Add(damage);
+            i = i + 1;
+        }
+        result.Resolve(anyHit, anyCritical, 0);
+        if (skill.DamageDelay() > 0) {
+            result.SetPending(true);
+            this.pendingSkills.Add(ZgmPendingSkill.Create(
+                skill.DamageDelay(),
+                result,
+                caster,
+                skill,
+                targets,
+                hits,
+                criticals,
+                damages));
+            return result;
+        }
+        i = 0;
+        while (i < targets.Count) {
+            this.ApplySkillHit(
+                result,
+                caster,
+                targets[i],
+                skill,
+                hits[i],
+                criticals[i],
+                damages[i]);
+            i = i + 1;
+        }
+        return this.Resolve(result);
+    }
+
+    void Update(int deltaMilliseconds) {
+        if (deltaMilliseconds <= 0) { return; }
+        int pendingIndex = this.pendingSkills.Count - 1;
+        while (pendingIndex >= 0) {
+            ZgmPendingSkill pending = this.pendingSkills[pendingIndex];
+            pending.Tick(deltaMilliseconds);
+            if (pending.Ready()) {
+                int p = 0;
+                while (p < pending.TargetCount()) {
+                    this.ApplySkillHit(
+                        pending.Result(),
+                        pending.Caster(),
+                        pending.TargetAt(p),
+                        pending.Skill(),
+                        pending.HitAt(p),
+                        pending.CriticalAt(p),
+                        pending.DamageAt(p));
+                    p = p + 1;
+                }
+                pending.Result().SetPending(false);
+                this.Resolve(pending.Result());
+                pending.Dispose();
+                this.pendingSkills.RemoveAt(pendingIndex);
+            }
+            pendingIndex = pendingIndex - 1;
+        }
+        int groundIndex = this.groundItems.Count - 1;
+        while (groundIndex >= 0) {
+            this.groundItems[groundIndex].Tick(deltaMilliseconds);
+            if (this.groundItems[groundIndex].Expired()) {
+                this.groundItems.RemoveAt(groundIndex);
+            }
+            groundIndex = groundIndex - 1;
+        }
+        int a = 0;
+        while (a < this.actors.Count) {
+            ZgmActor actor = this.actors[a];
+            actor.Cooldowns().Tick(deltaMilliseconds);
+            int i = actor.BuffCount() - 1;
+            while (i >= 0) {
+                ZgmBuffInstance instance = actor.BuffAt(i);
+                int triggers = instance.Tick(deltaMilliseconds);
+                while (triggers > 0 && actor.Alive()) {
+                    BuffConfig config = instance.Config();
+                    int hp = 0;
+                    int mp = 0;
+                    int n = 0;
+                    while (n < config.AttrCount()) {
+                        ZgmAttr attr = config.AttrAt(n);
+                        if (attr.Name() == "hp") { hp = hp + attr.Value(); }
+                        if (attr.Name() == "mp") { mp = mp + attr.Value(); }
+                        n = n + 1;
+                    }
+                    if (hp < 0) {
+                        int applied = actor.TakeDamage(-hp);
+                        this.gameplayEvents.RaiseActorDamaged(
+                            instance.Source(), actor, applied, false);
+                    } else {
+                        actor.Restore(hp, mp);
+                    }
+                    triggers = triggers - 1;
+                }
+                if (i < actor.BuffCount()
+                    && actor.BuffAt(i) == instance
+                    && instance.Expired()) {
+                    actor.RemoveBuffAt(i);
+                    this.gameplayEvents.RaiseBuffChanged(
+                        actor, instance, false);
+                }
+                i = i - 1;
+            }
+            a = a + 1;
+        }
+        this.UpdateAi(deltaMilliseconds);
+        if (this.camera != null) { this.camera.Update(); }
+    }
+    void Dispose() {
+        int i = 0;
+        while (i < this.actors.Count) {
+            this.actors[i].Dispose();
+            i = i + 1;
+        }
+        this.actors = new List<ZgmActor>();
+        this.groundItems = new List<ZgmGroundItem>();
+        int pendingIndex = this.pendingSkills.Count - 1;
+        while (pendingIndex >= 0) {
+            this.pendingSkills[pendingIndex].Dispose();
+            pendingIndex = pendingIndex - 1;
+        }
+        this.pendingSkills = new List<ZgmPendingSkill>();
+        if (this.camera != null) { this.camera.Dispose(); }
+        this.camera = null;
+        this.counterDepth = 0;
+        this.hero = null;
+        this.currentMap = null;
+        this.project = null;
+        this.events = null;
+        this.gameplayEvents = null;
+    }
+}

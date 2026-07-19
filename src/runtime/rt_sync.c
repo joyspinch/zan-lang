@@ -20,6 +20,7 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/file.h>
@@ -443,6 +444,49 @@ int64_t zan_thread_start(void *body) {
     if (pthread_create(&t, NULL, zan_thread_trampoline, body) != 0) return 0;
     pthread_detach(t);
     return 1;
+}
+#endif
+
+/* ---- lock-statement monitor ---------------------------------------------
+ * Backs the `lock (obj) { ... }` statement. A single process-wide recursive
+ * mutex serializes all lock statements: coarser than C#'s per-object monitor
+ * but preserves mutual exclusion and allows re-entry. */
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_monitor_cs;
+static INIT_ONCE g_monitor_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK zan_monitor_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_monitor_cs);
+    return TRUE;
+}
+void zan_monitor_enter(void *obj) {
+    (void)obj;
+    InitOnceExecuteOnce(&g_monitor_once, zan_monitor_init, NULL, NULL);
+    EnterCriticalSection(&g_monitor_cs);
+}
+void zan_monitor_exit(void *obj) {
+    (void)obj;
+    LeaveCriticalSection(&g_monitor_cs);
+}
+#else
+static pthread_mutex_t g_monitor_mx;
+static pthread_once_t g_monitor_once = PTHREAD_ONCE_INIT;
+static void zan_monitor_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_monitor_mx, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+void zan_monitor_enter(void *obj) {
+    (void)obj;
+    pthread_once(&g_monitor_once, zan_monitor_init);
+    pthread_mutex_lock(&g_monitor_mx);
+}
+void zan_monitor_exit(void *obj) {
+    (void)obj;
+    pthread_mutex_unlock(&g_monitor_mx);
 }
 #endif
 
@@ -957,4 +1001,72 @@ void zan_shared_table_clear(int64_t handle) {
         table->mapped_size - rows_offset);
     table->header->count = 0;
     zan_table_unlock(table);
+}
+
+/* ---- filesystem helpers for the compiler driver ---- */
+
+/* Write the directory containing the running executable into `out`
+ * (NUL-terminated, truncated at `cap`). Returns the length written. */
+long long zan_exe_dir_into(char *out, long long cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = '\0';
+#ifdef _WIN32
+    char buf[1024];
+    DWORD n = GetModuleFileNameA(NULL, buf, sizeof(buf));
+    while (n > 0 && buf[n - 1] != '\\') n--;
+    if (n > 0) n--; /* drop the trailing separator */
+    if ((long long)n >= cap) n = (DWORD)(cap - 1);
+    memcpy(out, buf, n);
+    out[n] = '\0';
+    return (long long)n;
+#else
+    char buf[1024];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n < 0) n = 0;
+    while (n > 0 && buf[n - 1] != '/') n--;
+    if (n > 0) n--;
+    if ((long long)n >= cap) n = (ssize_t)(cap - 1);
+    memcpy(out, buf, (size_t)n);
+    out[n] = '\0';
+    return (long long)n;
+#endif
+}
+
+/* List the file names matching `pattern` (a glob such as dir\*.zan) into
+ * `out`, one name per line ('\n'-separated, NUL-terminated, truncated at
+ * `cap`). Returns the length written; 0 when nothing matches. */
+long long zan_dir_list_into(const char *pattern, char *out, long long cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = '\0';
+    if (!pattern) return 0;
+    long long len = 0;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        long long nl = (long long)strlen(fd.cFileName);
+        if (len + nl + 2 > cap) break;
+        memcpy(out + len, fd.cFileName, (size_t)nl);
+        len += nl;
+        out[len++] = '\n';
+        out[len] = '\0';
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    glob_t g;
+    if (glob(pattern, 0, NULL, &g) != 0) return 0;
+    for (size_t i = 0; i < g.gl_pathc; i++) {
+        const char *base = strrchr(g.gl_pathv[i], '/');
+        base = base ? base + 1 : g.gl_pathv[i];
+        long long nl = (long long)strlen(base);
+        if (len + nl + 2 > cap) break;
+        memcpy(out + len, base, (size_t)nl);
+        len += nl;
+        out[len++] = '\n';
+        out[len] = '\0';
+    }
+    globfree(&g);
+#endif
+    return len;
 }

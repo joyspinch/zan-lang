@@ -1,0 +1,1079 @@
+// Reversi (Othello) — a complete product built on GameKit.
+// Features: start menu, four AI difficulties + adaptive scaling, alpha-beta
+// Minimax with a positional weight map + mobility + corner heuristics, legal
+// move hints, coin-flip disc animation, live disc tally, dynamic commentary,
+// and a persistent rank / win-streak profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Reversi;
+
+// ---------------------------------------------------------------------------
+// Persistent player profile (rank points, streaks, W/L, adaptive level).
+// ---------------------------------------------------------------------------
+class Profile {
+    int rank;
+    int streak;
+    int best;
+    int wins;
+    int losses;
+    int draws;
+    int games;
+    int level;      // 0..3 selected difficulty
+    int adaptive;   // 0/1
+
+    static string Path() { return "reversi_save.txt"; }
+
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            int eq = -1;
+            int j = 0;
+            while (j < ln.Length) {
+                if (ln[j] == 61) { eq = j; j = ln.Length; }
+                j = j + 1;
+            }
+            if (eq > 0) {
+                string k = ln.Substring(0, eq);
+                if (k == key) { return Profile.ParseInt(ln, eq + 1); }
+            }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static int ParseInt(string s, int start) {
+        int i = start;
+        int sign = 1;
+        if (i < s.Length && s[i] == 45) { sign = -1; i = i + 1; }
+        int v = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v * sign;
+    }
+
+    static Profile Load() {
+        Profile p = new Profile();
+        p.rank = 1000;
+        p.streak = 0;
+        p.best = 0;
+        p.wins = 0;
+        p.losses = 0;
+        p.draws = 0;
+        p.games = 0;
+        p.level = 1;
+        p.adaptive = 1;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.rank = Profile.ReadKey(lines, "rank", 1000);
+            p.streak = Profile.ReadKey(lines, "streak", 0);
+            p.best = Profile.ReadKey(lines, "best", 0);
+            p.wins = Profile.ReadKey(lines, "wins", 0);
+            p.losses = Profile.ReadKey(lines, "losses", 0);
+            p.draws = Profile.ReadKey(lines, "draws", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+            p.level = Profile.ReadKey(lines, "level", 1);
+            p.adaptive = Profile.ReadKey(lines, "adaptive", 1);
+        }
+        return p;
+    }
+
+    void Save() {
+        string s = "";
+        s = s + "rank=" + this.rank + "\n";
+        s = s + "streak=" + this.streak + "\n";
+        s = s + "best=" + this.best + "\n";
+        s = s + "wins=" + this.wins + "\n";
+        s = s + "losses=" + this.losses + "\n";
+        s = s + "draws=" + this.draws + "\n";
+        s = s + "games=" + this.games + "\n";
+        s = s + "level=" + this.level + "\n";
+        s = s + "adaptive=" + this.adaptive + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+
+    string TierName() {
+        int r = this.rank;
+        if (r < 900) { return "BRONZE"; }
+        if (r < 1100) { return "SILVER"; }
+        if (r < 1300) { return "GOLD"; }
+        if (r < 1500) { return "PLATINUM"; }
+        if (r < 1750) { return "DIAMOND"; }
+        return "MASTER";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Board + AI. 8x8. Cells: 0 empty, 1 human (black), 2 AI (white).
+// ---------------------------------------------------------------------------
+class Ai {
+    static int[] DR;
+    static int[] DC;
+    static bool dready;
+    static int[] W;
+    static bool wready;
+
+    static void EnsureDirs() {
+        if (Ai.dready) { return; }
+        Ai.DR = new int[8];
+        Ai.DC = new int[8];
+        Ai.DR[0] = -1; Ai.DC[0] = -1;
+        Ai.DR[1] = -1; Ai.DC[1] = 0;
+        Ai.DR[2] = -1; Ai.DC[2] = 1;
+        Ai.DR[3] = 0;  Ai.DC[3] = -1;
+        Ai.DR[4] = 0;  Ai.DC[4] = 1;
+        Ai.DR[5] = 1;  Ai.DC[5] = -1;
+        Ai.DR[6] = 1;  Ai.DC[6] = 0;
+        Ai.DR[7] = 1;  Ai.DC[7] = 1;
+        Ai.dready = true;
+    }
+
+    // Classic 8x8 Othello positional weight map (corners prized, X/C-squares
+    // penalised). Read from the AI's perspective; symmetric under reflection.
+    static void EnsureW() {
+        if (Ai.wready) { return; }
+        int[] w = new int[64];
+        w[0]=120;  w[1]=-20; w[2]=20;  w[3]=5;   w[4]=5;   w[5]=20;  w[6]=-20; w[7]=120;
+        w[8]=-20;  w[9]=-40; w[10]=-5; w[11]=-5; w[12]=-5; w[13]=-5; w[14]=-40;w[15]=-20;
+        w[16]=20;  w[17]=-5; w[18]=15; w[19]=3;  w[20]=3;  w[21]=15; w[22]=-5; w[23]=20;
+        w[24]=5;   w[25]=-5; w[26]=3;  w[27]=3;  w[28]=3;  w[29]=3;  w[30]=-5; w[31]=5;
+        w[32]=5;   w[33]=-5; w[34]=3;  w[35]=3;  w[36]=3;  w[37]=3;  w[38]=-5; w[39]=5;
+        w[40]=20;  w[41]=-5; w[42]=15; w[43]=3;  w[44]=3;  w[45]=15; w[46]=-5; w[47]=20;
+        w[48]=-20; w[49]=-40;w[50]=-5; w[51]=-5; w[52]=-5; w[53]=-5; w[54]=-40;w[55]=-20;
+        w[56]=120; w[57]=-20;w[58]=20; w[59]=5;  w[60]=5;  w[61]=20; w[62]=-20;w[63]=120;
+        Ai.W = w;
+        Ai.wready = true;
+    }
+
+    static int Opp(int p) { return 3 - p; }
+
+    static int[] Clone(int[] b) {
+        int[] nb = new int[64];
+        int i = 0;
+        while (i < 64) { nb[i] = b[i]; i = i + 1; }
+        return nb;
+    }
+
+    // Count of discs flipped along dir (dr,dc) if 'p' plays at (r,c); else 0.
+    static int FlipsDir(int[] b, int r, int c, int dr, int dc, int p) {
+        int o = Ai.Opp(p);
+        int rr = r + dr;
+        int cc = c + dc;
+        int cnt = 0;
+        while (rr >= 0 && rr < 8 && cc >= 0 && cc < 8 && b[rr * 8 + cc] == o) {
+            cnt = cnt + 1;
+            rr = rr + dr;
+            cc = cc + dc;
+        }
+        if (cnt > 0 && rr >= 0 && rr < 8 && cc >= 0 && cc < 8 && b[rr * 8 + cc] == p) {
+            return cnt;
+        }
+        return 0;
+    }
+
+    static bool Legal(int[] b, int at, int p) {
+        Ai.EnsureDirs();
+        if (b[at] != 0) { return false; }
+        int r = at / 8;
+        int c = at % 8;
+        int d = 0;
+        while (d < 8) {
+            if (Ai.FlipsDir(b, r, c, Ai.DR[d], Ai.DC[d], p) > 0) { return true; }
+            d = d + 1;
+        }
+        return false;
+    }
+
+    // Apply move for 'p' at 'at', flipping all captured discs. Mutates b.
+    static void ApplyMove(int[] b, int at, int p) {
+        Ai.EnsureDirs();
+        int r = at / 8;
+        int c = at % 8;
+        b[at] = p;
+        int d = 0;
+        while (d < 8) {
+            int dr = Ai.DR[d];
+            int dc = Ai.DC[d];
+            int cnt = Ai.FlipsDir(b, r, c, dr, dc, p);
+            int k = 0;
+            int rr = r + dr;
+            int cc = c + dc;
+            while (k < cnt) {
+                b[rr * 8 + cc] = p;
+                rr = rr + dr;
+                cc = cc + dc;
+                k = k + 1;
+            }
+            d = d + 1;
+        }
+    }
+
+    static int LegalMoves(int[] b, int p, int[] dst) {
+        int n = 0;
+        int at = 0;
+        while (at < 64) {
+            if (b[at] == 0 && Ai.Legal(b, at, p)) { dst[n] = at; n = n + 1; }
+            at = at + 1;
+        }
+        return n;
+    }
+
+    static int CountLegal(int[] b, int p) {
+        int n = 0;
+        int at = 0;
+        while (at < 64) {
+            if (b[at] == 0 && Ai.Legal(b, at, p)) { n = n + 1; }
+            at = at + 1;
+        }
+        return n;
+    }
+
+    static bool HasMove(int[] b, int p) {
+        int at = 0;
+        while (at < 64) {
+            if (b[at] == 0 && Ai.Legal(b, at, p)) { return true; }
+            at = at + 1;
+        }
+        return false;
+    }
+
+    static int Count(int[] b, int p) {
+        int n = 0;
+        int i = 0;
+        while (i < 64) { if (b[i] == p) { n = n + 1; } i = i + 1; }
+        return n;
+    }
+
+    static int CornerScore(int[] b, int p) {
+        int n = 0;
+        if (b[0] == p) { n = n + 1; }
+        if (b[7] == p) { n = n + 1; }
+        if (b[56] == p) { n = n + 1; }
+        if (b[63] == p) { n = n + 1; }
+        return n;
+    }
+
+    // Board score from the AI's perspective (white = 2).
+    static int Eval(int[] b) {
+        Ai.EnsureW();
+        int pos = 0;
+        int i = 0;
+        while (i < 64) {
+            int c = b[i];
+            if (c == 2) { pos = pos + Ai.W[i]; }
+            else if (c == 1) { pos = pos - Ai.W[i]; }
+            i = i + 1;
+        }
+        int myM = Ai.CountLegal(b, 2);
+        int opM = Ai.CountLegal(b, 1);
+        int mob = 0;
+        if (myM + opM != 0) { mob = 100 * (myM - opM) / (myM + opM); }
+        int corner = 40 * (Ai.CornerScore(b, 2) - Ai.CornerScore(b, 1));
+        int empty = Ai.Count(b, 0);
+        int diff = Ai.Count(b, 2) - Ai.Count(b, 1);
+        int parity = 0;
+        if (empty <= 12) { parity = diff * (18 - empty); }
+        return pos + mob + corner + parity;
+    }
+
+    static int FinalScore(int[] b) {
+        int d = Ai.Count(b, 2) - Ai.Count(b, 1);
+        if (d > 0) { return 1000000 + d; }
+        if (d < 0) { return -1000000 + d; }
+        return 0;
+    }
+
+    // Order moves by positional weight (corners first) to help alpha-beta cuts.
+    static void Order(int[] moves, int n) {
+        Ai.EnsureW();
+        int k = 0;
+        while (k < n) {
+            int bestI = k;
+            int j = k + 1;
+            while (j < n) {
+                if (Ai.W[moves[j]] > Ai.W[moves[bestI]]) { bestI = j; }
+                j = j + 1;
+            }
+            int t = moves[bestI]; moves[bestI] = moves[k]; moves[k] = t;
+            k = k + 1;
+        }
+    }
+
+    static int Search(int[] b, int depth, int alpha, int beta, int turn, bool prevPass) {
+        int[] moves = new int[64];
+        int n = Ai.LegalMoves(b, turn, moves);
+        if (n == 0) {
+            if (prevPass) { return Ai.FinalScore(b); }
+            return Ai.Search(b, depth, alpha, beta, Ai.Opp(turn), true);
+        }
+        if (depth == 0) { return Ai.Eval(b); }
+        Ai.Order(moves, n);
+        if (turn == 2) {
+            int best = -2000000000;
+            int i = 0;
+            while (i < n) {
+                int[] nb = Ai.Clone(b);
+                Ai.ApplyMove(nb, moves[i], 2);
+                int v = Ai.Search(nb, depth - 1, alpha, beta, 1, false);
+                if (v > best) { best = v; }
+                if (best > alpha) { alpha = best; }
+                if (beta <= alpha) { i = n; } else { i = i + 1; }
+            }
+            return best;
+        }
+        int best = 2000000000;
+        int i = 0;
+        while (i < n) {
+            int[] nb = Ai.Clone(b);
+            Ai.ApplyMove(nb, moves[i], 1);
+            int v = Ai.Search(nb, depth - 1, alpha, beta, 2, false);
+            if (v < best) { best = v; }
+            if (best < beta) { beta = best; }
+            if (beta <= alpha) { i = n; } else { i = i + 1; }
+        }
+        return best;
+    }
+
+    // Best move index for the AI (white=2), or -1 if it must pass.
+    static int BestMove(int[] b, int depth, int rand, Rng rng) {
+        int[] moves = new int[64];
+        int n = Ai.LegalMoves(b, 2, moves);
+        if (n == 0) { return -1; }
+        Ai.Order(moves, n);
+        int[] scores = new int[64];
+        int best = -2000000000;
+        int i = 0;
+        while (i < n) {
+            int[] nb = Ai.Clone(b);
+            Ai.ApplyMove(nb, moves[i], 2);
+            int v = Ai.Search(nb, depth - 1, -2000000000, 2000000000, 1, false);
+            scores[i] = v;
+            if (v > best) { best = v; }
+            i = i + 1;
+        }
+        int margin = 0;
+        if (rand > 0) { margin = 20 + rand * 15; }
+        int[] pool = new int[64];
+        int pn = 0;
+        i = 0;
+        while (i < n) {
+            if (scores[i] >= best - margin) { pool[pn] = moves[i]; pn = pn + 1; }
+            i = i + 1;
+        }
+        if (pn <= 1 || rand <= 0) {
+            i = 0;
+            while (i < n) { if (scores[i] == best) { return moves[i]; } i = i + 1; }
+            return moves[0];
+        }
+        return pool[rng.Range(0, pn)];
+    }
+
+    // Attract-mode / hint move for the human side (black=1).
+    static int BlackMove(int[] b, int depth) {
+        int[] moves = new int[64];
+        int n = Ai.LegalMoves(b, 1, moves);
+        if (n == 0) { return -1; }
+        Ai.Order(moves, n);
+        int best = 2000000000;
+        int bestAt = moves[0];
+        int i = 0;
+        while (i < n) {
+            int[] nb = Ai.Clone(b);
+            Ai.ApplyMove(nb, moves[i], 1);
+            int v = Ai.Search(nb, depth - 1, -2000000000, 2000000000, 2, false);
+            if (v < best) { best = v; bestAt = moves[i]; }
+            i = i + 1;
+        }
+        return bestAt;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Game — scenes, rendering, input, progression.
+// ---------------------------------------------------------------------------
+class ReversiGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    Talker talk;
+    int[] board;
+    int[] flipAt;       // ms timestamp of last change per cell (for animation)
+    int[] prevOwner;    // owner before last change (0 = was empty / placed)
+    int turn;           // 1 human (black), 2 ai (white)
+    int scene;          // 0 menu, 1 play, 2 over
+    int winner;         // 0 none, 1 human, 2 ai, 3 draw
+    int lastMove;
+    int blackCount;
+    int whiteCount;
+    int aiMoveAt;
+    bool aiPending;
+    int passInfo;       // 0 none, 1 you passed, 2 ai passed (for status line)
+    int mouseX;
+    int mouseY;
+    int scoreDelta;
+    int winAdj;
+    int lossAdj;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+    int demoAt;
+
+    static int CELL() { return 88; }
+    static int GX(int c) { return 92 + c * 88; }
+    static int GY(int r) { return 92 + r * 88; }
+
+    int Depth() {
+        if (this.prof.level == 0) { return 1; }
+        if (this.prof.level == 1) { return 2; }
+        if (this.prof.level == 2) { return 4; }
+        return 6;
+    }
+    int Rand() {
+        if (this.prof.level == 0) { return 3; }
+        if (this.prof.level == 1) { return 1; }
+        return 0;
+    }
+
+    string LevelName() {
+        if (this.prof.level == 0) { return "EASY"; }
+        if (this.prof.level == 1) { return "NORMAL"; }
+        if (this.prof.level == 2) { return "HARD"; }
+        return "EXPERT";
+    }
+
+    static ReversiGame Create(Host h) {
+        ReversiGame g = new ReversiGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 987654321);
+        g.talk = Talker.Create(g.rng);
+        g.board = new int[64];
+        g.flipAt = new int[64];
+        g.prevOwner = new int[64];
+        g.scene = 0;
+        g.winner = 0;
+        g.lastMove = -1;
+        g.turn = 1;
+        g.mouseX = 0;
+        g.mouseY = 0;
+        g.winAdj = 0;
+        g.lossAdj = 0;
+        g.passInfo = 0;
+        g.SetupTalk();
+        g.demo = File.Exists("reversi_demo.txt");
+        if (g.demo) {
+            g.StartGame(Sdl.Ticks());
+            g.demoAt = Sdl.Ticks() + 500;
+        }
+        return g;
+    }
+
+    void SetupTalk() {
+        this.talk.Add(0, "Nice flip!");
+        this.talk.Add(0, "Great capture.");
+        this.talk.Add(0, "Solid position.");
+        this.talk.Add(0, "Ooh, big swing!");
+        this.talk.Add(0, "Textbook move.");
+        this.talk.Add(1, "Bold... maybe too bold.");
+        this.talk.Add(1, "The AI smells a corner.");
+        this.talk.Add(1, "You sure about that?");
+        this.talk.Add(1, "That edge looks risky.");
+        this.talk.Add(1, "The AI is plotting.");
+        this.talk.Add(2, "Your move.");
+        this.talk.Add(2, "Take your time.");
+        this.talk.Add(3, "CORNER GRABBED!");
+        this.talk.Add(3, "Massive swing!");
+        this.talk.Add(3, "The crowd gasps!");
+        this.talk.Add(3, "What a comeback!");
+    }
+
+    void Recount() {
+        this.blackCount = Ai.Count(this.board, 1);
+        this.whiteCount = Ai.Count(this.board, 2);
+    }
+
+    void ResetBoard() {
+        int i = 0;
+        while (i < 64) { this.board[i] = 0; this.flipAt[i] = 0; this.prevOwner[i] = 0; i = i + 1; }
+        // Standard Othello opening.
+        this.board[27] = 2; // (3,3) white
+        this.board[28] = 1; // (3,4) black
+        this.board[35] = 1; // (4,3) black
+        this.board[36] = 2; // (4,4) white
+        this.turn = 1;
+        this.winner = 0;
+        this.lastMove = -1;
+        this.aiPending = false;
+        this.passInfo = 0;
+        this.scoreDelta = 0;
+        this.Recount();
+    }
+
+    // Play 'p' at 'at' on the real board, recording per-cell animation state.
+    void DoMove(int at, int p, int now) {
+        Ai.EnsureDirs();
+        int r = at / 8;
+        int c = at % 8;
+        this.prevOwner[at] = 0;
+        this.board[at] = p;
+        this.flipAt[at] = now;
+        int d = 0;
+        while (d < 8) {
+            int dr = Ai.DR[d];
+            int dc = Ai.DC[d];
+            int cnt = Ai.FlipsDir(this.board, r, c, dr, dc, p);
+            int k = 0;
+            int rr = r + dr;
+            int cc = c + dc;
+            while (k < cnt) {
+                int idx = rr * 8 + cc;
+                this.prevOwner[idx] = this.board[idx];
+                this.board[idx] = p;
+                this.flipAt[idx] = now;
+                rr = rr + dr;
+                cc = cc + dc;
+                k = k + 1;
+            }
+            d = d + 1;
+        }
+        this.lastMove = at;
+        this.Recount();
+    }
+
+    // Advance the turn after 'mover' has played, handling passes and game end.
+    void Advance(int mover, int now) {
+        int next = Ai.Opp(mover);
+        if (Ai.HasMove(this.board, next)) {
+            this.turn = next;
+            this.passInfo = 0;
+            if (next == 2) { this.aiPending = true; this.aiMoveAt = now + 460; }
+            return;
+        }
+        if (Ai.HasMove(this.board, mover)) {
+            // Opponent has no legal move: they pass, mover keeps the turn.
+            this.turn = mover;
+            if (next == 2) {
+                this.passInfo = 2;
+                this.talk.SayExact(0, "The AI has to pass -- keep pushing!", now, 2600);
+            } else {
+                this.passInfo = 1;
+                this.talk.SayExact(1, "No moves for you -- you pass!", now, 2600);
+            }
+            if (mover == 2) { this.aiPending = true; this.aiMoveAt = now + 460; }
+            return;
+        }
+        this.EndGame(now);
+    }
+
+    void HumanMove(int at, int now) {
+        int before = this.whiteCount;
+        this.DoMove(at, 1, now);
+        int capt = before - this.whiteCount;
+        if (at == 0 || at == 7 || at == 56 || at == 63) {
+            this.talk.Say(3, now, 2600);
+        } else if (capt >= 4) {
+            this.talk.SayExact(0, "Huge swing -- " + capt + " flipped!", now, 2200);
+        } else if (this.rng.Range(0, 100) < 40) {
+            this.talk.Say(0, now, 1800);
+        }
+        this.Advance(1, now);
+    }
+
+    void AiMove(int now) {
+        this.aiPending = false;
+        int before = this.blackCount;
+        int at = Ai.BestMove(this.board, this.Depth(), this.Rand(), this.rng);
+        if (at < 0) { this.Advance(2, now); return; }
+        this.DoMove(at, 2, now);
+        int capt = before - this.blackCount;
+        if (at == 0 || at == 7 || at == 56 || at == 63) {
+            this.talk.SayExact(1, "The AI seizes a corner!", now, 2400);
+        } else if (capt >= 4) {
+            this.talk.SayExact(1, "The AI flips " + capt + " of yours!", now, 2200);
+        }
+        this.Advance(2, now);
+    }
+
+    void EndGame(int now) {
+        this.Recount();
+        int who = 3;
+        if (this.blackCount > this.whiteCount) { who = 1; }
+        else if (this.whiteCount > this.blackCount) { who = 2; }
+        this.winner = who;
+        this.scene = 2;
+        this.aiPending = false;
+        this.prof.games = this.prof.games + 1;
+        int delta = 0;
+        if (who == 1) {
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.best) { this.prof.best = this.prof.streak; }
+            delta = 18 + this.prof.level * 8;
+            int bonus = this.prof.streak;
+            if (bonus > 5) { bonus = 5; }
+            delta = delta + bonus * 3;
+            this.prof.rank = this.prof.rank + delta;
+            this.winAdj = this.winAdj + 1;
+            this.lossAdj = 0;
+            if (this.prof.streak >= 3) {
+                this.talk.SayExact(3, "WIN STREAK x" + this.prof.streak + "! Unstoppable!", now, 4000);
+            } else {
+                this.talk.SayExact(0, "You win! Rank +" + delta, now, 4000);
+            }
+            if (this.prof.adaptive == 1 && this.winAdj >= 2 && this.prof.level < 3) {
+                this.prof.level = this.prof.level + 1;
+                this.winAdj = 0;
+                this.talk.SayExact(3, "The AI levels up. Prove yourself!", now, 4000);
+            }
+        } else if (who == 2) {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            delta = 14 - this.prof.level * 2;
+            if (delta < 6) { delta = 6; }
+            this.prof.rank = this.prof.rank - delta;
+            if (this.prof.rank < 100) { this.prof.rank = 100; }
+            delta = -delta;
+            this.lossAdj = this.lossAdj + 1;
+            this.winAdj = 0;
+            this.talk.SayExact(1, "The AI takes it. Rematch?", now, 4000);
+            if (this.prof.adaptive == 1 && this.lossAdj >= 2 && this.prof.level > 0) {
+                this.prof.level = this.prof.level - 1;
+                this.lossAdj = 0;
+                this.talk.SayExact(0, "AI eases off a touch. You got this.", now, 4000);
+            }
+        } else {
+            this.prof.draws = this.prof.draws + 1;
+            this.talk.SayExact(2, "A dead heat -- 32 to 32!", now, 4000);
+        }
+        this.scoreDelta = delta;
+        this.prof.Save();
+    }
+
+    // Board cell under a pixel, or -1 if outside the board.
+    int PickCell(int px, int py) {
+        if (px < 48 || px >= 752 || py < 48 || py >= 752) { return -1; }
+        int c = (px - 48) / 88;
+        int r = (py - 48) / 88;
+        if (c < 0 || c > 7 || r < 0 || r > 7) { return -1; }
+        return r * 8 + c;
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawDisc(int cx, int cy, int rx, int ry, bool white, int alpha) {
+        if (rx < 1) { rx = 1; }
+        if (ry < 1) { ry = 1; }
+        // drop shadow
+        Draw.FillEllipse(this.r, cx + 2, cy + 4, rx, ry, 0, 0, 0, alpha * 60 / 255);
+        int br; int bg; int bb;
+        if (white) { br = 236; bg = 238; bb = 244; }
+        else { br = 26; bg = 28; bb = 36; }
+        // dark rim
+        Draw.FillEllipse(this.r, cx, cy, rx, ry, 8, 10, 16, alpha);
+        int irx = rx - 2; int iry = ry - 2;
+        if (irx < 1) { irx = 1; }
+        if (iry < 1) { iry = 1; }
+        Draw.FillEllipse(this.r, cx, cy, irx, iry, br, bg, bb, alpha);
+        // bottom shade for a rounded read
+        int sr; int sg; int sb;
+        if (white) { sr = 176; sg = 182; sb = 196; }
+        else { sr = 6; sg = 8; sb = 12; }
+        Draw.FillEllipse(this.r, cx, cy + iry / 3, irx * 3 / 4, iry / 2, sr, sg, sb, alpha * 130 / 255);
+        // top sheen
+        int hr; int hg; int hb;
+        if (white) { hr = 255; hg = 255; hb = 255; }
+        else { hr = 96; hg = 100; hb = 116; }
+        Draw.FillEllipse(this.r, cx - irx / 4, cy - iry / 3, irx / 3, iry / 4,
+                         hr, hg, hb, alpha * 170 / 255);
+    }
+
+    void DrawCellDisc(int idx, int now) {
+        int owner = this.board[idx];
+        if (owner == 0) { return; }
+        int cx = ReversiGame.GX(idx % 8);
+        int cy = ReversiGame.GY(idx / 8);
+        int rad = 36;
+        int dt = now - this.flipAt[idx];
+        int prev = this.prevOwner[idx];
+        if (prev == 0) {
+            // freshly placed disc: scale in.
+            int dur = 170;
+            if (dt < dur) {
+                int s = rad * dt / dur;
+                if (s < 3) { s = 3; }
+                this.DrawDisc(cx, cy, s, s, owner == 2, 255);
+                return;
+            }
+            this.DrawDisc(cx, cy, rad, rad, owner == 2, 255);
+            return;
+        }
+        // flip: coin-flip squish, swap face at the midpoint.
+        int fdur = 280;
+        if (dt < fdur) {
+            int prog = dt * 100 / fdur;           // 0..100
+            int squish = 100 - 2 * prog;          // 100 -> 0 -> -100
+            if (squish < 0) { squish = -squish; }
+            int rx = rad * squish / 100;
+            if (rx < 2) { rx = 2; }
+            bool showWhite = (prev == 2);
+            if (prog >= 50) { showWhite = (owner == 2); }
+            this.DrawDisc(cx, cy, rx, rad, showWhite, 255);
+            return;
+        }
+        this.DrawDisc(cx, cy, rad, rad, owner == 2, 255);
+    }
+
+    void DrawBoard(int now) {
+        // felt board with a raised frame.
+        Draw.RoundRectFill(this.r, 40, 40, 720, 720, 18, 22, 46, 32, 255);
+        this.r.SetColor(30, 110, 74, 255);
+        this.r.FillRect(48, 48, 704, 704);
+        // subtle checker tint
+        int rr = 0;
+        while (rr < 8) {
+            int c = 0;
+            while (c < 8) {
+                if (((rr + c) & 1) == 0) {
+                    this.r.SetColor(34, 120, 82, 255);
+                    this.r.FillRect(48 + c * 88, 48 + rr * 88, 88, 88);
+                }
+                c = c + 1;
+            }
+            rr = rr + 1;
+        }
+        // grid lines
+        this.r.SetColor(16, 66, 44, 255);
+        int i = 0;
+        while (i <= 8) {
+            this.r.FillRect(48 + i * 88, 48, 2, 704);
+            this.r.FillRect(48, 48 + i * 88, 704, 2);
+            i = i + 1;
+        }
+        // guide dots at the classic star points
+        Draw.FillCircle(this.r, 48 + 2 * 88, 48 + 2 * 88, 5, 16, 66, 44, 255);
+        Draw.FillCircle(this.r, 48 + 6 * 88, 48 + 2 * 88, 5, 16, 66, 44, 255);
+        Draw.FillCircle(this.r, 48 + 2 * 88, 48 + 6 * 88, 5, 16, 66, 44, 255);
+        Draw.FillCircle(this.r, 48 + 6 * 88, 48 + 6 * 88, 5, 16, 66, 44, 255);
+
+        // legal-move hints + hover ghost for the human.
+        if (this.scene == 1 && this.turn == 1) {
+            int hover = this.PickCell(this.mouseX, this.mouseY);
+            int at = 0;
+            while (at < 64) {
+                if (this.board[at] == 0 && Ai.Legal(this.board, at, 1)) {
+                    int cx = ReversiGame.GX(at % 8);
+                    int cy = ReversiGame.GY(at / 8);
+                    if (at == hover) {
+                        this.DrawDisc(cx, cy, 34, 34, false, 110);
+                    } else {
+                        int pulse = (now % 900) - 450;
+                        if (pulse < 0) { pulse = -pulse; }
+                        Draw.FillCircle(this.r, cx, cy, 9, 250, 240, 180, 70 + pulse / 6);
+                    }
+                }
+                at = at + 1;
+            }
+        }
+
+        // discs
+        i = 0;
+        while (i < 64) { this.DrawCellDisc(i, now); i = i + 1; }
+
+        // last-move marker
+        if (this.lastMove >= 0 && this.board[this.lastMove] != 0) {
+            int cx = ReversiGame.GX(this.lastMove % 8);
+            int cy = ReversiGame.GY(this.lastMove / 8);
+            Draw.RingRect(this.r, cx - 40, cy - 40, 80, 80, 3, 236, 82, 66, 255);
+        }
+    }
+
+    bool Button(int x, int y, int w, int h, string label, int scale, bool selected, bool accent) {
+        int kind = 0;
+        if (selected) { kind = 2; }
+        else if (accent) { kind = 1; }
+        return Ui.Button(this.r, this.mouseX, this.mouseY, x, y, w, h, label, scale, kind);
+    }
+
+    void DrawScore(int px, int py) {
+        // black tally
+        this.DrawDisc(px + 26, py + 26, 24, 24, false, 255);
+        Text.Draw(this.r, "" + this.blackCount, px + 62, py + 8, 5, 235, 238, 244, 255);
+        Text.Draw(this.r, "YOU", px + 62, py + 52, 2, 150, 160, 180, 255);
+        // white tally
+        int wx = px + 230;
+        this.DrawDisc(wx + 26, py + 26, 24, 24, true, 255);
+        Text.Draw(this.r, "" + this.whiteCount, wx + 62, py + 8, 5, 235, 238, 244, 255);
+        Text.Draw(this.r, "AI", wx + 62, py + 52, 2, 150, 160, 180, 255);
+    }
+
+    void DrawPanelStats(int px, int py) {
+        Text.Draw(this.r, "RANK", px, py, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, this.prof.TierName() + "  " + this.prof.rank, px, py + 22, 3, 255, 210, 90, 255);
+        Text.Draw(this.r, "STREAK  " + this.prof.streak + "   BEST  " + this.prof.best, px, py + 66, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, "RECORD  " + this.prof.wins + "W  " + this.prof.losses + "L  " + this.prof.draws + "D", px, py + 92, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, px, py + 118, 2, 150, 160, 180, 255);
+    }
+
+    void DrawTalk(int px, int py, int w, int now) {
+        string msg = this.talk.Current(now);
+        if (msg.Length == 0) { return; }
+        int kind = this.talk.Kind();
+        int cr = 90; int cg = 150; int cb = 220;
+        if (kind == 0) { cr = 90; cg = 200; cb = 130; }
+        if (kind == 1) { cr = 230; cg = 130; cb = 90; }
+        if (kind == 3) { cr = 250; cg = 200; cb = 70; }
+        this.r.SetColor(28, 32, 42, 235);
+        this.r.FillRect(px, py, w, 46);
+        Draw.RingRect(this.r, px, py, w, 46, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, msg, px + 14, py + 16, 2, cr, cg, cb, 255);
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(20, 24, 32);
+        this.DrawBoard(now);
+
+        int px = 792;
+        Text.Draw(this.r, "REVERSI", px, 54, 6, 240, 240, 250, 255);
+        Text.Draw(this.r, "OTHELLO", px, 104, 2, 150, 160, 180, 255);
+
+        this.DrawScore(px, 146);
+
+        string status = "";
+        int sr = 120; int sg = 200; int sb = 140;
+        if (this.turn == 1) {
+            status = "YOUR TURN (BLACK)";
+            if (this.passInfo == 2) { status = "AI PASSED - YOUR TURN"; }
+        } else {
+            int dots = (now / 300) % 4;
+            status = "AI THINKING";
+            int d = 0;
+            while (d < dots) { status = status + "."; d = d + 1; }
+            sr = 230; sg = 180; sb = 90;
+            if (this.passInfo == 1) { status = "YOU PASSED - AI MOVES"; }
+        }
+        this.r.SetColor(30, 36, 48, 255);
+        this.r.FillRect(px, 236, 440, 44);
+        Text.Draw(this.r, status, px + 12, 250, 2, sr, sg, sb, 255);
+
+        Text.Draw(this.r, "DIFFICULTY  " + this.LevelName(), px, 300, 2, 180, 190, 210, 255);
+
+        this.DrawPanelStats(px, 344);
+        this.DrawTalk(px, 500, 440, now);
+
+        this.Button(812, 686, 180, 54, "RESTART (R)", 2, false, false);
+        this.Button(1010, 686, 180, 54, "MENU (ESC)", 2, false, false);
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/reversi/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(18, 22, 30);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+
+        Text.DrawCenteredShadow(this.r, "REVERSI", 640, 72, 10, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "OTHELLO -- FLIP TO WIN", 640, 176, 3, 240, 208, 130, 3);
+
+        Ui.Panel(this.r, 300, 250, 680, 470, 20, 24, 34, 212);
+
+        Text.DrawCenteredShadow(this.r, "SELECT DIFFICULTY", 640, 278, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 4) {
+            string nm = "EASY";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            if (i == 3) { nm = "EXPERT"; }
+            int kind = 0;
+            if (this.prof.level == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 330 + i * 156, 310, 140, 54, nm, 2, kind);
+            i = i + 1;
+        }
+
+        string adv = "ADAPTIVE: OFF";
+        if (this.prof.adaptive == 1) { adv = "ADAPTIVE: ON"; }
+        int akind = 0;
+        if (this.prof.adaptive == 1) { akind = 1; }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 330, 382, 250, 46, adv, 2, akind);
+        Text.Draw(this.r, "AI scales to your skill", 600, 396, 2, 150, 160, 178, 255);
+
+        Ui.Panel(this.r, 330, 448, 620, 128, 14, 18, 26, 200);
+        Text.Draw(this.r, "RANK", 354, 466, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.TierName() + "  " + this.prof.rank, 354, 488, 4, 255, 210, 90, 2);
+        Text.Draw(this.r, "BEST STREAK  " + this.prof.best, 354, 540, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.wins + "W - " + this.prof.losses + "L", 720, 488, 3, 205, 214, 232, 2);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, 720, 540, 2, 150, 160, 180, 255);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 632, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "You play Black and move first.   1-4 difficulty   ENTER play   F11 fullscreen", 640, 742, 2, 176, 184, 200, 2);
+
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 170);
+        this.r.FillRect(0, 0, 1280, 800);
+
+        int bx = 320; int by = 240; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+
+        string title = "DRAW";
+        int tr = 200; int tg = 200; int tb = 210;
+        if (this.winner == 1) { title = "YOU WIN!"; tr = 90; tg = 210; tb = 130; }
+        if (this.winner == 2) { title = "AI WINS"; tr = 230; tg = 120; tb = 90; }
+        Text.DrawCentered(this.r, title, 640, by + 34, 7, tr, tg, tb, 255);
+
+        Text.DrawCentered(this.r, "BLACK " + this.blackCount + "   -   " + this.whiteCount + " WHITE",
+                          640, by + 108, 3, 235, 238, 244, 255);
+
+        if (this.winner == 1 || this.winner == 2) {
+            string ds = "RANK " + this.scoreDelta;
+            if (this.scoreDelta > 0) { ds = "RANK +" + this.scoreDelta; }
+            Text.DrawCentered(this.r, ds, 640, by + 152, 3, 255, 210, 90, 255);
+        }
+        Text.DrawCentered(this.r, this.prof.TierName() + "  " + this.prof.rank + "    STREAK " + this.prof.streak,
+                          640, by + 190, 2, 170, 180, 200, 255);
+
+        this.Button(400, by + 232, 220, 66, "PLAY AGAIN", 3, false, true);
+        this.Button(660, by + 232, 200, 66, "MENU", 3, false, false);
+
+        this.host.End();
+    }
+
+    // ----- input / flow ------------------------------------------------------
+
+    void StartGame(int now) {
+        this.ResetBoard();
+        this.scene = 1;
+        this.talk.SayExact(2, "Black to move -- good luck!", now, 2500);
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) {
+            if (this.scene == 0) { this.host.Quit(); }
+            else { this.scene = 0; }
+        }
+        if (sc == 21) {
+            if (this.scene != 0) { this.StartGame(now); }
+        }
+        if (this.scene == 0) {
+            if (sc == 30) { this.prof.level = 0; }
+            if (sc == 31) { this.prof.level = 1; }
+            if (sc == 32) { this.prof.level = 2; }
+            if (sc == 33) { this.prof.level = 3; }
+            if (sc == 40 || sc == 44) { this.StartGame(now); }
+        }
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 4) {
+                if (Draw.PointIn(cx, cy, 330 + i * 156, 310, 140, 54)) { this.prof.level = i; }
+                i = i + 1;
+            }
+            if (Draw.PointIn(cx, cy, 330, 382, 250, 46)) { this.prof.adaptive = 1 - this.prof.adaptive; }
+            if (Draw.PointIn(cx, cy, 470, 632, 340, 74)) { this.StartGame(now); }
+        } else if (this.scene == 1) {
+            if (Draw.PointIn(cx, cy, 812, 686, 180, 54)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 1010, 686, 180, 54)) { this.scene = 0; return; }
+            if (this.turn == 1 && !this.aiPending) {
+                int idx = this.PickCell(cx, cy);
+                if (idx >= 0 && this.board[idx] == 0 && Ai.Legal(this.board, idx, 1)) {
+                    this.HumanMove(idx, now);
+                }
+            }
+        } else {
+            if (Draw.PointIn(cx, cy, 400, 472, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 472, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    void Tick(int now) {
+        if (this.demo) {
+            if (this.scene == 2 && now >= this.demoAt) {
+                this.StartGame(now);
+                this.demoAt = now + 800;
+                return;
+            }
+            if (this.scene == 1 && this.turn == 1 && !this.aiPending && now >= this.demoAt) {
+                int idx = Ai.BlackMove(this.board, 3);
+                if (idx >= 0) { this.HumanMove(idx, now); }
+                this.demoAt = now + 550;
+            }
+        }
+        if (this.scene == 1 && this.turn == 2 && this.aiPending && now >= this.aiMoveAt) {
+            this.AiMove(now);
+            if (this.demo) { this.demoAt = now + 350; }
+        }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 1) { this.DrawPlay(now); }
+        else { this.DrawOver(now); }
+    }
+}
+
+class ReversiApp {
+    static void Main() {
+        Host h = Host.Create("Reversi - Othello", 1280, 800);
+        ReversiGame g = ReversiGame.Create(h);
+
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) {
+                        int sc = SdlEvent.Scancode();
+                        if (sc == 68) { h.ToggleFullscreen(); }
+                        else { g.OnKey(sc, now); }
+                    }
+                }
+                if (ty == SdlEventType.MouseMotion()) {
+                    g.mouseX = h.MouseX();
+                    g.mouseY = h.MouseY();
+                }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX();
+                        cy = h.MouseY();
+                        g.mouseX = cx;
+                        g.mouseY = cy;
+                        clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}

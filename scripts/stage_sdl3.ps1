@@ -63,7 +63,7 @@ Write-Output "Building zan_sdl3 bridge..."
     -std=c11 -O2 -Wall -Wextra -Werror=implicit-function-declaration -shared `
     "-I$includeDir" `
     $source `
-    "-L$libraryDir" -lSDL3 `
+    "-L$libraryDir" "-l:libSDL3.dll.a" `
     "-Wl,--out-implib,$bridgeImport" `
     -static-libgcc `
     -o $bridgeDll

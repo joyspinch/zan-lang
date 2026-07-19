@@ -11,6 +11,11 @@ extern "C" {
  * function pointer). Returns 1 on success, 0 on failure. */
 int64_t zan_thread_start(void *body);
 
+/* `lock (obj)` statement monitor: process-wide recursive mutex (coarser than
+ * C#'s per-object monitor; the object argument is currently unused). */
+void zan_monitor_enter(void *obj);
+void zan_monitor_exit(void *obj);
+
 /* UI-thread dispatch queue: post a delegate from any thread, drain on the UI
  * thread. */
 void zan_dispatch_init(void);
@@ -49,6 +54,10 @@ int64_t zan_shared_table_delete(int64_t handle, const char *key);
 int64_t zan_shared_table_exists(int64_t handle, const char *key);
 int64_t zan_shared_table_count(int64_t handle);
 void zan_shared_table_clear(int64_t handle);
+
+/* filesystem helpers for the compiler driver */
+long long zan_exe_dir_into(char *out, long long cap);
+long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 
 #ifdef __cplusplus
 }

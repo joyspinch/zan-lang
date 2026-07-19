@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#include "stb_image.h"
+
 #if defined(_WIN32)
 #define ZAN_SDL_API __declspec(dllexport)
 #else
@@ -127,6 +132,38 @@ ZAN_SDL_API zan_i64 zan_sdl_set_logical_size(
         (SDL_RendererLogicalPresentation)mode));
 }
 
+ZAN_SDL_API double zan_sdl_window_to_render_x(
+    zan_i64 renderer, double window_x, double window_y) {
+    if (!renderer) return window_x;
+    float x = (float)window_x;
+    float y = (float)window_y;
+    if (!SDL_RenderCoordinatesFromWindow(
+            (SDL_Renderer *)zan_ptr(renderer),
+            (float)window_x,
+            (float)window_y,
+            &x,
+            &y)) {
+        return window_x;
+    }
+    return (double)x;
+}
+
+ZAN_SDL_API double zan_sdl_window_to_render_y(
+    zan_i64 renderer, double window_x, double window_y) {
+    if (!renderer) return window_y;
+    float x = (float)window_x;
+    float y = (float)window_y;
+    if (!SDL_RenderCoordinatesFromWindow(
+            (SDL_Renderer *)zan_ptr(renderer),
+            (float)window_x,
+            (float)window_y,
+            &x,
+            &y)) {
+        return window_y;
+    }
+    return (double)y;
+}
+
 ZAN_SDL_API zan_i64 zan_sdl_set_draw_color(
     zan_i64 renderer, zan_i64 red, zan_i64 green, zan_i64 blue, zan_i64 alpha) {
     if (!renderer) return 0;
@@ -218,6 +255,59 @@ ZAN_SDL_API zan_i64 zan_sdl_load_bmp_texture(zan_i64 renderer, const char *path)
     SDL_Texture *texture = SDL_CreateTextureFromSurface(
         (SDL_Renderer *)zan_ptr(renderer), surface);
     SDL_DestroySurface(surface);
+    return zan_handle(texture);
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_load_bmp_texture_colorkey(
+    zan_i64 renderer,
+    const char *path,
+    zan_i64 red,
+    zan_i64 green,
+    zan_i64 blue) {
+    if (!renderer || !path) return 0;
+    SDL_Surface *surface = SDL_LoadBMP(path);
+    if (!surface) return 0;
+    Uint32 key = SDL_MapSurfaceRGB(
+        surface, (Uint8)red, (Uint8)green, (Uint8)blue);
+    if (!SDL_SetSurfaceColorKey(surface, true, key)) {
+        SDL_DestroySurface(surface);
+        return 0;
+    }
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(
+        (SDL_Renderer *)zan_ptr(renderer), surface);
+    if (texture) SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+    SDL_DestroySurface(surface);
+    return zan_handle(texture);
+}
+
+ZAN_SDL_API zan_i64 zan_sdl_load_image_texture(
+    zan_i64 renderer,
+    const char *path) {
+    if (!renderer || !path) return 0;
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc *pixels = stbi_load(path, &width, &height, &channels, 4);
+    if (!pixels) {
+        const char *reason = stbi_failure_reason();
+        SDL_SetError("Unable to decode image '%s': %s",
+                     path, reason ? reason : "unknown decoder error");
+        return 0;
+    }
+    SDL_Surface *surface = SDL_CreateSurfaceFrom(
+        width, height, SDL_PIXELFORMAT_RGBA32, pixels, width * 4);
+    if (!surface) {
+        stbi_image_free(pixels);
+        return 0;
+    }
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(
+        (SDL_Renderer *)zan_ptr(renderer), surface);
+    if (texture) {
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+    }
+    SDL_DestroySurface(surface);
+    stbi_image_free(pixels);
     return zan_handle(texture);
 }
 
@@ -750,6 +840,25 @@ ZAN_SDL_API zan_i64 zan_gpu_load_bmp(zan_i64 handle, const char *path) {
     }
     SDL_DestroySurface(rgba);
     return zan_gpu_wrap(tex, tw, th);
+}
+
+/* Load PNG, JPEG and other stb_image formats as an RGBA sampler texture. */
+ZAN_SDL_API zan_i64 zan_gpu_load_image(zan_i64 handle, const char *path) {
+    ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
+    if (!ctx || !path) return 0;
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc *pixels = stbi_load(path, &width, &height, &channels, 4);
+    if (!pixels) {
+        const char *reason = stbi_failure_reason();
+        SDL_SetError("Unable to decode image '%s': %s",
+                     path, reason ? reason : "unknown decoder error");
+        return 0;
+    }
+    SDL_GPUTexture *texture = zan_gpu_make_texture(ctx, width, height, pixels);
+    stbi_image_free(pixels);
+    return zan_gpu_wrap(texture, width, height);
 }
 
 ZAN_SDL_API void zan_gpu_free_texture(zan_i64 handle, zan_i64 texture) {

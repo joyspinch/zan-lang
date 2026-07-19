@@ -32,6 +32,10 @@ typedef enum {
     TYPE_SHORT,
     TYPE_INT,
     TYPE_LONG,
+    TYPE_SBYTE,
+    TYPE_USHORT,
+    TYPE_UINT,
+    TYPE_ULONG,
     TYPE_FLOAT,
     TYPE_DOUBLE,
     TYPE_CHAR,
@@ -104,6 +108,10 @@ struct zan_binder {
     zan_type_t *type_short;
     zan_type_t *type_int;
     zan_type_t *type_long;
+    zan_type_t *type_sbyte;
+    zan_type_t *type_ushort;
+    zan_type_t *type_uint;
+    zan_type_t *type_ulong;
     zan_type_t *type_float;
     zan_type_t *type_double;
     zan_type_t *type_char;
@@ -117,6 +125,10 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag);
 void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit);
 
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
+
+/* Construct a List<elem> instantiation type (used by query-expression
+ * lowering, which has no syntactic type reference to resolve). */
+zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
 
 #endif /* ZAN_BINDER_H */

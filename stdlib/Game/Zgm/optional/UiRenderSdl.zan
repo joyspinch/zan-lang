@@ -1,0 +1,116 @@
+// SDL3 / GPU backend for the Zgm UI renderer.
+//
+// This file is compiled in ONLY when building with -DUI_GPU, and is passed
+// explicitly on the zanc command line (see build/ui_build.ps1). It lives outside
+// the auto-globbed stdlib/Game/Zgm directory precisely so that --auto-stdlib's
+// raw `using ...;` text scan never sees `using SDL3;` in a non-GPU build; that is
+// what keeps software / headless binaries free of any SDL3 dependency.
+//
+// namespace Game.Zgm (same as IUiRenderer) so UiBackendFactory can name
+// SdlUiRenderer directly without a `using` that would leak into the scan.
+using System;
+using System.Collections.Generic;
+using SDL3;
+
+namespace Game.Zgm;
+
+class SdlUiRenderer : IUiRenderer {
+    SdlWindow window;
+    SdlRenderer renderer;
+    SdlTexture spriteTex;
+    // Sprite texture cache: parallel lists keyed by resource id (Dictionary
+    // string-key indexing is unavailable in the current compiler). Distinct
+    // images are decoded once via SdlTexture.LoadImage and reused every frame.
+    List<string> texKeys;
+    List<SdlTexture> texVals;
+    long metric;
+
+    static SdlUiRenderer Create(int width, int height) {
+        SdlUiRenderer self = new SdlUiRenderer();
+        Sdl.Init(SdlInit.Video());
+        self.window = SdlWindow.Create(
+            "Zgm UI", width, height, SdlWindowFlags.Hidden());
+        self.renderer = SdlRenderer.Create(self.window);
+        self.spriteTex = SdlTexture.CreateTarget(self.renderer, 64, 64);
+        self.texKeys = new List<string>();
+        self.texVals = new List<SdlTexture>();
+        self.metric = 0;
+        return self;
+    }
+
+    // Returns the cached texture for an image id, decoding and caching it on
+    // first use. A failed decode caches null so we do not retry every frame.
+    SdlTexture TextureFor(string image) {
+        int i = 0;
+        while (i < this.texKeys.Count) {
+            if (this.texKeys[i] == image) { return this.texVals[i]; }
+            i = i + 1;
+        }
+        SdlTexture tex = SdlTexture.LoadImage(this.renderer, image);
+        if (tex != null && !tex.IsValid()) { tex = null; }
+        if (tex != null) { tex.SetBlendMode(1); }
+        this.texKeys.Add(image);
+        this.texVals.Add(tex);
+        return tex;
+    }
+    string BackendName() { return "sdl-gpu"; }
+    bool GpuAccelerated() { return true; }
+    void BeginFrame(int r, int g, int b) {
+        this.renderer.SetColor(r, g, b, 255);
+        this.renderer.Clear();
+    }
+    void PushClip(int x, int y, int w, int h) {
+        this.renderer.SetClip(x, y, w, h);
+    }
+    void PopClip() { this.renderer.ResetClip(); }
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a) {
+        this.renderer.SetColor(r, g, b, a);
+        this.renderer.FillRect(x, y, w, h);
+        this.metric = this.metric + (long)(x + y + w + h + r + g + b + a);
+    }
+    void DrawBorder(int x, int y, int w, int h, int t, int r, int g, int b, int a) {
+        this.renderer.SetColor(r, g, b, a);
+        this.renderer.DrawRect(x, y, w, h);
+        this.metric = this.metric + (long)(x + y + w + h + t);
+    }
+    // Rasterizes real glyphs from the shared PixelFont set: each set bit paints
+    // one filled cell, so text is drawn at the requested tint instead of a bar.
+    void DrawText(string text, int x, int y, int r, int g, int b, int a) {
+        if (text == null) { return; }
+        this.renderer.SetColor(r, g, b, a);
+        int cx = x;
+        int i = 0;
+        while (i < text.Length) {
+            int cp = text[i] & 255;
+            int ry = 0;
+            while (ry < 8) {
+                int mask = PixelFont.Row(cp, ry);
+                int rx = 0;
+                while (rx < 8) {
+                    if ((mask & (1 << (7 - rx))) != 0) {
+                        this.renderer.FillRect(cx + rx, y + ry, 1, 1);
+                    }
+                    rx = rx + 1;
+                }
+                ry = ry + 1;
+            }
+            cx = cx + PixelFont.Advance();
+            i = i + 1;
+        }
+        this.metric = this.metric + (long)(text.Length + x + y);
+    }
+    // Blits the cached decoded texture for the resource id (with rotation and
+    // opacity). Missing/failed images fall back to the neutral target texture.
+    void DrawSprite(string image, int x, int y, int w, int h, int angle, int alpha) {
+        SdlTexture tex = this.spriteTex;
+        if (image != null && image.Length > 0) {
+            SdlTexture cached = this.TextureFor(image);
+            if (cached != null) { tex = cached; }
+        }
+        tex.SetOpacity(alpha);
+        this.renderer.DrawTextureRotated(tex, x, y, w, h, angle);
+        this.metric = this.metric + (long)(x + y + w + h + angle + alpha);
+    }
+    void EndFrame() { this.renderer.Present(); }
+    long Metric() { return this.metric; }
+}

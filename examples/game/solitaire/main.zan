@@ -1,0 +1,666 @@
+// Solitaire (Klondike) -- a complete single-player product on GameKit.
+// Stock/waste, four foundations, seven tableau columns, alternating-color
+// build-downs, foundation build-ups, King-to-empty, multi-card run moves,
+// double-click auto-to-foundation, an auto-finish helper, move/time tracking,
+// and a persistent wins / best-moves profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Solitaire;
+
+class Profile {
+    int wins;
+    int games;
+    int best;      // fewest moves in a win
+    int streak;
+    int bestStreak;
+
+    static string Path() { return "solitaire_save.txt"; }
+
+    static int ParseInt(string s, int start) {
+        int i = start;
+        int sign = 1;
+        if (i < s.Length && s[i] == 45) { sign = -1; i = i + 1; }
+        int v = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v * sign;
+    }
+
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            int eq = -1;
+            int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static Profile Load() {
+        Profile p = new Profile();
+        p.wins = 0; p.games = 0; p.best = 0; p.streak = 0; p.bestStreak = 0;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.wins = Profile.ReadKey(lines, "wins", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+            p.best = Profile.ReadKey(lines, "best", 0);
+            p.streak = Profile.ReadKey(lines, "streak", 0);
+            p.bestStreak = Profile.ReadKey(lines, "bestStreak", 0);
+        }
+        return p;
+    }
+
+    void Save() {
+        string s = "";
+        s = s + "wins=" + this.wins + "\n";
+        s = s + "games=" + this.games + "\n";
+        s = s + "best=" + this.best + "\n";
+        s = s + "streak=" + this.streak + "\n";
+        s = s + "bestStreak=" + this.bestStreak + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+}
+
+// Card 0..51: rank = card % 13 (0=A..12=K), suit = card / 13
+// (0 hearts, 1 diamonds, 2 clubs, 3 spades).
+class Card {
+    static int Rank(int c) { return c % 13; }
+    static int Suit(int c) { return c / 13; }
+    static bool Red(int c) { int s = c / 13; return s == 0 || s == 1; }
+    static string RankStr(int c) {
+        int r = c % 13;
+        if (r == 0) { return "A"; }
+        if (r == 9) { return "10"; }
+        if (r == 10) { return "J"; }
+        if (r == 11) { return "Q"; }
+        if (r == 12) { return "K"; }
+        return "" + (r + 1);
+    }
+    static string SuitStr(int c) {
+        int s = c / 13;
+        if (s == 0) { return "H"; }
+        if (s == 1) { return "D"; }
+        if (s == 2) { return "C"; }
+        return "S";
+    }
+}
+
+class SolGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    int[] stock;
+    int sn;
+    int[] waste;
+    int wn;
+    int[] found;      // 4 * 13
+    int[] fn;         // 4
+    int[] tab;        // 7 * 24
+    int[] tn;         // 7
+    int[] fd;         // face-down count per column
+    int scene;
+    int moves;
+    int startTime;
+    int endTime;
+    bool won;
+    int selType;      // 0 none, 1 waste, 2 tableau
+    int selCol;
+    int selIdx;
+    int lastClickAt;
+    int lastClickType;
+    int lastClickCol;
+    int lastClickIdx;
+    int mouseX;
+    int mouseY;
+    string msg;
+    int msgAt;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+    int demoAt;
+
+    static int CW() { return 88; }
+    static int CH() { return 122; }
+    static int TABX() { return 60; }
+    static int TABY() { return 250; }
+    static int COLSP() { return 108; }
+    static int FANUP() { return 30; }
+    static int FANDN() { return 14; }
+
+    static SolGame Create(Host h) {
+        SolGame g = new SolGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 761234598);
+        g.stock = new int[52];
+        g.waste = new int[52];
+        g.found = new int[52];
+        g.fn = new int[4];
+        g.tab = new int[7 * 24];
+        g.tn = new int[7];
+        g.fd = new int[7];
+        g.scene = 0;
+        g.msg = "";
+        g.demo = File.Exists("solitaire_demo.txt");
+        if (g.demo) { g.NewGame(Sdl.Ticks()); g.demoAt = Sdl.Ticks() + 500; }
+        return g;
+    }
+
+    void NewGame(int now) {
+        int[] deck = new int[52];
+        int i = 0;
+        while (i < 52) { deck[i] = i; i = i + 1; }
+        i = 51;
+        while (i > 0) {
+            int j = this.rng.Range(0, i + 1);
+            int t = deck[i]; deck[i] = deck[j]; deck[j] = t;
+            i = i - 1;
+        }
+        int idx = 0;
+        int col = 0;
+        while (col < 7) {
+            int k = 0;
+            while (k <= col) { this.tab[col * 24 + k] = deck[idx]; idx = idx + 1; k = k + 1; }
+            this.tn[col] = col + 1;
+            this.fd[col] = col;   // last card face up
+            col = col + 1;
+        }
+        this.sn = 0;
+        while (idx < 52) { this.stock[this.sn] = deck[idx]; this.sn = this.sn + 1; idx = idx + 1; }
+        this.wn = 0;
+        i = 0;
+        while (i < 4) { this.fn[i] = 0; i = i + 1; }
+        this.scene = 1;
+        this.moves = 0;
+        this.won = false;
+        this.selType = 0;
+        this.startTime = now;
+        this.endTime = 0;
+        this.msg = "Build the four foundations Ace to King!";
+        this.msgAt = now + 3000;
+    }
+
+    void Flash(string m, int now) { this.msg = m; this.msgAt = now + 1600; }
+
+    void DrawStock(int now) {
+        // move stock top to waste; recycle if empty
+        if (this.sn == 0) {
+            if (this.wn == 0) { return; }
+            int i = this.wn - 1;
+            while (i >= 0) { this.stock[this.sn] = this.waste[i]; this.sn = this.sn + 1; i = i - 1; }
+            this.wn = 0;
+        } else {
+            this.waste[this.wn] = this.stock[this.sn - 1];
+            this.wn = this.wn + 1;
+            this.sn = this.sn - 1;
+        }
+        this.selType = 0;
+        this.moves = this.moves + 1;
+    }
+
+    bool CanToFoundation(int card, int slot) {
+        if (Card.Suit(card) != slot) { return false; }
+        return Card.Rank(card) == this.fn[slot];
+    }
+
+    bool CanToTableau(int card, int col) {
+        if (this.tn[col] == 0) { return Card.Rank(card) == 12; }
+        int top = this.tab[col * 24 + this.tn[col] - 1];
+        if (Card.Red(card) == Card.Red(top)) { return false; }
+        return Card.Rank(card) == Card.Rank(top) - 1;
+    }
+
+    void AfterRemove(int col) {
+        if (this.tn[col] > 0 && this.fd[col] >= this.tn[col]) { this.fd[col] = this.tn[col] - 1; }
+        if (this.tn[col] == 0) { this.fd[col] = 0; }
+    }
+
+    void CheckWin(int now) {
+        int tot = this.fn[0] + this.fn[1] + this.fn[2] + this.fn[3];
+        if (tot == 52) {
+            this.won = true;
+            this.scene = 2;
+            this.endTime = now;
+            this.prof.games = this.prof.games + 1;
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.bestStreak) { this.prof.bestStreak = this.prof.streak; }
+            if (this.prof.best == 0 || this.moves < this.prof.best) { this.prof.best = this.moves; }
+            this.prof.Save();
+        }
+    }
+
+    // move single card from waste to foundation/tableau
+    bool MoveWaste(int destType, int destCol, int now) {
+        if (this.wn == 0) { return false; }
+        int card = this.waste[this.wn - 1];
+        if (destType == 3) {
+            if (this.CanToFoundation(card, destCol)) {
+                this.found[destCol * 13 + this.fn[destCol]] = card;
+                this.fn[destCol] = this.fn[destCol] + 1;
+                this.wn = this.wn - 1;
+                this.moves = this.moves + 1;
+                return true;
+            }
+            return false;
+        }
+        if (destType == 2) {
+            if (this.CanToTableau(card, destCol)) {
+                this.tab[destCol * 24 + this.tn[destCol]] = card;
+                this.tn[destCol] = this.tn[destCol] + 1;
+                this.wn = this.wn - 1;
+                this.moves = this.moves + 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // move run from tableau col starting at idx
+    bool MoveTableau(int srcCol, int srcIdx, int destType, int destCol, int now) {
+        int runLen = this.tn[srcCol] - srcIdx;
+        if (runLen <= 0) { return false; }
+        int bottom = this.tab[srcCol * 24 + srcIdx];
+        if (destType == 3) {
+            if (runLen != 1) { return false; }
+            if (this.CanToFoundation(bottom, destCol)) {
+                this.found[destCol * 13 + this.fn[destCol]] = bottom;
+                this.fn[destCol] = this.fn[destCol] + 1;
+                this.tn[srcCol] = this.tn[srcCol] - 1;
+                this.AfterRemove(srcCol);
+                this.moves = this.moves + 1;
+                return true;
+            }
+            return false;
+        }
+        if (destType == 2) {
+            if (this.CanToTableau(bottom, destCol)) {
+                int i = 0;
+                while (i < runLen) {
+                    this.tab[destCol * 24 + this.tn[destCol]] = this.tab[srcCol * 24 + srcIdx + i];
+                    this.tn[destCol] = this.tn[destCol] + 1;
+                    i = i + 1;
+                }
+                this.tn[srcCol] = srcIdx;
+                this.AfterRemove(srcCol);
+                this.moves = this.moves + 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Try to auto-send a card to any foundation.
+    bool AutoToFoundation(int fromType, int col, int idx, int now) {
+        int card;
+        if (fromType == 1) { if (this.wn == 0) { return false; } card = this.waste[this.wn - 1]; }
+        else { if (idx != this.tn[col] - 1) { return false; } card = this.tab[col * 24 + idx]; }
+        int slot = Card.Suit(card);
+        if (this.CanToFoundation(card, slot)) {
+            if (fromType == 1) { return this.MoveWaste(3, slot, now); }
+            return this.MoveTableau(col, idx, 3, slot, now);
+        }
+        return false;
+    }
+
+    // Auto-finish: repeatedly send any available card to foundations.
+    void AutoFinish(int now) {
+        bool any = true;
+        int guard = 0;
+        while (any && guard < 200) {
+            any = false;
+            guard = guard + 1;
+            if (this.AutoToFoundation(1, 0, 0, now)) { any = true; }
+            int col = 0;
+            while (col < 7) {
+                if (this.tn[col] > 0) { if (this.AutoToFoundation(2, col, this.tn[col] - 1, now)) { any = true; } }
+                col = col + 1;
+            }
+        }
+        this.CheckWin(now);
+    }
+
+    // ----- input -------------------------------------------------------------
+
+    int PickTableau(int px, int py, int[] out2) {
+        int col = 0;
+        while (col < 7) {
+            int x = SolGame.TABX() + col * SolGame.COLSP();
+            if (px >= x && px < x + SolGame.CW()) {
+                int n = this.tn[col];
+                if (n == 0) {
+                    if (py >= SolGame.TABY() && py < SolGame.TABY() + SolGame.CH()) { out2[0] = col; out2[1] = -1; return 1; }
+                }
+                int y = SolGame.TABY();
+                int i = 0;
+                int cy = y;
+                int idx = -1;
+                while (i < n) {
+                    int step = SolGame.FANDN();
+                    if (i >= this.fd[col]) { step = SolGame.FANUP(); }
+                    int h = step;
+                    if (i == n - 1) { h = SolGame.CH(); }
+                    if (py >= cy && py < cy + h) { idx = i; }
+                    cy = cy + step;
+                    i = i + 1;
+                }
+                if (idx >= 0) { out2[0] = col; out2[1] = idx; return 1; }
+            }
+            col = col + 1;
+        }
+        return 0;
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            if (Draw.PointIn(cx, cy, 470, 620, 340, 74)) { this.NewGame(now); }
+            return;
+        }
+        if (this.scene == 2) {
+            if (Draw.PointIn(cx, cy, 400, 450, 220, 66)) { this.NewGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 450, 200, 66)) { this.scene = 0; return; }
+            return;
+        }
+        // top buttons
+        if (Draw.PointIn(cx, cy, 1040, 60, 180, 46)) { this.NewGame(now); return; }
+        if (Draw.PointIn(cx, cy, 1040, 116, 180, 46)) { this.AutoFinish(now); return; }
+        if (Draw.PointIn(cx, cy, 1040, 700, 180, 46)) { this.scene = 0; return; }
+
+        // stock
+        if (Draw.PointIn(cx, cy, 60, 60, SolGame.CW(), SolGame.CH())) { this.DrawStock(now); return; }
+        // waste
+        if (this.wn > 0 && Draw.PointIn(cx, cy, 168, 60, SolGame.CW(), SolGame.CH())) {
+            bool dbl = (now - this.lastClickAt < 400 && this.lastClickType == 1);
+            this.lastClickAt = now; this.lastClickType = 1; this.lastClickCol = 0; this.lastClickIdx = 0;
+            if (dbl) { if (this.AutoToFoundation(1, 0, 0, now)) { this.selType = 0; this.CheckWin(now); return; } }
+            this.selType = 1; this.selCol = 0; this.selIdx = 0;
+            return;
+        }
+        // foundations (slots by suit)
+        int f = 0;
+        while (f < 4) {
+            int fx = 620 + f * 108;
+            if (Draw.PointIn(cx, cy, fx, 60, SolGame.CW(), SolGame.CH())) {
+                if (this.selType == 1) { if (this.MoveWaste(3, f, now)) { this.selType = 0; this.CheckWin(now); } return; }
+                if (this.selType == 2) { if (this.MoveTableau(this.selCol, this.selIdx, 3, f, now)) { this.selType = 0; this.CheckWin(now); } return; }
+                return;
+            }
+            f = f + 1;
+        }
+        // tableau
+        int[] out2 = new int[2];
+        if (this.PickTableau(cx, cy, out2) == 1) {
+            int col = out2[0];
+            int idx = out2[1];
+            if (this.selType != 0) {
+                // attempt move to this column
+                bool ok = false;
+                if (this.selType == 1) { ok = this.MoveWaste(2, col, now); }
+                else if (this.selType == 2) {
+                    if (!(this.selCol == col)) { ok = this.MoveTableau(this.selCol, this.selIdx, 2, col, now); }
+                }
+                if (ok) { this.selType = 0; this.CheckWin(now); return; }
+                this.selType = 0;
+                // fallthrough: allow re-selecting below
+            }
+            if (idx >= 0 && idx >= this.fd[col]) {
+                bool dbl = (now - this.lastClickAt < 400 && this.lastClickType == 2 && this.lastClickCol == col && this.lastClickIdx == idx);
+                this.lastClickAt = now; this.lastClickType = 2; this.lastClickCol = col; this.lastClickIdx = idx;
+                if (dbl && idx == this.tn[col] - 1) {
+                    if (this.AutoToFoundation(2, col, idx, now)) { this.selType = 0; this.CheckWin(now); return; }
+                }
+                this.selType = 2; this.selCol = col; this.selIdx = idx;
+            } else {
+                this.selType = 0;
+            }
+            return;
+        }
+        this.selType = 0;
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } }
+        if (this.scene == 0) { if (sc == 40 || sc == 44) { this.NewGame(now); } }
+        else if (this.scene == 1) {
+            if (sc == 21) { this.NewGame(now); }         // R
+            if (sc == 4) { this.AutoFinish(now); }        // A
+            if (sc == 44) { this.DrawStock(now); }        // space draws
+        } else if (this.scene == 2) { if (sc == 40 || sc == 44) { this.NewGame(now); } }
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawCardAt(int x, int y, int card, bool faceUp, bool hi) {
+        int w = SolGame.CW(); int h = SolGame.CH();
+        Draw.RoundRectFill(this.r, x + 3, y + 4, w, h, 10, 6, 8, 12, 90);
+        if (!faceUp) {
+            Draw.RoundRectFill(this.r, x, y, w, h, 10, 40, 60, 120, 255);
+            Draw.RoundRectFill(this.r, x + 7, y + 7, w - 14, h - 14, 7, 60, 90, 170, 255);
+            Draw.RingRect(this.r, x + 7, y + 7, w - 14, h - 14, 2, 130, 160, 230, 255);
+            return;
+        }
+        Draw.RoundRectFill(this.r, x, y, w, h, 10, 248, 246, 240, 255);
+        int ringc = 200;
+        if (hi) { Draw.RingRect(this.r, x, y, w, h, 3, 250, 210, 80, 255); }
+        else { Draw.RingRect(this.r, x, y, w, h, 2, ringc, ringc, ringc, 255); }
+        int cr = 40; int cg = 44; int cb = 52;
+        if (Card.Red(card)) { cr = 200; cg = 50; cb = 55; }
+        Text.Draw(this.r, Card.RankStr(card), x + 7, y + 6, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, Card.SuitStr(card), x + 7, y + 28, 1, cr, cg, cb, 255);
+        Text.DrawCentered(this.r, Card.SuitStr(card), x + w / 2, y + h / 2 - 8, 3, cr, cg, cb, 255);
+    }
+
+    void DrawEmptySlot(int x, int y, string label) {
+        Draw.RoundRectFill(this.r, x, y, SolGame.CW(), SolGame.CH(), 10, 26, 74, 56, 255);
+        Draw.RingRect(this.r, x, y, SolGame.CW(), SolGame.CH(), 2, 40, 110, 84, 255);
+        if (label.Length > 0) { Text.DrawCentered(this.r, label, x + SolGame.CW() / 2, y + SolGame.CH() / 2 - 8, 3, 40, 110, 84, 255); }
+    }
+
+    void DrawTablePlay(int now) {
+        this.host.Begin(18, 60, 46);
+        this.r.SetColor(20, 82, 60, 255);
+        this.r.FillRect(20, 20, 1000, 760);
+        Draw.RingRect(this.r, 20, 20, 1000, 760, 3, 180, 155, 90, 200);
+
+        // stock
+        if (this.sn > 0) { this.DrawCardAt(60, 60, this.stock[this.sn - 1], false, false); }
+        else { this.DrawEmptySlot(60, 60, "O"); }
+        // waste
+        if (this.wn > 0) { this.DrawCardAt(168, 60, this.waste[this.wn - 1], true, this.selType == 1); }
+        else { this.DrawEmptySlot(168, 60, ""); }
+        // foundations
+        int f = 0;
+        while (f < 4) {
+            int fx = 620 + f * 108;
+            if (this.fn[f] > 0) { this.DrawCardAt(fx, 60, this.found[f * 13 + this.fn[f] - 1], true, false); }
+            else {
+                string lbl = "H";
+                if (f == 1) { lbl = "D"; }
+                if (f == 2) { lbl = "C"; }
+                if (f == 3) { lbl = "S"; }
+                this.DrawEmptySlot(fx, 60, lbl);
+            }
+            f = f + 1;
+        }
+
+        // tableau
+        int col = 0;
+        while (col < 7) {
+            int x = SolGame.TABX() + col * SolGame.COLSP();
+            int n = this.tn[col];
+            if (n == 0) { this.DrawEmptySlot(x, SolGame.TABY(), "K"); }
+            int y = SolGame.TABY();
+            int i = 0;
+            while (i < n) {
+                bool up = i >= this.fd[col];
+                bool hi = (this.selType == 2 && this.selCol == col && i >= this.selIdx);
+                this.DrawCardAt(x, y, this.tab[col * 24 + i], up, hi);
+                if (i < this.fd[col]) { y = y + SolGame.FANDN(); } else { y = y + SolGame.FANUP(); }
+                i = i + 1;
+            }
+            col = col + 1;
+        }
+
+        // side panel
+        Text.Draw(this.r, "SOLITAIRE", 1040, 190, 3, 240, 240, 250, 255);
+        Text.Draw(this.r, "KLONDIKE", 1040, 226, 2, 240, 208, 130, 255);
+        int elapsed = (now - this.startTime) / 1000;
+        Text.Draw(this.r, "TIME  " + elapsed + "s", 1040, 270, 2, 200, 210, 225, 255);
+        Text.Draw(this.r, "MOVES  " + this.moves, 1040, 296, 2, 200, 210, 225, 255);
+        Text.Draw(this.r, "WINS  " + this.prof.wins, 1040, 322, 2, 180, 190, 210, 255);
+        Text.Draw(this.r, "STREAK  " + this.prof.streak, 1040, 348, 2, 180, 190, 210, 255);
+        if (this.prof.best > 0) { Text.Draw(this.r, "BEST  " + this.prof.best + " mv", 1040, 374, 2, 255, 210, 90, 255); }
+
+        if (this.msg.Length > 0 && now < this.msgAt) {
+            this.r.SetColor(28, 32, 42, 235);
+            this.r.FillRect(1040, 420, 190, 60);
+            Draw.RingRect(this.r, 1040, 420, 190, 60, 2, 120, 180, 140, 255);
+            Text.Draw(this.r, this.msg, 1048, 436, 1, 150, 210, 170, 255);
+        }
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 1040, 60, 180, 46, "NEW (R)", 2, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 1040, 116, 180, 46, "AUTO (A)", 2, 0);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 1040, 700, 180, 46, "MENU (ESC)", 2, 0);
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/solitaire/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(16, 46, 34);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+
+        Text.DrawCenteredShadow(this.r, "SOLITAIRE", 640, 80, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "KLONDIKE -- CLEAR ALL FOUR SUITS", 640, 186, 3, 240, 208, 130, 3);
+
+        Ui.Panel(this.r, 360, 270, 560, 280, 20, 24, 34, 214);
+        Text.Draw(this.r, "WINS", 392, 300, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, "" + this.prof.wins, 392, 322, 6, 255, 210, 90, 3);
+        Text.Draw(this.r, "BEST STREAK  " + this.prof.bestStreak, 392, 402, 2, 150, 160, 180, 255);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, 392, 430, 2, 150, 160, 180, 255);
+        if (this.prof.best > 0) { Text.DrawShadow(this.r, "FEWEST MOVES  " + this.prof.best, 392, 462, 2, 205, 214, 232, 2); }
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 600, 340, 74, "DEAL", 4, 1);
+        Text.DrawCenteredShadow(this.r, "Click a card then its target. Double-click sends to foundation. ENTER deal, F11 fullscreen", 640, 720, 2, 176, 184, 200, 2);
+
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawTablePlay(now);
+        this.r.SetColor(0, 0, 0, 175);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 240; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        Text.DrawCentered(this.r, "YOU WIN!", 640, by + 40, 7, 90, 210, 130, 255);
+        int elapsed = (this.endTime - this.startTime) / 1000;
+        Text.DrawCentered(this.r, "MOVES " + this.moves + "    TIME " + elapsed + "s", 640, by + 120, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, "STREAK " + this.prof.streak + "    WINS " + this.prof.wins, 640, by + 168, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 210, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 210, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    // ----- demo self-play ----------------------------------------------------
+
+    bool DemoTry(int now) {
+        // send anything to foundation
+        if (this.AutoToFoundation(1, 0, 0, now)) { return true; }
+        int col = 0;
+        while (col < 7) { if (this.tn[col] > 0) { if (this.AutoToFoundation(2, col, this.tn[col] - 1, now)) { return true; } } col = col + 1; }
+        // waste -> tableau
+        if (this.wn > 0) {
+            int c = 0;
+            while (c < 7) { if (this.MoveWaste(2, c, now)) { return true; } c = c + 1; }
+        }
+        // tableau -> tableau (move face-up run)
+        int s = 0;
+        while (s < 7) {
+            if (this.tn[s] > 0) {
+                int idx = this.fd[s];
+                if (idx < this.tn[s]) {
+                    int d = 0;
+                    while (d < 7) {
+                        if (d != s) { if (this.MoveTableau(s, idx, 2, d, now)) { return true; } }
+                        d = d + 1;
+                    }
+                }
+            }
+            s = s + 1;
+        }
+        return false;
+    }
+
+    void Tick(int now) {
+        if (this.demo && this.scene == 1 && now >= this.demoAt) {
+            if (!this.DemoTry(now)) { this.DrawStock(now); }
+            this.CheckWin(now);
+            this.demoAt = now + 260;
+        }
+        if (this.demo && this.scene == 2 && now >= this.demoAt) { this.NewGame(now); this.demoAt = now + 600; }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2) { this.DrawOver(now); }
+        else { this.DrawTablePlay(now); }
+    }
+}
+
+class SolApp {
+    static void Main() {
+        Host h = Host.Create("Solitaire - Klondike", 1280, 800);
+        SolGame g = SolGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) {
+                        int sc = SdlEvent.Scancode();
+                        if (sc == 68) { h.ToggleFullscreen(); }
+                        else { g.OnKey(sc, now); }
+                    }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}

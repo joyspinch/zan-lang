@@ -289,6 +289,35 @@ static void emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
+/* On Windows, guard an about-to-be-dereferenced string header pointer (obj-8,
+ * the STRING_MAGIC slot) against freed/unmapped pages. The tolerant retain and
+ * release probe [obj-8] to decide whether a pointer is a managed string; for a
+ * bare buffer (e.g. a [DllImport] calloc result typed as string) that was
+ * manually free()d, the page may already be unmapped, so the probe load itself
+ * would fault. If IsBadReadPtr(ptr8, 8) is true we treat the pointer as
+ * non-managed and branch to ret_bb. kernel32 is always linked on Windows, so
+ * no extra runtime object is required. On Windows this leaves the builder
+ * positioned in a fresh "readable" block; elsewhere it is a no-op. */
+static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
+                                   LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb) {
+    if (!g->target_is_windows) return;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef args[] = { i8p, i64t };
+    LLVMTypeRef fnty = LLVMFunctionType(i32t, args, 2, 0);
+    LLVMValueRef isbad = LLVMGetNamedFunction(g->mod, "IsBadReadPtr");
+    if (!isbad) isbad = LLVMAddFunction(g->mod, "IsBadReadPtr", fnty);
+    LLVMValueRef cargs[] = { ptr8, LLVMConstInt(i64t, 8, 0) };
+    LLVMValueRef bad = LLVMBuildCall2(g->builder, fnty, isbad, cargs, 2, "badread");
+    LLVMValueRef isbadnz = LLVMBuildICmp(g->builder, LLVMIntNE, bad,
+        LLVMConstInt(i32t, 0, 0), "isbadnz");
+    LLVMBasicBlockRef readable_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "readable");
+    LLVMBuildCondBr(g->builder, isbadnz, ret_bb, readable_bb);
+    LLVMPositionBuilderAtEnd(g->builder, readable_bb);
+}
+
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
@@ -387,6 +416,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMValueRef int_fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld\n", "int_fmt");
     LLVMValueRef iargs[] = { int_fmt, LLVMGetParam(g->rt_print_int, 0) };
     LLVMBuildCall2(g->builder, printf_type, printf_fn, iargs, 2, "");
+    LLVMBuildRetVoid(g->builder);
+
+    /* declare zan_rt_print_uint(uint64) — unsigned (%llu) println for ulong */
+    g->rt_print_uint = LLVMAddFunction(g->mod, "zan_rt_print_uint", pint_type);
+
+    LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, puint_entry);
+    LLVMValueRef uint_fmt = LLVMBuildGlobalStringPtr(g->builder, "%llu\n", "uint_fmt");
+    LLVMValueRef uargs[] = { uint_fmt, LLVMGetParam(g->rt_print_uint, 0) };
+    LLVMBuildCall2(g->builder, printf_type, printf_fn, uargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
     /* declare zan_rt_print_double(double) */
@@ -1178,6 +1217,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
         LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)-8, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
+        emit_header_read_guard(g, g->rt_str_retain, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
         LLVMValueRef has_magic = LLVMBuildICmp(g->builder, LLVMIntEQ, magic,
@@ -1216,6 +1256,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMPositionBuilderAtEnd(g->builder, cont_bb);
         LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)-8, 1);
         LLVMValueRef magic_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "magicp");
+        emit_header_read_guard(g, g->rt_str_release, magic_ptr, ret_bb);
         LLVMValueRef magic_iptr = LLVMBuildBitCast(g->builder, magic_ptr, LLVMPointerType(i64t, 0), "magicip");
         LLVMValueRef magic = LLVMBuildLoad2(g->builder, i64t, magic_iptr, "magic");
         LLVMValueRef has_magic = LLVMBuildICmp(g->builder, LLVMIntEQ, magic,
@@ -1286,6 +1327,10 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_SHORT:  return LLVMInt16TypeInContext(g->ctx);
     case TYPE_INT:    return LLVMInt64TypeInContext(g->ctx);
     case TYPE_LONG:   return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_SBYTE:  return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_USHORT: return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_UINT:   return LLVMInt64TypeInContext(g->ctx);
+    case TYPE_ULONG:  return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NINT:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
@@ -1405,8 +1450,16 @@ static zan_symbol_t *method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t 
  * supplied at the call. When several remain (same arity) the first is returned;
  * when none match on arity the first same-named method is returned so that
  * behaviour degrades to the historical name-only lookup instead of failing. */
+static int method_is_params_variadic(zan_symbol_t *m) {
+    if (!m->decl || m->decl->method_decl.params.count == 0) return 0;
+    zan_ast_node_t *last =
+        m->decl->method_decl.params.items[m->decl->method_decl.params.count - 1];
+    return last->kind == AST_PARAM && last->param.is_params;
+}
+
 static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, int argc) {
     zan_symbol_t *first = NULL;
+    zan_symbol_t *variadic = NULL;
     for (int i = 0; i < type_sym->member_count; i++) {
         zan_symbol_t *m = type_sym->members[i];
         if (m->kind != SYM_METHOD) continue;
@@ -1416,7 +1469,12 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, i
         if (m->decl && m->decl->method_decl.params.count == argc) {
             return m;
         }
+        if (!variadic && method_is_params_variadic(m) &&
+            argc >= m->decl->method_decl.params.count - 1) {
+            variadic = m;
+        }
     }
+    if (variadic) return variadic;
     if (first) return first;
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         return resolve_overload(type_sym->type->base_type->sym, name, argc);
@@ -1570,6 +1628,15 @@ static local_scope_t *local_scope_new(zan_arena_t *arena) {
     local_scope_t *s = (local_scope_t *)zan_arena_alloc(arena, sizeof(local_scope_t));
     local_scope_init(s, arena);
     return s;
+}
+
+/* Storage slot type of a local. A `ref`/`out` parameter's slot is the raw
+ * incoming pointer parameter (not an alloca instruction), so derive the type
+ * from the zan type instead of LLVMGetAllocatedType in that case. */
+static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type);
+static LLVMTypeRef local_slot_type(zan_irgen_t *g, local_var_t *v) {
+    if (LLVMIsAAllocaInst(v->alloca)) return LLVMGetAllocatedType(v->alloca);
+    return map_type(g, v->type);
 }
 
 static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca, zan_type_t *type) {
@@ -1902,6 +1969,36 @@ static zan_type_t *container_elem_type(zan_type_t *t);
 static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
                                       zan_ast_node_t *call, local_scope_t *locals);
 
+/* Render a type reference's display name (with generic args, [] and ?). */
+static int render_type_ref_name(const zan_ast_node_t *t, char *buf, int cap) {
+    int n = 0;
+    if (t && t->kind == AST_TYPE_REF && cap > 1) {
+        int len = (int)t->type_ref.name.len;
+        if (len > cap - n - 1) len = cap - n - 1;
+        memcpy(buf + n, t->type_ref.name.str, (size_t)len);
+        n += len;
+        if (t->type_ref.type_args.count > 0) {
+            if (n < cap - 1) buf[n++] = '<';
+            for (int i = 0; i < t->type_ref.type_args.count; i++) {
+                if (i > 0) {
+                    if (n < cap - 1) buf[n++] = ',';
+                    if (n < cap - 1) buf[n++] = ' ';
+                }
+                n += render_type_ref_name(t->type_ref.type_args.items[i],
+                                          buf + n, cap - n);
+            }
+            if (n < cap - 1) buf[n++] = '>';
+        }
+        if (t->type_ref.is_array) {
+            if (n < cap - 1) buf[n++] = '[';
+            if (n < cap - 1) buf[n++] = ']';
+        }
+        if (t->type_ref.is_nullable && n < cap - 1) buf[n++] = '?';
+    }
+    if (cap > 0) buf[n] = 0;
+    return n;
+}
+
 /* Best-effort static test for whether an expression yields a `string` value.
  * Used to route `+` to concatenation and `==`/`!=` to strcmp rather than raw
  * pointer arithmetic/comparison. Reference (class) values are NOT strings. */
@@ -1910,6 +2007,7 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
     switch (e->kind) {
     case AST_STRING_LITERAL:
     case AST_STRING_INTERP:
+    case AST_TYPEOF_EXPR:
         return true;
     case AST_IDENTIFIER: {
         local_var_t *l = local_find(locals, e->ident.name);
@@ -1975,6 +2073,35 @@ static zan_type_t *dict_value_type(zan_type_t *t) {
     return t->type_args[1];
 }
 
+/* Extension method lookup: a static method whose first parameter is declared
+ * `this T` extends T; `recv.M(args)` resolves to it when no instance method
+ * matches. Matches on method name, arity, and the receiver's static type. */
+static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
+                                           zan_istr_t name, int argc) {
+    if (!recv_ty) return NULL;
+    for (int fi = 0; fi < g->function_count; fi++) {
+        zan_symbol_t *m = g->functions[fi].sym;
+        if (!m || m->kind != SYM_METHOD || !m->decl ||
+            m->decl->kind != AST_METHOD_DECL)
+            continue;
+        if (m->name.len != name.len ||
+            memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+            continue;
+        zan_ast_list_t *ps = &m->decl->method_decl.params;
+        if (ps->count != argc + 1) continue;
+        zan_ast_node_t *p0 = ps->items[0];
+        if (!p0 || p0->kind != AST_PARAM || !p0->param.is_this) continue;
+        zan_type_t *pt = zan_binder_resolve_type(g->binder, p0->param.type);
+        if (!pt || pt->kind != recv_ty->kind) continue;
+        if ((pt->kind == TYPE_CLASS || pt->kind == TYPE_STRUCT ||
+             pt->kind == TYPE_INTERFACE || pt->kind == TYPE_ENUM) &&
+            pt->sym != recv_ty->sym)
+            continue;
+        return m;
+    }
+    return NULL;
+}
+
 /* Best-effort static inference of an expression's Zan type, composed over
  * identifiers, `this`, field access and element indexing so that patterns like
  * `list[i].field` or `a.b[i].c` resolve their class/struct symbol. */
@@ -1993,6 +2120,19 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     }
     case AST_THIS_EXPR:
         return g->current_type_sym ? g->current_type_sym->type : NULL;
+    case AST_QUERY_EXPR: {
+        /* query yields List<select-type>; the range var is briefly registered
+         * (type only) so the projection can be inferred through it */
+        zan_type_t *src_ty = infer_expr_type(g, e->query.source, locals);
+        zan_type_t *elem = container_elem_type(src_ty);
+        if (!elem) elem = g->binder->type_int;
+        int mark = locals->count;
+        local_add(locals, e->query.var, NULL, elem);
+        zan_type_t *sel = infer_expr_type(g, e->query.select, locals);
+        locals->count = mark;
+        if (!sel) sel = elem;
+        return zan_binder_make_list_type(g->binder, sel);
+    }
     case AST_MEMBER_ACCESS: {
         /* static field: ClassName.StaticField (class name, not a local). */
         if (e->member.object->kind == AST_IDENTIFIER &&
@@ -2075,6 +2215,10 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_symbol_t *m = get_method_sym(rt->sym, callee->member.name);
                 if (m) return m->type;
             }
+            /* extension method: recv.M(args) returns the static method's type */
+            zan_symbol_t *xm = find_extension_method(g, rt, callee->member.name,
+                                                     e->call.args.count);
+            if (xm) return xm->type;
         }
         return NULL;
     }
@@ -2087,10 +2231,34 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
          * owned string; other binary operators produce non-rc scalars. */
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals))
             return g->binder->type_string;
-        return NULL;
+        switch (e->binary.op) {
+        case TK_PLUS: case TK_MINUS: case TK_STAR: case TK_SLASH:
+        case TK_PERCENT: case TK_AMP: case TK_PIPE: case TK_CARET:
+        case TK_LESS_LESS: case TK_GREATER_GREATER: {
+            zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
+            zan_type_t *rt = infer_expr_type(g, e->binary.right, locals);
+            if ((lt && lt->kind == TYPE_ULONG) || (rt && rt->kind == TYPE_ULONG))
+                return g->binder->type_ulong;
+            return NULL;
+        }
+        default:
+            return NULL;
+        }
+    case AST_TYPEOF_EXPR:
+    case AST_STRING_INTERP:
+        return g->binder->type_string;
+    case AST_CAST_EXPR:
+        return zan_binder_resolve_type(g->binder, e->cast.type);
     default:
         return NULL;
     }
+}
+
+/* True when an expression's static type is the unsigned 64-bit `ulong`,
+ * which selects unsigned division/remainder/shift/compare and %llu output. */
+static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && t->kind == TYPE_ULONG;
 }
 
 /* Class/struct symbol of an expression's static type, or NULL. */
@@ -3120,7 +3288,8 @@ static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
 /* A value already carrying an owned (+1) reference we may take over as-is;
  * anything else is a borrowed load that must be retained on capture. */
 static int expr_yields_owned_ref(zan_ast_node_t *e) {
-    return e && (e->kind == AST_NEW_EXPR || e->kind == AST_CALL);
+    return e && (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
+                 e->kind == AST_QUERY_EXPR);
 }
 
 static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
@@ -3131,7 +3300,8 @@ static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
-    if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL) return 1;
+    if (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
+        e->kind == AST_QUERY_EXPR) return 1;
     /* An awaited async call yields a freshly owned (+1) reference: the callee's
      * async `return` always retains the result before completing (see the
      * AST_RETURN_STMT async path), so the awaiter receives +1 and must NOT
@@ -3383,7 +3553,8 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
 static void emit_rc_capture_local(zan_irgen_t *g, zan_type_t *type,
                                   LLVMValueRef slot_alloca, LLVMValueRef v,
                                   zan_ast_node_t *rhs, local_scope_t *locals) {
-    LLVMTypeRef slot_ty = LLVMGetAllocatedType(slot_alloca);
+    LLVMTypeRef slot_ty = LLVMIsAAllocaInst(slot_alloca)
+        ? LLVMGetAllocatedType(slot_alloca) : map_type(g, type);
     LLVMValueRef old = LLVMBuildLoad2(g->builder, slot_ty, slot_alloca, "arc.old");
     if (!expr_yields_owned_rc_value(g, rhs, locals)) emit_rc_retain_for_type(g, type, v);
     if (LLVMTypeOf(v) != slot_ty &&
@@ -3658,6 +3829,74 @@ static LLVMValueRef emit_str_concat(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef
     return buf;
 }
 
+/* True when `e` is a string-yielding `+` node (either operand is a string),
+ * i.e. a link of a concatenation chain. */
+static bool is_str_concat_node(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    return e && e->kind == AST_BINARY && e->binary.op == TK_PLUS &&
+        (is_string_expr(g, e->binary.left, locals) ||
+         is_string_expr(g, e->binary.right, locals));
+}
+
+/* Collect the leaves of a `+` concatenation chain in evaluation order.
+ * Stops descending once `ops` is nearly full; an overflowing sub-chain is
+ * kept as a single leaf and flattened again when it is itself emitted. */
+static void collect_concat_ops(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals,
+                               zan_ast_node_t **ops, int *n, int max) {
+    if (*n < max - 1 && is_str_concat_node(g, e, locals)) {
+        collect_concat_ops(g, e->binary.left, locals, ops, n, max);
+        collect_concat_ops(g, e->binary.right, locals, ops, n, max);
+    } else {
+        ops[(*n)++] = e;
+    }
+}
+
+/* Emit an n-way string concatenation as a single allocation: sum the operand
+ * lengths, allocate once, memcpy each part in order and NUL-terminate.
+ * Replaces the O(n^2) copying of emitting a chain pairwise. */
+static LLVMValueRef emit_str_concat_n(zan_irgen_t *g, zan_ast_node_t *expr,
+                                      local_scope_t *locals) {
+    enum { MAXOPS = 48 };
+    zan_ast_node_t *ops[MAXOPS];
+    int n = 0;
+    collect_concat_ops(g, expr, locals, ops, &n, MAXOPS);
+
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+    LLVMTypeRef strlen_type = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+    LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+    if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_type);
+
+    LLVMValueRef vals[MAXOPS];
+    LLVMValueRef lens[MAXOPS];
+    bool owned[MAXOPS];
+    LLVMValueRef total = LLVMConstInt(i64t, 1, 0); /* NUL */
+    for (int i = 0; i < n; i++) {
+        LLVMValueRef v = emit_expr(g, ops[i], locals);
+        LLVMValueRef s = emit_to_cstr(g, v);
+        vals[i] = s;
+        owned[i] = !is_string_expr(g, ops[i], locals) ||
+                   expr_yields_owned_rc_value(g, ops[i], locals);
+        lens[i] = LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &s, 1, "cl");
+        total = LLVMBuildAdd(g->builder, total, lens[i], "ct");
+    }
+    LLVMValueRef buf = emit_string_alloc_rc(g, total);
+    LLVMValueRef off = LLVMConstInt(i64t, 0, 0);
+    for (int i = 0; i < n; i++) {
+        LLVMValueRef dst = LLVMBuildGEP2(g->builder, i8t, buf, &off, 1, "dst");
+        LLVMBuildCall2(g->builder, memcpy_type, memcpy_fn,
+            (LLVMValueRef[]){ dst, vals[i], lens[i] }, 3, "");
+        off = LLVMBuildAdd(g->builder, off, lens[i], "off");
+    }
+    LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8t, buf, &off, 1, "end");
+    LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0, 0), endp);
+    for (int i = 0; i < n; i++) {
+        if (owned[i]) emit_string_release(g, vals[i]);
+    }
+    return buf;
+}
+
 /* Return the internal `__zan_co_reap` step function, creating it once per
  * module. It matches zan_co_step_t (void(i8*)) and simply frees the frame it is
  * handed. A detached (Task.Spawn) coroutine has no awaiter to hand its frame
@@ -3723,7 +3962,7 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
     if (arg->kind == AST_IDENTIFIER) {
         local_var_t *local = local_find(locals, arg->ident.name);
         if (local && local->type && local->type->kind == TYPE_STRING) {
-            LLVMTypeRef slot_type = LLVMGetAllocatedType(local->alloca);
+            LLVMTypeRef slot_type = local_slot_type(g, local);
             if (LLVMGetTypeKind(slot_type) == LLVMPointerTypeKind) {
                 LLVMBuildStore(g->builder, LLVMConstNull(slot_type), local->alloca);
             }
@@ -3798,8 +4037,120 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
     LLVMBuildStore(g->builder, LLVMConstNull(map_type(g, field_type)), field_ptr);
 }
 
+/* Null-conditional access `a?.b` / `a?.M(...)`: evaluate the receiver once,
+ * bind it to a synthetic local, and only evaluate the member/call when it is
+ * non-null; a null receiver yields the result type's zero value. The member
+ * node is temporarily rewired to read the synthetic local so the ordinary
+ * member/call codegen paths apply unchanged, then restored (the same AST may
+ * be re-emitted, e.g. per generic instantiation). */
+static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
+                                   zan_ast_node_t *qmem, local_scope_t *locals) {
+    LLVMValueRef obj = emit_expr(g, qmem->member.object, locals);
+    if (LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind) {
+        /* value receiver can never be null: plain access */
+        qmem->member.null_cond = 0;
+        LLVMValueRef v = emit_expr(g, expr, locals);
+        qmem->member.null_cond = 1;
+        return v;
+    }
+    zan_type_t *oty = infer_expr_type(g, qmem->member.object, locals);
+    char nm[32];
+    snprintf(nm, sizeof(nm), "__qdot%d", g->qdot_counter++);
+    char *nmp = (char *)zan_arena_alloc(g->arena, strlen(nm) + 1);
+    strcpy(nmp, nm);
+    zan_istr_t iname = { nmp, (int)strlen(nmp) };
+    LLVMValueRef slot = emit_entry_alloca(g, LLVMTypeOf(obj), nm);
+    LLVMBuildStore(g->builder, obj, slot);
+    local_add(locals, iname, slot, oty);
+
+    zan_ast_node_t *ident = zan_ast_new(g->arena, AST_IDENTIFIER, qmem->loc);
+    ident->ident.name = iname;
+    zan_ast_node_t *saved_obj = qmem->member.object;
+    qmem->member.object = ident;
+    qmem->member.null_cond = 0;
+
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "qdot.then");
+    LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "qdot.end");
+    LLVMValueRef isnull = LLVMBuildICmp(g->builder, LLVMIntEQ, obj,
+        LLVMConstNull(LLVMTypeOf(obj)), "qdot.isnull");
+    LLVMBasicBlockRef entry_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBuildCondBr(g->builder, isnull, merge_bb, then_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, then_bb);
+    LLVMValueRef v = emit_expr(g, expr, locals);
+    LLVMBasicBlockRef then_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, merge_bb);
+
+    qmem->member.object = saved_obj;
+    qmem->member.null_cond = 1;
+
+    LLVMPositionBuilderAtEnd(g->builder, merge_bb);
+    LLVMTypeRef vt = LLVMTypeOf(v);
+    if (LLVMGetTypeKind(vt) == LLVMVoidTypeKind) {
+        emit_release_owned_call_temp(g, saved_obj, obj, locals);
+        return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+    }
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, vt, "qdot");
+    LLVMValueRef dflt = LLVMConstNull(vt);
+    LLVMValueRef vals[] = { dflt, v };
+    LLVMBasicBlockRef bbs[] = { entry_bb, then_end };
+    LLVMAddIncoming(phi, vals, bbs, 2);
+    /* an owned receiver temp (e.g. `M()?.x`, where M returns +1) is consumed
+     * by this access; the class release helper is null-safe */
+    emit_release_owned_call_temp(g, saved_obj, obj, locals);
+    return phi;
+}
+
+/* `params T[] rest` call-site packing. The trailing arguments are bundled into
+ * a synthetic `new List<T>{ ... }` node (the parameter itself was lowered to
+ * List<T> at parse time), so the callee sees a normal List. Passing a List
+ * (or an explicit `new List<T>{...}`) as the sole trailing argument passes it
+ * through unpacked. The call node is mutated in place; the rewrite is
+ * idempotent so re-emission (e.g. per generic instantiation) is safe. */
+static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
+                             zan_symbol_t *method_sym, local_scope_t *locals) {
+    if (!method_sym || !method_sym->decl ||
+        method_sym->decl->kind != AST_METHOD_DECL) return;
+    if (!method_is_params_variadic(method_sym)) return;
+    zan_ast_list_t *ps = &method_sym->decl->method_decl.params;
+    int fixed = ps->count - 1;
+    int argc = call->call.args.count;
+    if (argc < fixed) return;
+    if (argc == ps->count) {
+        zan_ast_node_t *la = call->call.args.items[argc - 1];
+        if (la->kind == AST_NEW_EXPR) return; /* already packed / explicit list */
+        zan_type_t *lt = infer_expr_type(g, la, locals);
+        if (lt && lt->name.len == 4 && memcmp(lt->name.str, "List", 4) == 0) return;
+    }
+    zan_ast_node_t *last_p = ps->items[ps->count - 1];
+    zan_ast_node_t *lst = zan_ast_new(g->arena, AST_NEW_EXPR, call->loc);
+    lst->new_expr.type = last_p->param.type; /* List<T> */
+    lst->new_expr.is_array = false;
+    zan_ast_list_init(&lst->new_expr.args);
+    for (int i = fixed; i < argc; i++)
+        zan_ast_list_push(&lst->new_expr.args, call->call.args.items[i], g->arena);
+    call->call.args.count = fixed;
+    zan_ast_list_push(&call->call.args, lst, g->arena);
+}
+
+static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
+                                 local_scope_t *locals);
+
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+
+    if (expr->kind == AST_REF_ARG) {
+        return emit_ref_arg(g, expr, locals);
+    }
+    if (expr->kind == AST_MEMBER_ACCESS && expr->member.null_cond) {
+        return emit_null_cond(g, expr, expr, locals);
+    }
+    if (expr->kind == AST_CALL && expr->call.callee &&
+        expr->call.callee->kind == AST_MEMBER_ACCESS &&
+        expr->call.callee->member.null_cond) {
+        return emit_null_cond(g, expr, expr->call.callee, locals);
+    }
 
     switch (expr->kind) {
     case AST_INT_LITERAL:
@@ -3922,6 +4273,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return phi;
         }
 
+        /* A chain of 3+ string `+` parts is emitted as one flattened
+         * allocation instead of pairwise (see emit_str_concat_n). */
+        if (expr->binary.op == TK_PLUS && is_str_concat_node(g, expr, locals) &&
+            (is_str_concat_node(g, expr->binary.left, locals) ||
+             is_str_concat_node(g, expr->binary.right, locals))) {
+            return emit_str_concat_n(g, expr, locals);
+        }
+
         LLVMValueRef left = emit_expr(g, expr->binary.left, locals);
         LLVMValueRef right = emit_expr(g, expr->binary.right, locals);
 
@@ -3929,7 +4288,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
          * look for a static op_add/op_sub/etc method and call it. */
         {
             zan_type_t *ltype = infer_expr_type(g, expr->binary.left, locals);
-            if (ltype && ltype->kind == TYPE_CLASS && ltype->sym) {
+            /* comparisons against the null literal stay reference compares,
+             * so an op_eq body can null-check without recursing into itself */
+            int null_cmp = expr->binary.left->kind == AST_NULL_LITERAL ||
+                           expr->binary.right->kind == AST_NULL_LITERAL;
+            if (!null_cmp && ltype && ltype->kind == TYPE_CLASS && ltype->sym) {
                 const char *op_name = NULL;
                 switch (expr->binary.op) {
                 case TK_PLUS:       op_name = "op_add"; break;
@@ -4046,12 +4409,32 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return sord;
         }
 
+        /* Pointer equality (incl. `== null`): compare the raw pointers, then
+         * release owned call-result temps so `obj.Get() != null` does not leak
+         * the +1 value the callee returned. */
+        if ((expr->binary.op == TK_EQ_EQ || expr->binary.op == TK_BANG_EQ) && both_ptr) {
+            LLVMValueRef rcast = right;
+            if (LLVMTypeOf(right) != LLVMTypeOf(left))
+                rcast = LLVMBuildBitCast(g->builder, right, LLVMTypeOf(left), "pcast");
+            LLVMValueRef pcmp = LLVMBuildICmp(g->builder,
+                expr->binary.op == TK_EQ_EQ ? LLVMIntEQ : LLVMIntNE,
+                left, rcast, "pcmp");
+            emit_release_owned_call_temp(g, expr->binary.left, left, locals);
+            emit_release_owned_call_temp(g, expr->binary.right, right, locals);
+            return pcmp;
+        }
+
         LLVMTypeRef left_type = LLVMTypeOf(left);
         bool is_float = (LLVMGetTypeKind(left_type) == LLVMDoubleTypeKind ||
                          LLVMGetTypeKind(left_type) == LLVMFloatTypeKind);
 
         /* reconcile mixed-width integer operands (e.g. i32 int vs i64 length) */
         coerce_int_pair(g, &left, &right);
+
+        /* ulong operands select unsigned division/remainder/shift/compare */
+        bool is_unsigned = !is_float &&
+            (expr_is_ulong(g, expr->binary.left, locals) ||
+             expr_is_ulong(g, expr->binary.right, locals));
 
         switch (expr->binary.op) {
         case TK_PLUS:
@@ -4070,7 +4453,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, right, zero, "divz");
                 emit_runtime_check(g, is_zero, expr->loc, "division by zero");
             }
-            return LLVMBuildSDiv(g->builder, left, right, "div");
+            return is_unsigned ? LLVMBuildUDiv(g->builder, left, right, "div")
+                               : LLVMBuildSDiv(g->builder, left, right, "div");
         case TK_PERCENT:
             if (is_float) return LLVMBuildFRem(g->builder, left, right, "rem");
             {
@@ -4078,7 +4462,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMValueRef is_zero = LLVMBuildICmp(g->builder, LLVMIntEQ, right, zero, "remz");
                 emit_runtime_check(g, is_zero, expr->loc, "division by zero (modulo)");
             }
-            return LLVMBuildSRem(g->builder, left, right, "rem");
+            return is_unsigned ? LLVMBuildURem(g->builder, left, right, "rem")
+                               : LLVMBuildSRem(g->builder, left, right, "rem");
         case TK_AMP:
             return LLVMBuildAnd(g->builder, left, right, "and");
         case TK_PIPE:
@@ -4088,7 +4473,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         case TK_LESS_LESS:
             return LLVMBuildShl(g->builder, left, right, "shl");
         case TK_GREATER_GREATER:
-            return LLVMBuildAShr(g->builder, left, right, "shr");
+            return is_unsigned ? LLVMBuildLShr(g->builder, left, right, "shr")
+                               : LLVMBuildAShr(g->builder, left, right, "shr");
         case TK_EQ_EQ:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOEQ, left, right, "eq")
                             : LLVMBuildICmp(g->builder, LLVMIntEQ, left, right, "eq");
@@ -4097,16 +4483,16 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             : LLVMBuildICmp(g->builder, LLVMIntNE, left, right, "ne");
         case TK_LESS:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOLT, left, right, "lt")
-                            : LLVMBuildICmp(g->builder, LLVMIntSLT, left, right, "lt");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntULT : LLVMIntSLT, left, right, "lt");
         case TK_GREATER:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOGT, left, right, "gt")
-                            : LLVMBuildICmp(g->builder, LLVMIntSGT, left, right, "gt");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntUGT : LLVMIntSGT, left, right, "gt");
         case TK_LESS_EQ:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOLE, left, right, "le")
-                            : LLVMBuildICmp(g->builder, LLVMIntSLE, left, right, "le");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntULE : LLVMIntSLE, left, right, "le");
         case TK_GREATER_EQ:
             return is_float ? LLVMBuildFCmp(g->builder, LLVMRealOGE, left, right, "ge")
-                            : LLVMBuildICmp(g->builder, LLVMIntSGE, left, right, "ge");
+                            : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntUGE : LLVMIntSGE, left, right, "ge");
         case TK_QUESTION_QUESTION: {
             /* ?? null coalescing: if left != 0/null, use left, else right */
             LLVMValueRef is_null;
@@ -4179,7 +4565,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 emit_rc_capture_local(g, local->type, local->alloca, right, expr->binary.right, locals);
             } else if (local) {
                 LLVMValueRef sv = coerce_int_to(g, right,
-                    LLVMGetAllocatedType(local->alloca));
+                    local_slot_type(g, local));
                 LLVMBuildStore(g->builder, sv, local->alloca);
             } else if (g->current_type_sym &&
                        get_static_field_global(g, g->current_type_sym,
@@ -4685,7 +5071,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMVoidTypeInContext(g->ctx),
                         (LLVMTypeRef[]){ LLVMInt64TypeInContext(g->ctx) },
                         1, 0);
-                    LLVMBuildCall2(g->builder, fn_type, g->rt_print_int, &arg, 1, "");
+                    LLVMValueRef print_fn = expr_is_ulong(g, arg_ast, locals)
+                        ? g->rt_print_uint : g->rt_print_int;
+                    LLVMBuildCall2(g->builder, fn_type, print_fn, &arg, 1, "");
                 }
                 emit_release_owned_call_temp(g, arg_ast, arg, locals);
             }
@@ -4717,7 +5105,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef args[] = { fmt, dbl_arg };
                     LLVMBuildCall2(g->builder, printf_type, printf_fn, args, 2, "");
                 } else {
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "wfmt_i");
+                    LLVMValueRef fmt = expr_is_ulong(g, arg_ast, locals)
+                        ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "wfmt_u")
+                        : LLVMBuildGlobalStringPtr(g->builder, "%lld", "wfmt_i");
                     LLVMValueRef int_arg = emit_widen_i64_for_print(g, arg);
                     LLVMValueRef args[] = { fmt, int_arg };
                     LLVMBuildCall2(g->builder, printf_type, printf_fn, args, 2, "");
@@ -4923,9 +5313,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             LLVMTypeRef atoi_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                             atoi_fn = LLVMAddFunction(g->mod, "atoi", atoi_type);
                         }
-                        return LLVMBuildCall2(g->builder,
+                        LLVMValueRef parsed = LLVMBuildCall2(g->builder,
                             LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0),
                             atoi_fn, &arg, 1, "atoi");
+                        emit_release_owned_call_temp(
+                            g, expr->call.args.items[0], arg, locals);
+                        return parsed;
                     }
                     if (method_name.len == 8 && memcmp(method_name.str, "ToString", 8) == 0 &&
                         expr->call.args.count == 1) {
@@ -5517,6 +5910,39 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
             emit_release_owned_call_temp(g, expr->call.args.items[0], path_arg, locals);
             return LLVMBuildZExt(g->builder, result, i64, "dex");
+        }
+
+        /* Environment.ExeDir() — directory containing the running executable
+         * (runtime helper zan_exe_dir_into fills an rc string buffer). */
+        if (is_call_to(expr, "Environment", "ExeDir") && expr->call.args.count == 0) {
+            g->uses_sync_runtime = true;
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 1024, 0));
+            LLVMTypeRef ft = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_exe_dir_into");
+            if (!fn) fn = LLVMAddFunction(g->mod, "zan_exe_dir_into", ft);
+            LLVMValueRef args2[] = { buf, LLVMConstInt(i64, 1024, 0) };
+            LLVMBuildCall2(g->builder, ft, fn, args2, 2, "");
+            return buf;
+        }
+
+        /* Directory.ListNames(pattern) — '\n'-joined file names matching a
+         * glob (runtime helper zan_dir_list_into fills an rc string buffer). */
+        if (is_call_to(expr, "Directory", "ListNames") && expr->call.args.count == 1) {
+            g->uses_sync_runtime = true;
+            LLVMValueRef pat = emit_expr(g, expr->call.args.items[0], locals);
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 65536, 0));
+            LLVMTypeRef ft = LLVMFunctionType(i64,
+                (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_dir_list_into");
+            if (!fn) fn = LLVMAddFunction(g->mod, "zan_dir_list_into", ft);
+            LLVMValueRef args3[] = { pat, buf, LLVMConstInt(i64, 65536, 0) };
+            LLVMBuildCall2(g->builder, ft, fn, args3, 3, "");
+            emit_release_owned_call_temp(g, expr->call.args.items[0], pat, locals);
+            return buf;
         }
 
         /* Directory.CreateDirectory(path) */
@@ -6546,6 +6972,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 if (local && local->type && local->type->sym) {
                     zan_symbol_t *type_sym = local->type->sym;
                     zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
+                    if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
                         for (int fi = 0; fi < g->function_count; fi++) {
                             if (g->functions[fi].sym == method_sym) {
@@ -6554,7 +6981,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 /* receiver: class refs hold the object pointer in
                                  * the local, so load it; struct value types pass
                                  * the storage address directly. */
-                                LLVMTypeRef at = LLVMGetAllocatedType(local->alloca);
+                                LLVMTypeRef at = local_slot_type(g, local);
                                 if (LLVMGetTypeKind(at) == LLVMPointerTypeKind) {
                                     call_args[0] = LLVMBuildLoad2(g->builder, at, local->alloca, "recv");
                                 } else {
@@ -6586,6 +7013,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 zan_symbol_t *type_sym = zan_binder_lookup(g->binder, callee->member.object->ident.name);
                 if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
                     zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
+                    if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
                         for (int fi = 0; fi < g->function_count; fi++) {
                             if (g->functions[fi].sym == method_sym) {
@@ -6630,6 +7058,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             zan_symbol_t *recv_cls = expr_class_sym(g, callee->member.object, locals);
             if (recv_cls) {
                 zan_symbol_t *method_sym = resolve_overload(recv_cls, callee->member.name, expr->call.args.count);
+                    if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
                     for (int fi = 0; fi < g->function_count; fi++) {
                         if (g->functions[fi].sym == method_sym) {
@@ -6781,6 +7210,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 zan_symbol_t *type_sym = zan_binder_lookup(g->binder, obj->member.name);
                 if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
                     zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
+                    if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
                         for (int fi = 0; fi < g->function_count; fi++) {
                             if (g->functions[fi].sym == method_sym) {
@@ -6817,6 +7247,41 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* extension method call: recv.M(args) lowers to the static method
+         * Ext.M(recv, args) whose first parameter is declared `this T`. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_type_t *recv_ty = infer_expr_type(g, callee->member.object, locals);
+            zan_symbol_t *method_sym =
+                find_extension_method(g, recv_ty, callee->member.name,
+                                      expr->call.args.count);
+            if (method_sym) {
+                for (int fi = 0; fi < g->function_count; fi++) {
+                    if (g->functions[fi].sym == method_sym) {
+                        int argc = expr->call.args.count + 1;
+                        LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
+                        call_args[0] = emit_arg_typed(g, callee->member.object,
+                            method_param_type(g, method_sym, 0), locals);
+                        for (int k = 0; k < expr->call.args.count; k++) {
+                            call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
+                                method_param_type(g, method_sym, k + 1), locals);
+                        }
+                        const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "extcall";
+                        coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
+                        LLVMValueRef result = LLVMBuildCall2(g->builder, g->functions[fi].fn_type,
+                            g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                        emit_release_owned_call_temp(g, callee->member.object, call_args[0], locals);
+                        for (int k = 0; k < expr->call.args.count; k++) {
+                            emit_release_owned_call_temp(g, expr->call.args.items[k],
+                                call_args[k + 1], locals);
+                        }
+                        free(call_args);
+                        return result;
+                    }
+                }
+            }
+        }
+
         /* bare function name call: Compute(21) → look up in current class then global */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
             zan_istr_t fn_name = expr->call.callee->ident.name;
@@ -6824,6 +7289,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             /* try current class methods first */
             if (g->current_type_sym) {
                 zan_symbol_t *method_sym = resolve_overload(g->current_type_sym, fn_name, expr->call.args.count);
+                    if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
                     for (int fi = 0; fi < g->function_count; fi++) {
                         if (g->functions[fi].sym == method_sym) {
@@ -6997,12 +7463,14 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     lens[i] = needed64;
                     owns[i] = 1;
                 } else {
-                    /* integer types — format with %lld */
+                    /* integer types — format with %lld (%llu for ulong) */
                     LLVMValueRef val64 = val;
                     if (LLVMGetIntTypeWidth(vt) < 64) {
                         val64 = LLVMBuildSExt(g->builder, val, i64, "ext");
                     }
-                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
+                    LLVMValueRef fmt = expr_is_ulong(g, part, locals)
+                        ? LLVMBuildGlobalStringPtr(g->builder, "%llu", "ufmt")
+                        : LLVMBuildGlobalStringPtr(g->builder, "%lld", "ifmt");
                     LLVMValueRef null_ptr = LLVMConstNull(i8ptr);
                     LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
                     LLVMValueRef snp_args1[] = { null_ptr, zero, fmt, val64 };
@@ -7104,7 +7572,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef strlen_type = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
                 /* strlen returns i64; `int` is i64 so return it directly. */
-                return LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
+                LLVMValueRef len = LLVMBuildCall2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
+                emit_release_owned_call_temp(g, expr->member.object, obj_val, locals);
+                return len;
             }
         }
 
@@ -7269,6 +7739,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     is_list = 1;
                 }
             }
+        } else {
+            /* General case: the base is any other expression that produces an
+             * array/string/list value — e.g. a method call `foo()[i]`, a
+             * parenthesized expression, or a nested index `a[i][j]`. Without
+             * this, arr_ptr stays NULL and the whole access silently folds to
+             * the constant 0 below. Evaluate the base value and recover its
+             * element/container type from the expression. */
+            arr_type = infer_expr_type(g, expr->index.object, locals);
+            if (arr_type) {
+                arr_ptr = emit_expr(g, expr->index.object, locals);
+                if (arr_type->name.len == 4 && memcmp(arr_type->name.str, "List", 4) == 0) {
+                    is_list = 1;
+                }
+            }
         }
         /* List indexer: list[i] -> load data[i] from list struct */
         if (arr_ptr && is_list) {
@@ -7376,6 +7860,132 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMBuildLoad2(g->builder, elem_llvm, elem_ptr, "elem");
         }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+    }
+
+    case AST_QUERY_EXPR: {
+        /* from x in src [where c]... select e — lowered to an eager loop that
+         * filters and projects into a fresh List<sel> */
+        static int query_counter = 0;
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        int mark = locals->count;
+
+        LLVMValueRef collection = emit_expr(g, expr->query.source, locals);
+        zan_type_t *src_ty = infer_expr_type(g, expr->query.source, locals);
+        zan_type_t *elem = container_elem_type(src_ty);
+        if (!elem) elem = g->binder->type_int;
+        LLVMTypeRef elem_llvm = map_type(g, elem);
+
+        /* select type, inferred with the range var briefly in scope */
+        local_add(locals, expr->query.var, NULL, elem);
+        zan_type_t *sel = infer_expr_type(g, expr->query.select, locals);
+        locals->count = mark;
+        if (!sel) sel = elem;
+
+        /* result list: synthesize and emit `new List<sel>()` */
+        zan_ast_node_t *sel_tr = zan_ast_new(g->arena, AST_TYPE_REF, expr->loc);
+        sel_tr->type_ref.name = sel->name;
+        zan_ast_list_init(&sel_tr->type_ref.type_args);
+        zan_ast_node_t *list_tr = zan_ast_new(g->arena, AST_TYPE_REF, expr->loc);
+        list_tr->type_ref.name = (zan_istr_t){"List", 4};
+        zan_ast_list_init(&list_tr->type_ref.type_args);
+        zan_ast_list_push(&list_tr->type_ref.type_args, sel_tr, g->arena);
+        zan_ast_node_t *new_list = zan_ast_new(g->arena, AST_NEW_EXPR, expr->loc);
+        new_list->new_expr.type = list_tr;
+        new_list->new_expr.is_array = false;
+        zan_ast_list_init(&new_list->new_expr.args);
+        LLVMValueRef list_val = emit_expr(g, new_list, locals);
+
+        /* hidden local holding the result so a synthetic `__q.Add(e)` call
+         * resolves through the normal List.Add path */
+        char qbuf[32];
+        snprintf(qbuf, sizeof(qbuf), "__q%d", query_counter++);
+        char *qn = zan_arena_strdup(g->arena, qbuf, strlen(qbuf));
+        zan_istr_t qname = {qn, (int)strlen(qn)};
+        LLVMValueRef list_alloc = LLVMBuildAlloca(g->builder, LLVMTypeOf(list_val), "q");
+        LLVMBuildStore(g->builder, list_val, list_alloc);
+        local_add(locals, qname, list_alloc,
+                  zan_binder_make_list_type(g->binder, sel));
+
+        /* iteration state */
+        LLVMValueRef col = LLVMBuildBitCast(g->builder, collection,
+            LLVMPointerType(g->list_struct_type, 0), "qcol");
+        LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            col, 0, "qcntp");
+        LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cnt_ptr, "qcnt");
+        LLVMValueRef data_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
+            col, 2, "qdatap");
+        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+            data_ptr, "qdata");
+        LLVMValueRef idx_alloc = LLVMBuildAlloca(g->builder, i64, "qi");
+        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
+        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, elem_llvm, "qv");
+        local_add(locals, expr->query.var, iter_alloc, elem);
+
+        LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.cond");
+        LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.body");
+        LLVMBasicBlockRef inc_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.inc");
+        LLVMBasicBlockRef end_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.end");
+
+        LLVMBuildBr(g->builder, cond_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+        LLVMValueRef idx_val = LLVMBuildLoad2(g->builder, i64, idx_alloc, "qiv");
+        LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSLT, idx_val, count, "qcmp");
+        LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, body_bb);
+        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_val, 1, "qep");
+        LLVMValueRef ev = LLVMBuildLoad2(g->builder, i64, elem_ptr, "qelem");
+        LLVMTypeKind ek = LLVMGetTypeKind(elem_llvm);
+        if (ek == LLVMPointerTypeKind)
+            ev = LLVMBuildIntToPtr(g->builder, ev, elem_llvm, "qelp");
+        else if (ek == LLVMDoubleTypeKind)
+            ev = LLVMBuildBitCast(g->builder, ev, elem_llvm, "qelf");
+        else if (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(elem_llvm) < 64)
+            ev = LLVMBuildTrunc(g->builder, ev, elem_llvm, "qelt");
+        LLVMBuildStore(g->builder, ev, iter_alloc);
+
+        /* where clauses: any false condition skips to the increment */
+        for (int wi = 0; wi < expr->query.wheres.count; wi++) {
+            LLVMValueRef c = emit_expr(g, expr->query.wheres.items[wi], locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(c)) == LLVMIntegerTypeKind &&
+                LLVMGetIntTypeWidth(LLVMTypeOf(c)) != 1)
+                c = LLVMBuildICmp(g->builder, LLVMIntNE, c,
+                                  LLVMConstNull(LLVMTypeOf(c)), "qw");
+            LLVMBasicBlockRef pass_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, fn, "q.pass");
+            LLVMBuildCondBr(g->builder, c, pass_bb, inc_bb);
+            LLVMPositionBuilderAtEnd(g->builder, pass_bb);
+        }
+
+        /* __q.Add(select) through the normal lowering */
+        zan_ast_node_t *qid = zan_ast_new(g->arena, AST_IDENTIFIER, expr->loc);
+        qid->ident.name = qname;
+        zan_ast_node_t *madd = zan_ast_new(g->arena, AST_MEMBER_ACCESS, expr->loc);
+        madd->member.object = qid;
+        madd->member.name = (zan_istr_t){"Add", 3};
+        madd->member.null_cond = 0;
+        zan_ast_node_t *addcall = zan_ast_new(g->arena, AST_CALL, expr->loc);
+        addcall->call.callee = madd;
+        zan_ast_list_init(&addcall->call.args);
+        zan_ast_list_init(&addcall->call.type_args);
+        zan_ast_list_push(&addcall->call.args, expr->query.select, g->arena);
+        emit_expr(g, addcall, locals);
+        LLVMBuildBr(g->builder, inc_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, inc_bb);
+        LLVMValueRef next = LLVMBuildAdd(g->builder,
+            LLVMBuildLoad2(g->builder, i64, idx_alloc, "qi2"),
+            LLVMConstInt(i64, 1, 0), "qnext");
+        LLVMBuildStore(g->builder, next, idx_alloc);
+        LLVMBuildBr(g->builder, cond_bb);
+
+        LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        emit_release_owned_call_temp(g, expr->query.source, collection, locals);
+        locals->count = mark;
+        (void)i8ptr;
+        return list_val;
     }
 
     case AST_NEW_EXPR: {
@@ -7718,6 +8328,30 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         zan_type_t *tt = zan_binder_resolve_type(g->binder, expr->cast.type);
         LLVMTypeRef target = tt ? map_type(g, tt) : LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef src = LLVMTypeOf(val);
+        /* Unsigned/small targets share the i64 representation, so their cast
+         * semantics are wrap-to-width masks (zero-extend for uint/ushort,
+         * sign-extend from 8 bits for sbyte) applied on the i64 value. */
+        if (tt && LLVMGetTypeKind(src) == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(src) == 64) {
+            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+            switch (tt->kind) {
+            case TYPE_UINT:
+                return LLVMBuildAnd(g->builder, val,
+                    LLVMConstInt(i64t, 0xFFFFFFFFull, 0), "cast.u32");
+            case TYPE_USHORT:
+                return LLVMBuildAnd(g->builder, val,
+                    LLVMConstInt(i64t, 0xFFFFull, 0), "cast.u16");
+            case TYPE_SBYTE: {
+                LLVMValueRef sh = LLVMConstInt(i64t, 56, 0);
+                LLVMValueRef up = LLVMBuildShl(g->builder, val, sh, "cast.i8.l");
+                return LLVMBuildAShr(g->builder, up, sh, "cast.i8");
+            }
+            case TYPE_ULONG:
+                return val;
+            default:
+                break;
+            }
+        }
         if (src == target) return val;
         LLVMTypeKind sk = LLVMGetTypeKind(src);
         LLVMTypeKind tk = LLVMGetTypeKind(target);
@@ -7749,8 +8383,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_TYPEOF_EXPR: {
-        /* typeof(x) — return type name as string */
-        return emit_string_literal_rc(g, (zan_istr_t){ "object", 6 });
+        /* typeof(T) — the type's display name as a string */
+        char buf[256];
+        int len = render_type_ref_name(expr->cast.type, buf, (int)sizeof(buf));
+        char *copy = zan_arena_strdup(g->arena, buf, (size_t)len);
+        return emit_string_literal_rc(g, (zan_istr_t){ copy, (uint32_t)len });
     }
 
     case AST_THIS_EXPR: {
@@ -8227,6 +8864,27 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
         return emit_lambda_typed(g, arg, ptype, locals);
     }
     return emit_expr(g, arg, locals);
+}
+
+/* `ref x` / `out x` / `out T x` argument: pass the address of the local's
+ * storage slot. An inline `out T x` declares a fresh zero-initialised local
+ * in the caller's scope first. */
+static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
+                                 local_scope_t *locals) {
+    zan_ast_node_t *tgt = arg->ref_arg.expr;
+    if (arg->ref_arg.decl_type && tgt && tgt->kind == AST_IDENTIFIER) {
+        zan_type_t *dt = zan_binder_resolve_type(g->binder, arg->ref_arg.decl_type);
+        LLVMTypeRef lt = map_type(g, dt);
+        LLVMValueRef a = LLVMBuildAlloca(g->builder, lt, "out");
+        LLVMBuildStore(g->builder, LLVMConstNull(lt), a);
+        local_add(locals, tgt->ident.name, a, dt);
+        return a;
+    }
+    if (tgt && tgt->kind == AST_IDENTIFIER) {
+        local_var_t *l = local_find(locals, tgt->ident.name);
+        if (l) return l->alloca;
+    }
+    return emit_expr(g, tgt, locals);
 }
 
 /* ---- async/await CPS lowering helpers ---- */
@@ -8966,6 +9624,25 @@ static int rc_array_local_escapes(zan_irgen_t *g, zan_istr_t nm) {
 
 /* ---- statement codegen ---- */
 
+/* Find or create the basic block for a goto label in the current function. */
+static LLVMBasicBlockRef irgen_goto_label(zan_irgen_t *g, zan_istr_t name) {
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    for (int i = 0; i < g->goto_label_count; i++) {
+        if (g->goto_labels[i].fn == fn &&
+            g->goto_labels[i].name.len == name.len &&
+            memcmp(g->goto_labels[i].name.str, name.str,
+                   (size_t)name.len) == 0)
+            return g->goto_labels[i].bb;
+    }
+    if (g->goto_label_count >= 256) return NULL;
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "label");
+    g->goto_labels[g->goto_label_count].name = name;
+    g->goto_labels[g->goto_label_count].fn = fn;
+    g->goto_labels[g->goto_label_count].bb = bb;
+    g->goto_label_count++;
+    return bb;
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
@@ -9636,6 +10313,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* evaluate collection */
         LLVMValueRef collection = emit_expr(g, stmt->foreach_stmt.collection, locals);
 
+        /* element type: declared loop-var type, else inferred from collection */
+        zan_type_t *elem_type = NULL;
+        if (stmt->foreach_stmt.var_type)
+            elem_type = zan_binder_resolve_type(g->binder, stmt->foreach_stmt.var_type);
+        if (!elem_type || elem_type->kind == TYPE_ERROR)
+            elem_type = container_elem_type(
+                infer_expr_type(g, stmt->foreach_stmt.collection, locals));
+        if (!elem_type) elem_type = g->binder->type_int;
+        LLVMTypeRef elem_llvm = map_type(g, elem_type);
+
         /* get count: field 0 of List struct */
         LLVMValueRef cnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
             collection, 0, "cnt_ptr");
@@ -9652,8 +10339,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
 
         /* iteration variable */
-        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, i64, "fv");
-        local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, g->binder->type_int);
+        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, elem_llvm, "fv");
+        local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, elem_type);
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.cond");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.body");
@@ -9666,9 +10353,18 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMBuildCondBr(g->builder, cmp, body_bb, end_bb);
 
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
-        /* load current element */
+        /* load current element; slots physically hold an i64, so pointer
+         * (class/string) elements need inttoptr, doubles a bitcast, and
+         * narrower integers a trunc back to the value type */
         LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &idx_val, 1, "ep");
         LLVMValueRef elem = LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
+        LLVMTypeKind ek = LLVMGetTypeKind(elem_llvm);
+        if (ek == LLVMPointerTypeKind)
+            elem = LLVMBuildIntToPtr(g->builder, elem, elem_llvm, "elp");
+        else if (ek == LLVMDoubleTypeKind)
+            elem = LLVMBuildBitCast(g->builder, elem, elem_llvm, "elf");
+        else if (ek == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(elem_llvm) < 64)
+            elem = LLVMBuildTrunc(g->builder, elem, elem_llvm, "elt");
         LLVMBuildStore(g->builder, elem, iter_alloc);
 
         emit_stmt(g, stmt->foreach_stmt.body, locals);
@@ -9686,23 +10382,84 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
+        /* an owned temporary collection (e.g. iterating a call result) is
+         * consumed by the loop and released once iteration ends */
+        emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
+                                     collection, locals);
+        break;
+    }
+
+    case AST_LOCK_STMT: {
+        /* lock (expr) body — enter/exit the runtime monitor around the body */
+        g->uses_sync_runtime = true;
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef mon_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                              &i8ptr, 1, 0);
+        LLVMValueRef enter_fn = LLVMGetNamedFunction(g->mod, "zan_monitor_enter");
+        if (!enter_fn)
+            enter_fn = LLVMAddFunction(g->mod, "zan_monitor_enter", mon_ty);
+        LLVMValueRef exit_fn = LLVMGetNamedFunction(g->mod, "zan_monitor_exit");
+        if (!exit_fn)
+            exit_fn = LLVMAddFunction(g->mod, "zan_monitor_exit", mon_ty);
+
+        LLVMValueRef obj = emit_expr(g, stmt->lock_stmt.expr, locals);
+        LLVMTypeRef ot = LLVMTypeOf(obj);
+        if (LLVMGetTypeKind(ot) == LLVMIntegerTypeKind)
+            obj = LLVMBuildIntToPtr(g->builder, obj, i8ptr, "lockp");
+        else if (LLVMGetTypeKind(ot) == LLVMPointerTypeKind && ot != i8ptr)
+            obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "lockp");
+        LLVMBuildCall2(g->builder, mon_ty, enter_fn, &obj, 1, "");
+        emit_stmt(g, stmt->lock_stmt.body, locals);
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildCall2(g->builder, mon_ty, exit_fn, &obj, 1, "");
+        break;
+    }
+
+    case AST_LABEL_STMT: {
+        LLVMBasicBlockRef bb = irgen_goto_label(g, stmt->ident.name);
+        if (!bb) break;
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildBr(g->builder, bb);
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        break;
+    }
+
+    case AST_GOTO_STMT: {
+        LLVMValueRef gfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+        LLVMBasicBlockRef bb = irgen_goto_label(g, stmt->ident.name);
+        if (!bb) break;
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildBr(g->builder, bb);
+        /* anything after an unconditional goto is unreachable; park in a
+         * fresh block so subsequent emission stays well-formed */
+        LLVMBasicBlockRef cont =
+            LLVMAppendBasicBlockInContext(g->ctx, gfn, "goto.cont");
+        LLVMPositionBuilderAtEnd(g->builder, cont);
         break;
     }
 
     case AST_THROW_STMT: {
-        /* throw expr; — release ARC locals, print error, and exit */
+        /* throw expr; — print the thrown message, release ARC locals, exit */
         LLVMValueRef val = emit_expr(g, stmt->throw_stmt.value, locals);
-        /* ARC cleanup: release all managed locals before aborting */
-        release_all_arc_locals(g, locals);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-        LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
-            "Unhandled exception\n", "exfmt");
-        LLVMValueRef args[] = { fmt };
         LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
         if (printf_fn) {
-            LLVMBuildCall2(g->builder, LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
-                &i8ptr, 1, 1), printf_fn, args, 1, "");
+            LLVMTypeRef printf_ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx),
+                &i8ptr, 1, 1);
+            if (LLVMTypeOf(val) == i8ptr) {
+                LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                    "Unhandled exception: %s\n", "exfmt");
+                LLVMValueRef args[] = { fmt, val };
+                LLVMBuildCall2(g->builder, printf_ty, printf_fn, args, 2, "");
+            } else {
+                LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                    "Unhandled exception\n", "exfmt");
+                LLVMValueRef args[] = { fmt };
+                LLVMBuildCall2(g->builder, printf_ty, printf_fn, args, 1, "");
+            }
         }
+        /* ARC cleanup: release all managed locals before aborting */
+        release_all_arc_locals(g, locals);
         /* call exit(1) */
         LLVMTypeRef exit_args[] = { LLVMInt32TypeInContext(g->ctx) };
         LLVMTypeRef exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
@@ -9801,6 +10558,23 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     }
     LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 0), g_argc);
     LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 1), g_argv);
+
+    /* Programs emit UTF-8 bytes; the Windows console defaults to the legacy
+     * OEM/ANSI code page, which renders CJK/accented output as mojibake.
+     * Switch the console to UTF-8 (65001). Only affects console rendering:
+     * output redirected to a pipe/file keeps its raw UTF-8 bytes. */
+    if (g->target_is_windows) {
+        LLVMValueRef set_out_cp = LLVMGetNamedFunction(g->mod, "SetConsoleOutputCP");
+        LLVMTypeRef setcp_type = LLVMFunctionType(i32ty, (LLVMTypeRef[]){ i32ty }, 1, 0);
+        if (!set_out_cp)
+            set_out_cp = LLVMAddFunction(g->mod, "SetConsoleOutputCP", setcp_type);
+        LLVMValueRef set_in_cp = LLVMGetNamedFunction(g->mod, "SetConsoleCP");
+        if (!set_in_cp)
+            set_in_cp = LLVMAddFunction(g->mod, "SetConsoleCP", setcp_type);
+        LLVMValueRef utf8cp = LLVMConstInt(i32ty, 65001, 0);
+        LLVMBuildCall2(g->builder, setcp_type, set_out_cp, &utf8cp, 1, "");
+        LLVMBuildCall2(g->builder, setcp_type, set_in_cp, &utf8cp, 1, "");
+    }
 
     g->current_fn = main_fn;
     g->current_fn_ret_type = LLVMInt32TypeInContext(g->ctx);
@@ -10080,7 +10854,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             for (int k = 0; k < param_count; k++) {
                 zan_ast_node_t *param = member->method_decl.params.items[k];
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
-                param_types[k + param_offset] = map_type(g, pt);
+                param_types[k + param_offset] = param->param.by_ref
+                    ? LLVMPointerType(map_type(g, pt), 0)
+                    : map_type(g, pt);
             }
 
             zan_type_t *ret_type = is_ctor ? g->binder->type_void
@@ -10422,9 +11198,16 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         /* bind method parameters */
         for (int k = 0; k < param_count; k++) {
             zan_ast_node_t *param = member->method_decl.params.items[k];
+            zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
+            if (param->param.by_ref) {
+                /* `ref`/`out`: the incoming pointer IS the storage slot, so
+                 * reads/writes go straight through to the caller's variable. */
+                local_add(locals, param->param.name,
+                          LLVMGetParam(fn, (unsigned)(k + param_offset)), pt);
+                continue;
+            }
             LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k + param_offset], "p");
             LLVMBuildStore(g->builder, LLVMGetParam(fn, (unsigned)(k + param_offset)), param_alloca);
-            zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
             local_add(locals, param->param.name, param_alloca, pt);
         }
 

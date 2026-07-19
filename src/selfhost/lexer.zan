@@ -211,6 +211,8 @@ class Lexer {
     int KeywordKind(string s) {
         if (s == "abstract") { return TK.Abstract(); }
         if (s == "as") { return TK.As(); }
+        if (s == "async") { return TK.Async(); }
+        if (s == "await") { return TK.Await(); }
         if (s == "base") { return TK.Base(); }
         if (s == "bool") { return TK.Bool(); }
         if (s == "break") { return TK.Break(); }
@@ -266,6 +268,11 @@ class Lexer {
         if (s == "virtual") { return TK.Virtual(); }
         if (s == "void") { return TK.Void(); }
         if (s == "while") { return TK.While(); }
+        if (s == "uint") { return TK.Uint(); }
+        if (s == "ulong") { return TK.Ulong(); }
+        if (s == "ushort") { return TK.Ushort(); }
+        if (s == "sbyte") { return TK.Sbyte(); }
+        if (s == "decimal") { return TK.Decimal(); }
         return TK.Ident();
     }
 
@@ -329,7 +336,13 @@ class Lexer {
             Adv();
             while (pos < n && (IsDigit(Peek()) || Peek() == 95)) { Adv(); }
         }
+        // numeric text excludes any trailing type suffix
         string t = src.Substring(start, pos - start);
+        // suffix: f/F (float), m/M (decimal, mapped to double)
+        if (pos < n && (Peek() == 102 || Peek() == 70 || Peek() == 109 || Peek() == 77)) {
+            isFloat = true;
+            Adv();
+        }
         if (isFloat) { return new Token(TK.FloatLit(), t, 0, startLine, startCol); }
         return new Token(TK.IntLit(), t, val, startLine, startCol);
     }
@@ -351,6 +364,80 @@ class Lexer {
         string t = src.Substring(start, pos - start);
         Adv(); // closing quote
         return new Token(TK.StringLit(), t, 0, startLine, startCol);
+    }
+
+    // Verbatim string @"...". No escape processing: backslashes are literal and
+    // a doubled quote ("") is a single literal quote; the string may span lines.
+    // Stored as an ordinary StringLit whose value round-trips through
+    // Irgen.DecodeStr, so each literal backslash is emitted here doubled.
+    Token Verbatim(int startLine, int startCol) {
+        Adv(); // @
+        Adv(); // opening quote
+        string t = "";
+        while (pos < n) {
+            int c = Peek();
+            if (c == 34) {
+                if (Peek2() == 34) { t = t + "\""; Adv(); Adv(); }
+                else { Adv(); break; }
+            } else if (c == 92) {
+                t = t + "\\\\";
+                Adv();
+            } else {
+                t = t + src.Substring(pos, 1);
+                Adv();
+            }
+        }
+        return new Token(TK.StringLit(), t, 0, startLine, startCol);
+    }
+
+    // Verbatim interpolated string $@"...{expr}...". Verbatim text rules (no
+    // escape processing, "" is a literal quote, may span lines) combined with
+    // {expr} interpolation. Spliced into the same concatenation token stream
+    // as InterpStr so the parser sees ordinary "+".
+    void InterpVerbatim(List<Token> toks, int sl, int sc) {
+        Adv(); // $ or @
+        Adv(); // @ or $
+        Adv(); // opening quote
+        toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), "", 0, sl, sc));
+        string seg = "";
+        while (pos < n) {
+            int c = Peek();
+            if (c == 34) {
+                if (Peek2() == 34) { seg = seg + "\""; Adv(); Adv(); continue; }
+                Adv(); // closing quote
+                break;
+            }
+            if (c == 123) {
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
+                seg = "";
+                Adv(); // '{'
+                toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+                toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+                int depth = 1;
+                while (pos < n && depth > 0) {
+                    SkipTrivia();
+                    if (pos >= n) { break; }
+                    int ic = Peek();
+                    if (ic == 125) { depth = depth - 1; Adv(); if (depth == 0) { break; } continue; }
+                    if (ic == 123) { depth = depth + 1; Adv(); continue; }
+                    if (IsAlpha(ic)) { toks.Add(Ident(line, col)); }
+                    else if (IsDigit(ic)) { toks.Add(Number(line, col)); }
+                    else if (ic == 34) { toks.Add(Str(line, col)); }
+                    else if (ic == 39) { toks.Add(CharLit(line, col)); }
+                    else { toks.Add(Punct(line, col)); }
+                }
+                toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+                continue;
+            }
+            if (c == 92) { seg = seg + "\\\\"; Adv(); continue; }
+            seg = seg + src.Substring(pos, 1);
+            Adv();
+        }
+        toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
+        toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
+        toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
     }
 
     // Interpolated string $"...{expr}...". Spliced into an ordinary
@@ -419,6 +506,9 @@ class Lexer {
             int c = Peek();
             if (c == 35) { Adv(); Directive(); }               // '#' preprocessor line
             else if (!PpActiveNow()) { while (pos < n && Peek() != 10) { Adv(); } }
+            else if (c == 36 && Peek2() == 64) { InterpVerbatim(toks, sl, sc); }
+            else if (c == 64 && Peek2() == 36) { InterpVerbatim(toks, sl, sc); }
+            else if (c == 64 && Peek2() == 34) { toks.Add(Verbatim(sl, sc)); }
             else if (c == 36 && Peek2() == 34) { InterpStr(toks, sl, sc); }
             else if (IsAlpha(c)) { toks.Add(Ident(sl, sc)); }
             else if (IsDigit(c)) { toks.Add(Number(sl, sc)); }
@@ -443,7 +533,11 @@ class Lexer {
         if (c == 58) { return Mk(TK.Colon(), sl, sc); }
         if (c == 44) { return Mk(TK.Comma(), sl, sc); }
         if (c == 46) { return Mk(TK.Dot(), sl, sc); }
-        if (c == 63) { return Mk(TK.Question(), sl, sc); }
+        if (c == 63) {
+            if (d == 63) { Adv(); return Mk(TK.QQ(), sl, sc); }
+            if (d == 46) { Adv(); return Mk(TK.QDot(), sl, sc); } // ?.
+            return Mk(TK.Question(), sl, sc);
+        }
         if (c == 126) { return Mk(TK.Bang(), sl, sc); } // ~ (reuse bang slot rarely used)
         if (c == 43) {
             if (d == 43) { Adv(); return Mk(TK.PlusPlus(), sl, sc); }
@@ -463,9 +557,17 @@ class Lexer {
             if (d == 61) { Adv(); return Mk(TK.SlashEq(), sl, sc); }
             return Mk(TK.Slash(), sl, sc);
         }
-        if (c == 37) { return Mk(TK.Percent(), sl, sc); }
+        if (c == 37) {
+            if (d == 61) { Adv(); return Mk(TK.PercentEq(), sl, sc); }
+            return Mk(TK.Percent(), sl, sc);
+        }
         if (c == 60) {
             if (d == 61) { Adv(); return Mk(TK.LessEq(), sl, sc); }
+            if (d == 60) {
+                Adv();
+                if (Peek() == 61) { Adv(); return Mk(TK.LessLessEq(), sl, sc); }
+                return Mk(TK.LessLess(), sl, sc);
+            }
             return Mk(TK.Less(), sl, sc);
         }
         if (c == 62) {
@@ -483,13 +585,18 @@ class Lexer {
         }
         if (c == 38) {
             if (d == 38) { Adv(); return Mk(TK.AmpAmp(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.AmpEq(), sl, sc); }
             return Mk(TK.Amp(), sl, sc);
         }
         if (c == 124) {
             if (d == 124) { Adv(); return Mk(TK.PipePipe(), sl, sc); }
+            if (d == 61) { Adv(); return Mk(TK.PipeEq(), sl, sc); }
             return Mk(TK.Pipe(), sl, sc);
         }
-        if (c == 94) { return Mk(TK.Caret(), sl, sc); }
+        if (c == 94) {
+            if (d == 61) { Adv(); return Mk(TK.CaretEq(), sl, sc); }
+            return Mk(TK.Caret(), sl, sc);
+        }
         return Mk(TK.Invalid(), sl, sc);
     }
 }
