@@ -6,6 +6,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Out,
     [string]$GameArgs = "",
     [int]$WaitMs = 1800,
+    [string]$Keys = "",
+    [int]$PostKeyWaitMs = 1200,
     [switch]$KeepOpen
 )
 $ErrorActionPreference = "Stop"
@@ -60,6 +62,12 @@ if ($h -eq [IntPtr]::Zero) { Write-Output "WINDOW-NOT-FOUND"; if(-not $KeepOpen)
 [WGShot]::SetWindowPos($h, [IntPtr](-2), 0, 0, 0, 0, 0x13) | Out-Null
 [WGShot]::SetForegroundWindow($h) | Out-Null
 Start-Sleep -Milliseconds 700
+
+if ($Keys -ne "") {
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.SendKeys]::SendWait($Keys)
+    Start-Sleep -Milliseconds $PostKeyWaitMs
+}
 
 $r = New-Object WGShot+RECT
 [WGShot]::GetWindowRect($h,[ref]$r) | Out-Null

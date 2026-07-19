@@ -62,9 +62,10 @@ class GlyphFont {
     static SdlTexture atlas;
     static bool tried;
     static bool ok;
-    static int cellW;
-    static int cellH;
+    static int cellW;   // design cell width (layout units)
+    static int cellH;   // design cell height (layout units)
     static int cols;
+    static int atlasScale;  // atlas is baked at this multiple of the design cell
     static int[] adv;   // advance width per glyph (codepoints 32..126)
 
     static int NextInt(string s, int[] pos) {
@@ -104,6 +105,8 @@ class GlyphFont {
         GlyphFont.cellH = GlyphFont.NextInt(meta, pos);
         GlyphFont.cols = GlyphFont.NextInt(meta, pos);
         int pad = GlyphFont.NextInt(meta, pos);
+        GlyphFont.atlasScale = GlyphFont.NextInt(meta, pos);
+        if (GlyphFont.atlasScale < 1) { GlyphFont.atlasScale = 1; }
         GlyphFont.adv = new int[95];
         int i = 0;
         while (i < 95) {
@@ -137,14 +140,17 @@ class GlyphFont {
         int pen = x;
         int dw = GlyphFont.cellW * scale / 6;
         int dh = GlyphFont.cellH * scale / 6;
+        int m = GlyphFont.atlasScale;
+        int scw = GlyphFont.cellW * m;
+        int sch = GlyphFont.cellH * m;
         int i = 0;
         while (i < text.Length) {
             int gi = (text[i] & 255) - 32;
             if (gi >= 0 && gi < 95) {
                 int col = gi % GlyphFont.cols;
                 int row = gi / GlyphFont.cols;
-                r.DrawTextureRegion(GlyphFont.atlas, col * GlyphFont.cellW,
-                    row * GlyphFont.cellH, GlyphFont.cellW, GlyphFont.cellH,
+                r.DrawTextureRegion(GlyphFont.atlas, col * scw,
+                    row * sch, scw, sch,
                     pen, y, dw, dh);
                 pen = pen + GlyphFont.adv[gi] * scale / 6;
             } else {
@@ -179,8 +185,14 @@ class Host {
         h.r = SdlRenderer.Create(h.window);
         h.r.SetBlend(1);
         h.r.SetVSync(true);
-        h.r.SetLogicalSize(logicalW, logicalH,
+        // Rasterize the whole scene at ~native 4K by super-scaling the logical
+        // canvas 3x; on a ~3840px display this is 1:1 (razor-sharp vectors),
+        // and it merely down-samples cleanly on smaller windows. Game code keeps
+        // authoring in the fixed design units (logicalW x logicalH).
+        int f = 3;
+        h.r.SetLogicalSize(logicalW * f, logicalH * f,
             SdlLogicalPresentation.Letterbox());
+        h.r.SetUiScale(f, 1);
         h.logicalW = logicalW;
         h.logicalH = logicalH;
         h.running = true;
@@ -200,8 +212,14 @@ class Host {
     }
     bool IsFullscreen() { return this.fullscreen; }
 
-    int MouseX() { return this.r.LogicalX(SdlEvent.MouseX(), SdlEvent.MouseY()); }
-    int MouseY() { return this.r.LogicalY(SdlEvent.MouseX(), SdlEvent.MouseY()); }
+    int MouseX() {
+        return this.r.LogicalX(SdlEvent.MouseX(), SdlEvent.MouseY())
+            * this.r.ScaleDen() / this.r.ScaleNum();
+    }
+    int MouseY() {
+        return this.r.LogicalY(SdlEvent.MouseX(), SdlEvent.MouseY())
+            * this.r.ScaleDen() / this.r.ScaleNum();
+    }
 
     void Begin(int cr, int cg, int cb) {
         this.r.SetColor(cr, cg, cb, 255);
@@ -264,12 +282,63 @@ class Draw {
     static void FillCircle(SdlRenderer r, int cx, int cy, int rad,
                            int cr, int cg, int cb, int ca) {
         if (rad <= 0) { return; }
+        // Rasterize at native resolution (after super-scale) so the circle is
+        // smooth rather than a scaled-up low-res disc.
+        int scx = r.Sc(cx); int scy = r.Sc(cy); int srad = r.Sc(rad);
         r.SetColor(cr, cg, cb, ca);
-        int dy = -rad;
-        while (dy <= rad) {
-            int dx = Draw.Isqrt(rad * rad - dy * dy);
-            r.FillRect(cx - dx, cy + dy, dx * 2 + 1, 1);
+        int dy = -srad;
+        while (dy <= srad) {
+            int dx = Draw.Isqrt(srad * srad - dy * dy);
+            r.FillRectRaw(scx - dx, scy + dy, dx * 2 + 1, 1);
             dy = dy + 1;
+        }
+    }
+
+    // Axis-aligned filled ellipse, rasterized at native resolution.
+    static void FillEllipse(SdlRenderer r, int cx, int cy, int rx, int ry,
+                            int cr, int cg, int cb, int ca) {
+        if (rx <= 0 || ry <= 0) { return; }
+        int scx = r.Sc(cx); int scy = r.Sc(cy);
+        int srx = r.Sc(rx); int sry = r.Sc(ry);
+        r.SetColor(cr, cg, cb, ca);
+        int dy = -sry;
+        while (dy <= sry) {
+            int t = sry * sry - dy * dy;
+            if (t < 0) { t = 0; }
+            int dx = Draw.Isqrt(srx * srx * t) / sry;
+            r.FillRectRaw(scx - dx, scy + dy, dx * 2 + 1, 1);
+            dy = dy + 1;
+        }
+    }
+
+    // Filled triangle (any orientation), rasterized at native resolution.
+    static void FillTriangle(SdlRenderer r, int ax, int ay, int bx, int by,
+                             int ccx, int ccy, int cr, int cg, int cb, int ca) {
+        int x0 = r.Sc(ax); int y0 = r.Sc(ay);
+        int x1 = r.Sc(bx); int y1 = r.Sc(by);
+        int x2 = r.Sc(ccx); int y2 = r.Sc(ccy);
+        // sort by y ascending
+        if (y1 < y0) { int t; t=x0;x0=x1;x1=t; t=y0;y0=y1;y1=t; }
+        if (y2 < y0) { int t; t=x0;x0=x2;x2=t; t=y0;y0=y2;y2=t; }
+        if (y2 < y1) { int t; t=x1;x1=x2;x2=t; t=y1;y1=y2;y2=t; }
+        r.SetColor(cr, cg, cb, ca);
+        int y = y0;
+        while (y <= y2) {
+            int xa; int xb;
+            if (y2 == y0) { xa = x0; xb = x2; }
+            else { xa = x0 + (x2 - x0) * (y - y0) / (y2 - y0); }
+            if (y < y1) {
+                if (y1 == y0) { xb = x1; }
+                else { xb = x0 + (x1 - x0) * (y - y0) / (y1 - y0); }
+            } else {
+                if (y2 == y1) { xb = x2; }
+                else { xb = x1 + (x2 - x1) * (y - y1) / (y2 - y1); }
+            }
+            if (y2 != y0) { xa = x0 + (x2 - x0) * (y - y0) / (y2 - y0); }
+            int lo = xa; int hi = xb;
+            if (lo > hi) { int t = lo; lo = hi; hi = t; }
+            r.FillRectRaw(lo, y, hi - lo + 1, 1);
+            y = y + 1;
         }
     }
 
@@ -284,6 +353,55 @@ class Draw {
 
     static bool PointIn(int px, int py, int x, int y, int w, int h) {
         return px >= x && px < x + w && py >= y && py < y + h;
+    }
+
+    // Filled rectangle with rounded corners.
+    static void RoundRectFill(SdlRenderer r, int x, int y, int w, int h, int rad,
+                              int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        r.SetColor(cr, cg, cb, ca);
+        if (rad < 1) { r.FillRect(x, y, w, h); return; }
+        r.FillRect(x + rad, y, w - rad * 2, h);
+        r.FillRect(x, y + rad, rad, h - rad * 2);
+        r.FillRect(x + w - rad, y + rad, rad, h - rad * 2);
+        Draw.FillCircle(r, x + rad, y + rad, rad, cr, cg, cb, ca);
+        Draw.FillCircle(r, x + w - rad - 1, y + rad, rad, cr, cg, cb, ca);
+        Draw.FillCircle(r, x + rad, y + h - rad - 1, rad, cr, cg, cb, ca);
+        Draw.FillCircle(r, x + w - rad - 1, y + h - rad - 1, rad, cr, cg, cb, ca);
+    }
+
+    // Rounded-rectangle stroke of thickness t drawn just outside (x,y,w,h).
+    static void RoundRectStroke(SdlRenderer r, int x, int y, int w, int h, int rad,
+                                int t, int cr, int cg, int cb, int ca) {
+        Draw.RoundRectFill(r, x - t, y - t, w + t * 2, h + t * 2, rad + t, cr, cg, cb, ca);
+    }
+
+    // Vertical gradient band (top color -> bottom color), simple scanlines.
+    static void VGradient(SdlRenderer r, int x, int y, int w, int h,
+                          int r0, int g0, int b0, int r1, int g1, int b1, int ca) {
+        if (h <= 0) { return; }
+        int j = 0;
+        while (j < h) {
+            int cr = r0 + (r1 - r0) * j / h;
+            int cg = g0 + (g1 - g0) * j / h;
+            int cb = b0 + (b1 - b0) * j / h;
+            r.SetColor(cr, cg, cb, ca);
+            r.FillRect(x, y + j, w, 1);
+            j = j + 1;
+        }
+    }
+
+    // Bottom-weighted darkening scrim to keep foreground text legible over art.
+    static void Scrim(SdlRenderer r, int w, int h) {
+        Draw.VGradient(r, 0, 0, w, h, 6, 8, 14, 6, 8, 14, 70);
+        Draw.VGradient(r, 0, h * 3 / 5, w, h * 2 / 5, 6, 8, 14, 8, 10, 16, 150);
+    }
+
+    static bool PointInCircle(int px, int py, int cx, int cy, int rad) {
+        int dx = px - cx; int dy = py - cy;
+        return dx * dx + dy * dy <= rad * rad;
     }
 }
 
@@ -386,5 +504,84 @@ class Text {
         int w = Font.Measure(text, scale);
         if (GlyphFont.Ready(r)) { w = GlyphFont.Measure(text, scale); }
         Text.Draw(r, text, centerX - w / 2, y, scale, cr, cg, cb, ca);
+    }
+
+    static int Width(SdlRenderer r, string text, int scale) {
+        if (GlyphFont.Ready(r)) { return GlyphFont.Measure(text, scale); }
+        return Font.Measure(text, scale);
+    }
+
+    // Text with a soft drop shadow for legibility over rich backgrounds.
+    static void DrawShadow(SdlRenderer r, string text, int x, int y, int scale,
+                           int cr, int cg, int cb, int off) {
+        Text.Draw(r, text, x + off, y + off, scale, 0, 0, 0, 150);
+        Text.Draw(r, text, x, y, scale, cr, cg, cb, 255);
+    }
+
+    static void DrawCenteredShadow(SdlRenderer r, string text, int centerX, int y,
+                                   int scale, int cr, int cg, int cb, int off) {
+        int w = Text.Width(r, text, scale);
+        Text.DrawShadow(r, text, centerX - w / 2, y, scale, cr, cg, cb, off);
+    }
+}
+
+// Shared, polished UI kit: frosted panels, three-state stroked buttons, and a
+// cover-fitted background image. Used by every game menu so they share one
+// refined look instead of flat programmer-art rectangles.
+class Ui {
+    // Draw a background texture stretched to fully cover the logical canvas,
+    // then a legibility scrim on top.
+    static void Backdrop(SdlRenderer r, SdlTexture bg, int w, int h) {
+        if (bg != null) {
+            r.DrawTexture(bg, 0, 0, w, h);
+        } else {
+            Draw.VGradient(r, 0, 0, w, h, 18, 22, 32, 8, 10, 16, 255);
+        }
+        Draw.Scrim(r, w, h);
+    }
+
+    // Frosted translucent rounded panel with a hairline border.
+    static void Panel(SdlRenderer r, int x, int y, int w, int h,
+                      int cr, int cg, int cb, int ca) {
+        Draw.RoundRectStroke(r, x, y, w, h, 14, 1, 255, 255, 255, 22);
+        Draw.RoundRectFill(r, x, y, w, h, 14, cr, cg, cb, ca);
+        // top sheen
+        Draw.RoundRectFill(r, x + 2, y + 2, w - 4, h / 3, 12, 255, 255, 255, 12);
+    }
+
+    // Three-state stroked, glossy rounded button. kind: 0 normal, 1 accent,
+    // 2 selected. Returns true when hovered.
+    static bool Button(SdlRenderer r, int mx, int my, int x, int y, int w, int h,
+                       string label, int scale, int kind) {
+        bool hov = Draw.PointIn(mx, my, x, y, w, h);
+        // body mid color + darker bottom shade, chosen per state
+        int mr = 58; int mg = 64; int mb = 80;
+        int dr = 30; int dg = 34; int db = 46;
+        int tc = 236;
+        if (kind == 1) {
+            mr = 52; mg = 138; mb = 92; dr = 30; dg = 96; db = 62;
+            if (hov) { mr = 64; mg = 162; mb = 108; }
+        } else if (kind == 2) {
+            mr = 224; mg = 176; mb = 66; dr = 196; dg = 146; db = 40;
+            tc = 36;
+        } else if (hov) {
+            mr = 74; mg = 82; mb = 102; dr = 42; dg = 48; db = 62;
+        }
+        int rad = 12;
+        if (hov) {
+            int gr = 120; int gg = 180; int gb = 240;
+            if (kind == 1) { gr = 120; gg = 230; gb = 170; }
+            if (kind == 2) { gr = 250; gg = 210; gb = 110; }
+            Draw.RoundRectFill(r, x - 5, y - 5, w + 10, h + 10, rad + 5, gr, gg, gb, 55);
+        }
+        // dark border, then rounded body on top (true rim, does not cover body)
+        Draw.RoundRectFill(r, x - 2, y - 2, w + 4, h + 4, rad + 2, 8, 10, 16, 240);
+        Draw.RoundRectFill(r, x, y, w, h, rad, mr, mg, mb, 255);
+        // bottom shade + top sheen for a glossy read
+        Draw.RoundRectFill(r, x + 2, y + h / 2, w - 4, h / 2 - 3, rad, dr, dg, db, 150);
+        Draw.RoundRectFill(r, x + 3, y + 3, w - 6, h / 2 - 3, rad, 255, 255, 255, 38);
+        Text.DrawCenteredShadow(r, label, x + w / 2, y + h / 2 - 4 * scale, scale,
+                                tc, tc, tc, 2);
+        return hov;
     }
 }
