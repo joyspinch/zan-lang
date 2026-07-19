@@ -83,6 +83,9 @@ struct zan_irgen {
     /* break/continue targets */
     LLVMBasicBlockRef break_target;
     LLVMBasicBlockRef continue_target;
+    /* first body-scope local of the innermost loop: `break`/`continue`
+     * release owned locals from this index before leaving the body */
+    int loop_locals_base;
 
     /* constructors */
     struct {

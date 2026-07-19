@@ -3516,6 +3516,27 @@ static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
     }
 }
 
+/* Release owned locals in [start, count) without dropping them from the
+ * scope: used on `break`/`continue` edges, where the same locals remain in
+ * scope on the fall-through path and are released there separately. */
+static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *locals, int start) {
+    if (!locals) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = locals->count - 1; i >= start; i--) {
+        if (local_owns_arc(&locals->vars[i])) {
+            LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
+                                              locals->vars[i].alloca, "arc.rel");
+            emit_rc_release_for_type(g, locals->vars[i].type, cur);
+        } else if (locals->vars[i].arr_len && locals->vars[i].type) {
+            LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
+                                            locals->vars[i].alloca, "arr.rel");
+            LLVMValueRef nn = LLVMBuildLoad2(g->builder,
+                LLVMInt64TypeInContext(g->ctx), locals->vars[i].arr_len, "arr.n");
+            emit_array_release_elems(g, locals->vars[i].type->element_type, a, nn);
+        }
+    }
+}
+
 static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals, int start) {
     if (!locals || start >= locals->count) return;
     /* If the current block already ends in a terminator (e.g. the scope exited
@@ -5392,6 +5413,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     memcpy_fn, mcargs, 3, "");
                 LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &slen, 1, "endp");
                 LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+                emit_release_owned_call_temp(g, sc->member.object, s, locals);
                 return buf;
             }
         }
@@ -10089,8 +10111,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMBasicBlockRef saved_break = g->break_target;
         LLVMBasicBlockRef saved_cont = g->continue_target;
+        int saved_loop_base = g->loop_locals_base;
         g->break_target = end_bb;
         g->continue_target = cond_bb;
+        g->loop_locals_base = body_start;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -10113,6 +10137,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         g->break_target = saved_break;
         g->continue_target = saved_cont;
+        g->loop_locals_base = saved_loop_base;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         break;
@@ -10138,8 +10163,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMBasicBlockRef saved_break = g->break_target;
         LLVMBasicBlockRef saved_cont = g->continue_target;
+        int saved_loop_base = g->loop_locals_base;
         g->break_target = end_bb;
         g->continue_target = step_bb;
+        g->loop_locals_base = for_body_start;
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
@@ -10170,6 +10197,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         g->break_target = saved_break;
         g->continue_target = saved_cont;
+        g->loop_locals_base = saved_loop_base;
 
         LLVMPositionBuilderAtEnd(g->builder, end_bb);
         /* Drop the loop variables (and any owned init-clause locals) now that
@@ -10180,12 +10208,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
     case AST_BREAK_STMT:
         if (g->break_target) {
+            emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             LLVMBuildBr(g->builder, g->break_target);
         }
         break;
 
     case AST_CONTINUE_STMT:
         if (g->continue_target) {
+            emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             LLVMBuildBr(g->builder, g->continue_target);
         }
         break;
