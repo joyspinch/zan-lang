@@ -1,0 +1,896 @@
+// 围棋 -- a quiet 9x9 go salon. You play black against a local heuristic AI
+// with real capture/ko/suicide rules and area scoring (komi 7), plus classic
+// life-and-death drills (征子 / 直三杀 / 关门吃) that teach the eternal shapes.
+// Kaya board and slate/clamshell stone textures, capture bursts, floating
+// "提子" popups, rank progression (布衣→棋圣). All text uses the smooth TTF
+// atlases. F11 borderless fullscreen, Esc back/exit.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Weiqi;
+
+class WqProfile {
+    int pts;
+    int wins;
+    int losses;
+    int streak;
+    int bestStreak;
+    int drills;
+
+    static string Path() { return "weiqi_profile.txt"; }
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fb) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return WqProfile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fb;
+    }
+    static WqProfile Load() {
+        WqProfile p = new WqProfile();
+        if (!File.Exists(WqProfile.Path())) { return p; }
+        List<string> lines = File.ReadAllLines(WqProfile.Path());
+        p.pts = WqProfile.ReadKey(lines, "pts", 0);
+        p.wins = WqProfile.ReadKey(lines, "wins", 0);
+        p.losses = WqProfile.ReadKey(lines, "losses", 0);
+        p.streak = WqProfile.ReadKey(lines, "streak", 0);
+        p.bestStreak = WqProfile.ReadKey(lines, "bestStreak", 0);
+        p.drills = WqProfile.ReadKey(lines, "drills", 0);
+        return p;
+    }
+    void Save() {
+        string s = "pts=" + this.pts + "\nwins=" + this.wins
+            + "\nlosses=" + this.losses + "\nstreak=" + this.streak
+            + "\nbestStreak=" + this.bestStreak + "\ndrills=" + this.drills + "\n";
+        File.WriteAllText(WqProfile.Path(), s);
+    }
+    string Title() {
+        if (this.pts >= 420) { return "棋圣"; }
+        if (this.pts >= 260) { return "九段"; }
+        if (this.pts >= 150) { return "六段"; }
+        if (this.pts >= 70) { return "三段"; }
+        if (this.pts >= 25) { return "初段"; }
+        return "布衣";
+    }
+}
+
+class WqParticle {
+    int x; int y; int vx; int vy; int bornAt; int cr; int cg; int cb;
+}
+class WqPopup {
+    int x; int y; string text; int bornAt; int cr; int cg; int cb;
+}
+
+class WqGame {
+    Host host;
+    SdlRenderer r;
+    WqProfile prof;
+    Rng rng;
+
+    int[] board;      // 9x9: 0 empty, 1 black (player), 2 white (AI)
+    int scene;        // 0 menu, 1 play, 2 over
+    int mode;         // 0 game, 1..3 drills
+    int moves;
+    int lastSq;
+    int koSq;         // forbidden ko point or -1
+    int passes;       // consecutive passes
+    int capB;         // stones captured BY black
+    int capW;         // stones captured BY white
+    int winner;       // 1 player, 2 ai
+    int scoreB;
+    int scoreW;
+    int aiThinkAt;
+    bool aiTurn;
+    int mouseX;
+    int mouseY;
+    int toastAt;
+    string toastText;
+    int placedAt;
+    List<WqParticle> parts;
+    List<WqPopup> pops;
+    SdlTexture menuBg;
+    SdlTexture titleTex;
+    SdlTexture boardTex;
+    SdlTexture blackTex;
+    SdlTexture whiteTex;
+    bool texTried;
+    bool demo;
+    int demoAt;
+
+    static int N() { return 9; }
+    static int Cell() { return 64; }
+    static int BX() { return 120; }
+    static int BY() { return 104; }
+
+    static WqGame Create(Host h) {
+        WqGame g = new WqGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = WqProfile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 24680135);
+        g.scene = 0;
+        g.mouseX = 640;
+        g.mouseY = 360;
+        g.parts = new List<WqParticle>();
+        g.pops = new List<WqPopup>();
+        g.toastAt = -9999;
+        g.demo = File.Exists("weiqi_demo.txt");
+        if (g.demo) { g.StartGame(0, Sdl.Ticks()); }
+        return g;
+    }
+
+    void EnsureTex() {
+        if (this.texTried) { return; }
+        this.texTried = true;
+        this.menuBg = WqGame.LoadTex(this.r, "examples/game/weiqi/assets/menu_bg.png");
+        this.titleTex = WqGame.LoadTex(this.r, "examples/game/weiqi/assets/title.png");
+        this.boardTex = WqGame.LoadTex(this.r, "examples/game/weiqi/assets/board_wood.png");
+        this.blackTex = WqGame.LoadTex(this.r, "examples/game/weiqi/assets/stone_black.png");
+        this.whiteTex = WqGame.LoadTex(this.r, "examples/game/weiqi/assets/stone_white.png");
+    }
+    static SdlTexture LoadTex(SdlRenderer r, string path) {
+        string p = Assets.Find(path);
+        if (!File.Exists(p)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, p);
+        if (t == null || !t.IsValid()) { return null; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        return t;
+    }
+
+    // ----- feedback --------------------------------------------------------
+
+    void Toast(string t, int now) { this.toastText = t; this.toastAt = now; }
+    void AddPop(int px, int py, string t, int now, int cr, int cg, int cb) {
+        if (this.pops.Count > 14) { this.pops.RemoveAt(0); }
+        WqPopup p = new WqPopup();
+        p.x = px; p.y = py; p.text = t; p.bornAt = now;
+        p.cr = cr; p.cg = cg; p.cb = cb;
+        this.pops.Add(p);
+    }
+    void Burst(int px, int py, int n, int now, int cr, int cg, int cb) {
+        if (this.parts.Count > 240) { return; }
+        int i = 0;
+        while (i < n) {
+            WqParticle p = new WqParticle();
+            p.x = px * 256; p.y = py * 256;
+            int a = this.rng.Range(0, 16);
+            int spd = 60 + this.rng.Range(0, 160);
+            int ux = 0; int uy = 0;
+            int q = a % 4;
+            if (q == 0) { ux = 256; uy = (a / 4 - 2) * 128; }
+            if (q == 1) { ux = -256; uy = (a / 4 - 2) * 128; }
+            if (q == 2) { uy = 256; ux = (a / 4 - 2) * 128; }
+            if (q == 3) { uy = -256; ux = (a / 4 - 2) * 128; }
+            p.vx = ux * spd / 256;
+            p.vy = uy * spd / 256;
+            p.bornAt = now;
+            p.cr = cr; p.cg = cg; p.cb = cb;
+            this.parts.Add(p);
+            i = i + 1;
+        }
+    }
+
+    // ----- setup -----------------------------------------------------------
+
+    void Put(int x, int y, int c) { this.board[y * WqGame.N() + x] = c; }
+
+    void StartGame(int mode, int now) {
+        int n = WqGame.N();
+        this.board = new int[n * n];
+        this.mode = mode;
+        this.moves = 0;
+        this.lastSq = -1;
+        this.koSq = -1;
+        this.passes = 0;
+        this.capB = 0;
+        this.capW = 0;
+        this.winner = 0;
+        this.scoreB = 0;
+        this.scoreW = 0;
+        this.aiTurn = false;
+        this.parts = new List<WqParticle>();
+        this.pops = new List<WqPopup>();
+        this.toastAt = -9999;
+        if (mode == 1) {
+            // 征子: chase the lone white stone into the wall
+            this.Put(2, 3, 1); this.Put(3, 2, 1);
+            this.Put(3, 3, 2);
+            this.Toast("死活题·征子：黑先，叫吃到底提掉白子", now);
+        } else if (mode == 2) {
+            // 直三杀: white ring alive only through the three inner points
+            this.Put(2, 1, 2); this.Put(3, 1, 2); this.Put(4, 1, 2); this.Put(5, 1, 2); this.Put(6, 1, 2);
+            this.Put(2, 2, 2); this.Put(6, 2, 2);
+            this.Put(2, 3, 2); this.Put(3, 3, 2); this.Put(4, 3, 2); this.Put(5, 3, 2); this.Put(6, 3, 2);
+            this.Put(1, 1, 1); this.Put(1, 2, 1); this.Put(1, 3, 1);
+            this.Put(2, 0, 1); this.Put(3, 0, 1); this.Put(4, 0, 1); this.Put(5, 0, 1); this.Put(6, 0, 1);
+            this.Put(7, 1, 1); this.Put(7, 2, 1); this.Put(7, 3, 1);
+            this.Put(2, 4, 1); this.Put(3, 4, 1); this.Put(4, 4, 1); this.Put(5, 4, 1); this.Put(6, 4, 1);
+            this.Toast("死活题·直三杀：点在要害，白不得两眼", now);
+        } else if (mode == 3) {
+            // 关门吃: shut the door on the white cutter
+            this.Put(5, 6, 1); this.Put(6, 5, 1);
+            this.Put(6, 6, 2);
+            this.Toast("死活题·关门吃：一步关门，白子无路", now);
+        } else {
+            this.Toast("黑先，围地多者胜（贴七目）", now);
+        }
+        this.scene = 1;
+        if (this.demo) { this.demoAt = now + 500; }
+    }
+
+    static string DrillName(int m) {
+        if (m == 1) { return "征子"; }
+        if (m == 2) { return "直三杀"; }
+        return "关门吃";
+    }
+    static int DrillTarget(int m) {
+        if (m == 2) { return 8; }
+        return 1;
+    }
+
+    // ----- rules -----------------------------------------------------------
+
+    int At(int x, int y) {
+        int n = WqGame.N();
+        if (x < 0 || y < 0 || x >= n || y >= n) { return -1; }
+        return this.board[y * n + x];
+    }
+
+    // collects the group containing (x,y) into outSq; returns its liberties
+    int Group(int x, int y, List<int> outSq) {
+        int n = WqGame.N();
+        int c = this.At(x, y);
+        if (c <= 0) { return 0; }
+        bool[] seen = new bool[n * n];
+        bool[] libSeen = new bool[n * n];
+        List<int> stack = new List<int>();
+        stack.Add(y * n + x);
+        seen[y * n + x] = true;
+        int libs = 0;
+        while (stack.Count > 0) {
+            int sq = stack[stack.Count - 1];
+            stack.RemoveAt(stack.Count - 1);
+            outSq.Add(sq);
+            int sx = sq % n; int sy = sq / n;
+            int d = 0;
+            while (d < 4) {
+                int tx = sx; int ty = sy;
+                if (d == 0) { tx = sx + 1; }
+                if (d == 1) { tx = sx - 1; }
+                if (d == 2) { ty = sy + 1; }
+                if (d == 3) { ty = sy - 1; }
+                int v = this.At(tx, ty);
+                if (v == 0) {
+                    int tsq = ty * n + tx;
+                    if (!libSeen[tsq]) { libSeen[tsq] = true; libs = libs + 1; }
+                } else if (v == c) {
+                    int tsq = ty * n + tx;
+                    if (!seen[tsq]) { seen[tsq] = true; stack.Add(tsq); }
+                }
+                d = d + 1;
+            }
+        }
+        return libs;
+    }
+
+    // plays color c at (x,y); returns captured count or -1 if illegal
+    int TryPlay(int x, int y, int c, int now) {
+        int n = WqGame.N();
+        if (this.At(x, y) != 0) { return -1; }
+        int sq = y * n + x;
+        if (sq == this.koSq) { return -1; }
+        this.board[sq] = c;
+        int other = 3 - c;
+        int captured = 0;
+        int lastCapSq = -1;
+        int d = 0;
+        while (d < 4) {
+            int tx = x; int ty = y;
+            if (d == 0) { tx = x + 1; }
+            if (d == 1) { tx = x - 1; }
+            if (d == 2) { ty = y + 1; }
+            if (d == 3) { ty = y - 1; }
+            if (this.At(tx, ty) == other) {
+                List<int> g = new List<int>();
+                int libs = this.Group(tx, ty, g);
+                if (libs == 0) {
+                    int i = 0;
+                    while (i < g.Count) {
+                        this.board[g[i]] = 0;
+                        lastCapSq = g[i];
+                        int px = WqGame.BX() + (g[i] % n) * WqGame.Cell();
+                        int py = WqGame.BY() + (g[i] / n) * WqGame.Cell();
+                        this.Burst(px, py, 6, now, 255, 200, 110);
+                        i = i + 1;
+                    }
+                    captured = captured + g.Count;
+                }
+            }
+            d = d + 1;
+        }
+        List<int> own = new List<int>();
+        int ownLibs = this.Group(x, y, own);
+        if (captured == 0 && ownLibs == 0) {
+            this.board[sq] = 0;
+            return -1;
+        }
+        // simple ko: single-stone capture by a single lone stone
+        this.koSq = -1;
+        if (captured == 1 && own.Count == 1 && ownLibs == 1) { this.koSq = lastCapSq; }
+        return captured;
+    }
+
+    // probe without mutation: copies the board, plays, restores
+    int Probe(int x, int y, int c) {
+        int n = WqGame.N();
+        int[] save = new int[n * n];
+        int i = 0;
+        while (i < n * n) { save[i] = this.board[i]; i = i + 1; }
+        int res = this.TryPlayRaw(x, y, c);
+        i = 0;
+        while (i < n * n) { this.board[i] = save[i]; i = i + 1; }
+        return res;
+    }
+    // returns captured count, or -1 illegal (mutates board; caller restores)
+    int TryPlayRaw(int x, int y, int c) {
+        int n = WqGame.N();
+        if (this.At(x, y) != 0) { return -1; }
+        int sq = y * n + x;
+        if (sq == this.koSq) { return -1; }
+        this.board[sq] = c;
+        int other = 3 - c;
+        int captured = 0;
+        int d = 0;
+        while (d < 4) {
+            int tx = x; int ty = y;
+            if (d == 0) { tx = x + 1; }
+            if (d == 1) { tx = x - 1; }
+            if (d == 2) { ty = y + 1; }
+            if (d == 3) { ty = y - 1; }
+            if (this.At(tx, ty) == other) {
+                List<int> g = new List<int>();
+                int libs = this.Group(tx, ty, g);
+                if (libs == 0) {
+                    int i = 0;
+                    while (i < g.Count) { this.board[g[i]] = 0; i = i + 1; }
+                    captured = captured + g.Count;
+                }
+            }
+            d = d + 1;
+        }
+        List<int> own = new List<int>();
+        int ownLibs = this.Group(x, y, own);
+        if (captured == 0 && ownLibs == 0) { return -1; }
+        return captured;
+    }
+
+    // area scoring: stones + territory reachable from exactly one color
+    void Score() {
+        int n = WqGame.N();
+        int b = 0; int w = 0;
+        bool[] seen = new bool[n * n];
+        int i = 0;
+        while (i < n * n) {
+            int v = this.board[i];
+            if (v == 1) { b = b + 1; }
+            if (v == 2) { w = w + 1; }
+            if (v == 0 && !seen[i]) {
+                // flood-fill the empty region, note bordering colors
+                List<int> reg = new List<int>();
+                List<int> stack = new List<int>();
+                stack.Add(i);
+                seen[i] = true;
+                bool tb = false; bool tw = false;
+                while (stack.Count > 0) {
+                    int sq = stack[stack.Count - 1];
+                    stack.RemoveAt(stack.Count - 1);
+                    reg.Add(sq);
+                    int sx = sq % n; int sy = sq / n;
+                    int d = 0;
+                    while (d < 4) {
+                        int tx = sx; int ty = sy;
+                        if (d == 0) { tx = sx + 1; }
+                        if (d == 1) { tx = sx - 1; }
+                        if (d == 2) { ty = sy + 1; }
+                        if (d == 3) { ty = sy - 1; }
+                        int v2 = this.At(tx, ty);
+                        if (v2 == 0) {
+                            int tsq = ty * n + tx;
+                            if (!seen[tsq]) { seen[tsq] = true; stack.Add(tsq); }
+                        } else if (v2 == 1) { tb = true; }
+                        else if (v2 == 2) { tw = true; }
+                        d = d + 1;
+                    }
+                }
+                if (tb && !tw) { b = b + reg.Count; }
+                if (tw && !tb) { w = w + reg.Count; }
+            }
+            i = i + 1;
+        }
+        this.scoreB = b;
+        this.scoreW = w + 7;   // komi
+    }
+
+    void EndByScore(int now) {
+        this.Score();
+        if (this.scoreB > this.scoreW) { this.Win(1, now); } else { this.Win(2, now); }
+    }
+
+    void Win(int who, int now) {
+        this.winner = who;
+        this.scene = 2;
+        if (who == 1) {
+            int gain = 15;
+            if (this.mode > 0) { gain = 18; this.prof.drills = this.prof.drills + 1; }
+            this.prof.pts = this.prof.pts + gain;
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.bestStreak) { this.prof.bestStreak = this.prof.streak; }
+            this.Burst(640, 300, 60, now, 255, 210, 100);
+        } else {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            this.prof.pts = this.prof.pts - 5;
+            if (this.prof.pts < 0) { this.prof.pts = 0; }
+        }
+        this.prof.Save();
+    }
+
+    void Place(int x, int y, int c, int now) {
+        int n = WqGame.N();
+        int captured = this.TryPlay(x, y, c, now);
+        if (captured < 0) { return; }
+        this.moves = this.moves + 1;
+        this.passes = 0;
+        this.lastSq = y * n + x;
+        this.placedAt = now;
+        int sx = WqGame.BX() + x * WqGame.Cell();
+        int sy = WqGame.BY() + y * WqGame.Cell();
+        if (captured > 0) {
+            if (c == 1) { this.capB = this.capB + captured; }
+            else { this.capW = this.capW + captured; }
+            this.AddPop(sx, sy - 28, "提 " + captured + " 子", now, 255, 205, 110);
+            if (captured >= 3) { this.Toast("大块提子！痛快", now); }
+        }
+        // drill win check
+        if (this.mode > 0 && c == 1 && this.capB >= WqGame.DrillTarget(this.mode)) {
+            this.Win(1, now);
+            return;
+        }
+        this.aiTurn = (c == 1);
+        if (this.aiTurn) { this.aiThinkAt = now + 350 + this.rng.Range(0, 450); }
+    }
+
+    void PlayerPass(int now) {
+        if (this.aiTurn || this.scene != 1) { return; }
+        this.passes = this.passes + 1;
+        this.moves = this.moves + 1;
+        this.koSq = -1;
+        this.Toast("你选择停一手", now);
+        if (this.passes >= 2) { this.EndByScore(now); return; }
+        this.aiTurn = true;
+        this.aiThinkAt = now + 400;
+    }
+
+    // ----- AI --------------------------------------------------------------
+
+    int NeighborCount(int x, int y, int c) {
+        int k = 0;
+        int d = 0;
+        while (d < 8) {
+            int dx = d % 3 - 1;
+            int dy = d / 3 - 1;
+            if (this.At(x + dx, y + dy) == c) { k = k + 1; }
+            d = d + 1;
+        }
+        return k;
+    }
+
+    int AiScoreMove(int x, int y) {
+        int cap = this.Probe(x, y, 2);
+        if (cap < 0) { return -1000000; }
+        int v = this.rng.Range(0, 14);
+        v = v + cap * 260;
+        // liberties after the move / avoid self-atari
+        int n = WqGame.N();
+        int[] save = new int[n * n];
+        int i = 0;
+        while (i < n * n) { save[i] = this.board[i]; i = i + 1; }
+        this.TryPlayRaw(x, y, 2);
+        List<int> own = new List<int>();
+        int libs = this.Group(x, y, own);
+        // does this rescue a white group that was in atari?
+        int rescued = 0;
+        if (libs >= 2 && own.Count > 1) { rescued = 1; }
+        i = 0;
+        while (i < n * n) { this.board[i] = save[i]; i = i + 1; }
+        if (libs <= 1 && cap == 0) { v = v - 700; }
+        v = v + libs * 22;
+        // threaten black groups: adjacent enemy stones with few liberties
+        int d = 0;
+        while (d < 4) {
+            int tx = x; int ty = y;
+            if (d == 0) { tx = x + 1; }
+            if (d == 1) { tx = x - 1; }
+            if (d == 2) { ty = y + 1; }
+            if (d == 3) { ty = y - 1; }
+            if (this.At(tx, ty) == 1) {
+                List<int> g = new List<int>();
+                int gl = this.Group(tx, ty, g);
+                if (gl == 2) { v = v + 90; }
+                if (gl == 1) { v = v + 240; }
+            } else if (this.At(tx, ty) == 2) {
+                List<int> g = new List<int>();
+                int gl = this.Group(tx, ty, g);
+                if (gl == 1) { v = v + 320 * rescued; }
+            }
+            d = d + 1;
+        }
+        // gentle shape prefs: contact play, edge in drills, center early
+        v = v + this.NeighborCount(x, y, 2) * 8;
+        v = v + this.NeighborCount(x, y, 1) * 12;
+        if (this.mode == 0 && this.moves < 12) {
+            int cx = x - 4; int cy = y - 4;
+            if (cx < 0) { cx = -cx; }
+            if (cy < 0) { cy = -cy; }
+            v = v + (4 - cx) * 6 + (4 - cy) * 6;
+        }
+        return v;
+    }
+
+    void AiMove(int now) {
+        int n = WqGame.N();
+        int bestV = -1000000;
+        int bestX = -1; int bestY = -1;
+        int y = 0;
+        while (y < n) {
+            int x = 0;
+            while (x < n) {
+                if (this.At(x, y) == 0) {
+                    int v = this.AiScoreMove(x, y);
+                    if (v > bestV) { bestV = v; bestX = x; bestY = y; }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        // pass when nothing worthwhile remains
+        int threshold = -999999;
+        if (this.mode == 0 && this.moves > 30) { threshold = 40; }
+        if (bestX < 0 || bestV < threshold) {
+            this.passes = this.passes + 1;
+            this.moves = this.moves + 1;
+            this.koSq = -1;
+            this.Toast("白棋停一手", now);
+            this.aiTurn = false;
+            if (this.passes >= 2) { this.EndByScore(now); }
+            return;
+        }
+        this.Place(bestX, bestY, 2, now);
+        this.aiTurn = false;
+    }
+
+    // ----- input -----------------------------------------------------------
+
+    void OnDown(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            if (Draw.PointIn(cx, cy, 430, 300, 420, 74)) { this.StartGame(0, now); }
+            if (Draw.PointIn(cx, cy, 430, 390, 420, 74)) { this.StartGame(1, now); }
+            if (Draw.PointIn(cx, cy, 430, 480, 420, 74)) { this.StartGame(2, now); }
+            if (Draw.PointIn(cx, cy, 430, 570, 420, 74)) { this.StartGame(3, now); }
+            return;
+        }
+        if (this.scene == 2) {
+            if (Draw.PointIn(cx, cy, 420, 430, 210, 60)) { this.StartGame(this.mode, now); return; }
+            if (Draw.PointIn(cx, cy, 650, 430, 210, 60)) { this.scene = 0; return; }
+            return;
+        }
+        // pass button
+        if (Draw.PointIn(cx, cy, 770, 560, 200, 56) && !this.aiTurn) { this.PlayerPass(now); return; }
+        if (this.aiTurn || this.winner != 0) { return; }
+        int c = WqGame.Cell();
+        int gx = (cx - WqGame.BX() + c / 2) / c;
+        int gy = (cy - WqGame.BY() + c / 2) / c;
+        int n = WqGame.N();
+        if (gx < 0 || gy < 0 || gx >= n || gy >= n) { return; }
+        if (this.At(gx, gy) != 0) { return; }
+        if (this.Probe(gx, gy, 1) < 0) { this.Toast("此处不能落子", now); return; }
+        this.Place(gx, gy, 1, now);
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } return; }
+        if (sc == 19 && this.scene == 1) { this.PlayerPass(now); return; }   // P
+        if (this.scene == 2 && (sc == 40 || sc == 44)) { this.StartGame(this.mode, now); }
+    }
+
+    void Tick(int now) {
+        if (this.scene == 1 && this.aiTurn && now >= this.aiThinkAt) {
+            this.AiMove(now);
+            this.demoAt = now + 420;
+        }
+        if (this.demo && this.scene == 1 && !this.aiTurn && now >= this.demoAt) {
+            this.DemoMove(now);
+        }
+    }
+
+    // demo: black mirrors the AI heuristic so screenshots show a real game
+    void DemoMove(int now) {
+        int n = WqGame.N();
+        int bestV = -1000000;
+        int bestX = -1; int bestY = -1;
+        int y = 0;
+        while (y < n) {
+            int x = 0;
+            while (x < n) {
+                if (this.At(x, y) == 0) {
+                    int cap = this.Probe(x, y, 1);
+                    if (cap >= 0) {
+                        int v = cap * 260 + this.NeighborCount(x, y, 2) * 14
+                            + this.NeighborCount(x, y, 1) * 8 + this.rng.Range(0, 60);
+                        if (v > bestV) { bestV = v; bestX = x; bestY = y; }
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        if (bestX < 0 || this.moves > 52) { this.PlayerPass(now); return; }
+        this.Place(bestX, bestY, 1, now);
+    }
+
+    // ----- rendering -------------------------------------------------------
+
+    void DrawAmbient() {
+        this.EnsureTex();
+        if (this.menuBg != null) {
+            Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+            this.r.SetColor(18, 14, 10, 190);
+            this.r.FillRect(0, 0, 1280, 720);
+        }
+        Draw.FillCircle(this.r, 380, 330, 420, 255, 190, 110, 14);
+    }
+
+    void DrawBoard(int now) {
+        int n = WqGame.N();
+        int c = WqGame.Cell();
+        int x0 = WqGame.BX();
+        int y0 = WqGame.BY();
+        int span = (n - 1) * c;
+        Draw.RoundRectFill(this.r, x0 - 48, y0 - 48, span + 96, span + 96, 14, 60, 38, 20, 255);
+        if (this.boardTex != null) {
+            this.r.DrawTexture(this.boardTex, x0 - 40, y0 - 40, span + 80, span + 80);
+            this.r.SetColor(255, 220, 160, 18);
+            this.r.FillRect(x0 - 40, y0 - 40, span + 80, span + 80);
+        } else {
+            Draw.RoundRectFill(this.r, x0 - 40, y0 - 40, span + 80, span + 80, 10, 214, 168, 106, 255);
+        }
+        this.r.SetColor(40, 24, 12, 240);
+        int i = 0;
+        while (i < n) {
+            this.r.FillRect(x0, y0 + i * c - 1, span, 2);
+            this.r.FillRect(x0 + i * c - 1, y0, 2, span);
+            i = i + 1;
+        }
+        // star points (9x9: corners at 2, center at 4)
+        Draw.FillCircle(this.r, x0 + 2 * c, y0 + 2 * c, 4, 40, 24, 12, 240);
+        Draw.FillCircle(this.r, x0 + 6 * c, y0 + 2 * c, 4, 40, 24, 12, 240);
+        Draw.FillCircle(this.r, x0 + 2 * c, y0 + 6 * c, 4, 40, 24, 12, 240);
+        Draw.FillCircle(this.r, x0 + 6 * c, y0 + 6 * c, 4, 40, 24, 12, 240);
+        Draw.FillCircle(this.r, x0 + 4 * c, y0 + 4 * c, 4, 40, 24, 12, 240);
+        // stones
+        int y = 0;
+        while (y < n) {
+            int x = 0;
+            while (x < n) {
+                int v = this.At(x, y);
+                if (v > 0) {
+                    int sx = x0 + x * c;
+                    int sy = y0 + y * c;
+                    int rad = 27;
+                    bool isLast = this.lastSq == y * n + x;
+                    if (isLast) {
+                        int age = now - this.placedAt;
+                        if (age < 220 && age >= 0) { rad = 21 + age * 6 / 220; }
+                        Draw.FillCircle(this.r, sx, sy, rad + 8, 255, 200, 110, 60);
+                    }
+                    Draw.FillCircle(this.r, sx + 2, sy + 4, rad, 30, 18, 8, 90);
+                    SdlTexture st2 = this.blackTex;
+                    if (v == 2) { st2 = this.whiteTex; }
+                    if (st2 != null) {
+                        this.r.DrawTexture(st2, sx - rad, sy - rad, rad * 2, rad * 2);
+                    } else if (v == 1) {
+                        Draw.FillCircle(this.r, sx, sy, rad, 34, 36, 44, 255);
+                        Draw.FillCircle(this.r, sx - 6, sy - 8, rad / 3, 130, 140, 160, 200);
+                    } else {
+                        Draw.FillCircle(this.r, sx, sy, rad, 236, 232, 222, 255);
+                        Draw.FillCircle(this.r, sx - 6, sy - 8, rad / 3, 255, 255, 255, 230);
+                    }
+                    if (isLast) {
+                        Draw.FillCircle(this.r, sx, sy, 5, 255, 90, 90, 220);
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        // ko marker
+        if (this.koSq >= 0) {
+            int kx = x0 + (this.koSq % n) * c;
+            int ky = y0 + (this.koSq / n) * c;
+            Draw.RingRect(this.r, kx - 10, ky - 10, 20, 20, 2, 220, 90, 80, 200);
+        }
+        // hover ghost
+        if (this.scene == 1 && !this.aiTurn) {
+            int gx = (this.mouseX - x0 + c / 2) / c;
+            int gy = (this.mouseY - y0 + c / 2) / c;
+            if (gx >= 0 && gy >= 0 && gx < n && gy < n && this.At(gx, gy) == 0) {
+                Draw.FillCircle(this.r, x0 + gx * c, y0 + gy * c, 24, 34, 36, 44, 90);
+            }
+        }
+    }
+
+    void DrawSide(int now) {
+        int px = 720;
+        Draw.RoundRectFill(this.r, px, 66, 492, 588, 16, 40, 28, 16, 205);
+        Draw.RingRect(this.r, px, 66, 492, 588, 2, 214, 178, 120, 90);
+        Text.Draw(this.r, "围棋", px + 36, 96, 5, 240, 224, 195, 255);
+        string mn = "九路对弈 · 贴七目";
+        if (this.mode > 0) { mn = "死活题 · " + WqGame.DrillName(this.mode); }
+        Text.Draw(this.r, mn, px + 36, 170, 2, 255, 216, 152, 255);
+        string turn = "轮到你落子";
+        int tr = 140; int tg = 220; int tb = 170;
+        if (this.aiTurn) { turn = "白棋长考中…"; tr = 255; tg = 214; tb = 150; }
+        Text.Draw(this.r, turn, px + 36, 214, 3, tr, tg, tb, 255);
+        Text.Draw(this.r, "段位 " + this.prof.Title() + " · " + this.prof.pts + " 分", px + 36, 286, 2, 235, 226, 205, 255);
+        Text.Draw(this.r, "胜 " + this.prof.wins + " · 负 " + this.prof.losses, px + 36, 326, 2, 200, 192, 172, 255);
+        Text.Draw(this.r, "连胜 " + this.prof.streak + " · 最佳 " + this.prof.bestStreak, px + 36, 366, 2, 200, 192, 172, 255);
+        Text.Draw(this.r, "你提子 " + this.capB + " · 白提子 " + this.capW, px + 36, 406, 2, 200, 192, 172, 255);
+        if (this.mode > 0) {
+            Text.Draw(this.r, "目标：提 " + WqGame.DrillTarget(this.mode) + " 子", px + 36, 446, 2, 255, 205, 130, 255);
+        } else {
+            Text.Draw(this.r, "第 " + (this.moves + 1) + " 手", px + 36, 446, 2, 200, 192, 172, 255);
+        }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 770, 560, 200, 56, "停一手 (P)", 2, 0);
+        Text.Draw(this.r, "Esc 菜单 · F11 全屏", px + 36, 630, 2, 160, 152, 136, 255);
+    }
+
+    void DrawFx(int now) {
+        int i = 0;
+        while (i < this.parts.Count) {
+            WqParticle p = this.parts[i];
+            int age = now - p.bornAt;
+            if (age > 900) { this.parts.RemoveAt(i); continue; }
+            int px = (p.x + p.vx * age / 4) / 256;
+            int py = (p.y + p.vy * age / 4) / 256 + age * age / 26000;
+            int alpha = 235 - age * 235 / 900;
+            Draw.FillCircle(this.r, px, py, 3, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < this.pops.Count) {
+            WqPopup p = this.pops[i];
+            int age = now - p.bornAt;
+            if (age > 1400) { this.pops.RemoveAt(i); continue; }
+            int alpha = 255 - age * 255 / 1400;
+            Text.DrawCentered(this.r, p.text, p.x, p.y - age / 14, 2, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        if (now - this.toastAt < 2200) {
+            Text.DrawCenteredShadow(this.r, this.toastText, 380, 692, 2, 255, 224, 150, 2);
+        }
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(30, 22, 14);
+        this.DrawAmbient();
+        this.DrawBoard(now);
+        this.DrawSide(now);
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureTex();
+        this.host.Begin(24, 18, 12);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+        this.r.SetColor(14, 10, 6, 120);
+        this.r.FillRect(0, 0, 1280, 720);
+        if (this.titleTex != null) {
+            this.r.DrawTexture(this.titleTex, 640 - 300, 30, 600, 200);
+        } else {
+            Text.DrawCenteredShadow(this.r, "围棋", 640, 70, 9, 245, 232, 205, 4);
+        }
+        Text.DrawCenteredShadow(this.r, "黑白之间 · 死活经典 · 段位成长", 640, 244, 3, 255, 218, 160, 3);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 300, 420, 74, "九路对弈", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 390, 420, 74, "死活题 · 征子", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 480, 420, 74, "死活题 · 直三杀", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 570, 420, 74, "死活题 · 关门吃", 3, 0);
+        Text.DrawCenteredShadow(this.r, "段位 " + this.prof.Title() + " · " + this.prof.pts
+            + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
+            + " · 死活通关 " + this.prof.drills, 640, 668, 2, 230, 212, 182, 2);
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.host.Begin(30, 22, 14);
+        this.DrawAmbient();
+        this.DrawBoard(now);
+        this.DrawSide(now);
+        this.r.SetColor(12, 10, 6, 165);
+        this.r.FillRect(0, 0, 1280, 720);
+        int by = 190;
+        Draw.RoundRectFill(this.r, 390, by, 500, 320, 20, 36, 26, 14, 245);
+        Draw.RingRect(this.r, 390, by, 500, 320, 2, 214, 178, 120, 140);
+        if (this.winner == 1) {
+            Text.DrawCenteredShadow(this.r, "妙手成局，黑胜！", 640, by + 34, 5, 255, 218, 110, 3);
+            if (this.mode == 0) {
+                Text.DrawCentered(this.r, "黑 " + this.scoreB + " · 白 " + this.scoreW + "（含贴目）", 640, by + 110, 3, 240, 226, 200, 255);
+            } else {
+                Text.DrawCentered(this.r, "死活要点，一击即中", 640, by + 110, 3, 240, 226, 200, 255);
+            }
+            string cheer = "棋形优美，再来一盘！";
+            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！势不可挡"; }
+            Text.DrawCentered(this.r, cheer, 640, by + 166, 2, 150, 230, 190, 255);
+        } else {
+            Text.DrawCenteredShadow(this.r, "白棋略胜半子", 640, by + 34, 5, 235, 165, 150, 3);
+            if (this.mode == 0) {
+                Text.DrawCentered(this.r, "黑 " + this.scoreB + " · 白 " + this.scoreW + "（含贴目）", 640, by + 110, 3, 225, 210, 190, 255);
+            } else {
+                Text.DrawCentered(this.r, "差一步之遥，再试一次", 640, by + 110, 3, 225, 210, 190, 255);
+            }
+            Text.DrawCentered(this.r, "复盘一手，胜负手就在眼前", 640, by + 166, 2, 255, 216, 152, 255);
+        }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 420, by + 240, 210, 60, "再来一局", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 650, by + 240, 210, 60, "回到菜单", 3, 0);
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2) { this.DrawOver(now); }
+        else { this.DrawPlay(now); }
+    }
+}
+
+class WqApp {
+    static void Main() {
+        Host h = Host.Create("围棋", 1280, 720);
+        WqGame g = WqGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { h.ToggleFullscreen(); }
+                    else if (!SdlEvent.IsRepeat()) { g.OnKey(sc, now); }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        g.mouseX = h.MouseX();
+                        g.mouseY = h.MouseY();
+                        g.OnDown(g.mouseX, g.mouseY, now);
+                    }
+                }
+            }
+            g.Tick(now);
+            g.Render(now);   // vsync-paced by the renderer
+        }
+        h.Close();
+    }
+}
