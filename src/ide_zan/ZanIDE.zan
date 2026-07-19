@@ -831,12 +831,10 @@ class ZanIDE {
         int dbgPanelTab = 0;
 
         // ---- Designer state ----
+        // A single window designer: .zform tabs open the WYSIWYG design
+        // surface below (the old separate "@builder" form designer was merged
+        // into it).
         bool designerMode = false;
-        // Reusable, component-based form/window Designer (stdlib Gui.Designer),
-        // hosted in the "@builder" tab. Self-contained palette + canvas +
-        // inspector; opened from the Form Builder ribbon command.
-        Designer formBuilder = Designer.Create();
-        formBuilder.Seed(app);
         List<string> dNames = new List<string>();
         List<int> dX = new List<int>();
         List<int> dY = new List<int>();
@@ -871,8 +869,17 @@ class ZanIDE {
         // it each frame so the Split drag handle moves the panel edge.
         SignalInt rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 300), 120, 1600));
         SignalInt centerW = SignalInt.Create(0);
-        // 0 = AI chat, 1 = terminal.
-        SignalInt rightTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightTab", 0), 0, 1));
+        // 0 = AI chat, 1 = terminal, 2 = tools/ tree, 3 = examples/ tree.
+        SignalInt rightTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightTab", 0), 0, 3));
+        // Tools / Examples trees for the right panel tabs.
+        List<TreeNode> rtToolTree = ZanIDE.BuildDirTree(root + "/tools");
+        List<TreeNode> rtExTree = ZanIDE.BuildExampleTree();
+        SignalInt rtToolSel = SignalInt.Create(-1);
+        SignalInt rtExSel = SignalInt.Create(-1);
+        int lastRtToolSel = -1;
+        int lastRtExSel = -1;
+        SignalInt rtToolScroll = SignalInt.Create(0);
+        SignalInt rtExScroll = SignalInt.Create(0);
         // Chat transcript: parallel role ("user"/"assistant"/"error") + text.
         List<string> aiRole = new List<string>();
         List<string> aiText = new List<string>();
@@ -914,8 +921,9 @@ class ZanIDE {
         // inside their region (EXPLORER in pixels, COMPONENTS/EXAMPLES in rows).
         SignalInt treeScrollY = SignalInt.Create(0);
 
-        // Examples panel is a collapsible tree (categories -> sample leaves).
-        List<TreeNode> exTree = ZanIDE.BuildExampleTree();
+        // Third sidebar section: the standard library as a collapsible tree
+        // (browse/open stdlib sources directly, like aardio's 库 pane).
+        List<TreeNode> exTree = ZanIDE.BuildStdlibTree();
         SignalInt exSel = SignalInt.Create(-1);
 
         // Per-section filter boxes: each sidebar tree can be narrowed by a
@@ -1300,16 +1308,31 @@ class ZanIDE {
                     dlg.Show();
                     dlgMode = 3;
                 } else if (rc == 9) {
-                    // Open the reusable form/window Designer component (a real
-                    // "@builder" tab), mirroring the @start/@docs special tabs.
-                    // This replaces the old coordinate-based .zform designer as
-                    // the primary Designer entry point.
-                    int bi = ZanIDE.FindTabByPath(tabPaths, "@builder");
+                    // Designer: open the window designer. Uses the active
+                    // .zform, else the first .zform already open, else creates
+                    // src/Form1.zform so there is always a design surface.
+                    int bi = 0 - 1;
+                    if (act >= 0 && act < tabPaths.Count && ZanIDE.IsFormPath(tabPaths[act])) { bi = act; }
+                    if (bi < 0) {
+                        int fi = 0;
+                        while (fi < tabPaths.Count) {
+                            if (ZanIDE.IsFormPath(tabPaths[fi])) { bi = fi; fi = tabPaths.Count; }
+                            fi = fi + 1;
+                        }
+                    }
                     if (bi >= 0) {
                         activeTab.Set(bi);
                     } else {
-                        tabNames.Add(ZanIDE.T("Designer", "设计器")); tabBodies.Add(""); tabPaths.Add("@builder");
-                        activeTab.Set(tabNames.Count - 1);
+                        string nfp = root + "/src/Form1.zform";
+                        if (!File.Exists(nfp)) {
+                            Directory.CreateDirectoryRecursive(root + "/src");
+                            File.WriteAllText(nfp, ZanIDE.SerializeForm("Form1",
+                                new List<string>(), new List<string>(), new List<int>(), new List<int>(),
+                                new List<int>(), new List<int>(), new List<string>(), new List<string>(),
+                                800, 600));
+                            log.Add("> Created " + nfp + ".");
+                        }
+                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, nfp, "Form1.zform");
                     }
                     lastActive = 0 - 1;
                     app.RequestRedraw();
@@ -1533,7 +1556,7 @@ class ZanIDE {
                 // Section 3: Examples (collapsible tree, click a leaf to open)
                 int exY = tr.y + explorerH + structH;
                 c.FillRect(tr.x, exY, tr.width, 1, t.divider);
-                c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, ZanIDE.T("EXAMPLES", "示例"), t.textTertiary, t.fontSizeSmall);
+                c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, ZanIDE.T("STDLIB", "标准库"), t.textTertiary, t.fontSizeSmall);
                 Rect exArea = Rect.Create(tr.x, exY + sectionH, tr.width, exampleH - sectionH);
                 exArea = TreeView.FilterBar(app, exArea, exFilter);
                 exShow = ZanIDE.FilterNodes(exTree, exFilter.GetText());
@@ -1708,7 +1731,7 @@ class ZanIDE {
                 Rect edRect = Rect.Create(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
                 bool activeIsStart = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@start");
                 bool activeIsDocs = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@docs");
-                bool activeIsBuilder = (act >= 0 && act < tabPaths.Count && tabPaths[act] == "@builder");
+
                 if (designerMode) {
                     // Bind the designer to the active .zform tab. On first display of
                     // a form (path change) load its controls from the tab body.
@@ -1722,7 +1745,7 @@ class ZanIDE {
                         loadedFormPath = fpath;
                         formCache = tabBodies[act];
                     }
-                    int dact = ZanIDE.RenderDesigner(app, c, t, edRect, dNames, dX, dY, dW, dH, dTypes,
+                    int dact = ZanIDE.RenderDesigner(app, c, t, edRect, fname, dNames, dX, dY, dW, dH, dTypes,
                         dSel, dDragMode, dDragOffX, dDragOffY, dResizeH, dPreview, dNewTool, dAnchor, dDock,
                         dFormW, dFormH, designerViewCodeBtn, designerPreviewBtn);
                     // Persist any layout change back to the tab body and the .zform file.
@@ -1736,7 +1759,7 @@ class ZanIDE {
                             string cbpS = ZanIDE.CodeBehindPath(fpath);
                             if (File.Exists(cbpS)) {
                                 string cbNew = ZanIDE.RegenerateCodeBehind(File.ReadAllText(cbpS), fname,
-                                    dNames, dTypes, dX, dY, dW, dH, dFormW.Get(), dFormH.Get());
+                                    dNames, dTypes, dX, dY, dW, dH, dDock, dFormW.Get(), dFormH.Get());
                                 File.WriteAllText(cbpS, cbNew);
                                 int cbTab = ZanIDE.FindTabByPath(tabPaths, cbpS);
                                 if (cbTab >= 0) { tabBodies[cbTab] = cbNew; }
@@ -1751,9 +1774,9 @@ class ZanIDE {
                         string cbtext = "";
                         if (File.Exists(cbp)) {
                             cbtext = ZanIDE.RegenerateCodeBehind(File.ReadAllText(cbp), fname,
-                                dNames, dTypes, dX, dY, dW, dH, dFormW.Get(), dFormH.Get());
+                                dNames, dTypes, dX, dY, dW, dH, dDock, dFormW.Get(), dFormH.Get());
                         } else {
-                            cbtext = ZanIDE.BuildCodeBehind(fname, dNames, dTypes, dX, dY, dW, dH, dFormW.Get(), dFormH.Get());
+                            cbtext = ZanIDE.BuildCodeBehind(fname, dNames, dTypes, dX, dY, dW, dH, dDock, dFormW.Get(), dFormH.Get());
                         }
                         File.WriteAllText(cbp, cbtext);
                         int cbi = ZanIDE.FindTabByPath(tabPaths, cbp);
@@ -1772,8 +1795,6 @@ class ZanIDE {
                         app, c, t, edRect, docsSearch,
                         docsSel, docsScroll, docsCodeScroll, docsDemoBool,
                         docsDemoInt, docsDemoInput, log);
-                } else if (activeIsBuilder) {
-                    formBuilder.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
                 } else if (activeIsStart) {
                     List<string> spFiles = ZanIDE.ListZanFiles(root + "/src");
                     int sact = ZanIDE.RenderStartPage(app, c, t, edRect, spFiles, startNewProjBtn, startNewFileBtn);
@@ -2141,25 +2162,28 @@ class ZanIDE {
                 ZanIDE.ShellSurface(app, rp.x, rp.y, rp.width, rp.height, 0, t.bgTertiary);
                 int rTabH = app.Scale(28);
                 int rTab = rightTab.Get();
-                int rTabW = app.Scale(90);
+                int rTabW = rp.width / 4;
+                if (rTabW > app.Scale(90)) { rTabW = app.Scale(90); }
                 c.FillRect(rp.x, rp.y, rp.width, rTabH, t.bgSecondary);
                 c.FillRect(rp.x, rp.y + rTabH - 1, rp.width, 1, t.divider);
-                int rBg0 = t.bgTertiary;
-                if (rTab == 0) { rBg0 = t.bgPrimary; }
-                c.FillRect(rp.x, rp.y, rTabW, rTabH, rBg0);
-                c.DrawText(rp.x + app.Scale(8), rp.y + app.Scale(6),
-                    ZanIDE.T("AI Chat", "AI 助手"), t.textPrimary, t.fontSizeSmall);
-                int rBg1 = t.bgTertiary;
-                if (rTab == 1) { rBg1 = t.bgPrimary; }
-                c.FillRect(rp.x + rTabW, rp.y, rTabW, rTabH, rBg1);
-                c.DrawText(rp.x + rTabW + app.Scale(8), rp.y + app.Scale(6),
-                    ZanIDE.T("Terminal", "终端"), t.textPrimary, t.fontSizeSmall);
+                List<string> rTabNames = new List<string>();
+                rTabNames.Add(ZanIDE.T("AI", "AI 助手"));
+                rTabNames.Add(ZanIDE.T("Terminal", "终端"));
+                rTabNames.Add(ZanIDE.T("Tools", "工具"));
+                rTabNames.Add(ZanIDE.T("Examples", "示例"));
+                int rtI = 0;
+                while (rtI < rTabNames.Count) {
+                    int rBgN = t.bgTertiary;
+                    if (rTab == rtI) { rBgN = t.bgPrimary; }
+                    c.FillRect(rp.x + rTabW * rtI, rp.y, rTabW, rTabH, rBgN);
+                    c.DrawText(rp.x + rTabW * rtI + app.Scale(8), rp.y + app.Scale(6),
+                        rTabNames[rtI], t.textPrimary, t.fontSizeSmall);
+                    rtI = rtI + 1;
+                }
                 if (app.window.EventKind() == 3
                     && app.mouseY >= rp.y && app.mouseY < rp.y + rTabH
-                    && app.mouseX >= rp.x && app.mouseX < rp.x + rTabW * 2) {
-                    int rti = 0;
-                    if (app.mouseX >= rp.x + rTabW) { rti = 1; }
-                    rightTab.Set(rti);
+                    && app.mouseX >= rp.x && app.mouseX < rp.x + rTabW * 4) {
+                    rightTab.Set((app.mouseX - rp.x) / rTabW);
                     app.RequestRedraw();
                 }
                 int rPad = app.Scale(6);
@@ -2239,6 +2263,59 @@ class ZanIDE {
                             }
                             aiScroll.Set(0);
                             app.RequestRedraw();
+                        }
+                    }
+                } else if (rTab >= 2) {
+                    // Tools / Examples: a file tree filling the whole panel
+                    // body (no input row); clicking a leaf opens the file.
+                    Rect rtArea = Rect.Create(rp.x, rp.y + rTabH, rp.width, rp.height - rTabH);
+                    List<TreeNode> rtNodes = rtToolTree;
+                    SignalInt rtSel = rtToolSel;
+                    SignalInt rtScroll = rtToolScroll;
+                    if (rTab == 3) { rtNodes = rtExTree; rtSel = rtExSel; rtScroll = rtExScroll; }
+                    int rtRowH = TreeView.RowHeight(app);
+                    int rtVis = rtArea.height / rtRowH;
+                    if (rtVis < 1) { rtVis = 1; }
+                    int rtContentH = TreeView.ContentHeight(app, rtNodes);
+                    int rtMax = rtContentH - rtVis * rtRowH;
+                    if (rtMax < 0) { rtMax = 0; }
+                    int rtSc = rtScroll.Get();
+                    if (app.CaptureWheel(rtArea.x, rtArea.y, rtArea.width, rtArea.height)) {
+                        int rtd = app.window.EventKeyCode();
+                        int rtstep = rtd / 120;
+                        if (rtstep == 0) {
+                            if (rtd > 0) { rtstep = 1; }
+                            else if (rtd < 0) { rtstep = 0 - 1; }
+                        }
+                        rtSc = rtSc - rtstep * rtRowH;
+                        app.RequestRedraw();
+                    }
+                    if (rtSc > rtMax) { rtSc = rtMax; }
+                    if (rtSc < 0) { rtSc = 0; }
+                    rtScroll.Set(rtSc);
+                    if (rtNodes.Count == 0) {
+                        string rtEmpty = ZanIDE.T("No files found in ", "没有找到文件：")
+                            + root + "/tools";
+                        if (rTab == 3) {
+                            rtEmpty = ZanIDE.T("No examples found.", "没有找到示例。");
+                        }
+                        c.DrawText(rtArea.x + app.Scale(8), rtArea.y + app.Scale(8),
+                            rtEmpty, t.textTertiary, t.fontSizeSmall);
+                    } else {
+                        TreeView.Render(app, rtArea, rtNodes, rtSel, rtSc);
+                    }
+                    int rtSelV = rtSel.Get();
+                    int rtLast = lastRtToolSel;
+                    if (rTab == 3) { rtLast = lastRtExSel; }
+                    if (rtSelV != rtLast) {
+                        if (rTab == 3) { lastRtExSel = rtSelV; } else { lastRtToolSel = rtSelV; }
+                        if (rtSelV >= 0 && rtSelV < rtNodes.Count) {
+                            TreeNode rtn = rtNodes[rtSelV];
+                            if (!rtn.isDir && rtn.path != "" && !ZanIDE.StartsWith(rtn.path, "@")) {
+                                ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, rtn.path, rtn.label);
+                                log.Add("> Opened " + rtn.path + ".");
+                                app.RequestRedraw();
+                            }
                         }
                     }
                 } else {
@@ -2987,7 +3064,7 @@ class ZanIDE {
         File.WriteAllText(dir + "/src/" + name + ".zform",
             ZanIDE.SerializeForm(name, dNames, dTypes, dX, dY, dW, dH, dAnchor, dDock, 800, 600));
         File.WriteAllText(dir + "/src/" + name + ".zan",
-            ZanIDE.BuildCodeBehind(name, dNames, dTypes, dX, dY, dW, dH, 800, 600));
+            ZanIDE.BuildCodeBehind(name, dNames, dTypes, dX, dY, dW, dH, dDock, 800, 600));
     }
 
     /// Populates the designer lists with a starter layout for a new form.
@@ -3036,7 +3113,7 @@ class ZanIDE {
             List<string> dDock = new List<string>();
             File.WriteAllText(formPath, ZanIDE.SerializeForm(name, dNames, dTypes, dX, dY, dW, dH, dAnchor, dDock, 800, 600));
             if (!File.Exists(cbPath)) {
-                File.WriteAllText(cbPath, ZanIDE.BuildCodeBehind(name, dNames, dTypes, dX, dY, dW, dH, 800, 600));
+                File.WriteAllText(cbPath, ZanIDE.BuildCodeBehind(name, dNames, dTypes, dX, dY, dW, dH, dDock, 800, 600));
             }
             log.Add("> Created form " + formPath + " + code-behind " + cbPath + ".");
             return formPath;
@@ -3214,10 +3291,10 @@ class ZanIDE {
 
     /// Resolves the source file Run/Build/Debug/Publish should compile for
     /// the active tab: a .zform maps to its code-behind (falling back to the
-    /// project entry), and the special @start/@docs/@builder tabs map to the
+    /// project entry), and the special @start/@docs tabs map to the
     /// project entry when one exists. Returns "" when there is no target.
     static string RunTarget(string p, string root) {
-        if (p == "@start" || p == "@docs" || p == "@builder") {
+        if (p == "@start" || p == "@docs") {
             string entry = ZanIDE.ProjectEntry(root);
             if (File.Exists(entry)) { return entry; }
             return "";
@@ -4441,40 +4518,40 @@ class ZanIDE {
     /// Emits the Zan draw statements for one designed control, used inside the
     /// generated RenderDesign. The y position is offset by the title-bar height
     /// so controls sit in the window's client area.
-    static string EmitControlDraw(string type, string nm, int x, int y, int w, int h) {
-        string sx = Convert.ToString(x);
-        string sy = Convert.ToString(y);
-        string sw = Convert.ToString(w);
-        string sh = Convert.ToString(h);
+    /// Emits the draw calls for one control. `sx`/`sy`/`sw`/`sh` are Zan
+    /// expressions (absolute window coordinates), so the caller can pass
+    /// either literals (free placement) or the dock-layout variables.
+    static string EmitControlDraw(string type, string nm, string sx, string sy, string sw, string sh) {
         string s = "        // " + type + " " + nm + "\n";
         if (type == "Label") {
-            s = s + "        app.canvas.DrawText(" + sx + ", top + " + sy + ", \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeMedium);\n";
+            s = s + "        app.canvas.DrawText(" + sx + ", " + sy + ", \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeMedium);\n";
         } else if (type == "Button") {
-            s = s + "        app.canvas.FillRoundRect(" + sx + ", top + " + sy + ", " + sw + ", " + sh + ", 4, 0xFF0E639C);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 10, top + " + sy + " + 6, \"" + nm + "\", 0xFFFFFFFF, app.theme.fontSizeSmall);\n";
+            s = s + "        app.canvas.FillRoundRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 4, 0xFF0E639C);\n";
+            s = s + "        app.canvas.DrawText(" + sx + " + 10, " + sy + " + 6, \"" + nm + "\", 0xFFFFFFFF, app.theme.fontSizeSmall);\n";
         } else if (type == "TextBox" || type == "RichTextBox") {
-            s = s + "        app.canvas.FillRect(" + sx + ", top + " + sy + ", " + sw + ", " + sh + ", 0xFF1E1E1E);\n";
-            s = s + "        app.canvas.DrawRect(" + sx + ", top + " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 6, top + " + sy + " + 6, \"" + nm + "\", 0xFF888888, app.theme.fontSizeSmall);\n";
+            s = s + "        app.canvas.FillRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF1E1E1E);\n";
+            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
+            s = s + "        app.canvas.DrawText(" + sx + " + 6, " + sy + " + 6, \"" + nm + "\", 0xFF888888, app.theme.fontSizeSmall);\n";
         } else if (type == "CheckBox") {
-            s = s + "        app.canvas.DrawRect(" + sx + ", top + " + sy + " + 2, 14, 14, 0xFF888888, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 20, top + " + sy + ", \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeSmall);\n";
+            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + " + 2, 14, 14, 0xFF888888, 1);\n";
+            s = s + "        app.canvas.DrawText(" + sx + " + 20, " + sy + ", \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeSmall);\n";
         } else if (type == "ProgressBar") {
-            s = s + "        app.canvas.DrawRect(" + sx + ", top + " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.FillRect(" + sx + " + 2, top + " + sy + " + 2, (" + sw + " - 4) * 60 / 100, " + sh + " - 4, 0xFF007ACC);\n";
+            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
+            s = s + "        app.canvas.FillRect(" + sx + " + 2, " + sy + " + 2, (" + sw + " - 4) * 60 / 100, " + sh + " - 4, 0xFF007ACC);\n";
         } else if (type == "Panel" || type == "GroupBox") {
-            s = s + "        app.canvas.DrawRect(" + sx + ", top + " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 6, top + " + sy + " + 4, \"" + nm + "\", app.theme.textSecondary, app.theme.fontSizeSmall);\n";
+            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
+            s = s + "        app.canvas.DrawText(" + sx + " + 6, " + sy + " + 4, \"" + nm + "\", app.theme.textSecondary, app.theme.fontSizeSmall);\n";
         } else {
-            s = s + "        app.canvas.FillRect(" + sx + ", top + " + sy + ", " + sw + ", " + sh + ", 0xFF3C3C3C);\n";
-            s = s + "        app.canvas.DrawRect(" + sx + ", top + " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
-            s = s + "        app.canvas.DrawText(" + sx + " + 6, top + " + sy + " + 4, \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeSmall);\n";
+            s = s + "        app.canvas.FillRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF3C3C3C);\n";
+            s = s + "        app.canvas.DrawRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ", 0xFF555555, 1);\n";
+            s = s + "        app.canvas.DrawText(" + sx + " + 6, " + sy + " + 4, \"" + nm + "\", app.theme.textPrimary, app.theme.fontSizeSmall);\n";
         }
         return s;
     }
 
     static string BuildDesignerRegion(string name, List<string> dNames, List<string> dTypes,
-                                      List<int> dX, List<int> dY, List<int> dW, List<int> dH, int fw, int fh) {
+                                      List<int> dX, List<int> dY, List<int> dW, List<int> dH,
+                                      List<string> dDock, int fw, int fh) {
         string s = "    // <<< ZAN-DESIGNER BEGIN (generated from " + name + ".zform - do not edit) >>>\n";
         s = s + "    // Generated from the visual layout in " + name + ".zform. This whole\n";
         s = s + "    // region is rewritten by the designer - do not edit it; put your own\n";
@@ -4484,9 +4561,46 @@ class ZanIDE {
         if (dNames.Count == 0) {
             s = s + "        // (no controls yet - add some in the form designer)\n";
         }
+        // Docked controls need the running remaining-client-area variables so
+        // the layout adapts to the live window size (no hand-computed coords).
+        bool anyDock = false;
+        int di2 = 0;
+        while (di2 < dNames.Count) {
+            if (di2 < dDock.Count && dDock[di2] != "None" && dDock[di2].Length > 0) { anyDock = true; }
+            di2 = di2 + 1;
+        }
+        if (anyDock) {
+            s = s + "        int lx = 0;\n";
+            s = s + "        int ly = top;\n";
+            s = s + "        int lw = app.canvas.Width();\n";
+            s = s + "        int lh = app.canvas.Height() - top;\n";
+        }
         int i = 0;
         while (i < dNames.Count) {
-            s = s + ZanIDE.EmitControlDraw(dTypes[i], dNames[i], dX[i], dY[i], dW[i], dH[i]);
+            string dk = "None";
+            if (i < dDock.Count && dDock[i].Length > 0) { dk = dDock[i]; }
+            string hS = Convert.ToString(dH[i]);
+            string wS = Convert.ToString(dW[i]);
+            if (dk == "Top") {
+                s = s + ZanIDE.EmitControlDraw(dTypes[i], dNames[i], "lx", "ly", "lw", hS);
+                s = s + "        ly = ly + " + hS + ";\n";
+                s = s + "        lh = lh - " + hS + ";\n";
+            } else if (dk == "Bottom") {
+                s = s + ZanIDE.EmitControlDraw(dTypes[i], dNames[i], "lx", "ly + lh - " + hS, "lw", hS);
+                s = s + "        lh = lh - " + hS + ";\n";
+            } else if (dk == "Left") {
+                s = s + ZanIDE.EmitControlDraw(dTypes[i], dNames[i], "lx", "ly", wS, "lh");
+                s = s + "        lx = lx + " + wS + ";\n";
+                s = s + "        lw = lw - " + wS + ";\n";
+            } else if (dk == "Right") {
+                s = s + ZanIDE.EmitControlDraw(dTypes[i], dNames[i], "lx + lw - " + wS, "ly", wS, "lh");
+                s = s + "        lw = lw - " + wS + ";\n";
+            } else if (dk == "Fill") {
+                s = s + ZanIDE.EmitControlDraw(dTypes[i], dNames[i], "lx", "ly", "lw", "lh");
+            } else {
+                s = s + ZanIDE.EmitControlDraw(dTypes[i], dNames[i],
+                    Convert.ToString(dX[i]), "top + " + Convert.ToString(dY[i]), wS, hS);
+            }
             i = i + 1;
         }
         s = s + "    }\n\n";
@@ -4509,7 +4623,8 @@ class ZanIDE {
 
     /// A fresh code-behind file: designer region + a Main entry the user can extend.
     static string BuildCodeBehind(string name, List<string> dNames, List<string> dTypes,
-                                  List<int> dX, List<int> dY, List<int> dW, List<int> dH, int fw, int fh) {
+                                  List<int> dX, List<int> dY, List<int> dW, List<int> dH,
+                                  List<string> dDock, int fw, int fh) {
         string s = "using System;\n";
         s = s + "using Gui;\n\n";
         s = s + "// Code-behind for " + name + ".zform.\n";
@@ -4517,7 +4632,7 @@ class ZanIDE {
         s = s + "// between the ZAN-DESIGNER markers is generated from it - do not edit it;\n";
         s = s + "// write your initialization and event logic in OnLoad.\n";
         s = s + "class " + name + " {\n";
-        s = s + ZanIDE.BuildDesignerRegion(name, dNames, dTypes, dX, dY, dW, dH, fw, fh);
+        s = s + ZanIDE.BuildDesignerRegion(name, dNames, dTypes, dX, dY, dW, dH, dDock, fw, fh);
         s = s + "\n";
         s = s + "    // Runs once after the window opens. Put your logic here.\n";
         s = s + "    static void OnLoad(App app) {\n";
@@ -4530,7 +4645,8 @@ class ZanIDE {
     /// user code outside the BEGIN/END markers. If markers are missing, returns the
     /// text unchanged (the designer will not clobber a hand-written file).
     static string RegenerateCodeBehind(string existing, string name, List<string> dNames,
-            List<string> dTypes, List<int> dX, List<int> dY, List<int> dW, List<int> dH, int fw, int fh) {
+            List<string> dTypes, List<int> dX, List<int> dY, List<int> dW, List<int> dH,
+            List<string> dDock, int fw, int fh) {
         List<string> ls = CodeEditor.SplitLines(existing);
         int bi = 0 - 1;
         int ei = 0 - 1;
@@ -4542,7 +4658,7 @@ class ZanIDE {
             i = i + 1;
         }
         if (bi < 0 || ei < 0 || ei < bi) { return existing; }
-        string region = ZanIDE.BuildDesignerRegion(name, dNames, dTypes, dX, dY, dW, dH, fw, fh);
+        string region = ZanIDE.BuildDesignerRegion(name, dNames, dTypes, dX, dY, dW, dH, dDock, fw, fh);
         string outp = "";
         i = 0;
         while (i < bi) { outp = outp + ls[i] + "\n"; i = i + 1; }
@@ -6083,6 +6199,28 @@ class ZanIDE {
 
     // The old standalone snippets were replaced by the searchable component
     // center so examples stay aligned with the current Gui.Widget API.
+    /// The stdlib/ shipped next to the IDE as a collapsed tree, so the
+    /// sidebar's third section doubles as a standard-library browser.
+    static List<TreeNode> BuildStdlibTree() {
+        List<TreeNode> n = ZanIDE.BuildDirTree(ZanIDE.StdlibDir());
+        int i = 0;
+        while (i < n.Count) {
+            if (n[i].isDir) { n[i].expanded = false; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// A generic collapsible .zan file tree for any directory (empty list
+    /// when the directory does not exist).
+    static List<TreeNode> BuildDirTree(string dir) {
+        List<TreeNode> n = new List<TreeNode>();
+        if (dir != "" && Directory.Exists(dir)) {
+            ZanIDE.ScanExamplesInto(n, dir, 0);
+        }
+        return n;
+    }
+
     static List<TreeNode> BuildExampleTree() {
         List<TreeNode> n = new List<TreeNode>();
         string dir = ZanIDE.ExamplesDir();
@@ -7239,7 +7377,7 @@ class ZanIDE {
         return result;
     }
 
-    static int RenderDesigner(App app, Canvas c, Theme t, Rect area,
+    static int RenderDesigner(App app, Canvas c, Theme t, Rect area, string fname,
             List<string> dNames, List<int> dX, List<int> dY,
             List<int> dW, List<int> dH, List<string> dTypes, SignalInt dSel,
             SignalInt dragMode, SignalInt dragOffX, SignalInt dragOffY, SignalInt resizeH,
@@ -7275,7 +7413,11 @@ class ZanIDE {
         ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "StatusBar", t); ty = ty + toolH2;
         ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "ProgressBar", t); ty = ty + toolH2;
         ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "PictureBox", t); ty = ty + toolH2;
-        ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "RichTextBox", t);
+        ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "RichTextBox", t); ty = ty + toolH2;
+        ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "Layer", t); ty = ty + toolH2;
+        ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "SubWindow", t); ty = ty + toolH2;
+        ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "Splitter", t); ty = ty + toolH2;
+        ZanIDE.DrawToolItem(c, area.x, ty, toolW, toolH2, "Timer", t);
 
         // "View Code" opens the associated code-behind (.zan), like WinForms.
         // The form layout itself is auto-saved to the .zform file by the host.
@@ -7390,32 +7532,86 @@ class ZanIDE {
             }
         }
 
-        // Form outline
-        int formX = surfX + app.Scale(20);
-        int formY = area.y + app.Scale(16);
-        int formW = surfW - app.Scale(40);
-        int formH = area.height - app.Scale(32);
-        c.FillRect(formX, formY, formW, formH, 0xFF1E1E1E);
+        // Form canvas: WYSIWYG. The window is drawn at exactly its designed
+        // size (logical px x DPI scale), centered in the surface when it fits,
+        // so what you lay out is what App.CreateDark will open at runtime.
+        int fCw = app.Scale(formW.Get());
+        int fCh = app.Scale(formH.Get());
+        int formX = surfX + (surfW - fCw) / 2;
+        if (formX < surfX + app.Scale(20)) { formX = surfX + app.Scale(20); }
+        int formY = area.y + (area.height - fCh) / 2;
+        if (formY < area.y + app.Scale(16)) { formY = area.y + app.Scale(16); }
+        c.FillRect(formX, formY, fCw, fCh, 0xFF1E1E1E);
         int titleH = app.Scale(28);
-        c.FillRect(formX, formY, formW, titleH, 0xFF333333);
-        c.DrawText(formX + app.Scale(8), formY + app.Scale(6), "Form1", 0xFFCCCCCC, t.fontSizeSmall);
+        c.FillRect(formX, formY, fCw, titleH, 0xFF333333);
+        c.DrawText(formX + app.Scale(8), formY + app.Scale(6), fname, 0xFFCCCCCC, t.fontSizeSmall);
         // Close/min/max buttons
         int btnSz = app.Scale(12);
-        c.FillRect(formX + formW - app.Scale(22), formY + app.Scale(8), btnSz, btnSz, 0xFFE81123);
-        c.FillRect(formX + formW - app.Scale(40), formY + app.Scale(8), btnSz, btnSz, 0xFF888888);
-        c.FillRect(formX + formW - app.Scale(58), formY + app.Scale(8), btnSz, btnSz, 0xFF888888);
-        // Form border
-        c.DrawRect(formX, formY, formW, formH, 0xFF555555, 1);
+        c.FillRect(formX + fCw - app.Scale(22), formY + app.Scale(8), btnSz, btnSz, 0xFFE81123);
+        c.FillRect(formX + fCw - app.Scale(40), formY + app.Scale(8), btnSz, btnSz, 0xFF888888);
+        c.FillRect(formX + fCw - app.Scale(58), formY + app.Scale(8), btnSz, btnSz, 0xFF888888);
+        // Form border + designed-size badge under the bottom-right corner.
+        c.DrawRect(formX, formY, fCw, fCh, 0xFF555555, 1);
+        string dimTxt = Convert.ToString(formW.Get()) + " x " + Convert.ToString(formH.Get());
+        int dimW = Canvas.MeasureText(dimTxt, t.fontSizeSmall);
+        c.DrawText(formX + fCw - dimW, formY + fCh + app.Scale(4), dimTxt, 0xFF888888, t.fontSizeSmall);
 
         // Draw placed controls
         int cntX = formX;
         int cntY = formY + titleH;
+
+        // Dock layout pass (WinForms/aardio-style, in list order): docked
+        // controls stick to an edge of the remaining client area and stretch
+        // along it, Fill takes what is left, None keeps its free coordinates.
+        // The same rules drive the generated code, so the design surface
+        // matches the running window even as it resizes.
+        List<int> eX = new List<int>();
+        List<int> eY = new List<int>();
+        List<int> eW = new List<int>();
+        List<int> eH = new List<int>();
+        int dlX = cntX;
+        int dlY = cntY;
+        int dlW = fCw;
+        int dlH = formY + fCh - cntY;
+        int dli = 0;
+        while (dli < dNames.Count) {
+            string dk = "None";
+            if (dli < dDock.Count && dDock[dli].Length > 0) { dk = dDock[dli]; }
+            if (dk == "Top") {
+                int hh2 = dH[dli];
+                if (hh2 > dlH) { hh2 = dlH; }
+                eX.Add(dlX); eY.Add(dlY); eW.Add(dlW); eH.Add(hh2);
+                dlY = dlY + hh2; dlH = dlH - hh2;
+            } else if (dk == "Bottom") {
+                int hh3 = dH[dli];
+                if (hh3 > dlH) { hh3 = dlH; }
+                eX.Add(dlX); eY.Add(dlY + dlH - hh3); eW.Add(dlW); eH.Add(hh3);
+                dlH = dlH - hh3;
+            } else if (dk == "Left") {
+                int ww2 = dW[dli];
+                if (ww2 > dlW) { ww2 = dlW; }
+                eX.Add(dlX); eY.Add(dlY); eW.Add(ww2); eH.Add(dlH);
+                dlX = dlX + ww2; dlW = dlW - ww2;
+            } else if (dk == "Right") {
+                int ww3 = dW[dli];
+                if (ww3 > dlW) { ww3 = dlW; }
+                eX.Add(dlX + dlW - ww3); eY.Add(dlY); eW.Add(ww3); eH.Add(dlH);
+                dlW = dlW - ww3;
+            } else if (dk == "Fill") {
+                eX.Add(dlX); eY.Add(dlY); eW.Add(dlW); eH.Add(dlH);
+            } else {
+                eX.Add(cntX + dX[dli]); eY.Add(cntY + dY[dli]);
+                eW.Add(dW[dli]); eH.Add(dH[dli]);
+            }
+            dli = dli + 1;
+        }
+
         int di = 0;
         while (di < dNames.Count) {
-            int cx = cntX + dX[di];
-            int cy = cntY + dY[di];
-            int cw = dW[di];
-            int ch = dH[di];
+            int cx = eX[di];
+            int cy = eY[di];
+            int cw = eW[di];
+            int ch = eH[di];
             string cType = dTypes[di];
             // Control rendering per type
             int cbg = 0xFF3C3C3C;
@@ -7475,14 +7671,58 @@ class ZanIDE {
         int evBtn = app.window.EventButton();
         int dm = dragMode.Get();
 
+        // Edge snapping for automatic layout: while moving a control, hovering
+        // near a form edge highlights a dock zone; dropping there docks the
+        // control (Top/Bottom/Left/Right) so the layout adapts automatically
+        // instead of relying on hand-computed coordinates.
+        int dkZone = 0;
+        if (dm == 1 && dSelV >= 0 && dSelV < dNames.Count
+            && mx >= cntX && mx < formX + fCw && my >= cntY && my < formY + fCh) {
+            int edgeT = app.Scale(26);
+            if (mx < cntX + edgeT) { dkZone = 1; }
+            else if (mx >= formX + fCw - edgeT) { dkZone = 3; }
+            else if (my < cntY + edgeT) { dkZone = 2; }
+            else if (my >= formY + fCh - edgeT) { dkZone = 4; }
+            if (dkZone == 1) { c.DrawRect(cntX, cntY, fCw / 4, formY + fCh - cntY, t.primary, 2); }
+            else if (dkZone == 3) { c.DrawRect(formX + fCw - fCw / 4, cntY, fCw / 4, formY + fCh - cntY, t.primary, 2); }
+            else if (dkZone == 2) { c.DrawRect(cntX, cntY, fCw, (formY + fCh - cntY) / 4, t.primary, 2); }
+            else if (dkZone == 4) { c.DrawRect(cntX, formY + fCh - (formY + fCh - cntY) / 4, fCw, (formY + fCh - cntY) / 4, t.primary, 2); }
+        }
+        if (evKind == 3 && dm == 1 && dkZone > 0 && dSelV >= 0 && dSelV < dDock.Count) {
+            if (dkZone == 1) { dDock[dSelV] = "Left"; }
+            else if (dkZone == 2) { dDock[dSelV] = "Top"; }
+            else if (dkZone == 3) { dDock[dSelV] = "Right"; }
+            else { dDock[dSelV] = "Bottom"; }
+            app.RequestRedraw();
+        }
+
+        // Drag/resize feedback: an accent ghost outline around the control
+        // plus a live position (or size) badge, redrawn on the animation
+        // clock so the control visibly tracks the cursor while dragging.
+        if (dm > 0 && dSelV >= 0 && dSelV < dNames.Count && previewOn == 0) {
+            int ghX = cntX + dX[dSelV];
+            int ghY = cntY + dY[dSelV];
+            c.DrawRect(ghX - 2, ghY - 2, dW[dSelV] + 4, dH[dSelV] + 4, t.primary, 2);
+            string bTxt = Convert.ToString(dX[dSelV]) + ", " + Convert.ToString(dY[dSelV]);
+            if (dm == 2) { bTxt = Convert.ToString(dW[dSelV]) + " x " + Convert.ToString(dH[dSelV]); }
+            int bW = Canvas.MeasureText(bTxt, t.fontSizeSmall) + app.Scale(10);
+            int bH = app.Scale(18);
+            int bX = ghX;
+            int bY = ghY - bH - app.Scale(6);
+            if (bY < area.y) { bY = ghY + dH[dSelV] + app.Scale(6); }
+            c.FillRoundRect(bX, bY, bW, bH, app.Scale(3), t.primary);
+            c.DrawText(bX + app.Scale(5), bY + app.Scale(3), bTxt, 0xFFFFFFFF, t.fontSizeSmall);
+            app.RequestAnimationFrame(16);
+        }
+
         // Mouse down (left) on the design surface: grab a resize handle of the
         // current selection, else select/begin-moving a control, else clear the
         // selection. Dragging itself happens on the following move events.
         if (evKind == 2 && evBtn == 0
-            && mx >= cntX && mx < formX + formW && my >= cntY && my < formY + formH) {
+            && mx >= cntX && mx < formX + fCw && my >= cntY && my < formY + fCh) {
             bool started = false;
             if (dSelV >= 0 && dSelV < dNames.Count) {
-                int rh = ZanIDE.HitHandle(app, mx, my, cntX + dX[dSelV], cntY + dY[dSelV], dW[dSelV], dH[dSelV]);
+                int rh = ZanIDE.HitHandle(app, mx, my, eX[dSelV], eY[dSelV], eW[dSelV], eH[dSelV]);
                 if (rh >= 0) {
                     dragMode.Set(2);
                     resizeH.Set(rh);
@@ -7495,13 +7735,22 @@ class ZanIDE {
                 int ci = dNames.Count - 1;
                 bool found = false;
                 while (ci >= 0 && !found) {
-                    int ccx = cntX + dX[ci];
-                    int ccy = cntY + dY[ci];
-                    if (mx >= ccx && mx < ccx + dW[ci] && my >= ccy && my < ccy + dH[ci]) {
+                    int ccx = eX[ci];
+                    int ccy = eY[ci];
+                    if (mx >= ccx && mx < ccx + eW[ci] && my >= ccy && my < ccy + eH[ci]) {
                         dSel.Set(ci);
                         dragMode.Set(1);
                         dragOffX.Set(mx - ccx);
                         dragOffY.Set(my - ccy);
+                        // Dragging a docked control releases it back to free
+                        // placement at its current on-screen position.
+                        if (ci < dDock.Count && dDock[ci] != "None" && dDock[ci].Length > 0) {
+                            dDock[ci] = "None";
+                            dX[ci] = ccx - cntX;
+                            dY[ci] = ccy - cntY;
+                            dW[ci] = eW[ci];
+                            dH[ci] = eH[ci];
+                        }
                         found = true;
                     }
                     ci = ci - 1;
@@ -7676,6 +7925,10 @@ class ZanIDE {
         if (idx == 15) { return "ProgressBar"; }
         if (idx == 16) { return "PictureBox"; }
         if (idx == 17) { return "RichTextBox"; }
+        if (idx == 18) { return "Layer"; }
+        if (idx == 19) { return "SubWindow"; }
+        if (idx == 20) { return "Splitter"; }
+        if (idx == 21) { return "Timer"; }
         return "";
     }
 
