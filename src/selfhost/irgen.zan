@@ -39,6 +39,7 @@ class Irgen {
     public List<string> stmtTemps;
     public List<Node> stmtTempTypes;
     public int loopScopeBase;
+    public List<string> externDecls; // extern C symbols already `declare`d
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -56,6 +57,59 @@ class Irgen {
         stmtTemps = new List<string>();
         stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
+        externDecls = new List<string>();
+    }
+
+    // The raw C-ABI symbol an extern (DllImport) method binds to: the
+    // EntryPoint override when given (stored in sval2), else the method name.
+    string ExternName(Node m) {
+        if (m.sval2 != "") { return m.sval2; }
+        return m.sval;
+    }
+
+    // Pre-register the C symbols already `declare`d in the module header so a
+    // [DllImport] of e.g. calloc/malloc does not emit a duplicate declaration.
+    void SeedExternBuiltins() {
+        externDecls.Add("printf"); externDecls.Add("malloc"); externDecls.Add("calloc");
+        externDecls.Add("realloc"); externDecls.Add("free"); externDecls.Add("strlen");
+        externDecls.Add("strcmp"); externDecls.Add("strcpy"); externDecls.Add("strcat");
+        externDecls.Add("memcpy"); externDecls.Add("snprintf"); externDecls.Add("fopen");
+        externDecls.Add("fseek"); externDecls.Add("ftell"); externDecls.Add("fread");
+        externDecls.Add("fwrite"); externDecls.Add("fclose"); externDecls.Add("_setjmp");
+        externDecls.Add("longjmp"); externDecls.Add("exit");
+    }
+
+    bool ExternSeen(string name) {
+        int i = 0;
+        while (i < externDecls.Count) {
+            if (externDecls[i] == name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Emit `declare <ret> @<sym>(<params>)` for a [DllImport] extern method,
+    // deduplicated against builtins and prior declarations. Calls route to the
+    // raw symbol via MethodSym.
+    void DeclareExtern(Node cls, Node m) {
+        string sym = ExternName(m);
+        if (ExternSeen(sym)) { return; }
+        externDecls.Add(sym);
+        string rt = MapType(m.type);
+        string sig = "declare " + rt + " @" + sym + "(";
+        int first = 1;
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                if (first == 0) { sig = sig + ", "; }
+                sig = sig + MapType(p.type);
+                first = 0;
+            }
+            i = i + 1;
+        }
+        sig = sig + ")";
+        H(sig);
     }
 
     string NT() { tmp = tmp + 1; return "%t" + tmp; }
@@ -365,6 +419,7 @@ class Irgen {
         H("declare void @longjmp(i8*, i32)");
         H("declare i8* @llvm.frameaddress.p0(i32)");
         H("declare void @exit(i32)");
+        SeedExternBuiltins();
         H("@__exc_sp = global i64 0");
         H("@__exc_stack = global [64 x i8*] zeroinitializer");
         H("@__exc_val = global i8* null");
@@ -1014,7 +1069,8 @@ class Irgen {
             Node m = cls.kids[i];
             if (m.kind == AK.MethodDecl()) {
                 // abstract/interface methods have no body: no function is emitted
-                if (!IsAbstract(m)) { GenMethod(cls, m, false); }
+                if (HasMod(m, MOD.Extern())) { DeclareExtern(cls, m); }
+                else if (!IsAbstract(m)) { GenMethod(cls, m, false); }
             }
             else if (m.kind == AK.CtorDecl()) { GenCtor(cls, m); }
             i = i + 1;
@@ -1249,6 +1305,12 @@ class Irgen {
         return true;
     }
 
+    // Any LLVM pointer type (class pointer or the generic i8*).
+    bool IsPtrLL(string s) {
+        if (s == "i8*") { return true; }
+        return IsClassPtr(s);
+    }
+
     // when null literal, retype to the target LLVM type; bitcast class pointers
     // (e.g. a derived instance stored into a base-typed slot)
     string Coerce(ExprVal v, string llty) {
@@ -1330,6 +1392,7 @@ class Irgen {
     // has no overloads -- is unchanged); an overloaded name gains an arity and
     // per-parameter-type suffix so each overload is a distinct definition.
     string MethodSym(string owner, Node m) {
+        if (HasMod(m, MOD.Extern())) { return ExternName(m); }
         Node oc = binder.FindType(owner);
         if (MethodCount(oc, m.sval) <= 1) { return owner + "_" + m.sval; }
         StringBuilder sb = new StringBuilder();
@@ -1900,6 +1963,9 @@ class Irgen {
         if (op == TK.Star()) { return "mul"; }
         if (op == TK.Slash()) { return "sdiv"; }
         if (op == TK.Percent()) { return "srem"; }
+        if (op == TK.Amp()) { return "and"; }
+        if (op == TK.Caret()) { return "xor"; }
+        if (op == TK.Pipe()) { return "or"; }
         return "";
     }
     string CmpOp(int op) {
@@ -2062,6 +2128,23 @@ class Irgen {
                 L("  " + z + " = zext i1 " + c + " to i64");
                 return new ExprVal(z, MkType("bool"));
             }
+            // reference identity: compare pointer operands as pointers, not i64
+            string alt = MapType(a.ty); string blt = MapType(b.ty);
+            if (IsPtrLL(alt) && IsPtrLL(blt)) {
+                string pty = alt;
+                string ao = a.op; string bo = b.op;
+                if (blt != pty) {
+                    string tb = NT();
+                    L("  " + tb + " = bitcast " + blt + " " + bo + " to " + pty);
+                    bo = tb;
+                }
+                string ccp = "eq"; if (op == TK.BangEq()) { ccp = "ne"; }
+                string cp = NT();
+                L("  " + cp + " = icmp " + ccp + " " + pty + " " + ao + ", " + bo);
+                string zp = NT();
+                L("  " + zp + " = zext i1 " + cp + " to i64");
+                return new ExprVal(zp, MkType("bool"));
+            }
             string cc2 = CmpOp(op);
             string c2 = NT();
             L("  " + c2 + " = icmp " + cc2 + " i64 " + a.op + ", " + b.op);
@@ -2096,6 +2179,16 @@ class Irgen {
         }
         string cp = CmpOp(op);
         if (cp != "") {
+            // lexicographic ordering for strings (matches ==/!= strcmp handling)
+            if (IsStr(a.ty) && IsStr(b.ty)) {
+                string r = NT();
+                L("  " + r + " = call i32 @strcmp(i8* " + a.op + ", i8* " + b.op + ")");
+                string cs = NT();
+                L("  " + cs + " = icmp " + cp + " i32 " + r + ", 0");
+                string zs = NT();
+                L("  " + zs + " = zext i1 " + cs + " to i64");
+                return new ExprVal(zs, MkType("bool"));
+            }
             string c = NT();
             L("  " + c + " = icmp " + cp + " i64 " + a.op + ", " + b.op);
             string z = NT();
@@ -2598,6 +2691,16 @@ class Irgen {
             string t = NT();
             string ow = "0"; if (ArcManaged(ListElem(ty))) { ow = "1"; }
             L("  " + t + " = call i8* @zlist_new(i64 " + ow + ")");
+            if (e.ival == 2) {
+                // collection initializer: append each item
+                int j = 0;
+                while (j < e.kids.Count) {
+                    ExprVal iv = GenExpr(e.kids[j]);
+                    string sv = ToSlot(iv, ListElem(ty));
+                    L("  call void @zlist_add(i8* " + t + ", i64 " + sv + ")");
+                    j = j + 1;
+                }
+            }
             AddTemp(t, ty);
             return new ExprVal(t, ty);
         }
@@ -2633,9 +2736,11 @@ class Irgen {
             L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
             L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + cn + "_vtable to i8*), i8** " + vtp0);
         }
-        // call ctor if present
+        // call ctor if present. With an object initializer (ival == 2) the kids
+        // are `Field = value` pairs, not ctor args, so only a parameterless ctor
+        // is invoked and the field stores follow.
         Node ctor = binder.FindCtor(cls);
-        if (ctor != null) {
+        if (ctor != null && e.ival != 2) {
             string args = "%" + cn + "* " + obj;
             int i = 0;
             while (i < e.kids.Count) {
@@ -2645,10 +2750,34 @@ class Irgen {
                 i = i + 1;
             }
             L("  call void @" + cn + "_ctor(" + args + ")");
+        } else if (ctor != null && e.ival == 2 && CtorParamCount(ctor) == 0) {
+            L("  call void @" + cn + "_ctor(%" + cn + "* " + obj + ")");
+        }
+        // object initializer: store each `Field = value` into the instance
+        if (e.ival == 2) {
+            int j = 0;
+            while (j < e.kids.Count) {
+                Node it = e.kids[j];
+                if (it.kind == AK.Assignment() && it.a != null
+                    && it.a.kind == AK.Ident()) {
+                    ExprVal fv = GenExpr(it.b);
+                    StoreField(obj, cn, it.a.sval, fv);
+                }
+                j = j + 1;
+            }
         }
         // preserve generic type arguments (ty may carry <...>) for the result
         AddTemp(obj, ty);
         return new ExprVal(obj, ty);
+    }
+
+    int CtorParamCount(Node ctor) {
+        int n = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            if (ctor.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
     }
 
     Node CtorParamType(Node ctor, int argIdx) {
@@ -2775,9 +2904,7 @@ class Irgen {
     // ---- lambdas / delegates ----
     bool IsDelegate(Node t) {
         if (t == null) { return false; }
-        if (t.sval == "Func") { return true; }
-        if (t.sval == "Action") { return true; }
-        return false;
+        return binder.IsDelegateName(t.sval);
     }
 
     Node MkIdent(string name) { Node n = new Node(AK.Ident()); n.sval = name; return n; }
@@ -3131,6 +3258,21 @@ class Irgen {
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i64 " + a0 + ")");
             }
             return new ExprVal("0", MkType("void"));
+        }
+        // Convert.ToString(x) -> heap string via snprintf; Convert.ToInt32(s) -> atoi
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Convert") {
+            if (callee.sval == "ToString" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string s = ToCStr(a);
+                return new ExprVal(s, MkType("string"));
+            }
+            if ((callee.sval == "ToInt32" || callee.sval == "ToInt") && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string r = NT();
+                L("  " + r + " = call i64 @atoi(i8* " + a.op + ")");
+                return new ExprVal(r, MkType("int"));
+            }
         }
         // method access forms
         if (callee.kind == AK.MemberAccess()) {

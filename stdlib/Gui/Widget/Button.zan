@@ -20,6 +20,7 @@ class Button : Control {
     bool loading;
     bool ghost;
     bool secondary;
+    bool specular;
     int customColor;
     int wid;
     /// Fires on the frame the button is clicked (C#-style: `btn.Click += h;`).
@@ -44,6 +45,7 @@ class Button : Control {
         loading = false;
         ghost = false;
         secondary = false;
+        specular = false;
         customColor = 0;
         wid = WidgetId.Next();
         Click = UiEvent.Create();
@@ -116,6 +118,20 @@ class Button : Control {
         return b;
     }
 
+    /// Specular: an opt-in luminous sheen — on hover a soft light follows the
+    /// cursor inside the button (reactbits "specular-button"). Clipped to the
+    /// button, so nothing spills onto neighbours.
+    static Button Specular(string text, int type) {
+        Button b = Button.Typed(text, type);
+        b.specular = true;
+        return b;
+    }
+
+    /// Enable/disable the specular sheen on an existing button.
+    void SetSpecular(bool v) {
+        specular = v;
+    }
+
     /// Loading: shows an animated spinner and ignores clicks until cleared.
     static Button Loading(string text, int type) {
         Button b = Button.Typed(text, type);
@@ -181,6 +197,15 @@ class Button : Control {
         return t.fontSizeMedium;
     }
 
+    /// Horizontal inner padding per size. Auto-sized buttons reserve this on
+    /// each side of the icon/text so short labels never read as cramped.
+    int GetHPad(Theme t) {
+        if (size == 0) { return t.paddingSmall; }
+        if (size == 1) { return t.paddingMedium; }
+        if (size == 3) { return t.paddingLarge + t.gapSmall; }
+        return t.paddingLarge;
+    }
+
     int Render(App app, int x, int y, int w) {
         int id = wid;
         Canvas c = app.canvas;
@@ -202,7 +227,7 @@ class Button : Control {
             if (text != "") { textW = Canvas.MeasureText(text, fontSize); }
             int iconW = 0;
             if (icon != "") { iconW = fontSize * 4 / 3 + t.gapSmall; }
-            w = textW + iconW + t.paddingMedium * 2;
+            w = textW + iconW + this.GetHPad(t) * 2;
             if (circle) { w = h; }
         }
         if (block) { w = app.canvas.Width() - x * 2; }
@@ -268,7 +293,16 @@ class Button : Control {
         // inset while pressed).
         if (t.brutal == 1) {
             int boff = app.Scale(4);
-            c.FillRoundRect(x + boff, y + boff, w, h, radius, t.shadowColor);
+            if (pressed && !disabled) {
+                // Press-into-shadow: translate the whole button onto its shadow
+                // (no gap) so activation reads as a tactile downward shift.
+                x = x + boff;
+                y = y + boff;
+            } else {
+                int soff = boff;
+                if (hovered && !disabled) { soff = boff + app.Scale(2); }
+                c.FillRoundRect(x + soff, y + soff, w, h, radius, t.shadowColor);
+            }
         } else if (t.neu == 1 && !disabled) {
             int noff = app.Scale(4);
             int lite = App.LerpColor(t.bgPrimary, 4294967295, 70);
@@ -307,7 +341,7 @@ class Button : Control {
                 int gA = App.Lerp(0, 30, hv);
                 gA = App.Lerp(gA, 55, pv);
                 if (gA > 0) { c.FillRoundRect(x, y, w, h, radius, Chart.WithAlpha(tc, gA)); }
-                c.DrawRect(x, y, w, h, tc, 1);
+                c.DrawRoundRect(x, y, w, h, radius, tc, 1);
                 fgColor = tc;
             }
         } else if (btnStyle == 1) {
@@ -320,7 +354,7 @@ class Button : Control {
                 bgColor = App.LerpColor(bgColor, t.bgActive, pv);
             }
             c.FillRoundRect(x, y, w, h, radius, bgColor);
-            c.DrawRect(x, y, w, h, outlineColor, 1);
+            c.DrawRoundRect(x, y, w, h, radius, outlineColor, 1);
         } else if (btnStyle == 2) {
             // Text (no bg)
             if (!disabled && btnType > 0) { fgColor = borderColor; }
@@ -361,12 +395,26 @@ class Button : Control {
         } else {
             // Solid (default)
             c.FillRoundRect(x, y, w, h, radius, bgColor);
-            if (btnType == 0) { c.DrawRect(x, y, w, h, borderColor, 1); }
+            if (btnType == 0) { c.DrawRoundRect(x, y, w, h, radius, borderColor, 1); }
         }
 
         // Neo-brutalism outlines every button with a thick hard black border.
         if (t.brutal == 1) {
-            c.DrawRect(x, y, w, h, t.borderPrimary, t.borderWidth);
+            c.DrawRoundRect(x, y, w, h, radius, t.borderPrimary, t.borderWidth);
+        }
+
+        // Click ripple over the fill (skip the no-fill text style so a bare
+        // text button doesn't flash a disc on a transparent background).
+        if (!disabled && !loading && btnStyle != 2) {
+            Ui.Ripple(app, id, x, y, w, h, App.LerpColor(bgColor, 4294967295, 320));
+        }
+
+        // Opt-in specular sheen: two small symmetric arcs of light on the
+        // border track the cursor and ease in on hover, clipped to the button
+        // so nothing spills onto neighbours or the label (reactbits
+        // "specular-button").
+        if (specular && !disabled && !loading) {
+            Fx.Specular(app, id, x, y, w, h, radius, 4294967295);
         }
 
         // Content (icon/spinner + text), centered. Button glyphs read ~1.33x
@@ -410,8 +458,13 @@ class Button : Control {
     }
 
     static bool WasClicked(App app, int id) {
-        if (app.window.EventKind() != 3) { return false; }
-        return app.hitTester.HitTest(app.mouseX, app.mouseY) == id;
+        // Use the click target resolved once per event against the PREVIOUS
+        // frame's complete hit regions (top-most wins), not a live HitTest
+        // against the partially-registered current frame. A live test would
+        // let a button see its own click before an overlay/blocker registered
+        // later in the same frame (loading mask, layer, modal scrim) could
+        // swallow it -- the pointer "passed through" the mask.
+        return Ui.Clicked(app, id);
     }
 
     // --- Designer / serialization model ---
@@ -480,7 +533,7 @@ class Button : Control {
         if (text != "") { textW = Canvas.MeasureText(text, fontSize); }
         int iconW = 0;
         if (icon != "") { iconW = fontSize * 4 / 3 + t.gapSmall; }
-        int w = textW + iconW + t.paddingMedium * 2;
+        int w = textW + iconW + this.GetHPad(t) * 2;
         if (circle) { w = prefH; }
         prefW = w;
     }

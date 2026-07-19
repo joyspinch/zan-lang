@@ -19,6 +19,8 @@ static zan_type_t *make_type(zan_arena_t *arena, zan_type_kind_t kind, const cha
     t->kind = kind;
     t->name.str = name;
     t->name.len = len;
+    t->interfaces = NULL;
+    t->interface_count = 0;
     return t;
 }
 
@@ -371,20 +373,37 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
     if (!type_sym) return;
 
-    /* resolve base types and inherit members */
+    /* resolve base types and inherit members. A declaration may list one base
+     * class followed by any number of interfaces (C#-style single inheritance):
+     * the class base sets base_type + inherits members, each interface base is
+     * recorded so codegen can emit interface (tag) dispatch. */
     if (type_node->type_decl.bases.count > 0) {
-        zan_ast_node_t *base_ref = type_node->type_decl.bases.items[0];
-        zan_istr_t base_name = base_ref->type_ref.name;
-        zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
-        if (base_sym && (base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT)) {
-            type_sym->type->base_type = base_sym->type;
-            /* inherit base class fields and properties */
-            for (int bi = 0; bi < base_sym->member_count; bi++) {
-                if (base_sym->members[bi]->kind == SYM_FIELD ||
-                    base_sym->members[bi]->kind == SYM_PROPERTY) {
-                    symbol_add_member(b->arena, type_sym, base_sym->members[bi]);
+        int nbases = type_node->type_decl.bases.count;
+        zan_type_t **ifaces = (zan_type_t **)zan_arena_alloc(
+            b->arena, sizeof(zan_type_t *) * (size_t)nbases);
+        int nif = 0;
+        for (int bx = 0; bx < nbases; bx++) {
+            zan_ast_node_t *base_ref = type_node->type_decl.bases.items[bx];
+            zan_istr_t base_name = base_ref->type_ref.name;
+            zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
+            if (!base_sym) continue;
+            if ((base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT) &&
+                !type_sym->type->base_type) {
+                type_sym->type->base_type = base_sym->type;
+                /* inherit base class fields and properties */
+                for (int bi = 0; bi < base_sym->member_count; bi++) {
+                    if (base_sym->members[bi]->kind == SYM_FIELD ||
+                        base_sym->members[bi]->kind == SYM_PROPERTY) {
+                        symbol_add_member(b->arena, type_sym, base_sym->members[bi]);
+                    }
                 }
+            } else if (base_sym->kind == SYM_INTERFACE) {
+                ifaces[nif++] = base_sym->type;
             }
+        }
+        if (nif > 0) {
+            type_sym->type->interfaces = ifaces;
+            type_sym->type->interface_count = nif;
         }
     }
 

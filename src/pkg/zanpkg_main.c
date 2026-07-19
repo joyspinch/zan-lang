@@ -21,6 +21,7 @@
 #else
 #include <unistd.h>
 #include <sys/stat.h>   /* mkdir() */
+#include <dirent.h>     /* opendir()/readdir() */
 #define PATH_SEP "/"
 #endif
 
@@ -168,18 +169,30 @@ static int collect_zan_files(const char *dir, char files[][512], int max_files, 
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
-    /* Linux: use popen with find command */
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "find \"%s\" -name '*.zan' -type f", dir);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return count;
-    char line[512];
-    while (fgets(line, sizeof(line), fp) && count < max_files) {
-        line[strcspn(line, "\n")] = 0;
-        strncpy(files[count], line, 511);
-        count++;
+    /* POSIX: walk the directory tree directly. Building a shell "find" command
+     * from `dir` would allow command injection when the source directory name
+     * (read from an untrusted zan.pkg manifest) contains shell metacharacters. */
+    DIR *d = opendir(dir);
+    if (!d) return count;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && count < max_files) {
+        if (ent->d_name[0] == '.') continue;   /* skip ., .. and dotfiles */
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            count = collect_zan_files(path, files, max_files, count);
+        } else if (S_ISREG(st.st_mode)) {
+            size_t len = strlen(ent->d_name);
+            if (len > 4 && strcmp(ent->d_name + len - 4, ".zan") == 0) {
+                strncpy(files[count], path, 511);
+                files[count][511] = 0;
+                count++;
+            }
+        }
     }
-    pclose(fp);
+    closedir(d);
 #endif
     return count;
 }

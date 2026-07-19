@@ -236,6 +236,24 @@ u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride) {
     return s->pixels;
 }
 
+/* Internal (not part of the [DllImport] ABI): expose the surface's active
+ * clip window so platform backends that rasterize text/glyphs themselves
+ * (e.g. the macOS CoreText path) honour PushClip like the shared renderer. */
+void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0, int *x1, int *y1) {
+    if (id < 0 || id >= g_surface_count || !g_surfaces[id]) {
+        if (x0) *x0 = 0;
+        if (y0) *y0 = 0;
+        if (x1) *x1 = 0;
+        if (y1) *y1 = 0;
+        return;
+    }
+    zan_surface_t *s = g_surfaces[id];
+    if (x0) *x0 = s->clip_x0;
+    if (y0) *y0 = s->clip_y0;
+    if (x1) *x1 = s->clip_x1;
+    if (y1) *y1 = s->clip_y1;
+}
+
 EXPORT void zan_gui_clear(i64 surface_id, i64 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -307,10 +325,10 @@ EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 co
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     u32 c = (u32)color;
-    int x0 = clamp_i((int)x, 0, s->width);
-    int y0 = clamp_i((int)y, 0, s->height);
-    int x1 = clamp_i((int)(x + w), 0, s->width);
-    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int x0 = clamp_i((int)x, s->clip_x0, s->clip_x1);
+    int y0 = clamp_i((int)y, s->clip_y0, s->clip_y1);
+    int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
+    int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
     u32 sa = (c >> 24) & 0xFF;
     if (sa == 255) {
         for (int py = y0; py < y1; py++) {
@@ -332,10 +350,10 @@ EXPORT void zan_gui_fill_vgrad(i64 surface_id, i64 x, i64 y, i64 w, i64 h,
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
-    int x0 = clamp_i((int)x, 0, s->width);
-    int y0 = clamp_i((int)y, 0, s->height);
-    int x1 = clamp_i((int)(x + w), 0, s->width);
-    int y1 = clamp_i((int)(y + h), 0, s->height);
+    int x0 = clamp_i((int)x, s->clip_x0, s->clip_x1);
+    int y0 = clamp_i((int)y, s->clip_y0, s->clip_y1);
+    int x1 = clamp_i((int)(x + w), s->clip_x0, s->clip_x1);
+    int y1 = clamp_i((int)(y + h), s->clip_y0, s->clip_y1);
     int rh = (int)h;
     if (rh < 1) rh = 1;
     int denom = rh > 1 ? rh - 1 : 1;
@@ -456,7 +474,7 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
         }
     }
 
-    /* Vibrancy (luma-preserving ~1.4x saturation) on the small copy so the
+    /* Vibrancy (luma-preserving ~1.6x saturation) on the small copy so the
      * frost keeps the wallpaper's colour instead of washing to grey. */
     for (int i = 0; i < (int)dn; i++) {
         u32 px = a[i];
@@ -464,19 +482,28 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
         int gc = (int)((px >> 8) & 0xFF);
         int bc = (int)(px & 0xFF);
         int luma = (rc * 77 + gc * 150 + bc * 29) >> 8;
-        rc = luma + (rc - luma) * 7 / 5;
-        gc = luma + (gc - luma) * 7 / 5;
-        bc = luma + (bc - luma) * 7 / 5;
+        rc = luma + (rc - luma) * 8 / 5;
+        gc = luma + (gc - luma) * 8 / 5;
+        bc = luma + (bc - luma) * 8 / 5;
         a[i] = 0xFF000000u | ((u32)clamp_i(rc, 0, 255) << 16)
              | ((u32)clamp_i(gc, 0, 255) << 8) | (u32)clamp_i(bc, 0, 255);
     }
 
-    /* Upscale the small blurred copy back into the surface region. */
+    /* Upscale the small blurred copy back into the surface region, adding a
+     * static fine grain (position-hashed +/-3 luma) so the frost reads as
+     * acrylic texture instead of a perfectly smooth plastic sheet. */
     if (ds == 1) {
         for (int j = 0; j < rh; j++) {
             u32 *row = s->pixels + (y0 + j) * s->stride + x0;
             u32 *src = a + j * dw;
-            for (int i = 0; i < rw; i++) row[i] = src[i];
+            for (int i = 0; i < rw; i++) {
+                u32 px = src[i];
+                int nz = ((((x0 + i) * 197 + (y0 + j) * 173) >> 3) % 7) - 3;
+                int rC = clamp_i((int)((px >> 16) & 0xFF) + nz, 0, 255);
+                int gC = clamp_i((int)((px >> 8) & 0xFF) + nz, 0, 255);
+                int bC = clamp_i((int)(px & 0xFF) + nz, 0, 255);
+                row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
+            }
         }
     } else {
         /* Bilinear: sample the small copy at each full-res pixel centre
@@ -508,6 +535,10 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
                         + (int)((p10 >> 8) & 0xFF) * w10 + (int)((p11 >> 8) & 0xFF) * w11) >> 16;
                 int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01
                         + (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >> 16;
+                int nz = ((((x0 + i) * 197 + (y0 + j) * 173) >> 3) % 7) - 3;
+                rC = clamp_i(rC + nz, 0, 255);
+                gC = clamp_i(gC + nz, 0, 255);
+                bC = clamp_i(bC + nz, 0, 255);
                 row[i] = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
             }
         }
@@ -649,6 +680,36 @@ EXPORT i64 zan_gui_restore_rect(i64 surface_id, i64 x, i64 y, i64 w,
     return 1;
 }
 
+/* Restores just the part of slot `slot` that intersects [x,y,w,h]. Unlike
+ * zan_gui_restore_rect the rect need not match the snapshot's geometry, so a
+ * caller can repair many small damaged regions (e.g. the previous animation
+ * frame's particles) without copying the whole snapshot back. Returns 1 while
+ * the slot holds a valid snapshot for this surface size, 0 otherwise. */
+EXPORT i64 zan_gui_restore_sub_rect(i64 surface_id, i64 x, i64 y, i64 w,
+                                    i64 h, i64 slot) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return 0;
+    if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return 0;
+    zan_blur_cache_t *c = &g_snap_cache[slot];
+    if (!c->valid || !c->pixels) return 0;
+    int x0 = clamp_i((int)x, c->x0, c->x0 + c->rw);
+    int y0 = clamp_i((int)y, c->y0, c->y0 + c->rh);
+    int x1 = clamp_i((int)(x + w), c->x0, c->x0 + c->rw);
+    int y1 = clamp_i((int)(y + h), c->y0, c->y0 + c->rh);
+    x0 = clamp_i(x0, 0, s->width);
+    y0 = clamp_i(y0, 0, s->height);
+    x1 = clamp_i(x1, 0, s->width);
+    y1 = clamp_i(y1, 0, s->height);
+    if (x1 <= x0 || y1 <= y0) return 1;
+    for (int j = y0; j < y1; j++) {
+        u32 *row = s->pixels + j * s->stride + x0;
+        u32 *src = c->pixels + (size_t)(j - c->y0) * c->rw + (x0 - c->x0);
+        for (int i = 0; i < x1 - x0; i++) row[i] = src[i];
+    }
+    return 1;
+}
+
 EXPORT void zan_gui_draw_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 color, i64 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -685,24 +746,76 @@ EXPORT void zan_gui_fill_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h
     zan_gui_fill_rect(surface_id, ix, yt, iw, ih - 2*r, color);      /* middle    */
     zan_gui_fill_rect(surface_id, xl, yb, iw - 2*r, r, color);        /* bottom band */
 
-    int cc[4][2] = {
-        {xl, yt},         /* TL, square px<xl, py<yt   */
-        {xr - 1, yt},     /* TR, square px>=xr, py<yt  */
-        {xl, yb - 1},     /* BL, square px<xl, py>=yb  */
-        {xr - 1, yb - 1}  /* BR, square px>=xr, py>=yb */
+    /* Corner arcs: sample each pixel centre against the continuous corner
+     * centre so all four corners share the same geometry (integer centres
+     * biased TL/BR corners by half a pixel and read as lumpy edges). */
+    double cc[4][2] = {
+        {xl, yt},     /* TL, square px<xl, py<yt   */
+        {xr, yt},     /* TR, square px>=xr, py<yt  */
+        {xl, yb},     /* BL, square px<xl, py>=yb  */
+        {xr, yb}      /* BR, square px>=xr, py>=yb */
     };
     int zx[4] = {ix, xr, ix, xr};
     int zy[4] = {iy, iy, yb, yb};
     for (int ci = 0; ci < 4; ci++) {
-        int ccx = cc[ci][0], ccy = cc[ci][1];
+        double ccx = cc[ci][0], ccy = cc[ci][1];
         for (int py = zy[ci]; py < zy[ci] + r; py++) {
             for (int px = zx[ci]; px < zx[ci] + r; px++) {
-                double ddx = px - ccx, ddy = py - ccy;
+                double ddx = (double)px + 0.5 - ccx;
+                double ddy = (double)py + 0.5 - ccy;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
-                double cov = r + 0.5 - dist;
+                double cov = (double)r - dist + 0.5;
+                if (cov >= 1.0) set_pixel(s, px, py, c);
+                else if (cov > 0.0) set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+            }
+        }
+    }
+}
+
+/* Anti-aliased stroked rounded rectangle. Straight edges are crisp (solid
+ * fill_rect between the corners); the four corner arcs are anti-aliased rings
+ * that share the fill's corner centres/radius so the border hugs a matching
+ * fill_rounded_rect exactly instead of the old square DrawRect outline. */
+EXPORT void zan_gui_draw_rounded_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 radius, i64 color, i64 thickness) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    u32 c = (u32)color;
+    int ix = (int)x, iy = (int)y, iw = (int)w, ih = (int)h;
+    int r = (int)radius, th = (int)thickness;
+    if (th < 1) th = 1;
+    if (r <= 0) { zan_gui_draw_rect(surface_id, x, y, w, h, color, thickness); return; }
+    if (r > iw/2) r = iw/2;
+    if (r > ih/2) r = ih/2;
+    if (th > r) th = r;
+
+    int xl = ix + r, xr = ix + iw - r;
+    int yt = iy + r, yb = iy + ih - r;
+    /* straight edges (exclude the r-wide corner zones) */
+    zan_gui_fill_rect(surface_id, xl, iy, iw - 2*r, th, color);              /* top    */
+    zan_gui_fill_rect(surface_id, xl, iy + ih - th, iw - 2*r, th, color);    /* bottom */
+    zan_gui_fill_rect(surface_id, ix, yt, th, ih - 2*r, color);             /* left   */
+    zan_gui_fill_rect(surface_id, ix + iw - th, yt, th, ih - 2*r, color);   /* right  */
+
+    double cc[4][2] = {
+        {xl, yt}, {xr, yt}, {xl, yb}, {xr, yb}
+    };
+    int zx[4] = {ix, xr, ix, xr};
+    int zy[4] = {iy, iy, yb, yb};
+    double rin = (double)r - (double)th;   /* inner arc radius */
+    for (int ci = 0; ci < 4; ci++) {
+        double ccx = cc[ci][0], ccy = cc[ci][1];
+        for (int py = zy[ci]; py < zy[ci] + r; py++) {
+            for (int px = zx[ci]; px < zx[ci] + r; px++) {
+                double ddx = (double)px + 0.5 - ccx;
+                double ddy = (double)py + 0.5 - ccy;
+                double dist = sqrt(ddx*ddx + ddy*ddy);
+                double outerCov = (double)r + 0.5 - dist;        /* 1 inside outer edge */
+                double innerCov = dist - (rin - 0.5);            /* 1 outside inner edge */
+                double cov = outerCov < innerCov ? outerCov : innerCov;
                 if (cov <= 0.0) continue;
-                if (cov > 1.0) cov = 1.0;
-                set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+                if (cov >= 1.0) set_pixel(s, px, py, c);
+                else set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
             }
         }
     }
@@ -726,6 +839,43 @@ EXPORT void zan_gui_fill_circle(i64 surface_id, i64 cx, i64 cy, i64 radius, i64 
                 int cov = (int)((r + 0.5 - dist) * 255.0);
                 set_pixel_aa(s, icx + dx, icy + dy, c, cov);
             }
+        }
+    }
+}
+
+/* Soft radial glow: a filled disc whose alpha fades smoothly from `inner_a`
+ * (0..255) at the centre to 0 at `radius`, so it reads as a luminous bloom
+ * rather than a hard-edged disc. Only the low 24 bits of `color` (RGB) are
+ * used; `inner_a` drives the peak alpha. The falloff is a smoothstep raised to
+ * a higher power to keep a bright, tight core with a long soft tail -- this is
+ * the building block for specular highlights, spotlights and border glow. */
+EXPORT void zan_gui_fill_radial(i64 surface_id, i64 cx, i64 cy, i64 radius,
+                                i64 color, i64 inner_a) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    int r = (int)radius;
+    if (r <= 0) return;
+    int icx = (int)cx, icy = (int)cy;
+    u32 rgb = (u32)color & 0x00FFFFFFu;
+    int peak = (int)inner_a;
+    if (peak > 255) peak = 255;
+    if (peak <= 0) return;
+    int r2 = r * r;
+    /* Integer squared-distance falloff (no per-pixel sqrt/double): t is 256 at
+     * the centre and 0 at the edge, squared for a bright tight core and a soft
+     * tail. This is called hundreds of times per animated frame, so the hot
+     * loop stays entirely in integer math. */
+    for (int dy = -r; dy <= r; dy++) {
+        int py = icy + dy;
+        int dy2 = dy * dy;
+        for (int dx = -r; dx <= r; dx++) {
+            int d2 = dx * dx + dy2;
+            if (d2 >= r2) continue;
+            int t = ((r2 - d2) << 8) / r2;
+            int a = (peak * t * t) >> 16;
+            if (a <= 0) continue;
+            set_pixel(s, icx + dx, py, ((u32)a << 24) | rgb);
         }
     }
 }
@@ -759,12 +909,29 @@ EXPORT void zan_gui_fill_sector(i64 surface_id, i64 cx, i64 cy, i64 r_inner, i64
             /* angle of this pixel: 0 at top, clockwise, in [0,360) */
             double ang = atan2((double)dx, (double)(-dy)) * 180.0 / PI;
             if (ang < 0.0) ang += 360.0;
-            /* test membership allowing the sweep to exceed 360 via wrap */
-            int inside = 0;
-            if (ang >= a0 && ang <= a1) inside = 1;
-            else if ((ang + 360.0) >= a0 && (ang + 360.0) <= a1) inside = 1;
-            if (!inside) continue;
-            int cov = (int)(radCov * 255.0);
+            /* Angular coverage: anti-alias the two radial (start/end) edges of
+             * the sweep so slice sides are smooth, not stair-stepped. One pixel
+             * of arc length subtends ~ (0.5/dist) radians; convert to degrees
+             * and ramp coverage across that half-pixel band on each edge. Skip
+             * for full turns so the closing seam does not double-darken. */
+            double angCov = 1.0;
+            double sweep = a1 - a0;
+            if (sweep < 360.0) {
+                double aa = ang;
+                double dpix = 45.0;
+                if (dist > 0.5) dpix = (0.5 / dist) * 180.0 / PI;
+                if (aa < a0 - dpix) aa += 360.0;
+                double dLo = aa - a0;   /* >0 inside from the start edge */
+                double dHi = a1 - aa;   /* >0 inside from the end edge   */
+                if (dLo <= -dpix || dHi <= -dpix) continue; /* fully outside */
+                double covLo = (dLo + dpix) / (2.0 * dpix);
+                double covHi = (dHi + dpix) / (2.0 * dpix);
+                if (covLo > 1.0) covLo = 1.0; if (covLo < 0.0) covLo = 0.0;
+                if (covHi > 1.0) covHi = 1.0; if (covHi < 0.0) covHi = 0.0;
+                angCov = covLo * covHi;
+                if (angCov <= 0.0) continue;
+            }
+            int cov = (int)(radCov * angCov * 255.0);
             if (cov >= 255) set_pixel(s, icx + dx, icy + dy, c);
             else set_pixel_aa(s, icx + dx, icy + dy, c, cov);
         }
@@ -1662,11 +1829,24 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     return 0;
 }
 
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
+    DestroyWindow((HWND)(intptr_t)hwnd_val);
+    return 0;
+}
+
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     WINDOWPLACEMENT wpl; wpl.length = sizeof(wpl);
     if (GetWindowPlacement(hwnd, &wpl) && wpl.showCmd == SW_SHOWMAXIMIZED) { return 1; }
     return 0;
+}
+
+/* 1 while the window can be seen (not minimized/hidden); ambient animations
+ * pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    if (IsIconic(hwnd) || !IsWindowVisible(hwnd)) return 0;
+    return 1;
 }
 
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
@@ -1710,6 +1890,30 @@ EXPORT i64 zan_gui_wait_event(void) {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
     return 0;
+}
+
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on quit. Lets an animation loop idle
+ * in the kernel until either input arrives or its next frame deadline. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    g_has_event = 0;
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (ms < 0) ms = 0;
+    DWORD start = GetTickCount();
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return -1;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if (g_has_event) return 0;
+        }
+        DWORD elapsed = GetTickCount() - start;
+        if (elapsed >= (DWORD)ms) return 1;
+        DWORD wr = MsgWaitForMultipleObjects(0, NULL, FALSE,
+                                             (DWORD)ms - elapsed, QS_ALLINPUT);
+        if (wr == WAIT_TIMEOUT) return 1;
+    }
 }
 
 /* Wake a UI thread blocked in wait_event so it can drain the dispatch queue.
@@ -2168,8 +2372,25 @@ static void sdl_translate(const SDL_Event *e) {
         }
         case SDL_EVENT_KEY_DOWN: {
             SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
-            zq_push(4, 0, 0, 0, sdl_key_to_vk(e->key.key),
-                    sdl_mods_to_bits(e->key.mod), w);
+            int vk = sdl_key_to_vk(e->key.key);
+            int kmods = sdl_mods_to_bits(e->key.mod);
+            zq_push(4, 0, 0, 0, vk, kmods, w);
+            /* SDL's TEXT_INPUT event never delivers control characters,
+             * but the widget layer was built on the Win32 WM_CHAR contract
+             * (Backspace=8, Enter=13, Ctrl+letter=1..26, Ctrl+/=31).
+             * Synthesize the matching kind-6 char event so text widgets
+             * (Input / TextArea / CodeEditor) keep editing under SDL3. */
+            {
+                int ctrl = (e->key.mod & SDL_KMOD_CTRL) != 0;
+                int ch = 0;
+                if (e->key.key == SDLK_BACKSPACE) ch = 8;
+                else if (e->key.key == SDLK_RETURN ||
+                         e->key.key == SDLK_KP_ENTER) ch = 13;
+                else if (ctrl && e->key.key >= 'a' && e->key.key <= 'z')
+                    ch = (int)(e->key.key - 'a' + 1);
+                else if (ctrl && e->key.key == '/') ch = 31;
+                if (ch != 0) zq_push(6, 0, 0, 0, ch, kmods, w);
+            }
             break;
         }
         case SDL_EVENT_KEY_UP: {
@@ -2228,6 +2449,10 @@ static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
 static void zan_sdl_ensure_init(void) {
     if (g_sdl_ready) return;
     SDL_SetMainReady();
+    /* Deliver the click that raises/focuses a background window instead of
+     * swallowing it, so a button clicked while the window is inactive fires on
+     * the first click rather than needing a second (focus-then-click). */
+    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     if (!SDL_Init(SDL_INIT_VIDEO)) return;
     float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (scale <= 0.0f) scale = 1.0f;
@@ -2255,6 +2480,21 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
      * present never blocks the UI thread up to a refresh interval. */
     SDL_SetRenderVSync(ren, 0);
     SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
+#ifdef _WIN32
+    /* SDL borderless windows strip the native frame and with it the DWM drop
+     * shadow. Re-extend a 1px frame into the client area so the compositor
+     * paints the standard window shadow -- matches the old Win32 shell and the
+     * IDE. The frame stays invisible because the window is borderless. */
+    {
+        HWND hwnd = (HWND)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(win),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        if (hwnd) {
+            MARGINS m = { 1, 1, 1, 1 };
+            DwmExtendFrameIntoClientArea(hwnd, &m);
+        }
+    }
+#endif
 
 #ifdef _WIN32
     /* A borderless SDL window loses the OS drop shadow. SDL keeps WS_THICKFRAME
@@ -2305,6 +2545,35 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
     if (!win) return 1;
     SDL_ShowWindow(win);
     SDL_RaiseWindow(win);
+#ifdef _WIN32
+    /* SDL_RaiseWindow does not reliably steal the OS foreground for a
+     * borderless secondary window, so mouse/keyboard input keeps routing
+     * to whatever window was active (usually the parent below). Force the
+     * activation the way a normal dialog would, so the child owns input. */
+    {
+        HWND chwnd = (HWND)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(win),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        if (chwnd) {
+            /* Windows blocks SetForegroundWindow from a thread that does
+             * not own the current foreground; briefly attach to the active
+             * window's input thread so the activation is allowed. */
+            HWND fg = GetForegroundWindow();
+            DWORD fgTid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+            DWORD myTid = GetCurrentThreadId();
+            if (fgTid && fgTid != myTid) {
+                AttachThreadInput(myTid, fgTid, TRUE);
+            }
+            SetForegroundWindow(chwnd);
+            SetActiveWindow(chwnd);
+            SetFocus(chwnd);
+            BringWindowToTop(chwnd);
+            if (fgTid && fgTid != myTid) {
+                AttachThreadInput(myTid, fgTid, FALSE);
+            }
+        }
+    }
+#endif
     /* Route typed text (incl. IME commits) to this window. */
     SDL_StartTextInput(win);
     return 0;
@@ -2342,9 +2611,44 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     return 0;
 }
 
+/* Actually tear down a (non-main) window: SDL_close_window only enqueues a
+ * kind-8 event so the app can react; the owner calls this once it has fully
+ * unwound its state, so a dialog does not linger on screen as an orphan. */
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win || win == g_main_win) return 1;
+    /* Drop any still-queued events aimed at this window so a later pop
+     * never dereferences a destroyed SDL_Window. */
+    for (int i = g_zq_head; i != g_zq_tail; i = (i + 1) % ZAN_ZQ_CAP) {
+        if (g_zq[i].win == win) { g_zq[i].e[0] = 0; g_zq[i].win = NULL; }
+    }
+    if (g_event_win == win) g_event_win = NULL;
+    zan_sdl_win_t *rec = sdl_find(win);
+    if (rec) {
+        if (rec->tex) SDL_DestroyTexture(rec->tex);
+        if (rec->ren) SDL_DestroyRenderer(rec->ren);
+        SDL_DestroyWindow(rec->win);
+        int idx = (int)(rec - g_wins);
+        g_wins[idx] = g_wins[--g_win_count];
+    } else {
+        SDL_DestroyWindow(win);
+    }
+    return 0;
+}
+
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     return (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) ? 1 : 0;
+}
+
+/* 1 while the window can be seen (not minimized/hidden/occluded); ambient
+ * animations pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    SDL_WindowFlags f = SDL_GetWindowFlags(win);
+    if (f & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED))
+        return 0;
+    return 1;
 }
 
 EXPORT i64 zan_gui_titlebar_height(void) { return g_titlebar_h; }
@@ -2394,6 +2698,24 @@ EXPORT i64 zan_gui_wait_event(void) {
         sdl_drain(); /* fold in anything already waiting behind it */
     }
     if (!zq_empty()) zq_pop(); /* else leaves kind 0 (e.g. a wake) */
+    return 0;
+}
+
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on quit. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (!g_sdl_ready) return -1;
+    if (zq_empty()) {
+        SDL_Event e;
+        if (!SDL_WaitEventTimeout(&e, (Sint32)(ms < 0 ? 0 : ms))) {
+            return (g_quit) ? -1 : 1;
+        }
+        sdl_translate(&e);
+        sdl_drain();
+    }
+    if (zq_empty()) return (g_quit) ? -1 : 1;
+    zq_pop();
     return 0;
 }
 
@@ -3058,6 +3380,56 @@ EXPORT i64 zan_gui_wait_event(void) {
             return 0;
         }
         /* X connection readable: loop back to XPending/XNextEvent. */
+    }
+}
+
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on error. Lets an animation loop idle
+ * in the kernel until either input arrives or its next frame deadline. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    if (!g_display) return -1;
+    memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
+    if (evq_pop_linux()) return 0;
+
+    int xfd = ConnectionNumber(g_display);
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    XEvent ev;
+    for (;;) {
+        while (XPending(g_display) > 0) {
+            XNextEvent(g_display, &ev);
+            if (ev.type == SelectionRequest) {
+                x11_serve_selection(&ev.xselectionrequest);
+                continue;
+            }
+            if (XFilterEvent(&ev, None)) continue;
+            x11_translate_event(&ev);
+            if (evq_pop_linux()) return 0;
+        }
+        struct timespec tn;
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        long elapsed = (tn.tv_sec - t0.tv_sec) * 1000
+                     + (tn.tv_nsec - t0.tv_nsec) / 1000000;
+        long remain = (long)ms - elapsed;
+        if (remain <= 0) return 1;
+        struct pollfd fds[2];
+        fds[0].fd = xfd; fds[0].events = POLLIN; fds[0].revents = 0;
+        int nfds = 1;
+        if (g_wake_pipe[0] >= 0) {
+            fds[1].fd = g_wake_pipe[0]; fds[1].events = POLLIN; fds[1].revents = 0;
+            nfds = 2;
+        }
+        int pr = poll(fds, (nfds_t)nfds, (int)remain);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pr == 0) return 1;
+        if (nfds == 2 && (fds[1].revents & POLLIN)) {
+            char buf[64];
+            while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) { }
+            return 0;
+        }
     }
 }
 
@@ -3992,6 +4364,19 @@ EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     return (found_v && found_h) ? 1 : 0;
 }
 
+/* 1 while the window can be seen (not iconified/unmapped); ambient
+ * animations pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
+    if (!g_display || !xid) return 0;
+    XWindowAttributes attrs;
+    if (XGetWindowAttributes(g_display, xid, &attrs)
+        && attrs.map_state != IsViewable) {
+        return 0;
+    }
+    return 1;
+}
+
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     x11_wm_state(xid, x11_atom("_NET_WM_STATE_ABOVE"), 0, on ? 1 : 0);
@@ -4048,6 +4433,11 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     XFlush(g_display);
     return 0;
 }
+
+/* On Linux close_window already destroys the X window synchronously, so the
+ * owner-driven destroy is a no-op kept for FFI symbol parity across
+ * backends. */
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 
 /* Native glass on Linux: ask a compositing WM (KWin, or picom via rules) to
  * blur whatever is behind the window by setting the de-facto standard
@@ -4203,6 +4593,7 @@ EXPORT const char *zan_gui_get_clipboard(void) {
 EXPORT i64 zan_gui_create_window(const char *t, i64 w, i64 h) { (void)t;(void)w;(void)h; return 0; }
 EXPORT i64 zan_gui_show_window(i64 h) { (void)h; return 0; }
 EXPORT i64 zan_gui_wait_event(void) { return -1; }
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) { (void)ms; return -1; }
 EXPORT i64 zan_gui_poll_event(void) { return -1; }
 EXPORT i64 zan_gui_wake(void) { return 0; }
 EXPORT i64 zan_gui_event_kind(void) { return 0; }
@@ -4265,9 +4656,11 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 1; }
 #if !defined(_WIN32) && !defined(__linux__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_GUI_SDL)
 EXPORT i64 zan_gui_get_dpi_scale(void) { return 100; }
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) { (void)hwnd_val; return 0; }
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) { (void)hwnd_val; (void)on; return 0; }
 EXPORT i64 zan_gui_set_clipboard(const char *utf8) { (void)utf8; return 0; }
 EXPORT const char *zan_gui_get_clipboard(void) { return ""; }

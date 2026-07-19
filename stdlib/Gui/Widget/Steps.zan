@@ -6,12 +6,18 @@ namespace Gui.Widget;
 /// Steps indicator with reactive current step.
 class Steps : Control {
     List<string> labels;
+    List<string> descs;
     SignalInt model;
+    int orient;      // 0 = horizontal, 1 = vertical
+    int errorIndex;  // -1 = none
 
     void InitSteps(SignalInt m) {
         this.InitControl("steps", 1);
         labels = new List<string>();
+        descs = new List<string>();
         model = m;
+        orient = 0;
+        errorIndex = -1;
     }
 
     /// Retained-mode constructor: `Steps s = new Steps(model); s.AddStep("Info");`
@@ -21,25 +27,82 @@ class Steps : Control {
 
     void AddStep(string label) {
         labels.Add(label);
+        descs.Add("");
     }
+
+    /// Adds a step with a secondary description line (shown in vertical layout).
+    void AddStepDesc(string label, string desc) {
+        labels.Add(label);
+        descs.Add(desc);
+    }
+
+    /// Fluent: stack vertically instead of horizontally.
+    Steps Vertical() { orient = 1; return this; }
+
+    /// Fluent: mark step `i` (0-based) as errored (red circle with `!`).
+    Steps Error(int i) { errorIndex = i; return this; }
+
+    int RowGap(App app) { return app.Scale(48); }
 
     override void OnMeasure(App app) {
         Theme t = app.theme;
-        prefH = app.Scale(13) * 2 + app.Scale(8) + Canvas.FontHeight(t.fontSizeSmall);
-        prefW = app.Scale(320);
+        if (orient == 1) {
+            int count = labels.Count;
+            if (count < 1) { count = 1; }
+            prefH = count * this.RowGap(app);
+            prefW = app.Scale(280);
+        } else {
+            prefH = app.Scale(13) * 2 + app.Scale(8) + Canvas.FontHeight(t.fontSizeSmall);
+            prefW = app.Scale(320);
+        }
     }
 
     override void OnPaint(App app) {
-        Steps.Render(app, bx, by, bw, labels, model);
+        if (orient == 1) {
+            Steps.RenderVertical(app, bx, by, this.RowGap(app), labels, descs, model.Get(), errorIndex);
+        } else {
+            Steps.RenderStatus(app, bx, by, bw, labels, model.Get(), errorIndex);
+        }
     }
 
     static void Render(App app, int x, int y, int totalWidth, List<string> labels, SignalInt model) {
+        Steps.RenderStatus(app, x, y, totalWidth, labels, model.Get(), -1);
+    }
+
+    // Draws a step circle: completed (check), error (×), active/pending (number).
+    static void StepCircle(App app, int cx, int cy, int circleR, int index,
+                           int current, int errorIndex) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool done = index < current;
+        bool active = index == current;
+        bool error = index == errorIndex;
+
+        int circleColor = t.borderPrimary;
+        int glyphColor = t.textPrimary;
+        if (done || active) { circleColor = t.primary; glyphColor = t.textInverse; }
+        if (error) { circleColor = t.error; glyphColor = t.textInverse; }
+
+        c.FillCircle(cx, cy, circleR, circleColor);
+        int fh = Canvas.FontHeight(t.fontSizeSmall);
+        if (error) {
+            c.DrawTextCentered(cx - circleR, cy - fh / 2, circleR * 2, fh, "!", glyphColor, t.fontSizeSmall);
+        } else if (done) {
+            int ck = app.Scale(12);
+            Icon.Draw(c, "check", cx - ck / 2, cy - ck / 2, ck, t.textInverse);
+        } else {
+            c.DrawTextCentered(cx - circleR, cy - fh / 2, circleR * 2, fh, Convert.ToString(index + 1), glyphColor, t.fontSizeSmall);
+        }
+    }
+
+    /// Horizontal steps with an optional error step (pass -1 for none).
+    static void RenderStatus(App app, int x, int y, int totalWidth,
+                             List<string> labels, int current, int errorIndex) {
         Canvas c = app.canvas;
         Theme t = app.theme;
 
         int count = labels.Count;
         if (count == 0) { return; }
-        int current = model.Get();
 
         int stepW = totalWidth / count;
         int circleR = app.Scale(13);
@@ -55,22 +118,58 @@ class Steps : Control {
                 c.DrawLine(prevCx + circleR + app.Scale(2), y + circleR, cx - circleR - app.Scale(2), y + circleR, lineColor, app.Scale(1));
             }
 
-            int circleColor = t.borderPrimary;
-            int textColor = t.textPrimary;
-            if (i <= current) { circleColor = t.primary; textColor = t.textInverse; }
-
-            c.FillCircle(cx, y + circleR, circleR, circleColor);
-            if (i < current) {
-                int ck = app.Scale(12);
-                Icon.Draw(c, "check", cx - ck / 2, y + circleR - ck / 2, ck, t.textInverse);
-            } else {
-                c.DrawTextCentered(cx - circleR, y + circleR - Canvas.FontHeight(t.fontSizeSmall) / 2, circleR * 2, Canvas.FontHeight(t.fontSizeSmall), Convert.ToString(i + 1), textColor, t.fontSizeSmall);
-            }
+            Steps.StepCircle(app, cx, y + circleR, circleR, i, current, errorIndex);
 
             int labelY = y + circleR * 2 + app.Scale(8);
             int labelColor = t.textSecondary;
             if (i == current) { labelColor = t.textPrimary; }
+            if (i == errorIndex) { labelColor = t.error; }
             c.DrawTextCentered(cx - stepW / 2, labelY, stepW, Canvas.FontHeight(t.fontSizeSmall), labels[i], labelColor, t.fontSizeSmall);
+
+            i = i + 1;
+        }
+    }
+
+    /// Vertical steps: circles stacked top-to-bottom with a connector line and
+    /// a label (+ optional description) to the right of each circle.
+    static void RenderVertical(App app, int x, int y, int rowGap,
+                               List<string> labels, List<string> descs,
+                               int current, int errorIndex) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int count = labels.Count;
+        if (count == 0) { return; }
+
+        int circleR = app.Scale(13);
+        int i = 0;
+        while (i < count) {
+            int cy = y + i * rowGap + circleR;
+
+            if (i > 0) {
+                int prevCy = y + (i - 1) * rowGap + circleR;
+                int lineColor = t.borderPrimary;
+                if (i <= current) { lineColor = t.primary; }
+                c.DrawLine(x + circleR, prevCy + circleR + app.Scale(2), x + circleR, cy - circleR - app.Scale(2), lineColor, app.Scale(1));
+            }
+
+            Steps.StepCircle(app, x + circleR, cy, circleR, i, current, errorIndex);
+
+            int tx = x + circleR * 2 + app.Scale(12);
+            int fh = Canvas.FontHeight(t.fontSizeMedium);
+            int sh = Canvas.FontHeight(t.fontSizeSmall);
+            int labelColor = t.textSecondary;
+            if (i == current) { labelColor = t.textPrimary; }
+            if (i == errorIndex) { labelColor = t.error; }
+            bool hasDesc = descs != null && i < descs.Count && descs[i] != "";
+            if (hasDesc) {
+                // Two-line block (label over description) vertically centred on
+                // the circle, both left-aligned so they never overlap.
+                int blockTop = cy - (fh + sh) / 2;
+                c.DrawText(tx, blockTop, labels[i], labelColor, t.fontSizeMedium);
+                c.DrawText(tx, blockTop + fh, descs[i], t.textTertiary, t.fontSizeSmall);
+            } else {
+                c.DrawText(tx, cy - fh / 2, labels[i], labelColor, t.fontSizeMedium);
+            }
 
             i = i + 1;
         }

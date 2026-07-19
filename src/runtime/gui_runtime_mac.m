@@ -11,6 +11,8 @@
  */
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
+#import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurface.h>
 #import <WebKit/WebKit.h>
 #include <objc/message.h>
 #include <stdint.h>
@@ -25,9 +27,12 @@ typedef uint32_t u32;
 
 /* Implemented in gui_runtime.c; not part of the [DllImport] ABI. */
 extern u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride);
+extern void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0,
+                                          int *x1, int *y1);
 
 /* Defined below; used by the client-side title-bar metrics helpers. */
 i64 zan_gui_get_dpi_scale(void);
+i64 zan_gui_wake(void);
 
 #define EXPORT __attribute__((visibility("default")))
 
@@ -40,6 +45,7 @@ typedef struct {
     NSWindow *window;
     NSView   *view;
     int w, h;
+    int caption_btns; /* per-window caption-button count for the drag hit-test */
     NSView   *glassFx; /* NSVisualEffectView while native glass is on, else nil */
 } zan_mwin_t;
 static zan_mwin_t g_mwins[ZAN_MAX_WINDOWS];
@@ -89,11 +95,31 @@ static int evq_pop(void) {
     return 1;
 }
 
+/* Defined with the event pump below; needed by ZanView's key handling. */
+static long zan_mods(NSUInteger f);
+
+/* Caret position in client-area (surface) pixels, reported by the app via
+ * zan_gui_set_ime_pos so the IME candidate window can follow the cursor. */
+static int g_ime_x = 0;
+static int g_ime_y = 0;
+/* Non-zero while an IME composition (marked text) is active; the event pump
+ * suppresses raw key/char delivery so widgets don't see composition keys. */
+static int g_ime_composing = 0;
+
 /* Custom content view that blits its own last-presented CGImage, so each
  * window renders independently. */
-@interface ZanView : NSView {
+@interface ZanView : NSView <NSTextInputClient> {
 @public
     CGImageRef frame;
+    /* Double-buffered IOSurfaces for the layer-contents present path: CA can
+     * hand an IOSurface straight to the WindowServer/GPU, so presenting is
+     * one memcpy with no CPU pixel-format or colour conversion. The frame
+     * being displayed wraps one surface while the next frame is copied into
+     * the other. */
+    IOSurfaceRef iosurf[2];
+    int ioW, ioH;
+    int backingIdx;
+    NSString *imeMarked;    /* active IME composition text, nil when none */
 }
 @end
 
@@ -118,6 +144,103 @@ static int evq_pop(void) {
     CGContextDrawImage(ctx, self.bounds, frame);
     CGContextRestoreGState(ctx);
 }
+
+/* ---- text input / IME (NSTextInputClient) ----
+ * Key events are routed through the view's input context so macOS input
+ * methods (pinyin, kana, ...) can compose: marked text tracks the in-progress
+ * composition (the IME draws its own candidate window at
+ * firstRectForCharacterRange, fed from zan_gui_set_ime_pos), and committed
+ * text arrives via insertText: as WM_CHAR-style kind-6 events -- the same
+ * shape the Win32 backend produces. */
+- (void)keyDown:(NSEvent *)ev {
+    /* Cmd/Ctrl shortcuts are delivered as control codes by decode_event and
+     * must not be eaten by the input context. */
+    if (zan_mods([ev modifierFlags]) & 1) return;
+    NSTextInputContext *ic = [self inputContext];
+    /* The event pump drives the run loop manually, so make sure the context
+     * is the active one before handing it the key event; otherwise the IME
+     * never engages. */
+    [ic activate];
+    if ([ic handleEvent:ev]) return;
+    /* No input method took the event: deliver printable characters directly
+     * (decode_event already pushed the key-down and control keys). */
+    NSString *chars = [ev characters];
+    for (NSUInteger i = 0; i < [chars length]; i++) {
+        unichar u = [chars characterAtIndex:i];
+        if (u >= 32 && u != 127 && !(u >= 0xF700 && u <= 0xF8FF))
+            evq_push(6, 0, 0, 0, (long)u, 0);
+    }
+}
+
+- (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    (void)replacementRange;
+    NSString *s = [string isKindOfClass:[NSAttributedString class]]
+        ? [string string] : (NSString *)string;
+    for (NSUInteger i = 0; i < [s length]; i++) {
+        unichar u = [s characterAtIndex:i];
+        if (u >= 32 && u != 127 && !(u >= 0xF700 && u <= 0xF8FF))
+            evq_push(6, 0, 0, 0, (long)u, 0);
+    }
+    [self unmarkText];
+}
+
+- (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange
+     replacementRange:(NSRange)replacementRange {
+    (void)selectedRange; (void)replacementRange;
+    NSString *s = [string isKindOfClass:[NSAttributedString class]]
+        ? [string string] : (NSString *)string;
+    [imeMarked release];
+    imeMarked = [s length] ? [s copy] : nil;
+    g_ime_composing = imeMarked != nil;
+}
+
+- (void)unmarkText {
+    [imeMarked release];
+    imeMarked = nil;
+    g_ime_composing = 0;
+}
+
+- (BOOL)hasMarkedText { return imeMarked != nil; }
+
+- (NSRange)markedRange {
+    return imeMarked ? NSMakeRange(0, [imeMarked length])
+                     : NSMakeRange(NSNotFound, 0);
+}
+
+- (NSRange)selectedRange { return NSMakeRange(NSNotFound, 0); }
+
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range
+                                                actualRange:(NSRangePointer)actual {
+    (void)range; (void)actual;
+    return nil;
+}
+
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText {
+    return [NSArray array];
+}
+
+/* Anchor the IME candidate window at the app-reported caret position
+ * (surface pixels -> view points -> screen). */
+- (NSRect)firstRectForCharacterRange:(NSRange)range
+                         actualRange:(NSRangePointer)actual {
+    (void)range;
+    if (actual) *actual = NSMakeRange(0, 0);
+    CGFloat scale = [[self window] backingScaleFactor];
+    if (scale <= 0) scale = 1.0;
+    NSRect r = NSMakeRect(g_ime_x / scale, g_ime_y / scale, 1,
+                          20.0 * zan_gui_get_dpi_scale() / 100.0 / scale);
+    r = [self convertRect:r toView:nil];
+    return [[self window] convertRectToScreen:r];
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point {
+    (void)point;
+    return 0;
+}
+
+/* Control keys (Enter/Tab/Backspace/arrows) already reach widgets through
+ * decode_event's key-down path; nothing extra to synthesize here. */
+- (void)doCommandBySelector:(SEL)selector { (void)selector; }
 @end
 
 /* Borderless windows are not key/main by default; allow both so the app still
@@ -159,6 +282,21 @@ static int zan_caption_btn_w(void) { return (int)(46 * zan_gui_get_dpi_scale() /
     evq_push(8, 0, 0, 0, 0, 0);
     return NO; /* let the app decide when to quit rather than tearing down */
 }
+/* Visibility changes (occluded by other windows, miniaturized, restored) wake
+ * the event pump with an empty (kind 0) event so the app can pause or resume
+ * its ambient backdrop animation (see zan_gui_window_visible). */
+- (void)windowDidChangeOcclusionState:(NSNotification *)note {
+    NSWindow *win = [note object];
+    g_evt_win = (long)(intptr_t)win;
+    evq_push(0, 0, 0, 0, 0, 0);
+    zan_gui_wake();
+}
+- (void)windowDidMiniaturize:(NSNotification *)note {
+    [self windowDidChangeOcclusionState:note];
+}
+- (void)windowDidDeminiaturize:(NSNotification *)note {
+    [self windowDidChangeOcclusionState:note];
+}
 @end
 
 static ZanDelegate *g_delegate = nil;
@@ -185,7 +323,20 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
                                                    defer:NO];
         ZanView *view = [[ZanView alloc] initWithFrame:rect];
         view->frame = NULL;
+        view->iosurf[0] = NULL;
+        view->iosurf[1] = NULL;
+        view->ioW = 0;
+        view->ioH = 0;
+        view->backingIdx = 0;
+        /* Layer-backed: present hands the frame to Core Animation as
+         * layer.contents, so colour conversion and compositing run on the GPU
+         * in the WindowServer instead of a CPU drawRect blit. */
+        [view setWantsLayer:YES];
+        view.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
+        view.layer.contentsGravity = kCAGravityResize;
+        view.layer.opaque = NO;
         [window setContentView:view];
+        [window makeFirstResponder:view];        /* key/IME input lands on the view */
         [window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
         [window setDelegate:g_delegate];          /* one delegate serves all windows */
         [window setMovableByWindowBackground:NO]; /* dragging is caption-driven */
@@ -218,6 +369,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
         mw->view = view;
         mw->w = (int)width;
         mw->h = (int)height;
+        mw->caption_btns = 5;
         mw->glassFx = nil;
         return (i64)(intptr_t)window;
     }
@@ -225,7 +377,7 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
 
 EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
         [NSApp activateIgnoringOtherApps:YES];
@@ -243,7 +395,7 @@ EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
 EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     (void)tint_argb;
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
         NSWindow *win = mw->window;
@@ -274,7 +426,7 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
  * view and drop the vibrancy material. */
 EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
         NSWindow *win = mw->window;
@@ -293,7 +445,7 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
 
 EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count == 1) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count == 1) mw = &g_mwins[0];
     if (!mw) return 0;
     @autoreleasepool {
         ZanView *view = (ZanView *)mw->view;
@@ -305,6 +457,11 @@ EXPORT i64 zan_gui_close_window(i64 hwnd_val) {
     g_mwins[idx] = g_mwins[--g_mwin_count];
     return 0;
 }
+
+/* On macOS close_window already tears the NSWindow down synchronously, so the
+ * owner-driven destroy is a no-op kept for FFI symbol parity across
+ * backends. */
+EXPORT i64 zan_gui_destroy_window(i64 hwnd_val) { (void)hwnd_val; return 0; }
 
 /* ---- event pump ---- */
 
@@ -387,7 +544,7 @@ static void decode_event(NSEvent *ev) {
          * title-bar strip that is left of the caption-button cluster drags the
          * window natively and is not delivered as a client click; presses over
          * the buttons or below the caption fall through as ordinary clicks. */
-        int capW = g_caption_btn_count * zan_caption_btn_w();
+        int capW = (mw ? mw->caption_btns : g_caption_btn_count) * zan_caption_btn_w();
         if (mw && ly >= 0 && ly < zan_titlebar_h() && lx < mw->w - capW) {
             [win performWindowDragWithEvent:ev];
             break;
@@ -409,12 +566,17 @@ static void decode_event(NSEvent *ev) {
         break;
     }
     case NSEventTypeKeyDown: {
+        /* While an IME composition is active the input method owns the
+         * keyboard: it consumes letters/Backspace/Enter to edit the marked
+         * text and commits via insertText:, so widgets must not see the raw
+         * keys. (sendEvent -> keyDown -> inputContext runs after this.) */
+        if (g_ime_composing) break;
         long vk = zan_vk_from_keycode([ev keyCode]);
         if (vk == 0) vk = zan_vk_from_chars([ev charactersIgnoringModifiers]);
         evq_push(4, 0, 0, 0, vk, mods);
-        /* Emit a WM_CHAR-style text event so widgets receive the same integer
-         * codes as on Win32 (typing, Backspace/Tab/Enter, and Ctrl/Cmd
-         * shortcuts as ASCII control codes). */
+        /* Emit WM_CHAR-style text events for control keys so widgets receive
+         * the same integer codes as on Win32. Printable text is delivered by
+         * the view's insertText: (IME-composed or plain) instead. */
         if (mods & 1) {
             /* Ctrl or Cmd held: deliver a control code (Ctrl+A..Z => 1..26,
              * Ctrl+/ => 31) since Cocoa's -characters does not fold these. */
@@ -430,19 +592,14 @@ static void decode_event(NSEvent *ev) {
         } else if (vk == 8) {
             /* Backspace: Cocoa reports 0x7F in -characters; deliver 8 like Win32. */
             evq_push(6, 0, 0, 0, 8, mods);
-        } else {
-            NSString *chars = [ev characters];
-            for (NSUInteger i = 0; i < [chars length]; i++) {
-                unichar u = [chars characterAtIndex:i];
-                /* printable text plus Tab(9)/Enter(13); skip DEL and the
-                 * 0xF700-0xF8FF private range Cocoa uses for function keys. */
-                if (u < 0xF700 && ((u >= 32 && u != 127) || u == 9 || u == 13))
-                    evq_push(6, 0, 0, 0, (long)u, mods);
-            }
+        } else if (vk == 9 || vk == 13) {
+            /* Tab/Enter arrive as chars on Win32 too. */
+            evq_push(6, 0, 0, 0, vk, mods);
         }
         break;
     }
     case NSEventTypeKeyUp: {
+        if (g_ime_composing) break;
         long vk = zan_vk_from_keycode([ev keyCode]);
         if (vk == 0) vk = zan_vk_from_chars([ev charactersIgnoringModifiers]);
         evq_push(5, 0, 0, 0, vk, mods);
@@ -477,6 +634,30 @@ static i64 pump(bool wait) {
 EXPORT i64 zan_gui_wait_event(void) { return pump(true); }
 EXPORT i64 zan_gui_poll_event(void) { return pump(false); }
 
+/* Like wait_event but gives up after `ms` milliseconds. Returns 0 when an
+ * event was delivered, 1 on timeout, -1 on quit. Lets an animation loop idle
+ * in the kernel (nextEventMatchingMask blocks) until either input arrives or
+ * its next frame deadline -- far cheaper than poll + sleep slices. */
+EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
+    if (g_mwin_count == 0) return -1;
+    if (evq_pop()) return 0;
+    memset(g_evt, 0, sizeof(g_evt));
+    if (ms < 0) ms = 0;
+    @autoreleasepool {
+        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:(double)ms / 1000.0];
+        for (;;) {
+            NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                             untilDate:until
+                                                inMode:NSDefaultRunLoopMode
+                                               dequeue:YES];
+            if (!ev) return 1;             /* deadline reached */
+            decode_event(ev);
+            [NSApp sendEvent:ev];
+            if (evq_pop()) return 0;
+        }
+    }
+}
+
 /* Wake a UI thread blocked in pump() from another thread so it can drain the
  * dispatch queue. Posting an application-defined NSEvent is thread-safe. */
 EXPORT i64 zan_gui_wake(void) {
@@ -509,6 +690,84 @@ static CTFontRef zan_font(i64 font_size) {
     CGFloat size = (CGFloat)font_size;
     if (size < 8.0) size = 8.0;
     return CTFontCreateWithName(CFSTR(".AppleSystemUIFont"), size, NULL);
+}
+
+static CTLineRef zan_text_line(const char *utf8, CTFontRef font);
+
+/* Rendered text-run cache. CoreText layout + rasterization (font parsing,
+ * glyph lookup, mask fill) dominates a full-page redraw, and UI strings repeat
+ * across frames, so cache the finished coverage mask per (string, font size).
+ * Direct-mapped by FNV hash; a collision simply re-renders and replaces. */
+typedef struct {
+    char *key;              /* strdup'ed string, NULL = empty slot */
+    i64 font_size;
+    int tw, th;             /* mask dimensions */
+    double width;           /* typographic width (for measure) */
+    unsigned char *mask;    /* tw*th coverage bytes (may be NULL: measure-only) */
+} zan_text_entry_t;
+
+#define ZAN_TEXT_CACHE_SLOTS 1024
+static zan_text_entry_t g_text_cache[ZAN_TEXT_CACHE_SLOTS];
+
+static unsigned int zan_text_hash(const char *s, i64 font_size) {
+    unsigned int h = 2166136261u;
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    h ^= (unsigned int)font_size * 2654435761u;
+    return h % ZAN_TEXT_CACHE_SLOTS;
+}
+
+/* Returns the cache slot for (utf8, font_size), rendering the coverage mask on
+ * a miss (or when a measure-only entry needs pixels and need_mask is set).
+ * Returns NULL when the string renders to an empty box. */
+static zan_text_entry_t *zan_text_lookup(const char *utf8, i64 font_size,
+                                         bool need_mask) {
+    unsigned int slot = zan_text_hash(utf8, font_size);
+    zan_text_entry_t *e = &g_text_cache[slot];
+    if (e->key && e->font_size == font_size && strcmp(e->key, utf8) == 0 &&
+        (!need_mask || e->mask))
+        return e;
+
+    CTFontRef font = zan_font(font_size);
+    CTLineRef line = zan_text_line(utf8, font);
+    if (!line) {
+        if (font) CFRelease(font);
+        return NULL;
+    }
+    CGFloat ascent = 0, descent = 0, leading = 0;
+    double measured = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
+    int tw = (int)ceil(measured) + 2;
+    int th = (int)ceil(ascent + descent + leading) + 2;
+    unsigned char *mask = NULL;
+    if (need_mask && tw > 0 && th > 0) {
+        mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+        CGContextRef ctx = CGBitmapContextCreate(
+            mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
+            cs, (CGBitmapInfo)kCGImageAlphaNone);
+        if (ctx) {
+            CGContextSetGrayFillColor(ctx, 1.0, 1.0);
+            CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+            CTLineDraw(line, ctx);
+            CGContextFlush(ctx);
+            CGContextRelease(ctx);
+        } else {
+            free(mask);
+            mask = NULL;
+        }
+        CGColorSpaceRelease(cs);
+    }
+    CFRelease(line);
+    CFRelease(font);
+
+    free(e->key);
+    free(e->mask);
+    e->key = strdup(utf8);
+    e->font_size = font_size;
+    e->tw = tw;
+    e->th = th;
+    e->width = measured;
+    e->mask = mask;
+    return e;
 }
 
 static CTLineRef zan_text_line(const char *utf8, CTFontRef font) {
@@ -558,77 +817,59 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
     u32 *pixels = zan_gui_internal_surface_data(surface_id, &sw, &sh, &stride);
     if (!pixels || !utf8 || !*utf8) return;
 
+    /* Honour the surface's active clip window (PushClip) like the shared
+     * renderer does, so glyphs never spill outside a scrolled/nested parent. */
+    int cx0 = 0, cy0 = 0, cx1 = sw, cy1 = sh;
+    zan_gui_internal_surface_clip(surface_id, &cx0, &cy0, &cx1, &cy1);
+
     @autoreleasepool {
-        CTFontRef font = zan_font(font_size);
-        CTLineRef line = zan_text_line(utf8, font);
-        if (!line) {
-            if (font) CFRelease(font);
-            return;
-        }
-        CGFloat ascent = 0, descent = 0, leading = 0;
-        double measured =
-            CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
-        int tw = (int)ceil(measured) + 2;
-        int th = (int)ceil(ascent + descent + leading) + 2;
-        if (tw > 0 && th > 0) {
-            unsigned char *mask =
-                (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-            CGContextRef ctx = CGBitmapContextCreate(
-                mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
-                cs, (CGBitmapInfo)kCGImageAlphaNone);
-            if (ctx) {
-                CGContextSetGrayFillColor(ctx, 1.0, 1.0);
-                CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
-                CTLineDraw(line, ctx);
-                CGContextFlush(ctx);
-                for (int py = 0; py < th; py++) {
-                    int dy = (int)y + py;
-                    if (dy < 0 || dy >= sh) continue;
-                    int sy = py;
-                    for (int px = 0; px < tw; px++) {
-                        int dx = (int)x + px;
-                        if (dx < 0 || dx >= sw) continue;
-                        unsigned int coverage = mask[sy * tw + px];
-                        if (!coverage) continue;
-                        int index = dy * stride + dx;
-                        pixels[index] =
-                            zan_blend(pixels[index], (u32)color, coverage);
-                    }
-                }
-                CGContextRelease(ctx);
+        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, true);
+        if (!e || !e->mask) return;
+        int tw = e->tw, th = e->th;
+        const unsigned char *mask = e->mask;
+        /* The mask carries 1px of padding on every side (the line is drawn at
+         * (1, descent+1)); blit at (x-1, y-1) so the typographic box lands
+         * exactly at (x, y) like the GDI path, keeping icon/text rows that
+         * centre on font_height visually centred. */
+        for (int py = 0; py < th; py++) {
+            int dy = (int)y + py - 1;
+            if (dy < cy0 || dy >= cy1 || dy < 0 || dy >= sh) continue;
+            for (int px = 0; px < tw; px++) {
+                int dx = (int)x + px - 1;
+                if (dx < cx0 || dx >= cx1 || dx < 0 || dx >= sw) continue;
+                unsigned int coverage = mask[py * tw + px];
+                if (!coverage) continue;
+                int index = dy * stride + dx;
+                pixels[index] = zan_blend(pixels[index], (u32)color, coverage);
             }
-            CGColorSpaceRelease(cs);
-            free(mask);
         }
-        CFRelease(line);
-        CFRelease(font);
     }
 }
 
 EXPORT i64 zan_gui_measure_text(const char *utf8, i64 font_size) {
     if (!utf8 || !*utf8) return 0;
     @autoreleasepool {
-        CTFontRef font = zan_font(font_size);
-        CTLineRef line = zan_text_line(utf8, font);
-        if (!line) {
-            if (font) CFRelease(font);
-            return 0;
-        }
-        double width = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
-        CFRelease(line);
-        CFRelease(font);
-        return (i64)ceil(width);
+        zan_text_entry_t *e = zan_text_lookup(utf8, font_size, false);
+        if (!e) return 0;
+        return (i64)ceil(e->width);
     }
 }
 
 EXPORT i64 zan_gui_font_height(i64 font_size) {
+    /* Font metrics never change per size; memoise so hot layout paths skip
+     * the CTFont create/parse round trip. */
+    enum { MAXSZ = 128 };
+    static i64 cached[MAXSZ];
+    int idx = (font_size > 0 && font_size < MAXSZ) ? (int)font_size : -1;
+    if (idx >= 0 && cached[idx]) return cached[idx];
     CTFontRef font = zan_font(font_size);
     if (!font) return 0;
     CGFloat height = CTFontGetAscent(font) + CTFontGetDescent(font) +
                      CTFontGetLeading(font);
     CFRelease(font);
-    return (i64)ceil(height);
+    i64 r = (i64)ceil(height);
+    if (idx >= 0) cached[idx] = r;
+    return r;
 }
 
 /* ---- geometry ---- */
@@ -641,14 +882,17 @@ EXPORT i64 zan_gui_window_height(void) {
     if (g_mwin_count == 0 || !g_mwins[0].view) return 0;
     return (i64)[g_mwins[0].view bounds].size.height;
 }
+/* A stale handle (window already closed) reports 0, never another window's
+ * size: falling back to g_mwins[0] made a closing dialog resize its canvas to
+ * the primary window's dimensions and present one parent-sized frame. */
 EXPORT i64 zan_gui_client_width(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw || !mw->view) return zan_gui_window_width();
+    if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_width() : 0;
     return (i64)[mw->view bounds].size.width;
 }
 EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw || !mw->view) return zan_gui_window_height();
+    if (!mw || !mw->view) return hwnd_val == 0 ? zan_gui_window_height() : 0;
     return (i64)[mw->view bounds].size.height;
 }
 
@@ -656,8 +900,11 @@ EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
 
 EXPORT i64 zan_gui_titlebar_height(void) { return (i64)zan_titlebar_h(); }
 EXPORT i64 zan_gui_caption_button_width(void) { return (i64)zan_caption_btn_w(); }
-EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
-    if (count >= 0 && count <= 8) g_caption_btn_count = (int)count;
+EXPORT i64 zan_gui_set_caption_buttons(i64 hwnd_val, i64 count) {
+    if (count < 0 || count > 8) return 0;
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (mw) mw->caption_btns = (int)count;
+    else g_caption_btn_count = (int)count;
     return 0;
 }
 
@@ -665,7 +912,7 @@ EXPORT i64 zan_gui_set_caption_buttons(i64 count) {
 
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 1;
     ZanView *view = (ZanView *)mw->view;
     int w = 0, h = 0, stride = 0;
@@ -673,21 +920,45 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     if (!pixels || w <= 0 || h <= 0) return 1;
 
     @autoreleasepool {
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        /* Surface pixels are 0xAARRGGBB in memory (little-endian bytes B,G,R,A);
-         * interpret as premultiplied ARGB via 32-little byte order. */
-        CGBitmapInfo info = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
-        CGContextRef bmp = CGBitmapContextCreate((void *)pixels, (size_t)w, (size_t)h,
-                                                 8, (size_t)stride * 4, cs, info);
-        CGImageRef img = bmp ? CGBitmapContextCreateImage(bmp) : NULL;
-        if (img) {
-            if (view->frame) CGImageRelease(view->frame);
-            view->frame = img;             /* retained; released on next present */
-            [view setNeedsDisplay:YES];
-            [view displayIfNeeded];
+        if (view->ioW != w || view->ioH != h ||
+            !view->iosurf[0] || !view->iosurf[1]) {
+            for (int i = 0; i < 2; i++) {
+                if (view->iosurf[i]) { CFRelease(view->iosurf[i]); view->iosurf[i] = NULL; }
+                NSDictionary *props = @{
+                    (__bridge NSString *)kIOSurfaceWidth: @(w),
+                    (__bridge NSString *)kIOSurfaceHeight: @(h),
+                    (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
+                    (__bridge NSString *)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+                };
+                view->iosurf[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            }
+            view->ioW = w;
+            view->ioH = h;
         }
-        if (bmp) CGContextRelease(bmp);
-        CGColorSpaceRelease(cs);
+        view->backingIdx = 1 - view->backingIdx;
+        IOSurfaceRef surf = view->iosurf[view->backingIdx];
+        if (!surf) return 1;
+        /* Surface pixels are 0xAARRGGBB in memory (little-endian bytes
+         * B,G,R,A) which is exactly IOSurface 'BGRA'; row-copy into the
+         * surface and hand it to the layer -- the WindowServer composites it
+         * on the GPU with no CPU format/colour conversion. */
+        IOSurfaceLock(surf, 0, NULL);
+        uint8_t *dst = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+        size_t dbpr = IOSurfaceGetBytesPerRow(surf);
+        size_t sbpr = (size_t)stride * 4;
+        size_t row = (size_t)w * 4;
+        for (int py = 0; py < h; py++)
+            memcpy(dst + (size_t)py * dbpr,
+                   (const uint8_t *)pixels + (size_t)py * sbpr, row);
+        IOSurfaceUnlock(surf, 0, NULL);
+        CALayer *layer = [view layer];
+        if (layer) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            layer.contentsScale = [[view window] backingScaleFactor];
+            layer.contents = (__bridge id)surf;
+            [CATransaction commit];
+        }
     }
     return 0;
 }
@@ -696,7 +967,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
 
 EXPORT i64 zan_gui_set_title(i64 hwnd_val, const char *title) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw && title) {
         @autoreleasepool { [mw->window setTitle:[NSString stringWithUTF8String:title]]; }
     }
@@ -730,28 +1001,41 @@ EXPORT void zan_gui_sleep_ms(i64 ms) {
 
 EXPORT i64 zan_gui_minimize(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) { @autoreleasepool { [mw->window miniaturize:nil]; } }
     return 0;
 }
 
 EXPORT i64 zan_gui_toggle_maximize(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) { @autoreleasepool { [mw->window zoom:nil]; } }
     return 0;
 }
 
 EXPORT i64 zan_gui_is_maximized(i64 hwnd_val) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
     return [mw->window isZoomed] ? 1 : 0;
 }
 
+/* 1 while any part of the window can be seen (not miniaturized and not fully
+ * occluded by other windows); ambient animations pause while this reports 0. */
+EXPORT i64 zan_gui_window_visible(i64 hwnd_val) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 0;
+    @autoreleasepool {
+        if ([mw->window isMiniaturized]) return 0;
+        return ([mw->window occlusionState] & NSWindowOcclusionStateVisible)
+            ? 1 : 0;
+    }
+}
+
 EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) {
         [mw->window setLevel:(on ? NSFloatingWindowLevel : NSNormalWindowLevel)];
     }
@@ -772,8 +1056,6 @@ EXPORT i64 zan_gui_get_dpi_scale(void) {
  * windows can follow the cursor. Stored for parity with the Win32/X11 backends;
  * macOS text entry currently flows through the shared software path, so this is
  * advisory and does not reposition a live composition session. */
-static int g_ime_x = 0;
-static int g_ime_y = 0;
 EXPORT void zan_gui_set_ime_pos(i64 x, i64 y) {
     g_ime_x = (int)x;
     g_ime_y = (int)y;
@@ -953,7 +1235,7 @@ static WKWebsiteDataStore *wv_store_for_profile(const char *profile_id) {
 
 EXPORT i64 zan_gui_webview_create(i64 hwnd_val, const char *profile_id) {
     zan_mwin_t *mw = mwin_find(hwnd_val);
-    if (!mw && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 0;
     int slot = -1;
     for (int i = 0; i < ZAN_MAX_WEBVIEWS; i++) {

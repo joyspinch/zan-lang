@@ -1253,7 +1253,13 @@ int main(int argc, char **argv) {
     }
 
     if (do_emit_ir) {
-        zan_irgen_write_ir(&irgen, NULL);
+        if (zan_irgen_write_ir(&irgen, NULL) != ZAN_OK) {
+            fprintf(stderr, "error: failed to write LLVM IR\n");
+            zan_irgen_destroy(&irgen);
+            zan_arena_free(arena);
+            free(source);
+            return 1;
+        }
     } else {
         /* determine output path */
         char obj_path[1024];

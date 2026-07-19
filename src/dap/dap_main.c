@@ -83,53 +83,24 @@ static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
     return true;
 }
 
-/* Read one Content-Length framed message from the socket (headers scanned a
- * byte at a time; body read in bulk). Returns a malloc'd NUL-terminated body,
- * or NULL on disconnect. */
+/* Byte-level transport callbacks over the client socket; the Content-Length
+ * framing itself is shared with the stdio path (see common/rpc.c). */
+static int sock_reader(void *ctx, char *buf, int n) {
+    return (int)recv(*(dap_sock_t *)ctx, buf, n, 0);
+}
+
+static bool sock_writer(void *ctx, const char *buf, int n) {
+    return sock_send_all(*(dap_sock_t *)ctx, buf, n);
+}
+
+/* Read one Content-Length framed message from the socket. Returns a malloc'd
+ * NUL-terminated body, or NULL on disconnect. */
 static char *rpc_read_message_sock(dap_sock_t s) {
-    char line[512];
-    long content_length = -1;
-    for (;;) {
-        int len = 0;
-        for (;;) {
-            char c;
-            int r = (int)recv(s, &c, 1, 0);
-            if (r <= 0) return NULL;
-            if (len < (int)sizeof(line) - 1) line[len++] = c;
-            if (c == '\n') break;
-        }
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-            len--;
-        line[len] = '\0';
-        if (len == 0) break; /* blank line -> end of headers */
-        const char *prefix = "content-length:";
-        bool match = true;
-        for (int i = 0; prefix[i]; i++) {
-            char lc = line[i];
-            if (lc >= 'A' && lc <= 'Z') lc = (char)(lc - 'A' + 'a');
-            if (lc != prefix[i]) { match = false; break; }
-        }
-        if (match) content_length = strtol(line + strlen(prefix), NULL, 10);
-    }
-    if (content_length < 0 || content_length > (64 * 1024 * 1024)) return NULL;
-    char *body = (char *)malloc((size_t)content_length + 1);
-    if (!body) return NULL;
-    long got = 0;
-    while (got < content_length) {
-        int r = (int)recv(s, body + got, (int)(content_length - got), 0);
-        if (r <= 0) { free(body); return NULL; }
-        got += r;
-    }
-    body[content_length] = '\0';
-    return body;
+    return rpc_read_message_cb(sock_reader, &s, 64 * 1024 * 1024);
 }
 
 static void rpc_write_message_sock(dap_sock_t s, const char *payload) {
-    char header[64];
-    int hn = snprintf(header, sizeof(header),
-                      "Content-Length: %zu\r\n\r\n", strlen(payload));
-    sock_send_all(s, header, hn);
-    sock_send_all(s, payload, (int)strlen(payload));
+    rpc_write_message_cb(sock_writer, &s, payload);
 }
 
 /* Reference ids used by scopes/variables. */

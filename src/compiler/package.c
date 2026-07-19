@@ -179,8 +179,9 @@ bool zan_pkg_save(const zan_package_t *pkg, const char *manifest_path) {
             fprintf(f, "%s = { source = \"%s\", version = \"%s%s\" }\n", d->name, d->source, prefix, dep_ver);
         }
     }
-    fclose(f);
-    return true;
+    bool ok = (ferror(f) == 0);
+    if (fclose(f) != 0) ok = false;
+    return ok;
 }
 
 void zan_pkg_new(zan_package_t *pkg, const char *name, const char *version) {
@@ -255,6 +256,22 @@ bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t 
     return false;
 }
 
+/* A dependency source and version are interpolated into a shell command below.
+ * They originate from an untrusted zan.pkg manifest, so anything outside the
+ * character set legitimately used by git remote URLs / semver strings is
+ * rejected to prevent OS command injection (e.g. a source containing a double
+ * quote followed by "; rm -rf ~"). */
+static bool pkg_token_is_shell_safe(const char *s) {
+    if (!s) return true;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c)) continue;
+        if (strchr(":/@._~%+-", c) != NULL) continue;
+        return false;
+    }
+    return true;
+}
+
 bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     char pkg_dir[1024];
     snprintf(pkg_dir, sizeof(pkg_dir), "%s" PATH_SEP "%s", reg->cache_dir, dep->name);
@@ -263,6 +280,10 @@ bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     if (dep->source[0] && (strncmp(dep->source, "http", 4) == 0 || strncmp(dep->source, "git@", 4) == 0)) {
         char cmd[2048]; char ver_buf[64];
         zan_version_format(&dep->min_ver, ver_buf, sizeof(ver_buf));
+        if (!pkg_token_is_shell_safe(dep->source) || !pkg_token_is_shell_safe(ver_buf)) {
+            fprintf(stderr, "error: refusing to fetch '%s': unsafe characters in source or version\n", dep->name);
+            return false;
+        }
         snprintf(cmd, sizeof(cmd), "git clone --depth 1 --branch v%s \"%s\" \"%s\" 2>&1", ver_buf, dep->source, pkg_dir);
         int ret = system(cmd);
         if (ret != 0) {
@@ -292,8 +313,14 @@ bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
                 char ver_buf[64]; zan_version_format(&fetched_pkg.version, ver_buf, sizeof(ver_buf));
                 fprintf(stderr, "warning: package '%s' version %s may not satisfy constraint\n", dep->name, ver_buf);
             }
-            if (fetched_pkg.dep_count > 0) zan_pkg_resolve(reg, &fetched_pkg);
+            /* Propagate transitive resolution failures instead of dropping
+             * them: an unresolved sub-dependency must fail the whole resolve. */
+            if (fetched_pkg.dep_count > 0 && !zan_pkg_resolve(reg, &fetched_pkg))
+                all_ok = false;
             zan_pkg_destroy(&fetched_pkg);
+        } else {
+            fprintf(stderr, "error: failed to read manifest for package '%s'\n", dep->name);
+            all_ok = false;
         }
     }
     return all_ok;
@@ -314,8 +341,9 @@ bool zan_pkg_write_lock(zan_pkg_registry_t *reg) {
         char ver_buf[64]; zan_version_format(&pkg->version, ver_buf, sizeof(ver_buf));
         fprintf(f, "[[package]]\nname = \"%s\"\nversion = \"%s\"\n\n", pkg->name, ver_buf);
     }
-    fclose(f);
-    return true;
+    bool ok = (ferror(f) == 0);
+    if (fclose(f) != 0) ok = false;
+    return ok;
 }
 
 bool zan_pkg_read_lock(zan_pkg_registry_t *reg) { (void)reg; return false; }

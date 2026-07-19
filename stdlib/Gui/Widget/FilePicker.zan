@@ -30,6 +30,15 @@ class FilePicker {
     string selectedPath;
     string statusText;
     List<string> expanded;
+    /// Extension filters shown in the footer dropdown. filterLabels[i] is the
+    /// human label (e.g. "Zan source (*.zan)"); filterPatterns[i] is a
+    /// ";"-separated extension list ("" = every file). filterSel is the chosen
+    /// index; filterOpen tracks the dropdown popup.
+    List<string> filterLabels;
+    List<string> filterPatterns;
+    SignalInt filterSel;
+    bool filterOpen;
+    bool filtersCustom;
 
     static FilePicker Create() {
         FilePicker picker = new FilePicker();
@@ -55,7 +64,23 @@ class FilePicker {
         picker.selectedPath = "";
         picker.statusText = "";
         picker.expanded = new List<string>();
+        picker.filterLabels = new List<string>();
+        picker.filterPatterns = new List<string>();
+        picker.filterSel = SignalInt.Create(0);
+        picker.filterOpen = false;
+        picker.filtersCustom = false;
         return picker;
+    }
+
+    /// Provide explicit extension filters for the next open. Each entry pairs a
+    /// display label with a ";"-separated extension pattern ("" matches all),
+    /// e.g. SetFilters(["Zan (*.zan)", "Text (*.txt;*.md)", "All (*.*)"],
+    ///                  [".zan", ".txt;.md", ""]).
+    void SetFilters(List<string> labels, List<string> patterns) {
+        filterLabels = labels;
+        filterPatterns = patterns;
+        filtersCustom = true;
+        filterSel.Set(0);
     }
 
     static string T(string en, string zh) {
@@ -243,6 +268,14 @@ class FilePicker {
         string defaultName,
         string dialogTitle
     ) {
+        // Re-opening while a dialog is already up must not orphan the old
+        // window: close it first so exactly one picker window ever exists.
+        if (popup != null) {
+            popup.window.Close();
+            popup.window.Destroy();
+            popup = null;
+            open = false;
+        }
         mode = pickerMode;
         title = dialogTitle;
         suffix = extension;
@@ -251,6 +284,26 @@ class FilePicker {
         creatingFolder = false;
         treeDragging = false;
         listDragging = false;
+        filterOpen = false;
+        filterSel.Set(0);
+        // Rebuild auto filters each open (custom filters set via SetFilters are
+        // preserved). With no explicit filter set, synthesise one from
+        // `extension` plus an "All files" fallback so the footer always offers a
+        // filter dropdown.
+        if (!filtersCustom) {
+            filterLabels = new List<string>();
+            filterPatterns = new List<string>();
+        }
+        if (pickerMode != 0 && filterLabels.Count == 0) {
+            if (extension != "") {
+                filterLabels.Add(FilePicker.T("Files", "文件")
+                    + " (*" + extension + ")");
+                filterPatterns.Add(extension);
+            }
+            filterLabels.Add(FilePicker.T("All files", "所有文件")
+                + " (*.*)");
+            filterPatterns.Add("");
+        }
         result = 0;
         string dir = FilePicker.ValidDirectory(initial);
         pathInput.SetText(dir);
@@ -276,6 +329,55 @@ class FilePicker {
 
     void BeginOpenFile(string initial, string extension, string dialogTitle) {
         Begin(1, initial, extension, "", dialogTitle);
+    }
+
+    /// Open-file dialog with an explicit set of extension filters.
+    void BeginOpenFileFilters(
+        string initial,
+        List<string> labels,
+        List<string> patterns,
+        string dialogTitle
+    ) {
+        SetFilters(labels, patterns);
+        string first = "";
+        if (patterns.Count > 0) { first = FilePicker.FirstExt(patterns[0]); }
+        Begin(1, initial, first, "", dialogTitle);
+    }
+
+    /// First extension of a ";"-separated pattern ("" if the pattern is empty).
+    static string FirstExt(string pattern) {
+        if (pattern == "") { return ""; }
+        int i = 0;
+        while (i < pattern.Length) {
+            if (pattern.Substring(i, 1) == ";") { return pattern.Substring(0, i); }
+            i = i + 1;
+        }
+        return pattern;
+    }
+
+    /// True when `name` passes the currently-selected filter. An empty pattern
+    /// (All files) matches everything; otherwise any of the ";"-separated
+    /// extensions may match.
+    bool MatchesCurrentFilter(string name) {
+        if (filterPatterns.Count == 0) {
+            return FilePicker.EndsWith(name, suffix);
+        }
+        int sel = filterSel.Get();
+        if (sel < 0 || sel >= filterPatterns.Count) { return true; }
+        string pattern = filterPatterns[sel];
+        if (pattern == "") { return true; }
+        int start = 0;
+        int i = 0;
+        while (i <= pattern.Length) {
+            bool end = i == pattern.Length;
+            if (end || pattern.Substring(i, 1) == ";") {
+                string ext = pattern.Substring(start, i - start);
+                if (ext != "" && FilePicker.EndsWith(name, ext)) { return true; }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return false;
     }
 
     void BeginSaveFile(
@@ -328,6 +430,7 @@ class FilePicker {
             }
             open = false;
             closing = false;
+            popup.window.Destroy();
             popup = null;
             return false;
         }
@@ -359,8 +462,17 @@ class FilePicker {
     void RenderWindow() {
         if (!open || popup == null || !popup.needsRedraw) { return; }
         popup.BeginFrame();
+        // The dialog is immediate-mode but shares the process-wide WidgetId
+        // counter with the main window, which only the main loop rewinds. Pin a
+        // fixed high baseline for the dialog's own frame so its buttons get
+        // identical ids every frame (otherwise hover/press never match the
+        // pointer target the framework resolved on the previous frame) without
+        // colliding with the main app's id space; restore afterwards.
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(900000);
         RenderContent(popup);
         popup.RenderChrome(title);
+        WidgetId.SetSeq(savedSeq);
         popup.PresentFrame();
     }
 
@@ -460,13 +572,54 @@ class FilePicker {
         c.FillRoundRect(
             pad, paneY, treeW, paneH,
             t.borderRadiusMedium, t.bgSecondary);
-        c.DrawRect(pad, paneY, treeW, paneH, t.borderSecondary, 1);
+        c.DrawRoundRect(pad, paneY, treeW, paneH, t.borderRadiusMedium, t.borderSecondary, 1);
         c.FillRoundRect(
             listX, paneY, listW, paneH,
             t.borderRadiusMedium, t.bgSecondary);
-        c.DrawRect(listX, paneY, listW, paneH, t.borderSecondary, 1);
+        c.DrawRoundRect(listX, paneY, listW, paneH, t.borderRadiusMedium, t.borderSecondary, 1);
 
-        bool releaseConsumed = treeDragging || listDragging;
+        // --- Extension-filter dropdown geometry + interaction (footer, left of
+        // the accept/cancel buttons). Handled here, before the tree/list click
+        // gate, so an open menu swallows this frame's click. Painted last. ---
+        bool showFilter = mode != 0 && filterLabels.Count > 0;
+        int fBtnW = app.Scale(112);
+        int fCancelX = W - pad - fBtnW - t.gapMedium - fBtnW;
+        int filterW = app.Scale(210);
+        int filterX = fCancelX - t.gapMedium - filterW;
+        int filterRowY = paneY + paneH + t.gapMedium;
+        if (mode == 2) { filterRowY = filterRowY + t.heightMedium + t.gapMedium; }
+        int filterMenuH = filterLabels.Count * t.heightMedium + t.paddingTiny * 2;
+        int filterMenuY = filterRowY - filterMenuH - app.Scale(4);
+        bool suppressOthers = false;
+        if (showFilter) {
+            bool onTrigger = FilePicker.Clicked(
+                app, filterX, filterRowY, filterW, t.heightMedium);
+            if (filterOpen) {
+                suppressOthers = true;
+                int fi2 = 0;
+                while (fi2 < filterLabels.Count) {
+                    int iy = filterMenuY + t.paddingTiny + fi2 * t.heightMedium;
+                    if (FilePicker.Clicked(app, filterX, iy, filterW, t.heightMedium)
+                            && fi2 != filterSel.Get()) {
+                        filterSel.Set(fi2);
+                        suffix = FilePicker.FirstExt(filterPatterns[fi2]);
+                        selectedPath = "";
+                        listScroll.Set(0);
+                    }
+                    fi2 = fi2 + 1;
+                }
+                if (app.window.EventKind() == 3) {
+                    filterOpen = false;
+                    app.RequestRedraw();
+                }
+            } else if (onTrigger) {
+                filterOpen = true;
+                suppressOthers = true;
+                app.RequestRedraw();
+            }
+        }
+
+        bool releaseConsumed = treeDragging || listDragging || suppressOthers;
 
         List<string> treePaths = new List<string>();
         List<int> treeDepths = new List<int>();
@@ -603,7 +756,7 @@ class FilePicker {
                     dir, showHidden.Get());
                 int fi = 0;
                 while (fi < files.Count) {
-                    if (FilePicker.EndsWith(files[fi], suffix)) {
+                    if (MatchesCurrentFilter(files[fi])) {
                         names.Add(files[fi]);
                         paths.Add(FilePicker.Join(dir, files[fi]));
                         kinds.Add(0);
@@ -737,14 +890,14 @@ class FilePicker {
             listDragging = false;
         }
 
-        if (FilePicker.Clicked(
+        if (!suppressOthers && FilePicker.Clicked(
                 app, pad, top, upW, t.heightMedium)) {
             string parent = FilePicker.ParentDirectory(dir);
             if (Directory.ExistsUtf8(parent)) { Navigate(parent); }
-        } else if (FilePicker.Clicked(
+        } else if (!suppressOthers && FilePicker.Clicked(
                 app, goX, top, goW, t.heightMedium)) {
             Navigate(pathInput.GetText());
-        } else if (FilePicker.Clicked(
+        } else if (!suppressOthers && FilePicker.Clicked(
                 app, newX, top, newW, t.heightMedium)) {
             if (valid) {
                 creatingFolder = true;
@@ -753,7 +906,7 @@ class FilePicker {
                 statusText = "";
                 app.RequestRedraw();
             }
-        } else if (clicked >= 0 && clicked < paths.Count) {
+        } else if (!suppressOthers && clicked >= 0 && clicked < paths.Count) {
             if (kinds[clicked] == 1) {
                 Navigate(paths[clicked]);
             } else {
@@ -789,7 +942,7 @@ class FilePicker {
             app, pad, footerY,
             FilePicker.T("Show hidden files", "显示隐藏文件"),
             showHidden);
-        Checkbox.HandleClick(app, hiddenId, showHidden);
+        if (!suppressOthers) { Checkbox.HandleClick(app, hiddenId, showHidden); }
         if (hiddenBefore != showHidden.Get()) {
             treeScroll.Set(0);
             listScroll.Set(0);
@@ -812,11 +965,55 @@ class FilePicker {
         Button.Primary(acceptText).Render(
             app, acceptX, footerY, buttonW);
 
-        if (FilePicker.Clicked(
+        // Extension-filter dropdown, painted after the buttons so its open menu
+        // layers above them. Interaction was resolved earlier in the frame.
+        if (showFilter) {
+            int fTextY = filterRowY
+                + (t.heightMedium - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+            c.FillRoundRect(filterX, filterRowY, filterW, t.heightMedium,
+                t.borderRadiusMedium, t.bgTertiary);
+            c.DrawRoundRect(filterX, filterRowY, filterW, t.heightMedium,
+                t.borderRadiusMedium, t.borderPrimary, 1);
+            string flabel = Ellipsis.Fit(filterLabels[filterSel.Get()],
+                filterW - t.paddingMedium * 2 - t.iconSizeSmall, t.fontSizeMedium);
+            c.DrawText(filterX + t.paddingMedium, fTextY, flabel,
+                t.textPrimary, t.fontSizeMedium);
+            Icon.DrawCenteredIn(c, "chevron-down",
+                filterX + filterW - t.paddingMedium - t.iconSizeSmall, filterRowY,
+                t.iconSizeSmall, t.heightMedium, t.iconSizeSmall, t.textSecondary);
+            if (filterOpen) {
+                c.FillRoundRect(filterX + 1, filterMenuY + 2, filterW,
+                    filterMenuH, t.borderRadiusMedium, t.shadowColor);
+                c.FillRoundRect(filterX, filterMenuY, filterW, filterMenuH,
+                    t.borderRadiusMedium, t.bgPrimary);
+                c.DrawRoundRect(filterX, filterMenuY, filterW, filterMenuH,
+                    t.borderRadiusMedium, t.borderPrimary, 1);
+                app.BlockHitsRect(filterX, filterMenuY, filterW, filterMenuH);
+                int mi = 0;
+                while (mi < filterLabels.Count) {
+                    int iy = filterMenuY + t.paddingTiny + mi * t.heightMedium;
+                    if (mi == filterSel.Get()) {
+                        c.FillRect(filterX + 1, iy, filterW - 2,
+                            t.heightMedium, t.bgActive);
+                    } else if (FilePicker.Inside(app, filterX, iy, filterW,
+                            t.heightMedium)) {
+                        c.FillRect(filterX + 1, iy, filterW - 2,
+                            t.heightMedium, t.bgHover);
+                    }
+                    int iTextY = iy
+                        + (t.heightMedium - Canvas.FontHeight(t.fontSizeMedium)) / 2;
+                    c.DrawText(filterX + t.paddingMedium, iTextY,
+                        filterLabels[mi], t.textPrimary, t.fontSizeMedium);
+                    mi = mi + 1;
+                }
+            }
+        }
+
+        if (!suppressOthers && FilePicker.Clicked(
                 app, cancelX, footerY, buttonW, t.heightMedium)) {
             selectedPath = "";
             Finish(2);
-        } else if (FilePicker.Clicked(
+        } else if (!suppressOthers && FilePicker.Clicked(
                 app, acceptX, footerY, buttonW, t.heightMedium)) {
             if (mode == 0 && valid) {
                 selectedPath = dir;

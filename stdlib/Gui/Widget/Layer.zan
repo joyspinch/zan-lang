@@ -201,18 +201,34 @@ class Layer {
             c.FillRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 55));
             c.FillRoundRect(x, y, w, app.Scale(2), radius,
                             Layer.Fade(t.textPrimary, 150));
-            c.DrawRect(x, y, w, h, Layer.Fade(t.textPrimary, 120), 1);
+            c.DrawRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 120), 1);
         } else if (t.glass != 0 && a >= 900) {
             // Frosted-glass skin (software faux glass, no OS backdrop): strong
             // backdrop blur + a light translucent tint so the frosted wallpaper
             // clearly shows through, plus a hairline top sheen and a soft rim.
-            c.BlurRectCached(x, y, w, h, app.Scale(30),
+            c.BlurRectCached(x, y, w, h, app.Scale(36),
                 app.NextBlurSlot(), app.BackdropDirty());
-            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, 320));
-            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 45));
+            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, 260));
+            c.FillRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 40));
+            // Top-down light sheen (a few fading bands) so the pane reads as
+            // lit acrylic with depth instead of a flat frosted slab.
+            int bands = 5;
+            int bh = h / 4 / bands;
+            if (bh < 1) { bh = 1; }
+            int bi = 0;
+            while (bi < bands) {
+                c.FillRect(x + app.Scale(1), y + app.Scale(1) + bi * bh,
+                           w - app.Scale(2), bh,
+                           Layer.Fade(t.textPrimary, 70 - bi * 13));
+                bi = bi + 1;
+            }
+            // Specular rim: bright hairline on top, soft edge all around and a
+            // faint dark seat at the bottom so the pane visually floats.
             c.FillRoundRect(x, y, w, app.Scale(2), radius,
-                            Layer.Fade(t.textPrimary, 150));
-            c.DrawRect(x, y, w, h, Layer.Fade(t.textPrimary, 90), 1);
+                            Layer.Fade(t.textPrimary, 220));
+            c.DrawRoundRect(x, y, w, h, radius, Layer.Fade(t.textPrimary, 110), 1);
+            c.FillRect(x + app.Scale(2), y + h - 1, w - app.Scale(4), 1,
+                       Layer.Fade(0, 180));
         } else {
             c.FillRoundRect(x, y, w, h, radius, Layer.Fade(color, a));
         }
@@ -295,7 +311,7 @@ class Layer {
         int sh = 34 * a / 1000;
         c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, sh * 16777216);
         Layer.GlassFill(app, x, y, w, h, t.borderRadiusMedium, t.bgPrimary, a);
-        c.DrawRect(x, y, w, h, Layer.Fade(t.borderSecondary, a), 1);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, Layer.Fade(t.borderSecondary, a), 1);
         Icon.DrawCenteredIn(c, iconName, x + t.paddingMedium, y, ico, h, ico,
                             Layer.Fade(accent, a));
         c.DrawText(x + t.paddingMedium + ico + t.gapSmall,
@@ -376,7 +392,7 @@ class Layer {
         int sh = 34 * a / 1000;
         c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, sh * 16777216);
         Layer.GlassFill(app, x, y, w, h, t.borderRadiusMedium, t.bgPrimary, a);
-        c.DrawRect(x, y, w, h, Layer.Fade(t.borderSecondary, a), 1);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, Layer.Fade(t.borderSecondary, a), 1);
 
         int barColor = t.primary;
         string iconName = "info";
@@ -474,7 +490,7 @@ class Layer {
         int notch = app.Scale(6);
         c.FillRoundRect(x + 1, y + 2, w, h, t.borderRadiusMedium, t.shadowColor);
         Layer.GlassFill(app, x, y, w, h, t.borderRadiusMedium, t.bgPrimary, 1000);
-        c.DrawRect(x, y, w, h, t.borderSecondary, 1);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderSecondary, 1);
         Tooltip.TriUp(c, anchorX, y - notch, notch, notch, t.bgPrimary);
         app.BlockHitsRect(x, y, w, h);
 
@@ -534,7 +550,7 @@ class Layer {
         Icon.DrawCenteredIn(c, "close", bx, byy, bw, bw, t.iconSizeSmall, 0xFFFFFFFF);
         app.hitTester.Register(HitRegion.Create(closeId, bx, byy, bw, bw, 0));
         if (app.window.EventKind() == 3
-            && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            && app.ClickTarget() == closeId) {
             return true;
         }
         return false;
@@ -681,6 +697,12 @@ class Layer {
         int maxX = closeX - bw;
         int minX = maxX - bw;
 
+        // Opaque to the pointer: swallow every hit over the whole layer rect so
+        // page widgets behind it don't also react (the "see-through layer" bug).
+        // Registered first, so the caption buttons below and any component the
+        // app draws into the body afterwards register later and win over it.
+        app.BlockHitsRect(ex, ey, ew, eh);
+
         app.hitTester.Register(HitRegion.Create(
             s.barId, ex, ey, ew - bw * 3, bar, 5));
         app.hitTester.Register(HitRegion.Create(
@@ -703,10 +725,16 @@ class Layer {
         if (ek == 1 && s.dragging) {
             s.x = mx - s.grabDx;
             s.y = my - s.grabDy;
+            // A simulated window is a page layer, so keep it WHOLLY inside the
+            // parent client area: it can never be dragged past any edge.
+            int clampMaxX = W - ew;
+            int clampMaxY = H - eh;
+            if (clampMaxX < 0) { clampMaxX = 0; }
+            if (clampMaxY < top) { clampMaxY = top; }
+            if (s.x < 0) { s.x = 0; }
+            if (s.x > clampMaxX) { s.x = clampMaxX; }
             if (s.y < top) { s.y = top; }
-            if (s.y > H - bar) { s.y = H - bar; }
-            if (s.x < bar - ew) { s.x = bar - ew; }
-            if (s.x > W - bar) { s.x = W - bar; }
+            if (s.y > clampMaxY) { s.y = clampMaxY; }
             ex = s.x; ey = s.y;
             closeX = ex + ew - bw; maxX = closeX - bw; minX = maxX - bw;
             app.RequestRedraw();
@@ -751,7 +779,7 @@ class Layer {
 
         if (s.dragging && t.glass != 0) {
             c.FillRoundRect(ex, ey, ew, eh, rad, t.bgPrimary);
-            c.DrawRect(ex, ey, ew, eh, t.borderSecondary, 1);
+            c.DrawRoundRect(ex, ey, ew, eh, rad, t.borderSecondary, 1);
         } else {
             if (ek == 1) { app.ReuseBackdrop(); }
             Layer.GlassFill(app, ex, ey, ew, eh, rad, t.bgPrimary, 1000);
@@ -882,7 +910,7 @@ class Layer {
         app.hitTester.Register(
             HitRegion.Create(closeId, closeX, closeY, t.heightMedium, t.heightMedium, 0));
         if (app.window.EventKind() == 3
-            && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+            && app.ClickTarget() == closeId) {
             s.action = 3;
         }
     }

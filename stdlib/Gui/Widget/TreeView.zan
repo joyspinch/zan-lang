@@ -7,6 +7,7 @@ namespace Gui.Widget;
 /// Directories can be expanded/collapsed; files are leaves. `icon` overrides the
 /// default folder/file glyph when non-empty. `path` optionally carries the real
 /// filesystem path this row represents (empty for purely in-memory trees).
+/// `checked` backs the optional selection checkbox column.
 class TreeNode {
     string label;
     int depth;
@@ -14,6 +15,7 @@ class TreeNode {
     bool expanded;
     string icon;
     string path;
+    bool checked;
 
     static TreeNode Dir(string label, int depth, bool expanded) {
         TreeNode n = new TreeNode();
@@ -23,6 +25,7 @@ class TreeNode {
         n.expanded = expanded;
         n.icon = "";
         n.path = "";
+        n.checked = false;
         return n;
     }
 
@@ -34,6 +37,7 @@ class TreeNode {
         n.expanded = false;
         n.icon = "";
         n.path = "";
+        n.checked = false;
         return n;
     }
 
@@ -48,9 +52,9 @@ class TreeNode {
 /// A collapsible file tree built from a flat, pre-ordered `List<TreeNode>`. A
 /// node is hidden when any ancestor directory is collapsed. Clicking a
 /// directory toggles it; clicking any row selects it (row index -> `selected`).
-/// The list is scrolled by `scrollOffset` pixels; rows outside the viewport are
-/// culled. Interaction is handled inside Render (immediate-mode), so a single
-/// call both draws and updates the model.
+/// When rendered with checkboxes, clicking a box toggles that node (and, for a
+/// directory, all of its descendants). Interaction is handled inside Render
+/// (immediate-mode), so a single call both draws and updates the model.
 /// </summary>
 class TreeView {
     static int RowHeight(App app) {
@@ -83,7 +87,22 @@ class TreeView {
     /// user right-clicked this frame (for the caller to open a context menu),
     /// or -1 if none. Left-click select/expand is handled internally.
     static int Render(App app, Rect area, List<TreeNode> nodes,
-                       SignalInt selected, int scrollOffset) {
+                      SignalInt selected, int scrollOffset) {
+        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
+            false);
+    }
+
+    /// Same as Render but draws a selection checkbox in front of every row.
+    /// Toggling a directory box cascades to its descendants; read the result
+    /// with CheckedIndices / CheckedLabels.
+    static int RenderChecked(App app, Rect area, List<TreeNode> nodes,
+                             SignalInt selected, int scrollOffset) {
+        return TreeView.RenderImpl(app, area, nodes, selected, scrollOffset,
+            true);
+    }
+
+    static int RenderImpl(App app, Rect area, List<TreeNode> nodes,
+                          SignalInt selected, int scrollOffset, bool showChecks) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int rowH = TreeView.RowHeight(app);
@@ -99,8 +118,12 @@ class TreeView {
         int sel = selected.Get();
         int indent = app.Scale(14);
         int fontSize = t.fontSizeMedium;
+        int box = app.Scale(16);
+        int checkCol = 0;
+        if (showChecks) { checkCol = box + app.Scale(6); }
         int hideDepth = -1;
         int rowY = area.y - scrollOffset;
+        bool checkClick = false;
 
         // Clip all rows to the viewport so labels/icons and partially-scrolled
         // rows never paint outside the tree's bounds.
@@ -128,7 +151,36 @@ class TreeView {
                         }
                     }
 
-                    int x0 = area.x + t.paddingSmall + n.depth * indent;
+                    int rowLeft = area.x + t.paddingSmall;
+                    if (showChecks) {
+                        int bx = rowLeft;
+                        int by = rowY + (rowH - box) / 2;
+                        int state = TreeView.CheckState(nodes, k);
+                        int bd = t.borderPrimary;
+                        if (state == 1 || state == 2) {
+                            c.FillRoundRect(bx, by, box, box, t.borderRadiusSmall, t.primary);
+                            if (state == 1) {
+                                Icon.DrawCenteredIn(c, "check", bx, by, box, box,
+                                    box - app.Scale(4), t.bgPrimary);
+                            } else {
+                                c.FillRect(bx + app.Scale(4), by + box / 2 - app.Scale(1),
+                                    box - app.Scale(8), app.Scale(2), t.bgPrimary);
+                            }
+                        } else {
+                            c.DrawRoundRect(bx, by, box, box, t.borderRadiusSmall, bd, 1);
+                        }
+                        // checkbox click toggles the node instead of selecting
+                        if (app.window.EventKind() == 3
+                            && app.window.EventButton() == 0
+                            && app.mouseX >= bx && app.mouseX < bx + box
+                            && app.mouseY >= rowY && app.mouseY < rowY + rowH) {
+                            TreeView.ToggleCheck(nodes, k);
+                            checkClick = true;
+                            app.RequestRedraw();
+                        }
+                    }
+
+                    int x0 = rowLeft + checkCol + n.depth * indent;
                     if (n.isDir) {
                         string chev = "chevron-right";
                         if (n.expanded) { chev = "chevron-down"; }
@@ -183,8 +235,9 @@ class TreeView {
             c.FillRect(barX, thumbY, barW, thumbH, t.textTertiary);
         }
 
-        if (app.window.EventKind() == 3) {
-            int hit = app.hitTester.HitTest(app.mouseX, app.mouseY);
+        if (!checkClick && app.window.EventKind() == 3
+            && app.window.EventButton() == 0) {
+            int hit = app.ClickTarget();
             int idx = hit - firstId;
             if (idx >= 0 && idx < count) {
                 TreeNode n = nodes[idx];
@@ -198,7 +251,7 @@ class TreeView {
         // the caller can raise a context menu at the cursor.
         int rightIdx = 0 - 1;
         if (app.window.EventKind() == 2 && app.window.EventButton() == 1) {
-            int rhit = app.hitTester.HitTest(app.mouseX, app.mouseY);
+            int rhit = app.RightPressTarget();
             int ridx = rhit - firstId;
             if (ridx >= 0 && ridx < count) {
                 selected.Set(ridx);
@@ -207,5 +260,105 @@ class TreeView {
             }
         }
         return rightIdx;
+    }
+
+    /// Index of the last visible descendant of `idx` (exclusive upper bound is
+    /// the first later node whose depth is <= nodes[idx].depth).
+    static int SubtreeEnd(List<TreeNode> nodes, int idx) {
+        int d = nodes[idx].depth;
+        int j = idx + 1;
+        while (j < nodes.Count && nodes[j].depth > d) { j = j + 1; }
+        return j;
+    }
+
+    /// Tri-state of a node's checkbox: 0 = unchecked, 1 = checked, 2 = partially
+    /// checked (a directory whose descendants are a mix).
+    static int CheckState(List<TreeNode> nodes, int idx) {
+        TreeNode n = nodes[idx];
+        if (!n.isDir) {
+            if (n.checked) { return 1; }
+            return 0;
+        }
+        int end = TreeView.SubtreeEnd(nodes, idx);
+        int total = 0;
+        int on = 0;
+        int j = idx + 1;
+        while (j < end) {
+            if (!nodes[j].isDir) {
+                total = total + 1;
+                if (nodes[j].checked) { on = on + 1; }
+            }
+            j = j + 1;
+        }
+        if (total == 0) {
+            if (n.checked) { return 1; }
+            return 0;
+        }
+        if (on == 0) { return 0; }
+        if (on == total) { return 1; }
+        return 2;
+    }
+
+    /// Toggle a node. A leaf flips its own state; a directory drives all of its
+    /// descendants (and itself) to the opposite of its current aggregate state.
+    static void ToggleCheck(List<TreeNode> nodes, int idx) {
+        TreeNode n = nodes[idx];
+        if (!n.isDir) {
+            n.checked = !n.checked;
+            return;
+        }
+        bool target = TreeView.CheckState(nodes, idx) != 1;
+        n.checked = target;
+        int end = TreeView.SubtreeEnd(nodes, idx);
+        int j = idx + 1;
+        while (j < end) { nodes[j].checked = target; j = j + 1; }
+    }
+
+    /// Indices of every checked node (directories and files).
+    static List<int> CheckedIndices(List<TreeNode> nodes) {
+        List<int> res = new List<int>();
+        int k = 0;
+        while (k < nodes.Count) {
+            if (nodes[k].checked) { res.Add(k); }
+            k = k + 1;
+        }
+        return res;
+    }
+
+    /// Labels of every checked leaf (file) node.
+    static List<string> CheckedLabels(List<TreeNode> nodes) {
+        List<string> res = new List<string>();
+        int k = 0;
+        while (k < nodes.Count) {
+            if (nodes[k].checked && !nodes[k].isDir) { res.Add(nodes[k].label); }
+            k = k + 1;
+        }
+        return res;
+    }
+
+    /// Number of checked leaf (file) nodes.
+    static int CheckedCount(List<TreeNode> nodes) {
+        return TreeView.CheckedLabels(nodes).Count;
+    }
+
+    static void SetAllChecked(List<TreeNode> nodes, bool on) {
+        int k = 0;
+        while (k < nodes.Count) { nodes[k].checked = on; k = k + 1; }
+    }
+
+    static void ExpandAll(List<TreeNode> nodes) {
+        int k = 0;
+        while (k < nodes.Count) {
+            if (nodes[k].isDir) { nodes[k].expanded = true; }
+            k = k + 1;
+        }
+    }
+
+    static void CollapseAll(List<TreeNode> nodes) {
+        int k = 0;
+        while (k < nodes.Count) {
+            if (nodes[k].isDir) { nodes[k].expanded = false; }
+            k = k + 1;
+        }
     }
 }
