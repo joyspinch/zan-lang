@@ -883,14 +883,22 @@ class ZanIDE {
         Input aiInput = Input.Bind(SignalString.Create(""),
             ZanIDE.T("Ask AI about your code...", "向 AI 提问，辅助开发..."));
         Button aiSendBtn = Button.Primary(ZanIDE.T("Send", "发送")).SetSize(1);
-        // Terminal history (commands echoed with a "> " prefix + their output).
+        // "Insert code" applies the code block of the last AI answer at the
+        // editor cursor, making the assistant a real pair-programming tool.
+        Button aiApplyBtn = Button.WithIcon(ZanIDE.T("Insert code", "插入代码"), "code").SetSize(1);
+        // Terminal: a persistent interactive shell session. Its stdin is a
+        // pipe (Process.ShellSend) and its stdout/stderr stream to a session
+        // log file that is polled each frame, so long-running interactive
+        // tools (codex, watchers, REPLs) work without blocking the UI.
         List<string> termLog = new List<string>();
-        termLog.Add(ZanIDE.T("> Terminal ready. Commands run in the project root.",
-            "> 终端就绪。命令在项目根目录下执行。"));
+        termLog.Add(ZanIDE.T("> Terminal ready. A persistent shell starts in the project root on the first command.",
+            "> 终端就绪。首次执行命令时将在项目根目录启动持久 shell 会话。"));
         SignalInt termScroll = SignalInt.Create(0);
         Input termInput = Input.Bind(SignalString.Create(""),
             ZanIDE.T("Type a command, press Enter...", "输入命令后回车..."));
         Button termRunBtn = Button.Primary(ZanIDE.T("Run", "运行")).SetSize(1);
+        int termFp = 0;
+        int termLogLen = 0;
         // Hot reload: when ON, saving rebuilds and restarts the running app.
         bool autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
         // Designer live-preview toggle (0 = design view, 1 = clean preview).
@@ -1406,13 +1414,11 @@ class ZanIDE {
                 int structH = (tr.height * 32) / 100;
                 int exampleH = tr.height - explorerH - structH;
 
-                // Section 1: Explorer (header + right-aligned filter box)
+                // Section 1: Explorer (inline filter bar owned by the tree)
                 c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, ZanIDE.T("EXPLORER", "资源管理器"), t.textTertiary, t.fontSizeSmall);
-                int filtW = (tr.width * 45) / 100;
-                int filtH = sectionH - app.Scale(4);
-                treeFilter.Render(app, tr.x + tr.width - filtW - app.Scale(4), tr.y + app.Scale(2), filtW, filtH);
-                treeShow = ZanIDE.FilterNodes(tree, treeFilter.GetText());
                 Rect treeArea = Rect.Create(tr.x, tr.y + sectionH, tr.width, explorerH - sectionH);
+                treeArea = TreeView.FilterBar(app, treeArea, treeFilter);
+                treeShow = ZanIDE.FilterNodes(tree, treeFilter.GetText());
                 // Wheel-scroll the tree when the pointer is over it. Scroll in
                 // whole-row steps so rows always align to the region top (the
                 // renderer only draws rows fully inside the area).
@@ -1451,7 +1457,6 @@ class ZanIDE {
                 string stTitle = ZanIDE.T("STRUCTURE", "结构");
                 if (designerMode) { stTitle = ZanIDE.T("COMPONENTS", "组件"); }
                 c.DrawText(tr.x + t.paddingMedium, stY + t.paddingSmall, stTitle, t.textTertiary, t.fontSizeSmall);
-                structFilter.Render(app, tr.x + tr.width - filtW - app.Scale(4), stY + app.Scale(2), filtW, filtH);
                 // Rebuild the tree only when the active buffer/form changes so
                 // typing and clicking stay cheap. The signature prefix (C/F)
                 // also flips the panel between code outline and components.
@@ -1476,8 +1481,9 @@ class ZanIDE {
                     structSel.Set(0 - 1);
                     lastStructSel = 0 - 1;
                 }
-                structShow = ZanIDE.FilterNodes(structTree, structFilter.GetText());
                 Rect stArea = Rect.Create(tr.x, stY + sectionH, tr.width, structH - sectionH);
+                stArea = TreeView.FilterBar(app, stArea, structFilter);
+                structShow = ZanIDE.FilterNodes(structTree, structFilter.GetText());
                 int stRowH = TreeView.RowHeight(app);
                 int stVis = stArea.height / stRowH;
                 if (stVis < 1) { stVis = 1; }
@@ -1528,9 +1534,9 @@ class ZanIDE {
                 int exY = tr.y + explorerH + structH;
                 c.FillRect(tr.x, exY, tr.width, 1, t.divider);
                 c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, ZanIDE.T("EXAMPLES", "示例"), t.textTertiary, t.fontSizeSmall);
-                exFilter.Render(app, tr.x + tr.width - filtW - app.Scale(4), exY + app.Scale(2), filtW, filtH);
-                exShow = ZanIDE.FilterNodes(exTree, exFilter.GetText());
                 Rect exArea = Rect.Create(tr.x, exY + sectionH, tr.width, exampleH - sectionH);
+                exArea = TreeView.FilterBar(app, exArea, exFilter);
+                exShow = ZanIDE.FilterNodes(exTree, exFilter.GetText());
                 int exRowH = TreeView.RowHeight(app);
                 int exVis = exArea.height / exRowH;
                 if (exVis < 1) { exVis = 1; }
@@ -1615,21 +1621,28 @@ class ZanIDE {
                 if (newRightW < rightMin) { newRightW = rightMin; }
                 rightW.Set(newRightW);
 
-                int bottomMin = app.Scale(90);
-                if (dbgState == 2) { bottomMin = app.Scale(160); }
-                int editorMin = app.Scale(140);
-                int splitHandleH = 5;
-                // Editor fills everything above the (compact) output panel.
-                int wantEditorH = centerArea.height - bottomPanelH.Get() - splitHandleH;
-                if (wantEditorH < editorMin) { wantEditorH = editorMin; }
-                editorAreaH.Set(wantEditorH);
-                Split rows = Split.Horizontal(app, centerArea, editorAreaH, editorMin, bottomMin);
-                Rect ea = rows.first;
-                // Persist the resulting output height (not the editor height) so
-                // resizing the window keeps the editor as the dominant area.
-                int newBottomH = centerArea.height - editorAreaH.Get() - splitHandleH;
-                if (newBottomH < bottomMin) { newBottomH = bottomMin; }
-                bottomPanelH.Set(newBottomH);
+                // The designer takes the whole center column (full-height design
+                // surface, aardio-style); code tabs keep the editor/output split.
+                Rect ea = centerArea;
+                Rect orr = Rect.Create(centerArea.x, centerArea.y + centerArea.height, centerArea.width, 0);
+                if (!designerMode) {
+                    int bottomMin = app.Scale(90);
+                    if (dbgState == 2) { bottomMin = app.Scale(160); }
+                    int editorMin = app.Scale(140);
+                    int splitHandleH = 5;
+                    // Editor fills everything above the (compact) output panel.
+                    int wantEditorH = centerArea.height - bottomPanelH.Get() - splitHandleH;
+                    if (wantEditorH < editorMin) { wantEditorH = editorMin; }
+                    editorAreaH.Set(wantEditorH);
+                    Split rows = Split.Horizontal(app, centerArea, editorAreaH, editorMin, bottomMin);
+                    ea = rows.first;
+                    orr = rows.second;
+                    // Persist the resulting output height (not the editor height) so
+                    // resizing the window keeps the editor as the dominant area.
+                    int newBottomH = centerArea.height - editorAreaH.Get() - splitHandleH;
+                    if (newBottomH < bottomMin) { newBottomH = bottomMin; }
+                    bottomPanelH.Set(newBottomH);
+                }
 
                 int tabH = TabView.Height(app);
                 TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
@@ -1921,8 +1934,9 @@ class ZanIDE {
                     }
                 }
 
-                Rect orr = rows.second;
-                if (dbgState == 2) {
+                if (designerMode) {
+                    // Output panel is hidden while designing.
+                } else if (dbgState == 2) {
                     ZanIDE.RenderDebugBottom(app, c, t, orr, dbgPanelTab,
                         dbgConsole, dbgVarInfo, dbgStack, log);
                     // Handle tab clicks
@@ -2174,6 +2188,26 @@ class ZanIDE {
                         aiScroll.Get(), aiBusy.Get() == 1);
                     if (aiScroll.Get() > aiMax) { aiScroll.Set(aiMax); }
                     if (aiScroll.Get() < 0) { aiScroll.Set(0); }
+                    // "Insert code": drop the last AI code block at the editor
+                    // cursor of the active source tab.
+                    string aiCode = ZanIDE.AiLastCode(aiRole, aiText);
+                    bool aiCanApply = aiCode != "" && act >= 0 && act < tabPaths.Count
+                        && !designerMode && tabPaths[act] != ""
+                        && tabPaths[act].Substring(0, 1) != "@";
+                    if (aiCanApply) {
+                        int abW = app.Scale(110);
+                        int abH = aiApplyBtn.GetHeight(t);
+                        int abId = aiApplyBtn.Render(app,
+                            rp.x + rp.width - abW - rPad,
+                            rBody.y + rBody.height - abH - rPad, abW);
+                        if (Button.WasClicked(app, abId)) {
+                            editor.InsertStr(aiCode);
+                            tabBodies[act] = editor.GetText();
+                            log.Add(ZanIDE.T("> Inserted AI code into ", "> 已将 AI 代码插入 ")
+                                + tabPaths[act] + ".");
+                            app.RequestRedraw();
+                        }
+                    }
                     int aiInpId = aiInput.Render(app, rp.x + rPad, rInY, rInW, rInH);
                     int sendId = aiSendBtn.Render(app, rp.x + rPad * 2 + rInW, rInY, rBtnW);
                     bool doSend = Button.WasClicked(app, sendId);
@@ -2186,7 +2220,17 @@ class ZanIDE {
                             aiRole.Add("user");
                             aiText.Add(q);
                             aiInput.SetText("");
-                            string aerr = ZanIDE.AiLaunch(aiRole, aiText);
+                            // Attach the active file as context so the AI can
+                            // help with the code actually on screen.
+                            string aiCtxName = "";
+                            string aiCtxCode = "";
+                            if (act >= 0 && act < tabPaths.Count && tabPaths[act] != ""
+                                && tabPaths[act].Substring(0, 1) != "@") {
+                                aiCtxName = Path.GetFileName(tabPaths[act]);
+                                if (ZanIDE.IsFormPath(tabPaths[act])) { aiCtxCode = tabBodies[act]; }
+                                else { aiCtxCode = editor.GetText(); }
+                            }
+                            string aerr = ZanIDE.AiLaunch(aiRole, aiText, aiCtxName, aiCtxCode);
                             if (aerr != "") {
                                 aiRole.Add("error");
                                 aiText.Add(aerr);
@@ -2222,11 +2266,34 @@ class ZanIDE {
                         string tcmd = termInput.GetText();
                         if (tcmd != "") {
                             termInput.SetText("");
-                            ZanIDE.TermRun(root, tcmd, termLog);
+                            if (termFp == 0) {
+                                termFp = ZanIDE.TermOpen(root);
+                                termLogLen = 0;
+                                if (termFp == 0) {
+                                    termLog.Add(ZanIDE.T("[error] Could not start the shell session.",
+                                        "[错误] 无法启动 shell 会话。"));
+                                }
+                            }
+                            if (termFp != 0) {
+                                termLog.Add("> " + tcmd);
+                                Process.ShellSend(termFp, tcmd);
+                            }
                             termScroll.Set(0);
                             app.RequestRedraw();
                         }
                     }
+                }
+                // Stream new shell output into the terminal view. Poll on the
+                // throttled animation clock so a live session doesn't spin the
+                // CPU but output still appears promptly.
+                if (termFp != 0) {
+                    int consumed2 = ZanIDE.TermPoll(termLogLen, termLog);
+                    if (consumed2 != termLogLen) {
+                        termLogLen = consumed2;
+                        termScroll.Set(0);
+                        app.RequestRedraw();
+                    }
+                    app.RequestAnimationFrame(250);
                 }
                 // Poll the in-flight AI request: curl runs detached and drops a
                 // done-marker when the response file is complete.
@@ -4960,7 +5027,31 @@ class ZanIDE {
     /// request and launches curl DETACHED (response + done-marker files are
     /// polled from the event loop, so the UI stays responsive). Returns "" on
     /// success or a user-facing error message.
-    static string AiLaunch(List<string> roles, List<string> texts) {
+    /// The content of the last ``` fenced code block in the newest assistant
+    /// reply, or "" when there is none.
+    static string AiLastCode(List<string> roles, List<string> texts) {
+        int i = roles.Count - 1;
+        while (i >= 0) {
+            if (roles[i] == "assistant") {
+                string s = texts[i];
+                int a = ZanIDE.IndexOfStr(s, "```");
+                if (a < 0) { return ""; }
+                int ls = a + 3;
+                while (ls < s.Length && s.Substring(ls, 1) != "\n") { ls = ls + 1; }
+                ls = ls + 1;
+                if (ls >= s.Length) { return ""; }
+                string rest = s.Substring(ls, s.Length - ls);
+                int b = ZanIDE.IndexOfStr(rest, "```");
+                if (b <= 0) { return ""; }
+                return rest.Substring(0, b);
+            }
+            i = i - 1;
+        }
+        return "";
+    }
+
+    static string AiLaunch(List<string> roles, List<string> texts,
+            string ctxName, string ctxCode) {
         string key = ZanIDE.AiSetting("key", "OPENAI_API_KEY", "");
         if (key == "") {
             return ZanIDE.T(
@@ -4971,10 +5062,16 @@ class ZanIDE {
         string model = ZanIDE.AiSetting("model", "OPENAI_MODEL", "gpt-4o-mini");
         StringBuilder body = new StringBuilder();
         body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model) + "\",\"messages\":[");
-        body.Append("{\"role\":\"system\",\"content\":\"" + ZanIDE.JsonEsc(
-            "You are the AI assistant built into Zan IDE, the IDE of the Zan programming language."
+        string sysMsg = "You are the AI assistant built into Zan IDE, the IDE of the Zan programming language."
             + " Help the user develop their project: answer concisely, in the user's language,"
-            + " and include Zan code snippets when helpful.") + "\"}");
+            + " and include Zan code snippets when helpful.";
+        if (ctxName != "") {
+            string ctx = ctxCode;
+            if (ctx.Length > 6000) { ctx = ctx.Substring(0, 6000); }
+            sysMsg = sysMsg + " The user is currently editing " + ctxName
+                + ". Its current content:\n" + ctx;
+        }
+        body.Append("{\"role\":\"system\",\"content\":\"" + ZanIDE.JsonEsc(sysMsg) + "\"}");
         int i = 0;
         while (i < roles.Count) {
             if (roles[i] == "user" || roles[i] == "assistant") {
@@ -5158,20 +5255,46 @@ class ZanIDE {
 
     /// Runs a shell command in the project root, appending its output to the
     /// terminal history (capped so the transcript can't grow without bound).
-    static void TermRun(string root, string cmd, List<string> termLog) {
-        termLog.Add("> " + cmd);
+    static string TermLogPath() { return ZanIDE.UserConfigDir() + "/term_session.log"; }
+
+    /// Starts the persistent interactive shell session rooted at the project
+    /// directory. The session's stdin is the returned pipe; stdout/stderr
+    /// stream into the session log file, which the UI polls each frame.
+    static int TermOpen(string root) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.TermLogPath(), "");
         #if WINDOWS
-        string full = "cd /d \"" + root + "\" && (" + cmd + ")";
+        string cmd = "cmd /q /k cd /d \"" + root + "\" >>\"" + ZanIDE.TermLogPath() + "\" 2>&1";
         #else
-        string full = "cd \"" + root + "\" && (" + cmd + ")";
+        string cmd = "cd \"" + root + "\" && exec sh >>\"" + ZanIDE.TermLogPath() + "\" 2>&1";
         #endif
-        List<string> outp = Process.RunCapture(full);
-        int i = 0;
-        while (i < outp.Count) {
-            termLog.Add(outp[i]);
-            i = i + 1;
+        return Process.ShellOpen(cmd);
+    }
+
+    /// Appends any new complete lines from the session log to the terminal
+    /// view. Returns the new consumed length (only whole lines are consumed,
+    /// so a partially-written line is picked up on a later poll).
+    static int TermPoll(int consumed, List<string> termLog) {
+        if (!File.Exists(ZanIDE.TermLogPath())) { return consumed; }
+        string raw = File.ReadAllText(ZanIDE.TermLogPath());
+        if (raw.Length <= consumed) { return consumed; }
+        // Consume up to the last newline only.
+        int last = 0 - 1;
+        int i = raw.Length - 1;
+        while (i >= consumed) {
+            if (raw.Substring(i, 1) == "\n") { last = i; i = consumed - 1; }
+            i = i - 1;
         }
-        while (termLog.Count > 800) { termLog.RemoveAt(0); }
+        if (last < consumed) { return consumed; }
+        string chunk = raw.Substring(consumed, last + 1 - consumed);
+        List<string> nl = CodeEditor.SplitLines(chunk);
+        int k = 0;
+        while (k < nl.Count) {
+            if (!(k == nl.Count - 1 && nl[k] == "")) { termLog.Add(nl[k]); }
+            k = k + 1;
+        }
+        while (termLog.Count > 2000) { termLog.RemoveAt(0); }
+        return last + 1;
     }
 
     /// Tabbed bottom panel (Output / Error List) with a filter box + Clear
