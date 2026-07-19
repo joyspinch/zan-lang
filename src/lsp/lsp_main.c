@@ -15,6 +15,7 @@
  * dependency); symbol intelligence reuses the IDE intellisense engine.
  *
  * Usage: zan-lsp            (communicates over stdin/stdout)
+ *        zan-lsp --port <N> (listens on 127.0.0.1:<N> for a single client)
  */
 #include "json.h"
 #include "rpc.h"
@@ -40,6 +41,15 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <winsock2.h>
+typedef SOCKET lsp_sock_t;
+#define LSP_INVALID_SOCK INVALID_SOCKET
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+typedef int lsp_sock_t;
+#define LSP_INVALID_SOCK (-1)
 #endif
 
 #include "../common/host_oom.h"
@@ -59,7 +69,80 @@ typedef struct {
     bool      project_indexed;
     char      workspace_root[1024];
     FILE     *out;
+    bool       use_sock;  /* true when framing over a TCP socket */
+    lsp_sock_t sock;      /* connected client socket (server mode) */
 } lsp_server_t;
+
+/* ---- TCP transport (--port): same single-client server as zan-dap ---- */
+
+static bool sock_send_all(lsp_sock_t s, const char *buf, int n) {
+    int off = 0;
+    while (off < n) {
+        int r = (int)send(s, buf + off, n - off, 0);
+        if (r <= 0) return false;
+        off += r;
+    }
+    return true;
+}
+
+static int sock_reader(void *ctx, char *buf, int n) {
+    return (int)recv(*(lsp_sock_t *)ctx, buf, n, 0);
+}
+
+static bool sock_writer(void *ctx, const char *buf, int n) {
+    return sock_send_all(*(lsp_sock_t *)ctx, buf, n);
+}
+
+static char *rpc_read_message_sock(lsp_sock_t s) {
+    return rpc_read_message_cb(sock_reader, &s, 64 * 1024 * 1024);
+}
+
+static void rpc_write_message_sock(lsp_sock_t s, const char *payload) {
+    rpc_write_message_cb(sock_writer, &s, payload);
+}
+
+/* All protocol output funnels through here so the socket transport is a
+ * drop-in replacement for stdio. */
+static void lsp_write(lsp_server_t *s, const char *payload) {
+    if (s->use_sock)
+        rpc_write_message_sock(s->sock, payload);
+    else
+        rpc_write_message(s->out, payload);
+}
+
+/* Listen on 127.0.0.1:port and accept a single client. Returns the connected
+ * socket, or LSP_INVALID_SOCK on failure. */
+static lsp_sock_t lsp_listen_accept(int port) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return LSP_INVALID_SOCK;
+#endif
+    lsp_sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == LSP_INVALID_SOCK) return LSP_INVALID_SOCK;
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(ls, 1) != 0) {
+#ifdef _WIN32
+        closesocket(ls);
+#else
+        close(ls);
+#endif
+        return LSP_INVALID_SOCK;
+    }
+    lsp_sock_t cs = accept(ls, NULL, NULL);
+#ifdef _WIN32
+    closesocket(ls);
+#else
+    close(ls);
+#endif
+    return cs;
+}
 
 static char *dup_str(const char *s) {
     if (!s) s = "";
@@ -402,7 +485,7 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
     json_obj_set(note, "params", params);
 
     char *payload = json_serialize(note);
-    rpc_write_message(s->out, payload);
+    lsp_write(s, payload);
     free(payload);
     json_free(note);
 
@@ -425,7 +508,7 @@ static void send_response(lsp_server_t *s, json_value *id, json_value *result) {
     json_obj_set(resp, "result", result ? result : json_new_null());
 
     char *payload = json_serialize(resp);
-    rpc_write_message(s->out, payload);
+    lsp_write(s, payload);
     free(payload);
     json_free(resp);
 }
@@ -1289,7 +1372,7 @@ static void run_leak_check(lsp_server_t *s, const char *uri) {
     json_obj_set(note, "method", json_new_str("textDocument/publishDiagnostics"));
     json_obj_set(note, "params", params);
     char *payload = json_serialize(note);
-    rpc_write_message(s->out, payload);
+    lsp_write(s, payload);
     free(payload);
     json_free(note);
 
@@ -1302,7 +1385,7 @@ static void run_leak_check(lsp_server_t *s, const char *uri) {
         json_obj_set(mnote, "method", json_new_str("window/showMessage"));
         json_obj_set(mnote, "params", mparams);
         char *mp = json_serialize(mnote);
-        rpc_write_message(s->out, mp);
+        lsp_write(s, mp);
         free(mp);
         json_free(mnote);
     }
@@ -1367,19 +1450,35 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    int port = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
+            port = atoi(argv[++i]);
+    }
+
     lsp_server_t server;
     memset(&server, 0, sizeof(server));
     server.out = stdout;
 
+    if (port > 0) {
+        server.sock = lsp_listen_accept(port);
+        if (server.sock == LSP_INVALID_SOCK) {
+            fprintf(stderr, "zan-lsp: failed to listen on port %d\n", port);
+            return 1;
+        }
+        server.use_sock = true;
+    } else {
 #ifdef _WIN32
-    /* avoid CRLF translation mangling the framed protocol */
-    _setmode(_fileno(stdin), _O_BINARY);
-    _setmode(_fileno(stdout), _O_BINARY);
+        /* avoid CRLF translation mangling the framed protocol */
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    }
 
     for (;;) {
-        char *body = rpc_read_message(stdin);
+        char *body = server.use_sock ? rpc_read_message_sock(server.sock)
+                                     : rpc_read_message(stdin);
         if (!body) break; /* EOF */
 
         json_value *msg = json_parse(body);
@@ -1399,5 +1498,10 @@ int main(void) {
         free(server.docs[i].uri);
         free(server.docs[i].text);
     }
+#ifdef _WIN32
+    if (server.use_sock) { closesocket(server.sock); WSACleanup(); }
+#else
+    if (server.use_sock) close(server.sock);
+#endif
     return server.shutdown_requested ? 0 : 0;
 }

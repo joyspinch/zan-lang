@@ -216,6 +216,10 @@ add_executable(zan-lsp
 target_include_directories(zan-lsp PRIVATE src/compiler src/common src/lsp)
 if(MSVC)
     target_compile_definitions(zan-lsp PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(WIN32)
+    # TCP server transport (--port) uses winsock.
+    target_link_libraries(zan-lsp PRIVATE ws2_32)
 else()
     # json.c uses floor(); libm is separate from libc on most Unix toolchains.
     target_link_libraries(zan-lsp PRIVATE m)
