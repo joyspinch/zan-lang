@@ -192,9 +192,11 @@ class Host {
     static Host Create(string title, int logicalW, int logicalH) {
         Sdl.Init(SdlInit.Video() + SdlInit.Events());
         Host h = new Host();
-        // Windowed by default at the logical size (centered by SDL), resizable
-        // and high-DPI aware so it looks right on 4K without being oversized.
-        h.window = SdlWindow.Create(title, logicalW, logicalH,
+        // Windowed by default at 1.5x the logical size (comfortably large on
+        // 1440p/4K without covering the desktop), resizable and high-DPI
+        // aware; F11 toggles fullscreen. The letterboxed logical canvas keeps
+        // gameplay math resolution-independent.
+        h.window = SdlWindow.Create(title, logicalW * 3 / 2, logicalH * 3 / 2,
             SdlWindowFlags.Resizable() + SdlWindowFlags.HighPixelDensity());
         h.r = SdlRenderer.Create(h.window);
         h.r.SetBlend(1);
@@ -369,7 +371,8 @@ class Draw {
         return px >= x && px < x + w && py >= y && py < y + h;
     }
 
-    // Filled rectangle with rounded corners.
+    // Filled rectangle with rounded corners, rasterized as one scanline pass at
+    // native resolution so translucent fills never double-blend at the corners.
     static void RoundRectFill(SdlRenderer r, int x, int y, int w, int h, int rad,
                               int cr, int cg, int cb, int ca) {
         if (w <= 0 || h <= 0) { return; }
@@ -377,13 +380,19 @@ class Draw {
         if (rad * 2 > h) { rad = h / 2; }
         r.SetColor(cr, cg, cb, ca);
         if (rad < 1) { r.FillRect(x, y, w, h); return; }
-        r.FillRect(x + rad, y, w - rad * 2, h);
-        r.FillRect(x, y + rad, rad, h - rad * 2);
-        r.FillRect(x + w - rad, y + rad, rad, h - rad * 2);
-        Draw.FillCircle(r, x + rad, y + rad, rad, cr, cg, cb, ca);
-        Draw.FillCircle(r, x + w - rad - 1, y + rad, rad, cr, cg, cb, ca);
-        Draw.FillCircle(r, x + rad, y + h - rad - 1, rad, cr, cg, cb, ca);
-        Draw.FillCircle(r, x + w - rad - 1, y + h - rad - 1, rad, cr, cg, cb, ca);
+        int sx = r.Sc(x); int sy = r.Sc(y);
+        int sw = r.Sc(x + w) - sx; int sh = r.Sc(y + h) - sy;
+        int srad = r.Sc(rad);
+        int dy = 0;
+        while (dy < sh) {
+            int inset = 0;
+            int t = 0;
+            if (dy < srad) { t = srad - dy; }
+            if (dy > sh - 1 - srad) { t = dy - (sh - 1 - srad); }
+            if (t > 0) { inset = srad - Draw.Isqrt(srad * srad - t * t); }
+            r.FillRectRaw(sx + inset, sy + dy, sw - inset * 2, 1);
+            dy = dy + 1;
+        }
     }
 
     // Rounded-rectangle stroke of thickness t drawn just outside (x,y,w,h).
