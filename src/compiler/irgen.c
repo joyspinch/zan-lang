@@ -10236,19 +10236,21 @@ done:
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
     char *ir = LLVMPrintModuleToString(g->mod);
     if (!path) {
-        printf("%s", ir);
+        int rc = fputs(ir, stdout);
         LLVMDisposeMessage(ir);
-        return ZAN_OK;
+        return rc < 0 ? ZAN_ERROR : ZAN_OK;
     }
     FILE *f = fopen(path, "w");
     if (!f) {
         LLVMDisposeMessage(ir);
         return ZAN_ERROR;
     }
-    fputs(ir, f);
-    fclose(f);
+    /* Report short writes (e.g. a full disk) instead of claiming success and
+     * leaving a truncated .ll behind. */
+    bool ok = (fputs(ir, f) >= 0);
+    if (fclose(f) != 0) ok = false;
     LLVMDisposeMessage(ir);
-    return ZAN_OK;
+    return ok ? ZAN_OK : ZAN_ERROR;
 }
 
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
