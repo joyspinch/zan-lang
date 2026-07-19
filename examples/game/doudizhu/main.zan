@@ -1,0 +1,1001 @@
+// Dou Dizhu (Fight the Landlord) -- a complete 3-player product on GameKit.
+// 54-card deck, landlord bidding, full combo engine (singles, pairs, triples
+// with wings, straights, pair-straights, airplanes, four-with-two, bombs and
+// rocket), two heuristic AI opponents, click-to-select play with a hint
+// helper, and a persistent score / streak profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Doudizhu;
+
+class Profile {
+    int score;
+    int streak;
+    int best;
+    int wins;
+    int losses;
+    int games;
+    int landlordWins;
+
+    static string Path() { return "doudizhu_save.txt"; }
+
+    static int ParseInt(string s, int start) {
+        int i = start;
+        int sign = 1;
+        if (i < s.Length && s[i] == 45) { sign = -1; i = i + 1; }
+        int v = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v * sign;
+    }
+
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            int eq = -1;
+            int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static Profile Load() {
+        Profile p = new Profile();
+        p.score = 1000; p.streak = 0; p.best = 0;
+        p.wins = 0; p.losses = 0; p.games = 0; p.landlordWins = 0;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.score = Profile.ReadKey(lines, "score", 1000);
+            p.streak = Profile.ReadKey(lines, "streak", 0);
+            p.best = Profile.ReadKey(lines, "best", 0);
+            p.wins = Profile.ReadKey(lines, "wins", 0);
+            p.losses = Profile.ReadKey(lines, "losses", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+            p.landlordWins = Profile.ReadKey(lines, "landlordWins", 0);
+        }
+        return p;
+    }
+
+    void Save() {
+        string s = "";
+        s = s + "score=" + this.score + "\n";
+        s = s + "streak=" + this.streak + "\n";
+        s = s + "best=" + this.best + "\n";
+        s = s + "wins=" + this.wins + "\n";
+        s = s + "losses=" + this.losses + "\n";
+        s = s + "games=" + this.games + "\n";
+        s = s + "landlordWins=" + this.landlordWins + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+
+    string TierName() {
+        int r = this.score;
+        if (r < 900) { return "NOVICE"; }
+        if (r < 1100) { return "AMATEUR"; }
+        if (r < 1300) { return "SKILLED"; }
+        if (r < 1500) { return "EXPERT"; }
+        if (r < 1750) { return "MASTER"; }
+        return "GRANDMASTER";
+    }
+}
+
+class Combo {
+    int type;   // 0 invalid,1 single,2 pair,3 triple,4 triple+1,5 triple+2,
+                // 6 straight,7 pairstraight,8 plane,9 plane+singles,10 plane+pairs,
+                // 11 four+2single,12 four+2pair,13 bomb,14 rocket
+    int main;   // primary rank
+    int len;    // number of groups (straights/planes)
+}
+
+// Card 0..51 standard: rank = 3 + card/4 (3..15), suit = card%4.
+// Card 52 = black joker (rank 16), 53 = red joker (rank 17).
+class Rules {
+    static int Rank(int card) {
+        if (card >= 52) { return 16 + (card - 52); }
+        return 3 + card / 4;
+    }
+    static int Suit(int card) {
+        if (card >= 52) { return -1; }
+        return card % 4;
+    }
+    static string RankStr(int rank) {
+        if (rank <= 10) { return "" + rank; }
+        if (rank == 11) { return "J"; }
+        if (rank == 12) { return "Q"; }
+        if (rank == 13) { return "K"; }
+        if (rank == 14) { return "A"; }
+        if (rank == 15) { return "2"; }
+        if (rank == 16) { return "j"; }
+        return "J*";
+    }
+    static bool IsRed(int card) {
+        if (card == 53) { return true; }
+        if (card == 52) { return false; }
+        int s = card % 4;
+        return s == 0 || s == 1;   // hearts, diamonds
+    }
+    static string SuitStr(int card) {
+        if (card >= 52) { return "JKR"; }
+        int s = card % 4;
+        if (s == 0) { return "H"; }
+        if (s == 1) { return "D"; }
+        if (s == 2) { return "C"; }
+        return "S";
+    }
+
+    static Combo Classify(int[] cnt, int n) {
+        Combo c = new Combo();
+        c.type = 0; c.main = 0; c.len = 0;
+        if (n == 0) { return c; }
+        int singles = 0; int pairs = 0; int triples = 0; int quads = 0;
+        int minR = 99; int maxR = -1;
+        int tripleRank = 0; int quadRank = 0;
+        int r = 3;
+        while (r <= 17) {
+            int k = cnt[r];
+            if (k > 0) {
+                if (r < minR) { minR = r; }
+                if (r > maxR) { maxR = r; }
+                if (k == 1) { singles = singles + 1; }
+                if (k == 2) { pairs = pairs + 1; }
+                if (k == 3) { triples = triples + 1; tripleRank = r; }
+                if (k == 4) { quads = quads + 1; quadRank = r; }
+            }
+            r = r + 1;
+        }
+        if (n == 2 && cnt[16] == 1 && cnt[17] == 1) { c.type = 14; c.main = 17; return c; }
+        if (n == 4 && quads == 1) { c.type = 13; c.main = quadRank; return c; }
+        if (n == 1) { c.type = 1; c.main = maxR; return c; }
+        if (n == 2 && pairs == 1) { c.type = 2; c.main = maxR; return c; }
+        if (n == 3 && triples == 1) { c.type = 3; c.main = maxR; return c; }
+        if (n == 4 && triples == 1 && singles == 1) { c.type = 4; c.main = tripleRank; return c; }
+        if (n == 5 && triples == 1 && pairs == 1) { c.type = 5; c.main = tripleRank; return c; }
+        // straight
+        if (n >= 5 && singles == n && maxR <= 14 && (maxR - minR + 1) == n) {
+            c.type = 6; c.main = maxR; c.len = n; return c;
+        }
+        // pair straight
+        if (n >= 6 && n % 2 == 0 && pairs == n / 2 && maxR <= 14 && (maxR - minR + 1) == n / 2) {
+            c.type = 7; c.main = maxR; c.len = n / 2; return c;
+        }
+        // planes (triples of count exactly 3, consecutive)
+        int tmin = 99; int tmax = -1; int tcnt = 0;
+        r = 3;
+        while (r <= 14) {
+            if (cnt[r] == 3) { if (r < tmin) { tmin = r; } if (r > tmax) { tmax = r; } tcnt = tcnt + 1; }
+            r = r + 1;
+        }
+        if (tcnt >= 2 && (tmax - tmin + 1) == tcnt) {
+            int rem = n - 3 * tcnt;
+            if (rem == 0) { c.type = 8; c.main = tmax; c.len = tcnt; return c; }
+            if (rem == tcnt) { c.type = 9; c.main = tmax; c.len = tcnt; return c; }
+            if (rem == 2 * tcnt) {
+                int pw = 0;
+                r = 3;
+                while (r <= 17) {
+                    if (cnt[r] == 2 && (r < tmin || r > tmax)) { pw = pw + 1; }
+                    r = r + 1;
+                }
+                if (pw == tcnt) { c.type = 10; c.main = tmax; c.len = tcnt; return c; }
+            }
+        }
+        // four + two
+        if (n == 6 && quads == 1) { c.type = 11; c.main = quadRank; return c; }
+        if (n == 8 && quads == 1 && pairs == 2) { c.type = 12; c.main = quadRank; return c; }
+        return c;
+    }
+
+    static bool Beats(Combo a, Combo b) {
+        if (a.type == 0) { return false; }
+        if (a.type == 14) { return true; }
+        if (b.type == 14) { return false; }
+        if (a.type == 13 && b.type != 13) { return true; }
+        if (b.type == 13 && a.type != 13) { return false; }
+        if (a.type == 13 && b.type == 13) { return a.main > b.main; }
+        if (a.type != b.type) { return false; }
+        if (a.len != b.len) { return false; }
+        return a.main > b.main;
+    }
+}
+
+class DdzGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    Talker talk;
+    int[] hands;      // 3 * 21
+    int[] hn;         // counts
+    int[] bottom;     // 3 cards
+    bool[] sel;       // human selection, by hand position (max 21)
+    int scene;
+    int phase;        // 0 bidding, 1 playing, 2 over
+    int landlord;
+    int turn;
+    int lastPlayer;   // who laid the current live combo
+    Combo lastCombo;
+    int[] lastCards;  // cards of last play (for display)
+    int lastN;
+    int lastOwner;    // seat whose cards are shown in center
+    int botAt;
+    bool botPending;
+    int mouseX;
+    int mouseY;
+    int winner;       // 1 human side wins, 2 loses
+    int scoreDelta;
+    int level;        // AI aggression 0..3 (difficulty)
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+    int demoAt;
+
+    static DdzGame Create(Host h) {
+        DdzGame g = new DdzGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 246813579);
+        g.talk = Talker.Create(g.rng);
+        g.hands = new int[63];
+        g.hn = new int[3];
+        g.bottom = new int[3];
+        g.sel = new bool[21];
+        g.lastCombo = new Combo();
+        g.lastCards = new int[21];
+        g.scene = 0;
+        g.level = 1;
+        g.SetupTalk();
+        g.demo = File.Exists("doudizhu_demo.txt");
+        if (g.demo) { g.Deal(Sdl.Ticks()); g.demoAt = Sdl.Ticks() + 900; }
+        return g;
+    }
+
+    void SetupTalk() {
+        this.talk.Add(0, "Good play!");
+        this.talk.Add(0, "Clearing your hand.");
+        this.talk.Add(0, "Nice control.");
+        this.talk.Add(1, "The landlord presses.");
+        this.talk.Add(1, "Watch those bombs.");
+        this.talk.Add(1, "Careful now...");
+        this.talk.Add(2, "Your turn.");
+        this.talk.Add(2, "Pick your cards.");
+        this.talk.Add(3, "BOMB!");
+        this.talk.Add(3, "ROCKET!");
+        this.talk.Add(3, "Big play!");
+    }
+
+    void SortHand(int p) {
+        int n = this.hn[p];
+        int i = 1;
+        while (i < n) {
+            int key = this.hands[p * 21 + i];
+            int kr = Rules.Rank(key);
+            int j = i - 1;
+            while (j >= 0 && Rules.Rank(this.hands[p * 21 + j]) > kr) {
+                this.hands[p * 21 + j + 1] = this.hands[p * 21 + j];
+                j = j - 1;
+            }
+            this.hands[p * 21 + j + 1] = key;
+            i = i + 1;
+        }
+    }
+
+    void Deal(int now) {
+        int[] deck = new int[54];
+        int i = 0;
+        while (i < 54) { deck[i] = i; i = i + 1; }
+        i = 53;
+        while (i > 0) {
+            int j = this.rng.Range(0, i + 1);
+            int t = deck[i]; deck[i] = deck[j]; deck[j] = t;
+            i = i - 1;
+        }
+        int p = 0;
+        while (p < 3) { this.hn[p] = 0; p = p + 1; }
+        i = 0;
+        while (i < 51) {
+            int pl = i / 17;
+            this.hands[pl * 21 + this.hn[pl]] = deck[i];
+            this.hn[pl] = this.hn[pl] + 1;
+            i = i + 1;
+        }
+        this.bottom[0] = deck[51]; this.bottom[1] = deck[52]; this.bottom[2] = deck[53];
+        p = 0;
+        while (p < 3) { this.SortHand(p); p = p + 1; }
+        i = 0;
+        while (i < 21) { this.sel[i] = false; i = i + 1; }
+        this.scene = 1;
+        this.phase = 0;
+        this.landlord = -1;
+        this.lastCombo.type = 0;
+        this.lastN = 0;
+        this.lastOwner = -1;
+        this.winner = 0;
+        this.talk.SayExact(2, "Bid to become the Landlord!", now, 2600);
+    }
+
+    int HandScore(int p) {
+        // rough hand strength for bidding
+        int s = 0;
+        int i = 0;
+        while (i < this.hn[p]) {
+            int rk = Rules.Rank(this.hands[p * 21 + i]);
+            if (rk == 15) { s = s + 4; }
+            if (rk == 14) { s = s + 2; }
+            if (rk >= 16) { s = s + 6; }
+            i = i + 1;
+        }
+        // bombs
+        int[] cnt = new int[18];
+        i = 0;
+        while (i < this.hn[p]) { cnt[Rules.Rank(this.hands[p * 21 + i])] = cnt[Rules.Rank(this.hands[p * 21 + i])] + 1; i = i + 1; }
+        int r = 3;
+        while (r <= 15) { if (cnt[r] == 4) { s = s + 8; } r = r + 1; }
+        if (cnt[16] == 1 && cnt[17] == 1) { s = s + 10; }
+        return s;
+    }
+
+    void SetLandlord(int p, int now) {
+        this.landlord = p;
+        int i = 0;
+        while (i < 3) {
+            this.hands[p * 21 + this.hn[p]] = this.bottom[i];
+            this.hn[p] = this.hn[p] + 1;
+            i = i + 1;
+        }
+        this.SortHand(p);
+        i = 0;
+        while (i < 21) { this.sel[i] = false; i = i + 1; }
+        this.phase = 1;
+        this.turn = p;
+        this.lastPlayer = p;
+        this.lastCombo.type = 0;
+        this.lastN = 0;
+        this.lastOwner = -1;
+        if (p == 0) { this.talk.SayExact(0, "You are the Landlord! Lead off.", now, 3000); }
+        else { this.talk.SayExact(1, "AI " + p + " is the Landlord.", now, 3000); }
+        if (p != 0) { this.botAt = now + 700; this.botPending = true; }
+    }
+
+    void HumanBid(bool call, int now) {
+        if (this.phase != 0) { return; }
+        if (call) { this.SetLandlord(0, now); return; }
+        // human passes -> pick stronger bot
+        int s1 = this.HandScore(1);
+        int s2 = this.HandScore(2);
+        if (s1 >= s2) { this.SetLandlord(1, now); } else { this.SetLandlord(2, now); }
+    }
+
+    void Histogram(int p, int[] cnt) {
+        int i = 0;
+        while (i < 18) { cnt[i] = 0; i = i + 1; }
+        i = 0;
+        while (i < this.hn[p]) { int rk = Rules.Rank(this.hands[p * 21 + i]); cnt[rk] = cnt[rk] + 1; i = i + 1; }
+    }
+
+    // Remove given card ids from player p's hand.
+    void RemoveCards(int p, int[] ids, int k) {
+        int w = 0;
+        int i = 0;
+        while (i < this.hn[p]) {
+            int card = this.hands[p * 21 + i];
+            bool drop = false;
+            int j = 0;
+            while (j < k) { if (ids[j] == card) { drop = true; j = k; } j = j + 1; }
+            if (!drop) { this.hands[p * 21 + w] = card; w = w + 1; }
+            i = i + 1;
+        }
+        this.hn[p] = w;
+    }
+
+    // Pick k card ids of a given rank from player p into out.
+    int PickRank(int p, int rank, int k, int[] outIds, int start) {
+        int got = 0;
+        int i = 0;
+        while (i < this.hn[p] && got < k) {
+            if (Rules.Rank(this.hands[p * 21 + i]) == rank) { outIds[start + got] = this.hands[p * 21 + i]; got = got + 1; }
+            i = i + 1;
+        }
+        return got;
+    }
+
+    int LowestOtherSingle(int p, int[] cnt, int avoidRank, int[] outIds, int start) {
+        int r = 3;
+        while (r <= 17) {
+            if (r != avoidRank && cnt[r] >= 1) { return this.PickRank(p, r, 1, outIds, start); }
+            r = r + 1;
+        }
+        return 0;
+    }
+
+    int LowestOtherPair(int p, int[] cnt, int avoidRank, int[] outIds, int start) {
+        int r = 3;
+        while (r <= 15) {
+            if (r != avoidRank && cnt[r] >= 2) { return this.PickRank(p, r, 2, outIds, start); }
+            r = r + 1;
+        }
+        return 0;
+    }
+
+    // Find a play by p that beats lastCombo (or leads if lead=true).
+    // Returns number of cards, fills outIds. 0 = pass / none.
+    int FindPlay(int p, bool lead, bool allowBomb, int[] outIds) {
+        int[] cnt = new int[18];
+        this.Histogram(p, cnt);
+        if (lead) {
+            // lead the lowest single available
+            int r = 3;
+            while (r <= 17) { if (cnt[r] >= 1) { return this.PickRank(p, r, 1, outIds, 0); } r = r + 1; }
+            return 0;
+        }
+        Combo b = this.lastCombo;
+        if (b.type == 1) {
+            int r = b.main + 1;
+            while (r <= 17) { if (cnt[r] >= 1) { return this.PickRank(p, r, 1, outIds, 0); } r = r + 1; }
+        } else if (b.type == 2) {
+            int r = b.main + 1;
+            while (r <= 15) { if (cnt[r] >= 2) { return this.PickRank(p, r, 2, outIds, 0); } r = r + 1; }
+        } else if (b.type == 3) {
+            int r = b.main + 1;
+            while (r <= 15) { if (cnt[r] >= 3) { return this.PickRank(p, r, 3, outIds, 0); } r = r + 1; }
+        } else if (b.type == 4) {
+            int r = b.main + 1;
+            while (r <= 15) {
+                if (cnt[r] >= 3) {
+                    int g = this.PickRank(p, r, 3, outIds, 0);
+                    int cnt2r = cnt[r]; cnt[r] = 0;
+                    int e = this.LowestOtherSingle(p, cnt, r, outIds, 3);
+                    cnt[r] = cnt2r;
+                    if (g == 3 && e == 1) { return 4; }
+                }
+                r = r + 1;
+            }
+        } else if (b.type == 5) {
+            int r = b.main + 1;
+            while (r <= 15) {
+                if (cnt[r] >= 3) {
+                    int g = this.PickRank(p, r, 3, outIds, 0);
+                    int cnt2r = cnt[r]; cnt[r] = 0;
+                    int e = this.LowestOtherPair(p, cnt, r, outIds, 3);
+                    cnt[r] = cnt2r;
+                    if (g == 3 && e == 2) { return 5; }
+                }
+                r = r + 1;
+            }
+        } else if (b.type == 6) {
+            int L = b.len;
+            int start = b.main - L + 1 + 1;   // need top > b.main
+            int top = start + L - 1;
+            while (top <= 14) {
+                bool ok = true;
+                int rr = top - L + 1;
+                while (rr <= top) { if (cnt[rr] < 1) { ok = false; rr = top; } rr = rr + 1; }
+                if (ok) {
+                    int cc = 0;
+                    rr = top - L + 1;
+                    while (rr <= top) { cc = cc + this.PickRank(p, rr, 1, outIds, cc); rr = rr + 1; }
+                    return cc;
+                }
+                top = top + 1;
+            }
+        } else if (b.type == 7) {
+            int L = b.len;
+            int top = b.main + 1;
+            while (top <= 14) {
+                bool ok = true;
+                int rr = top - L + 1;
+                while (rr <= top) { if (cnt[rr] < 2) { ok = false; rr = top; } rr = rr + 1; }
+                if (ok) {
+                    int cc = 0;
+                    rr = top - L + 1;
+                    while (rr <= top) { cc = cc + this.PickRank(p, rr, 2, outIds, cc); rr = rr + 1; }
+                    return cc;
+                }
+                top = top + 1;
+            }
+        }
+        // bomb / rocket fallback
+        if (allowBomb) {
+            if (b.type != 13 && b.type != 14) {
+                int r = 3;
+                while (r <= 15) { if (cnt[r] >= 4) { return this.PickRank(p, r, 4, outIds, 0); } r = r + 1; }
+            } else if (b.type == 13) {
+                int r = b.main + 1;
+                while (r <= 15) { if (cnt[r] >= 4) { return this.PickRank(p, r, 4, outIds, 0); } r = r + 1; }
+            }
+            if (cnt[16] == 1 && cnt[17] == 1) {
+                this.PickRank(p, 16, 1, outIds, 0);
+                this.PickRank(p, 17, 1, outIds, 1);
+                return 2;
+            }
+        }
+        return 0;
+    }
+
+    void ApplyPlay(int p, int[] ids, int k, int now) {
+        int[] cnt = new int[18];
+        int i = 0;
+        while (i < 18) { cnt[i] = 0; i = i + 1; }
+        i = 0;
+        while (i < k) { int rk = Rules.Rank(ids[i]); cnt[rk] = cnt[rk] + 1; i = i + 1; }
+        Combo c = Rules.Classify(cnt, k);
+        this.lastCombo = c;
+        this.lastPlayer = p;
+        this.lastOwner = p;
+        this.lastN = k;
+        i = 0;
+        while (i < k) { this.lastCards[i] = ids[i]; i = i + 1; }
+        this.RemoveCards(p, ids, k);
+        if (c.type == 13) { this.talk.SayExact(3, "BOMB!", now, 2000); }
+        if (c.type == 14) { this.talk.SayExact(3, "ROCKET!", now, 2000); }
+        if (this.hn[p] == 0) { this.EndGame(p, now); return; }
+        this.AdvanceTurn(now);
+    }
+
+    void PassTurn(int p, int now) {
+        this.AdvanceTurn(now);
+    }
+
+    void AdvanceTurn(int now) {
+        int nxt = (this.turn + 1) % 3;
+        // if the two others have passed back to lastPlayer, they lead free
+        if (nxt == this.lastPlayer) { this.lastCombo.type = 0; this.lastN = 0; }
+        this.turn = nxt;
+        if (this.phase != 1) { return; }
+        if (this.turn != 0) { this.botAt = now + 650; this.botPending = true; }
+    }
+
+    void BotTurn(int now) {
+        this.botPending = false;
+        int p = this.turn;
+        bool lead = (this.lastCombo.type == 0 || this.lastPlayer == p);
+        int[] ids = new int[21];
+        bool allowBomb = false;
+        // use bombs if an opponent is close to winning, or by difficulty
+        int minOpp = 99;
+        int q = 0;
+        while (q < 3) {
+            if (q != p) {
+                bool sameTeam = (this.landlord == p && this.landlord == q);
+                bool oppTeam = false;
+                if (this.landlord == p) { oppTeam = (q != this.landlord); }
+                else { oppTeam = (q == this.landlord); }
+                if (oppTeam && this.hn[q] < minOpp) { minOpp = this.hn[q]; }
+            }
+            q = q + 1;
+        }
+        if (minOpp <= 2) { allowBomb = true; }
+        if (this.level >= 2 && minOpp <= 4) { allowBomb = true; }
+        int k = this.FindPlay(p, lead, allowBomb, ids);
+        if (k == 0) { this.PassTurn(p, now); return; }
+        this.ApplyPlay(p, ids, k, now);
+    }
+
+    // ----- human input -------------------------------------------------------
+
+    int SelectedIds(int[] outIds) {
+        int k = 0;
+        int i = 0;
+        while (i < this.hn[0]) { if (this.sel[i]) { outIds[k] = this.hands[i]; k = k + 1; } i = i + 1; }
+        return k;
+    }
+
+    bool CanPlaySelection() {
+        int[] ids = new int[21];
+        int k = this.SelectedIds(ids);
+        if (k == 0) { return false; }
+        int[] cnt = new int[18];
+        int i = 0;
+        while (i < k) { cnt[Rules.Rank(ids[i])] = cnt[Rules.Rank(ids[i])] + 1; i = i + 1; }
+        Combo c = Rules.Classify(cnt, k);
+        if (c.type == 0) { return false; }
+        bool lead = (this.lastCombo.type == 0 || this.lastPlayer == 0);
+        if (lead) { return true; }
+        return Rules.Beats(c, this.lastCombo);
+    }
+
+    void HumanPlay(int now) {
+        if (this.turn != 0 || this.phase != 1) { return; }
+        if (!this.CanPlaySelection()) { return; }
+        int[] ids = new int[21];
+        int k = this.SelectedIds(ids);
+        int i = 0;
+        while (i < 21) { this.sel[i] = false; i = i + 1; }
+        this.ApplyPlay(0, ids, k, now);
+    }
+
+    void HumanPass(int now) {
+        if (this.turn != 0 || this.phase != 1) { return; }
+        if (this.lastCombo.type == 0 || this.lastPlayer == 0) { return; }   // cannot pass on a free lead
+        int i = 0;
+        while (i < 21) { this.sel[i] = false; i = i + 1; }
+        this.PassTurn(0, now);
+    }
+
+    void HumanHint(int now) {
+        if (this.turn != 0 || this.phase != 1) { return; }
+        bool lead = (this.lastCombo.type == 0 || this.lastPlayer == 0);
+        int[] ids = new int[21];
+        int k = this.FindPlay(0, lead, true, ids);
+        int i = 0;
+        while (i < 21) { this.sel[i] = false; i = i + 1; }
+        if (k == 0) { return; }
+        // mark matching positions
+        i = 0;
+        while (i < this.hn[0]) {
+            int card = this.hands[i];
+            int j = 0;
+            while (j < k) { if (ids[j] == card) { this.sel[i] = true; ids[j] = -1; j = k; } j = j + 1; }
+            i = i + 1;
+        }
+    }
+
+    void EndGame(int p, int now) {
+        this.phase = 2;
+        this.botPending = false;
+        bool humanIsLandlord = (this.landlord == 0);
+        bool landlordWon = (p == this.landlord);
+        bool humanWon = false;
+        if (humanIsLandlord) { humanWon = landlordWon; }
+        else { humanWon = !landlordWon; }
+        this.winner = 2;
+        if (humanWon) { this.winner = 1; }
+        this.prof.games = this.prof.games + 1;
+        int delta = 0;
+        int base2 = 30;
+        if (this.landlord == 0) { base2 = 45; }
+        if (humanWon) {
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.best) { this.prof.best = this.prof.streak; }
+            if (this.landlord == 0) { this.prof.landlordWins = this.prof.landlordWins + 1; }
+            delta = base2;
+            this.prof.score = this.prof.score + delta;
+            this.talk.SayExact(3, "You win! +" + delta, now, 4000);
+        } else {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            delta = 25;
+            this.prof.score = this.prof.score - delta;
+            if (this.prof.score < 100) { this.prof.score = 100; }
+            delta = -delta;
+            this.talk.SayExact(1, "You lose. Rematch?", now, 4000);
+        }
+        this.scoreDelta = delta;
+        this.prof.Save();
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawCard(int x, int y, int card, bool faceUp, bool sel) {
+        int w = 78; int h = 116;
+        int yy = y;
+        if (sel) { yy = y - 22; }
+        Draw.RoundRectFill(this.r, x + 3, yy + 5, w, h, 10, 6, 8, 12, 110);
+        if (!faceUp) {
+            Draw.RoundRectFill(this.r, x, yy, w, h, 10, 40, 60, 120, 255);
+            Draw.RoundRectFill(this.r, x + 6, yy + 6, w - 12, h - 12, 7, 60, 90, 170, 255);
+            Draw.RingRect(this.r, x + 6, yy + 6, w - 12, h - 12, 2, 130, 160, 230, 255);
+            return;
+        }
+        Draw.RoundRectFill(this.r, x, yy, w, h, 10, 248, 246, 240, 255);
+        Draw.RingRect(this.r, x, yy, w, h, 2, 200, 200, 200, 255);
+        int cr = 40; int cg = 44; int cb = 52;
+        if (Rules.IsRed(card)) { cr = 200; cg = 50; cb = 55; }
+        int rank = Rules.Rank(card);
+        Text.Draw(this.r, Rules.RankStr(rank), x + 6, yy + 6, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, Rules.SuitStr(card), x + 6, yy + 28, 1, cr, cg, cb, 255);
+        if (rank >= 16) {
+            Text.DrawCentered(this.r, "JKR", x + w / 2, yy + h / 2 - 6, 1, cr, cg, cb, 255);
+        } else {
+            Text.DrawCentered(this.r, Rules.SuitStr(card), x + w / 2, yy + h / 2 - 12, 3, cr, cg, cb, 255);
+        }
+    }
+
+    void DrawCenterCombo(int now) {
+        if (this.lastN <= 0 || this.lastOwner < 0) { return; }
+        int total = this.lastN;
+        int sp = 44;
+        if (total * sp > 700) { sp = 700 / total; }
+        int startX = 640 - (total * sp) / 2;
+        string who = "AI " + this.lastOwner;
+        if (this.lastOwner == 0) { who = "YOU"; }
+        Text.DrawCentered(this.r, who + " PLAYED", 640, 330, 2, 200, 210, 225, 255);
+        int i = 0;
+        while (i < total) {
+            this.DrawCard(startX + i * sp, 360, this.lastCards[i], true, false);
+            i = i + 1;
+        }
+    }
+
+    int CardHitX(int i, int n, int startX, int sp) { return startX + i * sp; }
+
+    void DrawHumanHand(int now) {
+        int n = this.hn[0];
+        if (n <= 0) { return; }
+        int sp = 62;
+        int avail = 1000;
+        if (n * sp > avail) { sp = avail / n; }
+        int startX = 640 - (n * sp + 16) / 2;
+        int y = 640;
+        int i = 0;
+        while (i < n) {
+            this.DrawCard(startX + i * sp, y, this.hands[i], true, this.sel[i]);
+            i = i + 1;
+        }
+    }
+
+    void DrawBot(int seat, int x, int y) {
+        Text.Draw(this.r, "AI " + seat, x, y, 2, 210, 220, 235, 255);
+        string tag = "FARMER";
+        if (this.landlord == seat) { tag = "LANDLORD"; }
+        int tr = 130; int tg = 200; int tb = 150;
+        if (this.landlord == seat) { tr = 250; tg = 200; tb = 90; }
+        Text.Draw(this.r, tag, x, y + 24, 1, tr, tg, tb, 255);
+        Text.Draw(this.r, "" + this.hn[seat] + " cards", x, y + 42, 2, 200, 210, 225, 255);
+        // fanned backs
+        int i = 0;
+        int shown = this.hn[seat];
+        if (shown > 12) { shown = 12; }
+        while (i < shown) {
+            Draw.RoundRectFill(this.r, x + i * 12, y + 70, 40, 58, 6, 40, 60, 120, 255);
+            Draw.RingRect(this.r, x + i * 12, y + 70, 40, 58, 1, 120, 150, 220, 255);
+            i = i + 1;
+        }
+    }
+
+    void DrawTalk(int px, int py, int w, int now) {
+        string msg = this.talk.Current(now);
+        if (msg.Length == 0) { return; }
+        int kind = this.talk.Kind();
+        int cr = 90; int cg = 150; int cb = 220;
+        if (kind == 0) { cr = 90; cg = 200; cb = 130; }
+        if (kind == 1) { cr = 230; cg = 130; cb = 90; }
+        if (kind == 3) { cr = 250; cg = 200; cb = 70; }
+        this.r.SetColor(28, 32, 42, 235);
+        this.r.FillRect(px, py, w, 44);
+        Draw.RingRect(this.r, px, py, w, 44, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, msg, px + 12, py + 14, 2, cr, cg, cb, 255);
+    }
+
+    void DrawTable(int now) {
+        this.host.Begin(18, 40, 34);
+        this.r.SetColor(22, 78, 58, 255);
+        this.r.FillRect(24, 24, 1232, 752);
+        Draw.RingRect(this.r, 24, 24, 1232, 752, 4, 190, 160, 90, 255);
+
+        this.DrawBot(1, 60, 70);
+        this.DrawBot(2, 1040, 70);
+
+        // human tag
+        string htag = "FARMER";
+        int hr = 130; int hg = 200; int hb = 150;
+        if (this.landlord == 0) { htag = "LANDLORD"; hr = 250; hg = 200; hb = 90; }
+        Text.Draw(this.r, "YOU  " + htag, 60, 560, 2, hr, hg, hb, 255);
+        Text.Draw(this.r, "SCORE " + this.prof.score + "  (" + this.prof.TierName() + ")", 60, 586, 2, 255, 210, 90, 255);
+        Text.Draw(this.r, "STREAK " + this.prof.streak + "   W" + this.prof.wins + " L" + this.prof.losses, 60, 606, 1, 180, 190, 210, 255);
+
+        this.DrawCenterCombo(now);
+        this.DrawHumanHand(now);
+        this.DrawTalk(430, 250, 420, now);
+
+        if (this.phase == 0) {
+            Text.DrawCentered(this.r, "BID FOR THE LANDLORD", 640, 200, 3, 240, 220, 130, 255);
+            Ui.Button(this.r, this.mouseX, this.mouseY, 500, 250, 130, 56, "CALL", 2, 1);
+            Ui.Button(this.r, this.mouseX, this.mouseY, 650, 250, 130, 56, "PASS", 2, 0);
+        } else if (this.phase == 1) {
+            if (this.turn == 0) {
+                int pk = 0;
+                if (this.CanPlaySelection()) { pk = 1; }
+                Ui.Button(this.r, this.mouseX, this.mouseY, 470, 590, 130, 50, "PLAY", 2, pk);
+                bool canPass = !(this.lastCombo.type == 0 || this.lastPlayer == 0);
+                int passk = 0;
+                if (canPass) { passk = 0; } else { passk = 3; }
+                Ui.Button(this.r, this.mouseX, this.mouseY, 610, 590, 130, 50, "PASS", 2, passk);
+                Ui.Button(this.r, this.mouseX, this.mouseY, 750, 590, 130, 50, "HINT", 2, 1);
+            } else {
+                Text.DrawCentered(this.r, "AI " + this.turn + " is thinking...", 640, 600, 2, 180, 190, 210, 255);
+            }
+        }
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 1090, 700, 140, 48, "MENU (ESC)", 2, 0);
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/doudizhu/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(16, 34, 28);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+
+        Text.DrawCenteredShadow(this.r, "DOU DIZHU", 640, 78, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "FIGHT THE LANDLORD", 640, 184, 3, 240, 208, 130, 3);
+
+        Ui.Panel(this.r, 320, 260, 640, 320, 20, 24, 34, 214);
+        Text.DrawCenteredShadow(this.r, "AI STRENGTH", 640, 286, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 4) {
+            string nm = "EASY";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            if (i == 3) { nm = "EXPERT"; }
+            int kind = 0;
+            if (this.level == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 350 + i * 152, 320, 136, 54, nm, 2, kind);
+            i = i + 1;
+        }
+        Ui.Panel(this.r, 350, 396, 580, 150, 14, 18, 26, 200);
+        Text.Draw(this.r, "SCORE", 374, 414, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.TierName() + "  " + this.prof.score, 374, 436, 4, 255, 210, 90, 2);
+        Text.Draw(this.r, "BEST STREAK  " + this.prof.best, 374, 490, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.wins + "W - " + this.prof.losses + "L", 700, 436, 3, 205, 214, 232, 2);
+        Text.Draw(this.r, "LANDLORD WINS  " + this.prof.landlordWins, 700, 490, 2, 150, 160, 180, 255);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "Empty your hand first.   ENTER play   F11 fullscreen", 640, 736, 2, 176, 184, 200, 2);
+
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawTable(now);
+        this.r.SetColor(0, 0, 0, 175);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 240; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        string title = "YOU WIN!";
+        int tr = 90; int tg = 210; int tb = 130;
+        if (this.winner == 2) { title = "YOU LOSE"; tr = 230; tg = 120; tb = 90; }
+        Text.DrawCentered(this.r, title, 640, by + 40, 7, tr, tg, tb, 255);
+        string ds = "SCORE " + this.scoreDelta;
+        if (this.scoreDelta > 0) { ds = "SCORE +" + this.scoreDelta; }
+        Text.DrawCentered(this.r, ds, 640, by + 120, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, this.prof.TierName() + "  " + this.prof.score + "    STREAK " + this.prof.streak, 640, by + 168, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 210, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 210, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } }
+        if (this.scene == 0) {
+            if (sc == 30) { this.level = 0; }
+            if (sc == 31) { this.level = 1; }
+            if (sc == 32) { this.level = 2; }
+            if (sc == 33) { this.level = 3; }
+            if (sc == 40 || sc == 44) { this.Deal(now); }
+        } else if (this.scene == 1) {
+            if (this.phase == 1 && this.turn == 0) {
+                if (sc == 44) { this.HumanPlay(now); }     // space
+                if (sc == 40) { this.HumanPlay(now); }     // enter
+                if (sc == 20) { this.HumanPass(now); }     // Q pass
+                if (sc == 11) { this.HumanHint(now); }     // H hint
+            }
+            if (this.phase == 2 && (sc == 40 || sc == 44)) { this.Deal(now); }
+        }
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 4) { if (Draw.PointIn(cx, cy, 350 + i * 152, 320, 136, 54)) { this.level = i; } i = i + 1; }
+            if (Draw.PointIn(cx, cy, 470, 620, 340, 74)) { this.Deal(now); }
+            return;
+        }
+        if (this.scene == 1) {
+            if (Draw.PointIn(cx, cy, 1090, 700, 140, 48)) { this.scene = 0; return; }
+            if (this.phase == 0) {
+                if (Draw.PointIn(cx, cy, 500, 250, 130, 56)) { this.HumanBid(true, now); }
+                if (Draw.PointIn(cx, cy, 650, 250, 130, 56)) { this.HumanBid(false, now); }
+                return;
+            }
+            if (this.phase == 1 && this.turn == 0) {
+                if (Draw.PointIn(cx, cy, 470, 590, 130, 50)) { this.HumanPlay(now); return; }
+                if (Draw.PointIn(cx, cy, 610, 590, 130, 50)) { this.HumanPass(now); return; }
+                if (Draw.PointIn(cx, cy, 750, 590, 130, 50)) { this.HumanHint(now); return; }
+                // card selection
+                int n = this.hn[0];
+                int sp = 62;
+                int avail = 1000;
+                if (n * sp > avail) { sp = avail / n; }
+                int startX = 640 - (n * sp + 16) / 2;
+                int y = 640;
+                int hit = -1;
+                int i = n - 1;
+                while (i >= 0) {
+                    int x = startX + i * sp;
+                    int wCard = sp;
+                    if (i == n - 1) { wCard = 78; }
+                    int yy = y;
+                    if (this.sel[i]) { yy = y - 22; }
+                    if (cx >= x && cx < x + wCard && cy >= yy && cy < yy + 116) { hit = i; i = -1; }
+                    i = i - 1;
+                }
+                if (hit >= 0) { this.sel[hit] = !this.sel[hit]; }
+                return;
+            }
+            return;
+        }
+    }
+
+    void Tick(int now) {
+        if (this.phase == 1 && this.botPending && this.turn != 0 && now >= this.botAt) {
+            this.BotTurn(now);
+        }
+        if (this.demo) {
+            if (this.scene == 1 && this.phase == 0 && now >= this.demoAt) {
+                // human auto-bids based on hand
+                if (this.HandScore(0) >= 12) { this.HumanBid(true, now); } else { this.HumanBid(false, now); }
+                this.demoAt = now + 800;
+            } else if (this.scene == 1 && this.phase == 1 && this.turn == 0 && now >= this.demoAt) {
+                bool lead = (this.lastCombo.type == 0 || this.lastPlayer == 0);
+                int[] ids = new int[21];
+                int k = this.FindPlay(0, lead, true, ids);
+                if (k == 0) { this.HumanPass(now); } else { this.ApplyPlay(0, ids, k, now); }
+                this.demoAt = now + 700;
+            } else if (this.scene == 1 && this.phase == 2 && now >= this.demoAt) {
+                this.Deal(now); this.demoAt = now + 900;
+            }
+        }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.phase == 2) { this.DrawOver(now); }
+        else { this.DrawTable(now); }
+    }
+}
+
+class DdzApp {
+    static void Main() {
+        Host h = Host.Create("Dou Dizhu - Fight the Landlord", 1280, 800);
+        DdzGame g = DdzGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) {
+                        int sc = SdlEvent.Scancode();
+                        if (sc == 68) { h.ToggleFullscreen(); }
+                        else { g.OnKey(sc, now); }
+                    }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}
