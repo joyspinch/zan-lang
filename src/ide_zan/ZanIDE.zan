@@ -186,23 +186,42 @@ class ZanIDE {
     /// The command *order* is a stable contract — dispatch is by index (rc==N),
     /// never by label — so translating labels is display-only.
     static List<RibbonCmd> BuildRibbon() {
+        // Grouped by workflow: file ops | start page | run & debug |
+        // design & project | app. Dispatch uses RibbonAction(), never the
+        // position, so this order can change freely.
         List<RibbonCmd> cmds = new List<RibbonCmd>();
         cmds.Add(RibbonCmd.Create("plus", ZanIDE.T("Project", "项目")));
-        cmds.Add(RibbonCmd.Group("file", ZanIDE.T("New", "新建")));
+        cmds.Add(RibbonCmd.Create("file", ZanIDE.T("New", "新建")));
         cmds.Add(RibbonCmd.Create("folder", ZanIDE.T("Open", "打开")));
-        cmds.Add(RibbonCmd.Group("download", ZanIDE.T("Save", "保存")));
-        cmds.Add(RibbonCmd.Create("arrow-right", ZanIDE.T("Run", "运行")));
-        cmds.Add(RibbonCmd.Create("refresh", ZanIDE.T("Build", "构建")));
-        cmds.Add(RibbonCmd.Create("upload", ZanIDE.T("Publish", "发布")));
+        cmds.Add(RibbonCmd.Create("save", ZanIDE.T("Save", "保存")));
+        cmds.Add(RibbonCmd.Group("home", ZanIDE.T("Start", "开始")));
+        cmds.Add(RibbonCmd.Group("play", ZanIDE.T("Run", "运行")));
         cmds.Add(RibbonCmd.Create("bug", ZanIDE.T("Debug", "调试")));
-        cmds.Add(RibbonCmd.Group("copy", ZanIDE.T("Template", "模板")));
-        cmds.Add(RibbonCmd.Create("layout", ZanIDE.T("Designer", "设计器")));
-        cmds.Add(RibbonCmd.Create("home", ZanIDE.T("Start", "开始")));
+        cmds.Add(RibbonCmd.Create("check", ZanIDE.T("Build", "构建")));
+        cmds.Add(RibbonCmd.Create("upload", ZanIDE.T("Publish", "发布")));
         cmds.Add(RibbonCmd.Create("refresh", ZanIDE.T("Hot", "热重载")));
+        cmds.Add(RibbonCmd.Group("layout", ZanIDE.T("Designer", "设计器")));
+        cmds.Add(RibbonCmd.Create("copy", ZanIDE.T("Template", "模板")));
         cmds.Add(RibbonCmd.Create("grid", ZanIDE.T("Config", "配置")));
-        cmds.Add(RibbonCmd.Create("settings", ZanIDE.T("Settings", "设置")));
+        cmds.Add(RibbonCmd.Group("settings", ZanIDE.T("Settings", "设置")));
         cmds.Add(RibbonCmd.Create("info", ZanIDE.T("Help", "帮助")));
         return cmds;
+    }
+
+    /// Maps a ribbon position (from Ribbon.Render) to its stable action id.
+    /// Action ids: 0 Project, 1 New, 2 Open, 3 Save, 4 Run, 5 Build,
+    /// 6 Publish, 7 Debug, 8 Template, 9 Designer, 10 Start, 11 Hot,
+    /// 12 Config, 13 Settings, 14 Help.
+    static int RibbonAction(int pos) {
+        if (pos == 4) { return 10; }
+        if (pos == 5) { return 4; }
+        if (pos == 6) { return 7; }
+        if (pos == 7) { return 5; }
+        if (pos == 8) { return 6; }
+        if (pos == 9) { return 11; }
+        if (pos == 10) { return 9; }
+        if (pos == 11) { return 8; }
+        return pos;
     }
 
     // ---- editor appearance (font + syntax color themes) ----
@@ -890,6 +909,16 @@ class ZanIDE {
         // Examples panel is a collapsible tree (categories -> sample leaves).
         List<TreeNode> exTree = ZanIDE.BuildExampleTree();
         SignalInt exSel = SignalInt.Create(-1);
+
+        // Per-section filter boxes: each sidebar tree can be narrowed by a
+        // case-insensitive substring; the displayed (possibly filtered) lists
+        // are recomputed every frame so click handlers index into them.
+        Input treeFilter = Input.Bind(SignalString.Create(""), ZanIDE.T("Filter...", "筛选..."));
+        Input structFilter = Input.Bind(SignalString.Create(""), ZanIDE.T("Filter...", "筛选..."));
+        Input exFilter = Input.Bind(SignalString.Create(""), ZanIDE.T("Filter...", "筛选..."));
+        List<TreeNode> treeShow = new List<TreeNode>();
+        List<TreeNode> structShow = new List<TreeNode>();
+        List<TreeNode> exShow = new List<TreeNode>();
         int lastExSel = -1;
         SignalInt exTreeScrollY = SignalInt.Create(0);
 
@@ -905,6 +934,7 @@ class ZanIDE {
         int lastPresent = 0;
         while (app.isRunning) {
             FilePicker.lang = ZanIDE.uiLang;
+            CodeEditor.lang = ZanIDE.uiLang;
             pathPicker.ApplySkin(app.ThemeMenuIndex());
             // One shared event pump drives BOTH the main window and any open
             // wizard child window. Poll (to keep animating) when either needs a
@@ -1165,14 +1195,18 @@ class ZanIDE {
                 if (atE >= 0 && atE < tabPaths.Count) { apE = tabPaths[atE]; }
                 bool activeIsFile = apE != "" && apE != "@start";
                 bool haveProj = File.Exists(root + "/zan.proj");
-                cmds[4].SetEnabled(activeIsFile);
-                cmds[5].SetEnabled(activeIsFile);
-                cmds[6].SetEnabled(haveProj);
-                cmds[7].SetEnabled(activeIsFile);
-                cmds[9].SetEnabled(activeIsFile);
-                cmds[11].SetEnabled(haveProj);
+                // Run/Debug/Build follow the active file, or fall back to the
+                // project entry (so a designer/start tab can still run the app).
+                bool canRun = activeIsFile || haveProj;
+                cmds[5].SetEnabled(canRun);
+                cmds[6].SetEnabled(canRun);
+                cmds[7].SetEnabled(canRun);
+                cmds[8].SetEnabled(haveProj);
+                cmds[9].SetEnabled(haveProj);
+                cmds[10].SetEnabled(activeIsFile);
                 cmds[12].SetEnabled(haveProj);
-                int rc = Ribbon.Render(app, 0, top, W, ribbonH, cmds);
+                int rc = ZanIDE.RibbonAction(
+                    Ribbon.Render(app, 0, top, W, ribbonH, cmds));
                 if (rc == 0) {
                     // Rebuild the catalog (built-ins + custom templates on disk).
                     tpls = ZanIDE.BuildCatalog(root);
@@ -1372,8 +1406,12 @@ class ZanIDE {
                 int structH = (tr.height * 32) / 100;
                 int exampleH = tr.height - explorerH - structH;
 
-                // Section 1: Explorer
+                // Section 1: Explorer (header + right-aligned filter box)
                 c.DrawText(tr.x + t.paddingMedium, tr.y + t.paddingSmall, ZanIDE.T("EXPLORER", "资源管理器"), t.textTertiary, t.fontSizeSmall);
+                int filtW = (tr.width * 45) / 100;
+                int filtH = sectionH - app.Scale(4);
+                treeFilter.Render(app, tr.x + tr.width - filtW - app.Scale(4), tr.y + app.Scale(2), filtW, filtH);
+                treeShow = ZanIDE.FilterNodes(tree, treeFilter.GetText());
                 Rect treeArea = Rect.Create(tr.x, tr.y + sectionH, tr.width, explorerH - sectionH);
                 // Wheel-scroll the tree when the pointer is over it. Scroll in
                 // whole-row steps so rows always align to the region top (the
@@ -1381,7 +1419,7 @@ class ZanIDE {
                 int treeRowH = TreeView.RowHeight(app);
                 int treeVis = treeArea.height / treeRowH;
                 if (treeVis < 1) { treeVis = 1; }
-                int treeContentH = TreeView.ContentHeight(app, tree);
+                int treeContentH = TreeView.ContentHeight(app, treeShow);
                 int treeMaxScroll = treeContentH - treeVis * treeRowH;
                 if (treeMaxScroll < 0) { treeMaxScroll = 0; }
                 int tScroll = treeScrollY.Get();
@@ -1400,7 +1438,7 @@ class ZanIDE {
                 if (tScroll > treeMaxScroll) { tScroll = treeMaxScroll; }
                 if (tScroll < 0) { tScroll = 0; }
                 treeScrollY.Set(tScroll);
-                int trRight = TreeView.Render(app, treeArea, tree, treeSel, tScroll);
+                int trRight = TreeView.Render(app, treeArea, treeShow, treeSel, tScroll);
                 if (trRight >= 0) {
                     ctxKind = 1; ctxX = app.mouseX; ctxY = app.mouseY;
                     ctxTarget = trRight; app.RequestRedraw();
@@ -1413,6 +1451,7 @@ class ZanIDE {
                 string stTitle = ZanIDE.T("STRUCTURE", "结构");
                 if (designerMode) { stTitle = ZanIDE.T("COMPONENTS", "组件"); }
                 c.DrawText(tr.x + t.paddingMedium, stY + t.paddingSmall, stTitle, t.textTertiary, t.fontSizeSmall);
+                structFilter.Render(app, tr.x + tr.width - filtW - app.Scale(4), stY + app.Scale(2), filtW, filtH);
                 // Rebuild the tree only when the active buffer/form changes so
                 // typing and clicking stay cheap. The signature prefix (C/F)
                 // also flips the panel between code outline and components.
@@ -1437,11 +1476,12 @@ class ZanIDE {
                     structSel.Set(0 - 1);
                     lastStructSel = 0 - 1;
                 }
+                structShow = ZanIDE.FilterNodes(structTree, structFilter.GetText());
                 Rect stArea = Rect.Create(tr.x, stY + sectionH, tr.width, structH - sectionH);
                 int stRowH = TreeView.RowHeight(app);
                 int stVis = stArea.height / stRowH;
                 if (stVis < 1) { stVis = 1; }
-                int stContentH = TreeView.ContentHeight(app, structTree);
+                int stContentH = TreeView.ContentHeight(app, structShow);
                 int stMaxScroll = stContentH - stVis * stRowH;
                 if (stMaxScroll < 0) { stMaxScroll = 0; }
                 int stSc = structScrollY.Get();
@@ -1459,23 +1499,23 @@ class ZanIDE {
                 if (stSc > stMaxScroll) { stSc = stMaxScroll; }
                 if (stSc < 0) { stSc = 0; }
                 structScrollY.Set(stSc);
-                if (structTree.Count == 0) {
+                if (structShow.Count == 0) {
                     c.DrawText(stArea.x + t.paddingMedium, stArea.y + t.paddingSmall,
                         ZanIDE.T("No symbols", "无符号"), t.textTertiary, t.fontSizeSmall);
                 } else {
-                    TreeView.Render(app, stArea, structTree, structSel, stSc);
+                    TreeView.Render(app, stArea, structShow, structSel, stSc);
                 }
                 // Clicking a node navigates: an outline symbol jumps the editor
                 // to its line; a component selects that control in the designer.
                 int stSelV = structSel.Get();
                 if (stSelV != lastStructSel) {
                     lastStructSel = stSelV;
-                    if (stSelV >= 0 && stSelV < structTree.Count) {
+                    if (stSelV >= 0 && stSelV < structShow.Count) {
                         if (designerMode) {
-                            int ci = ZanIDE.OutlineLineOf(structTree[stSelV].path);
+                            int ci = ZanIDE.OutlineLineOf(structShow[stSelV].path);
                             if (ci >= 0) { dSel.Set(ci); app.RequestRedraw(); }
                         } else {
-                            int gln = ZanIDE.OutlineLineOf(structTree[stSelV].path);
+                            int gln = ZanIDE.OutlineLineOf(structShow[stSelV].path);
                             if (gln >= 0) {
                                 pendingGotoLine = gln; pendingGotoCol = 0;
                                 app.RequestRedraw();
@@ -1488,11 +1528,13 @@ class ZanIDE {
                 int exY = tr.y + explorerH + structH;
                 c.FillRect(tr.x, exY, tr.width, 1, t.divider);
                 c.DrawText(tr.x + t.paddingMedium, exY + t.paddingSmall, ZanIDE.T("EXAMPLES", "示例"), t.textTertiary, t.fontSizeSmall);
+                exFilter.Render(app, tr.x + tr.width - filtW - app.Scale(4), exY + app.Scale(2), filtW, filtH);
+                exShow = ZanIDE.FilterNodes(exTree, exFilter.GetText());
                 Rect exArea = Rect.Create(tr.x, exY + sectionH, tr.width, exampleH - sectionH);
                 int exRowH = TreeView.RowHeight(app);
                 int exVis = exArea.height / exRowH;
                 if (exVis < 1) { exVis = 1; }
-                int exContentH = TreeView.ContentHeight(app, exTree);
+                int exContentH = TreeView.ContentHeight(app, exShow);
                 int exMaxScroll = exContentH - exVis * exRowH;
                 if (exMaxScroll < 0) { exMaxScroll = 0; }
                 int exSc = exTreeScrollY.Get();
@@ -1511,13 +1553,13 @@ class ZanIDE {
                 if (exSc > exMaxScroll) { exSc = exMaxScroll; }
                 if (exSc < 0) { exSc = 0; }
                 exTreeScrollY.Set(exSc);
-                TreeView.Render(app, exArea, exTree, exSel, exSc);
+                TreeView.Render(app, exArea, exShow, exSel, exSc);
 
                 int sel = treeSel.Get();
                 if (sel != lastTreeSel) {
                     lastTreeSel = sel;
-                    if (ctxKind == 0 && sel >= 0 && sel < tree.Count) {
-                        TreeNode node = tree[sel];
+                    if (ctxKind == 0 && sel >= 0 && sel < treeShow.Count) {
+                        TreeNode node = treeShow[sel];
                         if (!node.isDir) {
                             ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, node.path, node.label);
                             log.Add("> Opened " + node.path + ".");
@@ -1532,8 +1574,8 @@ class ZanIDE {
                 int exSelV = exSel.Get();
                 if (exSelV != lastExSel) {
                     lastExSel = exSelV;
-                    if (exSelV >= 0 && exSelV < exTree.Count) {
-                        TreeNode en = exTree[exSelV];
+                    if (exSelV >= 0 && exSelV < exShow.Count) {
+                        TreeNode en = exShow[exSelV];
                         if (!en.isDir && ZanIDE.StartsWith(en.path, "@ex:")) {
                             int di = ZanIDE.FindTabByPath(tabPaths, "@docs");
                             if (di >= 0) {
@@ -2270,13 +2312,13 @@ class ZanIDE {
                             } else if (chosen == 1) {
                                 rescan = true;
                             } else if (chosen == 3) {
-                                if (ctxTarget >= 0 && ctxTarget < tree.Count) {
-                                    Clipboard.SetText(tree[ctxTarget].path);
-                                    log.Add("> Copied path: " + tree[ctxTarget].path);
+                                if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
+                                    Clipboard.SetText(treeShow[ctxTarget].path);
+                                    log.Add("> Copied path: " + treeShow[ctxTarget].path);
                                 }
                             } else if (chosen == 4) {
-                                if (ctxTarget >= 0 && ctxTarget < tree.Count) {
-                                    ZanIDE.RevealInFileManager(tree[ctxTarget].path);
+                                if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
+                                    ZanIDE.RevealInFileManager(treeShow[ctxTarget].path);
                                 }
                             }
                         } else if (ctxKind == 3) {
@@ -3082,12 +3124,51 @@ class ZanIDE {
 
     // ---- toolchain ----
 
+    /// Rows whose label contains the filter (case-insensitive substring);
+    /// directories are dropped and matches flattened to depth 0 so every hit
+    /// is visible regardless of collapsed ancestors. An empty filter returns
+    /// the nodes unchanged.
+    static List<TreeNode> FilterNodes(List<TreeNode> nodes, string filter) {
+        if (filter == "") { return nodes; }
+        string f = ZanIDE.ToLowerS(filter);
+        List<TreeNode> outp = new List<TreeNode>();
+        int i = 0;
+        while (i < nodes.Count) {
+            TreeNode n = nodes[i];
+            if (!n.isDir && ZanIDE.Has(ZanIDE.ToLowerS(n.label), f)) {
+                TreeNode m = TreeNode.FileIcon(n.label, 0, n.icon);
+                m.path = n.path;
+                outp.Add(m);
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Resolves the source file Run/Build/Debug/Publish should compile for
+    /// the active tab: a .zform maps to its code-behind (falling back to the
+    /// project entry), and the special @start/@docs/@builder tabs map to the
+    /// project entry when one exists. Returns "" when there is no target.
+    static string RunTarget(string p, string root) {
+        if (p == "@start" || p == "@docs" || p == "@builder") {
+            string entry = ZanIDE.ProjectEntry(root);
+            if (File.Exists(entry)) { return entry; }
+            return "";
+        }
+        if (ZanIDE.IsFormPath(p)) {
+            string cb = ZanIDE.CodeBehindPath(p);
+            if (File.Exists(cb)) { return cb; }
+            return ZanIDE.ProjectEntry(root);
+        }
+        return p;
+    }
+
     static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
         int a = active.Get();
         string activePath = paths[a];
         string p = activePath;
-        if (p == "") { log.Add("> Nothing to build (save the file first)."); return; }
-        if (ZanIDE.IsFormPath(p)) { p = ZanIDE.ProjectEntry(root); }
+        p = ZanIDE.RunTarget(p, root);
+        if (p == "") { log.Add(ZanIDE.T("> Nothing to build (save the file first).", "> 没有可构建的目标（请先保存文件）。")); return; }
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zanbuild.ll";
         string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
@@ -3109,11 +3190,11 @@ class ZanIDE {
         }
         string activePath = paths[a];
         string p = activePath;
-        if (p == "" || p == "@start" || p == "@docs" || p == "@builder") {
-            log.Add("> Nothing to run (open and save a source file first).");
+        p = ZanIDE.RunTarget(p, root);
+        if (p == "") {
+            log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
             return;
         }
-        if (ZanIDE.IsFormPath(p)) { p = ZanIDE.ProjectEntry(root); }
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zanrun.ll";
         string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
@@ -3262,8 +3343,8 @@ class ZanIDE {
         int a = active.Get();
         if (a < 0 || a >= paths.Count) { return; }
         string p = paths[a];
-        if (p == "" || p == "@start") { log.Add("> [Hot] Nothing to run (save the file first)."); return; }
-        if (ZanIDE.IsFormPath(p)) { p = ZanIDE.ProjectEntry(root); }
+        p = ZanIDE.RunTarget(p, root);
+        if (p == "") { log.Add(ZanIDE.T("> [Hot] Nothing to run (save the file first).", "> [热重载] 没有可运行的目标（请先保存文件）。")); return; }
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zanhot.ll";
         string exe = bd + "/zanhot_run" + ZanIDE.ExeSuffix();
@@ -4431,12 +4512,12 @@ class ZanIDE {
         int fw = x + w - pad - fx;
         int fy = contentY;
 
-        c.DrawText(fx, fy, "Name", t.textSecondary, t.fontSizeSmall);
+        c.DrawText(fx, fy, ZanIDE.T("Name", "名称"), t.textSecondary, t.fontSizeSmall);
         nameInput.Render(app, fx, fy + app.Scale(20), fw, t.heightMedium);
         int nextY = fy + app.Scale(20) + t.heightMedium + t.paddingMedium;
 
         if (showLoc) {
-            c.DrawText(fx, nextY, "Location", t.textSecondary, t.fontSizeSmall);
+            c.DrawText(fx, nextY, ZanIDE.T("Location", "位置"), t.textSecondary, t.fontSizeSmall);
             locInput.Render(app, fx, nextY + app.Scale(20), fw, t.heightMedium);
             nextY = nextY + app.Scale(20) + t.heightMedium + t.paddingMedium;
         }
@@ -4761,7 +4842,7 @@ class ZanIDE {
         int rowH = app.Scale(20);
         int pad = app.Scale(6);
         if (ePath.Count == 0) {
-            c.DrawText(x + pad, y + pad, "No errors.", 0xFF6A9955, t.fontSizeSmall);
+            c.DrawText(x + pad, y + pad, ZanIDE.T("No errors.", "无错误。"), 0xFF6A9955, t.fontSizeSmall);
             return;
         }
         int i = 0;
@@ -5110,8 +5191,8 @@ class ZanIDE {
         int bg1 = t.bgTertiary;
         if (tab == 1) { bg1 = t.bgPrimary; }
         c.FillRect(orr.x + tabW, orr.y, tabW, tabH, bg1);
-        string elabel = "Errors";
-        if (eLine.Count > 0) { elabel = "Errors (" + Convert.ToString(eLine.Count) + ")"; }
+        string elabel = ZanIDE.T("Errors", "错误");
+        if (eLine.Count > 0) { elabel = ZanIDE.T("Errors (", "错误 (") + Convert.ToString(eLine.Count) + ")"; }
         c.DrawText(orr.x + tabW + app.Scale(8), orr.y + app.Scale(6), elabel, t.textPrimary, t.fontSizeSmall);
         // Toolbar: a substring filter box + Clear, right-aligned in the tab strip.
         Rect fr = ZanIDE.OutFilterRect(app, orr);
@@ -5172,11 +5253,11 @@ class ZanIDE {
         if (a < 0 || a >= tabPaths.Count) { return false; }
         string activePath = tabPaths[a];
         string p = activePath;
-        if (p == "" || p == "@start" || p == "@docs" || p == "@builder") {
-            log.Add("> [Debug] Open a source file first.");
+        p = ZanIDE.RunTarget(p, root);
+        if (p == "") {
+            log.Add(ZanIDE.T("> [Debug] Open a source file first.", "> [调试] 请先打开源文件。"));
             return false;
         }
-        if (ZanIDE.IsFormPath(p)) { p = ZanIDE.ProjectEntry(root); }
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zandbg.ll";
         string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
@@ -5697,11 +5778,11 @@ class ZanIDE {
         int colType = app.Scale(100);
         // Header
         c.FillRect(x, y, w, rowH, t.bgSecondary);
-        c.DrawText(x + pad, y + pad, "Name", t.textSecondary, t.fontSizeSmall);
+        c.DrawText(x + pad, y + pad, ZanIDE.T("Name", "名称"), t.textSecondary, t.fontSizeSmall);
         c.FillRect(x + colName - 1, y, 1, rowH, t.borderSecondary);
-        c.DrawText(x + colName + pad, y + pad, "Type", t.textSecondary, t.fontSizeSmall);
+        c.DrawText(x + colName + pad, y + pad, ZanIDE.T("Type", "类型"), t.textSecondary, t.fontSizeSmall);
         c.FillRect(x + colName + colType - 1, y, 1, rowH, t.borderSecondary);
-        c.DrawText(x + colName + colType + pad, y + pad, "Value", t.textSecondary, t.fontSizeSmall);
+        c.DrawText(x + colName + colType + pad, y + pad, ZanIDE.T("Value", "值"), t.textSecondary, t.fontSizeSmall);
         c.FillRect(x, y + rowH, w, 1, t.divider);
         int cy = y + rowH + 1;
         int ri = 0;
