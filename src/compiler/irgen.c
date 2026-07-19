@@ -5418,6 +5418,34 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* str.Contains(sub) -> bool: substring search via strstr. Without
+         * this, the call fell through to the generic fallback and lowered to
+         * constant false for multi-character needles. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *sc = expr->call.callee;
+            zan_istr_t sm = sc->member.name;
+            if (sm.len == 8 && memcmp(sm.str, "Contains", 8) == 0 &&
+                expr->call.args.count == 1 &&
+                is_string_expr(g, sc->member.object, locals)) {
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMValueRef s = emit_expr(g, sc->member.object, locals);
+                LLVMValueRef sub = emit_expr(g, expr->call.args.items[0], locals);
+                LLVMTypeRef strstr_type = LLVMFunctionType(i8ptr,
+                    (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+                LLVMValueRef strstr_fn = LLVMGetNamedFunction(g->mod, "strstr");
+                if (!strstr_fn)
+                    strstr_fn = LLVMAddFunction(g->mod, "strstr", strstr_type);
+                LLVMValueRef ss_args[] = { s, sub };
+                LLVMValueRef hit = LLVMBuildCall2(g->builder, strstr_type,
+                    strstr_fn, ss_args, 2, "ss");
+                LLVMValueRef res = LLVMBuildICmp(g->builder, LLVMIntNE, hit,
+                    LLVMConstPointerNull(i8ptr), "ctn");
+                emit_release_owned_call_temp(g, sc->member.object, s, locals);
+                emit_release_owned_call_temp(g, expr->call.args.items[0], sub, locals);
+                return res;
+            }
+        }
+
         /* Environment.ArgCount() -> number of command-line args (excludes the
          * program name), i.e. argc - 1. */
         if (is_call_to(expr, "Environment", "ArgCount") && expr->call.args.count == 0) {
