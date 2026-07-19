@@ -1,0 +1,680 @@
+// 五子棋 -- a warm wood-and-ink gomoku parlor. You play black against a local
+// AI whose strength you pick (初学 / 棋士 / 棋圣). Stones are glossy with soft
+// shadows on a textured kaya board; the last move glows, placements ripple.
+// Wins earn rank points toward titles (棋童→棋圣), streaks bring cheering
+// toasts, defeats get an encouraging review line. All text uses the smooth
+// TTF atlases. F11 borderless fullscreen, Esc back/exit.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Gomoku;
+
+class GmProfile {
+    int pts;        // rank points
+    int wins;
+    int losses;
+    int streak;
+    int bestStreak;
+
+    static string Path() { return "gomoku_profile.txt"; }
+
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fb) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return GmProfile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fb;
+    }
+    static GmProfile Load() {
+        GmProfile p = new GmProfile();
+        if (!File.Exists(GmProfile.Path())) { return p; }
+        List<string> lines = File.ReadAllLines(GmProfile.Path());
+        p.pts = GmProfile.ReadKey(lines, "pts", 0);
+        p.wins = GmProfile.ReadKey(lines, "wins", 0);
+        p.losses = GmProfile.ReadKey(lines, "losses", 0);
+        p.streak = GmProfile.ReadKey(lines, "streak", 0);
+        p.bestStreak = GmProfile.ReadKey(lines, "bestStreak", 0);
+        return p;
+    }
+    void Save() {
+        string s = "pts=" + this.pts + "\nwins=" + this.wins
+            + "\nlosses=" + this.losses + "\nstreak=" + this.streak
+            + "\nbestStreak=" + this.bestStreak + "\n";
+        File.WriteAllText(GmProfile.Path(), s);
+    }
+    string Title() {
+        if (this.pts >= 400) { return "棋圣"; }
+        if (this.pts >= 240) { return "国手"; }
+        if (this.pts >= 140) { return "棋士"; }
+        if (this.pts >= 60) { return "入段"; }
+        if (this.pts >= 20) { return "棋童"; }
+        return "新手";
+    }
+}
+
+class GmParticle {
+    int x;      // fp 1/256
+    int y;
+    int vx;
+    int vy;
+    int bornAt;
+    int cr;
+    int cg;
+    int cb;
+}
+
+class GmPopup {
+    int x;
+    int y;
+    string text;
+    int bornAt;
+    int cr;
+    int cg;
+    int cb;
+}
+
+class GmGame {
+    Host host;
+    SdlRenderer r;
+    GmProfile prof;
+    Rng rng;
+
+    int[] board;      // 15*15: 0 empty, 1 black (player), 2 white (AI)
+    int scene;        // 0 menu, 1 play, 2 over
+    int diff;         // 0 easy, 1 normal, 2 hard
+    int moves;
+    int lastX;
+    int lastY;
+    int winner;       // 0 none, 1 player, 2 ai, 3 draw
+    int winX0; int winY0; int winX1; int winY1;
+    int aiThinkAt;    // AI answers after a short human-feeling pause
+    bool aiTurn;
+    int mouseX;
+    int mouseY;
+    int toastAt;
+    string toastText;
+    int placedAt;     // ripple animation timestamp
+    List<GmParticle> parts;
+    List<GmPopup> pops;
+    SdlTexture menuBg;
+    SdlTexture titleTex;
+    bool texTried;
+    bool demo;        // self-play showcase for screenshots
+    int demoAt;
+
+    static int N() { return 15; }
+    static int Cell() { return 42; }
+    static int BX() { return 66; }    // board origin (first line)
+    static int BY() { return 66; }
+
+    static GmGame Create(Host h) {
+        GmGame g = new GmGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = GmProfile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 1357924);
+        g.scene = 0;
+        g.diff = 1;
+        g.mouseX = 640;
+        g.mouseY = 360;
+        g.parts = new List<GmParticle>();
+        g.pops = new List<GmPopup>();
+        g.toastAt = -9999;
+        g.demo = File.Exists("gomoku_demo.txt");
+        if (g.demo) { g.diff = 2; g.StartGame(Sdl.Ticks()); }
+        return g;
+    }
+
+    void EnsureTex() {
+        if (this.texTried) { return; }
+        this.texTried = true;
+        this.menuBg = GmGame.LoadTex(this.r, "examples/game/gomoku/assets/menu_bg.png");
+        this.titleTex = GmGame.LoadTex(this.r, "examples/game/gomoku/assets/title.png");
+    }
+    static SdlTexture LoadTex(SdlRenderer r, string path) {
+        string p = Assets.Find(path);
+        if (!File.Exists(p)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, p);
+        if (t == null || !t.IsValid()) { return null; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        return t;
+    }
+
+    // ----- feedback --------------------------------------------------------
+
+    void Toast(string t, int now) { this.toastText = t; this.toastAt = now; }
+    void AddPop(int px, int py, string t, int now, int cr, int cg, int cb) {
+        if (this.pops.Count > 14) { this.pops.RemoveAt(0); }
+        GmPopup p = new GmPopup();
+        p.x = px; p.y = py; p.text = t; p.bornAt = now;
+        p.cr = cr; p.cg = cg; p.cb = cb;
+        this.pops.Add(p);
+    }
+    void Burst(int px, int py, int n, int now, int cr, int cg, int cb) {
+        if (this.parts.Count > 240) { return; }
+        int i = 0;
+        while (i < n) {
+            GmParticle p = new GmParticle();
+            p.x = px * 256; p.y = py * 256;
+            int a = this.rng.Range(0, 16);
+            int spd = 60 + this.rng.Range(0, 160);
+            int ux = 0; int uy = 0;
+            int q = a % 4;
+            if (q == 0) { ux = 256; uy = (a / 4 - 2) * 128; }
+            if (q == 1) { ux = -256; uy = (a / 4 - 2) * 128; }
+            if (q == 2) { uy = 256; ux = (a / 4 - 2) * 128; }
+            if (q == 3) { uy = -256; ux = (a / 4 - 2) * 128; }
+            p.vx = ux * spd / 256;
+            p.vy = uy * spd / 256;
+            p.bornAt = now;
+            p.cr = cr; p.cg = cg; p.cb = cb;
+            this.parts.Add(p);
+            i = i + 1;
+        }
+    }
+
+    // ----- game flow -------------------------------------------------------
+
+    void StartGame(int now) {
+        this.board = new int[GmGame.N() * GmGame.N()];
+        this.moves = 0;
+        this.lastX = -1;
+        this.lastY = -1;
+        this.winner = 0;
+        this.aiTurn = false;
+        this.parts = new List<GmParticle>();
+        this.pops = new List<GmPopup>();
+        this.toastAt = -9999;
+        this.scene = 1;
+        this.Toast("执黑先行，五连制胜", now);
+    }
+
+    int At(int x, int y) {
+        if (x < 0 || y < 0 || x >= GmGame.N() || y >= GmGame.N()) { return -1; }
+        return this.board[y * GmGame.N() + x];
+    }
+
+    // Counts the c-colored run through (x,y) along (dx,dy); records endpoints.
+    bool IsWin(int x, int y, int c) {
+        int d = 0;
+        while (d < 4) {
+            int dx = 1; int dy = 0;
+            if (d == 1) { dx = 0; dy = 1; }
+            if (d == 2) { dx = 1; dy = 1; }
+            if (d == 3) { dx = 1; dy = -1; }
+            int n = 1;
+            int x0 = x; int y0 = y; int x1 = x; int y1 = y;
+            int k = 1;
+            while (this.At(x + dx * k, y + dy * k) == c) { x1 = x + dx * k; y1 = y + dy * k; n = n + 1; k = k + 1; }
+            k = 1;
+            while (this.At(x - dx * k, y - dy * k) == c) { x0 = x - dx * k; y0 = y - dy * k; n = n + 1; k = k + 1; }
+            if (n >= 5) {
+                this.winX0 = x0; this.winY0 = y0; this.winX1 = x1; this.winY1 = y1;
+                return true;
+            }
+            d = d + 1;
+        }
+        return false;
+    }
+
+    void Place(int x, int y, int c, int now) {
+        this.board[y * GmGame.N() + x] = c;
+        this.moves = this.moves + 1;
+        this.lastX = x;
+        this.lastY = y;
+        this.placedAt = now;
+        int sx = GmGame.BX() + x * GmGame.Cell();
+        int sy = GmGame.BY() + y * GmGame.Cell();
+        if (c == 1) { this.Burst(sx, sy, 5, now, 90, 200, 255); }
+        else { this.Burst(sx, sy, 5, now, 255, 210, 140); }
+        if (this.IsWin(x, y, c)) {
+            this.winner = c;
+            this.scene = 2;
+            if (c == 1) {
+                int gain = 10 + this.diff * 10;
+                this.prof.pts = this.prof.pts + gain;
+                this.prof.wins = this.prof.wins + 1;
+                this.prof.streak = this.prof.streak + 1;
+                if (this.prof.streak > this.prof.bestStreak) { this.prof.bestStreak = this.prof.streak; }
+                this.Burst(640, 300, 60, now, 255, 220, 110);
+                if (this.prof.streak >= 3) { this.Toast(this.prof.streak + " 连胜！锐不可当", now); }
+            } else {
+                this.prof.losses = this.prof.losses + 1;
+                this.prof.streak = 0;
+                this.prof.pts = this.prof.pts - 4;
+                if (this.prof.pts < 0) { this.prof.pts = 0; }
+            }
+            this.prof.Save();
+            return;
+        }
+        if (this.moves >= GmGame.N() * GmGame.N()) {
+            this.winner = 3;
+            this.scene = 2;
+            this.prof.Save();
+            return;
+        }
+        if (c == 1) {
+            this.aiTurn = true;
+            this.aiThinkAt = now + 350 + this.rng.Range(0, 450);
+        } else {
+            this.aiTurn = false;
+        }
+    }
+
+    // ----- AI: line-pattern scoring ---------------------------------------
+
+    // Scores placing color c at (x,y): sums pattern values over 4 directions.
+    int ScoreCell(int x, int y, int c) {
+        int total = 0;
+        int d = 0;
+        while (d < 4) {
+            int dx = 1; int dy = 0;
+            if (d == 1) { dx = 0; dy = 1; }
+            if (d == 2) { dx = 1; dy = 1; }
+            if (d == 3) { dx = 1; dy = -1; }
+            int n = 1;
+            int openA = 0; int openB = 0;
+            int k = 1;
+            while (this.At(x + dx * k, y + dy * k) == c) { n = n + 1; k = k + 1; }
+            if (this.At(x + dx * k, y + dy * k) == 0) { openA = 1; }
+            k = 1;
+            while (this.At(x - dx * k, y - dy * k) == c) { n = n + 1; k = k + 1; }
+            if (this.At(x - dx * k, y - dy * k) == 0) { openB = 1; }
+            int open = openA + openB;
+            int v = 0;
+            if (n >= 5) { v = 1000000; }
+            else if (n == 4) { if (open == 2) { v = 120000; } else if (open == 1) { v = 20000; } }
+            else if (n == 3) { if (open == 2) { v = 12000; } else if (open == 1) { v = 900; } }
+            else if (n == 2) { if (open == 2) { v = 650; } else if (open == 1) { v = 80; } }
+            else { if (open == 2) { v = 40; } }
+            total = total + v;
+            d = d + 1;
+        }
+        return total;
+    }
+
+    bool NearStone(int x, int y) {
+        int dy = -2;
+        while (dy <= 2) {
+            int dx = -2;
+            while (dx <= 2) {
+                int v = this.At(x + dx, y + dy);
+                if (v == 1 || v == 2) { return true; }
+                dx = dx + 1;
+            }
+            dy = dy + 1;
+        }
+        return false;
+    }
+
+    void AiMove(int now) {
+        int n = GmGame.N();
+        if (this.moves == 0) { this.Place(n / 2, n / 2, 2, now); return; }
+        // defense weight rises with difficulty; easy adds noise
+        int defNum = 70;
+        if (this.diff == 1) { defNum = 95; }
+        if (this.diff == 2) { defNum = 105; }
+        int bestV = -1;
+        int bestX = -1;
+        int bestY = -1;
+        int y = 0;
+        while (y < n) {
+            int x = 0;
+            while (x < n) {
+                if (this.At(x, y) == 0 && this.NearStone(x, y)) {
+                    int atk = this.ScoreCell(x, y, 2);
+                    int def = this.ScoreCell(x, y, 1);
+                    int v = atk + def * defNum / 100;
+                    if (this.diff == 0) { v = v + this.rng.Range(0, 2600); }
+                    if (this.diff == 1) { v = v + this.rng.Range(0, 220); }
+                    if (v > bestV) { bestV = v; bestX = x; bestY = y; }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        if (bestX < 0) {
+            // no neighborhood cell (shouldn't happen): first empty
+            y = 0;
+            while (y < n) {
+                int x = 0;
+                while (x < n) {
+                    if (this.At(x, y) == 0 && bestX < 0) { bestX = x; bestY = y; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+        }
+        // emotional beats: praise the player's threats we had to answer
+        int pThreat = this.ScoreCell(bestX, bestY, 1);
+        this.Place(bestX, bestY, 2, now);
+        if (this.scene == 1 && pThreat >= 12000) {
+            this.AddPop(GmGame.BX() + bestX * GmGame.Cell(),
+                GmGame.BY() + bestY * GmGame.Cell() - 30, "好棋，只能挡了", now, 255, 214, 150);
+        }
+    }
+
+    // ----- input -----------------------------------------------------------
+
+    void OnDown(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            if (Draw.PointIn(cx, cy, 460, 350, 360, 78)) { this.diff = 0; this.StartGame(now); }
+            if (Draw.PointIn(cx, cy, 460, 444, 360, 78)) { this.diff = 1; this.StartGame(now); }
+            if (Draw.PointIn(cx, cy, 460, 538, 360, 78)) { this.diff = 2; this.StartGame(now); }
+            return;
+        }
+        if (this.scene == 2) {
+            if (Draw.PointIn(cx, cy, 420, 430, 210, 60)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 650, 430, 210, 60)) { this.scene = 0; return; }
+            return;
+        }
+        if (this.aiTurn || this.winner != 0) { return; }
+        int gx = (cx - GmGame.BX() + GmGame.Cell() / 2) / GmGame.Cell();
+        int gy = (cy - GmGame.BY() + GmGame.Cell() / 2) / GmGame.Cell();
+        if (gx < 0 || gy < 0 || gx >= GmGame.N() || gy >= GmGame.N()) { return; }
+        if (this.At(gx, gy) != 0) { return; }
+        this.Place(gx, gy, 1, now);
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } return; }
+        if (this.scene == 2 && (sc == 40 || sc == 44)) { this.StartGame(now); }
+    }
+
+    void Tick(int now) {
+        if (this.scene == 1 && this.aiTurn && now >= this.aiThinkAt) {
+            this.AiMove(now);
+            this.demoAt = now + 420;
+        }
+        if (this.demo && this.scene == 1 && !this.aiTurn && now >= this.demoAt) {
+            this.DemoMove(now);
+        }
+    }
+
+    // demo: play black with the same evaluator so screenshots show a real game
+    void DemoMove(int now) {
+        int n = GmGame.N();
+        if (this.moves == 0) { this.Place(n / 2, n / 2 - 1, 1, now); return; }
+        int bestV = -1; int bestX = -1; int bestY = -1;
+        int y = 0;
+        while (y < n) {
+            int x = 0;
+            while (x < n) {
+                if (this.At(x, y) == 0 && this.NearStone(x, y)) {
+                    int v = this.ScoreCell(x, y, 1) + this.ScoreCell(x, y, 2) * 90 / 100
+                        + this.rng.Range(0, 500);
+                    if (v > bestV) { bestV = v; bestX = x; bestY = y; }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        if (bestX >= 0) { this.Place(bestX, bestY, 1, now); }
+    }
+
+    // ----- rendering -------------------------------------------------------
+
+    void DrawBoard(int now) {
+        int n = GmGame.N();
+        int c = GmGame.Cell();
+        int x0 = GmGame.BX();
+        int y0 = GmGame.BY();
+        int span = (n - 1) * c;
+        // kaya wood: layered warm tones with subtle grain bands
+        Draw.RoundRectFill(this.r, x0 - 44, y0 - 44, span + 88, span + 88, 14, 92, 62, 34, 255);
+        Draw.RoundRectFill(this.r, x0 - 38, y0 - 38, span + 76, span + 76, 10, 214, 168, 106, 255);
+        int gi = 0;
+        while (gi < 14) {
+            int gy = y0 - 38 + gi * (span + 76) / 14;
+            int shade = 6 + (gi * 7919 % 11);
+            this.r.SetColor(150, 108, 58, shade + 8);
+            this.r.FillRect(x0 - 38, gy, span + 76, 3 + gi % 3);
+            gi = gi + 1;
+        }
+        // grid
+        this.r.SetColor(74, 48, 22, 235);
+        int i = 0;
+        while (i < n) {
+            this.r.FillRect(x0, y0 + i * c - 1, span, 2);
+            this.r.FillRect(x0 + i * c - 1, y0, 2, span);
+            i = i + 1;
+        }
+        // star points
+        int[] st = new int[3];
+        st[0] = 3; st[1] = 7; st[2] = 11;
+        int a = 0;
+        while (a < 3) {
+            int b = 0;
+            while (b < 3) {
+                Draw.FillCircle(this.r, x0 + st[a] * c, y0 + st[b] * c, 4, 74, 48, 22, 235);
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        // stones
+        int y = 0;
+        while (y < n) {
+            int x = 0;
+            while (x < n) {
+                int v = this.At(x, y);
+                if (v != 0) {
+                    int sx = x0 + x * c;
+                    int sy = y0 + y * c;
+                    int rad = 18;
+                    bool isLast = x == this.lastX && y == this.lastY;
+                    if (isLast) {
+                        int age = now - this.placedAt;
+                        if (age < 220 && age >= 0) { rad = 14 + age * 4 / 220; }
+                        Draw.FillCircle(this.r, sx, sy, rad + 9, 255, 200, 110, 60);
+                        Draw.FillCircle(this.r, sx, sy, rad + 4, 255, 214, 130, 70);
+                    }
+                    Draw.FillCircle(this.r, sx + 2, sy + 3, rad, 30, 18, 8, 90);
+                    if (v == 1) {
+                        Draw.FillCircle(this.r, sx, sy, rad, 34, 36, 44, 255);
+                        Draw.FillCircle(this.r, sx - 5, sy - 6, rad / 3, 130, 140, 160, 200);
+                    } else {
+                        Draw.FillCircle(this.r, sx, sy, rad, 236, 232, 222, 255);
+                        Draw.FillCircle(this.r, sx - 5, sy - 6, rad / 3, 255, 255, 255, 230);
+                        Draw.FillCircle(this.r, sx + 4, sy + 6, rad / 2, 205, 198, 185, 90);
+                    }
+                    if (isLast) {
+                        Draw.FillCircle(this.r, sx, sy, 5, 255, 90, 90, 230);
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        // winning line glow
+        if (this.winner == 1 || this.winner == 2) {
+            int ax = x0 + this.winX0 * c; int ay = y0 + this.winY0 * c;
+            int bx = x0 + this.winX1 * c; int by = y0 + this.winY1 * c;
+            int steps = 24;
+            int s = 0;
+            while (s <= steps) {
+                int px = ax + (bx - ax) * s / steps;
+                int py = ay + (by - ay) * s / steps;
+                Draw.FillCircle(this.r, px, py, 6, 255, 214, 90, 180);
+                s = s + 1;
+            }
+        }
+        // hover ghost stone
+        if (this.scene == 1 && !this.aiTurn) {
+            int gx = (this.mouseX - x0 + c / 2) / c;
+            int gy = (this.mouseY - y0 + c / 2) / c;
+            if (gx >= 0 && gy >= 0 && gx < n && gy < n && this.At(gx, gy) == 0) {
+                Draw.FillCircle(this.r, x0 + gx * c, y0 + gy * c, 18, 34, 36, 44, 90);
+            }
+        }
+    }
+
+    void DrawSide(int now) {
+        int px = 750;
+        Draw.RoundRectFill(this.r, px, 66, 460, 588, 16, 46, 30, 18, 200);
+        Draw.RingRect(this.r, px, 66, 460, 588, 2, 214, 168, 106, 90);
+        Text.Draw(this.r, "五子棋", px + 32, 96, 5, 240, 220, 190, 255);
+        string dn = "初学";
+        if (this.diff == 1) { dn = "棋士"; }
+        if (this.diff == 2) { dn = "棋圣"; }
+        Text.Draw(this.r, "对手 · " + dn, px + 32, 170, 2, 255, 214, 150, 255);
+        string turn = "轮到你落子";
+        int tr = 140; int tg = 220; int tb = 170;
+        if (this.aiTurn) { turn = "对手思考中…"; tr = 255; tg = 214; tb = 150; }
+        Text.Draw(this.r, turn, px + 32, 214, 3, tr, tg, tb, 255);
+        Text.Draw(this.r, "段位 " + this.prof.Title() + " · " + this.prof.pts + " 分", px + 32, 286, 2, 235, 225, 205, 255);
+        Text.Draw(this.r, "胜 " + this.prof.wins + " · 负 " + this.prof.losses, px + 32, 326, 2, 200, 190, 170, 255);
+        Text.Draw(this.r, "连胜 " + this.prof.streak + " · 最佳 " + this.prof.bestStreak, px + 32, 366, 2, 200, 190, 170, 255);
+        Text.Draw(this.r, "第 " + (this.moves + 1) + " 手", px + 32, 406, 2, 200, 190, 170, 255);
+        Text.Draw(this.r, "Esc 菜单 · F11 全屏", px + 32, 610, 2, 160, 150, 135, 255);
+    }
+
+    void DrawFx(int now) {
+        int i = 0;
+        while (i < this.parts.Count) {
+            GmParticle p = this.parts[i];
+            int age = now - p.bornAt;
+            if (age > 900) { this.parts.RemoveAt(i); continue; }
+            int px = (p.x + p.vx * age / 4) / 256;
+            int py = (p.y + p.vy * age / 4) / 256 + age * age / 26000;
+            int alpha = 235 - age * 235 / 900;
+            Draw.FillCircle(this.r, px, py, 3, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < this.pops.Count) {
+            GmPopup p = this.pops[i];
+            int age = now - p.bornAt;
+            if (age > 1400) { this.pops.RemoveAt(i); continue; }
+            int alpha = 255 - age * 255 / 1400;
+            Text.DrawCentered(this.r, p.text, p.x, p.y - age / 14, 2, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        if (now - this.toastAt < 2200) {
+            int age = now - this.toastAt;
+            int alpha = 235;
+            if (age > 1700) { alpha = 235 - (age - 1700) * 235 / 500; }
+            Text.DrawCenteredShadow(this.r, this.toastText, 400, 690, 2, 255, 224, 150, 2);
+        }
+    }
+
+    void DrawAmbient() {
+        // dim parlor artwork behind the table for atmosphere
+        this.EnsureTex();
+        if (this.menuBg != null) {
+            Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+            this.r.SetColor(24, 14, 8, 180);
+            this.r.FillRect(0, 0, 1280, 720);
+        }
+        // warm lantern pool over the playing area
+        Draw.FillCircle(this.r, 400, 330, 420, 255, 190, 110, 16);
+        Draw.FillCircle(this.r, 400, 330, 300, 255, 200, 130, 14);
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(38, 26, 18);
+        this.DrawAmbient();
+        this.DrawBoard(now);
+        this.DrawSide(now);
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureTex();
+        this.host.Begin(30, 20, 14);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+        this.r.SetColor(20, 12, 6, 120);
+        this.r.FillRect(0, 0, 1280, 720);
+        if (this.titleTex != null) {
+            this.r.DrawTexture(this.titleTex, 640 - 300, 36, 600, 200);
+        } else {
+            Text.DrawCenteredShadow(this.r, "五子棋", 640, 80, 9, 245, 232, 205, 4);
+        }
+        Text.DrawCenteredShadow(this.r, "落子生根 · 五连制胜 · 段位成长", 640, 262, 3, 255, 218, 160, 3);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 460, 350, 360, 78, "初学对弈", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 460, 444, 360, 78, "棋士对弈", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 460, 538, 360, 78, "棋圣对弈", 3, 0);
+        Text.DrawCenteredShadow(this.r, "段位 " + this.prof.Title() + " · " + this.prof.pts
+            + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
+            + " · 最佳连胜 " + this.prof.bestStreak, 640, 646, 2, 230, 210, 180, 2);
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.host.Begin(38, 26, 18);
+        this.DrawAmbient();
+        this.DrawBoard(now);
+        this.DrawSide(now);
+        this.r.SetColor(18, 12, 6, 165);
+        this.r.FillRect(0, 0, 1280, 720);
+        int by = 190;
+        Draw.RoundRectFill(this.r, 390, by, 500, 320, 20, 40, 28, 16, 245);
+        Draw.RingRect(this.r, 390, by, 500, 320, 2, 214, 168, 106, 140);
+        if (this.winner == 1) {
+            Text.DrawCenteredShadow(this.r, "妙手连珠，胜！", 640, by + 34, 5, 255, 220, 110, 3);
+            Text.DrawCentered(this.r, "+" + (10 + this.diff * 10) + " 段位分 · 现 " + this.prof.Title(), 640, by + 110, 3, 240, 225, 200, 255);
+            string cheer = "棋风正盛，再下一城！";
+            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！势不可挡"; }
+            Text.DrawCentered(this.r, cheer, 640, by + 166, 2, 150, 230, 190, 255);
+        } else if (this.winner == 2) {
+            Text.DrawCenteredShadow(this.r, "惜败半目间", 640, by + 34, 5, 235, 160, 150, 3);
+            Text.DrawCentered(this.r, "第 " + this.moves + " 手告负", 640, by + 110, 3, 220, 205, 185, 255);
+            Text.DrawCentered(this.r, "复盘一手，下局翻盘！", 640, by + 166, 2, 255, 214, 150, 255);
+        } else {
+            Text.DrawCenteredShadow(this.r, "满盘和棋", 640, by + 34, 5, 220, 210, 190, 3);
+            Text.DrawCentered(this.r, "势均力敌，罕见的对局", 640, by + 130, 2, 220, 205, 185, 255);
+        }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 420, by + 240, 210, 60, "再来一局", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 650, by + 240, 210, 60, "回到菜单", 3, 0);
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2) { this.DrawOver(now); }
+        else { this.DrawPlay(now); }
+    }
+}
+
+class GmApp {
+    static void Main() {
+        Host h = Host.Create("五子棋", 1280, 720);
+        GmGame g = GmGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { h.ToggleFullscreen(); }
+                    else if (!SdlEvent.IsRepeat()) { g.OnKey(sc, now); }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        g.mouseX = h.MouseX();
+                        g.mouseY = h.MouseY();
+                        g.OnDown(g.mouseX, g.mouseY, now);
+                    }
+                }
+            }
+            g.Tick(now);
+            g.Render(now);   // vsync-paced by the renderer
+        }
+        h.Close();
+    }
+}
