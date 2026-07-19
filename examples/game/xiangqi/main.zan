@@ -1,0 +1,959 @@
+// 象棋 -- a lacquered Chinese chess parlor. You command red against a local
+// alpha-beta AI; besides full games there are classic endgame drills (双车错 /
+// 马后炮 / 车兵破士象) that teach mating patterns. Pieces are glossy lacquer
+// discs with engraved characters; the last move trails a glow, checks flash a
+// warning, victories shower sparks and rank points (草莽→棋圣). All text uses
+// the smooth TTF atlases. F11 borderless fullscreen, Esc back/exit.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Xiangqi;
+
+class XqProfile {
+    int pts;
+    int wins;
+    int losses;
+    int streak;
+    int bestStreak;
+    int drills;     // endgame drills solved
+
+    static string Path() { return "xiangqi_profile.txt"; }
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fb) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return XqProfile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fb;
+    }
+    static XqProfile Load() {
+        XqProfile p = new XqProfile();
+        if (!File.Exists(XqProfile.Path())) { return p; }
+        List<string> lines = File.ReadAllLines(XqProfile.Path());
+        p.pts = XqProfile.ReadKey(lines, "pts", 0);
+        p.wins = XqProfile.ReadKey(lines, "wins", 0);
+        p.losses = XqProfile.ReadKey(lines, "losses", 0);
+        p.streak = XqProfile.ReadKey(lines, "streak", 0);
+        p.bestStreak = XqProfile.ReadKey(lines, "bestStreak", 0);
+        p.drills = XqProfile.ReadKey(lines, "drills", 0);
+        return p;
+    }
+    void Save() {
+        string s = "pts=" + this.pts + "\nwins=" + this.wins
+            + "\nlosses=" + this.losses + "\nstreak=" + this.streak
+            + "\nbestStreak=" + this.bestStreak + "\ndrills=" + this.drills + "\n";
+        File.WriteAllText(XqProfile.Path(), s);
+    }
+    string Title() {
+        if (this.pts >= 420) { return "棋圣"; }
+        if (this.pts >= 260) { return "大师"; }
+        if (this.pts >= 150) { return "县冠军"; }
+        if (this.pts >= 70) { return "街霸"; }
+        if (this.pts >= 25) { return "巷口高手"; }
+        return "草莽";
+    }
+}
+
+class XqParticle {
+    int x; int y; int vx; int vy; int bornAt; int cr; int cg; int cb;
+}
+class XqPopup {
+    int x; int y; string text; int bornAt; int cr; int cg; int cb;
+}
+
+class XqGame {
+    Host host;
+    SdlRenderer r;
+    XqProfile prof;
+    Rng rng;
+
+    // board[y*9+x]; 0 empty. red: 1帅 2仕 3相 4马 5车 6炮 7兵
+    // black: 8将 9士 10象 11马 12车 13炮 14卒. Red at bottom (y7..9 palace).
+    int[] board;
+    int scene;      // 0 menu, 1 play, 2 over
+    int mode;       // 0 full game, 1..3 endgame drills
+    bool redTurn;
+    int selSq;      // selected square or -1
+    int lastFrom;
+    int lastTo;
+    int winner;     // 1 red(player), 2 black(ai)
+    int aiThinkAt;
+    bool aiTurn;
+    int moveCount;
+    bool inCheck;   // player currently in check
+    int mouseX;
+    int mouseY;
+    int toastAt;
+    string toastText;
+    List<XqParticle> parts;
+    List<XqPopup> pops;
+    SdlTexture menuBg;
+    SdlTexture titleTex;
+    bool texTried;
+    bool demo;
+    int demoAt;
+    List<int> legal;    // cached legal moves for the side to move
+
+    static int Cell() { return 58; }
+    static int BX() { return 130; }
+    static int BY() { return 78; }
+
+    static XqGame Create(Host h) {
+        XqGame g = new XqGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = XqProfile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 8642097);
+        g.scene = 0;
+        g.mouseX = 640;
+        g.mouseY = 360;
+        g.parts = new List<XqParticle>();
+        g.pops = new List<XqPopup>();
+        g.toastAt = -9999;
+        g.selSq = -1;
+        g.demo = File.Exists("xiangqi_demo.txt");
+        if (g.demo) { g.StartGame(0, Sdl.Ticks()); }
+        return g;
+    }
+
+    void EnsureTex() {
+        if (this.texTried) { return; }
+        this.texTried = true;
+        this.menuBg = XqGame.LoadTex(this.r, "examples/game/xiangqi/assets/menu_bg.png");
+        this.titleTex = XqGame.LoadTex(this.r, "examples/game/xiangqi/assets/title.png");
+    }
+    static SdlTexture LoadTex(SdlRenderer r, string path) {
+        string p = Assets.Find(path);
+        if (!File.Exists(p)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, p);
+        if (t == null || !t.IsValid()) { return null; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        return t;
+    }
+
+    // ----- feedback --------------------------------------------------------
+
+    void Toast(string t, int now) { this.toastText = t; this.toastAt = now; }
+    void AddPop(int px, int py, string t, int now, int cr, int cg, int cb) {
+        if (this.pops.Count > 14) { this.pops.RemoveAt(0); }
+        XqPopup p = new XqPopup();
+        p.x = px; p.y = py; p.text = t; p.bornAt = now;
+        p.cr = cr; p.cg = cg; p.cb = cb;
+        this.pops.Add(p);
+    }
+    void Burst(int px, int py, int n, int now, int cr, int cg, int cb) {
+        if (this.parts.Count > 240) { return; }
+        int i = 0;
+        while (i < n) {
+            XqParticle p = new XqParticle();
+            p.x = px * 256; p.y = py * 256;
+            int a = this.rng.Range(0, 16);
+            int spd = 60 + this.rng.Range(0, 160);
+            int ux = 0; int uy = 0;
+            int q = a % 4;
+            if (q == 0) { ux = 256; uy = (a / 4 - 2) * 128; }
+            if (q == 1) { ux = -256; uy = (a / 4 - 2) * 128; }
+            if (q == 2) { uy = 256; ux = (a / 4 - 2) * 128; }
+            if (q == 3) { uy = -256; ux = (a / 4 - 2) * 128; }
+            p.vx = ux * spd / 256;
+            p.vy = uy * spd / 256;
+            p.bornAt = now;
+            p.cr = cr; p.cg = cg; p.cb = cb;
+            this.parts.Add(p);
+            i = i + 1;
+        }
+    }
+
+    // ----- setup -----------------------------------------------------------
+
+    void Put(int x, int y, int p) { this.board[y * 9 + x] = p; }
+
+    void StartGame(int mode, int now) {
+        this.board = new int[90];
+        this.mode = mode;
+        this.selSq = -1;
+        this.lastFrom = -1;
+        this.lastTo = -1;
+        this.winner = 0;
+        this.moveCount = 0;
+        this.inCheck = false;
+        this.parts = new List<XqParticle>();
+        this.pops = new List<XqPopup>();
+        this.toastAt = -9999;
+        if (mode == 0) {
+            // full game
+            this.Put(0, 0, 12); this.Put(1, 0, 11); this.Put(2, 0, 10); this.Put(3, 0, 9);
+            this.Put(4, 0, 8);
+            this.Put(5, 0, 9); this.Put(6, 0, 10); this.Put(7, 0, 11); this.Put(8, 0, 12);
+            this.Put(1, 2, 13); this.Put(7, 2, 13);
+            this.Put(0, 3, 14); this.Put(2, 3, 14); this.Put(4, 3, 14); this.Put(6, 3, 14); this.Put(8, 3, 14);
+            this.Put(0, 9, 5); this.Put(1, 9, 4); this.Put(2, 9, 3); this.Put(3, 9, 2);
+            this.Put(4, 9, 1);
+            this.Put(5, 9, 2); this.Put(6, 9, 3); this.Put(7, 9, 4); this.Put(8, 9, 5);
+            this.Put(1, 7, 6); this.Put(7, 7, 6);
+            this.Put(0, 6, 7); this.Put(2, 6, 7); this.Put(4, 6, 7); this.Put(6, 6, 7); this.Put(8, 6, 7);
+            this.Toast("红先行，将军制胜", now);
+        } else if (mode == 1) {
+            // 双车错: two chariots roll up a bare palace
+            this.Put(4, 9, 1);
+            this.Put(0, 2, 5); this.Put(1, 4, 5);
+            this.Put(4, 0, 8); this.Put(3, 0, 9); this.Put(5, 1, 9);
+            this.Toast("残局·双车错：双车交错擒将", now);
+        } else if (mode == 2) {
+            // 马后炮: the classic horse-then-cannon mate
+            this.Put(4, 9, 1);
+            this.Put(4, 4, 6); this.Put(3, 2, 4);
+            this.Put(4, 0, 8); this.Put(3, 0, 9);
+            this.Toast("残局·马后炮：马定将门炮定音", now);
+        } else {
+            // 车兵破士象: chariot + pawn grind down advisors and elephants
+            this.Put(4, 9, 1);
+            this.Put(0, 4, 5); this.Put(4, 4, 7);
+            this.Put(4, 0, 8); this.Put(3, 0, 9); this.Put(5, 0, 9);
+            this.Put(2, 0, 10); this.Put(6, 0, 10);
+            this.Toast("残局·车兵破士象：稳扎稳打", now);
+        }
+        this.redTurn = true;
+        this.aiTurn = false;
+        this.scene = 1;
+        this.legal = this.LegalMoves(true);
+        if (this.demo) { this.demoAt = now + 500; }
+    }
+
+    // ----- rules -----------------------------------------------------------
+
+    static bool IsRed(int p) { return p >= 1 && p <= 7; }
+    static bool IsBlack(int p) { return p >= 8; }
+    int At(int x, int y) {
+        if (x < 0 || x > 8 || y < 0 || y > 9) { return -2; }
+        return this.board[y * 9 + x];
+    }
+
+    void AddMove(List<int> res, int fx, int fy, int tx, int ty, bool red) {
+        int t = this.At(tx, ty);
+        if (t == -2) { return; }
+        if (t != 0) {
+            if (red && XqGame.IsRed(t)) { return; }
+            if (!red && XqGame.IsBlack(t)) { return; }
+        }
+        res.Add((fy * 9 + fx) * 90 + ty * 9 + tx);
+    }
+
+    void SlideMoves(List<int> res, int fx, int fy, int dx, int dy, bool red, bool cannon) {
+        int x = fx + dx; int y = fy + dy;
+        bool jumped = false;
+        while (x >= 0 && x <= 8 && y >= 0 && y <= 9) {
+            int t = this.At(x, y);
+            if (!cannon) {
+                this.AddMove(res, fx, fy, x, y, red);
+                if (t != 0) { return; }
+            } else {
+                if (!jumped) {
+                    if (t == 0) { this.AddMove(res, fx, fy, x, y, red); }
+                    else { jumped = true; }
+                } else {
+                    if (t != 0) { this.AddMove(res, fx, fy, x, y, red); return; }
+                }
+            }
+            x = x + dx; y = y + dy;
+        }
+    }
+
+    // pseudo-legal moves for one side (includes flying-general capture, so a
+    // facing-generals position is auto-punished in search / legality checks)
+    List<int> GenMoves(bool red) {
+        List<int> res = new List<int>();
+        int y = 0;
+        while (y < 10) {
+            int x = 0;
+            while (x < 9) {
+                int p = this.At(x, y);
+                if (p != 0 && (red == XqGame.IsRed(p))) {
+                    int k = p;
+                    if (k >= 8) { k = k - 7; }
+                    if (k == 1) {
+                        // general: palace steps + flying general
+                        int py0 = 7; int py1 = 9;
+                        if (!red) { py0 = 0; py1 = 2; }
+                        if (x > 3) { this.AddMove(res, x, y, x - 1, y, red); }
+                        if (x < 5) { this.AddMove(res, x, y, x + 1, y, red); }
+                        if (y > py0) { this.AddMove(res, x, y, x, y - 1, red); }
+                        if (y < py1) { this.AddMove(res, x, y, x, y + 1, red); }
+                        int dy = -1;
+                        if (!red) { dy = 1; }
+                        int yy = y + dy;
+                        while (yy >= 0 && yy <= 9) {
+                            int t = this.At(x, yy);
+                            if (t != 0) {
+                                int tk = t;
+                                if (tk >= 8) { tk = tk - 7; }
+                                if (tk == 1) { this.AddMove(res, x, y, x, yy, red); }
+                                yy = -99;
+                            } else { yy = yy + dy; }
+                        }
+                    } else if (k == 2) {
+                        // advisor: palace diagonals
+                        int py0 = 7; int py1 = 9;
+                        if (!red) { py0 = 0; py1 = 2; }
+                        int d = 0;
+                        while (d < 4) {
+                            int dx = 1; int dy = 1;
+                            if (d == 1) { dx = -1; }
+                            if (d == 2) { dy = -1; }
+                            if (d == 3) { dx = -1; dy = -1; }
+                            int tx = x + dx; int ty = y + dy;
+                            if (tx >= 3 && tx <= 5 && ty >= py0 && ty <= py1) {
+                                this.AddMove(res, x, y, tx, ty, red);
+                            }
+                            d = d + 1;
+                        }
+                    } else if (k == 3) {
+                        // elephant: two-step diagonal, blocked eye, own half
+                        int d = 0;
+                        while (d < 4) {
+                            int dx = 2; int dy = 2;
+                            if (d == 1) { dx = -2; }
+                            if (d == 2) { dy = -2; }
+                            if (d == 3) { dx = -2; dy = -2; }
+                            int tx = x + dx; int ty = y + dy;
+                            bool half = ty >= 5;
+                            if (!red) { half = ty <= 4; }
+                            if (half && this.At(x + dx / 2, y + dy / 2) == 0) {
+                                this.AddMove(res, x, y, tx, ty, red);
+                            }
+                            d = d + 1;
+                        }
+                    } else if (k == 4) {
+                        // horse with leg blocks
+                        int d = 0;
+                        while (d < 8) {
+                            int dx = 1; int dy = 2;
+                            if (d == 1) { dx = -1; dy = 2; }
+                            if (d == 2) { dx = 1; dy = -2; }
+                            if (d == 3) { dx = -1; dy = -2; }
+                            if (d == 4) { dx = 2; dy = 1; }
+                            if (d == 5) { dx = 2; dy = -1; }
+                            if (d == 6) { dx = -2; dy = 1; }
+                            if (d == 7) { dx = -2; dy = -1; }
+                            int lx = x; int ly = y;
+                            if (dx == 2) { lx = x + 1; }
+                            if (dx == -2) { lx = x - 1; }
+                            if (dy == 2) { ly = y + 1; }
+                            if (dy == -2) { ly = y - 1; }
+                            if (this.At(lx, ly) == 0) {
+                                this.AddMove(res, x, y, x + dx, y + dy, red);
+                            }
+                            d = d + 1;
+                        }
+                    } else if (k == 5) {
+                        this.SlideMoves(res, x, y, 1, 0, red, false);
+                        this.SlideMoves(res, x, y, -1, 0, red, false);
+                        this.SlideMoves(res, x, y, 0, 1, red, false);
+                        this.SlideMoves(res, x, y, 0, -1, red, false);
+                    } else if (k == 6) {
+                        this.SlideMoves(res, x, y, 1, 0, red, true);
+                        this.SlideMoves(res, x, y, -1, 0, red, true);
+                        this.SlideMoves(res, x, y, 0, 1, red, true);
+                        this.SlideMoves(res, x, y, 0, -1, red, true);
+                    } else {
+                        // pawn
+                        int dy = -1;
+                        if (!red) { dy = 1; }
+                        this.AddMove(res, x, y, x, y + dy, red);
+                        bool crossed = y <= 4;
+                        if (!red) { crossed = y >= 5; }
+                        if (crossed) {
+                            this.AddMove(res, x, y, x - 1, y, red);
+                            this.AddMove(res, x, y, x + 1, y, red);
+                        }
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        return res;
+    }
+
+    int FindGeneral(bool red) {
+        int want = 1;
+        if (!red) { want = 8; }
+        int i = 0;
+        while (i < 90) {
+            if (this.board[i] == want) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    bool InCheckSide(bool red) {
+        int g = this.FindGeneral(red);
+        if (g < 0) { return true; }
+        List<int> opp = this.GenMoves(!red);
+        int i = 0;
+        while (i < opp.Count) {
+            if (opp[i] % 90 == g) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    List<int> LegalMoves(bool red) {
+        List<int> ps = this.GenMoves(red);
+        List<int> res = new List<int>();
+        int i = 0;
+        while (i < ps.Count) {
+            int m = ps[i];
+            int f = m / 90; int t = m % 90;
+            int cap = this.board[t];
+            this.board[t] = this.board[f];
+            this.board[f] = 0;
+            if (!this.InCheckSide(red)) { res.Add(m); }
+            this.board[f] = this.board[t];
+            this.board[t] = cap;
+            i = i + 1;
+        }
+        return res;
+    }
+
+    // ----- evaluation + search ---------------------------------------------
+
+    static int PieceVal(int p) {
+        int k = p;
+        if (k >= 8) { k = k - 7; }
+        if (k == 1) { return 100000; }
+        if (k == 2) { return 130; }
+        if (k == 3) { return 130; }
+        if (k == 4) { return 430; }
+        if (k == 5) { return 920; }
+        if (k == 6) { return 460; }
+        return 90;
+    }
+
+    // evaluation from black's (AI) perspective
+    int Eval() {
+        int v = 0;
+        int i = 0;
+        while (i < 90) {
+            int p = this.board[i];
+            if (p != 0) {
+                int val = XqGame.PieceVal(p);
+                int y = i / 9;
+                int k = p;
+                if (k >= 8) { k = k - 7; }
+                if (k == 7) {
+                    // pawns gain value as they advance
+                    if (XqGame.IsRed(p)) { val = val + (6 - y) * 22; }
+                    else { val = val + (y - 3) * 22; }
+                }
+                if (k == 4 || k == 6) {
+                    // horses/cannons like the middle files
+                    int x = i % 9;
+                    int cd = x - 4;
+                    if (cd < 0) { cd = -cd; }
+                    val = val + (4 - cd) * 6;
+                }
+                if (XqGame.IsBlack(p)) { v = v + val; } else { v = v - val; }
+            }
+            i = i + 1;
+        }
+        return v;
+    }
+
+    // negamax with alpha-beta over pseudo-legal moves; capturing the enemy
+    // general scores as an immediate huge win, which also enforces legality.
+    int Search(bool blackToMove, int depth, int alpha, int beta) {
+        if (depth == 0) { return this.EvalFor(blackToMove); }
+        List<int> ms = this.GenMoves(!blackToMove);
+        // order captures first (simple selection by captured value)
+        int best = -9999999;
+        int n = ms.Count;
+        // score-order in place: captures of high value first
+        int oi = 0;
+        while (oi < n) {
+            int bi = oi;
+            int bv = this.MoveOrder(ms[oi]);
+            int oj = oi + 1;
+            while (oj < n) {
+                int vv = this.MoveOrder(ms[oj]);
+                if (vv > bv) { bv = vv; bi = oj; }
+                oj = oj + 1;
+            }
+            if (bi != oi) { int tmp = ms[oi]; ms[oi] = ms[bi]; ms[bi] = tmp; }
+            int m = ms[oi];
+            int f = m / 90; int t = m % 90;
+            int cap = this.board[t];
+            if (cap != 0) {
+                int ck = cap;
+                if (ck >= 8) { ck = ck - 7; }
+                if (ck == 1) { return 500000 + depth * 1000; }
+            }
+            this.board[t] = this.board[f];
+            this.board[f] = 0;
+            int sc = -this.Search(!blackToMove, depth - 1, -beta, -alpha);
+            this.board[f] = this.board[t];
+            this.board[t] = cap;
+            if (sc > best) { best = sc; }
+            if (best > alpha) { alpha = best; }
+            if (alpha >= beta) { return best; }
+            oi = oi + 1;
+        }
+        if (n == 0) { return -400000; }
+        return best;
+    }
+
+    int EvalFor(bool blackToMove) {
+        int e = this.Eval();
+        if (blackToMove) { return e; }
+        return -e;
+    }
+
+    int MoveOrder(int m) {
+        int t = m % 90;
+        int cap = this.board[t];
+        if (cap == 0) { return 0; }
+        return XqGame.PieceVal(cap);
+    }
+
+    void AiMove(int now) {
+        List<int> ms = this.LegalMoves(false);
+        if (ms.Count == 0) { this.Win(1, now); return; }
+        int depth = 3;
+        int bestM = ms[0];
+        int bestV = -9999999;
+        int i = 0;
+        while (i < ms.Count) {
+            int m = ms[i];
+            int f = m / 90; int t = m % 90;
+            int cap = this.board[t];
+            this.board[t] = this.board[f];
+            this.board[f] = 0;
+            int sc = -this.Search(false, depth - 1, -9999999, 9999999);
+            this.board[f] = this.board[t];
+            this.board[t] = cap;
+            sc = sc + this.rng.Range(0, 5);
+            if (sc > bestV) { bestV = sc; bestM = m; }
+            i = i + 1;
+        }
+        this.Apply(bestM, now, false);
+    }
+
+    void Apply(int m, int now, bool byPlayer) {
+        int f = m / 90; int t = m % 90;
+        int cap = this.board[t];
+        this.board[t] = this.board[f];
+        this.board[f] = 0;
+        this.lastFrom = f;
+        this.lastTo = t;
+        this.moveCount = this.moveCount + 1;
+        int sx = XqGame.BX() + (t % 9) * XqGame.Cell();
+        int sy = XqGame.BY() + (t / 9) * XqGame.Cell();
+        if (cap != 0) {
+            this.Burst(sx, sy, 12, now, 255, 190, 90);
+            this.AddPop(sx, sy - 26, "吃" + XqGame.Name(cap), now, 255, 205, 110);
+        }
+        this.redTurn = !this.redTurn;
+        this.aiTurn = !this.redTurn;
+        if (this.aiTurn) { this.aiThinkAt = now + 300 + this.rng.Range(0, 400); }
+        this.legal = this.LegalMoves(this.redTurn);
+        this.inCheck = this.InCheckSide(this.redTurn);
+        if (this.legal.Count == 0) {
+            if (this.redTurn) { this.Win(2, now); } else { this.Win(1, now); }
+            return;
+        }
+        if (this.inCheck) {
+            if (this.redTurn) { this.Toast("将军！小心应对", now); }
+            else { this.AddPop(sx, sy - 50, "将军！", now, 255, 120, 110); }
+        }
+        if (this.demo) { this.demoAt = now + 450; }
+    }
+
+    void Win(int who, int now) {
+        this.winner = who;
+        this.scene = 2;
+        if (who == 1) {
+            int gain = 15;
+            if (this.mode > 0) { gain = 20; this.prof.drills = this.prof.drills + 1; }
+            this.prof.pts = this.prof.pts + gain;
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.bestStreak) { this.prof.bestStreak = this.prof.streak; }
+            this.Burst(640, 300, 60, now, 255, 210, 100);
+        } else {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            this.prof.pts = this.prof.pts - 5;
+            if (this.prof.pts < 0) { this.prof.pts = 0; }
+        }
+        this.prof.Save();
+    }
+
+    static string Name(int p) {
+        if (p == 1) { return "帅"; }
+        if (p == 2) { return "仕"; }
+        if (p == 3) { return "相"; }
+        if (p == 4) { return "马"; }
+        if (p == 5) { return "车"; }
+        if (p == 6) { return "炮"; }
+        if (p == 7) { return "兵"; }
+        if (p == 8) { return "将"; }
+        if (p == 9) { return "士"; }
+        if (p == 10) { return "象"; }
+        if (p == 11) { return "马"; }
+        if (p == 12) { return "车"; }
+        if (p == 13) { return "炮"; }
+        if (p == 14) { return "卒"; }
+        return "";
+    }
+
+    // ----- input -----------------------------------------------------------
+
+    void OnDown(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            if (Draw.PointIn(cx, cy, 430, 300, 420, 74)) { this.StartGame(0, now); }
+            if (Draw.PointIn(cx, cy, 430, 390, 420, 74)) { this.StartGame(1, now); }
+            if (Draw.PointIn(cx, cy, 430, 480, 420, 74)) { this.StartGame(2, now); }
+            if (Draw.PointIn(cx, cy, 430, 570, 420, 74)) { this.StartGame(3, now); }
+            return;
+        }
+        if (this.scene == 2) {
+            if (Draw.PointIn(cx, cy, 420, 430, 210, 60)) { this.StartGame(this.mode, now); return; }
+            if (Draw.PointIn(cx, cy, 650, 430, 210, 60)) { this.scene = 0; return; }
+            return;
+        }
+        if (this.aiTurn || this.winner != 0) { return; }
+        int gx = (cx - XqGame.BX() + XqGame.Cell() / 2) / XqGame.Cell();
+        int gy = (cy - XqGame.BY() + XqGame.Cell() / 2) / XqGame.Cell();
+        if (gx < 0 || gy < 0 || gx > 8 || gy > 9) { return; }
+        int sq = gy * 9 + gx;
+        int p = this.board[sq];
+        if (this.selSq < 0) {
+            if (XqGame.IsRed(p)) { this.selSq = sq; }
+            return;
+        }
+        if (sq == this.selSq) { this.selSq = -1; return; }
+        if (XqGame.IsRed(p)) { this.selSq = sq; return; }
+        int m = this.selSq * 90 + sq;
+        int i = 0;
+        bool ok = false;
+        while (i < this.legal.Count) {
+            if (this.legal[i] == m) { ok = true; i = this.legal.Count; }
+            i = i + 1;
+        }
+        if (ok) {
+            this.selSq = -1;
+            this.Apply(m, now, true);
+        } else {
+            this.Toast("此步不合规则", now);
+        }
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } return; }
+        if (this.scene == 2 && (sc == 40 || sc == 44)) { this.StartGame(this.mode, now); }
+    }
+
+    void Tick(int now) {
+        if (this.scene == 1 && this.aiTurn && now >= this.aiThinkAt) {
+            this.AiMove(now);
+        }
+        if (this.demo && this.scene == 1 && !this.aiTurn && now >= this.demoAt) {
+            this.DemoMove(now);
+        }
+    }
+
+    // demo: red plays with a shallow search so screenshots show a real game
+    void DemoMove(int now) {
+        List<int> ms = this.LegalMoves(true);
+        if (ms.Count == 0) { this.Win(2, now); return; }
+        int bestM = ms[0];
+        int bestV = -9999999;
+        int i = 0;
+        while (i < ms.Count) {
+            int m = ms[i];
+            int f = m / 90; int t = m % 90;
+            int cap = this.board[t];
+            this.board[t] = this.board[f];
+            this.board[f] = 0;
+            int sc = -this.Search(true, 1, -9999999, 9999999);
+            this.board[f] = this.board[t];
+            this.board[t] = cap;
+            sc = sc + this.rng.Range(0, 30);
+            if (sc > bestV) { bestV = sc; bestM = m; }
+            i = i + 1;
+        }
+        this.Apply(bestM, now, true);
+    }
+
+    // ----- rendering -------------------------------------------------------
+
+    void DrawAmbient() {
+        this.EnsureTex();
+        if (this.menuBg != null) {
+            Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+            this.r.SetColor(20, 12, 8, 190);
+            this.r.FillRect(0, 0, 1280, 720);
+        }
+        Draw.FillCircle(this.r, 380, 320, 430, 255, 180, 100, 14);
+    }
+
+    void DotLine(int ax, int ay, int bx, int by, int cr, int cg, int cb, int ca) {
+        int steps = 14;
+        int s = 0;
+        while (s <= steps) {
+            int px = ax + (bx - ax) * s / steps;
+            int py = ay + (by - ay) * s / steps;
+            Draw.FillCircle(this.r, px, py, 1, cr, cg, cb, ca);
+            s = s + 1;
+        }
+    }
+
+    void DrawBoard(int now) {
+        int c = XqGame.Cell();
+        int x0 = XqGame.BX();
+        int y0 = XqGame.BY();
+        int w = 8 * c;
+        int h = 9 * c;
+        // lacquered table + board face
+        Draw.RoundRectFill(this.r, x0 - 46, y0 - 46, w + 92, h + 92, 16, 66, 30, 20, 255);
+        Draw.RoundRectFill(this.r, x0 - 38, y0 - 38, w + 76, h + 76, 12, 226, 186, 128, 255);
+        int gi = 0;
+        while (gi < 12) {
+            int gy = y0 - 38 + gi * (h + 76) / 12;
+            this.r.SetColor(170, 128, 76, 12 + gi % 3 * 6);
+            this.r.FillRect(x0 - 38, gy, w + 76, 4);
+            gi = gi + 1;
+        }
+        // grid: verticals stop at the river
+        this.r.SetColor(88, 52, 24, 235);
+        int i = 0;
+        while (i < 9) {
+            int lx = x0 + i * c;
+            if (i == 0 || i == 8) {
+                this.r.FillRect(lx - 1, y0, 2, h);
+            } else {
+                this.r.FillRect(lx - 1, y0, 2, 4 * c);
+                this.r.FillRect(lx - 1, y0 + 5 * c, 2, 4 * c);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 10) {
+            this.r.FillRect(x0, y0 + i * c - 1, w, 2);
+            i = i + 1;
+        }
+        // palace diagonals
+        this.DotLine(x0 + 3 * c, y0, x0 + 5 * c, y0 + 2 * c, 88, 52, 24, 235);
+        this.DotLine(x0 + 5 * c, y0, x0 + 3 * c, y0 + 2 * c, 88, 52, 24, 235);
+        this.DotLine(x0 + 3 * c, y0 + 7 * c, x0 + 5 * c, y0 + 9 * c, 88, 52, 24, 235);
+        this.DotLine(x0 + 5 * c, y0 + 7 * c, x0 + 3 * c, y0 + 9 * c, 88, 52, 24, 235);
+        // river inscription
+        Text.Draw(this.r, "楚 河", x0 + c, y0 + 4 * c + c / 2 - 14, 3, 120, 76, 40, 200);
+        Text.Draw(this.r, "汉 界", x0 + 5 * c + 10, y0 + 4 * c + c / 2 - 14, 3, 120, 76, 40, 200);
+        // last move trail
+        if (this.lastFrom >= 0) {
+            int fx = x0 + (this.lastFrom % 9) * c;
+            int fy = y0 + (this.lastFrom / 9) * c;
+            Draw.RingRect(this.r, fx - 14, fy - 14, 28, 28, 2, 255, 200, 110, 160);
+        }
+        // pieces
+        int y = 0;
+        while (y < 10) {
+            int x = 0;
+            while (x < 9) {
+                int p = this.At(x, y);
+                if (p > 0) {
+                    int sx = x0 + x * c;
+                    int sy = y0 + y * c;
+                    int rad = 24;
+                    bool sel = this.selSq == y * 9 + x;
+                    bool last = this.lastTo == y * 9 + x;
+                    if (sel || last) {
+                        Draw.FillCircle(this.r, sx, sy, rad + 7, 255, 210, 120, 90);
+                    }
+                    Draw.FillCircle(this.r, sx + 2, sy + 4, rad, 30, 16, 8, 110);
+                    Draw.FillCircle(this.r, sx, sy, rad, 244, 222, 178, 255);
+                    Draw.FillCircle(this.r, sx - 6, sy - 8, rad / 3, 255, 250, 235, 190);
+                    if (XqGame.IsRed(p)) {
+                        Draw.RingRect(this.r, sx - rad + 3, sy - rad + 3, rad * 2 - 6, rad * 2 - 6, 2, 196, 60, 40, 255);
+                        Text.DrawCentered(this.r, XqGame.Name(p), sx, sy - 15, 3, 186, 44, 30, 255);
+                    } else {
+                        Draw.RingRect(this.r, sx - rad + 3, sy - rad + 3, rad * 2 - 6, rad * 2 - 6, 2, 40, 40, 48, 255);
+                        Text.DrawCentered(this.r, XqGame.Name(p), sx, sy - 15, 3, 34, 34, 42, 255);
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        // legal targets of the selected piece
+        if (this.selSq >= 0) {
+            i = 0;
+            while (i < this.legal.Count) {
+                int m = this.legal[i];
+                if (m / 90 == this.selSq) {
+                    int t = m % 90;
+                    Draw.FillCircle(this.r, x0 + (t % 9) * c, y0 + (t / 9) * c, 7, 90, 200, 130, 190);
+                }
+                i = i + 1;
+            }
+        }
+    }
+
+    void DrawSide(int now) {
+        int px = 700;
+        Draw.RoundRectFill(this.r, px, 66, 512, 588, 16, 44, 24, 16, 205);
+        Draw.RingRect(this.r, px, 66, 512, 588, 2, 226, 186, 128, 90);
+        Text.Draw(this.r, "象棋", px + 36, 96, 5, 240, 220, 190, 255);
+        string mn = "经典对弈";
+        if (this.mode == 1) { mn = "残局·双车错"; }
+        if (this.mode == 2) { mn = "残局·马后炮"; }
+        if (this.mode == 3) { mn = "残局·车兵破士象"; }
+        Text.Draw(this.r, mn, px + 36, 170, 2, 255, 214, 150, 255);
+        string turn = "轮到红方（你）";
+        int tr = 140; int tg = 220; int tb = 170;
+        if (this.aiTurn) { turn = "黑方思考中…"; tr = 255; tg = 214; tb = 150; }
+        if (this.inCheck && !this.aiTurn) { turn = "将军！速解"; tr = 255; tg = 120; tb = 110; }
+        Text.Draw(this.r, turn, px + 36, 214, 3, tr, tg, tb, 255);
+        Text.Draw(this.r, "段位 " + this.prof.Title() + " · " + this.prof.pts + " 分", px + 36, 286, 2, 235, 225, 205, 255);
+        Text.Draw(this.r, "胜 " + this.prof.wins + " · 负 " + this.prof.losses, px + 36, 326, 2, 200, 190, 170, 255);
+        Text.Draw(this.r, "连胜 " + this.prof.streak + " · 最佳 " + this.prof.bestStreak, px + 36, 366, 2, 200, 190, 170, 255);
+        Text.Draw(this.r, "残局通关 " + this.prof.drills, px + 36, 406, 2, 200, 190, 170, 255);
+        Text.Draw(this.r, "第 " + (this.moveCount + 1) + " 手", px + 36, 446, 2, 200, 190, 170, 255);
+        Text.Draw(this.r, "点选红子再点目标 · Esc 菜单", px + 36, 610, 2, 160, 150, 135, 255);
+    }
+
+    void DrawFx(int now) {
+        int i = 0;
+        while (i < this.parts.Count) {
+            XqParticle p = this.parts[i];
+            int age = now - p.bornAt;
+            if (age > 900) { this.parts.RemoveAt(i); continue; }
+            int px = (p.x + p.vx * age / 4) / 256;
+            int py = (p.y + p.vy * age / 4) / 256 + age * age / 26000;
+            int alpha = 235 - age * 235 / 900;
+            Draw.FillCircle(this.r, px, py, 3, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < this.pops.Count) {
+            XqPopup p = this.pops[i];
+            int age = now - p.bornAt;
+            if (age > 1400) { this.pops.RemoveAt(i); continue; }
+            int alpha = 255 - age * 255 / 1400;
+            Text.DrawCentered(this.r, p.text, p.x, p.y - age / 14, 2, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        if (now - this.toastAt < 2200) {
+            Text.DrawCenteredShadow(this.r, this.toastText, 360, 690, 2, 255, 224, 150, 2);
+        }
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(34, 22, 14);
+        this.DrawAmbient();
+        this.DrawBoard(now);
+        this.DrawSide(now);
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureTex();
+        this.host.Begin(28, 18, 12);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+        this.r.SetColor(18, 10, 6, 120);
+        this.r.FillRect(0, 0, 1280, 720);
+        if (this.titleTex != null) {
+            this.r.DrawTexture(this.titleTex, 640 - 300, 30, 600, 200);
+        } else {
+            Text.DrawCenteredShadow(this.r, "象棋", 640, 70, 9, 245, 230, 200, 4);
+        }
+        Text.DrawCenteredShadow(this.r, "楚河汉界 · 经典残局 · 段位成长", 640, 244, 3, 255, 216, 155, 3);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 300, 420, 74, "经典对弈", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 390, 420, 74, "残局 · 双车错", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 480, 420, 74, "残局 · 马后炮", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 430, 570, 420, 74, "残局 · 车兵破士象", 3, 0);
+        Text.DrawCenteredShadow(this.r, "段位 " + this.prof.Title() + " · " + this.prof.pts
+            + " 分 · 胜 " + this.prof.wins + " 负 " + this.prof.losses
+            + " · 残局通关 " + this.prof.drills, 640, 668, 2, 230, 210, 180, 2);
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.host.Begin(34, 22, 14);
+        this.DrawAmbient();
+        this.DrawBoard(now);
+        this.DrawSide(now);
+        this.r.SetColor(16, 10, 6, 165);
+        this.r.FillRect(0, 0, 1280, 720);
+        int by = 190;
+        Draw.RoundRectFill(this.r, 390, by, 500, 320, 20, 40, 24, 14, 245);
+        Draw.RingRect(this.r, 390, by, 500, 320, 2, 226, 186, 128, 140);
+        if (this.winner == 1) {
+            Text.DrawCenteredShadow(this.r, "绝杀！红方胜", 640, by + 34, 5, 255, 218, 110, 3);
+            int gain = 15;
+            if (this.mode > 0) { gain = 20; }
+            Text.DrawCentered(this.r, "+" + gain + " 段位分 · 现 " + this.prof.Title(), 640, by + 110, 3, 240, 225, 200, 255);
+            string cheer = "棋高一着，再战一盘！";
+            if (this.prof.streak >= 3) { cheer = this.prof.streak + " 连胜！杀伐果断"; }
+            if (this.mode > 0) { cheer = "残局功力见涨！"; }
+            Text.DrawCentered(this.r, cheer, 640, by + 166, 2, 150, 230, 190, 255);
+        } else {
+            Text.DrawCenteredShadow(this.r, "黑方得手", 640, by + 34, 5, 235, 160, 150, 3);
+            Text.DrawCentered(this.r, "第 " + this.moveCount + " 手告负", 640, by + 110, 3, 220, 205, 185, 255);
+            Text.DrawCentered(this.r, "复盘关键一手，卷土重来！", 640, by + 166, 2, 255, 214, 150, 255);
+        }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 420, by + 240, 210, 60, "再来一局", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 650, by + 240, 210, 60, "回到菜单", 3, 0);
+        this.DrawFx(now);
+        this.host.End();
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2) { this.DrawOver(now); }
+        else { this.DrawPlay(now); }
+    }
+}
+
+class XqApp {
+    static void Main() {
+        Host h = Host.Create("象棋", 1280, 720);
+        XqGame g = XqGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { h.ToggleFullscreen(); }
+                    else if (!SdlEvent.IsRepeat()) { g.OnKey(sc, now); }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        g.mouseX = h.MouseX();
+                        g.mouseY = h.MouseY();
+                        g.OnDown(g.mouseX, g.mouseY, now);
+                    }
+                }
+            }
+            g.Tick(now);
+            g.Render(now);   // vsync-paced by the renderer
+        }
+        h.Close();
+    }
+}
