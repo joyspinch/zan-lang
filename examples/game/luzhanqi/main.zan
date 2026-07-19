@@ -1,0 +1,981 @@
+// Luzhanqi (Land Battle Chess / Junqi) -- a complete product on GameKit.
+// Faithful-but-streamlined rules: 25 pieces per side with hidden identities
+// (face-down like Stratego), railways with straight-line & engineer moves,
+// safe camps, headquarters holding the flag, landmines, bombs, engineers that
+// defuse mines, and rank combat. Heuristic AI with four difficulties, move
+// animation, legal-move hints, and a persistent rank / streak profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Luzhanqi;
+
+class Profile {
+    int rank;
+    int streak;
+    int best;
+    int wins;
+    int losses;
+    int draws;
+    int games;
+    int level;
+    int adaptive;
+
+    static string Path() { return "luzhanqi_save.txt"; }
+
+    static int ParseInt(string s, int start) {
+        int i = start;
+        int sign = 1;
+        if (i < s.Length && s[i] == 45) { sign = -1; i = i + 1; }
+        int v = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v * sign;
+    }
+
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            int eq = -1;
+            int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static Profile Load() {
+        Profile p = new Profile();
+        p.rank = 1000; p.streak = 0; p.best = 0;
+        p.wins = 0; p.losses = 0; p.draws = 0; p.games = 0;
+        p.level = 1; p.adaptive = 1;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.rank = Profile.ReadKey(lines, "rank", 1000);
+            p.streak = Profile.ReadKey(lines, "streak", 0);
+            p.best = Profile.ReadKey(lines, "best", 0);
+            p.wins = Profile.ReadKey(lines, "wins", 0);
+            p.losses = Profile.ReadKey(lines, "losses", 0);
+            p.draws = Profile.ReadKey(lines, "draws", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+            p.level = Profile.ReadKey(lines, "level", 1);
+            p.adaptive = Profile.ReadKey(lines, "adaptive", 1);
+        }
+        return p;
+    }
+
+    void Save() {
+        string s = "";
+        s = s + "rank=" + this.rank + "\n";
+        s = s + "streak=" + this.streak + "\n";
+        s = s + "best=" + this.best + "\n";
+        s = s + "wins=" + this.wins + "\n";
+        s = s + "losses=" + this.losses + "\n";
+        s = s + "draws=" + this.draws + "\n";
+        s = s + "games=" + this.games + "\n";
+        s = s + "level=" + this.level + "\n";
+        s = s + "adaptive=" + this.adaptive + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+
+    string TierName() {
+        int r = this.rank;
+        if (r < 900) { return "BRONZE"; }
+        if (r < 1100) { return "SILVER"; }
+        if (r < 1300) { return "GOLD"; }
+        if (r < 1500) { return "PLATINUM"; }
+        if (r < 1750) { return "DIAMOND"; }
+        return "MASTER";
+    }
+}
+
+// Board: 12 rows x 5 cols, index = r*5 + c. Rows 0-5 AI, rows 6-11 human.
+// Codes (abs): 1 Engineer, 2 Platoon, 3 Captain, 4 Major, 5 Colonel,
+// 6 Brigadier, 7 MajorGen, 8 General, 9 FieldMarshal, 10 Bomb, 11 Mine, 12 Flag.
+class Lz {
+    static int Rank(int v) { if (v < 0) { return -v; } return v; }
+
+    static bool IsHQ(int idx) {
+        int r = idx / 5; int c = idx % 5;
+        if ((r == 0 || r == 11) && (c == 1 || c == 3)) { return true; }
+        return false;
+    }
+
+    static bool IsCamp(int idx) {
+        int r = idx / 5; int c = idx % 5;
+        if (r == 2 || r == 4 || r == 7 || r == 9) { return c == 1 || c == 3; }
+        if (r == 3 || r == 8) { return c == 2; }
+        return false;
+    }
+
+    static bool IsRail(int idx) {
+        int r = idx / 5; int c = idx % 5;
+        if (r == 1 || r == 5 || r == 6 || r == 10) { return true; }
+        if ((c == 0 || c == 4) && r >= 1 && r <= 10) { return true; }
+        return false;
+    }
+
+    static bool Movable(int v) {
+        int rk = Lz.Rank(v);
+        return rk >= 1 && rk <= 10;   // engineer..field marshal + bomb; not mine/flag
+    }
+
+    static int[] Clone(int[] b) {
+        int[] nb = new int[60];
+        int i = 0;
+        while (i < 60) { nb[i] = b[i]; i = i + 1; }
+        return nb;
+    }
+
+    static bool Owns(int v, int side) {
+        if (v == 0) { return false; }
+        if (side == 1) { return v > 0; }
+        return v < 0;
+    }
+
+    // Single-step adjacency (roads): orthogonal within a side, front-line only
+    // at cols 0/2/4, plus diagonals touching a camp.
+    static bool StepAdj(int from, int to) {
+        int fr = from / 5; int fc = from % 5;
+        int tr = to / 5; int tc = to % 5;
+        int dr = tr - fr; int dc = tc - fc;
+        if (dr < 0) { dr = -dr; }
+        if (dc < 0) { dc = -dc; }
+        if (dr + dc == 1) {
+            int lo = fr; int hi = tr;
+            if (lo > hi) { lo = tr; hi = fr; }
+            if (lo == 5 && hi == 6) {
+                if (fc != tc) { return false; }
+                return fc == 0 || fc == 2 || fc == 4;
+            }
+            return true;
+        }
+        if (dr == 1 && dc == 1) {
+            return Lz.IsCamp(from) || Lz.IsCamp(to);
+        }
+        return false;
+    }
+
+    // Add a move if legal (empty, or enemy not protected in a camp).
+    static int TryAdd(int[] b, int from, int to, int side, int[] mf, int[] mt, int n) {
+        int dv = b[to];
+        if (dv == 0) { mf[n] = from; mt[n] = to; return n + 1; }
+        if (Lz.Owns(dv, side)) { return n; }
+        if (Lz.IsCamp(to)) { return n; }   // cannot attack into a safe camp
+        mf[n] = from; mt[n] = to; return n + 1;
+    }
+
+    static int Gen(int[] b, int side, int[] mf, int[] mt) {
+        int n = 0;
+        int idx = 0;
+        while (idx < 60) {
+            int v = b[idx];
+            if (v != 0 && Lz.Owns(v, side) && Lz.Movable(v) && !Lz.IsHQ(idx)) {
+                int rk = Lz.Rank(v);
+                int r = idx / 5; int c = idx % 5;
+                // one-step road moves
+                int nr = r - 1;
+                while (nr <= r + 1) {
+                    int nc = c - 1;
+                    while (nc <= c + 1) {
+                        if (!(nr == r && nc == c) && nr >= 0 && nr < 12 && nc >= 0 && nc < 5) {
+                            int to = nr * 5 + nc;
+                            if (Lz.StepAdj(idx, to)) { n = Lz.TryAdd(b, idx, to, side, mf, mt, n); }
+                        }
+                        nc = nc + 1;
+                    }
+                    nr = nr + 1;
+                }
+                // railway moves
+                if (Lz.IsRail(idx)) {
+                    if (rk == 1) {
+                        n = Lz.EngineerRail(b, idx, side, mf, mt, n);
+                    } else {
+                        n = Lz.StraightRail(b, idx, side, mf, mt, n);
+                    }
+                }
+            }
+            idx = idx + 1;
+        }
+        return n;
+    }
+
+    static int StraightRail(int[] b, int from, int side, int[] mf, int[] mt, int n) {
+        int di = 0;
+        while (di < 4) {
+            int dr = 0; int dc = 0;
+            if (di == 0) { dr = -1; }
+            if (di == 1) { dr = 1; }
+            if (di == 2) { dc = -1; }
+            if (di == 3) { dc = 1; }
+            int r = from / 5 + dr;
+            int c = from % 5 + dc;
+            bool go = true;
+            while (go && r >= 0 && r < 12 && c >= 0 && c < 5) {
+                int to = r * 5 + c;
+                if (!Lz.IsRail(to)) { go = false; }
+                else {
+                    int dv = b[to];
+                    if (dv == 0) { mf[n] = from; mt[n] = to; n = n + 1; }
+                    else {
+                        if (!Lz.Owns(dv, side) && !Lz.IsCamp(to)) { mf[n] = from; mt[n] = to; n = n + 1; }
+                        go = false;
+                    }
+                }
+                r = r + dr; c = c + dc;
+            }
+            di = di + 1;
+        }
+        return n;
+    }
+
+    // Engineer: BFS over connected empty rail cells; can attack first enemy.
+    static int EngineerRail(int[] b, int from, int side, int[] mf, int[] mt, int n) {
+        int[] q = new int[64];
+        bool[] seen = new bool[60];
+        int head = 0; int tail = 0;
+        q[tail] = from; tail = tail + 1;
+        seen[from] = true;
+        while (head < tail) {
+            int cur = q[head]; head = head + 1;
+            int r = cur / 5; int c = cur % 5;
+            int di = 0;
+            while (di < 4) {
+                int dr = 0; int dc = 0;
+                if (di == 0) { dr = -1; }
+                if (di == 1) { dr = 1; }
+                if (di == 2) { dc = -1; }
+                if (di == 3) { dc = 1; }
+                int nr = r + dr; int nc = c + dc;
+                if (nr >= 0 && nr < 12 && nc >= 0 && nc < 5) {
+                    int nb = nr * 5 + nc;
+                    if (Lz.IsRail(nb) && !seen[nb]) {
+                        int dv = b[nb];
+                        if (dv == 0) {
+                            seen[nb] = true;
+                            mf[n] = from; mt[n] = nb; n = n + 1;
+                            q[tail] = nb; tail = tail + 1;
+                        } else {
+                            seen[nb] = true;
+                            if (!Lz.Owns(dv, side) && !Lz.IsCamp(nb)) { mf[n] = from; mt[n] = nb; n = n + 1; }
+                        }
+                    }
+                }
+                di = di + 1;
+            }
+        }
+        return n;
+    }
+
+    // Combat: returns 0 attacker dies, 1 defender dies (attacker advances),
+    // 2 both die, 3 flag captured (attacker wins game).
+    static int Combat(int a, int d) {
+        int ad = Lz.Rank(a);
+        int dd = Lz.Rank(d);
+        if (dd == 12) { return 3; }
+        if (dd == 11) { if (ad == 1) { return 1; } return 2; }
+        if (ad == 10 || dd == 10) { return 2; }
+        if (ad > dd) { return 1; }
+        if (ad < dd) { return 0; }
+        return 2;
+    }
+}
+
+class LzGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    Talker talk;
+    int[] board;
+    bool[] aiSeen;   // AI piece identity known to player
+    bool[] huSeen;   // human piece identity known to AI
+    int scene;
+    int turn;
+    int winner;
+    int selected;
+    int[] legalTo;
+    int legalN;
+    int aiMoveAt;
+    bool aiPending;
+    int animFrom;
+    int animTo;
+    int animStart;
+    int animPiece;
+    int mouseX;
+    int mouseY;
+    int scoreDelta;
+    int winAdj;
+    int lossAdj;
+    string lastFight;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+    int demoAt;
+
+    static int BX() { return 44; }
+    static int BY() { return 30; }
+    static int CW() { return 104; }
+    static int CH() { return 60; }
+    static int CX(int c) { return 44 + c * 104 + 52; }
+    static int CY(int r) { return 30 + r * 60 + 30; }
+
+    int Noise() {
+        if (this.prof.level == 0) { return 45; }
+        if (this.prof.level == 1) { return 22; }
+        if (this.prof.level == 2) { return 9; }
+        return 2;
+    }
+    string LevelName() {
+        if (this.prof.level == 0) { return "EASY"; }
+        if (this.prof.level == 1) { return "NORMAL"; }
+        if (this.prof.level == 2) { return "HARD"; }
+        return "EXPERT";
+    }
+
+    static LzGame Create(Host h) {
+        LzGame g = new LzGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 573921648);
+        g.talk = Talker.Create(g.rng);
+        g.board = new int[60];
+        g.aiSeen = new bool[60];
+        g.huSeen = new bool[60];
+        g.legalTo = new int[64];
+        g.scene = 0;
+        g.selected = -1;
+        g.winner = 0;
+        g.turn = 1;
+        g.animFrom = -1;
+        g.lastFight = "";
+        g.SetupTalk();
+        g.demo = File.Exists("luzhanqi_demo.txt");
+        if (g.demo) { g.StartGame(Sdl.Ticks()); g.demoAt = Sdl.Ticks() + 500; }
+        return g;
+    }
+
+    void SetupTalk() {
+        this.talk.Add(0, "Good advance!");
+        this.talk.Add(0, "The railway is yours.");
+        this.talk.Add(0, "Push for the flag!");
+        this.talk.Add(1, "Careful, hidden mines...");
+        this.talk.Add(1, "The AI regroups.");
+        this.talk.Add(1, "Your lines look thin.");
+        this.talk.Add(2, "Your move, Commander.");
+        this.talk.Add(2, "Pick a unit.");
+        this.talk.Add(3, "Contact! Shots fired.");
+        this.talk.Add(3, "A fierce exchange!");
+    }
+
+    void Shuffle(int[] a, int n) {
+        int i = n - 1;
+        while (i > 0) {
+            int j = this.rng.Range(0, i + 1);
+            int t = a[i]; a[i] = a[j]; a[j] = t;
+            i = i - 1;
+        }
+    }
+
+    // Fill one side. top=true -> AI rows 0..5 (sign -1); else human rows 6..11.
+    void PlaceSide(bool top) {
+        int r0; int r1; int hqRow; int mineA; int mineB; int frontRow; int sign;
+        if (top) { r0 = 0; r1 = 5; hqRow = 0; mineA = 0; mineB = 1; frontRow = 5; sign = -1; }
+        else { r0 = 6; r1 = 11; hqRow = 11; mineA = 10; mineB = 11; frontRow = 6; sign = 1; }
+
+        int[] cells = new int[30];
+        int nc = 0;
+        int r = r0;
+        while (r <= r1) {
+            int c = 0;
+            while (c < 5) {
+                int idx = r * 5 + c;
+                if (!Lz.IsCamp(idx)) { cells[nc] = idx; nc = nc + 1; }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+
+        // flag into an HQ cell
+        int flag = hqRow * 5 + 1;
+        if (this.rng.Range(0, 2) == 1) { flag = hqRow * 5 + 3; }
+        this.board[flag] = 12 * sign;
+
+        // mines in back two rows
+        int[] mineCells = new int[12];
+        int mn = 0;
+        int i = 0;
+        while (i < nc) {
+            int idx = cells[i];
+            int rr = idx / 5;
+            if ((rr == mineA || rr == mineB) && this.board[idx] == 0) { mineCells[mn] = idx; mn = mn + 1; }
+            i = i + 1;
+        }
+        this.Shuffle(mineCells, mn);
+        int placed = 0;
+        i = 0;
+        while (i < mn && placed < 3) { this.board[mineCells[i]] = 11 * sign; placed = placed + 1; i = i + 1; }
+
+        // bombs anywhere except the front row
+        int[] bombCells = new int[30];
+        int bn = 0;
+        i = 0;
+        while (i < nc) {
+            int idx = cells[i];
+            if (idx / 5 != frontRow && this.board[idx] == 0) { bombCells[bn] = idx; bn = bn + 1; }
+            i = i + 1;
+        }
+        this.Shuffle(bombCells, bn);
+        placed = 0;
+        i = 0;
+        while (i < bn && placed < 2) { this.board[bombCells[i]] = 10 * sign; placed = placed + 1; i = i + 1; }
+
+        // remaining pieces
+        int[] rest = new int[30];
+        int rn = 0;
+        i = 0;
+        while (i < nc) { if (this.board[cells[i]] == 0) { rest[rn] = cells[i]; rn = rn + 1; } i = i + 1; }
+        this.Shuffle(rest, rn);
+        int[] ranks = new int[19];
+        int[] src = new int[19];
+        // 9,8,7,7,6,6,5,5,4,4,3,3,3,2,2,2,1,1,1
+        src[0] = 9; src[1] = 8; src[2] = 7; src[3] = 7; src[4] = 6; src[5] = 6;
+        src[6] = 5; src[7] = 5; src[8] = 4; src[9] = 4; src[10] = 3; src[11] = 3;
+        src[12] = 3; src[13] = 2; src[14] = 2; src[15] = 2; src[16] = 1; src[17] = 1; src[18] = 1;
+        i = 0;
+        while (i < rn && i < 19) { this.board[rest[i]] = src[i] * sign; i = i + 1; }
+    }
+
+    void StartGame(int now) {
+        int i = 0;
+        while (i < 60) { this.board[i] = 0; this.aiSeen[i] = false; this.huSeen[i] = false; i = i + 1; }
+        this.PlaceSide(true);
+        this.PlaceSide(false);
+        this.scene = 1;
+        this.turn = 1;
+        this.winner = 0;
+        this.selected = -1;
+        this.legalN = 0;
+        this.aiPending = false;
+        this.animFrom = -1;
+        this.scoreDelta = 0;
+        this.lastFight = "";
+        this.talk.SayExact(2, "Deploy and strike for the enemy flag!", now, 2800);
+    }
+
+    void ComputeLegal(int from) {
+        this.legalN = 0;
+        int[] mf = new int[400];
+        int[] mt = new int[400];
+        int n = Lz.Gen(this.board, 1, mf, mt);
+        int i = 0;
+        while (i < n) {
+            if (mf[i] == from) { this.legalTo[this.legalN] = mt[i]; this.legalN = this.legalN + 1; }
+            i = i + 1;
+        }
+    }
+
+    bool IsLegalTarget(int to) {
+        int i = 0;
+        while (i < this.legalN) { if (this.legalTo[i] == to) { return true; } i = i + 1; }
+        return false;
+    }
+
+    static string Label(int code) {
+        int rk = Lz.Rank(code);
+        if (rk == 1) { return "ENG"; }
+        if (rk == 2) { return "PLT"; }
+        if (rk == 3) { return "CPT"; }
+        if (rk == 4) { return "MAJ"; }
+        if (rk == 5) { return "COL"; }
+        if (rk == 6) { return "BRG"; }
+        if (rk == 7) { return "MGN"; }
+        if (rk == 8) { return "GEN"; }
+        if (rk == 9) { return "MSH"; }
+        if (rk == 10) { return "BOMB"; }
+        if (rk == 11) { return "MINE"; }
+        return "FLAG";
+    }
+
+    // Perform a move with combat. mover: 1 human, 2 ai.
+    void DoMove(int from, int to, int mover, int now) {
+        this.animFrom = from;
+        this.animTo = to;
+        this.animPiece = this.board[from];
+        this.animStart = now;
+        int a = this.board[from];
+        int d = this.board[to];
+        // reveal on contact
+        if (d != 0) {
+            if (a < 0) { this.aiSeen[from] = true; }
+            if (d < 0) { this.aiSeen[to] = true; }
+            if (a > 0) { this.huSeen[from] = true; }
+            if (d > 0) { this.huSeen[to] = true; }
+            this.lastFight = LzGame.Label(a) + " vs " + LzGame.Label(d);
+            if (this.rng.Range(0, 100) < 70) { this.talk.Say(3, now, 2200); }
+        }
+        if (d == 0) {
+            this.board[to] = a; this.board[from] = 0;
+            this.aiSeen[to] = this.aiSeen[from]; this.aiSeen[from] = false;
+            this.huSeen[to] = this.huSeen[from]; this.huSeen[from] = false;
+            return;
+        }
+        int res = Lz.Combat(a, d);
+        if (res == 3) {
+            this.board[to] = a; this.board[from] = 0;
+            if (a > 0) { this.EndGame(1, now); } else { this.EndGame(2, now); }
+            return;
+        }
+        if (res == 1) {           // attacker wins
+            this.board[to] = a; this.board[from] = 0;
+            this.aiSeen[to] = (a < 0); this.huSeen[to] = (a > 0);
+            this.aiSeen[from] = false; this.huSeen[from] = false;
+        } else if (res == 0) {    // defender wins
+            this.board[from] = 0;
+            this.aiSeen[from] = false; this.huSeen[from] = false;
+        } else {                  // both die
+            this.board[from] = 0; this.board[to] = 0;
+            this.aiSeen[from] = false; this.aiSeen[to] = false;
+            this.huSeen[from] = false; this.huSeen[to] = false;
+        }
+    }
+
+    void HumanMove(int from, int to, int now) {
+        this.DoMove(from, to, 1, now);
+        this.selected = -1;
+        this.legalN = 0;
+        if (this.scene == 2) { return; }
+        int[] mf = new int[400];
+        int[] mt = new int[400];
+        if (Lz.Gen(this.board, 2, mf, mt) == 0) { this.EndGame(1, now); return; }
+        this.turn = 2;
+        this.aiMoveAt = now + 520;
+        this.aiPending = true;
+    }
+
+    int ScoreMove(int from, int to) {
+        int a = this.board[from];
+        int d = this.board[to];
+        int ad = Lz.Rank(a);
+        int toRow = to / 5;
+        int sv = 0;
+        if (d == 0) {
+            sv = toRow * 2;
+            if (Lz.IsRail(to)) { sv = sv + 3; }
+            if (Lz.IsCamp(to)) { sv = sv + 4; }
+        } else {
+            int td = Lz.Rank(d);
+            if (this.huSeen[to]) {
+                if (td == 12) { sv = 100000; }
+                else if (ad == 10) { sv = 40 + td * 8; }
+                else if (td == 11) { if (ad == 1) { sv = 60; } else { sv = -60; } }
+                else {
+                    if (ad > td) { sv = 30 + td * 6; }
+                    else if (ad == td) { sv = 6 - td; }
+                    else { sv = -45; }
+                }
+            } else {
+                if (ad == 10) { sv = 22; }
+                else if (ad == 1) { sv = -18; }
+                else { sv = (ad - 5) * 6; }
+                if (toRow >= 10) { sv = sv + 12; }
+            }
+        }
+        return sv;
+    }
+
+    void AiMove(int now) {
+        this.aiPending = false;
+        int[] mf = new int[400];
+        int[] mt = new int[400];
+        int n = Lz.Gen(this.board, 2, mf, mt);
+        if (n == 0) { this.EndGame(1, now); return; }
+        int bestI = 0;
+        int best = -2000000000;
+        int i = 0;
+        int noise = this.Noise();
+        while (i < n) {
+            int s = this.ScoreMove(mf[i], mt[i]);
+            s = s + this.rng.Range(0, noise);
+            if (s > best) { best = s; bestI = i; }
+            i = i + 1;
+        }
+        this.DoMove(mf[bestI], mt[bestI], 2, now);
+        if (this.scene == 2) { return; }
+        int[] hf = new int[400];
+        int[] ht = new int[400];
+        if (Lz.Gen(this.board, 1, hf, ht) == 0) { this.EndGame(2, now); return; }
+        this.turn = 1;
+    }
+
+    void EndGame(int who, int now) {
+        this.winner = who;
+        this.scene = 2;
+        this.aiPending = false;
+        this.prof.games = this.prof.games + 1;
+        int delta = 0;
+        if (who == 1) {
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.best) { this.prof.best = this.prof.streak; }
+            delta = 20 + this.prof.level * 8;
+            this.prof.rank = this.prof.rank + delta;
+            this.winAdj = this.winAdj + 1; this.lossAdj = 0;
+            this.talk.SayExact(3, "Flag captured! Rank +" + delta, now, 4000);
+            if (this.prof.adaptive == 1 && this.winAdj >= 2 && this.prof.level < 3) {
+                this.prof.level = this.prof.level + 1; this.winAdj = 0;
+            }
+        } else {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            delta = 14 - this.prof.level * 2;
+            if (delta < 6) { delta = 6; }
+            this.prof.rank = this.prof.rank - delta;
+            if (this.prof.rank < 100) { this.prof.rank = 100; }
+            delta = -delta;
+            this.lossAdj = this.lossAdj + 1; this.winAdj = 0;
+            this.talk.SayExact(1, "Your flag has fallen. Rematch?", now, 4000);
+            if (this.prof.adaptive == 1 && this.lossAdj >= 2 && this.prof.level > 0) {
+                this.prof.level = this.prof.level - 1; this.lossAdj = 0;
+            }
+        }
+        this.scoreDelta = delta;
+        this.prof.Save();
+    }
+
+    int PickCell(int px, int py) {
+        if (px < LzGame.BX() || py < LzGame.BY()) { return -1; }
+        int c = (px - LzGame.BX()) / LzGame.CW();
+        int r = (py - LzGame.BY()) / LzGame.CH();
+        if (c < 0 || c > 4 || r < 0 || r > 11) { return -1; }
+        return r * 5 + c;
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawTile(int idx, int v, int alpha) {
+        int x = LzGame.BX() + (idx % 5) * LzGame.CW();
+        int y = LzGame.BY() + (idx / 5) * LzGame.CH();
+        int px = x + 6; int py = y + 5;
+        int pw = LzGame.CW() - 12; int ph = LzGame.CH() - 10;
+        bool human = v > 0;
+        bool known = true;
+        if (!human) { known = this.aiSeen[idx]; }
+        if (this.demo) { known = true; }
+        if (!known) {
+            Draw.RoundRectFill(this.r, px, py, pw, ph, 8, 60, 66, 82, alpha);
+            Draw.RoundRectFill(this.r, px + 3, py + 3, pw - 6, ph - 6, 6, 44, 50, 66, alpha);
+            Text.DrawCentered(this.r, "?", x + LzGame.CW() / 2, y + LzGame.CH() / 2 - 8, 3, 150, 160, 185, alpha);
+            return;
+        }
+        int br; int bg; int bb;
+        if (human) { br = 190; bg = 66; bb = 60; } else { br = 66; bg = 108; bb = 190; }
+        Draw.RoundRectFill(this.r, px, py, pw, ph, 8, 8, 10, 16, alpha);
+        Draw.RoundRectFill(this.r, px + 2, py + 2, pw - 4, ph - 4, 7, br, bg, bb, alpha);
+        Text.DrawCentered(this.r, LzGame.Label(v), x + LzGame.CW() / 2, y + LzGame.CH() / 2 - 7, 2, 250, 248, 240, alpha);
+    }
+
+    void DrawBoard(int now) {
+        int idx = 0;
+        while (idx < 60) {
+            int r = idx / 5; int c = idx % 5;
+            int x = LzGame.BX() + c * LzGame.CW();
+            int y = LzGame.BY() + r * LzGame.CH();
+            int cr = 58; int cg = 72; int cb = 62;
+            if (r <= 5) { cr = 50; cg = 60; cb = 78; }
+            this.r.SetColor(cr, cg, cb, 255);
+            this.r.FillRect(x + 1, y + 1, LzGame.CW() - 2, LzGame.CH() - 2);
+            if (Lz.IsRail(idx)) {
+                Draw.RingRect(this.r, x + 2, y + 2, LzGame.CW() - 4, LzGame.CH() - 4, 1, 120, 110, 70, 120);
+            }
+            if (Lz.IsCamp(idx)) {
+                Draw.FillCircle(this.r, x + LzGame.CW() / 2, y + LzGame.CH() / 2, 22, 90, 80, 50, 200);
+                Draw.RingRect(this.r, x + 6, y + 6, LzGame.CW() - 12, LzGame.CH() - 12, 2, 210, 190, 90, 200);
+            }
+            if (Lz.IsHQ(idx)) {
+                Draw.RingRect(this.r, x + 6, y + 6, LzGame.CW() - 12, LzGame.CH() - 12, 2, 230, 120, 120, 220);
+                Text.DrawCentered(this.r, "HQ", x + LzGame.CW() / 2, y + 4, 1, 220, 160, 160, 200);
+            }
+            idx = idx + 1;
+        }
+        // front line
+        int fy = LzGame.BY() + 6 * LzGame.CH();
+        this.r.SetColor(200, 170, 80, 255);
+        this.r.FillRect(LzGame.BX(), fy - 2, 5 * LzGame.CW(), 4);
+
+        // selection + legal
+        if (this.selected >= 0) {
+            int sx = LzGame.BX() + (this.selected % 5) * LzGame.CW();
+            int sy = LzGame.BY() + (this.selected / 5) * LzGame.CH();
+            Draw.RingRect(this.r, sx + 2, sy + 2, LzGame.CW() - 4, LzGame.CH() - 4, 3, 250, 230, 120, 255);
+            int k = 0;
+            while (k < this.legalN) {
+                int t = this.legalTo[k];
+                int gx = LzGame.CX(t % 5);
+                int gy = LzGame.CY(t / 5);
+                if (this.board[t] != 0) {
+                    Draw.RingRect(this.r, LzGame.BX() + (t % 5) * LzGame.CW() + 3, LzGame.BY() + (t / 5) * LzGame.CH() + 3, LzGame.CW() - 6, LzGame.CH() - 6, 3, 250, 120, 110, 235);
+                } else {
+                    Draw.FillCircle(this.r, gx, gy, 7, 250, 240, 150, 200);
+                }
+                k = k + 1;
+            }
+        }
+
+        bool anim = this.animFrom >= 0 && (now - this.animStart) < 200;
+        idx = 0;
+        while (idx < 60) {
+            int v = this.board[idx];
+            if (v != 0) { if (!(anim && idx == this.animTo)) { this.DrawTile(idx, v, 255); } }
+            idx = idx + 1;
+        }
+        if (anim) {
+            int dt = now - this.animStart;
+            int p = dt * 100 / 200;
+            int fx = LzGame.CX(this.animFrom % 5); int fyy = LzGame.CY(this.animFrom / 5);
+            int tx = LzGame.CX(this.animTo % 5); int tyy = LzGame.CY(this.animTo / 5);
+            int cx = fx + (tx - fx) * p / 100;
+            int cy = fyy + (tyy - fyy) * p / 100;
+            // draw floating piece
+            int px = cx - (LzGame.CW() - 12) / 2; int py = cy - (LzGame.CH() - 10) / 2;
+            bool human = this.animPiece > 0;
+            int br; int bg; int bb;
+            if (human) { br = 190; bg = 66; bb = 60; } else { br = 66; bg = 108; bb = 190; }
+            Draw.RoundRectFill(this.r, px, py, LzGame.CW() - 12, LzGame.CH() - 10, 8, br, bg, bb, 255);
+            string lbl = LzGame.Label(this.animPiece);
+            if (!human && !this.demo) { lbl = "?"; }
+            Text.DrawCentered(this.r, lbl, cx, cy - 7, 2, 250, 248, 240, 255);
+        }
+    }
+
+    void DrawTalk(int px, int py, int w, int now) {
+        string msg = this.talk.Current(now);
+        if (msg.Length == 0) { return; }
+        int kind = this.talk.Kind();
+        int cr = 90; int cg = 150; int cb = 220;
+        if (kind == 0) { cr = 90; cg = 200; cb = 130; }
+        if (kind == 1) { cr = 230; cg = 130; cb = 90; }
+        if (kind == 3) { cr = 250; cg = 200; cb = 70; }
+        this.r.SetColor(28, 32, 42, 235);
+        this.r.FillRect(px, py, w, 46);
+        Draw.RingRect(this.r, px, py, w, 46, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, msg, px + 14, py + 16, 2, cr, cg, cb, 255);
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(20, 24, 32);
+        this.DrawBoard(now);
+
+        int px = 600;
+        Text.Draw(this.r, "LUZHANQI", px, 40, 5, 240, 240, 250, 255);
+        Text.Draw(this.r, "LAND BATTLE CHESS", px, 86, 2, 240, 208, 130, 255);
+
+        string status = "YOUR TURN (RED)";
+        int sr = 206; int sg = 90; int sb = 84;
+        if (this.turn == 2) {
+            int dots = (now / 300) % 4;
+            status = "AI THINKING";
+            int d = 0;
+            while (d < dots) { status = status + "."; d = d + 1; }
+            sr = 90; sg = 130; sb = 210;
+        }
+        this.r.SetColor(30, 36, 48, 255);
+        this.r.FillRect(px, 120, 640, 42);
+        Text.Draw(this.r, status, px + 12, 133, 2, sr, sg, sb, 255);
+
+        Text.Draw(this.r, "DIFFICULTY  " + this.LevelName(), px, 178, 2, 180, 190, 210, 255);
+        Text.Draw(this.r, "RANK  " + this.prof.TierName() + "  " + this.prof.rank, px, 204, 2, 255, 210, 90, 255);
+        Text.Draw(this.r, "STREAK  " + this.prof.streak + "   RECORD  " + this.prof.wins + "-" + this.prof.losses, px, 230, 2, 180, 190, 210, 255);
+        if (this.lastFight.Length > 0) {
+            Text.Draw(this.r, "LAST FIGHT  " + this.lastFight, px, 256, 2, 235, 180, 120, 255);
+        }
+
+        Text.Draw(this.r, "MSH>GEN>MGN>BRG>COL>MAJ>CPT>PLT>ENG", px, 296, 1, 150, 160, 180, 255);
+        Text.Draw(this.r, "BOMB kills both. ENG defuses MINE.", px, 314, 1, 150, 160, 180, 255);
+        Text.Draw(this.r, "Camps are safe. Capture the FLAG.", px, 332, 1, 150, 160, 180, 255);
+
+        this.DrawTalk(px, 366, 640, now);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, px, 686, 180, 54, "RESTART (R)", 2, 0);
+        Ui.Button(this.r, this.mouseX, this.mouseY, px + 198, 686, 180, 54, "MENU (ESC)", 2, 0);
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/luzhanqi/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(18, 22, 30);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+
+        Text.DrawCenteredShadow(this.r, "LUZHANQI", 640, 72, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "LAND BATTLE CHESS -- CAPTURE THE FLAG", 640, 176, 3, 240, 208, 130, 3);
+
+        Ui.Panel(this.r, 300, 250, 680, 470, 20, 24, 34, 212);
+        Text.DrawCenteredShadow(this.r, "SELECT DIFFICULTY", 640, 278, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 4) {
+            string nm = "EASY";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            if (i == 3) { nm = "EXPERT"; }
+            int kind = 0;
+            if (this.prof.level == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 330 + i * 156, 310, 140, 54, nm, 2, kind);
+            i = i + 1;
+        }
+        string adv = "ADAPTIVE: OFF";
+        if (this.prof.adaptive == 1) { adv = "ADAPTIVE: ON"; }
+        int akind = 0;
+        if (this.prof.adaptive == 1) { akind = 1; }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 330, 382, 250, 46, adv, 2, akind);
+        Text.Draw(this.r, "AI scales to your skill", 600, 396, 2, 150, 160, 178, 255);
+
+        Ui.Panel(this.r, 330, 448, 620, 128, 14, 18, 26, 200);
+        Text.Draw(this.r, "RANK", 354, 466, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.TierName() + "  " + this.prof.rank, 354, 488, 4, 255, 210, 90, 2);
+        Text.Draw(this.r, "BEST STREAK  " + this.prof.best, 354, 540, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.wins + "W - " + this.prof.losses + "L", 720, 488, 3, 205, 214, 232, 2);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, 720, 540, 2, 150, 160, 180, 255);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 632, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "Pieces are hidden until they fight.   1-4 difficulty   ENTER play   F11 fullscreen", 640, 742, 2, 176, 184, 200, 2);
+
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 170);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 240; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        string title = "YOU WIN!";
+        int tr = 90; int tg = 210; int tb = 130;
+        if (this.winner == 2) { title = "AI WINS"; tr = 230; tg = 120; tb = 90; }
+        Text.DrawCentered(this.r, title, 640, by + 40, 7, tr, tg, tb, 255);
+        string ds = "RANK " + this.scoreDelta;
+        if (this.scoreDelta > 0) { ds = "RANK +" + this.scoreDelta; }
+        Text.DrawCentered(this.r, ds, 640, by + 120, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, this.prof.TierName() + "  " + this.prof.rank + "    STREAK " + this.prof.streak, 640, by + 168, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 210, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 210, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } }
+        if (sc == 21) { if (this.scene != 0) { this.StartGame(now); } }
+        if (this.scene == 0) {
+            if (sc == 30) { this.prof.level = 0; }
+            if (sc == 31) { this.prof.level = 1; }
+            if (sc == 32) { this.prof.level = 2; }
+            if (sc == 33) { this.prof.level = 3; }
+            if (sc == 40 || sc == 44) { this.StartGame(now); }
+        }
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 4) {
+                if (Draw.PointIn(cx, cy, 330 + i * 156, 310, 140, 54)) { this.prof.level = i; }
+                i = i + 1;
+            }
+            if (Draw.PointIn(cx, cy, 330, 382, 250, 46)) { this.prof.adaptive = 1 - this.prof.adaptive; }
+            if (Draw.PointIn(cx, cy, 470, 632, 340, 74)) { this.StartGame(now); }
+        } else if (this.scene == 1) {
+            if (Draw.PointIn(cx, cy, 600, 686, 180, 54)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 798, 686, 180, 54)) { this.scene = 0; return; }
+            if (this.turn != 1 || this.aiPending) { return; }
+            int idx = this.PickCell(cx, cy);
+            if (idx < 0) { return; }
+            if (this.selected >= 0 && this.IsLegalTarget(idx)) { this.HumanMove(this.selected, idx, now); return; }
+            if (this.board[idx] > 0 && Lz.Movable(this.board[idx]) && !Lz.IsHQ(idx)) {
+                this.selected = idx; this.ComputeLegal(idx);
+            } else { this.selected = -1; this.legalN = 0; }
+        } else {
+            if (Draw.PointIn(cx, cy, 400, 450, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 450, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    void Tick(int now) {
+        if (this.demo) {
+            if (this.scene == 2 && now >= this.demoAt) { this.StartGame(now); this.demoAt = now + 900; return; }
+            if (this.scene == 1 && this.turn == 1 && !this.aiPending && now >= this.demoAt) {
+                int[] mf = new int[400];
+                int[] mt = new int[400];
+                int n = Lz.Gen(this.board, 1, mf, mt);
+                if (n > 0) {
+                    int pick = this.rng.Range(0, n);
+                    this.HumanMove(mf[pick], mt[pick], now);
+                }
+                this.demoAt = now + 450;
+            }
+        }
+        if (this.scene == 1 && this.turn == 2 && this.aiPending && now >= this.aiMoveAt) {
+            this.AiMove(now);
+            if (this.demo) { this.demoAt = now + 300; }
+        }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 1) { this.DrawPlay(now); }
+        else { this.DrawOver(now); }
+    }
+}
+
+class LzApp {
+    static void Main() {
+        Host h = Host.Create("Luzhanqi - Land Battle Chess", 1280, 800);
+        LzGame g = LzGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) {
+                        int sc = SdlEvent.Scancode();
+                        if (sc == 68) { h.ToggleFullscreen(); }
+                        else { g.OnKey(sc, now); }
+                    }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}

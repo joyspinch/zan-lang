@@ -5,6 +5,12 @@ namespace SDL3;
 /// <summary>An owning SDL_Renderer handle with integer-coordinate helpers.</summary>
 class SdlRenderer {
     int handle;
+    // Optional integer super-scale applied to all integer drawing coordinates so
+    // the scene can be rasterized at (near) native resolution instead of being
+    // linear-upscaled from a small logical canvas. Defaults to 1/1 (identity),
+    // so existing callers are unaffected until they opt in via SetUiScale.
+    int sclN;
+    int sclD;
 
     static SdlRenderer Create(SdlWindow window) {
         return CreateNamed(window, "");
@@ -13,7 +19,24 @@ class SdlRenderer {
     static SdlRenderer CreateNamed(SdlWindow window, string driverName) {
         SdlRenderer renderer = new SdlRenderer();
         renderer.handle = SdlNative.zan_sdl_create_renderer(window.Handle(), driverName);
+        renderer.sclN = 1;
+        renderer.sclD = 1;
         return renderer;
+    }
+
+    // Set the coordinate super-scale as the fraction num/den (>=1). Callers keep
+    // authoring in design units; every draw is multiplied up to native pixels.
+    void SetUiScale(int num, int den) {
+        if (num < 1) { num = 1; }
+        if (den < 1) { den = 1; }
+        this.sclN = num;
+        this.sclD = den;
+    }
+    int ScaleNum() { return this.sclN; }
+    int ScaleDen() { return this.sclD; }
+    int Sc(int v) {
+        if (this.sclD < 1) { return v; }
+        return v * this.sclN / this.sclD;
     }
 
     bool IsValid() { return this.handle != 0; }
@@ -30,14 +53,26 @@ class SdlRenderer {
         return SdlNative.zan_sdl_set_logical_size(this.handle, width, height, mode) != 0;
     }
 
+    int LogicalX(double windowX, double windowY) {
+        return (int)SdlNative.zan_sdl_window_to_render_x(
+            this.handle, windowX, windowY);
+    }
+
+    int LogicalY(double windowX, double windowY) {
+        return (int)SdlNative.zan_sdl_window_to_render_y(
+            this.handle, windowX, windowY);
+    }
+
     bool SetColor(int red, int green, int blue, int alpha) {
         return SdlNative.zan_sdl_set_draw_color(this.handle, red, green, blue, alpha) != 0;
     }
 
     bool SetClip(int x, int y, int width, int height) {
-        int packedPosition = ((x & 65535) << 16) | (y & 65535);
+        int sx = this.Sc(x); int sy = this.Sc(y);
+        int sw = this.Sc(x + width) - sx; int sh = this.Sc(y + height) - sy;
+        int packedPosition = ((sx & 65535) << 16) | (sy & 65535);
         return SdlNative.zan_sdl_set_draw_color(
-            this.handle, -2 - packedPosition, width, height, 0) != 0;
+            this.handle, -2 - packedPosition, sw, sh, 0) != 0;
     }
 
     bool ResetClip() {
@@ -49,24 +84,62 @@ class SdlRenderer {
     bool Present() { return SdlNative.zan_sdl_present(this.handle) != 0; }
 
     bool DrawPoint(int x, int y) {
-        return SdlNative.zan_sdl_draw_point(this.handle, x, y) != 0;
+        return SdlNative.zan_sdl_draw_point(this.handle, this.Sc(x), this.Sc(y)) != 0;
     }
 
     bool DrawLine(int x1, int y1, int x2, int y2) {
-        return SdlNative.zan_sdl_draw_line(this.handle, x1, y1, x2, y2) != 0;
+        return SdlNative.zan_sdl_draw_line(this.handle,
+            this.Sc(x1), this.Sc(y1), this.Sc(x2), this.Sc(y2)) != 0;
     }
 
     bool DrawRect(int x, int y, int width, int height) {
-        return SdlNative.zan_sdl_draw_rect(this.handle, x, y, width, height) != 0;
+        int sx = this.Sc(x); int sy = this.Sc(y);
+        return SdlNative.zan_sdl_draw_rect(this.handle,
+            sx, sy, this.Sc(x + width) - sx, this.Sc(y + height) - sy) != 0;
     }
 
     bool FillRect(int x, int y, int width, int height) {
+        int sx = this.Sc(x); int sy = this.Sc(y);
+        return SdlNative.zan_sdl_fill_rect(this.handle,
+            sx, sy, this.Sc(x + width) - sx, this.Sc(y + height) - sy) != 0;
+    }
+
+    // Fill without super-scaling; used by helpers that already computed native
+    // pixel coordinates (e.g. smooth circles rasterized at native resolution).
+    bool FillRectRaw(int x, int y, int width, int height) {
         return SdlNative.zan_sdl_fill_rect(this.handle, x, y, width, height) != 0;
     }
 
     bool DrawTexture(SdlTexture texture, int x, int y, int width, int height) {
+        int sx = this.Sc(x); int sy = this.Sc(y);
         return SdlNative.zan_sdl_render_texture(
-            this.handle, texture.Handle(), x, y, width, height) != 0;
+            this.handle, texture.Handle(), sx, sy,
+            this.Sc(x + width) - sx, this.Sc(y + height) - sy) != 0;
+    }
+
+    bool DrawTextureRegion(
+        SdlTexture texture,
+        int sourceX,
+        int sourceY,
+        int sourceWidth,
+        int sourceHeight,
+        int x,
+        int y,
+        int width,
+        int height
+    ) {
+        int sx = this.Sc(x); int sy = this.Sc(y);
+        return SdlNative.zan_sdl_render_texture_region(
+            this.handle,
+            texture.Handle(),
+            sourceX,
+            sourceY,
+            sourceWidth,
+            sourceHeight,
+            sx,
+            sy,
+            this.Sc(x + width) - sx,
+            this.Sc(y + height) - sy) != 0;
     }
 
     bool DrawTextureRotated(
@@ -85,6 +158,22 @@ class SdlRenderer {
             this.handle, texture.Handle(),
             x, y, packedWidth, height) != 0;
     }
+
+    bool SetTarget(SdlTexture texture) {
+        if (texture == null) { return this.ResetTarget(); }
+        return SdlNative.zan_sdl_set_render_target(
+            this.handle, texture.Handle()) != 0;
+    }
+
+    bool ResetTarget() {
+        return SdlNative.zan_sdl_set_render_target(this.handle, 0) != 0;
+    }
+
+    bool SetBlend(int mode) {
+        return SdlNative.zan_sdl_set_draw_blend(this.handle, mode) != 0;
+    }
+
+    bool ClearClip() { return this.ResetClip(); }
 
     void Close() {
         if (this.handle != 0) {

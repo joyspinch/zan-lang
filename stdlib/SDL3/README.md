@@ -44,7 +44,9 @@ class Program {
 - process lifecycle, errors, version and timing;
 - windows, size, title, visibility and fullscreen;
 - renderer creation, VSync, logical presentation and primitive drawing;
-- RGBA32 streaming/static textures and BMP texture loading;
+- RGBA32 streaming/static textures, PNG/JPEG loading with preserved Alpha,
+  legacy BMP loading, texture regions, render targets, color/alpha modulation
+  and blend modes;
 - event polling for window, keyboard, text and mouse events;
 - keyboard state, scancodes, modifiers and mouse buttons;
 - publish-time bundling through the native-driver mechanism.

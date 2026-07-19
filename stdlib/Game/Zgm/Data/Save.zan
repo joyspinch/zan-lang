@@ -1,0 +1,351 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using Game.Zgm;
+
+namespace Game.Zgm.Data;
+
+// ZGM-native save repository on top of the generic SQLite connection. The
+// schema is ZGM-local: one row per slot plus normalized child rows for
+// inventory, equipment, learned skills and active buffs. It stays separate
+// from the generic System.Data.Sqlite API.
+class ZgmSaveRepository {
+    ZgmDatabase database;
+    bool ready;
+
+    static ZgmSaveRepository Open(ZgmDatabase database) {
+        if (database == null || !database.IsOpen()) { return null; }
+        ZgmSaveRepository repository = new ZgmSaveRepository();
+        repository.database = database;
+        repository.ready = repository.Initialize();
+        return repository;
+    }
+
+    static ZgmSaveRepository OpenProject(
+        ZgmProject project,
+        string componentName,
+        string path
+    ) {
+        ZgmDatabase database = ZgmDatabase.OpenProject(
+            project, componentName, path);
+        return ZgmSaveRepository.Open(database);
+    }
+
+    bool IsReady() { return this.ready; }
+    ZgmDatabase Database() { return this.database; }
+
+    bool HasColumn(string table, string column) {
+        DbResult columns = this.database.Query(
+            "PRAGMA table_info(" + table + ")");
+        int i = 0;
+        while (i < columns.RowCount()) {
+            if (columns.GetString(i, 1) == column) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    bool EnsureColumn(string table, string column, string definition) {
+        if (this.HasColumn(table, column)) { return true; }
+        return this.database.Execute(
+            "ALTER TABLE " + table + " ADD COLUMN "
+            + column + " " + definition) >= 0;
+    }
+
+    bool Initialize() {
+        int saves = this.database.Execute(
+            "CREATE TABLE IF NOT EXISTS zgm_save_slot ("
+            + "slot TEXT PRIMARY KEY,"
+            + "map_name TEXT NOT NULL,"
+            + "hero_x INTEGER NOT NULL,"
+            + "hero_y INTEGER NOT NULL,"
+            + "hero_direction INTEGER NOT NULL,"
+            + "hero_level INTEGER NOT NULL,"
+            + "hero_hp INTEGER NOT NULL,"
+            + "hero_mp INTEGER NOT NULL,"
+            + "hero_experience INTEGER NOT NULL DEFAULT 0,"
+            + "hero_rage INTEGER NOT NULL DEFAULT 0)");
+        if (saves < 0) { return false; }
+        if (!this.EnsureColumn(
+            "zgm_save_slot", "hero_experience",
+            "INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+        if (!this.EnsureColumn(
+            "zgm_save_slot", "hero_rage",
+            "INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+
+        int items = this.database.Execute(
+            "CREATE TABLE IF NOT EXISTS zgm_save_item ("
+            + "slot TEXT NOT NULL,"
+            + "item_name TEXT NOT NULL,"
+            + "quantity INTEGER NOT NULL,"
+            + "PRIMARY KEY(slot, item_name))");
+        if (items < 0) { return false; }
+
+        int equipment = this.database.Execute(
+            "CREATE TABLE IF NOT EXISTS zgm_save_equipment ("
+            + "slot TEXT NOT NULL,"
+            + "equip_slot TEXT NOT NULL,"
+            + "item_name TEXT NOT NULL,"
+            + "PRIMARY KEY(slot, equip_slot))");
+        if (equipment < 0) { return false; }
+
+        int skills = this.database.Execute(
+            "CREATE TABLE IF NOT EXISTS zgm_save_skill ("
+            + "slot TEXT NOT NULL,"
+            + "skill_name TEXT NOT NULL,"
+            + "PRIMARY KEY(slot, skill_name))");
+        if (skills < 0) { return false; }
+
+        int buffs = this.database.Execute(
+            "CREATE TABLE IF NOT EXISTS zgm_save_buff ("
+            + "slot TEXT NOT NULL,"
+            + "buff_name TEXT NOT NULL,"
+            + "remaining INTEGER NOT NULL,"
+            + "PRIMARY KEY(slot, buff_name))");
+        return buffs >= 0;
+    }
+
+    // Quotes a value for SQLite without requiring a second SQL parameter API.
+    // The repository only interpolates slot and item identifiers; numeric
+    // snapshot fields are emitted as integers.
+    static string Quote(string text) {
+        string result = "'";
+        int i = 0;
+        while (i < text.Length) {
+            string part = text.Substring(i, 1);
+            if (part == "'") {
+                result = result + "''";
+            } else {
+                result = result + part;
+            }
+            i = i + 1;
+        }
+        return result + "'";
+    }
+
+    bool Save(string slot, ZgmSaveState state) {
+        if (!this.ready || slot == "" || state == null) { return false; }
+        string key = ZgmSaveRepository.Quote(slot);
+        this.database.Begin();
+
+        int row = this.database.Execute(
+            "INSERT OR REPLACE INTO zgm_save_slot "
+            + "(slot,map_name,hero_x,hero_y,hero_direction,hero_level,"
+            + "hero_hp,hero_mp,hero_experience,hero_rage) VALUES ("
+            + key + ","
+            + ZgmSaveRepository.Quote(state.MapName()) + ","
+            + Convert.ToString(state.HeroX()) + ","
+            + Convert.ToString(state.HeroY()) + ","
+            + Convert.ToString(state.HeroDirection()) + ","
+            + Convert.ToString(state.HeroLevel()) + ","
+            + Convert.ToString(state.HeroHp()) + ","
+            + Convert.ToString(state.HeroMp()) + ","
+            + Convert.ToString(state.HeroExperience()) + ","
+            + Convert.ToString(state.HeroRage()) + ")");
+        if (row < 0) {
+            this.database.Rollback();
+            return false;
+        }
+
+        int removed = this.database.Execute(
+            "DELETE FROM zgm_save_item WHERE slot=" + key);
+        if (removed < 0) {
+            this.database.Rollback();
+            return false;
+        }
+        int removedEquipment = this.database.Execute(
+            "DELETE FROM zgm_save_equipment WHERE slot=" + key);
+        int removedSkills = this.database.Execute(
+            "DELETE FROM zgm_save_skill WHERE slot=" + key);
+        int removedBuffs = this.database.Execute(
+            "DELETE FROM zgm_save_buff WHERE slot=" + key);
+        if (removedEquipment < 0
+            || removedSkills < 0
+            || removedBuffs < 0) {
+            this.database.Rollback();
+            return false;
+        }
+
+        int i = 0;
+        while (i < state.ItemCount()) {
+            ZgmSaveItem item = state.ItemAt(i);
+            int inserted = this.database.Execute(
+                "INSERT INTO zgm_save_item(slot,item_name,quantity) VALUES("
+                + key + ","
+                + ZgmSaveRepository.Quote(item.Name()) + ","
+                + Convert.ToString(item.Quantity()) + ")");
+            if (inserted < 0) {
+                this.database.Rollback();
+                return false;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < state.EquipmentCount()) {
+            ZgmSaveEquipment equipment = state.EquipmentAt(i);
+            int inserted = this.database.Execute(
+                "INSERT INTO zgm_save_equipment("
+                + "slot,equip_slot,item_name) VALUES("
+                + key + ","
+                + ZgmSaveRepository.Quote(equipment.Slot()) + ","
+                + ZgmSaveRepository.Quote(equipment.ItemName()) + ")");
+            if (inserted < 0) {
+                this.database.Rollback();
+                return false;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < state.SkillCount()) {
+            ZgmSaveSkill skill = state.SkillAt(i);
+            int inserted = this.database.Execute(
+                "INSERT INTO zgm_save_skill(slot,skill_name) VALUES("
+                + key + ","
+                + ZgmSaveRepository.Quote(skill.Name()) + ")");
+            if (inserted < 0) {
+                this.database.Rollback();
+                return false;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < state.BuffCount()) {
+            ZgmSaveBuff buff = state.BuffAt(i);
+            int inserted = this.database.Execute(
+                "INSERT INTO zgm_save_buff("
+                + "slot,buff_name,remaining) VALUES("
+                + key + ","
+                + ZgmSaveRepository.Quote(buff.Name()) + ","
+                + Convert.ToString(buff.Remaining()) + ")");
+            if (inserted < 0) {
+                this.database.Rollback();
+                return false;
+            }
+            i = i + 1;
+        }
+
+        this.database.Commit();
+        return true;
+    }
+
+    ZgmSaveState Load(string slot) {
+        if (!this.ready || slot == "") { return null; }
+        string key = ZgmSaveRepository.Quote(slot);
+        DbResult row = this.database.Query(
+            "SELECT map_name,hero_x,hero_y,hero_direction,hero_level,"
+            + "hero_hp,hero_mp,hero_experience,hero_rage "
+            + "FROM zgm_save_slot WHERE slot=" + key);
+        if (row.RowCount() == 0) { return null; }
+
+        ZgmSaveState state = ZgmSaveState.Create(
+            row.GetString(0, 0),
+            Convert.ToInt32(row.GetString(0, 1)),
+            Convert.ToInt32(row.GetString(0, 2)),
+            Convert.ToInt32(row.GetString(0, 3)),
+            Convert.ToInt32(row.GetString(0, 4)),
+            Convert.ToInt32(row.GetString(0, 5)),
+            Convert.ToInt32(row.GetString(0, 6)))
+            .SetProgress(
+                Convert.ToInt32(row.GetString(0, 7)),
+                Convert.ToInt32(row.GetString(0, 8)));
+
+        DbResult items = this.database.Query(
+            "SELECT item_name,quantity FROM zgm_save_item "
+            + "WHERE slot=" + key + " ORDER BY item_name");
+        int i = 0;
+        while (i < items.RowCount()) {
+            state.AddItem(
+                items.GetString(i, 0),
+                Convert.ToInt32(items.GetString(i, 1)));
+            i = i + 1;
+        }
+        DbResult equipment = this.database.Query(
+            "SELECT equip_slot,item_name FROM zgm_save_equipment "
+            + "WHERE slot=" + key + " ORDER BY equip_slot");
+        i = 0;
+        while (i < equipment.RowCount()) {
+            state.AddEquipment(
+                equipment.GetString(i, 0),
+                equipment.GetString(i, 1));
+            i = i + 1;
+        }
+        DbResult skills = this.database.Query(
+            "SELECT skill_name FROM zgm_save_skill "
+            + "WHERE slot=" + key + " ORDER BY skill_name");
+        i = 0;
+        while (i < skills.RowCount()) {
+            state.AddSkill(skills.GetString(i, 0));
+            i = i + 1;
+        }
+        DbResult buffs = this.database.Query(
+            "SELECT buff_name,remaining FROM zgm_save_buff "
+            + "WHERE slot=" + key + " ORDER BY buff_name");
+        i = 0;
+        while (i < buffs.RowCount()) {
+            state.AddBuff(
+                buffs.GetString(i, 0),
+                Convert.ToInt32(buffs.GetString(i, 1)));
+            i = i + 1;
+        }
+        return state;
+    }
+
+    bool Exists(string slot) {
+        if (!this.ready || slot == "") { return false; }
+        string count = this.database.Scalar(
+            "SELECT COUNT(*) FROM zgm_save_slot WHERE slot="
+            + ZgmSaveRepository.Quote(slot));
+        return Convert.ToInt32(count) > 0;
+    }
+
+    bool Delete(string slot) {
+        if (!this.ready || slot == "") { return false; }
+        string key = ZgmSaveRepository.Quote(slot);
+        this.database.Begin();
+        int itemResult = this.database.Execute(
+            "DELETE FROM zgm_save_item WHERE slot=" + key);
+        int equipmentResult = this.database.Execute(
+            "DELETE FROM zgm_save_equipment WHERE slot=" + key);
+        int skillResult = this.database.Execute(
+            "DELETE FROM zgm_save_skill WHERE slot=" + key);
+        int buffResult = this.database.Execute(
+            "DELETE FROM zgm_save_buff WHERE slot=" + key);
+        int saveResult = this.database.Execute(
+            "DELETE FROM zgm_save_slot WHERE slot=" + key);
+        if (itemResult < 0
+            || equipmentResult < 0
+            || skillResult < 0
+            || buffResult < 0
+            || saveResult < 0) {
+            this.database.Rollback();
+            return false;
+        }
+        this.database.Commit();
+        return saveResult > 0;
+    }
+
+    int SlotCount() {
+        if (!this.ready) { return 0; }
+        return Convert.ToInt32(
+            this.database.Scalar("SELECT COUNT(*) FROM zgm_save_slot"));
+    }
+
+    string SlotAt(int index) {
+        if (!this.ready || index < 0) { return ""; }
+        DbResult slots = this.database.Query(
+            "SELECT slot FROM zgm_save_slot ORDER BY slot");
+        if (index >= slots.RowCount()) { return ""; }
+        return slots.GetString(index, 0);
+    }
+
+    void Close() {
+        if (this.database != null) {
+            this.database.Close();
+        }
+        this.ready = false;
+        this.database = null;
+    }
+}

@@ -1,0 +1,275 @@
+// Production UI rendering: real Zgm Widget/UiRuntime state -> IUiRenderer,
+// with the concrete backend chosen at COMPILE TIME (-DUI_GPU / -DUI_SOFTWARE /
+// default headless). Only the UI_GPU build references SDL3.
+//
+// The widget paint pass (WidgetPainter) is written ONCE against IUiRenderer and
+// walks the real ZgmWindowState / ZgmWidgetState produced by UiRuntime. It reads
+// only base Widget + ZgmWidgetState getters (rect / visible / alpha / text /
+// range position) and dispatches on Kind(); no downcast is required.
+
+// The SDL3/GPU backend (class SdlUiRenderer) lives in a separate file
+// (optional/UiRenderSdl.zan) that is passed on the compiler command line ONLY
+// for -DUI_GPU builds. This is deliberate: --auto-stdlib discovers modules by a
+// raw pre-preprocess text scan for `using ...;`, so a `using SDL3;` here -- even
+// under #if UI_GPU -- would still pull stdlib/SDL3 into non-GPU builds. Keeping
+// SDL out of every always-compiled file is what makes non-GPU binaries free of
+// any SDL3 dependency.
+using System;
+using System.Collections.Generic;
+
+namespace Game.Zgm;
+
+// ---- backend-agnostic contract -------------------------------------------
+interface IUiRenderer {
+    string BackendName();
+    bool GpuAccelerated();
+    void BeginFrame(int r, int g, int b);
+    void PushClip(int x, int y, int w, int h);
+    void PopClip();
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a);
+    void DrawBorder(int x, int y, int w, int h, int t, int r, int g, int b, int a);
+    // Text is rasterized from the shared PixelFont glyph set; DrawSprite takes
+    // the widget's image resource id so a backend with a decoder (GPU) can blit
+    // a cached texture, while decoder-less backends fall back to a tint block.
+    void DrawText(string text, int x, int y, int r, int g, int b, int a);
+    void DrawSprite(string image, int x, int y, int w, int h, int angle, int alpha);
+    void EndFrame();
+    long Metric();
+}
+
+// ==========================================================================
+#if UI_SOFTWARE
+class SoftwareUiRenderer : IUiRenderer {
+    int width; int height;
+    int[] buffer;
+    int clipX; int clipY; int clipW; int clipH;
+
+    static SoftwareUiRenderer Create(int width, int height) {
+        SoftwareUiRenderer self = new SoftwareUiRenderer();
+        self.width = width; self.height = height;
+        self.buffer = new int[width * height];
+        self.clipX = 0; self.clipY = 0; self.clipW = width; self.clipH = height;
+        return self;
+    }
+    string BackendName() { return "software-cpu"; }
+    bool GpuAccelerated() { return false; }
+    void Blend(int px, int py, int r, int g, int b, int a) {
+        if (px < this.clipX || py < this.clipY) { return; }
+        if (px >= this.clipX + this.clipW || py >= this.clipY + this.clipH) { return; }
+        if (px < 0 || py < 0 || px >= this.width || py >= this.height) { return; }
+        int idx = py * this.width + px;
+        int old = this.buffer[idx];
+        int or = (old >> 16) & 255; int og = (old >> 8) & 255; int ob = old & 255;
+        int nr = (r * a + or * (255 - a)) / 255;
+        int ng = (g * a + og * (255 - a)) / 255;
+        int nb = (b * a + ob * (255 - a)) / 255;
+        this.buffer[idx] = ((nr & 255) << 16) | ((ng & 255) << 8) | (nb & 255);
+    }
+    void BeginFrame(int r, int g, int b) {
+        int packed = ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+        int i = 0; int total = this.width * this.height;
+        while (i < total) { this.buffer[i] = packed; i = i + 1; }
+    }
+    void PushClip(int x, int y, int w, int h) {
+        this.clipX = x; this.clipY = y; this.clipW = w; this.clipH = h;
+    }
+    void PopClip() {
+        this.clipX = 0; this.clipY = 0; this.clipW = this.width; this.clipH = this.height;
+    }
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a) {
+        int yy = 0;
+        while (yy < h) {
+            int xx = 0;
+            while (xx < w) { this.Blend(x + xx, y + yy, r, g, b, a); xx = xx + 1; }
+            yy = yy + 1;
+        }
+    }
+    void DrawBorder(int x, int y, int w, int h, int t, int r, int g, int b, int a) {
+        this.FillRect(x, y, w, t, r, g, b, a);
+        this.FillRect(x, y + h - t, w, t, r, g, b, a);
+        this.FillRect(x, y, t, h, r, g, b, a);
+        this.FillRect(x + w - t, y, t, h, r, g, b, a);
+    }
+    void DrawText(string text, int x, int y, int r, int g, int b, int a) {
+        if (text == null) { return; }
+        int cx = x;
+        int i = 0;
+        while (i < text.Length) {
+            int cp = text[i] & 255;
+            int ry = 0;
+            while (ry < 8) {
+                int mask = PixelFont.Row(cp, ry);
+                int rx = 0;
+                while (rx < 8) {
+                    if ((mask & (1 << (7 - rx))) != 0) {
+                        this.Blend(cx + rx, y + ry, r, g, b, a);
+                    }
+                    rx = rx + 1;
+                }
+                ry = ry + 1;
+            }
+            cx = cx + PixelFont.Advance();
+            i = i + 1;
+        }
+    }
+    // No image decoder on the CPU path: render a deterministic tint block whose
+    // hue is derived from the resource id so distinct sprites stay visually
+    // distinguishable. The GPU backend blits the real cached texture.
+    void DrawSprite(string image, int x, int y, int w, int h, int angle, int alpha) {
+        int seed = 0;
+        if (image != null) {
+            int i = 0;
+            while (i < image.Length) { seed = seed + (image[i] & 255); i = i + 1; }
+        }
+        int r = 120 + (seed * 37) % 120;
+        int g = 90 + (seed * 53) % 120;
+        int b = 80 + (seed * 29) % 120;
+        this.FillRect(x, y, w, h, r, g, b, alpha);
+        this.DrawBorder(x, y, w, h, 1, 20, 24, 32, alpha);
+    }
+    void EndFrame() { }
+    long Metric() {
+        long sum = 0; int i = 0; int total = this.width * this.height;
+        while (i < total) { sum = sum + (long)this.buffer[i]; i = i + 1; }
+        return sum;
+    }
+}
+#endif
+
+// ==========================================================================
+#if UI_GPU
+#elif UI_SOFTWARE
+#else
+class HeadlessUiRenderer : IUiRenderer {
+    long metric;
+    static HeadlessUiRenderer Create(int width, int height) {
+        HeadlessUiRenderer self = new HeadlessUiRenderer();
+        self.metric = (long)(width + height);
+        return self;
+    }
+    string BackendName() { return "headless"; }
+    bool GpuAccelerated() { return false; }
+    void BeginFrame(int r, int g, int b) { this.metric = this.metric + (long)(r + g + b); }
+    void PushClip(int x, int y, int w, int h) { this.metric = this.metric + (long)(x + y + w + h); }
+    void PopClip() { }
+    void FillRect(int x, int y, int w, int h, int r, int g, int b, int a) {
+        this.metric = this.metric + (long)(x + y + w + h + r + g + b + a);
+    }
+    void DrawBorder(int x, int y, int w, int h, int t, int r, int g, int b, int a) {
+        this.metric = this.metric + (long)(x + y + w + h + t + r + g + b + a);
+    }
+    void DrawText(string text, int x, int y, int r, int g, int b, int a) {
+        this.metric = this.metric + (long)(text.Length + x + y + r + g + b + a);
+    }
+    void DrawSprite(string image, int x, int y, int w, int h, int angle, int alpha) {
+        int imgLen = 0;
+        if (image != null) { imgLen = image.Length; }
+        this.metric = this.metric + (long)(imgLen + x + y + w + h + angle + alpha);
+    }
+    void EndFrame() { }
+    long Metric() { return this.metric; }
+}
+#endif
+
+// ---- compile-time backend factory ----------------------------------------
+class UiBackendFactory {
+    static IUiRenderer Create(int width, int height) {
+#if UI_GPU
+        return SdlUiRenderer.Create(width, height);
+#elif UI_SOFTWARE
+        return SoftwareUiRenderer.Create(width, height);
+#else
+        return HeadlessUiRenderer.Create(width, height);
+#endif
+    }
+    static string BackendId() {
+#if UI_GPU
+        return "sdl-gpu";
+#elif UI_SOFTWARE
+        return "software-cpu";
+#else
+        return "headless";
+#endif
+    }
+}
+
+// ---- backend-agnostic widget paint pass (real Zgm state) -----------------
+class WidgetPainter {
+    static int AlphaOf(double a) {
+        int v = (int)(a * 255.0);
+        if (v < 0) { v = 0; }
+        if (v > 255) { v = 255; }
+        return v;
+    }
+
+    static void PaintWidget(IUiRenderer ui, int ox, int oy, ZgmWidgetState s) {
+        if (!s.Visible()) { return; }
+        int a = WidgetPainter.AlphaOf(s.Alpha());
+        int x = ox + s.X();
+        int y = oy + s.Y();
+        int w = s.Width();
+        int h = s.Height();
+        string kind = s.Kind();
+        if (kind == "按钮") {                       // button
+            int face = 70;
+            if (s.Selected()) { face = 110; }
+            if (!s.Enabled()) { face = 40; }
+            ui.FillRect(x, y, w, h, face, face + 8, face + 24, a);
+            ui.DrawBorder(x, y, w, h, 1, 20, 24, 36, a);
+            ui.DrawText(s.Text(), x + 6, y + h / 2 - 4, 235, 235, 245, a);
+        } else if (kind == "标签") {                // label
+            ui.DrawText(s.Text(), x, y, 230, 230, 240, a);
+        } else if (kind == "文本框"
+                || kind == "输入框") {          // rich text / edit
+            ui.FillRect(x, y, w, h, 24, 26, 34, a);
+            ui.DrawBorder(x, y, w, h, 1, 60, 66, 84, a);
+            ui.PushClip(x, y, w, h);
+            ui.DrawText(s.Text(), x + 4, y + 4, 210, 214, 226, a);
+            ui.PopClip();
+        } else if (kind == "进度条") {          // progress bar
+            ui.FillRect(x, y, w, h, 30, 32, 40, a);
+            int lo = s.Config().ControlMin();
+            int hi = s.Config().ControlMax();
+            int span = hi - lo;
+            int fill = 0;
+            if (span > 0) {
+                int p = s.Position() - lo;
+                if (p < 0) { p = 0; }
+                if (p > span) { p = span; }
+                fill = w * p / span;
+            }
+            ui.FillRect(x, y, fill, h, 90, 180, 120, a);
+            ui.DrawBorder(x, y, w, h, 1, 60, 66, 84, a);
+        } else if (kind == "图片框"             // image box
+                || kind == "动画框") {          // anim box
+            ui.DrawSprite(s.Image(), x, y, w, h, s.Angle(), a);
+        } else if (kind == "容器") {                // container
+            ui.FillRect(x, y, w, h, 18, 20, 28, a);
+            ui.DrawBorder(x, y, w, h, 1, 54, 60, 78, a);
+        } else {
+            ui.DrawBorder(x, y, w, h, 1, 90, 96, 116, a);
+        }
+    }
+
+    static void PaintWidgets(
+        IUiRenderer ui, List<ZgmWidgetState> widgets, int ox, int oy) {
+        int i = 0;
+        while (i < widgets.Count) {
+            WidgetPainter.PaintWidget(ui, ox, oy, widgets[i]);
+            i = i + 1;
+        }
+    }
+
+    static void PaintWindow(IUiRenderer ui, ZgmWindowState window) {
+        if (!window.Visible()) { return; }
+        int a = WidgetPainter.AlphaOf(window.Alpha());
+        ui.FillRect(window.X(), window.Y(), window.Width(), window.Height(),
+            12, 14, 20, a);
+        int i = 0;
+        while (i < window.WidgetCount()) {
+            WidgetPainter.PaintWidget(ui, window.X(), window.Y(),
+                window.WidgetAt(i));
+            i = i + 1;
+        }
+    }
+}

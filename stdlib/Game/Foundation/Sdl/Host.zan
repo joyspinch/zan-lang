@@ -1,0 +1,146 @@
+using System;
+using SDL3;
+using Game.Foundation;
+
+namespace Game.Foundation.Sdl;
+
+interface IGameHostLoop {
+    void Start(GameHost host);
+    void Event(GameHost host, int eventType);
+    void FixedUpdate(GameHost host, int deltaMilliseconds);
+    void Update(GameHost host, int deltaMilliseconds);
+    void Render(GameHost host, SdlRenderer renderer, double alpha);
+    void Stop(GameHost host);
+}
+
+/// <summary>
+/// SDL3 host with a deterministic fixed update, semantic input state and
+/// logical-resolution presentation.
+/// </summary>
+class GameHost {
+    string title;
+    int logicalWidth;
+    int logicalHeight;
+    int targetFrameMilliseconds;
+    SdlWindow window;
+    SdlRenderer renderer;
+    InputMap input;
+    FixedStepClock clock;
+    bool running;
+    bool verticalSync;
+    int lastTick;
+
+    static GameHost Create(
+        string title,
+        int logicalWidth,
+        int logicalHeight,
+        int fixedStepMilliseconds
+    ) {
+        GameHost host = new GameHost();
+        host.title = title;
+        host.logicalWidth = logicalWidth;
+        host.logicalHeight = logicalHeight;
+        host.targetFrameMilliseconds = fixedStepMilliseconds;
+        if (host.targetFrameMilliseconds <= 0) {
+            host.targetFrameMilliseconds = 16;
+        }
+        host.input = InputMap.Create();
+        host.clock =
+            FixedStepClock.Create(host.targetFrameMilliseconds, 6);
+        host.running = false;
+        host.verticalSync = true;
+        host.lastTick = 0;
+        return host;
+    }
+
+    bool Open() {
+        if (this.running) { return true; }
+        if (!Sdl.Init(SdlInit.Video() + SdlInit.Events())) { return false; }
+        this.window = SdlWindow.Create(
+            this.title,
+            this.logicalWidth,
+            this.logicalHeight,
+            SdlWindowFlags.Resizable() + SdlWindowFlags.HighPixelDensity());
+        if (!this.window.IsValid()) {
+            Sdl.Quit();
+            return false;
+        }
+        this.renderer = SdlRenderer.Create(this.window);
+        if (!this.renderer.IsValid()) {
+            this.window.Close();
+            Sdl.Quit();
+            return false;
+        }
+        this.renderer.SetVSync(this.verticalSync);
+        this.renderer.SetLogicalSize(
+            this.logicalWidth,
+            this.logicalHeight,
+            SdlLogicalPresentation.Letterbox());
+        this.running = true;
+        this.lastTick = Sdl.Ticks();
+        return true;
+    }
+
+    bool Run(IGameHostLoop loop) {
+        if (loop == null || !this.Open()) { return false; }
+        loop.Start(this);
+        while (this.running) {
+            int frameStart = Sdl.Ticks();
+            this.input.BeginFrame();
+            while (SdlEvent.Poll()) {
+                int type = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) {
+                    this.running = false;
+                } else if (type == SdlEventType.KeyDown()) {
+                    this.input.ProcessKey(SdlEvent.Scancode(), true);
+                } else if (type == SdlEventType.KeyUp()) {
+                    this.input.ProcessKey(SdlEvent.Scancode(), false);
+                }
+                loop.Event(this, type);
+            }
+
+            int now = Sdl.Ticks();
+            int delta = now - this.lastTick;
+            if (delta < 0) { delta = 0; }
+            this.lastTick = now;
+            this.clock.Advance(delta);
+            while (this.clock.HasStep()) {
+                loop.FixedUpdate(this, this.clock.ConsumeStep());
+            }
+            loop.Update(this, delta);
+            loop.Render(this, this.renderer, this.clock.Alpha());
+
+            if (!this.verticalSync) {
+                int spent = Sdl.Ticks() - frameStart;
+                if (spent < this.targetFrameMilliseconds) {
+                    Sdl.Delay(this.targetFrameMilliseconds - spent);
+                }
+            }
+        }
+        loop.Stop(this);
+        this.Close();
+        return true;
+    }
+
+    void Close() {
+        this.running = false;
+        if (this.renderer != null) { this.renderer.Close(); }
+        if (this.window != null) { this.window.Close(); }
+        Sdl.Quit();
+    }
+
+    void RequestStop() { this.running = false; }
+    bool Running() { return this.running; }
+    InputMap Input() { return this.input; }
+    SdlWindow Window() { return this.window; }
+    SdlRenderer Renderer() { return this.renderer; }
+    int Width() { return this.logicalWidth; }
+    int Height() { return this.logicalHeight; }
+
+    void SetVerticalSync(bool enabled) {
+        this.verticalSync = enabled;
+        if (this.renderer != null) {
+            this.renderer.SetVSync(enabled);
+        }
+    }
+}

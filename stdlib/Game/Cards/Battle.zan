@@ -1,0 +1,254 @@
+using System;
+
+namespace Game.Cards;
+
+class CardActor {
+    string id;
+    int hp;
+    int maxHp;
+    int block;
+    int strength;
+    int vulnerable;
+
+    static CardActor Create(string id, int maxHp) {
+        CardActor actor = new CardActor();
+        actor.id = id;
+        actor.maxHp = maxHp;
+        if (actor.maxHp < 1) { actor.maxHp = 1; }
+        actor.hp = actor.maxHp;
+        actor.block = 0;
+        actor.strength = 0;
+        actor.vulnerable = 0;
+        return actor;
+    }
+
+    int TakeDamage(int amount) {
+        if (amount < 0) { amount = 0; }
+        if (this.vulnerable > 0) {
+            amount = amount + amount / 2;
+        }
+        int blocked = amount;
+        if (blocked > this.block) { blocked = this.block; }
+        this.block = this.block - blocked;
+        int damage = amount - blocked;
+        this.hp = this.hp - damage;
+        if (this.hp < 0) { this.hp = 0; }
+        return damage;
+    }
+
+    int Heal(int amount) {
+        if (amount < 0) { return 0; }
+        int before = this.hp;
+        this.hp = this.hp + amount;
+        if (this.hp > this.maxHp) { this.hp = this.maxHp; }
+        return this.hp - before;
+    }
+
+    void AddBlock(int amount) {
+        if (amount > 0) { this.block = this.block + amount; }
+    }
+
+    void AddStrength(int amount) { this.strength = this.strength + amount; }
+
+    void AddVulnerable(int turns) {
+        if (turns > 0) { this.vulnerable = this.vulnerable + turns; }
+    }
+
+    void StartTurn() { this.block = 0; }
+
+    void EndTurn() {
+        if (this.vulnerable > 0) {
+            this.vulnerable = this.vulnerable - 1;
+        }
+    }
+
+    string Id() { return this.id; }
+    int Hp() { return this.hp; }
+    int MaxHp() { return this.maxHp; }
+    int Block() { return this.block; }
+    int Strength() { return this.strength; }
+    int Vulnerable() { return this.vulnerable; }
+    bool Alive() { return this.hp > 0; }
+}
+
+class CardPlayResult {
+    bool success;
+    int damage;
+    int blocked;
+    int healed;
+    int drawn;
+    int energyDelta;
+
+    static CardPlayResult Failed() {
+        CardPlayResult result = new CardPlayResult();
+        result.success = false;
+        result.damage = 0;
+        result.blocked = 0;
+        result.healed = 0;
+        result.drawn = 0;
+        result.energyDelta = 0;
+        return result;
+    }
+
+    void SetSuccess() { this.success = true; }
+    void AddDamage(int amount) { this.damage = this.damage + amount; }
+    void AddBlock(int amount) { this.blocked = this.blocked + amount; }
+    void AddHeal(int amount) { this.healed = this.healed + amount; }
+    void AddDraw(int amount) { this.drawn = this.drawn + amount; }
+    void AddEnergy(int amount) {
+        this.energyDelta = this.energyDelta + amount;
+    }
+
+    bool Success() { return this.success; }
+    int Damage() { return this.damage; }
+    int Blocked() { return this.blocked; }
+    int Healed() { return this.healed; }
+    int Drawn() { return this.drawn; }
+    int EnergyDelta() { return this.energyDelta; }
+}
+
+/// <summary>
+/// Compact deck-building battle runtime used by roguelite card games. Projects
+/// can replace enemy intent selection while retaining zones and effect rules.
+/// </summary>
+class CardBattle {
+    CardActor player;
+    CardActor enemy;
+    CardDeck deck;
+    int energy;
+    int maxEnergy;
+    int handSize;
+    int turn;
+    int enemyDamage;
+    int winner;
+
+    static CardBattle Create(
+        CardActor player,
+        CardActor enemy,
+        CardDeck deck
+    ) {
+        CardBattle battle = new CardBattle();
+        battle.player = player;
+        battle.enemy = enemy;
+        battle.deck = deck;
+        battle.energy = 0;
+        battle.maxEnergy = 3;
+        battle.handSize = 5;
+        battle.turn = 0;
+        battle.enemyDamage = 7;
+        battle.winner = -1;
+        return battle;
+    }
+
+    void Start() {
+        this.deck.ShuffleDraw();
+        this.StartPlayerTurn();
+    }
+
+    void StartPlayerTurn() {
+        if (this.winner >= 0) { return; }
+        this.turn = this.turn + 1;
+        this.player.StartTurn();
+        this.energy = this.maxEnergy;
+        int need = this.handSize - this.deck.Hand().Count();
+        if (need > 0) { this.deck.Draw(need); }
+    }
+
+    bool CanPlay(int handIndex) {
+        if (this.winner >= 0
+            || handIndex < 0
+            || handIndex >= this.deck.Hand().Count()) {
+            return false;
+        }
+        CardDefinition definition =
+            this.deck.Hand().At(handIndex).Definition();
+        return definition != null && definition.Cost() <= this.energy;
+    }
+
+    CardPlayResult Play(int handIndex) {
+        CardPlayResult result = CardPlayResult.Failed();
+        if (!this.CanPlay(handIndex)) { return result; }
+
+        CardInstance instance = this.deck.Hand().At(handIndex);
+        CardDefinition definition = instance.Definition();
+        this.energy = this.energy - definition.Cost();
+        result.SetSuccess();
+
+        int i = 0;
+        while (i < definition.EffectCount()) {
+            CardEffect effect = definition.EffectAt(i);
+            CardActor target = this.player;
+            if (effect.Target() == CardTarget.Enemy()) {
+                target = this.enemy;
+            }
+            int amount = effect.Amount();
+            if (effect.Kind() == CardEffectKind.Damage()) {
+                int damage = target.TakeDamage(
+                    amount + this.player.Strength());
+                result.AddDamage(damage);
+            } else if (effect.Kind() == CardEffectKind.Block()) {
+                target.AddBlock(amount);
+                result.AddBlock(amount);
+            } else if (effect.Kind() == CardEffectKind.Heal()) {
+                result.AddHeal(target.Heal(amount));
+            } else if (effect.Kind() == CardEffectKind.Draw()) {
+                result.AddDraw(this.deck.Draw(amount));
+            } else if (effect.Kind() == CardEffectKind.Energy()) {
+                this.energy = this.energy + amount;
+                result.AddEnergy(amount);
+            } else if (effect.Kind() == CardEffectKind.Strength()) {
+                target.AddStrength(amount);
+            } else if (effect.Kind() == CardEffectKind.Vulnerable()) {
+                target.AddVulnerable(amount);
+            }
+            i = i + 1;
+        }
+
+        this.deck.DiscardFromHand(handIndex);
+        this.UpdateWinner();
+        return result;
+    }
+
+    int EndPlayerTurn() {
+        if (this.winner >= 0) { return 0; }
+        this.deck.DiscardHand();
+        this.player.EndTurn();
+        int damage = this.player.TakeDamage(this.enemyDamage);
+        this.enemy.EndTurn();
+        this.UpdateWinner();
+        if (this.winner < 0) { this.StartPlayerTurn(); }
+        return damage;
+    }
+
+    void UpdateWinner() {
+        if (!this.enemy.Alive()) {
+            this.winner = 0;
+        } else if (!this.player.Alive()) {
+            this.winner = 1;
+        }
+    }
+
+    CardActor Player() { return this.player; }
+    CardActor Enemy() { return this.enemy; }
+    CardDeck Deck() { return this.deck; }
+    int Energy() { return this.energy; }
+    int MaxEnergy() { return this.maxEnergy; }
+    int Turn() { return this.turn; }
+    int EnemyDamage() { return this.enemyDamage; }
+    int Winner() { return this.winner; }
+
+    void SetEnergy(int maxEnergy) {
+        if (maxEnergy < 0) { maxEnergy = 0; }
+        this.maxEnergy = maxEnergy;
+    }
+
+    void SetHandSize(int handSize) {
+        if (handSize < 0) { handSize = 0; }
+        this.handSize = handSize;
+    }
+
+    void SetEnemyDamage(int damage) {
+        if (damage < 0) { damage = 0; }
+        this.enemyDamage = damage;
+    }
+}

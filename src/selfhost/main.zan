@@ -11,7 +11,126 @@ namespace Zan;
 // All inputs are concatenated into a single translation unit (they share one
 // namespace), lexed, parsed, bound, checked and lowered to LLVM IR text which
 // is written to <output.ll>. clang then compiles that to a native executable.
+//
+// Like the C host, stdlib modules are auto-included by PATH: every
+// `using X.Y.Z;` directive maps to <stdlib_root>/X/Y/Z and all *.zan files
+// there are compiled in, resolved to a fixpoint (a pulled-in module may itself
+// `using` another namespace). stdlib_root is discovered relative to the
+// compiler executable (exe_dir/../stdlib, else exe_dir/stdlib).
 class Program {
+    static string stdlibRoot;
+    static List<string> inclPaths;
+    static List<string> inclSrcs;
+
+    static string NormPath(string p) {
+        string r = "";
+        int i = 0;
+        while (i < p.Length) {
+            string c = p.Substring(i, 1);
+            if (c == "\\") { c = "/"; }
+            r = r + c;
+            i = i + 1;
+        }
+        return r;
+    }
+
+    static bool Included(string norm) {
+        int i = 0;
+        while (i < inclPaths.Count) {
+            if (inclPaths[i] == norm) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static void AddInput(string path) {
+        string norm = NormPath(path);
+        if (Included(norm)) { return; }
+        inclPaths.Add(norm);
+        inclSrcs.Add(File.ReadAllText(path));
+    }
+
+    static string FindStdlibRoot() {
+        string exe = Environment.ExeDir();
+        string up = exe + "\\..\\stdlib";
+        if (Directory.ListNames(up + "\\*") != "") { return up; }
+        string sib = exe + "\\stdlib";
+        if (Directory.ListNames(sib + "\\*") != "") { return sib; }
+        return "stdlib";
+    }
+
+    // Scan `src` for `using X.Y.Z;` directives (skipping alias forms with '=')
+    // and auto-include every .zan file under the matching stdlib directory.
+    static bool ScanUsings(string src) {
+        bool added = false;
+        int n = src.Length;
+        int i = 0;
+        while (i + 6 <= n) {
+            bool atStart = i == 0;
+            if (!atStart) {
+                string pv = src.Substring(i - 1, 1);
+                if (pv == "\n" || pv == "\r" || pv == " " || pv == "\t" || pv == ";") { atStart = true; }
+            }
+            if (atStart && src.Substring(i, 6) == "using ") {
+                int j = i + 6;
+                string ns = "";
+                bool alias = false;
+                while (j < n) {
+                    string c = src.Substring(j, 1);
+                    if (c == ";") { break; }
+                    if (c == "=") { alias = true; break; }
+                    if (c == "\n" || c == "\r") { break; }
+                    if (c != " " && c != "\t") { ns = ns + c; }
+                    j = j + 1;
+                }
+                if (!alias && ns != "" && j < n && src.Substring(j, 1) == ";") {
+                    string rel = "";
+                    int k = 0;
+                    while (k < ns.Length) {
+                        string c2 = ns.Substring(k, 1);
+                        if (c2 == ".") { c2 = "\\"; }
+                        rel = rel + c2;
+                        k = k + 1;
+                    }
+                    if (AddStdlibDir(rel)) { added = true; }
+                }
+                i = j;
+            }
+            i = i + 1;
+        }
+        return added;
+    }
+
+    // Include every *.zan directly under stdlib_root/<rel>. Returns true when
+    // a new file was added.
+    static bool AddStdlibDir(string rel) {
+        string dir = stdlibRoot + "\\" + rel;
+        string names = Directory.ListNames(dir + "\\*.zan");
+        bool added = false;
+        int n = names.Length;
+        int i = 0;
+        string cur = "";
+        while (i <= n) {
+            string c = "";
+            if (i < n) { c = names.Substring(i, 1); }
+            if (c == "\n" || i == n) {
+                if (cur != "") {
+                    string full = dir + "\\" + cur;
+                    string norm = NormPath(full);
+                    if (!Included(norm)) {
+                        AddInput(full);
+                        added = true;
+                    }
+                }
+                cur = "";
+            } else {
+                cur = cur + c;
+            }
+            i = i + 1;
+        }
+        return added;
+    }
+
     static void Main() {
         int argc = Environment.ArgCount();
         if (argc < 2) {
@@ -19,19 +138,49 @@ class Program {
             throw "zanc: no input files";
         } else {
             string outPath = Environment.ArgAt(0);
-            string src = "";
+            inclPaths = new List<string>();
+            inclSrcs = new List<string>();
             int i = 1;
             while (i < argc) {
-                string p = Environment.ArgAt(i);
-                string t = File.ReadAllText(p);
-                src = src + t + "\n";
+                AddInput(Environment.ArgAt(i));
                 i = i + 1;
+            }
+
+            // stdlib auto-include to a fixpoint, mirroring the C host.
+            stdlibRoot = FindStdlibRoot();
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                int fi = 0;
+                while (fi < inclSrcs.Count) {
+                    if (ScanUsings(inclSrcs[fi])) { changed = true; }
+                    fi = fi + 1;
+                }
+            }
+
+            string src = "";
+            List<int> fileStarts = new List<int>();
+            int nextLine = 1;
+            int si = 0;
+            while (si < inclSrcs.Count) {
+                fileStarts.Add(nextLine);
+                string body = inclSrcs[si];
+                int nlc = 0;
+                int ci = 0;
+                while (ci < body.Length) {
+                    if ((int)body[ci] == 10) { nlc = nlc + 1; }
+                    ci = ci + 1;
+                }
+                nextLine = nextLine + nlc + 1;
+                src = src + body + "\n";
+                si = si + 1;
             }
 
             Lexer lx = new Lexer(src);
             List<Token> toks = lx.Run();
 
             Diags d = new Diags();
+            d.SetFiles(inclPaths, fileStarts);
             Parser ps = new Parser(toks, d);
             Node unit = ps.ParseUnit();
 
@@ -40,24 +189,17 @@ class Program {
 
             Checker chk = new Checker(b, d);
             chk.Check(unit);
-            int j = 0;
-            while (j < d.Count()) {
-                Diag e = d.items[j];
-                Console.WriteLine(e.msg);
-                j = j + 1;
-            }
+            d.Report(src, 0);
             if (d.HasErrors()) {
+                d.Summary();
                 throw "zanc: compilation failed";
             }
 
             Irgen ig = new Irgen(b, d);
             string ir = ig.Gen(unit);
-            while (j < d.Count()) {
-                Diag e2 = d.items[j];
-                Console.WriteLine(e2.msg);
-                j = j + 1;
-            }
+            d.Report(src, 0);
             if (d.HasErrors()) {
+                d.Summary();
                 throw "zanc: compilation failed";
             }
             File.WriteAllText(outPath, ir);

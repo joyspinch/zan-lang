@@ -80,11 +80,20 @@ typedef enum {
     AST_GENERIC_TYPE,
     AST_QUALIFIED_NAME,
 
+    /* `ref x` / `out x` / `out T x` call argument */
+    AST_REF_ARG,
+
     /* misc */
     AST_ATTRIBUTE,
     AST_ENUM_MEMBER,
     AST_CATCH_CLAUSE,
     AST_SWITCH_CASE,
+    AST_WHERE_CLAUSE, /* generic constraint: where T : C1, C2 */
+    AST_YIELD_STMT,   /* yield return expr; / yield break; (desugared in parser) */
+    AST_LOCK_STMT,    /* lock (expr) body */
+    AST_GOTO_STMT,    /* goto label; */
+    AST_LABEL_STMT,   /* label: */
+    AST_QUERY_EXPR,   /* from x in src where c ... select e */
 
     AST__COUNT,
 } zan_ast_kind_t;
@@ -134,10 +143,11 @@ struct zan_ast_node {
             zan_ast_list_t type_args; /* explicit generic args: f<int>(...) */
         } call;
 
-        /* member access: expr.name */
+        /* member access: expr.name (null_cond: `expr?.name`) */
         struct {
             zan_ast_node_t *object;
             zan_istr_t name;
+            int null_cond;
         } member;
 
         /* index: expr[idx] */
@@ -284,6 +294,7 @@ struct zan_ast_node {
             zan_ast_list_t members;
             uint32_t modifiers;
             bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
+            zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
         } type_decl;
 
         /* method / constructor */
@@ -296,6 +307,7 @@ struct zan_ast_node {
             uint32_t modifiers;
             zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
             zan_istr_t entry_point;  /* DllImport entry point override, {NULL,0} if none */
+            zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
         } method_decl;
 
         /* field */
@@ -306,12 +318,47 @@ struct zan_ast_node {
             uint32_t modifiers;
         } field_decl;
 
+        /* generic constraint clause: where T : C1, C2 */
+        struct {
+            zan_istr_t param_name;
+            zan_ast_list_t constraints; /* AST_TYPE_REF list */
+        } where_clause;
+
+        /* yield return expr; (value set) or yield break; (value NULL) */
+        struct {
+            zan_ast_node_t *value;
+        } yield_stmt;
+
+        /* lock (expr) body */
+        struct {
+            zan_ast_node_t *expr;
+            zan_ast_node_t *body;
+        } lock_stmt;
+
+        /* from var in source where c1 where c2 select proj */
+        struct {
+            zan_istr_t var;
+            zan_ast_node_t *source;
+            zan_ast_list_t wheres;
+            zan_ast_node_t *select;
+        } query;
+
         /* parameter */
         struct {
             zan_istr_t name;
             zan_ast_node_t *type;
             zan_ast_node_t *default_val;
+            int is_params; /* trailing `params T[]` variadic parameter */
+            int by_ref;    /* 0 = by value, 1 = `ref`, 2 = `out` */
+            int is_this;   /* leading `this T recv` extension-method receiver */
         } param;
+
+        /* by-reference call argument: `ref x`, `out x`, `out T x` */
+        struct {
+            zan_ast_node_t *expr;      /* the referenced lvalue (identifier) */
+            zan_ast_node_t *decl_type; /* non-NULL for inline `out T x` decl */
+            int is_out;
+        } ref_arg;
 
         /* type reference */
         struct {
@@ -372,6 +419,8 @@ struct zan_ast_node {
 #define MOD_ASYNC     0x0800
 #define MOD_UNSAFE    0x1000
 #define MOD_WEAK      0x2000
+#define MOD_EVENT     0x4000
+#define MOD_PARTIAL   0x8000
 
 /* ---- utility functions ---- */
 

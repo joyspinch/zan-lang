@@ -1,0 +1,408 @@
+// Snake -- a complete arcade product on GameKit. Grid movement with a buffered
+// turn queue, growth on eating, escalating speed, wall or wrap modes, a
+// self-avoiding demo AI, and a persistent high-score profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Snake;
+
+class Profile {
+    int high;
+    int longest;
+    int games;
+
+    static string Path() { return "snake_save.txt"; }
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fb) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fb;
+    }
+    static Profile Load() {
+        Profile p = new Profile();
+        p.high = 0; p.longest = 3; p.games = 0;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.high = Profile.ReadKey(lines, "high", 0);
+            p.longest = Profile.ReadKey(lines, "longest", 3);
+            p.games = Profile.ReadKey(lines, "games", 0);
+        }
+        return p;
+    }
+    void Save() {
+        string s = "high=" + this.high + "\nlongest=" + this.longest + "\ngames=" + this.games + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+}
+
+class SnGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    int[] sx;
+    int[] sy;
+    int len;
+    int dir;
+    int nextDir;
+    int fx;
+    int fy;
+    int scene;        // 0 menu,1 play,2 over
+    int score;
+    int stepMs;
+    int stepAt;
+    int diff;         // 0 easy,1 normal,2 hard
+    bool wrap;
+    int mouseX;
+    int mouseY;
+    int eatFlashAt;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+
+    static int COLS() { return 30; }
+    static int ROWS() { return 22; }
+    static int CELL() { return 30; }
+    static int FX() { return 190; }
+    static int FY() { return 90; }
+
+    static SnGame Create(Host h) {
+        SnGame g = new SnGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 424242421);
+        g.sx = new int[SnGame.COLS() * SnGame.ROWS()];
+        g.sy = new int[SnGame.COLS() * SnGame.ROWS()];
+        g.scene = 0;
+        g.diff = 1;
+        g.demo = File.Exists("snake_demo.txt");
+        if (g.demo) { g.StartGame(Sdl.Ticks()); }
+        return g;
+    }
+
+    void PlaceFood() {
+        int guard = 0;
+        while (guard < 2000) {
+            int c = this.rng.Range(0, SnGame.COLS());
+            int rw = this.rng.Range(0, SnGame.ROWS());
+            bool onSnake = false;
+            int i = 0;
+            while (i < this.len) { if (this.sx[i] == c && this.sy[i] == rw) { onSnake = true; i = this.len; } i = i + 1; }
+            if (!onSnake) { this.fx = c; this.fy = rw; return; }
+            guard = guard + 1;
+        }
+    }
+
+    void StartGame(int now) {
+        this.len = 4;
+        int cx = SnGame.COLS() / 2;
+        int cy = SnGame.ROWS() / 2;
+        int i = 0;
+        while (i < this.len) { this.sx[i] = cx - i; this.sy[i] = cy; i = i + 1; }
+        this.dir = 1; this.nextDir = 1;
+        this.score = 0;
+        this.stepMs = 150;
+        if (this.diff == 0) { this.stepMs = 180; }
+        if (this.diff == 2) { this.stepMs = 100; }
+        this.wrap = (this.diff == 0);
+        this.scene = 1;
+        this.stepAt = now + this.stepMs;
+        this.PlaceFood();
+    }
+
+    int Dx(int d) { if (d == 1) { return 1; } if (d == 3) { return -1; } return 0; }
+    int Dy(int d) { if (d == 0) { return -1; } if (d == 2) { return 1; } return 0; }
+
+    void Step(int now) {
+        // apply buffered direction if not a reversal
+        if (!((this.nextDir + 2) % 4 == this.dir)) { this.dir = this.nextDir; }
+        int nx = this.sx[0] + this.Dx(this.dir);
+        int ny = this.sy[0] + this.Dy(this.dir);
+        if (this.wrap) {
+            if (nx < 0) { nx = SnGame.COLS() - 1; }
+            if (nx >= SnGame.COLS()) { nx = 0; }
+            if (ny < 0) { ny = SnGame.ROWS() - 1; }
+            if (ny >= SnGame.ROWS()) { ny = 0; }
+        } else {
+            if (nx < 0 || nx >= SnGame.COLS() || ny < 0 || ny >= SnGame.ROWS()) { this.EndGame(now); return; }
+        }
+        // self collision (ignore tail tip which will move, unless growing)
+        bool grow = (nx == this.fx && ny == this.fy);
+        int check = this.len;
+        if (!grow) { check = this.len - 1; }
+        int i = 0;
+        while (i < check) { if (this.sx[i] == nx && this.sy[i] == ny) { this.EndGame(now); return; } i = i + 1; }
+        // shift body
+        int j = this.len;
+        if (!grow) { j = this.len - 1; }
+        while (j > 0) { this.sx[j] = this.sx[j - 1]; this.sy[j] = this.sy[j - 1]; j = j - 1; }
+        this.sx[0] = nx; this.sy[0] = ny;
+        if (grow) {
+            this.len = this.len + 1;
+            this.score = this.score + 10 + this.len / 3;
+            this.eatFlashAt = now + 140;
+            if (this.stepMs > 60) { this.stepMs = this.stepMs - 3; }
+            this.PlaceFood();
+        }
+    }
+
+    void EndGame(int now) {
+        this.scene = 2;
+        this.prof.games = this.prof.games + 1;
+        if (this.score > this.prof.high) { this.prof.high = this.score; }
+        if (this.len > this.prof.longest) { this.prof.longest = this.len; }
+        this.prof.Save();
+    }
+
+    // ----- input -------------------------------------------------------------
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } return; }
+        if (this.scene == 0) {
+            if (sc == 30) { this.diff = 0; }
+            if (sc == 31) { this.diff = 1; }
+            if (sc == 32) { this.diff = 2; }
+            if (sc == 40 || sc == 44) { this.StartGame(now); }
+            return;
+        }
+        if (this.scene == 2) { if (sc == 40 || sc == 44) { this.StartGame(now); } return; }
+        if (this.scene == 1) {
+            if (sc == 82 || sc == 26) { this.nextDir = 0; }
+            if (sc == 79 || sc == 7) { this.nextDir = 1; }
+            if (sc == 81 || sc == 22) { this.nextDir = 2; }
+            if (sc == 80 || sc == 4) { this.nextDir = 3; }
+            if (sc == 21) { this.StartGame(now); }
+        }
+    }
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 3) { if (Draw.PointIn(cx, cy, 400 + i * 170, 330, 150, 56)) { this.diff = i; } i = i + 1; }
+            if (Draw.PointIn(cx, cy, 470, 620, 340, 74)) { this.StartGame(now); }
+            return;
+        }
+        if (this.scene == 2) {
+            if (Draw.PointIn(cx, cy, 400, 470, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 470, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    // ----- demo AI -----------------------------------------------------------
+
+    bool Danger(int nx, int ny) {
+        if (this.wrap) {
+            if (nx < 0) { nx = SnGame.COLS() - 1; }
+            if (nx >= SnGame.COLS()) { nx = 0; }
+            if (ny < 0) { ny = SnGame.ROWS() - 1; }
+            if (ny >= SnGame.ROWS()) { ny = 0; }
+        } else {
+            if (nx < 0 || nx >= SnGame.COLS() || ny < 0 || ny >= SnGame.ROWS()) { return true; }
+        }
+        int i = 0;
+        while (i < this.len - 1) { if (this.sx[i] == nx && this.sy[i] == ny) { return true; } i = i + 1; }
+        return false;
+    }
+    void DemoThink() {
+        int hx = this.sx[0]; int hy = this.sy[0];
+        int want = this.dir;
+        // greedy toward food
+        int[] order = new int[4];
+        int n = 0;
+        if (this.fx > hx) { order[n] = 1; n = n + 1; }
+        if (this.fx < hx) { order[n] = 3; n = n + 1; }
+        if (this.fy > hy) { order[n] = 2; n = n + 1; }
+        if (this.fy < hy) { order[n] = 0; n = n + 1; }
+        // append remaining dirs
+        int d = 0;
+        while (d < 4) {
+            bool has = false; int k = 0;
+            while (k < n) { if (order[k] == d) { has = true; k = n; } k = k + 1; }
+            if (!has) { order[n] = d; n = n + 1; }
+            d = d + 1;
+        }
+        int idx = 0;
+        while (idx < n) {
+            int cand = order[idx];
+            if (!((cand + 2) % 4 == this.dir)) {
+                int nx = hx + this.Dx(cand);
+                int ny = hy + this.Dy(cand);
+                if (!this.Danger(nx, ny)) { want = cand; idx = n; }
+            }
+            idx = idx + 1;
+        }
+        this.nextDir = want;
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawPlay(int now) {
+        this.host.Begin(12, 16, 20);
+        int fw = SnGame.COLS() * SnGame.CELL();
+        int fh = SnGame.ROWS() * SnGame.CELL();
+        this.r.SetColor(18, 22, 28, 255);
+        this.r.FillRect(SnGame.FX(), SnGame.FY(), fw, fh);
+        // checker
+        int rr = 0;
+        while (rr < SnGame.ROWS()) {
+            int cc = 0;
+            while (cc < SnGame.COLS()) {
+                if ((rr + cc) % 2 == 0) {
+                    this.r.SetColor(24, 30, 38, 255);
+                    this.r.FillRect(SnGame.FX() + cc * SnGame.CELL(), SnGame.FY() + rr * SnGame.CELL(), SnGame.CELL(), SnGame.CELL());
+                }
+                cc = cc + 1;
+            }
+            rr = rr + 1;
+        }
+        Draw.RingRect(this.r, SnGame.FX(), SnGame.FY(), fw, fh, 3, 70, 120, 90, 255);
+
+        // food
+        int fxp = SnGame.FX() + this.fx * SnGame.CELL();
+        int fyp = SnGame.FY() + this.fy * SnGame.CELL();
+        int pulse = 0;
+        if (now < this.eatFlashAt) { pulse = 4; }
+        Draw.RoundRectFill(this.r, fxp + 5 - pulse / 2, fyp + 5 - pulse / 2, SnGame.CELL() - 10 + pulse, SnGame.CELL() - 10 + pulse, 8, 230, 90, 90, 255);
+        this.r.SetColor(120, 200, 120, 255);
+        this.r.FillRect(fxp + SnGame.CELL() / 2 - 2, fyp + 3, 4, 6);
+
+        // snake
+        int i = this.len - 1;
+        while (i >= 0) {
+            int x = SnGame.FX() + this.sx[i] * SnGame.CELL();
+            int y = SnGame.FY() + this.sy[i] * SnGame.CELL();
+            int cr = 90; int cg = 200; int cb = 120;
+            if (i == 0) { cr = 130; cg = 235; cb = 150; }
+            int t = SnGame.CELL();
+            Draw.RoundRectFill(this.r, x + 2, y + 2, t - 4, t - 4, 8, cr, cg, cb, 255);
+            if (i == 0) {
+                this.r.SetColor(20, 30, 24, 255);
+                int ex = x + t / 2; int ey = y + t / 2;
+                int ax = this.Dx(this.dir); int ay = this.Dy(this.dir);
+                this.r.FillRect(ex + ay * 5 - 3, ey + ax * 5 - 3, 5, 5);
+                this.r.FillRect(ex - ay * 5 - 3, ey - ax * 5 - 3, 5, 5);
+            } else {
+                this.r.SetColor(255, 255, 255, 30);
+                this.r.FillRect(x + 5, y + 5, t - 10, 5);
+            }
+            i = i - 1;
+        }
+
+        // HUD
+        Text.Draw(this.r, "SNAKE", 190, 30, 3, 240, 240, 250, 255);
+        Text.Draw(this.r, "SCORE " + this.score, 420, 34, 3, 255, 210, 90, 255);
+        Text.Draw(this.r, "LEN " + this.len, 720, 34, 2, 150, 235, 160, 255);
+        Text.Draw(this.r, "HIGH " + this.prof.high, 900, 34, 2, 170, 180, 200, 255);
+        string md = "WALLS";
+        if (this.wrap) { md = "WRAP"; }
+        Text.Draw(this.r, md, 1080, 34, 2, 150, 160, 180, 255);
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/snake/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(10, 16, 14);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+        Text.DrawCenteredShadow(this.r, "SNAKE", 640, 90, 10, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "EAT -- GROW -- DON'T CRASH", 640, 210, 3, 240, 208, 130, 3);
+        Ui.Panel(this.r, 360, 300, 560, 120, 20, 24, 34, 214);
+        Text.DrawCenteredShadow(this.r, "MODE", 640, 320, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 3) {
+            string nm = "EASY-WRAP";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            int kind = 0;
+            if (this.diff == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 400 + i * 170, 330, 150, 56, nm, 1, kind);
+            i = i + 1;
+        }
+        Ui.Panel(this.r, 420, 450, 440, 120, 14, 18, 26, 200);
+        Text.Draw(this.r, "HIGH SCORE", 448, 470, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, "" + this.prof.high, 448, 492, 4, 255, 210, 90, 3);
+        Text.Draw(this.r, "LONGEST  " + this.prof.longest, 448, 544, 2, 150, 160, 180, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "Arrows or WASD to steer. ENTER play. F11 fullscreen.", 640, 720, 2, 176, 184, 200, 2);
+        this.host.End();
+    }
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 180);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 250; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        Text.DrawCentered(this.r, "GAME OVER", 640, by + 44, 7, 230, 120, 90, 255);
+        Text.DrawCentered(this.r, "SCORE " + this.score + "    LENGTH " + this.len, 640, by + 124, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, "HIGH " + this.prof.high, 640, by + 172, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 220, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 220, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    void Tick(int now) {
+        if (this.scene != 1) { return; }
+        if (now >= this.stepAt) {
+            if (this.demo) { this.DemoThink(); }
+            this.Step(now);
+            this.stepAt = now + this.stepMs;
+        }
+    }
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2) { this.DrawOver(now); }
+        else { this.DrawPlay(now); }
+    }
+}
+
+class SnApp {
+    static void Main() {
+        Host h = Host.Create("Snake", 1280, 800);
+        SnGame g = SnGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { h.ToggleFullscreen(); }
+                    else if (!SdlEvent.IsRepeat()) { g.OnKey(sc, now); }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) { cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true; }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}

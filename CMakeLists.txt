@@ -465,6 +465,19 @@ set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
 #      large stack reservation (matching what the host bakes into its own link).
 #      Skipped automatically wherever clang is absent. ----
 if(SELFHOST_CLANG)
+  # The selfhost driver calls the zan_exe_dir_into/zan_dir_list_into runtime
+  # helpers (stdlib auto-include), so gen2 links an rt_sync object built with
+  # the same clang that links the test (the host-toolchain object may target a
+  # different C runtime, e.g. mingw vs MSVC).
+  set(ZAN_RT_SYNC_SELFHOST_OBJ "${CMAKE_BINARY_DIR}/zanrt_sync_selfhost.obj")
+  add_custom_command(
+    OUTPUT ${ZAN_RT_SYNC_SELFHOST_OBJ}
+    COMMAND ${SELFHOST_CLANG} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
+            -o ${ZAN_RT_SYNC_SELFHOST_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.h
+    COMMENT "Building rt_sync object for selfhost tests (zanrt_sync_selfhost)")
+  add_custom_target(zanrt_sync_selfhost ALL DEPENDS ${ZAN_RT_SYNC_SELFHOST_OBJ})
   if(WIN32)
     # Reserve a large stack so gen2 (which self-compiles into g3.ll) does not
     # overflow. The flag depends on the linker clang drives: MSVC-targeting
@@ -490,6 +503,7 @@ if(SELFHOST_CLANG)
       -DG2LL=${CMAKE_BINARY_DIR}/fixedpoint_g2.ll
       -DG3LL=${CMAKE_BINARY_DIR}/fixedpoint_g3.ll
       "-DSTACK_ARGS=${_fixedpoint_stack}"
+      "-DRT_OBJS=${ZAN_RT_SYNC_SELFHOST_OBJ}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_fixedpoint.cmake)
   set_tests_properties(selfhost_fixed_point PROPERTIES TIMEOUT 1200)
 endif()

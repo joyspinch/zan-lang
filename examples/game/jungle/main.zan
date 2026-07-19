@@ -1,0 +1,922 @@
+// Dou Shou Qi -- Jungle / Animal Chess. A complete product on GameKit.
+// Full rules: 8 ranked animals, rivers (rat swims, lion/tiger leap), traps
+// that neutralise rank, dens (win by entry), rat-beats-elephant. Alpha-beta
+// Minimax AI with four difficulties + adaptive scaling, slide animation,
+// legal-move hints, and a persistent rank / streak profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Jungle;
+
+class Profile {
+    int rank;
+    int streak;
+    int best;
+    int wins;
+    int losses;
+    int draws;
+    int games;
+    int level;
+    int adaptive;
+
+    static string Path() { return "jungle_save.txt"; }
+
+    static int ParseInt(string s, int start) {
+        int i = start;
+        int sign = 1;
+        if (i < s.Length && s[i] == 45) { sign = -1; i = i + 1; }
+        int v = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v * sign;
+    }
+
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            int eq = -1;
+            int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) {
+                if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); }
+            }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static Profile Load() {
+        Profile p = new Profile();
+        p.rank = 1000; p.streak = 0; p.best = 0;
+        p.wins = 0; p.losses = 0; p.draws = 0; p.games = 0;
+        p.level = 1; p.adaptive = 1;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.rank = Profile.ReadKey(lines, "rank", 1000);
+            p.streak = Profile.ReadKey(lines, "streak", 0);
+            p.best = Profile.ReadKey(lines, "best", 0);
+            p.wins = Profile.ReadKey(lines, "wins", 0);
+            p.losses = Profile.ReadKey(lines, "losses", 0);
+            p.draws = Profile.ReadKey(lines, "draws", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+            p.level = Profile.ReadKey(lines, "level", 1);
+            p.adaptive = Profile.ReadKey(lines, "adaptive", 1);
+        }
+        return p;
+    }
+
+    void Save() {
+        string s = "";
+        s = s + "rank=" + this.rank + "\n";
+        s = s + "streak=" + this.streak + "\n";
+        s = s + "best=" + this.best + "\n";
+        s = s + "wins=" + this.wins + "\n";
+        s = s + "losses=" + this.losses + "\n";
+        s = s + "draws=" + this.draws + "\n";
+        s = s + "games=" + this.games + "\n";
+        s = s + "level=" + this.level + "\n";
+        s = s + "adaptive=" + this.adaptive + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+
+    string TierName() {
+        int r = this.rank;
+        if (r < 900) { return "BRONZE"; }
+        if (r < 1100) { return "SILVER"; }
+        if (r < 1300) { return "GOLD"; }
+        if (r < 1500) { return "PLATINUM"; }
+        if (r < 1750) { return "DIAMOND"; }
+        return "MASTER";
+    }
+}
+
+// Board: 9 rows x 7 cols, index = r*7 + c.  Row 0 = AI back rank, row 8 = human.
+// Cell values: 0 empty; +1..+8 human ranks; -1..-8 AI ranks.
+// Ranks: 1 Rat, 2 Cat, 3 Dog, 4 Wolf, 5 Leopard, 6 Tiger, 7 Lion, 8 Elephant.
+class Jungle {
+    static int AI_DEN() { return 3; }        // r0,c3
+    static int HU_DEN() { return 59; }        // r8,c3
+
+    static int Rank(int v) { if (v < 0) { return -v; } return v; }
+
+    static bool IsWater(int idx) {
+        int r = idx / 7;
+        int c = idx % 7;
+        if (r < 3 || r > 5) { return false; }
+        if (c == 1 || c == 2 || c == 4 || c == 5) { return true; }
+        return false;
+    }
+
+    static bool IsAiTrap(int idx) { return idx == 2 || idx == 4 || idx == 10; }
+    static bool IsHuTrap(int idx) { return idx == 58 || idx == 60 || idx == 52; }
+
+    static int[] Clone(int[] b) {
+        int[] nb = new int[63];
+        int i = 0;
+        while (i < 63) { nb[i] = b[i]; i = i + 1; }
+        return nb;
+    }
+
+    static void Setup(int[] b) {
+        int i = 0;
+        while (i < 63) { b[i] = 0; i = i + 1; }
+        // AI (negative), top
+        b[0] = -7;  b[6] = -6;                 // lion, tiger
+        b[8] = -3;  b[12] = -2;                // dog, cat
+        b[14] = -1; b[16] = -5; b[18] = -4; b[20] = -8; // rat, leopard, wolf, elephant
+        // Human (positive), bottom -- 180-degree mirror
+        b[62] = 7;  b[56] = 6;
+        b[54] = 3;  b[50] = 2;
+        b[48] = 1;  b[46] = 5; b[44] = 4; b[42] = 8;
+    }
+
+    // Can the piece at `from` capture the enemy piece at `to`?
+    static bool CanCapture(int[] b, int from, int to) {
+        int a = b[from];
+        int d = b[to];
+        int ra = Jungle.Rank(a);
+        int rd = Jungle.Rank(d);
+        bool aw = Jungle.IsWater(from);
+        bool dw = Jungle.IsWater(to);
+        if (aw && !dw) { return false; }   // rat in water can't strike land
+        if (dw && !aw) { return false; }   // land can't strike rat in water
+        if (aw && dw) { return ra >= rd; } // rat vs rat in water
+        // trap override: defender standing in attacker's trap has rank 0
+        if (a > 0 && Jungle.IsHuTrap(to)) { return true; }
+        if (a < 0 && Jungle.IsAiTrap(to)) { return true; }
+        if (ra == 1 && rd == 8) { return true; }   // rat beats elephant
+        if (ra == 8 && rd == 1) { return false; }  // elephant can't take rat
+        return ra >= rd;
+    }
+
+    static bool Owns(int v, int side) {
+        if (side == 1) { return v > 0; }
+        return v < 0;
+    }
+
+    // Generate all legal moves for `side` (1 human, 2 ai) into from[]/to[].
+    // Capture moves are emitted first for better alpha-beta ordering.
+    static int Gen(int[] b, int side, int[] from, int[] to) {
+        int[] qf = new int[220];
+        int[] qt = new int[220];
+        int qn = 0;
+        int n = 0;
+        int idx = 0;
+        while (idx < 63) {
+            int v = b[idx];
+            if (v != 0 && Jungle.Owns(v, side)) {
+                int rk = Jungle.Rank(v);
+                int r = idx / 7;
+                int c = idx % 7;
+                int di = 0;
+                while (di < 4) {
+                    int dr = 0; int dc = 0;
+                    if (di == 0) { dr = -1; }
+                    if (di == 1) { dr = 1; }
+                    if (di == 2) { dc = -1; }
+                    if (di == 3) { dc = 1; }
+                    int nr = r + dr;
+                    int nc = c + dc;
+                    if (nr >= 0 && nr < 9 && nc >= 0 && nc < 7) {
+                        int nt = nr * 7 + nc;
+                        bool water = Jungle.IsWater(nt);
+                        bool ok = true;
+                        // only rat may enter water
+                        if (water && rk != 1) { ok = false; }
+                        // cannot enter own den
+                        if (side == 1 && nt == Jungle.HU_DEN()) { ok = false; }
+                        if (side == 2 && nt == Jungle.AI_DEN()) { ok = false; }
+                        if (ok) {
+                            int dv = b[nt];
+                            if (dv == 0) {
+                                from[n] = idx; to[n] = nt; n = n + 1;
+                            } else if (!Jungle.Owns(dv, side)) {
+                                if (Jungle.CanCapture(b, idx, nt)) {
+                                    qf[qn] = idx; qt[qn] = nt; qn = qn + 1;
+                                }
+                            }
+                        }
+                    }
+                    di = di + 1;
+                }
+                // lion / tiger leap across a river
+                if (rk == 6 || rk == 7) {
+                    int dj = 0;
+                    while (dj < 4) {
+                        int dr = 0; int dc = 0;
+                        if (dj == 0) { dr = -1; }
+                        if (dj == 1) { dr = 1; }
+                        if (dj == 2) { dc = -1; }
+                        if (dj == 3) { dc = 1; }
+                        int ar = r + dr; int ac = c + dc;
+                        bool blocked = false;
+                        bool overWater = false;
+                        while (ar >= 0 && ar < 9 && ac >= 0 && ac < 7 && Jungle.IsWater(ar * 7 + ac)) {
+                            overWater = true;
+                            if (b[ar * 7 + ac] != 0) { blocked = true; }
+                            ar = ar + dr; ac = ac + dc;
+                        }
+                        if (overWater && !blocked && ar >= 0 && ar < 9 && ac >= 0 && ac < 7) {
+                            int land = ar * 7 + ac;
+                            bool ok = true;
+                            if (side == 2 && land == Jungle.AI_DEN()) { ok = false; }
+                            if (side == 1 && land == Jungle.HU_DEN()) { ok = false; }
+                            if (ok) {
+                                int dv = b[land];
+                                if (dv == 0) { from[n] = idx; to[n] = land; n = n + 1; }
+                                else if (!Jungle.Owns(dv, side)) {
+                                    if (Jungle.CanCapture(b, idx, land)) {
+                                        qf[qn] = idx; qt[qn] = land; qn = qn + 1;
+                                    }
+                                }
+                            }
+                        }
+                        dj = dj + 1;
+                    }
+                }
+            }
+            idx = idx + 1;
+        }
+        // prepend captures
+        int total = 0;
+        int[] tf = new int[240];
+        int[] tt = new int[240];
+        int k = 0;
+        while (k < qn) { tf[total] = qf[k]; tt[total] = qt[k]; total = total + 1; k = k + 1; }
+        k = 0;
+        while (k < n) { tf[total] = from[k]; tt[total] = to[k]; total = total + 1; k = k + 1; }
+        k = 0;
+        while (k < total) { from[k] = tf[k]; to[k] = tt[k]; k = k + 1; }
+        return total;
+    }
+
+    static int Terminal(int[] b) {
+        if (b[Jungle.HU_DEN()] < 0) { return 1000000; }   // AI reached human den
+        if (b[Jungle.AI_DEN()] > 0) { return -1000000; }  // human reached AI den
+        return 0;
+    }
+
+    static int Val(int rk) {
+        if (rk == 1) { return 7; }
+        if (rk == 2) { return 2; }
+        if (rk == 3) { return 3; }
+        if (rk == 4) { return 4; }
+        if (rk == 5) { return 5; }
+        if (rk == 6) { return 8; }
+        if (rk == 7) { return 9; }
+        return 10;
+    }
+
+    static int Abs(int x) { if (x < 0) { return -x; } return x; }
+
+    static int Eval(int[] b) {
+        int score = 0;
+        int i = 0;
+        while (i < 63) {
+            int v = b[i];
+            if (v != 0) {
+                int r = i / 7;
+                int c = i % 7;
+                int val = Jungle.Val(Jungle.Rank(v));
+                if (v < 0) {
+                    score = score + val * 12;
+                    score = score + (11 - (Jungle.Abs(r - 8) + Jungle.Abs(c - 3)));
+                } else {
+                    score = score - val * 12;
+                    score = score - (11 - (Jungle.Abs(r - 0) + Jungle.Abs(c - 3)));
+                }
+            }
+            i = i + 1;
+        }
+        return score;
+    }
+
+    static int Search(int[] b, int depth, int alpha, int beta, int side) {
+        int term = Jungle.Terminal(b);
+        if (term != 0) {
+            if (term > 0) { return term + depth; }
+            return term - depth;
+        }
+        if (depth == 0) { return Jungle.Eval(b); }
+        int[] from = new int[240];
+        int[] to = new int[240];
+        int n = Jungle.Gen(b, side, from, to);
+        if (n == 0) {
+            if (side == 2) { return -1000000 - depth; }
+            return 1000000 + depth;
+        }
+        if (side == 2) {
+            int best = -2000000000;
+            int i = 0;
+            while (i < n) {
+                int[] nb = Jungle.Clone(b);
+                nb[to[i]] = nb[from[i]]; nb[from[i]] = 0;
+                int v = Jungle.Search(nb, depth - 1, alpha, beta, 1);
+                if (v > best) { best = v; }
+                if (best > alpha) { alpha = best; }
+                if (beta <= alpha) { i = n; }
+                i = i + 1;
+            }
+            return best;
+        }
+        int best = 2000000000;
+        int i = 0;
+        while (i < n) {
+            int[] nb = Jungle.Clone(b);
+            nb[to[i]] = nb[from[i]]; nb[from[i]] = 0;
+            int v = Jungle.Search(nb, depth - 1, alpha, beta, 2);
+            if (v < best) { best = v; }
+            if (best < beta) { beta = best; }
+            if (beta <= alpha) { i = n; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    // Returns packed move from*63+to for the AI (side 2), or -1 if none.
+    static int BestMove(int[] b, int depth, int rand, Rng rng) {
+        int[] from = new int[240];
+        int[] to = new int[240];
+        int n = Jungle.Gen(b, 2, from, to);
+        if (n == 0) { return -1; }
+        int[] sc = new int[240];
+        int best = -2000000000;
+        int i = 0;
+        while (i < n) {
+            int[] nb = Jungle.Clone(b);
+            nb[to[i]] = nb[from[i]]; nb[from[i]] = 0;
+            int v = Jungle.Search(nb, depth - 1, -2000000000, 2000000000, 1);
+            sc[i] = v;
+            if (v > best) { best = v; }
+            i = i + 1;
+        }
+        int margin = 0;
+        if (rand > 0) { margin = 4 + rand * 10; }
+        int[] pool = new int[240];
+        int pn = 0;
+        i = 0;
+        while (i < n) {
+            if (sc[i] >= best - margin) { pool[pn] = i; pn = pn + 1; }
+            i = i + 1;
+        }
+        int pick = pool[0];
+        if (pn > 1 && rand > 0) { pick = pool[rng.Range(0, pn)]; }
+        else {
+            i = 0;
+            while (i < n) { if (sc[i] == best) { pick = i; i = n; } i = i + 1; }
+        }
+        return from[pick] * 63 + to[pick];
+    }
+}
+
+class JungleGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    Talker talk;
+    int[] board;
+    int scene;      // 0 menu, 1 play, 2 over
+    int turn;       // 1 human, 2 ai
+    int winner;     // 0 none, 1 human, 2 ai
+    int selected;   // selected cell or -1
+    int[] legalTo;  // legal target cells for selection
+    int legalN;
+    int aiMoveAt;
+    bool aiPending;
+    int animFrom;
+    int animTo;
+    int animStart;
+    int animPiece;
+    int mouseX;
+    int mouseY;
+    int scoreDelta;
+    int winAdj;
+    int lossAdj;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+    int demoAt;
+
+    static int CELL() { return 80; }
+    static int BX() { return 70; }
+    static int BY() { return 48; }
+    static int CX(int c) { return 70 + c * 80 + 40; }
+    static int CY(int r) { return 48 + r * 80 + 40; }
+
+    int Depth() {
+        if (this.prof.level == 0) { return 1; }
+        if (this.prof.level == 1) { return 2; }
+        if (this.prof.level == 2) { return 3; }
+        return 4;
+    }
+    int Rand() {
+        if (this.prof.level == 0) { return 4; }
+        if (this.prof.level == 1) { return 1; }
+        return 0;
+    }
+    string LevelName() {
+        if (this.prof.level == 0) { return "EASY"; }
+        if (this.prof.level == 1) { return "NORMAL"; }
+        if (this.prof.level == 2) { return "HARD"; }
+        return "EXPERT";
+    }
+
+    static JungleGame Create(Host h) {
+        JungleGame g = new JungleGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 918273645);
+        g.talk = Talker.Create(g.rng);
+        g.board = new int[63];
+        g.legalTo = new int[64];
+        g.scene = 0;
+        g.selected = -1;
+        g.winner = 0;
+        g.turn = 1;
+        g.animFrom = -1;
+        g.SetupTalk();
+        g.demo = File.Exists("jungle_demo.txt");
+        if (g.demo) { g.StartGame(Sdl.Ticks()); g.demoAt = Sdl.Ticks() + 500; }
+        return g;
+    }
+
+    void SetupTalk() {
+        this.talk.Add(0, "Good push!");
+        this.talk.Add(0, "The river is yours.");
+        this.talk.Add(0, "Smart trade.");
+        this.talk.Add(0, "Marching to the den!");
+        this.talk.Add(1, "Mind the traps...");
+        this.talk.Add(1, "The AI circles back.");
+        this.talk.Add(1, "Watch that leopard.");
+        this.talk.Add(1, "Your den looks open.");
+        this.talk.Add(2, "Your move.");
+        this.talk.Add(2, "Pick an animal.");
+        this.talk.Add(3, "CAPTURE! Big swing.");
+        this.talk.Add(3, "The rat fears no one!");
+        this.talk.Add(3, "A mighty pounce!");
+    }
+
+    void StartGame(int now) {
+        Jungle.Setup(this.board);
+        this.scene = 1;
+        this.turn = 1;
+        this.winner = 0;
+        this.selected = -1;
+        this.legalN = 0;
+        this.aiPending = false;
+        this.animFrom = -1;
+        this.scoreDelta = 0;
+        this.talk.SayExact(2, "You are Red -- reach the blue den!", now, 2600);
+    }
+
+    void ComputeLegal(int from) {
+        this.legalN = 0;
+        int[] af = new int[240];
+        int[] at = new int[240];
+        int n = Jungle.Gen(this.board, 1, af, at);
+        int i = 0;
+        while (i < n) {
+            if (af[i] == from) { this.legalTo[this.legalN] = at[i]; this.legalN = this.legalN + 1; }
+            i = i + 1;
+        }
+    }
+
+    bool IsLegalTarget(int to) {
+        int i = 0;
+        while (i < this.legalN) { if (this.legalTo[i] == to) { return true; } i = i + 1; }
+        return false;
+    }
+
+    void ApplyMove(int from, int to, int now) {
+        this.animFrom = from;
+        this.animTo = to;
+        this.animPiece = this.board[from];
+        this.animStart = now;
+        bool cap = this.board[to] != 0;
+        this.board[to] = this.board[from];
+        this.board[from] = 0;
+        if (cap) {
+            if (this.rng.Range(0, 100) < 70) { this.talk.Say(3, now, 2200); }
+        }
+    }
+
+    void HumanMove(int from, int to, int now) {
+        this.ApplyMove(from, to, now);
+        this.selected = -1;
+        this.legalN = 0;
+        int term = Jungle.Terminal(this.board);
+        if (term < 0) { this.EndGame(1, now); return; }
+        int[] af = new int[240];
+        int[] at = new int[240];
+        if (Jungle.Gen(this.board, 2, af, at) == 0) { this.EndGame(1, now); return; }
+        this.turn = 2;
+        this.aiMoveAt = now + 460;
+        this.aiPending = true;
+    }
+
+    void AiMove(int now) {
+        this.aiPending = false;
+        int mv = Jungle.BestMove(this.board, this.Depth(), this.Rand(), this.rng);
+        if (mv < 0) { this.EndGame(1, now); return; }
+        int from = mv / 63;
+        int to = mv % 63;
+        this.ApplyMove(from, to, now);
+        int term = Jungle.Terminal(this.board);
+        if (term > 0) { this.EndGame(2, now); return; }
+        int[] af = new int[240];
+        int[] at = new int[240];
+        if (Jungle.Gen(this.board, 1, af, at) == 0) { this.EndGame(2, now); return; }
+        this.turn = 1;
+    }
+
+    void EndGame(int who, int now) {
+        this.winner = who;
+        this.scene = 2;
+        this.aiPending = false;
+        this.prof.games = this.prof.games + 1;
+        int delta = 0;
+        if (who == 1) {
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.best) { this.prof.best = this.prof.streak; }
+            delta = 18 + this.prof.level * 8;
+            this.prof.rank = this.prof.rank + delta;
+            this.winAdj = this.winAdj + 1; this.lossAdj = 0;
+            this.talk.SayExact(3, "Victory! Rank +" + delta, now, 4000);
+            if (this.prof.adaptive == 1 && this.winAdj >= 2 && this.prof.level < 3) {
+                this.prof.level = this.prof.level + 1; this.winAdj = 0;
+                this.talk.SayExact(3, "The AI grows fiercer.", now, 4000);
+            }
+        } else {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            delta = 14 - this.prof.level * 2;
+            if (delta < 6) { delta = 6; }
+            this.prof.rank = this.prof.rank - delta;
+            if (this.prof.rank < 100) { this.prof.rank = 100; }
+            delta = -delta;
+            this.lossAdj = this.lossAdj + 1; this.winAdj = 0;
+            this.talk.SayExact(1, "The AI storms your den. Rematch?", now, 4000);
+            if (this.prof.adaptive == 1 && this.lossAdj >= 2 && this.prof.level > 0) {
+                this.prof.level = this.prof.level - 1; this.lossAdj = 0;
+                this.talk.SayExact(0, "AI eases off. You got this.", now, 4000);
+            }
+        }
+        this.scoreDelta = delta;
+        this.prof.Save();
+    }
+
+    int PickCell(int px, int py) {
+        if (px < JungleGame.BX() || py < JungleGame.BY()) { return -1; }
+        int c = (px - JungleGame.BX()) / JungleGame.CELL();
+        int r = (py - JungleGame.BY()) / JungleGame.CELL();
+        if (c < 0 || c > 6 || r < 0 || r > 8) { return -1; }
+        return r * 7 + c;
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    static string Label(int rk) {
+        if (rk == 1) { return "R"; }
+        if (rk == 2) { return "C"; }
+        if (rk == 3) { return "D"; }
+        if (rk == 4) { return "W"; }
+        if (rk == 5) { return "P"; }
+        if (rk == 6) { return "T"; }
+        if (rk == 7) { return "L"; }
+        return "E";
+    }
+
+    void DrawPiece(int cx, int cy, int v, int alpha) {
+        int rk = Jungle.Rank(v);
+        int br; int bg; int bb;
+        if (v > 0) { br = 206; bg = 74; bb = 66; }
+        else { br = 70; bg = 116; bb = 200; }
+        Draw.FillCircle(this.r, cx, cy, 31, 8, 10, 16, alpha);
+        Draw.FillCircle(this.r, cx, cy, 28, br, bg, bb, alpha);
+        Draw.FillCircle(this.r, cx - 9, cy - 9, 8, 255, 255, 255, alpha * 90 / 255);
+        Text.DrawCentered(this.r, JungleGame.Label(rk), cx, cy - 10, 3, 250, 250, 250, alpha);
+        Text.DrawCentered(this.r, "" + rk, cx, cy + 10, 1, 235, 235, 240, alpha);
+    }
+
+    void DrawBoard(int now) {
+        int r = 0;
+        while (r < 9) {
+            int c = 0;
+            while (c < 7) {
+                int idx = r * 7 + c;
+                int x = JungleGame.BX() + c * JungleGame.CELL();
+                int y = JungleGame.BY() + r * JungleGame.CELL();
+                int cr = 66; int cg = 120; int cb = 78;
+                if (Jungle.IsWater(idx)) { cr = 44; cg = 96; cb = 158; }
+                this.r.SetColor(cr, cg, cb, 255);
+                this.r.FillRect(x + 1, y + 1, JungleGame.CELL() - 2, JungleGame.CELL() - 2);
+                if (Jungle.IsAiTrap(idx) || Jungle.IsHuTrap(idx)) {
+                    Draw.RingRect(this.r, x + 8, y + 8, JungleGame.CELL() - 16, JungleGame.CELL() - 16, 3, 230, 190, 70, 220);
+                    Text.DrawCentered(this.r, "X", x + JungleGame.CELL() / 2, y + JungleGame.CELL() / 2 - 8, 2, 230, 190, 70, 180);
+                }
+                if (idx == Jungle.AI_DEN()) {
+                    Draw.FillCircle(this.r, x + JungleGame.CELL() / 2, y + JungleGame.CELL() / 2, 26, 60, 100, 190, 255);
+                    Text.DrawCentered(this.r, "DEN", x + JungleGame.CELL() / 2, y + JungleGame.CELL() / 2 - 8, 1, 240, 240, 250, 255);
+                }
+                if (idx == Jungle.HU_DEN()) {
+                    Draw.FillCircle(this.r, x + JungleGame.CELL() / 2, y + JungleGame.CELL() / 2, 26, 190, 70, 70, 255);
+                    Text.DrawCentered(this.r, "DEN", x + JungleGame.CELL() / 2, y + JungleGame.CELL() / 2 - 8, 1, 250, 240, 240, 255);
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        // grid
+        int i = 0;
+        while (i <= 7) {
+            this.r.SetColor(20, 30, 26, 255);
+            this.r.FillRect(JungleGame.BX() + i * JungleGame.CELL(), JungleGame.BY(), 1, 9 * JungleGame.CELL());
+            i = i + 1;
+        }
+        i = 0;
+        while (i <= 9) {
+            this.r.SetColor(20, 30, 26, 255);
+            this.r.FillRect(JungleGame.BX(), JungleGame.BY() + i * JungleGame.CELL(), 7 * JungleGame.CELL(), 1);
+            i = i + 1;
+        }
+
+        // selection highlight + legal dots
+        if (this.selected >= 0) {
+            int sx = JungleGame.BX() + (this.selected % 7) * JungleGame.CELL();
+            int sy = JungleGame.BY() + (this.selected / 7) * JungleGame.CELL();
+            Draw.RingRect(this.r, sx + 2, sy + 2, JungleGame.CELL() - 4, JungleGame.CELL() - 4, 3, 250, 230, 120, 255);
+            int k = 0;
+            while (k < this.legalN) {
+                int t = this.legalTo[k];
+                int gx = JungleGame.CX(t % 7);
+                int gy = JungleGame.CY(t / 7);
+                if (this.board[t] != 0) {
+                    Draw.RingRect(this.r, JungleGame.BX() + (t % 7) * JungleGame.CELL() + 3, JungleGame.BY() + (t / 7) * JungleGame.CELL() + 3, JungleGame.CELL() - 6, JungleGame.CELL() - 6, 3, 250, 120, 110, 235);
+                } else {
+                    Draw.FillCircle(this.r, gx, gy, 9, 250, 240, 150, 200);
+                }
+                k = k + 1;
+            }
+        }
+
+        // pieces (skip animating destination while it slides)
+        bool anim = this.animFrom >= 0 && (now - this.animStart) < 200;
+        i = 0;
+        while (i < 63) {
+            int v = this.board[i];
+            if (v != 0) {
+                if (!(anim && i == this.animTo)) {
+                    this.DrawPiece(JungleGame.CX(i % 7), JungleGame.CY(i / 7), v, 255);
+                }
+            }
+            i = i + 1;
+        }
+        if (anim) {
+            int dt = now - this.animStart;
+            int p = dt * 100 / 200;
+            int fx = JungleGame.CX(this.animFrom % 7);
+            int fy = JungleGame.CY(this.animFrom / 7);
+            int tx = JungleGame.CX(this.animTo % 7);
+            int ty = JungleGame.CY(this.animTo / 7);
+            int cx = fx + (tx - fx) * p / 100;
+            int cy = fy + (ty - fy) * p / 100;
+            this.DrawPiece(cx, cy, this.animPiece, 255);
+        }
+    }
+
+    void DrawTalk(int px, int py, int w, int now) {
+        string msg = this.talk.Current(now);
+        if (msg.Length == 0) { return; }
+        int kind = this.talk.Kind();
+        int cr = 90; int cg = 150; int cb = 220;
+        if (kind == 0) { cr = 90; cg = 200; cb = 130; }
+        if (kind == 1) { cr = 230; cg = 130; cb = 90; }
+        if (kind == 3) { cr = 250; cg = 200; cb = 70; }
+        this.r.SetColor(28, 32, 42, 235);
+        this.r.FillRect(px, py, w, 46);
+        Draw.RingRect(this.r, px, py, w, 46, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, msg, px + 14, py + 16, 2, cr, cg, cb, 255);
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(20, 24, 32);
+        this.DrawBoard(now);
+
+        int px = 660;
+        Text.Draw(this.r, "JUNGLE", px, 40, 5, 240, 240, 250, 255);
+        Text.Draw(this.r, "DOU SHOU QI", px, 86, 2, 240, 208, 130, 255);
+
+        string status = "YOUR TURN (RED)";
+        int sr = 206; int sg = 90; int sb = 84;
+        if (this.turn == 2) {
+            int dots = (now / 300) % 4;
+            status = "AI THINKING";
+            int d = 0;
+            while (d < dots) { status = status + "."; d = d + 1; }
+            sr = 90; sg = 130; sb = 210;
+        }
+        this.r.SetColor(30, 36, 48, 255);
+        this.r.FillRect(px, 120, 560, 42);
+        Text.Draw(this.r, status, px + 12, 133, 2, sr, sg, sb, 255);
+
+        Text.Draw(this.r, "DIFFICULTY  " + this.LevelName(), px, 178, 2, 180, 190, 210, 255);
+        Text.Draw(this.r, "RANK  " + this.prof.TierName() + "  " + this.prof.rank, px, 204, 2, 255, 210, 90, 255);
+        Text.Draw(this.r, "STREAK  " + this.prof.streak + "   RECORD  " + this.prof.wins + "-" + this.prof.losses, px, 230, 2, 180, 190, 210, 255);
+
+        Text.Draw(this.r, "RANKS (high beats low, rat beats E):", px, 272, 1, 150, 160, 180, 255);
+        Text.Draw(this.r, "E8 L7 T6 P5 W4 D3 C2 R1", px, 292, 2, 200, 208, 224, 255);
+        Text.Draw(this.r, "Rat swims. Lion/Tiger leap rivers.", px, 320, 1, 150, 160, 180, 255);
+        Text.Draw(this.r, "Reach the enemy DEN to win.", px, 338, 1, 150, 160, 180, 255);
+
+        this.DrawTalk(px, 372, 560, now);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, px, 686, 180, 54, "RESTART (R)", 2, 0);
+        Ui.Button(this.r, this.mouseX, this.mouseY, px + 198, 686, 180, 54, "MENU (ESC)", 2, 0);
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/jungle/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(18, 22, 30);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+
+        Text.DrawCenteredShadow(this.r, "JUNGLE CHESS", 640, 72, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "DOU SHOU QI -- REACH THE DEN", 640, 176, 3, 240, 208, 130, 3);
+
+        Ui.Panel(this.r, 300, 250, 680, 470, 20, 24, 34, 212);
+        Text.DrawCenteredShadow(this.r, "SELECT DIFFICULTY", 640, 278, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 4) {
+            string nm = "EASY";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            if (i == 3) { nm = "EXPERT"; }
+            int kind = 0;
+            if (this.prof.level == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 330 + i * 156, 310, 140, 54, nm, 2, kind);
+            i = i + 1;
+        }
+        string adv = "ADAPTIVE: OFF";
+        if (this.prof.adaptive == 1) { adv = "ADAPTIVE: ON"; }
+        int akind = 0;
+        if (this.prof.adaptive == 1) { akind = 1; }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 330, 382, 250, 46, adv, 2, akind);
+        Text.Draw(this.r, "AI scales to your skill", 600, 396, 2, 150, 160, 178, 255);
+
+        Ui.Panel(this.r, 330, 448, 620, 128, 14, 18, 26, 200);
+        Text.Draw(this.r, "RANK", 354, 466, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.TierName() + "  " + this.prof.rank, 354, 488, 4, 255, 210, 90, 2);
+        Text.Draw(this.r, "BEST STREAK  " + this.prof.best, 354, 540, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.wins + "W - " + this.prof.losses + "L", 720, 488, 3, 205, 214, 232, 2);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, 720, 540, 2, 150, 160, 180, 255);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 632, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "You are Red and move first.   1-4 difficulty   ENTER play   F11 fullscreen", 640, 742, 2, 176, 184, 200, 2);
+
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 170);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 240; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        string title = "YOU WIN!";
+        int tr = 90; int tg = 210; int tb = 130;
+        if (this.winner == 2) { title = "AI WINS"; tr = 230; tg = 120; tb = 90; }
+        Text.DrawCentered(this.r, title, 640, by + 40, 7, tr, tg, tb, 255);
+        string ds = "RANK " + this.scoreDelta;
+        if (this.scoreDelta > 0) { ds = "RANK +" + this.scoreDelta; }
+        Text.DrawCentered(this.r, ds, 640, by + 120, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, this.prof.TierName() + "  " + this.prof.rank + "    STREAK " + this.prof.streak, 640, by + 168, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 210, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 210, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) {
+            if (this.scene == 0) { this.host.Quit(); }
+            else { this.scene = 0; }
+        }
+        if (sc == 21) { if (this.scene != 0) { this.StartGame(now); } }
+        if (this.scene == 0) {
+            if (sc == 30) { this.prof.level = 0; }
+            if (sc == 31) { this.prof.level = 1; }
+            if (sc == 32) { this.prof.level = 2; }
+            if (sc == 33) { this.prof.level = 3; }
+            if (sc == 40 || sc == 44) { this.StartGame(now); }
+        }
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 4) {
+                if (Draw.PointIn(cx, cy, 330 + i * 156, 310, 140, 54)) { this.prof.level = i; }
+                i = i + 1;
+            }
+            if (Draw.PointIn(cx, cy, 330, 382, 250, 46)) { this.prof.adaptive = 1 - this.prof.adaptive; }
+            if (Draw.PointIn(cx, cy, 470, 632, 340, 74)) { this.StartGame(now); }
+        } else if (this.scene == 1) {
+            if (Draw.PointIn(cx, cy, 660, 686, 180, 54)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 858, 686, 180, 54)) { this.scene = 0; return; }
+            if (this.turn != 1 || this.aiPending) { return; }
+            int idx = this.PickCell(cx, cy);
+            if (idx < 0) { return; }
+            if (this.selected >= 0 && this.IsLegalTarget(idx)) {
+                this.HumanMove(this.selected, idx, now);
+                return;
+            }
+            if (this.board[idx] > 0) {
+                this.selected = idx;
+                this.ComputeLegal(idx);
+            } else {
+                this.selected = -1;
+                this.legalN = 0;
+            }
+        } else {
+            if (Draw.PointIn(cx, cy, 400, 450, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 450, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    void Tick(int now) {
+        if (this.demo) {
+            if (this.scene == 2 && now >= this.demoAt) { this.StartGame(now); this.demoAt = now + 800; return; }
+            if (this.scene == 1 && this.turn == 1 && !this.aiPending && now >= this.demoAt) {
+                int mv = Jungle.BestMove(this.board, 3, 1, this.rng);
+                if (mv >= 0) { this.HumanMove(mv / 63, mv % 63, now); }
+                this.demoAt = now + 500;
+            }
+        }
+        if (this.scene == 1 && this.turn == 2 && this.aiPending && now >= this.aiMoveAt) {
+            this.AiMove(now);
+            if (this.demo) { this.demoAt = now + 350; }
+        }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 1) { this.DrawPlay(now); }
+        else { this.DrawOver(now); }
+    }
+}
+
+class JungleApp {
+    static void Main() {
+        Host h = Host.Create("Jungle Chess - Dou Shou Qi", 1280, 800);
+        JungleGame g = JungleGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) {
+                        int sc = SdlEvent.Scancode();
+                        if (sc == 68) { h.ToggleFullscreen(); }
+                        else { g.OnKey(sc, now); }
+                    }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}

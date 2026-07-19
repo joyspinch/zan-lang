@@ -31,6 +31,7 @@ class Checker {
     Node curRet;                // return type of the current method (null=void)
     bool curVoid;               // is the current method void / a constructor
     bool curStatic;             // is the current method static
+    int infCount;
     int loopDepth;              // enclosing loop/switch nesting
     List<string> scopeName;     // value names currently in scope
     List<Node> scopeType;       // parallel declared/inferred types (may be null)
@@ -66,19 +67,25 @@ class Checker {
     // ---- type-directed lookup, walking base classes ----
     Node FieldUp(Node cls, string name) {
         Node c = cls;
+        int cg = 0;
         while (c != null) {
             Node f = binder.FindField(c, name);
             if (f != null) { return f; }
             c = binder.FindType(c.sval2);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
         }
         return null;
     }
     Node MethodUp(Node cls, string name) {
         Node c = cls;
+        int cg = 0;
         while (c != null) {
             Node m = binder.FindMethod(c, name);
             if (m != null) { return m; }
             c = binder.FindType(c.sval2);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
         }
         return null;
     }
@@ -89,6 +96,12 @@ class Checker {
         if (MethodUp(cls, "get_" + name) != null) { return true; }
         if (MethodUp(cls, "set_" + name) != null) { return true; }
         return false;
+    }
+
+    // An extension method `name` whose `this` receiver matches type `tyName`.
+    bool HasExt(string tyName, string name) {
+        List<string> owner = new List<string>();
+        return binder.FindExtension(tyName, name, owner) != null;
     }
 
     // The user class/struct declaration a type refers to, or null.
@@ -136,6 +149,7 @@ class Checker {
     // receiver shifts the count) -- in which case we do not second-guess it.
     bool AcceptsArgc(Node cls, string name, int argc) {
         Node c = cls;
+        int cg3 = 0;
         while (c != null) {
             int i = 0;
             while (i < c.kids.Count) {
@@ -143,25 +157,32 @@ class Checker {
                 if (m.kind == AK.MethodDecl() && m.sval == name) {
                     if (m.ival == 1) { return true; }
                     int tot = 0; int req = 0;
+                    Node lastP = null;
                     int j = 0;
                     while (j < m.kids.Count) {
                         if (m.kids[j].kind == AK.Param()) {
                             tot = tot + 1;
                             if (m.kids[j].b == null) { req = req + 1; }
+                            lastP = m.kids[j];
                         }
                         j = j + 1;
                     }
                     if (argc >= req && argc <= tot) { return true; }
+                    // `params T[]` tail accepts any argc >= fixed params
+                    if (lastP != null && lastP.op == 1 && argc >= req - 1) { return true; }
                 }
                 i = i + 1;
             }
             c = binder.FindType(c.sval2);
+            cg3 = cg3 + 1;
+            if (cg3 > 512) { c = null; }
         }
         return false;
     }
 
     // ---- expression typer (null == unknown) ----
     Node InferType(Node e) {
+        infCount = infCount + 1;
         if (e == null) { return null; }
         int k = e.kind;
         if (k == AK.IntLit()) { return MkType("int"); }
@@ -179,8 +200,22 @@ class Checker {
             return null;
         }
         if (k == AK.CastExpr()) { return e.type; }
+        if (k == AK.AwaitExpr()) { return InferType(e.a); }
         if (k == AK.NewExpr()) { return e.type; }
         if (k == AK.IsExpr()) { return MkType("bool"); }
+        if (k == AK.QueryExpr()) {
+            Node srcT = InferType(e.a);
+            Node elem = null;
+            if (srcT != null && srcT.sval == "List" && srcT.kids.Count > 0) { elem = srcT.kids[0]; }
+            int qm = ScopeMark();
+            ScopeAdd(e.sval, elem);
+            Node sel = InferType(e.b);
+            ScopeTrim(qm);
+            if (sel == null) { sel = elem; }
+            Node lst = MkType("List");
+            lst.Add(sel);
+            return lst;
+        }
         if (k == AK.Unary()) {
             if (e.op == TK.Bang()) { return MkType("bool"); }
             return InferType(e.a);
@@ -390,6 +425,7 @@ class Checker {
             }
             return;
         }
+        if (k == AK.GotoStmt() || k == AK.LabelStmt()) { return; }
         if (k == AK.ExprStmt()) { CheckExpr(n.a); return; }
         if (k == AK.ReturnStmt()) {
             CheckExpr(n.a);
@@ -533,6 +569,19 @@ class Checker {
             return;
         }
         if (k == AK.Conditional()) { CheckExpr(n.a); CheckExpr(n.b); CheckExpr(n.c); return; }
+        if (k == AK.QueryExpr()) {
+            CheckExpr(n.a);
+            int mark = ScopeMark();
+            Node et = null;
+            Node ct = InferType(n.a);
+            if (ct != null && ct.sval == "List" && ct.kids.Count > 0) { et = ct.kids[0]; }
+            ScopeAdd(n.sval, et);
+            int i = 0;
+            while (i < n.kids.Count) { CheckExpr(n.kids[i]); i = i + 1; }
+            CheckExpr(n.b);
+            ScopeTrim(mark);
+            return;
+        }
         if (k == AK.Lambda()) {
             int mark = ScopeMark();
             int i = 0;
@@ -569,7 +618,7 @@ class Checker {
         CheckObj(n.a);
         Node ot = InferType(n.a);
         Node cls = ClassOf(ot);
-        if (cls != null && !HasMember(cls, n.sval)) {
+        if (cls != null && !HasMember(cls, n.sval) && !HasExt(cls.sval, n.sval)) {
             diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
         }
     }
@@ -597,7 +646,7 @@ class Checker {
             Node ot = InferType(callee.a);
             Node cls = ClassOf(ot);
             if (cls != null) {
-                if (!HasMember(cls, callee.sval)) {
+                if (!HasMember(cls, callee.sval) && !HasExt(cls.sval, callee.sval)) {
                     diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);
                 } else if (MethodUp(cls, callee.sval) != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
                     diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);

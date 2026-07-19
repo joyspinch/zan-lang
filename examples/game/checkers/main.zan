@@ -1,0 +1,883 @@
+// Checkers (English Draughts) -- a complete product on GameKit.
+// 8x8, 12 men each, mandatory captures with multi-jump chains, promotion to
+// kings, alpha-beta Minimax AI over full-turn sequences, four difficulties +
+// adaptive scaling, slide animation, legal-move hints, and a persistent
+// rank / streak profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Checkers;
+
+class Profile {
+    int rank;
+    int streak;
+    int best;
+    int wins;
+    int losses;
+    int draws;
+    int games;
+    int level;
+    int adaptive;
+
+    static string Path() { return "checkers_save.txt"; }
+
+    static int ParseInt(string s, int start) {
+        int i = start;
+        int sign = 1;
+        if (i < s.Length && s[i] == 45) { sign = -1; i = i + 1; }
+        int v = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v * sign;
+    }
+
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i];
+            int eq = -1;
+            int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static Profile Load() {
+        Profile p = new Profile();
+        p.rank = 1000; p.streak = 0; p.best = 0;
+        p.wins = 0; p.losses = 0; p.draws = 0; p.games = 0;
+        p.level = 1; p.adaptive = 1;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.rank = Profile.ReadKey(lines, "rank", 1000);
+            p.streak = Profile.ReadKey(lines, "streak", 0);
+            p.best = Profile.ReadKey(lines, "best", 0);
+            p.wins = Profile.ReadKey(lines, "wins", 0);
+            p.losses = Profile.ReadKey(lines, "losses", 0);
+            p.draws = Profile.ReadKey(lines, "draws", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+            p.level = Profile.ReadKey(lines, "level", 1);
+            p.adaptive = Profile.ReadKey(lines, "adaptive", 1);
+        }
+        return p;
+    }
+
+    void Save() {
+        string s = "";
+        s = s + "rank=" + this.rank + "\n";
+        s = s + "streak=" + this.streak + "\n";
+        s = s + "best=" + this.best + "\n";
+        s = s + "wins=" + this.wins + "\n";
+        s = s + "losses=" + this.losses + "\n";
+        s = s + "draws=" + this.draws + "\n";
+        s = s + "games=" + this.games + "\n";
+        s = s + "level=" + this.level + "\n";
+        s = s + "adaptive=" + this.adaptive + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+
+    string TierName() {
+        int r = this.rank;
+        if (r < 900) { return "BRONZE"; }
+        if (r < 1100) { return "SILVER"; }
+        if (r < 1300) { return "GOLD"; }
+        if (r < 1500) { return "PLATINUM"; }
+        if (r < 1750) { return "DIAMOND"; }
+        return "MASTER";
+    }
+}
+
+// Board int[64], index r*8+c. 0 empty; 1 human man, 2 human king;
+// -1 AI man, -2 AI king. Human plays red at the bottom (moves up).
+class Chk {
+    static int[] Clone(int[] b) {
+        int[] nb = new int[64];
+        int i = 0;
+        while (i < 64) { nb[i] = b[i]; i = i + 1; }
+        return nb;
+    }
+
+    static bool Owns(int v, int side) {
+        if (v == 0) { return false; }
+        if (side == 1) { return v > 0; }
+        return v < 0;
+    }
+
+    static bool AllowDir(int v, int dr) {
+        if (v == 1) { return dr == -1; }
+        if (v == -1) { return dr == 1; }
+        return true;   // kings
+    }
+
+    static bool CaptureFrom(int[] b, int from, int side) {
+        int v = b[from];
+        int r = from / 8; int c = from % 8;
+        int di = 0;
+        while (di < 4) {
+            int dr = -1; int dc = -1;
+            if (di == 1) { dr = -1; dc = 1; }
+            if (di == 2) { dr = 1; dc = -1; }
+            if (di == 3) { dr = 1; dc = 1; }
+            if (Chk.AllowDir(v, dr)) {
+                int mr = r + dr; int mc = c + dc;
+                int lr = r + 2 * dr; int lc = c + 2 * dc;
+                if (lr >= 0 && lr < 8 && lc >= 0 && lc < 8) {
+                    int mid = mr * 8 + mc;
+                    int land = lr * 8 + lc;
+                    if (b[land] == 0 && b[mid] != 0 && !Chk.Owns(b[mid], side)) { return true; }
+                }
+            }
+            di = di + 1;
+        }
+        return false;
+    }
+
+    static bool HasAnyCapture(int[] b, int side) {
+        int i = 0;
+        while (i < 64) {
+            if (b[i] != 0 && Chk.Owns(b[i], side)) { if (Chk.CaptureFrom(b, i, side)) { return true; } }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static void Emit(int[] nb, int origin, int land, int[] outB, int[] outF, int[] outT, int[] cnt) {
+        int k = cnt[0];
+        int i = 0;
+        while (i < 64) { outB[k * 64 + i] = nb[i]; i = i + 1; }
+        outF[k] = origin; outT[k] = land;
+        cnt[0] = k + 1;
+    }
+
+    static void GenCap(int[] b, int from, int origin, int side, int[] outB, int[] outF, int[] outT, int[] cnt) {
+        int v = b[from];
+        int r = from / 8; int c = from % 8;
+        bool found = false;
+        int di = 0;
+        while (di < 4) {
+            int dr = -1; int dc = -1;
+            if (di == 1) { dr = -1; dc = 1; }
+            if (di == 2) { dr = 1; dc = -1; }
+            if (di == 3) { dr = 1; dc = 1; }
+            if (Chk.AllowDir(v, dr)) {
+                int lr = r + 2 * dr; int lc = c + 2 * dc;
+                if (lr >= 0 && lr < 8 && lc >= 0 && lc < 8) {
+                    int mid = (r + dr) * 8 + (c + dc);
+                    int land = lr * 8 + lc;
+                    if (b[land] == 0 && b[mid] != 0 && !Chk.Owns(b[mid], side)) {
+                        found = true;
+                        int[] nb = Chk.Clone(b);
+                        int pv = nb[from];
+                        nb[from] = 0; nb[mid] = 0; nb[land] = pv;
+                        bool promoted = false;
+                        if (pv == 1 && lr == 0) { nb[land] = 2; promoted = true; }
+                        if (pv == -1 && lr == 7) { nb[land] = -2; promoted = true; }
+                        if (!promoted && Chk.CaptureFrom(nb, land, side)) {
+                            Chk.GenCap(nb, land, origin, side, outB, outF, outT, cnt);
+                        } else {
+                            Chk.Emit(nb, origin, land, outB, outF, outT, cnt);
+                        }
+                    }
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    static void GenSimpleSq(int[] b, int from, int side, int[] outB, int[] outF, int[] outT, int[] cnt) {
+        int v = b[from];
+        int r = from / 8; int c = from % 8;
+        int di = 0;
+        while (di < 4) {
+            int dr = -1; int dc = -1;
+            if (di == 1) { dr = -1; dc = 1; }
+            if (di == 2) { dr = 1; dc = -1; }
+            if (di == 3) { dr = 1; dc = 1; }
+            if (Chk.AllowDir(v, dr)) {
+                int nr = r + dr; int nc = c + dc;
+                if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+                    int to = nr * 8 + nc;
+                    if (b[to] == 0) {
+                        int[] nb = Chk.Clone(b);
+                        int pv = nb[from];
+                        nb[from] = 0; nb[to] = pv;
+                        if (pv == 1 && nr == 0) { nb[to] = 2; }
+                        if (pv == -1 && nr == 7) { nb[to] = -2; }
+                        Chk.Emit(nb, from, to, outB, outF, outT, cnt);
+                    }
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    static int GenPositions(int[] b, int side, int[] outB, int[] outF, int[] outT) {
+        int[] cnt = new int[1];
+        cnt[0] = 0;
+        bool anyCap = Chk.HasAnyCapture(b, side);
+        int sq = 0;
+        while (sq < 64) {
+            int v = b[sq];
+            if (v != 0 && Chk.Owns(v, side)) {
+                if (anyCap) { Chk.GenCap(b, sq, sq, side, outB, outF, outT, cnt); }
+                else { Chk.GenSimpleSq(b, sq, side, outB, outF, outT, cnt); }
+            }
+            sq = sq + 1;
+        }
+        return cnt[0];
+    }
+
+    static int Eval(int[] b) {
+        int score = 0;
+        int i = 0;
+        while (i < 64) {
+            int v = b[i];
+            if (v != 0) {
+                int r = i / 8;
+                if (v == -1) { score = score + 100 + r * 4; }
+                else if (v == -2) { score = score + 180; }
+                else if (v == 1) { score = score - 100 - (7 - r) * 4; }
+                else if (v == 2) { score = score - 180; }
+            }
+            i = i + 1;
+        }
+        return score;
+    }
+
+    static int Search(int[] b, int depth, int alpha, int beta, int side) {
+        int[] ob = new int[64 * 64];
+        int[] of = new int[64];
+        int[] ot = new int[64];
+        int n = Chk.GenPositions(b, side, ob, of, ot);
+        if (n == 0) {
+            if (side == 2) { return -1000000 - depth; }
+            return 1000000 + depth;
+        }
+        if (depth == 0) { return Chk.Eval(b); }
+        if (side == 2) {
+            int best = -2000000000;
+            int i = 0;
+            while (i < n) {
+                int[] nb = new int[64];
+                int k = 0;
+                while (k < 64) { nb[k] = ob[i * 64 + k]; k = k + 1; }
+                int v = Chk.Search(nb, depth - 1, alpha, beta, 1);
+                if (v > best) { best = v; }
+                if (best > alpha) { alpha = best; }
+                if (beta <= alpha) { i = n; }
+                i = i + 1;
+            }
+            return best;
+        }
+        int best = 2000000000;
+        int i = 0;
+        while (i < n) {
+            int[] nb = new int[64];
+            int k = 0;
+            while (k < 64) { nb[k] = ob[i * 64 + k]; k = k + 1; }
+            int v = Chk.Search(nb, depth - 1, alpha, beta, 2);
+            if (v < best) { best = v; }
+            if (best < beta) { beta = best; }
+            if (beta <= alpha) { i = n; }
+            i = i + 1;
+        }
+        return best;
+    }
+}
+
+class ChkGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    Talker talk;
+    int[] board;
+    int scene;
+    int turn;
+    int winner;
+    int selected;
+    int[] legalTo;
+    int[] legalCap;
+    int legalN;
+    bool chaining;
+    int aiMoveAt;
+    bool aiPending;
+    int animFrom;
+    int animTo;
+    int animStart;
+    int animPiece;
+    int mouseX;
+    int mouseY;
+    int scoreDelta;
+    int winAdj;
+    int lossAdj;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+    int demoAt;
+
+    static int CELL() { return 78; }
+    static int BX() { return 120; }
+    static int BY() { return 60; }
+    static int CX(int c) { return 120 + c * 78 + 39; }
+    static int CY(int r) { return 60 + r * 78 + 39; }
+
+    int Depth() {
+        if (this.prof.level == 0) { return 1; }
+        if (this.prof.level == 1) { return 3; }
+        if (this.prof.level == 2) { return 5; }
+        return 7;
+    }
+    int Rand() {
+        if (this.prof.level == 0) { return 3; }
+        if (this.prof.level == 1) { return 1; }
+        return 0;
+    }
+    string LevelName() {
+        if (this.prof.level == 0) { return "EASY"; }
+        if (this.prof.level == 1) { return "NORMAL"; }
+        if (this.prof.level == 2) { return "HARD"; }
+        return "EXPERT";
+    }
+
+    static ChkGame Create(Host h) {
+        ChkGame g = new ChkGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 315927486);
+        g.talk = Talker.Create(g.rng);
+        g.board = new int[64];
+        g.legalTo = new int[16];
+        g.legalCap = new int[16];
+        g.scene = 0;
+        g.selected = -1;
+        g.winner = 0;
+        g.turn = 1;
+        g.animFrom = -1;
+        g.SetupTalk();
+        g.demo = File.Exists("checkers_demo.txt");
+        if (g.demo) { g.StartGame(Sdl.Ticks()); g.demoAt = Sdl.Ticks() + 500; }
+        return g;
+    }
+
+    void SetupTalk() {
+        this.talk.Add(0, "Nice jump!");
+        this.talk.Add(0, "Building a wall.");
+        this.talk.Add(0, "King me soon!");
+        this.talk.Add(0, "Great tempo.");
+        this.talk.Add(1, "Careful, forced capture...");
+        this.talk.Add(1, "The AI sets a trap.");
+        this.talk.Add(1, "Watch your back rank.");
+        this.talk.Add(2, "Your move.");
+        this.talk.Add(2, "Pick a piece.");
+        this.talk.Add(3, "DOUBLE JUMP!");
+        this.talk.Add(3, "Crowned a king!");
+        this.talk.Add(3, "What a combo!");
+    }
+
+    void ResetBoard() {
+        int i = 0;
+        while (i < 64) { this.board[i] = 0; i = i + 1; }
+        int r = 0;
+        while (r < 8) {
+            int c = 0;
+            while (c < 8) {
+                if ((r + c) % 2 == 1) {
+                    if (r < 3) { this.board[r * 8 + c] = -1; }
+                    if (r > 4) { this.board[r * 8 + c] = 1; }
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+    }
+
+    void StartGame(int now) {
+        this.ResetBoard();
+        this.scene = 1;
+        this.turn = 1;
+        this.winner = 0;
+        this.selected = -1;
+        this.legalN = 0;
+        this.chaining = false;
+        this.aiPending = false;
+        this.animFrom = -1;
+        this.scoreDelta = 0;
+        this.talk.SayExact(2, "You are Red -- capture is forced!", now, 2600);
+    }
+
+    // Legal single hops for the selected piece, honoring forced capture.
+    void ComputeHops(int from, bool captureOnly) {
+        this.legalN = 0;
+        int v = this.board[from];
+        int r = from / 8; int c = from % 8;
+        int di = 0;
+        while (di < 4) {
+            int dr = -1; int dc = -1;
+            if (di == 1) { dr = -1; dc = 1; }
+            if (di == 2) { dr = 1; dc = -1; }
+            if (di == 3) { dr = 1; dc = 1; }
+            if (Chk.AllowDir(v, dr)) {
+                int lr = r + 2 * dr; int lc = c + 2 * dc;
+                if (lr >= 0 && lr < 8 && lc >= 0 && lc < 8) {
+                    int mid = (r + dr) * 8 + (c + dc);
+                    int land = lr * 8 + lc;
+                    if (this.board[land] == 0 && this.board[mid] != 0 && !Chk.Owns(this.board[mid], 1)) {
+                        this.legalTo[this.legalN] = land; this.legalCap[this.legalN] = mid; this.legalN = this.legalN + 1;
+                    }
+                }
+                if (!captureOnly) {
+                    int nr = r + dr; int nc = c + dc;
+                    if (nr >= 0 && nr < 8 && nc >= 0 && nc < 8) {
+                        int to = nr * 8 + nc;
+                        if (this.board[to] == 0) { this.legalTo[this.legalN] = to; this.legalCap[this.legalN] = -1; this.legalN = this.legalN + 1; }
+                    }
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    int FindHop(int to) {
+        int i = 0;
+        while (i < this.legalN) { if (this.legalTo[i] == to) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    void EndTurnAfterHuman(int now) {
+        this.selected = -1;
+        this.legalN = 0;
+        this.chaining = false;
+        int[] ob = new int[64 * 64];
+        int[] of = new int[64];
+        int[] ot = new int[64];
+        if (Chk.GenPositions(this.board, 2, ob, of, ot) == 0) { this.EndGame(1, now); return; }
+        this.turn = 2;
+        this.aiMoveAt = now + 480;
+        this.aiPending = true;
+    }
+
+    void DoHop(int from, int to, int cap, int now) {
+        this.animFrom = from;
+        this.animTo = to;
+        this.animPiece = this.board[from];
+        this.animStart = now;
+        int pv = this.board[from];
+        this.board[from] = 0;
+        if (cap >= 0) { this.board[cap] = 0; }
+        this.board[to] = pv;
+        bool promoted = false;
+        int tr = to / 8;
+        if (pv == 1 && tr == 0) { this.board[to] = 2; promoted = true; }
+        if (promoted) { this.talk.Say(3, now, 2200); }
+        if (cap >= 0 && !promoted && Chk.CaptureFrom(this.board, to, 1)) {
+            this.selected = to;
+            this.chaining = true;
+            this.ComputeHops(to, true);
+            if (this.rng.Range(0, 100) < 60) { this.talk.Say(3, now, 1800); }
+            return;
+        }
+        this.EndTurnAfterHuman(now);
+    }
+
+    void AiMove(int now) {
+        this.aiPending = false;
+        int[] ob = new int[64 * 64];
+        int[] of = new int[64];
+        int[] ot = new int[64];
+        int n = Chk.GenPositions(this.board, 2, ob, of, ot);
+        if (n == 0) { this.EndGame(1, now); return; }
+        int[] sc = new int[64];
+        int best = -2000000000;
+        int i = 0;
+        while (i < n) {
+            int[] nb = new int[64];
+            int k = 0;
+            while (k < 64) { nb[k] = ob[i * 64 + k]; k = k + 1; }
+            int v = Chk.Search(nb, this.Depth() - 1, -2000000000, 2000000000, 1);
+            sc[i] = v;
+            if (v > best) { best = v; }
+            i = i + 1;
+        }
+        int rand = this.Rand();
+        int margin = 0;
+        if (rand > 0) { margin = 20 + rand * 30; }
+        int[] pool = new int[64];
+        int pn = 0;
+        i = 0;
+        while (i < n) { if (sc[i] >= best - margin) { pool[pn] = i; pn = pn + 1; } i = i + 1; }
+        int pick = pool[0];
+        if (pn > 1 && rand > 0) { pick = pool[this.rng.Range(0, pn)]; }
+        else { i = 0; while (i < n) { if (sc[i] == best) { pick = i; i = n; } i = i + 1; } }
+        this.animFrom = of[pick];
+        this.animTo = ot[pick];
+        this.animPiece = this.board[of[pick]];
+        this.animStart = now;
+        int k = 0;
+        while (k < 64) { this.board[k] = ob[pick * 64 + k]; k = k + 1; }
+        int[] hf = new int[64 * 64];
+        int[] hf2 = new int[64];
+        int[] hf3 = new int[64];
+        if (Chk.GenPositions(this.board, 1, hf, hf2, hf3) == 0) { this.EndGame(2, now); return; }
+        this.turn = 1;
+    }
+
+    void EndGame(int who, int now) {
+        this.winner = who;
+        this.scene = 2;
+        this.aiPending = false;
+        this.prof.games = this.prof.games + 1;
+        int delta = 0;
+        if (who == 1) {
+            this.prof.wins = this.prof.wins + 1;
+            this.prof.streak = this.prof.streak + 1;
+            if (this.prof.streak > this.prof.best) { this.prof.best = this.prof.streak; }
+            delta = 18 + this.prof.level * 8;
+            this.prof.rank = this.prof.rank + delta;
+            this.winAdj = this.winAdj + 1; this.lossAdj = 0;
+            this.talk.SayExact(3, "Victory! Rank +" + delta, now, 4000);
+            if (this.prof.adaptive == 1 && this.winAdj >= 2 && this.prof.level < 3) { this.prof.level = this.prof.level + 1; this.winAdj = 0; }
+        } else {
+            this.prof.losses = this.prof.losses + 1;
+            this.prof.streak = 0;
+            delta = 14 - this.prof.level * 2;
+            if (delta < 6) { delta = 6; }
+            this.prof.rank = this.prof.rank - delta;
+            if (this.prof.rank < 100) { this.prof.rank = 100; }
+            delta = -delta;
+            this.lossAdj = this.lossAdj + 1; this.winAdj = 0;
+            this.talk.SayExact(1, "The AI cleans up. Rematch?", now, 4000);
+            if (this.prof.adaptive == 1 && this.lossAdj >= 2 && this.prof.level > 0) { this.prof.level = this.prof.level - 1; this.lossAdj = 0; }
+        }
+        this.scoreDelta = delta;
+        this.prof.Save();
+    }
+
+    int PickCell(int px, int py) {
+        if (px < ChkGame.BX() || py < ChkGame.BY()) { return -1; }
+        int c = (px - ChkGame.BX()) / ChkGame.CELL();
+        int r = (py - ChkGame.BY()) / ChkGame.CELL();
+        if (c < 0 || c > 7 || r < 0 || r > 7) { return -1; }
+        return r * 8 + c;
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void DrawPiece(int cx, int cy, int v, int alpha) {
+        int br; int bg; int bb;
+        if (v > 0) { br = 206; bg = 74; bb = 66; } else { br = 60; bg = 66; bb = 82; }
+        Draw.FillCircle(this.r, cx, cy + 3, 27, 6, 8, 12, alpha * 120 / 255);
+        Draw.FillCircle(this.r, cx, cy, 27, 8, 10, 16, alpha);
+        Draw.FillCircle(this.r, cx, cy, 24, br, bg, bb, alpha);
+        Draw.FillCircle(this.r, cx, cy, 17, br * 7 / 10, bg * 7 / 10, bb * 7 / 10, alpha);
+        Draw.FillCircle(this.r, cx - 7, cy - 8, 6, 255, 255, 255, alpha * 110 / 255);
+        int rk = v;
+        if (rk < 0) { rk = -rk; }
+        if (rk == 2) {
+            Text.DrawCentered(this.r, "K", cx, cy - 8, 3, 250, 220, 90, alpha);
+        }
+    }
+
+    void DrawBoard(int now) {
+        int r = 0;
+        while (r < 8) {
+            int c = 0;
+            while (c < 8) {
+                int x = ChkGame.BX() + c * ChkGame.CELL();
+                int y = ChkGame.BY() + r * ChkGame.CELL();
+                if ((r + c) % 2 == 1) { this.r.SetColor(78, 54, 40, 255); }
+                else { this.r.SetColor(224, 208, 176, 255); }
+                this.r.FillRect(x, y, ChkGame.CELL(), ChkGame.CELL());
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        // border
+        Draw.RingRect(this.r, ChkGame.BX() - 4, ChkGame.BY() - 4, 8 * ChkGame.CELL() + 8, 8 * ChkGame.CELL() + 8, 4, 40, 28, 20, 255);
+
+        if (this.selected >= 0) {
+            int sx = ChkGame.BX() + (this.selected % 8) * ChkGame.CELL();
+            int sy = ChkGame.BY() + (this.selected / 8) * ChkGame.CELL();
+            Draw.RingRect(this.r, sx + 2, sy + 2, ChkGame.CELL() - 4, ChkGame.CELL() - 4, 3, 250, 230, 120, 255);
+            int k = 0;
+            while (k < this.legalN) {
+                int t = this.legalTo[k];
+                int gx = ChkGame.CX(t % 8);
+                int gy = ChkGame.CY(t / 8);
+                if (this.legalCap[k] >= 0) { Draw.FillCircle(this.r, gx, gy, 12, 250, 150, 120, 220); }
+                else { Draw.FillCircle(this.r, gx, gy, 9, 250, 240, 150, 200); }
+                k = k + 1;
+            }
+        }
+
+        bool anim = this.animFrom >= 0 && (now - this.animStart) < 200;
+        int i = 0;
+        while (i < 64) {
+            int v = this.board[i];
+            if (v != 0) { if (!(anim && i == this.animTo)) { this.DrawPiece(ChkGame.CX(i % 8), ChkGame.CY(i / 8), v, 255); } }
+            i = i + 1;
+        }
+        if (anim) {
+            int dt = now - this.animStart;
+            int p = dt * 100 / 200;
+            int fx = ChkGame.CX(this.animFrom % 8); int fy = ChkGame.CY(this.animFrom / 8);
+            int tx = ChkGame.CX(this.animTo % 8); int ty = ChkGame.CY(this.animTo / 8);
+            this.DrawPiece(fx + (tx - fx) * p / 100, fy + (ty - fy) * p / 100, this.animPiece, 255);
+        }
+    }
+
+    void DrawTalk(int px, int py, int w, int now) {
+        string msg = this.talk.Current(now);
+        if (msg.Length == 0) { return; }
+        int kind = this.talk.Kind();
+        int cr = 90; int cg = 150; int cb = 220;
+        if (kind == 0) { cr = 90; cg = 200; cb = 130; }
+        if (kind == 1) { cr = 230; cg = 130; cb = 90; }
+        if (kind == 3) { cr = 250; cg = 200; cb = 70; }
+        this.r.SetColor(28, 32, 42, 235);
+        this.r.FillRect(px, py, w, 46);
+        Draw.RingRect(this.r, px, py, w, 46, 2, cr, cg, cb, 255);
+        Text.Draw(this.r, msg, px + 14, py + 16, 2, cr, cg, cb, 255);
+    }
+
+    int Count(int a, int b2) {
+        int n = 0; int i = 0;
+        while (i < 64) { if (this.board[i] == a || this.board[i] == b2) { n = n + 1; } i = i + 1; }
+        return n;
+    }
+
+    void DrawPlay(int now) {
+        this.host.Begin(20, 24, 32);
+        this.DrawBoard(now);
+
+        int px = 770;
+        Text.Draw(this.r, "CHECKERS", px, 44, 5, 240, 240, 250, 255);
+        Text.Draw(this.r, "ENGLISH DRAUGHTS", px, 90, 2, 240, 208, 130, 255);
+
+        this.DrawPiece(px + 18, 150, 1, 255);
+        Text.Draw(this.r, "YOU  " + this.Count(1, 2), px + 44, 142, 2, 222, 120, 116, 255);
+        this.DrawPiece(px + 200, 150, -1, 255);
+        Text.Draw(this.r, "AI  " + this.Count(-1, -2), px + 226, 142, 2, 170, 180, 205, 255);
+
+        string status = "YOUR TURN (RED)";
+        int sr = 206; int sg = 90; int sb = 84;
+        if (this.turn == 2) {
+            int dots = (now / 300) % 4;
+            status = "AI THINKING";
+            int d = 0;
+            while (d < dots) { status = status + "."; d = d + 1; }
+            sr = 150; sg = 160; sb = 200;
+        }
+        this.r.SetColor(30, 36, 48, 255);
+        this.r.FillRect(px, 186, 400, 42);
+        Text.Draw(this.r, status, px + 12, 199, 2, sr, sg, sb, 255);
+
+        Text.Draw(this.r, "DIFFICULTY  " + this.LevelName(), px, 244, 2, 180, 190, 210, 255);
+        Text.Draw(this.r, "RANK  " + this.prof.TierName() + "  " + this.prof.rank, px, 270, 2, 255, 210, 90, 255);
+        Text.Draw(this.r, "STREAK  " + this.prof.streak + "   RECORD  " + this.prof.wins + "-" + this.prof.losses, px, 296, 2, 180, 190, 210, 255);
+        Text.Draw(this.r, "Captures are mandatory. Chain jumps!", px, 330, 1, 150, 160, 180, 255);
+        Text.Draw(this.r, "Reach the far row to crown a KING.", px, 348, 1, 150, 160, 180, 255);
+
+        this.DrawTalk(px, 380, 400, now);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, px, 686, 190, 54, "RESTART (R)", 2, 0);
+        Ui.Button(this.r, this.mouseX, this.mouseY, px + 208, 686, 190, 54, "MENU (ESC)", 2, 0);
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/checkers/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(18, 22, 30);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+
+        Text.DrawCenteredShadow(this.r, "CHECKERS", 640, 72, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "ENGLISH DRAUGHTS -- JUMP TO WIN", 640, 176, 3, 240, 208, 130, 3);
+
+        Ui.Panel(this.r, 300, 250, 680, 470, 20, 24, 34, 212);
+        Text.DrawCenteredShadow(this.r, "SELECT DIFFICULTY", 640, 278, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 4) {
+            string nm = "EASY";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            if (i == 3) { nm = "EXPERT"; }
+            int kind = 0;
+            if (this.prof.level == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 330 + i * 156, 310, 140, 54, nm, 2, kind);
+            i = i + 1;
+        }
+        string adv = "ADAPTIVE: OFF";
+        if (this.prof.adaptive == 1) { adv = "ADAPTIVE: ON"; }
+        int akind = 0;
+        if (this.prof.adaptive == 1) { akind = 1; }
+        Ui.Button(this.r, this.mouseX, this.mouseY, 330, 382, 250, 46, adv, 2, akind);
+        Text.Draw(this.r, "AI scales to your skill", 600, 396, 2, 150, 160, 178, 255);
+
+        Ui.Panel(this.r, 330, 448, 620, 128, 14, 18, 26, 200);
+        Text.Draw(this.r, "RANK", 354, 466, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.TierName() + "  " + this.prof.rank, 354, 488, 4, 255, 210, 90, 2);
+        Text.Draw(this.r, "BEST STREAK  " + this.prof.best, 354, 540, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, this.prof.wins + "W - " + this.prof.losses + "L", 720, 488, 3, 205, 214, 232, 2);
+        Text.Draw(this.r, "GAMES  " + this.prof.games, 720, 540, 2, 150, 160, 180, 255);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 632, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "You are Red and move first.   1-4 difficulty   ENTER play   F11 fullscreen", 640, 742, 2, 176, 184, 200, 2);
+
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 170);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 240; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        string title = "YOU WIN!";
+        int tr = 90; int tg = 210; int tb = 130;
+        if (this.winner == 2) { title = "AI WINS"; tr = 230; tg = 120; tb = 90; }
+        Text.DrawCentered(this.r, title, 640, by + 40, 7, tr, tg, tb, 255);
+        string ds = "RANK " + this.scoreDelta;
+        if (this.scoreDelta > 0) { ds = "RANK +" + this.scoreDelta; }
+        Text.DrawCentered(this.r, ds, 640, by + 120, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, this.prof.TierName() + "  " + this.prof.rank + "    STREAK " + this.prof.streak, 640, by + 168, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 210, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 210, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } }
+        if (sc == 21) { if (this.scene != 0) { this.StartGame(now); } }
+        if (this.scene == 0) {
+            if (sc == 30) { this.prof.level = 0; }
+            if (sc == 31) { this.prof.level = 1; }
+            if (sc == 32) { this.prof.level = 2; }
+            if (sc == 33) { this.prof.level = 3; }
+            if (sc == 40 || sc == 44) { this.StartGame(now); }
+        }
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 4) { if (Draw.PointIn(cx, cy, 330 + i * 156, 310, 140, 54)) { this.prof.level = i; } i = i + 1; }
+            if (Draw.PointIn(cx, cy, 330, 382, 250, 46)) { this.prof.adaptive = 1 - this.prof.adaptive; }
+            if (Draw.PointIn(cx, cy, 470, 632, 340, 74)) { this.StartGame(now); }
+        } else if (this.scene == 1) {
+            if (Draw.PointIn(cx, cy, 770, 686, 190, 54)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 978, 686, 190, 54)) { this.scene = 0; return; }
+            if (this.turn != 1 || this.aiPending) { return; }
+            int idx = this.PickCell(cx, cy);
+            if (idx < 0) { return; }
+            if (this.selected >= 0) {
+                int h = this.FindHop(idx);
+                if (h >= 0) { this.DoHop(this.selected, idx, this.legalCap[h], now); return; }
+            }
+            if (this.chaining) { return; }   // during a chain only hops allowed
+            if (this.board[idx] > 0) {
+                bool anyCap = Chk.HasAnyCapture(this.board, 1);
+                if (anyCap && !Chk.CaptureFrom(this.board, idx, 1)) { this.selected = -1; this.legalN = 0; return; }
+                this.selected = idx;
+                this.ComputeHops(idx, !anyCap);
+            } else { this.selected = -1; this.legalN = 0; }
+        } else {
+            if (Draw.PointIn(cx, cy, 400, 450, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 450, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    void DemoStep(int now) {
+        int[] ob = new int[64 * 64];
+        int[] of = new int[64];
+        int[] ot = new int[64];
+        int n = Chk.GenPositions(this.board, 1, ob, of, ot);
+        if (n == 0) { this.EndGame(2, now); return; }
+        int pick = this.rng.Range(0, n);
+        this.animFrom = of[pick]; this.animTo = ot[pick]; this.animPiece = this.board[of[pick]]; this.animStart = now;
+        int k = 0;
+        while (k < 64) { this.board[k] = ob[pick * 64 + k]; k = k + 1; }
+        int[] hf = new int[64 * 64];
+        int[] hf2 = new int[64];
+        int[] hf3 = new int[64];
+        if (Chk.GenPositions(this.board, 2, hf, hf2, hf3) == 0) { this.EndGame(1, now); return; }
+        this.turn = 2;
+        this.aiMoveAt = now + 350;
+        this.aiPending = true;
+    }
+
+    void Tick(int now) {
+        if (this.demo) {
+            if (this.scene == 2 && now >= this.demoAt) { this.StartGame(now); this.demoAt = now + 800; return; }
+            if (this.scene == 1 && this.turn == 1 && !this.aiPending && now >= this.demoAt) {
+                this.DemoStep(now);
+                this.demoAt = now + 500;
+            }
+        }
+        if (this.scene == 1 && this.turn == 2 && this.aiPending && now >= this.aiMoveAt) {
+            this.AiMove(now);
+            if (this.demo) { this.demoAt = now + 300; }
+        }
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 1) { this.DrawPlay(now); }
+        else { this.DrawOver(now); }
+    }
+}
+
+class ChkApp {
+    static void Main() {
+        Host h = Host.Create("Checkers - English Draughts", 1280, 800);
+        ChkGame g = ChkGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) {
+                        int sc = SdlEvent.Scancode();
+                        if (sc == 68) { h.ToggleFullscreen(); }
+                        else { g.OnKey(sc, now); }
+                    }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}

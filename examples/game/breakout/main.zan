@@ -1,0 +1,511 @@
+// Breakout -- a complete arcade product on GameKit. Mouse/keyboard paddle,
+// fixed-point ball physics with angled paddle bounce, a multi-hit brick grid,
+// escalating levels, lives, combo scoring, and a persistent high-score profile.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Breakout;
+
+class Profile {
+    int high;
+    int bestLevel;
+    int games;
+
+    static string Path() { return "breakout_save.txt"; }
+
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; }
+            else { i = s.Length; }
+        }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fallback) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fallback;
+    }
+    static Profile Load() {
+        Profile p = new Profile();
+        p.high = 0; p.bestLevel = 1; p.games = 0;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.high = Profile.ReadKey(lines, "high", 0);
+            p.bestLevel = Profile.ReadKey(lines, "bestLevel", 1);
+            p.games = Profile.ReadKey(lines, "games", 0);
+        }
+        return p;
+    }
+    void Save() {
+        string s = "";
+        s = s + "high=" + this.high + "\n";
+        s = s + "bestLevel=" + this.bestLevel + "\n";
+        s = s + "games=" + this.games + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+}
+
+class BoGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+    int[] hp;         // COLS*ROWS, 0 empty
+    int cols;
+    int rows;
+    int alive;
+    int scene;        // 0 menu, 1 play, 2 over
+    int level;
+    int score;
+    int lives;
+    int combo;
+    // fixed point (1/16 px)
+    int bxq;
+    int byq;
+    int vx;
+    int vy;
+    int paddleX;      // px, left
+    int pw;
+    bool launched;
+    int speed;        // base speed fixed
+    int diff;         // 0 easy,1 normal,2 hard
+    int mouseX;
+    int mouseY;
+    bool moveL;
+    bool moveR;
+    string msg;
+    int msgAt;
+    int shake;
+    SdlTexture menuBg;
+    bool menuTried;
+    bool demo;
+
+    static int FX() { return 40; }
+    static int FY() { return 40; }
+    static int FW() { return 1200; }
+    static int FH() { return 720; }
+    static int BX() { return 60; }
+    static int BTOP() { return 120; }
+    static int CELLW() { return 89; }
+    static int CELLH() { return 34; }
+    static int BW() { return 83; }
+    static int BH() { return 28; }
+    static int PADY() { return 726; }
+    static int PADH() { return 18; }
+    static int BS() { return 16; }
+
+    static BoGame Create(Host h) {
+        BoGame g = new BoGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 913572468);
+        g.cols = 13;
+        g.rows = 9;
+        g.hp = new int[g.cols * g.rows];
+        g.scene = 0;
+        g.diff = 1;
+        g.pw = 150;
+        g.paddleX = 640 - g.pw / 2;
+        g.msg = "";
+        g.demo = File.Exists("breakout_demo.txt");
+        if (g.demo) { g.StartGame(Sdl.Ticks()); }
+        return g;
+    }
+
+    void BuildLevel(int now) {
+        int rr = 4 + this.level;
+        if (rr > this.rows) { rr = this.rows; }
+        int i = 0;
+        while (i < this.cols * this.rows) { this.hp[i] = 0; i = i + 1; }
+        this.alive = 0;
+        int row = 0;
+        while (row < rr) {
+            int col = 0;
+            while (col < this.cols) {
+                int h = 1;
+                if (this.level >= 2 && row % 3 == 0) { h = 2; }
+                if (this.level >= 4 && row == 0) { h = 3; }
+                // carve a little pattern on higher levels
+                bool place = true;
+                if (this.level >= 3) { if ((row + col) % 7 == 0) { place = false; } }
+                if (place) { this.hp[row * this.cols + col] = h; this.alive = this.alive + 1; }
+                col = col + 1;
+            }
+            row = row + 1;
+        }
+        this.ResetBall(now);
+        this.msg = "LEVEL " + this.level;
+        this.msgAt = now + 1500;
+    }
+
+    void ResetBall(int now) {
+        this.launched = false;
+        this.paddleX = 640 - this.pw / 2;
+        this.bxq = (this.paddleX + this.pw / 2) * 16;
+        this.byq = (BoGame.PADY() - BoGame.BS()) * 16;
+        this.vx = 0;
+        this.vy = 0;
+    }
+
+    void Launch() {
+        if (this.launched) { return; }
+        this.launched = true;
+        this.vy = -this.speed;
+        int dir = 1;
+        if (this.rng.Range(0, 2) == 0) { dir = -1; }
+        this.vx = dir * (this.speed * 5 / 8);
+    }
+
+    void StartGame(int now) {
+        this.pw = 170;
+        if (this.diff == 1) { this.pw = 150; }
+        if (this.diff == 2) { this.pw = 120; }
+        this.speed = 72;
+        if (this.diff == 1) { this.speed = 84; }
+        if (this.diff == 2) { this.speed = 100; }
+        this.level = 1;
+        this.score = 0;
+        this.combo = 0;
+        this.lives = 3;
+        this.scene = 1;
+        this.BuildLevel(now);
+    }
+
+    void LoseLife(int now) {
+        this.lives = this.lives - 1;
+        this.combo = 0;
+        this.shake = now + 260;
+        if (this.lives <= 0) { this.EndGame(now); return; }
+        this.ResetBall(now);
+        this.msg = "BALL LOST -- " + this.lives + " LEFT";
+        this.msgAt = now + 1400;
+    }
+
+    void EndGame(int now) {
+        this.scene = 2;
+        this.prof.games = this.prof.games + 1;
+        if (this.score > this.prof.high) { this.prof.high = this.score; }
+        if (this.level > this.prof.bestLevel) { this.prof.bestLevel = this.level; }
+        this.prof.Save();
+    }
+
+    void HitBrick(int idx, int now) {
+        this.hp[idx] = this.hp[idx] - 1;
+        this.combo = this.combo + 1;
+        int pts = 10 * this.level + this.combo * 2;
+        this.score = this.score + pts;
+        if (this.hp[idx] <= 0) { this.hp[idx] = 0; this.alive = this.alive - 1; }
+    }
+
+    void StepBall(int now) {
+        if (!this.launched) {
+            this.bxq = (this.paddleX + this.pw / 2) * 16;
+            this.byq = (BoGame.PADY() - BoGame.BS()) * 16;
+            return;
+        }
+        // advance in a few substeps for accuracy
+        int sub = 0;
+        while (sub < 2) {
+            this.bxq = this.bxq + this.vx / 2;
+            this.byq = this.byq + this.vy / 2;
+            int bx = this.bxq / 16;
+            int by = this.byq / 16;
+            int bs = BoGame.BS();
+            // walls
+            if (bx <= BoGame.FX()) { bx = BoGame.FX(); this.bxq = bx * 16; this.vx = -this.vx; }
+            if (bx + bs >= BoGame.FX() + BoGame.FW()) { bx = BoGame.FX() + BoGame.FW() - bs; this.bxq = bx * 16; this.vx = -this.vx; }
+            if (by <= BoGame.FY()) { by = BoGame.FY(); this.byq = by * 16; this.vy = -this.vy; }
+            // paddle
+            int py = BoGame.PADY();
+            if (this.vy > 0 && by + bs >= py && by + bs <= py + BoGame.PADH() + 6) {
+                if (bx + bs >= this.paddleX && bx <= this.paddleX + this.pw) {
+                    by = py - bs; this.byq = by * 16;
+                    this.vy = -this.vy;
+                    int rel = (bx + bs / 2) - (this.paddleX + this.pw / 2);
+                    this.vx = this.vx + rel * this.speed / (this.pw);
+                    int maxv = this.speed * 3 / 2;
+                    if (this.vx > maxv) { this.vx = maxv; }
+                    if (this.vx < -maxv) { this.vx = -maxv; }
+                    this.combo = 0;
+                }
+            }
+            // bottom
+            if (by > BoGame.FY() + BoGame.FH()) { this.LoseLife(now); return; }
+            // bricks
+            this.BrickCollide(bx, by, bs, now);
+            sub = sub + 1;
+        }
+    }
+
+    void BrickCollide(int bx, int by, int bs, int now) {
+        int c0 = (bx - BoGame.BX()) / BoGame.CELLW();
+        int c1 = (bx + bs - BoGame.BX()) / BoGame.CELLW();
+        int r0 = (by - BoGame.BTOP()) / BoGame.CELLH();
+        int r1 = (by + bs - BoGame.BTOP()) / BoGame.CELLH();
+        int rr = r0;
+        while (rr <= r1) {
+            int cc = c0;
+            while (cc <= c1) {
+                if (rr >= 0 && rr < this.rows && cc >= 0 && cc < this.cols) {
+                    int idx = rr * this.cols + cc;
+                    if (this.hp[idx] > 0) {
+                        int rx = BoGame.BX() + cc * BoGame.CELLW();
+                        int ry = BoGame.BTOP() + rr * BoGame.CELLH();
+                        int penX1 = (bx + bs) - rx;
+                        int penX2 = (rx + BoGame.BW()) - bx;
+                        int penY1 = (by + bs) - ry;
+                        int penY2 = (ry + BoGame.BH()) - by;
+                        int penX = penX1; if (penX2 < penX) { penX = penX2; }
+                        int penY = penY1; if (penY2 < penY) { penY = penY2; }
+                        if (penX < penY) { this.vx = -this.vx; } else { this.vy = -this.vy; }
+                        this.HitBrick(idx, now);
+                        if (this.alive <= 0) { this.NextLevel(now); }
+                        return;
+                    }
+                }
+                cc = cc + 1;
+            }
+            rr = rr + 1;
+        }
+    }
+
+    void NextLevel(int now) {
+        this.level = this.level + 1;
+        this.score = this.score + 200;
+        if (this.speed < 150) { this.speed = this.speed + 6; }
+        this.BuildLevel(now);
+    }
+
+    // ----- input -------------------------------------------------------------
+
+    void OnKey(int sc, int now, bool down) {
+        if (down) {
+            if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } }
+            if (this.scene == 0) {
+                if (sc == 30) { this.diff = 0; }
+                if (sc == 31) { this.diff = 1; }
+                if (sc == 32) { this.diff = 2; }
+                if (sc == 40 || sc == 44) { this.StartGame(now); }
+            } else if (this.scene == 1) {
+                if (sc == 44 || sc == 40) { this.Launch(); }
+                if (sc == 21) { this.StartGame(now); }
+            } else if (this.scene == 2) {
+                if (sc == 40 || sc == 44) { this.StartGame(now); }
+            }
+        }
+        if (sc == 4 || sc == 80) { this.moveL = down; }     // A / left
+        if (sc == 7 || sc == 79) { this.moveR = down; }     // D / right
+    }
+
+    void OnClick(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            int i = 0;
+            while (i < 3) { if (Draw.PointIn(cx, cy, 400 + i * 170, 330, 150, 56)) { this.diff = i; } i = i + 1; }
+            if (Draw.PointIn(cx, cy, 470, 620, 340, 74)) { this.StartGame(now); }
+            return;
+        }
+        if (this.scene == 1) { this.Launch(); return; }
+        if (this.scene == 2) {
+            if (Draw.PointIn(cx, cy, 400, 470, 220, 66)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 660, 470, 200, 66)) { this.scene = 0; return; }
+        }
+    }
+
+    void MovePaddle(int now) {
+        // mouse takes priority when moved; else keys
+        if (this.moveL) { this.paddleX = this.paddleX - 14; }
+        if (this.moveR) { this.paddleX = this.paddleX + 14; }
+        if (!this.moveL && !this.moveR) {
+            int target = this.mouseX - this.pw / 2;
+            this.paddleX = target;
+        }
+        if (this.paddleX < BoGame.FX()) { this.paddleX = BoGame.FX(); }
+        if (this.paddleX + this.pw > BoGame.FX() + BoGame.FW()) { this.paddleX = BoGame.FX() + BoGame.FW() - this.pw; }
+    }
+
+    // ----- rendering ---------------------------------------------------------
+
+    void BrickColor(int hpv, int row, int[] c) {
+        if (hpv >= 3) { c[0] = 230; c[1] = 90; c[2] = 90; return; }
+        if (hpv == 2) { c[0] = 240; c[1] = 180; c[2] = 70; return; }
+        int[] pal = new int[24];
+        pal[0] = 90; pal[1] = 200; pal[2] = 140;
+        pal[3] = 90; pal[4] = 170; pal[5] = 220;
+        pal[6] = 150; pal[7] = 140; pal[8] = 230;
+        pal[9] = 220; pal[10] = 150; pal[11] = 200;
+        int k = (row % 4) * 3;
+        c[0] = pal[k]; c[1] = pal[k + 1]; c[2] = pal[k + 2];
+    }
+
+    void DrawPlay(int now) {
+        int ox = 0;
+        int oy = 0;
+        if (now < this.shake) { ox = this.rng.Range(-4, 5); oy = this.rng.Range(-4, 5); }
+        this.host.Begin(12, 14, 22);
+        this.r.SetColor(18, 22, 34, 255);
+        this.r.FillRect(BoGame.FX() + ox, BoGame.FY() + oy, BoGame.FW(), BoGame.FH());
+        Draw.RingRect(this.r, BoGame.FX() + ox, BoGame.FY() + oy, BoGame.FW(), BoGame.FH(), 3, 80, 90, 120, 255);
+
+        int[] c = new int[3];
+        int row = 0;
+        while (row < this.rows) {
+            int col = 0;
+            while (col < this.cols) {
+                int idx = row * this.cols + col;
+                int hpv = this.hp[idx];
+                if (hpv > 0) {
+                    int x = BoGame.BX() + col * BoGame.CELLW() + ox;
+                    int y = BoGame.BTOP() + row * BoGame.CELLH() + oy;
+                    this.BrickColor(hpv, row, c);
+                    Draw.RoundRectFill(this.r, x, y, BoGame.BW(), BoGame.BH(), 5, c[0], c[1], c[2], 255);
+                    this.r.SetColor(255, 255, 255, 45);
+                    this.r.FillRect(x + 4, y + 4, BoGame.BW() - 8, 5);
+                    if (hpv >= 2) { Draw.RingRect(this.r, x, y, BoGame.BW(), BoGame.BH(), 2, 255, 255, 255, 90); }
+                }
+                col = col + 1;
+            }
+            row = row + 1;
+        }
+
+        // paddle
+        Draw.RoundRectFill(this.r, this.paddleX + ox, BoGame.PADY() + oy, this.pw, BoGame.PADH(), 8, 210, 220, 240, 255);
+        this.r.SetColor(120, 170, 240, 255);
+        this.r.FillRect(this.paddleX + 6 + ox, BoGame.PADY() + 4 + oy, this.pw - 12, 5);
+
+        // ball
+        int bx = this.bxq / 16 + ox;
+        int by = this.byq / 16 + oy;
+        Draw.RoundRectFill(this.r, bx, by, BoGame.BS(), BoGame.BS(), 7, 250, 240, 150, 255);
+
+        // HUD
+        Text.Draw(this.r, "SCORE " + this.score, 60, 16, 3, 240, 240, 250, 255);
+        Text.Draw(this.r, "LEVEL " + this.level, 560, 16, 3, 240, 208, 130, 255);
+        Text.Draw(this.r, "HIGH " + this.prof.high, 900, 16, 2, 170, 180, 200, 255);
+        int i = 0;
+        while (i < this.lives) {
+            Draw.RoundRectFill(this.r, 1120 + i * 34, 20, 26, 12, 5, 210, 220, 240, 255);
+            i = i + 1;
+        }
+        if (this.combo >= 3) { Text.Draw(this.r, "COMBO x" + this.combo, 60, 46, 2, 250, 210, 90, 255); }
+
+        if (!this.launched) { Text.DrawCentered(this.r, "CLICK / SPACE TO LAUNCH", 640, 640, 3, 240, 230, 150, 255); }
+        if (this.msg.Length > 0 && now < this.msgAt) { Text.DrawCentered(this.r, this.msg, 640, 400, 5, 250, 220, 120, 255); }
+
+        this.host.End();
+    }
+
+    void EnsureMenuBg() {
+        if (this.menuTried) { return; }
+        this.menuTried = true;
+        SdlTexture t = SdlTexture.LoadImage(this.r, "examples/game/breakout/assets/menu_bg.png");
+        if (t != null && t.IsValid()) { t.SetNearest(false); t.SetBlendMode(1); } else { t = null; }
+        this.menuBg = t;
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureMenuBg();
+        this.host.Begin(10, 12, 20);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 800);
+        Text.DrawCenteredShadow(this.r, "BREAKOUT", 640, 82, 9, 245, 238, 220, 4);
+        Text.DrawCenteredShadow(this.r, "CLEAR EVERY BRICK", 640, 190, 3, 240, 208, 130, 3);
+
+        Ui.Panel(this.r, 360, 300, 560, 120, 20, 24, 34, 214);
+        Text.DrawCenteredShadow(this.r, "DIFFICULTY", 640, 320, 2, 190, 198, 214, 2);
+        int i = 0;
+        while (i < 3) {
+            string nm = "EASY";
+            if (i == 1) { nm = "NORMAL"; }
+            if (i == 2) { nm = "HARD"; }
+            int kind = 0;
+            if (this.diff == i) { kind = 2; }
+            Ui.Button(this.r, this.mouseX, this.mouseY, 400 + i * 170, 330, 150, 56, nm, 2, kind);
+            i = i + 1;
+        }
+        Ui.Panel(this.r, 420, 450, 440, 120, 14, 18, 26, 200);
+        Text.Draw(this.r, "HIGH SCORE", 448, 470, 2, 150, 160, 180, 255);
+        Text.DrawShadow(this.r, "" + this.prof.high, 448, 492, 4, 255, 210, 90, 3);
+        Text.Draw(this.r, "BEST LEVEL  " + this.prof.bestLevel, 448, 544, 2, 150, 160, 180, 255);
+
+        Ui.Button(this.r, this.mouseX, this.mouseY, 470, 620, 340, 74, "PLAY", 4, 1);
+        Text.DrawCenteredShadow(this.r, "Mouse or A/D to move. SPACE launch. F11 fullscreen.", 640, 720, 2, 176, 184, 200, 2);
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawPlay(now);
+        this.r.SetColor(0, 0, 0, 180);
+        this.r.FillRect(0, 0, 1280, 800);
+        int bx = 320; int by = 250; int bw = 640; int bh = 320;
+        this.r.SetColor(26, 30, 42, 245);
+        this.r.FillRect(bx, by, bw, bh);
+        Draw.RingRect(this.r, bx, by, bw, bh, 3, 80, 90, 110, 255);
+        Text.DrawCentered(this.r, "GAME OVER", 640, by + 44, 7, 230, 120, 90, 255);
+        Text.DrawCentered(this.r, "SCORE " + this.score + "    LEVEL " + this.level, 640, by + 124, 3, 255, 210, 90, 255);
+        Text.DrawCentered(this.r, "HIGH " + this.prof.high, 640, by + 172, 2, 170, 180, 200, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 400, by + 220, 220, 66, "PLAY AGAIN", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 660, by + 220, 200, 66, "MENU", 3, 0);
+        this.host.End();
+    }
+
+    void Tick(int now) {
+        if (this.scene != 1) { return; }
+        if (this.demo) {
+            // AI paddle: follow the ball; auto-launch
+            if (!this.launched) { this.Launch(); }
+            int bx = this.bxq / 16;
+            this.mouseX = bx + BoGame.BS() / 2;
+        }
+        this.MovePaddle(now);
+        this.StepBall(now);
+    }
+
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2) { this.DrawOver(now); }
+        else { this.DrawPlay(now); }
+    }
+}
+
+class BoApp {
+    static void Main() {
+        Host h = Host.Create("Breakout", 1280, 800);
+        BoGame g = BoGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            bool clicked = false;
+            int cx = g.mouseX;
+            int cy = g.mouseY;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    if (!SdlEvent.IsRepeat()) { g.OnKey(SdlEvent.Scancode(), now, true); }
+                    if (SdlEvent.Scancode() == 68) { h.ToggleFullscreen(); }
+                }
+                if (ty == SdlEventType.KeyUp()) { g.OnKey(SdlEvent.Scancode(), now, false); }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        cx = h.MouseX(); cy = h.MouseY(); g.mouseX = cx; g.mouseY = cy; clicked = true;
+                    }
+                }
+            }
+            if (clicked) { g.OnClick(cx, cy, now); }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}
