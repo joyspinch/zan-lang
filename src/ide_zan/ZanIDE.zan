@@ -747,7 +747,7 @@ class ZanIDE {
         saveCats.Add("Custom");     saveIcons.Add("file");        saveDescs.Add(ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。"));
 
         // ---- Find/Replace & GoToLine state ----
-        int findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine
+        int findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition
         string findText = "";
         string replText = "";
         string gotoText = "";
@@ -833,6 +833,15 @@ class ZanIDE {
         List<string> dbgVarInfo = new List<string>();
         List<string> dbgStack = new List<string>();
         int dbgPanelTab = 0;
+        // Conditional breakpoints: expression per 0-based line (edited via
+        // Ctrl+B, passed through DAP setBreakpoints as `condition`).
+        List<int> bpCondLines = new List<int>();
+        List<string> bpCondExprs = new List<string>();
+        string bpCondText = "";
+        // Watch expressions, re-evaluated via DAP `evaluate` on every stop.
+        List<string> dbgWatches = new List<string>();
+        List<string> dbgWatchVals = new List<string>();
+        string watchText = "";
 
         // ---- Designer state ----
         // The single unified designer: .zform tabs host the component-based
@@ -1066,14 +1075,15 @@ class ZanIDE {
                         dbg = ZanIDE.DbgBegin(root,
                             ZanIDE.PathOf(tabPaths, activeTab),
                             editor.Breakpoints(),
-                            ZanIDE.FirstDebugLine(editor), log);
+                            ZanIDE.FirstDebugLine(editor), bpCondLines, bpCondExprs, log);
                         dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
                         dbgExecLine = ZanIDE.DbgLine(dbg);
                         dbgVarInfo = ZanIDE.DbgVars(dbg);
                         dbgStack = ZanIDE.DbgStack(dbg);
+                        dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                         dbgPanelTab = 1;
                         if (dbgState == 2) {
-                            log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Esc=Stop");
+                            log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Ctrl+B=Condition  Esc=Stop");
                             ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                         } else {
                             dbg = null;
@@ -1087,6 +1097,7 @@ class ZanIDE {
                     dbgExecLine = ZanIDE.DbgLine(dbg);
                     dbgVarInfo = ZanIDE.DbgVars(dbg);
                     dbgStack = ZanIDE.DbgStack(dbg);
+                    dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                     if (dbgState == 2) {
                         ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                     } else {
@@ -1100,6 +1111,7 @@ class ZanIDE {
                     dbgExecLine = ZanIDE.DbgLine(dbg);
                     dbgVarInfo = ZanIDE.DbgVars(dbg);
                     dbgStack = ZanIDE.DbgStack(dbg);
+                    dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                     if (dbgState == 2) {
                         ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                     } else {
@@ -1113,6 +1125,7 @@ class ZanIDE {
                     dbgExecLine = ZanIDE.DbgLine(dbg);
                     dbgVarInfo = ZanIDE.DbgVars(dbg);
                     dbgStack = ZanIDE.DbgStack(dbg);
+                    dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                     if (dbgState == 2) {
                         ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                     } else {
@@ -1174,6 +1187,14 @@ class ZanIDE {
                 } else if (cc == 18) {
                     // Ctrl+R = Replace (Ctrl+H is 8 which conflicts with Backspace)
                     findMode = 2;
+                    app.RequestRedraw();
+                } else if (cc == 2) {
+                    // Ctrl+B = edit the breakpoint condition on the caret line
+                    if (!designerMode) {
+                        findMode = 4;
+                        bpCondText = ZanIDE.CondFor(bpCondLines, bpCondExprs,
+                            editor.CurLine());
+                    }
                     app.RequestRedraw();
                 } else if (cc == 19) {
                     // Ctrl+S = Save (+ hot reload when enabled)
@@ -1284,14 +1305,15 @@ class ZanIDE {
                             dbg = ZanIDE.DbgBegin(root,
                                 ZanIDE.PathOf(tabPaths, activeTab),
                                 editor.Breakpoints(),
-                                ZanIDE.FirstDebugLine(editor), log);
+                                ZanIDE.FirstDebugLine(editor), bpCondLines, bpCondExprs, log);
                             dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
                             dbgExecLine = ZanIDE.DbgLine(dbg);
                             dbgVarInfo = ZanIDE.DbgVars(dbg);
                             dbgStack = ZanIDE.DbgStack(dbg);
+                            dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                             dbgPanelTab = 1;
                             if (dbgState == 2) {
-                                log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Esc=Stop");
+                                log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Ctrl+B=Condition  Esc=Stop");
                                 ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                             } else {
                                 dbg = null;
@@ -1303,6 +1325,7 @@ class ZanIDE {
                         dbgExecLine = ZanIDE.DbgLine(dbg);
                         dbgVarInfo = ZanIDE.DbgVars(dbg);
                         dbgStack = ZanIDE.DbgStack(dbg);
+                        dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                         if (dbgState == 2) {
                             ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                         } else {
@@ -1444,6 +1467,7 @@ class ZanIDE {
                         dbgExecLine = ZanIDE.DbgLine(dbg);
                         dbgVarInfo = ZanIDE.DbgVars(dbg);
                         dbgStack = ZanIDE.DbgStack(dbg);
+                        dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                         if (dbgState == 2) {
                             ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                         } else { dbg = null; }
@@ -1454,6 +1478,7 @@ class ZanIDE {
                         dbgExecLine = ZanIDE.DbgLine(dbg);
                         dbgVarInfo = ZanIDE.DbgVars(dbg);
                         dbgStack = ZanIDE.DbgStack(dbg);
+                        dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                         if (dbgState == 2) {
                             ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                         } else { dbg = null; }
@@ -1464,6 +1489,7 @@ class ZanIDE {
                         dbgExecLine = ZanIDE.DbgLine(dbg);
                         dbgVarInfo = ZanIDE.DbgVars(dbg);
                         dbgStack = ZanIDE.DbgStack(dbg);
+                        dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
                         if (dbgState == 2) {
                             ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
                         } else { dbg = null; }
@@ -1988,6 +2014,38 @@ class ZanIDE {
                             findMode = 0;
                             app.RequestRedraw();
                         }
+                    } else if (findMode == 4) {
+                        c.DrawText(fpX + app.Scale(4), fpY + app.Scale(2),
+                            ZanIDE.T("Breakpoint Condition (Ctrl+B) - line ", "断点条件 (Ctrl+B) - 行 ")
+                            + Convert.ToString(editor.CurLine() + 1),
+                            t.textTertiary, t.fontSizeSmall);
+                        ZanIDE.ShellField(app, inpX, inpY, inpW, inpH);
+                        c.DrawText(inpX + app.Scale(4), inpY + app.Scale(4), bpCondText, t.textPrimary, t.fontSizeSmall);
+                        if (kind == 6) {
+                            int bcc = app.window.EventKeyCode();
+                            if (bcc == 8 && bpCondText.Length > 0) {
+                                bpCondText = bpCondText.Substring(0, bpCondText.Length - 1);
+                                app.RequestRedraw();
+                            } else if (bcc == 13) {
+                                int bLine = editor.CurLine();
+                                ZanIDE.SetCond(bpCondLines, bpCondExprs, bLine, bpCondText);
+                                if (bpCondText.Length > 0 && !editor.HasBreakpoint(bLine)) {
+                                    editor.ToggleBreakpoint(bLine);
+                                }
+                                if (bpCondText.Length > 0) {
+                                    log.Add("> [Debug] Breakpoint condition on line "
+                                        + Convert.ToString(bLine + 1) + ": " + bpCondText);
+                                } else {
+                                    log.Add("> [Debug] Breakpoint condition cleared on line "
+                                        + Convert.ToString(bLine + 1) + ".");
+                                }
+                                findMode = 0;
+                                app.RequestRedraw();
+                            } else if (bcc > 31) {
+                                bpCondText = bpCondText + Text.CharStr(bcc);
+                                app.RequestRedraw();
+                            }
+                        }
                     }
                 }
 
@@ -1995,7 +2053,8 @@ class ZanIDE {
                     // Output panel is hidden while designing.
                 } else if (dbgState == 2) {
                     ZanIDE.RenderDebugBottom(app, c, t, orr, dbgPanelTab,
-                        dbgConsole, dbgVarInfo, dbgStack, log);
+                        dbgConsole, dbgVarInfo, dbgWatchVals, watchText,
+                        dbgStack, log);
                     // Handle tab clicks
                     if (app.window.EventKind() == 3) {
                         int tabClickW = app.Scale(80);
@@ -2007,6 +2066,35 @@ class ZanIDE {
                                 dbgPanelTab = tabIdx;
                                 app.RequestRedraw();
                             }
+                        } else if (dbgPanelTab == 2) {
+                            // Click a watch row to remove that expression.
+                            int wRowH = app.Scale(20);
+                            int wTop = orr.y + app.Scale(28) + app.Scale(26)
+                                + wRowH + 1;
+                            if (app.mouseY >= wTop) {
+                                int wIdx = (app.mouseY - wTop) / wRowH;
+                                if (wIdx >= 0 && wIdx < dbgWatches.Count) {
+                                    dbgWatches.RemoveAt(wIdx);
+                                    dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                                    app.RequestRedraw();
+                                }
+                            }
+                        }
+                    }
+                    // Type into the Watch tab's expression field.
+                    if (kind == 6 && dbgPanelTab == 2 && findMode == 0) {
+                        int wcc = app.window.EventKeyCode();
+                        if (wcc == 8 && watchText.Length > 0) {
+                            watchText = watchText.Substring(0, watchText.Length - 1);
+                            app.RequestRedraw();
+                        } else if (wcc == 13 && watchText.Length > 0) {
+                            dbgWatches.Add(watchText);
+                            watchText = "";
+                            dbgWatchVals = ZanIDE.DbgEvalWatches(dbg, dbgWatches);
+                            app.RequestRedraw();
+                        } else if (wcc > 31) {
+                            watchText = watchText + Text.CharStr(wcc);
+                            app.RequestRedraw();
                         }
                     }
                 } else {
@@ -6063,7 +6151,8 @@ class ZanIDE {
     }
 
     static void RenderDebugBottom(App app, Canvas c, Theme t, Rect orr, int tab,
-            List<string> console, List<string> vars, List<string> stack, List<string> log) {
+            List<string> console, List<string> vars, List<string> watchRows,
+            string watchInput, List<string> stack, List<string> log) {
         int tabH = app.Scale(28);
         int tabW = app.Scale(80);
         int pad = app.Scale(4);
@@ -6105,7 +6194,8 @@ class ZanIDE {
         } else if (tab == 1) {
             ZanIDE.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
         } else if (tab == 2) {
-            ZanIDE.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
+            ZanIDE.RenderWatchTab(app, c, t, orr.x, contentY, orr.width, contentH,
+                watchRows, watchInput);
         } else if (tab == 3) {
             ZanIDE.RenderStackTab(app, c, t, orr.x, contentY, orr.width, contentH, stack);
         }
@@ -6286,6 +6376,24 @@ class ZanIDE {
         if (vars.Count == 0) {
             c.DrawText(x + pad, y + rowH + pad + pad, "(no variables in scope)", t.textDisabled, t.fontSizeSmall);
         }
+    }
+
+    /// Watch tab: an expression input row on top (Enter adds, click a row
+    /// removes), then the evaluated expressions in the Variables grid.
+    static void RenderWatchTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> rows, string inputText) {
+        int inpH = app.Scale(26);
+        ZanIDE.ShellField(app, x + app.Scale(4), y + app.Scale(3),
+            w - app.Scale(8), app.Scale(20));
+        string shown = inputText;
+        int shownCol = t.textPrimary;
+        if (shown.Length == 0) {
+            shown = ZanIDE.T("Type an expression and press Enter; click a row to remove it",
+                "输入表达式后回车添加；点击行删除");
+            shownCol = t.textDisabled;
+        }
+        c.DrawText(x + app.Scale(8), y + app.Scale(6), shown, shownCol, t.fontSizeSmall);
+        ZanIDE.RenderVarsTab(app, c, t, x, y + inpH, w, h - inpH, rows);
     }
 
     static string GetTabField(string s, int fieldIdx) {
@@ -7723,7 +7831,8 @@ class ZanIDE {
     /// empty a single breakpoint is placed at `fallback0` so F5 still pauses.
     /// Returns the session, or null when the adapter cannot be reached.
     static DebugSession DbgBegin(string root, string srcPath, List<int> bps0,
-            int fallback0, List<string> log) {
+            int fallback0, List<int> condLines0, List<string> condExprs0,
+            List<string> log) {
         string exe = ZanIDE.EnsureBuildDir(root) + "/.zandbg" + ZanIDE.ExeSuffix();
         string dap = ZanIDE.ToolchainDir() + "/zan-dap" + ZanIDE.ExeSuffix();
         if (!File.Exists(dap)) { dap = ZanIDE.ExeDir() + "/zan-dap" + ZanIDE.ExeSuffix(); }
@@ -7732,15 +7841,20 @@ class ZanIDE {
             return null;
         }
         List<int> lines = new List<int>();
+        List<string> conds = new List<string>();
         int bi = 0;
-        while (bi < bps0.Count) { lines.Add(bps0[bi] + 1); bi = bi + 1; }
-        if (lines.Count == 0) { lines.Add(fallback0 + 1); }
+        while (bi < bps0.Count) {
+            lines.Add(bps0[bi] + 1);
+            conds.Add(ZanIDE.CondFor(condLines0, condExprs0, bps0[bi]));
+            bi = bi + 1;
+        }
+        if (lines.Count == 0) { lines.Add(fallback0 + 1); conds.Add(""); }
 
         int attempt = 0;
         while (attempt < 4) {
             int port = 47113 + attempt;
             Process.RunDetached("\"" + dap + "\" --port " + Convert.ToString(port));
-            DebugSession s = DebugSession.Open(port, exe, srcPath, lines);
+            DebugSession s = DebugSession.Open(port, exe, srcPath, lines, conds);
             if (s != null) { return s; }
             attempt = attempt + 1;
         }
@@ -7788,6 +7902,45 @@ class ZanIDE {
     static List<string> DbgStack(DebugSession dbg) {
         if (dbg == null) { return new List<string>(); }
         return dbg.Stack();
+    }
+
+    /// The condition expression stored for 0-based `line` ("" when none).
+    static string CondFor(List<int> lines, List<string> exprs, int line) {
+        int i = 0;
+        while (i < lines.Count) {
+            if (lines[i] == line) { return exprs[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Sets, replaces or clears (empty expr) the condition for 0-based `line`.
+    static void SetCond(List<int> lines, List<string> exprs, int line,
+            string expr) {
+        int i = 0;
+        while (i < lines.Count) {
+            if (lines[i] == line) {
+                if (expr.Length == 0) { lines.RemoveAt(i); exprs.RemoveAt(i); }
+                else { exprs[i] = expr; }
+                return;
+            }
+            i = i + 1;
+        }
+        if (expr.Length > 0) { lines.Add(line); exprs.Add(expr); }
+    }
+
+    /// Evaluates every watch expression in the paused frame; returns rows in
+    /// the Variables panel format (expr\t\tvalue).
+    static List<string> DbgEvalWatches(DebugSession dbg, List<string> watches) {
+        List<string> rows = new List<string>();
+        int i = 0;
+        while (i < watches.Count) {
+            string v = "";
+            if (dbg != null) { v = dbg.Evaluate(watches[i]); }
+            rows.Add(watches[i] + "\t\t" + v);
+            i = i + 1;
+        }
+        return rows;
     }
 }
 
@@ -7861,7 +8014,7 @@ class DebugSession {
     /// Connects to a zan-dap listening on 127.0.0.1:port and runs the DAP
     /// launch handshake. Returns null if the socket cannot be reached.
     static DebugSession Open(int port, string program, string source,
-            List<int> bpLines) {
+            List<int> bpLines, List<string> bpConds) {
         DebugSession d = new DebugSession();
         d.sock = 0 - 1;
         d.seq = 1;
@@ -7907,7 +8060,7 @@ class DebugSession {
         d.Request("launch", "{\"program\":\"" + DebugSession.JsonEsc(program)
             + "\",\"stopOnEntry\":false}");
         d.AwaitResponse("launch");
-        d.Request("setBreakpoints", d.BpJson(source, bpLines));
+        d.Request("setBreakpoints", d.BpJson(source, bpLines, bpConds));
         d.AwaitResponse("setBreakpoints");
         d.Request("configurationDone", "");
         d.AwaitResponse("configurationDone");
@@ -7943,12 +8096,17 @@ class DebugSession {
         return addr;
     }
 
-    string BpJson(string source, List<int> lines) {
+    string BpJson(string source, List<int> lines, List<string> conds) {
         string arr = "";
         int i = 0;
         while (i < lines.Count) {
             if (i > 0) { arr = arr + ","; }
-            arr = arr + "{\"line\":" + Convert.ToString(lines[i]) + "}";
+            arr = arr + "{\"line\":" + Convert.ToString(lines[i]);
+            if (i < conds.Count && conds[i].Length > 0) {
+                arr = arr + ",\"condition\":\""
+                    + DebugSession.JsonEsc(conds[i]) + "\"";
+            }
+            arr = arr + "}";
             i = i + 1;
         }
         return "{\"source\":{\"path\":\"" + DebugSession.JsonEsc(source)
@@ -7970,6 +8128,23 @@ class DebugSession {
     void StepOver() { this.Resume("next"); }
     void StepIn() { this.Resume("stepIn"); }
     void StepOut() { this.Resume("stepOut"); }
+
+    /// Evaluates `expr` in the current (top) frame via the DAP `evaluate`
+    /// request. Returns the adapter's result string, or "<error>" when the
+    /// expression cannot be evaluated.
+    string Evaluate(string expr) {
+        if (!this.alive || !this.paused) { return ""; }
+        this.Request("evaluate",
+            "{\"expression\":\"" + DebugSession.JsonEsc(expr)
+            + "\",\"frameId\":" + Convert.ToString(this.frameId)
+            + ",\"context\":\"watch\"}");
+        string m = this.AwaitResponseMsg("evaluate");
+        if (m.Length == 0) { return "<error>"; }
+        if (DebugSession.IndexOf(m, "\"success\":false", 0) >= 0) {
+            return "<error>";
+        }
+        return DebugSession.JsonStr(m, "result", 0);
+    }
 
     void Resume(string cmd) {
         if (!this.alive) { this.paused = false; return; }
