@@ -55,13 +55,15 @@ class Profile {
 }
 
 class Brick {
-    int x;      // px
+    int x;      // px (fixed point 1/256 when moving; stored *256)
     int y;
     int w;
     int h;
     int hp;     // 1..3, 0 = gone
     int hue;    // palette index
     bool gem;   // drops a bonus when broken
+    bool steel; // indestructible obstacle: ball bounces off, no score
+    int mvx;    // horizontal drift px/s (moving rows), bounces at the rails
 }
 
 class Ball {
@@ -178,9 +180,11 @@ class BkGame {
 
     // ----- level layouts ---------------------------------------------------
 
+    // Eight layouts cycle with rising difficulty: steel obstacle bricks that
+    // only deflect the ball, shield rows guarding the stack, moving rows.
     void BuildLevel(int lv) {
         this.bricks = new List<Brick>();
-        int pattern = (lv - 1) % 4;
+        int pattern = (lv - 1) % 8;
         int cols = 12;
         int bw = 88;
         int bh = 34;
@@ -192,20 +196,47 @@ class BkGame {
             int ci = 0;
             while (ci < cols) {
                 bool put = true;
+                bool steel = false;
+                int mvx = 0;
                 if (pattern == 1) { put = (ri + ci) % 2 == 0; }
                 if (pattern == 2) { int mid = cols / 2; int d = ci - mid; if (d < 0) { d = -d; } put = d + 1 >= ri && d - 1 <= ri + 1; }
                 if (pattern == 3) { put = ri % 2 == 0 || ci % 3 != 1; }
+                if (pattern == 4) {
+                    // steel pillars every 4th column shield the stack
+                    if (ri >= 2 && ci % 4 == 1) { steel = true; }
+                }
+                if (pattern == 5) {
+                    // full steel shield row with two gaps under the stack
+                    if (ri == 4) { steel = ci != 2 && ci != 9; }
+                    if (ri == 5) { put = false; }
+                }
+                if (pattern == 6) {
+                    // two moving rows sweep left/right
+                    if (ri == 2) { mvx = 90; }
+                    if (ri == 4) { mvx = -90; }
+                    put = ri != 5 || ci % 2 == 0;
+                }
+                if (pattern == 7) {
+                    // fortress: steel frame with a soft core, moving floor
+                    if (ri == 1 && ci >= 2 && ci <= 9 && ci != 5 && ci != 6) { steel = true; }
+                    if (ri >= 2 && ri <= 3 && (ci == 2 || ci == 9)) { steel = true; }
+                    if (ri == 5) { mvx = 110; }
+                }
                 if (put) {
                     Brick b = new Brick();
-                    b.x = x0 + ci * (bw + gap);
+                    b.x = (x0 + ci * (bw + gap)) * 256;
                     b.y = 90 + ri * (bh + gap);
                     b.w = bw;
                     b.h = bh;
+                    b.steel = steel;
+                    b.mvx = mvx;
+                    if (lv > 8) { if (mvx > 0) { b.mvx = mvx + 40; } if (mvx < 0) { b.mvx = mvx - 40; } }
                     b.hp = 1 + (rows - 1 - ri) / 2;
                     if (b.hp > 3) { b.hp = 3; }
                     if (lv >= 3) { b.hp = b.hp + ri % 2; if (b.hp > 3) { b.hp = 3; } }
+                    if (steel) { b.hp = 1; b.gem = false; }
+                    else { b.gem = this.rng.Range(0, 100) < 16; }
                     b.hue = (ri + lv) % 6;
-                    b.gem = this.rng.Range(0, 100) < 16;
                     this.bricks.Add(b);
                 }
                 ci = ci + 1;
@@ -251,7 +282,8 @@ class BkGame {
         this.padX = 640;
         this.wideUntil = 0;
         this.slowUntil = 0;
-        this.BuildLevel(1);
+        if (this.demo) { this.level = 5; }
+        this.BuildLevel(this.level);
         this.ResetBall();
         this.drops = new List<Drop>();
         this.parts = new List<Particle>();
@@ -304,7 +336,7 @@ class BkGame {
         if (this.combo > this.bestCombo) { this.bestCombo = this.combo; }
         this.mult = 1 + this.combo / 4;
         if (this.mult > 5) { this.mult = 5; }
-        int cx = b.x + b.w / 2;
+        int cx = b.x / 256 + b.w / 2;
         int cy = b.y + b.h / 2;
         if (b.hp <= 0) {
             int gain = 10 * this.mult;
@@ -430,9 +462,10 @@ class BkGame {
         int bi = this.bricks.Count - 1;
         while (bi >= 0) {
             Brick k = this.bricks[bi];
+            int kx = k.x / 256;
             int nx = px;
-            if (nx < k.x) { nx = k.x; }
-            if (nx > k.x + k.w) { nx = k.x + k.w; }
+            if (nx < kx) { nx = kx; }
+            if (nx > kx + k.w) { nx = kx + k.w; }
             int ny = py;
             if (ny < k.y) { ny = k.y; }
             if (ny > k.y + k.h) { ny = k.y + k.h; }
@@ -450,7 +483,11 @@ class BkGame {
                         if ((dy > 0 && b.vy < 0) || (dy < 0 && b.vy > 0)) { b.vy = -b.vy; }
                     }
                 }
-                this.HitBrick(bi, b, now);
+                if (k.steel) {
+                    this.Burst(kx + k.w / 2, k.y + k.h / 2, 3, now, 200, 210, 230);
+                } else {
+                    this.HitBrick(bi, b, now);
+                }
                 bi = -1;
             } else {
                 bi = bi - 1;
@@ -544,7 +581,26 @@ class BkGame {
             i = i - 1;
         }
 
-        if (this.bricks.Count == 0 && this.scene == 1) {
+        // moving rows drift and bounce off the side rails
+        i = 0;
+        while (i < this.bricks.Count) {
+            Brick k = this.bricks[i];
+            if (k.mvx != 0) {
+                k.x = k.x + k.mvx * dt * 256 / 1000;
+                if (k.x < 10 * 256 && k.mvx < 0) { k.mvx = -k.mvx; }
+                if (k.x > (BkGame.W() - 10 - k.w) * 256 && k.mvx > 0) { k.mvx = -k.mvx; }
+            }
+            i = i + 1;
+        }
+
+        // level cleared when no breakable bricks remain (steel stays)
+        int breakable = 0;
+        i = 0;
+        while (i < this.bricks.Count) {
+            if (!this.bricks[i].steel) { breakable = breakable + 1; }
+            i = i + 1;
+        }
+        if (breakable == 0 && this.scene == 1) {
             this.scene = 3;
             this.clearAt = now + 1400;
             this.Toast("清屏！漂亮！", now);
@@ -585,18 +641,29 @@ class BkGame {
         int i = 0;
         while (i < this.bricks.Count) {
             Brick b = this.bricks[i];
+            int bx = b.x / 256;
+            if (b.steel) {
+                // riveted steel obstacle
+                Draw.RoundRectFill(this.r, bx + shX, b.y + shY, b.w, b.h, 7, 96, 104, 128, 245);
+                Draw.RoundRectFill(this.r, bx + 4 + shX, b.y + 4 + shY, b.w - 8, b.h / 2 - 4, 5, 255, 255, 255, 26);
+                Draw.RingRect(this.r, bx + shX, b.y + shY, b.w, b.h, 2, 170, 180, 205, 160);
+                Draw.FillCircle(this.r, bx + 10 + shX, b.y + b.h / 2 + shY, 3, 190, 200, 220, 220);
+                Draw.FillCircle(this.r, bx + b.w - 10 + shX, b.y + b.h / 2 + shY, 3, 190, 200, 220, 220);
+                i = i + 1;
+                continue;
+            }
             int cr = BkGame.PalR(b.hue); int cg = BkGame.PalG(b.hue); int cb = BkGame.PalB(b.hue);
             int dim = (3 - b.hp) * 22;
             int br2 = cr - cr * dim / 100;
             int bg2 = cg - cg * dim / 100;
             int bb2 = cb - cb * dim / 100;
-            Draw.RoundRectFill(this.r, b.x + shX, b.y + shY, b.w, b.h, 9, br2, bg2, bb2, 235);
-            Draw.RoundRectFill(this.r, b.x + 4 + shX, b.y + 4 + shY, b.w - 8, b.h / 2 - 4, 6, 255, 255, 255, 46);
+            Draw.RoundRectFill(this.r, bx + shX, b.y + shY, b.w, b.h, 9, br2, bg2, bb2, 235);
+            Draw.RoundRectFill(this.r, bx + 4 + shX, b.y + 4 + shY, b.w - 8, b.h / 2 - 4, 6, 255, 255, 255, 46);
             if (b.gem) {
-                Draw.FillCircle(this.r, b.x + b.w / 2 + shX, b.y + b.h / 2 + shY, 5, 255, 255, 255, 200);
+                Draw.FillCircle(this.r, bx + b.w / 2 + shX, b.y + b.h / 2 + shY, 5, 255, 255, 255, 200);
             }
             if (b.hp >= 3) {
-                Draw.RingRect(this.r, b.x + shX, b.y + shY, b.w, b.h, 2, 255, 255, 255, 70);
+                Draw.RingRect(this.r, bx + shX, b.y + shY, b.w, b.h, 2, 255, 255, 255, 70);
             }
             i = i + 1;
         }
