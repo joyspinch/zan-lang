@@ -1,0 +1,786 @@
+// 打砖块 -- a neon arcade brick-breaker. Mouse moves the glowing paddle; the
+// ball smashes candy-glass bricks that spark and shatter. Chain combos raise a
+// score multiplier, bricks drop powerups (multiball, wide paddle, slow-mo,
+// score gems), and clearing a board advances to the next, faster level.
+// Floating score popups, particle bursts, screen shake and encouraging toasts
+// provide the juice; best score / highest level / max combo persist. All text
+// uses the smooth TTF atlases. F11 borderless fullscreen, Esc back/exit.
+using System;
+using System.IO;
+using SDL3;
+using GameKit;
+
+namespace Breakout;
+
+class Profile {
+    int high;
+    int bestLevel;
+    int bestCombo;
+    int games;
+
+    static string Path() { return "breakout_save.txt"; }
+    static int ParseInt(string s, int start) {
+        int i = start; int v = 0; bool any = false;
+        while (i < s.Length) { int c = s[i] & 255; if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); any = true; i = i + 1; } else { i = s.Length; } }
+        if (!any) { return 0; }
+        return v;
+    }
+    static int ReadKey(List<string> lines, string key, int fb) {
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = lines[i]; int eq = -1; int j = 0;
+            while (j < ln.Length) { if (ln[j] == 61) { eq = j; j = ln.Length; } j = j + 1; }
+            if (eq > 0) { if (ln.Substring(0, eq) == key) { return Profile.ParseInt(ln, eq + 1); } }
+            i = i + 1;
+        }
+        return fb;
+    }
+    static Profile Load() {
+        Profile p = new Profile();
+        p.high = 0; p.bestLevel = 1; p.bestCombo = 0; p.games = 0;
+        if (File.Exists(Profile.Path())) {
+            List<string> lines = File.ReadAllLines(Profile.Path());
+            p.high = Profile.ReadKey(lines, "high", 0);
+            p.bestLevel = Profile.ReadKey(lines, "bestLevel", 1);
+            p.bestCombo = Profile.ReadKey(lines, "bestCombo", 0);
+            p.games = Profile.ReadKey(lines, "games", 0);
+        }
+        return p;
+    }
+    void Save() {
+        string s = "high=" + this.high + "\nbestLevel=" + this.bestLevel
+            + "\nbestCombo=" + this.bestCombo + "\ngames=" + this.games + "\n";
+        File.WriteAllText(Profile.Path(), s);
+    }
+}
+
+class Brick {
+    int x;      // px
+    int y;
+    int w;
+    int h;
+    int hp;     // 1..3, 0 = gone
+    int hue;    // palette index
+    bool gem;   // drops a bonus when broken
+}
+
+class Ball {
+    bool alive;
+    int x;      // fp 1/256 px
+    int y;
+    int vx;     // fp px/s
+    int vy;
+}
+
+class Drop {
+    bool alive;
+    int x;      // px
+    int y;      // fp 1/256 px (falls)
+    int kind;   // 0 multiball, 1 wide, 2 slow, 3 gem score
+}
+
+class Particle {
+    int x;      // fp
+    int y;
+    int vx;
+    int vy;
+    int bornAt;
+    int cr;
+    int cg;
+    int cb;
+}
+
+class Popup {
+    int x;
+    int y;
+    string text;
+    int bornAt;
+    int cr;
+    int cg;
+    int cb;
+}
+
+class BkGame {
+    Host host;
+    SdlRenderer r;
+    Profile prof;
+    Rng rng;
+
+    List<Brick> bricks;
+    List<Ball> balls;
+    List<Drop> drops;
+    List<Particle> parts;
+    List<Popup> pops;
+
+    int scene;        // 0 menu, 1 play, 2 over, 3 level-clear flash
+    int clearAt;
+    int score;
+    int level;
+    int lives;
+    int combo;        // hits since last paddle touch / miss
+    int bestCombo;
+    int mult;         // score multiplier from combo
+    int padX;         // center px
+    int padW;
+    int wideUntil;
+    int slowUntil;
+    int lastTick;
+    int mouseX;
+    int mouseY;
+    bool stuck;       // ball waiting on the paddle
+    int toastAt;
+    string toastText;
+    int shakeUntil;
+    bool wasRecord;
+    SdlTexture menuBg;
+    SdlTexture titleTex;
+    bool texTried;
+    bool demo;
+    int demoJitter;
+
+    static int W() { return 1280; }
+    static int H() { return 720; }
+    static int PadY() { return 660; }
+
+    static int PalR(int i) { int m = i % 6; if (m == 0) { return 255; } if (m == 1) { return 255; } if (m == 2) { return 120; } if (m == 3) { return 90; } if (m == 4) { return 190; } return 255; }
+    static int PalG(int i) { int m = i % 6; if (m == 0) { return 110; } if (m == 1) { return 205; } if (m == 2) { return 235; } if (m == 3) { return 160; } if (m == 4) { return 120; } return 235; }
+    static int PalB(int i) { int m = i % 6; if (m == 0) { return 140; } if (m == 1) { return 90; } if (m == 2) { return 140; } if (m == 3) { return 255; } if (m == 4) { return 255; } return 120; }
+
+    static BkGame Create(Host h) {
+        BkGame g = new BkGame();
+        g.host = h;
+        g.r = h.Renderer();
+        g.prof = Profile.Load();
+        g.rng = Rng.Seed((long)Sdl.Ticks() + 24681357);
+        g.scene = 0;
+        g.mouseX = 640;
+        g.mouseY = 360;
+        g.demo = File.Exists("breakout_demo.txt");
+        if (g.demo) { g.StartGame(Sdl.Ticks()); }
+        return g;
+    }
+
+    void EnsureTex() {
+        if (this.texTried) { return; }
+        this.texTried = true;
+        this.menuBg = BkGame.LoadTex(this.r, "examples/game/breakout/assets/menu_bg.png");
+        this.titleTex = BkGame.LoadTex(this.r, "examples/game/breakout/assets/title.png");
+    }
+    static SdlTexture LoadTex(SdlRenderer r, string path) {
+        string p = Assets.Find(path);
+        if (!File.Exists(p)) { return null; }
+        SdlTexture t = SdlTexture.LoadImage(r, p);
+        if (t == null || !t.IsValid()) { return null; }
+        t.SetNearest(false);
+        t.SetBlendMode(1);
+        return t;
+    }
+
+    // ----- level layouts ---------------------------------------------------
+
+    void BuildLevel(int lv) {
+        this.bricks = new List<Brick>();
+        int pattern = (lv - 1) % 4;
+        int cols = 12;
+        int bw = 88;
+        int bh = 34;
+        int gap = 8;
+        int x0 = (BkGame.W() - cols * (bw + gap) + gap) / 2;
+        int rows = 6;
+        int ri = 0;
+        while (ri < rows) {
+            int ci = 0;
+            while (ci < cols) {
+                bool put = true;
+                if (pattern == 1) { put = (ri + ci) % 2 == 0; }
+                if (pattern == 2) { int mid = cols / 2; int d = ci - mid; if (d < 0) { d = -d; } put = d + 1 >= ri && d - 1 <= ri + 1; }
+                if (pattern == 3) { put = ri % 2 == 0 || ci % 3 != 1; }
+                if (put) {
+                    Brick b = new Brick();
+                    b.x = x0 + ci * (bw + gap);
+                    b.y = 90 + ri * (bh + gap);
+                    b.w = bw;
+                    b.h = bh;
+                    b.hp = 1 + (rows - 1 - ri) / 2;
+                    if (b.hp > 3) { b.hp = 3; }
+                    if (lv >= 3) { b.hp = b.hp + ri % 2; if (b.hp > 3) { b.hp = 3; } }
+                    b.hue = (ri + lv) % 6;
+                    b.gem = this.rng.Range(0, 100) < 16;
+                    this.bricks.Add(b);
+                }
+                ci = ci + 1;
+            }
+            ri = ri + 1;
+        }
+    }
+
+    int BallSpeed() {
+        int s = 430 + (this.level - 1) * 40;
+        if (s > 640) { s = 640; }
+        return s;
+    }
+
+    void ResetBall() {
+        this.balls = new List<Ball>();
+        Ball b = new Ball();
+        b.alive = true;
+        this.balls.Add(b);
+        this.stuck = true;
+        this.combo = 0;
+        this.mult = 1;
+    }
+
+    void LaunchBall(int now) {
+        if (!this.stuck) { return; }
+        this.stuck = false;
+        Ball b = this.balls[0];
+        int side = 1;
+        if (this.rng.Range(0, 2) == 1) { side = -1; }
+        int spd = this.BallSpeed();
+        b.vx = side * spd * 100 / 256;
+        b.vy = -spd * 235 / 256;
+    }
+
+    void StartGame(int now) {
+        this.score = 0;
+        this.level = 1;
+        this.lives = 3;
+        this.bestCombo = 0;
+        this.padW = 150;
+        this.padX = 640;
+        this.wideUntil = 0;
+        this.slowUntil = 0;
+        this.BuildLevel(1);
+        this.ResetBall();
+        this.drops = new List<Drop>();
+        this.parts = new List<Particle>();
+        this.pops = new List<Popup>();
+        this.toastAt = -9999;
+        this.wasRecord = false;
+        this.scene = 1;
+        this.lastTick = now;
+    }
+
+    // ----- feedback --------------------------------------------------------
+
+    void Toast(string t, int now) { this.toastText = t; this.toastAt = now; }
+    void AddPop(int px, int py, string t, int now, int cr, int cg, int cb) {
+        if (this.pops.Count > 22) { this.pops.RemoveAt(0); }
+        Popup p = new Popup();
+        p.x = px; p.y = py; p.text = t; p.bornAt = now;
+        p.cr = cr; p.cg = cg; p.cb = cb;
+        this.pops.Add(p);
+    }
+    void Burst(int px, int py, int n, int now, int cr, int cg, int cb) {
+        if (this.parts.Count > 200) { return; }
+        int i = 0;
+        while (i < n) {
+            Particle p = new Particle();
+            p.x = px * 256; p.y = py * 256;
+            int a = this.rng.Range(0, 16);
+            int spd = 70 + this.rng.Range(0, 170);
+            int ux = 0; int uy = 0;
+            int q = a % 4;
+            if (q == 0) { ux = 256; uy = (a / 4 - 2) * 128; }
+            if (q == 1) { ux = -256; uy = (a / 4 - 2) * 128; }
+            if (q == 2) { uy = 256; ux = (a / 4 - 2) * 128; }
+            if (q == 3) { uy = -256; ux = (a / 4 - 2) * 128; }
+            p.vx = ux * spd / 256;
+            p.vy = uy * spd / 256;
+            p.bornAt = now;
+            p.cr = cr; p.cg = cg; p.cb = cb;
+            this.parts.Add(p);
+            i = i + 1;
+        }
+    }
+
+    // ----- simulation ------------------------------------------------------
+
+    void HitBrick(int bi, Ball ball, int now) {
+        Brick b = this.bricks[bi];
+        b.hp = b.hp - 1;
+        this.combo = this.combo + 1;
+        if (this.combo > this.bestCombo) { this.bestCombo = this.combo; }
+        this.mult = 1 + this.combo / 4;
+        if (this.mult > 5) { this.mult = 5; }
+        int cx = b.x + b.w / 2;
+        int cy = b.y + b.h / 2;
+        if (b.hp <= 0) {
+            int gain = 10 * this.mult;
+            this.score = this.score + gain;
+            this.Burst(cx, cy, 10, now, BkGame.PalR(b.hue), BkGame.PalG(b.hue), BkGame.PalB(b.hue));
+            this.AddPop(cx, cy, "+" + gain, now, BkGame.PalR(b.hue), BkGame.PalG(b.hue), BkGame.PalB(b.hue));
+            if (b.gem) {
+                Drop d = new Drop();
+                d.alive = true;
+                d.x = cx;
+                d.y = cy * 256;
+                int roll = this.rng.Range(0, 100);
+                if (roll < 30) { d.kind = 0; }
+                else if (roll < 55) { d.kind = 1; }
+                else if (roll < 75) { d.kind = 2; }
+                else { d.kind = 3; }
+                this.drops.Add(d);
+            }
+            this.bricks.RemoveAt(bi);
+            if (this.combo == 8) { this.Toast("连击 x" + this.mult + "！火力全开", now); }
+        } else {
+            this.score = this.score + 2 * this.mult;
+            this.Burst(cx, cy, 4, now, 255, 255, 255);
+        }
+        if (!this.wasRecord && this.prof.high > 0 && this.score > this.prof.high) {
+            this.wasRecord = true;
+            this.Toast("新纪录诞生！", now);
+        }
+    }
+
+    void ApplyDrop(Drop d, int now) {
+        if (d.kind == 0) {
+            // multiball: split every live ball into two
+            int n = this.balls.Count;
+            int i = 0;
+            while (i < n && this.balls.Count < 6) {
+                Ball src = this.balls[i];
+                if (src.alive) {
+                    Ball nb = new Ball();
+                    nb.alive = true;
+                    nb.x = src.x; nb.y = src.y;
+                    nb.vx = -src.vx;
+                    nb.vy = src.vy;
+                    if (nb.vy > 0) { nb.vy = -nb.vy; }
+                    this.balls.Add(nb);
+                }
+                i = i + 1;
+            }
+            this.Toast("分裂球！", now);
+        } else if (d.kind == 1) {
+            this.wideUntil = now + 9000;
+            this.Toast("加长挡板！", now);
+        } else if (d.kind == 2) {
+            this.slowUntil = now + 6000;
+            this.Toast("子弹时间！", now);
+        } else {
+            int gain = 50 * this.mult;
+            this.score = this.score + gain;
+            this.AddPop(d.x, d.y / 256, "宝石 +" + gain, now, 255, 220, 110);
+        }
+        this.Burst(d.x, d.y / 256, 8, now, 255, 235, 140);
+    }
+
+    void LoseBall(int now) {
+        // called when the last ball fell
+        this.lives = this.lives - 1;
+        this.combo = 0;
+        this.mult = 1;
+        this.shakeUntil = now + 350;
+        if (this.lives <= 0) {
+            this.scene = 2;
+            this.prof.games = this.prof.games + 1;
+            if (this.score > this.prof.high) { this.prof.high = this.score; }
+            if (this.level > this.prof.bestLevel) { this.prof.bestLevel = this.level; }
+            if (this.bestCombo > this.prof.bestCombo) { this.prof.bestCombo = this.bestCombo; }
+            this.prof.Save();
+        } else {
+            this.Toast("还有 " + this.lives + " 次机会，稳住！", now);
+            this.ResetBall();
+        }
+    }
+
+    void StepBall(Ball b, int dt, int now) {
+        if (!b.alive) { return; }
+        if (this.stuck) {
+            b.x = this.padX * 256;
+            b.y = (BkGame.PadY() - 16) * 256;
+            return;
+        }
+        int sdt = dt;
+        if (now < this.slowUntil) { sdt = dt * 60 / 100; }
+        b.x = b.x + b.vx * sdt / 1000;
+        b.y = b.y + b.vy * sdt / 1000;
+        int px = b.x / 256;
+        int py = b.y / 256;
+        int rad = 9;
+        // walls
+        if (px < rad + 8) { b.x = (rad + 8) * 256; if (b.vx < 0) { b.vx = -b.vx; } }
+        if (px > BkGame.W() - rad - 8) { b.x = (BkGame.W() - rad - 8) * 256; if (b.vx > 0) { b.vx = -b.vx; } }
+        if (py < rad + 8) { b.y = (rad + 8) * 256; if (b.vy < 0) { b.vy = -b.vy; } }
+        // paddle
+        int pw = this.padW;
+        if (now < this.wideUntil) { pw = pw + 70; }
+        if (b.vy > 0 && py > BkGame.PadY() - rad && py < BkGame.PadY() + 22) {
+            if (px > this.padX - pw / 2 - rad && px < this.padX + pw / 2 + rad) {
+                b.vy = -b.vy;
+                b.y = (BkGame.PadY() - rad) * 256;
+                // deflect by where the ball hit the paddle
+                int off = (px - this.padX) * 256 / (pw / 2 + rad);
+                int spd = this.BallSpeed();
+                b.vx = off * spd * 200 / 65536 + b.vx / 3;
+                if (this.combo >= 6) { this.Toast("连击被接住，继续冲！", now); }
+                this.combo = 0;
+                this.mult = 1;
+            }
+        }
+        // fell below
+        if (py > BkGame.H() + 30) {
+            b.alive = false;
+            return;
+        }
+        // bricks (AABB vs circle, resolve by shallowest axis)
+        int bi = this.bricks.Count - 1;
+        while (bi >= 0) {
+            Brick k = this.bricks[bi];
+            int nx = px;
+            if (nx < k.x) { nx = k.x; }
+            if (nx > k.x + k.w) { nx = k.x + k.w; }
+            int ny = py;
+            if (ny < k.y) { ny = k.y; }
+            if (ny > k.y + k.h) { ny = k.y + k.h; }
+            int dx = px - nx;
+            int dy = py - ny;
+            if (dx * dx + dy * dy <= rad * rad) {
+                if (dx == 0 && dy == 0) {
+                    if (b.vy > 0) { b.vy = -b.vy; } else { b.vy = -b.vy; }
+                } else {
+                    int adx = dx; if (adx < 0) { adx = -adx; }
+                    int ady = dy; if (ady < 0) { ady = -ady; }
+                    if (adx > ady) {
+                        if ((dx > 0 && b.vx < 0) || (dx < 0 && b.vx > 0)) { b.vx = -b.vx; }
+                    } else {
+                        if ((dy > 0 && b.vy < 0) || (dy < 0 && b.vy > 0)) { b.vy = -b.vy; }
+                    }
+                }
+                this.HitBrick(bi, b, now);
+                bi = -1;
+            } else {
+                bi = bi - 1;
+            }
+        }
+    }
+
+    void Step(int now) {
+        int dt = now - this.lastTick;
+        this.lastTick = now;
+        if (dt < 0) { dt = 0; }
+        if (dt > 50) { dt = 50; }
+        if (dt == 0) { return; }
+
+        // paddle follows the mouse
+        if (this.demo) {
+            // track the lowest live ball
+            int tx = 640;
+            int bi = 0;
+            int by = -1;
+            while (bi < this.balls.Count) {
+                Ball b = this.balls[bi];
+                if (b.alive && b.y > by) { by = b.y; tx = b.x / 256; }
+                bi = bi + 1;
+            }
+            this.demoJitter = (this.demoJitter + dt) % 2000;
+            this.padX = this.padX + (tx - this.padX) * dt / 90;
+            if (this.stuck && now % 1700 < 40) { this.LaunchBall(now); }
+        } else {
+            this.padX = this.mouseX;
+        }
+        int pw = this.padW;
+        if (now < this.wideUntil) { pw = pw + 70; }
+        if (this.padX < pw / 2 + 10) { this.padX = pw / 2 + 10; }
+        if (this.padX > BkGame.W() - pw / 2 - 10) { this.padX = BkGame.W() - pw / 2 - 10; }
+
+        if (this.scene == 3) {
+            if (now >= this.clearAt) {
+                this.level = this.level + 1;
+                this.BuildLevel(this.level);
+                this.ResetBall();
+                this.drops = new List<Drop>();
+                this.scene = 1;
+                this.Toast("第 " + this.level + " 关！球速提升", now);
+            }
+            return;
+        }
+
+        int i = 0;
+        while (i < this.balls.Count) {
+            this.StepBall(this.balls[i], dt, now);
+            i = i + 1;
+        }
+        // prune dead balls; if none left, lose a life
+        i = this.balls.Count - 1;
+        bool any = false;
+        while (i >= 0) {
+            if (this.balls[i].alive) { any = true; }
+            else if (this.balls.Count > 1) { this.balls.RemoveAt(i); }
+            i = i - 1;
+        }
+        if (!any) { this.LoseBall(now); return; }
+
+        // drops fall
+        i = this.drops.Count - 1;
+        while (i >= 0) {
+            Drop d = this.drops[i];
+            d.y = d.y + 190 * dt * 256 / 1000;
+            int dy = d.y / 256;
+            int pw2 = this.padW;
+            if (now < this.wideUntil) { pw2 = pw2 + 70; }
+            if (dy > BkGame.PadY() - 12 && dy < BkGame.PadY() + 26
+                && d.x > this.padX - pw2 / 2 - 14 && d.x < this.padX + pw2 / 2 + 14) {
+                this.ApplyDrop(d, now);
+                this.drops.RemoveAt(i);
+            } else if (dy > BkGame.H() + 20) {
+                this.drops.RemoveAt(i);
+            }
+            i = i - 1;
+        }
+
+        // particles
+        i = this.parts.Count - 1;
+        while (i >= 0) {
+            Particle p = this.parts[i];
+            if (now - p.bornAt > 650) { this.parts.RemoveAt(i); }
+            else {
+                p.x = p.x + p.vx * dt / 4;
+                p.y = p.y + p.vy * dt / 4;
+            }
+            i = i - 1;
+        }
+
+        if (this.bricks.Count == 0 && this.scene == 1) {
+            this.scene = 3;
+            this.clearAt = now + 1400;
+            this.Toast("清屏！漂亮！", now);
+            this.Burst(640, 300, 30, now, 255, 230, 120);
+        }
+    }
+
+    // ----- rendering -------------------------------------------------------
+
+    void DrawScene(int now) {
+        this.EnsureTex();
+        int shX = 0; int shY = 0;
+        if (now < this.shakeUntil) {
+            int left = this.shakeUntil - now;
+            int amp = left / 80 + 1;
+            shX = (now * 7 % (amp * 2 + 1)) - amp;
+            shY = (now * 13 % (amp * 2 + 1)) - amp;
+        }
+        this.host.Begin(12, 10, 28);
+        // side + top glow rails
+        this.r.SetColor(120, 80, 220, 60);
+        this.r.FillRect(0 + shX, 0 + shY, 8, BkGame.H());
+        this.r.FillRect(BkGame.W() - 8 + shX, 0 + shY, 8, BkGame.H());
+        this.r.FillRect(0 + shX, 0 + shY, BkGame.W(), 8);
+        this.r.SetColor(190, 120, 255, 200);
+        this.r.FillRect(6 + shX, 0 + shY, 2, BkGame.H());
+        this.r.FillRect(BkGame.W() - 8 + shX, 0 + shY, 2, BkGame.H());
+        this.r.FillRect(0 + shX, 6 + shY, BkGame.W(), 2);
+
+        // bricks: candy glass with inner highlight; hp shows as brightness
+        int i = 0;
+        while (i < this.bricks.Count) {
+            Brick b = this.bricks[i];
+            int cr = BkGame.PalR(b.hue); int cg = BkGame.PalG(b.hue); int cb = BkGame.PalB(b.hue);
+            int dim = (3 - b.hp) * 22;
+            int br2 = cr - cr * dim / 100;
+            int bg2 = cg - cg * dim / 100;
+            int bb2 = cb - cb * dim / 100;
+            Draw.RoundRectFill(this.r, b.x + shX, b.y + shY, b.w, b.h, 9, br2, bg2, bb2, 235);
+            Draw.RoundRectFill(this.r, b.x + 4 + shX, b.y + 4 + shY, b.w - 8, b.h / 2 - 4, 6, 255, 255, 255, 46);
+            if (b.gem) {
+                Draw.FillCircle(this.r, b.x + b.w / 2 + shX, b.y + b.h / 2 + shY, 5, 255, 255, 255, 200);
+            }
+            if (b.hp >= 3) {
+                Draw.RingRect(this.r, b.x + shX, b.y + shY, b.w, b.h, 2, 255, 255, 255, 70);
+            }
+            i = i + 1;
+        }
+
+        // drops
+        i = 0;
+        while (i < this.drops.Count) {
+            Drop d = this.drops[i];
+            int dy = d.y / 256;
+            int cr = 140; int cg = 255; int cb = 210;
+            string mark = "分";
+            if (d.kind == 1) { cr = 255; cg = 205; cb = 90; mark = "长"; }
+            if (d.kind == 2) { cr = 120; cg = 200; cb = 255; mark = "慢"; }
+            if (d.kind == 3) { cr = 255; cg = 220; cb = 110; mark = "宝"; }
+            Draw.FillCircle(this.r, d.x + shX, dy + shY, 18, cr, cg, cb, 50);
+            Draw.FillCircle(this.r, d.x + shX, dy + shY, 13, cr, cg, cb, 235);
+            Text.DrawCentered(this.r, mark, d.x + shX, dy - 11 + shY, 2, 20, 24, 44, 255);
+            i = i + 1;
+        }
+
+        // paddle: glowing capsule
+        int pw = this.padW;
+        if (now < this.wideUntil) { pw = pw + 70; }
+        int py = BkGame.PadY();
+        Draw.RoundRectFill(this.r, this.padX - pw / 2 - 4 + shX, py - 4 + shY, pw + 8, 26, 13, 140, 255, 210, 40);
+        Draw.RoundRectFill(this.r, this.padX - pw / 2 + shX, py + shY, pw, 18, 9, 90, 235, 190, 255);
+        Draw.RoundRectFill(this.r, this.padX - pw / 2 + 8 + shX, py + 3 + shY, pw - 16, 6, 3, 255, 255, 255, 90);
+
+        // balls
+        i = 0;
+        while (i < this.balls.Count) {
+            Ball b = this.balls[i];
+            if (b.alive) {
+                int bx = b.x / 256; int by = b.y / 256;
+                Draw.FillCircle(this.r, bx + shX, by + shY, 14, 255, 240, 160, 46);
+                Draw.FillCircle(this.r, bx + shX, by + shY, 9, 255, 235, 130, 255);
+                Draw.FillCircle(this.r, bx - 3 + shX, by - 3 + shY, 3, 255, 255, 255, 220);
+            }
+            i = i + 1;
+        }
+
+        // particles
+        i = 0;
+        while (i < this.parts.Count) {
+            Particle p = this.parts[i];
+            int age = now - p.bornAt;
+            int alpha = 255 - age * 255 / 650;
+            Draw.FillCircle(this.r, p.x / 256 + shX, p.y / 256 + shY, 3, p.cr, p.cg, p.cb, alpha);
+            i = i + 1;
+        }
+        // popups
+        i = this.pops.Count - 1;
+        while (i >= 0) {
+            Popup p = this.pops[i];
+            int age = now - p.bornAt;
+            if (age > 900) { this.pops.RemoveAt(i); }
+            else {
+                int alpha = 255 - age * 255 / 900;
+                Text.DrawCentered(this.r, p.text, p.x, p.y - age / 9, 3, p.cr, p.cg, p.cb, alpha);
+            }
+            i = i - 1;
+        }
+
+        // HUD
+        Text.DrawShadow(this.r, "" + this.score, 28, 18, 7, 255, 230, 120, 3);
+        Text.DrawShadow(this.r, "第 " + this.level + " 关", 32, 84, 2, 170, 220, 255, 2);
+        if (this.mult > 1) {
+            Text.DrawShadow(this.r, "连击 x" + this.mult, 32, 114, 3, 255, 170, 210, 2);
+        }
+        // lives (hearts as glowing dots)
+        i = 0;
+        while (i < this.lives) {
+            Draw.FillCircle(this.r, 1230 - i * 34, 36, 12, 255, 110, 140, 235);
+            Draw.FillCircle(this.r, 1233 - i * 34, 32, 4, 255, 255, 255, 140);
+            i = i + 1;
+        }
+        // toast
+        if (now - this.toastAt < 1500) {
+            int a = 255;
+            int age = now - this.toastAt;
+            if (age > 1100) { a = 255 - (age - 1100) * 255 / 400; }
+            Text.DrawCentered(this.r, this.toastText, 640, 150, 4, 255, 235, 140, a);
+        }
+        if (this.stuck) {
+            Text.DrawCentered(this.r, "点击发射", 640, 560, 3, 190, 200, 230, 200);
+        }
+    }
+
+    void DrawPlay(int now) {
+        this.DrawScene(now);
+        this.host.End();
+    }
+
+    void DrawMenu(int now) {
+        this.EnsureTex();
+        this.host.Begin(12, 10, 28);
+        Ui.Backdrop(this.r, this.menuBg, 1280, 720);
+        this.r.SetColor(8, 8, 24, 130);
+        this.r.FillRect(0, 0, 1280, 720);
+        if (this.titleTex != null) {
+            this.r.DrawTexture(this.titleTex, 640 - 300, 40, 600, 200);
+        } else {
+            Text.DrawCenteredShadow(this.r, "打砖块", 640, 80, 9, 245, 238, 220, 4);
+        }
+        Text.DrawCenteredShadow(this.r, "霓虹碎砖 · 连击倍增 · 道具连锁", 640, 268, 3, 255, 214, 150, 3);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 460, 380, 360, 88, "开始弹射", 4, 1);
+        Text.DrawCenteredShadow(this.r, "最高分 " + this.prof.high + " · 最高 " + this.prof.bestLevel + " 关 · 最长连击 " + this.prof.bestCombo, 640, 520, 2, 255, 224, 130, 2);
+        Text.DrawCenteredShadow(this.r, "鼠标移动挡板 · 点击发射 · F11 全屏 · Esc 退出", 640, 600, 2, 185, 195, 220, 2);
+        this.host.End();
+    }
+
+    void DrawOver(int now) {
+        this.DrawScene(now);
+        this.r.SetColor(6, 8, 18, 185);
+        this.r.FillRect(0, 0, 1280, 720);
+        int by = 190;
+        Draw.RoundRectFill(this.r, 390, by, 500, 320, 20, 16, 20, 40, 240);
+        Draw.RingRect(this.r, 390, by, 500, 320, 2, 190, 120, 255, 120);
+        bool record = this.score >= this.prof.high && this.score > 0;
+        if (record) {
+            Text.DrawCenteredShadow(this.r, "新纪录！", 640, by + 30, 6, 255, 220, 100, 3);
+        } else {
+            Text.DrawCenteredShadow(this.r, "挡板失守", 640, by + 34, 4, 235, 140, 150, 3);
+        }
+        Text.DrawCentered(this.r, "得分 " + this.score, 640, by + 100, 5, 255, 225, 110, 255);
+        Text.DrawCentered(this.r, "第 " + this.level + " 关 · 最长连击 " + this.bestCombo, 640, by + 156, 2, 175, 200, 235, 255);
+        string cheer = "再来一局，打出更高连击！";
+        if (record) { cheer = "砖块粉碎机就是你！"; }
+        Text.DrawCentered(this.r, cheer, 640, by + 196, 2, 150, 230, 190, 255);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 420, by + 236, 210, 60, "再来一局", 3, 1);
+        Ui.Button(this.r, this.mouseX, this.mouseY, 650, by + 236, 210, 60, "回到菜单", 3, 0);
+        this.host.End();
+    }
+
+    // ----- input -----------------------------------------------------------
+
+    void OnKey(int sc, int now) {
+        if (sc == 41) { if (this.scene == 0) { this.host.Quit(); } else { this.scene = 0; } return; }
+        if (this.scene == 0 || this.scene == 2) {
+            if (sc == 40 || sc == 44) { this.StartGame(now); }
+            return;
+        }
+        if (sc == 44) { this.LaunchBall(now); }
+    }
+    void OnDown(int cx, int cy, int now) {
+        if (this.scene == 0) {
+            if (Draw.PointIn(cx, cy, 460, 380, 360, 88)) { this.StartGame(now); }
+            return;
+        }
+        if (this.scene == 1 || this.scene == 3) { this.LaunchBall(now); return; }
+        if (this.scene == 2) {
+            if (Draw.PointIn(cx, cy, 420, 426, 210, 60)) { this.StartGame(now); return; }
+            if (Draw.PointIn(cx, cy, 650, 426, 210, 60)) { this.scene = 0; return; }
+        }
+    }
+
+    void Tick(int now) {
+        if (this.scene == 1 || this.scene == 3) { this.Step(now); }
+    }
+    void Render(int now) {
+        if (this.scene == 0) { this.DrawMenu(now); }
+        else if (this.scene == 2) { this.DrawOver(now); }
+        else { this.DrawPlay(now); }
+    }
+}
+
+class BkApp {
+    static void Main() {
+        Host h = Host.Create("打砖块", 1280, 720);
+        BkGame g = BkGame.Create(h);
+        while (h.Running()) {
+            int now = Sdl.Ticks();
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                if (SdlEvent.IsQuit()) { h.Quit(); }
+                if (ty == SdlEventType.KeyDown()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == 68) { h.ToggleFullscreen(); }
+                    else if (!SdlEvent.IsRepeat()) { g.OnKey(sc, now); }
+                }
+                if (ty == SdlEventType.MouseMotion()) { g.mouseX = h.MouseX(); g.mouseY = h.MouseY(); }
+                if (ty == SdlEventType.MouseButtonDown()) {
+                    if (SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                        g.mouseX = h.MouseX(); g.mouseY = h.MouseY();
+                        g.OnDown(g.mouseX, g.mouseY, now);
+                    }
+                }
+            }
+            g.Tick(now);
+            g.Render(now);
+            Sdl.Delay(12);
+        }
+        h.Close();
+    }
+}
