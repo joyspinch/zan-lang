@@ -36,6 +36,7 @@ edit it and restart to change settings. Ship it next to the executable.
   "server":   { "host": "127.0.0.1", "port": 8080, "maxBodyMB": 2, "globalLimitPerSec": 0 },
   "database": { "driver": "sqlite", "sqlitePath": "app.db",
                 "host": "127.0.0.1", "port": 3306, "name": "app", "user": "root", "password": "" },
+  "worker":   { "count": 1, "daemon": false },
   "cache":    { "driver": "memory", "redisHost": "127.0.0.1", "redisPort": 6379 }
 }
 ```
@@ -60,6 +61,27 @@ crashing.
 | In-memory views | `framework/View.zan` | templates loaded ONCE at startup |
 | Streaming uploads | `.Upload()` routes | body streamed to disk in 64KB chunks |
 | Validation | `framework/Validate.zan` | Require/MaxLen/IsInt/OneOf + SafeFileName |
+
+## Workers & scaling
+
+Set `worker.count` in `config/app.json`:
+
+- **`count: 1` (default)** — one process running the coroutine event loop. Each
+  connection is handled in its own coroutine, so a single worker already serves
+  thousands of concurrent connections. Best for development: logs stream into
+  the IDE terminal.
+- **`count: N` (Linux/macOS)** — the process binds with `SO_REUSEPORT` and
+  re-launches itself as `N-1` extra worker processes bound to the **same** port;
+  the kernel load-balances accepted connections across all workers, using every
+  CPU core (this is how Workerman/swoole scale). Windows has no `SO_REUSEPORT`
+  load-balancing, so it runs a single process there.
+- **`daemon: true` (Linux)** — detaches from the terminal (`setsid`) and runs in
+  the background.
+
+Restart-on-crash is delegated to the process supervisor (systemd
+`Restart=always`, Docker `restart: unless-stopped`, Kubernetes), the standard
+way to supervise horizontally scaled services. `main.zan` boots via
+`Server.Run(app)` (see `src/framework/Server.zan`).
 
 ## Run
 
