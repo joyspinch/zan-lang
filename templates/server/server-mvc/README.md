@@ -138,6 +138,23 @@ zanc src/main.zan src/**/*.zan --stdlib-path <stdlib> -o app.exe
 - `GET /api/me` — requires `Authorization: Bearer <token>` or session cookie
 - `POST /upload` — streaming upload
 
+## Database & ORM (FreeSQL-style, bidirectional)
+
+`System.Data.Orm.Model` maps both directions:
+
+- **Model -> table** (code first): `Model.Define("users").Column(...).CreateTable(db)`
+  (see `src/model/User.zan`).
+- **Table -> model** (database first): `Model.FromTable(db, "users")` reflects an
+  existing table's schema (SQLite `PRAGMA table_info`, MySQL/MariaDB
+  `SHOW COLUMNS`, otherwise the ANSI `information_schema` catalog) into a Model,
+  auto-detecting the provider. `Model.FromTable(db, "users").ToDefineCode()`
+  emits the `Model.Define(...)` source to scaffold a model file from a table.
+
+```
+Model users = Model.FromTable(Db.Conn(), "users");   // reflect schema
+Console.WriteLine(users.ToDefineCode());               // print model source
+```
+
 ## Template syntax (views/*.html)
 
 ```

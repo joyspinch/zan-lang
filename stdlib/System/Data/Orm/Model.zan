@@ -216,6 +216,198 @@ class Model {
     string GetPrimaryKey() {
         return this.primaryKey;
     }
+
+    // ===== Reverse mapping: build a Model FROM an existing table =====
+    // Complements CreateTable() (model -> table) with table -> model, the
+    // FreeSQL-style "database first" direction. Introspection SQL is chosen by
+    // the connection's provider; the raw DB column type is preserved verbatim.
+
+    /// <summary>Number of columns defined on this model.</summary>
+    int ColumnCount() { return this.columnNames.Count; }
+
+    /// <summary>Column name at index i.</summary>
+    string ColumnNameAt(int i) { return this.columnNames[i]; }
+
+    /// <summary>Column type (with any NOT NULL / PRIMARY KEY suffix) at index i.</summary>
+    string ColumnTypeAt(int i) { return this.columnTypes[i]; }
+
+    static bool EqIgnoreCase(string a, string b) {
+        if (a.Length != b.Length) { return false; }
+        int i = 0;
+        while (i < a.Length) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+            if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+            if (ca != cb) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static int ColIndex(DbResult r, string name) {
+        List<string> cols = r.GetColumnNames();
+        int i = 0;
+        while (i < cols.Count) {
+            if (Model.EqIgnoreCase(cols[i], name)) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static void FillFromSqlite(Model m, DbConnection db, string t) {
+        DbResult r = db.Query("PRAGMA table_info(" + t + ")");
+        if (r == null) { return; }
+        int ni = Model.ColIndex(r, "name");
+        int ti = Model.ColIndex(r, "type");
+        int nn = Model.ColIndex(r, "notnull");
+        int pk = Model.ColIndex(r, "pk");
+        int row = 0;
+        while (row < r.RowCount()) {
+            string name = r.GetString(row, ni);
+            string type = r.GetString(row, ti);
+            bool isPk = pk >= 0 && r.GetString(row, pk) != "0"
+                && r.GetString(row, pk) != "";
+            bool notNull = nn >= 0 && r.GetString(row, nn) == "1";
+            m.AddIntrospected(name, type, isPk, notNull);
+            row = row + 1;
+        }
+    }
+
+    static void FillFromMysql(Model m, DbConnection db, string t) {
+        DbResult r = db.Query("SHOW COLUMNS FROM " + t);
+        if (r == null) { return; }
+        int ni = Model.ColIndex(r, "Field");
+        int ti = Model.ColIndex(r, "Type");
+        int nu = Model.ColIndex(r, "Null");
+        int ky = Model.ColIndex(r, "Key");
+        int row = 0;
+        while (row < r.RowCount()) {
+            string name = r.GetString(row, ni);
+            string type = r.GetString(row, ti);
+            bool isPk = ky >= 0 && r.GetString(row, ky) == "PRI";
+            bool notNull = nu >= 0 && Model.EqIgnoreCase(r.GetString(row, nu), "NO");
+            m.AddIntrospected(name, type, isPk, notNull);
+            row = row + 1;
+        }
+    }
+
+    static void FillFromInformationSchema(Model m, DbConnection db, string t) {
+        DbResult r = db.Query("SELECT column_name, data_type, is_nullable "
+            + "FROM information_schema.columns WHERE table_name = '" + t
+            + "' ORDER BY ordinal_position");
+        if (r == null) { return; }
+        int ni = Model.ColIndex(r, "column_name");
+        int ti = Model.ColIndex(r, "data_type");
+        int nu = Model.ColIndex(r, "is_nullable");
+        // Best-effort primary-key column (ANSI catalog; PG / SQL Server).
+        string pkCol = Model.PrimaryKeyFromCatalog(db, t);
+        int row = 0;
+        while (row < r.RowCount()) {
+            string name = r.GetString(row, ni);
+            string type = r.GetString(row, ti);
+            bool isPk = pkCol.Length > 0 && Model.EqIgnoreCase(name, pkCol);
+            bool notNull = nu >= 0 && Model.EqIgnoreCase(r.GetString(row, nu), "NO");
+            m.AddIntrospected(name, type, isPk, notNull);
+            row = row + 1;
+        }
+    }
+
+    static string PrimaryKeyFromCatalog(DbConnection db, string t) {
+        DbResult r = db.Query("SELECT kcu.column_name "
+            + "FROM information_schema.table_constraints tc "
+            + "JOIN information_schema.key_column_usage kcu "
+            + "ON tc.constraint_name = kcu.constraint_name "
+            + "WHERE tc.table_name = '" + t
+            + "' AND tc.constraint_type = 'PRIMARY KEY'");
+        if (r == null) { return ""; }
+        if (r.RowCount() == 0) { return ""; }
+        return r.GetString(0, 0);
+    }
+
+    void AddIntrospected(string name, string type, bool isPk, bool notNull) {
+        this.columnNames.Add(name);
+        if (isPk) {
+            this.columnTypes.Add(type + " PRIMARY KEY");
+            this.primaryKey = name;
+        } else if (notNull) {
+            this.columnTypes.Add(type + " NOT NULL");
+        } else {
+            this.columnTypes.Add(type);
+        }
+    }
+
+    /// <summary>Builds a Model by reflecting an existing table's schema (the
+    /// "database first" direction). Provider is auto-detected: SQLite uses
+    /// PRAGMA table_info, MySQL/MariaDB use SHOW COLUMNS, and everything else
+    /// falls back to the ANSI information_schema catalog. The raw DB column type
+    /// is preserved so a subsequent CreateTable() round-trips.</summary>
+    static Model FromTable(DbConnection db, string tableName) {
+        Model m = new Model(tableName);
+        if (db == null) { return m; }
+        int p = db.GetProvider();
+        if (p == DbProvider.SQLite) {
+            Model.FillFromSqlite(m, db, tableName);
+        } else if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            Model.FillFromMysql(m, db, tableName);
+        } else {
+            Model.FillFromInformationSchema(m, db, tableName);
+        }
+        return m;
+    }
+
+    static string StripMods(string type) {
+        string t = type;
+        int at = Model.IndexOfSub(t, " PRIMARY KEY");
+        if (at >= 0) { t = t.Substring(0, at); }
+        at = Model.IndexOfSub(t, " NOT NULL");
+        if (at >= 0) { t = t.Substring(0, at); }
+        at = Model.IndexOfSub(t, " UNIQUE");
+        if (at >= 0) { t = t.Substring(0, at); }
+        return t;
+    }
+
+    static int IndexOfSub(string s, string sub) {
+        int n = s.Length;
+        int m = sub.Length;
+        if (m == 0) { return 0; }
+        int i = 0;
+        while (i + m <= n) {
+            if (s.Substring(i, m) == sub) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// <summary>Emits Zan source that reconstructs this model as a
+    /// Model.Define(...) fluent chain -- handy for scaffolding a model file
+    /// from an existing table (`FromTable(...).ToDefineCode()`).</summary>
+    string ToDefineCode() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("Model.Define(\"");
+        sb.Append(this.tableName);
+        sb.Append("\")");
+        int i = 0;
+        while (i < this.columnNames.Count) {
+            string nm = this.columnNames[i];
+            string ty = this.columnTypes[i];
+            string bt = Model.StripMods(ty);
+            if (nm == this.primaryKey) {
+                sb.Append("\n    .Column(\"");
+                sb.Append(nm); sb.Append("\", \""); sb.Append(bt);
+                sb.Append("\", true)");
+            } else if (Model.IndexOfSub(ty, " NOT NULL") >= 0) {
+                sb.Append("\n    .ColumnNotNull(\"");
+                sb.Append(nm); sb.Append("\", \""); sb.Append(bt); sb.Append("\")");
+            } else {
+                sb.Append("\n    .Column(\"");
+                sb.Append(nm); sb.Append("\", \""); sb.Append(bt); sb.Append("\")");
+            }
+            i = i + 1;
+        }
+        sb.Append(";");
+        return sb.ToString();
+    }
 }
 
 /// <summary>
