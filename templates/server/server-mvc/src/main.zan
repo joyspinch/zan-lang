@@ -1,32 +1,39 @@
 using System;
 using ZanWeb;
 
-// {{NAME}} -- ZanWeb enterprise web application.
+// {{NAME}} -- ZanWeb enterprise web application (layered).
 //
-// Modeled on the swoole/ZxPHP framework: high-performance routing,
-// rate limiting, auth guards, lifecycle hooks and an in-memory template
-// engine -- but with compile-time typed hooks instead of runtime include.
+// main.zan only bootstraps the server and wires routes. Request handling lives
+// in controllers (src/controller), data access in models (src/model), and the
+// cross-cutting plumbing in the framework (src/framework). Runtime settings are
+// read from config/app.json and are NOT compiled into the binary -- edit the
+// file and restart to change host / port / limits / database / cache.
 class Program {
-    static WebApp app;
-
     static void Main() {
-        app = WebApp.Create("127.0.0.1", 8080);
-        app.Views("views");            // loaded into memory ONCE at startup
-        app.MaxBody(2 * 1024 * 1024);  // 413 above 2MB -- uploads can't blow the heap
-        app.GlobalLimit(0);            // e.g. 5000 = max 5000 req/s in total
+        Config.Load("config/app.json");
+
+        WebApp app = WebApp.Create(
+            Config.Str("server", "host", "127.0.0.1"),
+            Config.Int("server", "port", 8080));
+        App.Use(app);
+
+        app.Views("views");                                        // loaded ONCE at startup
+        app.MaxBody(Config.Int("server", "maxBodyMB", 2) * 1024 * 1024);
+        app.GlobalLimit(Config.Int("server", "globalLimitPerSec", 0));
 
         // ---- lifecycle hooks (compile-time typed, run in order) ----
         app.Before(Program.AccessLog);
         app.After(Program.Metrics);
 
-        // ---- routes ----
-        app.Get("/", Program.Home);
-        app.Get("/user/{id}", Program.UserShow);
-        app.Get("/api/status", Program.ApiStatus);
-        app.Post("/api/echo", Program.ApiEcho).Limit(100);   // 100 req/s per route
-        app.Post("/api/login", Program.ApiLogin);
-        app.Get("/api/me", Program.ApiMe).Auth();            // requires session
-        app.Post("/upload", Program.Upload).Upload();        // streamed to disk
+        // ---- routes: thin wiring, controller actions do the work ----
+        app.Get("/", HomeController.Index);
+        app.Get("/users", UserController.Index);                   // ORM + cache demo
+        app.Get("/user/{id}", UserController.Show);                // route param demo
+        app.Get("/api/status", ApiController.Status);
+        app.Post("/api/echo", ApiController.Echo).Limit(100);      // 100 req/s per route
+        app.Post("/api/login", ApiController.Login);
+        app.Get("/api/me", ApiController.Me).Auth();               // requires session
+        app.Post("/upload", ApiController.Upload).Upload();        // streamed to disk
 
         int r = await app.Start();
     }
@@ -43,85 +50,5 @@ class Program {
             Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
                 + Convert.ToString(elapsedMs) + "ms");
         }
-    }
-
-    // ---- handlers ----
-
-    static void Home(HttpContext ctx) {
-        ViewData d = ViewData.Create();
-        d.Set("title", "{{NAME}}");
-        d.Set("message", "Rendered from the in-memory template cache.");
-        List<StrMap> items = d.AddList("features");
-        items.Add(Program.Feature("Routing", "static-first router with {param} segments"));
-        items.Add(Program.Feature("Rate limiting", "global + per-route fixed windows"));
-        items.Add(Program.Feature("Auth", "bearer token / session cookie guards"));
-        items.Add(Program.Feature("Views", "templates loaded into memory at startup"));
-        ctx.Html(app.RenderPage("index", d));
-    }
-
-    static StrMap Feature(string name, string desc) {
-        StrMap m = StrMap.Create();
-        m.Set("name", name);
-        m.Set("desc", desc);
-        return m;
-    }
-
-    static void UserShow(HttpContext ctx) {
-        string id = ctx.Param("id");
-        ctx.Api("0000", "ok", "{\"id\":\"" + JsonStr.Escape(id) + "\",\"name\":\"user-"
-            + JsonStr.Escape(id) + "\"}");
-    }
-
-    static void ApiStatus(HttpContext ctx) {
-        ctx.Json(app.StatusJson());
-    }
-
-    static void ApiEcho(HttpContext ctx) {
-        string msg = ctx.Form("msg");
-        if (msg.Length == 0) { msg = ctx.Body(); }
-        ctx.Api("0000", "ok", "{\"echo\":\"" + JsonStr.Escape(msg) + "\"}");
-    }
-
-    static void ApiLogin(HttpContext ctx) {
-        Validator v = Validator.Create();
-        v.Require(ctx.Form("user"), "user");
-        v.MaxLen(ctx.Form("user"), 32, "user");
-        v.Require(ctx.Form("pass"), "pass");
-        v.MaxLen(ctx.Form("pass"), 64, "pass");
-        if (!v.Ok()) {
-            ctx.Status(422, "Unprocessable Entity");
-            ctx.Api("1003", "validation failed", v.ErrorsJson());
-            return;
-        }
-        string user = ctx.Form("user");
-        string pass = ctx.Form("pass");
-        // Demo credential check -- replace with your user store.
-        if (user == "admin" && pass == "admin") {
-            string token = app.sessions.Issue("1", WebApp.NowSeconds());
-            ctx.SetCookie("zsession", token, 86400);
-            ctx.Api("0000", "ok", "{\"token\":\"" + token + "\"}");
-        } else {
-            ctx.Status(401, "Unauthorized");
-            ctx.Api("1001", "bad credentials", "null");
-        }
-    }
-
-    static void Upload(HttpContext ctx) {
-        // Large bodies are streamed to disk in 64KB chunks (binary-safe);
-        // memory stays flat even for multi-hundred-MB uploads.
-        string path = ctx.state.Get("upload_path");
-        string size = ctx.state.Get("upload_size");
-        if (path.Length == 0) {
-            ctx.Status(400, "Bad Request");
-            ctx.Api("1002", "no upload body", "null");
-            return;
-        }
-        ctx.Api("0000", "ok", "{\"path\":\"" + JsonStr.Escape(path)
-            + "\",\"bytes\":" + size + "}");
-    }
-
-    static void ApiMe(HttpContext ctx) {
-        string uid = ctx.state.Get("uid");
-        ctx.Api("0000", "ok", "{\"uid\":\"" + uid + "\"}");
     }
 }

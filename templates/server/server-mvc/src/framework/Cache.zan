@@ -1,0 +1,76 @@
+using System;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Process-local cache with optional TTL. This is the zero-dependency default
+/// wired into the app. For a shared/distributed cache, point the [cache] section
+/// at Redis and use System.Data.Redis (RESP client) from an async worker; the
+/// Redis client is async, so it belongs on the coroutine path rather than in a
+/// synchronous request handler.
+/// </summary>
+class Cache {
+    static StrMap store = StrMap.Create();
+    static StrMap expiry = StrMap.Create();   // key -> expiry epoch seconds ("0" = never)
+
+    static int Digit(string ch) {
+        string d = "0123456789";
+        int i = 0;
+        while (i < 10) {
+            if (d.Substring(i, 1) == ch) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static int ToInt(string s) {
+        int v = 0;
+        int i = 0;
+        while (i < s.Length) {
+            int d = Cache.Digit(s.Substring(i, 1));
+            if (d < 0) { break; }
+            v = v * 10 + d;
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static bool Alive(string key) {
+        if (!store.Has(key)) { return false; }
+        string e = expiry.GetOr(key, "0");
+        if (e == "0") { return true; }
+        if (WebApp.NowSeconds() >= Cache.ToInt(e)) {
+            store.Set(key, "");
+            expiry.Set(key, "0");
+            return false;
+        }
+        return true;
+    }
+
+    static bool Has(string key) { return Cache.Alive(key); }
+
+    static string Get(string key) {
+        if (!Cache.Alive(key)) { return ""; }
+        return store.Get(key);
+    }
+
+    static string GetOr(string key, string dflt) {
+        if (!Cache.Alive(key)) { return dflt; }
+        return store.Get(key);
+    }
+
+    static void Set(string key, string val) {
+        store.Set(key, val);
+        expiry.Set(key, "0");
+    }
+
+    static void SetTtl(string key, string val, int seconds) {
+        store.Set(key, val);
+        expiry.Set(key, Convert.ToString(WebApp.NowSeconds() + seconds));
+    }
+
+    static void Del(string key) {
+        store.Set(key, "");
+        expiry.Set(key, "0");
+    }
+}
