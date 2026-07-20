@@ -11,8 +11,6 @@ namespace Gui;
 /// WinForms / element-plus form designers, but without touching coordinates.
 ///
 /// Surface:
-///   * a toolbar (JSON drawer / Preview / Clear, plus move-up /
-///     move-down / delete acting on the selected field),
 ///   * a categorised field palette on the left (click a type to append a row),
 ///   * the vertical form preview in the centre (label + required star + a preview
 ///     of each field control; click a row to select it),
@@ -31,6 +29,10 @@ namespace Gui;
 ///   d.Seed(app);                      // optional sample fields
 ///   d.Render(app, x, y, w, h);        // each frame
 class Designer {
+    // 0 = English, 1 = 简体中文. Set by the host (e.g. the IDE) so the designer
+    // chrome follows the host UI language; read via T(en, zh).
+    static int lang;
+
     List<FormField> fields;
     FormField sel;
     FormField selPrev;
@@ -72,6 +74,10 @@ class Designer {
     int dropY;        // y of the insertion indicator
     int dragMouseX;
     int dragMouseY;
+    // Container currently under the drag pointer (recomputed every frame while
+    // dragging); the drop nests into it instead of the top-level form.
+    FormField dropContainer;
+    int dragUserComp; // index of the user component being dragged, else -1
 
     // Palette hover (for the tooltip drawn on top after the panels).
     int hoverFt;
@@ -93,6 +99,8 @@ class Designer {
     Input customInput;
     SignalString optSig;
     Input optInput;
+    SignalString optFieldSig;   // data field key for table columns
+    Input optFieldInput;
     SignalString evtSig;
     Input evtInput;
     string evtEditing;   // which event of the selected field the handler box edits
@@ -121,6 +129,13 @@ class Designer {
     int inspScroll;
     int inspContentH;
 
+    // Bindable variables scanned from the paired code-behind file (host IDE
+    // supplies them via SetBindVars). The inspector's bind-path row offers
+    // them in a small picker so a component can be two-way bound to a code
+    // variable without typing its name.
+    List<string> bindVars;
+    bool bindPickOpen;
+
     // Editable JSON drawer: the single source-of-truth text box for the design
     // (replaces the old opaque Save/Load/Export buttons). Editing it and
     // pressing Apply rebuilds the design; opening it dumps the current design.
@@ -130,13 +145,26 @@ class Designer {
     bool evtRootPrev;              // last event-tab target was the window root
     FormField evtSelPrev;         // last event-tab component target
 
+    // Project user components: designs saved as reusable components (the host
+    // IDE persists them as components/*.zcomp and feeds them back in). The
+    // save request is raised by the inspector and consumed by the host.
+    List<string> userCompNames;
+    List<string> userCompJsons;
+    bool saveCompRequested;
+
+    /// Picks the string for the current UI language.
+    static string T(string en, string zh) {
+        if (Designer.lang == 1) { return zh; }
+        return en;
+    }
+
     static Designer Create() {
         Designer d = new Designer();
         d.fields = new List<FormField>();
         d.sel = null;
         d.selPrev = null;
         d.doc = "";
-        d.msg = "click a field type on the left to add a row";
+        d.msg = Designer.T("click a field type on the left to add a row", "点击左侧组件类型以添加一行");
         d.inspTab = 0;
         d.preview = false;
         d.seq = 0;
@@ -160,32 +188,36 @@ class Designer {
         d.dropY = 0;
         d.dragMouseX = 0;
         d.dragMouseY = 0;
+        d.dropContainer = null;
+        d.dragUserComp = -1;
         d.hoverFt = -1;
         d.hoverX = 0;
         d.hoverY = 0;
         d.labelSig = SignalString.Create("");
-        d.labelInput = Input.Bind(d.labelSig, "label");
+        d.labelInput = Input.Bind(d.labelSig, Designer.T("label", "标签"));
         d.nameSig = SignalString.Create("");
-        d.nameInput = Input.Bind(d.nameSig, "field name");
+        d.nameInput = Input.Bind(d.nameSig, Designer.T("field name", "字段名"));
         d.phSig = SignalString.Create("");
-        d.phInput = Input.Bind(d.phSig, "placeholder");
+        d.phInput = Input.Bind(d.phSig, Designer.T("placeholder", "占位文本"));
         d.bindSig = SignalString.Create("");
         d.bindInput = Input.Bind(d.bindSig, "model.path");
         d.bindPropSig = SignalString.Create("");
         d.bindPropInput = Input.Bind(d.bindPropSig, "value");
         d.customSig = SignalString.Create("");
-        d.customInput = Input.Bind(d.customSig, "component kind");
+        d.customInput = Input.Bind(d.customSig, Designer.T("component kind", "组件类型"));
         d.optSig = SignalString.Create("");
-        d.optInput = Input.Bind(d.optSig, "new option");
+        d.optInput = Input.Bind(d.optSig, Designer.T("new option", "新选项"));
+        d.optFieldSig = SignalString.Create("");
+        d.optFieldInput = Input.Bind(d.optFieldSig, Designer.T("field", "字段"));
         d.evtSig = SignalString.Create("");
-        d.evtInput = Input.Bind(d.evtSig, "handler");
+        d.evtInput = Input.Bind(d.evtSig, Designer.T("handler", "处理器"));
         d.evtEditing = "";
-        d.formNameSig = SignalString.Create("My form");
-        d.formNameInput = Input.Bind(d.formNameSig, "form name");
+        d.formNameSig = SignalString.Create(Designer.T("My form", "我的表单"));
+        d.formNameInput = Input.Bind(d.formNameSig, Designer.T("form name", "表单名称"));
         d.submitSig = SignalString.Create("");
-        d.submitInput = Input.Bind(d.submitSig, "handler");
-        d.winTitleSig = SignalString.Create("Tool Window");
-        d.winTitleInput = Input.Bind(d.winTitleSig, "window title");
+        d.submitInput = Input.Bind(d.submitSig, Designer.T("handler", "处理器"));
+        d.winTitleSig = SignalString.Create(Designer.T("Tool Window", "工具窗口"));
+        d.winTitleInput = Input.Bind(d.winTitleSig, Designer.T("window title", "窗口标题"));
         d.winW = 480;
         d.winH = 360;
         d.winResizable = true;
@@ -196,14 +228,19 @@ class Designer {
         d.winEvtHandlers = new List<string>();
         d.winEvtEditing = "";
         d.filterSig = SignalString.Create("");
-        d.filterInput = Input.Bind(d.filterSig, "filter…");
+        d.filterInput = Input.Bind(d.filterSig, Designer.T("filter…", "筛选…"));
         d.inspScroll = 0;
         d.inspContentH = 0;
+        d.bindVars = new List<string>();
+        d.bindPickOpen = false;
         d.evtRootPrev = false;
         d.evtSelPrev = null;
         d.jsonSig = SignalString.Create("");
-        d.jsonArea = TextArea.Bind(d.jsonSig, "paste or edit the design JSON, then Apply");
+        d.jsonArea = TextArea.Bind(d.jsonSig, Designer.T("paste or edit the design JSON, then Apply", "粘贴或编辑设计 JSON，然后点击应用"));
         d.jsonOpen = false;
+        d.userCompNames = new List<string>();
+        d.userCompJsons = new List<string>();
+        d.saveCompRequested = false;
         return d;
     }
 
@@ -257,6 +294,15 @@ class Designer {
     void AddField(int ftype) {
         FormField f = FormField.New(ftype, seq);
         seq = seq + 1;
+        if (FormField.IsNonVisualOf(ftype)) {
+            // Non-visual components always live at the top level: the tray
+            // below the canvas shows them, never a container.
+            fields.Add(f);
+            sel = f;
+            inspTab = 0;
+            msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+            return;
+        }
         if (activeContainer != null) {
             f.childTab = 0;
             if (activeContainer.ftype == 36) { f.childTab = activeContainer.uiState.Get(); }
@@ -267,7 +313,59 @@ class Designer {
         sel = f;
         inspTab = 0;
         if (f.IsContainer()) { activeContainer = f; }
-        msg = "added " + FormField.TypeName(ftype);
+        msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
+    }
+
+    /// The host IDE supplies the bindable variable names scanned from the
+    /// form's paired code-behind file (see the inspector's bind-path picker).
+    void SetBindVars(List<string> vars) {
+        bindVars = vars;
+        bindPickOpen = false;
+    }
+
+    /// The host IDE supplies the project's saved user components (parallel
+    /// name / design-JSON lists, from components/*.zcomp).
+    void SetUserComponents(List<string> names, List<string> jsons) {
+        userCompNames = names;
+        userCompJsons = jsons;
+    }
+
+    /// True exactly once after the user asked to save the current design as a
+    /// reusable component; the host IDE persists it and reloads the list.
+    bool ConsumeSaveComponent() {
+        if (saveCompRequested) { saveCompRequested = false; return true; }
+        return false;
+    }
+
+    /// Instantiates a saved user component onto the form: a single-container
+    /// design is inserted as itself, anything else is wrapped in a Card named
+    /// after the component (WinForms UserControl style).
+    void AddUserComponent(int k) {
+        if (k < 0 || k >= userCompJsons.Count) { return; }
+        List<FormField> parsed = ParseComponentFields(userCompJsons[k]);
+        FormField f;
+        if (parsed.Count == 1 && parsed[0].IsContainer()) {
+            f = parsed[0];
+        } else {
+            f = FormField.New(18, seq);
+            f.label = userCompNames[k];
+            f.kids = parsed;
+            int ci = 0;
+            while (ci < parsed.Count) { parsed[ci].childTab = 0; ci = ci + 1; }
+        }
+        f.fname = userCompNames[k] + Convert.ToString(seq);
+        f.name = f.fname;
+        seq = seq + 1;
+        if (activeContainer != null && activeContainer != f) {
+            f.childTab = 0;
+            if (activeContainer.ftype == 36) { f.childTab = activeContainer.uiState.Get(); }
+            activeContainer.kids.Add(f);
+        } else {
+            fields.Add(f);
+        }
+        sel = f;
+        inspTab = 0;
+        msg = Designer.T("added ", "已添加 ") + userCompNames[k];
     }
 
     /// Adds a discovered project custom component (by its CustomComponents tag)
@@ -284,7 +382,19 @@ class Designer {
         }
         sel = f;
         inspTab = 0;
-        msg = "added " + kind;
+        msg = Designer.T("added ", "已添加 ") + kind;
+    }
+
+    /// True when `inner` lives anywhere inside `owner`'s subtree.
+    bool InSubtree(FormField owner, FormField inner) {
+        if (!owner.IsContainer()) { return false; }
+        if (ContainsRef(owner.kids, inner)) { return true; }
+        int i = 0;
+        while (i < owner.kids.Count) {
+            if (InSubtree(owner.kids[i], inner)) { return true; }
+            i = i + 1;
+        }
+        return false;
     }
 
     bool ContainsRef(List<FormField> lst, FormField target) {
@@ -408,28 +518,41 @@ class Designer {
         sel = null;
         selPrev = null;
         activeContainer = null;
-        msg = "deleted field";
+        msg = Designer.T("deleted field", "已删除组件");
     }
 
     // --- Top-level layout ----------------------------------------------------
 
     void Render(App app, int x, int y, int w, int h) {
+        // The designer builds its buttons/segments/steppers immediate-mode
+        // every frame, but the host (the IDE) is retained-style and never
+        // rewinds the process-wide WidgetId counter. Pin a fixed high
+        // baseline for the designer's frame so every control gets the SAME
+        // id each frame -- hover/press/click are keyed by id and resolved
+        // against the previous frame's hit regions, so drifting ids made the
+        // whole inspector unclickable. Restore the counter afterwards (same
+        // pattern as FilePicker's dialog, which pins 900000).
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(800000);
+        RenderPinned(app, x, y, w, h);
+        WidgetId.SetSeq(savedSeq);
+    }
+
+    void RenderPinned(App app, int x, int y, int w, int h) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int barH = app.Scale(30);
         int statusH = app.Scale(20);
         int top = y + app.Scale(6);
-        int bodyY = top + barH + app.Scale(8);
+        int bodyY = top;
         int bot = y + h - statusH - app.Scale(6);
 
         int palX = x + app.Scale(12);
         int palW = app.Scale(176);
         int inspW = app.Scale(288);
         int canX = palX + palW + app.Scale(12);
+        // The canvas fills the whole middle column (通栏) between the palette
+        // and the inspector.
         int canW = w - palW - inspW - app.Scale(60);
-        // Fill the middle (通栏) but keep a ceiling so the inspector always
-        // stays on-screen on very wide windows.
-        if (canW > app.Scale(860)) { canW = app.Scale(860); }
         if (canW < app.Scale(240)) { canW = app.Scale(240); }
         int inspX = canX + canW + app.Scale(12);
         int bodyH = bot - bodyY;
@@ -445,11 +568,22 @@ class Designer {
         }
 
         hoverFt = -1;
-        RenderToolbar(app, c, t, canX, top, canW, barH);
+        // Delete removes the selected component; ignored while a text input
+        // has keyboard focus so typing is unaffected.
+        if (!preview && ek == 4 && app.window.EventKeyCode() == 46
+            && sel != null && app.focus.focusedId < 0) {
+            DeleteSel();
+            app.RequestRedraw();
+        }
         if (jsonOpen) {
             RenderJsonPanel(app, c, t, canX, bodyY, canW, bodyH);
         } else {
-            RenderForm(app, c, t, canX, bodyY, canW, bodyH);
+            // WinForms-style component tray below the canvas: non-visual
+            // components (context menus, layers, timers, popups...) live
+            // there instead of occupying space inside the designed window.
+            int trayH = app.Scale(46);
+            RenderForm(app, c, t, canX, bodyY, canW, bodyH - trayH - app.Scale(8));
+            RenderTray(app, c, t, canX, bodyY + bodyH - trayH, canW, trayH);
         }
         RenderPalette(app, c, t, palX, bodyY, palW, bodyH);
         RenderInspector(app, c, t, inspX, bodyY, inspW, bodyH);
@@ -461,6 +595,9 @@ class Designer {
             dragFromPalette = false;
             dragMoved = false;
             dragIndex = -1;
+            dragUserComp = -1;
+            dropContainer = null;
+            app.RequestRedraw();
         }
 
         // Palette tooltip (name + description), drawn on top of every panel.
@@ -477,6 +614,10 @@ class Designer {
                 gkind = fields[dragIndex].ftype;
             }
             string gl = FormField.TypeName(gkind);
+            if (gkind == 200 && dragUserComp >= 0 && dragUserComp < userCompNames.Count) {
+                gl = userCompNames[dragUserComp];
+                gkind = 18;
+            }
             int gh = app.Scale(26);
             int icoW = app.Scale(22);
             int gw = icoW + Canvas.MeasureText(gl, t.fontSizeSmall) + app.Scale(16);
@@ -503,64 +644,25 @@ class Designer {
         int ix = x + pad;
         int iw = w - pad * 2;
         int iy = y + app.Scale(10);
-        c.DrawText(ix, iy, "DESIGN JSON  ·  edit then Apply", t.textTertiary, fs);
+        c.DrawText(ix, iy, Designer.T("DESIGN JSON  ·  edit then Apply", "设计 JSON  ·  编辑后点击应用"), t.textTertiary, fs);
         iy = iy + app.Scale(24);
         int btnH = app.Scale(30);
         int taH = y + h - iy - btnH - app.Scale(20);
         if (taH < app.Scale(80)) { taH = app.Scale(80); }
         jsonArea.Render(app, ix, iy, iw, taH);
         int by = iy + taH + app.Scale(8);
-        int applyId = Button.Primary("Apply").Render(app, ix, by, app.Scale(80));
+        int applyId = Button.Primary(Designer.T("Apply", "应用")).Render(app, ix, by, app.Scale(80));
         if (Button.WasClicked(app, applyId)) {
             LoadJson(jsonSig.Get());
-            msg = "loaded " + Convert.ToString(fields.Count) + " components from JSON";
+            msg = Designer.T("loaded ", "已从 JSON 加载 ") + Convert.ToString(fields.Count) + Designer.T(" components from JSON", " 个组件");
         }
-        int dumpId = Button.Create("Regenerate").Render(app, ix + app.Scale(88), by, app.Scale(104));
+        int dumpId = Button.Create(Designer.T("Regenerate", "重新生成")).Render(app, ix + app.Scale(88), by, app.Scale(104));
         if (Button.WasClicked(app, dumpId)) {
             jsonArea.SetText(SaveJson());
-            msg = "regenerated JSON from the current design";
+            msg = Designer.T("regenerated JSON from the current design", "已根据当前设计重新生成 JSON");
         }
-        int closeId = Button.Create("Close").Render(app, ix + iw - app.Scale(70), by, app.Scale(70));
+        int closeId = Button.Create(Designer.T("Close", "关闭")).Render(app, ix + iw - app.Scale(70), by, app.Scale(70));
         if (Button.WasClicked(app, closeId)) { jsonOpen = false; }
-    }
-
-    void RenderToolbar(App app, Canvas c, Theme t, int tx, int ty, int tw, int th) {
-        int bw = app.Scale(50);
-        int g = app.Scale(6);
-        int bx = tx;
-        // Single JSON drawer toggle. Opening it dumps the current design so the
-        // box always reflects what's on the canvas; editing + Apply loads it.
-        int jType = 0;
-        if (jsonOpen) { jType = 3; }
-        int jId = Button.Typed("JSON", jType).Render(app, bx, ty, bw + app.Scale(4));
-        if (Button.WasClicked(app, jId)) {
-            jsonOpen = !jsonOpen;
-            if (jsonOpen) { jsonArea.SetText(SaveJson()); }
-        }
-        bx = bx + bw + app.Scale(4) + g;
-        int pType = 0;
-        if (preview) { pType = 3; }
-        int pId = Button.Typed("Preview", pType).Render(app, bx, ty, bw + app.Scale(12));
-        if (Button.WasClicked(app, pId)) {
-            preview = !preview;
-            if (preview) { sel = null; }
-        }
-        bx = bx + bw + app.Scale(12) + g;
-        int clId = Button.Create("Clear").Render(app, bx, ty, bw);
-        if (Button.WasClicked(app, clId)) {
-            fields = new List<FormField>();
-            sel = null; selPrev = null; activeContainer = null;
-            msg = "cleared form";
-        }
-        bx = bx + bw + g + app.Scale(10);
-        int uId = Button.Create("Up").Render(app, bx, ty, app.Scale(36));
-        if (Button.WasClicked(app, uId)) { MoveSel(-1); }
-        bx = bx + app.Scale(36) + g;
-        int dnId = Button.Create("Down").Render(app, bx, ty, app.Scale(46));
-        if (Button.WasClicked(app, dnId)) { MoveSel(1); }
-        bx = bx + app.Scale(46) + g;
-        int delId = Button.Typed("Del", 5).Render(app, bx, ty, app.Scale(40));
-        if (Button.WasClicked(app, delId)) { DeleteSel(); }
     }
 
     // --- Field palette -------------------------------------------------------
@@ -606,19 +708,21 @@ class Designer {
             iy = PaletteFiltered(app, c, t, q, ix, iy, iw);
         } else {
             if (PalVisible(app, iy, app.Scale(14))) {
-                c.DrawText(ix, iy, "COMPONENTS", t.textTertiary, fs);
+                c.DrawText(ix, iy, Designer.T("COMPONENTS", "组件"), t.textTertiary, fs);
             }
             iy = iy + app.Scale(20);
-            iy = PaletteGroup(app, c, t, "Basic", 0, 8, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "Advanced", 8, 15, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "Layout", 15, 18, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "Display", 18, 28, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "Feedback", 28, 34, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "Navigation", 34, 40, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "Display+", 40, 47, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "Feedback+", 47, 53, ix, iy, iw);
-            iy = PaletteGroup(app, c, t, "More", 53, 55, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Basic", "基础"), 0, 8, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Advanced", "高级"), 8, 15, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Layout", "布局"), 15, 18, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Display", "展示"), 18, 28, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Feedback", "反馈"), 28, 34, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Navigation", "导航"), 34, 40, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Display+", "展示+"), 40, 47, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Feedback+", "反馈+"), 47, 53, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("More", "更多"), 53, 55, ix, iy, iw);
+            iy = PaletteGroup(app, c, t, Designer.T("Non-visual", "功能组件"), 55, 58, ix, iy, iw);
             iy = CustomPaletteGroup(app, c, t, ix, iy, iw);
+            iy = UserPaletteGroup(app, c, t, ix, iy, iw);
         }
         c.PopClip();
 
@@ -641,17 +745,17 @@ class Designer {
         int fs = t.fontSizeSmall;
         List<int> hits = new List<int>();
         int ft = 0;
-        while (ft < 55) {
+        while (ft < 58) {
             if (MatchesFilter(ft, q)) { hits.Add(ft); }
             ft = ft + 1;
         }
         if (PalVisible(app, iy, app.Scale(14))) {
-            c.DrawText(ix, iy, "MATCHES (" + Convert.ToString(hits.Count) + ")", t.textTertiary, fs);
+            c.DrawText(ix, iy, Designer.T("MATCHES (", "匹配 (") + Convert.ToString(hits.Count) + ")", t.textTertiary, fs);
         }
         iy = iy + app.Scale(20);
         if (hits.Count == 0) {
             if (PalVisible(app, iy, app.Scale(16))) {
-                c.DrawText(ix, iy, "No components match.", t.textSecondary, fs);
+                c.DrawText(ix, iy, Designer.T("No components match.", "没有匹配的组件。"), t.textSecondary, fs);
             }
             return iy + app.Scale(24);
         }
@@ -701,7 +805,7 @@ class Designer {
         if (q != "") {
             int m = 0;
             int ft = 0;
-            while (ft < 55) {
+            while (ft < 58) {
                 if (MatchesFilter(ft, q)) { m = m + 1; }
                 ft = ft + 1;
             }
@@ -720,8 +824,14 @@ class Designer {
         h = h + PaletteGroupH(app, 7);   // Display+
         h = h + PaletteGroupH(app, 6);   // Feedback+
         h = h + PaletteGroupH(app, 2);   // More
+        h = h + PaletteGroupH(app, 3);   // Non-visual
         int nc = CustomComponents.Kinds().Count;
         if (nc > 0) { h = h + PaletteGroupH(app, nc); }  // Custom
+        if (userCompNames.Count > 0) {                   // My Components
+            h = h + app.Scale(18)
+                + userCompNames.Count * (app.Scale(28) + app.Scale(6))
+                + app.Scale(10);
+        }
         return h + app.Scale(8);
     }
 
@@ -792,7 +902,7 @@ class Designer {
         if (kinds.Count == 0) { return iy; }
         int fs = t.fontSizeSmall;
         if (PalVisible(app, iy, app.Scale(14))) {
-            c.DrawText(ix, iy, "Custom", t.textSecondary, fs);
+            c.DrawText(ix, iy, Designer.T("Custom", "自定义"), t.textSecondary, fs);
         }
         iy = iy + app.Scale(18);
         int cols = 4;
@@ -831,6 +941,42 @@ class Designer {
         return iy + app.Scale(10);
     }
 
+    /// Palette group for the project's saved user components (windows saved as
+    /// reusable components). One named row per component; click to add, drag to
+    /// drop it onto the form like any built-in.
+    int UserPaletteGroup(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        if (userCompNames.Count == 0) { return iy; }
+        int fs = t.fontSizeSmall;
+        if (PalVisible(app, iy, app.Scale(14))) {
+            c.DrawText(ix, iy, Designer.T("My Components", "我的组件"), t.textSecondary, fs);
+        }
+        iy = iy + app.Scale(18);
+        int rowH2 = app.Scale(28);
+        int ek = app.window.EventKind();
+        int k = 0;
+        while (k < userCompNames.Count) {
+            if (PalVisible(app, iy, rowH2)) {
+                if (!preview && ek == 2 && !dragging
+                    && InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH2)) {
+                    dragging = true;
+                    dragFromPalette = true;
+                    dragMoved = false;
+                    dragKind = 200;
+                    dragUserComp = k;
+                    dragMouseX = app.mouseX;
+                    dragMouseY = app.mouseY;
+                }
+                Button b = Button.WithIcon(userCompNames[k], "layout");
+                b.SetSize(1);
+                int id = b.Render(app, ix, iy, iw);
+                if (Button.WasClicked(app, id) && !dragMoved) { AddUserComponent(k); }
+            }
+            iy = iy + rowH2 + app.Scale(6);
+            k = k + 1;
+        }
+        return iy + app.Scale(10);
+    }
+
     bool InRect(int mx, int my, int x, int y, int w, int h) {
         return mx >= x && mx <= x + w && my >= y && my <= y + h;
     }
@@ -853,13 +999,19 @@ class Designer {
     int FormContentH(App app) {
         int pad = app.Scale(14);
         int h = pad + app.Scale(24) + app.Scale(10);
-        int n = fields.Count;
+        List<int> visIdx = new List<int>();
+        int vf = 0;
+        while (vf < fields.Count) {
+            if (!fields[vf].IsNonVisual()) { visIdx.Add(vf); }
+            vf = vf + 1;
+        }
+        int n = visIdx.Count;
         int i = 0;
         while (i < n) {
             int cols = 0;
             int rowEnd = i;
             while (rowEnd < n) {
-                int sp = ClampSpan(fields[rowEnd].span);
+                int sp = ClampSpan(fields[visIdx[rowEnd]].span);
                 if (rowEnd > i && cols + sp > 24) { break; }
                 cols = cols + sp;
                 rowEnd = rowEnd + 1;
@@ -868,8 +1020,8 @@ class Designer {
             int rowH = 0;
             int k = i;
             while (k < rowEnd) {
-                int hk = FieldHeight(app, fields[k]);
-                if (labelPos == 2 && !fields[k].IsDisplay()) { hk = hk + app.Scale(18); }
+                int hk = FieldHeight(app, fields[visIdx[k]]);
+                if (labelPos == 2 && !fields[visIdx[k]].IsDisplay()) { hk = hk + app.Scale(18); }
                 if (hk > rowH) { rowH = hk; }
                 k = k + 1;
             }
@@ -877,6 +1029,61 @@ class Designer {
             i = rowEnd;
         }
         return h + pad;
+    }
+
+    /// WinForms-style component tray: every non-visual component on the form
+    /// shows as a chip here. Clicking a chip selects it so its properties and
+    /// events edit in the inspector; the selected chip is highlighted.
+    void RenderTray(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(x, y, w, h, app.Scale(6), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        bool overTray = dragging && dragFromPalette
+            && FormField.IsNonVisualOf(dragKind)
+            && InRect(dragMouseX, dragMouseY, x, y, w, h);
+        if (overTray) { c.DrawRect(x, y, w, h, t.primary, 2); }
+        int bx = x + app.Scale(10);
+        int by = y + (h - app.Scale(28)) / 2;
+        bool any = false;
+        int i = 0;
+        while (i < fields.Count) {
+            FormField f = fields[i];
+            if (f.IsNonVisual()) {
+                any = true;
+                string nm = f.fname;
+                if (nm == "") { nm = FormField.TypeName(f.ftype); }
+                int ty = 0;
+                if (!preview && f == sel) { ty = 1; }
+                Button b = Button.IconTextTyped(nm, FieldIcon(f.ftype), ty);
+                b.SetSize(1);
+                int bw = Canvas.MeasureText(nm, fs) + app.Scale(44);
+                int id = b.Render(app, bx, by, bw);
+                if (!preview && Button.WasClicked(app, id)) {
+                    sel = f;
+                    activeContainer = null;
+                    inspTab = 0;
+                    app.RequestRedraw();
+                }
+                bx = bx + bw + app.Scale(8);
+            }
+            i = i + 1;
+        }
+        if (!any) {
+            c.DrawText(bx, y + (h - Canvas.FontHeight(fs)) / 2,
+                Designer.T("Component tray — context menus, layers, timers and other non-visual components land here.",
+                    "组件托盘 —— 右键菜单、Layer、定时器等功能组件会放在这里。"),
+                t.textTertiary, fs);
+        }
+        // Dropping a non-visual palette drag anywhere over the tray adds it.
+        if (overTray && app.window.EventKind() == 3) {
+            activeContainer = null;
+            AddField(dragKind);
+            dragging = false;
+            dragFromPalette = false;
+            dragMoved = false;
+            dropContainer = null;
+            app.RequestRedraw();
+        }
     }
 
     /// Clamp a field's column span into the valid 1..24 grid range.
@@ -888,62 +1095,65 @@ class Designer {
 
     /// One-line description shown in the palette hover tooltip.
     string FieldDesc(int ft) {
-        if (ft == 0) { return "Single-line text input"; }
-        if (ft == 1) { return "Multi-line text area"; }
-        if (ft == 2) { return "Masked password input"; }
-        if (ft == 3) { return "Numeric stepper input"; }
-        if (ft == 4) { return "Single choice from options"; }
-        if (ft == 5) { return "Multiple choice from options"; }
-        if (ft == 6) { return "Dropdown selector"; }
-        if (ft == 7) { return "On / off toggle"; }
-        if (ft == 8) { return "Star rating"; }
-        if (ft == 9) { return "Value slider"; }
-        if (ft == 10) { return "Date picker"; }
-        if (ft == 11) { return "Time picker"; }
-        if (ft == 12) { return "File upload area"; }
-        if (ft == 13) { return "Colour picker"; }
-        if (ft == 14) { return "Rich text editor"; }
-        if (ft == 15) { return "Section heading text"; }
-        if (ft == 16) { return "Static paragraph text"; }
-        if (ft == 17) { return "Horizontal separator"; }
-        if (ft == 18) { return "Content card panel"; }
-        if (ft == 19) { return "Coloured label tag"; }
-        if (ft == 20) { return "Count / status badge"; }
-        if (ft == 21) { return "User avatar circle"; }
-        if (ft == 22) { return "Statistic figure"; }
-        if (ft == 23) { return "Data table with columns"; }
-        if (ft == 24) { return "Vertical timeline"; }
-        if (ft == 25) { return "Tree / hierarchy"; }
-        if (ft == 26) { return "Collapsible panels"; }
-        if (ft == 27) { return "Empty-state placeholder"; }
-        if (ft == 28) { return "Inline alert banner"; }
-        if (ft == 29) { return "Progress bar"; }
-        if (ft == 30) { return "Result / status page"; }
-        if (ft == 31) { return "Skeleton placeholder"; }
-        if (ft == 32) { return "Loading spinner"; }
-        if (ft == 33) { return "Tooltip trigger"; }
-        if (ft == 34) { return "Step progress"; }
-        if (ft == 35) { return "Breadcrumb trail"; }
-        if (ft == 36) { return "Tab bar"; }
-        if (ft == 37) { return "Pagination controls"; }
-        if (ft == 38) { return "Navigation menu"; }
-        if (ft == 39) { return "Page header"; }
-        if (ft == 40) { return "Scrollable list of rows"; }
-        if (ft == 41) { return "Sortable data grid"; }
-        if (ft == 42) { return "Image / slide carousel"; }
-        if (ft == 43) { return "Bar chart"; }
-        if (ft == 44) { return "Truncated text with ellipsis"; }
-        if (ft == 45) { return "Titled content panel"; }
-        if (ft == 46) { return "Vertical scrollbar"; }
-        if (ft == 47) { return "Loading indicator"; }
-        if (ft == 48) { return "Dropdown trigger"; }
-        if (ft == 49) { return "Floating action button"; }
-        if (ft == 50) { return "Anchored popover"; }
-        if (ft == 51) { return "Inline confirm popover"; }
-        if (ft == 52) { return "Notification toast"; }
-        if (ft == 53) { return "Command ribbon"; }
-        if (ft == 54) { return "Standalone icon"; }
-        return "Form field";
+        if (ft == 0) { return Designer.T("Single-line text input", "单行文本输入框"); }
+        if (ft == 1) { return Designer.T("Multi-line text area", "多行文本域"); }
+        if (ft == 2) { return Designer.T("Masked password input", "密码输入框"); }
+        if (ft == 3) { return Designer.T("Numeric stepper input", "数字步进输入框"); }
+        if (ft == 4) { return Designer.T("Single choice from options", "单选项"); }
+        if (ft == 5) { return Designer.T("Multiple choice from options", "多选项"); }
+        if (ft == 6) { return Designer.T("Dropdown selector", "下拉选择器"); }
+        if (ft == 7) { return Designer.T("On / off toggle", "开 / 关开关"); }
+        if (ft == 8) { return Designer.T("Star rating", "星级评分"); }
+        if (ft == 9) { return Designer.T("Value slider", "滑块"); }
+        if (ft == 10) { return Designer.T("Date picker", "日期选择器"); }
+        if (ft == 11) { return Designer.T("Time picker", "时间选择器"); }
+        if (ft == 12) { return Designer.T("File upload area", "文件上传区域"); }
+        if (ft == 13) { return Designer.T("Colour picker", "颜色选择器"); }
+        if (ft == 14) { return Designer.T("Rich text editor", "富文本编辑器"); }
+        if (ft == 15) { return Designer.T("Section heading text", "章节标题文本"); }
+        if (ft == 16) { return Designer.T("Static paragraph text", "静态段落文本"); }
+        if (ft == 17) { return Designer.T("Horizontal separator", "水平分隔线"); }
+        if (ft == 18) { return Designer.T("Content card panel", "内容卡片面板"); }
+        if (ft == 19) { return Designer.T("Coloured label tag", "彩色标签"); }
+        if (ft == 20) { return Designer.T("Count / status badge", "计数 / 状态徽标"); }
+        if (ft == 21) { return Designer.T("User avatar circle", "用户头像"); }
+        if (ft == 22) { return Designer.T("Statistic figure", "统计数值"); }
+        if (ft == 23) { return Designer.T("Data table with columns", "带列的数据表格"); }
+        if (ft == 24) { return Designer.T("Vertical timeline", "垂直时间轴"); }
+        if (ft == 25) { return Designer.T("Tree / hierarchy", "树 / 层级结构"); }
+        if (ft == 26) { return Designer.T("Collapsible panels", "折叠面板"); }
+        if (ft == 27) { return Designer.T("Empty-state placeholder", "空状态占位"); }
+        if (ft == 28) { return Designer.T("Inline alert banner", "内联警告横幅"); }
+        if (ft == 29) { return Designer.T("Progress bar", "进度条"); }
+        if (ft == 30) { return Designer.T("Result / status page", "结果 / 状态页"); }
+        if (ft == 31) { return Designer.T("Skeleton placeholder", "骨架屏占位"); }
+        if (ft == 32) { return Designer.T("Loading spinner", "加载动画"); }
+        if (ft == 33) { return Designer.T("Tooltip trigger", "提示气泡触发器"); }
+        if (ft == 34) { return Designer.T("Step progress", "步骤条"); }
+        if (ft == 35) { return Designer.T("Breadcrumb trail", "面包屑导航"); }
+        if (ft == 36) { return Designer.T("Tab bar", "标签页栏"); }
+        if (ft == 37) { return Designer.T("Pagination controls", "分页控件"); }
+        if (ft == 38) { return Designer.T("Navigation menu", "导航菜单"); }
+        if (ft == 39) { return Designer.T("Page header", "页面头部"); }
+        if (ft == 40) { return Designer.T("Scrollable list of rows", "可滚动行列表"); }
+        if (ft == 41) { return Designer.T("Sortable data grid", "可排序数据网格"); }
+        if (ft == 42) { return Designer.T("Image / slide carousel", "图片 / 幻灯轮播"); }
+        if (ft == 43) { return Designer.T("Bar chart", "柱状图"); }
+        if (ft == 44) { return Designer.T("Truncated text with ellipsis", "带省略号的截断文本"); }
+        if (ft == 45) { return Designer.T("Titled content panel", "带标题内容面板"); }
+        if (ft == 46) { return Designer.T("Vertical scrollbar", "垂直滚动条"); }
+        if (ft == 47) { return Designer.T("Loading indicator", "加载指示器"); }
+        if (ft == 48) { return Designer.T("Dropdown trigger", "下拉触发器"); }
+        if (ft == 49) { return Designer.T("Floating action button", "悬浮操作按钮"); }
+        if (ft == 50) { return Designer.T("Anchored popover", "锚定气泡卡片"); }
+        if (ft == 51) { return Designer.T("Inline confirm popover", "内联确认气泡"); }
+        if (ft == 52) { return Designer.T("Notification toast", "通知提示"); }
+        if (ft == 53) { return Designer.T("Command ribbon", "命令功能区"); }
+        if (ft == 54) { return Designer.T("Standalone icon", "独立图标"); }
+        if (ft == 55) { return Designer.T("Right-click context menu (component tray)", "右键上下文菜单（组件托盘）"); }
+        if (ft == 56) { return Designer.T("Popup layer / overlay (component tray)", "弹出层 / 遮罩（组件托盘）"); }
+        if (ft == 57) { return Designer.T("Interval timer (component tray)", "定时器（组件托盘）"); }
+        return Designer.T("Form field", "表单字段");
     }
 
     /// Maps a field type to a Segoe MDL2 icon name for the palette.
@@ -1003,6 +1213,9 @@ class Designer {
         if (ft == 52) { return "bell"; }
         if (ft == 53) { return "grid"; }
         if (ft == 54) { return "star"; }
+        if (ft == 55) { return "menu"; }
+        if (ft == 56) { return "copy"; }
+        if (ft == 57) { return "clock"; }
         return "file";
     }
 
@@ -1056,7 +1269,7 @@ class Designer {
         int fy = cy + pad - formScroll;
 
         string head = formNameSig.Get();
-        if (preview) { head = head + "   (preview)"; }
+        if (preview) { head = head + Designer.T("   (preview)", "  （预览）"); }
         if (FormVisible(fy, app.Scale(18))) {
             c.DrawText(fx, fy, head, t.textPrimary, t.fontSizeMedium);
         }
@@ -1064,18 +1277,29 @@ class Designer {
         if (FormVisible(fy, 1)) { c.FillRect(fx, fy, fw, 1, t.divider); }
         fy = fy + app.Scale(10);
 
-        int n = fields.Count;
+        // Non-visual components never take part in the canvas layout: they
+        // live in the tray strip below (see RenderTray). Lay out only the
+        // visual fields; visIdx maps a layout position back to the real index
+        // in `fields` so drag/drop indices stay correct.
+        List<int> visIdx = new List<int>();
+        int vf = 0;
+        while (vf < fields.Count) {
+            if (!fields[vf].IsNonVisual()) { visIdx.Add(vf); }
+            vf = vf + 1;
+        }
+        int n = visIdx.Count;
         if (n == 0) {
             c.DrawText(fx, fy + app.Scale(6),
-                "Empty form — pick a component on the left, or drag one in.",
+                Designer.T("Empty form — pick a component on the left, or drag one in.", "空表单 —— 在左侧选择一个组件，或拖入一个组件。"),
                 t.textTertiary, fs);
         }
         bool active = dragging && InRect(dragMouseX, dragMouseY, cx, cy, cw, ch);
         bool dropSet = false;
-        dropIndex = n;
+        dropIndex = fields.Count;
         dropY = fy - app.Scale(4);
         int colGap = app.Scale(12);
         rowClicked = false;
+        dropContainer = null;
         int i = 0;
         while (i < n) {
             // Pack consecutive fields into one visual row until their column
@@ -1085,7 +1309,7 @@ class Designer {
             int cols = 0;
             int rowEnd = i;
             while (rowEnd < n) {
-                int sp = ClampSpan(fields[rowEnd].span);
+                int sp = ClampSpan(fields[visIdx[rowEnd]].span);
                 if (rowEnd > rowStart && cols + sp > 24) { break; }
                 cols = cols + sp;
                 rowEnd = rowEnd + 1;
@@ -1095,13 +1319,13 @@ class Designer {
             int rowH = 0;
             int k = rowStart;
             while (k < rowEnd) {
-                int hk = FieldHeight(app, fields[k]);
-                if (labelPos == 2 && !fields[k].IsDisplay()) { hk = hk + app.Scale(18); }
+                int hk = FieldHeight(app, fields[visIdx[k]]);
+                if (labelPos == 2 && !fields[visIdx[k]].IsDisplay()) { hk = hk + app.Scale(18); }
                 if (hk > rowH) { rowH = hk; }
                 k = k + 1;
             }
             if (active && !dropSet && dragMouseY < fy + rowH / 2) {
-                dropIndex = rowStart;
+                dropIndex = visIdx[rowStart];
                 dropY = fy - app.Scale(4);
                 dropSet = true;
             }
@@ -1111,25 +1335,25 @@ class Designer {
             int accSpan = 0;
             int rc = rowStart;
             while (rc < rowEnd) {
-                int sp = ClampSpan(fields[rc].span);
+                int sp = ClampSpan(fields[visIdx[rc]].span);
                 int x0 = fx + fw * accSpan / 24;
                 accSpan = accSpan + sp;
                 int x1 = fx + fw * accSpan / 24;
                 int wf = x1 - x0;
                 if (rc < rowEnd - 1) { wf = wf - colGap; }
-                if (vis) { RenderRow(app, c, t, fields[rc], x0, fy, wf, rowH, rc, true); }
+                if (vis) { RenderRow(app, c, t, fields[visIdx[rc]], x0, fy, wf, rowH, visIdx[rc], true); }
                 rc = rc + 1;
             }
             fy = fy + rowH + app.Scale(6);
             i = rowEnd;
         }
-        if (active && !dropSet) { dropIndex = n; dropY = fy - app.Scale(4); }
-        if (active && (dragFromPalette || dragMoved)) {
+        if (active && !dropSet) { dropIndex = fields.Count; dropY = fy - app.Scale(4); }
+        if (active && (dragFromPalette || dragMoved) && dropContainer == null) {
             c.FillRect(fx, dropY, fw, app.Scale(2), t.primary);
         }
 
         int dek = app.window.EventKind();
-        if (dragging && dek == 3 && active) { DropField(); }
+        if (dragging && dek == 3 && active) { DropField(); app.RequestRedraw(); }
 
         // Click on empty form background clears the selection / add target.
         if (!preview && dek == 2 && !rowClicked && !dragging
@@ -1151,17 +1375,27 @@ class Designer {
     /// field at dropIndex; in-form drags relocate the dragged row there.
     void DropField() {
         if (dragFromPalette) {
-            if (activeContainer != null) {
-                // Drop into the active container (its active tab for Tabs).
-                if (dragKind == 100) { AddCustomField(dragCustomKind); }
+            if (dragKind != 100 && dragKind != 200 && FormField.IsNonVisualOf(dragKind)) {
+                // Non-visual components go to the tray regardless of where
+                // they were dropped.
+                AddField(dragKind);
+            } else if (dropContainer != null) {
+                // Drop into the container under the pointer (its active tab
+                // for Tabs).
+                activeContainer = dropContainer;
+                if (dragKind == 200) { AddUserComponent(dragUserComp); }
+                else if (dragKind == 100) { AddCustomField(dragCustomKind); }
                 else { AddField(dragKind); }
+            } else if (dragKind == 200) {
+                activeContainer = null;
+                AddUserComponent(dragUserComp);
             } else if (dragKind == 100) {
                 FormField nf = FormField.NewCustom(dragCustomKind, seq);
                 seq = seq + 1;
                 InsertFieldAt(dropIndex, nf);
                 sel = nf;
                 inspTab = 0;
-                msg = "added " + dragCustomKind;
+                msg = Designer.T("added ", "已添加 ") + dragCustomKind;
             } else {
                 FormField nf = FormField.New(dragKind, seq);
                 seq = seq + 1;
@@ -1169,16 +1403,29 @@ class Designer {
                 sel = nf;
                 inspTab = 0;
                 if (nf.IsContainer()) { activeContainer = nf; }
-                msg = "added " + FormField.TypeName(dragKind);
+                msg = Designer.T("added ", "已添加 ") + FormField.TypeName(dragKind);
             }
         } else if (dragIndex >= 0 && dragMoved) {
-            int at = dropIndex;
-            if (at > dragIndex) { at = at - 1; }
             FormField mv = fields[dragIndex];
-            fields = ListMove(fields, dragIndex, at);
-            sel = mv;
-            msg = "moved field";
+            if (dropContainer != null && dropContainer != mv && !InSubtree(mv, dropContainer)) {
+                // Re-parent the dragged top-level row into the container
+                // under the pointer (its active tab for Tabs).
+                fields = ListRemove(fields, mv);
+                mv.childTab = 0;
+                if (dropContainer.ftype == 36) { mv.childTab = dropContainer.uiState.Get(); }
+                dropContainer.kids.Add(mv);
+                sel = mv;
+                activeContainer = dropContainer;
+                msg = Designer.T("moved into ", "已移入 ") + FormField.TypeName(dropContainer.ftype);
+            } else {
+                int at = dropIndex;
+                if (at > dragIndex) { at = at - 1; }
+                fields = ListMove(fields, dragIndex, at);
+                sel = mv;
+                msg = Designer.T("moved field", "已移动组件");
+            }
         }
+        dropContainer = null;
     }
 
     void RenderRow(App app, Canvas c, Theme t, FormField f, int rx, int ry, int rw, int rowH, int idx, bool topLevel) {
@@ -1199,6 +1446,20 @@ class Designer {
             // Container frame + nested children (children handle their own
             // selection first, so a click inside prefers the child).
             RenderContainer(app, c, t, f, rx, ry, rw, rowH);
+            // While a drag hovers this container it becomes the drop target
+            // (nested containers win: they render after their parent).
+            if (dragging && InRect(dragMouseX, dragMouseY, rx, ry, rw, rowH)) {
+                bool ok = true;
+                if (!dragFromPalette) {
+                    if (dragIndex < 0 || dragIndex >= fields.Count) { ok = false; }
+                    else if (fields[dragIndex] == f || InSubtree(fields[dragIndex], f)) { ok = false; }
+                }
+                if (ok) {
+                    dropContainer = f;
+                    c.DrawRect(rx - app.Scale(4), ry - app.Scale(2),
+                        rw + app.Scale(8), rowH + app.Scale(4), t.primary, 2);
+                }
+            }
         } else {
             int lw = app.Scale(labelWidth);
             int gap = app.Scale(10);
@@ -1262,6 +1523,7 @@ class Designer {
         int total = 0;
         int shown = 0;
         int activeTab = f.uiState.Get();
+        if (activeTab >= f.OptionCount() || activeTab < 0) { activeTab = 0; }
         int i = 0;
         while (i < f.KidCount()) {
             FormField ch = f.KidAt(i);
@@ -1296,6 +1558,8 @@ class Designer {
             int oi = 0;
             while (oi < f.OptionCount()) { labels.Add(f.OptionAt(oi)); oi = oi + 1; }
             if (labels.Count == 0) { labels.Add("Tab 1"); }
+            // Keep the active tab inside range (tab options may get deleted).
+            if (f.uiState.Get() >= labels.Count || f.uiState.Get() < 0) { f.uiState.Set(0); }
             int firstId = TabStrip.Render(app, rx, ry, rw, labels, f.uiState);
             if (!preview) { TabStrip.HandleClick(app, firstId, labels.Count, f.uiState); }
             int innerX = rx + app.Scale(4);
@@ -1326,7 +1590,7 @@ class Designer {
         }
         if (shown == 0) {
             c.DrawText(x + app.Scale(6), y + app.Scale(12),
-                "Empty — select this container, then add components",
+                Designer.T("Empty — select this container, then add components", "空 —— 选中此容器，然后添加组件"),
                 t.textTertiary, t.fontSizeSmall);
         }
     }
@@ -1357,6 +1621,9 @@ class Designer {
 
         // Display / layout / feedback / navigation components (ftype >= 15).
         if (ft >= 15) {
+            // Options may have been deleted since the ui state was set; keep
+            // the index in range so option-driven previews never overrun.
+            if (f.UsesOptions() && f.uiState.Get() >= f.OptionCount()) { f.uiState.Set(0); }
             PreviewDisplay(app, c, t, f, x, y, w, avail, line);
             return;
         }
@@ -1490,7 +1757,7 @@ class Designer {
             c.DrawRect(x, y, w, bh, t.borderPrimary, 1);
             c.DrawText(x + app.Scale(10), y + app.Scale(8), f.label, t.textPrimary, t.fontSizeMedium);
             c.FillRect(x, y + app.Scale(30), w, 1, t.divider);
-            c.DrawText(x + app.Scale(10), y + app.Scale(38), "Card body content", t.textTertiary, fs);
+            c.DrawText(x + app.Scale(10), y + app.Scale(38), Designer.T("Card body content", "卡片内容"), t.textTertiary, fs);
             return;
         }
         if (ft == 19) {                      // tag
@@ -1539,7 +1806,7 @@ class Designer {
             List<string> titles = new List<string>();
             List<string> bodies = new List<string>();
             int i = 0;
-            while (i < f.OptionCount()) { titles.Add(f.OptionAt(i)); bodies.Add("Panel content"); i = i + 1; }
+            while (i < f.OptionCount()) { titles.Add(f.OptionAt(i)); bodies.Add(Designer.T("Panel content", "面板内容")); i = i + 1; }
             int fid = Collapse.Render(app, x, y + app.Scale(2), w, titles, bodies, f.uiState);
             if (!preview) { Collapse.HandleClick(app, fid, titles.Count, f.uiState); }
             return;
@@ -1559,7 +1826,7 @@ class Designer {
             return;
         }
         if (ft == 30) {                      // result
-            Result.Render(app, x, y, w, 1, f.label, "Operation completed");
+            Result.Render(app, x, y, w, 1, f.label, Designer.T("Operation completed", "操作已完成"));
             return;
         }
         if (ft == 31) {                      // skeleton
@@ -1570,7 +1837,7 @@ class Designer {
         }
         if (ft == 32) {                      // spin
             Spin.Render(app, x + app.Scale(12), y + app.Scale(16), app.Scale(10), t.primary);
-            c.DrawText(x + app.Scale(30), y + app.Scale(10), "Loading...", t.textTertiary, fs);
+            c.DrawText(x + app.Scale(30), y + app.Scale(10), Designer.T("Loading...", "加载中..."), t.textTertiary, fs);
             return;
         }
         if (ft == 33) {                      // tooltip trigger
@@ -1609,7 +1876,7 @@ class Designer {
                 i = i + 1;
             }
             c.FillRect(x, y + app.Scale(25), w, 1, t.divider);
-            c.DrawText(x + app.Scale(4), y + app.Scale(38), "Tab panel content", t.textTertiary, fs);
+            c.DrawText(x + app.Scale(4), y + app.Scale(38), Designer.T("Tab panel content", "标签页内容"), t.textTertiary, fs);
             return;
         }
         if (ft == 37) {                      // pagination
@@ -1627,7 +1894,7 @@ class Designer {
             return;
         }
         if (ft == 39) {                      // page header
-            PageHeader.Render(app, x, y, w, f.label, "Subtitle / description");
+            PageHeader.Render(app, x, y, w, f.label, Designer.T("Subtitle / description", "副标题 / 描述"));
             return;
         }
         if (ft == 40) {                      // list view
@@ -1664,7 +1931,7 @@ class Designer {
             int ph = avail - app.Scale(6);
             if (ph < app.Scale(70)) { ph = app.Scale(70); }
             Rect r = Panel.Section(app, x, y, w, ph, f.label);
-            c.DrawText(r.x, r.y, "Panel content", t.textTertiary, fs);
+            c.DrawText(r.x, r.y, Designer.T("Panel content", "面板内容"), t.textTertiary, fs);
             return;
         }
         if (ft == 46) {                      // scrollbar
@@ -1672,7 +1939,7 @@ class Designer {
             if (sh < app.Scale(70)) { sh = app.Scale(70); }
             c.DrawRect(x, y, w, sh, t.borderPrimary, 1);
             c.DrawText(x + app.Scale(8), y + app.Scale(8),
-                "Scrollable content", t.textTertiary, fs);
+                Designer.T("Scrollable content", "可滚动内容"), t.textTertiary, fs);
             Scrollbar.RenderVertical(app, x + w - app.Scale(10), y, sh,
                 sh * 3, app.Scale(20));
             return;
@@ -1681,7 +1948,7 @@ class Designer {
             int r = app.Scale(12);
             Loading.Render(app, x + r + app.Scale(4), y + r + app.Scale(8), r);
             c.DrawText(x + r * 2 + app.Scale(16), y + r,
-                "Loading...", t.textTertiary, fs);
+                Designer.T("Loading...", "加载中..."), t.textTertiary, fs);
             return;
         }
         if (ft == 48) {                      // dropdown trigger
@@ -1695,11 +1962,11 @@ class Designer {
         }
         if (ft == 50) {                      // popover
             Popover.Render(app, x + app.Scale(90), y,
-                app.Scale(180), app.Scale(60), f.label, "Popover body text");
+                app.Scale(180), app.Scale(60), f.label, Designer.T("Popover body text", "气泡内容"));
             return;
         }
         if (ft == 51) {                      // popconfirm
-            Layer.DrawPopconfirm(app, x + app.Scale(110), y, f.label, "OK", "Cancel");
+            Layer.DrawPopconfirm(app, x + app.Scale(110), y, f.label, Designer.T("OK", "确定"), Designer.T("Cancel", "取消"));
             return;
         }
         if (ft == 52) {                      // notification
@@ -1708,10 +1975,10 @@ class Designer {
         }
         if (ft == 53) {                      // ribbon
             List<RibbonCmd> cmds = new List<RibbonCmd>();
-            cmds.Add(RibbonCmd.Group("save", "Save"));
-            cmds.Add(RibbonCmd.Create("copy", "Copy"));
-            cmds.Add(RibbonCmd.Create("paste", "Paste"));
-            cmds.Add(RibbonCmd.Create("cut", "Cut"));
+            cmds.Add(RibbonCmd.Group("save", Designer.T("Save", "保存")));
+            cmds.Add(RibbonCmd.Create("copy", Designer.T("Copy", "复制")));
+            cmds.Add(RibbonCmd.Create("paste", Designer.T("Paste", "粘贴")));
+            cmds.Add(RibbonCmd.Create("cut", Designer.T("Cut", "剪切")));
             Ribbon.Render(app, x, y, w, Ribbon.Height(app), cmds);
             return;
         }
@@ -1786,7 +2053,7 @@ class Designer {
         int i = 0;
         while (i < nc) {
             string h = "Col " + Convert.ToString(i + 1);
-            if (i < f.OptionCount()) { h = f.OptionAt(i); }
+            if (i < f.OptionCount()) { h = Designer.ColTitle(f.OptionAt(i)); }
             cols.Add(h);
             widths.Add(colW);
             cells.Add("—");
@@ -1855,11 +2122,11 @@ class Designer {
         // when nothing is selected.
         bool root = (sel == null);
         int hy = y + app.Scale(10);
-        string target = "WINDOW  ·  " + winTitleSig.Get();
+        string target = Designer.T("WINDOW", "窗口") + "  ·  " + winTitleSig.Get();
         if (!root) {
             string tn = FormField.TypeName(sel.ftype);
             if (sel.ftype == 100) { tn = sel.customKind; }
-            target = "COMPONENT  ·  " + tn;
+            target = Designer.T("COMPONENT", "组件") + "  ·  " + tn;
         }
         c.DrawText(ix, hy, Ellipsis.Fit(target, iw, fs), t.textTertiary, fs);
         hy = hy + app.Scale(18);
@@ -1867,8 +2134,8 @@ class Designer {
         int tabW = (iw - app.Scale(6)) / 2;
         int pType = 0; if (inspTab == 0) { pType = 1; }
         int eType = 0; if (inspTab == 1) { eType = 1; }
-        int pId = Button.Typed("Properties", pType).Render(app, ix, hy, tabW);
-        int eId = Button.Typed("Events", eType).Render(app, ix + tabW + app.Scale(6), hy, tabW);
+        int pId = Button.Typed(Designer.T("Properties", "属性"), pType).Render(app, ix, hy, tabW);
+        int eId = Button.Typed(Designer.T("Events", "事件"), eType).Render(app, ix + tabW + app.Scale(6), hy, tabW);
         if (Button.WasClicked(app, pId) && inspTab != 0) { inspTab = 0; inspScroll = 0; }
         if (Button.WasClicked(app, eId) && inspTab != 1) { inspTab = 1; inspScroll = 0; }
         hy = hy + app.Scale(38);
@@ -1944,23 +2211,55 @@ class Designer {
     /// Events tab). Returns the y after the last row so the body can scroll.
     int RenderFieldProps(App app, Canvas c, Theme t, FormField f, int ix, int iy, int iw) {
         int fs = t.fontSizeSmall;
-        iy = LabeledInput(app, c, t, "Label", labelInput, ix, iy, iw);
+        iy = LabeledInput(app, c, t, Designer.T("Label", "标签"), labelInput, ix, iy, iw);
         f.label = labelSig.Get();
-        iy = LabeledInput(app, c, t, "Name", nameInput, ix, iy, iw);
+        iy = LabeledInput(app, c, t, Designer.T("Name", "名称"), nameInput, ix, iy, iw);
         f.fname = nameSig.Get();
         f.name = f.fname;
-        iy = LabeledInput(app, c, t, "Placeholder", phInput, ix, iy, iw);
+        iy = LabeledInput(app, c, t, Designer.T("Placeholder", "占位文本"), phInput, ix, iy, iw);
         f.placeholder = phSig.Get();
-        iy = LabeledInput(app, c, t, "Bind path", bindInput, ix, iy, iw);
+        string bindLbl = Designer.T("Bind path", "绑定路径");
+        if (f.ftype == 23 || f.ftype == 41) { bindLbl = Designer.T("Data source", "数据源"); }
+        iy = LabeledInput(app, c, t, bindLbl, bindInput, ix, iy, iw);
         f.bindPath = bindSig.Get();
-        iy = LabeledInput(app, c, t, "Bind prop", bindPropInput, ix, iy, iw);
+        // Two-way binding picker: variables scanned from the paired code file.
+        if (bindVars.Count > 0) {
+            string pickLbl = Designer.T("Pick from code ▾", "从代码选择 ▾");
+            if (bindPickOpen) { pickLbl = Designer.T("Pick from code ▴", "从代码选择 ▴"); }
+            int pkId = SmallBtn(app, pickLbl, 0, ix + app.Scale(84), iy, iw - app.Scale(84));
+            if (Button.WasClicked(app, pkId)) {
+                bindPickOpen = !bindPickOpen;
+                app.RequestRedraw();
+            }
+            iy = iy + app.Scale(34);
+            if (bindPickOpen) {
+                int bvi = 0;
+                while (bvi < bindVars.Count) {
+                    int bvType = 0;
+                    if (bindVars[bvi] == f.bindPath) { bvType = 1; }
+                    int bvId = SmallBtn(app, bindVars[bvi], bvType,
+                        ix + app.Scale(84), iy, iw - app.Scale(84));
+                    if (Button.WasClicked(app, bvId)) {
+                        f.bindPath = bindVars[bvi];
+                        bindSig.Set(f.bindPath);
+                        bindInput.SetText(f.bindPath);
+                        bindPickOpen = false;
+                        msg = Designer.T("bound to ", "已绑定 ") + f.bindPath;
+                        app.RequestRedraw();
+                    }
+                    iy = iy + app.Scale(32);
+                    bvi = bvi + 1;
+                }
+            }
+        }
+        iy = LabeledInput(app, c, t, Designer.T("Bind prop", "绑定属性"), bindPropInput, ix, iy, iw);
         f.bindProp = bindPropSig.Get();
         if (f.ftype == 100) {
-            iy = LabeledInput(app, c, t, "Component", customInput, ix, iy, iw);
+            iy = LabeledInput(app, c, t, Designer.T("Component", "组件"), customInput, ix, iy, iw);
             f.customKind = customSig.Get();
         }
 
-        f.required = ToggleRow(app, c, t, "Required", f.required, ix, iy, iw);
+        f.required = ToggleRow(app, c, t, Designer.T("Required", "必填"), f.required, ix, iy, iw);
         iy = iy + app.Scale(34);
 
         // Field width on the 24-column grid: quick presets plus an exact span.
@@ -1970,7 +2269,7 @@ class Designer {
         if (f.span == 12) { spanSel = 1; }
         else if (f.span == 8) { spanSel = 2; }
         else if (f.span == 6) { spanSel = 3; }
-        int newSel = SegRow(app, c, t, "Field width", spanOpts, spanSel, ix, iy, iw);
+        int newSel = SegRow(app, c, t, Designer.T("Field width", "字段宽度"), spanOpts, spanSel, ix, iy, iw);
         if (newSel != spanSel) {
             if (newSel == 1) { f.span = 12; }
             else if (newSel == 2) { f.span = 8; }
@@ -1978,77 +2277,153 @@ class Designer {
             else { f.span = 24; }
         }
         iy = iy + app.Scale(54);
-        f.span = IntRow(app, c, t, "Span / 24", f.span, 1, ix, iy, iw);
+        f.span = IntRow(app, c, t, Designer.T("Span / 24", "跨度 / 24"), f.span, 1, ix, iy, iw);
         if (f.span < 1) { f.span = 1; }
         if (f.span > 24) { f.span = 24; }
         iy = iy + app.Scale(36);
 
         if (f.ftype == 7) {
-            f.defOn = ToggleRow(app, c, t, "Default on", f.defOn, ix, iy, iw);
+            f.defOn = ToggleRow(app, c, t, Designer.T("Default on", "默认开启"), f.defOn, ix, iy, iw);
             iy = iy + app.Scale(34);
         }
 
         if (f.UsesOptions()) {
+            bool table = (f.ftype == 23 || f.ftype == 41);
             iy = iy + app.Scale(6);
-            c.DrawText(ix, iy, "OPTIONS", t.textTertiary, fs);
+            if (table) {
+                c.DrawText(ix, iy, Designer.T("COLUMNS (title · field)", "列（标题 · 字段）"), t.textTertiary, fs);
+            } else {
+                c.DrawText(ix, iy, Designer.T("OPTIONS", "选项"), t.textTertiary, fs);
+            }
             iy = iy + app.Scale(20);
             int oi = 0;
             while (oi < f.OptionCount()) {
+                string disp = f.OptionAt(oi);
+                if (table) {
+                    disp = Designer.ColTitle(disp);
+                    string cfd = Designer.ColField(f.OptionAt(oi));
+                    if (cfd != "") { disp = disp + "  ·  " + cfd; }
+                }
                 c.DrawText(ix, iy + app.Scale(7),
-                    Convert.ToString(oi + 1) + ".  " + f.OptionAt(oi), t.textSecondary, fs);
+                    Convert.ToString(oi + 1) + ".  " + disp, t.textSecondary, fs);
                 int rmId = SmallIconBtn(app, "close", 5, ix + iw - app.Scale(28), iy, app.Scale(28));
-                if (Button.WasClicked(app, rmId)) { f.RemoveOptionAt(oi); }
+                if (Button.WasClicked(app, rmId)) {
+                    RemoveOptionFixup(f, oi);
+                }
                 iy = iy + app.Scale(32);
                 oi = oi + 1;
             }
-            optInput.Render(app, ix, iy, iw - app.Scale(54), app.Scale(28));
-            int addId = SmallBtn(app, "Add", 1, ix + iw - app.Scale(48), iy, app.Scale(48));
-            if (Button.WasClicked(app, addId) && optSig.Get() != "") {
-                f.AddOption(optSig.Get());
-                optSig.Set("");
+            if (table) {
+                // Two-part column editor: display title + data field key.
+                int half = (iw - app.Scale(54) - app.Scale(6)) / 2;
+                optInput.Render(app, ix, iy, half, app.Scale(28));
+                optFieldInput.Render(app, ix + half + app.Scale(6), iy, half, app.Scale(28));
+                int addId = SmallBtn(app, Designer.T("Add", "添加"), 1, ix + iw - app.Scale(48), iy, app.Scale(48));
+                if (Button.WasClicked(app, addId) && optSig.Get() != "") {
+                    string col = optSig.Get();
+                    if (optFieldSig.Get() != "") { col = col + ":" + optFieldSig.Get(); }
+                    f.AddOption(col);
+                    optSig.Set("");
+                    optFieldSig.Set("");
+                }
+            } else {
+                optInput.Render(app, ix, iy, iw - app.Scale(54), app.Scale(28));
+                int addId = SmallBtn(app, Designer.T("Add", "添加"), 1, ix + iw - app.Scale(48), iy, app.Scale(48));
+                if (Button.WasClicked(app, addId) && optSig.Get() != "") {
+                    f.AddOption(optSig.Get());
+                    optSig.Set("");
+                }
             }
             iy = iy + app.Scale(38);
         }
         return iy + app.Scale(4);
     }
 
+    /// Removes option `oi` from `f` and repairs dependent state so the UI never
+    /// indexes past the shrunken list (the old direct RemoveOptionAt could
+    /// leave a Tabs container's active tab / child tab out of range).
+    void RemoveOptionFixup(FormField f, int oi) {
+        f.RemoveOptionAt(oi);
+        if (f.ftype == 36) {
+            int ki = 0;
+            while (ki < f.kids.Count) {
+                if (f.kids[ki].childTab == oi) { f.kids[ki].childTab = 0; }
+                else if (f.kids[ki].childTab > oi) { f.kids[ki].childTab = f.kids[ki].childTab - 1; }
+                ki = ki + 1;
+            }
+        }
+        if (f.uiState.Get() >= f.OptionCount() || f.uiState.Get() < 0) { f.uiState.Set(0); }
+    }
+
+    /// Display title of a table column option ("Title:field" convention).
+    static string ColTitle(string opt) {
+        int p = Designer.IndexOfColon(opt);
+        if (p < 0) { return opt; }
+        return opt.Substring(0, p);
+    }
+
+    /// Data field key of a table column option ("" when none was declared).
+    static string ColField(string opt) {
+        int p = Designer.IndexOfColon(opt);
+        if (p < 0) { return ""; }
+        return opt.Substring(p + 1, opt.Length - p - 1);
+    }
+
+    static int IndexOfColon(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == ":") { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
     /// Properties tab for the root Window: window chrome (title/size/flags) plus
     /// the shared layout defaults applied to labelled input rows placed inside.
     int RenderWindowProps(App app, Canvas c, Theme t, int ix, int iy, int iw) {
         int fs = t.fontSizeSmall;
-        c.DrawText(ix, iy, "WINDOW", t.textTertiary, fs);
+        c.DrawText(ix, iy, Designer.T("WINDOW", "窗口"), t.textTertiary, fs);
         iy = iy + app.Scale(20);
 
-        iy = LabeledInput(app, c, t, "Title", winTitleInput, ix, iy, iw);
+        iy = LabeledInput(app, c, t, Designer.T("Title", "标题"), winTitleInput, ix, iy, iw);
 
-        winW = IntRow(app, c, t, "Width", winW, 20, ix, iy, iw);
-        iy = iy + app.Scale(36);
-        winH = IntRow(app, c, t, "Height", winH, 20, ix, iy, iw);
+        // Save the whole designed window as a reusable project component; the
+        // host IDE persists it and it then shows up under "My Components".
+        int scId = SmallBtn(app, Designer.T("Save as component", "保存为组件"), 1, ix, iy, iw);
+        if (Button.WasClicked(app, scId)) {
+            saveCompRequested = true;
+            msg = Designer.T("saving as component…", "正在保存为组件…");
+        }
         iy = iy + app.Scale(36);
 
-        winResizable = ToggleRow(app, c, t, "Resizable", winResizable, ix, iy, iw);
+        winW = IntRow(app, c, t, Designer.T("Width", "宽度"), winW, 20, ix, iy, iw);
+        iy = iy + app.Scale(36);
+        winH = IntRow(app, c, t, Designer.T("Height", "高度"), winH, 20, ix, iy, iw);
+        iy = iy + app.Scale(36);
+
+        winResizable = ToggleRow(app, c, t, Designer.T("Resizable", "可调整大小"), winResizable, ix, iy, iw);
         iy = iy + app.Scale(34);
-        winTool = ToggleRow(app, c, t, "Tool window", winTool, ix, iy, iw);
+        winTool = ToggleRow(app, c, t, Designer.T("Tool window", "工具窗口"), winTool, ix, iy, iw);
         iy = iy + app.Scale(34);
-        winCenter = ToggleRow(app, c, t, "Center on show", winCenter, ix, iy, iw);
+        winCenter = ToggleRow(app, c, t, Designer.T("Center on show", "显示时居中"), winCenter, ix, iy, iw);
         iy = iy + app.Scale(34);
-        winGlass = ToggleRow(app, c, t, "Frosted glass", winGlass, ix, iy, iw);
+        winGlass = ToggleRow(app, c, t, Designer.T("Frosted glass", "毛玻璃效果"), winGlass, ix, iy, iw);
         iy = iy + app.Scale(40);
 
-        c.DrawText(ix, iy, "LAYOUT", t.textTertiary, fs);
+        c.DrawText(ix, iy, Designer.T("LAYOUT", "布局"), t.textTertiary, fs);
         iy = iy + app.Scale(20);
         List<string> posOpts = new List<string>();
-        posOpts.Add("Left"); posOpts.Add("Right"); posOpts.Add("Top");
-        labelPos = SegRow(app, c, t, "Label position", posOpts, labelPos, ix, iy, iw);
+        posOpts.Add(Designer.T("Left", "左")); posOpts.Add(Designer.T("Right", "右")); posOpts.Add(Designer.T("Top", "上"));
+        labelPos = SegRow(app, c, t, Designer.T("Label position", "标签位置"), posOpts, labelPos, ix, iy, iw);
         iy = iy + app.Scale(54);
         List<string> szOpts = new List<string>();
-        szOpts.Add("Large"); szOpts.Add("Default"); szOpts.Add("Small");
-        formSize = SegRow(app, c, t, "Control size", szOpts, formSize, ix, iy, iw);
+        szOpts.Add(Designer.T("Large", "大")); szOpts.Add(Designer.T("Default", "默认")); szOpts.Add(Designer.T("Small", "小"));
+        formSize = SegRow(app, c, t, Designer.T("Control size", "控件大小"), szOpts, formSize, ix, iy, iw);
         iy = iy + app.Scale(54);
-        labelWidth = IntRow(app, c, t, "Label width", labelWidth, 8, ix, iy, iw);
+        labelWidth = IntRow(app, c, t, Designer.T("Label width", "标签宽度"), labelWidth, 8, ix, iy, iw);
         iy = iy + app.Scale(36);
         bool showStar = !hideStar;
-        showStar = ToggleRow(app, c, t, "Required star", showStar, ix, iy, iw);
+        showStar = ToggleRow(app, c, t, Designer.T("Required star", "必填星号"), showStar, ix, iy, iw);
         hideStar = !showStar;
         iy = iy + app.Scale(40);
         return iy;
@@ -2091,7 +2466,7 @@ class Designer {
                 ck = ck + 1;
             }
             if (cnt > 0) {
-                c.DrawText(ix, iy, grp + "  (" + Convert.ToString(cnt) + ")", t.textSecondary, fs);
+                c.DrawText(ix, iy, Designer.GroupLabel(grp) + "  (" + Convert.ToString(cnt) + ")", t.textSecondary, fs);
                 iy = iy + app.Scale(20);
                 int ei = 0;
                 while (ei < evs.Count) {
@@ -2111,12 +2486,12 @@ class Designer {
                         if (hv == "") { hv = "—"; } else { hColor = t.success; }
                         c.DrawText(ix + app.Scale(92), iy + app.Scale(5),
                             Ellipsis.Fit(hv, iw - app.Scale(180), fs), hColor, fs);
-                        int edId = SmallBtn(app, "edit", 0, ix + iw - app.Scale(84), iy, app.Scale(40));
+                        int edId = SmallBtn(app, Designer.T("edit", "编辑"), 0, ix + iw - app.Scale(84), iy, app.Scale(40));
                         if (Button.WasClicked(app, edId)) {
                             if (root) { winEvtEditing = ev; evtSig.Set(WinGetHandler(ev)); }
                             else { evtEditing = ev; evtSig.Set(sel.GetHandler(ev)); }
                         }
-                        int crId = SmallBtn(app, "new", 1, ix + iw - app.Scale(40), iy, app.Scale(40));
+                        int crId = SmallBtn(app, Designer.T("new", "新建"), 1, ix + iw - app.Scale(40), iy, app.Scale(40));
                         if (Button.WasClicked(app, crId)) {
                             if (root) {
                                 winEvtEditing = ev;
@@ -2199,6 +2574,19 @@ class Designer {
         return "Value & Data";
     }
 
+    /// Display label for an event category heading. Category KEYS stay
+    /// English (they are matched by string equality); only the heading text
+    /// shown in the Events tab is translated.
+    static string GroupLabel(string grp) {
+        if (grp == "Pointer") { return Designer.T("Pointer", "指针"); }
+        if (grp == "Keyboard") { return Designer.T("Keyboard", "键盘"); }
+        if (grp == "Focus") { return Designer.T("Focus", "焦点"); }
+        if (grp == "Drag & Drop") { return Designer.T("Drag & Drop", "拖放"); }
+        if (grp == "Lifecycle") { return Designer.T("Lifecycle", "生命周期"); }
+        if (grp == "Value & Data") { return Designer.T("Value & Data", "值与数据"); }
+        return grp;
+    }
+
     /// Category display order for the Events tab.
     static List<string> EventGroups() {
         List<string> g = new List<string>();
@@ -2233,9 +2621,9 @@ class Designer {
     bool ToggleRow(App app, Canvas c, Theme t, string label, bool val, int ix, int iy, int iw) {
         int fs = t.fontSizeSmall;
         c.DrawText(ix, iy + app.Scale(7), label, t.textSecondary, fs);
-        string disp = "Off";
+        string disp = Designer.T("Off", "关");
         int ty = 0;
-        if (val) { disp = "On"; ty = 3; }
+        if (val) { disp = Designer.T("On", "开"); ty = 3; }
         int id = SmallBtn(app, disp, ty, ix + iw - app.Scale(54), iy, app.Scale(54));
         bool nv = val;
         if (Button.WasClicked(app, id)) { nv = !val; }
@@ -2285,14 +2673,14 @@ class Designer {
 
     void RenderStatus(App app, Canvas c, Theme t, int x, int y, int w) {
         int fs = t.fontSizeSmall;
-        string s = Convert.ToString(fields.Count) + " fields";
+        string s = Convert.ToString(fields.Count) + Designer.T(" fields", " 个组件");
         if (sel != null) {
-            s = s + "   ·   selected: " + FormField.TypeName(sel.ftype) + " '" + sel.fname + "'";
+            s = s + Designer.T("   ·   selected: ", "   ·   已选中：") + FormField.TypeName(sel.ftype) + " '" + sel.fname + "'";
         }
         if (activeContainer != null) {
-            s = s + "   ·   adding into: " + FormField.TypeName(activeContainer.ftype);
+            s = s + Designer.T("   ·   adding into: ", "   ·   添加到：") + FormField.TypeName(activeContainer.ftype);
             if (activeContainer.ftype == 36) {
-                s = s + " tab " + Convert.ToString(activeContainer.uiState.Get() + 1);
+                s = s + Designer.T(" tab ", " 标签页 ") + Convert.ToString(activeContainer.uiState.Get() + 1);
             }
         }
         c.DrawText(x, y, s + "     ·     " + msg, t.textTertiary, fs);
@@ -2444,58 +2832,8 @@ class Designer {
                     submitSig.Set(JStr(JAfter(ln)));
                 }
             } else {
-                if (StartsWith(ln, "{")) {
-                    FormField nf = new FormField(0);
-                    nf.SetOptionsFrom("");
-                    if (stack.Count > 0) {
-                        stack[stack.Count - 1].kids.Add(nf);
-                    } else {
-                        fields.Add(nf);
-                    }
-                    stack.Add(nf);
-                    total = total + 1;
-                } else if (StartsWith(ln, "}")) {
-                    if (stack.Count > 0) { stack.RemoveAt(stack.Count - 1); }
-                } else if (stack.Count > 0) {
-                    FormField cur = stack[stack.Count - 1];
-                    if (LineKey(ln, "type")) {
-                        cur.ftype = JInt(JAfter(ln));
-                    } else if (LineKey(ln, "custom")) {
-                        cur.customKind = JStr(JAfter(ln));
-                    } else if (LineKey(ln, "label")) {
-                        cur.label = JStr(JAfter(ln));
-                    } else if (LineKey(ln, "name")) {
-                        cur.fname = JStr(JAfter(ln));
-                        cur.name = cur.fname;
-                    } else if (LineKey(ln, "placeholder")) {
-                        cur.placeholder = JStr(JAfter(ln));
-                    } else if (LineKey(ln, "bind")) {
-                        cur.bindPath = JStr(JAfter(ln));
-                    } else if (LineKey(ln, "bindProp")) {
-                        cur.bindProp = JStr(JAfter(ln));
-                    } else if (LineKey(ln, "required")) {
-                        cur.required = JBool(JAfter(ln));
-                    } else if (LineKey(ln, "span")) {
-                        cur.span = JInt(JAfter(ln));
-                    } else if (LineKey(ln, "defOn")) {
-                        cur.defOn = JBool(JAfter(ln));
-                    } else if (LineKey(ln, "childTab")) {
-                        cur.childTab = JInt(JAfter(ln));
-                    } else if (LineKey(ln, "activeTab")) {
-                        cur.uiState.Set(JInt(JAfter(ln)));
-                    } else if (LineKey(ln, "change")) {
-                        cur.SetHandler("Change", JStr(JAfter(ln)));
-                    } else if (LineKey(ln, "options")) {
-                        string rawOptions = JAfter(ln);
-                        while (!JsonArrayClosed(rawOptions) && i + 1 < lines.Count) {
-                            i = i + 1;
-                            rawOptions = rawOptions + "\n" + Trim(lines[i]);
-                        }
-                        ParseOptions(cur, rawOptions);
-                    } else {
-                        ParseHandlerLine(cur, ln);
-                    }
-                }
+                if (StartsWith(ln, "{")) { total = total + 1; }
+                i = ParseFieldLine(lines, i, ln, fields, stack);
             }
             i = i + 1;
         }
@@ -2503,6 +2841,85 @@ class Designer {
         sel = null;
         selPrev = null;
         activeContainer = null;
+    }
+
+    /// Handles one line inside the "fields" array (shared by LoadJson and
+    /// ParseComponentFields); returns the possibly-advanced line index (the
+    /// "options" array can span several lines).
+    int ParseFieldLine(List<string> lines, int i, string ln,
+            List<FormField> topList, List<FormField> stack) {
+        if (StartsWith(ln, "{")) {
+            FormField nf = new FormField(0);
+            nf.SetOptionsFrom("");
+            if (stack.Count > 0) {
+                stack[stack.Count - 1].kids.Add(nf);
+            } else {
+                topList.Add(nf);
+            }
+            stack.Add(nf);
+        } else if (StartsWith(ln, "}")) {
+            if (stack.Count > 0) { stack.RemoveAt(stack.Count - 1); }
+        } else if (stack.Count > 0) {
+            FormField cur = stack[stack.Count - 1];
+            if (LineKey(ln, "type")) {
+                cur.ftype = JInt(JAfter(ln));
+            } else if (LineKey(ln, "custom")) {
+                cur.customKind = JStr(JAfter(ln));
+            } else if (LineKey(ln, "label")) {
+                cur.label = JStr(JAfter(ln));
+            } else if (LineKey(ln, "name")) {
+                cur.fname = JStr(JAfter(ln));
+                cur.name = cur.fname;
+            } else if (LineKey(ln, "placeholder")) {
+                cur.placeholder = JStr(JAfter(ln));
+            } else if (LineKey(ln, "bind")) {
+                cur.bindPath = JStr(JAfter(ln));
+            } else if (LineKey(ln, "bindProp")) {
+                cur.bindProp = JStr(JAfter(ln));
+            } else if (LineKey(ln, "required")) {
+                cur.required = JBool(JAfter(ln));
+            } else if (LineKey(ln, "span")) {
+                cur.span = JInt(JAfter(ln));
+            } else if (LineKey(ln, "defOn")) {
+                cur.defOn = JBool(JAfter(ln));
+            } else if (LineKey(ln, "childTab")) {
+                cur.childTab = JInt(JAfter(ln));
+            } else if (LineKey(ln, "activeTab")) {
+                cur.uiState.Set(JInt(JAfter(ln)));
+            } else if (LineKey(ln, "change")) {
+                cur.SetHandler("Change", JStr(JAfter(ln)));
+            } else if (LineKey(ln, "options")) {
+                string rawOptions = JAfter(ln);
+                while (!JsonArrayClosed(rawOptions) && i + 1 < lines.Count) {
+                    i = i + 1;
+                    rawOptions = rawOptions + "\n" + Trim(lines[i]);
+                }
+                ParseOptions(cur, rawOptions);
+            } else {
+                ParseHandlerLine(cur, ln);
+            }
+        }
+        return i;
+    }
+
+    /// Parses just the "fields" array of a design JSON into a fresh list,
+    /// used to instantiate saved user components without touching the form.
+    List<FormField> ParseComponentFields(string s) {
+        List<string> lines = Serialize.SplitLines(s);
+        List<FormField> outp = new List<FormField>();
+        List<FormField> stack = new List<FormField>();
+        bool inFields = false;
+        int i = 0;
+        while (i < lines.Count) {
+            string ln = Trim(lines[i]);
+            if (!inFields) {
+                if (LineKey(ln, "fields")) { inFields = true; }
+            } else {
+                i = ParseFieldLine(lines, i, ln, outp, stack);
+            }
+            i = i + 1;
+        }
+        return outp;
     }
 
     // --- JSON helpers --------------------------------------------------------

@@ -20,6 +20,10 @@ class Input : Control {
     SignalString model;
     string hint;
     int cursorPos;
+    // Selection anchor (the fixed end; the caret is the moving end): -1 when
+    // there is no selection. Set on mouse press / Shift+move, cleared on any
+    // plain caret move or edit.
+    int selAnchor;
     int wid;
     /// Fires whenever the text changes (C#-style: `inp.Change += h;`).
     UiEvent Change;
@@ -34,6 +38,7 @@ class Input : Control {
         model = sig;
         hint = hintText;
         cursorPos = 0;
+        selAnchor = -1;
         wid = WidgetId.Next();
         Change = UiEvent.Create();
         Submit = UiEvent.Create();
@@ -65,6 +70,27 @@ class Input : Control {
         string txt = model.Get();
         if (cursorPos > txt.Length) { cursorPos = txt.Length; }
         if (cursorPos < 0) { cursorPos = 0; }
+        if (selAnchor > txt.Length) { selAnchor = txt.Length; }
+    }
+
+    bool HasSel() { return selAnchor >= 0 && selAnchor != cursorPos; }
+    int SelStart() { if (selAnchor >= 0 && selAnchor < cursorPos) { return selAnchor; } return cursorPos; }
+    int SelEnd() { if (selAnchor > cursorPos) { return selAnchor; } return cursorPos; }
+
+    string SelText() {
+        if (!HasSel()) { return ""; }
+        return model.Get().Substring(SelStart(), SelEnd() - SelStart());
+    }
+
+    /// Removes the selected range and collapses the caret to its start.
+    void DeleteSel() {
+        if (!HasSel()) { return; }
+        string txt = model.Get();
+        int s = SelStart();
+        int e = SelEnd();
+        model.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
+        cursorPos = s;
+        selAnchor = -1;
     }
 
     void HandleInput(App app) {
@@ -74,7 +100,11 @@ class Input : Control {
         if (kind == 6) {
             int code = app.window.EventKeyCode();
             if (code == 8) {
-                if (cursorPos > 0) {
+                if (HasSel()) {
+                    DeleteSel();
+                    Change.Raise();
+                    app.RequestRedraw();
+                } else if (cursorPos > 0) {
                     int start = Text.PrevCharStart(txt, cursorPos);
                     model.Set(Text.DeleteBefore(txt, cursorPos));
                     cursorPos = start;
@@ -89,20 +119,74 @@ class Input : Control {
             } else {
                 string ch = Text.CharStr(code);
                 if (ch.Length > 0) {
+                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
                     model.Set(Text.InsertAt(txt, cursorPos, ch));
                     cursorPos = cursorPos + ch.Length;
+                    selAnchor = -1;
                     Change.Raise();
                     app.RequestRedraw();
                 }
             }
         } else if (kind == 4) {
             int kc = app.window.EventKeyCode();
-            if (kc == 37) { if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); } app.RequestRedraw(); }
-            else if (kc == 39) { if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); } app.RequestRedraw(); }
-            else if (kc == 36) { cursorPos = 0; app.RequestRedraw(); }
-            else if (kc == 35) { cursorPos = txt.Length; app.RequestRedraw(); }
-            else if (kc == 46) {
-                if (cursorPos < txt.Length) {
+            int mods = app.window.EventMods();
+            bool shift = Modifiers.HasShift(mods);
+            bool ctrl = Modifiers.HasCtrl(mods);
+            if (ctrl && kc == 65) {
+                // Ctrl+A: select all.
+                selAnchor = 0;
+                cursorPos = txt.Length;
+                app.RequestRedraw();
+            } else if (ctrl && kc == 67) {
+                // Ctrl+C: copy the selection (whole text when none).
+                if (HasSel()) { Clipboard.SetText(SelText()); }
+                else { Clipboard.SetText(txt); }
+            } else if (ctrl && kc == 88) {
+                // Ctrl+X: cut.
+                if (HasSel()) {
+                    Clipboard.SetText(SelText());
+                    DeleteSel();
+                    Change.Raise();
+                    app.RequestRedraw();
+                }
+            } else if (ctrl && kc == 86) {
+                // Ctrl+V: paste over the selection.
+                string clip = Clipboard.GetText();
+                if (clip.Length > 0) {
+                    if (HasSel()) { DeleteSel(); txt = model.Get(); }
+                    model.Set(Text.InsertAt(txt, cursorPos, clip));
+                    cursorPos = cursorPos + clip.Length;
+                    selAnchor = -1;
+                    Change.Raise();
+                    app.RequestRedraw();
+                }
+            } else if (kc == 37 || kc == 39 || kc == 36 || kc == 35) {
+                // Arrow/Home/End: Shift extends the selection from the caret;
+                // a plain move collapses it (to the selection edge for arrows,
+                // like every native text field).
+                if (shift) {
+                    if (selAnchor < 0) { selAnchor = cursorPos; }
+                } else if (HasSel()) {
+                    if (kc == 37) { cursorPos = SelStart(); }
+                    else if (kc == 39) { cursorPos = SelEnd(); }
+                    selAnchor = -1;
+                    if (kc == 36) { cursorPos = 0; }
+                    if (kc == 35) { cursorPos = txt.Length; }
+                    app.RequestRedraw();
+                    return;
+                }
+                if (!shift) { selAnchor = -1; }
+                if (kc == 37) { if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); } }
+                else if (kc == 39) { if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); } }
+                else if (kc == 36) { cursorPos = 0; }
+                else if (kc == 35) { cursorPos = txt.Length; }
+                app.RequestRedraw();
+            } else if (kc == 46) {
+                if (HasSel()) {
+                    DeleteSel();
+                    Change.Raise();
+                    app.RequestRedraw();
+                } else if (cursorPos < txt.Length) {
                     model.Set(Text.RemoveAt(txt, cursorPos));
                     Change.Raise();
                     app.RequestRedraw();
@@ -148,6 +232,14 @@ class Input : Control {
         if (caretW > innerW) { scrollX = caretW - innerW; }
 
         c.PushClip(innerX, y, innerW, h);
+        if (focused && HasSel()) {
+            // Selection highlight behind the text.
+            int selPx0 = Canvas.MeasureText(Text.Left(txt, SelStart()), t.fontSizeMedium);
+            int selPx1 = Canvas.MeasureText(Text.Left(txt, SelEnd()), t.fontSizeMedium);
+            int selH = Canvas.FontHeight(t.fontSizeMedium);
+            c.FillRect(innerX - scrollX + selPx0, textY, selPx1 - selPx0, selH,
+                       App.LerpColor(t.bgPrimary, t.primary, 96));
+        }
         if (txt == "") {
             c.DrawText(innerX, textY, hint, t.textTertiary, t.fontSizeMedium);
         } else {
@@ -165,13 +257,36 @@ class Input : Control {
 
         app.hitTester.Register(HitRegion.Create(id, x, y, w, h, 1));
 
+        // Mouse selection: press anchors the selection and places the caret;
+        // dragging while pressed moves the caret end; release keeps the range
+        // (collapsed ranges clear the anchor).
+        if (Ui.PressedDown(app, id)) {
+            int rel = app.mouseX - (x + t.paddingSmall) + scrollX;
+            cursorPos = CodeEditor.ColFromX(txt, rel, t.fontSizeMedium);
+            if (Modifiers.HasShift(app.window.EventMods()) && selAnchor >= 0) {
+                // Shift+click extends from the existing anchor.
+            } else {
+                selAnchor = cursorPos;
+            }
+            app.RequestRedraw();
+        } else if (focused && app.focus.IsPressed(id)
+                   && app.window.EventKind() == 1) {
+            int rel = app.mouseX - (x + t.paddingSmall) + scrollX;
+            int drag = CodeEditor.ColFromX(txt, rel, t.fontSizeMedium);
+            if (drag != cursorPos) {
+                cursorPos = drag;
+                app.RequestRedraw();
+            }
+        }
         // Single-consumer click: place the caret when this input is the click
         // target resolved by the framework.
         if (Ui.Clicked(app, id)) {
             int rel = app.mouseX - (x + t.paddingSmall) + scrollX;
             cursorPos = CodeEditor.ColFromX(txt, rel, t.fontSizeMedium);
+            if (selAnchor == cursorPos) { selAnchor = -1; }
             app.RequestRedraw();
         }
+        if (!focused && selAnchor >= 0) { selAnchor = -1; }
 
         On.Fire(app, id);
         return id;

@@ -557,6 +557,10 @@ EXPORT void zan_gui_blur_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 ra
 #define ZAN_BLUR_CACHE_SLOTS 64
 typedef struct {
     int valid;
+    int sid; /* owning surface: slots are shared across windows, so a slot
+              * must never be restored into a different window's surface
+              * (that painted one window's pixels into another during e.g. a
+              * child-window open animation). */
     int x0, y0, rw, rh, r;
     u32 *pixels;
     size_t cap;
@@ -587,7 +591,7 @@ EXPORT void zan_gui_blur_rect_cached(i64 surface_id, i64 x, i64 y, i64 w,
 
     /* Reuse path: same geometry, not dirtied -> restore cached blurred pixels
      * over the (freshly redrawn, identical) backdrop without re-blurring. */
-    if (!dirty && c->valid && c->pixels
+    if (!dirty && c->valid && c->pixels && c->sid == (int)surface_id
         && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
         && c->r == r) {
         for (int j = 0; j < rh; j++) {
@@ -612,6 +616,7 @@ EXPORT void zan_gui_blur_rect_cached(i64 surface_id, i64 x, i64 y, i64 w,
         for (int i = 0; i < rw; i++) dst[i] = row[i];
     }
     c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
+    c->sid = (int)surface_id;
     c->valid = 1;
 }
 
@@ -652,6 +657,7 @@ EXPORT void zan_gui_snapshot_rect(i64 surface_id, i64 x, i64 y, i64 w,
         for (int i = 0; i < rw; i++) dst[i] = row[i];
     }
     c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = 0;
+    c->sid = (int)surface_id;
     c->valid = 1;
 }
 
@@ -668,7 +674,7 @@ EXPORT i64 zan_gui_restore_rect(i64 surface_id, i64 x, i64 y, i64 w,
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0) return 0;
     zan_blur_cache_t *c = &g_snap_cache[slot];
-    if (!c->valid || !c->pixels
+    if (!c->valid || !c->pixels || c->sid != (int)surface_id
         || c->x0 != x0 || c->y0 != y0 || c->rw != rw || c->rh != rh) {
         return 0;
     }
@@ -692,7 +698,7 @@ EXPORT i64 zan_gui_restore_sub_rect(i64 surface_id, i64 x, i64 y, i64 w,
     if (!s) return 0;
     if (slot < 0 || slot >= ZAN_SNAP_CACHE_SLOTS) return 0;
     zan_blur_cache_t *c = &g_snap_cache[slot];
-    if (!c->valid || !c->pixels) return 0;
+    if (!c->valid || !c->pixels || c->sid != (int)surface_id) return 0;
     int x0 = clamp_i((int)x, c->x0, c->x0 + c->rw);
     int y0 = clamp_i((int)y, c->y0, c->y0 + c->rh);
     int x1 = clamp_i((int)(x + w), c->x0, c->x0 + c->rw);
@@ -1401,9 +1407,9 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     g_glass_on = 1;
     /* Present the current frame immediately so the layered window has valid
      * content the moment the style flips (otherwise it can flash empty). */
-    if (g_last_surface >= 0 && g_last_surface < g_surface_count
-        && g_surfaces[g_last_surface])
-        present_layered(hwnd, g_surfaces[g_last_surface]);
+    i64 owng = (i64)(intptr_t)GetPropW(hwnd, L"ZanSurfId") - 1;
+    if (owng >= 0 && owng < g_surface_count && g_surfaces[owng])
+        present_layered(hwnd, g_surfaces[owng]);
     return 0;
 }
 
@@ -1660,12 +1666,14 @@ static LRESULT CALLBACK ZanGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        /* Repaint from the last frame so OS-driven invalidations (move, uncover,
-         * DWM) never leave the client black between app repaints. A layered
+        /* Repaint from THIS window's own last frame so OS-driven invalidations
+         * (move, uncover, DWM) never leave the client black between app
+         * repaints -- and never paint another window's frame here. A layered
          * (glass) window keeps its own composited bitmap, so WM_PAINT need not
          * re-present it. */
-        if (!g_glass_on && g_last_surface >= 0 && g_last_surface < g_surface_count)
-            blit_surface_to_hwnd(hwnd, g_surfaces[g_last_surface]);
+        i64 own = (i64)(intptr_t)GetPropW(hwnd, L"ZanSurfId") - 1;
+        if (!g_glass_on && own >= 0 && own < g_surface_count && g_surfaces[own])
+            blit_surface_to_hwnd(hwnd, g_surfaces[own]);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1954,7 +1962,35 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     HWND hwnd = (HWND)(intptr_t)hwnd_val;
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
     g_last_surface = surface_id;
+    /* Remember which surface belongs to THIS window so WM_PAINT can repaint
+     * it from its own frame. A single global last-surface repainted whichever
+     * window asked, so with two windows open an OS invalidation of the main
+     * window blitted the dialog's frame into it (ghost dialogs). */
+    SetPropW(hwnd, L"ZanSurfId", (HANDLE)(intptr_t)(surface_id + 1));
     blit_surface_to_hwnd(hwnd, g_surfaces[surface_id]);
+    return 0;
+}
+
+/* Whole-window opacity, 10..100 percent. Uses a constant-alpha layered window
+ * (independent from the per-pixel-alpha glass present). 100 removes the
+ * layered style so the normal opaque present path is restored. */
+EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    if (!hwnd) return 1;
+    if (percent < 10) percent = 10;
+    if (percent > 100) percent = 100;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (percent >= 100) {
+        if (!g_glass_on && (ex & WS_EX_LAYERED)) {
+            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+        }
+        return 0;
+    }
+    if (!(ex & WS_EX_LAYERED)) {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+    }
+    SetLayeredWindowAttributes(hwnd, 0, (BYTE)(percent * 255 / 100), LWA_ALPHA);
     return 0;
 }
 
@@ -2148,6 +2184,20 @@ static zan_sdl_win_t *sdl_find(SDL_Window *w) {
     for (int i = 0; i < g_win_count; i++)
         if (g_wins[i].win == w) return &g_wins[i];
     return NULL;
+}
+
+/* Re-present a window's own last frame from its streaming texture. Used for
+ * OS-driven invalidations (expose/show/restore) so a window never shows stale
+ * or another window's pixels while the app thread is between repaints — e.g.
+ * the ghost trails the main window showed while a child dialog opened. */
+static void sdl_represent(zan_sdl_win_t *rec) {
+    if (!rec || !rec->ren || !rec->tex || rec->closed) return;
+    SDL_SetRenderDrawColor(rec->ren, (g_bg_color >> 16) & 0xFF,
+                           (g_bg_color >> 8) & 0xFF, g_bg_color & 0xFF, 255);
+    SDL_RenderClear(rec->ren);
+    SDL_FRect dst = { 0.0f, 0.0f, (float)rec->tw, (float)rec->th };
+    SDL_RenderTexture(rec->ren, rec->tex, NULL, &dst);
+    SDL_RenderPresent(rec->ren);
 }
 
 /* Destroy any window a prior zan_gui_close_window marked closed, freeing its
@@ -2350,6 +2400,16 @@ static void sdl_translate(const SDL_Event *e) {
             }
             zq_push(kind, (int)e->button.x, (int)e->button.y, btn, 0,
                     cur_mod_bits(), w);
+            break;
+        }
+        case SDL_EVENT_WINDOW_EXPOSED:
+        case SDL_EVENT_WINDOW_SHOWN:
+        case SDL_EVENT_WINDOW_RESTORED: {
+            /* The OS invalidated this window (uncovered, shown, restored, or a
+             * neighbouring window's open animation). Repaint it from its own
+             * last frame right away instead of leaving stale pixels. */
+            SDL_Window *w = SDL_GetWindowFromID(e->window.windowID);
+            sdl_represent(sdl_find(w));
             break;
         }
         case SDL_EVENT_WINDOW_MOUSE_LEAVE: {
@@ -2855,6 +2915,17 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     (void)hwnd_val; (void)tint_argb; return 0;
 }
 EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 0; }
+
+/* Whole-window opacity, 10..100 percent. SDL composites this natively on
+ * every platform (DWM / X11 compositor / Cocoa). */
+EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win) return 1;
+    if (percent < 10) percent = 10;
+    if (percent > 100) percent = 100;
+    SDL_SetWindowOpacity(win, (float)percent / 100.0f);
+    return 0;
+}
 
 EXPORT i64 zan_gui_write_file(const char *path, const char *utf8) {
     if (!path || !utf8) return -1;
@@ -4469,6 +4540,27 @@ EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) {
     return 0;
 }
 
+/* Whole-window opacity via the EWMH _NET_WM_WINDOW_OPACITY hint (honoured by
+ * any compositing WM). percent is 10..100. */
+EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+    if (!g_display) return 1;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    if (!xid) return 1;
+    if (percent < 10) percent = 10;
+    if (percent > 100) percent = 100;
+    Atom op = x11_atom("_NET_WM_WINDOW_OPACITY");
+    if (percent >= 100) {
+        XDeleteProperty(g_display, xid, op);
+    } else {
+        unsigned long v =
+            (unsigned long)((double)percent / 100.0 * 4294967295.0);
+        XChangeProperty(g_display, xid, op, XA_CARDINAL, 32,
+                        PropModeReplace, (unsigned char *)&v, 1);
+    }
+    XFlush(g_display);
+    return 0;
+}
+
 EXPORT i64 zan_gui_get_dpi_scale(void) {
     if (!g_display) return 100;
     int screen = DefaultScreen(g_display);
@@ -4648,6 +4740,9 @@ EXPORT i64 zan_gui_enable_glass(i64 hwnd_val, i64 tint_argb) {
     (void)hwnd_val; (void)tint_argb; return 1;
 }
 EXPORT i64 zan_gui_disable_glass(i64 hwnd_val) { (void)hwnd_val; return 1; }
+EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+    (void)hwnd_val; (void)percent; return 1;
+}
 #endif
 
 /* Window management: X11 has real implementations in the __linux__ branch
