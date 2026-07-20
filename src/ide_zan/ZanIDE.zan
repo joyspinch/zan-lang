@@ -780,7 +780,8 @@ class ZanIDE {
         // ---- Publish dialog state ----
         // pubSel holds a 0/1 flag per platform, parallel to the id list in
         // PlatformCsv (windows-x64, windows-arm64, linux-x64, linux-arm64,
-        // macos-x64, macos-arm64). Non-Windows targets are locked on Windows.
+        // macos-x64, macos-arm64). All targets are cross-compiled by zanc
+        // via --target, so non-Windows targets are selectable too.
         bool pubOpen = false;
         List<int> pubSel = new List<int>();
 
@@ -3933,18 +3934,45 @@ class ZanIDE {
             log.Add("> Published " + exe);
             published = published + 1;
         }
+        // Non-Windows targets: cross-compiled through zanc's own bundled linker
+        // (--target selects the triple; no external toolchain needed). Linux x64
+        // uses the musl static target so the result is a single portable file.
+        if (sel.Count > 2 && sel[2] == 1) {
+            string exe = root + "/publish/" + baseName + "-linux-x64";
+            ZanIDE.PublishNative(inputs, exe, "linux-musl", " --link-mode static", log);
+            published = published + 1;
+        }
+        if (sel.Count > 3 && sel[3] == 1) {
+            string exe = root + "/publish/" + baseName + "-linux-arm64";
+            ZanIDE.PublishNative(inputs, exe, "linux-arm64", "", log);
+            published = published + 1;
+        }
+        if (sel.Count > 4 && sel[4] == 1) {
+            string exe = root + "/publish/" + baseName + "-macos-x64";
+            ZanIDE.PublishNative(inputs, exe, "macos-x64", "", log);
+            published = published + 1;
+        }
+        if (sel.Count > 5 && sel[5] == 1) {
+            string exe = root + "/publish/" + baseName + "-macos-arm64";
+            ZanIDE.PublishNative(inputs, exe, "macos-arm64", "", log);
+            published = published + 1;
+        }
         if (published > 0) { ZanIDE.CopyResources(root, root + "/publish", log); }
-        bool anyLocked = false;
-        if (sel.Count > 2 && sel[2] == 1) { anyLocked = true; }
-        if (sel.Count > 3 && sel[3] == 1) { anyLocked = true; }
-        if (sel.Count > 4 && sel[4] == 1) { anyLocked = true; }
-        if (sel.Count > 5 && sel[5] == 1) { anyLocked = true; }
-        if (anyLocked) {
-            log.Add("> Skipped Linux/macOS targets: cross-compiling from Windows needs their toolchains (locked).");
-        }
         if (published == 0) {
-            log.Add("> No Windows target selected; nothing published.");
+            log.Add("> No target selected; nothing published.");
         }
+    }
+
+    /// Cross-compiles `inputs` for a native `target` triple (see
+    /// zanc --list-targets) via zanc's own bundled linker, writing `exe`.
+    /// `extra` carries per-target flags (e.g. " --link-mode static").
+    static void PublishNative(string inputs, string exe, string target, string extra, List<string> log) {
+        string cmd = ZanIDE.ZancCmd() + " --publish " + inputs
+            + " --target " + target + extra + " -o \"" + exe + "\"";
+        log.Add("> Publishing " + target + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        ZanIDE.AppendAll(log, outp);
+        log.Add("> Published " + exe);
     }
 
     /// Registers a clickable hit region for a dialog button so the shared
@@ -3992,7 +4020,6 @@ class ZanIDE {
         int i = 0;
         while (i < 6) {
             int ry = listY + i * rowH;
-            bool isWin = i < 2;
             bool on = false;
             if (i < sel.Count && sel[i] == 1) { on = true; }
             int boxX = listX;
@@ -4000,22 +4027,16 @@ class ZanIDE {
             int boxCol = t.bgSecondary;
             int borderCol = t.borderSecondary;
             int labelCol = t.textSecondary;
-            if (!isWin) { labelCol = t.textDisabled; borderCol = t.borderSecondary; }
-            if (isWin && on) { boxCol = t.primary; }
+            if (on) { boxCol = t.primary; }
             c.FillRoundRect(boxX, boxY, boxSize, boxSize, app.Scale(3), boxCol);
             c.DrawRect(boxX, boxY, boxSize, boxSize, borderCol, 1);
-            if (isWin && on) {
+            if (on) {
                 Icon.Draw(c, "check", boxX + app.Scale(3), boxY + app.Scale(3), boxSize - app.Scale(6), t.bgPrimary);
             }
             int lblY = ry + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
             c.DrawText(boxX + boxSize + app.Scale(10), lblY, disp[i], labelCol, t.fontSizeMedium);
-            if (!isWin) {
-                c.DrawText(x + w - pad - app.Scale(118), lblY, ZanIDE.T("locked on Windows", "Windows 上不可选"), t.textDisabled, t.fontSizeSmall);
-            }
-            if (isWin) {
-                ZanIDE.HandRegion(app, boxX, ry, x + w - pad - boxX, rowH);
-            }
-            if (isWin && app.window.EventKind() == 3
+            ZanIDE.HandRegion(app, boxX, ry, x + w - pad - boxX, rowH);
+            if (app.window.EventKind() == 3
                 && app.mouseX >= boxX && app.mouseX < x + w - pad
                 && app.mouseY >= ry && app.mouseY < ry + rowH) {
                 clicked = i;
@@ -4029,7 +4050,7 @@ class ZanIDE {
         }
 
         c.DrawText(x + pad, listY + 6 * rowH + app.Scale(8),
-            ZanIDE.T("Non-Windows targets need a cross toolchain — unavailable on this host.", "非 Windows 目标需要交叉编译工具链——本机不可用。"),
+            ZanIDE.T("Linux/macOS are cross-compiled here; run them on that OS (Linux musl is fully static).", "Linux/macOS 为本机交叉编译产物，需在对应系统运行（Linux musl 为全静态单文件）。"),
             t.textSecondary, t.fontSizeSmall);
 
         int btnH = app.Scale(30);
