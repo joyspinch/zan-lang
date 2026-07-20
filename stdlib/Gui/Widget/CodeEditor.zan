@@ -123,6 +123,11 @@ class CodeEditor {
     // Raw source of every other project file, kept so signature help can parse
     // the real parameter list of a user/project method (not just its name).
     List<string> projFileSrc;
+    // Cross-file type scan is deferred: SetProjectFiles() only stores the
+    // sources (cheap, keeps tab switches snappy) and marks this dirty; the
+    // actual per-file ScanTypesInto only runs the first time completion needs
+    // it, via EnsureProjectScan().
+    bool projScanDirty;
     // Missing-`using` quick-fix map: fixLines[i] is a line whose error can be
     // resolved by inserting `using fixNs[i];`.
     List<int> fixLines;
@@ -228,6 +233,7 @@ class CodeEditor {
         e.projTypeNames = new List<string>();
         e.projTypeMembers = new List<string>();
         e.projFileSrc = new List<string>();
+        e.projScanDirty = false;
         e.fixLines = new List<int>();
         e.fixNs = new List<string>();
         e.bps = new List<int>();
@@ -2258,12 +2264,21 @@ class CodeEditor {
     /// Host IDE hook: supply the source text of every other project file so the
     /// editor can resolve cross-file types (e.g. a `Utils` class in utils.zan).
     void SetProjectFiles(List<string> contents) {
+        projFileSrc = contents;
+        projScanDirty = true;
+    }
+
+    /// Runs the deferred cross-file type scan if SetProjectFiles() left it
+    /// pending. Called lazily by the completion paths so a tab switch itself
+    /// stays cheap.
+    void EnsureProjectScan() {
+        if (!projScanDirty) { return; }
+        projScanDirty = false;
         projTypeNames = new List<string>();
         projTypeMembers = new List<string>();
-        projFileSrc = contents;
         int i = 0;
-        while (i < contents.Count) {
-            CodeEditor.ScanTypesInto(contents[i], projTypeNames, projTypeMembers);
+        while (i < projFileSrc.Count) {
+            CodeEditor.ScanTypesInto(projFileSrc[i], projTypeNames, projTypeMembers);
             i = i + 1;
         }
     }
@@ -2436,6 +2451,7 @@ class CodeEditor {
     /// True when `name` is a type declared in the project (other files) or the
     /// current buffer.
     bool IsProjectType(string name) {
+        EnsureProjectScan();
         if (CodeEditor.Has(projTypeNames, name)) { return true; }
         List<string> tn = new List<string>();
         List<string> tm = new List<string>();
@@ -2446,6 +2462,7 @@ class CodeEditor {
     /// Looks up the declared members of user type `typeName` (project files, then
     /// current buffer). Returns true and fills `outMem` when found.
     bool FindTypeMembers(string typeName, List<string> outMem) {
+        EnsureProjectScan();
         int i = 0;
         while (i < projTypeNames.Count) {
             if (projTypeNames[i] == typeName) {
@@ -2551,6 +2568,7 @@ class CodeEditor {
 
     /// Adds project-declared types (and their members) to completion.
     void AddProjectCandidates(List<string> cand, List<string> kinds) {
+        EnsureProjectScan();
         int i = 0;
         while (i < projTypeNames.Count) {
             if (!CodeEditor.Has(cand, projTypeNames[i])) { cand.Add(projTypeNames[i]); kinds.Add("T"); }
@@ -2599,6 +2617,7 @@ class CodeEditor {
     /// Scans the buffer for `using X;` type usages that require an import which is
     /// missing, recording a diagnostic + quick-fix per offending line.
     void AnalyzeMissingUsings() {
+        EnsureProjectScan();
         fixLines = new List<int>();
         fixNs = new List<string>();
         List<string> usings = new List<string>();
