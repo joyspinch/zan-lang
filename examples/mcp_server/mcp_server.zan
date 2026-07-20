@@ -3,14 +3,13 @@ using System.IO;
 using System.Json;
 using System.Diagnostics;
 using System.Net.Sockets;
-using System.Net.Http;
 using System.Threading;
 
 /// Minimal MCP (Model Context Protocol) server for the Zan IDE project,
 /// using the streamable-HTTP transport: external AI tools POST JSON-RPC
 /// to http://127.0.0.1:8848/ (methods: initialize, tools/list, tools/call).
 ///
-/// Run it from your project root: zanc run examples/mcp_server/mcp_server.zan
+/// Run it from the project root (the IDE Tools pane runs tools there).
 /// Exposed tools (all sandboxed to the current project root):
 ///   list_files(path)          - list a project directory
 ///   read_file(path)           - read a project file
@@ -26,61 +25,105 @@ class McpServer {
         McpServer.root = ".";
         Console.WriteLine("Zan MCP server: project root = current directory");
         Console.WriteLine("MCP endpoint: http://127.0.0.1:8848/ (streamable HTTP JSON-RPC)");
-        McpServer.Serve();
+        int r = await McpServer.Serve();
     }
 
-    static async void Serve() {
+    static async int Serve() {
         Socket.Initialize();
-        TcpListener listener = TcpListener.Create("127.0.0.1", 8848);
-        listener.Start();
+        int listener = Socket.CreateTcp();
+        Socket.SetReuseAddr(listener);
+        Socket.Bind(listener, "127.0.0.1", 8848);
+        Socket.Listen(listener, 16);
+        Socket.SetNonBlocking(listener);
         while (true) {
-            int clientSock = await listener.AcceptAsync();
-            if (clientSock >= 0) {
-                Task.Spawn(McpServer.HandleConn(clientSock));
+            int client = await AsyncSocket.Accept(listener);
+            Socket.SetNonBlocking(client);
+            Task.Spawn(McpServer.HandleConn(client));
+        }
+        return 0;
+    }
+
+    /// One request per connection ("Connection: close"): reads the request
+    /// until Content-Length bytes of body have arrived, answers, closes.
+    static async void HandleConn(int client) {
+        string raw = "";
+        int need = 0 - 1;
+        int rounds = 0;
+        while (rounds < 200) {
+            string chunk = await AsyncSocket.Receive(client, 65536);
+            if (chunk.Length == 0) { break; }
+            raw = raw + chunk;
+            int hdrEnd = McpServer.Find(raw, "\r\n\r\n");
+            if (hdrEnd >= 0) {
+                if (need < 0) { need = McpServer.ContentLength(raw); }
+                if (raw.Length - hdrEnd - 4 >= need) { break; }
             }
+            rounds = rounds + 1;
         }
+        string body = "";
+        int he = McpServer.Find(raw, "\r\n\r\n");
+        if (he >= 0) { body = raw.Substring(he + 4, raw.Length - he - 4); }
+        string method = "GET";
+        if (raw.Length >= 4 && raw.Substring(0, 4) == "POST") { method = "POST"; }
+        string respBody = McpServer.Handle(method, body);
+        string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + "Content-Length: " + Convert.ToString(respBody.Length)
+            + "\r\nConnection: close\r\n\r\n" + respBody;
+        int _sent = await AsyncSocket.SendString(client, resp);
+        Socket.Close(client);
     }
 
-    static async void HandleConn(int clientSock) {
-        TcpClient client = TcpClient.FromSocket(clientSock);
-        bool keepAlive = true;
-        while (keepAlive) {
-            string rawData = await client.RecvReuseAsync();
-            if (rawData.Length == 0) { break; }
-            HttpRequest request = HttpRequest.Parse(rawData);
-            keepAlive = request.keepAlive;
-            HttpResponse response = McpServer.Handle(request);
-            response = response.SetKeepAlive(keepAlive);
-            int _sent = await client.SendAsync(response.Build());
-            if (!keepAlive) { break; }
+    /// First index of `pat` in `s`, or -1.
+    static int Find(string s, string pat) {
+        if (pat.Length == 0 || s.Length < pat.Length) { return 0 - 1; }
+        int i = 0;
+        while (i <= s.Length - pat.Length) {
+            if (s.Substring(i, pat.Length) == pat) { return i; }
+            i = i + 1;
         }
-        client.Close();
+        return 0 - 1;
     }
 
-    static HttpResponse Handle(HttpRequest req) {
-        if (req.method != "POST") {
-            return HttpResponse.Ok("Zan MCP server. POST JSON-RPC to this endpoint.");
+    static int ContentLength(string raw) {
+        int p = McpServer.Find(raw, "Content-Length:");
+        if (p < 0) { p = McpServer.Find(raw, "content-length:"); }
+        if (p < 0) { return 0; }
+        int i = p + 15;
+        while (i < raw.Length && raw.Substring(i, 1) == " ") { i = i + 1; }
+        int n = 0;
+        while (i < raw.Length) {
+            string ch = raw.Substring(i, 1);
+            if (ch < "0" || ch > "9") { break; }
+            n = n * 10 + Convert.ToInt32(ch);
+            i = i + 1;
         }
-        JsonValue v = JsonValue.Parse(req.body);
+        return n;
+    }
+
+    static string Handle(string method, string body) {
+        if (method != "POST") {
+            return "{\"error\": \"POST JSON-RPC to this endpoint\"}";
+        }
+        JsonValue v = JsonValue.Parse(body);
         if (v == null) {
-            return McpServer.Json(McpServer.RpcError("null", 0 - 32700, "parse error"));
+            return McpServer.RpcError("null", 0 - 32700, "parse error");
         }
         string id = v.Str("id", "");
         JsonValue idv = v.Get("id");
         if (idv != null) { id = idv.AsString(id); }
-        string method = v.Str("method", "");
-        if (method == "initialize") {
-            return McpServer.Json(McpServer.RpcResult(id,
+        string rpc = v.Str("method", "");
+        if (rpc == "initialize") {
+            return McpServer.RpcResult(id,
                 "{\"protocolVersion\": \"2024-11-05\", \"capabilities\": {\"tools\": {}}, "
-                + "\"serverInfo\": {\"name\": \"zan-ide-mcp\", \"version\": \"1.0\"}}"));
+                + "\"serverInfo\": {\"name\": \"zan-ide-mcp\", \"version\": \"1.0\"}}");
         }
-        if (method == "notifications/initialized" || method == "initialized") {
-            return HttpResponse.Ok("");
+        if (rpc == "notifications/initialized" || rpc == "initialized") {
+            return "{}";
         }
-        if (method == "tools/list") {
-            return McpServer.Json(McpServer.RpcResult(id, McpServer.ToolsJson()));
+        if (rpc == "tools/list") {
+            return McpServer.RpcResult(id, McpServer.ToolsJson());
         }
-        if (method == "tools/call") {
+        if (rpc == "tools/call") {
             JsonValue p = v.Get("params");
             string name = "";
             JsonValue targs = null;
@@ -89,10 +132,10 @@ class McpServer {
                 targs = p.Get("arguments");
             }
             string text = McpServer.CallTool(name, targs);
-            return McpServer.Json(McpServer.RpcResult(id,
-                "{\"content\": [{\"type\": \"text\", \"text\": \"" + McpServer.Esc(text) + "\"}]}"));
+            return McpServer.RpcResult(id,
+                "{\"content\": [{\"type\": \"text\", \"text\": \"" + McpServer.Esc(text) + "\"}]}");
         }
-        return McpServer.Json(McpServer.RpcError(id, 0 - 32601, "method not found: " + method));
+        return McpServer.RpcError(id, 0 - 32601, "method not found: " + rpc);
     }
 
     static string CallTool(string name, JsonValue args) {
@@ -204,9 +247,4 @@ class McpServer {
         return sb.ToString();
     }
 
-    static HttpResponse Json(string body) {
-        HttpResponse r = HttpResponse.Ok(body);
-        r.SetHeader("Content-Type", "application/json");
-        return r;
-    }
 }
