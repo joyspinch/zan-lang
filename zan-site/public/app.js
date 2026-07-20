@@ -196,6 +196,67 @@
     });
   }
 
+  // ===== full-screen hero particle constellation =====
+  (function () {
+    var cv = document.querySelector(".hero-canvas");
+    if (!cv || !cv.getContext) return;
+    var ctx = cv.getContext("2d");
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var W = 0, H = 0, pts = [], mouse = { x: -9999, y: -9999 };
+    var COLORS = [[91, 108, 255], [155, 92, 255], [255, 92, 157], [15, 180, 136]];
+    function resize() {
+      W = cv.clientWidth; H = cv.clientHeight;
+      cv.width = W * dpr; cv.height = H * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      var count = Math.max(28, Math.min(92, Math.round((W * H) / 15000)));
+      pts = [];
+      for (var i = 0; i < count; i++) {
+        pts.push({
+          x: Math.random() * W, y: Math.random() * H,
+          vx: (Math.random() - 0.5) * 0.35, vy: (Math.random() - 0.5) * 0.35,
+          r: Math.random() * 1.7 + 1.1, c: COLORS[i % COLORS.length]
+        });
+      }
+    }
+    resize();
+    window.addEventListener("resize", resize);
+    var host = cv.closest(".hero") || document;
+    host.addEventListener("pointermove", function (e) {
+      var r = cv.getBoundingClientRect(); mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
+    }, { passive: true });
+    host.addEventListener("pointerleave", function () { mouse.x = -9999; mouse.y = -9999; });
+
+    var LINK = 132, LINK2 = LINK * LINK;
+    function draw(animate) {
+      ctx.clearRect(0, 0, W, H);
+      var i, j, p;
+      for (i = 0; i < pts.length; i++) {
+        p = pts[i];
+        if (animate) { p.x += p.vx; p.y += p.vy; }
+        if (p.x < 0) { p.x = 0; p.vx *= -1; } else if (p.x > W) { p.x = W; p.vx *= -1; }
+        if (p.y < 0) { p.y = 0; p.vy *= -1; } else if (p.y > H) { p.y = H; p.vy *= -1; }
+        var mdx = p.x - mouse.x, mdy = p.y - mouse.y, md2 = mdx * mdx + mdy * mdy;
+        if (md2 < 15000) { var md = Math.sqrt(md2) || 1, f = (122 - md) / 122 * 0.7; p.x += mdx / md * f; p.y += mdy / md * f; }
+      }
+      for (i = 0; i < pts.length; i++) {
+        for (j = i + 1; j < pts.length; j++) {
+          var a = pts[i], b = pts[j], dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
+          if (d2 < LINK2) {
+            var al = (1 - Math.sqrt(d2) / LINK) * 0.5;
+            ctx.strokeStyle = "rgba(" + a.c[0] + "," + a.c[1] + "," + a.c[2] + "," + al.toFixed(3) + ")";
+            ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+          }
+        }
+      }
+      for (i = 0; i < pts.length; i++) {
+        p = pts[i]; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.2832);
+        ctx.fillStyle = "rgba(" + p.c[0] + "," + p.c[1] + "," + p.c[2] + ",.9)"; ctx.fill();
+      }
+    }
+    if (reduce) { draw(false); return; }
+    (function loop() { if (!document.hidden) draw(true); requestAnimationFrame(loop); })();
+  })();
+
   // ===== Docs sidebar: scrollspy + filter =====
   var docSide = document.querySelector(".doc-side");
   if (docSide) {
