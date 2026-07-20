@@ -1313,7 +1313,24 @@ class ZanIDE {
                     rescan = true;
                 } else if (rc == 4) {
                     ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                    ZanIDE.RunActive(tabPaths, activeTab, root, log, editor);
+                    string runExe = ZanIDE.RunBuildActive(tabPaths, activeTab, root, log, editor);
+                    if (runExe != "") {
+                        // Stream the program through the persistent terminal shell so a
+                        // long-running server keeps printing into the IDE without blocking
+                        // the UI (Ctrl+C in the terminal stops it).
+                        if (termFp == 0) {
+                            termFp = ZanIDE.TermOpen(root);
+                            termLogLen = 0;
+                        }
+                        if (termFp != 0) {
+                            rightTab.Set(1);
+                            termLog.Add("> " + runExe);
+                            Process.ShellSend(termFp, "\"" + runExe + "\"");
+                            app.RequestRedraw();
+                        } else {
+                            log.Add(ZanIDE.T("[error] Could not start the shell session.", "[错误] 无法启动 shell 会话。"));
+                        }
+                    }
                 } else if (rc == 5) {
                     ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     ZanIDE.BuildActive(tabPaths, activeTab, root, log, editor);
@@ -3687,6 +3704,54 @@ class ZanIDE {
         Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
         #endif
         log.Add(ZanIDE.T("> Started (running in a separate window).", "> 已启动（在独立窗口中运行）。"));
+    }
+
+    /// Builds the active run target and returns the executable path so the caller
+    /// can stream it through the IDE terminal (non-blocking). GUI apps open their
+    /// own window, so they are launched windowless here and "" is returned.
+    /// Returns "" on build failure or when there is nothing to run; compiler
+    /// diagnostics still flow to the Output log and editor squiggles.
+    static string RunBuildActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
+        int a = active.Get();
+        if (a < 0 || a >= paths.Count) {
+            log.Add(ZanIDE.T("> Nothing to run (open a source file first).", "> 没有可运行的目标（请先打开源文件）。"));
+            return "";
+        }
+        return ZanIDE.RunBuildFile(paths[a], root, log, editor);
+    }
+
+    static string RunBuildFile(string activePath, string root, List<string> log, CodeEditor editor) {
+        string p = activePath;
+        p = ZanIDE.RunTarget(p, root);
+        if (p == "") {
+            log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
+            return "";
+        }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zanrun.ll";
+        string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
+        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
+        bool isGui = ZanIDE.IsGuiTarget(root, p);
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
+        log.Add("> Building " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        ZanIDE.AppendAll(log, outp);
+        ZanIDE.ApplyDiagnostics(editor, activePath, outp, log);
+        if (!File.Exists(exe)) {
+            log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
+            return "";
+        }
+        if (isGui) {
+            #if WINDOWS
+            Process.Run("cmd /c start \"\" \"" + exe + "\"");
+            #else
+            Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
+            #endif
+            log.Add(ZanIDE.T("> GUI app started.", "> GUI 应用已启动。"));
+            return "";
+        }
+        return exe;
     }
 
     /// Compiler inputs for Run/Build. Inside a project (a zan.proj at the root or
