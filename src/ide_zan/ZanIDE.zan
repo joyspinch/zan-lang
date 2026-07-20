@@ -799,6 +799,7 @@ class ZanIDE {
         // sidebar list.
         Input docsSearch = Input.Bind(SignalString.Create(""), ZanIDE.T("Search syntax & components...", "搜索语法与组件..."));
         SignalInt docsSel = SignalInt.Create(0);
+        SignalInt docsSection = SignalInt.Create(0);
         SignalInt docsScroll = SignalInt.Create(0);
         SignalInt docsCodeScroll = SignalInt.Create(0);
         SignalBool docsDemoBool = SignalBool.Create(true);
@@ -1001,17 +1002,35 @@ class ZanIDE {
                     if (app.fxNextMs >= 0 && (deadline < 0 || app.fxNextMs < deadline)) {
                         deadline = app.fxNextMs;
                     }
+                    // Fold the wizard child window's animation deadlines in too, so
+                    // its button hover/press cross-fades and ripples keep ticking
+                    // after the mouse stops (otherwise a fade-out freezes mid-way
+                    // until the next OS event).
+                    if (dlg != null) {
+                        if (dlg.animNextMs >= 0 && (deadline < 0 || dlg.animNextMs < deadline)) {
+                            deadline = dlg.animNextMs;
+                        }
+                        if (dlg.fxNextMs >= 0 && (deadline < 0 || dlg.fxNextMs < deadline)) {
+                            deadline = dlg.fxNextMs;
+                        }
+                    }
                     if (deadline < 0) {
                         r = app.window.WaitEvent();
                         idleWait = false;
                     } else {
                         int idleNow = Window.GetTickMs();
                         if (idleNow >= deadline) {
+                            bool childDue = false;
+                            if (dlg != null) {
+                                if (dlg.animNextMs >= 0 && idleNow >= dlg.animNextMs) { childDue = true; }
+                                if (dlg.fxNextMs >= 0 && idleNow >= dlg.fxNextMs) { childDue = true; }
+                            }
                             bool fxOnly = app.animNextMs < 0 || idleNow < app.animNextMs;
-                            if (fxOnly && app.FxPresent()) {
+                            if (!childDue && fxOnly && app.FxPresent()) {
                                 // Effect tick presented in place; keep idling.
                             } else {
                                 app.needsRedraw = true;
+                                if (childDue) { dlg.RequestRedraw(); }
                                 r = app.window.PollEvent();
                                 idleWait = false;
                             }
@@ -1273,7 +1292,7 @@ class ZanIDE {
                     catSel.Set(0);
                     pSel.Set(0);
                     pNameInput.SetText("NewProject");
-                    pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(Path.GetDirectoryName(root)));
+                    pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
                     dlg = App.CreateDark(ZanIDE.T("New Project", "新建项目"), 900, 640);
                     dlg.ApplySkin(app.ThemeMenuIndex());
                     dlg.Show();
@@ -1886,7 +1905,7 @@ class ZanIDE {
                 } else if (activeIsDocs) {
                     ZanIDE.RenderDocsPage(
                         app, c, t, edRect, docsSearch,
-                        docsSel, docsScroll, docsCodeScroll, docsDemoBool,
+                        docsSel, docsSection, docsScroll, docsCodeScroll, docsDemoBool,
                         docsDemoInt, docsDemoInput, log);
                 } else if (activeIsStart) {
                     List<string> spFiles = ZanIDE.ListZanFiles(root + "/src");
@@ -1902,7 +1921,7 @@ class ZanIDE {
                         catSel.Set(0);
                         pSel.Set(0);
                         pNameInput.SetText("NewProject");
-                        pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(Path.GetDirectoryName(root)));
+                        pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
                         dlg = App.CreateDark(ZanIDE.T("New Project", "新建项目"), 900, 640);
                         dlg.ApplySkin(app.ThemeMenuIndex());
                         dlg.Show();
@@ -2690,6 +2709,15 @@ class ZanIDE {
             if (dlg != null) {
                 if (dlg.needsRedraw && !pathPicker.IsOpen()) {
                     dlg.BeginFrame();
+                    // The wizard is immediate-mode but shares the process-wide
+                    // WidgetId counter with the main window (which the IDE never
+                    // rewinds). Pin a fixed high baseline for the dialog's own
+                    // frame so its buttons (Create/Cancel/Browse) get identical
+                    // ids every frame -- otherwise hover/press/click never match
+                    // the pointer target resolved on the previous frame and the
+                    // Cancel/Create buttons appear dead. Restore afterwards.
+                    int savedSeq = WidgetId.SeqValue();
+                    WidgetId.SetSeq(850000);
                     int action = 0;
                     if (dlgMode == 1) {
                         action = Wizard.RenderCategorized(dlg, ZanIDE.T("New Project", "新建项目"), catNames, catSel,
@@ -2703,6 +2731,7 @@ class ZanIDE {
                         action = Wizard.Render(dlg, ZanIDE.T("New File", "新建文件"), fNames, fIcons, fDescs, fSel,
                                                fNameInput, fNameInput, false);
                     }
+                    WidgetId.SetSeq(savedSeq);
                     dlg.PresentFrame();
                     lastPresent = Window.GetTickMs();
 
@@ -6794,6 +6823,8 @@ class ZanIDE {
         string cWidgets = ZanIDE.T("GUI - Widgets", "GUI - 组件");
         string cProj = ZanIDE.T("Project & Build", "项目与构建");
         string cErr = ZanIDE.T("Errors", "错误排查");
+        string cStd = ZanIDE.T("Standard Library", "标准库");
+        string cDb = ZanIDE.T("Database", "数据库");
 
         ZanIDE.DocAdd(cat, title, body, code, cStart, ZanIDE.T("Hello World", "Hello World"),
             ZanIDE.T("Every Zan program starts in a static Main method. Console.WriteLine prints a line to standard output.",
@@ -7186,13 +7217,41 @@ class ZanIDE {
             ZanIDE.T("A full source editor with diagnostics, undo/redo, multiple carets, breakpoints and completion.",
                 "完整的源代码编辑器，支持诊断、撤销/重做、多光标、断点与补全。"),
             "CodeEditor editor = CodeEditor.Create();\neditor.LoadText(\"class Program {\\n}\\n\");\neditor.Render(app, Rect.Create(40, 60, 680, 420));");
+
+        // ---- Standard Library ----
+        ZanIDE.DocAdd(cat, title, body, code, cStd, ZanIDE.T("Date & Time", "日期与时间"),
+            ZanIDE.T("DateTime.Now() and UtcNow() capture the current time. Read parts with Year(), Month(), Day(), Hour(); format with ToString().",
+                "DateTime.Now() 与 UtcNow() 获取当前时间。用 Year()、Month()、Day()、Hour() 读取各部分；用 ToString() 格式化。"),
+            "using System;\n\nDateTime now = DateTime.Now();\nConsole.WriteLine(now.ToString());\nConsole.WriteLine(Convert.ToString(now.Year()));");
+        ZanIDE.DocAdd(cat, title, body, code, cStd, ZanIDE.T("Random Numbers", "随机数"),
+            ZanIDE.T("Create a Random, then draw values: Next(), NextBelow(n), Between(lo, hi) and NextDouble(). Use Random.Seeded(seed) for a reproducible sequence.",
+                "创建 Random 后取值：Next()、NextBelow(n)、Between(lo, hi)、NextDouble()。用 Random.Seeded(seed) 得到可复现序列。"),
+            "using System;\n\nRandom rng = new Random();\nint dice = rng.Between(1, 7);\ndouble r = rng.NextDouble();\nConsole.WriteLine(Convert.ToString(dice));");
+
+        // ---- Database ----
+        ZanIDE.DocAdd(cat, title, body, code, cDb, ZanIDE.T("Connect to a Database", "连接数据库"),
+            ZanIDE.T("DbConnection reaches any engine with an ODBC driver. Use OpenSQLite for a local file, or OpenMySQL / OpenPostgreSQL / OpenSqlServer for servers. Call Close() when done.",
+                "DbConnection 通过 ODBC 驱动连接各种数据库。本地文件用 OpenSQLite；服务器用 OpenMySQL / OpenPostgreSQL / OpenSqlServer。用完调用 Close()。"),
+            "using System;\nusing System.Data;\n\nDbConnection db = DbConnection.OpenSQLite(\"app.db\");\n// DbConnection srv = DbConnection.OpenMySQL(\"127.0.0.1\", 3306, \"app\", \"root\", \"secret\");\ndb.Close();");
+        ZanIDE.DocAdd(cat, title, body, code, cDb, ZanIDE.T("Execute SQL", "执行 SQL"),
+            ZanIDE.T("Use Execute for statements that change data: CREATE, INSERT, UPDATE and DELETE.",
+                "用 Execute 执行会改变数据的语句：CREATE、INSERT、UPDATE、DELETE。"),
+            "using System.Data;\n\nDbConnection db = DbConnection.OpenSQLite(\"app.db\");\ndb.Execute(\"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)\");\ndb.Execute(\"INSERT INTO users (name) VALUES ('Alice')\");\ndb.Close();");
+        ZanIDE.DocAdd(cat, title, body, code, cDb, ZanIDE.T("Query Rows", "查询数据"),
+            ZanIDE.T("Query returns a DbResult. Loop over RowCount() and read cells with GetString / GetInt (by index) or GetByName (by column name).",
+                "Query 返回 DbResult。用 RowCount() 遍历，用 GetString / GetInt（按列号）或 GetByName（按列名）读取单元格。"),
+            "using System;\nusing System.Data;\n\nDbConnection db = DbConnection.OpenSQLite(\"app.db\");\nDbResult r = db.Query(\"SELECT id, name FROM users\");\nint i = 0;\nwhile (i < r.RowCount()) {\n    Console.WriteLine(r.GetString(i, 1));\n    i = i + 1;\n}\ndb.Close();");
+        ZanIDE.DocAdd(cat, title, body, code, cDb, ZanIDE.T("ORM Models", "ORM 模型"),
+            ZanIDE.T("The ORM maps a table to a Model. Define columns, then CreateTable, Insert rows, and Select with a fluent Where().Execute() chain.",
+                "ORM 把表映射为 Model。先定义列，再用 CreateTable 建表、Insert 插入、Select().Where().Execute() 链式查询。"),
+            "using System.Data;\nusing System.Data.Orm;\n\nModel users = Model.Define(\"users\")\n    .Column(\"id\", \"INTEGER\", true)\n    .Column(\"name\", \"TEXT\")\n    .Column(\"age\", \"INTEGER\");\nusers.CreateTable(db);\nModelRow row = ModelRow.Create().Set(\"name\", \"Alice\").Set(\"age\", \"30\");\nusers.Insert(db, row);\nList<ModelRow> adults = users.Select(db).Where(\"age > 18\").Execute();");
     }
 
     /// Renders the Help / documentation browser: a searchable sidebar of topics
     /// (language + GUI components) and a detail pane with a copyable code
     /// example, in the spirit of a component showcase.
     static void RenderDocsPage(App app, Canvas c, Theme t, Rect area, Input search,
-                               SignalInt selSig, SignalInt scrollSig,
+                               SignalInt selSig, SignalInt sectionSig, SignalInt scrollSig,
                                SignalInt codeScrollSig,
                                SignalBool demoBool, SignalInt demoInt,
                                Input demoInput, List<string> log) {
@@ -7210,20 +7269,57 @@ class ZanIDE {
         bool ownsDocsWheel = app.CaptureWheel(
             area.x, area.y, sw, area.height);
 
-        // Search box.
+        // Top-level section tabs (Syntax / Standard Library / GUI / Database).
         int sx = area.x + app.Scale(12);
-        int sy = area.y + app.Scale(12);
         int swid = sw - app.Scale(24);
         int sh = app.Scale(28);
+        int selSec = sectionSig.Get();
+        if (selSec < 0 || selSec > 3) { selSec = 0; }
+        int syTabs = area.y + app.Scale(12);
+        int tabH = app.Scale(28);
+        int nSec = 4;
+        int tabW = swid / nSec;
+        bool clickTabs = app.window.EventKind() == 3;
+        int ti = 0;
+        while (ti < nSec) {
+            int tx = sx + ti * tabW;
+            int tw = tabW - app.Scale(3);
+            bool tsel = ti == selSec;
+            bool thot = app.mouseX >= tx && app.mouseX < tx + tw
+                && app.mouseY >= syTabs && app.mouseY < syTabs + tabH;
+            if (tsel) {
+                c.FillRoundRect(tx, syTabs, tw, tabH, app.Scale(4), 0xFF094771);
+            } else if (thot) {
+                c.FillRoundRect(tx, syTabs, tw, tabH, app.Scale(4), t.bgHover);
+            }
+            int tcol = t.textSecondary;
+            if (tsel) { tcol = 0xFFFFFFFF; }
+            string tlab = ZanIDE.DocSectionName(ti);
+            int tlw = Canvas.MeasureText(tlab, t.fontSizeSmall);
+            c.DrawText(tx + (tw - tlw) / 2, syTabs + app.Scale(6), tlab, tcol, t.fontSizeSmall);
+            ZanIDE.HandRegion(app, tx, syTabs, tw, tabH);
+            if (clickTabs && thot) {
+                sectionSig.Set(ti);
+                selSec = ti;
+                scrollSig.Set(0);
+                app.RequestRedraw();
+            }
+            ti = ti + 1;
+        }
+
+        // Search box.
+        int sy = syTabs + tabH + app.Scale(8);
         search.Render(app, sx, sy, swid, sh);
         string query = ZanIDE.ToLowerS(search.GetText());
 
-        // Filter the doc entries by the query.
+        // Filter the doc entries by the query and the active section.
         List<int> filt = new List<int>();
         int fi = 0;
         while (fi < dTitle.Count) {
-            string hay = ZanIDE.ToLowerS(dTitle[fi] + " " + dCat[fi] + " " + dBody[fi]);
-            if (ZanIDE.ContainsS(hay, query)) { filt.Add(fi); }
+            if (ZanIDE.DocSection(dCat[fi]) == selSec) {
+                string hay = ZanIDE.ToLowerS(dTitle[fi] + " " + dCat[fi] + " " + dBody[fi]);
+                if (ZanIDE.ContainsS(hay, query)) { filt.Add(fi); }
+            }
             fi = fi + 1;
         }
 
@@ -7734,6 +7830,26 @@ class ZanIDE {
     /// returns the category text prefixed for visual separation.)
     static string ToUpperCat(string s) {
         return s;
+    }
+
+    /// Maps a fine-grained doc category to a top-level section index:
+    /// 0 = Syntax, 1 = Standard Library, 2 = GUI, 3 = Database.
+    static int DocSection(string cat) {
+        if (cat == ZanIDE.T("GUI - Basics", "GUI - 基础")
+            || cat == ZanIDE.T("GUI - Widgets", "GUI - 组件")) { return 2; }
+        if (cat == ZanIDE.T("Collections & Strings", "集合与字符串")
+            || cat == ZanIDE.T("Files & IO", "文件与 IO")
+            || cat == ZanIDE.T("Standard Library", "标准库")) { return 1; }
+        if (cat == ZanIDE.T("Database", "数据库")) { return 3; }
+        return 0;
+    }
+
+    /// Display label for a top-level doc section tab.
+    static string DocSectionName(int i) {
+        if (i == 1) { return ZanIDE.T("Standard Library", "标准库"); }
+        if (i == 2) { return "GUI"; }
+        if (i == 3) { return ZanIDE.T("Database", "数据库"); }
+        return ZanIDE.T("Syntax", "语法");
     }
 
     // Start page (welcome): quick actions + project file list.
