@@ -64,6 +64,19 @@ class ApiController {
 | `[Upload]` | stream the request body to disk |
 | `[Menu]` | surface this route in the admin menu (`/admin/menu`) |
 
+**Shorthand: one combined `[Api(...)]` attribute.** Instead of stacking many
+lines you can declare everything in one, mixing bare flags and `key=value`:
+
+```zan
+[Api(post, route="/api/gather", title="收集数据", auth, rank=3, lock="user")]
+static void Gather(HttpContext ctx) { ... }
+```
+
+Keys: `get/post/put/delete/patch` (or `method="POST"`), `route="/x"`,
+`title="…"`, `login`, `auth`, `rank=n`, `lock="user"|"global"`, `limit=n`,
+`upload`, `menu` — booleans may be bare (`menu`) or explicit (`menu=true`). The
+single attributes above still work and can be mixed with `[Api(...)]`.
+
 **Routes follow the directory structure.** The path is
 `<folders under src/controller> + controller name (minus "Controller") + action`,
 lower-cased — `ApiController.Status` → `/api/status`, `Admin/UserController.List`

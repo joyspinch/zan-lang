@@ -21,6 +21,9 @@ and JSON API on `:8080`. Built on the same `ZanWeb` framework as `server-mvc`
   and the full HTTP runtime metrics snapshot.
 - **Attribute-driven routes** (`[Get]`/`[Post]`/`[Route]`/`[Auth]`/`[Rank]`/
   `[Lock]`/`[Menu]`/`[Title]`) generated into `src/framework/Routes.gen.zan`.
+  These can also be collapsed into one combined attribute, e.g.
+  `[Api(post, route="/iot/clients/{id}/kick", title="踢下线", auth, rank=9, lock="global")]`
+  (bare flags + `key=value`; the single attributes still work and can be mixed).
 
 ## Layout
 

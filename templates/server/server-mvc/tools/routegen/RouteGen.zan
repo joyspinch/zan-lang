@@ -182,6 +182,57 @@ class Str {
         return val;
     }
 
+    static string Upper(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            int k = 0;
+            bool done = false;
+            while (k < 26 && !done) {
+                if (lo.Substring(k, 1) == c) {
+                    sb.Append(up.Substring(k, 1));
+                    done = true;
+                }
+                k = k + 1;
+            }
+            if (!done) { sb.Append(c); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Strips one surrounding pair of double quotes, if present.</summary>
+    static string Unquote(string s) {
+        string t = Str.Trim(s);
+        if (t.Length >= 2 && t.Substring(0, 1) == "\""
+            && t.Substring(t.Length - 1, 1) == "\"") {
+            return t.Substring(1, t.Length - 2);
+        }
+        return t;
+    }
+
+    /// <summary>Parses a decimal int from s (leading digits only), else def.</summary>
+    static int ToInt(string s, int def) {
+        string t = Str.Trim(s);
+        if (t.Length == 0) { return def; }
+        string digits = "0123456789";
+        int val = 0;
+        int i = 0;
+        while (i < t.Length) {
+            string c = t.Substring(i, 1);
+            int d = -1;
+            int k = 0;
+            while (k < 10) { if (digits.Substring(k, 1) == c) { d = k; } k = k + 1; }
+            if (d < 0) { return def; }
+            val = val * 10 + d;
+            i = i + 1;
+        }
+        return val;
+    }
+
     /// <summary>The attribute name: chars after '[' up to '(' or ']'.</summary>
     static string AttrName(string line) {
         int a = Str.Find(line, "[", 0);
@@ -320,6 +371,101 @@ class Program {
         else if (name == "Limit") { a.limit = Str.ParenInt(line, 0); }
         else if (name == "Upload") { a.upload = true; }
         else if (name == "Menu") { a.menu = true; }
+        else if (name == "Api" || name == "Acl" || name == "Http") {
+            Program.ApplyApi(line, a);
+        }
+    }
+
+    /// <summary>Combined attribute: [Api(post, route="/x", title="..", auth,
+    /// rank=9, lock="user", limit=100, upload, menu)]. Verb can be a bare flag
+    /// (get/post/put/delete/patch) or method="POST"; boolean keys may be bare
+    /// (menu) or explicit (menu=true). Coexists with the single attributes.</summary>
+    static void ApplyApi(string line, ActionInfo a) {
+        a.isRoute = true;
+        int lp = Str.Find(line, "(", 0);
+        if (lp < 0) { return; }
+        int rp = -1;
+        int k = line.Length - 1;
+        while (k > lp) {
+            if (line.Substring(k, 1) == ")") { rp = k; break; }
+            k = k - 1;
+        }
+        if (rp < 0) { rp = line.Length; }
+        string inside = line.Substring(lp + 1, rp - lp - 1);
+        List<string> parts = Program.SplitArgs(inside);
+        int i = 0;
+        while (i < parts.Count) {
+            string p = Str.Trim(parts[i]);
+            i = i + 1;
+            if (p.Length == 0) { continue; }
+            string key = p;
+            string valStr = "";
+            bool hasVal = false;
+            int eq = Program.FindEq(p);
+            if (eq >= 0) {
+                key = Str.Trim(p.Substring(0, eq));
+                valStr = Str.Trim(p.Substring(eq + 1, p.Length - eq - 1));
+                hasVal = true;
+            }
+            string lk = Str.Lower(key);
+            if (lk == "get") { a.verb = "GET"; }
+            else if (lk == "post") { a.verb = "POST"; }
+            else if (lk == "put") { a.verb = "PUT"; }
+            else if (lk == "delete") { a.verb = "DELETE"; }
+            else if (lk == "patch") { a.verb = "PATCH"; }
+            else if (lk == "method") { a.verb = Str.Upper(Str.Unquote(valStr)); }
+            else if (lk == "route" || lk == "path") { a.path = Str.Unquote(valStr); }
+            else if (lk == "title") { a.title = Str.Unquote(valStr); }
+            else if (lk == "auth") { a.auth = Program.BoolVal(valStr, hasVal); }
+            else if (lk == "login") { a.login = Program.BoolVal(valStr, hasVal); }
+            else if (lk == "rank") { a.rank = Str.ToInt(Str.Unquote(valStr), 0); }
+            else if (lk == "lock") {
+                string sc = Str.Unquote(valStr);
+                if (!hasVal || sc.Length == 0) { sc = "global"; }
+                a.lockScope = sc;
+            }
+            else if (lk == "limit") { a.limit = Str.ToInt(Str.Unquote(valStr), 0); }
+            else if (lk == "upload") { a.upload = Program.BoolVal(valStr, hasVal); }
+            else if (lk == "menu") { a.menu = Program.BoolVal(valStr, hasVal); }
+        }
+    }
+
+    /// <summary>Splits an attribute arg list on commas outside quotes.</summary>
+    static List<string> SplitArgs(string inside) {
+        List<string> outp = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        bool inStr = false;
+        int i = 0;
+        while (i < inside.Length) {
+            string c = inside.Substring(i, 1);
+            if (c == "\"") { inStr = !inStr; sb.Append(c); }
+            else if (c == "," && !inStr) {
+                outp.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else { sb.Append(c); }
+            i = i + 1;
+        }
+        outp.Add(sb.ToString());
+        return outp;
+    }
+
+    /// <summary>Index of the first '=' outside quotes, or -1.</summary>
+    static int FindEq(string p) {
+        bool inStr = false;
+        int i = 0;
+        while (i < p.Length) {
+            string c = p.Substring(i, 1);
+            if (c == "\"") { inStr = !inStr; }
+            else if (c == "=" && !inStr) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static bool BoolVal(string valStr, bool hasVal) {
+        if (!hasVal) { return true; }
+        string v = Str.Lower(Str.Unquote(valStr));
+        return v == "true" || v == "1" || v == "yes";
     }
 
     static bool IsAction(string line) {
