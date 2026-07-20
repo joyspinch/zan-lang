@@ -70,8 +70,15 @@ class SceneMetrics {
 // anchorY are permille (0..1000). x/y are the offset from the anchor point, so
 // a health bar anchored top-left keeps its corner offset on every resolution,
 // while a centred crosshair (anchor 500/500, x=0, y=0) stays centred.
+// Element kinds understood by the designer and runtime renderers.
+//   controls:   label button imagebox animbox textbox progressbar skillslot
+//               quickslot bagslot itemslot avatarbox checkbox tabbox container
+//               minimap slider scrollbar combobox input listbox
+//   components: text arttext sprite rect circle anim
+// Legacy kinds ("bar", "panel") remain parseable. Slot kinds can form a grid
+// group: rows x cols cells of w x h with (gapX, gapY) spacing.
 class SceneElement {
-    string kind;      // "sprite" | "label" | "button" | "bar" | "panel" | custom
+    string kind;
     string ename;
     int x;
     int y;
@@ -87,6 +94,12 @@ class SceneElement {
     int cb;
     int ca;
     bool visible;
+    int rows;         // grid group rows (>=1); 1x1 = single element
+    int cols;         // grid group columns (>=1)
+    int gapX;         // horizontal spacing between grid cells (design px)
+    int gapY;         // vertical spacing between grid cells (design px)
+    int val;          // progressbar/slider/scrollbar 0..100, checkbox 0/1
+    string items;     // ';'-separated entries for combobox/listbox/tabbox
 
     static SceneElement Create(string kind, string name) {
         SceneElement e = new SceneElement();
@@ -99,6 +112,10 @@ class SceneElement {
         e.text = "";
         e.cr = 255; e.cg = 255; e.cb = 255; e.ca = 255;
         e.visible = true;
+        e.rows = 1; e.cols = 1;
+        e.gapX = 0; e.gapY = 0;
+        e.val = 0;
+        e.items = "";
         return e;
     }
 
@@ -112,6 +129,15 @@ class SceneElement {
         this.cr = r; this.cg = g; this.cb = b; this.ca = a; return this;
     }
     SceneElement SetVisible(bool v) { this.visible = v; return this; }
+    SceneElement Grid(int rows, int cols, int gapX, int gapY) {
+        this.rows = rows; this.cols = cols;
+        this.gapX = gapX; this.gapY = gapY;
+        if (this.rows < 1) { this.rows = 1; }
+        if (this.cols < 1) { this.cols = 1; }
+        return this;
+    }
+    SceneElement SetValue(int v) { this.val = v; return this; }
+    SceneElement SetItems(string s) { this.items = s; return this; }
 
     string Kind() { return this.kind; }
     string Name() { return this.ename; }
@@ -129,6 +155,18 @@ class SceneElement {
     int B() { return this.cb; }
     int A() { return this.ca; }
     bool Visible() { return this.visible; }
+    int Rows() { return this.rows; }
+    int Cols() { return this.cols; }
+    int GapX() { return this.gapX; }
+    int GapY() { return this.gapY; }
+    int Value() { return this.val; }
+    string Items() { return this.items; }
+    bool IsGrid() { return this.rows > 1 || this.cols > 1; }
+
+    // Full footprint of the element: w/h are the size of ONE cell; a grid
+    // group of rows x cols occupies TotalW x TotalH.
+    int TotalW() { return this.cols * this.w + (this.cols - 1) * this.gapX; }
+    int TotalH() { return this.rows * this.h + (this.rows - 1) * this.gapY; }
 }
 
 // A `.zscene` document: a design-resolution canvas, a background, and a flat,
@@ -239,8 +277,8 @@ class SceneDoc {
         SceneMetrics m = this.Metrics(winW, winH);
         double ax = (double)e.AnchorX() / 1000.0;
         double ay = (double)e.AnchorY() / 1000.0;
-        double ew = (double)e.W() * m.ScaleX();
-        double eh = (double)e.H() * m.ScaleY();
+        double ew = (double)e.TotalW() * m.ScaleX();
+        double eh = (double)e.TotalH() * m.ScaleY();
         double anchorPxX = m.OffX() + ax * m.CanvasW();
         double anchorPxY = m.OffY() + ay * m.CanvasH();
         double px = anchorPxX + (double)e.X() * m.ScaleX() - ax * ew;
@@ -322,6 +360,14 @@ class SceneDoc {
                     e.ca = col.At(3).AsInt(255);
                 }
                 e.visible = je.Bool("visible", true);
+                e.rows = je.Int("rows", 1);
+                e.cols = je.Int("cols", 1);
+                if (e.rows < 1) { e.rows = 1; }
+                if (e.cols < 1) { e.cols = 1; }
+                e.gapX = je.Int("gapX", 0);
+                e.gapY = je.Int("gapY", 0);
+                e.val = je.Int("value", 0);
+                e.items = je.Str("items", "");
                 d.elements.Add(e);
                 i = i + 1;
             }
@@ -358,6 +404,14 @@ class SceneDoc {
             o = o + "\"text\": \"" + SceneDoc.Esc(e.Text()) + "\", ";
             o = o + "\"color\": [" + SceneDoc.IntStr(e.R()) + ", " + SceneDoc.IntStr(e.G())
                 + ", " + SceneDoc.IntStr(e.B()) + ", " + SceneDoc.IntStr(e.A()) + "], ";
+            if (e.IsGrid() || e.GapX() != 0 || e.GapY() != 0) {
+                o = o + "\"rows\": " + SceneDoc.IntStr(e.Rows()) + ", ";
+                o = o + "\"cols\": " + SceneDoc.IntStr(e.Cols()) + ", ";
+                o = o + "\"gapX\": " + SceneDoc.IntStr(e.GapX()) + ", ";
+                o = o + "\"gapY\": " + SceneDoc.IntStr(e.GapY()) + ", ";
+            }
+            if (e.Value() != 0) { o = o + "\"value\": " + SceneDoc.IntStr(e.Value()) + ", "; }
+            if (e.Items().Length > 0) { o = o + "\"items\": \"" + SceneDoc.Esc(e.Items()) + "\", "; }
             if (e.Visible()) { o = o + "\"visible\": true"; }
             else { o = o + "\"visible\": false"; }
             o = o + "}";

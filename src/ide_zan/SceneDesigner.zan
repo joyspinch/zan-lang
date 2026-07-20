@@ -1,0 +1,906 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Game.Scene;
+
+/// The visual editor for a `.zscene` game window/scene document, hosted by the
+/// Zan IDE the same way Gui.Designer hosts `.zform`. Unlike the form designer
+/// (dock/anchor/flow layout for tools), this is a FREE CANVAS: elements are
+/// placed by absolute design-space coordinates over an optional background
+/// reference image, positioned relative to a nine-grid anchor so a HUD keeps
+/// its layout across resolutions. Game UIs live inside ONE main window, so the
+/// whole scene is a single canvas rather than many child windows.
+///
+/// Palette: game controls (label, button, image/anim boxes, progress bar, the
+/// slot family as rows x cols grid groups, avatar, checkbox, tabs, container,
+/// minimap, slider, scrollbar, combobox, input, listbox) and drawing
+/// components (text, art text, sprite, rect, circle, anim). Drag to move,
+/// drag the corner handle to resize, snap to grid, edit properties in the
+/// inspector, reorder z, duplicate, then Save writes the `.zscene` JSON.
+class SceneDesigner {
+    // 0 = English, 1 = Chinese; the IDE sets this from its UI language.
+    static int lang;
+
+    SceneDoc doc;
+    SceneElement sel;
+    SceneElement lastSel;
+
+    bool dragging;
+    bool resizing;
+    int dragDx;          // design-space offset from element top-left to cursor
+    int dragDy;
+    bool showGrid;
+    bool snap;
+    int grid;            // grid size in design pixels
+    string msg;
+
+    Input nameIn;
+    Input imgIn;
+    Input textIn;
+    Input bgIn;
+    Input itemsIn;
+
+    /// Picks the string for the current UI language.
+    static string T(string en, string zh) {
+        if (SceneDesigner.lang == 1) { return zh; }
+        return en;
+    }
+
+    static SceneDesigner Create() {
+        SceneDesigner d = new SceneDesigner();
+        d.doc = SceneDoc.Create("scene", 1280, 720);
+        d.sel = null;
+        d.lastSel = null;
+        d.dragging = false;
+        d.resizing = false;
+        d.dragDx = 0;
+        d.dragDy = 0;
+        d.showGrid = true;
+        d.snap = true;
+        d.grid = 8;
+        d.msg = "";
+        d.nameIn = Input.Create("name");
+        d.imgIn = Input.Create("image / resource id");
+        d.textIn = Input.Create("text");
+        d.bgIn = Input.Create("background image");
+        d.itemsIn = Input.Create("a;b;c");
+        return d;
+    }
+
+    void LoadJson(string json) {
+        this.doc = SceneDoc.Parse(json);
+        this.sel = null;
+        this.lastSel = null;
+        this.bgIn.SetText(this.doc.Background());
+        this.msg = "loaded";
+    }
+
+    string SaveJson() {
+        return this.doc.ToJson();
+    }
+
+    // --- element catalog -------------------------------------------------
+
+    // Game controls: interactive widgets a game HUD/window is built from.
+    static List<string> ControlKinds() {
+        List<string> k = new List<string>();
+        k.Add("label");
+        k.Add("button");
+        k.Add("imagebox");
+        k.Add("animbox");
+        k.Add("textbox");
+        k.Add("progressbar");
+        k.Add("skillslot");
+        k.Add("quickslot");
+        k.Add("bagslot");
+        k.Add("itemslot");
+        k.Add("avatarbox");
+        k.Add("checkbox");
+        k.Add("tabbox");
+        k.Add("container");
+        k.Add("minimap");
+        k.Add("slider");
+        k.Add("scrollbar");
+        k.Add("combobox");
+        k.Add("input");
+        k.Add("listbox");
+        return k;
+    }
+
+    // Drawing components: non-interactive primitives layered on the canvas.
+    static List<string> ComponentKinds() {
+        List<string> k = new List<string>();
+        k.Add("text");
+        k.Add("arttext");
+        k.Add("sprite");
+        k.Add("rect");
+        k.Add("circle");
+        k.Add("anim");
+        return k;
+    }
+
+    static string KindLabel(string kind) {
+        if (kind == "label") { return SceneDesigner.T("Label", "标签"); }
+        if (kind == "button") { return SceneDesigner.T("Button", "按钮"); }
+        if (kind == "imagebox") { return SceneDesigner.T("Image", "图片框"); }
+        if (kind == "animbox") { return SceneDesigner.T("AnimBox", "动画框"); }
+        if (kind == "textbox") { return SceneDesigner.T("TextBox", "文本框"); }
+        if (kind == "progressbar") { return SceneDesigner.T("Progress", "进度条"); }
+        if (kind == "skillslot") { return SceneDesigner.T("SkillSlot", "技能格"); }
+        if (kind == "quickslot") { return SceneDesigner.T("QuickSlot", "快捷格"); }
+        if (kind == "bagslot") { return SceneDesigner.T("BagSlot", "包裹格"); }
+        if (kind == "itemslot") { return SceneDesigner.T("ItemSlot", "道具格"); }
+        if (kind == "avatarbox") { return SceneDesigner.T("Avatar", "角色框"); }
+        if (kind == "checkbox") { return SceneDesigner.T("CheckBox", "选择框"); }
+        if (kind == "tabbox") { return SceneDesigner.T("TabBox", "选择夹"); }
+        if (kind == "container") { return SceneDesigner.T("Container", "容器"); }
+        if (kind == "minimap") { return SceneDesigner.T("MiniMap", "地图框"); }
+        if (kind == "slider") { return SceneDesigner.T("Slider", "滑块条"); }
+        if (kind == "scrollbar") { return SceneDesigner.T("ScrollBar", "滚动条"); }
+        if (kind == "combobox") { return SceneDesigner.T("ComboBox", "组合框"); }
+        if (kind == "input") { return SceneDesigner.T("Input", "输入框"); }
+        if (kind == "listbox") { return SceneDesigner.T("ListBox", "列表框"); }
+        if (kind == "text") { return SceneDesigner.T("Text", "文本"); }
+        if (kind == "arttext") { return SceneDesigner.T("ArtText", "艺术字"); }
+        if (kind == "sprite") { return SceneDesigner.T("Sprite", "精灵"); }
+        if (kind == "rect") { return SceneDesigner.T("Rect", "矩形"); }
+        if (kind == "circle") { return SceneDesigner.T("Circle", "圆形"); }
+        if (kind == "anim") { return SceneDesigner.T("Anim", "动画"); }
+        return kind;
+    }
+
+    static bool IsSlotKind(string kind) {
+        return kind == "skillslot" || kind == "quickslot"
+            || kind == "bagslot" || kind == "itemslot";
+    }
+
+    // Sensible starting size/tint/grid for each kind so a fresh element is
+    // recognisable on the canvas immediately.
+    static void ApplyDefaults(SceneElement e, string kind) {
+        e.Size(160, 48);
+        if (kind == "label" || kind == "text") { e.Size(120, 28).Caption(SceneDesigner.KindLabel(kind)); }
+        else if (kind == "arttext") { e.Size(220, 52).Caption(SceneDesigner.KindLabel(kind)).Tint(250, 200, 80, 255); }
+        else if (kind == "button") { e.Size(140, 40).Caption(SceneDesigner.KindLabel(kind)); }
+        else if (kind == "imagebox" || kind == "sprite") { e.Size(96, 96); }
+        else if (kind == "animbox" || kind == "anim") { e.Size(96, 96).Tint(120, 200, 255, 255); }
+        else if (kind == "textbox") { e.Size(260, 120).Tint(24, 28, 44, 220); }
+        else if (kind == "progressbar") { e.Size(220, 20).Tint(210, 70, 70, 255).SetValue(65); }
+        else if (kind == "skillslot") { e.Size(48, 48).Grid(1, 8, 4, 4).Tint(40, 46, 70, 230); }
+        else if (kind == "quickslot") { e.Size(44, 44).Grid(1, 10, 4, 4).Tint(40, 46, 70, 230); }
+        else if (kind == "bagslot") { e.Size(44, 44).Grid(5, 8, 4, 4).Tint(40, 46, 70, 230); }
+        else if (kind == "itemslot") { e.Size(48, 48).Grid(1, 1, 4, 4).Tint(40, 46, 70, 230); }
+        else if (kind == "avatarbox") { e.Size(220, 64).Tint(30, 34, 52, 220); }
+        else if (kind == "checkbox") { e.Size(140, 24).Caption(SceneDesigner.KindLabel(kind)).SetValue(1); }
+        else if (kind == "tabbox") { e.Size(320, 200).Tint(30, 34, 52, 220).SetItems(SceneDesigner.T("Tab1;Tab2;Tab3", "页1;页2;页3")); }
+        else if (kind == "container") { e.Size(320, 220).Tint(30, 34, 52, 200); }
+        else if (kind == "minimap") { e.Size(180, 180).Tint(22, 40, 30, 235); }
+        else if (kind == "slider") { e.Size(200, 20).SetValue(40); }
+        else if (kind == "scrollbar") { e.Size(16, 180).SetValue(30); }
+        else if (kind == "combobox") { e.Size(180, 28).SetItems(SceneDesigner.T("Item A;Item B", "选项A;选项B")); }
+        else if (kind == "input") { e.Size(200, 28).Caption(""); }
+        else if (kind == "listbox") { e.Size(200, 140).SetItems(SceneDesigner.T("Item 1;Item 2;Item 3", "项目1;项目2;项目3")); }
+        else if (kind == "rect") { e.Size(120, 80).Tint(90, 130, 220, 255); }
+        else if (kind == "circle") { e.Size(80, 80).Tint(90, 200, 140, 255); }
+    }
+
+    // --- helpers -------------------------------------------------------------
+
+    static bool InRect(int mx, int my, int x, int y, int w, int h) {
+        if (mx < x) { return false; }
+        if (my < y) { return false; }
+        if (mx >= x + w) { return false; }
+        if (my >= y + h) { return false; }
+        return true;
+    }
+
+    static int PackColor(int r, int g, int b, int a) {
+        return a * 16777216 + r * 65536 + g * 256 + b;
+    }
+
+    static List<string> SplitItems(string items) {
+        List<string> o = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < items.Length) {
+            string c = items.Substring(i, 1);
+            if (c == ";") { o.Add(cur); cur = ""; }
+            else { cur = cur + c; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { o.Add(cur); }
+        return o;
+    }
+
+    // Design-space top-left of an element (anchor resolved at 1:1 against the
+    // design canvas). Mirrors SceneDoc.Resolve with mode None / no scaling.
+    int DesignLeft(SceneElement e) {
+        int aw = e.AnchorX() * this.doc.DesignWidth() / 1000;
+        int off = e.AnchorX() * e.TotalW() / 1000;
+        return aw + e.X() - off;
+    }
+    int DesignTop(SceneElement e) {
+        int ah = e.AnchorY() * this.doc.DesignHeight() / 1000;
+        int off = e.AnchorY() * e.TotalH() / 1000;
+        return ah + e.Y() - off;
+    }
+
+    void AddElement(string kind) {
+        SceneElement e = SceneElement.Create(kind, kind + SceneDoc.IntStr(this.doc.Count() + 1));
+        e.At(0, 0).AnchorTo(Anchor.Mid(), Anchor.Mid());
+        SceneDesigner.ApplyDefaults(e, kind);
+        e.Order(this.doc.Count());
+        this.doc.Add(e);
+        this.sel = e;
+        this.msg = SceneDesigner.T("added ", "已添加 ") + SceneDesigner.KindLabel(kind);
+    }
+
+    void DuplicateSel() {
+        if (this.sel == null) { return; }
+        SceneElement s = this.sel;
+        SceneElement e = SceneElement.Create(s.Kind(), s.Name() + SceneDoc.IntStr(this.doc.Count() + 1));
+        e.At(s.X() + this.grid * 2, s.Y() + this.grid * 2).Size(s.W(), s.H());
+        e.AnchorTo(s.AnchorX(), s.AnchorY());
+        e.Order(s.Z() + 1);
+        e.Image(s.ImageId());
+        e.Caption(s.Text());
+        e.Tint(s.R(), s.G(), s.B(), s.A());
+        e.SetVisible(s.Visible());
+        e.Grid(s.Rows(), s.Cols(), s.GapX(), s.GapY());
+        e.SetValue(s.Value());
+        e.SetItems(s.Items());
+        this.doc.Add(e);
+        this.sel = e;
+        this.msg = SceneDesigner.T("duplicated", "已复制");
+    }
+
+    void DeleteSel() {
+        if (this.sel == null) { return; }
+        List<SceneElement> keep = new List<SceneElement>();
+        int i = 0;
+        while (i < this.doc.Count()) {
+            SceneElement e = this.doc.ElementAt(i);
+            if (e != this.sel) { keep.Add(e); }
+            i = i + 1;
+        }
+        this.doc.elements = keep;
+        this.sel = null;
+        this.msg = SceneDesigner.T("deleted", "已删除");
+    }
+
+    void RaiseSel(int dir) {
+        if (this.sel == null) { return; }
+        this.sel.Order(this.sel.Z() + dir);
+    }
+
+    // --- top-level render ----------------------------------------------------
+
+    void Render(App app, int x, int y, int w, int h) {
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(820000);
+        this.RenderPinned(app, x, y, w, h);
+        WidgetId.SetSeq(savedSeq);
+    }
+
+    void RenderPinned(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int pad = app.Scale(10);
+        int palW = app.Scale(172);
+        int inspW = app.Scale(276);
+        int statusH = app.Scale(22);
+        int top = y + pad;
+        int bot = y + h - statusH - pad;
+        int bodyH = bot - top;
+
+        int palX = x + pad;
+        int canX = palX + palW + pad;
+        int canW = w - palW - inspW - pad * 4;
+        if (canW < app.Scale(220)) { canW = app.Scale(220); }
+        int inspX = canX + canW + pad;
+
+        // Sync inspector inputs when the selection changes.
+        if (this.sel != this.lastSel) {
+            if (this.sel != null) {
+                this.nameIn.SetText(this.sel.Name());
+                this.imgIn.SetText(this.sel.ImageId());
+                this.textIn.SetText(this.sel.Text());
+                this.itemsIn.SetText(this.sel.Items());
+            }
+            this.lastSel = this.sel;
+        }
+
+        this.RenderPalette(app, c, t, palX, top, palW, bodyH);
+        this.RenderCanvas(app, c, t, canX, top, canW, bodyH);
+        this.RenderInspector(app, c, t, inspX, top, inspW, bodyH);
+        this.RenderStatus(app, c, t, palX, bot + app.Scale(2), inspX + inspW - palX);
+    }
+
+    // --- palette (add elements) ---------------------------------------------
+
+    // Renders one section of the palette as a two-column grid of add-buttons;
+    // returns the y after the section.
+    int PaletteSection(App app, Canvas c, Theme t, int x, int y, int w,
+            string title, List<string> kinds) {
+        c.DrawText(x, y, title, t.textTertiary, t.fontSizeSmall);
+        int iy = y + app.Scale(18);
+        int bw = (w - app.Scale(6)) / 2;
+        int bh = app.Scale(26);
+        int k = 0;
+        while (k < kinds.Count) {
+            int col = k % 2;
+            int bx = x + col * (bw + app.Scale(6));
+            int id = Button.Create(SceneDesigner.KindLabel(kinds[k])).Render(app, bx, iy, bw);
+            if (Button.WasClicked(app, id)) { this.AddElement(kinds[k]); app.RequestRedraw(); }
+            if (col == 1 || k == kinds.Count - 1) { iy = iy + bh + app.Scale(4); }
+            k = k + 1;
+        }
+        return iy + app.Scale(6);
+    }
+
+    void RenderPalette(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        c.FillRoundRect(x, y, w, h, app.Scale(8), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int ix = x + app.Scale(8);
+        int iw = w - app.Scale(16);
+        int iy = y + app.Scale(10);
+
+        iy = this.PaletteSection(app, c, t, ix, iy, iw,
+            SceneDesigner.T("CONTROLS", "控件"), SceneDesigner.ControlKinds());
+        iy = this.PaletteSection(app, c, t, ix, iy, iw,
+            SceneDesigner.T("COMPONENTS", "组件"), SceneDesigner.ComponentKinds());
+
+        c.DrawText(ix, iy, SceneDesigner.T("CANVAS", "画布"), t.textTertiary, t.fontSizeSmall);
+        iy = iy + app.Scale(18);
+        int bh = app.Scale(26);
+        int bw = (iw - app.Scale(6)) / 2;
+        string gl = SceneDesigner.T("Grid: off", "网格:关");
+        if (this.showGrid) { gl = SceneDesigner.T("Grid: on", "网格:开"); }
+        int gid = Button.Create(gl).Render(app, ix, iy, bw);
+        if (Button.WasClicked(app, gid)) { this.showGrid = !this.showGrid; app.RequestRedraw(); }
+        string sl = SceneDesigner.T("Snap: off", "吸附:关");
+        if (this.snap) { sl = SceneDesigner.T("Snap: on", "吸附:开"); }
+        int sid = Button.Create(sl).Render(app, ix + bw + app.Scale(6), iy, bw);
+        if (Button.WasClicked(app, sid)) { this.snap = !this.snap; app.RequestRedraw(); }
+    }
+
+    // --- canvas (free placement over the design resolution) ------------------
+
+    // Draws one element at screen rect (ex,ey,exw,exh), approximating how the
+    // runtime renders that kind so the design view reads like the real HUD.
+    void DrawElement(App app, Canvas c, Theme t, SceneElement e,
+            int ex, int ey, int exw, int exh, int psMilli) {
+        string kind = e.Kind();
+        int alpha = e.A();
+        if (!e.Visible()) { alpha = 60; }
+        int fill = SceneDesigner.PackColor(e.R(), e.G(), e.B(), alpha);
+        string cap = e.Text();
+        if (cap.Length == 0) { cap = e.Name(); }
+
+        if (SceneDesigner.IsSlotKind(kind)) {
+            // Grid group: rows x cols cells of the cell size with gaps.
+            int cw = e.W() * psMilli / 1000;
+            int chh = e.H() * psMilli / 1000;
+            int gx = e.GapX() * psMilli / 1000;
+            int gy = e.GapY() * psMilli / 1000;
+            int r = 0;
+            while (r < e.Rows()) {
+                int col = 0;
+                while (col < e.Cols()) {
+                    int sx = ex + col * (cw + gx);
+                    int sy = ey + r * (chh + gy);
+                    c.FillRoundRect(sx, sy, cw, chh, app.Scale(3), fill);
+                    c.DrawRect(sx, sy, cw, chh, t.borderSecondary, 1);
+                    col = col + 1;
+                }
+                r = r + 1;
+            }
+            return;
+        }
+        if (kind == "circle") {
+            int rad = exw;
+            if (exh < rad) { rad = exh; }
+            rad = rad / 2;
+            c.FillCircle(ex + exw / 2, ey + exh / 2, rad, fill);
+            return;
+        }
+        if (kind == "progressbar" || kind == "slider" || kind == "scrollbar") {
+            int v = e.Value();
+            if (v < 0) { v = 0; }
+            if (v > 100) { v = 100; }
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
+                SceneDesigner.PackColor(20, 22, 34, alpha));
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            if (kind == "progressbar") {
+                c.FillRoundRect(ex, ey, exw * v / 100, exh, app.Scale(3), fill);
+            } else if (kind == "slider") {
+                int kx = ex + (exw - app.Scale(8)) * v / 100;
+                c.FillRect(ex, ey + exh / 2 - 1, exw, 2, t.borderPrimary);
+                c.FillRoundRect(kx, ey, app.Scale(8), exh, app.Scale(3), t.primary);
+            } else {
+                // vertical thumb proportional to value
+                int th = exh / 4;
+                int ty = ey + (exh - th) * v / 100;
+                c.FillRoundRect(ex + 1, ty, exw - 2, th, app.Scale(3), t.primary);
+            }
+            return;
+        }
+        if (kind == "text" || kind == "label") {
+            c.DrawText(ex, ey, cap, SceneDesigner.PackColor(e.R(), e.G(), e.B(), alpha), t.fontSizeMedium);
+            return;
+        }
+        if (kind == "arttext") {
+            // faux outline: shadow offset + bright face
+            c.DrawText(ex + 2, ey + 2, cap, SceneDesigner.PackColor(20, 12, 4, alpha), t.fontSizeLarge);
+            c.DrawText(ex, ey, cap, fill, t.fontSizeLarge);
+            return;
+        }
+        if (kind == "checkbox") {
+            int bs = exh;
+            if (bs > app.Scale(18)) { bs = app.Scale(18); }
+            c.DrawRect(ex, ey + (exh - bs) / 2, bs, bs, t.borderPrimary, 1);
+            if (e.Value() != 0) {
+                c.FillRect(ex + 3, ey + (exh - bs) / 2 + 3, bs - 6, bs - 6, t.primary);
+            }
+            c.DrawText(ex + bs + app.Scale(6), ey + (exh - t.fontSizeSmall) / 2 - 2,
+                cap, t.textPrimary, t.fontSizeSmall);
+            return;
+        }
+        if (kind == "tabbox") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            List<string> tabs = SceneDesigner.SplitItems(e.Items());
+            int th = app.Scale(20);
+            int tx = ex;
+            int i = 0;
+            while (i < tabs.Count) {
+                int tw = app.Scale(12) + tabs[i].Length * t.fontSizeTiny;
+                int tc = t.bgTertiary;
+                if (i == 0) { tc = t.primary; }
+                c.FillRoundRect(tx, ey, tw, th, app.Scale(3), tc);
+                c.DrawText(tx + app.Scale(6), ey + app.Scale(3), tabs[i], t.textInverse, t.fontSizeTiny);
+                tx = tx + tw + app.Scale(2);
+                i = i + 1;
+            }
+            return;
+        }
+        if (kind == "combobox" || kind == "input") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
+                SceneDesigner.PackColor(20, 22, 34, alpha));
+            c.DrawRect(ex, ey, exw, exh, t.borderPrimary, 1);
+            string txt = e.Text();
+            if (kind == "combobox") {
+                List<string> its = SceneDesigner.SplitItems(e.Items());
+                if (its.Count > 0) { txt = its[0]; }
+                c.DrawText(ex + exw - app.Scale(14), ey + app.Scale(2), "v", t.textTertiary, t.fontSizeSmall);
+            }
+            c.DrawText(ex + app.Scale(5), ey + app.Scale(4), txt, t.textPrimary, t.fontSizeSmall);
+            return;
+        }
+        if (kind == "listbox") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
+                SceneDesigner.PackColor(20, 22, 34, alpha));
+            c.DrawRect(ex, ey, exw, exh, t.borderPrimary, 1);
+            List<string> its = SceneDesigner.SplitItems(e.Items());
+            int iy = ey + app.Scale(3);
+            int i = 0;
+            while (i < its.Count && iy < ey + exh - app.Scale(10)) {
+                c.DrawText(ex + app.Scale(5), iy, its[i], t.textPrimary, t.fontSizeTiny);
+                iy = iy + app.Scale(14);
+                i = i + 1;
+            }
+            return;
+        }
+        if (kind == "minimap") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            c.FillCircle(ex + exw / 2, ey + exh / 2, app.Scale(3), t.primary);
+            c.DrawRect(ex + exw / 4, ey + exh / 4, exw / 2, exh / 2, t.borderPrimary, 1);
+            return;
+        }
+        if (kind == "avatarbox") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            int ps = exh - app.Scale(8);
+            c.FillCircle(ex + app.Scale(4) + ps / 2, ey + app.Scale(4) + ps / 2, ps / 2,
+                SceneDesigner.PackColor(90, 130, 220, alpha));
+            c.FillRoundRect(ex + ps + app.Scale(10), ey + app.Scale(8),
+                exw - ps - app.Scale(18), app.Scale(8), app.Scale(2),
+                SceneDesigner.PackColor(210, 70, 70, alpha));
+            c.FillRoundRect(ex + ps + app.Scale(10), ey + app.Scale(20),
+                (exw - ps - app.Scale(18)) * 3 / 4, app.Scale(8), app.Scale(2),
+                SceneDesigner.PackColor(70, 120, 210, alpha));
+            return;
+        }
+        // generic box-like kinds: button, imagebox, animbox, textbox, container,
+        // sprite, rect, anim, legacy bar/panel...
+        c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+        c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+        if (kind == "imagebox" || kind == "sprite") {
+            // picture placeholder: crossed diagonals
+            c.DrawText(ex + app.Scale(4), ey + app.Scale(3),
+                "IMG " + e.ImageId(), t.textInverse, t.fontSizeTiny);
+        } else if (kind == "animbox" || kind == "anim") {
+            c.DrawText(ex + app.Scale(4), ey + app.Scale(3), "ANIM", t.textInverse, t.fontSizeTiny);
+        } else {
+            c.DrawText(ex + app.Scale(4), ey + app.Scale(3), cap, t.textInverse, t.fontSizeTiny);
+        }
+    }
+
+    void RenderCanvas(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        c.FillRoundRect(x, y, w, h, app.Scale(8), t.bgTertiary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+
+        int dw = this.doc.DesignWidth();
+        int dh = this.doc.DesignHeight();
+        if (dw <= 0) { dw = 1; }
+        if (dh <= 0) { dh = 1; }
+        int inX = x + app.Scale(12);
+        int inY = y + app.Scale(12);
+        int inW = w - app.Scale(24);
+        int inH = h - app.Scale(24);
+
+        // Fit the design canvas into the editor viewport (letterboxed preview).
+        int psNumW = inW * 1000 / dw;
+        int psNumH = inH * 1000 / dh;
+        int psMilli = psNumW;
+        if (psNumH < psMilli) { psMilli = psNumH; }
+        if (psMilli < 1) { psMilli = 1; }
+        int cw = dw * psMilli / 1000;
+        int ch = dh * psMilli / 1000;
+        int ox = inX + (inW - cw) / 2;
+        int oy = inY + (inH - ch) / 2;
+
+        // The design canvas backdrop (clear color) + optional bg reference.
+        c.FillRect(ox, oy, cw, ch, SceneDesigner.PackColor(
+            this.doc.ClearR(), this.doc.ClearG(), this.doc.ClearB(), 255));
+        c.DrawRect(ox, oy, cw, ch, t.borderSecondary, 1);
+        if (this.doc.Background().Length > 0) {
+            c.DrawText(ox + app.Scale(6), oy + app.Scale(6),
+                "bg: " + this.doc.Background(), t.textTertiary, t.fontSizeTiny);
+        }
+
+        // Grid overlay.
+        if (this.showGrid && this.grid > 0) {
+            int gx = 0;
+            while (gx <= dw) {
+                int sx = ox + gx * psMilli / 1000;
+                c.FillRect(sx, oy, 1, ch, t.borderSecondary);
+                gx = gx + this.grid * 8;
+            }
+            int gy = 0;
+            while (gy <= dh) {
+                int sy = oy + gy * psMilli / 1000;
+                c.FillRect(ox, sy, cw, 1, t.borderSecondary);
+                gy = gy + this.grid * 8;
+            }
+        }
+
+        int ek = app.window.EventKind();
+
+        // Draw elements back-to-front (lower z first) and hit-test front-to-back.
+        List<SceneElement> ordered = this.OrderedByZ();
+        c.PushClip(ox, oy, cw, ch);
+        int i = 0;
+        while (i < ordered.Count) {
+            SceneElement e = ordered[i];
+            int ex = ox + this.DesignLeft(e) * psMilli / 1000;
+            int ey = oy + this.DesignTop(e) * psMilli / 1000;
+            int exw = e.TotalW() * psMilli / 1000;
+            int exh = e.TotalH() * psMilli / 1000;
+            this.DrawElement(app, c, t, e, ex, ey, exw, exh, psMilli);
+            if (e == this.sel) {
+                c.DrawRect(ex - 1, ey - 1, exw + 2, exh + 2, t.primary, 1);
+                // corner resize handle
+                int hs = app.Scale(8);
+                c.FillRect(ex + exw - hs / 2, ey + exh - hs / 2, hs, hs, t.primary);
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+
+        // Pointer interaction: press to select + begin drag/resize (topmost first).
+        if (ek == 2 && SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {
+            // Corner handle of the current selection wins (start resizing).
+            bool started = false;
+            if (this.sel != null) {
+                int sx = ox + this.DesignLeft(this.sel) * psMilli / 1000;
+                int sy = oy + this.DesignTop(this.sel) * psMilli / 1000;
+                int sw = this.sel.TotalW() * psMilli / 1000;
+                int sh = this.sel.TotalH() * psMilli / 1000;
+                int hs = app.Scale(10);
+                if (SceneDesigner.InRect(app.mouseX, app.mouseY,
+                        sx + sw - hs, sy + sh - hs, hs * 2, hs * 2)) {
+                    this.resizing = true;
+                    started = true;
+                }
+            }
+            if (!started) {
+                SceneElement hit = null;
+                int j = ordered.Count - 1;
+                while (j >= 0) {
+                    SceneElement e = ordered[j];
+                    int ex = ox + this.DesignLeft(e) * psMilli / 1000;
+                    int ey = oy + this.DesignTop(e) * psMilli / 1000;
+                    int exw = e.TotalW() * psMilli / 1000;
+                    int exh = e.TotalH() * psMilli / 1000;
+                    if (SceneDesigner.InRect(app.mouseX, app.mouseY, ex, ey, exw, exh)) {
+                        hit = e;
+                        j = -1;
+                    } else {
+                        j = j - 1;
+                    }
+                }
+                this.sel = hit;
+                if (hit != null) {
+                    this.dragging = true;
+                    int dLeft = this.DesignLeft(hit);
+                    int dTop = this.DesignTop(hit);
+                    int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+                    int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+                    this.dragDx = mDesX - dLeft;
+                    this.dragDy = mDesY - dTop;
+                }
+            }
+            app.RequestRedraw();
+        }
+
+        // Drag: move the selected element in design space, keeping its anchor.
+        if (this.dragging && ek == 1 && this.sel != null) {
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            int newLeft = mDesX - this.dragDx;
+            int newTop = mDesY - this.dragDy;
+            if (this.snap && this.grid > 0) {
+                newLeft = (newLeft + this.grid / 2) / this.grid * this.grid;
+                newTop = (newTop + this.grid / 2) / this.grid * this.grid;
+            }
+            // Convert desired design top-left back into the anchor-relative offset.
+            int baseX = this.sel.AnchorX() * this.doc.DesignWidth() / 1000
+                - this.sel.AnchorX() * this.sel.TotalW() / 1000;
+            int baseY = this.sel.AnchorY() * this.doc.DesignHeight() / 1000
+                - this.sel.AnchorY() * this.sel.TotalH() / 1000;
+            this.sel.At(newLeft - baseX, newTop - baseY);
+            app.RequestRedraw();
+        }
+
+        // Resize: dragging the corner handle changes the CELL size (grid groups
+        // scale as a whole: the total footprint tracks the cursor).
+        if (this.resizing && ek == 1 && this.sel != null) {
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            int newTw = mDesX - this.DesignLeft(this.sel);
+            int newTh = mDesY - this.DesignTop(this.sel);
+            if (this.snap && this.grid > 0) {
+                newTw = (newTw + this.grid / 2) / this.grid * this.grid;
+                newTh = (newTh + this.grid / 2) / this.grid * this.grid;
+            }
+            int nw = (newTw - (this.sel.Cols() - 1) * this.sel.GapX()) / this.sel.Cols();
+            int nh = (newTh - (this.sel.Rows() - 1) * this.sel.GapY()) / this.sel.Rows();
+            if (nw < 4) { nw = 4; }
+            if (nh < 4) { nh = 4; }
+            this.sel.Size(nw, nh);
+            app.RequestRedraw();
+        }
+
+        if (ek == 3 && (this.dragging || this.resizing)) {
+            this.dragging = false;
+            this.resizing = false;
+            app.RequestRedraw();
+        }
+    }
+
+    List<SceneElement> OrderedByZ() {
+        List<SceneElement> o = new List<SceneElement>();
+        int i = 0;
+        while (i < this.doc.Count()) {
+            o.Add(this.doc.ElementAt(i));
+            i = i + 1;
+        }
+        // insertion sort by z (stable, small n)
+        int a = 1;
+        while (a < o.Count) {
+            SceneElement key = o[a];
+            int b = a - 1;
+            while (b >= 0 && o[b].Z() > key.Z()) {
+                o[b + 1] = o[b];
+                b = b - 1;
+            }
+            o[b + 1] = key;
+            a = a + 1;
+        }
+        return o;
+    }
+
+    // --- inspector -----------------------------------------------------------
+
+    int Stepper(App app, Canvas c, Theme t, int x, int y, int w, string label, int cur, int step) {
+        c.DrawText(x, y + app.Scale(6), label, t.textSecondary, t.fontSizeSmall);
+        int bw = app.Scale(26);
+        int valW = app.Scale(58);
+        int rx = x + w - bw * 2 - valW - app.Scale(8);
+        int minusId = Button.Create("-").Render(app, rx, y, bw);
+        int vX = rx + bw + app.Scale(4);
+        c.FillRoundRect(vX, y, valW, app.Scale(28), app.Scale(4), t.bgPrimary);
+        c.DrawRect(vX, y, valW, app.Scale(28), t.borderPrimary, 1);
+        int res = cur;
+        c.DrawText(vX + app.Scale(6), y + app.Scale(6), SceneDoc.IntStr(cur), t.textPrimary, t.fontSizeSmall);
+        int plusId = Button.Create("+").Render(app, vX + valW + app.Scale(4), y, bw);
+        if (Button.WasClicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
+        if (Button.WasClicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
+        return res;
+    }
+
+    // Two side-by-side steppers on one row (label pairs like rows/cols).
+    int StepperHalf(App app, Canvas c, Theme t, int x, int y, int w, string label, int cur, int step) {
+        c.DrawText(x, y + app.Scale(6), label, t.textSecondary, t.fontSizeSmall);
+        int bw = app.Scale(20);
+        int valW = app.Scale(34);
+        int rx = x + w - bw * 2 - valW - app.Scale(6);
+        int minusId = Button.Create("-").Render(app, rx, y, bw);
+        int vX = rx + bw + app.Scale(3);
+        c.FillRoundRect(vX, y, valW, app.Scale(28), app.Scale(4), t.bgPrimary);
+        c.DrawRect(vX, y, valW, app.Scale(28), t.borderPrimary, 1);
+        int res = cur;
+        c.DrawText(vX + app.Scale(5), y + app.Scale(6), SceneDoc.IntStr(cur), t.textPrimary, t.fontSizeSmall);
+        int plusId = Button.Create("+").Render(app, vX + valW + app.Scale(3), y, bw);
+        if (Button.WasClicked(app, minusId)) { res = cur - step; app.RequestRedraw(); }
+        if (Button.WasClicked(app, plusId)) { res = cur + step; app.RequestRedraw(); }
+        return res;
+    }
+
+    void RenderInspector(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        c.FillRoundRect(x, y, w, h, app.Scale(8), t.bgSecondary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int ix = x + app.Scale(12);
+        int iw = w - app.Scale(24);
+        int iy = y + app.Scale(12);
+        int rowH = app.Scale(34);
+        int halfW = (iw - app.Scale(10)) / 2;
+
+        c.DrawText(ix, iy, SceneDesigner.T("SCENE", "场景"), t.textTertiary, t.fontSizeSmall);
+        iy = iy + app.Scale(20);
+        int nw = this.StepperHalf(app, c, t, ix, iy, halfW, "W", this.doc.DesignWidth(), 20);
+        if (nw >= 16) { this.doc.designWidth = nw; }
+        int nh = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, "H", this.doc.DesignHeight(), 20);
+        if (nh >= 16) { this.doc.designHeight = nh; }
+        iy = iy + rowH;
+
+        // Scale mode selector.
+        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("scale", "缩放"), t.textSecondary, t.fontSizeSmall);
+        int mbw = (iw - app.Scale(40)) / 4;
+        int mx = ix + app.Scale(40);
+        List<string> modes = new List<string>();
+        modes.Add("Fit");
+        modes.Add("Fill");
+        modes.Add("Str");
+        modes.Add("1:1");
+        int m = 0;
+        while (m < modes.Count) {
+            int mid = Button.Typed(modes[m], this.ModeType(m)).Render(app, mx + m * (mbw + app.Scale(2)), iy, mbw);
+            if (Button.WasClicked(app, mid)) { this.doc.SetMode(m); app.RequestRedraw(); }
+            m = m + 1;
+        }
+        iy = iy + rowH;
+
+        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("bg", "背景"), t.textSecondary, t.fontSizeSmall);
+        this.bgIn.Render(app, ix + app.Scale(40), iy, iw - app.Scale(40), app.Scale(28));
+        this.doc.SetBackground(this.bgIn.GetText());
+        iy = iy + rowH + app.Scale(6);
+
+        c.FillRect(ix, iy, iw, 1, t.borderPrimary);
+        iy = iy + app.Scale(10);
+
+        if (this.sel == null) {
+            c.DrawText(ix, iy, SceneDesigner.T("Select an element to edit", "选中一个元素进行编辑"),
+                t.textTertiary, t.fontSizeSmall);
+            return;
+        }
+
+        c.DrawText(ix, iy, SceneDesigner.T("ELEMENT · ", "元素 · ") + SceneDesigner.KindLabel(this.sel.Kind()),
+            t.textTertiary, t.fontSizeSmall);
+        iy = iy + app.Scale(20);
+
+        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("name", "名称"), t.textSecondary, t.fontSizeSmall);
+        this.nameIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.sel.ename = this.nameIn.GetText();
+        iy = iy + rowH;
+
+        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("image", "图片"), t.textSecondary, t.fontSizeSmall);
+        this.imgIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.sel.image = this.imgIn.GetText();
+        iy = iy + rowH;
+
+        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("text", "文本"), t.textSecondary, t.fontSizeSmall);
+        this.textIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.sel.text = this.textIn.GetText();
+        iy = iy + rowH;
+
+        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("items", "选项"), t.textSecondary, t.fontSizeSmall);
+        this.itemsIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.sel.items = this.itemsIn.GetText();
+        iy = iy + rowH;
+
+        this.sel.x = this.StepperHalf(app, c, t, ix, iy, halfW, "x", this.sel.X(), 1);
+        this.sel.y = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, "y", this.sel.Y(), 1);
+        iy = iy + rowH;
+        int ww = this.StepperHalf(app, c, t, ix, iy, halfW, "w", this.sel.W(), 1);
+        if (ww >= 1) { this.sel.w = ww; }
+        int hh = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, "h", this.sel.H(), 1);
+        if (hh >= 1) { this.sel.h = hh; }
+        iy = iy + rowH;
+
+        // Grid group: rows x cols cells with gaps (any element can become one;
+        // slot kinds default to grids).
+        int nr = this.StepperHalf(app, c, t, ix, iy, halfW, SceneDesigner.T("rows", "行"), this.sel.Rows(), 1);
+        int nc = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, SceneDesigner.T("cols", "列"), this.sel.Cols(), 1);
+        this.sel.Grid(nr, nc, this.sel.GapX(), this.sel.GapY());
+        iy = iy + rowH;
+        int ngx = this.StepperHalf(app, c, t, ix, iy, halfW, SceneDesigner.T("gapX", "横距"), this.sel.GapX(), 1);
+        int ngy = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, SceneDesigner.T("gapY", "纵距"), this.sel.GapY(), 1);
+        if (ngx >= 0) { this.sel.gapX = ngx; }
+        if (ngy >= 0) { this.sel.gapY = ngy; }
+        iy = iy + rowH;
+
+        int nz = this.StepperHalf(app, c, t, ix, iy, halfW, "z", this.sel.Z(), 1);
+        this.sel.z = nz;
+        int nv = this.StepperHalf(app, c, t, ix + halfW + app.Scale(10), iy, halfW, SceneDesigner.T("val", "值"), this.sel.Value(), 5);
+        if (nv < 0) { nv = 0; }
+        this.sel.SetValue(nv);
+        iy = iy + rowH;
+
+        // Anchor nine-grid.
+        c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("anchor", "锚点"), t.textSecondary, t.fontSizeSmall);
+        int abw = app.Scale(24);
+        int ax0 = ix + app.Scale(52);
+        int r = 0;
+        while (r < 3) {
+            int col = 0;
+            while (col < 3) {
+                int av = col * 500;
+                int avy = r * 500;
+                string glyph = "·";
+                if (this.sel.AnchorX() == av && this.sel.AnchorY() == avy) { glyph = "●"; }
+                int aid = Button.Create(glyph).Render(app, ax0 + col * (abw + app.Scale(2)),
+                    iy + r * (abw + app.Scale(2)), abw);
+                if (Button.WasClicked(app, aid)) {
+                    this.sel.AnchorTo(av, avy);
+                    app.RequestRedraw();
+                }
+                col = col + 1;
+            }
+            r = r + 1;
+        }
+        iy = iy + 3 * (abw + app.Scale(2)) + app.Scale(8);
+
+        int visId = Button.Create(this.VisLabel()).Render(app, ix, iy, (iw - app.Scale(6)) / 2);
+        if (Button.WasClicked(app, visId)) { this.sel.SetVisible(!this.sel.Visible()); app.RequestRedraw(); }
+        int dupId = Button.Create(SceneDesigner.T("Duplicate", "复制")).Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
+        if (Button.WasClicked(app, dupId)) { this.DuplicateSel(); app.RequestRedraw(); }
+        iy = iy + rowH;
+        int upId = Button.Create(SceneDesigner.T("forward", "上移一层")).Render(app, ix, iy, (iw - app.Scale(6)) / 2);
+        if (Button.WasClicked(app, upId)) { this.RaiseSel(1); app.RequestRedraw(); }
+        int dnId = Button.Create(SceneDesigner.T("back", "下移一层")).Render(app, ix + (iw + app.Scale(6)) / 2, iy, (iw - app.Scale(6)) / 2);
+        if (Button.WasClicked(app, dnId)) { this.RaiseSel(0 - 1); app.RequestRedraw(); }
+        iy = iy + rowH;
+        int delId = Button.Typed(SceneDesigner.T("Delete", "删除"), 3).Render(app, ix, iy, iw);
+        if (Button.WasClicked(app, delId)) { this.DeleteSel(); app.RequestRedraw(); }
+    }
+
+    string VisLabel() {
+        if (this.sel != null && this.sel.Visible()) { return SceneDesigner.T("Visible", "显示"); }
+        return SceneDesigner.T("Hidden", "隐藏");
+    }
+
+    int ModeType(int m) {
+        if (m == this.doc.Mode()) { return 1; }
+        return 0;
+    }
+
+    void RenderStatus(App app, Canvas c, Theme t, int x, int y, int w) {
+        c.DrawText(x, y, ".zscene · " + SceneDoc.IntStr(this.doc.Count())
+            + SceneDesigner.T(" elements   ", " 个元素   ") + this.msg,
+            t.textTertiary, t.fontSizeTiny);
+    }
+}

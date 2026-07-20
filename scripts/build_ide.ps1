@@ -83,6 +83,8 @@ try {
     $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
+    $files += (Join-Path (Get-Location) "stdlib\Game\Scene\SceneDoc.zan")
+    $files += (Join-Path (Get-Location) "src\ide_zan\SceneDesigner.zan")
     $files += (Join-Path (Get-Location) "src\ide_zan\ZanIDE.zan")
     Push-Location build
     try {
@@ -95,7 +97,7 @@ try {
         [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "ZanIDE.ll"), $ir)
         clang ZanIDE.ll zanrt_sync_ide.obj zan_icon.res -o ZanIDE.exe -O2 `
             -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS `
-            -Xlinker /ENTRY:mainCRTStartup -lzan_gui "$sdlLib" -llegacy_stdio_definitions -lws2_32
+            -Xlinker /ENTRY:mainCRTStartup -lzan_gui "$sdlLib" -llegacy_stdio_definitions -lws2_32 -lpsapi
         if ($LASTEXITCODE -ne 0) { throw "LINK_FAILED code=$LASTEXITCODE" }
         Copy-Item -LiteralPath (Join-Path $driverDir "SDL3.dll") `
             -Destination (Join-Path (Get-Location) "SDL3.dll") -Force

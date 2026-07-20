@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Json;
 using Gui;
 using Gui.Widget;
+using Game.Scene;
 
 /// Describes one project template: the category it appears under, its display
 /// name / icon / description, the scaffolding "kind" (console / dll-class /
@@ -641,6 +642,9 @@ class ZanIDE {
         // serialized layout (to detect changes and persist them back to disk).
         string loadedFormPath = "";
         string formCache = "";
+        // Same for the .zscene tab bound to the scene designer.
+        string loadedScenePath = "";
+        string sceneCache = "";
 
         if (haveProject) {
             ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
@@ -662,6 +666,7 @@ class ZanIDE {
         ZanIDE.uiLang = ZanIDE.ReadUiLang();
         Wizard.lang = ZanIDE.uiLang;
         Designer.lang = ZanIDE.uiLang;
+        SceneDesigner.lang = ZanIDE.uiLang;
         List<RibbonCmd> cmds = ZanIDE.BuildRibbon();
 
         // ---- New Project categories (built-in + user "Custom") ----
@@ -691,6 +696,7 @@ class ZanIDE {
         fNames.Add(ZanIDE.T("Interface", "接口"));      fIcons.Add("copy");        fDescs.Add(ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。"));
         fNames.Add(ZanIDE.T("Empty File", "空文件"));     fIcons.Add("file");        fDescs.Add(ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。"));
         fNames.Add(ZanIDE.T("Form (Designer)", "表单 (设计器)")); fIcons.Add("layout");     fDescs.Add(ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。"));
+        fNames.Add(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)")); fIcons.Add("maximize");   fDescs.Add(ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。"));
 
         // ---- Dialog state ----
         // The New Project / New File wizards are REAL secondary top-level windows
@@ -864,6 +870,12 @@ class ZanIDE {
         string codeViewForm = "";
         CodeEditor formCodeEd = CodeEditor.Create();
         string formCodeLoaded = "";
+        // .zscene tabs host the free-canvas game scene designer (stdlib
+        // Game.Scene.SceneDesigner): background reference, absolute placement,
+        // nine-grid anchors, grid snapping, slot grid groups, z-order. The
+        // Design/Code toggle shows the .zscene JSON in place.
+        bool sceneMode = false;
+        SceneDesigner sceneDesigner = SceneDesigner.Create();
 
         SignalInt treeW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
         // The code editor is the primary area: it fills the space left over
@@ -1090,8 +1102,10 @@ class ZanIDE {
             int actDM = activeTab.Get();
             if (actDM >= 0 && actDM < tabPaths.Count) {
                 designerMode = ZanIDE.IsFormPath(tabPaths[actDM]) && tabPaths[actDM] != codeViewForm;
+                sceneMode = ZanIDE.IsScenePath(tabPaths[actDM]) && tabPaths[actDM] != codeViewForm;
             } else {
                 designerMode = false;
+                sceneMode = false;
             }
 
             // ---- keyboard shortcuts for debug ----
@@ -1241,7 +1255,15 @@ class ZanIDE {
                         // In the .zform code view, save the code-behind, not the form.
                         ZanIDE.SaveFormCode(formCodeEd, tabPaths[aSv], root, log);
                         rescan = true;
-                    } else if (!designerMode && aSv >= 0 && aSv < tabPaths.Count && tabPaths[aSv] != "@start") {
+                    } else if (aSv >= 0 && aSv < tabPaths.Count
+                            && ZanIDE.IsScenePath(tabPaths[aSv]) && codeViewForm == tabPaths[aSv]) {
+                        // In the .zscene code view, save the scene JSON itself.
+                        File.WriteAllText(tabPaths[aSv], formCodeEd.GetText());
+                        tabBodies[aSv] = formCodeEd.GetText();
+                        loadedScenePath = "";
+                        log.Add("> Saved " + tabPaths[aSv] + ".");
+                        rescan = true;
+                    } else if (!designerMode && !sceneMode && aSv >= 0 && aSv < tabPaths.Count && tabPaths[aSv] != "@start") {
                         ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                         if (autoRun) { ZanIDE.HotReloadRun(tabPaths, activeTab, root, log); }
                         rescan = true;
@@ -1290,7 +1312,8 @@ class ZanIDE {
                 cmds[7].SetEnabled(canRun);
                 cmds[8].SetEnabled(haveProj);
                 cmds[9].SetEnabled(haveProj);
-                cmds[10].SetEnabled(activeIsFile && ZanIDE.IsFormPath(apE));
+                cmds[10].SetEnabled(activeIsFile
+                    && (ZanIDE.IsFormPath(apE) || ZanIDE.IsScenePath(apE)));
                 cmds[12].SetEnabled(haveProj);
                 int rc = ZanIDE.RibbonAction(
                     Ribbon.Render(app, 0, top, W, ribbonH, cmds));
@@ -1325,6 +1348,12 @@ class ZanIDE {
                     if (aSv3 >= 0 && aSv3 < tabPaths.Count
                             && ZanIDE.IsFormPath(tabPaths[aSv3]) && codeViewForm == tabPaths[aSv3]) {
                         ZanIDE.SaveFormCode(formCodeEd, tabPaths[aSv3], root, log);
+                    } else if (aSv3 >= 0 && aSv3 < tabPaths.Count
+                            && ZanIDE.IsScenePath(tabPaths[aSv3]) && codeViewForm == tabPaths[aSv3]) {
+                        File.WriteAllText(tabPaths[aSv3], formCodeEd.GetText());
+                        tabBodies[aSv3] = formCodeEd.GetText();
+                        loadedScenePath = "";
+                        log.Add("> Saved " + tabPaths[aSv3] + ".");
                     } else {
                         ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                         if (autoRun) { ZanIDE.HotReloadRun(tabPaths, activeTab, root, log); }
@@ -1405,11 +1434,12 @@ class ZanIDE {
                     dlg.Show();
                     dlgMode = 3;
                 } else if (rc == 9) {
-                    // Design/Code: toggle the CURRENT .zform tab in place between
-                    // the visual designer and a view of its code. It never opens a
-                    // new tab nor creates a file, and only .zform tabs have it --
-                    // other files stay in code and cannot enter design mode.
-                    if (act >= 0 && act < tabPaths.Count && ZanIDE.IsFormPath(tabPaths[act])) {
+                    // Design/Code: toggle the CURRENT .zform/.zscene tab in place
+                    // between the visual designer and a view of its code. It never
+                    // opens a new tab nor creates a file, and only design tabs have
+                    // it -- other files stay in code and cannot enter design mode.
+                    if (act >= 0 && act < tabPaths.Count
+                            && (ZanIDE.IsFormPath(tabPaths[act]) || ZanIDE.IsScenePath(tabPaths[act]))) {
                         string fp9 = tabPaths[act];
                         if (codeViewForm == fp9) {
                             codeViewForm = "";
@@ -1420,7 +1450,7 @@ class ZanIDE {
                             log.Add(ZanIDE.T("> Code view.", "> 代码视图。"));
                         }
                     } else {
-                        log.Add(ZanIDE.T("> Design/Code applies only to .zform files.", "> 设计/代码切换仅适用于 .zform 文件。"));
+                        log.Add(ZanIDE.T("> Design/Code applies only to .zform/.zscene files.", "> 设计/代码切换仅适用于 .zform/.zscene 文件。"));
                     }
                     lastActive = 0 - 1;
                     app.RequestRedraw();
@@ -1746,7 +1776,7 @@ class ZanIDE {
                 // surface, aardio-style); code tabs keep the editor/output split.
                 Rect ea = centerArea;
                 Rect orr = Rect.Create(centerArea.x, centerArea.y + centerArea.height, centerArea.width, 0);
-                if (!designerMode) {
+                if (!designerMode && !sceneMode) {
                     int bottomMin = app.Scale(90);
                     if (dbgState == 2) { bottomMin = app.Scale(160); }
                     int editorMin = app.Scale(140);
@@ -1796,11 +1826,13 @@ class ZanIDE {
                     // Only sync editor text for code tabs; .zform tabs are owned by
                     // the designer and must not be overwritten with editor contents.
                     if (lastActive >= 0 && lastActive < tabBodies.Count
-                        && !ZanIDE.IsFormPath(tabPaths[lastActive])) {
+                        && !ZanIDE.IsFormPath(tabPaths[lastActive])
+                        && !ZanIDE.IsScenePath(tabPaths[lastActive])) {
                         tabBodies[lastActive] = editor.GetText();
                     }
                     if (act >= 0 && act < tabBodies.Count
-                        && !ZanIDE.IsFormPath(tabPaths[act])) {
+                        && !ZanIDE.IsFormPath(tabPaths[act])
+                        && !ZanIDE.IsScenePath(tabPaths[act])) {
                         editor.LoadText(tabBodies[act]);
                         // Feed the other open source files to the editor so it can
                         // resolve cross-file types (e.g. a `Utils` class defined
@@ -1810,6 +1842,7 @@ class ZanIDE {
                         while (pf < tabBodies.Count) {
                             if (pf != act && pf < tabPaths.Count
                                 && !ZanIDE.IsFormPath(tabPaths[pf])
+                                && !ZanIDE.IsScenePath(tabPaths[pf])
                                 && tabPaths[pf] != "@start") {
                                 projFiles.Add(tabBodies[pf]);
                             }
@@ -1890,6 +1923,32 @@ class ZanIDE {
                         log.Add("> Saved component -> " + compPath + ".");
                         app.RequestRedraw();
                     }
+                } else if (sceneMode) {
+                    // The .zscene tab hosts the free-canvas game scene designer
+                    // (stdlib Game.Scene.SceneDesigner). The .zscene file stores
+                    // the scene JSON document.
+                    string spath = tabPaths[act];
+                    if (spath != loadedScenePath) {
+                        string sbody = tabBodies[act];
+                        if (ZanIDE.LooksLikeJson(sbody)) {
+                            sceneDesigner.LoadJson(sbody);
+                        } else {
+                            sceneDesigner.LoadJson(SceneDoc.Create(
+                                ZanIDE.SceneBaseName(spath), 1280, 720).ToJson());
+                        }
+                        loadedScenePath = spath;
+                        sceneCache = sceneDesigner.SaveJson();
+                    }
+                    sceneDesigner.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
+                    // Persist design changes to the .zscene file.
+                    string snewser = sceneDesigner.SaveJson();
+                    if (snewser != sceneCache) {
+                        tabBodies[act] = snewser;
+                        if (spath.Length > 0 && spath.Substring(0, 1) != "@") {
+                            File.WriteAllText(spath, snewser);
+                        }
+                        sceneCache = snewser;
+                    }
                 } else if (activeIsDocs) {
                     ZanIDE.RenderDocsPage(
                         app, c, t, edRect, docsSearch,
@@ -1928,6 +1987,20 @@ class ZanIDE {
                             app.RequestRedraw();
                         }
                     }
+                } else if (act >= 0 && act < tabPaths.Count
+                        && ZanIDE.IsScenePath(tabPaths[act]) && codeViewForm == tabPaths[act]) {
+                    // Code view of the current .zscene: show and edit the scene
+                    // JSON in place; Save writes it back to the same file.
+                    string spC = tabPaths[act];
+                    if (formCodeLoaded != spC) {
+                        string sTxt = "";
+                        if (File.Exists(spC)) { sTxt = File.ReadAllText(spC); }
+                        else { sTxt = tabBodies[act]; }
+                        formCodeEd.LoadText(sTxt);
+                        formCodeLoaded = spC;
+                    }
+                    ZanIDE.ApplyEditorTheme(formCodeEd, edThemeIdx, edFontPx);
+                    formCodeEd.Render(app, edRect);
                 } else if (act >= 0 && act < tabPaths.Count
                         && ZanIDE.IsFormPath(tabPaths[act]) && codeViewForm == tabPaths[act]) {
                     // Code view of the current .zform: show its code (read from the
@@ -1973,7 +2046,7 @@ class ZanIDE {
                 }
 
                 // ---- Find / Replace / GoToLine overlay ----
-                if (findMode > 0 && !designerMode && !activeIsStart && !activeIsDocs) {
+                if (findMode > 0 && !designerMode && !sceneMode && !activeIsStart && !activeIsDocs) {
                     int fpH = app.Scale(36);
                     if (findMode == 2) { fpH = app.Scale(68); }
                     int fpW = app.Scale(360);
@@ -3436,6 +3509,12 @@ class ZanIDE {
     /// the .zform so it opens in the designer.
     static string CreateFile(int kind, string root, string name, List<string> log) {
         Directory.CreateDirectory(root + "/src");
+        if (kind == 6) {
+            string scenePath = root + "/src/" + name + ".zscene";
+            File.WriteAllText(scenePath, SceneDoc.Create(name, 1280, 720).ToJson());
+            log.Add("> Created scene " + scenePath + ".");
+            return scenePath;
+        }
         if (kind == 5) {
             string formPath = root + "/src/" + name + ".zform";
             string cbPath = root + "/src/" + name + ".zan";
@@ -4924,6 +5003,20 @@ class ZanIDE {
         int n = p.Length;
         if (n < 6) { return false; }
         return p.Substring(n - 6, 6) == ".zform";
+    }
+
+    static bool IsScenePath(string p) {
+        int n = p.Length;
+        if (n < 7) { return false; }
+        return p.Substring(n - 7, 7) == ".zscene";
+    }
+
+    /// Base name of a .zscene (the scene name), e.g. src/Hud.zscene -> Hud.
+    static string SceneBaseName(string p) {
+        string fn = Path.GetFileName(p);
+        int n = fn.Length;
+        if (n >= 7 && fn.Substring(n - 7, 7) == ".zscene") { return fn.Substring(0, n - 7); }
+        return fn;
     }
 
     /// Base name of a .zform (the form/class name), e.g. src/Login.zform -> Login.
