@@ -585,6 +585,8 @@ typedef struct {
     SDL_GPUSampler *sampler;
     SDL_GPUBuffer *vbuf;
     Uint32 vbuf_cap;                 /* capacity in vertices */
+    SDL_GPUTransferBuffer *upbuf;    /* reused vertex-upload staging buffer */
+    Uint32 upbuf_cap;                /* capacity in bytes */
     ZanGpuVertex *verts; int vcount, vcap;
     ZanGpuDraw *draws;   int dcount, dcap;
     SDL_GPUCommandBuffer *cmd;       /* per-frame */
@@ -740,6 +742,7 @@ ZAN_SDL_API void zan_gpu_destroy(zan_i64 handle) {
     ZanGpuCtx *ctx = (ZanGpuCtx *)zan_ptr(handle);
     if (!ctx) return;
     if (ctx->vbuf) SDL_ReleaseGPUBuffer(ctx->device, ctx->vbuf);
+    if (ctx->upbuf) SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->upbuf);
     if (ctx->sampler) SDL_ReleaseGPUSampler(ctx->device, ctx->sampler);
     if (ctx->pipeline) SDL_ReleaseGPUGraphicsPipeline(ctx->device, ctx->pipeline);
     if (ctx->offtex) SDL_ReleaseGPUTexture(ctx->device, ctx->offtex);
@@ -958,7 +961,6 @@ ZAN_SDL_API void zan_gpu_end(zan_i64 handle) {
     if (!ctx || !ctx->cmd) return;
     if (!ctx->swap) { SDL_SubmitGPUCommandBuffer(ctx->cmd); ctx->cmd = NULL; return; }
 
-    SDL_GPUTransferBuffer *tb = NULL;
     if (ctx->vcount > 0) {
         if ((Uint32)ctx->vcount > ctx->vbuf_cap) {
             SDL_ReleaseGPUBuffer(ctx->device, ctx->vbuf);
@@ -970,17 +972,25 @@ ZAN_SDL_API void zan_gpu_end(zan_i64 handle) {
             ctx->vbuf = SDL_CreateGPUBuffer(ctx->device, &bci);
         }
         Uint32 bytes = (Uint32)(ctx->vcount * (int)sizeof(ZanGpuVertex));
-        SDL_GPUTransferBufferCreateInfo up;
-        memset(&up, 0, sizeof(up));
-        up.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD; up.size = bytes;
-        tb = SDL_CreateGPUTransferBuffer(ctx->device, &up);
-        void *map = SDL_MapGPUTransferBuffer(ctx->device, tb, false);
+        /* Reuse the staging buffer across frames; only grow it when a frame
+         * needs more room. Creating/releasing one per frame churned GPU driver
+         * allocations for every game. */
+        if (bytes > ctx->upbuf_cap) {
+            if (ctx->upbuf) SDL_ReleaseGPUTransferBuffer(ctx->device, ctx->upbuf);
+            if (ctx->upbuf_cap == 0) { ctx->upbuf_cap = bytes; }
+            while (bytes > ctx->upbuf_cap) ctx->upbuf_cap *= 2;
+            SDL_GPUTransferBufferCreateInfo up;
+            memset(&up, 0, sizeof(up));
+            up.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD; up.size = ctx->upbuf_cap;
+            ctx->upbuf = SDL_CreateGPUTransferBuffer(ctx->device, &up);
+        }
+        void *map = SDL_MapGPUTransferBuffer(ctx->device, ctx->upbuf, true);
         memcpy(map, ctx->verts, bytes);
-        SDL_UnmapGPUTransferBuffer(ctx->device, tb);
+        SDL_UnmapGPUTransferBuffer(ctx->device, ctx->upbuf);
         SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(ctx->cmd);
         SDL_GPUTransferBufferLocation loc;
         memset(&loc, 0, sizeof(loc));
-        loc.transfer_buffer = tb; loc.offset = 0;
+        loc.transfer_buffer = ctx->upbuf; loc.offset = 0;
         SDL_GPUBufferRegion reg;
         memset(&reg, 0, sizeof(reg));
         reg.buffer = ctx->vbuf; reg.offset = 0; reg.size = bytes;
@@ -1030,6 +1040,5 @@ ZAN_SDL_API void zan_gpu_end(zan_i64 handle) {
     } else {
         SDL_SubmitGPUCommandBuffer(ctx->cmd);
     }
-    if (tb) SDL_ReleaseGPUTransferBuffer(ctx->device, tb);
     ctx->cmd = NULL; ctx->swap = NULL;
 }
