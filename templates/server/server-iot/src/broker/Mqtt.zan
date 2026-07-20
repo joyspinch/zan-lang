@@ -1,0 +1,311 @@
+using System;
+using System.Net.Sockets;
+
+namespace ZanWeb;
+
+/// <summary>MQTT 3.1.1 control packet type codes (high nibble of byte 0).</summary>
+class MqttType {
+    static int Connect = 1;
+    static int Connack = 2;
+    static int Publish = 3;
+    static int Puback = 4;
+    static int Pubrec = 5;
+    static int Pubrel = 6;
+    static int Pubcomp = 7;
+    static int Subscribe = 8;
+    static int Suback = 9;
+    static int Unsubscribe = 10;
+    static int Unsuback = 11;
+    static int Pingreq = 12;
+    static int Pingresp = 13;
+    static int Disconnect = 14;
+}
+
+/// <summary>An encoded MQTT packet ready to write to a socket: a byte buffer
+/// plus its exact length (Zan strings are strlen-based, so binary buffers with
+/// NUL bytes must carry an explicit length).</summary>
+class MqttMsg {
+    string buf;
+    int len;
+}
+
+/// <summary>
+/// Buffered MQTT packet framer over a non-blocking socket, modelled on the
+/// stdlib WsReader: FillMore() suspends on the reactor and appends bytes,
+/// PacketSize() returns the length of the complete packet at the front of the
+/// buffer (or -1 if more bytes are needed, -2 if malformed), Consume() drops it.
+/// Byte access uses buf[i] (an int 0..255) exactly like the WebSocket codec.
+/// </summary>
+class MqttReader {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    int sock;
+    string buf;
+    int len;
+    int cap;
+    string tmp;
+
+    MqttReader(int sock) {
+        this.sock = sock;
+        this.cap = 8192;
+        this.buf = calloc(this.cap + 1, 1);
+        this.len = 0;
+        this.tmp = calloc(65537, 1);
+    }
+
+    static MqttReader Create(int sock) { return new MqttReader(sock); }
+
+    void Ensure(int need) {
+        if (need <= this.cap) { return; }
+        int nc = this.cap * 2;
+        while (nc < need) { nc = nc * 2; }
+        string nb = calloc(nc + 1, 1);
+        int i = 0;
+        while (i < this.len) { nb[i] = this.buf[i]; i = i + 1; }
+        free(this.buf);
+        this.buf = nb;
+        this.cap = nc;
+    }
+
+    /// <summary>Suspends until readable, then appends received bytes. Returns
+    /// the count read; 0 means the peer closed (EOF).</summary>
+    async int FillMore() {
+        int got = 0;
+        while (got == 0) {
+            await Socket.ReadReady(this.sock);
+            int n = 0;
+            if (this.len == 0) {
+                n = Socket.Recv(this.sock, this.buf, this.cap);
+                if (n > 0) { this.len = n; got = n; }
+                else if (n == 0) { return 0; }
+            } else {
+                n = Socket.Recv(this.sock, this.tmp, 65536);
+                if (n > 0) {
+                    this.Ensure(this.len + n);
+                    int i = 0;
+                    while (i < n) { this.buf[this.len + i] = this.tmp[i]; i = i + 1; }
+                    this.len = this.len + n;
+                    got = n;
+                } else if (n == 0) { return 0; }
+            }
+        }
+        return got;
+    }
+
+    /// <summary>Total bytes of the packet at the front of the buffer, -1 if not
+    /// yet complete, -2 if the remaining-length field is malformed.</summary>
+    int PacketSize() {
+        if (this.len < 2) { return -1; }
+        int multiplier = 1;
+        int val = 0;
+        int i = 1;
+        bool more = true;
+        while (more) {
+            if (i >= this.len) { return -1; }
+            if (i > 4) { return -2; }
+            int enc = this.buf[i] & 255;
+            val = val + (enc & 127) * multiplier;
+            if ((enc & 128) == 0) { more = false; }
+            else { multiplier = multiplier * 128; i = i + 1; }
+        }
+        int header = i + 1;
+        int total = header + val;
+        if (this.len < total) { return -1; }
+        return total;
+    }
+
+    /// <summary>Number of fixed-header bytes (1 + remaining-length bytes).</summary>
+    int HeaderLen() {
+        int i = 1;
+        bool more = true;
+        while (more) {
+            int enc = this.buf[i] & 255;
+            if ((enc & 128) == 0) { more = false; }
+            else { i = i + 1; }
+        }
+        return i + 1;
+    }
+
+    int Type() { return (this.buf[0] & 255) >> 4; }
+    int Flags() { return this.buf[0] & 15; }
+
+    void Consume(int total) {
+        int rem = this.len - total;
+        int i = 0;
+        while (i < rem) { this.buf[i] = this.buf[total + i]; i = i + 1; }
+        this.len = rem;
+    }
+}
+
+/// <summary>Decoding helpers over an MQTT packet buffer (byte-indexed).</summary>
+class MqttDec {
+    /// <summary>Big-endian uint16 at off.</summary>
+    static int U16(string buf, int off) {
+        return ((buf[off] & 255) << 8) + (buf[off + 1] & 255);
+    }
+
+    /// <summary>MQTT UTF-8 string at off (2-byte length prefix + bytes).</summary>
+    static string Str(string buf, int off) {
+        int n = MqttDec.U16(buf, off);
+        return buf.Substring(off + 2, n);
+    }
+
+    static int StrEnd(string buf, int off) {
+        return off + 2 + MqttDec.U16(buf, off);
+    }
+}
+
+/// <summary>Encodes outbound MQTT packets into MqttMsg byte buffers.</summary>
+class MqttEnc {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    /// <summary>Writes an MQTT remaining-length varint at buf[off]; returns the
+    /// number of bytes written (1..4).</summary>
+    static int PutRemLen(string buf, int off, int val) {
+        int n = 0;
+        int v = val;
+        bool more = true;
+        while (more) {
+            int enc = v % 128;
+            v = v / 128;
+            if (v > 0) { enc = enc | 128; }
+            buf[off + n] = enc;
+            n = n + 1;
+            if (v == 0) { more = false; }
+        }
+        return n;
+    }
+
+    static int RemLenBytes(int val) {
+        int n = 1;
+        int v = val;
+        while (v > 127) { v = v / 128; n = n + 1; }
+        return n;
+    }
+
+    /// <summary>CONNACK: session-present=0, return code = code.</summary>
+    static MqttMsg Connack(int code) {
+        MqttMsg m = new MqttMsg();
+        string b = calloc(5, 1);
+        b[0] = 32;      // 0x20 CONNACK
+        b[1] = 2;
+        b[2] = 0;
+        b[3] = code;
+        m.buf = b;
+        m.len = 4;
+        return m;
+    }
+
+    /// <summary>SUBACK granting QoS0 for each of `count` filters.</summary>
+    static MqttMsg Suback(int packetId, int count) {
+        MqttMsg m = new MqttMsg();
+        int remaining = 2 + count;
+        string b = calloc(2 + remaining + 1, 1);
+        b[0] = 144;     // 0x90 SUBACK
+        int hn = MqttEnc.PutRemLen(b, 1, remaining);
+        int off = 1 + hn;
+        b[off] = (packetId >> 8) & 255;
+        b[off + 1] = packetId & 255;
+        off = off + 2;
+        int i = 0;
+        while (i < count) { b[off + i] = 0; i = i + 1; }   // 0x00 = granted QoS0
+        m.buf = b;
+        m.len = 1 + hn + remaining;
+        return m;
+    }
+
+    static MqttMsg Unsuback(int packetId) {
+        MqttMsg m = new MqttMsg();
+        string b = calloc(5, 1);
+        b[0] = 176;     // 0xB0 UNSUBACK
+        b[1] = 2;
+        b[2] = (packetId >> 8) & 255;
+        b[3] = packetId & 255;
+        m.buf = b;
+        m.len = 4;
+        return m;
+    }
+
+    static MqttMsg Puback(int packetId) {
+        MqttMsg m = new MqttMsg();
+        string b = calloc(5, 1);
+        b[0] = 64;      // 0x40 PUBACK
+        b[1] = 2;
+        b[2] = (packetId >> 8) & 255;
+        b[3] = packetId & 255;
+        m.buf = b;
+        m.len = 4;
+        return m;
+    }
+
+    static MqttMsg Pingresp() {
+        MqttMsg m = new MqttMsg();
+        string b = calloc(3, 1);
+        b[0] = 208;     // 0xD0 PINGRESP
+        b[1] = 0;
+        m.buf = b;
+        m.len = 2;
+        return m;
+    }
+
+    /// <summary>PUBLISH at QoS0 (no packet id): topic + payload.</summary>
+    static MqttMsg Publish(string topic, string payload, int payloadLen) {
+        MqttMsg m = new MqttMsg();
+        int tlen = topic.Length;
+        int remaining = 2 + tlen + payloadLen;
+        int hn = MqttEnc.RemLenBytes(remaining);
+        int total = 1 + hn + remaining;
+        string b = calloc(total + 1, 1);
+        b[0] = 48;      // 0x30 PUBLISH, QoS0, no retain/dup
+        MqttEnc.PutRemLen(b, 1, remaining);
+        int off = 1 + hn;
+        b[off] = (tlen >> 8) & 255;
+        b[off + 1] = tlen & 255;
+        off = off + 2;
+        int i = 0;
+        while (i < tlen) { b[off + i] = topic[i] & 255; i = i + 1; }
+        off = off + tlen;
+        int j = 0;
+        while (j < payloadLen) { b[off + j] = payload[j] & 255; j = j + 1; }
+        m.buf = b;
+        m.len = total;
+        return m;
+    }
+}
+
+/// <summary>Topic filter matching with MQTT wildcards: `+` (single level) and
+/// `#` (multi level, trailing).</summary>
+class Topic {
+    static List<string> Split(string s) {
+        List<string> outp = new List<string>();
+        int start = 0;
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == "/") {
+                outp.Add(s.Substring(start, i - start));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        outp.Add(s.Substring(start, s.Length - start));
+        return outp;
+    }
+
+    static bool Match(string filter, string topic) {
+        List<string> f = Topic.Split(filter);
+        List<string> t = Topic.Split(topic);
+        int i = 0;
+        while (i < f.Count) {
+            string fs = f[i];
+            if (fs == "#") { return true; }
+            if (i >= t.Count) { return false; }
+            if (fs != "+" && fs != t[i]) { return false; }
+            i = i + 1;
+        }
+        return i == t.Count;
+    }
+}

@@ -9,12 +9,13 @@ cache wired in by default.
 
 ```
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
-src/main.zan            bootstrap + route wiring only
+src/main.zan            bootstrap only — routes come from Routes.gen.zan
 src/controller/         request handlers, grouped per resource
   Controller.zan          shared response helpers (Ok / Fail envelopes)
   HomeController.zan       HTML landing page
-  ApiController.zan        status / echo / login / me / upload
+  ApiController.zan        status / echo / login / me / gather / upload
   UserController.zan       ORM + cache demo (/users, /user/{id})
+  AdminController.zan      /admin/menu — menu built from [Menu] routes
 src/model/              data access on System.Data.Orm
   User.zan                example model (auto-creates + seeds its table)
 src/framework/          reusable plumbing
@@ -22,9 +23,81 @@ src/framework/          reusable plumbing
   App.zan                 global accessor for the running WebApp
   Db.zan                  DbConnection bootstrap from [database]
   Cache.zan               in-memory TTL cache (Redis optional)
+  Security.zan            request-lock manager + rank/RBAC resolver
+  Filter.zan              unified input sanitising (Clean / Html / ToInt)
+  Menu.zan                admin menu JSON built from the route table
+  Routes.gen.zan          GENERATED route table (do not edit by hand)
   Router / Hooks / View / WebApp / HttpContext / Validate / StrMap
+tools/routegen/         RouteGen.zan — scans attributes -> Routes.gen.zan
 views/                  in-memory HTML templates
 ```
+
+## Attribute-driven routes
+
+Controllers declare routing with **attributes** instead of hand-wiring in
+`main.zan` (the Zan equivalent of the PHP `@title/@auth/@rank` docblocks). A
+build-time generator (`tools/routegen`) scans the controllers and emits
+`src/framework/Routes.gen.zan`, which `main.zan` registers with a single
+`Routes.Map(app)`.
+
+```zan
+class ApiController {
+    [Post]                 // HTTP verb: [Get] [Post] [Put] [Delete] [Patch]
+    [Title("收集数据")]     // human label (admin menu / docs)
+    [Auth]                 // permission check required (implies login)
+    [Rank(3)]              // minimum principal rank
+    [Lock("user")]         // per-user request lock (double-submit guard)
+    static void Gather(HttpContext ctx) { ... }   // -> POST /api/gather
+}
+```
+
+| Attribute | Effect |
+|---|---|
+| `[Get] [Post] [Put] [Delete] [Patch]` | HTTP verb (required to mark a method as a route) |
+| `[Route("/custom")]` | override the convention path |
+| `[Title("...")]` | label for the admin menu / docs |
+| `[Login]` | a logged-in principal is required (401 otherwise) |
+| `[Auth]` | RBAC permission check (implies `[Login]`, 403 on failure) |
+| `[Rank(n)]` | minimum principal rank |
+| `[Lock("user"\|"global")]` | request lock; second concurrent call gets 429 |
+| `[Limit(n)]` | per-route rate limit (requests/sec) |
+| `[Upload]` | stream the request body to disk |
+| `[Menu]` | surface this route in the admin menu (`/admin/menu`) |
+
+**Routes follow the directory structure.** The path is
+`<folders under src/controller> + controller name (minus "Controller") + action`,
+lower-cased — `ApiController.Status` → `/api/status`, `Admin/UserController.List`
+→ `/admin/user/list`. `Index` maps to the folder root. `[Route("...")]` overrides
+the convention when you need an exception.
+
+Regenerate after editing controller attributes:
+
+```
+zanc tools/routegen/RouteGen.zan --auto-stdlib -o routegen.exe
+./routegen.exe        # run from the project root; rewrites Routes.gen.zan
+```
+
+Custom rank/RBAC logic plugs in without touching the framework:
+`app.RankResolver(fn)` where `fn(uid) -> int` (default: uid "1" is rank 9).
+
+## Safe request input
+
+Read every frontend parameter through the unified, filtered accessors on
+`HttpContext` — resolved from the same place (form → query → route param) and
+passed through the central `Filter` so sanitising is uniform:
+
+```zan
+string name = ctx.In("name");       // trimmed, CR/LF/TAB control chars stripped
+string html = ctx.InText("bio");    // In + HTML-entity escaped (safe to render)
+int    page = ctx.InInt("page", 1); // tolerant integer parse with a fallback
+string raw  = ctx.InRaw("blob");    // UNFILTERED — only when you need raw bytes
+bool   has  = ctx.HasIn("name");
+```
+
+`In*` centralises input handling; it is **not** a universal security layer.
+Output/context escaping (HTML via `InText`, JSON via `JsonStr.Escape`),
+parameterised SQL (the ORM binds values), and authorisation remain separate
+concerns — filtering input does not replace them.
 
 ## Configuration (no recompile)
 
@@ -134,8 +207,10 @@ zanc src/main.zan src/**/*.zan --stdlib-path <stdlib> -o app.exe
 - `GET /api/status` — request statistics
 - `GET /admin/stats` — runtime diagnostics (CPU, memory, requests, slow requests/queries) — **protect before exposing**
 - `POST /api/echo` — rate-limited (100 req/s) echo
+- `POST /api/gather` — `[Auth] [Rank(3)] [Lock("user")]` permissioned + locked demo
 - `POST /api/login` — `user=admin&pass=admin` issues a session token
 - `GET /api/me` — requires `Authorization: Bearer <token>` or session cookie
+- `GET /admin/menu` — admin menu built from `[Menu]` routes (`[Auth] [Rank(9)]`)
 - `POST /upload` — streaming upload
 
 ## Database & ORM (FreeSQL-style, bidirectional)

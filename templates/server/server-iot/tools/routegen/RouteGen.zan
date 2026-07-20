@@ -1,0 +1,453 @@
+using System;
+using System.IO;
+using System.Text;
+
+namespace RouteGen;
+
+// -----------------------------------------------------------------------------
+// RouteGen -- scans the MVC controllers for routing attributes and emits the
+// generated route table src/framework/Routes.gen.zan.
+//
+//   Build:  zanc tools/routegen/RouteGen.zan --auto-stdlib -o routegen.exe
+//   Run  :  routegen.exe            (from the project root)
+//
+// The route path is convention-based: <folder under src/controller> + controller
+// name (minus "Controller") + action name, lower-cased. ApiController.Status ->
+// /api/status; a [Route("...")] attribute overrides it. HTTP verb comes from
+// [Get]/[Post]/[Put]/[Delete] (default GET). All other attributes ([Title],
+// [Auth], [Login], [Rank], [Lock], [Limit], [Upload], [Menu]) map straight onto
+// the generated Route metadata.
+//
+// NOTE: implemented with Substring / Length / char comparison only -- the string
+// helpers here (Lower/Trim/StartsWith/...) are local because several string
+// instance methods are unreliable in the current toolchain.
+// -----------------------------------------------------------------------------
+
+/// <summary>One scanned controller action + its attribute metadata.</summary>
+class ActionInfo {
+    string controller;   // "ApiController"
+    string method;       // "Status"
+    string verb;         // "GET"
+    string path;         // "/api/status"
+    string title;
+    bool auth;
+    bool login;
+    int rank;
+    string lockScope;
+    int limit;
+    bool upload;
+    bool menu;
+    string group;
+    bool isRoute;    // true once a verb / [Route] attribute marks this a route
+
+    ActionInfo() {
+        this.controller = "";
+        this.method = "";
+        this.verb = "GET";
+        this.path = "";
+        this.title = "";
+        this.auth = false;
+        this.login = false;
+        this.rank = 0;
+        this.lockScope = "";
+        this.limit = 0;
+        this.upload = false;
+        this.menu = false;
+        this.group = "";
+        this.isRoute = false;
+    }
+}
+
+/// <summary>String helpers built on Substring/Length only.</summary>
+class Str {
+    static string Lower(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            int k = 0;
+            bool done = false;
+            while (k < 26 && !done) {
+                if (up.Substring(k, 1) == c) {
+                    sb.Append(lo.Substring(k, 1));
+                    done = true;
+                }
+                k = k + 1;
+            }
+            if (!done) { sb.Append(c); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static bool IsSpace(string c) {
+        return c == " " || c == "\t" || c == "\r" || c == "\n";
+    }
+
+    static string Trim(string s) {
+        int n = s.Length;
+        int a = 0;
+        while (a < n && Str.IsSpace(s.Substring(a, 1))) { a = a + 1; }
+        int b = n;
+        while (b > a && Str.IsSpace(s.Substring(b - 1, 1))) { b = b - 1; }
+        if (b <= a) { return ""; }
+        return s.Substring(a, b - a);
+    }
+
+    static bool StartsWith(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        return s.Substring(0, p.Length) == p;
+    }
+
+    static bool EndsWith(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        return s.Substring(s.Length - p.Length, p.Length) == p;
+    }
+
+    static int Find(string s, string sub, int from) {
+        if (sub.Length == 0) { return from; }
+        int i = from;
+        int last = s.Length - sub.Length;
+        while (i <= last) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static bool Contains(string s, string sub) {
+        return Str.Find(s, sub, 0) >= 0;
+    }
+
+    /// <summary>The text between the first pair of double quotes, or "".</summary>
+    static string FirstQuoted(string s) {
+        int a = Str.Find(s, "\"", 0);
+        if (a < 0) { return ""; }
+        int b = Str.Find(s, "\"", a + 1);
+        if (b < 0) { return ""; }
+        return s.Substring(a + 1, b - a - 1);
+    }
+
+    /// <summary>The n-th (0-based) double-quoted token, or "".</summary>
+    static string QuotedAt(string s, int idx) {
+        int pos = 0;
+        int count = 0;
+        while (true) {
+            int a = Str.Find(s, "\"", pos);
+            if (a < 0) { return ""; }
+            int b = Str.Find(s, "\"", a + 1);
+            if (b < 0) { return ""; }
+            if (count == idx) { return s.Substring(a + 1, b - a - 1); }
+            count = count + 1;
+            pos = b + 1;
+        }
+        return "";
+    }
+
+    static int CountQuotes(string s) {
+        int i = 0;
+        int c = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == "\"") { c = c + 1; }
+            i = i + 1;
+        }
+        return c;
+    }
+
+    /// <summary>The integer inside the first (...) of an attribute, or def.</summary>
+    static int ParenInt(string s, int def) {
+        int a = Str.Find(s, "(", 0);
+        if (a < 0) { return def; }
+        int b = Str.Find(s, ")", a + 1);
+        if (b < 0) { return def; }
+        string inside = Str.Trim(s.Substring(a + 1, b - a - 1));
+        if (inside.Length == 0) { return def; }
+        string digits = "0123456789";
+        int val = 0;
+        int i = 0;
+        while (i < inside.Length) {
+            string c = inside.Substring(i, 1);
+            int d = -1;
+            int k = 0;
+            while (k < 10) {
+                if (digits.Substring(k, 1) == c) { d = k; }
+                k = k + 1;
+            }
+            if (d < 0) { return def; }
+            val = val * 10 + d;
+            i = i + 1;
+        }
+        return val;
+    }
+
+    /// <summary>The attribute name: chars after '[' up to '(' or ']'.</summary>
+    static string AttrName(string line) {
+        int a = Str.Find(line, "[", 0);
+        if (a < 0) { return ""; }
+        int i = a + 1;
+        StringBuilder sb = new StringBuilder();
+        while (i < line.Length) {
+            string c = line.Substring(i, 1);
+            if (c == "(" || c == "]" || c == " ") { return sb.ToString(); }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}
+
+class Program {
+    static string CONTROLLER_DIR = "src/controller";
+    static string OUT_FILE = "src/framework/Routes.gen.zan";
+
+    static void Main() {
+        List<ActionInfo> actions = new List<ActionInfo>();
+        Program.ScanDir(Program.CONTROLLER_DIR, "", actions);
+        string code = Program.Render(actions);
+        File.WriteAllText(Program.OUT_FILE, code);
+        Console.WriteLine("[routegen] wrote " + Program.OUT_FILE + " ("
+            + Convert.ToString(actions.Count) + " routes)");
+    }
+
+    /// <summary>Recursively scans dir; prefix is the route prefix built from the
+    /// folders below src/controller (e.g. "admin/").</summary>
+    static void ScanDir(string dir, string prefix, List<ActionInfo> outp) {
+        if (!Directory.Exists(dir)) {
+            Console.WriteLine("[routegen] missing dir: " + dir);
+            return;
+        }
+        List<string> files = Directory.GetFiles(dir);
+        int i = 0;
+        while (i < files.Count) {
+            string fn = files[i];
+            i = i + 1;
+            if (fn.Length > 4 && Str.EndsWith(fn, ".zan")) {
+                Program.ScanFile(dir + "/" + fn, prefix, outp);
+            }
+        }
+        List<string> subs = Directory.GetDirectories(dir);
+        int j = 0;
+        while (j < subs.Count) {
+            string sd = subs[j];
+            j = j + 1;
+            Program.ScanDir(dir + "/" + sd, prefix + Str.Lower(sd) + "/", outp);
+        }
+    }
+
+    static void ScanFile(string file, string prefix, List<ActionInfo> outp) {
+        string text = File.ReadAllText(file);
+        List<string> lines = Program.SplitLines(text);
+        string controller = "";
+        string cbase = "";
+        // pending attribute state for the next method
+        ActionInfo pend = new ActionInfo();
+        bool haveVerb = false;
+        int i = 0;
+        while (i < lines.Count) {
+            string raw = lines[i];
+            i = i + 1;
+            string line = Str.Trim(raw);
+            if (line.Length == 0) { continue; }
+            if (Str.StartsWith(line, "//") || Str.StartsWith(line, "///")
+                || Str.StartsWith(line, "*") || Str.StartsWith(line, "/*")) {
+                continue;
+            }
+            if (Str.StartsWith(line, "class ") && Str.Contains(line, "Controller")) {
+                controller = Program.IdentAfter(line, "class ");
+                cbase = Program.ControllerBase(controller);
+                continue;
+            }
+            if (Str.StartsWith(line, "[")) {
+                Program.ApplyAttr(line, pend, haveVerb);
+                if (Program.IsVerb(Str.AttrName(line))) { haveVerb = true; }
+                continue;
+            }
+            if (Program.IsAction(line)) {
+                string mname = Program.MethodName(line);
+                if (mname.Length > 0 && controller.Length > 0 && pend.isRoute) {
+                    pend.controller = controller;
+                    pend.method = mname;
+                    if (pend.path.Length == 0) {
+                        pend.path = Program.ConventionPath(prefix, cbase, mname);
+                    }
+                    pend.group = Program.GroupOf(pend.path);
+                    outp.Add(pend);
+                }
+                pend = new ActionInfo();
+                haveVerb = false;
+                continue;
+            }
+            // any other code line resets a dangling attribute block
+            pend = new ActionInfo();
+            haveVerb = false;
+        }
+    }
+
+    static bool IsVerb(string name) {
+        return name == "Get" || name == "Post" || name == "Put"
+            || name == "Delete" || name == "Patch";
+    }
+
+    static void ApplyAttr(string line, ActionInfo a, bool haveVerb) {
+        string name = Str.AttrName(line);
+        if (Program.IsVerb(name)) { a.isRoute = true; }
+        if (name == "Get") { a.verb = "GET"; }
+        else if (name == "Post") { a.verb = "POST"; }
+        else if (name == "Put") { a.verb = "PUT"; }
+        else if (name == "Delete") { a.verb = "DELETE"; }
+        else if (name == "Patch") { a.verb = "PATCH"; }
+        else if (name == "Route") {
+            a.isRoute = true;
+            int q = Str.CountQuotes(line);
+            if (q >= 4) {
+                a.verb = Str.QuotedAt(line, 0);
+                a.path = Str.QuotedAt(line, 1);
+            } else {
+                a.path = Str.FirstQuoted(line);
+            }
+        }
+        else if (name == "Title") { a.title = Str.FirstQuoted(line); }
+        else if (name == "Auth") { a.auth = true; }
+        else if (name == "Login") { a.login = true; }
+        else if (name == "Rank") { a.rank = Str.ParenInt(line, 0); }
+        else if (name == "Lock") {
+            string sc = Str.FirstQuoted(line);
+            if (sc.Length == 0) { sc = "global"; }
+            a.lockScope = sc;
+        }
+        else if (name == "Limit") { a.limit = Str.ParenInt(line, 0); }
+        else if (name == "Upload") { a.upload = true; }
+        else if (name == "Menu") { a.menu = true; }
+    }
+
+    static bool IsAction(string line) {
+        return Str.Contains(line, "static")
+            && Str.Contains(line, "(HttpContext");
+    }
+
+    /// <summary>Extracts the method name in "... Name(HttpContext ...".</summary>
+    static string MethodName(string line) {
+        int p = Str.Find(line, "(", 0);
+        if (p <= 0) { return ""; }
+        int i = p - 1;
+        while (i >= 0 && Str.IsSpace(line.Substring(i, 1))) { i = i - 1; }
+        int end = i + 1;
+        while (i >= 0) {
+            string c = line.Substring(i, 1);
+            if (c == " " || c == "\t" || c == "*" || c == ">") { break; }
+            i = i - 1;
+        }
+        int start = i + 1;
+        if (end <= start) { return ""; }
+        return line.Substring(start, end - start);
+    }
+
+    static string IdentAfter(string line, string kw) {
+        int p = Str.Find(line, kw, 0);
+        if (p < 0) { return ""; }
+        int i = p + kw.Length;
+        StringBuilder sb = new StringBuilder();
+        while (i < line.Length) {
+            string c = line.Substring(i, 1);
+            if (c == " " || c == "\t" || c == "{" || c == ":" || c == "<") { break; }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static string ControllerBase(string controller) {
+        string b = controller;
+        if (Str.EndsWith(b, "Controller")) {
+            b = b.Substring(0, b.Length - 10);
+        }
+        return Str.Lower(b);
+    }
+
+    static string ConventionPath(string prefix, string cbase, string method) {
+        string m = Str.Lower(method);
+        if (m == "index") {
+            return "/" + prefix + cbase;
+        }
+        return "/" + prefix + cbase + "/" + m;
+    }
+
+    static string GroupOf(string path) {
+        int i = 0;
+        // skip leading slash
+        while (i < path.Length && path.Substring(i, 1) == "/") { i = i + 1; }
+        int start = i;
+        while (i < path.Length && path.Substring(i, 1) != "/") { i = i + 1; }
+        if (i <= start) { return ""; }
+        return path.Substring(start, i - start);
+    }
+
+    static List<string> SplitLines(string text) {
+        List<string> outp = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            string c = text.Substring(i, 1);
+            if (c == "\n") {
+                outp.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else if (c != "\r") {
+                sb.Append(c);
+            }
+            i = i + 1;
+        }
+        outp.Add(sb.ToString());
+        return outp;
+    }
+
+    static string Render(List<ActionInfo> actions) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("using System;\n\n");
+        sb.Append("namespace ZanWeb;\n\n");
+        sb.Append("// ---------------------------------------------------------------------------\n");
+        sb.Append("// AUTO-GENERATED by tools/routegen -- DO NOT EDIT BY HAND.\n");
+        sb.Append("// Regenerate after changing controller attributes:\n");
+        sb.Append("//     zanc tools/routegen/RouteGen.zan --auto-stdlib -o routegen.exe\n");
+        sb.Append("//     routegen.exe            (from the project root)\n");
+        sb.Append("// ---------------------------------------------------------------------------\n");
+        sb.Append("class Routes {\n");
+        sb.Append("    static void Map(WebApp app) {\n");
+        int i = 0;
+        while (i < actions.Count) {
+            ActionInfo a = actions[i];
+            i = i + 1;
+            sb.Append("        app.Map(\"");
+            sb.Append(a.verb);
+            sb.Append("\", \"");
+            sb.Append(a.path);
+            sb.Append("\", ");
+            sb.Append(a.controller);
+            sb.Append(".");
+            sb.Append(a.method);
+            sb.Append(")\n            .Named(\"");
+            sb.Append(a.controller);
+            sb.Append(".");
+            sb.Append(a.method);
+            sb.Append("\").Title(\"");
+            sb.Append(a.title);
+            sb.Append("\").Group(\"");
+            sb.Append(a.group);
+            sb.Append("\")");
+            if (a.auth) { sb.Append(".Auth()"); }
+            else if (a.login || a.rank > 0) {
+                if (a.login && a.rank == 0) { sb.Append(".Login()"); }
+            }
+            if (a.rank > 0) { sb.Append(".Rank(" + Convert.ToString(a.rank) + ")"); }
+            if (a.lockScope.Length > 0) { sb.Append(".Lock(\"" + a.lockScope + "\")"); }
+            if (a.limit > 0) { sb.Append(".Limit(" + Convert.ToString(a.limit) + ")"); }
+            if (a.upload) { sb.Append(".Upload()"); }
+            if (a.menu) { sb.Append(".Menu()"); }
+            sb.Append(";\n");
+        }
+        sb.Append("    }\n");
+        sb.Append("}\n");
+        return sb.ToString();
+    }
+}

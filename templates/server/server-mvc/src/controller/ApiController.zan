@@ -2,39 +2,87 @@ using System;
 
 namespace ZanWeb;
 
-/// <summary>JSON API actions: status, echo, auth (login / me) and the streamed
-/// upload endpoint.</summary>
+/// <summary>JSON API actions: status, echo, auth (login / me), a permissioned
+/// data-collection endpoint and the streamed upload endpoint.
+///
+/// Routing is convention-based: the URL comes from the controller's location
+/// (folder path under src/controller + controller name) plus the action name --
+/// ApiController.Status -> GET /api/status. Everything else is declared with
+/// attributes and wired automatically by the generated route table
+/// (tools/routegen -> src/framework/Routes.gen.zan):
+///   [Get] [Post] [Put] [Delete]   HTTP verb (default GET)
+///   [Route("/custom")]            override the convention path
+///   [Title("...")]                human label (admin menu / docs)
+///   [Login]                       a logged-in principal is required
+///   [Auth]                        permission check required (implies [Login])
+///   [Rank(n)]                     minimum principal rank
+///   [Lock("user"|"global")]       request lock (double-submit / race guard)
+///   [Limit(n)]                    per-route rate limit (requests/sec)
+///   [Menu]                        surface this action in the admin menu
+///   [Upload]                      stream the request body to disk
+///
+/// Read frontend parameters through ctx.In / ctx.InInt / ctx.InText so every
+/// value goes through the same central Filter.
+/// </summary>
 class ApiController {
+    [Get]
+    [Title("服务状态")]
     static void Status(HttpContext ctx) {
         ctx.Json(App.Web().StatusJson());
     }
 
     /// <summary>Runtime diagnostics: CPU, memory, uptime, request + query
-    /// throughput/latency, and the most recent slow requests / slow queries.
-    /// Protect this route (Auth / IP allow-list) before exposing it publicly.</summary>
+    /// throughput/latency, and the most recent slow requests / slow queries.</summary>
+    [Get]
+    [Route("/admin/stats")]
+    [Title("运行指标")]
+    [Auth]
+    [Rank(9)]
+    [Menu]
     static void Stats(HttpContext ctx) {
         ctx.Json(App.Web().MetricsJson());
     }
 
+    [Post]
+    [Title("回显")]
+    [Limit(100)]
     static void Echo(HttpContext ctx) {
-        string msg = ctx.Form("msg");
+        string msg = ctx.In("msg");
         if (msg.Length == 0) { msg = ctx.Body(); }
         Controller.Ok(ctx, "{\"echo\":\"" + JsonStr.Escape(msg) + "\"}");
     }
 
+    /// <summary>Collects a data payload. Mirrors the PHP docblock demo
+    /// (@title 收集数据 / @auth true / @rank 3): permissioned + request-locked
+    /// per user so a double click cannot submit twice.</summary>
+    [Post]
+    [Title("收集数据")]
+    [Auth]
+    [Rank(3)]
+    [Lock("user")]
+    static void Gather(HttpContext ctx) {
+        string uid = ctx.state.Get("uid");
+        string payload = ctx.In("payload");
+        if (payload.Length == 0) { payload = ctx.Body(); }
+        Controller.Ok(ctx, "{\"uid\":\"" + JsonStr.Escape(uid)
+            + "\",\"bytes\":" + Convert.ToString(payload.Length) + "}");
+    }
+
+    [Post]
+    [Title("登录")]
     static void Login(HttpContext ctx) {
+        string user = ctx.In("user");
+        string pass = ctx.In("pass");
         Validator v = Validator.Create();
-        v.Require(ctx.Form("user"), "user");
-        v.MaxLen(ctx.Form("user"), 32, "user");
-        v.Require(ctx.Form("pass"), "pass");
-        v.MaxLen(ctx.Form("pass"), 64, "pass");
+        v.Require(user, "user");
+        v.MaxLen(user, 32, "user");
+        v.Require(pass, "pass");
+        v.MaxLen(pass, 64, "pass");
         if (!v.Ok()) {
             ctx.Status(422, "Unprocessable Entity");
             ctx.Api("1003", "validation failed", v.ErrorsJson());
             return;
         }
-        string user = ctx.Form("user");
-        string pass = ctx.Form("pass");
         // Demo credential check -- replace with your user store.
         if (user == "admin" && pass == "admin") {
             string token = App.Web().sessions.Issue("1", WebApp.NowSeconds());
@@ -45,14 +93,23 @@ class ApiController {
         }
     }
 
+    [Get]
+    [Title("当前用户")]
+    [Login]
     static void Me(HttpContext ctx) {
         string uid = ctx.state.Get("uid");
         Controller.Ok(ctx, "{\"uid\":\"" + uid + "\"}");
     }
 
+    /// <summary>Large bodies are streamed to disk in 64KB chunks (binary-safe);
+    /// memory stays flat even for multi-hundred-MB uploads.</summary>
+    [Post]
+    [Route("/upload")]
+    [Title("上传")]
+    [Login]
+    [Upload]
+    [Lock("user")]
     static void Upload(HttpContext ctx) {
-        // Large bodies are streamed to disk in 64KB chunks (binary-safe);
-        // memory stays flat even for multi-hundred-MB uploads.
         string path = ctx.state.Get("upload_path");
         string size = ctx.state.Get("upload_size");
         if (path.Length == 0) {

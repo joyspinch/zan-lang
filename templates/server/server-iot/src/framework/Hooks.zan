@@ -1,0 +1,203 @@
+using System;
+
+namespace ZanWeb;
+
+/// <summary>Lifecycle hook: return false to short-circuit the request
+/// (the hook must have written a response into ctx first).</summary>
+delegate bool HookFn(HttpContext ctx);
+
+/// <summary>Post-request hook (logging, metrics); cannot short-circuit.</summary>
+delegate void AfterFn(HttpContext ctx, int elapsedMs);
+
+/// <summary>
+/// Explicit, typed replacement for runtime `include`-style plugin hooks:
+/// hooks are registered once at startup and run in registration order.
+/// Everything is compile-time checked -- no reflection, no string dispatch.
+/// </summary>
+class Hooks {
+    List<HookFn> before;
+    List<AfterFn> after;
+
+    Hooks() {
+        this.before = new List<HookFn>();
+        this.after = new List<AfterFn>();
+    }
+
+    static Hooks Create() { return new Hooks(); }
+
+    void Before(HookFn fn) { this.before.Add(fn); }
+    void After(AfterFn fn) { this.after.Add(fn); }
+
+    /// <summary>Runs before-hooks in order; false = request short-circuited.</summary>
+    bool RunBefore(HttpContext ctx) {
+        int i = 0;
+        while (i < this.before.Count) {
+            HookFn fn = this.before[i];
+            if (!fn(ctx)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    void RunAfter(HttpContext ctx, int elapsedMs) {
+        int i = 0;
+        while (i < this.after.Count) {
+            AfterFn fn = this.after[i];
+            fn(ctx, elapsedMs);
+            i = i + 1;
+        }
+    }
+}
+
+/// <summary>
+/// Fixed-window rate limiter, the in-process analogue of a swoole_table
+/// counter: one slot per key (route / ip / token), counting requests in the
+/// current window and resetting when the window rolls over. Windows are
+/// wall-clock seconds. Single-threaded event loop => no locking needed.
+/// </summary>
+class RateLimiter {
+    List<string> keys;
+    List<int> counts;
+    List<int> windowStart;
+    int windowSeconds;
+
+    RateLimiter() {
+        this.keys = new List<string>();
+        this.counts = new List<int>();
+        this.windowStart = new List<int>();
+        this.windowSeconds = 1;
+    }
+
+    static RateLimiter Create(int windowSeconds) {
+        RateLimiter rl = new RateLimiter();
+        if (windowSeconds > 0) { rl.windowSeconds = windowSeconds; }
+        return rl;
+    }
+
+    /// <summary>Counts one hit on `key`; false when `limit` is exceeded
+    /// inside the current window. limit <= 0 means unlimited.</summary>
+    bool Allow(string key, int limit, int nowSeconds) {
+        if (limit <= 0) { return true; }
+        int i = this.IndexOf(key);
+        if (i < 0) {
+            this.keys.Add(key);
+            this.counts.Add(1);
+            this.windowStart.Add(nowSeconds);
+            return true;
+        }
+        if (nowSeconds - this.windowStart[i] >= this.windowSeconds) {
+            this.windowStart[i] = nowSeconds;
+            this.counts[i] = 1;
+            return true;
+        }
+        if (this.counts[i] >= limit) { return false; }
+        this.counts[i] = this.counts[i] + 1;
+        return true;
+    }
+
+    /// <summary>Current hit count for a key (for /api/status).</summary>
+    int CountOf(string key) {
+        int i = this.IndexOf(key);
+        if (i < 0) { return 0; }
+        return this.counts[i];
+    }
+
+    int IndexOf(string key) {
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (this.keys[i] == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+/// <summary>
+/// Per-route request statistics (count / total / min / max elapsed ms) --
+/// the analogue of the swoole request_stat table, kept in process memory.
+/// </summary>
+class RouteStats {
+    List<string> keys;
+    List<int> counts;
+    List<int> totalMs;
+    List<int> minMs;
+    List<int> maxMs;
+
+    RouteStats() {
+        this.keys = new List<string>();
+        this.counts = new List<int>();
+        this.totalMs = new List<int>();
+        this.minMs = new List<int>();
+        this.maxMs = new List<int>();
+    }
+
+    static RouteStats Create() { return new RouteStats(); }
+
+    void Record(string key, int ms) {
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (this.keys[i] == key) {
+                this.counts[i] = this.counts[i] + 1;
+                this.totalMs[i] = this.totalMs[i] + ms;
+                if (ms < this.minMs[i]) { this.minMs[i] = ms; }
+                if (ms > this.maxMs[i]) { this.maxMs[i] = ms; }
+                return;
+            }
+            i = i + 1;
+        }
+        this.keys.Add(key);
+        this.counts.Add(1);
+        this.totalMs.Add(ms);
+        this.minMs.Add(ms);
+        this.maxMs.Add(ms);
+    }
+
+    /// <summary>Stats snapshot as a JSON array.</summary>
+    string ToJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        int i = 0;
+        while (i < this.keys.Count) {
+            if (i > 0) { sb.Append(","); }
+            int avg = 0;
+            if (this.counts[i] > 0) { avg = this.totalMs[i] / this.counts[i]; }
+            sb.Append("{\"route\":\"");
+            sb.Append(JsonStr.Escape(this.keys[i]));
+            sb.Append("\",\"count\":");
+            sb.Append(Convert.ToString(this.counts[i]));
+            sb.Append(",\"avg_ms\":");
+            sb.Append(Convert.ToString(avg));
+            sb.Append(",\"min_ms\":");
+            sb.Append(Convert.ToString(this.minMs[i]));
+            sb.Append(",\"max_ms\":");
+            sb.Append(Convert.ToString(this.maxMs[i]));
+            sb.Append("}");
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+}
+
+/// <summary>
+/// Minimal in-memory session/auth store: token -> user id. A before-hook
+/// checks `route.needsAuth` against this store; swap the storage for Redis
+/// or a database without touching the hook contract.
+/// </summary>
+class Sessions {
+    StrMap tokens;   // token -> uid
+
+    Sessions() { this.tokens = StrMap.Create(); }
+
+    static Sessions Create() { return new Sessions(); }
+
+    string Issue(string uid, int nowSeconds) {
+        string token = "t" + Convert.ToString(nowSeconds) + "x" + uid
+            + Convert.ToString(this.tokens.Count());
+        this.tokens.Set(token, uid);
+        return token;
+    }
+
+    /// <summary>Returns the uid for a bearer token / cookie, or "".</summary>
+    string UserOf(string token) { return this.tokens.Get(token); }
+}

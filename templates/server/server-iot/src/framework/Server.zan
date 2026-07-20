@@ -1,0 +1,68 @@
+using System;
+using System.Diagnostics;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Server bootstrap. All of the process/daemon/worker plumbing now lives in the
+/// standard library (System.Diagnostics.ProcessHost); this class only reads the
+/// [worker] config section and wires ProcessHost to the WebApp accept loop.
+///
+/// worker.count = 1  (default): a single process runs the coroutine event loop
+///   -- each connection is already handled in its own coroutine, so one worker
+///   scales to many thousands of concurrent connections. Best for development
+///   (logs stream straight into the IDE terminal).
+///
+/// worker.count > 1: on Linux/macOS the master binds with SO_REUSEPORT and
+///   ProcessHost.SpawnWorkers re-launches (count-1) copies of this executable
+///   that bind the SAME port; the kernel load-balances connections across all
+///   workers, using every CPU core. Windows has no SO_REUSEPORT load-balancing,
+///   so it transparently falls back to a single process.
+///
+/// worker.daemon = true (Linux): ProcessHost.Daemonize() detaches from the
+///   controlling terminal (setsid) and keeps running in the background.
+///
+/// Restart-on-crash is delegated to the process supervisor (systemd
+/// `Restart=always`, Docker `restart: unless-stopped`, Kubernetes) -- the
+/// standard way to supervise horizontally scaled services.
+/// </summary>
+class Server {
+    /// <summary>Boots the server according to the [worker] config section and
+    /// then runs the accept loop. Await this from Main.</summary>
+    static async int Run(WebApp app) {
+        int count = Config.Int("worker", "count", 1);
+        bool daemon = Config.Bool("worker", "daemon", false);
+
+        if (count > 1 && !ProcessHost.MultiProcessSupported() && !ProcessHost.IsWorker()) {
+            Console.WriteLine("[server] SO_REUSEPORT multi-worker is Linux/macOS-only; "
+                + "running a single process on this platform.");
+            count = 1;
+        }
+
+        if (daemon && ProcessHost.Daemonize()) {
+            Console.WriteLine("[server] daemonized; parent process exiting.");
+            return 0;
+        }
+
+        if (count > 1) {
+            app.ReusePort(true);
+            if (ProcessHost.IsWorker()) {
+                Console.WriteLine("[worker " + Convert.ToString(ProcessHost.WorkerId())
+                    + "] pid=" + Convert.ToString(ProcessHost.Pid()) + " serving.");
+            } else {
+                int spawned = ProcessHost.SpawnWorkers(count);
+                if (spawned == 0) {
+                    Console.WriteLine("[server] could not spawn workers; "
+                        + "running a single process.");
+                } else {
+                    Console.WriteLine("[master] pid=" + Convert.ToString(ProcessHost.Pid())
+                        + " serving as worker 0; spawned " + Convert.ToString(spawned)
+                        + " more (SO_REUSEPORT).");
+                }
+            }
+        }
+
+        int r = await app.Start();
+        return r;
+    }
+}

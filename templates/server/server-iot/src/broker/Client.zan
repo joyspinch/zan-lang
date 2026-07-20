@@ -1,0 +1,95 @@
+using System;
+using System.Net.Sockets;
+
+namespace ZanWeb;
+
+/// <summary>One topic subscription held by a client (filter + granted QoS).</summary>
+class Sub {
+    string filter;
+    int qos;
+
+    static Sub Create(string filter, int qos) {
+        Sub s = new Sub();
+        s.filter = filter;
+        s.qos = qos;
+        return s;
+    }
+}
+
+/// <summary>
+/// A connected MQTT client session tracked by the broker. Holds the socket so
+/// the broker can push PUBLISH frames to it from any coroutine (a publish runs
+/// in the *publisher's* coroutine but writes to every subscriber's socket), plus
+/// per-client counters surfaced by the management API.
+/// </summary>
+class MqttClient {
+    int id;
+    string clientId;
+    int sock;
+    string addr;
+    int connectedAt;
+    int keepAlive;
+    bool alive;
+    int msgsIn;
+    int msgsOut;
+    List<Sub> subs;
+
+    MqttClient(int id, int sock) {
+        this.id = id;
+        this.clientId = "";
+        this.sock = sock;
+        this.addr = "";
+        this.connectedAt = 0;
+        this.keepAlive = 0;
+        this.alive = true;
+        this.msgsIn = 0;
+        this.msgsOut = 0;
+        this.subs = new List<Sub>();
+    }
+
+    static MqttClient Create(int id, int sock) { return new MqttClient(id, sock); }
+
+    /// <summary>Writes a fully-encoded packet with a bounded full-send loop.
+    /// Uses the non-blocking Socket.Send (a direct syscall) rather than the
+    /// awaitable path ON PURPOSE: a publish writes to *other* clients whose
+    /// coroutines are parked awaiting readability; a direct send never touches
+    /// their read registration on the reactor. Returns false if unwritable.</summary>
+    bool Send(MqttMsg m) {
+        if (!this.alive) { return false; }
+        int off = 0;
+        int tries = 0;
+        while (off < m.len) {
+            int r = Socket.Send(this.sock, m.buf.Substring(off, m.len - off), m.len - off);
+            if (r > 0) { off = off + r; tries = 0; }
+            else {
+                tries = tries + 1;
+                if (tries > 1000) { this.alive = false; return false; }
+            }
+        }
+        this.msgsOut = this.msgsOut + 1;
+        return true;
+    }
+
+    void AddSub(string filter, int qos) {
+        int i = 0;
+        while (i < this.subs.Count) {
+            if (this.subs[i].filter == filter) {
+                this.subs[i].qos = qos;
+                return;
+            }
+            i = i + 1;
+        }
+        this.subs.Add(Sub.Create(filter, qos));
+    }
+
+    void RemoveSub(string filter) {
+        int i = 0;
+        while (i < this.subs.Count) {
+            if (this.subs[i].filter == filter) {
+                this.subs.RemoveAt(i);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+}

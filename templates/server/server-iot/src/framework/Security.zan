@@ -1,0 +1,70 @@
+using System;
+
+namespace ZanWeb;
+
+/// <summary>Resolves the permission rank of an authenticated principal (by uid).
+/// Plug your user store in via WebApp.RankResolver; the default treats uid "1"
+/// as an administrator (rank 9) and every other logged-in user as rank 1.</summary>
+delegate int RankFn(string uid);
+
+/// <summary>
+/// Request-lock registry: the typed replacement for the PHP "接口请求锁" pattern.
+/// A route annotated with [Lock("user")] / [Lock("global")] may only run one
+/// request at a time for the given key; overlapping requests get 429 instead of
+/// racing (double-submit / duplicate-write protection). The HTTP server is a
+/// single-threaded event loop per worker, so a plain in-flight key set is race
+/// free -- no OS mutex needed.
+/// </summary>
+class LockManager {
+    List<string> active;   // keys currently executing
+
+    LockManager() { this.active = new List<string>(); }
+
+    static LockManager Create() { return new LockManager(); }
+
+    /// <summary>Computes the lock key for a route + principal. "" = no lock.</summary>
+    static string KeyFor(Route route, string uid) {
+        if (route.lockScope == "user") {
+            string who = uid;
+            if (who.Length == 0) { who = "_anon_"; }
+            return "u:" + who + ":" + route.Key();
+        }
+        if (route.lockScope == "global") {
+            return "g:" + route.Key();
+        }
+        return "";
+    }
+
+    /// <summary>Reserves the key; false when another request already holds it.</summary>
+    bool TryAcquire(string key) {
+        if (key.Length == 0) { return true; }
+        int i = 0;
+        while (i < this.active.Count) {
+            if (this.active[i] == key) { return false; }
+            i = i + 1;
+        }
+        this.active.Add(key);
+        return true;
+    }
+
+    void Release(string key) {
+        if (key.Length == 0) { return; }
+        int i = 0;
+        while (i < this.active.Count) {
+            if (this.active[i] == key) {
+                this.active.RemoveAt(i);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/// <summary>Default rank policy used when the app does not install its own
+/// RankResolver: uid "1" is an administrator, every other user is rank 1.</summary>
+class DefaultAuth {
+    static int Rank(string uid) {
+        if (uid == "1") { return 9; }
+        return 1;
+    }
+}

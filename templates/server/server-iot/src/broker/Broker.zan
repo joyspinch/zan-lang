@@ -1,0 +1,422 @@
+using System;
+using System.Net.Sockets;
+using System.Diagnostics;
+
+namespace ZanWeb;
+
+/// <summary>Per-topic activity counter surfaced by the management API.</summary>
+class TopicStat {
+    string name;
+    int messages;
+    string lastPayload;
+
+    static TopicStat Create(string name) {
+        TopicStat t = new TopicStat();
+        t.name = name;
+        t.messages = 0;
+        t.lastPayload = "";
+        return t;
+    }
+}
+
+/// <summary>
+/// A compact EMQX-style MQTT 3.1.1 broker: accepts clients, tracks sessions and
+/// subscriptions, routes PUBLISH to matching subscribers (with `+`/`#` wildcard
+/// topic matching), and records throughput metrics. The management HTTP API
+/// (controllers) reads these in-memory registries through Broker.Instance().
+///
+/// Concurrency: one coroutine per client on a single-threaded event loop, so the
+/// registries are touched cooperatively (no locks) as long as no `await` splits
+/// a mutation -- the routing path is fully synchronous by design.
+/// </summary>
+class MqttBroker {
+    [DllImport("crt")]
+    static extern int time(int ptr);
+
+    static MqttBroker inst;
+    static MqttBroker Instance() { return MqttBroker.inst; }
+    static void Use(MqttBroker b) { MqttBroker.inst = b; }
+    static int Now() { return time(0); }
+
+    string host;
+    int port;
+    bool running;
+    TcpListener listener;
+    List<MqttClient> clients;
+    List<TopicStat> topics;
+    int nextId;
+    int startedAt;
+
+    // metrics
+    int totalConnections;
+    int msgsIn;
+    int msgsOut;
+    int bytesIn;
+    int bytesOut;
+
+    MqttBroker(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.clients = new List<MqttClient>();
+        this.topics = new List<TopicStat>();
+        this.nextId = 0;
+        this.startedAt = 0;
+        this.totalConnections = 0;
+        this.msgsIn = 0;
+        this.msgsOut = 0;
+        this.bytesIn = 0;
+        this.bytesOut = 0;
+    }
+
+    static MqttBroker Create(string host, int port) {
+        return new MqttBroker(host, port);
+    }
+
+    int Count() { return this.clients.Count; }
+
+    async int Start() {
+        Socket.Initialize();
+        this.listener = TcpListener.Create(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+        this.startedAt = MqttBroker.Now();
+        Console.WriteLine("[mqtt] broker listening on mqtt://" + this.host + ":"
+            + Convert.ToString(this.port));
+        while (this.running) {
+            int sock = await this.listener.AcceptAsync();
+            if (sock >= 0) {
+                Task.Spawn(HandleClient(sock));
+            }
+        }
+        return 0;
+    }
+
+    async void HandleClient(int sock) {
+        this.nextId = this.nextId + 1;
+        MqttClient c = MqttClient.Create(this.nextId, sock);
+        c.addr = "fd:" + Convert.ToString(sock);
+        c.connectedAt = MqttBroker.Now();
+        MqttReader reader = MqttReader.Create(sock);
+        bool connected = true;
+
+        while (connected) {
+            int total = reader.PacketSize();
+            while (total == -1) {
+                int n = await reader.FillMore();
+                if (n == 0) { connected = false; break; }
+                total = reader.PacketSize();
+            }
+            if (!connected) { break; }
+            if (total == -2) { break; }     // malformed remaining length
+
+            int type = reader.Type();
+            int flags = reader.Flags();
+            int headerLen = reader.HeaderLen();
+            int remLen = total - headerLen;
+            string buf = reader.buf;
+            this.bytesIn = this.bytesIn + total;
+
+            if (type == MqttType.Connect) {
+                int off = headerLen;
+                off = MqttDec.StrEnd(buf, off);   // protocol name
+                off = off + 1;                    // protocol level
+                off = off + 1;                    // connect flags
+                c.keepAlive = MqttDec.U16(buf, off);
+                off = off + 2;
+                c.clientId = MqttDec.Str(buf, off);
+                if (c.clientId.Length == 0) {
+                    c.clientId = "auto-" + Convert.ToString(c.id);
+                }
+                this.clients.Add(c);
+                this.totalConnections = this.totalConnections + 1;
+                bool _a = c.Send(MqttEnc.Connack(0));
+                Console.WriteLine("[mqtt] + " + c.clientId + " (" + c.addr + ")");
+            } else if (type == MqttType.Publish) {
+                int qos = (flags >> 1) & 3;
+                int off = headerLen;
+                string topic = MqttDec.Str(buf, off);
+                off = MqttDec.StrEnd(buf, off);
+                int pid = 0;
+                if (qos > 0) { pid = MqttDec.U16(buf, off); off = off + 2; }
+                int end = headerLen + remLen;
+                int plen = end - off;
+                string payload = buf.Substring(off, plen);
+                c.msgsIn = c.msgsIn + 1;
+                this.msgsIn = this.msgsIn + 1;
+                this.Route(topic, payload, plen);
+                if (qos == 1) { bool _p = c.Send(MqttEnc.Puback(pid)); }
+            } else if (type == MqttType.Subscribe) {
+                int off = headerLen;
+                int pid = MqttDec.U16(buf, off);
+                off = off + 2;
+                int end = headerLen + remLen;
+                int count = 0;
+                while (off < end) {
+                    string filter = MqttDec.Str(buf, off);
+                    off = MqttDec.StrEnd(buf, off);
+                    int rqos = buf[off] & 255;
+                    off = off + 1;
+                    c.AddSub(filter, rqos);
+                    count = count + 1;
+                }
+                bool _s = c.Send(MqttEnc.Suback(pid, count));
+            } else if (type == MqttType.Unsubscribe) {
+                int off = headerLen;
+                int pid = MqttDec.U16(buf, off);
+                off = off + 2;
+                int end = headerLen + remLen;
+                while (off < end) {
+                    string filter = MqttDec.Str(buf, off);
+                    off = MqttDec.StrEnd(buf, off);
+                    c.RemoveSub(filter);
+                }
+                bool _u = c.Send(MqttEnc.Unsuback(pid));
+            } else if (type == MqttType.Pingreq) {
+                bool _pr = c.Send(MqttEnc.Pingresp());
+            } else if (type == MqttType.Disconnect) {
+                connected = false;
+            }
+
+            reader.Consume(total);
+        }
+
+        c.alive = false;
+        this.Remove(c);
+        Socket.Close(sock);
+        Console.WriteLine("[mqtt] - " + c.clientId);
+    }
+
+    /// <summary>Routes one message to every client whose subscription matches
+    /// the topic. Encodes the PUBLISH once and reuses it. Returns the fan-out
+    /// count.</summary>
+    int Route(string topic, string payload, int plen) {
+        this.Touch(topic, payload);
+        MqttMsg m = MqttEnc.Publish(topic, payload, plen);
+        int sent = 0;
+        int i = 0;
+        while (i < this.clients.Count) {
+            MqttClient c = this.clients[i];
+            i = i + 1;
+            if (!c.alive) { continue; }
+            if (this.Matches(c, topic)) {
+                if (c.Send(m)) {
+                    sent = sent + 1;
+                    this.msgsOut = this.msgsOut + 1;
+                    this.bytesOut = this.bytesOut + m.len;
+                }
+            }
+        }
+        return sent;
+    }
+
+    bool Matches(MqttClient c, string topic) {
+        int i = 0;
+        while (i < c.subs.Count) {
+            if (Topic.Match(c.subs[i].filter, topic)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>Admin-side injection: publish a message as the broker itself.
+    /// Returns the number of subscribers it reached.</summary>
+    int Publish(string topic, string payload) {
+        this.msgsIn = this.msgsIn + 1;
+        return this.Route(topic, payload, payload.Length);
+    }
+
+    void Touch(string topic, string payload) {
+        int i = 0;
+        while (i < this.topics.Count) {
+            if (this.topics[i].name == topic) {
+                this.topics[i].messages = this.topics[i].messages + 1;
+                this.topics[i].lastPayload = payload;
+                return;
+            }
+            i = i + 1;
+        }
+        TopicStat t = TopicStat.Create(topic);
+        t.messages = 1;
+        t.lastPayload = payload;
+        this.topics.Add(t);
+    }
+
+    void Remove(MqttClient c) {
+        int i = 0;
+        while (i < this.clients.Count) {
+            if (this.clients[i].id == c.id) {
+                this.clients.RemoveAt(i);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Force-disconnects a client by clientId. Returns true if found.</summary>
+    bool Kick(string clientId) {
+        int i = 0;
+        while (i < this.clients.Count) {
+            MqttClient c = this.clients[i];
+            if (c.clientId == clientId) {
+                c.alive = false;
+                Socket.Close(c.sock);
+                this.clients.RemoveAt(i);
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // ---- management API snapshots ----
+
+    int SubsTotal() {
+        int n = 0;
+        int i = 0;
+        while (i < this.clients.Count) {
+            n = n + this.clients[i].subs.Count;
+            i = i + 1;
+        }
+        return n;
+    }
+
+    string ClientsJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        int i = 0;
+        while (i < this.clients.Count) {
+            MqttClient c = this.clients[i];
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"id\":");
+            sb.Append(Convert.ToString(c.id));
+            sb.Append(",\"client_id\":\"");
+            sb.Append(JsonStr.Escape(c.clientId));
+            sb.Append("\",\"addr\":\"");
+            sb.Append(JsonStr.Escape(c.addr));
+            sb.Append("\",\"connected_at\":");
+            sb.Append(Convert.ToString(c.connectedAt));
+            sb.Append(",\"keepalive\":");
+            sb.Append(Convert.ToString(c.keepAlive));
+            sb.Append(",\"subs\":");
+            sb.Append(Convert.ToString(c.subs.Count));
+            sb.Append(",\"msgs_in\":");
+            sb.Append(Convert.ToString(c.msgsIn));
+            sb.Append(",\"msgs_out\":");
+            sb.Append(Convert.ToString(c.msgsOut));
+            sb.Append("}");
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    string ClientDetailJson(string clientId) {
+        int i = 0;
+        while (i < this.clients.Count) {
+            MqttClient c = this.clients[i];
+            if (c.clientId == clientId) {
+                StringBuilder sb = new StringBuilder();
+                sb.Append("{\"id\":");
+                sb.Append(Convert.ToString(c.id));
+                sb.Append(",\"client_id\":\"");
+                sb.Append(JsonStr.Escape(c.clientId));
+                sb.Append("\",\"addr\":\"");
+                sb.Append(JsonStr.Escape(c.addr));
+                sb.Append("\",\"connected_at\":");
+                sb.Append(Convert.ToString(c.connectedAt));
+                sb.Append(",\"msgs_in\":");
+                sb.Append(Convert.ToString(c.msgsIn));
+                sb.Append(",\"msgs_out\":");
+                sb.Append(Convert.ToString(c.msgsOut));
+                sb.Append(",\"subscriptions\":[");
+                int j = 0;
+                while (j < c.subs.Count) {
+                    if (j > 0) { sb.Append(","); }
+                    sb.Append("{\"filter\":\"");
+                    sb.Append(JsonStr.Escape(c.subs[j].filter));
+                    sb.Append("\",\"qos\":");
+                    sb.Append(Convert.ToString(c.subs[j].qos));
+                    sb.Append("}");
+                    j = j + 1;
+                }
+                sb.Append("]}");
+                return sb.ToString();
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    string SubscriptionsJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        bool first = true;
+        int i = 0;
+        while (i < this.clients.Count) {
+            MqttClient c = this.clients[i];
+            int j = 0;
+            while (j < c.subs.Count) {
+                if (!first) { sb.Append(","); }
+                first = false;
+                sb.Append("{\"client_id\":\"");
+                sb.Append(JsonStr.Escape(c.clientId));
+                sb.Append("\",\"filter\":\"");
+                sb.Append(JsonStr.Escape(c.subs[j].filter));
+                sb.Append("\",\"qos\":");
+                sb.Append(Convert.ToString(c.subs[j].qos));
+                sb.Append("}");
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    string TopicsJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        int i = 0;
+        while (i < this.topics.Count) {
+            TopicStat t = this.topics[i];
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"topic\":\"");
+            sb.Append(JsonStr.Escape(t.name));
+            sb.Append("\",\"messages\":");
+            sb.Append(Convert.ToString(t.messages));
+            sb.Append(",\"last\":\"");
+            sb.Append(JsonStr.Escape(t.lastPayload));
+            sb.Append("\"}");
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    /// <summary>Broker performance snapshot (perf detection).</summary>
+    string MetricsJson() {
+        int uptime = MqttBroker.Now() - this.startedAt;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"uptime_sec\":");
+        sb.Append(Convert.ToString(uptime));
+        sb.Append(",\"clients_connected\":");
+        sb.Append(Convert.ToString(this.clients.Count));
+        sb.Append(",\"clients_total\":");
+        sb.Append(Convert.ToString(this.totalConnections));
+        sb.Append(",\"subscriptions\":");
+        sb.Append(Convert.ToString(this.SubsTotal()));
+        sb.Append(",\"topics\":");
+        sb.Append(Convert.ToString(this.topics.Count));
+        sb.Append(",\"messages_in\":");
+        sb.Append(Convert.ToString(this.msgsIn));
+        sb.Append(",\"messages_out\":");
+        sb.Append(Convert.ToString(this.msgsOut));
+        sb.Append(",\"bytes_in\":");
+        sb.Append(Convert.ToString(this.bytesIn));
+        sb.Append(",\"bytes_out\":");
+        sb.Append(Convert.ToString(this.bytesOut));
+        sb.Append("}");
+        return sb.ToString();
+    }
+}

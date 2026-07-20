@@ -1,0 +1,44 @@
+using System;
+using ZanWeb;
+
+// {{NAME}} -- EMQX-style MQTT IoT management server.
+//
+// Two listeners run on one coroutine event loop:
+//   * the MQTT 3.1.1 broker (config mqtt.port, default 1883) accepts devices,
+//     tracks sessions/subscriptions and routes PUBLISH with +/# wildcards;
+//   * the HTTP management console (config server.port, default 8080) serves the
+//     dashboard + /iot/* JSON APIs, wired from controller attributes via the
+//     generated route table (tools/routegen -> src/framework/Routes.gen.zan).
+//
+// Runtime settings live in config/app.json (no recompile to change host/port).
+class Program {
+    static void Main() {
+        Config.Load("config/app.json");
+
+        // ---- MQTT broker ----
+        MqttBroker broker = MqttBroker.Create(
+            Config.Str("mqtt", "host", "0.0.0.0"),
+            Config.Int("mqtt", "port", 1883));
+        MqttBroker.Use(broker);
+        Task.Spawn(broker.Start());       // runs on the shared event loop
+
+        // ---- HTTP management console ----
+        WebApp app = WebApp.Create(
+            Config.Str("server", "host", "127.0.0.1"),
+            Config.Int("server", "port", 8080));
+        App.Use(app);
+        app.Views("views");
+        app.MaxBody(Config.Int("server", "maxBodyMB", 2) * 1024 * 1024);
+        app.GlobalLimit(Config.Int("server", "globalLimitPerSec", 0));
+        app.Before(Program.AccessLog);
+
+        Routes.Map(app);                  // generated from controller attributes
+
+        int r = await Server.Run(app);
+    }
+
+    static bool AccessLog(HttpContext ctx) {
+        Console.WriteLine("[req] " + ctx.method + " " + ctx.path);
+        return true;
+    }
+}

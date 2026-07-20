@@ -1,0 +1,100 @@
+using System;
+
+namespace ZanWeb;
+
+/// <summary>
+/// MQTT broker management API. Routes are convention-derived from the controller
+/// location + action ("iot" + action) with `[Route]` overrides where a path
+/// parameter or a custom prefix is needed. Every action reads the live broker
+/// registries via MqttBroker.Instance().
+/// </summary>
+class IotController {
+    [Get]
+    [Title("客户端列表")]
+    [Menu]
+    static void Clients(HttpContext ctx) {
+        Controller.Ok(ctx, MqttBroker.Instance().ClientsJson());
+    }
+
+    [Get]
+    [Route("/iot/clients/{id}")]
+    [Title("客户端详情")]
+    static void Client(HttpContext ctx) {
+        string id = ctx.In("id");
+        string data = MqttBroker.Instance().ClientDetailJson(id);
+        if (data.Length == 0) {
+            Controller.Fail(ctx, 404, "2001", "client not found");
+            return;
+        }
+        Controller.Ok(ctx, data);
+    }
+
+    [Post]
+    [Route("/iot/clients/{id}/kick")]
+    [Title("踢下线")]
+    [Auth]
+    [Rank(9)]
+    [Lock("global")]
+    static void Kick(HttpContext ctx) {
+        string id = ctx.In("id");
+        if (MqttBroker.Instance().Kick(id)) {
+            Controller.Ok(ctx, "{\"kicked\":\"" + JsonStr.Escape(id) + "\"}");
+        } else {
+            Controller.Fail(ctx, 404, "2001", "client not found");
+        }
+    }
+
+    [Get]
+    [Title("订阅管理")]
+    [Menu]
+    static void Subscriptions(HttpContext ctx) {
+        Controller.Ok(ctx, MqttBroker.Instance().SubscriptionsJson());
+    }
+
+    [Get]
+    [Title("主题列表")]
+    [Menu]
+    static void Topics(HttpContext ctx) {
+        Controller.Ok(ctx, MqttBroker.Instance().TopicsJson());
+    }
+
+    /// <summary>Open broker-only metrics for the dashboard (no HTTP internals).</summary>
+    [Get]
+    [Title("broker指标")]
+    static void Metrics(HttpContext ctx) {
+        Controller.Ok(ctx, MqttBroker.Instance().MetricsJson());
+    }
+
+    /// <summary>Injects a message onto a topic as the broker (fan-out to every
+    /// matching subscriber). `topic` is required; `payload` is taken raw.</summary>
+    [Post]
+    [Title("发布消息")]
+    [Auth]
+    [Rank(3)]
+    static void Publish(HttpContext ctx) {
+        string topic = ctx.In("topic");
+        if (topic.Length == 0) {
+            Controller.Fail(ctx, 422, "2002", "topic required");
+            return;
+        }
+        string payload = ctx.InRaw("payload");
+        int n = MqttBroker.Instance().Publish(topic, payload);
+        Controller.Ok(ctx, "{\"topic\":\"" + JsonStr.Escape(topic)
+            + "\",\"delivered\":" + Convert.ToString(n) + "}");
+    }
+
+    /// <summary>Performance detection: broker throughput/clients + HTTP runtime
+    /// metrics in one snapshot.</summary>
+    [Get]
+    [Route("/admin/stats")]
+    [Title("性能检测")]
+    [Auth]
+    [Rank(9)]
+    [Menu]
+    static void Stats(HttpContext ctx) {
+        string broker = MqttBroker.Instance().MetricsJson();
+        string http = App.Web().MetricsJson();
+        ctx.Json("{\"code\":\"0000\",\"msg\":\"ok\",\"data\":{\"broker\":"
+            + broker + ",\"http\":" + http + "}}");
+    }
+}

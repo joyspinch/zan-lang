@@ -1,0 +1,142 @@
+using System;
+
+namespace ZanWeb;
+
+/// <summary>
+/// Request parameter validation. Chain rules, then check Ok():
+///
+///   Validator v = Validator.Create();
+///   v.Require(ctx.Form("user"), "user");
+///   v.MaxLen(ctx.Form("user"), 32, "user");
+///   v.IsInt(ctx.Param("id"), "id");
+///   if (!v.Ok()) { ctx.Status(422, "Unprocessable Entity");
+///                  ctx.Api("1003", "validation failed", v.ErrorsJson()); return; }
+///
+/// Also carries the upload-safety helpers: client-supplied file names are
+/// never trusted as paths -- SafeFileName strips directories and dangerous
+/// characters, ExtAllowed enforces an extension whitelist.
+/// </summary>
+class Validator {
+    List<string> errors;
+
+    Validator() { this.errors = new List<string>(); }
+
+    static Validator Create() { return new Validator(); }
+
+    Validator Require(string val, string field) {
+        if (val.Length == 0) { this.errors.Add(field + " is required"); }
+        return this;
+    }
+
+    Validator MaxLen(string val, int max, string field) {
+        if (val.Length > max) {
+            this.errors.Add(field + " exceeds " + Convert.ToString(max) + " chars");
+        }
+        return this;
+    }
+
+    Validator MinLen(string val, int min, string field) {
+        if (val.Length > 0 && val.Length < min) {
+            this.errors.Add(field + " is shorter than " + Convert.ToString(min) + " chars");
+        }
+        return this;
+    }
+
+    /// <summary>Digits only (optional leading minus).</summary>
+    Validator IsInt(string val, string field) {
+        if (val.Length == 0) { return this; }
+        int i = 0;
+        if (val.Substring(0, 1) == "-") { i = 1; }
+        if (i >= val.Length) { this.errors.Add(field + " must be an integer"); return this; }
+        bool ok = true;
+        while (i < val.Length) {
+            string ch = val.Substring(i, 1);
+            if (ch < "0" || ch > "9") { ok = false; i = val.Length; }
+            i = i + 1;
+        }
+        if (!ok) { this.errors.Add(field + " must be an integer"); }
+        return this;
+    }
+
+    /// <summary>Value must be one of the comma-separated whitelist entries.</summary>
+    Validator OneOf(string val, string allowedCsv, string field) {
+        if (val.Length == 0) { return this; }
+        string csv = "," + allowedCsv + ",";
+        if (!Validator.ContainsStr(csv, "," + val + ",")) {
+            this.errors.Add(field + " is not an allowed value");
+        }
+        return this;
+    }
+
+    /// <summary>Multi-character substring search (string.Contains only
+    /// supports single characters reliably).</summary>
+    static bool ContainsStr(string s, string pat) {
+        int n = s.Length;
+        int pl = pat.Length;
+        if (pl == 0 || pl > n) { return false; }
+        int i = 0;
+        while (i + pl <= n) {
+            if (s.Substring(i, pl) == pat) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    bool Ok() { return this.errors.Count == 0; }
+
+    string ErrorsJson() {
+        string outp = "[";
+        int i = 0;
+        while (i < this.errors.Count) {
+            if (i > 0) { outp = outp + ","; }
+            outp = outp + "\"" + JsonStr.Escape(this.errors[i]) + "\"";
+            i = i + 1;
+        }
+        return outp + "]";
+    }
+
+    // ---- upload safety ----
+
+    /// <summary>Reduces a client-supplied file name to a safe base name:
+    /// strips any directory components (both separators), rejects "..",
+    /// and keeps only [A-Za-z0-9._-]. Returns "file" if nothing survives.</summary>
+    static string SafeFileName(string name) {
+        // Drop everything before the last path separator.
+        int i = name.Length - 1;
+        int cut = 0;
+        while (i >= 0) {
+            string ch = name.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { cut = i + 1; i = 0 - 1; }
+            else { i = i - 1; }
+        }
+        string base_ = name.Substring(cut);
+        string outp = "";
+        string prev = "";
+        int j = 0;
+        while (j < base_.Length) {
+            string c = base_.Substring(j, 1);
+            bool ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+                || (c >= "0" && c <= "9") || c == "." || c == "_" || c == "-";
+            if (ok && !(c == "." && prev == ".")) { outp = outp + c; prev = c; }
+            j = j + 1;
+        }
+        if (outp.Length == 0 || outp == ".") { return "file"; }
+        return outp;
+    }
+
+    /// <summary>True if the file's extension is in the comma-separated
+    /// whitelist (e.g. "jpg,png,mp4"). Case-insensitive is NOT applied;
+    /// pass lowercase names.</summary>
+    static bool ExtAllowed(string name, string allowedCsv) {
+        int dot = 0 - 1;
+        int i = 0;
+        while (i < name.Length) {
+            if (name.Substring(i, 1) == ".") { dot = i; }
+            i = i + 1;
+        }
+        if (dot < 0 || dot == name.Length - 1) { return false; }
+        string ext = name.Substring(dot + 1);
+        string csv = "," + allowedCsv + ",";
+        return Validator.ContainsStr(csv, "," + ext + ",");
+    }
+}

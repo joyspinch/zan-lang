@@ -1,0 +1,591 @@
+using System;
+using System.IO;
+using System.Text;
+
+namespace RepoMap;
+
+// -----------------------------------------------------------------------------
+// RepoMap -- a repository structure indexer for AI-assisted development.
+//
+// Scans a Zan project and emits three artefacts (into <root>/.zanmap/) that let
+// an AI grasp the whole codebase from a few KB instead of reading every file:
+//
+//   repo.map.txt     compact, token-efficient outline (aider-style): every file
+//                    with its classes and method signatures -- feed this as AI
+//                    context ("here is the shape of my repo").
+//   symbols.json     flat symbol index  [{name,kind,file,line,sig}] -- lets the
+//                    AI (or the MCP bridge) jump straight to a definition.
+//   routes.json      HTTP route table extracted from controller attributes
+//                    (only when a src/controller folder exists).
+//
+//   Build:  zanc tools/repomap/RepoMap.zan --auto-stdlib -o repomap.exe
+//   Run  :  repomap.exe [root]          (root defaults to ".")
+//
+// Implemented with Substring/Length/char scanning only (several string instance
+// methods are unreliable in the current toolchain). Brace depth is tracked with
+// a real tokenizer that ignores strings / char literals / // and /* */ comments,
+// so JSON-building code like  sb.Append("{")  does not corrupt the nesting.
+// -----------------------------------------------------------------------------
+
+/// <summary>One declared symbol (type or method).</summary>
+class Sym {
+    string kind;    // class | struct | interface | enum | method | delegate
+    string name;    // "MqttBroker" or "MqttBroker.Start"
+    string sig;     // full signature line (methods) or "" (types)
+    int line;
+
+    static Sym Create(string kind, string name, string sig, int line) {
+        Sym s = new Sym();
+        s.kind = kind;
+        s.name = name;
+        s.sig = sig;
+        s.line = line;
+        return s;
+    }
+}
+
+/// <summary>A scanned source file with its top-level symbols.</summary>
+class FileInfo {
+    string path;
+    List<Sym> syms;
+
+    static FileInfo Create(string path) {
+        FileInfo f = new FileInfo();
+        f.path = path;
+        f.syms = new List<Sym>();
+        return f;
+    }
+}
+
+/// <summary>String helpers on Substring/Length only.</summary>
+class Str {
+    static string Lower(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            int k = 0;
+            bool done = false;
+            while (k < 26 && !done) {
+                if (up.Substring(k, 1) == c) { sb.Append(lo.Substring(k, 1)); done = true; }
+                k = k + 1;
+            }
+            if (!done) { sb.Append(c); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static bool IsSpace(string c) {
+        return c == " " || c == "\t" || c == "\r" || c == "\n";
+    }
+
+    static string Trim(string s) {
+        int n = s.Length;
+        int a = 0;
+        while (a < n && Str.IsSpace(s.Substring(a, 1))) { a = a + 1; }
+        int b = n;
+        while (b > a && Str.IsSpace(s.Substring(b - 1, 1))) { b = b - 1; }
+        if (b <= a) { return ""; }
+        return s.Substring(a, b - a);
+    }
+
+    static bool StartsWith(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        return s.Substring(0, p.Length) == p;
+    }
+
+    static bool EndsWith(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        return s.Substring(s.Length - p.Length, p.Length) == p;
+    }
+
+    static int Find(string s, string sub, int from) {
+        if (sub.Length == 0) { return from; }
+        int i = from;
+        int last = s.Length - sub.Length;
+        while (i <= last) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static bool Contains(string s, string sub) { return Str.Find(s, sub, 0) >= 0; }
+
+    static bool IsAlnum(string c) {
+        string d = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        return Str.Find(d, c, 0) >= 0;
+    }
+
+    /// <summary>true if s begins with word `w` followed by a non-identifier char
+    /// (or nothing) -- a real keyword, not a prefix of a longer identifier.</summary>
+    static bool Word(string s, string w) {
+        if (!Str.StartsWith(s, w)) { return false; }
+        if (s.Length == w.Length) { return true; }
+        return !Str.IsAlnum(s.Substring(w.Length, 1));
+    }
+
+    static string FirstQuoted(string s) {
+        int a = Str.Find(s, "\"", 0);
+        if (a < 0) { return ""; }
+        int b = Str.Find(s, "\"", a + 1);
+        if (b < 0) { return ""; }
+        return s.Substring(a + 1, b - a - 1);
+    }
+
+    static int ParenInt(string s, int def) {
+        int a = Str.Find(s, "(", 0);
+        if (a < 0) { return def; }
+        int b = Str.Find(s, ")", a + 1);
+        if (b < 0) { return def; }
+        string inside = Str.Trim(s.Substring(a + 1, b - a - 1));
+        string digits = "0123456789";
+        if (inside.Length == 0) { return def; }
+        int val = 0;
+        int i = 0;
+        while (i < inside.Length) {
+            string c = inside.Substring(i, 1);
+            int d = -1;
+            int k = 0;
+            while (k < 10) { if (digits.Substring(k, 1) == c) { d = k; } k = k + 1; }
+            if (d < 0) { return def; }
+            val = val * 10 + d;
+            i = i + 1;
+        }
+        return val;
+    }
+
+    static string JsonEsc(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (c == "\\") { sb.Append("\\\\"); }
+            else if (c == "\"") { sb.Append("\\\""); }
+            else if (c == "\n") { sb.Append("\\n"); }
+            else if (c == "\r") { }
+            else if (c == "\t") { sb.Append("\\t"); }
+            else { sb.Append(c); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}
+
+class Program {
+    static string OUT_DIR = ".zanmap";
+
+    static void Main(string[] args) {
+        string root = ".";
+        if (args.Length > 0) { root = args[0]; }
+
+        List<FileInfo> files = new List<FileInfo>();
+        Program.ScanDir(root, "", files);
+
+        if (!Directory.Exists(Program.OUT_DIR)) {
+            Directory.CreateDirectoryRecursive(Program.OUT_DIR);
+        }
+        File.WriteAllText(Program.OUT_DIR + "/repo.map.txt", Program.RenderText(root, files));
+        File.WriteAllText(Program.OUT_DIR + "/symbols.json", Program.RenderSymbols(files));
+
+        // Route table, when this looks like a ZanWeb server project.
+        string controllerDir = root + "/src/controller";
+        int routeCount = 0;
+        if (Directory.Exists(controllerDir)) {
+            string routes = Program.RenderRoutes(controllerDir);
+            File.WriteAllText(Program.OUT_DIR + "/routes.json", routes);
+            routeCount = Program.lastRouteCount;
+        }
+
+        int symCount = 0;
+        int i = 0;
+        while (i < files.Count) { symCount = symCount + files[i].syms.Count; i = i + 1; }
+        Console.WriteLine("[repomap] " + Convert.ToString(files.Count) + " files, "
+            + Convert.ToString(symCount) + " symbols, "
+            + Convert.ToString(routeCount) + " routes -> " + Program.OUT_DIR + "/");
+    }
+
+    static bool SkipDir(string name) {
+        string n = Str.Lower(name);
+        return n == "_scratch" || n == "build" || n == "dist" || n == ".git"
+            || n == "assets" || n == "toolchain" || n == "node_modules"
+            || n == ".zanmap" || n == "uploads" || n == "obj" || n == "bin";
+    }
+
+    static void ScanDir(string dir, string rel, List<FileInfo> outp) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> fs = Directory.GetFiles(dir);
+        int i = 0;
+        while (i < fs.Count) {
+            string fn = fs[i];
+            i = i + 1;
+            if (Str.EndsWith(fn, ".zan")) {
+                string relPath = rel + fn;
+                FileInfo fi = FileInfo.Create(relPath);
+                Program.ScanFile(dir + "/" + fn, fi);
+                if (fi.syms.Count > 0) { outp.Add(fi); }
+            }
+        }
+        List<string> subs = Directory.GetDirectories(dir);
+        int j = 0;
+        while (j < subs.Count) {
+            string sd = subs[j];
+            j = j + 1;
+            if (!Program.SkipDir(sd)) {
+                Program.ScanDir(dir + "/" + sd, rel + sd + "/", outp);
+            }
+        }
+    }
+
+    // ---- per-file symbol extraction ----
+
+    static void ScanFile(string path, FileInfo fi) {
+        string text = File.ReadAllText(path);
+        List<string> lines = Program.SplitLines(text);
+        List<int> depth = Program.DepthPerLine(lines);
+        int i = 0;
+        while (i < lines.Count) {
+            string t = Str.Trim(lines[i]);
+            int d = depth[i];
+            if (t.Length > 0) {
+                if (d == 0) {
+                    Program.TryType(t, i + 1, fi);
+                } else if (d == 1) {
+                    Program.TryMethod(t, i + 1, fi);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    static void TryType(string t, int line, FileInfo fi) {
+        if (Str.Word(t, "class")) { fi.syms.Add(Sym.Create("class", Program.IdentAfter(t, "class"), "", line)); }
+        else if (Str.Word(t, "struct")) { fi.syms.Add(Sym.Create("struct", Program.IdentAfter(t, "struct"), "", line)); }
+        else if (Str.Word(t, "interface")) { fi.syms.Add(Sym.Create("interface", Program.IdentAfter(t, "interface"), "", line)); }
+        else if (Str.Word(t, "enum")) { fi.syms.Add(Sym.Create("enum", Program.IdentAfter(t, "enum"), "", line)); }
+    }
+
+    static bool IsControlWord(string t) {
+        return Str.Word(t, "if") || Str.Word(t, "for") || Str.Word(t, "while")
+            || Str.Word(t, "switch") || Str.Word(t, "catch") || Str.Word(t, "else")
+            || Str.Word(t, "do") || Str.Word(t, "return") || Str.Word(t, "using")
+            || Str.Word(t, "namespace") || Str.Word(t, "await") || Str.Word(t, "lock");
+    }
+
+    static void TryMethod(string t, int line, FileInfo fi) {
+        if (Str.StartsWith(t, "//") || Str.StartsWith(t, "*") || Str.StartsWith(t, "/*")) { return; }
+        if (Str.StartsWith(t, "[")) { return; }          // attribute
+        if (Program.IsControlWord(t)) { return; }
+        int p = Str.Find(t, "(", 0);
+        if (p <= 0) { return; }                          // no call/def parens
+        // the token immediately before '(' must be an identifier (the name)
+        string name = Program.NameBefore(t, p);
+        if (name.Length == 0) { return; }
+        // exclude bare invocations `foo(...)` with no return type / modifier:
+        // a definition has whitespace (a type or modifier) before the name.
+        int ni = Str.Find(t, name, 0);
+        if (ni <= 0) { return; }
+        string sig = t;
+        int brace = Str.Find(sig, "{", 0);
+        if (brace >= 0) { sig = Str.Trim(sig.Substring(0, brace)); }
+        int semi = Str.Find(sig, ";", 0);
+        if (semi >= 0) { sig = Str.Trim(sig.Substring(0, semi)); }
+        string kind = "method";
+        if (Str.Word(t, "delegate")) { kind = "delegate"; }
+        fi.syms.Add(Sym.Create(kind, name, sig, line));
+    }
+
+    /// <summary>Identifier ending just before position p (the '(').</summary>
+    static string NameBefore(string s, int p) {
+        int i = p - 1;
+        while (i >= 0 && Str.IsSpace(s.Substring(i, 1))) { i = i - 1; }
+        int end = i + 1;
+        while (i >= 0 && Str.IsAlnum(s.Substring(i, 1))) { i = i - 1; }
+        int start = i + 1;
+        if (end <= start) { return ""; }
+        return s.Substring(start, end - start);
+    }
+
+    static string IdentAfter(string line, string kw) {
+        int p = Str.Find(line, kw, 0);
+        if (p < 0) { return ""; }
+        int i = p + kw.Length;
+        while (i < line.Length && Str.IsSpace(line.Substring(i, 1))) { i = i + 1; }
+        StringBuilder sb = new StringBuilder();
+        while (i < line.Length) {
+            string c = line.Substring(i, 1);
+            if (!Str.IsAlnum(c)) { break; }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Brace depth at the START of every line, ignoring braces inside
+    /// string / char literals and // or /* */ comments.</summary>
+    static List<int> DepthPerLine(List<string> lines) {
+        List<int> outp = new List<int>();
+        int depth = 0;
+        bool inBlock = false;
+        int li = 0;
+        while (li < lines.Count) {
+            outp.Add(depth);
+            string s = lines[li];
+            li = li + 1;
+            int i = 0;
+            int n = s.Length;
+            bool inStr = false;
+            bool inChar = false;
+            while (i < n) {
+                string c = s.Substring(i, 1);
+                if (inBlock) {
+                    if (c == "*" && i + 1 < n && s.Substring(i + 1, 1) == "/") { inBlock = false; i = i + 2; continue; }
+                    i = i + 1; continue;
+                }
+                if (inStr) {
+                    if (c == "\\") { i = i + 2; continue; }
+                    if (c == "\"") { inStr = false; }
+                    i = i + 1; continue;
+                }
+                if (inChar) {
+                    if (c == "\\") { i = i + 2; continue; }
+                    if (c == "'") { inChar = false; }
+                    i = i + 1; continue;
+                }
+                if (c == "/" && i + 1 < n && s.Substring(i + 1, 1) == "/") { break; }   // line comment
+                if (c == "/" && i + 1 < n && s.Substring(i + 1, 1) == "*") { inBlock = true; i = i + 2; continue; }
+                if (c == "\"") { inStr = true; i = i + 1; continue; }
+                if (c == "'") { inChar = true; i = i + 1; continue; }
+                if (c == "{") { depth = depth + 1; }
+                else if (c == "}") { depth = depth - 1; }
+                i = i + 1;
+            }
+        }
+        return outp;
+    }
+
+    static List<string> SplitLines(string text) {
+        List<string> outp = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            string c = text.Substring(i, 1);
+            if (c == "\n") { outp.Add(sb.ToString()); sb = new StringBuilder(); }
+            else if (c != "\r") { sb.Append(c); }
+            i = i + 1;
+        }
+        outp.Add(sb.ToString());
+        return outp;
+    }
+
+    // ---- renderers ----
+
+    static string RenderText(string root, List<FileInfo> files) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("# RepoMap for ");
+        sb.Append(root);
+        sb.Append("\n# <file>\n#   <kind> <name/signature>  :line\n\n");
+        int i = 0;
+        while (i < files.Count) {
+            FileInfo f = files[i];
+            i = i + 1;
+            sb.Append(f.path);
+            sb.Append("\n");
+            int j = 0;
+            while (j < f.syms.Count) {
+                Sym s = f.syms[j];
+                j = j + 1;
+                if (s.kind == "class" || s.kind == "struct"
+                    || s.kind == "interface" || s.kind == "enum") {
+                    sb.Append("  ");
+                    sb.Append(s.kind);
+                    sb.Append(" ");
+                    sb.Append(s.name);
+                } else {
+                    sb.Append("    ");
+                    sb.Append(s.sig);
+                }
+                sb.Append("  :");
+                sb.Append(Convert.ToString(s.line));
+                sb.Append("\n");
+            }
+            sb.Append("\n");
+        }
+        return sb.ToString();
+    }
+
+    static string RenderSymbols(List<FileInfo> files) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        bool first = true;
+        int i = 0;
+        while (i < files.Count) {
+            FileInfo f = files[i];
+            i = i + 1;
+            string owner = "";
+            int j = 0;
+            while (j < f.syms.Count) {
+                Sym s = f.syms[j];
+                j = j + 1;
+                string full = s.name;
+                if (s.kind == "class" || s.kind == "struct"
+                    || s.kind == "interface" || s.kind == "enum") {
+                    owner = s.name;
+                } else if (owner.Length > 0) {
+                    full = owner + "." + s.name;
+                }
+                if (!first) { sb.Append(","); }
+                first = false;
+                sb.Append("\n{\"name\":\"");
+                sb.Append(Str.JsonEsc(full));
+                sb.Append("\",\"kind\":\"");
+                sb.Append(s.kind);
+                sb.Append("\",\"file\":\"");
+                sb.Append(Str.JsonEsc(f.path));
+                sb.Append("\",\"line\":");
+                sb.Append(Convert.ToString(s.line));
+                sb.Append(",\"sig\":\"");
+                sb.Append(Str.JsonEsc(s.sig));
+                sb.Append("\"}");
+            }
+        }
+        sb.Append("\n]\n");
+        return sb.ToString();
+    }
+
+    // ---- route extraction (controllers) ----
+
+    static int lastRouteCount;
+
+    static string RenderRoutes(string controllerDir) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        List<string> rows = new List<string>();
+        Program.ScanControllers(controllerDir, "", rows);
+        int i = 0;
+        while (i < rows.Count) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("\n");
+            sb.Append(rows[i]);
+            i = i + 1;
+        }
+        sb.Append("\n]\n");
+        Program.lastRouteCount = rows.Count;
+        return sb.ToString();
+    }
+
+    static void ScanControllers(string dir, string prefix, List<string> rows) {
+        if (!Directory.Exists(dir)) { return; }
+        List<string> fs = Directory.GetFiles(dir);
+        int i = 0;
+        while (i < fs.Count) {
+            string fn = fs[i];
+            i = i + 1;
+            if (Str.EndsWith(fn, ".zan")) {
+                Program.ScanControllerFile(dir + "/" + fn, prefix, rows);
+            }
+        }
+        List<string> subs = Directory.GetDirectories(dir);
+        int j = 0;
+        while (j < subs.Count) {
+            string sd = subs[j];
+            j = j + 1;
+            Program.ScanControllers(dir + "/" + sd, prefix + Str.Lower(sd) + "/", rows);
+        }
+    }
+
+    static void ScanControllerFile(string path, string prefix, List<string> rows) {
+        List<string> lines = Program.SplitLines(File.ReadAllText(path));
+        string cbase = "";
+        string controller = "";
+        string verb = "";
+        string routePath = "";
+        string title = "";
+        bool auth = false;
+        bool login = false;
+        int rank = 0;
+        bool isRoute = false;
+        int i = 0;
+        while (i < lines.Count) {
+            string t = Str.Trim(lines[i]);
+            i = i + 1;
+            if (t.Length == 0) { continue; }
+            if (Str.Word(t, "class") && Str.Contains(t, "Controller")) {
+                controller = Program.IdentAfter(t, "class");
+                cbase = Program.ControllerBase(controller);
+                continue;
+            }
+            if (Str.StartsWith(t, "[")) {
+                string a = Program.AttrName(t);
+                if (a == "Get") { verb = "GET"; isRoute = true; }
+                else if (a == "Post") { verb = "POST"; isRoute = true; }
+                else if (a == "Put") { verb = "PUT"; isRoute = true; }
+                else if (a == "Delete") { verb = "DELETE"; isRoute = true; }
+                else if (a == "Patch") { verb = "PATCH"; isRoute = true; }
+                else if (a == "Route") { isRoute = true; routePath = Str.FirstQuoted(t); }
+                else if (a == "Title") { title = Str.FirstQuoted(t); }
+                else if (a == "Auth") { auth = true; }
+                else if (a == "Login") { login = true; }
+                else if (a == "Rank") { rank = Str.ParenInt(t, 0); }
+                continue;
+            }
+            if (Str.Contains(t, "static") && Str.Contains(t, "(HttpContext")) {
+                if (isRoute && controller.Length > 0) {
+                    string m = Program.NameBefore(t, Str.Find(t, "(", 0));
+                    if (verb.Length == 0) { verb = "GET"; }
+                    string pth = routePath;
+                    if (pth.Length == 0) { pth = Program.ConventionPath(prefix, cbase, m); }
+                    StringBuilder r = new StringBuilder();
+                    r.Append("{\"method\":\"");
+                    r.Append(verb);
+                    r.Append("\",\"path\":\"");
+                    r.Append(Str.JsonEsc(pth));
+                    r.Append("\",\"action\":\"");
+                    r.Append(Str.JsonEsc(controller + "." + m));
+                    r.Append("\",\"title\":\"");
+                    r.Append(Str.JsonEsc(title));
+                    r.Append("\",\"auth\":");
+                    r.Append(auth ? "true" : "false");
+                    r.Append(",\"login\":");
+                    r.Append((login || auth) ? "true" : "false");
+                    r.Append(",\"rank\":");
+                    r.Append(Convert.ToString(rank));
+                    r.Append("}");
+                    rows.Add(r.ToString());
+                }
+                verb = ""; routePath = ""; title = ""; auth = false; login = false; rank = 0; isRoute = false;
+                continue;
+            }
+            verb = ""; routePath = ""; title = ""; auth = false; login = false; rank = 0; isRoute = false;
+        }
+    }
+
+    static string AttrName(string line) {
+        int a = Str.Find(line, "[", 0);
+        if (a < 0) { return ""; }
+        int i = a + 1;
+        StringBuilder sb = new StringBuilder();
+        while (i < line.Length) {
+            string c = line.Substring(i, 1);
+            if (c == "(" || c == "]" || c == " ") { return sb.ToString(); }
+            sb.Append(c);
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static string ControllerBase(string controller) {
+        string b = controller;
+        if (Str.EndsWith(b, "Controller")) { b = b.Substring(0, b.Length - 10); }
+        return Str.Lower(b);
+    }
+
+    static string ConventionPath(string prefix, string cbase, string method) {
+        string m = Str.Lower(method);
+        if (m == "index") { return "/" + prefix + cbase; }
+        return "/" + prefix + cbase + "/" + m;
+    }
+}
