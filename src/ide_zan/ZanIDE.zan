@@ -963,6 +963,11 @@ class ZanIDE {
         bool pubOpen = false;
         bool pubPending = false;
         List<int> pubSel = new List<int>();
+        // In-flight detached publish: exe paths to verify on completion plus
+        // the consumed length of its streamed log (see the poll below).
+        bool pubBusy = false;
+        List<string> pubExes = new List<string>();
+        int pubLogLen = 0;
 
         // ---- Editor appearance (color theme + font size) ----
         // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
@@ -1066,8 +1071,18 @@ class ZanIDE {
         // it each frame so the Split drag handle moves the panel edge.
         SignalInt rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 300), 120, 1600));
         SignalInt centerW = SignalInt.Create(0);
-        // 0 = AI chat, 1 = tools/ tree, 2 = examples/ tree.
-        SignalInt rightTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightTab", 0), 0, 2));
+        // 0 = AI chat, 1 = tools/ tree, 2 = examples/ tree, 3 = git panel.
+        SignalInt rightTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightTab", 0), 0, 3));
+        // ---- Git panel state (right panel "Git" tab) ----
+        // gitFiles holds `git status --porcelain` lines; gitLoaded gates the
+        // first (and refresh-triggered) status scan so git only runs on demand.
+        List<string> gitFiles = new List<string>();
+        string gitBranch = "";
+        bool gitLoaded = false;
+        SignalInt gitSel = SignalInt.Create(0 - 1);
+        SignalInt gitScroll = SignalInt.Create(0);
+        Input gitMsgIn = Input.Bind(SignalString.Create(""),
+            ZanIDE.T("Commit message...", "提交信息..."));
         // Tools / Examples trees for the right panel tabs.
         List<TreeNode> rtToolTree = ZanIDE.BuildDirTree(root + "/tools");
         List<TreeNode> rtExTree = ZanIDE.BuildExampleTree();
@@ -1561,6 +1576,7 @@ class ZanIDE {
                     pSel.Set(0);
                     pNameInput.SetText("NewProject");
                     pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
+                    Wizard.notice = "";
                     dlg = App.CreateDark(ZanIDE.T("New Project", "新建项目"), 900, 640);
                     dlg.ApplySkin(app.ThemeMenuIndex());
                     dlg.Show();
@@ -2206,6 +2222,7 @@ class ZanIDE {
                         pSel.Set(0);
                         pNameInput.SetText("NewProject");
                         pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
+                        Wizard.notice = "";
                         dlg = App.CreateDark(ZanIDE.T("New Project", "新建项目"), 900, 640);
                         dlg.ApplySkin(app.ThemeMenuIndex());
                         dlg.Show();
@@ -2611,7 +2628,8 @@ class ZanIDE {
                             if (app.mouseX >= orr.x + obTabW) { ti = 1; }
                             bottomTab.Set(ti);
                             app.RequestRedraw();
-                        } else if (botTab == 1 && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width) {
+                        } else if (botTab == 1 && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
+                            && app.mouseY < orr.y + orr.height) {
                             // Click an error row -> apply an import quick-fix or
                             // jump to its file:line.
                             int rowH = app.Scale(20);
@@ -2674,7 +2692,7 @@ class ZanIDE {
                 ZanIDE.ShellSurface(app, rp.x, rp.y, rp.width, rp.height, 0, t.bgTertiary);
                 int rTabH = app.Scale(28);
                 int rTab = rightTab.Get();
-                int rTabW = rp.width / 3;
+                int rTabW = rp.width / 4;
                 if (rTabW > app.Scale(90)) { rTabW = app.Scale(90); }
                 c.FillRect(rp.x, rp.y, rp.width, rTabH, t.bgSecondary);
                 c.FillRect(rp.x, rp.y + rTabH - 1, rp.width, 1, t.divider);
@@ -2682,6 +2700,7 @@ class ZanIDE {
                 rTabNames.Add(ZanIDE.T("AI", "AI 助手"));
                 rTabNames.Add(ZanIDE.T("Tools", "工具"));
                 rTabNames.Add(ZanIDE.T("Examples", "示例"));
+                rTabNames.Add(ZanIDE.T("Git", "Git"));
                 int rtI = 0;
                 while (rtI < rTabNames.Count) {
                     int rBgN = t.bgTertiary;
@@ -2693,7 +2712,7 @@ class ZanIDE {
                 }
                 if (app.window.EventKind() == 3
                     && app.mouseY >= rp.y && app.mouseY < rp.y + rTabH
-                    && app.mouseX >= rp.x && app.mouseX < rp.x + rTabW * 3) {
+                    && app.mouseX >= rp.x && app.mouseX < rp.x + rTabW * rTabNames.Count) {
                     rightTab.Set((app.mouseX - rp.x) / rTabW);
                     app.RequestRedraw();
                 }
@@ -3096,6 +3115,180 @@ class ZanIDE {
                             app.RequestRedraw();
                         }
                     }
+                } else if (rTab == 3) {
+                    // ---- Git: repository status + stage / commit / sync ----
+                    Rect gArea = Rect.Create(rp.x, rp.y + rTabH, rp.width, rp.height - rTabH);
+                    int gPad = app.Scale(6);
+                    if (!gitLoaded) {
+                        gitBranch = ZanIDE.GitRefresh(root, gitFiles);
+                        gitLoaded = true;
+                        gitSel.Set(0 - 1);
+                    }
+                    bool gitRepo = Directory.Exists(root + "/.git");
+                    int gy = gArea.y + gPad;
+                    if (!gitRepo) {
+                        c.DrawText(gArea.x + gPad, gy,
+                            ZanIDE.T("Not a git repository.", "当前项目不是 git 仓库。"),
+                            t.textSecondary, t.fontSizeSmall);
+                        int giId = Button.Primary(ZanIDE.T("Initialize repository", "初始化仓库"))
+                            .SetSize(1).Render(app, gArea.x + gPad, gy + app.Scale(24), app.Scale(150));
+                        if (Button.WasClicked(app, giId)) {
+                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "init"));
+                            log.Add(ZanIDE.T("> git init done.", "> git 仓库初始化完成。"));
+                            gitLoaded = false;
+                            app.RequestRedraw();
+                        }
+                    } else {
+                        // Header: current branch + change count, then two rows
+                        // of actions (all git commands echo into Output).
+                        c.DrawText(gArea.x + gPad, gy + app.Scale(4),
+                            Ellipsis.Fit(ZanIDE.T("Branch: ", "分支：") + gitBranch
+                                + "   (" + Convert.ToString(gitFiles.Count)
+                                + ZanIDE.T(" changes", " 处变更") + ")",
+                                gArea.width - gPad * 2, t.fontSizeSmall),
+                            t.textPrimary, t.fontSizeSmall);
+                        int gBtnW = (gArea.width - gPad * 4) / 3;
+                        if (gBtnW < app.Scale(50)) { gBtnW = app.Scale(50); }
+                        int gRow1 = gy + app.Scale(22);
+                        int gRefId = Button.Create(ZanIDE.T("Refresh", "刷新")).SetSize(1)
+                            .Render(app, gArea.x + gPad, gRow1, gBtnW);
+                        int gStgId = Button.Create(ZanIDE.T("Stage all", "暂存全部")).SetSize(1)
+                            .Render(app, gArea.x + gPad * 2 + gBtnW, gRow1, gBtnW);
+                        int gDifId = Button.Create(ZanIDE.T("Diff", "差异")).SetSize(1)
+                            .Render(app, gArea.x + gPad * 3 + gBtnW * 2, gRow1, gBtnW);
+                        int gRow2 = gRow1 + app.Scale(28);
+                        int gLogId = Button.Create(ZanIDE.T("History", "历史")).SetSize(1)
+                            .Render(app, gArea.x + gPad, gRow2, gBtnW);
+                        int gPulId = Button.Create(ZanIDE.T("Pull", "拉取")).SetSize(1)
+                            .Render(app, gArea.x + gPad * 2 + gBtnW, gRow2, gBtnW);
+                        int gPshId = Button.Create(ZanIDE.T("Push", "推送")).SetSize(1)
+                            .Render(app, gArea.x + gPad * 3 + gBtnW * 2, gRow2, gBtnW);
+                        if (Button.WasClicked(app, gRefId)) {
+                            gitLoaded = false;
+                            app.RequestRedraw();
+                        }
+                        if (Button.WasClicked(app, gStgId)) {
+                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "add -A"));
+                            log.Add(ZanIDE.T("> Staged all changes.", "> 已暂存全部变更。"));
+                            gitLoaded = false;
+                            bottomTab.Set(0);
+                            app.RequestRedraw();
+                        }
+                        if (Button.WasClicked(app, gDifId)) {
+                            int gsv = gitSel.Get();
+                            string gtgt = "";
+                            if (gsv >= 0 && gsv < gitFiles.Count) {
+                                gtgt = " -- \"" + ZanIDE.GitPathOf(gitFiles[gsv]) + "\"";
+                            }
+                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "diff HEAD" + gtgt));
+                            bottomTab.Set(0);
+                            coScroll = 0;
+                            app.RequestRedraw();
+                        }
+                        if (Button.WasClicked(app, gLogId)) {
+                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root,
+                                "log --oneline --decorate -20"));
+                            bottomTab.Set(0);
+                            coScroll = 0;
+                            app.RequestRedraw();
+                        }
+                        if (Button.WasClicked(app, gPulId)) {
+                            log.Add("> git pull ...");
+                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "pull"));
+                            gitLoaded = false;
+                            bottomTab.Set(0);
+                            app.RequestRedraw();
+                        }
+                        if (Button.WasClicked(app, gPshId)) {
+                            log.Add("> git push ...");
+                            ZanIDE.AppendAll(log, ZanIDE.GitRun(root, "push"));
+                            bottomTab.Set(0);
+                            app.RequestRedraw();
+                        }
+                        // Changed-file list (porcelain "XY path" rows): click
+                        // selects, double-click opens the file in the editor.
+                        int gListY = gRow2 + app.Scale(30);
+                        int gListH = rInY - gPad - gListY;
+                        int gRowH = app.Scale(20);
+                        c.FillRect(gArea.x + gPad, gListY, gArea.width - gPad * 2, gListH, t.bgSecondary);
+                        int gVis = gListH / gRowH;
+                        if (gVis < 1) { gVis = 1; }
+                        int gMax = gitFiles.Count - gVis;
+                        if (gMax < 0) { gMax = 0; }
+                        if (app.CaptureWheel(gArea.x, gListY, gArea.width, gListH)) {
+                            int gwd = app.window.EventKeyCode();
+                            int gwstep = gwd / 120;
+                            if (gwstep == 0) {
+                                if (gwd > 0) { gwstep = 1; }
+                                else if (gwd < 0) { gwstep = 0 - 1; }
+                            }
+                            gitScroll.Set(gitScroll.Get() - gwstep);
+                            app.RequestRedraw();
+                        }
+                        if (gitScroll.Get() > gMax) { gitScroll.Set(gMax); }
+                        if (gitScroll.Get() < 0) { gitScroll.Set(0); }
+                        c.PushClip(gArea.x + gPad, gListY, gArea.width - gPad * 2, gListH);
+                        if (gitFiles.Count == 0) {
+                            c.DrawText(gArea.x + gPad * 2, gListY + gPad,
+                                ZanIDE.T("Working tree clean.", "工作区无变更。"),
+                                0xFF6A9955, t.fontSizeSmall);
+                        }
+                        int gfi = gitScroll.Get();
+                        int gcy = gListY;
+                        while (gfi < gitFiles.Count && gcy + gRowH <= gListY + gListH) {
+                            if (gitSel.Get() == gfi) {
+                                c.FillRect(gArea.x + gPad, gcy, gArea.width - gPad * 2, gRowH, t.bgHover);
+                            }
+                            int gClr = ZanIDE.GitStatusColor(gitFiles[gfi]);
+                            c.DrawText(gArea.x + gPad * 2, gcy + app.Scale(2),
+                                Ellipsis.Fit(gitFiles[gfi], gArea.width - gPad * 4, t.fontSizeSmall),
+                                gClr, t.fontSizeSmall);
+                            gcy = gcy + gRowH;
+                            gfi = gfi + 1;
+                        }
+                        c.PopClip();
+                        if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                            && app.mouseX >= gArea.x + gPad && app.mouseX < gArea.x + gArea.width - gPad
+                            && app.mouseY >= gListY && app.mouseY < gListY + gListH) {
+                            int gIdx = gitScroll.Get() + (app.mouseY - gListY) / gRowH;
+                            if (gIdx >= 0 && gIdx < gitFiles.Count) {
+                                if (app.DoubleClickNow() && gitSel.Get() == gIdx) {
+                                    string gp = root + "/" + ZanIDE.GitPathOf(gitFiles[gIdx]);
+                                    if (File.Exists(gp)) {
+                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths,
+                                            activeTab, gp, Path.GetFileName(gp));
+                                        lastActive = 0 - 1;
+                                    }
+                                }
+                                gitSel.Set(gIdx);
+                                app.RequestRedraw();
+                            }
+                        }
+                        // Bottom row: commit message + Commit (stages nothing
+                        // itself; commits what is already staged, falling back
+                        // to `commit -a` when nothing is staged yet).
+                        gitMsgIn.Render(app, rp.x + rPad, rInY, rInW, rInH);
+                        int gCmtId = Button.Primary(ZanIDE.T("Commit", "提交")).SetSize(1)
+                            .Render(app, rp.x + rPad * 2 + rInW, rInY + app.Scale(2), rBtnW);
+                        if (Button.WasClicked(app, gCmtId)) {
+                            string gMsg = gitMsgIn.GetText();
+                            if (gMsg == "") {
+                                log.Add(ZanIDE.T("> Enter a commit message first.",
+                                    "> 请先输入提交信息。"));
+                            } else {
+                                gMsg = ZanIDE.GitEscape(gMsg);
+                                List<string> gOut = ZanIDE.GitRun(root,
+                                    "diff --cached --quiet && git -C \"" + root
+                                    + "\" commit -a -m \"" + gMsg
+                                    + "\" || git -C \"" + root + "\" commit -m \"" + gMsg + "\"");
+                                ZanIDE.AppendAll(log, gOut);
+                                gitMsgIn.SetText("");
+                                gitLoaded = false;
+                            }
+                            bottomTab.Set(0);
+                            app.RequestRedraw();
+                        }
+                    }
                 } else if (rTab >= 1) {
                     // Tools / Examples: a filter bar + file tree. Single click
                     // selects; double-click RUNS a tool (tools are Zan code)
@@ -3172,6 +3365,38 @@ class ZanIDE {
                     }
                     app.RequestAnimationFrame(250);
                 }
+                // Poll the in-flight detached publish: compiler output streams
+                // into the Output tab and a done-marker file signals completion,
+                // so even a slow cross-compile never blocks the UI.
+                if (pubBusy) {
+                    int pubConsumed = ZanIDE.PubPoll(pubLogLen, log);
+                    if (pubConsumed != pubLogLen) {
+                        pubLogLen = pubConsumed;
+                        coScroll = 0;
+                        app.RequestRedraw();
+                    }
+                    if (File.Exists(ZanIDE.PubDonePath())) {
+                        File.Delete(ZanIDE.PubDonePath());
+                        pubLogLen = ZanIDE.PubPoll(pubLogLen, log);
+                        int pubOk = 0;
+                        int pe = 0;
+                        while (pe < pubExes.Count) {
+                            if (File.Exists(pubExes[pe])) {
+                                log.Add("> Published " + pubExes[pe]);
+                                pubOk = pubOk + 1;
+                            } else {
+                                log.Add(ZanIDE.T("> Publish failed for ", "> 发布失败：") + pubExes[pe]);
+                            }
+                            pe = pe + 1;
+                        }
+                        if (pubOk > 0) { ZanIDE.CopyResources(root, root + "/publish", log); }
+                        pubBusy = false;
+                        pubExes = new List<string>();
+                        coScroll = 0;
+                        app.RequestRedraw();
+                    }
+                    app.RequestAnimationFrame(250);
+                }
                 // Poll the in-flight AI request: curl runs detached and drops a
                 // done-marker when the response file is complete.
                 if (aiBusy.Get() == 1) {
@@ -3206,6 +3431,7 @@ class ZanIDE {
                 c.DrawText(app.Scale(8), sbTextY, posInfo, sbText, t.fontSizeSmall);
                 string modeInfo = "Zan";
                 if (designerMode) { modeInfo = ZanIDE.T("Designer", "设计器"); }
+                if (pubBusy) { modeInfo = ZanIDE.T("Publishing...", "发布中..."); }
                 if (dbgState == 2) { modeInfo = ZanIDE.T("Debugging", "调试中"); }
                 int modeW = Canvas.MeasureText(modeInfo, t.fontSizeSmall);
                 c.DrawText(W - modeW - app.Scale(10), sbTextY, modeInfo, sbText, t.fontSizeSmall);
@@ -3316,9 +3542,11 @@ class ZanIDE {
                         pubOpen = false;
                         app.RequestRedraw();
                     }
-                } else if (pubPending) {
+                } else if (pubPending && !pubBusy) {
                     pubPending = false;
-                    ZanIDE.PublishPlatforms(tabNames, tabPaths, activeTab, root, pubSel, log);
+                    pubExes = ZanIDE.PublishPlatformsBegin(tabNames, tabPaths, activeTab, root, pubSel, log);
+                    pubBusy = pubExes.Count > 0;
+                    pubLogLen = 0;
                     app.RequestRedraw();
                 }
 
@@ -3385,6 +3613,7 @@ class ZanIDE {
                     lastPresent = Window.GetTickMs();
 
                     if (action == 1) {
+                        bool dlgDone = true;
                         if (dlgMode == 1) {
                             string parent = pLocInput.GetText();
                             string name = pNameInput.GetText();
@@ -3393,15 +3622,25 @@ class ZanIDE {
                                 string plats = ZanIDE.PlatformCsv(platSel);
                                 ZanIDE.WriteLastPickerDirectory(parent);
                                 string newDir = ZanIDE.CreateProjectT(tpls[gi], parent, name, plats, log);
-                                root = newDir;
-                                haveProject = true;
-                                ZanIDE.WriteLastProject(root);
-                                tabNames = new List<string>();
-                                tabBodies = new List<string>();
-                                tabPaths = new List<string>();
-                                activeTab.Set(0);
-                                lastActive = 0 - 1;
-                                ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                                if (newDir == "") {
+                                    // Target folder exists and is not empty: keep the
+                                    // wizard open (with an inline notice) so the user
+                                    // can pick another name/location.
+                                    Wizard.notice = ZanIDE.T(
+                                        "Target folder exists and is not empty.",
+                                        "目标文件夹已存在且非空。");
+                                    dlgDone = false;
+                                } else {
+                                    root = newDir;
+                                    haveProject = true;
+                                    ZanIDE.WriteLastProject(root);
+                                    tabNames = new List<string>();
+                                    tabBodies = new List<string>();
+                                    tabPaths = new List<string>();
+                                    activeTab.Set(0);
+                                    lastActive = 0 - 1;
+                                    ZanIDE.OpenFirst(tabNames, tabBodies, tabPaths, activeTab, root);
+                                }
                             }
                         } else if (dlgMode == 3) {
                             string cat = saveCats[tmplCatSel.Get()];
@@ -3412,12 +3651,18 @@ class ZanIDE {
                             string p = ZanIDE.CreateFile(fSel.Get(), root, name, log);
                             ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
                         }
-                        rescan = true;
-                        dlg.window.Close();
-                        dlg = null;
-                        dlgMode = 0;
+                        if (dlgDone) {
+                            rescan = true;
+                            Wizard.notice = "";
+                            dlg.window.Close();
+                            dlg = null;
+                            dlgMode = 0;
+                        } else {
+                            dlg.RequestRedraw();
+                        }
                         app.RequestRedraw();
                     } else if (action == 2) {
+                        Wizard.notice = "";
                         dlg.window.Close();
                         dlg = null;
                         dlgMode = 0;
@@ -3960,6 +4205,18 @@ class ZanIDE {
     /// platforms is a comma-separated target-platform id list written to zan.proj.
     static string CreateProjectT(Tpl tpl, string parent, string name, string platforms, List<string> log) {
         string dir = parent + "/" + name;
+        // Scaffolding into an existing non-empty folder would mix template
+        // files into unrelated user data, so refuse and return "" (the caller
+        // keeps the wizard open).
+        if (Directory.Exists(dir)) {
+            List<string> exFiles = Directory.GetFiles(dir);
+            List<string> exDirs = Directory.GetDirectories(dir);
+            if (exFiles.Count > 0 || exDirs.Count > 0) {
+                log.Add(ZanIDE.T("> Cannot create project: target folder is not empty: ",
+                    "> 无法创建项目：目标文件夹非空：") + dir);
+                return "";
+            }
+        }
         Directory.CreateDirectoryRecursive(dir);
         Directory.CreateDirectoryRecursive(dir + "/src");
 
@@ -4632,66 +4889,105 @@ class ZanIDE {
         return flags;
     }
 
-    /// Publishes the active file for each selected Windows target into
-    /// <root>/publish. Non-Windows targets are locked and only logged.
-    static void PublishPlatforms(List<string> names, List<string> paths, SignalInt active, string root, List<int> sel, List<string> log) {
+    /// Streamed log + done-marker used by the detached (non-blocking) publish.
+    static string PubLogPath() { return ZanIDE.UserConfigDir() + "/publish.log"; }
+    static string PubDonePath() { return ZanIDE.UserConfigDir() + "/publish_done.txt"; }
+
+    /// Starts publishing the selected targets in a DETACHED shell so the UI
+    /// stays responsive while the (possibly slow) compiles run: compiler
+    /// output streams into PubLogPath and PubDonePath marks completion (the
+    /// main loop polls both, same pattern as the AI request). Returns the exe
+    /// paths the caller must verify once the done-marker appears; an empty
+    /// list means nothing was started.
+    static List<string> PublishPlatformsBegin(List<string> names, List<string> paths, SignalInt active, string root, List<int> sel, List<string> log) {
+        List<string> exes = new List<string>();
         int a = active.Get();
-        if (a < 0 || a >= paths.Count) { log.Add("> Nothing to publish."); return; }
+        if (a < 0 || a >= paths.Count) { log.Add("> Nothing to publish."); return exes; }
         // Publish always targets the whole project (its entry + every project
         // .zan file), not whichever tab happens to be focused.
         string p = ZanIDE.RibbonRunTarget(paths[a], root);
-        if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
+        if (p == "") { log.Add("> Nothing to publish (save the file first)."); return exes; }
         Directory.CreateDirectory(root + "/publish");
         string bd = ZanIDE.EnsureBuildDir(root);
         string zc = ZanIDE.ZancCmd();
         string inputs = ZanIDE.ProjectInputs(ZanIDE.DirOf(p), p, "");
         string baseName = Path.GetFileName(root);
-        int published = 0;
+        #if WINDOWS
+        string sep = " & ";
+        #else
+        string sep = " ; ";
+        #endif
+        string seq = "";
         if (sel.Count > 0 && sel[0] == 1) {
             string exe = root + "/publish/" + baseName + "-windows-x64.exe";
             string ll = bd + "/.zanpub_x64.ll";
-            string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, true);
+            if (seq != "") { seq = seq + sep; }
+            seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, true) + ")";
+            exes.Add(exe);
             log.Add("> Publishing windows-x64 ...");
-            List<string> outp = Process.RunCapture(cmd);
-            ZanIDE.AppendAll(log, outp);
-            log.Add("> Published " + exe);
-            published = published + 1;
         }
         if (sel.Count > 1 && sel[1] == 1) {
             string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
             string ll = bd + "/.zanpub_arm64.ll";
-            string cmd = zc + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p);
+            if (seq != "") { seq = seq + sep; }
+            seq = seq + "(" + zc + " --emit-ir " + inputs + " > \"" + ll + "\""
+                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ")";
+            exes.Add(exe);
             log.Add("> Publishing windows-arm64 (requires ARM64 toolchain) ...");
-            List<string> outp = Process.RunCapture(cmd);
-            ZanIDE.AppendAll(log, outp);
-            log.Add("> Published " + exe);
-            published = published + 1;
         }
         // Non-Windows targets: cross-compiled through zanc's own bundled linker
         // (--target selects the triple; no external toolchain needed). Linux x64
         // uses the musl static target so the result is a single portable file.
         if (sel.Count > 2 && sel[2] == 1) {
             string exe = root + "/publish/" + baseName + "-linux-x64";
-            ZanIDE.PublishNative(inputs, exe, "linux-musl", " --link-mode static", log);
-            published = published + 1;
+            if (seq != "") { seq = seq + sep; }
+            seq = seq + "(" + zc + " --publish " + inputs
+                + " --target linux-musl --link-mode static -o \"" + exe + "\")";
+            exes.Add(exe);
+            log.Add("> Publishing linux-x64 ...");
         }
-        if (published > 0) { ZanIDE.CopyResources(root, root + "/publish", log); }
-        if (published == 0) {
+        if (seq == "") {
             log.Add("> No target selected; nothing published.");
+            return exes;
         }
+        // Stale outputs would make a failed compile look successful, so drop
+        // them before the detached run starts.
+        int di = 0;
+        while (di < exes.Count) {
+            if (File.Exists(exes[di])) { File.Delete(exes[di]); }
+            di = di + 1;
+        }
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.PubLogPath(), "");
+        if (File.Exists(ZanIDE.PubDonePath())) { File.Delete(ZanIDE.PubDonePath()); }
+        string run = "((" + seq + ") >> \"" + ZanIDE.PubLogPath() + "\" 2>&1)"
+            + sep + "echo ok > \"" + ZanIDE.PubDonePath() + "\"";
+        Process.RunDetached(run);
+        return exes;
     }
 
-    /// Cross-compiles `inputs` for a native `target` triple (see
-    /// zanc --list-targets) via zanc's own bundled linker, writing `exe`.
-    /// `extra` carries per-target flags (e.g. " --link-mode static").
-    static void PublishNative(string inputs, string exe, string target, string extra, List<string> log) {
-        string cmd = ZanIDE.ZancCmd() + " --publish " + inputs
-            + " --target " + target + extra + " -o \"" + exe + "\"";
-        log.Add("> Publishing " + target + " ...");
-        List<string> outp = Process.RunCapture(cmd);
-        ZanIDE.AppendAll(log, outp);
-        log.Add("> Published " + exe);
+    /// Appends any new complete lines of the detached publish's streamed log
+    /// to the Output tab; returns the new consumed length (same contract as
+    /// TermPoll).
+    static int PubPoll(int consumed, List<string> log) {
+        if (!File.Exists(ZanIDE.PubLogPath())) { return consumed; }
+        string raw = File.ReadAllText(ZanIDE.PubLogPath());
+        if (raw.Length <= consumed) { return consumed; }
+        int last = 0 - 1;
+        int i = raw.Length - 1;
+        while (i >= consumed) {
+            if (raw.Substring(i, 1) == "\n") { last = i; i = consumed - 1; }
+            i = i - 1;
+        }
+        if (last < consumed) { return consumed; }
+        string chunk = raw.Substring(consumed, last + 1 - consumed);
+        List<string> nl = CodeEditor.SplitLines(chunk);
+        int k = 0;
+        while (k < nl.Count) {
+            if (!(k == nl.Count - 1 && nl[k] == "")) { log.Add(nl[k]); }
+            k = k + 1;
+        }
+        return last + 1;
     }
 
     /// Registers a clickable hit region for a dialog button so the shared
@@ -6258,8 +6554,13 @@ class ZanIDE {
                 c.FillRect(x, cy, w, rowH, t.bgHover);
             }
             string row = ZanIDE.BaseName(ePath[i]) + ":" + eLine[i] + "   " + eMsg[i];
-            c.DrawText(x + pad, cy, row, 0xFFF48771, t.fontSizeSmall);
             string importNs = ZanIDE.SuggestedUsing(eMsg[i]);
+            // Clip the message to the panel so long diagnostics never bleed
+            // into the right side panel (and never under the quick-fix chip).
+            int rowMaxW = w - pad * 2;
+            if (importNs != "") { rowMaxW = rowMaxW - app.Scale(154); }
+            c.DrawText(x + pad, cy, Ellipsis.Fit(row, rowMaxW, t.fontSizeSmall),
+                0xFFF48771, t.fontSizeSmall);
             if (importNs != "") {
                 int fixW = app.Scale(154);
                 int fixX = x + w - fixW;
@@ -6945,6 +7246,75 @@ class ZanIDE {
         return last + 1;
     }
 
+    // ================================================================
+    // Git panel helpers (right panel "Git" tab)
+    // ================================================================
+
+    /// Runs a git command inside `root`, capturing stdout+stderr.
+    static List<string> GitRun(string root, string args) {
+        return Process.RunCapture("git -C \"" + root + "\" " + args);
+    }
+
+    /// Refills `files` with `git status --porcelain` lines and returns the
+    /// current branch name ("" when not a repository).
+    static string GitRefresh(string root, List<string> files) {
+        while (files.Count > 0) { files.RemoveAt(files.Count - 1); }
+        if (!Directory.Exists(root + "/.git")) { return ""; }
+        List<string> st = ZanIDE.GitRun(root, "status --porcelain");
+        int i = 0;
+        while (i < st.Count) {
+            if (st[i] != "") { files.Add(st[i]); }
+            i = i + 1;
+        }
+        List<string> br = ZanIDE.GitRun(root, "rev-parse --abbrev-ref HEAD");
+        if (br.Count > 0) { return br[0]; }
+        return "";
+    }
+
+    /// The path part of a porcelain status line ("XY path" or "XY a -> b",
+    /// where the rename target is the interesting path).
+    static string GitPathOf(string line) {
+        if (line.Length < 4) { return ""; }
+        string p = line.Substring(3, line.Length - 3);
+        int arrow = ZanIDE.IndexOfStr(p, " -> ");
+        if (arrow >= 0) { p = p.Substring(arrow + 4, p.Length - arrow - 4); }
+        if (p.Length >= 2 && p.Substring(0, 1) == "\"") {
+            p = p.Substring(1, p.Length - 2);
+        }
+        return p;
+    }
+
+    /// Row color for a porcelain status line: green when fully staged,
+    /// red for untracked, orange for modified/partially staged.
+    static int GitStatusColor(string line) {
+        if (line.Length < 2) { return 0xFFCCCCCC; }
+        string x = line.Substring(0, 1);
+        string y = line.Substring(1, 1);
+        if (x == "?") { return 0xFFF48771; }
+        if (y == " ") { return 0xFF6A9955; }
+        return 0xFFCE9178;
+    }
+
+    /// Makes a commit message safe to embed in a double-quoted shell argument
+    /// (quotes/backslashes/backticks would otherwise break out of it).
+    static string GitEscape(string msg) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < msg.Length) {
+            string ch = msg.Substring(i, 1);
+            if (ch != "\"" && ch != "\\" && ch != "`" && ch != "$"
+                && ch != "\r" && ch != "\n") {
+                sb.Append(ch);
+            } else if (ch == "\r" || ch == "\n") {
+                sb.Append(" ");
+            } else {
+                sb.Append("'");
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
     /// Tabbed bottom panel (Output / Error List) with a filter box + Clear
     /// button in the tab strip. The Output tab owns its scrolling/scrollbar.
     static void RenderOutputBottom(App app, Canvas c, Theme t, Rect orr, int tab,
@@ -6978,12 +7348,16 @@ class ZanIDE {
         int contentY = orr.y + tabH;
         int contentH = orr.height - tabH;
         c.FillRect(orr.x, contentY, orr.width, contentH, t.bgPrimary);
+        // Clip the tab content to the panel so long lines never bleed into
+        // the right side (AI) panel.
+        c.PushClip(orr.x, contentY, orr.width, contentH);
         if (tab == 0) {
             ZanIDE.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, log,
                 scroll, selR0, selC0, selR1, selC1);
         } else {
             ZanIDE.RenderErrorList(app, c, t, orr.x, contentY, orr.width, contentH, ePath, eLine, eMsg);
         }
+        c.PopClip();
     }
 
     static void RenderLog(App app, Rect r, List<string> log) {

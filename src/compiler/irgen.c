@@ -10869,6 +10869,19 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                         g->extern_libs[g->extern_lib_count++] = member->method_decl.extern_lib;
                     }
                 }
+                /* record (lib, fn) so an unresolvable lib can be stubbed when
+                 * cross-linking a static Linux binary */
+                if (g->extern_fn_count < (int)(sizeof(g->extern_fns) / sizeof(g->extern_fns[0]))) {
+                    bool seen = false;
+                    for (int fi = 0; fi < g->extern_fn_count; fi++) {
+                        if (g->extern_fns[fi].fn == efn) { seen = true; break; }
+                    }
+                    if (!seen) {
+                        g->extern_fns[g->extern_fn_count].lib = member->method_decl.extern_lib;
+                        g->extern_fns[g->extern_fn_count].fn = efn;
+                        g->extern_fn_count++;
+                    }
+                }
                 free(pt);
                 continue;
             }
@@ -11435,6 +11448,41 @@ zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
     if (fclose(f) != 0) ok = false;
     LLVMDisposeMessage(ir);
     return ok ? ZAN_OK : ZAN_ERROR;
+}
+
+int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
+    int stubbed = 0;
+    for (int i = 0; i < g->extern_fn_count; i++) {
+        if ((int)g->extern_fns[i].lib.len != lib_len ||
+            memcmp(g->extern_fns[i].lib.str, lib, (size_t)lib_len) != 0)
+            continue;
+        LLVMValueRef fn = g->extern_fns[i].fn;
+        if (LLVMCountBasicBlocks(fn) > 0) continue; /* already defined */
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+        LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+        LLVMPositionBuilderAtEnd(b, bb);
+        LLVMTypeRef ft = LLVMGlobalGetValueType(fn);
+        LLVMTypeRef rt = LLVMGetReturnType(ft);
+        switch (LLVMGetTypeKind(rt)) {
+        case LLVMVoidTypeKind:
+            LLVMBuildRetVoid(b);
+            break;
+        case LLVMIntegerTypeKind:
+            /* -1 doubles as SQL_ERROR / a generic nonzero failure code */
+            LLVMBuildRet(b, LLVMConstInt(rt, (unsigned long long)-1, 1));
+            break;
+        case LLVMFloatTypeKind:
+        case LLVMDoubleTypeKind:
+            LLVMBuildRet(b, LLVMConstReal(rt, 0.0));
+            break;
+        default:
+            LLVMBuildRet(b, LLVMConstNull(rt));
+            break;
+        }
+        LLVMDisposeBuilder(b);
+        stubbed++;
+    }
+    return stubbed;
 }
 
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {

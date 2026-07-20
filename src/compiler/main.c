@@ -790,6 +790,15 @@ static void zan_exe_dir(char *out, size_t outsz) {
 #endif
 }
 
+/* Portable existence check (files or directories). */
+static bool zan_file_exists(const char *path) {
+#ifdef _WIN32
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+    return access(path, F_OK) == 0;
+#endif
+}
+
 /* Bare filename of a path (after the last '/' or '\\'). */
 static const char *zan_path_basename(const char *p) {
     const char *b = p;
@@ -1280,6 +1289,56 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Cross-linking to Linux is fully static against the bundled musl
+         * sysroot, so a [DllImport] lib resolves only from a bundled static
+         * archive (<module>/drivers/<target-sub>/static/lib<name>.a). Collect
+         * those archives for the link line; any lib without one (e.g.
+         * unixODBC's libodbc - a driver manager that cannot live inside a
+         * static binary) has its extern functions stubbed out so the publish
+         * still links, with the stubbed calls failing at runtime instead. */
+        char cross_archives[16][1200];
+        int cross_archive_count = 0;
+        if (cross_compiling && target.os == ZAN_OS_LINUX) {
+            zan_driver_registry_t cross_reg;
+            zan_discover_drivers(resolved_stdlib_root, &cross_reg);
+            const char *dsub = zan_driver_subdir(&target);
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue; /* CRT/libc/libm: resolved by musl libc.a */
+                char archive[1200];
+                archive[0] = '\0';
+                int didx = zan_driver_find(&cross_reg, nm, nlen);
+                if (didx >= 0 && resolved_stdlib_root[0]) {
+                    snprintf(archive, sizeof(archive),
+                             "%s/%s/drivers/%s/static/lib%.*s.a",
+                             resolved_stdlib_root,
+                             cross_reg.entries[didx].module, dsub, nlen, nm);
+                }
+                if (archive[0] && zan_file_exists(archive)) {
+                    if (cross_archive_count < 16) {
+                        snprintf(cross_archives[cross_archive_count],
+                                 sizeof(cross_archives[0]), "%s", archive);
+                        cross_archive_count++;
+                    }
+                } else {
+                    int n = zan_irgen_stub_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                    if (n > 0) {
+                        fprintf(stderr,
+                                "warning: no static %s archive for "
+                                "[DllImport(\"%.*s\")]; its %d function(s) "
+                                "are stubbed and will fail at runtime\n",
+                                dsub, (int)irgen.extern_libs[li].len,
+                                irgen.extern_libs[li].str, n);
+                    }
+                }
+            }
+        }
+
         /* emit object file */
         char obj_tmp[1024];
         snprintf(obj_tmp, sizeof(obj_tmp), "%s.o", obj_path);
@@ -1529,9 +1588,16 @@ int main(int argc, char **argv) {
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
             }
             { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur, " --start-group \"%s/libc.a\"", sys); }
+            /* bundled static driver archives (sqlite3, ...), inside the group
+             * so their libc references resolve from musl */
+            for (int d = 0; d < cross_archive_count; d++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
+            }
+            { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
-                       " --start-group \"%s/libc.a\" --end-group \"%s/crtn.o\"",
-                       sys, sys); }
+                       " --end-group \"%s/crtn.o\"", sys); }
             link_ret = system(cmd);
         } else if (cross_compiling) {
             fprintf(stderr,

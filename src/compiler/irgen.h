@@ -247,6 +247,14 @@ struct zan_irgen {
     /* DllImport: tracked extern libraries for linker */
     zan_istr_t extern_libs[64];
     int extern_lib_count;
+    /* DllImport: every extern declaration with its owning lib, so a lib that
+     * cannot be resolved when cross-linking a fully static Linux binary can
+     * have its functions stubbed out (see zan_irgen_stub_extern_lib). */
+    struct {
+        zan_istr_t   lib;
+        LLVMValueRef fn;
+    } extern_fns[512];
+    int extern_fn_count;
 
     /* cross-compilation target. When target_triple[0] is set, write_obj emits
      * an object for that LLVM triple verbatim (e.g. x86_64-unknown-linux-musl)
@@ -286,5 +294,12 @@ void zan_irgen_destroy(zan_irgen_t *g);
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
+
+/* Turns every bodyless [DllImport] declaration owned by `lib` into a strong
+ * definition returning -1/null/0. Used before write_obj when cross-linking a
+ * static Linux binary and no static archive for the lib is bundled: the
+ * program still links, and the stubbed calls fail at runtime instead of the
+ * whole publish failing. Returns the number of functions stubbed. */
+int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
 #endif /* ZAN_IRGEN_H */
