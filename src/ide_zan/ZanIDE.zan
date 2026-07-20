@@ -783,6 +783,7 @@ class ZanIDE {
         // macos-x64, macos-arm64). All targets are cross-compiled by zanc
         // via --target, so non-Windows targets are selectable too.
         bool pubOpen = false;
+        bool pubPending = false;
         List<int> pubSel = new List<int>();
 
         // ---- Editor appearance (color theme + font size) ----
@@ -2681,18 +2682,23 @@ class ZanIDE {
 
                 // Publish dialog overlay (modal, topmost).
                 if (pubOpen) {
-                    string pubName = "project";
-                    int at = activeTab.Get();
-                    if (at >= 0 && at < tabNames.Count) { pubName = tabNames[at]; }
+                    string pubName = Path.GetFileName(root);
+                    if (pubName == "") { pubName = "project"; }
                     int pAct = ZanIDE.RenderPublishDialog(app, pubName, pubSel);
                     if (pAct == 1) {
-                        ZanIDE.PublishPlatforms(tabNames, tabPaths, activeTab, root, pubSel, log);
+                        // Close the dialog first, then publish on the next frame so
+                        // the (blocking) cross-compile never leaves a frozen modal.
                         pubOpen = false;
+                        pubPending = true;
                         app.RequestRedraw();
                     } else if (pAct == 2) {
                         pubOpen = false;
                         app.RequestRedraw();
                     }
+                } else if (pubPending) {
+                    pubPending = false;
+                    ZanIDE.PublishPlatforms(tabNames, tabPaths, activeTab, root, pubSel, log);
+                    app.RequestRedraw();
                 }
 
                 // Project configuration overlay (modal): icon + static resources.
@@ -3640,11 +3646,24 @@ class ZanIDE {
         return p;
     }
 
+    /// Run/Build/Debug/Publish from the ribbon always act on the whole project:
+    /// when a zan.proj is present at the root, the project entry is compiled (with
+    /// every project .zan file), regardless of which tab is focused. Only loose
+    /// files outside a project fall back to the active file. (The Tools panel runs
+    /// individual files via RunFile/RunTarget, which is intentionally unchanged.)
+    static string RibbonRunTarget(string activePath, string root) {
+        if (File.Exists(root + "/zan.proj")) {
+            string entry = ZanIDE.ProjectEntry(root);
+            if (File.Exists(entry)) { return entry; }
+        }
+        return ZanIDE.RunTarget(activePath, root);
+    }
+
     static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
         int a = active.Get();
         string activePath = paths[a];
         string p = activePath;
-        p = ZanIDE.RunTarget(p, root);
+        p = ZanIDE.RibbonRunTarget(p, root);
         if (p == "") { log.Add(ZanIDE.T("> Nothing to build (save the file first).", "> 没有可构建的目标（请先保存文件）。")); return; }
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zanbuild.ll";
@@ -3722,7 +3741,7 @@ class ZanIDE {
 
     static string RunBuildFile(string activePath, string root, List<string> log, CodeEditor editor) {
         string p = activePath;
-        p = ZanIDE.RunTarget(p, root);
+        p = ZanIDE.RibbonRunTarget(p, root);
         if (p == "") {
             log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
             return "";
@@ -3878,7 +3897,7 @@ class ZanIDE {
         int a = active.Get();
         if (a < 0 || a >= paths.Count) { return; }
         string p = paths[a];
-        p = ZanIDE.RunTarget(p, root);
+        p = ZanIDE.RibbonRunTarget(p, root);
         if (p == "") { log.Add(ZanIDE.T("> [Hot] Nothing to run (save the file first).", "> [热重载] 没有可运行的目标（请先保存文件）。")); return; }
         string bd = ZanIDE.EnsureBuildDir(root);
         string ll = bd + "/.zanhot.ll";
@@ -3972,11 +3991,10 @@ class ZanIDE {
     static void PublishPlatforms(List<string> names, List<string> paths, SignalInt active, string root, List<int> sel, List<string> log) {
         int a = active.Get();
         if (a < 0 || a >= paths.Count) { log.Add("> Nothing to publish."); return; }
-        string p = paths[a];
+        // Publish always targets the whole project (its entry + every project
+        // .zan file), not whichever tab happens to be focused.
+        string p = ZanIDE.RibbonRunTarget(paths[a], root);
         if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
-        // The active tab may be the .zform designer surface; publish the project's
-        // real code entry, never hand a .zform to the compiler.
-        if (ZanIDE.IsFormPath(p)) { p = ZanIDE.ProjectEntry(root); }
         Directory.CreateDirectory(root + "/publish");
         string bd = ZanIDE.EnsureBuildDir(root);
         string zc = ZanIDE.ZancCmd();
@@ -4058,7 +4076,7 @@ class ZanIDE {
 
         int pad = app.Scale(18);
         c.DrawText(x + pad, y + pad, ZanIDE.T("Publish Project", "发布项目"), t.textPrimary, t.fontSizeLarge);
-        c.DrawText(x + pad, y + pad + app.Scale(24), ZanIDE.T("Target file: ", "目标文件：") + projName, t.textSecondary, t.fontSizeSmall);
+        c.DrawText(x + pad, y + pad + app.Scale(24), ZanIDE.T("Project: ", "项目：") + projName, t.textSecondary, t.fontSizeSmall);
         c.FillRect(x + 1, y + app.Scale(60), w - 2, 1, t.divider);
         c.DrawText(x + pad, y + app.Scale(72), ZanIDE.T("Platforms", "目标平台"), t.textSecondary, t.fontSizeSmall);
 
@@ -4105,7 +4123,10 @@ class ZanIDE {
         }
 
         c.DrawText(x + pad, listY + 3 * rowH + app.Scale(8),
-            ZanIDE.T("Linux is cross-compiled here (static single file); run it on Linux, e.g. a server or container.", "Linux 为本机交叉编译产物（静态单文件），需在 Linux（服务器/容器）上运行。"),
+            ZanIDE.T("Linux is cross-compiled here as a static single file.", "Linux 为本机交叉编译的静态单文件产物。"),
+            t.textSecondary, t.fontSizeSmall);
+        c.DrawText(x + pad, listY + 3 * rowH + app.Scale(8) + app.Scale(16),
+            ZanIDE.T("Run it on Linux (a server or container).", "需在 Linux（服务器或容器）上运行。"),
             t.textSecondary, t.fontSizeSmall);
 
         int btnH = app.Scale(30);
@@ -6045,7 +6066,7 @@ class ZanIDE {
         if (a < 0 || a >= tabPaths.Count) { return false; }
         string activePath = tabPaths[a];
         string p = activePath;
-        p = ZanIDE.RunTarget(p, root);
+        p = ZanIDE.RibbonRunTarget(p, root);
         if (p == "") {
             log.Add(ZanIDE.T("> [Debug] Open a source file first.", "> [调试] 请先打开源文件。"));
             return false;
