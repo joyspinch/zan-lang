@@ -2890,6 +2890,49 @@ EXPORT i64 zan_gui_client_height(i64 hwnd_val) {
     return h;
 }
 
+/* Lightweight opt-in frame profiler: enabled by setting env ZAN_FRAME_PROF=1.
+ * Every 120 presents it appends one summary line to zan_frame_perf.log (in the
+ * process CWD) breaking the frame budget into CPU-render / upload / present so
+ * we can target the real bottleneck instead of guessing. Zero cost when off. */
+static int g_fprof = -1;                 /* -1 = unread, 0 = off, 1 = on */
+static Uint64 g_fp_last_end = 0;         /* perf counter at previous present end */
+static Uint64 g_fp_acc_interval = 0;     /* sum of gaps between successive frames */
+static Uint64 g_fp_acc_upload = 0;
+static Uint64 g_fp_acc_present = 0;
+static int    g_fp_frames = 0;
+
+static void fprof_record(Uint64 t_enter, Uint64 t_upload, Uint64 t_present_end) {
+    if (g_fprof < 0) {
+        const char *e = getenv("ZAN_FRAME_PROF");
+        g_fprof = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (!g_fprof) return;
+    if (g_fp_last_end != 0) {
+        /* interval = CPU render + event handling before this present; upload =
+         * SDL_UpdateTexture; present = clear+blit+RenderPresent (incl. vsync). */
+        g_fp_acc_interval += t_enter - g_fp_last_end;
+        g_fp_acc_upload   += t_upload;
+        g_fp_acc_present  += t_present_end - t_enter - t_upload;
+        g_fp_frames++;
+        if (g_fp_frames >= 120) {
+            double f = (double)SDL_GetPerformanceFrequency() / 1000.0; /* ticks per ms */
+            double n = (double)g_fp_frames;
+            double cpu = (double)g_fp_acc_interval / n / f;
+            double up  = (double)g_fp_acc_upload   / n / f;
+            double pr  = (double)g_fp_acc_present  / n / f;
+            double frame = cpu + up + pr;
+            FILE *fp = fopen("zan_frame_perf.log", "a");
+            if (fp) {
+                fprintf(fp, "frames=%d avg_frame=%.2fms fps=%.0f | cpu_render=%.2f upload=%.2f present=%.2f\n",
+                        g_fp_frames, frame, frame > 0 ? 1000.0 / frame : 0.0, cpu, up, pr);
+                fclose(fp);
+            }
+            g_fp_acc_interval = 0; g_fp_acc_upload = 0; g_fp_acc_present = 0; g_fp_frames = 0;
+        }
+    }
+    g_fp_last_end = t_present_end;
+}
+
 EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (surface_id < 0 || surface_id >= g_surface_count ||
@@ -2898,6 +2941,8 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     if (!rec) return 1;
     zan_surface_t *s = g_surfaces[surface_id];
     g_last_surface = surface_id;
+
+    Uint64 t_enter = SDL_GetPerformanceCounter();
 
     if (!rec->tex || rec->tw != s->width || rec->th != s->height) {
         if (rec->tex) SDL_DestroyTexture(rec->tex);
@@ -2909,6 +2954,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
         rec->tw = s->width; rec->th = s->height;
     }
     SDL_UpdateTexture(rec->tex, NULL, s->pixels, s->width * 4);
+    Uint64 t_upload = SDL_GetPerformanceCounter() - t_enter;
 
     /* Clear the (possibly larger) window to the canvas background so a live
      * grow-resize shows solid bg rather than stretched/garbage pixels, then
@@ -2919,6 +2965,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
     SDL_FRect dst = { 0.0f, 0.0f, (float)s->width, (float)s->height };
     SDL_RenderTexture(rec->ren, rec->tex, NULL, &dst);
     SDL_RenderPresent(rec->ren);
+    fprof_record(t_enter, t_upload, SDL_GetPerformanceCounter());
     return 0;
 }
 
