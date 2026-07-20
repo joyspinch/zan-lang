@@ -1231,28 +1231,88 @@ EXPORT void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
     }
 }
 
-EXPORT i64 zan_gui_measure_text(const char *text, i64 font_size) {
-    if (!text || !*text) return 0;
-    int size = (int)font_size;
-    if (size < 8) size = 8;
+/* --- Measured-width cache -------------------------------------------------
+ * zan_gui_measure_text runs a GDI GetTextExtentPoint32W round-trip plus two
+ * MultiByteToWideChar and a malloc/free on every call, and layout / caret /
+ * selection / syntax-highlight code calls it hundreds of times per frame with
+ * the same strings (one per visible token, every frame while scrolling). Cache
+ * width by (text, size) so a steady frame measures nothing and allocates
+ * nothing -- the dominant per-frame CPU + allocation churn otherwise. */
+typedef struct {
+    char    *text;   /* UTF-8 key; NULL marks an empty slot */
+    int      size;
+    int      width;
+    uint64_t used;   /* LRU tick */
+} zan_measure_cache_t;
 
-    ensure_text_dc();
+#define ZAN_MEAS_CACHE_CAP 2048
+#define ZAN_MEAS_CACHE_PROBE 8
+static zan_measure_cache_t g_mcache[ZAN_MEAS_CACHE_CAP];
+static uint64_t g_mcache_clock = 0;
+
+static int measure_text_gdi(const char *text, int size) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
     wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wtext) return 0;
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
-
     HFONT font = get_or_create_font(size);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
     SIZE text_size;
     GetTextExtentPoint32W(g_text_dc, wtext, wlen - 1, &text_size);
     SelectObject(g_text_dc, old_font);
     free(wtext);
-    return (i64)text_size.cx;
+    return (int)text_size.cx;
 }
+
+EXPORT i64 zan_gui_measure_text(const char *text, i64 font_size) {
+    if (!text || !*text) return 0;
+    int size = (int)font_size;
+    if (size < 8) size = 8;
+
+    ensure_text_dc();
+
+    uint64_t h = zan_text_hash(text, size);
+    int base = (int)(h % ZAN_MEAS_CACHE_CAP);
+    zan_measure_cache_t *victim = NULL;
+    uint64_t best = ~0ULL;
+    for (int i = 0; i < ZAN_MEAS_CACHE_PROBE; i++) {
+        zan_measure_cache_t *e = &g_mcache[(base + i) % ZAN_MEAS_CACHE_CAP];
+        if (e->text && e->size == size && strcmp(e->text, text) == 0) {
+            e->used = ++g_mcache_clock;
+            return (i64)e->width;
+        }
+        if (!e->text) { if (!victim || best != 0) { victim = e; best = 0; } }
+        else if (e->used < best) { best = e->used; victim = e; }
+    }
+
+    int w = measure_text_gdi(text, size);
+
+    if (victim) {
+        if (victim->text) { free(victim->text); victim->text = NULL; }
+        size_t klen = strlen(text) + 1;
+        victim->text = (char *)malloc(klen);
+        if (victim->text) {
+            memcpy(victim->text, text, klen);
+            victim->size = size;
+            victim->width = w;
+            victim->used = ++g_mcache_clock;
+        }
+    }
+    return (i64)w;
+}
+
+/* Font height depends only on size; only a handful of sizes are ever used. */
+static int g_fh_size[16];
+static int g_fh_val[16];
+static int g_fh_count = 0;
 
 EXPORT i64 zan_gui_font_height(i64 font_size) {
     int size = (int)font_size;
     if (size < 8) size = 8;
+
+    for (int i = 0; i < g_fh_count; i++) {
+        if (g_fh_size[i] == size) return (i64)g_fh_val[i];
+    }
 
     ensure_text_dc();
     HFONT font = get_or_create_font(size);
@@ -1260,7 +1320,14 @@ EXPORT i64 zan_gui_font_height(i64 font_size) {
     TEXTMETRICW tm;
     GetTextMetricsW(g_text_dc, &tm);
     SelectObject(g_text_dc, old_font);
-    return (i64)tm.tmHeight;
+
+    int val = (int)tm.tmHeight;
+    if (g_fh_count < 16) {
+        g_fh_size[g_fh_count] = size;
+        g_fh_val[g_fh_count] = val;
+        g_fh_count = g_fh_count + 1;
+    }
+    return (i64)val;
 }
 
 
