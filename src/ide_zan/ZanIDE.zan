@@ -857,6 +857,13 @@ class ZanIDE {
         // through the .zform file.
         bool designerMode = false;
         Designer formDesigner = Designer.Create();
+        // Design/Code toggle: codeViewForm holds the path of the .zform currently
+        // shown as code ("" = design view). The code view reuses a dedicated,
+        // in-place editor over the paired code-behind -- it never opens a new tab
+        // or creates a file just from switching modes. Only .zform tabs toggle.
+        string codeViewForm = "";
+        CodeEditor formCodeEd = CodeEditor.Create();
+        string formCodeLoaded = "";
 
         SignalInt treeW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
         // The code editor is the primary area: it fills the space left over
@@ -1082,7 +1089,7 @@ class ZanIDE {
             // editor is shown, rather than a global toggle.
             int actDM = activeTab.Get();
             if (actDM >= 0 && actDM < tabPaths.Count) {
-                designerMode = ZanIDE.IsFormPath(tabPaths[actDM]);
+                designerMode = ZanIDE.IsFormPath(tabPaths[actDM]) && tabPaths[actDM] != codeViewForm;
             } else {
                 designerMode = false;
             }
@@ -1229,7 +1236,12 @@ class ZanIDE {
                 } else if (cc == 19) {
                     // Ctrl+S = Save (+ hot reload when enabled)
                     int aSv = activeTab.Get();
-                    if (!designerMode && aSv >= 0 && aSv < tabPaths.Count && tabPaths[aSv] != "@start") {
+                    if (aSv >= 0 && aSv < tabPaths.Count
+                            && ZanIDE.IsFormPath(tabPaths[aSv]) && codeViewForm == tabPaths[aSv]) {
+                        // In the .zform code view, save the code-behind, not the form.
+                        ZanIDE.SaveFormCode(formCodeEd, tabPaths[aSv], root, log);
+                        rescan = true;
+                    } else if (!designerMode && aSv >= 0 && aSv < tabPaths.Count && tabPaths[aSv] != "@start") {
                         ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                         if (autoRun) { ZanIDE.HotReloadRun(tabPaths, activeTab, root, log); }
                         rescan = true;
@@ -1278,7 +1290,7 @@ class ZanIDE {
                 cmds[7].SetEnabled(canRun);
                 cmds[8].SetEnabled(haveProj);
                 cmds[9].SetEnabled(haveProj);
-                cmds[10].SetEnabled(activeIsFile);
+                cmds[10].SetEnabled(activeIsFile && ZanIDE.IsFormPath(apE));
                 cmds[12].SetEnabled(haveProj);
                 int rc = ZanIDE.RibbonAction(
                     Ribbon.Render(app, 0, top, W, ribbonH, cmds));
@@ -1309,8 +1321,14 @@ class ZanIDE {
                     pathPickerOwner = 4;
                     app.RequestRedraw();
                 } else if (rc == 3) {
-                    ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                    if (autoRun) { ZanIDE.HotReloadRun(tabPaths, activeTab, root, log); }
+                    int aSv3 = activeTab.Get();
+                    if (aSv3 >= 0 && aSv3 < tabPaths.Count
+                            && ZanIDE.IsFormPath(tabPaths[aSv3]) && codeViewForm == tabPaths[aSv3]) {
+                        ZanIDE.SaveFormCode(formCodeEd, tabPaths[aSv3], root, log);
+                    } else {
+                        ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
+                        if (autoRun) { ZanIDE.HotReloadRun(tabPaths, activeTab, root, log); }
+                    }
                     rescan = true;
                 } else if (rc == 4) {
                     ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
@@ -1387,71 +1405,22 @@ class ZanIDE {
                     dlg.Show();
                     dlgMode = 3;
                 } else if (rc == 9) {
-                    // Design/Code: one-click toggle between the visual designer
-                    // (.zform) and its code-behind (.zan), WinForms-style.
-                    if (designerMode && act >= 0 && act < tabPaths.Count) {
-                        // Design -> Code: regenerate the designer region and
-                        // open the code-behind (created when missing).
-                        string fpath9 = tabPaths[act];
-                        string fname9 = ZanIDE.FormBaseName(fpath9);
-                        string cbp9 = ZanIDE.CodeBehindPath(fpath9);
-                        string region9 = ZanIDE.FieldsRegion(fname9,
-                            formDesigner.fields, formDesigner.winW, formDesigner.winH);
-                        string cbtext9 = "";
-                        if (File.Exists(cbp9)) {
-                            cbtext9 = ZanIDE.ReplaceDesignerRegion(File.ReadAllText(cbp9), region9);
+                    // Design/Code: toggle the CURRENT .zform tab in place between
+                    // the visual designer and a view of its code. It never opens a
+                    // new tab nor creates a file, and only .zform tabs have it --
+                    // other files stay in code and cannot enter design mode.
+                    if (act >= 0 && act < tabPaths.Count && ZanIDE.IsFormPath(tabPaths[act])) {
+                        string fp9 = tabPaths[act];
+                        if (codeViewForm == fp9) {
+                            codeViewForm = "";
+                            log.Add(ZanIDE.T("> Design view.", "> 设计视图。"));
                         } else {
-                            cbtext9 = ZanIDE.CodeBehindShell(fname9, region9);
+                            codeViewForm = fp9;
+                            formCodeLoaded = "";
+                            log.Add(ZanIDE.T("> Code view.", "> 代码视图。"));
                         }
-                        File.WriteAllText(cbp9, cbtext9);
-                        int cbi9 = ZanIDE.FindTabByPath(tabPaths, cbp9);
-                        if (cbi9 >= 0) {
-                            tabBodies[cbi9] = cbtext9;
-                            activeTab.Set(cbi9);
-                        } else {
-                            ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, cbp9, Path.GetFileName(cbp9));
-                        }
-                        log.Add("> Code mode -> " + cbp9 + ".");
                     } else {
-                        // Code -> Design: the active code file's paired .zform,
-                        // else the first open .zform, else create one.
-                        int bi = 0 - 1;
-                        if (act >= 0 && act < tabPaths.Count && ZanIDE.IsFormPath(tabPaths[act])) { bi = act; }
-                        if (bi < 0 && act >= 0 && act < tabPaths.Count) {
-                            string ap9 = tabPaths[act];
-                            if (ap9.Length > 4 && ap9.Substring(ap9.Length - 4, 4) == ".zan") {
-                                string sib9 = ap9.Substring(0, ap9.Length - 4) + ".zform";
-                                if (File.Exists(sib9)) {
-                                    // The code may have been edited: save it so
-                                    // the design/code pair stays in sync.
-                                    ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                                    bi = ZanIDE.FindTabByPath(tabPaths, sib9);
-                                    if (bi < 0) {
-                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, sib9, Path.GetFileName(sib9));
-                                        bi = activeTab.Get();
-                                    }
-                                }
-                            }
-                        }
-                        if (bi < 0) {
-                            int fi = 0;
-                            while (fi < tabPaths.Count) {
-                                if (ZanIDE.IsFormPath(tabPaths[fi])) { bi = fi; fi = tabPaths.Count; }
-                                fi = fi + 1;
-                            }
-                        }
-                        if (bi >= 0) {
-                            activeTab.Set(bi);
-                        } else {
-                            string nfp = root + "/src/Form1.zform";
-                            if (!File.Exists(nfp)) {
-                                Directory.CreateDirectoryRecursive(root + "/src");
-                                File.WriteAllText(nfp, ZanIDE.NewFormJson("Form1", 0 - 1));
-                                log.Add("> Created " + nfp + ".");
-                            }
-                            ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, nfp, "Form1.zform");
-                        }
-                        loadedFormPath = "";
+                        log.Add(ZanIDE.T("> Design/Code applies only to .zform files.", "> 设计/代码切换仅适用于 .zform 文件。"));
                     }
                     lastActive = 0 - 1;
                     app.RequestRedraw();
@@ -1959,6 +1928,27 @@ class ZanIDE {
                             app.RequestRedraw();
                         }
                     }
+                } else if (act >= 0 && act < tabPaths.Count
+                        && ZanIDE.IsFormPath(tabPaths[act]) && codeViewForm == tabPaths[act]) {
+                    // Code view of the current .zform: show its code (read from the
+                    // paired code-behind, kept in sync by the designer) in place --
+                    // no new tab, no new file. Editing + Save writes the code-behind.
+                    string fpC = tabPaths[act];
+                    string fnC = ZanIDE.FormBaseName(fpC);
+                    if (formCodeLoaded != fpC) {
+                        string cbpC = ZanIDE.CodeBehindPath(fpC);
+                        string codeTxt = "";
+                        if (File.Exists(cbpC)) {
+                            codeTxt = File.ReadAllText(cbpC);
+                        } else {
+                            codeTxt = ZanIDE.CodeBehindShell(fnC,
+                                ZanIDE.FieldsRegion(fnC, new List<FormField>(), 480, 520));
+                        }
+                        formCodeEd.LoadText(codeTxt);
+                        formCodeLoaded = fpC;
+                    }
+                    ZanIDE.ApplyEditorTheme(formCodeEd, edThemeIdx, edFontPx);
+                    formCodeEd.Render(app, edRect);
                 } else {
                     // Sync debug vars into editor for hover tooltips
                     if (dbgState == 2) { editor.SetDebugVars(dbgVarInfo); }
@@ -3603,6 +3593,15 @@ class ZanIDE {
         }
         File.WriteAllText(p, bodies[a]);
         log.Add("> Saved " + p + ".");
+    }
+
+    /// Saves the .zform code view: writes the in-place code editor to the form's
+    /// paired code-behind (.zan). Used instead of SaveActive while a .zform tab is
+    /// showing code, so the form JSON is never overwritten with source.
+    static void SaveFormCode(CodeEditor ed, string formPath, string root, List<string> log) {
+        string cbp = ZanIDE.CodeBehindPath(formPath);
+        File.WriteAllText(cbp, ed.GetText());
+        log.Add("> Saved " + cbp + ".");
     }
 
     // ---- toolchain ----
