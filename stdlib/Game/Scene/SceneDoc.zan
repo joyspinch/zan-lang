@@ -1,0 +1,370 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace Game.Scene;
+
+// How the authored design resolution maps onto the actual window/backbuffer.
+//   0 Fit     uniform scale, letterboxed (keeps aspect ratio, may show bars)
+//   1 Fill    uniform scale, cover (keeps aspect ratio, may crop edges)
+//   2 Stretch non-uniform scale, fills exactly (aspect ratio can distort)
+//   3 None     1:1, no scaling (design pixels == screen pixels)
+class ScaleMode {
+    static int Fit() { return 0; }
+    static int Fill() { return 1; }
+    static int Stretch() { return 2; }
+    static int None() { return 3; }
+}
+
+// Nine-grid anchor presets expressed in permille (0..1000), where 500 is the
+// centre. An element's anchor picks BOTH the reference point on the canvas and
+// the element's own pivot, so (0,0)=top-left corner, (1000,1000)=bottom-right,
+// (500,500)=perfectly centred regardless of resolution.
+class Anchor {
+    static int Min() { return 0; }
+    static int Mid() { return 500; }
+    static int Max() { return 1000; }
+}
+
+// A resolved on-screen rectangle in real device pixels.
+class SceneRect {
+    double x;
+    double y;
+    double w;
+    double h;
+
+    static SceneRect Of(double x, double y, double w, double h) {
+        SceneRect r = new SceneRect();
+        r.x = x; r.y = y; r.w = w; r.h = h;
+        return r;
+    }
+    double X() { return this.x; }
+    double Y() { return this.y; }
+    double W() { return this.w; }
+    double H() { return this.h; }
+    int Xi() { return (int)this.x; }
+    int Yi() { return (int)this.y; }
+    int Wi() { return (int)this.w; }
+    int Hi() { return (int)this.h; }
+}
+
+// Scaled canvas placement for the current window: the design canvas rendered at
+// (offX, offY) with size (canvasW, canvasH) and per-axis scale (scaleX, scaleY).
+class SceneMetrics {
+    double offX;
+    double offY;
+    double canvasW;
+    double canvasH;
+    double scaleX;
+    double scaleY;
+
+    double OffX() { return this.offX; }
+    double OffY() { return this.offY; }
+    double CanvasW() { return this.canvasW; }
+    double CanvasH() { return this.canvasH; }
+    double ScaleX() { return this.scaleX; }
+    double ScaleY() { return this.scaleY; }
+}
+
+// One placed element. Position/size are authored in *design* pixels. anchorX /
+// anchorY are permille (0..1000). x/y are the offset from the anchor point, so
+// a health bar anchored top-left keeps its corner offset on every resolution,
+// while a centred crosshair (anchor 500/500, x=0, y=0) stays centred.
+class SceneElement {
+    string kind;      // "sprite" | "label" | "button" | "bar" | "panel" | custom
+    string ename;
+    int x;
+    int y;
+    int w;
+    int h;
+    int anchorX;      // permille 0..1000
+    int anchorY;      // permille 0..1000
+    int z;            // draw order (low first)
+    string image;     // resource id / path for sprite/button/panel
+    string text;      // caption for label/button/bar
+    int cr;
+    int cg;
+    int cb;
+    int ca;
+    bool visible;
+
+    static SceneElement Create(string kind, string name) {
+        SceneElement e = new SceneElement();
+        e.kind = kind;
+        e.ename = name;
+        e.x = 0; e.y = 0; e.w = 0; e.h = 0;
+        e.anchorX = 0; e.anchorY = 0;
+        e.z = 0;
+        e.image = "";
+        e.text = "";
+        e.cr = 255; e.cg = 255; e.cb = 255; e.ca = 255;
+        e.visible = true;
+        return e;
+    }
+
+    SceneElement At(int x, int y) { this.x = x; this.y = y; return this; }
+    SceneElement Size(int w, int h) { this.w = w; this.h = h; return this; }
+    SceneElement AnchorTo(int ax, int ay) { this.anchorX = ax; this.anchorY = ay; return this; }
+    SceneElement Order(int z) { this.z = z; return this; }
+    SceneElement Image(string img) { this.image = img; return this; }
+    SceneElement Caption(string t) { this.text = t; return this; }
+    SceneElement Tint(int r, int g, int b, int a) {
+        this.cr = r; this.cg = g; this.cb = b; this.ca = a; return this;
+    }
+    SceneElement SetVisible(bool v) { this.visible = v; return this; }
+
+    string Kind() { return this.kind; }
+    string Name() { return this.ename; }
+    int X() { return this.x; }
+    int Y() { return this.y; }
+    int W() { return this.w; }
+    int H() { return this.h; }
+    int AnchorX() { return this.anchorX; }
+    int AnchorY() { return this.anchorY; }
+    int Z() { return this.z; }
+    string ImageId() { return this.image; }
+    string Text() { return this.text; }
+    int R() { return this.cr; }
+    int G() { return this.cg; }
+    int B() { return this.cb; }
+    int A() { return this.ca; }
+    bool Visible() { return this.visible; }
+}
+
+// A `.zscene` document: a design-resolution canvas, a background, and a flat,
+// z-ordered list of absolutely-placed HUD/scene elements. This is the runtime
+// contract the Zan IDE scene designer reads and writes.
+class SceneDoc {
+    string sname;
+    int designWidth;
+    int designHeight;
+    int scaleMode;
+    string background;   // background image resource id / path (may be empty)
+    int bgR;
+    int bgG;
+    int bgB;
+    List<SceneElement> elements;
+
+    static SceneDoc Create(string name, int designWidth, int designHeight) {
+        SceneDoc d = new SceneDoc();
+        d.sname = name;
+        d.designWidth = designWidth;
+        d.designHeight = designHeight;
+        d.scaleMode = 0;
+        d.background = "";
+        d.bgR = 18; d.bgG = 20; d.bgB = 32;
+        d.elements = new List<SceneElement>();
+        return d;
+    }
+
+    SceneElement Add(SceneElement e) {
+        this.elements.Add(e);
+        return e;
+    }
+
+    SceneElement Find(string name) {
+        int i = 0;
+        while (i < this.elements.Count) {
+            if (this.elements[i].Name() == name) { return this.elements[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    int Count() { return this.elements.Count; }
+    SceneElement ElementAt(int i) { return this.elements[i]; }
+    string Name() { return this.sname; }
+    int DesignWidth() { return this.designWidth; }
+    int DesignHeight() { return this.designHeight; }
+    int Mode() { return this.scaleMode; }
+    string Background() { return this.background; }
+
+    void SetMode(int m) { this.scaleMode = m; }
+    void SetBackground(string img) { this.background = img; }
+    void SetClearColor(int r, int g, int b) { this.bgR = r; this.bgG = g; this.bgB = b; }
+    int ClearR() { return this.bgR; }
+    int ClearG() { return this.bgG; }
+    int ClearB() { return this.bgB; }
+
+    // Canvas placement + scale for the current window/backbuffer size.
+    SceneMetrics Metrics(int winW, int winH) {
+        SceneMetrics m = new SceneMetrics();
+        double dw = (double)this.designWidth;
+        double dh = (double)this.designHeight;
+        double ww = (double)winW;
+        double wh = (double)winH;
+        if (dw <= 0.0) { dw = 1.0; }
+        if (dh <= 0.0) { dh = 1.0; }
+        if (this.scaleMode == 2) {
+            // Stretch
+            m.scaleX = ww / dw;
+            m.scaleY = wh / dh;
+            m.canvasW = ww;
+            m.canvasH = wh;
+            m.offX = 0.0;
+            m.offY = 0.0;
+            return m;
+        }
+        if (this.scaleMode == 3) {
+            // None (1:1)
+            m.scaleX = 1.0;
+            m.scaleY = 1.0;
+            m.canvasW = dw;
+            m.canvasH = dh;
+            m.offX = (ww - dw) / 2.0;
+            m.offY = (wh - dh) / 2.0;
+            return m;
+        }
+        double sx = ww / dw;
+        double sy = wh / dh;
+        double s = sx;
+        if (this.scaleMode == 1) {
+            // Fill: cover (max)
+            if (sy > s) { s = sy; }
+        } else {
+            // Fit: letterbox (min)
+            if (sy < s) { s = sy; }
+        }
+        m.scaleX = s;
+        m.scaleY = s;
+        m.canvasW = dw * s;
+        m.canvasH = dh * s;
+        m.offX = (ww - m.canvasW) / 2.0;
+        m.offY = (wh - m.canvasH) / 2.0;
+        return m;
+    }
+
+    // Resolve one element to real device pixels for the given window size.
+    SceneRect Resolve(SceneElement e, int winW, int winH) {
+        SceneMetrics m = this.Metrics(winW, winH);
+        double ax = (double)e.AnchorX() / 1000.0;
+        double ay = (double)e.AnchorY() / 1000.0;
+        double ew = (double)e.W() * m.ScaleX();
+        double eh = (double)e.H() * m.ScaleY();
+        double anchorPxX = m.OffX() + ax * m.CanvasW();
+        double anchorPxY = m.OffY() + ay * m.CanvasH();
+        double px = anchorPxX + (double)e.X() * m.ScaleX() - ax * ew;
+        double py = anchorPxY + (double)e.Y() * m.ScaleY() - ay * eh;
+        return SceneRect.Of(px, py, ew, eh);
+    }
+
+    // ---- serialization -------------------------------------------------
+
+    static string IntStr(int v) {
+        if (v == 0) { return "0"; }
+        bool neg = v < 0;
+        int n = v;
+        if (neg) { n = 0 - n; }
+        string digits = "0123456789";
+        string o = "";
+        while (n > 0) {
+            int d = n % 10;
+            o = digits.Substring(d, 1) + o;
+            n = n / 10;
+        }
+        if (neg) { o = "-" + o; }
+        return o;
+    }
+
+    static string Esc(string v) {
+        string o = "";
+        int i = 0;
+        while (i < v.Length) {
+            string c = v.Substring(i, 1);
+            if (c == "\"") { o = o + "\\\""; }
+            else if (c == "\\") { o = o + "\\\\"; }
+            else if (c == "\n") { o = o + "\\n"; }
+            else if (c == "\r") { o = o + "\\r"; }
+            else if (c == "\t") { o = o + "\\t"; }
+            else { o = o + c; }
+            i = i + 1;
+        }
+        return o;
+    }
+
+    // Parses a `.zscene` JSON document (best-effort, tool-authored input).
+    static SceneDoc Parse(string json) {
+        JsonValue root = JsonValue.Parse(json);
+        SceneDoc d = SceneDoc.Create(
+            root.Str("name", ""),
+            root.Int("designWidth", 1280),
+            root.Int("designHeight", 720));
+        d.scaleMode = root.Int("scaleMode", 0);
+        d.background = root.Str("background", "");
+        JsonValue clear = root.Get("clearColor");
+        if (clear != null && clear.IsArray() && clear.Count() >= 3) {
+            d.bgR = clear.At(0).AsInt(18);
+            d.bgG = clear.At(1).AsInt(20);
+            d.bgB = clear.At(2).AsInt(32);
+        }
+        JsonValue els = root.Get("elements");
+        if (els != null && els.IsArray()) {
+            int i = 0;
+            while (i < els.Count()) {
+                JsonValue je = els.At(i);
+                SceneElement e = SceneElement.Create(
+                    je.Str("kind", "sprite"),
+                    je.Str("name", ""));
+                e.x = je.Int("x", 0);
+                e.y = je.Int("y", 0);
+                e.w = je.Int("w", 0);
+                e.h = je.Int("h", 0);
+                e.anchorX = je.Int("anchorX", 0);
+                e.anchorY = je.Int("anchorY", 0);
+                e.z = je.Int("z", 0);
+                e.image = je.Str("image", "");
+                e.text = je.Str("text", "");
+                JsonValue col = je.Get("color");
+                if (col != null && col.IsArray() && col.Count() >= 4) {
+                    e.cr = col.At(0).AsInt(255);
+                    e.cg = col.At(1).AsInt(255);
+                    e.cb = col.At(2).AsInt(255);
+                    e.ca = col.At(3).AsInt(255);
+                }
+                e.visible = je.Bool("visible", true);
+                d.elements.Add(e);
+                i = i + 1;
+            }
+        }
+        return d;
+    }
+
+    // Serializes to a stable, human-diffable `.zscene` JSON document.
+    string ToJson() {
+        string o = "{\n";
+        o = o + "  \"name\": \"" + SceneDoc.Esc(this.sname) + "\",\n";
+        o = o + "  \"designWidth\": " + SceneDoc.IntStr(this.designWidth) + ",\n";
+        o = o + "  \"designHeight\": " + SceneDoc.IntStr(this.designHeight) + ",\n";
+        o = o + "  \"scaleMode\": " + SceneDoc.IntStr(this.scaleMode) + ",\n";
+        o = o + "  \"background\": \"" + SceneDoc.Esc(this.background) + "\",\n";
+        o = o + "  \"clearColor\": [" + SceneDoc.IntStr(this.bgR) + ", "
+            + SceneDoc.IntStr(this.bgG) + ", " + SceneDoc.IntStr(this.bgB) + "],\n";
+        o = o + "  \"elements\": [";
+        int i = 0;
+        while (i < this.elements.Count) {
+            SceneElement e = this.elements[i];
+            if (i > 0) { o = o + ","; }
+            o = o + "\n    {";
+            o = o + "\"kind\": \"" + SceneDoc.Esc(e.Kind()) + "\", ";
+            o = o + "\"name\": \"" + SceneDoc.Esc(e.Name()) + "\", ";
+            o = o + "\"x\": " + SceneDoc.IntStr(e.X()) + ", ";
+            o = o + "\"y\": " + SceneDoc.IntStr(e.Y()) + ", ";
+            o = o + "\"w\": " + SceneDoc.IntStr(e.W()) + ", ";
+            o = o + "\"h\": " + SceneDoc.IntStr(e.H()) + ", ";
+            o = o + "\"anchorX\": " + SceneDoc.IntStr(e.AnchorX()) + ", ";
+            o = o + "\"anchorY\": " + SceneDoc.IntStr(e.AnchorY()) + ", ";
+            o = o + "\"z\": " + SceneDoc.IntStr(e.Z()) + ", ";
+            o = o + "\"image\": \"" + SceneDoc.Esc(e.ImageId()) + "\", ";
+            o = o + "\"text\": \"" + SceneDoc.Esc(e.Text()) + "\", ";
+            o = o + "\"color\": [" + SceneDoc.IntStr(e.R()) + ", " + SceneDoc.IntStr(e.G())
+                + ", " + SceneDoc.IntStr(e.B()) + ", " + SceneDoc.IntStr(e.A()) + "], ";
+            if (e.Visible()) { o = o + "\"visible\": true"; }
+            else { o = o + "\"visible\": false"; }
+            o = o + "}";
+            i = i + 1;
+        }
+        if (this.elements.Count > 0) { o = o + "\n  "; }
+        o = o + "]\n}\n";
+        return o;
+    }
+}
