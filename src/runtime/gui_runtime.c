@@ -335,10 +335,14 @@ EXPORT void zan_gui_fill_rect(i64 surface_id, i64 x, i64 y, i64 w, i64 h, i64 co
             u32 *row = s->pixels + py * s->stride;
             for (int px = x0; px < x1; px++) row[px] = c;
         }
-    } else {
-        for (int py = y0; py < y1; py++)
-            for (int px = x0; px < x1; px++)
-                set_pixel(s, px, py, c);
+    } else if (sa != 0) {
+        /* Rect is already clamped to the clip window, so blend straight into
+         * the row instead of re-clipping every pixel via set_pixel -- these
+         * translucent fills (scrims, hover/selection tints) cover large areas. */
+        for (int py = y0; py < y1; py++) {
+            u32 *row = s->pixels + py * s->stride;
+            for (int px = x0; px < x1; px++) row[px] = blend_over(row[px], c);
+        }
     }
 }
 
