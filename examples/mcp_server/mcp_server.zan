@@ -1,0 +1,212 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Diagnostics;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Threading;
+
+/// Minimal MCP (Model Context Protocol) server for the Zan IDE project,
+/// using the streamable-HTTP transport: external AI tools POST JSON-RPC
+/// to http://127.0.0.1:8848/ (methods: initialize, tools/list, tools/call).
+///
+/// Run it from your project root: zanc run examples/mcp_server/mcp_server.zan
+/// Exposed tools (all sandboxed to the current project root):
+///   list_files(path)          - list a project directory
+///   read_file(path)           - read a project file
+///   write_file(path, content) - write a project file
+///   build()                   - zanc build of src/main.zan (template layout)
+///
+/// SECURITY: binds to localhost only; every path is validated to stay
+/// inside the project root (no absolute paths, no `..` traversal).
+class McpServer {
+    static string root;
+
+    static void Main() {
+        McpServer.root = ".";
+        Console.WriteLine("Zan MCP server: project root = current directory");
+        Console.WriteLine("MCP endpoint: http://127.0.0.1:8848/ (streamable HTTP JSON-RPC)");
+        McpServer.Serve();
+    }
+
+    static async void Serve() {
+        Socket.Initialize();
+        TcpListener listener = TcpListener.Create("127.0.0.1", 8848);
+        listener.Start();
+        while (true) {
+            int clientSock = await listener.AcceptAsync();
+            if (clientSock >= 0) {
+                Task.Spawn(McpServer.HandleConn(clientSock));
+            }
+        }
+    }
+
+    static async void HandleConn(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        bool keepAlive = true;
+        while (keepAlive) {
+            string rawData = await client.RecvReuseAsync();
+            if (rawData.Length == 0) { break; }
+            HttpRequest request = HttpRequest.Parse(rawData);
+            keepAlive = request.keepAlive;
+            HttpResponse response = McpServer.Handle(request);
+            response = response.SetKeepAlive(keepAlive);
+            int _sent = await client.SendAsync(response.Build());
+            if (!keepAlive) { break; }
+        }
+        client.Close();
+    }
+
+    static HttpResponse Handle(HttpRequest req) {
+        if (req.method != "POST") {
+            return HttpResponse.Ok("Zan MCP server. POST JSON-RPC to this endpoint.");
+        }
+        JsonValue v = JsonValue.Parse(req.body);
+        if (v == null) {
+            return McpServer.Json(McpServer.RpcError("null", 0 - 32700, "parse error"));
+        }
+        string id = v.Str("id", "");
+        JsonValue idv = v.Get("id");
+        if (idv != null) { id = idv.AsString(id); }
+        string method = v.Str("method", "");
+        if (method == "initialize") {
+            return McpServer.Json(McpServer.RpcResult(id,
+                "{\"protocolVersion\": \"2024-11-05\", \"capabilities\": {\"tools\": {}}, "
+                + "\"serverInfo\": {\"name\": \"zan-ide-mcp\", \"version\": \"1.0\"}}"));
+        }
+        if (method == "notifications/initialized" || method == "initialized") {
+            return HttpResponse.Ok("");
+        }
+        if (method == "tools/list") {
+            return McpServer.Json(McpServer.RpcResult(id, McpServer.ToolsJson()));
+        }
+        if (method == "tools/call") {
+            JsonValue p = v.Get("params");
+            string name = "";
+            JsonValue targs = null;
+            if (p != null) {
+                name = p.Str("name", "");
+                targs = p.Get("arguments");
+            }
+            string text = McpServer.CallTool(name, targs);
+            return McpServer.Json(McpServer.RpcResult(id,
+                "{\"content\": [{\"type\": \"text\", \"text\": \"" + McpServer.Esc(text) + "\"}]}"));
+        }
+        return McpServer.Json(McpServer.RpcError(id, 0 - 32601, "method not found: " + method));
+    }
+
+    static string CallTool(string name, JsonValue args) {
+        string path = "";
+        if (args != null) { path = args.Str("path", ""); }
+        if (name == "list_files") {
+            string full = McpServer.Safe(path);
+            if (full == "") { return "error: path outside project root"; }
+            List<string> dirs = Directory.GetDirectories(full);
+            List<string> files = Directory.GetFiles(full);
+            StringBuilder sb = new StringBuilder();
+            int i = 0;
+            while (i < dirs.Count) { sb.Append(dirs[i] + "/\n"); i = i + 1; }
+            i = 0;
+            while (i < files.Count) { sb.Append(files[i] + "\n"); i = i + 1; }
+            return sb.ToString();
+        }
+        if (name == "read_file") {
+            string full = McpServer.Safe(path);
+            if (full == "") { return "error: path outside project root"; }
+            if (!File.Exists(full)) { return "error: file not found: " + path; }
+            return File.ReadAllText(full);
+        }
+        if (name == "write_file") {
+            string full = McpServer.Safe(path);
+            if (full == "") { return "error: path outside project root"; }
+            string content = "";
+            if (args != null) { content = args.Str("content", ""); }
+            File.WriteAllText(full, content);
+            return "ok: wrote " + path;
+        }
+        if (name == "build") {
+            List<string> outp = Process.RunCapture(
+                "cd \"" + McpServer.root + "\" && zanc build src/main.zan 2>&1");
+            StringBuilder sb = new StringBuilder();
+            int i = 0;
+            while (i < outp.Count) { sb.Append(outp[i] + "\n"); i = i + 1; }
+            return sb.ToString();
+        }
+        return "error: unknown tool " + name;
+    }
+
+    /// Resolves a project-relative path, rejecting absolute paths and any
+    /// `..` traversal so access stays inside the project root.
+    static string Safe(string rel) {
+        if (rel.Length > 0 && (rel.Substring(0, 1) == "/" || rel.Substring(0, 1) == "\\")) {
+            return "";
+        }
+        if (rel.Length > 1 && rel.Substring(1, 1) == ":") { return ""; }
+        int i = 0;
+        while (i + 1 < rel.Length) {
+            if (rel.Substring(i, 2) == "..") { return ""; }
+            i = i + 1;
+        }
+        if (rel == "..") { return ""; }
+        if (rel == "" || rel == ".") { return McpServer.root; }
+        return McpServer.root + "/" + rel;
+    }
+
+    static string ToolsJson() {
+        string pathProp = "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}";
+        string writeProp = "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}";
+        string noProp = "{\"type\": \"object\", \"properties\": {}}";
+        return "{\"tools\": ["
+            + "{\"name\": \"list_files\", \"description\": \"List a directory inside the Zan project (path is project-relative).\", \"inputSchema\": " + pathProp + "}, "
+            + "{\"name\": \"read_file\", \"description\": \"Read a text file inside the Zan project.\", \"inputSchema\": " + pathProp + "}, "
+            + "{\"name\": \"write_file\", \"description\": \"Write a text file inside the Zan project.\", \"inputSchema\": " + writeProp + "}, "
+            + "{\"name\": \"build\", \"description\": \"Build the Zan project (zanc build src/main.zan) and return the compiler output.\", \"inputSchema\": " + noProp + "}"
+            + "]}";
+    }
+
+    static string RpcResult(string id, string resultJson) {
+        return "{\"jsonrpc\": \"2.0\", \"id\": " + McpServer.IdJson(id)
+            + ", \"result\": " + resultJson + "}";
+    }
+
+    static string RpcError(string id, int code, string msg) {
+        return "{\"jsonrpc\": \"2.0\", \"id\": " + McpServer.IdJson(id)
+            + ", \"error\": {\"code\": " + Convert.ToString(code)
+            + ", \"message\": \"" + McpServer.Esc(msg) + "\"}}";
+    }
+
+    static string IdJson(string id) {
+        if (id == "") { return "null"; }
+        bool numeric = true;
+        int i = 0;
+        while (i < id.Length) {
+            string ch = id.Substring(i, 1);
+            if (ch < "0" || ch > "9") { numeric = false; }
+            i = i + 1;
+        }
+        if (numeric) { return id; }
+        return "\"" + McpServer.Esc(id) + "\"";
+    }
+
+    static string Esc(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\"") { sb.Append("\\\""); }
+            else if (ch == "\\") { sb.Append("\\\\"); }
+            else if (ch == "\n") { sb.Append("\\n"); }
+            else if (ch == "\r") { sb.Append("\\r"); }
+            else if (ch == "\t") { sb.Append("\\t"); }
+            else { sb.Append(ch); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static HttpResponse Json(string body) {
+        HttpResponse r = HttpResponse.Ok(body);
+        r.SetHeader("Content-Type", "application/json");
+        return r;
+    }
+}
