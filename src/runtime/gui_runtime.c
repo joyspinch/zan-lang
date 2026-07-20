@@ -2908,27 +2908,7 @@ EXPORT i64 zan_gui_present(i64 hwnd_val, i64 surface_id) {
         SDL_SetTextureScaleMode(rec->tex, SDL_SCALEMODE_NEAREST);
         rec->tw = s->width; rec->th = s->height;
     }
-    /* Write straight into the streaming texture's staging memory. This avoids
-     * the extra internal copy SDL_UpdateTexture makes of the whole frame every
-     * present -- meaningful for a full-window ARGB buffer during interaction. */
-    void *lockpix = NULL;
-    int lockpitch = 0;
-    if (SDL_LockTexture(rec->tex, NULL, &lockpix, &lockpitch)) {
-        int rowbytes = s->width * 4;
-        if (lockpitch == rowbytes) {
-            memcpy(lockpix, s->pixels, (size_t)rowbytes * s->height);
-        } else {
-            unsigned char *dstp = (unsigned char *)lockpix;
-            const unsigned char *srcp = (const unsigned char *)s->pixels;
-            for (int row = 0; row < s->height; row++) {
-                memcpy(dstp + (size_t)row * lockpitch,
-                       srcp + (size_t)row * rowbytes, (size_t)rowbytes);
-            }
-        }
-        SDL_UnlockTexture(rec->tex);
-    } else {
-        SDL_UpdateTexture(rec->tex, NULL, s->pixels, s->width * 4);
-    }
+    SDL_UpdateTexture(rec->tex, NULL, s->pixels, s->width * 4);
 
     /* Clear the (possibly larger) window to the canvas background so a live
      * grow-resize shows solid bg rather than stretched/garbage pixels, then
