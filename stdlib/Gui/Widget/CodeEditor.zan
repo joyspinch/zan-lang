@@ -3444,7 +3444,9 @@ class CodeEditor {
         if (m == 0) { return true; }
         int i = 0;
         while (i + m <= n) {
-            if (hay.Substring(i, m) == needle) { return true; }
+            int k = 0;
+            while (k < m && hay[i + k] == needle[k]) { k = k + 1; }
+            if (k == m) { return true; }
             i = i + 1;
         }
         return false;
@@ -3519,72 +3521,63 @@ class CodeEditor {
     /// outT/outC lists) using the given palette.
     static void HighlightSpans(string line, int kwC, int tyC, int strC,
             int comC, int numC, int def, List<string> outT, List<int> outC) {
-        string lower = "abcdefghijklmnopqrstuvwxyz";
-        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        string digits = "0123456789";
-        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        // Classify by raw byte code (line[i]) and emit each token with a single
+        // Substring, instead of allocating a one-char string per byte and
+        // scanning character sets. ASCII identifiers/keywords/numbers/strings
+        // are recognised by byte range; any byte >= 128 (UTF-8 multibyte text)
+        // falls into the default run exactly as before.
         int n = line.Length;
         int i = 0;
-        string pending = "";
+        int pstart = -1;   // start of the current default-colored run, -1 = none
         while (i < n) {
-            string ch = line.Substring(i, 1);
-            if (ch == "/" && i + 1 < n && line.Substring(i + 1, 1) == "/") {
-                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+            int b = line[i];
+            if (b == 47 && i + 1 < n && line[i + 1] == 47) {          // "//" comment
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
                 outT.Add(line.Substring(i, n - i)); outC.Add(comC);
                 i = n;
-            } else if (ch == "\"") {
-                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+            } else if (b == 34) {                                      // string literal
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
                 int j = i + 1;
-                string s = "\"";
                 while (j < n) {
-                    string cj = line.Substring(j, 1);
-                    if (cj == "\\" && j + 1 < n) {
-                        s = s + cj + line.Substring(j + 1, 1);
-                        j = j + 2;
-                    } else if (cj == "\"") {
-                        s = s + cj;
-                        j = j + 1;
-                        break;
-                    } else {
-                        s = s + cj;
-                        j = j + 1;
-                    }
+                    int cj = line[j];
+                    if (cj == 92 && j + 1 < n) { j = j + 2; }
+                    else if (cj == 34) { j = j + 1; break; }
+                    else { j = j + 1; }
                 }
-                outT.Add(s); outC.Add(strC);
+                outT.Add(line.Substring(i, j - i)); outC.Add(strC);
                 i = j;
-            } else if (CodeEditor.InSet(digits, ch)) {
-                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
+            } else if (b >= 48 && b <= 57) {                          // number
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
                 int j = i;
-                string num = "";
                 while (j < n) {
-                    string cj = line.Substring(j, 1);
-                    if (CodeEditor.InSet(digits, cj) || cj == "." || cj == "x"
-                        || CodeEditor.InSet("abcdefABCDEF", cj)) {
-                        num = num + cj; j = j + 1;
-                    } else { break; }
-                }
-                outT.Add(num); outC.Add(numC);
-                i = j;
-            } else if (CodeEditor.InSet(lower + upper + "_", ch)) {
-                if (pending.Length > 0) { outT.Add(pending); outC.Add(def); pending = ""; }
-                int j = i;
-                string w = "";
-                while (j < n) {
-                    string cj = line.Substring(j, 1);
-                    if (CodeEditor.InSet(idrest, cj)) { w = w + cj; j = j + 1; }
+                    int cj = line[j];
+                    bool hex = (cj >= 97 && cj <= 102) || (cj >= 65 && cj <= 70);
+                    if ((cj >= 48 && cj <= 57) || cj == 46 || cj == 120 || hex) { j = j + 1; }
                     else { break; }
                 }
+                outT.Add(line.Substring(i, j - i)); outC.Add(numC);
+                i = j;
+            } else if ((b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95) { // identifier
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                int j = i;
+                while (j < n) {
+                    int cj = line[j];
+                    if ((cj >= 97 && cj <= 122) || (cj >= 65 && cj <= 90)
+                        || (cj >= 48 && cj <= 57) || cj == 95) { j = j + 1; }
+                    else { break; }
+                }
+                string w = line.Substring(i, j - i);
                 int col = def;
                 if (CodeEditor.IsKeyword(w)) { col = kwC; }
-                else if (CodeEditor.InSet(upper, line.Substring(i, 1))) { col = tyC; }
+                else if (b >= 65 && b <= 90) { col = tyC; }
                 outT.Add(w); outC.Add(col);
                 i = j;
             } else {
-                pending = pending + ch;
+                if (pstart < 0) { pstart = i; }
                 i = i + 1;
             }
         }
-        if (pending.Length > 0) { outT.Add(pending); outC.Add(def); }
+        if (pstart >= 0) { outT.Add(line.Substring(pstart, n - pstart)); outC.Add(def); }
     }
 
     /// A background is "light" when its RGB channels are collectively bright;
