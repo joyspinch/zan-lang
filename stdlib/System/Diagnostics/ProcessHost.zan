@@ -1,0 +1,142 @@
+using System;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// Process/daemon supervision as a standard-library capability. This is the
+/// portable, dependency-free core behind "workerman-style" servers: identify
+/// the running process, locate its own executable, detach as a Unix daemon, and
+/// launch worker copies of itself that share a listening port via SO_REUSEPORT.
+///
+/// It deliberately owns ONLY the process/OS plumbing. Binding, SO_REUSEPORT and
+/// the accept loop live in the socket/server layer; a server framework wires the
+/// two together (see the server templates' Server.Run). Restart-on-crash is left
+/// to an external supervisor (systemd `Restart=always`, Docker
+/// `restart: unless-stopped`, Kubernetes) -- the standard way to keep
+/// horizontally scaled services alive -- rather than reimplemented here.
+///
+/// PLATFORM SUPPORT:
+///   - Pid / Env / SelfExe / WorkerId / IsWorker: all platforms.
+///   - Daemonize (setsid detach): Linux only; a no-op that returns false
+///     elsewhere so callers keep running in the foreground.
+///   - SpawnWorkers (SO_REUSEPORT multi-process): Linux/macOS. Windows has no
+///     SO_REUSEPORT connection load-balancing, so SpawnWorkers is a no-op there
+///     and MultiProcessSupported() returns false; callers should run a single
+///     process (managed instead by IIS/NSSM/a Windows service if needed).
+/// </summary>
+class ProcessHost {
+    static extern string getenv(string name);
+    static extern string calloc(int count, int size);
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    static extern int GetCurrentProcessId();
+    [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
+    static extern int GetModuleFileNameA(int hModule, string buf, int size);
+    #elif LINUX
+    static extern int getpid();
+    static extern int readlink(string path, string buf, int size);
+    #elif MACOS
+    static extern int getpid();
+    #endif
+
+    /// <summary>PID of the current process.</summary>
+    static int Pid() {
+        #if WINDOWS
+        return GetCurrentProcessId();
+        #else
+        return getpid();
+        #endif
+    }
+
+    /// <summary>Reads an environment variable, returning "" when unset (instead
+    /// of a null pointer) so call sites can compare against "" safely.</summary>
+    static string Env(string name) {
+        string v = getenv(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+
+    /// <summary>Best-effort absolute path of the running executable, used to
+    /// re-launch worker copies of ourselves. Returns "" when it cannot be
+    /// determined (macOS/others), in which case callers run single-process.</summary>
+    static string SelfExe() {
+        string buf = calloc(4097, 1);
+        #if WINDOWS
+        GetModuleFileNameA(0, buf, 4096);
+        #elif LINUX
+        int n = readlink("/proc/self/exe", buf, 4096);
+        if (n > 0) { buf[n] = 0; }
+        #endif
+        return buf;
+    }
+
+    /// <summary>Worker index for this process: 0 for the master, N for a spawned
+    /// worker (via the ZAN_WORKER_ID env var set by SpawnWorkers).</summary>
+    static int WorkerId() {
+        string v = ProcessHost.Env("ZAN_WORKER_ID");
+        if (v == "") { return 0; }
+        return Convert.ToInt32(v);
+    }
+
+    /// <summary>True when this process was launched as a worker by SpawnWorkers
+    /// (i.e. ZAN_WORKER_ID is set), false for the master/standalone process.</summary>
+    static bool IsWorker() {
+        return ProcessHost.Env("ZAN_WORKER_ID") != "";
+    }
+
+    /// <summary>Whether SO_REUSEPORT multi-process workers are supported on this
+    /// platform (Linux/macOS yes, Windows no).</summary>
+    static bool MultiProcessSupported() {
+        #if WINDOWS
+        return false;
+        #else
+        return true;
+        #endif
+    }
+
+    /// <summary>
+    /// Detaches into a background daemon on Linux (double via setsid). Returns
+    /// TRUE in the ORIGINAL foreground process, which should then exit; the
+    /// detached child re-runs the program with ZAN_DAEMON=1 set so this call
+    /// becomes a no-op the second time. On non-Linux, or if the executable path
+    /// cannot be found, returns FALSE and the caller keeps running normally.
+    /// </summary>
+    static bool Daemonize() {
+        #if LINUX
+        if (ProcessHost.IsWorker()) { return false; }
+        if (ProcessHost.Env("ZAN_DAEMON") != "") { return false; }
+        string exe = ProcessHost.SelfExe();
+        if (exe == "") { return false; }
+        Process.RunDetached("ZAN_DAEMON=1 setsid \"" + exe + "\"");
+        return true;
+        #else
+        return false;
+        #endif
+    }
+
+    /// <summary>
+    /// Launches (count-1) additional worker processes that re-run this same
+    /// executable with ZAN_WORKER_ID=1..count-1. Combined with a listener bound
+    /// using SO_REUSEPORT, the OS kernel then load-balances incoming connections
+    /// across the master (worker 0) and every spawned worker. Returns the number
+    /// of workers actually spawned (0 when unsupported, count<=1, or the
+    /// executable path is unknown -- caller then runs single-process).
+    /// </summary>
+    static int SpawnWorkers(int count) {
+        if (count <= 1) { return 0; }
+        if (!ProcessHost.MultiProcessSupported()) { return 0; }
+        if (ProcessHost.IsWorker()) { return 0; }
+        string exe = ProcessHost.SelfExe();
+        if (exe == "") { return 0; }
+        int spawned = 0;
+        int i = 1;
+        while (i < count) {
+            Process.RunDetached("ZAN_WORKER_ID=" + Convert.ToString(i)
+                + " \"" + exe + "\"");
+            spawned = spawned + 1;
+            i = i + 1;
+        }
+        return spawned;
+    }
+}

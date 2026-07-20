@@ -4,127 +4,60 @@ using System.Diagnostics;
 namespace ZanWeb;
 
 /// <summary>
-/// Server bootstrap with an optional multi-worker mode (workerman-style).
+/// Server bootstrap. All of the process/daemon/worker plumbing now lives in the
+/// standard library (System.Diagnostics.ProcessHost); this class only reads the
+/// [worker] config section and wires ProcessHost to the WebApp accept loop.
 ///
 /// worker.count = 1  (default): a single process runs the coroutine event loop
 ///   -- each connection is already handled in its own coroutine, so one worker
-///   scales to many thousands of concurrent connections. This is what you want
-///   in development (logs stream straight into the IDE terminal).
+///   scales to many thousands of concurrent connections. Best for development
+///   (logs stream straight into the IDE terminal).
 ///
-/// worker.count > 1: the master binds with SO_REUSEPORT and re-launches itself
-///   as (count-1) additional worker processes that bind the SAME port; the OS
-///   kernel then load-balances accepted connections across all workers, using
-///   every CPU core. This is a Linux/macOS capability -- Windows has no
-///   SO_REUSEPORT load-balancing, so it falls back to a single process there.
+/// worker.count > 1: on Linux/macOS the master binds with SO_REUSEPORT and
+///   ProcessHost.SpawnWorkers re-launches (count-1) copies of this executable
+///   that bind the SAME port; the kernel load-balances connections across all
+///   workers, using every CPU core. Windows has no SO_REUSEPORT load-balancing,
+///   so it transparently falls back to a single process.
 ///
-/// worker.daemon = true (Linux): the process detaches from the controlling
-///   terminal (setsid) and keeps running in the background.
+/// worker.daemon = true (Linux): ProcessHost.Daemonize() detaches from the
+///   controlling terminal (setsid) and keeps running in the background.
 ///
-/// Automatic restart-on-crash is intentionally delegated to the process
-/// supervisor (systemd `Restart=always`, Docker `restart: unless-stopped`,
-/// Kubernetes, etc.), which is the standard way to supervise horizontally
-/// scaled services.
+/// Restart-on-crash is delegated to the process supervisor (systemd
+/// `Restart=always`, Docker `restart: unless-stopped`, Kubernetes) -- the
+/// standard way to supervise horizontally scaled services.
 /// </summary>
 class Server {
-    static extern string getenv(string name);
-    static extern string calloc(int count, int size);
-
-    #if WINDOWS
-    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
-    static extern int GetCurrentProcessId();
-    [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
-    static extern int GetModuleFileNameA(int hModule, string buf, int size);
-    #elif LINUX
-    static extern int getpid();
-    static extern int readlink(string path, string buf, int size);
-    #elif MACOS
-    static extern int getpid();
-    #endif
-
-    static int Pid() {
-        #if WINDOWS
-        return GetCurrentProcessId();
-        #else
-        return getpid();
-        #endif
-    }
-
-    static string Env(string name) {
-        string v = getenv(name);
-        if (v == null) { return ""; }
-        return v;
-    }
-
-    /// <summary>Best-effort absolute path of the running executable, used to
-    /// re-launch worker copies of ourselves. Returns "" when it cannot be
-    /// determined (then the server runs single-process).</summary>
-    static string SelfExe() {
-        string buf = calloc(4097, 1);
-        #if WINDOWS
-        GetModuleFileNameA(0, buf, 4096);
-        #elif LINUX
-        int n = readlink("/proc/self/exe", buf, 4096);
-        if (n > 0) { buf[n] = 0; }
-        #endif
-        return buf;
-    }
-
-    static void SpawnWorker(string exe, int id) {
-        if (exe == "") { return; }
-        #if WINDOWS
-        Process.RunDetached("set ZAN_WORKER_ID=" + Convert.ToString(id)
-            + " && \"" + exe + "\"");
-        #else
-        Process.RunDetached("ZAN_WORKER_ID=" + Convert.ToString(id)
-            + " \"" + exe + "\"");
-        #endif
-    }
-
     /// <summary>Boots the server according to the [worker] config section and
     /// then runs the accept loop. Await this from Main.</summary>
     static async int Run(WebApp app) {
         int count = Config.Int("worker", "count", 1);
         bool daemon = Config.Bool("worker", "daemon", false);
-        bool isWorker = Server.Env("ZAN_WORKER_ID") != "";
 
-        #if WINDOWS
-        if (!isWorker && count > 1) {
+        if (count > 1 && !ProcessHost.MultiProcessSupported() && !ProcessHost.IsWorker()) {
             Console.WriteLine("[server] SO_REUSEPORT multi-worker is Linux/macOS-only; "
-                + "running a single process on Windows.");
+                + "running a single process on this platform.");
             count = 1;
         }
-        #endif
 
-        #if LINUX
-        if (daemon && !isWorker && Server.Env("ZAN_DAEMON") == "") {
-            string dexe = Server.SelfExe();
-            if (dexe != "") {
-                Process.RunDetached("ZAN_DAEMON=1 setsid \"" + dexe + "\"");
-                Console.WriteLine("[server] daemonized; parent process exiting.");
-                return 0;
-            }
+        if (daemon && ProcessHost.Daemonize()) {
+            Console.WriteLine("[server] daemonized; parent process exiting.");
+            return 0;
         }
-        #endif
 
         if (count > 1) {
             app.ReusePort(true);
-            if (isWorker) {
-                Console.WriteLine("[worker " + Server.Env("ZAN_WORKER_ID") + "] pid="
-                    + Convert.ToString(Server.Pid()) + " serving.");
+            if (ProcessHost.IsWorker()) {
+                Console.WriteLine("[worker " + Convert.ToString(ProcessHost.WorkerId())
+                    + "] pid=" + Convert.ToString(ProcessHost.Pid()) + " serving.");
             } else {
-                string exe = Server.SelfExe();
-                if (exe == "") {
-                    Console.WriteLine("[server] cannot locate own executable; "
-                        + "running a single worker.");
+                int spawned = ProcessHost.SpawnWorkers(count);
+                if (spawned == 0) {
+                    Console.WriteLine("[server] could not spawn workers; "
+                        + "running a single process.");
                 } else {
-                    int i = 1;
-                    while (i < count) {
-                        Server.SpawnWorker(exe, i);
-                        i = i + 1;
-                    }
-                    Console.WriteLine("[master] pid=" + Convert.ToString(Server.Pid())
-                        + " serving as worker 0; spawned "
-                        + Convert.ToString(count - 1) + " more (SO_REUSEPORT).");
+                    Console.WriteLine("[master] pid=" + Convert.ToString(ProcessHost.Pid())
+                        + " serving as worker 0; spawned " + Convert.ToString(spawned)
+                        + " more (SO_REUSEPORT).");
                 }
             }
         }
