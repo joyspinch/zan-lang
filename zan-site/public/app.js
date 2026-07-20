@@ -208,7 +208,7 @@
       W = cv.clientWidth; H = cv.clientHeight;
       cv.width = W * dpr; cv.height = H * dpr;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      var count = Math.max(28, Math.min(92, Math.round((W * H) / 15000)));
+      var count = Math.max(20, Math.min(60, Math.round((W * H) / 26000)));
       pts = [];
       for (var i = 0; i < count; i++) {
         pts.push({
@@ -255,6 +255,70 @@
     }
     if (reduce) { draw(false); return; }
     (function loop() { if (!document.hidden) draw(true); requestAnimationFrame(loop); })();
+  })();
+
+  // ===== live IDE demo: type code → build → run native window =====
+  (function () {
+    var stage = document.getElementById("demo");
+    if (!stage) return;
+    var codeEl = document.getElementById("typeCode");
+    var lines = [].slice.call(codeEl.querySelectorAll(".cline"));
+    var status = stage.querySelector(".ide-status");
+    var build = document.getElementById("buildState");
+    var appwin = document.getElementById("appwin");
+    var appLabel = document.getElementById("appLabel");
+    var runBtn = stage.querySelector(".run-btn");
+    var OK = '<span class="zh">就绪</span><span class="en">Ready</span>';
+    var BUILDING = '<span class="zh">构建中…</span><span class="en">Building…</span>';
+    var RUNNING = '<span class="zh">运行中 ▶</span><span class="en">Running ▶</span>';
+    var timers = [], counter = 0, n = 0;
+    function label(v) { appLabel.innerHTML = '<span class="zh">点击了 ' + v + ' 次</span><span class="en">clicked ' + v + '</span>'; }
+    function clearT() { timers.forEach(clearTimeout); timers = []; clearInterval(counter); }
+    function later(fn, ms) { var t = setTimeout(fn, ms); timers.push(t); return t; }
+
+    function reset() {
+      clearT();
+      lines.forEach(function (l) { l.classList.remove("shown", "active"); });
+      status.classList.remove("building", "running");
+      build.innerHTML = OK;
+      stage.classList.remove("running");
+      appwin.classList.remove("run");
+      n = 0; label(0);
+    }
+    function type() {
+      reset();
+      var i = 0;
+      (function step() {
+        if (i > 0) lines[i - 1].classList.remove("active");
+        if (i < lines.length) {
+          lines[i].classList.add("shown", "active");
+          i++;
+          later(step, 120 + Math.random() * 130);
+        } else {
+          lines[lines.length - 1].classList.remove("active");
+          later(doBuild, 380);
+        }
+      })();
+    }
+    function doBuild() {
+      status.classList.add("building"); build.innerHTML = BUILDING;
+      later(doRun, 1050);
+    }
+    function doRun() {
+      status.classList.remove("building"); status.classList.add("running");
+      build.innerHTML = RUNNING; stage.classList.add("running"); appwin.classList.add("run");
+      counter = setInterval(function () { n++; label(n); }, 2600);
+      later(function () { type(); }, 8200);
+    }
+
+    if (reduce) {
+      lines.forEach(function (l) { l.classList.add("shown"); });
+      status.classList.add("running"); build.innerHTML = RUNNING;
+      stage.classList.add("running"); appwin.classList.add("run"); label(3);
+      return;
+    }
+    if (runBtn) runBtn.addEventListener("click", type);
+    type();
   })();
 
   // ===== Docs sidebar: scrollspy + filter =====
