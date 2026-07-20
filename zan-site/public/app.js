@@ -80,4 +80,87 @@
   } else {
     document.querySelectorAll(".reveal").forEach(function (el) { el.classList.add("in"); });
   }
+
+  // ===== Download modal (surface the access code prominently) =====
+  var modal = document.getElementById("dlModal");
+  if (modal) {
+    var open = function (e) { if (e) e.preventDefault(); modal.classList.add("open"); };
+    var close = function () { modal.classList.remove("open"); };
+    document.querySelectorAll("[data-download]").forEach(function (b) {
+      b.addEventListener("click", open);
+    });
+    modal.addEventListener("click", function (e) { if (e.target === modal) close(); });
+    var xBtn = modal.querySelector(".modal-x");
+    if (xBtn) xBtn.addEventListener("click", close);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") close(); });
+    var copyBtn = modal.querySelector(".copy-btn");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", function () {
+        var code = copyBtn.getAttribute("data-copy") || "zanlang";
+        var done = function () {
+          copyBtn.classList.add("done");
+          copyBtn.setAttribute("data-copied", "1");
+          setTimeout(function () { copyBtn.classList.remove("done"); }, 1600);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(code).then(done, done);
+        } else {
+          var ta = document.createElement("textarea");
+          ta.value = code; document.body.appendChild(ta); ta.select();
+          try { document.execCommand("copy"); } catch (e) {}
+          document.body.removeChild(ta); done();
+        }
+      });
+    }
+  }
+
+  // ===== Animated counters =====
+  var counters = document.querySelectorAll("[data-count]");
+  if (counters.length && "IntersectionObserver" in window) {
+    var cio = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (!en.isIntersecting) return;
+        var el = en.target, target = parseInt(el.getAttribute("data-count"), 10) || 0, t0 = null;
+        var step = function (ts) {
+          if (!t0) t0 = ts;
+          var p = Math.min((ts - t0) / 900, 1);
+          el.textContent = Math.floor(p * p * (3 - 2 * p) * target).toString();
+          if (p < 1) requestAnimationFrame(step); else el.textContent = target.toString();
+        };
+        requestAnimationFrame(step);
+        cio.unobserve(el);
+      });
+    }, { threshold: 0.5 });
+    counters.forEach(function (el) { cio.observe(el); });
+  }
+
+  // ===== Docs sidebar: scrollspy + filter =====
+  var docSide = document.querySelector(".doc-side");
+  if (docSide) {
+    var links = [].slice.call(docSide.querySelectorAll("a[href^='#']"));
+    var secs = links.map(function (a) { return document.getElementById(a.getAttribute("href").slice(1)); });
+    var spy = function () {
+      var y = window.scrollY + 160, idx = 0;
+      for (var i = 0; i < secs.length; i++) { if (secs[i] && secs[i].offsetTop <= y) idx = i; }
+      links.forEach(function (a, i) { a.classList.toggle("active", i === idx); });
+    };
+    window.addEventListener("scroll", spy, { passive: true });
+    spy();
+    // filter box
+    var box = document.getElementById("docSearch");
+    if (box) {
+      box.addEventListener("input", function () {
+        var q = box.value.trim().toLowerCase();
+        var groups = docSide.querySelectorAll("[data-grp]");
+        links.forEach(function (a) {
+          var hit = !q || a.textContent.toLowerCase().indexOf(q) >= 0;
+          a.style.display = hit ? "" : "none";
+        });
+        groups.forEach(function (g) {
+          var any = [].slice.call(g.querySelectorAll("a")).some(function (a) { return a.style.display !== "none"; });
+          g.style.display = any ? "" : "none";
+        });
+      });
+    }
+  }
 })();
