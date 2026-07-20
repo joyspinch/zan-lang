@@ -52,6 +52,23 @@
     if (initial && document.getElementById(initial)) { showSec(initial); }
   }
 
+  // Nav shadow on scroll
+  var nav = document.querySelector(".nav");
+  if (nav) {
+    var onScroll = function () { nav.classList.toggle("scrolled", window.scrollY > 8); };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+  }
+
+  // Card spotlight (mouse-follow)
+  document.querySelectorAll(".card").forEach(function (card) {
+    card.addEventListener("pointermove", function (e) {
+      var r = card.getBoundingClientRect();
+      card.style.setProperty("--mx", (e.clientX - r.left) + "px");
+      card.style.setProperty("--my", (e.clientY - r.top) + "px");
+    });
+  });
+
   // Scroll reveal
   if ("IntersectionObserver" in window) {
     var io = new IntersectionObserver(function (entries) {
