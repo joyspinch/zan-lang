@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Net.Sockets;
 using System.Net.Http;
+using System.Diagnostics;
 
 namespace ZanWeb;
 
@@ -41,6 +42,7 @@ class WebApp {
     Sessions sessions;
     RateLimiter limiter;
     RouteStats stats;
+    ServerMetrics metrics;
 
     int maxBodyBytes;      // in-memory request body cap (413 above this)
     int maxUploadBytes;    // streaming upload cap for .Upload() routes
@@ -61,6 +63,7 @@ class WebApp {
         this.sessions = Sessions.Create();
         this.limiter = RateLimiter.Create(1);
         this.stats = RouteStats.Create();
+        this.metrics = ServerMetrics.Global();
         this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
         this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
         this.uploadDir = "uploads";
@@ -262,10 +265,20 @@ class WebApp {
         return sb.ToString();
     }
 
-    /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.</summary>
+    /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.
+    /// Times the whole pipeline with a monotonic ms clock and feeds the shared
+    /// ServerMetrics (throughput / latency / slow requests) for /admin/stats.</summary>
     string Dispatch(HttpContext ctx, Route route, bool keepAlive) {
-        int startedAt = WebApp.NowSeconds();
+        int startMs = ServerMetrics.MonoMillis();
         this.totalRequests = this.totalRequests + 1;
+        string resp = this.DispatchInner(ctx, route, keepAlive, startMs);
+        int elapsedMs = ServerMetrics.MonoMillis() - startMs;
+        this.metrics.RecordRequest(ctx.method, ctx.path, ctx.status, elapsedMs);
+        return resp;
+    }
+
+    string DispatchInner(HttpContext ctx, Route route, bool keepAlive, int startMs) {
+        int startedAt = WebApp.NowSeconds();
 
         // Global rate limit (per second across all routes).
         if (this.globalLimit > 0
@@ -319,9 +332,9 @@ class WebApp {
             ctx.Json("{\"code\":\"500\",\"msg\":\"handler produced no response\"}");
         }
 
-        int elapsed = WebApp.NowSeconds() - startedAt;
-        this.stats.Record(routeKey, elapsed * 1000);
-        this.hooks.RunAfter(ctx, elapsed * 1000);
+        int elapsedMs = ServerMetrics.MonoMillis() - startMs;
+        this.stats.Record(routeKey, elapsedMs);
+        this.hooks.RunAfter(ctx, elapsedMs);
         return ctx.BuildResponse(keepAlive);
     }
 
@@ -342,6 +355,12 @@ class WebApp {
         return "{\"total_requests\":" + Convert.ToString(this.totalRequests)
             + ",\"active_connections\":" + Convert.ToString(this.activeConnections)
             + ",\"routes\":" + this.stats.ToJson() + "}";
+    }
+
+    /// <summary>Full runtime metrics snapshot (CPU, memory, request + query
+    /// throughput/latency, slow-request and slow-query rings) for /admin/stats.</summary>
+    string MetricsJson() {
+        return this.metrics.SnapshotJson();
     }
 
     static string SimpleResponse(int code, string text, string msg) {

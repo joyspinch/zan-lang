@@ -81,7 +81,41 @@ Set `worker.count` in `config/app.json`:
 Restart-on-crash is delegated to the process supervisor (systemd
 `Restart=always`, Docker `restart: unless-stopped`, Kubernetes), the standard
 way to supervise horizontally scaled services. `main.zan` boots via
-`Server.Run(app)` (see `src/framework/Server.zan`).
+`Server.Run(app)` (see `src/framework/Server.zan`), which is now a thin wrapper
+over the standard library: PID/exe discovery, daemonization (`setsid`) and
+`SO_REUSEPORT` worker spawning all live in `System.Diagnostics.ProcessHost`, so
+the same capability is available to any server, not just this template.
+
+## Observability (`GET /admin/stats`)
+
+The request lifecycle and database queries are instrumented into the shared
+`System.Diagnostics.ServerMetrics` singleton, exposed as JSON at
+`/admin/stats`:
+
+```json
+{
+  "uptime_ms": 2015, "pid": 31084, "worker_id": 0,
+  "cpu_ms": 31, "cpu_percent": 1, "mem_rss_bytes": 6852608,
+  "requests": {"count":4,"errors":2,"avg_ms":3,"max_ms":15,
+               "slow_threshold_ms":500,"slow_count":0},
+  "queries":  {"count":2,"avg_ms":6,"max_ms":8,
+               "slow_threshold_ms":200,"slow_count":0},
+  "slow_requests": [{"req":"GET /slow -> 200","ms":750}],
+  "slow_queries":  [{"sql":"SELECT * FROM huge_join","ms":320}]
+}
+```
+
+- `cpu_ms` / `cpu_percent` / `mem_rss_bytes` are read from the OS
+  (Windows `GetProcessTimes`/`GetProcessMemoryInfo`, Linux `/proc/self`). On a
+  platform where a probe is unavailable the field reports `-1` (not a fake
+  zero). `cpu_percent` is a delta between successive polls — poll on a fixed
+  interval for a meaningful value.
+- Request throughput/latency/errors and the last 32 **slow requests** are
+  recorded for every request; database query throughput/latency and the last
+  32 **slow queries** are recorded around model DB calls. Adjust thresholds via
+  `ServerMetrics.Global().SlowRequestMs(...)` / `.SlowQueryMs(...)`.
+- **Security:** `/admin/stats` leaks internal timing/paths. Guard it with
+  `.Auth()`, an IP allow-list, or a separate admin bind before exposing it.
 
 ## Run
 
@@ -98,6 +132,7 @@ zanc src/main.zan src/**/*.zan --stdlib-path <stdlib> -o app.exe
 - `GET /users` — ORM + cache demo (503 until a database is configured)
 - `GET /user/{id}` — route parameter demo (JSON envelope)
 - `GET /api/status` — request statistics
+- `GET /admin/stats` — runtime diagnostics (CPU, memory, requests, slow requests/queries) — **protect before exposing**
 - `POST /api/echo` — rate-limited (100 req/s) echo
 - `POST /api/login` — `user=admin&pass=admin` issues a session token
 - `GET /api/me` — requires `Authorization: Bearer <token>` or session cookie

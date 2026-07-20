@@ -1,0 +1,359 @@
+using System;
+using System.IO;
+
+namespace System.Diagnostics;
+
+/// <summary>
+/// Runtime observability for long-running servers, as a standard-library
+/// capability. It combines two things:
+///
+///   1. Portable OS probes -- a monotonic millisecond clock, process CPU time
+///      and process resident memory -- so callers do not need their own
+///      platform #if blocks.
+///   2. An in-process aggregator (a shared singleton via Global()) that records
+///      request and database-query throughput/latency, keeps a ring buffer of
+///      the most recent SLOW requests and SLOW queries, and emits the whole
+///      thing as JSON for a /admin/stats-style endpoint.
+///
+/// PLATFORM SUPPORT for the OS probes:
+///   - MonoMillis: all platforms (GetTickCount64 on Windows, gettimeofday
+///     elsewhere).
+///   - CpuMillis:  Windows (GetProcessTimes) and Linux (/proc/self/stat).
+///     Returns -1 on platforms where it cannot be read (e.g. macOS here).
+///   - MemoryRssBytes: Windows (GetProcessMemoryInfo) and Linux
+///     (/proc/self/statm). Returns -1 elsewhere.
+/// Counters/latency/slow-lists are exact on every platform (pure in-memory).
+/// The JSON reports -1 for any probe unavailable on the current OS, so callers
+/// can tell "not measured" apart from a real zero.
+/// </summary>
+class ServerMetrics {
+    static extern string calloc(int count, int size);
+    static extern void free(string ptr);
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetTickCount64")]
+    static extern int GetTickCount64();
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcess")]
+    static extern int GetCurrentProcess();
+    [DllImport("kernel32", EntryPoint = "GetProcessTimes")]
+    static extern int GetProcessTimes(int h, string cre, string ex, string kern, string usr);
+    [DllImport("psapi", EntryPoint = "GetProcessMemoryInfo")]
+    static extern int GetProcessMemoryInfo(int h, string counters, int cb);
+    #else
+    [DllImport("crt", EntryPoint = "gettimeofday")]
+    static extern int gettimeofday(string tv, int tz);
+    #endif
+
+    // Aggregated request metrics.
+    int reqCount;
+    int reqErrors;
+    int reqTotalMs;
+    int reqMaxMs;
+    int slowReqMs;                 // slow-request threshold (ms)
+    List<string> slowReqInfo;      // "METHOD path -> status"
+    List<int> slowReqMsList;
+
+    // Aggregated query metrics.
+    int queryCount;
+    int queryTotalMs;
+    int queryMaxMs;
+    int slowQueryMs;               // slow-query threshold (ms)
+    List<string> slowQuerySql;
+    List<int> slowQueryMsList;
+
+    int startMillis;
+    int lastWallMs;                // for CPU% delta sampling
+    int lastCpuMs;
+    int ringCap;
+
+    ServerMetrics() {
+        this.reqCount = 0;
+        this.reqErrors = 0;
+        this.reqTotalMs = 0;
+        this.reqMaxMs = 0;
+        this.slowReqMs = 500;
+        this.slowReqInfo = new List<string>();
+        this.slowReqMsList = new List<int>();
+        this.queryCount = 0;
+        this.queryTotalMs = 0;
+        this.queryMaxMs = 0;
+        this.slowQueryMs = 200;
+        this.slowQuerySql = new List<string>();
+        this.slowQueryMsList = new List<int>();
+        this.startMillis = ServerMetrics.MonoMillis();
+        this.lastWallMs = this.startMillis;
+        this.lastCpuMs = 0;
+        this.ringCap = 32;
+    }
+
+    // ---- shared singleton ----
+    static ServerMetrics inst;
+    static ServerMetrics Global() {
+        if (inst == null) { inst = new ServerMetrics(); }
+        return inst;
+    }
+
+    ServerMetrics SlowRequestMs(int ms) { this.slowReqMs = ms; return this; }
+    ServerMetrics SlowQueryMs(int ms) { this.slowQueryMs = ms; return this; }
+
+    // ---- OS probes ----
+
+    static int LeInt(string buf, int off, int n) {
+        int v = 0;
+        int mul = 1;
+        int k = 0;
+        while (k < n) {
+            v = v + (buf[off + k] & 255) * mul;
+            mul = mul * 256;
+            k = k + 1;
+        }
+        return v;
+    }
+
+    /// <summary>Monotonic wall-clock milliseconds (not affected by clock resets
+    /// the way a seconds epoch is); use deltas, not the absolute value.</summary>
+    static int MonoMillis() {
+        #if WINDOWS
+        return GetTickCount64();
+        #else
+        string tv = calloc(16, 1);
+        int r = gettimeofday(tv, 0);
+        int sec = ServerMetrics.LeInt(tv, 0, 8);
+        int usec = ServerMetrics.LeInt(tv, 8, 8);
+        free(tv);
+        return sec * 1000 + usec / 1000;
+        #endif
+    }
+
+    /// <summary>Cumulative process CPU time in ms (user+kernel), or -1 if the
+    /// current platform cannot report it.</summary>
+    static int CpuMillis() {
+        #if WINDOWS
+        int h = GetCurrentProcess();
+        string cre = calloc(8, 1);
+        string ex = calloc(8, 1);
+        string kern = calloc(8, 1);
+        string usr = calloc(8, 1);
+        int ok = GetProcessTimes(h, cre, ex, kern, usr);
+        int k = ServerMetrics.LeInt(kern, 0, 8);
+        int u = ServerMetrics.LeInt(usr, 0, 8);
+        free(cre); free(ex); free(kern); free(usr);
+        if (ok == 0) { return 0 - 1; }
+        return (k + u) / 10000;   // 100ns units -> ms
+        #elif LINUX
+        if (!File.Exists("/proc/self/stat")) { return 0 - 1; }
+        string s = File.ReadAllText("/proc/self/stat");
+        int rp = ServerMetrics.LastIndexOf(s, ")");
+        if (rp < 0) { return 0 - 1; }
+        string rest = s.Substring(rp + 2, s.Length - (rp + 2));
+        List<string> f = ServerMetrics.SplitWs(rest);
+        // rest[0] = field 3 (state); utime = field 14 -> index 11, stime -> 12.
+        if (f.Count < 13) { return 0 - 1; }
+        int utime = Convert.ToInt32(f[11]);
+        int stime = Convert.ToInt32(f[12]);
+        return (utime + stime) * 10;   // assumes 100 Hz USER_HZ -> *1000/100
+        #else
+        return 0 - 1;
+        #endif
+    }
+
+    /// <summary>Resident memory of this process in bytes, or -1 if unavailable
+    /// on the current platform.</summary>
+    static int MemoryRssBytes() {
+        #if WINDOWS
+        int h = GetCurrentProcess();
+        string c = calloc(72, 1);
+        int ok = GetProcessMemoryInfo(h, c, 72);
+        int rss = ServerMetrics.LeInt(c, 16, 8);   // WorkingSetSize
+        free(c);
+        if (ok == 0) { return 0 - 1; }
+        return rss;
+        #elif LINUX
+        if (!File.Exists("/proc/self/statm")) { return 0 - 1; }
+        string s = File.ReadAllText("/proc/self/statm");
+        List<string> f = ServerMetrics.SplitWs(s);
+        if (f.Count < 2) { return 0 - 1; }
+        int residentPages = Convert.ToInt32(f[1]);
+        return residentPages * 4096;
+        #else
+        return 0 - 1;
+        #endif
+    }
+
+    static int LastIndexOf(string s, string ch) {
+        int i = s.Length - 1;
+        while (i >= 0) {
+            if (s.Substring(i, 1) == ch) { return i; }
+            i = i - 1;
+        }
+        return 0 - 1;
+    }
+
+    static List<string> SplitWs(string s) {
+        List<string> parts = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            string c = s.Substring(i, 1);
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+                if (sb.Length > 0) { parts.Add(sb.ToString()); sb = new StringBuilder(); }
+            } else {
+                sb.Append(c);
+            }
+            i = i + 1;
+        }
+        if (sb.Length > 0) { parts.Add(sb.ToString()); }
+        return parts;
+    }
+
+    // ---- recording ----
+
+    /// <summary>Records one completed HTTP request.</summary>
+    void RecordRequest(string method, string path, int status, int ms) {
+        this.reqCount = this.reqCount + 1;
+        this.reqTotalMs = this.reqTotalMs + ms;
+        if (ms > this.reqMaxMs) { this.reqMaxMs = ms; }
+        if (status >= 500) { this.reqErrors = this.reqErrors + 1; }
+        if (ms >= this.slowReqMs) {
+            this.slowReqInfo.Add(method + " " + path + " -> " + Convert.ToString(status));
+            this.slowReqMsList.Add(ms);
+            if (this.slowReqInfo.Count > this.ringCap) {
+                this.slowReqInfo.RemoveAt(0);
+                this.slowReqMsList.RemoveAt(0);
+            }
+        }
+    }
+
+    /// <summary>Records one completed database query.</summary>
+    void RecordQuery(string sql, int ms) {
+        this.queryCount = this.queryCount + 1;
+        this.queryTotalMs = this.queryTotalMs + ms;
+        if (ms > this.queryMaxMs) { this.queryMaxMs = ms; }
+        if (ms >= this.slowQueryMs) {
+            string q = sql;
+            if (q.Length > 200) { q = q.Substring(0, 200); }
+            this.slowQuerySql.Add(q);
+            this.slowQueryMsList.Add(ms);
+            if (this.slowQuerySql.Count > this.ringCap) {
+                this.slowQuerySql.RemoveAt(0);
+                this.slowQueryMsList.RemoveAt(0);
+            }
+        }
+    }
+
+    static string JsonEsc(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (c == "\"") { sb.Append("\\\""); }
+            else if (c == "\\") { sb.Append("\\\\"); }
+            else if (c == "\n") { sb.Append("\\n"); }
+            else if (c == "\r") { sb.Append("\\r"); }
+            else if (c == "\t") { sb.Append("\\t"); }
+            else { sb.Append(c); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    string SlowReqJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        int i = 0;
+        while (i < this.slowReqInfo.Count) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"req\":\"");
+            sb.Append(ServerMetrics.JsonEsc(this.slowReqInfo[i]));
+            sb.Append("\",\"ms\":");
+            sb.Append(Convert.ToString(this.slowReqMsList[i]));
+            sb.Append("}");
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    string SlowQueryJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        int i = 0;
+        while (i < this.slowQuerySql.Count) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"sql\":\"");
+            sb.Append(ServerMetrics.JsonEsc(this.slowQuerySql[i]));
+            sb.Append("\",\"ms\":");
+            sb.Append(Convert.ToString(this.slowQueryMsList[i]));
+            sb.Append("}");
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    /// <summary>Full metrics snapshot as JSON. Recomputes CPU% from the delta
+    /// since the previous snapshot, so poll it on a fixed interval for a
+    /// meaningful "cpu_percent".</summary>
+    string SnapshotJson() {
+        int nowWall = ServerMetrics.MonoMillis();
+        int cpuMs = ServerMetrics.CpuMillis();
+        int uptime = nowWall - this.startMillis;
+
+        int cpuPct = 0 - 1;
+        if (cpuMs >= 0) {
+            int dWall = nowWall - this.lastWallMs;
+            int dCpu = cpuMs - this.lastCpuMs;
+            if (dWall > 0) { cpuPct = (dCpu * 100) / dWall; }
+            this.lastWallMs = nowWall;
+            this.lastCpuMs = cpuMs;
+        }
+
+        int reqAvg = 0;
+        if (this.reqCount > 0) { reqAvg = this.reqTotalMs / this.reqCount; }
+        int qAvg = 0;
+        if (this.queryCount > 0) { qAvg = this.queryTotalMs / this.queryCount; }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"uptime_ms\":");
+        sb.Append(Convert.ToString(uptime));
+        sb.Append(",\"pid\":");
+        sb.Append(Convert.ToString(ProcessHost.Pid()));
+        sb.Append(",\"worker_id\":");
+        sb.Append(Convert.ToString(ProcessHost.WorkerId()));
+        sb.Append(",\"cpu_ms\":");
+        sb.Append(Convert.ToString(cpuMs));
+        sb.Append(",\"cpu_percent\":");
+        sb.Append(Convert.ToString(cpuPct));
+        sb.Append(",\"mem_rss_bytes\":");
+        sb.Append(Convert.ToString(ServerMetrics.MemoryRssBytes()));
+        sb.Append(",\"requests\":{\"count\":");
+        sb.Append(Convert.ToString(this.reqCount));
+        sb.Append(",\"errors\":");
+        sb.Append(Convert.ToString(this.reqErrors));
+        sb.Append(",\"avg_ms\":");
+        sb.Append(Convert.ToString(reqAvg));
+        sb.Append(",\"max_ms\":");
+        sb.Append(Convert.ToString(this.reqMaxMs));
+        sb.Append(",\"slow_threshold_ms\":");
+        sb.Append(Convert.ToString(this.slowReqMs));
+        sb.Append(",\"slow_count\":");
+        sb.Append(Convert.ToString(this.slowReqInfo.Count));
+        sb.Append("},\"queries\":{\"count\":");
+        sb.Append(Convert.ToString(this.queryCount));
+        sb.Append(",\"avg_ms\":");
+        sb.Append(Convert.ToString(qAvg));
+        sb.Append(",\"max_ms\":");
+        sb.Append(Convert.ToString(this.queryMaxMs));
+        sb.Append(",\"slow_threshold_ms\":");
+        sb.Append(Convert.ToString(this.slowQueryMs));
+        sb.Append(",\"slow_count\":");
+        sb.Append(Convert.ToString(this.slowQuerySql.Count));
+        sb.Append("},\"slow_requests\":");
+        sb.Append(this.SlowReqJson());
+        sb.Append(",\"slow_queries\":");
+        sb.Append(this.SlowQueryJson());
+        sb.Append("}");
+        return sb.ToString();
+    }
+}
