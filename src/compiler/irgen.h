@@ -251,8 +251,9 @@ struct zan_irgen {
      * cannot be resolved when cross-linking a fully static Linux binary can
      * have its functions stubbed out (see zan_irgen_stub_extern_lib). */
     struct {
-        zan_istr_t   lib;
-        LLVMValueRef fn;
+        zan_istr_t lib;
+        zan_istr_t name; /* symbol name; looked up at stub time because
+                            optimization may delete unused declarations */
     } extern_fns[512];
     int extern_fn_count;
 

@@ -10872,13 +10872,20 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 /* record (lib, fn) so an unresolvable lib can be stubbed when
                  * cross-linking a static Linux binary */
                 if (g->extern_fn_count < (int)(sizeof(g->extern_fns) / sizeof(g->extern_fns[0]))) {
+                    zan_istr_t sym = member->method_decl.entry_point.str
+                        ? member->method_decl.entry_point
+                        : member->method_decl.name;
                     bool seen = false;
                     for (int fi = 0; fi < g->extern_fn_count; fi++) {
-                        if (g->extern_fns[fi].fn == efn) { seen = true; break; }
+                        if (g->extern_fns[fi].name.len == sym.len &&
+                            memcmp(g->extern_fns[fi].name.str, sym.str, sym.len) == 0) {
+                            seen = true;
+                            break;
+                        }
                     }
                     if (!seen) {
                         g->extern_fns[g->extern_fn_count].lib = member->method_decl.extern_lib;
-                        g->extern_fns[g->extern_fn_count].fn = efn;
+                        g->extern_fns[g->extern_fn_count].name = sym;
                         g->extern_fn_count++;
                     }
                 }
@@ -11456,7 +11463,11 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
         if ((int)g->extern_fns[i].lib.len != lib_len ||
             memcmp(g->extern_fns[i].lib.str, lib, (size_t)lib_len) != 0)
             continue;
-        LLVMValueRef fn = g->extern_fns[i].fn;
+        char nm[256];
+        snprintf(nm, sizeof(nm), "%.*s", (int)g->extern_fns[i].name.len,
+                 g->extern_fns[i].name.str);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, nm);
+        if (!fn) continue; /* optimized away: nothing references it */
         if (LLVMCountBasicBlocks(fn) > 0) continue; /* already defined */
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
         LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
