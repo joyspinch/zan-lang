@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.Threading;
 
 namespace System.Data.MySql;
 
@@ -8,9 +9,10 @@ namespace System.Data.MySql;
 ///
 /// Connections are opened lazily up to <c>maxSize</c> and reused across
 /// coroutines. When every connection is checked out and the cap is reached,
-/// <see cref="AcquireAsync"/> suspends the calling coroutine (via the timer
-/// reactor) instead of blocking the worker thread, resuming once a connection
-/// is returned with <see cref="Release"/>. Because both opening a connection
+/// <see cref="AcquireAsync"/> suspends the calling coroutine on an
+/// event-driven <see cref="Gate"/> (no polling, no timer) instead of blocking
+/// the worker thread, and is resumed the moment a connection is returned with
+/// <see cref="Release"/>. Because both opening a connection
 /// and running queries are already coroutine-ized on the IO reactor, the whole
 /// acquire/query/release cycle stays non-blocking.
 ///
@@ -33,6 +35,8 @@ class MySqlPool {
     int maxSize;
     List<MySqlConnection> idle;
     int liveCount;      // total opened connections (idle + checked out)
+    int waiting;        // coroutines currently parked in AcquireAsync
+    Gate gate;          // event-driven wakeup for waiters (replaces poll)
     bool closed;
 
     MySqlPool(string host, int port, string database, string user,
@@ -45,6 +49,8 @@ class MySqlPool {
         this.maxSize = maxSize;
         this.idle = new List<MySqlConnection>();
         this.liveCount = 0;
+        this.waiting = 0;
+        this.gate = Gate.Create();
         this.closed = false;
     }
 
@@ -58,6 +64,9 @@ class MySqlPool {
     /// under the cap, otherwise suspends the coroutine until one is released.</summary>
     async MySqlConnection AcquireAsync() {
         while (true) {
+            if (this.closed) {
+                return null;
+            }
             if (this.idle.Count > 0) {
                 int last = this.idle.Count - 1;
                 MySqlConnection c = this.idle[last];
@@ -73,7 +82,11 @@ class MySqlPool {
                 }
                 return c;
             }
-            await Task.Delay(1);
+            // Pool saturated: park until a connection is released. The gate's
+            // counting semantics + this recheck loop guarantee no lost wakeup.
+            this.waiting = this.waiting + 1;
+            await this.gate.Wait();
+            this.waiting = this.waiting - 1;
         }
         return null;
     }
@@ -91,9 +104,16 @@ class MySqlPool {
             if (this.liveCount > 0) {
                 this.liveCount = this.liveCount - 1;
             }
+            // A live slot freed up: let a waiter open a fresh connection.
+            if (this.waiting > 0) {
+                this.gate.Signal();
+            }
             return;
         }
         this.idle.Add(c);
+        if (this.waiting > 0) {
+            this.gate.Signal();
+        }
     }
 
     /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
@@ -118,6 +138,13 @@ class MySqlPool {
             if (this.liveCount > 0) {
                 this.liveCount = this.liveCount - 1;
             }
+        }
+        // Wake every parked waiter; each rechecks `closed` and returns null.
+        int n = this.waiting;
+        int k = 0;
+        while (k < n) {
+            this.gate.Signal();
+            k = k + 1;
         }
     }
 }
