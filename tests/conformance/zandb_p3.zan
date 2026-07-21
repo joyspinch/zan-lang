@@ -1,0 +1,139 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+using System.Json;
+
+// ZanDB P3: document collections -- native value trees (JsonValue) stored
+// directly (no ORM mapping), auto _id, CRUD, bulk insert, range iteration,
+// reopen persistence, concurrent UpdateAtomic on a document field.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+    static Collection users;
+    static int finished = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static JsonValue MakeUser(string name, int age, bool active) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("name", JsonValue.NewStr(name));
+        u.Put("age", JsonValue.NewNum(Convert.ToString(age)));
+        u.Put("active", JsonValue.NewBool(active));
+        JsonValue tags = JsonValue.NewArray();
+        tags.Append(JsonValue.NewStr("a"));
+        tags.Append(JsonValue.NewStr("b"));
+        u.Put("tags", tags);
+        JsonValue addr = JsonValue.NewObject();
+        addr.Put("city", JsonValue.NewStr("北京"));
+        addr.Put("zip", JsonValue.NewStr("100000"));
+        u.Put("addr", addr);
+        return u;
+    }
+
+    static async void Bump(int docId) {
+        int i = 0;
+        while (i < 25) {
+            await users.UpdateAtomic(docId, (JsonValue cur) => {
+                int a = cur.Int("age", 0);
+                cur.Set("age", JsonValue.NewNum(Convert.ToString(a + 1)));
+                return cur;
+            });
+            i = i + 1;
+        }
+        finished = finished + 1;
+    }
+
+    static async int Run() {
+        string path = "zandb_p3.tmp.db";
+        File.Delete(path);
+        File.Delete(path + "-wal");
+
+        ZanDatabase db = ZanDatabase.Open(path, 64);
+        Check("open", db.IsOpen());
+        users = db.GetCollection("users");
+
+        // 1. Insert + typed round-trip (nested object, array, bool, CJK).
+        int id1 = users.Insert(MakeUser("alice \"quoted\" \\slash", 30, true));
+        int id2 = users.Insert(MakeUser("bob", 25, false));
+        Check("ids", id1 == 1 && id2 == 2);
+        JsonValue a = users.FindById(id1);
+        Check("roundtrip-str", a.Str("name", "") == "alice \"quoted\" \\slash");
+        Check("roundtrip-int", a.Int("age", 0) == 30);
+        Check("roundtrip-bool", a.Bool("active", false) && !users.FindById(id2).Bool("active", true));
+        Check("roundtrip-id", a.Int("_id", 0) == id1);
+        Check("roundtrip-nested", a.Get("addr").Str("city", "") == "北京");
+        Check("roundtrip-array", a.Get("tags").Count() == 2 && a.Get("tags").At(1).AsString("") == "b");
+
+        // 2. Update / Upsert / Delete / Exists.
+        a.Set("age", JsonValue.NewNum("31"));
+        Check("update", users.Update(id1, a) && users.FindById(id1).Int("age", 0) == 31);
+        Check("update-missing", !users.Update(999, a));
+        users.Upsert(500, MakeUser("eve", 40, true));
+        Check("upsert", users.FindById(500).Str("name", "") == "eve");
+        Check("delete", users.DeleteById(id2) && users.FindById(id2) == null);
+        Check("exists", users.Exists(id1) && !users.Exists(id2));
+
+        // 3. Bulk insert + FindAll ordering + FindRange.
+        List<JsonValue> batch = new List<JsonValue>();
+        int i = 0;
+        while (i < 200) {
+            batch.Add(MakeUser("u" + Convert.ToString(i), 20 + i, true));
+            i = i + 1;
+        }
+        int firstId = users.InsertBulk(batch);
+        Check("bulk-first", firstId == 501);
+        Check("count", users.Count() == 202);   // id1, 500, 200 bulk
+        List<JsonValue> all = users.FindAll();
+        Check("findall", all.Count == 202 && all[0].Int("_id", 0) == id1
+            && all[1].Int("_id", 0) == 500);
+        List<JsonValue> range = users.FindRange(501, 510, 0);
+        Check("findrange", range.Count == 10 && range[0].Str("name", "") == "u0"
+            && range[9].Str("name", "") == "u9");
+        List<JsonValue> limited = users.FindRange(501, 0, 5);
+        Check("findrange-limit", limited.Count == 5);
+
+        // 4. Second collection is isolated.
+        Collection logs = db.GetCollection("logs");
+        JsonValue e = JsonValue.NewObject();
+        e.Put("msg", JsonValue.NewStr("hello"));
+        int lid = logs.Insert(e);
+        Check("collection-isolated", lid == 1 && logs.Count() == 1 && users.Count() == 202);
+
+        // 5. Concurrent UpdateAtomic: 8 coroutines x 25 age increments.
+        db.SetSyncEvery(50);
+        int w = 0;
+        while (w < 8) {
+            Task.Spawn(Bump(id1));
+            w = w + 1;
+        }
+        while (finished < 8) {
+            await Task.Delay(5);
+        }
+        Check("doc-lost-update", users.FindById(id1).Int("age", 0) == 231);
+
+        db.Checkpoint();
+        db.Close();
+
+        // 6. Reopen persistence: documents + sequence counter.
+        ZanDatabase db2 = ZanDatabase.Open(path, 64);
+        Collection users2 = db2.GetCollection("users");
+        Check("reopen-doc", users2.FindById(id1).Int("age", 0) == 231);
+        Check("reopen-count", users2.Count() == 202);
+        int nid = users2.Insert(MakeUser("new", 1, true));
+        Check("reopen-seq", nid == 701);
+        db2.Close();
+
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}

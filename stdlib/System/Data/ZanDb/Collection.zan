@@ -1,0 +1,202 @@
+using System;
+using System.Json;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// A named set of documents inside a <see cref="ZanDatabase"/>. Documents are
+/// JsonValue object trees; each gets an auto-incrementing integer _id.
+/// Storage keys are namespaced in the shared B+Tree:
+///   c:{name}:{id}   document body (canonical JSON)
+///   m:{name}:seq    last assigned id
+/// Ids are zero-padded so B+Tree order == insertion order, making FindAll
+/// and range iteration sequential page reads.
+/// </summary>
+class Collection {
+    KvStore kv;
+    AsyncRwLock rw;
+    string name;
+
+    Collection() { this.name = ""; }
+
+    static Collection Attach(KvStore kv, AsyncRwLock rw, string name) {
+        Collection c = new Collection();
+        c.kv = kv;
+        c.rw = rw;
+        c.name = name;
+        return c;
+    }
+
+    string Name() { return this.name; }
+
+    static string PadId(int id) {
+        string s = Convert.ToString(id);
+        while (s.Length < 12) { s = "0" + s; }
+        return s;
+    }
+
+    string DocKey(int id) {
+        return "c:" + this.name + ":" + Collection.PadId(id);
+    }
+
+    string SeqKey() {
+        return "m:" + this.name + ":seq";
+    }
+
+    int NextId() {
+        string cur = this.kv.Get(SeqKey());
+        int id = 1;
+        if (cur.Length > 0) { id = Convert.ToInt(cur) + 1; }
+        this.kv.Put(SeqKey(), Convert.ToString(id));
+        return id;
+    }
+
+    // ===== CRUD =====
+
+    /// <summary>Stores a new document, assigning and returning its _id
+    /// (also written into the document).</summary>
+    int Insert(JsonValue doc) {
+        this.kv.Begin();
+        int id = NextId();
+        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        this.kv.Put(DocKey(id), doc.ToJson());
+        this.kv.Commit();
+        return id;
+    }
+
+    /// <summary>Bulk insert in one atomic commit (one WAL flush for the whole
+    /// batch). Returns the first assigned id.</summary>
+    int InsertBulk(List<JsonValue> docs) {
+        this.kv.Begin();
+        int first = 0;
+        int i = 0;
+        while (i < docs.Count) {
+            int id = NextId();
+            if (first == 0) { first = id; }
+            docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            this.kv.Put(DocKey(id), docs[i].ToJson());
+            i = i + 1;
+        }
+        this.kv.Commit();
+        return first;
+    }
+
+    /// <summary>Returns the document, or null when absent.</summary>
+    JsonValue FindById(int id) {
+        string body = this.kv.Get(DocKey(id));
+        if (body.Length == 0) { return null; }
+        return JsonValue.Parse(body);
+    }
+
+    bool Exists(int id) { return this.kv.Contains(DocKey(id)); }
+
+    /// <summary>Replaces an existing document; false when the id is absent.</summary>
+    bool Update(int id, JsonValue doc) {
+        if (!this.kv.Contains(DocKey(id))) { return false; }
+        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        this.kv.Put(DocKey(id), doc.ToJson());
+        return true;
+    }
+
+    /// <summary>Insert-or-replace under an explicit id. Advances the auto-id
+    /// sequence past id so later inserts cannot collide.</summary>
+    void Upsert(int id, JsonValue doc) {
+        this.kv.Begin();
+        string cur = this.kv.Get(SeqKey());
+        int seq = 0;
+        if (cur.Length > 0) { seq = Convert.ToInt(cur); }
+        if (id > seq) { this.kv.Put(SeqKey(), Convert.ToString(id)); }
+        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        this.kv.Put(DocKey(id), doc.ToJson());
+        this.kv.Commit();
+    }
+
+    bool DeleteById(int id) {
+        return this.kv.Delete(DocKey(id));
+    }
+
+    /// <summary>Number of documents (range scan over the namespace).</summary>
+    int Count() {
+        List<string> ks = new List<string>();
+        List<string> vs = new List<string>();
+        return this.kv.ScanPrefix("c:" + this.name + ":", 0, ks, vs);
+    }
+
+    /// <summary>All documents in id order.</summary>
+    List<JsonValue> FindAll() {
+        return FindRange(0, 0, 0);
+    }
+
+    /// <summary>Documents with fromId <= _id <= toId (0 = unbounded),
+    /// limit 0 = unlimited, in id order.</summary>
+    List<JsonValue> FindRange(int fromId, int toId, int limit) {
+        string lo = DocKey(fromId);
+        string hi = "";
+        if (toId > 0) { hi = DocKey(toId); }
+        else { hi = "c:" + this.name + ";"; }   // ';' sorts just after ':'
+        List<string> ks = new List<string>();
+        List<string> vs = new List<string>();
+        this.kv.Scan(lo, hi, limit, ks, vs);
+        List<JsonValue> docs = new List<JsonValue>();
+        int i = 0;
+        while (i < vs.Count) {
+            if (ks[i].Length > 2 && ks[i].Substring(0, 2) == "c:") {
+                docs.Add(JsonValue.Parse(vs[i]));
+            }
+            i = i + 1;
+        }
+        return docs;
+    }
+
+    // ===== Coroutine-safe async API =====
+
+    async JsonValue FindByIdAsync(int id) {
+        await this.rw.EnterRead();
+        JsonValue v = FindById(id);
+        this.rw.ExitRead();
+        return v;
+    }
+
+    async int InsertAsync(JsonValue doc) {
+        await this.rw.EnterWrite();
+        int id = Insert(doc);
+        this.rw.ExitWrite();
+        return id;
+    }
+
+    async bool UpdateAsync(int id, JsonValue doc) {
+        await this.rw.EnterWrite();
+        bool ok = Update(id, doc);
+        this.rw.ExitWrite();
+        return ok;
+    }
+
+    async bool DeleteByIdAsync(int id) {
+        await this.rw.EnterWrite();
+        bool ok = DeleteById(id);
+        this.rw.ExitWrite();
+        return ok;
+    }
+
+    /// <summary>Atomic read-modify-write on one document: fn runs inside the
+    /// write critical section against the latest committed version, so
+    /// concurrent updates never lose writes (the decision and the write are
+    /// one atomic step). Returns true when the document existed and fn
+    /// returned a replacement.</summary>
+    async bool UpdateAtomic(int id, DocUpdater fn) {
+        await this.rw.EnterWrite();
+        JsonValue cur = FindById(id);
+        if (cur == null) {
+            this.rw.ExitWrite();
+            return false;
+        }
+        JsonValue next = fn(cur);
+        bool ok = false;
+        if (next != null) {
+            ok = Update(id, next);
+        }
+        this.rw.ExitWrite();
+        return ok;
+    }
+}

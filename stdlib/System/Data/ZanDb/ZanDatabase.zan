@@ -1,0 +1,88 @@
+using System;
+using System.Json;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>Computes the new document from the current one inside the write
+/// critical section (null when the id is absent). Return null to leave the
+/// document unchanged.</summary>
+delegate JsonValue DocUpdater(JsonValue current);
+
+/// <summary>
+/// Embedded document database storing native Zan value trees (JsonValue:
+/// ints, doubles, bools, strings, nested objects, arrays) -- no ORM mapping,
+/// no SQL strings. Single file + WAL, crash-safe atomic commits, LRU page
+/// cache with a hard memory cap.
+///
+///   ZanDatabase db = ZanDatabase.Open("app.zdb");
+///   Collection users = db.GetCollection("users");
+///   JsonValue u = JsonValue.NewObject();
+///   u.Put("name", JsonValue.NewStr("alice"));
+///   u.Put("age", JsonValue.NewNum("30"));
+///   int id = users.Insert(u);
+///   JsonValue back = users.FindById(id);
+///   db.Close();
+/// </summary>
+class ZanDatabase {
+    KvStore kv;
+    AsyncRwLock rw;
+    List<string> colNames;
+    List<Collection> cols;
+    string lastError;
+
+    ZanDatabase() {
+        this.colNames = new List<string>();
+        this.cols = new List<Collection>();
+        this.lastError = "";
+    }
+
+    /// <summary>Opens (creating if needed) with defaults: 256-page cache,
+    /// fsync every commit.</summary>
+    static ZanDatabase Open(string path) {
+        return ZanDatabase.Open(path, 256);
+    }
+
+    static ZanDatabase Open(string path, int cachePages) {
+        ZanDatabase d = new ZanDatabase();
+        d.kv = KvStore.Open(path, cachePages);
+        if (!d.kv.IsOpen()) { d.lastError = d.kv.GetError(); }
+        d.rw = AsyncRwLock.Create();
+        return d;
+    }
+
+    bool IsOpen() { return this.lastError.Length == 0 && this.kv.IsOpen(); }
+
+    string GetError() { return this.lastError; }
+
+    /// <summary>fsync cadence: 1 = every commit, N = grouped.</summary>
+    void SetSyncEvery(int n) { this.kv.SetSyncEvery(n); }
+
+    /// <summary>Returns (creating lazily) a named document collection.</summary>
+    Collection GetCollection(string name) {
+        int i = 0;
+        while (i < this.colNames.Count) {
+            if (this.colNames[i] == name) { return this.cols[i]; }
+            i = i + 1;
+        }
+        Collection c = Collection.Attach(this.kv, this.rw, name);
+        this.colNames.Add(name);
+        this.cols.Add(c);
+        return c;
+    }
+
+    /// <summary>Direct access to the underlying key/value store.</summary>
+    KvStore Kv() { return this.kv; }
+
+    /// <summary>Batches subsequent writes into one atomic commit.</summary>
+    void Begin() { this.kv.Begin(); }
+
+    bool Commit() { return this.kv.Commit(); }
+
+    void Checkpoint() { this.kv.Checkpoint(); }
+
+    void Close() {
+        this.kv.Close();
+        this.rw.Close();
+    }
+}
