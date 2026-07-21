@@ -28,6 +28,7 @@ class SceneDesigner {
 
     bool dragging;
     bool resizing;
+    string palDrag;      // element kind being dragged out of the palette ("" = none)
     int dragDx;          // design-space offset from element top-left to cursor
     int dragDy;
     bool showGrid;
@@ -54,6 +55,7 @@ class SceneDesigner {
         d.lastSel = null;
         d.dragging = false;
         d.resizing = false;
+        d.palDrag = "";
         d.dragDx = 0;
         d.dragDy = 0;
         d.showGrid = true;
@@ -235,6 +237,29 @@ class SceneDesigner {
         this.msg = SceneDesigner.T("added ", "已添加 ") + SceneDesigner.KindLabel(kind);
     }
 
+    /// Adds an element of `kind` centred on the design-space point (dx, dy) —
+    /// the drop target of a palette drag.
+    void AddElementAt(string kind, int dx, int dy) {
+        SceneElement e = SceneElement.Create(kind, kind + SceneDoc.IntStr(this.doc.Count() + 1));
+        e.AnchorTo(Anchor.Mid(), Anchor.Mid());
+        SceneDesigner.ApplyDefaults(e, kind);
+        int left = dx - e.TotalW() / 2;
+        int top = dy - e.TotalH() / 2;
+        if (this.snap && this.grid > 0) {
+            left = (left + this.grid / 2) / this.grid * this.grid;
+            top = (top + this.grid / 2) / this.grid * this.grid;
+        }
+        int baseX = e.AnchorX() * this.doc.DesignWidth() / 1000
+            - e.AnchorX() * e.TotalW() / 1000;
+        int baseY = e.AnchorY() * this.doc.DesignHeight() / 1000
+            - e.AnchorY() * e.TotalH() / 1000;
+        e.At(left - baseX, top - baseY);
+        e.Order(this.doc.Count());
+        this.doc.Add(e);
+        this.sel = e;
+        this.msg = SceneDesigner.T("added ", "已添加 ") + SceneDesigner.KindLabel(kind);
+    }
+
     void DuplicateSel() {
         if (this.sel == null) { return; }
         SceneElement s = this.sel;
@@ -315,24 +340,50 @@ class SceneDesigner {
         this.RenderCanvas(app, c, t, canX, top, canW, bodyH);
         this.RenderInspector(app, c, t, inspX, top, inspW, bodyH);
         this.RenderStatus(app, c, t, palX, bot + app.Scale(2), inspX + inspW - palX);
+
+        // Palette drag ghost: a floating chip following the cursor until it is
+        // dropped on the canvas (handled in RenderCanvas) or released elsewhere.
+        int gek = app.window.EventKind();
+        if (this.palDrag.Length > 0) {
+            if (gek == 3) {
+                // Released outside the canvas (a canvas drop already cleared it).
+                this.palDrag = "";
+            } else {
+                string gl = SceneDesigner.KindLabel(this.palDrag);
+                int gw = app.Scale(24) + gl.Length * t.fontSizeSmall;
+                int gh = app.Scale(24);
+                c.FillRoundRect(app.mouseX + app.Scale(10), app.mouseY + app.Scale(10),
+                    gw, gh, app.Scale(4), SceneDesigner.PackColor(70, 110, 200, 220));
+                c.DrawText(app.mouseX + app.Scale(18), app.mouseY + app.Scale(14),
+                    gl, 0xFFFFFFFF, t.fontSizeSmall);
+            }
+            app.RequestRedraw();
+        }
     }
 
     // --- palette (add elements) ---------------------------------------------
 
-    // Renders one section of the palette as a two-column grid of add-buttons;
-    // returns the y after the section.
+    // Renders one section of the palette as a two-column grid of drag sources;
+    // pressing a chip starts a drag that must be dropped onto the canvas to
+    // add the element (no click-to-add). Returns the y after the section.
     int PaletteSection(App app, Canvas c, Theme t, int x, int y, int w,
             string title, List<string> kinds) {
         c.DrawText(x, y, title, t.textTertiary, t.fontSizeSmall);
         int iy = y + app.Scale(18);
         int bw = (w - app.Scale(6)) / 2;
         int bh = app.Scale(26);
+        int ek = app.window.EventKind();
         int k = 0;
         while (k < kinds.Count) {
             int col = k % 2;
             int bx = x + col * (bw + app.Scale(6));
-            int id = Button.Create(SceneDesigner.KindLabel(kinds[k])).Render(app, bx, iy, bw);
-            if (Button.WasClicked(app, id)) { this.AddElement(kinds[k]); app.RequestRedraw(); }
+            Button.Create(SceneDesigner.KindLabel(kinds[k])).Render(app, bx, iy, bw);
+            if (ek == 2 && SceneDesigner.InRect(app.mouseX, app.mouseY, bx, iy, bw, bh)) {
+                this.palDrag = kinds[k];
+                this.msg = SceneDesigner.T("drag onto the canvas to add ", "拖到画布上以添加 ")
+                    + SceneDesigner.KindLabel(kinds[k]);
+                app.RequestRedraw();
+            }
             if (col == 1 || k == kinds.Count - 1) { iy = iy + bh + app.Scale(4); }
             k = k + 1;
         }
@@ -599,6 +650,20 @@ class SceneDesigner {
             i = i + 1;
         }
         c.PopClip();
+
+        // Drop of a palette drag: releasing over the canvas adds the element
+        // at the cursor (centred), converted into design space.
+        if (this.palDrag.Length > 0 && ek == 3) {
+            if (SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {
+                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+                this.AddElementAt(this.palDrag, mDesX, mDesY);
+            } else {
+                this.msg = SceneDesigner.T("drop cancelled", "已取消拖放");
+            }
+            this.palDrag = "";
+            app.RequestRedraw();
+        }
 
         // Pointer interaction: press to select + begin drag/resize (topmost first).
         if (ek == 2 && SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {

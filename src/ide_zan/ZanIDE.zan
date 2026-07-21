@@ -1858,9 +1858,10 @@ class ZanIDE {
                     ZanIDE.FlattenFields(formDesigner.fields, flatSig);
                     newSig = "F:" + Convert.ToString(stActTab) + ":" + Convert.ToString(flatSig.Count);
                 } else {
-                    string curSrc = editor.GetText();
-                    newSig = "C:" + Convert.ToString(stActTab) + ":" + Convert.ToString(curSrc.Length);
-                    if (newSig != structSig) { structTree = ZanIDE.BuildOutline(curSrc); }
+                    // TextStamp is O(lines) with no allocation; the full text is
+                    // only materialised when the outline actually needs rebuilding.
+                    newSig = "C:" + Convert.ToString(stActTab) + ":" + Convert.ToString(editor.TextStamp());
+                    if (newSig != structSig) { structTree = ZanIDE.BuildOutline(editor.GetText()); }
                 }
                 if (newSig != structSig) {
                     structSig = newSig;
@@ -4546,19 +4547,16 @@ class ZanIDE {
             if (File.Exists(cb)) { return cb; }
             return ZanIDE.ProjectEntry(root);
         }
+        if (ZanIDE.IsScenePath(p)) { return ZanIDE.ProjectEntry(root); }
         return p;
     }
 
-    /// Run/Build/Debug/Publish from the ribbon always act on the whole project:
-    /// when a zan.proj is present at the root, the project entry is compiled (with
-    /// every project .zan file), regardless of which tab is focused. Only loose
-    /// files outside a project fall back to the active file. (The Tools panel runs
-    /// individual files via RunFile/RunTarget, which is intentionally unchanged.)
+    /// Run/Build/Debug from the ribbon act on the ACTIVE TAB: the focused code
+    /// tab is what gets compiled and run, so a scratch snippet in its own tab
+    /// can be tried without touching the project entry. Special tabs
+    /// (@start/@docs) and designer tabs (.zform/.zscene) still map to the
+    /// project entry via RunTarget.
     static string RibbonRunTarget(string activePath, string root) {
-        if (File.Exists(root + "/zan.proj")) {
-            string entry = ZanIDE.ProjectEntry(root);
-            if (File.Exists(entry)) { return entry; }
-        }
         return ZanIDE.RunTarget(activePath, root);
     }
 
@@ -4682,8 +4680,42 @@ class ZanIDE {
     /// folder don't clash (e.g. two Main methods).
     static string SmartInputs(string root, string dir, string entry) {
         bool proj = File.Exists(root + "/zan.proj") || File.Exists(dir + "/zan.proj");
-        if (proj) { return ZanIDE.ProjectInputs(dir, entry, ""); }
-        return "\"" + entry + "\"";
+        if (!proj) { return "\"" + entry + "\""; }
+        // Feed the project's other files in for cross-file types, but skip any
+        // that declare their own Main: when the focused tab is a runnable
+        // snippet, compiling it together with the project entry's Main would
+        // fail with a duplicate entry point.
+        string args = "\"" + entry + "\"";
+        List<string> all = new List<string>();
+        ZanIDE.GatherZanFiles(dir, all);
+        int i = 0;
+        while (i < all.Count) {
+            string f = all[i];
+            if (f != entry && !ZanIDE.FileHasMain(f)) {
+                args = args + " \"" + f + "\"";
+            }
+            i = i + 1;
+        }
+        return args;
+    }
+
+    /// True when the file declares a `static ... Main(` entry point.
+    static bool FileHasMain(string path) {
+        if (!File.Exists(path)) { return false; }
+        string s = File.ReadAllText(path);
+        int i = ZanIDE.IndexOfStr(s, " Main(");
+        while (i >= 0) {
+            // Require `static` earlier on the same line so a call like
+            // `x.Main()` or a comment does not count.
+            int ls = i;
+            while (ls > 0 && s.Substring(ls - 1, 1) != "\n") { ls = ls - 1; }
+            string line = s.Substring(ls, i - ls);
+            if (ZanIDE.IndexOfStr(line, "static ") >= 0) { return true; }
+            int nxt = ZanIDE.IndexOfStr(s.Substring(i + 1, s.Length - i - 1), " Main(");
+            if (nxt < 0) { return false; }
+            i = i + 1 + nxt;
+        }
+        return false;
     }
 
     /// First index of `needle` in `hay`, or -1.
