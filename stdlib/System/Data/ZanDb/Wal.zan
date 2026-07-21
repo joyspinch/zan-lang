@@ -1,0 +1,144 @@
+using System;
+using System.IO;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// Write-ahead log: sequential, CRC-guarded frames appended per transaction,
+/// closed by a commit record and fsynced. SSD-friendly (append-only) and the
+/// sole durability point of a commit: page frames of transactions that lack a
+/// valid commit record are ignored during recovery, giving atomic all-or-
+/// nothing commits.
+///
+/// Frame layout (little-endian):
+///   u32 type      1 = page frame, 2 = commit record
+///   u64 pageId    (frames) / commitId (commit records)
+///   u32 payloadLen
+///   u32 crc32     of the payload
+///   payload       payloadLen bytes (page image; commit records have none)
+/// </summary>
+class Wal {
+    static int FRAME_PAGE = 1;
+    static int FRAME_COMMIT = 2;
+    static int HEADER_LEN = 20;
+
+    PageFile file;
+    string path;
+    int pageSize;
+
+    Wal() {
+        this.path = "";
+        this.pageSize = 4096;
+    }
+
+    static Wal Open(string path, int pageSize) {
+        Wal w = new Wal();
+        w.path = path;
+        w.pageSize = pageSize;
+        w.file = PageFile.Open(path);
+        return w;
+    }
+
+    bool IsOpen() { return this.file.IsOpen(); }
+
+    /// <summary>Appends one page image; not yet durable (see AppendCommit).</summary>
+    bool AppendFrame(int pageId, ByteBuffer page) {
+        ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
+        h.WriteU32(Wal.FRAME_PAGE);
+        h.WriteU64(pageId);
+        h.WriteU32(this.pageSize);
+        h.WriteU32(page.Crc32(this.pageSize));
+        int ok1 = this.file.Append(h.Raw(), Wal.HEADER_LEN);
+        h.Free();
+        if (ok1 < 0) { return false; }
+        return this.file.Append(page.Raw(), this.pageSize) >= 0;
+    }
+
+    /// <summary>Appends a commit record and fsyncs: the durability point.</summary>
+    bool AppendCommit(int commitId) {
+        ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
+        h.WriteU32(Wal.FRAME_COMMIT);
+        h.WriteU64(commitId);
+        h.WriteU32(0);
+        h.WriteU32(0);
+        int ok = this.file.Append(h.Raw(), Wal.HEADER_LEN);
+        h.Free();
+        if (ok < 0) { return false; }
+        return this.file.Sync();
+    }
+
+    /// <summary>Replays committed transactions into the main database file.
+    /// Uncommitted trailing frames (torn writes, crash mid-transaction) are
+    /// discarded. Idempotent: replaying already-checkpointed frames simply
+    /// rewrites identical page images. Resets the WAL afterwards.</summary>
+    int Recover(PageFile db) {
+        int size = this.file.Size();
+        if (size <= 0) { return 0; }
+
+        int applied = 0;
+        int off = 0;
+        // Pending frames of the transaction currently being scanned.
+        List<int> pendIds = new List<int>();
+        List<ByteBuffer> pendPages = new List<ByteBuffer>();
+        ByteBuffer h = ByteBuffer.Alloc(Wal.HEADER_LEN);
+        ByteBuffer payload = ByteBuffer.Alloc(this.pageSize);
+
+        while (off + Wal.HEADER_LEN <= size) {
+            this.file.ReadAt(off, h, Wal.HEADER_LEN);
+            h.SeekRead(0);
+            int type = h.ReadU32();
+            int id = h.ReadU64();
+            int plen = h.ReadU32();
+            int crc = h.ReadU32();
+            off = off + Wal.HEADER_LEN;
+
+            if (type == Wal.FRAME_PAGE) {
+                if (plen != this.pageSize || off + plen > size) { break; }
+                this.file.ReadAt(off, payload, plen);
+                off = off + plen;
+                if (payload.Crc32(plen) != crc) { break; }
+                ByteBuffer copy = ByteBuffer.FromRaw(payload.Raw(), plen);
+                pendIds.Add(id);
+                pendPages.Add(copy);
+            } else if (type == Wal.FRAME_COMMIT) {
+                // Whole transaction present: apply it.
+                int i = 0;
+                while (i < pendIds.Count) {
+                    db.WriteAt(pendIds[i] * this.pageSize, pendPages[i].Raw(), this.pageSize);
+                    pendPages[i].Free();
+                    i = i + 1;
+                }
+                applied = applied + pendIds.Count;
+                pendIds = new List<int>();
+                pendPages = new List<ByteBuffer>();
+            } else {
+                break;   // corrupt/unknown frame: stop scanning
+            }
+        }
+
+        // Drop any uncommitted tail.
+        int j = 0;
+        while (j < pendPages.Count) {
+            pendPages[j].Free();
+            j = j + 1;
+        }
+        h.Free();
+        payload.Free();
+
+        if (applied > 0) { db.Sync(); }
+        Reset();
+        return applied;
+    }
+
+    /// <summary>Truncates the WAL (after a successful main-file checkpoint).</summary>
+    void Reset() {
+        this.file.Close();
+        File.Delete(this.path);
+        this.file = PageFile.Open(this.path);
+    }
+
+    void Close() {
+        this.file.Close();
+        File.Delete(this.path);
+    }
+}

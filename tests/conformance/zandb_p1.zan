@@ -1,0 +1,156 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+
+// ZanDB P1: pager + LRU cache + WAL. Covers commit/reopen persistence,
+// freelist reuse, cache eviction correctness, WAL crash recovery (committed
+// transactions re-applied, uncommitted tails discarded).
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static void FillPage(ByteBuffer pg, int stamp, string tag) {
+        pg.Clear();
+        pg.WriteU32(stamp);
+        pg.WriteString(tag);
+        pg.SetLength(4096);
+    }
+
+    static void Main() {
+        string path = "zandb_p1.tmp.db";
+        File.Delete(path);
+        File.Delete(path + "-wal");
+
+        // 1. Create, write pages, commit, close, reopen.
+        Pager p = Pager.Open(path, 8);
+        Check("open", p.IsOpen());
+        int a = p.AllocPage();
+        int b = p.AllocPage();
+        int c = p.AllocPage();
+        Check("alloc-ids", a == 1 && b == 2 && c == 3);
+        FillPage(p.GetPage(a), 111, "alpha");
+        p.MarkDirty(a);
+        FillPage(p.GetPage(b), 222, "beta");
+        p.MarkDirty(b);
+        FillPage(p.GetPage(c), 333, "gamma");
+        p.MarkDirty(c);
+        Check("commit", p.Commit());
+        int cid = p.CommitId();
+        p.Close();
+
+        Pager p2 = Pager.Open(path, 8);
+        Check("reopen", p2.IsOpen() && p2.PageCount() == 4 && p2.CommitId() == cid);
+        ByteBuffer pg = p2.GetPage(b);
+        pg.SeekRead(0);
+        Check("persisted", pg.ReadU32() == 222 && pg.ReadString() == "beta");
+
+        // 2. Freelist reuse.
+        p2.FreePage(b);
+        p2.Commit();
+        int reused = p2.AllocPage();
+        Check("freelist-reuse", reused == b);
+        FillPage(p2.GetPage(reused), 444, "recycled");
+        p2.MarkDirty(reused);
+        p2.Commit();
+        p2.Close();
+
+        // 3. Cache eviction correctness: tiny cache, many pages.
+        Pager p3 = Pager.Open(path, 4);
+        List<int> ids = new List<int>();
+        int i = 0;
+        while (i < 20) {
+            int id = p3.AllocPage();
+            ids.Add(id);
+            FillPage(p3.GetPage(id), 1000 + i, "pg" + Convert.ToString(i));
+            p3.MarkDirty(id);
+            i = i + 1;
+        }
+        Check("evict-commit", p3.Commit());
+        // Read them all back through the 4-slot cache.
+        bool allOk = true;
+        i = 0;
+        while (i < 20) {
+            ByteBuffer q = p3.GetPage(ids[i]);
+            q.SeekRead(0);
+            if (q.ReadU32() != 1000 + i) { allOk = false; }
+            if (q.ReadString() != "pg" + Convert.ToString(i)) { allOk = false; }
+            i = i + 1;
+        }
+        Check("evict-readback", allOk);
+        p3.Close();
+
+        // 4. Crash recovery: craft a WAL with a committed change to page 1
+        //    that never reached the main file.
+        ByteBuffer newPage = ByteBuffer.Alloc(4096);
+        FillPage(newPage, 999, "recovered");
+        PageFile wal = PageFile.Open(path + "-wal");
+        ByteBuffer hdr = ByteBuffer.Alloc(20);
+        hdr.WriteU32(1);                       // FRAME_PAGE
+        hdr.WriteU64(1);                       // pageId 1
+        hdr.WriteU32(4096);
+        hdr.WriteU32(newPage.Crc32(4096));
+        wal.Append(hdr.Raw(), 20);
+        wal.Append(newPage.Raw(), 4096);
+        hdr.Clear();
+        hdr.WriteU32(2);                       // FRAME_COMMIT
+        hdr.WriteU64(77);
+        hdr.WriteU32(0);
+        hdr.WriteU32(0);
+        wal.Append(hdr.Raw(), 20);
+        // Uncommitted tail: another frame with no commit record.
+        ByteBuffer junk = ByteBuffer.Alloc(4096);
+        FillPage(junk, 31337, "should-not-apply");
+        hdr.Clear();
+        hdr.WriteU32(1);
+        hdr.WriteU64(3);                       // pageId 3
+        hdr.WriteU32(4096);
+        hdr.WriteU32(junk.Crc32(4096));
+        wal.Append(hdr.Raw(), 20);
+        wal.Append(junk.Raw(), 4096);
+        wal.Sync();
+        wal.Close();
+
+        Pager p4 = Pager.Open(path, 8);
+        ByteBuffer r1 = p4.GetPage(1);
+        r1.SeekRead(0);
+        Check("wal-recovered", r1.ReadU32() == 999 && r1.ReadString() == "recovered");
+        ByteBuffer r3 = p4.GetPage(3);
+        r3.SeekRead(0);
+        Check("wal-tail-discarded", r3.ReadU32() == 333 && r3.ReadString() == "gamma");
+        Check("wal-truncated", !File.Exists(path + "-wal") || File.GetSize(path + "-wal") == 0);
+
+        // 5. Grouped sync mode: durability comes from the WAL between syncs.
+        p4.SetSyncEvery(4);
+        int k = 0;
+        while (k < 6) {
+            ByteBuffer g = p4.GetPage(2);
+            FillPage(g, 5000 + k, "grouped");
+            p4.MarkDirty(2);
+            p4.Commit();
+            k = k + 1;
+        }
+        ByteBuffer gg = p4.GetPage(2);
+        gg.SeekRead(0);
+        Check("grouped-sync", gg.ReadU32() == 5005);
+        p4.Close();
+
+        Pager p5 = Pager.Open(path, 8);
+        ByteBuffer g2 = p5.GetPage(2);
+        g2.SeekRead(0);
+        Check("grouped-persisted", g2.ReadU32() == 5005 && g2.ReadString() == "grouped");
+        p5.Close();
+
+        newPage.Free();
+        junk.Free();
+        hdr.Free();
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+    }
+}

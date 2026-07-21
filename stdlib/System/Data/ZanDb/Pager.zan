@@ -1,0 +1,428 @@
+using System;
+using System.IO;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// Fixed-capacity LRU cache mapping page id -> ByteBuffer. Open-addressing
+/// hash table with an intrusive doubly-linked LRU list; no allocation after
+/// construction. Dirty pages are pinned (never evicted) until the pager
+/// commits them.
+/// </summary>
+class PageCache {
+    int capacity;      // max resident pages
+    int slots;         // hash slots (power of two, > capacity)
+    List<int> keys;    // pageId + 1; 0 = empty, -1 = tombstone
+    List<ByteBuffer> vals;
+    List<bool> dirty;
+    List<int> lruPrev; // slot index links, -1 = none
+    List<int> lruNext;
+    int lruHead;       // most recently used slot
+    int lruTail;       // least recently used slot
+    int count;
+
+    PageCache(int cap) {
+        this.capacity = cap;
+        int s = 16;
+        while (s < cap * 2) { s = s * 2; }
+        this.slots = s;
+        this.keys = new List<int>();
+        this.vals = new List<ByteBuffer>();
+        this.dirty = new List<bool>();
+        this.lruPrev = new List<int>();
+        this.lruNext = new List<int>();
+        int i = 0;
+        while (i < s) {
+            this.keys.Add(0);
+            this.vals.Add(ByteBuffer.Alloc(16));
+            this.dirty.Add(false);
+            this.lruPrev.Add(-1);
+            this.lruNext.Add(-1);
+            i = i + 1;
+        }
+        this.lruHead = -1;
+        this.lruTail = -1;
+        this.count = 0;
+    }
+
+    static PageCache Create(int capacity) {
+        return new PageCache(capacity);
+    }
+
+    int Count() { return this.count; }
+
+    int FindSlot(int pageId) {
+        int mask = this.slots - 1;
+        int h = (pageId * 2654435761) & mask;
+        if (h < 0) { h = -h & mask; }
+        int probes = 0;
+        while (probes < this.slots) {
+            int k = this.keys[h];
+            if (k == 0) { return -1; }
+            if (k == pageId + 1) { return h; }
+            h = (h + 1) & mask;
+            probes = probes + 1;
+        }
+        return -1;
+    }
+
+    int FindInsertSlot(int pageId) {
+        int mask = this.slots - 1;
+        int h = (pageId * 2654435761) & mask;
+        if (h < 0) { h = -h & mask; }
+        while (this.keys[h] != 0 && this.keys[h] != -1) {
+            h = (h + 1) & mask;
+        }
+        return h;
+    }
+
+    void LruUnlink(int slot) {
+        int p = this.lruPrev[slot];
+        int n = this.lruNext[slot];
+        if (p >= 0) { this.lruNext[p] = n; } else { this.lruHead = n; }
+        if (n >= 0) { this.lruPrev[n] = p; } else { this.lruTail = p; }
+        this.lruPrev[slot] = -1;
+        this.lruNext[slot] = -1;
+    }
+
+    void LruPushFront(int slot) {
+        this.lruPrev[slot] = -1;
+        this.lruNext[slot] = this.lruHead;
+        if (this.lruHead >= 0) { this.lruPrev[this.lruHead] = slot; }
+        this.lruHead = slot;
+        if (this.lruTail < 0) { this.lruTail = slot; }
+    }
+
+    /// <summary>Returns the cached page or null-equivalent (check Found).</summary>
+    bool Has(int pageId) {
+        return FindSlot(pageId) >= 0;
+    }
+
+    ByteBuffer Get(int pageId) {
+        int slot = FindSlot(pageId);
+        LruUnlink(slot);
+        LruPushFront(slot);
+        return this.vals[slot];
+    }
+
+    bool IsDirty(int pageId) {
+        int slot = FindSlot(pageId);
+        if (slot < 0) { return false; }
+        return this.dirty[slot];
+    }
+
+    void SetDirty(int pageId, bool d) {
+        int slot = FindSlot(pageId);
+        if (slot >= 0) { this.dirty[slot] = d; }
+    }
+
+    /// <summary>Slot of the least-recently-used clean page, or -1.</summary>
+    int EvictableSlot() {
+        int s = this.lruTail;
+        while (s >= 0) {
+            if (!this.dirty[s]) { return s; }
+            s = this.lruPrev[s];
+        }
+        return -1;
+    }
+
+    /// <summary>Doubles the slot table (dirty-page bursts can exceed the
+    /// nominal capacity, and tombstones consume slots).</summary>
+    void Grow() {
+        List<int> oldKeys = this.keys;
+        List<ByteBuffer> oldVals = this.vals;
+        List<bool> oldDirty = this.dirty;
+        int oldSlots = this.slots;
+
+        this.slots = oldSlots * 2;
+        this.keys = new List<int>();
+        this.vals = new List<ByteBuffer>();
+        this.dirty = new List<bool>();
+        this.lruPrev = new List<int>();
+        this.lruNext = new List<int>();
+        int i = 0;
+        while (i < this.slots) {
+            this.keys.Add(0);
+            this.vals.Add(ByteBuffer.Alloc(16));
+            this.dirty.Add(false);
+            this.lruPrev.Add(-1);
+            this.lruNext.Add(-1);
+            i = i + 1;
+        }
+        this.lruHead = -1;
+        this.lruTail = -1;
+        this.count = 0;
+
+        // Reinsert live entries (LRU recency ordering is rebuilt coarsely).
+        i = 0;
+        while (i < oldSlots) {
+            if (oldKeys[i] > 0) {
+                int id = oldKeys[i] - 1;
+                int slot = FindInsertSlot(id);
+                this.keys[slot] = id + 1;
+                this.vals[slot] = oldVals[i];
+                this.dirty[slot] = oldDirty[i];
+                LruPushFront(slot);
+                this.count = this.count + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Inserts a page taking ownership of buf; evicts the LRU clean
+    /// page when full (its buffer is freed). Dirty pages are never evicted,
+    /// so the cache may temporarily exceed capacity under write bursts.</summary>
+    void Put(int pageId, ByteBuffer buf) {
+        if (this.count >= this.capacity) {
+            int ev = EvictableSlot();
+            if (ev >= 0) {
+                this.vals[ev].Free();
+                this.keys[ev] = -1;
+                LruUnlink(ev);
+                this.count = this.count - 1;
+            }
+        }
+        if (this.count * 2 >= this.slots) { Grow(); }
+        int slot = FindInsertSlot(pageId);
+        this.keys[slot] = pageId + 1;
+        this.vals[slot] = buf;
+        this.dirty[slot] = false;
+        LruPushFront(slot);
+        this.count = this.count + 1;
+    }
+
+    /// <summary>Collects the ids of all dirty pages.</summary>
+    List<int> DirtyPageIds() {
+        List<int> ids = new List<int>();
+        int s = this.lruTail;
+        while (s >= 0) {
+            if (this.dirty[s]) { ids.Add(this.keys[s] - 1); }
+            s = this.lruPrev[s];
+        }
+        return ids;
+    }
+}
+
+/// <summary>
+/// Page manager: fixed-size pages in a single file, LRU page cache with a
+/// hard memory cap, free-page reuse, and WAL-backed atomic commits.
+///
+/// Page 0 is the header: magic, page size, page count, freelist head and
+/// commit counter. Data pages start at id 1. Mutations go through:
+///   ByteBuffer page = pager.GetPage(id);
+///   ...mutate page...
+///   pager.MarkDirty(id);
+///   pager.Commit();      // atomic: all dirty pages or none
+/// </summary>
+class Pager {
+    static int PAGE_SIZE = 4096;
+    static int MAGIC = 826425690;        // "ZDB1" little-endian
+
+    PageFile file;
+    Wal wal;
+    PageCache cache;
+    string lastError;
+    int pageCount;      // includes header page
+    int freelistHead;   // 0 = none
+    int commitId;
+    int syncEvery;      // fsync main file every N commits (1 = always)
+    int commitsSinceSync;
+
+    Pager() {
+        this.lastError = "";
+        this.pageCount = 1;
+        this.freelistHead = 0;
+        this.commitId = 0;
+        this.syncEvery = 1;
+        this.commitsSinceSync = 0;
+    }
+
+    /// <summary>Opens (creating if missing) a database file, recovering any
+    /// committed-but-unapplied WAL data from a previous crash.</summary>
+    static Pager Open(string path, int cacheCapacity) {
+        Pager p = new Pager();
+        p.file = PageFile.Open(path);
+        if (!p.file.IsOpen()) {
+            p.lastError = p.file.GetError();
+            return p;
+        }
+        p.cache = PageCache.Create(cacheCapacity);
+        p.wal = Wal.Open(path + "-wal", Pager.PAGE_SIZE);
+
+        // Crash recovery: re-apply committed WAL frames, then reset the WAL.
+        p.wal.Recover(p.file);
+
+        if (p.file.Size() < Pager.PAGE_SIZE) {
+            // Fresh database: write the header page.
+            ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+            h.WriteU32(Pager.MAGIC);
+            h.WriteU32(Pager.PAGE_SIZE);
+            h.WriteU64(1);       // pageCount
+            h.WriteU64(0);       // freelistHead
+            h.WriteU64(0);       // commitId
+            p.file.WriteAt(0, h.Raw(), Pager.PAGE_SIZE);
+            p.file.Sync();
+            h.Free();
+        } else {
+            ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+            p.file.ReadAt(0, h, Pager.PAGE_SIZE);
+            h.SeekRead(0);
+            int magic = h.ReadU32();
+            if (magic != Pager.MAGIC) {
+                p.lastError = "not a ZanDB file";
+                h.Free();
+                return p;
+            }
+            int ps = h.ReadU32();
+            if (ps != Pager.PAGE_SIZE) {
+                p.lastError = "unsupported page size";
+                h.Free();
+                return p;
+            }
+            p.pageCount = h.ReadU64();
+            p.freelistHead = h.ReadU64();
+            p.commitId = h.ReadU64();
+            h.Free();
+        }
+        return p;
+    }
+
+    bool IsOpen() { return this.lastError.Length == 0 && this.file.IsOpen(); }
+
+    string GetError() { return this.lastError; }
+
+    int PageCount() { return this.pageCount; }
+
+    int CommitId() { return this.commitId; }
+
+    /// <summary>fsync cadence for the main file: 1 = every commit (Full),
+    /// N = every N commits (Grouped; WAL still fsyncs each commit so
+    /// committed data is always recoverable).</summary>
+    void SetSyncEvery(int n) {
+        if (n >= 1) { this.syncEvery = n; }
+    }
+
+    /// <summary>Returns the page buffer (cached; loaded from disk on miss).
+    /// The buffer stays owned by the pager.</summary>
+    ByteBuffer GetPage(int pageId) {
+        if (this.cache.Has(pageId)) {
+            return this.cache.Get(pageId);
+        }
+        ByteBuffer buf = ByteBuffer.Alloc(Pager.PAGE_SIZE);
+        if (pageId < this.pageCount) {
+            this.file.ReadAt(pageId * Pager.PAGE_SIZE, buf, Pager.PAGE_SIZE);
+        }
+        buf.SetLength(Pager.PAGE_SIZE);
+        this.cache.Put(pageId, buf);
+        return this.cache.Get(pageId);
+    }
+
+    /// <summary>Marks a page as modified; it will be persisted atomically by
+    /// the next Commit().</summary>
+    void MarkDirty(int pageId) {
+        this.cache.SetDirty(pageId, true);
+    }
+
+    /// <summary>Allocates a page, reusing the freelist before growing the
+    /// file. Returns the new page id.</summary>
+    int AllocPage() {
+        if (this.freelistHead != 0) {
+            int id = this.freelistHead;
+            ByteBuffer pg = GetPage(id);
+            pg.SeekRead(0);
+            this.freelistHead = pg.ReadU64();
+            pg.Clear();
+            pg.SetLength(Pager.PAGE_SIZE);
+            MarkDirty(id);
+            return id;
+        }
+        int nid = this.pageCount;
+        this.pageCount = this.pageCount + 1;
+        ByteBuffer fresh = GetPage(nid);
+        fresh.Clear();
+        fresh.SetLength(Pager.PAGE_SIZE);
+        MarkDirty(nid);
+        return nid;
+    }
+
+    /// <summary>Returns a page to the freelist for reuse.</summary>
+    void FreePage(int pageId) {
+        ByteBuffer pg = GetPage(pageId);
+        pg.Clear();
+        pg.WriteU64(this.freelistHead);
+        pg.SetLength(Pager.PAGE_SIZE);
+        this.freelistHead = pageId;
+        MarkDirty(pageId);
+    }
+
+    void WriteHeaderInto(ByteBuffer h) {
+        h.Clear();
+        h.WriteU32(Pager.MAGIC);
+        h.WriteU32(Pager.PAGE_SIZE);
+        h.WriteU64(this.pageCount);
+        h.WriteU64(this.freelistHead);
+        h.WriteU64(this.commitId);
+        h.SetLength(Pager.PAGE_SIZE);
+    }
+
+    /// <summary>Atomically persists all dirty pages: frames + commit record
+    /// are appended to the WAL and fsynced (durability point), then pages are
+    /// checkpointed into the main file. Returns true on success.</summary>
+    bool Commit() {
+        List<int> ids = this.cache.DirtyPageIds();
+        this.commitId = this.commitId + 1;
+
+        // Header page carries the new commit id / page count / freelist.
+        ByteBuffer header = GetPage(0);
+        WriteHeaderInto(header);
+        this.cache.SetDirty(0, true);
+        ids = this.cache.DirtyPageIds();
+
+        int i = 0;
+        while (i < ids.Count) {
+            ByteBuffer pg = this.cache.Get(ids[i]);
+            if (!this.wal.AppendFrame(ids[i], pg)) {
+                this.lastError = "wal append failed";
+                return false;
+            }
+            i = i + 1;
+        }
+        if (!this.wal.AppendCommit(this.commitId)) {
+            this.lastError = "wal commit failed";
+            return false;
+        }
+        // Durability point: committed data now survives a crash.
+
+        // Checkpoint: write dirty pages into the main file.
+        i = 0;
+        while (i < ids.Count) {
+            ByteBuffer pg = this.cache.Get(ids[i]);
+            this.file.WriteAt(ids[i] * Pager.PAGE_SIZE, pg.Raw(), Pager.PAGE_SIZE);
+            this.cache.SetDirty(ids[i], false);
+            i = i + 1;
+        }
+        this.file.Flush();
+
+        this.commitsSinceSync = this.commitsSinceSync + 1;
+        if (this.commitsSinceSync >= this.syncEvery) {
+            this.file.Sync();
+            this.commitsSinceSync = 0;
+            // Main file is durable; the WAL can start over.
+            this.wal.Reset();
+        }
+        return true;
+    }
+
+    /// <summary>Forces the main file to disk and truncates the WAL.</summary>
+    void Checkpoint() {
+        this.file.Sync();
+        this.commitsSinceSync = 0;
+        this.wal.Reset();
+    }
+
+    void Close() {
+        Checkpoint();
+        this.wal.Close();
+        this.file.Close();
+    }
+}
