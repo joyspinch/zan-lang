@@ -765,7 +765,8 @@ static bool zan_is_safe_bundle_name(const char *name) {
  * built for that target. */
 static const char *zan_driver_subdir(const zan_target_t *t) {
     if (t->os == ZAN_OS_LINUX)
-        return (t->arch == ZAN_ARCH_AARCH64) ? "linux-arm64" : "linux-x64";
+        return (t->arch == ZAN_ARCH_AARCH64) ? "linux-arm64"
+             : (t->arch == ZAN_ARCH_RISCV64) ? "linux-riscv64" : "linux-x64";
     if (t->os == ZAN_OS_MACOS)
         return (t->arch == ZAN_ARCH_AARCH64) ? "macos-arm64" : "macos-x64";
     return (t->arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
@@ -1578,7 +1579,9 @@ int main(int argc, char **argv) {
               if (n > 0) { exe_dir[n] = '\0'; char *s = strrchr(exe_dir, '/'); if (s) *s = '\0'; } }
 #endif
             const char *sub = (target.arch == ZAN_ARCH_AARCH64)
-                              ? "linux-arm64" : "linux-musl";
+                              ? "linux-arm64"
+                              : (target.arch == ZAN_ARCH_RISCV64)
+                              ? "riscv64" : "linux-musl";
             /* Sysroot sits right next to zanc, in whatever directory the
              * compiler was installed into (dev: build/<sub>; release:
              * dist/toolchain/<sub>). No separate toolchain/ subdirectory. */
@@ -1711,6 +1714,98 @@ int main(int argc, char **argv) {
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
                        " --end-group \"%s/crtend.o\"", syslib); }
+            link_ret = system(cmd);
+        } else if (cross_compiling && target.os == ZAN_OS_WASI) {
+            /* Link a WASI command module with wasm-ld against the bundled
+             * wasi-libc sysroot (wasm32/, copied next to zanc). */
+            char exe_dir2[1024];
+            zan_exe_dir(exe_dir2, sizeof(exe_dir2));
+            char sys[1200];
+            snprintf(sys, sizeof(sys), "%s/wasm32", exe_dir2);
+            char probe[1300];
+            snprintf(probe, sizeof(probe), "%s/libc.a", sys);
+            if (!zan_file_exists(probe)) {
+                fprintf(stderr,
+                        "error: bundled wasm32 wasi sysroot not found at "
+                        "'%s'; reinstall zan or rebuild with "
+                        "toolchain/wasm32 present\n", sys);
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            if (rt_io_obj) {
+                fprintf(stderr,
+                        "error: socket-async programs are not available for "
+                        "the wasm32 target\n");
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            char cmd[8192];
+            snprintf(cmd, sizeof(cmd),
+                     "wasm-ld%s -o \"%s\" \"%s/crt1.o\" \"%s\"",
+                     publish_mode ? " -s" : "", obj_path, sys, obj_tmp);
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                         extra_link_inputs[ei]);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " \"%s/zanrt_wasm.o\" \"%s/libc.a\" \"%s/libm.a\""
+                       " \"%s/libclang_rt.builtins-wasm32.a\"",
+                       sys, sys, sys, sys); }
+            link_ret = system(cmd);
+        } else if (cross_compiling && target.os == ZAN_OS_MACOS) {
+            /* Cross-link a Mach-O executable with ld64.lld against the
+             * bundled libSystem text stub (macos/libSystem.tbd, an
+             * MIT-licensed symbol list -- no Apple SDK is redistributed).
+             * All macOS system libraries live behind /usr/lib/libSystem.B
+             * on the target, so a console executable only needs -lSystem. */
+            char exe_dir2[1024];
+            zan_exe_dir(exe_dir2, sizeof(exe_dir2));
+            char tbd[1200];
+            snprintf(tbd, sizeof(tbd), "%s/macos/libSystem.tbd", exe_dir2);
+            if (!zan_file_exists(tbd)) {
+                fprintf(stderr,
+                        "error: bundled macOS libSystem stub not found at "
+                        "'%s'; reinstall zan or rebuild with "
+                        "toolchain/macos present\n", tbd);
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            if (rt_io_obj || irgen.uses_sync_runtime) {
+                fprintf(stderr,
+                        "error: socket-async/sync-runtime programs are not "
+                        "available for macOS cross-compilation yet\n");
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            const char *march = (target.arch == ZAN_ARCH_AARCH64)
+                                ? "arm64" : "x86_64";
+            char cmd[8192];
+            snprintf(cmd, sizeof(cmd),
+                     "ld64.lld -arch %s -platform_version macos 11.0 11.0"
+                     "%s -o \"%s\" \"%s\"",
+                     march, publish_mode ? " -dead_strip" : "",
+                     obj_path, obj_tmp);
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                         extra_link_inputs[ei]);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", tbd); }
             link_ret = system(cmd);
         } else if (cross_compiling) {
             fprintf(stderr,

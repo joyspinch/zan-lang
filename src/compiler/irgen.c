@@ -11496,7 +11496,207 @@ int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
     return stubbed;
 }
 
+/* wasm32 libc adapters (see zan_irgen_write_obj): define `fn` (which must be
+ * a body-less function of type src_ft) as a thin wrapper that converts its
+ * arguments to `lft` (the real 32-bit libc signature), calls `real`, and
+ * converts the result back. Conversions are int<->ptr and int-width casts;
+ * wasm pointers fit in 32 bits so the i64 handles Zan uses are safe to
+ * truncate. */
+static void w32_build_adapter_into(zan_irgen_t *g, LLVMValueRef fn,
+                                   LLVMValueRef real, LLVMTypeRef lft) {
+    LLVMTypeRef src_ft = LLVMGlobalGetValueType(fn);
+    unsigned nparams = LLVMCountParamTypes(src_ft);
+    if (nparams > 8 || LLVMCountParamTypes(lft) != nparams) return;
+    LLVMTypeRef sps[8], lps[8];
+    LLVMGetParamTypes(src_ft, sps);
+    LLVMGetParamTypes(lft, lps);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+    LLVMPositionBuilderAtEnd(b, bb);
+    LLVMValueRef args[8];
+    for (unsigned p = 0; p < nparams; p++) {
+        LLVMValueRef a = LLVMGetParam(fn, p);
+        LLVMTypeKind sk = LLVMGetTypeKind(sps[p]);
+        LLVMTypeKind lk = LLVMGetTypeKind(lps[p]);
+        if (sps[p] == lps[p]) {
+            args[p] = a;
+        } else if (sk == LLVMIntegerTypeKind && lk == LLVMPointerTypeKind) {
+            args[p] = LLVMBuildIntToPtr(b, a, lps[p], "");
+        } else if (sk == LLVMPointerTypeKind && lk == LLVMIntegerTypeKind) {
+            args[p] = LLVMBuildPtrToInt(b, a, lps[p], "");
+        } else if (sk == LLVMIntegerTypeKind && lk == LLVMIntegerTypeKind) {
+            args[p] = LLVMBuildIntCast2(b, a, lps[p], 1, "");
+        } else if (sk == LLVMPointerTypeKind && lk == LLVMPointerTypeKind) {
+            args[p] = LLVMBuildPointerCast(b, a, lps[p], "");
+        } else {
+            args[p] = a;
+        }
+    }
+    LLVMValueRef rv = LLVMBuildCall2(b, lft, real, args, nparams, "");
+    LLVMTypeRef srt = LLVMGetReturnType(src_ft);
+    LLVMTypeRef lrt = LLVMGetReturnType(lft);
+    if (LLVMGetTypeKind(srt) == LLVMVoidTypeKind) {
+        LLVMBuildRetVoid(b);
+    } else if (srt == lrt) {
+        LLVMBuildRet(b, rv);
+    } else if (LLVMGetTypeKind(lrt) == LLVMVoidTypeKind) {
+        LLVMBuildRet(b, LLVMConstNull(srt));
+    } else if (LLVMGetTypeKind(lrt) == LLVMPointerTypeKind &&
+               LLVMGetTypeKind(srt) == LLVMIntegerTypeKind) {
+        LLVMBuildRet(b, LLVMBuildPtrToInt(b, rv, srt, ""));
+    } else if (LLVMGetTypeKind(lrt) == LLVMIntegerTypeKind &&
+               LLVMGetTypeKind(srt) == LLVMIntegerTypeKind) {
+        LLVMBuildRet(b, LLVMBuildIntCast2(b, rv, srt, 1, ""));
+    } else if (LLVMGetTypeKind(lrt) == LLVMIntegerTypeKind &&
+               LLVMGetTypeKind(srt) == LLVMPointerTypeKind) {
+        LLVMBuildRet(b, LLVMBuildIntToPtr(b, rv, srt, ""));
+    } else {
+        LLVMBuildRet(b, rv);
+    }
+    LLVMDisposeBuilder(b);
+}
+
+static LLVMValueRef w32_build_adapter(zan_irgen_t *g, const char *name,
+                                      LLVMTypeRef src_ft, LLVMValueRef real,
+                                      LLVMTypeRef lft) {
+    if (LLVMCountParamTypes(src_ft) != LLVMCountParamTypes(lft) ||
+        LLVMCountParamTypes(src_ft) > 8)
+        return NULL;
+    LLVMValueRef fn = LLVMAddFunction(g->mod, name, src_ft);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    w32_build_adapter_into(g, fn, real, lft);
+    return fn;
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
+    /* wasm32: libc size_t/long are 32-bit but the IR declares these libc
+     * functions with i64 sizes (Zan int). Redirect the declarations to the
+     * zan_w32_* wrappers (src/runtime/rt_wasm.c, shipped pre-compiled in the
+     * wasm32 sysroot) whose signatures take i64 and forward to the real
+     * 32-bit libc, so wasm's strict signature checking is satisfied. */
+    if (strncmp(g->target_triple, "wasm32", 6) == 0) {
+        /* wasi-libc's _start calls __main_argc_argv (the name clang gives a
+         * two-argument main on wasm), not "main". */
+        LLVMValueRef mainf = LLVMGetNamedFunction(g->mod, "main");
+        if (mainf && LLVMCountBasicBlocks(mainf) > 0)
+            LLVMSetValueName2(mainf, "__main_argc_argv",
+                              strlen("__main_argc_argv"));
+        /* Variadic snprintf cannot be adapted in IR (varargs cannot be
+         * forwarded); route it to the C wrapper in rt_wasm.c instead. */
+        {
+            LLVMValueRef f = LLVMGetNamedFunction(g->mod, "snprintf");
+            if (f && LLVMCountBasicBlocks(f) == 0)
+                LLVMSetValueName2(f, "zan_w32_snprintf",
+                                  strlen("zan_w32_snprintf"));
+        }
+        /* Zan IR declares libc functions with 64-bit ints (Zan int is i64,
+         * and pointers passed through Zan `int` handles are i64 too), but
+         * wasm32's size_t/long/pointers are 32-bit and wasm enforces exact
+         * call signatures. For each such declaration, turn it into a thin
+         * adapter that truncates/extends the values and calls the real
+         * 32-bit libc function.
+         * Signature codes: p=pointer, i=i32, j=i64, s=size_t(i32),
+         * v=void; first char is the return, the rest are the params. */
+        static const struct { const char *name; const char *sig; } w32adapt[] = {
+            { "malloc", "ps" },      { "calloc", "pss" },
+            { "realloc", "pps" },    { "free", "vp" },
+            { "strlen", "sp" },      { "memcpy", "ppps" },
+            { "memset", "ppis" },    { "memcmp", "ipps" },
+            { "strcat", "ppp" },     { "strcpy", "ppp" },
+            { "strncpy", "ppps" },   { "strcmp", "ipp" },
+            { "strncmp", "ipps" },   { "strrchr", "ppi" },
+            { "strstr", "ppp" },     { "atoi", "ip" },
+            { "fopen", "ppp" },      { "fclose", "ip" },
+            { "fgetc", "ip" },       { "fputc", "iip" },
+            { "fputs", "ipp" },      { "fgets", "ppip" },
+            { "fread", "spssp" },    { "fwrite", "spssp" },
+            { "fseek", "ipii" },     { "ftell", "ip" },
+            { "fflush", "ip" },      { "remove", "ip" },
+            { "rename", "ipp" },     { "chdir", "ip" },
+            { "getcwd", "pps" },     { "mkdir", "ipi" },
+            { "rmdir", "ip" },       { "opendir", "pp" },
+            { "readdir", "pp" },     { "closedir", "ip" },
+            { "time", "jp" },        { "poll", "ipii" },
+            { NULL, NULL }
+        };
+        LLVMTypeRef w_i32 = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef w_i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef w_ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        for (int i = 0; w32adapt[i].name; i++) {
+            LLVMValueRef decl = LLVMGetNamedFunction(g->mod, w32adapt[i].name);
+            if (!decl || LLVMCountBasicBlocks(decl) > 0) continue;
+            LLVMTypeRef dft = LLVMGlobalGetValueType(decl);
+            if (LLVMIsFunctionVarArg(dft)) continue;
+            const char *sig = w32adapt[i].sig;
+            int nparams = (int)strlen(sig) - 1;
+            if (nparams > 8 || (int)LLVMCountParamTypes(dft) != nparams)
+                continue;
+            /* the real libc function's type */
+            LLVMTypeRef lps[8];
+            for (int p = 0; p < nparams; p++) {
+                char c = sig[p + 1];
+                lps[p] = (c == 'p') ? w_ptr : (c == 'j') ? w_i64 : w_i32;
+            }
+            char rc = sig[0];
+            LLVMTypeRef lrt = (rc == 'v') ? LLVMVoidTypeInContext(g->ctx)
+                              : (rc == 'p') ? w_ptr
+                              : (rc == 'j') ? w_i64 : w_i32;
+            LLVMTypeRef lft = LLVMFunctionType(lrt, lps, (unsigned)nparams, 0);
+            /* rename the declaration; re-add the real libc function */
+            char an[80];
+            snprintf(an, sizeof(an), "__zan_w32ir_%s", w32adapt[i].name);
+            LLVMSetValueName2(decl, an, strlen(an));
+            LLVMValueRef real = LLVMAddFunction(g->mod, w32adapt[i].name, lft);
+            /* Different call sites may use different signatures for the same
+             * function (Zan reuses an existing declaration whatever its
+             * type), so rewrite every direct call: give each distinct
+             * call-site type its own adapter that converts the values and
+             * calls the real 32-bit libc function. */
+            LLVMTypeRef cts[8];
+            LLVMValueRef cad[8];
+            int ncts = 0;
+            LLVMUseRef use = LLVMGetFirstUse(decl);
+            while (use) {
+                LLVMUseRef next = LLVMGetNextUse(use);
+                LLVMValueRef user = LLVMGetUser(use);
+                if (LLVMIsACallInst(user) &&
+                    LLVMGetCalledValue(user) == decl) {
+                    LLVMTypeRef cft = LLVMGetCalledFunctionType(user);
+                    if (cft == lft) {
+                        /* already the 32-bit ABI: call libc directly */
+                        LLVMSetOperand(user,
+                                       LLVMGetNumOperands(user) - 1, real);
+                    } else if (!LLVMIsFunctionVarArg(cft) &&
+                               (int)LLVMCountParamTypes(cft) == nparams) {
+                        LLVMValueRef ad = NULL;
+                        for (int k = 0; k < ncts; k++) {
+                            if (cts[k] == cft) { ad = cad[k]; break; }
+                        }
+                        if (!ad) {
+                            char nm[96];
+                            snprintf(nm, sizeof(nm), "%s.v%d", an, ncts);
+                            ad = w32_build_adapter(g, nm, cft, real, lft);
+                            if (ad && ncts < 8) {
+                                cts[ncts] = cft;
+                                cad[ncts] = ad;
+                                ncts++;
+                            }
+                        }
+                        if (ad)
+                            LLVMSetOperand(user,
+                                           LLVMGetNumOperands(user) - 1, ad);
+                    }
+                }
+                use = next;
+            }
+            /* Any remaining (indirect) uses go through the renamed
+             * declaration itself: define it as an adapter too. */
+            if (LLVMGetFirstUse(decl) && dft != lft) {
+                w32_build_adapter_into(g, decl, real, lft);
+                LLVMSetLinkage(decl, LLVMInternalLinkage);
+            }
+        }
+    }
     /* Initialize every target family the build links (see CMakeLists.txt), so
      * zanc can emit code for the host regardless of architecture (e.g. arm64
      * macOS) as well as cross-compile to the advertised targets. */
@@ -11523,6 +11723,12 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     LLVMInitializeWebAssemblyTargetMC();
     LLVMInitializeWebAssemblyAsmParser();
     LLVMInitializeWebAssemblyAsmPrinter();
+
+    LLVMInitializeRISCVTargetInfo();
+    LLVMInitializeRISCVTarget();
+    LLVMInitializeRISCVTargetMC();
+    LLVMInitializeRISCVAsmParser();
+    LLVMInitializeRISCVAsmPrinter();
 
     char *triple;
     if (g->target_triple[0]) {
@@ -11560,8 +11766,21 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         return ZAN_ERROR;
     }
 
+    /* RISC-V: match the RV64GC / lp64d ABI the bundled musl sysroot uses
+     * (the ABI must be recorded as a module flag for the backend to lower
+     * doubles into FP registers). */
+    const char *tm_cpu = "generic";
+    const char *tm_features = "";
+    if (strncmp(triple, "riscv64", 7) == 0) {
+        tm_cpu = "generic-rv64";
+        tm_features = "+m,+a,+f,+d,+c";
+        LLVMAddModuleFlag(g->mod, LLVMModuleFlagBehaviorError,
+                          "target-abi", strlen("target-abi"),
+                          LLVMValueAsMetadata(LLVMMDStringInContext(
+                              g->ctx, "lp64d", 5)));
+    }
     LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
-        target, triple, "generic", "",
+        target, triple, tm_cpu, tm_features,
         LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelDefault);
 
     LLVMSetTarget(g->mod, triple);
