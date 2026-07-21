@@ -18,6 +18,12 @@ namespace System.Data.Postgres;
 ///   db.Execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)");
 ///   DbResult r = db.Query("SELECT * FROM users");
 ///   db.Close();
+///
+/// Parameterized (preferred -- values never enter the SQL text; `?`
+/// placeholders are translated to $1..$n for libpq):
+///   db.Execute("INSERT INTO users (name) VALUES (?)", DbParams.Create().Add(name));
+///   DbResult r = db.Query("SELECT * FROM users WHERE name = ?",
+///       DbParams.Create().Add(name));
 /// </summary>
 class PgConnection {
     int handle;      // PGconn*
@@ -63,8 +69,27 @@ class PgConnection {
     [DllImport("libpq")]
     static extern void PQclear(int res);
 
+    [DllImport("libpq")]
+    static extern int PQexecParams(int conn, string command, int nParams,
+        int paramTypes, string paramValues, int paramLengths, int paramFormats,
+        int resultFormat);   // -> PGresult*
+
+    [DllImport("libpq")]
+    static extern int PQsendQueryParams(int conn, string command, int nParams,
+        int paramTypes, string paramValues, int paramLengths, int paramFormats,
+        int resultFormat);   // 1 = ok, 0 = fail
+
     [DllImport("crt")]
     static extern int atoi(string str);
+
+    [DllImport("crt")]
+    static extern string calloc(int num, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    [DllImport("crt")]
+    static extern int memcpy(string dest, string src, int n);   // returns dest pointer
 
     // ---- Non-blocking (async) libpq entry points ----
     [DllImport("libpq")]
@@ -104,6 +129,99 @@ class PgConnection {
     /// </summary>
     static string CopyText(string s) {
         return "" + s;
+    }
+
+    /// <summary>Rewrites `?` placeholders (outside single-quoted literals) to
+    /// libpq's positional $1..$n form, so all drivers share the `?` syntax.</summary>
+    static string ToDollarParams(string sql) {
+        StringBuilder sb = new StringBuilder();
+        int n = sql.Length;
+        int next = 1;
+        bool inQuote = false;
+        int i = 0;
+        while (i < n) {
+            int c = sql[i] & 255;
+            if (c == 39) {                    // '
+                inQuote = !inQuote;
+                sb.Append("'");
+            } else if (c == 63 && !inQuote) { // ?
+                sb.Append("$");
+                sb.Append(Convert.ToString(next));
+                next = next + 1;
+            } else {
+                sb.Append(sql.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Builds the char** paramValues block for PQexecParams: an array
+    /// of pointers to NUL-terminated copies of each value (0 for SQL NULL).
+    /// The value buffers are appended to keepAlive and must be freed with
+    /// FreeParamBlock after the libpq call returns.</summary>
+    static string BuildParamBlock(DbParams prms, List<string> keepAlive) {
+        int n = prms.Count();
+        string block = calloc(n * 8 + 8, 1);
+        int i = 0;
+        while (i < n) {
+            int p = 0;
+            if (!prms.IsNull(i)) {
+                string t = prms.AsText(i);
+                string buf = calloc(t.Length + 1, 1);
+                p = memcpy(buf, t, t.Length);
+                keepAlive.Add(buf);
+            }
+            int off = i * 8;
+            block[off] = p & 255;
+            block[off + 1] = (p >> 8) & 255;
+            block[off + 2] = (p >> 16) & 255;
+            block[off + 3] = (p >> 24) & 255;
+            block[off + 4] = (p >> 32) & 255;
+            block[off + 5] = (p >> 40) & 255;
+            block[off + 6] = (p >> 48) & 255;
+            block[off + 7] = (p >> 56) & 255;
+            i = i + 1;
+        }
+        return block;
+    }
+
+    static void FreeParamBlock(string block, List<string> keepAlive) {
+        int i = 0;
+        while (i < keepAlive.Count) {
+            free(keepAlive[i]);
+            i = i + 1;
+        }
+        free(block);
+    }
+
+    /// <summary>Copies a TUPLES_OK PGresult into a DbResult (NULL cells become "").</summary>
+    static DbResult ReadTuples(int res) {
+        DbResult result = DbResult.Create();
+        int cols = PQnfields(res);
+        result.SetColumnCount(cols);
+        int c = 0;
+        while (c < cols) {
+            result.AddColumnName(CopyText(PQfname(res, c)));
+            c = c + 1;
+        }
+        int rows = PQntuples(res);
+        int r = 0;
+        while (r < rows) {
+            List<string> row = new List<string>();
+            c = 0;
+            while (c < cols) {
+                if (PQgetisnull(res, r, c) == 1) {
+                    row.Add("");
+                } else {
+                    row.Add(CopyText(PQgetvalue(res, r, c)));
+                }
+                c = c + 1;
+            }
+            result.AddRow(row);
+            r = r + 1;
+        }
+        return result;
     }
 
     PgConnection() {
@@ -191,9 +309,58 @@ class PgConnection {
         return result;
     }
 
+    /// <summary>Executes a parameterized non-query statement via PQexecParams:
+    /// values are sent out-of-band, never spliced into the SQL text.</summary>
+    int Execute(string sql, DbParams prms) {
+        if (!this.connected) { return -1; }
+        List<string> keepAlive = new List<string>();
+        string block = BuildParamBlock(prms, keepAlive);
+        int res = PQexecParams(this.handle, ToDollarParams(sql), prms.Count(),
+            0, block, 0, 0, 0);
+        FreeParamBlock(block, keepAlive);
+        if (res == 0) { this.lastError = CopyText(PQerrorMessage(this.handle)); return -1; }
+        int st = PQresultStatus(res);
+        if (st != 1 && st != 2) {
+            this.lastError = CopyText(PQerrorMessage(this.handle));
+            PQclear(res);
+            return -1;
+        }
+        int affected = atoi(PQcmdTuples(res));
+        PQclear(res);
+        return affected;
+    }
+
+    /// <summary>Executes a parameterized query via PQexecParams.</summary>
+    DbResult Query(string sql, DbParams prms) {
+        if (!this.connected) { return DbResult.Empty(); }
+        List<string> keepAlive = new List<string>();
+        string block = BuildParamBlock(prms, keepAlive);
+        int res = PQexecParams(this.handle, ToDollarParams(sql), prms.Count(),
+            0, block, 0, 0, 0);
+        FreeParamBlock(block, keepAlive);
+        if (res == 0) { this.lastError = CopyText(PQerrorMessage(this.handle)); return DbResult.Create(); }
+        if (PQresultStatus(res) != 2) {
+            this.lastError = CopyText(PQerrorMessage(this.handle));
+            PQclear(res);
+            return DbResult.Create();
+        }
+        DbResult result = ReadTuples(res);
+        PQclear(res);
+        return result;
+    }
+
     /// <summary>Executes a scalar query (first column of first row).</summary>
     string ExecuteScalar(string sql) {
         DbResult result = Query(sql);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// <summary>Executes a parameterized scalar query.</summary>
+    string ExecuteScalar(string sql, DbParams prms) {
+        DbResult result = Query(sql, prms);
         if (result.RowCount() > 0) {
             return result.GetString(0, 0);
         }
@@ -336,6 +503,86 @@ class PgConnection {
             PQclear(res);
         }
         return result;
+    }
+
+    /// <summary>Sends a parameterized query asynchronously (PQsendQueryParams)
+    /// and drains the results on the IO reactor.</summary>
+    async DbResult QueryAsync(string sql, DbParams prms) {
+        if (!this.connected) { return DbResult.Empty(); }
+        DbResult result = DbResult.Create();
+        List<string> keepAlive = new List<string>();
+        string block = BuildParamBlock(prms, keepAlive);
+        int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
+            0, block, 0, 0, 0);
+        FreeParamBlock(block, keepAlive);
+        if (ok == 0) {
+            this.lastError = CopyText(PQerrorMessage(this.handle));
+            return result;
+        }
+        int f = await this.flushOutput();
+        if (f < 0) {
+            return result;
+        }
+        while (true) {
+            bool ready = await this.waitReady();
+            if (!ready) {
+                return result;
+            }
+            int res = PQgetResult(this.handle);
+            if (res == 0) {
+                break;
+            }
+            if (PQresultStatus(res) == 2) {   // TUPLES_OK
+                result = ReadTuples(res);
+            } else if (PQresultStatus(res) != 1) {   // not COMMAND_OK
+                this.lastError = CopyText(PQerrorMessage(this.handle));
+            }
+            PQclear(res);
+        }
+        return result;
+    }
+
+    /// <summary>Sends a parameterized non-query statement asynchronously;
+    /// returns the affected row count, or -1 on error.</summary>
+    async int ExecuteAsync(string sql, DbParams prms) {
+        if (!this.connected) { return -1; }
+        List<string> keepAlive = new List<string>();
+        string block = BuildParamBlock(prms, keepAlive);
+        int ok = PQsendQueryParams(this.handle, ToDollarParams(sql), prms.Count(),
+            0, block, 0, 0, 0);
+        FreeParamBlock(block, keepAlive);
+        if (ok == 0) {
+            this.lastError = CopyText(PQerrorMessage(this.handle));
+            return -1;
+        }
+        int f2 = await this.flushOutput();
+        if (f2 < 0) {
+            return -1;
+        }
+        int affected2 = 0;
+        bool failed2 = false;
+        while (true) {
+            bool ready = await this.waitReady();
+            if (!ready) {
+                return -1;
+            }
+            int res = PQgetResult(this.handle);
+            if (res == 0) {
+                break;
+            }
+            int st = PQresultStatus(res);
+            if (st == 1 || st == 2) {
+                affected2 = atoi(PQcmdTuples(res));
+            } else {
+                this.lastError = CopyText(PQerrorMessage(this.handle));
+                failed2 = true;
+            }
+            PQclear(res);
+        }
+        if (failed2) {
+            return -1;
+        }
+        return affected2;
     }
 
     /// <summary>Sends a non-query statement asynchronously; returns the affected
