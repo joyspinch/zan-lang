@@ -199,6 +199,21 @@ foreach(_linux_sub linux-musl linux-arm64)
     endif()
 endforeach()
 
+# ---- Windows cross-compilation runtimes ----
+# Copy the bundled mingw-w64 runtimes (committed at toolchain/win-x64/ and
+# toolchain/win-arm64/) next to zanc so that --target win-x64 / win-arm64 can
+# link PE executables from any host with ld.lld.
+foreach(_win_sub win-x64 win-arm64)
+    set(_win_sys "${CMAKE_SOURCE_DIR}/toolchain/${_win_sub}")
+    if(EXISTS "${_win_sys}/mingw/lib/crt2.o")
+        add_custom_command(TARGET zanc POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${_win_sys}" $<TARGET_FILE_DIR:zanc>/${_win_sub}
+            COMMENT "Copying ${_win_sub} mingw runtime for cross-compilation"
+            VERBATIM)
+    endif()
+endforeach()
+
 # ---- Native database drivers (publish-time bundling) ----
 # Each native DB driver now lives inside the stdlib module that owns it
 # (e.g. stdlib/System/Data/Sqlite/drivers/<target>/), so it travels with stdlib

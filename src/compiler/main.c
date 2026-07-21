@@ -1227,8 +1227,20 @@ int main(int argc, char **argv) {
 
     /* ---- codegen ---- */
     zan_irgen_t irgen;
+    /* Windows cross-objects use the mingw ABI (matching the bundled
+     * mingw-w64 runtime linked below), not the MSVC ABI of the listed
+     * triple. */
+    const char *irgen_triple = NULL;
+    if (cross_compiling) {
+        if (target.os == ZAN_OS_WINDOWS)
+            irgen_triple = (target.arch == ZAN_ARCH_AARCH64)
+                           ? "aarch64-w64-windows-gnu"
+                           : "x86_64-w64-windows-gnu";
+        else
+            irgen_triple = target.triple;
+    }
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
-                       cross_compiling ? target.triple : NULL,
+                       irgen_triple,
                        target.os == ZAN_OS_WINDOWS, mt_scheduler,
                        check_leaks) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
@@ -1606,10 +1618,104 @@ int main(int argc, char **argv) {
               snprintf(cmd + cur, sizeof(cmd) - cur,
                        " --end-group \"%s/crtn.o\"", sys); }
             link_ret = system(cmd);
+        } else if (cross_compiling && target.os == ZAN_OS_WINDOWS) {
+            /* Cross-link a Windows PE executable with ld.lld's MinGW driver
+             * against the bundled mingw-w64 runtime shipped next to zanc at
+             * win-<arch>/mingw/lib. Objects were emitted with the
+             * *-w64-windows-gnu ABI (see irgen_triple above). win-x64 uses
+             * the GCC-built mingw runtime (libgcc); win-arm64 uses the
+             * llvm-mingw runtime (compiler-rt builtins + libunwind). */
+            char exe_dir2[1024];
+            zan_exe_dir(exe_dir2, sizeof(exe_dir2));
+            const char *wsub = (target.arch == ZAN_ARCH_AARCH64)
+                               ? "win-arm64" : "win-x64";
+            char syslib[1200];
+            snprintf(syslib, sizeof(syslib), "%s/%s/mingw/lib", exe_dir2, wsub);
+            char probe[1300];
+            snprintf(probe, sizeof(probe), "%s/crt2.o", syslib);
+            if (!zan_file_exists(probe)) {
+                fprintf(stderr,
+                        "error: bundled %s mingw runtime not found at '%s'; "
+                        "reinstall zan or rebuild with toolchain/%s present\n",
+                        wsub, syslib, wsub);
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            if (rt_io_obj) {
+                fprintf(stderr,
+                        "error: socket-async programs are not available for "
+                        "this cross-compilation target yet\n");
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            char gcclib[1300];
+            snprintf(gcclib, sizeof(gcclib), "%s/libgcc.a", syslib);
+            int have_gcc = zan_file_exists(gcclib);
+
+            char cmd[8192];
+            snprintf(cmd, sizeof(cmd),
+                     "ld.lld -m %s --stack 268435456%s%s -o \"%s\" "
+                     "\"%s/crt2.o\" \"%s/crtbegin.o\" -L\"%s\"",
+                     (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep",
+                     publish_mode ? " -s" : "",
+                     (link_subsystem && strcmp(link_subsystem, "windows") == 0)
+                         ? " --subsystem windows" : "",
+                     obj_path, syslib, syslib, syslib);
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         zan_lib_dirs[di]);
+            }
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         extra_lib_paths[di]);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", obj_tmp); }
+            for (int ei = 0; ei < extra_link_input_count; ei++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                         extra_link_inputs[ei]);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur, " --start-group"
+                       " -lmingw32 -lmoldname -lmingwex -lmsvcrt"
+                       " -lkernel32 -ladvapi32 -lshell32 -luser32"); }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur, have_gcc
+                       ? " -lgcc -lgcc_eh"
+                       : " -lclang_rt.builtins-aarch64 -lunwind -lucrt"); }
+            for (int ei = 0; ei < extra_link_lib_count; ei++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -l%s",
+                         extra_link_libs[ei]);
+            }
+            /* extern [DllImport] libraries: resolve from the bundled import
+             * libs or the driver search dirs added above */
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue;
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s", nlen, nm);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " --end-group \"%s/crtend.o\"", syslib); }
+            link_ret = system(cmd);
         } else if (cross_compiling) {
             fprintf(stderr,
-                    "error: cross-compilation to '%s' is not supported yet; "
-                    "only linux targets are implemented (see --list-targets)\n",
+                    "error: cross-compilation to '%s' is not supported yet "
+                    "(see --list-targets)\n",
                     target.triple);
             remove(obj_tmp);
             zan_irgen_destroy(&irgen);

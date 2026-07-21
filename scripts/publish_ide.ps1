@@ -94,7 +94,7 @@ if (Test-Path $ld) {
 } else {
     Write-Output "PUBLISH_WARN: build\ld.exe missing; dist zanc will need a system LLVM/clang on PATH"
 }
-foreach ($sub in @('linux-musl', 'linux-arm64')) {
+foreach ($sub in @('linux-musl', 'linux-arm64', 'win-x64', 'win-arm64', 'wasm32', 'riscv64', 'macos')) {
     $sys = Join-Path $b $sub
     if (Test-Path $sys) { Copy-Item $sys (Join-Path $distTc $sub) -Recurse }
 }
