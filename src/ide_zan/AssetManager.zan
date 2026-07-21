@@ -1,0 +1,596 @@
+using System;
+using System.IO;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+/// The IDE's asset manager: a modal browser over the project's assets/ tree.
+/// Navigate folders, import single files or whole directories (recursively,
+/// keeping the folder structure), create/rename/delete entries, and author
+/// `.anim` clip metadata for 8-direction frame-sheet sprites (framesPerDir /
+/// dirs / fps / loop mode), the format Game.Core.AnimPlayer consumes.
+///
+/// Batch import understands an `assets.manifest.json` written by external
+/// export tools (see docs/ASSET_PIPELINE.md): each entry names the source
+/// file, its target path inside assets/, and optional anim clip data; a
+/// folder with a manifest imports exactly what the manifest lists.
+class AssetManager {
+    static int lang;   // 0 English, 1 Chinese; the IDE keeps this in sync
+
+    string curRel;     // current folder relative to assets/ ("" = root)
+    int selIdx;        // selected row in the combined dir+file listing (-1 none)
+    int scroll;        // first visible row
+    string msg;        // one-line status feedback
+    int loopMode;      // anim editor: 0 once, 1 loop, 2 loop-section
+    bool confirmDel;   // delete button clicked once (asks to confirm)
+
+    Input folderIn;
+    Input renameIn;
+    Input fpdIn;       // frames per direction
+    Input dirsIn;      // direction count (8 for Mir-style)
+    Input fpsIn;
+    Input loopStartIn;
+    Input frameWIn;
+    Input frameHIn;
+    string renameFor;  // entry the rename box was loaded for
+    string animFor;    // entry the anim editor was loaded for
+
+    static string T(string en, string zh) {
+        if (AssetManager.lang == 1) { return zh; }
+        return en;
+    }
+
+    static AssetManager Create() {
+        AssetManager m = new AssetManager();
+        m.curRel = "";
+        m.selIdx = -1;
+        m.scroll = 0;
+        m.msg = "";
+        m.loopMode = 1;
+        m.confirmDel = false;
+        m.folderIn = Input.Create("new-folder");
+        m.renameIn = Input.Create("name");
+        m.fpdIn = Input.Create("6");
+        m.dirsIn = Input.Create("8");
+        m.fpsIn = Input.Create("12");
+        m.loopStartIn = Input.Create("0");
+        m.frameWIn = Input.Create("0");
+        m.frameHIn = Input.Create("0");
+        m.renameFor = "";
+        m.animFor = "";
+        return m;
+    }
+
+    // ---- small local helpers (no dependency on ZanIDE) ----
+
+    static bool endsWith(string s, string suf) {
+        if (s.Length < suf.Length) { return false; }
+        return s.Substring(s.Length - suf.Length, suf.Length) == suf;
+    }
+
+    static int parseInt(string s, int def) {
+        int v = 0;
+        int n = 0;
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) { v = v * 10 + (c - 48); n = n + 1; }
+            i = i + 1;
+        }
+        if (n == 0) { return def; }
+        return v;
+    }
+
+    /// Classifies by extension: 0 image, 1 audio, 2 font, 3 data, 4 anim, 5 other.
+    static int typeOf(string nm) {
+        string lo = SceneDesigner.AsciiLower(nm);
+        if (endsWith(lo, ".png") || endsWith(lo, ".jpg") || endsWith(lo, ".jpeg")
+            || endsWith(lo, ".bmp") || endsWith(lo, ".gif") || endsWith(lo, ".tga")
+            || endsWith(lo, ".ico")) { return 0; }
+        if (endsWith(lo, ".wav") || endsWith(lo, ".mp3") || endsWith(lo, ".ogg")
+            || endsWith(lo, ".flac") || endsWith(lo, ".mid")) { return 1; }
+        if (endsWith(lo, ".ttf") || endsWith(lo, ".otf") || endsWith(lo, ".fnt")) { return 2; }
+        if (endsWith(lo, ".json") || endsWith(lo, ".txt") || endsWith(lo, ".xml")
+            || endsWith(lo, ".csv") || endsWith(lo, ".ini")
+            || endsWith(lo, ".zscene")) { return 3; }
+        if (endsWith(lo, ".anim")) { return 4; }
+        return 5;
+    }
+
+    static string typeLabel(int ty) {
+        if (ty == 0) { return T("IMG", "图片"); }
+        if (ty == 1) { return T("AUD", "音频"); }
+        if (ty == 2) { return T("FONT", "字体"); }
+        if (ty == 3) { return T("DATA", "数据"); }
+        if (ty == 4) { return T("ANIM", "动画"); }
+        return T("MISC", "其它");
+    }
+
+    static int typeColor(Theme t, int ty) {
+        if (ty == 0) { return t.success; }
+        if (ty == 1) { return t.info; }
+        if (ty == 2) { return t.warning; }
+        if (ty == 3) { return t.primary; }
+        if (ty == 4) { return t.error; }
+        return t.textTertiary;
+    }
+
+    string curDir(string root) {
+        string d = root + "/assets";
+        if (this.curRel.Length > 0) { d = d + "/" + this.curRel; }
+        return d;
+    }
+
+    static string sizeLabel(int bytes) {
+        if (bytes < 0) { return ""; }
+        if (bytes < 1024) { return Convert.ToString(bytes) + " B"; }
+        if (bytes < 1048576) { return Convert.ToString(bytes / 1024) + " KB"; }
+        return Convert.ToString(bytes / 1048576) + " MB"; 
+    }
+
+    // ---- import operations (invoked by ZanIDE after the path picker) ----
+
+    /// Copies one picked file into the current assets folder.
+    void ImportFile(string picked, string root, List<string> log) {
+        string dst = this.curDir(root);
+        Directory.CreateDirectoryRecursive(dst);
+        string nm = Path.GetFileName(picked);
+        File.Copy(picked, dst + "/" + nm);
+        this.msg = T("Imported ", "已导入 ") + nm;
+        log.Add("> Asset imported: " + this.relOf(nm));
+    }
+
+    string relOf(string nm) {
+        if (this.curRel.Length > 0) { return this.curRel + "/" + nm; }
+        return nm;
+    }
+
+    static int copyTree(string src, string dst) {
+        Directory.CreateDirectoryRecursive(dst);
+        int n = 0;
+        List<string> fs = Directory.GetFiles(src);
+        int i = 0;
+        while (i < fs.Count) {
+            File.Copy(src + "/" + fs[i], dst + "/" + fs[i]);
+            n = n + 1;
+            i = i + 1;
+        }
+        List<string> ds = Directory.GetDirectories(src);
+        i = 0;
+        while (i < ds.Count) {
+            n = n + copyTree(src + "/" + ds[i], dst + "/" + ds[i]);
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// Imports a whole folder. With an assets.manifest.json each listed entry
+    /// is placed (and its anim clip written) exactly as the manifest says;
+    /// otherwise the tree is copied recursively into the current folder.
+    void ImportFolder(string srcDir, string root, List<string> log) {
+        string mf = srcDir + "/assets.manifest.json";
+        if (File.Exists(mf)) {
+            int n = AssetManager.importManifest(mf, srcDir, root, log);
+            this.msg = T("Manifest import: ", "清单导入：") + Convert.ToString(n)
+                + T(" entries", " 项");
+            return;
+        }
+        int c = copyTree(srcDir, this.curDir(root));
+        this.msg = T("Imported ", "已导入 ") + Convert.ToString(c) + T(" files", " 个文件");
+        log.Add("> Asset folder imported: " + Convert.ToString(c) + " file(s) -> assets/" + this.curRel);
+    }
+
+    static string extOf(string nm) {
+        int i = nm.Length - 1;
+        while (i >= 0) {
+            string ch = nm.Substring(i, 1);
+            if (ch == ".") { return nm.Substring(i, nm.Length - i); }
+            if (ch == "/" || ch == "\\") { return ""; }
+            i = i - 1;
+        }
+        return "";
+    }
+
+    static string dirPart(string rel) {
+        int i = rel.Length - 1;
+        while (i >= 0) {
+            string ch = rel.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { return rel.Substring(0, i); }
+            i = i - 1;
+        }
+        return "";
+    }
+
+    static int importManifest(string mf, string srcDir, string root, List<string> log) {
+        JsonValue doc = JsonValue.Parse(File.ReadAllText(mf));
+        if (doc == null) { return 0; }
+        JsonValue entries = doc.Get("entries");
+        if (entries == null || !entries.IsArray()) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < entries.Count()) {
+            JsonValue e = entries.At(i);
+            string src = e.Str("src", "");
+            string name = e.Str("name", "");
+            if (src == "" || !File.Exists(srcDir + "/" + src)) {
+                log.Add("> WARNING: manifest entry missing: " + src);
+                i = i + 1;
+                continue;
+            }
+            if (name == "") { name = src; }
+            string rel = name;
+            string ext = extOf(src);
+            if (extOf(name) == "") { rel = name + ext; }
+            string dstDir = root + "/assets";
+            string dp = dirPart(rel);
+            if (dp.Length > 0) { dstDir = dstDir + "/" + dp; }
+            Directory.CreateDirectoryRecursive(dstDir);
+            File.Copy(srcDir + "/" + src, root + "/assets/" + rel);
+            n = n + 1;
+            JsonValue an = e.Get("anim");
+            if (an != null && an.IsObject()) {
+                string image = Path.GetFileName(rel);
+                string loop = an.Str("loop", "loop");
+                writeAnim(root, stripExt(rel), image,
+                    an.Int("frameW", 0), an.Int("frameH", 0),
+                    an.Int("dirs", 8), an.Int("framesPerDir", 1),
+                    an.Int("fps", 12), loop, an.Int("loopStart", 0));
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        log.Add("> Manifest import: " + Convert.ToString(n) + " item(s) from " + srcDir);
+        return n;
+    }
+
+    static string stripExt(string nm) {
+        string ext = extOf(nm);
+        if (ext.Length == 0) { return nm; }
+        return nm.Substring(0, nm.Length - ext.Length);
+    }
+
+    /// Writes the `.anim` clip descriptor consumed by Game.Core.AnimPlayer.
+    static void writeAnim(string root, string relNoExt, string image,
+                          int fw, int fh, int dirs, int fpd, int fps,
+                          string loop, int loopStart) {
+        string o = "{\n";
+        o = o + "  \"version\": 1,\n";
+        o = o + "  \"image\": \"" + image + "\",\n";
+        o = o + "  \"frameW\": " + Convert.ToString(fw) + ",\n";
+        o = o + "  \"frameH\": " + Convert.ToString(fh) + ",\n";
+        o = o + "  \"dirs\": " + Convert.ToString(dirs) + ",\n";
+        o = o + "  \"framesPerDir\": " + Convert.ToString(fpd) + ",\n";
+        o = o + "  \"fps\": " + Convert.ToString(fps) + ",\n";
+        o = o + "  \"loop\": \"" + loop + "\",\n";
+        o = o + "  \"loopStart\": " + Convert.ToString(loopStart) + "\n";
+        o = o + "}\n";
+        File.WriteAllText(root + "/assets/" + relNoExt + ".anim", o);
+    }
+
+    static void deleteTree(string path) {
+        List<string> fs = Directory.GetFiles(path);
+        int i = 0;
+        while (i < fs.Count) { File.Delete(path + "/" + fs[i]); i = i + 1; }
+        List<string> ds = Directory.GetDirectories(path);
+        i = 0;
+        while (i < ds.Count) { deleteTree(path + "/" + ds[i]); i = i + 1; }
+        Directory.Delete(path);
+    }
+
+    /// Renders the modal manager. Returns 0 open, 1 close,
+    /// 2 = caller should open a file picker (import file),
+    /// 3 = caller should open a folder picker (import folder).
+    int Render(App app, string root, List<string> log) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        c.FillRect(0, 0, W, H, t.overlay);
+        app.BlockHitsBelow();
+
+        int w = app.Scale(880);
+        int h = app.Scale(620);
+        if (w > W - app.Scale(20)) { w = W - app.Scale(20); }
+        if (h > H - app.Scale(20)) { h = H - app.Scale(20); }
+        int x = (W - w) / 2;
+        int y = (H - h) / 2;
+        c.FillRoundRect(x + 2, y + 3, w, h, app.Scale(6), t.shadowColor);
+        Panel.FillSurface(app, x, y, w, h, t.bgPrimary);
+
+        int pad = app.Scale(16);
+        c.DrawText(x + pad, y + pad, T("Asset Manager", "资源管理器"), t.textPrimary, t.fontSizeLarge);
+        string crumb = "assets/";
+        if (this.curRel.Length > 0) { crumb = crumb + this.curRel; }
+        c.DrawText(x + pad, y + pad + app.Scale(24), crumb, t.textSecondary, t.fontSizeSmall);
+        c.FillRect(x + 1, y + app.Scale(58), w - 2, 1, t.divider);
+
+        int action = 0;
+        string ad = this.curDir(root);
+        Directory.CreateDirectoryRecursive(root + "/assets");
+
+        // ---- toolbar ----
+        int bY = y + app.Scale(66);
+        int bW = app.Scale(108);
+        int bX = x + pad;
+        int impId = Button.Primary(T("Import file...", "导入文件...")).SetSize(1).Render(app, bX, bY, bW);
+        bX = bX + bW + app.Scale(8);
+        int impDirId = Button.Primary(T("Import folder...", "导入文件夹...")).SetSize(1).Render(app, bX, bY, bW);
+        bX = bX + bW + app.Scale(8);
+        int upW = app.Scale(64);
+        int upId = Button.Create(T("Up", "上级")).SetSize(1).Render(app, bX, bY, upW);
+        bX = bX + upW + app.Scale(16);
+        int nfW = app.Scale(140);
+        this.folderIn.Render(app, bX, bY - app.Scale(2), nfW, app.Scale(26));
+        bX = bX + nfW + app.Scale(6);
+        int mkW = app.Scale(96);
+        int mkId = Button.Create(T("New folder", "新建文件夹")).SetSize(1).Render(app, bX, bY, mkW);
+
+        // ---- listing (left) ----
+        List<string> dirs = Directory.GetDirectories(ad);
+        List<string> files = Directory.GetFiles(ad);
+        int total = dirs.Count + files.Count;
+        int listX = x + pad;
+        int listY = y + app.Scale(104);
+        int listW = w - pad - pad - app.Scale(310);
+        int rowH = app.Scale(28);
+        int maxRows = (h - app.Scale(104) - app.Scale(64)) / rowH;
+        if (this.scroll > total - maxRows) { this.scroll = total - maxRows; }
+        if (this.scroll < 0) { this.scroll = 0; }
+        if (this.selIdx >= total) { this.selIdx = -1; }
+
+        bool click = app.window.EventKind() == 3;
+        int mx = app.mouseX;
+        int my = app.mouseY;
+
+        int shown = total - this.scroll;
+        if (shown > maxRows) { shown = maxRows; }
+        if (total == 0) {
+            c.DrawText(listX + app.Scale(4), listY + app.Scale(6),
+                T("Empty. Import files or a whole folder to begin.",
+                  "空目录。可导入文件或整个文件夹。"),
+                t.textSecondary, t.fontSizeSmall);
+        }
+        int r = 0;
+        while (r < shown) {
+            int idx = this.scroll + r;
+            int ry = listY + r * rowH;
+            bool isDir = idx < dirs.Count;
+            string nm = "";
+            if (isDir) { nm = dirs[idx]; } else { nm = files[idx - dirs.Count]; }
+            int rowBg = t.bgSecondary;
+            if (idx == this.selIdx) { rowBg = t.bgTertiary; }
+            c.FillRoundRect(listX, ry, listW, rowH - app.Scale(4), app.Scale(4), rowBg);
+            if (isDir) {
+                c.DrawText(listX + app.Scale(8), ry + app.Scale(5), "[" + T("DIR", "目录") + "]",
+                    t.warning, t.fontSizeTiny);
+                c.DrawText(listX + app.Scale(52), ry + app.Scale(5), nm, t.textPrimary, t.fontSizeSmall);
+            } else {
+                int ty = typeOf(nm);
+                string tag = typeLabel(ty);
+                int tagW = Canvas.MeasureText(tag, t.fontSizeTiny) + app.Scale(10);
+                c.FillRoundRect(listX + app.Scale(6), ry + app.Scale(4), tagW,
+                    rowH - app.Scale(12), app.Scale(3), typeColor(t, ty));
+                c.DrawText(listX + app.Scale(11), ry + app.Scale(6), tag, t.textInverse, t.fontSizeTiny);
+                c.DrawText(listX + app.Scale(12) + tagW, ry + app.Scale(5), nm, t.textPrimary, t.fontSizeSmall);
+                string sz = sizeLabel(File.GetSize(ad + "/" + nm));
+                int szW = Canvas.MeasureText(sz, t.fontSizeTiny);
+                c.DrawText(listX + listW - szW - app.Scale(8), ry + app.Scale(6), sz,
+                    t.textTertiary, t.fontSizeTiny);
+            }
+            if (click && mx >= listX && mx < listX + listW && my >= ry && my < ry + rowH - app.Scale(4)) {
+                if (this.selIdx == idx && isDir) {
+                    // second click on a selected folder enters it
+                    if (this.curRel.Length > 0) { this.curRel = this.curRel + "/" + nm; }
+                    else { this.curRel = nm; }
+                    this.selIdx = -1;
+                    this.scroll = 0;
+                } else {
+                    this.selIdx = idx;
+                }
+                this.confirmDel = false;
+                app.RequestRedraw();
+            }
+            r = r + 1;
+        }
+        // simple scroll buttons when the list overflows
+        if (total > maxRows) {
+            int scW = app.Scale(30);
+            int scX = listX + listW - scW;
+            int scUpId = Button.Create("^").SetSize(1).Render(app, scX, listY - app.Scale(30), scW);
+            int scDnId = Button.Create("v").SetSize(1).Render(app, scX - scW - app.Scale(4), listY - app.Scale(30), scW);
+            if (Button.WasClicked(app, scUpId) && this.scroll > 0) {
+                this.scroll = this.scroll - 1; app.RequestRedraw();
+            }
+            if (Button.WasClicked(app, scDnId) && this.scroll < total - maxRows) {
+                this.scroll = this.scroll + 1; app.RequestRedraw();
+            }
+        }
+
+        // ---- detail panel (right) ----
+        int dX = x + w - pad - app.Scale(290);
+        int dW = app.Scale(290);
+        int dY = listY;
+        c.FillRoundRect(dX, dY, dW, h - app.Scale(104) - app.Scale(64), app.Scale(5), t.bgSecondary);
+        int inPad = app.Scale(10);
+        int cy = dY + inPad;
+        int delId = -1;
+        int renApplyId = -1;
+        int animWriteId = -1;
+        int loopBtnId = -1;
+        bool selValid = this.selIdx >= 0 && this.selIdx < total;
+        bool selIsDir = selValid && this.selIdx < dirs.Count;
+        string selName = "";
+        if (selValid) {
+            if (selIsDir) { selName = dirs[this.selIdx]; }
+            else { selName = files[this.selIdx - dirs.Count]; }
+            c.DrawText(dX + inPad, cy, selName, t.textPrimary, t.fontSizeMedium);
+            cy = cy + app.Scale(22);
+            if (selIsDir) {
+                c.DrawText(dX + inPad, cy, T("Folder", "文件夹"), t.textSecondary, t.fontSizeSmall);
+            } else {
+                int ty = typeOf(selName);
+                c.DrawText(dX + inPad, cy, typeLabel(ty) + "  "
+                    + sizeLabel(File.GetSize(ad + "/" + selName)),
+                    t.textSecondary, t.fontSizeSmall);
+            }
+            cy = cy + app.Scale(26);
+
+            // rename
+            if (this.renameFor != selName) {
+                this.renameIn.SetText(selName);
+                this.renameFor = selName;
+            }
+            this.renameIn.Render(app, dX + inPad, cy, dW - inPad - inPad - app.Scale(66), app.Scale(26));
+            renApplyId = Button.Create(T("Rename", "重命名")).SetSize(1)
+                .Render(app, dX + dW - inPad - app.Scale(62), cy, app.Scale(62));
+            cy = cy + app.Scale(34);
+
+            string delLabel = T("Delete", "删除");
+            if (this.confirmDel) { delLabel = T("Confirm delete", "确认删除"); }
+            delId = Button.Create(delLabel).SetSize(1).SetColor(t.error)
+                .Render(app, dX + inPad, cy, app.Scale(110));
+            cy = cy + app.Scale(38);
+
+            // anim clip editor for image files
+            if (!selIsDir && typeOf(selName) == 0) {
+                c.FillRect(dX + inPad, cy, dW - inPad - inPad, 1, t.divider);
+                cy = cy + app.Scale(8);
+                c.DrawText(dX + inPad, cy, T("Animation clip (.anim)", "动画剪辑 (.anim)"),
+                    t.textSecondary, t.fontSizeSmall);
+                cy = cy + app.Scale(22);
+                if (this.animFor != selName) {
+                    this.loadAnimFields(ad, selName);
+                    this.animFor = selName;
+                }
+                int labW = app.Scale(96);
+                int inW = dW - inPad - inPad - labW;
+                c.DrawText(dX + inPad, cy + app.Scale(5), T("frames/dir", "每方向帧数"), t.textTertiary, t.fontSizeTiny);
+                this.fpdIn.Render(app, dX + inPad + labW, cy, inW, app.Scale(24));
+                cy = cy + app.Scale(28);
+                c.DrawText(dX + inPad, cy + app.Scale(5), T("directions", "方向数"), t.textTertiary, t.fontSizeTiny);
+                this.dirsIn.Render(app, dX + inPad + labW, cy, inW, app.Scale(24));
+                cy = cy + app.Scale(28);
+                c.DrawText(dX + inPad, cy + app.Scale(5), "fps", t.textTertiary, t.fontSizeTiny);
+                this.fpsIn.Render(app, dX + inPad + labW, cy, inW, app.Scale(24));
+                cy = cy + app.Scale(28);
+                c.DrawText(dX + inPad, cy + app.Scale(5), T("frame WxH", "帧宽x高"), t.textTertiary, t.fontSizeTiny);
+                int half = (inW - app.Scale(6)) / 2;
+                this.frameWIn.Render(app, dX + inPad + labW, cy, half, app.Scale(24));
+                this.frameHIn.Render(app, dX + inPad + labW + half + app.Scale(6), cy, half, app.Scale(24));
+                cy = cy + app.Scale(28);
+                string lm = T("loop: once", "循环: 单次");
+                if (this.loopMode == 1) { lm = T("loop: loop", "循环: 循环"); }
+                if (this.loopMode == 2) { lm = T("loop: section", "循环: 区段"); }
+                loopBtnId = Button.Create(lm).SetSize(1).Render(app, dX + inPad, cy, app.Scale(120));
+                this.loopStartIn.Render(app, dX + inPad + labW + app.Scale(30), cy, inW - app.Scale(30), app.Scale(24));
+                cy = cy + app.Scale(32);
+                animWriteId = Button.Primary(T("Write .anim", "写入 .anim")).SetSize(1)
+                    .Render(app, dX + inPad, cy, app.Scale(120));
+                cy = cy + app.Scale(30);
+            }
+        } else {
+            c.DrawText(dX + inPad, cy, T("Select an entry on the left.", "在左侧选择一个条目。"),
+                t.textSecondary, t.fontSizeSmall);
+        }
+
+        // ---- footer ----
+        if (this.msg.Length > 0) {
+            c.DrawText(x + pad, y + h - app.Scale(46), this.msg, t.textSecondary, t.fontSizeSmall);
+        }
+        int clW = app.Scale(100);
+        int clId = Button.Primary(T("Close", "关闭")).Render(app, x + w - pad - clW,
+            y + h - app.Scale(40) - t.paddingSmall, clW);
+
+        // ---- click handling ----
+        if (Button.WasClicked(app, impId)) {
+            action = 2;
+        } else if (Button.WasClicked(app, impDirId)) {
+            action = 3;
+        } else if (Button.WasClicked(app, upId)) {
+            if (this.curRel.Length > 0) {
+                this.curRel = dirPart(this.curRel);
+                this.selIdx = -1;
+                this.scroll = 0;
+                app.RequestRedraw();
+            }
+        } else if (Button.WasClicked(app, mkId)) {
+            string fn = this.folderIn.GetText();
+            if (fn.Length > 0) {
+                Directory.CreateDirectoryRecursive(ad + "/" + fn);
+                this.folderIn.SetText("");
+                this.msg = T("Folder created: ", "已创建文件夹：") + fn;
+                app.RequestRedraw();
+            }
+        } else if (renApplyId >= 0 && Button.WasClicked(app, renApplyId)) {
+            string nn = this.renameIn.GetText();
+            if (nn.Length > 0 && nn != selName) {
+                File.Move(ad + "/" + selName, ad + "/" + nn);
+                log.Add("> Asset renamed: " + this.relOf(selName) + " -> " + this.relOf(nn));
+                this.msg = T("Renamed to ", "已重命名为 ") + nn;
+                this.renameFor = "";
+                this.animFor = "";
+                this.selIdx = -1;
+                app.RequestRedraw();
+            }
+        } else if (delId >= 0 && Button.WasClicked(app, delId)) {
+            if (!this.confirmDel) {
+                this.confirmDel = true;
+                app.RequestRedraw();
+            } else {
+                if (selIsDir) { deleteTree(ad + "/" + selName); }
+                else { File.Delete(ad + "/" + selName); }
+                log.Add("> Asset deleted: " + this.relOf(selName));
+                this.msg = T("Deleted ", "已删除 ") + selName;
+                this.confirmDel = false;
+                this.selIdx = -1;
+                app.RequestRedraw();
+            }
+        } else if (loopBtnId >= 0 && Button.WasClicked(app, loopBtnId)) {
+            this.loopMode = this.loopMode + 1;
+            if (this.loopMode > 2) { this.loopMode = 0; }
+            app.RequestRedraw();
+        } else if (animWriteId >= 0 && Button.WasClicked(app, animWriteId)) {
+            string loop = "once";
+            if (this.loopMode == 1) { loop = "loop"; }
+            if (this.loopMode == 2) { loop = "section"; }
+            string relNoExt = stripExt(this.relOf(selName));
+            writeAnim(root, relNoExt, selName,
+                parseInt(this.frameWIn.GetText(), 0), parseInt(this.frameHIn.GetText(), 0),
+                parseInt(this.dirsIn.GetText(), 8), parseInt(this.fpdIn.GetText(), 1),
+                parseInt(this.fpsIn.GetText(), 12), loop,
+                parseInt(this.loopStartIn.GetText(), 0));
+            log.Add("> Anim clip written: assets/" + relNoExt + ".anim");
+            this.msg = T("Wrote ", "已写入 ") + relNoExt + ".anim";
+            app.RequestRedraw();
+        } else if (Button.WasClicked(app, clId)) {
+            action = 1;
+        }
+        return action;
+    }
+
+    /// Preloads the anim editor from an existing side-car .anim file, if any.
+    void loadAnimFields(string ad, string imgName) {
+        this.fpdIn.SetText("6");
+        this.dirsIn.SetText("8");
+        this.fpsIn.SetText("12");
+        this.loopStartIn.SetText("0");
+        this.frameWIn.SetText("0");
+        this.frameHIn.SetText("0");
+        this.loopMode = 1;
+        string af = ad + "/" + stripExt(imgName) + ".anim";
+        if (!File.Exists(af)) { return; }
+        JsonValue v = JsonValue.Parse(File.ReadAllText(af));
+        if (v == null) { return; }
+        this.fpdIn.SetText(Convert.ToString(v.Int("framesPerDir", 6)));
+        this.dirsIn.SetText(Convert.ToString(v.Int("dirs", 8)));
+        this.fpsIn.SetText(Convert.ToString(v.Int("fps", 12)));
+        this.loopStartIn.SetText(Convert.ToString(v.Int("loopStart", 0)));
+        this.frameWIn.SetText(Convert.ToString(v.Int("frameW", 0)));
+        this.frameHIn.SetText(Convert.ToString(v.Int("frameH", 0)));
+        string loop = v.Str("loop", "loop");
+        this.loopMode = 1;
+        if (loop == "once") { this.loopMode = 0; }
+        if (loop == "section") { this.loopMode = 2; }
+    }
+}

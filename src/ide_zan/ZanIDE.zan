@@ -973,6 +973,8 @@ class ZanIDE {
         // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
         // is the code font size (0 = follow the UI theme). Persisted to editor.cfg.
         bool cfgOpen = false;
+        // Asset Manager overlay (browse/import/organize assets/ recursively).
+        bool assetMgrOpen = false;
         int edThemeIdx = ZanIDE.ReadEditorTheme();
         int edFontPx = ZanIDE.ReadEditorFont();
         int defFontPx = app.theme.fontSizeMedium;
@@ -1058,6 +1060,7 @@ class ZanIDE {
         // Design/Code toggle shows the .zscene JSON in place.
         bool sceneMode = false;
         SceneDesigner sceneDesigner = SceneDesigner.Create();
+        AssetManager assetMgr = AssetManager.Create();
 
         SignalInt treeW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
         // The code editor is the primary area: it fills the space left over
@@ -3709,6 +3712,37 @@ class ZanIDE {
                             ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
                         pathPickerOwner = 5;
                         app.RequestRedraw();
+                    } else if (cAct == 5) {
+                        cfgOpen = false;
+                        assetMgrOpen = true;
+                        app.RequestRedraw();
+                    }
+                }
+
+                // Asset Manager overlay (modal): recursive assets/ browser,
+                // batch folder import and .anim clip authoring.
+                if (assetMgrOpen) {
+                    AssetManager.lang = ZanIDE.uiLang;
+                    int savedSeqA = WidgetId.SeqValue();
+                    WidgetId.SetSeq(890000);
+                    int aAct = assetMgr.Render(app, root, log);
+                    WidgetId.SetSeq(savedSeqA);
+                    if (aAct == 1) {
+                        assetMgrOpen = false;
+                        lastActive = 0 - 1;
+                        app.RequestRedraw();
+                    } else if (aAct == 2) {
+                        pathPicker.BeginOpenFile(
+                            ZanIDE.ReadLastPickerDirectory(root), "",
+                            ZanIDE.T("Import an asset file", "导入素材文件"));
+                        pathPickerOwner = 6;
+                        app.RequestRedraw();
+                    } else if (aAct == 3) {
+                        pathPicker.BeginFolder(
+                            ZanIDE.ReadLastPickerDirectory(root),
+                            ZanIDE.T("Import an asset folder (recursive)", "导入素材文件夹（递归）"));
+                        pathPickerOwner = 7;
+                        app.RequestRedraw();
                     }
                 }
                 string windowTitle = "Zan IDE";
@@ -3879,6 +3913,12 @@ class ZanIDE {
                     File.Copy(picked, ad + "/" + nm);
                     log.Add("> Added resource: assets/" + nm);
                     Layer.Msg(ZanIDE.T("Resource copied: ", "已复制资源：") + nm, 3);
+                } else if (pathPickerOwner == 6) {
+                    assetMgr.ImportFile(picked, root, log);
+                    Layer.Msg(ZanIDE.T("Asset imported", "素材已导入"), 3);
+                } else if (pathPickerOwner == 7) {
+                    assetMgr.ImportFolder(picked, root, log);
+                    Layer.Msg(ZanIDE.T("Folder imported", "文件夹已导入"), 3);
                 } else if (pathPickerOwner == 5) {
                     ZanIDE.AddProjLink(root, picked);
                     log.Add("> Linked resource: " + picked);
@@ -5429,6 +5469,9 @@ class ZanIDE {
         int addId = Button.Primary(ZanIDE.T("Add (copy)...", "导入(复制)...")).SetSize(1).Render(app, addX, addY, addW);
         int lnkX = addX - app.Scale(8) - addW;
         int lnkId = Button.Create(ZanIDE.T("Add (link)...", "导入(链接)...")).SetSize(1).Render(app, lnkX, addY, addW);
+        int amW = app.Scale(120);
+        int amX = lnkX - app.Scale(8) - amW;
+        int amId = Button.Create(ZanIDE.T("Asset Manager...", "资源管理器...")).SetSize(1).Render(app, amX, addY, amW);
 
         List<string> res = ZanIDE.ListResources(root);
         List<string> lnks = ZanIDE.ProjLinks(root);
@@ -5512,6 +5555,8 @@ class ZanIDE {
             action = 3;
         } else if (Button.WasClicked(app, lnkId)) {
             action = 4;
+        } else if (Button.WasClicked(app, amId)) {
+            action = 5;
         } else if (removeIdx >= 0 && removeIdx < res.Count) {
             File.Delete(ZanIDE.AssetsDir(root) + "/" + res[removeIdx]);
             log.Add("> Removed resource: assets/" + res[removeIdx]);
@@ -5540,6 +5585,14 @@ class ZanIDE {
             File.Copy(ad + "/" + res[i], dst + "/" + res[i]);
             i = i + 1;
         }
+        // Asset subfolders (from the Asset Manager) ship recursively too.
+        List<string> subs = Directory.GetDirectories(ad);
+        int si = 0;
+        int scopied = 0;
+        while (si < subs.Count) {
+            scopied = scopied + AssetManager.copyTree(ad + "/" + subs[si], dst + "/" + subs[si]);
+            si = si + 1;
+        }
         // Linked resources are referenced in place during development and
         // copied next to the exe only when publishing.
         int li = 0;
@@ -5553,7 +5606,7 @@ class ZanIDE {
             }
             li = li + 1;
         }
-        log.Add("> Bundled " + Convert.ToString(res.Count + lcopied) + " resource file(s) into " + dst);
+        log.Add("> Bundled " + Convert.ToString(res.Count + scopied + lcopied) + " resource file(s) into " + dst);
     }
 
     // ---- code navigation (go to definition / find references) ----

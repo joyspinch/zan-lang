@@ -1,0 +1,149 @@
+using System;
+using System.IO;
+using System.Json;
+
+namespace Game.Core;
+
+/// <summary>One animation clip over a direction-major frame sheet (the
+/// Mir-style layout: all frames of direction 0, then direction 1, ...).
+/// Loaded from the `.anim` side-car JSON the IDE's Asset Manager writes.</summary>
+class AnimClip {
+    string image;      // sheet image entry/path
+    int frameW;        // frame cell size (0 = unknown/derive from sheet)
+    int frameH;
+    int baseFrame;          // first frame of this action inside a multi-action sheet
+    int dirs;          // direction count (8 for classic Mir movement)
+    int framesPerDir;  // frames belonging to each direction
+    int fps;
+    int loopMode;      // 0 once, 1 loop, 2 loop-section
+    int loopStart;     // first frame of the repeating section (mode 2)
+
+    static AnimClip Create(int dirs, int framesPerDir, int fps, int loopMode, int loopStart) {
+        AnimClip c = new AnimClip();
+        c.image = "";
+        c.frameW = 0;
+        c.frameH = 0;
+        c.baseFrame = 0;
+        c.dirs = dirs;
+        c.framesPerDir = framesPerDir;
+        c.fps = fps;
+        c.loopMode = loopMode;
+        c.loopStart = loopStart;
+        if (c.dirs < 1) { c.dirs = 1; }
+        if (c.framesPerDir < 1) { c.framesPerDir = 1; }
+        if (c.fps < 1) { c.fps = 1; }
+        if (c.loopStart < 0) { c.loopStart = 0; }
+        if (c.loopStart >= c.framesPerDir) { c.loopStart = c.framesPerDir - 1; }
+        return c;
+    }
+
+    /// <summary>Parses a `.anim` JSON document. Returns null if it is not one.</summary>
+    static AnimClip ParseJson(string json) {
+        JsonValue v = JsonValue.Parse(json);
+        if (v == null || !v.IsObject()) { return null; }
+        int lm = 1;
+        string loop = v.Str("loop", "loop");
+        if (loop == "once") { lm = 0; }
+        if (loop == "section") { lm = 2; }
+        AnimClip c = AnimClip.Create(
+            v.Int("dirs", 8), v.Int("framesPerDir", 1),
+            v.Int("fps", 12), lm, v.Int("loopStart", 0));
+        c.image = v.Str("image", "");
+        c.frameW = v.Int("frameW", 0);
+        c.frameH = v.Int("frameH", 0);
+        c.baseFrame = v.Int("base", 0);
+        return c;
+    }
+
+    /// <summary>Loads a clip from a `.anim` file on disk (null on failure).</summary>
+    static AnimClip Load(string path) {
+        if (!File.Exists(path)) { return null; }
+        return AnimClip.ParseJson(File.ReadAllText(path));
+    }
+
+    string Image() { return this.image; }
+    int Base() { return this.baseFrame; }
+    int FrameW() { return this.frameW; }
+    int FrameH() { return this.frameH; }
+    int Dirs() { return this.dirs; }
+    int FramesPerDir() { return this.framesPerDir; }
+    int Fps() { return this.fps; }
+    int LoopMode() { return this.loopMode; }
+    int LoopStart() { return this.loopStart; }
+}
+
+/// <summary>Plays an AnimClip: advance with elapsed milliseconds, switch the
+/// facing direction at any time (the frame position is kept, exactly like the
+/// classic Mir renderer), and read back the absolute sheet frame to draw.
+/// Loop modes: once (hold the last frame, Done() turns true), loop (wrap to
+/// 0), section (play the intro 0..loopStart-1 once, then repeat
+/// loopStart..last — e.g. a cast wind-up followed by a sustained cast).</summary>
+class AnimPlayer {
+    AnimClip clip;
+    int dir;        // current facing (0..dirs-1)
+    int frame;      // current frame within the direction (0..framesPerDir-1)
+    int accMs;      // accumulated time toward the next frame step
+    bool done;      // a "once" clip has reached and held its last frame
+
+    static AnimPlayer Create() {
+        AnimPlayer p = new AnimPlayer();
+        p.clip = null;
+        p.dir = 0;
+        p.frame = 0;
+        p.accMs = 0;
+        p.done = false;
+        return p;
+    }
+
+    /// <summary>Starts (or restarts) a clip from frame 0, keeping direction.</summary>
+    void Play(AnimClip c) {
+        this.clip = c;
+        this.frame = 0;
+        this.accMs = 0;
+        this.done = false;
+    }
+
+    /// <summary>Switches the facing; the in-clip frame position is preserved
+    /// so a turning character does not restart its stride.</summary>
+    void SetDir(int d) {
+        if (this.clip == null) { this.dir = d; return; }
+        int n = this.clip.Dirs();
+        int v = d % n;
+        if (v < 0) { v = v + n; }
+        this.dir = v;
+    }
+
+    int Dir() { return this.dir; }
+    bool Done() { return this.done; }
+    int Frame() { return this.frame; }
+
+    /// <summary>Advances by elapsed milliseconds.</summary>
+    void Update(int dtMs) {
+        if (this.clip == null || this.done) { return; }
+        if (dtMs < 0) { return; }
+        this.accMs = this.accMs + dtMs;
+        int stepMs = 1000 / this.clip.Fps();
+        if (stepMs < 1) { stepMs = 1; }
+        while (this.accMs >= stepMs) {
+            this.accMs = this.accMs - stepMs;
+            this.frame = this.frame + 1;
+            if (this.frame >= this.clip.FramesPerDir()) {
+                int lm = this.clip.LoopMode();
+                if (lm == 0) {
+                    this.frame = this.clip.FramesPerDir() - 1;
+                    this.done = true;
+                    return;
+                }
+                if (lm == 2) { this.frame = this.clip.LoopStart(); }
+                else { this.frame = 0; }
+            }
+        }
+    }
+
+    /// <summary>The absolute frame index in the sheet for the current
+    /// direction and position: base + dir * framesPerDir + frame.</summary>
+    int SheetFrame() {
+        if (this.clip == null) { return 0; }
+        return this.clip.Base() + this.dir * this.clip.FramesPerDir() + this.frame;
+    }
+}

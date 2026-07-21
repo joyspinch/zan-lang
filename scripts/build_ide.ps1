@@ -85,6 +85,7 @@ try {
     $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
     $files += (Join-Path (Get-Location) "stdlib\Game\Scene\SceneDoc.zan")
     $files += (Join-Path (Get-Location) "src\ide_zan\SceneDesigner.zan")
+    $files += (Join-Path (Get-Location) "src\ide_zan\AssetManager.zan")
     $files += (Join-Path (Get-Location) "src\ide_zan\ZanIDE.zan")
     Push-Location build
     try {
