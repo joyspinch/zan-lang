@@ -1,0 +1,142 @@
+using System;
+using System.Net.Http;
+using System.Text;
+
+namespace Board;
+
+/// <summary>
+/// Per-request context. Lives on the request coroutine's own heap frame, so
+/// every field here is request-local: concurrent requests each get their own
+/// Ctx and coroutine switches never cross-contaminate these values.
+/// </summary>
+class Ctx {
+    HttpRequest req;
+    string method;
+    string path;
+    string token;          // session token from the zsession cookie ("" if none)
+    string uid;            // resolved principal id ("" = anonymous)
+    string uname;          // resolved principal username
+
+    int status;
+    string statusText;
+    string ctype;
+    string body;
+    List<string> extraHeaders;   // e.g. Set-Cookie
+
+    Ctx() {
+        this.token = "";
+        this.uid = "";
+        this.uname = "";
+        this.status = 200;
+        this.statusText = "OK";
+        this.ctype = "application/json";
+        this.body = "";
+        this.extraHeaders = new List<string>();
+    }
+
+    static Ctx From(HttpRequest req) {
+        Ctx c = new Ctx();
+        c.req = req;
+        c.method = req.method;
+        c.path = req.path;
+        c.token = Ctx.ReadCookie(req, "zsession");
+        return c;
+    }
+
+    static string ReadCookie(HttpRequest req, string name) {
+        string raw = req.GetHeader("Cookie");
+        if (raw.Length == 0) { return ""; }
+        int pos = 0;
+        int len = raw.Length;
+        while (pos < len) {
+            int semi = pos;
+            while (semi < len && (raw[semi] & 255) != 59) { semi = semi + 1; }   // ';'
+            string pair = raw.Substring(pos, semi - pos);
+            int eq = pair.IndexOf("=");
+            if (eq > 0) {
+                string k = Ctx.Trim(pair.Substring(0, eq));
+                if (k == name) { return Ctx.Trim(pair.Substring(eq + 1)); }
+            }
+            pos = semi + 1;
+        }
+        return "";
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b && (s[a] & 255) == 32) { a = a + 1; }
+        while (b > a && (s[b - 1] & 255) == 32) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+
+    /// <summary>Filtered input: form field first, then query param. Strips CR/LF
+    /// control chars so a value cannot smuggle header/log injection.</summary>
+    string In(string name) {
+        string v = this.req.GetFormField(name);
+        if (v.Length == 0) { v = this.req.GetQueryParam(name); }
+        return Ctx.StripControl(v);
+    }
+
+    static string StripControl(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c != 13 && c != 10 && c != 9) { sb.Append(s.Substring(i, 1)); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    void Json(string b) {
+        this.status = 200; this.statusText = "OK";
+        this.ctype = "application/json"; this.body = b;
+    }
+
+    void Html(string b) {
+        this.status = 200; this.statusText = "OK";
+        this.ctype = "text/html; charset=utf-8"; this.body = b;
+    }
+
+    void Fail(int code, string msg) {
+        this.status = code;
+        this.statusText = Ctx.StatusText(code);
+        this.ctype = "application/json";
+        this.body = "{\"code\":" + Convert.ToString(code) + ",\"msg\":\""
+            + Encoding.JsonEscape(msg) + "\"}";
+    }
+
+    void SetCookie(string name, string val, int maxAge) {
+        this.extraHeaders.Add("Set-Cookie: " + name + "=" + val
+            + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + Convert.ToString(maxAge));
+    }
+
+    static string StatusText(int code) {
+        if (code == 200) { return "OK"; }
+        if (code == 400) { return "Bad Request"; }
+        if (code == 401) { return "Unauthorized"; }
+        if (code == 403) { return "Forbidden"; }
+        if (code == 404) { return "Not Found"; }
+        if (code == 409) { return "Conflict"; }
+        if (code == 429) { return "Too Many Requests"; }
+        return "Internal Server Error";
+    }
+
+    string Build(bool keepAlive) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 " + Convert.ToString(this.status) + " " + this.statusText + "\r\n");
+        sb.Append("Content-Type: " + this.ctype + "\r\n");
+        sb.Append("Content-Length: " + Convert.ToString(this.body.Length) + "\r\n");
+        if (keepAlive) { sb.Append("Connection: keep-alive\r\n"); }
+        else { sb.Append("Connection: close\r\n"); }
+        int i = 0;
+        while (i < this.extraHeaders.Count) {
+            sb.Append(this.extraHeaders[i] + "\r\n");
+            i = i + 1;
+        }
+        sb.Append("\r\n");
+        sb.Append(this.body);
+        return sb.ToString();
+    }
+}

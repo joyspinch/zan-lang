@@ -1,0 +1,74 @@
+using System;
+using System.Text;
+
+namespace Board;
+
+/// <summary>
+/// Authentication endpoints. Register/login mint a Redis-backed session and
+/// return it as an HttpOnly cookie; logout destroys it. The current principal
+/// (ctx.uid/uname) is resolved centrally in Server.route before dispatch, so
+/// these handlers never re-implement token validation.
+/// </summary>
+class AuthController {
+
+    static bool ValidName(string s) {
+        if (s.Length < 3 || s.Length > 32) { return false; }
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+                || (c >= 48 && c <= 57) || c == 95;
+            if (!ok) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static async int register(Ctx ctx) {
+        string username = ctx.In("username");
+        string password = ctx.In("password");
+        if (!AuthController.ValidName(username)) {
+            ctx.Fail(400, "username must be 3-32 chars [A-Za-z0-9_]"); return 0;
+        }
+        if (password.Length < 6 || password.Length > 128) {
+            ctx.Fail(400, "password must be 6-128 chars"); return 0;
+        }
+        string uid = await User.Create(App.pool, username, password);
+        if (uid.Length == 0) {
+            ctx.Fail(409, "username already taken"); return 0;
+        }
+        string token = await Session.Create(App.redis, uid, username, App.sessionTtl);
+        ctx.SetCookie("zsession", token, App.sessionTtl);
+        ctx.Json("{\"ok\":true,\"uid\":" + uid + ",\"user\":\""
+            + Encoding.JsonEscape(username) + "\"}");
+        return 0;
+    }
+
+    static async int login(Ctx ctx) {
+        string username = ctx.In("username");
+        string password = ctx.In("password");
+        List<string> uname = new List<string>();
+        string uid = await User.Verify(App.pool, username, password, uname);
+        if (uid.Length == 0) {
+            ctx.Fail(401, "invalid username or password"); return 0;
+        }
+        string token = await Session.Create(App.redis, uid, uname[0], App.sessionTtl);
+        ctx.SetCookie("zsession", token, App.sessionTtl);
+        ctx.Json("{\"ok\":true,\"uid\":" + uid + ",\"user\":\""
+            + Encoding.JsonEscape(uname[0]) + "\"}");
+        return 0;
+    }
+
+    static async int logout(Ctx ctx) {
+        await Session.Destroy(App.redis, ctx.token);
+        ctx.SetCookie("zsession", "", 0);
+        ctx.Json("{\"ok\":true}");
+        return 0;
+    }
+
+    static async int me(Ctx ctx) {
+        ctx.Json("{\"uid\":" + ctx.uid + ",\"user\":\""
+            + Encoding.JsonEscape(ctx.uname) + "\"}");
+        return 0;
+    }
+}
