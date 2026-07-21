@@ -28,9 +28,18 @@ class SceneDesigner {
 
     bool dragging;
     bool resizing;
+    int resizeH;         // active resize handle 0-7 (TL,T,TR,R,BR,B,BL,L)
     string palDrag;      // element kind being dragged out of the palette ("" = none)
+    bool palMoved;       // the palette press moved away from its chip (a real drag)
     int dragDx;          // design-space offset from element top-left to cursor
     int dragDy;
+    int guideX;          // vertical smart-guide in design space (-1 = none)
+    int guideY;          // horizontal smart-guide in design space (-1 = none)
+    int inpIdName;       // inspector input widget ids (keyboard is ignored
+    int inpIdImg;        // while one of them has focus)
+    int inpIdText;
+    int inpIdBg;
+    int inpIdItems;
     bool showGrid;
     bool snap;
     int grid;            // grid size in design pixels
@@ -55,9 +64,18 @@ class SceneDesigner {
         d.lastSel = null;
         d.dragging = false;
         d.resizing = false;
+        d.resizeH = 4;
         d.palDrag = "";
+        d.palMoved = false;
         d.dragDx = 0;
         d.dragDy = 0;
+        d.guideX = 0 - 1;
+        d.guideY = 0 - 1;
+        d.inpIdName = 0 - 1;
+        d.inpIdImg = 0 - 1;
+        d.inpIdText = 0 - 1;
+        d.inpIdBg = 0 - 1;
+        d.inpIdItems = 0 - 1;
         d.showGrid = true;
         d.snap = true;
         d.grid = 8;
@@ -345,10 +363,11 @@ class SceneDesigner {
         // dropped on the canvas (handled in RenderCanvas) or released elsewhere.
         int gek = app.window.EventKind();
         if (this.palDrag.Length > 0) {
+            if (gek == 1) { this.palMoved = true; }
             if (gek == 3) {
                 // Released outside the canvas (a canvas drop already cleared it).
                 this.palDrag = "";
-            } else {
+            } else if (this.palMoved) {
                 string gl = SceneDesigner.KindLabel(this.palDrag);
                 int gw = app.Scale(24) + gl.Length * t.fontSizeSmall;
                 int gh = app.Scale(24);
@@ -363,9 +382,9 @@ class SceneDesigner {
 
     // --- palette (add elements) ---------------------------------------------
 
-    // Renders one section of the palette as a two-column grid of drag sources;
-    // pressing a chip starts a drag that must be dropped onto the canvas to
-    // add the element (no click-to-add). Returns the y after the section.
+    // Renders one section of the palette as a two-column grid of chips. A
+    // CLICK adds the element at the canvas centre immediately; press-and-drag
+    // drops it at a specific spot instead. Returns the y after the section.
     int PaletteSection(App app, Canvas c, Theme t, int x, int y, int w,
             string title, List<string> kinds) {
         c.DrawText(x, y, title, t.textTertiary, t.fontSizeSmall);
@@ -377,11 +396,18 @@ class SceneDesigner {
         while (k < kinds.Count) {
             int col = k % 2;
             int bx = x + col * (bw + app.Scale(6));
-            Button.Create(SceneDesigner.KindLabel(kinds[k])).Render(app, bx, iy, bw);
-            if (ek == 2 && SceneDesigner.InRect(app.mouseX, app.mouseY, bx, iy, bw, bh)) {
+            int chipId = Button.Create(SceneDesigner.KindLabel(kinds[k])).Render(app, bx, iy, bw);
+            if (Button.WasClicked(app, chipId)) {
+                // Simple click: add at the canvas centre, no drag needed.
+                this.AddElement(kinds[k]);
+                this.palDrag = "";
+                this.palMoved = false;
+                app.RequestRedraw();
+            } else if (ek == 2 && SceneDesigner.InRect(app.mouseX, app.mouseY, bx, iy, bw, bh)) {
                 this.palDrag = kinds[k];
-                this.msg = SceneDesigner.T("drag onto the canvas to add ", "拖到画布上以添加 ")
-                    + SceneDesigner.KindLabel(kinds[k]);
+                this.palMoved = false;
+                this.msg = SceneDesigner.T("click to add at centre, or drag onto the canvas",
+                    "单击添加到画布中心，或拖到画布指定位置");
                 app.RequestRedraw();
             }
             if (col == 1 || k == kinds.Count - 1) { iy = iy + bh + app.Scale(4); }
@@ -643,9 +669,16 @@ class SceneDesigner {
             this.DrawElement(app, c, t, e, ex, ey, exw, exh, psMilli);
             if (e == this.sel) {
                 c.DrawRect(ex - 1, ey - 1, exw + 2, exh + 2, t.primary, 1);
-                // corner resize handle
+                // eight resize handles (corners + edge midpoints)
                 int hs = app.Scale(8);
-                c.FillRect(ex + exw - hs / 2, ey + exh - hs / 2, hs, hs, t.primary);
+                int hh2 = hs / 2;
+                int hnum = 0;
+                while (hnum < 8) {
+                    int hx = SceneDesigner.HandleX(hnum, ex, exw) - hh2;
+                    int hy = SceneDesigner.HandleY(hnum, ey, exh) - hh2;
+                    c.FillRect(hx, hy, hs, hs, t.primary);
+                    hnum = hnum + 1;
+                }
             }
             i = i + 1;
         }
@@ -667,7 +700,7 @@ class SceneDesigner {
 
         // Pointer interaction: press to select + begin drag/resize (topmost first).
         if (ek == 2 && SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {
-            // Corner handle of the current selection wins (start resizing).
+            // A resize handle of the current selection wins (start resizing).
             bool started = false;
             if (this.sel != null) {
                 int sx = ox + this.DesignLeft(this.sel) * psMilli / 1000;
@@ -675,10 +708,17 @@ class SceneDesigner {
                 int sw = this.sel.TotalW() * psMilli / 1000;
                 int sh = this.sel.TotalH() * psMilli / 1000;
                 int hs = app.Scale(10);
-                if (SceneDesigner.InRect(app.mouseX, app.mouseY,
-                        sx + sw - hs, sy + sh - hs, hs * 2, hs * 2)) {
-                    this.resizing = true;
-                    started = true;
+                int hnum = 0;
+                while (hnum < 8 && !started) {
+                    int hx = SceneDesigner.HandleX(hnum, sx, sw);
+                    int hy = SceneDesigner.HandleY(hnum, sy, sh);
+                    if (SceneDesigner.InRect(app.mouseX, app.mouseY,
+                            hx - hs, hy - hs, hs * 2, hs * 2)) {
+                        this.resizing = true;
+                        this.resizeH = hnum;
+                        started = true;
+                    }
+                    hnum = hnum + 1;
                 }
             }
             if (!started) {
@@ -712,6 +752,8 @@ class SceneDesigner {
         }
 
         // Drag: move the selected element in design space, keeping its anchor.
+        this.guideX = 0 - 1;
+        this.guideY = 0 - 1;
         if (this.dragging && ek == 1 && this.sel != null) {
             int mDesX = (app.mouseX - ox) * 1000 / psMilli;
             int mDesY = (app.mouseY - oy) * 1000 / psMilli;
@@ -721,6 +763,14 @@ class SceneDesigner {
                 newLeft = (newLeft + this.grid / 2) / this.grid * this.grid;
                 newTop = (newTop + this.grid / 2) / this.grid * this.grid;
             }
+            // Smart guides: snap the element's edges/centre to the edges and
+            // centres of the other elements and the canvas centre.
+            int tw2 = this.sel.TotalW();
+            int th2 = this.sel.TotalH();
+            int snX = this.SnapAxisX(newLeft, tw2);
+            if (snX != 0 - 100000) { newLeft = snX; }
+            int snY = this.SnapAxisY(newTop, th2);
+            if (snY != 0 - 100000) { newTop = snY; }
             // Convert desired design top-left back into the anchor-relative offset.
             int baseX = this.sel.AnchorX() * this.doc.DesignWidth() / 1000
                 - this.sel.AnchorX() * this.sel.TotalW() / 1000;
@@ -730,22 +780,57 @@ class SceneDesigner {
             app.RequestRedraw();
         }
 
-        // Resize: dragging the corner handle changes the CELL size (grid groups
-        // scale as a whole: the total footprint tracks the cursor).
+        // Draw the active smart guides across the whole canvas.
+        if (this.guideX >= 0) {
+            int gsx = ox + this.guideX * psMilli / 1000;
+            c.FillRect(gsx, oy, 1, ch, SceneDesigner.PackColor(255, 80, 200, 220));
+        }
+        if (this.guideY >= 0) {
+            int gsy = oy + this.guideY * psMilli / 1000;
+            c.FillRect(ox, gsy, cw, 1, SceneDesigner.PackColor(255, 80, 200, 220));
+        }
+
+        // Resize: dragging any handle. Left/top handles move the element while
+        // resizing; grid groups scale their CELL size so the whole footprint
+        // tracks the cursor.
         if (this.resizing && ek == 1 && this.sel != null) {
             int mDesX = (app.mouseX - ox) * 1000 / psMilli;
             int mDesY = (app.mouseY - oy) * 1000 / psMilli;
-            int newTw = mDesX - this.DesignLeft(this.sel);
-            int newTh = mDesY - this.DesignTop(this.sel);
             if (this.snap && this.grid > 0) {
-                newTw = (newTw + this.grid / 2) / this.grid * this.grid;
-                newTh = (newTh + this.grid / 2) / this.grid * this.grid;
+                mDesX = (mDesX + this.grid / 2) / this.grid * this.grid;
+                mDesY = (mDesY + this.grid / 2) / this.grid * this.grid;
             }
-            int nw = (newTw - (this.sel.Cols() - 1) * this.sel.GapX()) / this.sel.Cols();
-            int nh = (newTh - (this.sel.Rows() - 1) * this.sel.GapY()) / this.sel.Rows();
+            int oldL = this.DesignLeft(this.sel);
+            int oldT = this.DesignTop(this.sel);
+            int oldR = oldL + this.sel.TotalW();
+            int oldB = oldT + this.sel.TotalH();
+            int newL = oldL;
+            int newT = oldT;
+            int newR = oldR;
+            int newB = oldB;
+            int hn = this.resizeH;
+            // 0=TL 1=T 2=TR 3=R 4=BR 5=B 6=BL 7=L
+            if (hn == 0 || hn == 6 || hn == 7) { newL = mDesX; }
+            if (hn == 0 || hn == 1 || hn == 2) { newT = mDesY; }
+            if (hn == 2 || hn == 3 || hn == 4) { newR = mDesX; }
+            if (hn == 4 || hn == 5 || hn == 6) { newB = mDesY; }
+            if (newR - newL < 8) {
+                if (hn == 0 || hn == 6 || hn == 7) { newL = newR - 8; } else { newR = newL + 8; }
+            }
+            if (newB - newT < 8) {
+                if (hn == 0 || hn == 1 || hn == 2) { newT = newB - 8; } else { newB = newT + 8; }
+            }
+            int nw = (newR - newL - (this.sel.Cols() - 1) * this.sel.GapX()) / this.sel.Cols();
+            int nh = (newB - newT - (this.sel.Rows() - 1) * this.sel.GapY()) / this.sel.Rows();
             if (nw < 4) { nw = 4; }
             if (nh < 4) { nh = 4; }
             this.sel.Size(nw, nh);
+            // Re-anchor so the design-space top-left lands at (newL, newT).
+            int rbX = this.sel.AnchorX() * this.doc.DesignWidth() / 1000
+                - this.sel.AnchorX() * this.sel.TotalW() / 1000;
+            int rbY = this.sel.AnchorY() * this.doc.DesignHeight() / 1000
+                - this.sel.AnchorY() * this.sel.TotalH() / 1000;
+            this.sel.At(newL - rbX, newT - rbY);
             app.RequestRedraw();
         }
 
@@ -754,6 +839,130 @@ class SceneDesigner {
             this.resizing = false;
             app.RequestRedraw();
         }
+
+        this.HandleKeys(app);
+    }
+
+    // Screen-space centre of resize handle `hnum` (0=TL 1=T 2=TR 3=R 4=BR 5=B 6=BL 7=L).
+    static int HandleX(int hnum, int ex, int exw) {
+        if (hnum == 0 || hnum == 6 || hnum == 7) { return ex; }
+        if (hnum == 1 || hnum == 5) { return ex + exw / 2; }
+        return ex + exw;
+    }
+    static int HandleY(int hnum, int ey, int exh) {
+        if (hnum == 0 || hnum == 1 || hnum == 2) { return ey; }
+        if (hnum == 3 || hnum == 7) { return ey + exh / 2; }
+        return ey + exh;
+    }
+
+    // Snaps a proposed design-space left/top to nearby element or canvas-centre
+    // alignment lines. Returns the snapped value or -100000 when nothing is in
+    // range; records the matched guide line for drawing.
+    int SnapAxisX(int left, int tw) {
+        int thr = 6;
+        int best = 0 - 100000;
+        int bestD = thr + 1;
+        List<int> lines = new List<int>();
+        lines.Add(this.doc.DesignWidth() / 2);
+        int i = 0;
+        while (i < this.doc.Count()) {
+            SceneElement e = this.doc.ElementAt(i);
+            if (e != this.sel) {
+                int l = this.DesignLeft(e);
+                lines.Add(l);
+                lines.Add(l + e.TotalW() / 2);
+                lines.Add(l + e.TotalW());
+            }
+            i = i + 1;
+        }
+        int j = 0;
+        while (j < lines.Count) {
+            int ln = lines[j];
+            // candidate positions: our left, centre or right sits on the line
+            int k = 0;
+            while (k < 3) {
+                int cand = ln;
+                if (k == 1) { cand = ln - tw / 2; }
+                if (k == 2) { cand = ln - tw; }
+                int d = left - cand;
+                if (d < 0) { d = 0 - d; }
+                if (d <= thr && d < bestD) { bestD = d; best = cand; this.guideX = ln; }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        if (best == 0 - 100000) { this.guideX = 0 - 1; }
+        return best;
+    }
+    int SnapAxisY(int top, int th) {
+        int thr = 6;
+        int best = 0 - 100000;
+        int bestD = thr + 1;
+        List<int> lines = new List<int>();
+        lines.Add(this.doc.DesignHeight() / 2);
+        int i = 0;
+        while (i < this.doc.Count()) {
+            SceneElement e = this.doc.ElementAt(i);
+            if (e != this.sel) {
+                int tp = this.DesignTop(e);
+                lines.Add(tp);
+                lines.Add(tp + e.TotalH() / 2);
+                lines.Add(tp + e.TotalH());
+            }
+            i = i + 1;
+        }
+        int j = 0;
+        while (j < lines.Count) {
+            int ln = lines[j];
+            int k = 0;
+            while (k < 3) {
+                int cand = ln;
+                if (k == 1) { cand = ln - th / 2; }
+                if (k == 2) { cand = ln - th; }
+                int d = top - cand;
+                if (d < 0) { d = 0 - d; }
+                if (d <= thr && d < bestD) { bestD = d; best = cand; this.guideY = ln; }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        if (best == 0 - 100000) { this.guideY = 0 - 1; }
+        return best;
+    }
+
+    // True while one of the designer's own text inputs owns the keyboard.
+    bool AnyInputFocused(App app) {
+        if (app.focus.IsFocused(this.inpIdName)) { return true; }
+        if (app.focus.IsFocused(this.inpIdImg)) { return true; }
+        if (app.focus.IsFocused(this.inpIdText)) { return true; }
+        if (app.focus.IsFocused(this.inpIdBg)) { return true; }
+        if (app.focus.IsFocused(this.inpIdItems)) { return true; }
+        return false;
+    }
+
+    // Keyboard editing: arrows nudge the selection by one grid step (Shift =
+    // 1px), Delete removes it, Ctrl+D duplicates it. Ignored while an
+    // inspector input has focus so typing there is unaffected.
+    void HandleKeys(App app) {
+        if (this.sel == null) { return; }
+        if (this.AnyInputFocused(app)) { return; }
+        int ek = app.window.EventKind();
+        if (ek == 6 && app.window.EventKeyCode() == 4) {
+            // Ctrl+D
+            this.DuplicateSel();
+            app.RequestRedraw();
+            return;
+        }
+        if (ek != 4) { return; }
+        int kc = app.window.EventKeyCode();
+        int step = this.grid;
+        if (step < 1) { step = 1; }
+        if (Modifiers.HasShift(app.window.EventMods())) { step = 1; }
+        if (kc == 37) { this.sel.At(this.sel.X() - step, this.sel.Y()); app.RequestRedraw(); }
+        else if (kc == 39) { this.sel.At(this.sel.X() + step, this.sel.Y()); app.RequestRedraw(); }
+        else if (kc == 38) { this.sel.At(this.sel.X(), this.sel.Y() - step); app.RequestRedraw(); }
+        else if (kc == 40) { this.sel.At(this.sel.X(), this.sel.Y() + step); app.RequestRedraw(); }
+        else if (kc == 46) { this.DeleteSel(); app.RequestRedraw(); }
     }
 
     List<SceneElement> OrderedByZ() {
@@ -850,7 +1059,7 @@ class SceneDesigner {
         iy = iy + rowH;
 
         c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("bg", "背景"), t.textSecondary, t.fontSizeSmall);
-        this.bgIn.Render(app, ix + app.Scale(40), iy, iw - app.Scale(40), app.Scale(28));
+        this.inpIdBg = this.bgIn.Render(app, ix + app.Scale(40), iy, iw - app.Scale(40), app.Scale(28));
         this.doc.SetBackground(this.bgIn.GetText());
         iy = iy + rowH + app.Scale(6);
 
@@ -868,22 +1077,22 @@ class SceneDesigner {
         iy = iy + app.Scale(20);
 
         c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("name", "名称"), t.textSecondary, t.fontSizeSmall);
-        this.nameIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.inpIdName = this.nameIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
         this.sel.ename = this.nameIn.GetText();
         iy = iy + rowH;
 
         c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("image", "图片"), t.textSecondary, t.fontSizeSmall);
-        this.imgIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.inpIdImg = this.imgIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
         this.sel.image = this.imgIn.GetText();
         iy = iy + rowH;
 
         c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("text", "文本"), t.textSecondary, t.fontSizeSmall);
-        this.textIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.inpIdText = this.textIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
         this.sel.text = this.textIn.GetText();
         iy = iy + rowH;
 
         c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("items", "选项"), t.textSecondary, t.fontSizeSmall);
-        this.itemsIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.inpIdItems = this.itemsIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
         this.sel.items = this.itemsIn.GetText();
         iy = iy + rowH;
 
