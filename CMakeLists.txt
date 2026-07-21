@@ -632,7 +632,16 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text PROPERTIES
+  add_test(NAME conformance_gui_codeeditor
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Widget/CodeEditor.zan;--auto-stdlib;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_text conformance_gui_codeeditor PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
