@@ -1,0 +1,155 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+// Exercises the full QueryBuilder surface (parameterized and legacy modes)
+// against a real SQLite database: every WHERE combinator, ordering, grouping,
+// paging, INSERT/UPDATE/DELETE round-trips, scalar queries, NULL and hostile
+// values, and the identifier guards.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static void Main() {
+        string path = "orm_queries_test.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE people (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age INTEGER, city TEXT, note TEXT)");
+
+        // Seed via parameterized INSERT built by QueryBuilder.
+        QueryBuilder ins1 = QueryBuilder.InsertInto("people")
+            .Set("name", "Alice").Set("age", "30").Set("city", "Paris").Set("note", "");
+        db.Execute(ins1.BuildInsertParams(), ins1.InsertParams());
+        QueryBuilder ins2 = QueryBuilder.InsertInto("people")
+            .Set("name", "O'Brien").Set("age", "41").Set("city", "Dublin").Set("note", "quote'test");
+        db.Execute(ins2.BuildInsertParams(), ins2.InsertParams());
+        QueryBuilder ins3 = QueryBuilder.InsertInto("people")
+            .Set("name", "Bob").Set("age", "25").Set("city", "Paris").Set("note", "b\\slash");
+        db.Execute(ins3.BuildInsertParams(), ins3.InsertParams());
+        db.Execute("INSERT INTO people (name, age, city, note) VALUES (?, ?, ?, ?)",
+            DbParams.Create().Add("张伟").AddInt(33).Add("北京").AddNull());
+        db.Execute("INSERT INTO people (name, age, city, note) VALUES (?, ?, ?, ?)",
+            DbParams.Create().Add("x'); DROP TABLE people;--").AddInt(99).Add("Nowhere").Add("inj"));
+        Check("seed-count", db.ExecuteScalar("SELECT COUNT(*) FROM people") == "5");
+
+        // WhereEq (string) parameterized.
+        QueryBuilder q1 = QueryBuilder.From("people").WhereEq("name", "O'Brien");
+        DbResult r1 = db.Query(q1.BuildSelectParams("age"), q1.SelectParams());
+        Check("where-eq", r1.RowCount() == 1 && r1.GetString(0, 0) == "41");
+
+        // WhereEqInt.
+        QueryBuilder q2 = QueryBuilder.From("people").WhereEqInt("age", 25);
+        DbResult r2 = db.Query(q2.BuildSelectParams("name"), q2.SelectParams());
+        Check("where-eq-int", r2.RowCount() == 1 && r2.GetString(0, 0) == "Bob");
+
+        // WhereIn.
+        List<string> cities = new List<string>();
+        cities.Add("Paris");
+        cities.Add("北京");
+        QueryBuilder q3 = QueryBuilder.From("people").WhereIn("city", cities).OrderBy("age");
+        DbResult r3 = db.Query(q3.BuildSelectParams("name"), q3.SelectParams());
+        Check("where-in", r3.RowCount() == 3 && r3.GetString(0, 0) == "Bob"
+            && r3.GetString(1, 0) == "Alice" && r3.GetString(2, 0) == "张伟");
+
+        // WhereLike.
+        QueryBuilder q4 = QueryBuilder.From("people").WhereLike("name", "%li%");
+        DbResult r4 = db.Query(q4.BuildSelectParams("name"), q4.SelectParams());
+        Check("where-like", r4.RowCount() == 1 && r4.GetString(0, 0) == "Alice");
+
+        // WhereBetween.
+        QueryBuilder q5 = QueryBuilder.From("people").WhereBetween("age", "30", "41").OrderByDesc("age");
+        DbResult r5 = db.Query(q5.BuildSelectParams("age"), q5.SelectParams());
+        Check("where-between", r5.RowCount() == 3 && r5.GetString(0, 0) == "41"
+            && r5.GetString(2, 0) == "30");
+
+        // Combined conditions: two Where merge with AND.
+        QueryBuilder q6 = QueryBuilder.From("people").WhereEq("city", "Paris").WhereBetween("age", "20", "28");
+        DbResult r6 = db.Query(q6.BuildSelectParams("name"), q6.SelectParams());
+        Check("where-and", r6.RowCount() == 1 && r6.GetString(0, 0) == "Bob");
+
+        // WhereNull / WhereNotNull.
+        QueryBuilder q7 = QueryBuilder.From("people").WhereNull("note");
+        DbResult r7 = db.Query(q7.BuildSelectParams("name"), q7.SelectParams());
+        Check("where-null", r7.RowCount() == 1 && r7.GetString(0, 0) == "张伟");
+        QueryBuilder q8 = QueryBuilder.From("people").WhereNotNull("note").WhereEq("city", "Paris");
+        DbResult r8 = db.Query(q8.BuildSelectParams("name"), q8.SelectParams());
+        Check("where-not-null", r8.RowCount() == 2);
+
+        // GroupBy + Having + Count.
+        QueryBuilder q9 = QueryBuilder.From("people").GroupBy("city").Having("COUNT(*) > 1");
+        DbResult r9 = db.Query(q9.BuildSelectParams("city, COUNT(*)"), q9.SelectParams());
+        Check("group-having", r9.RowCount() == 1 && r9.GetString(0, 0) == "Paris"
+            && r9.GetString(0, 1) == "2");
+
+        // Limit + Offset.
+        QueryBuilder q10 = QueryBuilder.From("people").OrderBy("age").Limit(2).Offset(1);
+        DbResult r10 = db.Query(q10.BuildSelectParams("age"), q10.SelectParams());
+        Check("limit-offset", r10.RowCount() == 2 && r10.GetString(0, 0) == "30"
+            && r10.GetString(1, 0) == "33");
+
+        // Injection payload is stored as data; table intact.
+        QueryBuilder q11 = QueryBuilder.From("people").WhereEq("name", "x'); DROP TABLE people;--");
+        DbResult r11 = db.Query(q11.BuildSelectParams("age"), q11.SelectParams());
+        Check("injection-as-data", r11.RowCount() == 1 && r11.GetString(0, 0) == "99");
+
+        // Multibyte round-trip.
+        DbResult r12 = db.Query("SELECT city FROM people WHERE name = ?",
+            DbParams.Create().Add("张伟"));
+        Check("multibyte", r12.RowCount() == 1 && r12.GetString(0, 0) == "北京");
+
+        // Parameterized UPDATE: SET params precede WHERE params.
+        QueryBuilder u1 = QueryBuilder.Update("people").Set("city", "Lyon").SetInt("age", 26)
+            .WhereEq("name", "Bob");
+        int nu = db.Execute(u1.BuildUpdateParams(), u1.UpdateParams());
+        DbResult ru = db.Query("SELECT city, age FROM people WHERE name = ?",
+            DbParams.Create().Add("Bob"));
+        Check("update-params", nu == 1 && ru.GetString(0, 0) == "Lyon" && ru.GetString(0, 1) == "26");
+
+        // Atomic increment (no read-modify-write in app code).
+        db.Execute("UPDATE people SET age = age + 1 WHERE name = ?",
+            DbParams.Create().Add("Bob"));
+        Check("atomic-inc", db.ExecuteScalar("SELECT age FROM people WHERE name = ?",
+            DbParams.Create().Add("Bob")) == "27");
+
+        // Parameterized DELETE.
+        QueryBuilder d1 = QueryBuilder.DeleteFrom("people").WhereEq("name", "x'); DROP TABLE people;--");
+        int nd = db.Execute(d1.BuildDeleteParams(), d1.SelectParams());
+        Check("delete-params", nd == 1 && db.ExecuteScalar("SELECT COUNT(*) FROM people") == "4");
+
+        // Legacy string mode still works and escapes.
+        QueryBuilder l1 = QueryBuilder.From("people").WhereEq("name", "O'Brien");
+        DbResult rl = db.Query(l1.BuildSelect("age"));
+        Check("legacy-inline", rl.RowCount() == 1 && rl.GetString(0, 0) == "41");
+
+        // Identifier guards.
+        bool threw = false;
+        try { QueryBuilder bad = QueryBuilder.From("people; DROP TABLE people"); }
+        catch (Exception e) { threw = true; }
+        Check("ident-table", threw);
+        threw = false;
+        try { QueryBuilder bad2 = QueryBuilder.From("people").OrderBy("age; DELETE FROM people"); }
+        catch (Exception e) { threw = true; }
+        Check("ident-order", threw);
+        threw = false;
+        try { QueryBuilder bad3 = QueryBuilder.Update("people").Set("age = 1; --", "5"); }
+        catch (Exception e) { threw = true; }
+        Check("ident-set", threw);
+
+        // ModelRow JSON escaping (quotes, backslash, control chars).
+        ModelRow row = ModelRow.Create().Set("name", "say \"hi\"\\").Set("note", "line1\nline2\ttab");
+        string js = row.ToJson();
+        Check("json-escape", js == "{\"name\":\"say \\\"hi\\\"\\\\\",\"note\":\"line1\\nline2\\ttab\"}");
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        db.Close();
+        File.Delete(path);
+    }
+}
