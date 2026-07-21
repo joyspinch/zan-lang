@@ -40,7 +40,11 @@ class SceneDesigner {
     int inpIdText;
     int inpIdBg;
     int inpIdItems;
-    List<SceneElement> selExtra;  // additional multi-selected elements (Ctrl+click)
+    List<SceneElement> selExtra;  // additional multi-selected elements (Ctrl+click / marquee)
+    bool marquee;        // rubber-band selection drag in progress
+    int mqSX;            // marquee start (screen space)
+    int mqSY;
+    bool showTags;       // draw kind/name badges over the elements
     bool ctxOpen;        // canvas right-click context menu
     int ctxX;
     int ctxY;
@@ -82,6 +86,10 @@ class SceneDesigner {
         d.inpIdBg = 0 - 1;
         d.inpIdItems = 0 - 1;
         d.selExtra = new List<SceneElement>();
+        d.marquee = false;
+        d.mqSX = 0;
+        d.mqSY = 0;
+        d.showTags = true;
         d.ctxOpen = false;
         d.ctxX = 0;
         d.ctxY = 0;
@@ -667,6 +675,11 @@ class SceneDesigner {
         if (this.snap) { sl = SceneDesigner.T("Snap: on", "吸附:开"); }
         int sid = Button.Create(sl).Render(app, ix + bw + app.Scale(6), iy, bw);
         if (Button.WasClicked(app, sid)) { this.snap = !this.snap; app.RequestRedraw(); }
+        iy = iy + bh + app.Scale(4);
+        string tl = SceneDesigner.T("Tags: off", "标签:关");
+        if (this.showTags) { tl = SceneDesigner.T("Tags: on", "标签:开"); }
+        int tid = Button.Create(tl).Render(app, ix, iy, bw);
+        if (Button.WasClicked(app, tid)) { this.showTags = !this.showTags; app.RequestRedraw(); }
     }
 
     // --- canvas (free placement over the design resolution) ------------------
@@ -915,6 +928,19 @@ class SceneDesigner {
             } else if (e.Locked()) {
                 c.DrawText(ex + 2, ey + 2, "◈", t.textTertiary, t.fontSizeSmall);
             }
+            if (this.showTags) {
+                // Small identifying badge so identical-looking elements are
+                // easy to tell apart at a glance.
+                string tag = SceneDesigner.KindLabel(e.Kind()) + " · " + e.Name();
+                int tgw = Canvas.MeasureText(tag, t.fontSizeTiny) + app.Scale(8);
+                int tgh = Canvas.FontHeight(t.fontSizeTiny) + app.Scale(4);
+                int tgy = ey - tgh - app.Scale(2);
+                if (tgy < oy) { tgy = ey + app.Scale(2); }
+                c.FillRoundRect(ex, tgy, tgw, tgh, app.Scale(3),
+                    SceneDesigner.PackColor(18, 22, 36, 200));
+                c.DrawText(ex + app.Scale(4), tgy + app.Scale(2), tag,
+                    SceneDesigner.PackColor(180, 200, 240, 255), t.fontSizeTiny);
+            }
             i = i + 1;
         }
         c.PopClip();
@@ -1024,6 +1050,13 @@ class SceneDesigner {
                     this.sel = hit;
                     this.selExtra = new List<SceneElement>();
                 }
+                if (hit == null && !ctrl) {
+                    // Empty canvas press: start a rubber-band (marquee) drag —
+                    // releasing selects everything the box touches.
+                    this.marquee = true;
+                    this.mqSX = app.mouseX;
+                    this.mqSY = app.mouseY;
+                }
                 if (hit != null && !ctrl) {
                     if (hit.Locked()) {
                         this.msg = SceneDesigner.T("element is locked", "元素已锁定");
@@ -1128,6 +1161,48 @@ class SceneDesigner {
             int rbY = this.sel.AnchorY() * this.doc.DesignHeight() / 1000
                 - this.sel.AnchorY() * this.sel.TotalH() / 1000;
             this.sel.At(newL - rbX, newT - rbY);
+            app.RequestRedraw();
+        }
+
+        // Marquee: live rectangle while dragging over empty canvas; releasing
+        // multi-selects every element intersecting the box.
+        if (this.marquee) {
+            int rx = this.mqSX;
+            int ry = this.mqSY;
+            int rw = app.mouseX - rx;
+            int rh = app.mouseY - ry;
+            if (rw < 0) { rx = rx + rw; rw = 0 - rw; }
+            if (rh < 0) { ry = ry + rh; rh = 0 - rh; }
+            c.FillRect(rx, ry, rw, rh, SceneDesigner.PackColor(80, 130, 220, 40));
+            c.DrawRect(rx, ry, rw, rh, t.primary, 1);
+            if (ek == 3) {
+                this.marquee = false;
+                if (rw > 3 || rh > 3) {
+                    this.sel = null;
+                    this.selExtra = new List<SceneElement>();
+                    int mi = 0;
+                    while (mi < ordered.Count) {
+                        SceneElement e = ordered[mi];
+                        int ex = ox + this.DesignLeft(e) * psMilli / 1000;
+                        int ey = oy + this.DesignTop(e) * psMilli / 1000;
+                        int exw = e.TotalW() * psMilli / 1000;
+                        int exh = e.TotalH() * psMilli / 1000;
+                        if (ex < rx + rw && ex + exw > rx && ey < ry + rh && ey + exh > ry) {
+                            if (this.sel == null) { this.sel = e; }
+                            else { this.selExtra.Add(e); }
+                        }
+                        mi = mi + 1;
+                    }
+                    int selN = this.selExtra.Count;
+                    if (this.sel != null) { selN = selN + 1; }
+                    if (selN > 0) {
+                        this.msg = SceneDesigner.T("selected ", "已选中 ")
+                            + SceneDoc.IntStr(selN)
+                            + SceneDesigner.T(" element(s)", " 个元素");
+                        Layer.Msg(this.msg, 3);
+                    }
+                }
+            }
             app.RequestRedraw();
         }
 
