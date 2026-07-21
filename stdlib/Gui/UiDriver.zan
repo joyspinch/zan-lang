@@ -1,0 +1,475 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+
+namespace Gui;
+
+/// <summary>
+/// AI-operable UI automation driver for the Gui framework.
+///
+/// Instead of moving the OS mouse and screen-scraping pixels, a driver script
+/// injects synthetic input events (see Window.InjectEvent / the native
+/// zan_gui_inject_event) that are drained by the SAME poll/wait event loop real
+/// OS input flows through. Every hit-test, focus change, click target and key
+/// handler therefore runs exactly as it would for a human — the app is driven
+/// "from inside" through its real event dispatch, not simulated from outside.
+///
+/// Opt-in: set the environment variable ZAN_UI_SCRIPT to a text script path.
+/// When unset the driver is completely inert and normal GUI behaviour is
+/// unchanged. Output (hit-region / editor dumps, an assertion results log) is
+/// written under ZAN_UI_OUT (default "_scratch/uidrv").
+///
+/// Script grammar (one command per line; blank lines and '#' comments ignored):
+///   wait &lt;ms&gt;                     pause &lt;ms&gt; before the next command
+///   move &lt;x&gt; &lt;y&gt;                 synthetic mouse move
+///   click &lt;x&gt; &lt;y&gt;                move+press+release (left button) at x,y
+///   clickid &lt;hitId&gt;              click the centre of the hit region with id
+///   rclick &lt;x&gt; &lt;y&gt;               right-button click at x,y
+///   scroll &lt;x&gt; &lt;y&gt; &lt;delta&gt;       wheel scroll at x,y
+///   char &lt;code&gt;                  a text-input char (also Tab=9/Enter=13/Esc=27)
+///   type "&lt;text&gt;"                type each character of the literal text
+///   keydown &lt;code&gt; [mods]        raw KeyDown (arrows, F-keys, App Tab focus)
+///   keyup &lt;code&gt; [mods]          raw KeyUp (e.g. F5 in the IDE)
+///   ev &lt;kind&gt; &lt;x&gt; &lt;y&gt; &lt;btn&gt; &lt;code&gt; &lt;mods&gt;   raw event (escape hatch)
+///   dump hitregions &lt;file&gt;       write every registered hit region as JSON
+///   dump probe &lt;name&gt; &lt;file&gt;     write the current value of a named probe
+///   assert probe &lt;name&gt; contains &lt;text&gt;   record PASS/FAIL vs. probe value
+///   assert probe &lt;name&gt; equals &lt;text&gt;
+///   log &lt;text&gt;                   append a note to the results log
+///   quit                         close the window (ends the app)
+///
+/// Named probes are pushed by the host each frame via SetProbe(name, value);
+/// the IDE publishes "editor" (buffer/caret/completion state) and "log".
+/// </summary>
+class UiDriver {
+    static extern string getenv(string name);
+
+    static bool active;
+    static bool finished;
+    static App app;
+    static List<string> cmds;
+    static int pc;
+    static int waitUntil;          // absolute ms; 0 = no pending wait
+    static string outDir;
+    static string resultsPath;
+    static int passCount;
+    static int failCount;
+
+    static List<string> probeNames;
+    static List<string> probeVals;
+
+    /// True once a ZAN_UI_SCRIPT-driven session is running (probes may be set).
+    static bool Active() { return active; }
+
+    /// Reads ZAN_UI_SCRIPT; when set, loads the script and arms the driver.
+    /// Bound to the given app's window for event injection. A no-op (leaving
+    /// the driver inert) when the env var is unset. Safe to call more than once.
+    static void Begin(App a) {
+        if (active) { return; }
+        string path = UiDriver.Env("ZAN_UI_SCRIPT");
+        if (path == "") { return; }
+        if (!File.Exists(path)) { return; }
+        app = a;
+        outDir = UiDriver.Env("ZAN_UI_OUT");
+        if (outDir == "") { outDir = "_scratch/uidrv"; }
+        Directory.CreateDirectoryRecursive(outDir);
+        resultsPath = outDir + "/results.log";
+        cmds = new List<string>();
+        string body = File.ReadAllText(path);
+        List<string> raw = body.Replace("\r", "").Split("\n");
+        int i = 0;
+        while (i < raw.Count) { cmds.Add(raw[i]); i = i + 1; }
+        pc = 0;
+        waitUntil = 0;
+        passCount = 0;
+        failCount = 0;
+        probeNames = new List<string>();
+        probeVals = new List<string>();
+        finished = false;
+        active = true;
+        File.WriteAllText(resultsPath,
+            "# UiDriver session: " + path + " (" + Convert.ToString(cmds.Count)
+            + " lines)\n");
+        app.needsRedraw = true;
+    }
+
+    static string Env(string name) {
+        string v = getenv(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+
+    /// Host hook: publish (or overwrite) a named introspection probe.
+    static void SetProbe(string name, string val) {
+        if (!active) { return; }
+        int i = 0;
+        while (i < probeNames.Count) {
+            if (probeNames[i] == name) { probeVals[i] = val; return; }
+            i = i + 1;
+        }
+        probeNames.Add(name);
+        probeVals.Add(val);
+    }
+
+    static string GetProbe(string name) {
+        int i = 0;
+        while (i < probeNames.Count) {
+            if (probeNames[i] == name) { return probeVals[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Drives the script forward. Call once per event-loop iteration (from
+    /// App.ProcessEvent and the IDE's custom loop). Injects the next event(s)
+    /// or advances past immediate (dump/assert/log) commands. Yields between
+    /// injected batches so each is fully consumed and rendered before the next.
+    static void Tick() {
+        if (!active || finished) { return; }
+        // Keep the host loop polling (rather than blocking) while a script runs,
+        // so injected events flush and time-based waits advance.
+        app.needsRedraw = true;
+        // Let a previously injected batch drain (and get rendered) first.
+        if (Window.InjectPending() > 0) { return; }
+        int now = Window.GetTickMs();
+        if (waitUntil > 0) {
+            if (now < waitUntil) { return; }
+            waitUntil = 0;
+        }
+        while (pc < cmds.Count) {
+            string line = cmds[pc];
+            pc = pc + 1;
+            bool yield = UiDriver.Exec(line);
+            if (yield) { return; }
+        }
+        UiDriver.Finish();
+    }
+
+    /// Executes one command line. Returns true when it injected events or set a
+    /// wait (the caller should let the loop process before the next command).
+    static bool Exec(string line) {
+        string trimmed = UiDriver.Trim(line);
+        if (trimmed == "") { return false; }
+        if (UiDriver.StartsWith(trimmed, "#")) { return false; }
+        List<string> t = UiDriver.Tok(trimmed);
+        string cmd = t[0];
+
+        if (cmd == "wait") {
+            int ms = UiDriver.ArgI(t, 1, 0);
+            waitUntil = Window.GetTickMs() + ms;
+            UiDriver.Note("wait " + Convert.ToString(ms));
+            return true;
+        }
+        if (cmd == "move") {
+            UiDriver.Inject(1, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 0, 0, 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "click") {
+            UiDriver.ClickAt(UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "rclick") {
+            UiDriver.ClickAt(UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 1);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "clickid") {
+            int id = UiDriver.ArgI(t, 1, -1);
+            HitRegion r = UiDriver.FindRegion(id);
+            if (r != null) {
+                int cx = r.x + r.width / 2;
+                int cy = r.y + r.height / 2;
+                UiDriver.ClickAt(cx, cy, 0);
+                UiDriver.Note("clickid " + Convert.ToString(id)
+                    + " -> (" + Convert.ToString(cx) + "," + Convert.ToString(cy) + ")");
+            } else {
+                UiDriver.Note("clickid " + Convert.ToString(id) + " -> NOT FOUND");
+                return false;
+            }
+            return true;
+        }
+        if (cmd == "scroll") {
+            UiDriver.Inject(13, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0),
+                0, UiDriver.ArgI(t, 3, 0), 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "char") {
+            UiDriver.Inject(6, 0, 0, 0, UiDriver.ArgI(t, 1, 0), 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "type") {
+            string txt = UiDriver.Unquote(UiDriver.RemainderAfter(trimmed, 1));
+            int i = 0;
+            while (i < txt.Length) {
+                int b = txt[i];
+                if (b >= 32 && b < 127) {
+                    UiDriver.Inject(6, 0, 0, 0, b, 0);
+                }
+                i = i + 1;
+            }
+            UiDriver.Note("type \"" + txt + "\"");
+            return true;
+        }
+        if (cmd == "keydown") {
+            UiDriver.Inject(4, 0, 0, 0, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0));
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "keyup") {
+            UiDriver.Inject(5, 0, 0, 0, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0));
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "ev") {
+            UiDriver.Inject(UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0),
+                UiDriver.ArgI(t, 3, 0), UiDriver.ArgI(t, 4, 0),
+                UiDriver.ArgI(t, 5, 0), UiDriver.ArgI(t, 6, 0));
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "dump") {
+            UiDriver.DoDump(t);
+            return false;
+        }
+        if (cmd == "assert") {
+            UiDriver.DoAssert(t, trimmed);
+            return false;
+        }
+        if (cmd == "log") {
+            UiDriver.Note(UiDriver.RemainderAfter(trimmed, 1));
+            return false;
+        }
+        if (cmd == "quit") {
+            UiDriver.Note("quit");
+            UiDriver.Finish();
+            app.window.Close();
+            app.isRunning = false;
+            return true;
+        }
+        UiDriver.Note("UNKNOWN COMMAND: " + trimmed);
+        return false;
+    }
+
+    static void ClickAt(int x, int y, int button) {
+        UiDriver.Inject(1, x, y, 0, 0, 0);          // move
+        UiDriver.Inject(2, x, y, button, 0, 0);     // press
+        UiDriver.Inject(3, x, y, button, 0, 0);     // release
+    }
+
+    static void Inject(int kind, int x, int y, int button, int code, int mods) {
+        app.window.InjectEvent(kind, x, y, button, code, mods);
+    }
+
+    /// Resolves a hit-region id to its region (last registration wins, matching
+    /// the HitTester's reverse-order hit precedence). null when not registered.
+    static HitRegion FindRegion(int id) {
+        List<HitRegion> rs = app.hitTester.regions;
+        int i = rs.Count - 1;
+        while (i >= 0) {
+            if (rs[i].id == id) { return rs[i]; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    static void DoDump(List<string> t) {
+        if (t.Count < 3) { UiDriver.Note("dump: missing args"); return; }
+        string what = t[1];
+        if (what == "hitregions") {
+            string file = t[2];
+            File.WriteAllText(UiDriver.OutPath(file), UiDriver.HitRegionsJson());
+
+            UiDriver.Note("dump hitregions -> " + file + " ("
+                + Convert.ToString(app.hitTester.regions.Count) + " regions)");
+            return;
+        }
+        if (what == "probe") {
+            if (t.Count < 4) { UiDriver.Note("dump probe: missing file"); return; }
+            string name = t[2];
+            string file = t[3];
+            File.WriteAllText(UiDriver.OutPath(file), UiDriver.GetProbe(name));
+            UiDriver.Note("dump probe " + name + " -> " + file);
+            return;
+        }
+        UiDriver.Note("dump: unknown target " + what);
+    }
+
+    static void DoAssert(List<string> t, string trimmed) {
+        // assert probe <name> <contains|equals> <text...>
+        if (t.Count < 5 || t[1] != "probe") {
+            UiDriver.Note("assert: bad form: " + trimmed);
+            return;
+        }
+        string name = t[2];
+        string op = t[3];
+        string expect = UiDriver.RemainderAfter(trimmed, 4);
+        string val = UiDriver.GetProbe(name);
+        bool ok = false;
+        if (op == "contains") { ok = UiDriver.Contains(val, expect); }
+        else if (op == "equals") { ok = (UiDriver.Trim(val) == UiDriver.Trim(expect)); }
+        else { UiDriver.Note("assert: unknown op " + op); return; }
+        if (ok) {
+            passCount = passCount + 1;
+            UiDriver.Note("ASSERT PASS  probe " + name + " " + op + " \"" + expect + "\"");
+        } else {
+            failCount = failCount + 1;
+            string shown = val;
+            if (shown.Length > 200) { shown = shown.Substring(0, 200) + "..."; }
+            UiDriver.Note("ASSERT FAIL  probe " + name + " " + op + " \"" + expect
+                + "\"  | actual=" + shown);
+        }
+    }
+
+    static void Finish() {
+        if (finished) { return; }
+        finished = true;
+        UiDriver.Note("DONE pass=" + Convert.ToString(passCount)
+            + " fail=" + Convert.ToString(failCount));
+    }
+
+    // ---------------- introspection serialisers ----------------
+
+    static string HitRegionsJson() {
+        List<HitRegion> rs = app.hitTester.regions;
+        string s = "{\"count\":" + Convert.ToString(rs.Count) + ",\"regions\":[";
+        int i = 0;
+        while (i < rs.Count) {
+            HitRegion r = rs[i];
+            if (i > 0) { s = s + ","; }
+            s = s + "{\"z\":" + Convert.ToString(i)
+                + ",\"id\":" + Convert.ToString(r.id)
+                + ",\"x\":" + Convert.ToString(r.x)
+                + ",\"y\":" + Convert.ToString(r.y)
+                + ",\"w\":" + Convert.ToString(r.width)
+                + ",\"h\":" + Convert.ToString(r.height)
+                + ",\"type\":" + Convert.ToString(r.widgetType) + "}";
+            i = i + 1;
+        }
+        s = s + "]}";
+        return s;
+    }
+
+    /// JSON literal for a bool ("true"/"false"). Public so hosts building probe
+    /// JSON (e.g. the IDE's editor snapshot) can reuse it.
+    static string JsonBool(bool b) {
+        if (b) { return "true"; }
+        return "false";
+    }
+
+    // ---------------- small string helpers ----------------
+
+    static void Note(string msg) {
+        File.AppendAllText(resultsPath, msg + "\n");
+    }
+
+    static string OutPath(string file) {
+        if (UiDriver.StartsWith(file, "/") || UiDriver.Contains(file, ":")) { return file; }
+        return outDir + "/" + file;
+    }
+
+    static int ArgI(List<string> t, int idx, int def) {
+        if (idx < 0 || idx >= t.Count) { return def; }
+        return Convert.ToInt32(t[idx]);
+    }
+
+    static List<string> Tok(string s) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") {
+                if (cur.Length > 0) { outp.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { outp.Add(cur); }
+        return outp;
+    }
+
+    /// Everything after the first `count` whitespace-separated tokens, trimmed.
+    static string RemainderAfter(string s, int count) {
+        int i = 0;
+        int seen = 0;
+        while (seen < count && i < s.Length) {
+            while (i < s.Length) {
+                string c = s.Substring(i, 1);
+                if (c == " " || c == "\t") { i = i + 1; } else { break; }
+            }
+            while (i < s.Length) {
+                string c = s.Substring(i, 1);
+                if (c != " " && c != "\t") { i = i + 1; } else { break; }
+            }
+            seen = seen + 1;
+        }
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (c == " " || c == "\t") { i = i + 1; } else { break; }
+        }
+        return UiDriver.Trim(s.Substring(i, s.Length - i));
+    }
+
+    static string Unquote(string s) {
+        string r = UiDriver.Trim(s);
+        if (r.Length >= 2 && r.Substring(0, 1) == "\"" && r.Substring(r.Length - 1, 1) == "\"") {
+            return r.Substring(1, r.Length - 2);
+        }
+        return r;
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            string c = s.Substring(a, 1);
+            if (c == " " || c == "\t" || c == "\r" || c == "\n") { a = a + 1; } else { break; }
+        }
+        while (b > a) {
+            string c = s.Substring(b - 1, 1);
+            if (c == " " || c == "\t" || c == "\r" || c == "\n") { b = b - 1; } else { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    static bool StartsWith(string s, string pfx) {
+        if (pfx.Length > s.Length) { return false; }
+        return s.Substring(0, pfx.Length) == pfx;
+    }
+
+    static bool Contains(string s, string sub) {
+        if (sub.Length == 0) { return true; }
+        if (sub.Length > s.Length) { return false; }
+        int i = 0;
+        int last = s.Length - sub.Length;
+        while (i <= last) {
+            if (s.Substring(i, sub.Length) == sub) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// JSON-escapes a string (quotes, backslashes, control chars). Public so
+    /// hosts building probe JSON (e.g. the IDE's editor snapshot) can reuse it.
+    static string JsonEsc(string s) {
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            int b = s[i];
+            if (b == 34) { outp = outp + "\\\""; }
+            else if (b == 92) { outp = outp + "\\\\"; }
+            else if (b == 10) { outp = outp + "\\n"; }
+            else if (b == 13) { outp = outp + "\\r"; }
+            else if (b == 9) { outp = outp + "\\t"; }
+            else if (b < 32) { outp = outp + " "; }
+            else { outp = outp + s.Substring(i, 1); }
+            i = i + 1;
+        }
+        return outp;
+    }
+}
