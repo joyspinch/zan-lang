@@ -94,8 +94,10 @@ if (Test-Path $ld) {
 } else {
     Write-Output "PUBLISH_WARN: build\ld.exe missing; dist zanc will need a system LLVM/clang on PATH"
 }
-$musl = Join-Path $b 'linux-musl'
-if (Test-Path $musl) { Copy-Item $musl (Join-Path $distTc 'linux-musl') -Recurse }
+foreach ($sub in @('linux-musl', 'linux-arm64')) {
+    $sys = Join-Path $b $sub
+    if (Test-Path $sys) { Copy-Item $sys (Join-Path $distTc $sub) -Recurse }
+}
 foreach ($rt in (Get-ChildItem $b -File -ErrorAction SilentlyContinue |
                  Where-Object { $_.Name -like 'zanrt_*' -and $_.Extension -in '.o','.obj' })) {
     Copy-Item $rt.FullName (Join-Path $distTc $rt.Name)

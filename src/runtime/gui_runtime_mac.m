@@ -1042,6 +1042,20 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
     return 0;
 }
 
+/* Whole-window opacity, 10..100 percent. */
+EXPORT i64 zan_gui_set_opacity(i64 hwnd_val, i64 percent) {
+    zan_mwin_t *mw = mwin_find(hwnd_val);
+    if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+    if (!mw) return 1;
+    if (percent < 10) percent = 10;
+    if (percent > 100) percent = 100;
+    @autoreleasepool {
+        [mw->window setAlphaValue:((CGFloat)percent / 100.0)];
+        [mw->window setOpaque:(percent >= 100 ? YES : NO)];
+    }
+    return 0;
+}
+
 EXPORT i64 zan_gui_get_dpi_scale(void) {
     @autoreleasepool {
         NSWindow *w = g_mwin_count > 0 ? g_mwins[0].window : nil;

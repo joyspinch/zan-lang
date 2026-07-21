@@ -170,23 +170,34 @@ if(WIN32)
     endif()
 endif()
 
-# ---- Linux cross-compilation sysroot ----
-# Copy the bundled musl sysroot (committed at toolchain/linux-musl/) next to
-# zanc so that --target linux-musl / linux-x64 can static-link ELF binaries
-# without any external toolchain.  The sysroot contains crt*.o, libc.a, and
-# a pre-built zanrt_io.o for socket-async programs.
-set(LINUX_MUSL_SYS "${CMAKE_SOURCE_DIR}/toolchain/linux-musl")
-if(EXISTS "${LINUX_MUSL_SYS}/libc.a")
-    add_custom_command(TARGET zanc POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/linux-musl
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${LINUX_MUSL_SYS}/crt1.o" "${LINUX_MUSL_SYS}/crti.o"
-                "${LINUX_MUSL_SYS}/crtn.o" "${LINUX_MUSL_SYS}/libc.a"
-                "${LINUX_MUSL_SYS}/zanrt_io.o"
-                $<TARGET_FILE_DIR:zanc>/linux-musl/
-        COMMENT "Copying Linux musl sysroot for cross-compilation"
-        VERBATIM)
-endif()
+# ---- Linux cross-compilation sysroots ----
+# Copy the bundled musl sysroots (committed at toolchain/linux-musl/ for
+# x86_64 and toolchain/linux-arm64/ for aarch64) next to zanc so that
+# --target linux-musl / linux-x64 / linux-arm64 can static-link ELF binaries
+# without any external toolchain.  Each sysroot contains crt*.o, libc.a, a
+# pre-built zanrt_io.o for socket-async programs, and zanrt_sync.o for
+# atomics/shared-memory programs.
+foreach(_linux_sub linux-musl linux-arm64)
+    set(_linux_sys "${CMAKE_SOURCE_DIR}/toolchain/${_linux_sub}")
+    if(EXISTS "${_linux_sys}/libc.a")
+        add_custom_command(TARGET zanc POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:zanc>/${_linux_sub}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_linux_sys}/crt1.o" "${_linux_sys}/crti.o"
+                    "${_linux_sys}/crtn.o" "${_linux_sys}/libc.a"
+                    "${_linux_sys}/zanrt_io.o" "${_linux_sys}/zanrt_sync.o"
+                    $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
+            COMMENT "Copying ${_linux_sub} sysroot for cross-compilation"
+            VERBATIM)
+        if(EXISTS "${_linux_sys}/libgcc.a")
+            add_custom_command(TARGET zanc POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_linux_sys}/libgcc.a"
+                        $<TARGET_FILE_DIR:zanc>/${_linux_sub}/
+                VERBATIM)
+        endif()
+    endif()
+endforeach()
 
 # ---- Native database drivers (publish-time bundling) ----
 # Each native DB driver now lives inside the stdlib module that owns it

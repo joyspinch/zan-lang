@@ -28,6 +28,7 @@ done
 
 # cross sysroot + runtime objects that travel next to zanc
 [ -d build/linux-musl ] && cp -r build/linux-musl "$stage/toolchain/"
+[ -d build/linux-arm64 ] && cp -r build/linux-arm64 "$stage/toolchain/"
 for o in build/zanrt_*.o build/zanrt_*.obj; do
     [ -f "$o" ] && cp "$o" "$stage/toolchain/"
 done

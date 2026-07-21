@@ -1589,6 +1589,13 @@ int main(int argc, char **argv) {
             }
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur, " --start-group \"%s/libc.a\"", sys); }
+            /* soft-float / int128 builtins (aarch64 long double is fp128) */
+            { char gcclib[1300];
+              snprintf(gcclib, sizeof(gcclib), "%s/libgcc.a", sys);
+              if (zan_file_exists(gcclib)) {
+                  size_t cur = strlen(cmd);
+                  snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", gcclib);
+              } }
             /* bundled static driver archives (sqlite3, ...), inside the group
              * so their libc references resolve from musl */
             for (int d = 0; d < cross_archive_count; d++) {
