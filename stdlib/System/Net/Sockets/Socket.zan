@@ -391,7 +391,13 @@ class Socket {
         string buf = calloc(bufSize + 1, 1);
         while (true) {
             await Socket.ReadReady(sock);
-            int n = winrecv(sock, buf, bufSize, 0);
+            // Route through the int64-returning reactor shim rather than the raw
+            // ws2_32 recv: a foreign C `int` -1 (WSAEWOULDBLOCK on a spurious
+            // wake) arrives zero-extended as 0xFFFFFFFF, defeating this `n >= 0`
+            // guard and turning the following Substring into a ~4GB memcpy
+            // (heap corruption). The shim casts recv()'s result to int64_t, so
+            // -1 is a genuine negative and the guard behaves.
+            int n = ReactorRecv(sock, buf, bufSize, 0);
             if (n >= 0) {
                 string result = buf.Substring(0, n);
                 free(buf);
@@ -449,6 +455,11 @@ class Socket {
         string fromLen = calloc(4, 1);
         fromLen[0] = 16;
         int n = recvfrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        // recvfrom is a raw ws2_32 import returning C `int`; a -1 error arrives
+        // zero-extended as 0xFFFFFFFF. Sign-normalize the low 32 bits so the
+        // error check below sees a genuine negative rather than ~4G (which would
+        // make Substring copy far past the buffer -- heap corruption).
+        if (n > 2147483647) { n = n - 4294967296; }
         if (n < 0) { n = 0; }
         string result = buf.Substring(0, n);
         free(buf);

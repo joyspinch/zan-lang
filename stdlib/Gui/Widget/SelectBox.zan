@@ -23,7 +23,7 @@ namespace Gui.Widget;
 ///   SelectBox.Create(hint).Clearable(true).Size(SelectBox.Large())
 ///                         .Status(SelectBox.Error())
 /// </summary>
-class SelectBox {
+class SelectBox : Control {
     List<string> options;
     List<bool> chosen;
     int selected;
@@ -35,6 +35,11 @@ class SelectBox {
     int size;
     int status;
     int maxVisible;
+    // Anchor geometry stashed each frame so the deferred popup (OnPaintOverlay,
+    // run in the overlay pass) can lay itself out below the trigger.
+    int trigX;
+    int trigY;
+    int trigW;
 
     static int Small() { return 0; }
     static int Medium() { return 1; }
@@ -47,6 +52,7 @@ class SelectBox {
 
     static SelectBox Make(string hintText, bool isMulti) {
         SelectBox s = new SelectBox();
+        s.InitControl("selectbox", 0);
         s.options = new List<string>();
         s.chosen = new List<bool>();
         s.selected = 0 - 1;
@@ -162,7 +168,6 @@ class SelectBox {
 
         int h = this.HeadHeight(t);
         int fs = this.FontSize(t);
-        int optH = h;
 
         int ek = app.window.EventKind();
         int eb = app.window.EventButton();
@@ -170,17 +175,6 @@ class SelectBox {
 
         bool overHead = app.mouseX >= x && app.mouseX < x + w
             && app.mouseY >= y && app.mouseY < y + h;
-
-        // Popup geometry (below the trigger).
-        int visRows = options.Count;
-        if (visRows > maxVisible) { visRows = maxVisible; }
-        int viewH = visRows * optH;
-        int contentH = options.Count * optH;
-        int popX = x;
-        int popY = y + h + app.Scale(4);
-
-        bool overPopup = open && app.mouseX >= popX && app.mouseX < popX + w
-            && app.mouseY >= popY && app.mouseY < popY + viewH;
 
         // Clear button geometry (left of the arrow) when there is a value.
         int arrowSlot = t.paddingLarge + t.iconSizeSmall;
@@ -215,41 +209,60 @@ class SelectBox {
         Icon.DrawCenteredIn(c, "chevron-down", x + w - arrowSlot, y,
             t.iconSizeSmall, h, t.iconSizeSmall, t.textSecondary);
 
-        // ---- input ----
-        if (leftUp) {
-            if (open) {
-                if (overPopup) {
-                    int rel = app.mouseY - popY + scrollY;
-                    int idx = rel / optH;
-                    if (idx >= 0 && idx < options.Count) {
-                        if (multi) {
-                            chosen[idx] = !chosen[idx];
-                        } else {
-                            selected = idx;
-                            open = false;
-                        }
-                        app.RequestRedraw();
-                    }
-                } else {
-                    // Click on the header or anywhere outside closes.
-                    open = false;
-                    app.RequestRedraw();
-                }
-            } else {
-                if (overClear) {
-                    this.Clear();
-                    app.RequestRedraw();
-                } else if (overHead) {
-                    open = true;
-                    scrollY = 0;
-                    app.RequestRedraw();
-                }
+        // ---- trigger input (closed state only) ----
+        // The popup's own clicks (option pick / outside-dismiss) are handled in
+        // OnPaintOverlay so they resolve above content in the overlay pass.
+        if (leftUp && !open) {
+            if (overClear) {
+                this.Clear();
+                app.RequestRedraw();
+            } else if (overHead) {
+                open = true;
+                scrollY = 0;
+                // Claim the opening click so the just-shown popup does not treat
+                // it as an outside-press and immediately close this same frame.
+                app.ClaimClick();
+                app.RequestRedraw();
             }
         }
 
-        if (!open) { return; }
+        // Defer the option list to the overlay pass: it then paints above every
+        // widget drawn after this one (no occlusion) and registers the top-most
+        // hit regions (no click-through). See OnPaintOverlay.
+        trigX = x;
+        trigY = y;
+        trigW = w;
+        if (open) {
+            app.AddOverlay(OverlayPopup.Host(this));
+        }
+    }
 
-        // ---- popup ----
+    /// Deferred popup: drawn + dispatched in App.RunOverlays after all content.
+    override void OnPaintOverlay(App app) {
+        if (!open) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+
+        int x = trigX;
+        int y = trigY;
+        int w = trigW;
+        int h = this.HeadHeight(t);
+        int fs = this.FontSize(t);
+        int optH = h;
+        int arrowSlot = t.paddingLarge + t.iconSizeSmall;
+
+        int ek = app.window.EventKind();
+
+        int visRows = options.Count;
+        if (visRows > maxVisible) { visRows = maxVisible; }
+        int viewH = visRows * optH;
+        int contentH = options.Count * optH;
+        int popX = x;
+        int popY = y + h + app.Scale(4);
+
+        bool overPopup = app.mouseX >= popX && app.mouseX < popX + w
+            && app.mouseY >= popY && app.mouseY < popY + viewH;
+
         int maxScroll = contentH - viewH;
         if (maxScroll < 0) { maxScroll = 0; }
         if (overPopup) {
@@ -316,6 +329,34 @@ class SelectBox {
             c.PushClip(popX, popY, w, viewH);
             c.FillRoundRect(bx, thumbY, barW, thumbH, barW / 2, t.scrollbar);
             c.PopClip();
+        }
+
+        // ---- centralized popup input (overlay pass, above content) ----
+        // ClickAvailable() is false on the frame the popup opened (the opening
+        // click was claimed) so the popup never self-closes on open.
+        if (app.ClickAvailable()) {
+            if (overPopup) {
+                int rel = app.mouseY - popY + scrollY;
+                int idx = rel / optH;
+                if (idx >= 0 && idx < options.Count) {
+                    if (multi) {
+                        chosen[idx] = !chosen[idx];
+                    } else {
+                        selected = idx;
+                        open = false;
+                    }
+                    app.ClaimClick();
+                    app.RequestRedraw();
+                }
+            } else {
+                // Press anywhere outside the popup (incl. the trigger) closes.
+                open = false;
+                app.RequestRedraw();
+            }
+        }
+        if (ek == 4 && app.window.EventKeyCode() == 27) {
+            open = false;
+            app.RequestRedraw();
         }
     }
 }
