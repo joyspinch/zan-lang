@@ -359,8 +359,14 @@ class Socket {
                 }
             } else if (sent == 0) {
                 return totalSent;
-            } else {
+            } else if (sent == -1) {
+                // Would block: wait until the socket is writable, then retry.
                 await Socket.WriteReady(sock);
+            } else {
+                // Fatal (peer reset/aborted, broken pipe, ...). The socket will
+                // never become writable again, so stop instead of waiting
+                // forever; report what was actually accepted.
+                return totalSent;
             }
         }
         return totalSent;
@@ -389,22 +395,17 @@ class Socket {
     /// string (empty on peer close / EOF). Requires a non-blocking socket.</summary>
     static async string RecvAsync(int sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
-        while (true) {
-            await Socket.ReadReady(sock);
-            // Route through the int64-returning reactor shim rather than the raw
-            // ws2_32 recv: a foreign C `int` -1 (WSAEWOULDBLOCK on a spurious
-            // wake) arrives zero-extended as 0xFFFFFFFF, defeating this `n >= 0`
-            // guard and turning the following Substring into a ~4GB memcpy
-            // (heap corruption). The shim casts recv()'s result to int64_t, so
-            // -1 is a genuine negative and the guard behaves.
-            int n = ReactorRecv(sock, buf, bufSize, 0);
-            if (n >= 0) {
-                string result = buf.Substring(0, n);
-                free(buf);
-                return result;
-            }
-        }
-        return buf;
+        // Use the real overlapped receive (RecvOv) rather than a readiness probe
+        // plus synchronous recv. A zero-byte readiness WSARecv can complete
+        // immediately with no data pending, so ReadReady + ReactorRecv would see
+        // WSAEWOULDBLOCK and mistake it for a peer close, returning empty before
+        // the peer's data ever arrives. RecvOv posts a genuine WSARecv into buf
+        // that completes only when bytes are read (or the peer closes).
+        int n = await Socket.RecvOv(sock, buf, bufSize);
+        if (n < 0) { n = 0; }
+        string result = buf.Substring(0, n);
+        free(buf);
+        return result;
     }
 
     /// <summary>Suspends until readable, then receives up to <paramref

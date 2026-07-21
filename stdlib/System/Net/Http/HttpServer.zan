@@ -1,8 +1,11 @@
-using System;
+﻿using System;
 using System.Net.Sockets;
 using System.Net.Http;
 
 namespace System.Net.Http;
+
+/// <summary>Handles a parsed request and produces the response to send.</summary>
+delegate HttpResponse HttpRequestHandler(HttpRequest request);
 
 /// <summary>
 /// Coroutine-based HTTP/1.1 server, inspired by Workerman.
@@ -32,6 +35,8 @@ class HttpServer {
     int maxConnections;
     int activeConnections;
     int requestTimeout;
+    int maxRequestBytes;
+    HttpRequestHandler requestHandler;
 
     HttpServer(string host, int port) {
         this.host = host;
@@ -40,6 +45,8 @@ class HttpServer {
         this.maxConnections = 10000;
         this.activeConnections = 0;
         this.requestTimeout = 30000;
+        this.maxRequestBytes = 1048576;
+        this.requestHandler = null;
     }
 
     /// <summary>Creates an HTTP server on the given address.</summary>
@@ -57,6 +64,45 @@ class HttpServer {
     /// <summary>Sets the request timeout in milliseconds.</summary>
     HttpServer SetTimeout(int ms) {
         this.requestTimeout = ms;
+        return this;
+    }
+
+    /// <summary>Sets the maximum accepted size, in bytes, of a single request
+    /// (headers + body). A request that grows past this is answered with 413 and
+    /// the connection is closed, so a client cannot exhaust memory with an
+    /// unbounded request.</summary>
+    HttpServer SetMaxRequestBytes(int bytes) {
+        this.maxRequestBytes = bytes;
+        return this;
+    }
+
+    /// <summary>Returns the index just past the end of the header block (the
+    /// first byte of the body) for the first request in <paramref name="buf"/>,
+    /// or -1 if the blank line terminating the headers has not arrived yet.
+    /// Recognises both CRLF (\r\n\r\n) and bare-LF (\n\n) separators.</summary>
+    static int FindHeaderEnd(string buf) {
+        int len = buf.Length;
+        int i = 0;
+        while (i < len) {
+            if ((buf[i] & 255) == 10) {
+                // "\n\n"
+                if (i + 1 < len && (buf[i + 1] & 255) == 10) {
+                    return i + 2;
+                }
+                // "\n\r\n"
+                if (i + 2 < len && (buf[i + 1] & 255) == 13 && (buf[i + 2] & 255) == 10) {
+                    return i + 3;
+                }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>Registers the handler invoked for every incoming request.
+    /// When set, it replaces the default placeholder response.</summary>
+    HttpServer OnRequest(HttpRequestHandler handler) {
+        this.requestHandler = handler;
         return this;
     }
 
@@ -86,14 +132,51 @@ class HttpServer {
     async void HandleConnection(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         bool keepAlive = true;
+        // Bytes received but not yet consumed as a complete request. Persisting
+        // this across the keep-alive loop is what makes framing correct: a read
+        // may deliver a partial request (finish it on the next read) or several
+        // pipelined requests at once (the remainder stays buffered for the next
+        // iteration instead of leaking into this request's body).
+        string buffer = "";
+        bool overflow = false;
 
         while (keepAlive) {
-            string rawData = await client.RecvReuseAsync();
-            if (rawData.Length == 0) {
-                break;
+            // 1) Read until the full header block has arrived.
+            int headerEnd = HttpServer.FindHeaderEnd(buffer);
+            while (headerEnd < 0) {
+                if (buffer.Length > this.maxRequestBytes) { overflow = true; break; }
+                string chunk = await client.RecvAsync(65536);
+                if (chunk.Length == 0) { keepAlive = false; break; }
+                buffer = buffer + chunk;
+                headerEnd = HttpServer.FindHeaderEnd(buffer);
+            }
+            if (overflow) { break; }
+            if (!keepAlive) { break; }
+
+            // 2) Parse headers to learn the declared body length, then read
+            //    until exactly that many body bytes are present.
+            HttpRequest head = HttpRequest.Parse(buffer);
+            int bodyLen = head.contentLength;
+            if (bodyLen < 0) { bodyLen = 0; }
+            int need = headerEnd + bodyLen;
+            if (need > this.maxRequestBytes) { overflow = true; break; }
+            while (buffer.Length < need) {
+                string chunk = await client.RecvAsync(65536);
+                if (chunk.Length == 0) { keepAlive = false; break; }
+                buffer = buffer + chunk;
+            }
+            if (!keepAlive && buffer.Length < need) { break; }
+
+            // 3) Slice out exactly this request; keep any trailing bytes as the
+            //    start of the next pipelined request.
+            string reqBytes = buffer.Substring(0, need);
+            if (buffer.Length > need) {
+                buffer = buffer.Substring(need);
+            } else {
+                buffer = "";
             }
 
-            HttpRequest request = HttpRequest.Parse(rawData);
+            HttpRequest request = HttpRequest.Parse(reqBytes);
             keepAlive = request.keepAlive;
 
             HttpResponse response = ProcessRequest(request);
@@ -107,6 +190,12 @@ class HttpServer {
             }
         }
 
+        if (overflow) {
+            HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
+            tooLarge = tooLarge.SetKeepAlive(false);
+            int _s = await client.SendAsync(tooLarge.Build());
+        }
+
         client.Close();
         this.activeConnections = this.activeConnections - 1;
     }
@@ -114,6 +203,10 @@ class HttpServer {
     /// <summary>Default request processor. Override this in subclasses
     /// or use a routing table.</summary>
     HttpResponse ProcessRequest(HttpRequest request) {
+        HttpRequestHandler handler = this.requestHandler;
+        if (handler != null) {
+            return handler(request);
+        }
         return HttpResponse.Ok("<h1>Zan HTTP Server</h1><p>Override ProcessRequest to handle routes.</p>");
     }
 
