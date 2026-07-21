@@ -29,6 +29,15 @@ class SqlDialect {
 ///
 ///   string updateSql = QueryBuilder.Update("users")
 ///       .Set("name", "Bob").Where("id = 1").BuildUpdate();
+///
+/// Parameterized mode (preferred -- values never enter the SQL text):
+///   QueryBuilder qb = QueryBuilder.From("users").WhereEq("name", name);
+///   DbResult r = db.Query(qb.BuildSelectParams("*"), qb.SelectParams());
+///
+/// Identifiers (table, column, ORDER BY / GROUP BY targets) are validated
+/// against [A-Za-z_][A-Za-z0-9_.]* ; an invalid identifier throws Exception.
+/// Raw-string clauses (Where/OrWhere/Having/Join) are NOT parameterized --
+/// never place user input in them; use WhereEq/WhereIn/... instead.
 /// </summary>
 class QueryBuilder {
     string tableName;
@@ -44,8 +53,10 @@ class QueryBuilder {
     List<string> setValues;
     bool distinct;
 
+    DbParams whereParams;
+
     QueryBuilder(string table) {
-        this.tableName = table;
+        this.tableName = QueryBuilder.RequireIdent(table);
         this.whereClause = "";
         this.orderByClause = "";
         this.groupByClause = "";
@@ -57,6 +68,36 @@ class QueryBuilder {
         this.setColumns = new List<string>();
         this.setValues = new List<string>();
         this.distinct = false;
+        this.whereParams = DbParams.Create();
+    }
+
+    /// <summary>True when s is a safe SQL identifier: [A-Za-z_][A-Za-z0-9_.]*
+    /// (dot allowed for qualified names like schema.table).</summary>
+    static bool IsIdent(string s) {
+        int n = s.Length;
+        if (n == 0) { return false; }
+        int i = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+            bool digit = c >= 48 && c <= 57;
+            bool dot = c == 46;
+            if (i == 0) {
+                if (!alpha) { return false; }
+            } else {
+                if (!alpha && !digit && !dot) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>Returns s unchanged when it is a safe identifier; throws otherwise.</summary>
+    static string RequireIdent(string s) {
+        if (!QueryBuilder.IsIdent(s)) {
+            throw new Exception("unsafe SQL identifier: " + s);
+        }
+        return s;
     }
 
     /// <summary>Creates a query builder for SELECT from a table.</summary>
@@ -99,64 +140,74 @@ class QueryBuilder {
         return this;
     }
 
-    /// <summary>Adds a WHERE with parameterized value (SQL injection safe).</summary>
+    /// <summary>Adds `column = ?` with the value carried as a bound parameter
+    /// (SQL injection safe: the value never enters the SQL text).</summary>
     QueryBuilder WhereEq(string column, string val) {
-        string cond = column + " = '" + EscapeString(val) + "'";
-        return Where(cond);
+        this.whereParams.Add(val);
+        return Where(QueryBuilder.RequireIdent(column) + " = ?");
     }
 
-    /// <summary>Adds a WHERE column IN list.</summary>
+    /// <summary>Adds `column = ?` with an integer parameter.</summary>
+    QueryBuilder WhereEqInt(string column, int val) {
+        this.whereParams.AddInt(val);
+        return Where(QueryBuilder.RequireIdent(column) + " = ?");
+    }
+
+    /// <summary>Adds a WHERE column IN (?, ?, ...) with bound parameters.</summary>
     QueryBuilder WhereIn(string column, List<string> values) {
         StringBuilder sb = new StringBuilder();
-        sb.Append(column);
+        sb.Append(QueryBuilder.RequireIdent(column));
         sb.Append(" IN (");
+        int n = values.Count;
         int i = 0;
-        while (i < values.Count) {
+        while (i < n) {
             if (i > 0) { sb.Append(", "); }
-            sb.Append("'");
-            sb.Append(EscapeString(values[i]));
-            sb.Append("'");
+            sb.Append("?");
+            this.whereParams.Add(values[i]);
             i = i + 1;
         }
         sb.Append(")");
         return Where(sb.ToString());
     }
 
-    /// <summary>Adds a WHERE LIKE clause.</summary>
+    /// <summary>Adds a WHERE column LIKE ? with a bound parameter.</summary>
     QueryBuilder WhereLike(string column, string pattern) {
-        return Where(column + " LIKE '" + EscapeString(pattern) + "'");
+        this.whereParams.Add(pattern);
+        return Where(QueryBuilder.RequireIdent(column) + " LIKE ?");
     }
 
-    /// <summary>Adds a WHERE BETWEEN clause.</summary>
+    /// <summary>Adds a WHERE column BETWEEN ? AND ? with bound parameters.</summary>
     QueryBuilder WhereBetween(string column, string low, string high) {
-        return Where(column + " BETWEEN '" + EscapeString(low) + "' AND '" + EscapeString(high) + "'");
+        this.whereParams.Add(low);
+        this.whereParams.Add(high);
+        return Where(QueryBuilder.RequireIdent(column) + " BETWEEN ? AND ?");
     }
 
     /// <summary>Adds a WHERE IS NULL clause.</summary>
     QueryBuilder WhereNull(string column) {
-        return Where(column + " IS NULL");
+        return Where(QueryBuilder.RequireIdent(column) + " IS NULL");
     }
 
     /// <summary>Adds a WHERE IS NOT NULL clause.</summary>
     QueryBuilder WhereNotNull(string column) {
-        return Where(column + " IS NOT NULL");
+        return Where(QueryBuilder.RequireIdent(column) + " IS NOT NULL");
     }
 
-    /// <summary>Sets ORDER BY clause.</summary>
+    /// <summary>Sets ORDER BY clause (column is identifier-validated).</summary>
     QueryBuilder OrderBy(string column) {
-        this.orderByClause = column;
+        this.orderByClause = QueryBuilder.RequireIdent(column);
         return this;
     }
 
-    /// <summary>Sets ORDER BY DESC clause.</summary>
+    /// <summary>Sets ORDER BY DESC clause (column is identifier-validated).</summary>
     QueryBuilder OrderByDesc(string column) {
-        this.orderByClause = column + " DESC";
+        this.orderByClause = QueryBuilder.RequireIdent(column) + " DESC";
         return this;
     }
 
-    /// <summary>Sets GROUP BY clause.</summary>
+    /// <summary>Sets GROUP BY clause (column is identifier-validated).</summary>
     QueryBuilder GroupBy(string column) {
-        this.groupByClause = column;
+        this.groupByClause = QueryBuilder.RequireIdent(column);
         return this;
     }
 
@@ -210,20 +261,134 @@ class QueryBuilder {
 
     /// <summary>Sets a column=value pair for INSERT/UPDATE.</summary>
     QueryBuilder Set(string column, string val) {
-        this.setColumns.Add(column);
+        this.setColumns.Add(QueryBuilder.RequireIdent(column));
         this.setValues.Add(val);
         return this;
     }
 
     /// <summary>Sets an integer column=value pair.</summary>
     QueryBuilder SetInt(string column, int val) {
-        this.setColumns.Add(column);
+        this.setColumns.Add(QueryBuilder.RequireIdent(column));
         this.setValues.Add(Convert.ToString(val));
         return this;
     }
 
-    /// <summary>Builds a SELECT query.</summary>
+    // ===== Parameterized builders (preferred) =====
+    // The SQL text contains only `?` placeholders; call the matching *Params()
+    // accessor and pass both to a parameterized driver overload, e.g.
+    //   db.Query(qb.BuildSelectParams("*"), qb.SelectParams())
+
+    /// <summary>Builds a SELECT with `?` placeholders (see SelectParams()).</summary>
+    string BuildSelectParams(string columns) {
+        return BuildSelect(columns, true);
+    }
+
+    /// <summary>Parameters for BuildSelectParams / BuildDeleteParams.</summary>
+    DbParams SelectParams() {
+        return this.whereParams;
+    }
+
+    /// <summary>Builds an INSERT with `?` placeholders (see InsertParams()).</summary>
+    string BuildInsertParams() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("INSERT INTO ");
+        sb.Append(this.tableName);
+        sb.Append(" (");
+        int n = this.setColumns.Count;
+        int i = 0;
+        while (i < n) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(this.setColumns[i]);
+            i = i + 1;
+        }
+        sb.Append(") VALUES (");
+        i = 0;
+        while (i < n) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("?");
+            i = i + 1;
+        }
+        sb.Append(")");
+        return sb.ToString();
+    }
+
+    /// <summary>Parameters for BuildInsertParams (the Set values, in order).</summary>
+    DbParams InsertParams() {
+        DbParams p = DbParams.Create();
+        int n = this.setValues.Count;
+        int i = 0;
+        while (i < n) {
+            p.Add(this.setValues[i]);
+            i = i + 1;
+        }
+        return p;
+    }
+
+    /// <summary>Builds an UPDATE with `?` placeholders (see UpdateParams()).</summary>
+    string BuildUpdateParams() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("UPDATE ");
+        sb.Append(this.tableName);
+        sb.Append(" SET ");
+        int n = this.setColumns.Count;
+        int i = 0;
+        while (i < n) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(this.setColumns[i]);
+            sb.Append(" = ?");
+            i = i + 1;
+        }
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Parameters for BuildUpdateParams (Set values, then WHERE values).</summary>
+    DbParams UpdateParams() {
+        DbParams p = DbParams.Create();
+        int n = this.setValues.Count;
+        int i = 0;
+        while (i < n) {
+            p.Add(this.setValues[i]);
+            i = i + 1;
+        }
+        int wn = this.whereParams.Count();
+        i = 0;
+        while (i < wn) {
+            int k = this.whereParams.KindAt(i);
+            if (k == 1) { p.AddInt(this.whereParams.IntAt(i)); }
+            else if (k == 2) { p.AddDouble(this.whereParams.DoubleAt(i)); }
+            else if (k == 3) { p.Add(this.whereParams.TextAt(i)); }
+            else { p.AddNull(); }
+            i = i + 1;
+        }
+        return p;
+    }
+
+    /// <summary>Builds a DELETE with `?` placeholders (see SelectParams()).</summary>
+    string BuildDeleteParams() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("DELETE FROM ");
+        sb.Append(this.tableName);
+        if (this.whereClause.Length > 0) {
+            sb.Append(" WHERE ");
+            sb.Append(this.whereClause);
+        }
+        return sb.ToString();
+    }
+
+    // ===== Legacy string builders =====
+    // Kept for callers that cannot bind parameters yet; WHERE placeholders
+    // produced by WhereEq/WhereIn/... are inlined back with quoting+escaping.
+
+    /// <summary>Builds a SELECT query (legacy: parameters inlined).</summary>
     string BuildSelect(string columns) {
+        return BuildSelect(columns, false);
+    }
+
+    string BuildSelect(string columns, bool keepPlaceholders) {
         StringBuilder sb = new StringBuilder();
         sb.Append("SELECT ");
         if (this.distinct) { sb.Append("DISTINCT "); }
@@ -231,7 +396,8 @@ class QueryBuilder {
         sb.Append(" FROM ");
         sb.Append(this.tableName);
         AppendClauses(sb);
-        return sb.ToString();
+        if (keepPlaceholders) { return sb.ToString(); }
+        return InlineParams(sb.ToString(), this.whereParams);
     }
 
     /// <summary>Builds a SELECT COUNT query.</summary>
@@ -287,22 +453,46 @@ class QueryBuilder {
             sb.Append(" WHERE ");
             sb.Append(this.whereClause);
         }
-        return sb.ToString();
+        return InlineParams(sb.ToString(), this.whereParams);
     }
 
-    /// <summary>Builds a DELETE query.</summary>
+    /// <summary>Builds a DELETE query (legacy: parameters inlined).</summary>
     string BuildDelete() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("DELETE FROM ");
-        sb.Append(this.tableName);
-        if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
-        }
-        return sb.ToString();
+        return InlineParams(BuildDeleteParams(), this.whereParams);
     }
 
     // --- Internal helpers ---
+
+    /// <summary>Substitutes `?` placeholders (outside quoted literals) with the
+    /// quoted, escaped parameter values, for legacy string-only execution.</summary>
+    static string InlineParams(string sql, DbParams prms) {
+        if (prms.Count() == 0) { return sql; }
+        StringBuilder sb = new StringBuilder();
+        int n = sql.Length;
+        int next = 0;
+        bool inQuote = false;
+        int i = 0;
+        while (i < n) {
+            int c = sql[i] & 255;
+            if (c == 39) {                       // '
+                inQuote = !inQuote;
+                sb.Append("'");
+            } else if (c == 63 && !inQuote && next < prms.Count()) {   // ?
+                if (prms.IsNull(next)) {
+                    sb.Append("NULL");
+                } else {
+                    sb.Append("'");
+                    sb.Append(EscapeString(prms.AsText(next)));
+                    sb.Append("'");
+                }
+                next = next + 1;
+            } else {
+                sb.Append(sql.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
 
     void AppendClauses(StringBuilder sb) {
         if (this.joinClause.Length > 0) {

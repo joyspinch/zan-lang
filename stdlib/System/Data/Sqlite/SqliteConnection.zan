@@ -53,6 +53,18 @@ class SqliteConnection {
     static extern string sqlite3_errmsg(int db);
 
     [DllImport("sqlite3")]
+    static extern int sqlite3_bind_int64(int stmt, int index, int val);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_bind_double(int stmt, int index, double val);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_bind_text(int stmt, int index, string val, int nBytes, int destructor);
+
+    [DllImport("sqlite3")]
+    static extern int sqlite3_bind_null(int stmt, int index);
+
+    [DllImport("sqlite3")]
     static extern int sqlite3_changes(int db);
 
     [DllImport("sqlite3")]
@@ -107,6 +119,31 @@ class SqliteConnection {
         return conn;
     }
 
+    /// <summary>Binds every parameter in <paramref name="prms"/> to the prepared
+    /// statement, 1-based, with its native type. SQLITE_TRANSIENT (-1) makes
+    /// sqlite3 copy text immediately, so the Zan string may be collected freely.</summary>
+    static bool BindAll(int stmt, DbParams prms) {
+        int n = prms.Count();
+        int i = 0;
+        while (i < n) {
+            int rc = 0;
+            int k = prms.KindAt(i);
+            if (k == 1) {
+                rc = sqlite3_bind_int64(stmt, i + 1, prms.IntAt(i));
+            } else if (k == 2) {
+                rc = sqlite3_bind_double(stmt, i + 1, prms.DoubleAt(i));
+            } else if (k == 3) {
+                string t = prms.TextAt(i);
+                rc = sqlite3_bind_text(stmt, i + 1, t, t.Length, -1);
+            } else {
+                rc = sqlite3_bind_null(stmt, i + 1);
+            }
+            if (rc != 0) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
     /// <summary>Executes a non-query statement (INSERT/UPDATE/DELETE/DDL).</summary>
     int Execute(string sql) {
         if (!this.connected) { return -1; }
@@ -119,23 +156,52 @@ class SqliteConnection {
         return -1;
     }
 
+    /// <summary>Executes a parameterized non-query statement. Values are bound
+    /// natively (never inlined into the SQL text), so no escaping is needed and
+    /// injection through values is impossible. Placeholders are `?`.</summary>
+    int Execute(string sql, DbParams prms) {
+        if (!this.connected) { return -1; }
+        string ppStmt = calloc(8, 1);
+        string pzTail = calloc(8, 1);
+        int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length, ppStmt, pzTail);
+        int stmt = HandleFromBuf(ppStmt);
+        free(ppStmt);
+        free(pzTail);
+        if (rc != 0) { return -1; }
+        if (!BindAll(stmt, prms)) {
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+        int step = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (step != 101) { return -1; }   // SQLITE_DONE = 101
+        return sqlite3_changes(this.handle);
+    }
+
     /// <summary>Executes a query and returns a result set.</summary>
     DbResult Query(string sql) {
+        return Query(sql, DbParams.Create());
+    }
+
+    /// <summary>Executes a parameterized query (`?` placeholders) and returns a
+    /// result set. Values are bound natively via sqlite3_bind_*.</summary>
+    DbResult Query(string sql, DbParams prms) {
         if (!this.connected) { return DbResult.Empty(); }
         DbResult result = DbResult.Create();
 
         string ppStmt = calloc(8, 1);
         string pzTail = calloc(8, 1);
         int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length, ppStmt, pzTail);
-        if (rc != 0) {
-            free(ppStmt);
-            free(pzTail);
-            return result;
-        }
-
         int stmt = HandleFromBuf(ppStmt);
         free(ppStmt);
         free(pzTail);
+        if (rc != 0) {
+            return result;
+        }
+        if (!BindAll(stmt, prms)) {
+            sqlite3_finalize(stmt);
+            return result;
+        }
 
         int colCount = sqlite3_column_count(stmt);
         result.SetColumnCount(colCount);
@@ -167,6 +233,15 @@ class SqliteConnection {
     /// <summary>Executes a scalar query (first column of first row).</summary>
     string ExecuteScalar(string sql) {
         DbResult result = Query(sql);
+        if (result.RowCount() > 0) {
+            return result.GetString(0, 0);
+        }
+        return "";
+    }
+
+    /// <summary>Executes a parameterized scalar query.</summary>
+    string ExecuteScalar(string sql, DbParams prms) {
+        DbResult result = Query(sql, prms);
         if (result.RowCount() > 0) {
             return result.GetString(0, 0);
         }

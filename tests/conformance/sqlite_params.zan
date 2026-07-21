@@ -1,0 +1,70 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+// Verifies native parameter binding (sqlite3_bind_*) and the parameterized
+// QueryBuilder: values never enter the SQL text, so classic injection
+// payloads are stored verbatim instead of being executed, and identifier
+// validation rejects unsafe table/column names.
+class Program {
+    static void Main() {
+        string path = "sqlite_params_test.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age INTEGER)");
+
+        // 1. Parameterized INSERT: hostile value is data, not SQL.
+        string hostile = "x'); DROP TABLE users;--";
+        int n1 = db.Execute("INSERT INTO users (name, age) VALUES (?, ?)",
+            DbParams.Create().Add(hostile).AddInt(30));
+        int n2 = db.Execute("INSERT INTO users (name, age) VALUES (?, ?)",
+            DbParams.Create().Add("O'Brien").AddInt(41));
+        int n3 = db.Execute("INSERT INTO users (name, age) VALUES (?, ?)",
+            DbParams.Create().AddNull().AddInt(7));
+        Console.WriteLine("inserts: " + Convert.ToString(n1 + n2 + n3));
+
+        // Table survived the injection attempt and holds 3 rows.
+        Console.WriteLine("count: " + db.ExecuteScalar("SELECT COUNT(*) FROM users"));
+
+        // 2. Parameterized SELECT round-trips the hostile value exactly.
+        DbResult r = db.Query("SELECT name FROM users WHERE name = ?",
+            DbParams.Create().Add(hostile));
+        Console.WriteLine("roundtrip: " + Convert.ToString(r.RowCount()));
+
+        // 3. QueryBuilder parameterized mode.
+        QueryBuilder qb = QueryBuilder.From("users").WhereEq("name", "O'Brien");
+        DbResult r2 = db.Query(qb.BuildSelectParams("age"), qb.SelectParams());
+        Console.WriteLine("qb: " + r2.GetString(0, 0));
+
+        // 4. Legacy string mode inlines the same parameters safely.
+        QueryBuilder qb2 = QueryBuilder.From("users").WhereEq("name", "O'Brien");
+        DbResult r3 = db.Query(qb2.BuildSelect("age"));
+        Console.WriteLine("qb-legacy: " + r3.GetString(0, 0));
+
+        // 5. Unsafe identifiers are rejected.
+        bool threw = false;
+        try {
+            QueryBuilder bad = QueryBuilder.From("users; DROP TABLE users");
+        } catch (Exception e) {
+            threw = true;
+        }
+        Console.WriteLine("ident-guard: " + Convert.ToString(threw));
+
+        bool threw2 = false;
+        try {
+            QueryBuilder bad2 = QueryBuilder.From("users").OrderBy("age; DELETE FROM users");
+        } catch (Exception e) {
+            threw2 = true;
+        }
+        Console.WriteLine("orderby-guard: " + Convert.ToString(threw2));
+
+        // 6. ModelRow.ToJson emits valid JSON (escapes quotes/backslashes).
+        ModelRow row = ModelRow.Create().Set("name", "say \"hi\"\\").Set("age", "30");
+        Console.WriteLine(row.ToJson());
+
+        db.Close();
+        File.Delete(path);
+    }
+}

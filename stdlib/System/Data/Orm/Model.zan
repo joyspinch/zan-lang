@@ -43,7 +43,7 @@ class Model {
     DbConnection db;
 
     Model(string tableName) {
-        this.tableName = tableName;
+        this.tableName = QueryBuilder.RequireIdent(tableName);
         this.columnNames = new List<string>();
         this.columnTypes = new List<string>();
         this.primaryKey = "";
@@ -56,14 +56,14 @@ class Model {
 
     /// <summary>Adds a column definition.</summary>
     Model Column(string name, string type) {
-        this.columnNames.Add(name);
+        this.columnNames.Add(QueryBuilder.RequireIdent(name));
         this.columnTypes.Add(type);
         return this;
     }
 
     /// <summary>Adds a column as primary key.</summary>
     Model Column(string name, string type, bool isPrimaryKey) {
-        this.columnNames.Add(name);
+        this.columnNames.Add(QueryBuilder.RequireIdent(name));
         if (isPrimaryKey) {
             this.columnTypes.Add(type + " PRIMARY KEY AUTOINCREMENT");
             this.primaryKey = name;
@@ -75,21 +75,21 @@ class Model {
 
     /// <summary>Adds a NOT NULL column.</summary>
     Model ColumnNotNull(string name, string type) {
-        this.columnNames.Add(name);
+        this.columnNames.Add(QueryBuilder.RequireIdent(name));
         this.columnTypes.Add(type + " NOT NULL");
         return this;
     }
 
     /// <summary>Adds a column with a default value.</summary>
     Model ColumnDefault(string name, string type, string defaultVal) {
-        this.columnNames.Add(name);
-        this.columnTypes.Add(type + " DEFAULT '" + defaultVal + "'");
+        this.columnNames.Add(QueryBuilder.RequireIdent(name));
+        this.columnTypes.Add(type + " DEFAULT '" + QueryBuilder.EscapeString(defaultVal) + "'");
         return this;
     }
 
     /// <summary>Adds a UNIQUE column.</summary>
     Model ColumnUnique(string name, string type) {
-        this.columnNames.Add(name);
+        this.columnNames.Add(QueryBuilder.RequireIdent(name));
         this.columnTypes.Add(type + " UNIQUE");
         return this;
     }
@@ -122,7 +122,8 @@ class Model {
         db.Execute("DROP TABLE IF EXISTS " + this.tableName);
     }
 
-    /// <summary>Checks if the table exists.</summary>
+    /// <summary>Checks if the table exists. (tableName is identifier-validated
+    /// at Define time, so inlining it here is safe.)</summary>
     bool TableExists(DbConnection db) {
         string sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='" + this.tableName + "'";
         string result = db.ExecuteScalar(sql);
@@ -514,18 +515,45 @@ class ModelRow {
     string ToJson() {
         StringBuilder sb = new StringBuilder();
         sb.Append("{");
+        int n = this.keys.Count;
         int i = 0;
-        while (i < this.keys.Count) {
+        while (i < n) {
             if (i > 0) { sb.Append(","); }
-            sb.Append("\"");
-            sb.Append(this.keys[i]);
-            sb.Append("\":\"");
-            sb.Append(this.values[i]);
-            sb.Append("\"");
+            AppendJsonString(sb, this.keys[i]);
+            sb.Append(":");
+            AppendJsonString(sb, this.values[i]);
             i = i + 1;
         }
         sb.Append("}");
         return sb.ToString();
+    }
+
+    /// <summary>Appends s as a quoted JSON string, escaping quotes, backslashes
+    /// and control characters so the output is always valid JSON.</summary>
+    static void AppendJsonString(StringBuilder sb, string s) {
+        sb.Append("\"");
+        int n = s.Length;
+        int i = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 34) { sb.Append("\\\""); }
+            else if (c == 92) { sb.Append("\\\\"); }
+            else if (c == 10) { sb.Append("\\n"); }
+            else if (c == 13) { sb.Append("\\r"); }
+            else if (c == 9) { sb.Append("\\t"); }
+            else if (c < 32) {
+                sb.Append("\\u00");
+                int hi = c / 16;
+                int lo = c - hi * 16;
+                string hex = "0123456789abcdef";
+                sb.Append(hex.Substring(hi, 1));
+                sb.Append(hex.Substring(lo, 1));
+            } else {
+                sb.Append(s.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        sb.Append("\"");
     }
 }
 
@@ -563,16 +591,16 @@ class ModelQuery {
     }
 
     ModelQuery WhereEq(string column, string val) {
-        return Where(column + " = '" + QueryBuilder.EscapeString(val) + "'");
+        return Where(QueryBuilder.RequireIdent(column) + " = '" + QueryBuilder.EscapeString(val) + "'");
     }
 
     ModelQuery OrderBy(string column) {
-        this.orderByClause = column;
+        this.orderByClause = QueryBuilder.RequireIdent(column);
         return this;
     }
 
     ModelQuery OrderByDesc(string column) {
-        this.orderByClause = column + " DESC";
+        this.orderByClause = QueryBuilder.RequireIdent(column) + " DESC";
         return this;
     }
 
@@ -758,7 +786,7 @@ class Migration {
 
     /// <summary>Checks if a migration has been applied.</summary>
     static bool IsApplied(DbConnection db, string name) {
-        string result = db.ExecuteScalar("SELECT COUNT(*) FROM _migrations WHERE name = '" + name + "'");
+        string result = db.ExecuteScalar("SELECT COUNT(*) FROM _migrations WHERE name = '" + QueryBuilder.EscapeString(name) + "'");
         return result == "1";
     }
 
@@ -770,7 +798,7 @@ class Migration {
             Migration m = migrations[i];
             if (!IsApplied(db, m.name)) {
                 m.Up(db);
-                db.Execute("INSERT INTO _migrations (name, applied_at) VALUES ('" + m.name + "', 'now')");
+                db.Execute("INSERT INTO _migrations (name, applied_at) VALUES ('" + QueryBuilder.EscapeString(m.name) + "', 'now')");
                 Console.WriteLine("[Migration] Applied: " + m.name);
             }
             i = i + 1;
