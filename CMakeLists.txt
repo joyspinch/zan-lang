@@ -27,15 +27,27 @@ find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-llvm_map_components_to_libnames(LLVM_LIBS
+# Cross-compile backends beyond x86/aarch64 are optional: not every LLVM
+# distribution builds them (e.g. mozbuild clang omits RISCV). Link — and
+# initialize, via HAVE_LLVM_* defines — only the ones this LLVM provides.
+set(ZAN_LLVM_COMPONENTS
     core support analysis bitwriter target
     x86codegen x86asmparser x86desc x86info
     aarch64codegen aarch64asmparser aarch64desc aarch64info
-    webassemblycodegen webassemblyasmparser webassemblydesc webassemblyinfo
-    armcodegen armasmparser armdesc arminfo
-    riscvcodegen riscvasmparser riscvdesc riscvinfo
     passes
 )
+foreach(_opt_target ARM WebAssembly RISCV)
+    if("${_opt_target}" IN_LIST LLVM_TARGETS_TO_BUILD)
+        string(TOLOWER "${_opt_target}" _t)
+        list(APPEND ZAN_LLVM_COMPONENTS
+            ${_t}codegen ${_t}asmparser ${_t}desc ${_t}info)
+        string(TOUPPER "${_opt_target}" _T)
+        add_compile_definitions(ZAN_HAVE_LLVM_${_T}=1)
+    else()
+        message(STATUS "LLVM target ${_opt_target} not available; cross-compilation to it is disabled")
+    endif()
+endforeach()
+llvm_map_components_to_libnames(LLVM_LIBS ${ZAN_LLVM_COMPONENTS})
 
 # ---- Compiler executable ----
 add_executable(zanc

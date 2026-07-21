@@ -13244,23 +13244,29 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     LLVMInitializeAArch64AsmParser();
     LLVMInitializeAArch64AsmPrinter();
 
+#ifdef ZAN_HAVE_LLVM_ARM
     LLVMInitializeARMTargetInfo();
     LLVMInitializeARMTarget();
     LLVMInitializeARMTargetMC();
     LLVMInitializeARMAsmParser();
     LLVMInitializeARMAsmPrinter();
+#endif
 
+#ifdef ZAN_HAVE_LLVM_WEBASSEMBLY
     LLVMInitializeWebAssemblyTargetInfo();
     LLVMInitializeWebAssemblyTarget();
     LLVMInitializeWebAssemblyTargetMC();
     LLVMInitializeWebAssemblyAsmParser();
     LLVMInitializeWebAssemblyAsmPrinter();
+#endif
 
+#ifdef ZAN_HAVE_LLVM_RISCV
     LLVMInitializeRISCVTargetInfo();
     LLVMInitializeRISCVTarget();
     LLVMInitializeRISCVTargetMC();
     LLVMInitializeRISCVAsmParser();
     LLVMInitializeRISCVAsmPrinter();
+#endif
 
     char *triple;
     if (g->target_triple[0]) {
