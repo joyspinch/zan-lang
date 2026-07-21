@@ -1,0 +1,378 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+
+namespace System.Resources;
+
+/// <summary>Encrypted resource pack (.zrp) writer.
+///
+/// Layout (private format, nothing legible without the master key):
+///   [0..3]   magic (4 opaque bytes, not ASCII)
+///   [4]      version, obfuscated
+///   [5..20]  packId — 16 random bytes, unique per pack
+///   [21..32] index IV (12)
+///   [33..48] index GCM tag (16)
+///   [49..52] index ciphertext length (BE32)
+///   [53..56] signature length (BE32, 0 = unsigned)
+///   [...]    index ciphertext, then RSA signature, then entry payloads
+///
+/// The index (entry table) is AES-256-GCM encrypted with a key derived via
+/// HKDF from the master key and packId, and signed (RSASSA-PKCS1-v1_5 /
+/// SHA-256) so a repacked or entry-swapped file is rejected even by an
+/// attacker who recovered the master key but not the private signing key.
+/// Entry names are stored only as truncated SHA-256 hashes; each entry is
+/// encrypted with its own HKDF-derived key, so one broken entry key reveals
+/// nothing about the others or the master key.</summary>
+class ResourcePackWriter {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+    [DllImport("crt")] static extern int fopen(string path, string mode);
+    [DllImport("crt")] static extern int fwrite(string buf, int size, int count, int fp);
+    [DllImport("crt")] static extern int fclose(int fp);
+
+    List<string> names;
+    List<string> datas;
+    List<int> lens;
+
+    static ResourcePackWriter Create() {
+        ResourcePackWriter w = new ResourcePackWriter();
+        w.names = new List<string>();
+        w.datas = new List<string>();
+        w.lens = new List<int>();
+        return w;
+    }
+
+    /// <summary>Queues one entry. <paramref name="data"/> is raw bytes with an
+    /// explicit length (Zan strings are byte buffers).</summary>
+    void Add(string name, string data, int len) {
+        this.names.Add(name);
+        this.datas.Add(data);
+        this.lens.Add(len);
+    }
+
+    /// <summary>Writes the pack. <paramref name="masterKey"/> is 32 bytes.
+    /// <paramref name="nHex"/>/<paramref name="dHex"/> are the RSA modulus and
+    /// private exponent (hex) for index signing; pass null to skip signing.
+    /// Returns true on success.</summary>
+    bool Write(string path, string masterKey, string nHex, string dHex) {
+        int count = this.names.Count;
+        int sigLen = 0;
+        string nBuf = null;
+        string dBuf = null;
+        if (nHex != null && dHex != null) {
+            nBuf = Hex.Decode(nHex);
+            dBuf = Hex.Decode(dHex);
+            sigLen = nHex.Length / 2;
+        }
+
+        string packId = RandomNumberGenerator.GetBytes(16);
+        string idxIv = RandomNumberGenerator.GetBytes(12);
+        if (packId == null || idxIv == null) { return false; }
+
+        int idxLen = 4 + 61 * count;
+        int dataStart = 57 + idxLen + sigLen;
+
+        // Build the plaintext index while laying out payload offsets.
+        string idx = calloc(idxLen + 1, 1);
+        ResourcePack.storeBE32(idx, 0, count);
+        List<string> ivs = new List<string>();
+        int off = dataStart;
+        int i = 0;
+        while (i < count) {
+            string nh = ResourcePack.nameHash(this.names[i]);
+            string iv = RandomNumberGenerator.GetBytes(12);
+            if (iv == null) { free(idx); return false; }
+            ivs.Add(iv);
+            int rec = 4 + 61 * i;
+            int j = 0;
+            while (j < 16) { idx[rec + j] = nh[j] & 255; j = j + 1; }
+            ResourcePack.storeBE64(idx, rec + 16, off);
+            ResourcePack.storeBE64(idx, rec + 24, this.lens[i]);
+            idx[rec + 32] = 0;  // flags (bit0 reserved for compression)
+            j = 0;
+            while (j < 12) { idx[rec + 33 + j] = iv[j] & 255; j = j + 1; }
+            // tag written after encryption below
+            free(nh);
+            off = off + this.lens[i];
+            i = i + 1;
+        }
+
+        // Encrypt each payload with its own derived key.
+        List<string> cts = new List<string>();
+        i = 0;
+        while (i < count) {
+            string nh = ResourcePack.nameHash(this.names[i]);
+            string ek = ResourcePack.entryKey(masterKey, packId, nh);
+            string tag = calloc(17, 1);
+            string ct = AesGcm.Encrypt(ek, 32, ivs[i], nh, 16, this.datas[i], this.lens[i], tag);
+            cts.Add(ct);
+            int rec = 4 + 61 * i;
+            int j = 0;
+            while (j < 16) { idx[rec + 45 + j] = tag[j] & 255; j = j + 1; }
+            free(nh); free(ek); free(tag);
+            i = i + 1;
+        }
+
+        // Sign the plaintext index, then encrypt it.
+        string sig = null;
+        if (sigLen > 0) {
+            sig = Rsa.SignPkcs1Sha256(idx, idxLen, nBuf, sigLen, dBuf, sigLen);
+        }
+
+        string hdr = calloc(58, 1);
+        ResourcePack.writeMagic(hdr);
+        i = 0;
+        while (i < 16) { hdr[5 + i] = packId[i] & 255; i = i + 1; }
+        i = 0;
+        while (i < 12) { hdr[21 + i] = idxIv[i] & 255; i = i + 1; }
+        ResourcePack.storeBE32(hdr, 49, idxLen);
+        ResourcePack.storeBE32(hdr, 53, sigLen);
+
+        string ik = ResourcePack.indexKey(masterKey, packId);
+        string idxTag = calloc(17, 1);
+        string idxCt = AesGcm.Encrypt(ik, 32, idxIv, hdr, 21, idx, idxLen, idxTag);
+        i = 0;
+        while (i < 16) { hdr[33 + i] = idxTag[i] & 255; i = i + 1; }
+        free(ik); free(idxTag); free(idx);
+
+        int fp = fopen(path, "wb");
+        if (fp == 0) { return false; }
+        fwrite(hdr, 1, 57, fp);
+        fwrite(idxCt, 1, idxLen, fp);
+        if (sigLen > 0) { fwrite(sig, 1, sigLen, fp); }
+        i = 0;
+        while (i < count) { fwrite(cts[i], 1, this.lens[i], fp); i = i + 1; }
+        fclose(fp);
+
+        free(hdr); free(idxCt);
+        if (sig != null) { free(sig); }
+        i = 0;
+        while (i < count) { free(cts[i]); free(ivs[i]); i = i + 1; }
+        free(packId); free(idxIv);
+        if (nBuf != null) { free(nBuf); }
+        if (dBuf != null) { free(dBuf); }
+        return true;
+    }
+}
+
+/// <summary>Encrypted resource pack reader. See ResourcePackWriter for the
+/// format. Open() verifies the index signature and authenticity before any
+/// entry is served; Read() re-derives the per-entry key and rejects tampered
+/// payloads via the GCM tag.</summary>
+class ResourcePack {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    string path;
+    string masterKey;
+    string packId;
+    int count;
+    List<string> hashes;   // 16-byte truncated SHA-256 per entry
+    List<int> offs;
+    List<int> sizes;
+    List<string> ivs;
+    List<string> tags;
+
+    // ---- shared helpers (also used by the writer) ----
+
+    static void writeMagic(string hdr) {
+        // opaque non-ASCII magic + obfuscated version byte
+        hdr[0] = 199; hdr[1] = 17; hdr[2] = 158; hdr[3] = 66;
+        hdr[4] = 1 ^ 165;
+    }
+
+    static bool checkMagic(string hdr) {
+        if ((hdr[0] & 255) != 199) { return false; }
+        if ((hdr[1] & 255) != 17) { return false; }
+        if ((hdr[2] & 255) != 158) { return false; }
+        if ((hdr[3] & 255) != 66) { return false; }
+        return ((hdr[4] & 255) ^ 165) == 1;
+    }
+
+    static void storeBE32(string buf, int off, int v) {
+        buf[off] = (v >> 24) & 255;
+        buf[off + 1] = (v >> 16) & 255;
+        buf[off + 2] = (v >> 8) & 255;
+        buf[off + 3] = v & 255;
+    }
+
+    static int loadBE32(string buf, int off) {
+        return ((buf[off] & 255) << 24) | ((buf[off + 1] & 255) << 16)
+             | ((buf[off + 2] & 255) << 8) | (buf[off + 3] & 255);
+    }
+
+    static void storeBE64(string buf, int off, int v) {
+        int i = 0;
+        while (i < 8) { buf[off + i] = Bits.Shr64(v, 8 * (7 - i)) & 255; i = i + 1; }
+    }
+
+    static int loadBE64(string buf, int off) {
+        int v = 0;
+        int i = 0;
+        while (i < 8) { v = (v << 8) | (buf[off + i] & 255); i = i + 1; }
+        return v;
+    }
+
+    /// <summary>Truncated SHA-256 of an entry name (16 bytes). Only this hash
+    /// is stored in the pack, so entry names cannot be listed from the file.</summary>
+    static string nameHash(string name) {
+        string h = Sha256.Hash(name, name.Length);
+        string t = calloc(17, 1);
+        int i = 0;
+        while (i < 16) { t[i] = h[i] & 255; i = i + 1; }
+        free(h);
+        return t;
+    }
+
+    static string indexKey(string masterKey, string packId) {
+        return Hkdf.Derive(packId, 16, masterKey, 32, "ZRIX", 4, 32);
+    }
+
+    static string entryKey(string masterKey, string packId, string nh) {
+        string info = calloc(21, 1);
+        info[0] = 90; info[1] = 82; info[2] = 69; info[3] = 78;  // "ZREN"
+        int i = 0;
+        while (i < 16) { info[4 + i] = nh[i] & 255; i = i + 1; }
+        string k = Hkdf.Derive(packId, 16, masterKey, 32, info, 20, 32);
+        free(info);
+        return k;
+    }
+
+    /// <summary>Reassembles a key from two XOR shares so the real key never
+    /// appears as one literal in the binary. Caller frees the result.</summary>
+    static string MixKey(string a, string b, int len) {
+        string k = calloc(len + 1, 1);
+        int i = 0;
+        while (i < len) { k[i] = ((a[i] & 255) ^ (b[i] & 255)) & 255; i = i + 1; }
+        return k;
+    }
+
+    /// <summary>Opens a pack and authenticates its index. <paramref name="nHex"/>
+    /// and <paramref name="eHex"/> are the RSA public modulus/exponent (hex)
+    /// used to verify the index signature; pass null to accept unsigned packs.
+    /// <paramref name="err"/>[0]: 0 ok, 1 io/magic, 2 auth failure, 3 bad signature.</summary>
+    static ResourcePack Open(string path, string masterKey, string nHex, string eHex, List<int> err) {
+        err[0] = 1;
+        int fsz = File.GetSize(path);
+        if (fsz < 57) { return null; }
+        string hdr = File.ReadBytes(path, 0, 57);
+        if (!checkMagic(hdr)) { free(hdr); return null; }
+        int idxLen = loadBE32(hdr, 49);
+        int sigLen = loadBE32(hdr, 53);
+        if (idxLen < 4 || 57 + idxLen + sigLen > fsz) { free(hdr); return null; }
+
+        string packId = calloc(17, 1);
+        string idxIv = calloc(13, 1);
+        string idxTag = calloc(17, 1);
+        int i = 0;
+        while (i < 16) { packId[i] = hdr[5 + i] & 255; i = i + 1; }
+        i = 0;
+        while (i < 12) { idxIv[i] = hdr[21 + i] & 255; i = i + 1; }
+        i = 0;
+        while (i < 16) { idxTag[i] = hdr[33 + i] & 255; i = i + 1; }
+
+        string idxCt = File.ReadBytes(path, 57, idxLen);
+        string ik = indexKey(masterKey, packId);
+        List<int> ok = new List<int>(); ok.Add(0);
+        string idx = AesGcm.Decrypt(ik, 32, idxIv, hdr, 21, idxCt, idxLen, idxTag, ok);
+        free(ik); free(idxCt); free(idxIv); free(idxTag);
+        if (ok[0] == 0) {
+            err[0] = 2;
+            free(idx); free(hdr); free(packId);
+            return null;
+        }
+
+        if (nHex != null && eHex != null) {
+            bool sigOk = false;
+            if (sigLen > 0) {
+                string sig = File.ReadBytes(path, 57 + idxLen, sigLen);
+                string nBuf = Hex.Decode(nHex);
+                string eBuf = Hex.Decode(eHex);
+                sigOk = Rsa.VerifyPkcs1Sha256(idx, idxLen, sig, nBuf, nHex.Length / 2, eBuf, eHex.Length / 2);
+                free(sig); free(nBuf); free(eBuf);
+            }
+            if (!sigOk) {
+                err[0] = 3;
+                free(idx); free(hdr); free(packId);
+                return null;
+            }
+        }
+
+        ResourcePack p = new ResourcePack();
+        p.path = path;
+        p.masterKey = masterKey;
+        p.packId = packId;
+        p.count = loadBE32(idx, 0);
+        p.hashes = new List<string>();
+        p.offs = new List<int>();
+        p.sizes = new List<int>();
+        p.ivs = new List<string>();
+        p.tags = new List<string>();
+        i = 0;
+        while (i < p.count) {
+            int rec = 4 + 61 * i;
+            string nh = calloc(17, 1);
+            string iv = calloc(13, 1);
+            string tg = calloc(17, 1);
+            int j = 0;
+            while (j < 16) { nh[j] = idx[rec + j] & 255; j = j + 1; }
+            j = 0;
+            while (j < 12) { iv[j] = idx[rec + 33 + j] & 255; j = j + 1; }
+            j = 0;
+            while (j < 16) { tg[j] = idx[rec + 45 + j] & 255; j = j + 1; }
+            p.hashes.Add(nh);
+            p.offs.Add(loadBE64(idx, rec + 16));
+            p.sizes.Add(loadBE64(idx, rec + 24));
+            p.ivs.Add(iv);
+            p.tags.Add(tg);
+            i = i + 1;
+        }
+        free(idx); free(hdr);
+        err[0] = 0;
+        return p;
+    }
+
+    int Count() { return this.count; }
+
+    int find(string name) {
+        string nh = nameHash(name);
+        int i = 0;
+        while (i < this.count) {
+            string h = this.hashes[i];
+            int diff = 0;
+            int j = 0;
+            while (j < 16) { diff = diff | ((h[j] & 255) ^ (nh[j] & 255)); j = j + 1; }
+            if (diff == 0) { free(nh); return i; }
+            i = i + 1;
+        }
+        free(nh);
+        return -1;
+    }
+
+    bool Contains(string name) { return this.find(name) >= 0; }
+
+    int SizeOf(string name) {
+        int i = this.find(name);
+        if (i < 0) { return -1; }
+        return this.sizes[i];
+    }
+
+    /// <summary>Decrypts one entry on demand (only that entry is read from
+    /// disk). Returns the plaintext and sets <paramref name="outLen"/>[0], or
+    /// returns null (outLen -1) if the name is unknown or the data fails
+    /// authentication.</summary>
+    string Read(string name, List<int> outLen) {
+        outLen[0] = -1;
+        int i = this.find(name);
+        if (i < 0) { return null; }
+        int sz = this.sizes[i];
+        string ct = File.ReadBytes(this.path, this.offs[i], sz);
+        string ek = entryKey(this.masterKey, this.packId, this.hashes[i]);
+        List<int> ok = new List<int>(); ok.Add(0);
+        string pt = AesGcm.Decrypt(ek, 32, this.ivs[i], this.hashes[i], 16, ct, sz, this.tags[i], ok);
+        free(ct); free(ek);
+        if (ok[0] == 0) { free(pt); return null; }
+        outLen[0] = sz;
+        return pt;
+    }
+}

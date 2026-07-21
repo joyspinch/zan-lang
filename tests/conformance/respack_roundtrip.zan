@@ -1,0 +1,111 @@
+using System;
+using System.IO;
+using System.Resources;
+using System.Security.Cryptography;
+
+class Program {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+    [DllImport("crt")] static extern int fopen(string path, string mode);
+    [DllImport("crt")] static extern int fseek(int fp, int offset, int origin);
+    [DllImport("crt")] static extern int fread(string buf, int size, int count, int fp);
+    [DllImport("crt")] static extern int fwrite(string buf, int size, int count, int fp);
+    [DllImport("crt")] static extern int fclose(int fp);
+
+    // 512-bit test-only RSA key (do not reuse anywhere).
+    static string NHEX = "af02d9fc6eff840938631f63eab44b47e76e8ea46ee2fa4b8391c0940ecf28e41de729a0009bf99cec62c1c76a85dba6c19122c72f5596069aa9166f90591de9";
+    static string EHEX = "010001";
+    static string DHEX = "71cd70e26d6b49f894ea1fe7611f8c345d91cebfae3b7a76d03f5ef2e80e5d8fa463e05d2769aa70b31c550b5e6cb1720a09ec6033672e35d26d93600da42c01";
+
+    static void P(bool v) {
+        if (v) { Console.WriteLine(1); } else { Console.WriteLine(0); }
+    }
+
+    static void flipByte(string path, int off) {
+        int fp = fopen(path, "r+b");
+        string b = calloc(2, 1);
+        fseek(fp, off, 0);
+        fread(b, 1, 1, fp);
+        b[0] = (b[0] & 255) ^ 255;
+        fseek(fp, off, 0);
+        fwrite(b, 1, 1, fp);
+        fclose(fp);
+        free(b);
+    }
+
+    static void Main() {
+        // Master key assembled from two XOR shares (never one literal).
+        string shareA = Hex.Decode("6f3a91c4e8b2075dd41c66aa03f9b8e12275c40a9b6ed3184ff007c2a15be390");
+        string shareB = Hex.Decode("1c88f3026a45e9b13377a0c5de0142f8a9910b36c7d24e75b26c39d8e40a71fd");
+        string master = ResourcePack.MixKey(shareA, shareB, 32);
+        free(shareA); free(shareB);
+
+        string hello = "Hello, resource pack!";
+        string blob = calloc(257, 1);
+        int i = 0;
+        while (i < 256) { blob[i] = i & 255; i = i + 1; }
+
+        ResourcePackWriter w = ResourcePackWriter.Create();
+        w.Add("hello.txt", hello, hello.Length);
+        w.Add("data/bin.dat", blob, 256);
+        bool wrote = w.Write("respack_test.zrp", master, NHEX, DHEX);
+        P(wrote);
+
+        List<int> err = new List<int>(); err.Add(0);
+        ResourcePack p = ResourcePack.Open("respack_test.zrp", master, NHEX, EHEX, err);
+        Console.WriteLine(err[0]);
+        Console.WriteLine(p.Count());
+        P(p.Contains("hello.txt"));
+        P(p.Contains("missing.txt"));
+
+        List<int> len = new List<int>(); len.Add(0);
+        string t = p.Read("hello.txt", len);
+        Console.WriteLine(len[0]);
+        Console.WriteLine(t);
+        free(t);
+
+        string b2 = p.Read("data/bin.dat", len);
+        int diff = 0;
+        i = 0;
+        while (i < 256) { diff = diff | ((b2[i] & 255) ^ (i & 255)); i = i + 1; }
+        Console.WriteLine(len[0]);
+        Console.WriteLine(diff);
+        free(b2);
+
+        // Wrong master key: index fails authentication.
+        string bad = calloc(33, 1);
+        i = 0; while (i < 32) { bad[i] = i & 255; i = i + 1; }
+        ResourcePack pb = ResourcePack.Open("respack_test.zrp", bad, NHEX, EHEX, err);
+        Console.WriteLine(err[0]);
+        free(bad);
+
+        // Tampered payload: last byte belongs to data/bin.dat's ciphertext.
+        int fsz = File.GetSize("respack_test.zrp");
+        flipByte("respack_test.zrp", fsz - 1);
+        ResourcePack pt = ResourcePack.Open("respack_test.zrp", master, NHEX, EHEX, err);
+        Console.WriteLine(err[0]);
+        string bt = pt.Read("data/bin.dat", len);
+        P(bt == null);
+        Console.WriteLine(len[0]);
+        flipByte("respack_test.zrp", fsz - 1);  // restore
+
+        // Tampered index ciphertext: rejected before anything is served.
+        flipByte("respack_test.zrp", 60);
+        ResourcePack px = ResourcePack.Open("respack_test.zrp", master, NHEX, EHEX, err);
+        Console.WriteLine(err[0]);
+        P(px == null);
+        flipByte("respack_test.zrp", 60);  // restore
+
+        // Unsigned pack rejected when a verify key is required.
+        ResourcePackWriter w2 = ResourcePackWriter.Create();
+        w2.Add("hello.txt", hello, hello.Length);
+        w2.Write("respack_unsigned.zrp", master, null, null);
+        ResourcePack pu = ResourcePack.Open("respack_unsigned.zrp", master, NHEX, EHEX, err);
+        Console.WriteLine(err[0]);
+        P(pu == null);
+
+        File.Delete("respack_test.zrp");
+        File.Delete("respack_unsigned.zrp");
+        free(blob); free(master);
+    }
+}
