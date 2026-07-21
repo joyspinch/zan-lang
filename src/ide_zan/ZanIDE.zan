@@ -476,6 +476,26 @@ class ZanIDE {
         if (role == 4) { return 0xFFB5CEA8; } return 0xFFD4D4D4;
     }
 
+    /// Machine-readable snapshot of the editor for the AI automation driver:
+    /// caret, live completion popup (candidates + selection) and buffer text.
+    static string EditorProbeJson(CodeEditor ed) {
+        string s = "{\"caretLine\":" + Convert.ToString(ed.CurLine())
+            + ",\"caretCol\":" + Convert.ToString(ed.CurCol())
+            + ",\"completionActive\":" + UiDriver.JsonBool(ed.CompletionActive())
+            + ",\"completionSel\":" + Convert.ToString(ed.CompletionSel())
+            + ",\"completion\":[";
+        int n = ed.CompletionCount();
+        int i = 0;
+        while (i < n) {
+            if (i > 0) { s = s + ","; }
+            s = s + "{\"label\":\"" + UiDriver.JsonEsc(ed.CompletionItem(i))
+                + "\",\"kind\":\"" + UiDriver.JsonEsc(ed.CompletionKind(i)) + "\"}";
+            i = i + 1;
+        }
+        s = s + "],\"text\":\"" + UiDriver.JsonEsc(ed.GetText()) + "\"}";
+        return s;
+    }
+
     /// Pushes the selected preset's colors and font size into the editor.
     static void ApplyEditorTheme(CodeEditor editor, int themeIdx, int fontPx) {
         editor.ApplyTheme(fontPx,
@@ -1227,6 +1247,10 @@ class ZanIDE {
         int lastPresent = 0;
         int lastSkinIdx = app.ThemeMenuIndex();
         while (app.isRunning) {
+            // Advance any active AI automation script (ZAN_UI_SCRIPT). This
+            // pump bypasses App.ProcessEvent, so drive the driver here too;
+            // it injects synthetic events this loop then polls & dispatches.
+            UiDriver.Tick();
             FilePicker.lang = ZanIDE.uiLang;
             CodeEditor.lang = ZanIDE.uiLang;
             Designer.lang = ZanIDE.uiLang;
@@ -2379,6 +2403,13 @@ class ZanIDE {
                     else { editor.SetDebugVars(new List<string>()); }
                     ZanIDE.ApplyEditorTheme(editor, edThemeIdx, edFontPx);
                     editor.Render(app, edRect);
+                    // Publish live editor state to the AI automation driver
+                    // (ZAN_UI_SCRIPT) so scripts can assert buffer/caret and the
+                    // completion popup without screen-scraping. Inert otherwise.
+                    if (UiDriver.Active()) {
+                        UiDriver.SetProbe("editor", ZanIDE.EditorProbeJson(editor));
+                        UiDriver.SetProbe("log", string.Join("\n", log));
+                    }
                     // Ctrl+click in the editor requests Go to Definition.
                     if (editor.ConsumeGotoRequest()) {
                         if (lspSess == null && !lspTried) {
@@ -8862,7 +8893,7 @@ class ZanIDE {
                 "Tooltip 在某个点绘制一个浮动的小提示。"),
             "Tooltip.Render(app, 120, 80, \"More information\");");
         ZanIDE.AddExtendedWidgetDocs(
-            cat, title, body, code, cWidgets);
+            cat, title, body, code, cWidgets, cStd, cDb);
         ZanIDE.DocAdd(cat, title, body, code, cProj, ZanIDE.T("Project Layout", "项目结构"),
             ZanIDE.T("A project has zan.proj describing the entry file, target platforms, icon and resources. Source files live alongside it.",
                 "项目包含 zan.proj，描述入口文件、目标平台、图标和资源。源文件与它放在一起。"),
@@ -8906,7 +8937,9 @@ class ZanIDE {
         List<string> title,
         List<string> body,
         List<string> code,
-        string cWidgets
+        string cWidgets,
+        string cStd,
+        string cDb
     ) {
         ZanIDE.DocAdd(cat, title, body, code, cWidgets, "Typography",
             ZanIDE.T("Headings, paragraphs and inline text styles for documentation and application content.",
