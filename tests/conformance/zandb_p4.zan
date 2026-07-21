@@ -1,0 +1,119 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+using System.Json;
+
+// ZanDB P4: LINQ-style DocQuery (lambda filters, ordering, paging, First,
+// Count) and secondary indexes (EnsureIndex backfill, maintenance on
+// insert/update/delete, index-accelerated WhereEq, reopen persistence).
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static JsonValue P(string name, int age, string city) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("name", JsonValue.NewStr(name));
+        u.Put("age", JsonValue.NewNum(Convert.ToString(age)));
+        u.Put("city", JsonValue.NewStr(city));
+        return u;
+    }
+
+    static void Main() {
+        string path = "zandb_p4.tmp.db";
+        File.Delete(path);
+        File.Delete(path + "-wal");
+
+        ZanDatabase db = ZanDatabase.Open(path, 64);
+        Collection users = db.GetCollection("users");
+
+        List<JsonValue> batch = new List<JsonValue>();
+        batch.Add(P("alice", 30, "beijing"));
+        batch.Add(P("bob", 25, "shanghai"));
+        batch.Add(P("carol", 35, "beijing"));
+        batch.Add(P("dave", 28, "beijing"));
+        batch.Add(P("eve", 22, "shanghai"));
+        batch.Add(P("frank", 41, "shenzhen"));
+        users.InsertBulk(batch);
+
+        // 1. Lambda Where + Count + First.
+        Check("where", users.Query()
+            .Where((JsonValue u) => u.Int("age", 0) >= 30).Count() == 3);
+        JsonValue first = users.Query()
+            .Where((JsonValue u) => u.Str("city", "") == "shenzhen").First();
+        Check("first", first != null && first.Str("name", "") == "frank");
+        Check("first-none", users.Query()
+            .Where((JsonValue u) => u.Int("age", 0) > 100).First() == null);
+
+        // 2. WhereEq without index (filter path) + AND combination.
+        Check("whereeq-noindex", users.Query().WhereEq("city", "beijing").Count() == 3);
+        Check("where-and", users.Query()
+            .WhereEq("city", "beijing")
+            .Where((JsonValue u) => u.Int("age", 0) < 32).Count() == 2);
+
+        // 3. Ordering (int asc/desc, string) + stability + paging.
+        List<JsonValue> byAge = users.Query()
+            .OrderByInt((JsonValue u) => u.Int("age", 0)).ToList();
+        Check("orderby-int", byAge.Count == 6 && byAge[0].Str("name", "") == "eve"
+            && byAge[5].Str("name", "") == "frank");
+        List<JsonValue> byAgeDesc = users.Query()
+            .OrderByIntDesc((JsonValue u) => u.Int("age", 0)).ToList();
+        Check("orderby-desc", byAgeDesc[0].Str("name", "") == "frank"
+            && byAgeDesc[5].Str("name", "") == "eve");
+        List<JsonValue> byName = users.Query()
+            .OrderByStr((JsonValue u) => u.Str("name", "")).ToList();
+        Check("orderby-str", byName[0].Str("name", "") == "alice"
+            && byName[5].Str("name", "") == "frank");
+        List<JsonValue> page = users.Query()
+            .OrderByInt((JsonValue u) => u.Int("age", 0)).Skip(2).Take(2).ToList();
+        Check("paging", page.Count == 2 && page[0].Str("name", "") == "dave"
+            && page[1].Str("name", "") == "alice");
+
+        // 4. Secondary index: backfill + accelerated lookup.
+        users.EnsureIndex("city");
+        Check("hasindex", users.HasIndex("city") && !users.HasIndex("age"));
+        List<JsonValue> bj = users.FindByIndex("city", "beijing");
+        Check("index-backfill", bj.Count == 3);
+        Check("whereeq-index", users.Query().WhereEq("city", "beijing")
+            .Where((JsonValue u) => u.Int("age", 0) >= 30).Count() == 2);
+
+        // 5. Index maintenance on insert / update / delete.
+        int gid = users.Insert(P("grace", 29, "beijing"));
+        Check("index-insert", users.FindByIndex("city", "beijing").Count == 4);
+        JsonValue g = users.FindById(gid);
+        g.Set("city", JsonValue.NewStr("chengdu"));
+        users.Update(gid, g);
+        Check("index-update", users.FindByIndex("city", "beijing").Count == 3
+            && users.FindByIndex("city", "chengdu").Count == 1);
+        users.DeleteById(gid);
+        Check("index-delete", users.FindByIndex("city", "chengdu").Count == 0);
+
+        // 6. Index survives reopen (metadata reloaded).
+        db.Close();
+        ZanDatabase db2 = ZanDatabase.Open(path, 64);
+        Collection users2 = db2.GetCollection("users");
+        Check("index-reopen", users2.HasIndex("city")
+            && users2.FindByIndex("city", "shanghai").Count == 2);
+        int hid = users2.Insert(P("henry", 50, "shanghai"));
+        Check("index-reopen-insert", users2.FindByIndex("city", "shanghai").Count == 3);
+
+        // 7. Fluent combined query on reopened db.
+        List<JsonValue> combo = users2.Query()
+            .WhereEq("city", "shanghai")
+            .Where((JsonValue u) => u.Int("age", 0) > 21)
+            .OrderByIntDesc((JsonValue u) => u.Int("age", 0))
+            .ToList();
+        Check("combo", combo.Count == 3 && combo[0].Str("name", "") == "henry"
+            && combo[2].Str("name", "") == "eve");
+
+        db2.Close();
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+    }
+}

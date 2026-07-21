@@ -8,8 +8,10 @@ namespace System.Data.ZanDb;
 /// A named set of documents inside a <see cref="ZanDatabase"/>. Documents are
 /// JsonValue object trees; each gets an auto-incrementing integer _id.
 /// Storage keys are namespaced in the shared B+Tree:
-///   c:{name}:{id}   document body (canonical JSON)
-///   m:{name}:seq    last assigned id
+///   c:{name}:{id}                    document body (canonical JSON)
+///   m:{name}:seq                     last assigned id
+///   m:{name}:idx                     comma list of indexed fields
+///   i:{name}:{field}:{value}\t{id}   secondary index entry -> id
 /// Ids are zero-padded so B+Tree order == insertion order, making FindAll
 /// and range iteration sequential page reads.
 /// </summary>
@@ -17,14 +19,19 @@ class Collection {
     KvStore kv;
     AsyncRwLock rw;
     string name;
+    List<string> indexedFields;
 
-    Collection() { this.name = ""; }
+    Collection() {
+        this.name = "";
+        this.indexedFields = new List<string>();
+    }
 
     static Collection Attach(KvStore kv, AsyncRwLock rw, string name) {
         Collection c = new Collection();
         c.kv = kv;
         c.rw = rw;
         c.name = name;
+        c.LoadIndexMeta();
         return c;
     }
 
@@ -44,6 +51,52 @@ class Collection {
         return "m:" + this.name + ":seq";
     }
 
+    string IdxMetaKey() {
+        return "m:" + this.name + ":idx";
+    }
+
+    string IdxKey(string field, string val, int id) {
+        return "i:" + this.name + ":" + field + ":" + val + "\t" + Collection.PadId(id);
+    }
+
+    void LoadIndexMeta() {
+        this.indexedFields = new List<string>();
+        string meta = this.kv.Get(IdxMetaKey());
+        if (meta.Length == 0) { return; }
+        int start = 0;
+        int i = 0;
+        while (i <= meta.Length) {
+            if (i == meta.Length || (meta[i] & 255) == 44) {
+                if (i > start) { this.indexedFields.Add(meta.Substring(start, i - start)); }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    void AddIndexEntries(int id, JsonValue doc) {
+        int i = 0;
+        while (i < this.indexedFields.Count) {
+            string f = this.indexedFields[i];
+            if (doc.Has(f)) {
+                this.kv.Put(IdxKey(f, doc.Get(f).AsString(""), id), Convert.ToString(id));
+            }
+            i = i + 1;
+        }
+    }
+
+    void RemoveIndexEntries(int id, JsonValue doc) {
+        if (doc == null) { return; }
+        int i = 0;
+        while (i < this.indexedFields.Count) {
+            string f = this.indexedFields[i];
+            if (doc.Has(f)) {
+                this.kv.Delete(IdxKey(f, doc.Get(f).AsString(""), id));
+            }
+            i = i + 1;
+        }
+    }
+
     int NextId() {
         string cur = this.kv.Get(SeqKey());
         int id = 1;
@@ -61,6 +114,7 @@ class Collection {
         int id = NextId();
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
         this.kv.Put(DocKey(id), doc.ToJson());
+        AddIndexEntries(id, doc);
         this.kv.Commit();
         return id;
     }
@@ -76,6 +130,7 @@ class Collection {
             if (first == 0) { first = id; }
             docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
             this.kv.Put(DocKey(id), docs[i].ToJson());
+            AddIndexEntries(id, docs[i]);
             i = i + 1;
         }
         this.kv.Commit();
@@ -94,8 +149,12 @@ class Collection {
     /// <summary>Replaces an existing document; false when the id is absent.</summary>
     bool Update(int id, JsonValue doc) {
         if (!this.kv.Contains(DocKey(id))) { return false; }
+        this.kv.Begin();
+        if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
         this.kv.Put(DocKey(id), doc.ToJson());
+        AddIndexEntries(id, doc);
+        this.kv.Commit();
         return true;
     }
 
@@ -107,13 +166,83 @@ class Collection {
         int seq = 0;
         if (cur.Length > 0) { seq = Convert.ToInt(cur); }
         if (id > seq) { this.kv.Put(SeqKey(), Convert.ToString(id)); }
+        if (this.indexedFields.Count > 0 && this.kv.Contains(DocKey(id))) {
+            RemoveIndexEntries(id, FindById(id));
+        }
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
         this.kv.Put(DocKey(id), doc.ToJson());
+        AddIndexEntries(id, doc);
         this.kv.Commit();
     }
 
     bool DeleteById(int id) {
-        return this.kv.Delete(DocKey(id));
+        this.kv.Begin();
+        if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
+        bool existed = this.kv.Delete(DocKey(id));
+        this.kv.Commit();
+        return existed;
+    }
+
+    // ===== Secondary indexes =====
+
+    /// <summary>Creates (or rebuilds) a secondary index on a field, indexing
+    /// existing documents. Maintained automatically by later writes.</summary>
+    void EnsureIndex(string field) {
+        bool known = false;
+        int i = 0;
+        while (i < this.indexedFields.Count) {
+            if (this.indexedFields[i] == field) { known = true; }
+            i = i + 1;
+        }
+        this.kv.Begin();
+        if (!known) {
+            this.indexedFields.Add(field);
+            string meta = "";
+            i = 0;
+            while (i < this.indexedFields.Count) {
+                if (i > 0) { meta = meta + ","; }
+                meta = meta + this.indexedFields[i];
+                i = i + 1;
+            }
+            this.kv.Put(IdxMetaKey(), meta);
+        }
+        List<JsonValue> all = FindAll();
+        i = 0;
+        while (i < all.Count) {
+            JsonValue d = all[i];
+            if (d.Has(field)) {
+                int id = d.Int("_id", 0);
+                this.kv.Put(IdxKey(field, d.Get(field).AsString(""), id),
+                    Convert.ToString(id));
+            }
+            i = i + 1;
+        }
+        this.kv.Commit();
+    }
+
+    bool HasIndex(string field) {
+        int i = 0;
+        while (i < this.indexedFields.Count) {
+            if (this.indexedFields[i] == field) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>Index lookup: documents whose field equals val (string form),
+    /// via the secondary index -- no full scan.</summary>
+    List<JsonValue> FindByIndex(string field, string val) {
+        List<string> ks = new List<string>();
+        List<string> vs = new List<string>();
+        this.kv.ScanPrefix("i:" + this.name + ":" + field + ":" + val + "\t", 0, ks, vs);
+        List<JsonValue> docs = new List<JsonValue>();
+        int i = 0;
+        while (i < vs.Count) {
+            JsonValue d = FindById(Convert.ToInt(vs[i]));
+            if (d != null) { docs.Add(d); }
+            i = i + 1;
+        }
+        return docs;
     }
 
     /// <summary>Number of documents (range scan over the namespace).</summary>
@@ -147,6 +276,11 @@ class Collection {
             i = i + 1;
         }
         return docs;
+    }
+
+    /// <summary>Starts a fluent LINQ-style query over this collection.</summary>
+    DocQuery Query() {
+        return DocQuery.Of(this);
     }
 
     // ===== Coroutine-safe async API =====

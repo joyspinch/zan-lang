@@ -1,0 +1,266 @@
+using System;
+using System.Json;
+
+namespace System.Data.ZanDb;
+
+/// <summary>Keeps a document when it returns true.</summary>
+delegate bool DocPredicate(JsonValue doc);
+
+/// <summary>Extracts an integer sort key from a document.</summary>
+delegate int DocIntKey(JsonValue doc);
+
+/// <summary>Extracts a string sort key from a document.</summary>
+delegate string DocStrKey(JsonValue doc);
+
+/// <summary>
+/// Fluent LINQ-style query over a <see cref="Collection"/>: type-safe lambda
+/// predicates, index-accelerated equality, O(n log n) merge-sort ordering,
+/// Skip/Take paging. Evaluation is deferred until ToList/First/Count.
+///
+///   List&lt;JsonValue&gt; adults = users.Query()
+///       .WhereEq("city", "北京")                       // uses index if present
+///       .Where((JsonValue u) => u.Int("age", 0) >= 18) // lambda filter
+///       .OrderByInt((JsonValue u) => u.Int("age", 0))
+///       .Take(10)
+///       .ToList();
+/// </summary>
+class DocQuery {
+    Collection col;
+    List<DocPredicate> preds;
+    List<string> eqFields;
+    List<string> eqValues;
+    string idxField;
+    string idxValue;
+    bool hasIdxEq;
+    bool sortInt;
+    bool sortStr;
+    bool sortDesc;
+    DocIntKey intKey;
+    DocStrKey strKey;
+    int skipN;
+    int takeN;
+
+    DocQuery() {
+        this.preds = new List<DocPredicate>();
+        this.eqFields = new List<string>();
+        this.eqValues = new List<string>();
+        this.idxField = "";
+        this.idxValue = "";
+        this.hasIdxEq = false;
+        this.sortInt = false;
+        this.sortStr = false;
+        this.sortDesc = false;
+        this.skipN = 0;
+        this.takeN = 0;
+    }
+
+    static DocQuery Of(Collection col) {
+        DocQuery q = new DocQuery();
+        q.col = col;
+        return q;
+    }
+
+    /// <summary>Lambda filter; multiple calls AND together.</summary>
+    DocQuery Where(DocPredicate pred) {
+        this.preds.Add(pred);
+        return this;
+    }
+
+    /// <summary>Equality on a field (string form). When the field has a
+    /// secondary index the candidate set comes from the index instead of a
+    /// full scan; otherwise it is applied as a filter.</summary>
+    DocQuery WhereEq(string field, string val) {
+        if (!this.hasIdxEq && this.col.HasIndex(field)) {
+            this.hasIdxEq = true;
+            this.idxField = field;
+            this.idxValue = val;
+            return this;
+        }
+        this.eqFields.Add(field);
+        this.eqValues.Add(val);
+        return this;
+    }
+
+    /// <summary>Integer equality on a field.</summary>
+    DocQuery WhereEqInt(string field, int val) {
+        return WhereEq(field, Convert.ToString(val));
+    }
+
+    DocQuery OrderByInt(DocIntKey key) {
+        this.sortInt = true;
+        this.sortStr = false;
+        this.sortDesc = false;
+        this.intKey = key;
+        return this;
+    }
+
+    DocQuery OrderByIntDesc(DocIntKey key) {
+        OrderByInt(key);
+        this.sortDesc = true;
+        return this;
+    }
+
+    DocQuery OrderByStr(DocStrKey key) {
+        this.sortStr = true;
+        this.sortInt = false;
+        this.sortDesc = false;
+        this.strKey = key;
+        return this;
+    }
+
+    DocQuery OrderByStrDesc(DocStrKey key) {
+        OrderByStr(key);
+        this.sortDesc = true;
+        return this;
+    }
+
+    DocQuery Skip(int n) {
+        this.skipN = n;
+        return this;
+    }
+
+    DocQuery Take(int n) {
+        this.takeN = n;
+        return this;
+    }
+
+    // ===== Execution =====
+
+    List<JsonValue> Candidates() {
+        if (this.hasIdxEq) {
+            return this.col.FindByIndex(this.idxField, this.idxValue);
+        }
+        return this.col.FindAll();
+    }
+
+    bool Matches(JsonValue d) {
+        int i = 0;
+        while (i < this.eqFields.Count) {
+            string f = this.eqFields[i];
+            if (!d.Has(f)) { return false; }
+            if (d.Get(f).AsString("") != this.eqValues[i]) { return false; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < this.preds.Count) {
+            if (!this.preds[i](d)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>Bottom-up merge sort on precomputed keys: O(n log n), stable.</summary>
+    void SortDocs(List<JsonValue> docs) {
+        int n = docs.Count;
+        if (n < 2) { return; }
+        List<int> ik = new List<int>();
+        List<string> sk = new List<string>();
+        int i = 0;
+        while (i < n) {
+            if (this.sortInt) { ik.Add(this.intKey(docs[i])); sk.Add(""); }
+            else { sk.Add(this.strKey(docs[i])); ik.Add(0); }
+            i = i + 1;
+        }
+        List<JsonValue> tmpD = new List<JsonValue>();
+        List<int> tmpI = new List<int>();
+        List<string> tmpS = new List<string>();
+        i = 0;
+        while (i < n) {
+            tmpD.Add(docs[i]);
+            tmpI.Add(0);
+            tmpS.Add("");
+            i = i + 1;
+        }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                int hi = lo + width * 2;
+                if (mid > n) { mid = n; }
+                if (hi > n) { hi = n; }
+                int a = lo;
+                int b = mid;
+                int t = lo;
+                while (a < mid || b < hi) {
+                    bool takeA = false;
+                    if (b >= hi) { takeA = true; }
+                    else if (a < mid) {
+                        if (this.sortInt) { takeA = ik[a] <= ik[b]; }
+                        else { takeA = BTree.Compare(sk[a], sk[b]) <= 0; }
+                    }
+                    if (takeA) {
+                        tmpD[t] = docs[a]; tmpI[t] = ik[a]; tmpS[t] = sk[a];
+                        a = a + 1;
+                    } else {
+                        tmpD[t] = docs[b]; tmpI[t] = ik[b]; tmpS[t] = sk[b];
+                        b = b + 1;
+                    }
+                    t = t + 1;
+                }
+                lo = hi;
+            }
+            i = 0;
+            while (i < n) {
+                docs[i] = tmpD[i];
+                ik[i] = tmpI[i];
+                sk[i] = tmpS[i];
+                i = i + 1;
+            }
+            width = width * 2;
+        }
+    }
+
+    /// <summary>Runs the query and materializes matching documents.</summary>
+    List<JsonValue> ToList() {
+        List<JsonValue> cand = Candidates();
+        List<JsonValue> matched = new List<JsonValue>();
+        int i = 0;
+        while (i < cand.Count) {
+            if (Matches(cand[i])) { matched.Add(cand[i]); }
+            i = i + 1;
+        }
+        if (this.sortInt || this.sortStr) {
+            SortDocs(matched);
+            if (this.sortDesc) {
+                List<JsonValue> rev = new List<JsonValue>();
+                int r = matched.Count - 1;
+                while (r >= 0) {
+                    rev.Add(matched[r]);
+                    r = r - 1;
+                }
+                matched = rev;
+            }
+        }
+        if (this.skipN > 0 || this.takeN > 0) {
+            List<JsonValue> page = new List<JsonValue>();
+            int p = this.skipN;
+            while (p < matched.Count) {
+                if (this.takeN > 0 && page.Count >= this.takeN) { break; }
+                page.Add(matched[p]);
+                p = p + 1;
+            }
+            return page;
+        }
+        return matched;
+    }
+
+    /// <summary>First match, or null.</summary>
+    JsonValue First() {
+        List<JsonValue> r = Take(1).ToList();
+        if (r.Count > 0) { return r[0]; }
+        return null;
+    }
+
+    /// <summary>Number of matches (no sort/paging applied).</summary>
+    int Count() {
+        List<JsonValue> cand = Candidates();
+        int n = 0;
+        int i = 0;
+        while (i < cand.Count) {
+            if (Matches(cand[i])) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+}
