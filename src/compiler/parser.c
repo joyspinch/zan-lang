@@ -294,8 +294,20 @@ static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
     return n;
 }
 
+static bool is_type_kw(zan_token_kind_t k);
+
 static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
+
+    /* Type keyword as a static receiver: `int.Parse(...)`, `string.Join(...)`.
+     * Lower the keyword to an identifier so member access parses normally. */
+    if (is_type_kw(p->current.kind) && zan_lexer_peek(p->lex).kind == TK_DOT) {
+        const char *nm = zan_token_kind_name(p->current.kind);
+        parser_advance(p);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_IDENTIFIER, loc);
+        n->ident.name = (zan_istr_t){ nm, (int)strlen(nm) };
+        return n;
+    }
 
     /* LINQ query: `from x in src [where c]... select e` — `from` is
      * contextual, committed only when `in` follows the range variable */
