@@ -3625,8 +3625,18 @@ static void emit_rc_store_field(zan_irgen_t *g, zan_type_t *type,
      * typed-pointer LLVM builds. */
     LLVMTypeRef slot_t = LLVMTypeOf(field_ptr);
     LLVMTypeRef elem_t = vt;
+    /* Opaque-pointer LLVM builds (15+) have no pointer element type — and
+     * every pointer already inter-stores freely there, so keep vt. */
+#if !defined(LLVM_VERSION_MAJOR) || LLVM_VERSION_MAJOR < 15
     if (LLVMGetTypeKind(slot_t) == LLVMPointerTypeKind)
         elem_t = LLVMGetElementType(slot_t);
+#elif LLVM_VERSION_MAJOR < 17
+    if (LLVMGetTypeKind(slot_t) == LLVMPointerTypeKind &&
+        !LLVMPointerTypeIsOpaque(slot_t))
+        elem_t = LLVMGetElementType(slot_t);
+#else
+    (void)slot_t;
+#endif
     if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind &&
         LLVMGetTypeKind(elem_t) == LLVMPointerTypeKind && vt != elem_t) {
         v = LLVMBuildBitCast(g->builder, v, elem_t, "fld.cast");
