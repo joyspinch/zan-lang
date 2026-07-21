@@ -512,6 +512,7 @@ class MySqlConnection {
         DbResult result = DbResult.Create();
         this.hadError = false;
         this.lastAffected = 0;
+        this.lastError = "";
         if (!this.connected) {
             this.hadError = true;
             this.lastError = "not connected";
@@ -596,6 +597,347 @@ class MySqlConnection {
     /// <summary>First column of the first row as a string ("" if empty).</summary>
     async string ExecuteScalarAsync(string sql) {
         DbResult r = await this.QueryAsync(sql);
+        if (r.RowCount() > 0) {
+            return r.GetString(0, 0);
+        }
+        return "";
+    }
+
+    // ============================================================
+    // Prepared statements (COM_STMT_PREPARE / COM_STMT_EXECUTE)
+    // ============================================================
+    // Values travel out-of-band in the binary protocol, so injection through
+    // values is impossible and no escaping is involved. Placeholders are `?`.
+    // All parameters are sent as MYSQL_TYPE_VAR_STRING (the server coerces to
+    // the column type) or MYSQL_TYPE_NULL; result rows arrive in the binary
+    // row format and are decoded per column type.
+
+    /// <summary>Writes a length-encoded integer at pos; returns the new pos.</summary>
+    static int writeLenenc(string buf, int pos, int v) {
+        if (v < 251) { buf[pos] = v & 255; return pos + 1; }
+        if (v < 65536) {
+            buf[pos] = 252; buf[pos+1] = v & 255; buf[pos+2] = (v >> 8) & 255;
+            return pos + 3;
+        }
+        buf[pos] = 253; buf[pos+1] = v & 255; buf[pos+2] = (v >> 8) & 255;
+        buf[pos+3] = (v >> 16) & 255;
+        return pos + 4;
+    }
+
+    /// <summary>2^e as a double (e may be negative).</summary>
+    static double pow2(int e) {
+        double v = 1.0;
+        int i = 0;
+        if (e >= 0) {
+            while (i < e) { v = v * 2.0; i = i + 1; }
+        } else {
+            while (i > e) { v = v / 2.0; i = i - 1; }
+        }
+        return v;
+    }
+
+    /// <summary>Decodes an IEEE-754 value from mantissa/exponent/sign fields.</summary>
+    static string ieeeToText(int sign, int exp, int mant, int expBias, int mantBits) {
+        if (exp == 0 && mant == 0) { return "0"; }
+        double m = 1.0;
+        int b = mantBits - 1;
+        while (b >= 0) {
+            if (((mant >> b) & 1) == 1) { m = m + pow2(b - mantBits); }
+            b = b - 1;
+        }
+        double v = m * pow2(exp - expBias);
+        if (sign == 1) { v = 0.0 - v; }
+        return Convert.ToString(v);
+    }
+
+    static string pad2(int v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+
+    /// <summary>Reads one binary-protocol value of the given column type at
+    /// cursor cur[0], advancing it; returns the text form.</summary>
+    static string readBinValue(string buf, List<int> cur, int type, int flags) {
+        int p = cur[0];
+        bool uns = (flags & 32) != 0;
+        if (type == 1) {                                       // TINY
+            int v = buf[p] & 255; cur[0] = p + 1;
+            if (!uns && v > 127) { v = v - 256; }
+            return Convert.ToString(v);
+        }
+        if (type == 2 || type == 13) {                         // SHORT / YEAR
+            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); cur[0] = p + 2;
+            if (!uns && v > 32767) { v = v - 65536; }
+            return Convert.ToString(v);
+        }
+        if (type == 3 || type == 9) {                          // LONG / INT24
+            int v = (buf[p]&255) | ((buf[p+1]&255)<<8) | ((buf[p+2]&255)<<16) | ((buf[p+3]&255)<<24);
+            cur[0] = p + 4;
+            if (!uns && v > 2147483647) { v = v - 4294967296; }
+            return Convert.ToString(v);
+        }
+        if (type == 8) {                                       // LONGLONG
+            int v = 0; int i = 0;
+            while (i < 8) { v = v | ((buf[p+i]&255) << (8*i)); i = i + 1; }
+            cur[0] = p + 8;
+            return Convert.ToString(v);
+        }
+        if (type == 4) {                                       // FLOAT (IEEE binary32)
+            int bits = (buf[p]&255) | ((buf[p+1]&255)<<8) | ((buf[p+2]&255)<<16) | ((buf[p+3]&255)<<24);
+            cur[0] = p + 4;
+            return ieeeToText((bits >> 31) & 1, (bits >> 23) & 255, bits & 8388607, 127, 23);
+        }
+        if (type == 5) {                                       // DOUBLE (IEEE binary64)
+            int bits = 0; int i = 0;
+            while (i < 8) { bits = bits | ((buf[p+i]&255) << (8*i)); i = i + 1; }
+            cur[0] = p + 8;
+            return ieeeToText((bits >> 63) & 1, (bits >> 52) & 2047, bits & 4503599627370495, 1023, 52);
+        }
+        if (type == 10 || type == 12 || type == 7) {           // DATE / DATETIME / TIMESTAMP
+            int len = buf[p] & 255; p = p + 1;
+            int y = 0; int mo = 0; int d = 0; int h = 0; int mi = 0; int s = 0;
+            if (len >= 4) {
+                y = (buf[p]&255) | ((buf[p+1]&255)<<8);
+                mo = buf[p+2] & 255; d = buf[p+3] & 255;
+            }
+            if (len >= 7) { h = buf[p+4] & 255; mi = buf[p+5] & 255; s = buf[p+6] & 255; }
+            cur[0] = cur[0] + 1 + len;
+            string date = Convert.ToString(y) + "-" + pad2(mo) + "-" + pad2(d);
+            if (type == 10) { return date; }
+            return date + " " + pad2(h) + ":" + pad2(mi) + ":" + pad2(s);
+        }
+        if (type == 11) {                                      // TIME
+            int len = buf[p] & 255; p = p + 1;
+            int h = 0; int mi = 0; int s = 0; string sign = "";
+            if (len >= 8) {
+                if ((buf[p] & 255) == 1) { sign = "-"; }
+                int days = (buf[p+1]&255) | ((buf[p+2]&255)<<8) | ((buf[p+3]&255)<<16) | ((buf[p+4]&255)<<24);
+                h = (buf[p+5] & 255) + days * 24; mi = buf[p+6] & 255; s = buf[p+7] & 255;
+            }
+            cur[0] = cur[0] + 1 + len;
+            return sign + pad2(h) + ":" + pad2(mi) + ":" + pad2(s);
+        }
+        // DECIMAL/NEWDECIMAL, BIT, JSON, ENUM/SET, BLOB family, VARCHAR,
+        // VAR_STRING, STRING, GEOMETRY: length-encoded byte strings.
+        return readLenencStr(buf, cur);
+    }
+
+    /// <summary>Prepares sql; on success fills out[0]=stmtId, out[1]=numCols,
+    /// out[2]=numParams and returns true. Skips the parameter/column definition
+    /// packets of the prepare response.</summary>
+    async bool stmtPrepare(string sql, List<int> outIds) {
+        int len = sql.Length + 1;
+        string pay = calloc(len + 1, 1);
+        pay[0] = 22;   // COM_STMT_PREPARE
+        int i = 0;
+        while (i < sql.Length) { pay[i+1] = sql[i] & 255; i = i + 1; }
+        await this.writePacket(pay, len, 0);
+        free(pay);
+        string r = await this.readPacket();
+        if (r == null) { this.lastError = "connection closed"; this.connected = false; return false; }
+        int b0 = r[0] & 255;
+        if (b0 == 255) {
+            int code = (r[1]&255)|((r[2]&255)<<8);
+            this.lastError = "prepare err " + Convert.ToString(code) + ": "
+                + bytesToStr(r, 9, this.lastLen - 9);
+            free(r);
+            return false;
+        }
+        int stmtId = (r[1]&255) | ((r[2]&255)<<8) | ((r[3]&255)<<16) | ((r[4]&255)<<24);
+        int numCols = (r[5]&255) | ((r[6]&255)<<8);
+        int numParams = (r[7]&255) | ((r[8]&255)<<8);
+        free(r);
+        outIds.Add(stmtId); outIds.Add(numCols); outIds.Add(numParams);
+        int skip = 0;
+        if (numParams > 0) { skip = numParams + 1; }   // param defs + EOF
+        if (numCols > 0) { skip = skip + numCols + 1; } // column defs + EOF
+        int k = 0;
+        while (k < skip) {
+            string d = await this.readPacket();
+            if (d == null) { this.connected = false; return false; }
+            free(d);
+            k = k + 1;
+        }
+        return true;
+    }
+
+    /// <summary>Sends COM_STMT_EXECUTE with all parameters bound as
+    /// VAR_STRING (or NULL), text values length-encoded.</summary>
+    async int stmtExecute(int stmtId, DbParams prms) {
+        int n = prms.Count();
+        int bitmapLen = (n + 7) / 8;
+        int total = 1 + 4 + 1 + 4;
+        if (n > 0) {
+            total = total + bitmapLen + 1 + 2 * n;
+            int i = 0;
+            while (i < n) {
+                if (!prms.IsNull(i)) { total = total + 4 + prms.AsText(i).Length; }
+                i = i + 1;
+            }
+        }
+        string pay = calloc(total + 1, 1);
+        pay[0] = 23;   // COM_STMT_EXECUTE
+        pay[1]=stmtId&255; pay[2]=(stmtId>>8)&255; pay[3]=(stmtId>>16)&255; pay[4]=(stmtId>>24)&255;
+        pay[5] = 0;    // CURSOR_TYPE_NO_CURSOR
+        pay[6] = 1; pay[7] = 0; pay[8] = 0; pay[9] = 0;   // iteration count = 1
+        int q = 10;
+        if (n > 0) {
+            int i = 0;
+            while (i < n) {
+                if (prms.IsNull(i)) {
+                    int off = q + i / 8;
+                    pay[off] = (pay[off] & 255) | (1 << (i % 8));
+                }
+                i = i + 1;
+            }
+            q = q + bitmapLen;
+            pay[q] = 1; q = q + 1;   // new-params-bound flag
+            i = 0;
+            while (i < n) {
+                if (prms.IsNull(i)) { pay[q] = 6; }    // MYSQL_TYPE_NULL
+                else { pay[q] = 253; }                  // MYSQL_TYPE_VAR_STRING
+                pay[q+1] = 0;
+                q = q + 2;
+                i = i + 1;
+            }
+            i = 0;
+            while (i < n) {
+                if (!prms.IsNull(i)) {
+                    string t = prms.AsText(i);
+                    q = writeLenenc(pay, q, t.Length);
+                    int j = 0;
+                    while (j < t.Length) { pay[q+j] = t[j] & 255; j = j + 1; }
+                    q = q + t.Length;
+                }
+                i = i + 1;
+            }
+        }
+        int rc = await this.writePacket(pay, q, 0);
+        free(pay);
+        return rc;
+    }
+
+    /// <summary>Closes a server-side prepared statement (fire-and-forget).</summary>
+    async int stmtClose(int stmtId) {
+        string pay = calloc(6, 1);
+        pay[0] = 25;   // COM_STMT_CLOSE
+        pay[1]=stmtId&255; pay[2]=(stmtId>>8)&255; pay[3]=(stmtId>>16)&255; pay[4]=(stmtId>>24)&255;
+        int rc = await this.writePacket(pay, 5, 0);
+        free(pay);
+        return rc;
+    }
+
+    /// <summary>Runs a parameterized query through the binary prepared-statement
+    /// protocol (COM_STMT_PREPARE + COM_STMT_EXECUTE). Values are transmitted
+    /// out-of-band -- never spliced into the SQL text.</summary>
+    async DbResult QueryParamsAsync(string sql, DbParams prms) {
+        DbResult result = DbResult.Create();
+        this.hadError = false;
+        this.lastAffected = 0;
+        this.lastError = "";
+        if (!this.connected) {
+            this.hadError = true;
+            this.lastError = "not connected";
+            return result;
+        }
+        List<int> ids = new List<int>();
+        bool ok = await this.stmtPrepare(sql, ids);
+        if (!ok) { this.hadError = true; return result; }
+        int stmtId = ids[0];
+        await this.stmtExecute(stmtId, prms);
+        string first = await this.readPacket();
+        if (first == null) {
+            this.hadError = true;
+            this.lastError = "connection closed";
+            this.connected = false;
+            return result;
+        }
+        int b0 = first[0] & 255;
+        if (b0 == 255) {
+            int code = (first[1]&255)|((first[2]&255)<<8);
+            this.lastError = "err " + Convert.ToString(code) + ": "
+                + bytesToStr(first, 9, this.lastLen - 9);
+            this.hadError = true;
+            free(first);
+            await this.stmtClose(stmtId);
+            return result;
+        }
+        if (b0 == 0 || b0 == 254) {
+            List<int> cur = new List<int>(); cur.Add(1);
+            this.lastAffected = readLenenc(first, cur);
+            free(first);
+            await this.stmtClose(stmtId);
+            return result;
+        }
+        List<int> cc = new List<int>(); cc.Add(0);
+        int ncols = readLenenc(first, cc);
+        free(first);
+        result.SetColumnCount(ncols);
+        List<int> colTypes = new List<int>();
+        List<int> colFlags = new List<int>();
+        int c = 0;
+        while (c < ncols) {
+            string cd = await this.readPacket();
+            List<int> cur = new List<int>(); cur.Add(0);
+            readLenencStr(cd, cur);   // catalog
+            readLenencStr(cd, cur);   // schema
+            readLenencStr(cd, cur);   // table
+            readLenencStr(cd, cur);   // org_table
+            result.AddColumnName(readLenencStr(cd, cur));  // name
+            readLenencStr(cd, cur);   // org_name
+            readLenenc(cd, cur);      // fixed-length fields marker (0x0c)
+            int p = cur[0];
+            int ctype = cd[p + 6] & 255;                       // charset 2 + length 4
+            int cflags = (cd[p+7]&255) | ((cd[p+8]&255) << 8);
+            colTypes.Add(ctype);
+            colFlags.Add(cflags);
+            free(cd);
+            c = c + 1;
+        }
+        string colEof = await this.readPacket();
+        if (colEof != null) { free(colEof); }
+        int rowCount = 0;
+        while (true) {
+            string row = await this.readPacket();
+            if (row == null) { break; }
+            if (this.isEof(row)) { free(row); break; }
+            // Binary row: 0x00 header, then a null bitmap with a 2-bit offset.
+            int bmLen = (ncols + 9) / 8;
+            List<int> cur = new List<int>(); cur.Add(1 + bmLen);
+            List<string> outRow = new List<string>();
+            c = 0;
+            while (c < ncols) {
+                int bit = c + 2;
+                int nb = row[1 + bit / 8] & 255;
+                if (((nb >> (bit % 8)) & 1) == 1) {
+                    outRow.Add("");
+                } else {
+                    outRow.Add(readBinValue(row, cur, colTypes[c], colFlags[c]));
+                }
+                c = c + 1;
+            }
+            result.AddRow(outRow);
+            free(row);
+            rowCount = rowCount + 1;
+        }
+        this.lastAffected = rowCount;
+        await this.stmtClose(stmtId);
+        return result;
+    }
+
+    /// <summary>Runs a parameterized non-query statement; returns affected rows
+    /// (-1 on error).</summary>
+    async int ExecuteParamsAsync(string sql, DbParams prms) {
+        DbResult r = await this.QueryParamsAsync(sql, prms);
+        if (this.hadError) {
+            return -1;
+        }
+        return this.lastAffected;
+    }
+
+    /// <summary>Parameterized scalar query (first column of first row).</summary>
+    async string ExecuteScalarParamsAsync(string sql, DbParams prms) {
+        DbResult r = await this.QueryParamsAsync(sql, prms);
         if (r.RowCount() > 0) {
             return r.GetString(0, 0);
         }
