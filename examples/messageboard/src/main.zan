@@ -1,0 +1,98 @@
+using System;
+using System.Text;
+using System.Net.Sockets;
+using System.Net.Http;
+
+// MessageBoard -- a small real-world HTTP app used to exercise the Zan
+// coroutine runtime under concurrency: many simultaneous connections,
+// keep-alive, POST bodies split across TCP segments, and hostile input.
+//
+// Routes:
+//   GET  /              HTML page listing all messages
+//   GET  /api/messages  JSON array of messages
+//   GET  /api/count     number of stored messages
+//   POST /post          form body: name=...&text=...   (adds a message)
+//
+// URL-decoding, HTML/JSON escaping and form-field parsing all come from the
+// standard library (System.Text.Encoding, HttpRequest); this file is just the
+// routes.
+class MessageBoard {
+    static List<string> names;
+    static List<string> texts;
+    static int maxMessageLen;
+
+    static HttpResponse Handle(HttpRequest request) {
+        if (request.method == "GET" && request.path == "/") {
+            StringBuilder html = new StringBuilder();
+            html.Append("<!doctype html><html><head><meta charset=\"utf-8\">");
+            html.Append("<title>Zan Message Board</title></head><body>");
+            html.Append("<h1>Zan Message Board</h1>");
+            html.Append("<form method=\"post\" action=\"/post\">");
+            html.Append("<input name=\"name\" placeholder=\"Name\"> ");
+            html.Append("<input name=\"text\" placeholder=\"Message\" size=\"48\"> ");
+            html.Append("<button>Post</button></form><ul>");
+            int i = MessageBoard.names.Count - 1;
+            while (i >= 0) {
+                html.Append("<li><b>");
+                html.Append(Encoding.HtmlEncode(MessageBoard.names[i]));
+                html.Append("</b>: ");
+                html.Append(Encoding.HtmlEncode(MessageBoard.texts[i]));
+                html.Append("</li>");
+                i = i - 1;
+            }
+            html.Append("</ul></body></html>");
+            return HttpResponse.Ok(html.ToString());
+        }
+        if (request.method == "GET" && request.path == "/api/messages") {
+            StringBuilder js = new StringBuilder();
+            js.Append("[");
+            int i = 0;
+            while (i < MessageBoard.names.Count) {
+                if (i > 0) { js.Append(","); }
+                js.Append("{\"name\":\"");
+                js.Append(Encoding.JsonEscape(MessageBoard.names[i]));
+                js.Append("\",\"text\":\"");
+                js.Append(Encoding.JsonEscape(MessageBoard.texts[i]));
+                js.Append("\"}");
+                i = i + 1;
+            }
+            js.Append("]");
+            return HttpResponse.Json(js.ToString());
+        }
+        if (request.method == "GET" && request.path == "/api/count") {
+            return HttpResponse.Text(Convert.ToString(MessageBoard.names.Count));
+        }
+        if (request.method == "POST" && request.path == "/post") {
+            string name = request.GetFormField("name");
+            string text = request.GetFormField("text");
+            if (name.Length == 0 || text.Length == 0) {
+                return HttpResponse.WithStatus(400, "Bad Request", "name and text are required");
+            }
+            if (name.Length > 64 || text.Length > MessageBoard.maxMessageLen) {
+                return HttpResponse.WithStatus(400, "Bad Request", "message too long");
+            }
+            MessageBoard.names.Add(name);
+            MessageBoard.texts.Add(text);
+            return HttpResponse.Text("ok " + Convert.ToString(MessageBoard.names.Count));
+        }
+        return HttpResponse.NotFound();
+    }
+}
+
+class Program {
+    static async int Run() {
+        MessageBoard.names = new List<string>();
+        MessageBoard.texts = new List<string>();
+        MessageBoard.maxMessageLen = 2048;
+        HttpServer server = HttpServer.Create("127.0.0.1", 8090);
+        server.SetMaxConnections(512);
+        server.SetMaxRequestSize(65536);
+        server.OnRequest(MessageBoard.Handle);
+        await server.Start();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
