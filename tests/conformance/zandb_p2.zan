@@ -1,0 +1,138 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+
+// ZanDB P2: B+Tree KV store -- CRUD, multi-level splits, sorted scans,
+// reopen persistence, batch transactions, atomic read-modify-write under
+// concurrent coroutines (lost-update test).
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+    static KvStore db;
+    static int finished = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static string K(int i) {
+        // zero-padded so lexicographic order == numeric order
+        string s = Convert.ToString(i);
+        while (s.Length < 6) { s = "0" + s; }
+        return "k" + s;
+    }
+
+    static async void Incr(int id) {
+        int i = 0;
+        while (i < 25) {
+            await db.UpdateAtomic("counter", (string cur) => {
+                int v = 0;
+                if (cur.Length > 0) { v = Convert.ToInt(cur); }
+                return Convert.ToString(v + 1);
+            });
+            i = i + 1;
+        }
+        finished = finished + 1;
+    }
+
+    static async int Run() {
+        string path = "zandb_p2.tmp.db";
+        File.Delete(path);
+        File.Delete(path + "-wal");
+
+        db = KvStore.Open(path, 64);
+        Check("open", db.IsOpen());
+
+        // 1. Basic CRUD.
+        db.Put("user:1", "alice");
+        db.Put("user:2", "bob");
+        Check("get", db.Get("user:1") == "alice" && db.Get("user:2") == "bob");
+        Check("contains", db.Contains("user:1") && !db.Contains("user:9"));
+        db.Put("user:1", "alice2");
+        Check("replace", db.Get("user:1") == "alice2");
+        Check("delete", db.Delete("user:2") && !db.Contains("user:2"));
+        Check("delete-missing", !db.Delete("user:2"));
+        Check("get-missing", db.Get("nope") == "");
+
+        // 2. Volume: force multi-level splits (batch tx for speed).
+        db.Begin();
+        int i = 0;
+        while (i < 3000) {
+            db.Put(K(i), "val-" + Convert.ToString(i * 7));
+            i = i + 1;
+        }
+        Check("bulk-commit", db.Commit());
+        bool allOk = true;
+        i = 0;
+        while (i < 3000) {
+            if (db.Get(K(i)) != "val-" + Convert.ToString(i * 7)) { allOk = false; }
+            i = i + 1;
+        }
+        Check("bulk-readback", allOk);
+
+        // 3. Sorted range scan.
+        List<string> ks = new List<string>();
+        List<string> vs = new List<string>();
+        int n = db.Scan(K(100), K(109), 0, ks, vs);
+        Check("scan-range", n == 10 && ks[0] == K(100) && ks[9] == K(109));
+        bool sorted = true;
+        int j = 1;
+        while (j < ks.Count) {
+            if (!(ks[j - 1] < ks[j]) && ks[j - 1] == ks[j]) { sorted = false; }
+            j = j + 1;
+        }
+        Check("scan-values", vs[0] == "val-700" && vs[9] == "val-763");
+
+        // Prefix scan over the user: namespace.
+        db.Put("user:3", "carol");
+        List<string> pk = new List<string>();
+        List<string> pv = new List<string>();
+        int pn = db.ScanPrefix("user:", 0, pk, pv);
+        Check("scan-prefix", pn == 2 && pk[0] == "user:1" && pk[1] == "user:3");
+
+        // 4. Reopen persistence (multi-level tree survives).
+        db.Close();
+        db = KvStore.Open(path, 64);
+        Check("reopen", db.IsOpen() && db.Get(K(2500)) == "val-" + Convert.ToString(2500 * 7));
+        Check("reopen-count", db.Count() == 3002);
+
+        // 5. Batch transaction atomicity (both writes appear).
+        db.Begin();
+        db.Put("tx:a", "1");
+        db.Put("tx:b", "2");
+        db.Commit();
+        Check("tx", db.Get("tx:a") == "1" && db.Get("tx:b") == "2");
+
+        // 6. Lost-update: 8 coroutines x 25 atomic increments = 200.
+        db.SetSyncEvery(50);   // grouped fsync keeps the test fast
+        db.Put("counter", "0");
+        int w = 0;
+        while (w < 8) {
+            Task.Spawn(Incr(w));
+            w = w + 1;
+        }
+        while (finished < 8) {
+            await Task.Delay(5);
+        }
+        Check("lost-update", db.Get("counter") == "200");
+
+        db.Checkpoint();
+        db.Close();
+
+        // 7. Reopen after grouped mode: committed data all present.
+        db = KvStore.Open(path, 64);
+        Check("grouped-durable", db.Get("counter") == "200");
+        db.Close();
+
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}

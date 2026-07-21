@@ -1,0 +1,174 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>Computes the new value from the current one inside the write
+/// critical section (current is "" when the key is absent).</summary>
+delegate string KvUpdater(string current);
+
+/// <summary>
+/// Embedded key/value store: single file + WAL, B+Tree index, LRU page cache
+/// with a hard memory cap, crash-safe atomic commits. Open-and-go facade:
+///
+///   KvStore db = KvStore.Open("app.zdb");
+///   db.Put("user:1", "alice");
+///   string v = db.Get("user:1");
+///   db.Close();
+///
+/// Writes auto-commit. Wrap several writes in Begin()/Commit() to make them
+/// one atomic (and much faster) transaction. Coroutine-safe async variants
+/// (GetAsync/PutAsync/UpdateAtomic) coordinate through a reader/writer lock;
+/// UpdateAtomic runs read-modify-write inside the write critical section so
+/// concurrent increments never lose updates.
+/// </summary>
+class KvStore {
+    Pager pager;
+    BTree tree;
+    AsyncRwLock rw;
+    bool inTx;
+    string lastError;
+
+    KvStore() {
+        this.inTx = false;
+        this.lastError = "";
+    }
+
+    /// <summary>Opens (creating if needed) a store with default settings
+    /// (256-page / 1 MB cache, fsync every commit).</summary>
+    static KvStore Open(string path) {
+        return KvStore.Open(path, 256);
+    }
+
+    /// <summary>Opens with an explicit page-cache capacity (pages are 4 KB).</summary>
+    static KvStore Open(string path, int cachePages) {
+        KvStore s = new KvStore();
+        s.pager = Pager.Open(path, cachePages);
+        if (!s.pager.IsOpen()) {
+            s.lastError = s.pager.GetError();
+            return s;
+        }
+        s.tree = BTree.Open(s.pager);
+        s.rw = AsyncRwLock.Create();
+        return s;
+    }
+
+    bool IsOpen() { return this.lastError.Length == 0 && this.pager.IsOpen(); }
+
+    string GetError() { return this.lastError; }
+
+    /// <summary>fsync cadence: 1 = every commit (Full, default), N = every N
+    /// commits (Grouped; the WAL still makes each commit crash-recoverable).</summary>
+    void SetSyncEvery(int n) { this.pager.SetSyncEvery(n); }
+
+    // ===== Synchronous core =====
+
+    /// <summary>Returns the value, or "" when absent (see Contains).</summary>
+    string Get(string key) {
+        List<string> outv = new List<string>();
+        if (this.tree.Get(key, outv)) { return outv[0]; }
+        return "";
+    }
+
+    bool Contains(string key) { return this.tree.Contains(key); }
+
+    /// <summary>Inserts or replaces a key. Auto-commits unless inside
+    /// Begin()/Commit().</summary>
+    void Put(string key, string val) {
+        this.tree.Put(key, val);
+        if (!this.inTx) { this.pager.Commit(); }
+    }
+
+    /// <summary>Removes a key; true when it existed.</summary>
+    bool Delete(string key) {
+        bool existed = this.tree.Delete(key);
+        if (existed && !this.inTx) { this.pager.Commit(); }
+        return existed;
+    }
+
+    /// <summary>Starts a batch: writes accumulate and commit atomically
+    /// together on Commit().</summary>
+    void Begin() { this.inTx = true; }
+
+    /// <summary>Atomically persists everything since Begin().</summary>
+    bool Commit() {
+        this.inTx = false;
+        return this.pager.Commit();
+    }
+
+    /// <summary>Range scan: startKey <= key <= endKey (endKey "" = to end),
+    /// limit 0 = unlimited. Returns number of entries appended.</summary>
+    int Scan(string startKey, string endKey, int limit,
+            List<string> outKeys, List<string> outVals) {
+        return this.tree.Scan(startKey, endKey, limit, outKeys, outVals);
+    }
+
+    /// <summary>All keys with the given prefix (e.g. "user:").</summary>
+    int ScanPrefix(string prefix, int limit,
+            List<string> outKeys, List<string> outVals) {
+        List<string> ks = new List<string>();
+        List<string> vs = new List<string>();
+        this.tree.Scan(prefix, "", 0, ks, vs);
+        int added = 0;
+        int i = 0;
+        while (i < ks.Count) {
+            string k = ks[i];
+            if (k.Length < prefix.Length) { break; }
+            if (k.Substring(0, prefix.Length) != prefix) { break; }
+            outKeys.Add(k);
+            outVals.Add(vs[i]);
+            added = added + 1;
+            if (limit > 0 && added >= limit) { break; }
+            i = i + 1;
+        }
+        return added;
+    }
+
+    int Count() { return this.tree.Count(); }
+
+    /// <summary>Forces everything to stable storage and truncates the WAL.</summary>
+    void Checkpoint() { this.pager.Checkpoint(); }
+
+    void Close() {
+        this.pager.Close();
+        this.rw.Close();
+    }
+
+    // ===== Coroutine-safe async API =====
+
+    /// <summary>Shared-lock read; safe alongside concurrent writers.</summary>
+    async string GetAsync(string key) {
+        await this.rw.EnterRead();
+        string v = Get(key);
+        this.rw.ExitRead();
+        return v;
+    }
+
+    /// <summary>Exclusive-lock write with auto-commit.</summary>
+    async void PutAsync(string key, string val) {
+        await this.rw.EnterWrite();
+        Put(key, val);
+        this.rw.ExitWrite();
+    }
+
+    async bool DeleteAsync(string key) {
+        await this.rw.EnterWrite();
+        bool existed = Delete(key);
+        this.rw.ExitWrite();
+        return existed;
+    }
+
+    /// <summary>Atomic read-modify-write: fn sees the latest committed value
+    /// ("" when absent) inside the write critical section, so concurrent
+    /// UpdateAtomic calls on the same key never lose updates. Returns the
+    /// stored result.</summary>
+    async string UpdateAtomic(string key, KvUpdater fn) {
+        await this.rw.EnterWrite();
+        string cur = Get(key);
+        string next = fn(cur);
+        Put(key, next);
+        this.rw.ExitWrite();
+        return next;
+    }
+}

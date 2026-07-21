@@ -1,0 +1,406 @@
+using System;
+using System.IO;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// Decoded form of one B+Tree node (leaf or internal). Nodes are encoded
+/// into fixed-size pager pages; mutation happens on the decoded lists and the
+/// node is re-encoded, splitting when it no longer fits a page.
+/// </summary>
+class BNode {
+    bool leaf;
+    List<string> keys;
+    List<string> vals;      // leaf only
+    List<int> children;     // internal only: keys.Count + 1 entries
+    int next;               // leaf only: right sibling page id (0 = none)
+
+    BNode(bool isLeaf) {
+        this.leaf = isLeaf;
+        this.keys = new List<string>();
+        this.vals = new List<string>();
+        this.children = new List<int>();
+        this.next = 0;
+    }
+
+    static BNode Leaf() { return new BNode(true); }
+    static BNode Internal() { return new BNode(false); }
+}
+
+/// <summary>
+/// Disk B+Tree over a <see cref="Pager"/>: sorted string keys, string values,
+/// leaf-linked range scans. Page 1 is the tree meta page (root id); data
+/// nodes live in pager-allocated pages. All mutations go through the pager's
+/// WAL, so the tree inherits atomic crash-safe commits.
+///
+/// Keys and values are text strings (byte-wise ordering); values up to
+/// ~3.9 KB fit a page. (Overflow chains for larger values: future work.)
+/// </summary>
+class BTree {
+    static int META_PAGE = 1;
+    static int TYPE_LEAF = 1;
+    static int TYPE_INTERNAL = 2;
+
+    Pager pager;
+    int rootId;
+    string lastError;
+
+    BTree() {
+        this.rootId = 0;
+        this.lastError = "";
+    }
+
+    /// <summary>Opens the tree stored in the pager, initializing meta + root
+    /// leaf on a fresh database.</summary>
+    static BTree Open(Pager pager) {
+        BTree t = new BTree();
+        t.pager = pager;
+        if (pager.PageCount() <= BTree.META_PAGE) {
+            int meta = pager.AllocPage();           // page 1
+            int root = pager.AllocPage();           // page 2
+            BNode empty = BNode.Leaf();
+            t.WriteNode(root, empty);
+            t.rootId = root;
+            t.WriteMeta();
+            pager.Commit();
+        } else {
+            ByteBuffer m = pager.GetPage(BTree.META_PAGE);
+            m.SeekRead(0);
+            t.rootId = m.ReadU64();
+        }
+        return t;
+    }
+
+    string GetError() { return this.lastError; }
+
+    void WriteMeta() {
+        ByteBuffer m = this.pager.GetPage(BTree.META_PAGE);
+        m.Clear();
+        m.WriteU64(this.rootId);
+        m.SetLength(4096);
+        this.pager.MarkDirty(BTree.META_PAGE);
+    }
+
+    static void InsStr(List<string> l, int idx, string v) {
+        l.Add("");
+        int m = l.Count - 1;
+        while (m > idx) {
+            l[m] = l[m - 1];
+            m = m - 1;
+        }
+        l[idx] = v;
+    }
+
+    static void InsInt(List<int> l, int idx, int v) {
+        l.Add(0);
+        int m = l.Count - 1;
+        while (m > idx) {
+            l[m] = l[m - 1];
+            m = m - 1;
+        }
+        l[idx] = v;
+    }
+
+    static int Compare(string a, string b) {
+        int la = a.Length;
+        int lb = b.Length;
+        int n = la;
+        if (lb < n) { n = lb; }
+        int i = 0;
+        while (i < n) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca != cb) { return ca - cb; }
+            i = i + 1;
+        }
+        return la - lb;
+    }
+
+    // ===== Node encode/decode =====
+
+    BNode ReadNode(int pageId) {
+        ByteBuffer pg = this.pager.GetPage(pageId);
+        pg.SeekRead(0);
+        int type = pg.ReadU8();
+        int nkeys = pg.ReadU16();
+        if (type == BTree.TYPE_LEAF) {
+            BNode n = BNode.Leaf();
+            n.next = pg.ReadU64();
+            int i = 0;
+            while (i < nkeys) {
+                n.keys.Add(pg.ReadString());
+                n.vals.Add(pg.ReadString());
+                i = i + 1;
+            }
+            return n;
+        }
+        BNode m = BNode.Internal();
+        m.children.Add(pg.ReadU64());
+        int j = 0;
+        while (j < nkeys) {
+            m.keys.Add(pg.ReadString());
+            m.children.Add(pg.ReadU64());
+            j = j + 1;
+        }
+        return m;
+    }
+
+    static int EncodedSize(BNode n) {
+        int size = 3;   // type + nkeys
+        if (n.leaf) {
+            size = size + 8;   // next
+            int i = 0;
+            while (i < n.keys.Count) {
+                size = size + 5 + n.keys[i].Length + 5 + n.vals[i].Length;
+                i = i + 1;
+            }
+            return size;
+        }
+        size = size + 8;
+        int j = 0;
+        while (j < n.keys.Count) {
+            size = size + 5 + n.keys[j].Length + 8;
+            j = j + 1;
+        }
+        return size;
+    }
+
+    void WriteNode(int pageId, BNode n) {
+        ByteBuffer pg = this.pager.GetPage(pageId);
+        pg.Clear();
+        if (n.leaf) {
+            pg.WriteU8(BTree.TYPE_LEAF);
+            pg.WriteU16(n.keys.Count);
+            pg.WriteU64(n.next);
+            int i = 0;
+            while (i < n.keys.Count) {
+                pg.WriteString(n.keys[i]);
+                pg.WriteString(n.vals[i]);
+                i = i + 1;
+            }
+        } else {
+            pg.WriteU8(BTree.TYPE_INTERNAL);
+            pg.WriteU16(n.keys.Count);
+            pg.WriteU64(n.children[0]);
+            int j = 0;
+            while (j < n.keys.Count) {
+                pg.WriteString(n.keys[j]);
+                pg.WriteU64(n.children[j + 1]);
+                j = j + 1;
+            }
+        }
+        pg.SetLength(4096);
+        this.pager.MarkDirty(pageId);
+    }
+
+    // ===== Search =====
+
+    /// <summary>Index of the child to descend into for key.</summary>
+    static int ChildIndex(BNode n, string key) {
+        int i = 0;
+        while (i < n.keys.Count && BTree.Compare(key, n.keys[i]) >= 0) {
+            i = i + 1;
+        }
+        return i;
+    }
+
+    /// <summary>Position of key in a leaf, or -1.</summary>
+    static int LeafFind(BNode n, string key) {
+        int lo = 0;
+        int hi = n.keys.Count - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int c = BTree.Compare(n.keys[mid], key);
+            if (c == 0) { return mid; }
+            if (c < 0) { lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return -1;
+    }
+
+    /// <summary>Looks up a key. Returns true and stores the value in outVal
+    /// (single-element list) when found.</summary>
+    bool Get(string key, List<string> outVal) {
+        int pid = this.rootId;
+        BNode n = ReadNode(pid);
+        while (!n.leaf) {
+            pid = n.children[BTree.ChildIndex(n, key)];
+            n = ReadNode(pid);
+        }
+        int pos = BTree.LeafFind(n, key);
+        if (pos < 0) { return false; }
+        outVal.Add(n.vals[pos]);
+        return true;
+    }
+
+    bool Contains(string key) {
+        List<string> tmp = new List<string>();
+        return Get(key, tmp);
+    }
+
+    // ===== Insert =====
+
+    /// <summary>Inserts or replaces key -> val (not yet durable; call
+    /// pager.Commit() to persist atomically).</summary>
+    void Put(string key, string val) {
+        List<int> path = new List<int>();       // page ids root..leaf
+        List<int> pathIdx = new List<int>();    // child index taken at each internal
+        int pid = this.rootId;
+        BNode n = ReadNode(pid);
+        while (!n.leaf) {
+            int ci = BTree.ChildIndex(n, key);
+            path.Add(pid);
+            pathIdx.Add(ci);
+            pid = n.children[ci];
+            n = ReadNode(pid);
+        }
+
+        int pos = BTree.LeafFind(n, key);
+        if (pos >= 0) {
+            n.vals[pos] = val;
+        } else {
+            int ins = 0;
+            while (ins < n.keys.Count && BTree.Compare(n.keys[ins], key) < 0) {
+                ins = ins + 1;
+            }
+            BTree.InsStr(n.keys, ins, key);
+            BTree.InsStr(n.vals, ins, val);
+        }
+
+        if (BTree.EncodedSize(n) <= 4096) {
+            WriteNode(pid, n);
+            return;
+        }
+
+        // Split the leaf: left keeps the low half, new right page gets the rest.
+        int mid = n.keys.Count / 2;
+        BNode right = BNode.Leaf();
+        int k = mid;
+        while (k < n.keys.Count) {
+            right.keys.Add(n.keys[k]);
+            right.vals.Add(n.vals[k]);
+            k = k + 1;
+        }
+        while (n.keys.Count > mid) {
+            n.keys.RemoveAt(n.keys.Count - 1);
+            n.vals.RemoveAt(n.vals.Count - 1);
+        }
+        int rightId = this.pager.AllocPage();
+        right.next = n.next;
+        n.next = rightId;
+        WriteNode(pid, n);
+        WriteNode(rightId, right);
+        InsertUp(path, pathIdx, right.keys[0], rightId);
+    }
+
+    /// <summary>Propagates a split upward: separator key + new right child.</summary>
+    void InsertUp(List<int> path, List<int> pathIdx, string sep, int rightId) {
+        string curSep = sep;
+        int curRight = rightId;
+        int level = path.Count - 1;
+        while (level >= 0) {
+            int pid = path[level];
+            int ci = pathIdx[level];
+            BNode n = ReadNode(pid);
+            BTree.InsStr(n.keys, ci, curSep);
+            BTree.InsInt(n.children, ci + 1, curRight);
+            if (BTree.EncodedSize(n) <= 4096) {
+                WriteNode(pid, n);
+                return;
+            }
+            // Split internal: middle key moves up.
+            int mid = n.keys.Count / 2;
+            string upKey = n.keys[mid];
+            BNode right = BNode.Internal();
+            int k = mid + 1;
+            while (k < n.keys.Count) {
+                right.keys.Add(n.keys[k]);
+                k = k + 1;
+            }
+            k = mid + 1;
+            while (k < n.children.Count) {
+                right.children.Add(n.children[k]);
+                k = k + 1;
+            }
+            while (n.keys.Count > mid) {
+                n.keys.RemoveAt(n.keys.Count - 1);
+            }
+            while (n.children.Count > mid + 1) {
+                n.children.RemoveAt(n.children.Count - 1);
+            }
+            int newRightId = this.pager.AllocPage();
+            WriteNode(pid, n);
+            WriteNode(newRightId, right);
+            curSep = upKey;
+            curRight = newRightId;
+            level = level - 1;
+        }
+        // Root split: grow the tree by one level.
+        BNode newRoot = BNode.Internal();
+        newRoot.children.Add(this.rootId);
+        newRoot.keys.Add(curSep);
+        newRoot.children.Add(curRight);
+        int newRootId = this.pager.AllocPage();
+        WriteNode(newRootId, newRoot);
+        this.rootId = newRootId;
+        WriteMeta();
+    }
+
+    // ===== Delete =====
+
+    /// <summary>Removes a key. Returns true when it existed. Empty leaves are
+    /// left in place and reclaimed by future compaction (no merge yet).</summary>
+    bool Delete(string key) {
+        int pid = this.rootId;
+        BNode n = ReadNode(pid);
+        while (!n.leaf) {
+            pid = n.children[BTree.ChildIndex(n, key)];
+            n = ReadNode(pid);
+        }
+        int pos = BTree.LeafFind(n, key);
+        if (pos < 0) { return false; }
+        n.keys.RemoveAt(pos);
+        n.vals.RemoveAt(pos);
+        WriteNode(pid, n);
+        return true;
+    }
+
+    // ===== Range scan =====
+
+    /// <summary>Collects up to limit entries with startKey <= key <= endKey
+    /// (endKey "" = unbounded) into outKeys/outVals via leaf sibling links.</summary>
+    int Scan(string startKey, string endKey, int limit,
+            List<string> outKeys, List<string> outVals) {
+        int pid = this.rootId;
+        BNode n = ReadNode(pid);
+        while (!n.leaf) {
+            pid = n.children[BTree.ChildIndex(n, startKey)];
+            n = ReadNode(pid);
+        }
+        int found = 0;
+        while (true) {
+            int i = 0;
+            while (i < n.keys.Count) {
+                if (BTree.Compare(n.keys[i], startKey) >= 0) {
+                    if (endKey.Length > 0 && BTree.Compare(n.keys[i], endKey) > 0) {
+                        return found;
+                    }
+                    outKeys.Add(n.keys[i]);
+                    outVals.Add(n.vals[i]);
+                    found = found + 1;
+                    if (limit > 0 && found >= limit) { return found; }
+                }
+                i = i + 1;
+            }
+            if (n.next == 0) { return found; }
+            n = ReadNode(n.next);
+        }
+        return found;
+    }
+
+    /// <summary>Total number of keys (full scan; diagnostics).</summary>
+    int Count() {
+        List<string> ks = new List<string>();
+        List<string> vs = new List<string>();
+        return Scan("", "", 0, ks, vs);
+    }
+}
