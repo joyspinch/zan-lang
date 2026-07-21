@@ -565,7 +565,9 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/layout_test.zan
       # Types.zan is pulled in automatically by 'using Gui;' (auto-stdlib), so
       # only the non-auto-included Stack.zan is passed explicitly here.
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan"
+      # --driver-dir: link the freshly built zan_gui, not the committed
+      # driver bundle (which may lag behind newly added native exports).
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -574,7 +576,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/text_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan;--driver-dir;$<TARGET_FILE_DIR:zan_gui>"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
