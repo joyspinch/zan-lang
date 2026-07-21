@@ -1,0 +1,132 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+using System.Threading;
+
+// ZanDB P0 groundwork: ByteBuffer binary round-trips, PageFile random access
+// with durability sync, and AsyncRwLock reader/writer coordination.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+    static int events = 0;
+    static int maxConcurrentReaders = 0;
+    static int activeReaders = 0;
+    static bool writerActive = false;
+    static bool overlapViolation = false;
+    static int finished = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static AsyncRwLock rw;
+
+    static async void Reader(int id) {
+        await rw.EnterRead();
+        if (writerActive) { overlapViolation = true; }
+        activeReaders = activeReaders + 1;
+        if (activeReaders > maxConcurrentReaders) { maxConcurrentReaders = activeReaders; }
+        await Task.Delay(10);
+        activeReaders = activeReaders - 1;
+        rw.ExitRead();
+        finished = finished + 1;
+    }
+
+    static async void Writer(int id) {
+        await rw.EnterWrite();
+        if (activeReaders > 0 || writerActive) { overlapViolation = true; }
+        writerActive = true;
+        await Task.Delay(10);
+        writerActive = false;
+        rw.ExitWrite();
+        finished = finished + 1;
+    }
+
+    static async int Run() {
+        // 1. ByteBuffer primitive round-trips.
+        ByteBuffer b = ByteBuffer.Alloc(8);   // small: forces growth
+        b.WriteU8(200).WriteU16(65535).WriteU32(4000000000).WriteU64(123456789012345);
+        b.WriteVarInt(0).WriteVarInt(127).WriteVarInt(128).WriteVarInt(300000);
+        b.WriteString("héllo 世界");
+        b.SeekRead(0);
+        Check("u8", b.ReadU8() == 200);
+        Check("u16", b.ReadU16() == 65535);
+        Check("u32", b.ReadU32() == 4000000000);
+        Check("u64", b.ReadU64() == 123456789012345);
+        Check("var0", b.ReadVarInt() == 0);
+        Check("var127", b.ReadVarInt() == 127);
+        Check("var128", b.ReadVarInt() == 128);
+        Check("var300k", b.ReadVarInt() == 300000);
+        Check("string", b.ReadString() == "héllo 世界");
+        Check("consumed", b.Remaining() == 0);
+
+        // CRC32 of "123456789" must be the standard check value 0xCBF43926.
+        ByteBuffer c = ByteBuffer.Alloc(16);
+        c.WriteBytes("123456789", 9);
+        Check("crc32", c.Crc32(9) == 3421780262);
+        c.Free();
+
+        // 2. PageFile random-access IO.
+        string path = "zandb_p0.tmp.db";
+        File.Delete(path);
+        PageFile f = PageFile.Open(path);
+        Check("open", f.IsOpen());
+
+        ByteBuffer page = ByteBuffer.Alloc(4096);
+        page.WriteU32(305419896).WriteString("page-zero");
+        int w0 = f.WriteAt(0, page.Raw(), 4096);
+        ByteBuffer p2 = ByteBuffer.Alloc(4096);
+        p2.WriteU32(2271560481).WriteString("page-one");
+        int w1 = f.WriteAt(4096, p2.Raw(), 4096);
+        Check("write-pages", w0 == 4096 && w1 == 4096);
+        Check("sync", f.Sync());
+        Check("size", f.Size() == 8192);
+
+        ByteBuffer rd = ByteBuffer.Alloc(4096);
+        int n = f.ReadAt(4096, rd, 4096);
+        rd.SeekRead(0);
+        Check("read-back", n == 4096 && rd.ReadU32() == 2271560481 && rd.ReadString() == "page-one");
+
+        // Overwrite page 0 in place and re-read.
+        page.Clear();
+        page.WriteU32(1122867).WriteString("rewritten");
+        f.WriteAt(0, page.Raw(), 4096);
+        f.ReadAt(0, rd, 4096);
+        rd.SeekRead(0);
+        Check("overwrite", rd.ReadU32() == 1122867 && rd.ReadString() == "rewritten");
+
+        int appendOff = f.Append(page.Raw(), 4096);
+        Check("append", appendOff == 8192 && f.Size() == 12288);
+
+        f.Close();
+        b.Free();
+        page.Free();
+        p2.Free();
+        rd.Free();
+        File.Delete(path);
+
+        // 3. AsyncRwLock: readers overlap each other, writers exclude everyone.
+        rw = AsyncRwLock.Create();
+        Task.Spawn(Reader(0));
+        Task.Spawn(Reader(1));
+        Task.Spawn(Reader(2));
+        Task.Spawn(Writer(0));
+        Task.Spawn(Reader(3));
+        Task.Spawn(Writer(1));
+        while (finished < 6) {
+            await Task.Delay(5);
+        }
+        Check("rw-no-overlap", !overlapViolation);
+        Check("rw-readers-concurrent", maxConcurrentReaders >= 2);
+        rw.Close();
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}

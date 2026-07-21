@@ -1,0 +1,286 @@
+using System;
+
+namespace System.IO;
+
+/// <summary>
+/// Growable binary buffer with explicit length tracking and little-endian
+/// primitive encoding. The backing store is a raw C allocation, so the
+/// contents may include NUL bytes (unlike text strings) and the buffer can be
+/// handed directly to FFI calls via <see cref="Raw"/>.
+///
+/// Writing appends at the write position; reading consumes from an
+/// independent read position:
+///   ByteBuffer b = ByteBuffer.Alloc(64);
+///   b.WriteU32(1234).WriteVarInt(5).WriteString("hello");
+///   b.SeekRead(0);
+///   int v = b.ReadU32();
+/// Call <see cref="Free"/> when done.
+/// </summary>
+class ByteBuffer {
+    string data;
+    int capacity;
+    int length;      // bytes written (high-water mark)
+    int rpos;        // read cursor
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    [DllImport("crt")]
+    static extern int memcpy(string dst, string src, int n);
+
+    ByteBuffer() {
+        this.data = "";
+        this.capacity = 0;
+        this.length = 0;
+        this.rpos = 0;
+    }
+
+    /// <summary>Allocates a buffer with the given initial capacity.</summary>
+    static ByteBuffer Alloc(int initialCapacity) {
+        ByteBuffer b = new ByteBuffer();
+        int cap = initialCapacity;
+        if (cap < 16) { cap = 16; }
+        b.data = calloc(cap, 1);
+        b.capacity = cap;
+        return b;
+    }
+
+    /// <summary>Wraps count bytes copied out of an existing raw block.</summary>
+    static ByteBuffer FromRaw(string src, int count) {
+        ByteBuffer b = ByteBuffer.Alloc(count);
+        memcpy(b.data, src, count);
+        b.length = count;
+        return b;
+    }
+
+    /// <summary>Releases the backing allocation.</summary>
+    void Free() {
+        if (this.capacity > 0) {
+            free(this.data);
+            this.data = "";
+            this.capacity = 0;
+            this.length = 0;
+            this.rpos = 0;
+        }
+    }
+
+    /// <summary>Bytes written so far.</summary>
+    int Length() { return this.length; }
+
+    /// <summary>Current read position.</summary>
+    int ReadPos() { return this.rpos; }
+
+    /// <summary>Remaining unread bytes.</summary>
+    int Remaining() { return this.length - this.rpos; }
+
+    /// <summary>Raw backing pointer for FFI calls (valid until Free/growth).</summary>
+    string Raw() { return this.data; }
+
+    /// <summary>Moves the read cursor.</summary>
+    ByteBuffer SeekRead(int pos) {
+        this.rpos = pos;
+        return this;
+    }
+
+    /// <summary>Resets write and read positions, keeping the allocation.</summary>
+    ByteBuffer Clear() {
+        this.length = 0;
+        this.rpos = 0;
+        return this;
+    }
+
+    /// <summary>Grows the allocation so at least cap bytes fit.</summary>
+    ByteBuffer EnsureCapacity(int cap) {
+        if (cap > this.capacity) {
+            int c = this.capacity * 2;
+            while (c < cap) { c = c * 2; }
+            string grown = calloc(c, 1);
+            memcpy(grown, this.data, this.length);
+            free(this.data);
+            this.data = grown;
+            this.capacity = c;
+        }
+        return this;
+    }
+
+    /// <summary>Sets the logical length after external code (e.g. an FFI read)
+    /// filled the backing store directly. Must not exceed capacity.</summary>
+    ByteBuffer SetLength(int n) {
+        if (n >= 0 && n <= this.capacity) { this.length = n; }
+        return this;
+    }
+
+    void EnsureRoom(int extra) {
+        int need = this.length + extra;
+        if (need <= this.capacity) { return; }
+        int cap = this.capacity * 2;
+        while (cap < need) { cap = cap * 2; }
+        string grown = calloc(cap, 1);
+        memcpy(grown, this.data, this.length);
+        free(this.data);
+        this.data = grown;
+        this.capacity = cap;
+    }
+
+    // ===== Writers (little-endian) =====
+
+    ByteBuffer WriteU8(int v) {
+        EnsureRoom(1);
+        this.data[this.length] = v & 255;
+        this.length = this.length + 1;
+        return this;
+    }
+
+    ByteBuffer WriteU16(int v) {
+        EnsureRoom(2);
+        this.data[this.length] = v & 255;
+        this.data[this.length + 1] = (v >> 8) & 255;
+        this.length = this.length + 2;
+        return this;
+    }
+
+    ByteBuffer WriteU32(int v) {
+        EnsureRoom(4);
+        int p = this.length;
+        this.data[p] = v & 255;
+        this.data[p + 1] = (v >> 8) & 255;
+        this.data[p + 2] = (v >> 16) & 255;
+        this.data[p + 3] = (v >> 24) & 255;
+        this.length = p + 4;
+        return this;
+    }
+
+    ByteBuffer WriteU64(int v) {
+        EnsureRoom(8);
+        int p = this.length;
+        this.data[p] = v & 255;
+        this.data[p + 1] = (v >> 8) & 255;
+        this.data[p + 2] = (v >> 16) & 255;
+        this.data[p + 3] = (v >> 24) & 255;
+        this.data[p + 4] = (v >> 32) & 255;
+        this.data[p + 5] = (v >> 40) & 255;
+        this.data[p + 6] = (v >> 48) & 255;
+        this.data[p + 7] = (v >> 56) & 255;
+        this.length = p + 8;
+        return this;
+    }
+
+    /// <summary>Unsigned LEB128 variable-length integer (1 byte for 0-127).</summary>
+    ByteBuffer WriteVarInt(int v) {
+        int x = v;
+        while ((x & -128) != 0) {
+            WriteU8((x & 127) | 128);
+            x = (x >> 7) & 144115188075855871;   // logical shift: clear sign bits
+        }
+        WriteU8(x & 127);
+        return this;
+    }
+
+    /// <summary>Copies count bytes from a raw block / another buffer's Raw().</summary>
+    ByteBuffer WriteBytes(string src, int count) {
+        EnsureRoom(count);
+        int i = 0;
+        while (i < count) {
+            this.data[this.length + i] = src[i] & 255;
+            i = i + 1;
+        }
+        this.length = this.length + count;
+        return this;
+    }
+
+    /// <summary>Writes a length-prefixed (varint) UTF-8 string.</summary>
+    ByteBuffer WriteString(string s) {
+        WriteVarInt(s.Length);
+        WriteBytes(s, s.Length);
+        return this;
+    }
+
+    // ===== Readers (little-endian) =====
+
+    int ReadU8() {
+        int v = this.data[this.rpos] & 255;
+        this.rpos = this.rpos + 1;
+        return v;
+    }
+
+    int ReadU16() {
+        int p = this.rpos;
+        this.rpos = p + 2;
+        return (this.data[p] & 255) + ((this.data[p + 1] & 255) << 8);
+    }
+
+    int ReadU32() {
+        int p = this.rpos;
+        this.rpos = p + 4;
+        return (this.data[p] & 255) + ((this.data[p + 1] & 255) << 8)
+            + ((this.data[p + 2] & 255) << 16) + ((this.data[p + 3] & 255) << 24);
+    }
+
+    int ReadU64() {
+        int p = this.rpos;
+        this.rpos = p + 8;
+        int v = this.data[p] & 255;
+        v = v + ((this.data[p + 1] & 255) << 8);
+        v = v + ((this.data[p + 2] & 255) << 16);
+        v = v + ((this.data[p + 3] & 255) << 24);
+        v = v + ((this.data[p + 4] & 255) << 32);
+        v = v + ((this.data[p + 5] & 255) << 40);
+        v = v + ((this.data[p + 6] & 255) << 48);
+        v = v + ((this.data[p + 7] & 255) << 56);
+        return v;
+    }
+
+    int ReadVarInt() {
+        int result = 0;
+        int shift = 0;
+        int b = ReadU8();
+        while ((b & 128) != 0) {
+            result = result + ((b & 127) << shift);
+            shift = shift + 7;
+            b = ReadU8();
+        }
+        return result + ((b & 127) << shift);
+    }
+
+    /// <summary>Reads count bytes into a freshly allocated raw block
+    /// (caller frees with the CRT allocator or wraps in a ByteBuffer).</summary>
+    string ReadBytes(int count) {
+        string buf = calloc(count + 1, 1);
+        int i = 0;
+        while (i < count) {
+            buf[i] = this.data[this.rpos + i] & 255;
+            i = i + 1;
+        }
+        this.rpos = this.rpos + count;
+        return buf;
+    }
+
+    /// <summary>Reads a length-prefixed string written by WriteString.</summary>
+    string ReadString() {
+        int n = ReadVarInt();
+        return ReadBytes(n);
+    }
+
+    // ===== Checksums =====
+
+    /// <summary>CRC32 (IEEE, reflected) over the first count bytes.</summary>
+    int Crc32(int count) {
+        int crc = 4294967295;   // 0xFFFFFFFF
+        int i = 0;
+        while (i < count) {
+            crc = crc ^ (this.data[i] & 255);
+            int k = 0;
+            while (k < 8) {
+                int lsb = crc & 1;
+                crc = (crc >> 1) & 2147483647;
+                if (lsb != 0) { crc = crc ^ 3988292384; }   // 0xEDB88320
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        return (crc ^ 4294967295) & 4294967295;
+    }
+}

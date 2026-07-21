@@ -1,0 +1,153 @@
+using System;
+using System.IO;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// Random-access page-granular file used by the ZanDB storage engine.
+/// Unlike System.IO.File (whole-file text helpers), PageFile reads and writes
+/// arbitrary byte ranges at 64-bit offsets and can force data to stable
+/// storage (fsync) for durability.
+///
+///   PageFile f = PageFile.Open("data.zdb");
+///   ByteBuffer page = ByteBuffer.Alloc(4096);
+///   f.ReadAt(0, page, 4096);
+///   f.WriteAt(4096, page.Raw(), page.Length());
+///   f.Sync();
+///   f.Close();
+/// </summary>
+class PageFile {
+    int fp;
+    string path;
+    string lastError;
+
+    [DllImport("crt")]
+    static extern int fopen(string path, string mode);
+
+    [DllImport("crt")]
+    static extern int fclose(int fp);
+
+    [DllImport("crt")]
+    static extern int fread(string buf, int size, int count, int fp);
+
+    [DllImport("crt")]
+    static extern int fwrite(string buf, int size, int count, int fp);
+
+    [DllImport("crt")]
+    static extern int fflush(int fp);
+
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "_fseeki64")]
+    static extern int Seek64(int fp, int offset, int origin);
+
+    [DllImport("crt", EntryPoint = "_ftelli64")]
+    static extern int Tell64(int fp);
+
+    [DllImport("crt", EntryPoint = "_fileno")]
+    static extern int FileNo(int fp);
+
+    [DllImport("crt", EntryPoint = "_commit")]
+    static extern int SyncFd(int fd);
+    #else
+    [DllImport("crt", EntryPoint = "fseeko")]
+    static extern int Seek64(int fp, int offset, int origin);
+
+    [DllImport("crt", EntryPoint = "ftello")]
+    static extern int Tell64(int fp);
+
+    [DllImport("crt", EntryPoint = "fileno")]
+    static extern int FileNo(int fp);
+
+    [DllImport("crt", EntryPoint = "fsync")]
+    static extern int SyncFd(int fd);
+    #endif
+
+    PageFile() {
+        this.fp = 0;
+        this.path = "";
+        this.lastError = "";
+    }
+
+    /// <summary>Opens (or creates) a file for random read/write access.</summary>
+    static PageFile Open(string path) {
+        PageFile f = new PageFile();
+        f.path = path;
+        f.fp = fopen(path, "r+b");
+        if (f.fp == 0) {
+            f.fp = fopen(path, "w+b");
+        }
+        if (f.fp == 0) {
+            f.lastError = "cannot open " + path;
+        }
+        return f;
+    }
+
+    bool IsOpen() { return this.fp != 0; }
+
+    string GetError() { return this.lastError; }
+
+    /// <summary>Reads count bytes at offset into buf (cleared first).
+    /// Returns the number of bytes actually read.</summary>
+    int ReadAt(int offset, ByteBuffer buf, int count) {
+        if (this.fp == 0) { return -1; }
+        buf.Clear();
+        buf.EnsureCapacity(count);
+        if (Seek64(this.fp, offset, 0) != 0) {
+            this.lastError = "seek failed";
+            return -1;
+        }
+        int n = fread(buf.Raw(), 1, count, this.fp);
+        buf.SetLength(n);
+        return n;
+    }
+
+    /// <summary>Writes count bytes from a raw block at offset.
+    /// Returns bytes written.</summary>
+    int WriteAt(int offset, string raw, int count) {
+        if (this.fp == 0) { return -1; }
+        if (Seek64(this.fp, offset, 0) != 0) {
+            this.lastError = "seek failed";
+            return -1;
+        }
+        int n = fwrite(raw, 1, count, this.fp);
+        return n;
+    }
+
+    /// <summary>Appends count bytes at end of file; returns the offset the
+    /// data landed at, or -1 on error.</summary>
+    int Append(string raw, int count) {
+        if (this.fp == 0) { return -1; }
+        if (Seek64(this.fp, 0, 2) != 0) { return -1; }
+        int off = Tell64(this.fp);
+        int n = fwrite(raw, 1, count, this.fp);
+        if (n != count) { return -1; }
+        return off;
+    }
+
+    /// <summary>Current file size in bytes.</summary>
+    int Size() {
+        if (this.fp == 0) { return -1; }
+        Seek64(this.fp, 0, 2);
+        return Tell64(this.fp);
+    }
+
+    /// <summary>Flushes stdio buffers to the OS.</summary>
+    void Flush() {
+        if (this.fp != 0) { fflush(this.fp); }
+    }
+
+    /// <summary>Forces buffered data to stable storage (fflush + fsync).
+    /// Returns true on success.</summary>
+    bool Sync() {
+        if (this.fp == 0) { return false; }
+        fflush(this.fp);
+        return SyncFd(FileNo(this.fp)) == 0;
+    }
+
+    void Close() {
+        if (this.fp != 0) {
+            fclose(this.fp);
+            this.fp = 0;
+        }
+    }
+}

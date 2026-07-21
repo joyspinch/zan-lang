@@ -1,0 +1,82 @@
+using System;
+
+namespace System.Threading;
+
+/// <summary>
+/// Coroutine reader/writer lock: many concurrent readers or one exclusive
+/// writer. Waiters genuinely suspend on the scheduler (via AsyncGate) --
+/// no polling. Writers get priority: once a writer is queued, new readers
+/// wait, so a steady read stream cannot starve writes.
+///
+///   AsyncRwLock lock = AsyncRwLock.Create();
+///   await lock.EnterRead();  ...  lock.ExitRead();
+///   await lock.EnterWrite(); ...  lock.ExitWrite();
+/// </summary>
+class AsyncRwLock {
+    int readers;
+    bool writer;
+    int writersWaiting;
+    AsyncGate readGate;
+    AsyncGate writeGate;
+
+    AsyncRwLock() {
+        this.readers = 0;
+        this.writer = false;
+        this.writersWaiting = 0;
+        this.readGate = AsyncGate.Create();
+        this.writeGate = AsyncGate.Create();
+    }
+
+    static AsyncRwLock Create() {
+        return new AsyncRwLock();
+    }
+
+    /// <summary>Acquires shared (read) access; suspends while a writer holds
+    /// or is waiting for the lock.</summary>
+    async void EnterRead() {
+        while (this.writer || this.writersWaiting > 0) {
+            await this.readGate.Wait();
+        }
+        this.readers = this.readers + 1;
+        // Cascade the wakeup so all queued readers get in.
+        this.readGate.Signal();
+    }
+
+    /// <summary>Releases shared access.</summary>
+    void ExitRead() {
+        this.readers = this.readers - 1;
+        if (this.readers == 0) {
+            this.writeGate.Signal();
+        }
+    }
+
+    /// <summary>Acquires exclusive (write) access; suspends until all readers
+    /// and any current writer have released.</summary>
+    async void EnterWrite() {
+        this.writersWaiting = this.writersWaiting + 1;
+        while (this.writer || this.readers > 0) {
+            await this.writeGate.Wait();
+        }
+        this.writersWaiting = this.writersWaiting - 1;
+        this.writer = true;
+    }
+
+    /// <summary>Releases exclusive access, waking a queued writer first,
+    /// then any queued readers.</summary>
+    void ExitWrite() {
+        this.writer = false;
+        this.writeGate.Signal();
+        this.readGate.Signal();
+    }
+
+    /// <summary>Current reader count (diagnostics).</summary>
+    int ReaderCount() { return this.readers; }
+
+    /// <summary>Whether a writer currently holds the lock (diagnostics).</summary>
+    bool IsWriteLocked() { return this.writer; }
+
+    void Close() {
+        this.readGate.Close();
+        this.writeGate.Close();
+    }
+}
