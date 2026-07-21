@@ -21,6 +21,9 @@ namespace Game.Scene;
 class SceneDesigner {
     // 0 = English, 1 = Chinese; the IDE sets this from its UI language.
     static int lang;
+    // The project's assets directory; the IDE sets this so the inspector's
+    // resource pickers can browse bundled files. "" = no project open.
+    static string assetsDir;
 
     SceneDoc doc;
     SceneElement sel;
@@ -48,6 +51,7 @@ class SceneDesigner {
     List<string> undoStack;  // document JSON snapshots (undo history)
     List<string> redoStack;
     string clipJson;     // copied element (single-element scene JSON)
+    int resPick;         // resource picker popup: 0 closed, 1 image, 2 background
     bool ctxOpen;        // canvas right-click context menu
     int ctxX;
     int ctxY;
@@ -96,6 +100,7 @@ class SceneDesigner {
         d.undoStack = new List<string>();
         d.redoStack = new List<string>();
         d.clipJson = "";
+        d.resPick = 0;
         d.ctxOpen = false;
         d.ctxX = 0;
         d.ctxY = 0;
@@ -592,75 +597,209 @@ class SceneDesigner {
         }
 
         this.RenderContextMenu(app, c, t);
+        this.RenderResPicker(app, c, t, x, y, w, h);
+    }
+
+    static string AsciiLower(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int j = 0;
+            bool done = false;
+            while (j < 26 && !done) {
+                if (ch == up.Substring(j, 1)) { ch = lo.Substring(j, 1); done = true; }
+                j = j + 1;
+            }
+            outp = outp + ch;
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    static bool EndsWith(string s, string suf) {
+        if (s.Length < suf.Length) { return false; }
+        return s.Substring(s.Length - suf.Length, suf.Length) == suf;
+    }
+
+    static bool IsImageFile(string nm) {
+        string lo = SceneDesigner.AsciiLower(nm);
+        return SceneDesigner.EndsWith(lo, ".png") || SceneDesigner.EndsWith(lo, ".jpg")
+            || SceneDesigner.EndsWith(lo, ".jpeg") || SceneDesigner.EndsWith(lo, ".bmp")
+            || SceneDesigner.EndsWith(lo, ".gif") || SceneDesigner.EndsWith(lo, ".tga");
+    }
+
+    // Centred popup listing the project's bundled image resources; picking
+    // one fills the image / background input (typing a path stays possible).
+    void RenderResPicker(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        if (this.resPick == 0) { return; }
+        List<string> files = new List<string>();
+        if (SceneDesigner.assetsDir.Length > 0 && Directory.Exists(SceneDesigner.assetsDir)) {
+            List<string> all = Directory.GetFiles(SceneDesigner.assetsDir);
+            int fi = 0;
+            while (fi < all.Count) {
+                string nm = Path.GetFileName(all[fi]);
+                if (SceneDesigner.IsImageFile(nm)) { files.Add(nm); }
+                fi = fi + 1;
+            }
+        }
+        int mW = app.Scale(300);
+        int rowH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(12);
+        int rows = files.Count;
+        if (rows > 10) { rows = 10; }
+        int mH = app.Scale(40) + rowH;  // header + clear row
+        mH = mH + rows * rowH + app.Scale(10);
+        if (files.Count == 0) { mH = mH + rowH; }
+        int mx = x + (w - mW) / 2;
+        int my = y + (h - mH) / 2;
+        c.FillRoundRect(mx + 1, my + 2, mW, mH, app.Scale(6), t.shadowColor);
+        c.FillRoundRect(mx, my, mW, mH, app.Scale(6), t.bgSecondary);
+        c.DrawRect(mx, my, mW, mH, t.borderPrimary, 1);
+        string title = SceneDesigner.T("Pick a resource (assets/)", "选择资源（assets/）");
+        if (this.resPick == 2) {
+            title = SceneDesigner.T("Pick a background (assets/)", "选择背景（assets/）");
+        }
+        c.DrawText(mx + app.Scale(10), my + app.Scale(8), title, t.textSecondary, t.fontSizeSmall);
+        int ek = app.window.EventKind();
+        int iy = my + app.Scale(32);
+        bool inside = SceneDesigner.InRect(app.mouseX, app.mouseY, mx, my, mW, mH);
+        // "(none)" clears the field.
+        bool overClr = SceneDesigner.InRect(app.mouseX, app.mouseY, mx, iy, mW, rowH);
+        if (overClr) { c.FillRect(mx + 2, iy, mW - 4, rowH, t.bgTertiary); }
+        c.DrawText(mx + app.Scale(12), iy + app.Scale(5),
+            SceneDesigner.T("(none)", "（无）"), t.textTertiary, t.fontSizeSmall);
+        if (overClr && ek == 3) {
+            if (this.resPick == 1) { this.imgIn.SetText(""); }
+            else { this.bgIn.SetText(""); }
+            this.resPick = 0;
+        }
+        iy = iy + rowH;
+        if (files.Count == 0) {
+            c.DrawText(mx + app.Scale(12), iy + app.Scale(5),
+                SceneDesigner.T("no image resources; add files via Project Config",
+                    "暂无图片资源，可在项目配置中添加"),
+                t.textTertiary, t.fontSizeTiny);
+        }
+        int i = 0;
+        while (i < rows) {
+            bool over = SceneDesigner.InRect(app.mouseX, app.mouseY, mx, iy, mW, rowH);
+            if (over) { c.FillRect(mx + 2, iy, mW - 4, rowH, t.bgTertiary); }
+            c.DrawText(mx + app.Scale(12), iy + app.Scale(5), files[i], t.textPrimary, t.fontSizeSmall);
+            if (over && ek == 3) {
+                if (this.resPick == 1) { this.imgIn.SetText(files[i]); }
+                else { this.bgIn.SetText(files[i]); }
+                this.resPick = 0;
+            }
+            iy = iy + rowH;
+            i = i + 1;
+        }
+        if (files.Count > rows) {
+            c.DrawText(mx + app.Scale(12), iy + app.Scale(2),
+                "+" + SceneDoc.IntStr(files.Count - rows), t.textTertiary, t.fontSizeTiny);
+        }
+        // Click outside closes the popup; swallow the event either way.
+        if (ek == 2 && !inside) { this.resPick = 0; }
+        app.RequestRedraw();
     }
 
     // Quick-layout toolbar pinned above the canvas: align / centre /
     // equalize buttons acting on the multi-selection.
-    void RenderLayoutBar(App app, Canvas c, Theme t, int x, int y, int w, int h) {
-        int bx = x;
+    // One ribbon group: renders `items` as small buttons, a caption under
+    // them and a trailing separator; returns the x after the group. Clicks
+    // are reported through this.barClickGroup / barClickIndex.
+    int barClickGroup;
+    int barClickIndex;
+    int RibbonGroup(App app, Canvas c, Theme t, int bx, int y, int h,
+            string caption, List<string> items, int group) {
+        int gx = bx;
         int by = y;
-        List<string> alys = new List<string>();
-        alys.Add(SceneDesigner.T("Left", "左对齐"));
-        alys.Add(SceneDesigner.T("Right", "右对齐"));
-        alys.Add(SceneDesigner.T("Top", "顶对齐"));
-        alys.Add(SceneDesigner.T("Bottom", "底对齐"));
-        alys.Add(SceneDesigner.T("H-Ctr", "水平居中"));
-        alys.Add(SceneDesigner.T("V-Ctr", "垂直居中"));
-        alys.Add(SceneDesigner.T("Same W", "等宽"));
-        alys.Add(SceneDesigner.T("Same H", "等高"));
-        int ai = 0;
-        while (ai < alys.Count) {
-            int bw = Canvas.MeasureText(alys[ai], t.fontSizeSmall) + app.Scale(14);
-            int aid = Button.Create(alys[ai]).SetSize(1).Render(app, bx, by, bw);
-            if (Button.WasClicked(app, aid)) { this.AlignSel(ai); app.RequestRedraw(); }
+        int i = 0;
+        while (i < items.Count) {
+            int bw = Canvas.MeasureText(items[i], t.fontSizeSmall) + app.Scale(14);
+            int id = Button.Create(items[i]).SetSize(1).Render(app, bx, by, bw);
+            if (Button.WasClicked(app, id)) {
+                this.barClickGroup = group;
+                this.barClickIndex = i;
+            }
             bx = bx + bw + app.Scale(4);
-            ai = ai + 1;
+            i = i + 1;
         }
-
-        // Element quick actions fill the rest of the bar (same commands as
-        // the right-click menu, one click away).
-        bx = bx + app.Scale(6);
+        // Group caption centred under the buttons.
+        int cw2 = Canvas.MeasureText(caption, t.fontSizeTiny);
+        c.DrawText(gx + (bx - app.Scale(4) - gx - cw2) / 2,
+            y + t.heightSmall + app.Scale(3), caption, t.textTertiary, t.fontSizeTiny);
+        // Separator between groups.
+        bx = bx + app.Scale(4);
         c.FillRect(bx, y + app.Scale(2), 1, h - app.Scale(4), t.borderPrimary);
-        bx = bx + app.Scale(7);
-        List<string> acts = new List<string>();
-        acts.Add(SceneDesigner.T("Duplicate", "复制"));
-        acts.Add(SceneDesigner.T("Delete", "删除"));
-        acts.Add(SceneDesigner.T("Forward", "上移"));
-        acts.Add(SceneDesigner.T("Backward", "下移"));
-        acts.Add(SceneDesigner.T("Front", "置顶"));
-        acts.Add(SceneDesigner.T("Back", "置底"));
+        return bx + app.Scale(8);
+    }
+
+    void RenderLayoutBar(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        this.barClickGroup = 0 - 1;
+        this.barClickIndex = 0 - 1;
+        int bx = x;
+
+        List<string> gAlign = new List<string>();
+        gAlign.Add(SceneDesigner.T("Left", "左"));
+        gAlign.Add(SceneDesigner.T("Right", "右"));
+        gAlign.Add(SceneDesigner.T("Top", "顶"));
+        gAlign.Add(SceneDesigner.T("Bottom", "底"));
+        gAlign.Add(SceneDesigner.T("H-Ctr", "水平中"));
+        gAlign.Add(SceneDesigner.T("V-Ctr", "垂直中"));
+        bx = this.RibbonGroup(app, c, t, bx, y, h,
+            SceneDesigner.T("Align", "对齐"), gAlign, 0);
+
+        List<string> gSize = new List<string>();
+        gSize.Add(SceneDesigner.T("Same W", "等宽"));
+        gSize.Add(SceneDesigner.T("Same H", "等高"));
+        bx = this.RibbonGroup(app, c, t, bx, y, h,
+            SceneDesigner.T("Size", "尺寸"), gSize, 1);
+
+        List<string> gEdit = new List<string>();
+        gEdit.Add(SceneDesigner.T("Duplicate", "复制"));
+        gEdit.Add(SceneDesigner.T("Delete", "删除"));
         if (this.sel != null && this.sel.Locked()) {
-            acts.Add(SceneDesigner.T("Unlock", "解锁"));
+            gEdit.Add(SceneDesigner.T("Unlock", "解锁"));
         } else {
-            acts.Add(SceneDesigner.T("Lock", "锁定"));
+            gEdit.Add(SceneDesigner.T("Lock", "锁定"));
         }
-        int qi = 0;
-        while (qi < acts.Count) {
-            int bw = Canvas.MeasureText(acts[qi], t.fontSizeSmall) + app.Scale(14);
-            int qid = Button.Create(acts[qi]).SetSize(1).Render(app, bx, by, bw);
-            if (Button.WasClicked(app, qid)) {
-                if (this.sel == null) {
-                    this.msg = SceneDesigner.T("select an element first", "请先选中一个元素");
-                } else if (qi == 0) { this.DuplicateSel(); }
-                else if (qi == 1) { this.DeleteSel(); }
-                else if (qi == 2) { this.RaiseSel(1); this.msg = SceneDesigner.T("brought forward", "已上移一层"); }
-                else if (qi == 3) { this.RaiseSel(0 - 1); this.msg = SceneDesigner.T("sent backward", "已下移一层"); }
-                else if (qi == 4) { this.SelToTop(); this.msg = SceneDesigner.T("brought to front", "已置顶"); }
-                else if (qi == 5) { this.SelToBottom(); this.msg = SceneDesigner.T("sent to back", "已置底"); }
+        bx = this.RibbonGroup(app, c, t, bx, y, h,
+            SceneDesigner.T("Edit", "编辑"), gEdit, 2);
+
+        List<string> gZ = new List<string>();
+        gZ.Add(SceneDesigner.T("Forward", "上移"));
+        gZ.Add(SceneDesigner.T("Backward", "下移"));
+        gZ.Add(SceneDesigner.T("Front", "置顶"));
+        gZ.Add(SceneDesigner.T("Back", "置底"));
+        bx = this.RibbonGroup(app, c, t, bx, y, h,
+            SceneDesigner.T("Layer", "层级"), gZ, 3);
+
+        // Dispatch the click recorded by whichever group was hit.
+        if (this.barClickGroup == 0) { this.AlignSel(this.barClickIndex); app.RequestRedraw(); }
+        else if (this.barClickGroup == 1) { this.AlignSel(6 + this.barClickIndex); app.RequestRedraw(); }
+        else if (this.barClickGroup >= 2) {
+            if (this.sel == null) {
+                this.msg = SceneDesigner.T("select an element first", "请先选中一个元素");
+            } else if (this.barClickGroup == 2) {
+                if (this.barClickIndex == 0) { this.DuplicateSel(); }
+                else if (this.barClickIndex == 1) { this.DeleteSel(); }
                 else {
                     this.PushUndo();
                     this.sel.SetLocked(!this.sel.Locked());
-                    if (this.sel.Locked()) {
-                        this.msg = SceneDesigner.T("locked", "已锁定");
-                    } else {
-                        this.msg = SceneDesigner.T("unlocked", "已解锁");
-                    }
+                    if (this.sel.Locked()) { this.msg = SceneDesigner.T("locked", "已锁定"); }
+                    else { this.msg = SceneDesigner.T("unlocked", "已解锁"); }
                 }
-                app.RequestRedraw();
+            } else {
+                if (this.barClickIndex == 0) { this.RaiseSel(1); this.msg = SceneDesigner.T("brought forward", "已上移一层"); }
+                else if (this.barClickIndex == 1) { this.RaiseSel(0 - 1); this.msg = SceneDesigner.T("sent backward", "已下移一层"); }
+                else if (this.barClickIndex == 2) { this.SelToTop(); this.msg = SceneDesigner.T("brought to front", "已置顶"); }
+                else { this.SelToBottom(); this.msg = SceneDesigner.T("sent to back", "已置底"); }
             }
-            bx = bx + bw + app.Scale(4);
-            qi = qi + 1;
+            app.RequestRedraw();
         }
+
         // Selection hint on the right end of the bar.
         int selN = this.selExtra.Count;
         if (this.sel != null) { selN = selN + 1; }
@@ -672,7 +811,7 @@ class SceneDesigner {
         }
         int hw = Canvas.MeasureText(hint, t.fontSizeSmall);
         c.DrawText(x + w - hw - app.Scale(10),
-            y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2, hint,
+            y + (t.heightSmall - Canvas.FontHeight(t.fontSizeSmall)) / 2, hint,
             t.textTertiary, t.fontSizeSmall);
     }
 
@@ -715,7 +854,7 @@ class SceneDesigner {
         if (mx + mW > app.canvas.Width()) { mx = app.canvas.Width() - mW - app.Scale(4); }
         if (my + mH > app.canvas.Height()) { my = app.canvas.Height() - mH - app.Scale(4); }
 
-        c.FillRoundRect(mx + 1, my + 2, mW, mH, app.Scale(6), 40 * 16777216);
+        c.FillRoundRect(mx + 1, my + 2, mW, mH, app.Scale(6), t.shadowColor);
         c.FillRoundRect(mx, my, mW, mH, app.Scale(6), t.bgSecondary);
         c.DrawRect(mx, my, mW, mH, t.borderPrimary, 1);
 
@@ -842,6 +981,16 @@ class SceneDesigner {
         if (this.showTags) { tl = SceneDesigner.T("Tags: on", "标签:开"); }
         int tid = Button.Create(tl).Render(app, ix, iy, bw);
         if (Button.WasClicked(app, tid)) { this.showTags = !this.showTags; app.RequestRedraw(); }
+        // Grid size cycles 4 -> 8 -> 16 -> 32 (design px per cell).
+        string gsl = SceneDesigner.T("Grid ", "网格 ") + SceneDoc.IntStr(this.grid) + "px";
+        int gsid = Button.Create(gsl).Render(app, ix + bw + app.Scale(6), iy, bw);
+        if (Button.WasClicked(app, gsid)) {
+            if (this.grid == 4) { this.grid = 8; }
+            else if (this.grid == 8) { this.grid = 16; }
+            else if (this.grid == 16) { this.grid = 32; }
+            else { this.grid = 4; }
+            app.RequestRedraw();
+        }
     }
 
     // --- canvas (free placement over the design resolution) ------------------
@@ -1017,9 +1166,10 @@ class SceneDesigner {
         if (dh <= 0) { dh = 1; }
         // Ribbon-style small-button toolbar in the strip above the design
         // canvas (this space was previously empty letterboxing).
-        int barH = t.heightSmall + app.Scale(10);
+        int barH = t.heightSmall + Canvas.FontHeight(t.fontSizeTiny) + app.Scale(14);
         this.RenderLayoutBar(app, c, t,
-            x + app.Scale(12), y + app.Scale(8), w - app.Scale(24), t.heightSmall);
+            x + app.Scale(12), y + app.Scale(8), w - app.Scale(24),
+            t.heightSmall + Canvas.FontHeight(t.fontSizeTiny) + app.Scale(4));
 
         int inX = x + app.Scale(12);
         int inY = y + app.Scale(8) + barH;
@@ -1048,19 +1198,23 @@ class SceneDesigner {
                 "bg: " + this.doc.Background(), t.textTertiary, t.fontSizeTiny);
         }
 
-        // Grid overlay.
+        // Grid overlay: one line per grid cell (the snapping unit). When the
+        // preview is zoomed out so far the cells would collapse (< ~6px on
+        // screen), draw every 2nd/4th... line so it stays readable.
         if (this.showGrid && this.grid > 0) {
+            int gstep = this.grid;
+            while (gstep * psMilli / 1000 < app.Scale(6)) { gstep = gstep * 2; }
             int gx = 0;
             while (gx <= dw) {
                 int sx = ox + gx * psMilli / 1000;
                 c.FillRect(sx, oy, 1, ch, t.borderSecondary);
-                gx = gx + this.grid * 8;
+                gx = gx + gstep;
             }
             int gy = 0;
             while (gy <= dh) {
                 int sy = oy + gy * psMilli / 1000;
                 c.FillRect(ox, sy, cw, 1, t.borderSecondary);
-                gy = gy + this.grid * 8;
+                gy = gy + gstep;
             }
         }
 
@@ -1259,15 +1413,21 @@ class SceneDesigner {
             int mDesY = (app.mouseY - oy) * 1000 / psMilli;
             int newLeft = mDesX - this.dragDx;
             int newTop = mDesY - this.dragDy;
-            // Free movement while dragging (grid snap applies on release) so
-            // the element tracks the cursor smoothly; smart guides still snap
-            // to other elements' edges/centres and the canvas centre.
+            // Smart guides (other elements' edges/centres, canvas centre)
+            // win over the grid; otherwise snap live to the grid so elements
+            // line up while dragging instead of only on release.
             int tw2 = this.sel.TotalW();
             int th2 = this.sel.TotalH();
             int snX = this.SnapAxisX(newLeft, tw2);
             if (snX != 0 - 100000) { newLeft = snX; }
+            else if (this.snap && this.grid > 0) {
+                newLeft = (newLeft + this.grid / 2) / this.grid * this.grid;
+            }
             int snY = this.SnapAxisY(newTop, th2);
             if (snY != 0 - 100000) { newTop = snY; }
+            else if (this.snap && this.grid > 0) {
+                newTop = (newTop + this.grid / 2) / this.grid * this.grid;
+            }
             int oldLeft = this.DesignLeft(this.sel);
             int oldTop = this.DesignTop(this.sel);
             this.SetDesignPos(this.sel, newLeft, newTop);
@@ -1633,7 +1793,10 @@ class SceneDesigner {
         iy = iy + rowH;
 
         c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("bg", "背景"), t.textSecondary, t.fontSizeSmall);
-        this.inpIdBg = this.bgIn.Render(app, ix + app.Scale(40), iy, iw - app.Scale(40), app.Scale(28));
+        this.inpIdBg = this.bgIn.Render(app, ix + app.Scale(40), iy,
+            iw - app.Scale(40) - app.Scale(32), app.Scale(28));
+        int bgBr = Button.Create("…").SetSize(1).Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
+        if (Button.WasClicked(app, bgBr)) { this.resPick = 2; app.RequestRedraw(); }
         this.doc.SetBackground(this.bgIn.GetText());
         iy = iy + rowH + app.Scale(6);
 
@@ -1656,7 +1819,10 @@ class SceneDesigner {
         iy = iy + rowH;
 
         c.DrawText(ix, iy + app.Scale(6), SceneDesigner.T("image", "图片"), t.textSecondary, t.fontSizeSmall);
-        this.inpIdImg = this.imgIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
+        this.inpIdImg = this.imgIn.Render(app, ix + app.Scale(52), iy,
+            iw - app.Scale(52) - app.Scale(32), app.Scale(28));
+        int imBr = Button.Create("…").SetSize(1).Render(app, ix + iw - app.Scale(28), iy, app.Scale(28));
+        if (Button.WasClicked(app, imBr)) { this.resPick = 1; app.RequestRedraw(); }
         this.sel.image = this.imgIn.GetText();
         iy = iy + rowH;
 

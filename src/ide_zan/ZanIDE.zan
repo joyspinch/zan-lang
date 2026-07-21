@@ -2196,6 +2196,7 @@ class ZanIDE {
                         loadedScenePath = spath;
                         sceneCache = sceneDesigner.SaveJson();
                     }
+                    SceneDesigner.assetsDir = ZanIDE.AssetsDir(root);
                     sceneDesigner.Render(app, edRect.x, edRect.y, edRect.width, edRect.height);
                     // Persist design changes to the .zscene file.
                     string snewser = sceneDesigner.SaveJson();
@@ -3583,8 +3584,14 @@ class ZanIDE {
                     } else if (cAct == 3) {
                         pathPicker.BeginOpenFile(
                             ZanIDE.ReadLastPickerDirectory(root), "",
-                            ZanIDE.T("Add a static resource", "添加静态资源"));
+                            ZanIDE.T("Add a static resource (copy)", "导入静态资源（复制）"));
                         pathPickerOwner = 3;
+                        app.RequestRedraw();
+                    } else if (cAct == 4) {
+                        pathPicker.BeginOpenFile(
+                            ZanIDE.ReadLastPickerDirectory(root), "",
+                            ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
+                        pathPickerOwner = 5;
                         app.RequestRedraw();
                     }
                 }
@@ -3755,6 +3762,11 @@ class ZanIDE {
                     string nm = Path.GetFileName(picked);
                     File.Copy(picked, ad + "/" + nm);
                     log.Add("> Added resource: assets/" + nm);
+                    Layer.Msg(ZanIDE.T("Resource copied: ", "已复制资源：") + nm, 3);
+                } else if (pathPickerOwner == 5) {
+                    ZanIDE.AddProjLink(root, picked);
+                    log.Add("> Linked resource: " + picked);
+                    Layer.Msg(ZanIDE.T("Resource linked: ", "已链接资源：") + Path.GetFileName(picked), 3);
                 } else if (pathPickerOwner == 4) {
                     string projectRoot = ZanIDE.FindProjectRoot(picked);
                     haveProject = projectRoot != "";
@@ -5141,6 +5153,95 @@ class ZanIDE {
     /// resources (text, images, data files) live.
     static string AssetsDir(string root) { return root + "/assets"; }
 
+    /// Classifies a resource by extension: 0 image, 1 audio, 2 font, 3 data, 4 other.
+    static int ResType(string nm) {
+        string lo = SceneDesigner.AsciiLower(nm);
+        if (ZanIDE.EndsWith(lo, ".png") || ZanIDE.EndsWith(lo, ".jpg")
+            || ZanIDE.EndsWith(lo, ".jpeg") || ZanIDE.EndsWith(lo, ".bmp")
+            || ZanIDE.EndsWith(lo, ".gif") || ZanIDE.EndsWith(lo, ".tga")
+            || ZanIDE.EndsWith(lo, ".ico")) { return 0; }
+        if (ZanIDE.EndsWith(lo, ".wav") || ZanIDE.EndsWith(lo, ".mp3")
+            || ZanIDE.EndsWith(lo, ".ogg") || ZanIDE.EndsWith(lo, ".flac")
+            || ZanIDE.EndsWith(lo, ".mid")) { return 1; }
+        if (ZanIDE.EndsWith(lo, ".ttf") || ZanIDE.EndsWith(lo, ".otf")
+            || ZanIDE.EndsWith(lo, ".fnt")) { return 2; }
+        if (ZanIDE.EndsWith(lo, ".json") || ZanIDE.EndsWith(lo, ".txt")
+            || ZanIDE.EndsWith(lo, ".xml") || ZanIDE.EndsWith(lo, ".csv")
+            || ZanIDE.EndsWith(lo, ".ini") || ZanIDE.EndsWith(lo, ".zscene")) { return 3; }
+        return 4;
+    }
+
+    static string ResTypeLabel(int ty) {
+        if (ty == 0) { return ZanIDE.T("IMG", "图片"); }
+        if (ty == 1) { return ZanIDE.T("AUD", "音频"); }
+        if (ty == 2) { return ZanIDE.T("FONT", "字体"); }
+        if (ty == 3) { return ZanIDE.T("DATA", "数据"); }
+        return ZanIDE.T("MISC", "其它");
+    }
+
+    static int ResTypeColor(Theme t, int ty) {
+        if (ty == 0) { return t.success; }
+        if (ty == 1) { return t.info; }
+        if (ty == 2) { return t.warning; }
+        if (ty == 3) { return t.primary; }
+        return t.textTertiary;
+    }
+
+    /// Linked (referenced-in-place) resources: `link = <path>` lines in zan.proj.
+    static List<string> ProjLinks(string root) {
+        List<string> outp = new List<string>();
+        string proj = root + "/zan.proj";
+        if (!File.Exists(proj)) { return outp; }
+        List<string> ls = CodeEditor.SplitLines(File.ReadAllText(proj));
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = ZanIDE.TrimLeadSpaces(ls[i]);
+            if (tr.Length > 5 && tr.Substring(0, 5) == "link ") {
+                string rest = ZanIDE.TrimLeadSpaces(tr.Substring(5, tr.Length - 5));
+                if (rest.Length > 1 && rest.Substring(0, 1) == "=") {
+                    string val = ZanIDE.TrimLeadSpaces(rest.Substring(1, rest.Length - 1));
+                    int e = val.Length;
+                    while (e > 0) {
+                        string ch = val.Substring(e - 1, 1);
+                        if (ch == " " || ch == "\t" || ch == "\r") { e = e - 1; }
+                        else { break; }
+                    }
+                    if (e > 0) { outp.Add(val.Substring(0, e)); }
+                }
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    static void AddProjLink(string root, string path) {
+        string proj = root + "/zan.proj";
+        string content = "";
+        if (File.Exists(proj)) { content = File.ReadAllText(proj); }
+        if (content.Length > 0 && content.Substring(content.Length - 1, 1) != "\n") {
+            content = content + "\n";
+        }
+        File.WriteAllText(proj, content + "link = " + path + "\n");
+    }
+
+    static void RemoveProjLink(string root, string path) {
+        string proj = root + "/zan.proj";
+        if (!File.Exists(proj)) { return; }
+        List<string> ls = CodeEditor.SplitLines(File.ReadAllText(proj));
+        string outp = "";
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = ZanIDE.TrimLeadSpaces(ls[i]);
+            bool drop = false;
+            if (tr.Length > 5 && tr.Substring(0, 5) == "link ") {
+                if (ZanIDE.ContainsS(tr, path)) { drop = true; }
+            }
+            if (!drop && tr.Length > 0) { outp = outp + ls[i] + "\n"; }
+            i = i + 1;
+        }
+        File.WriteAllText(proj, outp);
+    }
+
     /// Lists bundled static resources (everything in assets/ except the app icon).
     static List<string> ListResources(string root) {
         List<string> outp = new List<string>();
@@ -5201,42 +5302,69 @@ class ZanIDE {
 
         // ---- Static resources ----
         c.DrawText(x + pad, y + app.Scale(142), ZanIDE.T("Static Resources (bundled with your app)", "静态资源（随应用一起打包）"), t.textSecondary, t.fontSizeSmall);
+        // WinForms-style import modes: Copy brings the file into assets/;
+        // Link references it in place (zan.proj `link =`) and copies at publish.
         int addW = app.Scale(110);
         int addX = x + w - pad - addW;
         int addY = y + app.Scale(138);
-        int addId = Button.Primary(ZanIDE.T("Add File...", "添加文件...")).SetSize(1).Render(app, addX, addY, addW);
+        int addId = Button.Primary(ZanIDE.T("Add (copy)...", "导入(复制)...")).SetSize(1).Render(app, addX, addY, addW);
+        int lnkX = addX - app.Scale(8) - addW;
+        int lnkId = Button.Create(ZanIDE.T("Add (link)...", "导入(链接)...")).SetSize(1).Render(app, lnkX, addY, addW);
 
         List<string> res = ZanIDE.ListResources(root);
+        List<string> lnks = ZanIDE.ProjLinks(root);
         int listX = x + pad;
         int listY = y + app.Scale(178);
         int listW = w - pad - pad;
         int rowH = app.Scale(30);
         int maxRows = 8;
         int removeIdx = 0 - 1;
-        int shown = res.Count;
+        int removeLnk = 0 - 1;
+        int total = res.Count + lnks.Count;
+        int shown = total;
         if (shown > maxRows) { shown = maxRows; }
-        if (res.Count == 0) {
+        if (total == 0) {
             c.DrawText(listX + app.Scale(4), listY + app.Scale(6),
-                ZanIDE.T("No resources yet. Click \"Add File...\" to bundle text, images or data.", "暂无资源。点击“添加文件...”可打包文本、图片或数据。"),
+                ZanIDE.T("No resources yet. \"Add (copy)\" bundles a file; \"Add (link)\" references it in place.", "暂无资源。“导入(复制)”把文件拷入项目；“导入(链接)”引用原位置文件。"),
                 t.textSecondary, t.fontSizeSmall);
         }
         int i = 0;
         while (i < shown) {
             int ry = listY + i * rowH;
+            bool isLnk = i >= res.Count;
+            string nm = "";
+            string disp = "";
+            if (isLnk) { nm = Path.GetFileName(lnks[i - res.Count]); disp = lnks[i - res.Count]; }
+            else { nm = res[i]; disp = nm; }
             c.FillRoundRect(listX, ry, listW, rowH - app.Scale(4), app.Scale(4), t.bgSecondary);
-            c.DrawText(listX + app.Scale(10), ry + app.Scale(7), res[i], t.textPrimary, t.fontSizeSmall);
+            // Type chip (image/audio/font/data/other) before the name.
+            int ty = ZanIDE.ResType(nm);
+            string tag = ZanIDE.ResTypeLabel(ty);
+            int tagW = Canvas.MeasureText(tag, t.fontSizeTiny) + app.Scale(10);
+            c.FillRoundRect(listX + app.Scale(6), ry + app.Scale(5), tagW,
+                rowH - app.Scale(14), app.Scale(3), ZanIDE.ResTypeColor(t, ty));
+            c.DrawText(listX + app.Scale(11), ry + app.Scale(7), tag, t.textInverse, t.fontSizeTiny);
+            // Mode chip: copied into assets/ vs linked in place.
+            int mchX = listX + app.Scale(10) + tagW;
+            string mch = ZanIDE.T("copy", "复制");
+            if (isLnk) { mch = ZanIDE.T("link", "链接"); }
+            int mchW = Canvas.MeasureText(mch, t.fontSizeTiny) + app.Scale(10);
+            c.DrawRect(mchX, ry + app.Scale(5), mchW, rowH - app.Scale(14), t.borderPrimary, 1);
+            c.DrawText(mchX + app.Scale(5), ry + app.Scale(7), mch, t.textTertiary, t.fontSizeTiny);
+            c.DrawText(mchX + mchW + app.Scale(8), ry + app.Scale(7), disp, t.textPrimary, t.fontSizeSmall);
             int rmW = app.Scale(64);
             int rmX = listX + listW - app.Scale(8) - rmW;
             int rmY = ry + app.Scale(2);
             int rmId = Button.Create(ZanIDE.T("Remove", "删除")).SetSize(1).SetColor(t.error).Render(app, rmX, rmY, rmW);
             if (Button.WasClicked(app, rmId)) {
-                removeIdx = i;
+                if (isLnk) { removeLnk = i - res.Count; }
+                else { removeIdx = i; }
             }
             i = i + 1;
         }
-        if (res.Count > maxRows) {
+        if (total > maxRows) {
             c.DrawText(listX + app.Scale(4), listY + maxRows * rowH + app.Scale(4),
-                "+ " + Convert.ToString(res.Count - maxRows) + ZanIDE.T(" more in assets/", " 项（在 assets/ 中）"),
+                "+ " + Convert.ToString(total - maxRows) + ZanIDE.T(" more", " 项"),
                 t.textSecondary, t.fontSizeSmall);
         }
 
@@ -5263,9 +5391,15 @@ class ZanIDE {
             app.RequestRedraw();
         } else if (Button.WasClicked(app, addId)) {
             action = 3;
+        } else if (Button.WasClicked(app, lnkId)) {
+            action = 4;
         } else if (removeIdx >= 0 && removeIdx < res.Count) {
             File.Delete(ZanIDE.AssetsDir(root) + "/" + res[removeIdx]);
             log.Add("> Removed resource: assets/" + res[removeIdx]);
+            app.RequestRedraw();
+        } else if (removeLnk >= 0 && removeLnk < lnks.Count) {
+            ZanIDE.RemoveProjLink(root, lnks[removeLnk]);
+            log.Add("> Removed linked resource: " + lnks[removeLnk]);
             app.RequestRedraw();
         } else if (Button.WasClicked(app, doneId)) {
             action = 1;
@@ -5277,7 +5411,8 @@ class ZanIDE {
     /// output directory, so a published program ships with its static files.
     static void CopyResources(string root, string outDir, List<string> log) {
         List<string> res = ZanIDE.ListResources(root);
-        if (res.Count == 0) { return; }
+        List<string> lnks = ZanIDE.ProjLinks(root);
+        if (res.Count == 0 && lnks.Count == 0) { return; }
         string dst = outDir + "/assets";
         Directory.CreateDirectoryRecursive(dst);
         string ad = ZanIDE.AssetsDir(root);
@@ -5286,7 +5421,20 @@ class ZanIDE {
             File.Copy(ad + "/" + res[i], dst + "/" + res[i]);
             i = i + 1;
         }
-        log.Add("> Bundled " + Convert.ToString(res.Count) + " resource file(s) into " + dst);
+        // Linked resources are referenced in place during development and
+        // copied next to the exe only when publishing.
+        int li = 0;
+        int lcopied = 0;
+        while (li < lnks.Count) {
+            if (File.Exists(lnks[li])) {
+                File.Copy(lnks[li], dst + "/" + Path.GetFileName(lnks[li]));
+                lcopied = lcopied + 1;
+            } else {
+                log.Add("> WARNING: linked resource missing: " + lnks[li]);
+            }
+            li = li + 1;
+        }
+        log.Add("> Bundled " + Convert.ToString(res.Count + lcopied) + " resource file(s) into " + dst);
     }
 
     // ---- code navigation (go to definition / find references) ----
