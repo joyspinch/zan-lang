@@ -1,0 +1,58 @@
+using System;
+
+namespace System.Threading;
+
+/// <summary>
+/// Event-driven coroutine wait/notify primitive backed directly by the
+/// runtime scheduler (see zan_gate_* in src/runtime/rt_io.c). A waiter
+/// genuinely suspends -- no timer, no <c>Task.Delay</c> poll -- and is
+/// re-readied through the ready queue only when another coroutine calls
+/// <see cref="Signal"/>.
+///
+/// Counting / condition-variable semantics: a <see cref="Signal"/> issued
+/// while no waiter is parked is banked, so the next <see cref="Wait"/>
+/// returns without blocking. This makes the standard recheck idiom safe:
+/// <code>while (!available) { await gate.Wait(); }</code>
+/// with no lost wakeups and no busy polling.
+/// </summary>
+class Gate {
+    int handle;
+
+    Gate() { this.handle = 0; }
+
+    static Gate Create() {
+        Gate g = new Gate();
+        g.handle = Gate.zan_gate_new();
+        return g;
+    }
+
+    bool IsOpen() { return this.handle != 0; }
+
+    async bool Wait() {
+        if (this.handle == 0) { return false; }
+        await Gate.Park(this.handle);
+        return true;
+    }
+
+    void Signal() {
+        if (this.handle == 0) { return; }
+        Gate.zan_gate_signal(this.handle);
+    }
+
+    void Close() {
+        if (this.handle == 0) { return; }
+        Gate.zan_gate_free(this.handle);
+        this.handle = 0;
+    }
+
+    int Handle() { return this.handle; }
+
+    // Runtime ABI (resolved from the socket-async reactor object). `Park` is a
+    // compiler await-intrinsic (see irgen.c) and intentionally has no body.
+    [DllImport("crt", EntryPoint = "zan_gate_new")]
+    static extern int zan_gate_new();
+    [DllImport("crt", EntryPoint = "zan_gate_signal")]
+    static extern void zan_gate_signal(int h);
+    [DllImport("crt", EntryPoint = "zan_gate_free")]
+    static extern void zan_gate_free(int h);
+}

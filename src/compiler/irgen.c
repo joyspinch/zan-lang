@@ -5135,6 +5135,17 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             if (gfn) return gfn;
         }
         /* return 0 for unresolved — error was reported in checker */
+        /* Genuinely unresolved bare name: not a local, field, static,
+         * method, or global function, and the binder does not know it
+         * either. Silently lowering to 0/null hides real bugs (an
+         * out-of-scope variable compiled to null -> runtime AV), so fail
+         * the build. Guarded on the binder not knowing the name so known
+         * types/namespaces used in value position keep the old behavior. */
+        if (!zan_binder_lookup(g->binder, expr->ident.name)) {
+            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                "use of undeclared identifier '%.*s'",
+                (int)expr->ident.name.len, expr->ident.name.str);
+        }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     }
 
@@ -9920,6 +9931,52 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             return LLVMConstInt(di64, 0, 0);
         }
 
+        /* await Gate.Park(handle) — event-driven coroutine wait. Mirrors the
+         * Task.Delay lowering but suspends on a runtime gate rather than a
+         * timer: the frame is re-readied by zan_gate_signal (see rt_io.c).
+         * Yields no value; only valid inside an async body. */
+        if (is_call_to(expr->await_expr.expr, "Gate", "Park") &&
+            expr->await_expr.expr->call.args.count == 1) {
+            LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            if (!(g->current_async_frame && g->current_async_switch)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "await Gate.Park is only supported inside an async method");
+                return LLVMConstInt(di64, 0, 0);
+            }
+            LLVMValueRef handle = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+            if (LLVMTypeOf(handle) != di64) {
+                handle = LLVMBuildIntCast2(g->builder, handle, di64, 1, "gate64");
+            }
+            /* the gate runtime rides in the socket-async reactor object; force
+             * it to be linked whenever a program parks on a gate. */
+            g->uses_socket_async = true;
+            LLVMTypeRef gate_park_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                (LLVMTypeRef[]){ di64, di8ptr, g->co_step_ptr }, 3, 0);
+            LLVMValueRef gate_park = LLVMGetNamedFunction(g->mod, "zan_gate_park");
+            if (!gate_park) {
+                gate_park = LLVMAddFunction(g->mod, "zan_gate_park", gate_park_type);
+            }
+            int k = g->current_async_next_state++;
+            LLVMValueRef selfframe = g->current_async_frame;
+            LLVMTypeRef self_ft = g->current_async_frame_type;
+            LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+            emit_async_save_slots(g);
+            LLVMBuildStore(g->builder, LLVMConstInt(di32, (unsigned)k, 0),
+                LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+            zan_call2(g->builder, gate_park_type, gate_park,
+                (LLVMValueRef[]){ handle, self_i8, g->current_async_resume_fn }, 3, "");
+            LLVMBuildRetVoid(g->builder);
+
+            LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                g->current_async_resume_fn, "co.resume");
+            LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+            LLVMPositionBuilderAtEnd(g->builder, rk);
+            emit_async_reload_slots(g);
+            return LLVMConstInt(di64, 0, 0);
+        }
+
         /* await Socket.ReadReady(fd) / Socket.WriteReady(fd) — readiness-based
          * suspension driven by the IO reactor (S4b-2, path A). Inside an async
          * body: register a one-shot fd watcher via zan_io_wait_co that re-readies
@@ -12385,6 +12442,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 if (strncmp(ext_name, "zan_io_socket_", 14) == 0) {
                     g->uses_socket_async = true;
                 }
+                if (strncmp(ext_name, "zan_gate_", 9) == 0) {
+                    g->uses_socket_async = true;
+                }
                 /* Reuse existing declaration if the symbol already exists in the module
                  * (e.g. built-in malloc/free/strlen, or duplicate DllImport across files). */
                 LLVMValueRef efn = LLVMGetNamedFunction(g->mod, ext_name);
@@ -12679,9 +12739,28 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),
                 LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_RESULT, "rs"));
             for (int k = 0; k < total_params; k++) {
+                LLVMValueRef pv = LLVMGetParam(ramp_fn, (unsigned)k);
                 LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, frame_type, rframe,
                     (unsigned)(ASYNC_FRAME_FIRST_PARAM + k), "arg");
-                LLVMBuildStore(g->builder, LLVMGetParam(ramp_fn, (unsigned)k), slot);
+                LLVMBuildStore(g->builder, pv, slot);
+                /* The caller passes arguments by borrow and releases owned temps
+                 * right after the ramp returns, but the heap frame outlives that
+                 * temp and the coroutine reads the argument after suspension. So
+                 * the frame takes ownership of ARC-managed by-value arguments: it
+                 * retains here (synchronously, before the caller's release) and
+                 * releases them from emit_async_complete (see the matching
+                 * arc_owned marking on the resume-body param locals). `this`
+                 * (k < param_offset) stays a borrow, as in synchronous methods. */
+                if (k >= param_offset) {
+                    zan_ast_node_t *pn = member->method_decl.params.items[k - param_offset];
+                    if (!pn->param.by_ref) {
+                        zan_type_t *pt = zan_binder_resolve_type(g->binder, pn->param.type);
+                        if (is_rc_managed_type(pt) &&
+                            LLVMGetTypeKind(LLVMTypeOf(pv)) == LLVMPointerTypeKind) {
+                            emit_rc_retain_for_type(g, pt, pv);
+                        }
+                    }
+                }
             }
             LLVMBuildRet(g->builder, raw);
 
@@ -12717,6 +12796,12 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
                 zan_type_t *pt = zan_binder_resolve_type(g->binder, param->param.type);
                 local_add(locals, param->param.name, pa, pt);
+                /* Balances the retain the ramp performed for ARC-managed by-value
+                 * params: the frame owns them, so release at coroutine completion. */
+                if (!param->param.by_ref && is_rc_managed_type(pt) &&
+                    LLVMGetTypeKind(pty) == LLVMPointerTypeKind) {
+                    locals->vars[locals->count - 1].arc_owned = 1;
+                }
                 slots[si].slot_alloca = pa;
                 slots[si].llvm = pty;
                 slots[si].frame_index = ASYNC_FRAME_FIRST_PARAM + param_offset + k;
