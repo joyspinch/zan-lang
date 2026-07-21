@@ -73,6 +73,7 @@
 #endif
 
 #include "../common/host_oom.h"
+#include "rt_crash.h"
 typedef int64_t i64;
 typedef uint32_t u32;
 typedef uint8_t  u8;
@@ -180,6 +181,7 @@ static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage
 /* ---- Exported rendering functions ---- */
 
 EXPORT i64 zan_gui_create_surface(i64 width, i64 height) {
+    zan__crash_install(); /* idempotent; ensures GUI processes log hard crashes */
     /* Reuse a slot freed by destroy_surface so repeated resize/maximize cycles
      * (each destroy+create) don't leak the fixed 64-slot table. */
     int id = -1;
@@ -1355,6 +1357,50 @@ static HWND g_event_hwnd = NULL;
 static int g_pending_event[8]; /* kind, x, y, button, keycode, modifiers, 0, 0 */
 static int g_has_event = 0;
 static int g_window_width = 0, g_window_height = 0;
+
+/* --- Synthetic (driver/automation) event injection ------------------------
+ * A UI-automation driver (see Gui.UiDriver) pushes synthetic input events so
+ * the IDE can be driven programmatically, without moving the OS mouse or
+ * synthesizing OS keystrokes. Enqueued events are drained at the head of
+ * poll/wait_event exactly like real window messages, so the entire App +
+ * widget dispatch path (hit-testing, focus, click targets) sees them
+ * unchanged. This is what makes the IDE "AI-operable": target a widget by its
+ * registered hit-region and inject the click, rather than screenshot+SetCursorPos. */
+#define ZAN_INJECT_CAP 256
+static int  g_inject_q[ZAN_INJECT_CAP][6]; /* kind,x,y,button,keycode,mods */
+static HWND g_inject_hwnd[ZAN_INJECT_CAP];
+static int  g_inject_head = 0, g_inject_tail = 0;
+static CRITICAL_SECTION g_inject_cs;
+static int  g_inject_cs_ready = 0;
+
+static void zan_inject_lock(void) {
+    if (!g_inject_cs_ready) {
+        InitializeCriticalSection(&g_inject_cs);
+        g_inject_cs_ready = 1;
+    }
+    EnterCriticalSection(&g_inject_cs);
+}
+static void zan_inject_unlock(void) { LeaveCriticalSection(&g_inject_cs); }
+
+/* Pop one synthetic event into g_pending_event if any are queued. Returns 1
+ * when an event was delivered (poll/wait then reports it as a normal event). */
+static int zan_drain_injected(void) {
+    int got = 0;
+    zan_inject_lock();
+    if (g_inject_head != g_inject_tail) {
+        int *e = g_inject_q[g_inject_head];
+        g_pending_event[0] = e[0]; g_pending_event[1] = e[1];
+        g_pending_event[2] = e[2]; g_pending_event[3] = e[3];
+        g_pending_event[4] = e[4]; g_pending_event[5] = e[5];
+        HWND h = g_inject_hwnd[g_inject_head];
+        g_event_hwnd = h ? h : g_main_hwnd;
+        g_inject_head = (g_inject_head + 1) % ZAN_INJECT_CAP;
+        g_has_event = 1;
+        got = 1;
+    }
+    zan_inject_unlock();
+    return got;
+}
 /* g_last_surface: most recently presented surface, re-blitted synchronously on
  * WM_SIZE/WM_PAINT so a maximize/resize fills the new client area immediately
  * instead of flashing black. g_bg_color: last frame's clear color, used to fill
@@ -1956,6 +2002,7 @@ EXPORT i64 zan_gui_set_topmost(i64 hwnd_val, i64 on) {
 EXPORT i64 zan_gui_poll_event(void) {
     g_has_event = 0;
     memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (zan_drain_injected()) return 0;
     MSG msg;
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
@@ -1969,6 +2016,7 @@ EXPORT i64 zan_gui_poll_event(void) {
 EXPORT i64 zan_gui_wait_event(void) {
     g_has_event = 0;
     memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (zan_drain_injected()) return 0;
     MSG msg;
     if (GetMessageW(&msg, NULL, 0, 0) <= 0) return -1;
     TranslateMessage(&msg);
@@ -1982,6 +2030,7 @@ EXPORT i64 zan_gui_wait_event(void) {
 EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
     g_has_event = 0;
     memset(g_pending_event, 0, sizeof(g_pending_event));
+    if (zan_drain_injected()) return 0;
     if (ms < 0) ms = 0;
     DWORD start = GetTickCount();
     for (;;) {
@@ -2006,6 +2055,37 @@ EXPORT i64 zan_gui_wait_event_timeout(i64 ms) {
 EXPORT i64 zan_gui_wake(void) {
     if (g_main_hwnd) { PostMessageW(g_main_hwnd, WM_NULL, 0, 0); }
     return 0;
+}
+
+/* Queue a synthetic input event for the automation driver. hwnd_val=0 targets
+ * the main window. kind/x/y/button/keycode/mods use the same encoding as real
+ * events (see zan_gui_event_kind). Thread-safe. */
+EXPORT i64 zan_gui_inject_event(i64 hwnd_val, i64 kind, i64 x, i64 y,
+                                i64 button, i64 keycode, i64 mods) {
+    zan_inject_lock();
+    int nt = (g_inject_tail + 1) % ZAN_INJECT_CAP;
+    if (nt != g_inject_head) { /* drop silently when the queue is full */
+        int *e = g_inject_q[g_inject_tail];
+        e[0] = (int)kind;    e[1] = (int)x;       e[2] = (int)y;
+        e[3] = (int)button;  e[4] = (int)keycode; e[5] = (int)mods;
+        g_inject_hwnd[g_inject_tail] =
+            hwnd_val ? (HWND)(intptr_t)hwnd_val : g_main_hwnd;
+        g_inject_tail = nt;
+    }
+    zan_inject_unlock();
+    /* Wake a UI thread blocked in wait_event so the event is served promptly. */
+    if (g_main_hwnd) { PostMessageW(g_main_hwnd, WM_NULL, 0, 0); }
+    return 0;
+}
+
+/* Number of synthetic events still queued (0 = the driver's last batch has
+ * been fully consumed by the event loop). */
+EXPORT i64 zan_gui_inject_pending(void) {
+    int n;
+    zan_inject_lock();
+    n = (g_inject_tail - g_inject_head + ZAN_INJECT_CAP) % ZAN_INJECT_CAP;
+    zan_inject_unlock();
+    return n;
 }
 
 EXPORT i64 zan_gui_event_kind(void)    { return g_pending_event[0]; }
@@ -2864,6 +2944,31 @@ EXPORT i64 zan_gui_wake(void) {
     return 0;
 }
 
+/* Queue a synthetic input event for the automation driver (see Gui.UiDriver).
+ * It is pushed onto the same internal zan event queue real SDL events feed, so
+ * poll/wait_event report it exactly like OS input and the whole App + widget
+ * dispatch path is exercised unchanged. Must be called on the UI thread (the
+ * only thread that touches SDL events), which the driver is. */
+EXPORT i64 zan_gui_inject_event(i64 hwnd_val, i64 kind, i64 x, i64 y,
+                                i64 button, i64 keycode, i64 mods) {
+    SDL_Window *w = hwnd_val ? (SDL_Window *)(intptr_t)hwnd_val : g_main_win;
+    zq_push((int)kind, (int)x, (int)y, (int)button, (int)keycode, (int)mods, w);
+    /* Unblock a UI thread parked in wait_event so the event is served now. */
+    if (g_sdl_ready) {
+        SDL_Event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = g_wake_event;
+        SDL_PushEvent(&ev);
+    }
+    return 0;
+}
+
+/* Number of events still queued (synthetic + any un-popped real events). 0
+ * means the driver's last injected batch has been fully consumed. */
+EXPORT i64 zan_gui_inject_pending(void) {
+    return (g_zq_tail - g_zq_head + ZAN_ZQ_CAP) % ZAN_ZQ_CAP;
+}
+
 EXPORT i64 zan_gui_event_kind(void)    { return g_pending_event[0]; }
 EXPORT i64 zan_gui_event_x(void)       { return g_pending_event[1]; }
 EXPORT i64 zan_gui_event_y(void)       { return g_pending_event[2]; }
@@ -3655,6 +3760,22 @@ EXPORT i64 zan_gui_poll_event(void) {
         x11_translate_event(&ev);
         if (evq_pop_linux()) return 0;
     }
+}
+
+/* Queue a synthetic input event for the automation driver (see Gui.UiDriver);
+ * drained by poll/wait_event like a real X11 event so App dispatch is
+ * exercised unchanged. Called on the UI thread. hwnd_val is unused here (the
+ * X11 backend tracks the source window internally). */
+EXPORT i64 zan_gui_inject_event(i64 hwnd_val, i64 kind, i64 x, i64 y,
+                                i64 button, i64 keycode, i64 mods) {
+    (void)hwnd_val;
+    evq_push_linux((int)kind, (int)x, (int)y, (int)button, (int)keycode, (int)mods);
+    zan_gui_wake();
+    return 0;
+}
+
+EXPORT i64 zan_gui_inject_pending(void) {
+    return (g_evq_tail_linux - g_evq_head_linux + ZAN_EVQ_CAP) % ZAN_EVQ_CAP;
 }
 
 EXPORT i64 zan_gui_event_kind(void)    { return g_pending_event_linux[0]; }
