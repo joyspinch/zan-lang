@@ -45,6 +45,9 @@ class SceneDesigner {
     int mqSX;            // marquee start (screen space)
     int mqSY;
     bool showTags;       // draw kind/name badges over the elements
+    List<string> undoStack;  // document JSON snapshots (undo history)
+    List<string> redoStack;
+    string clipJson;     // copied element (single-element scene JSON)
     bool ctxOpen;        // canvas right-click context menu
     int ctxX;
     int ctxY;
@@ -90,6 +93,9 @@ class SceneDesigner {
         d.mqSX = 0;
         d.mqSY = 0;
         d.showTags = true;
+        d.undoStack = new List<string>();
+        d.redoStack = new List<string>();
+        d.clipJson = "";
         d.ctxOpen = false;
         d.ctxX = 0;
         d.ctxY = 0;
@@ -112,12 +118,51 @@ class SceneDesigner {
         this.lastSel = null;
         this.selExtra = new List<SceneElement>();
         this.ctxOpen = false;
+        this.undoStack = new List<string>();
+        this.redoStack = new List<string>();
         this.bgIn.SetText(this.doc.Background());
         this.msg = "loaded";
     }
 
     string SaveJson() {
         return this.doc.ToJson();
+    }
+
+    // --- undo / redo (whole-document JSON snapshots) ---------------------
+
+    /// Records the current document; call before any mutation.
+    void PushUndo() {
+        this.undoStack.Add(this.doc.ToJson());
+        if (this.undoStack.Count > 60) { this.undoStack.RemoveAt(0); }
+        this.redoStack = new List<string>();
+    }
+
+    void Undo() {
+        if (this.undoStack.Count == 0) {
+            this.msg = SceneDesigner.T("nothing to undo", "没有可撤销的操作");
+            return;
+        }
+        this.redoStack.Add(this.doc.ToJson());
+        string j = this.undoStack[this.undoStack.Count - 1];
+        this.undoStack.RemoveAt(this.undoStack.Count - 1);
+        this.doc = SceneDoc.Parse(j);
+        this.sel = null;
+        this.selExtra = new List<SceneElement>();
+        this.msg = SceneDesigner.T("undone", "已撤销");
+    }
+
+    void Redo() {
+        if (this.redoStack.Count == 0) {
+            this.msg = SceneDesigner.T("nothing to redo", "没有可重做的操作");
+            return;
+        }
+        this.undoStack.Add(this.doc.ToJson());
+        string j = this.redoStack[this.redoStack.Count - 1];
+        this.redoStack.RemoveAt(this.redoStack.Count - 1);
+        this.doc = SceneDoc.Parse(j);
+        this.sel = null;
+        this.selExtra = new List<SceneElement>();
+        this.msg = SceneDesigner.T("redone", "已重做");
     }
 
     // --- element catalog -------------------------------------------------
@@ -266,6 +311,7 @@ class SceneDesigner {
     }
 
     void AddElement(string kind) {
+        this.PushUndo();
         SceneElement e = SceneElement.Create(kind, kind + SceneDoc.IntStr(this.doc.Count() + 1));
         e.At(0, 0).AnchorTo(Anchor.Mid(), Anchor.Mid());
         SceneDesigner.ApplyDefaults(e, kind);
@@ -280,6 +326,7 @@ class SceneDesigner {
     /// Adds an element of `kind` centred on the design-space point (dx, dy) —
     /// the drop target of a palette drag.
     void AddElementAt(string kind, int dx, int dy) {
+        this.PushUndo();
         SceneElement e = SceneElement.Create(kind, kind + SceneDoc.IntStr(this.doc.Count() + 1));
         e.AnchorTo(Anchor.Mid(), Anchor.Mid());
         SceneDesigner.ApplyDefaults(e, kind);
@@ -302,9 +349,8 @@ class SceneDesigner {
         Layer.Msg(SceneDesigner.T("Added ", "已添加 ") + SceneDesigner.KindLabel(kind), 3);
     }
 
-    void DuplicateSel() {
-        if (this.sel == null) { return; }
-        SceneElement s = this.sel;
+    // Deep copy of `s` (position offset by two grid cells, next z).
+    SceneElement CloneEl(SceneElement s) {
         SceneElement e = SceneElement.Create(s.Kind(), s.Name() + SceneDoc.IntStr(this.doc.Count() + 1));
         e.At(s.X() + this.grid * 2, s.Y() + this.grid * 2).Size(s.W(), s.H());
         e.AnchorTo(s.AnchorX(), s.AnchorY());
@@ -316,6 +362,13 @@ class SceneDesigner {
         e.Grid(s.Rows(), s.Cols(), s.GapX(), s.GapY());
         e.SetValue(s.Value());
         e.SetItems(s.Items());
+        return e;
+    }
+
+    void DuplicateSel() {
+        if (this.sel == null) { return; }
+        this.PushUndo();
+        SceneElement e = this.CloneEl(this.sel);
         this.doc.Add(e);
         this.sel = e;
         this.selExtra = new List<SceneElement>();
@@ -323,8 +376,38 @@ class SceneDesigner {
         Layer.Msg(SceneDesigner.T("Element duplicated", "元素已复制"), 3);
     }
 
+    // Copies the selected element into an internal clipboard (a one-element
+    // scene document, so it survives undo/redo re-parses).
+    void CopySel() {
+        if (this.sel == null) {
+            this.msg = SceneDesigner.T("select an element first", "请先选中一个元素");
+            return;
+        }
+        SceneDoc d = SceneDoc.Create("clip", this.doc.DesignWidth(), this.doc.DesignHeight());
+        d.Add(this.CloneEl(this.sel));
+        this.clipJson = d.ToJson();
+        this.msg = SceneDesigner.T("copied", "已复制到剪贴板");
+    }
+
+    void PasteClip() {
+        if (this.clipJson.Length == 0) {
+            this.msg = SceneDesigner.T("clipboard is empty", "剪贴板为空");
+            return;
+        }
+        SceneDoc d = SceneDoc.Parse(this.clipJson);
+        if (d.Count() == 0) { return; }
+        this.PushUndo();
+        SceneElement e = this.CloneEl(d.ElementAt(0));
+        e.Order(this.doc.Count());
+        this.doc.Add(e);
+        this.sel = e;
+        this.selExtra = new List<SceneElement>();
+        this.msg = SceneDesigner.T("pasted", "已粘贴");
+    }
+
     void DeleteSel() {
         if (this.sel == null) { return; }
+        this.PushUndo();
         List<SceneElement> keep = new List<SceneElement>();
         int i = 0;
         while (i < this.doc.Count()) {
@@ -341,12 +424,14 @@ class SceneDesigner {
 
     void RaiseSel(int dir) {
         if (this.sel == null) { return; }
+        this.PushUndo();
         this.sel.Order(this.sel.Z() + dir);
     }
 
     // Move the selection to the very front/back of the z order.
     void SelToTop() {
         if (this.sel == null) { return; }
+        this.PushUndo();
         int mx = 0;
         int i = 0;
         while (i < this.doc.Count()) {
@@ -358,6 +443,7 @@ class SceneDesigner {
     }
     void SelToBottom() {
         if (this.sel == null) { return; }
+        this.PushUndo();
         int mn = 0;
         int i = 0;
         while (i < this.doc.Count()) {
@@ -417,11 +503,11 @@ class SceneDesigner {
     //     6 same width, 7 same height.
     void AlignSel(int op) {
         if (this.sel == null || this.selExtra.Count == 0) {
-            this.msg = SceneDesigner.T("Ctrl+click to select more elements first",
-                "先用 Ctrl+单击多选元素");
-            Layer.Msg(this.msg, 4);
+            this.msg = SceneDesigner.T("select 2+ elements first (drag box / Ctrl+click)",
+                "先框选或 Ctrl+单击多选元素");
             return;
         }
+        this.PushUndo();
         int refL = this.DesignLeft(this.sel);
         int refT = this.DesignTop(this.sel);
         int refR = refL + this.sel.TotalW();
@@ -444,7 +530,6 @@ class SceneDesigner {
             i = i + 1;
         }
         this.msg = SceneDesigner.T("layout applied", "已应用排版");
-        Layer.Msg(SceneDesigner.T("Layout applied", "已应用快速排版"), 3);
     }
 
     // --- top-level render ----------------------------------------------------
@@ -538,6 +623,53 @@ class SceneDesigner {
             if (Button.WasClicked(app, aid)) { this.AlignSel(ai); app.RequestRedraw(); }
             bx = bx + bw + app.Scale(4);
             ai = ai + 1;
+        }
+
+        // Element quick actions fill the rest of the bar (same commands as
+        // the right-click menu, one click away).
+        bx = bx + app.Scale(6);
+        c.FillRect(bx, y + app.Scale(5), 1, h - app.Scale(10), t.borderPrimary);
+        bx = bx + app.Scale(7);
+        List<string> acts = new List<string>();
+        acts.Add(SceneDesigner.T("Duplicate", "复制"));
+        acts.Add(SceneDesigner.T("Delete", "删除"));
+        acts.Add(SceneDesigner.T("Forward", "上移"));
+        acts.Add(SceneDesigner.T("Backward", "下移"));
+        acts.Add(SceneDesigner.T("Front", "置顶"));
+        acts.Add(SceneDesigner.T("Back", "置底"));
+        if (this.sel != null && this.sel.Locked()) {
+            acts.Add(SceneDesigner.T("Unlock", "解锁"));
+        } else {
+            acts.Add(SceneDesigner.T("Lock", "锁定"));
+        }
+        int qi = 0;
+        while (qi < acts.Count) {
+            int bw = Canvas.MeasureText(acts[qi], t.fontSizeSmall) + app.Scale(18);
+            int qid = Button.Create(acts[qi]).Render(app, bx, by, bw);
+            if (Button.WasClicked(app, qid)) {
+                if (this.sel == null) {
+                    this.msg = SceneDesigner.T("select an element first", "请先选中一个元素");
+                } else if (qi == 0) { this.DuplicateSel(); }
+                else if (qi == 1) { this.DeleteSel(); }
+                else if (qi == 2) { this.RaiseSel(1); this.msg = SceneDesigner.T("brought forward", "已上移一层"); }
+                else if (qi == 3) { this.RaiseSel(0 - 1); this.msg = SceneDesigner.T("sent backward", "已下移一层"); }
+                else if (qi == 4) { this.SelToTop(); this.msg = SceneDesigner.T("brought to front", "已置顶"); }
+                else if (qi == 5) { this.SelToBottom(); this.msg = SceneDesigner.T("sent to back", "已置底"); }
+                else {
+                    this.PushUndo();
+                    this.sel.SetLocked(!this.sel.Locked());
+                    if (this.sel.Locked()) {
+                        this.msg = SceneDesigner.T("locked", "已锁定");
+                        Layer.Msg(SceneDesigner.T("Element locked", "元素已锁定"), 3);
+                    } else {
+                        this.msg = SceneDesigner.T("unlocked", "已解锁");
+                        Layer.Msg(SceneDesigner.T("Element unlocked", "元素已解锁"), 3);
+                    }
+                }
+                app.RequestRedraw();
+            }
+            bx = bx + bw + app.Scale(4);
+            qi = qi + 1;
         }
         // Selection hint on the right end of the bar.
         int selN = this.selExtra.Count;
@@ -645,6 +777,7 @@ class SceneDesigner {
         else if (idx == 5) { this.SelToTop(); this.msg = SceneDesigner.T("brought to front", "已置顶"); }
         else if (idx == 6) { this.SelToBottom(); this.msg = SceneDesigner.T("sent to back", "已置底"); }
         else if (idx == 8 && this.sel != null) {
+            this.PushUndo();
             this.sel.SetLocked(!this.sel.Locked());
             if (this.sel.Locked()) {
                 this.msg = SceneDesigner.T("locked", "已锁定");
@@ -1051,6 +1184,7 @@ class SceneDesigner {
                     int hy = SceneDesigner.HandleY(hnum, sy, sh);
                     if (SceneDesigner.InRect(app.mouseX, app.mouseY,
                             hx - hs, hy - hs, hs * 2, hs * 2)) {
+                        this.PushUndo();
                         this.resizing = true;
                         this.resizeH = hnum;
                         started = true;
@@ -1102,6 +1236,7 @@ class SceneDesigner {
                     if (hit.Locked()) {
                         this.msg = SceneDesigner.T("element is locked", "元素已锁定");
                     } else {
+                        this.PushUndo();
                         this.dragging = true;
                         int dLeft = this.DesignLeft(hit);
                         int dTop = this.DesignTop(hit);
@@ -1374,25 +1509,33 @@ class SceneDesigner {
     // 1px), Delete removes it, Ctrl+D duplicates it. Ignored while an
     // inspector input has focus so typing there is unaffected.
     void HandleKeys(App app) {
-        if (this.sel == null) { return; }
         if (this.AnyInputFocused(app)) { return; }
         int ek = app.window.EventKind();
-        if (ek == 6 && app.window.EventKeyCode() == 4) {
-            // Ctrl+D
-            this.DuplicateSel();
-            app.RequestRedraw();
-            return;
+        // Ctrl+letter shortcuts arrive as text input control codes:
+        // ^Z=26 undo, ^Y=25 redo, ^C=3 copy, ^V=22 paste, ^D=4 duplicate.
+        if (ek == 6) {
+            int cc = app.window.EventKeyCode();
+            if (cc == 26) { this.Undo(); app.RequestRedraw(); return; }
+            if (cc == 25) { this.Redo(); app.RequestRedraw(); return; }
+            if (cc == 3) { this.CopySel(); app.RequestRedraw(); return; }
+            if (cc == 22) { this.PasteClip(); app.RequestRedraw(); return; }
+            if (cc == 4 && this.sel != null) {
+                this.DuplicateSel();
+                app.RequestRedraw();
+                return;
+            }
         }
+        if (this.sel == null) { return; }
         if (ek != 4) { return; }
         int kc = app.window.EventKeyCode();
         int step = this.grid;
         if (step < 1) { step = 1; }
         if (Modifiers.HasShift(app.window.EventMods())) { step = 1; }
         bool lk = this.sel.Locked();
-        if (kc == 37 && !lk) { this.sel.At(this.sel.X() - step, this.sel.Y()); app.RequestRedraw(); }
-        else if (kc == 39 && !lk) { this.sel.At(this.sel.X() + step, this.sel.Y()); app.RequestRedraw(); }
-        else if (kc == 38 && !lk) { this.sel.At(this.sel.X(), this.sel.Y() - step); app.RequestRedraw(); }
-        else if (kc == 40 && !lk) { this.sel.At(this.sel.X(), this.sel.Y() + step); app.RequestRedraw(); }
+        if (kc == 37 && !lk) { this.PushUndo(); this.sel.At(this.sel.X() - step, this.sel.Y()); app.RequestRedraw(); }
+        else if (kc == 39 && !lk) { this.PushUndo(); this.sel.At(this.sel.X() + step, this.sel.Y()); app.RequestRedraw(); }
+        else if (kc == 38 && !lk) { this.PushUndo(); this.sel.At(this.sel.X(), this.sel.Y() - step); app.RequestRedraw(); }
+        else if (kc == 40 && !lk) { this.PushUndo(); this.sel.At(this.sel.X(), this.sel.Y() + step); app.RequestRedraw(); }
         else if (kc == 46) { this.DeleteSel(); app.RequestRedraw(); }
     }
 
