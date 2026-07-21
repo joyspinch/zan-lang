@@ -1008,6 +1008,11 @@ class ZanIDE {
         // own scrolling/filtering rather than the caller wiring it up each time.
         int coScroll = 0;
         int coSbDrag = 0;
+        // Output/Errors right-click context menu (copy line / copy all / clear).
+        bool coCtxOpen = false;
+        int coCtxX = 0;
+        int coCtxY = 0;
+        int coCtxRow = 0 - 1;
         Input coFilter = Input.Bind(SignalString.Create(""),
             ZanIDE.T("Filter output...", "筛选输出..."));
 
@@ -2562,7 +2567,7 @@ class ZanIDE {
                         coScroll, coFilter, coSelA, coSelAc, coSelB, coSelBc);
                     // Clear button empties the real log and resets the view state.
                     Rect coClr = ZanIDE.OutClearRect(app, orr);
-                    if (app.window.EventKind() == 3
+                    if (!coCtxOpen && app.window.EventKind() == 3
                         && app.mouseX >= coClr.x && app.mouseX < coClr.x + coClr.width
                         && app.mouseY >= coClr.y && app.mouseY < coClr.y + coClr.height) {
                         log = new List<string>();
@@ -2607,7 +2612,8 @@ class ZanIDE {
                         bool coOver = !overSb && coSbDrag == 0
                             && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
                             && app.mouseY >= coContentY && app.mouseY < coContentY + coContentH;
-                        if (app.window.EventKind() == 2 && app.window.EventButton() == 0 && coOver) {
+                        if (!coCtxOpen && app.window.EventKind() == 2
+                            && app.window.EventButton() == 0 && coOver) {
                             int rr = ZanIDE.ConsoleRowAt(app, coContentY, coRowH, coPad,
                                 coView.Count, coMaxRows, coScroll, app.mouseY);
                             int cc = 0;
@@ -2633,7 +2639,7 @@ class ZanIDE {
                             app.RequestRedraw();
                         }
                     }
-                    if (app.window.EventKind() == 3) {
+                    if (!coCtxOpen && app.window.EventKind() == 3) {
                         int obTabW = app.Scale(90);
                         if (app.mouseY >= orr.y && app.mouseY < orr.y + obTabH
                             && app.mouseX >= orr.x && app.mouseX < orr.x + obTabW * 2) {
@@ -2673,29 +2679,117 @@ class ZanIDE {
                             }
                         }
                     }
-                    // Right-click the panel to copy the active tab's text.
+                    // Right-click opens a context menu (copy selection / line /
+                    // all, clear) instead of silently copying.
                     if (app.window.EventKind() == 2 && app.window.EventButton() == 1
                         && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
                         && app.mouseY >= orr.y && app.mouseY < orr.y + orr.height) {
-                        string clip = "";
+                        coCtxOpen = true;
+                        coCtxX = app.mouseX;
+                        coCtxY = app.mouseY;
+                        if (botTab == 0) {
+                            coCtxRow = ZanIDE.ConsoleRowAt(app, coContentY, coRowH, coPad,
+                                coView.Count, coMaxRows, coScroll, app.mouseY);
+                        } else {
+                            coCtxRow = (app.mouseY - (orr.y + obTabH + app.Scale(6))) / app.Scale(20);
+                        }
+                        app.RequestRedraw();
+                    }
+                    if (coCtxOpen) {
                         bool haveSel = coSelA >= 0
                             && !(coSelA == coSelB && coSelAc == coSelBc);
+                        List<string> cmi = new List<string>();
                         if (botTab == 0 && haveSel) {
-                            clip = ZanIDE.ConsoleSelectionText(coView,
-                                coSelA, coSelAc, coSelB, coSelBc);
-                        } else if (botTab == 0) {
-                            int ci = 0;
-                            while (ci < coView.Count) { clip = clip + coView[ci] + "\n"; ci = ci + 1; }
-                        } else {
-                            int ci = 0;
-                            while (ci < ePath.Count) {
-                                clip = clip + ZanIDE.BaseName(ePath[ci]) + ":" + eLine[ci]
-                                    + "  " + eMsg[ci] + "\n";
-                                ci = ci + 1;
-                            }
+                            cmi.Add(ZanIDE.T("Copy selection", "复制选中"));
                         }
-                        Clipboard.SetText(clip);
-                        log.Add("> Copied to clipboard.");
+                        cmi.Add(ZanIDE.T("Copy line", "复制该行"));
+                        cmi.Add(ZanIDE.T("Copy all", "复制全部"));
+                        cmi.Add(ZanIDE.T("Clear", "清空"));
+                        int cmRowH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(10);
+                        int cmW = app.Scale(150);
+                        int cmH = cmi.Count * cmRowH + app.Scale(8);
+                        int cmX = coCtxX;
+                        int cmY = coCtxY;
+                        if (cmX + cmW > orr.x + orr.width) { cmX = orr.x + orr.width - cmW; }
+                        if (cmY + cmH > orr.y + orr.height) { cmY = coCtxY - cmH; }
+                        c.FillRoundRect(cmX + 1, cmY + 2, cmW, cmH, app.Scale(5), t.shadowColor);
+                        c.FillRoundRect(cmX, cmY, cmW, cmH, app.Scale(5), t.bgSecondary);
+                        c.DrawRect(cmX, cmY, cmW, cmH, t.borderPrimary, 1);
+                        int cmEk = app.window.EventKind();
+                        int cmIy = cmY + app.Scale(4);
+                        int cmHit = 0 - 1;
+                        int cmI = 0;
+                        while (cmI < cmi.Count) {
+                            bool cmOver = app.mouseX >= cmX && app.mouseX < cmX + cmW
+                                && app.mouseY >= cmIy && app.mouseY < cmIy + cmRowH;
+                            if (cmOver) {
+                                c.FillRoundRect(cmX + app.Scale(3), cmIy, cmW - app.Scale(6),
+                                    cmRowH, app.Scale(3), t.bgTertiary);
+                                if (cmEk == 3) { cmHit = cmI; }
+                            }
+                            c.DrawText(cmX + app.Scale(10), cmIy + app.Scale(4), cmi[cmI],
+                                t.textPrimary, t.fontSizeSmall);
+                            cmIy = cmIy + cmRowH;
+                            cmI = cmI + 1;
+                        }
+                        if (cmHit >= 0) {
+                            int base2 = 0;
+                            if (botTab == 0 && haveSel) { base2 = 1; }
+                            string clip = "";
+                            if (botTab == 0 && haveSel && cmHit == 0) {
+                                clip = ZanIDE.ConsoleSelectionText(coView,
+                                    coSelA, coSelAc, coSelB, coSelBc);
+                            } else if (cmHit == base2) {
+                                if (botTab == 0) {
+                                    if (coCtxRow >= 0 && coCtxRow < coView.Count) {
+                                        clip = coView[coCtxRow];
+                                    }
+                                } else if (coCtxRow >= 0 && coCtxRow < ePath.Count) {
+                                    clip = ZanIDE.BaseName(ePath[coCtxRow]) + ":"
+                                        + eLine[coCtxRow] + "  " + eMsg[coCtxRow];
+                                }
+                            } else if (cmHit == base2 + 1) {
+                                if (botTab == 0) {
+                                    int ci = 0;
+                                    while (ci < coView.Count) { clip = clip + coView[ci] + "\n"; ci = ci + 1; }
+                                } else {
+                                    int ci = 0;
+                                    while (ci < ePath.Count) {
+                                        clip = clip + ZanIDE.BaseName(ePath[ci]) + ":" + eLine[ci]
+                                            + "  " + eMsg[ci] + "\n";
+                                        ci = ci + 1;
+                                    }
+                                }
+                            } else {
+                                log = new List<string>();
+                                coFilter.SetText("");
+                                coScroll = 0;
+                                coSelA = 0 - 1; coSelB = 0 - 1;
+                            }
+                            if (clip.Length > 0) {
+                                Clipboard.SetText(clip);
+                                Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
+                            }
+                            coCtxOpen = false;
+                            app.RequestRedraw();
+                        } else if ((cmEk == 2 && app.window.EventButton() == 0
+                                || cmEk == 3)
+                            && !(app.mouseX >= cmX && app.mouseX < cmX + cmW
+                                && app.mouseY >= cmY && app.mouseY < cmY + cmH)) {
+                            coCtxOpen = false;
+                            app.RequestRedraw();
+                        }
+                    }
+                    // Ctrl+C copies the console selection when the pointer is
+                    // over the output panel (the editor keeps its own copy).
+                    if (app.window.EventKind() == 4 && app.window.EventKeyCode() == 67
+                        && Modifiers.HasCtrl(app.window.EventMods())
+                        && coSelA >= 0 && !(coSelA == coSelB && coSelAc == coSelBc)
+                        && app.mouseX >= orr.x && app.mouseX < orr.x + orr.width
+                        && app.mouseY >= orr.y && app.mouseY < orr.y + orr.height) {
+                        Clipboard.SetText(ZanIDE.ConsoleSelectionText(coView,
+                            coSelA, coSelAc, coSelB, coSelBc));
+                        Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
                         app.RequestRedraw();
                     }
                 }
