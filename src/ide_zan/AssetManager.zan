@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Json;
+using System.Resources;
+using System.Security.Cryptography;
 using Gui;
 using Gui.Widget;
 using Game.Scene;
@@ -268,6 +270,192 @@ class AssetManager {
         File.WriteAllText(root + "/assets/" + relNoExt + ".anim", o);
     }
 
+    // ---- encrypted .zrp publish packing ----
+
+    /// Reads one `key = value` field from zan.proj ("" when absent).
+    static string projField(string root, string key) {
+        string proj = root + "/zan.proj";
+        if (!File.Exists(proj)) { return ""; }
+        List<string> ls = CodeEditor.SplitLines(File.ReadAllText(proj));
+        int i = 0;
+        while (i < ls.Count) {
+            string ln = ls[i];
+            int j = 0;
+            while (j < ln.Length && (ln.Substring(j, 1) == " " || ln.Substring(j, 1) == "\t")) { j = j + 1; }
+            string tr = ln.Substring(j, ln.Length - j);
+            if (tr.Length > key.Length && tr.Substring(0, key.Length) == key) {
+                string rest = tr.Substring(key.Length, tr.Length - key.Length);
+                int k = 0;
+                while (k < rest.Length && (rest.Substring(k, 1) == " " || rest.Substring(k, 1) == "\t")) { k = k + 1; }
+                if (k < rest.Length && rest.Substring(k, 1) == "=") {
+                    string val = rest.Substring(k + 1, rest.Length - k - 1);
+                    int a = 0;
+                    while (a < val.Length && (val.Substring(a, 1) == " " || val.Substring(a, 1) == "\t")) { a = a + 1; }
+                    int e = val.Length;
+                    while (e > a) {
+                        string ch = val.Substring(e - 1, 1);
+                        if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { e = e - 1; } else { break; }
+                    }
+                    return val.Substring(a, e - a);
+                }
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Writes/replaces one `key = value` line in zan.proj (single-valued).
+    static void setProjField(string root, string key, string val) {
+        string proj = root + "/zan.proj";
+        string content = "";
+        if (File.Exists(proj)) { content = File.ReadAllText(proj); }
+        List<string> ls = CodeEditor.SplitLines(content);
+        string outp = "";
+        int i = 0;
+        while (i < ls.Count) {
+            string ln = ls[i];
+            int j = 0;
+            while (j < ln.Length && (ln.Substring(j, 1) == " " || ln.Substring(j, 1) == "\t")) { j = j + 1; }
+            string tr = ln.Substring(j, ln.Length - j);
+            bool isKey = tr.Length > key.Length && tr.Substring(0, key.Length) == key;
+            if (isKey) {
+                string rest = tr.Substring(key.Length, tr.Length - key.Length);
+                int k = 0;
+                while (k < rest.Length && (rest.Substring(k, 1) == " " || rest.Substring(k, 1) == "\t")) { k = k + 1; }
+                isKey = k < rest.Length && rest.Substring(k, 1) == "=";
+            }
+            if (!isKey && tr.Length > 0) { outp = outp + ln + "\n"; }
+            i = i + 1;
+        }
+        outp = outp + key + " = " + val + "\n";
+        File.WriteAllText(proj, outp);
+    }
+
+    static bool PackEnabled(string root) {
+        return projField(root, "packassets") == "1";
+    }
+
+    /// Enables .zrp packing: generates the two XOR key shards (stored in
+    /// zan.proj) and an AssetPack.zan helper the game code uses to open the
+    /// pack at runtime, so the full key never appears as one literal.
+    static void EnablePack(string root, List<string> log) {
+        string aHex = projField(root, "assetkey_a");
+        string bHex = projField(root, "assetkey_b");
+        if (aHex.Length != 64 || bHex.Length != 64) {
+            string a = RandomNumberGenerator.GetBytes(32);
+            string b = RandomNumberGenerator.GetBytes(32);
+            if (a == null || b == null) {
+                log.Add("> ERROR: no secure random source; .zrp packing not enabled.");
+                return;
+            }
+            aHex = Hex.Encode(a, 32);
+            bHex = Hex.Encode(b, 32);
+            setProjField(root, "assetkey_a", aHex);
+            setProjField(root, "assetkey_b", bHex);
+        }
+        setProjField(root, "packassets", "1");
+        writeAssetPackHelper(root, aHex, bHex);
+        log.Add("> Publishing now packs assets/ into an encrypted assets.zrp (AssetPack.zan added).");
+    }
+
+    static void DisablePack(string root, List<string> log) {
+        setProjField(root, "packassets", "0");
+        log.Add("> Publishing copies assets/ as plain files again.");
+    }
+
+    /// The generated runtime helper. Kept in the project so user code can do:
+    ///   ResourcePack pack = AssetPack.Open(AppContext.BaseDirectory());
+    static void writeAssetPackHelper(string root, string aHex, string bHex) {
+        string o = "using System;\n";
+        o = o + "using System.Collections.Generic;\n";
+        o = o + "using System.Resources;\n";
+        o = o + "using System.Security.Cryptography;\n\n";
+        o = o + "/// Generated by the Zan IDE Asset Manager (do not edit by hand; it is\n";
+        o = o + "/// rewritten when asset packing is re-enabled). Opens the encrypted\n";
+        o = o + "/// assets.zrp produced by publishing. The master key is reassembled\n";
+        o = o + "/// from two XOR shards so it never appears whole in the binary.\n";
+        o = o + "class AssetPack {\n";
+        o = o + "    /// dir = the folder holding assets/ (usually the exe directory).\n";
+        o = o + "    /// err[0]: 0 ok, 1 io/magic, 2 auth failure, 3 bad signature.\n";
+        o = o + "    static ResourcePack Open(string dir, List<int> err) {\n";
+        o = o + "        string a = Hex.Decode(\"" + aHex + "\");\n";
+        o = o + "        string b = Hex.Decode(\"" + bHex + "\");\n";
+        o = o + "        string k = ResourcePack.MixKey(a, b, 32);\n";
+        o = o + "        return ResourcePack.Open(dir + \"/assets/assets.zrp\", k, null, null, err);\n";
+        o = o + "    }\n";
+        o = o + "}\n";
+        File.WriteAllText(root + "/AssetPack.zan", o);
+    }
+
+    static void packAddTree(ResourcePackWriter w, string dir, string rel, List<int> count) {
+        List<string> fs = Directory.GetFiles(dir);
+        int i = 0;
+        while (i < fs.Count) {
+            string nm = fs[i];
+            string entry = nm;
+            if (rel.Length > 0) { entry = rel + "/" + nm; }
+            if (entry != "app.ico") {
+                int sz = File.GetSize(dir + "/" + nm);
+                if (sz >= 0) {
+                    string data = File.ReadBytes(dir + "/" + nm, 0, sz);
+                    if (data != null) {
+                        w.Add(entry, data, sz);
+                        count[0] = count[0] + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        List<string> ds = Directory.GetDirectories(dir);
+        i = 0;
+        while (i < ds.Count) {
+            string sub = ds[i];
+            string srel = sub;
+            if (rel.Length > 0) { srel = rel + "/" + sub; }
+            packAddTree(w, dir + "/" + sub, srel, count);
+            i = i + 1;
+        }
+    }
+
+    /// Packs assets/ (plus linked files) into outDir/assets/assets.zrp using
+    /// the project's key shards. Returns the number of packed entries, or -1.
+    static int PackAssets(string root, string outDir, List<string> lnks, List<string> log) {
+        string aHex = projField(root, "assetkey_a");
+        string bHex = projField(root, "assetkey_b");
+        if (aHex.Length != 64 || bHex.Length != 64) {
+            log.Add("> ERROR: asset key shards missing in zan.proj; re-enable packing in the Asset Manager.");
+            return 0 - 1;
+        }
+        string ab = Hex.Decode(aHex);
+        string bb = Hex.Decode(bHex);
+        string master = ResourcePack.MixKey(ab, bb, 32);
+        ResourcePackWriter w = ResourcePackWriter.Create();
+        List<int> count = new List<int>();
+        count.Add(0);
+        packAddTree(w, root + "/assets", "", count);
+        int li = 0;
+        while (li < lnks.Count) {
+            if (File.Exists(lnks[li])) {
+                int sz = File.GetSize(lnks[li]);
+                string data = File.ReadBytes(lnks[li], 0, sz);
+                if (data != null) {
+                    w.Add(Path.GetFileName(lnks[li]), data, sz);
+                    count[0] = count[0] + 1;
+                }
+            } else {
+                log.Add("> WARNING: linked resource missing: " + lnks[li]);
+            }
+            li = li + 1;
+        }
+        Directory.CreateDirectoryRecursive(outDir + "/assets");
+        bool ok = w.Write(outDir + "/assets/assets.zrp", master, null, null);
+        if (!ok) {
+            log.Add("> ERROR: failed to write assets.zrp");
+            return 0 - 1;
+        }
+        return count[0];
+    }
+
     static void deleteTree(string path) {
         List<string> fs = Directory.GetFiles(path);
         int i = 0;
@@ -325,6 +513,19 @@ class AssetManager {
         bX = bX + nfW + app.Scale(6);
         int mkW = app.Scale(96);
         int mkId = Button.Create(T("New folder", "新建文件夹")).SetSize(1).Render(app, bX, bY, mkW);
+
+        // Publish packing toggle: encrypted .zrp vs plain copied files.
+        bool packOn = AssetManager.PackEnabled(root);
+        int pkW = app.Scale(170);
+        int pkX = x + w - pad - pkW;
+        string pkLabel = T("Publish: plain copy", "发布：原样复制");
+        if (packOn) { pkLabel = T("Publish: encrypted .zrp", "发布：加密 .zrp"); }
+        int pkId = 0;
+        if (packOn) {
+            pkId = Button.Primary(pkLabel).SetSize(1).Render(app, pkX, bY, pkW);
+        } else {
+            pkId = Button.Create(pkLabel).SetSize(1).Render(app, pkX, bY, pkW);
+        }
 
         // ---- listing (left) ----
         List<string> dirs = Directory.GetDirectories(ad);
@@ -514,6 +715,15 @@ class AssetManager {
                 this.scroll = 0;
                 app.RequestRedraw();
             }
+        } else if (Button.WasClicked(app, pkId)) {
+            if (packOn) {
+                AssetManager.DisablePack(root, log);
+                this.msg = T("Publishing copies plain files", "发布改为原样复制");
+            } else {
+                AssetManager.EnablePack(root, log);
+                this.msg = T("Publishing packs encrypted assets.zrp", "发布将打包加密 assets.zrp");
+            }
+            app.RequestRedraw();
         } else if (Button.WasClicked(app, mkId)) {
             string fn = this.folderIn.GetText();
             if (fn.Length > 0) {

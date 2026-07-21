@@ -109,3 +109,27 @@ p.Update(frameMs);    // advance by elapsed milliseconds
 int f = p.SheetFrame();  // absolute frame index in the sheet to draw
 if (p.Done()) { /* a "once" clip finished -> back to idle */ }
 ```
+
+## Publishing: encrypted `assets.zrp`
+
+The Asset Manager's `Publish: encrypted .zrp` toggle opts the project into
+packed publishing (stored as `packassets = 1` in `zan.proj`):
+
+* Enabling generates two random 32-byte XOR key shards (`assetkey_a` /
+  `assetkey_b` in `zan.proj`) and writes an `AssetPack.zan` helper into the
+  project, so the reassembled master key never appears whole in the binary.
+* Publishing then packs the whole `assets/` tree (plus linked resources)
+  into `publish/assets/assets.zrp` — AES-256-GCM per entry, HKDF-derived
+  per-entry keys, hashed entry names — instead of copying loose files.
+* Game code opens it with the generated helper:
+
+```zan
+List<int> err = new List<int>(); err.Add(0);
+ResourcePack pack = AssetPack.Open(exeDir, err);   // err[0] == 0 on success
+List<int> n = new List<int>(); n.Add(0);
+string bytes = pack.Read("mon/skeleton/walk.png", n);  // n[0] = byte length
+```
+
+Entry names are the paths relative to `assets/` (e.g. `mon/skel/run.anim`).
+Toggling back to `Publish: plain copy` restores loose-file publishing; the
+key shards are kept so re-enabling reuses them.
