@@ -22,6 +22,9 @@
 #define _WIN32_WINNT 0x0601   /* Windows 7+: GetQueuedCompletionStatusEx */
 #endif
 
+#if defined(_WIN32)
+#include <winsock2.h>   /* must precede <windows.h> (pulled in by rt_crash.h) */
+#endif
 #include "rt_io.h"
 #include "rt_co.h"
 #include <stdio.h>
