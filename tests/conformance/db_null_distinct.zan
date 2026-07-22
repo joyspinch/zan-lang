@@ -1,0 +1,48 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+
+// DbResult NULL vs empty-string distinction (SQLite, no server needed):
+// IsNull()/IsNullByName() report SQL NULL while GetString still returns ""
+// for both NULL and genuinely empty strings.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static void Main() {
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        db.Execute("CREATE TABLE t (id INTEGER, s TEXT, n INTEGER)");
+        db.Execute("INSERT INTO t VALUES (1, '', 5)");
+        db.Execute("INSERT INTO t VALUES (2, NULL, NULL)", DbParams.Create());
+        db.Execute("INSERT INTO t VALUES (?, ?, ?)",
+            DbParams.Create().AddInt(3).Add("x").AddNull());
+
+        DbResult r = db.Query("SELECT id, s, n FROM t ORDER BY id");
+        Check("rows", r.RowCount() == 3);
+
+        // Row 1: empty string is NOT NULL.
+        Check("empty-not-null", !r.IsNull(0, 1) && r.GetString(0, 1) == "");
+        Check("val-not-null", !r.IsNull(0, 2) && r.GetInt(0, 2) == 5);
+
+        // Row 2: real NULLs.
+        Check("null-str", r.IsNull(1, 1) && r.GetString(1, 1) == "");
+        Check("null-int", r.IsNull(1, 2));
+        Check("null-byname", r.IsNullByName(1, "s") && !r.IsNullByName(1, "id"));
+
+        // Row 3: bound NULL parameter round-trips as NULL.
+        Check("bound-null", r.IsNull(2, 2) && !r.IsNull(2, 1)
+            && r.GetString(2, 1) == "x");
+
+        // Out-of-range is not NULL.
+        Check("oob", !r.IsNull(9, 9) && !r.IsNullByName(0, "missing"));
+
+        db.Close();
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+    }
+}

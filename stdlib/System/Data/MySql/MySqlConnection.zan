@@ -568,12 +568,20 @@ class MySqlConnection {
             if (this.isEof(row)) { free(row); break; }
             List<int> cur = new List<int>(); cur.Add(0);
             List<string> outRow = new List<string>();
+            List<bool> nullFlags = new List<bool>();
             c = 0;
             while (c < ncols) {
-                outRow.Add(readLenencStr(row, cur));
+                if ((row[cur[0]] & 255) == 251) {   // NULL marker
+                    cur[0] = cur[0] + 1;
+                    outRow.Add("");
+                    nullFlags.Add(true);
+                } else {
+                    outRow.Add(readLenencStr(row, cur));
+                    nullFlags.Add(false);
+                }
                 c = c + 1;
             }
-            result.AddRow(outRow);
+            result.AddRowNulls(outRow, nullFlags);
             free(row);
             rowCount = rowCount + 1;
         }
@@ -761,8 +769,9 @@ class MySqlConnection {
         return true;
     }
 
-    /// <summary>Sends COM_STMT_EXECUTE with all parameters bound as
-    /// VAR_STRING (or NULL), text values length-encoded.</summary>
+    /// <summary>Sends COM_STMT_EXECUTE with typed binary parameters:
+    /// ints as LONGLONG, text/doubles as VAR_STRING (length-encoded; the
+    /// server coerces text to the column type), NULLs via the null bitmap.</summary>
     async int stmtExecute(int stmtId, DbParams prms) {
         int n = prms.Count();
         int bitmapLen = (n + 7) / 8;
@@ -771,7 +780,8 @@ class MySqlConnection {
             total = total + bitmapLen + 1 + 2 * n;
             int i = 0;
             while (i < n) {
-                if (!prms.IsNull(i)) { total = total + 4 + prms.AsText(i).Length; }
+                if (prms.KindAt(i) == DbParams.KindInt) { total = total + 8; }
+                else if (!prms.IsNull(i)) { total = total + 4 + prms.AsText(i).Length; }
                 i = i + 1;
             }
         }
@@ -794,15 +804,25 @@ class MySqlConnection {
             pay[q] = 1; q = q + 1;   // new-params-bound flag
             i = 0;
             while (i < n) {
-                if (prms.IsNull(i)) { pay[q] = 6; }    // MYSQL_TYPE_NULL
-                else { pay[q] = 253; }                  // MYSQL_TYPE_VAR_STRING
+                if (prms.IsNull(i)) { pay[q] = 6; }                        // MYSQL_TYPE_NULL
+                else if (prms.KindAt(i) == DbParams.KindInt) { pay[q] = 8; } // MYSQL_TYPE_LONGLONG
+                else { pay[q] = 253; }                                      // MYSQL_TYPE_VAR_STRING
                 pay[q+1] = 0;
                 q = q + 2;
                 i = i + 1;
             }
             i = 0;
             while (i < n) {
-                if (!prms.IsNull(i)) {
+                if (prms.IsNull(i)) { i = i + 1; continue; }
+                if (prms.KindAt(i) == DbParams.KindInt) {
+                    int v = prms.IntAt(i);
+                    int j = 0;
+                    while (j < 8) {
+                        pay[q+j] = (v >> (j * 8)) & 255;
+                        j = j + 1;
+                    }
+                    q = q + 8;
+                } else {
                     string t = prms.AsText(i);
                     q = writeLenenc(pay, q, t.Length);
                     int j = 0;
@@ -905,18 +925,21 @@ class MySqlConnection {
             int bmLen = (ncols + 9) / 8;
             List<int> cur = new List<int>(); cur.Add(1 + bmLen);
             List<string> outRow = new List<string>();
+            List<bool> nullFlags = new List<bool>();
             c = 0;
             while (c < ncols) {
                 int bit = c + 2;
                 int nb = row[1 + bit / 8] & 255;
                 if (((nb >> (bit % 8)) & 1) == 1) {
                     outRow.Add("");
+                    nullFlags.Add(true);
                 } else {
                     outRow.Add(readBinValue(row, cur, colTypes[c], colFlags[c]));
+                    nullFlags.Add(false);
                 }
                 c = c + 1;
             }
-            result.AddRow(outRow);
+            result.AddRowNulls(outRow, nullFlags);
             free(row);
             rowCount = rowCount + 1;
         }
