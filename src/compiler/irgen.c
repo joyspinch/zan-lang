@@ -1893,6 +1893,15 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                                       zan_type_t *expected, local_scope_t *locals);
 /* Resolve the declared type of a method's idx-th parameter (NULL if unknown). */
 static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx);
+static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
+                                        int idx, zan_ast_node_t *call,
+                                        zan_ast_node_t *recv_expr,
+                                        local_scope_t *locals);
+static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
+                                      zan_ast_node_t *call,
+                                      zan_ast_node_t *recv_expr,
+                                      local_scope_t *locals);
+static bool method_ret_is_bare_tp(zan_symbol_t *msym);
 /* Emit a call argument, typing a bare lambda from the target delegate param. */
 static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
                                    zan_type_t *ptype, local_scope_t *locals);
@@ -2242,10 +2251,13 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_symbol_t *m = get_method_sym(rt->sym, callee->member.name);
                 if (m) return m->type;
             }
-            /* extension method: recv.M(args) returns the static method's type */
+            /* extension method: recv.M(args) returns the static method's type
+             * (with its generic type parameters substituted from this call
+             * site, so fluent chains like list.Where(..).Select(..) keep a
+             * concrete element type) */
             zan_symbol_t *xm = find_extension_method(g, rt, callee->member.name,
                                                      e->call.args.count);
-            if (xm) return xm->type;
+            if (xm) return method_ret_type_at(g, xm, e, obj, locals);
         }
         return NULL;
     }
@@ -8443,14 +8455,27 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
                                 for (int k = 0; k < argc; k++) {
                                     call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
-                                        method_param_type(g, method_sym, k), locals);
+                                        method_param_type_at(g, method_sym, k, expr, NULL, locals), locals);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                                 LLVMValueRef result = zan_call2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
                                 zan_type_t *gret = generic_method_ret(g, method_sym, expr, locals);
-                                if (gret) result = emit_boundary_coerce(g, result, map_type(g, gret));
+                                if (!gret && method_ret_is_bare_tp(method_sym)) {
+                                    zan_type_t *ir = method_ret_type_at(g, method_sym,
+                                        expr, NULL, locals);
+                                    if (ir && ir->kind != TYPE_TYPE_PARAM) gret = ir;
+                                }
+                                if (gret) {
+                                    result = emit_boundary_coerce(g, result, map_type(g, gret));
+                                    /* the erased body returned a borrowed +0
+                                     * class reference; make it owned like
+                                     * every other call result */
+                                    if (gret->kind == TYPE_CLASS &&
+                                        method_ret_is_bare_tp(method_sym))
+                                        emit_arc_retain(g, result);
+                                }
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {
@@ -8640,14 +8665,27 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
                                 for (int k = 0; k < argc; k++) {
                                     call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
-                                        method_param_type(g, method_sym, k), locals);
+                                        method_param_type_at(g, method_sym, k, expr, NULL, locals), locals);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "scall";
                                 coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                                 LLVMValueRef result = zan_call2(g->builder, g->functions[fi].fn_type,
                                     g->functions[fi].fn, call_args, (unsigned)argc, cn);
                                 zan_type_t *gret = generic_method_ret(g, method_sym, expr, locals);
-                                if (gret) result = emit_boundary_coerce(g, result, map_type(g, gret));
+                                if (!gret && method_ret_is_bare_tp(method_sym)) {
+                                    zan_type_t *ir = method_ret_type_at(g, method_sym,
+                                        expr, NULL, locals);
+                                    if (ir && ir->kind != TYPE_TYPE_PARAM) gret = ir;
+                                }
+                                if (gret) {
+                                    result = emit_boundary_coerce(g, result, map_type(g, gret));
+                                    /* the erased body returned a borrowed +0
+                                     * class reference; make it owned like
+                                     * every other call result */
+                                    if (gret->kind == TYPE_CLASS &&
+                                        method_ret_is_bare_tp(method_sym))
+                                        emit_arc_retain(g, result);
+                                }
                                 int consumes_free_arg =
                                     argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                                 if (consumes_free_arg) {
@@ -8686,12 +8724,26 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                             method_param_type(g, method_sym, 0), locals);
                         for (int k = 0; k < expr->call.args.count; k++) {
                             call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
-                                method_param_type(g, method_sym, k + 1), locals);
+                                method_param_type_at(g, method_sym, k + 1, expr,
+                                                     callee->member.object, locals), locals);
                         }
                         const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "extcall";
                         coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
                         LLVMValueRef result = zan_call2(g->builder, g->functions[fi].fn_type,
                             g->functions[fi].fn, call_args, (unsigned)argc, cn);
+                        /* generic ext method returning bare T: coerce the
+                         * erased result to the inferred concrete type and, for
+                         * classes, own the borrowed +0 reference the erased
+                         * body returned */
+                        if (method_ret_is_bare_tp(method_sym)) {
+                            zan_type_t *gret = method_ret_type_at(g, method_sym,
+                                expr, callee->member.object, locals);
+                            if (gret && gret->kind != TYPE_TYPE_PARAM) {
+                                result = emit_boundary_coerce(g, result, map_type(g, gret));
+                                if (gret->kind == TYPE_CLASS)
+                                    emit_arc_retain(g, result);
+                            }
+                        }
                         emit_release_owned_call_temp(g, callee->member.object, call_args[0], locals);
                         for (int k = 0; k < expr->call.args.count; k++) {
                             emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -10394,6 +10446,172 @@ static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx
     zan_ast_node_t *p = params->items[idx];
     if (!p || !p->param.type) return NULL;
     return zan_binder_resolve_type(g->binder, p->param.type);
+}
+
+/* True when `t` mentions one of the method's own type parameters. */
+static bool type_mentions_tp(zan_type_t *t) {
+    if (!t) return false;
+    if (t->kind == TYPE_TYPE_PARAM) return true;
+    if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE)
+        return type_mentions_tp(t->element_type);
+    if (t->kind == TYPE_DELEGATE) {
+        if (type_mentions_tp(t->delegate_ret_type)) return true;
+        for (int i = 0; i < t->delegate_param_count; i++)
+            if (type_mentions_tp(t->delegate_param_types[i])) return true;
+    }
+    for (int i = 0; i < t->type_arg_count; i++)
+        if (type_mentions_tp(t->type_args[i])) return true;
+    return false;
+}
+
+/* Structurally match a declared (possibly type-parameterised) type against a
+ * concrete argument type, recording each type parameter's binding. */
+static void unify_method_tp(zan_type_t *dp, zan_type_t *at,
+                            zan_ast_list_t *tps, zan_type_t **bind) {
+    if (!dp || !at) return;
+    if (dp->kind == TYPE_TYPE_PARAM) {
+        for (int i = 0; i < tps->count; i++) {
+            zan_istr_t tn = tps->items[i]->ident.name;
+            if (tn.len == dp->name.len &&
+                memcmp(tn.str, dp->name.str, (size_t)dp->name.len) == 0) {
+                if (!bind[i]) bind[i] = at;
+                return;
+            }
+        }
+        return;
+    }
+    if ((dp->kind == TYPE_ARRAY || dp->kind == TYPE_NULLABLE) &&
+        dp->kind == at->kind) {
+        unify_method_tp(dp->element_type, at->element_type, tps, bind);
+        return;
+    }
+    for (int i = 0; i < dp->type_arg_count && i < at->type_arg_count; i++)
+        unify_method_tp(dp->type_args[i], at->type_args[i], tps, bind);
+}
+
+/* Substitute a generic method's own type parameters in `t` using `bind`,
+ * cloning composite types (delegates, generic instantiations) as needed. */
+static zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
+                                   zan_ast_list_t *tps, zan_type_t **bind) {
+    if (!t || !type_mentions_tp(t)) return t;
+    if (t->kind == TYPE_TYPE_PARAM) {
+        for (int i = 0; i < tps->count; i++) {
+            zan_istr_t tn = tps->items[i]->ident.name;
+            if (bind[i] && tn.len == t->name.len &&
+                memcmp(tn.str, t->name.str, (size_t)t->name.len) == 0)
+                return bind[i];
+        }
+        return t;
+    }
+    zan_type_t *nt = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
+    *nt = *t;
+    if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) {
+        nt->element_type = subst_method_tp(g, t->element_type, tps, bind);
+        return nt;
+    }
+    if (t->kind == TYPE_DELEGATE) {
+        nt->delegate_ret_type = subst_method_tp(g, t->delegate_ret_type, tps, bind);
+        if (t->delegate_param_count > 0) {
+            nt->delegate_param_types = (zan_type_t **)zan_arena_alloc(
+                g->arena, sizeof(zan_type_t *) * (size_t)t->delegate_param_count);
+            for (int i = 0; i < t->delegate_param_count; i++)
+                nt->delegate_param_types[i] =
+                    subst_method_tp(g, t->delegate_param_types[i], tps, bind);
+        }
+    }
+    if (t->type_arg_count > 0) {
+        nt->type_args = (zan_type_t **)zan_arena_alloc(
+            g->arena, sizeof(zan_type_t *) * (size_t)t->type_arg_count);
+        for (int i = 0; i < t->type_arg_count; i++)
+            nt->type_args[i] = subst_method_tp(g, t->type_args[i], tps, bind);
+    }
+    return nt;
+}
+
+/* Determine the bindings of a generic method's own type parameters at a call
+ * site: explicit type arguments when present, otherwise inferred by matching
+ * declared parameter types against the actual argument types (receiver
+ * included for extension methods, in which case `recv_expr` is the receiver
+ * bound to declared parameter 0). */
+static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
+                                     zan_ast_node_t *call,
+                                     zan_ast_node_t *recv_expr,
+                                     local_scope_t *locals,
+                                     zan_type_t **bind) {
+    zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
+    for (int i = 0; i < tps->count && i < call->call.type_args.count; i++)
+        bind[i] = zan_binder_resolve_type(g->binder, call->call.type_args.items[i]);
+
+    zan_ast_list_t *params = &msym->decl->method_decl.params;
+    int arg_base = recv_expr ? 1 : 0;
+    for (int j = 0; j < params->count; j++) {
+        zan_ast_node_t *aexpr = NULL;
+        if (arg_base == 1 && j == 0) aexpr = recv_expr;
+        else if (j - arg_base < call->call.args.count)
+            aexpr = call->call.args.items[j - arg_base];
+        if (!aexpr || aexpr->kind == AST_LAMBDA) continue;
+        zan_type_t *dp = method_param_type(g, msym, j);
+        if (!dp || !type_mentions_tp(dp)) continue;
+        zan_type_t *at = infer_expr_type(g, aexpr, locals);
+        if (at && !type_mentions_tp(at)) unify_method_tp(dp, at, tps, bind);
+    }
+}
+
+/* method_param_type with the generic method's type parameters substituted for
+ * this call site. This is what lets an untyped lambda argument (`x => ...`)
+ * get its parameter types from e.g. a `Pred<T>` delegate once T is known. */
+static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
+                                        int idx, zan_ast_node_t *call,
+                                        zan_ast_node_t *recv_expr,
+                                        local_scope_t *locals) {
+    zan_type_t *pt = method_param_type(g, msym, idx);
+    if (!pt || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return pt;
+    zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
+    if (tps->count == 0 || tps->count > 8) return pt;
+    if (!type_mentions_tp(pt)) return pt;
+    if (!call || call->kind != AST_CALL) return pt;
+
+    zan_type_t *bind[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+    infer_method_tp_bindings(g, msym, call, recv_expr, locals, bind);
+    return subst_method_tp(g, pt, tps, bind);
+}
+
+/* True when the method's declared return type is one of its own bare type
+ * parameters (e.g. `static T First<T>(...)`). The erased generic body cannot
+ * know T is a class, so it returns a borrowed (+0) reference; call sites that
+ * treat call results as owned must retain such results. */
+static bool method_ret_is_bare_tp(zan_symbol_t *msym) {
+    if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return false;
+    zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
+    if (tps->count == 0) return false;
+    zan_ast_node_t *ret_ref = msym->decl->method_decl.return_type;
+    if (!ret_ref || ret_ref->kind != AST_TYPE_REF) return false;
+    if (ret_ref->type_ref.type_args.count > 0 || ret_ref->type_ref.is_array)
+        return false;
+    zan_istr_t rn = ret_ref->type_ref.name;
+    for (int i = 0; i < tps->count; i++) {
+        zan_istr_t tn = tps->items[i]->ident.name;
+        if (tn.len == rn.len && memcmp(tn.str, rn.str, (size_t)rn.len) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Declared return type of a generic method with its type parameters
+ * substituted for this call site (identity for non-generic methods). */
+static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
+                                      zan_ast_node_t *call,
+                                      zan_ast_node_t *recv_expr,
+                                      local_scope_t *locals) {
+    zan_type_t *rt = msym ? msym->type : NULL;
+    if (!rt || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return rt;
+    zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
+    if (tps->count == 0 || tps->count > 8) return rt;
+    if (!type_mentions_tp(rt)) return rt;
+    if (!call || call->kind != AST_CALL) return rt;
+    zan_type_t *bind[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+    infer_method_tp_bindings(g, msym, call, recv_expr, locals, bind);
+    return subst_method_tp(g, rt, tps, bind);
 }
 
 static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
@@ -12553,6 +12771,22 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                          (int)decl->type_decl.name.len, decl->type_decl.name.str,
                          (int)member->method_decl.name.len, member->method_decl.name.str,
                          vsuffix);
+                /* Same-named overloads would otherwise all be added as this
+                 * one LLVM symbol; LLVM silently renames the later ones (e.g.
+                 * "Box_GetAsync.1"), which breaks the async ramp/$resume
+                 * pairing - an await site derives the resume symbol from the
+                 * callee's actual name and would find nothing, falling into
+                 * the legacy busy-wait path (a hang). Uniquify explicitly so
+                 * every ramp keeps a matching "$resume". */
+                {
+                    char base_name[512];
+                    int oi = 2;
+                    snprintf(base_name, sizeof(base_name), "%s", fn_name);
+                    while (LLVMGetNamedFunction(g->mod, fn_name)) {
+                        snprintf(fn_name, sizeof(fn_name), "%s$o%d",
+                                 base_name, oi++);
+                    }
+                }
             }
 
             /* build function type */
