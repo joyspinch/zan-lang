@@ -1,0 +1,203 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Tls;
+
+namespace System.Net.WebSocket;
+
+/// <summary>Handles one decoded text/binary message; the return value is sent
+/// back to the client (echo the argument for a pure echo server).</summary>
+delegate string WssMessageHandler(string message);
+
+/// <summary>
+/// WebSocket-over-TLS (wss://) server. Same framing as
+/// <see cref="WebSocketServer"/>, with every byte flowing through a
+/// per-connection <see cref="TlsStream"/>.
+///
+/// Usage:
+///   WssServer server = WssServer.Create("0.0.0.0", 8443,
+///                                       "cert.pem", "key.pem");
+///   server.OnMessage(Handle);
+///   await server.Start();
+/// </summary>
+class WssServer {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    TcpListener listener;
+    TlsContext tls;
+    string host;
+    int port;
+    bool running;
+    int activeConnections;
+    WssMessageHandler messageHandler;
+
+    WssServer(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.activeConnections = 0;
+        this.messageHandler = null;
+        this.tls = null;
+    }
+
+    /// <summary>Creates a wss server from a PEM certificate chain and PEM
+    /// private key. Returns null when the certificate/key cannot be
+    /// loaded.</summary>
+    static WssServer Create(string host, int port, string certFile, string keyFile) {
+        WssServer server = new WssServer(host, port);
+        server.tls = TlsContext.CreateServer(certFile, keyFile);
+        if (server.tls == null) {
+            return null;
+        }
+        return server;
+    }
+
+    /// <summary>Registers the per-message handler; its return value is sent
+    /// back to the client.</summary>
+    WssServer OnMessage(WssMessageHandler handler) {
+        this.messageHandler = handler;
+        return this;
+    }
+
+    async void Start() {
+        Socket.Initialize();
+        this.listener = TcpListener.Create(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+
+        while (this.running) {
+            int clientSock = await this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                this.activeConnections = this.activeConnections + 1;
+                Task.Spawn(HandleConnection(clientSock));
+            }
+        }
+    }
+
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) {
+            this.listener.Stop();
+        }
+    }
+
+    async void HandleConnection(int clientSock) {
+        Socket.SetNonBlocking(clientSock);
+        TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock);
+        if (stream == null) {
+            Socket.Close(clientSock);
+            this.activeConnections = this.activeConnections - 1;
+            return;
+        }
+
+        // HTTP upgrade handshake over TLS.
+        string rawReq = "";
+        int headerEnd = HttpServer.FindHeaderEnd(rawReq);
+        bool alive = true;
+        while (headerEnd < 0) {
+            string chunk = await stream.RecvAsync(65536);
+            if (chunk.Length == 0) { alive = false; break; }
+            rawReq = rawReq + chunk;
+            headerEnd = HttpServer.FindHeaderEnd(rawReq);
+        }
+        if (!alive) {
+            stream.Close();
+            Socket.Close(clientSock);
+            this.activeConnections = this.activeConnections - 1;
+            return;
+        }
+
+        HttpRequest req = HttpRequest.Parse(rawReq);
+        string upgrade = req.GetHeader("Upgrade");
+        if (upgrade != "websocket" && upgrade != "Websocket") {
+            HttpResponse resp = HttpResponse.WithStatus(400, "Bad Request", "Expected WebSocket upgrade");
+            string data = resp.Build();
+            int _b = await stream.SendAsync(data, data.Length);
+            stream.Close();
+            Socket.Close(clientSock);
+            this.activeConnections = this.activeConnections - 1;
+            return;
+        }
+
+        string wsKey = req.GetHeader("Sec-WebSocket-Key");
+        string acceptKey = Encoding.WebSocketAccept(wsKey);
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Accept: ");
+        sb.Append(acceptKey);
+        sb.Append("\r\n\r\n");
+        string hs = sb.ToString();
+        int _h = await stream.SendAsync(hs, hs.Length);
+
+        WsReader reader = new WsReader(clientSock);
+        // any bytes that followed the upgrade request are already frames
+        if (rawReq.Length > headerEnd) {
+            string extra = rawReq.Substring(headerEnd);
+            reader.Append(extra, extra.Length);
+        }
+
+        // binary-safe frame receive: decrypted bytes land in `plain` with an
+        // explicit count (frame payloads may contain NUL bytes)
+        string plain = calloc(65537, 1);
+        bool connected = true;
+        while (connected) {
+            int total = reader.FrameSize();
+            while (total < 0) {
+                int n = await stream.RecvIntoAsync(plain, 65536);
+                if (n <= 0) {
+                    connected = false;
+                    break;
+                }
+                reader.Append(plain, n);
+                total = reader.FrameSize();
+            }
+            if (!connected) { break; }
+
+            WsFrame frame = WsFrame.Decode(reader.buf, total);
+            reader.Consume(total);
+
+            if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
+                string response = OnMessageInternal(frame.payload);
+                int respLen = response.Length;
+                WsFrame respFrame = WsFrame.BinaryFrame(response, respLen);
+                respFrame.opcode = frame.opcode;
+                string encoded = respFrame.Encode();
+                int hdrLen = 2;
+                if (respLen > 65535) {
+                    hdrLen = 10;
+                } else if (respLen > 125) {
+                    hdrLen = 4;
+                }
+                int _s = await stream.SendAsync(encoded, hdrLen + respLen);
+            } else if (frame.opcode == WsOpcode.Ping) {
+                WsFrame pong = WsFrame.PongFrame();
+                string encoded = pong.Encode();
+                int _p = await stream.SendAsync(encoded, 2);
+            } else if (frame.opcode == WsOpcode.Close) {
+                WsFrame closeResp = WsFrame.CloseFrame();
+                string encoded = closeResp.Encode();
+                int _c = await stream.SendAsync(encoded, 2);
+                connected = false;
+            }
+        }
+
+        free(plain);
+        stream.Close();
+        Socket.Close(clientSock);
+        this.activeConnections = this.activeConnections - 1;
+    }
+
+    string OnMessageInternal(string message) {
+        WssMessageHandler handler = this.messageHandler;
+        if (handler != null) {
+            return handler(message);
+        }
+        return message;
+    }
+}

@@ -192,7 +192,7 @@ endif()
 # without any external toolchain.  Each sysroot contains crt*.o, libc.a, a
 # pre-built zanrt_io.o for socket-async programs, and zanrt_sync.o for
 # atomics/shared-memory programs.
-foreach(_linux_sub linux-musl linux-arm64 riscv64)
+foreach(_linux_sub linux-musl linux-arm64 linux-riscv64)
     set(_linux_sys "${CMAKE_SOURCE_DIR}/toolchain/${_linux_sub}")
     if(EXISTS "${_linux_sys}/libc.a")
         add_custom_command(TARGET zanc POST_BUILD

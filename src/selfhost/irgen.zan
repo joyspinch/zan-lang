@@ -60,6 +60,7 @@ class Irgen {
     public Node curAsyncThisTy;
     public List<string> gotoNames; // per-function goto label name -> id
     public List<int> gotoIds;
+    public bool crcEmitted; // NativeMemory.Crc32 helper+table emitted once
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -81,6 +82,7 @@ class Irgen {
         stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
         externDecls = new List<string>();
+        crcEmitted = false;
     }
 
     // The raw C-ABI symbol an extern (DllImport) method binds to: the
@@ -188,7 +190,7 @@ class Irgen {
     bool IsPrimValue(Node t) {
         if (t == null) { return false; }
         string n = t.sval;
-        return n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "double" || n == "float" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte";
+        return n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "double" || n == "float" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte" || n == "nint";
     }
 
     bool IsNullableValue(Node t) { return IsNullable(t) && IsPrimValue(t); }
@@ -216,6 +218,207 @@ class Irgen {
         return BoxVal(v, ty);
     }
 
+    // ---- NativeMemory intrinsics (mirror src/compiler/irgen.c) ----
+    // A raw address is a plain i64 (nint) that never enters ARC. addr(base,off)
+    // yields an i8* at base+off via inttoptr + getelementptr.
+    string NmAddr(string adr, string off) {
+        string p = NT();
+        L("  " + p + " = inttoptr i64 " + adr + " to i8*");
+        if (off == "0") { return p; }
+        string a = NT();
+        L("  " + a + " = getelementptr i8, i8* " + p + ", i64 " + off);
+        return a;
+    }
+
+    // little-endian, align-1 load of <ity> at base+off, zero-extended to i64.
+    string NmLoad(string adr, string off, string ity, bool zext) {
+        string a = NmAddr(adr, off);
+        string lp = NT();
+        L("  " + lp + " = bitcast i8* " + a + " to " + ity + "*");
+        string v = NT();
+        L("  " + v + " = load " + ity + ", " + ity + "* " + lp + ", align 1");
+        if (zext) {
+            string z = NT();
+            L("  " + z + " = zext " + ity + " " + v + " to i64");
+            return z;
+        }
+        return v;
+    }
+
+    // align-1 store of an i64 value (truncated to <ity>) at base+off.
+    void NmStore(string adr, string off, string ity, string val, bool trunc) {
+        string a = NmAddr(adr, off);
+        string sp = NT();
+        L("  " + sp + " = bitcast i8* " + a + " to " + ity + "*");
+        string sv = val;
+        if (trunc) {
+            string t = NT();
+            L("  " + t + " = trunc i64 " + val + " to " + ity);
+            sv = t;
+        }
+        L("  store " + ity + " " + sv + ", " + ity + "* " + sp + ", align 1");
+    }
+
+    // Emit the self-contained CRC32 (IEEE 802.3, reflected poly 0xEDB88320)
+    // helper and its compile-time-computed 256-entry table, once per module.
+    void EmitCrc32Helper() {
+        if (crcEmitted) { return; }
+        crcEmitted = true;
+        string tab = "";
+        int i = 0;
+        while (i < 256) {
+            int c = i;
+            int k = 0;
+            while (k < 8) {
+                if ((c & 1) != 0) { c = 3988292384 ^ (c >> 1); }
+                else { c = c >> 1; }
+                k = k + 1;
+            }
+            if (i > 0) { tab = tab + ", "; }
+            tab = tab + "i32 " + c;
+            i = i + 1;
+        }
+        H("@__zan_crc32_table = private unnamed_addr constant [256 x i32] [" + tab + "]");
+        H("define internal i64 @__zan_nm_crc32(i8* %data, i64 %len) {");
+        H("entry:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %i = phi i64 [ 0, %entry ], [ %ni, %body ]");
+        H("  %crc = phi i32 [ -1, %entry ], [ %nc, %body ]");
+        H("  %inr = icmp slt i64 %i, %len");
+        H("  br i1 %inr, label %body, label %done");
+        H("body:");
+        H("  %bp = getelementptr i8, i8* %data, i64 %i");
+        H("  %b = load i8, i8* %bp");
+        H("  %b32 = zext i8 %b to i32");
+        H("  %x = xor i32 %crc, %b32");
+        H("  %ti = and i32 %x, 255");
+        H("  %ti64 = zext i32 %ti to i64");
+        H("  %ep = getelementptr [256 x i32], [256 x i32]* @__zan_crc32_table, i64 0, i64 %ti64");
+        H("  %te = load i32, i32* %ep");
+        H("  %sh = lshr i32 %crc, 8");
+        H("  %nc = xor i32 %te, %sh");
+        H("  %ni = add i64 %i, 1");
+        H("  br label %loop");
+        H("done:");
+        H("  %fin = xor i32 %crc, -1");
+        H("  %fin64 = zext i32 %fin to i64");
+        H("  ret i64 %fin64");
+        H("}");
+    }
+
+    // Lower a NativeMemory.<Method>(...) call inline, mirroring the C host.
+    // Returns null when the call is not a recognised intrinsic.
+    ExprVal GenNativeMemory(Node callee, Node e) {
+        string m = callee.sval;
+        int argc = e.kids.Count;
+        if (m == "Alloc" && argc == 1) {
+            ExprVal sz = GenExpr(e.kids[0]);
+            string p = NT();
+            L("  " + p + " = call i8* @calloc(i64 " + sz.op + ", i64 1)");
+            string a = NT();
+            L("  " + a + " = ptrtoint i8* " + p + " to i64");
+            return new ExprVal(a, MkType("nint"));
+        }
+        if (m == "Free" && argc == 1) {
+            ExprVal p = GenExpr(e.kids[0]);
+            string fp = NT();
+            L("  " + fp + " = inttoptr i64 " + p.op + " to i8*");
+            L("  call void @free(i8* " + fp + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "Copy" && argc == 3) {
+            ExprVal dst = GenExpr(e.kids[0]);
+            ExprVal src = GenExpr(e.kids[1]);
+            ExprVal n = GenExpr(e.kids[2]);
+            string dp = NmAddr(dst.op, "0");
+            string spp = NmAddr(src.op, "0");
+            L("  call i8* @memmove(i8* " + dp + ", i8* " + spp + ", i64 " + n.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "Fill" && argc == 3) {
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal v = GenExpr(e.kids[1]);
+            ExprVal n = GenExpr(e.kids[2]);
+            string dp = NmAddr(p.op, "0");
+            string vb = NT();
+            L("  " + vb + " = trunc i64 " + v.op + " to i32");
+            L("  call i8* @memset(i8* " + dp + ", i32 " + vb + ", i64 " + n.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "Compare" && argc == 3) {
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            ExprVal n = GenExpr(e.kids[2]);
+            string ap = NmAddr(a.op, "0");
+            string bp = NmAddr(b.op, "0");
+            string r = NT();
+            L("  " + r + " = call i32 @memcmp(i8* " + ap + ", i8* " + bp + ", i64 " + n.op + ")");
+            string r64 = NT();
+            L("  " + r64 + " = sext i32 " + r + " to i64");
+            return new ExprVal(r64, MkType("int"));
+        }
+        if (m == "GetByte" && argc == 2) { return NmGet(e, "i8"); }
+        if (m == "GetU16" && argc == 2) { return NmGet(e, "i16"); }
+        if (m == "GetU32" && argc == 2) { return NmGet(e, "i32"); }
+        if (m == "GetI64" && argc == 2) { return NmGet(e, "i64"); }
+        if (m == "SetByte" && argc == 3) { return NmSet(e, "i8"); }
+        if (m == "SetU16" && argc == 3) { return NmSet(e, "i16"); }
+        if (m == "SetU32" && argc == 3) { return NmSet(e, "i32"); }
+        if (m == "SetI64" && argc == 3) { return NmSet(e, "i64"); }
+        if (m == "GetString" && argc == 3) {
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal off = GenExpr(e.kids[1]);
+            ExprVal len = GenExpr(e.kids[2]);
+            string total = NT();
+            L("  " + total + " = add i64 " + len.op + ", 1");
+            string s = NT();
+            L("  " + s + " = call i8* @malloc(i64 " + total + ")");
+            string src = NmAddr(p.op, off.op);
+            L("  call i8* @memcpy(i8* " + s + ", i8* " + src + ", i64 " + len.op + ")");
+            string endp = NT();
+            L("  " + endp + " = getelementptr i8, i8* " + s + ", i64 " + len.op);
+            L("  store i8 0, i8* " + endp);
+            return new ExprVal(s, MkType("string"));
+        }
+        if (m == "PutString" && argc == 4) {
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal off = GenExpr(e.kids[1]);
+            ExprVal s = GenExpr(e.kids[2]);
+            ExprVal len = GenExpr(e.kids[3]);
+            string dp = NmAddr(p.op, off.op);
+            L("  call i8* @memcpy(i8* " + dp + ", i8* " + s.op + ", i64 " + len.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "Crc32" && argc == 2) {
+            EmitCrc32Helper();
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal len = GenExpr(e.kids[1]);
+            string dp = NmAddr(p.op, "0");
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_nm_crc32(i8* " + dp + ", i64 " + len.op + ")");
+            return new ExprVal(r, MkType("int"));
+        }
+        return null;
+    }
+
+    ExprVal NmGet(Node e, string ity) {
+        ExprVal p = GenExpr(e.kids[0]);
+        ExprVal off = GenExpr(e.kids[1]);
+        bool zext = ity != "i64";
+        string v = NmLoad(p.op, off.op, ity, zext);
+        return new ExprVal(v, MkType("int"));
+    }
+
+    ExprVal NmSet(Node e, string ity) {
+        ExprVal p = GenExpr(e.kids[0]);
+        ExprVal off = GenExpr(e.kids[1]);
+        ExprVal v = GenExpr(e.kids[2]);
+        bool trunc = ity != "i64";
+        NmStore(p.op, off.op, ity, v.op, trunc);
+        return new ExprVal("0", MkType("void"));
+    }
+
     string MapType(Node t) {
         if (t == null) { return "void"; }
         string n = t.sval;
@@ -225,7 +428,7 @@ class Irgen {
         if (n == "void") { return "void"; }
         if (n == "string") { return "i8*"; }
         if (n == "double" || n == "float") { return "double"; }
-        if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte") { return "i64"; }
+        if (n == "int" || n == "long" || n == "bool" || n == "char" || n == "byte" || n == "short" || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte" || n == "nint") { return "i64"; }
         if (n == "object" || n == "var") { return "i8*"; }
         if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
         if (n == "StringBuilder") { return "i8*"; }
@@ -546,6 +749,9 @@ class Irgen {
         H("declare i8* @strcpy(i8*, i8*)");
         H("declare i8* @strcat(i8*, i8*)");
         H("declare i8* @memcpy(i8*, i8*, i64)");
+        H("declare i8* @memmove(i8*, i8*, i64)");
+        H("declare i8* @memset(i8*, i32, i64)");
+        H("declare i32 @memcmp(i8*, i8*, i64)");
         H("declare i32 @snprintf(i8*, i64, i8*, ...)");
         H("declare i8* @fopen(i8*, i8*)");
         H("declare i32 @fseek(i8*, i64, i32)");
@@ -5193,6 +5399,12 @@ class Irgen {
                 L("  " + r3 + " = ashr i64 " + r2 + ", 32");
                 return new ExprVal(r3, MkType("int"));
             }
+        }
+        // NativeMemory.* -> inline raw-memory intrinsics (no external symbol)
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "NativeMemory" && LocalIdx("NativeMemory") < 0) {
+            ExprVal nm = GenNativeMemory(callee, e);
+            if (nm != null) { return nm; }
         }
         // method access forms
         if (callee.kind == AK.MemberAccess()) {

@@ -1,16 +1,20 @@
 using System;
 using System.Net.Sockets;
 using System.Net.Http;
+using System.Net.Tls;
 
 namespace System.Net.Http;
 
 /// <summary>
-/// HTTP client supporting GET, POST, PUT, DELETE.
+/// HTTP client supporting GET, POST, PUT, DELETE, over plain TCP or TLS
+/// (https via CreateHttps / UseTls).
 /// </summary>
 class HttpClient {
     string host;
     int port;
     int timeout;
+    bool useTls;
+    bool verifyTls;
     List<string> defaultHeaders;
 
     [DllImport("crt")]
@@ -26,6 +30,8 @@ class HttpClient {
         this.host = "";
         this.port = 80;
         this.timeout = 30000;
+        this.useTls = false;
+        this.verifyTls = true;
         this.defaultHeaders = new List<string>();
     }
 
@@ -35,6 +41,26 @@ class HttpClient {
         client.host = host;
         client.port = port;
         return client;
+    }
+
+    /// <summary>Creates an HTTPS client for a given host and port.</summary>
+    static HttpClient CreateHttps(string host, int port) {
+        HttpClient client = HttpClient.Create(host, port);
+        client.useTls = true;
+        return client;
+    }
+
+    /// <summary>Enables TLS (https) for this client.</summary>
+    HttpClient UseTls() {
+        this.useTls = true;
+        return this;
+    }
+
+    /// <summary>Disables server certificate verification (development /
+    /// self-signed servers only).</summary>
+    HttpClient DisableTlsVerify() {
+        this.verifyTls = false;
+        return this;
     }
 
     /// <summary>Adds a default header to all requests.</summary>
@@ -51,8 +77,6 @@ class HttpClient {
 
     /// <summary>Sends an HTTP request and returns the raw response.</summary>
     async string RequestAsync(string method, string path, string body) {
-        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port);
-
         StringBuilder sb = new StringBuilder();
         sb.Append(method);
         sb.Append(" ");
@@ -82,6 +106,12 @@ class HttpClient {
             sb.Append(body);
         }
 
+        if (this.useTls) {
+            string raw = await RequestTlsAsync(sb.ToString());
+            return raw;
+        }
+
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port);
         int _sent = await conn.SendAsync(sb.ToString());
 
         // Read response
@@ -97,6 +127,43 @@ class HttpClient {
         }
 
         conn.Close();
+        return respSb.ToString();
+    }
+
+    // Sends one already-built request over a fresh TLS connection and reads
+    // the whole response (Connection: close framing).
+    async string RequestTlsAsync(string requestData) {
+        Socket.Initialize();
+        TcpClient conn = await TcpClient.ConnectAsync(this.host, this.port);
+        if (conn == null) { return ""; }
+        TlsContext ctx = TlsContext.CreateClient();
+        if (ctx == null) { conn.Close(); return ""; }
+        if (!this.verifyTls) {
+            ctx.DisableVerify();
+        }
+        TlsStream stream = await TlsStream.ConnectAsync(ctx, conn.Sock(), this.host);
+        if (stream == null) {
+            conn.Close();
+            ctx.Free();
+            return "";
+        }
+
+        int _sent = await stream.SendAsync(requestData, requestData.Length);
+
+        StringBuilder respSb = new StringBuilder();
+        bool reading = true;
+        while (reading) {
+            string chunk = await stream.RecvAsync(65536);
+            if (chunk.Length == 0) {
+                reading = false;
+            } else {
+                respSb.Append(chunk);
+            }
+        }
+
+        stream.Close();
+        conn.Close();
+        ctx.Free();
         return respSb.ToString();
     }
 
@@ -126,6 +193,14 @@ class HttpClient {
         string raw = await RequestAsync("DELETE", path, "");
         HttpResponse resp = HttpResponse.Parse(raw);
         return resp.body;
+    }
+
+    /// <summary>Quick static https GET (one-shot); verification stays on, so
+    /// the server certificate must chain to a trusted CA.</summary>
+    static async string GetHttpsAsync(string host, int port, string path) {
+        HttpClient client = HttpClient.CreateHttps(host, port);
+        string r = await client.GetAsync(path);
+        return r;
     }
 
     /// <summary>Quick static GET method (one-shot).</summary>

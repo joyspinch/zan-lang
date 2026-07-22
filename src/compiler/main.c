@@ -107,18 +107,37 @@ static int input_file_present(const char **files, int count, const char *cand) {
     return 0;
 }
 
+/* Growable input-file list: explicit CLI arguments plus every transitively
+ * auto-included stdlib .zan file. There is no fixed upper bound — the list
+ * grows to fit whatever the program pulls in (the self-hosted IDE alone lists
+ * ~114 files explicitly and auto-includes many more stdlib modules). */
+static void input_files_push(const char ***files, int *count, int *cap,
+                             const char *path) {
+    if (*count == *cap) {
+        int ncap = *cap ? *cap * 2 : 16;
+        const char **grown =
+            (const char **)realloc((void *)*files, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "error: out of memory tracking input files\n");
+            exit(1);
+        }
+        *files = grown;
+        *cap = ncap;
+    }
+    (*files)[(*count)++] = path;
+}
+
 /* Append an auto-discovered stdlib file: skip if it does not exist or is
  * already present (explicitly or from an earlier auto-include). */
-static void add_stdlib_input(const char **files, int *count, const char *path) {
+static void add_stdlib_input(const char ***files, int *count, int *cap,
+                             const char *path) {
     FILE *check = fopen(path, "rb");
     if (!check) return;
     fclose(check);
-    if (input_file_present(files, *count, path)) return;
-    if (*count < 128) {
-        char *dup = (char *)malloc(strlen(path) + 1);
-        memcpy(dup, path, strlen(path) + 1);
-        files[(*count)++] = dup;
-    }
+    if (input_file_present(*files, *count, path)) return;
+    char *dup = (char *)malloc(strlen(path) + 1);
+    memcpy(dup, path, strlen(path) + 1);
+    input_files_push(files, count, cap, dup);
 }
 
 #ifndef _WIN32
@@ -173,7 +192,7 @@ static int resolve_stdlib_dir(const char *stdlib_root, const char *subdir,
  * checked). Returns 1 if any new file was added. `subdir` uses '/' separators
  * (accepted by the Win32 file APIs too). */
 static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
-                           const char **files, int *count) {
+                           const char ***files, int *count, int *cap) {
     int before = *count;
 #ifdef _WIN32
     char glob_path[1024];
@@ -186,7 +205,7 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
             char mod_path[1024];
             snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
                      stdlib_root, subdir, fd.cFileName);
-            add_stdlib_input(files, count, mod_path);
+            add_stdlib_input(files, count, cap, mod_path);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
@@ -202,7 +221,7 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
             if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
             char mod_path[1024];
             snprintf(mod_path, sizeof(mod_path), "%s/%s", dir_path, ent->d_name);
-            add_stdlib_input(files, count, mod_path);
+            add_stdlib_input(files, count, cap, mod_path);
         }
         closedir(d);
     }
@@ -889,8 +908,9 @@ int main(int argc, char **argv) {
     }
 
     const char *input_file = NULL;
-    const char *input_files[128];
+    const char **input_files = NULL;
     int input_count = 0;
+    int input_cap = 0;
     const char *output_file = NULL;
     bool do_dump_tokens = false;
     bool do_dump_ast = false;
@@ -989,12 +1009,7 @@ int main(int argc, char **argv) {
         } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
             if (pp_define_count < 64) pp_defines[pp_define_count++] = argv[i] + 2;
         } else if (argv[i][0] != '-') {
-            if (input_count < 128) {
-                input_files[input_count++] = argv[i];
-            } else {
-                fprintf(stderr, "error: too many input files (max 128)\n");
-                return 1;
-            }
+            input_files_push(&input_files, &input_count, &input_cap, argv[i]);
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 1;
@@ -1119,7 +1134,7 @@ int main(int argc, char **argv) {
                     subdir[j] = '\0';
                     if (j > 0 && *p == ';') {
                         if (glob_stdlib_dir(stdlib_root, subdir,
-                                            input_files, &input_count)) {
+                                            &input_files, &input_count, &input_cap)) {
                             changed = 1;
                         }
                     }
@@ -1618,7 +1633,7 @@ int main(int argc, char **argv) {
             const char *sub = (target.arch == ZAN_ARCH_AARCH64)
                               ? "linux-arm64"
                               : (target.arch == ZAN_ARCH_RISCV64)
-                              ? "riscv64" : "linux-musl";
+                              ? "linux-riscv64" : "linux-musl";
             /* Sysroot sits right next to zanc, in whatever directory the
              * compiler was installed into (dev: build/<sub>; release:
              * dist/toolchain/<sub>). No separate toolchain/ subdirectory. */

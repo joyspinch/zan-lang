@@ -18,7 +18,8 @@ static const zan_target_info_t s_targets[] = {
     { "macos-x64",   "x86_64-apple-macosx",       "macOS x86-64" },
     { "macos-arm64", "aarch64-apple-macosx",       "macOS ARM64 (Apple Silicon)" },
     { "wasm32",      "wasm32-unknown-wasi",        "WebAssembly 32-bit (WASI)" },
-    { "riscv64",     "riscv64-unknown-linux-musl",  "RISC-V 64-bit Linux" },
+    { "linux-riscv64", "riscv64-unknown-linux-musl", "RISC-V 64-bit Linux (musl static)" },
+    { "riscv64",       "riscv64-unknown-linux-musl", "RISC-V 64-bit Linux (alias of linux-riscv64)" },
 };
 
 #define NUM_TARGETS (int)(sizeof(s_targets) / sizeof(s_targets[0]))

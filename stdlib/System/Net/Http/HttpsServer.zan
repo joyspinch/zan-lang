@@ -1,0 +1,168 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Tls;
+
+namespace System.Net.Http;
+
+/// <summary>
+/// Coroutine-based HTTPS (HTTP/1.1 over TLS) server. Same programming model
+/// as <see cref="HttpServer"/>, with per-connection TLS via
+/// <see cref="TlsStream"/> (OpenSSL).
+///
+/// Usage:
+///   HttpsServer server = HttpsServer.Create("0.0.0.0", 8443,
+///                                           "cert.pem", "key.pem");
+///   server.OnRequest(HandleRequest);
+///   await server.Start();
+/// </summary>
+class HttpsServer {
+    TcpListener listener;
+    TlsContext tls;
+    string host;
+    int port;
+    bool running;
+    int activeConnections;
+    int maxRequestBytes;
+    HttpRequestHandler requestHandler;
+
+    HttpsServer(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.running = false;
+        this.activeConnections = 0;
+        this.maxRequestBytes = 1048576;
+        this.requestHandler = null;
+        this.tls = null;
+    }
+
+    /// <summary>Creates an HTTPS server from a PEM certificate chain and PEM
+    /// private key. Returns null when the certificate/key cannot be
+    /// loaded.</summary>
+    static HttpsServer Create(string host, int port, string certFile, string keyFile) {
+        HttpsServer server = new HttpsServer(host, port);
+        server.tls = TlsContext.CreateServer(certFile, keyFile);
+        if (server.tls == null) {
+            return null;
+        }
+        return server;
+    }
+
+    /// <summary>Sets the maximum accepted size, in bytes, of a single request
+    /// (headers + body).</summary>
+    HttpsServer SetMaxRequestBytes(int bytes) {
+        this.maxRequestBytes = bytes;
+        return this;
+    }
+
+    /// <summary>Registers the handler invoked for every incoming request.</summary>
+    HttpsServer OnRequest(HttpRequestHandler handler) {
+        this.requestHandler = handler;
+        return this;
+    }
+
+    /// <summary>Starts the HTTPS server event loop. Runs forever, accepting
+    /// and handling connections on coroutines.</summary>
+    async void Start() {
+        Socket.Initialize();
+        this.listener = TcpListener.Create(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+
+        while (this.running) {
+            int clientSock = await this.listener.AcceptAsync();
+            if (clientSock >= 0) {
+                this.activeConnections = this.activeConnections + 1;
+                Task.Spawn(HandleConnection(clientSock));
+            }
+        }
+    }
+
+    /// <summary>Stops accepting new connections.</summary>
+    void Stop() {
+        this.running = false;
+    }
+
+    /// <summary>TLS-handshakes one client connection, then serves HTTP/1.1
+    /// requests over it (keep-alive and pipelining supported) using the same
+    /// framing as <see cref="HttpServer.HandleConnection"/>.</summary>
+    async void HandleConnection(int clientSock) {
+        Socket.SetNonBlocking(clientSock);
+        TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock);
+        if (stream == null) {
+            Socket.Close(clientSock);
+            this.activeConnections = this.activeConnections - 1;
+            return;
+        }
+
+        bool keepAlive = true;
+        string buffer = "";
+        bool overflow = false;
+
+        while (keepAlive) {
+            int headerEnd = HttpServer.FindHeaderEnd(buffer);
+            while (headerEnd < 0) {
+                if (buffer.Length > this.maxRequestBytes) { overflow = true; break; }
+                string chunk = await stream.RecvAsync(65536);
+                if (chunk.Length == 0) { keepAlive = false; break; }
+                buffer = buffer + chunk;
+                headerEnd = HttpServer.FindHeaderEnd(buffer);
+            }
+            if (overflow) { break; }
+            if (!keepAlive) { break; }
+
+            HttpRequest request = HttpRequest.Parse(buffer);
+            int bodyLen = request.contentLength;
+            if (bodyLen < 0) { bodyLen = 0; }
+            int need = headerEnd + bodyLen;
+            if (need > this.maxRequestBytes) { overflow = true; break; }
+            while (buffer.Length < need) {
+                string chunk = await stream.RecvAsync(65536);
+                if (chunk.Length == 0) { keepAlive = false; break; }
+                buffer = buffer + chunk;
+            }
+            if (!keepAlive && buffer.Length < need) { break; }
+
+            if (bodyLen > 0) {
+                request.body = buffer.Substring(headerEnd, bodyLen);
+            } else {
+                request.body = "";
+            }
+            if (buffer.Length > need) {
+                buffer = buffer.Substring(need);
+            } else {
+                buffer = "";
+            }
+            keepAlive = request.keepAlive;
+
+            HttpResponse response = ProcessRequest(request);
+            response = response.SetKeepAlive(keepAlive);
+
+            string responseData = response.Build();
+            int _sent = await stream.SendAsync(responseData, responseData.Length);
+
+            if (!keepAlive) {
+                break;
+            }
+        }
+
+        if (overflow) {
+            HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
+            tooLarge = tooLarge.SetKeepAlive(false);
+            string data = tooLarge.Build();
+            int _s = await stream.SendAsync(data, data.Length);
+        }
+
+        stream.Close();
+        Socket.Close(clientSock);
+        this.activeConnections = this.activeConnections - 1;
+    }
+
+    HttpResponse ProcessRequest(HttpRequest request) {
+        HttpRequestHandler handler = this.requestHandler;
+        if (handler != null) {
+            return handler(request);
+        }
+        return HttpResponse.Ok("<h1>Zan HTTPS Server</h1><p>Override ProcessRequest to handle routes.</p>");
+    }
+}

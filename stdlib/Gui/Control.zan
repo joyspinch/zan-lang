@@ -10,13 +10,13 @@ namespace Gui;
 /// Layout is WinForms-style docking (see `Arrange`): docked children snap to an
 /// edge and consume space in insertion order, a `Fill` child takes what remains,
 /// and `Manual` children sit at an explicit offset inside the parent. Drawing is
-/// polymorphic — subclasses override `OnPaint` and the framework recurses via
+/// polymorphic - subclasses override `OnPaint` and the framework recurses via
 /// `Paint`, clipping each subtree to its parent's box so content cannot bleed
 /// out (reuses the native clip stack).
 ///
 /// NOTE: the base method names are deliberately unusual (Paint/Arrange/
 /// MeasureTree/InitControl/OnPaint/OnMeasure) so they never collide with a
-/// widget's own methods when a widget subclasses Control — the compiler resolves
+/// widget's own methods when a widget subclasses Control - the compiler resolves
 /// calls by name only (no overloading), so a base name reused by a subclass with
 /// a different signature would miscompile.
 class Control {
@@ -81,6 +81,21 @@ class Control {
     /// declarations onto this control by `.class` selector. Empty = none.
     string styleClass;
 
+    // --- CSS-like style layer (all 0 = unset). Honoured by PaintStyleBox for
+    // surfaces and by text widgets for color/font. Set via the fluent
+    // Bg/Gradient/Radius/Border/Shadow/TextColor/FontPx helpers, or cascaded
+    // from a StyleSheet / skin. Colors are packed 0xAARRGGBB ints (as Theme).
+    int styleBg;
+    int styleBgTo;
+    int styleRadius;
+    int styleBorderColor;
+    int styleBorderWidth;
+    int styleShadow;
+    int styleShadowDy;
+    int styleColor;
+    int styleFontPx;
+    int styleTransitionMs;
+
     /// Base initialiser every subclass calls from its factory/constructor.
     void InitControl(string n, int d) {
         name = n;
@@ -118,6 +133,75 @@ class Control {
         bindProp = "";
         bindSnapshot = "";
         styleClass = "";
+        styleBg = 0;
+        styleBgTo = 0;
+        styleRadius = 0;
+        styleBorderColor = 0;
+        styleBorderWidth = 0;
+        styleShadow = 0;
+        styleShadowDy = 0;
+        styleColor = 0;
+        styleFontPx = 0;
+        styleTransitionMs = 0;
+    }
+
+    // --- CSS-like fluent style setters (chainable). Names are unique across
+    // the widget set so they never collide with a subclass method. ---
+    Control Bg(int c) { styleBg = c; styleBgTo = 0; return this; }
+    Control Gradient(int top, int bottom) { styleBg = top; styleBgTo = bottom; return this; }
+    Control Radius(int r) { styleRadius = r; return this; }
+    Control Border(int color, int w) { styleBorderColor = color; styleBorderWidth = w; return this; }
+    Control Shadow(int color, int dy) { styleShadow = color; styleShadowDy = dy; return this; }
+    Control TextColor(int c) { styleColor = c; return this; }
+    Control FontPx(int px) { styleFontPx = px; return this; }
+    Control Transition(int ms) { styleTransitionMs = ms; return this; }
+    Control Style(string cls) { styleClass = cls; return this; }
+
+    // --- Chainable event subscription (a C#-close alternative to BindEvent;
+    // `btn.OnClick(Handler)` reads like `btn.Click += Handler`). Each appends
+    // a handler and returns THIS so setup stays fluent. ---
+    Control OnClick(Action a) { BindEvent("Click", a); return this; }
+    Control OnDoubleClick(Action a) { BindEvent("DoubleClick", a); return this; }
+    Control OnChange(Action a) { BindEvent("Change", a); return this; }
+    Control OnEnter(Action a) { BindEvent("Enter", a); return this; }
+    Control OnKeyDown(Action a) { BindEvent("KeyDown", a); return this; }
+
+    /// Effective text color: the CSS `styleColor` if set, else the fallback the
+    /// widget resolves from its variant/theme. Text widgets call this.
+    int StyleTextColor(int fallback) {
+        if (styleColor != 0) { return styleColor; }
+        return fallback;
+    }
+
+    /// Effective font size: the CSS `styleFontPx` if set, else the fallback.
+    int StyleFontSize(int fallback) {
+        if (styleFontPx != 0) { return styleFontPx; }
+        return fallback;
+    }
+
+    /// Paints this node's CSS surface (shadow, background/gradient, border)
+    /// into its resolved bounds, honouring styleRadius. Called by RenderTree
+    /// before OnPaint, so every control gets uniform CSS styling and widgets'
+    /// OnPaint only draw their own content on top. No-op when nothing is set,
+    /// so existing widgets that paint their own surface are unaffected.
+    void PaintStyleBox(App app) {
+        Canvas c = app.canvas;
+        int r = styleRadius;
+        if (styleShadow != 0) {
+            int dy = styleShadowDy;
+            if (r > 0) { c.FillRoundRect(bx, by + dy, bw, bh, r, styleShadow); }
+            else { c.FillRect(bx, by + dy, bw, bh, styleShadow); }
+        }
+        if (styleBg != 0 && styleBgTo != 0) {
+            c.FillVGrad(bx, by, bw, bh, styleBg, styleBgTo);
+        } else if (styleBg != 0) {
+            if (r > 0) { c.FillRoundRect(bx, by, bw, bh, r, styleBg); }
+            else { c.FillRect(bx, by, bw, bh, styleBg); }
+        }
+        if (styleBorderWidth > 0 && styleBorderColor != 0) {
+            if (r > 0) { c.DrawRoundRect(bx, by, bw, bh, r, styleBorderColor, styleBorderWidth); }
+            else { c.DrawRect(bx, by, bw, bh, styleBorderColor, styleBorderWidth); }
+        }
     }
 
     /// Fires the common event bundle for this node against `id`. Widgets call
@@ -179,7 +263,7 @@ class Control {
     }
 
     /// Fluent child append: adds `c` and returns THIS container (not the child),
-    /// so several children can be chained — `panel.With(a).With(b).With(c)`. If
+    /// so several children can be chained - `panel.With(a).With(b).With(c)`. If
     /// this node has a flow layout (column/row) the child is auto-docked along
     /// the flow axis unless it opted into Grow().
     Control With(Control c) {
@@ -489,6 +573,7 @@ class Control {
         }
         if (!lastVisible && everLaidOut && Show.Count() > 0) { Show.Raise(); }
         lastVisible = true;
+        PaintStyleBox(app);
         OnPaint(app);
         if (Paint.Count() > 0) { Paint.Raise(); }
         if (everLaidOut && (bw != lastBw || bh != lastBh) && Resize.Count() > 0) {

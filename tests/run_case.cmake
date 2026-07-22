@@ -25,20 +25,35 @@ if(NOT compile_rc EQUAL 0)
 endif()
 
 # ---- run ----
-if(WORKDIR)
-  execute_process(
-    COMMAND ${OUT_EXE}
-    WORKING_DIRECTORY ${WORKDIR}
-    RESULT_VARIABLE run_rc
-    OUTPUT_VARIABLE actual
-    ENCODING UTF-8)
-else()
-  execute_process(
-    COMMAND ${OUT_EXE}
-    RESULT_VARIABLE run_rc
-    OUTPUT_VARIABLE actual
-    ENCODING UTF-8)
-endif()
+# On Windows a freshly linked executable can transiently fail to launch with
+# STATUS_SHARING_VIOLATION (0xC0000043) or STATUS_ACCESS_DENIED (0xC0000022)
+# when antivirus/the loader briefly holds the new image open -- common under
+# parallel ctest. These are image-load races, not program failures, so retry
+# the launch a few times before giving up.
+set(_run_attempt 0)
+while(TRUE)
+  math(EXPR _run_attempt "${_run_attempt} + 1")
+  if(WORKDIR)
+    execute_process(
+      COMMAND ${OUT_EXE}
+      WORKING_DIRECTORY ${WORKDIR}
+      RESULT_VARIABLE run_rc
+      OUTPUT_VARIABLE actual
+      ENCODING UTF-8)
+  else()
+    execute_process(
+      COMMAND ${OUT_EXE}
+      RESULT_VARIABLE run_rc
+      OUTPUT_VARIABLE actual
+      ENCODING UTF-8)
+  endif()
+  if((run_rc MATCHES "[cC]0000043" OR run_rc MATCHES "[cC]0000022")
+     AND _run_attempt LESS 6)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 0.4)
+    continue()
+  endif()
+  break()
+endwhile()
 if(NOT run_rc EQUAL 0)
   message(FATAL_ERROR "program exited with ${run_rc}\noutput:\n${actual}")
 endif()

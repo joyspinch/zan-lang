@@ -6,7 +6,7 @@ Set-Location $root
 # The native GUI runtime is now built with ZAN_GUI_SDL so the IDE window is an
 # SDL3 window driven by the same stack games use. Locate the staged SDL3 mingw
 # devel package (headers) and synthesize an MSVC import lib (SDL3.lib) from the
-# driver DLL — mirrors scripts\build_gui_sdl_smoke.ps1.
+# driver DLL - mirrors scripts\build_gui_sdl_smoke.ps1.
 $driverDir = Join-Path $root "stdlib\SDL3\drivers\win-x64"
 $cache = Get-ChildItem "$env:TEMP" -Filter "zan-sdl3-*" -Directory `
     | Sort-Object Name -Descending | Select-Object -First 1
@@ -59,6 +59,14 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 clang -O2 -std=c11 -I src\runtime -c src\runtime\rt_sync.c -o build\zanrt_sync_ide.obj
 if ($LASTEXITCODE -ne 0) { Write-Output "SYNC_COMPILE_FAILED"; exit 1 }
 
+# Build the socket-async / gate reactor runtime (rt_io.c) with the same
+# MSVC-target clang. Async stdlib the IDE pulls in (e.g. System.Threading's
+# AsyncGate) references zan_gate_*/zan_co_ready from here. ZAN_IO_STACKLESS_ONLY
+# drops the fiber scheduler half so it only needs zan_co_ready, which the IDE's
+# emitted IR already provides (mirrors the CMake zanrt_io object).
+clang -O2 -DZAN_IO_STACKLESS_ONLY -I src\runtime -c src\runtime\rt_io.c -o build\zanrt_io_ide.obj
+if ($LASTEXITCODE -ne 0) { Write-Output "IO_COMPILE_FAILED"; exit 1 }
+
 # ---- application icon resource --------------------------------------------
 # The IDE links a Windows .res for its exe/taskbar icon. Compile it from
 # assets\zan.rc so a clean build tree (with no build\zan_icon.res yet) links.
@@ -82,6 +90,10 @@ try {
     $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
     $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
     $files += (Get-ChildItem src\ide_zan\components\*.zan).FullName
+    if (Test-Path src\ide_zan\views) {
+        $viewFiles = Get-ChildItem src\ide_zan\views\*.zan -ErrorAction SilentlyContinue
+        if ($viewFiles) { $files += $viewFiles.FullName }
+    }
     $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
@@ -101,7 +113,7 @@ try {
             throw "IR_FAILED code=$code"
         }
         [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "ZanIDE.ll"), $ir)
-        clang ZanIDE.ll zanrt_sync_ide.obj zan_icon.res -o ZanIDE.exe -O2 `
+        clang ZanIDE.ll zanrt_sync_ide.obj zanrt_io_ide.obj zan_icon.res -o ZanIDE.exe -O2 `
             -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS `
             -Xlinker /ENTRY:mainCRTStartup -lzan_gui_ide "$sdlLib" -llegacy_stdio_definitions -lws2_32 -lpsapi -ladvapi32
         if ($LASTEXITCODE -ne 0) { throw "LINK_FAILED code=$LASTEXITCODE" }

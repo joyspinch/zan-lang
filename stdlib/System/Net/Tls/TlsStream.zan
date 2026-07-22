@@ -1,0 +1,391 @@
+using System;
+using System.Net.Sockets;
+
+namespace System.Net.Tls;
+
+/// <summary>
+/// TLS context: wraps an OpenSSL SSL_CTX. Create one per server (with a
+/// certificate + private key) or per client, then derive per-connection
+/// <see cref="TlsStream"/>s from it.
+///
+/// Server:
+///   TlsContext tls = TlsContext.CreateServer("cert.pem", "key.pem");
+///   TlsStream s = await TlsStream.AcceptAsync(tls, clientSock);
+///
+/// Client:
+///   TlsContext tls = TlsContext.CreateClient();
+///   TlsStream s = await TlsStream.ConnectAsync(tls, sock, "example.com");
+/// </summary>
+class TlsContext {
+    [DllImport("ssl")]
+    static extern string TLS_server_method();
+    [DllImport("ssl")]
+    static extern string TLS_client_method();
+    [DllImport("ssl")]
+    static extern string SSL_CTX_new(string method);
+    [DllImport("ssl")]
+    static extern void SSL_CTX_free(string ctx);
+    [DllImport("ssl")]
+    static extern int SSL_CTX_use_certificate_chain_file(string ctx, string file);
+    [DllImport("ssl")]
+    static extern int SSL_CTX_use_PrivateKey_file(string ctx, string file, int type);
+    [DllImport("ssl")]
+    static extern int SSL_CTX_check_private_key(string ctx);
+    [DllImport("ssl")]
+    static extern void SSL_CTX_set_verify(string ctx, int mode, string callback);
+    [DllImport("ssl")]
+    static extern int SSL_CTX_set_default_verify_paths(string ctx);
+
+    string ctx;
+    bool server;
+    string error;
+
+    TlsContext() {
+        this.ctx = null;
+        this.server = false;
+        this.error = "";
+    }
+
+    /// <summary>Creates a server-side TLS context from a PEM certificate chain
+    /// and PEM private key. Returns null on failure (bad paths / key
+    /// mismatch); LastError() has the reason.</summary>
+    static TlsContext CreateServer(string certFile, string keyFile) {
+        TlsContext c = new TlsContext();
+        c.server = true;
+        c.ctx = SSL_CTX_new(TLS_server_method());
+        if (c.ctx == null) { return null; }
+        // 1 = SSL_FILETYPE_PEM
+        if (SSL_CTX_use_certificate_chain_file(c.ctx, certFile) != 1) {
+            SSL_CTX_free(c.ctx);
+            return null;
+        }
+        if (SSL_CTX_use_PrivateKey_file(c.ctx, keyFile, 1) != 1) {
+            SSL_CTX_free(c.ctx);
+            return null;
+        }
+        if (SSL_CTX_check_private_key(c.ctx) != 1) {
+            SSL_CTX_free(c.ctx);
+            return null;
+        }
+        return c;
+    }
+
+    /// <summary>Creates a client-side TLS context. Certificate verification
+    /// uses the system default trust store; call DisableVerify() for e.g.
+    /// self-signed development servers.</summary>
+    static TlsContext CreateClient() {
+        TlsContext c = new TlsContext();
+        c.server = false;
+        c.ctx = SSL_CTX_new(TLS_client_method());
+        if (c.ctx == null) { return null; }
+        int _v = SSL_CTX_set_default_verify_paths(c.ctx);
+        // 1 = SSL_VERIFY_PEER
+        SSL_CTX_set_verify(c.ctx, 1, null);
+        return c;
+    }
+
+    /// <summary>Disables peer certificate verification (development only).
+    /// 0 = SSL_VERIFY_NONE.</summary>
+    void DisableVerify() {
+        SSL_CTX_set_verify(this.ctx, 0, null);
+    }
+
+    string Handle() {
+        return this.ctx;
+    }
+
+    bool IsServer() {
+        return this.server;
+    }
+
+    /// <summary>Releases the underlying SSL_CTX.</summary>
+    void Free() {
+        if (this.ctx != null) {
+            SSL_CTX_free(this.ctx);
+            this.ctx = null;
+        }
+    }
+}
+
+/// <summary>
+/// One TLS connection over a non-blocking socket, driven by OpenSSL memory
+/// BIOs so all socket IO goes through the coroutine reactor (await
+/// Socket.ReadReady / Socket.SendAsync) -- TLS never blocks the thread.
+///
+/// Encrypted bytes flow socket &lt;-&gt; rbio/wbio; SSL_read/SSL_write move
+/// plaintext in and out of the SSL engine. WANT_READ pumps one socket read
+/// into rbio; pending wbio bytes are flushed to the socket after every engine
+/// step.
+/// </summary>
+class TlsStream {
+    [DllImport("ssl")]
+    static extern string SSL_new(string ctx);
+    [DllImport("ssl")]
+    static extern void SSL_free(string ssl);
+    [DllImport("ssl")]
+    static extern void SSL_set_bio(string ssl, string rbio, string wbio);
+    [DllImport("ssl")]
+    static extern void SSL_set_accept_state(string ssl);
+    [DllImport("ssl")]
+    static extern void SSL_set_connect_state(string ssl);
+    [DllImport("ssl")]
+    static extern int SSL_do_handshake(string ssl);
+    [DllImport("ssl")]
+    static extern int SSL_read(string ssl, string buf, int num);
+    [DllImport("ssl")]
+    static extern int SSL_write(string ssl, string buf, int num);
+    [DllImport("ssl")]
+    static extern int SSL_get_error(string ssl, int ret);
+    [DllImport("ssl")]
+    static extern int SSL_shutdown(string ssl);
+    [DllImport("ssl")]
+    static extern int SSL_ctrl(string ssl, int cmd, int larg, string parg);
+
+    [DllImport("crypto")]
+    static extern string BIO_new(string method);
+    [DllImport("crypto")]
+    static extern string BIO_s_mem();
+    [DllImport("crypto")]
+    static extern int BIO_write(string bio, string data, int dlen);
+    [DllImport("crypto")]
+    static extern int BIO_read(string bio, string data, int dlen);
+    [DllImport("crypto")]
+    static extern int BIO_ctrl_pending(string bio);
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    string ssl;
+    string rbio;   // socket -> SSL (encrypted in)
+    string wbio;   // SSL -> socket (encrypted out)
+    int sock;
+    bool open;
+    // one reusable 16KB+ scratch buffer for BIO/socket pumping (a TLS record
+    // is at most 16KB; allocated once per stream, not per operation)
+    string scratch;
+    static int SCRATCH = 17408;
+
+    // C `int` returns arrive zero-extended (a C -1 reads as 4294967295);
+    // fold them back to signed 32-bit so error checks work.
+    static int Norm(int v) {
+        if (v > 2147483647) { return v - 4294967296; }
+        return v;
+    }
+
+    TlsStream() {
+        this.ssl = null;
+        this.rbio = null;
+        this.wbio = null;
+        this.sock = -1;
+        this.open = false;
+        this.scratch = null;
+    }
+
+    static TlsStream Setup(TlsContext ctx, int sock) {
+        TlsStream s = new TlsStream();
+        s.ssl = SSL_new(ctx.Handle());
+        if (s.ssl == null) { return null; }
+        s.rbio = BIO_new(BIO_s_mem());
+        s.wbio = BIO_new(BIO_s_mem());
+        // SSL_set_bio transfers BIO ownership to the SSL object.
+        SSL_set_bio(s.ssl, s.rbio, s.wbio);
+        s.sock = sock;
+        s.scratch = calloc(SCRATCH + 1, 1);
+        s.open = true;
+        return s;
+    }
+
+    /// <summary>Server side: wraps an accepted socket and performs the TLS
+    /// handshake. Returns null when the handshake fails.</summary>
+    static async TlsStream AcceptAsync(TlsContext ctx, int sock) {
+        TlsStream s = Setup(ctx, sock);
+        if (s == null) { return null; }
+        SSL_set_accept_state(s.ssl);
+        int ok = await s.HandshakeAsync();
+        if (ok != 1) {
+            s.Close();
+            return null;
+        }
+        return s;
+    }
+
+    /// <summary>Client side: wraps a connected socket, sends SNI for
+    /// <paramref name="host"/> and performs the TLS handshake. Returns null
+    /// when the handshake fails.</summary>
+    static async TlsStream ConnectAsync(TlsContext ctx, int sock, string host) {
+        TlsStream s = Setup(ctx, sock);
+        if (s == null) { return null; }
+        SSL_set_connect_state(s.ssl);
+        if (host != null && host.Length > 0) {
+            // 55 = SSL_CTRL_SET_TLSEXT_HOSTNAME, 0 = TLSEXT_NAMETYPE_host_name
+            int _sni = SSL_ctrl(s.ssl, 55, 0, host);
+        }
+        int ok = await s.HandshakeAsync();
+        if (ok != 1) {
+            s.Close();
+            return null;
+        }
+        return s;
+    }
+
+    // Flushes any pending encrypted output bytes from wbio to the socket.
+    async int FlushOutAsync() {
+        int pending = BIO_ctrl_pending(this.wbio);
+        while (pending > 0) {
+            int chunk = pending;
+            if (chunk > SCRATCH) { chunk = SCRATCH; }
+            int n = Norm(BIO_read(this.wbio, this.scratch, chunk));
+            if (n <= 0) { return -1; }
+            int sent = Norm(await Socket.SendAsync(this.sock, this.scratch, n));
+            if (sent < 0) { return -1; }
+            pending = BIO_ctrl_pending(this.wbio);
+        }
+        return 0;
+    }
+
+    // Reads one chunk of encrypted bytes from the socket into rbio.
+    // Returns the byte count, 0 on peer close, -1 on error.
+    async int PumpInAsync() {
+        while (true) {
+            await Socket.ReadReady(this.sock);
+            int n = Norm(Socket.Recv(this.sock, this.scratch, SCRATCH));
+            if (n == 0) { return 0; }
+            if (n > 0) {
+                int w = Norm(BIO_write(this.rbio, this.scratch, n));
+                if (w != n) { return -1; }
+                return n;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Drives the TLS handshake to completion. Returns 1 on success.</summary>
+    async int HandshakeAsync() {
+        while (true) {
+            int r = Norm(SSL_do_handshake(this.ssl));
+            int flushed = await FlushOutAsync();
+            if (flushed < 0) { return -1; }
+            if (r == 1) { return 1; }
+            int err = SSL_get_error(this.ssl, r);
+            // 2 = SSL_ERROR_WANT_READ, 3 = SSL_ERROR_WANT_WRITE
+            if (err == 2) {
+                int n = await PumpInAsync();
+                if (n <= 0) { return -1; }
+            } else if (err != 3) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Receives decrypted application bytes (up to
+    /// <paramref name="max"/>, at most one scratch buffer). Returns "" on
+    /// clean close or error.</summary>
+    async string RecvAsync(int max) {
+        if (!this.open) { return ""; }
+        int want = max;
+        if (want > SCRATCH) { want = SCRATCH; }
+        while (true) {
+            int n = Norm(SSL_read(this.ssl, this.scratch, want));
+            if (n > 0) {
+                return this.scratch.Substring(0, n);
+            }
+            int err = SSL_get_error(this.ssl, n);
+            int flushed = await FlushOutAsync();
+            if (flushed < 0) { return ""; }
+            if (err == 2) {
+                int got = await PumpInAsync();
+                if (got <= 0) { return ""; }
+            } else if (err != 3) {
+                return "";
+            }
+        }
+        return "";
+    }
+
+    /// <summary>Receives decrypted bytes into a caller-provided buffer
+    /// (binary-safe: the byte count is returned, no NUL truncation).
+    /// Returns 0 on clean close, -1 on error.</summary>
+    async int RecvIntoAsync(string buf, int max) {
+        if (!this.open) { return -1; }
+        while (true) {
+            int n = Norm(SSL_read(this.ssl, buf, max));
+            if (n > 0) { return n; }
+            int err = SSL_get_error(this.ssl, n);
+            int flushed = await FlushOutAsync();
+            if (flushed < 0) { return -1; }
+            if (err == 2) {
+                int got = await PumpInAsync();
+                if (got == 0) { return 0; }
+                if (got < 0) { return -1; }
+            } else if (err != 3) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Encrypts and sends <paramref name="len"/> bytes. Returns the
+    /// plaintext byte count on success, -1 on failure.</summary>
+    async int SendAsync(string data, int len) {
+        if (!this.open) { return -1; }
+        int off = 0;
+        while (off < len) {
+            int chunk = len - off;
+            if (chunk > 16384) { chunk = 16384; }
+            string part = data;
+            if (off > 0 || chunk < len) {
+                part = data.Substring(off, chunk);
+            }
+            int n = Norm(SSL_write(this.ssl, part, chunk));
+            if (n <= 0) {
+                int err = SSL_get_error(this.ssl, n);
+                int flushed = await FlushOutAsync();
+                if (flushed < 0) { return -1; }
+                if (err == 2) {
+                    int got = await PumpInAsync();
+                    if (got <= 0) { return -1; }
+                } else if (err != 3) {
+                    return -1;
+                }
+            } else {
+                off = off + n;
+                int flushed = await FlushOutAsync();
+                if (flushed < 0) { return -1; }
+            }
+        }
+        return len;
+    }
+
+    /// <summary>Sends a whole string (its .Length bytes).</summary>
+    async int SendStringAsync(string data) {
+        return await SendAsync(data, data.Length);
+    }
+
+    /// <summary>Sends the TLS close_notify alert and releases the SSL engine.
+    /// The caller still owns (and must close) the underlying socket.</summary>
+    void Close() {
+        if (this.ssl != null) {
+            if (this.open) {
+                int _s = SSL_shutdown(this.ssl);
+                // best effort: flush the close_notify synchronously
+                int pending = BIO_ctrl_pending(this.wbio);
+                if (pending > 0 && pending <= SCRATCH) {
+                    int n = BIO_read(this.wbio, this.scratch, pending);
+                    if (n > 0) {
+                        int _sent = Socket.Send(this.sock, this.scratch, n);
+                    }
+                }
+            }
+            SSL_free(this.ssl);
+            this.ssl = null;
+        }
+        if (this.scratch != null) {
+            free(this.scratch);
+            this.scratch = null;
+        }
+        this.open = false;
+    }
+}

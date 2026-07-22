@@ -359,6 +359,16 @@ class ZanIDE {
         return ZanIDE.CfgInt(File.ReadAllText(f), "lang", 0);
     }
 
+    /// Number of selectable UI languages (see uiLang). The Settings dialog
+    /// renders one language segment per index via LangName(i).
+    static int LangCount() { return 2; }
+
+    /// Display label for UI language `i` (0 = English, 1 = 简体中文).
+    static string LangName(int i) {
+        if (i == 1) { return "中文"; }
+        return "English";
+    }
+
     /// Builds the top ribbon commands, localized to the current UI language.
     /// Rebuilt (not mutated) whenever the language changes so labels update live.
     /// The command *order* is a stable contract — dispatch is by index (rc==N),
@@ -831,6 +841,7 @@ class ZanIDE {
 
         SignalInt activeTab = SignalInt.Create(0);
         CodeEditor editor = CodeEditor.Create();
+        StatusBar statusBar = new StatusBar();
         int lastActive = 0 - 1;
         // Which .zform tab the designer is currently bound to, and the last
         // serialized layout (to detect changes and persist them back to disk).
@@ -864,33 +875,24 @@ class ZanIDE {
         List<RibbonCmd> cmds = ZanIDE.BuildRibbon();
 
         // ---- New Project categories (built-in + user "Custom") ----
-        List<string> catNames = new List<string>();
-        catNames.Add("Console");
-        catNames.Add("Library");
-        catNames.Add("Window App");
-        catNames.Add("WebView");
-        catNames.Add("Server");
-        catNames.Add("Custom");
+        List<string> catNames = new List<string>{
+            "Console", "Library", "Window App", "WebView", "Server", "Custom" };
 
-        // The template catalog + its parallel projections; rebuilt whenever the
-        // New Project wizard opens so freshly-saved custom templates show up.
+        // The template catalog and the wizard's entity view of it; both rebuilt
+        // whenever the New Project wizard opens so freshly-saved custom
+        // templates show up.
         List<Tpl> tpls = new List<Tpl>();
-        List<string> tCats = new List<string>();
-        List<string> tNames = new List<string>();
-        List<string> tIcons = new List<string>();
-        List<string> tDescs = new List<string>();
+        List<WizardTemplate> wizTpls = new List<WizardTemplate>();
 
         // ---- New File template catalog ----
-        List<string> fNames = new List<string>();
-        List<string> fIcons = new List<string>();
-        List<string> fDescs = new List<string>();
-        fNames.Add(ZanIDE.T("Program (Main)", "程序 (Main)")); fIcons.Add("arrow-right"); fDescs.Add(ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。"));
-        fNames.Add(ZanIDE.T("Class", "类"));          fIcons.Add("grid");        fDescs.Add(ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。"));
-        fNames.Add(ZanIDE.T("GUI Window", "GUI 窗口"));     fIcons.Add("maximize");    fDescs.Add(ZanIDE.T("Code file: a Gui window with an event loop.", "代码文件：带事件循环的 Gui 窗口。"));
-        fNames.Add(ZanIDE.T("Interface", "接口"));      fIcons.Add("copy");        fDescs.Add(ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。"));
-        fNames.Add(ZanIDE.T("Empty File", "空文件"));     fIcons.Add("file");        fDescs.Add(ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。"));
-        fNames.Add(ZanIDE.T("Form (Designer)", "表单 (设计器)")); fIcons.Add("layout");     fDescs.Add(ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。"));
-        fNames.Add(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)")); fIcons.Add("maximize");   fDescs.Add(ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。"));
+        List<WizardItem> fileItems = new List<WizardItem>{
+            new WizardItem(ZanIDE.T("Program (Main)", "程序 (Main)"), "arrow-right", ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。")),
+            new WizardItem(ZanIDE.T("Class", "类"), "grid", ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。")),
+            new WizardItem(ZanIDE.T("GUI Window", "GUI 窗口"), "maximize", ZanIDE.T("Code file: a Gui window with an event loop.", "代码文件：带事件循环的 Gui 窗口。")),
+            new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
+            new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
+            new WizardItem(ZanIDE.T("Form (Designer)", "表单 (设计器)"), "layout", ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。")),
+            new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")) };
 
         // ---- Dialog state ----
         // The New Project / New File wizards are REAL secondary top-level windows
@@ -905,22 +907,17 @@ class ZanIDE {
         SignalInt pSel = SignalInt.Create(0);
         SignalInt fSel = SignalInt.Create(0);
 
-        // Target platforms for New Project (multi-select OS + architecture);
-        // platSel holds a 0/1 flag per entry, parallel to platformNames.
+        // Target platforms for New Project (multi-select OS + architecture).
         // One column per OS; two architecture chips stacked per column. Chip
         // labels are arch-only (the OS is the column header). Order is
         // column-major: [Win x64, Win ARM64, Linux x64, Linux ARM64, ...].
-        List<string> platformGroups = new List<string>();
-        platformGroups.Add("Windows");
-        platformGroups.Add("Linux");
-        platformGroups.Add("macOS");
-        List<string> platformNames = new List<string>();
-        platformNames.Add("x64"); platformNames.Add("ARM64");
-        platformNames.Add("x64"); platformNames.Add("ARM64");
-        platformNames.Add("x64"); platformNames.Add("ARM64");
-        List<int> platSel = new List<int>();
-        platSel.Add(1); platSel.Add(1); platSel.Add(1);
-        platSel.Add(1); platSel.Add(1); platSel.Add(1);
+        List<string> platformGroups = new List<string>{ "Windows", "Linux", "macOS" };
+        // One entry per (OS column, architecture), column-major, all selected by
+        // default. The order matches PlatformCsv's id list.
+        List<WizardTarget> platforms = new List<WizardTarget>{
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1),
+            new WizardTarget("x64", 1), new WizardTarget("ARM64", 1) };
         Input pNameInput = Input.Bind(SignalString.Create("NewProject"), ZanIDE.T("project name", "项目名称"));
         Input pLocInput = Input.Bind(
             SignalString.Create(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome())), ZanIDE.T("location", "位置"));
@@ -936,15 +933,13 @@ class ZanIDE {
         // Save-current-project-as-custom-template state.
         SignalInt tmplCatSel = SignalInt.Create(0);
         Input tmplNameInput = Input.Bind(SignalString.Create("MyTemplate"), ZanIDE.T("template name", "模板名称"));
-        List<string> saveCats = new List<string>();
-        List<string> saveIcons = new List<string>();
-        List<string> saveDescs = new List<string>();
-        saveCats.Add("Console");    saveIcons.Add("menu");        saveDescs.Add(ZanIDE.T("Save under the Console category.", "保存到 Console 分类下。"));
-        saveCats.Add("Library");    saveIcons.Add("grid");        saveDescs.Add(ZanIDE.T("Save under the Library category.", "保存到 Library 分类下。"));
-        saveCats.Add("Window App"); saveIcons.Add("maximize");    saveDescs.Add(ZanIDE.T("Save under the Window App category.", "保存到 Window App 分类下。"));
-        saveCats.Add("WebView");    saveIcons.Add("folder");      saveDescs.Add(ZanIDE.T("Save under the WebView category.", "保存到 WebView 分类下。"));
-        saveCats.Add("Server");     saveIcons.Add("arrow-right"); saveDescs.Add(ZanIDE.T("Save under the Server category.", "保存到 Server 分类下。"));
-        saveCats.Add("Custom");     saveIcons.Add("file");        saveDescs.Add(ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。"));
+        List<WizardItem> saveItems = new List<WizardItem>{
+            new WizardItem("Console", "menu", ZanIDE.T("Save under the Console category.", "保存到 Console 分类下。")),
+            new WizardItem("Library", "grid", ZanIDE.T("Save under the Library category.", "保存到 Library 分类下。")),
+            new WizardItem("Window App", "maximize", ZanIDE.T("Save under the Window App category.", "保存到 Window App 分类下。")),
+            new WizardItem("WebView", "folder", ZanIDE.T("Save under the WebView category.", "保存到 WebView 分类下。")),
+            new WizardItem("Server", "arrow-right", ZanIDE.T("Save under the Server category.", "保存到 Server 分类下。")),
+            new WizardItem("Custom", "file", ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。")) };
 
         // ---- Find/Replace & GoToLine state ----
         int findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition
@@ -1392,7 +1387,7 @@ class ZanIDE {
 
             // ---- keyboard shortcuts for debug ----
             if (kind == 5) {
-                int kc = app.window.EventKey();
+                int kc = app.window.EventKeyCode();
                 if (kc == 116 && dbgState == 0) {
                     // F5 = Start Debug (same as clicking Debug button)
                     ZanIDE.SaveActive(
@@ -1609,11 +1604,7 @@ class ZanIDE {
                 if (rc == 0 && dlg == null) {
                     // Rebuild the catalog (built-ins + custom templates on disk).
                     tpls = ZanIDE.BuildCatalog(root);
-                    tCats = new List<string>();
-                    tNames = new List<string>();
-                    tIcons = new List<string>();
-                    tDescs = new List<string>();
-                    ZanIDE.SplitTemplates(tpls, tCats, tNames, tIcons, tDescs);
+                    wizTpls = ZanIDE.WizTemplates(tpls);
                     catNames = ZanIDE.CatsOf(tpls);
                     catSel.Set(0);
                     pSel.Set(0);
@@ -2297,11 +2288,7 @@ class ZanIDE {
                         startNewProjBtn, startNewFileBtn, startOpenBtn, startNewsScroll);
                     if (sact == 1 && dlg == null) {
                         tpls = ZanIDE.BuildCatalog(root);
-                        tCats = new List<string>();
-                        tNames = new List<string>();
-                        tIcons = new List<string>();
-                        tDescs = new List<string>();
-                        ZanIDE.SplitTemplates(tpls, tCats, tNames, tIcons, tDescs);
+                        wizTpls = ZanIDE.WizTemplates(tpls);
                         catNames = ZanIDE.CatsOf(tpls);
                         catSel.Set(0);
                         pSel.Set(0);
@@ -3595,29 +3582,22 @@ class ZanIDE {
                 // title bar / side panels (bgSecondary) so the shell reads as
                 // one calm frame; only the debugging state gets a loud tint.
                 int sbY = H - sbH;
-                int sbBg = t.bgSecondary;
-                if (dbgState == 2) { sbBg = 0xFFCC6633; }
-                ZanIDE.ShellSurface(app, 0, sbY, W, sbH, 0, sbBg);
-                c.FillRect(0, sbY, W, 1, t.divider);
-                int sbTextY = sbY + (sbH - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+                bool sbDebug = (dbgState == 2);
                 int sbText = t.textPrimary;
                 int sbMuted = t.textSecondary;
-                if (dbgState == 2) {
+                if (sbDebug) {
                     sbText = 0xFFFFFFFF;
                     sbMuted = 0xFFEFEFEF;
                 }
                 int curLn = editor.CurLine();
                 int curCl = editor.CurCol();
                 string posInfo = ZanIDE.T("Ln ", "行 ") + Convert.ToString(curLn + 1) + ZanIDE.T(", Col ", "，列 ") + Convert.ToString(curCl + 1);
-                c.DrawText(app.Scale(8), sbTextY, posInfo, sbText, t.fontSizeSmall);
                 string modeInfo = "Zan";
                 if (designerMode) { modeInfo = ZanIDE.T("Designer", "设计器"); }
                 if (pubBusy) { modeInfo = ZanIDE.T("Publishing...", "发布中..."); }
-                if (dbgState == 2) { modeInfo = ZanIDE.T("Debugging", "调试中"); }
-                int modeW = Canvas.MeasureText(modeInfo, t.fontSizeSmall);
-                c.DrawText(W - modeW - app.Scale(10), sbTextY, modeInfo, sbText, t.fontSizeSmall);
-                int encW = Canvas.MeasureText("UTF-8", t.fontSizeSmall);
-                c.DrawText(W - modeW - app.Scale(24) - encW, sbTextY, "UTF-8", sbMuted, t.fontSizeSmall);
+                if (sbDebug) { modeInfo = ZanIDE.T("Debugging", "调试中"); }
+                statusBar.SetState(posInfo, modeInfo, "UTF-8", sbDebug, sbText, sbMuted);
+                statusBar.RenderAt(app, 0, sbY, W, sbH);
 
                 // Top-level editor context menu overlay (drawn last so nothing
                 // paints over it), then bridge its host commands.
@@ -3820,14 +3800,14 @@ class ZanIDE {
                     int action = 0;
                     if (dlgMode == 1) {
                         action = Wizard.RenderCategorized(dlg, ZanIDE.T("New Project", "新建项目"), catNames, catSel,
-                                                          tCats, tNames, tIcons, tDescs, pSel,
+                                                          wizTpls, pSel,
                                                           pNameInput, pLocInput,
-                                                          platformNames, platformGroups, platSel);
+                                                          platforms, platformGroups);
                     } else if (dlgMode == 3) {
-                        action = Wizard.Render(dlg, ZanIDE.T("Save as Template", "另存为模板"), saveCats, saveIcons, saveDescs,
+                        action = Wizard.Render(dlg, ZanIDE.T("Save as Template", "另存为模板"), saveItems,
                                                tmplCatSel, tmplNameInput, tmplNameInput, false);
                     } else {
-                        action = Wizard.Render(dlg, ZanIDE.T("New File", "新建文件"), fNames, fIcons, fDescs, fSel,
+                        action = Wizard.Render(dlg, ZanIDE.T("New File", "新建文件"), fileItems, fSel,
                                                fNameInput, fNameInput, false);
                     }
                     WidgetId.SetSeq(savedSeq);
@@ -3841,7 +3821,7 @@ class ZanIDE {
                             string name = pNameInput.GetText();
                             int gi = pSel.Get();
                             if (gi >= 0 && gi < tpls.Count) {
-                                string plats = ZanIDE.PlatformCsv(platSel);
+                                string plats = ZanIDE.PlatformCsv(platforms);
                                 ZanIDE.WriteLastPickerDirectory(parent);
                                 string newDir = ZanIDE.CreateProjectT(tpls[gi], parent, name, plats, log);
                                 if (newDir == "") {
@@ -3866,7 +3846,7 @@ class ZanIDE {
                                 }
                             }
                         } else if (dlgMode == 3) {
-                            string cat = saveCats[tmplCatSel.Get()];
+                            string cat = saveItems[tmplCatSel.Get()].name;
                             string tname = tmplNameInput.GetText();
                             ZanIDE.SaveAsTemplate(root, cat, tname, log);
                             Layer.Notify(ZanIDE.T("Template saved: ", "模板已保存：") + tname, 3);
@@ -4287,18 +4267,13 @@ class ZanIDE {
         return outp;
     }
 
-    /// Projects the catalog into the parallel lists the wizard consumes.
-    static void SplitTemplates(List<Tpl> ts, List<string> cats, List<string> names,
-                               List<string> icons, List<string> descs) {
-        int i = 0;
-        while (i < ts.Count) {
-            Tpl t = ts[i];
-            cats.Add(t.cat);
-            names.Add(t.name);
-            icons.Add(t.icon);
-            descs.Add(t.desc);
-            i = i + 1;
+    /// Projects the catalog into the entity list the wizard consumes.
+    static List<WizardTemplate> WizTemplates(List<Tpl> ts) {
+        List<WizardTemplate> outp = new List<WizardTemplate>();
+        foreach (Tpl t in ts) {
+            outp.Add(new WizardTemplate(t.cat, t.name, t.icon, t.desc));
         }
+        return outp;
     }
 
     /// Scans root/.templates/<name>/ and appends each as a "Custom" template.
@@ -4419,19 +4394,17 @@ class ZanIDE {
 
     /// Maps the multi-select platform flags to a comma-separated id list
     /// (e.g. "windows-x64,linux-arm64"); defaults to windows-x64 if none chosen.
-    static string PlatformCsv(List<int> flags) {
-        List<string> ids = new List<string>();
-        ids.Add("windows-x64"); ids.Add("windows-arm64");
-        ids.Add("linux-x64"); ids.Add("linux-arm64");
-        ids.Add("macos-x64"); ids.Add("macos-arm64");
+    static string PlatformCsv(List<WizardTarget> targets) {
+        List<string> ids = new List<string>{
+            "windows-x64", "windows-arm64",
+            "linux-x64", "linux-arm64",
+            "macos-x64", "macos-arm64" };
         string outp = "";
-        int i = 0;
-        while (i < flags.Count) {
-            if (i < ids.Count && flags[i] == 1) {
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            if (i < ids.Count && targets[i].selected == 1) {
                 if (outp.Length > 0) { outp = outp + ","; }
                 outp = outp + ids[i];
             }
-            i = i + 1;
         }
         if (outp.Length == 0) { outp = "windows-x64"; }
         return outp;
@@ -9108,7 +9081,7 @@ class ZanIDE {
         ZanIDE.DocAdd(cat, title, body, code, cWidgets, "Wizard",
             ZanIDE.T("Build a full child-window template or project creation workflow.",
                 "构建完整的子窗口模板或项目创建流程。"),
-            "List<string> names = new List<string>();\nList<string> icons = new List<string>();\nList<string> descs = new List<string>();\nSignalInt selected = SignalInt.Create(0);\nInput name = Input.Create(\"project name\");\nInput location = Input.Create(\"location\");\nint result = Wizard.Render(app, \"New Project\", names, icons, descs, selected, name, location, true);");
+            "List<WizardItem> items = new List<WizardItem>();\nitems.Add(new WizardItem(\"Console\", \"menu\", \"A console app.\"));\nitems.Add(new WizardItem(\"Library\", \"grid\", \"A reusable library.\"));\nSignalInt selected = SignalInt.Create(0);\nInput name = Input.Create(\"project name\");\nInput location = Input.Create(\"location\");\nint result = Wizard.Render(app, \"New Project\", items, selected, name, location, true);");
         ZanIDE.DocAdd(cat, title, body, code, cWidgets, "CodeEditor",
             ZanIDE.T("A full source editor with diagnostics, undo/redo, multiple carets, breakpoints and completion.",
                 "完整的源代码编辑器，支持诊断、撤销/重做、多光标、断点与补全。"),
