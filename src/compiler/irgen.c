@@ -8813,6 +8813,12 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
             zan_symbol_t *recv_cls = expr_class_sym(g, callee->member.object, locals);
+            if (!recv_cls && callee->member.object->kind == AST_IDENTIFIER &&
+                !local_find(locals, callee->member.object->ident.name)) {
+                /* static call ClassName.Method(...) */
+                zan_symbol_t *ts = zan_binder_lookup(g->binder, callee->member.object->ident.name);
+                if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) recv_cls = ts;
+            }
             if (recv_cls && (recv_cls->kind == SYM_CLASS || recv_cls->kind == SYM_STRUCT)) {
                 zan_istr_t mn = callee->member.name;
                 int found = 0;
