@@ -258,11 +258,11 @@ class JsonValue {
         int n = t.Length;
         int i = 0;
         bool neg = false;
-        if (n > 0 && t.Substring(0, 1) == "-") { neg = true; i = 1; }
+        if (n > 0 && (t[0] & 255) == 45) { neg = true; i = 1; }
         int acc = 0;
         while (i < n) {
-            int d = JsonValue.Digit(t.Substring(i, 1));
-            if (d < 0) { break; }
+            int d = (t[i] & 255) - 48;
+            if (d < 0 || d > 9) { break; }
             acc = acc * 10 + d;
             i = i + 1;
         }
@@ -336,15 +336,16 @@ class JsonReader {
         return r;
     }
 
-    string Cur() {
-        if (pos >= len) { return ""; }
-        return s.Substring(pos, 1);
+    /// Byte at the cursor, or -1 at end of input.
+    int CurB() {
+        if (pos >= len) { return -1; }
+        return s[pos] & 255;
     }
 
     void SkipWs() {
         while (pos < len) {
-            string c = s.Substring(pos, 1);
-            if (c == " " || c == "\t" || c == "\n" || c == "\r") {
+            int c = s[pos] & 255;
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
                 pos = pos + 1;
             } else {
                 return;
@@ -354,12 +355,12 @@ class JsonReader {
 
     JsonValue ReadValue() {
         SkipWs();
-        string c = Cur();
-        if (c == "{") { return ReadObject(); }
-        if (c == "[") { return ReadArray(); }
-        if (c == "\"") { return JsonValue.NewStr(ReadString()); }
-        if (c == "t" || c == "f") { return ReadBool(); }
-        if (c == "n") { pos = pos + 4; return JsonValue.NewNull(); }
+        int c = CurB();
+        if (c == 123) { return ReadObject(); }              // '{'
+        if (c == 91) { return ReadArray(); }                // '['
+        if (c == 34) { return JsonValue.NewStr(ReadString()); }
+        if (c == 116 || c == 102) { return ReadBool(); }    // 't' / 'f'
+        if (c == 110) { pos = pos + 4; return JsonValue.NewNull(); }
         return ReadNumber();
     }
 
@@ -367,18 +368,18 @@ class JsonReader {
         JsonValue obj = JsonValue.NewObject();
         pos = pos + 1;                 // consume '{'
         SkipWs();
-        if (Cur() == "}") { pos = pos + 1; return obj; }
+        if (CurB() == 125) { pos = pos + 1; return obj; }   // '}'
         while (pos < len) {
             SkipWs();
             string key = ReadString();
             SkipWs();
-            if (Cur() == ":") { pos = pos + 1; }
+            if (CurB() == 58) { pos = pos + 1; }            // ':'
             JsonValue v = ReadValue();
             obj.Put(key, v);
             SkipWs();
-            string c = Cur();
-            if (c == ",") { pos = pos + 1; }
-            else if (c == "}") { pos = pos + 1; return obj; }
+            int c = CurB();
+            if (c == 44) { pos = pos + 1; }                 // ','
+            else if (c == 125) { pos = pos + 1; return obj; } // '}'
             else { return obj; }
         }
         return obj;
@@ -388,48 +389,69 @@ class JsonReader {
         JsonValue arr = JsonValue.NewArray();
         pos = pos + 1;                 // consume '['
         SkipWs();
-        if (Cur() == "]") { pos = pos + 1; return arr; }
+        if (CurB() == 93) { pos = pos + 1; return arr; }    // ']'
         while (pos < len) {
             JsonValue v = ReadValue();
             arr.Append(v);
             SkipWs();
-            string c = Cur();
-            if (c == ",") { pos = pos + 1; }
-            else if (c == "]") { pos = pos + 1; return arr; }
+            int c = CurB();
+            if (c == 44) { pos = pos + 1; }                 // ','
+            else if (c == 93) { pos = pos + 1; return arr; } // ']'
             else { return arr; }
         }
         return arr;
     }
 
     /// Reads a quoted string starting at the opening quote; decodes the common
-    /// escapes. Leaves pos just past the closing quote.
+    /// escapes. Leaves pos just past the closing quote. Escape-free strings
+    /// (the overwhelmingly common case) are returned as a single substring;
+    /// strings with escapes fall back to a StringBuilder that bulk-copies the
+    /// plain runs between escapes.
     string ReadString() {
-        string outp = "";
-        if (Cur() != "\"") { return outp; }
+        if (CurB() != 34) { return ""; }
         pos = pos + 1;                 // consume opening quote
+        int start = pos;
         while (pos < len) {
-            string c = s.Substring(pos, 1);
-            if (c == "\"") { pos = pos + 1; return outp; }
-            if (c == "\\" && pos + 1 < len) {
-                string n = s.Substring(pos + 1, 1);
-                if (n == "n") { outp = outp + "\n"; }
-                else if (n == "t") { outp = outp + "\t"; }
-                else if (n == "r") { outp = outp + "\r"; }
-                else if (n == "\"") { outp = outp + "\""; }
-                else if (n == "\\") { outp = outp + "\\"; }
-                else if (n == "/") { outp = outp + "/"; }
-                else { outp = outp + n; }
+            int c = s[pos] & 255;
+            if (c == 34) {
+                string plain = s.Substring(start, pos - start);
+                pos = pos + 1;
+                return plain;
+            }
+            if (c == 92) { break; }    // '\' -> escaped path
+            pos = pos + 1;
+        }
+        StringBuilder sb = new StringBuilder();
+        if (pos > start) { sb.Append(s.Substring(start, pos - start)); }
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 34) { pos = pos + 1; return sb.ToString(); }
+            if (c == 92 && pos + 1 < len) {
+                int n = s[pos + 1] & 255;
+                if (n == 110) { sb.Append("\n"); }
+                else if (n == 116) { sb.Append("\t"); }
+                else if (n == 114) { sb.Append("\r"); }
+                else if (n == 34) { sb.Append("\""); }
+                else if (n == 92) { sb.Append("\\"); }
+                else if (n == 47) { sb.Append("/"); }
+                else { sb.Append(s.Substring(pos + 1, 1)); }
                 pos = pos + 2;
             } else {
-                outp = outp + c;
-                pos = pos + 1;
+                int run = pos;
+                while (run < len) {
+                    int c2 = s[run] & 255;
+                    if (c2 == 34 || c2 == 92) { break; }
+                    run = run + 1;
+                }
+                sb.Append(s.Substring(pos, run - pos));
+                pos = run;
             }
         }
-        return outp;
+        return sb.ToString();
     }
 
     JsonValue ReadBool() {
-        if (Cur() == "t") { pos = pos + 4; return JsonValue.NewBool(true); }
+        if (CurB() == 116) { pos = pos + 4; return JsonValue.NewBool(true); }
         pos = pos + 5;                 // "false"
         return JsonValue.NewBool(false);
     }
@@ -437,9 +459,9 @@ class JsonReader {
     JsonValue ReadNumber() {
         int start = pos;
         while (pos < len) {
-            string c = s.Substring(pos, 1);
-            if (c == "-" || c == "+" || c == "." || c == "e" || c == "E"
-                || JsonValue.Digit(c) >= 0) {
+            int c = s[pos] & 255;
+            if ((c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46
+                || c == 101 || c == 69) {   // digits - + . e E
                 pos = pos + 1;
             } else {
                 return JsonValue.NewNum(s.Substring(start, pos - start));
