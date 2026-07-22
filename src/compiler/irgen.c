@@ -5072,6 +5072,271 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
 static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
                                  local_scope_t *locals);
 
+/* ===== NativeMemory intrinsics =====================================
+ * Raw off-heap memory for binary IO. An address is a plain nint (i64) that
+ * never enters ARC. Every accessor lowers to direct (align-1) loads/stores or
+ * a single libc call, so byte-level hot loops in Zan code (page encoding,
+ * checksums, network framing) cost what the equivalent C would.
+ *
+ *   nint  Alloc(int size)                     zeroed malloc
+ *   void  Free(nint p)
+ *   void  Copy(nint dst, nint src, int n)     memmove (overlap-safe)
+ *   void  Fill(nint p, int byte, int n)       memset
+ *   int   Compare(nint a, nint b, int n)      memcmp
+ *   int   GetByte/GetU16/GetU32/GetI64(nint p, int off)   little-endian
+ *   void  SetByte/SetU16/SetU32/SetI64(nint p, int off, int v)
+ *   string GetString(nint p, int off, int len)  copies into a real ARC string
+ *   void  PutString(nint p, int off, string s, int len)
+ *   int   Crc32(nint p, int len)              hardware-independent CRC32 (IEEE)
+ */
+
+/* i8* pointer to (base + off); base/off are i64 values. */
+static LLVMValueRef nm_addr(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef off) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMValueRef p = LLVMBuildIntToPtr(g->builder, base, i8ptr, "nm.p");
+    return LLVMBuildGEP2(g->builder, i8, p, &off, 1, "nm.at");
+}
+
+/* Widen/narrow an emitted argument to i64 (args arrive as iN or pointer). */
+static LLVMValueRef nm_to_i64(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef t = LLVMTypeOf(v);
+    if (LLVMGetTypeKind(t) == LLVMPointerTypeKind)
+        return LLVMBuildPtrToInt(g->builder, v, i64t, "nm.pi");
+    if (LLVMGetTypeKind(t) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(t) < 64)
+        return LLVMBuildSExt(g->builder, v, i64t, "nm.sx");
+    return v;
+}
+
+static LLVMValueRef nm_arg(zan_irgen_t *g, zan_ast_node_t *expr, int i,
+                           local_scope_t *locals) {
+    return nm_to_i64(g, emit_expr(g, expr->call.args.items[i], locals));
+}
+
+/* Little-endian load of `bits` at (p+off), zero-extended to i64 (i64 loads
+ * are returned as-is). align 1: page/wire offsets are arbitrary. */
+static LLVMValueRef nm_load(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef off, int bits) {
+    LLVMTypeRef it = LLVMIntTypeInContext(g->ctx, (unsigned)bits);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef ptr = LLVMBuildBitCast(g->builder, nm_addr(g, base, off),
+        LLVMPointerType(it, 0), "nm.lp");
+    LLVMValueRef v = LLVMBuildLoad2(g->builder, it, ptr, "nm.ld");
+    LLVMSetAlignment(v, 1);
+    if (bits < 64) v = LLVMBuildZExt(g->builder, v, i64t, "nm.zx");
+    return v;
+}
+
+static void nm_store(zan_irgen_t *g, LLVMValueRef base, LLVMValueRef off,
+                     LLVMValueRef val, int bits) {
+    LLVMTypeRef it = LLVMIntTypeInContext(g->ctx, (unsigned)bits);
+    LLVMValueRef ptr = LLVMBuildBitCast(g->builder, nm_addr(g, base, off),
+        LLVMPointerType(it, 0), "nm.sp");
+    if (bits < 64) val = LLVMBuildTrunc(g->builder, val, it, "nm.tr");
+    LLVMValueRef st = LLVMBuildStore(g->builder, val, ptr);
+    LLVMSetAlignment(st, 1);
+}
+
+/* __zan_nm_crc32(i8*, i64) -> i64: CRC32 (IEEE 802.3, reflected polynomial
+ * 0xEDB88320), table-driven, one table lookup per byte. The 256-entry table
+ * is computed at compile time and emitted as a constant global, so the
+ * function is self-contained (no runtime object to link). */
+static LLVMValueRef nm_crc32_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_nm_crc32");
+    if (fn) return fn;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fnty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr, i64t }, 2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_nm_crc32", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+
+    LLVMValueRef entries[256];
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        entries[i] = LLVMConstInt(i32t, c, 0);
+    }
+    LLVMTypeRef tab_ty = LLVMArrayType(i32t, 256);
+    LLVMValueRef tab = LLVMAddGlobal(g->mod, tab_ty, "__zan_crc32_table");
+    LLVMSetInitializer(tab, LLVMConstArray(i32t, entries, 256));
+    LLVMSetGlobalConstant(tab, 1);
+    LLVMSetLinkage(tab, LLVMInternalLinkage);
+
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "loop");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, fn, "body");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef data = LLVMGetParam(fn, 0);
+    LLVMValueRef len = LLVMGetParam(fn, 1);
+    LLVMBuildBr(g->builder, loop);
+
+    LLVMPositionBuilderAtEnd(g->builder, loop);
+    LLVMValueRef idx = LLVMBuildPhi(g->builder, i64t, "i");
+    LLVMValueRef crc = LLVMBuildPhi(g->builder, i32t, "crc");
+    LLVMValueRef in_range = LLVMBuildICmp(g->builder, LLVMIntSLT, idx, len, "inrange");
+    LLVMBuildCondBr(g->builder, in_range, body, done);
+
+    LLVMPositionBuilderAtEnd(g->builder, body);
+    LLVMValueRef bp = LLVMBuildGEP2(g->builder, i8, data, &idx, 1, "bp");
+    LLVMValueRef byte = LLVMBuildZExt(g->builder,
+        LLVMBuildLoad2(g->builder, i8, bp, "b"), i32t, "b32");
+    LLVMValueRef ti = LLVMBuildAnd(g->builder,
+        LLVMBuildXor(g->builder, crc, byte, "x"),
+        LLVMConstInt(i32t, 0xFF, 0), "ti");
+    LLVMValueRef ti64 = LLVMBuildZExt(g->builder, ti, i64t, "ti64");
+    LLVMValueRef gep_idx[] = { LLVMConstInt(i64t, 0, 0), ti64 };
+    LLVMValueRef ep = LLVMBuildGEP2(g->builder, tab_ty, tab, gep_idx, 2, "ep");
+    LLVMValueRef te = LLVMBuildLoad2(g->builder, i32t, ep, "te");
+    LLVMValueRef next_crc = LLVMBuildXor(g->builder, te,
+        LLVMBuildLShr(g->builder, crc, LLVMConstInt(i32t, 8, 0), "sh"), "nc");
+    LLVMValueRef next_idx = LLVMBuildAdd(g->builder, idx, LLVMConstInt(i64t, 1, 0), "ni");
+    LLVMBuildBr(g->builder, loop);
+
+    LLVMAddIncoming(idx, (LLVMValueRef[]){ LLVMConstInt(i64t, 0, 0), next_idx },
+        (LLVMBasicBlockRef[]){ entry, body }, 2);
+    LLVMAddIncoming(crc, (LLVMValueRef[]){ LLVMConstInt(i32t, 0xFFFFFFFFu, 0), next_crc },
+        (LLVMBasicBlockRef[]){ entry, body }, 2);
+
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMValueRef fin = LLVMBuildXor(g->builder, crc,
+        LLVMConstInt(i32t, 0xFFFFFFFFu, 0), "fin");
+    LLVMBuildRet(g->builder, LLVMBuildZExt(g->builder, fin, i64t, "fin64"));
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
+static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
+                                    local_scope_t *locals, LLVMValueRef *out) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+
+    if (is_call_to(expr, "NativeMemory", "Alloc") && expr->call.args.count == 1) {
+        LLVMValueRef size = nm_arg(g, expr, 0, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64t, i64t }, 2, 0);
+        LLVMValueRef fn = get_libc_fn(g, "calloc", ty);
+        LLVMValueRef p = zan_call2(g->builder, ty, fn,
+            (LLVMValueRef[]){ size, LLVMConstInt(i64t, 1, 0) }, 2, "nm.alloc");
+        *out = LLVMBuildPtrToInt(g->builder, p, i64t, "nm.addr");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Free") && expr->call.args.count == 1) {
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8ptr }, 1, 0);
+        LLVMValueRef fn = get_libc_fn(g, "free", ty);
+        LLVMValueRef pp = LLVMBuildIntToPtr(g->builder, p, i8ptr, "nm.fp");
+        zan_call2(g->builder, ty, fn, &pp, 1, "");
+        *out = zero64;
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Copy") && expr->call.args.count == 3) {
+        LLVMValueRef dst = nm_arg(g, expr, 0, locals);
+        LLVMValueRef src = nm_arg(g, expr, 1, locals);
+        LLVMValueRef n = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+        LLVMValueRef fn = get_libc_fn(g, "memmove", ty);
+        zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, dst, zero64), nm_addr(g, src, zero64), n }, 3, "");
+        *out = zero64;
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Fill") && expr->call.args.count == 3) {
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef v = nm_arg(g, expr, 1, locals);
+        LLVMValueRef n = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i32t, i64t }, 3, 0);
+        LLVMValueRef fn = get_libc_fn(g, "memset", ty);
+        zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, p, zero64),
+            LLVMBuildTrunc(g->builder, v, i32t, "nm.b"), n }, 3, "");
+        *out = zero64;
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Compare") && expr->call.args.count == 3) {
+        LLVMValueRef a = nm_arg(g, expr, 0, locals);
+        LLVMValueRef b = nm_arg(g, expr, 1, locals);
+        LLVMValueRef n = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+        LLVMValueRef fn = get_libc_fn(g, "memcmp", ty);
+        LLVMValueRef r = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, a, zero64), nm_addr(g, b, zero64), n }, 3, "nm.cmp");
+        *out = LLVMBuildSExt(g->builder, r, i64t, "nm.cmp64");
+        return true;
+    }
+
+    static const struct { const char *get, *set; int bits; } nm_acc[] = {
+        { "GetByte", "SetByte", 8 },
+        { "GetU16",  "SetU16", 16 },
+        { "GetU32",  "SetU32", 32 },
+        { "GetI64",  "SetI64", 64 },
+    };
+    for (size_t i = 0; i < sizeof(nm_acc) / sizeof(nm_acc[0]); i++) {
+        if (is_call_to(expr, "NativeMemory", nm_acc[i].get) && expr->call.args.count == 2) {
+            LLVMValueRef p = nm_arg(g, expr, 0, locals);
+            LLVMValueRef off = nm_arg(g, expr, 1, locals);
+            *out = nm_load(g, p, off, nm_acc[i].bits);
+            return true;
+        }
+        if (is_call_to(expr, "NativeMemory", nm_acc[i].set) && expr->call.args.count == 3) {
+            LLVMValueRef p = nm_arg(g, expr, 0, locals);
+            LLVMValueRef off = nm_arg(g, expr, 1, locals);
+            LLVMValueRef v = nm_arg(g, expr, 2, locals);
+            nm_store(g, p, off, v, nm_acc[i].bits);
+            *out = zero64;
+            return true;
+        }
+    }
+
+    if (is_call_to(expr, "NativeMemory", "GetString") && expr->call.args.count == 3) {
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef off = nm_arg(g, expr, 1, locals);
+        LLVMValueRef len = nm_arg(g, expr, 2, locals);
+        LLVMValueRef one = LLVMConstInt(i64t, 1, 0);
+        LLVMValueRef total = LLVMBuildAdd(g->builder, len, one, "nm.gs.sz");
+        LLVMValueRef s = emit_string_alloc_rc(g, total);
+        LLVMTypeRef ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+        LLVMValueRef fn = get_libc_fn(g, "memcpy", ty);
+        zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            s, nm_addr(g, p, off), len }, 3, "");
+        LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s, &len, 1, "nm.gs.end");
+        LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+        *out = s;
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "PutString") && expr->call.args.count == 4) {
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef off = nm_arg(g, expr, 1, locals);
+        zan_ast_node_t *s_ast = expr->call.args.items[2];
+        LLVMValueRef s = emit_expr(g, s_ast, locals);
+        LLVMValueRef len = nm_arg(g, expr, 3, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+        LLVMValueRef fn = get_libc_fn(g, "memcpy", ty);
+        zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, p, off), s, len }, 3, "");
+        emit_release_owned_call_temp(g, s_ast, s, locals);
+        *out = zero64;
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Crc32") && expr->call.args.count == 2) {
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef len = nm_arg(g, expr, 1, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t, (LLVMTypeRef[]){ i8ptr, i64t }, 2, 0);
+        LLVMValueRef fn = nm_crc32_fn(g);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, p, zero64), len }, 2, "nm.crc");
+        return true;
+    }
+    return false;
+}
+
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals) {
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 
@@ -6107,6 +6372,37 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, LLVMInt32TypeInContext(g->ctx), i8ptr }, 3, 0),
                 fgets_fn, fgets_args, 3, "");
             return buf;
+        }
+
+        /* ==== NativeMemory intrinsics ====
+         * Raw off-heap memory access for binary IO (ByteBuffer, ZanDB pages,
+         * network framing). Addresses travel as nint (i64); every operation
+         * lowers to direct loads/stores or libc calls, so none of these values
+         * ever enter the ARC string/object machinery. Multi-byte accessors are
+         * little-endian and unaligned-safe (align 1). */
+        {
+            LLVMValueRef nm_out = NULL;
+            if (emit_native_memory_call(g, expr, locals, &nm_out))
+                return nm_out;
+        }
+
+        /* String.CompareOrdinal(a, b) → strcmp: byte-wise ordinal compare of
+         * two NUL-terminated strings in one libc call. */
+        if (is_call_to(expr, "String", "CompareOrdinal") && expr->call.args.count == 2) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+            zan_ast_node_t *a_ast = expr->call.args.items[0];
+            zan_ast_node_t *b_ast = expr->call.args.items[1];
+            LLVMValueRef a = emit_expr(g, a_ast, locals);
+            LLVMValueRef b = emit_expr(g, b_ast, locals);
+            LLVMTypeRef strcmp_ty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+            LLVMValueRef strcmp_fn = get_libc_fn(g, "strcmp", strcmp_ty);
+            LLVMValueRef r = zan_call2(g->builder, strcmp_ty, strcmp_fn,
+                (LLVMValueRef[]){ a, b }, 2, "ordcmp");
+            emit_release_owned_call_temp(g, a_ast, a, locals);
+            emit_release_owned_call_temp(g, b_ast, b, locals);
+            return LLVMBuildSExt(g->builder, r, i64t, "ordcmp64");
         }
 
         /* Math.Sqrt(expr) → llvm.sqrt */
@@ -8922,13 +9218,28 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             expr->call.callee->member.object->kind == AST_IDENTIFIER) {
             zan_istr_t on = expr->call.callee->member.object->ident.name;
             zan_istr_t mn = expr->call.callee->member.name;
-            if (!local_find(locals, on) && !zan_binder_lookup(g->binder, on)) {
+            zan_symbol_t *osym = local_find(locals, on) ? NULL
+                : zan_binder_lookup(g->binder, on);
+            if (!local_find(locals, on) && !osym) {
                 zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                     "unresolved call '%.*s.%.*s': '%.*s' is not a known variable, "
                     "type, or namespace (is the class imported and registered in "
                     "the stdlib map?)",
                     (int)on.len, on.str, (int)mn.len, mn.str,
                     (int)on.len, on.str);
+            }
+            /* The object is a known class/struct but the method does not exist
+             * on it (and no builtin lowering claimed the call earlier). This is
+             * the method-call twin of the check above: silently lowering to
+             * 0/null turns a typo or a missing stdlib method into a runtime
+             * null-pointer crash far from the call site. */
+            else if (osym && (osym->kind == SYM_CLASS || osym->kind == SYM_STRUCT) &&
+                     !get_method_sym(osym, mn)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "unresolved call '%.*s.%.*s': type '%.*s' has no method "
+                    "'%.*s'",
+                    (int)on.len, on.str, (int)mn.len, mn.str,
+                    (int)on.len, on.str, (int)mn.len, mn.str);
             }
         }
 

@@ -1,0 +1,104 @@
+using System;
+using System.IO;
+
+// NativeMemory intrinsics + ByteBuffer over raw off-heap memory: scalar
+// accessors (LE, unaligned), bulk copy/fill/compare, string round-trips into
+// real ARC strings, CRC32, and buffer growth. Guards against raw pointers
+// ever re-entering the ARC string machinery (heap corruption regression).
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static void Main() {
+        // ---- scalar accessors, little-endian, unaligned offsets ----
+        nint p = NativeMemory.Alloc(64);
+        Check("alloc-nonzero", p != 0);
+        Check("alloc-zeroed", NativeMemory.GetI64(p, 0) == 0);
+        NativeMemory.SetByte(p, 0, 200);
+        NativeMemory.SetU16(p, 1, 65535);
+        NativeMemory.SetU32(p, 3, 305419896);          // 0x12345678
+        NativeMemory.SetI64(p, 7, 1234567890123);
+        Check("get-byte", NativeMemory.GetByte(p, 0) == 200);
+        Check("get-u16", NativeMemory.GetU16(p, 1) == 65535);
+        Check("get-u32", NativeMemory.GetU32(p, 3) == 305419896);
+        Check("get-i64", NativeMemory.GetI64(p, 7) == 1234567890123);
+        Check("le-order", NativeMemory.GetByte(p, 3) == 120);   // 0x78 first
+
+        // ---- string round-trip through raw memory ----
+        NativeMemory.PutString(p, 20, "hello world", 11);
+        string s = NativeMemory.GetString(p, 20, 11);
+        Check("str-roundtrip", s == "hello world");
+        Check("str-length", s.Length == 11);
+        Check("str-slice", NativeMemory.GetString(p, 26, 5) == "world");
+
+        // ---- copy / fill / compare ----
+        nint q = NativeMemory.Alloc(64);
+        NativeMemory.Copy(q, p, 64);
+        Check("copy-compare", NativeMemory.Compare(p, q, 64) == 0);
+        NativeMemory.SetByte(q, 63, 1);
+        Check("compare-diff", NativeMemory.Compare(p, q, 64) != 0);
+        NativeMemory.Fill(q, 170, 64);                 // 0xAA
+        Check("fill", NativeMemory.GetByte(q, 0) == 170 && NativeMemory.GetByte(q, 63) == 170);
+        NativeMemory.Free(q);
+
+        // ---- CRC32 (IEEE): crc32("123456789") = 0xCBF43926 ----
+        nint c = NativeMemory.Alloc(16);
+        NativeMemory.PutString(c, 0, "123456789", 9);
+        Check("crc32-vector", NativeMemory.Crc32(c, 9) == 3421780262);
+        NativeMemory.Free(c);
+        NativeMemory.Free(p);
+
+        // ---- String.CompareOrdinal ----
+        Check("ordcmp-lt", String.CompareOrdinal("abc", "abd") < 0);
+        Check("ordcmp-gt", String.CompareOrdinal("b", "a") > 0);
+        Check("ordcmp-eq", String.CompareOrdinal("same", "same") == 0);
+        Check("ordcmp-prefix", String.CompareOrdinal("ab", "abc") < 0);
+
+        // ---- ByteBuffer over NativeMemory: writers/readers + growth ----
+        ByteBuffer b = ByteBuffer.Alloc(16);
+        b.WriteU8(7).WriteU16(513).WriteU32(70000).WriteU64(9000000000);
+        b.WriteVarInt(300);
+        b.WriteString("byte buffer");
+        int i = 0;
+        while (i < 100) {                              // force several growths
+            b.WriteU32(i);
+            i = i + 1;
+        }
+        b.SeekRead(0);
+        Check("bb-u8", b.ReadU8() == 7);
+        Check("bb-u16", b.ReadU16() == 513);
+        Check("bb-u32", b.ReadU32() == 70000);
+        Check("bb-u64", b.ReadU64() == 9000000000);
+        Check("bb-varint", b.ReadVarInt() == 300);
+        Check("bb-string", b.ReadString() == "byte buffer");
+        bool seqOk = true;
+        i = 0;
+        while (i < 100) {
+            if (b.ReadU32() != i) { seqOk = false; }
+            i = i + 1;
+        }
+        Check("bb-growth-seq", seqOk);
+        Check("bb-remaining", b.Remaining() == 0);
+
+        // heavy churn: repeated string round-trips must stay stable
+        int churnOk = 1;
+        i = 0;
+        while (i < 10000) {
+            b.Clear();
+            b.WriteString("key-" + Convert.ToString(i));
+            b.SeekRead(0);
+            if (b.ReadString() != "key-" + Convert.ToString(i)) { churnOk = 0; }
+            i = i + 1;
+        }
+        Check("bb-churn", churnOk == 1);
+        b.Free();
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+    }
+}

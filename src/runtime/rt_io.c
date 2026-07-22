@@ -1634,6 +1634,9 @@ void zan_co_sched_run(void) {
  * concurrently, so the waiter list is guarded by a lock there; the
  * single-thread cooperative driver has no concurrency and needs none.
  * ====================================================================== */
+#if defined(ZAN_CO_DRIVER) && !defined(_WIN32)
+#include <pthread.h>
+#endif
 typedef struct zan_gate_waiter {
     struct zan_gate_waiter *next;
     void                   *frame;
