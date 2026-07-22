@@ -26,6 +26,12 @@
 #include "rt_co.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include "rt_crash.h"
+
+static int zan_io_trace(void){static int t=-1;if(t<0){const char*e=getenv("ZAN_IO_TRACE");t=(e&&*e&&*e!='0')?1:0;}return t;}
+#define IOTRACE(...) do{if(zan_io_trace()){fprintf(stderr,"[iot] " __VA_ARGS__);fprintf(stderr,"\n");fflush(stderr);}}while(0)
 
 
 /* The reactor serves two clients:
@@ -159,12 +165,33 @@ void zan_io_socket_cleanup(void) {
 void zan_io_socket_cleanup(void) {}
 #endif
 
+/* Non-blocking send with a classified result so callers can tell a transient
+ * "try again once writable" from a dead connection:
+ *   >= 0  bytes accepted this call
+ *   -1    would block (EWOULDBLOCK/EAGAIN) -- retry after the socket is writable
+ *   -2    fatal (connection reset/aborted, broken pipe, not connected, ...)
+ * Returning a single -1 for every error made the async SendAsync loop wait
+ * forever for a writability that never comes when the peer had reset the
+ * connection mid-send (e.g. a server that answers 413 and closes). */
 int64_t zan_io_socket_send(int64_t fd, const void *buf, int64_t len,
                            int64_t flags) {
 #if defined(_WIN32)
-    return (int64_t)send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
+    int _sr = send((SOCKET)fd, (const char *)buf, (int)len, (int)flags);
+    if (_sr == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        IOTRACE("send fd=%lld len=%lld -> ERR err=%d", (long long)fd, (long long)len, e);
+        if (e == WSAEWOULDBLOCK) return -1;
+        return -2;
+    }
+    IOTRACE("send fd=%lld len=%lld -> %d", (long long)fd, (long long)len, _sr);
+    return (int64_t)_sr;
 #else
-    return (int64_t)send((int)fd, buf, (size_t)len, (int)flags);
+    ssize_t r = send((int)fd, buf, (size_t)len, (int)flags);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        return -2;
+    }
+    return (int64_t)r;
 #endif
 }
 
@@ -445,99 +472,39 @@ static void op_free(zan_io_op_t *op) {
 }
 #endif
 
-/* ---- completion-port association cache ----
- * A socket only needs to be associated with the IOCP once, yet the recv
- * registration path re-ran CreateIoCompletionPort on every op -- a syscall per
- * request. Cache the sockets the reactor freshly created (accept/connect) so
- * their later registrations skip the redundant association. Windows recycles
- * closed handle numbers, which a naive value cache would mishandle; that is
- * safe here because mark_assoc() -- called for every newly created socket --
- * always issues the real association for the new kernel object, so a recycled
- * number never makes ensure_assoc() skip associating a fresh socket (which is
- * why ensure_assoc() itself never records sockets it did not force-associate).
- * The table is guarded by an SRWLOCK under the multi-worker driver (many
- * workers register concurrently); in the single-threaded reactor the lock
- * macros expand to nothing. */
-#if defined(ZAN_CO_DRIVER)
-static SRWLOCK g_assoc_lock = SRWLOCK_INIT;
-#define ASSOC_RLOCK()   AcquireSRWLockShared(&g_assoc_lock)
-#define ASSOC_RUNLOCK() ReleaseSRWLockShared(&g_assoc_lock)
-#define ASSOC_WLOCK()   AcquireSRWLockExclusive(&g_assoc_lock)
-#define ASSOC_WUNLOCK() ReleaseSRWLockExclusive(&g_assoc_lock)
-#else
-#define ASSOC_RLOCK()
-#define ASSOC_RUNLOCK()
-#define ASSOC_WLOCK()
-#define ASSOC_WUNLOCK()
-#endif
+/* ---- completion-port association ----
+ * Every socket must be associated with the IOCP once before its first
+ * overlapped op. A previous version cached associated handle *numbers* to skip
+ * the CreateIoCompletionPort syscall on the hot recv path, but that was unsafe:
+ * Windows recycles the handle number of a closed socket and the runtime has no
+ * hook on socket close, so a fresh un-associated socket could reuse a cached
+ * number and wrongly skip association -- dropping it off the port so its
+ * completions never arrived (a low-activity lost-wakeup hang). Association is
+ * now unconditional and idempotent (re-binding an already-bound handle is a
+ * cheap ERROR_INVALID_PARAMETER no-op), which is correct and race-free. */
 
-static SOCKET *g_assoc_tab;      /* open-addressed, power-of-two, linear probe */
-static size_t  g_assoc_cap;
-static size_t  g_assoc_len;
-
-static void assoc_insert_locked(SOCKET s);
-
-static void assoc_grow_locked(void) {
-    size_t ncap = g_assoc_cap ? g_assoc_cap * 2 : 64;
-    SOCKET *old = g_assoc_tab;
-    size_t oldcap = g_assoc_cap;
-    SOCKET *nt = (SOCKET *)malloc(ncap * sizeof(SOCKET));
-    for (size_t i = 0; i < ncap; i++) nt[i] = INVALID_SOCKET;
-    g_assoc_tab = nt;
-    g_assoc_cap = ncap;
-    g_assoc_len = 0;
-    for (size_t i = 0; i < oldcap; i++)
-        if (old[i] != INVALID_SOCKET) assoc_insert_locked(old[i]);
-    free(old);
-}
-
-static void assoc_insert_locked(SOCKET s) {
-    if ((g_assoc_len + 1) * 4 >= g_assoc_cap * 3) assoc_grow_locked();
-    size_t mask = g_assoc_cap - 1;
-    size_t i = ((size_t)s / 4) & mask;
-    while (g_assoc_tab[i] != INVALID_SOCKET) {
-        if (g_assoc_tab[i] == s) return;
-        i = (i + 1) & mask;
-    }
-    g_assoc_tab[i] = s;
-    g_assoc_len++;
-}
-
-static int assoc_contains(SOCKET s) {
-    int found = 0;
-    ASSOC_RLOCK();
-    if (g_assoc_cap) {
-        size_t mask = g_assoc_cap - 1;
-        size_t i = ((size_t)s / 4) & mask;
-        while (g_assoc_tab[i] != INVALID_SOCKET) {
-            if (g_assoc_tab[i] == s) { found = 1; break; }
-            i = (i + 1) & mask;
-        }
-    }
-    ASSOC_RUNLOCK();
-    return found;
-}
-
-/* Associate a brand-new kernel socket with the port and record it. Always
- * performs the association: a recycled handle number may still sit in the cache
- * from a since-closed socket, but this new kernel object is unassociated. */
+/* Associate a brand-new kernel socket with the port. */
 static void mark_assoc(SOCKET s) {
     if (CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0) == NULL) {
         DWORD e = GetLastError();
         (void)e;
     }
-    ASSOC_WLOCK();
-    assoc_insert_locked(s);
-    ASSOC_WUNLOCK();
 }
 
-/* Associate a socket with the completion port on first use. Sockets the reactor
- * created itself (accept/connect) were already force-associated by mark_assoc
- * and sit in the cache, so their hot-path registrations skip the syscall.
- * Everything else -- e.g. the listener -- (re)associates and is treated as
- * success when already bound (ERROR_INVALID_PARAMETER). ensure_assoc never
- * records a socket, so a recycled handle number can never make it skip
- * associating a socket that was not force-associated by mark_assoc. */
+/* Associate a socket with the completion port before its first overlapped op.
+ *
+ * This ALWAYS issues CreateIoCompletionPort and treats "already bound"
+ * (ERROR_INVALID_PARAMETER) as success -- it never skips based on a
+ * remembered handle. An earlier version cached associated handle *numbers*
+ * and skipped the syscall on a cache hit, but Windows recycles the handle
+ * number of a closed socket, and the runtime has no hook on socket close
+ * (stdlib calls closesocket directly). So a freshly created, still
+ * UN-associated client socket could reuse the number of a since-closed
+ * server socket left in the cache; the skip then left the new socket off the
+ * IOCP entirely and its completion (connect/recv) was never delivered -- a
+ * lost-wakeup hang that surfaced at low activity, where handle reuse is
+ * common. Re-associating an already-bound socket is a cheap, harmless no-op,
+ * so always doing it is the correct and race-free choice. */
 static void ensure_assoc(SOCKET s) {
 #if defined(ZAN_CO_DRIVER)
     /* Do NOT enable FILE_SKIP_COMPLETION_PORT_ON_SUCCESS under the multi-worker
@@ -553,7 +520,6 @@ static void ensure_assoc(SOCKET s) {
      * stays 0 so io_register / zan_io_recv_co never take the inline shortcut. */
     if (g_skip_mode < 0) InterlockedExchange(&g_skip_mode, 0);
 #endif
-    if (assoc_contains(s)) return;
     if (CreateIoCompletionPort((HANDLE)s, g_iocp, (ULONG_PTR)s, 0) == NULL) {
         DWORD e = GetLastError();
         (void)e;   /* ERROR_INVALID_PARAMETER == already bound to this port */
@@ -562,6 +528,7 @@ static void ensure_assoc(SOCKET s) {
 
 void zan_io_init(void) {
     if (g_io_started) return;
+    zan__crash_install();
     g_io_count = 0;
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -575,9 +542,8 @@ void zan_io_init(void) {
 void zan_io_shutdown(void) {
     if (g_iocp) { CloseHandle(g_iocp); g_iocp = NULL; }
     g_io_count = 0;
-    /* Drop pooled ops and the association cache: the completion port is gone,
-     * so the cached socket->associated facts and recycled op structs are all
-     * stale for any future zan_io_init(). */
+    /* Drop pooled ops: the completion port is gone, so recycled op structs are
+     * all stale for any future zan_io_init(). */
 #if defined(ZAN_CO_DRIVER)
     for (;;) {
         PSLIST_ENTRY e = InterlockedPopEntrySList(&g_op_slist);
@@ -591,12 +557,6 @@ void zan_io_shutdown(void) {
         g_op_pool = nx;
     }
 #endif
-    ASSOC_WLOCK();
-    free(g_assoc_tab);
-    g_assoc_tab = NULL;
-    g_assoc_cap = 0;
-    g_assoc_len = 0;
-    ASSOC_WUNLOCK();
     WSACleanup();
 #if defined(ZAN_CO_DRIVER)
     LONG requested = InterlockedExchange(&g_socket_cleanup_requested, 0);
@@ -652,6 +612,7 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
 #endif
 
     ensure_assoc(s);
+    IOTRACE("io_register(READY) fd=%lld interest=%d cnt=%d", (long long)s, interest, g_io_count);
 
     zan_io_op_t *op = op_alloc();
     op->sock = s;
@@ -671,6 +632,8 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     } else {
         r = WSASend(s, &b, 1, NULL, 0, &op->ov, NULL);
     }
+    IOTRACE("ready_co fd=%lld interest=%d op=%p -> r=%d err=%d cnt=%d",
+            (long long)s, interest, (void*)op, r, r?WSAGetLastError():0, g_io_count);
     if (r == 0) {
 #if defined(ZAN_CO_DRIVER)
         /* Inline completion. With skip-on-success in effect no IOCP packet is
@@ -719,6 +682,7 @@ void zan_io_recv_co(int64_t fd, void *buf, int len, void *frame,
     b.buf = (char *)buf;
     DWORD flags = 0, got = 0;
     int r = WSARecv(s, &b, 1, &got, &flags, &op->ov, NULL);
+    IOTRACE("recv_co fd=%lld len=%d op=%p -> r=%d got=%lu err=%d cnt=%d", (long long)fd, len, (void*)op, r, (unsigned long)got, r?WSAGetLastError():0, g_io_count);
     if (r == 0) {
 #if defined(ZAN_CO_DRIVER)
         /* Immediate completion. With skip-on-success no packet is queued, so
@@ -746,6 +710,7 @@ void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
                       int64_t *out_fd) {
     zan_io_init();
     SOCKET listener = (SOCKET)fd;
+    IOTRACE("accept_co ENTER listener=%lld", (long long)fd);
     ensure_assoc(listener);
 
     LPFN_ACCEPTEX accept_ex = NULL;
@@ -781,6 +746,7 @@ void zan_io_accept_co(int64_t fd, void *frame, zan_co_step_t step,
     got = 0;
     BOOL ok = accept_ex(listener, accepted, op->accept_buf, 0,
                         addr_len, addr_len, &got, &op->ov);
+    IOTRACE("accept_co listener=%lld op=%p ok=%d err=%d cnt=%d", (long long)listener, (void*)op, (int)ok, WSAGetLastError(), g_io_count);
     if (ok || WSAGetLastError() == WSA_IO_PENDING) return;
 
     closesocket(accepted);
@@ -808,10 +774,12 @@ static void io_complete_op(zan_io_op_t *op, DWORD transferred,
         } else {
             closesocket(accepted);
         }
+        IOTRACE("accept_complete listener=%lld accepted=%lld status=%llu", (long long)op->sock, (long long)result, (unsigned long long)status);
         if (op->out_n) *op->out_n = result;
         free(op->accept_buf);
         return;
     }
+    IOTRACE("complete op=%p kind=%d transferred=%lu status=%llu", (void*)op, op->kind, (unsigned long)transferred, (unsigned long long)status);
     if (op->out_n) *op->out_n = (int64_t)transferred;
 }
 
@@ -820,14 +788,18 @@ int zan_io_poll(int64_t timeout_ms) {
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
-    if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE))
+    if (!GetQueuedCompletionStatusEx(g_iocp, entries, 64, &removed, to, FALSE)) {
+        IOTRACE("poll GQCS=0 err=%lu to=%lu cnt=%d", (unsigned long)GetLastError(), (unsigned long)to, g_io_count);
         return 0;
+    }
+    IOTRACE("poll removed=%lu cnt=%d", (unsigned long)removed, g_io_count);
     int woke = 0;
     for (ULONG i = 0; i < removed; i++) {
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        IOTRACE("poll_op op=%p kind=%d bytes=%lu status=%llu", (void*)op, op->kind, (unsigned long)entries[i].dwNumberOfBytesTransferred, (unsigned long long)entries[i].Internal);
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
         op_free(op);
@@ -1364,6 +1336,7 @@ static void co_wait_io(long long timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        IOTRACE("poll_op op=%p kind=%d bytes=%lu status=%llu", (void*)op, op->kind, (unsigned long)entries[i].dwNumberOfBytesTransferred, (unsigned long long)entries[i].Internal);
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
         op_free(op);
@@ -1543,3 +1516,132 @@ void zan_co_sched_run(void) {
 }
 #endif /* _WIN32 */
 #endif /* ZAN_CO_DRIVER */
+
+
+/* ======================================================================
+ * Coroutine gate -- event-driven, counting wait primitive.
+ *
+ * Purpose: replace the `await Task.Delay(1)` spin-poll used by connection
+ * pools (MySqlPool / SqlitePool / RedisPool) and reconnect loops with a
+ * genuine suspend/wake handshake. A coroutine that cannot make progress
+ * parks on a gate (no CPU, no timer); whoever makes progress possible
+ * calls signal, which re-readies exactly one parked coroutine through the
+ * same ready queue the rest of the async machinery uses.
+ *
+ * Semantics (counting / condition-variable style, no lost wakeup):
+ *   - park: if a surplus signal is banked, consume it and re-ready the
+ *     caller immediately; otherwise enqueue the caller as a FIFO waiter.
+ *   - signal: wake the oldest waiter, or bank a surplus signal when none
+ *     is parked. Surplus lets signal-before-park work, so callers that use
+ *     a recheck loop (while (!avail) await gate.Wait()) never deadlock.
+ *
+ * Compiled unconditionally (outside ZAN_CO_DRIVER) so it lives in both
+ * zanrt_io.o (single-thread inline driver) and zanrt_io_mt.o (multi-worker
+ * driver). zan_co_ready is resolved from whichever driver is linked. Under
+ * the multi-worker driver several OS threads may park/signal the same gate
+ * concurrently, so the waiter list is guarded by a lock there; the
+ * single-thread cooperative driver has no concurrency and needs none.
+ * ====================================================================== */
+typedef struct zan_gate_waiter {
+    struct zan_gate_waiter *next;
+    void                   *frame;
+    zan_co_step_t           step;
+} zan_gate_waiter;
+
+typedef struct zan_gate {
+    zan_gate_waiter *head;
+    zan_gate_waiter *tail;
+    long long        surplus;   /* signals banked while no waiter parked */
+#if defined(ZAN_CO_DRIVER) && defined(_WIN32)
+    CRITICAL_SECTION lock;
+#elif defined(ZAN_CO_DRIVER)
+    pthread_mutex_t  lock;
+#endif
+} zan_gate;
+
+#if defined(ZAN_CO_DRIVER) && defined(_WIN32)
+static void zan_gate_lock(zan_gate *g)   { EnterCriticalSection(&g->lock); }
+static void zan_gate_unlock(zan_gate *g) { LeaveCriticalSection(&g->lock); }
+static void zan_gate_lock_init(zan_gate *g) { InitializeCriticalSection(&g->lock); }
+static void zan_gate_lock_free(zan_gate *g) { DeleteCriticalSection(&g->lock); }
+#elif defined(ZAN_CO_DRIVER)
+static void zan_gate_lock(zan_gate *g)   { pthread_mutex_lock(&g->lock); }
+static void zan_gate_unlock(zan_gate *g) { pthread_mutex_unlock(&g->lock); }
+static void zan_gate_lock_init(zan_gate *g) { pthread_mutex_init(&g->lock, NULL); }
+static void zan_gate_lock_free(zan_gate *g) { pthread_mutex_destroy(&g->lock); }
+#else
+static void zan_gate_lock(zan_gate *g)   { (void)g; }
+static void zan_gate_unlock(zan_gate *g) { (void)g; }
+static void zan_gate_lock_init(zan_gate *g) { (void)g; }
+static void zan_gate_lock_free(zan_gate *g) { (void)g; }
+#endif
+
+/* Allocate a gate; returns an opaque handle (its address as an integer). */
+long long zan_gate_new(void) {
+    zan_gate *g = (zan_gate *)calloc(1, sizeof(*g));
+    if (!g) return 0;
+    zan_gate_lock_init(g);
+    return (long long)(intptr_t)g;
+}
+
+/* Suspend the calling coroutine on the gate. The compiler emits this after
+ * saving the frame's live slots and setting its resume state, then returns
+ * void from the step; the frame is re-entered via `step(frame)` once a
+ * signal is delivered (or immediately if one was already banked). */
+void zan_gate_park(long long handle, void *frame, zan_co_step_t step) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) { if (step) zan_co_ready(frame, step); return; }
+    if (!step) return;
+    zan_gate_lock(g);
+    if (g->surplus > 0) {
+        g->surplus--;
+        zan_gate_unlock(g);
+        zan_co_ready(frame, step);   /* a signal was already available */
+        return;
+    }
+    zan_gate_waiter *w = (zan_gate_waiter *)malloc(sizeof(*w));
+    if (!w) { zan_gate_unlock(g); zan_co_ready(frame, step); return; }
+    w->next = NULL; w->frame = frame; w->step = step;
+    if (g->tail) g->tail->next = w; else g->head = w;
+    g->tail = w;
+    zan_gate_unlock(g);
+    /* parked: nothing more to do -- zan_gate_signal will re-ready us. */
+}
+
+/* Wake exactly one parked waiter, or bank a surplus signal when none is
+ * parked so a subsequent park does not block. */
+void zan_gate_signal(long long handle) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) return;
+    zan_gate_lock(g);
+    zan_gate_waiter *w = g->head;
+    if (w) {
+        g->head = w->next;
+        if (!g->head) g->tail = NULL;
+        zan_gate_unlock(g);
+        zan_co_ready(w->frame, w->step);
+        free(w);
+        return;
+    }
+    g->surplus++;
+    zan_gate_unlock(g);
+}
+
+/* Destroy a gate. Any stragglers are re-readied (so they don't hang) before
+ * the storage is released. */
+void zan_gate_free(long long handle) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) return;
+    zan_gate_lock(g);
+    zan_gate_waiter *w = g->head;
+    g->head = g->tail = NULL;
+    zan_gate_unlock(g);
+    while (w) {
+        zan_gate_waiter *n = w->next;
+        zan_co_ready(w->frame, w->step);
+        free(w);
+        w = n;
+    }
+    zan_gate_lock_free(g);
+    free(g);
+}

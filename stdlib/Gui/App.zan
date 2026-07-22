@@ -78,6 +78,13 @@ class App {
     int tabHoldId;
     bool blocksInputBelow;
     bool inputBlockPrevious;
+    // The live primary click has been consumed for the rest of this frame --
+    // set automatically when a modal scrim first appears mid-frame (the click
+    // that opened it is spent) or explicitly via ClaimClick(). Surfaces that
+    // read raw click events must test ClickAvailable() instead of the window
+    // event directly so a click can never fall through into a modal that it
+    // itself just opened. Reset every frame in BeginFrame.
+    bool clickClaimed;
 
     // --- Event delegation ---
     // Target of the current mouse event, resolved once per event in
@@ -623,6 +630,8 @@ class App {
         if (titlebarH < 24) { titlebarH = Scale(32); }
         if (captionBtnW < 24) { captionBtnW = Scale(46); }
         window.SetCaptionButtons(ChromeButtonCount());
+        // Arm the AI automation driver when ZAN_UI_SCRIPT is set (inert otherwise).
+        UiDriver.Begin(this);
     }
 
     /// Shows the window and runs the standard event loop until it closes,
@@ -1127,6 +1136,9 @@ class App {
     }
 
     bool ProcessEvent() {
+        // Advance any active automation script (injects synthetic events that
+        // this same loop then polls & dispatches). No-op unless driver-armed.
+        UiDriver.Tick();
         // If a repaint is already pending (e.g. a click handler changed state
         // mid-frame), don't block waiting for the next OS event ��?poll so the
         // new state paints immediately. Otherwise block until an event arrives.
@@ -1564,6 +1576,7 @@ class App {
         tabHoldId = -1;
         inputBlockPrevious = blocksInputBelow;
         blocksInputBelow = false;
+        clickClaimed = false;
         hitTester.Clear();
         focus.ResetIds();
         overlays = new List<OverlayPopup>();
@@ -1627,9 +1640,34 @@ class App {
         bool firstBlock = !blocksInputBelow;
         blocksInputBelow = true;
         int id = BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
-        if (firstBlock && !inputBlockPrevious) { focus.SetFocused(id); }
+        if (firstBlock && !inputBlockPrevious) {
+            focus.SetFocused(id);
+            // The modal appeared during this frame, so the click being
+            // dispatched (the one that opened it) is spent: without this, a
+            // surface drawn inside the new modal at the same coordinates as
+            // the opening button would receive that same click.
+            clickClaimed = true;
+        }
         return id;
     }
+
+    /// True while a primary click (mouse-up) event is live this frame and may
+    /// be acted on by the surface being rendered right now. Immediate-mode
+    /// surfaces should test this instead of window.EventKind() == 3: it is
+    /// false when the click was claimed (a modal opened on this very click),
+    /// and false for content painted *under* an open modal scrim -- a modal
+    /// was up last frame (inputBlockPrevious) but its BlockHitsBelow has not
+    /// run yet this frame, meaning the code asking renders below it. The
+    /// modal's own internals render after its scrim, where this is true
+    /// again, so clicks never fall through a modal to the page beneath.
+    bool ClickAvailable() {
+        if (window.EventKind() != 3 || clickClaimed) { return false; }
+        if (inputBlockPrevious && !blocksInputBelow) { return false; }
+        return true;
+    }
+
+    /// Marks the live click as consumed for the rest of this frame.
+    void ClaimClick() { clickClaimed = true; }
 
     /// Id of the widget the current click (mouse-up) landed on, or -1.
     int ClickTarget() { return clickTargetId; }

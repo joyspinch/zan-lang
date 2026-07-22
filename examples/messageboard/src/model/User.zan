@@ -1,0 +1,81 @@
+using System;
+using System.Data;
+using System.Data.MySql;
+using System.Security.Cryptography;
+
+namespace Board;
+
+/// <summary>
+/// User model / repository. All access goes through the pool: each method
+/// checks out its own connection, so nothing is shared with a concurrent
+/// request. Passwords are stored as salt + SHA-256(salt+password), never in
+/// plaintext. Uniqueness of the username is enforced by a UNIQUE index so two
+/// concurrent registrations of the same name cannot both succeed (no
+/// check-then-insert race).
+/// </summary>
+class User {
+
+    static async void EnsureTable(MySqlConnection db) {
+        int _r = await db.ExecuteAsync(
+            "CREATE TABLE IF NOT EXISTS users ("
+            + "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
+            + "username VARCHAR(64) NOT NULL,"
+            + "pass_salt VARCHAR(32) NOT NULL,"
+            + "pass_hash VARCHAR(64) NOT NULL,"
+            + "created_at BIGINT NOT NULL,"
+            + "UNIQUE KEY uq_username (username)"
+            + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    static string HashPw(string salt, string password) {
+        string cat = salt + password;
+        return Hex.Encode(Sha256.Hash(cat, cat.Length), 32);
+    }
+
+    /// <summary>Registers a user. Returns the new uid, or "" if the username is
+    /// already taken (UNIQUE violation) or on error.</summary>
+    static async string Create(MySqlPool pool, string username, string password) {
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(8), 8);
+        string hash = User.HashPw(salt, password);
+        int now = DateTime.Now().ToUnixSeconds();
+
+        MySqlConnection db = await pool.AcquireAsync();
+        if (db == null || !db.IsConnected()) { pool.Release(db); return ""; }
+
+        int rc = await db.ExecuteAsync(
+            "INSERT INTO users(username,pass_salt,pass_hash,created_at) VALUES('"
+            + Sql.Esc(username) + "','" + salt + "','" + hash + "',"
+            + Convert.ToString(now) + ")");
+
+        string uid = "";
+        if (rc >= 1 && db.GetError().Length == 0) {
+            uid = await db.ExecuteScalarAsync("SELECT LAST_INSERT_ID()");
+        }
+        pool.Release(db);
+        return uid;
+    }
+
+    /// <summary>Verifies credentials. Returns the uid on success, "" otherwise.
+    /// out[0] receives the username when successful.</summary>
+    static async string Verify(MySqlPool pool, string username, string password,
+            List<string> sink) {
+        sink.Add("");
+        MySqlConnection db = await pool.AcquireAsync();
+        if (db == null || !db.IsConnected()) { pool.Release(db); return ""; }
+
+        DbResult r = await db.QueryAsync(
+            "SELECT id,username,pass_salt,pass_hash FROM users WHERE username='"
+            + Sql.Esc(username) + "' LIMIT 1");
+        string uid = "";
+        if (r.RowCount() > 0) {
+            string salt = r.GetString(0, 2);
+            string want = r.GetString(0, 3);
+            if (User.HashPw(salt, password) == want) {
+                uid = r.GetString(0, 0);
+                sink[0] = r.GetString(0, 1);
+            }
+        }
+        pool.Release(db);
+        return uid;
+    }
+}

@@ -1,0 +1,52 @@
+using System;
+
+namespace System.Security.Cryptography;
+
+/// <summary>HKDF (RFC 5869) over HMAC-SHA256: extract-then-expand key
+/// derivation. Used to derive per-purpose subkeys from one master key so a
+/// leaked subkey never exposes the master or its siblings.</summary>
+class Hkdf {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+    [DllImport("crt")] static extern void free(string ptr);
+
+    /// <summary>HKDF-Extract: PRK = HMAC-SHA256(salt, ikm). Returns 32 bytes.</summary>
+    static string Extract(string salt, int saltLen, string ikm, int ikmLen) {
+        return Hmac.Sha256Mac(salt, saltLen, ikm, ikmLen);
+    }
+
+    /// <summary>HKDF-Expand: derives <paramref name="outLen"/> bytes (max 8160)
+    /// from a 32-byte PRK and a context/info string.</summary>
+    static string Expand(string prk, string info, int infoLen, int outLen) {
+        string outb = calloc(outLen + 1, 1);
+        string t = null;
+        int tLen = 0;
+        int pos = 0;
+        int counter = 1;
+        while (pos < outLen) {
+            string msg = calloc(tLen + infoLen + 2, 1);
+            int i = 0;
+            while (i < tLen) { msg[i] = t[i] & 255; i = i + 1; }
+            i = 0;
+            while (i < infoLen) { msg[tLen + i] = info[i] & 255; i = i + 1; }
+            msg[tLen + infoLen] = counter & 255;
+            string nt = Hmac.Sha256Mac(prk, 32, msg, tLen + infoLen + 1);
+            free(msg);
+            if (t != null) { free(t); }
+            t = nt;
+            tLen = 32;
+            int j = 0;
+            while (j < 32 && pos < outLen) { outb[pos] = t[j] & 255; pos = pos + 1; j = j + 1; }
+            counter = counter + 1;
+        }
+        if (t != null) { free(t); }
+        return outb;
+    }
+
+    /// <summary>One-call HKDF: Extract then Expand.</summary>
+    static string Derive(string salt, int saltLen, string ikm, int ikmLen, string info, int infoLen, int outLen) {
+        string prk = Extract(salt, saltLen, ikm, ikmLen);
+        string okm = Expand(prk, info, infoLen, outLen);
+        free(prk);
+        return okm;
+    }
+}

@@ -381,6 +381,7 @@ class ZanIDE {
         cmds.Add(RibbonCmd.Group("layout", ZanIDE.T("Design/Code", "设计/代码")));
         cmds.Add(RibbonCmd.Create("copy", ZanIDE.T("Template", "模板")));
         cmds.Add(RibbonCmd.Create("grid", ZanIDE.T("Config", "配置")));
+        cmds.Add(RibbonCmd.Create("image", ZanIDE.T("Assets", "素材")));
         cmds.Add(RibbonCmd.Group("settings", ZanIDE.T("Settings", "设置")));
         cmds.Add(RibbonCmd.Create("info", ZanIDE.T("Help", "帮助")));
         return cmds;
@@ -389,7 +390,7 @@ class ZanIDE {
     /// Maps a ribbon position (from Ribbon.Render) to its stable action id.
     /// Action ids: 0 Project, 1 New, 2 Open, 3 Save, 4 Run, 5 Build,
     /// 6 Publish, 7 Debug, 8 Template, 9 Designer, 10 Start, 11 Hot,
-    /// 12 Config, 13 Settings, 14 Help.
+    /// 12 Config, 13 Settings, 14 Help, 15 Assets.
     static int RibbonAction(int pos) {
         if (pos == 4) { return 10; }
         if (pos == 5) { return 4; }
@@ -399,6 +400,9 @@ class ZanIDE {
         if (pos == 9) { return 11; }
         if (pos == 10) { return 9; }
         if (pos == 11) { return 8; }
+        if (pos == 13) { return 15; }
+        if (pos == 14) { return 13; }
+        if (pos == 15) { return 14; }
         return pos;
     }
 
@@ -470,6 +474,26 @@ class ZanIDE {
         if (role == 0) { return 0xFF569CD6; } if (role == 1) { return 0xFF4EC9B0; }
         if (role == 2) { return 0xFFCE9178; } if (role == 3) { return 0xFF6A9955; }
         if (role == 4) { return 0xFFB5CEA8; } return 0xFFD4D4D4;
+    }
+
+    /// Machine-readable snapshot of the editor for the AI automation driver:
+    /// caret, live completion popup (candidates + selection) and buffer text.
+    static string EditorProbeJson(CodeEditor ed) {
+        string s = "{\"caretLine\":" + Convert.ToString(ed.CurLine())
+            + ",\"caretCol\":" + Convert.ToString(ed.CurCol())
+            + ",\"completionActive\":" + UiDriver.JsonBool(ed.CompletionActive())
+            + ",\"completionSel\":" + Convert.ToString(ed.CompletionSel())
+            + ",\"completion\":[";
+        int n = ed.CompletionCount();
+        int i = 0;
+        while (i < n) {
+            if (i > 0) { s = s + ","; }
+            s = s + "{\"label\":\"" + UiDriver.JsonEsc(ed.CompletionItem(i))
+                + "\",\"kind\":\"" + UiDriver.JsonEsc(ed.CompletionKind(i)) + "\"}";
+            i = i + 1;
+        }
+        s = s + "],\"text\":\"" + UiDriver.JsonEsc(ed.GetText()) + "\"}";
+        return s;
     }
 
     /// Pushes the selected preset's colors and font size into the editor.
@@ -973,6 +997,8 @@ class ZanIDE {
         // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
         // is the code font size (0 = follow the UI theme). Persisted to editor.cfg.
         bool cfgOpen = false;
+        // Asset Manager overlay (browse/import/organize assets/ recursively).
+        bool assetMgrOpen = false;
         int edThemeIdx = ZanIDE.ReadEditorTheme();
         int edFontPx = ZanIDE.ReadEditorFont();
         int defFontPx = app.theme.fontSizeMedium;
@@ -1058,6 +1084,7 @@ class ZanIDE {
         // Design/Code toggle shows the .zscene JSON in place.
         bool sceneMode = false;
         SceneDesigner sceneDesigner = SceneDesigner.Create();
+        AssetManager assetMgr = AssetManager.Create();
 
         SignalInt treeW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "treeW", 240), 120, 900));
         // The code editor is the primary area: it fills the space left over
@@ -1220,6 +1247,10 @@ class ZanIDE {
         int lastPresent = 0;
         int lastSkinIdx = app.ThemeMenuIndex();
         while (app.isRunning) {
+            // Advance any active AI automation script (ZAN_UI_SCRIPT). This
+            // pump bypasses App.ProcessEvent, so drive the driver here too;
+            // it injects synthetic events this loop then polls & dispatches.
+            UiDriver.Tick();
             FilePicker.lang = ZanIDE.uiLang;
             CodeEditor.lang = ZanIDE.uiLang;
             Designer.lang = ZanIDE.uiLang;
@@ -1443,6 +1474,10 @@ class ZanIDE {
                     // Escape = close publish dialog
                     pubOpen = false;
                     app.RequestRedraw();
+                } else if (kc == 27 && assetMgrOpen) {
+                    // Escape = close the asset manager
+                    assetMgrOpen = false;
+                    app.RequestRedraw();
                 } else if (kc == 123 && !designerMode && dbgState == 0) {
                     // F12 = Go to Definition
                     if (lspSess == null && !lspTried) {
@@ -1568,6 +1603,7 @@ class ZanIDE {
                 cmds[10].SetEnabled(activeIsFile
                     && (ZanIDE.IsFormPath(apE) || ZanIDE.IsScenePath(apE)));
                 cmds[12].SetEnabled(haveProj);
+                cmds[13].SetEnabled(haveProj);
                 int rc = ZanIDE.RibbonAction(
                     Ribbon.Render(app, 0, top, W, ribbonH, cmds));
                 if (rc == 0 && dlg == null) {
@@ -1754,6 +1790,14 @@ class ZanIDE {
                             app, edThemeIdx, edFontPx,
                             ZanIDE.uiLang, defFontPx);
                     }
+                } else if (rc == 15) {
+                    // Open the Asset Manager (assets/ browser + batch import).
+                    if (File.Exists(root + "/zan.proj")) {
+                        assetMgrOpen = true;
+                    } else {
+                        log.Add("> Open or create a project first to manage its assets.");
+                    }
+                    app.RequestRedraw();
                 } else if (rc == 14) {
                     // Open the Help / documentation browser (a real "@docs" tab).
                     int di = ZanIDE.FindTabByPath(tabPaths, "@docs");
@@ -2359,6 +2403,13 @@ class ZanIDE {
                     else { editor.SetDebugVars(new List<string>()); }
                     ZanIDE.ApplyEditorTheme(editor, edThemeIdx, edFontPx);
                     editor.Render(app, edRect);
+                    // Publish live editor state to the AI automation driver
+                    // (ZAN_UI_SCRIPT) so scripts can assert buffer/caret and the
+                    // completion popup without screen-scraping. Inert otherwise.
+                    if (UiDriver.Active()) {
+                        UiDriver.SetProbe("editor", ZanIDE.EditorProbeJson(editor));
+                        UiDriver.SetProbe("log", string.Join("\n", log));
+                    }
                     // Ctrl+click in the editor requests Go to Definition.
                     if (editor.ConsumeGotoRequest()) {
                         if (lspSess == null && !lspTried) {
@@ -2502,7 +2553,7 @@ class ZanIDE {
                         dbgConsole, dbgVarInfo, dbgWatchVals, watchText,
                         dbgStack, log);
                     // Handle tab clicks
-                    if (app.window.EventKind() == 3) {
+                    if (app.ClickAvailable()) {
                         int tabClickW = app.Scale(80);
                         int tabClickY = orr.y;
                         int tabClickH = app.Scale(28);
@@ -2590,7 +2641,7 @@ class ZanIDE {
                         coScroll, coFilter, coSelA, coSelAc, coSelB, coSelBc);
                     // Clear button empties the real log and resets the view state.
                     Rect coClr = ZanIDE.OutClearRect(app, orr);
-                    if (!coCtxOpen && app.window.EventKind() == 3
+                    if (!coCtxOpen && app.ClickAvailable()
                         && app.mouseX >= coClr.x && app.mouseX < coClr.x + coClr.width
                         && app.mouseY >= coClr.y && app.mouseY < coClr.y + coClr.height) {
                         log = new List<string>();
@@ -2662,7 +2713,7 @@ class ZanIDE {
                             app.RequestRedraw();
                         }
                     }
-                    if (!coCtxOpen && app.window.EventKind() == 3) {
+                    if (!coCtxOpen && app.ClickAvailable()) {
                         int obTabW = app.Scale(90);
                         if (app.mouseY >= orr.y && app.mouseY < orr.y + obTabH
                             && app.mouseX >= orr.x && app.mouseX < orr.x + obTabW * 2) {
@@ -2840,7 +2891,7 @@ class ZanIDE {
                         rTabNames[rtI], t.textPrimary, t.fontSizeSmall);
                     rtI = rtI + 1;
                 }
-                if (app.window.EventKind() == 3
+                if (app.ClickAvailable()
                     && app.mouseY >= rp.y && app.mouseY < rp.y + rTabH
                     && app.mouseX >= rp.x && app.mouseX < rp.x + rTabW * rTabNames.Count) {
                     rightTab.Set((app.mouseX - rp.x) / rTabW);
@@ -3377,7 +3428,7 @@ class ZanIDE {
                             gfi = gfi + 1;
                         }
                         c.PopClip();
-                        if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                        if (app.ClickAvailable() && app.window.EventButton() == 0
                             && app.mouseX >= gArea.x + gPad && app.mouseX < gArea.x + gArea.width - gPad
                             && app.mouseY >= gListY && app.mouseY < gListY + gListH) {
                             int gIdx = gitScroll.Get() + (app.mouseY - gListY) / gRowH;
@@ -3463,7 +3514,7 @@ class ZanIDE {
                         TreeView.Render(app, rtArea, rtShow, rtSel, rtSc);
                     }
                     // Double-click on a leaf: run the tool / open the example.
-                    if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                    if (app.ClickAvailable() && app.window.EventButton() == 0
                         && app.DoubleClickNow()
                         && app.mouseX >= rtArea.x && app.mouseX < rtArea.x + rtArea.width
                         && app.mouseY >= rtArea.y && app.mouseY < rtArea.y + rtArea.height) {
@@ -3709,6 +3760,37 @@ class ZanIDE {
                             ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
                         pathPickerOwner = 5;
                         app.RequestRedraw();
+                    } else if (cAct == 5) {
+                        cfgOpen = false;
+                        assetMgrOpen = true;
+                        app.RequestRedraw();
+                    }
+                }
+
+                // Asset Manager overlay (modal): recursive assets/ browser,
+                // batch folder import and .anim clip authoring.
+                if (assetMgrOpen) {
+                    AssetManager.lang = ZanIDE.uiLang;
+                    int savedSeqA = WidgetId.SeqValue();
+                    WidgetId.SetSeq(890000);
+                    int aAct = assetMgr.Render(app, root, log);
+                    WidgetId.SetSeq(savedSeqA);
+                    if (aAct == 1) {
+                        assetMgrOpen = false;
+                        lastActive = 0 - 1;
+                        app.RequestRedraw();
+                    } else if (aAct == 2) {
+                        pathPicker.BeginOpenFile(
+                            ZanIDE.ReadLastPickerDirectory(root), "",
+                            ZanIDE.T("Import an asset file", "导入素材文件"));
+                        pathPickerOwner = 6;
+                        app.RequestRedraw();
+                    } else if (aAct == 3) {
+                        pathPicker.BeginFolder(
+                            ZanIDE.ReadLastPickerDirectory(root),
+                            ZanIDE.T("Import an asset folder (recursive)", "导入素材文件夹（递归）"));
+                        pathPickerOwner = 7;
+                        app.RequestRedraw();
                     }
                 }
                 string windowTitle = "Zan IDE";
@@ -3879,6 +3961,12 @@ class ZanIDE {
                     File.Copy(picked, ad + "/" + nm);
                     log.Add("> Added resource: assets/" + nm);
                     Layer.Msg(ZanIDE.T("Resource copied: ", "已复制资源：") + nm, 3);
+                } else if (pathPickerOwner == 6) {
+                    assetMgr.ImportFile(picked, root, log);
+                    Layer.Msg(ZanIDE.T("Asset imported", "素材已导入"), 3);
+                } else if (pathPickerOwner == 7) {
+                    assetMgr.ImportFolder(picked, root, log);
+                    Layer.Msg(ZanIDE.T("Folder imported", "文件夹已导入"), 3);
                 } else if (pathPickerOwner == 5) {
                     ZanIDE.AddProjLink(root, picked);
                     log.Add("> Linked resource: " + picked);
@@ -3990,7 +4078,7 @@ class ZanIDE {
             ri = ri + 1;
         }
 
-        if (app.window.EventKind() == 3 && app.window.EventButton() == 0) {
+        if (app.ClickAvailable() && app.window.EventButton() == 0) {
             bool inside = app.mouseX >= mx && app.mouseX < mx + mW
                           && app.mouseY >= my && app.mouseY < my + mH;
             if (inside) {
@@ -5233,7 +5321,7 @@ class ZanIDE {
             int lblY = ry + (rowH - Canvas.FontHeight(t.fontSizeMedium)) / 2;
             c.DrawText(boxX + boxSize + app.Scale(10), lblY, disp[i], labelCol, t.fontSizeMedium);
             ZanIDE.HandRegion(app, boxX, ry, x + w - pad - boxX, rowH);
-            if (app.window.EventKind() == 3
+            if (app.ClickAvailable()
                 && app.mouseX >= boxX && app.mouseX < x + w - pad
                 && app.mouseY >= ry && app.mouseY < ry + rowH) {
                 clicked = i;
@@ -5398,7 +5486,7 @@ class ZanIDE {
         c.DrawText(x + pad, y + pad + app.Scale(24), Path.GetFileName(root), t.textSecondary, t.fontSizeSmall);
         c.FillRect(x + 1, y + app.Scale(60), w - 2, 1, t.divider);
 
-        bool click = app.window.EventKind() == 3;
+        bool click = app.ClickAvailable();
         int action = 0;
 
         // ---- Application icon ----
@@ -5429,6 +5517,9 @@ class ZanIDE {
         int addId = Button.Primary(ZanIDE.T("Add (copy)...", "导入(复制)...")).SetSize(1).Render(app, addX, addY, addW);
         int lnkX = addX - app.Scale(8) - addW;
         int lnkId = Button.Create(ZanIDE.T("Add (link)...", "导入(链接)...")).SetSize(1).Render(app, lnkX, addY, addW);
+        int amW = app.Scale(120);
+        int amX = lnkX - app.Scale(8) - amW;
+        int amId = Button.Create(ZanIDE.T("Asset Manager...", "资源管理器...")).SetSize(1).Render(app, amX, addY, amW);
 
         List<string> res = ZanIDE.ListResources(root);
         List<string> lnks = ZanIDE.ProjLinks(root);
@@ -5512,6 +5603,8 @@ class ZanIDE {
             action = 3;
         } else if (Button.WasClicked(app, lnkId)) {
             action = 4;
+        } else if (Button.WasClicked(app, amId)) {
+            action = 5;
         } else if (removeIdx >= 0 && removeIdx < res.Count) {
             File.Delete(ZanIDE.AssetsDir(root) + "/" + res[removeIdx]);
             log.Add("> Removed resource: assets/" + res[removeIdx]);
@@ -5532,6 +5625,17 @@ class ZanIDE {
         List<string> res = ZanIDE.ListResources(root);
         List<string> lnks = ZanIDE.ProjLinks(root);
         if (res.Count == 0 && lnks.Count == 0) { return; }
+        // Opted-in projects ship one encrypted assets.zrp instead of loose
+        // files (toggle in the Asset Manager; opened via generated AssetPack).
+        if (AssetManager.PackEnabled(root)) {
+            int packed = AssetManager.PackAssets(root, outDir, lnks, log);
+            if (packed >= 0) {
+                log.Add("> Packed " + Convert.ToString(packed)
+                    + " resource file(s) into " + outDir + "/assets/assets.zrp");
+                return;
+            }
+            log.Add("> Falling back to plain resource copy.");
+        }
         string dst = outDir + "/assets";
         Directory.CreateDirectoryRecursive(dst);
         string ad = ZanIDE.AssetsDir(root);
@@ -5539,6 +5643,14 @@ class ZanIDE {
         while (i < res.Count) {
             File.Copy(ad + "/" + res[i], dst + "/" + res[i]);
             i = i + 1;
+        }
+        // Asset subfolders (from the Asset Manager) ship recursively too.
+        List<string> subs = Directory.GetDirectories(ad);
+        int si = 0;
+        int scopied = 0;
+        while (si < subs.Count) {
+            scopied = scopied + AssetManager.copyTree(ad + "/" + subs[si], dst + "/" + subs[si]);
+            si = si + 1;
         }
         // Linked resources are referenced in place during development and
         // copied next to the exe only when publishing.
@@ -5553,7 +5665,7 @@ class ZanIDE {
             }
             li = li + 1;
         }
-        log.Add("> Bundled " + Convert.ToString(res.Count + lcopied) + " resource file(s) into " + dst);
+        log.Add("> Bundled " + Convert.ToString(res.Count + scopied + lcopied) + " resource file(s) into " + dst);
     }
 
     // ---- code navigation (go to definition / find references) ----
@@ -6581,7 +6693,7 @@ class ZanIDE {
         int okId = Button.Primary("Create").Render(app, okX, by, bw);
         if (Button.WasClicked(app, okId)) { result = 1; }
 
-        if (app.window.EventKind() == 3 && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
+        if (app.ClickAvailable() && app.hitTester.HitTest(app.mouseX, app.mouseY) == closeId) {
             result = 2;
         }
         return result;
@@ -6624,7 +6736,7 @@ class ZanIDE {
             k = k + 1;
         }
 
-        if (app.window.EventKind() == 3) {
+        if (app.ClickAvailable()) {
             int hitv = app.hitTester.HitTest(app.mouseX, app.mouseY);
             int idx = hitv - firstId;
             if (idx >= 0 && idx < n) {
@@ -8781,7 +8893,7 @@ class ZanIDE {
                 "Tooltip 在某个点绘制一个浮动的小提示。"),
             "Tooltip.Render(app, 120, 80, \"More information\");");
         ZanIDE.AddExtendedWidgetDocs(
-            cat, title, body, code, cWidgets);
+            cat, title, body, code, cWidgets, cStd, cDb);
         ZanIDE.DocAdd(cat, title, body, code, cProj, ZanIDE.T("Project Layout", "项目结构"),
             ZanIDE.T("A project has zan.proj describing the entry file, target platforms, icon and resources. Source files live alongside it.",
                 "项目包含 zan.proj，描述入口文件、目标平台、图标和资源。源文件与它放在一起。"),
@@ -8825,7 +8937,9 @@ class ZanIDE {
         List<string> title,
         List<string> body,
         List<string> code,
-        string cWidgets
+        string cWidgets,
+        string cStd,
+        string cDb
     ) {
         ZanIDE.DocAdd(cat, title, body, code, cWidgets, "Typography",
             ZanIDE.T("Headings, paragraphs and inline text styles for documentation and application content.",
@@ -9061,7 +9175,7 @@ class ZanIDE {
         int tabH = app.Scale(28);
         int nSec = 4;
         int tabW = swid / nSec;
-        bool clickTabs = app.window.EventKind() == 3;
+        bool clickTabs = app.ClickAvailable();
         int ti = 0;
         while (ti < nSec) {
             int tx = sx + ti * tabW;
@@ -9150,7 +9264,7 @@ class ZanIDE {
         if (scroll < 0) { scroll = 0; }
         scrollSig.Set(scroll);
 
-        bool click = app.window.EventKind() == 3;
+        bool click = app.ClickAvailable();
         int r = 0;
         while (r < visRows) {
             int idx = scroll + r;
@@ -9867,7 +9981,7 @@ class ZanIDE {
         }
 
         // Report a click on a visible row (mouse-up over the area).
-        if (app.window.EventKind() == 3 && over) {
+        if (app.ClickAvailable() && over) {
             int rel = (my - y) / rowH;
             if (rel >= 0 && rel < shown) { return off + rel; }
         }

@@ -48,7 +48,9 @@ if (!(Test-Path $sdlLib)) {
 Write-Output "[0/2] Rebuilding native GUI runtime (SDL3 windowing)..."
 clang -O2 -DZAN_GUI_STATIC -DZAN_GUI_SDL "-I$inc" -c src\runtime\gui_runtime.c -o build\zan_gui_static.obj
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
-llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj | Out-Null
+# Named zan_gui_ide.lib (not zan_gui.lib) so it never clobbers the CMake
+# import library for zan_gui.dll that the ctest GUI cases link against.
+llvm-lib /out:build\zan_gui_ide.lib build\zan_gui_static.obj | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
 # Build the atomic/dispatch/thread runtime (rt_sync.c) with the same MSVC-target
@@ -84,7 +86,11 @@ try {
     $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\Diagnostics\Process.zan")
     $files += (Join-Path (Get-Location) "stdlib\Game\Scene\SceneDoc.zan")
+    # Crypto + encrypted resource pack (.zrp publishing from the Asset Manager).
+    $files += (Get-ChildItem stdlib\System\Security\Cryptography\*.zan).FullName
+    $files += (Join-Path (Get-Location) "stdlib\System\Resources\ResourcePack.zan")
     $files += (Join-Path (Get-Location) "src\ide_zan\SceneDesigner.zan")
+    $files += (Join-Path (Get-Location) "src\ide_zan\AssetManager.zan")
     $files += (Join-Path (Get-Location) "src\ide_zan\ZanIDE.zan")
     Push-Location build
     try {
@@ -97,7 +103,7 @@ try {
         [System.IO.File]::WriteAllLines((Join-Path (Get-Location) "ZanIDE.ll"), $ir)
         clang ZanIDE.ll zanrt_sync_ide.obj zan_icon.res -o ZanIDE.exe -O2 `
             -Xlinker /STACK:268435456 -Xlinker /SUBSYSTEM:WINDOWS `
-            -Xlinker /ENTRY:mainCRTStartup -lzan_gui "$sdlLib" -llegacy_stdio_definitions -lws2_32 -lpsapi
+            -Xlinker /ENTRY:mainCRTStartup -lzan_gui_ide "$sdlLib" -llegacy_stdio_definitions -lws2_32 -lpsapi -ladvapi32
         if ($LASTEXITCODE -ne 0) { throw "LINK_FAILED code=$LASTEXITCODE" }
         Copy-Item -LiteralPath (Join-Path $driverDir "SDL3.dll") `
             -Destination (Join-Path (Get-Location) "SDL3.dll") -Force

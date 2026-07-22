@@ -359,8 +359,14 @@ class Socket {
                 }
             } else if (sent == 0) {
                 return totalSent;
-            } else {
+            } else if (sent == -1) {
+                // Would block: wait until the socket is writable, then retry.
                 await Socket.WriteReady(sock);
+            } else {
+                // Fatal (peer reset/aborted, broken pipe, ...). The socket will
+                // never become writable again, so stop instead of waiting
+                // forever; report what was actually accepted.
+                return totalSent;
             }
         }
         return totalSent;
@@ -389,16 +395,17 @@ class Socket {
     /// string (empty on peer close / EOF). Requires a non-blocking socket.</summary>
     static async string RecvAsync(int sock, int bufSize) {
         string buf = calloc(bufSize + 1, 1);
-        while (true) {
-            await Socket.ReadReady(sock);
-            int n = winrecv(sock, buf, bufSize, 0);
-            if (n >= 0) {
-                string result = buf.Substring(0, n);
-                free(buf);
-                return result;
-            }
-        }
-        return buf;
+        // Use the real overlapped receive (RecvOv) rather than a readiness probe
+        // plus synchronous recv. A zero-byte readiness WSARecv can complete
+        // immediately with no data pending, so ReadReady + ReactorRecv would see
+        // WSAEWOULDBLOCK and mistake it for a peer close, returning empty before
+        // the peer's data ever arrives. RecvOv posts a genuine WSARecv into buf
+        // that completes only when bytes are read (or the peer closes).
+        int n = await Socket.RecvOv(sock, buf, bufSize);
+        if (n < 0) { n = 0; }
+        string result = buf.Substring(0, n);
+        free(buf);
+        return result;
     }
 
     /// <summary>Suspends until readable, then receives up to <paramref
@@ -449,6 +456,11 @@ class Socket {
         string fromLen = calloc(4, 1);
         fromLen[0] = 16;
         int n = recvfrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        // recvfrom is a raw ws2_32 import returning C `int`; a -1 error arrives
+        // zero-extended as 0xFFFFFFFF. Sign-normalize the low 32 bits so the
+        // error check below sees a genuine negative rather than ~4G (which would
+        // make Substring copy far past the buffer -- heap corruption).
+        if (n > 2147483647) { n = n - 4294967296; }
         if (n < 0) { n = 0; }
         string result = buf.Substring(0, n);
         free(buf);

@@ -1,0 +1,58 @@
+using System;
+using System.Data.Redis;
+using System.Security.Cryptography;
+
+namespace Board;
+
+/// <summary>
+/// Redis-backed session store. The session token is a 192-bit CSPRNG value
+/// (unguessable); the server stores only token -> uid in Redis with a TTL, so
+/// no session state lives in process memory and nothing is shared between
+/// requests except through Redis. Every protected route resolves the principal
+/// centrally via UidOf, giving one unified token-validation path.
+/// </summary>
+class Session {
+
+    static string NewToken() {
+        return Hex.Encode(RandomNumberGenerator.GetBytes(24), 24);
+    }
+
+    /// <summary>Creates a session for uid and returns its token.</summary>
+    static async string Create(RedisPool rp, string uid, string uname, int ttl) {
+        string token = Session.NewToken();
+        RedisClient r = await rp.AcquireAsync();
+        if (r == null) { return ""; }
+        bool _s = await r.SetAsync("sess:" + token, uid + "|" + uname);
+        int _e = await r.ExpireAsync("sess:" + token, ttl);
+        rp.Release(r);
+        return token;
+    }
+
+    /// <summary>Resolves the uid for a token, sliding its TTL. Returns "" when
+    /// the token is missing/expired. out[0]=uid, out[1]=uname when found.</summary>
+    static async bool Resolve(RedisPool rp, string token, int ttl, List<string> sink) {
+        sink.Add(""); sink.Add("");
+        if (token.Length == 0) { return false; }
+        RedisClient r = await rp.AcquireAsync();
+        if (r == null) { return false; }
+        string v = await r.GetAsync("sess:" + token);
+        if (v.Length > 0) {
+            int _e = await r.ExpireAsync("sess:" + token, ttl);   // sliding expiry
+        }
+        rp.Release(r);
+        if (v.Length == 0) { return false; }
+        int bar = v.IndexOf("|");
+        if (bar < 0) { sink[0] = v; return true; }
+        sink[0] = v.Substring(0, bar);
+        sink[1] = v.Substring(bar + 1);
+        return true;
+    }
+
+    static async void Destroy(RedisPool rp, string token) {
+        if (token.Length == 0) { return; }
+        RedisClient r = await rp.AcquireAsync();
+        if (r == null) { return; }
+        int _d = await r.DelAsync("sess:" + token);
+        rp.Release(r);
+    }
+}

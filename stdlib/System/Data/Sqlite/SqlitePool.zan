@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.Threading;
 
 namespace System.Data.Sqlite;
 
@@ -11,9 +12,10 @@ namespace System.Data.Sqlite;
 /// pool provides is coroutine-aware *lifecycle* management: connections are
 /// reused instead of being opened/closed per request, and the number of
 /// concurrently checked-out connections is capped. When the pool is at
-/// capacity, <see cref="AcquireAsync"/> suspends the calling coroutine (via the
-/// timer reactor) instead of blocking the worker thread, so other coroutines
-/// keep running until a connection is returned with <see cref="Release"/>.
+/// capacity, <see cref="AcquireAsync"/> suspends the calling coroutine on an
+/// event-driven <see cref="Gate"/> (no polling) instead of blocking the worker
+/// thread, so other coroutines keep running until a connection is returned with
+/// <see cref="Release"/>.
 ///
 /// The pool relies on the cooperative single-thread-per-scheduler model: the
 /// free-list is only touched between await points, so no lock is required.
@@ -30,6 +32,8 @@ class SqlitePool {
     int maxSize;
     List<SqliteConnection> idle;
     int liveCount;      // total opened connections (idle + checked out)
+    int waiting;        // coroutines currently parked in AcquireAsync
+    Gate gate;          // event-driven wakeup for waiters (replaces poll)
     bool closed;
 
     SqlitePool(string filename, int maxSize) {
@@ -37,6 +41,8 @@ class SqlitePool {
         this.maxSize = maxSize;
         this.idle = new List<SqliteConnection>();
         this.liveCount = 0;
+        this.waiting = 0;
+        this.gate = Gate.Create();
         this.closed = false;
     }
 
@@ -50,6 +56,9 @@ class SqlitePool {
     /// under the cap, otherwise suspends the coroutine until one is released.</summary>
     async SqliteConnection AcquireAsync() {
         while (true) {
+            if (this.closed) {
+                return null;
+            }
             if (this.idle.Count > 0) {
                 int last = this.idle.Count - 1;
                 SqliteConnection c = this.idle[last];
@@ -63,7 +72,11 @@ class SqlitePool {
                 }
                 return c;
             }
-            await Task.Delay(1);
+            // Pool saturated: park until a connection is released. The gate's
+            // counting semantics + this recheck loop guarantee no lost wakeup.
+            this.waiting = this.waiting + 1;
+            await this.gate.Wait();
+            this.waiting = this.waiting - 1;
         }
         return null;
     }
@@ -81,9 +94,16 @@ class SqlitePool {
             if (this.liveCount > 0) {
                 this.liveCount = this.liveCount - 1;
             }
+            // A live slot freed up: let a waiter open a fresh connection.
+            if (this.waiting > 0) {
+                this.gate.Signal();
+            }
             return;
         }
         this.idle.Add(c);
+        if (this.waiting > 0) {
+            this.gate.Signal();
+        }
     }
 
     /// <summary>Number of idle (pooled, ready-to-use) connections.</summary>
@@ -108,6 +128,13 @@ class SqlitePool {
             if (this.liveCount > 0) {
                 this.liveCount = this.liveCount - 1;
             }
+        }
+        // Wake every parked waiter; each rechecks `closed` and returns null.
+        int n = this.waiting;
+        int k = 0;
+        while (k < n) {
+            this.gate.Signal();
+            k = k + 1;
         }
     }
 }

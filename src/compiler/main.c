@@ -734,6 +734,39 @@ static int zan_driver_find(const zan_driver_registry_t *reg,
 
 /* Copy a file byte-for-byte (portable; no shell). Returns 0 on success. */
 static int zan_copy_file(const char *src, const char *dst) {
+    /* Copying a file onto itself (e.g. the output dir IS the driver dir, as
+     * when tests build into the CMake build tree) would truncate it to zero
+     * bytes: fopen(dst, "wb") empties the file before the source is read. */
+#ifdef _WIN32
+    if (_stricmp(src, dst) == 0) return 0;
+    { WIN32_FILE_ATTRIBUTE_DATA sa, da;
+      if (GetFileAttributesExA(src, GetFileExInfoStandard, &sa) &&
+          GetFileAttributesExA(dst, GetFileExInfoStandard, &da)) {
+          HANDLE hs = CreateFileA(src, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+              NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+          HANDLE hd = CreateFileA(dst, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+              NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+          if (hs != INVALID_HANDLE_VALUE && hd != INVALID_HANDLE_VALUE) {
+              BY_HANDLE_FILE_INFORMATION is, id;
+              if (GetFileInformationByHandle(hs, &is) &&
+                  GetFileInformationByHandle(hd, &id) &&
+                  is.dwVolumeSerialNumber == id.dwVolumeSerialNumber &&
+                  is.nFileIndexHigh == id.nFileIndexHigh &&
+                  is.nFileIndexLow == id.nFileIndexLow) {
+                  CloseHandle(hs); CloseHandle(hd);
+                  return 0;
+              }
+          }
+          if (hs != INVALID_HANDLE_VALUE) CloseHandle(hs);
+          if (hd != INVALID_HANDLE_VALUE) CloseHandle(hd);
+      } }
+#else
+    if (strcmp(src, dst) == 0) return 0;
+    { struct stat ss, ds;
+      if (stat(src, &ss) == 0 && stat(dst, &ds) == 0 &&
+          ss.st_dev == ds.st_dev && ss.st_ino == ds.st_ino)
+          return 0; }
+#endif
     FILE *in = fopen(src, "rb");
     if (!in) return -1;
     FILE *out = fopen(dst, "wb");

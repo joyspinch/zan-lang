@@ -580,6 +580,31 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                 /* Inside a method body */
                 if (strcmp(word, "var") == 0 || isupper((unsigned char)word[0])) {
                     const char *peek = p;
+                    char vtype[64];
+                    snprintf(vtype, sizeof(vtype), "%s", word);
+                    /* Generic declared type: List<string> xs, Dict<K,V> m */
+                    if (peek < end && *peek == '<') {
+                        const char *gs = peek;
+                        int angle = 1;
+                        peek++;
+                        while (peek < end && angle > 0) {
+                            if (*peek == '<') angle++;
+                            else if (*peek == '>') angle--;
+                            peek++;
+                        }
+                        size_t wl = strlen(vtype);
+                        size_t gl = (size_t)(peek - gs);
+                        if (wl + gl < sizeof(vtype)) {
+                            memcpy(vtype + wl, gs, gl);
+                            vtype[wl + gl] = '\0';
+                        }
+                    }
+                    /* Array declared type: Type[] xs */
+                    if (peek + 1 < end && *peek == '[' && peek[1] == ']') {
+                        peek += 2;
+                        size_t wl = strlen(vtype);
+                        if (wl + 2 < sizeof(vtype)) { vtype[wl] = '['; vtype[wl+1] = ']'; vtype[wl+2] = '\0'; }
+                    }
                     while (peek < end && (*peek == ' ' || *peek == '\t')) peek++;
                     if (peek < end && (isalpha((unsigned char)*peek) || *peek == '_')) {
                         const char *vn = peek;
@@ -593,7 +618,7 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                                 char vname[128];
                                 memcpy(vname, vn, (size_t)vn_len);
                                 vname[vn_len] = '\0';
-                                add_symbol(is, vname, word, current_class, NULL,
+                                add_symbol(is, vname, vtype, current_class, NULL,
                                           filepath, ISYM_VARIABLE, line_num,
                                           (int)(vn - content));
                             }
@@ -646,9 +671,41 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
 
     size_t plen = prefix ? strlen(prefix) : 0;
 
+    /* The caller may pass a variable name (`p.` after `Player p = ...`).
+     * When no type of that name exists, resolve the variable's declared
+     * type and complete against it instead. */
+    bool is_known_type = false;
+    for (int i = 0; i < is->symbol_count; i++) {
+        isym_kind_t k = is->symbols[i].kind;
+        if ((k == ISYM_CLASS || k == ISYM_STRUCT || k == ISYM_INTERFACE ||
+             k == ISYM_ENUM) && strcmp(is->symbols[i].name, type_name) == 0) {
+            is_known_type = true;
+            break;
+        }
+    }
+    if (!is_known_type) {
+        for (int ci = 0; stdlib_classes[ci].class_name; ci++) {
+            if (strcmp(type_name, stdlib_classes[ci].class_name) == 0) {
+                is_known_type = true;
+                break;
+            }
+        }
+    }
+    if (!is_known_type) {
+        const char *rv = intel_resolve_type(is, type_name);
+        if (rv && rv[0]) type_name = rv;
+    }
+
+    /* Strip generic arguments for the class-name walk: members of
+     * `List<string>` live under `List`. */
+    char bare_type[64];
+    snprintf(bare_type, sizeof(bare_type), "%s", type_name);
+    { char *lt = strchr(bare_type, '<'); if (lt) *lt = '\0';
+      char *br = strstr(bare_type, "[]"); if (br) *br = '\0'; }
+
     /* Check user-defined type members, walking the inheritance chain so
      * inherited members from base classes are offered too. */
-    const char *cls = type_name;
+    const char *cls = bare_type;
     int guard = 0;
     while (cls && cls[0] && guard < 16 &&
            is->completion_count < INTEL_MAX_COMPLETIONS) {
@@ -689,7 +746,7 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
 
     /* Check stdlib classes */
     for (int ci = 0; stdlib_classes[ci].class_name; ci++) {
-        if (strcmp(type_name, stdlib_classes[ci].class_name) != 0) continue;
+        if (strcmp(bare_type, stdlib_classes[ci].class_name) != 0) continue;
         for (int mi = 0; stdlib_classes[ci].methods[mi] && is->completion_count < INTEL_MAX_COMPLETIONS; mi++) {
             if (plen > 0 && _strnicmp(stdlib_classes[ci].methods[mi], prefix, plen) != 0) continue;
             completion_t *c = &is->completions[is->completion_count++];
@@ -703,7 +760,7 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
     }
 
     /* Console methods */
-    if (strcmp(type_name, "Console") == 0) {
+    if (strcmp(bare_type, "Console") == 0) {
         for (int i = 0; console_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
             if (plen > 0 && _strnicmp(console_methods[i], prefix, plen) != 0) continue;
             completion_t *c = &is->completions[is->completion_count++];
@@ -716,7 +773,7 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
     }
 
     /* string instance methods */
-    if (strcmp(type_name, "string") == 0 || strcmp(type_name, "String") == 0) {
+    if (strcmp(bare_type, "string") == 0 || strcmp(bare_type, "String") == 0) {
         for (int i = 0; string_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
             if (plen > 0 && _strnicmp(string_methods[i], prefix, plen) != 0) continue;
             completion_t *c = &is->completions[is->completion_count++];
@@ -728,8 +785,8 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
         }
     }
 
-    /* List/Dict/StringBuilder instance methods (resolve via symbol type) */
-    const char *resolved = intel_resolve_type(is, type_name);
+    /* List/Dict/StringBuilder instance methods (declared or resolved type) */
+    const char *resolved = type_name;
     if (resolved) {
         if (strstr(resolved, "List") != NULL) {
             for (int i = 0; list_methods[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
@@ -768,11 +825,11 @@ int intel_complete_members(intellisense_t *is, const char *type_name,
 
     /* Enum member access */
     for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-        if (is->symbols[i].kind == ISYM_ENUM && strcmp(is->symbols[i].name, type_name) == 0) {
+        if (is->symbols[i].kind == ISYM_ENUM && strcmp(is->symbols[i].name, bare_type) == 0) {
             /* found enum type, list its members */
             for (int j = 0; j < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
                 if (is->symbols[j].kind == ISYM_ENUM_MEMBER &&
-                    strcmp(is->symbols[j].parent, type_name) == 0) {
+                    strcmp(is->symbols[j].parent, bare_type) == 0) {
                     if (plen > 0 && _strnicmp(is->symbols[j].name, prefix, plen) != 0) continue;
                     completion_t *c = &is->completions[is->completion_count++];
                     strncpy(c->label, is->symbols[j].name, sizeof(c->label) - 1);
@@ -921,11 +978,25 @@ hover_info_t intel_hover(intellisense_t *is, const char *word) {
 
     for (int i = 0; i < is->symbol_count; i++) {
         if (strcmp(is->symbols[i].name, word) == 0) {
-            if (is->symbols[i].signature[0])
+            isym_kind_t hk = is->symbols[i].kind;
+            if (is->symbols[i].signature[0]) {
                 strncpy(info.text, is->symbols[i].signature, sizeof(info.text) - 1);
-            else
+            } else if (hk == ISYM_CLASS || hk == ISYM_STRUCT ||
+                       hk == ISYM_INTERFACE || hk == ISYM_ENUM) {
+                const char *kw = "class";
+                if (hk == ISYM_STRUCT) kw = "struct";
+                else if (hk == ISYM_INTERFACE) kw = "interface";
+                else if (hk == ISYM_ENUM) kw = "enum";
+                if (is->symbols[i].type_name[0])
+                    snprintf(info.text, sizeof(info.text), "%s %s : %s",
+                            kw, is->symbols[i].name, is->symbols[i].type_name);
+                else
+                    snprintf(info.text, sizeof(info.text), "%s %s",
+                            kw, is->symbols[i].name);
+            } else {
                 snprintf(info.text, sizeof(info.text), "%s : %s",
                         is->symbols[i].name, is->symbols[i].type_name);
+            }
             strncpy(info.doc, is->symbols[i].doc, sizeof(info.doc) - 1);
             info.valid = true;
             return info;
@@ -979,6 +1050,29 @@ goto_def_t intel_goto_def(intellisense_t *is, const char *word) {
 signature_info_t intel_signature_help(intellisense_t *is, const char *method_name,
                                       const char *class_context) {
     signature_info_t sig = {0};
+
+    /* `obj.Method(` passes the receiver variable as class_context; map it to
+     * its declared type (stripping generic args) so the method is found. */
+    char ctx_type[64] = "";
+    if (class_context && class_context[0]) {
+        snprintf(ctx_type, sizeof(ctx_type), "%s", class_context);
+        bool is_type = false;
+        for (int i = 0; i < is->symbol_count; i++) {
+            isym_kind_t k = is->symbols[i].kind;
+            if ((k == ISYM_CLASS || k == ISYM_STRUCT || k == ISYM_INTERFACE) &&
+                strcmp(is->symbols[i].name, class_context) == 0) {
+                is_type = true;
+                break;
+            }
+        }
+        if (!is_type) {
+            const char *rv = intel_resolve_type(is, class_context);
+            if (rv && rv[0]) snprintf(ctx_type, sizeof(ctx_type), "%s", rv);
+        }
+        char *lt = strchr(ctx_type, '<');
+        if (lt) *lt = '\0';
+        class_context = ctx_type;
+    }
 
     for (int i = 0; i < is->symbol_count; i++) {
         isym_t *sym = &is->symbols[i];
