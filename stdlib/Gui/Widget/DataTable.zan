@@ -283,6 +283,22 @@ class ChartBar {
     }
 }
 
+/// One entry in the flattened display model: `kind` 0 = data row, 1 = group
+/// header; `row` = data-row index (kind 0) or GroupRow index (kind 1); `no` =
+/// 1-based data ordinal for data rows, else 0. Replaces the old index-aligned
+/// dispKind/dispRow/dispNo parallel lists.
+class DispRow {
+    int kind;
+    int row;
+    int no;
+
+    DispRow(int k, int r, int n) {
+        kind = k;
+        row = r;
+        no = n;
+    }
+}
+
 /// One group-header row in a grouped table: caption, nesting level, contained
 /// data-row count, full path key (collapse lookup) and collapsed snapshot.
 /// Replaces the old index-aligned grpLabel/grpLevel/grpCount/grpKey/grpCollapsed
@@ -391,9 +407,7 @@ class DataTableState {
     // ---- row grouping (ag-Grid / DevExpress style) ----
     List<int> groupCols;       // grouped columns, outer→inner (empty = flat table)
     List<string> collapsedKeys;// group path keys whose rows are collapsed away
-    List<int> dispKind;        // per display row: 0 = data row, 1 = group header
-    List<int> dispRow;         // data-row index (kind 0) or group-table index (kind 1)
-    List<int> dispNo;          // 1-based data ordinal for kind-0 rows, else 0
+    List<DispRow> dispRows;     // flattened display model (see DispRow)
     List<GroupRow> groups;     // group-header rows (see GroupRow)
 
     // ---- semantic event surface (sender = this state; handlers pull context
@@ -501,9 +515,7 @@ class DataTableState {
         s.ColumnReorder = UiEvent.Create();
         s.groupCols = new List<int>();
         s.collapsedKeys = new List<string>();
-        s.dispKind = new List<int>();
-        s.dispRow = new List<int>();
-        s.dispNo = new List<int>();
+        s.dispRows = new List<DispRow>();
         s.groups = new List<GroupRow>();
         s.hitRow = -1;
         s.hitOrder = -1;
@@ -1122,7 +1134,7 @@ class DataTable {
         if (st.showSummary) { DataTable.ComputeSummary(st, cols, src); }
         DataTable.ComputeColStats(st, cols, src);
         DataTable.BuildDisplay(st, cols, src);
-        int maxScroll = st.dispKind.Count - 1;
+        int maxScroll = st.dispRows.Count - 1;
         if (st.scrollRow > maxScroll) { st.scrollRow = maxScroll; }
         if (st.scrollRow < 0) { st.scrollRow = 0; }
         st.dirty = false;
@@ -1258,17 +1270,13 @@ class DataTable {
     // model mirrors st.order one-to-one, so every downstream render/hit path
     // behaves exactly as before.
     static void BuildDisplay(DataTableState st, List<DataColumn> cols, DataSource src) {
-        st.dispKind.Clear();
-        st.dispRow.Clear();
-        st.dispNo.Clear();
+        st.dispRows.Clear();
         st.groups.Clear();
         int G = st.groupCols.Count;
         if (G == 0) {
             int i = 0;
             while (i < st.order.Count) {
-                st.dispKind.Add(0);
-                st.dispRow.Add(st.order[i]);
-                st.dispNo.Add(i + 1);
+                st.dispRows.Add(new DispRow(0, st.order[i], i + 1));
                 i = i + 1;
             }
             return;
@@ -1305,9 +1313,7 @@ class DataTable {
                             + src.CellText(rowIdx, st.groupCols[L]),
                         L, cnt, key, DataTable.IsCollapsed(st, key)));
                     if (!ancColl) {
-                        st.dispKind.Add(1);
-                        st.dispRow.Add(gi);
-                        st.dispNo.Add(0);
+                        st.dispRows.Add(new DispRow(1, gi, 0));
                     }
                 }
                 L = L + 1;
@@ -1322,9 +1328,7 @@ class DataTable {
             }
             dataNo = dataNo + 1;
             if (!anyColl) {
-                st.dispKind.Add(0);
-                st.dispRow.Add(rowIdx);
-                st.dispNo.Add(dataNo);
+                st.dispRows.Add(new DispRow(0, rowIdx, dataNo));
             }
             p = p + 1;
         }
@@ -2408,7 +2412,7 @@ class DataTable {
         }
 
         // ---------------- body (virtualised) ----------------
-        int total = st.dispKind.Count;
+        int total = st.dispRows.Count;
         int summaryH = 0;
         if (st.showSummary) { summaryH = rowH; }
         int pagerH = 0;
@@ -2467,8 +2471,8 @@ class DataTable {
 
             // Group header row: indented chevron + caption + row count. It
             // occupies a display slot but carries no data-row payload.
-            if (st.dispKind[oiRow] == 1) {
-                int gi = st.dispRow[oiRow];
+            if (st.dispRows[oiRow].kind == 1) {
+                int gi = st.dispRows[oiRow].row;
                 GroupRow grp = st.groups[gi];
                 int lvl = grp.level;
                 c.FillRect(x + 1, ry, viewW - 2, rowH, t.bgTertiary);
@@ -2486,7 +2490,7 @@ class DataTable {
                 continue;
             }
 
-            int rowIdx = st.dispRow[oiRow];
+            int rowIdx = st.dispRows[oiRow].row;
             bool rowInRange = hasRange && oiRow >= rgR0 && oiRow <= rgR1;
 
             int rowId = app.focus.AllocId();
@@ -2495,7 +2499,7 @@ class DataTable {
             bool rSel = st.selected[rowIdx];
 
             int rowBg = t.bgPrimary;
-            if (st.striped && (st.dispNo[oiRow] % 2 == 0)) { rowBg = t.bgSecondary; }
+            if (st.striped && (st.dispRows[oiRow].no % 2 == 0)) { rowBg = t.bgSecondary; }
             if (rSel) { rowBg = t.bgActive; }
             if (rHover) { rowBg = t.bgHover; }
             c.FillRect(x + 1, ry, viewW - 2, rowH, rowBg);
@@ -2506,7 +2510,7 @@ class DataTable {
                 // filtered view — NOT the original data index, so the row-number
                 // column stays ordered instead of jumping around when the user
                 // sorts or filters.
-                c.DrawTextCentered(cx2, ry, numW, rowH, Convert.ToString(st.dispNo[oiRow]), t.textTertiary, t.fontSizeSmall);
+                c.DrawTextCentered(cx2, ry, numW, rowH, Convert.ToString(st.dispRows[oiRow].no), t.textTertiary, t.fontSizeSmall);
                 cx2 = cx2 + numW;
             }
             if (st.showSelect) {
@@ -2676,9 +2680,9 @@ class DataTable {
 
         // left press
         if (ek == 2 && eb == 0 && ptrOi >= 0) {
-            if (st.dispKind[ptrOi] == 1) {
+            if (st.dispRows[ptrOi].kind == 1) {
                 // group header press: toggle collapse of that group
-                int gi = st.dispRow[ptrOi];
+                int gi = st.dispRows[ptrOi].row;
                 DataTable.ToggleCollapse(st, st.groups[gi].key);
                 app.RequestRedraw();
             } else if (app.mouseX >= x && app.mouseX < x + numW) {
@@ -2695,7 +2699,7 @@ class DataTable {
                     && st.rangeR0 == st.rangeR1 && st.rangeC0 == st.rangeC1;
                 if (st.editing) { DataTable.CommitEdit(st, cols, src); }
                 if (sameCell && cols[ptrCol].editable) {
-                    DataTable.BeginEdit(st, cols, src, st.dispRow[ptrOi], ptrCol);
+                    DataTable.BeginEdit(st, cols, src, st.dispRows[ptrOi].row, ptrCol);
                     app.RequestRedraw();
                 } else {
                     st.rangeR0 = ptrOi;
@@ -2705,7 +2709,7 @@ class DataTable {
                     st.rangeDrag = true;
                     st.selAnchor = ptrOi;
                     st.hitOrder = ptrOi;
-                    st.hitRow = st.dispRow[ptrOi];
+                    st.hitRow = st.dispRows[ptrOi].row;
                     st.hitCol = ptrCol;
                     st.CellClick.Raise();
                     app.RequestRedraw();
@@ -2732,16 +2736,16 @@ class DataTable {
             if (st.rangeDrag) { st.rangeDrag = false; app.RequestRedraw(); }
             if (st.dragRow >= 0) {
                 if (st.groupCols.Count == 0 && st.dragMoved && ptrOi >= 0 && ptrOi != st.dragRow
-                    && st.dispKind[ptrOi] == 0) {
+                    && st.dispRows[ptrOi].kind == 0) {
                     DataTable.MoveOrder(st, st.dragRow, ptrOi);
                     // manual order — drop any active sort without re-running
                     // Recompute (which would rebuild st.order and lose the move).
                     st.sortKeys.Clear();
                     DataTable.SyncPrimary(st);
                     app.RequestRedraw();
-                } else if (!st.dragMoved && st.dispKind[st.dragRow] == 0) {
+                } else if (!st.dragMoved && st.dispRows[st.dragRow].kind == 0) {
                     // treat as a row-selection click (按行选择)
-                    int ri = st.dispRow[st.dragRow];
+                    int ri = st.dispRows[st.dragRow].row;
                     st.hitOrder = st.dragRow;
                     st.hitRow = ri;
                     st.hitCol = -1;
@@ -2754,7 +2758,7 @@ class DataTable {
                         int a = DataTable.MinI(st.selAnchor, st.dragRow);
                         int b = DataTable.MaxI(st.selAnchor, st.dragRow);
                         int kk = a;
-                        while (kk <= b) { if (kk >= 0 && kk < st.dispKind.Count && st.dispKind[kk] == 0) { st.selected[st.dispRow[kk]] = true; } kk = kk + 1; }
+                        while (kk <= b) { if (kk >= 0 && kk < st.dispRows.Count && st.dispRows[kk].kind == 0) { st.selected[st.dispRows[kk].row] = true; } kk = kk + 1; }
                     } else if (ctrl) {
                         st.selected[ri] = !st.selected[ri];
                         st.selAnchor = st.dragRow;
@@ -2772,9 +2776,9 @@ class DataTable {
         }
 
         // double-click on a body row
-        if (ek == 3 && eb == 0 && ptrOi >= 0 && st.dispKind[ptrOi] == 0 && app.DoubleClickNow()) {
+        if (ek == 3 && eb == 0 && ptrOi >= 0 && st.dispRows[ptrOi].kind == 0 && app.DoubleClickNow()) {
             st.hitOrder = ptrOi;
-            st.hitRow = st.dispRow[ptrOi];
+            st.hitRow = st.dispRows[ptrOi].row;
             st.RowDoubleClick.Raise();
         }
 
@@ -2784,8 +2788,8 @@ class DataTable {
             && app.mouseY >= bodyTop && app.mouseY < bodyTop + bodyH) {
             // if right-clicking a row outside any current range/selection, make
             // that row the selection so the menu's copy/export act on something.
-            if (ptrOi >= 0 && st.dispKind[ptrOi] == 0 && !DataTable.HasRange(st)) {
-                int ri = st.dispRow[ptrOi];
+            if (ptrOi >= 0 && st.dispRows[ptrOi].kind == 0 && !DataTable.HasRange(st)) {
+                int ri = st.dispRows[ptrOi].row;
                 if (!st.selected[ri]) {
                     DataTable.SelectAllRows(st, false);
                     st.selected[ri] = true;
