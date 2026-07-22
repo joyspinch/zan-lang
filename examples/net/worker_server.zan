@@ -1,0 +1,162 @@
+// ============================================================================
+// Worker 统一服务端 —— workerman 风格开箱即用示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. Worker.Create / Worker.Listen：一行注册一个协议监听
+//   2. 回调式编程：onHttpRequest / onMessage / onConnect / onClose /
+//      onUdpMessage / onSseSubscriber —— 只写业务，不碰 socket
+//   3. 同一进程同时服务 HTTP + TCP + WebSocket + UDP + SSE + MQTT 六个协议
+//   4. Worker.RunAll()：单进程 (count=1) 直接服务；把任一 worker 的
+//      count 设为 N 即变成 master + N worker 多进程模式（master 守护、
+//      崩溃自动拉起、内核级 accept 分流），业务代码零改动
+//   5. 前台自动刷新的状态行（每 10 秒一行：各 worker 的请求数/QPS/CPU/内存），
+//      Worker.SetStatusInterval(0) 可关闭
+//   6. 本示例最后用各协议客户端自测一轮后退出；真实服务端把
+//      Worker.RunAll() 放在 Main 末尾即可（永不返回）
+//
+// 多进程用法（生产形态，Windows/Linux 皆可）：
+//   Worker w = Worker.Create("http", "0.0.0.0", 8080);
+//   w.count = 4;                    // 4 个 worker 进程分流
+//   Worker.SetDaemonize(true);      // 后台守护运行（可选）
+//   Worker.SetLogDir("logs");       // worker 输出重定向到 logs/worker_N.log
+//   Worker.RunAll();
+//
+// 运行：zanc examples/net/worker_server.zan --auto-stdlib -o worker_server.exe
+// ============================================================================
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Sse;
+using System.Net.Mqtt;
+
+class Program {
+    [DllImport("crt")]
+    static extern void exit(int code);
+
+    static int HTTP_PORT = 54481;
+    static int TCP_PORT  = 54482;
+    static int WS_PORT   = 54483;
+    static int UDP_PORT  = 54484;
+    static int SSE_PORT  = 54485;
+    static int MQTT_PORT = 54486;
+
+    // ---- HTTP：请求 -> 响应 --------------------------------------------------
+    static HttpResponse OnHttp(HttpRequest req) {
+        if (req.path == "/hello") {
+            return HttpResponse.Json("{\"msg\":\"hello from worker\"}");
+        }
+        return HttpResponse.Text("worker http ok, path=" + req.path);
+    }
+
+    // ---- TCP：收到什么回什么（大写化演示业务处理） ----------------------------
+    static string OnTcpMessage(Connection conn, string data) {
+        return "echo:" + data;
+    }
+
+    static void OnTcpConnect(Connection conn) {
+        Console.WriteLine("[tcp] client #" + Convert.ToString(conn.GetId()) + " connected");
+    }
+
+    static void OnTcpClose(Connection conn) {
+        Console.WriteLine("[tcp] client #" + Convert.ToString(conn.GetId()) + " closed");
+    }
+
+    // ---- WebSocket：双向消息 --------------------------------------------------
+    static string OnWsMessage(Connection conn, string data) {
+        return "ws-reply:" + data;
+    }
+
+    // ---- UDP：一个数据报一次回调 ----------------------------------------------
+    static string OnUdp(string data) {
+        return "udp-ack:" + data;
+    }
+
+    // ---- SSE：订阅者接入后由业务推送事件 ---------------------------------------
+    static void OnSse(SseConnection conn) {
+        Task.Spawn(PushEvents(conn));
+    }
+
+    static async void PushEvents(SseConnection conn) {
+        int i = 1;
+        while (i <= 3 && conn.IsOpen()) {
+            int _n = await conn.SendAsync("tick", "count=" + Convert.ToString(i));
+            await Task.Delay(100);
+            i = i + 1;
+        }
+        conn.Close();
+    }
+
+    // ---- 注册所有协议并启动 ----------------------------------------------------
+    static async void StartServer() {
+        Worker http = Worker.Create("http", "127.0.0.1", HTTP_PORT);
+        http.onHttpRequest = OnHttp;
+
+        Worker tcp = Worker.Create("tcp", "127.0.0.1", TCP_PORT);
+        tcp.onMessage = OnTcpMessage;
+        tcp.onConnect = OnTcpConnect;
+        tcp.onClose = OnTcpClose;
+
+        Worker ws = Worker.Create("websocket", "127.0.0.1", WS_PORT);
+        ws.onMessage = OnWsMessage;
+
+        Worker udp = Worker.Create("udp", "127.0.0.1", UDP_PORT);
+        udp.onUdpMessage = OnUdp;
+
+        Worker sse = Worker.Create("sse", "127.0.0.1", SSE_PORT);
+        sse.onSseSubscriber = OnSse;
+
+        // MQTT 无需回调：连接由内置 MqttBroker.Global() 接管
+        Worker mqtt = Worker.Create("mqtt", "127.0.0.1", MQTT_PORT);
+
+        // 状态行每 5 秒刷新一次（默认 10；0 = 关闭）
+        Worker.SetStatusInterval(5);
+
+        await Worker.RunAll();
+    }
+
+    // ---- 自测客户端 ------------------------------------------------------------
+    static async int SelfTest() {
+        await Task.Delay(300);   // 等服务端就绪
+
+        // HTTP
+        HttpClient hc = HttpClient.Create("127.0.0.1", HTTP_PORT);
+        string h1 = await hc.GetAsync("/hello");
+        Console.WriteLine("HTTP  -> " + h1);
+
+        // TCP
+        TcpClient tc = await TcpClient.ConnectAsync("127.0.0.1", TCP_PORT);
+        int _t = await tc.SendAsync("ping");
+        string t1 = await tc.RecvAsync(4096);
+        Console.WriteLine("TCP   -> " + t1);
+        tc.Close();
+
+        // UDP
+        UdpClient uc = UdpClient.Create();
+        int _u = await uc.SendToAsync("beat", "127.0.0.1", UDP_PORT);
+        string u1 = await uc.RecvFromAsync(4096);
+        Console.WriteLine("UDP   -> " + u1);
+
+        // MQTT（订阅+发布走内置 broker）
+        MqttClient sub = await MqttClient.ConnectAsync("127.0.0.1", MQTT_PORT, "sub");
+        int _s = await sub.SubscribeAsync("demo/#", MqttQos.AtMostOnce);
+        MqttClient pub = await MqttClient.ConnectAsync("127.0.0.1", MQTT_PORT, "pub");
+        int _p = await pub.PublishAsync("demo/topic", "hello-mqtt", MqttQos.AtMostOnce);
+        string m1 = await sub.ReceiveAsync();
+        Console.WriteLine("MQTT  -> " + m1);
+        int _d1 = await pub.DisconnectAsync();
+        int _d2 = await sub.DisconnectAsync();
+
+        // WebSocket / SSE 客户端见 websocket_chat.zan / sse_events.zan
+        Console.WriteLine("self test done");
+        // 示例到此结束；真实服务端删掉这行即可长驻服务
+        exit(0);
+        return 0;
+    }
+
+    static void Main() {
+        Task.Spawn(SelfTest());
+        // RunAll 永不返回：真实服务端就停在这里持续服务
+        await StartServer();
+    }
+}

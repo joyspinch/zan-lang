@@ -1,0 +1,82 @@
+// ============================================================================
+// HTTP 客户端 —— GET/POST/PUT/DELETE、自定义头、JSON 解析完整示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. HttpClient.Create(host, port) 实例化客户端；SetHeader 设置默认请求头
+//   2. GetAsync / PostAsync / PutAsync / DeleteAsync 四种方法
+//   3. 静态便捷方法 HttpClient.GetAsync(host, port, path)（一次性请求）
+//   4. 响应体是 JSON 时用 JsonValue.Parse 解析并取字段
+//   5. 错误处理：连接失败/非 200 时 GetAsync 返回空串或错误页body，
+//      业务侧应校验内容而非盲目信任
+//
+// 说明：本示例自带一个极简服务端作为请求目标，
+//       重点看 Client() 里的客户端用法。
+// 运行：zanc examples/net/http_client.zan --auto-stdlib -o http_client.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Json;
+
+class Program {
+    static int PORT = 54431;
+
+    // 极简测试服务端：把 method/path/body 回显成 JSON
+    static HttpResponse Handle(HttpRequest req) {
+        JsonValue o = JsonValue.NewObject();
+        o.Set("method", JsonValue.NewStr(req.method));
+        o.Set("path", JsonValue.NewStr(req.path));
+        o.Set("body", JsonValue.NewStr(req.body));
+        return HttpResponse.Json(o.ToJson());
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = HttpServer.Create("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        // ---- 实例化客户端并设置默认头 ---------------------------------------
+        // SetHeader 设置的头会附加到之后该客户端发出的每个请求上，
+        // 常见用途：认证 token、接受类型等。
+        HttpClient cli = HttpClient.Create("127.0.0.1", PORT);
+        cli.SetHeader("X-Api-Key", "demo-key-123");
+        cli.SetHeader("Accept", "application/json");
+        cli.SetTimeout(5000);   // 毫秒
+
+        // ---- GET：无请求体 ---------------------------------------------------
+        string g = await cli.GetAsync("/users/42");
+        JsonValue gv = JsonValue.Parse(g);
+        Console.WriteLine("GET    -> method=" + gv.Str("method", "?")
+            + " path=" + gv.Str("path", "?"));
+
+        // ---- POST：带请求体（这里发 JSON 文本） ------------------------------
+        string p = await cli.PostAsync("/users", "{\"name\":\"alice\",\"age\":30}");
+        JsonValue pv = JsonValue.Parse(p);
+        Console.WriteLine("POST   -> body=" + pv.Str("body", "?"));
+
+        // ---- PUT：更新语义 ---------------------------------------------------
+        string u = await cli.PutAsync("/users/42", "{\"age\":31}");
+        JsonValue uv = JsonValue.Parse(u);
+        Console.WriteLine("PUT    -> method=" + uv.Str("method", "?")
+            + " body=" + uv.Str("body", "?"));
+
+        // ---- DELETE ----------------------------------------------------------
+        string d = await cli.DeleteAsync("/users/42");
+        JsonValue dv = JsonValue.Parse(d);
+        Console.WriteLine("DELETE -> method=" + dv.Str("method", "?"));
+
+        // ---- 静态便捷方法：适合一次性请求，不需要先 Create --------------------
+        string once = await HttpClient.GetAsync("127.0.0.1", PORT, "/ping");
+        JsonValue ov = JsonValue.Parse(once);
+        Console.WriteLine("STATIC -> path=" + ov.Str("path", "?"));
+
+        server.Stop();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

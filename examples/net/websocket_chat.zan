@@ -1,0 +1,84 @@
+// ============================================================================
+// WebSocket —— 服务端 + 客户端双向通信完整示例
+// ----------------------------------------------------------------------------
+// WebSocket 在一次 HTTP 握手后升级为全双工二进制帧协议，
+// 适合聊天、协同编辑、游戏等需要"双向、低延迟、长连接"的场景。
+//
+// 演示内容：
+//   1. WebSocketServer.Create + Start：握手、帧解析、ping/pong 由框架处理；
+//      默认 OnMessage 行为是回显（echo），继承后可覆写成自己的业务逻辑
+//   2. WebSocketClient.ConnectAsync(host, port, path)：客户端握手
+//   3. SendText / RecvText：文本帧收发
+//   4. Ping：心跳（服务端自动回 pong，对应用透明）
+//   5. Close：发送关闭帧，优雅断开
+//   6. 多客户端并发连接同一服务端
+//
+// 运行：zanc examples/net/websocket_chat.zan --auto-stdlib -o ws.exe && ./ws.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+
+class Program {
+    static int PORT = 54451;
+    static int CLIENTS = 2;
+    static int doneCount = 0;
+
+    // ---- 客户端协程 ----------------------------------------------------------
+    static async void Client(int id) {
+        // 握手：发送 HTTP Upgrade 请求，校验 101 响应
+        WebSocketClient c = await WebSocketClient.ConnectAsync(
+            "127.0.0.1", PORT, "/chat");
+        if (!c.IsConnected()) {
+            Console.WriteLine("client " + Convert.ToString(id) + ": handshake failed");
+            doneCount = doneCount + 1;
+            return;
+        }
+
+        // 发两条消息，逐条等回显。
+        // 服务端默认 OnMessage 是 echo，因此回文与发文相同。
+        int m = 0;
+        while (m < 2) {
+            string msg = "msg-" + Convert.ToString(id) + "-" + Convert.ToString(m);
+            await c.SendText(msg);
+            string reply = await c.RecvText();   // 挂起直到收到文本帧
+            Console.WriteLine("client " + Convert.ToString(id)
+                + " got [" + reply + "]");
+            m = m + 1;
+        }
+
+        // 心跳：Ping 帧由服务端自动应答 Pong，
+        // 生产环境用定时 Ping 检测半开连接（对端悄悄消失）。
+        await c.Ping();
+
+        // 优雅关闭：发送 Close 帧后再断 TCP
+        await c.Close();
+        doneCount = doneCount + 1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // 服务端：握手 + 帧编解码全部由 WebSocketServer 处理。
+        // 默认 OnMessage(message) 直接返回收到的文本（回显服务）。
+        // 要实现聊天室等业务，可继承 WebSocketServer 并覆写 OnMessage。
+        WebSocketServer server = WebSocketServer.Create("127.0.0.1", PORT);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        int i = 0;
+        while (i < CLIENTS) {
+            Task.Spawn(Client(i));
+            i = i + 1;
+        }
+        while (doneCount < CLIENTS) { await Task.Delay(10); }
+
+        server.Stop();
+        Console.WriteLine("done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

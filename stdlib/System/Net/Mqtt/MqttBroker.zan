@@ -1,0 +1,394 @@
+using System;
+using System.Net.Sockets;
+using System.Text;
+
+namespace System.Net.Mqtt;
+
+/// <summary>
+/// One connected MQTT client session held by the broker: its socket, client id
+/// and active topic filters.
+/// </summary>
+class MqttSession {
+    int sock;
+    string clientId;
+    List<string> filters;
+    bool alive;
+
+    MqttSession(int sock) {
+        this.sock = sock;
+        this.clientId = "";
+        this.filters = new List<string>();
+        this.alive = true;
+    }
+
+    static MqttSession Create(int sock) {
+        return new MqttSession(sock);
+    }
+}
+
+/// <summary>
+/// MQTT v3.1.1 broker (server side of <see cref="MqttClient"/>).
+///
+/// Supports CONNECT/CONNACK, PUBLISH QoS 0 and 1 (PUBACK), SUBSCRIBE/SUBACK,
+/// UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP and DISCONNECT, with `+` and `#`
+/// topic-filter wildcards. QoS 2 is downgraded to 1. Retained messages and
+/// persistent sessions are not implemented.
+///
+/// Standalone:
+///   MqttBroker b = MqttBroker.Create("0.0.0.0", 1883);
+///   await b.RunAsync();                      // accept loop; never returns
+///
+/// Under a Worker (protocol "mqtt"), the Worker accepts and calls
+/// <see cref="HandleConnection"/> for each client, so the broker also works in
+/// master/multi-worker mode. Note that in multi-process mode each worker holds
+/// its own session table: publishers only reach subscribers accepted by the
+/// same worker, so brokers that need global fan-out should use count = 1.
+/// </summary>
+class MqttBroker {
+    string host;
+    int port;
+    List<MqttSession> sessions;
+    bool running;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+    [DllImport("crt")]
+    static extern int strlen(string str);
+
+    MqttBroker(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.sessions = new List<MqttSession>();
+        this.running = false;
+    }
+
+    static MqttBroker Create(string host, int port) {
+        return new MqttBroker(host, port);
+    }
+
+    // Shared instance for Worker integration ("mqtt" protocol workers route
+    // every accepted connection here).
+    static MqttBroker inst;
+    static MqttBroker Global() {
+        if (inst == null) { inst = new MqttBroker("", 0); }
+        return inst;
+    }
+
+    /// <summary>Binds, listens and serves clients. Never returns.</summary>
+    async void RunAsync() {
+        int s = Socket.CreateTcp();
+        Socket.SetReuseAddr(s);
+        int r = Socket.Bind(s, this.host, this.port);
+        if (r != 0) {
+            Console.WriteLine("[MqttBroker] cannot bind " + this.host + ":"
+                + Convert.ToString(this.port));
+            return;
+        }
+        Socket.Listen(s, 511);
+        Socket.SetNonBlocking(s);
+        this.running = true;
+        Console.WriteLine("[MqttBroker] listening on mqtt://" + this.host + ":"
+            + Convert.ToString(this.port));
+        while (this.running) {
+            int c = await Socket.AcceptAsync(s);
+            if (c >= 0) {
+                Socket.SetNonBlocking(c);
+                Task.Spawn(this.HandleConnection(c));
+            }
+        }
+    }
+
+    // ---- framing (binary-safe reads; see MqttClient for rationale) ----
+
+    async int ReadByteAsync(int sock) {
+        string b = calloc(2, 1);
+        while (true) {
+            await Socket.ReadReady(sock);
+            int n = Socket.Recv(sock, b, 1);
+            if (n == 0) { return -1; }
+            if (n > 0) {
+                int v = b[0] & 255;
+                return v;
+            }
+        }
+        return -1;
+    }
+
+    async string ReadBytesAsync(int sock, int need) {
+        string buf = calloc(need + 1, 1);
+        string tmp = calloc(need + 1, 1);
+        int got = 0;
+        while (got < need) {
+            await Socket.ReadReady(sock);
+            int n = Socket.Recv(sock, tmp, need - got);
+            if (n == 0) { return buf; }
+            if (n > 0) {
+                int i = 0;
+                while (i < n) {
+                    buf[got] = tmp[i];
+                    got = got + 1;
+                    i = i + 1;
+                }
+            }
+        }
+        return buf;
+    }
+
+    async int ReadRemainingLenAsync(int sock) {
+        int multiplier = 1;
+        int acc = 0;
+        int encoded = 128;
+        while ((encoded & 128) != 0) {
+            encoded = await ReadByteAsync(sock);
+            if (encoded < 0) { return -1; }
+            acc = acc + (encoded & 127) * multiplier;
+            multiplier = multiplier * 128;
+        }
+        return acc;
+    }
+
+    // ---- topic matching: filter with + / # wildcards vs concrete topic ----
+
+    static List<string> SplitTopic(string s) {
+        List<string> parts = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            if ((s[i] & 255) == 47) {
+                parts.Add(sb.ToString());
+                sb = new StringBuilder();
+            } else {
+                sb.Append(s.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        parts.Add(sb.ToString());
+        return parts;
+    }
+
+    static bool TopicMatches(string filter, string topic) {
+        List<string> f = SplitTopic(filter);
+        List<string> t = SplitTopic(topic);
+        int i = 0;
+        while (i < f.Count) {
+            if (f[i] == "#") { return true; }
+            if (i >= t.Count) { return false; }
+            if (f[i] != "+" && f[i] != t[i]) { return false; }
+            i = i + 1;
+        }
+        return t.Count == f.Count;
+    }
+
+    // ---- packet builders ----
+
+    static string BuildPublish(string topic, string payload, int payloadLen) {
+        int topicLen = strlen(topic);
+        int remainLen = 2 + topicLen + payloadLen;
+        // Varint remaining length (up to 2 bytes covers 16383; enough for the
+        // 64 KB reads we do, encode up to 3 bytes to be safe).
+        string packet = calloc(remainLen + 5, 1);
+        int offset = 0;
+        packet[offset] = MqttPacketType.PUBLISH << 4;
+        offset = offset + 1;
+        int rl = remainLen;
+        while (true) {
+            int digit = rl & 127;
+            rl = rl >> 7;
+            if (rl > 0) {
+                packet[offset] = digit | 128;
+            } else {
+                packet[offset] = digit;
+            }
+            offset = offset + 1;
+            if (rl == 0) { break; }
+        }
+        packet[offset] = (topicLen >> 8) & 255;
+        offset = offset + 1;
+        packet[offset] = topicLen & 255;
+        offset = offset + 1;
+        int i = 0;
+        while (i < topicLen) {
+            packet[offset] = topic[i];
+            offset = offset + 1;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < payloadLen) {
+            packet[offset] = payload[i];
+            offset = offset + 1;
+            i = i + 1;
+        }
+        return packet;
+    }
+
+    int PublishPacketLen(string topic, int payloadLen) {
+        int topicLen = strlen(topic);
+        int remainLen = 2 + topicLen + payloadLen;
+        int varint = 1;
+        int rl = remainLen >> 7;
+        while (rl > 0) { varint = varint + 1; rl = rl >> 7; }
+        return 1 + varint + remainLen;
+    }
+
+    // ---- fan-out ----
+
+    /// <summary>Delivers a message to every live session whose filters match
+    /// <paramref name="topic"/>. Returns the number of receivers.</summary>
+    async int PublishToSubscribers(string topic, string payload, int payloadLen) {
+        string packet = BuildPublish(topic, payload, payloadLen);
+        int packetLen = this.PublishPacketLen(topic, payloadLen);
+        int receivers = 0;
+        int i = 0;
+        while (i < this.sessions.Count) {
+            MqttSession sess = this.sessions[i];
+            if (sess.alive) {
+                bool match = false;
+                int j = 0;
+                while (j < sess.filters.Count) {
+                    if (TopicMatches(sess.filters[j], topic)) { match = true; break; }
+                    j = j + 1;
+                }
+                if (match) {
+                    int n = await Socket.SendAsync(sess.sock, packet, packetLen);
+                    if (n <= 0) { sess.alive = false; }
+                    else { receivers = receivers + 1; }
+                }
+            }
+            i = i + 1;
+        }
+        return receivers;
+    }
+
+    /// <summary>Serves one MQTT client on an accepted socket until it
+    /// disconnects. Used both by RunAsync and by "mqtt" Workers.</summary>
+    async void HandleConnection(int sock) {
+        MqttSession sess = MqttSession.Create(sock);
+
+        bool active = true;
+        while (active) {
+            int b0 = await ReadByteAsync(sock);
+            if (b0 < 0) { break; }
+            int remainLen = await ReadRemainingLenAsync(sock);
+            if (remainLen < 0) { break; }
+            string body = "";
+            if (remainLen > 0) {
+                body = await ReadBytesAsync(sock, remainLen);
+            }
+            int packetType = (b0 >> 4) & 15;
+
+            if (packetType == MqttPacketType.CONNECT) {
+                // variable header: proto name (2+4) + level (1) + flags (1) +
+                // keepalive (2) = 10 bytes; then client id (2 + n).
+                if (remainLen >= 12) {
+                    int idLen = ((body[10] & 255) << 8) + (body[11] & 255);
+                    if (12 + idLen <= remainLen) {
+                        sess.clientId = body.Substring(12, idLen);
+                    }
+                }
+                this.sessions.Add(sess);
+                string connack = calloc(4, 1);
+                connack[0] = MqttPacketType.CONNACK << 4;
+                connack[1] = 2;
+                connack[2] = 0;
+                connack[3] = 0;   // accepted
+                int _c = await Socket.SendAsync(sock, connack, 4);
+            } else if (packetType == MqttPacketType.PUBLISH) {
+                int qos = (b0 >> 1) & 3;
+                int topicLen = ((body[0] & 255) << 8) + (body[1] & 255);
+                string topic = body.Substring(2, topicLen);
+                int offset = 2 + topicLen;
+                int pid = 0;
+                if (qos > 0) {
+                    pid = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
+                    offset = offset + 2;
+                }
+                int payloadLen = remainLen - offset;
+                string payload = body.Substring(offset, payloadLen);
+                int _r = await this.PublishToSubscribers(topic, payload, payloadLen);
+                if (qos > 0) {
+                    string puback = calloc(5, 1);
+                    puback[0] = MqttPacketType.PUBACK << 4;
+                    puback[1] = 2;
+                    puback[2] = (pid >> 8) & 255;
+                    puback[3] = pid & 255;
+                    int _a = await Socket.SendAsync(sock, puback, 4);
+                }
+            } else if (packetType == MqttPacketType.SUBSCRIBE) {
+                int pid = ((body[0] & 255) << 8) + (body[1] & 255);
+                // topic filters: (2-byte len + filter + 1-byte qos)*
+                int offset = 2;
+                List<int> grantedQos = new List<int>();
+                while (offset + 2 < remainLen) {
+                    int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
+                    offset = offset + 2;
+                    string filter = body.Substring(offset, fLen);
+                    offset = offset + fLen;
+                    int reqQos = body[offset] & 255;
+                    offset = offset + 1;
+                    sess.filters.Add(filter);
+                    if (reqQos > 1) { reqQos = 1; }   // QoS 2 downgraded
+                    grantedQos.Add(reqQos);
+                }
+                int ackLen = 4 + grantedQos.Count;
+                string suback = calloc(ackLen + 1, 1);
+                suback[0] = MqttPacketType.SUBACK << 4;
+                suback[1] = 2 + grantedQos.Count;
+                suback[2] = (pid >> 8) & 255;
+                suback[3] = pid & 255;
+                int g = 0;
+                while (g < grantedQos.Count) {
+                    suback[4 + g] = grantedQos[g];
+                    g = g + 1;
+                }
+                int _s = await Socket.SendAsync(sock, suback, ackLen);
+            } else if (packetType == MqttPacketType.UNSUBSCRIBE) {
+                int pid = ((body[0] & 255) << 8) + (body[1] & 255);
+                int offset = 2;
+                while (offset + 2 <= remainLen) {
+                    int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
+                    offset = offset + 2;
+                    string filter = body.Substring(offset, fLen);
+                    offset = offset + fLen;
+                    int k = 0;
+                    while (k < sess.filters.Count) {
+                        if (sess.filters[k] == filter) {
+                            sess.filters.RemoveAt(k);
+                        } else {
+                            k = k + 1;
+                        }
+                    }
+                }
+                string unsuback = calloc(5, 1);
+                unsuback[0] = MqttPacketType.UNSUBACK << 4;
+                unsuback[1] = 2;
+                unsuback[2] = (pid >> 8) & 255;
+                unsuback[3] = pid & 255;
+                int _u = await Socket.SendAsync(sock, unsuback, 4);
+            } else if (packetType == MqttPacketType.PINGREQ) {
+                string pong = calloc(3, 1);
+                pong[0] = MqttPacketType.PINGRESP << 4;
+                pong[1] = 0;
+                int _p = await Socket.SendAsync(sock, pong, 2);
+            } else if (packetType == MqttPacketType.DISCONNECT) {
+                active = false;
+            }
+        }
+
+        sess.alive = false;
+        int k2 = 0;
+        while (k2 < this.sessions.Count) {
+            if (this.sessions[k2] == sess) {
+                this.sessions.RemoveAt(k2);
+                break;
+            }
+            k2 = k2 + 1;
+        }
+        Socket.Close(sock);
+    }
+
+    void Stop() {
+        this.running = false;
+    }
+}

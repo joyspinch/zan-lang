@@ -477,6 +477,61 @@ class Socket {
         return result;
     }
 
+    // Sender address of the last RecvFromPeer/RecvFromPeerAsync datagram.
+    // Single-threaded runtime: read via PeerIp/PeerPort right after the recv,
+    // before the next await on this coroutine.
+    static string lastPeerIp = "";
+    static int lastPeerPort = 0;
+
+    /// <summary>IPv4 address of the sender of the last datagram received via
+    /// RecvFromPeer / RecvFromPeerAsync.</summary>
+    static string PeerIp() {
+        return lastPeerIp;
+    }
+
+    /// <summary>UDP port of the sender of the last datagram received via
+    /// RecvFromPeer / RecvFromPeerAsync.</summary>
+    static int PeerPort() {
+        return lastPeerPort;
+    }
+
+    /// <summary>Receives a UDP datagram and records the sender's address, so a
+    /// server can reply (see PeerIp/PeerPort). Returns the payload ("" on
+    /// error/close).</summary>
+    static string RecvFromPeer(int sock, int bufSize) {
+        string buf = calloc(bufSize + 1, 1);
+        string fromAddr = calloc(16, 1);
+        string fromLen = calloc(4, 1);
+        fromLen[0] = 16;
+        int n = recvfrom(sock, buf, bufSize, 0, fromAddr, fromLen);
+        // Sign-normalize the low 32 bits (see RecvFrom).
+        if (n > 2147483647) { n = n - 4294967296; }
+        if (n < 0) { n = 0; }
+        if (n > 0) {
+            lastPeerPort = ((fromAddr[2] & 255) << 8) + (fromAddr[3] & 255);
+            lastPeerIp = Convert.ToString(fromAddr[4] & 255) + "."
+                + Convert.ToString(fromAddr[5] & 255) + "."
+                + Convert.ToString(fromAddr[6] & 255) + "."
+                + Convert.ToString(fromAddr[7] & 255);
+        } else {
+            lastPeerPort = 0;
+            lastPeerIp = "";
+        }
+        string result = buf.Substring(0, n);
+        free(buf);
+        free(fromAddr);
+        free(fromLen);
+        return result;
+    }
+
+    /// <summary>Suspends until a datagram arrives, receives it, and records the
+    /// sender's address (see PeerIp/PeerPort). Requires a non-blocking socket.</summary>
+    static async string RecvFromPeerAsync(int sock, int bufSize) {
+        await Socket.ReadReady(sock);
+        string result = RecvFromPeer(sock, bufSize);
+        return result;
+    }
+
     /// <summary>Resolves a hostname to an IP address.</summary>
     static string Resolve(string hostname) {
         int he = gethostbyname(hostname);

@@ -1,0 +1,127 @@
+// ============================================================================
+// TCP 回显服务 —— 服务端 + 客户端完整示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. TcpListener 建立监听、异步接收连接（AcceptAsync 挂起协程而非阻塞线程）
+//   2. 每个连接由独立协程处理（Task.Spawn），accept 循环不会被单个慢客户端拖住
+//   3. TcpClient 异步连接 / 发送 / 接收
+//   4. 简单的行分隔协议（每条消息以 '\n' 结尾）——TCP 是字节流，必须自己分帧！
+//   5. 多个客户端并发访问同一服务
+//   6. 连接关闭：RecvAsync 返回空串表示对端关闭
+//
+// 运行：zanc examples/net/tcp_echo.zan --auto-stdlib -o tcp_echo.exe && ./tcp_echo.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+using System.Text;
+
+class Program {
+    static int PORT = 54401;
+    static int CLIENTS = 3;      // 并发客户端数
+    static int doneCount = 0;    // 已完成的客户端计数（协程单线程调度，无需加锁）
+    static bool serverUp = false;
+
+    // ---- 服务端：单个连接的处理协程 ----------------------------------------
+    // TCP 没有"消息"概念，一次 RecvAsync 可能收到半条消息，也可能收到多条。
+    // 这里把收到的字节累积到 buf，再按 '\n' 切分出完整的行逐条回显。
+    static async void HandleClient(int sock) {
+        TcpClient c = TcpClient.FromSocket(sock);
+        string buf = "";
+        while (true) {
+            string chunk = await c.RecvAsync(4096);
+            // 空串 == 对端关闭连接（EOF），退出处理循环
+            if (chunk.Length == 0) { break; }
+            buf = buf + chunk;
+
+            // 从缓冲中切出所有完整的行（可能一次到达多行）
+            while (true) {
+                int nl = -1;
+                int i = 0;
+                while (i < buf.Length) {
+                    if ((buf[i] & 255) == 10) { nl = i; break; }
+                    i = i + 1;
+                }
+                if (nl < 0) { break; }           // 没有完整行，继续收
+                string line = buf.Substring(0, nl);
+                buf = buf.Substring(nl + 1, buf.Length - nl - 1);
+
+                // 协议约定：收到 "quit" 服务端主动关闭该连接
+                if (line == "quit") { c.Close(); return; }
+                // 回显：原样送回，并补上行结束符
+                int _n = await c.SendAsync("echo: " + line + "\n");
+            }
+        }
+        c.Close();
+    }
+
+    // ---- 服务端：accept 循环 ------------------------------------------------
+    static async void Server() {
+        TcpListener listener = TcpListener.Create("127.0.0.1", PORT);
+        listener.Start();
+        serverUp = true;
+        // 每接受一个连接就交给独立协程，主循环立即回去继续 accept，
+        // 这就是"一协程一连接"的并发模型（比一线程一连接便宜得多）。
+        // 本例只服务固定数量的客户端后就退出；常驻服务应写成
+        // while (running) 并由外部调用 listener.Stop() 打断挂起的 accept。
+        int accepted = 0;
+        while (accepted < CLIENTS) {
+            int sock = await listener.AcceptAsync();
+            if (sock >= 0) {
+                Task.Spawn(HandleClient(sock));
+                accepted = accepted + 1;
+            }
+        }
+        listener.Stop();
+    }
+
+    // ---- 客户端 -------------------------------------------------------------
+    static async void Client(int id) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT);
+        if (!c.IsConnected()) {
+            Console.WriteLine("client " + Convert.ToString(id) + ": connect failed");
+            doneCount = doneCount + 1;
+            return;
+        }
+
+        // 发送两条消息并逐条读回显。注意接收同样要按行分帧——
+        // 这里消息很短、往返一次一条，简化为单次 RecvAsync。
+        int m = 0;
+        while (m < 2) {
+            string msg = "hello-" + Convert.ToString(id) + "-" + Convert.ToString(m);
+            int _n = await c.SendAsync(msg + "\n");
+            string reply = await c.RecvAsync(4096);
+            // 去掉行尾 '\n' 再打印，输出稳定可比对
+            if (reply.Length > 0 && (reply[reply.Length - 1] & 255) == 10) {
+                reply = reply.Substring(0, reply.Length - 1);
+            }
+            Console.WriteLine("client " + Convert.ToString(id) + " got [" + reply + "]");
+            m = m + 1;
+        }
+
+        // 通知服务端关闭这条连接，然后本端也关闭
+        int _q = await c.SendAsync("quit\n");
+        c.Close();
+        doneCount = doneCount + 1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();          // 初始化套接字子系统（Windows 上是 WSAStartup）
+        Task.Spawn(Server());
+        // 等服务端进入监听状态再发起连接，避免连接竞态
+        while (!serverUp) { await Task.Delay(10); }
+
+        int i = 0;
+        while (i < CLIENTS) {
+            Task.Spawn(Client(i));
+            i = i + 1;
+        }
+        // 等全部客户端跑完
+        while (doneCount < CLIENTS) { await Task.Delay(10); }
+        Console.WriteLine("all clients done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

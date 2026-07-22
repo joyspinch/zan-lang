@@ -2,13 +2,68 @@ using System;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.WebSocket;
+using System.Net.Sse;
+using System.Net.Mqtt;
+using System.Diagnostics;
 using System.Text;
 
 namespace System.Net;
 
+/// <summary>Invoked when a client connection is established.</summary>
+delegate void ConnectionHandler(Connection conn);
+
+/// <summary>Invoked for every complete inbound message on a TCP or WebSocket
+/// connection. The returned string (when non-empty) is sent back to the peer
+/// as the reply; return "" to send nothing.</summary>
+delegate string MessageHandler(Connection conn, string data);
+
+/// <summary>Invoked after a connection is closed (peer disconnect or
+/// conn.Close()).</summary>
+delegate void ConnectionCloseHandler(Connection conn);
+
+/// <summary>Invoked per UDP datagram. The returned string (when non-empty) is
+/// sent back to the datagram's sender; return "" to send nothing.</summary>
+delegate string DatagramHandler(string data);
+
+/// <summary>Invoked when an SSE subscriber completes its handshake. The
+/// application keeps the SseConnection and pushes events through it.</summary>
+delegate void SseSubscriberHandler(SseConnection conn);
+
 /// <summary>
-/// Workerman-style multi-protocol Worker server.
-/// Supports TCP, HTTP, WebSocket, and UDP protocols.
+/// Workerman-style multi-protocol server: one Worker per listen address,
+/// per-event callbacks, and a master + N worker-processes runtime that
+/// load-balances accepted connections across CPU cores.
+///
+///   Worker w = Worker.Create("http", "0.0.0.0", 8080);
+///   w.count = 4;                        // 4 worker processes
+///   w.onHttpRequest = App.Handle;       // HttpRequest -> HttpResponse
+///   Worker.RunAll();                    // never returns
+///
+/// Protocols: "tcp", "udp", "http", "websocket" (or "ws"), "sse", "mqtt".
+/// Callbacks (assign what the protocol needs):
+///   onConnect / onMessage / onClose     -- tcp, websocket
+///   onHttpRequest                       -- http
+///   onUdpMessage                        -- udp
+///   onSseSubscriber                     -- sse
+///   (none)                              -- mqtt: connections are served by
+///                                          the built-in MqttBroker.Global()
+///
+/// MULTI-PROCESS MODEL (count > 1). The initially launched process becomes the
+/// MASTER: it never serves traffic itself; it spawns `count` worker copies of
+/// this executable, gives every worker an equal share of the listen sockets,
+/// and supervises them (a crashed worker is respawned). Kernel-level accept
+/// load-balancing spreads connections across workers:
+///   - Windows: the master binds each listen address once, then duplicates the
+///     listening socket into every worker over a loopback control connection
+///     (WSADuplicateSocket). All workers post accepts on the same socket and
+///     the kernel distributes completions.
+///   - Linux/macOS: each worker binds its own listener with SO_REUSEPORT and
+///     the kernel hashes new connections across the sockets.
+/// Workers watch the control connection to the master and exit when it dies,
+/// so no orphan processes outlive the master.
+///
+/// SINGLE-PROCESS MODEL (count == 1, default): RunAll runs every Worker's
+/// event loop on this process's coroutine scheduler -- no child processes.
 /// </summary>
 class Worker {
     string protocol;
@@ -19,7 +74,70 @@ class Worker {
     int connectionCount;
     int maxConnections;
 
+    /// <summary>Number of worker processes serving this Worker's port. The
+    /// largest count of any registered Worker decides how many worker
+    /// processes RunAll launches; 1 (default) = serve in-process.</summary>
+    int count;
+
+    // ---- event callbacks (assign before RunAll) ----
+    ConnectionHandler onConnect;
+    MessageHandler onMessage;
+    ConnectionCloseHandler onClose;
+    HttpRequestHandler onHttpRequest;
+    DatagramHandler onUdpMessage;
+    SseSubscriberHandler onSseSubscriber;
+
     static List<Worker> workers = new List<Worker>();
+    static bool daemonize = false;
+    static int controlPort = 0;
+    static int nextConnId = 1;
+    static string logDir = "";
+
+    // ---- status/statistics (workerman-style `status`) ----
+    // Requests/messages served by this process, across all Workers.
+    static int statRequests = 0;
+
+    // Static-context increment. Do NOT inline `statRequests = statRequests+1`
+    // into the instance async handlers: the async lowering captures statics
+    // referenced from instance async methods by value, so increments there
+    // write to a per-coroutine copy and are lost.
+    static void BumpStat() {
+        statRequests = statRequests + 1;
+    }
+    // Status print interval in seconds for the foreground master (or the
+    // single-process server). 0 disables. Workers report to the master over
+    // the control connection every 2s regardless.
+    static int statusInterval = 10;
+
+    // Master-side latest report per worker (parallel lists indexed by slot).
+    static List<int> stWid = new List<int>();
+    static List<int> stPid = new List<int>();
+    static List<int> stReq = new List<int>();
+    static List<int> stPrevReq = new List<int>();
+    static List<int> stCpuMs = new List<int>();
+    static List<int> stPrevCpuMs = new List<int>();
+    static List<int> stRss = new List<int>();
+
+    // True when this Worker serves a socket duplicated from the master
+    // process (Windows multi-process mode). AcceptEx completions do not fire
+    // reliably on cross-process duplicated listeners, so accept by polling.
+    bool pollAccept;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+    [DllImport("crt")]
+    static extern void exit(int code);
+
+    #if WINDOWS
+    [DllImport("ws2_32", EntryPoint = "WSADuplicateSocketA")]
+    static extern int WSADuplicateSocketA(int s, int pid, string info);
+    [DllImport("ws2_32", EntryPoint = "WSASocketA")]
+    static extern int WSASocketA(int af, int type, int protocol, string info, int g, int flags);
+    [DllImport("kernel32", EntryPoint = "SetEnvironmentVariableA")]
+    static extern int SetEnvironmentVariableA(string name, string val);
+    #endif
 
     Worker(string protocol, string host, int port) {
         this.protocol = protocol;
@@ -29,77 +147,676 @@ class Worker {
         this.running = false;
         this.connectionCount = 0;
         this.maxConnections = 10000;
+        this.count = 1;
+        this.onConnect = null;
+        this.onMessage = null;
+        this.onClose = null;
+        this.onHttpRequest = null;
+        this.onUdpMessage = null;
+        this.onSseSubscriber = null;
+        this.pollAccept = false;
     }
 
-    /// <summary>Creates a new Worker for the given protocol.</summary>
+    /// <summary>Creates and registers a Worker for the given protocol
+    /// ("tcp", "udp", "http", "websocket"/"ws", "sse", "mqtt").</summary>
     static Worker Create(string protocol, string host, int port) {
         Worker w = new Worker(protocol, host, port);
         workers.Add(w);
         return w;
     }
 
-    /// <summary>Sets the worker name.</summary>
+    /// <summary>Creates a Worker from an address like "http://0.0.0.0:8080".</summary>
+    static Worker Listen(string address) {
+        string proto = "tcp";
+        string rest = address;
+        int i = 0;
+        int n = address.Length;
+        while (i + 2 < n) {
+            if ((address[i] & 255) == 58 && (address[i + 1] & 255) == 47 && (address[i + 2] & 255) == 47) {
+                proto = address.Substring(0, i);
+                rest = address.Substring(i + 3, n - i - 3);
+                break;
+            }
+            i = i + 1;
+        }
+        string host = rest;
+        int port = 0;
+        int colon = -1;
+        int j = rest.Length - 1;
+        while (j >= 0) {
+            if ((rest[j] & 255) == 58) { colon = j; break; }
+            j = j - 1;
+        }
+        if (colon >= 0) {
+            host = rest.Substring(0, colon);
+            port = Convert.ToInt32(rest.Substring(colon + 1, rest.Length - colon - 1));
+        }
+        return Worker.Create(proto, host, port);
+    }
+
+    /// <summary>Sets the worker name (used in log lines).</summary>
     Worker SetName(string name) {
         this.name = name;
         return this;
     }
 
-    /// <summary>Sets max concurrent connections.</summary>
+    /// <summary>Sets max concurrent connections for this Worker (per process).
+    /// Connections over the limit are accepted and immediately closed.</summary>
     Worker SetMaxConnections(int max) {
         this.maxConnections = max;
         return this;
     }
 
-    /// <summary>Runs all registered workers concurrently. Every worker but the
-    /// last is spawned as its own coroutine; the last is awaited so this call
-    /// drives the scheduler forever while all workers accept connections in
-    /// parallel on the single-threaded IO reactor. (Previously each worker was
-    /// awaited in turn, so only the first -- whose accept loop never returns --
-    /// ever ran.)</summary>
-    static async void RunAll() {
-        Socket.Initialize();
-        Console.WriteLine("[Worker] Starting " + Convert.ToString(workers.Count) + " workers...");
-
-        int i = 0;
-        while (i < workers.Count) {
-            Worker w = workers[i];
-            Console.WriteLine("[Worker] " + w.name + " listening on " + w.protocol + "://" + w.host + ":" + Convert.ToString(w.port));
-            i = i + 1;
-        }
-
-        int n = workers.Count;
-        int j = 0;
-        while (j < n - 1) {
-            Task.Spawn(workers[j].Run());
-            j = j + 1;
-        }
-        if (n > 0) {
-            await workers[n - 1].Run();
-        }
+    /// <summary>Sets the number of worker processes (like Workerman's
+    /// $worker->count). The process-wide worker count is the max over all
+    /// registered Workers.</summary>
+    Worker SetCount(int count) {
+        this.count = count;
+        return this;
     }
 
-    /// <summary>Starts this worker's event loop.</summary>
-    async void Run() {
-        this.running = true;
+    /// <summary>Requests daemon mode: on Linux the master detaches from the
+    /// terminal (setsid) before serving. No-op elsewhere.</summary>
+    static void SetDaemonize(bool on) {
+        daemonize = on;
+    }
 
-        if (this.protocol == "udp") {
-            await RunUdp();
+    /// <summary>Overrides the loopback control port used by the master/worker
+    /// handshake (default: first Worker's port + 10000).</summary>
+    static void SetControlPort(int port) {
+        controlPort = port;
+    }
+
+    /// <summary>Seconds between status lines printed by the foreground
+    /// master/single-process server (like watching workerman's status).
+    /// 0 disables printing; stats are still collected.</summary>
+    static void SetStatusInterval(int seconds) {
+        statusInterval = seconds;
+    }
+
+    /// <summary>When set, each worker process redirects its stdout/stderr to
+    /// <dir>/worker_<id>.log (like Workerman's stdout_file). Otherwise worker
+    /// output is discarded (workers run detached without a console).</summary>
+    static void SetLogDir(string dir) {
+        logDir = dir;
+    }
+
+    static int MaxCount() {
+        int m = 1;
+        int i = 0;
+        while (i < workers.Count) {
+            if (workers[i].count > m) { m = workers[i].count; }
+            i = i + 1;
+        }
+        return m;
+    }
+
+    static int ControlPort() {
+        if (controlPort > 0) { return controlPort; }
+        string env = ProcessHost.Env("ZAN_CTL_PORT");
+        if (env != "") { return Convert.ToInt32(env); }
+        if (workers.Count > 0) { return workers[0].port + 10000; }
+        return 19999;
+    }
+
+    /// <summary>Runs every registered Worker. Never returns. In the master
+    /// process with count > 1 this spawns and supervises worker processes;
+    /// in a worker process (or with count == 1) it serves connections.</summary>
+    static async void RunAll() {
+        Socket.Initialize();
+
+        if (ProcessHost.IsWorker()) {
+            await RunAsWorkerProcess();
             return;
         }
 
-        TcpListener listener = TcpListener.Create(this.host, this.port);
-        listener.Start();
+        if (daemonize) {
+            if (ProcessHost.Daemonize()) {
+                exit(0);
+            }
+        }
+
+        int procs = MaxCount();
+        if (procs <= 1) {
+            Console.WriteLine("[Worker] single process serving "
+                + Convert.ToString(workers.Count) + " listener(s)");
+            LogListeners();
+            if (statusInterval > 0 && !daemonize) {
+                Task.Spawn(SelfStatusLoop());
+            }
+            await RunAllLoopsInProcess(true);
+            return;
+        }
+
+        Console.WriteLine("[Worker] master pid=" + Convert.ToString(ProcessHost.Pid())
+            + " starting " + Convert.ToString(procs) + " workers");
+        LogListeners();
+        await RunAsMaster(procs);
+    }
+
+    static void LogListeners() {
+        int i = 0;
+        while (i < workers.Count) {
+            Worker w = workers[i];
+            Console.WriteLine("[Worker] " + w.name + " -> " + w.protocol + "://"
+                + w.host + ":" + Convert.ToString(w.port));
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Stops all workers in this process (single-process mode).</summary>
+    static void StopAll() {
+        int i = 0;
+        while (i < workers.Count) {
+            workers[i].Stop();
+            i = i + 1;
+        }
+    }
+
+    void Stop() {
+        this.running = false;
+    }
+
+    int GetConnectionCount() {
+        return this.connectionCount;
+    }
+
+    // ======================================================================
+    // master: spawn + share listeners + supervise
+    // ======================================================================
+
+    // Total children ever spawned by this master. Hard safety cap: a bug that
+    // respawns workers in a tight loop must never take the machine down again.
+    static int totalSpawned = 0;
+    static int maxTotalSpawns = 512;
+
+    static void SpawnChild(int wid) {
+        if (totalSpawned >= maxTotalSpawns) {
+            Console.WriteLine("[Worker] spawn cap (" + Convert.ToString(maxTotalSpawns)
+                + ") reached; refusing to spawn more workers");
+            return;
+        }
+        totalSpawned = totalSpawned + 1;
+        string exe = ProcessHost.SelfExe();
+        int ctl = ControlPort();
+        #if WINDOWS
+        // Set the variables in our own environment so the child inherits them
+        // via CreateProcess (cmd-level `set X=..&&` does not survive the
+        // cmd.exe /c hop that Process.RunDetached uses), then clear them so
+        // the master itself never looks like a worker.
+        SetEnvironmentVariableA("ZAN_WORKER_ID", Convert.ToString(wid));
+        SetEnvironmentVariableA("ZAN_CTL_PORT", Convert.ToString(ctl));
+        string cmd = "\"" + exe + "\"";
+        if (logDir != "") {
+            // Extra outer quotes so cmd.exe /c does not strip the quote around
+            // the exe path when the command also contains a quoted log path.
+            cmd = "\"" + cmd + " > \"" + logDir + "\\worker_" + Convert.ToString(wid)
+                + ".log\" 2>&1\"";
+        }
+        Process.RunDetached(cmd);
+        SetEnvironmentVariableA("ZAN_WORKER_ID", "");
+        SetEnvironmentVariableA("ZAN_CTL_PORT", "");
+        #else
+        string cmd = "ZAN_WORKER_ID=" + Convert.ToString(wid)
+            + " ZAN_CTL_PORT=" + Convert.ToString(ctl)
+            + " \"" + exe + "\"";
+        if (logDir != "") {
+            cmd = cmd + " > \"" + logDir + "/worker_" + Convert.ToString(wid)
+                + ".log\" 2>&1";
+        }
+        Process.RunDetached(cmd);
+        #endif
+    }
+
+    static async void RunAsMaster(int procs) {
+        // Fork-bomb guard: claim the control port exclusively (no SO_REUSEADDR)
+        // BEFORE spawning anything. If a child ever mistakes itself for a
+        // master (e.g. env vars failed to propagate), its bind fails here and
+        // it exits instead of spawning children of its own.
+        int ctlSock = Socket.CreateTcp();
+        int ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
+        if (ctlBind != 0) {
+            Console.WriteLine("[Worker] FATAL: control port "
+                + Convert.ToString(ControlPort())
+                + " is taken (another master running?); refusing to spawn workers");
+            exit(1);
+        }
+        Socket.Listen(ctlSock, 64);
+        Socket.SetNonBlocking(ctlSock);
+
+        // On Windows the master owns every listen socket and hands a duplicate
+        // to each worker; on POSIX workers bind their own SO_REUSEPORT sockets.
+        List<int> masterSocks = new List<int>();
+        #if WINDOWS
+        int i = 0;
+        while (i < workers.Count) {
+            Worker w = workers[i];
+            int s = w.BindSocket(false);
+            if (s < 0) {
+                Console.WriteLine("[Worker] FATAL: cannot bind " + w.protocol
+                    + "://" + w.host + ":" + Convert.ToString(w.port));
+                exit(1);
+            }
+            masterSocks.Add(s);
+            i = i + 1;
+        }
+        #endif
+
+        int wid = 1;
+        while (wid <= procs) {
+            SpawnChild(wid);
+            wid = wid + 1;
+        }
+
+        if (statusInterval > 0 && !daemonize) {
+            Task.Spawn(MasterStatusLoop());
+        }
+
+        // Accept control connections forever: first HELLO from each worker gets
+        // the listener handoff, then the connection doubles as a liveness watch
+        // (worker died => respawn it).
+        while (true) {
+            int sock = await Socket.AcceptAsync(ctlSock);
+            if (sock < 0) { continue; }
+            Socket.SetNonBlocking(sock);
+            Task.Spawn(HandleWorkerControl(sock, masterSocks));
+        }
+    }
+
+    static async void HandleWorkerControl(int sock, List<int> masterSocks) {
+        TcpClient conn = TcpClient.FromSocket(sock);
+
+        // "HELLO <pid> <wid>\n"
+        string line = "";
+        bool ok = true;
+        while (true) {
+            int nl = IndexOfByte(line, 10);
+            if (nl >= 0) { line = line.Substring(0, nl); break; }
+            string chunk = await conn.RecvAsync(256);
+            if (chunk.Length == 0) { ok = false; break; }
+            line = line + chunk;
+        }
+        if (!ok || line.Length < 7) { conn.Close(); return; }
+
+        int sp1 = IndexOfByte(line, 32);
+        int sp2 = -1;
+        if (sp1 >= 0) {
+            int k = sp1 + 1;
+            while (k < line.Length) {
+                if ((line[k] & 255) == 32) { sp2 = k; break; }
+                k = k + 1;
+            }
+        }
+        if (sp1 < 0 || sp2 < 0) { conn.Close(); return; }
+        int childPid = Convert.ToInt32(line.Substring(sp1 + 1, sp2 - sp1 - 1));
+        int childWid = Convert.ToInt32(line.Substring(sp2 + 1, line.Length - sp2 - 1));
+
+        #if WINDOWS
+        // Duplicate every listen socket into the worker, in registration order.
+        int i = 0;
+        while (i < masterSocks.Count) {
+            string info = calloc(372, 1);
+            int r = WSADuplicateSocketA(masterSocks[i], childPid, info);
+            if (r != 0) {
+                Console.WriteLine("[Worker] WSADuplicateSocket failed for worker "
+                    + Convert.ToString(childWid));
+            }
+            int _n = await Socket.SendAsync(sock, info, 372);
+            free(info);
+            i = i + 1;
+        }
+        #else
+        int _n = await Socket.SendStringAsync(sock, "GO\n");
+        #endif
+
+        Console.WriteLine("[Worker] worker " + Convert.ToString(childWid)
+            + " (pid " + Convert.ToString(childPid) + ") online");
+
+        // Supervise: the control connection stays open for the worker's whole
+        // life and carries its periodic "STAT wid pid req cpuMs rss" reports;
+        // it closing means the worker exited.
+        string acc = "";
+        while (true) {
+            string beat = await conn.RecvAsync(256);
+            if (beat.Length == 0) { break; }
+            acc = acc + beat;
+            while (true) {
+                int nl2 = IndexOfByte(acc, 10);
+                if (nl2 < 0) { break; }
+                RecordStat(acc.Substring(0, nl2));
+                acc = acc.Substring(nl2 + 1);
+            }
+        }
+        conn.Close();
+        Console.WriteLine("[Worker] worker " + Convert.ToString(childWid)
+            + " (pid " + Convert.ToString(childPid) + ") exited; respawning");
+        // Pace respawns so a worker that dies instantly on startup cannot
+        // drive a rapid spawn loop.
+        await Task.Delay(1000);
+        SpawnChild(childWid);
+    }
+
+    // ======================================================================
+    // worker process: obtain listeners, serve, exit with master
+    // ======================================================================
+
+    static async void RunAsWorkerProcess() {
+        TcpClient ctl = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
+        if (!ctl.IsConnected()) {
+            Console.WriteLine("[Worker] worker cannot reach master; exiting");
+            exit(1);
+        }
+        int _h = await ctl.SendAsync("HELLO " + Convert.ToString(ProcessHost.Pid())
+            + " " + Convert.ToString(ProcessHost.WorkerId()) + "\n");
+
+        #if WINDOWS
+        // Receive one 372-byte WSAPROTOCOL_INFOA block per registered Worker
+        // and rebuild the shared listening/UDP socket from it.
+        int i = 0;
+        while (i < workers.Count) {
+            string info = calloc(372, 1);
+            bool ok = await RecvExact(ctl, info, 372);
+            if (!ok) {
+                Console.WriteLine("[Worker] listener handoff failed; exiting");
+                exit(1);
+            }
+            int dup = WSASocketA(-1, -1, -1, info, 0, 1);
+            free(info);
+            if (dup < 0) {
+                Console.WriteLine("[Worker] WSASocket(FROM_PROTOCOL_INFO) failed; exiting");
+                exit(1);
+            }
+            Socket.SetNonBlocking(dup);
+            Console.WriteLine("[Worker] worker " + Convert.ToString(ProcessHost.WorkerId())
+                + " serving " + workers[i].protocol + ":" + Convert.ToString(workers[i].port)
+                + " on shared socket");
+            workers[i].pollAccept = true;
+            Task.Spawn(workers[i].RunOnSocket(dup));
+            i = i + 1;
+        }
+        #else
+        // Wait for GO, then bind our own SO_REUSEPORT sockets.
+        string go = await ctl.RecvAsync(16);
+        if (go.Length == 0) { exit(1); }
+        int i = 0;
+        while (i < workers.Count) {
+            Worker w = workers[i];
+            int s = w.BindSocket(true);
+            if (s < 0) {
+                Console.WriteLine("[Worker] worker cannot bind "
+                    + Convert.ToString(w.port) + "; exiting");
+                exit(1);
+            }
+            Task.Spawn(w.RunOnSocket(s));
+            i = i + 1;
+        }
+        #endif
+
+        // Report stats to the master every 2s over the control connection.
+        Task.Spawn(StatReportLoop(ctl));
+
+        // Liveness watch: the master holds this connection open for our whole
+        // life; when it closes (master exited), leave too.
+        while (true) {
+            string beat = await ctl.RecvAsync(64);
+            if (beat.Length == 0) { break; }
+        }
+        exit(0);
+    }
+
+    static async void StatReportLoop(TcpClient ctl) {
+        while (true) {
+            await Task.Delay(2000);
+            int cpu = ServerMetrics.CpuMillis();
+            int rss = ServerMetrics.MemoryRssBytes();
+            int _n = await ctl.SendAsync("STAT " + Convert.ToString(ProcessHost.WorkerId())
+                + " " + Convert.ToString(ProcessHost.Pid())
+                + " " + Convert.ToString(statRequests)
+                + " " + Convert.ToString(cpu)
+                + " " + Convert.ToString(rss) + "\n");
+            if (_n <= 0) { return; }
+        }
+    }
+
+    // Parses one "STAT wid pid req cpuMs rss" line from a worker.
+    static void RecordStat(string line) {
+        List<string> f = SplitWords(line);
+        if (f.Count < 6) { return; }
+        if (f[0] != "STAT") { return; }
+        int wid = Convert.ToInt32(f[1]);
+        int slot = -1;
+        int i = 0;
+        while (i < stWid.Count) {
+            if (stWid[i] == wid) { slot = i; break; }
+            i = i + 1;
+        }
+        if (slot < 0) {
+            stWid.Add(wid);
+            stPid.Add(0);
+            stReq.Add(0);
+            stPrevReq.Add(0);
+            stCpuMs.Add(0);
+            stPrevCpuMs.Add(0);
+            stRss.Add(0);
+            slot = stWid.Count - 1;
+        }
+        stPid[slot] = Convert.ToInt32(f[2]);
+        stReq[slot] = Convert.ToInt32(f[3]);
+        stCpuMs[slot] = Convert.ToInt32(f[4]);
+        stRss[slot] = Convert.ToInt32(f[5]);
+    }
+
+    static List<string> SplitWords(string s) {
+        List<string> parts = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9 || c == 13 || c == 10) {
+                if (sb.Length > 0) { parts.Add(sb.ToString()); sb = new StringBuilder(); }
+            } else {
+                sb.Append(s.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        if (sb.Length > 0) { parts.Add(sb.ToString()); }
+        return parts;
+    }
+
+    // Foreground master: print one status block per interval, computing each
+    // worker's qps and cpu%% from the deltas between its last two reports.
+    static async void MasterStatusLoop() {
+        int prevWall = ServerMetrics.MonoMillis();
+        while (true) {
+            await Task.Delay(statusInterval * 1000);
+            int now = ServerMetrics.MonoMillis();
+            int dWall = now - prevWall;
+            prevWall = now;
+            if (dWall <= 0) { continue; }
+            StringBuilder sb = new StringBuilder();
+            sb.Append("[status]");
+            int totQps = 0;
+            int i = 0;
+            while (i < stWid.Count) {
+                int dReq = stReq[i] - stPrevReq[i];
+                int dCpu = stCpuMs[i] - stPrevCpuMs[i];
+                stPrevReq[i] = stReq[i];
+                stPrevCpuMs[i] = stCpuMs[i];
+                int qps = (dReq * 1000) / dWall;
+                totQps = totQps + qps;
+                int cpuPct = -1;
+                if (stCpuMs[i] >= 0 && dCpu >= 0) { cpuPct = (dCpu * 100) / dWall; }
+                sb.Append(" | w" + Convert.ToString(stWid[i])
+                    + " pid=" + Convert.ToString(stPid[i])
+                    + " reqs=" + Convert.ToString(stReq[i])
+                    + " qps=" + Convert.ToString(qps)
+                    + " cpu=" + Convert.ToString(cpuPct) + "%"
+                    + " mem=" + Convert.ToString(stRss[i] / 1048576) + "MB");
+                i = i + 1;
+            }
+            sb.Append(" | total qps=" + Convert.ToString(totQps));
+            Console.WriteLine(sb.ToString());
+        }
+    }
+
+    // Single-process server: same status line from in-process counters.
+    static async void SelfStatusLoop() {
+        int prevWall = ServerMetrics.MonoMillis();
+        int prevReq = 0;
+        int prevCpu = 0;
+        while (true) {
+            await Task.Delay(statusInterval * 1000);
+            int now = ServerMetrics.MonoMillis();
+            int dWall = now - prevWall;
+            prevWall = now;
+            if (dWall <= 0) { continue; }
+            int cpu = ServerMetrics.CpuMillis();
+            int rss = ServerMetrics.MemoryRssBytes();
+            int qps = ((statRequests - prevReq) * 1000) / dWall;
+            int cpuPct = -1;
+            if (cpu >= 0) { cpuPct = ((cpu - prevCpu) * 100) / dWall; }
+            prevReq = statRequests;
+            prevCpu = cpu;
+            int conns = 0;
+            int i = 0;
+            while (i < workers.Count) {
+                conns = conns + workers[i].connectionCount;
+                i = i + 1;
+            }
+            Console.WriteLine("[status] pid=" + Convert.ToString(ProcessHost.Pid())
+                + " reqs=" + Convert.ToString(statRequests)
+                + " qps=" + Convert.ToString(qps)
+                + " conns=" + Convert.ToString(conns)
+                + " cpu=" + Convert.ToString(cpuPct) + "%"
+                + " mem=" + Convert.ToString(rss / 1048576) + "MB");
+        }
+    }
+
+    /// <summary>Receives exactly `need` bytes into `dest` (binary-safe).</summary>
+    static async bool RecvExact(TcpClient conn, string dest, int need) {
+        string tmp = calloc(need + 1, 1);
+        int got = 0;
+        while (got < need) {
+            int n = await Socket.RecvIntoAsync(conn.GetSocket(), tmp, need - got);
+            if (n <= 0) { free(tmp); return false; }
+            int k = 0;
+            while (k < n) {
+                dest[got + k] = tmp[k];
+                k = k + 1;
+            }
+            got = got + n;
+        }
+        free(tmp);
+        return true;
+    }
+
+    static int IndexOfByte(string s, int b) {
+        int i = 0;
+        while (i < s.Length) {
+            if ((s[i] & 255) == b) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ======================================================================
+    // in-process serving
+    // ======================================================================
+
+    /// <summary>Runs all registered workers concurrently on this process's
+    /// scheduler. Every worker but the last is spawned as its own coroutine;
+    /// the last is awaited so this call drives the scheduler forever.</summary>
+    static async void RunAllLoopsInProcess(bool bindOwn) {
+        int n = workers.Count;
+        int j = 0;
+        while (j < n - 1) {
+            Task.Spawn(workers[j].RunOwnSocket());
+            j = j + 1;
+        }
+        if (n > 0) {
+            await workers[n - 1].RunOwnSocket();
+        }
+    }
+
+    /// <summary>Binds this worker's socket. For "udp" that is a bound datagram
+    /// socket; otherwise a listening TCP socket. reusePort=true additionally
+    /// sets SO_REUSEPORT before bind (POSIX multi-worker). Returns the socket
+    /// or -1.</summary>
+    int BindSocket(bool reusePort) {
+        if (this.protocol == "udp") {
+            int u = Socket.CreateUdp();
+            Socket.SetReuseAddr(u);
+            if (reusePort) { Socket.SetReusePort(u); }
+            int r = Socket.Bind(u, this.host, this.port);
+            if (r != 0) { Socket.Close(u); return -1; }
+            Socket.SetNonBlocking(u);
+            return u;
+        }
+        int s = Socket.CreateTcp();
+        Socket.SetReuseAddr(s);
+        if (reusePort) { Socket.SetReusePort(s); }
+        int r2 = Socket.Bind(s, this.host, this.port);
+        if (r2 != 0) { Socket.Close(s); return -1; }
+        Socket.Listen(s, 511);
+        Socket.SetNonBlocking(s);
+        return s;
+    }
+
+    async void RunOwnSocket() {
+        int s = this.BindSocket(false);
+        if (s < 0) {
+            Console.WriteLine("[Worker] FATAL: cannot bind " + this.protocol
+                + "://" + this.host + ":" + Convert.ToString(this.port));
+            return;
+        }
+        await this.RunOnSocket(s);
+    }
+
+    // Polling accept for cross-process duplicated listeners: non-blocking
+    // accept(), sleeping 1ms when the backlog is empty. Bursts drain
+    // back-to-back, so the poll interval only affects idle wakeup latency.
+    static async int AcceptPollAsync(int sock) {
+        while (true) {
+            int c = Socket.Accept(sock);
+            if (c >= 0) { return c; }
+            await Task.Delay(1);
+        }
+        return -1;
+    }
+
+    /// <summary>Serves this worker's protocol on an already-bound socket.</summary>
+    async void RunOnSocket(int sock) {
+        this.running = true;
+
+        if (this.protocol == "udp") {
+            await RunUdp(sock);
+            return;
+        }
 
         while (this.running) {
-            int clientSock = await listener.AcceptAsync();
+            int clientSock = -1;
+            if (this.pollAccept) {
+                clientSock = await AcceptPollAsync(sock);
+            } else {
+                clientSock = await Socket.AcceptAsync(sock);
+            }
             if (clientSock >= 0) {
+                Socket.SetNonBlocking(clientSock);
+                if (this.connectionCount >= this.maxConnections) {
+                    Socket.Close(clientSock);
+                    continue;
+                }
                 this.connectionCount = this.connectionCount + 1;
-                // Handle each connection on its own coroutine so the accept loop
-                // keeps accepting instead of serving one client at a time.
+                // Handle each connection on its own coroutine so the accept
+                // loop keeps accepting instead of serving one client at a time.
                 if (this.protocol == "http") {
                     Task.Spawn(HandleHttp(clientSock));
                 } else if (this.protocol == "websocket" || this.protocol == "ws") {
                     Task.Spawn(HandleWebSocket(clientSock));
+                } else if (this.protocol == "sse") {
+                    Task.Spawn(HandleSse(clientSock));
+                } else if (this.protocol == "mqtt") {
+                    Task.Spawn(HandleMqtt(clientSock));
                 } else {
                     Task.Spawn(HandleTcp(clientSock));
                 }
@@ -107,49 +824,108 @@ class Worker {
         }
     }
 
-    /// <summary>Handles a raw TCP connection.</summary>
+    Connection NewConnection(int sock) {
+        int id = nextConnId;
+        nextConnId = nextConnId + 1;
+        return Connection.Create(id, sock, this.protocol);
+    }
+
+    // ---- tcp ----
+
     async void HandleTcp(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
+        Connection conn = NewConnection(clientSock);
+        if (this.onConnect != null) { this.onConnect(conn); }
+
         bool active = true;
-        while (active) {
+        while (active && !conn.closed) {
             string data = await client.RecvReuseAsync();
             if (data.Length == 0) {
                 active = false;
             } else {
-                string response = OnTcpMessage(data);
+                BumpStat();
+                string response = "";
+                if (this.onMessage != null) {
+                    response = this.onMessage(conn, data);
+                } else {
+                    response = data;   // default: echo
+                }
                 if (response.Length > 0) {
-                    await client.SendAsync(response);
+                    int _n = await client.SendAsync(response);
                 }
             }
         }
         client.Close();
+        conn.closed = true;
         this.connectionCount = this.connectionCount - 1;
+        if (this.onClose != null) { this.onClose(conn); }
     }
 
-    /// <summary>Handles an HTTP connection with keep-alive.</summary>
+    // ---- http ----
+
     async void HandleHttp(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         bool keepAlive = true;
+        // Bytes received but not yet consumed as a complete request; correct
+        // framing across partial and pipelined requests (see HttpServer).
+        string buffer = "";
+
         while (keepAlive) {
-            string rawData = await client.RecvReuseAsync();
-            if (rawData.Length == 0) { break; }
+            int headerEnd = HttpServer.FindHeaderEnd(buffer);
+            while (headerEnd < 0) {
+                string chunk = await client.RecvReuseAsync();
+                if (chunk.Length == 0) { keepAlive = false; break; }
+                buffer = buffer + chunk;
+                headerEnd = HttpServer.FindHeaderEnd(buffer);
+            }
+            if (!keepAlive) { break; }
 
-            HttpRequest request = HttpRequest.Parse(rawData);
+            HttpRequest head = HttpRequest.Parse(buffer);
+            int bodyLen = head.contentLength;
+            if (bodyLen < 0) { bodyLen = 0; }
+            int need = headerEnd + bodyLen;
+            while (buffer.Length < need) {
+                string chunk = await client.RecvReuseAsync();
+                if (chunk.Length == 0) { keepAlive = false; break; }
+                buffer = buffer + chunk;
+            }
+            if (!keepAlive && buffer.Length < need) { break; }
+
+            string reqBytes = buffer.Substring(0, need);
+            if (buffer.Length > need) {
+                buffer = buffer.Substring(need);
+            } else {
+                buffer = "";
+            }
+
+            HttpRequest request = HttpRequest.Parse(reqBytes);
             keepAlive = request.keepAlive;
+            BumpStat();
 
-            HttpResponse response = OnHttpRequest(request);
-            response.SetKeepAlive(keepAlive);
-            await client.SendAsync(response.Build());
+            HttpResponse response = null;
+            if (this.onHttpRequest != null) {
+                response = this.onHttpRequest(request);
+            } else {
+                response = HttpResponse.Ok("<h1>Zan Worker - " + this.name + "</h1>");
+            }
+            response = response.SetKeepAlive(keepAlive);
+            int _sent = await client.SendAsync(response.Build());
         }
         client.Close();
         this.connectionCount = this.connectionCount - 1;
     }
 
-    /// <summary>Handles a WebSocket connection.</summary>
+    // ---- websocket ----
+
     async void HandleWebSocket(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
 
         string rawReq = await client.RecvAsync(65536);
+        if (rawReq.Length == 0) {
+            client.Close();
+            this.connectionCount = this.connectionCount - 1;
+            return;
+        }
         HttpRequest req = HttpRequest.Parse(rawReq);
         string wsKey = req.GetHeader("Sec-WebSocket-Key");
 
@@ -160,13 +936,16 @@ class Worker {
         sb.Append("Sec-WebSocket-Accept: ");
         sb.Append(Encoding.WebSocketAccept(wsKey));
         sb.Append("\r\n\r\n");
-        await client.SendAsync(sb.ToString());
+        int _hs = await client.SendAsync(sb.ToString());
+
+        Connection conn = NewConnection(clientSock);
+        if (this.onConnect != null) { this.onConnect(conn); }
 
         // Reassemble whole frames via WsReader (handles partial and coalesced
         // frames), rather than assuming one recv == one frame.
         WsReader reader = new WsReader(clientSock);
         bool active = true;
-        while (active) {
+        while (active && !conn.closed) {
             int total = reader.FrameSize();
             while (total < 0) {
                 int got = await reader.FillMore();
@@ -182,94 +961,139 @@ class Worker {
             reader.Consume(total);
 
             if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
-                string response = OnWebSocketMessage(frame.payload);
+                BumpStat();
+                string response = "";
+                if (this.onMessage != null) {
+                    response = this.onMessage(conn, frame.payload);
+                } else {
+                    response = frame.payload;   // default: echo
+                }
                 if (response.Length > 0) {
                     WsFrame respFrame = WsFrame.TextFrame(response);
+                    respFrame.opcode = frame.opcode;
                     string encoded = respFrame.Encode();
-                    await client.SendBytesAsync(encoded, 2 + response.Length);
+                    int hdrLen = 2;
+                    if (response.Length > 65535) { hdrLen = 10; }
+                    else if (response.Length > 125) { hdrLen = 4; }
+                    int _n = await client.SendBytesAsync(encoded, hdrLen + response.Length);
                 }
             } else if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
                 string encoded = pong.Encode();
-                await client.SendBytesAsync(encoded, 2);
+                int _p = await client.SendBytesAsync(encoded, 2);
             } else if (frame.opcode == WsOpcode.Close) {
+                WsFrame closeResp = WsFrame.CloseFrame();
+                string enc2 = closeResp.Encode();
+                int _c = await client.SendBytesAsync(enc2, 2);
                 active = false;
             }
         }
 
         client.Close();
+        conn.closed = true;
+        this.connectionCount = this.connectionCount - 1;
+        if (this.onClose != null) { this.onClose(conn); }
+    }
+
+    // ---- sse ----
+
+    async void HandleSse(int clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+
+        // Read the subscriber's GET request head.
+        string req = "";
+        while (HttpServer.FindHeaderEnd(req) < 0 && req.Length < 65536) {
+            string chunk = await client.RecvAsync(4096);
+            if (chunk.Length == 0) {
+                client.Close();
+                this.connectionCount = this.connectionCount - 1;
+                return;
+            }
+            req = req + chunk;
+        }
+        string path = "/";
+        HttpRequest head = HttpRequest.Parse(req);
+        if (head.path.Length > 0) { path = head.path; }
+
+        int _n = await client.SendAsync("HTTP/1.1 200 OK\r\n"
+            + "Content-Type: text/event-stream\r\n"
+            + "Cache-Control: no-cache\r\n"
+            + "Connection: keep-alive\r\n"
+            + "Access-Control-Allow-Origin: *\r\n"
+            + "\r\n");
+
+        BumpStat();
+        SseConnection sse = SseConnection.Of(client, path);
+        if (this.onSseSubscriber != null) {
+            this.onSseSubscriber(sse);
+        } else {
+            sse.Close();
+        }
+        // The application owns the SseConnection from here; connection count is
+        // released when it closes (tracked via the poll below).
+        while (sse.IsOpen()) {
+            await Task.Delay(500);
+        }
         this.connectionCount = this.connectionCount - 1;
     }
 
-    /// <summary>Handles UDP messages.</summary>
-    async void RunUdp() {
-        UdpClient udp = UdpClient.Bind(this.host, this.port);
+    // ---- mqtt ----
+
+    async void HandleMqtt(int clientSock) {
+        BumpStat();
+        await MqttBroker.Global().HandleConnection(clientSock);
+        this.connectionCount = this.connectionCount - 1;
+    }
+
+    // ---- udp ----
+
+    async void RunUdp(int sock) {
         while (this.running) {
-            string data = await udp.RecvFromAsync(65536);
+            string data = await Socket.RecvFromPeerAsync(sock, 65536);
             if (data.Length > 0) {
-                string response = OnUdpMessage(data);
+                BumpStat();
+                string peerIp = Socket.PeerIp();
+                int peerPort = Socket.PeerPort();
+                string response = "";
+                if (this.onUdpMessage != null) {
+                    response = this.onUdpMessage(data);
+                } else {
+                    response = data;   // default: echo
+                }
+                if (response.Length > 0 && peerPort > 0) {
+                    int _n = await Socket.SendToAsync(sock, response, response.Length, peerIp, peerPort);
+                }
             }
         }
-        udp.Close();
-    }
-
-    string OnTcpMessage(string data) {
-        return data;
-    }
-
-    HttpResponse OnHttpRequest(HttpRequest request) {
-        return HttpResponse.Ok("<h1>Zan Worker - " + this.name + "</h1>");
-    }
-
-    string OnWebSocketMessage(string message) {
-        return message;
-    }
-
-    string OnUdpMessage(string data) {
-        return data;
-    }
-
-    void Stop() {
-        this.running = false;
-    }
-
-    static void StopAll() {
-        int i = 0;
-        while (i < workers.Count) {
-            workers[i].Stop();
-            i = i + 1;
-        }
-    }
-
-    int GetConnectionCount() {
-        return this.connectionCount;
+        Socket.Close(sock);
     }
 }
 
 /// <summary>
-/// Connection abstraction for tracking client connections.
+/// One accepted client connection, passed to Worker callbacks. Send pushes
+/// data to the peer from any (including non-async) context; Close marks the
+/// connection for shutdown after the current callback returns.
 /// </summary>
 class Connection {
     int id;
     int sock;
-    string remoteIp;
-    int remotePort;
     string protocol;
     string userData;
+    bool closed;
 
     Connection(int id, int sock, string protocol) {
         this.id = id;
         this.sock = sock;
         this.protocol = protocol;
-        this.remoteIp = "";
-        this.remotePort = 0;
         this.userData = "";
+        this.closed = false;
     }
 
     static Connection Create(int id, int sock, string protocol) {
         return new Connection(id, sock, protocol);
     }
 
+    /// <summary>Arbitrary per-connection state for the application.</summary>
     void SetData(string data) {
         this.userData = data;
     }
@@ -290,11 +1114,25 @@ class Connection {
         return this.protocol;
     }
 
-    async void Send(string data) {
-        await Socket.SendStringAsync(this.sock, data);
+    /// <summary>Queues raw bytes to the peer (fire-and-forget; usable from
+    /// synchronous callbacks). For "websocket" workers, prefer returning the
+    /// reply from onMessage so it is framed; Send writes raw bytes.</summary>
+    void Send(string data) {
+        Task.Spawn(Socket.SendStringAsync(this.sock, data));
     }
 
+    /// <summary>Sends data and suspends until it is written.</summary>
+    async int SendAsync(string data) {
+        int n = await Socket.SendStringAsync(this.sock, data);
+        return n;
+    }
+
+    /// <summary>Marks the connection to be closed by its worker loop.</summary>
     void Close() {
-        Socket.Close(this.sock);
+        this.closed = true;
+    }
+
+    bool IsClosed() {
+        return this.closed;
     }
 }

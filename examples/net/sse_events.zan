@@ -1,0 +1,115 @@
+// ============================================================================
+// Server-Sent Events (SSE) —— 服务端推送 + 客户端订阅完整示例
+// ----------------------------------------------------------------------------
+// SSE 是 HTTP 上的单向服务器推送协议（Content-Type: text/event-stream），
+// 浏览器里对应 EventSource API。适合行情、日志、进度条等"服务器 -> 客户端"
+// 持续推送的场景；需要双向通信时应改用 WebSocket。
+//
+// 演示内容：
+//   1. SseServer：接受订阅（AcceptAsync 完成 HTTP 握手，返回 SseConnection）
+//   2. SseConnection.SendAsync(event, data)：推送命名事件
+//      SendDataAsync(data)：推送默认 "message" 事件
+//      PingAsync()：注释行保活（防止中间代理断开空闲连接）
+//   3. 多行 data 的编码：payload 中的 '\n' 自动拆成多个 data: 行（SSE 规范）
+//   4. SseClient：ConnectAsync 订阅，NextAsync 逐条取事件（流结束返回 null）
+//   5. 广播模式：服务端把每个订阅者的 SseConnection 存进列表统一推送
+//
+// 运行：zanc examples/net/sse_events.zan --auto-stdlib -o sse.exe && ./sse.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+using System.Net.Sse;
+
+class Program {
+    static int PORT = 54441;
+    static int SUBSCRIBERS = 2;
+    static SseServer srv;
+    static List<SseConnection> subs;    // 已订阅的连接（广播用）
+    static int doneClients = 0;
+
+    // ---- 服务端：接受订阅，凑齐后广播 ----------------------------------------
+    static async void Server() {
+        // 先收满全部订阅者
+        while (subs.Count < SUBSCRIBERS) {
+            SseConnection c = await srv.AcceptAsync();
+            if (c != null) {
+                // Path() 是订阅方请求的路径，可据此区分频道
+                Console.WriteLine("server: new subscriber on " + c.Path());
+                subs.Add(c);
+            }
+        }
+
+        // 广播 3 条行情事件给所有订阅者
+        int tick = 0;
+        while (tick < 3) {
+            int i = 0;
+            while (i < subs.Count) {
+                // 命名事件 "price"：客户端按 e.Name() 区分事件类型
+                int _n = await subs[i].SendAsync("price",
+                    "{\"symbol\":\"ZAN\",\"px\":" + Convert.ToString(100 + tick) + "}");
+                i = i + 1;
+            }
+            tick = tick + 1;
+        }
+
+        // 保活注释行：不产生客户端事件，只是让连接上有字节流动
+        int j = 0;
+        while (j < subs.Count) {
+            int _p = await subs[j].PingAsync();
+            j = j + 1;
+        }
+
+        // 演示多行 payload：'\n' 会编码成两个 data: 行，客户端解析后原样还原
+        int k = 0;
+        while (k < subs.Count) {
+            int _m = await subs[k].SendAsync("notice", "line-a\nline-b");
+            // 关闭连接 => 客户端 NextAsync 返回 null，订阅结束
+            subs[k].Close();
+            k = k + 1;
+        }
+    }
+
+    // ---- 客户端：订阅并消费事件到流结束 --------------------------------------
+    static async void Client(int id) {
+        SseClient c = await SseClient.ConnectAsync("127.0.0.1", PORT, "/stream");
+        if (!c.IsConnected()) {
+            Console.WriteLine("client " + Convert.ToString(id) + ": subscribe failed");
+            doneClients = doneClients + 1;
+            return;
+        }
+        int events = 0;
+        while (true) {
+            SseEvent e = await c.NextAsync();   // 挂起直到下一条事件或流关闭
+            if (e == null) { break; }           // null == 服务端关闭了流
+            events = events + 1;
+            Console.WriteLine("client " + Convert.ToString(id)
+                + " event=" + e.Name() + " data=" + e.Data());
+        }
+        Console.WriteLine("client " + Convert.ToString(id)
+            + " stream closed, events=" + Convert.ToString(events));
+        c.Close();
+        doneClients = doneClients + 1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        subs = new List<SseConnection>();
+        srv = SseServer.Create("127.0.0.1", PORT);
+        srv.Start();
+        Task.Spawn(Server());
+
+        int i = 0;
+        while (i < SUBSCRIBERS) {
+            Task.Spawn(Client(i));
+            i = i + 1;
+        }
+        while (doneClients < SUBSCRIBERS) { await Task.Delay(10); }
+        srv.Stop();
+        Console.WriteLine("done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

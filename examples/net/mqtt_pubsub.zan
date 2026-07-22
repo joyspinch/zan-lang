@@ -1,0 +1,86 @@
+// ============================================================================
+// MQTT 发布/订阅 —— 内置 Broker + 客户端完整示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. MqttBroker：纯 Zan 实现的 MQTT v3.1.1 服务端，无需外部 broker
+//   2. MqttClient 连接 / 订阅 / 发布 / 接收 / 断开（全部为挂起式 async）
+//   3. 主题通配符：`+` 匹配单层，`#` 匹配多层（sensors/+/temp）
+//   4. QoS 0（至多一次）与 QoS 1（至少一次，broker 回 PUBACK）
+//   5. 多个订阅者的扇出广播：一条消息投递给所有匹配的订阅者
+//   6. 不匹配的主题不会被投递（other/topic 示例）
+//
+// 运行：zanc examples/net/mqtt_pubsub.zan --auto-stdlib -o mqtt_pubsub.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+using System.Net.Mqtt;
+
+class Program {
+    [DllImport("crt")]
+    static extern void exit(int code);
+
+    static int PORT = 54471;
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // ---- 服务端：启动内置 broker ----------------------------------------
+        MqttBroker broker = MqttBroker.Create("127.0.0.1", PORT);
+        Task.Spawn(broker.RunAsync());
+        await Task.Delay(50);
+
+        // ---- 订阅者 1：单层通配符 sensors/+/temp -----------------------------
+        MqttClient sub1 = await MqttClient.ConnectAsync("127.0.0.1", PORT, "sub-1");
+        int s1 = await sub1.SubscribeAsync("sensors/+/temp", MqttQos.AtMostOnce);
+        Console.WriteLine("sub-1 subscribed sensors/+/temp connected="
+            + Convert.ToString(sub1.IsConnected()));
+
+        // ---- 订阅者 2：多层通配符 sensors/# ----------------------------------
+        MqttClient sub2 = await MqttClient.ConnectAsync("127.0.0.1", PORT, "sub-2");
+        int s2 = await sub2.SubscribeAsync("sensors/#", MqttQos.AtMostOnce);
+        Console.WriteLine("sub-2 subscribed sensors/#");
+
+        // ---- 发布者 ----------------------------------------------------------
+        MqttClient pub = await MqttClient.ConnectAsync("127.0.0.1", PORT, "pub-1");
+
+        // QoS 1：broker 返回 PUBACK 后 PublishAsync 才返回
+        int p1 = await pub.PublishAsync("sensors/kitchen/temp", "21.5", MqttQos.AtLeastOnce);
+        Console.WriteLine("published sensors/kitchen/temp = 21.5 (QoS1)");
+
+        // 两个订阅者都匹配，各收到一份
+        string m1 = await sub1.ReceiveAsync();
+        string m2 = await sub2.ReceiveAsync();
+        Console.WriteLine("sub-1 got: " + m1);
+        Console.WriteLine("sub-2 got: " + m2);
+
+        // 只匹配 sensors/#（sub-2），不匹配 sensors/+/temp（sub-1）
+        int p2 = await pub.PublishAsync("sensors/hall/humidity", "40%", MqttQos.AtMostOnce);
+        string m3 = await sub2.ReceiveAsync();
+        Console.WriteLine("sub-2 got: " + m3 + " (sensors/hall/humidity)");
+
+        // 谁都不匹配：直接被 broker 丢弃，没有订阅者收到
+        int p3 = await pub.PublishAsync("other/topic", "ignored", MqttQos.AtMostOnce);
+        Console.WriteLine("published other/topic (no subscriber matches)");
+
+        // 再发一条给两个订阅者，确认 other/topic 确实没被投递
+        int p4 = await pub.PublishAsync("sensors/hall/temp", "18.0", MqttQos.AtMostOnce);
+        string m4 = await sub1.ReceiveAsync();
+        string m5 = await sub2.ReceiveAsync();
+        Console.WriteLine("sub-1 got: " + m4);
+        Console.WriteLine("sub-2 got: " + m5);
+
+        // ---- 收尾 ------------------------------------------------------------
+        int d1 = await pub.DisconnectAsync();
+        int d2 = await sub1.DisconnectAsync();
+        int d3 = await sub2.DisconnectAsync();
+        broker.Stop();
+        Console.WriteLine("done");
+        // broker 的 accept 协程仍在运行，直接退出进程
+        exit(0);
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

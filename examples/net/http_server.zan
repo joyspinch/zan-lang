@@ -1,0 +1,118 @@
+// ============================================================================
+// HTTP 服务端 —— 路由、JSON API、查询参数、错误处理完整示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. HttpServer.Create + OnRequest 回调式请求处理
+//   2. 手写路由分发：按 method + path 分派（GET/POST/未匹配 404）
+//   3. 返回不同 Content-Type：HttpResponse.Text / Json / Ok(html) / NotFound
+//   4. 读取请求体（POST）与查询串（req.queryString）
+//   5. 用 JsonValue 构造/解析 JSON，实现一个内存 TODO API：
+//        GET  /todos        -> 列表（JSON 数组）
+//        POST /todos        -> 新增（请求体为 JSON）
+//        GET  /todos/count  -> 数量
+//   6. SetMaxConnections / SetTimeout / SetMaxRequestBytes 服务端自我保护
+//   7. keep-alive：同一条 TCP 连接上的多次请求由 HttpServer 自动处理
+//
+// 运行：zanc examples/net/http_server.zan --auto-stdlib -o http_server.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Json;
+
+class Program {
+    static int PORT = 54421;
+    static List<string> todos;      // 内存存储：每项是一条 JSON 文本
+
+    // ---- 请求处理器 ----------------------------------------------------------
+    // HttpServer 对每个完整请求调用一次该函数；返回的 HttpResponse
+    // 由框架负责序列化（状态行、Content-Length、keep-alive 头等）。
+    static HttpResponse Handle(HttpRequest req) {
+        // 路由 1：GET /todos —— 返回 JSON 数组
+        if (req.method == "GET" && req.path == "/todos") {
+            JsonValue arr = JsonValue.NewArray();
+            int i = 0;
+            while (i < todos.Count) {
+                arr.Append(JsonValue.Parse(todos[i]));
+                i = i + 1;
+            }
+            return HttpResponse.Json(arr.ToJson());
+        }
+
+        // 路由 2：POST /todos —— 请求体是 {"title": "..."}
+        if (req.method == "POST" && req.path == "/todos") {
+            JsonValue doc = JsonValue.Parse(req.body);
+            string title = doc.Str("title", "");
+            if (title.Length == 0) {
+                // 客户端错误：给出机器可读的错误结构，而不是裸文本
+                HttpResponse bad = HttpResponse.Json("{\"error\":\"title required\"}");
+                bad.statusCode = 400;
+                bad.statusText = "Bad Request";
+                return bad;
+            }
+            // 服务端补充字段后存储
+            JsonValue item = JsonValue.NewObject();
+            item.Set("id", JsonValue.NewNum(Convert.ToString(todos.Count + 1)));
+            item.Set("title", JsonValue.NewStr(title));
+            item.Set("done", JsonValue.NewBool(false));
+            todos.Add(item.ToJson());
+            return HttpResponse.Json(item.ToJson());
+        }
+
+        // 路由 3：GET /todos/count —— 纯文本
+        if (req.method == "GET" && req.path == "/todos/count") {
+            return HttpResponse.Text(Convert.ToString(todos.Count));
+        }
+
+        // 路由 4：GET /hello?name=xxx —— 演示查询串的读取
+        if (req.method == "GET" && req.path == "/hello") {
+            // queryString 是 '?' 之后的原始内容，如 "name=zan&x=1"
+            return HttpResponse.Text("hi, query=[" + req.queryString + "]");
+        }
+
+        // 兜底：404
+        return HttpResponse.NotFound();
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        todos = new List<string>();
+
+        HttpServer server = HttpServer.Create("127.0.0.1", PORT);
+        server.SetMaxConnections(128);      // 超过则拒绝新连接，防打满
+        server.SetTimeout(10000);           // 空闲连接超时（毫秒）
+        server.SetMaxRequestBytes(1048576); // 请求体上限 1MB，防恶意大包
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        // ---- 用 HttpClient 自测各路由 ---------------------------------------
+        HttpClient cli = HttpClient.Create("127.0.0.1", PORT);
+
+        string r1 = await cli.PostAsync("/todos", "{\"title\":\"write docs\"}");
+        Console.WriteLine("POST /todos -> " + r1);
+
+        string r2 = await cli.PostAsync("/todos", "{\"title\":\"ship it\"}");
+        Console.WriteLine("POST /todos -> " + r2);
+
+        // 错误路径：缺 title 应得到 400 的错误 JSON
+        string r3 = await cli.PostAsync("/todos", "{}");
+        Console.WriteLine("POST bad    -> " + r3);
+
+        string r4 = await cli.GetAsync("/todos");
+        Console.WriteLine("GET  /todos -> " + r4);
+
+        string r5 = await cli.GetAsync("/todos/count");
+        Console.WriteLine("GET  count  -> " + r5);
+
+        string r6 = await cli.GetAsync("/hello?name=zan");
+        Console.WriteLine("GET  hello  -> " + r6);
+
+        server.Stop();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

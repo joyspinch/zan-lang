@@ -1,0 +1,77 @@
+// ============================================================================
+// UDP 数据报通信 —— 服务端 + 客户端完整示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. UdpClient.Bind 建立"服务端"（UDP 无连接，本质是绑定端口收包）
+//   2. UdpClient.Create 建立"客户端"（不绑定，由系统分配临时端口）
+//   3. SendToAsync / RecvFromAsync 异步收发数据报
+//   4. UDP 与 TCP 的核心区别：
+//      - 有消息边界：一次 RecvFrom 恰好收到一个完整数据报，无需分帧
+//      - 不可靠：数据报可能丢失、乱序、重复（本例在回环地址上不会发生）
+//      - 无连接：同一个套接字可以与任意多个对端通信
+//   5. 简单的"请求-应答"模式：客户端在已知端口上等待服务端回包
+//
+// 运行：zanc examples/net/udp_messaging.zan --auto-stdlib -o udp.exe && ./udp.exe
+// ============================================================================
+using System;
+using System.Net.Sockets;
+
+class Program {
+    static int SERVER_PORT = 54411;
+    static int CLIENT_PORT = 54412;   // 客户端也绑定端口，服务端才知道往哪回
+    static int ROUNDS = 3;
+    static bool serverUp = false;
+    static bool clientDone = false;
+
+    // ---- 服务端 -------------------------------------------------------------
+    // UDP 服务端就是一个循环：收包 -> 处理 -> 回包。
+    // 注意：标准库当前的 RecvFromAsync 只返回数据，不返回来源地址，
+    // 因此本例采用"双方约定端口"的模式回包。需要动态回源地址的场景
+    // 可以在应用层把回复端口写进报文里（本例的做法）。
+    static async void Server() {
+        UdpClient srv = UdpClient.Bind("127.0.0.1", SERVER_PORT);
+        serverUp = true;
+        int handled = 0;
+        while (handled < ROUNDS) {
+            // 一次收一个完整数据报（UDP 保留消息边界）
+            string msg = await srv.RecvFromAsync(4096);
+            Console.WriteLine("server got: " + msg);
+            // 处理后回包到约定的客户端端口
+            int _n = await srv.SendToAsync("ack: " + msg, "127.0.0.1", CLIENT_PORT);
+            handled = handled + 1;
+        }
+        srv.Close();
+    }
+
+    // ---- 客户端 -------------------------------------------------------------
+    static async void Client() {
+        // 客户端绑定固定端口以接收服务端的应答
+        UdpClient cli = UdpClient.Bind("127.0.0.1", CLIENT_PORT);
+        int i = 0;
+        while (i < ROUNDS) {
+            string payload = "datagram-" + Convert.ToString(i);
+            int _n = await cli.SendToAsync(payload, "127.0.0.1", SERVER_PORT);
+            // 等待应答。真实网络中 UDP 可能丢包，
+            // 生产代码应配合超时重发（Task.Delay + 重试计数）。
+            string reply = await cli.RecvFromAsync(4096);
+            Console.WriteLine("client got: " + reply);
+            i = i + 1;
+        }
+        cli.Close();
+        clientDone = true;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Task.Spawn(Server());
+        while (!serverUp) { await Task.Delay(10); }
+        Task.Spawn(Client());
+        while (!clientDone) { await Task.Delay(10); }
+        Console.WriteLine("done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
