@@ -1543,3 +1543,134 @@ void zan_co_sched_run(void) {
 }
 #endif /* _WIN32 */
 #endif /* ZAN_CO_DRIVER */
+
+/* ======================================================================
+ * Coroutine gate -- event-driven, counting wait primitive.
+ *
+ * Purpose: replace the `await Task.Delay(1)` spin-poll used by connection
+ * pools (MySqlPool / SqlitePool / RedisPool) and reconnect loops with a
+ * genuine suspend/wake handshake. A coroutine that cannot make progress
+ * parks on a gate (no CPU, no timer); whoever makes progress possible
+ * calls signal, which re-readies exactly one parked coroutine through the
+ * same ready queue the rest of the async machinery uses.
+ *
+ * Semantics (counting / condition-variable style, no lost wakeup):
+ *   - park: if a surplus signal is banked, consume it and re-ready the
+ *     caller immediately; otherwise enqueue the caller as a FIFO waiter.
+ *   - signal: wake the oldest waiter, or bank a surplus signal when none
+ *     is parked. Surplus lets signal-before-park work, so callers that use
+ *     a recheck loop (while (!avail) await gate.Wait()) never deadlock.
+ *
+ * Compiled unconditionally (outside ZAN_CO_DRIVER) so it lives in both
+ * zanrt_io.o (single-thread inline driver) and zanrt_io_mt.o (multi-worker
+ * driver). zan_co_ready is resolved from whichever driver is linked. Under
+ * the multi-worker driver several OS threads may park/signal the same gate
+ * concurrently, so the waiter list is guarded by a lock there; the
+ * single-thread cooperative driver has no concurrency and needs none.
+ * ====================================================================== */
+#if defined(ZAN_CO_DRIVER) && !defined(_WIN32)
+#include <pthread.h>
+#endif
+typedef struct zan_gate_waiter {
+    struct zan_gate_waiter *next;
+    void                   *frame;
+    zan_co_step_t           step;
+} zan_gate_waiter;
+
+typedef struct zan_gate {
+    zan_gate_waiter *head;
+    zan_gate_waiter *tail;
+    long long        surplus;   /* signals banked while no waiter parked */
+#if defined(ZAN_CO_DRIVER) && defined(_WIN32)
+    CRITICAL_SECTION lock;
+#elif defined(ZAN_CO_DRIVER)
+    pthread_mutex_t  lock;
+#endif
+} zan_gate;
+
+#if defined(ZAN_CO_DRIVER) && defined(_WIN32)
+static void zan_gate_lock(zan_gate *g)   { EnterCriticalSection(&g->lock); }
+static void zan_gate_unlock(zan_gate *g) { LeaveCriticalSection(&g->lock); }
+static void zan_gate_lock_init(zan_gate *g) { InitializeCriticalSection(&g->lock); }
+static void zan_gate_lock_free(zan_gate *g) { DeleteCriticalSection(&g->lock); }
+#elif defined(ZAN_CO_DRIVER)
+static void zan_gate_lock(zan_gate *g)   { pthread_mutex_lock(&g->lock); }
+static void zan_gate_unlock(zan_gate *g) { pthread_mutex_unlock(&g->lock); }
+static void zan_gate_lock_init(zan_gate *g) { pthread_mutex_init(&g->lock, NULL); }
+static void zan_gate_lock_free(zan_gate *g) { pthread_mutex_destroy(&g->lock); }
+#else
+static void zan_gate_lock(zan_gate *g)   { (void)g; }
+static void zan_gate_unlock(zan_gate *g) { (void)g; }
+static void zan_gate_lock_init(zan_gate *g) { (void)g; }
+static void zan_gate_lock_free(zan_gate *g) { (void)g; }
+#endif
+
+/* Allocate a gate; returns an opaque handle (its address as an integer). */
+long long zan_gate_new(void) {
+    zan_gate *g = (zan_gate *)calloc(1, sizeof(*g));
+    if (!g) return 0;
+    zan_gate_lock_init(g);
+    return (long long)(intptr_t)g;
+}
+
+/* Suspend the calling coroutine on the gate. The compiler emits this after
+ * saving the frame's live slots and setting its resume state, then returns
+ * void from the step; the frame is re-entered via `step(frame)` once a
+ * signal is delivered (or immediately if one was already banked). */
+void zan_gate_park(long long handle, void *frame, zan_co_step_t step) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) { if (step) zan_co_ready(frame, step); return; }
+    if (!step) return;
+    zan_gate_lock(g);
+    if (g->surplus > 0) {
+        g->surplus--;
+        zan_gate_unlock(g);
+        zan_co_ready(frame, step);   /* a signal was already available */
+        return;
+    }
+    zan_gate_waiter *w = (zan_gate_waiter *)malloc(sizeof(*w));
+    if (!w) { zan_gate_unlock(g); zan_co_ready(frame, step); return; }
+    w->next = NULL; w->frame = frame; w->step = step;
+    if (g->tail) g->tail->next = w; else g->head = w;
+    g->tail = w;
+    zan_gate_unlock(g);
+    /* parked: nothing more to do -- zan_gate_signal will re-ready us. */
+}
+
+/* Wake exactly one parked waiter, or bank a surplus signal when none is
+ * parked so a subsequent park does not block. */
+void zan_gate_signal(long long handle) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) return;
+    zan_gate_lock(g);
+    zan_gate_waiter *w = g->head;
+    if (w) {
+        g->head = w->next;
+        if (!g->head) g->tail = NULL;
+        zan_gate_unlock(g);
+        zan_co_ready(w->frame, w->step);
+        free(w);
+        return;
+    }
+    g->surplus++;
+    zan_gate_unlock(g);
+}
+
+/* Destroy a gate. Any stragglers are re-readied (so they don't hang) before
+ * the storage is released. */
+void zan_gate_free(long long handle) {
+    zan_gate *g = (zan_gate *)(intptr_t)handle;
+    if (!g) return;
+    zan_gate_lock(g);
+    zan_gate_waiter *w = g->head;
+    g->head = g->tail = NULL;
+    zan_gate_unlock(g);
+    while (w) {
+        zan_gate_waiter *n = w->next;
+        zan_co_ready(w->frame, w->step);
+        free(w);
+        w = n;
+    }
+    zan_gate_lock_free(g);
+    free(g);
+}

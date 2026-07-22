@@ -4,9 +4,9 @@ namespace System.IO;
 
 /// <summary>
 /// Growable binary buffer with explicit length tracking and little-endian
-/// primitive encoding. The backing store is a raw C allocation, so the
-/// contents may include NUL bytes (unlike text strings) and the buffer can be
-/// handed directly to FFI calls via <see cref="Raw"/>.
+/// primitive encoding. The backing store is raw off-heap memory held as a
+/// nint address (never an ARC string), so contents may include NUL bytes and
+/// the buffer can be handed directly to FFI calls via <see cref="Raw"/>.
 ///
 /// Writing appends at the write position; reading consumes from an
 /// independent read position:
@@ -17,22 +17,13 @@ namespace System.IO;
 /// Call <see cref="Free"/> when done.
 /// </summary>
 class ByteBuffer {
-    string data;
+    nint data;
     int capacity;
     int length;      // bytes written (high-water mark)
     int rpos;        // read cursor
 
-    [DllImport("crt")]
-    static extern string calloc(int count, int size);
-
-    [DllImport("crt")]
-    static extern void free(string ptr);
-
-    [DllImport("crt")]
-    static extern int memcpy(string dst, string src, int n);
-
     ByteBuffer() {
-        this.data = "";
+        this.data = 0;
         this.capacity = 0;
         this.length = 0;
         this.rpos = 0;
@@ -43,15 +34,15 @@ class ByteBuffer {
         ByteBuffer b = new ByteBuffer();
         int cap = initialCapacity;
         if (cap < 16) { cap = 16; }
-        b.data = calloc(cap, 1);
+        b.data = NativeMemory.Alloc(cap);
         b.capacity = cap;
         return b;
     }
 
     /// <summary>Wraps count bytes copied out of an existing raw block.</summary>
-    static ByteBuffer FromRaw(string src, int count) {
+    static ByteBuffer FromRaw(nint src, int count) {
         ByteBuffer b = ByteBuffer.Alloc(count);
-        memcpy(b.data, src, count);
+        NativeMemory.Copy(b.data, src, count);
         b.length = count;
         return b;
     }
@@ -59,8 +50,8 @@ class ByteBuffer {
     /// <summary>Releases the backing allocation.</summary>
     void Free() {
         if (this.capacity > 0) {
-            free(this.data);
-            this.data = "";
+            NativeMemory.Free(this.data);
+            this.data = 0;
             this.capacity = 0;
             this.length = 0;
             this.rpos = 0;
@@ -76,8 +67,8 @@ class ByteBuffer {
     /// <summary>Remaining unread bytes.</summary>
     int Remaining() { return this.length - this.rpos; }
 
-    /// <summary>Raw backing pointer for FFI calls (valid until Free/growth).</summary>
-    string Raw() { return this.data; }
+    /// <summary>Raw backing address for FFI calls (valid until Free/growth).</summary>
+    nint Raw() { return this.data; }
 
     /// <summary>Moves the read cursor.</summary>
     ByteBuffer SeekRead(int pos) {
@@ -97,9 +88,9 @@ class ByteBuffer {
         if (cap > this.capacity) {
             int c = this.capacity * 2;
             while (c < cap) { c = c * 2; }
-            string grown = calloc(c, 1);
-            memcpy(grown, this.data, this.length);
-            free(this.data);
+            nint grown = NativeMemory.Alloc(c);
+            NativeMemory.Copy(grown, this.data, this.length);
+            NativeMemory.Free(this.data);
             this.data = grown;
             this.capacity = c;
         }
@@ -118,9 +109,9 @@ class ByteBuffer {
         if (need <= this.capacity) { return; }
         int cap = this.capacity * 2;
         while (cap < need) { cap = cap * 2; }
-        string grown = calloc(cap, 1);
-        memcpy(grown, this.data, this.length);
-        free(this.data);
+        nint grown = NativeMemory.Alloc(cap);
+        NativeMemory.Copy(grown, this.data, this.length);
+        NativeMemory.Free(this.data);
         this.data = grown;
         this.capacity = cap;
     }
@@ -129,42 +120,29 @@ class ByteBuffer {
 
     ByteBuffer WriteU8(int v) {
         EnsureRoom(1);
-        this.data[this.length] = v & 255;
+        NativeMemory.SetByte(this.data, this.length, v);
         this.length = this.length + 1;
         return this;
     }
 
     ByteBuffer WriteU16(int v) {
         EnsureRoom(2);
-        this.data[this.length] = v & 255;
-        this.data[this.length + 1] = (v >> 8) & 255;
+        NativeMemory.SetU16(this.data, this.length, v);
         this.length = this.length + 2;
         return this;
     }
 
     ByteBuffer WriteU32(int v) {
         EnsureRoom(4);
-        int p = this.length;
-        this.data[p] = v & 255;
-        this.data[p + 1] = (v >> 8) & 255;
-        this.data[p + 2] = (v >> 16) & 255;
-        this.data[p + 3] = (v >> 24) & 255;
-        this.length = p + 4;
+        NativeMemory.SetU32(this.data, this.length, v);
+        this.length = this.length + 4;
         return this;
     }
 
     ByteBuffer WriteU64(int v) {
         EnsureRoom(8);
-        int p = this.length;
-        this.data[p] = v & 255;
-        this.data[p + 1] = (v >> 8) & 255;
-        this.data[p + 2] = (v >> 16) & 255;
-        this.data[p + 3] = (v >> 24) & 255;
-        this.data[p + 4] = (v >> 32) & 255;
-        this.data[p + 5] = (v >> 40) & 255;
-        this.data[p + 6] = (v >> 48) & 255;
-        this.data[p + 7] = (v >> 56) & 255;
-        this.length = p + 8;
+        NativeMemory.SetI64(this.data, this.length, v);
+        this.length = this.length + 8;
         return this;
     }
 
@@ -180,56 +158,46 @@ class ByteBuffer {
     }
 
     /// <summary>Copies count bytes from a raw block / another buffer's Raw().</summary>
-    ByteBuffer WriteBytes(string src, int count) {
+    ByteBuffer WriteBytes(nint src, int count) {
         EnsureRoom(count);
-        int i = 0;
-        while (i < count) {
-            this.data[this.length + i] = src[i] & 255;
-            i = i + 1;
-        }
+        NativeMemory.Copy(this.data + this.length, src, count);
         this.length = this.length + count;
         return this;
     }
 
     /// <summary>Writes a length-prefixed (varint) UTF-8 string.</summary>
     ByteBuffer WriteString(string s) {
-        WriteVarInt(s.Length);
-        WriteBytes(s, s.Length);
+        int n = s.Length;
+        WriteVarInt(n);
+        EnsureRoom(n);
+        NativeMemory.PutString(this.data, this.length, s, n);
+        this.length = this.length + n;
         return this;
     }
 
     // ===== Readers (little-endian) =====
 
     int ReadU8() {
-        int v = this.data[this.rpos] & 255;
+        int v = NativeMemory.GetByte(this.data, this.rpos);
         this.rpos = this.rpos + 1;
         return v;
     }
 
     int ReadU16() {
-        int p = this.rpos;
-        this.rpos = p + 2;
-        return (this.data[p] & 255) + ((this.data[p + 1] & 255) << 8);
+        int v = NativeMemory.GetU16(this.data, this.rpos);
+        this.rpos = this.rpos + 2;
+        return v;
     }
 
     int ReadU32() {
-        int p = this.rpos;
-        this.rpos = p + 4;
-        return (this.data[p] & 255) + ((this.data[p + 1] & 255) << 8)
-            + ((this.data[p + 2] & 255) << 16) + ((this.data[p + 3] & 255) << 24);
+        int v = NativeMemory.GetU32(this.data, this.rpos);
+        this.rpos = this.rpos + 4;
+        return v;
     }
 
     int ReadU64() {
-        int p = this.rpos;
-        this.rpos = p + 8;
-        int v = this.data[p] & 255;
-        v = v + ((this.data[p + 1] & 255) << 8);
-        v = v + ((this.data[p + 2] & 255) << 16);
-        v = v + ((this.data[p + 3] & 255) << 24);
-        v = v + ((this.data[p + 4] & 255) << 32);
-        v = v + ((this.data[p + 5] & 255) << 40);
-        v = v + ((this.data[p + 6] & 255) << 48);
-        v = v + ((this.data[p + 7] & 255) << 56);
+        int v = NativeMemory.GetI64(this.data, this.rpos);
+        this.rpos = this.rpos + 8;
         return v;
     }
 
@@ -246,14 +214,10 @@ class ByteBuffer {
     }
 
     /// <summary>Reads count bytes into a freshly allocated raw block
-    /// (caller frees with the CRT allocator or wraps in a ByteBuffer).</summary>
-    string ReadBytes(int count) {
-        string buf = calloc(count + 1, 1);
-        int i = 0;
-        while (i < count) {
-            buf[i] = this.data[this.rpos + i] & 255;
-            i = i + 1;
-        }
+    /// (caller frees with NativeMemory.Free or wraps in a ByteBuffer).</summary>
+    nint ReadBytes(int count) {
+        nint buf = NativeMemory.Alloc(count + 1);
+        NativeMemory.Copy(buf, this.data + this.rpos, count);
         this.rpos = this.rpos + count;
         return buf;
     }
@@ -261,26 +225,15 @@ class ByteBuffer {
     /// <summary>Reads a length-prefixed string written by WriteString.</summary>
     string ReadString() {
         int n = ReadVarInt();
-        return ReadBytes(n);
+        string s = NativeMemory.GetString(this.data, this.rpos, n);
+        this.rpos = this.rpos + n;
+        return s;
     }
 
     // ===== Checksums =====
 
     /// <summary>CRC32 (IEEE, reflected) over the first count bytes.</summary>
     int Crc32(int count) {
-        int crc = 4294967295;   // 0xFFFFFFFF
-        int i = 0;
-        while (i < count) {
-            crc = crc ^ (this.data[i] & 255);
-            int k = 0;
-            while (k < 8) {
-                int lsb = crc & 1;
-                crc = (crc >> 1) & 2147483647;
-                if (lsb != 0) { crc = crc ^ 3988292384; }   // 0xEDB88320
-                k = k + 1;
-            }
-            i = i + 1;
-        }
-        return (crc ^ 4294967295) & 4294967295;
+        return NativeMemory.Crc32(this.data, count);
     }
 }
