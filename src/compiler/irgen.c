@@ -1402,11 +1402,21 @@ static LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
     return NULL;
 }
 
+/* Static fields live in module globals, not in the instance struct: they are
+ * excluded from instance layout and field indexing. */
+static bool field_member_is_static(zan_symbol_t *m) {
+    if (m->modifiers & MOD_STATIC) return true;
+    if (m->kind == SYM_FIELD && m->decl &&
+        (m->decl->field_decl.modifiers & MOD_STATIC)) return true;
+    return false;
+}
+
 static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
     int idx = class_vptr_offset(type_sym);
     for (int i = 0; i < type_sym->member_count; i++) {
         if (type_sym->members[i]->kind == SYM_FIELD ||
             type_sym->members[i]->kind == SYM_PROPERTY) {
+            if (field_member_is_static(type_sym->members[i])) continue;
             if (type_sym->members[i]->name.len == field_name.len &&
                 memcmp(type_sym->members[i]->name.str, field_name.str, field_name.len) == 0) {
                 return idx;
@@ -1511,11 +1521,12 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     g->struct_types[g->struct_type_count].llvm_type = st;
     g->struct_type_count++;
 
-    /* count fields (including auto-property backing fields) */
+    /* count fields (including auto-property backing fields; statics excluded) */
     int field_count = 0;
     for (int i = 0; i < sym->member_count; i++) {
-        if (sym->members[i]->kind == SYM_FIELD ||
-            sym->members[i]->kind == SYM_PROPERTY) field_count++;
+        if ((sym->members[i]->kind == SYM_FIELD ||
+             sym->members[i]->kind == SYM_PROPERTY) &&
+            !field_member_is_static(sym->members[i])) field_count++;
     }
 
     /* Reserve field 0 for a hidden vtable pointer on classes that participate
@@ -1529,8 +1540,9 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
         field_types[fi++] = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     }
     for (int i = 0; i < sym->member_count; i++) {
-        if (sym->members[i]->kind == SYM_FIELD ||
-            sym->members[i]->kind == SYM_PROPERTY) {
+        if ((sym->members[i]->kind == SYM_FIELD ||
+             sym->members[i]->kind == SYM_PROPERTY) &&
+            !field_member_is_static(sym->members[i])) {
             field_types[fi++] = map_type(g, sym->members[i]->type);
         }
     }
@@ -2562,6 +2574,7 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym, LLVMValu
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];
         if (m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) continue;
+        if (field_member_is_static(m)) continue;
         int idx = fi++;
         zan_type_t *ft = m->type;
         if (!ft) continue;
@@ -6330,7 +6343,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                 LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
                 LLVMValueRef outp = emit_expr(g, expr->call.args.items[1], locals);
-                LLVMValueRef endp = LLVMBuildAlloca(g->builder, i8ptr, "endp");
+                LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "endp");
                 LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
                 LLVMValueRef v;
                 if (int_recv) {
@@ -7709,7 +7722,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     /* snapshot other's count (so self.AddRange(self) terminates) */
                     LLVMValueRef ocnt_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, other_ptr, 0, "ar.ocp");
                     LLVMValueRef ocnt = LLVMBuildLoad2(g->builder, i64, ocnt_ptr, "ar.ocnt");
-                    LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "ar.i");
+                    LLVMValueRef idx_a = emit_entry_alloca(g, i64, "ar.i");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
                     LLVMBasicBlockRef c_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ar.cond");
                     LLVMBasicBlockRef b_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ar.step");
@@ -7796,7 +7809,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt");
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
-                    LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "lc");
+                    LLVMValueRef idx_a = emit_entry_alloca(g, i64, "lc");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
                     LLVMBasicBlockRef c_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lc.cond");
                     LLVMBasicBlockRef b_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lc.body");
@@ -7844,7 +7857,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef removed = LLVMBuildLoad2(g->builder, i64, removed_ptr, "rmv");
                     emit_collection_release_raw_slot(g, container_elem_type(ltype), removed, i64);
                     /* shift loop: for j = idx; j < count-1; j++ : data[j] = data[j+1] */
-                    LLVMValueRef j_a = LLVMBuildAlloca(g->builder, i64, "j");
+                    LLVMValueRef j_a = emit_entry_alloca(g, i64, "j");
                     LLVMBuildStore(g->builder, idx, j_a);
                     LLVMValueRef last = LLVMBuildSub(g->builder, count, LLVMConstInt(i64, 1, 0), "last");
                     LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ra.cond");
@@ -7894,9 +7907,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
                     LLVMValueRef search = emit_expr(g, expr->call.args.items[0], locals);
                     /* result alloca — -1 for not found */
-                    LLVMValueRef res = LLVMBuildAlloca(g->builder, i64, "iofr");
+                    LLVMValueRef res = emit_entry_alloca(g, i64, "iofr");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, (uint64_t)-1LL, 1), res);
-                    LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "ii");
+                    LLVMValueRef idx_a = emit_entry_alloca(g, i64, "ii");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
                     LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "io.cond");
                     LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "io.body");
@@ -7968,9 +7981,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
                     LLVMValueRef search = emit_expr(g, expr->call.args.items[0], locals);
-                    LLVMValueRef res = LLVMBuildAlloca(g->builder, LLVMInt32TypeInContext(g->ctx), "cr");
+                    LLVMValueRef res = emit_entry_alloca(g, LLVMInt32TypeInContext(g->ctx), "cr");
                     LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), res);
-                    LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "ci");
+                    LLVMValueRef idx_a = emit_entry_alloca(g, i64, "ci");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
                     LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ct.cond");
                     LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ct.body");
@@ -8068,7 +8081,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     /* shift elements right from count-1 down to idx */
                     LLVMPositionBuilderAtEnd(g->builder, shift_bb);
                     LLVMValueRef phi_data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "phid");
-                    LLVMValueRef j_a = LLVMBuildAlloca(g->builder, i64, "ij");
+                    LLVMValueRef j_a = emit_entry_alloca(g, i64, "ij");
                     LLVMBuildStore(g->builder, count, j_a);
                     LLVMBasicBlockRef scond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ins.scond");
                     LLVMBasicBlockRef sbody_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ins.sbody");
@@ -8121,8 +8134,8 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
                     /* two-pointer swap: lo=0, hi=count-1 */
-                    LLVMValueRef lo_a = LLVMBuildAlloca(g->builder, i64, "lo");
-                    LLVMValueRef hi_a = LLVMBuildAlloca(g->builder, i64, "hi");
+                    LLVMValueRef lo_a = emit_entry_alloca(g, i64, "lo");
+                    LLVMValueRef hi_a = emit_entry_alloca(g, i64, "hi");
                     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), lo_a);
                     LLVMValueRef hi_init = LLVMBuildSub(g->builder, count, LLVMConstInt(i64, 1, 0), "hi");
                     LLVMBuildStore(g->builder, hi_init, hi_a);
@@ -8196,9 +8209,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMValueRef ks = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp, "ks");
                         LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals));
                         /* result alloca */
-                        LLVMValueRef res = LLVMBuildAlloca(g->builder, i32t, "ckr");
+                        LLVMValueRef res = emit_entry_alloca(g, i32t, "ckr");
                         LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), res);
-                        LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "di");
+                        LLVMValueRef idx_a = emit_entry_alloca(g, i64, "di");
                         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
                         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ck.cond");
                         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ck.body");
@@ -8238,7 +8251,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMValueRef ks = LLVMBuildLoad2(g->builder, LLVMPointerType(i8ptr, 0), kp, "ks");
                         LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 3, "vp");
                         LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
-                        LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "dc");
+                        LLVMValueRef idx_a = emit_entry_alloca(g, i64, "dc");
                         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
                         LLVMBasicBlockRef cbb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dc.cond");
                         LLVMBasicBlockRef bbb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dc.body");
@@ -8312,7 +8325,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
                         LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->call.args.items[0], locals));
                         /* linear search for key */
-                        LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "di");
+                        LLVMValueRef idx_a = emit_entry_alloca(g, i64, "di");
                         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
                         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dr.cond");
                         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dr.body");
@@ -8339,7 +8352,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         LLVMValueRef rvslot = LLVMBuildGEP2(g->builder, i64, vs, &fi, 1, "rvslot");
                         LLVMValueRef rv = LLVMBuildLoad2(g->builder, i64, rvslot, "rv");
                         emit_collection_release_raw_slot(g, dict_value_type(dict_local->type), rv, i64);
-                        LLVMValueRef j_a = LLVMBuildAlloca(g->builder, i64, "fj");
+                        LLVMValueRef j_a = emit_entry_alloca(g, i64, "fj");
                         LLVMBuildStore(g->builder, fi, j_a);
                         LLVMBasicBlockRef sc_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dr.sc");
                         LLVMBasicBlockRef sb_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dr.sb");
@@ -9334,9 +9347,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             LLVMValueRef vs = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), vp, "vs");
             LLVMValueRef search = coerce_dict_key(g, emit_expr(g, expr->index.index, locals));
             /* loop to find key */
-            LLVMValueRef res = LLVMBuildAlloca(g->builder, i64, "dres");
+            LLVMValueRef res = emit_entry_alloca(g, i64, "dres");
             LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), res);
-            LLVMValueRef idx_a = LLVMBuildAlloca(g->builder, i64, "di");
+            LLVMValueRef idx_a = emit_entry_alloca(g, i64, "di");
             LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
             LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.cond");
             LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "di.body");
@@ -9446,7 +9459,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         snprintf(qbuf, sizeof(qbuf), "__q%d", query_counter++);
         char *qn = zan_arena_strdup(g->arena, qbuf, strlen(qbuf));
         zan_istr_t qname = {qn, (int)strlen(qn)};
-        LLVMValueRef list_alloc = LLVMBuildAlloca(g->builder, LLVMTypeOf(list_val), "q");
+        LLVMValueRef list_alloc = emit_entry_alloca(g, LLVMTypeOf(list_val), "q");
         LLVMBuildStore(g->builder, list_val, list_alloc);
         local_add(locals, qname, list_alloc,
                   zan_binder_make_list_type(g->binder, sel));
@@ -9461,9 +9474,9 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             col, 2, "qdatap");
         LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
             data_ptr, "qdata");
-        LLVMValueRef idx_alloc = LLVMBuildAlloca(g->builder, i64, "qi");
+        LLVMValueRef idx_alloc = emit_entry_alloca(g, i64, "qi");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
-        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, elem_llvm, "qv");
+        LLVMValueRef iter_alloc = emit_entry_alloca(g, elem_llvm, "qv");
         local_add(locals, expr->query.var, iter_alloc, elem);
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "q.cond");
@@ -9711,7 +9724,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         alloca = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(st, 0), "objp");
                     } else {
                         /* value type: stack-allocate as before */
-                        alloca = LLVMBuildAlloca(g->builder, st, "new");
+                        alloca = emit_entry_alloca(g, st, "new");
                     }
                     LLVMBuildStore(g->builder, LLVMConstNull(st), alloca);
 
@@ -10631,7 +10644,7 @@ static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
     if (arg->ref_arg.decl_type && tgt && tgt->kind == AST_IDENTIFIER) {
         zan_type_t *dt = zan_binder_resolve_type(g->binder, arg->ref_arg.decl_type);
         LLVMTypeRef lt = map_type(g, dt);
-        LLVMValueRef a = LLVMBuildAlloca(g->builder, lt, "out");
+        LLVMValueRef a = emit_entry_alloca(g, lt, "out");
         LLVMBuildStore(g->builder, LLVMConstNull(lt), a);
         local_add(locals, tgt->ident.name, a, dt);
         return a;
@@ -11496,7 +11509,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (init->kind == AST_NEW_EXPR && init->new_expr.is_array) {
                 LLVMValueRef arr_val = emit_expr(g, init, locals);
                 LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ptr_type, "arr");
+                LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "arr");
                 LLVMBuildStore(g->builder, arr_val, alloca);
 
                 zan_type_t *elem_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
@@ -11519,7 +11532,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 if (tname.len == 4 && memcmp(tname.str, "List", 4) == 0) {
                     LLVMValueRef list_val = emit_expr(g, init, locals);
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                    LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ptr_type, "list");
+                    LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "list");
                     LLVMBuildStore(g->builder, list_val, alloca);
                     zan_type_t *list_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, list_type);
@@ -11532,7 +11545,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 if (tname.len == 13 && memcmp(tname.str, "StringBuilder", 13) == 0) {
                     LLVMValueRef sb_val = emit_expr(g, init, locals);
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                    LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ptr_type, "sb");
+                    LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "sb");
                     LLVMBuildStore(g->builder, sb_val, alloca);
                     zan_type_t *sb_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, sb_type);
@@ -11546,7 +11559,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     (tname.len == 10 && memcmp(tname.str, "Dictionary", 10) == 0)) {
                     LLVMValueRef dict_val = emit_expr(g, init, locals);
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                    LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ptr_type, "dict");
+                    LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "dict");
                     LLVMBuildStore(g->builder, dict_val, alloca);
                     zan_type_t *dict_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, dict_type);
@@ -11568,7 +11581,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         type = sym->type;
                         LLVMTypeRef st = get_struct_llvm_type(g, sym);
                         if (st) {
-                            LLVMValueRef alloca = LLVMBuildAlloca(g->builder, st, "var");
+                            LLVMValueRef alloca = emit_entry_alloca(g, st, "var");
                             LLVMBuildStore(g->builder, LLVMConstNull(st), alloca);
 
                             /* try calling constructor */
@@ -11626,7 +11639,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             /* regular type inference from initializer */
             LLVMValueRef init_val = emit_expr(g, init, locals);
             LLVMTypeRef init_type = LLVMTypeOf(init_val);
-            LLVMValueRef alloca = LLVMBuildAlloca(g->builder, init_type, "var");
+            LLVMValueRef alloca = emit_entry_alloca(g, init_type, "var");
             LLVMBuildStore(g->builder, init_val, alloca);
             if (LLVMGetTypeKind(init_type) == LLVMDoubleTypeKind) {
                 type = g->binder->type_double;
@@ -11657,7 +11670,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMTypeRef llvm_type = map_type(g, type);
         LLVMValueRef alloca = (type && type->kind == TYPE_STRING)
             ? emit_entry_alloca(g, llvm_type, "var")
-            : LLVMBuildAlloca(g->builder, llvm_type, "var");
+            : emit_entry_alloca(g, llvm_type, "var");
 
         /* ARC: a class-typed local holds an owning heap reference. Track every
          * rc-managed local, including those declared inside loop/if/block
@@ -12140,7 +12153,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_ast_node_t *cc = stmt->try_stmt.catches.items[0];
             if (cc->catch_clause.var_name.len > 0) {
                 LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc");
-                LLVMValueRef ea = LLVMBuildAlloca(g->builder, i8ptr, "exc.var");
+                LLVMValueRef ea = emit_entry_alloca(g, i8ptr, "exc.var");
                 LLVMBuildStore(g->builder, ev, ea);
                 zan_type_t *et = cc->catch_clause.type
                     ? zan_binder_resolve_type(g->binder, cc->catch_clause.type)
@@ -12221,11 +12234,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             data_ptr, "data");
 
         /* index variable */
-        LLVMValueRef idx_alloc = LLVMBuildAlloca(g->builder, i64, "fi");
+        LLVMValueRef idx_alloc = emit_entry_alloca(g, i64, "fi");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_alloc);
 
         /* iteration variable */
-        LLVMValueRef iter_alloc = LLVMBuildAlloca(g->builder, elem_llvm, "fv");
+        LLVMValueRef iter_alloc = emit_entry_alloca(g, elem_llvm, "fv");
         local_add(locals, stmt->foreach_stmt.var_name, iter_alloc, elem_type);
 
         LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fe.cond");

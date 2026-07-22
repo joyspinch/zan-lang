@@ -77,3 +77,7 @@ merge sort's merge step. Both crash at `-O0` and are fine at `-O2`.
 At `-O0`, emit the indexed-store address computation without a per-iteration
 `alloca` (reuse a fixed stack slot / compute into a register), matching how the
 constant- and loop-counter-indexed cases are already handled.
+
+## Status
+
+Fixed. Locals declared in loop bodies (and codegen helper temporaries) are now allocated once in the function entry block (emit_entry_alloca) instead of a fresh alloca at the current insertion point, so the stack no longer grows per iteration at -O0. Regression test: tests/conformance/list_index_write_o0.zan.
