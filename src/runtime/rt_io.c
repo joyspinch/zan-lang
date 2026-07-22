@@ -1124,7 +1124,89 @@ typedef struct zan_co_worker_queue {
     zan_co_node      *tail;
     void             *active[64];
     int               active_count;
+    /* Open-addressed set of frames currently queued, so the duplicate check
+     * in zan_co_ready is O(1) instead of walking the whole list (which made
+     * enqueue O(n^2) under load). Tombstones mark removed slots. */
+    void            **qset;
+    size_t            qset_cap;   /* power of two */
+    size_t            qset_len;   /* live entries */
+    size_t            qset_tombs;
+    zan_co_node      *free_nodes; /* recycled list nodes */
 } zan_co_worker_queue;
+
+#define ZAN_QSET_TOMB ((void *)(uintptr_t)1)
+
+static size_t qset_hash(void *f) {
+    return (size_t)((((uintptr_t)f) >> 4) * (uintptr_t)2654435761u);
+}
+
+static void qset_rehash(zan_co_worker_queue *q, size_t ncap) {
+    void **ns = (void **)calloc(ncap, sizeof(void *));
+    if (!ns) abort();
+    for (size_t i = 0; i < q->qset_cap; i++) {
+        void *f = q->qset[i];
+        if (f && f != ZAN_QSET_TOMB) {
+            size_t j = qset_hash(f) & (ncap - 1);
+            while (ns[j]) j = (j + 1) & (ncap - 1);
+            ns[j] = f;
+        }
+    }
+    free(q->qset);
+    q->qset = ns;
+    q->qset_cap = ncap;
+    q->qset_tombs = 0;
+}
+
+/* Insert frame; returns 0 when it was already present. Caller holds q->lock. */
+static int qset_add(zan_co_worker_queue *q, void *f) {
+    if (q->qset_cap == 0) qset_rehash(q, 64);
+    else if ((q->qset_len + q->qset_tombs + 1) * 4 >= q->qset_cap * 3)
+        qset_rehash(q, q->qset_len * 4 >= q->qset_cap ? q->qset_cap * 2
+                                                      : q->qset_cap);
+    size_t mask = q->qset_cap - 1;
+    size_t j = qset_hash(f) & mask;
+    size_t tomb = (size_t)-1;
+    while (q->qset[j]) {
+        if (q->qset[j] == f) return 0;
+        if (q->qset[j] == ZAN_QSET_TOMB && tomb == (size_t)-1) tomb = j;
+        j = (j + 1) & mask;
+    }
+    if (tomb != (size_t)-1) { j = tomb; q->qset_tombs--; }
+    q->qset[j] = f;
+    q->qset_len++;
+    return 1;
+}
+
+static void qset_remove(zan_co_worker_queue *q, void *f) {
+    if (q->qset_cap == 0) return;
+    size_t mask = q->qset_cap - 1;
+    size_t j = qset_hash(f) & mask;
+    while (q->qset[j]) {
+        if (q->qset[j] == f) {
+            q->qset[j] = ZAN_QSET_TOMB;
+            q->qset_len--;
+            q->qset_tombs++;
+            return;
+        }
+        j = (j + 1) & mask;
+    }
+}
+
+/* Append a ready frame if it is not already queued. Caller holds q->lock. */
+static int co_enqueue_locked(zan_co_worker_queue *q, void *frame,
+                             zan_co_step_t step) {
+    if (!qset_add(q, frame)) return 0;
+    zan_co_node *n = q->free_nodes;
+    if (n) q->free_nodes = n->next;
+    else {
+        n = (zan_co_node *)malloc(sizeof(*n));
+        if (!n) abort();
+    }
+    n->next = NULL; n->frame = frame; n->step = step;
+    if (q->tail) q->tail->next = n; else q->head = n;
+    q->tail = n;
+    return 1;
+}
 
 static CRITICAL_SECTION g_co_lock;
 static volatile LONG    g_co_running;   /* workers currently inside a step() */
@@ -1176,25 +1258,21 @@ void zan_co_sched_init(void) {
         g_co_queues[i].head = NULL;
         g_co_queues[i].tail = NULL;
         g_co_queues[i].active_count = 0;
+        g_co_queues[i].qset_len = 0;
+        g_co_queues[i].qset_tombs = 0;
+        if (g_co_queues[i].qset)
+            memset(g_co_queues[i].qset, 0,
+                   g_co_queues[i].qset_cap * sizeof(void *));
     }
 }
 
 void zan_co_ready(void *frame, zan_co_step_t step) {
     if (!step) return;
-    zan_co_node *n = (zan_co_node *)malloc(sizeof(*n));
-    n->next = NULL; n->frame = frame; n->step = step;
     zan_co_worker_queue *q = &g_co_queues[co_queue_index(frame)];
     EnterCriticalSection(&q->lock);
-    for (zan_co_node *queued = q->head; queued; queued = queued->next) {
-        if (queued->frame == frame) {
-            LeaveCriticalSection(&q->lock);
-            free(n);
-            return;
-        }
-    }
-    if (q->tail) q->tail->next = n; else q->head = n;
-    q->tail = n;
+    int added = co_enqueue_locked(q, frame, step);
     LeaveCriticalSection(&q->lock);
+    if (!added) return;
     /* Only nudge the port when a worker is actually blocked waiting for work.
      * While every worker is busy (g_co_idle == 0) the frame will be picked up
      * by a worker's own run-loop iteration, so posting a completion packet per
@@ -1242,7 +1320,9 @@ static int co_pop(int worker, void **frame, zan_co_step_t *step) {
             if (q->tail == n) q->tail = prev;
             *frame = n->frame;
             *step = n->step;
-            free(n);
+            qset_remove(q, n->frame);
+            n->next = q->free_nodes;
+            q->free_nodes = n;
             q->active[q->active_count++] = *frame;
             InterlockedIncrement(&g_co_running);
             LeaveCriticalSection(&q->lock);
@@ -1298,12 +1378,9 @@ static long long co_pump_timers(void) {
         zan_co_timer *t = *pp;
         if (t->due_ms <= now) {
             *pp = t->next;
-            zan_co_node *n = (zan_co_node *)malloc(sizeof(*n));
-            n->next = NULL; n->frame = t->frame; n->step = t->step;
             zan_co_worker_queue *q = &g_co_queues[co_queue_index(t->frame)];
             EnterCriticalSection(&q->lock);
-            if (q->tail) q->tail->next = n; else q->head = n;
-            q->tail = n;
+            co_enqueue_locked(q, t->frame, t->step);
             LeaveCriticalSection(&q->lock);
             free(t);
         } else {
