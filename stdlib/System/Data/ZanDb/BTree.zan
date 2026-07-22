@@ -28,6 +28,82 @@ class BNode {
 }
 
 /// <summary>
+/// Fixed-capacity cache of decoded nodes keyed by page id, so hot lookups
+/// skip re-decoding a page into keys/values on every visit. Write-through:
+/// BTree.WriteNode stores the (already mutated) node here, so an entry is
+/// always in sync with its encoded page. Cleared wholesale when full.
+/// </summary>
+class NodeCache {
+    int slots;          // power of two
+    int capacity;
+    int count;
+    List<int> ids;      // pageId + 1; 0 = empty
+    List<BNode> nodes;
+
+    NodeCache(int cap) {
+        this.capacity = cap;
+        int s = 16;
+        while (s < cap * 2) { s = s * 2; }
+        this.slots = s;
+        this.count = 0;
+        this.ids = new List<int>();
+        this.nodes = new List<BNode>();
+        int i = 0;
+        while (i < s) {
+            this.ids.Add(0);
+            this.nodes.Add(BNode.Leaf());
+            i = i + 1;
+        }
+    }
+
+    static NodeCache Create(int cap) { return new NodeCache(cap); }
+
+    int FindSlot(int pageId) {
+        int mask = this.slots - 1;
+        int h = (pageId * 2654435761) & mask;
+        if (h < 0) { h = -h & mask; }
+        while (true) {
+            int k = this.ids[h];
+            if (k == 0) { return -(h + 1); }        // free slot, encoded
+            if (k == pageId + 1) { return h; }
+            h = (h + 1) & mask;
+        }
+        return 0;
+    }
+
+    /// <summary>Cached node or null.</summary>
+    BNode Get(int pageId) {
+        int s = FindSlot(pageId);
+        if (s < 0) { return null; }
+        return this.nodes[s];
+    }
+
+    void Put(int pageId, BNode n) {
+        int s = FindSlot(pageId);
+        if (s >= 0) {
+            this.nodes[s] = n;
+            return;
+        }
+        if (this.count >= this.capacity) { Clear(); s = FindSlot(pageId); }
+        int slot = -s - 1;
+        this.ids[slot] = pageId + 1;
+        this.nodes[slot] = n;
+        this.count = this.count + 1;
+    }
+
+    void Clear() {
+        int i = 0;
+        BNode empty = BNode.Leaf();
+        while (i < this.slots) {
+            this.ids[i] = 0;
+            this.nodes[i] = empty;
+            i = i + 1;
+        }
+        this.count = 0;
+    }
+}
+
+/// <summary>
 /// Disk B+Tree over a <see cref="Pager"/>: sorted string keys, string values,
 /// leaf-linked range scans. Page 1 is the tree meta page (root id); data
 /// nodes live in pager-allocated pages. All mutations go through the pager's
@@ -44,6 +120,7 @@ class BTree {
     Pager pager;
     int rootId;
     string lastError;
+    NodeCache nodeCache;
 
     BTree() {
         this.rootId = 0;
@@ -55,6 +132,7 @@ class BTree {
     static BTree Open(Pager pager) {
         BTree t = new BTree();
         t.pager = pager;
+        t.nodeCache = NodeCache.Create(256);
         if (pager.PageCount() <= BTree.META_PAGE) {
             int meta = pager.AllocPage();           // page 1
             int root = pager.AllocPage();           // page 2
@@ -119,6 +197,8 @@ class BTree {
     // ===== Node encode/decode =====
 
     BNode ReadNode(int pageId) {
+        BNode cached = this.nodeCache.Get(pageId);
+        if (cached != null) { return cached; }
         ByteBuffer pg = this.pager.GetPage(pageId);
         pg.SeekRead(0);
         int type = pg.ReadU8();
@@ -132,6 +212,7 @@ class BTree {
                 n.vals.Add(pg.ReadString());
                 i = i + 1;
             }
+            this.nodeCache.Put(pageId, n);
             return n;
         }
         BNode m = BNode.Internal();
@@ -142,6 +223,7 @@ class BTree {
             m.children.Add(pg.ReadU64());
             j = j + 1;
         }
+        this.nodeCache.Put(pageId, m);
         return m;
     }
 
@@ -191,29 +273,39 @@ class BTree {
         }
         pg.SetLength(4096);
         this.pager.MarkDirty(pageId);
+        this.nodeCache.Put(pageId, n);
     }
 
     // ===== Search =====
 
-    /// <summary>Index of the child to descend into for key.</summary>
+    /// <summary>Index of the child to descend into for key: binary search
+    /// for the first separator strictly greater than key.</summary>
     static int ChildIndex(BNode n, string key) {
-        int i = 0;
-        while (i < n.keys.Count && BTree.Compare(key, n.keys[i]) >= 0) {
-            i = i + 1;
+        int lo = 0;
+        int hi = n.keys.Count;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (BTree.Compare(key, n.keys[mid]) >= 0) { lo = mid + 1; } else { hi = mid; }
         }
-        return i;
+        return lo;
+    }
+
+    /// <summary>Binary search for the first index whose key is >= key
+    /// (n.keys.Count when all keys are smaller).</summary>
+    static int LowerBound(BNode n, string key) {
+        int lo = 0;
+        int hi = n.keys.Count;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (BTree.Compare(n.keys[mid], key) < 0) { lo = mid + 1; } else { hi = mid; }
+        }
+        return lo;
     }
 
     /// <summary>Position of key in a leaf, or -1.</summary>
     static int LeafFind(BNode n, string key) {
-        int lo = 0;
-        int hi = n.keys.Count - 1;
-        while (lo <= hi) {
-            int mid = (lo + hi) / 2;
-            int c = BTree.Compare(n.keys[mid], key);
-            if (c == 0) { return mid; }
-            if (c < 0) { lo = mid + 1; } else { hi = mid - 1; }
-        }
+        int lb = BTree.LowerBound(n, key);
+        if (lb < n.keys.Count && BTree.Compare(n.keys[lb], key) == 0) { return lb; }
         return -1;
     }
 
@@ -254,14 +346,10 @@ class BTree {
             n = ReadNode(pid);
         }
 
-        int pos = BTree.LeafFind(n, key);
-        if (pos >= 0) {
-            n.vals[pos] = val;
+        int ins = BTree.LowerBound(n, key);
+        if (ins < n.keys.Count && BTree.Compare(n.keys[ins], key) == 0) {
+            n.vals[ins] = val;
         } else {
-            int ins = 0;
-            while (ins < n.keys.Count && BTree.Compare(n.keys[ins], key) < 0) {
-                ins = ins + 1;
-            }
             BTree.InsStr(n.keys, ins, key);
             BTree.InsStr(n.vals, ins, val);
         }
@@ -377,22 +465,21 @@ class BTree {
             n = ReadNode(pid);
         }
         int found = 0;
+        int i = BTree.LowerBound(n, startKey);
         while (true) {
-            int i = 0;
             while (i < n.keys.Count) {
-                if (BTree.Compare(n.keys[i], startKey) >= 0) {
-                    if (endKey.Length > 0 && BTree.Compare(n.keys[i], endKey) > 0) {
-                        return found;
-                    }
-                    outKeys.Add(n.keys[i]);
-                    outVals.Add(n.vals[i]);
-                    found = found + 1;
-                    if (limit > 0 && found >= limit) { return found; }
+                if (endKey.Length > 0 && BTree.Compare(n.keys[i], endKey) > 0) {
+                    return found;
                 }
+                outKeys.Add(n.keys[i]);
+                outVals.Add(n.vals[i]);
+                found = found + 1;
+                if (limit > 0 && found >= limit) { return found; }
                 i = i + 1;
             }
             if (n.next == 0) { return found; }
             n = ReadNode(n.next);
+            i = 0;
         }
         return found;
     }
