@@ -50,6 +50,52 @@ class PivotConfig {
     }
 }
 
+/// One aggregation accumulator (sum / count / max / min) for a single pivot
+/// cell or total. Replaces the old sum/cnt/mx/mn parallel-list convention.
+class PivotAgg {
+    int sum;
+    int cnt;
+    int mx;
+    int mn;
+
+    PivotAgg() {
+        sum = 0;
+        cnt = 0;
+        mx = 0;
+        mn = 0;
+    }
+
+    void Add(int v) {
+        if (cnt == 0) {
+            mx = v;
+            mn = v;
+        } else {
+            if (v > mx) { mx = v; }
+            if (v < mn) { mn = v; }
+        }
+        sum = sum + v;
+        cnt = cnt + 1;
+    }
+
+    int Value(int aggType) {
+        return PivotTable.AggValue(sum, cnt, mx, mn, aggType);
+    }
+}
+
+/// One resolved measure: which column to read, how to aggregate it, and its
+/// display title. Replaces the old field/agg/title parallel lists.
+class PivotMeasure {
+    int field;
+    int agg;
+    string title;
+
+    PivotMeasure(int f, int a, string tt) {
+        field = f;
+        agg = a;
+        title = tt;
+    }
+}
+
 /// A cross-tab / pivot table. Groups raw DataRows by two fields and aggregates
 /// one or more numeric measures at each row x column intersection, with row
 /// totals, column totals and a grand total. Aggregation runs each frame (the
@@ -123,102 +169,47 @@ class PivotTable {
 
         // Resolve the measure list: explicit AddValue measures, else the single
         // inline value field. M >= 1 always.
-        List<int> vf = new List<int>();
-        List<int> va = new List<int>();
-        List<string> vt = new List<string>();
+        List<PivotMeasure> measures = new List<PivotMeasure>();
         if (cfg.valueFields.Count > 0) {
-            int m0 = 0;
-            while (m0 < cfg.valueFields.Count) {
-                vf.Add(cfg.valueFields[m0]);
-                va.Add(cfg.aggTypes[m0]);
-                vt.Add(cfg.valueTitles[m0]);
-                m0 = m0 + 1;
+            for (int m0 = 0; m0 < cfg.valueFields.Count; m0 = m0 + 1) {
+                measures.Add(new PivotMeasure(cfg.valueFields[m0], cfg.aggTypes[m0], cfg.valueTitles[m0]));
             }
         } else {
-            vf.Add(cfg.valueField);
-            va.Add(cfg.aggType);
-            vt.Add(cfg.valueTitle);
+            measures.Add(new PivotMeasure(cfg.valueField, cfg.aggType, cfg.valueTitle));
         }
-        int M = vf.Count;
+        int M = measures.Count;
 
         List<string> rowKeys = PivotTable.SortedDistinct(rows, cfg.rowField);
         List<string> colKeys = PivotTable.SortedDistinct(rows, cfg.colField);
         int R = rowKeys.Count;
         int C = colKeys.Count;
 
-        // Per-cell accumulators, flat over (r, c, measure).
+        // Per-cell accumulators, flat over (r, c, measure); one PivotAgg each.
         int cells = R * C * M;
-        List<int> sum = new List<int>();
-        List<int> cnt = new List<int>();
-        List<int> mx = new List<int>();
-        List<int> mn = new List<int>();
-        int k = 0;
-        while (k < cells) { sum.Add(0); cnt.Add(0); mx.Add(0); mn.Add(0); k = k + 1; }
+        List<PivotAgg> cell = new List<PivotAgg>();
+        for (int k = 0; k < cells; k = k + 1) { cell.Add(new PivotAgg()); }
 
         // Per-row / per-column / grand accumulators, each over (axis, measure).
-        List<int> rSum = new List<int>();
-        List<int> rCnt = new List<int>();
-        List<int> rMx = new List<int>();
-        List<int> rMn = new List<int>();
-        int ir = 0;
-        while (ir < R * M) { rSum.Add(0); rCnt.Add(0); rMx.Add(0); rMn.Add(0); ir = ir + 1; }
-        List<int> cSum = new List<int>();
-        List<int> cCnt = new List<int>();
-        List<int> cMx = new List<int>();
-        List<int> cMn = new List<int>();
-        int ic = 0;
-        while (ic < C * M) { cSum.Add(0); cCnt.Add(0); cMx.Add(0); cMn.Add(0); ic = ic + 1; }
-        List<int> gSum = new List<int>();
-        List<int> gCnt = new List<int>();
-        List<int> gMx = new List<int>();
-        List<int> gMn = new List<int>();
-        int ig = 0;
-        while (ig < M) { gSum.Add(0); gCnt.Add(0); gMx.Add(0); gMn.Add(0); ig = ig + 1; }
+        List<PivotAgg> rowAgg = new List<PivotAgg>();
+        for (int ir = 0; ir < R * M; ir = ir + 1) { rowAgg.Add(new PivotAgg()); }
+        List<PivotAgg> colAgg = new List<PivotAgg>();
+        for (int ic = 0; ic < C * M; ic = ic + 1) { colAgg.Add(new PivotAgg()); }
+        List<PivotAgg> grand = new List<PivotAgg>();
+        for (int ig = 0; ig < M; ig = ig + 1) { grand.Add(new PivotAgg()); }
 
-        int ri2 = 0;
-        while (ri2 < rows.Count) {
+        for (int ri2 = 0; ri2 < rows.Count; ri2 = ri2 + 1) {
             DataRow row = rows[ri2];
             int ridx = rowKeys.IndexOf(row.At(cfg.rowField));
             int cidx = colKeys.IndexOf(row.At(cfg.colField));
             if (ridx >= 0 && cidx >= 0) {
-                int m = 0;
-                while (m < M) {
-                    int v = DataTable.ParseInt(row.At(vf[m]));
-                    int idx = (ridx * C + cidx) * M + m;
-                    if (cnt[idx] == 0) { mx[idx] = v; mn[idx] = v; } else {
-                        if (v > mx[idx]) { mx[idx] = v; }
-                        if (v < mn[idx]) { mn[idx] = v; }
-                    }
-                    sum[idx] = sum[idx] + v;
-                    cnt[idx] = cnt[idx] + 1;
-
-                    int rm = ridx * M + m;
-                    if (rCnt[rm] == 0) { rMx[rm] = v; rMn[rm] = v; } else {
-                        if (v > rMx[rm]) { rMx[rm] = v; }
-                        if (v < rMn[rm]) { rMn[rm] = v; }
-                    }
-                    rSum[rm] = rSum[rm] + v;
-                    rCnt[rm] = rCnt[rm] + 1;
-
-                    int cm = cidx * M + m;
-                    if (cCnt[cm] == 0) { cMx[cm] = v; cMn[cm] = v; } else {
-                        if (v > cMx[cm]) { cMx[cm] = v; }
-                        if (v < cMn[cm]) { cMn[cm] = v; }
-                    }
-                    cSum[cm] = cSum[cm] + v;
-                    cCnt[cm] = cCnt[cm] + 1;
-
-                    if (gCnt[m] == 0) { gMx[m] = v; gMn[m] = v; } else {
-                        if (v > gMx[m]) { gMx[m] = v; }
-                        if (v < gMn[m]) { gMn[m] = v; }
-                    }
-                    gSum[m] = gSum[m] + v;
-                    gCnt[m] = gCnt[m] + 1;
-
-                    m = m + 1;
+                for (int m = 0; m < M; m = m + 1) {
+                    int v = DataTable.ParseInt(row.At(measures[m].field));
+                    cell[(ridx * C + cidx) * M + m].Add(v);
+                    rowAgg[ridx * M + m].Add(v);
+                    colAgg[cidx * M + m].Add(v);
+                    grand[m].Add(v);
                 }
             }
-            ri2 = ri2 + 1;
         }
 
         int headerH = t.heightMedium;
@@ -251,7 +242,7 @@ class PivotTable {
         c.FillRect(x, y, rowHeadW, headBand, t.bgSecondary);
         string corner = PivotTable.AggName(cfg.aggType);
         if (M > 1) { corner = Convert.ToString(M) + " measures"; }
-        else if (vt[0].Length > 0) { corner = corner + " of " + vt[0]; }
+        else if (measures[0].title.Length > 0) { corner = corner + " of " + measures[0].title; }
         int cornerY = y + (headBand - Canvas.FontHeight(fsS)) / 2;
         c.DrawText(x + pad, cornerY, corner, t.textSecondary, fsS);
 
@@ -275,7 +266,7 @@ class PivotTable {
                             if (sx + sw > clipRight) { sw = clipRight - sx; }
                             c.FillRect(sx, y + hTop, sw, hBot, t.bgSecondary);
                             if (mj > 0) { c.FillRect(sx, y + hTop, 1, hBot, gridColor); }
-                            string ml = DataTable.Truncate(PivotTable.MeasureLabel(va[mj], vt[mj]), fsS, sw - pad * 2);
+                            string ml = DataTable.Truncate(PivotTable.MeasureLabel(measures[mj].agg, measures[mj].title), fsS, sw - pad * 2);
                             c.DrawTextCentered(sx, y + hTop, sw, hBot, ml, t.textTertiary, fsS);
                         }
                         mj = mj + 1;
@@ -298,7 +289,7 @@ class PivotTable {
                     int sx = cx + subW * mj;
                     c.FillRect(sx, y + hTop, subW, hBot, t.bgTertiary);
                     if (mj > 0) { c.FillRect(sx, y + hTop, 1, hBot, gridColor); }
-                    string ml = DataTable.Truncate(PivotTable.MeasureLabel(va[mj], vt[mj]), fsS, subW - pad * 2);
+                    string ml = DataTable.Truncate(PivotTable.MeasureLabel(measures[mj].agg, measures[mj].title), fsS, subW - pad * 2);
                     c.DrawTextCentered(sx, y + hTop, subW, hBot, ml, t.textTertiary, fsS);
                     mj = mj + 1;
                 }
@@ -328,8 +319,8 @@ class PivotTable {
                                 if (sx + sw > clipRight) { sw = clipRight - sx; }
                                 c.FillRect(sx, by, 1, rowH, gridColor);
                                 int idx = (rii * C + cj2) * M + mj;
-                                if (cnt[idx] > 0) {
-                                    int v = PivotTable.AggValue(sum[idx], cnt[idx], mx[idx], mn[idx], va[mj]);
+                                if (cell[idx].cnt > 0) {
+                                    int v = cell[idx].Value(measures[mj].agg);
                                     PivotTable.DrawNum(c, sx, by, sw, rowH, pad, Convert.ToString(v), t.textPrimary, fs);
                                 } else {
                                     c.DrawTextCentered(sx, by, sw, rowH, "-", t.textTertiary, fs);
@@ -348,7 +339,7 @@ class PivotTable {
                         c.FillRect(sx, by, subW, rowH, t.bgSecondary);
                         c.FillRect(sx, by, 1, rowH, gridColor);
                         int rm = rii * M + mj;
-                        int vtt = PivotTable.AggValue(rSum[rm], rCnt[rm], rMx[rm], rMn[rm], va[mj]);
+                        int vtt = rowAgg[rm].Value(measures[mj].agg);
                         PivotTable.DrawNum(c, sx, by, subW, rowH, pad, Convert.ToString(vtt), t.textPrimary, fs);
                         mj = mj + 1;
                     }
@@ -376,8 +367,8 @@ class PivotTable {
                             if (sx + sw > clipRight) { sw = clipRight - sx; }
                             c.FillRect(sx, by, 1, rowH, gridColor);
                             int cm = cj3 * M + mj;
-                            if (cCnt[cm] > 0) {
-                                int v = PivotTable.AggValue(cSum[cm], cCnt[cm], cMx[cm], cMn[cm], va[mj]);
+                            if (colAgg[cm].cnt > 0) {
+                                int v = colAgg[cm].Value(measures[mj].agg);
                                 PivotTable.DrawNum(c, sx, by, sw, rowH, pad, Convert.ToString(v), t.textPrimary, fs);
                             }
                         }
@@ -392,7 +383,7 @@ class PivotTable {
                 while (mj < M) {
                     int sx = totalColX + subW * mj;
                     c.FillRect(sx, by, 1, rowH, gridColor);
-                    int vg = PivotTable.AggValue(gSum[mj], gCnt[mj], gMx[mj], gMn[mj], va[mj]);
+                    int vg = grand[mj].Value(measures[mj].agg);
                     PivotTable.DrawNum(c, sx, by, subW, rowH, pad, Convert.ToString(vg), t.primary, fs);
                     mj = mj + 1;
                 }
