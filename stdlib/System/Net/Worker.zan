@@ -959,13 +959,24 @@ class Worker {
         // Bytes received but not yet consumed as a complete request; correct
         // framing across partial and pipelined requests (see HttpServer).
         string buffer = "";
+        // When the whole request arrives in one receive (the common case),
+        // `buffer` aliases the connection's shared receive buffer instead of
+        // copying it. The alias is only valid until the next receive, so it is
+        // detached (copied) before any further RecvReuseAsync.
+        bool aliased = false;
 
         while (keepAlive) {
             int headerEnd = HttpServer.FindHeaderEnd(buffer);
             while (headerEnd < 0) {
+                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
                 string chunk = await client.RecvReuseAsync();
                 if (chunk.Length == 0) { keepAlive = false; break; }
-                buffer = buffer + chunk;
+                if (buffer.Length == 0) {
+                    buffer = chunk;
+                    aliased = true;
+                } else {
+                    buffer = buffer + chunk;
+                }
                 headerEnd = HttpServer.FindHeaderEnd(buffer);
             }
             if (!keepAlive) { break; }
@@ -979,6 +990,7 @@ class Worker {
             if (bodyLen < 0) { bodyLen = 0; }
             int need = headerEnd + bodyLen;
             while (buffer.Length < need) {
+                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
                 string chunk = await client.RecvReuseAsync();
                 if (chunk.Length == 0) { keepAlive = false; break; }
                 buffer = buffer + chunk;
@@ -995,6 +1007,7 @@ class Worker {
             } else {
                 buffer = "";
             }
+            aliased = false;
             keepAlive = request.keepAlive;
             BumpStat();
 

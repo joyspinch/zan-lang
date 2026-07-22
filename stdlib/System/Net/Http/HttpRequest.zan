@@ -86,9 +86,12 @@ class HttpRequest {
             req.path = raw.Substring(pathStart, pathEnd - pathStart);
         }
 
-        // Parse headers
+        // Parse headers in place: the well-known fields are matched byte by
+        // byte (case-insensitive) against the buffer, and rawHeaders is one
+        // slice of the whole block -- no per-line or per-name/value allocation.
         int pos = lineEnd + 1;
-        StringBuilder headersSb = new StringBuilder();
+        int headersStart = pos;
+        int headersStop = pos;
         while (pos < len) {
             int hEnd = pos;
             while (hEnd < len && (raw[hEnd] & 255) != 10) {
@@ -101,8 +104,7 @@ class HttpRequest {
                 pos = hEnd + 1;
                 break;
             }
-            headersSb.Append(raw.Substring(pos, lineStop - pos));
-            headersSb.Append("\n");
+            headersStop = lineStop;
 
             // Parse well-known headers
             int colonPos = pos;
@@ -110,26 +112,34 @@ class HttpRequest {
                 colonPos = colonPos + 1;
             }
             if (colonPos < lineStop) {
-                string hName = raw.Substring(pos, colonPos - pos);
                 int vStart = colonPos + 1;
                 // Trim leading space
                 if (vStart < lineStop && (raw[vStart] & 255) == 32) {
                     vStart = vStart + 1;
                 }
-                string hValue = raw.Substring(vStart, lineStop - vStart);
-                if (hName == "Host" || hName == "host") {
-                    req.host = hValue;
-                } else if (hName == "Content-Type" || hName == "content-type") {
-                    req.contentType = hValue;
-                } else if (hName == "Content-Length" || hName == "content-length") {
-                    req.contentLength = Convert.ToInt(hValue);
-                } else if (hName == "Connection" || hName == "connection") {
-                    req.keepAlive = (hValue != "close");
+                if (RegionIs(raw, pos, colonPos, "host")) {
+                    req.host = raw.Substring(vStart, lineStop - vStart);
+                } else if (RegionIs(raw, pos, colonPos, "content-type")) {
+                    req.contentType = raw.Substring(vStart, lineStop - vStart);
+                } else if (RegionIs(raw, pos, colonPos, "content-length")) {
+                    int cl = 0;
+                    int di = vStart;
+                    while (di < lineStop) {
+                        int d = raw[di] & 255;
+                        if (d < 48 || d > 57) { break; }
+                        cl = cl * 10 + (d - 48);
+                        di = di + 1;
+                    }
+                    req.contentLength = cl;
+                } else if (RegionIs(raw, pos, colonPos, "connection")) {
+                    req.keepAlive = !RegionIs(raw, vStart, lineStop, "close");
                 }
             }
             pos = hEnd + 1;
         }
-        req.rawHeaders = headersSb.ToString();
+        if (headersStop > headersStart) {
+            req.rawHeaders = raw.Substring(headersStart, headersStop - headersStart);
+        }
 
         // Body
         if (pos < len) {
@@ -139,29 +149,44 @@ class HttpRequest {
         return req;
     }
 
-    /// <summary>Gets a specific header value by name.</summary>
+    /// <summary>True when raw[pos..stop) equals name, ASCII case-insensitively
+    /// (name must be lowercase). Allocation-free header matching.</summary>
+    static bool RegionIs(string raw, int pos, int stop, string name) {
+        if (stop - pos != name.Length) { return false; }
+        int i = 0;
+        while (pos + i < stop) {
+            int c = raw[pos + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (name[i] & 255)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>Gets a specific header value by name (case-insensitive).</summary>
     string GetHeader(string name) {
-        // Search through rawHeaders
+        // Search through rawHeaders (byte scan; allocates only the returned value)
+        string lname = name.ToLower();
         int pos = 0;
         int len = this.rawHeaders.Length;
         while (pos < len) {
             int lineEnd = pos;
-            while (lineEnd < len && this.rawHeaders.Substring(lineEnd, 1) != "\n") {
+            while (lineEnd < len && (this.rawHeaders[lineEnd] & 255) != 10) {
                 lineEnd = lineEnd + 1;
             }
-            string line = this.rawHeaders.Substring(pos, lineEnd - pos);
-            int colonPos = 0;
-            while (colonPos < line.Length && line.Substring(colonPos, 1) != ":") {
+            int lineStop = lineEnd;
+            if (lineStop > pos && (this.rawHeaders[lineStop - 1] & 255) == 13) { lineStop = lineStop - 1; }
+            int colonPos = pos;
+            while (colonPos < lineStop && (this.rawHeaders[colonPos] & 255) != 58) {
                 colonPos = colonPos + 1;
             }
-            if (colonPos < line.Length) {
-                string hName = line.Substring(0, colonPos);
-                if (hName == name) {
-                    string hValue = line.Substring(colonPos + 1);
-                    if (hValue.Length > 0 && hValue.Substring(0, 1) == " ") {
-                        hValue = hValue.Substring(1);
+            if (colonPos < lineStop) {
+                if (RegionIs(this.rawHeaders, pos, colonPos, lname)) {
+                    int vStart = colonPos + 1;
+                    if (vStart < lineStop && (this.rawHeaders[vStart] & 255) == 32) {
+                        vStart = vStart + 1;
                     }
-                    return hValue;
+                    return this.rawHeaders.Substring(vStart, lineStop - vStart);
                 }
             }
             pos = lineEnd + 1;

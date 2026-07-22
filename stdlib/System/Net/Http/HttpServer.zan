@@ -137,6 +137,11 @@ class HttpServer {
         // pipelined requests at once (the remainder stays buffered for the next
         // iteration instead of leaking into this request's body).
         string buffer = "";
+        // When the whole request arrives in one receive (the common case),
+        // `buffer` aliases the connection's shared receive buffer instead of
+        // copying it. The alias is only valid until the next receive, so it is
+        // detached (copied) before any further RecvReuseAsync.
+        bool aliased = false;
         bool overflow = false;
 
         while (keepAlive) {
@@ -144,38 +149,49 @@ class HttpServer {
             int headerEnd = HttpServer.FindHeaderEnd(buffer);
             while (headerEnd < 0) {
                 if (buffer.Length > this.maxRequestBytes) { overflow = true; break; }
-                string chunk = await client.RecvAsync(65536);
+                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
+                string chunk = await client.RecvReuseAsync();
                 if (chunk.Length == 0) { keepAlive = false; break; }
-                buffer = buffer + chunk;
+                if (buffer.Length == 0) {
+                    buffer = chunk;
+                    aliased = true;
+                } else {
+                    buffer = buffer + chunk;
+                }
                 headerEnd = HttpServer.FindHeaderEnd(buffer);
             }
             if (overflow) { break; }
             if (!keepAlive) { break; }
 
-            // 2) Parse headers to learn the declared body length, then read
-            //    until exactly that many body bytes are present.
-            HttpRequest head = HttpRequest.Parse(buffer);
-            int bodyLen = head.contentLength;
+            // 2) Parse once: the headers are complete here, so every header
+            //    field is final; only the body may still be in flight. Then
+            //    read until exactly the declared body bytes are present.
+            HttpRequest request = HttpRequest.Parse(buffer);
+            int bodyLen = request.contentLength;
             if (bodyLen < 0) { bodyLen = 0; }
             int need = headerEnd + bodyLen;
             if (need > this.maxRequestBytes) { overflow = true; break; }
             while (buffer.Length < need) {
-                string chunk = await client.RecvAsync(65536);
+                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
+                string chunk = await client.RecvReuseAsync();
                 if (chunk.Length == 0) { keepAlive = false; break; }
                 buffer = buffer + chunk;
             }
             if (!keepAlive && buffer.Length < need) { break; }
 
-            // 3) Slice out exactly this request; keep any trailing bytes as the
-            //    start of the next pipelined request.
-            string reqBytes = buffer.Substring(0, need);
+            // 3) Slice out exactly this request's body; keep any trailing bytes
+            //    as the start of the next pipelined request.
+            if (bodyLen > 0) {
+                request.body = buffer.Substring(headerEnd, bodyLen);
+            } else {
+                request.body = "";
+            }
             if (buffer.Length > need) {
                 buffer = buffer.Substring(need);
             } else {
                 buffer = "";
             }
-
-            HttpRequest request = HttpRequest.Parse(reqBytes);
+            aliased = false;
             keepAlive = request.keepAlive;
 
             HttpResponse response = ProcessRequest(request);
