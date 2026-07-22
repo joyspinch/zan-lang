@@ -627,7 +627,15 @@ static void io_register(int fd, int interest, void *co, zan_co_step_t step) {
     b.buf = NULL;
     int r, e;
     if (interest == ZAN_IO_READ) {
+        /* On a datagram socket a zero-byte WSARecv would dequeue and truncate
+         * the pending datagram (payload silently lost). MSG_PEEK keeps the
+         * datagram queued: the op completes (typically WSAEMSGSIZE) when data
+         * is ready and the waiter's real recvfrom then reads it intact. */
         DWORD flags = 0;
+        int sotype = 0, solen = (int)sizeof(sotype);
+        if (getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&sotype, &solen) == 0 &&
+            sotype == SOCK_DGRAM)
+            flags = MSG_PEEK;
         r = WSARecv(s, &b, 1, NULL, &flags, &op->ov, NULL);
     } else {
         r = WSASend(s, &b, 1, NULL, 0, &op->ov, NULL);
@@ -767,9 +775,13 @@ static void io_complete_op(zan_io_op_t *op, DWORD transferred,
                        (const char *)&op->sock, (int)sizeof(op->sock)) == 0) {
             u_long mode = 1;
             ioctlsocket(accepted, FIONBIO, &mode);
-            /* Force-associate the freshly accepted socket once, so its recv
-             * registrations can skip CreateIoCompletionPort (ensure_assoc). */
-            mark_assoc(accepted);
+            /* Do NOT associate the accepted socket with this process's IOCP
+             * here. Association binds the underlying file object to one port
+             * for its whole lifetime, and an accepted socket may be handed to
+             * another process (Worker multi-process handoff via
+             * WSADuplicateSocket) whose own IOCP must receive its completions.
+             * The first overlapped op on the socket associates it via
+             * ensure_assoc in whichever process actually performs IO. */
             result = (int64_t)accepted;
         } else {
             closesocket(accepted);

@@ -49,14 +49,16 @@ delegate void SseSubscriberHandler(SseConnection conn);
 ///                                          the built-in MqttBroker.Global()
 ///
 /// MULTI-PROCESS MODEL (count > 1). The initially launched process becomes the
-/// MASTER: it never serves traffic itself; it spawns `count` worker copies of
-/// this executable, gives every worker an equal share of the listen sockets,
-/// and supervises them (a crashed worker is respawned). Kernel-level accept
-/// load-balancing spreads connections across workers:
-///   - Windows: the master binds each listen address once, then duplicates the
-///     listening socket into every worker over a loopback control connection
-///     (WSADuplicateSocket). All workers post accepts on the same socket and
-///     the kernel distributes completions.
+/// MASTER: it spawns `count` worker copies of this executable and supervises
+/// them (a crashed worker is respawned). Accepted connections are spread
+/// across workers, fully event-driven (no polling anywhere):
+///   - Windows: the master binds and accepts every TCP listener on its own
+///     IOCP, then hands each ACCEPTED socket to a worker round-robin via
+///     WSADuplicateSocket over a dedicated per-listener channel connection.
+///     (AcceptEx on a listener shared across processes loses completions --
+///     a documented WSADuplicateSocket/IOCP limitation -- so workers never
+///     accept themselves.) UDP has no accept; UDP Workers are served in the
+///     master process on Windows.
 ///   - Linux/macOS: each worker binds its own listener with SO_REUSEPORT and
 ///     the kernel hashes new connections across the sockets.
 /// Workers watch the control connection to the master and exit when it dies,
@@ -118,17 +120,28 @@ class Worker {
     static List<int> stPrevCpuMs = new List<int>();
     static List<int> stRss = new List<int>();
 
-    // True when this Worker serves a socket duplicated from the master
-    // process (Windows multi-process mode). AcceptEx completions do not fire
-    // reliably on cross-process duplicated listeners, so accept by polling.
-    bool pollAccept;
-
     [DllImport("crt")]
     static extern string calloc(int count, int size);
     [DllImport("crt")]
     static extern void free(string ptr);
     [DllImport("crt")]
     static extern void exit(int code);
+    static bool debugLog = false;
+    static void Dbg(string msg) {
+        if (!debugLog) { return; }
+        Console.WriteLine("[dbg] " + msg);
+        #if WINDOWS
+        int _f = _flushall();
+        #endif
+    }
+    #if WINDOWS
+    [DllImport("crt")]
+    static extern int _flushall();
+    #endif
+    /// <summary>Enables verbose master/worker handoff tracing.</summary>
+    static void SetDebug(bool on) {
+        debugLog = on;
+    }
 
     #if WINDOWS
     [DllImport("ws2_32", EntryPoint = "WSADuplicateSocketA")]
@@ -154,7 +167,6 @@ class Worker {
         this.onHttpRequest = null;
         this.onUdpMessage = null;
         this.onSseSubscriber = null;
-        this.pollAccept = false;
     }
 
     /// <summary>Creates and registers a Worker for the given protocol
@@ -368,6 +380,14 @@ class Worker {
         #endif
     }
 
+    // ---- master-side handoff channel registry (Windows) ----
+    // One entry per (worker process, TCP listener) channel connection, filled
+    // in by HandleWorkerControl when a worker sends its CHAN handshake.
+    static List<int> chIdx = new List<int>();      // listener index served
+    static List<int> chPid = new List<int>();      // worker process pid
+    static List<TcpClient> chConn = new List<TcpClient>();
+    static int rrCounter = 0;
+
     static async void RunAsMaster(int procs) {
         // Fork-bomb guard: claim the control port exclusively (no SO_REUSEADDR)
         // BEFORE spawning anything. If a child ever mistakes itself for a
@@ -384,9 +404,9 @@ class Worker {
         Socket.Listen(ctlSock, 64);
         Socket.SetNonBlocking(ctlSock);
 
-        // On Windows the master owns every listen socket and hands a duplicate
-        // to each worker; on POSIX workers bind their own SO_REUSEPORT sockets.
-        List<int> masterSocks = new List<int>();
+        // On Windows the master owns every listen socket, accepts on its own
+        // IOCP, and hands each accepted connection to a worker; on POSIX
+        // workers bind their own SO_REUSEPORT sockets.
         #if WINDOWS
         int i = 0;
         while (i < workers.Count) {
@@ -397,7 +417,12 @@ class Worker {
                     + "://" + w.host + ":" + Convert.ToString(w.port));
                 exit(1);
             }
-            masterSocks.Add(s);
+            if (w.protocol == "udp") {
+                // No accept to distribute: serve UDP in the master itself.
+                Task.Spawn(w.RunOnSocket(s));
+            } else {
+                Task.Spawn(MasterAcceptLoop(i, s));
+            }
             i = i + 1;
         }
         #endif
@@ -419,14 +444,82 @@ class Worker {
             int sock = await Socket.AcceptAsync(ctlSock);
             if (sock < 0) { continue; }
             Socket.SetNonBlocking(sock);
-            Task.Spawn(HandleWorkerControl(sock, masterSocks));
+            Task.Spawn(HandleWorkerControl(sock));
         }
     }
 
-    static async void HandleWorkerControl(int sock, List<int> masterSocks) {
+    #if WINDOWS
+    // Master accept loop for listener `idx`: event-driven accept on the
+    // master's IOCP, then hand the accepted socket to the next worker.
+    static async void MasterAcceptLoop(int idx, int sock) {
+        Dbg("accept loop up idx=" + Convert.ToString(idx));
+        while (true) {
+            int c = await Socket.AcceptAsync(sock);
+            Dbg("accepted idx=" + Convert.ToString(idx) + " c=" + Convert.ToString(c));
+            if (c < 0) { continue; }
+            await HandoffClient(idx, c);
+        }
+    }
+
+    // Round-robin pick of a live channel serving listener `idx`; -1 if none.
+    static int PickChannel(int idx) {
+        int n = chIdx.Count;
+        if (n == 0) { return -1; }
+        rrCounter = rrCounter + 1;
+        int k = 0;
+        int start = rrCounter;
+        while (k < n) {
+            int slot = (start + k) % n;
+            if (chIdx[slot] == idx) { return slot; }
+            k = k + 1;
+        }
+        return -1;
+    }
+
+    static void DropChannel(int slot) {
+        chConn[slot].Close();
+        chIdx.RemoveAt(slot);
+        chPid.RemoveAt(slot);
+        chConn.RemoveAt(slot);
+    }
+
+    // Duplicates accepted socket `c` into a worker process and closes the
+    // master's copy once the worker ACKs that it rebuilt the socket.
+    static async void HandoffClient(int idx, int c) {
+        while (true) {
+            int slot = PickChannel(idx);
+            if (slot < 0) {
+                // No worker online (all crashed / still starting): drop.
+                Socket.Close(c);
+                return;
+            }
+            TcpClient ch = chConn[slot];
+            string info = calloc(373, 1);
+            int r = WSADuplicateSocketA(c, chPid[slot], info);
+            Dbg("dup c=" + Convert.ToString(c) + " -> pid=" + Convert.ToString(chPid[slot]) + " r=" + Convert.ToString(r));
+            if (r != 0) {
+                free(info);
+                Socket.Close(c);
+                return;
+            }
+            int n = await Socket.SendAsync(ch.GetSocket(), info, 372);
+            free(info);
+            if (n <= 0) { DropChannel(slot); continue; }
+            string ack = await ch.RecvAsync(1);
+            Dbg("ack len=" + Convert.ToString(ack.Length));
+            if (ack.Length == 0) { DropChannel(slot); continue; }
+            Socket.Close(c);
+            return;
+        }
+    }
+    #endif
+
+    static async void HandleWorkerControl(int sock) {
         TcpClient conn = TcpClient.FromSocket(sock);
 
-        // "HELLO <pid> <wid>\n"
+        // First line is the handshake:
+        //   "HELLO <pid> <wid>\n"        -- control/liveness/STAT connection
+        //   "CHAN <pid> <listenerIdx>\n" -- Windows per-listener handoff channel
         string line = "";
         bool ok = true;
         while (true) {
@@ -438,34 +531,25 @@ class Worker {
         }
         if (!ok || line.Length < 7) { conn.Close(); return; }
 
-        int sp1 = IndexOfByte(line, 32);
-        int sp2 = -1;
-        if (sp1 >= 0) {
-            int k = sp1 + 1;
-            while (k < line.Length) {
-                if ((line[k] & 255) == 32) { sp2 = k; break; }
-                k = k + 1;
-            }
-        }
-        if (sp1 < 0 || sp2 < 0) { conn.Close(); return; }
-        int childPid = Convert.ToInt32(line.Substring(sp1 + 1, sp2 - sp1 - 1));
-        int childWid = Convert.ToInt32(line.Substring(sp2 + 1, line.Length - sp2 - 1));
+        List<string> f = SplitWords(line);
+        if (f.Count < 3) { conn.Close(); return; }
 
         #if WINDOWS
-        // Duplicate every listen socket into the worker, in registration order.
-        int i = 0;
-        while (i < masterSocks.Count) {
-            string info = calloc(372, 1);
-            int r = WSADuplicateSocketA(masterSocks[i], childPid, info);
-            if (r != 0) {
-                Console.WriteLine("[Worker] WSADuplicateSocket failed for worker "
-                    + Convert.ToString(childWid));
-            }
-            int _n = await Socket.SendAsync(sock, info, 372);
-            free(info);
-            i = i + 1;
+        if (f[0] == "CHAN") {
+            // Register the handoff channel; it is written to by HandoffClient
+            // from now on and dropped when a send/ACK fails (worker died).
+            chPid.Add(Convert.ToInt32(f[1]));
+            chIdx.Add(Convert.ToInt32(f[2]));
+            chConn.Add(conn);
+            Dbg("chan registered pid=" + f[1] + " idx=" + f[2] + " total=" + Convert.ToString(chConn.Count));
+            return;
         }
-        #else
+        #endif
+        if (f[0] != "HELLO") { conn.Close(); return; }
+        int childPid = Convert.ToInt32(f[1]);
+        int childWid = Convert.ToInt32(f[2]);
+
+        #if !WINDOWS
         int _n = await Socket.SendStringAsync(sock, "GO\n");
         #endif
 
@@ -510,28 +594,21 @@ class Worker {
             + " " + Convert.ToString(ProcessHost.WorkerId()) + "\n");
 
         #if WINDOWS
-        // Receive one 372-byte WSAPROTOCOL_INFOA block per registered Worker
-        // and rebuild the shared listening/UDP socket from it.
+        // The master owns and accepts every TCP listener; open one handoff
+        // channel per listener and serve the accepted sockets it delivers.
+        // (UDP Workers run in the master on Windows.)
         int i = 0;
         while (i < workers.Count) {
-            string info = calloc(372, 1);
-            bool ok = await RecvExact(ctl, info, 372);
-            if (!ok) {
-                Console.WriteLine("[Worker] listener handoff failed; exiting");
-                exit(1);
+            if (workers[i].protocol != "udp") {
+                TcpClient ch = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
+                if (!ch.IsConnected()) {
+                    Console.WriteLine("[Worker] channel connect failed; exiting");
+                    exit(1);
+                }
+                int _c = await ch.SendAsync("CHAN " + Convert.ToString(ProcessHost.Pid())
+                    + " " + Convert.ToString(i) + "\n");
+                Task.Spawn(ChannelLoop(ch, workers[i]));
             }
-            int dup = WSASocketA(-1, -1, -1, info, 0, 1);
-            free(info);
-            if (dup < 0) {
-                Console.WriteLine("[Worker] WSASocket(FROM_PROTOCOL_INFO) failed; exiting");
-                exit(1);
-            }
-            Socket.SetNonBlocking(dup);
-            Console.WriteLine("[Worker] worker " + Convert.ToString(ProcessHost.WorkerId())
-                + " serving " + workers[i].protocol + ":" + Convert.ToString(workers[i].port)
-                + " on shared socket");
-            workers[i].pollAccept = true;
-            Task.Spawn(workers[i].RunOnSocket(dup));
             i = i + 1;
         }
         #else
@@ -563,6 +640,32 @@ class Worker {
         }
         exit(0);
     }
+
+    #if WINDOWS
+    // Worker side of a handoff channel: each inbound 372-byte
+    // WSAPROTOCOL_INFOA block is one accepted client connection. Rebuild the
+    // socket, ACK so the master can close its copy, and serve it.
+    static async void ChannelLoop(TcpClient ch, Worker w) {
+        Dbg("worker chan loop up " + w.protocol);
+        while (true) {
+            string info = calloc(373, 1);
+            bool ok = await RecvExact(ch, info, 372);
+            if (!ok) {
+                free(info);
+                exit(0);   // master gone
+            }
+            int s = WSASocketA(-1, -1, -1, info, 0, 1);
+            Dbg("worker rebuilt s=" + Convert.ToString(s));
+            free(info);
+            int _a = await ch.SendAsync("K");
+            if (_a <= 0) { exit(0); }
+            if (s >= 0) {
+                Socket.SetNonBlocking(s);
+                w.Dispatch(s);
+            }
+        }
+    }
+    #endif
 
     static async void StatReportLoop(TcpClient ctl) {
         while (true) {
@@ -772,18 +875,6 @@ class Worker {
         await this.RunOnSocket(s);
     }
 
-    // Polling accept for cross-process duplicated listeners: non-blocking
-    // accept(), sleeping 1ms when the backlog is empty. Bursts drain
-    // back-to-back, so the poll interval only affects idle wakeup latency.
-    static async int AcceptPollAsync(int sock) {
-        while (true) {
-            int c = Socket.Accept(sock);
-            if (c >= 0) { return c; }
-            await Task.Delay(1);
-        }
-        return -1;
-    }
-
     /// <summary>Serves this worker's protocol on an already-bound socket.</summary>
     async void RunOnSocket(int sock) {
         this.running = true;
@@ -794,33 +885,32 @@ class Worker {
         }
 
         while (this.running) {
-            int clientSock = -1;
-            if (this.pollAccept) {
-                clientSock = await AcceptPollAsync(sock);
-            } else {
-                clientSock = await Socket.AcceptAsync(sock);
-            }
+            int clientSock = await Socket.AcceptAsync(sock);
             if (clientSock >= 0) {
                 Socket.SetNonBlocking(clientSock);
-                if (this.connectionCount >= this.maxConnections) {
-                    Socket.Close(clientSock);
-                    continue;
-                }
-                this.connectionCount = this.connectionCount + 1;
-                // Handle each connection on its own coroutine so the accept
-                // loop keeps accepting instead of serving one client at a time.
-                if (this.protocol == "http") {
-                    Task.Spawn(HandleHttp(clientSock));
-                } else if (this.protocol == "websocket" || this.protocol == "ws") {
-                    Task.Spawn(HandleWebSocket(clientSock));
-                } else if (this.protocol == "sse") {
-                    Task.Spawn(HandleSse(clientSock));
-                } else if (this.protocol == "mqtt") {
-                    Task.Spawn(HandleMqtt(clientSock));
-                } else {
-                    Task.Spawn(HandleTcp(clientSock));
-                }
+                this.Dispatch(clientSock);
             }
+        }
+    }
+
+    // Starts serving one accepted client on its own coroutine, so the caller
+    // (accept loop or handoff channel) immediately moves to the next one.
+    void Dispatch(int clientSock) {
+        if (this.connectionCount >= this.maxConnections) {
+            Socket.Close(clientSock);
+            return;
+        }
+        this.connectionCount = this.connectionCount + 1;
+        if (this.protocol == "http") {
+            Task.Spawn(HandleHttp(clientSock));
+        } else if (this.protocol == "websocket" || this.protocol == "ws") {
+            Task.Spawn(HandleWebSocket(clientSock));
+        } else if (this.protocol == "sse") {
+            Task.Spawn(HandleSse(clientSock));
+        } else if (this.protocol == "mqtt") {
+            Task.Spawn(HandleMqtt(clientSock));
+        } else {
+            Task.Spawn(HandleTcp(clientSock));
         }
     }
 
@@ -880,8 +970,12 @@ class Worker {
             }
             if (!keepAlive) { break; }
 
-            HttpRequest head = HttpRequest.Parse(buffer);
-            int bodyLen = head.contentLength;
+            // Parse once: the headers are complete here, so every header
+            // field is final; only the body may still be in flight. (The old
+            // code re-parsed the request a second time after buffering the
+            // body -- double work on the hot path.)
+            HttpRequest request = HttpRequest.Parse(buffer);
+            int bodyLen = request.contentLength;
             if (bodyLen < 0) { bodyLen = 0; }
             int need = headerEnd + bodyLen;
             while (buffer.Length < need) {
@@ -891,14 +985,16 @@ class Worker {
             }
             if (!keepAlive && buffer.Length < need) { break; }
 
-            string reqBytes = buffer.Substring(0, need);
+            if (bodyLen > 0) {
+                request.body = buffer.Substring(headerEnd, bodyLen);
+            } else {
+                request.body = "";
+            }
             if (buffer.Length > need) {
                 buffer = buffer.Substring(need);
             } else {
                 buffer = "";
             }
-
-            HttpRequest request = HttpRequest.Parse(reqBytes);
             keepAlive = request.keepAlive;
             BumpStat();
 
@@ -1029,11 +1125,7 @@ class Worker {
         } else {
             sse.Close();
         }
-        // The application owns the SseConnection from here; connection count is
-        // released when it closes (tracked via the poll below).
-        while (sse.IsOpen()) {
-            await Task.Delay(500);
-        }
+        // The application owns the SseConnection from here.
         this.connectionCount = this.connectionCount - 1;
     }
 
