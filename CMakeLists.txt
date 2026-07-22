@@ -1,4 +1,4 @@
-ï»¿cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.16)
 # CXX is enabled so that targets linking LLVM's C++ static libraries can be
 # driven by the C++ linker where needed (see the MinGW case below).
 project(zan-lang C CXX)
@@ -28,8 +28,8 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 # Cross-compile backends beyond x86/aarch64 are optional: not every LLVM
-# distribution builds them (e.g. mozbuild clang omits RISCV). Link â€” and
-# initialize, via HAVE_LLVM_* defines â€” only the ones this LLVM provides.
+# distribution builds them (e.g. mozbuild clang omits RISCV). Link ¡ª and
+# initialize, via HAVE_LLVM_* defines ¡ª only the ones this LLVM provides.
 set(ZAN_LLVM_COMPONENTS
     core support analysis bitwriter target
     x86codegen x86asmparser x86desc x86info
@@ -58,6 +58,7 @@ add_executable(zanc
     src/compiler/ast.c
     src/compiler/parser.c
     src/compiler/jsongen.c
+    src/compiler/dbgen.c
     src/compiler/binder.c
     src/compiler/checker.c
     src/compiler/irgen.c

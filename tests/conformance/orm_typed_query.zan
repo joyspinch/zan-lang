@@ -1,0 +1,112 @@
+// Conformance: compile-time typed ORM queries (dbgen pass).
+// db.Query<T>() lowers into a generated query class: lambda Where
+// conditions become parameterized SQL (values are bound, never inlined),
+// OrderBy/Take/Skip compose, Include(p => p.nav) LEFT JOINs the
+// navigation entity by convention (t.<nav>Id = j.id) and materializes it,
+// and rows map back into List<T> by declared field types.
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class User {
+    int id;
+    string name;
+    bool active;
+}
+
+class UserPoint {
+    int id;
+    int userId;
+    int points;
+    double ratio;
+    string tag;
+    User user;
+}
+
+class Program {
+    static void Main() {
+        string path = "orm_typed_query.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE User (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)");
+        db.Execute("CREATE TABLE UserPoint (id INTEGER PRIMARY KEY, userId INTEGER, points INTEGER, ratio REAL, tag TEXT)");
+        db.Execute("INSERT INTO User VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)");
+        db.Execute("INSERT INTO UserPoint VALUES (10, 1, 120, 0.5, 'gold'), (11, 2, 80, 0.25, 'silver'), (12, 3, 200, 0.75, 'gold'), (13, 1, 40, 0.1, 'bronze'), (14, 9, 300, 1.0, 'gold')");
+
+        // 1. full table scan into typed entities
+        List<UserPoint> all = db.Query<UserPoint>().ToList();
+        Console.WriteLine("all: " + Convert.ToString(all.Count));
+
+        // 2. lambda Where: comparison against a local + In + &&, ordered
+        int min = 50;
+        List<int> ids = new List<int>();
+        ids.Add(1);
+        ids.Add(2);
+        ids.Add(3);
+        List<UserPoint> hi = db.Query<UserPoint>()
+            .Where(p => p.points > min && p.userId.In(ids))
+            .OrderByDescending(p => p.points)
+            .ToList();
+        Console.WriteLine("hi: " + Convert.ToString(hi.Count) + " top=" + Convert.ToString(hi[0].points));
+
+        // 3. string operators: Like / Contains / NotIn
+        List<UserPoint> gold = db.Query<UserPoint>().Where(p => p.tag.Like("go%")).ToList();
+        Console.WriteLine("gold: " + Convert.ToString(gold.Count));
+        List<UserPoint> silv = db.Query<UserPoint>().Where(p => p.tag.Contains("ilv")).ToList();
+        Console.WriteLine("silv: " + Convert.ToString(silv.Count));
+        List<string> skiptags = new List<string>();
+        skiptags.Add("gold");
+        List<UserPoint> notg = db.Query<UserPoint>().Where(p => p.tag.NotIn(skiptags)).ToList();
+        Console.WriteLine("notg: " + Convert.ToString(notg.Count));
+
+        // 4. || with a double column, Skip/Take paging
+        List<UserPoint> od = db.Query<UserPoint>()
+            .Where(p => p.ratio >= 0.5 || p.points < 50)
+            .OrderBy(p => p.id)
+            .Skip(1)
+            .Take(2)
+            .ToList();
+        Console.WriteLine("od: " + Convert.ToString(od.Count) + " first=" + Convert.ToString(od[0].id));
+
+        // 5. Include: LEFT JOIN materializes p.user; missing FK stays null
+        List<UserPoint> inc = db.Query<UserPoint>()
+            .Where(p => p.points >= 40)
+            .Include(p => p.user)
+            .OrderBy(p => p.id)
+            .ToList();
+        Console.WriteLine("inc: " + Convert.ToString(inc.Count));
+        Console.WriteLine("nav0: " + inc[0].user.name + " active=" + Convert.ToString(inc[0].user.active));
+        if (inc[4].user == null) { Console.WriteLine("nav-miss: null"); }
+
+        // 6. First / Count terminals + bool column condition
+        UserPoint one = db.Query<UserPoint>().Where(p => p.tag == "silver").First();
+        Console.WriteLine("one: " + Convert.ToString(one.userId));
+        int cnt = db.Query<UserPoint>().Where(p => p.points > 100).Count();
+        Console.WriteLine("cnt: " + Convert.ToString(cnt));
+        int act = db.Query<User>().Where(u => u.active).Count();
+        Console.WriteLine("act: " + Convert.ToString(act));
+
+        // 7. QueryBuilder convenience helpers (parameterized)
+        QueryBuilder qb = QueryBuilder.From("UserPoint")
+            .WhereGtInt("points", 50)
+            .WhereNotLike("tag", "si%");
+        DbResult r = db.Query(qb.BuildSelectParams("id"), qb.SelectParams());
+        Console.WriteLine("qb1: " + Convert.ToString(r.RowCount()));
+        QueryBuilder qb2 = QueryBuilder.From("UserPoint").WhereContains("tag", "old");
+        DbResult r2 = db.Query(qb2.BuildSelectParams("id"), qb2.SelectParams());
+        Console.WriteLine("qb2: " + Convert.ToString(r2.RowCount()));
+        List<string> ex = new List<string>();
+        ex.Add("gold");
+        ex.Add("silver");
+        QueryBuilder qb3 = QueryBuilder.From("UserPoint")
+            .WhereNotIn("tag", ex)
+            .WhereLeInt("points", 40);
+        DbResult r3 = db.Query(qb3.BuildSelectParams("id"), qb3.SelectParams());
+        Console.WriteLine("qb3: " + Convert.ToString(r3.RowCount()));
+
+        db.Close();
+        File.Delete(path);
+    }
+}
