@@ -57,6 +57,7 @@ add_executable(zanc
     src/compiler/lexer.c
     src/compiler/ast.c
     src/compiler/parser.c
+    src/compiler/jsongen.c
     src/compiler/binder.c
     src/compiler/checker.c
     src/compiler/irgen.c

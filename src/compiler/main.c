@@ -8,6 +8,7 @@
 #include "diag.h"
 #include "lexer.h"
 #include "parser.h"
+#include "jsongen.h"
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
@@ -1221,6 +1222,7 @@ int main(int argc, char **argv) {
     if (!zan_diag_has_errors(diag)) {
         zan_parser_merge_partials(ast, arena, diag);
         zan_parser_desugar_events(ast, arena, diag);
+        zan_jsongen_run(ast, arena, diag);
     }
 
     if (do_dump_ast) {
