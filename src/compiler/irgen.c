@@ -8804,6 +8804,38 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
             }
         }
 
+        /* Robustness: a call `obj.Method(...)` on a known class/struct type
+         * where no member of that name exists anywhere in the class or its
+         * base chain. Historically this silently lowered to a constant 0
+         * (e.g. a missing IsOpen() "returned" false), which is very hard to
+         * diagnose. Members that do exist (delegate fields, arity-mismatched
+         * overloads) are left to the later paths / LLVM verification. */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_symbol_t *recv_cls = expr_class_sym(g, callee->member.object, locals);
+            if (recv_cls && (recv_cls->kind == SYM_CLASS || recv_cls->kind == SYM_STRUCT)) {
+                zan_istr_t mn = callee->member.name;
+                int found = 0;
+                zan_symbol_t *cur = recv_cls;
+                while (cur && !found) {
+                    for (int mi = 0; mi < cur->member_count; mi++) {
+                        zan_symbol_t *m = cur->members[mi];
+                        if (m && m->name.len == mn.len &&
+                            memcmp(m->name.str, mn.str, mn.len) == 0) { found = 1; break; }
+                    }
+                    zan_symbol_t *base = (cur->type && cur->type->base_type)
+                        ? cur->type->base_type->sym : NULL;
+                    cur = (base && base != cur) ? base : NULL;
+                }
+                if (!found) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "'%.*s' has no member '%.*s'",
+                        (int)recv_cls->name.len, recv_cls->name.str,
+                        (int)mn.len, mn.str);
+                }
+            }
+        }
+
         /* Robustness: a member-access call `X.Method(...)` where X is neither a
          * local variable nor any known symbol (class / struct / enum / namespace)
          * is an unresolved reference. This most often means the class was never
