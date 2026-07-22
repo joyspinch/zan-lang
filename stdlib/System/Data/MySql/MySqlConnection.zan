@@ -40,6 +40,8 @@ class MySqlConnection {
     int lastSeq;        // sequence id of the most recently read packet
     int lastAffected;   // affected rows / row count of the last statement
     bool hadError;      // whether the last statement returned an ERR packet
+    List<string> stmtSqls;  // prepared-statement cache: SQL text ...
+    List<int> stmtIds;      // ... and matching server-side statement id
 
     [DllImport("crt")]
     static extern string calloc(int count, int size);
@@ -56,6 +58,8 @@ class MySqlConnection {
         this.lastSeq = 0;
         this.lastAffected = 0;
         this.hadError = false;
+        this.stmtSqls = new List<string>();
+        this.stmtIds = new List<int>();
     }
 
     // ============================================================
@@ -847,9 +851,46 @@ class MySqlConnection {
         return rc;
     }
 
+    /// <summary>Index of sql in the statement cache, or -1.</summary>
+    int stmtCacheFind(string sql) {
+        int i = 0;
+        while (i < this.stmtSqls.Count) {
+            if (this.stmtSqls[i] == sql) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>Caches a prepared statement id, closing the oldest entry when
+    /// the cache is full (32 statements per connection).</summary>
+    async int stmtCacheAdd(string sql, int stmtId) {
+        if (this.stmtSqls.Count >= 32) {
+            await this.stmtClose(this.stmtIds[0]);
+            this.stmtSqls.RemoveAt(0);
+            this.stmtIds.RemoveAt(0);
+        }
+        this.stmtSqls.Add(sql);
+        this.stmtIds.Add(stmtId);
+        return 0;
+    }
+
+    /// <summary>Drops a statement from the cache (after a server error).</summary>
+    void stmtCacheRemove(int stmtId) {
+        int i = 0;
+        while (i < this.stmtIds.Count) {
+            if (this.stmtIds[i] == stmtId) {
+                this.stmtSqls.RemoveAt(i);
+                this.stmtIds.RemoveAt(i);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
     /// <summary>Runs a parameterized query through the binary prepared-statement
     /// protocol (COM_STMT_PREPARE + COM_STMT_EXECUTE). Values are transmitted
-    /// out-of-band -- never spliced into the SQL text.</summary>
+    /// out-of-band -- never spliced into the SQL text. Prepared statements are
+    /// cached per connection, so repeated queries skip the prepare round-trip.</summary>
     async DbResult QueryParamsAsync(string sql, DbParams prms) {
         DbResult result = DbResult.Create();
         this.hadError = false;
@@ -860,10 +901,17 @@ class MySqlConnection {
             this.lastError = "not connected";
             return result;
         }
-        List<int> ids = new List<int>();
-        bool ok = await this.stmtPrepare(sql, ids);
-        if (!ok) { this.hadError = true; return result; }
-        int stmtId = ids[0];
+        int stmtId = 0;
+        int hit = this.stmtCacheFind(sql);
+        if (hit >= 0) {
+            stmtId = this.stmtIds[hit];
+        } else {
+            List<int> ids = new List<int>();
+            bool ok = await this.stmtPrepare(sql, ids);
+            if (!ok) { this.hadError = true; return result; }
+            stmtId = ids[0];
+            await this.stmtCacheAdd(sql, stmtId);
+        }
         await this.stmtExecute(stmtId, prms);
         string first = await this.readPacket();
         if (first == null) {
@@ -879,6 +927,7 @@ class MySqlConnection {
                 + bytesToStr(first, 9, this.lastLen - 9);
             this.hadError = true;
             free(first);
+            this.stmtCacheRemove(stmtId);
             await this.stmtClose(stmtId);
             return result;
         }
@@ -886,7 +935,6 @@ class MySqlConnection {
             List<int> cur = new List<int>(); cur.Add(1);
             this.lastAffected = readLenenc(first, cur);
             free(first);
-            await this.stmtClose(stmtId);
             return result;
         }
         List<int> cc = new List<int>(); cc.Add(0);
@@ -944,7 +992,6 @@ class MySqlConnection {
             rowCount = rowCount + 1;
         }
         this.lastAffected = rowCount;
-        await this.stmtClose(stmtId);
         return result;
     }
 
@@ -984,5 +1031,8 @@ class MySqlConnection {
             this.connected = false;
             this.sock = -1;
         }
+        // Server-side statements die with the connection.
+        this.stmtSqls = new List<string>();
+        this.stmtIds = new List<int>();
     }
 }
