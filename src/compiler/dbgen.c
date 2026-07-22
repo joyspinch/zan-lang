@@ -1052,11 +1052,10 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         for (int i = 0; i < fs.count; i++) {
             if (fs.items[i].kind == DF_NAV) continue;
             if (fs.items[i].kind == DF_ENUM)
+                /* enum casts are not parseable; int -> enum is implicit */
                 dg_putf(out,
-                    "            o.%.*s = (%.*s)r.GetInt(row, %d);\n",
-                    (int)fs.items[i].name.len, fs.items[i].name.str,
-                    (int)fs.items[i].type_name.len, fs.items[i].type_name.str,
-                    ci);
+                    "            o.%.*s = r.GetInt(row, %d);\n",
+                    (int)fs.items[i].name.len, fs.items[i].name.str, ci);
             else
                 dg_putf(out, "            o.%.*s = r.%s(row, %d);\n",
                         (int)fs.items[i].name.len, fs.items[i].name.str,
@@ -1091,12 +1090,10 @@ static void dg_gen_entity(dg_ctx_t *c, dg_buf_t *out, zan_istr_t cls) {
         for (int k = 0; k < nfs.count; k++) {
             if (nfs.items[k].kind == DF_NAV) continue;
             if (nfs.items[k].kind == DF_ENUM)
+                /* enum casts are not parseable; int -> enum is implicit */
                 dg_putf(out,
-                    "                    nv.%.*s = (%.*s)r.GetInt(row, "
-                    "ci + %d);\n",
-                    (int)nfs.items[k].name.len, nfs.items[k].name.str,
-                    (int)nfs.items[k].type_name.len,
-                    nfs.items[k].type_name.str, nk);
+                    "                    nv.%.*s = r.GetInt(row, ci + %d);\n",
+                    (int)nfs.items[k].name.len, nfs.items[k].name.str, nk);
             else
                 dg_putf(out,
                     "                    nv.%.*s = r.%s(row, ci + %d);\n",

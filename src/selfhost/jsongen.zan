@@ -1,0 +1,464 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Compile-time entity mapper generation for System.Json. Mirrors the C host
+// pass in src/compiler/jsongen.c.
+//
+// `Json.Deserialize<T>(text)` / `Json.Serialize<T>(obj)` are lowered at parse
+// time: for every class T reachable from a call site (including classes
+// referenced by fields, transitively), a binder (`B_T`), tree serializer
+// (`T_T`), direct writer (`W_T`) and the string-facing entry points
+// (`D_T`/`S_T`, `DL_T`/`SL_T` for List roots) are generated as Zan source
+// into a synthetic `__JsonBind` class, parsed, and merged into the unit.
+// Call sites are rewritten to the generated methods, so no reflection or
+// runtime type info is needed. Mapping is lenient: missing keys keep field
+// defaults, scalar mismatches coerce through the JsonValue As* helpers, a
+// single object binds into List<T> as one element, extra keys are ignored,
+// and JsonValue-typed fields pass their subtree through untouched.
+class Jsongen {
+    Node unit;
+    Diags diags;
+    List<string> needNames;
+    List<int> needRootList;
+    bool any;
+
+    // field-kind classification (mirrors jg_fk_t)
+    static int FkSkip() { return 0; }
+    static int FkInt() { return 1; }
+    static int FkFloat() { return 2; }
+    static int FkBool() { return 3; }
+    static int FkString() { return 4; }
+    static int FkEnum() { return 5; }
+    static int FkClass() { return 6; }
+    static int FkJson() { return 7; }
+    static int FkList() { return 8; }
+
+    // Classify() side results for list element types.
+    string elemName;
+    int elemKind;
+
+    public Jsongen() {
+        unit = null;
+        diags = null;
+        needNames = new List<string>();
+        needRootList = new List<int>();
+        any = false;
+        elemName = "";
+        elemKind = 0;
+    }
+
+    Node FindDecl(string name, int kind) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == kind && d.sval == name) { return d; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    bool IsIntName(string n) {
+        return n == "int" || n == "long" || n == "short" || n == "byte"
+            || n == "sbyte" || n == "uint" || n == "ushort" || n == "ulong"
+            || n == "char";
+    }
+
+    bool IsFloatName(string n) {
+        return n == "double" || n == "float" || n == "decimal";
+    }
+
+    int ClassifyBase(string name) {
+        if (IsIntName(name)) { return Jsongen.FkInt(); }
+        if (IsFloatName(name)) { return Jsongen.FkFloat(); }
+        if (name == "bool") { return Jsongen.FkBool(); }
+        if (name == "string") { return Jsongen.FkString(); }
+        if (name == "JsonValue") { return Jsongen.FkJson(); }
+        if (FindDecl(name, AK.EnumDecl()) != null) { return Jsongen.FkEnum(); }
+        if (FindDecl(name, AK.ClassDecl()) != null) { return Jsongen.FkClass(); }
+        return Jsongen.FkSkip();
+    }
+
+    // Classify a field's type-ref; for lists, elemName/elemKind carry the
+    // element classification.
+    int Classify(Node tref) {
+        if (tref == null || tref.kind != AK.TypeRef()) { return Jsongen.FkSkip(); }
+        if (tref.ival == 1) { return Jsongen.FkSkip(); } // arrays unsupported
+        if (tref.sval == "List" && tref.kids.Count == 1) {
+            Node ea = tref.kids[0];
+            if (ea == null || ea.kind != AK.TypeRef() || ea.ival == 1 || ea.kids.Count > 0) {
+                return Jsongen.FkSkip();
+            }
+            int ek = ClassifyBase(ea.sval);
+            if (ek == Jsongen.FkSkip()) { return Jsongen.FkSkip(); }
+            elemName = ea.sval;
+            elemKind = ek;
+            return Jsongen.FkList();
+        }
+        if (tref.kids.Count > 0) { return Jsongen.FkSkip(); }
+        return ClassifyBase(tref.sval);
+    }
+
+    int NeedFind(string name) {
+        int i = 0;
+        while (i < needNames.Count) {
+            if (needNames[i] == name) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    int NeedAdd(string name) {
+        int at = NeedFind(name);
+        if (at >= 0) { return at; }
+        needNames.Add(name);
+        needRootList.Add(0);
+        return needNames.Count - 1;
+    }
+
+    // ---- call-site scan + rewrite ----
+
+    // True when `call` is Json.Deserialize<...>(...) / Json.Serialize<...>(...).
+    bool IsJsonCall(Node call) {
+        if (call.kind != AK.Call()) { return false; }
+        Node callee = call.a;
+        if (callee == null || callee.kind != AK.MemberAccess()) { return false; }
+        Node obj = callee.a;
+        if (obj == null || obj.kind != AK.Ident() || obj.sval != "Json") { return false; }
+        return callee.sval == "Deserialize" || callee.sval == "Serialize";
+    }
+
+    void RewriteCall(Node call) {
+        Node callee = call.a;
+        bool isDeser = callee.sval == "Deserialize";
+        string what = callee.sval;
+        Node targs = callee.b;
+        if (targs == null || targs.kids.Count != 1) {
+            diags.Error("Json." + what + " requires an explicit type argument: Json." + what + "<T>(...)", call.line, call.col);
+            return;
+        }
+        Node targ = targs.kids[0];
+        if (targ == null || targ.kind != AK.TypeRef() || targ.ival == 1 || targ.op == 1) {
+            diags.Error("Json." + what + "<T>: unsupported type argument", call.line, call.col);
+            return;
+        }
+        string cls = "";
+        bool asList = false;
+        if (targ.sval == "List" && targ.kids.Count == 1 && targ.kids[0].kind == AK.TypeRef()) {
+            cls = targ.kids[0].sval;
+            asList = true;
+        } else if (targ.kids.Count == 0) {
+            cls = targ.sval;
+        } else {
+            diags.Error("Json." + what + "<T>: T must be a class or List<Class>", call.line, call.col);
+            return;
+        }
+        if (FindDecl(cls, AK.ClassDecl()) == null) {
+            diags.Error("Json." + what + "<T>: '" + cls + "' is not a known class", call.line, call.col);
+            return;
+        }
+        if (call.kids.Count != 1) {
+            diags.Error("Json." + what + "<T> takes exactly one argument", call.line, call.col);
+            return;
+        }
+        int at = NeedAdd(cls);
+        if (asList) { needRootList[at] = 1; }
+        any = true;
+
+        string prefix = "S_";
+        if (isDeser) { prefix = "D_"; }
+        if (asList && isDeser) { prefix = "DL_"; }
+        if (asList && !isDeser) { prefix = "SL_"; }
+        callee.a.sval = "__JsonBind";
+        callee.sval = prefix + cls;
+        callee.b = null;
+    }
+
+    // Generic AST walk: rewriting only mutates call nodes in place, so slot
+    // order does not matter.
+    void Visit(Node n) {
+        if (n == null) { return; }
+        if (n.kind == AK.Call() && IsJsonCall(n)) { RewriteCall(n); }
+        Visit(n.a);
+        Visit(n.b);
+        Visit(n.c);
+        Visit(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { Visit(n.kids[i]); i = i + 1; }
+    }
+
+    // ---- per-class code generation ----
+
+    string WriteScalar(int k, string item, string tname) {
+        if (k == Jsongen.FkInt() || k == Jsongen.FkFloat()) {
+            return "sb.Append(Convert.ToString(" + item + "));";
+        }
+        if (k == Jsongen.FkEnum()) {
+            return "sb.Append(Convert.ToString((int)" + item + "));";
+        }
+        if (k == Jsongen.FkBool()) {
+            return "if (" + item + ") { sb.Append(\"true\"); } else { sb.Append(\"false\"); }";
+        }
+        if (k == Jsongen.FkString()) {
+            return "if (" + item + " == null) { sb.Append(\"null\"); } else { sb.Append(\"\\\"\"); sb.Append(Encoding.JsonEscape(" + item + ")); sb.Append(\"\\\"\"); }";
+        }
+        if (k == Jsongen.FkJson()) {
+            return "if (" + item + " == null) { sb.Append(\"null\"); } else { sb.Append(" + item + ".ToJson()); }";
+        }
+        // class
+        return "__JsonBind.W_" + tname + "(sb, " + item + ");";
+    }
+
+    string TreeScalar(int k, string item, string tname) {
+        if (k == Jsongen.FkInt() || k == Jsongen.FkFloat()) {
+            return "JsonValue.NewNum(Convert.ToString(" + item + "))";
+        }
+        if (k == Jsongen.FkEnum()) {
+            return "JsonValue.NewNum(Convert.ToString((int)" + item + "))";
+        }
+        if (k == Jsongen.FkBool()) { return "JsonValue.NewBool(" + item + ")"; }
+        if (k == Jsongen.FkString()) { return "__JsonBind.T_Str(" + item + ")"; }
+        if (k == Jsongen.FkJson()) { return "__JsonBind.T_Jv(" + item + ")"; }
+        return "__JsonBind.T_" + tname + "(" + item + ")";
+    }
+
+    string BindElem(int k, string item, string tname) {
+        if (k == Jsongen.FkInt()) {
+            return "(" + tname + ")" + item + ".AsInt(0)";
+        }
+        if (k == Jsongen.FkEnum()) {
+            // enum casts are not parseable; int -> enum is implicit
+            return item + ".AsInt(0)";
+        }
+        if (k == Jsongen.FkFloat()) {
+            return "(" + tname + ")" + item + ".AsDouble(0.0)";
+        }
+        if (k == Jsongen.FkBool()) { return item + ".AsBool(false)"; }
+        if (k == Jsongen.FkString()) { return item + ".AsString(\"\")"; }
+        if (k == Jsongen.FkJson()) { return item; }
+        return "__JsonBind.B_" + tname + "(" + item + ")";
+    }
+
+    // mode: 1 = bind (JsonValue -> entity), 0 = tree (entity -> JsonValue),
+    // 2 = write (entity -> JSON text into `sb`).
+    int emitted;
+    string GenFields(string clsName, Node cls, int mode, int depth) {
+        string s = "";
+        if (depth > 16 || cls == null) { return s; }
+        // base class fields first (C#-style ordering)
+        if (cls.sval2 != "") {
+            Node bdecl = FindDecl(cls.sval2, AK.ClassDecl());
+            if (bdecl != null) {
+                s = s + GenFields(cls.sval2, bdecl, mode, depth + 1);
+            }
+        }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            i = i + 1;
+            if (m.kind != AK.FieldDecl()) { continue; }
+            if (HasMod(m.mods, MOD.Static())) { continue; }
+            string f = m.sval;
+            elemName = "";
+            elemKind = 0;
+            int fk = Classify(m.type);
+            string en = elemName;
+            int ek = elemKind;
+            string tname = "?";
+            if (m.type != null && m.type.kind == AK.TypeRef()) { tname = m.type.sval; }
+            if (fk == Jsongen.FkSkip()) {
+                // unsupported field type: skipped (the C host warns; the
+                // selfhost Diags sink has no warning severity)
+                continue;
+            }
+            if (fk == Jsongen.FkClass()) { NeedAdd(tname); }
+            if (fk == Jsongen.FkList() && ek == Jsongen.FkClass()) { NeedAdd(en); }
+
+            if (mode == 2) {
+                string comma = "";
+                if (emitted > 0) { comma = ","; }
+                emitted = emitted + 1;
+                s = s + "        sb.Append(\"" + comma + "\\\"" + f + "\\\":\");\n";
+                if (fk == Jsongen.FkList()) {
+                    string item = "o." + f + "[i_" + f + "]";
+                    string wr = WriteScalar(ek, item, en);
+                    s = s + "        sb.Append(\"[\");\n";
+                    s = s + "        if (o." + f + " != null) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
+                    s = s + "                if (i_" + f + " > 0) { sb.Append(\",\"); }\n";
+                    s = s + "                " + wr + "\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
+                    s = s + "        sb.Append(\"]\");\n";
+                } else {
+                    s = s + "        " + WriteScalar(fk, "o." + f, tname) + "\n";
+                }
+            } else if (mode == 1) {
+                if (fk == Jsongen.FkInt()) {
+                    s = s + "        o." + f + " = (" + tname + ")v.Int(\"" + f + "\", 0);\n";
+                } else if (fk == Jsongen.FkEnum()) {
+                    // enum casts are not parseable; int -> enum is implicit
+                    s = s + "        o." + f + " = v.Int(\"" + f + "\", 0);\n";
+                } else if (fk == Jsongen.FkFloat()) {
+                    s = s + "        o." + f + " = (" + tname + ")v.Double(\"" + f + "\", 0.0);\n";
+                } else if (fk == Jsongen.FkBool()) {
+                    s = s + "        o." + f + " = v.Bool(\"" + f + "\", false);\n";
+                } else if (fk == Jsongen.FkString()) {
+                    s = s + "        o." + f + " = v.Str(\"" + f + "\", \"\");\n";
+                } else if (fk == Jsongen.FkJson()) {
+                    s = s + "        o." + f + " = v.Get(\"" + f + "\");\n";
+                } else if (fk == Jsongen.FkClass()) {
+                    s = s + "        JsonValue j_" + f + " = v.Get(\"" + f + "\");\n";
+                    s = s + "        if (j_" + f + " != null && j_" + f + ".IsObject()) { o." + f + " = __JsonBind.B_" + tname + "(j_" + f + "); }\n";
+                } else {
+                    // list: array binds element-wise; a lone object becomes a
+                    // one-element list
+                    string convAt = BindElem(ek, "j_" + f + ".At(i_" + f + ")", en);
+                    string convOne = BindElem(ek, "j_" + f, en);
+                    s = s + "        JsonValue j_" + f + " = v.Get(\"" + f + "\");\n";
+                    s = s + "        o." + f + " = new List<" + en + ">();\n";
+                    s = s + "        if (j_" + f + " != null && j_" + f + ".IsArray()) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < j_" + f + ".Count()) {\n";
+                    s = s + "                o." + f + ".Add(" + convAt + ");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        } else if (j_" + f + " != null && !j_" + f + ".IsNull()) {\n";
+                    s = s + "            o." + f + ".Add(" + convOne + ");\n";
+                    s = s + "        }\n";
+                }
+            } else {
+                // tree (serialize) direction
+                if (fk == Jsongen.FkList()) {
+                    string conv = TreeScalar(ek, "o." + f + "[i_" + f + "]", en);
+                    s = s + "        JsonValue a_" + f + " = JsonValue.NewArray();\n";
+                    s = s + "        if (o." + f + " != null) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
+                    s = s + "                a_" + f + ".Append(" + conv + ");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
+                    s = s + "        v.Put(\"" + f + "\", a_" + f + ");\n";
+                } else {
+                    s = s + "        v.Put(\"" + f + "\", " + TreeScalar(fk, "o." + f, tname) + ");\n";
+                }
+            }
+        }
+        return s;
+    }
+
+    bool HasMod(int mods, int bit) {
+        int q = mods / bit;
+        int r = q - (q / 2) * 2;
+        return r == 1;
+    }
+
+    string GenClass(int idx) {
+        string cls = needNames[idx];
+        Node decl = FindDecl(cls, AK.ClassDecl());
+        if (decl == null) { return ""; }
+        string s = "";
+
+        // binder: JsonValue -> entity (lenient)
+        s = s + "    static " + cls + " B_" + cls + "(JsonValue v) {\n";
+        s = s + "        " + cls + " o = new " + cls + "();\n";
+        s = s + "        if (v == null || !v.IsObject()) { return o; }\n";
+        s = s + GenFields(cls, decl, 1, 0);
+        s = s + "        return o;\n    }\n";
+
+        // tree: entity -> JsonValue
+        s = s + "    static JsonValue T_" + cls + "(" + cls + " o) {\n";
+        s = s + "        if (o == null) { return JsonValue.NewNull(); }\n";
+        s = s + "        JsonValue v = JsonValue.NewObject();\n";
+        s = s + GenFields(cls, decl, 0, 0);
+        s = s + "        return v;\n    }\n";
+
+        // writer: entity -> JSON text appended directly to a StringBuilder
+        s = s + "    static void W_" + cls + "(StringBuilder sb, " + cls + " o) {\n";
+        s = s + "        if (o == null) { sb.Append(\"null\"); return; }\n";
+        s = s + "        sb.Append(\"{\");\n";
+        emitted = 0;
+        s = s + GenFields(cls, decl, 2, 0);
+        s = s + "        sb.Append(\"}\");\n    }\n";
+
+        // string-facing entry points
+        s = s + "    static " + cls + " D_" + cls + "(string s) { return __JsonBind.B_" + cls + "(JsonValue.Parse(s)); }\n";
+        s = s + "    static string S_" + cls + "(" + cls + " o) { StringBuilder sb = new StringBuilder(); __JsonBind.W_" + cls + "(sb, o); return sb.ToString(); }\n";
+
+        if (needRootList[idx] == 1) {
+            s = s + "    static List<" + cls + "> DL_" + cls + "(string s) {\n";
+            s = s + "        JsonValue v = JsonValue.Parse(s);\n";
+            s = s + "        List<" + cls + "> r = new List<" + cls + ">();\n";
+            s = s + "        if (v != null && v.IsArray()) {\n";
+            s = s + "            int i = 0;\n";
+            s = s + "            while (i < v.Count()) { r.Add(__JsonBind.B_" + cls + "(v.At(i))); i = i + 1; }\n";
+            s = s + "        } else if (v != null && v.IsObject()) {\n";
+            s = s + "            r.Add(__JsonBind.B_" + cls + "(v));\n";
+            s = s + "        }\n";
+            s = s + "        return r;\n";
+            s = s + "    }\n";
+            s = s + "    static string SL_" + cls + "(List<" + cls + "> l) {\n";
+            s = s + "        StringBuilder sb = new StringBuilder();\n";
+            s = s + "        sb.Append(\"[\");\n";
+            s = s + "        if (l != null) {\n";
+            s = s + "            int i = 0;\n";
+            s = s + "            while (i < l.Count) {\n";
+            s = s + "                if (i > 0) { sb.Append(\",\"); }\n";
+            s = s + "                __JsonBind.W_" + cls + "(sb, l[i]);\n";
+            s = s + "                i = i + 1;\n";
+            s = s + "            }\n";
+            s = s + "        }\n";
+            s = s + "        sb.Append(\"]\");\n";
+            s = s + "        return sb.ToString();\n";
+            s = s + "    }\n";
+        }
+        return s;
+    }
+
+    // ---- entry point ----
+
+    public void Run(Node u, Diags d) {
+        unit = u;
+        diags = d;
+
+        // scan every method/ctor body and field initializer
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node dc = unit.kids[i];
+            i = i + 1;
+            if (dc.kind != AK.ClassDecl() && dc.kind != AK.StructDecl()) { continue; }
+            int mi = 0;
+            while (mi < dc.kids.Count) {
+                Node m = dc.kids[mi];
+                mi = mi + 1;
+                if (m.kind == AK.MethodDecl() || m.kind == AK.CtorDecl()) { Visit(m.d); }
+                else if (m.kind == AK.FieldDecl()) { Visit(m.b); }
+            }
+        }
+        if (!any || diags.HasErrors()) { return; }
+
+        string src = "class __JsonBind {\n";
+        src = src + "    static JsonValue T_Str(string s) { if (s == null) { return JsonValue.NewNull(); } return JsonValue.NewStr(s); }\n";
+        src = src + "    static JsonValue T_Jv(JsonValue x) { if (x == null) { return JsonValue.NewNull(); } return x; }\n";
+        // GenClass may append to needNames while generating (nested classes)
+        int gi = 0;
+        while (gi < needNames.Count) {
+            src = src + GenClass(gi);
+            gi = gi + 1;
+        }
+        src = src + "}\n";
+
+        Lexer lx = new Lexer(src);
+        List<Token> gt = lx.Run();
+        Parser gp = new Parser(gt, diags);
+        Node gu = gp.ParseUnit();
+        int j = 0;
+        while (j < gu.kids.Count) {
+            if (gu.kids[j].kind == AK.ClassDecl()) { unit.Add(gu.kids[j]); }
+            j = j + 1;
+        }
+    }
+}

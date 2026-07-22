@@ -240,7 +240,38 @@ class Parser {
         MergePartials(unit);
         DesugarEvents(unit);
         DesugarIterators(unit);
+        Jsongen jg = new Jsongen();
+        jg.Run(unit, diags);
+        Dbgen dbg = new Dbgen();
+        dbg.Run(unit, diags);
+        StripTypeArgs(unit);
         return unit;
+    }
+
+    // Explicit call type args (`__typeargs` containers captured in
+    // ParsePostfix) are only meaningful to the jsongen/dbgen source
+    // generators; drop them before binding so downstream passes never see
+    // a TypeRef in an expression slot.
+    Node ParseCallTypeArg() {
+        Node t = ParseType();
+        while (Eat(TK.Dot())) {
+            if (At(TK.Ident())) { t.sval = Next().text; }
+        }
+        return t;
+    }
+
+    void StripTypeArgs(Node n) {
+        if (n == null) { return; }
+        if ((n.kind == AK.MemberAccess() || n.kind == AK.Ident())
+            && n.b != null && n.b.kind == AK.TypeRef() && n.b.sval == "__typeargs") {
+            n.b = null;
+        }
+        StripTypeArgs(n.a);
+        StripTypeArgs(n.b);
+        StripTypeArgs(n.c);
+        StripTypeArgs(n.d);
+        int i = 0;
+        while (i < n.kids.Count) { StripTypeArgs(n.kids[i]); i = i + 1; }
     }
 
     // Iterator methods are lowered eagerly: a method containing `yield` gets a
@@ -1426,16 +1457,18 @@ class Parser {
                 e = m;
             } else if (k == TK.Less() && LooksLikeGenericCall()) {
                 // generic method call:  Name<TypeArgs>(args). Erasure is uniform,
-                // so the explicit type args are consumed and discarded here; the
-                // following "(" is picked up as a normal call on the next pass.
+                // so codegen ignores the explicit type args, but they are kept
+                // on the callee (b = "__typeargs" container) for the jsongen /
+                // dbgen source generators; StripTypeArgs removes them before
+                // binding. The following "(" is picked up as a normal call on
+                // the next pass.
                 Next();
-                int gdepth = 1;
-                while (gdepth > 0 && !At(TK.Eof())) {
-                    int gk = K();
-                    if (gk == TK.Less()) { gdepth = gdepth + 1; }
-                    else if (gk == TK.Greater()) { gdepth = gdepth - 1; }
-                    Next();
-                }
+                Node targs = new Node(AK.TypeRef());
+                targs.sval = "__typeargs";
+                targs.Add(ParseCallTypeArg());
+                while (Eat(TK.Comma())) { targs.Add(ParseCallTypeArg()); }
+                Expect(TK.Greater());
+                if (e.kind == AK.MemberAccess() || e.kind == AK.Ident()) { e.b = targs; }
             } else if (k == TK.LParen()) {
                 Node call = new Node(AK.Call());
                 call.a = e; call.line = e.line; call.col = e.col;

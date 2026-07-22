@@ -507,9 +507,14 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
         } else if (mode == 1) {
             switch (fk) {
             case FK_INT:
-            case FK_ENUM:
                 jg_putf(out, "        o.%.*s = (%.*s)v.Int(\"%.*s\", 0);\n",
                         FL, FS, (int)tname.len, tname.str, FL, FS);
+                break;
+            case FK_ENUM:
+                /* enum casts are not parseable; int -> enum assignment is
+                 * implicit */
+                jg_putf(out, "        o.%.*s = v.Int(\"%.*s\", 0);\n",
+                        FL, FS, FL, FS);
                 break;
             case FK_FLOAT:
                 jg_putf(out, "        o.%.*s = (%.*s)v.Double(\"%.*s\", 0.0);\n",
@@ -547,9 +552,12 @@ static void jg_gen_fields(jg_ctx_t *c, jg_buf_t *out, zan_istr_t cls_name,
                 (void)src_one;
                 switch (ek) {
                 case FK_INT:
-                case FK_ENUM:
                     snprintf(elem_from, sizeof(elem_from),
                              "(%.*s)%%s.AsInt(0)", EL, ES);
+                    break;
+                case FK_ENUM:
+                    /* enum casts are not parseable; int -> enum is implicit */
+                    snprintf(elem_from, sizeof(elem_from), "%%s.AsInt(0)");
                     break;
                 case FK_FLOAT:
                     snprintf(elem_from, sizeof(elem_from),
