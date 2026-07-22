@@ -1,0 +1,96 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Data.ZanDb;
+
+// P5: large-value overflow chains -- values beyond one page round-trip,
+// survive reopen, free their pages on overwrite/delete, and coexist with
+// small values and batch transactions.
+class Program {
+    static int passed = 0;
+    static int failed = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { passed = passed + 1; }
+        else { failed = failed + 1; Console.WriteLine("FAIL: " + name); }
+    }
+
+    static string MakeVal(string seed, int len) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (sb.Length < len) {
+            sb.Append(seed);
+            sb.Append(Convert.ToString(i));
+            i = i + 1;
+        }
+        return sb.ToString().Substring(0, len);
+    }
+
+    static void Main() {
+        string path = "_scratch/zandb_p5.zdb";
+        if (File.Exists(path)) { File.Delete(path); }
+        if (File.Exists(path + "-wal")) { File.Delete(path + "-wal"); }
+
+        KvStore db = KvStore.Open(path);
+
+        // 1. big value round-trips in-memory
+        string big = MakeVal("overflow-", 8000);
+        db.Put("big", big);
+        Check(db.Get("big") == big, "big roundtrip");
+
+        // 2. very big value (multiple chain pages)
+        string huge = MakeVal("HUGE-", 50000);
+        db.Put("huge", huge);
+        Check(db.Get("huge") == huge, "huge roundtrip");
+
+        // 3. small values around the big ones stay intact
+        db.Begin();
+        int i = 0;
+        while (i < 200) {
+            db.Put("small:" + Convert.ToString(1000 + i), "v" + Convert.ToString(i));
+            i = i + 1;
+        }
+        db.Commit();
+        Check(db.Get("small:1000") == "v0" && db.Get("small:1199") == "v199", "small neighbors");
+        Check(db.Get("big") == big, "big survives small inserts");
+
+        // 4. overwrite big with small frees the chain (pages get reused)
+        db.Put("big", "now-small");
+        Check(db.Get("big") == "now-small", "overwrite big->small");
+
+        // 5. overwrite big with a different big value
+        string big2 = MakeVal("second-", 12000);
+        db.Put("huge", big2);
+        Check(db.Get("huge") == big2, "overwrite huge->big2");
+
+        // 6. delete a big value
+        db.Put("gone", MakeVal("bye-", 6000));
+        Check(db.Delete("gone"), "delete big");
+        Check(!db.Contains("gone"), "deleted big absent");
+
+        db.Close();
+
+        // 7. everything survives reopen (chains read back from disk)
+        KvStore db2 = KvStore.Open(path);
+        Check(db2.Get("huge") == big2, "huge after reopen");
+        Check(db2.Get("big") == "now-small", "big after reopen");
+        Check(db2.Get("small:1042") == "v42", "small after reopen");
+        Check(!db2.Contains("gone"), "deleted stays gone after reopen");
+
+        // 8. freed chain pages are reused: file should not balloon when the
+        // same key is rewritten repeatedly with a big value.
+        i = 0;
+        while (i < 20) {
+            db2.Put("churn", MakeVal("churn-", 9000));
+            i = i + 1;
+        }
+        Check(db2.Get("churn").Length == 9000, "churn value intact");
+        db2.Close();
+        int fileLen = File.GetSize(path);
+        Check(fileLen < 400000, "file stays bounded after churn (" + Convert.ToString(fileLen) + ")");
+
+        File.Delete(path);
+        Console.WriteLine("pass: " + Convert.ToString(passed));
+        Console.WriteLine("fail: " + Convert.ToString(failed));
+    }
+}

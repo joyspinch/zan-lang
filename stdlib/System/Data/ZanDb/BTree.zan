@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 
 namespace System.Data.ZanDb;
 
@@ -12,6 +13,7 @@ class BNode {
     bool leaf;
     List<string> keys;
     List<string> vals;      // leaf only
+    List<int> ovf;          // leaf only: first overflow page id (0 = inline)
     List<int> children;     // internal only: keys.Count + 1 entries
     int next;               // leaf only: right sibling page id (0 = none)
 
@@ -19,6 +21,7 @@ class BNode {
         this.leaf = isLeaf;
         this.keys = new List<string>();
         this.vals = new List<string>();
+        this.ovf = new List<int>();
         this.children = new List<int>();
         this.next = 0;
     }
@@ -109,13 +112,17 @@ class NodeCache {
 /// nodes live in pager-allocated pages. All mutations go through the pager's
 /// WAL, so the tree inherits atomic crash-safe commits.
 ///
-/// Keys and values are text strings (byte-wise ordering); values up to
-/// ~3.9 KB fit a page. (Overflow chains for larger values: future work.)
+/// Keys and values are text strings (byte-wise ordering). Values larger
+/// than INLINE_MAX are stored out-of-line in chained overflow pages (also
+/// WAL-covered), so value size is unbounded; keys must fit a node.
 /// </summary>
 class BTree {
     static int META_PAGE = 1;
-    static int TYPE_LEAF = 1;
+    static int TYPE_LEAF = 1;      // legacy: plain key/val strings
     static int TYPE_INTERNAL = 2;
+    static int TYPE_LEAF2 = 3;     // per-entry flag: inline or overflow ref
+    static int INLINE_MAX = 1024;  // values above this go to overflow pages
+    static int OVF_CHUNK = 4000;   // payload bytes per overflow page
 
     Pager pager;
     int rootId;
@@ -196,6 +203,58 @@ class BTree {
 
     // ===== Node encode/decode =====
 
+    /// <summary>Reads a whole overflow chain back into one string.</summary>
+    string ReadChain(int firstPage) {
+        StringBuilder sb = new StringBuilder();
+        int pid = firstPage;
+        while (pid != 0) {
+            ByteBuffer pg = this.pager.GetPage(pid);
+            pg.SeekRead(0);
+            int nxt = pg.ReadU64();
+            sb.Append(pg.ReadString());
+            pid = nxt;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Writes val into a chain of overflow pages; returns the first
+    /// page id. Pages go through the pager, so the chain is WAL-covered.</summary>
+    int WriteChain(string val) {
+        int total = val.Length;
+        int nchunks = (total + BTree.OVF_CHUNK - 1) / BTree.OVF_CHUNK;
+        if (nchunks == 0) { nchunks = 1; }
+        // Build back-to-front so each page knows its successor.
+        List<int> ids = new List<int>();
+        int i = 0;
+        while (i < nchunks) { ids.Add(this.pager.AllocPage()); i = i + 1; }
+        i = 0;
+        while (i < nchunks) {
+            int off = i * BTree.OVF_CHUNK;
+            int len = total - off;
+            if (len > BTree.OVF_CHUNK) { len = BTree.OVF_CHUNK; }
+            ByteBuffer pg = this.pager.GetPage(ids[i]);
+            pg.Clear();
+            if (i + 1 < nchunks) { pg.WriteU64(ids[i + 1]); } else { pg.WriteU64(0); }
+            pg.WriteString(val.Substring(off, len));
+            pg.SetLength(4096);
+            this.pager.MarkDirty(ids[i]);
+            i = i + 1;
+        }
+        return ids[0];
+    }
+
+    /// <summary>Returns an overflow chain's pages to the freelist.</summary>
+    void FreeChain(int firstPage) {
+        int pid = firstPage;
+        while (pid != 0) {
+            ByteBuffer pg = this.pager.GetPage(pid);
+            pg.SeekRead(0);
+            int nxt = pg.ReadU64();
+            this.pager.FreePage(pid);
+            pid = nxt;
+        }
+    }
+
     BNode ReadNode(int pageId) {
         BNode cached = this.nodeCache.Get(pageId);
         if (cached != null) { return cached; }
@@ -210,6 +269,27 @@ class BTree {
             while (i < nkeys) {
                 n.keys.Add(pg.ReadString());
                 n.vals.Add(pg.ReadString());
+                n.ovf.Add(0);
+                i = i + 1;
+            }
+            this.nodeCache.Put(pageId, n);
+            return n;
+        }
+        if (type == BTree.TYPE_LEAF2) {
+            BNode n = BNode.Leaf();
+            n.next = pg.ReadU64();
+            int i = 0;
+            while (i < nkeys) {
+                n.keys.Add(pg.ReadString());
+                int flag = pg.ReadU8();
+                if (flag == 0) {
+                    n.vals.Add(pg.ReadString());
+                    n.ovf.Add(0);
+                } else {
+                    int first = pg.ReadU64();
+                    n.vals.Add(ReadChain(first));
+                    n.ovf.Add(first);
+                }
                 i = i + 1;
             }
             this.nodeCache.Put(pageId, n);
@@ -233,7 +313,12 @@ class BTree {
             size = size + 8;   // next
             int i = 0;
             while (i < n.keys.Count) {
-                size = size + 5 + n.keys[i].Length + 5 + n.vals[i].Length;
+                size = size + 5 + n.keys[i].Length + 1;   // key + flag
+                if (n.vals[i].Length > BTree.INLINE_MAX) {
+                    size = size + 8;                       // overflow page ref
+                } else {
+                    size = size + 5 + n.vals[i].Length;
+                }
                 i = i + 1;
             }
             return size;
@@ -248,16 +333,33 @@ class BTree {
     }
 
     void WriteNode(int pageId, BNode n) {
+        if (n.leaf) {
+            // Move large values out to overflow chains first (allocating
+            // pages may touch the pager, so do it before encoding).
+            int i = 0;
+            while (i < n.keys.Count) {
+                if (n.vals[i].Length > BTree.INLINE_MAX && n.ovf[i] == 0) {
+                    n.ovf[i] = WriteChain(n.vals[i]);
+                }
+                i = i + 1;
+            }
+        }
         ByteBuffer pg = this.pager.GetPage(pageId);
         pg.Clear();
         if (n.leaf) {
-            pg.WriteU8(BTree.TYPE_LEAF);
+            pg.WriteU8(BTree.TYPE_LEAF2);
             pg.WriteU16(n.keys.Count);
             pg.WriteU64(n.next);
             int i = 0;
             while (i < n.keys.Count) {
                 pg.WriteString(n.keys[i]);
-                pg.WriteString(n.vals[i]);
+                if (n.ovf[i] != 0) {
+                    pg.WriteU8(1);
+                    pg.WriteU64(n.ovf[i]);
+                } else {
+                    pg.WriteU8(0);
+                    pg.WriteString(n.vals[i]);
+                }
                 i = i + 1;
             }
         } else {
@@ -348,10 +450,12 @@ class BTree {
 
         int ins = BTree.LowerBound(n, key);
         if (ins < n.keys.Count && BTree.Compare(n.keys[ins], key) == 0) {
+            if (n.ovf[ins] != 0) { FreeChain(n.ovf[ins]); n.ovf[ins] = 0; }
             n.vals[ins] = val;
         } else {
             BTree.InsStr(n.keys, ins, key);
             BTree.InsStr(n.vals, ins, val);
+            BTree.InsInt(n.ovf, ins, 0);
         }
 
         if (BTree.EncodedSize(n) <= 4096) {
@@ -366,11 +470,13 @@ class BTree {
         while (k < n.keys.Count) {
             right.keys.Add(n.keys[k]);
             right.vals.Add(n.vals[k]);
+            right.ovf.Add(n.ovf[k]);
             k = k + 1;
         }
         while (n.keys.Count > mid) {
             n.keys.RemoveAt(n.keys.Count - 1);
             n.vals.RemoveAt(n.vals.Count - 1);
+            n.ovf.RemoveAt(n.ovf.Count - 1);
         }
         int rightId = this.pager.AllocPage();
         right.next = n.next;
@@ -446,8 +552,10 @@ class BTree {
         }
         int pos = BTree.LeafFind(n, key);
         if (pos < 0) { return false; }
+        if (n.ovf[pos] != 0) { FreeChain(n.ovf[pos]); }
         n.keys.RemoveAt(pos);
         n.vals.RemoveAt(pos);
+        n.ovf.RemoveAt(pos);
         WriteNode(pid, n);
         return true;
     }
