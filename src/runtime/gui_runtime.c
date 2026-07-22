@@ -855,6 +855,33 @@ EXPORT void zan_gui_fill_circle(i64 surface_id, i64 cx, i64 cy, i64 radius, i64 
     }
 }
 
+/* Anti-aliased circle outline: a ring of the given thickness centered on
+ * the radius, with smooth coverage falloff at both edges. */
+EXPORT void zan_gui_draw_circle(i64 surface_id, i64 cx, i64 cy, i64 radius,
+                                i64 color, i64 thickness) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    u32 c = (u32)color;
+    int r = (int)radius;
+    if (r <= 0) return;
+    double half = (double)(thickness > 0 ? thickness : 1) / 2.0;
+    int ext = r + (int)half + 2;
+    int icx = (int)cx, icy = (int)cy;
+
+    for (int dy = -ext; dy <= ext; dy++) {
+        for (int dx = -ext; dx <= ext; dx++) {
+            double d = fabs(sqrt((double)(dx*dx + dy*dy)) - (double)r);
+            if (d <= half - 0.5) {
+                set_pixel(s, icx + dx, icy + dy, c);
+            } else if (d <= half + 0.5) {
+                int cov = (int)((half + 0.5 - d) * 255.0);
+                set_pixel_aa(s, icx + dx, icy + dy, c, cov);
+            }
+        }
+    }
+}
+
 /* Soft radial glow: a filled disc whose alpha fades smoothly from `inner_a`
  * (0..255) at the centre to 0 at `radius`, so it reads as a luminous bloom
  * rather than a hard-edged disc. Only the low 24 bits of `color` (RGB) are
