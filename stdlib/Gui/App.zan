@@ -2,6 +2,28 @@ using System;
 
 namespace Gui;
 
+/// One keyed tween/state slot in App's retained animation store. Replaces the
+/// six index-aligned animKeys/animVals/animTarget/animFrom/animStart/animDur
+/// parallel lists: `key`=stable id, `cur`=current value, `dst`=target,
+/// `src`=value at tween start, `startMs`=tween start time, `dur`=duration (ms).
+class AnimSlot {
+    int key;
+    int cur;
+    int dst;
+    int src;
+    int startMs;
+    int dur;
+
+    AnimSlot(int k, int c, int d, int s, int st, int du) {
+        key = k;
+        cur = c;
+        dst = d;
+        src = s;
+        startMs = st;
+        dur = du;
+    }
+}
+
 class App {
     Window window;
     Canvas canvas;
@@ -135,14 +157,9 @@ class App {
     // settles, giving smooth transitions on an otherwise event-driven loop.
     // AnimTo is *time-based*: progress = (now - start) / duration, so it is
     // immune to per-frame dt jitter (which used to make the motion stutter).
-    // Columns are index-aligned: key / current value / target / tween-start
-    // value / tween-start time (ms) / duration (ms).
-    List<int> animKeys;
-    List<int> animVals;
-    List<int> animTarget;
-    List<int> animFrom;
-    List<int> animStart;
-    List<int> animDur;
+    // Each slot carries its own key / current value / target / tween-start
+    // value / tween-start time (ms) / duration (ms) as an AnimSlot entity.
+    List<AnimSlot> anims;
     int nowMs;
     int lastFrameMs;
     int lastPresentMs;
@@ -256,12 +273,7 @@ class App {
         app.themeDrawerTab = SignalInt.Create(0);
         app.autoSkins = false;
         app.appliedSkin = -1;
-        app.animKeys = new List<int>();
-        app.animVals = new List<int>();
-        app.animTarget = new List<int>();
-        app.animFrom = new List<int>();
-        app.animStart = new List<int>();
-        app.animDur = new List<int>();
+        app.anims = new List<AnimSlot>();
         app.nowMs = Window.GetTickMs();
         app.lastFrameMs = app.nowMs;
         app.lastPresentMs = 0;
@@ -919,21 +931,14 @@ class App {
     /// Finds the row index for an animation key, or -1. Rows are appended by
     /// AnimTo/AnimPx and kept index-aligned across all six columns.
     int AnimIndex(int key) {
-        int i = 0;
-        while (i < animKeys.Count) {
-            if (animKeys[i] == key) { return i; }
-            i = i + 1;
+        for (int i = 0; i < anims.Count; i = i + 1) {
+            if (anims[i].key == key) { return i; }
         }
         return -1;
     }
 
     void AnimAdd(int key, int val, int target, int durMs) {
-        animKeys.Add(key);
-        animVals.Add(val);
-        animTarget.Add(target);
-        animFrom.Add(val);
-        animStart.Add(nowMs);
-        animDur.Add(durMs);
+        anims.Add(new AnimSlot(key, val, target, val, nowMs, durMs));
     }
 
     /// Persistent per-key integer state (reuses the animation KV store as a
@@ -943,15 +948,16 @@ class App {
     int StateGet(int key, int dflt) {
         int idx = AnimIndex(key);
         if (idx < 0) { return dflt; }
-        return animVals[idx];
+        return anims[idx].cur;
     }
 
     void StateSet(int key, int val) {
         int idx = AnimIndex(key);
         if (idx < 0) { AnimAdd(key, val, val, 1); return; }
-        animVals[idx] = val;
-        animTarget[idx] = val;
-        animFrom[idx] = val;
+        AnimSlot a = anims[idx];
+        a.cur = val;
+        a.dst = val;
+        a.src = val;
     }
 
     /// Time-based eased tween of a per-key value (permille, 0..1000) toward
@@ -965,26 +971,27 @@ class App {
             AnimAdd(key, target, target, durMs);
             return target;
         }
-        if (animTarget[idx] != target) {
-            animFrom[idx] = animVals[idx];
-            animTarget[idx] = target;
-            animStart[idx] = nowMs;
-            animDur[idx] = durMs;
+        AnimSlot a = anims[idx];
+        if (a.dst != target) {
+            a.src = a.cur;
+            a.dst = target;
+            a.startMs = nowMs;
+            a.dur = durMs;
         }
-        int from = animFrom[idx];
-        int tgt = animTarget[idx];
-        if (from == tgt) { animVals[idx] = tgt; return tgt; }
-        int dur = animDur[idx];
+        int from = a.src;
+        int tgt = a.dst;
+        if (from == tgt) { a.cur = tgt; return tgt; }
+        int dur = a.dur;
         if (dur < 1) { dur = 1; }
-        int elapsed = nowMs - animStart[idx];
+        int elapsed = nowMs - a.startMs;
         if (elapsed < 0) { elapsed = 0; }
         int p = elapsed * 1000 / dur;
         if (p > 1000) { p = 1000; }
         int e = App.Ease(p);
         int val = from + (tgt - from) * e / 1000;
-        animVals[idx] = val;
-        if (p < 1000) { needsRedraw = true; } else { animVals[idx] = tgt; }
-        return animVals[idx];
+        a.cur = val;
+        if (p < 1000) { needsRedraw = true; } else { a.cur = tgt; }
+        return a.cur;
     }
 
     /// One-shot intro tween: eases a per-key value from 0 up to 1000 over
@@ -996,29 +1003,25 @@ class App {
     int AnimIntro(int key, int durMs) {
         int idx = AnimIndex(key);
         if (idx < 0) {
-            animKeys.Add(key);
-            animVals.Add(0);
-            animTarget.Add(1000);
-            animFrom.Add(0);
-            animStart.Add(nowMs);
-            animDur.Add(durMs);
+            anims.Add(new AnimSlot(key, 0, 1000, 0, nowMs, durMs));
             needsRedraw = true;
             return 0;
         }
-        int from = animFrom[idx];
-        int tgt = animTarget[idx];
-        if (from == tgt) { animVals[idx] = tgt; return tgt; }
-        int dur = animDur[idx];
+        AnimSlot a = anims[idx];
+        int from = a.src;
+        int tgt = a.dst;
+        if (from == tgt) { a.cur = tgt; return tgt; }
+        int dur = a.dur;
         if (dur < 1) { dur = 1; }
-        int elapsed = nowMs - animStart[idx];
+        int elapsed = nowMs - a.startMs;
         if (elapsed < 0) { elapsed = 0; }
         int p = elapsed * 1000 / dur;
         if (p > 1000) { p = 1000; }
         int e = App.Ease(p);
         int val = from + (tgt - from) * e / 1000;
-        animVals[idx] = val;
-        if (p < 1000) { needsRedraw = true; } else { animVals[idx] = tgt; }
-        return animVals[idx];
+        a.cur = val;
+        if (p < 1000) { needsRedraw = true; } else { a.cur = tgt; }
+        return a.cur;
     }
 
     /// Eases a per-key value toward `target` in arbitrary (pixel) space using
@@ -1031,7 +1034,8 @@ class App {
             AnimAdd(key, target, target, tauMs);
             return target;
         }
-        int cur = animVals[idx];
+        AnimSlot a = anims[idx];
+        int cur = a.cur;
         if (cur == target) { return cur; }
         int dt = nowMs - lastFrameMs;
         if (dt < 1) { dt = 1; }
@@ -1045,7 +1049,7 @@ class App {
         int next = cur + delta;
         if (delta > 0 && next > target) { next = target; }
         if (delta < 0 && next < target) { next = target; }
-        animVals[idx] = next;
+        a.cur = next;
         if (next != target) { needsRedraw = true; }
         return next;
     }
