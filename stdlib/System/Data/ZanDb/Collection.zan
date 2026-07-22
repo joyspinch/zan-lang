@@ -1,5 +1,6 @@
 using System;
 using System.Json;
+using System.Text;
 using System.Threading;
 
 namespace System.Data.ZanDb;
@@ -8,7 +9,8 @@ namespace System.Data.ZanDb;
 /// A named set of documents inside a <see cref="ZanDatabase"/>. Documents are
 /// JsonValue object trees; each gets an auto-incrementing integer _id.
 /// Storage keys are namespaced in the shared B+Tree:
-///   c:{name}:{id}                    document body (canonical JSON)
+///   c:{name}:{id}                    document body (key-dict encoded JSON)
+///   m:{name}:keys                    field-name dictionary (JSON array)
 ///   m:{name}:seq                     last assigned id
 ///   m:{name}:idx                     comma list of indexed fields
 ///   i:{name}:{field}:{value}\t{id}   secondary index entry -> id
@@ -20,10 +22,14 @@ class Collection {
     AsyncRwLock rw;
     string name;
     List<string> indexedFields;
+    List<string> keyDict;
+    bool keyDictDirty;
 
     Collection() {
         this.name = "";
         this.indexedFields = new List<string>();
+        this.keyDict = new List<string>();
+        this.keyDictDirty = false;
     }
 
     static Collection Attach(KvStore kv, AsyncRwLock rw, string name) {
@@ -32,6 +38,7 @@ class Collection {
         c.rw = rw;
         c.name = name;
         c.LoadIndexMeta();
+        c.LoadKeyDict();
         return c;
     }
 
@@ -55,6 +62,10 @@ class Collection {
         return "m:" + this.name + ":idx";
     }
 
+    string KeysMetaKey() {
+        return "m:" + this.name + ":keys";
+    }
+
     string IdxKey(string field, string val, int id) {
         return "i:" + this.name + ":" + field + ":" + val + "\t" + Collection.PadId(id);
     }
@@ -72,6 +83,124 @@ class Collection {
             }
             i = i + 1;
         }
+    }
+
+    // ===== Field-name dictionary =====
+    //
+    // Object keys repeat in every document, so storing them verbatim wastes
+    // space proportional to collection size. Each collection keeps a
+    // persistent field-name dictionary; on disk object keys are 1-based
+    // dictionary ids (a few digits) instead of the full name. Encoded bodies
+    // carry a "K" prefix; legacy plain-JSON bodies (starting with '{') are
+    // still decoded as-is.
+
+    void LoadKeyDict() {
+        this.keyDict = new List<string>();
+        this.keyDictDirty = false;
+        string meta = this.kv.Get(KeysMetaKey());
+        if (meta.Length == 0) { return; }
+        JsonValue arr = JsonValue.Parse(meta);
+        int i = 0;
+        while (i < arr.Count()) {
+            this.keyDict.Add(arr.At(i).AsString(""));
+            i = i + 1;
+        }
+    }
+
+    int KeyId(string k) {
+        int i = 0;
+        while (i < this.keyDict.Count) {
+            if (this.keyDict[i] == k) { return i + 1; }
+            i = i + 1;
+        }
+        this.keyDict.Add(k);
+        this.keyDictDirty = true;
+        return this.keyDict.Count;
+    }
+
+    string KeyName(int id) {
+        if (id >= 1 && id <= this.keyDict.Count) { return this.keyDict[id - 1]; }
+        return "?" + Convert.ToString(id);
+    }
+
+    void PersistKeyDict() {
+        if (!this.keyDictDirty) { return; }
+        JsonValue arr = JsonValue.NewArray();
+        int i = 0;
+        while (i < this.keyDict.Count) {
+            arr.Append(JsonValue.NewStr(this.keyDict[i]));
+            i = i + 1;
+        }
+        this.kv.Put(KeysMetaKey(), arr.ToJson());
+        this.keyDictDirty = false;
+    }
+
+    void WriteEnc(StringBuilder sb, JsonValue v) {
+        if (v.IsObject()) {
+            sb.Append("{");
+            int i = 0;
+            while (i < v.Count()) {
+                if (i > 0) { sb.Append(","); }
+                sb.Append("\"");
+                sb.Append(Convert.ToString(KeyId(v.KeyAt(i))));
+                sb.Append("\":");
+                WriteEnc(sb, v.ValAt(i));
+                i = i + 1;
+            }
+            sb.Append("}");
+            return;
+        }
+        if (v.IsArray()) {
+            sb.Append("[");
+            int i = 0;
+            while (i < v.Count()) {
+                if (i > 0) { sb.Append(","); }
+                WriteEnc(sb, v.At(i));
+                i = i + 1;
+            }
+            sb.Append("]");
+            return;
+        }
+        v.WriteTo(sb);
+    }
+
+    /// <summary>Serializes a document with dictionary-id keys. Must run inside
+    /// a kv transaction: new field names are persisted alongside the body.</summary>
+    string EncodeDoc(JsonValue doc) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("K");
+        WriteEnc(sb, doc);
+        PersistKeyDict();
+        return sb.ToString();
+    }
+
+    JsonValue RemapDecode(JsonValue v) {
+        if (v.IsObject()) {
+            JsonValue o = JsonValue.NewObject();
+            int i = 0;
+            while (i < v.Count()) {
+                o.Set(KeyName(Convert.ToInt(v.KeyAt(i))), RemapDecode(v.ValAt(i)));
+                i = i + 1;
+            }
+            return o;
+        }
+        if (v.IsArray()) {
+            JsonValue a = JsonValue.NewArray();
+            int i = 0;
+            while (i < v.Count()) {
+                a.Append(RemapDecode(v.At(i)));
+                i = i + 1;
+            }
+            return a;
+        }
+        return v;
+    }
+
+    JsonValue DecodeDoc(string body) {
+        if (body.Length > 0 && (body[0] & 255) == 75) {
+            return RemapDecode(JsonValue.Parse(body.Substring(1, body.Length - 1)));
+        }
+        return JsonValue.Parse(body);
     }
 
     void AddIndexEntries(int id, JsonValue doc) {
@@ -113,7 +242,7 @@ class Collection {
         this.kv.Begin();
         int id = NextId();
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-        this.kv.Put(DocKey(id), doc.ToJson());
+        this.kv.Put(DocKey(id), EncodeDoc(doc));
         AddIndexEntries(id, doc);
         this.kv.Commit();
         return id;
@@ -129,7 +258,7 @@ class Collection {
             int id = NextId();
             if (first == 0) { first = id; }
             docs[i].Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-            this.kv.Put(DocKey(id), docs[i].ToJson());
+            this.kv.Put(DocKey(id), EncodeDoc(docs[i]));
             AddIndexEntries(id, docs[i]);
             i = i + 1;
         }
@@ -141,7 +270,7 @@ class Collection {
     JsonValue FindById(int id) {
         string body = this.kv.Get(DocKey(id));
         if (body.Length == 0) { return null; }
-        return JsonValue.Parse(body);
+        return DecodeDoc(body);
     }
 
     bool Exists(int id) { return this.kv.Contains(DocKey(id)); }
@@ -152,7 +281,7 @@ class Collection {
         this.kv.Begin();
         if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-        this.kv.Put(DocKey(id), doc.ToJson());
+        this.kv.Put(DocKey(id), EncodeDoc(doc));
         AddIndexEntries(id, doc);
         this.kv.Commit();
         return true;
@@ -170,7 +299,7 @@ class Collection {
             RemoveIndexEntries(id, FindById(id));
         }
         doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
-        this.kv.Put(DocKey(id), doc.ToJson());
+        this.kv.Put(DocKey(id), EncodeDoc(doc));
         AddIndexEntries(id, doc);
         this.kv.Commit();
     }
@@ -271,7 +400,7 @@ class Collection {
         int i = 0;
         while (i < vs.Count) {
             if (ks[i].Length > 2 && ks[i].Substring(0, 2) == "c:") {
-                docs.Add(JsonValue.Parse(vs[i]));
+                docs.Add(DecodeDoc(vs[i]));
             }
             i = i + 1;
         }
