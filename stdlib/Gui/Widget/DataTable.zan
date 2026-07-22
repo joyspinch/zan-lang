@@ -271,6 +271,38 @@ class SortKey {
     }
 }
 
+/// One bar in the chart-from-selection overlay: its category label and value.
+/// Replaces the old index-aligned chartLabels/chartVals parallel lists.
+class ChartBar {
+    string label;
+    int val;
+
+    ChartBar(string l, int v) {
+        label = l;
+        val = v;
+    }
+}
+
+/// One group-header row in a grouped table: caption, nesting level, contained
+/// data-row count, full path key (collapse lookup) and collapsed snapshot.
+/// Replaces the old index-aligned grpLabel/grpLevel/grpCount/grpKey/grpCollapsed
+/// parallel lists.
+class GroupRow {
+    string label;
+    int level;
+    int count;
+    string key;
+    bool collapsed;
+
+    GroupRow(string lb, int lv, int cnt, string k, bool coll) {
+        label = lb;
+        level = lv;
+        count = cnt;
+        key = k;
+        collapsed = coll;
+    }
+}
+
 /// Persisted DataTable state — create once (outside the frame loop) and pass in
 /// every frame so selection / sort / filter / scroll survive across repaints.
 class DataTableState {
@@ -353,8 +385,7 @@ class DataTableState {
     // ---- chart-from-selection overlay ----
     bool chartOpen;            // bar-chart overlay drawn on top of the grid
     string chartTitle;         // chart caption (value column name)
-    List<string> chartLabels;  // per-bar category label (raw first-column value)
-    List<int> chartVals;       // per-bar value (integer part of the numeric cell)
+    List<ChartBar> chartBars;  // per-bar {category label, value}
     int chartMax;              // largest bar value (>=1), for scaling
 
     // ---- row grouping (ag-Grid / DevExpress style) ----
@@ -363,11 +394,7 @@ class DataTableState {
     List<int> dispKind;        // per display row: 0 = data row, 1 = group header
     List<int> dispRow;         // data-row index (kind 0) or group-table index (kind 1)
     List<int> dispNo;          // 1-based data ordinal for kind-0 rows, else 0
-    List<string> grpLabel;     // group header caption ("Region: North")
-    List<int> grpLevel;        // group nesting depth (0 = outermost)
-    List<int> grpCount;        // number of data rows contained in the group
-    List<string> grpKey;       // full group path key (collapse lookup)
-    List<bool> grpCollapsed;   // per-group collapsed snapshot for rendering
+    List<GroupRow> groups;     // group-header rows (see GroupRow)
 
     // ---- semantic event surface (sender = this state; handlers pull context
     // via HitRow()/HitCol()/SortColIndex()/... per the parameterless model) ----
@@ -459,8 +486,7 @@ class DataTableState {
         s.toastFrames = 0;
         s.chartOpen = false;
         s.chartTitle = "";
-        s.chartLabels = new List<string>();
-        s.chartVals = new List<int>();
+        s.chartBars = new List<ChartBar>();
         s.chartMax = 1;
         s.HeaderClick = UiEvent.Create();
         s.Sort = UiEvent.Create();
@@ -478,11 +504,7 @@ class DataTableState {
         s.dispKind = new List<int>();
         s.dispRow = new List<int>();
         s.dispNo = new List<int>();
-        s.grpLabel = new List<string>();
-        s.grpLevel = new List<int>();
-        s.grpCount = new List<int>();
-        s.grpKey = new List<string>();
-        s.grpCollapsed = new List<bool>();
+        s.groups = new List<GroupRow>();
         s.hitRow = -1;
         s.hitOrder = -1;
         s.hitCol = -1;
@@ -1127,10 +1149,8 @@ class DataTable {
     static int GroupCount(DataTableState st) { return st.groupCols.Count; }
 
     static void CollapseAll(DataTableState st) {
-        int i = 0;
-        while (i < st.grpKey.Count) {
-            if (st.collapsedKeys.IndexOf(st.grpKey[i]) < 0) { st.collapsedKeys.Add(st.grpKey[i]); }
-            i = i + 1;
+        foreach (GroupRow g in st.groups) {
+            if (st.collapsedKeys.IndexOf(g.key) < 0) { st.collapsedKeys.Add(g.key); }
         }
         st.dirty = true;
     }
@@ -1241,11 +1261,7 @@ class DataTable {
         st.dispKind.Clear();
         st.dispRow.Clear();
         st.dispNo.Clear();
-        st.grpLabel.Clear();
-        st.grpLevel.Clear();
-        st.grpCount.Clear();
-        st.grpKey.Clear();
-        st.grpCollapsed.Clear();
+        st.groups.Clear();
         int G = st.groupCols.Count;
         if (G == 0) {
             int i = 0;
@@ -1283,13 +1299,11 @@ class DataTable {
                     while (q < N && DataTable.PathKey(st, src, st.order[q], L) == key) {
                         cnt = cnt + 1; q = q + 1;
                     }
-                    int gi = st.grpLabel.Count;
-                    st.grpLabel.Add(cols[st.groupCols[L]].title + ": "
-                        + src.CellText(rowIdx, st.groupCols[L]));
-                    st.grpLevel.Add(L);
-                    st.grpCount.Add(cnt);
-                    st.grpKey.Add(key);
-                    st.grpCollapsed.Add(DataTable.IsCollapsed(st, key));
+                    int gi = st.groups.Count;
+                    st.groups.Add(new GroupRow(
+                        cols[st.groupCols[L]].title + ": "
+                            + src.CellText(rowIdx, st.groupCols[L]),
+                        L, cnt, key, DataTable.IsCollapsed(st, key)));
                     if (!ancColl) {
                         st.dispKind.Add(1);
                         st.dispRow.Add(gi);
@@ -1895,8 +1909,7 @@ class DataTable {
         int labCol = c0;
         if (labCol == valCol) { labCol = -1; }
 
-        st.chartLabels = new List<string>();
-        st.chartVals = new List<int>();
+        st.chartBars = new List<ChartBar>();
         st.chartMax = 1;
         st.chartTitle = cols[valCol].title;
 
@@ -1908,8 +1921,7 @@ class DataTable {
                 int v = DataTable.ParseIntLoose(src.CellText(ri, valCol));
                 string lab = Convert.ToString(n + 1);
                 if (labCol >= 0) { lab = src.CellText(ri, labCol); }
-                st.chartLabels.Add(lab);
-                st.chartVals.Add(v);
+                st.chartBars.Add(new ChartBar(lab, v));
                 int av = v;
                 if (av < 0) { av = 0 - av; }
                 if (av > st.chartMax) { st.chartMax = av; }
@@ -2457,15 +2469,16 @@ class DataTable {
             // occupies a display slot but carries no data-row payload.
             if (st.dispKind[oiRow] == 1) {
                 int gi = st.dispRow[oiRow];
-                int lvl = st.grpLevel[gi];
+                GroupRow grp = st.groups[gi];
+                int lvl = grp.level;
                 c.FillRect(x + 1, ry, viewW - 2, rowH, t.bgTertiary);
                 int gcx = x + numW + selW + lvl * app.Scale(16) + app.Scale(6);
-                bool gcoll = st.grpCollapsed[gi];
+                bool gcoll = grp.collapsed;
                 string chev = "chevron-down";
                 if (gcoll) { chev = "chevron-right"; }
                 int chSz = app.Scale(14);
                 Icon.Draw(c, chev, gcx, ry + (rowH - chSz) / 2, chSz, t.textSecondary);
-                string glbl = st.grpLabel[gi] + "  (" + Convert.ToString(st.grpCount[gi]) + ")";
+                string glbl = grp.label + "  (" + Convert.ToString(grp.count) + ")";
                 c.DrawText(gcx + chSz + app.Scale(4),
                     ry + (rowH - t.fontSizeMedium) / 2, glbl, t.textPrimary, t.fontSizeMedium);
                 c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
@@ -2666,7 +2679,7 @@ class DataTable {
             if (st.dispKind[ptrOi] == 1) {
                 // group header press: toggle collapse of that group
                 int gi = st.dispRow[ptrOi];
-                DataTable.ToggleCollapse(st, st.grpKey[gi]);
+                DataTable.ToggleCollapse(st, st.groups[gi].key);
                 app.RequestRedraw();
             } else if (app.mouseX >= x && app.mouseX < x + numW) {
                 // row-number press: could become a row click or a reorder drag
@@ -3161,7 +3174,7 @@ class DataTable {
         int plotRight = px + pw - app.Scale(16);
         int plotW = plotRight - plotX;
         int plotH = plotBottom - plotTop;
-        int n = st.chartVals.Count;
+        int n = st.chartBars.Count;
         if (plotH < app.Scale(20) || plotW < app.Scale(20) || n <= 0) {
             // still allow closing even if too small to plot
         } else {
@@ -3182,7 +3195,8 @@ class DataTable {
             if (barW < app.Scale(4)) { barW = app.Scale(4); }
             int i = 0;
             while (i < n) {
-                int av = st.chartVals[i];
+                ChartBar bar = st.chartBars[i];
+                int av = bar.val;
                 if (av < 0) { av = 0 - av; }
                 int bh = av * plotH / mx;
                 if (bh < 1 && av > 0) { bh = 1; }
@@ -3192,7 +3206,7 @@ class DataTable {
                 c.FillRect(bx, byy, barW, bh, t.primary);
 
                 // value label above the bar
-                string vlab = Convert.ToString(st.chartVals[i]);
+                string vlab = Convert.ToString(bar.val);
                 int vlw = Canvas.MeasureText(vlab, t.fontSizeSmall);
                 int vlx = slotL + (slotW - vlw) / 2;
                 int vly = byy - Canvas.FontHeight(t.fontSizeSmall) - app.Scale(2);
@@ -3203,7 +3217,7 @@ class DataTable {
                 c.PushClip(slotL, plotBottom + app.Scale(4), slotW, app.Scale(20));
                 c.DrawTextCentered(slotL, plotBottom + app.Scale(4), slotW,
                                    Canvas.FontHeight(t.fontSizeSmall),
-                                   st.chartLabels[i], t.textTertiary, t.fontSizeSmall);
+                                   bar.label, t.textTertiary, t.fontSizeSmall);
                 c.PopClip();
                 i = i + 1;
             }
