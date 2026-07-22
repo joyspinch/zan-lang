@@ -1,0 +1,305 @@
+using System;
+using System.Text;
+using System.Net.Sockets;
+
+namespace System.Net.Sse;
+
+
+/// <summary>Internal byte-wise substring search shared by the SSE classes
+/// (avoids per-character Substring allocations).</summary>
+class SseText {
+    /// Index of `needle` in `s` at/after `from`, or -1.
+    static int Find(string s, string needle, int from) {
+        int n = s.Length;
+        int m = needle.Length;
+        if (m == 0) { return from; }
+        int i = from;
+        while (i + m <= n) {
+            int j = 0;
+            while (j < m && (s[i + j] & 255) == (needle[j] & 255)) { j = j + 1; }
+            if (j == m) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+/// <summary>
+/// One Server-Sent Events message: the optional `event` name, the `data`
+/// payload (multi-line data fields are joined with '\n' per the SSE spec),
+/// and the optional last-event `id`.
+/// </summary>
+class SseEvent {
+    string name;
+    string data;
+    string id;
+
+    static SseEvent Create() {
+        SseEvent e = new SseEvent();
+        e.name = "";
+        e.data = "";
+        e.id = "";
+        return e;
+    }
+
+    /// <summary>The event name ("message" when the stream did not set one).</summary>
+    string Name() {
+        if (this.name.Length == 0) { return "message"; }
+        return this.name;
+    }
+
+    string Data() { return this.data; }
+    string Id() { return this.id; }
+}
+
+/// <summary>
+/// One accepted SSE subscriber connection on the server side. Obtained from
+/// SseServer.AcceptAsync after the HTTP handshake; push events with
+/// SendAsync/SendDataAsync and finish with Close.
+/// </summary>
+class SseConnection {
+    TcpClient client;
+    string path;
+    bool open;
+
+    static SseConnection Of(TcpClient client, string path) {
+        SseConnection c = new SseConnection();
+        c.client = client;
+        c.path = path;
+        c.open = true;
+        return c;
+    }
+
+    /// <summary>The request path the subscriber asked for (e.g. "/events").</summary>
+    string Path() { return this.path; }
+
+    bool IsOpen() { return this.open; }
+
+    /// <summary>Sends a named event. Each '\n' inside data becomes its own
+    /// `data:` line so multi-line payloads survive the wire format.</summary>
+    async int SendAsync(string eventName, string data) {
+        StringBuilder sb = new StringBuilder();
+        if (eventName.Length > 0) {
+            sb.Append("event: ");
+            sb.Append(eventName);
+            sb.Append("\n");
+        }
+        int start = 0;
+        int i = 0;
+        while (i <= data.Length) {
+            if (i == data.Length || (data[i] & 255) == 10) {
+                sb.Append("data: ");
+                sb.Append(data.Substring(start, i - start));
+                sb.Append("\n");
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        sb.Append("\n");
+        int n = await this.client.SendAsync(sb.ToString());
+        if (n <= 0) { this.open = false; }
+        return n;
+    }
+
+    /// <summary>Sends an unnamed ("message") event.</summary>
+    async int SendDataAsync(string data) {
+        int n = await SendAsync("", data);
+        return n;
+    }
+
+    /// <summary>Sends an SSE comment line, usable as a keep-alive ping.</summary>
+    async int PingAsync() {
+        int n = await this.client.SendAsync(": ping\n\n");
+        return n;
+    }
+
+    void Close() {
+        this.open = false;
+        this.client.Close();
+    }
+}
+
+/// <summary>
+/// Minimal Server-Sent Events server: accepts HTTP GET subscribers, answers
+/// the `text/event-stream` handshake, and hands back an SseConnection the
+/// application pushes events through.
+///
+///   SseServer srv = SseServer.Create("127.0.0.1", 8080);
+///   srv.Start();
+///   SseConnection c = await srv.AcceptAsync();
+///   await c.SendAsync("tick", "hello");
+/// </summary>
+class SseServer {
+    TcpListener listener;
+    bool running;
+
+    static SseServer Create(string host, int port) {
+        SseServer s = new SseServer();
+        s.listener = TcpListener.Create(host, port);
+        s.running = false;
+        return s;
+    }
+
+    void Start() {
+        this.listener.Start();
+        this.running = true;
+    }
+
+    int GetPort() { return this.listener.GetPort(); }
+
+    /// <summary>Waits for the next subscriber, consumes its HTTP request head,
+    /// and completes the event-stream handshake. Returns null when the client
+    /// disconnected mid-handshake.</summary>
+    async SseConnection AcceptAsync() {
+        int sock = await this.listener.AcceptAsync();
+        if (sock < 0) { return null; }
+        TcpClient client = TcpClient.FromSocket(sock);
+
+        // Read until the end of the request headers (\r\n\r\n).
+        string req = "";
+        while (SseText.Find(req, "\r\n\r\n", 0) < 0 && req.Length < 65536) {
+            string chunk = await client.RecvAsync(4096);
+            if (chunk.Length == 0) { client.Close(); return null; }
+            req = req + chunk;
+        }
+
+        // First line: "GET /path HTTP/1.1" -> extract the path.
+        string path = "/";
+        int sp1 = SseText.Find(req, " ", 0);
+        if (sp1 >= 0) {
+            int sp2 = SseText.Find(req, " ", sp1 + 1);
+            if (sp2 > sp1) { path = req.Substring(sp1 + 1, sp2 - sp1 - 1); }
+        }
+
+        await client.SendAsync("HTTP/1.1 200 OK\r\n"
+            + "Content-Type: text/event-stream\r\n"
+            + "Cache-Control: no-cache\r\n"
+            + "Connection: keep-alive\r\n"
+            + "Access-Control-Allow-Origin: *\r\n"
+            + "\r\n");
+        return SseConnection.Of(client, path);
+    }
+
+    void Stop() {
+        this.running = false;
+        this.listener.Stop();
+    }
+}
+
+/// <summary>
+/// Server-Sent Events client: connects, performs the HTTP handshake, then
+/// yields parsed events one at a time.
+///
+///   SseClient c = await SseClient.ConnectAsync("127.0.0.1", 8080, "/events");
+///   SseEvent e = await c.NextAsync();
+/// </summary>
+class SseClient {
+    TcpClient client;
+    string buf;
+    bool connected;
+
+    /// <summary>Connects and sends the subscription request. Returns a client
+    /// whose IsConnected() is false when the server rejected the stream.</summary>
+    static async SseClient ConnectAsync(string host, int port, string path) {
+        SseClient c = new SseClient();
+        c.buf = "";
+        c.connected = false;
+        c.client = await TcpClient.ConnectAsync(host, port);
+        await c.client.SendAsync("GET " + path + " HTTP/1.1\r\n"
+            + "Host: " + host + ":" + Convert.ToString(port) + "\r\n"
+            + "Accept: text/event-stream\r\n"
+            + "Connection: keep-alive\r\n"
+            + "\r\n");
+
+        // Consume the response headers; anything after \r\n\r\n is stream data.
+        string head = "";
+        while (SseText.Find(head, "\r\n\r\n", 0) < 0 && head.Length < 65536) {
+            string chunk = await c.client.RecvAsync(4096);
+            if (chunk.Length == 0) { c.client.Close(); return c; }
+            head = head + chunk;
+        }
+        if (SseText.Find(head, " 200 ", 0) < 0) { c.client.Close(); return c; }
+        int bodyAt = SseText.Find(head, "\r\n\r\n", 0);
+        c.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
+        c.connected = true;
+        return c;
+    }
+
+    bool IsConnected() { return this.connected; }
+
+    /// <summary>Blocks (suspending the coroutine) until the next full event
+    /// arrives. Returns null when the server closed the stream. Comment lines
+    /// (keep-alive pings) are skipped transparently.</summary>
+    async SseEvent NextAsync() {
+        if (!this.connected) { return null; }
+        while (true) {
+            // An event ends at a blank line; the stream may use \n or \r\n.
+            int end = SseText.Find(this.buf, "\n\n", 0);
+            int sepLen = 2;
+            int endCrlf = SseText.Find(this.buf, "\r\n\r\n", 0);
+            if (endCrlf >= 0 && (end < 0 || endCrlf < end)) { end = endCrlf; sepLen = 4; }
+            if (end >= 0) {
+                string block = this.buf.Substring(0, end);
+                this.buf = this.buf.Substring(end + sepLen,
+                                              this.buf.Length - end - sepLen);
+                SseEvent e = ParseBlock(block);
+                if (e != null) { return e; }
+                continue;                     // block was only comments
+            }
+            string chunk = await this.client.RecvAsync(4096);
+            if (chunk.Length == 0) {
+                this.connected = false;
+                return null;
+            }
+            this.buf = this.buf + chunk;
+        }
+        return null;
+    }
+
+    /// <summary>Parses one event block (lines of "field: value"). Returns null
+    /// if the block held no event/data/id fields (pure comment).</summary>
+    SseEvent ParseBlock(string block) {
+        SseEvent e = SseEvent.Create();
+        bool any = false;
+        int start = 0;
+        int i = 0;
+        bool firstData = true;
+        while (i <= block.Length) {
+            if (i == block.Length || (block[i] & 255) == 10) {
+                int lineEnd = i;
+                if (lineEnd > start && (block[lineEnd - 1] & 255) == 13) {
+                    lineEnd = lineEnd - 1;    // strip trailing \r
+                }
+                string line = block.Substring(start, lineEnd - start);
+                if (line.Length > 0 && line.Substring(0, 1) != ":") {
+                    string field = line;
+                    string val = "";
+                    int colon = SseText.Find(line, ":", 0);
+                    if (colon >= 0) {
+                        field = line.Substring(0, colon);
+                        val = line.Substring(colon + 1, line.Length - colon - 1);
+                        if (val.Length > 0 && val.Substring(0, 1) == " ") {
+                            val = val.Substring(1, val.Length - 1);
+                        }
+                    }
+                    if (field == "event") { e.name = val; any = true; }
+                    else if (field == "data") {
+                        if (firstData) { e.data = val; firstData = false; }
+                        else { e.data = e.data + "\n" + val; }
+                        any = true;
+                    }
+                    else if (field == "id") { e.id = val; any = true; }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (!any) { return null; }
+        return e;
+    }
+
+    void Close() {
+        this.connected = false;
+        this.client.Close();
+    }
+}
