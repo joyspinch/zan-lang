@@ -1,0 +1,377 @@
+using System;
+using System.Json;
+using System.Text;
+
+namespace System.Net.Rpc;
+
+/// <summary>
+/// XML-RPC codec. Maps the neutral RpcRequest/RpcResponse model onto the
+/// classic `<methodCall>` / `<methodResponse>` envelopes, reusing JsonValue as
+/// the structured value model (int/double/boolean/string/array/struct <->
+/// number/bool/string/array/object). XML-RPC has no request id on the wire, so
+/// responses decode with id 0; the kernel correlates by request/response order
+/// on the connection. This proves the codec axis: the same RpcClient/RpcServer
+/// speak XML-RPC just by swapping the codec.
+/// </summary>
+class XmlRpcCodec : IRpcCodec {
+
+    string Name() { return "xml-rpc"; }
+
+    // ---- encode ----------------------------------------------------------
+
+    static bool IsDouble(string raw) {
+        int i = 0;
+        while (i < raw.Length) {
+            int c = raw[i] & 255;
+            if (c == 46 || c == 101 || c == 69) { return true; }   // '.' 'e' 'E'
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static string XmlEscape(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 38) { sb.Append("&amp;"); }
+            else if (c == 60) { sb.Append("&lt;"); }
+            else if (c == 62) { sb.Append("&gt;"); }
+            else { sb.Append(s.Substring(i, 1)); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static void WriteValue(StringBuilder sb, JsonValue v) {
+        sb.Append("<value>");
+        if (v == null || v.IsNull()) {
+            sb.Append("<string></string>");
+        } else if (v.IsBool()) {
+            sb.Append("<boolean>");
+            if (v.AsBool(false)) { sb.Append("1"); } else { sb.Append("0"); }
+            sb.Append("</boolean>");
+        } else if (v.IsNumber()) {
+            string raw = v.AsString("0");
+            if (XmlRpcCodec.IsDouble(raw)) {
+                sb.Append("<double>"); sb.Append(raw); sb.Append("</double>");
+            } else {
+                sb.Append("<int>"); sb.Append(raw); sb.Append("</int>");
+            }
+        } else if (v.IsString()) {
+            sb.Append("<string>");
+            sb.Append(XmlRpcCodec.XmlEscape(v.AsString("")));
+            sb.Append("</string>");
+        } else if (v.IsArray()) {
+            sb.Append("<array><data>");
+            int i = 0;
+            while (i < v.Count()) { XmlRpcCodec.WriteValue(sb, v.At(i)); i = i + 1; }
+            sb.Append("</data></array>");
+        } else if (v.IsObject()) {
+            sb.Append("<struct>");
+            int i = 0;
+            while (i < v.Count()) {
+                sb.Append("<member><name>");
+                sb.Append(XmlRpcCodec.XmlEscape(v.KeyAt(i)));
+                sb.Append("</name>");
+                XmlRpcCodec.WriteValue(sb, v.ValAt(i));
+                sb.Append("</member>");
+                i = i + 1;
+            }
+            sb.Append("</struct>");
+        }
+        sb.Append("</value>");
+    }
+
+    string EncodeRequest(RpcRequest req) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\"?><methodCall><methodName>");
+        sb.Append(XmlRpcCodec.XmlEscape(req.method));
+        sb.Append("</methodName><params>");
+        JsonValue a = req.args;
+        if (a != null && a.IsArray()) {
+            int i = 0;
+            while (i < a.Count()) {
+                sb.Append("<param>");
+                XmlRpcCodec.WriteValue(sb, a.At(i));
+                sb.Append("</param>");
+                i = i + 1;
+            }
+        } else if (a != null && !a.IsNull()) {
+            sb.Append("<param>");
+            XmlRpcCodec.WriteValue(sb, a);
+            sb.Append("</param>");
+        }
+        sb.Append("</params></methodCall>");
+        return sb.ToString();
+    }
+
+    string EncodeResponse(RpcResponse resp) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\"?><methodResponse>");
+        if (resp.IsError()) {
+            sb.Append("<fault><value><struct>");
+            sb.Append("<member><name>faultCode</name><value><int>");
+            sb.Append(Convert.ToString(resp.error.code));
+            sb.Append("</int></value></member>");
+            sb.Append("<member><name>faultString</name><value><string>");
+            sb.Append(XmlRpcCodec.XmlEscape(resp.error.message));
+            sb.Append("</string></value></member>");
+            sb.Append("</struct></value></fault>");
+        } else {
+            sb.Append("<params><param>");
+            XmlRpcCodec.WriteValue(sb, resp.result);
+            sb.Append("</param></params>");
+        }
+        sb.Append("</methodResponse>");
+        return sb.ToString();
+    }
+
+    // ---- decode ----------------------------------------------------------
+
+    RpcResponse DecodeResponse(string frame) {
+        XmlRpcReader r = XmlRpcReader.Of(frame);
+        if (r.SeekOpen("fault")) {
+            if (r.SeekOpen("value")) {
+                JsonValue fv = r.ReadValue();
+                int code = -1;
+                string msg = "";
+                if (fv != null && fv.IsObject()) {
+                    code = fv.Int("faultCode", -1);
+                    msg = fv.Str("faultString", "");
+                }
+                return RpcResponse.Fail(0, new RpcError(code, msg));
+            }
+            return RpcResponse.Fail(0, RpcError.Internal("malformed XML-RPC fault"));
+        }
+        XmlRpcReader r2 = XmlRpcReader.Of(frame);
+        if (r2.SeekOpen("value")) {
+            return RpcResponse.Ok(0, r2.ReadValue());
+        }
+        return RpcResponse.Ok(0, null);
+    }
+
+    RpcRequest DecodeRequest(string frame) {
+        XmlRpcReader r = XmlRpcReader.Of(frame);
+        string method = "";
+        if (r.SeekOpen("methodName")) {
+            r.ConsumeHead();
+            method = XmlRpcReader.Unescape(r.ReadTextUntilLt());
+        }
+        JsonValue args = JsonValue.NewArray();
+        XmlRpcReader p = XmlRpcReader.Of(frame);
+        if (p.SeekOpen("params")) {
+            while (p.SeekOpen("value")) {
+                args.Append(p.ReadValue());
+            }
+        }
+        return RpcRequest.Call(method, args, 0);
+    }
+}
+
+/// A cursor over an XML-RPC document. Deliberately scoped to the XML-RPC value
+/// grammar (not a general XML parser): it walks value/type/array/struct nodes
+/// and tolerates the incidental whitespace real servers emit between tags.
+class XmlRpcReader {
+    string s;
+    int pos;
+    int len;
+
+    static XmlRpcReader Of(string src) {
+        XmlRpcReader r = new XmlRpcReader();
+        r.s = src;
+        r.pos = 0;
+        r.len = src.Length;
+        return r;
+    }
+
+    int CurB() {
+        if (pos >= len) { return -1; }
+        return s[pos] & 255;
+    }
+
+    void SkipWs() {
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 32 || c == 9 || c == 10 || c == 13) { pos = pos + 1; }
+            else { return; }
+        }
+    }
+
+    /// Moves pos to the '<' of the next `<tag` open element, or returns false.
+    bool SeekOpen(string tag) {
+        string needle = "<" + tag;
+        int i = pos;
+        int nl = needle.Length;
+        while (i + nl <= len) {
+            if (s.Substring(i, nl) == needle) {
+                int c = 62;
+                if (i + nl < len) { c = s[i + nl] & 255; }
+                if (c == 62 || c == 47 || c == 32 || c == 9 || c == 10 || c == 13) {
+                    pos = i;
+                    return true;
+                }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Consumes the current tag head up to and including '>'; returns true when
+    /// it was self-closing ("<tag/>").
+    bool ConsumeHead() {
+        int prev = 0;
+        while (pos < len) {
+            int c = s[pos] & 255;
+            pos = pos + 1;
+            if (c == 62) { return prev == 47; }
+            prev = c;
+        }
+        return false;
+    }
+
+    /// pos must be at '<'; reads the element name and consumes the tag head.
+    string ReadElementOpen() {
+        int start = pos + 1;
+        int i = start;
+        while (i < len) {
+            int c = s[i] & 255;
+            if (c == 62 || c == 47 || c == 32 || c == 9 || c == 10 || c == 13) { break; }
+            i = i + 1;
+        }
+        string name = s.Substring(start, i - start);
+        this.ConsumeHead();
+        return name;
+    }
+
+    /// Reads raw text from pos up to the next '<'.
+    string ReadTextUntilLt() {
+        int start = pos;
+        while (pos < len && (s[pos] & 255) != 60) { pos = pos + 1; }
+        return s.Substring(start, pos - start);
+    }
+
+    bool LookingAtCloseOf(string name) {
+        string needle = "</" + name;
+        if (pos + needle.Length > len) { return false; }
+        return s.Substring(pos, needle.Length) == needle;
+    }
+
+    bool LookingAtOpenOf(string name) {
+        string needle = "<" + name;
+        if (pos + needle.Length > len) { return false; }
+        if (s.Substring(pos, needle.Length) != needle) { return false; }
+        int c = 62;
+        if (pos + needle.Length < len) { c = s[pos + needle.Length] & 255; }
+        return c == 62 || c == 47 || c == 32 || c == 9 || c == 10 || c == 13;
+    }
+
+    /// Consumes a closing `</name>` at pos (after optional whitespace).
+    void ConsumeClose(string name) {
+        SkipWs();
+        if (this.LookingAtCloseOf(name)) { this.ConsumeHead(); }
+    }
+
+    static string Unescape(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 38) {                                  // '&'
+                if (i + 4 < n && s.Substring(i, 5) == "&amp;") { sb.Append("&"); i = i + 5; }
+                else if (i + 3 < n && s.Substring(i, 4) == "&lt;") { sb.Append("<"); i = i + 4; }
+                else if (i + 3 < n && s.Substring(i, 4) == "&gt;") { sb.Append(">"); i = i + 4; }
+                else if (i + 5 < n && s.Substring(i, 6) == "&quot;") { sb.Append("\""); i = i + 6; }
+                else if (i + 5 < n && s.Substring(i, 6) == "&apos;") { sb.Append("'"); i = i + 6; }
+                else { sb.Append("&"); i = i + 1; }
+            } else {
+                sb.Append(s.Substring(i, 1));
+                i = i + 1;
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// pos must be at '<value'. Reads a full XML-RPC value, leaving pos past the
+    /// closing `</value>`.
+    JsonValue ReadValue() {
+        bool selfClose = this.ConsumeHead();      // consume '<value>'
+        if (selfClose) { return JsonValue.NewStr(""); }
+        this.SkipWs();
+        if (this.CurB() != 60) {                  // raw text (untyped => string)
+            string txt = XmlRpcReader.Unescape(this.ReadTextUntilLt());
+            this.ConsumeClose("value");
+            return JsonValue.NewStr(txt);
+        }
+        if (this.LookingAtCloseOf("value")) {     // <value></value>
+            this.ConsumeClose("value");
+            return JsonValue.NewStr("");
+        }
+        JsonValue result = this.ReadTyped();
+        this.SkipWs();
+        this.ConsumeClose("value");
+        return result;
+    }
+
+    /// pos at the '<' of a type element (int/double/boolean/string/array/struct).
+    JsonValue ReadTyped() {
+        string tag = this.ReadElementOpen();
+        if (tag == "int" || tag == "i4") {
+            string t = this.ReadTextUntilLt();
+            this.ConsumeClose(tag);
+            return JsonValue.NewNum(t);
+        }
+        if (tag == "double") {
+            string t = this.ReadTextUntilLt();
+            this.ConsumeClose(tag);
+            return JsonValue.NewNum(t);
+        }
+        if (tag == "boolean") {
+            string t = this.ReadTextUntilLt();
+            this.ConsumeClose(tag);
+            return JsonValue.NewBool(t == "1");
+        }
+        if (tag == "array") {
+            JsonValue arr = JsonValue.NewArray();
+            if (this.SeekOpen("data")) { this.ConsumeHead(); }
+            while (true) {
+                this.SkipWs();
+                if (this.LookingAtOpenOf("value")) {
+                    arr.Append(this.ReadValue());
+                } else {
+                    break;
+                }
+            }
+            this.ConsumeClose("data");
+            this.ConsumeClose("array");
+            return arr;
+        }
+        if (tag == "struct") {
+            JsonValue obj = JsonValue.NewObject();
+            while (true) {
+                this.SkipWs();
+                if (!this.LookingAtOpenOf("member")) { break; }
+                this.ConsumeHead();                // consume '<member>'
+                this.SkipWs();
+                string key = "";
+                if (this.LookingAtOpenOf("name")) {
+                    this.ConsumeHead();
+                    key = XmlRpcReader.Unescape(this.ReadTextUntilLt());
+                    this.ConsumeClose("name");
+                }
+                this.SkipWs();
+                JsonValue mv = JsonValue.NewStr("");
+                if (this.LookingAtOpenOf("value")) { mv = this.ReadValue(); }
+                obj.Put(key, mv);
+                this.ConsumeClose("member");
+            }
+            this.ConsumeClose("struct");
+            return obj;
+        }
+        // string or any unknown type: read text
+        string txt = XmlRpcReader.Unescape(this.ReadTextUntilLt());
+        this.ConsumeClose(tag);
+        return JsonValue.NewStr(txt);
+    }
+}
