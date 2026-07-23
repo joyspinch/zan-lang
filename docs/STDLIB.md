@@ -426,12 +426,16 @@ class Enumerable {
     static List<Grouping<T>> GroupBy<T>(this List<T> src, KeySelector<T> key);
     static List<Grouping<T>> GroupByStr<T>(this List<T> src, StrKeySelector<T> key);
 
-    // set / membership (== semantics; use the *Str forms for string values)
+    // set / membership (== semantics; use the *Str forms for string values,
+    // or the EqualityComparer overloads for structural equality)
     static bool Contains<T>(this List<T> src, T target);
+    static bool Contains<T>(this List<T> src, T target, EqualityComparer<T> eq);
     static bool ContainsStr(this List<string> src, string target);
     static List<T> Distinct<T>(this List<T> src);
+    static List<T> Distinct<T>(this List<T> src, EqualityComparer<T> eq);
     static List<string> DistinctStr(this List<string> src);
     static List<T> In<T>(this List<T> src, List<T> values);      // SQL IN
+    static List<T> In<T>(this List<T> src, List<T> values, EqualityComparer<T> eq);
     static List<string> InStr(this List<string> src, List<string> values);
     static List<string> Like(this List<string> src, string pattern); // SQL LIKE
 
@@ -462,7 +466,10 @@ Differences from C# (by design or pending compiler work — see
 - **`*Num` aggregate names** for `List<double>` receivers (`SumNum`,
   `MinNum`, `MaxNum`, `AverageNum`) for the same overload-resolution reason.
 - **String membership uses the `*Str` forms** (`ContainsStr`, `DistinctStr`,
-  `InStr`): the generic forms compare references for strings.
+  `InStr`): the generic forms compare references for strings. For other
+  reference types, pass an `EqualityComparer<T>` delegate
+  (`delegate bool EqualityComparer<T>(T a, T b)`) to `Contains`/`Distinct`/
+  `In` for structural (C# `Equals`-style) semantics.
 - **No `ToDictionary`** yet (blocked by a Dictionary generic-value bug).
 - `Grouping<T>` exposes `Key` (string), `IntKey` (int) and `Items`.
 

@@ -12,6 +12,9 @@
 
 1. **P0 硬伤**（阶段 1）：
    - A1 修复 O0 codegen bug（`docs/bugs/O0-list-index-write-stack-leak.md`）。
+     **已完成**：循环体内局部量/编解码临时量改为函数入口块一次性
+     alloca（emit_entry_alloca），-O0 不再每次迭代增长栈
+     （`tests/conformance/list_index_write_o0.zan`）。
    - A2 stdlib 错误模型统一：File/Net/Json 失败 throw 标准异常，不再静默返回空。
      **File 部分已完成**：`FileNotFoundException`/`IOException` 落地，
      读/写/复制失败抛异常（`tests/conformance/io_errors.zan`）；编译器
@@ -46,8 +49,8 @@
 | B1 | ~~泛型可比较键~~ → 已落地为类型化键名：`OrderByStr/OrderByStrDescending`（string 键）、`OrderByNum/OrderByNumDescending`（double 键）、`OrderBy(k1, k2)` 二级 int 键（泛型键受编译器 bug 限制，见 `docs/bugs/generics-uniform-repr.md`） | **已完成** | `tests/conformance/linq_extended.zan` |
 | B2 | 核心算子：`GroupBy/GroupByStr`、`SelectMany`、`Single/SingleOrDefault`、`LastOrDefault`、`Sum/Min/Max/Average(selector)`、`TakeWhile/SkipWhile`、`ContainsStr/DistinctStr/InStr`（`ToDictionary` 被 Dictionary 泛型值 bug 阻塞，见 bug 文档 §5） | **已完成** | 同上 |
 | B3 | 异常语义对齐 C#：空序列 `First/Last/Single` 抛 `InvalidOperationException`；保留 `*OrDefault` 返回默认值 | **已完成** | 同上（`stdlib/System/Exception.zan` 新增 InvalidOperationException/ArgumentException） |
-| B4 | `Contains/Distinct/In` 对引用类型支持 `Equals` 语义（当前仅 `==`） | P1 | 自定义类型去重/包含用例通过 |
-| B5 | 文档：`docs/STDLIB.md` 增补 LINQ 章节，明确与 C# 的差异清单（急切求值、无 IEnumerable） | P1 | 文档与实现一致 |
+| B4 | `Contains/Distinct/In` 对引用类型支持 `Equals` 语义：新增 `EqualityComparer<T>` 委托重载（虚方法 `Equals` 受泛型统一表示限制） | **已完成** | `tests/conformance/linq_equality.zan` |
+| B5 | 文档：`docs/STDLIB.md` 增补 LINQ 章节，明确与 C# 的差异清单（急切求值、无 IEnumerable） | **已完成** | STDLIB.md §3.6 |
 | B6 | 惰性迭代器：`yield` 生成真正的惰性迭代器，LINQ 算子基于 IEnumerable 惰性链 | P2 | 无限序列 + Take 用例通过；现有急切用例不回归 |
 | B7 | LINQ 查询语法（`from … where … select`）脱糖为方法链 | P2 | parser/binder 支持，conformance 覆盖 join/group |
 | B8 | 语言便利特性（按需）：`using` 声明、`init`/`with`、`checked` | P2 | 逐项 SPEC + conformance |
