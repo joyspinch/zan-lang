@@ -851,6 +851,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef exc_val = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc");
         LLVMValueRef exc_slot = emit_entry_alloca(g, i8ptr, "eh.exc.slot");
         LLVMBuildStore(g->builder, exc_val, exc_slot);
+        /* set when a matched handler takes over the in-flight +1 (see the
+         * ownership transfer at the top of each catch body) */
+        LLVMValueRef exc_owned_slot = emit_entry_alloca(g, i32t, "eh.excown.slot");
+        LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), exc_owned_slot);
         int catch_start = locals->count;
         int ncatch = stmt->try_stmt.catches.count;
         if (ncatch > 0) {
@@ -900,6 +904,29 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMValueRef ea = emit_entry_alloca(g, i8ptr, "exc.var");
                     LLVMBuildStore(g->builder, ev, ea);
                     local_add(locals, cc->catch_clause.var_name, ea, et);
+                }
+                /* transfer the in-flight +1 into this handler: clear the
+                 * global owned flag (so a throw during the handler doesn't
+                 * touch it) and stack the object as an EH temp so a throw
+                 * escaping this handler releases it via the outer catch's
+                 * temp unwind; the normal handler exit pops and releases. */
+                {
+                    LLVMValueRef owned_g2 = get_eh_exc_owned_global(g);
+                    LLVMValueRef ofl = LLVMBuildLoad2(g->builder, i32t, owned_g2, "exc.ofl");
+                    LLVMBuildStore(g->builder, ofl, exc_owned_slot);
+                    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), owned_g2);
+                    LLVMValueRef isown = LLVMBuildICmp(g->builder, LLVMIntNE, ofl,
+                        LLVMConstInt(i32t, 0, 0), "exc.isown");
+                    LLVMBasicBlockRef push_bb =
+                        LLVMAppendBasicBlockInContext(g->ctx, fn, "exc.push");
+                    LLVMBasicBlockRef pcont_bb =
+                        LLVMAppendBasicBlockInContext(g->ctx, fn, "exc.pcont");
+                    LLVMBuildCondBr(g->builder, isown, push_bb, pcont_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, push_bb);
+                    LLVMValueRef ev2 = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
+                    emit_eh_tmp_push(g, ev2);
+                    LLVMBuildBr(g->builder, pcont_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, pcont_bb);
                 }
                 emit_stmt(g, cc->catch_clause.body, locals);
                 locals->count = catch_start;
@@ -985,6 +1012,25 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), exc_g);
             LLVMBuildBr(g->builder, cont_bb);
             LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+            /* handler-owned release: a matched catch body transferred the
+             * in-flight +1 to itself (owned flag in exc_owned_slot, object
+             * stacked as an EH temp) -- pop the temp and release it now */
+            LLVMValueRef hofl = LLVMBuildLoad2(g->builder, i32t, exc_owned_slot,
+                "exc.hown");
+            LLVMValueRef h_owned = LLVMBuildICmp(g->builder, LLVMIntNE, hofl,
+                LLVMConstInt(i32t, 0, 0), "exc.hisown");
+            LLVMBasicBlockRef hrel_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.hrel");
+            LLVMBasicBlockRef hcont_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.hcont");
+            LLVMBuildCondBr(g->builder, h_owned, hrel_bb, hcont_bb);
+            LLVMPositionBuilderAtEnd(g->builder, hrel_bb);
+            emit_eh_tmp_pop(g);
+            LLVMValueRef hev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.hre");
+            zan_call2(g->builder,
+                LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+                g->rt_release_dyn, &hev, 1, "");
+            LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), exc_g);
+            LLVMBuildBr(g->builder, hcont_bb);
+            LLVMPositionBuilderAtEnd(g->builder, hcont_bb);
             LLVMBuildBr(g->builder, end_bb);
         }
 

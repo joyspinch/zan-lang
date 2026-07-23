@@ -570,6 +570,16 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
                 if (ot && ot->kind == TYPE_STRING)
                     return zan_binder_make_list_type(g->binder, g->binder->type_string);
             }
+            /* string.Join / string.Format statics return a fresh owned string */
+            if (callee->member.object->kind == AST_IDENTIFIER &&
+                !local_find(locals, callee->member.object->ident.name)) {
+                zan_istr_t on = callee->member.object->ident.name;
+                int sr = on.len == 6 && (memcmp(on.str, "string", 6) == 0 ||
+                                         memcmp(on.str, "String", 6) == 0);
+                if (sr && ((mm.len == 4 && memcmp(mm.str, "Join", 4) == 0) ||
+                           (mm.len == 6 && memcmp(mm.str, "Format", 6) == 0)))
+                    return g->binder->type_string;
+            }
         }
         if (callee->kind == AST_IDENTIFIER) {
             /* bare call: current class method, else global function */

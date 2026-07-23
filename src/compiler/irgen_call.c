@@ -638,8 +638,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 expr->call.args.count >= 1 &&
                 expr->call.args.items[0]->kind == AST_STRING_LITERAL) {
                 /* compile-time expansion of a literal format: split on {N}
-                 * placeholders and concatenate pieces with stringified args. */
+                 * placeholders and concatenate pieces with stringified args.
+                 * `res` always holds an owned (+1) string; each fold releases
+                 * the previous accumulator and any owned piece. */
                 zan_istr_t f = expr->call.args.items[0]->str_val;
+                zan_type_t *str_ty = g->binder->type_string;
                 LLVMValueRef res = NULL;
                 int seg_start = 0;
                 for (int i = 0; i < f.len; i++) {
@@ -653,12 +656,33 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             if (i > seg_start) {
                                 zan_istr_t seg = { f.str + seg_start, i - seg_start };
                                 LLVMValueRef sl = emit_string_literal_rc(g, seg);
-                                res = res ? emit_str_concat(g, res, sl) : sl;
+                                if (res) {
+                                    LLVMValueRef nr = emit_str_concat(g, res, sl);
+                                    emit_rc_release_for_type(g, str_ty, res);
+                                    emit_rc_release_for_type(g, str_ty, sl);
+                                    res = nr;
+                                } else {
+                                    res = sl;
+                                }
                             }
-                            LLVMValueRef av = emit_expr(g,
-                                expr->call.args.items[idx + 1], locals);
+                            zan_ast_node_t *arg_ast = expr->call.args.items[idx + 1];
+                            LLVMValueRef av = emit_expr(g, arg_ast, locals);
                             LLVMValueRef as = emit_to_cstr(g, av);
-                            res = res ? emit_str_concat(g, res, as) : as;
+                            int as_owned =
+                                LLVMGetTypeKind(LLVMTypeOf(av)) != LLVMPointerTypeKind ||
+                                expr_yields_owned_rc_value(g, arg_ast, locals);
+                            if (res) {
+                                LLVMValueRef nr = emit_str_concat(g, res, as);
+                                emit_rc_release_for_type(g, str_ty, res);
+                                if (as_owned)
+                                    emit_rc_release_for_type(g, str_ty, as);
+                                res = nr;
+                            } else if (as_owned) {
+                                res = as;
+                            } else {
+                                emit_rc_retain_for_type(g, str_ty, as);
+                                res = as;
+                            }
                             i = j;
                             seg_start = j + 1;
                         }
@@ -667,7 +691,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (seg_start < f.len || !res) {
                     zan_istr_t seg = { f.str + seg_start, f.len - seg_start };
                     LLVMValueRef sl = emit_string_literal_rc(g, seg);
-                    res = res ? emit_str_concat(g, res, sl) : sl;
+                    if (res) {
+                        LLVMValueRef nr = emit_str_concat(g, res, sl);
+                        emit_rc_release_for_type(g, str_ty, res);
+                        emit_rc_release_for_type(g, str_ty, sl);
+                        res = nr;
+                    } else {
+                        res = sl;
+                    }
                 }
                 return res;
             }
