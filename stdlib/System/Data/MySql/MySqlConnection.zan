@@ -5,6 +5,18 @@ using System.Security.Cryptography;
 
 namespace System.Data.MySql;
 
+/// <summary>One cached prepared statement: its SQL text and the matching
+/// server-side statement id. One entity instead of parallel sql/id lists.</summary>
+class PreparedStmt {
+    string sql;
+    int id;
+
+    PreparedStmt(string sql, int id) {
+        this.sql = sql;
+        this.id = id;
+    }
+}
+
 /// <summary>
 /// Native, coroutine-ized MySQL / MariaDB client that speaks the MySQL wire
 /// protocol directly over Zan's asynchronous sockets -- no libmariadb, no ODBC,
@@ -40,8 +52,7 @@ class MySqlConnection {
     int lastSeq;        // sequence id of the most recently read packet
     int lastAffected;   // affected rows / row count of the last statement
     bool hadError;      // whether the last statement returned an ERR packet
-    List<string> stmtSqls;  // prepared-statement cache: SQL text ...
-    List<int> stmtIds;      // ... and matching server-side statement id
+    List<PreparedStmt> stmtCache;  // prepared-statement cache (SQL -> server id)
 
     [DllImport("crt")]
     static extern string calloc(int count, int size);
@@ -58,8 +69,7 @@ class MySqlConnection {
         this.lastSeq = 0;
         this.lastAffected = 0;
         this.hadError = false;
-        this.stmtSqls = new List<string>();
-        this.stmtIds = new List<int>();
+        this.stmtCache = new List<PreparedStmt>();
     }
 
     // ============================================================
@@ -854,8 +864,8 @@ class MySqlConnection {
     /// <summary>Index of sql in the statement cache, or -1.</summary>
     int stmtCacheFind(string sql) {
         int i = 0;
-        while (i < this.stmtSqls.Count) {
-            if (this.stmtSqls[i] == sql) { return i; }
+        while (i < this.stmtCache.Count) {
+            if (this.stmtCache[i].sql == sql) { return i; }
             i = i + 1;
         }
         return -1;
@@ -864,23 +874,20 @@ class MySqlConnection {
     /// <summary>Caches a prepared statement id, closing the oldest entry when
     /// the cache is full (32 statements per connection).</summary>
     async int stmtCacheAdd(string sql, int stmtId) {
-        if (this.stmtSqls.Count >= 32) {
-            await this.stmtClose(this.stmtIds[0]);
-            this.stmtSqls.RemoveAt(0);
-            this.stmtIds.RemoveAt(0);
+        if (this.stmtCache.Count >= 32) {
+            await this.stmtClose(this.stmtCache[0].id);
+            this.stmtCache.RemoveAt(0);
         }
-        this.stmtSqls.Add(sql);
-        this.stmtIds.Add(stmtId);
+        this.stmtCache.Add(new PreparedStmt(sql, stmtId));
         return 0;
     }
 
     /// <summary>Drops a statement from the cache (after a server error).</summary>
     void stmtCacheRemove(int stmtId) {
         int i = 0;
-        while (i < this.stmtIds.Count) {
-            if (this.stmtIds[i] == stmtId) {
-                this.stmtSqls.RemoveAt(i);
-                this.stmtIds.RemoveAt(i);
+        while (i < this.stmtCache.Count) {
+            if (this.stmtCache[i].id == stmtId) {
+                this.stmtCache.RemoveAt(i);
                 return;
             }
             i = i + 1;
@@ -904,7 +911,7 @@ class MySqlConnection {
         int stmtId = 0;
         int hit = this.stmtCacheFind(sql);
         if (hit >= 0) {
-            stmtId = this.stmtIds[hit];
+            stmtId = this.stmtCache[hit].id;
         } else {
             List<int> ids = new List<int>();
             bool ok = await this.stmtPrepare(sql, ids);
@@ -1032,7 +1039,6 @@ class MySqlConnection {
             this.sock = -1;
         }
         // Server-side statements die with the connection.
-        this.stmtSqls = new List<string>();
-        this.stmtIds = new List<int>();
+        this.stmtCache = new List<PreparedStmt>();
     }
 }
