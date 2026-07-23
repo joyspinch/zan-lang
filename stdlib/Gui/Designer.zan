@@ -28,6 +28,19 @@ namespace Gui;
 ///   Designer d = Designer.Create();   // once
 ///   d.Seed(app);                      // optional sample fields
 ///   d.Render(app, x, y, w, h);        // each frame
+
+/// One saved user component: its display name and its design JSON. One entity
+/// instead of parallel name/json lists.
+class UserComponent {
+    string name;
+    string json;
+
+    UserComponent(string name, string json) {
+        this.name = name;
+        this.json = json;
+    }
+}
+
 class Designer {
     // 0 = English, 1 = 简体中文. Set by the host (e.g. the IDE) so the designer
     // chrome follows the host UI language; read via T(en, zh).
@@ -119,8 +132,7 @@ class Designer {
     bool winTool;
     bool winCenter;
     bool winGlass;
-    List<string> winEvtNames;      // window event -> handler (parallel lists)
-    List<string> winEvtHandlers;
+    List<EventBinding> winEvents;  // window event -> handler bindings
     string winEvtEditing;          // which window event the handler box edits
 
     // Component palette filter (search box) + inspector scroll state.
@@ -148,8 +160,7 @@ class Designer {
     // Project user components: designs saved as reusable components (the host
     // IDE persists them as components/*.zcomp and feeds them back in). The
     // save request is raised by the inspector and consumed by the host.
-    List<string> userCompNames;
-    List<string> userCompJsons;
+    List<UserComponent> userComps;
     bool saveCompRequested;
 
     /// Picks the string for the current UI language.
@@ -224,8 +235,7 @@ class Designer {
         d.winTool = true;
         d.winCenter = true;
         d.winGlass = false;
-        d.winEvtNames = new List<string>();
-        d.winEvtHandlers = new List<string>();
+        d.winEvents = new List<EventBinding>();
         d.winEvtEditing = "";
         d.filterSig = SignalString.Create("");
         d.filterInput = Input.Bind(d.filterSig, Designer.T("filter…", "筛选…"));
@@ -238,8 +248,7 @@ class Designer {
         d.jsonSig = SignalString.Create("");
         d.jsonArea = TextArea.Bind(d.jsonSig, Designer.T("paste or edit the design JSON, then Apply", "粘贴或编辑设计 JSON，然后点击应用"));
         d.jsonOpen = false;
-        d.userCompNames = new List<string>();
-        d.userCompJsons = new List<string>();
+        d.userComps = new List<UserComponent>();
         d.saveCompRequested = false;
         return d;
     }
@@ -326,8 +335,14 @@ class Designer {
     /// The host IDE supplies the project's saved user components (parallel
     /// name / design-JSON lists, from components/*.zcomp).
     void SetUserComponents(List<string> names, List<string> jsons) {
-        userCompNames = names;
-        userCompJsons = jsons;
+        userComps = new List<UserComponent>();
+        int i = 0;
+        while (i < names.Count) {
+            string js = "";
+            if (i < jsons.Count) { js = jsons[i]; }
+            userComps.Add(new UserComponent(names[i], js));
+            i = i + 1;
+        }
     }
 
     /// True exactly once after the user asked to save the current design as a
@@ -341,19 +356,19 @@ class Designer {
     /// design is inserted as itself, anything else is wrapped in a Card named
     /// after the component (WinForms UserControl style).
     void AddUserComponent(int k) {
-        if (k < 0 || k >= userCompJsons.Count) { return; }
-        List<FormField> parsed = ParseComponentFields(userCompJsons[k]);
+        if (k < 0 || k >= userComps.Count) { return; }
+        List<FormField> parsed = ParseComponentFields(userComps[k].json);
         FormField f;
         if (parsed.Count == 1 && parsed[0].IsContainer()) {
             f = parsed[0];
         } else {
             f = FormField.New(18, seq);
-            f.label = userCompNames[k];
+            f.label = userComps[k].name;
             f.kids = parsed;
             int ci = 0;
             while (ci < parsed.Count) { parsed[ci].childTab = 0; ci = ci + 1; }
         }
-        f.fname = userCompNames[k] + Convert.ToString(seq);
+        f.fname = userComps[k].name + Convert.ToString(seq);
         f.name = f.fname;
         seq = seq + 1;
         if (activeContainer != null && activeContainer != f) {
@@ -365,7 +380,7 @@ class Designer {
         }
         sel = f;
         inspTab = 0;
-        msg = Designer.T("added ", "已添加 ") + userCompNames[k];
+        msg = Designer.T("added ", "已添加 ") + userComps[k].name;
     }
 
     /// Adds a discovered project custom component (by its CustomComponents tag)
@@ -614,8 +629,8 @@ class Designer {
                 gkind = fields[dragIndex].ftype;
             }
             string gl = FormField.TypeName(gkind);
-            if (gkind == 200 && dragUserComp >= 0 && dragUserComp < userCompNames.Count) {
-                gl = userCompNames[dragUserComp];
+            if (gkind == 200 && dragUserComp >= 0 && dragUserComp < userComps.Count) {
+                gl = userComps[dragUserComp].name;
                 gkind = 18;
             }
             int gh = app.Scale(26);
@@ -827,9 +842,9 @@ class Designer {
         h = h + PaletteGroupH(app, 3);   // Non-visual
         int nc = CustomComponents.Kinds().Count;
         if (nc > 0) { h = h + PaletteGroupH(app, nc); }  // Custom
-        if (userCompNames.Count > 0) {                   // My Components
+        if (userComps.Count > 0) {                       // My Components
             h = h + app.Scale(18)
-                + userCompNames.Count * (app.Scale(28) + app.Scale(6))
+                + userComps.Count * (app.Scale(28) + app.Scale(6))
                 + app.Scale(10);
         }
         return h + app.Scale(8);
@@ -945,7 +960,7 @@ class Designer {
     /// reusable components). One named row per component; click to add, drag to
     /// drop it onto the form like any built-in.
     int UserPaletteGroup(App app, Canvas c, Theme t, int ix, int iy, int iw) {
-        if (userCompNames.Count == 0) { return iy; }
+        if (userComps.Count == 0) { return iy; }
         int fs = t.fontSizeSmall;
         if (PalVisible(app, iy, app.Scale(14))) {
             c.DrawText(ix, iy, Designer.T("My Components", "我的组件"), t.textSecondary, fs);
@@ -954,7 +969,7 @@ class Designer {
         int rowH2 = app.Scale(28);
         int ek = app.window.EventKind();
         int k = 0;
-        while (k < userCompNames.Count) {
+        while (k < userComps.Count) {
             if (PalVisible(app, iy, rowH2)) {
                 if (!preview && ek == 2 && !dragging
                     && InRect(app.mouseX, app.mouseY, ix, iy, iw, rowH2)) {
@@ -966,7 +981,7 @@ class Designer {
                     dragMouseX = app.mouseX;
                     dragMouseY = app.mouseY;
                 }
-                Button b = Button.WithIcon(userCompNames[k], "layout");
+                Button b = Button.WithIcon(userComps[k].name, "layout");
                 b.SetSize(1);
                 int id = b.Render(app, ix, iy, iw);
                 if (Button.WasClicked(app, id) && !dragMoved) { AddUserComponent(k); }
@@ -2539,8 +2554,8 @@ class Designer {
 
     string WinGetHandler(string ev) {
         int i = 0;
-        while (i < winEvtNames.Count) {
-            if (winEvtNames[i] == ev) { return winEvtHandlers[i]; }
+        while (i < winEvents.Count) {
+            if (winEvents[i].key == ev) { return winEvents[i].val; }
             i = i + 1;
         }
         return "";
@@ -2548,12 +2563,11 @@ class Designer {
 
     void WinSetHandler(string ev, string h) {
         int i = 0;
-        while (i < winEvtNames.Count) {
-            if (winEvtNames[i] == ev) { winEvtHandlers[i] = h; return; }
+        while (i < winEvents.Count) {
+            if (winEvents[i].key == ev) { winEvents[i].val = h; return; }
             i = i + 1;
         }
-        winEvtNames.Add(ev);
-        winEvtHandlers.Add(h);
+        winEvents.Add(new EventBinding(ev, h));
     }
 
     /// Logical category for an event name, so the Events tab can group a long
