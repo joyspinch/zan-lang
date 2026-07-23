@@ -9,6 +9,10 @@
 # exit, prints "memory leak detected: N object(s) still reachable" (plus a
 # per-site breakdown) to stderr. A clean program prints nothing and exits 0.
 
+# Script mode carries no project policy version; without this, while(TRUE)
+# treats TRUE as an (unset) variable and the run loop never executes.
+cmake_policy(SET CMP0012 NEW)
+
 if(NOT ZANC OR NOT SRC OR NOT OUT_EXE)
   message(FATAL_ERROR "run_leakcheck.cmake: ZANC, SRC and OUT_EXE are required")
 endif()

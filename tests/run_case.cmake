@@ -10,6 +10,10 @@
 # compiled program is run with that working directory (so it can resolve
 # relative paths, e.g. a self-hosting compiler reading a source file).
 
+# Script mode carries no project policy version; without this, while(TRUE)
+# treats TRUE as an (unset) variable and the run loop never executes.
+cmake_policy(SET CMP0012 NEW)
+
 if(NOT ZANC OR NOT SRC OR NOT EXPECTED OR NOT OUT_EXE)
   message(FATAL_ERROR "run_case.cmake: ZANC, SRC, EXPECTED and OUT_EXE are required")
 endif()
