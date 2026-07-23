@@ -546,11 +546,24 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             }
             parser_expect(p, TK_RPAREN);
         }
-        /* collection/object initializer: { items } */
+        /* collection/object initializer: { items }
+         * A plain element is a single expression (list initializer).
+         * A braced element `{ k, v }` is a dictionary initializer entry; its
+         * inner expressions are flattened into args as consecutive key/value
+         * pairs and consumed pairwise by the Dict lowering. */
         if (parser_match(p, TK_LBRACE)) {
             while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
-                zan_ast_node_t *item = parse_expression(p);
-                zan_ast_list_push(&n->new_expr.args, item, p->arena);
+                if (parser_match(p, TK_LBRACE)) {
+                    while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                        zan_ast_node_t *sub = parse_expression(p);
+                        zan_ast_list_push(&n->new_expr.args, sub, p->arena);
+                        if (!parser_match(p, TK_COMMA)) break;
+                    }
+                    parser_expect(p, TK_RBRACE);
+                } else {
+                    zan_ast_node_t *item = parse_expression(p);
+                    zan_ast_list_push(&n->new_expr.args, item, p->arena);
+                }
                 if (!parser_match(p, TK_COMMA)) break;
             }
             parser_expect(p, TK_RBRACE);

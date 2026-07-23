@@ -10182,6 +10182,49 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                     LLVMPointerType(i64, 0), "vptr");
                 LLVMValueRef vf = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, typed_ptr, 3, "vf");
                 LLVMBuildStore(g->builder, vals_typed, vf);
+                /* dictionary initializer entries: new Dict<K,V>{ {k, v}, ... }.
+                 * The parser flattens each `{ k, v }` pair into new_expr.args,
+                 * so consume them pairwise via the shared upsert helper. */
+                int ninit = expr->new_expr.args.count;
+                if (ninit >= 2) {
+                    zan_type_t *kt = dict_key_type(g, expr->new_expr.type
+                        ? zan_binder_resolve_type(g->binder, expr->new_expr.type) : NULL);
+                    zan_type_t *vt = dict_value_type(expr->new_expr.type
+                        ? zan_binder_resolve_type(g->binder, expr->new_expr.type) : NULL);
+                    LLVMValueRef sf = get_dict_set_fn(g);
+                    LLVMValueRef is_str = LLVMConstInt(i64,
+                        (kt && kt->kind == TYPE_STRING) ? 1 : 0, 0);
+                    for (int ii = 0; ii + 1 < ninit; ii += 2) {
+                        zan_ast_node_t *kexpr = expr->new_expr.args.items[ii];
+                        zan_ast_node_t *vexpr = expr->new_expr.args.items[ii + 1];
+                        LLVMValueRef key = emit_expr(g, kexpr, locals);
+                        if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
+                            if (LLVMGetIntTypeWidth(LLVMTypeOf(key)) < 64)
+                                key = LLVMBuildSExt(g->builder, key, i64, "k.sx");
+                            key = LLVMBuildIntToPtr(g->builder, key, i8ptr, "k.ip");
+                        } else if (LLVMTypeOf(key) != i8ptr) {
+                            key = LLVMBuildBitCast(g->builder, key, i8ptr, "k.bc");
+                        }
+                        if (kt && is_rc_managed_type(kt) &&
+                            !expr_yields_owned_rc_value(g, kexpr, locals))
+                            emit_rc_retain_for_type(g, kt, key);
+                        LLVMValueRef val = emit_expr(g, vexpr, locals);
+                        LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(val));
+                        if (vk == LLVMPointerTypeKind) {
+                            if (vt && is_rc_managed_type(vt) &&
+                                !expr_yields_owned_rc_value(g, vexpr, locals))
+                                emit_rc_retain_for_type(g, vt, val);
+                            val = LLVMBuildPtrToInt(g->builder, val, i64, "v.pi");
+                        } else if (vk == LLVMDoubleTypeKind) {
+                            val = LLVMBuildBitCast(g->builder, val, i64, "v.bc");
+                        } else if (vk == LLVMIntegerTypeKind &&
+                                   LLVMGetIntTypeWidth(LLVMTypeOf(val)) < 64) {
+                            val = LLVMBuildSExt(g->builder, val, i64, "v.sx");
+                        }
+                        zan_call2(g->builder, LLVMGlobalGetValueType(sf), sf,
+                            (LLVMValueRef[]){ dict_raw, key, val, is_str }, 4, "");
+                    }
+                }
                 return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "dictv");
             }
         }
