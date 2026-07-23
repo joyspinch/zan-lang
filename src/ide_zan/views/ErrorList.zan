@@ -1,0 +1,170 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// One diagnostics row: the row container, its message label and the optional
+/// quick-fix button (one entity instead of parallel lists).
+class ErrorRowView {
+    Panel box;
+    Label label;
+    Button fixBtn;
+    string fixNs;
+}
+
+/// Output panel "Errors" tab as a retained component tree: each diagnostic is
+/// a row of widgets (message label + optional quick-fix button) instead of
+/// per-frame manual drawing. The layout skeleton lives in ErrorList.zform;
+/// rows are data-driven and rebuilt only when the diagnostics change. The
+/// shell polls TakeFix()/TakeJump() once per frame after RenderAt.
+class ErrorList : Control {
+    List<ErrorRowView> rows;
+    Label emptyLabel;
+    string sig;
+    int jumpRow;
+    int fixRow;
+
+    // <<< ZAN-DESIGNER BEGIN (generated from ErrorList.zform - do not edit) >>>
+    void BuildUi() {
+        layout = 1;
+        styleClass = "errorList";
+    }
+    // <<< ZAN-DESIGNER END >>>
+
+    ErrorList() {
+        this.InitControl("errorList", 5);
+        rows = new List<ErrorRowView>();
+        emptyLabel = null;
+        sig = "";
+        jumpRow = 0 - 1;
+        fixRow = 0 - 1;
+        BuildUi();
+    }
+
+    override string Kind() { return "ErrorList"; }
+
+    /// Rebuilds the row widgets when the parsed diagnostics changed.
+    void SetErrors(List<string> ePath, List<string> eLine, List<string> eMsg) {
+        string s = Convert.ToString(ePath.Count);
+        int i = 0;
+        while (i < ePath.Count) {
+            s = s + "|" + ePath[i] + ":" + eLine[i] + ":" + eMsg[i];
+            i = i + 1;
+        }
+        if (s == sig) { return; }
+        sig = s;
+        while (children.Count > 0) { Remove(children[children.Count - 1]); }
+        while (rows.Count > 0) { rows.RemoveAt(rows.Count - 1); }
+        emptyLabel = null;
+        if (ePath.Count == 0) {
+            Label l = new Label(ZanIDE.T("No errors.", "无错误。"));
+            l.Variant(2);
+            emptyLabel = l;
+            Add(l);
+            return;
+        }
+        int r = 0;
+        while (r < ePath.Count) {
+            ErrorRowView row = new ErrorRowView();
+            Panel box = Panel.Row();
+            box.dock = 1;
+            string ns = ZanIDE.SuggestedUsing(eMsg[r]);
+            row.fixNs = ns;
+            row.fixBtn = null;
+            if (ns != "") {
+                Button b = Button.Typed(
+                    ZanIDE.T("Add using " + ns, "添加 using " + ns), 1);
+                b.size = 0;
+                b.dock = 4;
+                box.Add(b);
+                row.fixBtn = b;
+            }
+            Label l = new Label(
+                ZanIDE.BaseName(ePath[r]) + ":" + eLine[r] + "   " + eMsg[r]);
+            l.Variant(2);
+            l.dock = 5;
+            box.Add(l);
+            row.box = box;
+            row.label = l;
+            rows.Add(row);
+            Add(box);
+            r = r + 1;
+        }
+    }
+
+    override void OnMeasure(App app) {
+        padT = app.Scale(6);
+        padL = app.Scale(6);
+        padR = app.Scale(6);
+        int i = 0;
+        while (i < rows.Count) {
+            rows[i].box.prefH = app.Scale(20);
+            i = i + 1;
+        }
+    }
+
+    /// Host-mode render into an explicit rectangle (the shell owns the overall
+    /// window layout during migration). Resolves theme-driven colors, applies
+    /// the hover highlight through the CSS style layer, paints the widget tree
+    /// and records which row / quick-fix the user clicked this frame.
+    void RenderAt(App app, int x, int y, int w, int h) {
+        Theme t = app.theme;
+        if (emptyLabel != null) { emptyLabel.TextColor(t.success); }
+        MeasureTree(app);
+        Arrange(x, y, w, h);
+        int i = 0;
+        while (i < rows.Count) {
+            ErrorRowView rv = rows[i];
+            rv.label.TextColor(t.error);
+            bool hov = app.mouseX >= rv.box.bx
+                && app.mouseX < rv.box.bx + rv.box.bw
+                && app.mouseY >= rv.box.by
+                && app.mouseY < rv.box.by + rv.box.bh
+                && rv.box.bh > 0;
+            if (hov) { rv.box.Bg(t.bgHover); } else { rv.box.Bg(0); }
+            i = i + 1;
+        }
+        RenderTree(app);
+        i = 0;
+        while (i < rows.Count) {
+            ErrorRowView rv = rows[i];
+            if (rv.fixBtn != null && Button.WasClicked(app, rv.fixBtn.wid)) {
+                fixRow = i;
+            }
+            i = i + 1;
+        }
+        if (fixRow < 0 && app.ClickAvailable()) {
+            i = 0;
+            while (i < rows.Count) {
+                ErrorRowView rv = rows[i];
+                if (app.mouseX >= rv.box.bx
+                    && app.mouseX < rv.box.bx + rv.box.bw
+                    && app.mouseY >= rv.box.by
+                    && app.mouseY < rv.box.by + rv.box.bh
+                    && rv.box.bh > 0) {
+                    jumpRow = i;
+                }
+                i = i + 1;
+            }
+        }
+    }
+
+    /// The quick-fix row clicked this frame, or -1. Consumes the click.
+    int TakeFix() {
+        int r = fixRow;
+        fixRow = 0 - 1;
+        return r;
+    }
+
+    /// The row clicked (jump to file:line) this frame, or -1. Consumes it.
+    int TakeJump() {
+        int r = jumpRow;
+        jumpRow = 0 - 1;
+        return r;
+    }
+
+    /// The suggested `using` namespace for a row ("" when none).
+    string FixNs(int i) {
+        if (i >= 0 && i < rows.Count) { return rows[i].fixNs; }
+        return "";
+    }
+}
