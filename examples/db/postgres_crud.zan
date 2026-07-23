@@ -1,0 +1,98 @@
+// ============================================================================
+// PostgreSQL（原生 libpq）—— 连接、参数化 CRUD、事务、异步查询示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. PgConnection.OpenParams / Open(conninfo) 同步连接；GetError 错误诊断
+//   2. Execute / Query / ExecuteScalar 及其 DbParams 参数化重载
+//      （`?` 占位符自动改写为 $1..$n，值经 PQexecParams 原生传递，防注入）
+//   3. 事务 BeginTransaction / Commit / Rollback
+//   4. 异步 API：OpenParamsAsync / QueryParamsAsync / ExecuteParamsAsync
+//      （挂起在 IO reactor 上，单 worker 可并发成千上万条查询）
+//   5. ORM 同样适用：Model / QueryBuilder 通过 IDbExecutor 直接驱动 PgConnection
+//
+// 说明：本示例需要一个可连接的 PostgreSQL（或 openGauss/金仓等 PG 协议引擎）。
+//       没有可用服务时会打印提示并跳过，不算失败。同样的写法也适用于
+//       DbProvider 列表中的其它 PG 系引擎。
+// 运行：build/zanc examples/db/postgres_crud.zan --auto-stdlib -o pg_crud.exe
+// 准备：docker run -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:16
+// ============================================================================
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Postgres;
+
+class Program {
+    static async int RunAsync() {
+        // 异步连接：非阻塞握手（PQconnectStart/Poll），失败不阻塞线程。
+        PgConnection db = await PgConnection.OpenParamsAsync(
+            "127.0.0.1", 5432, "postgres", "postgres", "secret");
+        if (!db.IsConnected()) { return -1; }
+
+        // 异步参数化查询：协程挂起在 socket 可读事件上。
+        DbResult r = await db.QueryParamsAsync(
+            "SELECT title FROM pg_demo_books WHERE price > ?",
+            DbParams.Create().AddDouble(20.0));
+        Console.WriteLine("async rows: " + Convert.ToString(r.RowCount()));
+        db.Close();
+        return 0;
+    }
+
+    static void Main() {
+        // ---- 1. 同步连接 ---------------------------------------------------------
+        PgConnection db = PgConnection.OpenParams(
+            "127.0.0.1", 5432, "postgres", "postgres", "secret");
+        if (!db.IsConnected()) {
+            Console.WriteLine("PostgreSQL 未就绪，跳过示例: " + db.GetError());
+            Console.WriteLine("启动方法: docker run -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:16");
+            return;
+        }
+
+        // ---- 2. DDL + 参数化 CRUD -------------------------------------------------
+        db.Execute("DROP TABLE IF EXISTS pg_demo_books");
+        db.Execute("CREATE TABLE pg_demo_books ("
+            + "id SERIAL PRIMARY KEY, title TEXT NOT NULL, "
+            + "author TEXT, price NUMERIC(8,2))");
+
+        // `?` 占位符自动改写为 $1/$2/$3，值走 PQexecParams 原生绑定。
+        db.Execute("INSERT INTO pg_demo_books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("Zan 语言入门").Add("Alice").AddDouble(59.9));
+        db.Execute("INSERT INTO pg_demo_books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("编译原理").Add("O'Brien").AddDouble(99.0));
+
+        DbResult r = db.Query("SELECT id, title, author FROM pg_demo_books ORDER BY id");
+        int i = 0;
+        while (i < r.RowCount()) {
+            Console.WriteLine("  #" + r.GetByName(i, "id") + " "
+                + r.GetByName(i, "title") + " by " + r.GetByName(i, "author"));
+            i = i + 1;
+        }
+        Console.WriteLine("count: " + db.ExecuteScalar("SELECT COUNT(*) FROM pg_demo_books"));
+
+        int updated = db.Execute("UPDATE pg_demo_books SET price = ? WHERE title = ?",
+            DbParams.Create().AddDouble(49.5).Add("编译原理"));
+        Console.WriteLine("updated: " + Convert.ToString(updated));
+
+        // ---- 3. 事务 ---------------------------------------------------------------
+        db.BeginTransaction();
+        db.Execute("INSERT INTO pg_demo_books (title, price) VALUES ('临时', 1)");
+        db.Rollback();   // 撤销
+        Console.WriteLine("after rollback: "
+            + db.ExecuteScalar("SELECT COUNT(*) FROM pg_demo_books"));
+
+        // ---- 4. ORM 直接驱动 PgConnection ------------------------------------------
+        // Model / QueryBuilder 通过 IDbExecutor 工作，换连接不换代码。
+        Model books = Model.FromTable(db, "pg_demo_books");
+        Console.WriteLine("orm columns: " + Convert.ToString(books.ColumnCount())
+            + " pk=" + books.GetPrimaryKey());
+        List<ModelRow> rows = books.Select(db).Where("price > 50").Execute();
+        Console.WriteLine("orm rows: " + Convert.ToString(rows.Count));
+
+        // ---- 5. 异步 API ------------------------------------------------------------
+        int rc = await RunAsync();
+        Console.WriteLine("async rc: " + Convert.ToString(rc));
+
+        db.Execute("DROP TABLE pg_demo_books");
+        db.Close();
+        Console.WriteLine("done");
+    }
+}

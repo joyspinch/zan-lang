@@ -1,0 +1,109 @@
+// ============================================================================
+// DbConnection（ODBC 通道）—— 一套代码连接 SQL Server / MySQL / Oracle /
+// 达梦 / 金仓 / ClickHouse / DuckDB 等各种数据库
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. DbConnection 便捷工厂：OpenSqlServer / OpenMySQL / OpenPostgreSQL /
+//      OpenOracle / OpenDM(达梦) / OpenKingbase(金仓) / OpenOpenGauss /
+//      OpenClickHouse / OpenTDengine / OpenDuckDB / OpenSQLite / OpenFirebird，
+//      以及万能入口 OpenODBC(任意 DSN / 连接串)
+//   2. 统一 API：Execute / Query / ExecuteScalar（+ DbParams 参数化重载）
+//   3. GetProvider 检测引擎类型；QueryBuilder.Dialect 适配分页方言
+//   4. ORM（Model / QueryBuilder）同样通过 IDbExecutor 驱动 DbConnection
+//
+// 说明：ODBC 通道要求本机装有对应引擎的 ODBC 驱动（Windows: odbc32，
+//       Linux/macOS: unixODBC）。本示例逐个尝试常见目标，连不上的打印
+//       提示并跳过；只要有一个连上就演示完整 CRUD。
+//       追求零配置请用原生驱动：SQLite → sqlite_crud.zan，
+//       PostgreSQL → postgres_crud.zan，MySQL → mysql_crud.zan。
+// 运行：build/zanc examples/db/odbc_multidb.zan --auto-stdlib -o odbc_multidb.exe
+// ============================================================================
+using System;
+using System.Data;
+using System.Data.Orm;
+
+class Program {
+    // 统一的 CRUD 演示：任何 ODBC 引擎连上后走同一套代码。
+    static void Demo(DbConnection db, string label) {
+        Console.WriteLine("== " + label + " connected, provider="
+            + Convert.ToString(db.GetProvider()));
+
+        db.Execute("DROP TABLE IF EXISTS odbc_demo_books");
+        db.Execute("CREATE TABLE odbc_demo_books ("
+            + "id INT PRIMARY KEY, title VARCHAR(128), price INT)");
+
+        // 参数化写入：`?` 占位符 + DbParams（ODBC 通道内联转义后执行）。
+        db.Execute("INSERT INTO odbc_demo_books (id, title, price) VALUES (?, ?, ?)",
+            DbParams.Create().AddInt(1).Add("Zan 语言入门").AddInt(59));
+        db.Execute("INSERT INTO odbc_demo_books (id, title, price) VALUES (?, ?, ?)",
+            DbParams.Create().AddInt(2).Add("O'Reilly 精选").AddInt(99));
+
+        DbResult r = db.Query("SELECT id, title FROM odbc_demo_books ORDER BY id");
+        int i = 0;
+        while (i < r.RowCount()) {
+            Console.WriteLine("  #" + r.GetString(i, 0) + " " + r.GetString(i, 1));
+            i = i + 1;
+        }
+        Console.WriteLine("  count: "
+            + db.ExecuteScalar("SELECT COUNT(*) FROM odbc_demo_books"));
+
+        // ORM 模型层同样可用（IDbExecutor 驱动）。
+        Model books = Model.FromTable(db, "odbc_demo_books");
+        Console.WriteLine("  orm columns: " + Convert.ToString(books.ColumnCount()));
+
+        // 分页方言：SQL Server / Oracle 用 OFFSET..FETCH，其余用 LIMIT/OFFSET。
+        QueryBuilder qb = QueryBuilder.From("odbc_demo_books").OrderBy("id").Limit(1);
+        if (db.GetProvider() == DbProvider.SqlServer
+            || db.GetProvider() == DbProvider.Oracle) {
+            qb.Dialect(SqlDialect.SqlServer);
+        }
+        Console.WriteLine("  paged sql: " + qb.BuildSelect("*"));
+
+        db.Execute("DROP TABLE odbc_demo_books");
+        db.Close();
+    }
+
+    static bool Try(DbConnection db, string label) {
+        if (db.IsConnected()) {
+            Demo(db, label);
+            return true;
+        }
+        Console.WriteLine("-- " + label + " 未就绪，跳过（缺服务或 ODBC 驱动）");
+        db.Close();
+        return false;
+    }
+
+    static void Main() {
+        int hits = 0;
+
+        // ---- 各引擎便捷工厂：按需解注释/修改连接参数 ------------------------------
+        // SQL Server（需 "ODBC Driver 17 for SQL Server"）：
+        if (Try(DbConnection.OpenSqlServer("127.0.0.1", 1433, "master", "sa", "Secret123!"),
+                "SQL Server")) { hits = hits + 1; }
+
+        // MySQL（需 "MySQL ODBC 8.0 Unicode Driver"）：
+        if (Try(DbConnection.OpenMySQL("127.0.0.1", 3306, "demo", "root", "secret"),
+                "MySQL(ODBC)")) { hits = hits + 1; }
+
+        // SQLite（需 "SQLite3 ODBC Driver"；零配置内嵌用法见 sqlite_crud.zan）：
+        if (Try(DbConnection.OpenSQLite("odbc_demo.tmp.db"),
+                "SQLite(ODBC)")) { hits = hits + 1; }
+
+        // 其余引擎的工厂一览（连接参数就绪后同样传给 Try 即可）：
+        //   DbConnection.OpenPostgreSQL(host, 5432, db, user, pw)   // psqlODBC
+        //   DbConnection.OpenOracle(host, 1521, service, user, pw)
+        //   DbConnection.OpenDM(host, 5236, user, pw)               // 达梦
+        //   DbConnection.OpenKingbase(host, 54321, db, user, pw)    // 人大金仓
+        //   DbConnection.OpenOpenGauss(host, 5432, db, user, pw)
+        //   DbConnection.OpenClickHouse(host, 8123, db, user, pw)
+        //   DbConnection.OpenTDengine(host, 6030, db, user, pw)
+        //   DbConnection.OpenDuckDB("analytics.duckdb")
+        //   DbConnection.OpenFirebird(host, 3050, dbPath, user, pw)
+        //   DbConnection.OpenODBC("DSN=mydsn;UID=u;PWD=p;")         // 万能入口
+
+        if (hits == 0) {
+            Console.WriteLine("没有可用的 ODBC 数据源。装好驱动/启动服务后重跑即可。");
+        }
+        Console.WriteLine("done");
+    }
+}

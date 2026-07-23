@@ -1,0 +1,103 @@
+// ============================================================================
+// SQLite（内嵌，零依赖）—— 直接 SQL 的建表、参数化增删改查、事务、连接池示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. SqliteConnection.Open 打开/创建数据库文件；IsConnected / GetError
+//   2. Execute 执行 DDL/DML；参数化 Execute(sql, DbParams)（`?` 原生绑定）
+//   3. Query / Query(sql, DbParams) 查询；DbResult 遍历、按列名取值、NULL 判定
+//   4. ExecuteScalar 单值查询；LastInsertId 取自增主键
+//   5. 事务 BeginTransaction / Commit / Rollback（批量写入提速的关键）
+//   6. SqlitePool 协程感知连接池：AcquireAsync / Release
+//
+// 说明：更高层的用法见 orm_model.zan（模型层）与 orm_querybuilder.zan（构建器）。
+// 运行：build/zanc examples/db/sqlite_crud.zan --auto-stdlib -o sqlite_crud.exe
+// ============================================================================
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.IO;
+
+class Program {
+    static async int Pool(string path) {
+        // 连接池：并发协程下复用连接、封顶并发数；池满时挂起而非阻塞线程。
+        SqlitePool pool = SqlitePool.Create(path, 4);
+        SqliteConnection db = await pool.AcquireAsync();
+        int total = Convert.ToInt(db.ExecuteScalar("SELECT COUNT(*) FROM books"));
+        pool.Release(db);
+        pool.Close();
+        return total;
+    }
+
+    static void Main() {
+        string path = "sqlite_crud_demo.tmp.db";
+        File.Delete(path);
+
+        // ---- 1. 打开数据库（不存在则创建） -------------------------------------
+        SqliteConnection db = SqliteConnection.Open(path);
+        if (!db.IsConnected()) {
+            Console.WriteLine("open failed: " + db.GetError());
+            return;
+        }
+
+        // ---- 2. DDL + 参数化 INSERT -------------------------------------------
+        db.Execute("CREATE TABLE books ("
+            + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            + "title TEXT NOT NULL, author TEXT, price REAL)");
+
+        db.Execute("INSERT INTO books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("Zan 语言入门").Add("Alice").AddDouble(59.9));
+        db.Execute("INSERT INTO books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("编译原理").Add("O'Brien").AddDouble(99.0));
+        // NULL 也是一种参数（author 未知）。
+        db.Execute("INSERT INTO books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("佚名手稿").AddNull().AddDouble(9.9));
+        Console.WriteLine("last id: " + Convert.ToString(db.LastInsertId()));
+
+        // ---- 3. 查询与结果集 ----------------------------------------------------
+        DbResult r = db.Query("SELECT id, title, author, price FROM books WHERE price > ?",
+            DbParams.Create().AddDouble(20.0));
+        Console.WriteLine("expensive: " + Convert.ToString(r.RowCount()));
+        int i = 0;
+        while (i < r.RowCount()) {
+            // 按列名取值；IsNull 区分 NULL 与空串。
+            string author = r.GetByName(i, "author");
+            if (r.IsNullByName(i, "author")) { author = "(unknown)"; }
+            Console.WriteLine("  #" + r.GetByName(i, "id") + " "
+                + r.GetByName(i, "title") + " by " + author);
+            i = i + 1;
+        }
+
+        // ---- 4. 单值查询 / 更新 / 删除 ------------------------------------------
+        Console.WriteLine("max price: " + db.ExecuteScalar("SELECT MAX(price) FROM books"));
+        int updated = db.Execute("UPDATE books SET price = price * 0.5 WHERE title = ?",
+            DbParams.Create().Add("编译原理"));
+        Console.WriteLine("discounted rows: " + Convert.ToString(updated));
+        int deleted = db.Execute("DELETE FROM books WHERE author IS NULL");
+        Console.WriteLine("deleted rows: " + Convert.ToString(deleted));
+
+        // ---- 5. 事务 -------------------------------------------------------------
+        // 回滚示例：出错时整批撤销。
+        db.BeginTransaction();
+        db.Execute("INSERT INTO books (title, price) VALUES ('临时', 1)");
+        db.Rollback();
+        // 提交示例：100 条一次落盘，比逐条自动提交快一个数量级以上。
+        db.BeginTransaction();
+        int k = 0;
+        while (k < 100) {
+            db.Execute("INSERT INTO books (title, author, price) VALUES (?, ?, ?)",
+                DbParams.Create().Add("批量书目 " + Convert.ToString(k))
+                    .Add("Robot").AddDouble(10.0));
+            k = k + 1;
+        }
+        db.Commit();
+        Console.WriteLine("after tx: " + db.ExecuteScalar("SELECT COUNT(*) FROM books"));
+        db.Close();
+
+        // ---- 6. 连接池 -----------------------------------------------------------
+        int total = await Pool(path);
+        Console.WriteLine("pool count: " + Convert.ToString(total));
+
+        File.Delete(path);
+        Console.WriteLine("done");
+    }
+}

@@ -52,7 +52,7 @@ class DbProvider {
 ///
 ///   DbConnection any = DbConnection.OpenODBC("DSN=mydsn;UID=u;PWD=p;");
 /// </summary>
-class DbConnection {
+class DbConnection : IDbExecutor {
     int handle;        // ODBC connection (dbc) handle, as int
     int env;           // ODBC environment handle
     int provider;      // DbProvider.*
@@ -545,5 +545,66 @@ class DbConnection {
     /// <summary>Returns the provider type.</summary>
     int GetProvider() {
         return this.provider;
+    }
+
+    /// <summary>Executes a parameterized non-query statement. The ODBC path has
+    /// no uniform binding surface, so `?` placeholders are inlined with quoting
+    /// and escaping before execution.</summary>
+    int Execute(string sql, DbParams prms) {
+        return Execute(InlineParams(sql, prms));
+    }
+
+    /// <summary>Executes a parameterized query (see the Execute overload for
+    /// how parameters are applied on the ODBC path).</summary>
+    DbResult Query(string sql, DbParams prms) {
+        return Query(InlineParams(sql, prms));
+    }
+
+    /// <summary>Substitutes `?` placeholders (outside quoted literals) with the
+    /// quoted, escaped parameter values.</summary>
+    static string InlineParams(string sql, DbParams prms) {
+        if (prms.Count() == 0) { return sql; }
+        StringBuilder sb = new StringBuilder();
+        int n = sql.Length;
+        int next = 0;
+        bool inQuote = false;
+        int i = 0;
+        while (i < n) {
+            int c = sql[i] & 255;
+            if (c == 39) {                       // '
+                inQuote = !inQuote;
+                sb.Append("'");
+            } else if (c == 63 && !inQuote && next < prms.Count()) {   // ?
+                if (prms.IsNull(next)) {
+                    sb.Append("NULL");
+                } else {
+                    sb.Append("'");
+                    sb.Append(EscapeSqlString(prms.AsText(next)));
+                    sb.Append("'");
+                }
+                next = next + 1;
+            } else {
+                sb.Append(sql.Substring(i, 1));
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Escapes single quotes in a string for SQL safety.</summary>
+    static string EscapeSqlString(string val) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int len = val.Length;
+        while (i < len) {
+            string ch = val.Substring(i, 1);
+            if (ch == "'") {
+                sb.Append("''");
+            } else {
+                sb.Append(ch);
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
     }
 }
