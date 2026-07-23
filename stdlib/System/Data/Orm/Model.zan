@@ -4,6 +4,19 @@ using System.Data.Orm;
 
 namespace System.Data.Orm;
 
+/// <summary>One column definition: its name and its full SQL type text (with
+/// any NOT NULL / PRIMARY KEY / DEFAULT suffix). One entity instead of parallel
+/// name/type lists.</summary>
+class ModelColumn {
+    string name;
+    string type;
+
+    ModelColumn(string name, string type) {
+        this.name = name;
+        this.type = type;
+    }
+}
+
 /// <summary>
 /// FreeSQL-inspired ORM model base.
 /// Provides CRUD operations with automatic SQL generation.
@@ -37,15 +50,13 @@ namespace System.Data.Orm;
 /// </summary>
 class Model {
     string tableName;
-    List<string> columnNames;
-    List<string> columnTypes;
+    List<ModelColumn> columns;
     string primaryKey;
     DbConnection db;
 
     Model(string tableName) {
         this.tableName = QueryBuilder.RequireIdent(tableName);
-        this.columnNames = new List<string>();
-        this.columnTypes = new List<string>();
+        this.columns = new List<ModelColumn>();
         this.primaryKey = "";
     }
 
@@ -56,41 +67,37 @@ class Model {
 
     /// <summary>Adds a column definition.</summary>
     Model Column(string name, string type) {
-        this.columnNames.Add(QueryBuilder.RequireIdent(name));
-        this.columnTypes.Add(type);
+        this.columns.Add(new ModelColumn(QueryBuilder.RequireIdent(name), type));
         return this;
     }
 
     /// <summary>Adds a column as primary key.</summary>
     Model Column(string name, string type, bool isPrimaryKey) {
-        this.columnNames.Add(QueryBuilder.RequireIdent(name));
+        string ident = QueryBuilder.RequireIdent(name);
         if (isPrimaryKey) {
-            this.columnTypes.Add(type + " PRIMARY KEY AUTOINCREMENT");
+            this.columns.Add(new ModelColumn(ident, type + " PRIMARY KEY AUTOINCREMENT"));
             this.primaryKey = name;
         } else {
-            this.columnTypes.Add(type);
+            this.columns.Add(new ModelColumn(ident, type));
         }
         return this;
     }
 
     /// <summary>Adds a NOT NULL column.</summary>
     Model ColumnNotNull(string name, string type) {
-        this.columnNames.Add(QueryBuilder.RequireIdent(name));
-        this.columnTypes.Add(type + " NOT NULL");
+        this.columns.Add(new ModelColumn(QueryBuilder.RequireIdent(name), type + " NOT NULL"));
         return this;
     }
 
     /// <summary>Adds a column with a default value.</summary>
     Model ColumnDefault(string name, string type, string defaultVal) {
-        this.columnNames.Add(QueryBuilder.RequireIdent(name));
-        this.columnTypes.Add(type + " DEFAULT '" + QueryBuilder.EscapeString(defaultVal) + "'");
+        this.columns.Add(new ModelColumn(QueryBuilder.RequireIdent(name), type + " DEFAULT '" + QueryBuilder.EscapeString(defaultVal) + "'"));
         return this;
     }
 
     /// <summary>Adds a UNIQUE column.</summary>
     Model ColumnUnique(string name, string type) {
-        this.columnNames.Add(QueryBuilder.RequireIdent(name));
-        this.columnTypes.Add(type + " UNIQUE");
+        this.columns.Add(new ModelColumn(QueryBuilder.RequireIdent(name), type + " UNIQUE"));
         return this;
     }
 
@@ -100,13 +107,13 @@ class Model {
         sb.Append("CREATE TABLE IF NOT EXISTS ");
         sb.Append(this.tableName);
         sb.Append(" (");
-        int i = 0;
-        while (i < this.columnNames.Count) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(this.columnNames[i]);
+        bool first = true;
+        foreach (ModelColumn col in this.columns) {
+            if (!first) { sb.Append(", "); }
+            sb.Append(col.name);
             sb.Append(" ");
-            sb.Append(this.columnTypes[i]);
-            i = i + 1;
+            sb.Append(col.type);
+            first = false;
         }
         sb.Append(")");
         db.Execute(sb.ToString());
@@ -224,13 +231,13 @@ class Model {
     // the connection's provider; the raw DB column type is preserved verbatim.
 
     /// <summary>Number of columns defined on this model.</summary>
-    int ColumnCount() { return this.columnNames.Count; }
+    int ColumnCount() { return this.columns.Count; }
 
     /// <summary>Column name at index i.</summary>
-    string ColumnNameAt(int i) { return this.columnNames[i]; }
+    string ColumnNameAt(int i) { return this.columns[i].name; }
 
     /// <summary>Column type (with any NOT NULL / PRIMARY KEY suffix) at index i.</summary>
-    string ColumnTypeAt(int i) { return this.columnTypes[i]; }
+    string ColumnTypeAt(int i) { return this.columns[i].type; }
 
     static bool EqIgnoreCase(string a, string b) {
         if (a.Length != b.Length) { return false; }
@@ -327,14 +334,13 @@ class Model {
     }
 
     void AddIntrospected(string name, string type, bool isPk, bool notNull) {
-        this.columnNames.Add(name);
         if (isPk) {
-            this.columnTypes.Add(type + " PRIMARY KEY");
+            this.columns.Add(new ModelColumn(name, type + " PRIMARY KEY"));
             this.primaryKey = name;
         } else if (notNull) {
-            this.columnTypes.Add(type + " NOT NULL");
+            this.columns.Add(new ModelColumn(name, type + " NOT NULL"));
         } else {
-            this.columnTypes.Add(type);
+            this.columns.Add(new ModelColumn(name, type));
         }
     }
 
@@ -388,10 +394,9 @@ class Model {
         sb.Append("Model.Define(\"");
         sb.Append(this.tableName);
         sb.Append("\")");
-        int i = 0;
-        while (i < this.columnNames.Count) {
-            string nm = this.columnNames[i];
-            string ty = this.columnTypes[i];
+        foreach (ModelColumn col in this.columns) {
+            string nm = col.name;
+            string ty = col.type;
             string bt = Model.StripMods(ty);
             if (nm == this.primaryKey) {
                 sb.Append("\n    .Column(\"");
@@ -404,10 +409,21 @@ class Model {
                 sb.Append("\n    .Column(\"");
                 sb.Append(nm); sb.Append("\", \""); sb.Append(bt); sb.Append("\")");
             }
-            i = i + 1;
         }
         sb.Append(";");
         return sb.ToString();
+    }
+}
+
+/// <summary>One column value on a row: its key and string value, kept as an
+/// entity so the two never drift out of alignment.</summary>
+class ModelCell {
+    string key;
+    string val;
+
+    ModelCell(string key, string val) {
+        this.key = key;
+        this.val = val;
     }
 }
 
@@ -415,12 +431,10 @@ class Model {
 /// Represents a single row of model data (key-value pairs).
 /// </summary>
 class ModelRow {
-    List<string> keys;
-    List<string> values;
+    List<ModelCell> cells;
 
     ModelRow() {
-        this.keys = new List<string>();
-        this.values = new List<string>();
+        this.cells = new List<ModelCell>();
     }
 
     /// <summary>Creates an empty model row.</summary>
@@ -430,17 +444,13 @@ class ModelRow {
 
     /// <summary>Sets a value on the row.</summary>
     ModelRow Set(string key, string val) {
-        // Check if key already exists
-        int i = 0;
-        while (i < this.keys.Count) {
-            if (this.keys[i] == key) {
-                this.values[i] = val;
+        foreach (ModelCell cell in this.cells) {
+            if (cell.key == key) {
+                cell.val = val;
                 return this;
             }
-            i = i + 1;
         }
-        this.keys.Add(key);
-        this.values.Add(val);
+        this.cells.Add(new ModelCell(key, val));
         return this;
     }
 
@@ -451,12 +461,8 @@ class ModelRow {
 
     /// <summary>Gets a string value by key.</summary>
     string Get(string key) {
-        int i = 0;
-        while (i < this.keys.Count) {
-            if (this.keys[i] == key) {
-                return this.values[i];
-            }
-            i = i + 1;
+        foreach (ModelCell cell in this.cells) {
+            if (cell.key == key) { return cell.val; }
         }
         return "";
     }
@@ -470,22 +476,24 @@ class ModelRow {
 
     /// <summary>Checks if a key exists in the row.</summary>
     bool Has(string key) {
-        int i = 0;
-        while (i < this.keys.Count) {
-            if (this.keys[i] == key) { return true; }
-            i = i + 1;
+        foreach (ModelCell cell in this.cells) {
+            if (cell.key == key) { return true; }
         }
         return false;
     }
 
-    /// <summary>Returns all keys.</summary>
+    /// <summary>Returns all keys, in insertion order.</summary>
     List<string> GetKeys() {
-        return this.keys;
+        List<string> keys = new List<string>();
+        foreach (ModelCell cell in this.cells) { keys.Add(cell.key); }
+        return keys;
     }
 
-    /// <summary>Returns all values.</summary>
+    /// <summary>Returns all values, in insertion order.</summary>
     List<string> GetValues() {
-        return this.values;
+        List<string> values = new List<string>();
+        foreach (ModelCell cell in this.cells) { values.Add(cell.val); }
+        return values;
     }
 
     /// <summary>Creates a ModelRow from a DbResult row.</summary>
@@ -515,14 +523,13 @@ class ModelRow {
     string ToJson() {
         StringBuilder sb = new StringBuilder();
         sb.Append("{");
-        int n = this.keys.Count;
-        int i = 0;
-        while (i < n) {
-            if (i > 0) { sb.Append(","); }
-            AppendJsonString(sb, this.keys[i]);
+        bool first = true;
+        foreach (ModelCell cell in this.cells) {
+            if (!first) { sb.Append(","); }
+            AppendJsonString(sb, cell.key);
             sb.Append(":");
-            AppendJsonString(sb, this.values[i]);
-            i = i + 1;
+            AppendJsonString(sb, cell.val);
+            first = false;
         }
         sb.Append("}");
         return sb.ToString();
