@@ -789,17 +789,105 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         LLVMValueRef exc_val = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc");
         int catch_start = locals->count;
-        if (stmt->try_stmt.catches.count > 0) {
-            zan_ast_node_t *cc = stmt->try_stmt.catches.items[0];
-            if (cc->catch_clause.var_name.len > 0) {
-                LLVMValueRef ea = emit_entry_alloca(g, i8ptr, "exc.var");
-                LLVMBuildStore(g->builder, exc_val, ea);
+        int ncatch = stmt->try_stmt.catches.count;
+        if (ncatch > 0) {
+            /* type-based dispatch: test each clause in order against the
+             * thrown object's type descriptor (walking its base chain); if
+             * no clause matches, rethrow to the next outer handler */
+            LLVMValueRef tid_g = get_eh_exc_tid_global(g);
+            LLVMValueRef thrown_tid = LLVMBuildLoad2(g->builder, i8ptr, tid_g, "exc.tid");
+            LLVMValueRef match_fn = get_eh_tid_match_fn(g);
+            LLVMTypeRef match_ty = LLVMFunctionType(LLVMInt1TypeInContext(g->ctx),
+                (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+            LLVMBasicBlockRef done_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, fn, "catch.done");
+            LLVMBasicBlockRef rethrow_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, fn, "catch.rethrow");
+
+            for (int ci = 0; ci < ncatch; ci++) {
+                zan_ast_node_t *cc = stmt->try_stmt.catches.items[ci];
                 zan_type_t *et = cc->catch_clause.type
                     ? zan_binder_resolve_type(g->binder, cc->catch_clause.type)
                     : NULL;
-                local_add(locals, cc->catch_clause.var_name, ea, et);
+                LLVMBasicBlockRef body_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "catch.body");
+                LLVMBasicBlockRef miss_bb = (ci + 1 < ncatch)
+                    ? LLVMAppendBasicBlockInContext(g->ctx, fn, "catch.test")
+                    : rethrow_bb;
+                if (et && et->kind == TYPE_CLASS && et->sym) {
+                    LLVMValueRef want = LLVMBuildBitCast(g->builder,
+                        get_class_tid_global(g, et->sym), i8ptr, "want.tid");
+                    LLVMValueRef hits = zan_call2(g->builder, match_ty, match_fn,
+                        (LLVMValueRef[]){ thrown_tid, want }, 2, "tid.hit");
+                    LLVMBuildCondBr(g->builder, hits, body_bb, miss_bb);
+                } else {
+                    /* untyped / non-class clause: catches everything */
+                    LLVMBuildBr(g->builder, body_bb);
+                    if (miss_bb != rethrow_bb) {
+                        /* unreachable later tests still need a terminator */
+                        LLVMPositionBuilderAtEnd(g->builder, miss_bb);
+                        LLVMBuildBr(g->builder, rethrow_bb);
+                    }
+                    miss_bb = NULL;
+                }
+
+                LLVMPositionBuilderAtEnd(g->builder, body_bb);
+                if (cc->catch_clause.var_name.len > 0) {
+                    LLVMValueRef ea = emit_entry_alloca(g, i8ptr, "exc.var");
+                    LLVMBuildStore(g->builder, exc_val, ea);
+                    local_add(locals, cc->catch_clause.var_name, ea, et);
+                }
+                emit_stmt(g, cc->catch_clause.body, locals);
+                locals->count = catch_start;
+                if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                    LLVMBuildBr(g->builder, done_bb);
+
+                if (!miss_bb) break;   /* catch-all consumed the rest */
+                LLVMPositionBuilderAtEnd(g->builder, miss_bb);
             }
-            emit_stmt(g, cc->catch_clause.body, locals);
+            /* current block is the last miss target when every clause is
+             * typed; it already IS rethrow_bb in that case */
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)) &&
+                LLVMGetInsertBlock(g->builder) != rethrow_bb)
+                LLVMBuildBr(g->builder, rethrow_bb);
+
+            /* rethrow: the exception object/owned/tid globals still hold the
+             * in-flight exception; jump to the next outer handler (this try's
+             * frame was already popped above) or die if none remains */
+            LLVMPositionBuilderAtEnd(g->builder, rethrow_bb);
+            {
+                LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "reh.top");
+                LLVMValueRef rhas = LLVMBuildICmp(g->builder, LLVMIntSGE, rtop,
+                    LLVMConstInt(i32t, 0, 0), "reh.has");
+                LLVMBasicBlockRef rjmp_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.jmp");
+                LLVMBasicBlockRef rdie_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.die");
+                LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
+                LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
+                LLVMValueRef rgep_idx[2] = { LLVMConstInt(i32t, 0, 0), rtop };
+                LLVMValueRef rbuf = LLVMBuildGEP2(g->builder,
+                    LLVMGlobalGetValueType(bufs_g), bufs_g, rgep_idx, 2, "reh.buf");
+                LLVMValueRef rbufp = LLVMBuildBitCast(g->builder, rbuf, i8ptr, "reh.bufp");
+                emit_eh_longjmp(g, rbufp);
+                LLVMBuildUnreachable(g->builder);
+                LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
+                LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
+                if (printf_fn) {
+                    LLVMTypeRef printf_ty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
+                    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder,
+                        "Unhandled exception\n", "rexfmt");
+                    zan_call2(g->builder, printf_ty, printf_fn, &fmt, 1, "");
+                }
+                LLVMTypeRef exit_ty = LLVMFunctionType(
+                    LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
+                LLVMValueRef exit_fn = get_libc_fn(g, "exit", exit_ty);
+                LLVMValueRef one = LLVMConstInt(i32t, 1, 0);
+                zan_call2(g->builder, exit_ty, exit_fn, &one, 1, "");
+                LLVMBuildUnreachable(g->builder);
+            }
+
+            LLVMPositionBuilderAtEnd(g->builder, done_bb);
         }
         locals->count = catch_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
@@ -1015,14 +1103,26 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * once the handler completes */
             {
                 LLVMValueRef owned_g = get_eh_exc_owned_global(g);
+                LLVMValueRef tid_g = get_eh_exc_tid_global(g);
                 zan_type_t *tt = infer_expr_type(g, stmt->throw_stmt.value, locals);
                 if (tt && tt->kind == TYPE_CLASS &&
                     LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) {
                     if (!expr_yields_owned_rc_value(g, stmt->throw_stmt.value, locals))
                         emit_arc_retain(g, vail);
                     LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0), owned_g);
+                    /* record the thrown class's type descriptor so catch
+                     * clauses can dispatch by type */
+                    if (tt->sym) {
+                        LLVMValueRef tid = get_class_tid_global(g, tt->sym);
+                        LLVMBuildStore(g->builder,
+                            LLVMBuildBitCast(g->builder, tid, i8ptr, "tid.bc"),
+                            tid_g);
+                    } else {
+                        LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), tid_g);
+                    }
                 } else {
                     LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), owned_g);
+                    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), tid_g);
                 }
             }
             LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.top");

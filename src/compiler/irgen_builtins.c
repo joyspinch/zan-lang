@@ -671,6 +671,88 @@ static LLVMValueRef get_eh_exc_owned_global(zan_irgen_t *g) {
     return v;
 }
 
+/* i8* pointing at the thrown object's class type-descriptor (see
+ * get_class_tid_global); null for string/non-class throws. Catch clauses use
+ * it for type-based dispatch. */
+static LLVMValueRef get_eh_exc_tid_global(zan_irgen_t *g) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_exc_tid");
+    if (!v) {
+        v = LLVMAddGlobal(g->mod, i8ptr, "__zan_eh_exc_tid");
+        LLVMSetLinkage(v, LLVMInternalLinkage);
+        LLVMSetInitializer(v, LLVMConstNull(i8ptr));
+    }
+    return v;
+}
+
+/* Per-class type descriptor for exception dispatch: an i8* global named
+ * __zan_tid_<Class> whose value is the base class's descriptor (or null for
+ * a root class). Identity is the descriptor's ADDRESS; the stored pointer
+ * links the inheritance chain so `catch (Base b)` matches derived throws. */
+static LLVMValueRef get_class_tid_global(zan_irgen_t *g, zan_symbol_t *sym) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    char name[512];
+    snprintf(name, sizeof(name), "__zan_tid_%.*s", sym->name.len, sym->name.str);
+    LLVMValueRef v = LLVMGetNamedGlobal(g->mod, name);
+    if (v) return v;
+    v = LLVMAddGlobal(g->mod, i8ptr, name);
+    LLVMSetLinkage(v, LLVMInternalLinkage);
+    LLVMSetInitializer(v, LLVMConstNull(i8ptr));
+    if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
+        LLVMValueRef base_tid = get_class_tid_global(g, sym->type->base_type->sym);
+        LLVMSetInitializer(v, LLVMConstBitCast(base_tid, i8ptr));
+    }
+    return v;
+}
+
+/* i1 __zan_eh_tid_match(i8* thrown, i8* want): walks the thrown descriptor's
+ * base chain looking for `want`. A null thrown descriptor (string / legacy
+ * throw) matches any clause, preserving pre-dispatch behaviour. */
+static LLVMValueRef get_eh_tid_match_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tid_match");
+    if (fn) return fn;
+    LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fnty = LLVMFunctionType(i1t, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_eh_tid_match", fnty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "loop");
+    LLVMBasicBlockRef test = LLVMAppendBasicBlockInContext(g->ctx, fn, "test");
+    LLVMBasicBlockRef step = LLVMAppendBasicBlockInContext(g->ctx, fn, "step");
+    LLVMBasicBlockRef yes = LLVMAppendBasicBlockInContext(g->ctx, fn, "yes");
+    LLVMBasicBlockRef no = LLVMAppendBasicBlockInContext(g->ctx, fn, "no");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef thrown = LLVMGetParam(fn, 0);
+    LLVMValueRef want = LLVMGetParam(fn, 1);
+    LLVMValueRef cur = LLVMBuildAlloca(g->builder, i8ptr, "cur");
+    LLVMBuildStore(g->builder, thrown, cur);
+    LLVMValueRef thrown_null = LLVMBuildICmp(g->builder, LLVMIntEQ, thrown,
+        LLVMConstNull(i8ptr), "tnull");
+    LLVMBuildCondBr(g->builder, thrown_null, yes, loop);
+    LLVMPositionBuilderAtEnd(g->builder, loop);
+    LLVMValueRef c = LLVMBuildLoad2(g->builder, i8ptr, cur, "c");
+    LLVMValueRef cnull = LLVMBuildICmp(g->builder, LLVMIntEQ, c,
+        LLVMConstNull(i8ptr), "cnull");
+    LLVMBuildCondBr(g->builder, cnull, no, test);
+    LLVMPositionBuilderAtEnd(g->builder, test);
+    LLVMValueRef eq = LLVMBuildICmp(g->builder, LLVMIntEQ, c, want, "eq");
+    LLVMBuildCondBr(g->builder, eq, yes, step);
+    LLVMPositionBuilderAtEnd(g->builder, step);
+    LLVMValueRef cp = LLVMBuildBitCast(g->builder, c,
+        LLVMPointerType(i8ptr, 0), "cp");
+    LLVMValueRef next = LLVMBuildLoad2(g->builder, i8ptr, cp, "next");
+    LLVMBuildStore(g->builder, next, cur);
+    LLVMBuildBr(g->builder, loop);
+    LLVMPositionBuilderAtEnd(g->builder, yes);
+    LLVMBuildRet(g->builder, LLVMConstInt(i1t, 1, 0));
+    LLVMPositionBuilderAtEnd(g->builder, no);
+    LLVMBuildRet(g->builder, LLVMConstInt(i1t, 0, 0));
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return fn;
+}
+
 static LLVMValueRef get_eh_tmp_push_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_push");
     if (fn) return fn;

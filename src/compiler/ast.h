@@ -308,6 +308,8 @@ struct zan_ast_node {
             zan_istr_t extern_lib;   /* DllImport library name, {NULL,0} if none */
             zan_istr_t entry_point;  /* DllImport entry point override, {NULL,0} if none */
             zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
+            zan_ast_list_t base_args;  /* constructor `: base(...)` argument exprs */
+            bool has_base_init;        /* constructor declared a `: base(...)` initializer */
         } method_decl;
 
         /* field */

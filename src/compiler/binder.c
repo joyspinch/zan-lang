@@ -386,16 +386,31 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     }
 }
 
-/* Pass 2: bind member declarations */
-static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
-    zan_istr_t type_name = type_node->type_decl.name;
-    zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
-    if (!type_sym) return;
+/* Pass 3: resolve base types and inherit members. Runs only after every
+ * type's own members are bound (pass 2), so a base class declared later in
+ * the merged compilation unit -- e.g. a stdlib class pulled in by
+ * --auto-stdlib after the user's sources -- contributes its fields all the
+ * same. Multi-level chains are handled by resolving the base first
+ * (recursively); inherited fields are PREPENDED so base fields stay a prefix
+ * of the derived layout (upcasts are plain bitcasts). */
+static bool type_has_own_member(zan_symbol_t *type_sym, zan_istr_t name) {
+    for (int i = 0; i < type_sym->member_count; i++) {
+        if ((type_sym->members[i]->kind == SYM_FIELD ||
+             type_sym->members[i]->kind == SYM_PROPERTY) &&
+            type_sym->members[i]->name.len == name.len &&
+            memcmp(type_sym->members[i]->name.str, name.str, name.len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
-    /* resolve base types and inherit members. A declaration may list one base
-     * class followed by any number of interfaces (C#-style single inheritance):
-     * the class base sets base_type + inherits members, each interface base is
-     * recorded so codegen can emit interface (tag) dispatch. */
+static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
+    zan_symbol_t *type_sym = scope_find(b->current_scope, type_node->type_decl.name);
+    if (!type_sym || !type_sym->type || type_sym->decl != type_node) return;
+    if (type_sym->type->bases_resolved) return;   /* done or cycle guard */
+    type_sym->type->bases_resolved = 1;
+
     if (type_node->type_decl.bases.count > 0) {
         int nbases = type_node->type_decl.bases.count;
         zan_type_t **ifaces = (zan_type_t **)zan_arena_alloc(
@@ -408,13 +423,42 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             if (!base_sym) continue;
             if ((base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT) &&
                 !type_sym->type->base_type) {
+                /* make sure the base has its own inherited fields first */
+                if (base_sym->decl &&
+                    (base_sym->decl->kind == AST_CLASS_DECL ||
+                     base_sym->decl->kind == AST_STRUCT_DECL)) {
+                    resolve_bases(b, base_sym->decl);
+                }
                 type_sym->type->base_type = base_sym->type;
-                /* inherit base class fields and properties */
+                /* inherit base class fields and properties (prefix layout):
+                 * collect the base's non-shadowed fields/properties, then
+                 * prepend them to the derived member list */
+                int ninherit = 0;
                 for (int bi = 0; bi < base_sym->member_count; bi++) {
-                    if (base_sym->members[bi]->kind == SYM_FIELD ||
-                        base_sym->members[bi]->kind == SYM_PROPERTY) {
-                        symbol_add_member(b->arena, type_sym, base_sym->members[bi]);
+                    if ((base_sym->members[bi]->kind == SYM_FIELD ||
+                         base_sym->members[bi]->kind == SYM_PROPERTY) &&
+                        !type_has_own_member(type_sym, base_sym->members[bi]->name)) {
+                        ninherit++;
                     }
+                }
+                if (ninherit > 0) {
+                    int total = ninherit + type_sym->member_count;
+                    zan_symbol_t **merged = (zan_symbol_t **)zan_arena_alloc(
+                        b->arena, sizeof(zan_symbol_t *) * (size_t)total);
+                    int mi = 0;
+                    for (int bi = 0; bi < base_sym->member_count; bi++) {
+                        if ((base_sym->members[bi]->kind == SYM_FIELD ||
+                             base_sym->members[bi]->kind == SYM_PROPERTY) &&
+                            !type_has_own_member(type_sym, base_sym->members[bi]->name)) {
+                            merged[mi++] = base_sym->members[bi];
+                        }
+                    }
+                    for (int oi = 0; oi < type_sym->member_count; oi++) {
+                        merged[mi++] = type_sym->members[oi];
+                    }
+                    type_sym->members = merged;
+                    type_sym->member_count = total;
+                    type_sym->member_cap = total;
                 }
             } else if (base_sym->kind == SYM_INTERFACE) {
                 ifaces[nif++] = base_sym->type;
@@ -425,6 +469,14 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             type_sym->type->interface_count = nif;
         }
     }
+    type_sym->type->bases_resolved = 2;
+}
+
+/* Pass 2: bind member declarations */
+static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
+    zan_istr_t type_name = type_node->type_decl.name;
+    zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
+    if (!type_sym) return;
 
     zan_scope_t *saved = b->current_scope;
     b->current_scope = scope_new(b->arena, saved);
@@ -521,6 +573,16 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
         if (decl->kind == AST_CLASS_DECL || decl->kind == AST_STRUCT_DECL ||
             decl->kind == AST_INTERFACE_DECL || decl->kind == AST_ENUM_DECL) {
             bind_members(b, decl);
+        }
+    }
+
+    /* pass 3: resolve bases + inherit members, after every type's own
+     * members exist (declaration order across files no longer matters) */
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+        if (decl->kind == AST_CLASS_DECL || decl->kind == AST_STRUCT_DECL ||
+            decl->kind == AST_INTERFACE_DECL) {
+            resolve_bases(b, decl);
         }
     }
 

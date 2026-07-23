@@ -796,19 +796,36 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
         g->current_type_sym = type_sym;
         g->current_fn_body = member->method_decl.body;
 
-        /* implicit base construction: a derived constructor first chains to
-         * its base class's parameterless constructor so inherited fields are
-         * initialised (base fields are laid out as a prefix of the derived
-         * struct, so `this` upcasts by a plain bitcast). */
+        /* base construction: a derived constructor first chains to its base
+         * class's constructor so inherited fields are initialised (base
+         * fields are laid out as a prefix of the derived struct, so `this`
+         * upcasts by a plain bitcast). An explicit `: base(args)` initializer
+         * selects the base overload by argument count; otherwise the
+         * parameterless base constructor is chained implicitly. */
         if (member->kind == AST_CONSTRUCTOR_DECL && type_sym->type && type_sym->type->base_type &&
             type_sym->type->base_type->sym) {
             zan_symbol_t *base_sym = type_sym->type->base_type->sym;
+            int want_args = member->method_decl.has_base_init
+                ? member->method_decl.base_args.count : 0;
             for (int ci = 0; ci < g->ctor_count; ci++) {
-                if (g->ctors[ci].type_sym == base_sym && g->ctors[ci].param_count == 0) {
+                if (g->ctors[ci].type_sym == base_sym && g->ctors[ci].param_count == want_args) {
                     LLVMValueRef thisv = LLVMBuildLoad2(g->builder, param_types[0], this_alloca, "this.base");
                     LLVMTypeRef bst = get_struct_llvm_type(g, base_sym);
                     if (bst) thisv = LLVMBuildBitCast(g->builder, thisv, LLVMPointerType(bst, 0), "base.this");
-                    zan_call2(g->builder, g->ctors[ci].fn_type, g->ctors[ci].fn, &thisv, 1, "");
+                    if (want_args == 0) {
+                        zan_call2(g->builder, g->ctors[ci].fn_type, g->ctors[ci].fn, &thisv, 1, "");
+                    } else {
+                        LLVMValueRef *cargs = (LLVMValueRef *)malloc(
+                            sizeof(LLVMValueRef) * (size_t)(want_args + 1));
+                        cargs[0] = thisv;
+                        for (int ai = 0; ai < want_args; ai++) {
+                            cargs[ai + 1] = emit_expr(g,
+                                member->method_decl.base_args.items[ai], locals);
+                        }
+                        zan_call2(g->builder, g->ctors[ci].fn_type, g->ctors[ci].fn,
+                                  cargs, (unsigned)(want_args + 1), "");
+                        free(cargs);
+                    }
                     break;
                 }
             }

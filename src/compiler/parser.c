@@ -1821,17 +1821,24 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         zan_ast_list_t params = parse_param_list(p);
 
         /* optional base/this initializer: : base(...) or : this(...) */
+        zan_ast_list_t base_args;
+        zan_ast_list_init(&base_args);
+        bool has_base_init = false;
         if (parser_match(p, TK_COLON)) {
-            /* skip base(...) or this(...) for now */
             if (parser_check(p, TK_BASE) || parser_check(p, TK_THIS)) {
+                bool is_base = parser_check(p, TK_BASE);
                 parser_advance(p);
                 if (parser_match(p, TK_LPAREN)) {
                     while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
-                        parse_expression(p);
+                        zan_ast_node_t *arg = parse_expression(p);
+                        if (is_base && arg)
+                            zan_ast_list_push(&base_args, arg, p->arena);
                         if (!parser_match(p, TK_COMMA)) break;
                     }
                     parser_expect(p, TK_RPAREN);
                 }
+                /* this(...) chaining is still skipped (unsupported) */
+                has_base_init = is_base;
             }
         }
 
@@ -1848,6 +1855,8 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
         n->method_decl.body = body;
         n->method_decl.modifiers = mods;
         n->method_decl.return_type = NULL;
+        n->method_decl.base_args = base_args;
+        n->method_decl.has_base_init = has_base_init;
         zan_ast_list_init(&n->method_decl.type_params);
         return n;
     }
