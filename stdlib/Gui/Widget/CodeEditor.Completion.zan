@@ -1,0 +1,1468 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// CodeEditor part: the autocomplete popup, the symbol index and the
+/// using-aware completion engine (member/type/identifier suggestions).
+partial class CodeEditor {
+    // ---- autocomplete ----
+
+    /// True when list `xs` already contains `v`.
+    static bool Has(List<string> xs, string v) {
+        int i = 0;
+        while (i < xs.Count) {
+            if (xs[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `s` begins with `pre`.
+    static bool StartsWithP(string s, string pre) {
+        if (pre.Length > s.Length) { return false; }
+        return s.Substring(0, pre.Length) == pre;
+    }
+
+    /// Appends the language keywords to `outk`.
+    static void KeywordList(List<string> outk) {
+        string kws = "using namespace class struct enum interface static extern void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof";
+        string cur = "";
+        int i = 0;
+        int n = kws.Length;
+        while (i < n) {
+            string ch = kws.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0) { outk.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { outk.Add(cur); }
+    }
+
+    /// Appends common standard library types and members for completion.
+    static void StdlibList(List<string> outk) {
+        string types = "Console List Dictionary StringBuilder String Math File Directory Path Environment Process Convert Array DateTime TimeSpan Task Thread App Canvas Theme Rect Button Label Input Panel Split Modal TreeView TabView CodeEditor Ribbon Icon SignalInt SignalBool SignalString Window TreeNode RibbonCmd TabHit HitRegion Point Size";
+        string methods = "WriteLine ReadLine Write ToString Add Remove RemoveAt Insert IndexOf Contains Count Length Clear Sort Reverse Join Split Substring Replace Trim StartsWith EndsWith ToUpper ToLower Format Concat Exists ReadAllText WriteAllText CreateDirectory GetFiles GetDirectories Append AppendLine Max Min Abs Round Sqrt Floor Ceiling Pow Parse TryParse GetText LoadText Render Create SetText";
+        string snippets = "Program Main InitializeComponent EventArgs Dispose Override";
+        string all = types + " " + methods + " " + snippets;
+        string cur = "";
+        int i = 0;
+        int n = all.Length;
+        while (i < n) {
+            string ch = all.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); }
+    }
+
+    /// Collects unique identifier tokens (length >= 2) appearing anywhere in the
+    /// buffer, so the editor can complete symbols the user has already typed.
+    static void CollectWords(List<string> ls, List<string> outw) {
+        string idstart = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < ls.Count) {
+            string line = ls[li];
+            int n = line.Length;
+            int i = 0;
+            while (i < n) {
+                string ch = line.Substring(i, 1);
+                if (CodeEditor.InSet(idstart, ch)) {
+                    int j = i;
+                    string w = "";
+                    while (j < n) {
+                        string cj = line.Substring(j, 1);
+                        if (CodeEditor.InSet(idrest, cj)) { w = w + cj; j = j + 1; }
+                        else { break; }
+                    }
+                    if (w.Length >= 2 && !CodeEditor.Has(outw, w)) { outw.Add(w); }
+                    i = j;
+                } else {
+                    i = i + 1;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// Rebuilds the visible acItems/acKinds from acAllItems/acAllKinds by
+    /// applying the current kind filter, then updates popup active state.
+    void ApplyKindFilter() {
+        acItems = new List<string>();
+        acKinds = new List<string>();
+        int i = 0;
+        while (i < acAllItems.Count) {
+            string k = "";
+            if (i < acAllKinds.Count) { k = acAllKinds[i]; }
+            if (acFilter == "" || acFilter == k) {
+                acItems.Add(acAllItems[i]);
+                acKinds.Add(k);
+            }
+            i = i + 1;
+        }
+        if (acAllItems.Count > 0) {
+            acActive = true;
+            if (acSel >= acItems.Count) { acSel = acItems.Count - 1; }
+            if (acSel < 0) { acSel = 0; }
+        } else {
+            acActive = false;
+            acFilter = "";
+        }
+    }
+
+    /// True when the unfiltered candidate list contains at least one item of
+    /// the given kind (used to gray out unavailable filter buttons).
+    bool HasKind(string kind) {
+        int i = 0;
+        while (i < acAllKinds.Count) {
+            if (acAllKinds[i] == kind) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Recomputes the completion popup from the word immediately left of the
+    /// cursor; closes the popup when there is no prefix or no candidate.
+    void UpdateCompletion() {
+        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string ln = lines[curLine];
+
+        // If in dot-mode, filter the full member list by the typed prefix
+        if (acDot) {
+            if (acStart > curCol || acStart < 0) { acActive = false; acDot = false; return; }
+            string prefix = ln.Substring(acStart, curCol - acStart);
+            acAllItems = new List<string>();
+            acAllKinds = new List<string>();
+            int fi = 0;
+            while (fi < acFull.Count) {
+                if (prefix.Length == 0 || CodeEditor.StartsWithI(acFull[fi], prefix)) {
+                    acAllItems.Add(acFull[fi]);
+                    acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
+                }
+                fi = fi + 1;
+            }
+            if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+            acSel = 0;
+            ApplyKindFilter();
+            return;
+        }
+
+        // Regular word completion
+        int st = curCol;
+        while (st > 0) {
+            string ch = ln.Substring(st - 1, 1);
+            if (CodeEditor.InSet(idrest, ch)) { st = st - 1; }
+            else { break; }
+        }
+        acStart = st;
+        string pfx = ln.Substring(st, curCol - st);
+        if (pfx.Length < 1) { acActive = false; return; }
+
+        List<string> cand = new List<string>();
+        List<string> candKinds = new List<string>();
+        if (InAttributeContext()) {
+            // Inside `[ ... ]`: only real attributes exist here. The compiler
+            // recognizes exactly DllImport and StructLayout (see parser.c).
+            CodeEditor.AddKindWords(cand, candKinds, "DllImport StructLayout", "M");
+        } else {
+            CodeEditor.SnippetListK(cand, candKinds);
+            CodeEditor.KeywordListK(cand, candKinds);
+            AddStdlibCandidates(cand, candKinds);
+            AddProjectCandidates(cand, candKinds);
+            CodeEditor.CollectWordsK(lines, cand, candKinds);
+        }
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        int i = 0;
+        while (i < cand.Count) {
+            string w = cand[i];
+            if (w != pfx && CodeEditor.StartsWithI(w, pfx) && !CodeEditor.Has(acAllItems, w)) {
+                acAllItems.Add(w);
+                if (i < candKinds.Count) { acAllKinds.Add(candKinds[i]); }
+                else { acAllKinds.Add("W"); }
+                if (acAllItems.Count >= 40) { i = cand.Count; }
+            }
+            i = i + 1;
+        }
+        if (acAllItems.Count == 0) { acActive = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// Heuristic kind tag for a member name: camelCase → field, known nouns →
+    /// property, *Changed/*Click → event, otherwise method.
+    static string MemberKind(string name) {
+        if (name.Length == 0) { return "M"; }
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        if (CodeEditor.InSet(lower, name.Substring(0, 1))) { return "F"; }
+        if (CodeEditor.Find(name, "Changed") >= 0 || CodeEditor.Find(name, "Click") >= 0) { return "E"; }
+        string props = " Count Length Keys Values Now Today UtcNow Year Month Day Hour Minute Second DayOfWeek DayOfYear Ticks PI E Capacity Empty Chars ForegroundColor BackgroundColor ResetColor Title WindowWidth WindowHeight ExitCode HasExited Id ProcessName StandardOutput StandardError StandardInput NewLine MachineName UserName OSVersion ProcessorCount TickCount StackTrace CommandLine CurrentDirectory Is64BitOperatingSystem DirectorySeparatorChar AltDirectorySeparatorChar ";
+        if (CodeEditor.Find(props, " " + name + " ") >= 0) { return "P"; }
+        return "M";
+    }
+
+    /// True when `w` is a control-flow keyword that looks like a call.
+    static bool IsControlWord(string w) {
+        string ctrl = " if for while switch catch foreach using lock return sizeof typeof new ";
+        return CodeEditor.Find(ctrl, " " + w + " ") >= 0;
+    }
+
+    /// If `line` is a method/function declaration, returns the method name;
+    /// otherwise returns "". Heuristic: an identifier followed by '(' whose
+    /// line ends with '{' and is not a control statement.
+    static string DeclNameAt(string line) {
+        string trimmed = CodeEditor.TrimStr(line);
+        if (trimmed.Length == 0) { return ""; }
+        // Must contain a '(' and end with '{' (opening brace on same line).
+        int paren = CodeEditor.Find(trimmed, "(");
+        if (paren <= 0) { return ""; }
+        if (trimmed.Substring(trimmed.Length - 1, 1) != "{") { return ""; }
+        // Reject obvious non-decls.
+        if (CodeEditor.Find(trimmed, "=") >= 0 && CodeEditor.Find(trimmed, "==") < 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int e = paren;
+        while (e > 0) {
+            string ch = trimmed.Substring(e - 1, 1);
+            if (CodeEditor.InSet(idset, ch)) { e = e - 1; }
+            else { break; }
+        }
+        string name = trimmed.Substring(e, paren - e);
+        if (name.Length == 0) { return ""; }
+        // A declaration has a return type / modifier before the name.
+        if (e == 0) { return ""; }
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        return name;
+    }
+
+    /// Counts whole-word occurrences of `name` across all lines.
+    int CountWord(string name) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int total = 0;
+        int li = 0;
+        while (li < lines.Count) {
+            string s = lines[li];
+            int from = 0;
+            while (true) {
+                int p = CodeEditor.FindFrom(s, name, from);
+                if (p < 0) { break; }
+                bool lok = true;
+                bool rok = true;
+                if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+                int rp = p + name.Length;
+                if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+                if (lok && rok) { total = total + 1; }
+                from = p + name.Length;
+            }
+            li = li + 1;
+        }
+        return total;
+    }
+
+    /// Moves the caret to the next whole-word reference of `name` after
+    /// `declLine` (wrapping around), skipping the declaration line itself, and
+    /// selects it. Does nothing when no other reference exists.
+    void JumpToNextRef(string name, int declLine) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int total = lines.Count;
+        int scanned = 0;
+        int li = declLine + 1;
+        while (scanned < total) {
+            if (li >= lines.Count) { li = 0; }
+            if (li != declLine) {
+                string s = lines[li];
+                int from = 0;
+                while (true) {
+                    int p = CodeEditor.FindFrom(s, name, from);
+                    if (p < 0) { break; }
+                    bool lok = true;
+                    bool rok = true;
+                    if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+                    int rp = p + name.Length;
+                    if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+                    if (lok && rok) {
+                        ClearExtraCarets();
+                        selActive = true;
+                        selAnchorLine = li; selAnchorCol = p;
+                        curLine = li; curCol = p + name.Length;
+                        return;
+                    }
+                    from = p + name.Length;
+                }
+            }
+            li = li + 1;
+            scanned = scanned + 1;
+        }
+    }
+
+    /// Collects every line index (excluding `declLine`) that contains a
+    /// whole-word reference of `name`, in file order, into `outLines`.
+    void CollectRefs(string name, int declLine, List<int> outLines) {
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < lines.Count) {
+            if (li != declLine) {
+                string s = lines[li];
+                int from = 0;
+                bool found = false;
+                while (!found) {
+                    int p = CodeEditor.FindFrom(s, name, from);
+                    if (p < 0) { break; }
+                    bool lok = true;
+                    bool rok = true;
+                    if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+                    int rp = p + name.Length;
+                    if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+                    if (lok && rok) { outLines.Add(li); found = true; }
+                    from = p + name.Length;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// Moves the caret to the first whole-word reference of `name` on `targetLine`
+    /// and selects it (used by the reference-list popup).
+    void JumpToRefLine(string name, int targetLine) {
+        if (targetLine < 0 || targetLine >= lines.Count) { return; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string s = lines[targetLine];
+        int from = 0;
+        while (true) {
+            int p = CodeEditor.FindFrom(s, name, from);
+            if (p < 0) { break; }
+            bool lok = true;
+            bool rok = true;
+            if (p > 0 && CodeEditor.InSet(idset, s.Substring(p - 1, 1))) { lok = false; }
+            int rp = p + name.Length;
+            if (rp < s.Length && CodeEditor.InSet(idset, s.Substring(rp, 1))) { rok = false; }
+            if (lok && rok) {
+                ClearExtraCarets();
+                selActive = true;
+                selAnchorLine = targetLine; selAnchorCol = p;
+                curLine = targetLine; curCol = p + name.Length;
+                if (curLine < scrollLine || curLine >= scrollLine + 4) {
+                    scrollLine = curLine - 4;
+                    if (scrollLine < 0) { scrollLine = 0; }
+                }
+                return;
+            }
+            from = p + name.Length;
+        }
+    }
+
+    /// First index of `sub` in `s` at or after `start`, or -1.
+    static int FindFrom(string s, string sub, int start) {
+        if (sub.Length == 0) { return start; }
+        int limit = s.Length - sub.Length;
+        int i = start;
+        if (i < 0) { i = 0; }
+        while (i <= limit) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Trims leading/trailing spaces and tabs from `s`.
+    static string TrimStr(string s) {
+        int a = 0;
+        while (a < s.Length) {
+            string ch = s.Substring(a, 1);
+            if (ch == " " || ch == "\t") { a = a + 1; }
+            else { break; }
+        }
+        int b = s.Length;
+        while (b > a) {
+            string ch = s.Substring(b - 1, 1);
+            if (ch == " " || ch == "\t" || ch == "\r") { b = b - 1; }
+            else { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    /// Returns the identifier under the mouse pointer, or "" if none.
+    string WordAtMouse(App app, Rect area, int gutterW, int fontSize) {
+        int textX = area.x + gutterW + app.theme.paddingSmall;
+        if (app.mouseX < textX || app.mouseX >= area.x + area.width) { return ""; }
+        if (app.mouseY < area.y || app.mouseY >= area.y + area.height) { return ""; }
+        int rel = app.mouseY - area.y;
+        int ln = scrollLine + rel / (Canvas.FontHeight(fontSize) + app.Scale(4));
+        if (ln < 0 || ln >= lines.Count) { return ""; }
+        string s = lines[ln];
+        int col = CodeEditor.ColFromX(s, app.mouseX - textX, fontSize);
+        if (col < 0 || col > s.Length) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int a = col;
+        while (a > 0 && CodeEditor.InSet(idset, s.Substring(a - 1, 1))) { a = a - 1; }
+        int b = col;
+        while (b < s.Length && CodeEditor.InSet(idset, s.Substring(b, 1))) { b = b + 1; }
+        if (b <= a) { return ""; }
+        return s.Substring(a, b - a);
+    }
+
+    static void KeywordListK(List<string> outk, List<string> kinds) {
+        List<string> tmp = new List<string>();
+        CodeEditor.KeywordList(tmp);
+        int i = 0;
+        while (i < tmp.Count) {
+            outk.Add(tmp[i]);
+            kinds.Add("K");
+            i = i + 1;
+        }
+    }
+
+    static void StdlibListK(List<string> outk, List<string> kinds) {
+        string types = "Console List Dictionary StringBuilder String Math File Directory Path Environment Process Convert Array DateTime TimeSpan Task Thread App Canvas Theme Rect Button Label Input Panel Split Modal TreeView TabView CodeEditor Ribbon Icon SignalInt SignalBool SignalString Window TreeNode RibbonCmd TabHit HitRegion Point Size Color Font Graphics Bitmap Image Stream StreamReader StreamWriter HttpClient JsonSerializer Regex Match Timer Socket WebSocket";
+        string methods = "WriteLine ReadLine Write ToString Add Remove RemoveAt Insert IndexOf Contains Count Length Clear Sort Reverse Join Split Substring Replace Trim StartsWith EndsWith ToUpper ToLower Format Concat Exists ReadAllText WriteAllText CreateDirectory GetFiles GetDirectories Append AppendLine Max Min Abs Round Sqrt Floor Ceiling Pow Parse TryParse GetText LoadText Render Create SetText Where Select OrderBy GroupBy First Last Any All Sum Skip Take Distinct Aggregate";
+        string all = types;
+        string cur = "";
+        int i = 0;
+        while (i < all.Length) {
+            string ch = all.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("T"); }
+                cur = "";
+            } else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("T"); }
+        cur = "";
+        i = 0;
+        while (i < methods.Length) {
+            string ch = methods.Substring(i, 1);
+            if (ch == " ") {
+                if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("M"); }
+                cur = "";
+            } else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0 && !CodeEditor.Has(outk, cur)) { outk.Add(cur); kinds.Add("M"); }
+    }
+
+    static void CollectWordsK(List<string> ls, List<string> outw, List<string> kinds) {
+        List<string> tmp = new List<string>();
+        CodeEditor.CollectWords(ls, tmp);
+        int i = 0;
+        while (i < tmp.Count) {
+            if (!CodeEditor.Has(outw, tmp[i])) {
+                outw.Add(tmp[i]);
+                kinds.Add("W");
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Case-insensitive StartsWith check.
+    static bool StartsWithI(string s, string pre) {
+        if (pre.Length > s.Length) { return false; }
+        string lower = "abcdefghijklmnopqrstuvwxyz";
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        int i = 0;
+        while (i < pre.Length) {
+            string a = s.Substring(i, 1);
+            string b = pre.Substring(i, 1);
+            // Normalize both to same case
+            string la = a;
+            string lb = b;
+            int ai = 0;
+            while (ai < 26) {
+                if (upper.Substring(ai, 1) == a) { la = lower.Substring(ai, 1); }
+                if (upper.Substring(ai, 1) == b) { lb = lower.Substring(ai, 1); }
+                ai = ai + 1;
+            }
+            if (la != lb) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// Replaces the in-progress word with the selected candidate. When `viaTab`
+    /// is true and the candidate is a code snippet, its template is expanded.
+    void AcceptCompletion(bool viaTab) {
+        if (!acActive) { return; }
+        if (acSel < 0 || acSel >= acItems.Count) { acActive = false; return; }
+        string ln = lines[curLine];
+        string chosen = acItems[acSel];
+        string chosenKind = "";
+        if (acSel < acKinds.Count) { chosenKind = acKinds[acSel]; }
+        if (viaTab && chosenKind == "S") { SaveUndo(); ExpandSnippet(chosen); return; }
+        string left = Text.Left(ln, acStart);
+        string right = Text.Right(ln, curCol);
+        lines[curLine] = left + chosen + right;
+        curCol = acStart + chosen.Length;
+        acActive = false;
+        acDot = false;
+        acFilter = "";
+    }
+
+    /// Triggered when user types '.'. Looks at the word before the dot and
+    /// suggests known members for that type, or the chain return type.
+    void DotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        if (dotPos < 0) { acActive = false; return; }
+
+        // On a `using X.` directive, complete child namespaces, not members.
+        if (CodeEditor.StartsWithP(CodeEditor.TrimStr(ln), "using ")) {
+            UsingDotCompletion();
+            return;
+        }
+
+        // Walk backwards through the chain: skip matched parens and identifiers
+        string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int pos = dotPos;
+        // Skip over closing paren groups (for chained calls like .Where(...).Select)
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ")") {
+            int depth = 1;
+            pos = pos - 1;
+            while (pos > 0 && depth > 0) {
+                pos = pos - 1;
+                string pc = ln.Substring(pos, 1);
+                if (pc == ")") { depth = depth + 1; }
+                else if (pc == "(") { depth = depth - 1; }
+            }
+        }
+        // Now get the word (method or variable name) before the paren or dot
+        int end = pos;
+        while (pos > 0) {
+            string pc = ln.Substring(pos - 1, 1);
+            if (CodeEditor.InSet(idchars, pc)) { pos = pos - 1; }
+            else { break; }
+        }
+        string lastWord = ln.Substring(pos, end - pos);
+
+        // Walk further back to find the owner (e.g. "Console" in "Console.Xxx")
+        string owner = lastWord;
+        if (pos > 0 && ln.Substring(pos - 1, 1) == ".") {
+            int ownerEnd = pos - 1;
+            int ownerStart = ownerEnd;
+            while (ownerStart > 0) {
+                string pc = ln.Substring(ownerStart - 1, 1);
+                if (CodeEditor.InSet(idchars, pc)) { ownerStart = ownerStart - 1; }
+                else { break; }
+            }
+            owner = ln.Substring(ownerStart, ownerEnd - ownerStart);
+        }
+
+        // Build member list based on identified type
+        acStart = curCol;
+        acFull = new List<string>();
+        acDot = true;
+
+        // Resolve the receiver's type, then list ONLY that type's real members.
+        // Priority: hardcoded stdlib static types -> user/project type -> the
+        // declared type of a local variable -> universal object members. We
+        // never dump speculative string/collection/LINQ helpers for a receiver
+        // we cannot resolve (that produced bogus `Utils.OrderByDescending`).
+        string recv = lastWord;
+        if (recv.Length == 0) { recv = owner; }
+        string norm = CodeEditor.NormalizeStdlibType(recv);
+        if (CodeEditor.IsKnownStdlibType(norm)) {
+            CodeEditor.AddMembers(acFull, norm);
+            if (CodeEditor.IsCollectionType(norm) && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
+        } else {
+            List<string> mem = new List<string>();
+            bool found = FindTypeMembers(recv, mem);
+            bool coll = false;
+            if (!found) {
+                string vt = ResolveVarType(recv);
+                if (vt.Length > 0) {
+                    string nvt = CodeEditor.NormalizeStdlibType(vt);
+                    if (CodeEditor.IsKnownStdlibType(nvt)) {
+                        CodeEditor.AddMembers(acFull, nvt);
+                        found = true;
+                        if (CodeEditor.IsCollectionType(nvt)) { coll = true; }
+                    } else if (FindTypeMembers(vt, mem)) {
+                        found = true;
+                    }
+                }
+            }
+            if (found) {
+                int mi = 0;
+                while (mi < mem.Count) {
+                    if (!CodeEditor.Has(acFull, mem[mi])) { acFull.Add(mem[mi]); }
+                    mi = mi + 1;
+                }
+                if (coll && UsesLinq()) { CodeEditor.AddLinqMembers(acFull); }
+                // Universal members every object inherits.
+                if (!CodeEditor.Has(acFull, "ToString")) { acFull.Add("ToString"); }
+                if (!CodeEditor.Has(acFull, "Equals")) { acFull.Add("Equals"); }
+                if (!CodeEditor.Has(acFull, "GetHashCode")) { acFull.Add("GetHashCode"); }
+                if (!CodeEditor.Has(acFull, "GetType")) { acFull.Add("GetType"); }
+            } else {
+                acFull.Add("ToString"); acFull.Add("Equals");
+                acFull.Add("GetHashCode"); acFull.Add("GetType");
+            }
+        }
+
+        acFilter = "";
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        int fi = 0;
+        while (fi < acFull.Count) {
+            acAllItems.Add(acFull[fi]);
+            acAllKinds.Add(CodeEditor.MemberKind(acFull[fi]));
+            fi = fi + 1;
+        }
+        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// Namespace completion for a `using X.` directive: lists the child
+    /// namespaces of the prefix typed so far (e.g. `using System.` -> Data,
+    /// Net, IO, Text, ...). Derived from the stdlib namespace catalog so it
+    /// never invents members and never falls through to the type-member path.
+    void UsingDotCompletion() {
+        string ln = lines[curLine];
+        int dotPos = curCol - 1;
+        string nsset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+        int s = dotPos;
+        while (s > 0 && CodeEditor.InSet(nsset, ln.Substring(s - 1, 1))) { s = s - 1; }
+        string prefix = ln.Substring(s, dotPos - s);
+        while (prefix.Length > 0 && prefix.Substring(prefix.Length - 1, 1) == ".") {
+            prefix = prefix.Substring(0, prefix.Length - 1);
+        }
+        acStart = curCol;
+        acDot = true;
+        acFull = new List<string>();
+        List<string> kids = new List<string>();
+        CodeEditor.ChildNamespaces(prefix, kids);
+        int ki = 0;
+        while (ki < kids.Count) { acFull.Add(kids[ki]); ki = ki + 1; }
+        acFilter = "";
+        acAllItems = new List<string>();
+        acAllKinds = new List<string>();
+        int fi = 0;
+        while (fi < acFull.Count) {
+            acAllItems.Add(acFull[fi]);
+            acAllKinds.Add("M");
+            fi = fi + 1;
+        }
+        if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+        acSel = 0;
+        ApplyKindFilter();
+    }
+
+    /// Appends to `out2` the distinct next-segment child namespaces of `prefix`
+    /// found in the stdlib catalog (e.g. prefix "System.Data" -> Orm Sqlite
+    /// Postgres).
+    static void ChildNamespaces(string prefix, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        string pre = prefix + ".";
+        int i = 0;
+        string cur = "";
+        while (i <= data.Length) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                string key = cur;
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) { key = cur.Substring(0, eq); }
+                if (key.Length > pre.Length && CodeEditor.StartsWithP(key, pre)) {
+                    string rest = key.Substring(pre.Length, key.Length - pre.Length);
+                    string seg = rest;
+                    int dotp = CodeEditor.Find(rest, ".");
+                    if (dotp > 0) { seg = rest.Substring(0, dotp); }
+                    if (seg.Length > 0 && !CodeEditor.Has(out2, seg)) { out2.Add(seg); }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Populates member lists for known types.
+    static void AddMembers(List<string> out2, string typeName) {
+        if (typeName == "Console") {
+            out2.Add("WriteLine"); out2.Add("ReadLine"); out2.Add("Write");
+            out2.Add("Clear"); out2.Add("ReadKey"); out2.Add("SetCursorPosition");
+            out2.Add("ForegroundColor"); out2.Add("BackgroundColor"); out2.Add("ResetColor");
+            out2.Add("Title"); out2.Add("WindowWidth"); out2.Add("WindowHeight");
+            out2.Add("Beep"); out2.Add("Error"); out2.Add("Out"); out2.Add("In");
+        } else if (typeName == "Math") {
+            out2.Add("Max"); out2.Add("Min"); out2.Add("Abs"); out2.Add("Sqrt");
+            out2.Add("Round"); out2.Add("Floor"); out2.Add("Ceiling"); out2.Add("Pow");
+            out2.Add("Log"); out2.Add("Log10"); out2.Add("Sin"); out2.Add("Cos");
+            out2.Add("Tan"); out2.Add("Atan"); out2.Add("Atan2"); out2.Add("Exp");
+            out2.Add("Sign"); out2.Add("Truncate"); out2.Add("Clamp");
+            out2.Add("PI"); out2.Add("E");
+        } else if (typeName == "File") {
+            out2.Add("ReadAllText"); out2.Add("WriteAllText"); out2.Add("ReadAllLines");
+            out2.Add("WriteAllLines"); out2.Add("AppendAllText"); out2.Add("Exists");
+            out2.Add("Delete"); out2.Add("Copy"); out2.Add("Move"); out2.Add("Create");
+            out2.Add("Open"); out2.Add("OpenRead"); out2.Add("OpenWrite");
+            out2.Add("ReadAllBytes"); out2.Add("WriteAllBytes"); out2.Add("GetCreationTime");
+            out2.Add("GetLastWriteTime"); out2.Add("SetAttributes");
+        } else if (typeName == "Directory") {
+            out2.Add("Exists"); out2.Add("CreateDirectory"); out2.Add("Delete");
+            out2.Add("GetFiles"); out2.Add("GetDirectories"); out2.Add("Move");
+            out2.Add("GetCurrentDirectory"); out2.Add("SetCurrentDirectory");
+            out2.Add("EnumerateFiles"); out2.Add("EnumerateDirectories");
+            out2.Add("GetParent"); out2.Add("GetDirectoryRoot");
+        } else if (typeName == "Path") {
+            out2.Add("GetFileName"); out2.Add("GetDirectoryName"); out2.Add("GetExtension");
+            out2.Add("Combine"); out2.Add("GetFullPath"); out2.Add("GetTempPath");
+            out2.Add("GetTempFileName"); out2.Add("ChangeExtension");
+            out2.Add("GetFileNameWithoutExtension"); out2.Add("HasExtension");
+            out2.Add("IsPathRooted"); out2.Add("GetPathRoot");
+            out2.Add("DirectorySeparatorChar"); out2.Add("AltDirectorySeparatorChar");
+        } else if (typeName == "Convert") {
+            out2.Add("ToString"); out2.Add("ToInt32"); out2.Add("ToInt64");
+            out2.Add("ToDouble"); out2.Add("ToSingle"); out2.Add("ToBoolean");
+            out2.Add("ToByte"); out2.Add("ToChar"); out2.Add("ToDateTime");
+            out2.Add("ToDecimal"); out2.Add("ToUInt32"); out2.Add("ToUInt64");
+            out2.Add("FromBase64String"); out2.Add("ToBase64String");
+            out2.Add("ChangeType");
+        } else if (typeName == "Environment") {
+            out2.Add("GetEnvironmentVariable"); out2.Add("SetEnvironmentVariable");
+            out2.Add("CurrentDirectory"); out2.Add("NewLine");
+            out2.Add("MachineName"); out2.Add("UserName"); out2.Add("OSVersion");
+            out2.Add("ProcessorCount"); out2.Add("TickCount"); out2.Add("StackTrace");
+            out2.Add("CommandLine"); out2.Add("Exit"); out2.Add("FailFast");
+            out2.Add("GetCommandLineArgs"); out2.Add("Is64BitOperatingSystem");
+        } else if (typeName == "string") {
+            out2.Add("Length"); out2.Add("Substring"); out2.Add("IndexOf");
+            out2.Add("LastIndexOf"); out2.Add("Contains"); out2.Add("StartsWith");
+            out2.Add("EndsWith"); out2.Add("Replace"); out2.Add("Trim");
+            out2.Add("TrimStart"); out2.Add("TrimEnd"); out2.Add("ToUpper");
+            out2.Add("ToLower"); out2.Add("Split"); out2.Add("Join");
+            out2.Add("Insert"); out2.Add("Remove"); out2.Add("PadLeft");
+            out2.Add("PadRight"); out2.Add("Format"); out2.Add("Concat");
+            out2.Add("IsNullOrEmpty"); out2.Add("IsNullOrWhiteSpace");
+            out2.Add("Equals"); out2.Add("CompareTo"); out2.Add("ToCharArray");
+            out2.Add("Chars"); out2.Add("Empty");
+        } else if (typeName == "List") {
+            out2.Add("Add"); out2.Add("Insert"); out2.Add("Remove"); out2.Add("RemoveAt");
+            out2.Add("RemoveAll"); out2.Add("Clear"); out2.Add("Count");
+            out2.Add("Contains"); out2.Add("IndexOf"); out2.Add("LastIndexOf");
+            out2.Add("Sort"); out2.Add("Reverse"); out2.Add("ToArray");
+            out2.Add("Find"); out2.Add("FindAll"); out2.Add("FindIndex");
+            out2.Add("Exists"); out2.Add("ForEach"); out2.Add("AddRange");
+            out2.Add("GetRange"); out2.Add("CopyTo"); out2.Add("BinarySearch");
+            out2.Add("ToArray");
+            // NOTE: LINQ chain methods (Where/Select/OrderBy…) are intentionally
+            // NOT added here. They only exist under `using System.Linq;` and are
+            // appended by DotCompletion via AddLinqMembers() when that using is
+            // present, so custom types never see them by accident.
+        } else if (typeName == "Dictionary") {
+            out2.Add("Add"); out2.Add("Remove"); out2.Add("Clear"); out2.Add("Count");
+            out2.Add("ContainsKey"); out2.Add("ContainsValue"); out2.Add("TryGetValue");
+            out2.Add("Keys"); out2.Add("Values"); out2.Add("GetEnumerator");
+        } else if (typeName == "StringBuilder") {
+            out2.Add("Append"); out2.Add("AppendLine"); out2.Add("AppendFormat");
+            out2.Add("Insert"); out2.Add("Remove"); out2.Add("Replace");
+            out2.Add("Clear"); out2.Add("ToString"); out2.Add("Length");
+            out2.Add("Capacity"); out2.Add("EnsureCapacity");
+        } else if (typeName == "DateTime") {
+            out2.Add("Now"); out2.Add("Today"); out2.Add("UtcNow");
+            out2.Add("Year"); out2.Add("Month"); out2.Add("Day");
+            out2.Add("Hour"); out2.Add("Minute"); out2.Add("Second");
+            out2.Add("DayOfWeek"); out2.Add("DayOfYear"); out2.Add("Ticks");
+            out2.Add("AddDays"); out2.Add("AddHours"); out2.Add("AddMinutes");
+            out2.Add("AddSeconds"); out2.Add("AddMonths"); out2.Add("AddYears");
+            out2.Add("ToString"); out2.Add("ToShortDateString"); out2.Add("ToLongDateString");
+            out2.Add("Parse"); out2.Add("TryParse"); out2.Add("Compare");
+        } else if (typeName == "Array") {
+            out2.Add("Length"); out2.Add("Sort"); out2.Add("Reverse");
+            out2.Add("IndexOf"); out2.Add("Copy"); out2.Add("Clear");
+            out2.Add("Resize"); out2.Add("Find"); out2.Add("FindAll");
+            out2.Add("Exists"); out2.Add("ForEach"); out2.Add("ConvertAll");
+        } else if (typeName == "Process") {
+            out2.Add("Start"); out2.Add("Kill"); out2.Add("WaitForExit");
+            out2.Add("RunCapture"); out2.Add("ExitCode"); out2.Add("HasExited");
+            out2.Add("Id"); out2.Add("ProcessName"); out2.Add("GetCurrentProcess");
+            out2.Add("GetProcesses"); out2.Add("GetProcessesByName");
+            out2.Add("StandardOutput"); out2.Add("StandardError"); out2.Add("StandardInput");
+        } else if (typeName == "App") {
+            out2.Add("CreateDark"); out2.Add("Create"); out2.Add("Show");
+            out2.Add("BeginFrame"); out2.Add("PresentFrame"); out2.Add("RenderChrome");
+            out2.Add("ProcessEvent"); out2.Add("RequestRedraw"); out2.Add("Scale");
+            out2.Add("isRunning"); out2.Add("needsRedraw"); out2.Add("canvas");
+            out2.Add("theme"); out2.Add("window"); out2.Add("titlebarH");
+            out2.Add("mouseX"); out2.Add("mouseY"); out2.Add("focus");
+            out2.Add("hitTester"); out2.Add("ApplyEvent"); out2.Add("WindowHandle");
+            out2.Add("CaptureWheel");
+        } else if (typeName == "Canvas") {
+            out2.Add("DrawText"); out2.Add("FillRect"); out2.Add("DrawRect");
+            out2.Add("FillRoundRect"); out2.Add("Width"); out2.Add("Height");
+            out2.Add("MeasureText"); out2.Add("FontHeight"); out2.Add("Create");
+            out2.Add("Destroy"); out2.Add("DrawLine"); out2.Add("DrawCircle");
+            out2.Add("FillCircle"); out2.Add("SetClip"); out2.Add("ResetClip");
+        } else if (typeName == "Theme") {
+            out2.Add("bgPrimary"); out2.Add("bgSecondary"); out2.Add("bgTertiary");
+            out2.Add("bgHover"); out2.Add("bgActive"); out2.Add("textPrimary");
+            out2.Add("textSecondary"); out2.Add("textTertiary"); out2.Add("primary");
+            out2.Add("error"); out2.Add("warning"); out2.Add("success");
+            out2.Add("divider"); out2.Add("borderPrimary"); out2.Add("borderRadiusMedium");
+            out2.Add("borderRadiusSmall"); out2.Add("fontSizeSmall"); out2.Add("fontSizeMedium");
+            out2.Add("fontSizeLarge"); out2.Add("iconSizeLarge"); out2.Add("paddingSmall");
+            out2.Add("paddingMedium"); out2.Add("paddingLarge"); out2.Add("paddingTiny");
+            out2.Add("gapMedium"); out2.Add("heightMedium");
+        } else if (typeName == "Window") {
+            out2.Add("EventKind"); out2.Add("EventKeyCode"); out2.Add("EventX");
+            out2.Add("EventY"); out2.Add("PollEvent"); out2.Add("WaitEvent");
+            out2.Add("GetWidth"); out2.Add("GetHeight"); out2.Add("Close");
+            out2.Add("SetCursor"); out2.Add("GetTickMs"); out2.Add("SleepMs");
+        } else if (typeName == "LayoutKind") {
+            // [StructLayout(LayoutKind.Sequential)] — the only real member used
+            // by the FFI/marshalling attribute.
+            out2.Add("Sequential"); out2.Add("Explicit"); out2.Add("Auto");
+        } else {
+            // Unknown / unresolved receiver: only the universally-available
+            // object members. We deliberately do NOT guess string / collection /
+            // LINQ helpers, because doing so shows methods the type may not have
+            // (e.g. `Utils.OrderByDescending`). DotCompletion resolves user and
+            // stdlib types by name/using and only falls back here when nothing is
+            // known about the receiver.
+            out2.Add("ToString"); out2.Add("Equals");
+            out2.Add("GetHashCode"); out2.Add("GetType");
+        }
+    }
+
+    /// Appends the LINQ query-operator methods. Only called for collection
+    /// receivers when the file imports `using System.Linq;`.
+    static void AddLinqMembers(List<string> out2) {
+        out2.Add("Where"); out2.Add("Select"); out2.Add("SelectMany");
+        out2.Add("OrderBy"); out2.Add("OrderByDescending"); out2.Add("ThenBy");
+        out2.Add("ThenByDescending"); out2.Add("GroupBy"); out2.Add("First");
+        out2.Add("FirstOrDefault"); out2.Add("Last"); out2.Add("LastOrDefault");
+        out2.Add("Single"); out2.Add("SingleOrDefault"); out2.Add("Any");
+        out2.Add("All"); out2.Add("Count"); out2.Add("Sum"); out2.Add("Average");
+        out2.Add("Min"); out2.Add("Max"); out2.Add("Take"); out2.Add("Skip");
+        out2.Add("TakeWhile"); out2.Add("SkipWhile"); out2.Add("Distinct");
+        out2.Add("Concat"); out2.Add("Union"); out2.Add("Intersect"); out2.Add("Except");
+        out2.Add("Reverse"); out2.Add("ToList"); out2.Add("ToArray");
+        out2.Add("ToDictionary"); out2.Add("Aggregate"); out2.Add("Zip");
+        out2.Add("Append"); out2.Add("Prepend"); out2.Add("OfType"); out2.Add("Cast");
+    }
+
+    // ============================================================
+    //  Symbol index & using-aware, accurate completion
+    // ============================================================
+
+    /// Splits a space-separated string into tokens appended to `out2`.
+    static void AddWords(List<string> out2, string s) {
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " ") { if (cur.Length > 0) { out2.Add(cur); cur = ""; } }
+            else { cur = cur + ch; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { out2.Add(cur); }
+    }
+
+    /// Appends each space-separated token of `s` to `cand` (kind `kind`),
+    /// skipping duplicates already present.
+    static void AddKindWords(List<string> cand, List<string> kinds, string s, string kind) {
+        List<string> tmp = new List<string>();
+        CodeEditor.AddWords(tmp, s);
+        int i = 0;
+        while (i < tmp.Count) {
+            if (!CodeEditor.Has(cand, tmp[i])) { cand.Add(tmp[i]); kinds.Add(kind); }
+            i = i + 1;
+        }
+    }
+
+    /// Strips leading declaration modifiers (public/static/…) from a trimmed
+    /// line, returning what remains (e.g. "class Foo {" from "public class Foo {").
+    static string StripModifiers(string trimmed) {
+        string mods = " public private protected internal static abstract sealed partial file virtual override readonly const async unsafe extern new ";
+        string s = trimmed;
+        while (true) {
+            int sp = CodeEditor.Find(s, " ");
+            if (sp <= 0) { break; }
+            string first = s.Substring(0, sp);
+            if (CodeEditor.Find(mods, " " + first + " ") >= 0) {
+                s = CodeEditor.LTrim(s.Substring(sp, s.Length - sp));
+            } else { break; }
+        }
+        return s;
+    }
+
+    /// If `trimmed` declares a class/struct/enum/interface, returns its name;
+    /// otherwise "".
+    static string TypeDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        string kw = "";
+        if (CodeEditor.StartsWithP(s, "class ")) { kw = "class "; }
+        else if (CodeEditor.StartsWithP(s, "struct ")) { kw = "struct "; }
+        else if (CodeEditor.StartsWithP(s, "enum ")) { kw = "enum "; }
+        else if (CodeEditor.StartsWithP(s, "interface ")) { kw = "interface "; }
+        else { return ""; }
+        string rest = CodeEditor.LTrim(s.Substring(kw.Length, s.Length - kw.Length));
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string name = "";
+        int i = 0;
+        while (i < rest.Length) {
+            string ch = rest.Substring(i, 1);
+            if (CodeEditor.InSet(idset, ch)) { name = name + ch; i = i + 1; }
+            else { break; }
+        }
+        return name;
+    }
+
+    /// If `trimmed` is a direct member declaration (method / field / property)
+    /// returns the member name; otherwise "".
+    static string MemberDeclName(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        if (s.Length == 0) { return ""; }
+        string f = s.Substring(0, 1);
+        if (f == "/" || f == "*" || f == "#" || f == "@" || f == "[" || f == "}" || f == "{") { return ""; }
+        if (CodeEditor.TypeDeclName(trimmed).Length > 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        // Method: an identifier immediately followed by '('.
+        int paren = CodeEditor.Find(s, "(");
+        if (paren > 0) {
+            int e = paren;
+            while (e > 0 && CodeEditor.InSet(idset, s.Substring(e - 1, 1))) { e = e - 1; }
+            string mname = s.Substring(e, paren - e);
+            if (mname.Length == 0) { return ""; }
+            if (e == 0) { return ""; }
+            if (CodeEditor.IsControlWord(mname)) { return ""; }
+            return mname;
+        }
+        // Field / property: "Type name;" or "Type name =" or "Type name {".
+        int term = -1;
+        int ti = 0;
+        while (ti < s.Length) {
+            string ch = s.Substring(ti, 1);
+            if (ch == ";" || ch == "=" || ch == "{") { term = ti; break; }
+            ti = ti + 1;
+        }
+        if (term < 0) { return ""; }
+        string head = CodeEditor.TrimStr(s.Substring(0, term));
+        int b = head.Length;
+        while (b > 0 && !CodeEditor.InSet(idset, head.Substring(b - 1, 1))) { b = b - 1; }
+        int a = b;
+        while (a > 0 && CodeEditor.InSet(idset, head.Substring(a - 1, 1))) { a = a - 1; }
+        if (b <= a) { return ""; }
+        string name = head.Substring(a, b - a);
+        string before = CodeEditor.TrimStr(head.Substring(0, a));
+        if (before.Length == 0) { return ""; }        // needs a type token before it
+        if (CodeEditor.IsControlWord(name)) { return ""; }
+        string digits = "0123456789";
+        if (CodeEditor.InSet(digits, name.Substring(0, 1))) { return ""; }
+        return name;
+    }
+
+    /// Scans `src` for every class/struct/enum declaration, appending each type
+    /// name to `names` and its space-separated direct member names to `membersJoined`.
+    static void ScanTypesInto(string src, List<string> names, List<string> membersJoined) {
+        List<string> ls = CodeEditor.SplitLines(src);
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.TrimStr(ls[i]);
+            string tname = CodeEditor.TypeDeclName(tr);
+            if (tname.Length > 0) {
+                string members = " ";
+                int depth = 0;
+                bool started = false;
+                int j = i;
+                while (j < ls.Count) {
+                    string lj = ls[j];
+                    if (started && depth == 1 && j != i) {
+                        string mn = CodeEditor.MemberDeclName(CodeEditor.TrimStr(lj));
+                        if (mn.Length > 0 && CodeEditor.Find(members, " " + mn + " ") < 0) {
+                            members = members + mn + " ";
+                        }
+                    }
+                    int k = 0;
+                    while (k < lj.Length) {
+                        string ch = lj.Substring(k, 1);
+                        if (ch == "{") { depth = depth + 1; started = true; }
+                        else if (ch == "}") { depth = depth - 1; }
+                        k = k + 1;
+                    }
+                    j = j + 1;
+                    if (started && depth <= 0) { break; }
+                }
+                names.Add(tname);
+                membersJoined.Add(CodeEditor.TrimStr(members));
+                i = j;
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /// Host IDE hook: supply the source text of every other project file so the
+    /// editor can resolve cross-file types (e.g. a `Utils` class in utils.zan).
+    void SetProjectFiles(List<string> contents) {
+        projFileSrc = contents;
+        projScanDirty = true;
+    }
+
+    /// Runs the deferred cross-file type scan if SetProjectFiles() left it
+    /// pending. Called lazily by the completion paths so a tab switch itself
+    /// stays cheap.
+    void EnsureProjectScan() {
+        if (!projScanDirty) { return; }
+        projScanDirty = false;
+        projTypes = new List<ProjType>();
+        int i = 0;
+        while (i < projFileSrc.Count) {
+            List<string> tn = new List<string>();
+            List<string> tm = new List<string>();
+            CodeEditor.ScanTypesInto(projFileSrc[i], tn, tm);
+            int k = 0;
+            while (k < tn.Count) {
+                string mm = "";
+                if (k < tm.Count) { mm = tm[k]; }
+                projTypes.Add(new ProjType(tn[k], mm));
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// True when the project type list contains a type named `name`.
+    static bool HasProjType(List<ProjType> ps, string name) {
+        int i = 0;
+        while (i < ps.Count) {
+            if (ps[i].name == name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Collects the namespaces imported by the current buffer's `using` lines.
+    void ParseUsingsInto(List<string> outNs) {
+        int i = 0;
+        while (i < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "using ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(6, tr.Length - 6));
+                if (CodeEditor.StartsWithP(rest, "static ")) {
+                    rest = CodeEditor.LTrim(rest.Substring(7, rest.Length - 7));
+                }
+                string ns = "";
+                int j = 0;
+                while (j < rest.Length) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == "=" || ch == " ") { break; }
+                    ns = ns + ch;
+                    j = j + 1;
+                }
+                if (ns.Length > 0 && !CodeEditor.Has(outNs, ns)) { outNs.Add(ns); }
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The namespace the current buffer declares (`namespace X;`), or "".
+    string FileNamespace() {
+        int i = 0;
+        while (i < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.StartsWithP(tr, "namespace ")) {
+                string rest = CodeEditor.LTrim(tr.Substring(10, tr.Length - 10));
+                string ns = "";
+                int j = 0;
+                while (j < rest.Length) {
+                    string ch = rest.Substring(j, 1);
+                    if (ch == ";" || ch == " " || ch == "{") { break; }
+                    ns = ns + ch;
+                    j = j + 1;
+                }
+                return ns;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// True when namespace `ns` is visible in the current buffer: imported via
+    /// `using`, or it is (an ancestor of) the file's own namespace.
+    bool NsVisible(string ns) {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        if (CodeEditor.Has(u, ns)) { return true; }
+        string fn = FileNamespace();
+        if (fn.Length > 0) {
+            if (fn == ns) { return true; }
+            if (fn.Length > ns.Length && CodeEditor.StartsWithP(fn, ns + ".")) { return true; }
+        }
+        return false;
+    }
+
+    /// True when the file imports System.Linq (gates LINQ query operators).
+    bool UsesLinq() {
+        List<string> u = new List<string>();
+        ParseUsingsInto(u);
+        return CodeEditor.Has(u, "System.Linq");
+    }
+
+    /// The stdlib types the editor has hardcoded member data for.
+    static bool IsKnownStdlibType(string name) {
+        string known = " Console Math File Directory Path Convert Environment string List Dictionary StringBuilder DateTime Array Process App Canvas Theme Window LayoutKind ";
+        return CodeEditor.Find(known, " " + name + " ") >= 0;
+    }
+
+    /// Canonicalizes a type name for member lookup (String -> string).
+    static string NormalizeStdlibType(string name) {
+        if (name == "String") { return "string"; }
+        return name;
+    }
+
+    /// True for the built-in collection types that expose LINQ under System.Linq.
+    static bool IsCollectionType(string name) {
+        return name == "List" || name == "Array" || name == "Dictionary";
+    }
+
+    /// The full namespace -> types catalog used to add in-scope stdlib types to
+    /// completion. One entry per line: "Namespace=Type Type Type".
+    static string StdlibNsData() {
+        return "System.IO=File Directory Path;"
+            + "System.Text=Encoding;"
+            + "System.Json=JsonBuilder JsonParser;"
+            + "System.Threading=Thread Mutex Semaphore Stopwatch Channel AtomicInt SharedTable;"
+            + "System.Net.Sockets=Socket AsyncSocket TcpListener TcpClient UdpClient;"
+            + "System.Net.Http=HttpClient HttpRequest HttpResponse HttpServer HttpRouter;"
+            + "System.Net.WebSocket=WebSocketClient WebSocketServer WsFrame WsOpcode;"
+            + "System.Net.Mqtt=MqttClient MqttPacketType MqttQos;"
+            + "System.Net=Dns IPAddress SocketHttpClient TcpSocket Worker Connection;"
+            + "System.Data.Orm=Model ModelQuery ModelRow ModelUpdate ModelDelete Migration QueryBuilder;"
+            + "System.Data.Sqlite=SqliteConnection;"
+            + "System.Data.Postgres=PgConnection;"
+            + "System.Data=DbConnection DbProvider DbResult;"
+            + "System.Diagnostics=Process;"
+            + "System.Drawing=Graphics Bitmap Font Rectangle;"
+            + "Platform=Posix Runtime Win32;"
+            + "Gui=App Canvas Theme Window Icon Text Stack Ui SignalInt SignalBool SignalString FocusManager HitRegion HitTester Clipboard Keys Modifiers Cursor Insets FlexNode FlexStyle;"
+            + "Gui.Widget=Alert Avatar Badge Breadcrumb Button Card Carousel Chart Checkbox CodeEditor Collapse DataTable Dialog Divider Drawer Dropdown Empty FloatButton Input Label ListView Loading Menu Message Modal Notification Pagination Panel PivotTable Popover Progress Radio Rate Result Ribbon RibbonCmd Scrollbar Select Skeleton Slider Spin Split Statistic Steps Switch Table Tabs TabView Tag Timeline Tooltip TreeNode TreeView Typography Wizard;"
+            + "System.Windows.Forms=MessageBox TextBox;";
+    }
+
+    /// Appends to `out2` the type names declared in namespace `ns`.
+    static void StdlibTypesForNs(string ns, List<string> out2) {
+        string data = CodeEditor.StdlibNsData();
+        int i = 0;
+        string cur = "";
+        while (i <= data.Length) {
+            string ch = "";
+            if (i < data.Length) { ch = data.Substring(i, 1); }
+            if (ch == ";" || i == data.Length) {
+                int eq = CodeEditor.Find(cur, "=");
+                if (eq > 0) {
+                    string key = cur.Substring(0, eq);
+                    if (key == ns) {
+                        CodeEditor.AddWords(out2, cur.Substring(eq + 1, cur.Length - eq - 1));
+                    }
+                }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The namespace that must be imported to use stdlib type `name`, or "" when
+    /// `name` is a built-in / ambiguous / non-stdlib type. Deliberately limited
+    /// to distinctive, unambiguous names so a missing-using diagnostic never
+    /// fires on a user's own identifiers.
+    static string NsForStdlibType(string name) {
+        string io = " File Directory Path ";
+        string diag = " Process ";
+        string text = " Encoding ";
+        string json = " JsonBuilder JsonParser ";
+        string thread = " Thread Mutex Semaphore Stopwatch AtomicInt SharedTable ";
+        string sock = " Socket TcpListener TcpClient UdpClient AsyncSocket ";
+        string http = " HttpClient HttpRequest HttpResponse HttpServer HttpRouter ";
+        string ws = " WebSocketClient WebSocketServer ";
+        string data = " DbConnection DbResult ";
+        string orm = " QueryBuilder ";
+        string gui = " App Canvas Theme ";
+        string widget = " CodeEditor TreeView TabView Ribbon Modal DataTable Dropdown Carousel Pagination ";
+        string key = " " + name + " ";
+        if (CodeEditor.Find(io, key) >= 0) { return "System.IO"; }
+        if (CodeEditor.Find(diag, key) >= 0) { return "System.Diagnostics"; }
+        if (CodeEditor.Find(text, key) >= 0) { return "System.Text"; }
+        if (CodeEditor.Find(json, key) >= 0) { return "System.Json"; }
+        if (CodeEditor.Find(thread, key) >= 0) { return "System.Threading"; }
+        if (CodeEditor.Find(sock, key) >= 0) { return "System.Net.Sockets"; }
+        if (CodeEditor.Find(http, key) >= 0) { return "System.Net.Http"; }
+        if (CodeEditor.Find(ws, key) >= 0) { return "System.Net.WebSocket"; }
+        if (CodeEditor.Find(data, key) >= 0) { return "System.Data"; }
+        if (CodeEditor.Find(orm, key) >= 0) { return "System.Data.Orm"; }
+        if (CodeEditor.Find(gui, key) >= 0) { return "Gui"; }
+        if (CodeEditor.Find(widget, key) >= 0) { return "Gui.Widget"; }
+        return "";
+    }
+
+    /// True when `name` is a type declared in the project (other files) or the
+    /// current buffer.
+    bool IsProjectType(string name) {
+        EnsureProjectScan();
+        if (CodeEditor.HasProjType(projTypes, name)) { return true; }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        return CodeEditor.Has(tn, name);
+    }
+
+    /// Looks up the declared members of user type `typeName` (project files, then
+    /// current buffer). Returns true and fills `outMem` when found.
+    bool FindTypeMembers(string typeName, List<string> outMem) {
+        EnsureProjectScan();
+        int i = 0;
+        while (i < projTypes.Count) {
+            if (projTypes[i].name == typeName) {
+                CodeEditor.AddWords(outMem, projTypes[i].members);
+                return true;
+            }
+            i = i + 1;
+        }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        int j = 0;
+        while (j < tn.Count) {
+            if (tn[j] == typeName) {
+                CodeEditor.AddWords(outMem, tm[j]);
+                return true;
+            }
+            j = j + 1;
+        }
+        return false;
+    }
+
+    /// Best-effort resolution of a local variable's declared type by scanning the
+    /// buffer for a `Type name` declaration. Returns the base type (generics
+    /// stripped), or "".
+    string ResolveVarType(string name) {
+        if (name.Length == 0) { return ""; }
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int li = 0;
+        while (li < lines.Count) {
+            string s = CodeEditor.TrimStr(lines[li]);
+            int from = 0;
+            while (true) {
+                int p = CodeEditor.FindFrom(s, name, from);
+                if (p < 0) { break; }
+                bool lok = (p > 0 && s.Substring(p - 1, 1) == " ");
+                int rp = p + name.Length;
+                bool rok = false;
+                if (rp < s.Length) {
+                    string rc = s.Substring(rp, 1);
+                    if (rc == " " || rc == "=" || rc == ";") { rok = true; }
+                }
+                if (lok && rok) {
+                    // token immediately before `name` must be a type reference
+                    int te = p - 1;
+                    while (te > 0 && s.Substring(te - 1, 1) == " ") { te = te - 1; }
+                    int ts = te;
+                    while (ts > 0 && CodeEditor.InSet(idset, s.Substring(ts - 1, 1))) { ts = ts - 1; }
+                    // allow a trailing generic argument list on the type: List<int>
+                    int gts = ts;
+                    if (te > ts) {
+                        string tok = s.Substring(ts, te - ts);
+                        // strip a generic close if the char right before name-token is '>'
+                        string typeTok = tok;
+                        int lt = CodeEditor.Find(typeTok, "<");
+                        if (lt > 0) { typeTok = typeTok.Substring(0, lt); }
+                        if (typeTok.Length > 0 && !CodeEditor.IsControlWord(typeTok)
+                            && !CodeEditor.StartsWithP(typeTok, "return")) {
+                            string firstc = typeTok.Substring(0, 1);
+                            string digits = "0123456789";
+                            if (!CodeEditor.InSet(digits, firstc)) { return typeTok; }
+                        }
+                    }
+                }
+                from = p + name.Length;
+            }
+            li = li + 1;
+        }
+        return "";
+    }
+
+    /// Adds the in-scope stdlib type names to completion: always the built-ins,
+    /// plus the types of every imported (or own) namespace, plus LINQ operators
+    /// only when System.Linq is imported.
+    void AddStdlibCandidates(List<string> cand, List<string> kinds) {
+        CodeEditor.AddKindWords(cand, kinds,
+            "Console Math Convert Environment String Array List Dictionary StringBuilder DateTime TimeSpan Task Object Exception Tuple Random", "T");
+        List<string> ns = new List<string>();
+        ParseUsingsInto(ns);
+        string fn = FileNamespace();
+        if (fn.Length > 0 && !CodeEditor.Has(ns, fn)) { ns.Add(fn); }
+        int i = 0;
+        while (i < ns.Count) {
+            List<string> types = new List<string>();
+            CodeEditor.StdlibTypesForNs(ns[i], types);
+            int j = 0;
+            while (j < types.Count) {
+                if (!CodeEditor.Has(cand, types[j])) { cand.Add(types[j]); kinds.Add("T"); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        if (UsesLinq()) {
+            List<string> linq = new List<string>();
+            CodeEditor.AddLinqMembers(linq);
+            int k = 0;
+            while (k < linq.Count) {
+                if (!CodeEditor.Has(cand, linq[k])) { cand.Add(linq[k]); kinds.Add("M"); }
+                k = k + 1;
+            }
+        }
+    }
+
+    /// Adds project-declared types (and their members) to completion.
+    void AddProjectCandidates(List<string> cand, List<string> kinds) {
+        EnsureProjectScan();
+        int i = 0;
+        while (i < projTypes.Count) {
+            if (!CodeEditor.Has(cand, projTypes[i].name)) { cand.Add(projTypes[i].name); kinds.Add("T"); }
+            List<string> mem = new List<string>();
+            CodeEditor.AddWords(mem, projTypes[i].members);
+            int j = 0;
+            while (j < mem.Count) {
+                if (!CodeEditor.Has(cand, mem[j])) { cand.Add(mem[j]); kinds.Add("M"); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        int a = 0;
+        while (a < tn.Count) {
+            if (!CodeEditor.Has(cand, tn[a])) { cand.Add(tn[a]); kinds.Add("T"); }
+            List<string> mem2 = new List<string>();
+            CodeEditor.AddWords(mem2, tm[a]);
+            int b = 0;
+            while (b < mem2.Count) {
+                if (!CodeEditor.Has(cand, mem2[b])) { cand.Add(mem2[b]); kinds.Add("M"); }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+    }
+
+    /// True when the in-progress word at (curLine, up to curCol) sits inside an
+    /// attribute bracket — i.e. the nearest unmatched '[' precedes it on the line.
+    bool InAttributeContext() {
+        if (curLine < 0 || curLine >= lines.Count) { return false; }
+        string s = lines[curLine];
+        int i = curCol - 1;
+        if (i >= s.Length) { i = s.Length - 1; }
+        while (i >= 0) {
+            string ch = s.Substring(i, 1);
+            if (ch == "[") { return true; }
+            if (ch == "]") { return false; }
+            i = i - 1;
+        }
+        return false;
+    }
+
+    /// Scans the buffer for `using X;` type usages that require an import which is
+    /// missing, recording a diagnostic + quick-fix per offending line.
+    void AnalyzeMissingUsings() {
+        EnsureProjectScan();
+        fixes = new List<QuickFix>();
+        List<string> usings = new List<string>();
+        ParseUsingsInto(usings);
+        string fileNs = FileNamespace();
+        List<string> tn = new List<string>();
+        List<string> tm = new List<string>();
+        CodeEditor.ScanTypesInto(GetText(), tn, tm);
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        int li = 0;
+        while (li < lines.Count) {
+            string tr = CodeEditor.TrimStr(lines[li]);
+            if (tr.Length == 0 || tr.Substring(0, 1) == "/" || tr.Substring(0, 1) == "*"
+                || CodeEditor.StartsWithP(tr, "using ") || CodeEditor.StartsWithP(tr, "namespace ")) {
+                li = li + 1; continue;
+            }
+            string ln = lines[li];
+            int p = 0;
+            int n = ln.Length;
+            while (p < n) {
+                string ch = ln.Substring(p, 1);
+                if (CodeEditor.InSet(idset, ch)) {
+                    int s2 = p;
+                    string w = "";
+                    while (p < n && CodeEditor.InSet(idset, ln.Substring(p, 1))) {
+                        w = w + ln.Substring(p, 1); p = p + 1;
+                    }
+                    bool dotAfter = (p < n && ln.Substring(p, 1) == ".");
+                    bool dotBefore = (s2 > 0 && ln.Substring(s2 - 1, 1) == ".");
+                    bool cap = (w.Length > 0 && CodeEditor.InSet(upper, w.Substring(0, 1)));
+                    if (dotAfter && !dotBefore && cap) {
+                        string ns = CodeEditor.NsForStdlibType(w);
+                        if (ns.Length > 0) {
+                            bool imported = CodeEditor.Has(usings, ns);
+                            if (!imported && fileNs.Length > 0) {
+                                if (fileNs == ns) { imported = true; }
+                                else if (fileNs.Length > ns.Length && CodeEditor.StartsWithP(fileNs, ns + ".")) { imported = true; }
+                            }
+                            bool userType = CodeEditor.Has(tn, w) || CodeEditor.HasProjType(projTypes, w);
+                            if (!imported && !userType && !CodeEditor.QuickFixHas(fixes, li)) {
+                                errors.Add(new Diagnostic(li, "'" + w + "' needs 'using " + ns + ";'"));
+                                fixes.Add(new QuickFix(li, ns));
+                            }
+                        }
+                    }
+                } else {
+                    p = p + 1;
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// The namespace a missing-`using` quick-fix would add for the caret line, or "".
+    string QuickFixNs() {
+        int i = 0;
+        while (i < fixes.Count) {
+            if (fixes[i].line == curLine) { return fixes[i].ns; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// True when the caret line has a missing-`using` quick-fix available.
+    bool HasQuickFix() { return QuickFixNs().Length > 0; }
+
+    /// Inserts `using ns;` after the last existing using (or at the top),
+    /// unless already present.
+    void AddUsing(string ns) {
+        if (ns.Length == 0) { return; }
+        List<string> cur = new List<string>();
+        ParseUsingsInto(cur);
+        if (CodeEditor.Has(cur, ns)) { return; }
+        int lastUsing = -1;
+        int i = 0;
+        while (i < lines.Count) {
+            if (CodeEditor.StartsWithP(CodeEditor.TrimStr(lines[i]), "using ")) { lastUsing = i; }
+            i = i + 1;
+        }
+        SaveUndo();
+        int at = 0;
+        if (lastUsing >= 0) { at = lastUsing + 1; }
+        lines.Insert(at, "using " + ns + ";");
+        if (at <= curLine) { curLine = curLine + 1; }
+        lastDiagLine = -1;
+        CheckErrors();
+    }
+
+    /// Applies the missing-`using` quick-fix for the caret line, if any.
+    void ApplyQuickFix() {
+        AddUsing(QuickFixNs());
+    }
+}

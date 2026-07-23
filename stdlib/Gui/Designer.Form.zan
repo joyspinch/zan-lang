@@ -1,0 +1,881 @@
+using System;
+using Gui.Widget;
+
+namespace Gui;
+
+/// Designer part: the form canvas -- row/container rendering, drag &
+/// drop placement and the live widget previews.
+partial class Designer {
+    void RenderForm(App app, Canvas c, Theme t, int cx, int cy, int cw, int ch) {
+        int fs = t.fontSizeSmall;
+        c.FillRoundRect(cx, cy, cw, ch, app.Scale(6), t.bgPrimary);
+        c.DrawRect(cx, cy, cw, ch, t.borderPrimary, 1);
+        c.PushClip(cx + 1, cy + 1, cw - 2, ch - 2);
+        formClipTop = cy + 1;
+        formClipBot = cy + ch - 1;
+
+        // The form can grow past its panel, so it scrolls internally. Claim the
+        // wheel while the pointer is over it and clamp the offset (skip while a
+        // drag is in progress so dropping isn't fighting the scroll).
+        int contentH = FormContentH(app);
+        int maxScroll = contentH - ch;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (!dragging && InRect(app.mouseX, app.mouseY, cx, cy, cw, ch)) {
+            bool ownsWheel = app.CaptureWheel(cx, cy, cw, ch);
+            if (ownsWheel) {
+                int fdelta = app.window.EventKeyCode();
+                formScroll = formScroll - fdelta * app.Scale(40) / 120;
+                app.RequestRedraw();
+            }
+        }
+        if (formScroll < 0) { formScroll = 0; }
+        if (formScroll > maxScroll) { formScroll = maxScroll; }
+
+        int pad = app.Scale(14);
+        int fx = cx + pad;
+        int fw = cw - pad * 2;
+        if (maxScroll > 0) { fw = fw - app.Scale(8); }
+        int fy = cy + pad - formScroll;
+
+        string head = formNameSig.Get();
+        if (preview) { head = head + Designer.T("   (preview)", "  （预览）"); }
+        if (FormVisible(fy, app.Scale(18))) {
+            c.DrawText(fx, fy, head, t.textPrimary, t.fontSizeMedium);
+        }
+        fy = fy + app.Scale(24);
+        if (FormVisible(fy, 1)) { c.FillRect(fx, fy, fw, 1, t.divider); }
+        fy = fy + app.Scale(10);
+
+        // Non-visual components never take part in the canvas layout: they
+        // live in the tray strip below (see RenderTray). Lay out only the
+        // visual fields; visIdx maps a layout position back to the real index
+        // in `fields` so drag/drop indices stay correct.
+        List<int> visIdx = new List<int>();
+        int vf = 0;
+        while (vf < fields.Count) {
+            if (!fields[vf].IsNonVisual()) { visIdx.Add(vf); }
+            vf = vf + 1;
+        }
+        int n = visIdx.Count;
+        if (n == 0) {
+            c.DrawText(fx, fy + app.Scale(6),
+                Designer.T("Empty form — pick a component on the left, or drag one in.", "空表单 —— 在左侧选择一个组件，或拖入一个组件。"),
+                t.textTertiary, fs);
+        }
+        bool active = dragging && InRect(dragMouseX, dragMouseY, cx, cy, cw, ch);
+        bool dropSet = false;
+        dropIndex = fields.Count;
+        dropY = fy - app.Scale(4);
+        int colGap = app.Scale(12);
+        rowClicked = false;
+        dropContainer = null;
+        int i = 0;
+        while (i < n) {
+            // Pack consecutive fields into one visual row until their column
+            // spans (out of 24) would overflow, FormCreate-style. Containers
+            // and display components normally span the full 24.
+            int rowStart = i;
+            int cols = 0;
+            int rowEnd = i;
+            while (rowEnd < n) {
+                int sp = ClampSpan(fields[visIdx[rowEnd]].span);
+                if (rowEnd > rowStart && cols + sp > 24) { break; }
+                cols = cols + sp;
+                rowEnd = rowEnd + 1;
+                if (cols >= 24) { break; }
+            }
+            // Row height is the tallest field in the row (+ top-label room).
+            int rowH = 0;
+            int k = rowStart;
+            while (k < rowEnd) {
+                int hk = FieldHeight(app, fields[visIdx[k]]);
+                if (labelPos == 2 && !fields[visIdx[k]].IsDisplay()) { hk = hk + app.Scale(18); }
+                if (hk > rowH) { rowH = hk; }
+                k = k + 1;
+            }
+            if (active && !dropSet && dragMouseY < fy + rowH / 2) {
+                dropIndex = visIdx[rowStart];
+                dropY = fy - app.Scale(4);
+                dropSet = true;
+            }
+            // Cull rows that don't fit fully inside the body: the canvas clip
+            // doesn't contain child widgets, so a straddling row would bleed.
+            bool vis = FormVisible(fy, rowH);
+            int accSpan = 0;
+            int rc = rowStart;
+            while (rc < rowEnd) {
+                int sp = ClampSpan(fields[visIdx[rc]].span);
+                int x0 = fx + fw * accSpan / 24;
+                accSpan = accSpan + sp;
+                int x1 = fx + fw * accSpan / 24;
+                int wf = x1 - x0;
+                if (rc < rowEnd - 1) { wf = wf - colGap; }
+                if (vis) { RenderRow(app, c, t, fields[visIdx[rc]], x0, fy, wf, rowH, visIdx[rc], true); }
+                rc = rc + 1;
+            }
+            fy = fy + rowH + app.Scale(6);
+            i = rowEnd;
+        }
+        if (active && !dropSet) { dropIndex = fields.Count; dropY = fy - app.Scale(4); }
+        if (active && (dragFromPalette || dragMoved) && dropContainer == null) {
+            c.FillRect(fx, dropY, fw, app.Scale(2), t.primary);
+        }
+
+        int dek = app.window.EventKind();
+        if (dragging && dek == 3 && active) { DropField(); app.RequestRedraw(); }
+
+        // Click on empty form background clears the selection / add target.
+        if (!preview && dek == 2 && !rowClicked && !dragging
+            && InRect(app.mouseX, app.mouseY, cx, cy, cw, ch)) {
+            sel = null;
+            activeContainer = null;
+            app.RequestRedraw();
+        }
+
+        c.PopClip();
+
+        if (maxScroll > 0) {
+            Scrollbar.RenderVertical(app, cx + cw - app.Scale(7), cy + 1,
+                ch - 2, contentH, formScroll);
+        }
+    }
+
+    /// Resolves the pending drag onto the form: palette drags insert a new
+    /// field at dropIndex; in-form drags relocate the dragged row there.
+    void DropField() {
+        if (dragFromPalette) {
+            if (dragKind != 100 && dragKind != 200 && FormField.IsNonVisualOf(dragKind)) {
+                // Non-visual components go to the tray regardless of where
+                // they were dropped.
+                AddField(dragKind);
+            } else if (dropContainer != null) {
+                // Drop into the container under the pointer (its active tab
+                // for Tabs).
+                activeContainer = dropContainer;
+                if (dragKind == 200) { AddUserComponent(dragUserComp); }
+                else if (dragKind == 100) { AddCustomField(dragCustomKind); }
+                else { AddField(dragKind); }
+            } else if (dragKind == 200) {
+                activeContainer = null;
+                AddUserComponent(dragUserComp);
+            } else if (dragKind == 100) {
+                FormField nf = FormField.NewCustom(dragCustomKind, seq);
+                seq = seq + 1;
+                InsertFieldAt(dropIndex, nf);
+                sel = nf;
+                inspTab = 0;
+                msg = Designer.T("added ", "已添加 ") + dragCustomKind;
+            } else {
+                FormField nf = FormField.New(dragKind, seq);
+                seq = seq + 1;
+                InsertFieldAt(dropIndex, nf);
+                sel = nf;
+                inspTab = 0;
+                if (nf.IsContainer()) { activeContainer = nf; }
+                msg = Designer.T("added ", "已添加 ") + FormField.TypeName(dragKind);
+            }
+        } else if (dragIndex >= 0 && dragMoved) {
+            FormField mv = fields[dragIndex];
+            if (dropContainer != null && dropContainer != mv && !InSubtree(mv, dropContainer)) {
+                // Re-parent the dragged top-level row into the container
+                // under the pointer (its active tab for Tabs).
+                fields = ListRemove(fields, mv);
+                mv.childTab = 0;
+                if (dropContainer.ftype == 36) { mv.childTab = dropContainer.uiState.Get(); }
+                dropContainer.kids.Add(mv);
+                sel = mv;
+                activeContainer = dropContainer;
+                msg = Designer.T("moved into ", "已移入 ") + FormField.TypeName(dropContainer.ftype);
+            } else {
+                int at = dropIndex;
+                if (at > dragIndex) { at = at - 1; }
+                fields = ListMove(fields, dragIndex, at);
+                sel = mv;
+                msg = Designer.T("moved field", "已移动组件");
+            }
+        }
+        dropContainer = null;
+    }
+
+    void RenderRow(App app, Canvas c, Theme t, FormField f, int rx, int ry, int rw, int rowH, int idx, bool topLevel) {
+        int fs = t.fontSizeSmall;
+        bool selected = !preview && (f == sel);
+        if (topLevel && dragging && !dragFromPalette && dragIndex == idx && dragMoved) {
+            c.FillRoundRect(rx - app.Scale(6), ry - app.Scale(3),
+                rw + app.Scale(12), rowH + app.Scale(6), app.Scale(4), t.bgActive);
+        }
+        if (selected) {
+            c.FillRoundRect(rx - app.Scale(6), ry - app.Scale(3),
+                rw + app.Scale(12), rowH + app.Scale(6), app.Scale(4), t.bgHover);
+            c.DrawRect(rx - app.Scale(6), ry - app.Scale(3),
+                rw + app.Scale(12), rowH + app.Scale(6), t.primary, 2);
+        }
+
+        if (f.IsContainer()) {
+            // Container frame + nested children (children handle their own
+            // selection first, so a click inside prefers the child).
+            RenderContainer(app, c, t, f, rx, ry, rw, rowH);
+            // While a drag hovers this container it becomes the drop target
+            // (nested containers win: they render after their parent).
+            if (dragging && InRect(dragMouseX, dragMouseY, rx, ry, rw, rowH)) {
+                bool ok = true;
+                if (!dragFromPalette) {
+                    if (dragIndex < 0 || dragIndex >= fields.Count) { ok = false; }
+                    else if (fields[dragIndex] == f || InSubtree(fields[dragIndex], f)) { ok = false; }
+                }
+                if (ok) {
+                    dropContainer = f;
+                    c.DrawRect(rx - app.Scale(4), ry - app.Scale(2),
+                        rw + app.Scale(8), rowH + app.Scale(4), t.primary, 2);
+                }
+            }
+        } else {
+            int lw = app.Scale(labelWidth);
+            int gap = app.Scale(10);
+            int ctlX = rx;
+            int ctlY = ry;
+            int ctlW = rw;
+            int labelY = ry + app.Scale(6);
+
+            if (f.IsDisplay()) {
+                ctlX = rx; ctlY = ry; ctlW = rw;
+            } else if (labelPos == 2) {
+                DrawLabel(app, c, t, f, rx, labelY, rw, 0);
+                ctlY = ry + app.Scale(26); ctlX = rx; ctlW = rw;
+            } else {
+                int align = labelPos;
+                DrawLabel(app, c, t, f, rx, labelY, lw, align);
+                ctlX = rx + lw + gap;
+                ctlW = rw - lw - gap;
+            }
+            PreviewControl(app, c, t, f, ctlX, ctlY, ctlW, rowH - (ctlY - ry));
+        }
+
+        int ek = app.window.EventKind();
+        bool inRow = InRect(app.mouseX, app.mouseY,
+            rx - app.Scale(6), ry - app.Scale(3), rw + app.Scale(12), rowH + app.Scale(6));
+        // A nested child already handled the click (rowClicked) — don't let the
+        // enclosing container steal the selection.
+        if (!preview && ek == 2 && inRow && !dragging && !rowClicked) {
+            sel = f;
+            inspTab = 0;
+            rowClicked = true;
+            if (f.IsContainer()) { activeContainer = f; }
+            else { activeContainer = ParentContainerOf(f); }
+            if (topLevel) {
+                dragging = true;
+                dragFromPalette = false;
+                dragMoved = false;
+                dragIndex = idx;
+                dragMouseX = app.mouseX;
+                dragMouseY = app.mouseY;
+            }
+            app.RequestRedraw();
+        }
+    }
+
+    // --- Container geometry + rendering --------------------------------------
+
+    /// Height of a container's chrome above its body: Card title bar, or the
+    /// Tabs header strip.
+    int ContainerHeaderH(App app, FormField f) {
+        Theme t = app.theme;
+        if (f.ftype == 18) { return Card.ContentY(0, t); }
+        return t.heightMedium + app.Scale(8);
+    }
+
+    /// Height of the visible child stack for the active tab (or the card body),
+    /// with a minimum so an empty container is still a usable drop target.
+    int ContainerBodyH(App app, FormField f) {
+        int gap = app.Scale(6);
+        int pad = app.Scale(8);
+        int total = 0;
+        int shown = 0;
+        int activeTab = f.uiState.Get();
+        if (activeTab >= f.OptionCount() || activeTab < 0) { activeTab = 0; }
+        int i = 0;
+        while (i < f.KidCount()) {
+            FormField ch = f.KidAt(i);
+            bool vis = true;
+            if (f.ftype == 36 && ch.childTab != activeTab) { vis = false; }
+            if (vis) {
+                total = total + FieldHeight(app, ch) + gap;
+                shown = shown + 1;
+            }
+            i = i + 1;
+        }
+        if (shown == 0) { return app.Scale(40); }
+        return total - gap + pad * 2;
+    }
+
+    int FieldHeight(App app, FormField f) {
+        if (f.IsContainer()) {
+            return ContainerHeaderH(app, f) + ContainerBodyH(app, f) + app.Scale(10);
+        }
+        return app.Scale(f.RowUnits());
+    }
+
+    void RenderContainer(App app, Canvas c, Theme t, FormField f, int rx, int ry, int rw, int rowH) {
+        int headerH = ContainerHeaderH(app, f);
+        if (f.ftype == 18) {
+            Card.Render(app, rx, ry, rw, rowH, f.label);
+            int innerX = rx + t.paddingLarge;
+            int innerW = rw - t.paddingLarge * 2;
+            RenderKids(app, c, t, f, innerX, ry + headerH, innerW, 0);
+        } else {
+            List<string> labels = new List<string>();
+            int oi = 0;
+            while (oi < f.OptionCount()) { labels.Add(f.OptionAt(oi)); oi = oi + 1; }
+            if (labels.Count == 0) { labels.Add("Tab 1"); }
+            // Keep the active tab inside range (tab options may get deleted).
+            if (f.uiState.Get() >= labels.Count || f.uiState.Get() < 0) { f.uiState.Set(0); }
+            int firstId = TabStrip.Render(app, rx, ry, rw, labels, f.uiState);
+            if (!preview) { TabStrip.HandleClick(app, firstId, labels.Count, f.uiState); }
+            int innerX = rx + app.Scale(4);
+            int innerW = rw - app.Scale(8);
+            RenderKids(app, c, t, f, innerX, ry + headerH, innerW, f.uiState.Get());
+        }
+    }
+
+    /// Lays the container's visible children vertically. `tabFilter` limits the
+    /// children to one Tabs panel (ignored for single-body Card).
+    void RenderKids(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int tabFilter) {
+        int gap = app.Scale(6);
+        int pad = app.Scale(8);
+        int cyk = y + pad;
+        int shown = 0;
+        int i = 0;
+        while (i < f.KidCount()) {
+            FormField ch = f.KidAt(i);
+            bool vis = true;
+            if (f.ftype == 36 && ch.childTab != tabFilter) { vis = false; }
+            if (vis) {
+                int kh = FieldHeight(app, ch);
+                RenderRow(app, c, t, ch, x + app.Scale(4), cyk, w - app.Scale(8), kh, -1, false);
+                cyk = cyk + kh + gap;
+                shown = shown + 1;
+            }
+            i = i + 1;
+        }
+        if (shown == 0) {
+            c.DrawText(x + app.Scale(6), y + app.Scale(12),
+                Designer.T("Empty — select this container, then add components", "空 —— 选中此容器，然后添加组件"),
+                t.textTertiary, t.fontSizeSmall);
+        }
+    }
+
+    void DrawLabel(App app, Canvas c, Theme t, FormField f, int lx, int ly, int lw, int align) {
+        int fs = t.fontSizeSmall;
+        string star = "";
+        if (f.required && !hideStar) { star = "* "; }
+        int starW = 0;
+        if (star != "") { starW = Canvas.MeasureText("* ", fs); }
+        int textW = Canvas.MeasureText(f.label, fs);
+        int total = starW + textW;
+        int tx = lx;
+        if (align == 1) { tx = lx + lw - total; }
+        if (star != "") {
+            c.DrawText(tx, ly, "*", t.error, fs);
+            tx = tx + starW;
+        }
+        c.DrawText(tx, ly, f.label, t.textSecondary, fs);
+    }
+
+    /// Draws a non-interactive preview of the field's input control.
+    void PreviewControl(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
+        int fs = t.fontSizeSmall;
+        int line = app.Scale(28);
+        if (w < app.Scale(40)) { w = app.Scale(40); }
+        int ft = f.ftype;
+
+        // Display / layout / feedback / navigation components (ftype >= 15).
+        if (ft >= 15) {
+            // Options may have been deleted since the ui state was set; keep
+            // the index in range so option-driven previews never overrun.
+            if (f.UsesOptions() && f.uiState.Get() >= f.OptionCount()) { f.uiState.Set(0); }
+            PreviewDisplay(app, c, t, f, x, y, w, avail, line);
+            return;
+        }
+
+        if (ft == 1) {                       // textarea
+            int bh = avail - app.Scale(6);
+            if (bh < line) { bh = line; }
+            Box(c, t, x, y, w, bh);
+            c.DrawText(x + app.Scale(8), y + app.Scale(6), f.placeholder, t.textTertiary, fs);
+            return;
+        }
+        if (ft == 12) {                      // upload
+            int bh = avail - app.Scale(6);
+            if (bh < line) { bh = line; }
+            c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, t.bgSecondary);
+            c.DrawRect(x, y, w, bh, t.borderSecondary, 1);
+            c.DrawTextCentered(x, y, w, bh, "+  " + f.placeholder, t.textTertiary, fs);
+            return;
+        }
+        if (ft == 14) {                      // rich text
+            int bh = avail - app.Scale(6);
+            if (bh < line * 2) { bh = line * 2; }
+            Box(c, t, x, y, w, bh);
+            c.FillRect(x, y + app.Scale(24), w, 1, t.divider);
+            c.DrawText(x + app.Scale(8), y + app.Scale(5), "B  I  U  •", t.textTertiary, fs);
+            c.DrawText(x + app.Scale(8), y + app.Scale(30), f.placeholder, t.textTertiary, fs);
+            return;
+        }
+
+        if (ft == 4 || ft == 5) {            // radio / checkbox
+            PreviewChoice(app, c, t, f, x, y, w, line);
+            return;
+        }
+        if (ft == 7) {                       // switch
+            int sw = app.Scale(40);
+            int sh = app.Scale(20);
+            int syy = y + (line - sh) / 2;
+            int track = t.bgTertiary;
+            int knobX = x + sh / 2;
+            if (f.defOn) {
+                track = t.primary;
+                knobX = x + sw - sh / 2;
+            }
+            c.FillRoundRect(x, syy, sw, sh, sh / 2, track);
+            c.FillCircle(knobX, syy + sh / 2, sh / 2 - app.Scale(2), t.bgPrimary);
+            return;
+        }
+        if (ft == 8) {                       // rate
+            int r = app.Scale(6);
+            int syy = y + line / 2;
+            int sx = x + r;
+            int k = 0;
+            while (k < 5) {
+                int col = t.borderSecondary;
+                if (k < 3) { col = t.warning; }
+                c.FillCircle(sx, syy, r, col);
+                sx = sx + r * 2 + app.Scale(6);
+                k = k + 1;
+            }
+            return;
+        }
+        if (ft == 9) {                       // slider
+            int syy = y + line / 2;
+            c.FillRect(x, syy, w, app.Scale(3), t.bgTertiary);
+            c.FillRect(x, syy, w * 2 / 5, app.Scale(3), t.primary);
+            c.FillCircle(x + w * 2 / 5, syy + app.Scale(1), app.Scale(7), t.primary);
+            return;
+        }
+        if (ft == 13) {                      // color
+            Box(c, t, x, y, w, line);
+            c.FillRoundRect(x + app.Scale(6), y + app.Scale(6), app.Scale(16), line - app.Scale(12),
+                t.borderRadiusSmall, t.primary);
+            c.DrawText(x + app.Scale(30), y + app.Scale(6), "#3366FF", t.textSecondary, fs);
+            return;
+        }
+
+        // Default single-line box (input / password / number / select / date / time).
+        Box(c, t, x, y, w, line);
+        string txt = f.placeholder;
+        int txtCol = t.textTertiary;
+        if (ft == 2) { txt = "••••••••"; }
+        if (ft == 6 && f.OptionCount() > 0) { txt = f.OptionAt(0); txtCol = t.textSecondary; }
+        c.DrawText(x + app.Scale(8), y + app.Scale(6), txt, txtCol, fs);
+        if (ft == 6 || ft == 10 || ft == 11) {
+            Icon.DrawCenteredIn(c, "chevron-down", x + w - app.Scale(20), y, app.Scale(16), line,
+                app.Scale(11), t.textTertiary);
+        }
+        if (ft == 3) {
+            Icon.DrawCenteredIn(c, "chevron-up", x + w - app.Scale(18), y,
+                app.Scale(14), line / 2, app.Scale(9), t.textTertiary);
+            Icon.DrawCenteredIn(c, "chevron-down", x + w - app.Scale(18), y + line / 2,
+                app.Scale(14), line / 2, app.Scale(9), t.textTertiary);
+        }
+    }
+
+    /// Draws the non-interactive preview for a display / layout / feedback /
+    /// navigation component (ftype >= 15). Each case paints a recognisable
+    /// miniature of the corresponding stdlib widget.
+    void PreviewDisplay(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail, int line) {
+        int fs = t.fontSizeSmall;
+        int ft = f.ftype;
+
+        if (ft == 100) {                     // project custom component
+            int bh = line + app.Scale(8);
+            c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, t.bgSecondary);
+            c.DrawRect(x, y, w, bh, t.primary, 1);
+            string icon = CustomComponents.IconOf(f.customKind);
+            if (icon == "") { icon = "puzzle"; }
+            Icon.DrawCenteredIn(c, icon, x + app.Scale(6), y, app.Scale(20), bh,
+                app.Scale(13), t.primary);
+            c.DrawText(x + app.Scale(30), y + (bh - fs) / 2, f.customKind, t.textSecondary, fs);
+            return;
+        }
+        if (ft == 15) {                      // title / heading
+            Typography.Heading(app, x, y, f.label, 4);
+            return;
+        }
+        if (ft == 16) {                      // static paragraph text
+            Typography.Paragraph(app, x, y, f.label);
+            return;
+        }
+        if (ft == 17) {                      // divider
+            if (f.label == "") { Divider.Render(app, x, y + line / 2, w); }
+            else { Divider.RenderText(app, x, y + app.Scale(2), w, f.label, 0); }
+            return;
+        }
+        if (ft == 18) {                      // card
+            int bh = avail - app.Scale(6);
+            if (bh < app.Scale(56)) { bh = app.Scale(56); }
+            c.FillRoundRect(x, y, w, bh, t.borderRadiusMedium, t.bgPrimary);
+            c.DrawRect(x, y, w, bh, t.borderPrimary, 1);
+            c.DrawText(x + app.Scale(10), y + app.Scale(8), f.label, t.textPrimary, t.fontSizeMedium);
+            c.FillRect(x, y + app.Scale(30), w, 1, t.divider);
+            c.DrawText(x + app.Scale(10), y + app.Scale(38), Designer.T("Card body content", "卡片内容"), t.textTertiary, fs);
+            return;
+        }
+        if (ft == 19) {                      // tag
+            Tag.Render(app, x, y + app.Scale(3), f.label, 1);
+            return;
+        }
+        if (ft == 20) {                      // badge
+            c.DrawText(x, y + app.Scale(6), f.label, t.textPrimary, fs);
+            int bw = Canvas.MeasureText(f.label, fs);
+            Badge.Count(app, x + bw + app.Scale(10), y + app.Scale(2), 5);
+            return;
+        }
+        if (ft == 21) {                      // avatar
+            Avatar.Render(app, x, y + app.Scale(2), app.Scale(34), f.label);
+            return;
+        }
+        if (ft == 22) {                      // statistic
+            Statistic.Render(app, x, y, f.label, "12,480");
+            return;
+        }
+        if (ft == 23) {                      // table
+            PreviewTable(app, c, t, f, x, y, w, avail);
+            return;
+        }
+        if (ft == 24) {                      // timeline
+            List<string> titles = new List<string>();
+            List<string> descs = new List<string>();
+            int i = 0;
+            while (i < f.OptionCount()) { titles.Add(f.OptionAt(i)); descs.Add(""); i = i + 1; }
+            Timeline.Render(app, x, y + app.Scale(2), titles, descs);
+            return;
+        }
+        if (ft == 25) {                      // tree
+            List<TreeNode> nodes = new List<TreeNode>();
+            int i = 0;
+            while (i < f.OptionCount()) {
+                if (i == 0) { nodes.Add(TreeNode.Dir(f.OptionAt(i), 0, true)); }
+                else { nodes.Add(TreeNode.File(f.OptionAt(i), 1)); }
+                i = i + 1;
+            }
+            Rect area = Rect.Create(x, y + app.Scale(2), w, avail - app.Scale(6));
+            TreeView.Render(app, area, nodes, f.uiState, 0);
+            return;
+        }
+        if (ft == 26) {                      // collapse
+            List<string> titles = new List<string>();
+            List<string> bodies = new List<string>();
+            int i = 0;
+            while (i < f.OptionCount()) { titles.Add(f.OptionAt(i)); bodies.Add(Designer.T("Panel content", "面板内容")); i = i + 1; }
+            int fid = Collapse.Render(app, x, y + app.Scale(2), w, titles, bodies, f.uiState);
+            if (!preview) { Collapse.HandleClick(app, fid, titles.Count, f.uiState); }
+            return;
+        }
+        if (ft == 27) {                      // empty
+            int eh = avail - app.Scale(6);
+            if (eh < app.Scale(56)) { eh = app.Scale(56); }
+            Empty.Render(app, x, y, w, eh, f.label);
+            return;
+        }
+        if (ft == 28) {                      // alert
+            Alert.Render(app, x, y, w, f.label, "", 2);
+            return;
+        }
+        if (ft == 29) {                      // progress
+            Progress.RenderText(app, x, y + app.Scale(8), w, 60, 1);
+            return;
+        }
+        if (ft == 30) {                      // result
+            Result.Render(app, x, y, w, 1, f.label, Designer.T("Operation completed", "操作已完成"));
+            return;
+        }
+        if (ft == 31) {                      // skeleton
+            Skeleton.Text(app, x, y + app.Scale(4), w);
+            Skeleton.Text(app, x, y + app.Scale(24), w);
+            Skeleton.Text(app, x, y + app.Scale(44), w * 3 / 5);
+            return;
+        }
+        if (ft == 32) {                      // spin
+            Spin.Render(app, x + app.Scale(12), y + app.Scale(16), app.Scale(10), t.primary);
+            c.DrawText(x + app.Scale(30), y + app.Scale(10), Designer.T("Loading...", "加载中..."), t.textTertiary, fs);
+            return;
+        }
+        if (ft == 33) {                      // tooltip trigger
+            int bw = Canvas.MeasureText(f.label, fs) + app.Scale(20);
+            c.FillRoundRect(x, y + app.Scale(2), bw, app.Scale(24), t.borderRadiusMedium, t.bgSecondary);
+            c.DrawRect(x, y + app.Scale(2), bw, app.Scale(24), t.borderSecondary, 1);
+            c.DrawText(x + app.Scale(10), y + app.Scale(7), f.label, t.textSecondary, fs);
+            return;
+        }
+        if (ft == 34) {                      // steps
+            List<string> labels = new List<string>();
+            int i = 0;
+            while (i < f.OptionCount()) { labels.Add(f.OptionAt(i)); i = i + 1; }
+            Steps.Render(app, x, y + app.Scale(2), w, labels, f.uiState);
+            return;
+        }
+        if (ft == 35) {                      // breadcrumb
+            List<string> items = new List<string>();
+            int i = 0;
+            while (i < f.OptionCount()) { items.Add(f.OptionAt(i)); i = i + 1; }
+            Breadcrumb.Render(app, x, y + app.Scale(4), items);
+            return;
+        }
+        if (ft == 36) {                      // tabs
+            int nn = f.OptionCount(); if (nn < 1) { nn = 3; }
+            int gx = x;
+            int i = 0;
+            while (i < nn) {
+                string it = "Tab"; if (i < f.OptionCount()) { it = f.OptionAt(i); }
+                int tw = Canvas.MeasureText(it, fs) + app.Scale(16);
+                int col = t.textTertiary;
+                if (i == 0) { col = t.primary; }
+                c.DrawText(gx + app.Scale(8), y + app.Scale(4), it, col, fs);
+                if (i == 0) { c.FillRect(gx, y + app.Scale(24), tw, app.Scale(2), t.primary); }
+                gx = gx + tw;
+                i = i + 1;
+            }
+            c.FillRect(x, y + app.Scale(25), w, 1, t.divider);
+            c.DrawText(x + app.Scale(4), y + app.Scale(38), Designer.T("Tab panel content", "标签页内容"), t.textTertiary, fs);
+            return;
+        }
+        if (ft == 37) {                      // pagination
+            int fid = Pagination.Render(app, x, y + app.Scale(2), 10, f.uiState);
+            if (!preview) { Pagination.HandleClick(app, fid, 10, f.uiState); }
+            return;
+        }
+        if (ft == 38) {                      // menu
+            List<string> items = new List<string>();
+            int i = 0;
+            while (i < f.OptionCount()) { items.Add(f.OptionAt(i)); i = i + 1; }
+            int mh = avail - app.Scale(4);
+            Menu.RenderVertical(app, x, y + app.Scale(2), w, y + app.Scale(2) + mh,
+                t.heightMedium, items, f.uiState, 0);
+            return;
+        }
+        if (ft == 39) {                      // page header
+            PageHeader.Render(app, x, y, w, f.label, Designer.T("Subtitle / description", "副标题 / 描述"));
+            return;
+        }
+        if (ft == 40) {                      // list view
+            List<string> items = new List<string>();
+            int i = 0;
+            while (i < f.OptionCount()) { items.Add(f.OptionAt(i)); i = i + 1; }
+            ListView.Render(app, x, y + app.Scale(2), w, items);
+            return;
+        }
+        if (ft == 41) {                      // data table
+            PreviewTable(app, c, t, f, x, y, w, avail);
+            return;
+        }
+        if (ft == 42) {                      // carousel
+            List<string> slides = new List<string>();
+            int i = 0;
+            while (i < f.OptionCount()) { slides.Add(f.OptionAt(i)); i = i + 1; }
+            if (slides.Count == 0) { slides.Add("Slide 1"); }
+            int chh = avail - app.Scale(6);
+            if (chh < app.Scale(70)) { chh = app.Scale(70); }
+            int cid = Carousel.Render(app, x, y, w, chh, slides, f.uiState);
+            if (!preview) { Carousel.HandleClick(app, cid, slides.Count, f.uiState); }
+            return;
+        }
+        if (ft == 43) {                      // chart
+            PreviewChart(app, c, t, f, x, y, w, avail);
+            return;
+        }
+        if (ft == 44) {                      // ellipsis
+            Ellipsis.Render(app, x, y + app.Scale(4), w, f.label);
+            return;
+        }
+        if (ft == 45) {                      // panel
+            int ph = avail - app.Scale(6);
+            if (ph < app.Scale(70)) { ph = app.Scale(70); }
+            Rect r = Panel.Section(app, x, y, w, ph, f.label);
+            c.DrawText(r.x, r.y, Designer.T("Panel content", "面板内容"), t.textTertiary, fs);
+            return;
+        }
+        if (ft == 46) {                      // scrollbar
+            int sh = avail - app.Scale(6);
+            if (sh < app.Scale(70)) { sh = app.Scale(70); }
+            c.DrawRect(x, y, w, sh, t.borderPrimary, 1);
+            c.DrawText(x + app.Scale(8), y + app.Scale(8),
+                Designer.T("Scrollable content", "可滚动内容"), t.textTertiary, fs);
+            Scrollbar.RenderVertical(app, x + w - app.Scale(10), y, sh,
+                sh * 3, app.Scale(20));
+            return;
+        }
+        if (ft == 47) {                      // loading
+            int r = app.Scale(12);
+            Loading.Render(app, x + r + app.Scale(4), y + r + app.Scale(8), r);
+            c.DrawText(x + r * 2 + app.Scale(16), y + r,
+                Designer.T("Loading...", "加载中..."), t.textTertiary, fs);
+            return;
+        }
+        if (ft == 48) {                      // dropdown trigger
+            Dropdown.RenderTrigger(app, x, y + app.Scale(2),
+                app.Scale(180), t.heightMedium, f.label, false);
+            return;
+        }
+        if (ft == 49) {                      // float button
+            FloatButton.Render(app, x, y + app.Scale(2), t.heightLarge, "plus", 1);
+            return;
+        }
+        if (ft == 50) {                      // popover
+            Popover.Render(app, x + app.Scale(90), y,
+                app.Scale(180), app.Scale(60), f.label, Designer.T("Popover body text", "气泡内容"));
+            return;
+        }
+        if (ft == 51) {                      // popconfirm
+            Layer.DrawPopconfirm(app, x + app.Scale(110), y, f.label, Designer.T("OK", "确定"), Designer.T("Cancel", "取消"));
+            return;
+        }
+        if (ft == 52) {                      // notification
+            Layer.DrawNotify(app, x, y + app.Scale(2), w, f.label, 3);
+            return;
+        }
+        if (ft == 53) {                      // ribbon
+            List<RibbonCmd> cmds = new List<RibbonCmd>();
+            cmds.Add(RibbonCmd.Group("save", Designer.T("Save", "保存")));
+            cmds.Add(RibbonCmd.Create("copy", Designer.T("Copy", "复制")));
+            cmds.Add(RibbonCmd.Create("paste", Designer.T("Paste", "粘贴")));
+            cmds.Add(RibbonCmd.Create("cut", Designer.T("Cut", "剪切")));
+            Ribbon.Render(app, x, y, w, Ribbon.Height(app), cmds);
+            return;
+        }
+        if (ft == 54) {                      // icon
+            int sz = app.Scale(24);
+            Icon.DrawCenteredIn(c, "star", x, y, sz, sz, t.iconSizeLarge, t.primary);
+            c.DrawText(x + sz + app.Scale(8), y + app.Scale(4),
+                f.label, t.textSecondary, fs);
+            return;
+        }
+    }
+
+    /// Human name of a chart kind (Chart field stores the kind in uiState).
+    static string ChartKindName(int k) {
+        if (k == 1) { return "Line"; }
+        if (k == 2) { return "Area"; }
+        if (k == 3) { return "Stacked"; }
+        if (k == 4) { return "H-Bar"; }
+        if (k == 5) { return "Pie"; }
+        if (k == 6) { return "Donut"; }
+        if (k == 7) { return "Scatter"; }
+        return "Bar";
+    }
+
+    /// Preview for the Chart component. The chart kind is held in the field's
+    /// uiState (0 Bar .. 7 Scatter) so a single palette entry composes every
+    /// chart type the stdlib Chart widget provides.
+    void PreviewChart(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
+        int kind = f.uiState.Get();
+        int hh = avail - app.Scale(6);
+        if (hh < app.Scale(120)) { hh = app.Scale(120); }
+
+        List<string> labels = new List<string>();
+        labels.Add("Mon"); labels.Add("Tue"); labels.Add("Wed");
+        labels.Add("Thu"); labels.Add("Fri");
+        List<int> a = new List<int>();
+        a.Add(24); a.Add(52); a.Add(38); a.Add(66); a.Add(45);
+        List<int> b = new List<int>();
+        b.Add(30); b.Add(20); b.Add(50); b.Add(40); b.Add(60);
+
+        if (kind == 5 || kind == 6) {
+            if (kind == 6) { Chart.Donut(app, x, y, w, hh, f.label, labels, a); }
+            else { Chart.Pie(app, x, y, w, hh, f.label, labels, a); }
+            return;
+        }
+        if (kind == 7) {
+            List<int> xs = new List<int>();
+            xs.Add(12); xs.Add(28); xs.Add(40); xs.Add(55); xs.Add(70);
+            Chart.Scatter(app, x, y, w, hh, f.label, xs, a, Chart.Palette(t, 0));
+            return;
+        }
+
+        List<ChartSeries> series = new List<ChartSeries>();
+        series.Add(ChartSeries.Create("Series A", a, Chart.Palette(t, 0)));
+        series.Add(ChartSeries.Create("Series B", b, Chart.Palette(t, 1)));
+        if (kind == 1) { Chart.Line(app, x, y, w, hh, f.label, labels, series); return; }
+        if (kind == 2) { Chart.Area(app, x, y, w, hh, f.label, labels, series); return; }
+        if (kind == 3) { Chart.StackedBar(app, x, y, w, hh, f.label, labels, series); return; }
+        if (kind == 4) { Chart.HBar(app, x, y, w, hh, f.label, labels, series); return; }
+        Chart.Bar(app, x, y, w, hh, f.label, labels, series);
+    }
+
+    /// Renders a compact non-interactive preview of a table field: a header row
+    /// built from the field's options (its columns) plus a few placeholder rows.
+    void PreviewTable(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int avail) {
+        int nc = f.OptionCount();
+        if (nc < 1) { nc = 3; }
+        List<string> cols = new List<string>();
+        List<int> widths = new List<int>();
+        List<string> cells = new List<string>();
+        int colW = w / nc;
+        int i = 0;
+        while (i < nc) {
+            string h = "Col " + Convert.ToString(i + 1);
+            if (i < f.OptionCount()) { h = Designer.ColTitle(f.OptionAt(i)); }
+            cols.Add(h);
+            widths.Add(colW);
+            cells.Add("—");
+            i = i + 1;
+        }
+        int totalW = colW * nc;
+        int rowH = t.heightMedium;
+        int bh = avail - app.Scale(6);
+        if (bh < rowH * 3) { bh = rowH * 3; }
+        c.PushClip(x, y, totalW, bh);
+        Table.RenderHeader(app, x, y, cols, widths);
+        int ry = y + rowH;
+        bool striped = true;
+        while (ry + rowH <= y + bh) {
+            Table.RenderRow(app, x, ry, cells, widths, striped);
+            striped = !striped;
+            ry = ry + rowH;
+        }
+        c.PopClip();
+        c.DrawRect(x, y, totalW, bh, t.borderPrimary, 1);
+    }
+
+    /// Renders a horizontal preview of a radio/checkbox field's options.
+    void PreviewChoice(App app, Canvas c, Theme t, FormField f, int x, int y, int w, int line) {
+        int fs = t.fontSizeSmall;
+        bool radio = (f.ftype == 4);
+        int cy = y + line / 2;
+        int gx = x;
+        int mark = app.Scale(14);
+        int i = 0;
+        while (i < f.OptionCount()) {
+            string opt = f.OptionAt(i);
+            if (radio) {
+                c.FillCircle(gx + mark / 2, cy, mark / 2, t.bgPrimary);
+                c.DrawRect(gx, cy - mark / 2, mark, mark, t.borderPrimary, 1);
+                if (i == 0) { c.FillCircle(gx + mark / 2, cy, mark / 4, t.primary); }
+            } else {
+                c.FillRoundRect(gx, cy - mark / 2, mark, mark, t.borderRadiusSmall, t.bgPrimary);
+                c.DrawRect(gx, cy - mark / 2, mark, mark, t.borderPrimary, 1);
+            }
+            int tx = gx + mark + app.Scale(4);
+            c.DrawText(tx, y + app.Scale(6), opt, t.textSecondary, fs);
+            int ow = mark + app.Scale(8) + Canvas.MeasureText(opt, fs) + app.Scale(12);
+            gx = gx + ow;
+            if (gx > x + w - app.Scale(30)) { i = f.OptionCount(); }
+            i = i + 1;
+        }
+    }
+
+    void Box(Canvas c, Theme t, int x, int y, int w, int h) {
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+    }
+
+    // --- Inspector -----------------------------------------------------------
+}

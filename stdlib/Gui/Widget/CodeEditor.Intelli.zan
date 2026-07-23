@@ -1,0 +1,705 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// CodeEditor part: IntelliSense descriptions & snippet expansions, and
+/// breakpoint management.
+partial class CodeEditor {
+    // ---- IntelliSense descriptions & snippets ----
+
+    /// First index of substring `sub` in `s`, or -1.
+    static int Find(string s, string sub) {
+        if (sub.Length == 0) { return 0; }
+        int limit = s.Length - sub.Length;
+        int i = 0;
+        while (i <= limit) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Human-readable label for a completion kind tag.
+    static string KindWord(string kind) {
+        if (kind == "M") { return "method"; }
+        if (kind == "P") { return "property"; }
+        if (kind == "T") { return "type"; }
+        if (kind == "K") { return "keyword"; }
+        if (kind == "S") { return "code snippet"; }
+        if (kind == "F") { return "field"; }
+        if (kind == "E") { return "event"; }
+        return "symbol";
+    }
+
+    /// Given a trimmed method declaration line, returns a clean one-line
+    /// signature "ReturnType Name(params)" (modifiers stripped, body removed),
+    /// or "" if the line is not a method declaration.
+    static string SigFromLine(string trimmed) {
+        string s = CodeEditor.StripModifiers(trimmed);
+        int paren = CodeEditor.Find(s, "(");
+        if (paren <= 0) { return ""; }
+        // Reject control keywords like "if (" / "while (" masquerading as methods.
+        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        int e = paren;
+        while (e > 0 && CodeEditor.InSet(idset, s.Substring(e - 1, 1))) { e = e - 1; }
+        string mname = s.Substring(e, paren - e);
+        if (mname.Length == 0 || e == 0) { return ""; }
+        if (CodeEditor.IsControlWord(mname)) { return ""; }
+        // Take through the matching close paren on this line; if none, to EOL.
+        int depth = 0;
+        int i = paren;
+        int close = -1;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "(") { depth = depth + 1; }
+            else if (ch == ")") { depth = depth - 1; if (depth == 0) { close = i; break; } }
+            i = i + 1;
+        }
+        string sig = "";
+        if (close >= 0) { sig = s.Substring(0, close + 1); }
+        else { sig = CodeEditor.TrimStr(s) + ")"; }
+        return CodeEditor.TrimStr(sig);
+    }
+
+    /// Scans the given source lines for a method named `name` and returns its
+    /// real parsed signature, or "".
+    static string SigInSource(string src, string name) {
+        List<string> ls = CodeEditor.SplitLines(src);
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = CodeEditor.TrimStr(ls[i]);
+            if (CodeEditor.MemberDeclName(tr) == name) {
+                string sig = CodeEditor.SigFromLine(tr);
+                if (sig.Length > 0) { return sig; }
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Real signature of a user/project method named `name`, parsed from the
+    /// current buffer first, then other project files. "" when not found — so
+    /// callers can fall back to the curated stdlib signatures.
+    string RealSigFor(string name) {
+        string here = CodeEditor.SigInSource(GetText(), name);
+        if (here.Length > 0) { return here; }
+        int i = 0;
+        while (i < projFileSrc.Count) {
+            string s = CodeEditor.SigInSource(projFileSrc[i], name);
+            if (s.Length > 0) { return s; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Curated one-line signature for well-known members, else "".
+    static string DescSig(string name) {
+        if (name == "WriteLine") { return "void WriteLine(object value)"; }
+        if (name == "ReadLine") { return "string ReadLine()"; }
+        if (name == "Write") { return "void Write(object value)"; }
+        if (name == "Add") { return "void Add(T item)"; }
+        if (name == "Remove") { return "bool Remove(T item)"; }
+        if (name == "RemoveAt") { return "void RemoveAt(int index)"; }
+        if (name == "Insert") { return "void Insert(int index, T item)"; }
+        if (name == "Count") { return "int Count { get; }"; }
+        if (name == "Length") { return "int Length { get; }"; }
+        if (name == "Clear") { return "void Clear()"; }
+        if (name == "Contains") { return "bool Contains(T item)"; }
+        if (name == "IndexOf") { return "int IndexOf(T item)"; }
+        if (name == "Substring") { return "string Substring(int start, int len)"; }
+        if (name == "Replace") { return "string Replace(string old, string new)"; }
+        if (name == "Split") { return "string[] Split(string separator)"; }
+        if (name == "Join") { return "string Join(string sep, IEnumerable values)"; }
+        if (name == "Trim") { return "string Trim()"; }
+        if (name == "ToUpper") { return "string ToUpper()"; }
+        if (name == "ToLower") { return "string ToLower()"; }
+        if (name == "StartsWith") { return "bool StartsWith(string value)"; }
+        if (name == "EndsWith") { return "bool EndsWith(string value)"; }
+        if (name == "ToString") { return "string ToString()"; }
+        if (name == "Parse") { return "T Parse(string s)"; }
+        if (name == "TryParse") { return "bool TryParse(string s, out T result)"; }
+        if (name == "Where") { return "IEnumerable<T> Where(Func<T,bool> predicate)"; }
+        if (name == "Select") { return "IEnumerable<R> Select(Func<T,R> selector)"; }
+        if (name == "OrderBy") { return "IEnumerable<T> OrderBy(Func<T,K> key)"; }
+        if (name == "First") { return "T First()"; }
+        if (name == "Last") { return "T Last()"; }
+        if (name == "Any") { return "bool Any(Func<T,bool> predicate)"; }
+        if (name == "All") { return "bool All(Func<T,bool> predicate)"; }
+        if (name == "Sum") { return "N Sum()"; }
+        if (name == "Max") { return "T Max()"; }
+        if (name == "Min") { return "T Min()"; }
+        if (name == "Abs") { return "double Abs(double value)"; }
+        if (name == "Sqrt") { return "double Sqrt(double value)"; }
+        if (name == "ReadAllText") { return "string ReadAllText(string path)"; }
+        if (name == "WriteAllText") { return "void WriteAllText(string path, string text)"; }
+        if (name == "Format") { return "string Format(string fmt, params object[] args)"; }
+        if (name == "ContainsKey") { return "bool ContainsKey(K key)"; }
+        if (name == "TryGetValue") { return "bool TryGetValue(K key, out V value)"; }
+        if (name == "Append") { return "StringBuilder Append(object value)"; }
+        if (name == "AppendLine") { return "StringBuilder AppendLine(object value)"; }
+        return "";
+    }
+
+    /// Curated one-line documentation for well-known members, else "".
+    static string DescDoc(string name) {
+        if (name == "WriteLine") { return "Writes the value followed by a line terminator to standard output."; }
+        if (name == "ReadLine") { return "Reads the next line of characters from standard input."; }
+        if (name == "Write") { return "Writes the value to standard output (no line terminator)."; }
+        if (name == "Add") { return "Adds an item to the end of the collection."; }
+        if (name == "Remove") { return "Removes the first occurrence of the item; returns whether it was found."; }
+        if (name == "RemoveAt") { return "Removes the item at the given zero-based index."; }
+        if (name == "Insert") { return "Inserts an item at the given index, shifting later items."; }
+        if (name == "Count") { return "Number of elements currently in the collection."; }
+        if (name == "Length") { return "Number of characters/elements."; }
+        if (name == "Clear") { return "Removes all elements."; }
+        if (name == "Contains") { return "Returns whether the item is present."; }
+        if (name == "IndexOf") { return "Zero-based index of the first matching item, or -1."; }
+        if (name == "Substring") { return "Returns a portion of the string starting at start."; }
+        if (name == "Replace") { return "Returns a copy with all occurrences of old replaced by new."; }
+        if (name == "Split") { return "Splits the string into an array around the separator."; }
+        if (name == "Join") { return "Concatenates values, inserting the separator between them."; }
+        if (name == "Trim") { return "Removes leading and trailing whitespace."; }
+        if (name == "ToUpper") { return "Returns an uppercase copy of the string."; }
+        if (name == "ToLower") { return "Returns a lowercase copy of the string."; }
+        if (name == "StartsWith") { return "Returns whether the string begins with the given value."; }
+        if (name == "EndsWith") { return "Returns whether the string ends with the given value."; }
+        if (name == "ToString") { return "Returns the text representation of this object."; }
+        if (name == "Parse") { return "Converts the string to the target type; throws on failure."; }
+        if (name == "TryParse") { return "Attempts to convert the string; returns success without throwing."; }
+        if (name == "Where") { return "Filters a sequence by a predicate."; }
+        if (name == "Select") { return "Projects each element into a new form."; }
+        if (name == "OrderBy") { return "Sorts elements in ascending order by a key."; }
+        if (name == "First") { return "Returns the first element (throws if empty)."; }
+        if (name == "Last") { return "Returns the last element (throws if empty)."; }
+        if (name == "Any") { return "Returns whether any element satisfies the predicate."; }
+        if (name == "All") { return "Returns whether every element satisfies the predicate."; }
+        if (name == "Sum") { return "Computes the sum of the sequence."; }
+        if (name == "Max") { return "Returns the maximum value."; }
+        if (name == "Min") { return "Returns the minimum value."; }
+        if (name == "Abs") { return "Returns the absolute value."; }
+        if (name == "Sqrt") { return "Returns the square root."; }
+        if (name == "ReadAllText") { return "Opens a file, reads all text, then closes it."; }
+        if (name == "WriteAllText") { return "Creates or overwrites a file with the given text."; }
+        if (name == "Format") { return "Replaces format items in a string with argument values."; }
+        if (name == "ContainsKey") { return "Returns whether the dictionary contains the key."; }
+        if (name == "TryGetValue") { return "Gets the value for a key without throwing if absent."; }
+        if (name == "Append") { return "Appends the value to this builder."; }
+        if (name == "AppendLine") { return "Appends the value followed by a line terminator."; }
+        return "";
+    }
+
+    /// Curated one-line documentation for language keywords and built-in types,
+    /// so the completion preview explains basic syntax; else "".
+    static string DescKeyword(string name) {
+        // ---- built-in types ----
+        if (name == "int") { return "32/64-bit signed integer number."; }
+        if (name == "uint") { return "Unsigned integer number."; }
+        if (name == "long") { return "64-bit signed integer number."; }
+        if (name == "short") { return "16-bit signed integer number."; }
+        if (name == "byte") { return "8-bit unsigned integer (0-255)."; }
+        if (name == "float") { return "Single-precision floating-point number."; }
+        if (name == "double") { return "Double-precision floating-point number."; }
+        if (name == "bool") { return "Boolean value: true or false."; }
+        if (name == "char") { return "A single character."; }
+        if (name == "string") { return "A sequence of text characters."; }
+        if (name == "void") { return "No return value; used for methods that return nothing."; }
+        if (name == "var") { return "Local variable with a type inferred from its initializer."; }
+        // ---- declarations ----
+        if (name == "class") { return "Declares a reference type with fields, methods and constructors."; }
+        if (name == "struct") { return "Declares a value type (copied by value)."; }
+        if (name == "enum") { return "Declares a set of named integer constants."; }
+        if (name == "interface") { return "Declares a contract of members a class must implement."; }
+        if (name == "record") { return "Declares a concise immutable data type with value equality."; }
+        if (name == "delegate") { return "Declares a type that references a method (a callback)."; }
+        if (name == "event") { return "Declares an event that callers can subscribe to."; }
+        if (name == "namespace") { return "Groups related types under a qualified name."; }
+        if (name == "using") { return "Imports a namespace so its types can be used unqualified."; }
+        // ---- modifiers ----
+        if (name == "public") { return "Access modifier: visible everywhere."; }
+        if (name == "private") { return "Access modifier: visible only within the declaring type."; }
+        if (name == "protected") { return "Access modifier: visible in the declaring type and subclasses."; }
+        if (name == "internal") { return "Access modifier: visible within the same assembly."; }
+        if (name == "static") { return "Belongs to the type itself, not to an instance."; }
+        if (name == "extern") { return "Declares a method implemented externally (native/FFI)."; }
+        if (name == "const") { return "A compile-time constant value that cannot change."; }
+        if (name == "readonly") { return "A field that can only be assigned once (in the constructor)."; }
+        if (name == "abstract") { return "Cannot be instantiated; declares members subclasses must implement."; }
+        if (name == "virtual") { return "A member that subclasses may override."; }
+        if (name == "override") { return "Replaces a virtual/abstract member from the base type."; }
+        if (name == "sealed") { return "Prevents further inheritance or overriding."; }
+        if (name == "partial") { return "Splits a type or method across multiple files."; }
+        if (name == "required") { return "Marks a member that must be set when constructing the object."; }
+        if (name == "init") { return "A property setter usable only during object initialization."; }
+        // ---- control flow ----
+        if (name == "if") { return "Runs a block when its condition is true."; }
+        if (name == "else") { return "Runs when the preceding if condition is false."; }
+        if (name == "while") { return "Repeats a block while its condition stays true."; }
+        if (name == "for") { return "Loop with an initializer, condition and step."; }
+        if (name == "foreach") { return "Iterates over each element of a collection."; }
+        if (name == "do") { return "Runs a block once, then repeats while the condition holds."; }
+        if (name == "break") { return "Exits the nearest loop or switch."; }
+        if (name == "continue") { return "Skips to the next iteration of the loop."; }
+        if (name == "switch") { return "Selects a branch based on a value."; }
+        if (name == "case") { return "A branch label inside a switch."; }
+        if (name == "default") { return "The fallback branch of a switch, or a type's default value."; }
+        if (name == "return") { return "Exits a method, optionally returning a value."; }
+        if (name == "throw") { return "Raises an exception."; }
+        if (name == "try") { return "Guards a block whose exceptions are handled by catch/finally."; }
+        if (name == "catch") { return "Handles an exception thrown in a try block."; }
+        if (name == "finally") { return "A block that always runs after try/catch."; }
+        if (name == "lock") { return "Restricts a block to one thread at a time."; }
+        // ---- expressions & misc ----
+        if (name == "new") { return "Creates a new object instance."; }
+        if (name == "this") { return "Refers to the current instance."; }
+        if (name == "base") { return "Refers to the base class."; }
+        if (name == "true") { return "The boolean value true."; }
+        if (name == "false") { return "The boolean value false."; }
+        if (name == "null") { return "A reference that points to no object."; }
+        if (name == "is") { return "Tests whether a value is of a given type."; }
+        if (name == "as") { return "Casts to a type, yielding null on failure."; }
+        if (name == "typeof") { return "Gets the type object for a type name."; }
+        if (name == "sizeof") { return "Gets the size in bytes of a type."; }
+        if (name == "nameof") { return "Gets the source name of a symbol as a string."; }
+        if (name == "ref") { return "Passes an argument by reference."; }
+        if (name == "out") { return "Passes an argument by reference for output."; }
+        if (name == "params") { return "Accepts a variable number of arguments as an array."; }
+        if (name == "get") { return "Defines a property's read accessor."; }
+        if (name == "set") { return "Defines a property's write accessor."; }
+        if (name == "operator") { return "Defines an operator overload."; }
+        if (name == "async") { return "Marks a method that can use await."; }
+        if (name == "await") { return "Suspends until an asynchronous operation completes."; }
+        if (name == "yield") { return "Produces the next value of an iterator."; }
+        if (name == "in") { return "Iteration/membership keyword (foreach, LINQ)."; }
+        if (name == "where") { return "Filters query results by a condition (LINQ)."; }
+        if (name == "select") { return "Projects each element of a query (LINQ)."; }
+        if (name == "from") { return "Starts a query, naming the range variable (LINQ)."; }
+        if (name == "orderby") { return "Sorts query results (LINQ)."; }
+        if (name == "group") { return "Groups query results by a key (LINQ)."; }
+        if (name == "join") { return "Correlates two sequences by a key (LINQ)."; }
+        if (name == "let") { return "Introduces a computed range variable in a query (LINQ)."; }
+        return "";
+    }
+
+    /// Word-wraps `s` to fit within `maxW` pixels at `fontSize`, appending the
+    /// resulting lines to `outl` (at most `maxLines`).
+    static void WrapText(string s, int maxW, int fontSize, List<string> outl, int maxLines) {
+        string cur = "";
+        string word = "";
+        int i = 0;
+        while (i <= s.Length) {
+            string ch = "";
+            if (i < s.Length) { ch = s.Substring(i, 1); }
+            if (ch == " " || i == s.Length) {
+                string trial = cur;
+                if (trial.Length > 0) { trial = trial + " "; }
+                trial = trial + word;
+                if (Canvas.MeasureText(trial, fontSize) > maxW && cur.Length > 0) {
+                    outl.Add(cur);
+                    cur = word;
+                    if (outl.Count >= maxLines - 1) {
+                        // Dump the rest onto the final line and stop.
+                        int j = i;
+                        while (j < s.Length) { cur = cur + s.Substring(j, 1); j = j + 1; }
+                        outl.Add(cur);
+                        return;
+                    }
+                } else {
+                    cur = trial;
+                }
+                word = "";
+            } else {
+                word = word + ch;
+            }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { outl.Add(cur); }
+    }
+
+    /// Appends built-in code-snippet triggers (kind "S") to a candidate list.
+    static void SnippetListK(List<string> outk, List<string> kinds) {
+        outk.Add("for"); kinds.Add("S");
+        outk.Add("foreach"); kinds.Add("S");
+        outk.Add("while"); kinds.Add("S");
+        outk.Add("if"); kinds.Add("S");
+        outk.Add("ifelse"); kinds.Add("S");
+        outk.Add("class"); kinds.Add("S");
+        outk.Add("func"); kinds.Add("S");
+        outk.Add("prop"); kinds.Add("S");
+        outk.Add("try"); kinds.Add("S");
+    }
+
+    /// Expands a code snippet at the current caret, replacing the trigger word
+    /// [acStart, curCol). Places the caret at the "$C$" marker in the body.
+    void ExpandSnippet(string name) {
+        List<string> body = new List<string>();
+        if (name == "for") {
+            body.Add("for (int i = 0; i < $C$; i = i + 1) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "foreach") {
+            body.Add("foreach (var item in $C$) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "while") {
+            body.Add("while ($C$) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "if") {
+            body.Add("if ($C$) {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "ifelse") {
+            body.Add("if ($C$) {");
+            body.Add("    ");
+            body.Add("} else {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "class") {
+            body.Add("class $C$ {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "func") {
+            body.Add("void $C$() {");
+            body.Add("    ");
+            body.Add("}");
+        } else if (name == "prop") {
+            body.Add("int $C$;");
+        } else if (name == "try") {
+            body.Add("try {");
+            body.Add("    $C$");
+            body.Add("} catch (Exception e) {");
+            body.Add("    ");
+            body.Add("}");
+        } else {
+            return;
+        }
+
+        string curls = lines[curLine];
+        string left = Text.Left(curls, acStart);
+        string right = Text.Right(curls, curCol);
+        // Base indent = leading whitespace of the current line.
+        string indent = "";
+        int p = 0;
+        while (p < left.Length) {
+            string ch = left.Substring(p, 1);
+            if (ch == " ") { indent = indent + " "; p = p + 1; }
+            else { break; }
+        }
+
+        int caretLine = curLine;
+        int caretCol = acStart;
+        List<string> assembled = new List<string>();
+        int n = body.Count;
+        int bi = 0;
+        while (bi < n) {
+            string pre = indent;
+            if (bi == 0) { pre = left; }
+            string lineText = pre + body[bi];
+            if (bi == n - 1) { lineText = lineText + right; }
+            int mk = CodeEditor.Find(lineText, "$C$");
+            if (mk >= 0) {
+                caretLine = curLine + bi;
+                caretCol = mk;
+                lineText = Text.Left(lineText, mk) + Text.Right(lineText, mk + 3);
+            }
+            assembled.Add(lineText);
+            bi = bi + 1;
+        }
+
+        List<string> rebuilt = new List<string>();
+        int q = 0;
+        while (q < curLine) { rebuilt.Add(lines[q]); q = q + 1; }
+        int ai = 0;
+        while (ai < assembled.Count) { rebuilt.Add(assembled[ai]); ai = ai + 1; }
+        q = curLine + 1;
+        while (q < lines.Count) { rebuilt.Add(lines[q]); q = q + 1; }
+        lines = rebuilt;
+        curLine = caretLine;
+        curCol = caretCol;
+        acActive = false;
+        acDot = false;
+        acFilter = "";
+        CheckErrors();
+    }
+
+    // ---- breakpoints ----
+
+    /// True when integer list `xs` contains `v`.
+    static bool HasInt(List<int> xs, int v) {
+        int i = 0;
+        while (i < xs.Count) {
+            if (xs[i] == v) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when line `line` (0-based) has a breakpoint.
+    bool HasBreakpoint(int line) {
+        return CodeEditor.HasInt(bps, line);
+    }
+
+    /// Toggles a breakpoint on `line`.
+    void ToggleBreakpoint(int line) {
+        int idx = -1;
+        int i = 0;
+        while (i < bps.Count) {
+            if (bps[i] == line) { idx = i; }
+            i = i + 1;
+        }
+        if (idx >= 0) { bps.RemoveAt(idx); }
+        else { bps.Add(line); }
+    }
+
+    /// The set of breakpoint line numbers (0-based).
+    List<int> Breakpoints() {
+        return bps;
+    }
+
+    /// Highlights `line` as the currently paused execution line (-1 clears).
+    void SetExecLine(int line) {
+        execLine = line;
+        if (line >= 0) {
+            curLine = line;
+            if (curLine < scrollLine) { scrollLine = curLine; }
+        }
+    }
+
+    void HandleInput(App app) {
+        int kind = app.window.EventKind();
+        if (kind == 6) {
+            int code = app.window.EventKeyCode();
+            // Ctrl+A = select all (code 1)
+            if (code == 1) {
+                SelectAll();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+C = copy (code 3)
+            if (code == 3) {
+                CopySelection();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+X = cut (code 24)
+            if (code == 24) {
+                CutSelection();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+V = paste (code 22)
+            if (code == 22) {
+                PasteClipboard();
+                CheckErrors();
+                UpdateCompletion();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+Z = undo (code 26)
+            if (code == 26) {
+                Undo();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+Y = redo (code 25)
+            if (code == 25) {
+                Redo();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+D = duplicate line (code 4)
+            if (code == 4) {
+                DuplicateLine();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+L = delete line (code 12)
+            if (code == 12) {
+                DeleteLine();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            // Ctrl+/ = toggle line comment (code 31)
+            if (code == 31) {
+                ToggleComment();
+                CheckErrors();
+                app.RequestRedraw();
+                return;
+            }
+            if (code == 8) {
+                if (selActive) { ClearExtraCarets(); DeleteSelection(); }
+                else if (carets.Count > 0) { McBackspace(); }
+                else { SaveUndo(); BackspaceEdit(); }
+                CheckErrors();
+                UpdateCompletion();
+                app.RequestRedraw();
+            } else if (code == 13) {
+                if (acActive) { AcceptCompletion(false); }
+                else {
+                    ClearExtraCarets();
+                    if (selActive) { DeleteSelection(); }
+                    else { SaveUndo(); }
+                    NewLine();
+                    CheckErrors();
+                }
+                app.RequestRedraw();
+            } else if (code == 9) {
+                bool tabShift = Modifiers.HasShift(app.window.EventMods());
+                if (acActive) { AcceptCompletion(true); }
+                else if (tabShift) {
+                    if (selActive && selAnchorLine != curLine) { OutdentSelection(); }
+                    else { OutdentCurrentLine(); }
+                    CheckErrors();
+                }
+                else if (selActive && selAnchorLine != curLine) {
+                    IndentSelection();
+                    CheckErrors();
+                }
+                else {
+                    if (selActive) { ClearExtraCarets(); DeleteSelection(); }
+                    if (carets.Count > 0) { McInsertStr("    "); }
+                    else { InsertStr("    "); }
+                }
+                app.RequestRedraw();
+            } else if (code == 27) {
+                acActive = false;
+                acFilter = "";
+                selActive = false;
+                refPopOpen = false;
+                ClearExtraCarets();
+                ctxOpen = false;
+                app.RequestRedraw();
+            } else if (code > 31) {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0) {
+                    if (selActive) { ClearExtraCarets(); DeleteSelection(); }
+                    else { SaveUndo(); }
+                    if (carets.Count > 0) { McInsertStr(ch); }
+                    else { InsertStr(ch); }
+                    selActive = false;
+                    if (ch == ".") {
+                        DotCompletion();
+                    } else {
+                        UpdateCompletion();
+                    }
+                    // Only re-run diagnostics for characters that can change the
+                    // structure of *other* lines (brace/paren balance, statement
+                    // termination). Ordinary text on the current line is validated
+                    // once the caret leaves the line, avoiding a full-document
+                    // rescan on every keystroke.
+                    if (ch == "{" || ch == "}" || ch == "(" || ch == ")" || ch == ";") {
+                        CheckErrors();
+                    }
+                    app.RequestRedraw();
+                }
+            }
+        } else if (kind == 4) {
+            int kc = app.window.EventKeyCode();
+            if (acActive && kc == 38) {
+                acSel = acSel - 1;
+                if (acSel < 0) { acSel = acItems.Count - 1; }
+                app.RequestRedraw();
+            } else if (acActive && kc == 40) {
+                acSel = acSel + 1;
+                if (acSel >= acItems.Count) { acSel = 0; }
+                app.RequestRedraw();
+            } else if (kc == 27) { acActive = false; acFilter = ""; selActive = false; refPopOpen = false; app.RequestRedraw(); }
+            else if (kc == 37) {
+                int m37 = app.window.EventMods();
+                acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m37));
+                if (Modifiers.HasCtrl(m37)) { MoveWordLeft(); } else { MoveLeft(); }
+                app.RequestRedraw();
+            }
+            else if (kc == 39) {
+                int m39 = app.window.EventMods();
+                acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m39));
+                if (Modifiers.HasCtrl(m39)) { MoveWordRight(); } else { MoveRight(); }
+                app.RequestRedraw();
+            }
+            else if (kc == 38) {
+                int mods38 = app.window.EventMods();
+                if (Modifiers.HasCtrl(mods38) && Modifiers.HasAlt(mods38)) { AddCaretAbove(); }
+                else if (Modifiers.HasAlt(mods38)) { ClearExtraCarets(); MoveLineUp(); CheckErrors(); }
+                else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods38)); MoveUp(); }
+                app.RequestRedraw();
+            }
+            else if (kc == 40) {
+                int mods40 = app.window.EventMods();
+                if (Modifiers.HasCtrl(mods40) && Modifiers.HasAlt(mods40)) { AddCaretBelow(); }
+                else if (Modifiers.HasAlt(mods40)) { ClearExtraCarets(); MoveLineDown(); CheckErrors(); }
+                else { ClearExtraCarets(); SelPrepare(Modifiers.HasShift(mods40)); MoveDown(); }
+                app.RequestRedraw();
+            }
+            else if (kc == 33) {
+                int vis = pageRows;
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh);
+                int np = curLine - vis; if (np < 0) { np = 0; }
+                curLine = np; ClampCol(); app.RequestRedraw();
+            }
+            else if (kc == 34) {
+                int vis = pageRows;
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                acActive = false; ClearExtraCarets(); SelPrepare(sh);
+                int np = curLine + vis; if (np > lines.Count - 1) { np = lines.Count - 1; }
+                curLine = np; ClampCol(); app.RequestRedraw();
+            }
+            else if (kc == 36) {
+                int m36 = app.window.EventMods();
+                acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m36));
+                if (Modifiers.HasCtrl(m36)) { curLine = 0; curCol = 0; }
+                else { curCol = SmartHomeCol(); }
+                app.RequestRedraw();
+            }
+            else if (kc == 35) {
+                int m35 = app.window.EventMods();
+                acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m35));
+                if (Modifiers.HasCtrl(m35)) { curLine = lines.Count - 1; }
+                curCol = lines[curLine].Length;
+                app.RequestRedraw();
+            }
+            else if (kc == 46) {
+                if (selActive) { DeleteSelection(); }
+                else { SaveUndo(); DeleteEdit(); }
+                acActive = false;
+                CheckErrors();
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    /// Maps a pixel x-offset (relative to the text origin) to a column index:
+    /// the first character-boundary whose measured prefix width reaches `px`.
+    /// Prefix width is monotonic in the boundary, so a binary search over the
+    /// boundaries needs only O(log n) MeasureText calls instead of one per
+    /// character -- this runs on every mouse-move while drag-selecting, so the
+    /// quadratic scan it replaces was the source of selection latency on long
+    /// lines.
+    static int ColFromX(string s, int px, int fontSize) {
+        if (px <= 0) { return 0; }
+        List<int> ends = new List<int>();
+        int p = Text.NextCharEnd(s, 0);
+        while (p <= s.Length) {
+            ends.Add(p);
+            if (p >= s.Length) { break; }
+            p = Text.NextCharEnd(s, p);
+        }
+        int lo = 0;
+        int hi = ends.Count - 1;
+        int ansIdx = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int w = Canvas.MeasureText(Text.Left(s, ends[mid]), fontSize);
+            if (w >= px) { ansIdx = mid; hi = mid - 1; }
+            else { lo = mid + 1; }
+        }
+        if (ansIdx < 0) { return s.Length; }
+        return ends[ansIdx];
+    }
+}

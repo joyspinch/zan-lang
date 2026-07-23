@@ -1,0 +1,1690 @@
+using System;
+using System.Json;
+
+namespace Gui;
+
+/// Componentized, animated chart control (the modern face of the static Chart
+/// renderers). Bind a ChartModel + ChartOptions once, then call Render each
+/// frame; it plays a grow-in intro, draws gradient/smoothed series and an
+/// optional hover crosshair + value tooltip. Keeps the raw static Chart.* API
+/// intact for callers that just want a one-shot draw.
+class ChartView {
+    ChartModel model;
+    ChartOptions options;
+    // Stable per-chart animation key. Defaults to a fresh WidgetId, but callers
+    // in an immediate-mode / virtualized list (where widget-id order churns as
+    // rows scroll in and out) should pass a caller-owned stable key via Keyed()
+    // so the grow-in intro is not re-seeded to 0 every frame.
+    int wid;
+
+    static ChartView Of(ChartModel m, ChartOptions o) {
+        ChartView v = new ChartView();
+        v.model = m;
+        v.options = o;
+        v.wid = WidgetId.Next();
+        return v;
+    }
+
+    /// Bind a model + options with a caller-owned stable animation key.
+    static ChartView Keyed(ChartModel m, ChartOptions o, int key) {
+        ChartView v = new ChartView();
+        v.model = m;
+        v.options = o;
+        v.wid = key;
+        return v;
+    }
+
+    /// Convenience: bind a model to a plain ChartType.* kind with defaults.
+    static ChartView Create(ChartModel m, int kind) {
+        return ChartView.Of(m, ChartOptions.Of(kind));
+    }
+
+    void Render(App app, int x, int y, int w, int h) {
+        Theme t = app.theme;
+        // Resolve auto (0) series colors from the palette so JSON/model data
+        // that omits colors still renders a distinct hue per series.
+        int i = 0;
+        while (i < model.series.Count) {
+            if (model.series[i].color == 0) {
+                model.series[i].color = Chart.Palette(t, i);
+            }
+            i = i + 1;
+        }
+
+        int g = 1000;
+        if (options.animate) { g = app.AnimIntro(5000000 + wid, options.animMs); }
+
+        // Publish the stable interaction key so DrawPanel can wire an
+        // interactive legend (click a swatch to show/hide that series).
+        options.iwid = wid;
+
+        // Clip every chart kind to its own rectangle so plot lines, bars,
+        // axis labels and legends can never bleed into a neighbouring widget.
+        app.canvas.PushClip(x, y, w, h);
+        int k = options.kind;
+        if (k == 5) {
+            ChartView.DrawPie(app, x, y, w, h, model, 0, g, options.pieLabels);
+        } else if (k == 6) {
+            ChartView.DrawPie(app, x, y, w, h, model, options.donutPct, g, options.pieLabels);
+        } else if (k == 7) {
+            ChartView.DrawScatter(app, x, y, w, h, model, t.primary, g);
+        } else if (k == 8) {
+            ChartView.DrawGauge(app, x, y, w, h, model, options, g);
+        } else if (k == 9) {
+            ChartView.DrawRadialBars(app, x, y, w, h, model, options, g);
+        } else if (k == 10) {
+            ChartView.DrawHeatmap(app, x, y, w, h, model, options, g);
+        } else if (k == 12) {
+            ChartView.DrawStackedArea(app, x, y, w, h, model, options, g);
+        } else if (k == 13) {
+            ChartView.DrawCandles(app, x, y, w, h, model, options, g);
+        } else if (k == 14) {
+            ChartView.DrawBubbles(app, x, y, w, h, model, options, g);
+        } else if (k == 15) {
+            ChartView.DrawBox(app, x, y, w, h, model, options, g);
+        } else if (k == 16) {
+            ChartView.DrawError(app, x, y, w, h, model, options, g);
+        } else if (k == 17) {
+            ChartView.DrawPolar(app, x, y, w, h, model, options, g);
+        } else if (k == 18) {
+            ChartView.DrawFunnel(app, x, y, w, h, model, options, g, false);
+        } else if (k == 19) {
+            ChartView.DrawFunnel(app, x, y, w, h, model, options, g, true);
+        } else if (k == 20) {
+            ChartView.DrawRose(app, x, y, w, h, model, options, g);
+        } else if (k == 2 || k == 3 || k == 4) {
+            ChartView.DrawBars(app, x, y, w, h, model, options, g);
+        } else {
+            ChartView.DrawLines(app, x, y, w, h, model, options, g);
+        }
+        app.canvas.PopClip();
+    }
+
+    // ---- polyline (straight or Catmull-Rom smoothed) ----
+
+    // Expand raw points into a dense polyline (straight-through, or a
+    // Catmull-Rom curve). The fill and the stroke both consume this same path
+    // so a filled area's top edge follows the identical curve as its outline
+    // (no gap between a smooth stroke and a straight-segment fill).
+    static void BuildPath(List<int> px, List<int> py, bool smooth,
+                          List<int> ox, List<int> oy) {
+        int n = px.Count;
+        if (n < 1) { return; }
+        if (!smooth || n < 3) {
+            int i = 0;
+            while (i < n) { ox.Add(px[i]); oy.Add(py[i]); i = i + 1; }
+            return;
+        }
+        ox.Add(px[0]); oy.Add(py[0]);
+        int seg = 0;
+        while (seg + 1 < n) {
+            int p0 = seg - 1; if (p0 < 0) { p0 = 0; }
+            int p3 = seg + 2; if (p3 > n - 1) { p3 = n - 1; }
+            int x0 = px[p0]; int y0 = py[p0];
+            int x1 = px[seg]; int y1 = py[seg];
+            int x2 = px[seg + 1]; int y2 = py[seg + 1];
+            int x3 = px[p3]; int y3 = py[p3];
+            int steps = 24;
+            int s = 1;
+            while (s <= steps) {
+                int tt = s * 1000 / steps;
+                int tt2 = tt * tt / 1000;
+                int tt3 = tt2 * tt / 1000;
+                int qx = (2 * x1
+                    + (x2 - x0) * tt / 1000
+                    + (2 * x0 - 5 * x1 + 4 * x2 - x3) * tt2 / 1000
+                    + (0 - x0 + 3 * x1 - 3 * x2 + x3) * tt3 / 1000) / 2;
+                int qy = (2 * y1
+                    + (y2 - y0) * tt / 1000
+                    + (2 * y0 - 5 * y1 + 4 * y2 - y3) * tt2 / 1000
+                    + (0 - y0 + 3 * y1 - 3 * y2 + y3) * tt3 / 1000) / 2;
+                ox.Add(qx); oy.Add(qy);
+                s = s + 1;
+            }
+            seg = seg + 1;
+        }
+    }
+
+    // Fill the region between a dense (left-to-right) path and baseY, giving the
+    // top edge sub-pixel anti-aliased coverage. The interior is filled with
+    // solid 1px columns; the single boundary row of each column is blended with
+    // fractional coverage so the top reads as a smooth curve, not a staircase.
+    // Columns are half-open [x0,x1) so segment seams are not double-blended.
+    static void FillUnder(Canvas c, List<int> ox, List<int> oy, int baseY,
+                          int color, bool gradient, int topA, int botA) {
+        int cnt = ox.Count;
+        if (cnt < 2) { return; }
+        int ii = 0;
+        while (ii + 1 < cnt) {
+            int ax0 = ox[ii]; int ay0 = oy[ii];
+            int ax1 = ox[ii + 1]; int ay1 = oy[ii + 1];
+            if (ax1 > ax0) {
+                int pxc = ax0;
+                while (pxc < ax1) {
+                    int yyF = ay0 * 256 + (ay1 - ay0) * (pxc - ax0) * 256 / (ax1 - ax0);
+                    ChartView.FillColumnAA(c, pxc, yyF, baseY, color, gradient, topA, botA, 56);
+                    pxc = pxc + 1;
+                }
+            }
+            ii = ii + 1;
+        }
+        // final column at the last vertex (half-open loop skips it)
+        ChartView.FillColumnAA(c, ox[cnt - 1], oy[cnt - 1] * 256, baseY,
+                               color, gradient, topA, botA, 56);
+    }
+
+    // One anti-aliased fill column. yyF is the fractional top in 1/256 px;
+    // solidA is the flat (non-gradient) fill alpha.
+    static void FillColumnAA(Canvas c, int px, int yyF, int baseY,
+                             int color, bool gradient, int topA, int botA, int solidA) {
+        int iy = yyF / 256;
+        int frac = yyF - iy * 256;      // 0..255 : part of row iy above the fill
+        int cover = 256 - frac;         // coverage of boundary row iy by the fill
+        int solidTop = iy + 1;
+        if (baseY > solidTop) {
+            if (gradient) {
+                c.FillVGrad(px, solidTop, 1, baseY - solidTop,
+                    Chart.WithAlpha(color, topA), Chart.WithAlpha(color, botA));
+            } else {
+                c.FillRect(px, solidTop, 1, baseY - solidTop, Chart.WithAlpha(color, solidA));
+            }
+        }
+        if (iy >= 0 && iy < baseY) {
+            int edgeA = solidA;
+            if (gradient) { edgeA = topA; }
+            c.FillRect(px, iy, 1, 1, Chart.WithAlpha(color, edgeA * cover / 256));
+        }
+    }
+
+    static void PolyLine(Canvas c, List<int> px, List<int> py,
+                         bool smooth, int color, int th) {
+        List<int> ox = new List<int>();
+        List<int> oy = new List<int>();
+        ChartView.BuildPath(px, py, smooth, ox, oy);
+        int i = 0;
+        while (i + 1 < ox.Count) {
+            c.DrawLine(ox[i], oy[i], ox[i + 1], oy[i + 1], color, th);
+            i = i + 1;
+        }
+    }
+
+    // ---- line / area ----
+
+    static void DrawLines(App app, int x, int y, int w, int h,
+                          ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        List<ChartSeries> series = m.series;
+        List<string> labels = m.labels;
+
+        // dataZoom: window the categories to the persisted range and reserve a
+        // strip at the bottom for the range slider.
+        int zoomH = 0;
+        int fullN = labels.Count;
+        if (o.zoom && o.iwid != 0 && fullN > 1) {
+            int i0 = Chart.ZoomI0(app, o.iwid, fullN);
+            int i1 = Chart.ZoomI1(app, o.iwid, fullN);
+            series = Chart.Window(series, i0, i1);
+            labels = Chart.WindowLabels(labels, i0, i1);
+            zoomH = app.Scale(24);
+        }
+
+        int maxV = Chart.NiceMax(Chart.MaxOf(series));
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
+        ChartFrame f = Chart.BuildAxes(app, x, y, w, h - zoomH, plotTop, labels, o, series);
+        if (zoomH > 0) {
+            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
+                app.Scale(12), o.iwid, fullN);
+        }
+        Chart.DrawMarkArea(app, f, o);
+
+        int n = labels.Count;
+        if (n < 1) { return; }
+        int step = f.plotW / n;
+        int half = step / 2;
+        int th = app.Scale(2);
+        int rad = app.Scale(3);
+        int baseY = f.plotY + f.plotH;
+
+        int si = 0;
+        while (si < series.Count) {
+            ChartSeries s = series[si];
+          if (!s.hidden) {
+            List<int> vs = s.values;
+            int ax = s.axisIndex;
+
+            // A series can override the chart kind to draw bars inside a line
+            // chart (mixed bar + line). Bars are rendered instead of the line.
+            if (s.kind == 2) {
+                int bw = step / 2;
+                int bx0 = (step - bw) / 2;
+                int bi = 0;
+                while (bi < n && bi < vs.Count) {
+                    int v = vs[bi] * g / 1000;
+                    int by = f.YOf(v, ax);
+                    int bh = baseY - by;
+                    if (bh < 0) { bh = 0; }
+                    ChartView.BarCell(c, f.plotX + bi * step + bx0, by, bw, bh, app.Scale(2), s.color, o.gradient);
+                    bi = bi + 1;
+                }
+            } else {
+            // Collect the (grown) plot points once, reused for fill + stroke.
+            List<int> pxs = new List<int>();
+            List<int> pys = new List<int>();
+            int j = 0;
+            while (j < n && j < vs.Count) {
+                int v = vs[j] * g / 1000;
+                pxs.Add(f.plotX + j * step + half);
+                pys.Add(f.YOf(v, ax));
+                j = j + 1;
+            }
+
+            // Build the (optionally smoothed) path once; the fill and the
+            // stroke share the identical curve so the filled top follows the
+            // stroke exactly with an anti-aliased edge.
+            List<int> pathX = new List<int>();
+            List<int> pathY = new List<int>();
+            ChartView.BuildPath(pxs, pys, o.smooth, pathX, pathY);
+
+            if (o.area) {
+                ChartView.FillUnder(c, pathX, pathY, baseY, s.color, o.gradient, 150, 16);
+            }
+
+            if (o.stepped) {
+                int sp = 0;
+                while (sp + 1 < pxs.Count) {
+                    c.DrawLine(pxs[sp], pys[sp], pxs[sp + 1], pys[sp], s.color, th);
+                    c.DrawLine(pxs[sp + 1], pys[sp], pxs[sp + 1], pys[sp + 1], s.color, th);
+                    sp = sp + 1;
+                }
+            } else {
+                int pli = 0;
+                while (pli + 1 < pathX.Count) {
+                    c.DrawLine(pathX[pli], pathY[pli], pathX[pli + 1], pathY[pli + 1], s.color, th);
+                    pli = pli + 1;
+                }
+            }
+
+            int m2 = 0;
+            while (m2 < pxs.Count) {
+                c.FillCircle(pxs[m2], pys[m2], rad, s.color);
+                if (o.showValues) {
+                    string lbl = Convert.ToString(vs[m2]);
+                    int lw = Canvas.MeasureText(lbl, app.theme.fontSizeSmall);
+                    c.DrawText(pxs[m2] - lw / 2, pys[m2] - app.Scale(16), lbl,
+                        app.theme.textSecondary, app.theme.fontSizeSmall);
+                }
+                m2 = m2 + 1;
+            }
+            }
+          }
+            si = si + 1;
+        }
+
+        Chart.DrawMarkLine(app, f, o);
+        if (o.showTooltip) {
+            ChartView.CartesianTooltip(app, f, labels, series, maxV, step, half);
+        }
+    }
+
+    // ---- bars (grouped / stacked / horizontal) ----
+
+    static void DrawBars(App app, int x, int y, int w, int h,
+                         ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<ChartSeries> series = m.series;
+        List<string> labels = m.labels;
+
+        if (o.horizontal) {
+            // Delegate the horizontal layout to the existing renderer, then the
+            // grow factor is applied by pre-scaling a temporary series set.
+            Chart.HBar(app, x, y, w, h, m.title, labels, ChartView.Scaled(series, g));
+            return;
+        }
+
+        // dataZoom: window the categories and reserve a bottom strip.
+        int zoomH = 0;
+        int fullN = labels.Count;
+        if (o.zoom && o.iwid != 0 && fullN > 1) {
+            int wi0 = Chart.ZoomI0(app, o.iwid, fullN);
+            int wi1 = Chart.ZoomI1(app, o.iwid, fullN);
+            series = Chart.Window(series, wi0, wi1);
+            labels = Chart.WindowLabels(labels, wi0, wi1);
+            zoomH = app.Scale(24);
+        }
+
+        int n = labels.Count;
+        int ns = series.Count;
+
+        int leftData = 0 - 1;
+        if (o.kind == 3) { leftData = Chart.MaxStack(series, n); }
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
+        ChartFrame f = Chart.BuildAxesR(app, x, y, w, h - zoomH, plotTop, labels, o, series, leftData, 0 - 1);
+        if (zoomH > 0) {
+            Chart.DrawZoomBar(app, f.plotX, f.plotW, y + h - app.Scale(18),
+                app.Scale(12), o.iwid, fullN);
+        }
+        Chart.DrawMarkArea(app, f, o);
+        int maxV = f.leftMax;
+        if (n < 1 || ns < 1) { return; }
+
+        int baseY = f.plotY + f.plotH;
+        int step = f.plotW / n;
+        int rad = app.Scale(3);
+        if (!o.rounded) { rad = app.Scale(1); }
+
+        // number of visible bar-family series (line-family overlays don't take a slot)
+        int nsVis = 0;
+        int cs = 0;
+        while (cs < ns) {
+            ChartSeries sc = series[cs];
+            if (!sc.hidden && sc.kind != 0 && sc.kind != 1 && sc.kind != 11) { nsVis = nsVis + 1; }
+            cs = cs + 1;
+        }
+        if (nsVis < 1) { nsVis = 1; }
+
+        if (o.kind == 3) {
+            // Stacked
+            int barW = step * 5 / 10;
+            int barX0 = (step - barW) / 2;
+            int i = 0;
+            while (i < n) {
+                int bx = f.plotX + i * step + barX0;
+                int acc = 0;
+                int si = 0;
+                while (si < ns) {
+                    if (!series[si].hidden) {
+                        List<int> vs = series[si].values;
+                        int v = 0;
+                        if (i < vs.Count) { v = vs[i]; }
+                        int yTop = f.YOf((acc + v) * g / 1000, 0);
+                        int yBot = f.YOf(acc * g / 1000, 0);
+                        ChartView.BarCell(c, bx, yTop, barW, yBot - yTop, rad, series[si].color, o.gradient);
+                        acc = acc + v;
+                    }
+                    si = si + 1;
+                }
+                i = i + 1;
+            }
+        } else {
+            // Grouped bars + optional line-family overlays (mixed charts)
+            int groupW = step * 7 / 10;
+            int gap = app.Scale(2);
+            int barW = (groupW - gap * (nsVis - 1)) / nsVis;
+            if (barW < app.Scale(2)) { barW = app.Scale(2); }
+            int groupX0 = (step - groupW) / 2;
+
+            int barSlot = 0;
+            int si = 0;
+            while (si < ns) {
+                ChartSeries s = series[si];
+                if (!s.hidden) {
+                    List<int> vs = s.values;
+                    int ax = s.axisIndex;
+                    bool isLine = (s.kind == 0 || s.kind == 1 || s.kind == 11);
+                    if (isLine) {
+                        // draw as a polyline over the group centers
+                        List<int> lpx = new List<int>();
+                        List<int> lpy = new List<int>();
+                        int li = 0;
+                        while (li < n && li < vs.Count) {
+                            lpx.Add(f.plotX + li * step + step / 2);
+                            lpy.Add(f.YOf(vs[li] * g / 1000, ax));
+                            li = li + 1;
+                        }
+                        ChartView.PolyLine(c, lpx, lpy, s.kind != 11, s.color, app.Scale(2));
+                        int di = 0;
+                        while (di < lpx.Count) { c.FillCircle(lpx[di], lpy[di], app.Scale(3), s.color); di = di + 1; }
+                    } else {
+                        int i = 0;
+                        while (i < n) {
+                            int v = 0;
+                            if (i < vs.Count) { v = vs[i]; }
+                            int by = f.YOf(v * g / 1000, ax);
+                            int bh = baseY - by;
+                            if (bh < 0) { bh = 0; }
+                            int bx = f.plotX + i * step + groupX0 + barSlot * (barW + gap);
+                            ChartView.BarCell(c, bx, by, barW, bh, rad, s.color, o.gradient);
+                            if (o.showValues && v > 0) {
+                                string lbl = Convert.ToString(v);
+                                int lw = Canvas.MeasureText(lbl, t.fontSizeSmall);
+                                c.DrawText(bx + (barW - lw) / 2, by - app.Scale(14), lbl,
+                                    t.textSecondary, t.fontSizeSmall);
+                            }
+                            i = i + 1;
+                        }
+                        barSlot = barSlot + 1;
+                    }
+                }
+                si = si + 1;
+            }
+        }
+
+        Chart.DrawMarkLine(app, f, o);
+        if (o.showTooltip && o.kind != 3) {
+            ChartView.CartesianTooltip(app, f, labels, series, maxV, step, step / 2);
+        }
+    }
+
+    /// One bar cell, optionally with a vertical gradient (color -> lighter).
+    static void BarCell(Canvas c, int x, int y, int w, int h, int rad,
+                        int color, bool gradient) {
+        if (h <= 0) { return; }
+        if (gradient) {
+            int top = App.LerpColor(color, 4294967295, 150);
+            c.FillRoundRect(x, y, w, h, rad, color);
+            c.FillVGrad(x, y, w, h / 2, top, color);
+        } else {
+            c.FillRoundRect(x, y, w, h, rad, color);
+        }
+    }
+
+    /// Returns a copy of `series` with every value scaled by g/1000 (used to
+    /// animate renderers that only accept a plain series list).
+    static List<ChartSeries> Scaled(List<ChartSeries> series, int g) {
+        List<ChartSeries> outp = new List<ChartSeries>();
+        int i = 0;
+        while (i < series.Count) {
+            ChartSeries s = series[i];
+            List<int> vs = new List<int>();
+            int j = 0;
+            while (j < s.values.Count) {
+                vs.Add(s.values[j] * g / 1000);
+                j = j + 1;
+            }
+            outp.Add(ChartSeries.Create(s.name, vs, s.color));
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    // ---- pie / donut (sweep grows with g) ----
+
+    static void DrawPie(App app, int x, int y, int w, int h,
+                        ChartModel m, int innerPct, int g, bool sliceLabels) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderPrimary, 1);
+        int top = y + pad;
+        if (m.title.Length > 0) {
+            c.DrawText(x + pad, top, m.title, t.textPrimary, t.fontSizeLarge);
+        }
+        top = top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+
+        // Totals come from the FULL data (not g-scaled) so the pie geometry is
+        // stable; the grow-in is a radial sweep to sweepMax degrees. This avoids
+        // integer division collapsing small early-frame values to 0 (which used
+        // to leave the whole chart blank).
+        int total = 0;
+        int i = 0;
+        while (i < m.series.Count) {
+            List<int> vs = m.series[i].values;
+            int v = 0;
+            if (vs.Count > 0) { v = vs[0]; }
+            total = total + v;
+            i = i + 1;
+        }
+        if (total <= 0) { return; }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (areaH / 2 < rOuter) { rOuter = areaH / 2; }
+        if (rOuter < app.Scale(10)) { rOuter = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int rInner = rOuter * innerPct / 100;
+        int sweepMax = 360 * g / 1000;
+
+        int acc = 0;
+        int k = 0;
+        while (k < m.series.Count) {
+            List<int> vs = m.series[k].values;
+            int v = 0;
+            if (vs.Count > 0) { v = vs[0]; }
+            int a0 = acc * 360 / total;
+            int a1 = (acc + v) * 360 / total;
+            int aEnd = a1;
+            if (aEnd > sweepMax) { aEnd = sweepMax; }
+            if (aEnd > a0) {
+                c.FillSector(cx, cy, rInner, rOuter, a0, aEnd, m.series[k].color);
+            }
+            acc = acc + v;
+            k = k + 1;
+        }
+
+        // Optional on-slice percentage labels, placed at the sector mid-angle.
+        if (sliceLabels) {
+            int rLbl = (rInner + rOuter) / 2;
+            if (rInner < app.Scale(4)) { rLbl = rOuter * 62 / 100; }
+            int acc2 = 0;
+            int p = 0;
+            while (p < m.series.Count) {
+                List<int> vs2 = m.series[p].values;
+                int v2 = 0;
+                if (vs2.Count > 0) { v2 = vs2[0]; }
+                int a0 = acc2 * 360 / total;
+                int a1 = (acc2 + v2) * 360 / total;
+                int pct = v2 * 100 / total;
+                if (a1 <= sweepMax && pct >= 4) {
+                    int mid = (a0 + a1) / 2;
+                    int lxp = cx + ChartView.CosDeg(mid) * rLbl / 1000;
+                    int lyp = cy + ChartView.SinDeg(mid) * rLbl / 1000;
+                    string pl = Convert.ToString(pct) + "%";
+                    int pw = Canvas.MeasureText(pl, t.fontSizeSmall);
+                    c.DrawText(lxp - pw / 2, lyp - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                        pl, 4294967295, t.fontSizeSmall);
+                }
+                acc2 = acc2 + v2;
+                p = p + 1;
+            }
+        }
+
+        // Donut centre caption: the running total, so the hole is informative.
+        if (rInner > app.Scale(18)) {
+            string tot = Convert.ToString(total);
+            int tw = Canvas.MeasureText(tot, t.fontSizeLarge);
+            c.DrawText(cx - tw / 2, cy - Canvas.FontHeight(t.fontSizeLarge) / 2,
+                tot, t.textPrimary, t.fontSizeLarge);
+        }
+
+        // Legend: swatch + name + percent (always drawn).
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        int j = 0;
+        while (j < m.series.Count) {
+            List<int> vs = m.series[j].values;
+            int v = 0;
+            if (vs.Count > 0) { v = vs[0]; }
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, m.series[j].color);
+            int pct = v * 100 / total;
+            string lbl = m.series[j].name + "  " + Convert.ToString(pct) + "%";
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
+    }
+
+    // ---- scatter (point radius grows with g) ----
+
+    static void DrawScatter(App app, int x, int y, int w, int h,
+                            ChartModel m, int color, int g) {
+        Chart.Scatter(app, x, y, w, h, m.title, m.scatterX, m.scatterY, color);
+    }
+
+    // ---- shared panel chrome: bg + border + title, returns content top y ----
+
+    static int PanelHead(App app, int x, int y, int w, int h, string title) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+    }
+
+    // ---- gauge (half-ring speedometer; sweep grows with g) ----
+
+    static void DrawGauge(App app, int x, int y, int w, int h,
+                          ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        int val = 0;
+        if (m.series.Count > 0) {
+            List<int> vs0 = m.series[0].values;
+            if (vs0.Count > 0) { val = vs0[0]; }
+        }
+        int max = o.gaugeMax;
+        if (max <= 0) { max = 100; }
+        if (val < 0) { val = 0; }
+        if (val > max) { val = max; }
+        int color = t.primary;
+        if (m.series.Count > 0) { color = m.series[0].color; }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - top;
+        int rOuter = areaW / 2;
+        if (rOuter > areaH - app.Scale(16)) { rOuter = areaH - app.Scale(16); }
+        if (rOuter < app.Scale(20)) { rOuter = app.Scale(20); }
+        int cx = x + w / 2;
+        int cy = top + rOuter;
+        int ring = rOuter * 32 / 100;
+        int rInner = rOuter - ring;
+
+        // Track (top semicircle split into left/right halves to avoid 0/360 wrap)
+        c.FillSector(cx, cy, rInner, rOuter, 270, 360, t.bgTertiary);
+        c.FillSector(cx, cy, rInner, rOuter, 0, 90, t.bgTertiary);
+
+        // Value arc, swept clockwise from the left (270 deg) and animated by g.
+        int sweep = 180 * val / max;
+        sweep = sweep * g / 1000;
+        int leftDeg = sweep;
+        if (leftDeg > 90) { leftDeg = 90; }
+        if (leftDeg > 0) {
+            c.FillSector(cx, cy, rInner, rOuter, 270, 270 + leftDeg, color);
+        }
+        if (sweep > 90) {
+            c.FillSector(cx, cy, rInner, rOuter, 0, sweep - 90, color);
+        }
+
+        // Big centred value + 0 / max end labels.
+        string vs = Convert.ToString(val);
+        int tw = Canvas.MeasureText(vs, t.fontSizeLarge);
+        c.DrawText(cx - tw / 2, cy - Canvas.FontHeight(t.fontSizeLarge) - app.Scale(2),
+            vs, t.textPrimary, t.fontSizeLarge);
+        c.DrawText(cx - rOuter, cy + app.Scale(4), "0", t.textTertiary, t.fontSizeSmall);
+        string mxs = Convert.ToString(max);
+        int mw = Canvas.MeasureText(mxs, t.fontSizeSmall);
+        c.DrawText(cx + rOuter - mw, cy + app.Scale(4), mxs, t.textTertiary, t.fontSizeSmall);
+    }
+
+    // ---- radial bars (concentric progress rings; sweep grows with g) ----
+
+    static void DrawRadialBars(App app, int x, int y, int w, int h,
+                               ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        int max = o.gaugeMax;
+        if (max <= 0) { max = 100; }
+        int n = m.series.Count;
+        if (n < 1) { return; }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rMax = areaW / 2;
+        if (areaH / 2 < rMax) { rMax = areaH / 2; }
+        if (rMax < app.Scale(20)) { rMax = app.Scale(20); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+
+        int band = rMax * 70 / 100 / n;
+        int gap = band * 22 / 100;
+        int i = 0;
+        while (i < n) {
+            int ringOuter = rMax - i * band;
+            int ringInner = ringOuter - band + gap;
+            if (ringInner < 0) { ringInner = 0; }
+            List<int> vsi = m.series[i].values;
+            int val = 0;
+            if (vsi.Count > 0) { val = vsi[0]; }
+            if (val < 0) { val = 0; }
+            if (val > max) { val = max; }
+            c.FillSector(cx, cy, ringInner, ringOuter, 0, 360, t.bgTertiary);
+            int sweep = 360 * val / max;
+            sweep = sweep * g / 1000;
+            if (sweep > 0) {
+                c.FillSector(cx, cy, ringInner, ringOuter, 0, sweep, m.series[i].color);
+            }
+            i = i + 1;
+        }
+
+        // Legend: swatch + name + value.
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        int j = 0;
+        while (j < n) {
+            List<int> vsj = m.series[j].values;
+            int val = 0;
+            if (vsj.Count > 0) { val = vsj[0]; }
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, m.series[j].color);
+            string lbl = m.series[j].name + "  " + Convert.ToString(val);
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1), lbl, t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+            j = j + 1;
+        }
+    }
+
+    // ---- heatmap (row=series, col=value index; intensity fades in with g) ----
+
+    static void DrawHeatmap(App app, int x, int y, int w, int h,
+                            ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        int rows = m.series.Count;
+        if (rows < 1) { return; }
+        int cols = 0;
+        int r = 0;
+        while (r < rows) {
+            List<int> vr = m.series[r].values;
+            if (vr.Count > cols) { cols = vr.Count; }
+            r = r + 1;
+        }
+        if (cols < 1) { return; }
+
+        // Global min/max for the colour ramp.
+        List<int> v0 = m.series[0].values;
+        int lo = 0;
+        if (v0.Count > 0) { lo = v0[0]; }
+        int hi = lo;
+        r = 0;
+        while (r < rows) {
+            List<int> vr = m.series[r].values;
+            int cc = 0;
+            while (cc < vr.Count) {
+                int v = vr[cc];
+                if (v < lo) { lo = v; }
+                if (v > hi) { hi = v; }
+                cc = cc + 1;
+            }
+            r = r + 1;
+        }
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+
+        int rowLabelW = app.Scale(56);
+        int colHeadH = app.Scale(16);
+        int gridX = x + pad + rowLabelW;
+        int gridY = top + colHeadH;
+        int gridW = w - pad * 2 - rowLabelW;
+        int gridH = (y + h - pad) - gridY;
+        int cellW = gridW / cols;
+        int cellH = gridH / rows;
+        if (cellW < 1 || cellH < 1) { return; }
+        int cellGap = app.Scale(2);
+
+        // Column headers (category labels).
+        int ci = 0;
+        while (ci < cols) {
+            if (ci < m.labels.Count) {
+                c.DrawTextCentered(gridX + ci * cellW, top, cellW, colHeadH,
+                    m.labels[ci], t.textTertiary, t.fontSizeSmall);
+            }
+            ci = ci + 1;
+        }
+
+        r = 0;
+        while (r < rows) {
+            // Row label (series name).
+            c.DrawText(x + pad, gridY + r * cellH + (cellH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                m.series[r].name, t.textSecondary, t.fontSizeSmall);
+            List<int> vr = m.series[r].values;
+            int cc = 0;
+            while (cc < cols) {
+                int v = lo;
+                if (cc < vr.Count) { v = vr[cc]; }
+                int inten = (v - lo) * 1000 / span;
+                inten = inten * g / 1000;
+                int cellCol = App.LerpColor(t.bgTertiary, m.series[r].color, inten);
+                int bx = gridX + cc * cellW;
+                int by = gridY + r * cellH;
+                c.FillRoundRect(bx, by, cellW - cellGap, cellH - cellGap,
+                    t.borderRadiusSmall, cellCol);
+                cc = cc + 1;
+            }
+            r = r + 1;
+        }
+    }
+
+    // ---- hover crosshair + value tooltip (cartesian charts) ----
+
+    static void CartesianTooltip(App app, ChartFrame f, List<string> labels,
+                                 List<ChartSeries> series, int maxV,
+                                 int step, int half) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        bool inside = mx >= f.plotX && mx < f.plotX + f.plotW
+            && my >= f.plotY && my < f.plotY + f.plotH;
+        if (!inside) { return; }
+        int n = labels.Count;
+        if (n < 1 || step < 1) { return; }
+        int idx = (mx - f.plotX) / step;
+        if (idx < 0) { idx = 0; }
+        if (idx > n - 1) { idx = n - 1; }
+
+        int gx = f.plotX + idx * step + half;
+        c.FillRect(gx, f.plotY, 1, f.plotH, t.borderHover);
+
+        // Tooltip card: category label + each *visible* series value + swatch.
+        int fs = t.fontSizeSmall;
+        int lh = Canvas.FontHeight(fs) + app.Scale(4);
+        int vis = 0;
+        int cs = 0;
+        while (cs < series.Count) {
+            if (!series[cs].hidden) { vis = vis + 1; }
+            cs = cs + 1;
+        }
+        int rows = vis + 1;
+        int boxW = app.Scale(120);
+        int boxH = rows * lh + app.Scale(10);
+        int bx = gx + app.Scale(10);
+        if (bx + boxW > f.plotX + f.plotW) { bx = gx - app.Scale(10) - boxW; }
+        int by = f.plotY + app.Scale(6);
+
+        c.FillRoundRect(bx, by, boxW, boxH, t.borderRadiusMedium, t.bgSecondary);
+        c.DrawRoundRect(bx, by, boxW, boxH, t.borderRadiusMedium, t.borderPrimary, 1);
+        int ty = by + app.Scale(5);
+        c.DrawText(bx + app.Scale(8), ty, labels[idx], t.textPrimary, fs);
+        ty = ty + lh;
+        int si = 0;
+        while (si < series.Count) {
+            ChartSeries s = series[si];
+            if (!s.hidden) {
+                int sw = app.Scale(9);
+                c.FillRoundRect(bx + app.Scale(8), ty + app.Scale(2), sw, sw,
+                    t.borderRadiusSmall, s.color);
+                int v = 0;
+                if (idx < s.values.Count) { v = s.values[idx]; }
+                string line = s.name + "  " + Convert.ToString(v);
+                c.DrawText(bx + app.Scale(8) + sw + app.Scale(6), ty, line,
+                    t.textSecondary, fs);
+                ty = ty + lh;
+            }
+            si = si + 1;
+        }
+        app.RequestRedraw();
+    }
+
+    // ==== integer / trig helpers (fixed-point, *1000) ====
+
+    static int ISqrt(int v) {
+        if (v <= 0) { return 0; }
+        int r = 1;
+        while (r * r <= v) { r = r + 1; }
+        return r - 1;
+    }
+
+    // sin(deg) * 1000, Bhaskara I approximation (error < 0.2%).
+    static int SinDeg(int deg) {
+        int d = deg % 360;
+        if (d < 0) { d = d + 360; }
+        int sign = 1;
+        if (d >= 180) { d = d - 180; sign = 0 - 1; }
+        int num = 4 * d * (180 - d);
+        int den = 40500 - d * (180 - d);
+        if (den == 0) { den = 1; }
+        return sign * (num * 1000 / den);
+    }
+
+    static int CosDeg(int deg) { return ChartView.SinDeg(deg + 90); }
+
+    static void RingOutline(Canvas c, int cx, int cy, int r, int color) {
+        int seg = 36;
+        int prevx = cx + r;
+        int prevy = cy;
+        int i = 1;
+        while (i <= seg) {
+            int ang = i * 360 / seg;
+            int px = cx + ChartView.CosDeg(ang) * r / 1000;
+            int py = cy + ChartView.SinDeg(ang) * r / 1000;
+            c.DrawLine(prevx, prevy, px, py, color, 1);
+            prevx = px;
+            prevy = py;
+            i = i + 1;
+        }
+    }
+
+    // ---- stacked area (cumulative filled bands) ----
+
+    static void DrawStackedArea(App app, int x, int y, int w, int h,
+                                ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        List<ChartSeries> series = m.series;
+        List<string> labels = m.labels;
+        int i = 0;
+        while (i < series.Count) {
+            if (series[i].color == 0) { series[i].color = Chart.Palette(app.theme, i); }
+            i = i + 1;
+        }
+        int n = labels.Count;
+        int maxV = Chart.NiceMax(Chart.MaxStack(series, n));
+        int plotTop = Chart.DrawPanelI(app, x, y, w, h, m.title, series, o.iwid);
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, labels, maxV);
+        if (n < 1 || maxV < 1) { return; }
+        int step = f.plotW / n;
+        int half = step / 2;
+
+        List<int> baseCum = new List<int>();
+        int bi = 0;
+        while (bi < n) { baseCum.Add(0); bi = bi + 1; }
+
+        int si = 0;
+        while (si < series.Count) {
+            ChartSeries s = series[si];
+            List<int> vs = s.values;
+            List<int> topY = new List<int>();
+            List<int> botY = new List<int>();
+            int j = 0;
+            while (j < n) {
+                int prev = baseCum[j];
+                int val = 0;
+                if (j < vs.Count) { val = vs[j]; }
+                int cumG = (prev + val) * g / 1000;
+                int prevG = prev * g / 1000;
+                topY.Add(f.plotY + f.plotH - (cumG * f.plotH / maxV));
+                botY.Add(f.plotY + f.plotH - (prevG * f.plotH / maxV));
+                j = j + 1;
+            }
+            int ii = 0;
+            while (ii + 1 < n) {
+                int ax0 = f.plotX + ii * step + half;
+                int ax1 = f.plotX + (ii + 1) * step + half;
+                int pxc = ax0;
+                while (pxc < ax1) {
+                    int tt = 0;
+                    if (ax1 > ax0) { tt = (pxc - ax0) * 1000 / (ax1 - ax0); }
+                    int tyF = topY[ii] * 256 + (topY[ii + 1] - topY[ii]) * tt * 256 / 1000;
+                    int by = botY[ii] + (botY[ii + 1] - botY[ii]) * tt / 1000;
+                    ChartView.FillColumnAA(c, pxc, tyF, by, s.color, o.gradient, 150, 40, 90);
+                    pxc = pxc + 1;
+                }
+                ii = ii + 1;
+            }
+            int lastx = f.plotX + (n - 1) * step + half;
+            ChartView.FillColumnAA(c, lastx, topY[n - 1] * 256, botY[n - 1],
+                                   s.color, o.gradient, 150, 40, 90);
+            int k2 = 0;
+            while (k2 + 1 < n) {
+                int x0 = f.plotX + k2 * step + half;
+                int x1 = f.plotX + (k2 + 1) * step + half;
+                c.DrawLine(x0, topY[k2], x1, topY[k2 + 1], s.color, app.Scale(2));
+                k2 = k2 + 1;
+            }
+            int u = 0;
+            while (u < n) {
+                int val = 0;
+                if (u < vs.Count) { val = vs[u]; }
+                baseCum[u] = baseCum[u] + val;
+                u = u + 1;
+            }
+            si = si + 1;
+        }
+    }
+
+    // ---- candlestick / financial (buckets to plot width for huge data) ----
+
+    static void DrawCandles(App app, int x, int y, int w, int h,
+                            ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<Candle> cs = m.candles;
+        int n = cs.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, m.title);
+        if (n < 1) { return; }
+
+        int lo = cs[0].low;
+        int hi = cs[0].high;
+        int i = 0;
+        while (i < n) {
+            if (cs[i].low < lo) { lo = cs[i].low; }
+            if (cs[i].high > hi) { hi = cs[i].high; }
+            i = i + 1;
+        }
+        int pad2 = (hi - lo) / 20;
+        if (pad2 < 1) { pad2 = 1; }
+        lo = lo - pad2;
+        hi = hi + pad2;
+        List<string> noLab = new List<string>();
+        ChartFrame f = Chart.DrawFrameLoHi(app, x, y, w, h, plotTop, noLab, lo, hi);
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+
+        int cols = f.plotW / app.Scale(5);
+        if (cols < 1) { cols = 1; }
+        if (cols > n) { cols = n; }
+        int cw = f.plotW / cols;
+        int upC = Chart.Rgb(38, 166, 89);
+        int dnC = Chart.Rgb(229, 72, 77);
+
+        int bc = 0;
+        while (bc < cols) {
+            int i0 = bc * n / cols;
+            int i1 = (bc + 1) * n / cols;
+            if (i1 <= i0) { i1 = i0 + 1; }
+            if (i1 > n) { i1 = n; }
+            int open = cs[i0].open;
+            int close = cs[i1 - 1].close;
+            int chi = cs[i0].high;
+            int clo = cs[i0].low;
+            int k = i0;
+            while (k < i1) {
+                if (cs[k].high > chi) { chi = cs[k].high; }
+                if (cs[k].low < clo) { clo = cs[k].low; }
+                k = k + 1;
+            }
+            int cx = f.plotX + bc * cw + cw / 2;
+            int yHigh = f.plotY + f.plotH - (chi - lo) * f.plotH / span;
+            int yLow = f.plotY + f.plotH - (clo - lo) * f.plotH / span;
+            int yOpen = f.plotY + f.plotH - (open - lo) * f.plotH / span;
+            int yClose = f.plotY + f.plotH - (close - lo) * f.plotH / span;
+            int col = upC;
+            if (close < open) { col = dnC; }
+            c.DrawLine(cx, yHigh, cx, yLow, col, app.Scale(1));
+            int bw = cw * 6 / 10;
+            if (bw < app.Scale(2)) { bw = app.Scale(2); }
+            int bodyTop = yOpen;
+            int bodyBot = yClose;
+            if (yClose < yOpen) { bodyTop = yClose; bodyBot = yOpen; }
+            int bh = bodyBot - bodyTop;
+            if (bh < app.Scale(1)) { bh = app.Scale(1); }
+            c.FillRoundRect(cx - bw / 2, bodyTop, bw, bh, app.Scale(1), col);
+            bc = bc + 1;
+        }
+
+        string cap = Convert.ToString(n) + " bars";
+        int cwid = Canvas.MeasureText(cap, t.fontSizeSmall);
+        c.DrawText(x + w - t.paddingMedium - cwid, y + h - t.paddingMedium - Canvas.FontHeight(t.fontSizeSmall),
+            cap, t.textTertiary, t.fontSizeSmall);
+    }
+
+    // ---- weighted scatter / bubbles (strides for huge data) ----
+
+    static void DrawBubbles(App app, int x, int y, int w, int h,
+                            ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<Bubble> bs = m.bubbles;
+        int n = bs.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, m.title);
+        if (n < 1) { return; }
+
+        int maxX = 1;
+        int maxY = 1;
+        int maxW = 1;
+        int i = 0;
+        while (i < n) {
+            if (bs[i].x > maxX) { maxX = bs[i].x; }
+            if (bs[i].y > maxY) { maxY = bs[i].y; }
+            if (bs[i].weight > maxW) { maxW = bs[i].weight; }
+            i = i + 1;
+        }
+        int niceY = Chart.NiceMax(maxY);
+        int niceX = Chart.NiceMax(maxX);
+        List<string> noLab = new List<string>();
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, noLab, niceY);
+        int color = t.primary;
+        int maxR = app.Scale(20);
+        int rootMaxW = ChartView.ISqrt(maxW);
+        if (rootMaxW < 1) { rootMaxW = 1; }
+        int stride = 1;
+        if (n > f.plotW) { stride = n / f.plotW; if (stride < 1) { stride = 1; } }
+
+        int j = 0;
+        while (j < n) {
+            int px = f.plotX + bs[j].x * f.plotW / niceX;
+            int py = f.plotY + f.plotH - (bs[j].y * f.plotH / niceY);
+            int rr = ChartView.ISqrt(bs[j].weight) * maxR / rootMaxW;
+            if (rr < app.Scale(2)) { rr = app.Scale(2); }
+            rr = rr * g / 1000;
+            c.FillCircle(px, py, rr, Chart.WithAlpha(color, 80));
+            j = j + stride;
+        }
+    }
+
+    // ---- box-and-whisker ----
+
+    static void DrawBox(App app, int x, int y, int w, int h,
+                        ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<BoxItem> bx = m.boxes;
+        int n = bx.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, m.title);
+        if (n < 1) { return; }
+
+        int lo = bx[0].lo;
+        int hi = bx[0].hi;
+        int i = 0;
+        while (i < n) {
+            if (bx[i].lo < lo) { lo = bx[i].lo; }
+            if (bx[i].hi > hi) { hi = bx[i].hi; }
+            i = i + 1;
+        }
+        int pad2 = (hi - lo) / 20;
+        if (pad2 < 1) { pad2 = 1; }
+        lo = lo - pad2;
+        hi = hi + pad2;
+        ChartFrame f = Chart.DrawFrameLoHi(app, x, y, w, h, plotTop, m.labels, lo, hi);
+        int span = hi - lo;
+        if (span < 1) { span = 1; }
+        int step = f.plotW / n;
+        int bw = step * 5 / 10;
+        if (bw < app.Scale(6)) { bw = app.Scale(6); }
+
+        int k = 0;
+        while (k < n) {
+            int cx = f.plotX + k * step + step / 2;
+            int col = Chart.Palette(t, k);
+            int yLo = f.plotY + f.plotH - (bx[k].lo - lo) * f.plotH / span;
+            int yQ1 = f.plotY + f.plotH - (bx[k].q1 - lo) * f.plotH / span;
+            int yMed = f.plotY + f.plotH - (bx[k].med - lo) * f.plotH / span;
+            int yQ3 = f.plotY + f.plotH - (bx[k].q3 - lo) * f.plotH / span;
+            int yHi = f.plotY + f.plotH - (bx[k].hi - lo) * f.plotH / span;
+            c.DrawLine(cx, yHi, cx, yQ3, col, app.Scale(1));
+            c.DrawLine(cx, yQ1, cx, yLo, col, app.Scale(1));
+            c.DrawLine(cx - bw / 4, yHi, cx + bw / 4, yHi, col, app.Scale(1));
+            c.DrawLine(cx - bw / 4, yLo, cx + bw / 4, yLo, col, app.Scale(1));
+            int boxH = yQ1 - yQ3;
+            if (boxH < app.Scale(1)) { boxH = app.Scale(1); }
+            c.FillRoundRect(cx - bw / 2, yQ3, bw, boxH, app.Scale(2), Chart.WithAlpha(col, 70));
+            c.DrawRoundRect(cx - bw / 2, yQ3, bw, boxH, app.Scale(2), col, 1);
+            c.DrawLine(cx - bw / 2, yMed, cx + bw / 2, yMed, col, app.Scale(2));
+            k = k + 1;
+        }
+    }
+
+    // ---- error bars (value +/- margin over categories) ----
+
+    static void DrawError(App app, int x, int y, int w, int h,
+                          ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        List<ErrorItem> es = m.errors;
+        int n = es.Count;
+        int plotTop = ChartView.PanelHead(app, x, y, w, h, m.title);
+        if (n < 1) { return; }
+
+        int maxV = 0;
+        int i = 0;
+        while (i < n) {
+            int top = es[i].y + es[i].err;
+            if (top > maxV) { maxV = top; }
+            i = i + 1;
+        }
+        int nice = Chart.NiceMax(maxV);
+        if (nice < 1) { nice = 1; }
+        ChartFrame f = Chart.DrawFrame(app, x, y, w, h, plotTop, m.labels, nice);
+        int step = f.plotW / n;
+        int color = t.primary;
+        int prevX = 0;
+        int prevY = 0;
+
+        int k = 0;
+        while (k < n) {
+            int cx = f.plotX + k * step + step / 2;
+            int vy = f.plotY + f.plotH - (es[k].y * g / 1000 * f.plotH / nice);
+            int eTop = f.plotY + f.plotH - ((es[k].y + es[k].err) * f.plotH / nice);
+            int eBot = f.plotY + f.plotH - ((es[k].y - es[k].err) * f.plotH / nice);
+            c.DrawLine(cx, eTop, cx, eBot, Chart.WithAlpha(color, 160), app.Scale(1));
+            c.DrawLine(cx - app.Scale(4), eTop, cx + app.Scale(4), eTop, color, app.Scale(1));
+            c.DrawLine(cx - app.Scale(4), eBot, cx + app.Scale(4), eBot, color, app.Scale(1));
+            if (k > 0) { c.DrawLine(prevX, prevY, cx, vy, color, app.Scale(2)); }
+            c.FillCircle(cx, vy, app.Scale(3), color);
+            prevX = cx;
+            prevY = vy;
+            k = k + 1;
+        }
+    }
+
+    // ---- polar / radar (series polygons over angular categories) ----
+
+    static void DrawPolar(App app, int x, int y, int w, int h,
+                          ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int ci = 0;
+        while (ci < m.series.Count) {
+            if (m.series[ci].color == 0) { m.series[ci].color = Chart.Palette(t, ci); }
+            ci = ci + 1;
+        }
+        int top = Chart.DrawPanelI(app, x, y, w, h, m.title, m.series, o.iwid);
+        int n = m.labels.Count;
+        if (n < 1 && m.series.Count > 0) { n = m.series[0].values.Count; }
+        if (n < 1) { return; }
+        int maxV = Chart.NiceMax(Chart.MaxOf(m.series));
+        if (maxV < 1) { maxV = 1; }
+
+        int areaW = w - pad * 2;
+        int areaH = (y + h - pad) - top;
+        int r = areaW / 2;
+        if (areaH / 2 < r) { r = areaH / 2; }
+        if (r < app.Scale(10)) { r = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+
+        int rings = 4;
+        int rr = 1;
+        while (rr <= rings) {
+            ChartView.RingOutline(c, cx, cy, r * rr / rings, t.divider);
+            rr = rr + 1;
+        }
+        int a = 0;
+        while (a < n) {
+            int ang = a * 360 / n - 90;
+            int ex = cx + ChartView.CosDeg(ang) * r / 1000;
+            int ey = cy + ChartView.SinDeg(ang) * r / 1000;
+            c.DrawLine(cx, cy, ex, ey, t.divider, 1);
+            string lbl = "";
+            if (a < m.labels.Count) { lbl = m.labels[a]; }
+            if (lbl.Length > 0) {
+                int lx = cx + ChartView.CosDeg(ang) * (r + app.Scale(10)) / 1000;
+                int ly = cy + ChartView.SinDeg(ang) * (r + app.Scale(10)) / 1000;
+                c.DrawText(lx - Canvas.MeasureText(lbl, t.fontSizeSmall) / 2, ly - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                    lbl, t.textTertiary, t.fontSizeSmall);
+            }
+            a = a + 1;
+        }
+
+        int si = 0;
+        while (si < m.series.Count) {
+            List<int> vs = m.series[si].values;
+            int col = m.series[si].color;
+            int firstX = 0;
+            int firstY = 0;
+            int prevX = 0;
+            int prevY = 0;
+            int j = 0;
+            while (j < n && j < vs.Count) {
+                int ang = j * 360 / n - 90;
+                int rad = vs[j] * g / 1000 * r / maxV;
+                int px = cx + ChartView.CosDeg(ang) * rad / 1000;
+                int py = cy + ChartView.SinDeg(ang) * rad / 1000;
+                if (j == 0) { firstX = px; firstY = py; }
+                else { c.DrawLine(prevX, prevY, px, py, col, app.Scale(2)); }
+                c.FillCircle(px, py, app.Scale(3), col);
+                prevX = px;
+                prevY = py;
+                j = j + 1;
+            }
+            if (n > 1 && vs.Count >= n) { c.DrawLine(prevX, prevY, firstX, firstY, col, app.Scale(2)); }
+            si = si + 1;
+        }
+    }
+
+    // Gather funnel/pyramid/rose stages: one value+color+name per stage, from
+    // either multiple single-value series or one multi-value series.
+    static List<ChartStage> GatherStages(App app, ChartModel m) {
+        Theme t = app.theme;
+        List<ChartStage> stages = new List<ChartStage>();
+        if (m.series.Count > 1) {
+            for (int i = 0; i < m.series.Count; i = i + 1) {
+                int v = 0;
+                if (m.series[i].values.Count > 0) { v = m.series[i].values[0]; }
+                int col = m.series[i].color;
+                if (col == 0) { col = Chart.Palette(t, i); }
+                stages.Add(new ChartStage(v, col, m.series[i].name));
+            }
+        } else if (m.series.Count == 1) {
+            List<int> vs = m.series[0].values;
+            for (int i = 0; i < vs.Count; i = i + 1) {
+                stages.Add(new ChartStage(vs[i], Chart.Palette(t, i), ""));
+            }
+        }
+        return stages;
+    }
+
+    // ---- funnel / pyramid ----
+
+    static void DrawFunnel(App app, int x, int y, int w, int h,
+                           ChartModel m, ChartOptions o, int g, bool pyramid) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        List<ChartStage> stages = ChartView.GatherStages(app, m);
+        int n = stages.Count;
+        if (n < 1) { return; }
+        int maxV = 1;
+        foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int cx = x + pad + areaW / 2;
+        int rowH = areaH / n;
+
+        for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+            int idx = i2;
+            if (pyramid) { idx = n - 1 - i2; }
+            int vTop = stages[idx].val;
+            int vBot = vTop;
+            int nextIdx = idx + 1;
+            if (pyramid) { nextIdx = idx - 1; }
+            if (nextIdx >= 0 && nextIdx < n) { vBot = stages[nextIdx].val; }
+            int wTop = vTop * areaW / maxV * g / 1000;
+            int wBot = vBot * areaW / maxV * g / 1000;
+            int ry = top + i2 * rowH;
+            int col = stages[idx].color;
+            int r = 0;
+            int strip = rowH - app.Scale(3);
+            while (r < strip) {
+                int tt = 0;
+                if (strip > 0) { tt = r * 1000 / strip; }
+                int ww = wTop + (wBot - wTop) * tt / 1000;
+                c.FillRect(cx - ww / 2, ry + r, ww, 1, col);
+                r = r + 1;
+            }
+            string lbl = stages[idx].name;
+            if (lbl.Length == 0) { lbl = Convert.ToString(stages[idx].val); }
+            c.DrawTextCentered(cx - areaW / 2, ry + rowH / 2 - Canvas.FontHeight(t.fontSizeSmall) / 2,
+                areaW, Canvas.FontHeight(t.fontSizeSmall), lbl, t.textPrimary, t.fontSizeSmall);
+        }
+
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        for (int j = 0; j < n; j = j + 1) {
+            ChartStage st = stages[j];
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, st.color);
+            string nm = st.name;
+            if (nm.Length == 0) { nm = ChartView.StageName(j); }
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1),
+                nm + "  " + Convert.ToString(st.val), t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+        }
+    }
+
+    static string StageName(int i) { return "Stage " + Convert.ToString(i + 1); }
+
+    // ---- rose / nightingale (equal angles, radius by value) ----
+
+    static void DrawRose(App app, int x, int y, int w, int h,
+                         ChartModel m, ChartOptions o, int g) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int top = ChartView.PanelHead(app, x, y, w, h, m.title);
+
+        List<ChartStage> stages = ChartView.GatherStages(app, m);
+        int n = stages.Count;
+        if (n < 1) { return; }
+        int maxV = 1;
+        foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
+
+        int legendW = app.Scale(120);
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+        int rMax = areaW / 2;
+        if (areaH / 2 < rMax) { rMax = areaH / 2; }
+        if (rMax < app.Scale(10)) { rMax = app.Scale(10); }
+        int cx = x + pad + areaW / 2;
+        int cy = top + areaH / 2;
+        int sweepMax = 360 * g / 1000;
+
+        for (int i = 0; i < n; i = i + 1) {
+            int a0 = i * 360 / n;
+            int a1 = (i + 1) * 360 / n;
+            if (a1 > sweepMax) { a1 = sweepMax; }
+            int r = rMax * stages[i].val / maxV;
+            if (r < app.Scale(6)) { r = app.Scale(6); }
+            if (a1 > a0) { c.FillSector(cx, cy, 0, r, a0, a1, stages[i].color); }
+        }
+
+        int lx = x + w - pad - legendW;
+        int ly = top;
+        int sw = app.Scale(12);
+        int lh = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+        for (int j = 0; j < n; j = j + 1) {
+            ChartStage st = stages[j];
+            c.FillRoundRect(lx, ly + app.Scale(2), sw, sw, t.borderRadiusSmall, st.color);
+            string nm = st.name;
+            if (nm.Length == 0) { nm = "Item " + Convert.ToString(j + 1); }
+            c.DrawText(lx + sw + app.Scale(6), ly + app.Scale(1),
+                nm + "  " + Convert.ToString(st.val), t.textSecondary, t.fontSizeSmall);
+            ly = ly + lh;
+        }
+    }
+}
+
+/// Cached min/max decimation for the high-performance chart path. Hold one per
+/// big chart (like DataTableState); call Invalidate() when the underlying data
+/// changes. ChartBig fills it lazily and reuses it across frames.
+class ChartState {
+    int version;        // caller bumps (via Invalidate) when the data changes
+    int builtVersion;   // data version the cache was built at
+    int builtW;         // widget width the cache was built for
+    int builtSeries;    // series count the cache was built for
+    int cols;           // widest per-series column count in the cache
+    int axisLo;         // resolved value-axis bounds
+    int axisHi;
+    List<List<int>> colMin;   // per series: min value per decimated column
+    List<List<int>> colMax;   // per series: max value per decimated column
+
+    static ChartState Create() {
+        ChartState s = new ChartState();
+        s.version = 1;
+        s.builtVersion = 0;
+        s.builtW = -1;
+        s.builtSeries = -1;
+        s.cols = 0;
+        s.axisLo = 0;
+        s.axisHi = 0;
+        s.colMin = new List<List<int>>();
+        s.colMax = new List<List<int>>();
+        return s;
+    }
+
+    /// Mark the cache stale so the next render re-decimates the source.
+    void Invalidate() { this.version = this.version + 1; }
+}
+
+/// High-performance renderer for a virtual ChartSource. Each series is reduced
+/// to a min/max envelope of at most ~plot-width columns, cached in a ChartState
+/// and rebuilt only when the data version or width changes — so a line/area of
+/// millions of points draws in O(width) per frame instead of O(points), and the
+/// chart never owns a point-per-object array. Usage:
+///
+///   ChartState st = ChartState.Create();          // once, kept by the caller
+///   ChartBig.Render(app, st, mySource, ChartOptions.Area(), x, y, w, h, "CPU");
+class ChartBig {
+
+    static bool NeedsRebuild(ChartState st, ChartSource src, int w) {
+        if (st.builtVersion != st.version) { return true; }
+        if (st.builtW != w) { return true; }
+        if (st.builtSeries != src.SeriesCount()) { return true; }
+        return false;
+    }
+
+    // Decimate every series into ~`target` min/max columns. Append-only build
+    // (no indexed list writes) — safe and fast at any optimization level; runs
+    // once per data/size change, O(total points).
+    static void Build(ChartState st, ChartSource src, int target) {
+        if (target < 2) { target = 2; }
+        st.colMin = new List<List<int>>();
+        st.colMax = new List<List<int>>();
+        int ns = src.SeriesCount();
+        int lo = 0;
+        int hi = 0;
+        bool seen = false;
+        int cols = 0;
+
+        int s = 0;
+        while (s < ns) {
+            int n = src.PointCount(s);
+            List<int> mn = new List<int>();
+            List<int> mx = new List<int>();
+            if (n > 0) {
+                int C = target;
+                if (C > n) { C = n; }
+                int curCol = 0;
+                int cMin = src.ValueAt(s, 0);
+                int cMax = cMin;
+                int i = 1;
+                while (i < n) {
+                    int col = i * C / n;
+                    int v = src.ValueAt(s, i);
+                    if (col != curCol) {
+                        mn.Add(cMin);
+                        mx.Add(cMax);
+                        curCol = col;
+                        cMin = v;
+                        cMax = v;
+                    } else {
+                        if (v < cMin) { cMin = v; }
+                        if (v > cMax) { cMax = v; }
+                    }
+                    i = i + 1;
+                }
+                mn.Add(cMin);
+                mx.Add(cMax);
+            }
+
+            int j = 0;
+            while (j < mn.Count) {
+                int a = mn[j];
+                int b = mx[j];
+                if (!seen) { lo = a; hi = b; seen = true; }
+                if (a < lo) { lo = a; }
+                if (b > hi) { hi = b; }
+                j = j + 1;
+            }
+            if (mn.Count > cols) { cols = mn.Count; }
+            st.colMin.Add(mn);
+            st.colMax.Add(mx);
+            s = s + 1;
+        }
+
+        st.cols = cols;
+        int axisLo = lo;
+        if (axisLo > 0) { axisLo = 0; }   // zero-anchor when all non-negative
+        int axisHi = Chart.NiceMax(hi);
+        if (axisHi <= axisLo) { axisHi = axisLo + 1; }
+        st.axisLo = axisLo;
+        st.axisHi = axisHi;
+    }
+
+    static int DrawHead(App app, int x, int y, int w, int h, string title, ChartSource src) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusMedium, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusMedium, t.borderPrimary, 1);
+        int top = y + pad;
+        if (title.Length > 0) {
+            c.DrawText(x + pad, top, title, t.textPrimary, t.fontSizeLarge);
+        }
+        int lx = x + w - pad;
+        int sw = app.Scale(12);
+        int si = src.SeriesCount() - 1;
+        while (si >= 0) {
+            string nm = src.SeriesName(si);
+            int tw = Canvas.MeasureText(nm, t.fontSizeSmall);
+            lx = lx - tw;
+            c.DrawText(lx, top + app.Scale(2), nm, t.textSecondary, t.fontSizeSmall);
+            int col = src.SeriesColor(si);
+            if (col == 0) { col = Chart.Palette(t, si); }
+            lx = lx - app.Scale(6) - sw;
+            c.FillRoundRect(lx, top + app.Scale(3), sw, sw, t.borderRadiusSmall, col);
+            lx = lx - app.Scale(14);
+            si = si - 1;
+        }
+        return top + Canvas.FontHeight(t.fontSizeLarge) + app.Scale(6);
+    }
+
+    /// Draw the source as a decimated line/area chart into the given rect.
+    static void Render(App app, ChartState st, ChartSource src, ChartOptions o,
+                       int x, int y, int w, int h, string title) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        int axisFs = t.fontSizeSmall;
+
+        // One decimated column per horizontal pixel of the widget is an upper
+        // bound on the plot width, so the cache is independent of the gutter.
+        if (ChartBig.NeedsRebuild(st, src, w)) {
+            ChartBig.Build(st, src, w);
+            st.builtVersion = st.version;
+            st.builtW = w;
+            st.builtSeries = src.SeriesCount();
+        }
+
+        int plotTop = ChartBig.DrawHead(app, x, y, w, h, title, src);
+
+        // Clip the plot/axes to the chart box so decimated columns and axis
+        // labels stay inside the widget even with millions of points.
+        c.PushClip(x, y, w, h);
+
+        int leftGut = Canvas.MeasureText(Convert.ToString(st.axisHi), axisFs) + app.Scale(12);
+        int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
+        int plotX = x + pad + leftGut;
+        int plotY = plotTop;
+        int plotW = (x + w - pad) - plotX;
+        int plotH = (y + h - pad - botGut) - plotY;
+        if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+
+        int span = st.axisHi - st.axisLo;
+        if (span < 1) { span = 1; }
+
+        int ticks = 5;
+        int k = 0;
+        while (k <= ticks) {
+            int gy = plotY + plotH - (k * plotH / ticks);
+            c.FillRect(plotX, gy, plotW, 1, t.divider);
+            int val = st.axisLo + span * k / ticks;
+            string vs = Convert.ToString(val);
+            int vw = Canvas.MeasureText(vs, axisFs);
+            c.DrawText(plotX - app.Scale(6) - vw, gy - Canvas.FontHeight(axisFs) / 2, vs, t.textTertiary, axisFs);
+            k = k + 1;
+        }
+        c.FillRect(plotX, plotY, 1, plotH, t.borderSecondary);
+        c.FillRect(plotX, plotY + plotH, plotW, 1, t.borderSecondary);
+
+        int ns = src.SeriesCount();
+        if (st.cols < 1) { c.PopClip(); return; }
+        int baseY = plotY + plotH;
+        int g = 1000;
+        if (o.animate) { g = app.AnimIntro(5200000 + w, o.animMs); }
+
+        int s = 0;
+        while (s < ns) {
+            int color = src.SeriesColor(s);
+            if (color == 0) { color = Chart.Palette(t, s); }
+            List<int> mn = st.colMin[s];
+            List<int> mx = st.colMax[s];
+            int cn = mn.Count;
+            int fillTop = Chart.WithAlpha(color, 120);
+            int fillBot = Chart.WithAlpha(color, 12);
+
+            int cc = 0;
+            int prevX = plotX;
+            int prevY = baseY;
+            bool first = true;
+            while (cc < cn) {
+                int px = plotX + cc * plotW / cn;
+                int vTop = mx[cc] * g / 1000;
+                int vBot = mn[cc] * g / 1000;
+                int yTop = plotY + plotH - (vTop - st.axisLo) * plotH / span;
+                int yBot = plotY + plotH - (vBot - st.axisLo) * plotH / span;
+                if (o.area) {
+                    if (o.gradient) {
+                        c.FillVGrad(px, yTop, 1, baseY - yTop, fillTop, fillBot);
+                    } else {
+                        c.FillRect(px, yTop, 1, baseY - yTop, Chart.WithAlpha(color, 56));
+                    }
+                }
+                c.FillRect(px, yTop, 1, yBot - yTop + 1, color);
+                if (!first) { c.DrawLine(prevX, prevY, px, yTop, color, app.Scale(1)); }
+                prevX = px;
+                prevY = yTop;
+                first = false;
+                cc = cc + 1;
+            }
+            s = s + 1;
+        }
+
+        int total = 0;
+        int ci = 0;
+        while (ci < ns) { total = total + src.PointCount(ci); ci = ci + 1; }
+        string cap = Convert.ToString(total) + " pts";
+        int cw = Canvas.MeasureText(cap, axisFs);
+        c.DrawText(x + w - pad - cw, y + h - pad - Canvas.FontHeight(axisFs), cap, t.textTertiary, axisFs);
+        c.PopClip();
+    }
+}

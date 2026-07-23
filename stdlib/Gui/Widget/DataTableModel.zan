@@ -1,0 +1,582 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// A column descriptor for DataTable.
+/// cellType: 0 text, 1 link, 2 tag, 3 progress, 4 badge
+/// align:    0 left, 1 center, 2 right
+class DataColumn {
+    string title;
+    int width;
+    int cellType;
+    int align;
+    bool sortable;
+    bool filterable;
+    bool resizable;
+    int tagType;
+    bool numeric;
+    int summary;   // total-row aggregate: 0 none,1 sum,2 avg,3 min,4 max,5 count,6 derived
+
+    // ---- derived summary (summary==6): computed from OTHER columns' aggregate
+    // values, so it costs O(1) and never scans the rows.
+    // deriveOp: 0 percent (A*100/B), 1 ratio (A/B), 2 diff (A-B), 3 sum (A+B), 4 product (A*B)
+    // deriveA / deriveB: source column indices whose aggregate values feed the op
+    int deriveOp;
+    int deriveA;
+    int deriveB;
+
+    // ---- conditional formatting ----
+    int cfMode;    // 0 none,1 data bar,2 color scale,3 highlight >,4 highlight <
+    int cfColor;   // data-bar / low-end / highlight accent color
+    int cfColor2;  // color-scale high-end color
+    int cfThreshold; // highlight comparison value
+
+    // ---- display formatting (affects the rendered string only; sort/filter
+    // still see the raw cell value) ----
+    int fmt;       // 0 raw, 1 formatted (prefix + optionally grouped digits + suffix)
+    bool grouped;  // insert thousands separators into the integer part
+    string prefix; // leading text, e.g. a currency symbol
+    string suffix; // trailing text, e.g. "%"
+
+    // ---- editing ----
+    bool editable; // cell values can be edited inline (opt-in)
+
+    // ---- pinning / freeze ----
+    bool pinned;   // freeze this column to the left: hoisted ahead of the rest
+                   // and kept at its natural width when others compress to fit
+
+    static DataColumn Create(string title, int width) {
+        DataColumn col = new DataColumn();
+        col.title = title;
+        col.width = width;
+        col.cellType = 0;
+        col.align = 0;
+        col.sortable = true;
+        col.filterable = true;
+        col.resizable = true;
+        col.tagType = 1;
+        col.numeric = false;
+        col.summary = 0;
+        col.deriveOp = 0;
+        col.deriveA = 0;
+        col.deriveB = -1;
+        col.cfMode = 0;
+        col.cfColor = 0;
+        col.cfColor2 = 0;
+        col.cfThreshold = 0;
+        col.fmt = 0;
+        col.grouped = false;
+        col.prefix = "";
+        col.suffix = "";
+        col.editable = false;
+        col.pinned = false;
+        return col;
+    }
+
+    /// Opt a column in to inline editing (double/second-click a cell or press
+    /// F2/Enter). Numeric columns validate input on commit.
+    static DataColumn Editable(DataColumn c) {
+        c.editable = true; return c;
+    }
+
+    /// Freeze a column to the left edge: it is hoisted ahead of the unpinned
+    /// columns and keeps its natural width while the rest shrink to fit.
+    static DataColumn Pin(DataColumn c) {
+        c.pinned = true; return c;
+    }
+
+    // ---- display-format configurators (compose onto any column) ----
+    /// Currency: thousands-grouped digits with a leading symbol, right-aligned.
+    static DataColumn Money(DataColumn c, string symbol) {
+        c.fmt = 1; c.grouped = true; c.prefix = symbol; c.numeric = true; c.align = 2; return c;
+    }
+    /// Percent: appends "%", right-aligned.
+    static DataColumn Percent(DataColumn c) {
+        c.fmt = 1; c.suffix = "%"; c.numeric = true; c.align = 2; return c;
+    }
+    /// Thousands separators only (e.g. 1234567 -> 1,234,567).
+    static DataColumn Grouped(DataColumn c) {
+        c.fmt = 1; c.grouped = true; c.numeric = true; c.align = 2; return c;
+    }
+    /// Arbitrary prefix/suffix (either may be empty), e.g. units like " kg".
+    static DataColumn Affix(DataColumn c, string prefix, string suffix) {
+        c.fmt = 1; c.prefix = prefix; c.suffix = suffix; return c;
+    }
+
+    // ---- conditional-format configurators (static so they compose without
+    // relying on instance-method chaining) ----
+    static DataColumn DataBar(DataColumn c, int color) {
+        c.cfMode = 1; c.cfColor = color; return c;
+    }
+    static DataColumn ColorScale(DataColumn c, int lowColor, int highColor) {
+        c.cfMode = 2; c.cfColor = lowColor; c.cfColor2 = highColor; return c;
+    }
+    static DataColumn HighlightGreater(DataColumn c, int threshold, int color) {
+        c.cfMode = 3; c.cfThreshold = threshold; c.cfColor = color; return c;
+    }
+    static DataColumn HighlightLess(DataColumn c, int threshold, int color) {
+        c.cfMode = 4; c.cfThreshold = threshold; c.cfColor = color; return c;
+    }
+
+    /// Marks a column as fixed-width: users can't drag its right border and the
+    /// pointer shows a not-allowed cursor over the (would-be) resize grip.
+    static DataColumn NotResizable(DataColumn c) {
+        c.resizable = false; return c;
+    }
+
+    static DataColumn Text(string title, int width) {
+        return DataColumn.Create(title, width);
+    }
+
+    static DataColumn Numeric(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.numeric = true;
+        c.align = 2;
+        return c;
+    }
+
+    static DataColumn Link(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 1;
+        return c;
+    }
+
+    static DataColumn TagCol(string title, int width, int tagType) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 2;
+        c.tagType = tagType;
+        c.align = 1;
+        return c;
+    }
+
+    static DataColumn ProgressCol(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 3;
+        c.numeric = true;
+        return c;
+    }
+
+    static DataColumn BadgeCol(string title, int width) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.cellType = 4;
+        c.align = 1;
+        return c;
+    }
+
+    /// A numeric column whose summary is derived from other columns' aggregates
+    /// (no per-row scan). `op` is 0 percent / 1 ratio / 2 diff / 3 sum / 4 product;
+    /// `a` and `b` are the source column indices.
+    static DataColumn Derived(string title, int width, int op, int a, int b) {
+        DataColumn c = DataColumn.Create(title, width);
+        c.numeric = true;
+        c.align = 2;
+        c.summary = 6;
+        c.deriveOp = op;
+        c.deriveA = a;
+        c.deriveB = b;
+        return c;
+    }
+
+    // ---- footer-aggregate configurators (show a total row for this column) ----
+    static DataColumn Sum(DataColumn c) { c.summary = 1; return c; }
+    static DataColumn Avg(DataColumn c) { c.summary = 2; return c; }
+    static DataColumn Min(DataColumn c) { c.summary = 3; return c; }
+    static DataColumn Max(DataColumn c) { c.summary = 4; return c; }
+    static DataColumn Count(DataColumn c) { c.summary = 5; return c; }
+}
+
+/// One row of string cells. Build with Create() then Push() per column.
+class DataRow {
+    List<string> cells;
+
+    static DataRow Create() {
+        DataRow r = new DataRow();
+        r.cells = new List<string>();
+        return r;
+    }
+
+    void Push(string v) {
+        cells.Add(v);
+    }
+
+    string At(int i) {
+        if (i < 0) { return ""; }
+        if (i >= cells.Count) { return ""; }
+        return cells[i];
+    }
+
+    void Set(int i, string v) {
+        if (i < 0) { return; }
+        while (cells.Count <= i) { cells.Add(""); }
+        cells[i] = v;
+    }
+}
+
+/// Per-column filter with three cooperating stages (all optional):
+///  1. set filter   \u2014 values present in `hidden` are removed (Values tab);
+///  2. text filter  \u2014 `textMode` (1 contains / 2 equals / 3 starts / 4 ends)
+///     tested against `textQuery` (Text Filters tab);
+///  3. batch filter \u2014 each entry in `batchTerms` is matched (exact or
+///     substring per `batchExact`); `batchKeep` keeps matches, else excludes.
+class ColFilter {
+    List<string> hidden;
+    int textMode;
+    string textQuery;
+    List<string> batchTerms;
+    bool batchExact;
+    bool batchKeep;
+
+    static ColFilter Create() {
+        ColFilter f = new ColFilter();
+        f.hidden = new List<string>();
+        f.textMode = 1;
+        f.textQuery = "";
+        f.batchTerms = new List<string>();
+        f.batchExact = false;
+        f.batchKeep = true;
+        return f;
+    }
+
+    bool IsHidden(string v) {
+        return hidden.Contains(v);
+    }
+
+    void Toggle(string v) {
+        int idx = hidden.IndexOf(v);
+        if (idx >= 0) {
+            hidden.RemoveAt(idx);
+        } else {
+            hidden.Add(v);
+        }
+    }
+
+    bool Active() {
+        if (hidden.Count > 0) { return true; }
+        if (textQuery.Length > 0) { return true; }
+        if (batchTerms.Count > 0) { return true; }
+        return false;
+    }
+}
+
+/// One active sort key: the column index and its direction (1 asc, 2 desc).
+/// Replaces the old index-aligned sortCols/sortDirs parallel lists.
+class SortKey {
+    int col;
+    int dir;
+
+    SortKey(int c, int d) {
+        col = c;
+        dir = d;
+    }
+}
+
+/// One bar in the chart-from-selection overlay: its category label and value.
+/// Replaces the old index-aligned chartLabels/chartVals parallel lists.
+class ChartBar {
+    string label;
+    int val;
+
+    ChartBar(string l, int v) {
+        label = l;
+        val = v;
+    }
+}
+
+/// One entry in the flattened display model: `kind` 0 = data row, 1 = group
+/// header; `row` = data-row index (kind 0) or GroupRow index (kind 1); `no` =
+/// 1-based data ordinal for data rows, else 0. Replaces the old index-aligned
+/// dispKind/dispRow/dispNo parallel lists.
+class DispRow {
+    int kind;
+    int row;
+    int no;
+
+    DispRow(int k, int r, int n) {
+        kind = k;
+        row = r;
+        no = n;
+    }
+}
+
+/// One group-header row in a grouped table: caption, nesting level, contained
+/// data-row count, full path key (collapse lookup) and collapsed snapshot.
+/// Replaces the old index-aligned grpLabel/grpLevel/grpCount/grpKey/grpCollapsed
+/// parallel lists.
+class GroupRow {
+    string label;
+    int level;
+    int count;
+    string key;
+    bool collapsed;
+
+    GroupRow(string lb, int lv, int cnt, string k, bool coll) {
+        label = lb;
+        level = lv;
+        count = cnt;
+        key = k;
+        collapsed = coll;
+    }
+}
+
+/// Persisted DataTable state — create once (outside the frame loop) and pass in
+/// every frame so selection / sort / filter / scroll survive across repaints.
+class DataTableState {
+    bool inited;
+    int sortCol;
+    int sortDir;
+    // Multi-column sort keys (outer→inner priority). sortCol/sortDir mirror the
+    // primary (index 0) key for back-compat; an empty list means "unsorted".
+    List<SortKey> sortKeys;
+    List<bool> selected;
+    List<int> colWidths;
+    List<int> dispW;
+    List<int> order;
+    List<ColFilter> filters;
+    int openMenu;
+    int scrollRow;
+    int scrollX;               // horizontal pixel offset into the data columns
+    int resizeCol;
+    int resizeStartX;
+    int resizeStartW;
+    bool dirty;
+
+    int filterTab;
+    string searchText;
+    int valScroll;
+    int editFocus;
+    List<string> batchLines;
+    int batchExactFlag;
+    List<string> menuVals;
+    List<string> menuMatched;
+    string menuSearchCache;
+
+    bool showRowNum;
+    bool showSelect;
+    bool striped;
+
+    // ---- summary (total) row ----
+    bool showSummary;
+    List<int> aggMode;         // per column: 0 none,1 sum,2 avg,3 min,4 max,5 count,6 derived
+    List<int> aggValue;        // cached raw aggregate value per column (feeds derived columns)
+    List<string> summaryText;  // cached formatted aggregate per column
+
+    // ---- conditional formatting: per-column min/max over the filtered set,
+    // cached so data-bar / color-scale cells normalise without a per-frame scan ----
+    List<int> cfMin;
+    List<int> cfMax;
+
+    // ---- pagination ----
+    bool paged;
+    SignalInt pageModel;       // 1-based current page, bound to the Pagination widget
+    int pageRows;              // rows per page (auto-fit), recomputed each frame
+
+    // ---- selection & interaction ----
+    int selAnchor;             // order-index anchor for shift range row-select (-1 none)
+    int rangeR0;               // cell-range start row (order-index, -1 = no range)
+    int rangeC0;               // cell-range start column
+    int rangeR1;               // cell-range end row (order-index)
+    int rangeC1;               // cell-range end column
+    bool rangeDrag;            // currently drag-selecting a cell range
+    int dragRow;               // order-index position of row being drag-reordered (-1 none)
+    int dragStartY;            // pointer Y where a row press began
+    bool dragMoved;            // pointer moved enough to become a reorder drag
+    bool ctxOpen;              // right-click context menu open
+    int ctxX;                  // context-menu anchor X
+    int ctxY;                  // context-menu anchor Y
+    List<bool> colHidden;      // per-column visibility (true = hidden from view)
+    List<bool> colPinned;      // per-column freeze-left flag (true = frozen)
+    List<int> colOrder;        // user column order (master sequence of column indices)
+    int dragCol;               // column index being header-drag-reordered (-1 none)
+    int dragColStartX;         // pointer X where the header press began
+    bool dragColMoved;         // pointer moved enough to become a reorder drag
+    int dropVis;               // visual insertion slot during a column drag (-1 none)
+    bool hdrCtxOpen;           // header right-click context menu open
+    int hdrCtxCol;             // column the header context menu targets
+    int hdrCtxX;               // header context-menu anchor X
+    int hdrCtxY;               // header context-menu anchor Y
+    string toast;              // transient status message (copy/export feedback)
+    int toastFrames;           // frames remaining to show the toast
+
+    // ---- chart-from-selection overlay ----
+    bool chartOpen;            // bar-chart overlay drawn on top of the grid
+    string chartTitle;         // chart caption (value column name)
+    List<ChartBar> chartBars;  // per-bar {category label, value}
+    int chartMax;              // largest bar value (>=1), for scaling
+
+    // ---- row grouping (ag-Grid / DevExpress style) ----
+    List<int> groupCols;       // grouped columns, outer→inner (empty = flat table)
+    List<string> collapsedKeys;// group path keys whose rows are collapsed away
+    List<DispRow> dispRows;     // flattened display model (see DispRow)
+    List<GroupRow> groups;     // group-header rows (see GroupRow)
+
+    // ---- semantic event surface (sender = this state; handlers pull context
+    // via HitRow()/HitCol()/SortColIndex()/... per the parameterless model) ----
+    UiEvent HeaderClick;       // a sortable/filterable header title was clicked
+    UiEvent Sort;              // sort column/direction changed (read SortColIndex/SortDirection)
+    UiEvent RowClick;          // a row was clicked (read HitRow/HitOrderIndex)
+    UiEvent RowDoubleClick;    // a row was double-clicked
+    UiEvent CellClick;         // a data cell was clicked (read HitRow/HitCol)
+    UiEvent CellEdit;          // an in-cell edit committed (read EditRow/EditCol/EditValue)
+    UiEvent SelectionChanged;  // the selected-row set changed
+    UiEvent ColumnResize;      // a column width changed by dragging (read HitCol)
+    UiEvent ScrollChanged;     // the virtual row window scrolled (read ScrollTop)
+    UiEvent GroupChanged;      // grouping columns changed (read GroupCount)
+    UiEvent ColumnReorder;     // a column was drag-reordered (read HitCol)
+    int hitRow;                // data-row index of the last row/cell interaction
+    int hitOrder;              // order-position (post sort/filter) of that row
+    int hitCol;                // column index of the last header/cell interaction
+    int editRow;               // data-row index being edited (CellEdit)
+    int editCol;               // column index being edited (CellEdit)
+    string editVal;            // committed value (CellEdit)
+    bool editing;              // an inline editor is currently open
+    string editBuf;            // working text inside the open editor
+    int editCur;               // caret position (chars) in editBuf
+
+    static DataTableState Create() {
+        DataTableState s = new DataTableState();
+        s.inited = false;
+        s.sortCol = -1;
+        s.sortDir = 1;
+        s.sortKeys = new List<SortKey>();
+        s.selected = new List<bool>();
+        s.colWidths = new List<int>();
+        s.dispW = new List<int>();
+        s.order = new List<int>();
+        s.filters = new List<ColFilter>();
+        s.openMenu = -1;
+        s.scrollRow = 0;
+        s.scrollX = 0;
+        s.resizeCol = -1;
+        s.resizeStartX = 0;
+        s.resizeStartW = 0;
+        s.dirty = true;
+        s.filterTab = 0;
+        s.searchText = "";
+        s.valScroll = 0;
+        s.editFocus = 0;
+        s.batchLines = new List<string>();
+        s.batchLines.Add("");
+        s.batchExactFlag = 0;
+        s.menuVals = new List<string>();
+        s.menuMatched = new List<string>();
+        s.menuSearchCache = "";
+        s.showRowNum = true;
+        s.showSelect = true;
+        s.striped = true;
+        s.showSummary = false;
+        s.aggMode = new List<int>();
+        s.aggValue = new List<int>();
+        s.summaryText = new List<string>();
+        s.cfMin = new List<int>();
+        s.cfMax = new List<int>();
+        s.paged = false;
+        s.pageModel = SignalInt.Create(1);
+        s.pageRows = 0;
+        s.selAnchor = -1;
+        s.rangeR0 = -1;
+        s.rangeC0 = -1;
+        s.rangeR1 = -1;
+        s.rangeC1 = -1;
+        s.rangeDrag = false;
+        s.dragRow = -1;
+        s.dragStartY = 0;
+        s.dragMoved = false;
+        s.ctxOpen = false;
+        s.ctxX = 0;
+        s.ctxY = 0;
+        s.colHidden = new List<bool>();
+        s.colPinned = new List<bool>();
+        s.colOrder = new List<int>();
+        s.dragCol = -1;
+        s.dragColStartX = 0;
+        s.dragColMoved = false;
+        s.dropVis = -1;
+        s.hdrCtxOpen = false;
+        s.hdrCtxCol = -1;
+        s.hdrCtxX = 0;
+        s.hdrCtxY = 0;
+        s.toast = "";
+        s.toastFrames = 0;
+        s.chartOpen = false;
+        s.chartTitle = "";
+        s.chartBars = new List<ChartBar>();
+        s.chartMax = 1;
+        s.HeaderClick = UiEvent.Create();
+        s.Sort = UiEvent.Create();
+        s.RowClick = UiEvent.Create();
+        s.RowDoubleClick = UiEvent.Create();
+        s.CellClick = UiEvent.Create();
+        s.CellEdit = UiEvent.Create();
+        s.SelectionChanged = UiEvent.Create();
+        s.ColumnResize = UiEvent.Create();
+        s.ScrollChanged = UiEvent.Create();
+        s.GroupChanged = UiEvent.Create();
+        s.ColumnReorder = UiEvent.Create();
+        s.groupCols = new List<int>();
+        s.collapsedKeys = new List<string>();
+        s.dispRows = new List<DispRow>();
+        s.groups = new List<GroupRow>();
+        s.hitRow = -1;
+        s.hitOrder = -1;
+        s.hitCol = -1;
+        s.editRow = -1;
+        s.editCol = -1;
+        s.editVal = "";
+        s.editing = false;
+        s.editBuf = "";
+        s.editCur = 0;
+        return s;
+    }
+
+    // ---- event context accessors (option A: handlers read the sender) ----
+    int HitRow() { return hitRow; }
+    int HitOrderIndex() { return hitOrder; }
+    int HitCol() { return hitCol; }
+    int SortColIndex() { return sortCol; }
+    int SortDirection() { return sortDir; }
+    int ScrollTop() { return scrollRow; }
+    int EditRow() { return editRow; }
+    int EditCol() { return editCol; }
+    string EditValue() { return editVal; }
+}
+
+/// Virtual data source for DataTable (DevExpress-style ValueNeeded).
+///
+/// The grid never stores rows itself — it pulls cells on demand for the visible
+/// window, and reads a typed key (`CellNum`) for sorting / aggregation without
+/// re-parsing strings. Subclass this and back it with columnar storage (one
+/// array per column) to hold millions of rows in a fraction of the memory a
+/// `List<DataRow>` of string cells would cost, and to sort / total without
+/// per-cell string parsing.
+class DataSource {
+    /// Number of source rows.
+    virtual int RowCount() { return 0; }
+    /// Display text for a cell (row = source index, col = column index).
+    virtual string CellText(int row, int col) { return ""; }
+    /// Numeric key for a cell, used for sorting/aggregating numeric columns.
+    /// Return 0 for non-numeric columns.
+    virtual int CellNum(int row, int col) { return 0; }
+
+    /// Write a cell value back into the underlying data (inline editing).
+    /// Read-only sources ignore the write.
+    virtual void SetCell(int row, int col, string v) { }
+}
+
+/// Backward-compatible adapter: serves an in-memory `List<DataRow>` of string
+/// cells through the DataSource interface, so existing `DataTable.Render(...,
+/// rows, ...)` calls keep working unchanged.
+class RowListSource : DataSource {
+    List<DataRow> rows;
+
+    static RowListSource Create(List<DataRow> rows) {
+        RowListSource s = new RowListSource();
+        s.rows = rows;
+        return s;
+    }
+
+    override int RowCount() { return this.rows.Count; }
+    override string CellText(int row, int col) { return this.rows[row].At(col); }
+    override int CellNum(int row, int col) { return DataTable.ParseInt(this.rows[row].At(col)); }
+    override void SetCell(int row, int col, string v) { this.rows[row].Set(col, v); }
+}

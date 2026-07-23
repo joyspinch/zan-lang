@@ -1,0 +1,1238 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+/// CodeEditor part: syntax highlighting (cached per-line tokenisation)
+/// and the main render path (gutter, text, carets, popups, minimap).
+partial class CodeEditor {
+    // ---- syntax highlighting ----
+
+    /// True when the one-character string `ch` occurs in `set`.
+    static bool InSet(string chars, string ch) {
+        int i = 0;
+        while (i < chars.Length) {
+            if (chars.Substring(i, 1) == ch) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `hay` contains the substring `needle`.
+    static bool ContainsSub(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        if (m == 0) { return true; }
+        int i = 0;
+        while (i + m <= n) {
+            int k = 0;
+            while (k < m && hay[i + k] == needle[k]) { k = k + 1; }
+            if (k == m) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when `w` is a Zan/C#-style language keyword.
+    static bool IsKeyword(string w) {
+        string kws = " using namespace class struct enum interface static void int string bool float double char long short byte uint new return if else while for foreach do in break continue true false null this base public private protected internal override virtual abstract sealed const readonly var switch case default try catch finally throw is as typeof sizeof ref out params get set operator async await yield from where select orderby group join let into ascending descending on equals when and or not with record init required global file scoped allows value partial event delegate fixed lock checked unchecked unsafe stackalloc nameof ";
+        return CodeEditor.ContainsSub(kws, " " + w + " ");
+    }
+
+    /// Cheap signature of the active syntax palette; when it changes the whole
+    /// highlight cache is dropped so colours follow a theme/override switch.
+    int HlThemeSig(Theme t) {
+        int s = t.textPrimary;
+        s = s ^ synKw ^ synTy ^ synStr ^ synCom ^ synNum ^ synText;
+        if (CodeEditor.IsLightBg(t)) { s = s ^ 0x5A5A5A5A; }
+        return s;
+    }
+
+    /// Returns the cached highlight for line `ln`, re-tokenising only when the
+    /// line's text (or the palette) changed. On a steady frame every visible
+    /// line hits the cache, so scrolling does no tokenising or allocation.
+    CeHlLine GetHl(int ln, string text, Theme t) {
+        int sig = HlThemeSig(t);
+        if (sig != hlThemeSig) {
+            hlCache = new List<CeHlLine>();
+            hlThemeSig = sig;
+        }
+        while (hlCache.Count <= ln) { hlCache.Add(null); }
+        CeHlLine cur = hlCache[ln];
+        if (cur != null && cur.src == text) { return cur; }
+        CeHlLine ne = new CeHlLine();
+        ne.src = text;
+        ne.toks = new List<string>();
+        ne.cols = new List<int>();
+        Highlight(text, t, ne.toks, ne.cols);
+        hlCache[ln] = ne;
+        return ne;
+    }
+
+    /// Splits `line` into colored segments (parallel outT/outC lists): keywords,
+    /// types (Capitalized identifiers), strings, line comments and numbers get
+    /// distinct colors; everything else uses the default text color.
+    void Highlight(string line, Theme t, List<string> outT, List<int> outC) {
+        // Defaults follow the active skin: a light background gets a
+        // light-friendly palette, a dark one keeps the classic dark palette.
+        EditorPalette pal = EditorPalette.For(t);
+        int kwC = pal.keyword;
+        int tyC = pal.type;
+        int strC = pal.str;
+        int comC = pal.comment;
+        int numC = pal.number;
+        int def = t.textPrimary;
+        if (synKw != 0) { kwC = synKw; }
+        if (synTy != 0) { tyC = synTy; }
+        if (synStr != 0) { strC = synStr; }
+        if (synCom != 0) { comC = synCom; }
+        if (synNum != 0) { numC = synNum; }
+        if (synText != 0) { def = synText; }
+        CodeEditor.HighlightSpans(line, kwC, tyC, strC, comC, numC, def, outT, outC);
+    }
+
+    /// Static tokenizer used by both the editor and read-only code views (e.g.
+    /// the component gallery). Splits `line` into colored segments (parallel
+    /// outT/outC lists) using the given palette.
+    static void HighlightSpans(string line, int kwC, int tyC, int strC,
+            int comC, int numC, int def, List<string> outT, List<int> outC) {
+        // Classify by raw byte code (line[i]) and emit each token with a single
+        // Substring, instead of allocating a one-char string per byte and
+        // scanning character sets. ASCII identifiers/keywords/numbers/strings
+        // are recognised by byte range; any byte >= 128 (UTF-8 multibyte text)
+        // falls into the default run exactly as before.
+        int n = line.Length;
+        int i = 0;
+        int pstart = -1;   // start of the current default-colored run, -1 = none
+        while (i < n) {
+            int b = line[i];
+            if (b == 47 && i + 1 < n && line[i + 1] == 47) {          // "//" comment
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                outT.Add(line.Substring(i, n - i)); outC.Add(comC);
+                i = n;
+            } else if (b == 34) {                                      // string literal
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                int j = i + 1;
+                while (j < n) {
+                    int cj = line[j];
+                    if (cj == 92 && j + 1 < n) { j = j + 2; }
+                    else if (cj == 34) { j = j + 1; break; }
+                    else { j = j + 1; }
+                }
+                outT.Add(line.Substring(i, j - i)); outC.Add(strC);
+                i = j;
+            } else if (b >= 48 && b <= 57) {                          // number
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                int j = i;
+                while (j < n) {
+                    int cj = line[j];
+                    bool hex = (cj >= 97 && cj <= 102) || (cj >= 65 && cj <= 70);
+                    if ((cj >= 48 && cj <= 57) || cj == 46 || cj == 120 || hex) { j = j + 1; }
+                    else { break; }
+                }
+                outT.Add(line.Substring(i, j - i)); outC.Add(numC);
+                i = j;
+            } else if ((b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95) { // identifier
+                if (pstart >= 0) { outT.Add(line.Substring(pstart, i - pstart)); outC.Add(def); pstart = -1; }
+                int j = i;
+                while (j < n) {
+                    int cj = line[j];
+                    if ((cj >= 97 && cj <= 122) || (cj >= 65 && cj <= 90)
+                        || (cj >= 48 && cj <= 57) || cj == 95) { j = j + 1; }
+                    else { break; }
+                }
+                string w = line.Substring(i, j - i);
+                int col = def;
+                if (CodeEditor.IsKeyword(w)) { col = kwC; }
+                else if (b >= 65 && b <= 90) { col = tyC; }
+                outT.Add(w); outC.Add(col);
+                i = j;
+            } else {
+                if (pstart < 0) { pstart = i; }
+                i = i + 1;
+            }
+        }
+        if (pstart >= 0) { outT.Add(line.Substring(pstart, n - pstart)); outC.Add(def); }
+    }
+
+    /// A background is "light" when its RGB channels are collectively bright;
+    /// used to pick skin-appropriate default syntax / selection colors.
+    static bool IsLightBg(Theme t) {
+        int rgb = t.bgPrimary % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+        int r = rgb / 65536;
+        int g = (rgb / 256) % 256;
+        int b = rgb % 256;
+        return r + g + b > 384;
+    }
+
+    /// Selection highlight tint, chosen to read on the active skin.
+    static int SelColor(Theme t) {
+        return EditorPalette.For(t).selection;
+    }
+
+    static void DrawSelHighlight(Canvas c, App app,
+            int aL, int aC, int cL, int cC,
+            int ln, string text, int textX, int rowY, int lineH, int fontSize, Rect area) {
+        int sL = aL; int sC = aC; int eL = cL; int eC = cC;
+        if (sL > eL || (sL == eL && sC > eC)) {
+            int tL = sL; sL = eL; eL = tL;
+            int tC = sC; sC = eC; eC = tC;
+        }
+        if (ln < sL || ln > eL) { return; }
+        int startC = 0;
+        int endC = text.Length;
+        if (ln == sL) { startC = sC; }
+        if (ln == eL) { endC = eC; }
+        if (startC > text.Length) { startC = text.Length; }
+        if (endC > text.Length) { endC = text.Length; }
+        if (startC >= endC && ln != sL && ln != eL) {
+            startC = 0; endC = text.Length;
+        }
+        if (startC >= endC) { return; }
+        int xStart = textX + Canvas.MeasureText(Text.Left(text, startC), fontSize);
+        int xEnd = textX + Canvas.MeasureText(Text.Left(text, endC), fontSize);
+        c.FillRect(xStart, rowY, xEnd - xStart, lineH, CodeEditor.SelColor(app.theme));
+    }
+
+    static string DiagMsg(List<Diagnostic> ds, int line) {
+        int i = 0;
+        while (i < ds.Count) {
+            if (ds[i].line == line) {
+                return ds[i].msg;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// True when any diagnostic sits on `line`.
+    static bool DiagHas(List<Diagnostic> ds, int line) {
+        int i = 0;
+        while (i < ds.Count) {
+            if (ds[i].line == line) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// True when any quick-fix targets `line`.
+    static bool QuickFixHas(List<QuickFix> qs, int line) {
+        int i = 0;
+        while (i < qs.Count) {
+            if (qs[i].line == line) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    int Render(App app, Rect area) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        EditorPalette pal = EditorPalette.For(t);
+        int id = app.focus.AllocId();
+        lastId = id;
+        bool focused = app.focus.IsFocused(id);
+        // Claim Tab while focused so the App does not step keyboard focus away;
+        // the editor uses Tab/Shift+Tab for indentation instead.
+        if (focused) { app.tabHoldId = id; }
+
+        int fontSize = FontSize(t);
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+        int gutterW = app.Scale(48);
+
+        c.FillRect(area.x, area.y, area.width, area.height, t.bgPrimary);
+        c.FillRect(area.x, area.y, gutterW, area.height, t.bgSecondary);
+        c.FillRect(area.x + gutterW, area.y, 1, area.height, t.divider);
+
+        bool ownsWheel = app.CaptureWheel(
+            area.x, area.y, area.width, area.height);
+
+        int visLines = area.height / lineH;
+        if (visLines < 1) { visLines = 1; }
+        pageRows = visLines;
+
+        if (focused) { HandleInput(app); }
+        // Re-validate diagnostics when the caret moves to a different line: the
+        // line just left is now complete and checkable, while the active line is
+        // deliberately skipped by CheckErrors. This also avoids a full-document
+        // rescan on every keystroke within a line.
+        // Skip the full-document diagnostics pass while a selection drag is in
+        // progress; running it on every line the pointer crosses makes multi-line
+        // selection stutter. It runs once the drag settles (caret line changes
+        // while not selecting).
+        if (curLine != lastDiagLine && !mouseSelecting) {
+            CheckErrors();
+            lastDiagLine = curLine;
+        }
+
+        if (ownsWheel) {
+            int delta = app.window.EventKeyCode();
+            int step = delta / 120;
+            if (step == 0) {
+                if (delta > 0) { step = 1; }
+                else if (delta < 0) { step = 0 - 1; }
+            }
+            scrollLine = scrollLine - step * 3;
+            app.RequestRedraw();
+        }
+
+        // Keep the caret in view only when it actually moved this frame; plain
+        // wheel/scrollbar scrolling leaves the caret line unchanged and must not
+        // snap the view back to it.
+        if (curLine != ensuredCaretLine) {
+            if (curLine < scrollLine) { scrollLine = curLine; }
+            if (curLine >= scrollLine + visLines) { scrollLine = curLine - visLines + 1; }
+            ensuredCaretLine = curLine;
+        }
+        int maxScroll = lines.Count - visLines;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (scrollLine > maxScroll) { scrollLine = maxScroll; }
+        if (scrollLine < 0) { scrollLine = 0; }
+
+        int textX = area.x + gutterW + t.paddingSmall;
+        codeLens = new List<CodeLensRef>();
+        // Clip all line rendering to the editor box so long code lines, wide
+        // gutters, selection highlights and inline error tips can never paint
+        // outside the editor's own rectangle into a neighbouring pane.
+        c.PushClip(area.x, area.y, area.width, area.height);
+        int i = 0;
+        while (i < visLines) {
+            int ln = scrollLine + i;
+            if (ln < lines.Count) {
+                int rowY = area.y + i * lineH;
+                int textY = rowY + (lineH - Canvas.FontHeight(fontSize)) / 2;
+
+                if (ln == execLine) {
+                    c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1, lineH, pal.warnLineBg);
+                } else if (ln == curLine && focused) {
+                    c.FillRect(area.x + gutterW + 1, rowY, area.width - gutterW - 1, lineH, t.bgHover);
+                }
+
+                if (HasBreakpoint(ln)) {
+                    int dotSz = app.Scale(10);
+                    int dotX = area.x + app.Scale(6);
+                    int dotY = rowY + (lineH - dotSz) / 2;
+                    c.FillRoundRect(dotX, dotY, dotSz, dotSz, dotSz, t.error);
+                }
+                if (ln == execLine) {
+                    int aw = app.Scale(10);
+                    int ax = area.x + app.Scale(6);
+                    int ay = rowY + (lineH - aw) / 2;
+                    c.FillRoundRect(ax, ay, aw, aw, app.Scale(2), pal.warn);
+                }
+
+                string num = Convert.ToString(ln + 1);
+                int numW = Canvas.MeasureText(num, fontSize);
+                c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num, t.textTertiary, fontSize);
+
+                string text = lines[ln];
+
+                // Selection highlight
+                if (selActive) {
+                    CodeEditor.DrawSelHighlight(c, app, selAnchorLine, selAnchorCol,
+                        curLine, curCol, ln, text, textX, rowY, lineH, fontSize, area);
+                }
+
+                // Error indicator (red underline). Real compiler errors take
+                // priority and are drawn a touch bolder than the heuristic ones.
+                if (HasCompilerErr(ln)) {
+                    c.FillRect(textX, rowY + lineH - app.Scale(2),
+                        Canvas.MeasureText(text, fontSize), app.Scale(2), pal.error);
+                } else if (CodeEditor.DiagHas(errors, ln)) {
+                    c.FillRect(textX, rowY + lineH - app.Scale(2),
+                        Canvas.MeasureText(text, fontSize), app.Scale(2), pal.errorDim);
+                }
+
+                CeHlLine hl = GetHl(ln, text, t);
+                List<string> segT = hl.toks;
+                List<int> segC = hl.cols;
+                int sx = textX;
+                int si2 = 0;
+                while (si2 < segT.Count) {
+                    c.DrawText(sx, textY, segT[si2], segC[si2], fontSize);
+                    sx = sx + Canvas.MeasureText(segT[si2], fontSize);
+                    si2 = si2 + 1;
+                }
+
+                if (ln == curLine && focused) {
+                    string upto = Text.Left(text, curCol);
+                    int cxp = textX + Canvas.MeasureText(upto, fontSize);
+                    c.FillRect(cxp, rowY + app.Scale(2), 1, lineH - app.Scale(4), t.primary);
+                }
+
+                // CodeLens: reference count for a method declaration on this line.
+                string decl = CodeEditor.DeclNameAt(text);
+                if (decl.Length > 0) {
+                    int refs = CountWord(decl) - 1;
+                    if (refs < 0) { refs = 0; }
+                    string clLabel = Convert.ToString(refs) + " references";
+                    if (refs == 1) { clLabel = "1 reference"; }
+                    int clx = sx + app.Scale(24);
+                    int clw = Canvas.MeasureText(clLabel, t.fontSizeSmall);
+                    if (clx + clw < area.x + area.width) {
+                        c.DrawText(clx, textY, clLabel, pal.changeLabel, t.fontSizeSmall);
+                        codeLens.Add(new CodeLensRef(ln, decl, clx, rowY, clw));
+                    }
+                }
+
+                // Secondary carets (multi-cursor) on this line.
+                if (focused && carets.Count > 0) {
+                    int mci = 0;
+                    while (mci < carets.Count) {
+                        if (carets[mci].line == ln) {
+                            int mcc = carets[mci].col;
+                            if (mcc > text.Length) { mcc = text.Length; }
+                            int mcx = textX + Canvas.MeasureText(Text.Left(text, mcc), fontSize);
+                            c.FillRect(mcx, rowY + app.Scale(2), 1, lineH - app.Scale(4), pal.caretSecondary);
+                        }
+                        mci = mci + 1;
+                    }
+                }
+
+                // Show the error reason for the caret line. Compiler diagnostics
+                // win over the heuristic guess when both are present.
+                if ((HasCompilerErr(ln) || CodeEditor.DiagHas(errors, ln)) && ln == curLine) {
+                    string errMsg = CompilerErrMsg(ln);
+                    if (errMsg.Length == 0) { errMsg = CodeEditor.DiagMsg(errors, ln); }
+                    if (errMsg.Length > 0) {
+                        int ttW = Canvas.MeasureText(errMsg, fontSize) + app.Scale(12);
+                        int ttH = lineH;
+                        int ttX = textX;
+                        int ttY = rowY - ttH - app.Scale(2);
+                        if (ttY < area.y) { ttY = rowY + lineH; }
+                        c.FillRoundRect(ttX, ttY, ttW, ttH, app.Scale(3), pal.errTipBg);
+                        c.DrawRoundRect(ttX, ttY, ttW, ttH, app.Scale(3), pal.error, 1);
+                        c.DrawText(ttX + app.Scale(6), ttY + app.Scale(3), errMsg, pal.errTipText, fontSize);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+
+        // ---- right-edge diagnostics / scroll strip (VS-style overview ruler) ----
+        // Shows a viewport thumb plus a red tick for every diagnostic line so the
+        // user can jump straight to problem areas; clicking the strip scrolls there.
+        {
+            int stripW = app.Scale(14);
+            int stripX = area.x + area.width - stripW;
+            c.FillRect(stripX, area.y, stripW, area.height, pal.minimapBg);
+            c.FillRect(stripX, area.y, app.Scale(1), area.height, pal.border);
+            int total = lines.Count;
+            if (total < 1) { total = 1; }
+            int thumbY = area.y + scrollLine * area.height / total;
+            int thumbH = visLines * area.height / total;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            if (thumbY + thumbH > area.y + area.height) { thumbY = area.y + area.height - thumbH; }
+            if (thumbY < area.y) { thumbY = area.y; }
+            c.FillRoundRect(stripX + app.Scale(3), thumbY, stripW - app.Scale(6), thumbH, app.Scale(3), pal.minimapThumb);
+            int mi = 0;
+            while (mi < errors.Count) {
+                int el = errors[mi].line;
+                if (el >= 0 && el < lines.Count) {
+                    int my = area.y + el * area.height / total;
+                    c.FillRect(stripX + app.Scale(2), my, stripW - app.Scale(4), app.Scale(3), pal.error);
+                }
+                mi = mi + 1;
+            }
+            if (!CompilerDiagStale()) {
+                int ci2 = 0;
+                while (ci2 < compErrors.Count) {
+                    int el2 = compErrors[ci2].line;
+                    if (el2 >= 0 && el2 < lines.Count) {
+                        int my2 = area.y + el2 * area.height / total;
+                        c.FillRect(stripX + app.Scale(2), my2, stripW - app.Scale(4), app.Scale(3), pal.error);
+                    }
+                    ci2 = ci2 + 1;
+                }
+            }
+        }
+
+        // ---- autocomplete popup (drawn below the cursor, with icons) ----
+        if (acActive && focused && acAllItems.Count > 0
+            && curLine >= scrollLine && curLine < scrollLine + visLines) {
+            int prow = curLine - scrollLine;
+            int pRowY = area.y + prow * lineH;
+            int px = textX + Canvas.MeasureText(Text.Left(lines[curLine], acStart), fontSize);
+            int maxShow = 10;
+            int shown = acItems.Count;
+            if (shown > maxShow) { shown = maxShow; }
+            int itemH2 = lineH + app.Scale(2);
+            int popH2 = shown * itemH2 + app.Scale(4);
+            if (shown == 0) { popH2 = itemH2 + app.Scale(4); }
+            int iconW = app.Scale(22);
+            int popW2 = app.Scale(220);
+            int k = 0;
+            while (k < acItems.Count) {
+                int wpx = Canvas.MeasureText(acItems[k], fontSize) + iconW + app.Scale(16);
+                if (wpx > popW2) { popW2 = wpx; }
+                k = k + 1;
+            }
+            if (popW2 > app.Scale(400)) { popW2 = app.Scale(400); }
+            int popY2 = pRowY + lineH;
+            // Ensure popup stays within the visible area
+            if (popY2 + popH2 > area.y + area.height) { popY2 = pRowY - popH2; }
+            if (px + popW2 > area.x + area.width) { px = area.x + area.width - popW2 - 4; }
+            int first2 = 0;
+            if (acSel >= maxShow) { first2 = acSel - maxShow + 1; }
+            // Save popup geometry for click detection
+            popX = px; popY = popY2; popW = popW2; popH = popH2;
+            popItemH = itemH2; popFirst = first2; popShown = shown;
+            // Draw shadow
+            c.FillRoundRect(px + 2, popY2 + 2, popW2, popH2, app.Scale(4), pal.shadowSoft);
+            // Draw popup background
+            c.FillRoundRect(px, popY2, popW2, popH2, app.Scale(4), pal.popupBg);
+            c.DrawRoundRect(px, popY2, popW2, popH2, app.Scale(4), pal.border, 1);
+            int r2 = 0;
+            while (r2 < shown) {
+                int idx = first2 + r2;
+                if (idx < acItems.Count) {
+                    int iy = popY2 + app.Scale(2) + r2 * itemH2;
+                    int tcol = pal.menuText;
+                    if (idx == acSel) {
+                        c.FillRect(px + 2, iy, popW2 - 4, itemH2, pal.selBg);
+                        tcol = pal.textSel;
+                    }
+                    int ity = iy + (itemH2 - Canvas.FontHeight(fontSize)) / 2;
+                    // Draw kind icon/indicator
+                    string kind2 = "";
+                    if (idx < acKinds.Count) { kind2 = acKinds[idx]; }
+                    int iconColor = pal.accent;
+                    string iconLetter = "?";
+                    if (kind2 == "M") { iconColor = pal.iconMethod; iconLetter = "M"; }
+                    else if (kind2 == "P") { iconColor = pal.accent; iconLetter = "P"; }
+                    else if (kind2 == "T") { iconColor = pal.iconType; iconLetter = "T"; }
+                    else if (kind2 == "K") { iconColor = pal.accent; iconLetter = "K"; }
+                    else if (kind2 == "S") { iconColor = pal.iconSnippet; iconLetter = "S"; }
+                    else if (kind2 == "F") { iconColor = pal.signature; iconLetter = "F"; }
+                    else if (kind2 == "E") { iconColor = pal.iconEnum; iconLetter = "E"; }
+                    else { iconColor = pal.iconDefault; iconLetter = "W"; }
+                    c.FillRoundRect(px + app.Scale(3), ity, app.Scale(16), app.Scale(16), app.Scale(3), iconColor);
+                    c.DrawText(px + app.Scale(6), ity + app.Scale(1), iconLetter, pal.iconGlyph, t.fontSizeSmall);
+                    c.DrawText(px + iconW, ity, acItems[idx], tcol, fontSize);
+                }
+                r2 = r2 + 1;
+            }
+            // Scrollbar hint if there are more items
+            if (acItems.Count > maxShow) {
+                int sbH = popH2 * shown / acItems.Count;
+                if (sbH < app.Scale(10)) { sbH = app.Scale(10); }
+                int sbY = popY2 + (popH2 - sbH) * first2 / (acItems.Count - shown);
+                c.FillRoundRect(px + popW2 - app.Scale(6), sbY, app.Scale(4), sbH, app.Scale(2), pal.scrollThumb);
+            }
+
+            // Placeholder text when the active filter hides every item.
+            if (acItems.Count == 0) {
+                int hy = popY2 + (itemH2 - Canvas.FontHeight(fontSize)) / 2 + app.Scale(2);
+                c.DrawText(px + app.Scale(8), hy, "no " + CodeEditor.KindWord(acFilter) + " here", pal.muted, fontSize);
+            }
+
+            // ---- kind filter strip (click to show only one kind) ----
+            List<string> fkinds = new List<string>();
+            fkinds.Add(""); fkinds.Add("M"); fkinds.Add("P"); fkinds.Add("F");
+            fkinds.Add("E"); fkinds.Add("T"); fkinds.Add("K"); fkinds.Add("S");
+            int fbH = app.Scale(22);
+            int fbY = popY2 + popH2;
+            filtX = px; filtY = fbY; filtW = popW2; filtH = fbH;
+            c.FillRect(px, fbY, popW2, fbH, pal.panelBg);
+            c.DrawRect(px, fbY, popW2, fbH, pal.border, 1);
+            int isz = app.Scale(16);
+            int fgap = app.Scale(4);
+            int fbx = px + app.Scale(5);
+            int fiy = fbY + (fbH - isz) / 2;
+            int fki = 0;
+            while (fki < fkinds.Count) {
+                string fk = fkinds[fki];
+                bool present = fk == "" || HasKind(fk);
+                bool seld = acFilter == fk;
+                string flet = "*";
+                int fcol = pal.iconDefault;
+                if (fk == "M") { fcol = pal.iconMethod; flet = "M"; }
+                else if (fk == "P") { fcol = pal.accent; flet = "P"; }
+                else if (fk == "F") { fcol = pal.signature; flet = "F"; }
+                else if (fk == "E") { fcol = pal.iconEnum; flet = "E"; }
+                else if (fk == "T") { fcol = pal.iconType; flet = "T"; }
+                else if (fk == "K") { fcol = pal.accent; flet = "K"; }
+                else if (fk == "S") { fcol = pal.iconSnippet; flet = "S"; }
+                if (!present) { fcol = pal.iconDisabled; }
+                if (seld) {
+                    c.FillRoundRect(fbx - app.Scale(2), fiy - app.Scale(2), isz + app.Scale(4), isz + app.Scale(4), app.Scale(3), pal.selBg);
+                }
+                c.FillRoundRect(fbx, fiy, isz, isz, app.Scale(3), fcol);
+                int tc = pal.iconGlyph;
+                if (!present) { tc = pal.iconGlyphDisabled; }
+                c.DrawText(fbx + app.Scale(4), fiy + app.Scale(1), flet, tc, t.fontSizeSmall);
+                fbx = fbx + isz + fgap;
+                fki = fki + 1;
+            }
+
+            // ---- description panel for the highlighted item ----
+            if (acSel >= 0 && acSel < acItems.Count) {
+                string dName = acItems[acSel];
+                string dKind = "";
+                if (acSel < acKinds.Count) { dKind = acKinds[acSel]; }
+                string dSig = RealSigFor(dName);
+                if (dSig.Length == 0) { dSig = CodeEditor.DescSig(dName); }
+                string dDoc = CodeEditor.DescDoc(dName);
+                if (dDoc.Length == 0) { dDoc = CodeEditor.DescKeyword(dName); }
+                string sigLine = dSig;
+                if (sigLine.Length == 0) { sigLine = dName; }
+                string kindLine = "(" + CodeEditor.KindWord(dKind) + ")";
+                if (dDoc.Length == 0 && dKind == "S") {
+                    dDoc = "Press Tab to insert the '" + dName + "' code template.";
+                }
+
+                int dw = app.Scale(280);
+                int dpad = app.Scale(8);
+                int fh = Canvas.FontHeight(fontSize);
+                List<string> wrapped = new List<string>();
+                if (dDoc.Length > 0) {
+                    CodeEditor.WrapText(dDoc, dw - dpad * 2, t.fontSizeSmall, wrapped, 6);
+                }
+                int dh = dpad * 2 + fh + app.Scale(4) + fh;
+                if (wrapped.Count > 0) {
+                    dh = dh + app.Scale(6) + wrapped.Count * (Canvas.FontHeight(t.fontSizeSmall) + app.Scale(2));
+                }
+                // Prefer right of the popup; fall back to the left.
+                int dx = px + popW2 + app.Scale(6);
+                if (dx + dw > area.x + area.width) { dx = px - dw - app.Scale(6); }
+                if (dx < area.x) { dx = area.x + app.Scale(2); }
+                int dy = popY2;
+                if (dy + dh > area.y + area.height) { dy = area.y + area.height - dh; }
+                if (dy < area.y) { dy = area.y; }
+
+                c.FillRoundRect(dx + 2, dy + 2, dw, dh, app.Scale(4), pal.shadowSoft);
+                c.FillRoundRect(dx, dy, dw, dh, app.Scale(4), pal.panelBg);
+                c.DrawRoundRect(dx, dy, dw, dh, app.Scale(4), pal.border, 1);
+                int ty = dy + dpad;
+                c.DrawText(dx + dpad, ty, sigLine, pal.signature, fontSize);
+                ty = ty + fh + app.Scale(4);
+                c.DrawText(dx + dpad, ty, kindLine, pal.muted, t.fontSizeSmall);
+                ty = ty + Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+                int wl = 0;
+                while (wl < wrapped.Count) {
+                    c.DrawText(dx + dpad, ty, wrapped[wl], pal.text, t.fontSizeSmall);
+                    ty = ty + Canvas.FontHeight(t.fontSizeSmall) + app.Scale(2);
+                    wl = wl + 1;
+                }
+            }
+        }
+
+        // ---- right-click context menu ----
+        // Open on right mouse button (button 1) pressed inside the text area.
+        if (app.window.EventKind() == 2 && app.window.EventButton() == 1) {
+            bool overArea = app.mouseX >= area.x + gutterW && app.mouseX < area.x + area.width
+                            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            if (overArea) {
+                if (!selActive) {
+                    int rrel = app.mouseY - area.y;
+                    int rclk = scrollLine + rrel / lineH;
+                    if (rclk >= lines.Count) { rclk = lines.Count - 1; }
+                    if (rclk < 0) { rclk = 0; }
+                    curLine = rclk;
+                    curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
+                }
+                ctxOpen = true;
+                ctxX = app.mouseX;
+                ctxY = app.mouseY;
+                acActive = false;
+                app.RequestRedraw();
+            }
+        }
+
+        app.hitTester.Register(HitRegion.Create(id, area.x, area.y, area.width, area.height, 1));
+
+        // ---- left button pressed: place caret / begin drag-select ----
+        // Skip when the click lands on the autocomplete popup (handled on up).
+        bool overPopup = acActive && popShown > 0
+            && app.mouseX >= popX && app.mouseX < popX + popW
+            && app.mouseY >= popY && app.mouseY < popY + popH;
+        bool overFilter = acActive && filtW > 0
+            && app.mouseX >= filtX && app.mouseX < filtX + filtW
+            && app.mouseY >= filtY && app.mouseY < filtY + filtH;
+        bool overCodeLens = false;
+        int cli = 0;
+        while (cli < codeLens.Count) {
+            CodeLensRef cl = codeLens[cli];
+            if (app.mouseX >= cl.x && app.mouseX < cl.x + cl.w
+                && app.mouseY >= cl.y && app.mouseY < cl.y + lineH) {
+                overCodeLens = true;
+            }
+            cli = cli + 1;
+        }
+        // Reference-list popup: click an entry to jump, click outside to dismiss.
+        if (refPopOpen && app.window.EventKind() == 2 && app.window.EventButton() == 0) {
+            bool insidePop = app.mouseX >= refPopGX && app.mouseX < refPopGX + refPopGW
+                && app.mouseY >= refPopGY && app.mouseY < refPopGY + refPopGH;
+            if (insidePop) {
+                int relRow = (app.mouseY - refPopGY - refPopHeadH) / refPopRowH;
+                if (relRow >= 0 && relRow < refPopShown && relRow < refPopLines.Count) {
+                    JumpToRefLine(refPopName, refPopLines[relRow]);
+                    refPopOpen = false;
+                }
+                app.RequestRedraw();
+                return id;
+            }
+            refPopOpen = false;
+            app.RequestRedraw();
+        }
+
+        // Click on the diagnostics/scroll strip (right edge): jump to that line.
+        int diagStripW = app.Scale(14);
+        int diagStripX = area.x + area.width - diagStripW;
+        if (app.window.EventKind() == 2 && app.window.EventButton() == 0
+            && !ctxOpen && !overPopup && !overFilter && !overCodeLens
+            && app.mouseX >= diagStripX && app.mouseX < area.x + area.width
+            && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+            int dtotal = lines.Count;
+            if (dtotal < 1) { dtotal = 1; }
+            int dtgt = (app.mouseY - area.y) * dtotal / area.height;
+            if (dtgt < 0) { dtgt = 0; }
+            if (dtgt >= lines.Count) { dtgt = lines.Count - 1; }
+            curLine = dtgt;
+            if (curCol > lines[curLine].Length) { curCol = lines[curLine].Length; }
+            selActive = false;
+            ClearExtraCarets();
+            scrollLine = dtgt - visLines / 2;
+            if (scrollLine < 0) { scrollLine = 0; }
+            barDragging = true;
+            app.RequestRedraw();
+            return id;
+        }
+
+        // Drag on the scroll strip: the view follows the pointer (thumb drag),
+        // scrolling the document without moving the caret.
+        if (app.window.EventKind() == 1 && barDragging) {
+            int dtotal2 = lines.Count;
+            if (dtotal2 < 1) { dtotal2 = 1; }
+            scrollLine = (app.mouseY - area.y) * dtotal2 / area.height - visLines / 2;
+            if (scrollLine < 0) { scrollLine = 0; }
+            app.RequestRedraw();
+            return id;
+        }
+        if (app.window.EventKind() == 2 && app.window.EventButton() == 0
+            && !ctxOpen && !overPopup && !overFilter && !overCodeLens) {
+            bool overText = app.mouseX >= area.x + gutterW && app.mouseX < diagStripX
+                            && app.mouseY >= area.y && app.mouseY < area.y + area.height;
+            if (overText) {
+                bool sh = Modifiers.HasShift(app.window.EventMods());
+                bool ct = Modifiers.HasCtrl(app.window.EventMods());
+                if (ct) {
+                    // Ctrl+click: place caret and ask the host for Go to Definition.
+                    CaretFromMouse(app, area, gutterW, fontSize);
+                    selActive = false;
+                    ClearExtraCarets();
+                    gotoRequested = true;
+                } else if (sh) {
+                    if (!selActive) {
+                        selAnchorLine = curLine; selAnchorCol = curCol; selActive = true;
+                    }
+                    CaretFromMouse(app, area, gutterW, fontSize);
+                } else {
+                    CaretFromMouse(app, area, gutterW, fontSize);
+                    bool near = curLine == lastClickLine
+                        && curCol >= lastClickCol - 1 && curCol <= lastClickCol + 1;
+                    if (app.nowMs - lastClickMs <= 400 && near) {
+                        clickCount = clickCount + 1;
+                    } else {
+                        clickCount = 1;
+                    }
+                    lastClickMs = app.nowMs;
+                    lastClickLine = curLine;
+                    lastClickCol = curCol;
+                    if (clickCount == 2) {
+                        SelectWordCaret();
+                        mouseSelecting = false;
+                    } else if (clickCount >= 3) {
+                        SelectLineCaret();
+                        mouseSelecting = false;
+                        clickCount = 0;
+                    } else {
+                        selAnchorLine = curLine; selAnchorCol = curCol;
+                        selActive = false;
+                        ClearExtraCarets();
+                        mouseSelecting = true;
+                    }
+                }
+                acActive = false;
+                app.RequestRedraw();
+            }
+        }
+
+        // ---- dragging: extend the selection to the pointer ----
+        if (app.window.EventKind() == 1 && mouseSelecting) {
+            CaretFromMouse(app, area, gutterW, fontSize);
+            if (curLine != selAnchorLine || curCol != selAnchorCol) { selActive = true; }
+            else { selActive = false; }
+            app.RequestRedraw();
+        }
+
+        // ---- hover: redraw so the symbol tooltip tracks the pointer ----
+        if (app.window.EventKind() == 1 && !mouseSelecting && !acActive) {
+            if (app.mouseX >= area.x && app.mouseX < area.x + area.width
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+                app.RequestRedraw();
+            }
+        }
+
+        if (app.window.EventKind() == 3 && app.window.EventButton() == 0 && !ctxOpen) {
+            mouseSelecting = false;
+            barDragging = false;
+            // CodeLens click: open an expandable list of all references.
+            bool clHit = false;
+            int clc = 0;
+            while (clc < codeLens.Count) {
+                CodeLensRef cl = codeLens[clc];
+                if (app.mouseX >= cl.x && app.mouseX < cl.x + cl.w
+                    && app.mouseY >= cl.y && app.mouseY < cl.y + lineH) {
+                    refPopLines = new List<int>();
+                    CollectRefs(cl.name, cl.line, refPopLines);
+                    refPopName = cl.name;
+                    refPopSel = 0;
+                    refPopX = cl.x;
+                    refPopY = cl.y + lineH;
+                    refPopOpen = refPopLines.Count > 0;
+                    if (!refPopOpen) { JumpToNextRef(cl.name, cl.line); }
+                    clHit = true;
+                    app.RequestRedraw();
+                }
+                clc = clc + 1;
+            }
+            if (clHit) {
+                // handled
+            }
+            // Kind filter strip click: toggle the selected kind.
+            else if (acActive && filtW > 0
+                && app.mouseX >= filtX && app.mouseX < filtX + filtW
+                && app.mouseY >= filtY && app.mouseY < filtY + filtH) {
+                List<string> fk2 = new List<string>();
+                fk2.Add(""); fk2.Add("M"); fk2.Add("P"); fk2.Add("F");
+                fk2.Add("E"); fk2.Add("T"); fk2.Add("K"); fk2.Add("S");
+                int step = app.Scale(16) + app.Scale(4);
+                int fidx = (app.mouseX - (filtX + app.Scale(5))) / step;
+                if (fidx >= 0 && fidx < fk2.Count) {
+                    string chosenF = fk2[fidx];
+                    if (chosenF == "" || HasKind(chosenF)) {
+                        if (acFilter == chosenF) { acFilter = ""; }
+                        else { acFilter = chosenF; }
+                        acSel = 0;
+                        ApplyKindFilter();
+                    }
+                }
+                app.RequestRedraw();
+            }
+            // Check autocomplete popup click
+            else if (acActive && popShown > 0
+                && app.mouseX >= popX && app.mouseX < popX + popW
+                && app.mouseY >= popY && app.mouseY < popY + popH) {
+                int relY = app.mouseY - popY - app.Scale(2);
+                int clickedRow = relY / popItemH;
+                if (clickedRow >= 0 && clickedRow < popShown) {
+                    int clickedIdx = popFirst + clickedRow;
+                    if (clickedIdx >= 0 && clickedIdx < acItems.Count) {
+                        acSel = clickedIdx;
+                        AcceptCompletion(false);
+                    }
+                }
+                app.RequestRedraw();
+            } else {
+                int hit = app.ClickTarget();
+                if (hit == id && app.mouseX < area.x + gutterW) {
+                    int rel = app.mouseY - area.y;
+                    int clicked = scrollLine + rel / lineH;
+                    if (clicked >= lines.Count) { clicked = lines.Count - 1; }
+                    if (clicked < 0) { clicked = 0; }
+                    ToggleBreakpoint(clicked);
+                    app.RequestRedraw();
+                }
+            }
+        }
+
+        // ---- Debug hover tooltip ----
+        if (execLine >= 0 && dbgVars.Count > 0) {
+            // Detect word under mouse cursor
+            if (app.mouseX >= textX && app.mouseX < area.x + area.width
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+                int hoverLine = scrollLine + (app.mouseY - area.y) / lineH;
+                if (hoverLine >= 0 && hoverLine < lines.Count) {
+                    int hoverCol = CodeEditor.ColFromX(lines[hoverLine], app.mouseX - textX, fontSize);
+                    string hWord = CodeEditor.WordAt(lines[hoverLine], hoverCol);
+                    if (hWord.Length > 0) {
+                        string raw = CodeEditor.LookupVarRaw(dbgVars, hWord);
+                        if (raw.Length > 0) {
+                            hoverTip = raw;
+                            hoverTipX = app.mouseX;
+                            hoverTipY = app.mouseY;
+                        } else {
+                            hoverTip = "";
+                        }
+                    } else {
+                        hoverTip = "";
+                    }
+                }
+            }
+            // Draw the (possibly multi-line, JSON-formatted) tooltip.
+            if (hoverTip.Length > 0) {
+                List<string> hl = new List<string>();
+                CodeEditor.BuildHoverLines(hoverTip, hl);
+                int rowh = Canvas.FontHeight(fontSize) + app.Scale(2);
+                int maxw = 0;
+                int k = 0;
+                while (k < hl.Count) {
+                    int mw = Canvas.MeasureText(hl[k], fontSize);
+                    if (mw > maxw) { maxw = mw; }
+                    k = k + 1;
+                }
+                int ttW2 = maxw + app.Scale(16);
+                int capW = area.width - app.Scale(8);
+                if (ttW2 > capW) { ttW2 = capW; }
+                int ttH2 = rowh * hl.Count + app.Scale(8);
+                int ttX2 = hoverTipX + app.Scale(8);
+                int ttY2 = hoverTipY + app.Scale(20);
+                if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - app.Scale(4); }
+                if (ttX2 < area.x) { ttX2 = area.x; }
+                if (ttY2 + ttH2 > area.y + area.height) { ttY2 = hoverTipY - ttH2 - app.Scale(6); }
+                if (ttY2 < area.y) { ttY2 = area.y; }
+                c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), pal.shadowStrong);
+                c.FillRoundRect(ttX2, ttY2, ttW2, ttH2, app.Scale(4), pal.hoverBg);
+                c.DrawRoundRect(ttX2, ttY2, ttW2, ttH2, app.Scale(4), pal.accent, 1);
+                int ty = ttY2 + app.Scale(4);
+                int kk = 0;
+                while (kk < hl.Count) {
+                    int col = pal.str;
+                    if (kk == 0) { col = pal.signature; }
+                    c.DrawText(ttX2 + app.Scale(8), ty, hl[kk], col, fontSize);
+                    ty = ty + rowh;
+                    kk = kk + 1;
+                }
+            }
+        }
+
+        // ---- Ctrl+hover: underline the identifier as a clickable link ----
+        if (!acActive && !ctxOpen && Modifiers.HasCtrl(app.window.EventMods())) {
+            int utextX = area.x + gutterW + t.paddingSmall;
+            if (app.mouseX >= utextX && app.mouseX < area.x + area.width
+                && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
+                int urel = app.mouseY - area.y;
+                int uln = scrollLine + urel / lineH;
+                if (uln >= 0 && uln < lines.Count) {
+                    string uls = lines[uln];
+                    int ucol = CodeEditor.ColFromX(uls, app.mouseX - utextX, fontSize);
+                    string uidset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+                    if (ucol >= 0 && ucol <= uls.Length) {
+                        int ua = ucol;
+                        while (ua > 0 && CodeEditor.InSet(uidset, uls.Substring(ua - 1, 1))) { ua = ua - 1; }
+                        int ub = ucol;
+                        while (ub < uls.Length && CodeEditor.InSet(uidset, uls.Substring(ub, 1))) { ub = ub + 1; }
+                        if (ub > ua) {
+                            int uxp = utextX + Canvas.MeasureText(uls.Substring(0, ua), fontSize);
+                            int uwp = Canvas.MeasureText(uls.Substring(ua, ub - ua), fontSize);
+                            int uyp = area.y + (uln - scrollLine) * lineH
+                                + (lineH + Canvas.FontHeight(fontSize)) / 2 + app.Scale(1);
+                            c.FillRect(uxp, uyp, uwp, app.Scale(1), pal.link);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- symbol hover tooltip (method/property signature + docs) ----
+        if (!acActive && !ctxOpen && execLine < 0) {
+            string hw = WordAtMouse(app, area, gutterW, fontSize);
+            if (hw.Length > 0) {
+                string hsig = RealSigFor(hw);
+                if (hsig.Length == 0) { hsig = CodeEditor.DescSig(hw); }
+                string hdoc = CodeEditor.DescDoc(hw);
+                if (hdoc.Length == 0) { hdoc = CodeEditor.DescKeyword(hw); }
+                if (hsig.Length == 0 && hdoc.Length > 0) { hsig = hw; }
+                if (hsig.Length > 0) {
+                    int hpad = app.Scale(8);
+                    int hfh = Canvas.FontHeight(fontSize);
+                    int sfh = Canvas.FontHeight(t.fontSizeSmall);
+                    // Fixed inner text width; wrap BOTH signature and docs to it so no
+                    // content can spill past the box, then shrink the box to the widest
+                    // line actually produced (never wider than the cap).
+                    int innerW = app.Scale(300);
+                    List<string> siglines = new List<string>();
+                    CodeEditor.WrapText(hsig, innerW, fontSize, siglines, 4);
+                    List<string> hlines = new List<string>();
+                    if (hdoc.Length > 0) {
+                        CodeEditor.WrapText(hdoc, innerW, t.fontSizeSmall, hlines, 6);
+                    }
+                    int widest = 0;
+                    int wi = 0;
+                    while (wi < siglines.Count) {
+                        int lw = Canvas.MeasureText(siglines[wi], fontSize);
+                        if (lw > widest) { widest = lw; }
+                        wi = wi + 1;
+                    }
+                    wi = 0;
+                    while (wi < hlines.Count) {
+                        int lw = Canvas.MeasureText(hlines[wi], t.fontSizeSmall);
+                        if (lw > widest) { widest = lw; }
+                        wi = wi + 1;
+                    }
+                    if (widest > innerW) { widest = innerW; }
+                    int hw2 = widest + hpad * 2;
+                    if (hw2 < app.Scale(120)) { hw2 = app.Scale(120); }
+                    int hh = hpad * 2 + siglines.Count * hfh;
+                    if (hlines.Count > 0) {
+                        hh = hh + app.Scale(4) + hlines.Count * (sfh + app.Scale(2));
+                    }
+                    int hx = app.mouseX + app.Scale(12);
+                    int hy = app.mouseY + app.Scale(18);
+                    if (hx + hw2 > area.x + area.width) { hx = area.x + area.width - hw2 - app.Scale(4); }
+                    if (hx < area.x) { hx = area.x + app.Scale(2); }
+                    if (hy + hh > area.y + area.height) { hy = app.mouseY - hh - app.Scale(6); }
+                    if (hy < area.y) { hy = area.y + app.Scale(2); }
+                    c.FillRoundRect(hx + 2, hy + 2, hw2, hh, app.Scale(4), pal.shadow);
+                    c.FillRoundRect(hx, hy, hw2, hh, app.Scale(4), pal.popupBg);
+                    c.DrawRoundRect(hx, hy, hw2, hh, app.Scale(4), pal.accent, 1);
+                    int hty = hy + hpad;
+                    int sl = 0;
+                    while (sl < siglines.Count) {
+                        c.DrawText(hx + hpad, hty, siglines[sl], pal.signature, fontSize);
+                        hty = hty + hfh;
+                        sl = sl + 1;
+                    }
+                    hty = hty + app.Scale(4);
+                    int hl = 0;
+                    while (hl < hlines.Count) {
+                        c.DrawText(hx + hpad, hty, hlines[hl], pal.text, t.fontSizeSmall);
+                        hty = hty + sfh + app.Scale(2);
+                        hl = hl + 1;
+                    }
+                }
+            }
+        }
+
+        // ---- expandable reference list popup (from a CodeLens click) ----
+        if (refPopOpen && refPopLines.Count > 0) {
+            int rpMax = 10;
+            int rpShown = refPopLines.Count;
+            if (rpShown > rpMax) { rpShown = rpMax; }
+            int rpRowH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(6);
+            int rpHeadH = rpRowH;
+            int rpW = app.Scale(440);
+            if (rpW > area.width - app.Scale(20)) { rpW = area.width - app.Scale(20); }
+            int rpH = rpHeadH + rpShown * rpRowH + app.Scale(6);
+            int rpX = refPopX;
+            int rpY = refPopY;
+            if (rpX + rpW > area.x + area.width) { rpX = area.x + area.width - rpW - app.Scale(6); }
+            if (rpX < area.x) { rpX = area.x + app.Scale(2); }
+            if (rpY + rpH > area.y + area.height) { rpY = area.y + area.height - rpH - app.Scale(4); }
+            if (rpY < area.y) { rpY = area.y + app.Scale(2); }
+            refPopGX = rpX; refPopGY = rpY; refPopGW = rpW; refPopGH = rpH;
+            refPopRowH = rpRowH; refPopHeadH = rpHeadH; refPopShown = rpShown;
+            c.FillRoundRect(rpX + 2, rpY + 2, rpW, rpH, app.Scale(4), pal.shadowMed);
+            c.FillRoundRect(rpX, rpY, rpW, rpH, app.Scale(4), pal.popupBg);
+            c.DrawRoundRect(rpX, rpY, rpW, rpH, app.Scale(4), pal.accent, 1);
+            // Header: "N references to <name>"
+            string rpHead = Convert.ToString(refPopLines.Count) + " references to " + refPopName;
+            c.FillRect(rpX + 1, rpY + 1, rpW - 2, rpHeadH, pal.panelBg);
+            c.DrawText(rpX + app.Scale(8), rpY + app.Scale(4), rpHead, pal.signature, t.fontSizeSmall);
+            int rri = 0;
+            while (rri < rpShown) {
+                int rl = refPopLines[rri];
+                int ry = rpY + rpHeadH + rri * rpRowH;
+                bool rhover = app.mouseX >= rpX && app.mouseX < rpX + rpW
+                    && app.mouseY >= ry && app.mouseY < ry + rpRowH;
+                if (rhover) { c.FillRect(rpX + 1, ry, rpW - 2, rpRowH, pal.selBg); }
+                string rnum = Convert.ToString(rl + 1);
+                c.DrawText(rpX + app.Scale(8), ry + app.Scale(3), rnum, pal.lineNo, t.fontSizeSmall);
+                string rcode = CodeEditor.TrimStr(lines[rl]);
+                if (rcode.Length > 64) { rcode = rcode.Substring(0, 64) + "..."; }
+                c.DrawText(rpX + app.Scale(48), ry + app.Scale(3), rcode, pal.text, t.fontSizeSmall);
+                rri = rri + 1;
+            }
+            if (refPopLines.Count > rpShown) {
+                int mory = rpY + rpHeadH + rpShown * rpRowH;
+                c.DrawText(rpX + app.Scale(8), mory - rpRowH + app.Scale(3),
+                    "... +" + Convert.ToString(refPopLines.Count - rpShown) + " more", pal.lineNo, t.fontSizeSmall);
+            }
+        }
+
+        return id;
+    }
+
+    static string WordAt(string line, int col) {
+        if (col < 0 || col >= line.Length) { return ""; }
+        // Find word boundaries
+        int start = col;
+        while (start > 0) {
+            string ch = line.Substring(start - 1, 1);
+            if (CodeEditor.IsIdentChar(ch)) { start = start - 1; }
+            else { break; }
+        }
+        int end = col;
+        while (end < line.Length) {
+            string ch = line.Substring(end, 1);
+            if (CodeEditor.IsIdentChar(ch)) { end = end + 1; }
+            else { break; }
+        }
+        if (start == end) { return ""; }
+        return line.Substring(start, end - start);
+    }
+
+    static bool IsIdentChar(string ch) {
+        if (ch == "_") { return true; }
+        int c = ch.Substring(0, 1).Length;
+        if (c == 0) { return false; }
+        string fc = ch.Substring(0, 1);
+        if (fc >= "a" && fc <= "z") { return true; }
+        if (fc >= "A" && fc <= "Z") { return true; }
+        if (fc >= "0" && fc <= "9") { return true; }
+        return false;
+    }
+
+    static string LookupVar(List<string> vars, string name) {
+        int i = 0;
+        while (i < vars.Count) {
+            string entry = vars[i];
+            // entry is "name\ttype\tvalue"
+            int tab1 = -1;
+            int tab2 = -1;
+            int j = 0;
+            while (j < entry.Length) {
+                string ch = entry.Substring(j, 1);
+                if (ch == "\t") {
+                    if (tab1 < 0) { tab1 = j; }
+                    else if (tab2 < 0) { tab2 = j; }
+                }
+                j = j + 1;
+            }
+            if (tab1 > 0) {
+                string vName = entry.Substring(0, tab1);
+                if (vName == name) {
+                    string vType = "";
+                    string vVal = "";
+                    if (tab2 > tab1) {
+                        vType = entry.Substring(tab1 + 1, tab2 - tab1 - 1);
+                        vVal = entry.Substring(tab2 + 1, entry.Length - tab2 - 1);
+                    } else {
+                        vType = entry.Substring(tab1 + 1, entry.Length - tab1 - 1);
+                    }
+                    return vName + " : " + vType + " = " + vVal;
+                }
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Like LookupVar, but returns the raw "name\ttype\tvalue" entry so the
+    /// caller can render an expandable, formatted tooltip.
+    static string LookupVarRaw(List<string> vars, string name) {
+        int i = 0;
+        while (i < vars.Count) {
+            string entry = vars[i];
+            int tab1 = -1;
+            int j = 0;
+            while (j < entry.Length) {
+                if (entry.Substring(j, 1) == "\t") { tab1 = j; j = entry.Length; }
+                j = j + 1;
+            }
+            if (tab1 > 0 && entry.Substring(0, tab1) == name) { return entry; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    static string Indent(int n) {
+        string s = "";
+        int i = 0;
+        while (i < n && i < 12) { s = s + "  "; i = i + 1; }
+        return s;
+    }
+
+    /// Pretty-prints a JSON-ish value string into indented lines. Ignores
+    /// structure inside quoted strings, caps at maxLines, truncates very long
+    /// lines, and reads at most 8000 input chars (large-data safety).
+    static void PrettyJson(string s, List<string> out2, int maxLines) {
+        int indent = 0;
+        string cur = "";
+        bool inStr = false;
+        int i = 0;
+        int limit = s.Length;
+        if (limit > 8000) { limit = 8000; }
+        while (i < limit) {
+            string ch = s.Substring(i, 1);
+            if (inStr) {
+                cur = cur + ch;
+                if (ch == "\"") { inStr = false; }
+                else if (ch == "\\" && i + 1 < limit) { cur = cur + s.Substring(i + 1, 1); i = i + 1; }
+            } else if (ch == "\"") {
+                cur = cur + ch; inStr = true;
+            } else if (ch == "{" || ch == "[") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+                indent = indent + 1;
+            } else if (ch == "}" || ch == "]") {
+                if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); cur = ""; }
+                indent = indent - 1;
+                if (indent < 0) { indent = 0; }
+                out2.Add(CodeEditor.Indent(indent) + ch);
+            } else if (ch == ",") {
+                cur = cur + ch;
+                out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur));
+                cur = "";
+            } else if (ch == ":") {
+                cur = cur + ": ";
+            } else if (ch == " " || ch == "\n" || ch == "\t" || ch == "\r") {
+                // insignificant whitespace outside strings
+            } else {
+                cur = cur + ch;
+            }
+            if (out2.Count >= maxLines) { out2.Add("  ...(truncated)"); return; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { out2.Add(CodeEditor.Indent(indent) + CodeEditor.Clip(cur)); }
+    }
+
+    /// Caps a single tooltip line so a very long value can't blow up the box.
+    static string Clip(string s) {
+        if (s.Length > 200) { return s.Substring(0, 200) + " ..."; }
+        return s;
+    }
+
+    /// Builds the lines shown in the debug hover tooltip: a header
+    /// (`name : type`) followed by the value, pretty-printed if it looks like
+    /// JSON / an array / an object.
+    static void BuildHoverLines(string entry, List<string> out2) {
+        int tab1 = -1;
+        int tab2 = -1;
+        int j = 0;
+        while (j < entry.Length) {
+            string ch = entry.Substring(j, 1);
+            if (ch == "\t") {
+                if (tab1 < 0) { tab1 = j; }
+                else if (tab2 < 0) { tab2 = j; }
+            }
+            j = j + 1;
+        }
+        string vName = entry;
+        string vType = "";
+        string vVal = "";
+        if (tab1 > 0) {
+            vName = entry.Substring(0, tab1);
+            if (tab2 > tab1) {
+                vType = entry.Substring(tab1 + 1, tab2 - tab1 - 1);
+                vVal = entry.Substring(tab2 + 1, entry.Length - tab2 - 1);
+            } else {
+                vType = entry.Substring(tab1 + 1, entry.Length - tab1 - 1);
+            }
+        }
+        out2.Add(vName + " : " + vType);
+        int a = 0;
+        while (a < vVal.Length && vVal.Substring(a, 1) == " ") { a = a + 1; }
+        string vt = vVal.Substring(a, vVal.Length - a);
+        if (vt.Length > 0 && (vt.Substring(0, 1) == "{" || vt.Substring(0, 1) == "[")) {
+            CodeEditor.PrettyJson(vt, out2, 60);
+        } else {
+            out2.Add("= " + CodeEditor.Clip(vVal));
+        }
+    }
+}
