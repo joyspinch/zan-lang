@@ -368,6 +368,14 @@ returning empty responses:
   connect fails, the TLS context cannot be created, or the TLS handshake
   fails. `HttpRequestException` derives from `Exception`.
 
+**JSON error model (System.Json).** `JsonValue.Parse` throws `JsonException`
+("Malformed JSON at position N") on malformed input; the document is
+validated with an allocation-free scan before the value tree is built.
+`JsonValue.ParseLenient` keeps the previous best-effort behaviour (returns
+whatever parsed so far) for authored/tool-emitted documents. The typed
+accessors (`Str`/`Int`/`Bool`/`Double`, `As*`) still return the caller's
+explicit default when a key is absent or of the wrong kind.
+
 ---
 
 ### 3.6 System.Linq.Enumerable

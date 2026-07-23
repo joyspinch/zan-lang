@@ -23,7 +23,11 @@
      失败返回 null，`HttpClient` 连接/TLS 失败抛 `HttpRequestException`
      （`tests/conformance/net_errors.zan`）。已知限制：异常穿过 async CPS
      帧时这些帧不被释放（net_errors 在 leakcheck 的 `_known_leaky`
-     允许列表中，ARC 后续工作）。**Json 待做**。
+     允许列表中，ARC 后续工作）。
+     **Json 部分已完成**：`JsonValue.Parse` 对畸形输入抛 `JsonException`
+     （先用无分配扫描校验再建树，错误路径无泄漏）；原 best-effort 行为
+     保留为 `JsonValue.ParseLenient`，现有调用点（UI 文档/RPC/IDE）已
+     迁移到 lenient，行为不变（`tests/conformance/json_errors.zan`）。
    - A3 IDE 长时运行泄漏验证（`--check-leaks` 2h+ 零净增长）。
 2. **P1 编辑体验 + 质量保障**（阶段 2.1–2.3、4.1–4.2）：LSP rename、
    workspace/symbol、IDE 接入 zanfmt、IDE golden-path UI 测试、发布包冒烟测试。

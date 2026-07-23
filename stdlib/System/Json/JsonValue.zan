@@ -374,9 +374,24 @@ class JsonValue {
 
     // ---- parse -----------------------------------------------------------
 
-    /// Parses a JSON document into a value tree. On malformed input returns
-    /// whatever parsed so far (best-effort; UI docs are authored/tool-emitted).
+    /// Parses a JSON document into a value tree. Malformed input throws
+    /// JsonException (C#-aligned). The document is validated with a
+    /// non-allocating scan before the tree is built, so the error path holds
+    /// no live allocations.
     static JsonValue Parse(string src) {
+        int errPos = JsonReader.FirstErrorPos(src);
+        if (errPos >= 0) {
+            throw new JsonException("Malformed JSON at position "
+                + Convert.ToString(errPos));
+        }
+        JsonReader r = JsonReader.Of(src);
+        return r.ReadValue();
+    }
+
+    /// Best-effort parse: on malformed input returns whatever parsed so far
+    /// instead of throwing (for authored/tool-emitted UI docs where a partial
+    /// tree is preferable to an exception).
+    static JsonValue ParseLenient(string src) {
         JsonReader r = JsonReader.Of(src);
         return r.ReadValue();
     }
@@ -529,5 +544,130 @@ class JsonReader {
             }
         }
         return JsonValue.NewNum(s.Substring(start, pos - start));
+    }
+
+    // ---- validation (allocation-free scan used by JsonValue.Parse) --------
+
+    /// Position of the first syntax error in `src`, or -1 when it is valid
+    /// JSON. Returns normally so the caller can throw with no reader object
+    /// live in its frame (exception unwind does not yet release locals).
+    static int FirstErrorPos(string src) {
+        JsonReader v = JsonReader.Of(src);
+        if (v.ValidDocument()) { return -1; }
+        return v.pos;
+    }
+
+    /// Scans the whole document for JSON syntax validity without allocating
+    /// any values. On failure the cursor is left at the offending position.
+    bool ValidDocument() {
+        if (!ValidValue()) { return false; }
+        SkipWs();
+        return pos >= len;
+    }
+
+    bool ValidValue() {
+        SkipWs();
+        int c = CurB();
+        if (c == 123) { return ValidObject(); }             // '{'
+        if (c == 91) { return ValidArray(); }               // '['
+        if (c == 34) { return ValidString(); }
+        if (c == 116) { return ValidLiteral("true"); }
+        if (c == 102) { return ValidLiteral("false"); }
+        if (c == 110) { return ValidLiteral("null"); }
+        return ValidNumber();
+    }
+
+    bool ValidLiteral(string lit) {
+        int n = lit.Length;
+        if (pos + n > len) { return false; }
+        if (s.Substring(pos, n) != lit) { return false; }
+        pos = pos + n;
+        return true;
+    }
+
+    bool ValidObject() {
+        pos = pos + 1;                 // consume '{'
+        SkipWs();
+        if (CurB() == 125) { pos = pos + 1; return true; }  // '}'
+        while (pos < len) {
+            SkipWs();
+            if (CurB() != 34) { return false; }
+            if (!ValidString()) { return false; }
+            SkipWs();
+            if (CurB() != 58) { return false; }             // ':'
+            pos = pos + 1;
+            if (!ValidValue()) { return false; }
+            SkipWs();
+            int c = CurB();
+            if (c == 44) { pos = pos + 1; }                 // ','
+            else if (c == 125) { pos = pos + 1; return true; } // '}'
+            else { return false; }
+        }
+        return false;
+    }
+
+    bool ValidArray() {
+        pos = pos + 1;                 // consume '['
+        SkipWs();
+        if (CurB() == 93) { pos = pos + 1; return true; }   // ']'
+        while (pos < len) {
+            if (!ValidValue()) { return false; }
+            SkipWs();
+            int c = CurB();
+            if (c == 44) { pos = pos + 1; }                 // ','
+            else if (c == 93) { pos = pos + 1; return true; } // ']'
+            else { return false; }
+        }
+        return false;
+    }
+
+    bool ValidString() {
+        if (CurB() != 34) { return false; }
+        pos = pos + 1;                 // consume opening quote
+        while (pos < len) {
+            int c = s[pos] & 255;
+            if (c == 34) { pos = pos + 1; return true; }
+            if (c == 92) {
+                if (pos + 1 >= len) { return false; }
+                pos = pos + 2;
+            } else {
+                pos = pos + 1;
+            }
+        }
+        return false;                  // unterminated
+    }
+
+    bool ValidNumber() {
+        int c = CurB();
+        if (c == 45) { pos = pos + 1; c = CurB(); }         // '-'
+        if (c < 48 || c > 57) { return false; }             // must start with digit
+        while (pos < len) {
+            int d = s[pos] & 255;
+            if (d >= 48 && d <= 57) { pos = pos + 1; }
+            else { break; }
+        }
+        if (CurB() == 46) {                                 // '.'
+            pos = pos + 1;
+            int d = CurB();
+            if (d < 48 || d > 57) { return false; }
+            while (pos < len) {
+                int d2 = s[pos] & 255;
+                if (d2 >= 48 && d2 <= 57) { pos = pos + 1; }
+                else { break; }
+            }
+        }
+        int e = CurB();
+        if (e == 101 || e == 69) {                          // 'e' / 'E'
+            pos = pos + 1;
+            int d = CurB();
+            if (d == 43 || d == 45) { pos = pos + 1; d = CurB(); }
+            if (d < 48 || d > 57) { return false; }
+            while (pos < len) {
+                int d2 = s[pos] & 255;
+                if (d2 >= 48 && d2 <= 57) { pos = pos + 1; }
+                else { break; }
+            }
+        }
+        return true;
     }
 }
