@@ -1,0 +1,172 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// The debugger's UI chrome, extracted from the shell: the bottom
+/// Console/Variables/Watch/CallStack panel (a TabStrip bound to the panel-tab
+/// signal over Table-rendered grids), the stepping toolbar and the inline
+/// variables overlay drawn over the editor while stepping.
+class DebugPanel {
+    static void RenderDebugBottom(App app, Canvas c, Theme t, Rect orr, SignalInt panelTab,
+            List<string> console, List<string> vars, List<string> watchRows,
+            string watchInput, List<string> stack, List<string> log) {
+        int tab = panelTab.Get();
+        int tabH = t.heightMedium;
+
+        // Tab bar: a real TabStrip widget bound to the panelTab signal.
+        c.FillRect(orr.x, orr.y, orr.width, tabH, t.bgSecondary);
+        List<string> tabLabels = new List<string>();
+        tabLabels.Add(ZanIDE.T("Console", "控制台"));
+        tabLabels.Add(ZanIDE.T("Variables", "变量"));
+        tabLabels.Add(ZanIDE.T("Watch", "监视"));
+        tabLabels.Add(ZanIDE.T("CallStack", "调用栈"));
+        int firstTab = TabStrip.Render(app, orr.x, orr.y, orr.width, tabLabels, panelTab);
+        TabStrip.HandleClick(app, firstTab, tabLabels.Count, panelTab);
+
+        // Content area
+        int contentY = orr.y + tabH;
+        int contentH = orr.height - tabH;
+        c.FillRect(orr.x, contentY, orr.width, contentH, t.bgPrimary);
+
+        if (tab == 0) {
+            ZanIDE.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, console,
+                0, 0 - 1, 0, 0 - 1, 0);
+        } else if (tab == 1) {
+            DebugPanel.RenderVarsTab(app, c, t, orr.x, contentY, orr.width, contentH, vars);
+        } else if (tab == 2) {
+            DebugPanel.RenderWatchTab(app, c, t, orr.x, contentY, orr.width, contentH,
+                watchRows, watchInput);
+        } else if (tab == 3) {
+            DebugPanel.RenderStackTab(app, c, t, orr.x, contentY, orr.width, contentH, stack);
+        }
+    }
+
+    static void RenderVarsTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> vars) {
+        // Name/Type/Value grid rendered through the framework Table widget.
+        int rowH = t.heightMedium;
+        List<int> widths = new List<int>();
+        widths.Add(app.Scale(120));
+        widths.Add(app.Scale(100));
+        int valW = w - app.Scale(220);
+        if (valW < app.Scale(80)) { valW = app.Scale(80); }
+        widths.Add(valW);
+        List<string> cols = new List<string>();
+        cols.Add(ZanIDE.T("Name", "名称"));
+        cols.Add(ZanIDE.T("Type", "类型"));
+        cols.Add(ZanIDE.T("Value", "值"));
+        Table.RenderHeader(app, x, y, cols, widths);
+        int cy = y + rowH;
+        int ri = 0;
+        while (ri < vars.Count && cy + rowH <= y + h) {
+            string entry = vars[ri];
+            List<string> cells = new List<string>();
+            cells.Add(ZanIDE.GetTabField(entry, 0));
+            cells.Add(ZanIDE.GetTabField(entry, 1));
+            cells.Add(ZanIDE.GetTabField(entry, 2));
+            Table.RenderRow(app, x, cy, cells, widths, ri % 2 == 1);
+            cy = cy + rowH;
+            ri = ri + 1;
+        }
+        if (vars.Count == 0) {
+            c.DrawText(x + app.Scale(4), y + rowH + app.Scale(8),
+                ZanIDE.T("(no variables in scope)", "（作用域内没有变量）"),
+                t.textDisabled, t.fontSizeSmall);
+        }
+    }
+
+    /// Watch tab: an expression input row on top (Enter adds, click a row
+    /// removes), then the evaluated expressions in the Variables grid.
+    static void RenderWatchTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> rows, string inputText) {
+        int inpH = app.Scale(26);
+        ZanIDE.ShellField(app, x + app.Scale(4), y + app.Scale(3),
+            w - app.Scale(8), app.Scale(20));
+        string shown = inputText;
+        int shownCol = t.textPrimary;
+        if (shown.Length == 0) {
+            shown = ZanIDE.T("Type an expression and press Enter; click a row to remove it",
+                "输入表达式后回车添加；点击行删除");
+            shownCol = t.textDisabled;
+        }
+        c.DrawText(x + app.Scale(8), y + app.Scale(6), shown, shownCol, t.fontSizeSmall);
+        DebugPanel.RenderVarsTab(app, c, t, x, y + inpH, w, h - inpH, rows);
+    }
+
+    static void RenderStackTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> stack) {
+        // Single-column frame list through the framework Table widget; the
+        // current (top) frame is the highlighted stripe.
+        int rowH = t.heightMedium;
+        List<int> widths = new List<int>();
+        widths.Add(w);
+        List<string> cols = new List<string>();
+        cols.Add(ZanIDE.T("Call Stack", "调用栈"));
+        Table.RenderHeader(app, x, y, cols, widths);
+        int cy = y + rowH;
+        int ri = 0;
+        while (ri < stack.Count && cy + rowH <= y + h) {
+            List<string> cells = new List<string>();
+            cells.Add(stack[ri]);
+            Table.RenderRow(app, x, cy, cells, widths, ri == 0);
+            cy = cy + rowH;
+            ri = ri + 1;
+        }
+    }
+
+    static void RenderInlineVars(App app, Canvas c, Theme t, Rect edRect,
+            List<string> varInfo, int execLine) {
+        if (varInfo.Count == 0) { return; }
+        int fontSize = t.fontSizeSmall;
+        int lineH = Canvas.FontHeight(t.fontSizeMedium) + app.Scale(4);
+        if (lineH < 1) { lineH = 1; }
+        // Build inline text from all variables
+        string inlineText = "";
+        int vi = 0;
+        while (vi < varInfo.Count) {
+            string entry = varInfo[vi];
+            string vName = ZanIDE.GetTabField(entry, 0);
+            string vVal = ZanIDE.GetTabField(entry, 2);
+            if (inlineText.Length > 0) { inlineText = inlineText + "  |  "; }
+            inlineText = inlineText + vName + " = " + vVal;
+            vi = vi + 1;
+        }
+        if (inlineText.Length == 0) { return; }
+        // Draw at top-right of editor area as an overlay
+        int tw = Canvas.MeasureText(inlineText, fontSize) + app.Scale(16);
+        int th = app.Scale(22);
+        int tx = edRect.x + edRect.width - tw - app.Scale(8);
+        int ty = edRect.y + app.Scale(4);
+        c.FillRoundRect(tx, ty, tw, th, app.Scale(4), t.bgSecondary);
+        c.DrawRect(tx, ty, tw, th, t.primary, 1);
+        c.DrawText(tx + app.Scale(8), ty + app.Scale(4), inlineText, EditorPalette.For(t).str, fontSize);
+    }
+
+    static int RenderDebugToolbar(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, int execLine,
+            Button continueBtn, Button stepOverBtn, Button stepIntoBtn,
+            Button stopBtn) {
+        ZanIDE.ShellSurface(app, x, y, w, h, 0, t.bgSecondary);
+        c.FillRect(x, y + h - 1, w, 1, t.divider);
+        int btnW = app.Scale(96);
+        int gap = app.Scale(6);
+        int bx = x + app.Scale(10);
+        int by = y + app.Scale(4);
+        int continueId = continueBtn.Render(app, bx, by, btnW);
+        bx = bx + btnW + gap;
+        int stepOverId = stepOverBtn.Render(app, bx, by, btnW);
+        bx = bx + btnW + gap;
+        int stepIntoId = stepIntoBtn.Render(app, bx, by, btnW);
+        bx = bx + btnW + gap;
+        int stopId = stopBtn.Render(app, bx, by, btnW);
+        bx = bx + btnW + gap + gap;
+        string lineInfo = ZanIDE.T("Line: ", "行：") + Convert.ToString(execLine + 1);
+        int lineY = y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2;
+        c.DrawText(bx, lineY, lineInfo, t.textSecondary, t.fontSizeSmall);
+        if (Button.WasClicked(app, continueId)) { return 0; }
+        if (Button.WasClicked(app, stepOverId)) { return 1; }
+        if (Button.WasClicked(app, stepIntoId)) { return 2; }
+        if (Button.WasClicked(app, stopId)) { return 3; }
+        return 0 - 1;
+    }
+}
