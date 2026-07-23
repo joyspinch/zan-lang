@@ -1,0 +1,1150 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Irgen part: async/await CPS lowering (heap frames, resume steps) and
+// await A-normal-form normalization.
+partial class Irgen {
+    // ===== async / await CPS lowering =====
+    // Uniform heap frame is a flat i64 array. Fixed header (all i64):
+    //   0=state 1=done 2=awaiter 3=awaiter_step 4=result 5=own_resume
+    // then (for instance methods) the receiver, then params, then
+    // frame-resident locals, then one sub-task slot per await point.
+    //
+    // Ownership across suspension: the frame owns exactly one +1 reference for
+    // every live ARC value it captures. The receiver and ARC params are
+    // retained once in the ramp (so they outlive the caller's frame) and
+    // released once when the coroutine completes. ARC locals get their +1 from
+    // their initializer / assignment (mirroring normal codegen) and are
+    // released by the same completion epilogue. Reload/save across an await
+    // only copies the pointer bits -- it never changes a refcount.
+    string ToI64(string v, string lt) {
+        if (lt == "i64") { return v; }
+        string r = NT();
+        if (lt == "double") { L("  " + r + " = bitcast double " + v + " to i64"); return r; }
+        if (lt == "i1" || lt == "i8" || lt == "i16" || lt == "i32") {
+            L("  " + r + " = zext " + lt + " " + v + " to i64");
+            return r;
+        }
+        if (v == "null" || v == "0") { return "0"; }
+        L("  " + r + " = ptrtoint " + lt + " " + v + " to i64");
+        return r;
+    }
+    string FromI64(string v, string lt) {
+        if (lt == "i64") { return v; }
+        string r = NT();
+        if (lt == "double") { L("  " + r + " = bitcast i64 " + v + " to double"); return r; }
+        if (lt == "i1" || lt == "i8" || lt == "i16" || lt == "i32") {
+            L("  " + r + " = trunc i64 " + v + " to " + lt);
+            return r;
+        }
+        L("  " + r + " = inttoptr i64 " + v + " to " + lt);
+        return r;
+    }
+    string FrameGep(string bp, int idx) {
+        string p = NT();
+        L("  " + p + " = getelementptr i64, i64* " + bp + ", i64 " + idx);
+        return p;
+    }
+    void EmitAsyncSaveSlots() {
+        int i = 0;
+        while (i < asyncSlotReg.Count) {
+            string lt = MapType(asyncSlotTy[i]);
+            string v = NT();
+            L("  " + v + " = load " + lt + ", " + lt + "* " + asyncSlotReg[i]);
+            string vi = ToI64(v, lt);
+            string p = FrameGep("%ff", asyncSlotIdx[i]);
+            L("  store i64 " + vi + ", i64* " + p);
+            i = i + 1;
+        }
+    }
+    void EmitAsyncReloadSlots() {
+        int i = 0;
+        while (i < asyncSlotReg.Count) {
+            string lt = MapType(asyncSlotTy[i]);
+            string p = FrameGep("%ff", asyncSlotIdx[i]);
+            string vi = NT();
+            L("  " + vi + " = load i64, i64* " + p);
+            string v = FromI64(vi, lt);
+            L("  store " + lt + " " + v + ", " + lt + "* " + asyncSlotReg[i]);
+            i = i + 1;
+        }
+    }
+    bool IsAwaitStmt(Node s) {
+        if (s == null) { return false; }
+        int k = s.kind;
+        if (k == AK.VarDecl()) { return s.b != null && s.b.kind == AK.AwaitExpr(); }
+        if (k == AK.ReturnStmt()) { return s.a != null && s.a.kind == AK.AwaitExpr(); }
+        if (k == AK.ExprStmt()) {
+            Node e = s.a;
+            if (e == null) { return false; }
+            if (e.kind == AK.AwaitExpr()) { return true; }
+            if (e.kind == AK.Assignment() && e.b != null && e.b.kind == AK.AwaitExpr()) { return true; }
+            return false;
+        }
+        return false;
+    }
+
+    // ---- await normalization ----
+    // CPS lowering suspends with `ret void` and re-enters at a resume label, so
+    // SSA values computed earlier in the same expression would not dominate the
+    // resume block. Statements are therefore rewritten so `await` only appears
+    // in the root positions GenAwaitStmt lowers: each embedded await is hoisted
+    // into a fresh temp declared immediately before the statement, preserving
+    // left-to-right await order.
+    public int awHoistN;
+
+    bool ExprHasAwait(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Lambda()) { return false; }
+        if (e.kind == AK.AwaitExpr()) { return true; }
+        if (ExprHasAwait(e.a)) { return true; }
+        if (ExprHasAwait(e.b)) { return true; }
+        if (ExprHasAwait(e.c)) { return true; }
+        if (ExprHasAwait(e.d)) { return true; }
+        int i = 0;
+        while (i < e.kids.Count) {
+            if (ExprHasAwait(e.kids[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Declared type of a name: method params, then VarDecls in the body.
+    Node DeclTypeOf(Node m, string name) {
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param() && p.sval == name) { return p.type; }
+            i = i + 1;
+        }
+        return VarDeclTypeIn(m.d, name);
+    }
+    Node VarDeclTypeIn(Node s, string name) {
+        if (s == null) { return null; }
+        if (s.kind == AK.Lambda()) { return null; }
+        if (s.kind == AK.VarDecl() && s.sval == name) { return s.type; }
+        Node t = VarDeclTypeIn(s.a, name);
+        if (t != null) { return t; }
+        t = VarDeclTypeIn(s.b, name);
+        if (t != null) { return t; }
+        t = VarDeclTypeIn(s.c, name);
+        if (t != null) { return t; }
+        t = VarDeclTypeIn(s.d, name);
+        if (t != null) { return t; }
+        int i = 0;
+        while (i < s.kids.Count) {
+            t = VarDeclTypeIn(s.kids[i], name);
+            if (t != null) { return t; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Best-effort static result type of an awaited call (the callee's declared
+    // return type). Null when unresolvable; the temp then defaults to int.
+    Node AwaitCallTy(Node cls, Node m, Node callExpr) {
+        if (callExpr == null || callExpr.kind != AK.Call()) { return null; }
+        Node callee = callExpr.a;
+        if (callee == null) { return null; }
+        if (callee.kind == AK.Ident()) {
+            Node mm = FindMethodUp(cls, callee.sval);
+            if (mm != null) { return mm.type; }
+            return null;
+        }
+        if (callee.kind == AK.MemberAccess()) {
+            Node r = callee.a;
+            if (r == null) { return null; }
+            if (r.kind == AK.ThisExpr()) {
+                Node mt = FindMethodUp(cls, callee.sval);
+                if (mt != null) { return mt.type; }
+                return null;
+            }
+            if (r.kind == AK.Ident()) {
+                Node rc = binder.FindType(r.sval);
+                if (rc != null) {
+                    Node ms = FindMethodUp(rc, callee.sval);
+                    if (ms != null) { return ms.type; }
+                    return null;
+                }
+                Node vt = DeclTypeOf(m, r.sval);
+                if (vt != null) {
+                    Node rc2 = binder.FindType(vt.sval);
+                    if (rc2 != null) {
+                        Node mi = FindMethodUp(rc2, callee.sval);
+                        if (mi != null) { return mi.type; }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    Node MakeAwaitTemp(Node cls, Node m, Node aw, List<Node> pre) {
+        Node d = new Node(AK.VarDecl());
+        d.sval = "__aw$" + awHoistN;
+        awHoistN = awHoistN + 1;
+        d.type = AwaitCallTy(cls, m, aw.a);
+        d.b = aw;
+        d.line = aw.line; d.col = aw.col;
+        pre.Add(d);
+        Node id = new Node(AK.Ident());
+        id.sval = d.sval;
+        id.line = aw.line; id.col = aw.col;
+        return id;
+    }
+
+    // Rewrite an expression tree: hoist every embedded await into `pre` and
+    // replace it with a reference to the hoisted temp.
+    Node HoistExpr(Node cls, Node m, Node e, List<Node> pre) {
+        if (e == null) { return null; }
+        if (e.kind == AK.Lambda()) { return e; }
+        e.a = HoistExpr(cls, m, e.a, pre);
+        e.b = HoistExpr(cls, m, e.b, pre);
+        e.c = HoistExpr(cls, m, e.c, pre);
+        e.d = HoistExpr(cls, m, e.d, pre);
+        int i = 0;
+        while (i < e.kids.Count) {
+            e.kids[i] = HoistExpr(cls, m, e.kids[i], pre);
+            i = i + 1;
+        }
+        if (e.kind == AK.AwaitExpr()) { return MakeAwaitTemp(cls, m, e, pre); }
+        return e;
+    }
+
+    // Hoist awaits nested inside a root-position await's own arguments.
+    void HoistInsideRootAwait(Node cls, Node m, Node aw, List<Node> pre) {
+        Node call = aw.a;
+        if (call == null) { return; }
+        call.a = HoistExpr(cls, m, call.a, pre);
+        int i = 0;
+        while (i < call.kids.Count) {
+            call.kids[i] = HoistExpr(cls, m, call.kids[i], pre);
+            i = i + 1;
+        }
+    }
+
+    Node WrapBlock(Node s) {
+        if (s == null || s.kind == AK.Block()) { return s; }
+        Node b = new Node(AK.Block());
+        b.Add(s);
+        return b;
+    }
+
+    // Normalize one statement; hoisted temp decls are appended to `pre` and
+    // must be emitted before the statement.
+    void NormStmt(Node cls, Node m, Node s, List<Node> pre) {
+        if (s == null) { return; }
+        int k = s.kind;
+        if (k == AK.Block()) { NormBlock(cls, m, s); return; }
+        if (k == AK.VarDecl()) {
+            if (s.b != null && s.b.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, s.b, pre); return; }
+            s.b = HoistExpr(cls, m, s.b, pre);
+            return;
+        }
+        if (k == AK.ReturnStmt()) {
+            if (s.a != null && s.a.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, s.a, pre); return; }
+            s.a = HoistExpr(cls, m, s.a, pre);
+            return;
+        }
+        if (k == AK.ExprStmt()) {
+            Node e = s.a;
+            if (e == null) { return; }
+            if (e.kind == AK.AwaitExpr()) { HoistInsideRootAwait(cls, m, e, pre); return; }
+            if (e.kind == AK.Assignment() && e.b != null && e.b.kind == AK.AwaitExpr()) {
+                HoistInsideRootAwait(cls, m, e.b, pre);
+                return;
+            }
+            s.a = HoistExpr(cls, m, e, pre);
+            return;
+        }
+        if (k == AK.IfStmt()) {
+            s.a = HoistExpr(cls, m, s.a, pre);
+            s.b = WrapBlock(s.b); NormStmt(cls, m, s.b, pre);
+            s.c = WrapBlock(s.c); NormStmt(cls, m, s.c, pre);
+            return;
+        }
+        if (k == AK.WhileStmt()) {
+            if (ExprHasAwait(s.a)) {
+                // while (..await..) body  =>  while (true) { <temps>; if (cond) { body } else { break; } }
+                List<Node> cpre = new List<Node>();
+                Node cond = HoistExpr(cls, m, s.a, cpre);
+                Node brk = new Node(AK.Block());
+                brk.Add(new Node(AK.BreakStmt()));
+                Node ifs = new Node(AK.IfStmt());
+                ifs.a = cond;
+                ifs.b = WrapBlock(s.b);
+                ifs.c = brk;
+                Node nb = new Node(AK.Block());
+                int ci = 0;
+                while (ci < cpre.Count) { nb.Add(cpre[ci]); ci = ci + 1; }
+                nb.Add(ifs);
+                Node tl = new Node(AK.BoolLit());
+                tl.ival = 1;
+                s.a = tl;
+                s.b = nb;
+            }
+            s.b = WrapBlock(s.b); NormStmt(cls, m, s.b, pre);
+            return;
+        }
+        if (k == AK.ForStmt()) {
+            if (s.a != null) { NormStmt(cls, m, s.a, pre); }
+            s.d = WrapBlock(s.d); NormStmt(cls, m, s.d, pre);
+            return;
+        }
+        if (k == AK.ForeachStmt()) {
+            s.b = HoistExpr(cls, m, s.b, pre);
+            s.d = WrapBlock(s.d); NormStmt(cls, m, s.d, pre);
+            return;
+        }
+        if (k == AK.TryStmt()) {
+            s.a = WrapBlock(s.a); NormStmt(cls, m, s.a, pre);
+            if (s.b != null && s.b.a != null) { s.b.a = WrapBlock(s.b.a); NormStmt(cls, m, s.b.a, pre); }
+            s.c = WrapBlock(s.c); NormStmt(cls, m, s.c, pre);
+            return;
+        }
+        if (k == AK.SwitchStmt()) {
+            s.a = HoistExpr(cls, m, s.a, pre);
+            int i = 0;
+            while (i < s.kids.Count) {
+                Node cse = s.kids[i];
+                List<Node> ck = new List<Node>();
+                int j = 0;
+                while (j < cse.kids.Count) {
+                    Node cs = cse.kids[j];
+                    List<Node> cpre = new List<Node>();
+                    NormStmt(cls, m, cs, cpre);
+                    int cj = 0;
+                    while (cj < cpre.Count) { ck.Add(cpre[cj]); cj = cj + 1; }
+                    ck.Add(cs);
+                    j = j + 1;
+                }
+                cse.kids = ck;
+                i = i + 1;
+            }
+            return;
+        }
+    }
+
+    void NormBlock(Node cls, Node m, Node blk) {
+        if (blk == null) { return; }
+        List<Node> outk = new List<Node>();
+        int i = 0;
+        while (i < blk.kids.Count) {
+            Node s = blk.kids[i];
+            List<Node> pre = new List<Node>();
+            NormStmt(cls, m, s, pre);
+            int j = 0;
+            while (j < pre.Count) { outk.Add(pre[j]); j = j + 1; }
+            outk.Add(s);
+            i = i + 1;
+        }
+        blk.kids = outk;
+    }
+
+    void NormalizeAwaits(Node cls, Node m) {
+        if (m.d == null) { return; }
+        if (CountAwaits(m.d) == 0) { return; }
+        awHoistN = 0;
+        Node body = WrapBlock(m.d);
+        m.d = body;
+        NormBlock(cls, m, body);
+    }
+    // Detect `await Socket.<Intrinsic>(...)` -- the IO-reactor primitives the
+    // C host lowers to zan_io_{wait,recv,accept}_co (ReadReady/WriteReady are a
+    // readiness probe yielding no value; RecvOv/AcceptOv post a real op and the
+    // reactor writes the byte count / accepted fd into this frame's result slot
+    // before re-readying it). These suspend the CURRENT frame (no sub-task).
+    bool IsSocketIntrinsic(Node callExpr) {
+        if (callExpr == null || callExpr.kind != AK.Call()) { return false; }
+        Node c = callExpr.a;
+        if (c == null || c.kind != AK.MemberAccess()) { return false; }
+        if (c.a == null || c.a.kind != AK.Ident()) { return false; }
+        string cn = c.a.sval; string mn = c.sval;
+        if (cn == "Task" && mn == "Delay") { return true; }
+        if (cn != "Socket") { return false; }
+        return mn == "ReadReady" || mn == "WriteReady" || mn == "RecvOv" || mn == "AcceptOv";
+    }
+    string ArgI64(Node a) {
+        ExprVal v = GenExpr(a);
+        return ToI64(v.op, MapType(v.ty));
+    }
+    ExprVal EmitSocketIntrinsic(Node callExpr) {
+        string cn = callExpr.a.a.sval;
+        string mn = callExpr.a.sval;
+        int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
+        int st = seq + 1;
+        if (cn == "Task" && mn == "Delay") {
+            string ms = ArgI64(callExpr.kids[0]);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  call void @zan_co_delay(i64 " + ms + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (mn == "ReadReady" || mn == "WriteReady") {
+            string fd = ArgI64(callExpr.kids[0]);
+            string interest = "1"; if (mn == "WriteReady") { interest = "2"; }
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  call void @zan_io_wait_co(i64 " + fd + ", i32 " + interest + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (mn == "RecvOv") {
+            string fd = ArgI64(callExpr.kids[0]);
+            ExprVal bufv = GenExpr(callExpr.kids[1]);
+            string buf = bufv.op;
+            if (MapType(bufv.ty) != "i8*") {
+                string bt = NT(); L("  " + bt + " = bitcast " + MapType(bufv.ty) + " " + buf + " to i8*"); buf = bt;
+            }
+            string lenv = ArgI64(callExpr.kids[2]);
+            string len32 = NT(); L("  " + len32 + " = trunc i64 " + lenv + " to i32");
+            string outn = FrameGep("%ff", 4);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  call void @zan_io_recv_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            string rs = FrameGep("%ff", 4);
+            string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
+            return new ExprVal(rv, MkType("int"));
+        }
+        // AcceptOv
+        string fd2 = ArgI64(callExpr.kids[0]);
+        string outfd = FrameGep("%ff", 4);
+        EmitAsyncSaveSlots();
+        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+        L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
+        L("  ret void");
+        L("resume_" + st + ":");
+        term = false; curLbl = "resume_" + st;
+        EmitAsyncReloadSlots();
+        string rs2 = FrameGep("%ff", 4);
+        string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
+        return new ExprVal(rv2, MkType("int"));
+    }
+    // Lower `await <callExpr>`; returns the awaited result (+1 owned if ARC).
+    ExprVal EmitAwait(Node callExpr) {
+        if (curAsync && IsSocketIntrinsic(callExpr)) { return EmitSocketIntrinsic(callExpr); }
+        ExprVal sub = GenExpr(callExpr);
+        Node resTy = MkType("int");
+        if (sub.ty != null && sub.ty.a != null) { resTy = sub.ty.a; }
+        string subv = sub.op;
+        string subh = NT();
+        L("  " + subh + " = bitcast i8* " + subv + " to i64*");
+        string orp = FrameGep(subh, 5);
+        string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
+        string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
+        if (curAsync) {
+            int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
+            int st = seq + 1;
+            string ssp = FrameGep("%ff", curSubBase + seq);
+            string subi = NT(); L("  " + subi + " = ptrtoint i8* " + subv + " to i64");
+            L("  store i64 " + subi + ", i64* " + ssp);
+            string selfi = NT(); L("  " + selfi + " = ptrtoint i8* %fp to i64");
+            string awp = FrameGep(subh, 2);
+            L("  store i64 " + selfi + ", i64* " + awp);
+            string stepi = NT(); L("  " + stepi + " = ptrtoint void(i8*)* @" + curResumeSym + " to i64");
+            string awsp = FrameGep(subh, 3);
+            L("  store i64 " + stepi + ", i64* " + awsp);
+            L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
+            EmitAsyncSaveSlots();
+            string stp = FrameGep("%ff", 0);
+            L("  store i64 " + st + ", i64* " + stp);
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            string ssp2 = FrameGep("%ff", curSubBase + seq);
+            string subi2 = NT(); L("  " + subi2 + " = load i64, i64* " + ssp2);
+            string subh2 = NT(); L("  " + subh2 + " = inttoptr i64 " + subi2 + " to i64*");
+            string fv = NT(); L("  " + fv + " = inttoptr i64 " + subi2 + " to i8*");
+            string lt = MapType(resTy);
+            if (lt == "void") {
+                L("  call void @free(i8* " + fv + ")");
+                return new ExprVal("0", MkType("int"));
+            }
+            string rp = FrameGep(subh2, 4);
+            string resi = NT(); L("  " + resi + " = load i64, i64* " + rp);
+            string rvv = FromI64(resi, lt);
+            L("  call void @free(i8* " + fv + ")");
+            return new ExprVal(rvv, resTy);
+        }
+        L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
+        L("  call void @zan_co_sched_run()");
+        string lt2 = MapType(resTy);
+        if (lt2 == "void") {
+            L("  call void @free(i8* " + subv + ")");
+            return new ExprVal("0", MkType("int"));
+        }
+        string rp2 = FrameGep(subh, 4);
+        string resi2 = NT(); L("  " + resi2 + " = load i64, i64* " + rp2);
+        string rvv2 = FromI64(resi2, lt2);
+        L("  call void @free(i8* " + subv + ")");
+        return new ExprVal(rvv2, resTy);
+    }
+    // Release the frame's owned refs (params + locals via ReleaseLocalsFrom, and
+    // the receiver which is not tracked as a local). Call exactly once per exit.
+    void EmitAsyncEpilogue() {
+        ReleaseLocalsFrom(0);
+        if (curAsyncThis && curAsyncThisTy != null) {
+            EmitArcRelease("%this", curAsyncThisTy);
+        }
+    }
+    // Terminal completion: write result, mark done, wake the awaiter, return.
+    // Caller must have already run EmitAsyncEpilogue and ensured a +1 result.
+    void EmitAsyncComplete(string resi) {
+        string rp = FrameGep("%ff", 4);
+        L("  store i64 " + resi + ", i64* " + rp);
+        string dp = FrameGep("%ff", 1);
+        L("  store i64 1, i64* " + dp);
+        string sp = FrameGep("%ff", 0);
+        L("  store i64 -1, i64* " + sp);
+        string awp = FrameGep("%ff", 2);
+        string awi = NT(); L("  " + awi + " = load i64, i64* " + awp);
+        string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
+        string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
+        int lw = NL(); int lr = NL();
+        L("  br i1 " + has + ", label %L" + lw + ", label %L" + lr);
+        Label(lw);
+        string asp = FrameGep("%ff", 3);
+        string asi = NT(); L("  " + asi + " = load i64, i64* " + asp);
+        string asfn = NT(); L("  " + asfn + " = inttoptr i64 " + asi + " to void(i8*)*");
+        L("  call void @zan_co_ready(i8* " + aw + ", void(i8*)* " + asfn + ")");
+        L("  br label %L" + lr);
+        Label(lr);
+        L("  ret void");
+        term = true;
+    }
+    void GenAsyncReturn(Node s) {
+        if (s.a != null) {
+            ExprVal v = GenExpr(s.a);
+            string lt = MapType(v.ty);
+            string rv = v.op;
+            EmitArcRetain(rv, v.ty);
+            EmitAsyncEpilogue();
+            EmitAsyncComplete(ToI64(rv, lt));
+        } else {
+            EmitAsyncEpilogue();
+            EmitAsyncComplete("0");
+        }
+    }
+    void GenAwaitStmt(Node s) {
+        int k = s.kind;
+        if (k == AK.VarDecl()) {
+            Node aw = s.b;
+            ExprVal res = EmitAwait(aw.a);
+            Node ty = s.type; if (ty == null) { ty = res.ty; }
+            string lt = MapType(ty);
+            string reg;
+            if (curAsync) { reg = locReg[LocalIdx(s.sval)]; }
+            else { reg = AddLocal(s.sval, ty); L("  " + reg + " = alloca " + lt); }
+            string sv = Coerce(res, lt);
+            L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+            // await result is already +1 owned; transfer ownership (no retain).
+            return;
+        }
+        if (k == AK.ReturnStmt()) {
+            ExprVal res = EmitAwait(s.a.a);
+            if (curAsync) {
+                // await result already +1; transfer as the coroutine result.
+                string lt = MapType(res.ty);
+                EmitAsyncEpilogue();
+                EmitAsyncComplete(ToI64(res.op, lt));
+            } else {
+                ReleaseLocalsFrom(0);
+                if (curRet == "void") { L("  ret void"); }
+                else { L("  ret " + curRet + " " + Coerce(res, curRet)); }
+                term = true;
+            }
+            return;
+        }
+        Node e = s.a;
+        if (e.kind == AK.AwaitExpr()) {
+            ExprVal r0 = EmitAwait(e.a);
+            EmitArcRelease(r0.op, r0.ty);
+            return;
+        }
+        ExprVal r2 = EmitAwait(e.b.a);
+        StoreTo(e.a, r2);
+        // StoreTo retains the stored value; the await result was already +1,
+        // so drop the extra reference to keep the count balanced.
+        EmitArcRelease(r2.op, r2.ty);
+    }
+    void PrescanAsyncLocals(Node s, List<string> names, List<Node> types) {
+        if (s == null) { return; }
+        if (s.kind == AK.VarDecl()) {
+            names.Add(s.sval);
+            Node ty = s.type; if (ty == null) { ty = MkType("int"); }
+            types.Add(ty);
+        }
+        int i = 0;
+        while (i < s.kids.Count) { PrescanAsyncLocals(s.kids[i], names, types); i = i + 1; }
+        PrescanAsyncLocals(s.a, names, types);
+        PrescanAsyncLocals(s.b, names, types);
+        PrescanAsyncLocals(s.c, names, types);
+        PrescanAsyncLocals(s.d, names, types);
+    }
+    int CountAwaits(Node s) {
+        if (s == null) { return 0; }
+        int n = 0;
+        if (s.kind == AK.AwaitExpr()) { n = 1; }
+        int i = 0;
+        while (i < s.kids.Count) { n = n + CountAwaits(s.kids[i]); i = i + 1; }
+        n = n + CountAwaits(s.a) + CountAwaits(s.b) + CountAwaits(s.c) + CountAwaits(s.d);
+        return n;
+    }
+    void GenAsyncMethod(Node cls, Node m) {
+        bool stat = IsStatic(m);
+        int thisExtra = 0; if (!stat) { thisExtra = 1; }
+        List<string> pn = new List<string>();
+        List<Node> pt = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); }
+            i = i + 1;
+        }
+        List<string> lnames = new List<string>();
+        List<Node> ltypes = new List<Node>();
+        if (m.d != null) { PrescanAsyncLocals(m.d, lnames, ltypes); }
+        int awaitCount = 0; if (m.d != null) { awaitCount = CountAwaits(m.d); }
+        int header = 6;
+        int thisSlot = header;
+        int paramBase = header + thisExtra;
+        int localBase = paramBase + pn.Count;
+        int subBase = localBase + lnames.Count;
+        int nfields = subBase + awaitCount;
+        usesAsync = true;
+        string sym = MethodSym(cls.sval, m);
+        string resumeSym = sym + "$resume";
+        Node thisTy = MkType(cls.sval);
+        int j = 0;
+
+        // ---- ramp: allocate frame, capture (retain) receiver+params, return ----
+        StartFn();
+        curClass = cls.sval;
+        curHasThis = false;
+        string sig = "define i8* @" + sym + "(";
+        int np = 0;
+        if (!stat) { sig = sig + "%" + cls.sval + "* %this"; np = 1; }
+        j = 0;
+        while (j < pn.Count) {
+            if (np > 0) { sig = sig + ", "; }
+            sig = sig + MapType(pt[j]) + " %p" + j;
+            np = np + 1;
+            j = j + 1;
+        }
+        L(sig + ") {");
+        L("entry:");
+        string raw = NT();
+        L("  " + raw + " = call i8* @malloc(i64 " + (nfields * 8) + ")");
+        L("  %ff = bitcast i8* " + raw + " to i64*");
+        int h = 0;
+        // Zero the whole frame so every owning (RC) local slot starts null:
+        // the completion epilogue releases locals that the executed path may
+        // never have assigned, and sub-task slots are read on resume.
+        while (h < nfields) { L("  store i64 0, i64* " + FrameGep("%ff", h)); h = h + 1; }
+        string orp = FrameGep("%ff", 5);
+        string ori = NT(); L("  " + ori + " = ptrtoint void(i8*)* @" + resumeSym + " to i64");
+        L("  store i64 " + ori + ", i64* " + orp);
+        if (!stat) {
+            string ti = ToI64("%this", MapType(thisTy));
+            L("  store i64 " + ti + ", i64* " + FrameGep("%ff", thisSlot));
+            EmitArcRetain("%this", thisTy);
+        }
+        j = 0;
+        while (j < pn.Count) {
+            string lt = MapType(pt[j]);
+            string vi = ToI64("%p" + j, lt);
+            L("  store i64 " + vi + ", i64* " + FrameGep("%ff", paramBase + j));
+            EmitArcRetain("%p" + j, pt[j]);
+            j = j + 1;
+        }
+        L("  ret i8* " + raw);
+        L("}");
+
+        // ---- resume: dispatch on state, run body, spill/reload across await ----
+        StartFn();
+        curClass = cls.sval;
+        curHasThis = !stat;
+        curRet = "void";
+        curAsync = true;
+        curAwaitSeq = 0;
+        curResumeSym = resumeSym;
+        curSubBase = subBase;
+        curAsyncThis = !stat;
+        curAsyncThisSlot = thisSlot;
+        curAsyncThisTy = thisTy;
+        asyncSlotReg = new List<string>();
+        asyncSlotTy = new List<Node>();
+        asyncSlotIdx = new List<int>();
+        L("define void @" + resumeSym + "(i8* %fp) {");
+        L("entry:");
+        L("  %ff = bitcast i8* %fp to i64*");
+        if (!stat) {
+            // receiver is immutable across the coroutine: load once, dominates all.
+            string tr = NT();
+            L("  " + tr + " = load i64, i64* " + FrameGep("%ff", thisSlot));
+            L("  %this = inttoptr i64 " + tr + " to %" + cls.sval + "*");
+        }
+        j = 0;
+        while (j < pn.Count) {
+            string lt = MapType(pt[j]);
+            string reg = AddLocal(pn[j], pt[j]);
+            L("  " + reg + " = alloca " + lt);
+            asyncSlotReg.Add(reg); asyncSlotTy.Add(pt[j]); asyncSlotIdx.Add(paramBase + j);
+            j = j + 1;
+        }
+        j = 0;
+        while (j < lnames.Count) {
+            string lt = MapType(ltypes[j]);
+            string reg = AddLocal(lnames[j], ltypes[j]);
+            L("  " + reg + " = alloca " + lt);
+            asyncSlotReg.Add(reg); asyncSlotTy.Add(ltypes[j]); asyncSlotIdx.Add(localBase + j);
+            j = j + 1;
+        }
+        string st = NT();
+        L("  " + st + " = load i64, i64* " + FrameGep("%ff", 0));
+        string sw = "  switch i64 " + st + ", label %co.start [ i64 0, label %co.start";
+        int a2 = 1;
+        while (a2 <= awaitCount) { sw = sw + " i64 " + a2 + ", label %resume_" + a2; a2 = a2 + 1; }
+        L(sw + " ]");
+        L("co.start:");
+        term = false; curLbl = "co.start";
+        EmitAsyncReloadSlots();
+        if (m.d != null) { GenStmt(m.d); }
+        if (!term) { EmitAsyncEpilogue(); EmitAsyncComplete("0"); }
+        L("}");
+        curAsync = false;
+        curAsyncThis = false;
+        curAsyncThisTy = null;
+    }
+    // Directory listing + exe-path helpers (Windows host). @zan_dir_list
+    // returns the file names matching a glob pattern joined by '\n' (empty
+    // string when the directory is missing); @zan_exe_dir returns the
+    // directory containing the running executable.
+    void EmitDirRuntime() {
+        if (!ExternSeen("zan_exe_dir_into")) { externDecls.Add("zan_exe_dir_into"); H("declare i64 @zan_exe_dir_into(i8*, i64)"); }
+        if (!ExternSeen("zan_dir_list_into")) { externDecls.Add("zan_dir_list_into"); H("declare i64 @zan_dir_list_into(i8*, i8*, i64)"); }
+        H("define i8* @zan_exe_dir() {");
+        H("entry:");
+        H("  %buf = call i8* @malloc(i64 1024)");
+        H("  %n = call i64 @zan_exe_dir_into(i8* %buf, i64 1024)");
+        H("  ret i8* %buf");
+        H("}");
+        H("define i8* @zan_dir_list(i8* %pat) {");
+        H("entry:");
+        H("  %buf = call i8* @malloc(i64 65536)");
+        H("  %n = call i64 @zan_dir_list_into(i8* %pat, i8* %buf, i64 65536)");
+        H("  ret i8* %buf");
+        H("}");
+    }
+    void EmitAsyncRuntime() {
+        H("declare void @zan_io_wait_co(i64, i32, i8*, void(i8*)*)");
+        H("declare void @zan_io_recv_co(i64, i8*, i32, i8*, void(i8*)*, i64*)");
+        H("declare void @zan_io_accept_co(i64, i8*, void(i8*)*, i64*)");
+        if (hostWin) {
+            if (!ExternSeen("GetTickCount64")) { externDecls.Add("GetTickCount64"); H("declare i64 @GetTickCount64()"); }
+            if (!ExternSeen("Sleep")) { externDecls.Add("Sleep"); H("declare void @Sleep(i64)"); }
+        } else {
+            if (!ExternSeen("gettimeofday")) { externDecls.Add("gettimeofday"); H("declare i32 @gettimeofday(i8*, i8*)"); }
+            if (!ExternSeen("usleep")) { externDecls.Add("usleep"); H("declare i32 @usleep(i32)"); }
+        }
+        H("%co_node = type { i8*, i8*, i8* }");
+        H("%co_timer = type { i8*, i64, i8*, i8* }");
+        H("@co_head = global i8* null");
+        H("@co_tail = global i8* null");
+        H("@co_timers = global i8* null");
+        if (hostWin) {
+            H("define internal i64 @__zan_co_now_ms() {");
+            H("entry:");
+            H("  %n = call i64 @GetTickCount64()");
+            H("  ret i64 %n");
+            H("}");
+            H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
+            H("entry:");
+            H("  %pos = icmp sgt i64 %timeout, 0");
+            H("  br i1 %pos, label %sleep, label %ret");
+            H("sleep:");
+            H("  call void @Sleep(i64 %timeout)");
+            H("  br label %ret");
+            H("ret:");
+            H("  ret i32 0");
+            H("}");
+        } else {
+            H("define internal i64 @__zan_co_now_ms() {");
+            H("entry:");
+            H("  %tv = alloca [2 x i64]");
+            H("  %tvp = bitcast [2 x i64]* %tv to i8*");
+            H("  call i32 @gettimeofday(i8* %tvp, i8* null)");
+            H("  %secp = getelementptr [2 x i64], [2 x i64]* %tv, i64 0, i64 0");
+            H("  %usecp = getelementptr [2 x i64], [2 x i64]* %tv, i64 0, i64 1");
+            H("  %sec = load i64, i64* %secp");
+            H("  %usec = load i64, i64* %usecp");
+            H("  %ms1 = mul i64 %sec, 1000");
+            H("  %ms2 = sdiv i64 %usec, 1000");
+            H("  %n = add i64 %ms1, %ms2");
+            H("  ret i64 %n");
+            H("}");
+            H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
+            H("entry:");
+            H("  %pos = icmp sgt i64 %timeout, 0");
+            H("  br i1 %pos, label %sleep, label %ret");
+            H("sleep:");
+            H("  %us64 = mul i64 %timeout, 1000");
+            H("  %us = trunc i64 %us64 to i32");
+            H("  call i32 @usleep(i32 %us)");
+            H("  br label %ret");
+            H("ret:");
+            H("  ret i32 0");
+            H("}");
+        }
+        H("define weak i32 @zan_io_pump() {");
+        H("entry:");
+        H("  %w = call i32 @zan_io_pump_timeout(i64 -1)");
+        H("  ret i32 %w");
+        H("}");
+        H("define void @zan_co_sched_init() {");
+        H("entry:");
+        H("  store i8* null, i8** @co_head");
+        H("  store i8* null, i8** @co_tail");
+        H("  store i8* null, i8** @co_timers");
+        H("  ret void");
+        H("}");
+        H("define internal void @__zan_co_reap(i8* %f) {");
+        H("entry:");
+        H("  call void @free(i8* %f)");
+        H("  ret void");
+        H("}");
+        H("define void @zan_co_ready(i8* %frame, void(i8*)* %step) {");
+        H("entry:");
+        H("  %n = call i8* @malloc(i64 24)");
+        H("  %np = bitcast i8* %n to %co_node*");
+        H("  %nx = getelementptr %co_node, %co_node* %np, i32 0, i32 0");
+        H("  store i8* null, i8** %nx");
+        H("  %frp = getelementptr %co_node, %co_node* %np, i32 0, i32 1");
+        H("  store i8* %frame, i8** %frp");
+        H("  %stp = getelementptr %co_node, %co_node* %np, i32 0, i32 2");
+        H("  %si = bitcast void(i8*)* %step to i8*");
+        H("  store i8* %si, i8** %stp");
+        H("  %tail = load i8*, i8** @co_tail");
+        H("  %isempty = icmp eq i8* %tail, null");
+        H("  br i1 %isempty, label %sethead, label %appendtail");
+        H("sethead:");
+        H("  store i8* %n, i8** @co_head");
+        H("  store i8* %n, i8** @co_tail");
+        H("  ret void");
+        H("appendtail:");
+        H("  %tp = bitcast i8* %tail to %co_node*");
+        H("  %tnx = getelementptr %co_node, %co_node* %tp, i32 0, i32 0");
+        H("  store i8* %n, i8** %tnx");
+        H("  store i8* %n, i8** @co_tail");
+        H("  ret void");
+        H("}");
+        H("define void @zan_co_delay(i64 %ms, i8* %frame, void(i8*)* %step) {");
+        H("entry:");
+        H("  %raw = call i8* @malloc(i64 32)");
+        H("  %tn = bitcast i8* %raw to %co_timer*");
+        H("  %old = load i8*, i8** @co_timers");
+        H("  %tnp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 0");
+        H("  store i8* %old, i8** %tnp");
+        H("  %now = call i64 @__zan_co_now_ms()");
+        H("  %pos = icmp sgt i64 %ms, 0");
+        H("  %delay = select i1 %pos, i64 %ms, i64 0");
+        H("  %deadline = add i64 %now, %delay");
+        H("  %tdp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 1");
+        H("  store i64 %deadline, i64* %tdp");
+        H("  %tfp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 2");
+        H("  store i8* %frame, i8** %tfp");
+        H("  %tsp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 3");
+        H("  %si = bitcast void(i8*)* %step to i8*");
+        H("  store i8* %si, i8** %tsp");
+        H("  store i8* %raw, i8** @co_timers");
+        H("  ret void");
+        H("}");
+        H("define void @zan_co_sched_run() {");
+        H("entry:");
+        H("  %a.best = alloca i8*");
+        H("  %a.bestprev = alloca i8*");
+        H("  %a.cur = alloca i8*");
+        H("  %a.curprev = alloca i8*");
+        H("  br label %loop");
+        H("loop:");
+        H("  %head = load i8*, i8** @co_head");
+        H("  %qe = icmp eq i8* %head, null");
+        H("  br i1 %qe, label %timers, label %body");
+        H("body:");
+        H("  %hp = bitcast i8* %head to %co_node*");
+        H("  %frpb = getelementptr %co_node, %co_node* %hp, i32 0, i32 1");
+        H("  %fr = load i8*, i8** %frpb");
+        H("  %stpb = getelementptr %co_node, %co_node* %hp, i32 0, i32 2");
+        H("  %sti8 = load i8*, i8** %stpb");
+        H("  %nxpb = getelementptr %co_node, %co_node* %hp, i32 0, i32 0");
+        H("  %nx = load i8*, i8** %nxpb");
+        H("  store i8* %nx, i8** @co_head");
+        H("  %islast = icmp eq i8* %nx, null");
+        H("  br i1 %islast, label %last, label %after");
+        H("last:");
+        H("  store i8* null, i8** @co_tail");
+        H("  br label %after");
+        H("after:");
+        H("  call void @free(i8* %head)");
+        H("  %stfn = bitcast i8* %sti8 to void(i8*)*");
+        H("  call void %stfn(i8* %fr)");
+        H("  br label %loop");
+        H("timers:");
+        H("  %t0 = load i8*, i8** @co_timers");
+        H("  %te = icmp eq i8* %t0, null");
+        H("  br i1 %te, label %iopump, label %scansetup");
+        H("scansetup:");
+        H("  store i8* %t0, i8** %a.best");
+        H("  store i8* null, i8** %a.bestprev");
+        H("  %t0p = bitcast i8* %t0 to %co_timer*");
+        H("  %t0np = getelementptr %co_timer, %co_timer* %t0p, i32 0, i32 0");
+        H("  %t0next = load i8*, i8** %t0np");
+        H("  store i8* %t0next, i8** %a.cur");
+        H("  store i8* %t0, i8** %a.curprev");
+        H("  br label %scancond");
+        H("scancond:");
+        H("  %cur = load i8*, i8** %a.cur");
+        H("  %curnull = icmp eq i8* %cur, null");
+        H("  br i1 %curnull, label %scandone, label %scanbody");
+        H("scanbody:");
+        H("  %curb = load i8*, i8** %a.cur");
+        H("  %bestb = load i8*, i8** %a.best");
+        H("  %curbp = bitcast i8* %curb to %co_timer*");
+        H("  %bestbp = bitcast i8* %bestb to %co_timer*");
+        H("  %curduep = getelementptr %co_timer, %co_timer* %curbp, i32 0, i32 1");
+        H("  %curdue = load i64, i64* %curduep");
+        H("  %bestduep = getelementptr %co_timer, %co_timer* %bestbp, i32 0, i32 1");
+        H("  %bestdue = load i64, i64* %bestduep");
+        H("  %dlt = icmp ult i64 %curdue, %bestdue");
+        H("  br i1 %dlt, label %scantake, label %scannext");
+        H("scantake:");
+        H("  %curt = load i8*, i8** %a.cur");
+        H("  %curprevt = load i8*, i8** %a.curprev");
+        H("  store i8* %curt, i8** %a.best");
+        H("  store i8* %curprevt, i8** %a.bestprev");
+        H("  br label %scannext");
+        H("scannext:");
+        H("  %curn = load i8*, i8** %a.cur");
+        H("  store i8* %curn, i8** %a.curprev");
+        H("  %curnp = bitcast i8* %curn to %co_timer*");
+        H("  %curnextp = getelementptr %co_timer, %co_timer* %curnp, i32 0, i32 0");
+        H("  %curnextv = load i8*, i8** %curnextp");
+        H("  store i8* %curnextv, i8** %a.cur");
+        H("  br label %scancond");
+        H("scandone:");
+        H("  %best = load i8*, i8** %a.best");
+        H("  %bestprev = load i8*, i8** %a.bestprev");
+        H("  %bestp = bitcast i8* %best to %co_timer*");
+        H("  %bestduep2 = getelementptr %co_timer, %co_timer* %bestp, i32 0, i32 1");
+        H("  %bestdued = load i64, i64* %bestduep2");
+        H("  %nowd = call i64 @__zan_co_now_ms()");
+        H("  %duenow = icmp sle i64 %bestdued, %nowd");
+        H("  br i1 %duenow, label %timerdue, label %timerwait");
+        H("timerwait:");
+        H("  %remaining = sub i64 %bestdued, %nowd");
+        H("  call i32 @zan_io_pump_timeout(i64 %remaining)");
+        H("  br label %loop");
+        H("timerdue:");
+        H("  %bestp2 = bitcast i8* %best to %co_timer*");
+        H("  %bestnextp = getelementptr %co_timer, %co_timer* %bestp2, i32 0, i32 0");
+        H("  %bestnextv = load i8*, i8** %bestnextp");
+        H("  %bpnull = icmp eq i8* %bestprev, null");
+        H("  br i1 %bpnull, label %unlinkhead, label %unlinkmid");
+        H("unlinkhead:");
+        H("  store i8* %bestnextv, i8** @co_timers");
+        H("  br label %afterunlink");
+        H("unlinkmid:");
+        H("  %bestprevp = bitcast i8* %bestprev to %co_timer*");
+        H("  %bpnextp = getelementptr %co_timer, %co_timer* %bestprevp, i32 0, i32 0");
+        H("  store i8* %bestnextv, i8** %bpnextp");
+        H("  br label %afterunlink");
+        H("afterunlink:");
+        H("  %bestp3 = bitcast i8* %best to %co_timer*");
+        H("  %bframep = getelementptr %co_timer, %co_timer* %bestp3, i32 0, i32 2");
+        H("  %bframe = load i8*, i8** %bframep");
+        H("  %bstepp = getelementptr %co_timer, %co_timer* %bestp3, i32 0, i32 3");
+        H("  %bstepi8 = load i8*, i8** %bstepp");
+        H("  %bstepfn = bitcast i8* %bstepi8 to void(i8*)*");
+        H("  call void @zan_co_ready(i8* %bframe, void(i8*)* %bstepfn)");
+        H("  call void @free(i8* %best)");
+        H("  br label %loop");
+        H("iopump:");
+        H("  %woke = call i32 @zan_io_pump()");
+        H("  %iomore = icmp sgt i32 %woke, 0");
+        H("  br i1 %iomore, label %loop, label %exit");
+        H("exit:");
+        H("  ret void");
+        H("}");
+    }
+
+    void GenMethod(Node cls, Node m, bool ctor) {
+        NormalizeAwaits(cls, m);
+        if (IsAsync(m)) { GenAsyncMethod(cls, m); return; }
+        StartFn();
+        curClass = cls.sval;
+        curRet = MapType(m.type);
+        bool stat = IsStatic(m);
+        curHasThis = !stat;
+        string sig = "define " + curRet + " @" + MethodSym(cls.sval, m) + "(";
+        int np = 0;
+        if (!stat) {
+            sig = sig + "%" + cls.sval + "* %this";
+            np = 1;
+        }
+        List<string> pn = new List<string>();
+        List<Node> pt = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); }
+            i = i + 1;
+        }
+        int j = 0;
+        while (j < pn.Count) {
+            if (np > 0) { sig = sig + ", "; }
+            sig = sig + MapType(pt[j]) + " %p" + j;
+            np = np + 1;
+            j = j + 1;
+        }
+        sig = sig + ") {";
+        L(sig);
+        L("entry:");
+        j = 0;
+        while (j < pn.Count) {
+            string lt = MapType(pt[j]);
+            string preg = AddLocal(pn[j], pt[j]);
+            L("  " + preg + " = alloca " + lt);
+            L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
+            EmitArcRetain("%p" + j, pt[j]);
+            j = j + 1;
+        }
+        if (m.d != null) { GenStmt(m.d); }
+        if (!term) {
+            ReleaseLocalsFrom(0);
+            if (curRet == "void") { L("  ret void"); }
+            else if (curRet == "i64") { L("  ret i64 0"); }
+            else { L("  ret " + curRet + " null"); }
+        }
+        L("}");
+    }
+
+    void GenCtor(Node cls, Node m) {
+        StartFn();
+        curClass = cls.sval;
+        curRet = "void";
+        curHasThis = true;
+        string sig = "define void @" + cls.sval + "_ctor(%" + cls.sval + "* %this";
+        List<string> pn = new List<string>();
+        List<Node> pt = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); }
+            i = i + 1;
+        }
+        int j = 0;
+        while (j < pn.Count) {
+            sig = sig + ", " + MapType(pt[j]) + " %p" + j;
+            j = j + 1;
+        }
+        sig = sig + ") {";
+        L(sig);
+        L("entry:");
+        j = 0;
+        while (j < pn.Count) {
+            string lt = MapType(pt[j]);
+            string preg = AddLocal(pn[j], pt[j]);
+            L("  " + preg + " = alloca " + lt);
+            L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
+            EmitArcRetain("%p" + j, pt[j]);
+            j = j + 1;
+        }
+        if (m.d != null) { GenStmt(m.d); }
+        if (!term) {
+            ReleaseLocalsFrom(0);
+            L("  ret void");
+        }
+        L("}");
+    }
+
+    // Emit: if `cond` (an i1) holds, print `msg` and exit(1) -- never falling
+    // through with an invalid result. Shared by every I/O return-value check.
+    void EmitAbortIf(string cond, string msg, int len) {
+        int lf = NL(); int lk = NL();
+        L("  br i1 " + cond + ", label %L" + lf + ", label %L" + lk);
+        Label(lf);
+        string em = NT(); L("  " + em + " = getelementptr inbounds [" + len + " x i8], [" + len + " x i8]* " + msg + ", i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + em + ")");
+        L("  call void @exit(i32 1)");
+        L("  unreachable");
+        Label(lk);
+    }
+
+    void EmitFopenCheck(string fp, string msg, int len) {
+        string np = NT(); L("  " + np + " = icmp eq i8* " + fp + ", null");
+        EmitAbortIf(np, msg, len);
+    }
+
+    void GenMainWrapper(Node unit) {
+        string owner = "";
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                if (binder.FindMethod(d, "Main") != null) { owner = d.sval; }
+            }
+            i = i + 1;
+        }
+        if (owner == "") { return; }
+        L("define i32 @main(i32 %argc, i8** %argv) {");
+        L("entry:");
+        L("  store i32 %argc, i32* @__zan_argc");
+        L("  store i8** %argv, i8*** @__zan_argv");
+        // Programs emit UTF-8 bytes; switch the Windows console to code page
+        // 65001 so CJK/accented output renders instead of mojibake. Redirected
+        // output (pipe/file) keeps its raw UTF-8 bytes.
+        if (hostWin) {
+            L("  call i32 @SetConsoleOutputCP(i32 65001)");
+            L("  call i32 @SetConsoleCP(i32 65001)");
+        }
+        // Install a root exception handler so an uncaught throw prints a
+        // message and exits 1 instead of longjmp-ing through an empty stack.
+        string rbuf = NT(); L("  " + rbuf + " = alloca [32 x i64]");
+        string rbp = NT(); L("  " + rbp + " = bitcast [32 x i64]* " + rbuf + " to i8*");
+        string rsp = NT(); L("  " + rsp + " = load i64, i64* @__exc_sp");
+        string rslot = NT(); L("  " + rslot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + rsp);
+        L("  store i8* " + rbp + ", i8** " + rslot);
+        string rsp1 = NT(); L("  " + rsp1 + " = add i64 " + rsp + ", 1");
+        L("  store i64 " + rsp1 + ", i64* @__exc_sp");
+        string rfp = NT(); L("  " + rfp + " = call i8* @llvm.frameaddress.p0(i32 0)");
+        string rr = NT(); L("  " + rr + " = call i32 @_setjmp(i8* " + rbp + ", i8* " + rfp + ")");
+        string rc = NT(); L("  " + rc + " = icmp ne i32 " + rr + ", 0");
+        int lbody = NL(); int lcatch = NL();
+        L("  br i1 " + rc + ", label %L" + lcatch + ", label %L" + lbody);
+        Label(lbody);
+        EmitStaticInits(unit);
+        L("  call void @" + owner + "_Main()");
+        L("  ret i32 0");
+        Label(lcatch);
+        string mp = NT(); L("  " + mp + " = getelementptr inbounds [25 x i8], [25 x i8]* @.msg.unhandled, i64 0, i64 0");
+        string xv = NT(); L("  " + xv + " = load i8*, i8** @__exc_val");
+        string xn = NT(); L("  " + xn + " = icmp eq i8* " + xv + ", null");
+        string xm = NT(); L("  " + xm + " = select i1 " + xn + ", i8* getelementptr inbounds ([13 x i8], [13 x i8]* @.msg.exnil, i64 0, i64 0), i8* " + xv);
+        L("  call i32 (i8*, ...) @printf(i8* " + mp + ", i8* " + xm + ")");
+        L("  ret i32 1");
+        L("}");
+    }
+}

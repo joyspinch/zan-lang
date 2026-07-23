@@ -25,6 +25,9 @@ endif()
 set(_srcs
   ${SELFHOST_DIR}/main.zan
   ${SELFHOST_DIR}/irgen.zan
+  ${SELFHOST_DIR}/irgen_async.zan
+  ${SELFHOST_DIR}/irgen_stmt.zan
+  ${SELFHOST_DIR}/irgen_expr.zan
   ${SELFHOST_DIR}/checker.zan
   ${SELFHOST_DIR}/binder.zan
   ${SELFHOST_DIR}/diag.zan

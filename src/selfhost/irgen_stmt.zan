@@ -1,0 +1,782 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Irgen part: statement codegen, vtable emission for polymorphic classes
+// and the non-emitting argument typer used for overload resolution.
+partial class Irgen {
+    // ---- statements ----
+    void GenStmt(Node s) {
+        if (s == null) { return; }
+        // A label is a branch target, so it must be emitted even when the
+        // current block is already terminated (e.g. code after a goto).
+        if (s.kind == AK.LabelStmt()) {
+            int lid = LabelId(s.sval);
+            if (!term) { L("  br label %L" + lid); }
+            Label(lid);
+            return;
+        }
+        if (term) { return; }
+        int k = s.kind;
+        if (IsAwaitStmt(s)) { GenAwaitStmt(s); return; }
+        if (curAsync && k == AK.ReturnStmt()) { GenAsyncReturn(s); return; }
+        if (k == AK.Block()) {
+            int scopeStart = locName.Count;
+            int i = 0;
+            while (i < s.kids.Count) { GenStmt(s.kids[i]); i = i + 1; }
+            if (!term) { ReleaseLocalsFrom(scopeStart); }
+            TrimLocals(scopeStart);
+        } else if (k == AK.VarDecl()) {
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            GenVarDecl(s);
+            EmitTempReleases();
+        } else if (k == AK.DeconDecl()) {
+            GenDecon(s);
+        } else if (k == AK.ExprStmt()) {
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            GenExpr(s.a);
+            EmitTempReleases();
+        } else if (k == AK.ReturnStmt()) {
+            if (s.a != null) {
+                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+                ExprVal v = GenExpr(s.a);
+                if (curRet == "void") {
+                    EmitTempReleases();
+                    ReleaseLocalsFrom(0);
+                    L("  ret void");
+                } else {
+                    string rv = Coerce(v, curRet);
+                    EmitArcRetain(rv, v.ty);
+                    EmitTempReleases();
+                    ReleaseLocalsFrom(0);
+                    L("  ret " + curRet + " " + rv);
+                }
+            } else {
+                ReleaseLocalsFrom(0);
+                L("  ret void");
+            }
+            term = true;
+        } else if (k == AK.IfStmt()) {
+            GenIf(s);
+        } else if (k == AK.WhileStmt()) {
+            GenWhile(s);
+        } else if (k == AK.ForStmt()) {
+            GenFor(s);
+        } else if (k == AK.ForeachStmt()) {
+            GenForeach(s);
+        } else if (k == AK.SwitchStmt()) {
+            GenSwitchStmt(s);
+        } else if (k == AK.TryStmt()) {
+            GenTry(s);
+        } else if (k == AK.ThrowStmt()) {
+            GenThrow(s);
+        } else if (k == AK.BreakStmt()) {
+            if (brkTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + brkTarget); term = true; }
+        } else if (k == AK.ContinueStmt()) {
+            if (contTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + contTarget); term = true; }
+        } else if (k == AK.GotoStmt()) {
+            int gid = LabelId(s.sval);
+            L("  br label %L" + gid);
+            term = true;
+        } else {
+            GenExpr(s);
+        }
+    }
+
+    bool IsClassPtr(string s) {
+        if (s.Length < 2) { return false; }
+        if (s.Substring(0, 1) != "%") { return false; }
+        if (s.Substring(s.Length - 1, 1) != "*") { return false; }
+        return true;
+    }
+
+    // Any LLVM pointer type (class pointer or the generic i8*).
+    bool IsPtrLL(string s) {
+        if (s == "i8*") { return true; }
+        return IsClassPtr(s);
+    }
+
+    // when null literal, retype to the target LLVM type; bitcast class pointers
+    // (e.g. a derived instance stored into a base-typed slot)
+    string Coerce(ExprVal v, string llty) {
+        if (v.op == "null") { if (llty == "i64") { return "0"; } return "null"; }
+        if (v.op == "0" && IsPtrLL(llty)) { return "null"; }
+        string vt = MapType(v.ty);
+        // erased i64 slots: pack pointers via ptrtoint / unpack via inttoptr
+        if (llty == "i64" && IsPtrLL(vt)) { return ToI64(v.op, vt); }
+        if (vt == "i64" && IsPtrLL(llty)) {
+            string tp = NT();
+            L("  " + tp + " = inttoptr i64 " + v.op + " to " + llty);
+            return tp;
+        }
+        if (vt != llty && IsClassPtr(vt) && IsClassPtr(llty)) {
+            string t = NT();
+            L("  " + t + " = bitcast " + vt + " " + v.op + " to " + llty);
+            return t;
+        }
+        // implicit integer -> double promotion (e.g. `double x = 5;`)
+        if (vt == "i64" && llty == "double") {
+            string t = NT();
+            L("  " + t + " = sitofp i64 " + v.op + " to double");
+            return t;
+        }
+        return v.op;
+    }
+
+    // ---- vtable emission for polymorphic classes ----
+    void EmitVtable(Node cls) {
+        List<string> slots = new List<string>();
+        CollectVSlots(cls, slots);
+        string s = "@" + cls.sval + "_vtable = global [" + slots.Count + " x i8*] [";
+        int i = 0;
+        while (i < slots.Count) {
+            string sl = slots[i];
+            string impl = ResolveImpl(cls, sl);
+            Node m = FindMethodUp(cls, sl);
+            if (i > 0) { s = s + ", "; }
+            s = s + "i8* bitcast (" + MethodFnTypeThis(m, impl) + " @" + impl + "_" + sl + " to i8*)";
+            i = i + 1;
+        }
+        s = s + "]";
+        H(s);
+    }
+
+    Node FindMethodUp(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node m = binder.FindMethod(c, name);
+            if (m != null) { return m; }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    string MethodOwner(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            if (binder.FindMethod(c, name) != null) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    // Number of methods named `name` declared directly in `cls`.
+    int MethodCount(Node cls, string name) {
+        if (cls == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // A type name reduced to a symbol-safe tag for overload mangling.
+    string TypeTag(Node t) {
+        if (t == null) { return "v"; }
+        if (t.sval == "") { return "v"; }
+        return t.sval;
+    }
+
+    // The LLVM symbol for a method. Non-overloaded names stay `Owner_Name`
+    // (so all existing output -- including the self-host fixed point, which
+    // has no overloads -- is unchanged); an overloaded name gains an arity and
+    // per-parameter-type suffix so each overload is a distinct definition.
+    string MethodSym(string owner, Node m) {
+        if (HasMod(m, MOD.Extern())) { return ExternName(m); }
+        Node oc = binder.FindType(owner);
+        if (MethodCount(oc, m.sval) <= 1) { return owner + "_" + m.sval; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(owner);
+        sb.Append("_");
+        sb.Append(m.sval);
+        sb.Append("__");
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                sb.Append("_");
+                sb.Append(TypeTag(p.type));
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // ---- non-emitting argument typer (for overload resolution only) ----
+    // Yields the static type of an argument expression without generating any
+    // IR. Returns null when the type cannot be determined; callers treat that
+    // as "compatible with anything" so nothing is mis-resolved.
+    Node ArgTypeNode(Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.IntLit()) { return MkType("int"); }
+        if (k == AK.FloatLit()) { return MkType("double"); }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.ThisExpr()) { return MkType(curClass); }
+        if (k == AK.CastExpr()) { return e.type; }
+        if (k == AK.NewExpr()) { return e.type; }
+        if (k == AK.IsExpr()) { return MkType("bool"); }
+        if (k == AK.Ident()) {
+            int li = LocalIdx(e.sval);
+            if (li >= 0) { return locType[li]; }
+            return FieldType(binder.FindType(curClass), e.sval);
+        }
+        if (k == AK.MemberAccess()) {
+            Node cls = ClassOf(ArgTypeNode(e.a));
+            if (cls != null) { return FieldType(cls, e.sval); }
+            return null;
+        }
+        if (k == AK.Unary()) { if (e.op == TK.Bang()) { return MkType("bool"); } return ArgTypeNode(e.a); }
+        if (k == AK.PostfixUnary()) { return ArgTypeNode(e.a); }
+        if (k == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq() || op == TK.AmpAmp() || op == TK.PipePipe()) {
+                return MkType("bool");
+            }
+            Node lt = ArgTypeNode(e.a);
+            Node rt = ArgTypeNode(e.b);
+            if (IsStr(lt) || IsStr(rt)) { return MkType("string"); }
+            if (lt != null) { return lt; }
+            return rt;
+        }
+        if (k == AK.Index()) {
+            Node ot = ArgTypeNode(e.a);
+            if (ot != null) {
+                if (IsListType(ot)) { return ListElem(ot); }
+                if (ot.sval == "string") { return MkType("char"); }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    string ArgTag(Node e) { Node t = ArgTypeNode(e); if (t == null) { return ""; } return t.sval; }
+
+    // How well candidate `m` fits the call `e`: +1 for matching the caller's
+    // static/instance context, +4 for each exact argument-type match, -1 for a
+    // known mismatch (an implicit conversion may still apply, so it is not
+    // disqualifying). Unknown argument types are neutral.
+    int ScoreCand(Node m, Node e, int argc, bool wantStatic) {
+        int score = 0;
+        if (IsStatic(m) == wantStatic) { score = score + 1; }
+        int a = 0;
+        while (a < argc) {
+            string at = ArgTag(e.kids[a]);
+            if (at != "") {
+                if (at == TypeTag(ParamTypeNode(m, a))) { score = score + 4; }
+                else { score = score - 1; }
+            }
+            a = a + 1;
+        }
+        return score;
+    }
+
+    // Select the method named `name` in `cls` for the call `e`. With a single
+    // candidate the behaviour is unchanged (arity is not consulted, so
+    // default-argument calls still resolve, and the self-host fixed point --
+    // which has no overloads -- emits byte-identical IR). With several
+    // overloads we keep those whose arity admits the call, then pick the best
+    // argument-type match for the caller's static/instance context; an empty
+    // candidate set or a tie is a diagnostic.
+    Node ResolveMethod(Node cls, string name, Node e, bool wantStatic) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name) { cands.Add(m); }
+            i = i + 1;
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        int argc = e.kids.Count;
+        List<Node> fit = new List<Node>();
+        i = 0;
+        while (i < cands.Count) {
+            Node m = cands[i];
+            int tot = 0; int req = 0; int j = 0;
+            Node lastP = null;
+            while (j < m.kids.Count) {
+                if (m.kids[j].kind == AK.Param()) { tot = tot + 1; if (m.kids[j].b == null) { req = req + 1; } lastP = m.kids[j]; }
+                j = j + 1;
+            }
+            bool vparams = lastP != null && lastP.op == 1;
+            if (argc >= req && argc <= tot) { fit.Add(m); }
+            else if (vparams && argc >= req - 1) { fit.Add(m); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) {
+            diags.Error("no overload of '" + name + "' takes " + argc + " argument(s)", e.line, e.col);
+            return cands[0];
+        }
+        if (fit.Count == 1) { return fit[0]; }
+        bool anyNamed = false;
+        i = 0;
+        while (i < e.kids.Count) { if (e.kids[i].sval2 != "") { anyNamed = true; } i = i + 1; }
+        if (anyNamed) { return fit[0]; }
+        int mx = -2000000000;
+        List<int> sc = new List<int>();
+        i = 0;
+        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, wantStatic); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
+        int cntMax = 0;
+        Node best = fit[0];
+        i = 0;
+        while (i < fit.Count) {
+            if (sc[i] == mx) { if (cntMax == 0) { best = fit[i]; } cntMax = cntMax + 1; }
+            i = i + 1;
+        }
+        if (cntMax > 1) { diags.Error("ambiguous call to overloaded '" + name + "'", e.line, e.col); }
+        return best;
+    }
+
+    // Like ResolveMethod but walks base classes, matching FindMethodUp.
+    Node ResolveMethodUp(Node cls, string name, Node e, bool wantStatic) {
+        Node c = cls;
+        while (c != null) {
+            Node m = ResolveMethod(c, name, e, wantStatic);
+            if (m != null) { return m; }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    // vtable slot method names, base classes first
+    void CollectVSlots(Node cls, List<string> slots) {
+        if (cls == null) { return; }
+        CollectVSlots(BaseClassOf(cls), slots);
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && IsVSlotIntro(m)) { slots.Add(m.sval); }
+            i = i + 1;
+        }
+    }
+
+    int VSlotIndex(Node cls, string name) {
+        List<string> slots = new List<string>();
+        CollectVSlots(cls, slots);
+        int i = 0;
+        while (i < slots.Count) { if (slots[i] == name) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // most-derived class (from cls upward) providing a concrete body for a slot.
+    // Matches explicit override AND implicit interface implementation (a plain
+    // method whose name matches an inherited abstract/virtual slot).
+    string ResolveImpl(Node cls, string name) {
+        Node c = cls;
+        while (c != null) {
+            Node m = binder.FindMethod(c, name);
+            if (m != null && !IsAbstract(m)) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return "";
+    }
+
+    string MethodFnTypeThis(Node m, string thisCls) {
+        string ty = MapType(m.type) + " (%" + thisCls + "*";
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { ty = ty + ", " + MapType(m.kids[i].type); }
+            i = i + 1;
+        }
+        return ty + ")*";
+    }
+
+    void GenVarDecl(Node s) {
+        if (curAsync) {
+            int pli = LocalIdx(s.sval);
+            if (pli >= 0) {
+                Node pty0 = locType[pli]; string preg0 = locReg[pli]; string plt0 = MapType(pty0);
+                if (s.b != null) {
+                    ExprVal iv0 = GenExpr(s.b);
+                    if (IsNullableValue(pty0)) {
+                        L("  store i8* " + BoxFor(iv0, pty0) + ", i8** " + preg0);
+                    } else {
+                        string sv0 = Coerce(iv0, plt0);
+                        L("  store " + plt0 + " " + sv0 + ", " + plt0 + "* " + preg0);
+                        EmitArcRetain(sv0, pty0);
+                    }
+                }
+                return;
+            }
+        }
+        Node ty = s.type;
+        ExprVal init;
+        bool hasInit = (s.b != null);
+        // propagate delegate parameter/return types onto an initialising lambda
+        if (hasInit && s.b.kind == AK.Lambda() && ty != null && IsDelegate(ty)) {
+            AnnotateLambda(s.b, ty);
+        }
+        if (hasInit) { init = GenExpr(s.b); } else { init = new ExprVal("0", MkType("int")); }
+        if (ty == null) { ty = init.ty; }
+        string lt = MapType(ty);
+        string reg = AddLocal(s.sval, ty);
+        L("  " + reg + " = alloca " + lt);
+        if (hasInit) {
+            if (IsNullableValue(ty)) {
+                L("  store i8* " + BoxFor(init, ty) + ", i8** " + reg);
+            } else {
+                string sv = Coerce(init, lt);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+                EmitArcRetain(sv, ty);
+            }
+        } else {
+            Node sd = binder.FindType(ty.sval);
+            if (sd != null && sd.kind == AK.StructDecl() && ty.ival == 0 && !IsNullable(ty)) {
+                // value struct default-initialised: allocate zeroed storage so
+                // field accesses operate on real memory (calloc zeroes fields).
+                string cn = ty.sval;
+                string szp = NT();
+                L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
+                string szi = NT();
+                L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
+                string raw = NT();
+                L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*))");
+                string obj = NT();
+                L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
+                L("  store " + lt + " " + obj + ", " + lt + "* " + reg);
+            } else if (ArcManaged(ty)) {
+                L("  store " + lt + " null, " + lt + "* " + reg);
+            }
+        }
+    }
+
+    string GenCond(Node e) {
+        ExprVal v = GenExpr(e);
+        string c = NT();
+        if (v.op == "null") {
+            L("  " + c + " = icmp ne i8* null, null");
+        } else if (MapType(v.ty) == "i8*" || IsPtrType(v.ty)) {
+            L("  " + c + " = icmp ne " + MapType(v.ty) + " " + v.op + ", null");
+        } else {
+            L("  " + c + " = icmp ne i64 " + v.op + ", 0");
+        }
+        return c;
+    }
+
+    void GenIf(Node s) {
+        string c = GenCond(s.a);
+        int lt = NL(); int le = NL(); int lend = NL();
+        if (s.c != null) { L("  br i1 " + c + ", label %L" + lt + ", label %L" + le); }
+        else { L("  br i1 " + c + ", label %L" + lt + ", label %L" + lend); }
+        Label(lt);
+        GenStmt(s.b);
+        if (!term) { L("  br label %L" + lend); }
+        if (s.c != null) {
+            Label(le);
+            GenStmt(s.c);
+            if (!term) { L("  br label %L" + lend); }
+        }
+        Label(lend);
+    }
+
+    void GenWhile(Node s) {
+        int lc = NL(); int lb = NL(); int lend = NL();
+        int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
+        brkTarget = lend; contTarget = lc;
+        loopScopeBase = locName.Count;
+        L("  br label %L" + lc);
+        Label(lc);
+        string c = GenCond(s.a);
+        L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        Label(lb);
+        GenStmt(s.b);
+        if (!term) { L("  br label %L" + lc); }
+        Label(lend);
+        brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
+    }
+
+    void GenFor(Node s) {
+        int forScope = locName.Count;
+        if (s.a != null) { GenStmt(s.a); }
+        int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
+        brkTarget = lend; contTarget = linc;
+        loopScopeBase = locName.Count;
+        L("  br label %L" + lc);
+        Label(lc);
+        if (s.b != null) {
+            string c = GenCond(s.b);
+            L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        } else {
+            L("  br label %L" + lb);
+        }
+        Label(lb);
+        GenStmt(s.d);
+        if (!term) { L("  br label %L" + linc); }
+        Label(linc);
+        if (s.c != null) { GenExpr(s.c); }
+        L("  br label %L" + lc);
+        Label(lend);
+        ReleaseLocalsFrom(forScope);
+        TrimLocals(forScope);
+        brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
+    }
+
+    // Infer the projected element type of a query's `select` expression, with
+    // the range variable resolving to the source element type.
+    Node QueryElem(Node sel, string qv, Node elemTy) {
+        if (sel == null) { return elemTy; }
+        int k = sel.kind;
+        if (k == AK.IntLit()) { return MkType("int"); }
+        if (k == AK.FloatLit()) { return MkType("double"); }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.CastExpr()) { return sel.type; }
+        if (k == AK.NewExpr()) { return sel.type; }
+        if (k == AK.Ident()) {
+            if (sel.sval == qv) { return elemTy; }
+            int li = LocalIdx(sel.sval);
+            if (li >= 0) { return locType[li]; }
+            return elemTy;
+        }
+        if (k == AK.Unary()) {
+            if (sel.op == TK.Bang()) { return MkType("bool"); }
+            return QueryElem(sel.a, qv, elemTy);
+        }
+        if (k == AK.Binary()) {
+            int op = sel.op;
+            if (op == TK.EqEq() || op == TK.BangEq() || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq() || op == TK.AmpAmp() || op == TK.PipePipe()) {
+                return MkType("bool");
+            }
+            Node lt = QueryElem(sel.a, qv, elemTy);
+            Node rt = QueryElem(sel.b, qv, elemTy);
+            if (IsStr(lt) || IsStr(rt)) { return MkType("string"); }
+            if (lt != null) { return lt; }
+            return rt;
+        }
+        if (k == AK.MemberAccess()) {
+            if (sel.sval == "Length" || sel.sval == "Count") { return MkType("int"); }
+            return MkType("int");
+        }
+        return elemTy;
+    }
+
+    // from x in src [where c]... select e — an eager loop that filters and
+    // projects each element into a fresh List<sel>. Mirrors the C host lowering.
+    ExprVal GenQuery(Node e) {
+        int qScope = locName.Count;
+        ExprVal coll = GenExpr(e.a);
+        Node srcElem = ListElem(coll.ty);
+        if (srcElem == null) { srcElem = MkType("int"); }
+        string selt = MapType(srcElem);
+        Node resElem = QueryElem(e.b, e.sval, srcElem);
+        Node resListTy = MkType("List");
+        resListTy.a = resElem; resListTy.Add(resElem);
+        string ow = "0"; if (ArcManaged(resElem)) { ow = "1"; }
+        string list = NT();
+        L("  " + list + " = call i8* @zlist_new(i64 " + ow + ")");
+        if (!IsListType(coll.ty)) { AddTemp(list, resListTy); return new ExprVal(list, resListTy); }
+        string idx = NT();
+        L("  " + idx + " = alloca i64");
+        L("  store i64 0, i64* " + idx);
+        string ereg = AddLocal(e.sval, srcElem);
+        L("  " + ereg + " = alloca " + selt);
+        if (ArcManaged(srcElem)) { L("  store " + selt + " null, " + selt + "* " + ereg); }
+        int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string iv = NT();
+        L("  " + iv + " = load i64, i64* " + idx);
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + coll.op + ")");
+        string c = NT();
+        L("  " + c + " = icmp slt i64 " + iv + ", " + cnt);
+        L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        Label(lb);
+        string slot = NT();
+        L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
+        ExprVal ev = FromSlot(slot, srcElem);
+        L("  store " + selt + " " + ev.op + ", " + selt + "* " + ereg);
+        int wi = 0;
+        while (wi < e.kids.Count) {
+            string wc = GenCond(e.kids[wi]);
+            int lkeep = NL();
+            L("  br i1 " + wc + ", label %L" + lkeep + ", label %L" + linc);
+            Label(lkeep);
+            wi = wi + 1;
+        }
+        ExprVal sel = GenExpr(e.b);
+        string sv = ToSlot(sel, resElem);
+        L("  call void @zlist_add(i8* " + list + ", i64 " + sv + ")");
+        L("  br label %L" + linc);
+        Label(linc);
+        string iv2 = NT();
+        L("  " + iv2 + " = load i64, i64* " + idx);
+        string inc = NT();
+        L("  " + inc + " = add i64 " + iv2 + ", 1");
+        L("  store i64 " + inc + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        TrimLocals(qScope);
+        AddTemp(list, resListTy);
+        return new ExprVal(list, resListTy);
+    }
+
+    // foreach (T x in coll) body  — lowered as an indexed walk over List<T>
+    void GenForeach(Node s) {
+        int feScope = locName.Count;
+        ExprVal coll = GenExpr(s.b);
+        if (!IsListType(coll.ty)) { return; }
+        Node elemTy = s.type;
+        if (elemTy == null) { elemTy = ListElem(coll.ty); }
+        string elt = MapType(elemTy);
+        string idx = NT();
+        L("  " + idx + " = alloca i64");
+        L("  store i64 0, i64* " + idx);
+        string ereg = AddLocal(s.sval, elemTy);
+        L("  " + ereg + " = alloca " + elt);
+        if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
+        int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
+        brkTarget = lend; contTarget = linc;
+        loopScopeBase = locName.Count;
+        L("  br label %L" + lc);
+        Label(lc);
+        string iv = NT();
+        L("  " + iv + " = load i64, i64* " + idx);
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + coll.op + ")");
+        string c = NT();
+        L("  " + c + " = icmp slt i64 " + iv + ", " + cnt);
+        L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        Label(lb);
+        string slot = NT();
+        L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
+        ExprVal ev = FromSlot(slot, elemTy);
+        if (ArcManaged(elemTy)) {
+            string old = NT();
+            L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);
+            L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+            EmitArcRetain(ev.op, elemTy);
+            EmitArcRelease(old, elemTy);
+        } else {
+            L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+        }
+        GenStmt(s.c);
+        if (!term) { L("  br label %L" + linc); }
+        Label(linc);
+        string iv2 = NT();
+        L("  " + iv2 + " = load i64, i64* " + idx);
+        string inc = NT();
+        L("  " + inc + " = add i64 " + iv2 + ", 1");
+        L("  store i64 " + inc + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        ReleaseLocalsFrom(feScope);
+        TrimLocals(feScope);
+        brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
+    }
+
+    // throw expr — store the exception object, pop the innermost handler and
+    // longjmp back into its try (setjmp returns nonzero -> catch path).
+    void GenThrow(Node s) {
+        ExprVal v = GenExpr(s.a);
+        string vt = MapType(v.ty);
+        string ev = v.op;
+        if (vt != "i8*") {
+            string t = NT();
+            L("  " + t + " = bitcast " + vt + " " + ev + " to i8*");
+            ev = t;
+        }
+        L("  store i8* " + ev + ", i8** @__exc_val");
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string sp1 = NT();
+        L("  " + sp1 + " = sub i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        string slot = NT();
+        L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp1);
+        string buf = NT();
+        L("  " + buf + " = load i8*, i8** " + slot);
+        L("  call void @longjmp(i8* " + buf + ", i32 1)");
+        L("  unreachable");
+        term = true;
+    }
+
+    void EmitExcPop() {
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string sp1 = NT();
+        L("  " + sp1 + " = sub i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+    }
+
+    // try { } catch (T e) { } finally { }  — setjmp/longjmp based
+    void GenTry(Node s) {
+        string buf = NT();
+        L("  " + buf + " = alloca [32 x i64]");
+        string bufp = NT();
+        L("  " + bufp + " = bitcast [32 x i64]* " + buf + " to i8*");
+        // push handler
+        string sp = NT();
+        L("  " + sp + " = load i64, i64* @__exc_sp");
+        string slot = NT();
+        L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
+        L("  store i8* " + bufp + ", i8** " + slot);
+        string sp1 = NT();
+        L("  " + sp1 + " = add i64 " + sp + ", 1");
+        L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        // setjmp
+        string fp = NT();
+        L("  " + fp + " = call i8* @llvm.frameaddress.p0(i32 0)");
+        string r = NT();
+        L("  " + r + " = call i32 @_setjmp(i8* " + bufp + ", i8* " + fp + ")");
+        string c = NT();
+        L("  " + c + " = icmp ne i32 " + r + ", 0");
+        int ltry = NL(); int lcatch = NL(); int lend = NL();
+        L("  br i1 " + c + ", label %L" + lcatch + ", label %L" + ltry);
+        Label(ltry);
+        GenStmt(s.a);
+        if (!term) {
+            EmitExcPop();
+            if (s.c != null) { GenStmt(s.c); }
+            if (!term) { L("  br label %L" + lend); }
+        }
+        term = false;
+        Label(lcatch);
+        // handler already popped by throw; bind catch variable to @__exc_val
+        if (s.b != null) {
+            int catchScope = locName.Count;
+            Node cc = s.b;
+            if (cc.sval != "" && cc.type != null) {
+                string exv = NT();
+                L("  " + exv + " = load i8*, i8** @__exc_val");
+                string ct = MapType(cc.type);
+                string reg = AddLocal(cc.sval, cc.type);
+                L("  " + reg + " = alloca " + ct);
+                string cv = exv;
+                if (ct != "i8*") {
+                    string t = NT();
+                    L("  " + t + " = bitcast i8* " + exv + " to " + ct);
+                    cv = t;
+                }
+                L("  store " + ct + " " + cv + ", " + ct + "* " + reg);
+            }
+            GenStmt(cc.a);
+            if (!term) { ReleaseLocalsFrom(catchScope); }
+            TrimLocals(catchScope);
+        }
+        if (!term) {
+            if (s.c != null) { GenStmt(s.c); }
+            if (!term) { L("  br label %L" + lend); }
+        }
+        Label(lend);
+        term = false;
+    }
+}
