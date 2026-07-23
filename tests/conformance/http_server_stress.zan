@@ -1,0 +1,89 @@
+// Conformance: the stdlib HttpServer connection handler under concurrency.
+// Several client coroutines run keep-alive POST+GET rounds in parallel against
+// HandleConnection (ReadRequest reassembly, handler dispatch, keep-alive), and
+// the shared store must end up with every message exactly once. The leakcheck
+// twin of this source verifies the coroutine/HTTP path releases everything.
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+
+class Program {
+    static int PORT = 54341;
+    static int CLIENTS = 8;
+    static int ROUNDS = 5;
+    static int done = 0;
+    static List<string> store;
+
+    static HttpResponse Handle(HttpRequest req) {
+        if (req.method == "POST" && req.path == "/add") {
+            store.Add(req.body);
+            return HttpResponse.Text("ok");
+        }
+        if (req.method == "GET" && req.path == "/count") {
+            return HttpResponse.Text(Convert.ToString(store.Count));
+        }
+        return HttpResponse.NotFound();
+    }
+
+    static async void Client(int id) {
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT);
+        int r = 0;
+        while (r < ROUNDS) {
+            string body = "m-" + Convert.ToString(id) + "-" + Convert.ToString(r);
+            int _s = await c.SendAsync(HttpRequest.BuildPost("/add", "t", body));
+            string resp = await c.RecvAsync(4096);
+            _s = await c.SendAsync(HttpRequest.BuildGet("/count", "t"));
+            resp = await c.RecvAsync(4096);
+            r = r + 1;
+        }
+        c.Close();
+        done = done + 1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        store = new List<string>();
+
+        HttpServer server = HttpServer.Create("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        int i = 0;
+        while (i < CLIENTS) {
+            Task.Spawn(Client(i));
+            i = i + 1;
+        }
+        while (done < CLIENTS) {
+            await Task.Delay(5);
+        }
+
+        // Every message from every client stored exactly once.
+        Console.WriteLine(store.Count);
+        int missing = 0;
+        int ci = 0;
+        while (ci < CLIENTS) {
+            int ri = 0;
+            while (ri < ROUNDS) {
+                string want = "m-" + Convert.ToString(ci) + "-" + Convert.ToString(ri);
+                int hits = 0;
+                int si = 0;
+                while (si < store.Count) {
+                    if (store[si] == want) { hits = hits + 1; }
+                    si = si + 1;
+                }
+                if (hits != 1) { missing = missing + 1; }
+                ri = ri + 1;
+            }
+            ci = ci + 1;
+        }
+        Console.WriteLine(missing);
+
+        server.Stop();
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

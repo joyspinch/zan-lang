@@ -11,8 +11,29 @@ delegate R Selector<T, R>(T item);
 /// <summary>Extracts an integer sort key from an element.</summary>
 delegate int KeySelector<T>(T item);
 
+/// <summary>Extracts a string sort key from an element.</summary>
+delegate string StrKeySelector<T>(T item);
+
+/// <summary>Extracts a floating-point sort key from an element.</summary>
+delegate double NumKeySelector<T>(T item);
+
 /// <summary>Combines an accumulator with the next element.</summary>
-delegate T Folder<T>(T acc, T item);
+delegate A Accumulator<T, A>(A acc, T item);
+
+/// <summary>One group produced by GroupBy: the key plus its elements.</summary>
+class Grouping<T> {
+    /// <summary>String form of the group key (always set).</summary>
+    public string Key;
+    /// <summary>Integer key when grouped with GroupBy(KeySelector).</summary>
+    public int IntKey;
+    public List<T> Items;
+
+    public Grouping() {
+        Key = "";
+        IntKey = 0;
+        Items = new List<T>();
+    }
+}
 
 /// <summary>
 /// Typed, eager LINQ-style query operators over List&lt;T&gt;.
@@ -26,16 +47,26 @@ delegate T Folder<T>(T acc, T item);
 ///   using System.Linq;
 ///   List&lt;int&gt; evens = nums.Where(x => x % 2 == 0);
 ///   List&lt;User&gt; adults = users.Where(u => u.age >= 18).OrderBy(u => u.age);
+///   List&lt;User&gt; byName = users.OrderByStr(u => u.name);
 ///   bool ok = nums.Any(x => x > 100);
+///
+/// Sort keys are typed: OrderBy takes an int key, OrderByStr a string key and
+/// OrderByNum a double key (separate names because overloads that differ only
+/// in delegate return type cannot be resolved from an untyped lambda).
+/// OrderBy(k1, k2) sorts by a primary and a secondary int key. For the same
+/// reason the double-sequence aggregates use the *Num names
+/// (SumNum/MinNum/MaxNum/AverageNum).
+///
+/// First/Last/Single throw InvalidOperationException on an empty (or
+/// ambiguous, for Single) sequence, matching C#; the *OrDefault variants
+/// return the type default instead.
 /// </summary>
 class Enumerable {
     /// <summary>Keeps the elements for which pred returns true.</summary>
     static List<T> Where<T>(this List<T> src, Predicate<T> pred) {
         List<T> outp = new List<T>();
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (pred(src[i])) { outp.Add(src[i]); }
-            i = i + 1;
         }
         return outp;
     }
@@ -43,20 +74,28 @@ class Enumerable {
     /// <summary>Projects every element through selector.</summary>
     static List<R> Select<T, R>(this List<T> src, Selector<T, R> selector) {
         List<R> outp = new List<R>();
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             outp.Add(selector(src[i]));
-            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// <summary>Projects every element to a List and flattens the results.</summary>
+    static List<R> SelectMany<T, R>(this List<T> src, Selector<T, List<R>> selector) {
+        List<R> outp = new List<R>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            List<R> part = selector(src[i]);
+            for (int j = 0; j < part.Count; j = j + 1) {
+                outp.Add(part[j]);
+            }
         }
         return outp;
     }
 
     /// <summary>True when any element satisfies pred.</summary>
     static bool Any<T>(this List<T> src, Predicate<T> pred) {
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (pred(src[i])) { return true; }
-            i = i + 1;
         }
         return false;
     }
@@ -68,10 +107,8 @@ class Enumerable {
 
     /// <summary>True when every element satisfies pred.</summary>
     static bool All<T>(this List<T> src, Predicate<T> pred) {
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (!pred(src[i])) { return false; }
-            i = i + 1;
         }
         return true;
     }
@@ -79,10 +116,8 @@ class Enumerable {
     /// <summary>Number of elements satisfying pred.</summary>
     static int Count<T>(this List<T> src, Predicate<T> pred) {
         int n = 0;
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (pred(src[i])) { n = n + 1; }
-            i = i + 1;
         }
         return n;
     }
@@ -92,42 +127,138 @@ class Enumerable {
         return src.Count;
     }
 
-    /// <summary>First element (or the type default when empty).</summary>
+    /// <summary>First element; throws InvalidOperationException when empty.</summary>
     static T First<T>(this List<T> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        return src[0];
+    }
+
+    /// <summary>First element satisfying pred; throws when none matches.</summary>
+    static T First<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) { return src[i]; }
+        }
+        throw new InvalidOperationException("Sequence contains no matching element");
+    }
+
+    /// <summary>First element, or the type default when empty.</summary>
+    static T FirstOrDefault<T>(this List<T> src) {
         if (src.Count > 0) { return src[0]; }
         T d = 0;
         return d;
     }
 
-    /// <summary>First element satisfying pred (or the type default).</summary>
-    static T First<T>(this List<T> src, Predicate<T> pred) {
-        int i = 0;
-        while (i < src.Count) {
+    /// <summary>First element satisfying pred, or the type default.</summary>
+    static T FirstOrDefault<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (pred(src[i])) { return src[i]; }
-            i = i + 1;
         }
         T d = 0;
         return d;
     }
 
-    /// <summary>First element, or the type default when empty.</summary>
-    static T FirstOrDefault<T>(this List<T> src) {
-        return Enumerable.First<T>(src);
+    /// <summary>Last element; throws InvalidOperationException when empty.</summary>
+    static T Last<T>(this List<T> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        return src[src.Count - 1];
     }
 
-    /// <summary>Last element (or the type default when empty).</summary>
-    static T Last<T>(this List<T> src) {
+    /// <summary>Last element satisfying pred; throws when none matches.</summary>
+    static T Last<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = src.Count - 1; i >= 0; i = i - 1) {
+            if (pred(src[i])) { return src[i]; }
+        }
+        throw new InvalidOperationException("Sequence contains no matching element");
+    }
+
+    /// <summary>Last element, or the type default when empty.</summary>
+    static T LastOrDefault<T>(this List<T> src) {
         if (src.Count > 0) { return src[src.Count - 1]; }
         T d = 0;
         return d;
     }
 
-    /// <summary>True when target is present (uses == on the element type).</summary>
+    /// <summary>Last element satisfying pred, or the type default.</summary>
+    static T LastOrDefault<T>(this List<T> src, Predicate<T> pred) {
+        for (int i = src.Count - 1; i >= 0; i = i - 1) {
+            if (pred(src[i])) { return src[i]; }
+        }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>The only element; throws unless the sequence has exactly one.</summary>
+    static T Single<T>(this List<T> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        if (src.Count > 1) {
+            throw new InvalidOperationException("Sequence contains more than one element");
+        }
+        return src[0];
+    }
+
+    /// <summary>The only element satisfying pred; throws on zero or many.</summary>
+    static T Single<T>(this List<T> src, Predicate<T> pred) {
+        int found = -1;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) {
+                if (found >= 0) {
+                    throw new InvalidOperationException("Sequence contains more than one matching element");
+                }
+                found = i;
+            }
+        }
+        if (found < 0) {
+            throw new InvalidOperationException("Sequence contains no matching element");
+        }
+        return src[found];
+    }
+
+    /// <summary>The only element, or the type default when empty; throws on many.</summary>
+    static T SingleOrDefault<T>(this List<T> src) {
+        if (src.Count > 1) {
+            throw new InvalidOperationException("Sequence contains more than one element");
+        }
+        if (src.Count == 1) { return src[0]; }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>The only matching element, or the type default; throws on many.</summary>
+    static T SingleOrDefault<T>(this List<T> src, Predicate<T> pred) {
+        int found = -1;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (pred(src[i])) {
+                if (found >= 0) {
+                    throw new InvalidOperationException("Sequence contains more than one matching element");
+                }
+                found = i;
+            }
+        }
+        if (found >= 0) { return src[found]; }
+        T d = 0;
+        return d;
+    }
+
+    /// <summary>True when target is present (uses == on the element type;
+    /// for reference types this is identity, not structural equality).</summary>
     static bool Contains<T>(this List<T> src, T target) {
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (src[i] == target) { return true; }
-            i = i + 1;
+        }
+        return false;
+    }
+
+    /// <summary>True when target is present, compared by string value.</summary>
+    static bool ContainsStr(this List<string> src, string target) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            string s = src[i];
+            if (s == target) { return true; }
         }
         return false;
     }
@@ -135,10 +266,8 @@ class Enumerable {
     /// <summary>A shallow copy of the sequence as a new List.</summary>
     static List<T> ToList<T>(this List<T> src) {
         List<T> outp = new List<T>();
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             outp.Add(src[i]);
-            i = i + 1;
         }
         return outp;
     }
@@ -146,10 +275,18 @@ class Enumerable {
     /// <summary>The first count elements (or fewer).</summary>
     static List<T> Take<T>(this List<T> src, int count) {
         List<T> outp = new List<T>();
-        int i = 0;
-        while (i < src.Count && i < count) {
+        for (int i = 0; i < src.Count && i < count; i = i + 1) {
             outp.Add(src[i]);
-            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// <summary>Leading elements while pred holds.</summary>
+    static List<T> TakeWhile<T>(this List<T> src, Predicate<T> pred) {
+        List<T> outp = new List<T>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (!pred(src[i])) { return outp; }
+            outp.Add(src[i]);
         }
         return outp;
     }
@@ -159,9 +296,19 @@ class Enumerable {
         List<T> outp = new List<T>();
         int i = count;
         if (i < 0) { i = 0; }
-        while (i < src.Count) {
+        for (; i < src.Count; i = i + 1) {
             outp.Add(src[i]);
-            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// <summary>Elements after the leading run where pred holds.</summary>
+    static List<T> SkipWhile<T>(this List<T> src, Predicate<T> pred) {
+        List<T> outp = new List<T>();
+        int i = 0;
+        while (i < src.Count && pred(src[i])) { i = i + 1; }
+        for (; i < src.Count; i = i + 1) {
+            outp.Add(src[i]);
         }
         return outp;
     }
@@ -169,47 +316,77 @@ class Enumerable {
     /// <summary>The elements in reverse order.</summary>
     static List<T> Reverse<T>(this List<T> src) {
         List<T> outp = new List<T>();
-        int i = src.Count - 1;
-        while (i >= 0) {
+        for (int i = src.Count - 1; i >= 0; i = i - 1) {
             outp.Add(src[i]);
-            i = i - 1;
         }
         return outp;
     }
 
-    /// <summary>Distinct elements, keeping first occurrence (uses ==).</summary>
+    /// <summary>Distinct elements, keeping first occurrence (uses ==;
+    /// for reference types this is identity, not structural equality).</summary>
     static List<T> Distinct<T>(this List<T> src) {
         List<T> outp = new List<T>();
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (!Enumerable.Contains<T>(outp, src[i])) { outp.Add(src[i]); }
-            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// <summary>Distinct strings, compared by value, keeping first occurrence.</summary>
+    static List<string> DistinctStr(this List<string> src) {
+        List<string> outp = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (!Enumerable.ContainsStr(outp, src[i])) { outp.Add(src[i]); }
         }
         return outp;
     }
 
     /// <summary>Ascending order by the integer key (stable merge sort).</summary>
     static List<T> OrderBy<T>(this List<T> src, KeySelector<T> key) {
-        return Enumerable.MergeSortBy<T>(src, key, 1);
+        return Enumerable.MergeSortInt<T>(src, key, 1);
+    }
+
+    /// <summary>Ascending by a primary then a secondary integer key (stable).</summary>
+    static List<T> OrderBy<T>(this List<T> src, KeySelector<T> key1, KeySelector<T> key2) {
+        List<T> pass1 = Enumerable.MergeSortInt<T>(src, key2, 1);
+        return Enumerable.MergeSortInt<T>(pass1, key1, 1);
     }
 
     /// <summary>Descending order by the integer key (stable merge sort).</summary>
     static List<T> OrderByDescending<T>(this List<T> src, KeySelector<T> key) {
-        return Enumerable.MergeSortBy<T>(src, key, -1);
+        return Enumerable.MergeSortInt<T>(src, key, -1);
     }
 
-    /* Bottom-up stable merge sort on precomputed keys; sign flips the order. */
-    static List<T> MergeSortBy<T>(List<T> src, KeySelector<T> key, int sign) {
+    /// <summary>Ascending order by the string key (stable merge sort).</summary>
+    static List<T> OrderByStr<T>(this List<T> src, StrKeySelector<T> key) {
+        return Enumerable.MergeSortStr<T>(src, key, false);
+    }
+
+    /// <summary>Descending order by the string key (stable merge sort).</summary>
+    static List<T> OrderByStrDescending<T>(this List<T> src, StrKeySelector<T> key) {
+        return Enumerable.MergeSortStr<T>(src, key, true);
+    }
+
+    /// <summary>Ascending order by the double key (stable merge sort).</summary>
+    static List<T> OrderByNum<T>(this List<T> src, NumKeySelector<T> key) {
+        return Enumerable.MergeSortNum<T>(src, key, false);
+    }
+
+    /// <summary>Descending order by the double key (stable merge sort).</summary>
+    static List<T> OrderByNumDescending<T>(this List<T> src, NumKeySelector<T> key) {
+        return Enumerable.MergeSortNum<T>(src, key, true);
+    }
+
+    /* Bottom-up stable merge sort on precomputed int keys; sign flips the order. */
+    static List<T> MergeSortInt<T>(List<T> src, KeySelector<T> key, int sign) {
         List<T> a = Enumerable.ToList<T>(src);
         int n = a.Count;
         if (n < 2) { return a; }
         List<int> ka = new List<int>();
-        int i = 0;
-        while (i < n) { ka.Add(sign * key(a[i])); i = i + 1; }
+        for (int i = 0; i < n; i = i + 1) { ka.Add(sign * key(a[i])); }
         List<T> b = Enumerable.ToList<T>(src);
         List<int> kb = new List<int>();
-        i = 0;
-        while (i < n) { kb.Add(0); i = i + 1; }
+        for (int i = 0; i < n; i = i + 1) { kb.Add(0); }
         int width = 1;
         while (width < n) {
             int lo = 0;
@@ -237,13 +414,136 @@ class Enumerable {
         return a;
     }
 
-    /// <summary>Folds the sequence starting from seed.</summary>
-    static T Aggregate<T>(this List<T> src, T seed, Folder<T> folder) {
-        T acc = seed;
-        int i = 0;
-        while (i < src.Count) {
+    /* Bottom-up stable merge sort on precomputed string keys. */
+    static List<T> MergeSortStr<T>(List<T> src, StrKeySelector<T> key, bool desc) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<string> ka = new List<string>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(key(a[i])); }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<string> kb = new List<string>();
+        for (int i = 0; i < n; i = i + 1) { kb.Add(""); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    string kl = ka[l];
+                    string kr = ka[r];
+                    bool takeLeft = kl <= kr;
+                    if (desc) { takeLeft = kl >= kr; }
+                    if (takeLeft) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<string> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /* Bottom-up stable merge sort on precomputed double keys. */
+    static List<T> MergeSortNum<T>(List<T> src, NumKeySelector<T> key, bool desc) {
+        List<T> a = Enumerable.ToList<T>(src);
+        int n = a.Count;
+        if (n < 2) { return a; }
+        List<double> ka = new List<double>();
+        for (int i = 0; i < n; i = i + 1) { ka.Add(key(a[i])); }
+        List<T> b = Enumerable.ToList<T>(src);
+        List<double> kb = new List<double>();
+        for (int i = 0; i < n; i = i + 1) { kb.Add(0.0); }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width + width;
+                if (hi > n) { hi = n; }
+                int l = lo;
+                int r = mid;
+                int o = lo;
+                while (l < mid && r < hi) {
+                    double kl = ka[l];
+                    double kr = ka[r];
+                    bool takeLeft = kl <= kr;
+                    if (desc) { takeLeft = kl >= kr; }
+                    if (takeLeft) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; }
+                    else { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; }
+                    o = o + 1;
+                }
+                while (l < mid) { b[o] = a[l]; kb[o] = ka[l]; l = l + 1; o = o + 1; }
+                while (r < hi) { b[o] = a[r]; kb[o] = ka[r]; r = r + 1; o = o + 1; }
+                lo = hi;
+            }
+            List<T> tl = a; a = b; b = tl;
+            List<double> tk = ka; ka = kb; kb = tk;
+            width = width + width;
+        }
+        return a;
+    }
+
+    /// <summary>Groups elements by an integer key. Grouping.IntKey holds the
+    /// key; Grouping.Key holds its string form. Group order follows first
+    /// occurrence.</summary>
+    static List<Grouping<T>> GroupBy<T>(this List<T> src, KeySelector<T> key) {
+        List<Grouping<T>> groups = new List<Grouping<T>>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            int k = key(src[i]);
+            Grouping<T> g = null;
+            for (int j = 0; j < groups.Count; j = j + 1) {
+                if (groups[j].IntKey == k) { g = groups[j]; }
+            }
+            if (g == null) {
+                g = new Grouping<T>();
+                g.IntKey = k;
+                g.Key = Convert.ToString(k);
+                groups.Add(g);
+            }
+            g.Items.Add(src[i]);
+        }
+        return groups;
+    }
+
+    /// <summary>Groups elements by a string key (compared by value). Group
+    /// order follows first occurrence.</summary>
+    static List<Grouping<T>> GroupByStr<T>(this List<T> src, StrKeySelector<T> key) {
+        List<Grouping<T>> groups = new List<Grouping<T>>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            string k = key(src[i]);
+            Grouping<T> g = null;
+            for (int j = 0; j < groups.Count; j = j + 1) {
+                string gk = groups[j].Key;
+                if (gk == k) { g = groups[j]; }
+            }
+            if (g == null) {
+                g = new Grouping<T>();
+                g.Key = k;
+                groups.Add(g);
+            }
+            g.Items.Add(src[i]);
+        }
+        return groups;
+    }
+
+    /// <summary>Folds the sequence into an accumulator starting from seed.</summary>
+    static A Aggregate<T, A>(this List<T> src, A seed, Accumulator<T, A> folder) {
+        A acc = seed;
+        for (int i = 0; i < src.Count; i = i + 1) {
             acc = folder(acc, src[i]);
-            i = i + 1;
         }
         return acc;
     }
@@ -251,10 +551,35 @@ class Enumerable {
     /// <summary>Sum of an integer sequence.</summary>
     static int Sum(this List<int> src) {
         int total = 0;
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             total = total + src[i];
-            i = i + 1;
+        }
+        return total;
+    }
+
+    /// <summary>Sum of a double sequence.</summary>
+    static double SumNum(this List<double> src) {
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + src[i];
+        }
+        return total;
+    }
+
+    /// <summary>Sum of an integer key over the sequence.</summary>
+    static int Sum<T>(this List<T> src, KeySelector<T> key) {
+        int total = 0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + key(src[i]);
+        }
+        return total;
+    }
+
+    /// <summary>Sum of a double key over the sequence.</summary>
+    static double SumNum<T>(this List<T> src, NumKeySelector<T> key) {
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + key(src[i]);
         }
         return total;
     }
@@ -263,22 +588,106 @@ class Enumerable {
     static int Min(this List<int> src) {
         if (src.Count == 0) { return 0; }
         int m = src[0];
-        int i = 1;
-        while (i < src.Count) {
+        for (int i = 1; i < src.Count; i = i + 1) {
             if (src[i] < m) { m = src[i]; }
-            i = i + 1;
         }
         return m;
+    }
+
+    /// <summary>Smallest value of a double sequence (0 when empty).</summary>
+    static double MinNum(this List<double> src) {
+        if (src.Count == 0) { return 0.0; }
+        double m = src[0];
+        for (int i = 1; i < src.Count; i = i + 1) {
+            if (src[i] < m) { m = src[i]; }
+        }
+        return m;
+    }
+
+    /// <summary>Smallest integer key over the sequence (0 when empty).</summary>
+    static int Min<T>(this List<T> src, KeySelector<T> key) {
+        if (src.Count == 0) { return 0; }
+        int m = key(src[0]);
+        for (int i = 1; i < src.Count; i = i + 1) {
+            int k = key(src[i]);
+            if (k < m) { m = k; }
+        }
+        return m;
+    }
+
+    /// <summary>Largest value of an integer sequence (0 when empty).</summary>
+    static int Max(this List<int> src) {
+        if (src.Count == 0) { return 0; }
+        int m = src[0];
+        for (int i = 1; i < src.Count; i = i + 1) {
+            if (src[i] > m) { m = src[i]; }
+        }
+        return m;
+    }
+
+    /// <summary>Largest value of a double sequence (0 when empty).</summary>
+    static double MaxNum(this List<double> src) {
+        if (src.Count == 0) { return 0.0; }
+        double m = src[0];
+        for (int i = 1; i < src.Count; i = i + 1) {
+            if (src[i] > m) { m = src[i]; }
+        }
+        return m;
+    }
+
+    /// <summary>Largest integer key over the sequence (0 when empty).</summary>
+    static int Max<T>(this List<T> src, KeySelector<T> key) {
+        if (src.Count == 0) { return 0; }
+        int m = key(src[0]);
+        for (int i = 1; i < src.Count; i = i + 1) {
+            int k = key(src[i]);
+            if (k > m) { m = k; }
+        }
+        return m;
+    }
+
+    /// <summary>Average of an integer sequence; throws when empty.</summary>
+    static double Average(this List<int> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + (double)src[i];
+        }
+        return total / (double)src.Count;
+    }
+
+    /// <summary>Average of a double sequence; throws when empty.</summary>
+    static double AverageNum(this List<double> src) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + src[i];
+        }
+        return total / (double)src.Count;
+    }
+
+    /// <summary>Average of an integer key over the sequence; throws when empty.</summary>
+    static double Average<T>(this List<T> src, KeySelector<T> key) {
+        if (src.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        double total = 0.0;
+        for (int i = 0; i < src.Count; i = i + 1) {
+            total = total + (double)key(src[i]);
+        }
+        return total / (double)src.Count;
     }
 
     /// <summary>SQL LIKE over a string sequence: '%' matches any run of
     /// characters, '_' matches exactly one (e.g. "a%", "%.log", "b_b").</summary>
     static List<string> Like(this List<string> src, string pattern) {
         List<string> outp = new List<string>();
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (Enumerable.LikeMatch(src[i], pattern)) { outp.Add(src[i]); }
-            i = i + 1;
         }
         return outp;
     }
@@ -311,23 +720,18 @@ class Enumerable {
     /// <summary>SQL IN: keeps the elements present in values (uses ==).</summary>
     static List<T> In<T>(this List<T> src, List<T> values) {
         List<T> outp = new List<T>();
-        int i = 0;
-        while (i < src.Count) {
+        for (int i = 0; i < src.Count; i = i + 1) {
             if (Enumerable.Contains<T>(values, src[i])) { outp.Add(src[i]); }
-            i = i + 1;
         }
         return outp;
     }
 
-    /// <summary>Largest value of an integer sequence (0 when empty).</summary>
-    static int Max(this List<int> src) {
-        if (src.Count == 0) { return 0; }
-        int m = src[0];
-        int i = 1;
-        while (i < src.Count) {
-            if (src[i] > m) { m = src[i]; }
-            i = i + 1;
+    /// <summary>SQL IN over strings, compared by value.</summary>
+    static List<string> InStr(this List<string> src, List<string> values) {
+        List<string> outp = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (Enumerable.ContainsStr(values, src[i])) { outp.Add(src[i]); }
         }
-        return m;
+        return outp;
     }
 }
