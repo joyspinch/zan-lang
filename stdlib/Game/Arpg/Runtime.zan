@@ -114,21 +114,31 @@ class ArpgInventory {
     }
 }
 
+// One equipped item bound to its slot. One entity instead of parallel
+// slot/item lists.
+class ArpgEquipSlot {
+    string slot;
+    ArpgItemDefinition item;
+
+    ArpgEquipSlot(string slot, ArpgItemDefinition item) {
+        this.slot = slot;
+        this.item = item;
+    }
+}
+
 class ArpgEquipment {
-    List<string> slots;
-    List<ArpgItemDefinition> items;
+    List<ArpgEquipSlot> slots;
 
     static ArpgEquipment Create() {
         ArpgEquipment equipment = new ArpgEquipment();
-        equipment.slots = new List<string>();
-        equipment.items = new List<ArpgItemDefinition>();
+        equipment.slots = new List<ArpgEquipSlot>();
         return equipment;
     }
 
     int IndexOf(string slot) {
         int i = 0;
         while (i < this.slots.Count) {
-            if (this.slots[i] == slot) { return i; }
+            if (this.slots[i].slot == slot) { return i; }
             i = i + 1;
         }
         return -1;
@@ -137,7 +147,7 @@ class ArpgEquipment {
     ArpgItemDefinition Get(string slot) {
         int index = this.IndexOf(slot);
         if (index < 0) { return null; }
-        return this.items[index];
+        return this.slots[index].item;
     }
 
     bool Equip(
@@ -155,16 +165,15 @@ class ArpgEquipment {
 
         int index = this.IndexOf(slot);
         if (index >= 0) {
-            ArpgItemDefinition old = this.items[index];
+            ArpgItemDefinition old = this.slots[index].item;
             int restored = inventory.Add(old, 1);
             if (restored != 1) {
                 inventory.Add(definition, 1);
                 return false;
             }
-            this.items[index] = definition;
+            this.slots[index].item = definition;
         } else {
-            this.slots.Add(slot);
-            this.items.Add(definition);
+            this.slots.Add(new ArpgEquipSlot(slot, definition));
         }
         return true;
     }
@@ -172,45 +181,54 @@ class ArpgEquipment {
     bool Unequip(string slot, ArpgInventory inventory) {
         int index = this.IndexOf(slot);
         if (index < 0 || inventory == null) { return false; }
-        ArpgItemDefinition old = this.items[index];
+        ArpgItemDefinition old = this.slots[index].item;
         if (inventory.Add(old, 1) != 1) { return false; }
         this.slots.RemoveAt(index);
-        this.items.RemoveAt(index);
         return true;
     }
 
     int Count() { return this.slots.Count; }
-    string SlotNameAt(int index) { return this.slots[index]; }
-    ArpgItemDefinition ItemAt(int index) { return this.items[index]; }
+    string SlotNameAt(int index) { return this.slots[index].slot; }
+    ArpgItemDefinition ItemAt(int index) { return this.slots[index].item; }
 
     ArpgAttributes Attributes() {
         ArpgAttributes attributes = ArpgAttributes.Create();
         int i = 0;
-        while (i < this.items.Count) {
-            attributes.AddModifiersFrom(this.items[i].Attributes());
+        while (i < this.slots.Count) {
+            attributes.AddModifiersFrom(this.slots[i].item.Attributes());
             i = i + 1;
         }
         return attributes;
     }
 }
 
+// One active cooldown: name, remaining time and the original duration (for a
+// progress readout). One entity instead of three parallel lists.
+class ArpgCooldownEntry {
+    string name;
+    int remaining;
+    int duration;
+
+    ArpgCooldownEntry(string name, int remaining, int duration) {
+        this.name = name;
+        this.remaining = remaining;
+        this.duration = duration;
+    }
+}
+
 class ArpgCooldowns {
-    List<string> names;
-    List<int> remaining;
-    List<int> durations;
+    List<ArpgCooldownEntry> entries;
 
     static ArpgCooldowns Create() {
         ArpgCooldowns cooldowns = new ArpgCooldowns();
-        cooldowns.names = new List<string>();
-        cooldowns.remaining = new List<int>();
-        cooldowns.durations = new List<int>();
+        cooldowns.entries = new List<ArpgCooldownEntry>();
         return cooldowns;
     }
 
     int IndexOf(string name) {
         int i = 0;
-        while (i < this.names.Count) {
-            if (this.names[i] == name) { return i; }
+        while (i < this.entries.Count) {
+            if (this.entries[i].name == name) { return i; }
             i = i + 1;
         }
         return -1;
@@ -220,43 +238,39 @@ class ArpgCooldowns {
         if (name == null || name == "" || milliseconds <= 0) { return; }
         int index = this.IndexOf(name);
         if (index < 0) {
-            this.names.Add(name);
-            this.remaining.Add(milliseconds);
-            this.durations.Add(milliseconds);
+            this.entries.Add(new ArpgCooldownEntry(name, milliseconds, milliseconds));
         } else {
-            this.remaining[index] = milliseconds;
-            this.durations[index] = milliseconds;
+            this.entries[index].remaining = milliseconds;
+            this.entries[index].duration = milliseconds;
         }
     }
 
     bool IsReady(string name) {
         int index = this.IndexOf(name);
-        return index < 0 || this.remaining[index] <= 0;
+        return index < 0 || this.entries[index].remaining <= 0;
     }
 
     int Remaining(string name) {
         int index = this.IndexOf(name);
         if (index < 0) { return 0; }
-        return this.remaining[index];
+        return this.entries[index].remaining;
     }
 
     int Progress(string name) {
         int index = this.IndexOf(name);
-        if (index < 0 || this.remaining[index] <= 0) { return 100; }
-        int duration = this.durations[index];
+        if (index < 0 || this.entries[index].remaining <= 0) { return 100; }
+        int duration = this.entries[index].duration;
         if (duration <= 0) { return 100; }
-        return (duration - this.remaining[index]) * 100 / duration;
+        return (duration - this.entries[index].remaining) * 100 / duration;
     }
 
     void Tick(int deltaMilliseconds) {
         if (deltaMilliseconds <= 0) { return; }
-        int i = this.names.Count - 1;
+        int i = this.entries.Count - 1;
         while (i >= 0) {
-            this.remaining[i] = this.remaining[i] - deltaMilliseconds;
-            if (this.remaining[i] <= 0) {
-                this.names.RemoveAt(i);
-                this.remaining.RemoveAt(i);
-                this.durations.RemoveAt(i);
+            this.entries[i].remaining = this.entries[i].remaining - deltaMilliseconds;
+            if (this.entries[i].remaining <= 0) {
+                this.entries.RemoveAt(i);
             }
             i = i - 1;
         }
