@@ -24,9 +24,11 @@
      `Socket.ConnectAsync` 通过运行时 `zan_io_connect_status`（select
      写/异常集探测 + SO_ERROR）返回连接结果，`TcpClient.ConnectAsync`
      失败返回 null，`HttpClient` 连接/TLS 失败抛 `HttpRequestException`
-     （`tests/conformance/net_errors.zan`）。已知限制：异常穿过 async CPS
-     帧时这些帧不被释放（net_errors 在 leakcheck 的 `_known_leaky`
-     允许列表中，ARC 后续工作）。
+     （`tests/conformance/net_errors.zan`）。异常穿过 async CPS 帧时
+     帧不释放的问题已修复：帧头新增 cleanup 函数指针与 armed-handler
+     计数，throw/rethrow 在 longjmp 前调用 `__zan_async_unwind` 沿
+     awaiter 链释放被跳过的帧及其持有的 ARC 值（net_errors 已从
+     leakcheck `_known_leaky` 允许列表移除）。
      **Json 部分已完成**：`JsonValue.Parse` 对畸形输入抛 `JsonException`
      （先用无分配扫描校验再建树，错误路径无泄漏）；原 best-effort 行为
      保留为 `JsonValue.ParseLenient`，现有调用点（UI 文档/RPC/IDE）已

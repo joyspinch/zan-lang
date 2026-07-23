@@ -778,6 +778,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         LLVMValueRef new_top = LLVMBuildAdd(g->builder, old_top,
             LLVMConstInt(i32t, 1, 0), "eh.new");
         LLVMBuildStore(g->builder, new_top, top_g);
+        /* An async frame records how many try handlers it currently has
+         * armed (frame.hcount): __zan_async_unwind stops releasing frames at
+         * the first one with an armed handler, since the exception resumes
+         * inside it. Balanced by the decrements at try-exit / catch-entry. */
+        if (g->current_async_frame) {
+            LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
+                g->current_async_frame_type, g->current_async_frame,
+                ASYNC_FRAME_HCOUNT, "eh.hc");
+            LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
+            LLVMBuildStore(g->builder, LLVMBuildAdd(g->builder, hc,
+                LLVMConstInt(i32t, 1, 0), "eh.hc1"), hc_ptr);
+            /* keep the heap frame authoritative across this try: a throw
+             * that crosses a suspension longjmps into a stale invocation
+             * whose stack allocas are garbage; the catch below re-loads the
+             * frame-resident slots from the frame instead. */
+            emit_async_save_slots(g);
+        }
         LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
         LLVMValueRef gep_idx[2] = { zero, new_top };
         LLVMTypeRef bufs_ty = LLVMGlobalGetValueType(bufs_g);
@@ -794,6 +811,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
             LLVMBuildStore(g->builder, ot, top_g);
+            if (g->current_async_frame) {
+                LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
+                    g->current_async_frame_type, g->current_async_frame,
+                    ASYNC_FRAME_HCOUNT, "eh.hc");
+                LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
+                LLVMBuildStore(g->builder, LLVMBuildSub(g->builder, hc,
+                    LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
+            }
             LLVMBuildBr(g->builder, end_bb);
         }
 
@@ -801,6 +826,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         {
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
             LLVMBuildStore(g->builder, ot, top_g);
+            if (g->current_async_frame) {
+                LLVMValueRef hc_ptr = LLVMBuildStructGEP2(g->builder,
+                    g->current_async_frame_type, g->current_async_frame,
+                    ASYNC_FRAME_HCOUNT, "eh.hc");
+                LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32t, hc_ptr, "eh.hcv");
+                LLVMBuildStore(g->builder, LLVMBuildSub(g->builder, hc,
+                    LLVMConstInt(i32t, 1, 0), "eh.hc0"), hc_ptr);
+                /* if the throw crossed a suspension, this invocation's stack
+                 * allocas are stale/garbage -- the frame (saved at try entry,
+                 * every suspension, and every async throw site) is the
+                 * authoritative copy of the frame-resident locals */
+                emit_async_reload_slots(g);
+            }
         }
         /* longjmp skipped the normal releases of temps pushed after this try
          * was entered (a throwing ctor's object, an owned receiver temp) —
@@ -891,6 +929,17 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.die");
                 LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
                 LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
+                /* rethrowing out of this coroutine: release the CPS frames
+                 * the longjmp is about to skip (see __zan_async_unwind) */
+                if (g->current_async_frame) {
+                    emit_async_save_slots(g);
+                    LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder,
+                        g->current_async_frame, i8ptr, "uw.self");
+                    LLVMTypeRef uw_ty = LLVMFunctionType(
+                        LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+                    zan_call2(g->builder, uw_ty, get_async_unwind_fn(g),
+                        &self_i8, 1, "");
+                }
                 LLVMValueRef rgep_idx[2] = { LLVMConstInt(i32t, 0, 0), rtop };
                 LLVMValueRef rbuf = LLVMBuildGEP2(g->builder,
                     LLVMGlobalGetValueType(bufs_g), bufs_g, rgep_idx, 2, "reh.buf");
@@ -1160,6 +1209,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn2, "throw.die");
             LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
             LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
+            /* a throw leaving an async body longjmps over every suspended
+             * CPS frame between here and the handler: save the live slots
+             * (so the frame is authoritative), then release the skipped
+             * frames and the rc values they own (see __zan_async_unwind) */
+            if (g->current_async_frame) {
+                emit_async_save_slots(g);
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder,
+                    g->current_async_frame, i8ptr, "uw.self");
+                LLVMTypeRef uw_ty = LLVMFunctionType(
+                    LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+                zan_call2(g->builder, uw_ty, get_async_unwind_fn(g),
+                    &self_i8, 1, "");
+            }
             LLVMValueRef gep_idx[2] = { LLVMConstInt(i32t, 0, 0), top };
             LLVMValueRef buf = LLVMBuildGEP2(g->builder,
                 LLVMGlobalGetValueType(bufs_g), bufs_g, gep_idx, 2, "eh.buf");

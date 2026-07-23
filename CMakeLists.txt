@@ -477,7 +477,6 @@ endforeach()
 set(_known_leaky
   lang_fixes        # rc objects owned by Dict/List slots (documented ARC follow-up)
   exceptions_basic  # thrown exception objects are not yet released after catch
-  net_errors        # async CPS frames are not released when an exception unwinds through them (documented ARC follow-up)
 )
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)

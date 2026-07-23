@@ -61,6 +61,10 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     LLVMBuildStore(g->builder, LLVMConstInt(i32, 1, 0), done_ptr);
     LLVMBuildStore(g->builder, LLVMConstInt(i32, -1, 1),
         LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_STATE, "fr.state"));
+    /* a `return` inside a try leaves that try's armed-handler count behind;
+     * a completed frame has no live handlers, so reset it for the unwinder */
+    LLVMBuildStore(g->builder, LLVMConstInt(i32, 0, 0),
+        LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_HCOUNT, "fr.hc"));
 
     emit_release_owned_locals(g, locals);
 

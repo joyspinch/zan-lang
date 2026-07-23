@@ -40,7 +40,9 @@ enum {
     ASYNC_FRAME_AWAITER = 2,      /* i8*: frame waiting on this one (or null) */
     ASYNC_FRAME_AWAITER_STEP = 3, /* void(i8*)*: awaiter's resume fn (or null) */
     ASYNC_FRAME_RESULT = 4,       /* i64: return value (scalars are i64 here) */
-    ASYNC_FRAME_FIRST_PARAM = 5
+    ASYNC_FRAME_CLEANUP = 5,      /* void(i8*)*: releases owned slots + frees the frame */
+    ASYNC_FRAME_HCOUNT = 6,       /* i32: try handlers currently armed by this frame */
+    ASYNC_FRAME_FIRST_PARAM = 7
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);

@@ -971,10 +971,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * knowing its concrete frame type (see ASYNC_FRAME_* indices). */
     LLVMTypeRef co_hdr_fields[] = {
         LLVMInt32TypeInContext(g->ctx), LLVMInt32TypeInContext(g->ctx),
-        i8ptr, g->co_step_ptr, i64
+        i8ptr, g->co_step_ptr, i64,
+        g->co_step_ptr, LLVMInt32TypeInContext(g->ctx)
     };
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
-    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 5, 0);
+    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 7, 0);
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
     g->current_async_resume_fn = NULL;

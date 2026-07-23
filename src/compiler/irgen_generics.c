@@ -1022,3 +1022,81 @@ static LLVMValueRef get_co_reap_fn(zan_irgen_t *g) {
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
     return reap;
 }
+
+/* Return the internal `__zan_async_unwind(i8* self)` helper, creating it once
+ * per module. An exception thrown in coroutine `self` longjmps straight to the
+ * target handler, skipping every suspended CPS frame in between; those frames
+ * (and every rc value they own) would leak. Starting at `self`, walk the
+ * awaiter chain calling each frame's $cleanup (releases owned slots + frees
+ * the frame), stopping at the first frame with an armed try handler
+ * (hcount > 0) -- that frame and everything above it stay live because the
+ * handler resumes there. Called right before the throw-site longjmp. */
+static LLVMValueRef get_async_unwind_fn(zan_irgen_t *g) {
+    LLVMValueRef f = LLVMGetNamedFunction(g->mod, "__zan_async_unwind");
+    if (f) return f;
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    f = LLVMAddFunction(g->mod, "__zan_async_unwind", fty);
+    LLVMSetLinkage(f, LLVMInternalLinkage);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMTypeRef hdr = g->co_header_type;
+    LLVMTypeRef hdr_ptr = LLVMPointerType(hdr, 0);
+
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, f, "entry");
+    LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, f, "head");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(g->ctx, f, "body");
+    LLVMBasicBlockRef clean = LLVMAppendBasicBlockInContext(g->ctx, f, "clean");
+    LLVMBasicBlockRef call_bb = LLVMAppendBasicBlockInContext(g->ctx, f, "call");
+    LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, f, "next");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, f, "done");
+
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMValueRef cur_a = LLVMBuildAlloca(g->builder, i8ptr, "cur.a");
+    LLVMValueRef next_a = LLVMBuildAlloca(g->builder, i8ptr, "next.a");
+    LLVMBuildStore(g->builder, LLVMGetParam(f, 0), cur_a);
+    LLVMBuildBr(g->builder, head);
+
+    LLVMPositionBuilderAtEnd(g->builder, head);
+    LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, cur_a, "cur");
+    LLVMValueRef nonnull = LLVMBuildICmp(g->builder, LLVMIntNE, cur,
+        LLVMConstNull(i8ptr), "cur.nn");
+    LLVMBuildCondBr(g->builder, nonnull, body, done);
+
+    LLVMPositionBuilderAtEnd(g->builder, body);
+    cur = LLVMBuildLoad2(g->builder, i8ptr, cur_a, "cur");
+    LLVMValueRef hf = LLVMBuildBitCast(g->builder, cur, hdr_ptr, "hf");
+    LLVMValueRef hc = LLVMBuildLoad2(g->builder, i32,
+        LLVMBuildStructGEP2(g->builder, hdr, hf, ASYNC_FRAME_HCOUNT, "hc.p"), "hc");
+    LLVMValueRef armed = LLVMBuildICmp(g->builder, LLVMIntSGT, hc,
+        LLVMConstInt(i32, 0, 0), "hc.armed");
+    LLVMBuildCondBr(g->builder, armed, done, clean);
+
+    LLVMPositionBuilderAtEnd(g->builder, clean);
+    LLVMValueRef aw = LLVMBuildLoad2(g->builder, i8ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, hf, ASYNC_FRAME_AWAITER, "aw.p"), "aw");
+    /* a detached (Task.Spawn) coroutine marks itself as its own awaiter */
+    LLVMValueRef det = LLVMBuildICmp(g->builder, LLVMIntEQ, aw, cur, "aw.det");
+    LLVMValueRef nxt = LLVMBuildSelect(g->builder, det,
+        LLVMConstNull(i8ptr), aw, "aw.next");
+    LLVMBuildStore(g->builder, nxt, next_a);
+    LLVMValueRef cl = LLVMBuildLoad2(g->builder, g->co_step_ptr,
+        LLVMBuildStructGEP2(g->builder, hdr, hf, ASYNC_FRAME_CLEANUP, "cl.p"), "cl");
+    LLVMValueRef has_cl = LLVMBuildICmp(g->builder, LLVMIntNE, cl,
+        LLVMConstNull(g->co_step_ptr), "cl.nn");
+    LLVMBuildCondBr(g->builder, has_cl, call_bb, next_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, call_bb);
+    zan_call2(g->builder, g->co_step_type, cl, &cur, 1, "");
+    LLVMBuildBr(g->builder, next_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, next_bb);
+    LLVMValueRef nv = LLVMBuildLoad2(g->builder, i8ptr, next_a, "next");
+    LLVMBuildStore(g->builder, nv, cur_a);
+    LLVMBuildBr(g->builder, head);
+
+    LLVMPositionBuilderAtEnd(g->builder, done);
+    LLVMBuildRetVoid(g->builder);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+    return f;
+}
