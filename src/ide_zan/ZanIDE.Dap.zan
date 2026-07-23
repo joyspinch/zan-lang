@@ -1,0 +1,135 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+/// ZanIDE part: DAP-backed debugging drivers -- session begin / sync,
+/// breakpoint conditions and watch evaluation over DebugSession.
+partial class ZanIDE {
+    // ==== Real DAP-backed debugging (P0-2) ================================
+    // These helpers drive a DebugSession (a Debug Adapter Protocol client that
+    // talks to a spawned zan-dap over a loopback socket), replacing the old
+    // static source-instrumentation debugger. Stop locations, the call stack,
+    // scopes and variables all come from a real gdb-backed inferior.
+
+    /// Spawns zan-dap in TCP server mode, connects, and runs the launch
+    /// handshake (initialize/launch/setBreakpoints/configurationDone) until the
+    /// first stop or program exit. `bps0` holds 0-based breakpoint lines; when
+    /// empty a single breakpoint is placed at `fallback0` so F5 still pauses.
+    /// Returns the session, or null when the adapter cannot be reached.
+    static DebugSession DbgBegin(string root, string srcPath, List<int> bps0,
+            int fallback0, List<int> condLines0, List<string> condExprs0,
+            List<string> log) {
+        string exe = ZanIDE.EnsureBuildDir(root) + "/.zandbg" + ZanIDE.ExeSuffix();
+        string dap = ZanIDE.ToolchainDir() + "/zan-dap" + ZanIDE.ExeSuffix();
+        if (!File.Exists(dap)) { dap = ZanIDE.ExeDir() + "/zan-dap" + ZanIDE.ExeSuffix(); }
+        if (!File.Exists(dap)) {
+            log.Add("> [Debug] zan-dap not found in toolchain.");
+            return null;
+        }
+        List<int> lines = new List<int>();
+        List<string> conds = new List<string>();
+        int bi = 0;
+        while (bi < bps0.Count) {
+            lines.Add(bps0[bi] + 1);
+            conds.Add(ZanIDE.CondFor(condLines0, condExprs0, bps0[bi]));
+            bi = bi + 1;
+        }
+        if (lines.Count == 0) { lines.Add(fallback0 + 1); conds.Add(""); }
+
+        int attempt = 0;
+        while (attempt < 4) {
+            int port = 47113 + attempt;
+            Process.RunDetached("\"" + dap + "\" --port " + Convert.ToString(port));
+            DebugSession s = DebugSession.Open(port, exe, srcPath, lines, conds);
+            if (s != null) { return s; }
+            attempt = attempt + 1;
+        }
+        log.Add("> [Debug] Could not connect to zan-dap.");
+        return null;
+    }
+
+    /// Reflects a session's current stop state into the editor + output log and
+    /// mirrors the inferior's stdout into the debug console. Returns the debug
+    /// UI state (2 = paused, 0 = not debugging).
+    static int DbgSync(DebugSession dbg, CodeEditor editor, List<string> log,
+            List<string> console) {
+        if (dbg == null) {
+            editor.SetExecLine(0 - 1);
+            return 0;
+        }
+        while (console.Count > 0) { console.RemoveAt(console.Count - 1); }
+        List<string> outp = dbg.Console();
+        int oi = 0;
+        while (oi < outp.Count) { console.Add(outp[oi]); oi = oi + 1; }
+        if (dbg.Paused()) {
+            editor.SetExecLine(dbg.CurLine() - 1);
+            log.Add("> [Debug] Paused at line " + Convert.ToString(dbg.CurLine()));
+            return 2;
+        }
+        editor.SetExecLine(0 - 1);
+        log.Add("> [Debug] Program exited (code "
+            + Convert.ToString(dbg.ExitCode()) + ").");
+        dbg.Stop();
+        return 0;
+    }
+
+    /// 0-based editor line for the current stop, or -1 when not paused.
+    static int DbgLine(DebugSession dbg) {
+        if (dbg == null) { return 0 - 1; }
+        if (!dbg.Paused()) { return 0 - 1; }
+        return dbg.CurLine() - 1;
+    }
+
+    static List<string> DbgVars(DebugSession dbg) {
+        if (dbg == null) { return new List<string>(); }
+        return dbg.Locals();
+    }
+
+    static List<string> DbgStack(DebugSession dbg) {
+        if (dbg == null) { return new List<string>(); }
+        return dbg.Stack();
+    }
+
+    /// The condition expression stored for 0-based `line` ("" when none).
+    static string CondFor(List<int> lines, List<string> exprs, int line) {
+        int i = 0;
+        while (i < lines.Count) {
+            if (lines[i] == line) { return exprs[i]; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// Sets, replaces or clears (empty expr) the condition for 0-based `line`.
+    static void SetCond(List<int> lines, List<string> exprs, int line,
+            string expr) {
+        int i = 0;
+        while (i < lines.Count) {
+            if (lines[i] == line) {
+                if (expr.Length == 0) { lines.RemoveAt(i); exprs.RemoveAt(i); }
+                else { exprs[i] = expr; }
+                return;
+            }
+            i = i + 1;
+        }
+        if (expr.Length > 0) { lines.Add(line); exprs.Add(expr); }
+    }
+
+    /// Evaluates every watch expression in the paused frame; returns rows in
+    /// the Variables panel format (expr\t\tvalue).
+    static List<string> DbgEvalWatches(DebugSession dbg, List<string> watches) {
+        List<string> rows = new List<string>();
+        int i = 0;
+        while (i < watches.Count) {
+            string v = "";
+            if (dbg != null) { v = dbg.Evaluate(watches[i]); }
+            rows.Add(watches[i] + "\t\t" + v);
+            i = i + 1;
+        }
+        return rows;
+    }
+}

@@ -1,0 +1,1274 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+/// ZanIDE part: workspace scaffolding, the New Project template catalog
+/// and bodies, explorer tree scanning, tab management and the zanc
+/// toolchain (build / run / publish process plumbing).
+partial class ZanIDE {
+    // ---- workspace / scaffolding ----
+
+    // ---- template catalog ----
+
+    /// The built-in project templates, grouped by category. Category labels here
+    /// must match the New Project wizard's category list exactly.
+    static List<Tpl> BuiltinTemplates() {
+        List<Tpl> ts = new List<Tpl>();
+        ts.Add(Tpl.Make("Console", ZanIDE.T("Hello World", "Hello World"), "menu", "console",
+            ZanIDE.T("Minimal console program that prints a line of text.", "最小控制台程序，打印一行文本。")));
+        ts.Add(Tpl.Make("Console", ZanIDE.T("Command-line Args", "命令行参数"), "menu", "console-args",
+            ZanIDE.T("Console program that reads command-line arguments.", "读取命令行参数的控制台程序。")));
+        ts.Add(Tpl.Make("Console", ZanIDE.T("Multi-file Project", "多文件项目"), "copy", "console-multi",
+            ZanIDE.T("Console project split into main + utils source files.", "拆分为 main + utils 源文件的控制台项目。")));
+        ts.Add(Tpl.Make("Library", ZanIDE.T("Class Library", "类库"), "grid", "dll-class",
+            ZanIDE.T("A reusable library of classes, compiled to a DLL.", "可复用的类库，编译为 DLL。")));
+        ts.Add(Tpl.Make("Library", ZanIDE.T("Export DLL", "导出 DLL"), "copy", "dll-export",
+            ZanIDE.T("A DLL exposing functions callable from other programs.", "导出可供其他程序调用函数的 DLL。")));
+        ts.Add(Tpl.Make("Window App", ZanIDE.T("Empty Window", "空窗口"), "maximize", "gui-empty",
+            ZanIDE.T("A blank window app built on the Gui standard library.", "基于 Gui 标准库的空白窗口程序。")));
+        ts.Add(Tpl.Make("Window App", ZanIDE.T("Component Showcase", "组件展示"), "grid", "gui-components",
+            ZanIDE.T("A window with panels/toolbars from the Gui components.", "带 Gui 组件面板/工具栏的窗口。")));
+        ts.Add(Tpl.Make("WebView", ZanIDE.T("WebView Window", "WebView 窗口"), "folder", "webview",
+            ZanIDE.T("A window that hosts web content (needs a WebView runtime).", "承载网页内容的窗口（需要 WebView 运行时）。")));
+        ts.Add(Tpl.Make("Server", ZanIDE.T("HTTP Server", "HTTP 服务器"), "arrow-right", "server",
+            ZanIDE.T("A minimal HTTP server skeleton.", "最小 HTTP 服务器骨架。")));
+        ts.Add(Tpl.Make("Server", ZanIDE.T("TCP Echo Server", "TCP 回显服务器"), "refresh", "server-tcp",
+            ZanIDE.T("A minimal TCP echo server skeleton.", "最小 TCP 回显服务器骨架。")));
+        return ts;
+    }
+
+    /// Where the shipped template tree lives: <ExeDir>/templates when
+    /// published, <ExeDir>/../templates when running from the build tree.
+    static string TemplatesDir() {
+        string a = ZanIDE.ExeDir() + "/templates";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.ExeDir() + "/../templates";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// Templates found on disk (category dirs -> template dirs, each described
+    /// by a template.manifest) plus user templates; falls back to the
+    /// hard-coded built-ins only when no disk tree exists.
+    static List<Tpl> BuildCatalog(string root) {
+        List<Tpl> ts = new List<Tpl>();
+        ZanIDE.LoadDiskTemplates(ts);
+        if (ts.Count == 0) { ts = ZanIDE.BuiltinTemplates(); }
+        ZanIDE.LoadCustomTemplates(ts, root);
+        return ts;
+    }
+
+    /// Scans <templates>/<category>/<template>/template.manifest (also accepts
+    /// a template.manifest directly one level down) and appends each template,
+    /// sorted by its manifest `order`.
+    static void LoadDiskTemplates(List<Tpl> ts) {
+        string base_ = ZanIDE.TemplatesDir();
+        if (base_.Length == 0) { return; }
+        List<Tpl> found = new List<Tpl>();
+        List<string> cats = Directory.GetDirectories(base_);
+        int i = 0;
+        while (i < cats.Count) {
+            string catDir = base_ + "/" + cats[i];
+            if (File.Exists(catDir + "/template.manifest")) {
+                ZanIDE.AddDiskTemplate(found, catDir);
+            } else {
+                List<string> subs = Directory.GetDirectories(catDir);
+                int j = 0;
+                while (j < subs.Count) {
+                    ZanIDE.AddDiskTemplate(found, catDir + "/" + subs[j]);
+                    j = j + 1;
+                }
+            }
+            i = i + 1;
+        }
+        // Insertion sort by order (catalog stays tiny).
+        int k = 0;
+        while (k < found.Count) {
+            int best = k;
+            int m = k + 1;
+            while (m < found.Count) {
+                if (found[m].order < found[best].order) { best = m; }
+                m = m + 1;
+            }
+            Tpl tmp = found[k]; found[k] = found[best]; found[best] = tmp;
+            ts.Add(found[k]);
+            k = k + 1;
+        }
+    }
+
+    /// Parses one template.manifest into a Tpl (localized name/desc).
+    static void AddDiskTemplate(List<Tpl> ts, string dir) {
+        string mpath = dir + "/template.manifest";
+        if (!File.Exists(mpath)) { return; }
+        string m = File.ReadAllText(mpath);
+        string nameEn = ZanIDE.ManifestField(m, "name", Path.GetFileName(dir));
+        string nameZh = ZanIDE.ManifestField(m, "name.zh", nameEn);
+        string descEn = ZanIDE.ManifestField(m, "desc", "");
+        string descZh = ZanIDE.ManifestField(m, "desc.zh", descEn);
+        Tpl t = Tpl.Make(
+            ZanIDE.ManifestField(m, "category", "Other"),
+            ZanIDE.T(nameEn, nameZh),
+            ZanIDE.ManifestField(m, "icon", "file"),
+            ZanIDE.ManifestField(m, "kind", "copy"),
+            ZanIDE.T(descEn, descZh));
+        t.src = dir;
+        t.ptype = ZanIDE.ManifestField(m, "type", "console");
+        t.ptarget = ZanIDE.ManifestField(m, "target", "exe");
+        t.pentry = ZanIDE.ManifestField(m, "entry", "src/main.zan");
+        t.order = ZanIDE.ParseInt(ZanIDE.ManifestField(m, "order", "1000"));
+        ts.Add(t);
+    }
+
+    /// The distinct categories of a catalog, in first-appearance order.
+    static List<string> CatsOf(List<Tpl> ts) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        while (i < ts.Count) {
+            string c = ts[i].cat;
+            bool seen = false;
+            int j = 0;
+            while (j < outp.Count) {
+                if (outp[j] == c) { seen = true; }
+                j = j + 1;
+            }
+            if (!seen) { outp.Add(c); }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Projects the catalog into the entity list the wizard consumes.
+    static List<WizardTemplate> WizTemplates(List<Tpl> ts) {
+        List<WizardTemplate> outp = new List<WizardTemplate>();
+        foreach (Tpl t in ts) {
+            outp.Add(new WizardTemplate(t.cat, t.name, t.icon, t.desc));
+        }
+        return outp;
+    }
+
+    /// Scans root/.templates/<name>/ and appends each as a "Custom" template.
+    /// GetDirectories on a missing directory yields an empty list, so no
+    /// separate existence check is needed.
+    static void LoadCustomTemplates(List<Tpl> ts, string root) {
+        string dir = ZanIDE.UserConfigDir() + "/templates";
+        List<string> subs = Directory.GetDirectories(dir);
+        int i = 0;
+        while (i < subs.Count) {
+            string tname = subs[i];
+            string tdir = dir + "/" + tname;
+            string desc = "Custom template.";
+            string icon = "file";
+            string mpath = tdir + "/template.manifest";
+            if (!File.Exists(mpath)) { mpath = tdir + "/manifest.txt"; }
+            if (File.Exists(mpath)) {
+                string m = File.ReadAllText(mpath);
+                desc = ZanIDE.ManifestField(m, "desc", desc);
+                icon = ZanIDE.ManifestField(m, "icon", icon);
+            }
+            Tpl t = Tpl.Make("Custom", tname, icon, "custom", desc);
+            t.src = tdir;
+            ts.Add(t);
+            i = i + 1;
+        }
+    }
+
+    /// Reads a "key=value" field from a simple manifest, or returns def.
+    /// Scans char-by-char (rather than splitting into a list) to stay robust.
+    static string ManifestField(string content, string key, string def) {
+        string prefix = key + "=";
+        int n = content.Length;
+        int pl = prefix.Length;
+        int i = 0;
+        while (i < n) {
+            bool atLineStart = (i == 0) || (content.Substring(i - 1, 1) == "\n");
+            if (atLineStart && i + pl <= n && content.Substring(i, pl) == prefix) {
+                int j = i + pl;
+                string val = "";
+                while (j < n) {
+                    string ch = content.Substring(j, 1);
+                    if (ch == "\n" || ch == "\r") { break; }
+                    val = val + ch;
+                    j = j + 1;
+                }
+                return val;
+            }
+            i = i + 1;
+        }
+        return def;
+    }
+
+    /// Recursively copies a template's files (skipping its manifest) into dst.
+    static void CopyTree(string srcDir, string dstDir) {
+        ZanIDE.CopyTreeT(srcDir, dstDir, "");
+    }
+
+    /// CopyTree with template-variable substitution: when name is non-empty,
+    /// every occurrence of {{NAME}} in file contents becomes the project name.
+    static void CopyTreeT(string srcDir, string dstDir, string name) {
+        Directory.CreateDirectory(dstDir);
+        List<string> files = Directory.GetFiles(srcDir);
+        int i = 0;
+        while (i < files.Count) {
+            string fn = files[i];
+            if (fn != "manifest.txt" && fn != "template.manifest") {
+                string body = File.ReadAllText(srcDir + "/" + fn);
+                if (name.Length > 0) {
+                    body = ZanIDE.ReplaceAll(body, "{{NAME}}", name);
+                }
+                File.WriteAllText(dstDir + "/" + fn, body);
+            }
+            i = i + 1;
+        }
+        List<string> subs = Directory.GetDirectories(srcDir);
+        int j = 0;
+        while (j < subs.Count) {
+            ZanIDE.CopyTreeT(srcDir + "/" + subs[j], dstDir + "/" + subs[j], name);
+            j = j + 1;
+        }
+    }
+
+    /// Replaces every occurrence of pat in s (no overlap handling needed for
+    /// template variables).
+    static string ReplaceAll(string s, string pat, string rep) {
+        if (pat.Length == 0) { return s; }
+        StringBuilder sb = new StringBuilder();
+        int n = s.Length;
+        int pl = pat.Length;
+        int i = 0;
+        while (i < n) {
+            bool hit = false;
+            if (i + pl <= n) {
+                if (s.Substring(i, pl) == pat) { hit = true; }
+            }
+            if (hit) { sb.Append(rep); i = i + pl; }
+            else { sb.Append(s.Substring(i, 1)); i = i + 1; }
+        }
+        return sb.ToString();
+    }
+
+    /// Saves the current project (its src/ tree + zan.proj) as a reusable custom
+    /// template under root/.templates/<tname>/ with a small manifest.
+    static void SaveAsTemplate(string root, string cat, string tname, List<string> log) {
+        string tdir = ZanIDE.UserConfigDir() + "/templates/" + tname;
+        Directory.CreateDirectoryRecursive(tdir);
+        if (Directory.Exists(root + "/src")) {
+            ZanIDE.CopyTree(root + "/src", tdir + "/src");
+        }
+        if (File.Exists(root + "/zan.proj")) {
+            File.WriteAllText(tdir + "/zan.proj", File.ReadAllText(root + "/zan.proj"));
+        }
+        File.WriteAllText(tdir + "/template.manifest",
+            "name=" + tname + "\ncategory=" + cat + "\nicon=file\nkind=custom\ndesc=Custom template from " + Path.GetFileName(root) + ".\n");
+        log.Add("> Saved current project as template '" + tname + "' (" + tdir + ").");
+    }
+
+    /// Maps the multi-select platform flags to a comma-separated id list
+    /// (e.g. "windows-x64,linux-arm64"); defaults to windows-x64 if none chosen.
+    static string PlatformCsv(List<WizardTarget> targets) {
+        List<string> ids = new List<string>{
+            "windows-x64", "windows-arm64",
+            "linux-x64", "linux-arm64",
+            "macos-x64", "macos-arm64" };
+        string outp = "";
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            if (i < ids.Count && targets[i].selected == 1) {
+                if (outp.Length > 0) { outp = outp + ","; }
+                outp = outp + ids[i];
+            }
+        }
+        if (outp.Length == 0) { outp = "windows-x64"; }
+        return outp;
+    }
+
+    /// Scaffolds a new project from a template descriptor; returns its directory.
+    /// platforms is a comma-separated target-platform id list written to zan.proj.
+    static string CreateProjectT(Tpl tpl, string parent, string name, string platforms, List<string> log) {
+        string dir = parent + "/" + name;
+        // Scaffolding into an existing non-empty folder would mix template
+        // files into unrelated user data, so refuse and return "" (the caller
+        // keeps the wizard open).
+        if (Directory.Exists(dir)) {
+            List<string> exFiles = Directory.GetFiles(dir);
+            List<string> exDirs = Directory.GetDirectories(dir);
+            if (exFiles.Count > 0 || exDirs.Count > 0) {
+                log.Add(ZanIDE.T("> Cannot create project: target folder is not empty: ",
+                    "> 无法创建项目：目标文件夹非空：") + dir);
+                return "";
+            }
+        }
+        Directory.CreateDirectoryRecursive(dir);
+        Directory.CreateDirectoryRecursive(dir + "/src");
+
+        string typeName = "console";
+        string target = "exe";
+        string entry = "src/main.zan";
+        string kind = tpl.kind;
+
+        if (kind == "gui-empty") {
+            typeName = "gui"; target = "exe"; entry = "src/" + name + ".zan";
+            ZanIDE.WriteFormProject(dir, name, 0);
+        } else if (kind == "gui-components") {
+            typeName = "gui"; target = "exe"; entry = "src/" + name + ".zan";
+            ZanIDE.WriteFormProject(dir, name, 1);
+        } else if (kind == "custom") {
+            ZanIDE.CopyTree(tpl.src, dir);
+        } else if (tpl.src.Length > 0) {
+            // Disk template: copy its tree with {{NAME}} substituted, and take
+            // project type/target/entry from its manifest.
+            typeName = tpl.ptype; target = tpl.ptarget; entry = tpl.pentry;
+            ZanIDE.CopyTreeT(tpl.src, dir, name);
+        } else if (kind == "console") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleTemplate(name));
+        } else if (kind == "console-args") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleArgsTemplate(name));
+        } else if (kind == "console-multi") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ConsoleTemplate(name));
+            File.WriteAllText(dir + "/src/utils.zan",
+                "using System;\n\nclass Utils {\n    static int Add(int a, int b) { return a + b; }\n}\n");
+        } else if (kind == "dll-class") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", ZanIDE.LibraryTemplate(name));
+        } else if (kind == "dll-export") {
+            typeName = "library"; target = "dll"; entry = "src/lib.zan";
+            File.WriteAllText(dir + "/src/lib.zan", ZanIDE.DllExportTemplate(name));
+        } else if (kind == "webview") {
+            typeName = "gui"; target = "exe";
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.WebViewTemplate(name));
+        } else if (kind == "server") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ServerHttpTemplate(name));
+        } else if (kind == "server-tcp") {
+            File.WriteAllText(dir + "/src/main.zan", ZanIDE.ServerTcpTemplate(name));
+        } else {
+            typeName = "empty";
+        }
+
+        if (!File.Exists(dir + "/README.md")) {
+            File.WriteAllText(dir + "/README.md",
+                "# " + name + "\n\nGenerated by the Zan IDE (template: " + tpl.name + ").\n");
+        }
+        if (kind != "custom" && !File.Exists(dir + "/zan.proj")) {
+            File.WriteAllText(dir + "/zan.proj",
+                "name = " + name + "\ntype = " + typeName + "\nentry = " + entry
+                + "\ntarget = " + target + "\nplatform = " + platforms + "\n");
+        }
+        log.Add("> Created " + typeName + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
+        return dir;
+    }
+
+    /// Scaffolds a Window App as a visual form project: writes <name>.zform (the
+    /// design surface) plus a runnable code-behind <name>.zan whose generated
+    /// region opens the window and renders the designed controls. seedKind 0 is a
+    /// minimal starter (label + button); 1 seeds a small component showcase.
+    static void WriteFormProject(string dir, string name, int seedKind) {
+        List<FormField> fs = ZanIDE.SeedFields(seedKind);
+        File.WriteAllText(dir + "/src/" + name + ".zform",
+            ZanIDE.FormJsonOf(name, fs));
+        File.WriteAllText(dir + "/src/" + name + ".zan",
+            ZanIDE.CodeBehindShell(name, ZanIDE.FieldsRegion(name, fs, 480, 520)));
+    }
+
+    /// A single seeded designer field (used by the new-form templates).
+    static FormField MakeField(int ft, string label, string name) {
+        FormField f = new FormField(ft);
+        f.SetOptionsFrom("");
+        f.label = label;
+        f.fname = name;
+        f.name = name;
+        return f;
+    }
+
+    /// Starter fields for a new form: 0 = minimal, 1 = small showcase.
+    static List<FormField> SeedFields(int seedKind) {
+        List<FormField> fs = new List<FormField>();
+        fs.Add(ZanIDE.MakeField(15, "Welcome", "TitleLabel"));
+        fs.Add(ZanIDE.MakeField(0, "Name", "NameInput"));
+        if (seedKind == 1) {
+            fs.Add(ZanIDE.MakeField(5, "Remember me", "RememberCheck"));
+            fs.Add(ZanIDE.MakeField(6, "Role", "RoleSelect"));
+            fs.Add(ZanIDE.MakeField(9, "Volume", "VolumeSlider"));
+        }
+        fs.Add(ZanIDE.MakeField(49, "OK", "OkButton"));
+        return fs;
+    }
+
+    /// Serializes a field list into the form designer's JSON document.
+    static string FormJsonOf(string name, List<FormField> fs) {
+        Designer d = Designer.Create();
+        d.fields = fs;
+        d.formNameSig.Set(name);
+        return d.SaveJson();
+    }
+
+    /// A fresh .zform design document; seedKind < 0 creates an empty form.
+    static string NewFormJson(string name, int seedKind) {
+        if (seedKind < 0) {
+            return ZanIDE.FormJsonOf(name, new List<FormField>());
+        }
+        return ZanIDE.FormJsonOf(name, ZanIDE.SeedFields(seedKind));
+    }
+
+    /// Creates a file from the chosen file template; returns the path to open.
+    /// For a Form (kind 5) this follows the C#-style rule and creates BOTH the
+    /// visual layout file (Name.zform) and its code-behind (Name.zan), returning
+    /// the .zform so it opens in the designer.
+    static string CreateFile(int kind, string root, string name, List<string> log) {
+        Directory.CreateDirectory(root + "/src");
+        if (kind == 6) {
+            string scenePath = root + "/src/" + name + ".zscene";
+            File.WriteAllText(scenePath, SceneDoc.Create(name, 1280, 720).ToJson());
+            log.Add("> Created scene " + scenePath + ".");
+            return scenePath;
+        }
+        if (kind == 5) {
+            string formPath = root + "/src/" + name + ".zform";
+            string cbPath = root + "/src/" + name + ".zan";
+            File.WriteAllText(formPath, ZanIDE.NewFormJson(name, 0 - 1));
+            if (!File.Exists(cbPath)) {
+                File.WriteAllText(cbPath, ZanIDE.CodeBehindShell(name,
+                    ZanIDE.FieldsRegion(name, new List<FormField>(), 480, 520)));
+            }
+            log.Add("> Created form " + formPath + " + code-behind " + cbPath + ".");
+            return formPath;
+        }
+        string path = root + "/src/" + name + ".zan";
+        File.WriteAllText(path, ZanIDE.FileTemplateBody(kind, name));
+        log.Add("> Created file " + path + ".");
+        return path;
+    }
+
+    static void OpenFirst(List<string> names, List<string> bodies, List<string> paths, SignalInt active, string root) {
+        string formP = root + "/src/" + Path.GetFileName(root) + ".zform";
+        string main = root + "/src/main.zan";
+        string lib = root + "/src/lib.zan";
+        if (File.Exists(formP)) {
+            ZanIDE.OpenPath(names, bodies, paths, active, formP, Path.GetFileName(formP));
+        } else if (File.Exists(main)) {
+            ZanIDE.OpenPath(names, bodies, paths, active, main, "main.zan");
+        } else if (File.Exists(lib)) {
+            ZanIDE.OpenPath(names, bodies, paths, active, lib, "lib.zan");
+        } else {
+            names.Add("README.md");
+            bodies.Add(File.ReadAllText(root + "/README.md"));
+            paths.Add(root + "/README.md");
+            active.Set(0);
+        }
+    }
+
+    // ---- template bodies ----
+
+    static string ConsoleTemplate(string name) {
+        return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
+    }
+
+    static string GuiTemplate(string name) {
+        return "using System;\nusing Gui;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 800, 600);\n        // app.Run drives the whole window loop (events + redraw + chrome);\n        // use the BeginFrame/PresentFrame loop directly to draw custom content.\n        app.Run(\"" + name + "\");\n    }\n}\n";
+    }
+
+    static string LibraryTemplate(string name) {
+        return "using System;\n\n/// " + name + " library.\nclass " + name + " {\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string ConsoleArgsTemplate(string name) {
+        return "using System;\n\nclass Program {\n    static void Main() {\n        // TODO: read and parse command-line arguments here.\n        Console.WriteLine(\"" + name + ": pass arguments on the command line\");\n    }\n}\n";
+    }
+
+    static string DllExportTemplate(string name) {
+        return "using System;\n\n/// Functions exported from this library for use by other programs.\nclass " + name + " {\n    static int Add(int a, int b) { return a + b; }\n    static int Version() { return 1; }\n}\n";
+    }
+
+    static string GuiComponentsTemplate(string name) {
+        return "using System;\nusing Gui;\nusing Gui.Widget;\n\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 900, 640);\n        app.Show();\n        while (app.isRunning) {\n            if (!app.ProcessEvent()) { break; }\n            if (!app.needsRedraw) { continue; }\n            app.BeginFrame();\n            Canvas c = app.canvas;\n            int w = c.Width();\n            int h = c.Height();\n            int top = app.titlebarH;\n            Rect box = Panel.Section(app, 20, top + 20, w - 40, h - top - 40, \"" + name + "\");\n            c.DrawText(box.x + 12, box.y + 12, \"Build your UI from Gui components here.\", app.theme.textPrimary, app.theme.fontSizeMedium);\n            app.RenderChrome(\"" + name + "\");\n            app.PresentFrame();\n        }\n    }\n}\n";
+    }
+
+    static string WebViewTemplate(string name) {
+        return "using System;\nusing Gui;\n\n// WebView window skeleton. Hosting real web content needs a WebView2\n// runtime binding; this placeholder window stands in until that lands.\nclass Program {\n    static void Main() {\n        App app = App.CreateDark(\"" + name + "\", 1000, 700);\n        app.Run(\"WebView: " + name + "\");\n    }\n}\n";
+    }
+
+    static string ServerHttpTemplate(string name) {
+        return "using System;\n\n// HTTP server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " listening on http://localhost:8080\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
+    }
+
+    static string ServerTcpTemplate(string name) {
+        return "using System;\n\n// TCP echo server skeleton. Wire in System.Net once its socket API is ready.\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"" + name + " TCP echo server on :9000\");\n        Console.WriteLine(\"(network binding pending)\");\n    }\n}\n";
+    }
+
+    static string FileTemplateBody(int kind, string name) {
+        if (kind == 0) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
+        }
+        if (kind == 1) {
+            return "using System;\n\nclass " + name + " {\n    // fields and methods\n}\n";
+        }
+        if (kind == 2) {
+            return ZanIDE.GuiTemplate(name);
+        }
+        if (kind == 3) {
+            return "using System;\n\n/// Contract implemented by concrete types.\nclass " + name + " {\n    void Execute() { }\n}\n";
+        }
+        return "";
+    }
+
+    // ---- tree scanning ----
+
+    static List<TreeNode> ScanTree(string root) {
+        List<TreeNode> nodes = new List<TreeNode>();
+        ZanIDE.ScanInto(
+            nodes, root, Path.GetFileName(root), 0, true);
+        return nodes;
+    }
+
+    static void ScanInto(List<TreeNode> nodes, string dirPath, string dirName, int depth, bool expanded) {
+        TreeNode d = TreeNode.Dir(dirName, depth, expanded);
+        d.path = dirPath;
+        nodes.Add(d);
+        List<string> subs = Directory.GetDirectories(dirPath);
+        int i = 0;
+        while (i < subs.Count) {
+            ZanIDE.ScanInto(nodes, dirPath + "/" + subs[i], subs[i], depth + 1, false);
+            i = i + 1;
+        }
+        List<string> files = Directory.GetFiles(dirPath);
+        int j = 0;
+        while (j < files.Count) {
+            if (!ZanIDE.EndsWith(files[j], ".proj")) {
+                TreeNode f = TreeNode.File(files[j], depth + 1);
+                f.path = dirPath + "/" + files[j];
+                nodes.Add(f);
+            }
+            j = j + 1;
+        }
+    }
+
+    /// True when `s` ends with `suffix` (used to hide project manifests from
+    /// the explorer tree).
+    static bool EndsWith(string s, string suffix) {
+        int sl = s.Length;
+        int fl = suffix.Length;
+        if (fl > sl) { return false; }
+        return s.Substring(sl - fl, fl) == suffix;
+    }
+
+    // ---- tabs ----
+
+    static void OpenPath(List<string> names, List<string> bodies, List<string> paths,
+                         SignalInt active, string path, string name) {
+        int idx = paths.IndexOf(path);
+        if (idx >= 0) {
+            active.Set(idx);
+            return;
+        }
+        string content = File.ReadAllText(path);
+        names.Add(name);
+        bodies.Add(content);
+        paths.Add(path);
+        active.Set(names.Count - 1);
+    }
+
+    static void SaveActive(CodeEditor editor, List<string> names, List<string> bodies,
+                           List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        if (a < 0 || a >= names.Count) { return; }
+        string p = paths[a];
+        // Virtual tabs (@start / @docs) have no file behind them; saving one
+        // used to write a literal "@start" file into the workspace root.
+        if (p == "@start" || p == "@docs") { return; }
+        bodies[a] = editor.GetText();
+        if (p == "") {
+            p = root + "/" + names[a];
+            paths[a] = p;
+        }
+        File.WriteAllText(p, bodies[a]);
+        log.Add("> Saved " + p + ".");
+    }
+
+    /// Saves the .zform code view: writes the in-place code editor to the form's
+    /// paired code-behind (.zan). Used instead of SaveActive while a .zform tab is
+    /// showing code, so the form JSON is never overwritten with source.
+    static void SaveFormCode(CodeEditor ed, string formPath, string root, List<string> log) {
+        string cbp = ZanIDE.CodeBehindPath(formPath);
+        File.WriteAllText(cbp, ed.GetText());
+        log.Add("> Saved " + cbp + ".");
+    }
+
+    // ---- toolchain ----
+
+    /// Rows whose label contains the filter (case-insensitive substring);
+    /// directories are dropped and matches flattened to depth 0 so every hit
+    /// is visible regardless of collapsed ancestors. An empty filter returns
+    /// the nodes unchanged.
+    static List<TreeNode> FilterNodes(List<TreeNode> nodes, string filter) {
+        if (filter == "") { return nodes; }
+        string f = ZanIDE.ToLowerS(filter);
+        List<TreeNode> outp = new List<TreeNode>();
+        int i = 0;
+        while (i < nodes.Count) {
+            TreeNode n = nodes[i];
+            if (!n.isDir && ZanIDE.Has(ZanIDE.ToLowerS(n.label), f)) {
+                TreeNode m = TreeNode.FileIcon(n.label, 0, n.icon);
+                m.path = n.path;
+                outp.Add(m);
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Resolves the source file Run/Build/Debug/Publish should compile for
+    /// the active tab: a .zform maps to its code-behind (falling back to the
+    /// project entry), and the special @start/@docs tabs map to the
+    /// project entry when one exists. Returns "" when there is no target.
+    static string RunTarget(string p, string root) {
+        if (p == "@start" || p == "@docs") {
+            string entry = ZanIDE.ProjectEntry(root);
+            if (File.Exists(entry)) { return entry; }
+            return "";
+        }
+        if (ZanIDE.IsFormPath(p)) {
+            string cb = ZanIDE.CodeBehindPath(p);
+            if (File.Exists(cb)) { return cb; }
+            return ZanIDE.ProjectEntry(root);
+        }
+        if (ZanIDE.IsScenePath(p)) { return ZanIDE.ProjectEntry(root); }
+        return p;
+    }
+
+    /// Run/Build/Debug from the ribbon act on the ACTIVE TAB: the focused code
+    /// tab is what gets compiled and run, so a scratch snippet in its own tab
+    /// can be tried without touching the project entry. Special tabs
+    /// (@start/@docs) and designer tabs (.zform/.zscene) still map to the
+    /// project entry via RunTarget.
+    static string RibbonRunTarget(string activePath, string root) {
+        return ZanIDE.RunTarget(activePath, root);
+    }
+
+    static void BuildActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
+        int a = active.Get();
+        string activePath = paths[a];
+        string p = activePath;
+        p = ZanIDE.RibbonRunTarget(p, root);
+        if (p == "") { log.Add(ZanIDE.T("> Nothing to build (save the file first).", "> 没有可构建的目标（请先保存文件）。")); return; }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zanbuild.ll";
+        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
+        string cmd = ZanIDE.ZancCmd() + " --emit-ir " + inputs + " > \"" + ll + "\"";
+        log.Add("> Building " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        ZanIDE.AppendAll(log, outp);
+        ZanIDE.ApplyDiagnostics(editor, activePath, outp, log);
+        if (outp.Count == 0) {
+            log.Add("> Build succeeded. 0 errors, 0 warnings.");
+        }
+    }
+
+    static void RunActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
+        int a = active.Get();
+        if (a < 0 || a >= paths.Count) {
+            log.Add("> Nothing to run (open a source file first).");
+            return;
+        }
+        ZanIDE.RunFile(paths[a], root, log, editor);
+    }
+
+    /// Compiles and runs one source file (or a tab sentinel/.zform mapped via
+    /// RunTarget). Also used by the Tools panel to run a tool on double-click.
+    static void RunFile(string activePath, string root, List<string> log, CodeEditor editor) {
+        string p = activePath;
+        p = ZanIDE.RunTarget(p, root);
+        if (p == "") {
+            log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
+            return;
+        }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zanrun.ll";
+        string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
+        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
+        bool isGui = ZanIDE.IsGuiTarget(root, p);
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
+        log.Add("> Building " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        ZanIDE.AppendAll(log, outp);
+        ZanIDE.ApplyDiagnostics(editor, activePath, outp, log);
+        if (!File.Exists(exe)) {
+            log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
+            return;
+        }
+        // Launch the program detached so the IDE never blocks: a console app may
+        // be a long-running server (e.g. a web server) that never returns, which
+        // would otherwise freeze the UI. Console apps get their own persistent
+        // window so output is visible and Ctrl+C can stop them; GUI apps launch
+        // windowless.
+        #if WINDOWS
+        if (isGui) { Process.Run("cmd /c start \"\" \"" + exe + "\""); }
+        else { Process.Run("cmd /c start \"Zan Run\" cmd /k \"" + exe + "\""); }
+        #else
+        Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
+        #endif
+        log.Add(ZanIDE.T("> Started (running in a separate window).", "> 已启动（在独立窗口中运行）。"));
+    }
+
+    /// Builds the active run target and returns the executable path so the caller
+    /// can stream it through the IDE terminal (non-blocking). GUI apps open their
+    /// own window, so they are launched windowless here and "" is returned.
+    /// Returns "" on build failure or when there is nothing to run; compiler
+    /// diagnostics still flow to the Output log and editor squiggles.
+    static string RunBuildActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
+        int a = active.Get();
+        if (a < 0 || a >= paths.Count) {
+            log.Add(ZanIDE.T("> Nothing to run (open a source file first).", "> 没有可运行的目标（请先打开源文件）。"));
+            return "";
+        }
+        return ZanIDE.RunBuildFile(paths[a], root, log, editor);
+    }
+
+    static string RunBuildFile(string activePath, string root, List<string> log, CodeEditor editor) {
+        string p = activePath;
+        p = ZanIDE.RibbonRunTarget(p, root);
+        if (p == "") {
+            log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
+            return "";
+        }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zanrun.ll";
+        string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
+        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
+        bool isGui = ZanIDE.IsGuiTarget(root, p);
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
+        log.Add("> Building " + p + " ...");
+        List<string> outp = Process.RunCapture(cmd);
+        ZanIDE.AppendAll(log, outp);
+        ZanIDE.ApplyDiagnostics(editor, activePath, outp, log);
+        if (!File.Exists(exe)) {
+            log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
+            return "";
+        }
+        if (isGui) {
+            #if WINDOWS
+            Process.Run("cmd /c start \"\" \"" + exe + "\"");
+            #else
+            Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
+            #endif
+            log.Add(ZanIDE.T("> GUI app started.", "> GUI 应用已启动。"));
+            return "";
+        }
+        return exe;
+    }
+
+    /// Compiler inputs for Run/Build. Inside a project (a zan.proj at the root or
+    /// beside the file) all sibling .zan files are compiled together; a loose
+    /// single file is compiled on its own so unrelated scratch files in the same
+    /// folder don't clash (e.g. two Main methods).
+    static string SmartInputs(string root, string dir, string entry) {
+        bool proj = File.Exists(root + "/zan.proj") || File.Exists(dir + "/zan.proj");
+        if (!proj) { return "\"" + entry + "\""; }
+        // Feed the project's other files in for cross-file types, but skip any
+        // that declare their own Main: when the focused tab is a runnable
+        // snippet, compiling it together with the project entry's Main would
+        // fail with a duplicate entry point.
+        string args = "\"" + entry + "\"";
+        List<string> all = new List<string>();
+        ZanIDE.GatherZanFiles(dir, all);
+        int i = 0;
+        while (i < all.Count) {
+            string f = all[i];
+            if (f != entry && !ZanIDE.FileHasMain(f)) {
+                args = args + " \"" + f + "\"";
+            }
+            i = i + 1;
+        }
+        return args;
+    }
+
+    /// True when the file declares a `static ... Main(` entry point.
+    static bool FileHasMain(string path) {
+        if (!File.Exists(path)) { return false; }
+        string s = File.ReadAllText(path);
+        int i = ZanIDE.IndexOfStr(s, " Main(");
+        while (i >= 0) {
+            // Require `static` earlier on the same line so a call like
+            // `x.Main()` or a comment does not count.
+            int ls = i;
+            while (ls > 0 && s.Substring(ls - 1, 1) != "\n") { ls = ls - 1; }
+            string line = s.Substring(ls, i - ls);
+            if (ZanIDE.IndexOfStr(line, "static ") >= 0) { return true; }
+            int nxt = ZanIDE.IndexOfStr(s.Substring(i + 1, s.Length - i - 1), " Main(");
+            if (nxt < 0) { return false; }
+            i = i + 1 + nxt;
+        }
+        return false;
+    }
+
+    /// First index of `needle` in `hay`, or -1.
+    static int IndexOfStr(string hay, string needle) {
+        int n = needle.Length;
+        int h = hay.Length;
+        if (n == 0) { return 0; }
+        int i = 0;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// Last index of `needle` in `hay`, or -1.
+    static int LastIndexOfStr(string hay, string needle) {
+        int n = needle.Length;
+        int h = hay.Length;
+        if (n == 0) { return h; }
+        int i = h - n;
+        while (i >= 0) {
+            if (hay.Substring(i, n) == needle) { return i; }
+            i = i - 1;
+        }
+        return -1;
+    }
+
+    /// Numeric value of a single-character digit string, or -1.
+    static int DigitVal(string ch) {
+        return ZanIDE.IndexOfStr("0123456789", ch);
+    }
+
+    /// Parses a leading run of digits into an int, or -1 when there are none.
+    static int ParseLeadInt(string s) {
+        int v = 0;
+        int i = 0;
+        bool any = false;
+        while (i < s.Length) {
+            int d = ZanIDE.DigitVal(s.Substring(i, 1));
+            if (d < 0) { break; }
+            v = v * 10 + d;
+            any = true;
+            i = i + 1;
+        }
+        if (!any) { return -1; }
+        return v;
+    }
+
+    /// Strips ANSI SGR escape sequences (ESC [ ... m) from compiler output so the
+    /// text can be matched and shown cleanly.
+    static string StripAnsi(string s) {
+        string esc = Text.ByteChar(27);
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == esc) {
+                i = i + 1;
+                while (i < s.Length && s.Substring(i, 1) != "m") { i = i + 1; }
+                if (i < s.Length) { i = i + 1; }
+            } else {
+                outp = outp + ch;
+                i = i + 1;
+            }
+        }
+        return outp;
+    }
+
+    /// Parses compiler output lines of the form `<path>:<line>:<col>: error: <msg>`
+    /// that refer to the active file, and pushes them onto the editor as real
+    /// diagnostics (red underline + reason tooltip), jumping to the first error.
+    static void ApplyDiagnostics(CodeEditor editor, string activePath, List<string> output, List<string> log) {
+        List<int> dl = new List<int>();
+        List<string> dm = new List<string>();
+        bool isZan = activePath.Length > 4
+            && activePath.Substring(activePath.Length - 4, 4) == ".zan";
+        if (isZan) {
+            string baseName = Path.GetFileName(activePath);
+            int oi = 0;
+            while (oi < output.Count) {
+                string raw = ZanIDE.StripAnsi(output[oi]);
+                int ep = ZanIDE.IndexOfStr(raw, ": error:");
+                if (ep > 0) {
+                    string loc = raw.Substring(0, ep);
+                    if (ZanIDE.IndexOfStr(loc, baseName) >= 0) {
+                        int c2 = ZanIDE.LastIndexOfStr(loc, ":");
+                        if (c2 > 0) {
+                            int c1 = ZanIDE.LastIndexOfStr(loc.Substring(0, c2), ":");
+                            if (c1 >= 0) {
+                                string lineStr = loc.Substring(c1 + 1, c2 - (c1 + 1));
+                                int lineNo = ZanIDE.ParseLeadInt(lineStr);
+                                if (lineNo > 0) {
+                                    string msg = raw.Substring(ep + 8, raw.Length - (ep + 8));
+                                    dl.Add(lineNo - 1);
+                                    dm.Add(ZanIDE.TrimLeadSpaces(msg));
+                                }
+                            }
+                        }
+                    }
+                }
+                oi = oi + 1;
+            }
+        }
+        editor.SetCompilerDiagnostics(dl, dm);
+        if (dl.Count > 0) {
+            log.Add("> " + Convert.ToString(dl.Count) + " error(s) in this file; jumped to the first.");
+        }
+    }
+
+    /// Hot reload: rebuild the active file and (re)launch it detached, killing
+    /// the previous hot instance so the IDE stays responsive across saves.
+    static void HotReloadRun(List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        if (a < 0 || a >= paths.Count) { return; }
+        string p = paths[a];
+        p = ZanIDE.RibbonRunTarget(p, root);
+        if (p == "") { log.Add(ZanIDE.T("> [Hot] Nothing to run (save the file first).", "> [热重载] 没有可运行的目标（请先保存文件）。")); return; }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zanhot.ll";
+        string exe = bd + "/zanhot_run" + ZanIDE.ExeSuffix();
+        // Stop the previous hot instance so the exe can be overwritten.
+        #if WINDOWS
+        Process.Run("taskkill /F /IM zanhot_run.exe >nul 2>nul");
+        Process.Run("cmd /c del /f /q \"" + exe + "\" >nul 2>nul");
+        #else
+        Process.Run("pkill -f zanhot_run >/dev/null 2>&1");
+        Process.Run("rm -f \"" + exe + "\" >/dev/null 2>&1");
+        #endif
+        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
+        log.Add("> [Hot] Rebuilding ...");
+        List<string> outp = Process.RunCapture(cmd);
+        ZanIDE.AppendAll(log, outp);
+        if (File.Exists(exe)) {
+            // Launch detached so the IDE stays responsive.
+            #if WINDOWS
+            Process.Run("cmd /c start \"\" \"" + exe + "\"");
+            #else
+            Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
+            #endif
+            log.Add("> [Hot] Reloaded -> restarted app.");
+        } else {
+            log.Add("> [Hot] Build failed; app not restarted.");
+        }
+    }
+
+    static void PublishActive(List<string> names, List<string> paths, SignalInt active, string root, List<string> log) {
+        int a = active.Get();
+        string p = paths[a];
+        if (p == "") { log.Add("> Nothing to publish (save the file first)."); return; }
+        // The active tab may be the .zform designer surface; publish the project's
+        // real code entry, never hand a .zform to the compiler.
+        if (ZanIDE.IsFormPath(p)) { p = ZanIDE.ProjectEntry(root); }
+        Directory.CreateDirectory(root + "/publish");
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zanpub.ll";
+        string exe = root + "/publish/" + Path.GetFileName(root) + ".exe";
+        string inputs = ZanIDE.ProjectInputs(ZanIDE.DirOf(p), p, "");
+        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, true);
+        log.Add("> Publishing console exe ...");
+        List<string> outp = Process.RunCapture(cmd);
+        ZanIDE.AppendAll(log, outp);
+        ZanIDE.CopyResources(root, root + "/publish", log);
+        log.Add("> Published " + exe);
+    }
+
+    /// Naive substring search (the stdlib string type here exposes only
+    /// Substring/Length), used to detect platform ids inside zan.proj.
+    static bool Has(string hay, string needle) {
+        int n = needle.Length;
+        int h = hay.Length;
+        if (n == 0) { return true; }
+        int i = 0;
+        while (i + n <= h) {
+            if (hay.Substring(i, n) == needle) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Reads the active project's target platforms from zan.proj into 6 flags
+    /// parallel to PlatformCsv's id list. Non-Windows targets are force-cleared
+    /// because this Windows host cannot produce them without a cross toolchain.
+    static List<int> ReadProjectPlatforms(string root) {
+        List<int> flags = new List<int>();
+        int z = 0;
+        while (z < 6) { flags.Add(0); z = z + 1; }
+        string content = "";
+        string pj = root + "/zan.proj";
+        if (File.Exists(pj)) { content = File.ReadAllText(pj); }
+        List<string> ids = new List<string>();
+        ids.Add("windows-x64"); ids.Add("windows-arm64");
+        ids.Add("linux-x64"); ids.Add("linux-arm64");
+        ids.Add("macos-x64"); ids.Add("macos-arm64");
+        int k = 0;
+        while (k < ids.Count) {
+            if (ZanIDE.Has(content, ids[k])) { flags[k] = 1; }
+            k = k + 1;
+        }
+        flags[2] = 0; flags[3] = 0; flags[4] = 0; flags[5] = 0;
+        if (flags[0] == 0 && flags[1] == 0) { flags[0] = 1; }
+        return flags;
+    }
+
+    /// Streamed log + done-marker used by the detached (non-blocking) publish.
+    static string PubLogPath() { return ZanIDE.UserConfigDir() + "/publish.log"; }
+    static string PubDonePath() { return ZanIDE.UserConfigDir() + "/publish_done.txt"; }
+
+    /// Starts publishing the selected targets in a DETACHED shell so the UI
+    /// stays responsive while the (possibly slow) compiles run: compiler
+    /// output streams into PubLogPath and PubDonePath marks completion (the
+    /// main loop polls both, same pattern as the AI request). Returns the exe
+    /// paths the caller must verify once the done-marker appears; an empty
+    /// list means nothing was started.
+    static List<string> PublishPlatformsBegin(List<string> names, List<string> paths, SignalInt active, string root, List<int> sel, List<string> log) {
+        List<string> exes = new List<string>();
+        int a = active.Get();
+        if (a < 0 || a >= paths.Count) { log.Add("> Nothing to publish."); return exes; }
+        // Publish always targets the whole project (its entry + every project
+        // .zan file), not whichever tab happens to be focused.
+        string p = ZanIDE.RibbonRunTarget(paths[a], root);
+        if (p == "") { log.Add("> Nothing to publish (save the file first)."); return exes; }
+        Directory.CreateDirectory(root + "/publish");
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string zc = ZanIDE.ZancCmd();
+        string inputs = ZanIDE.ProjectInputs(ZanIDE.DirOf(p), p, "");
+        string baseName = Path.GetFileName(root);
+        #if WINDOWS
+        string sep = " & ";
+        #else
+        string sep = " ; ";
+        #endif
+        string seq = "";
+        if (sel.Count > 0 && sel[0] == 1) {
+            string exe = root + "/publish/" + baseName + "-windows-x64.exe";
+            string ll = bd + "/.zanpub_x64.ll";
+            if (seq != "") { seq = seq + sep; }
+            seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, true) + ")";
+            exes.Add(exe);
+            log.Add("> Publishing windows-x64 ...");
+        }
+        if (sel.Count > 1 && sel[1] == 1) {
+            string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
+            string ll = bd + "/.zanpub_arm64.ll";
+            if (seq != "") { seq = seq + sep; }
+            seq = seq + "(" + zc + " --emit-ir " + inputs + " > \"" + ll + "\""
+                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ")";
+            exes.Add(exe);
+            log.Add("> Publishing windows-arm64 (requires ARM64 toolchain) ...");
+        }
+        // Non-Windows targets: cross-compiled through zanc's own bundled linker
+        // (--target selects the triple; no external toolchain needed). Linux x64
+        // uses the musl static target so the result is a single portable file.
+        if (sel.Count > 2 && sel[2] == 1) {
+            string exe = root + "/publish/" + baseName + "-linux-x64";
+            if (seq != "") { seq = seq + sep; }
+            seq = seq + "(" + zc + " --publish " + inputs
+                + " --target linux-musl --link-mode static -o \"" + exe + "\")";
+            exes.Add(exe);
+            log.Add("> Publishing linux-x64 ...");
+        }
+        if (seq == "") {
+            log.Add("> No target selected; nothing published.");
+            return exes;
+        }
+        // Stale outputs would make a failed compile look successful, so drop
+        // them before the detached run starts.
+        int di = 0;
+        while (di < exes.Count) {
+            if (File.Exists(exes[di])) { File.Delete(exes[di]); }
+            di = di + 1;
+        }
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.PubLogPath(), "");
+        if (File.Exists(ZanIDE.PubDonePath())) { File.Delete(ZanIDE.PubDonePath()); }
+        string run = "((" + seq + ") >> \"" + ZanIDE.PubLogPath() + "\" 2>&1)"
+            + sep + "echo ok > \"" + ZanIDE.PubDonePath() + "\"";
+        Process.RunDetached(run);
+        return exes;
+    }
+
+    /// Appends any new complete lines of the detached publish's streamed log
+    /// to the Output tab; returns the new consumed length (same contract as
+    /// TermPoll).
+    static int PubPoll(int consumed, List<string> log) {
+        if (!File.Exists(ZanIDE.PubLogPath())) { return consumed; }
+        string raw = File.ReadAllText(ZanIDE.PubLogPath());
+        if (raw.Length <= consumed) { return consumed; }
+        int last = 0 - 1;
+        int i = raw.Length - 1;
+        while (i >= consumed) {
+            if (raw.Substring(i, 1) == "\n") { last = i; i = consumed - 1; }
+            i = i - 1;
+        }
+        if (last < consumed) { return consumed; }
+        string chunk = raw.Substring(consumed, last + 1 - consumed);
+        List<string> nl = CodeEditor.SplitLines(chunk);
+        int k = 0;
+        while (k < nl.Count) {
+            if (!(k == nl.Count - 1 && nl[k] == "")) { log.Add(nl[k]); }
+            k = k + 1;
+        }
+        return last + 1;
+    }
+
+    /// Registers a clickable hit region for a dialog button so the shared
+    /// cursor logic shows the hand pointer while hovering it. Dialogs draw
+    /// buttons directly on the canvas (not via the Button widget), so they must
+    /// opt in explicitly for a consistent hover cursor.
+    static void HandRegion(App app, int x, int y, int w, int h) {
+        app.hitTester.Register(HitRegion.Create(app.focus.AllocId(), x, y, w, h, 0));
+    }
+
+    /// The project's assets directory, where the app icon and bundled static
+    /// resources (text, images, data files) live.
+    static string AssetsDir(string root) { return root + "/assets"; }
+
+    /// Classifies a resource by extension: 0 image, 1 audio, 2 font, 3 data, 4 other.
+    static int ResType(string nm) {
+        string lo = SceneDesigner.AsciiLower(nm);
+        if (ZanIDE.EndsWith(lo, ".png") || ZanIDE.EndsWith(lo, ".jpg")
+            || ZanIDE.EndsWith(lo, ".jpeg") || ZanIDE.EndsWith(lo, ".bmp")
+            || ZanIDE.EndsWith(lo, ".gif") || ZanIDE.EndsWith(lo, ".tga")
+            || ZanIDE.EndsWith(lo, ".ico")) { return 0; }
+        if (ZanIDE.EndsWith(lo, ".wav") || ZanIDE.EndsWith(lo, ".mp3")
+            || ZanIDE.EndsWith(lo, ".ogg") || ZanIDE.EndsWith(lo, ".flac")
+            || ZanIDE.EndsWith(lo, ".mid")) { return 1; }
+        if (ZanIDE.EndsWith(lo, ".ttf") || ZanIDE.EndsWith(lo, ".otf")
+            || ZanIDE.EndsWith(lo, ".fnt")) { return 2; }
+        if (ZanIDE.EndsWith(lo, ".json") || ZanIDE.EndsWith(lo, ".txt")
+            || ZanIDE.EndsWith(lo, ".xml") || ZanIDE.EndsWith(lo, ".csv")
+            || ZanIDE.EndsWith(lo, ".ini") || ZanIDE.EndsWith(lo, ".zscene")) { return 3; }
+        return 4;
+    }
+
+    static string ResTypeLabel(int ty) {
+        if (ty == 0) { return ZanIDE.T("IMG", "图片"); }
+        if (ty == 1) { return ZanIDE.T("AUD", "音频"); }
+        if (ty == 2) { return ZanIDE.T("FONT", "字体"); }
+        if (ty == 3) { return ZanIDE.T("DATA", "数据"); }
+        return ZanIDE.T("MISC", "其它");
+    }
+
+    static int ResTypeColor(Theme t, int ty) {
+        if (ty == 0) { return t.success; }
+        if (ty == 1) { return t.info; }
+        if (ty == 2) { return t.warning; }
+        if (ty == 3) { return t.primary; }
+        return t.textTertiary;
+    }
+
+    /// Linked (referenced-in-place) resources: `link = <path>` lines in zan.proj.
+    static List<string> ProjLinks(string root) {
+        List<string> outp = new List<string>();
+        string proj = root + "/zan.proj";
+        if (!File.Exists(proj)) { return outp; }
+        List<string> ls = CodeEditor.SplitLines(File.ReadAllText(proj));
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = ZanIDE.TrimLeadSpaces(ls[i]);
+            if (tr.Length > 5 && tr.Substring(0, 5) == "link ") {
+                string rest = ZanIDE.TrimLeadSpaces(tr.Substring(5, tr.Length - 5));
+                if (rest.Length > 1 && rest.Substring(0, 1) == "=") {
+                    string val = ZanIDE.TrimLeadSpaces(rest.Substring(1, rest.Length - 1));
+                    int e = val.Length;
+                    while (e > 0) {
+                        string ch = val.Substring(e - 1, 1);
+                        if (ch == " " || ch == "\t" || ch == "\r") { e = e - 1; }
+                        else { break; }
+                    }
+                    if (e > 0) { outp.Add(val.Substring(0, e)); }
+                }
+            }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    static void AddProjLink(string root, string path) {
+        string proj = root + "/zan.proj";
+        string content = "";
+        if (File.Exists(proj)) { content = File.ReadAllText(proj); }
+        if (content.Length > 0 && content.Substring(content.Length - 1, 1) != "\n") {
+            content = content + "\n";
+        }
+        File.WriteAllText(proj, content + "link = " + path + "\n");
+    }
+
+    static void RemoveProjLink(string root, string path) {
+        string proj = root + "/zan.proj";
+        if (!File.Exists(proj)) { return; }
+        List<string> ls = CodeEditor.SplitLines(File.ReadAllText(proj));
+        string outp = "";
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = ZanIDE.TrimLeadSpaces(ls[i]);
+            bool drop = false;
+            if (tr.Length > 5 && tr.Substring(0, 5) == "link ") {
+                if (ZanIDE.ContainsS(tr, path)) { drop = true; }
+            }
+            if (!drop && tr.Length > 0) { outp = outp + ls[i] + "\n"; }
+            i = i + 1;
+        }
+        File.WriteAllText(proj, outp);
+    }
+
+    /// Lists bundled static resources (everything in assets/ except the app icon).
+    static List<string> ListResources(string root) {
+        List<string> outp = new List<string>();
+        string ad = ZanIDE.AssetsDir(root);
+        if (!Directory.Exists(ad)) { return outp; }
+        List<string> files = Directory.GetFiles(ad);
+        int i = 0;
+        while (i < files.Count) {
+            string nm = Path.GetFileName(files[i]);
+            if (nm != "app.ico") { outp.Add(nm); }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Copies the project's bundled resources (assets/, minus app.ico) into an
+    /// output directory, so a published program ships with its static files.
+    static void CopyResources(string root, string outDir, List<string> log) {
+        List<string> res = ZanIDE.ListResources(root);
+        List<string> lnks = ZanIDE.ProjLinks(root);
+        if (res.Count == 0 && lnks.Count == 0) { return; }
+        // Opted-in projects ship one encrypted assets.zrp instead of loose
+        // files (toggle in the Asset Manager; opened via generated AssetPack).
+        if (AssetManager.PackEnabled(root)) {
+            int packed = AssetManager.PackAssets(root, outDir, lnks, log);
+            if (packed >= 0) {
+                log.Add("> Packed " + Convert.ToString(packed)
+                    + " resource file(s) into " + outDir + "/assets/assets.zrp");
+                return;
+            }
+            log.Add("> Falling back to plain resource copy.");
+        }
+        string dst = outDir + "/assets";
+        Directory.CreateDirectoryRecursive(dst);
+        string ad = ZanIDE.AssetsDir(root);
+        int i = 0;
+        while (i < res.Count) {
+            File.Copy(ad + "/" + res[i], dst + "/" + res[i]);
+            i = i + 1;
+        }
+        // Asset subfolders (from the Asset Manager) ship recursively too.
+        List<string> subs = Directory.GetDirectories(ad);
+        int si = 0;
+        int scopied = 0;
+        while (si < subs.Count) {
+            scopied = scopied + AssetManager.copyTree(ad + "/" + subs[si], dst + "/" + subs[si]);
+            si = si + 1;
+        }
+        // Linked resources are referenced in place during development and
+        // copied next to the exe only when publishing.
+        int li = 0;
+        int lcopied = 0;
+        while (li < lnks.Count) {
+            if (File.Exists(lnks[li])) {
+                File.Copy(lnks[li], dst + "/" + Path.GetFileName(lnks[li]));
+                lcopied = lcopied + 1;
+            } else {
+                log.Add("> WARNING: linked resource missing: " + lnks[li]);
+            }
+            li = li + 1;
+        }
+        log.Add("> Bundled " + Convert.ToString(res.Count + scopied + lcopied) + " resource file(s) into " + dst);
+    }
+}

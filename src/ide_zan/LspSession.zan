@@ -1,0 +1,331 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+
+/// A live Language Server Protocol client that drives a spawned `zan-lsp`
+/// over a loopback TCP socket (127.0.0.1), mirroring DebugSession's
+/// transport. Serves semantic go-to-definition, find-references and hover
+/// from the compiler front-end (binder/checker) instead of text scanning.
+/// The request/response model is synchronous, matching the IDE event loop.
+class LspSession {
+    #if WINDOWS
+    [DllImport("ws2_32", EntryPoint = "WSAStartup")]
+    static extern int ws_startup(int version, string data);
+    [DllImport("ws2_32", EntryPoint = "socket")]
+    static extern int ws_socket(int af, int type, int proto);
+    [DllImport("ws2_32", EntryPoint = "connect")]
+    static extern int ws_connect(int s, string addr, int len);
+    [DllImport("ws2_32", EntryPoint = "closesocket")]
+    static extern int ws_close(int s);
+    [DllImport("ws2_32", EntryPoint = "send")]
+    static extern int ws_send(int s, string buf, int len, int flags);
+    [DllImport("ws2_32", EntryPoint = "recv")]
+    static extern int ws_recv(int s, string buf, int len, int flags);
+    [DllImport("ws2_32", EntryPoint = "htons")]
+    static extern int ws_htons(int v);
+    [DllImport("ws2_32", EntryPoint = "inet_addr")]
+    static extern int ws_inet_addr(string cp);
+    [DllImport("kernel32", EntryPoint = "Sleep")]
+    static extern void plat_sleep(int ms);
+    #else
+    [DllImport("crt", EntryPoint = "socket")]
+    static extern int ws_socket(int af, int type, int proto);
+    [DllImport("crt", EntryPoint = "connect")]
+    static extern int ws_connect(int s, string addr, int len);
+    [DllImport("crt", EntryPoint = "close")]
+    static extern int ws_close(int s);
+    [DllImport("crt", EntryPoint = "send")]
+    static extern int ws_send(int s, string buf, int len, int flags);
+    [DllImport("crt", EntryPoint = "recv")]
+    static extern int ws_recv(int s, string buf, int len, int flags);
+    [DllImport("crt", EntryPoint = "htons")]
+    static extern int ws_htons(int v);
+    [DllImport("crt", EntryPoint = "inet_addr")]
+    static extern int ws_inet_addr(string cp);
+    [DllImport("crt", EntryPoint = "usleep")]
+    static extern int plat_usleep(int us);
+    #endif
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+    [DllImport("crt")]
+    static extern int strlen(string str);
+
+    int sock;
+    int seq;
+    bool alive;
+    string rbuf;
+
+    /// Spawns `zan-lsp --port N`, connects and runs the LSP initialize
+    /// handshake with `root` as the workspace root (enables project-wide
+    /// indexing). Returns null when the server cannot be reached.
+    static LspSession Start(string root) {
+        string exe = ZanIDE.ToolchainDir() + "/zan-lsp" + ZanIDE.ExeSuffix();
+        if (!File.Exists(exe)) { exe = ZanIDE.ExeDir() + "/zan-lsp" + ZanIDE.ExeSuffix(); }
+        if (!File.Exists(exe)) { return null; }
+        int attempt = 0;
+        while (attempt < 4) {
+            int port = 47411 + attempt;
+            Process.RunDetached("\"" + exe + "\" --port " + Convert.ToString(port));
+            LspSession s = LspSession.Open(port, root);
+            if (s != null) { return s; }
+            attempt = attempt + 1;
+        }
+        return null;
+    }
+
+    static LspSession Open(int port, string root) {
+        LspSession d = new LspSession();
+        d.sock = 0 - 1;
+        d.seq = 1;
+        d.alive = false;
+        d.rbuf = "";
+
+        #if WINDOWS
+        string wsa = calloc(512, 1);
+        ws_startup(514, wsa);
+        free(wsa);
+        #endif
+
+        int s = ws_socket(2, 1, 6);
+        if (s < 0) { return null; }
+        d.sock = s;
+
+        bool connected = false;
+        int tries = 0;
+        while (tries < 100 && !connected) {
+            string addr = d.BuildAddr(port);
+            int r = ws_connect(s, addr, 16);
+            free(addr);
+            if (r == 0) { connected = true; }
+            else { d.SnoozeMs(20); tries = tries + 1; }
+        }
+        if (!connected) { ws_close(s); return null; }
+        d.alive = true;
+
+        string m = d.RequestWait("initialize",
+            "{\"processId\":null,\"rootUri\":\"" + LspSession.PathToUri(root)
+            + "\",\"capabilities\":{}}");
+        if (m.Length == 0) { d.Shutdown(); return null; }
+        d.Notify("initialized", "{}");
+        return d;
+    }
+
+    bool Alive() { return this.alive; }
+
+    void Shutdown() {
+        if (this.sock >= 0) {
+            if (this.alive) {
+                this.RequestWait("shutdown", "");
+                this.Notify("exit", "");
+            }
+            ws_close(this.sock);
+            this.sock = 0 - 1;
+        }
+        this.alive = false;
+    }
+
+    /// Pushes the full current buffer for `path` so subsequent semantic
+    /// queries see unsaved edits (full-sync didOpen upserts the document).
+    void SyncDoc(string path, string text) {
+        this.Notify("textDocument/didOpen",
+            "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
+            + "\",\"languageId\":\"zan\",\"version\":1,\"text\":\""
+            + DebugSession.JsonEsc(text) + "\"}}");
+    }
+
+    /// Semantic go-to-definition. Returns "path\tline0" (0-based line) or "".
+    string Definition(string path, int line0, int col0) {
+        string m = this.RequestWait("textDocument/definition",
+            LspSession.PosParams(path, line0, col0));
+        if (m.Length == 0) { return ""; }
+        string uri = DebugSession.JsonStr(m, "uri", 0);
+        if (uri.Length == 0) { return ""; }
+        int ui = DebugSession.IndexOf(m, "\"uri\":", 0);
+        int ln = DebugSession.JsonInt(m, "line", ui);
+        return LspSession.UriToPath(uri) + "\t" + Convert.ToString(ln);
+    }
+
+    /// Semantic find-references. Returns "path\tline0" rows.
+    List<string> References(string path, int line0, int col0) {
+        List<string> outp = new List<string>();
+        string m = this.RequestWait("textDocument/references",
+            "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
+            + "\"},\"position\":{\"line\":" + Convert.ToString(line0)
+            + ",\"character\":" + Convert.ToString(col0)
+            + "},\"context\":{\"includeDeclaration\":true}}");
+        if (m.Length == 0) { return outp; }
+        int p = 0;
+        int count = 0;
+        while (count < 1000) {
+            int ui = DebugSession.IndexOf(m, "\"uri\":", p);
+            if (ui < 0) { break; }
+            string uri = DebugSession.JsonStr(m, "uri", ui);
+            int ln = DebugSession.JsonInt(m, "line", ui);
+            outp.Add(LspSession.UriToPath(uri) + "\t" + Convert.ToString(ln));
+            p = ui + 6;
+            count = count + 1;
+        }
+        return outp;
+    }
+
+    /// Hover text for the symbol at the position ("" when none).
+    string Hover(string path, int line0, int col0) {
+        string m = this.RequestWait("textDocument/hover",
+            LspSession.PosParams(path, line0, col0));
+        if (m.Length == 0) { return ""; }
+        return DebugSession.JsonStr(m, "value", 0);
+    }
+
+    static string PosParams(string path, int line0, int col0) {
+        return "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
+            + "\"},\"position\":{\"line\":" + Convert.ToString(line0)
+            + ",\"character\":" + Convert.ToString(col0) + "}}";
+    }
+
+    /// file:///-style URI from a native path (backslashes normalized).
+    static string PathToUri(string path) {
+        string p = "";
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            if (ch == "\\") { p = p + "/"; } else { p = p + ch; }
+            i = i + 1;
+        }
+        if (p.Length > 0 && p.Substring(0, 1) == "/") { return "file://" + p; }
+        return "file:///" + p;
+    }
+
+    static string UriToPath(string uri) {
+        string p = uri;
+        if (p.Length > 8 && p.Substring(0, 8) == "file:///") { p = p.Substring(8, p.Length - 8); }
+        else if (p.Length > 7 && p.Substring(0, 7) == "file://") { p = p.Substring(7, p.Length - 7); }
+        // %3A -> ':' (some servers percent-encode the drive colon)
+        string res = "";
+        int i = 0;
+        while (i < p.Length) {
+            if (i + 3 <= p.Length && (p.Substring(i, 3) == "%3A" || p.Substring(i, 3) == "%3a")) {
+                res = res + ":";
+                i = i + 3;
+            } else {
+                res = res + p.Substring(i, 1);
+                i = i + 1;
+            }
+        }
+        return res;
+    }
+
+    // ---- transport ----
+
+    void SnoozeMs(int ms) {
+        #if WINDOWS
+        plat_sleep(ms);
+        #else
+        plat_usleep(ms * 1000);
+        #endif
+    }
+
+    string BuildAddr(int port) {
+        string addr = calloc(16, 1);
+        #if MACOS
+        addr[0] = 16;
+        addr[1] = 2;
+        #else
+        addr[0] = 2;
+        addr[1] = 0;
+        #endif
+        int nport = ws_htons(port);
+        addr[2] = nport & 255;
+        addr[3] = (nport >> 8) & 255;
+        int ip = ws_inet_addr("127.0.0.1");
+        addr[4] = ip & 255;
+        addr[5] = (ip >> 8) & 255;
+        addr[6] = (ip >> 16) & 255;
+        addr[7] = (ip >> 24) & 255;
+        return addr;
+    }
+
+    void SendAll(string data) {
+        int total = strlen(data);
+        int off = 0;
+        while (off < total) {
+            string chunk = data;
+            if (off > 0) { chunk = data.Substring(off, total - off); }
+            int n = ws_send(this.sock, chunk, total - off, 0);
+            if (n <= 0) { this.alive = false; return; }
+            off = off + n;
+        }
+    }
+
+    void SendMsg(string body) {
+        string msg = "Content-Length: " + Convert.ToString(strlen(body))
+            + "\r\n\r\n" + body;
+        this.SendAll(msg);
+    }
+
+    void Notify(string method, string paramsJson) {
+        string body = "{\"jsonrpc\":\"2.0\",\"method\":\"" + method + "\"";
+        if (paramsJson.Length > 0) { body = body + ",\"params\":" + paramsJson; }
+        body = body + "}";
+        this.SendMsg(body);
+    }
+
+    /// Sends a request and blocks until its response arrives (notifications
+    /// such as publishDiagnostics that arrive in between are skipped).
+    string RequestWait(string method, string paramsJson) {
+        if (!this.alive) { return ""; }
+        int id = this.seq;
+        this.seq = this.seq + 1;
+        string body = "{\"jsonrpc\":\"2.0\",\"id\":" + Convert.ToString(id)
+            + ",\"method\":\"" + method + "\"";
+        if (paramsJson.Length > 0) { body = body + ",\"params\":" + paramsJson; }
+        body = body + "}";
+        this.SendMsg(body);
+        int guard = 0;
+        while (guard < 100000) {
+            guard = guard + 1;
+            string m = this.ReadMsg();
+            if (m.Length == 0) { return ""; }
+            if (DebugSession.IndexOf(m, "\"id\":" + Convert.ToString(id), 0) >= 0
+                && DebugSession.IndexOf(m, "\"result\"", 0) >= 0) {
+                return m;
+            }
+        }
+        return "";
+    }
+
+    string RecvChunk() {
+        int cap = 65536;
+        string buf = calloc(cap + 1, 1);
+        int n = ws_recv(this.sock, buf, cap, 0);
+        if (n <= 0) { free(buf); return ""; }
+        string res = buf.Substring(0, n);
+        free(buf);
+        return res;
+    }
+
+    string ReadMsg() {
+        int guard = 0;
+        while (guard < 1000000) {
+            guard = guard + 1;
+            int he = DebugSession.IndexOf(this.rbuf, "\r\n\r\n", 0);
+            if (he >= 0) {
+                string header = this.rbuf.Substring(0, he);
+                int cl = DebugSession.HeaderLen(header);
+                int start = he + 4;
+                if (cl >= 0 && this.rbuf.Length >= start + cl) {
+                    string body = this.rbuf.Substring(start, cl);
+                    int rest = this.rbuf.Length - start - cl;
+                    this.rbuf = this.rbuf.Substring(start + cl, rest);
+                    return body;
+                }
+            }
+            string chunk = this.RecvChunk();
+            if (chunk.Length == 0) { this.alive = false; return ""; }
+            this.rbuf = this.rbuf + chunk;
+        }
+        return "";
+    }
+}

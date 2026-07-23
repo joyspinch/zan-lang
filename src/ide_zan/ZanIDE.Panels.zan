@@ -1,0 +1,1336 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+/// ZanIDE part: settings persistence, the parsed error list, the AI
+/// assistant plumbing (profiles / requests / chat transcripts), the git
+/// panel and integrated-terminal helpers.
+partial class ZanIDE {
+    // ================================================================
+    // Settings persistence (window + panel sizes)
+    // ================================================================
+
+    static string CfgPath() { return ZanIDE.UserConfigDir() + "/config.cfg"; }
+
+    static bool IsDigit(string ch) {
+        return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
+            || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9";
+    }
+
+    /// Finds the first index of `sub` in `s`, or -1.
+    static int StrFind(string s, string sub) {
+        if (sub.Length == 0) { return 0; }
+        if (sub.Length > s.Length) { return -1; }
+        int n = s.Length - sub.Length;
+        int i = 0;
+        while (i <= n) {
+            if (s.Substring(i, sub.Length) == sub) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// The file name portion of a path (after the last '/' or '\').
+    static string BaseName(string p) {
+        int best = -1;
+        int i = 0;
+        while (i < p.Length) {
+            string ch = p.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { best = i; }
+            i = i + 1;
+        }
+        if (best >= 0 && best + 1 <= p.Length) { return p.Substring(best + 1, p.Length - best - 1); }
+        return p;
+    }
+
+    /// Reads an integer "key=NNN" from a settings blob, or `def` when absent.
+    static int CfgInt(string cfg, string key, int def) {
+        int idx = ZanIDE.StrFind(cfg, key + "=");
+        if (idx < 0) { return def; }
+        int p = idx + key.Length + 1;
+        string num = "";
+        while (p < cfg.Length) {
+            string ch = cfg.Substring(p, 1);
+            if (ZanIDE.IsDigit(ch)) { num = num + ch; p = p + 1; } else { break; }
+        }
+        if (num.Length == 0) { return def; }
+        return ZanIDE.ParseInt(num);
+    }
+
+    /// Clamps a restored dimension into a sane range.
+    static int CfgClamp(int v, int lo, int hi) {
+        if (v < lo) { return lo; }
+        if (v > hi) { return hi; }
+        return v;
+    }
+
+    /// A shell panel surface. Under a frosted-glass skin it frosts the themed
+    /// backdrop (Layer.GlassFill) so the IDE reads as glass exactly like the
+    /// gallery; otherwise a solid themed fill. Use for the IDE's structural
+    /// panels (sidebar, tab strip, bottom panel) so all skins render alike.
+    static void ShellSurface(App app, int x, int y, int w, int h, int radius, int color) {
+        Theme t = app.theme;
+        if (t.glass != 0) {
+            Layer.GlassFill(app, x, y, w, h, radius, color, 1000);
+        } else if (radius > 0) {
+            app.canvas.FillRoundRect(x, y, w, h, radius, color);
+        } else {
+            app.canvas.FillRect(x, y, w, h, color);
+        }
+    }
+
+    /// A small themed text-field surface (bg + hairline border) for the IDE's
+    /// inline input boxes, so they follow the active skin instead of a hardcoded
+    /// VS-dark box.
+    static void ShellField(App app, int x, int y, int w, int h) {
+        Theme t = app.theme;
+        app.canvas.FillRect(x, y, w, h, t.bgPrimary);
+        app.canvas.DrawRect(x, y, w, h, t.borderPrimary, 1);
+    }
+
+    static void SaveSettings(int treeW, int botH, int winW, int winH, int botTab, int autoRun, int skin, int rightW, int rightTab, int opacity) {
+        string s = "treeW=" + Convert.ToString(treeW)
+            + ";bottomH=" + Convert.ToString(botH)
+            + ";winW=" + Convert.ToString(winW)
+            + ";winH=" + Convert.ToString(winH)
+            + ";bottomTab=" + Convert.ToString(botTab)
+            + ";autoRun=" + Convert.ToString(autoRun)
+            + ";skin=" + Convert.ToString(skin)
+            + ";rightW=" + Convert.ToString(rightW)
+            + ";rightTab=" + Convert.ToString(rightTab)
+            + ";opacity=" + Convert.ToString(opacity) + ";";
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.CfgPath(), s);
+    }
+
+    /// Index of the open tab whose file name matches `base`, or -1.
+    static int FindTabByBase(List<string> tabPaths, string bn) {
+        int i = 0;
+        while (i < tabPaths.Count) {
+            if (ZanIDE.BaseName(tabPaths[i]) == bn) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ================================================================
+    // Error list (parsed from build/run output) + tabbed bottom panel
+    // ================================================================
+
+    /// Scans the log for compiler/linker diagnostics of the form
+    /// `...<file>.zan:<line>[:col]: ... message`, filling parallel lists.
+    static void ParseErrorList(List<string> log, List<string> outPath,
+            List<string> outLine, List<string> outMsg) {
+        int i = 0;
+        while (i < log.Count) {
+            string ln = log[i];
+            int idx = ZanIDE.StrFind(ln, ".zan:");
+            if (idx >= 0) {
+                // path: from first non-prefix char up to and including ".zan"
+                int ps = 0;
+                while (ps < ln.Length) {
+                    string pc = ln.Substring(ps, 1);
+                    if (pc == " " || pc == ">" || pc == "\t") { ps = ps + 1; } else { break; }
+                }
+                string path = ln.Substring(ps, (idx + 4) - ps);
+                int p = idx + 5;
+                string num = "";
+                while (p < ln.Length) {
+                    string ch = ln.Substring(p, 1);
+                    if (ZanIDE.IsDigit(ch)) { num = num + ch; p = p + 1; } else { break; }
+                }
+                if (num.Length > 0) {
+                    string msg = ln;
+                    int me = ZanIDE.StrFind(ln, "error");
+                    if (me < 0) { me = ZanIDE.StrFind(ln, "warning"); }
+                    if (me >= 0) { msg = ln.Substring(me, ln.Length - me); }
+                    outPath.Add(path);
+                    outLine.Add(num);
+                    outMsg.Add(msg);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    static string DiagnosticName(string msg) {
+        int first = ZanIDE.StrFind(msg, "'");
+        if (first < 0) { return ""; }
+        int rest = first + 1;
+        int secondRel = ZanIDE.StrFind(
+            msg.Substring(rest, msg.Length - rest), "'");
+        if (secondRel < 0) { return ""; }
+        return msg.Substring(rest, secondRel);
+    }
+
+    static string SuggestedUsing(string msg) {
+        string name = ZanIDE.DiagnosticName(msg);
+        string widgets = "|Alert|Avatar|Badge|Breadcrumb|Button|Card|Carousel|Chart|"
+            + "Checkbox|CodeEditor|Collapse|DataTable|Dialog|Divider|Drawer|Dropdown|"
+            + "Ellipsis|Empty|FilePicker|FloatButton|Input|Label|ListView|Loading|"
+            + "Menu|Message|Modal|Notification|PageHeader|Pagination|Panel|PivotTable|"
+            + "Popconfirm|Popover|Progress|Radio|Rate|Result|Ribbon|Scrollbar|Select|"
+            + "Skeleton|Slider|Spin|Split|Statistic|Steps|Switch|Table|Tabs|TabView|"
+            + "Tag|Timeline|Tooltip|TreeView|Typography|Wizard|";
+        string gui = "|App|Canvas|Theme|Window|Rect|Color|SignalBool|SignalInt|"
+            + "SignalString|HitRegion|TreeNode|Icon|Clipboard|Ui|Stack|Text|Point|"
+            + "Size|FlexStyle|FocusManager|";
+        string io = "|File|Directory|Path|";
+        string system = "|Console|Convert|List|StringBuilder|";
+        string text = "|Encoding|";
+        string threading = "|Thread|Mutex|Semaphore|Stopwatch|Channel|AtomicInt|";
+        string http = "|HttpClient|HttpRequest|HttpResponse|HttpServer|HttpRouter|";
+        string sockets = "|Socket|TcpClient|UdpClient|TcpListener|AsyncSocket|";
+        string net = "|Dns|IPAddress|";
+        string json = "|JsonParser|JsonBuilder|";
+        string drawing = "|Graphics|Bitmap|Font|Rectangle|";
+        string crypto = "|Sha1|Sha256|Sha512|Md5|Hmac|Aes|AesGcm|Rsa|Base64|Hex|"
+            + "RandomNumberGenerator|BigInt|";
+        string data = "|DbConnection|DbResult|";
+        if (name != "" && ZanIDE.Has(widgets, "|" + name + "|")) {
+            return "Gui.Widget";
+        }
+        if (name != "" && ZanIDE.Has(gui, "|" + name + "|")) {
+            return "Gui";
+        }
+        if (name != "" && ZanIDE.Has(io, "|" + name + "|")) {
+            return "System.IO";
+        }
+        if (name != "" && ZanIDE.Has(system, "|" + name + "|")) {
+            return "System";
+        }
+        if (name != "" && ZanIDE.Has(text, "|" + name + "|")) {
+            return "System.Text";
+        }
+        if (name != "" && ZanIDE.Has(threading, "|" + name + "|")) {
+            return "System.Threading";
+        }
+        if (name != "" && ZanIDE.Has(http, "|" + name + "|")) {
+            return "System.Net.Http";
+        }
+        if (name != "" && ZanIDE.Has(sockets, "|" + name + "|")) {
+            return "System.Net.Sockets";
+        }
+        if (name != "" && ZanIDE.Has(net, "|" + name + "|")) {
+            return "System.Net";
+        }
+        if (name != "" && ZanIDE.Has(json, "|" + name + "|")) {
+            return "System.Json";
+        }
+        if (name != "" && ZanIDE.Has(drawing, "|" + name + "|")) {
+            return "System.Drawing";
+        }
+        if (name != "" && ZanIDE.Has(crypto, "|" + name + "|")) {
+            return "System.Security.Cryptography";
+        }
+        if (name != "" && ZanIDE.Has(data, "|" + name + "|")) {
+            return "System.Data";
+        }
+        if (name == "Process") { return "System.Diagnostics"; }
+        return "";
+    }
+
+    static void AddUsing(
+        CodeEditor editor,
+        List<string> bodies,
+        SignalInt active,
+        string importNs,
+        List<string> log
+    ) {
+        string line = "using " + importNs + ";";
+        string text = editor.GetText();
+        if (ZanIDE.Has(text, line)) {
+            log.Add("> " + line + " is already present.");
+            return;
+        }
+        text = line + "\n" + text;
+        editor.LoadText(text);
+        int a = active.Get();
+        if (a >= 0 && a < bodies.Count) { bodies[a] = text; }
+        editor.SetCompilerDiagnostics(
+            new List<int>(), new List<string>());
+        log.Add("> Added " + line);
+    }
+
+    /// The Output panel's "Clear" button rect, right-aligned in the tab strip.
+    /// Shared by the renderer (draw) and the caller (hit-test) so they agree.
+    static Rect OutClearRect(App app, Rect orr) {
+        int tabH = app.theme.heightMedium;
+        int bw = app.Scale(52);
+        int bh = tabH - app.Scale(8);
+        int bx = orr.x + orr.width - bw - app.Scale(8);
+        int by = orr.y + app.Scale(4);
+        return Rect.Create(bx, by, bw, bh);
+    }
+
+    /// The Output panel's filter box rect, left of the Clear button.
+    static Rect OutFilterRect(App app, Rect orr) {
+        int tabH = app.theme.heightMedium;
+        Rect cb = ZanIDE.OutClearRect(app, orr);
+        int fw = app.Scale(160);
+        int fh = tabH - app.Scale(8);
+        int fx = cb.x - fw - app.Scale(6);
+        int fy = orr.y + app.Scale(4);
+        return Rect.Create(fx, fy, fw, fh);
+    }
+
+    // ================================================================
+    // Right side panel: AI assistant + integrated terminal
+    // ================================================================
+
+    /// Optional AI settings file (`key = value` lines: key / base / model).
+    /// Environment variables OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+    /// are the fallback so the panel works with a plain OpenAI-compatible setup.
+    static string AiCfgPath() { return ZanIDE.UserConfigDir() + "/ai.cfg"; }
+    static string AiReqPath() { return ZanIDE.UserConfigDir() + "/ai_req.json"; }
+    static string AiRespPath() { return ZanIDE.UserConfigDir() + "/ai_resp.json"; }
+    static string AiDonePath() { return ZanIDE.UserConfigDir() + "/ai_done.txt"; }
+
+    /// Reads `key = value` from `content` (same line format as zan.proj).
+    static string KvField(string content, string key) {
+        List<string> ls = CodeEditor.SplitLines(content);
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = ZanIDE.TrimLeadSpaces(ls[i]);
+            if (tr.Length >= key.Length && tr.Substring(0, key.Length) == key) {
+                string rest = ZanIDE.TrimLeadSpaces(tr.Substring(key.Length, tr.Length - key.Length));
+                if (rest.Length > 0 && rest.Substring(0, 1) == "=") {
+                    string val = ZanIDE.TrimLeadSpaces(rest.Substring(1, rest.Length - 1));
+                    int e = val.Length;
+                    while (e > 0) {
+                        string ch = val.Substring(e - 1, 1);
+                        if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { e = e - 1; }
+                        else { break; }
+                    }
+                    return val.Substring(0, e);
+                }
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    /// An AI setting: ai.cfg first, then the environment, then `def`.
+    static string AiSetting(string key, string envName, string def) {
+        if (File.Exists(ZanIDE.AiCfgPath())) {
+            string v = ZanIDE.KvField(File.ReadAllText(ZanIDE.AiCfgPath()), key);
+            if (v != "") { return v; }
+        }
+        string e = getenv(envName);
+        if (e != null && e != "") { return e; }
+        return def;
+    }
+
+    // ---- AI provider profiles (ai_profiles.json) ----
+    // {"active": 0, "profiles": [{"name", "base", "key", "model", "models": []}]}
+    static string AiProfilesPath() { return ZanIDE.UserConfigDir() + "/ai_profiles.json"; }
+    static string AiModelsRespPath() { return ZanIDE.UserConfigDir() + "/ai_models.json"; }
+    static string AiModelsDonePath() { return ZanIDE.UserConfigDir() + "/ai_models_done.txt"; }
+    static string AiPredReqPath() { return ZanIDE.UserConfigDir() + "/ai_pred_req.json"; }
+    static string AiPredRespPath() { return ZanIDE.UserConfigDir() + "/ai_pred.json"; }
+    static string AiPredDonePath() { return ZanIDE.UserConfigDir() + "/ai_pred_done.txt"; }
+
+    /// Loads the AI provider profiles into the parallel lists and returns the
+    /// active index. Falls back to a single profile synthesized from the
+    /// legacy ai.cfg / environment settings when ai_profiles.json is missing.
+    static int AiProfilesLoad(List<string> names, List<string> bases,
+            List<string> keys, List<string> models, List<string> lists) {
+        int active = 0;
+        if (File.Exists(ZanIDE.AiProfilesPath())) {
+            JsonValue v = JsonValue.Parse(File.ReadAllText(ZanIDE.AiProfilesPath()));
+            if (v != null) {
+                active = v.Int("active", 0);
+                JsonValue ps = v.Get("profiles");
+                if (ps != null && ps.IsArray()) {
+                    int i = 0;
+                    while (i < ps.Count()) {
+                        JsonValue p = ps.At(i);
+                        names.Add(p.Str("name", "AI " + Convert.ToString(i + 1)));
+                        bases.Add(p.Str("base", ""));
+                        keys.Add(p.Str("key", ""));
+                        models.Add(p.Str("model", ""));
+                        string ml = "";
+                        JsonValue ms = p.Get("models");
+                        if (ms != null && ms.IsArray()) {
+                            int j = 0;
+                            while (j < ms.Count()) {
+                                string mid = ms.At(j).AsString("");
+                                if (mid != "") {
+                                    if (ml != "") { ml = ml + ";"; }
+                                    ml = ml + mid;
+                                }
+                                j = j + 1;
+                            }
+                        }
+                        lists.Add(ml);
+                        i = i + 1;
+                    }
+                }
+            }
+        }
+        if (names.Count == 0) {
+            names.Add(ZanIDE.T("Default", "默认"));
+            bases.Add(ZanIDE.AiSetting("base", "OPENAI_BASE_URL", "https://api.openai.com/v1"));
+            keys.Add(ZanIDE.AiSetting("key", "OPENAI_API_KEY", ""));
+            models.Add(ZanIDE.AiSetting("model", "OPENAI_MODEL", "gpt-4o-mini"));
+            lists.Add("");
+            active = 0;
+        }
+        if (active < 0 || active >= names.Count) { active = 0; }
+        return active;
+    }
+
+    static void AiProfilesSave(int active, List<string> names, List<string> bases,
+            List<string> keys, List<string> models, List<string> lists) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"active\": " + Convert.ToString(active) + ", \"profiles\": [");
+        int i = 0;
+        while (i < names.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("{\"name\": \"" + ZanIDE.JsonEsc(names[i]) + "\"");
+            sb.Append(", \"base\": \"" + ZanIDE.JsonEsc(bases[i]) + "\"");
+            sb.Append(", \"key\": \"" + ZanIDE.JsonEsc(keys[i]) + "\"");
+            sb.Append(", \"model\": \"" + ZanIDE.JsonEsc(models[i]) + "\"");
+            sb.Append(", \"models\": [");
+            List<string> ms = ZanIDE.SplitList(lists[i]);
+            int j = 0;
+            while (j < ms.Count) {
+                if (j > 0) { sb.Append(", "); }
+                sb.Append("\"" + ZanIDE.JsonEsc(ms[j]) + "\"");
+                j = j + 1;
+            }
+            sb.Append("]}");
+            i = i + 1;
+        }
+        sb.Append("]}");
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.AiProfilesPath(), sb.ToString());
+    }
+
+    /// Splits a `;`-separated list, skipping empty entries.
+    static List<string> SplitList(string s) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == ";") {
+                if (cur != "") { outp.Add(cur); }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+            i = i + 1;
+        }
+        if (cur != "") { outp.Add(cur); }
+        return outp;
+    }
+
+    /// Launches a detached `GET {base}/models` request. The response and its
+    /// done-marker land in the user config dir and are polled by the UI.
+    /// Returns "" on success or a user-facing error message.
+    static string AiFetchModels(string baseUrl, string key) {
+        if (key == "") {
+            return ZanIDE.T("Set the API key first.", "请先填写 API 密钥。");
+        }
+        if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        if (File.Exists(ZanIDE.AiModelsRespPath())) { File.Delete(ZanIDE.AiModelsRespPath()); }
+        if (File.Exists(ZanIDE.AiModelsDonePath())) { File.Delete(ZanIDE.AiModelsDonePath()); }
+        string cmd = "curl -s --max-time 60 \"" + baseUrl + "/models\""
+            + " -H \"Authorization: Bearer " + key + "\""
+            + " -o \"" + ZanIDE.AiModelsRespPath() + "\"";
+        #if WINDOWS
+        Process.RunDetached("(" + cmd + ") & echo ok > \"" + ZanIDE.AiModelsDonePath() + "\"");
+        #else
+        Process.RunDetached("(" + cmd + ") ; echo ok > \"" + ZanIDE.AiModelsDonePath() + "\"");
+        #endif
+        return "";
+    }
+
+    /// Parses the /models response into a `;`-joined id list ("" on failure).
+    static string AiReadModels() {
+        if (!File.Exists(ZanIDE.AiModelsRespPath())) { return ""; }
+        string raw = File.ReadAllText(ZanIDE.AiModelsRespPath());
+        if (raw == "") { return ""; }
+        JsonValue v = JsonValue.Parse(raw);
+        if (v == null) { return ""; }
+        JsonValue data = v.Get("data");
+        string outp = "";
+        if (data != null && data.IsArray()) {
+            int i = 0;
+            while (i < data.Count()) {
+                string id = data.At(i).Str("id", "");
+                if (id != "") {
+                    if (outp != "") { outp = outp + ";"; }
+                    outp = outp + id;
+                }
+                i = i + 1;
+            }
+        }
+        return outp;
+    }
+
+    /// Asks the model to continue the code exactly at the caret: the file is
+    /// sent split around a <CURSOR> marker and the model must reply with only
+    /// the code to insert there. Detached like AiLaunch; returns "" or error.
+    static string AiLaunchPredict(string fileName, string code, int caretLine,
+            string baseUrl, string key, string model) {
+        if (key == "") {
+            return ZanIDE.T(
+                "No API key. Open the AI panel's Config editor and fill in the key for the enabled profile.",
+                "未配置 API 密钥。请在 AI 面板的“配置”中为启用的配置填写密钥。");
+        }
+        if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
+        if (model == "") { model = "gpt-4o-mini"; }
+        // Split around the caret line so the marker lands where the insert
+        // happens; keep a bounded window on both sides.
+        List<string> lines = CodeEditor.SplitLines(code);
+        string before = "";
+        string after = "";
+        int i = 0;
+        while (i < lines.Count) {
+            if (i <= caretLine) { before = before + lines[i] + "\n"; }
+            else { after = after + lines[i] + "\n"; }
+            i = i + 1;
+        }
+        if (before.Length > 6000) { before = before.Substring(before.Length - 6000, 6000); }
+        if (after.Length > 2000) { after = after.Substring(0, 2000); }
+        string sysMsg = "You are the inline code completion engine of Zan IDE"
+            + " (Zan programming language). The user's file " + fileName
+            + " is given with a <CURSOR> marker. Reply with ONLY the code to"
+            + " insert at the marker: no explanations, no markdown fences.";
+        StringBuilder body = new StringBuilder();
+        body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model) + "\",\"messages\":[");
+        body.Append("{\"role\":\"system\",\"content\":\"" + ZanIDE.JsonEsc(sysMsg) + "\"},");
+        body.Append("{\"role\":\"user\",\"content\":\""
+            + ZanIDE.JsonEsc(before + "<CURSOR>" + after) + "\"}");
+        body.Append("]}");
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.AiPredReqPath(), body.ToString());
+        if (File.Exists(ZanIDE.AiPredRespPath())) { File.Delete(ZanIDE.AiPredRespPath()); }
+        if (File.Exists(ZanIDE.AiPredDonePath())) { File.Delete(ZanIDE.AiPredDonePath()); }
+        string cmd = "curl -s --max-time 120 \"" + baseUrl + "/chat/completions\""
+            + " -H \"Content-Type: application/json\""
+            + " -H \"Authorization: Bearer " + key + "\""
+            + " --data-binary @\"" + ZanIDE.AiPredReqPath() + "\""
+            + " -o \"" + ZanIDE.AiPredRespPath() + "\"";
+        #if WINDOWS
+        Process.RunDetached("(" + cmd + ") & echo ok > \"" + ZanIDE.AiPredDonePath() + "\"");
+        #else
+        Process.RunDetached("(" + cmd + ") ; echo ok > \"" + ZanIDE.AiPredDonePath() + "\"");
+        #endif
+        return "";
+    }
+
+    /// Strips a surrounding ``` fence (with optional language tag) from `s`,
+    /// and returns "" for error replies so they are never inserted as code.
+    static string AiStripFence(string s) {
+        if (s.Length >= 7 && s.Substring(0, 7) == "[error]") { return ""; }
+        string r = s;
+        if (r.Length >= 3 && r.Substring(0, 3) == "```") {
+            int nl = 0;
+            while (nl < r.Length && r.Substring(nl, 1) != "\n") { nl = nl + 1; }
+            if (nl < r.Length) { r = r.Substring(nl + 1, r.Length - nl - 1); }
+            else { r = ""; }
+            int endF = r.Length - 1;
+            while (endF >= 0 && (r.Substring(endF, 1) == "\n" || r.Substring(endF, 1) == " ")) {
+                endF = endF - 1;
+            }
+            if (endF >= 2 && r.Substring(endF - 2, 3) == "```") {
+                r = r.Substring(0, endF - 2);
+            }
+        }
+        return r;
+    }
+
+    /// Escapes a string for embedding in a JSON string literal.
+    static string JsonEsc(string s) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") { sb.Append("\\\\"); }
+            else if (ch == "\"") { sb.Append("\\\""); }
+            else if (ch == "\n") { sb.Append("\\n"); }
+            else if (ch == "\r") { }
+            else if (ch == "\t") { sb.Append("\\t"); }
+            else { sb.Append(ch); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// Writes the chat transcript as an OpenAI-compatible /chat/completions
+    /// request and launches curl DETACHED (response + done-marker files are
+    /// polled from the event loop, so the UI stays responsive). Returns "" on
+    /// success or a user-facing error message.
+    /// The content of the last ``` fenced code block in the newest assistant
+    /// reply, or "" when there is none.
+    static string AiLastCode(List<string> roles, List<string> texts) {
+        int i = roles.Count - 1;
+        while (i >= 0) {
+            if (roles[i] == "assistant") {
+                string s = texts[i];
+                int a = ZanIDE.IndexOfStr(s, "```");
+                if (a < 0) { return ""; }
+                int ls = a + 3;
+                while (ls < s.Length && s.Substring(ls, 1) != "\n") { ls = ls + 1; }
+                ls = ls + 1;
+                if (ls >= s.Length) { return ""; }
+                string rest = s.Substring(ls, s.Length - ls);
+                int b = ZanIDE.IndexOfStr(rest, "```");
+                if (b <= 0) { return ""; }
+                return rest.Substring(0, b);
+            }
+            i = i - 1;
+        }
+        return "";
+    }
+
+    static string AiLaunch(List<string> roles, List<string> texts,
+            string ctxName, string ctxCode, string projRoot,
+            string baseUrl, string key, string model) {
+        if (key == "") {
+            return ZanIDE.T(
+                "No API key. Open the AI panel's Config editor and fill in the key for the enabled profile.",
+                "未配置 API 密钥。请在 AI 面板的“配置”中为启用的配置填写密钥。");
+        }
+        if (baseUrl == "") { baseUrl = "https://api.openai.com/v1"; }
+        if (model == "") { model = "gpt-4o-mini"; }
+        StringBuilder body = new StringBuilder();
+        body.Append("{\"model\":\"" + ZanIDE.JsonEsc(model) + "\",\"messages\":[");
+        string sysMsg = "You are the AI assistant built into Zan IDE, the IDE of the Zan programming language."
+            + " Help the user develop their project: answer concisely, in the user's language,"
+            + " and include Zan code snippets when helpful.";
+        if (ctxName != "") {
+            string ctx = ctxCode;
+            if (ctx.Length > 6000) { ctx = ctx.Substring(0, 6000); }
+            sysMsg = sysMsg + " The user is currently editing " + ctxName
+                + ". Its current content:\n" + ctx;
+        }
+        // Attach the RepoMap outline (whole-codebase structure) when the tool
+        // has been run for this project, so the AI can reason across files.
+        if (projRoot != "") {
+            string mapPath = projRoot + "/.zanmap/repo.map.txt";
+            if (File.Exists(mapPath)) {
+                string rm = File.ReadAllText(mapPath);
+                if (rm.Length > 8000) { rm = rm.Substring(0, 8000); }
+                sysMsg = sysMsg + "\n\nProject structure (RepoMap outline of the"
+                    + " whole codebase -- files, classes and method signatures):\n" + rm;
+            }
+        }
+        body.Append("{\"role\":\"system\",\"content\":\"" + ZanIDE.JsonEsc(sysMsg) + "\"}");
+        int i = 0;
+        while (i < roles.Count) {
+            if (roles[i] == "user" || roles[i] == "assistant") {
+                body.Append(",{\"role\":\"" + roles[i] + "\",\"content\":\""
+                    + ZanIDE.JsonEsc(texts[i]) + "\"}");
+            }
+            i = i + 1;
+        }
+        body.Append("]}");
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.AiReqPath(), body.ToString());
+        if (File.Exists(ZanIDE.AiRespPath())) { File.Delete(ZanIDE.AiRespPath()); }
+        if (File.Exists(ZanIDE.AiDonePath())) { File.Delete(ZanIDE.AiDonePath()); }
+        string cmd = "curl -s --max-time 180 \"" + baseUrl + "/chat/completions\""
+            + " -H \"Content-Type: application/json\""
+            + " -H \"Authorization: Bearer " + key + "\""
+            + " --data-binary @\"" + ZanIDE.AiReqPath() + "\""
+            + " -o \"" + ZanIDE.AiRespPath() + "\"";
+        #if WINDOWS
+        Process.RunDetached("(" + cmd + ") & echo ok > \"" + ZanIDE.AiDonePath() + "\"");
+        #else
+        Process.RunDetached("(" + cmd + ") ; echo ok > \"" + ZanIDE.AiDonePath() + "\"");
+        #endif
+        return "";
+    }
+
+    /// Extracts the assistant reply (or a readable error) from the response.
+    static string AiReadAnswer() {
+        return ZanIDE.AiReadAnswerFrom(ZanIDE.AiRespPath());
+    }
+
+    static string AiReadAnswerFrom(string path) {
+        if (!File.Exists(path)) {
+            return ZanIDE.T("[error] No response received (network problem?).",
+                "[错误] 未收到响应（网络问题？）。");
+        }
+        string raw = File.ReadAllText(path);
+        if (raw == "") {
+            return ZanIDE.T("[error] Empty response from the AI endpoint.",
+                "[错误] AI 服务返回为空。");
+        }
+        JsonValue v = JsonValue.Parse(raw);
+        JsonValue ch = v.Get("choices");
+        if (ch != null && ch.IsArray() && ch.Count() > 0) {
+            JsonValue msg = ch.At(0).Get("message");
+            if (msg != null) { return msg.Str("content", ""); }
+        }
+        JsonValue err = v.Get("error");
+        if (err != null) { return "[error] " + err.Str("message", raw); }
+        if (raw.Length > 400) { raw = raw.Substring(0, 400) + "..."; }
+        return "[error] " + raw;
+    }
+
+    /// Runs a shell command in the project root, appending its output to the
+    /// terminal history (capped so the transcript can't grow without bound).
+    static string TermLogPath() { return ZanIDE.UserConfigDir() + "/term_session.log"; }
+
+    /// Starts the persistent interactive shell session rooted at the project
+    /// directory. The session's stdin is the returned pipe; stdout/stderr
+    /// stream into the session log file, which the UI polls each frame.
+    static int TermOpen(string root) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.TermLogPath(), "");
+        #if WINDOWS
+        string cmd = "cmd /q /k cd /d \"" + root + "\" >>\"" + ZanIDE.TermLogPath() + "\" 2>&1";
+        #else
+        string cmd = "cd \"" + root + "\" && exec sh >>\"" + ZanIDE.TermLogPath() + "\" 2>&1";
+        #endif
+        return Process.ShellOpen(cmd);
+    }
+
+    /// Appends any new complete lines from the session log to the terminal
+    /// view. Returns the new consumed length (only whole lines are consumed,
+    /// so a partially-written line is picked up on a later poll).
+    static int TermPoll(int consumed, List<string> termLog) {
+        if (!File.Exists(ZanIDE.TermLogPath())) { return consumed; }
+        string raw = File.ReadAllText(ZanIDE.TermLogPath());
+        if (raw.Length <= consumed) { return consumed; }
+        // Consume up to the last newline only.
+        int last = 0 - 1;
+        int i = raw.Length - 1;
+        while (i >= consumed) {
+            if (raw.Substring(i, 1) == "\n") { last = i; i = consumed - 1; }
+            i = i - 1;
+        }
+        if (last < consumed) { return consumed; }
+        string chunk = raw.Substring(consumed, last + 1 - consumed);
+        List<string> nl = CodeEditor.SplitLines(chunk);
+        int k = 0;
+        while (k < nl.Count) {
+            if (!(k == nl.Count - 1 && nl[k] == "")) { termLog.Add(nl[k]); }
+            k = k + 1;
+        }
+        while (termLog.Count > 2000) { termLog.RemoveAt(0); }
+        return last + 1;
+    }
+
+    // ================================================================
+    // Git panel helpers (right panel "Git" tab)
+    // ================================================================
+
+    /// Runs a git command inside `root`, capturing stdout+stderr.
+    static List<string> GitRun(string root, string args) {
+        return Process.RunCapture("git -C \"" + root + "\" " + args);
+    }
+
+    /// Refills `files` with `git status --porcelain` lines and returns the
+    /// current branch name ("" when not a repository).
+    static string GitRefresh(string root, List<string> files) {
+        while (files.Count > 0) { files.RemoveAt(files.Count - 1); }
+        if (!Directory.Exists(root + "/.git")) { return ""; }
+        List<string> st = ZanIDE.GitRun(root, "status --porcelain");
+        int i = 0;
+        while (i < st.Count) {
+            if (st[i] != "") { files.Add(st[i]); }
+            i = i + 1;
+        }
+        List<string> br = ZanIDE.GitRun(root, "rev-parse --abbrev-ref HEAD");
+        if (br.Count > 0) { return br[0]; }
+        return "";
+    }
+
+    /// The path part of a porcelain status line ("XY path" or "XY a -> b",
+    /// where the rename target is the interesting path).
+    static string GitPathOf(string line) {
+        if (line.Length < 4) { return ""; }
+        string p = line.Substring(3, line.Length - 3);
+        int arrow = ZanIDE.IndexOfStr(p, " -> ");
+        if (arrow >= 0) { p = p.Substring(arrow + 4, p.Length - arrow - 4); }
+        if (p.Length >= 2 && p.Substring(0, 1) == "\"") {
+            p = p.Substring(1, p.Length - 2);
+        }
+        return p;
+    }
+
+    /// Row color for a porcelain status line: green when fully staged,
+    /// red for untracked, orange for modified/partially staged.
+    static int GitStatusColor(Theme t, string line) {
+        if (line.Length < 2) { return t.textSecondary; }
+        string x = line.Substring(0, 1);
+        string y = line.Substring(1, 1);
+        if (x == "?") { return t.error; }
+        if (y == " ") { return t.success; }
+        return t.warning;
+    }
+
+    /// Makes a commit message safe to embed in a double-quoted shell argument
+    /// (quotes/backslashes/backticks would otherwise break out of it).
+    static string GitEscape(string msg) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < msg.Length) {
+            string ch = msg.Substring(i, 1);
+            if (ch != "\"" && ch != "\\" && ch != "`" && ch != "$"
+                && ch != "\r" && ch != "\n") {
+                sb.Append(ch);
+            } else if (ch == "\r" || ch == "\n") {
+                sb.Append(" ");
+            } else {
+                sb.Append("'");
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // ================================================================
+    // Debug helpers
+    // ================================================================
+
+    static bool DebugBuild(
+        List<string> tabPaths,
+        SignalInt activeTab,
+        string root,
+        List<string> log,
+        CodeEditor editor
+    ) {
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabPaths.Count) { return false; }
+        string activePath = tabPaths[a];
+        string p = activePath;
+        p = ZanIDE.RibbonRunTarget(p, root);
+        if (p == "") {
+            log.Add(ZanIDE.T("> [Debug] Open a source file first.", "> [调试] 请先打开源文件。"));
+            return false;
+        }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zandbg.ll";
+        string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
+        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
+        // `-g` emits DWARF and forces -O0 so gdb (via zan-dap) sees real
+        // source lines, frames and locals.
+        string buildCmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false) + " -g";
+        log.Add("> [Debug] Building " + p + " ...");
+        List<string> buildOut = Process.RunCapture(buildCmd);
+        ZanIDE.AppendAll(log, buildOut);
+        ZanIDE.ApplyDiagnostics(editor, activePath, buildOut, log);
+        if (!File.Exists(exe)) {
+            log.Add("> [Debug] Build failed.");
+            return false;
+        }
+        log.Add("> [Debug] Build succeeded.");
+        return true;
+    }
+
+    static int FirstDebugLine(CodeEditor editor) {
+        List<string> lines = CodeEditor.SplitLines(editor.GetText());
+        int i = 0;
+        while (i < lines.Count) {
+            string line = ZanIDE.TrimLeadSpaces(lines[i]);
+            bool skip = line == "" || line == "{" || line == "}"
+                || ZanIDE.Has(line, "using ")
+                || ZanIDE.Has(line, "class ")
+                || ZanIDE.Has(line, "static void Main")
+                || ZanIDE.Has(line, "//");
+            if (!skip) { return i; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    static List<string> DebugBuildRun(List<string> tabPaths, SignalInt activeTab,
+            string root, List<string> log) {
+        List<string> console = new List<string>();
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabPaths.Count) { return console; }
+        string p = tabPaths[a];
+        if (p == "") {
+            log.Add("> [Debug] Save the file first.");
+            return console;
+        }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string ll = bd + "/.zandbg.ll";
+        string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
+        string buildCmd = ZanIDE.CompileToExe(root, p, "\"" + p + "\"", ll, exe, false);
+        log.Add("> [Debug] Building ...");
+        List<string> buildOut = Process.RunCapture(buildCmd);
+        int bo = 0;
+        while (bo < buildOut.Count) {
+            log.Add("  " + buildOut[bo]);
+            bo = bo + 1;
+        }
+        log.Add("> [Debug] Running ...");
+        List<string> runOut = Process.RunCapture("\"" + exe + "\"");
+        int ri = 0;
+        while (ri < runOut.Count) {
+            console.Add(runOut[ri]);
+            ri = ri + 1;
+        }
+        if (console.Count == 0) {
+            console.Add("(no output)");
+        }
+        return console;
+    }
+
+    static int FindInEditor(CodeEditor editor, string query, int afterLine) {
+        if (query.Length == 0) { return -1; }
+        int lc = editor.LineCount();
+        int startLine = afterLine + 1;
+        if (startLine < 0) { startLine = 0; }
+        string text = editor.GetText();
+        List<string> edLines = new List<string>();
+        string cur = "";
+        int ii = 0;
+        while (ii < text.Length) {
+            string ch = text.Substring(ii, 1);
+            if (ch == "\n") { edLines.Add(cur); cur = ""; }
+            else if (ch == "\r") { cur = cur; }
+            else { cur = cur + ch; }
+            ii = ii + 1;
+        }
+        edLines.Add(cur);
+        int li = startLine;
+        while (li < edLines.Count) {
+            string ln = edLines[li];
+            int fi = 0;
+            while (fi + query.Length <= ln.Length) {
+                string sub = ln.Substring(fi, query.Length);
+                if (sub == query) {
+                    editor.GoToLineCol(li, fi);
+                    return li;
+                }
+                fi = fi + 1;
+            }
+            li = li + 1;
+        }
+        // Wrap around from beginning
+        li = 0;
+        while (li < startLine && li < edLines.Count) {
+            string ln = edLines[li];
+            int fi = 0;
+            while (fi + query.Length <= ln.Length) {
+                string sub = ln.Substring(fi, query.Length);
+                if (sub == query) {
+                    editor.GoToLineCol(li, fi);
+                    return li;
+                }
+                fi = fi + 1;
+            }
+            li = li + 1;
+        }
+        return -1;
+    }
+
+    static int ParseInt(string s) {
+        int result = 0;
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "0") { result = result * 10; }
+            else if (ch == "1") { result = result * 10 + 1; }
+            else if (ch == "2") { result = result * 10 + 2; }
+            else if (ch == "3") { result = result * 10 + 3; }
+            else if (ch == "4") { result = result * 10 + 4; }
+            else if (ch == "5") { result = result * 10 + 5; }
+            else if (ch == "6") { result = result * 10 + 6; }
+            else if (ch == "7") { result = result * 10 + 7; }
+            else if (ch == "8") { result = result * 10 + 8; }
+            else if (ch == "9") { result = result * 10 + 9; }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    /// Net change in brace nesting for a line (approximate: counts { and }
+    /// literally, which is good enough for well-formed source).
+    static int BraceDelta(string ln) {
+        int d = 0;
+        int i = 0;
+        while (i < ln.Length) {
+            string ch = ln.Substring(i, 1);
+            if (ch == "{") { d = d + 1; }
+            else if (ch == "}") { d = d - 1; }
+            i = i + 1;
+        }
+        return d;
+    }
+
+    /// Returns "" if `elem` is not a primitive the debugger can stringify in an
+    /// injected `foreach`, else the element type. (bool is excluded from lists:
+    /// it stringifies to -1/0.)
+    static string ListElemKind(string elem) {
+        if (elem == "int" || elem == "string" || elem == "long"
+            || elem == "float" || elem == "double" || elem == "char") {
+            return elem;
+        }
+        return "";
+    }
+
+    static bool StartsWith(string s, string pfx) {
+        if (s.Length < pfx.Length) { return false; }
+        return s.Substring(0, pfx.Length) == pfx;
+    }
+
+    /// Path of the active tab, or "" if none.
+    static string PathOf(List<string> paths, SignalInt active) {
+        int a = active.Get();
+        if (a >= 0 && a < paths.Count) { return paths[a]; }
+        return "";
+    }
+
+    /// Directory portion of a path (before the last '/' or '\'), or "." if none.
+    static string DirOf(string path) {
+        int last = 0 - 1;
+        int i = 0;
+        while (i < path.Length) {
+            string ch = path.Substring(i, 1);
+            if (ch == "/" || ch == "\\") { last = i; }
+            i = i + 1;
+        }
+        if (last < 0) { return "."; }
+        return path.Substring(0, last);
+    }
+
+    static string FindProjectRoot(string path) {
+        string dir = ZanIDE.DirOf(path);
+        int depth = 0;
+        while (depth < 24) {
+            if (File.Exists(dir + "/zan.proj")) { return dir; }
+            string parent = ZanIDE.DirOf(dir);
+            if (parent == dir || parent == ".") { break; }
+            dir = parent;
+            depth = depth + 1;
+        }
+        return "";
+    }
+
+    static bool IsZanFile(string name) {
+        int n = name.Length;
+        if (n < 4) { return false; }
+        return name.Substring(n - 4, 4) == ".zan";
+    }
+
+    /// Recursively collects full paths of project .zan source files under `dir`,
+    /// skipping IDE temp files (names starting with ".") and build/publish output
+    /// directories, so a project can span multiple files.
+    static void GatherZanFiles(string dir, List<string> outp) {
+        List<string> files = Directory.GetFiles(dir);
+        int j = 0;
+        while (j < files.Count) {
+            string nm = files[j];
+            if (ZanIDE.IsZanFile(nm) && nm.Substring(0, 1) != ".") {
+                outp.Add(dir + "/" + nm);
+            }
+            j = j + 1;
+        }
+        List<string> subs = Directory.GetDirectories(dir);
+        int i = 0;
+        while (i < subs.Count) {
+            string sn = subs[i];
+            if (sn.Substring(0, 1) != "." && sn != "publish" && sn != "build"
+                && sn != "bin" && sn != "obj" && sn != "dist" && sn != "tools") {
+                ZanIDE.GatherZanFiles(dir + "/" + sn, outp);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Builds the quoted, space-joined zanc input list for a whole-project build:
+    /// `entry` first (so it becomes the compiler's primary input), then every
+    /// other project .zan file except `skip` (e.g. the original of a probe).
+    static string ProjectInputs(string dir, string entry, string skip) {
+        string args = "\"" + entry + "\"";
+        List<string> all = new List<string>();
+        ZanIDE.GatherZanFiles(dir, all);
+        int i = 0;
+        while (i < all.Count) {
+            string f = all[i];
+            if (f != entry && f != skip) {
+                args = args + " \"" + f + "\"";
+            }
+            i = i + 1;
+        }
+        return args;
+    }
+
+    /// Resolves the runnable entry point of the project at `root`. A .zform (or
+    /// its code-behind) is not independently runnable, so Run/Build always drive
+    /// the project entry declared in zan.proj (`entry = ...`), falling back to
+    /// src/main.zan. This keeps the compiler from ever being handed a .zform.
+    static string ProjectEntry(string root) {
+        string fallback = root + "/src/main.zan";
+        string proj = root + "/zan.proj";
+        if (!File.Exists(proj)) { return fallback; }
+        List<string> ls = CodeEditor.SplitLines(File.ReadAllText(proj));
+        int i = 0;
+        while (i < ls.Count) {
+            string tr = ZanIDE.TrimLeadSpaces(ls[i]);
+            if (tr.Length >= 5 && tr.Substring(0, 5) == "entry") {
+                string rest = ZanIDE.TrimLeadSpaces(tr.Substring(5, tr.Length - 5));
+                if (rest.Length > 0 && rest.Substring(0, 1) == "=") {
+                    string val = ZanIDE.TrimLeadSpaces(rest.Substring(1, rest.Length - 1));
+                    int e = val.Length;
+                    while (e > 0) {
+                        string ch = val.Substring(e - 1, 1);
+                        if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") { e = e - 1; }
+                        else { break; }
+                    }
+                    if (e > 0) { return root + "/" + val.Substring(0, e); }
+                }
+            }
+            i = i + 1;
+        }
+        return fallback;
+    }
+
+    static string TrimLeadSpaces(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") { i = i + 1; }
+            else { break; }
+        }
+        if (i == 0) { return s; }
+        return s.Substring(i, s.Length - i);
+    }
+
+    static string ExtractIdent(string s, int start) {
+        string idc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string name = "";
+        int i = start;
+        while (i < s.Length && CodeEditor.InSet(idc, s.Substring(i, 1))) {
+            name = name + s.Substring(i, 1);
+            i = i + 1;
+        }
+        return name;
+    }
+
+    static string ExtractValue(string rest, int ni) {
+        if (ni >= rest.Length) { return "(uninitialized)"; }
+        if (rest.Substring(ni, 1) != "=") { return "(uninitialized)"; }
+        ni = ni + 1;
+        while (ni < rest.Length && rest.Substring(ni, 1) == " ") { ni = ni + 1; }
+        string val = "";
+        while (ni < rest.Length && rest.Substring(ni, 1) != ";") {
+            val = val + rest.Substring(ni, 1);
+            ni = ni + 1;
+        }
+        if (val.Length == 0) { return "(empty)"; }
+        return val;
+    }
+
+    static string TrimTrailSpaces(string s) {
+        int e = s.Length;
+        while (e > 0 && s.Substring(e - 1, 1) == " ") { e = e - 1; }
+        if (e == s.Length) { return s; }
+        return s.Substring(0, e);
+    }
+
+    static void LogVarsToConsole(List<string> log, List<string> vars, int execLine) {
+        log.Add("> --- Line " + Convert.ToString(execLine + 1) + " ---");
+        int vi = 0;
+        while (vi < vars.Count) {
+            string entry = vars[vi];
+            string vn = ZanIDE.GetTabField(entry, 0);
+            string vt = ZanIDE.GetTabField(entry, 1);
+            string vv = ZanIDE.GetTabField(entry, 2);
+            log.Add(">   " + vn + " : " + vt + " = " + vv);
+            vi = vi + 1;
+        }
+    }
+
+    static string GetTabField(string s, int fieldIdx) {
+        int fi = 0;
+        int start = 0;
+        int i = 0;
+        while (i < s.Length) {
+            if (s.Substring(i, 1) == "\t") {
+                if (fi == fieldIdx) {
+                    return s.Substring(start, i - start);
+                }
+                fi = fi + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (fi == fieldIdx) {
+            return s.Substring(start, s.Length - start);
+        }
+        return "";
+    }
+
+    // ================================================================
+    // Designer
+    // ================================================================
+
+    // The old standalone snippets were replaced by the searchable component
+    // center so examples stay aligned with the current Gui.Widget API.
+    /// The stdlib/ shipped next to the IDE as a collapsed tree, so the
+    /// sidebar's third section doubles as a standard-library browser.
+    static List<TreeNode> BuildStdlibTree() {
+        List<TreeNode> n = ZanIDE.BuildDirTree(ZanIDE.StdlibDir());
+        int i = 0;
+        while (i < n.Count) {
+            if (n[i].isDir) { n[i].expanded = false; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// A generic collapsible .zan file tree for any directory (empty list
+    /// when the directory does not exist).
+    static List<TreeNode> BuildDirTree(string dir) {
+        List<TreeNode> n = new List<TreeNode>();
+        if (dir != "" && Directory.Exists(dir)) {
+            ZanIDE.ScanExamplesInto(n, dir, 0);
+        }
+        return n;
+    }
+
+    static List<TreeNode> BuildExampleTree() {
+        List<TreeNode> n = new List<TreeNode>();
+        string dir = ZanIDE.ExamplesDir();
+        if (dir != "") {
+            // Scan the real examples/ folder so every leaf carries the actual
+            // on-disk path; clicking one opens the true source and Run/Debug
+            // compile it directly. Sub-directories become collapsible groups.
+            ZanIDE.ScanExamplesInto(n, dir, 0);
+        }
+        if (n.Count == 0) {
+            // No examples shipped alongside the IDE: fall back to the built-in
+            // GUI component center so the panel is never empty.
+            n.Add(TreeNode.Dir(ZanIDE.T("GUI Reference", "GUI 参考"), 0, true));
+            n.Add(ZanIDE.ExLeaf(
+                ZanIDE.T("Component Center", "组件示例中心"), 0));
+        }
+        return n;
+    }
+
+    /// Adds the `.zan` files and sub-directories of `dirPath` to `nodes` in
+    /// pre-order, tagging every file leaf with its real path. Mirrors ScanInto
+    /// but keeps only Zan sources (examples never ship manifests) and omits the
+    /// redundant root directory row so the pane starts at the first example.
+    static void ScanExamplesInto(List<TreeNode> nodes, string dirPath, int depth) {
+        List<string> subs = Directory.GetDirectories(dirPath);
+        int i = 0;
+        while (i < subs.Count) {
+            TreeNode d = TreeNode.Dir(subs[i], depth, true);
+            d.path = dirPath + "/" + subs[i];
+            nodes.Add(d);
+            ZanIDE.ScanExamplesInto(nodes, dirPath + "/" + subs[i], depth + 1);
+            i = i + 1;
+        }
+        List<string> files = Directory.GetFiles(dirPath);
+        int j = 0;
+        while (j < files.Count) {
+            if (ZanIDE.EndsWith(files[j], ".zan")) {
+                TreeNode f = TreeNode.FileIcon(files[j], depth, "file");
+                f.path = dirPath + "/" + files[j];
+                nodes.Add(f);
+            }
+            j = j + 1;
+        }
+    }
+
+    static TreeNode ExLeaf(string label, int idx) {
+        TreeNode f = TreeNode.FileIcon(label, 1, "file");
+        f.path = "@ex:" + Convert.ToString(idx);
+        return f;
+    }
+
+    // Returns the index of the first tab whose path equals p, or -1.
+    static int FindTabByPath(List<string> paths, string p) {
+        int i = 0;
+        while (i < paths.Count) {
+            if (paths[i] == p) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    // ---- Help / documentation browser ----
+
+    /// Lowercases ASCII A-Z using only string ops (the runtime has no reliable
+    /// char-code helper here), leaving other characters unchanged.
+    static string ToLowerS(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string o = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            int k = 0;
+            bool done = false;
+            while (k < 26 && !done) {
+                if (up.Substring(k, 1) == ch) { o = o + lo.Substring(k, 1); done = true; }
+                k = k + 1;
+            }
+            if (!done) { o = o + ch; }
+            i = i + 1;
+        }
+        return o;
+    }
+
+    /// True if `hay` contains `needle` as a substring.
+    static bool ContainsS(string hay, string needle) {
+        if (needle.Length == 0) { return true; }
+        if (hay.Length < needle.Length) { return false; }
+        int last = hay.Length - needle.Length;
+        int i = 0;
+        while (i <= last) {
+            if (hay.Substring(i, needle.Length) == needle) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Word-wraps `s` (honoring embedded newlines) to fit `maxW` pixels at
+    /// `fontSize`. Empty input paragraphs become blank lines (paragraph gaps).
+    static List<string> WrapText(string s, int maxW, int fontSize) {
+        List<string> outl = new List<string>();
+        List<string> paras = CodeEditor.SplitLines(s);
+        int p = 0;
+        while (p < paras.Count) {
+            List<string> words = ZanIDE.SplitSpaces(paras[p]);
+            if (words.Count == 0) { outl.Add(""); }
+            string cur = "";
+            int wi = 0;
+            while (wi < words.Count) {
+                string cand = cur;
+                if (cand != "") { cand = cand + " "; }
+                cand = cand + words[wi];
+                if (Canvas.MeasureText(cand, fontSize) > maxW && cur != "") {
+                    outl.Add(cur);
+                    cur = words[wi];
+                } else {
+                    cur = cand;
+                }
+                wi = wi + 1;
+            }
+            if (cur != "") { outl.Add(cur); }
+            p = p + 1;
+        }
+        return outl;
+    }
+
+    // ================================================================
+    // Example Code Library
+    // ================================================================
+
+    static void OpenNewTab(List<string> tabNames, List<string> tabBodies,
+            List<string> tabPaths, SignalInt activeTab, string name, string code) {
+        tabNames.Add(name);
+        tabBodies.Add(code);
+        tabPaths.Add("");
+        activeTab.Set(tabNames.Count - 1);
+    }
+}

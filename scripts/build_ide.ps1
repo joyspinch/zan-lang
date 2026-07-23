@@ -64,9 +64,9 @@ try {
     # Crypto + encrypted resource pack (.zrp publishing from the Asset Manager).
     $files += (Get-ChildItem stdlib\System\Security\Cryptography\*.zan).FullName
     $files += (Join-Path (Get-Location) "stdlib\System\Resources\ResourcePack.zan")
-    $files += (Join-Path (Get-Location) "src\ide_zan\SceneDesigner.zan")
-    $files += (Join-Path (Get-Location) "src\ide_zan\AssetManager.zan")
-    $files += (Join-Path (Get-Location) "src\ide_zan\ZanIDE.zan")
+    # All IDE shell sources: ZanIDE.zan + its partial-class parts,
+    # SceneDesigner, AssetManager and the session classes.
+    $files += (Get-ChildItem src\ide_zan\*.zan).FullName
 
     # Link the IDE straight through zanc: it compiles all sources and drives the
     # bundled ld itself, auto-linking the socket-async reactor (rt_io) and the
