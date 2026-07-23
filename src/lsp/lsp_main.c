@@ -561,12 +561,16 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
         const char *root_uri = json_get_str(json_obj_get(params, "rootUri"));
         const char *root_path = json_get_str(json_obj_get(params, "rootPath"));
         if (root_uri && strncmp(root_uri, "file:///", 8) == 0) {
-            strncpy(s->workspace_root, root_uri + 8, sizeof(s->workspace_root) - 1);
-            /* Convert URI encoding: %20 -> space, forward slash -> backslash on Windows */
+            /* Windows URIs carry a drive letter ("file:///C:/..."); POSIX
+             * paths keep the leading slash ("file:///home/..." -> "/home"). */
 #ifdef _WIN32
+            strncpy(s->workspace_root, root_uri + 8, sizeof(s->workspace_root) - 1);
+            /* Convert URI encoding: forward slash -> backslash on Windows */
             for (char *p = s->workspace_root; *p; p++) {
                 if (*p == '/') *p = '\\';
             }
+#else
+            strncpy(s->workspace_root, root_uri + 7, sizeof(s->workspace_root) - 1);
 #endif
         } else if (root_path) {
             strncpy(s->workspace_root, root_path, sizeof(s->workspace_root) - 1);
@@ -597,6 +601,8 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     json_obj_set(caps, "definitionProvider", json_new_bool(true));
     json_obj_set(caps, "referencesProvider", json_new_bool(true));
     json_obj_set(caps, "documentSymbolProvider", json_new_bool(true));
+    json_obj_set(caps, "renameProvider", json_new_bool(true));
+    json_obj_set(caps, "workspaceSymbolProvider", json_new_bool(true));
 
     /* Code actions (organize usings, etc.) */
     json_value *code_action = json_new_obj();
@@ -1082,6 +1088,125 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
     send_response(s, id, arr);
 }
 
+/* Rename handler: whole-word, comment/string-aware textual rename across
+ * every open document, returned as a WorkspaceEdit. */
+static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
+    const char *uri; int line, character;
+    const char *new_name = json_get_str(json_obj_get(params, "newName"));
+    if (!get_position(params, &uri, &line, &character) || !new_name || !new_name[0]) {
+        send_response(s, id, json_new_null());
+        return;
+    }
+    /* the replacement must be a valid identifier */
+    if (!(isalpha((unsigned char)new_name[0]) || new_name[0] == '_')) {
+        send_response(s, id, json_new_null());
+        return;
+    }
+    for (const char *p = new_name + 1; *p; p++) {
+        if (!is_ident_char(*p)) { send_response(s, id, json_new_null()); return; }
+    }
+    lsp_doc_t *doc = lsp_find_doc(s, uri);
+    if (!doc) { send_response(s, id, json_new_null()); return; }
+
+    size_t off = pos_to_offset(doc->text, line, character);
+    char word[128];
+    word_at(doc->text, off, word, sizeof(word));
+    if (!word[0]) { send_response(s, id, json_new_null()); return; }
+
+    json_value *changes = json_new_obj();
+    for (int d = 0; d < s->doc_count; d++) {
+        lsp_doc_t *dd = &s->docs[d];
+        size_t offsets[512];
+        int n = find_text_references(dd->text, word, offsets, 512);
+        if (n == 0) continue;
+        json_value *edits = json_new_arr();
+        for (int i = 0; i < n; i++) {
+            int rl, rc;
+            offset_to_linecol(dd->text, (int)offsets[i], &rl, &rc);
+            json_value *edit = json_new_obj();
+            json_value *range = json_new_obj();
+            json_value *start = json_new_obj();
+            json_value *endp  = json_new_obj();
+            json_obj_set(start, "line", json_new_num(rl));
+            json_obj_set(start, "character", json_new_num(rc));
+            json_obj_set(endp, "line", json_new_num(rl));
+            json_obj_set(endp, "character", json_new_num(rc + (int)strlen(word)));
+            json_obj_set(range, "start", start);
+            json_obj_set(range, "end", endp);
+            json_obj_set(edit, "range", range);
+            json_obj_set(edit, "newText", json_new_str(new_name));
+            json_arr_add(edits, edit);
+        }
+        json_obj_set(changes, dd->uri, edits);
+    }
+    json_value *we = json_new_obj();
+    json_obj_set(we, "changes", changes);
+    send_response(s, id, we);
+}
+
+/* Case-insensitive substring match (workspace/symbol query filter). */
+static bool name_matches_query(const char *name, const char *query) {
+    if (!query || !query[0]) return true;
+    size_t qlen = strlen(query);
+    for (const char *p = name; *p; p++) {
+        size_t i = 0;
+        while (i < qlen && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)query[i]))
+            i++;
+        if (i == qlen) return true;
+    }
+    return false;
+}
+
+/* workspace/symbol handler: query the project-wide index (built from the
+ * workspace root on the first didOpen), filtered case-insensitively. */
+static void handle_workspace_symbol(lsp_server_t *s, json_value *id, json_value *params) {
+    const char *query = json_get_str(json_obj_get(params, "query"));
+    ensure_project_indexed(s);
+
+    json_value *arr = json_new_arr();
+    intellisense_t *is = g_project_intel;
+    int emitted = 0;
+    if (is) {
+        for (int i = 0; i < is->symbol_count && emitted < 256; i++) {
+            isym_t *sym = &is->symbols[i];
+            if (sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) continue;
+            if (!name_matches_query(sym->name, query)) continue;
+
+            json_value *sinfo = json_new_obj();
+            json_obj_set(sinfo, "name", json_new_str(sym->name));
+            json_obj_set(sinfo, "kind", json_new_num(lsp_symbol_kind(sym->kind)));
+            if (sym->parent[0])
+                json_obj_set(sinfo, "containerName", json_new_str(sym->parent));
+
+            char furi[600];
+            if (strncmp(sym->file, "file://", 7) == 0)
+                snprintf(furi, sizeof(furi), "%s", sym->file);
+            else if (sym->file[0] == '/')
+                snprintf(furi, sizeof(furi), "file://%s", sym->file);
+            else
+                snprintf(furi, sizeof(furi), "file:///%s", sym->file);
+
+            json_value *loc = json_new_obj();
+            json_obj_set(loc, "uri", json_new_str(furi));
+            json_value *range = json_new_obj();
+            json_value *start = json_new_obj();
+            json_value *endp  = json_new_obj();
+            json_obj_set(start, "line", json_new_num(sym->line));
+            json_obj_set(start, "character", json_new_num(0));
+            json_obj_set(endp, "line", json_new_num(sym->line));
+            json_obj_set(endp, "character", json_new_num((int)strlen(sym->name)));
+            json_obj_set(range, "start", start);
+            json_obj_set(range, "end", endp);
+            json_obj_set(loc, "range", range);
+            json_obj_set(sinfo, "location", loc);
+            json_arr_add(arr, sinfo);
+            emitted++;
+        }
+    }
+    send_response(s, id, arr);
+}
+
 /* Code action handler: organize usings (auto-import / remove unused) */
 static void handle_code_action(lsp_server_t *s, json_value *id, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
@@ -1435,6 +1560,10 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
         handle_signature_help(s, id, params);
     } else if (strcmp(method, "textDocument/documentSymbol") == 0) {
         handle_document_symbol(s, id, params);
+    } else if (strcmp(method, "textDocument/rename") == 0) {
+        handle_rename(s, id, params);
+    } else if (strcmp(method, "workspace/symbol") == 0) {
+        handle_workspace_symbol(s, id, params);
     } else if (strcmp(method, "textDocument/codeAction") == 0) {
         handle_code_action(s, id, params);
     } else if (strcmp(method, "workspace/executeCommand") == 0) {

@@ -630,6 +630,100 @@ partial class ZanIDE {
         log.Add("> " + Convert.ToString(total) + " reference(s) found.");
     }
 
+    /// Replaces whole-word occurrences of `word` with `newName`, skipping
+    /// string/char literals and line/block comments (same rules as zan-lsp).
+    static string ReplaceWholeWord(string text, string word, string newName) {
+        string outp = "";
+        int i = 0;
+        int n = text.Length;
+        while (i < n) {
+            string ch = text.Substring(i, 1);
+            if (ch == "/" && i + 1 < n && text.Substring(i + 1, 1) == "/") {
+                int j = i;
+                while (j < n && text.Substring(j, 1) != "\n") { j = j + 1; }
+                outp = outp + text.Substring(i, j - i);
+                i = j;
+            } else if (ch == "/" && i + 1 < n && text.Substring(i + 1, 1) == "*") {
+                int j = i + 2;
+                while (j + 1 < n && !(text.Substring(j, 1) == "*" && text.Substring(j + 1, 1) == "/")) { j = j + 1; }
+                if (j + 1 < n) { j = j + 2; } else { j = n; }
+                outp = outp + text.Substring(i, j - i);
+                i = j;
+            } else if (ch == "\"" || ch == "'") {
+                int j = i + 1;
+                while (j < n && text.Substring(j, 1) != ch) {
+                    if (text.Substring(j, 1) == "\\" && j + 1 < n) { j = j + 1; }
+                    j = j + 1;
+                }
+                if (j < n) { j = j + 1; }
+                outp = outp + text.Substring(i, j - i);
+                i = j;
+            } else if (CodeEditor.IsIdentChar(ch)) {
+                int j = i;
+                while (j < n && CodeEditor.IsIdentChar(text.Substring(j, 1))) { j = j + 1; }
+                string ident = text.Substring(i, j - i);
+                if (ident == word) { outp = outp + newName; } else { outp = outp + ident; }
+                i = j;
+            } else {
+                outp = outp + ch;
+                i = i + 1;
+            }
+        }
+        return outp;
+    }
+
+    /// Rename Symbol (F2): whole-word, comment/string-aware rename of the
+    /// symbol under the caret across every open tab (buffers only; save to
+    /// persist). Returns the number of tabs changed.
+    static int RenameSymbol(CodeEditor editor, List<string> tabNames, List<string> tabBodies,
+                            List<string> tabPaths, SignalInt active, List<string> log,
+                            string word, string newName) {
+        if (word == "" || newName == "" || word == newName) { return 0; }
+        int a = active.Get();
+        if (a >= 0 && a < tabBodies.Count) { tabBodies[a] = editor.GetText(); }
+        int changed = 0;
+        int i = 0;
+        while (i < tabBodies.Count) {
+            string nb = ZanIDE.ReplaceWholeWord(tabBodies[i], word, newName);
+            if (nb != tabBodies[i]) {
+                tabBodies[i] = nb;
+                changed = changed + 1;
+            }
+            i = i + 1;
+        }
+        if (a >= 0 && a < tabBodies.Count) {
+            int keepLine = editor.CurLine();
+            editor.LoadText(tabBodies[a]);
+            editor.GoToLine(keepLine);
+        }
+        log.Add("> Renamed '" + word + "' -> '" + newName + "' in "
+            + Convert.ToString(changed) + " open tab(s). Save to persist.");
+        return changed;
+    }
+
+    /// Format Document (Ctrl+E): pipes the active buffer through zanfmt
+    /// (--stdout on a temp copy) and reloads the formatted result.
+    static void FormatDocument(CodeEditor editor, List<string> log) {
+        string exe = ZanIDE.ToolchainDir() + "/zanfmt" + ZanIDE.ExeSuffix();
+        if (!File.Exists(exe)) { exe = ZanIDE.ExeDir() + "/zanfmt" + ZanIDE.ExeSuffix(); }
+        if (!File.Exists(exe)) { log.Add("> Format: zanfmt not found."); return; }
+        string tmp = ZanIDE.UserConfigDir() + "/fmt_buffer.zan";
+        File.WriteAllText(tmp, editor.GetText());
+        List<string> outp = Process.RunCapture("\"" + exe + "\" --stdout \"" + tmp + "\"");
+        File.Delete(tmp);
+        if (outp.Count == 0) { log.Add("> Format: zanfmt produced no output."); return; }
+        string body = "";
+        int i = 0;
+        while (i < outp.Count) {
+            body = body + outp[i] + "\n";
+            i = i + 1;
+        }
+        int keepLine = editor.CurLine();
+        editor.LoadText(body);
+        editor.GoToLine(keepLine);
+        log.Add("> Formatted document with zanfmt.");
+    }
+
     // ---- designer <-> code (form serialization) ----
 
     /// Splits a string on runs of spaces/tabs into tokens.
