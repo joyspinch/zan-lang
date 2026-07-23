@@ -1917,6 +1917,7 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
 #include "irgen_generics.c"
 #include "irgen_builtins.c"
 #include "irgen_expr.c"
+#include "irgen_call.c"
 #include "irgen_async.c"
 #include "irgen_stmt.c"
 #include "irgen_emit.c"
