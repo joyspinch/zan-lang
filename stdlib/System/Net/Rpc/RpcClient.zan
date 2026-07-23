@@ -7,12 +7,10 @@ namespace System.Net.Rpc;
 /// <summary>
 /// The RPC kernel: it owns the request/response lifecycle and correlation id
 /// allocation, and delegates the two orthogonal concerns to plug-in pieces --
-/// the wire format to an <see cref="IRpcCodec"/> and the bytes to a transport.
-/// This first cut speaks over a TCP <see cref="TcpClient"/>; frames are
-/// newline-delimited (each encoded message is followed by '\n'), which is the
-/// common line framing for JSON-RPC/XML-RPC over raw sockets. Swapping the codec
-/// gives XML-RPC or DMTP for free; a NamedPipe transport slots in behind the
-/// same newline framing.
+/// the wire format to an <see cref="IRpcCodec"/> and the bytes/framing to an
+/// <see cref="IRpcTransport"/>. It knows nothing about TCP, JSON or XML, so a
+/// different protocol is just a different codec and a different medium is just a
+/// different transport. Notifications are fire-and-forget (no id, no reply).
 ///
 /// Usage:
 ///   RpcClient c = await RpcClient.ConnectAsync("127.0.0.1", 4000, new JsonRpcCodec());
@@ -22,32 +20,29 @@ namespace System.Net.Rpc;
 ///   c.Close();
 /// </summary>
 class RpcClient {
-    TcpClient conn;
+    IRpcTransport transport;
     IRpcCodec codec;
     int nextId;
-    string rbuf;      // read accumulator holding bytes past the last full frame
 
     RpcClient() {
-        this.conn = null;
+        this.transport = null;
         this.codec = null;
         this.nextId = 1;
-        this.rbuf = "";
     }
 
-    /// Connects to a host/port and binds a codec, suspending on the IO reactor
-    /// until the (non-blocking) connection is established.
-    static async RpcClient ConnectAsync(string host, int port, IRpcCodec codec) {
+    /// Builds a client over any transport + codec (the fully general form).
+    static RpcClient Create(IRpcTransport transport, IRpcCodec codec) {
         RpcClient c = new RpcClient();
+        c.transport = transport;
         c.codec = codec;
-        c.conn = await TcpClient.ConnectAsync(host, port);
         return c;
     }
 
-    /// Wraps an already-connected TcpClient (e.g. an accepted server peer).
-    static RpcClient FromConn(TcpClient conn, IRpcCodec codec) {
+    /// Convenience: connect over newline-framed TCP with the given codec.
+    static async RpcClient ConnectAsync(string host, int port, IRpcCodec codec) {
         RpcClient c = new RpcClient();
-        c.conn = conn;
         c.codec = codec;
+        c.transport = await TcpRpcTransport.ConnectAsync(host, port);
         return c;
     }
 
@@ -57,52 +52,23 @@ class RpcClient {
         int id = this.nextId;
         this.nextId = this.nextId + 1;
         RpcRequest req = RpcRequest.Call(method, args, id);
-        string frame = this.codec.EncodeRequest(req) + "\n";
-        await this.conn.SendAsync(frame);
-        string line = await this.ReadFrameAsync();
-        if (line.Length == 0) {
+        await this.transport.SendFrameAsync(this.codec.EncodeRequest(req));
+        string frame = await this.transport.RecvFrameAsync();
+        if (frame.Length == 0) {
             return RpcResponse.Fail(id, RpcError.Transport("connection closed"));
         }
-        return this.codec.DecodeResponse(line);
+        return this.codec.DecodeResponse(frame);
     }
 
     /// Sends a fire-and-forget notification (no id, no reply awaited).
     async void NotifyAsync(string method, JsonValue args) {
         RpcRequest req = RpcRequest.Notification(method, args);
-        string frame = this.codec.EncodeRequest(req) + "\n";
-        await this.conn.SendAsync(frame);
+        await this.transport.SendFrameAsync(this.codec.EncodeRequest(req));
     }
 
-    /// Reads one newline-delimited frame, buffering any trailing bytes that
-    /// belong to the next frame. Returns "" when the peer closes with no data.
-    async string ReadFrameAsync() {
-        while (true) {
-            int nl = RpcClient.IndexOfNewline(this.rbuf);
-            if (nl >= 0) {
-                string line = this.rbuf.Substring(0, nl);
-                this.rbuf = this.rbuf.Substring(nl + 1, this.rbuf.Length - nl - 1);
-                return line;
-            }
-            string chunk = await this.conn.RecvAsync();
-            if (chunk == null || chunk.Length == 0) {
-                string rest = this.rbuf;
-                this.rbuf = "";
-                return rest;
-            }
-            this.rbuf = this.rbuf + chunk;
-        }
-    }
-
-    static int IndexOfNewline(string s) {
-        int i = 0;
-        while (i < s.Length) {
-            if ((s[i] & 255) == 10) { return i; }
-            i = i + 1;
-        }
-        return -1;
-    }
+    bool IsOpen() { return this.transport != null && this.transport.IsOpen(); }
 
     void Close() {
-        if (this.conn != null) { this.conn.Close(); }
+        if (this.transport != null) { this.transport.Close(); }
     }
 }

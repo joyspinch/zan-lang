@@ -1,0 +1,72 @@
+using System;
+using System.Net.Sockets;
+
+namespace System.Net.Rpc;
+
+/// <summary>
+/// Newline-delimited framing over a TCP connection -- the common line framing
+/// for text RPC protocols (JSON-RPC/XML-RPC) on a raw socket. Each message is
+/// sent followed by '\n'; on receive, bytes past a full frame are buffered for
+/// the next read so back-to-back frames in one packet are handled correctly.
+/// Payloads therefore must not contain a literal newline (compact JSON/XML from
+/// the stdlib codecs never do).
+/// </summary>
+class TcpRpcTransport : IRpcTransport {
+    TcpClient conn;
+    string rbuf;      // bytes received past the last complete frame
+
+    TcpRpcTransport() {
+        this.conn = null;
+        this.rbuf = "";
+    }
+
+    static async TcpRpcTransport ConnectAsync(string host, int port) {
+        TcpRpcTransport t = new TcpRpcTransport();
+        t.conn = await TcpClient.ConnectAsync(host, port);
+        return t;
+    }
+
+    /// Wraps an already-connected TcpClient (e.g. an accepted server peer).
+    static TcpRpcTransport FromConn(TcpClient conn) {
+        TcpRpcTransport t = new TcpRpcTransport();
+        t.conn = conn;
+        return t;
+    }
+
+    async int SendFrameAsync(string payload) {
+        return await this.conn.SendAsync(payload + "\n");
+    }
+
+    async string RecvFrameAsync() {
+        while (true) {
+            int nl = TcpRpcTransport.IndexOfNewline(this.rbuf);
+            if (nl >= 0) {
+                string line = this.rbuf.Substring(0, nl);
+                this.rbuf = this.rbuf.Substring(nl + 1, this.rbuf.Length - nl - 1);
+                return line;
+            }
+            string chunk = await this.conn.RecvAsync();
+            if (chunk == null || chunk.Length == 0) {
+                string rest = this.rbuf;
+                this.rbuf = "";
+                return rest;
+            }
+            this.rbuf = this.rbuf + chunk;
+        }
+    }
+
+    static int IndexOfNewline(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            if ((s[i] & 255) == 10) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    bool IsOpen() { return this.conn != null && this.conn.IsConnected(); }
+
+    void Close() {
+        if (this.conn != null) { this.conn.Close(); }
+    }
+}
