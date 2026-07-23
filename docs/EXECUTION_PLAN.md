@@ -54,7 +54,7 @@
 | B6 | 惰性迭代器：`yield` 生成真正的惰性迭代器，LINQ 算子基于 IEnumerable 惰性链 | P2 | 无限序列 + Take 用例通过；现有急切用例不回归 |
 | B7 | LINQ 查询语法（`from … where … select`）脱糖为方法链 | P2 | parser/binder 支持，conformance 覆盖 join/group |
 | B8 | 语言便利特性（按需）：`using` 声明、`init`/`with`、`checked` | P2 | 逐项 SPEC + conformance |
-| B9 | 编译器：修复泛型统一表示导致的 7 项 bug（泛型比较/相等、委托返回类型重载、Dictionary 泛型值、泛型累加器泄漏等），修复后可将 OrderByStr/ContainsStr 等并回 C# 同名重载 | P1 | `docs/bugs/generics-uniform-repr.md` 各条最小复现通过 |
+| B9 | 编译器：修复泛型统一表示导致的 7 项 bug（泛型比较/相等、委托返回类型重载、Dictionary 泛型值、泛型累加器泄漏等），修复后可将 OrderByStr/ContainsStr 等并回 C# 同名重载 | **已完成** | `docs/bugs/generics-uniform-repr.md` 各条最小复现通过；`tests/conformance/generics_uniform_repr.zan` + `linq_csharp_overloads.zan`（OrderBy/Contains/Distinct/GroupBy/Sum/Min/Max/Average/In 同名重载已并回） |
 
 > B1–B3 收益最大、改动集中在 stdlib，一周期内可完成；B6/B7 涉及编译器，
 > 放在 A 的 P0/P1 之后。

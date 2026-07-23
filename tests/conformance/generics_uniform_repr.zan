@@ -1,0 +1,117 @@
+// Conformance: generic uniform-representation fixes (docs/bugs/
+// generics-uniform-repr.md) — generic key comparison uses concrete string/
+// double semantics, generic == compares string values, untyped lambdas bind
+// the overload matching their body type, typed overloads outrank generic
+// ones, Dictionary generic-class values round-trip, foreach over
+// Dictionary.Keys/Values works, and a generic string accumulator does not
+// corrupt (leak coverage lives in the leakcheck run of this test).
+using System;
+using System.Linq;
+
+delegate R Sel<T, R>(T x);
+delegate int IK<T>(T x);
+delegate string SK<T>(T x);
+
+class User {
+    string name;
+    int age;
+    double score;
+}
+
+class Box<T> {
+    public T V;
+    public Box(T v) { V = v; }
+}
+
+class Ext {
+    // 1. generic < on string/double keys
+    static T MinBy<T, R>(this List<T> src, Sel<T, R> key) {
+        T best = src[0];
+        R mk = key(src[0]);
+        for (int i = 1; i < src.Count; i = i + 1) {
+            R k = key(src[i]);
+            if (k < mk) { mk = k; best = src[i]; }
+        }
+        return best;
+    }
+    // 3. overloads differing only in delegate return type
+    static string Pick<T>(this List<T> s, IK<T> k) {
+        return "int:" + Convert.ToString(k(s[0]));
+    }
+    static string Pick<T>(this List<T> s, SK<T> k) {
+        return "str:" + k(s[0]);
+    }
+    // 4. typed overload preferred over generic
+    static bool Has<T>(this List<T> src, T v) { return false; }
+    static bool Has(this List<string> src, string v) {
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (src[i] == v) { return true; }
+        }
+        return false;
+    }
+}
+
+class Program {
+    // 2. generic == uses value equality for strings
+    static bool Same<T>(T a, T b) { return a == b; }
+
+    static User Mk(string n, int a, double s) {
+        User u = new User();
+        u.name = n;
+        u.age = a;
+        u.score = s;
+        return u;
+    }
+
+    static void Main() {
+        List<User> us = new List<User>();
+        us.Add(Program.Mk("carol", 41, 2.5));
+        us.Add(Program.Mk("alice", 17, -1.5));
+        us.Add(Program.Mk("bob", 25, 1.0));
+
+        // 1. generic comparison with concrete key semantics
+        User byName = us.MinBy(u => u.name);
+        Console.WriteLine("minByName=" + byName.name);
+        User byScore = us.MinBy(u => u.score);
+        Console.WriteLine("minByScore=" + byScore.name);
+        List<double> ds = new List<double> { 2.5, -1.5, 1.0 };
+        Console.WriteLine("minD=" + Convert.ToString(ds.MinBy(x => x)));
+
+        // 2. generic string equality by value
+        string he = "he";
+        Console.WriteLine("same=" + Convert.ToString(Program.Same(he + "llo", "hello")));
+        Console.WriteLine("sameInt=" + Convert.ToString(Program.Same(3, 3)));
+
+        // 3. lambda body type selects the overload
+        Console.WriteLine(us.Pick(x => x.name));
+        Console.WriteLine(us.Pick(x => x.age));
+
+        // 4. typed overload outranks the generic one
+        List<string> xs = new List<string>();
+        xs.Add(he + "llo");
+        Console.WriteLine("has=" + Convert.ToString(xs.Has("hello")));
+
+        // 5. Dictionary with a generic-class value
+        Dictionary<string, Box<int>> d = new Dictionary<string, Box<int>>();
+        Box<int> b = new Box<int>(7);
+        d.Add("x", b);
+        Console.WriteLine("boxV=" + Convert.ToString(d["x"].V));
+
+        // 6. foreach over Dictionary.Keys / Values
+        Dictionary<string, int> m = new Dictionary<string, int>();
+        m.Add("a", 1);
+        m.Add("b", 2);
+        int ksum = 0;
+        foreach (string k in m.Keys) { ksum = ksum + m[k]; }
+        Console.WriteLine("ksum=" + Convert.ToString(ksum));
+        int vsum = 0;
+        foreach (int v in m.Values) { vsum = vsum + v; }
+        Console.WriteLine("vsum=" + Convert.ToString(vsum));
+
+        // 7. generic string accumulator (release-on-reassign inside Aggregate)
+        string all = us.Aggregate("", (string acc, User u) => acc + u.name);
+        Console.WriteLine("agg=" + all);
+
+        Console.WriteLine("done");
+    }
+}
