@@ -1,0 +1,197 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// The Output / Error List bottom panel, extracted from the shell: the
+/// TabStrip-driven panel chrome, the tail-scrolled console renderer and
+/// its selection hit-testing helpers.
+class OutputPanel {
+    /// Tabbed bottom panel (Output / Error List) with a filter box + Clear
+    /// button in the tab strip. The Output tab owns its scrolling/scrollbar.
+    static void RenderOutputBottom(App app, Canvas c, Theme t, Rect orr, SignalInt bottomTab,
+            List<string> log, List<string> ePath, List<string> eLine, List<string> eMsg,
+            int scroll, Input filter,
+            int selR0, int selC0, int selR1, int selC1,
+            ErrorList errorList, Button clearBtn) {
+        int tab = bottomTab.Get();
+        int tabH = t.heightMedium;
+        c.FillRect(orr.x, orr.y, orr.width, tabH, t.bgSecondary);
+        // Tab strip is a real widget bound to the bottomTab signal.
+        List<string> tabLabels = new List<string>();
+        tabLabels.Add(ZanIDE.T("Output", "输出"));
+        string elabel = ZanIDE.T("Errors", "错误");
+        if (eLine.Count > 0) { elabel = ZanIDE.T("Errors (", "错误 (") + Convert.ToString(eLine.Count) + ")"; }
+        tabLabels.Add(elabel);
+        int firstTab = TabStrip.Render(app, orr.x, orr.y, orr.width, tabLabels, bottomTab);
+        TabStrip.HandleClick(app, firstTab, tabLabels.Count, bottomTab);
+        // Toolbar: a substring filter box + Clear, right-aligned in the tab strip.
+        Rect fr = ZanIDE.OutFilterRect(app, orr);
+        filter.Render(app, fr.x, fr.y, fr.width, fr.height);
+        Rect cbr = ZanIDE.OutClearRect(app, orr);
+        clearBtn.SetProp("text", ZanIDE.T("Clear", "清空"));
+        clearBtn.Render(app, cbr.x, cbr.y, cbr.width);
+        int contentY = orr.y + tabH;
+        int contentH = orr.height - tabH;
+        c.FillRect(orr.x, contentY, orr.width, contentH, t.bgPrimary);
+        // Clip the tab content to the panel so long lines never bleed into
+        // the right side (AI) panel.
+        c.PushClip(orr.x, contentY, orr.width, contentH);
+        if (tab == 0) {
+            OutputPanel.RenderConsoleTab(app, c, t, orr.x, contentY, orr.width, contentH, log,
+                scroll, selR0, selC0, selR1, selC1);
+        } else {
+            errorList.SetErrors(ePath, eLine, eMsg);
+            errorList.RenderAt(app, orr.x, contentY, orr.width, contentH);
+        }
+        c.PopClip();
+    }
+
+    static void RenderLog(App app, Rect r, List<string> log) {
+        Theme t = app.theme;
+        int lineH = app.Scale(18);
+        if (lineH < 1) { lineH = 1; }
+        int maxLines = r.height / lineH;
+        if (maxLines < 1) { maxLines = 1; }
+        int start = log.Count - maxLines;
+        if (start < 0) { start = 0; }
+        int i = start;
+        int row = 0;
+        while (i < log.Count) {
+            string ln = log[i];
+            int col = t.textSecondary;
+            if (ln.Length >= 2) {
+                string head = ln.Substring(0, 2);
+                if (head == "> ") { col = t.textPrimary; }
+            }
+            app.canvas.DrawText(r.x, r.y + row * lineH, ln, col, t.fontSizeSmall);
+            i = i + 1;
+            row = row + 1;
+        }
+    }
+    static void RenderConsoleTab(App app, Canvas c, Theme t,
+            int x, int y, int w, int h, List<string> lines, int scroll,
+            int selR0, int selC0, int selR1, int selC1) {
+        EditorPalette pal = EditorPalette.For(t);
+        int rowH = app.Scale(18);
+        int pad = app.Scale(6);
+        int maxRows = h / rowH;
+        if (maxRows < 1) { maxRows = 1; }
+        // `scroll` is measured in lines up from the bottom (0 = follow the tail).
+        int maxScroll = lines.Count - maxRows;
+        if (maxScroll < 0) { maxScroll = 0; }
+        int sc = scroll;
+        if (sc < 0) { sc = 0; }
+        if (sc > maxScroll) { sc = maxScroll; }
+        int startIdx = maxScroll - sc;
+        // Normalize the selection so (selR0,selC0) precedes (selR1,selC1).
+        if (selR0 >= 0) {
+            if (selR0 > selR1 || (selR0 == selR1 && selC0 > selC1)) {
+                int tr = selR0; selR0 = selR1; selR1 = tr;
+                int tc = selC0; selC0 = selC1; selC1 = tc;
+            }
+        }
+        int ri = startIdx;
+        int cy = y + pad;
+        while (ri < lines.Count && cy + rowH <= y + h) {
+            string ln = lines[ri];
+            // Selection highlight for this row (drawn behind the text).
+            if (selR0 >= 0 && ri >= selR0 && ri <= selR1) {
+                int hs = 0;
+                int he = ln.Length;
+                if (ri == selR0) { hs = selC0; }
+                if (ri == selR1) { he = selC1; }
+                if (hs < 0) { hs = 0; }
+                if (he > ln.Length) { he = ln.Length; }
+                if (hs > he) { hs = he; }
+                int hx0 = x + pad + Canvas.MeasureText(Text.Left(ln, hs), t.fontSizeSmall);
+                int hx1 = x + pad + Canvas.MeasureText(Text.Left(ln, he), t.fontSizeSmall);
+                // Full lines in the middle of a multi-line selection extend to the
+                // right edge so the trailing newline reads as selected.
+                if (ri < selR1) { hx1 = hx1 + app.Scale(6); }
+                if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
+                c.FillRect(hx0, cy, hx1 - hx0, rowH, pal.selection);
+            }
+            int textColor = t.textPrimary;
+            // Color debug output lines
+            if (ln.Length > 2) {
+                string prefix = ln.Substring(0, 2);
+                if (prefix == "> ") {
+                    if (ln.Length > 8) {
+                        string sub6 = ln.Substring(2, 6);
+                        if (sub6 == "[Debug") { textColor = pal.type; }
+                        else if (sub6 == "--- Li") { textColor = pal.keyword; }
+                        else if (sub6 == "  ") { textColor = pal.str; }
+                    }
+                }
+            }
+            c.DrawText(x + pad, cy, ln, textColor, t.fontSizeSmall);
+            cy = cy + rowH;
+            ri = ri + 1;
+        }
+        if (lines.Count == 0) {
+            c.DrawText(x + pad, y + pad, "(no console output)", t.textDisabled, t.fontSizeSmall);
+        }
+        if (lines.Count > maxRows) {
+            Scrollbar.RenderVertical(app, x + w - app.Scale(10), y + pad,
+                maxRows * rowH, lines.Count * rowH, startIdx * rowH);
+        }
+    }
+
+    /// Map a pointer Y within the console content rect to an absolute line index
+    /// (into `lines`), matching RenderConsoleTab's tail-scroll layout.
+    static int ConsoleRowAt(App app, int contentY, int rowH, int pad,
+            int count, int maxRows, int scroll, int mouseY) {
+        if (count == 0) { return 0 - 1; }
+        int maxScroll = count - maxRows;
+        if (maxScroll < 0) { maxScroll = 0; }
+        int sc = scroll;
+        if (sc < 0) { sc = 0; }
+        if (sc > maxScroll) { sc = maxScroll; }
+        int startIdx = maxScroll - sc;
+        int rel = (mouseY - (contentY + pad)) / rowH;
+        if (rel < 0) { rel = 0; }
+        int ri = startIdx + rel;
+        if (ri < 0) { ri = 0; }
+        if (ri >= count) { ri = count - 1; }
+        return ri;
+    }
+
+    /// Map a pointer X to the nearest character boundary within `line`.
+    static int ConsoleColAt(string line, int textX, int fontSize, int mouseX) {
+        int i = 0;
+        while (i < line.Length) {
+            int wa = Canvas.MeasureText(Text.Left(line, i), fontSize);
+            int wb = Canvas.MeasureText(Text.Left(line, i + 1), fontSize);
+            int mid = textX + (wa + wb) / 2;
+            if (mouseX < mid) { return i; }
+            i = i + 1;
+        }
+        return line.Length;
+    }
+
+    /// Extract the selected text spanning (r0,c0)..(r1,c1) as newline-joined text.
+    static string ConsoleSelectionText(List<string> lines,
+            int r0, int c0, int r1, int c1) {
+        if (r0 < 0 || r1 < 0) { return ""; }
+        if (r0 > r1 || (r0 == r1 && c0 > c1)) {
+            int tr = r0; r0 = r1; r1 = tr;
+            int tc = c0; c0 = c1; c1 = tc;
+        }
+        string outp = "";
+        int r = r0;
+        while (r <= r1 && r < lines.Count) {
+            string ln = lines[r];
+            int s = 0;
+            int e = ln.Length;
+            if (r == r0) { s = c0; }
+            if (r == r1) { e = c1; }
+            if (s < 0) { s = 0; }
+            if (e > ln.Length) { e = ln.Length; }
+            if (s > e) { s = e; }
+            outp = outp + ln.Substring(s, e - s);
+            if (r < r1) { outp = outp + "\n"; }
+            r = r + 1;
+        }
+        return outp;
+    }
+}

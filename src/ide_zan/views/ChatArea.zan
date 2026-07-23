@@ -1,0 +1,210 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/// The AI chat transcript view, extracted from the shell: transcript
+/// serialization (ChatPack/ChatUnpack), the wrapped markdown-aware line
+/// cache (ChatBuildLines) and the bottom-anchored transcript renderer.
+class ChatArea {
+    /// Greedily wraps `s` to `maxW` pixels, appending the pieces to `outLines`.
+    static void WrapInto(string s, int maxW, int fontSize, List<string> outLines) {
+        List<string> hard = CodeEditor.SplitLines(s);
+        if (hard.Count == 0) { hard.Add(""); }
+        int li = 0;
+        while (li < hard.Count) {
+            string line = hard[li];
+            if (line == "") { outLines.Add(""); }
+            while (line != "") {
+                if (Canvas.MeasureText(line, fontSize) <= maxW) {
+                    outLines.Add(line);
+                    line = "";
+                } else {
+                    // Binary-search the longest prefix that fits.
+                    int lo = 1;
+                    int hi = line.Length;
+                    while (lo < hi) {
+                        int mid = (lo + hi + 1) / 2;
+                        if (Canvas.MeasureText(line.Substring(0, mid), fontSize) <= maxW) { lo = mid; }
+                        else { hi = mid - 1; }
+                    }
+                    outLines.Add(line.Substring(0, lo));
+                    line = line.Substring(lo, line.Length - lo);
+                }
+            }
+            li = li + 1;
+        }
+    }
+
+    /// Serializes a chat transcript for the session switcher (JSON, so any
+    /// message content round-trips safely).
+    static string ChatPack(List<string> roles, List<string> texts) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"m\": [");
+        int i = 0;
+        while (i < roles.Count) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("{\"r\": \"" + ZanIDE.JsonEsc(roles[i]) + "\", \"t\": \""
+                + ZanIDE.JsonEsc(texts[i]) + "\"}");
+            i = i + 1;
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    static void ChatUnpack(string packed, List<string> roles, List<string> texts) {
+        if (packed == "") { return; }
+        JsonValue v = JsonValue.Parse(packed);
+        if (v == null) { return; }
+        JsonValue ms = v.Get("m");
+        if (ms == null || !ms.IsArray()) { return; }
+        int i = 0;
+        while (i < ms.Count()) {
+            JsonValue m = ms.At(i);
+            roles.Add(m.Str("r", "assistant"));
+            texts.Add(m.Str("t", ""));
+            i = i + 1;
+        }
+    }
+
+    /// Builds the wrapped, markdown-aware line cache for the chat transcript.
+    /// kinds: 0 = normal text, 1 = code (drawn on a code background),
+    /// 2 = heading, 3 = message header row.
+    static void ChatBuildLines(App app, List<string> roles, List<string> texts,
+            int textW, List<string> lines, List<int> colors, List<int> kinds) {
+        Theme t = app.theme;
+        int i = 0;
+        while (i < roles.Count) {
+            string head = "AI";
+            int headCol = t.success;
+            int bodyCol = t.textPrimary;
+            if (roles[i] == "user") {
+                head = ZanIDE.T("You", "我");
+                headCol = t.primary;
+            } else if (roles[i] == "error") {
+                head = ZanIDE.T("Error", "错误");
+                headCol = t.error;
+                bodyCol = t.error;
+            }
+            lines.Add(head);
+            colors.Add(headCol);
+            kinds.Add(3);
+            // Markdown-lite: fenced code blocks get a code background and
+            // color; headings/bullets/inline `code`/**bold** markers are
+            // simplified for readable plain-canvas rendering.
+            List<string> src = CodeEditor.SplitLines(texts[i]);
+            bool inCode = false;
+            int li = 0;
+            while (li < src.Count) {
+                string ln = src[li];
+                bool fence = ln.Length >= 3 && ln.Substring(0, 3) == "```";
+                if (fence) {
+                    inCode = !inCode;
+                } else if (inCode) {
+                    int before = lines.Count;
+                    ChatArea.WrapInto(ln, textW - app.Scale(8), t.fontSizeSmall, lines);
+                    if (lines.Count == before) { lines.Add(""); }
+                    while (colors.Count < lines.Count) { colors.Add(t.info); kinds.Add(1); }
+                } else {
+                    string shown = ChatArea.MdStrip(ln);
+                    int kind = 0;
+                    int col = bodyCol;
+                    if (ln.Length >= 2 && ln.Substring(0, 1) == "#") {
+                        kind = 2;
+                        col = t.textPrimary;
+                    }
+                    int before = lines.Count;
+                    ChatArea.WrapInto(shown, textW, t.fontSizeSmall, lines);
+                    if (lines.Count == before) { lines.Add(""); }
+                    while (colors.Count < lines.Count) { colors.Add(col); kinds.Add(kind); }
+                }
+                li = li + 1;
+            }
+            lines.Add("");
+            colors.Add(bodyCol);
+            kinds.Add(0);
+            i = i + 1;
+        }
+    }
+
+    /// Strips light markdown syntax for plain-text display: heading hashes,
+    /// `**`/`__` bold markers and single backticks; keeps list dashes.
+    static string MdStrip(string ln) {
+        string s = ln;
+        int h = 0;
+        while (h < s.Length && s.Substring(h, 1) == "#") { h = h + 1; }
+        if (h > 0 && h < s.Length && s.Substring(h, 1) == " ") {
+            s = s.Substring(h + 1, s.Length - h - 1);
+        }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "*" && i + 1 < s.Length && s.Substring(i + 1, 1) == "*") { i = i + 2; }
+            else if (ch == "`") { i = i + 1; }
+            else { sb.Append(ch); i = i + 1; }
+        }
+        return sb.ToString();
+    }
+
+    /// Draws the (pre-wrapped, cached) chat transcript bottom-anchored inside
+    /// `area`; code lines get a code-colored background strip. Returns the
+    /// maximum scroll offset.
+    static int RenderChatArea(App app, Rect area, List<string> lines,
+            List<int> colors, List<int> kinds, int scroll, bool busy) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = app.Scale(6);
+        int rowH = app.Scale(18);
+        int extra = 0;
+        if (busy) { extra = 1; }
+        if (lines.Count == 0 && !busy) {
+            c.PushClip(area.x, area.y, area.width, area.height);
+            List<string> hint = new List<string>();
+            ChatArea.WrapInto(ZanIDE.T(
+                "Ask the AI assistant about your project: explain code, find bugs, generate Zan snippets.",
+                "向 AI 助手提问：解释代码、查找问题、生成 Zan 代码片段。"),
+                area.width - pad * 2, t.fontSizeSmall, hint);
+            int hi = 0;
+            while (hi < hint.Count) {
+                c.DrawText(area.x + pad, area.y + pad + hi * rowH, hint[hi],
+                    t.textTertiary, t.fontSizeSmall);
+                hi = hi + 1;
+            }
+            c.PopClip();
+            return 0;
+        }
+        int total = lines.Count + extra;
+        int maxRows = (area.height - pad * 2) / rowH;
+        if (maxRows < 1) { maxRows = 1; }
+        int maxScroll = total - maxRows;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (scroll > maxScroll) { scroll = maxScroll; }
+        if (scroll < 0) { scroll = 0; }
+        int start = total - maxRows - scroll;
+        if (start < 0) { start = 0; }
+        c.PushClip(area.x, area.y, area.width, area.height);
+        int row = 0;
+        int idx = start;
+        int codeBg = App.ScaleAlpha(t.bgTertiary, 160);
+        while (idx < total && row < maxRows) {
+            int ry = area.y + pad + row * rowH;
+            if (idx < lines.Count) {
+                if (kinds[idx] == 1) {
+                    c.FillRect(area.x + pad - app.Scale(2), ry - app.Scale(1),
+                        area.width - pad * 2 + app.Scale(4), rowH, codeBg);
+                    c.DrawText(area.x + pad + app.Scale(4), ry, lines[idx],
+                        colors[idx], t.fontSizeSmall);
+                } else {
+                    c.DrawText(area.x + pad, ry, lines[idx], colors[idx], t.fontSizeSmall);
+                }
+            } else {
+                c.DrawText(area.x + pad, ry, ZanIDE.T("AI is thinking...", "AI 思考中..."),
+                    t.textTertiary, t.fontSizeSmall);
+            }
+            idx = idx + 1;
+            row = row + 1;
+        }
+        c.PopClip();
+        return maxScroll;
+    }
+}
