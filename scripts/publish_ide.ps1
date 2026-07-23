@@ -1,17 +1,20 @@
 # publish_ide.ps1 -- Assemble a self-contained, redistributable Zan IDE into
-# the canonical release directory  d:\project\zan-lang\dist .
+# the per-platform release directory  dist\win-x64  (other platforms get their
+# own dist\<platform> when their builds exist, e.g. dist\linux-x64).
 #
 # The published tree is intentionally minimal: only the files an end user needs
 # to run the IDE and compile/run Zan programs. Nothing else should be dropped
 # into dist -- treat it as the single, clean release output.
 #
-# The final shipped output is a SINGLE FILE: dist\ZanIDE.exe, a self-extracting
-# launcher (scripts\pkg_stub.c) carrying the whole staged tree below as a zip
-# payload; on first run it extracts to %LOCALAPPDATA%\ZanGames\ZanIDE\ and
-# starts the real IDE from there. The staged tree is:
+# ZanIDE.exe in the release is a self-extracting wrapper (scripts\pkg_stub.c)
+# carrying only the real IDE exe + SDL3.dll as its zip payload: no loose
+# SDL3.dll ships, everything else stays as normal folders next to the exe. On
+# first run the wrapper extracts to %LOCALAPPDATA%\ZanGames\ZanIDE\, exports
+# ZAN_APP_DIR=<wrapper's folder> and starts the real IDE, which resolves
+# toolchain\ / stdlib\ / examples\ / templates\ / tools\ via ZAN_APP_DIR.
 #
-#   dist\ (staging, replaced by the single exe at the end)
-#     ZanIDE.exe           the IDE
+#   dist\win-x64\
+#     ZanIDE.exe           self-extracting wrapper (real IDE + SDL3.dll inside)
 #     toolchain\          the Zan compiler + its self-contained linker bundle:
 #                           zanc.exe, ld.exe, mingw\, linux-musl\ ...
 #                         (the IDE finds zanc here; zanc finds its linker next
@@ -35,7 +38,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$dist = Join-Path $root 'dist'
+$dist = Join-Path $root 'dist\win-x64'
 
 if (-not $SkipBuild) {
     Write-Output "[1/4] Building the IDE (scripts\build_ide.ps1) ..."
@@ -55,6 +58,7 @@ foreach ($p in @($ideExe, $zancExe, $stdlib)) {
 # ---- clean + recreate dist (release output only) ----
 Write-Output "[2/4] Preparing clean dist directory: $dist"
 if (Test-Path $dist) {
+    # (dist\ itself may hold other platform folders; only win-x64 is rebuilt)
     try { Remove-Item $dist -Recurse -Force -ErrorAction Stop }
     catch {
         # The dist folder itself is held by another process (e.g. an Explorer
@@ -64,7 +68,7 @@ if (Test-Path $dist) {
         Get-ChildItem -Path $dist -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist | Out-Null }
+if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist -Force | Out-Null }
 
 # ---- copy the toolchain ----
 Write-Output "[3/4] Copying IDE + compiler + stdlib ..."
@@ -185,8 +189,9 @@ Zan IDE - self-contained release
 ================================
 
 Contents
-  ZanIDE.exe     The Zan IDE.
-  SDL3.dll       SDL3 runtime the IDE window uses; keep it next to ZanIDE.exe.
+  ZanIDE.exe     The Zan IDE, as a self-extracting single exe: the real IDE
+                 and the SDL3 runtime it needs are embedded and unpacked to a
+                 per-user cache on first launch -- no loose SDL3.dll here.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
                    zan-lsp.exe             language server (for external editors)
@@ -220,21 +225,20 @@ Run
   needs to build and run Zan programs ships in this folder.
 
 Note
-  This folder is extracted on first launch by the single-file ZanIDE.exe
-  (built by scripts\publish_ide.ps1). Do not hand-edit it -- it is refreshed
-  whenever a new single-file build ships a different payload.
+  This folder is produced by scripts\publish_ide.ps1. Do not hand-edit or
+  drop unrelated files here -- re-run the publish script to refresh it.
 "@
 Set-Content -Path (Join-Path $dist 'README.txt') -Value $readme -Encoding UTF8
 
 $n = (Get-ChildItem $dist -Recurse -File | Measure-Object).Count
 Write-Output "STAGE_OK -> $dist ($n files)"
 
-# ---- pack everything into ONE self-extracting ZanIDE.exe -------------------
-# Same mechanism as package_games.ps1: a tiny launcher stub (pkg_stub.c) with
-# the whole staged tree appended as a zip payload. On first run the stub
-# extracts to %LOCALAPPDATA%\ZanGames\ZanIDE\ and starts ZanIDE.exe there, so
-# the shipped dist is a single file with no siblings.
-Write-Output "[5/5] Packing single-file ZanIDE.exe ..."
+# ---- embed SDL3.dll into ZanIDE.exe via the self-extract wrapper -----------
+# Same mechanism as package_games.ps1, but the payload is ONLY the real IDE
+# exe + SDL3.dll. The wrapper extracts them to %LOCALAPPDATA%\ZanGames\ZanIDE\
+# and starts the IDE with ZAN_APP_DIR pointing back at this folder, so the
+# sibling toolchain\/stdlib\/... resolve normally and no SDL3.dll ships loose.
+Write-Output "[5/5] Wrapping ZanIDE.exe (embedding SDL3.dll) ..."
 $gcc = 'C:\TDM-GCC-64\bin\gcc.exe'
 if (-not (Test-Path $gcc)) {
     $cc = Get-Command gcc -ErrorAction SilentlyContinue
@@ -251,15 +255,22 @@ if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_FAILED: launcher stub build fai
 Copy-Item $stub (Join-Path $distTc 'pkg_stub.exe') -Force
 Copy-Item (Join-Path $root 'scripts\pack_single.ps1') (Join-Path $distTc 'pack_single.ps1') -Force
 
+$packStage = Join-Path $b 'ide_pack'
+if (Test-Path $packStage) { Remove-Item $packStage -Recurse -Force }
+New-Item -ItemType Directory -Path $packStage | Out-Null
+Copy-Item (Join-Path $dist 'ZanIDE.exe') (Join-Path $packStage 'ZanIDE.exe')
+Copy-Item (Join-Path $dist 'SDL3.dll') (Join-Path $packStage 'SDL3.dll')
+
 $single = Join-Path $b 'ZanIDE_single.exe'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\pack_single.ps1') `
-    -Stage $dist -Stub $stub -Out $single -Icon (Join-Path $root 'assets\zan.ico')
+    -Stage $packStage -Stub $stub -Out $single -Icon (Join-Path $root 'assets\zan.ico')
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $single)) {
-    Write-Output "PUBLISH_FAILED: single-file packing failed"; exit 1
+    Write-Output "PUBLISH_FAILED: wrapper packing failed"; exit 1
 }
 
-# The shipped dist is exactly one file: the self-extracting IDE.
-Get-ChildItem -Path $dist -Force | Remove-Item -Recurse -Force
+# Replace the loose exe + dll with the wrapper; everything else stays as-is.
+Remove-Item (Join-Path $dist 'ZanIDE.exe') -Force
+Remove-Item (Join-Path $dist 'SDL3.dll') -Force
 Move-Item $single (Join-Path $dist 'ZanIDE.exe') -Force
 $sz = (Get-Item (Join-Path $dist 'ZanIDE.exe')).Length
-Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (single file, $sz bytes)"
+Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (SDL3 embedded, $sz bytes)"

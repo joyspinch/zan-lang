@@ -99,6 +99,15 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     }
     fclose(f);
 
+    /* tell the launched program where the launcher lives: apps that ship
+     * sibling folders next to the launcher (e.g. the IDE's toolchain\,
+     * stdlib\ ...) resolve them via ZAN_APP_DIR instead of the cache dir */
+    char selfdir[MAX_PATH];
+    lstrcpynA(selfdir, self, MAX_PATH);
+    char *sl = strrchr(selfdir, '\\');
+    if (sl) *sl = 0;
+    SetEnvironmentVariableA("ZAN_APP_DIR", selfdir);
+
     /* launch the real program with the extraction dir as cwd: game.exe when
      * present (game packages), otherwise <stub-basename>.exe (app packages) */
     char game[MAX_PATH];
