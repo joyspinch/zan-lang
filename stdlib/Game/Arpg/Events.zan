@@ -235,26 +235,37 @@ class ArpgGameplayEvents {
     }
 }
 
+// One scheduled timer: name, payload, fire interval, accumulated time, a
+// one-shot flag and the callback. One entity instead of six parallel lists.
+class ArpgTimerTask {
+    string name;
+    string payload;
+    int interval;
+    int elapsed;
+    bool oneShot;
+    ArpgTimedEvent handler;
+
+    ArpgTimerTask(string name, string payload, int interval, bool oneShot,
+                  ArpgTimedEvent handler) {
+        this.name = name;
+        this.payload = payload;
+        this.interval = interval;
+        this.elapsed = 0;
+        this.oneShot = oneShot;
+        this.handler = handler;
+    }
+}
+
 /// <summary>
 /// Named one-shot and repeating events matching the documented "join event"
 /// behavior. Payload is deliberately serialized so the scheduler stays typed.
 /// </summary>
 class ArpgScheduler {
-    List<string> names;
-    List<string> payloads;
-    List<int> intervals;
-    List<int> elapsed;
-    List<bool> oneShot;
-    List<ArpgTimedEvent> handlers;
+    List<ArpgTimerTask> tasks;
 
     static ArpgScheduler Create() {
         ArpgScheduler scheduler = new ArpgScheduler();
-        scheduler.names = new List<string>();
-        scheduler.payloads = new List<string>();
-        scheduler.intervals = new List<int>();
-        scheduler.elapsed = new List<int>();
-        scheduler.oneShot = new List<bool>();
-        scheduler.handlers = new List<ArpgTimedEvent>();
+        scheduler.tasks = new List<ArpgTimerTask>();
         return scheduler;
     }
 
@@ -266,25 +277,16 @@ class ArpgScheduler {
         ArpgTimedEvent handler
     ) {
         this.Remove(name);
-        this.names.Add(name);
-        this.payloads.Add(payload);
-        this.intervals.Add(ArpgMath.Max(1, delayMilliseconds));
-        this.elapsed.Add(0);
-        this.oneShot.Add(autoRemove);
-        this.handlers.Add(handler);
+        this.tasks.Add(new ArpgTimerTask(name, payload,
+            ArpgMath.Max(1, delayMilliseconds), autoRemove, handler));
     }
 
     bool Remove(string name) {
-        int i = this.names.Count - 1;
+        int i = this.tasks.Count - 1;
         bool removed = false;
         while (i >= 0) {
-            if (this.names[i] == name) {
-                this.names.RemoveAt(i);
-                this.payloads.RemoveAt(i);
-                this.intervals.RemoveAt(i);
-                this.elapsed.RemoveAt(i);
-                this.oneShot.RemoveAt(i);
-                this.handlers.RemoveAt(i);
+            if (this.tasks[i].name == name) {
+                this.tasks.RemoveAt(i);
                 removed = true;
             }
             i = i - 1;
@@ -296,12 +298,12 @@ class ArpgScheduler {
         return this.IndexOf(name) >= 0;
     }
 
-    int Count() { return this.names.Count; }
+    int Count() { return this.tasks.Count; }
 
     int IndexOf(string name) {
         int i = 0;
-        while (i < this.names.Count) {
-            if (this.names[i] == name) { return i; }
+        while (i < this.tasks.Count) {
+            if (this.tasks[i].name == name) { return i; }
             i = i + 1;
         }
         return -1;
@@ -311,8 +313,8 @@ class ArpgScheduler {
         if (deltaMilliseconds <= 0) { return 0; }
         List<string> pending = new List<string>();
         int i = 0;
-        while (i < this.names.Count) {
-            pending.Add(this.names[i]);
+        while (i < this.tasks.Count) {
+            pending.Add(this.tasks[i].name);
             i = i + 1;
         }
 
@@ -322,12 +324,13 @@ class ArpgScheduler {
             string eventName = pending[i];
             int eventIndex = this.IndexOf(eventName);
             if (eventIndex >= 0) {
-                int total = this.elapsed[eventIndex] + deltaMilliseconds;
-                this.elapsed[eventIndex] = total;
-                int interval = this.intervals[eventIndex];
-                bool autoRemove = this.oneShot[eventIndex];
-                string payload = this.payloads[eventIndex];
-                ArpgTimedEvent handler = this.handlers[eventIndex];
+                ArpgTimerTask task = this.tasks[eventIndex];
+                int total = task.elapsed + deltaMilliseconds;
+                task.elapsed = total;
+                int interval = task.interval;
+                bool autoRemove = task.oneShot;
+                string payload = task.payload;
+                ArpgTimedEvent handler = task.handler;
                 if (total < interval) {
                     i = i + 1;
                     continue;
@@ -339,16 +342,11 @@ class ArpgScheduler {
 
                 // A callback may remove or replace its own event.
                 eventIndex = this.IndexOf(eventName);
-                if (eventIndex >= 0 && this.handlers[eventIndex] == handler) {
+                if (eventIndex >= 0 && this.tasks[eventIndex].handler == handler) {
                     if (autoRemove) {
-                        this.names.RemoveAt(eventIndex);
-                        this.payloads.RemoveAt(eventIndex);
-                        this.intervals.RemoveAt(eventIndex);
-                        this.elapsed.RemoveAt(eventIndex);
-                        this.oneShot.RemoveAt(eventIndex);
-                        this.handlers.RemoveAt(eventIndex);
+                        this.tasks.RemoveAt(eventIndex);
                     } else {
-                        this.elapsed[eventIndex] = total - interval;
+                        this.tasks[eventIndex].elapsed = total - interval;
                     }
                 }
             }
