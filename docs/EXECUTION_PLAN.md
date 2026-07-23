@@ -1,0 +1,55 @@
+# zan-lang 综合执行计划（2026-07-23）
+
+> 本计划整合三类问题：(A) ZanIDE 生产可用差距（承接 `docs/PRODUCTION_PLAN.md`，
+> 此处不重复其表格，只排序引用）；(B) C# 语法/LINQ 友好度差距；(C) 仓库
+> 工作流问题（分支管理）。按优先级 P0 → P2 执行，每项含验收标准。
+
+---
+
+## Workstream A：ZanIDE 生产可用（引用 PRODUCTION_PLAN.md）
+
+执行顺序保持 PRODUCTION_PLAN.md 的建议不变：
+
+1. **P0 硬伤**（阶段 1）：
+   - A1 修复 O0 codegen bug（`docs/bugs/O0-list-index-write-stack-leak.md`）。
+   - A2 stdlib 错误模型统一：File/Net/Json 失败 throw 标准异常，不再静默返回空。
+   - A3 IDE 长时运行泄漏验证（`--check-leaks` 2h+ 零净增长）。
+2. **P1 编辑体验 + 质量保障**（阶段 2.1–2.3、4.1–4.2）：LSP rename、
+   workspace/symbol、IDE 接入 zanfmt、IDE golden-path UI 测试、发布包冒烟测试。
+3. **P1 产品化**（阶段 3）：代码签名 → 自动更新 → 崩溃上报 → 包商店。
+4. **P1 收尾**（阶段 2.4–2.5、4.3）：增量文档同步/大文件、崩溃恢复、Regex。
+5. **P2 跨平台**（阶段 5）：Linux/macOS 自包含工具链与 IDE 发布。
+
+## Workstream B：LINQ / C# 语法友好度
+
+背景：现 `System.Linq.Enumerable` 是对 `List<T>` 的急切求值实现，与 C# 手感
+差异集中在：排序只支持 int 键、First/Last 返回默认值不抛异常、缺常用算子、
+无查询语法、yield 急切降级为 List。
+
+| # | 事项 | 优先级 | 验收标准 |
+|---|------|--------|----------|
+| B1 | `OrderBy/OrderByDescending` 支持泛型可比较键（string/double/long），新增 `ThenBy/ThenByDescending` | P0 | conformance 用例：按 string 与 double 键排序、二级排序稳定 |
+| B2 | 补齐核心算子：`GroupBy`、`SelectMany`、`ToDictionary`、`Single/SingleOrDefault`、`Sum/Min/Max/Average(selector)`、`LastOrDefault` | P0 | 每个算子含 conformance 用例，语义对齐 C# |
+| B3 | 异常语义对齐 C#：空序列 `First/Last/Single` 抛 `InvalidOperationException`；保留 `*OrDefault` 返回默认值 | P0 | 异常路径 conformance 用例（依赖 A2 的异常约定） |
+| B4 | `Contains/Distinct/In` 对引用类型支持 `Equals` 语义（当前仅 `==`） | P1 | 自定义类型去重/包含用例通过 |
+| B5 | 文档：`docs/STDLIB.md` 增补 LINQ 章节，明确与 C# 的差异清单（急切求值、无 IEnumerable） | P1 | 文档与实现一致 |
+| B6 | 惰性迭代器：`yield` 生成真正的惰性迭代器，LINQ 算子基于 IEnumerable 惰性链 | P2 | 无限序列 + Take 用例通过；现有急切用例不回归 |
+| B7 | LINQ 查询语法（`from … where … select`）脱糖为方法链 | P2 | parser/binder 支持，conformance 覆盖 join/group |
+| B8 | 语言便利特性（按需）：`using` 声明、`init`/`with`、`checked` | P2 | 逐项 SPEC + conformance |
+
+> B1–B3 收益最大、改动集中在 stdlib，一周期内可完成；B6/B7 涉及编译器，
+> 放在 A 的 P0/P1 之后。
+
+## Workstream C：仓库工作流
+
+| # | 事项 | 优先级 | 验收标准 |
+|---|------|--------|----------|
+| C1 | 分支管理规则落地：禁止创建长期分支，所有提交直接进 main；规则写入 AGENTS.md 硬规则 | P0（已完成） | AGENTS.md 含该规则；仓库仅存 main |
+| C2 | 每次会话结束核查：`git branch -a` 只有 main、`git status` 无未收尾文件 | 持续 | 会话收尾清单 |
+
+---
+
+## 建议总执行顺序
+
+1. C1（已完成）→ 2. A1–A3（P0 硬伤，B3 依赖 A2）→ 3. B1–B3（LINQ 核心补齐）
+→ 4. A 的 P1 各项 + B4–B5 → 5. A 的 P2 与 B6–B8。

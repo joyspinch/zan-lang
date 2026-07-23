@@ -50,6 +50,9 @@ short, enforceable summary.
 7. **Every task ends clean.** Run `git status` before finishing; there should
    be no stray untracked files. Review `git diff --stat` and commit only what
    the task requires. Never `git add .` / `git add -A` blindly.
+8. **Never create branches.** Do NOT create local or remote branches; commit
+   directly to `main` and push. Delete any stray branch you find after making
+   sure its commits are merged into `main`.
 
 ## Build / dev quickstart
 
