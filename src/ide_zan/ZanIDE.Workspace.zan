@@ -1010,6 +1010,32 @@ partial class ZanIDE {
     static string PubLogPath() { return ZanIDE.UserConfigDir() + "/publish.log"; }
     static string PubDonePath() { return ZanIDE.UserConfigDir() + "/publish_done.txt"; }
 
+    /// True when the shipped single-file packer is available: the self-extract
+    /// launcher stub plus the pack script, both living in toolchain\ (put there
+    /// by scripts/publish_ide.ps1). With them, Windows publishes become ONE exe
+    /// carrying its resources; without them (e.g. a dev build tree) the publish
+    /// falls back to a plain exe + loose assets.
+    static bool CanPackSingle() {
+        return File.Exists(ZanIDE.ToolchainDir() + "/pkg_stub.exe")
+            && File.Exists(ZanIDE.ToolchainDir() + "/pack_single.ps1");
+    }
+
+    /// Fresh (emptied and recreated) staging directory for single-file packing.
+    static string ResetStage(string dir) {
+        if (Directory.Exists(dir)) { AssetManager.deleteTree(dir); }
+        Directory.CreateDirectoryRecursive(dir);
+        return dir;
+    }
+
+    /// The packer invocation appended after a Windows publish compile: wraps
+    /// the staged exe + resources into one self-extracting exe at `outExe`.
+    static string PackCmd(string root, string stage, string outExe) {
+        return "powershell -NoProfile -ExecutionPolicy Bypass -File \""
+            + ZanIDE.ToolchainDir() + "/pack_single.ps1\""
+            + " -Stage \"" + stage + "\" -Stub \"" + ZanIDE.ToolchainDir() + "/pkg_stub.exe\""
+            + " -Out \"" + outExe + "\" -Icon \"" + ZanIDE.AssetsDir(root) + "/app.ico\"";
+    }
+
     /// Starts publishing the selected targets in a DETACHED shell so the UI
     /// stays responsive while the (possibly slow) compiles run: compiler
     /// output streams into PubLogPath and PubDonePath marks completion (the
@@ -1035,11 +1061,23 @@ partial class ZanIDE {
         string sep = " ; ";
         #endif
         string seq = "";
+        bool pack = ZanIDE.CanPackSingle();
         if (sel.Count > 0 && sel[0] == 1) {
             string exe = root + "/publish/" + baseName + "-windows-x64.exe";
             string ll = bd + "/.zanpub_x64.ll";
             if (seq != "") { seq = seq + sep; }
-            seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, true) + ")";
+            if (pack) {
+                // Compile into a staging dir (zanc drops any driver DLLs next
+                // to the exe there), add the project resources, then wrap the
+                // whole stage into one self-extracting publish/<name>.exe.
+                string stage = ZanIDE.ResetStage(bd + "/pub_win_x64");
+                string sexe = stage + "/" + baseName + "-windows-x64.exe";
+                ZanIDE.CopyResources(root, stage, log);
+                seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, sexe, true)
+                    + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
+            } else {
+                seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, true) + ")";
+            }
             exes.Add(exe);
             log.Add("> Publishing windows-x64 ...");
         }
@@ -1047,8 +1085,17 @@ partial class ZanIDE {
             string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
             string ll = bd + "/.zanpub_arm64.ll";
             if (seq != "") { seq = seq + sep; }
+            string armExe = exe;
+            string armStage = "";
+            if (pack) {
+                armStage = ZanIDE.ResetStage(bd + "/pub_win_arm64");
+                armExe = armStage + "/" + baseName + "-windows-arm64.exe";
+                ZanIDE.CopyResources(root, armStage, log);
+            }
             seq = seq + "(" + zc + " --emit-ir " + inputs + " > \"" + ll + "\""
-                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + exe + "\"" + ZanIDE.GuiLinkArgs(root, p) + ")";
+                + " && clang --target=aarch64-pc-windows-msvc \"" + ll + "\" -o \"" + armExe + "\"" + ZanIDE.GuiLinkArgs(root, p);
+            if (pack) { seq = seq + " && " + ZanIDE.PackCmd(root, armStage, exe); }
+            seq = seq + ")";
             exes.Add(exe);
             log.Add("> Publishing windows-arm64 (requires ARM64 toolchain) ...");
         }

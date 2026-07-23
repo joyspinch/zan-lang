@@ -99,13 +99,16 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     }
     fclose(f);
 
-    /* launch the real game with the extraction dir as cwd */
+    /* launch the real program with the extraction dir as cwd: game.exe when
+     * present (game packages), otherwise <stub-basename>.exe (app packages) */
     char game[MAX_PATH];
     snprintf(game, MAX_PATH, "%s\\game.exe", dir);
+    if (GetFileAttributesA(game) == INVALID_FILE_ATTRIBUTES)
+        snprintf(game, MAX_PATH, "%s\\%s.exe", dir, base);
     STARTUPINFOA si; PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
     if (!CreateProcessA(game, NULL, NULL, NULL, FALSE, 0, NULL, dir, &si, &pi))
-        die("failed to start game");
+        die("failed to start program");
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return 0;
 }

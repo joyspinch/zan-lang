@@ -5,7 +5,12 @@
 # to run the IDE and compile/run Zan programs. Nothing else should be dropped
 # into dist -- treat it as the single, clean release output.
 #
-#   dist\
+# The final shipped output is a SINGLE FILE: dist\ZanIDE.exe, a self-extracting
+# launcher (scripts\pkg_stub.c) carrying the whole staged tree below as a zip
+# payload; on first run it extracts to %LOCALAPPDATA%\ZanGames\ZanIDE\ and
+# starts the real IDE from there. The staged tree is:
+#
+#   dist\ (staging, replaced by the single exe at the end)
 #     ZanIDE.exe           the IDE
 #     toolchain\          the Zan compiler + its self-contained linker bundle:
 #                           zanc.exe, ld.exe, mingw\, linux-musl\ ...
@@ -163,6 +168,16 @@ if (Test-Path $templates) {
     Write-Output "PUBLISH_WARN: templates\ missing; New Project will use the built-in fallback set"
 }
 
+# ---- copy the shipped IDE tools (Tools panel; run on double-click) ----
+# The IDE scans <ExeDir>\tools for .zan tools, so this folder must travel
+# next to ZanIDE.exe in the published tree.
+$toolsDir = Join-Path $root 'tools'
+if (Test-Path $toolsDir) {
+    Copy-Item $toolsDir (Join-Path $dist 'tools') -Recurse
+} else {
+    Write-Output "PUBLISH_WARN: tools\ missing; the Tools panel will be empty"
+}
+
 # ---- release readme ----
 Write-Output "[4/4] Writing README.txt ..."
 $readme = @"
@@ -191,6 +206,9 @@ Contents
   templates\     Built-in New Project templates (one folder each, with a
                  template.manifest). Edit or drop in your own folders to add
                  templates -- no rebuild needed.
+  tools\         Zan tools shown in the IDE's Tools panel. Double-click a tool
+                 to run it; right-click to open its source in the editor.
+                 Drop your own .zan tools here -- no rebuild needed.
 
 Requirement
   None for normal use: zanc links via the bundled toolchain\ folder, so no
@@ -202,10 +220,46 @@ Run
   needs to build and run Zan programs ships in this folder.
 
 Note
-  This directory is produced by scripts\publish_ide.ps1. Do not hand-edit or
-  drop unrelated files here -- re-run the publish script to refresh it.
+  This folder is extracted on first launch by the single-file ZanIDE.exe
+  (built by scripts\publish_ide.ps1). Do not hand-edit it -- it is refreshed
+  whenever a new single-file build ships a different payload.
 "@
 Set-Content -Path (Join-Path $dist 'README.txt') -Value $readme -Encoding UTF8
 
 $n = (Get-ChildItem $dist -Recurse -File | Measure-Object).Count
-Write-Output "PUBLISH_OK -> $dist ($n files)"
+Write-Output "STAGE_OK -> $dist ($n files)"
+
+# ---- pack everything into ONE self-extracting ZanIDE.exe -------------------
+# Same mechanism as package_games.ps1: a tiny launcher stub (pkg_stub.c) with
+# the whole staged tree appended as a zip payload. On first run the stub
+# extracts to %LOCALAPPDATA%\ZanGames\ZanIDE\ and starts ZanIDE.exe there, so
+# the shipped dist is a single file with no siblings.
+Write-Output "[5/5] Packing single-file ZanIDE.exe ..."
+$gcc = 'C:\TDM-GCC-64\bin\gcc.exe'
+if (-not (Test-Path $gcc)) {
+    $cc = Get-Command gcc -ErrorAction SilentlyContinue
+    if ($cc) { $gcc = $cc.Source }
+    else { Write-Output "PUBLISH_FAILED: gcc not found (needed for the launcher stub)"; exit 1 }
+}
+$stub = Join-Path $b 'pkg_stub.exe'
+& $gcc -O2 -mwindows (Join-Path $root 'scripts\pkg_stub.c') -o $stub
+if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_FAILED: launcher stub build failed"; exit 1 }
+
+# Ship the packer into the payload's toolchain so the published IDE can wrap
+# user programs into single-file exes too (its Publish flow calls
+# toolchain\pack_single.ps1 with toolchain\pkg_stub.exe).
+Copy-Item $stub (Join-Path $distTc 'pkg_stub.exe') -Force
+Copy-Item (Join-Path $root 'scripts\pack_single.ps1') (Join-Path $distTc 'pack_single.ps1') -Force
+
+$single = Join-Path $b 'ZanIDE_single.exe'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\pack_single.ps1') `
+    -Stage $dist -Stub $stub -Out $single -Icon (Join-Path $root 'assets\zan.ico')
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $single)) {
+    Write-Output "PUBLISH_FAILED: single-file packing failed"; exit 1
+}
+
+# The shipped dist is exactly one file: the self-extracting IDE.
+Get-ChildItem -Path $dist -Force | Remove-Item -Recurse -Force
+Move-Item $single (Join-Path $dist 'ZanIDE.exe') -Force
+$sz = (Get-Item (Join-Path $dist 'ZanIDE.exe')).Length
+Write-Output "PUBLISH_OK -> $dist\ZanIDE.exe (single file, $sz bytes)"
