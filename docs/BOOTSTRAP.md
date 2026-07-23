@@ -134,9 +134,17 @@ automatically when clang is absent (`tests/run_fixedpoint.cmake`).
   the language than the subset its own sources are written in — including
   classes with inheritance and virtual dispatch, interfaces, `List<T>`/
   `Dictionary<K,V>`, `foreach`, `try`/`catch`/`throw`, lambdas, properties,
-  operator overloading, and type-checked overload resolution. `async`/`await`,
-  full pattern matching and string interpolation are the main gaps versus
-  `docs/SPEC.md`.
+  operator overloading, type-checked overload resolution, `async`/`await`
+  CPS lowering, `yield`, and LINQ query syntax. Remaining gaps versus
+  `docs/SPEC.md` / the C host: full pattern matching, string interpolation,
+  and exception handling refinements — a single catch clause per try (no
+  type-based dispatch or rethrow-to-outer), and ARC edge cases the C host
+  now covers (a throw escaping a catch handler releases the caught object
+  via the EH temp stack; async CPS frames skipped by an exception unwind are
+  released via `__zan_async_unwind`). The basic caught-exception release is
+  present in both compilers: the C host transfers an in-flight +1 to the
+  handler, the selfhost releases the exception through the catch-variable
+  local on normal handler exit.
 - **Diagnostics** are basic (limited positions, no recovery).
 - **No optimization**: the emitted IR is naive.
 

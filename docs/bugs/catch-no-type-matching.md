@@ -41,7 +41,7 @@ with a standardized message prefix ("IOException: ...").
 
 ## Status
 
-Open.
+Fixed (see Resolution below; re-verified 2026-07-23 against build/zanc).
 
 
 ## Resolution (2026-07)

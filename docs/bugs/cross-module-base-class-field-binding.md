@@ -47,7 +47,7 @@ message — blocks a typed error model for the stdlib (PRODUCTION_PLAN.md 1.2).
 
 ## Status
 
-Open.
+Fixed (see Resolution below; re-verified 2026-07-23 against build/zanc).
 
 
 ## Resolution (2026-07)
