@@ -178,7 +178,13 @@ static bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loc
         /* Indexing a List<string>/string[] yields a borrowed string element.
          * Recognising it keeps `a + list[i]` from releasing the element (which
          * is still owned by the container). */
-        zan_type_t *et = container_elem_type(infer_expr_type(g, e->index.object, locals));
+        zan_type_t *ot = infer_expr_type(g, e->index.object, locals);
+        zan_type_t *et;
+        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0 &&
+            ot->type_arg_count == 2)
+            et = ot->type_args[1];   /* dict[key] yields the VALUE type */
+        else
+            et = container_elem_type(ot);
         return et && et->kind == TYPE_STRING;
     }
     case AST_BINARY:
@@ -227,12 +233,186 @@ static zan_type_t *dict_value_type(zan_type_t *t) {
     return t->type_args[1];
 }
 
+/* forward decls into irgen_expr.c (same translation unit, included later) */
+static bool type_mentions_tp(zan_type_t *t);
+static zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
+                                        int idx, zan_ast_node_t *call,
+                                        zan_ast_node_t *recv_expr,
+                                        local_scope_t *locals);
+
+/* Structural equality of two fully concrete types (no type parameters). */
+static bool types_concrete_equal(zan_type_t *a, zan_type_t *b) {
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if ((a->kind == TYPE_CLASS || a->kind == TYPE_STRUCT ||
+         a->kind == TYPE_INTERFACE || a->kind == TYPE_ENUM) &&
+        a->sym != b->sym)
+        return false;
+    if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE)
+        return types_concrete_equal(a->element_type, b->element_type);
+    if (a->type_arg_count != b->type_arg_count) return false;
+    for (int i = 0; i < a->type_arg_count; i++)
+        if (!types_concrete_equal(a->type_args[i], b->type_args[i]))
+            return false;
+    return true;
+}
+
+/* Coarse type family used to rank overload candidates: 0 = unknown (never
+ * ranked against), then bool / integral / floating / string / reference. */
+enum { FAM_UNKNOWN = 0, FAM_BOOL, FAM_INT, FAM_FLOAT, FAM_STRING, FAM_REF };
+
+static int type_family(zan_type_t *t) {
+    if (!t) return FAM_UNKNOWN;
+    switch (t->kind) {
+    case TYPE_BOOL: return FAM_BOOL;
+    case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG:
+    case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT: case TYPE_ULONG:
+    case TYPE_CHAR: case TYPE_ENUM:
+        return FAM_INT;
+    case TYPE_FLOAT: case TYPE_DOUBLE: return FAM_FLOAT;
+    case TYPE_STRING: return FAM_STRING;
+    case TYPE_CLASS: case TYPE_INTERFACE: case TYPE_ARRAY: return FAM_REF;
+    default: return FAM_UNKNOWN;
+    }
+}
+
+/* Type family of an expression, recognising the comparison/logical/arithmetic
+ * shapes infer_expr_type leaves untyped (a lambda body like `u.age >= 18` or
+ * `x * 2` still ranks against a delegate's declared return type). */
+static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    if (!e) return FAM_UNKNOWN;
+    switch (e->kind) {
+    case AST_INT_LITERAL: case AST_CHAR_LITERAL: return FAM_INT;
+    case AST_FLOAT_LITERAL: return FAM_FLOAT;
+    case AST_STRING_LITERAL: case AST_STRING_INTERP: return FAM_STRING;
+    case AST_BOOL_LITERAL: return FAM_BOOL;
+    case AST_UNARY:
+        if (e->unary.op == TK_BANG) return FAM_BOOL;
+        return expr_family(g, e->unary.operand, locals);
+    case AST_CONDITIONAL: {
+        int tf = expr_family(g, e->conditional.then_expr, locals);
+        if (tf != FAM_UNKNOWN) return tf;
+        return expr_family(g, e->conditional.else_expr, locals);
+    }
+    case AST_BINARY:
+        switch (e->binary.op) {
+        case TK_EQ_EQ: case TK_BANG_EQ: case TK_LESS: case TK_GREATER:
+        case TK_LESS_EQ: case TK_GREATER_EQ: case TK_AMP_AMP: case TK_PIPE_PIPE:
+            return FAM_BOOL;
+        case TK_PLUS: case TK_MINUS: case TK_STAR: case TK_SLASH:
+        case TK_PERCENT: {
+            int lf = expr_family(g, e->binary.left, locals);
+            int rf = expr_family(g, e->binary.right, locals);
+            if (lf == FAM_STRING || rf == FAM_STRING) return FAM_STRING;
+            if (lf == FAM_FLOAT || rf == FAM_FLOAT) return FAM_FLOAT;
+            if (lf != FAM_UNKNOWN) return lf;
+            return rf;
+        }
+        default:
+            return FAM_UNKNOWN;
+        }
+    default:
+        return type_family(infer_expr_type(g, e, locals));
+    }
+}
+
+/* Rank the arguments of one candidate against the call: -1 = incompatible,
+ * otherwise a score raised by each argument whose type agrees with the
+ * candidate's declared parameter type. `p0` is the parameter index that call
+ * argument 0 binds to (1 for extension-style invocation, 0 for direct calls).
+ * Lambdas rank by their body's type family against the delegate's declared
+ * return type; other arguments rank by structural / family agreement with a
+ * concrete (non-generic) parameter type. */
+static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
+                             zan_ast_node_t *call, zan_ast_node_t *recv_expr,
+                             local_scope_t *locals, int p0) {
+    zan_ast_list_t *ps = &m->decl->method_decl.params;
+    int score = 0;
+    if (!call || call->kind != AST_CALL || !locals) return score;
+    for (int j = p0; j < ps->count; j++) {
+        int ai = j - p0;
+        if (ai >= call->call.args.count) break;
+        zan_ast_node_t *a = call->call.args.items[ai];
+        if (!a) continue;
+        if (a->kind == AST_LAMBDA) {
+            zan_type_t *dp = method_param_type_at(g, m, j, call, recv_expr, locals);
+            if (!dp || dp->kind != TYPE_DELEGATE) continue;
+            if (a->lambda.params.count != dp->delegate_param_count) return -1;
+            zan_ast_node_t *body = a->lambda.body;
+            if (!body || body->kind == AST_BLOCK) continue;
+            int mark = locals->count;
+            for (int k = 0; k < a->lambda.params.count; k++) {
+                zan_ast_node_t *lp = a->lambda.params.items[k];
+                zan_type_t *lpt = lp->param.type
+                    ? zan_binder_resolve_type(g->binder, lp->param.type)
+                    : dp->delegate_param_types[k];
+                local_add(locals, lp->param.name, NULL, lpt);
+            }
+            int bf = expr_family(g, body, locals);
+            locals->count = mark;
+            int df = type_family(dp->delegate_ret_type);
+            if (bf != FAM_UNKNOWN && df != FAM_UNKNOWN) {
+                if (bf == df) score += 2;
+                else return -1;
+            }
+            continue;
+        }
+        zan_type_t *pt = zan_binder_resolve_type(g->binder, ps->items[j]->param.type);
+        if (!pt || type_mentions_tp(pt)) continue;
+        zan_type_t *at = infer_expr_type(g, a, locals);
+        if (at && !type_mentions_tp(at)) {
+            if (types_concrete_equal(pt, at)) { score += 4; continue; }
+            int pf = type_family(pt), af = type_family(at);
+            if (pf == FAM_UNKNOWN || af == FAM_UNKNOWN) continue;
+            /* integer arguments widen to floating parameters */
+            if (pf == FAM_FLOAT && af == FAM_INT) continue;
+            return -1;
+        }
+        int af = expr_family(g, a, locals);
+        int pf = type_family(pt);
+        if (af != FAM_UNKNOWN && pf != FAM_UNKNOWN) {
+            if (af == pf) score += 2;
+            else if (!(pf == FAM_FLOAT && af == FAM_INT)) return -1;
+        }
+    }
+    return score;
+}
+
+/* Rank one extension-method candidate against the call: -1 = incompatible
+ * (a fully typed receiver or lambda return that contradicts the call),
+ * otherwise a score where a concrete receiver match and each lambda whose
+ * body agrees with the delegate's return type raise the rank. */
+static int ext_method_score(zan_irgen_t *g, zan_symbol_t *m,
+                            zan_type_t *recv_ty, zan_ast_node_t *call,
+                            zan_ast_node_t *recv_expr, local_scope_t *locals) {
+    zan_ast_list_t *ps = &m->decl->method_decl.params;
+    zan_type_t *pt = zan_binder_resolve_type(g->binder, ps->items[0]->param.type);
+    int score = 0;
+    if (pt && !type_mentions_tp(pt)) {
+        if (types_concrete_equal(pt, recv_ty)) score += 4;
+        else if (!type_mentions_tp(recv_ty)) return -1;
+    }
+    int as = method_args_score(g, m, call, recv_expr, locals, 1);
+    if (as < 0) return -1;
+    return score + as;
+}
+
 /* Extension method lookup: a static method whose first parameter is declared
  * `this T` extends T; `recv.M(args)` resolves to it when no instance method
- * matches. Matches on method name, arity, and the receiver's static type. */
+ * matches. Candidates match on method name, arity, and the receiver's static
+ * type; among several, the best-scoring one wins (a concretely typed receiver
+ * beats a generic one, and a lambda argument's body must agree with the
+ * delegate's declared return type). Falls back to the first name/arity match
+ * when every candidate is disqualified, preserving the historical lookup. */
 static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
-                                           zan_istr_t name, int argc) {
+                                           zan_istr_t name, int argc,
+                                           zan_ast_node_t *call,
+                                           zan_ast_node_t *recv_expr,
+                                           local_scope_t *locals) {
     if (!recv_ty) return NULL;
+    zan_symbol_t *best = NULL;
+    int best_score = -1;
+    zan_symbol_t *first = NULL;
     for (int fi = 0; fi < g->function_count; fi++) {
         zan_symbol_t *m = g->functions[fi].sym;
         if (!m || m->kind != SYM_METHOD || !m->decl ||
@@ -251,9 +431,47 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
              pt->kind == TYPE_INTERFACE || pt->kind == TYPE_ENUM) &&
             pt->sym != recv_ty->sym)
             continue;
-        return m;
+        if (!first) first = m;
+        int score = ext_method_score(g, m, recv_ty, call, recv_expr, locals);
+        if (score > best_score) {
+            best_score = score;
+            best = m;
+        }
     }
-    return NULL;
+    if (best && best_score >= 0) return best;
+    return first;
+}
+
+/* Argument-type-aware overload resolution for direct method calls
+ * (Type.Method(args) and recv.Method(args)): among same-named, same-arity
+ * candidates pick the best-scoring one (see method_args_score); ties keep
+ * declaration order, and when every candidate is disqualified or no arity
+ * matches, fall back to resolve_overload's historical behaviour. */
+static zan_symbol_t *resolve_overload_typed(zan_irgen_t *g,
+                                            zan_symbol_t *type_sym,
+                                            zan_istr_t name,
+                                            zan_ast_node_t *call,
+                                            local_scope_t *locals) {
+    int argc = (call && call->kind == AST_CALL) ? call->call.args.count : 0;
+    zan_symbol_t *best = NULL;
+    int best_score = -1;
+    int arity_matches = 0;
+    for (int i = 0; i < type_sym->member_count; i++) {
+        zan_symbol_t *m = type_sym->members[i];
+        if (m->kind != SYM_METHOD || !m->decl ||
+            m->decl->kind != AST_METHOD_DECL) continue;
+        if (m->name.len != name.len ||
+            memcmp(m->name.str, name.str, name.len) != 0) continue;
+        if (m->decl->method_decl.params.count != argc) continue;
+        arity_matches++;
+        int score = method_args_score(g, m, call, NULL, locals, 0);
+        if (score > best_score) {
+            best_score = score;
+            best = m;
+        }
+    }
+    if (arity_matches > 1 && best && best_score >= 0) return best;
+    return resolve_overload(type_sym, name, argc);
 }
 
 /* Best-effort static inference of an expression's Zan type, composed over
@@ -303,14 +521,31 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
             }
         }
         zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
+        /* Dict.Keys / Dict.Values yield a fresh List of the key/value type */
+        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0) {
+            if (e->member.name.len == 4 &&
+                memcmp(e->member.name.str, "Keys", 4) == 0)
+                return zan_binder_make_list_type(g->binder, dict_key_type(g, ot));
+            if (e->member.name.len == 6 &&
+                memcmp(e->member.name.str, "Values", 6) == 0) {
+                zan_type_t *vt = dict_value_type(ot);
+                if (vt) return zan_binder_make_list_type(g->binder, vt);
+            }
+        }
         if (ot && ot->sym) {
             zan_symbol_t *fs = get_field_sym(ot->sym, e->member.name);
             if (fs) return fs->type;
         }
         return NULL;
     }
-    case AST_INDEX:
-        return container_elem_type(infer_expr_type(g, e->index.object, locals));
+    case AST_INDEX: {
+        zan_type_t *ot = infer_expr_type(g, e->index.object, locals);
+        /* dict[key] yields the VALUE type (second type arg), not the key */
+        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0 &&
+            ot->type_arg_count == 2)
+            return ot->type_args[1];
+        return container_elem_type(ot);
+    }
     case AST_CALL: {
         /* Resolve the static return type of a method/function call so that
          * chained member access (e.g. Next().field) can find the struct. */
@@ -350,7 +585,8 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
             if (obj->kind == AST_IDENTIFIER && !local_find(locals, obj->ident.name)) {
                 zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->ident.name);
                 if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
-                    zan_symbol_t *m = get_method_sym(ts, callee->member.name);
+                    zan_symbol_t *m = resolve_overload_typed(g, ts, callee->member.name, e, locals);
+                    if (!m) m = get_method_sym(ts, callee->member.name);
                     if (m) {
                         zan_type_t *gr = generic_method_ret(g, m, e, locals);
                         return gr ? gr : m->type;
@@ -385,7 +621,8 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
              * site, so fluent chains like list.Where(..).Select(..) keep a
              * concrete element type) */
             zan_symbol_t *xm = find_extension_method(g, rt, callee->member.name,
-                                                     e->call.args.count);
+                                                     e->call.args.count,
+                                                     e, obj, locals);
             if (xm) return method_ret_type_at(g, xm, e, obj, locals);
         }
         return NULL;
@@ -393,7 +630,7 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_NEW_EXPR:
         /* `new T(...)` yields a T; array `new T[n]` is not a single rc object. */
         if (e->new_expr.is_array) return NULL;
-        return zan_binder_resolve_type(g->binder, e->new_expr.type);
+        return resolve_type_ctx(g, e->new_expr.type);
     case AST_BINARY:
         /* string concatenation (`a + b`) yields a freshly heap-allocated,
          * owned string; other binary operators produce non-rc scalars. */
@@ -416,7 +653,7 @@ static zan_type_t *infer_expr_type(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_STRING_INTERP:
         return g->binder->type_string;
     case AST_CAST_EXPR:
-        return zan_binder_resolve_type(g->binder, e->cast.type);
+        return resolve_type_ctx(g, e->cast.type);
     default:
         return NULL;
     }

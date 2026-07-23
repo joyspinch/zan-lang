@@ -138,6 +138,51 @@ zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
+/* Substitute type parameters (matched by declared name in `tps`) with `args`
+ * throughout `t`, cloning composite types as needed. */
+static zan_type_t *subst_named_tp(zan_binder_t *b, zan_type_t *t,
+                                  zan_ast_list_t *tps, zan_type_t **args) {
+    if (!t) return t;
+    if (t->kind == TYPE_TYPE_PARAM) {
+        for (int i = 0; i < tps->count; i++) {
+            zan_istr_t tn = tps->items[i]->ident.name;
+            if (args[i] && tn.len == t->name.len &&
+                memcmp(tn.str, t->name.str, (size_t)t->name.len) == 0)
+                return args[i];
+        }
+        return t;
+    }
+    bool mentions = false;
+    if ((t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) && t->element_type)
+        mentions = true;
+    if (t->kind == TYPE_DELEGATE) mentions = true;
+    if (t->type_arg_count > 0) mentions = true;
+    if (!mentions) return t;
+    zan_type_t *nt = (zan_type_t *)zan_arena_alloc(b->arena, sizeof(zan_type_t));
+    *nt = *t;
+    if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) {
+        nt->element_type = subst_named_tp(b, t->element_type, tps, args);
+        return nt;
+    }
+    if (t->kind == TYPE_DELEGATE) {
+        nt->delegate_ret_type = subst_named_tp(b, t->delegate_ret_type, tps, args);
+        if (t->delegate_param_count > 0) {
+            nt->delegate_param_types = (zan_type_t **)zan_arena_alloc(
+                b->arena, sizeof(zan_type_t *) * (size_t)t->delegate_param_count);
+            for (int i = 0; i < t->delegate_param_count; i++)
+                nt->delegate_param_types[i] =
+                    subst_named_tp(b, t->delegate_param_types[i], tps, args);
+        }
+    }
+    if (t->type_arg_count > 0) {
+        nt->type_args = (zan_type_t **)zan_arena_alloc(
+            b->arena, sizeof(zan_type_t *) * (size_t)t->type_arg_count);
+        for (int i = 0; i < t->type_arg_count; i++)
+            nt->type_args[i] = subst_named_tp(b, t->type_args[i], tps, args);
+    }
+    return nt;
+}
+
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref || type_ref->kind != AST_TYPE_REF) {
         return b->type_error;
@@ -193,6 +238,38 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
      * to the *shared* class-symbol type; mutating that would let one
      * instantiation (Box<int>) clobber another (Box<string>), so copy it into a
      * fresh instantiation type first. */
+    /* A generic delegate instantiation (e.g. Selector<T, List<R>>) must
+     * substitute the delegate's own type parameters in its signature: the
+     * shared delegate type's ret/param types are the delegate's bare type
+     * params, which only coincide with the use-site's meaning when the
+     * argument is that same bare name. Composite arguments (List<R>) would
+     * otherwise be silently flattened to the bare param. */
+    if (type_ref->type_ref.type_args.count > 0 && base->kind == TYPE_DELEGATE &&
+        base->sym && base->sym->decl &&
+        base->sym->decl->method_decl.type_params.count ==
+            type_ref->type_ref.type_args.count) {
+        int nargs = type_ref->type_ref.type_args.count;
+        zan_type_t **args = (zan_type_t **)zan_arena_alloc(
+            b->arena, sizeof(zan_type_t *) * (size_t)nargs);
+        for (int i = 0; i < nargs; i++)
+            args[i] = zan_binder_resolve_type(b, type_ref->type_ref.type_args.items[i]);
+        zan_type_t *inst = make_type(b->arena, TYPE_DELEGATE,
+                                     base->name.str, base->name.len);
+        *inst = *base;
+        inst->type_args = args;
+        inst->type_arg_count = nargs;
+        zan_ast_list_t *dtps = &base->sym->decl->method_decl.type_params;
+        inst->delegate_ret_type =
+            subst_named_tp(b, base->delegate_ret_type, dtps, args);
+        if (base->delegate_param_count > 0) {
+            inst->delegate_param_types = (zan_type_t **)zan_arena_alloc(
+                b->arena, sizeof(zan_type_t *) * (size_t)base->delegate_param_count);
+            for (int i = 0; i < base->delegate_param_count; i++)
+                inst->delegate_param_types[i] =
+                    subst_named_tp(b, base->delegate_param_types[i], dtps, args);
+        }
+        base = inst;
+    } else
     if (type_ref->type_ref.type_args.count > 0) {
         bool builtin_generic = istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
                                istr_eq(name, "Dictionary", 10);

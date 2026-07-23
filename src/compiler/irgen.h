@@ -134,6 +134,32 @@ struct zan_irgen {
     int generic_inst_count;
     int generic_inst_cap;
 
+    /* method-level monomorphization: specialized copies of a *generic method*
+     * (one declaring its own <T,...>), keyed by the concrete types bound to
+     * those parameters at a call site. Unlike the class-level table above,
+     * a specialized method's SIGNATURE uses the concrete types (no erasure),
+     * so type-specific semantics (string/double comparison, ARC releases of
+     * replaced values) hold inside the body. Bodies are emitted from a pending
+     * queue drained after the main passes; emission may enqueue further
+     * specializations (a generic method calling another generic method). */
+    struct zan_method_spec {
+        zan_symbol_t   *msym;      /* the generic method symbol */
+        zan_symbol_t   *type_sym;  /* declaring class */
+        zan_ast_node_t *member;    /* AST_METHOD_DECL */
+        zan_type_t    **bind;      /* concrete type per declared type param */
+        int             bindc;
+        LLVMValueRef    fn;
+        LLVMTypeRef     fn_type;
+    } *method_specs;
+    int method_spec_count;
+    int method_spec_cap;
+    int method_spec_emitted;   /* queue cursor: bodies [0..emitted) are done */
+    /* active method specialization while emitting its body (else NULL): the
+     * declared type-param list and the bound concrete types, applied when
+     * resolving type refs in the body (see resolve_type_ctx). */
+    zan_ast_list_t *cur_mtps;
+    zan_type_t    **cur_mbind;
+
     /* ARC runtime functions */
     LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
     LLVMValueRef rt_release;     /* zan_rt_release(void*) */

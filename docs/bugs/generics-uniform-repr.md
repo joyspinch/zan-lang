@@ -1,8 +1,15 @@
 # Generic instantiation bugs (uniform-representation lowering)
 
-Status: OPEN — found 2026-07-23 while extending System.Linq. Each item below
-was reproduced with a minimal program against `build/zanc` (Windows, O0
-default flags, `--auto-stdlib`).
+Status: FIXED — found 2026-07-23 while extending System.Linq; fixed via
+method-level monomorphization (static/extension generic methods are now
+specialized per concrete type-argument binding, so string/double comparisons,
+string equality, delegate-return overload ranking, Dictionary generic values
+and generic-accumulator ARC all lower with concrete types). Regression
+coverage: `tests/conformance/generics_uniform_repr.zan` plus the same-name
+C#-style overloads in `tests/conformance/linq_csharp_overloads.zan`.
+
+Each item below was reproduced with a minimal program against `build/zanc`
+(Windows, O0 default flags, `--auto-stdlib`).
 
 The common theme: inside a generic function/class, values of an unbound type
 parameter appear to be handled as raw machine words, so type-specific

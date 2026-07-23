@@ -1235,6 +1235,80 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
             }
         }
 
+        /* Dict.Keys / Dict.Values — copy the entries into a fresh owned List
+         * of the key/value type (retaining rc-managed elements: the dict still
+         * owns its slots). */
+        if ((expr->member.name.len == 4 && memcmp(expr->member.name.str, "Keys", 4) == 0) ||
+            (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Values", 6) == 0)) {
+            zan_type_t *dt = infer_expr_type(g, expr->member.object, locals);
+            if (dt && dt->name.len == 4 && memcmp(dt->name.str, "Dict", 4) == 0) {
+                bool want_keys = (expr->member.name.len == 4);
+                zan_type_t *elem = want_keys ? dict_key_type(g, dt) : dict_value_type(dt);
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMValueRef raw = emit_expr(g, expr->member.object, locals);
+                LLVMValueRef dp = LLVMBuildBitCast(g->builder, raw,
+                    LLVMPointerType(g->dict_struct_type, 0), "dp");
+                LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp, 0, "cntp");
+                LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "dcnt");
+                LLVMValueRef srcp = LLVMBuildStructGEP2(g->builder, g->dict_struct_type, dp,
+                    want_keys ? 2 : 3, want_keys ? "kp" : "vp");
+                LLVMTypeRef src_slot_ty = want_keys ? i8ptr : i64;
+                LLVMValueRef src = LLVMBuildLoad2(g->builder,
+                    LLVMPointerType(src_slot_ty, 0), srcp, "dsrc");
+                /* fresh List: count = dict count, capacity = count + 8 */
+                LLVMValueRef list_raw = emit_alloc_rc_collection(g, expr, 24, 1, elem);
+                LLVMValueRef lp = LLVMBuildBitCast(g->builder, list_raw,
+                    LLVMPointerType(g->list_struct_type, 0), "lp");
+                LLVMBuildStore(g->builder, cnt,
+                    LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 0, "lcnt"));
+                LLVMValueRef cap = LLVMBuildAdd(g->builder, cnt,
+                    LLVMConstInt(i64, 8, 0), "lcap");
+                LLVMBuildStore(g->builder, cap,
+                    LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 1, "lcapp"));
+                LLVMValueRef data_size = LLVMBuildMul(g->builder, cap,
+                    LLVMConstInt(i64, 8, 0), "lsz");
+                LLVMValueRef data = zan_call2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
+                    get_calloc_fn(g),
+                    (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), data_size }, 2, "ldata");
+                LLVMValueRef data_typed = LLVMBuildBitCast(g->builder, data,
+                    LLVMPointerType(i64, 0), "ldp");
+                LLVMBuildStore(g->builder, data_typed,
+                    LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "ldf"));
+                /* copy loop */
+                LLVMValueRef idx_a = emit_entry_alloca(g, i64, "dk.i");
+                LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
+                LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dk.cond");
+                LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dk.body");
+                LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "dk.done");
+                LLVMBuildBr(g->builder, cond_bb);
+                LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+                LLVMValueRef ci = LLVMBuildLoad2(g->builder, i64, idx_a, "ci");
+                LLVMBuildCondBr(g->builder,
+                    LLVMBuildICmp(g->builder, LLVMIntUGE, ci, cnt, "cdone"),
+                    done_bb, body_bb);
+                LLVMPositionBuilderAtEnd(g->builder, body_bb);
+                LLVMValueRef sslot = LLVMBuildGEP2(g->builder, src_slot_ty, src, &ci, 1, "ssl");
+                LLVMValueRef sval = LLVMBuildLoad2(g->builder, src_slot_ty, sslot, "sv");
+                /* reinterpret a value slot per the concrete element type so
+                 * the slot-store retain sees a pointer for rc elements */
+                if (!want_keys && elem) {
+                    LLVMTypeRef m = map_type(g, elem);
+                    if (LLVMGetTypeKind(m) == LLVMPointerTypeKind)
+                        sval = LLVMBuildIntToPtr(g->builder, sval, m, "svp");
+                }
+                LLVMValueRef dslot = LLVMBuildGEP2(g->builder, i64, data_typed, &ci, 1, "dsl");
+                emit_collection_slot_store(g, elem, i64, dslot, sval, NULL, locals, 0);
+                LLVMBuildStore(g->builder,
+                    LLVMBuildAdd(g->builder, ci, LLVMConstInt(i64, 1, 0), "ni"), idx_a);
+                LLVMBuildBr(g->builder, cond_bb);
+                LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                emit_release_owned_call_temp(g, expr->member.object, raw, locals);
+                return LLVMBuildBitCast(g->builder, lp, i8ptr, "keysv");
+            }
+        }
+
         /* array.Length: read the element count captured at declaration. */
         if (expr->member.name.len == 6 && memcmp(expr->member.name.str, "Length", 6) == 0 &&
             expr->member.object->kind == AST_IDENTIFIER) {
@@ -1709,7 +1783,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                  * 3 * i64), so ARC frees it and its data buffer on release. */
                 zan_type_t *lelem = NULL;
                 {
-                    zan_type_t *lt = zan_binder_resolve_type(g->binder, expr->new_expr.type);
+                    zan_type_t *lt = resolve_type_ctx(g, expr->new_expr.type);
                     if (lt) lelem = container_elem_type(lt);
                 }
                 LLVMValueRef list_ptr = emit_alloc_rc_collection(g, expr, 24, 1, lelem);
@@ -1813,9 +1887,9 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 int ninit = expr->new_expr.args.count;
                 if (ninit >= 2) {
                     zan_type_t *kt = dict_key_type(g, expr->new_expr.type
-                        ? zan_binder_resolve_type(g->binder, expr->new_expr.type) : NULL);
+                        ? resolve_type_ctx(g, expr->new_expr.type) : NULL);
                     zan_type_t *vt = dict_value_type(expr->new_expr.type
-                        ? zan_binder_resolve_type(g->binder, expr->new_expr.type) : NULL);
+                        ? resolve_type_ctx(g, expr->new_expr.type) : NULL);
                     LLVMValueRef sf = get_dict_set_fn(g);
                     LLVMValueRef is_str = LLVMConstInt(i64,
                         (kt && kt->kind == TYPE_STRING) ? 1 : 0, 0);
@@ -1856,7 +1930,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
         /* new Type[size] — array creation */
         if (expr->new_expr.is_array && expr->new_expr.args.count > 0) {
-            zan_type_t *elem_type = zan_binder_resolve_type(g->binder, expr->new_expr.type);
+            zan_type_t *elem_type = resolve_type_ctx(g, expr->new_expr.type);
             if (!elem_type) elem_type = g->binder->type_int;
             LLVMTypeRef elem_llvm = map_type(g, elem_type);
             LLVMValueRef size_val = emit_expr(g, expr->new_expr.args.items[0], locals);
@@ -1939,7 +2013,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     /* look for constructor. For a concrete instantiation of a
                      * user generic class, prefer the specialized constructor so
                      * the body runs with the instantiation context. */
-                    zan_type_t *new_inst = zan_binder_resolve_type(g->binder, expr->new_expr.type);
+                    zan_type_t *new_inst = resolve_type_ctx(g, expr->new_expr.type);
                     LLVMValueRef ctor_fn = NULL;
                     LLVMTypeRef ctor_ft = NULL;
                     if (new_inst && new_inst->type_arg_count > 0)
@@ -2435,7 +2509,7 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* (Type)x — explicit numeric cast honoring the target type. */
         LLVMValueRef val = emit_expr(g, expr->cast.expr, locals);
-        zan_type_t *tt = zan_binder_resolve_type(g->binder, expr->cast.type);
+        zan_type_t *tt = resolve_type_ctx(g, expr->cast.type);
         LLVMTypeRef target = tt ? map_type(g, tt) : LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef src = LLVMTypeOf(val);
         /* Unsigned/small targets share the i64 representation, so their cast
@@ -2659,7 +2733,7 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         zan_ast_node_t *param = expr->lambda.params.items[k];
         zan_type_t *pt = NULL;
         if (param->param.type) {
-            pt = zan_binder_resolve_type(g->binder, param->param.type);
+            pt = resolve_type_ctx(g, param->param.type);
         }
         if (!pt && exp_delegate && k < expected->delegate_param_count) {
             pt = expected->delegate_param_types[k];
@@ -2839,7 +2913,7 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
                                      zan_type_t **bind) {
     zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
     for (int i = 0; i < tps->count && i < call->call.type_args.count; i++)
-        bind[i] = zan_binder_resolve_type(g->binder, call->call.type_args.items[i]);
+        bind[i] = resolve_type_ctx(g, call->call.type_args.items[i]);
 
     zan_ast_list_t *params = &msym->decl->method_decl.params;
     int arg_base = recv_expr ? 1 : 0;
@@ -2853,6 +2927,55 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
         if (!dp || !type_mentions_tp(dp)) continue;
         zan_type_t *at = infer_expr_type(g, aexpr, locals);
         if (at && !type_mentions_tp(at)) unify_method_tp(dp, at, tps, bind);
+    }
+
+    /* Second pass: lambda arguments. A delegate parameter can be the only
+     * mention of a type parameter (e.g. R in `Sel<T, R> key`): once the
+     * lambda's parameter types are known (explicit annotation, or the
+     * delegate's parameter types after the first pass), the lambda body's
+     * inferred type binds the delegate's declared return type. Explicitly
+     * annotated lambda parameters also bind the delegate's parameter types. */
+    for (int j = 0; j < params->count; j++) {
+        int ai = j - arg_base;
+        if (ai < 0 || ai >= call->call.args.count) continue;
+        zan_ast_node_t *a = call->call.args.items[ai];
+        if (!a || a->kind != AST_LAMBDA) continue;
+        zan_type_t *dp = method_param_type(g, msym, j);
+        if (!dp || dp->kind != TYPE_DELEGATE || !type_mentions_tp(dp)) continue;
+        if (a->lambda.params.count != dp->delegate_param_count) continue;
+        zan_type_t *sdp = subst_method_tp(g, dp, tps, bind);
+        int mark = locals->count;
+        bool params_known = true;
+        for (int k = 0; k < a->lambda.params.count; k++) {
+            zan_ast_node_t *lp = a->lambda.params.items[k];
+            zan_type_t *lpt = lp->param.type
+                ? zan_binder_resolve_type(g->binder, lp->param.type)
+                : sdp->delegate_param_types[k];
+            if (lpt && !type_mentions_tp(lpt)) {
+                if (lp->param.type)
+                    unify_method_tp(dp->delegate_param_types[k], lpt, tps, bind);
+                local_add(locals, lp->param.name, NULL, lpt);
+            } else {
+                params_known = false;
+            }
+        }
+        if (params_known &&
+            type_mentions_tp(dp->delegate_ret_type) &&
+            a->lambda.body && a->lambda.body->kind != AST_BLOCK) {
+            zan_type_t *bt = infer_expr_type(g, a->lambda.body, locals);
+            if (!bt || type_mentions_tp(bt)) {
+                switch (expr_family(g, a->lambda.body, locals)) {
+                case FAM_BOOL: bt = g->binder->type_bool; break;
+                case FAM_INT: bt = g->binder->type_int; break;
+                case FAM_FLOAT: bt = g->binder->type_double; break;
+                case FAM_STRING: bt = g->binder->type_string; break;
+                default: bt = NULL; break;
+                }
+            }
+            if (bt && !type_mentions_tp(bt))
+                unify_method_tp(dp->delegate_ret_type, bt, tps, bind);
+        }
+        locals->count = mark;
     }
 }
 
@@ -2928,7 +3051,7 @@ static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
                                  local_scope_t *locals) {
     zan_ast_node_t *tgt = arg->ref_arg.expr;
     if (arg->ref_arg.decl_type && tgt && tgt->kind == AST_IDENTIFIER) {
-        zan_type_t *dt = zan_binder_resolve_type(g->binder, arg->ref_arg.decl_type);
+        zan_type_t *dt = resolve_type_ctx(g, arg->ref_arg.decl_type);
         LLVMTypeRef lt = map_type(g, dt);
         LLVMValueRef a = emit_entry_alloca(g, lt, "out");
         LLVMBuildStore(g->builder, LLVMConstNull(lt), a);

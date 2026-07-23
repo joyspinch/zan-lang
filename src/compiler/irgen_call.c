@@ -21,6 +21,60 @@ static bool src_method_takes_over(zan_irgen_t *g, zan_ast_node_t *expr,
     return get_method_sym(ts, callee->member.name) != NULL;
 }
 
+/* Try to route a call to a generic method through a monomorphized copy (see
+ * get_or_create_method_spec in irgen_emit.c): every type parameter must be
+ * inferable to a concrete type at this call site. Returns the spec index or
+ * -1 to fall back to the erased call. */
+static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
+                           zan_ast_node_t *call, zan_ast_node_t *recv_expr,
+                           local_scope_t *locals) {
+    if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
+    zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
+    if (tps->count == 0 || tps->count > 8) return -1;
+    /* exact arity only: `params` packing / defaults keep the erased path */
+    if (msym->decl->method_decl.params.count !=
+        call->call.args.count + (recv_expr ? 1 : 0)) return -1;
+    for (int j = 0; j < msym->decl->method_decl.params.count; j++)
+        if (msym->decl->method_decl.params.items[j]->param.by_ref) return -1;
+    zan_type_t *bind[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+    infer_method_tp_bindings(g, msym, call, recv_expr, locals, bind);
+    return get_or_create_method_spec(g, msym, bind, tps->count);
+}
+
+/* Emit a call to a monomorphized generic method: arguments are emitted
+ * against the substituted (concrete) parameter types, so no boundary erasure
+ * or borrowed-return fixups apply — the result is owned like any call. */
+static LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
+                                          zan_ast_node_t *call,
+                                          zan_ast_node_t *recv_expr,
+                                          local_scope_t *locals) {
+    struct zan_method_spec *sp = &g->method_specs[idx];
+    zan_ast_list_t *tps = &sp->msym->decl->method_decl.type_params;
+    int pcount = sp->msym->decl->method_decl.params.count;
+    int arg_base = recv_expr ? 1 : 0;
+    LLVMValueRef *call_args = (LLVMValueRef *)calloc(
+        (size_t)(pcount > 0 ? pcount : 1), sizeof(LLVMValueRef));
+    zan_ast_node_t **aexprs = (zan_ast_node_t **)calloc(
+        (size_t)(pcount > 0 ? pcount : 1), sizeof(zan_ast_node_t *));
+    for (int j = 0; j < pcount; j++) {
+        aexprs[j] = (arg_base == 1 && j == 0)
+            ? recv_expr : call->call.args.items[j - arg_base];
+        zan_type_t *pt = subst_method_tp(g,
+            method_param_type(g, sp->msym, j), tps, sp->bind);
+        call_args[j] = emit_arg_typed(g, aexprs[j], pt, locals);
+    }
+    coerce_args_to_params(g, sp->fn_type, call_args, pcount);
+    const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(sp->fn_type)) ==
+                      LLVMVoidTypeKind) ? "" : "gspec";
+    LLVMValueRef result = zan_call2(g->builder, sp->fn_type, sp->fn,
+                                    call_args, (unsigned)pcount, cn);
+    for (int j = 0; j < pcount; j++)
+        emit_release_owned_call_temp(g, aexprs[j], call_args[j], locals);
+    free(aexprs);
+    free(call_args);
+    return result;
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
@@ -2626,9 +2680,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* try as static method: ClassName.Method(args) */
                 zan_symbol_t *type_sym = zan_binder_lookup(g->binder, callee->member.object->ident.name);
                 if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
-                    zan_symbol_t *method_sym = resolve_overload(type_sym, callee->member.name, expr->call.args.count);
+                    zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
+                        int spec = try_method_spec(g, method_sym, expr, NULL, locals);
+                        if (spec >= 0)
+                            return emit_method_spec_call(g, spec, expr, NULL, locals);
                         for (int fi = 0; fi < g->function_count; fi++) {
                             if (g->functions[fi].sym == method_sym) {
                                 int argc = expr->call.args.count;
@@ -2916,8 +2973,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_type_t *recv_ty = infer_expr_type(g, callee->member.object, locals);
             zan_symbol_t *method_sym =
                 find_extension_method(g, recv_ty, callee->member.name,
-                                      expr->call.args.count);
+                                      expr->call.args.count,
+                                      expr, callee->member.object, locals);
             if (method_sym) {
+                int spec = try_method_spec(g, method_sym, expr,
+                                           callee->member.object, locals);
+                if (spec >= 0)
+                    return emit_method_spec_call(g, spec, expr,
+                                                 callee->member.object, locals);
                 for (int fi = 0; fi < g->function_count; fi++) {
                     if (g->functions[fi].sym == method_sym) {
                         int argc = expr->call.args.count + 1;

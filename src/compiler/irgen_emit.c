@@ -879,6 +879,227 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
 
     g->cur_inst = NULL;
     free(work);
+    emit_pending_method_specs(g);
+}
+
+/* ---- method-level monomorphization (bodies for zan_method_spec) ----
+ *
+ * A generic method (one declaring its own <T,...>) is normally emitted once
+ * with type parameters erased to machine words, which loses type-specific
+ * semantics: `<`/`==` on a string key compare pointers, double keys compare
+ * raw bits, and a replaced ARC value is never released. When a call site can
+ * bind every type parameter to a concrete type AND some binding's semantics
+ * differ from the erased representation, a specialized copy with a concrete
+ * signature is declared here and its body emitted from the pending queue. */
+
+/* Erased codegen is already correct for int-like bindings; only strings,
+ * floating types and composite/reference types need a specialized copy. */
+static bool mspec_bind_worthwhile(zan_type_t **bind, int bindc) {
+    for (int i = 0; i < bindc; i++) {
+        if (!bind[i]) return false;
+        switch (bind[i]->kind) {
+        case TYPE_STRING: case TYPE_FLOAT: case TYPE_DOUBLE:
+        case TYPE_CLASS: case TYPE_STRUCT: case TYPE_INTERFACE:
+        case TYPE_ARRAY:
+            return true;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
+                                     zan_type_t **bind, int bindc) {
+    if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return -1;
+    zan_ast_node_t *member = msym->decl;
+    if (!member->method_decl.body) return -1;
+    /* async bodies lower through the CPS frame machinery; keep them erased */
+    if (member->method_decl.modifiers & MOD_ASYNC) return -1;
+    if (!(member->method_decl.modifiers & MOD_STATIC)) return -1;
+    zan_ast_list_t *tps = &member->method_decl.type_params;
+    if (tps->count != bindc || bindc <= 0 || bindc > 8) return -1;
+    for (int i = 0; i < bindc; i++)
+        if (!bind[i] || !type_is_concrete(bind[i])) return -1;
+    if (!mspec_bind_worthwhile(bind, bindc)) return -1;
+    zan_symbol_t *type_sym = msym->parent;
+    if (!type_sym ||
+        (type_sym->kind != SYM_CLASS && type_sym->kind != SYM_STRUCT))
+        return -1;
+
+    for (int i = 0; i < g->method_spec_count; i++)
+        if (g->method_specs[i].msym == msym &&
+            type_arglists_equal(g->method_specs[i].bind,
+                                g->method_specs[i].bindc, bind, bindc))
+            return i;
+
+    /* mangled name: Type_Method$$tok1$tok2, uniquified across overloads */
+    char fn_name[512];
+    {
+        size_t off = (size_t)snprintf(fn_name, sizeof(fn_name), "%.*s_%.*s$",
+            (int)type_sym->name.len, type_sym->name.str,
+            (int)msym->name.len, msym->name.str);
+        for (int i = 0; i < bindc; i++) {
+            if (off < sizeof(fn_name) - 1) fn_name[off++] = '$';
+            fn_name[off < sizeof(fn_name) ? off : sizeof(fn_name) - 1] = '\0';
+            mangle_type_token(fn_name, sizeof(fn_name), &off, bind[i]);
+        }
+        if (off < sizeof(fn_name)) fn_name[off] = '\0';
+        else fn_name[sizeof(fn_name) - 1] = '\0';
+        char base_name[512];
+        int oi = 2;
+        snprintf(base_name, sizeof(base_name), "%s", fn_name);
+        while (LLVMGetNamedFunction(g->mod, fn_name))
+            snprintf(fn_name, sizeof(fn_name), "%s$o%d", base_name, oi++);
+    }
+
+    int param_count = member->method_decl.params.count;
+    LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
+        (size_t)(param_count > 0 ? param_count : 1), sizeof(LLVMTypeRef));
+    for (int k = 0; k < param_count; k++) {
+        zan_ast_node_t *param = member->method_decl.params.items[k];
+        zan_type_t *pt = subst_method_tp(g,
+            zan_binder_resolve_type(g->binder, param->param.type), tps, bind);
+        param_types[k] = param->param.by_ref
+            ? LLVMPointerType(map_type(g, pt), 0)
+            : map_type(g, pt);
+    }
+    zan_type_t *ret_type = member->method_decl.return_type
+        ? subst_method_tp(g, zan_binder_resolve_type(g->binder,
+              member->method_decl.return_type), tps, bind)
+        : g->binder->type_void;
+    LLVMTypeRef fn_type = LLVMFunctionType(map_type(g, ret_type), param_types,
+                                           (unsigned)param_count, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+    free(param_types);
+
+    if (g->method_spec_count >= g->method_spec_cap) {
+        int ncap = g->method_spec_cap ? g->method_spec_cap * 2 : 32;
+        g->method_specs = realloc(g->method_specs,
+                                  (size_t)ncap * sizeof(*g->method_specs));
+        g->method_spec_cap = ncap;
+    }
+    zan_type_t **bcopy = (zan_type_t **)zan_arena_alloc(g->arena,
+        sizeof(zan_type_t *) * (size_t)bindc);
+    for (int i = 0; i < bindc; i++) bcopy[i] = bind[i];
+    int idx = g->method_spec_count++;
+    g->method_specs[idx].msym = msym;
+    g->method_specs[idx].type_sym = type_sym;
+    g->method_specs[idx].member = member;
+    g->method_specs[idx].bind = bcopy;
+    g->method_specs[idx].bindc = bindc;
+    g->method_specs[idx].fn = fn;
+    g->method_specs[idx].fn_type = fn_type;
+    return idx;
+}
+
+/* Emit the body of one specialization: the static, non-async subset of
+ * emit_user_methods Pass B, with the type-parameter bindings active so every
+ * type ref resolved from this body comes out concrete (resolve_type_ctx). */
+static void emit_method_spec_body(zan_irgen_t *g, int idx) {
+    struct zan_method_spec sp = g->method_specs[idx];
+    zan_ast_node_t *member = sp.member;
+    zan_ast_list_t *tps = &member->method_decl.type_params;
+
+    zan_ast_list_t *saved_mtps = g->cur_mtps;
+    zan_type_t **saved_mbind = g->cur_mbind;
+    zan_type_t *saved_inst = g->cur_inst;
+    g->cur_mtps = tps;
+    g->cur_mbind = sp.bind;
+    g->cur_inst = NULL;
+
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, sp.fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    di_clear(g);
+
+    local_scope_t *locals = local_scope_new(g->arena);
+    int param_count = member->method_decl.params.count;
+    unsigned npt = LLVMCountParamTypes(sp.fn_type);
+    LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
+        (size_t)(npt > 0 ? npt : 1), sizeof(LLVMTypeRef));
+    LLVMGetParamTypes(sp.fn_type, param_types);
+    for (int k = 0; k < param_count; k++) {
+        zan_ast_node_t *param = member->method_decl.params.items[k];
+        zan_type_t *pt = resolve_type_ctx(g, param->param.type);
+        if (param->param.by_ref) {
+            local_add(locals, param->param.name,
+                      LLVMGetParam(sp.fn, (unsigned)k), pt);
+            continue;
+        }
+        LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k], "p");
+        LLVMBuildStore(g->builder, LLVMGetParam(sp.fn, (unsigned)k), param_alloca);
+        local_add(locals, param->param.name, param_alloca, pt);
+    }
+    free(param_types);
+
+    zan_type_t *ret_type = member->method_decl.return_type
+        ? resolve_type_ctx(g, member->method_decl.return_type)
+        : g->binder->type_void;
+    LLVMTypeRef llvm_ret = LLVMGetReturnType(sp.fn_type);
+
+    LLVMValueRef saved_fn = g->current_fn;
+    LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
+    LLVMValueRef saved_this = g->current_this;
+    zan_symbol_t *saved_type_sym = g->current_type_sym;
+    zan_ast_node_t *saved_fn_body = g->current_fn_body;
+    g->current_fn = sp.fn;
+    g->current_fn_ret_type = llvm_ret;
+    g->current_this = NULL;
+    g->current_type_sym = sp.type_sym;
+    g->current_fn_body = member->method_decl.body;
+
+    if (member->method_decl.body->kind == AST_BLOCK) {
+        for (int k = 0; k < member->method_decl.body->block.stmts.count; k++) {
+            emit_stmt(g, member->method_decl.body->block.stmts.items[k], locals);
+        }
+    } else {
+        LLVMValueRef val = emit_expr(g, member->method_decl.body, locals);
+        LLVMTypeRef val_t = LLVMTypeOf(val);
+        if (val_t != llvm_ret) {
+            if (LLVMGetTypeKind(llvm_ret) == LLVMFloatTypeKind &&
+                LLVMGetTypeKind(val_t) == LLVMDoubleTypeKind) {
+                val = LLVMBuildFPTrunc(g->builder, val, llvm_ret, "trunc");
+            } else if (LLVMGetTypeKind(llvm_ret) == LLVMDoubleTypeKind &&
+                       LLVMGetTypeKind(val_t) == LLVMFloatTypeKind) {
+                val = LLVMBuildFPExt(g->builder, val, llvm_ret, "ext");
+            }
+        }
+        if (is_rc_managed_type(ret_type) &&
+            !expr_yields_owned_rc_value(g, member->method_decl.body, locals)) {
+            emit_rc_retain_for_type(g, ret_type, val);
+        }
+        emit_release_owned_locals(g, locals);
+        LLVMBuildRet(g->builder, val);
+    }
+
+    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+    if (!LLVMGetBasicBlockTerminator(cur_bb)) {
+        emit_release_owned_locals(g, locals);
+        if (ret_type->kind == TYPE_VOID) {
+            LLVMBuildRetVoid(g->builder);
+        } else {
+            LLVMBuildRet(g->builder, LLVMConstNull(llvm_ret));
+        }
+    }
+
+    g->current_fn = saved_fn;
+    g->current_fn_ret_type = saved_fn_ret;
+    g->current_this = saved_this;
+    g->current_type_sym = saved_type_sym;
+    g->current_fn_body = saved_fn_body;
+    g->cur_mtps = saved_mtps;
+    g->cur_mbind = saved_mbind;
+    g->cur_inst = saved_inst;
+    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+}
+
+/* Drain the queue; emitting a body may enqueue further specializations. */
+static void emit_pending_method_specs(zan_irgen_t *g) {
+    while (g->method_spec_emitted < g->method_spec_count) {
+        int i = g->method_spec_emitted++;
+        emit_method_spec_body(g, i);
+    }
 }
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
@@ -918,6 +1139,8 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
 done:
     ;
+    /* Main may have created method specializations too. */
+    emit_pending_method_specs(g);
     /* Synthesise per-class release functions now that every class type has
      * been registered (Pass 1) and referenced (Passes 2/3). */
     di_clear(g); /* the following are synthetic fns; no user source scope */

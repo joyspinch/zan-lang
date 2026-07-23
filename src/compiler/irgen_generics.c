@@ -268,6 +268,14 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         e->ident.name.str[2] == 'w')
         return 1;
     if (e->kind == AST_STRING_INTERP) return 1;
+    /* Dict.Keys / Dict.Values build a fresh owned List snapshot. */
+    if (e->kind == AST_MEMBER_ACCESS &&
+        ((e->member.name.len == 4 && memcmp(e->member.name.str, "Keys", 4) == 0) ||
+         (e->member.name.len == 6 && memcmp(e->member.name.str, "Values", 6) == 0))) {
+        zan_type_t *ot = infer_expr_type(g, e->member.object, locals);
+        if (ot && ot->name.len == 4 && memcmp(ot->name.str, "Dict", 4) == 0)
+            return 1;
+    }
     if (e->kind == AST_BINARY) {
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals)) {
             return 1;
@@ -448,6 +456,19 @@ static int local_owns_arc(local_var_t *v) {
     return LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
 }
 
+static int local_is_dict(local_var_t *v) {
+    return v && v->arc_owned == 1 && v->type &&
+           ((v->type->name.len == 4 && memcmp(v->type->name.str, "Dict", 4) == 0) ||
+            (v->type->name.len == 10 && memcmp(v->type->name.str, "Dictionary", 10) == 0)) &&
+           LLVMGetTypeKind(LLVMGetAllocatedType(v->alloca)) == LLVMPointerTypeKind;
+}
+
+static void emit_release_dict_local(zan_irgen_t *g, local_var_t *v) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, v->alloca, "dict.rel");
+    emit_dict_release_elems(g, v->type, cur);
+}
+
 static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
     if (!locals) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -456,6 +477,8 @@ static void emit_release_owned_locals(zan_irgen_t *g, local_scope_t *locals) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
+        } else if (local_is_dict(&locals->vars[i])) {
+            emit_release_dict_local(g, &locals->vars[i]);
         } else if (locals->vars[i].arr_len && locals->vars[i].type) {
             LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
                                             locals->vars[i].alloca, "arr.rel");
@@ -477,6 +500,8 @@ static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *local
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
+        } else if (local_is_dict(&locals->vars[i])) {
+            emit_release_dict_local(g, &locals->vars[i]);
         } else if (locals->vars[i].arr_len && locals->vars[i].type) {
             LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,
                                             locals->vars[i].alloca, "arr.rel");
@@ -503,6 +528,8 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
             emit_rc_release_for_type(g, locals->vars[i].type, cur);
+        } else if (!terminated && local_is_dict(&locals->vars[i])) {
+            emit_release_dict_local(g, &locals->vars[i]);
         } else if (!terminated && locals->vars[i].arr_len && locals->vars[i].type) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef a = LLVMBuildLoad2(g->builder, i8ptr,

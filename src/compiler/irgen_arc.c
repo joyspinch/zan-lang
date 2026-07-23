@@ -151,6 +151,63 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
     LLVMPositionBuilderAtEnd(b, done);
 }
 
+/* Release the rc-managed keys/values held by a Dict value `col` (an i8* to
+ * the bare Dict struct { i64 count, i64 cap, i8** keys, i64* vals }). The
+ * header-less Dict struct/buffers are calloc'd and not rc-counted; only the
+ * tracked occupants are released. No-op for a null dict. */
+static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col) {
+    zan_type_t *kt = dict_key_type(g, dict_type);
+    zan_type_t *vt = dict_value_type(dict_type);
+    bool krc = kt && is_rc_managed_type(kt);
+    bool vrc = vt && is_rc_managed_type(vt);
+    if (!krc && !vrc) return;
+    if (!col || LLVMGetTypeKind(LLVMTypeOf(col)) != LLVMPointerTypeKind) return;
+    LLVMContextRef c = g->ctx;
+    LLVMBuilderRef b = g->builder;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef chk  = LLVMAppendBasicBlockInContext(c, fn, "dc.chk");
+    LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(c, fn, "dc.head");
+    LLVMBasicBlockRef body = LLVMAppendBasicBlockInContext(c, fn, "dc.body");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(c, fn, "dc.done");
+    LLVMValueRef c8 = (LLVMTypeOf(col) == i8ptr) ? col
+                      : LLVMBuildBitCast(b, col, i8ptr, "dc.c8");
+    LLVMValueRef isn = LLVMBuildICmp(b, LLVMIntEQ, c8, LLVMConstNull(i8ptr), "dc.isn");
+    LLVMBuildCondBr(b, isn, done, chk);
+    LLVMPositionBuilderAtEnd(b, chk);
+    LLVMValueRef dp = LLVMBuildBitCast(b, c8, LLVMPointerType(g->dict_struct_type, 0), "dp");
+    LLVMValueRef cnt = LLVMBuildLoad2(b, i64,
+        LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 0, "cntp"), "cnt");
+    LLVMValueRef ks = LLVMBuildLoad2(b, LLVMPointerType(i8ptr, 0),
+        LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 2, "kp"), "ks");
+    LLVMValueRef vs = LLVMBuildLoad2(b, LLVMPointerType(i64, 0),
+        LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 3, "vp"), "vs");
+    LLVMBuildBr(b, head);
+    LLVMPositionBuilderAtEnd(b, head);
+    LLVMValueRef iphi = LLVMBuildPhi(b, i64, "i");
+    LLVMValueRef lt = LLVMBuildICmp(b, LLVMIntSLT, iphi, cnt, "lt");
+    LLVMBuildCondBr(b, lt, body, done);
+    LLVMPositionBuilderAtEnd(b, body);
+    if (krc) {
+        LLVMValueRef kslot = LLVMBuildGEP2(b, i8ptr, ks, &iphi, 1, "kslot");
+        LLVMValueRef kv = LLVMBuildLoad2(b, i8ptr, kslot, "kv");
+        emit_collection_release_raw_slot(g, kt, kv, i8ptr);
+    }
+    if (vrc) {
+        LLVMValueRef vslot = LLVMBuildGEP2(b, i64, vs, &iphi, 1, "vslot");
+        LLVMValueRef vv = LLVMBuildLoad2(b, i64, vslot, "vv");
+        emit_collection_release_raw_slot(g, vt, vv, i64);
+    }
+    LLVMValueRef inext = LLVMBuildAdd(b, iphi, LLVMConstInt(i64, 1, 0), "inext");
+    LLVMBasicBlockRef body_end = LLVMGetInsertBlock(b);
+    LLVMBuildBr(b, head);
+    LLVMValueRef vals[2] = { LLVMConstInt(i64, 0, 0), inext };
+    LLVMBasicBlockRef blks[2] = { chk, body_end };
+    LLVMAddIncoming(iphi, vals, blks, 2);
+    LLVMPositionBuilderAtEnd(b, done);
+}
+
 /* Release the rc-managed elements of a bare `new T[n]` array buffer. Arrays
  * carry no length header, so the count is threaded in explicitly (captured at
  * the declaration). Null buffer is a no-op. */
@@ -571,7 +628,7 @@ static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
     }
     if (which < 0) return NULL;
     if (call->call.type_args.count > which)
-        return zan_binder_resolve_type(g->binder, call->call.type_args.items[which]);
+        return resolve_type_ctx(g, call->call.type_args.items[which]);
     zan_ast_list_t *params = &msym->decl->method_decl.params;
     for (int j = 0; j < params->count && j < call->call.args.count; j++) {
         zan_ast_node_t *pref = params->items[j]->param.type;

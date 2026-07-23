@@ -64,7 +64,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             local_var_t *pre = local_find(locals, stmt->var_decl.name);
             if (pre) {
                 zan_type_t *type = stmt->var_decl.type
-                    ? zan_binder_resolve_type(g->binder, stmt->var_decl.type)
+                    ? resolve_type_ctx(g, stmt->var_decl.type)
                     : pre->type;
                 for (int i = 0; i < g->current_async_slot_count; i++) {
                     if (g->current_async_slots[i].slot_alloca == pre->alloca) {
@@ -117,7 +117,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         zan_type_t *type = g->binder->type_int; /* default */
         if (stmt->var_decl.type) {
-            type = zan_binder_resolve_type(g->binder, stmt->var_decl.type);
+            type = resolve_type_ctx(g, stmt->var_decl.type);
         } else if (stmt->var_decl.initializer) {
             zan_ast_node_t *init = stmt->var_decl.initializer;
 
@@ -128,7 +128,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "arr");
                 LLVMBuildStore(g->builder, arr_val, alloca);
 
-                zan_type_t *elem_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
+                zan_type_t *elem_type = resolve_type_ctx(g, init->new_expr.type);
                 if (!elem_type) elem_type = g->binder->type_int;
                 zan_type_t *arr_type = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
                 arr_type->kind = TYPE_ARRAY;
@@ -150,7 +150,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "list");
                     LLVMBuildStore(g->builder, list_val, alloca);
-                    zan_type_t *list_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
+                    zan_type_t *list_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, list_type);
                     /* List is refcounted: `new` yields an owned (+1) reference, so
                      * this local owns it and must release it at scope exit. */
@@ -163,7 +163,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "sb");
                     LLVMBuildStore(g->builder, sb_val, alloca);
-                    zan_type_t *sb_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
+                    zan_type_t *sb_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, sb_type);
                     /* StringBuilder is refcounted: `new` yields an owned (+1)
                      * reference this local owns and releases at scope exit. */
@@ -177,8 +177,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMTypeRef ptr_type = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef alloca = emit_entry_alloca(g, ptr_type, "dict");
                     LLVMBuildStore(g->builder, dict_val, alloca);
-                    zan_type_t *dict_type = zan_binder_resolve_type(g->binder, init->new_expr.type);
+                    zan_type_t *dict_type = resolve_type_ctx(g, init->new_expr.type);
                     local_add(locals, stmt->var_decl.name, alloca, dict_type);
+                    /* This local owns the freshly-built dict: release its
+                     * rc-managed keys/values at scope exit. */
+                    locals->vars[locals->count - 1].arc_owned = 1;
                     return;
                 }
             }
@@ -316,6 +319,14 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         local_add(locals, stmt->var_decl.name, alloca, type);
         if (arc_own) locals->vars[locals->count - 1].arc_owned = 1;
+        /* A local initialized with a freshly-built dict owns the dict's
+         * rc-managed keys/values and releases them at scope exit. */
+        if (type &&
+            ((type->name.len == 4 && memcmp(type->name.str, "Dict", 4) == 0) ||
+             (type->name.len == 10 && memcmp(type->name.str, "Dictionary", 10) == 0)) &&
+            stmt->var_decl.initializer &&
+            stmt->var_decl.initializer->kind == AST_NEW_EXPR)
+            locals->vars[locals->count - 1].arc_owned = 1;
         /* rc-element array from `new T[n]`: remember the element count so its
          * elements can be released at scope exit (arrays have no length header). */
         if (type && type->kind == TYPE_ARRAY && type->element_type &&
@@ -821,7 +832,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             for (int ci = 0; ci < ncatch; ci++) {
                 zan_ast_node_t *cc = stmt->try_stmt.catches.items[ci];
                 zan_type_t *et = cc->catch_clause.type
-                    ? zan_binder_resolve_type(g->binder, cc->catch_clause.type)
+                    ? resolve_type_ctx(g, cc->catch_clause.type)
                     : NULL;
                 LLVMBasicBlockRef body_bb =
                     LLVMAppendBasicBlockInContext(g->ctx, fn, "catch.body");
@@ -977,7 +988,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* element type: declared loop-var type, else inferred from collection */
         zan_type_t *elem_type = NULL;
         if (stmt->foreach_stmt.var_type)
-            elem_type = zan_binder_resolve_type(g->binder, stmt->foreach_stmt.var_type);
+            elem_type = resolve_type_ctx(g, stmt->foreach_stmt.var_type);
         if (!elem_type || elem_type->kind == TYPE_ERROR)
             elem_type = container_elem_type(
                 infer_expr_type(g, stmt->foreach_stmt.collection, locals));

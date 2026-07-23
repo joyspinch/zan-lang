@@ -1342,9 +1342,30 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->generic_insts);
     g->generic_insts = NULL;
     g->generic_inst_count = g->generic_inst_cap = 0;
+    free(g->method_specs);
+    g->method_specs = NULL;
+    g->method_spec_count = g->method_spec_cap = g->method_spec_emitted = 0;
+    g->cur_mtps = NULL;
+    g->cur_mbind = NULL;
 }
 
 /* ---- type mapping ---- */
+
+/* forward decls into later-included parts of this translation unit */
+static zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
+                                   zan_ast_list_t *tps, zan_type_t **bind);
+static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
+                                     zan_type_t **bind, int bindc);
+static void emit_pending_method_specs(zan_irgen_t *g);
+
+/* Resolve a type reference appearing in the body currently being emitted,
+ * substituting the active method specialization's type parameters (T -> the
+ * concrete type bound at the call site that created the specialization). */
+static zan_type_t *resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref) {
+    zan_type_t *t = zan_binder_resolve_type(g->binder, tref);
+    if (g->cur_mtps && t) t = subst_method_tp(g, t, g->cur_mtps, g->cur_mbind);
+    return t;
+}
 
 static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     if (!type) return LLVMVoidTypeInContext(g->ctx);
@@ -1778,6 +1799,7 @@ static void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueR
 static void emit_arc_release_typed(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym);
 static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef col);
+static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col);
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len);
 
