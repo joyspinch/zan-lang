@@ -20,11 +20,18 @@ Capabilities advertised on `initialize`:
 | Feature                          | Method                          |
 |----------------------------------|---------------------------------|
 | Diagnostics                      | `textDocument/publishDiagnostics` (push) |
-| Document sync (full)             | `didOpen` / `didChange` / `didClose` |
-| Autocomplete                     | `textDocument/completion`       |
+| Document sync (full)             | `didOpen` / `didChange` / `didClose` / `didSave` |
+| Autocomplete                     | `textDocument/completion` (with resolve) |
 | Hover type info                  | `textDocument/hover`            |
+| Signature help                   | `textDocument/signatureHelp`    |
 | Go to definition                 | `textDocument/definition`       |
+| Find references                  | `textDocument/references`       |
 | Document symbols (outline)       | `textDocument/documentSymbol`   |
+| Code actions / quick fixes       | `textDocument/codeAction`       |
+| Commands                         | `workspace/executeCommand`      |
+
+Not yet implemented: `rename`, `workspace/symbol`, semantic tokens, inlay
+hints, incremental document sync.
 
 Diagnostics are produced by running the real compiler front-end
 (lexer → parser → binder → checker) and mapping each `zan_diag_t` entry to an
@@ -43,15 +50,17 @@ new LanguageClient("zan", "Zan Language Server", serverOptions, clientOptions).s
 ## zan-dap — Debug Adapter Protocol
 
 Supported requests: `initialize`, `launch`/`attach`, `configurationDone`,
-`setBreakpoints` (with optional conditions), `threads`, `stackTrace`, `scopes`,
-`variables`, `continue`, `next`, `stepIn`, `stepOut`, `pause`, `terminate`,
-`disconnect`. Emits `initialized`, `stopped`, `terminated`, `exited`, and
-`output` events.
+`setBreakpoints` (conditional / hit-count / logpoints), `setExceptionBreakpoints`,
+function breakpoints, `threads`, `stackTrace`, `scopes`, `variables`,
+`setVariable`, `evaluate` (watch / hover), `exceptionInfo`, `continue`, `next`,
+`stepIn`, `stepOut`, `pause`, `terminate`, `disconnect`. Emits `initialized`,
+`stopped`, `terminated`, `exited`, and `output` events.
 
-Runtime process control is delegated to the IDE debugger engine
-(`src/ide/debugger.c`) — Windows `CreateProcess`-based, with a simulated
-stepping model on other platforms — while `zan-dap` provides the full
-protocol surface.
+Runtime process control is delegated to the debugger engine
+(`src/dap/debugger.c`), which drives a real native debug session through
+**gdb** — resolved first as the bundled `toolchain\debugger\bin\gdb.exe`
+shipped by `scripts/publish_ide.ps1`, then `ZAN_GDB`, then a system gdb —
+while `zan-dap` provides the protocol surface.
 
 ### VS Code launch config
 

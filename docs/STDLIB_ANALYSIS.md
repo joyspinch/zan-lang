@@ -1,5 +1,19 @@
 # Zan 标准库能力分析 (Stdlib Capability Analysis)
 
+> **状态更新（2026-07）：本文档的大部分"缺失"结论已过时，仅作历史参考。**
+> 现状核实（以 `stdlib/` 代码为准）：
+> - LINQ：`System/Linq/Enumerable.zan` 已存在（方法链），另有 conformance 测试（`linq_chained`、`generics_linq`）。
+> - 集合：`System/Collections/` 已有 `HashSet` / `Queue` / `Stack` / `LinkedList`。
+> - `DateTime.zan` / `TimeSpan.zan` / `Random.zan` 已存在。
+> - IO/Process：已通过 `DllImport("crt")` 抽象跨平台（msvcrt / libc 双端），不再仅 Windows。
+> - 网络：`System/Net/` 已有 Http / WebSocket / Mqtt / Tls / Sockets / Sse / Rpc 子模块。
+> - 数据库：`System/Data/` 已有 DbConnection + MySql / Postgres / Sqlite / Redis / Orm / ZanDb。
+> - 线程：可真正启动线程（见 `tests/conformance/thread_start.zan`），并有 AsyncGate / AsyncRwLock 等原语。
+> - 文本：`Encoding.zan` 已扩充（约 14 KB）；Regex 仍缺。
+>
+> **仍然成立的系统性短板**：失败静默返回空串/0、缺乏贯穿的异常（try/throw）或 Result 约定；Regex 缺失；部分模块仍偏薄。
+
+
 > 目标：盘点 zan-lang 当前"常用标准库"的真实覆盖面，找出与 C#/.NET 级别常用库的差距（含 ORM、LINQ 等），并给出分优先级的补全建议。
 > 结论先行：**语言层能力已相当完整（类/泛型/接口/async/异常/模式匹配/FFI），但标准库仍停留在"能跑通 demo"的薄封装阶段——大量常用能力缺失，且现有实现存在"仅 Windows / 靠 msvcrt / 字符串手撸"三大系统性问题。**
 

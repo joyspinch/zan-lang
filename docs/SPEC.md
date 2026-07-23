@@ -819,10 +819,15 @@ qualified_name  = IDENT { "." IDENT } ;
 
 ## Appendix A: Reserved for Future
 
-- `yield` — iterator/generator support
-- `fixed` — pin managed object in memory
+Since implemented (moved out of this appendix): `yield return` / `yield break`
+(eagerly lowered to a hidden `List<T>` accumulator, not a lazy iterator),
+`fixed`, `lock`, and `record` — see `tests/conformance/yield_iterators.zan`,
+`lock_goto_unsafe_fixed.zan`, and `record_types.zan`.
+
+Still reserved:
+
 - `checked` / `unchecked` — overflow checking
-- `lock` — monitor-based synchronization
 - `using` statement — deterministic disposal (like C# IDisposable)
-- `record` — immutable reference type with value equality
 - `init` — init-only property setter
+- lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
+- LINQ query syntax (`from x in xs where ... select`) — method chains only

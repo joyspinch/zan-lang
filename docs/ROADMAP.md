@@ -481,3 +481,29 @@ a simulated stepping model on other platforms).
 - Zan compiler written in Zan compiles itself
 - gen2 and gen3 produce identical output
 
+---
+
+## Milestone P: IDE Productization (production/commercial readiness)
+
+**Goal:** Ship ZanIDE as a production-grade product for commercial development.
+
+Decisions: distribution stays as a relocatable folder (**no installer**).
+
+- [ ] **P.1 — Code signing**
+  - Sign `ZanIDE.exe` / `zanc.exe` / bundled tools (Authenticode) so
+    SmartScreen/AV do not block the published folder.
+- [ ] **P.2 — Auto-update**
+  - In-IDE update check + download/replace of the dist folder (delta or full),
+    with rollback on failure.
+- [ ] **P.3 — Crash reporting**
+  - Crash handler in the IDE (minidump / stack capture) + opt-in upload;
+    surface compiler/runtime `zan_crash` reports the same way.
+- [ ] **P.4 — Stdlib / package store**
+  - A package registry ("store") browsable from the IDE, backed by `zanpkg`;
+    publish/install versioned stdlib extensions and third-party libraries.
+- [ ] **P.5 — Remaining gaps tracked elsewhere**
+  - Linux/macOS self-contained linking + publish path (`SELF_CONTAINED_TOOLCHAIN.md` §4)
+  - LSP: rename, workspace symbols, semantic tokens; IDE format-on-save via `zanfmt`
+  - Stdlib error model: throw exceptions instead of silent empty/0 returns
+  - IDE automated UI tests, long-run leak validation, crash recovery/autosave
+

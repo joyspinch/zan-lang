@@ -21,32 +21,43 @@ The script (`scripts/publish_ide.ps1`):
 1. Builds the IDE via `scripts/build_ide.ps1` (pass `-SkipBuild` to package the
    existing `build\` artifacts as-is).
 2. Wipes and recreates `dist\`.
-3. Copies the toolchain and standard library into it.
-4. Writes a `README.txt` describing prerequisites and usage.
+3. Copies the IDE, the compiler + bundled linker toolchain, companion CLIs,
+   the bundled gdb debugger, the standard library, examples, and templates.
+4. Writes a `README.txt` describing usage.
 
 ## Layout of `dist\`
 
 | Path            | Purpose                                                              |
-| --------------- | ------------------------------------------------------------------- |
+| --------------- | -------------------------------------------------------------------- |
 | `ZanIDE.exe`    | The IDE.                                                             |
-| `zanc.exe`      | The Zan compiler. Kept next to the IDE.                              |
-| `stdlib\`       | Standard library sources. `zanc` auto-includes what it needs.       |
-| `examples\`     | Sample programs for the IDE's Examples pane (optional).             |
-| `README.txt`    | Prerequisites + how to run.                                          |
+| `SDL3.dll`      | SDL3 runtime the IDE window uses; must sit next to `ZanIDE.exe`.     |
+| `toolchain\`    | The compiler and everything it links with, as siblings: `zanc.exe`, `zan-lsp.exe`, `zan-dap.exe`, `zanpkg`/`zanfmt`/`zandoc`, the bundled linker (`ld.exe` + `mingw\` MinGW-w64 runtime), cross sysroots (`linux-musl\` …), runtime objects (`zanrt_io*`, `zanrt_sync*`), `zan_gui.lib`, and `debugger\bin\gdb.exe`. |
+| `stdlib\`       | Standard library sources. `zanc` auto-includes what it needs.        |
+| `examples\`     | Sample programs for the IDE's Examples pane (optional).              |
+| `templates\`    | Built-in New Project templates (data-driven, `template.manifest`).   |
+| `README.txt`    | Usage notes.                                                          |
 
-## Why the stdlib lives inside the release folder
+## Why everything lives inside the release folder
 
 The IDE resolves the compiler relative to **its own executable directory**
-(`IdeDemo.ExeDir()` → `zanc.exe`), and `zanc` in turn resolves its stdlib
-relative to **its own** executable (`<exe_dir>/stdlib` or `<exe_dir>/../stdlib`).
+(`toolchain\zanc.exe`), and `zanc` in turn resolves its linker, sysroots, and
+runtime objects as **its own siblings** in that same `toolchain\` folder, and
+its stdlib relative to its executable (`<exe_dir>/stdlib` or
+`<exe_dir>/../stdlib`).
 
-Because `ZanIDE.exe`, `zanc.exe` and `stdlib\` all sit together in `dist\`,
-the release is fully relocatable: copy the folder anywhere and the IDE still
-finds the compiler and standard library — no absolute paths, no registry, no
-environment variables.
+Because `ZanIDE.exe`, `toolchain\` and `stdlib\` all travel together in
+`dist\`, the release is fully relocatable: copy the folder anywhere and the
+IDE still finds the compiler, linker, and standard library — no absolute
+paths, no registry, no environment variables.
 
 ## Runtime prerequisite
 
-An **LLVM toolchain** (`clang`, `llvm-lib`) must be on `PATH` on the target
-machine. `zanc` emits LLVM IR and shells out to `clang` to link the final
-executable; without it, Build/Run/Debug inside the IDE will fail.
+**None for normal use.** `zanc` emits object code and links it in-process via
+the bundled GNU `ld` + MinGW-w64 runtime in `toolchain\` (see
+`docs/SELF_CONTAINED_TOOLCHAIN.md`), and `zan-dap` debugs with the bundled
+`toolchain\debugger\bin\gdb.exe`. No LLVM/clang, MSVC, or system gdb install
+is required on the target machine.
+
+Fallbacks: if the linker files under `toolchain\` are removed, `zanc` falls
+back to a system `clang` on `PATH`; if the bundled gdb is missing, `zan-dap`
+falls back to a system/known gdb (`ZAN_GDB`).

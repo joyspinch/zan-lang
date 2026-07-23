@@ -16,8 +16,10 @@
 #     templates\          built-in New Project templates (data-driven, editable)
 #     README.txt          prerequisites + how to run
 #
-# Prerequisite on the target machine: an LLVM toolchain (clang, llvm-lib) on
-# PATH, because zanc emits LLVM IR and shells out to clang to produce the exe.
+# No prerequisite on the target machine: zanc links via the bundled linker in
+# dist\toolchain (ld.exe + mingw\ runtime), and zan-dap debugs with the bundled
+# gdb. A system clang on PATH is only a fallback if the bundled linker files
+# are removed.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1
 #         Add  -SkipBuild  to package the existing build\ artifacts as-is.
