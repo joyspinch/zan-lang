@@ -28,14 +28,15 @@
 
 | # | 事项 | 优先级 | 验收标准 |
 |---|------|--------|----------|
-| B1 | `OrderBy/OrderByDescending` 支持泛型可比较键（string/double/long），新增 `ThenBy/ThenByDescending` | P0 | conformance 用例：按 string 与 double 键排序、二级排序稳定 |
-| B2 | 补齐核心算子：`GroupBy`、`SelectMany`、`ToDictionary`、`Single/SingleOrDefault`、`Sum/Min/Max/Average(selector)`、`LastOrDefault` | P0 | 每个算子含 conformance 用例，语义对齐 C# |
-| B3 | 异常语义对齐 C#：空序列 `First/Last/Single` 抛 `InvalidOperationException`；保留 `*OrDefault` 返回默认值 | P0 | 异常路径 conformance 用例（依赖 A2 的异常约定） |
+| B1 | ~~泛型可比较键~~ → 已落地为类型化键名：`OrderByStr/OrderByStrDescending`（string 键）、`OrderByNum/OrderByNumDescending`（double 键）、`OrderBy(k1, k2)` 二级 int 键（泛型键受编译器 bug 限制，见 `docs/bugs/generics-uniform-repr.md`） | **已完成** | `tests/conformance/linq_extended.zan` |
+| B2 | 核心算子：`GroupBy/GroupByStr`、`SelectMany`、`Single/SingleOrDefault`、`LastOrDefault`、`Sum/Min/Max/Average(selector)`、`TakeWhile/SkipWhile`、`ContainsStr/DistinctStr/InStr`（`ToDictionary` 被 Dictionary 泛型值 bug 阻塞，见 bug 文档 §5） | **已完成** | 同上 |
+| B3 | 异常语义对齐 C#：空序列 `First/Last/Single` 抛 `InvalidOperationException`；保留 `*OrDefault` 返回默认值 | **已完成** | 同上（`stdlib/System/Exception.zan` 新增 InvalidOperationException/ArgumentException） |
 | B4 | `Contains/Distinct/In` 对引用类型支持 `Equals` 语义（当前仅 `==`） | P1 | 自定义类型去重/包含用例通过 |
 | B5 | 文档：`docs/STDLIB.md` 增补 LINQ 章节，明确与 C# 的差异清单（急切求值、无 IEnumerable） | P1 | 文档与实现一致 |
 | B6 | 惰性迭代器：`yield` 生成真正的惰性迭代器，LINQ 算子基于 IEnumerable 惰性链 | P2 | 无限序列 + Take 用例通过；现有急切用例不回归 |
 | B7 | LINQ 查询语法（`from … where … select`）脱糖为方法链 | P2 | parser/binder 支持，conformance 覆盖 join/group |
 | B8 | 语言便利特性（按需）：`using` 声明、`init`/`with`、`checked` | P2 | 逐项 SPEC + conformance |
+| B9 | 编译器：修复泛型统一表示导致的 7 项 bug（泛型比较/相等、委托返回类型重载、Dictionary 泛型值、泛型累加器泄漏等），修复后可将 OrderByStr/ContainsStr 等并回 C# 同名重载 | P1 | `docs/bugs/generics-uniform-repr.md` 各条最小复现通过 |
 
 > B1–B3 收益最大、改动集中在 stdlib，一周期内可完成；B6/B7 涉及编译器，
 > 放在 A 的 P0/P1 之后。

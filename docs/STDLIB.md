@@ -344,6 +344,94 @@ public class HttpResponse {
 
 ---
 
+### 3.6 System.Linq.Enumerable
+
+Eager, typed LINQ-style operators over `List<T>` (extension methods; the
+static form `Enumerable.Where(list, pred)` also works). Every operator
+materialises its result into a new `List`.
+
+```csharp
+namespace System.Linq;
+
+class Enumerable {
+    // filtering / projection
+    static List<T> Where<T>(this List<T> src, Predicate<T> pred);
+    static List<R> Select<T, R>(this List<T> src, Selector<T, R> sel);
+    static List<R> SelectMany<T, R>(this List<T> src, Selector<T, List<R>> sel);
+
+    // quantifiers / counting
+    static bool Any<T>(this List<T> src);                      // + (pred)
+    static bool All<T>(this List<T> src, Predicate<T> pred);
+    static int  Count<T>(this List<T> src);                    // + (pred)
+
+    // element access — First/Last/Single throw InvalidOperationException
+    // on empty/no-match (Single also on >1); *OrDefault return the default
+    static T First<T>(this List<T> src);                       // + (pred)
+    static T FirstOrDefault<T>(this List<T> src);              // + (pred)
+    static T Last<T>(this List<T> src);                        // + (pred)
+    static T LastOrDefault<T>(this List<T> src);               // + (pred)
+    static T Single<T>(this List<T> src);                      // + (pred)
+    static T SingleOrDefault<T>(this List<T> src);             // + (pred)
+
+    // partitioning / ordering
+    static List<T> Take<T>(this List<T> src, int n);
+    static List<T> TakeWhile<T>(this List<T> src, Predicate<T> pred);
+    static List<T> Skip<T>(this List<T> src, int n);
+    static List<T> SkipWhile<T>(this List<T> src, Predicate<T> pred);
+    static List<T> Reverse<T>(this List<T> src);
+    static List<T> OrderBy<T>(this List<T> src, KeySelector<T> key);      // int key
+    static List<T> OrderBy<T>(this List<T> src, KeySelector<T> k1,
+                              KeySelector<T> k2);                          // 2-level
+    static List<T> OrderByDescending<T>(this List<T> src, KeySelector<T> key);
+    static List<T> OrderByStr<T>(this List<T> src, StrKeySelector<T> key); // string key
+    static List<T> OrderByStrDescending<T>(this List<T> src, StrKeySelector<T> key);
+    static List<T> OrderByNum<T>(this List<T> src, NumKeySelector<T> key); // double key
+    static List<T> OrderByNumDescending<T>(this List<T> src, NumKeySelector<T> key);
+
+    // grouping (order of groups follows first occurrence)
+    static List<Grouping<T>> GroupBy<T>(this List<T> src, KeySelector<T> key);
+    static List<Grouping<T>> GroupByStr<T>(this List<T> src, StrKeySelector<T> key);
+
+    // set / membership (== semantics; use the *Str forms for string values)
+    static bool Contains<T>(this List<T> src, T target);
+    static bool ContainsStr(this List<string> src, string target);
+    static List<T> Distinct<T>(this List<T> src);
+    static List<string> DistinctStr(this List<string> src);
+    static List<T> In<T>(this List<T> src, List<T> values);      // SQL IN
+    static List<string> InStr(this List<string> src, List<string> values);
+    static List<string> Like(this List<string> src, string pattern); // SQL LIKE
+
+    // aggregation
+    static A Aggregate<T, A>(this List<T> src, A seed, Accumulator<T, A> f);
+    static int Sum(this List<int> src);
+    static int Sum<T>(this List<T> src, KeySelector<T> key);
+    static double SumNum(this List<double> src);
+    static double SumNum<T>(this List<T> src, NumKeySelector<T> key);
+    static int Min(this List<int> src);                          // + (key)
+    static double MinNum(this List<double> src);
+    static int Max(this List<int> src);                          // + (key)
+    static double MaxNum(this List<double> src);
+    static double Average(this List<int> src);                   // + (key)
+    static double AverageNum(this List<double> src);
+    static List<T> ToList<T>(this List<T> src);
+}
+```
+
+Differences from C# (by design or pending compiler work — see
+`docs/bugs/generics-uniform-repr.md`):
+
+- **Eager, not lazy**: every operator runs immediately and returns a `List`;
+  there is no `IEnumerable<T>` pipeline.
+- **Typed sort keys**: `OrderBy` takes an int key; string and double keys use
+  the `OrderByStr` / `OrderByNum` names. Overloads that differ only in the
+  delegate's return type would silently mis-bind an untyped lambda.
+- **`*Num` aggregate names** for `List<double>` receivers (`SumNum`,
+  `MinNum`, `MaxNum`, `AverageNum`) for the same overload-resolution reason.
+- **String membership uses the `*Str` forms** (`ContainsStr`, `DistinctStr`,
+  `InStr`): the generic forms compare references for strings.
+- **No `ToDictionary`** yet (blocked by a Dictionary generic-value bug).
+- `Grouping<T>` exposes `Key` (string), `IntKey` (int) and `Items`.
+
 ## 4. Module Resolution Rules
 
 ### 4.1 Search Order
