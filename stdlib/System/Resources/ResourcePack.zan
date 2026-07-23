@@ -4,6 +4,20 @@ using System.Security.Cryptography;
 
 namespace System.Resources;
 
+/// <summary>One queued pack entry: its name, its raw byte payload and the
+/// payload length. One entity instead of parallel name/data/len lists.</summary>
+class ResourceEntry {
+    string name;
+    string data;
+    int len;
+
+    ResourceEntry(string name, string data, int len) {
+        this.name = name;
+        this.data = data;
+        this.len = len;
+    }
+}
+
 /// <summary>Encrypted resource pack (.zrp) writer.
 ///
 /// Layout (private format, nothing legible without the master key):
@@ -30,24 +44,18 @@ class ResourcePackWriter {
     [DllImport("crt")] static extern int fwrite(string buf, int size, int count, int fp);
     [DllImport("crt")] static extern int fclose(int fp);
 
-    List<string> names;
-    List<string> datas;
-    List<int> lens;
+    List<ResourceEntry> entries;
 
     static ResourcePackWriter Create() {
         ResourcePackWriter w = new ResourcePackWriter();
-        w.names = new List<string>();
-        w.datas = new List<string>();
-        w.lens = new List<int>();
+        w.entries = new List<ResourceEntry>();
         return w;
     }
 
     /// <summary>Queues one entry. <paramref name="data"/> is raw bytes with an
     /// explicit length (Zan strings are byte buffers).</summary>
     void Add(string name, string data, int len) {
-        this.names.Add(name);
-        this.datas.Add(data);
-        this.lens.Add(len);
+        this.entries.Add(new ResourceEntry(name, data, len));
     }
 
     /// <summary>Writes the pack. <paramref name="masterKey"/> is 32 bytes.
@@ -55,7 +63,7 @@ class ResourcePackWriter {
     /// private exponent (hex) for index signing; pass null to skip signing.
     /// Returns true on success.</summary>
     bool Write(string path, string masterKey, string nHex, string dHex) {
-        int count = this.names.Count;
+        int count = this.entries.Count;
         int sigLen = 0;
         string nBuf = null;
         string dBuf = null;
@@ -79,7 +87,7 @@ class ResourcePackWriter {
         int off = dataStart;
         int i = 0;
         while (i < count) {
-            string nh = ResourcePack.nameHash(this.names[i]);
+            string nh = ResourcePack.nameHash(this.entries[i].name);
             string iv = RandomNumberGenerator.GetBytes(12);
             if (iv == null) { free(idx); return false; }
             ivs.Add(iv);
@@ -87,13 +95,13 @@ class ResourcePackWriter {
             int j = 0;
             while (j < 16) { idx[rec + j] = nh[j] & 255; j = j + 1; }
             ResourcePack.storeBE64(idx, rec + 16, off);
-            ResourcePack.storeBE64(idx, rec + 24, this.lens[i]);
+            ResourcePack.storeBE64(idx, rec + 24, this.entries[i].len);
             idx[rec + 32] = 0;  // flags (bit0 reserved for compression)
             j = 0;
             while (j < 12) { idx[rec + 33 + j] = iv[j] & 255; j = j + 1; }
             // tag written after encryption below
             free(nh);
-            off = off + this.lens[i];
+            off = off + this.entries[i].len;
             i = i + 1;
         }
 
@@ -101,10 +109,10 @@ class ResourcePackWriter {
         List<string> cts = new List<string>();
         i = 0;
         while (i < count) {
-            string nh = ResourcePack.nameHash(this.names[i]);
+            string nh = ResourcePack.nameHash(this.entries[i].name);
             string ek = ResourcePack.entryKey(masterKey, packId, nh);
             string tag = calloc(17, 1);
-            string ct = AesGcm.Encrypt(ek, 32, ivs[i], nh, 16, this.datas[i], this.lens[i], tag);
+            string ct = AesGcm.Encrypt(ek, 32, ivs[i], nh, 16, this.entries[i].data, this.entries[i].len, tag);
             cts.Add(ct);
             int rec = 4 + 61 * i;
             int j = 0;
@@ -141,7 +149,7 @@ class ResourcePackWriter {
         fwrite(idxCt, 1, idxLen, fp);
         if (sigLen > 0) { fwrite(sig, 1, sigLen, fp); }
         i = 0;
-        while (i < count) { fwrite(cts[i], 1, this.lens[i], fp); i = i + 1; }
+        while (i < count) { fwrite(cts[i], 1, this.entries[i].len, fp); i = i + 1; }
         fclose(fp);
 
         free(hdr); free(idxCt);
@@ -152,6 +160,25 @@ class ResourcePackWriter {
         if (nBuf != null) { free(nBuf); }
         if (dBuf != null) { free(dBuf); }
         return true;
+    }
+}
+
+/// <summary>One parsed index record: the entry's name hash, its payload offset
+/// and size, and its per-entry IV and GCM tag. One entity instead of five
+/// index-aligned parallel lists.</summary>
+class PackIndexEntry {
+    string hash;   // 16-byte truncated SHA-256 of the name
+    int off;       // payload offset within the file
+    int size;      // payload byte length
+    string iv;     // per-entry AES-GCM IV
+    string tag;    // per-entry AES-GCM tag
+
+    PackIndexEntry(string hash, int off, int size, string iv, string tag) {
+        this.hash = hash;
+        this.off = off;
+        this.size = size;
+        this.iv = iv;
+        this.tag = tag;
     }
 }
 
@@ -167,11 +194,7 @@ class ResourcePack {
     string masterKey;
     string packId;
     int count;
-    List<string> hashes;   // 16-byte truncated SHA-256 per entry
-    List<int> offs;
-    List<int> sizes;
-    List<string> ivs;
-    List<string> tags;
+    List<PackIndexEntry> index;
 
     // ---- shared helpers (also used by the writer) ----
 
@@ -303,11 +326,7 @@ class ResourcePack {
         p.masterKey = masterKey;
         p.packId = packId;
         p.count = loadBE32(idx, 0);
-        p.hashes = new List<string>();
-        p.offs = new List<int>();
-        p.sizes = new List<int>();
-        p.ivs = new List<string>();
-        p.tags = new List<string>();
+        p.index = new List<PackIndexEntry>();
         i = 0;
         while (i < p.count) {
             int rec = 4 + 61 * i;
@@ -320,11 +339,7 @@ class ResourcePack {
             while (j < 12) { iv[j] = idx[rec + 33 + j] & 255; j = j + 1; }
             j = 0;
             while (j < 16) { tg[j] = idx[rec + 45 + j] & 255; j = j + 1; }
-            p.hashes.Add(nh);
-            p.offs.Add(loadBE64(idx, rec + 16));
-            p.sizes.Add(loadBE64(idx, rec + 24));
-            p.ivs.Add(iv);
-            p.tags.Add(tg);
+            p.index.Add(new PackIndexEntry(nh, loadBE64(idx, rec + 16), loadBE64(idx, rec + 24), iv, tg));
             i = i + 1;
         }
         free(idx); free(hdr);
@@ -338,7 +353,7 @@ class ResourcePack {
         string nh = nameHash(name);
         int i = 0;
         while (i < this.count) {
-            string h = this.hashes[i];
+            string h = this.index[i].hash;
             int diff = 0;
             int j = 0;
             while (j < 16) { diff = diff | ((h[j] & 255) ^ (nh[j] & 255)); j = j + 1; }
@@ -354,7 +369,7 @@ class ResourcePack {
     int SizeOf(string name) {
         int i = this.find(name);
         if (i < 0) { return -1; }
-        return this.sizes[i];
+        return this.index[i].size;
     }
 
     /// <summary>Decrypts one entry on demand (only that entry is read from
@@ -365,11 +380,12 @@ class ResourcePack {
         outLen[0] = -1;
         int i = this.find(name);
         if (i < 0) { return null; }
-        int sz = this.sizes[i];
-        string ct = File.ReadBytes(this.path, this.offs[i], sz);
-        string ek = entryKey(this.masterKey, this.packId, this.hashes[i]);
+        PackIndexEntry e = this.index[i];
+        int sz = e.size;
+        string ct = File.ReadBytes(this.path, e.off, sz);
+        string ek = entryKey(this.masterKey, this.packId, e.hash);
         List<int> ok = new List<int>(); ok.Add(0);
-        string pt = AesGcm.Decrypt(ek, 32, this.ivs[i], this.hashes[i], 16, ct, sz, this.tags[i], ok);
+        string pt = AesGcm.Decrypt(ek, 32, e.iv, e.hash, 16, ct, sz, e.tag, ok);
         free(ct); free(ek);
         if (ok[0] == 0) { free(pt); return null; }
         outLen[0] = sz;
