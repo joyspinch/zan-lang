@@ -16,6 +16,18 @@ class SqlDialect {
     static int Oracle    = 2;
 }
 
+/// <summary>One column=value assignment for INSERT/UPDATE, kept together as an
+/// entity instead of parallel column/value lists.</summary>
+class SetClause {
+    string column;
+    string val;
+
+    SetClause(string column, string val) {
+        this.column = column;
+        this.val = val;
+    }
+}
+
 /// <summary>
 /// Fluent SQL query builder inspired by FreeSQL.
 /// Supports SELECT, INSERT, UPDATE, DELETE with method chaining.
@@ -49,8 +61,7 @@ class QueryBuilder {
     int limitVal;
     int offsetVal;
     int dialect;
-    List<string> setColumns;
-    List<string> setValues;
+    List<SetClause> sets;
     bool distinct;
 
     DbParams whereParams;
@@ -65,8 +76,7 @@ class QueryBuilder {
         this.limitVal = -1;
         this.offsetVal = -1;
         this.dialect = SqlDialect.Standard;
-        this.setColumns = new List<string>();
-        this.setValues = new List<string>();
+        this.sets = new List<SetClause>();
         this.distinct = false;
         this.whereParams = DbParams.Create();
     }
@@ -335,15 +345,13 @@ class QueryBuilder {
 
     /// <summary>Sets a column=value pair for INSERT/UPDATE.</summary>
     QueryBuilder Set(string column, string val) {
-        this.setColumns.Add(QueryBuilder.RequireIdent(column));
-        this.setValues.Add(val);
+        this.sets.Add(new SetClause(QueryBuilder.RequireIdent(column), val));
         return this;
     }
 
     /// <summary>Sets an integer column=value pair.</summary>
     QueryBuilder SetInt(string column, int val) {
-        this.setColumns.Add(QueryBuilder.RequireIdent(column));
-        this.setValues.Add(Convert.ToString(val));
+        this.sets.Add(new SetClause(QueryBuilder.RequireIdent(column), Convert.ToString(val)));
         return this;
     }
 
@@ -368,19 +376,18 @@ class QueryBuilder {
         sb.Append("INSERT INTO ");
         sb.Append(this.tableName);
         sb.Append(" (");
-        int n = this.setColumns.Count;
-        int i = 0;
-        while (i < n) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(this.setColumns[i]);
-            i = i + 1;
+        bool first = true;
+        foreach (SetClause s in this.sets) {
+            if (!first) { sb.Append(", "); }
+            sb.Append(s.column);
+            first = false;
         }
         sb.Append(") VALUES (");
-        i = 0;
-        while (i < n) {
-            if (i > 0) { sb.Append(", "); }
+        first = true;
+        foreach (SetClause s in this.sets) {
+            if (!first) { sb.Append(", "); }
             sb.Append("?");
-            i = i + 1;
+            first = false;
         }
         sb.Append(")");
         return sb.ToString();
@@ -389,12 +396,7 @@ class QueryBuilder {
     /// <summary>Parameters for BuildInsertParams (the Set values, in order).</summary>
     DbParams InsertParams() {
         DbParams p = DbParams.Create();
-        int n = this.setValues.Count;
-        int i = 0;
-        while (i < n) {
-            p.Add(this.setValues[i]);
-            i = i + 1;
-        }
+        foreach (SetClause s in this.sets) { p.Add(s.val); }
         return p;
     }
 
@@ -404,13 +406,12 @@ class QueryBuilder {
         sb.Append("UPDATE ");
         sb.Append(this.tableName);
         sb.Append(" SET ");
-        int n = this.setColumns.Count;
-        int i = 0;
-        while (i < n) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(this.setColumns[i]);
+        bool first = true;
+        foreach (SetClause s in this.sets) {
+            if (!first) { sb.Append(", "); }
+            sb.Append(s.column);
             sb.Append(" = ?");
-            i = i + 1;
+            first = false;
         }
         if (this.whereClause.Length > 0) {
             sb.Append(" WHERE ");
@@ -422,14 +423,9 @@ class QueryBuilder {
     /// <summary>Parameters for BuildUpdateParams (Set values, then WHERE values).</summary>
     DbParams UpdateParams() {
         DbParams p = DbParams.Create();
-        int n = this.setValues.Count;
-        int i = 0;
-        while (i < n) {
-            p.Add(this.setValues[i]);
-            i = i + 1;
-        }
+        foreach (SetClause s in this.sets) { p.Add(s.val); }
         int wn = this.whereParams.Count();
-        i = 0;
+        int i = 0;
         while (i < wn) {
             int k = this.whereParams.KindAt(i);
             if (k == 1) { p.AddInt(this.whereParams.IntAt(i)); }
@@ -486,21 +482,21 @@ class QueryBuilder {
         sb.Append(this.tableName);
         sb.Append(" (");
 
-        int i = 0;
-        while (i < this.setColumns.Count) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(this.setColumns[i]);
-            i = i + 1;
+        bool first = true;
+        foreach (SetClause s in this.sets) {
+            if (!first) { sb.Append(", "); }
+            sb.Append(s.column);
+            first = false;
         }
         sb.Append(") VALUES (");
 
-        i = 0;
-        while (i < this.setValues.Count) {
-            if (i > 0) { sb.Append(", "); }
+        first = true;
+        foreach (SetClause s in this.sets) {
+            if (!first) { sb.Append(", "); }
             sb.Append("'");
-            sb.Append(EscapeString(this.setValues[i]));
+            sb.Append(EscapeString(s.val));
             sb.Append("'");
-            i = i + 1;
+            first = false;
         }
         sb.Append(")");
         return sb.ToString();
@@ -513,14 +509,14 @@ class QueryBuilder {
         sb.Append(this.tableName);
         sb.Append(" SET ");
 
-        int i = 0;
-        while (i < this.setColumns.Count) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(this.setColumns[i]);
+        bool first = true;
+        foreach (SetClause s in this.sets) {
+            if (!first) { sb.Append(", "); }
+            sb.Append(s.column);
             sb.Append(" = '");
-            sb.Append(EscapeString(this.setValues[i]));
+            sb.Append(EscapeString(s.val));
             sb.Append("'");
-            i = i + 1;
+            first = false;
         }
 
         if (this.whereClause.Length > 0) {
