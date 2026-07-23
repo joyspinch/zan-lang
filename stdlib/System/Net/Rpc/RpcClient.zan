@@ -1,0 +1,108 @@
+using System;
+using System.Json;
+using System.Net.Sockets;
+
+namespace System.Net.Rpc;
+
+/// <summary>
+/// The RPC kernel: it owns the request/response lifecycle and correlation id
+/// allocation, and delegates the two orthogonal concerns to plug-in pieces --
+/// the wire format to an <see cref="IRpcCodec"/> and the bytes to a transport.
+/// This first cut speaks over a TCP <see cref="TcpClient"/>; frames are
+/// newline-delimited (each encoded message is followed by '\n'), which is the
+/// common line framing for JSON-RPC/XML-RPC over raw sockets. Swapping the codec
+/// gives XML-RPC or DMTP for free; a NamedPipe transport slots in behind the
+/// same newline framing.
+///
+/// Usage:
+///   RpcClient c = await RpcClient.ConnectAsync("127.0.0.1", 4000, new JsonRpcCodec());
+///   JsonValue p = JsonValue.NewArray(); p.Append(JsonValue.NewNum("2"));
+///   RpcResponse r = await c.CallAsync("add", p);
+///   if (!r.IsError()) { int sum = r.result.AsInt(0); }
+///   c.Close();
+/// </summary>
+class RpcClient {
+    TcpClient conn;
+    IRpcCodec codec;
+    int nextId;
+    string rbuf;      // read accumulator holding bytes past the last full frame
+
+    RpcClient() {
+        this.conn = null;
+        this.codec = null;
+        this.nextId = 1;
+        this.rbuf = "";
+    }
+
+    /// Connects to a host/port and binds a codec, suspending on the IO reactor
+    /// until the (non-blocking) connection is established.
+    static async RpcClient ConnectAsync(string host, int port, IRpcCodec codec) {
+        RpcClient c = new RpcClient();
+        c.codec = codec;
+        c.conn = await TcpClient.ConnectAsync(host, port);
+        return c;
+    }
+
+    /// Wraps an already-connected TcpClient (e.g. an accepted server peer).
+    static RpcClient FromConn(TcpClient conn, IRpcCodec codec) {
+        RpcClient c = new RpcClient();
+        c.conn = conn;
+        c.codec = codec;
+        return c;
+    }
+
+    /// Sends a request and awaits its correlated reply. The id is allocated
+    /// here, so callers never manage correlation themselves.
+    async RpcResponse CallAsync(string method, JsonValue args) {
+        int id = this.nextId;
+        this.nextId = this.nextId + 1;
+        RpcRequest req = RpcRequest.Call(method, args, id);
+        string frame = this.codec.EncodeRequest(req) + "\n";
+        await this.conn.SendAsync(frame);
+        string line = await this.ReadFrameAsync();
+        if (line.Length == 0) {
+            return RpcResponse.Fail(id, RpcError.Transport("connection closed"));
+        }
+        return this.codec.DecodeResponse(line);
+    }
+
+    /// Sends a fire-and-forget notification (no id, no reply awaited).
+    async void NotifyAsync(string method, JsonValue args) {
+        RpcRequest req = RpcRequest.Notification(method, args);
+        string frame = this.codec.EncodeRequest(req) + "\n";
+        await this.conn.SendAsync(frame);
+    }
+
+    /// Reads one newline-delimited frame, buffering any trailing bytes that
+    /// belong to the next frame. Returns "" when the peer closes with no data.
+    async string ReadFrameAsync() {
+        while (true) {
+            int nl = RpcClient.IndexOfNewline(this.rbuf);
+            if (nl >= 0) {
+                string line = this.rbuf.Substring(0, nl);
+                this.rbuf = this.rbuf.Substring(nl + 1, this.rbuf.Length - nl - 1);
+                return line;
+            }
+            string chunk = await this.conn.RecvAsync();
+            if (chunk == null || chunk.Length == 0) {
+                string rest = this.rbuf;
+                this.rbuf = "";
+                return rest;
+            }
+            this.rbuf = this.rbuf + chunk;
+        }
+    }
+
+    static int IndexOfNewline(string s) {
+        int i = 0;
+        while (i < s.Length) {
+            if ((s[i] & 255) == 10) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    void Close() {
+        if (this.conn != null) { this.conn.Close(); }
+    }
+}

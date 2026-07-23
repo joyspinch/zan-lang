@@ -1,0 +1,72 @@
+using System;
+using System.Json;
+
+namespace System.Net.Rpc;
+
+/// <summary>
+/// JSON-RPC 2.0 codec. Encodes/decodes the neutral RpcRequest/RpcResponse model
+/// to the standard `{"jsonrpc":"2.0", ...}` envelope. Batch requests are out of
+/// scope for this codec (one message per frame); higher layers can loop.
+/// </summary>
+class JsonRpcCodec : IRpcCodec {
+
+    string Name() { return "json-rpc-2.0"; }
+
+    string EncodeRequest(RpcRequest req) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("jsonrpc", JsonValue.NewStr("2.0"));
+        o.Put("method", JsonValue.NewStr(req.method));
+        if (req.args != null) { o.Put("params", req.args); }
+        if (!req.notify) {
+            o.Put("id", JsonValue.NewNum(Convert.ToString(req.id)));
+        }
+        return o.ToJson();
+    }
+
+    RpcResponse DecodeResponse(string frame) {
+        JsonValue o = JsonValue.Parse(frame);
+        if (o == null || !o.IsObject()) {
+            return RpcResponse.Fail(0, RpcError.ParseError("invalid JSON-RPC response"));
+        }
+        int id = o.Int("id", 0);
+        JsonValue err = o.Get("error");
+        if (err != null && err.IsObject()) {
+            return RpcResponse.Fail(id,
+                new RpcError(err.Int("code", -1), err.Str("message", "")));
+        }
+        return RpcResponse.Ok(id, o.Get("result"));
+    }
+
+    RpcRequest DecodeRequest(string frame) {
+        JsonValue o = JsonValue.Parse(frame);
+        if (o == null || !o.IsObject()) {
+            return RpcRequest.Call("", null, 0);
+        }
+        string method = o.Str("method", "");
+        JsonValue args = o.Get("params");
+        JsonValue idv = o.Get("id");
+        if (idv == null) {
+            return RpcRequest.Notification(method, args);
+        }
+        return RpcRequest.Call(method, args, idv.AsInt(0));
+    }
+
+    string EncodeResponse(RpcResponse resp) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("jsonrpc", JsonValue.NewStr("2.0"));
+        o.Put("id", JsonValue.NewNum(Convert.ToString(resp.id)));
+        if (resp.IsError()) {
+            JsonValue e = JsonValue.NewObject();
+            e.Put("code", JsonValue.NewNum(Convert.ToString(resp.error.code)));
+            e.Put("message", JsonValue.NewStr(resp.error.message));
+            o.Put("error", e);
+        } else {
+            if (resp.result != null) {
+                o.Put("result", resp.result);
+            } else {
+                o.Put("result", JsonValue.NewNull());
+            }
+        }
+        return o.ToJson();
+    }
+}
