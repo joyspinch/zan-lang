@@ -226,6 +226,50 @@ int64_t zan_io_socket_ready(int64_t fd, int64_t write_ready) {
 #endif
 }
 
+/* Non-blocking connect status probe. Returns 0 once the connection is
+ * established, a positive SO_ERROR code (or -1 when no code is available)
+ * once it has failed, and -2 while the connect is still in progress.
+ *
+ * The probe selects on both the write and exception sets: POSIX reports a
+ * failed connect as writable with SO_ERROR set, while Windows reports it
+ * only through the exception set -- and on some stacks SO_ERROR is not
+ * populated until the exception set has actually been polled, so a bare
+ * getsockopt(SO_ERROR) after the reactor wake reads 0 for a refused
+ * connection. */
+int64_t zan_io_connect_status(int64_t fd) {
+    fd_set wfds, efds;
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+    struct timeval timeout = {0, 0};
+    int err = 0;
+#if defined(_WIN32)
+    int elen = (int)sizeof(err);
+    SOCKET sock = (SOCKET)fd;
+    if (sock == INVALID_SOCKET) return -1;
+    FD_SET(sock, &wfds);
+    FD_SET(sock, &efds);
+    if (select(0, NULL, &wfds, &efds, &timeout) < 0) return -1;
+#else
+    socklen_t elen = (socklen_t)sizeof(err);
+    if (fd < 0 || fd >= FD_SETSIZE) return -1;
+    int sock = (int)fd;
+    FD_SET(sock, &wfds);
+    FD_SET(sock, &efds);
+    if (select(sock + 1, NULL, &wfds, &efds, &timeout) < 0) return -1;
+#endif
+    if (FD_ISSET(sock, &efds)) {
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &elen) != 0)
+            return -1;
+        return err != 0 ? (int64_t)err : -1;
+    }
+    if (FD_ISSET(sock, &wfds)) {
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &elen) != 0)
+            return -1;
+        return (int64_t)err;
+    }
+    return -2;
+}
+
 /* ---- platform backend ---- */
 
 #if defined(__linux__)

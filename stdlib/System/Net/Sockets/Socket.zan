@@ -16,6 +16,11 @@ class Socket {
     [DllImport("crt", EntryPoint = "zan_io_socket_ready")]
     static extern int ReactorReady(int sock, int writeReady);
 
+    /// <summary>Probes the outcome of a non-blocking connect: 0 connected,
+    /// positive SO_ERROR code (or -1) when failed, -2 while in progress.</summary>
+    [DllImport("crt", EntryPoint = "zan_io_connect_status")]
+    static extern int ConnectStatus(int sock);
+
     // ---- Platform-specific DllImport ----
     #if WINDOWS
     [DllImport("ws2_32", EntryPoint = "WSAStartup")]
@@ -312,11 +317,25 @@ class Socket {
     }
 
     /// <summary>Begins a non-blocking connect, then suspends on the IO reactor
-    /// until the socket becomes writable (connection established). Returns 0.
-    /// Requires a non-blocking socket.</summary>
+    /// until the connection settles. Returns 0 on success or a non-zero error
+    /// code (SO_ERROR, e.g. refused/unreachable; -1 when no code is available)
+    /// when it failed. Requires a non-blocking socket.
+    ///
+    /// The reactor's write-readiness wake can arrive before a pending connect
+    /// settles (notably on Windows, where the zero-byte send probe completes
+    /// early and a failed connect is reported through the exception set), so
+    /// after each wake the outcome is checked with ConnectStatus and re-polled
+    /// with a short delay while still in progress.</summary>
     static async int ConnectAsync(int sock, string ip, int port) {
         Connect(sock, ip, port);
         await Socket.WriteReady(sock);
+        while (true) {
+            int st = ConnectStatus(sock);
+            if (st != -2) {
+                return st;
+            }
+            await Task.Delay(1);
+        }
         return 0;
     }
 

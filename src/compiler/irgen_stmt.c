@@ -757,6 +757,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         (void)eh_tmps_g;
         LLVMValueRef tmp_mark = LLVMBuildLoad2(g->builder, i32t, eh_tmptop_g, "eh.tmpmark");
         LLVMValueRef old_top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.old");
+        /* Spill try-entry EH state to allocas: an await inside the try body
+         * splits the function during CPS lowering, so SSA values defined here
+         * would not dominate their uses in the catch/end blocks. */
+        LLVMValueRef tmp_mark_slot = emit_entry_alloca(g, i32t, "eh.tmpmark.slot");
+        LLVMBuildStore(g->builder, tmp_mark, tmp_mark_slot);
+        LLVMValueRef old_top_slot = emit_entry_alloca(g, i32t, "eh.old.slot");
+        LLVMBuildStore(g->builder, old_top, old_top_slot);
         LLVMValueRef new_top = LLVMBuildAdd(g->builder, old_top,
             LLVMConstInt(i32t, 1, 0), "eh.new");
         LLVMBuildStore(g->builder, new_top, top_g);
@@ -774,20 +781,27 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         emit_stmt(g, stmt->try_stmt.try_body, locals);
         locals->count = try_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            LLVMBuildStore(g->builder, old_top, top_g);
+            LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
+            LLVMBuildStore(g->builder, ot, top_g);
             LLVMBuildBr(g->builder, end_bb);
         }
 
         LLVMPositionBuilderAtEnd(g->builder, catch_bb);
-        LLVMBuildStore(g->builder, old_top, top_g);
+        {
+            LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
+            LLVMBuildStore(g->builder, ot, top_g);
+        }
         /* longjmp skipped the normal releases of temps pushed after this try
          * was entered (a throwing ctor's object, an owned receiver temp) —
          * release them now, restoring the temp stack to the try-entry depth */
         {
             LLVMTypeRef uwty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
-            zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &tmp_mark, 1, "");
+            LLVMValueRef tm = LLVMBuildLoad2(g->builder, i32t, tmp_mark_slot, "eh.tmpmark.re");
+            zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &tm, 1, "");
         }
         LLVMValueRef exc_val = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc");
+        LLVMValueRef exc_slot = emit_entry_alloca(g, i8ptr, "eh.exc.slot");
+        LLVMBuildStore(g->builder, exc_val, exc_slot);
         int catch_start = locals->count;
         int ncatch = stmt->try_stmt.catches.count;
         if (ncatch > 0) {
@@ -833,8 +847,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
                 LLVMPositionBuilderAtEnd(g->builder, body_bb);
                 if (cc->catch_clause.var_name.len > 0) {
+                    LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
                     LLVMValueRef ea = emit_entry_alloca(g, i8ptr, "exc.var");
-                    LLVMBuildStore(g->builder, exc_val, ea);
+                    LLVMBuildStore(g->builder, ev, ea);
                     local_add(locals, cc->catch_clause.var_name, ea, et);
                 }
                 emit_stmt(g, cc->catch_clause.body, locals);
@@ -902,9 +917,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, cfn, "exc.cont");
             LLVMBuildCondBr(g->builder, is_owned, rel_bb, cont_bb);
             LLVMPositionBuilderAtEnd(g->builder, rel_bb);
+            LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, exc_slot, "exc.re");
             zan_call2(g->builder,
                 LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-                g->rt_release_dyn, &exc_val, 1, "");
+                g->rt_release_dyn, &ev, 1, "");
             LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), owned_g);
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), exc_g);
             LLVMBuildBr(g->builder, cont_bb);

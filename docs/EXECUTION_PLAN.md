@@ -16,9 +16,14 @@
      **File 部分已完成**：`FileNotFoundException`/`IOException` 落地，
      读/写/复制失败抛异常（`tests/conformance/io_errors.zan`）；编译器
      builtin `File.*` 降级在 stdlib 源码存在时让位（`src_method_takes_over`）。
-     **Net/Json 待做**，受两个限制阻塞：async 函数内含 `await` 的
-     try/catch 触发 codegen 错误（"Instruction does not dominate all
-     uses"）；`TcpClient.ConnectAsync` 连接失败不返回 null，无失败信号。
+     **Net 部分已完成**：async try/catch codegen 修复（异常状态存 entry
+     alloca，跨 CPS resume 块重新 load，`tests/conformance/async_try_catch.zan`）；
+     `Socket.ConnectAsync` 通过运行时 `zan_io_connect_status`（select
+     写/异常集探测 + SO_ERROR）返回连接结果，`TcpClient.ConnectAsync`
+     失败返回 null，`HttpClient` 连接/TLS 失败抛 `HttpRequestException`
+     （`tests/conformance/net_errors.zan`）。已知限制：异常穿过 async CPS
+     帧时这些帧不被释放（net_errors 在 leakcheck 的 `_known_leaky`
+     允许列表中，ARC 后续工作）。**Json 待做**。
    - A3 IDE 长时运行泄漏验证（`--check-leaks` 2h+ 零净增长）。
 2. **P1 编辑体验 + 质量保障**（阶段 2.1–2.3、4.1–4.2）：LSP rename、
    workspace/symbol、IDE 接入 zanfmt、IDE golden-path UI 测试、发布包冒烟测试。

@@ -358,6 +358,16 @@ public class HttpResponse {
 }
 ```
 
+**Error model (C#-aligned).** Connection failures throw instead of silently
+returning empty responses:
+
+- `TcpClient.ConnectAsync` returns `null` when the connection fails
+  (refused / unreachable); `Socket.ConnectAsync` returns the socket error
+  code (0 on success).
+- `HttpClient` request methods throw `HttpRequestException` when the TCP
+  connect fails, the TLS context cannot be created, or the TLS handshake
+  fails. `HttpRequestException` derives from `Exception`.
+
 ---
 
 ### 3.6 System.Linq.Enumerable

@@ -33,6 +33,11 @@ int64_t zan_io_socket_recv(int64_t fd, void *buf, int64_t len,
                            int64_t flags);
 int64_t zan_io_socket_ready(int64_t fd, int64_t write_ready);
 
+/* Probe the outcome of a non-blocking connect on `fd`.
+ * Returns 0 once connected, a positive SO_ERROR code (or -1 when no code is
+ * available) once the connect has failed, and -2 while still in progress. */
+int64_t zan_io_connect_status(int64_t fd);
+
 /* ---- stackless (CPS state-machine) ABI ----
  *
  * The compiler's async lowering (see docs/ASYNC_CPS_DESIGN.md) has no fiber to
