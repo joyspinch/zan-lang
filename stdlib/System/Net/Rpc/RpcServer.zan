@@ -1,0 +1,119 @@
+using System;
+using System.Json;
+using System.Net.Sockets;
+
+namespace System.Net.Rpc;
+
+/// <summary>Handles one decoded request and produces the response to send.</summary>
+delegate RpcResponse RpcHandler(RpcRequest req);
+
+/// A registered method: its name and the handler to invoke. Modeled as an
+/// entity (not parallel name/handler lists) so the registry stays coherent.
+class RpcMethod {
+    string name;
+    RpcHandler fn;
+
+    RpcMethod(string name, RpcHandler fn) {
+        this.name = name;
+        this.fn = fn;
+    }
+}
+
+/// <summary>
+/// Protocol-neutral RPC server: it accepts connections, frames/decodes with the
+/// same <see cref="IRpcTransport"/> + <see cref="IRpcCodec"/> layers the client
+/// uses, dispatches to a registered <see cref="RpcHandler"/> by method name, and
+/// writes the correlated response back (notifications get none). Each peer runs
+/// on its own coroutine (Task.Spawn) so one slow client never blocks the accept
+/// loop -- the same concurrency model as HttpServer. Swap the codec to serve
+/// XML-RPC / DMTP over the identical dispatch core.
+///
+/// Usage:
+///   RpcServer s = RpcServer.Create("0.0.0.0", 4000, new JsonRpcCodec());
+///   s.On("add", AddHandler);
+///   await s.Start();
+/// </summary>
+class RpcServer {
+    TcpListener listener;
+    IRpcCodec codec;
+    List<RpcMethod> methods;
+    string host;
+    int port;
+    bool running;
+
+    RpcServer(string host, int port, IRpcCodec codec) {
+        this.host = host;
+        this.port = port;
+        this.codec = codec;
+        this.methods = new List<RpcMethod>();
+        this.running = false;
+        this.listener = null;
+    }
+
+    static RpcServer Create(string host, int port, IRpcCodec codec) {
+        return new RpcServer(host, port, codec);
+    }
+
+    /// Registers a handler for `name` (chainable).
+    RpcServer On(string name, RpcHandler fn) {
+        this.methods.Add(new RpcMethod(name, fn));
+        return this;
+    }
+
+    RpcHandler Lookup(string name) {
+        foreach (RpcMethod m in this.methods) {
+            if (m.name == name) { return m.fn; }
+        }
+        return null;
+    }
+
+    /// Accepts forever; each connection is served on its own coroutine.
+    async void Start() {
+        Socket.Initialize();
+        this.listener = TcpListener.Create(this.host, this.port);
+        this.listener.Start();
+        this.running = true;
+        while (this.running) {
+            int client = await this.listener.AcceptAsync();
+            if (client >= 0) {
+                Task.Spawn(this.HandlePeerAsync(client));
+            }
+        }
+    }
+
+    /// Serves one peer: read frame -> decode -> dispatch -> reply, until close.
+    async void HandlePeerAsync(int client) {
+        TcpClient conn = TcpClient.FromSocket(client);
+        TcpRpcTransport tr = TcpRpcTransport.FromConn(conn);
+        bool alive = true;
+        while (alive) {
+            string frame = await tr.RecvFrameAsync();
+            if (frame.Length == 0) {
+                alive = false;
+            } else {
+                RpcRequest req = this.codec.DecodeRequest(frame);
+                RpcResponse resp = this.Dispatch(req);
+                if (!req.notify) {
+                    resp.id = req.id;
+                    await tr.SendFrameAsync(this.codec.EncodeResponse(resp));
+                }
+            }
+        }
+        conn.Close();
+    }
+
+    /// Routes a request to its handler, or a MethodNotFound error.
+    RpcResponse Dispatch(RpcRequest req) {
+        RpcHandler fn = this.Lookup(req.method);
+        if (fn == null) {
+            return RpcResponse.Fail(req.id,
+                RpcError.MethodNotFound("method not found: " + req.method));
+        }
+        return fn(req);
+    }
+
+    void Stop() {
+        this.running = false;
+        if (this.listener != null) { this.listener.Stop(); }
+    }
+}
