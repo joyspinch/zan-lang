@@ -5,6 +5,22 @@
  * irgen_expr.c; not compiled standalone.
  */
 
+/* True when the call's receiver names a class compiled from source (user or
+ * stdlib) that defines the called method. Builtin lowerings that duplicate a
+ * stdlib class (File.*) step aside so the source implementation — with its
+ * richer semantics such as thrown exceptions — wins whenever it is present
+ * (e.g. under --auto-stdlib). */
+static bool src_method_takes_over(zan_irgen_t *g, zan_ast_node_t *expr,
+        local_scope_t *locals) {
+    zan_ast_node_t *callee = expr->call.callee;
+    if (callee->kind != AST_MEMBER_ACCESS ||
+        callee->member.object->kind != AST_IDENTIFIER) return false;
+    if (local_find(locals, callee->member.object->ident.name)) return false;
+    zan_symbol_t *ts = zan_binder_lookup(g->binder, callee->member.object->ident.name);
+    if (!ts || (ts->kind != SYM_CLASS && ts->kind != SYM_STRUCT)) return false;
+    return get_method_sym(ts, callee->member.name) != NULL;
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* Task.Spawn(<asyncCall>) — fire-and-forget: run an async call as an
@@ -1030,7 +1046,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.ReadAllText(path) -> string */
-        if (is_call_to(expr, "File", "ReadAllText") && expr->call.args.count == 1) {
+        if (is_call_to(expr, "File", "ReadAllText") && expr->call.args.count == 1 &&
+            !src_method_takes_over(g, expr, locals)) {
             zan_ast_node_t *path_ast = expr->call.args.items[0];
             LLVMValueRef path_arg = emit_expr(g, path_ast, locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1108,7 +1125,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.WriteAllText(path, content) */
-        if (is_call_to(expr, "File", "WriteAllText") && expr->call.args.count == 2) {
+        if (is_call_to(expr, "File", "WriteAllText") && expr->call.args.count == 2 &&
+            !src_method_takes_over(g, expr, locals)) {
             zan_ast_node_t *path_ast = expr->call.args.items[0];
             zan_ast_node_t *content_ast = expr->call.args.items[1];
             LLVMValueRef path_arg = emit_expr(g, path_ast, locals);
@@ -1229,7 +1247,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.AppendAllText(path, content) */
-        if (is_call_to(expr, "File", "AppendAllText") && expr->call.args.count == 2) {
+        if (is_call_to(expr, "File", "AppendAllText") && expr->call.args.count == 2 &&
+            !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef content_arg = emit_expr(g, expr->call.args.items[1], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1266,7 +1285,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Exists(path) -> bool */
-        if (is_call_to(expr, "File", "Exists") && expr->call.args.count == 1) {
+        if (is_call_to(expr, "File", "Exists") && expr->call.args.count == 1 &&
+            !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef fopen_fn = LLVMGetNamedFunction(g->mod, "fopen");
@@ -1301,7 +1321,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Delete(path) */
-        if (is_call_to(expr, "File", "Delete") && expr->call.args.count == 1) {
+        if (is_call_to(expr, "File", "Delete") && expr->call.args.count == 1 &&
+            !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -1317,7 +1338,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Move(source, dest) — rename */
-        if (is_call_to(expr, "File", "Move") && expr->call.args.count == 2) {
+        if (is_call_to(expr, "File", "Move") && expr->call.args.count == 2 &&
+            !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef src = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef dst = emit_expr(g, expr->call.args.items[1], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1336,7 +1358,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.Copy(source, dest) — read source, write dest */
-        if (is_call_to(expr, "File", "Copy") && expr->call.args.count == 2) {
+        if (is_call_to(expr, "File", "Copy") && expr->call.args.count == 2 &&
+            !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef src = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef dst = emit_expr(g, expr->call.args.items[1], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1417,7 +1440,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
 
         /* File.GetSize(path) -> int */
-        if (is_call_to(expr, "File", "GetSize") && expr->call.args.count == 1) {
+        if (is_call_to(expr, "File", "GetSize") && expr->call.args.count == 1 &&
+            !src_method_takes_over(g, expr, locals)) {
             LLVMValueRef path_arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

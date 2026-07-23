@@ -314,6 +314,22 @@ public static class File {
 }
 ```
 
+**Error model (C#-aligned).** Failures throw instead of silently returning
+empty/default values:
+
+- `ReadAllText` / `ReadAllLines` / `ReadBytes` / `GetSize` / `Copy` (source)
+  throw `FileNotFoundException` when the file cannot be opened.
+- `WriteAllText` / `WriteAllLines` / `AppendAllText` / `Copy` (destination)
+  throw `IOException` when the file cannot be opened for writing.
+- `Exists` remains a non-throwing boolean probe.
+- `FileNotFoundException` derives from `IOException`, which derives from
+  `Exception`, so `catch (IOException e)` and `catch (Exception e)` both work.
+
+These semantics live in the stdlib source (`stdlib/System/IO/File.zan`).
+When compiling **without** `--auto-stdlib` (no `File` class in the compile
+unit), the compiler's builtin `File.*` lowering is used instead, which aborts
+the process with `cannot read file` / `cannot write file` on failure.
+
 ### 3.5 System.Net.Http
 
 ```csharp

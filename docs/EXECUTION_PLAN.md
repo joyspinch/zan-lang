@@ -13,6 +13,12 @@
 1. **P0 硬伤**（阶段 1）：
    - A1 修复 O0 codegen bug（`docs/bugs/O0-list-index-write-stack-leak.md`）。
    - A2 stdlib 错误模型统一：File/Net/Json 失败 throw 标准异常，不再静默返回空。
+     **File 部分已完成**：`FileNotFoundException`/`IOException` 落地，
+     读/写/复制失败抛异常（`tests/conformance/io_errors.zan`）；编译器
+     builtin `File.*` 降级在 stdlib 源码存在时让位（`src_method_takes_over`）。
+     **Net/Json 待做**，受两个限制阻塞：async 函数内含 `await` 的
+     try/catch 触发 codegen 错误（"Instruction does not dominate all
+     uses"）；`TcpClient.ConnectAsync` 连接失败不返回 null，无失败信号。
    - A3 IDE 长时运行泄漏验证（`--check-leaks` 2h+ 零净增长）。
 2. **P1 编辑体验 + 质量保障**（阶段 2.1–2.3、4.1–4.2）：LSP rename、
    workspace/symbol、IDE 接入 zanfmt、IDE golden-path UI 测试、发布包冒烟测试。
