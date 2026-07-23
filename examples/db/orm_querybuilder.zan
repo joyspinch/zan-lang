@@ -1,0 +1,157 @@
+// ============================================================================
+// ORM 查询构建器（QueryBuilder）—— 参数化 SQL、复杂条件、连接、聚合完整示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. 参数化模式（推荐）：BuildSelectParams/BuildInsertParams/BuildUpdateParams/
+//      BuildDeleteParams + 对应 *Params()，值以 `?` 占位原生绑定，天然防注入
+//   2. 条件族：WhereEq/WhereEqInt/WhereNe/WhereGtInt/WhereGeInt/WhereLtInt/
+//      WhereLeInt/WhereBetween/WhereIn/WhereNotIn/WhereLike/WhereContains/
+//      WhereStartsWith/WhereNull/WhereNotNull/OrWhere
+//   3. Join / LeftJoin 多表连接
+//   4. GroupBy / Having / Distinct / OrderBy / Limit / Offset（分页）
+//   5. Dialect：Standard（LIMIT/OFFSET）与 SqlServer/Oracle（OFFSET..FETCH）
+//   6. 安全性：不安全的表名/列名（注入）在构建期即抛出异常
+//
+// 说明：QueryBuilder 只生成 SQL 文本 + 参数表，与任何 IDbExecutor 连接搭配
+//       （SqliteConnection / PgConnection / DbConnection-ODBC）。
+// 运行：build/zanc examples/db/orm_querybuilder.zan --auto-stdlib -o orm_qb.exe
+// ============================================================================
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class Program {
+    static void Main() {
+        string path = "orm_qb_demo.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, city TEXT, age INTEGER)");
+        db.Execute("CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER)");
+
+        // ---- 1. 参数化 INSERT ------------------------------------------------
+        // 值永远不进入 SQL 文本：BuildInsertParams 生成 `?` 占位符，
+        // InsertParams 按 Set 顺序给出绑定值。
+        InsertUser(db, "Alice", "Beijing", 30);
+        InsertUser(db, "Bob", "Shanghai", 25);
+        InsertUser(db, "Carol", "Beijing", 35);
+        InsertUser(db, "Dave", "Shenzhen", 17);
+        InsertUser(db, "O'Brien", "Beijing", 41);   // 单引号无需手工转义
+
+        db.Execute("INSERT INTO orders (user_id, amount) VALUES (?, ?)",
+            DbParams.Create().AddInt(1).AddInt(300));
+        db.Execute("INSERT INTO orders (user_id, amount) VALUES (?, ?)",
+            DbParams.Create().AddInt(1).AddInt(150));
+        db.Execute("INSERT INTO orders (user_id, amount) VALUES (?, ?)",
+            DbParams.Create().AddInt(3).AddInt(900));
+
+        // ---- 2. 参数化 SELECT + 各类条件 ---------------------------------------
+        // 相等 + 范围（AND 叠加）
+        QueryBuilder q1 = QueryBuilder.From("users")
+            .WhereEq("city", "Beijing")
+            .WhereGeInt("age", 18);
+        DbResult r1 = db.Query(q1.BuildSelectParams("name, age"), q1.SelectParams());
+        Console.WriteLine("beijing adults: " + Convert.ToString(r1.RowCount()));
+
+        // IN 列表
+        List<string> cities = new List<string>();
+        cities.Add("Beijing");
+        cities.Add("Shanghai");
+        QueryBuilder q2 = QueryBuilder.From("users").WhereIn("city", cities);
+        Console.WriteLine("in-cities: "
+            + db.ExecuteScalar(q2.BuildSelectParams("COUNT(*)"), q2.SelectParams()));
+
+        // LIKE / 前缀 / 包含
+        QueryBuilder q3 = QueryBuilder.From("users").WhereStartsWith("name", "O'");
+        DbResult r3 = db.Query(q3.BuildSelectParams("name"), q3.SelectParams());
+        Console.WriteLine("prefix O': " + r3.GetString(0, 0));
+
+        // BETWEEN + OR + 排序
+        QueryBuilder q4 = QueryBuilder.From("users")
+            .WhereBetween("age", "20", "36")
+            .OrWhere("age > 40")
+            .OrderByDesc("age");
+        DbResult r4 = db.Query(q4.BuildSelectParams("name, age"), q4.SelectParams());
+        Console.WriteLine("between-or rows: " + Convert.ToString(r4.RowCount())
+            + " top=" + r4.GetString(0, 0));
+
+        // ---- 3. JOIN 连接 ------------------------------------------------------
+        QueryBuilder q5 = QueryBuilder.From("users")
+            .Join("orders", "orders.user_id = users.id")
+            .WhereGtInt("orders.amount", 100)
+            .OrderByDesc("orders.amount");
+        DbResult r5 = db.Query(q5.BuildSelectParams("users.name, orders.amount"), q5.SelectParams());
+        int i = 0;
+        while (i < r5.RowCount()) {
+            Console.WriteLine("order: " + r5.GetString(i, 0) + " " + r5.GetString(i, 1));
+            i = i + 1;
+        }
+
+        // LEFT JOIN：没有订单的用户也保留（orders 列为 NULL）。
+        QueryBuilder q6 = QueryBuilder.From("users")
+            .LeftJoin("orders", "orders.user_id = users.id")
+            .WhereNull("orders.id");
+        Console.WriteLine("no-order users: "
+            + db.ExecuteScalar(q6.BuildSelectParams("COUNT(*)"), q6.SelectParams()));
+
+        // ---- 4. 聚合：GROUP BY / HAVING / DISTINCT -----------------------------
+        QueryBuilder q7 = QueryBuilder.From("users")
+            .GroupBy("city")
+            .Having("COUNT(*) >= 2")
+            .OrderBy("city");
+        DbResult r7 = db.Query(q7.BuildSelectParams("city, COUNT(*)"), q7.SelectParams());
+        Console.WriteLine("big city: " + r7.GetString(0, 0) + " users=" + r7.GetString(0, 1));
+
+        QueryBuilder q8 = QueryBuilder.From("users").Distinct().OrderBy("city");
+        DbResult r8 = db.Query(q8.BuildSelectParams("city"), q8.SelectParams());
+        Console.WriteLine("distinct cities: " + Convert.ToString(r8.RowCount()));
+
+        // ---- 5. 分页与方言 -----------------------------------------------------
+        QueryBuilder q9 = QueryBuilder.From("users").OrderBy("id").Limit(2).Offset(2);
+        Console.WriteLine("std paging: " + q9.BuildSelectParams("name"));
+        QueryBuilder q10 = QueryBuilder.From("users").OrderBy("id").Limit(2).Offset(2)
+            .Dialect(SqlDialect.SqlServer);
+        Console.WriteLine("mssql paging: " + q10.BuildSelectParams("name"));
+
+        // ---- 6. 参数化 UPDATE / DELETE -----------------------------------------
+        QueryBuilder up = QueryBuilder.Update("users")
+            .Set("city", "Hangzhou")
+            .WhereEq("name", "Bob");
+        int updated = db.Execute(up.BuildUpdateParams(), up.UpdateParams());
+        Console.WriteLine("updated: " + Convert.ToString(updated));
+
+        QueryBuilder del = QueryBuilder.DeleteFrom("users").WhereLtInt("age", 18);
+        int deleted = db.Execute(del.BuildDeleteParams(), del.SelectParams());
+        Console.WriteLine("deleted minors: " + Convert.ToString(deleted));
+
+        // ---- 7. 注入安全 -------------------------------------------------------
+        // 值注入：恶意字符串只是数据，表安然无恙。
+        string hostile = "x'); DROP TABLE users;--";
+        InsertUser(db, hostile, "Nowhere", 1);
+        QueryBuilder qh = QueryBuilder.From("users").WhereEq("name", hostile);
+        Console.WriteLine("hostile stored: "
+            + db.ExecuteScalar(qh.BuildSelectParams("COUNT(*)"), qh.SelectParams()));
+
+        // 标识符注入：表名/列名不合法时构建期即抛异常。
+        bool threw = false;
+        try {
+            QueryBuilder bad = QueryBuilder.From("users; DROP TABLE users");
+        } catch (Exception e) {
+            threw = true;
+        }
+        Console.WriteLine("ident guarded: " + Convert.ToString(threw));
+
+        db.Close();
+        File.Delete(path);
+        Console.WriteLine("done");
+    }
+
+    static void InsertUser(SqliteConnection db, string name, string city, int age) {
+        QueryBuilder qb = QueryBuilder.InsertInto("users")
+            .Set("name", name)
+            .Set("city", city)
+            .SetInt("age", age);
+        db.Execute(qb.BuildInsertParams(), qb.InsertParams());
+    }
+}

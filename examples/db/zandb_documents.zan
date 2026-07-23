@@ -1,0 +1,121 @@
+// ============================================================================
+// ZanDb（内置嵌入式文档数据库）—— 集合、文档 CRUD、二级索引、LINQ 查询示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. ZanDatabase.Open 打开单文件文档库（WAL 崩溃安全、LRU 页缓存，零依赖）
+//   2. Collection：Insert / InsertBulk（原子批量）/ FindById / Update /
+//      Upsert / DeleteById / Count / Exists
+//   3. 文档就是 JsonValue 树（嵌套对象/数组），无 SQL、无 ORM 映射
+//   4. EnsureIndex 二级索引：WhereEq 命中索引免全扫
+//   5. DocQuery（LINQ 风格）：WhereEq / Where(lambda) / OrderByInt(Desc) /
+//      Skip / Take / ToList / First / Count，延迟求值
+//   6. Begin/Commit 把多次写合并为一次原子提交；UpdateAtomic 原子读改写
+//
+// 说明：适合配置存储、桌面/移动端本地数据、小型服务端状态等场景；
+//       需要 SQL / 多进程共享时用 SQLite（见 sqlite_crud.zan）。
+// 运行：build/zanc examples/db/zandb_documents.zan --auto-stdlib -o zandb_demo.exe
+// ============================================================================
+using System;
+using System.Json;
+using System.Data.ZanDb;
+using System.IO;
+
+class Program {
+    static JsonValue MakeUser(string name, string city, int age) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("name", JsonValue.NewStr(name));
+        u.Put("city", JsonValue.NewStr(city));
+        u.Put("age", JsonValue.NewNum(Convert.ToString(age)));
+        // 嵌套结构随便放：文档天然支持对象/数组。
+        JsonValue tags = JsonValue.NewArray();
+        tags.Append(JsonValue.NewStr("member"));
+        u.Put("tags", tags);
+        return u;
+    }
+
+    // UpdateAtomic 的回调：在写临界区内基于当前值计算新值。
+    static JsonValue BumpAge(JsonValue cur) {
+        cur.Set("age", JsonValue.NewNum(Convert.ToString(cur.Int("age", 0) + 1)));
+        return cur;
+    }
+
+    static void Main() {
+        string path = "zandb_demo.tmp.zdb";
+        File.Delete(path);
+
+        // ---- 1. 打开库 + 取集合 -------------------------------------------------
+        ZanDatabase db = ZanDatabase.Open(path);
+        if (!db.IsOpen()) {
+            Console.WriteLine("open failed: " + db.GetError());
+            return;
+        }
+        Collection users = db.GetCollection("users");
+
+        // ---- 2. 插入：单条 + 原子批量 ---------------------------------------------
+        int idAlice = users.Insert(MakeUser("Alice", "北京", 30));
+        Console.WriteLine("alice id: " + Convert.ToString(idAlice));
+
+        List<JsonValue> batch = new List<JsonValue>();
+        batch.Add(MakeUser("Bob", "上海", 25));
+        batch.Add(MakeUser("Carol", "北京", 35));
+        batch.Add(MakeUser("Dave", "深圳", 17));
+        int firstId = users.InsertBulk(batch);   // 整批一次 WAL 提交
+        Console.WriteLine("bulk from id: " + Convert.ToString(firstId)
+            + " total: " + Convert.ToString(users.Count()));
+
+        // ---- 3. 主键读 / 改 / 删 -----------------------------------------------------
+        JsonValue alice = users.FindById(idAlice);
+        Console.WriteLine("alice: " + alice.ToJson());
+
+        alice.Set("age", JsonValue.NewNum("31"));
+        bool up = users.Update(idAlice, alice);
+        Console.WriteLine("updated: " + Convert.ToString(up)
+            + " age=" + Convert.ToString(users.FindById(idAlice).Int("age", 0)));
+
+        // Upsert：有则改、无则建（指定 id）。
+        users.Upsert(100, MakeUser("Eve", "杭州", 28));
+        Console.WriteLine("eve exists: " + Convert.ToString(users.Exists(100)));
+
+        // ---- 4. 二级索引 --------------------------------------------------------------
+        // 建索引后 WhereEq("city", ...) 从索引取候选集，不再全表扫描。
+        users.EnsureIndex("city");
+
+        // ---- 5. LINQ 风格查询 ----------------------------------------------------------
+        List<JsonValue> beijingAdults = users.Query()
+            .WhereEq("city", "北京")                          // 命中索引
+            .Where((JsonValue u) => u.Int("age", 0) >= 18)    // lambda 过滤
+            .OrderByIntDesc((JsonValue u) => u.Int("age", 0)) // 排序
+            .Take(10)                                          // 分页
+            .ToList();
+        foreach (JsonValue u in beijingAdults) {
+            Console.WriteLine("beijing: " + u.Str("name", "?")
+                + " age=" + Convert.ToString(u.Int("age", 0)));
+        }
+
+        JsonValue youngest = users.Query()
+            .OrderByInt((JsonValue u) => u.Int("age", 0))
+            .First();
+        Console.WriteLine("youngest: " + youngest.Str("name", "?"));
+
+        int minors = users.Query()
+            .Where((JsonValue u) => u.Int("age", 0) < 18)
+            .Count();
+        Console.WriteLine("minors: " + Convert.ToString(minors));
+
+        // ---- 6. 原子批量写 + 原子读改写 --------------------------------------------------
+        db.Begin();                                    // 多次写合并成一次提交
+        users.DeleteById(100);
+        int idFrank = users.Insert(MakeUser("Frank", "广州", 40));
+        bool committed = db.Commit();
+        Console.WriteLine("batch committed: " + Convert.ToString(committed));
+
+        // UpdateAtomic：原子读改写（并发安全的自增等）。
+        bool bumped = await users.UpdateAtomic(idFrank, BumpAge);
+        Console.WriteLine("frank age: "
+            + Convert.ToString(users.FindById(idFrank).Int("age", 0)));
+
+        db.Close();
+        File.Delete(path);
+        Console.WriteLine("done");
+    }
+}

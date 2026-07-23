@@ -1,0 +1,148 @@
+// ============================================================================
+// ORM 模型（Model）—— 建表、增删改查、分页、事务、迁移、反向映射完整示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. Model.Define 定义模型：主键（自增）、NOT NULL、UNIQUE、DEFAULT 列
+//   2. CreateTable / TableExists / DropTable 表管理
+//   3. Insert 插入（ModelRow.Set/SetInt）+ LastInsertId 取回自增主键
+//   4. Select 链式查询：Where / WhereEq / OrderBy(Desc) / Limit / Offset /
+//      First / Count，结果是 List<ModelRow>，可 ToJson 序列化
+//   5. FindById / DeleteById 主键快捷操作
+//   6. UpdateQuery / DeleteQuery 链式更新与删除（返回受影响行数）
+//   7. 事务：BeginTransaction / Commit / Rollback
+//   8. Migration 迁移：RunAll 按序执行且幂等（_migrations 表跟踪）
+//   9. 反向映射（database first）：Model.FromTable 从已有表反推模型，
+//      ToDefineCode 生成可粘贴的 Model.Define(...) 代码
+//
+// 说明：示例使用内嵌 SQLite（System.Data.Sqlite，零外部依赖）。ORM 的所有
+//       API 都通过 IDbExecutor 接口工作，同样适用于 PgConnection（原生
+//       PostgreSQL）和 DbConnection（ODBC：MySQL/SQL Server/达梦/金仓等）。
+// 运行：build/zanc examples/db/orm_model.zan --auto-stdlib -o orm_model.exe
+// ============================================================================
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class Program {
+    static void Main() {
+        string path = "orm_model_demo.tmp.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+
+        // ---- 1. 定义模型 -----------------------------------------------------
+        // Column(name, type, true) => INTEGER PRIMARY KEY AUTOINCREMENT
+        Model users = Model.Define("users")
+            .Column("id", "INTEGER", true)
+            .ColumnNotNull("name", "TEXT")
+            .ColumnUnique("email", "TEXT")
+            .Column("age", "INTEGER")
+            .ColumnDefault("status", "TEXT", "active");
+
+        // ---- 2. 建表 ---------------------------------------------------------
+        users.CreateTable(db);
+        Console.WriteLine("table exists: " + Convert.ToString(users.TableExists(db)));
+
+        // ---- 3. 插入 ---------------------------------------------------------
+        users.Insert(db, ModelRow.Create()
+            .Set("name", "Alice").Set("email", "alice@example.com").SetInt("age", 30));
+        users.Insert(db, ModelRow.Create()
+            .Set("name", "Bob").Set("email", "bob@example.com").SetInt("age", 25));
+        users.Insert(db, ModelRow.Create()
+            .Set("name", "Carol").Set("email", "carol@example.com").SetInt("age", 35));
+        // 单引号等特殊字符由 ORM 自动转义，无需手工处理。
+        users.Insert(db, ModelRow.Create()
+            .Set("name", "O'Brien").Set("email", "obrien@example.com").SetInt("age", 41));
+        Console.WriteLine("last insert id: " + Convert.ToString(db.LastInsertId()));
+        Console.WriteLine("total: " + Convert.ToString(users.Count(db)));
+
+        // ---- 4. 查询 ---------------------------------------------------------
+        // 链式 SELECT：条件 + 排序 + 分页；Execute 返回 List<ModelRow>。
+        List<ModelRow> adults = users.Select(db)
+            .Where("age >= 30")
+            .OrderByDesc("age")
+            .Limit(10)
+            .Execute();
+        foreach (ModelRow u in adults) {
+            Console.WriteLine("adult: " + u.Get("name") + " age=" + u.Get("age"));
+        }
+
+        // WhereEq 自动引用并转义值；First 返回首行（查不到时为空行）。
+        ModelRow bob = users.Select(db).WhereEq("name", "Bob").First();
+        Console.WriteLine("bob email: " + bob.Get("email"));
+
+        // 多条件叠加（AND）+ Count。
+        int n = users.Select(db).Where("age > 20").Where("age < 40").Count();
+        Console.WriteLine("20<age<40: " + Convert.ToString(n));
+
+        // 分页：第 2 页、每页 2 条。
+        List<ModelRow> page2 = users.Select(db).OrderBy("id").Limit(2).Offset(2).Execute();
+        Console.WriteLine("page2 first: " + page2[0].Get("name"));
+
+        // 主键查找；ModelRow 可直接序列化为 JSON。
+        ModelRow first = users.FindById(db, 1);
+        Console.WriteLine("byId(1): " + first.ToJson());
+
+        // ---- 5. 更新 ---------------------------------------------------------
+        int updated = users.UpdateQuery(db)
+            .SetInt("age", 26)
+            .Set("status", "vip")
+            .WhereEq("name", "Bob")
+            .Execute();
+        Console.WriteLine("updated rows: " + Convert.ToString(updated));
+        Console.WriteLine("bob now: " + users.Select(db).WhereEq("name", "Bob").First().ToJson());
+
+        // ---- 6. 删除 ---------------------------------------------------------
+        int deleted = users.DeleteQuery(db).Where("age > 40").Execute();
+        Console.WriteLine("deleted rows: " + Convert.ToString(deleted));
+        users.DeleteById(db, 3);
+        Console.WriteLine("after delete: " + Convert.ToString(users.Count(db)));
+
+        // ---- 7. 事务 ---------------------------------------------------------
+        // 回滚：事务内的写入全部撤销。
+        db.BeginTransaction();
+        users.Insert(db, ModelRow.Create()
+            .Set("name", "Temp").Set("email", "temp@example.com").SetInt("age", 1));
+        db.Rollback();
+        Console.WriteLine("after rollback: " + Convert.ToString(users.Count(db)));
+
+        // 提交：批量写入一次落盘（也远快于逐条自动提交）。
+        db.BeginTransaction();
+        int i = 0;
+        while (i < 3) {
+            users.Insert(db, ModelRow.Create()
+                .Set("name", "batch" + Convert.ToString(i))
+                .Set("email", "batch" + Convert.ToString(i) + "@example.com")
+                .SetInt("age", 20 + i));
+            i = i + 1;
+        }
+        db.Commit();
+        Console.WriteLine("after commit: " + Convert.ToString(users.Count(db)));
+
+        // ---- 8. 迁移 ---------------------------------------------------------
+        // RunAll 幂等：已应用过的迁移（记录在 _migrations 表）自动跳过。
+        List<Migration> migrations = new List<Migration>();
+        migrations.Add(Migration.Create("001_create_posts",
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT)",
+            "DROP TABLE posts"));
+        migrations.Add(Migration.Create("002_add_posts_body",
+            "ALTER TABLE posts ADD COLUMN body TEXT",
+            "ALTER TABLE posts DROP COLUMN body"));
+        Migration.RunAll(db, migrations);
+        Migration.RunAll(db, migrations);   // 第二次运行：什么都不做
+
+        // ---- 9. 反向映射（database first）------------------------------------
+        // 从已有表反推 Model；ToDefineCode 输出可直接粘贴的定义代码。
+        Model posts = Model.FromTable(db, "posts");
+        Console.WriteLine("posts columns: " + Convert.ToString(posts.ColumnCount())
+            + " pk=" + posts.GetPrimaryKey());
+        Console.WriteLine(posts.ToDefineCode());
+
+        // ---- 清理 ------------------------------------------------------------
+        users.DropTable(db);
+        db.Close();
+        File.Delete(path);
+        Console.WriteLine("done");
+    }
+}

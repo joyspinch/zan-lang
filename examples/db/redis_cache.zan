@@ -1,0 +1,89 @@
+// ============================================================================
+// Redis（RESP 协议，纯 Zan 实现）—— 缓存、计数器、过期、通用命令示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. RedisClient.ConnectAsync 异步连接（挂起在 IO reactor，不阻塞线程）
+//   2. 便捷方法：SetAsync / GetAsync / DelAsync / ExistsAsync /
+//      IncrAsync / ExpireAsync / PingAsync（AuthAsync / SelectAsync 备用）
+//   3. CommandAsync 家族发送任意 Redis 命令（HSET/HGET、LPUSH/LRANGE 等），
+//      RedisReply 按类型读取（kind/str/num/元素列表）
+//   4. 典型缓存模式：cache-aside（先查缓存，未命中回源再回填 + 过期时间）
+//
+// 说明：本示例需要一个可连接的 Redis。没有可用服务时会打印提示并跳过。
+// 运行：build/zanc examples/db/redis_cache.zan --auto-stdlib -o redis_cache.exe
+// 准备：docker run -p 6379:6379 redis:7
+// ============================================================================
+using System;
+using System.Data.Redis;
+
+class Program {
+    // cache-aside：命中直接返回；未命中"回源"（这里模拟为计算）后回填并设过期。
+    static async string LoadUserName(RedisClient r, int userId) {
+        string key = "user:" + Convert.ToString(userId) + ":name";
+        string cached = await r.GetAsync(key);
+        if (cached != null) { return cached + " (cache)"; }
+        string fresh = "Alice#" + Convert.ToString(userId);   // 假装查了数据库
+        bool ok = await r.SetAsync(key, fresh);
+        int e = await r.ExpireAsync(key, 60);                 // 60 秒过期
+        return fresh + " (db)";
+    }
+
+    static async int Run() {
+        // ---- 1. 连接 -----------------------------------------------------------
+        RedisClient r = await RedisClient.ConnectAsync("127.0.0.1", 6379);
+        bool alive = await r.PingAsync();
+        if (!alive) {
+            Console.WriteLine("Redis 未就绪，跳过示例。启动方法: docker run -p 6379:6379 redis:7");
+            return 0;
+        }
+
+        // ---- 2. 字符串：SET / GET / EXISTS / DEL ---------------------------------
+        await r.SetAsync("greeting", "你好, Zan!");
+        Console.WriteLine("get: " + await r.GetAsync("greeting"));
+        Console.WriteLine("exists: " + Convert.ToString(await r.ExistsAsync("greeting")));
+        Console.WriteLine("del: " + Convert.ToString(await r.DelAsync("greeting")));
+
+        // ---- 3. 计数器：INCR + EXPIRE（限流、PV 统计的基本件） -------------------
+        int d1 = await r.DelAsync("page:home:pv");
+        Console.WriteLine("pv: " + Convert.ToString(await r.IncrAsync("page:home:pv")));
+        Console.WriteLine("pv: " + Convert.ToString(await r.IncrAsync("page:home:pv")));
+        int e1 = await r.ExpireAsync("page:home:pv", 3600);
+
+        // ---- 4. 任意命令：哈希 / 列表 --------------------------------------------
+        List<string> hset = new List<string>();
+        hset.Add("HSET"); hset.Add("user:1");
+        hset.Add("name"); hset.Add("Alice");
+        hset.Add("age"); hset.Add("30");
+        RedisReply h = await r.CommandAsync(hset);
+        RedisReply age = await r.CommandAsync3("HGET", "user:1", "age");
+        Console.WriteLine("hget age: " + age.AsString());
+
+        List<string> lpush = new List<string>();
+        lpush.Add("RPUSH"); lpush.Add("queue:jobs"); lpush.Add("job-a"); lpush.Add("job-b");
+        RedisReply l1 = await r.CommandAsync(lpush);
+        List<string> lrange = new List<string>();
+        lrange.Add("LRANGE"); lrange.Add("queue:jobs"); lrange.Add("0"); lrange.Add("-1");
+        RedisReply jobs = await r.CommandAsync(lrange);
+        // ARRAY 回复：Count/At 遍历元素。
+        Console.WriteLine("jobs: " + Convert.ToString(jobs.Count())
+            + " first=" + jobs.At(0).AsString());
+
+        // ---- 5. cache-aside 模式 ---------------------------------------------------
+        int d2 = await r.DelAsync("user:42:name");
+        Console.WriteLine("first : " + await LoadUserName(r, 42));   // 未命中 -> db
+        Console.WriteLine("second: " + await LoadUserName(r, 42));   // 命中 -> cache
+
+        // ---- 清理 -------------------------------------------------------------------
+        List<string> cleanup = new List<string>();
+        cleanup.Add("DEL"); cleanup.Add("page:home:pv"); cleanup.Add("user:1");
+        cleanup.Add("queue:jobs"); cleanup.Add("user:42:name");
+        RedisReply c = await r.CommandAsync(cleanup);
+        r.Close();
+        Console.WriteLine("done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

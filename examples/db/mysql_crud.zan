@@ -1,0 +1,91 @@
+// ============================================================================
+// MySQL / MariaDB（原生协议，纯 Zan 实现）—— 异步连接、预处理语句、CRUD 示例
+// ----------------------------------------------------------------------------
+// 演示内容：
+//   1. MySqlConnection.OpenParamsAsync 异步连接（纯 Zan 实现 MySQL 线协议，
+//      支持 mysql_native_password / caching_sha2_password 认证，零 C 依赖）
+//   2. ExecuteAsync / QueryAsync 文本协议查询
+//   3. ExecuteParamsAsync / QueryParamsAsync 预处理语句（COM_STMT_PREPARE/
+//      EXECUTE 二进制协议，`?` 原生绑定 + 语句缓存，防注入且更快）
+//   4. ExecuteScalarAsync / ExecuteScalarParamsAsync 单值查询
+//   5. 事务（START TRANSACTION / COMMIT / ROLLBACK）
+//
+// 说明：本示例需要一个可连接的 MySQL/MariaDB（TiDB、OceanBase 等兼容协议
+//       的引擎同样适用）。没有可用服务时会打印提示并跳过，不算失败。
+// 运行：build/zanc examples/db/mysql_crud.zan --auto-stdlib -o mysql_crud.exe
+// 准备：docker run -e MYSQL_ROOT_PASSWORD=secret -e MYSQL_DATABASE=demo -p 3306:3306 mysql:8
+// ============================================================================
+using System;
+using System.Data;
+using System.Data.MySql;
+
+class Program {
+    static async int Run() {
+        // ---- 1. 异步连接 -----------------------------------------------------
+        MySqlConnection db = await MySqlConnection.OpenParamsAsync(
+            "127.0.0.1", 3306, "demo", "root", "secret");
+        if (!db.IsConnected()) {
+            Console.WriteLine("MySQL 未就绪，跳过示例: " + db.GetError());
+            Console.WriteLine("启动方法: docker run -e MYSQL_ROOT_PASSWORD=secret "
+                + "-e MYSQL_DATABASE=demo -p 3306:3306 mysql:8");
+            return 0;
+        }
+
+        // ---- 2. DDL（文本协议） ------------------------------------------------
+        await db.ExecuteAsync("DROP TABLE IF EXISTS my_demo_books");
+        await db.ExecuteAsync("CREATE TABLE my_demo_books ("
+            + "id INT AUTO_INCREMENT PRIMARY KEY, "
+            + "title VARCHAR(128) NOT NULL, author VARCHAR(64), price DECIMAL(8,2))");
+
+        // ---- 3. 预处理语句 INSERT（二进制协议，`?` 原生绑定） --------------------
+        // 同一 SQL 的语句句柄会被缓存，循环插入只 PREPARE 一次。
+        await db.ExecuteParamsAsync(
+            "INSERT INTO my_demo_books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("Zan 语言入门").Add("Alice").AddDouble(59.9));
+        await db.ExecuteParamsAsync(
+            "INSERT INTO my_demo_books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("编译原理").Add("O'Brien").AddDouble(99.0));
+        await db.ExecuteParamsAsync(
+            "INSERT INTO my_demo_books (title, author, price) VALUES (?, ?, ?)",
+            DbParams.Create().Add("分布式系统").Add("Carol").AddDouble(79.0));
+
+        // ---- 4. 查询 -------------------------------------------------------------
+        DbResult r = await db.QueryParamsAsync(
+            "SELECT id, title, author FROM my_demo_books WHERE price > ? ORDER BY id",
+            DbParams.Create().AddDouble(60.0));
+        int i = 0;
+        while (i < r.RowCount()) {
+            Console.WriteLine("  #" + r.GetByName(i, "id") + " "
+                + r.GetByName(i, "title") + " by " + r.GetByName(i, "author"));
+            i = i + 1;
+        }
+        Console.WriteLine("count: "
+            + await db.ExecuteScalarAsync("SELECT COUNT(*) FROM my_demo_books"));
+
+        // ---- 5. 更新 / 删除 ---------------------------------------------------------
+        int updated = await db.ExecuteParamsAsync(
+            "UPDATE my_demo_books SET price = ? WHERE title = ?",
+            DbParams.Create().AddDouble(49.5).Add("编译原理"));
+        Console.WriteLine("updated: " + Convert.ToString(updated));
+        int deleted = await db.ExecuteParamsAsync(
+            "DELETE FROM my_demo_books WHERE price < ?",
+            DbParams.Create().AddDouble(60.0));
+        Console.WriteLine("deleted: " + Convert.ToString(deleted));
+
+        // ---- 6. 事务 ----------------------------------------------------------------
+        await db.ExecuteAsync("START TRANSACTION");
+        await db.ExecuteAsync("INSERT INTO my_demo_books (title, price) VALUES ('临时', 1)");
+        await db.ExecuteAsync("ROLLBACK");
+        Console.WriteLine("after rollback: "
+            + await db.ExecuteScalarAsync("SELECT COUNT(*) FROM my_demo_books"));
+
+        await db.ExecuteAsync("DROP TABLE my_demo_books");
+        db.Close();
+        Console.WriteLine("done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
