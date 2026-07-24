@@ -272,17 +272,28 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef fgets_type = LLVMFunctionType(i8ptr, fgets_args, 3, 0);
                 fgets_fn = LLVMAddFunction(g->mod, "fgets", fgets_type);
             }
-            /* get stdin */
-            LLVMValueRef stdin_fn = LLVMGetNamedFunction(g->mod, "__acrt_iob_func");
-            if (!stdin_fn) {
-                LLVMTypeRef iob_args[] = { LLVMInt32TypeInContext(g->ctx) };
-                LLVMTypeRef iob_type = LLVMFunctionType(i8ptr, iob_args, 1, 0);
-                stdin_fn = LLVMAddFunction(g->mod, "__acrt_iob_func", iob_type);
+            /* get stdin: Windows UCRT exposes the stdin FILE* via
+             * __acrt_iob_func(0), but ELF libc (glibc/musl) exports a `stdin`
+             * global instead. Referencing __acrt_iob_func unconditionally left
+             * that symbol undefined when cross-compiling to linux, so pick the
+             * right one for the target. */
+            LLVMValueRef stdin_ptr;
+            if (g->target_is_windows) {
+                LLVMValueRef stdin_fn = LLVMGetNamedFunction(g->mod, "__acrt_iob_func");
+                if (!stdin_fn) {
+                    LLVMTypeRef iob_args[] = { LLVMInt32TypeInContext(g->ctx) };
+                    LLVMTypeRef iob_type = LLVMFunctionType(i8ptr, iob_args, 1, 0);
+                    stdin_fn = LLVMAddFunction(g->mod, "__acrt_iob_func", iob_type);
+                }
+                LLVMValueRef zero = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+                stdin_ptr = zan_call2(g->builder,
+                    LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ LLVMInt32TypeInContext(g->ctx) }, 1, 0),
+                    stdin_fn, &zero, 1, "stdin");
+            } else {
+                LLVMValueRef stdin_g = LLVMGetNamedGlobal(g->mod, "stdin");
+                if (!stdin_g) { stdin_g = LLVMAddGlobal(g->mod, i8ptr, "stdin"); }
+                stdin_ptr = LLVMBuildLoad2(g->builder, i8ptr, stdin_g, "stdin");
             }
-            LLVMValueRef zero = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
-            LLVMValueRef stdin_ptr = zan_call2(g->builder,
-                LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ LLVMInt32TypeInContext(g->ctx) }, 1, 0),
-                stdin_fn, &zero, 1, "stdin");
             LLVMValueRef sz = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1024, 0);
             LLVMValueRef fgets_args[] = { buf, sz, stdin_ptr };
             zan_call2(g->builder,
