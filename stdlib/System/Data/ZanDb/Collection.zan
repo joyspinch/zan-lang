@@ -135,8 +135,9 @@ class Collection {
         this.keyDictDirty = false;
     }
 
-    // Binary record value tags: 0 null, 1 false, 2 true, 3 int (zigzag
-    // varint), 4 number-as-text (non-integer), 5 string, 6 array, 7 object.
+    // Binary record value tags: 0 null, 1 false, 2 true, 3 non-negative int
+    // (varint), 8 negative int (varint of the magnitude), 4 number-as-text
+    // (non-integer), 5 string, 6 array, 7 object.
     static bool IsIntStr(string s) {
         int n = s.Length;
         if (n == 0) { return false; }
@@ -151,8 +152,25 @@ class Collection {
         return true;
     }
 
-    static int ZigZag(int v) { return (v << 1) ^ (v >> 63); }
-    static int UnZig(int z) { return (z >> 1) ^ (-(z & 1)); }
+    // Parses a signed base-10 integer. Used instead of Convert.ToInt, which
+    // currently lowers to C atoi (declared with an i64 return) and so fails to
+    // sign-extend -- negatives and values > 2^31 come back as zero-extended
+    // garbage.
+    static int ParseI64(string s) {
+        int n = s.Length;
+        int i = 0;
+        bool neg = false;
+        if (n > 0 && (s[0] & 255) == 45) { neg = true; i = 1; }   // '-'
+        int acc = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            acc = acc * 10 + (c - 48);
+            i = i + 1;
+        }
+        if (neg) { return 0 - acc; }
+        return acc;
+    }
 
     void WriteVal(ByteBuffer b, JsonValue v) {
         if (v.IsNull()) { b.WriteU8(0); return; }
@@ -163,8 +181,9 @@ class Collection {
         if (v.IsNumber()) {
             string raw = v.AsString("");
             if (Collection.IsIntStr(raw)) {
-                b.WriteU8(3);
-                b.WriteVarInt(Collection.ZigZag(Convert.ToInt(raw)));
+                int iv = Collection.ParseI64(raw);
+                if (iv < 0) { b.WriteU8(8); b.WriteVarInt(0 - iv); }
+                else { b.WriteU8(3); b.WriteVarInt(iv); }
             } else {
                 b.WriteU8(4);
                 b.WriteString(raw);
@@ -243,7 +262,8 @@ class Collection {
         if (tag == 0) { return JsonValue.NewNull(); }
         if (tag == 1) { return JsonValue.NewBool(false); }
         if (tag == 2) { return JsonValue.NewBool(true); }
-        if (tag == 3) { return JsonValue.NewNum(Convert.ToString(Collection.UnZig(b.ReadVarInt()))); }
+        if (tag == 3) { return JsonValue.NewNum(Convert.ToString(b.ReadVarInt())); }
+        if (tag == 8) { return JsonValue.NewNum(Convert.ToString(0 - b.ReadVarInt())); }
         if (tag == 4) { return JsonValue.NewNum(b.ReadString()); }
         if (tag == 5) { return JsonValue.NewStr(b.ReadString()); }
         if (tag == 6) {
