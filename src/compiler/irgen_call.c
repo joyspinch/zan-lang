@@ -787,33 +787,41 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
             }
             
-            /* Convert.ToInt32(str) -> atoi */
+            /* Convert.ToInt / Convert.ToInt32 / Convert.ToInt64(x) */
             if (callee->member.object->kind == AST_IDENTIFIER) {
                 zan_istr_t obj_name = callee->member.object->ident.name;
                 if (obj_name.len == 7 && memcmp(obj_name.str, "Convert", 7) == 0) {
                     if (((method_name.len == 7 && memcmp(method_name.str, "ToInt32", 7) == 0) ||
+                         (method_name.len == 7 && memcmp(method_name.str, "ToInt64", 7) == 0) ||
                          (method_name.len == 5 && memcmp(method_name.str, "ToInt", 5) == 0)) &&
                         expr->call.args.count == 1) {
                         LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-                        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                        LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-                        LLVMValueRef atoi_fn = LLVMGetNamedFunction(g->mod, "atoi");
-                        LLVMTypeRef atoi_type;
-                        if (!atoi_fn) {
-                            atoi_type = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-                            atoi_fn = LLVMAddFunction(g->mod, "atoi", atoi_type);
-                        } else {
-                            /* a stdlib `static extern int atoi(...)` may have
-                             * declared it already (with an i64 return); call
-                             * through the existing declaration's type */
-                            atoi_type = LLVMGlobalGetValueType(atoi_fn);
-                        }
-                        LLVMValueRef parsed = zan_call2(g->builder,
-                            atoi_type, atoi_fn, &arg, 1, "atoi");
                         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-                        if (LLVMTypeOf(parsed) != i64t &&
-                            LLVMGetTypeKind(LLVMTypeOf(parsed)) == LLVMIntegerTypeKind)
-                            parsed = LLVMBuildSExt(g->builder, parsed, i64t, "atoi64");
+                        LLVMTypeKind ak = LLVMGetTypeKind(LLVMTypeOf(arg));
+                        LLVMValueRef parsed;
+                        if (ak == LLVMPointerTypeKind) {
+                            /* string -> strtoll(s, NULL, 10): full signed 64-bit.
+                             * atoi returned i32 and, when a stdlib extern had
+                             * declared it i64, left garbage in the upper bits --
+                             * so values > 2^31 (and some negatives) came back
+                             * corrupt. */
+                            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                            LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
+                            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                            LLVMTypeRef strtoll_ty = LLVMFunctionType(i64t,
+                                (LLVMTypeRef[]){ i8ptr, i8pp, i32t }, 3, 0);
+                            LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
+                            parsed = zan_call2(g->builder, strtoll_ty, f,
+                                (LLVMValueRef[]){ arg, LLVMConstNull(i8pp),
+                                                  LLVMConstInt(i32t, 10, 0) }, 3, "toint");
+                        } else if (ak == LLVMDoubleTypeKind || ak == LLVMFloatTypeKind) {
+                            parsed = LLVMBuildFPToSI(g->builder, arg, i64t, "toint");
+                        } else if (ak == LLVMIntegerTypeKind) {
+                            parsed = (LLVMTypeOf(arg) == i64t) ? arg
+                                : LLVMBuildSExt(g->builder, arg, i64t, "toint");
+                        } else {
+                            parsed = LLVMConstInt(i64t, 0, 0);
+                        }
                         emit_release_owned_call_temp(
                             g, expr->call.args.items[0], arg, locals);
                         return parsed;
