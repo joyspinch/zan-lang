@@ -233,6 +233,25 @@ partial class ZanIDE {
         File.WriteAllText(ZanIDE.RecentProjectsPath(), sb.ToString());
     }
 
+    /// Drops a single entry from the recent-projects MRU (the start-page × removes
+    /// just that record; the project on disk is untouched).
+    static void RemoveRecentProject(string root) {
+        string p = ZanIDE.TrimWs(ZanIDE.NormSlashes(root));
+        if (p == "") { return; }
+        List<string> cur = ZanIDE.ReadRecentProjects();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < cur.Count) {
+            if (cur[i] != p) {
+                sb.Append(cur[i]);
+                sb.Append("\n");
+            }
+            i = i + 1;
+        }
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.RecentProjectsPath(), sb.ToString());
+    }
+
     /// Fills the start-page article list: docs/news.json in the project (or
     /// start_news.json in the user config dir) when present, else the built-in
     /// entries. `links` are URLs, or "@docs" to open the built-in help tab.
@@ -1099,7 +1118,7 @@ partial class ZanIDE {
         // Third column of the aardio-style 3-pane layout: sidebar | editor |
         // side panel. rightW persists across launches; centerW is derived from
         // it each frame so the Split drag handle moves the panel edge.
-        SignalInt rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 300), 120, 1600));
+        SignalInt rightW = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightW", 600), 120, 1600));
         SignalInt centerW = SignalInt.Create(0);
         // 0 = AI chat, 1 = tools/ tree, 2 = examples/ tree, 3 = git panel.
         SignalInt rightTab = SignalInt.Create(ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "rightTab", 0), 0, 3));
@@ -1181,6 +1200,11 @@ partial class ZanIDE {
         // stream to a session log file polled each frame.
         int termFp = 0;
         int termLogLen = 0;
+        // Console-program output mirror: a launched console program prints into
+        // its own console window and, teed, into RunLogPath, which is polled
+        // into the Output tab so output shows in both places.
+        int runLogLen = 0;
+        bool runStreaming = false;
         // Hot reload: when ON, saving rebuilds and restarts the running app.
         bool autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
         SignalInt treeSel = SignalInt.Create(-1);
@@ -1681,21 +1705,15 @@ partial class ZanIDE {
                     ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     string runExe = ZanIDE.RunBuildActive(tabPaths, activeTab, root, log, editor);
                     if (runExe != "") {
-                        // Stream the program through the persistent terminal shell so a
-                        // long-running server keeps printing into the IDE without blocking
-                        // the UI (Ctrl+C in the terminal stops it).
-                        if (termFp == 0) {
-                            termFp = ZanIDE.TermOpen(root);
-                            termLogLen = 0;
-                        }
-                        if (termFp != 0) {
-                            bottomTab.Set(0);
-                            log.Add("> " + runExe);
-                            Process.ShellSend(termFp, "\"" + runExe + "\"");
-                            app.RequestRedraw();
-                        } else {
-                            log.Add(ZanIDE.T("[error] Could not start the shell session.", "[错误] 无法启动 shell 会话。"));
-                        }
+                        // Console programs run in their own console window (real
+                        // stdin, so Console.ReadLine works) with output teed into
+                        // the Output tab so it is visible in both places.
+                        bottomTab.Set(0);
+                        log.Add("> " + runExe);
+                        ZanIDE.RunConsole(runExe);
+                        runLogLen = 0;
+                        runStreaming = true;
+                        app.RequestRedraw();
                     }
                 } else if (rc == 5) {
                     Layer.Msg(ZanIDE.T("Building…", "正在构建…"), 2);
@@ -2147,28 +2165,27 @@ partial class ZanIDE {
                 if (newRightW < rightMin) { newRightW = rightMin; }
                 rightW.Set(newRightW);
 
-                // The designer takes the whole center column (full-height design
-                // surface, aardio-style); code tabs keep the editor/output split.
-                Rect ea = centerArea;
-                Rect orr = Rect.Create(centerArea.x, centerArea.y + centerArea.height, centerArea.width, 0);
-                if (!designerMode && !sceneMode) {
-                    int bottomMin = app.Scale(90);
-                    if (dbgState == 2) { bottomMin = app.Scale(160); }
-                    int editorMin = app.Scale(140);
-                    int splitHandleH = 5;
-                    // Editor fills everything above the (compact) output panel.
-                    int wantEditorH = centerArea.height - bottomPanelH.Get() - splitHandleH;
-                    if (wantEditorH < editorMin) { wantEditorH = editorMin; }
-                    editorAreaH.Set(wantEditorH);
-                    Split rows = Split.Horizontal(app, centerArea, editorAreaH, editorMin, bottomMin);
-                    ea = rows.first;
-                    orr = rows.second;
-                    // Persist the resulting output height (not the editor height) so
-                    // resizing the window keeps the editor as the dominant area.
-                    int newBottomH = centerArea.height - editorAreaH.Get() - splitHandleH;
-                    if (newBottomH < bottomMin) { newBottomH = bottomMin; }
-                    bottomPanelH.Set(newBottomH);
-                }
+                // Center column = editor/designer stack on top + a docked output
+                // panel at the bottom, in every mode.
+                int bottomMin = app.Scale(90);
+                if (dbgState == 2) { bottomMin = app.Scale(160); }
+                int editorMin = app.Scale(140);
+                int splitHandleH = 5;
+                // The output/console panel stays docked at the bottom in EVERY
+                // mode -- code, form designer and scene designer -- so build
+                // output and logs are always visible. The editor/designer fills
+                // everything above the (compact) output panel.
+                int wantEditorH = centerArea.height - bottomPanelH.Get() - splitHandleH;
+                if (wantEditorH < editorMin) { wantEditorH = editorMin; }
+                editorAreaH.Set(wantEditorH);
+                Split rows = Split.Horizontal(app, centerArea, editorAreaH, editorMin, bottomMin);
+                Rect ea = rows.first;
+                Rect orr = rows.second;
+                // Persist the resulting output height (not the editor height) so
+                // resizing the window keeps the editor as the dominant area.
+                int newBottomH = centerArea.height - editorAreaH.Get() - splitHandleH;
+                if (newBottomH < bottomMin) { newBottomH = bottomMin; }
+                bottomPanelH.Set(newBottomH);
 
                 int tabH = TabView.Height(app);
                 TabHit hit = TabView.Render(app, ea.x, ea.y, ea.width, tabH, tabNames, activeTab, true);
@@ -2364,6 +2381,14 @@ partial class ZanIDE {
                             ZanIDE.T("Open Zan source file", "打开 Zan 源文件"));
                         pathPickerOwner = 4;
                         app.RequestRedraw();
+                    } else if (sact >= 300) {
+                        int ridx = sact - 300;
+                        if (ridx >= 0 && ridx < spRecents.Count) {
+                            ZanIDE.RemoveRecentProject(spRecents[ridx]);
+                            startPage.SetData(
+                                ZanIDE.ReadRecentProjects(), spTags, spTitles);
+                            app.RequestRedraw();
+                        }
                     } else if (sact >= 200) {
                         int nidx = sact - 200;
                         if (nidx >= 0 && nidx < spLinks.Count) {
@@ -2608,9 +2633,7 @@ partial class ZanIDE {
                     }
                 }
 
-                if (designerMode) {
-                    // Output panel is hidden while designing.
-                } else if (dbgState == 2) {
+                if (dbgState == 2) {
                     DebugPanel.RenderDebugBottom(app, c, t, orr, dbgPanelTab,
                         dbgConsole, dbgVarInfo, dbgWatchVals, watchText,
                         dbgStack, log);
@@ -3434,6 +3457,16 @@ partial class ZanIDE {
                     int consumed2 = ZanIDE.TermPoll(termLogLen, log);
                     if (consumed2 != termLogLen) {
                         termLogLen = consumed2;
+                        coScroll = 0;
+                        app.RequestRedraw();
+                    }
+                    app.RequestAnimationFrame(250);
+                }
+                // Mirror a launched console program's output into the Output tab.
+                if (runStreaming) {
+                    int rconsumed = ZanIDE.RunPoll(runLogLen, log);
+                    if (rconsumed != runLogLen) {
+                        runLogLen = rconsumed;
                         coScroll = 0;
                         app.RequestRedraw();
                     }

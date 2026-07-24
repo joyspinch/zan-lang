@@ -696,12 +696,12 @@ partial class ZanIDE {
         return Process.ShellOpen(cmd);
     }
 
-    /// Appends any new complete lines from the session log to the terminal
-    /// view. Returns the new consumed length (only whole lines are consumed,
-    /// so a partially-written line is picked up on a later poll).
-    static int TermPoll(int consumed, List<string> termLog) {
-        if (!File.Exists(ZanIDE.TermLogPath())) { return consumed; }
-        string raw = File.ReadAllText(ZanIDE.TermLogPath());
+    /// Appends any new complete lines from the given log file to `outLog`.
+    /// Returns the new consumed length (only whole lines are consumed, so a
+    /// partially-written line is picked up on a later poll).
+    static int PollLogFile(string path, int consumed, List<string> outLog) {
+        if (!File.Exists(path)) { return consumed; }
+        string raw = File.ReadAllText(path);
         if (raw.Length <= consumed) { return consumed; }
         // Consume up to the last newline only.
         int last = 0 - 1;
@@ -715,11 +715,47 @@ partial class ZanIDE {
         List<string> nl = CodeEditor.SplitLines(chunk);
         int k = 0;
         while (k < nl.Count) {
-            if (!(k == nl.Count - 1 && nl[k] == "")) { termLog.Add(nl[k]); }
+            if (!(k == nl.Count - 1 && nl[k] == "")) { outLog.Add(nl[k]); }
             k = k + 1;
         }
-        while (termLog.Count > 2000) { termLog.RemoveAt(0); }
+        while (outLog.Count > 2000) { outLog.RemoveAt(0); }
         return last + 1;
+    }
+
+    /// Appends any new complete lines from the terminal session log to the
+    /// terminal view.
+    static int TermPoll(int consumed, List<string> termLog) {
+        return ZanIDE.PollLogFile(ZanIDE.TermLogPath(), consumed, termLog);
+    }
+
+    /// Log file that a launched console program's output is mirrored into so
+    /// the IDE Output tab can show it alongside the real console window.
+    static string RunLogPath() { return ZanIDE.UserConfigDir() + "/run_output.log"; }
+
+    /// Launches a console executable in its own visible console window while
+    /// teeing its combined stdout/stderr into RunLogPath. The program's output
+    /// therefore appears in the real console (which also keeps a live stdin so
+    /// Console.ReadLine works) and, mirrored, in the IDE Output tab. Truncates
+    /// the mirror log first; the caller resets its consumed counter to 0.
+    static void RunConsole(string exe) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.RunLogPath(), "");
+        #if WINDOWS
+        // Echo each line to the host (so the console window shows it) and append
+        // it to the mirror log as UTF-8 without BOM (Tee-Object/Out-File default
+        // to UTF-16 on Windows PowerShell, which the log reader cannot decode).
+        string ps = "$e=New-Object System.Text.UTF8Encoding $false; & '" + exe
+            + "' 2>&1 | %{ $_; [IO.File]::AppendAllText('" + ZanIDE.RunLogPath()
+            + "',$_+[Environment]::NewLine,$e) }";
+        Process.Run("cmd /c start \"Zan Run\" powershell -NoProfile -ExecutionPolicy Bypass -NoExit -Command \"" + ps + "\"");
+        #else
+        Process.Run("sh -c '\"" + exe + "\" 2>&1 | tee \"" + ZanIDE.RunLogPath() + "\"' &");
+        #endif
+    }
+
+    /// Appends any new mirrored console-program output lines to `outLog`.
+    static int RunPoll(int consumed, List<string> outLog) {
+        return ZanIDE.PollLogFile(ZanIDE.RunLogPath(), consumed, outLog);
     }
 
     // ================================================================

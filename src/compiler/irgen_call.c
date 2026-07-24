@@ -2308,12 +2308,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
                     LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
                     LLVMValueRef idx = emit_expr(g, expr->call.args.items[0], locals);
+                    /* Keep `item` in its natural type (pointer for string/class
+                     * elements) so emit_collection_slot_store can retain it:
+                     * emit_string_retain/emit_arc_retain no-op on non-pointer
+                     * values, so pre-converting to i64 here would silently skip
+                     * the +1 and leave the list holding a slot that is freed
+                     * when the argument temp dies -> heap corruption. The store
+                     * helper performs the pointer->i64 slot conversion itself. */
                     LLVMValueRef item = emit_expr(g, expr->call.args.items[1], locals);
-                    if (LLVMGetTypeKind(LLVMTypeOf(item)) == LLVMPointerTypeKind)
-                        item = LLVMBuildPtrToInt(g->builder, item, i64, "ip");
-                    else if (LLVMGetTypeKind(LLVMTypeOf(item)) == LLVMIntegerTypeKind &&
-                             LLVMGetIntTypeWidth(LLVMTypeOf(item)) < 64)
-                        item = LLVMBuildSExt(g->builder, item, i64, "ie");
                     /* grow if needed */
                     LLVMValueRef need = LLVMBuildICmp(g->builder, LLVMIntUGE, count, cap, "need");
                     LLVMBasicBlockRef grow_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "ins.grow");
