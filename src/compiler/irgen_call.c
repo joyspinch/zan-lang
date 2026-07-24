@@ -217,6 +217,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     zan_call2(g->builder, fn_type, print_fn, &arg, 1, "");
                 }
                 emit_release_owned_call_temp(g, arg_ast, arg, locals);
+            } else {
+                /* WriteLine() with no argument -> a blank line, matching C#. */
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMValueRef empty = LLVMBuildGlobalStringPtr(g->builder, "", "wl_nl");
+                zan_call2(g->builder,
+                    LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0),
+                    g->rt_println, &empty, 1, "");
             }
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
@@ -300,6 +307,44 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, LLVMInt32TypeInContext(g->ctx), i8ptr }, 3, 0),
                 fgets_fn, fgets_args, 3, "");
             return buf;
+        }
+
+        /* Console.Read() -> one char from stdin as int (i64); getchar() returns
+         * the byte or EOF (-1). Portable across targets. */
+        if (is_call_to(expr, "Console", "Read")) {
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef getchar_ty = LLVMFunctionType(i32t, NULL, 0, 0);
+            LLVMValueRef getchar_fn = get_libc_fn(g, "getchar", getchar_ty);
+            LLVMValueRef r = zan_call2(g->builder, getchar_ty, getchar_fn, NULL, 0, "cread");
+            return LLVMBuildSExt(g->builder, r, i64t, "cread64");
+        }
+
+        /* Console.ReadKey([bool]) -> one keypress as its char code (i64).
+         * Windows uses _getch (no Enter, no echo -- matches C#); other targets
+         * fall back to getchar(). The optional intercept bool is accepted for
+         * source compatibility but not otherwise acted on. */
+        if (is_call_to(expr, "Console", "ReadKey")) {
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+            const char *fname = g->target_is_windows ? "_getch" : "getchar";
+            LLVMTypeRef fty = LLVMFunctionType(i32t, NULL, 0, 0);
+            LLVMValueRef fn = get_libc_fn(g, fname, fty);
+            LLVMValueRef r = zan_call2(g->builder, fty, fn, NULL, 0, "readkey");
+            return LLVMBuildSExt(g->builder, r, i64t, "readkey64");
+        }
+
+        /* Console.Clear() -> clear screen + home cursor via an ANSI escape
+         * (portable; Windows 10+ consoles interpret VT sequences). */
+        if (is_call_to(expr, "Console", "Clear")) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef printf_type = LLVMFunctionType(
+                LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 1);
+            LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
+            if (!printf_fn) printf_fn = LLVMAddFunction(g->mod, "printf", printf_type);
+            LLVMValueRef esc = LLVMBuildGlobalStringPtr(g->builder, "\033[2J\033[H", "clrseq");
+            zan_call2(g->builder, printf_type, printf_fn, &esc, 1, "");
+            return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
         /* ==== NativeMemory intrinsics ====
