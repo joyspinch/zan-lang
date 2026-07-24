@@ -347,6 +347,18 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
+        /* Console.ResetColor() -> reset all SGR attributes to default. */
+        if (is_call_to(expr, "Console", "ResetColor")) {
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef printf_type = LLVMFunctionType(
+                LLVMInt32TypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 1);
+            LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
+            if (!printf_fn) printf_fn = LLVMAddFunction(g->mod, "printf", printf_type);
+            LLVMValueRef esc = LLVMBuildGlobalStringPtr(g->builder, "\033[0m", "rstseq");
+            zan_call2(g->builder, printf_type, printf_fn, &esc, 1, "");
+            return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        }
+
         /* ==== NativeMemory intrinsics ====
          * Raw off-heap memory access for binary IO (ByteBuffer, ZanDB pages,
          * network framing). Addresses travel as nint (i64); every operation

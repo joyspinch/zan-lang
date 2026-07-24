@@ -921,6 +921,54 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
     return LLVMBuildBitCast(g->builder, objp, i8ptr, "bindv");
 }
 
+/* Emit `\e[<code>m` for a Console.ForegroundColor/BackgroundColor assignment,
+ * mapping a C# ConsoleColor (0..15) to its ANSI SGR code via a private lookup
+ * table indexed by the (runtime) colour value. */
+static void emit_console_color(zan_irgen_t *g, LLVMValueRef color, int is_bg) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef arrTy = LLVMArrayType(i32, 16);
+    const char *nm = is_bg ? "__zan_ansi_bg" : "__zan_ansi_fg";
+    LLVMValueRef tbl = LLVMGetNamedGlobal(g->mod, nm);
+    if (!tbl) {
+        static const int fg[16] = { 30,34,32,36,31,35,33,37,
+                                    90,94,92,96,91,95,93,97 };
+        LLVMValueRef vals[16];
+        for (int i = 0; i < 16; i++)
+            vals[i] = LLVMConstInt(i32, (unsigned)(fg[i] + (is_bg ? 10 : 0)), 0);
+        tbl = LLVMAddGlobal(g->mod, arrTy, nm);
+        LLVMSetInitializer(tbl, LLVMConstArray(i32, vals, 16));
+        LLVMSetGlobalConstant(tbl, 1);
+        LLVMSetLinkage(tbl, LLVMPrivateLinkage);
+    }
+    if (LLVMGetTypeKind(LLVMTypeOf(color)) != LLVMIntegerTypeKind)
+        color = LLVMConstInt(i64, 0, 0);
+    else if (LLVMGetIntTypeWidth(LLVMTypeOf(color)) < 64)
+        color = LLVMBuildSExt(g->builder, color, i64, "csx");
+    LLVMValueRef idx = LLVMBuildAnd(g->builder, color, LLVMConstInt(i64, 15, 0), "cidx");
+    LLVMValueRef gep = LLVMBuildInBoundsGEP2(g->builder, arrTy, tbl,
+        (LLVMValueRef[]){ LLVMConstInt(i64, 0, 0), idx }, 2, "ansip");
+    LLVMValueRef code = LLVMBuildLoad2(g->builder, i32, gep, "ansicode");
+    LLVMTypeRef pty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 1);
+    LLVMValueRef pf = LLVMGetNamedFunction(g->mod, "printf");
+    if (!pf) pf = LLVMAddFunction(g->mod, "printf", pty);
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "\033[%dm", "sgrfmt");
+    zan_call2(g->builder, pty, pf, (LLVMValueRef[]){ fmt, code }, 2, "");
+}
+
+/* Emit an OSC title sequence for Console.Title = value (works on Windows
+ * Terminal / conhost VT and xterm-compatible terminals). */
+static void emit_console_title(zan_irgen_t *g, LLVMValueRef s) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef pty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr }, 1, 1);
+    LLVMValueRef pf = LLVMGetNamedFunction(g->mod, "printf");
+    if (!pf) pf = LLVMAddFunction(g->mod, "printf", pty);
+    LLVMValueRef fmt = LLVMBuildGlobalStringPtr(g->builder, "\033]0;%s\007", "titlefmt");
+    zan_call2(g->builder, pty, pf, (LLVMValueRef[]){ fmt, s }, 2, "");
+}
+
 static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         LLVMValueRef right;
@@ -1269,6 +1317,27 @@ binding_lowered:
             /* obj.Field = value */
             zan_ast_node_t *obj_expr = expr->binary.left->member.object;
             bool stored = false;
+            /* Console.ForegroundColor/BackgroundColor/Title = value are console
+             * state, not field stores: lower them to ANSI escapes. */
+            if (obj_expr->kind == AST_IDENTIFIER &&
+                obj_expr->ident.name.len == 7 &&
+                memcmp(obj_expr->ident.name.str, "Console", 7) == 0 &&
+                !local_find(locals, obj_expr->ident.name)) {
+                zan_istr_t mn = expr->binary.left->member.name;
+                if (mn.len == 15 && memcmp(mn.str, "ForegroundColor", 15) == 0) {
+                    emit_console_color(g, right, 0);
+                    return right;
+                }
+                if (mn.len == 15 && memcmp(mn.str, "BackgroundColor", 15) == 0) {
+                    emit_console_color(g, right, 1);
+                    return right;
+                }
+                if (mn.len == 5 && memcmp(mn.str, "Title", 5) == 0) {
+                    emit_console_title(g, right);
+                    emit_release_owned_call_temp(g, expr->binary.right, right, locals);
+                    return right;
+                }
+            }
             /* ClassName.StaticField = value — store into the backing global. */
             if (obj_expr->kind == AST_IDENTIFIER &&
                 !local_find(locals, obj_expr->ident.name)) {
@@ -1614,6 +1683,25 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 LLVMValueRef len = zan_call2(g->builder, strlen_type, g->fn_strlen, &obj_val, 1, "len");
                 emit_release_owned_call_temp(g, expr->member.object, obj_val, locals);
                 return len;
+            }
+        }
+
+        /* ConsoleColor.<Member> -> its fixed 0..15 ordinal (C# order). Handled
+         * here so console-colour code yields the right value regardless of how
+         * the stdlib enum's members bind. */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            expr->member.object->ident.name.len == 12 &&
+            memcmp(expr->member.object->ident.name.str, "ConsoleColor", 12) == 0) {
+            static const struct { const char *n; int l; } cc[16] = {
+                {"Black",5},{"DarkBlue",8},{"DarkGreen",9},{"DarkCyan",8},
+                {"DarkRed",7},{"DarkMagenta",11},{"DarkYellow",10},{"Gray",4},
+                {"DarkGray",8},{"Blue",4},{"Green",5},{"Cyan",4},
+                {"Red",3},{"Magenta",7},{"Yellow",6},{"White",5} };
+            for (int i = 0; i < 16; i++) {
+                if (expr->member.name.len == cc[i].l &&
+                    memcmp(expr->member.name.str, cc[i].n, (size_t)cc[i].l) == 0)
+                    return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                                        (uint64_t)i, 0);
             }
         }
 
