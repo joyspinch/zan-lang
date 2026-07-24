@@ -594,13 +594,18 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
             const char *title = has_md ? m_desc : cls_desc;
 
             bool is_static = (m->method_decl.modifiers & MOD_STATIC) != 0;
+            bool is_async = (m->method_decl.modifiers & MOD_ASYNC) != 0;
             const char *hname_fmt = "__h_%s_%s";
             char hname[300]; snprintf(hname, sizeof(hname), hname_fmt, cname, mname);
 
-            /* trampoline */
-            rg_putf(&handlers, "    static void %s(HttpContext ctx) {\n", hname);
+            /* Trampoline. It is `async` so it satisfies the async HttpHandler
+             * delegate (WebApp.Dispatch awaits it), letting the action await
+             * I/O without blocking the connection coroutine. An async action is
+             * awaited; a plain action is called directly inside the async body. */
+            const char *aw = is_async ? "await " : "";
+            rg_putf(&handlers, "    static async void %s(HttpContext ctx) {\n", hname);
             if (is_static) {
-                rg_putf(&handlers, "        %s.%s(%s);\n", cname, mname,
+                rg_putf(&handlers, "        %s%s.%s(%s);\n", aw, cname, mname,
                         ctx_param ? "ctx" : "");
             } else {
                 rg_putf(&handlers, "        %s __c = new %s();\n", cname, cname);
@@ -610,7 +615,7 @@ void zan_routegen_run(zan_ast_node_t *unit, zan_arena_t *arena,
                 else snprintf(vkey, sizeof(vkey), "%s.%s", cdisp, mname);
                 rg_putf(&handlers, "        __c.__SetView(\"%s\");\n", vkey);
                 rg_putf(&handlers, "        if (__c.__Before()) {\n");
-                rg_putf(&handlers, "            __c.%s(%s);\n", mname, ctx_param ? "ctx" : "");
+                rg_putf(&handlers, "            %s__c.%s(%s);\n", aw, mname, ctx_param ? "ctx" : "");
                 rg_putf(&handlers, "            __c.__After();\n");
                 rg_putf(&handlers, "        }\n");
             }
