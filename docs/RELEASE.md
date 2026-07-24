@@ -56,8 +56,13 @@ Notes:
   natively on all three OSes today — `CMakeLists.txt` already has the non-Windows
   link path (`stdc++ m pthread`). Only the **IDE build recipe** (SDL3 GUI runtime
   + linking `ZanIDE.zan`) is currently Windows-only and must be ported.
-- `zanc` cross-compiles user programs to `--target linux-musl`/`linux-x64`
-  (static ELF) from any host via the bundled musl sysroot. This is orthogonal to
+- `zanc` cross-compiles **user programs** (distinct from IDE distribution above)
+  from any host to Linux (`linux-x64`/`linux-musl`/`linux-arm64`/`riscv64`, static
+  musl ELF — full runtime), Windows (`win-x64`/`win-arm64`) and macOS
+  (`macos-x64`/`macos-arm64`), plus `wasm32` (WASI). Linux cross is unrestricted;
+  Windows/macOS/WASI cross paths carry runtime restrictions (no async-socket; no
+  `AtomicInt`/`SharedTable`; macOS cross is console-only). See
+  `docs/platform-targets.md §2` for the authoritative matrix. This is orthogonal to
   which OS the *IDE itself* runs on.
 
 ---

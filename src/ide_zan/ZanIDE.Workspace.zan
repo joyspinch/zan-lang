@@ -986,27 +986,68 @@ partial class ZanIDE {
         return false;
     }
 
-    /// Reads the active project's target platforms from zan.proj into 6 flags
-    /// parallel to PlatformCsv's id list. Non-Windows targets are force-cleared
-    /// because this Windows host cannot produce them without a cross toolchain.
+    /// The publish targets offered on THIS build host, in dialog order.
+    /// Same-OS publishing is native (full support: GUI/threads/async); Linux is
+    /// a self-contained static-musl cross target available from any host. Cross
+    /// to a *different* desktop OS (Win<->mac) is intentionally NOT offered:
+    /// zanc's cross path to Windows/macOS is restricted (no async-socket; macOS
+    /// is console-only), so every listed target is one this host can produce.
+    static List<string> PublishTargetIds() {
+        List<string> ids = new List<string>();
+        #if WINDOWS
+        ids.Add("windows-x64"); ids.Add("windows-arm64");
+        #elif MACOS
+        ids.Add("macos-x64"); ids.Add("macos-arm64");
+        #endif
+        ids.Add("linux-x64"); ids.Add("linux-arm64");
+        return ids;
+    }
+
+    /// The OS-arch id matching the running IDE's own host (its native target),
+    /// e.g. "windows-x64" or "macos-arm64". Built from the compile-time OS and
+    /// arch macros so it needs no runtime probing.
+    static string HostTargetId() {
+        string os = "linux";
+        #if WINDOWS
+        os = "windows";
+        #elif MACOS
+        os = "macos";
+        #endif
+        string arch = "x64";
+        #if ARM64
+        arch = "arm64";
+        #endif
+        return os + "-" + arch;
+    }
+
+    /// Human-readable dialog label for a publish target id.
+    static string PublishTargetLabel(string id) {
+        if (id == "windows-x64") { return "Windows   x64"; }
+        if (id == "windows-arm64") { return "Windows   ARM64"; }
+        if (id == "macos-x64") { return "macOS   x64"; }
+        if (id == "macos-arm64") { return "macOS   ARM64"; }
+        if (id == "linux-x64") { return "Linux   x64  (musl static)"; }
+        if (id == "linux-arm64") { return "Linux   ARM64  (musl static)"; }
+        return id;
+    }
+
+    /// Reads persisted platform selection (parallel to PublishTargetIds) from
+    /// zan.proj, defaulting to the first (host-native) target when none match.
     static List<int> ReadProjectPlatforms(string root) {
+        List<string> ids = ZanIDE.PublishTargetIds();
         List<int> flags = new List<int>();
         int z = 0;
-        while (z < 6) { flags.Add(0); z = z + 1; }
+        while (z < ids.Count) { flags.Add(0); z = z + 1; }
         string content = "";
         string pj = root + "/zan.proj";
         if (File.Exists(pj)) { content = File.ReadAllText(pj); }
-        List<string> ids = new List<string>();
-        ids.Add("windows-x64"); ids.Add("windows-arm64");
-        ids.Add("linux-x64"); ids.Add("linux-arm64");
-        ids.Add("macos-x64"); ids.Add("macos-arm64");
+        bool any = false;
         int k = 0;
         while (k < ids.Count) {
-            if (ZanIDE.Has(content, ids[k])) { flags[k] = 1; }
+            if (ZanIDE.Has(content, ids[k])) { flags[k] = 1; any = true; }
             k = k + 1;
         }
-        flags[2] = 0; flags[3] = 0; flags[4] = 0; flags[5] = 0;
-        if (flags[0] == 0 && flags[1] == 0) { flags[0] = 1; }
+        if (!any && ids.Count > 0) { flags[0] = 1; }
         return flags;
     }
 
@@ -1094,62 +1135,83 @@ partial class ZanIDE {
         #endif
         string seq = "";
         bool pack = ZanIDE.CanPackSingle();
-        if (sel.Count > 0 && sel[0] == 1) {
-            string exe = root + "/publish/" + baseName + "-windows-x64.exe";
-            string ll = bd + "/.zanpub_x64.ll";
-            if (seq != "") { seq = seq + sep; }
-            if (pack) {
-                // Compile into a staging dir (zanc drops any driver DLLs next
-                // to the exe there), add the project resources, then wrap the
-                // whole stage into one self-extracting publish/<name>.exe.
-                string stage = ZanIDE.ResetStage(bd + "/pub_win_x64");
-                string sexe = stage + "/" + baseName + "-windows-x64.exe";
-                ZanIDE.CopyResources(root, stage, log);
-                seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, sexe, true)
-                    + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
-            } else {
-                seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, true) + ")";
+        // Host-aware target set (see PublishTargetIds); sel is parallel to it.
+        // Each id maps to zanc's supported path for this host: native for the
+        // host OS, self-contained musl-static for Linux, --target cross for the
+        // remaining arch.
+        List<string> ids = ZanIDE.PublishTargetIds();
+        string hostId = ZanIDE.HostTargetId();
+        int ti = 0;
+        while (ti < ids.Count) {
+            if (ti < sel.Count && sel[ti] == 1) {
+                string id = ids[ti];
+                if (id == "windows-x64") {
+                    string exe = root + "/publish/" + baseName + "-windows-x64.exe";
+                    string ll = bd + "/.zanpub_x64.ll";
+                    if (seq != "") { seq = seq + sep; }
+                    if (pack) {
+                        // Compile into a staging dir (zanc drops any driver DLLs
+                        // next to the exe there), add the project resources, then
+                        // wrap the whole stage into one self-extracting exe.
+                        string stage = ZanIDE.ResetStage(bd + "/pub_win_x64");
+                        string sexe = stage + "/" + baseName + "-windows-x64.exe";
+                        ZanIDE.CopyResources(root, stage, log);
+                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, sexe, true)
+                            + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
+                    } else {
+                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, ll, exe, true) + ")";
+                    }
+                    exes.Add(exe);
+                    log.Add("> Publishing windows-x64 ...");
+                } else if (id == "windows-arm64") {
+                    string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
+                    if (seq != "") { seq = seq + sep; }
+                    // Cross-compile ARM64 through zanc's bundled toolchain
+                    // (win-arm64 target) -- no external clang needed.
+                    if (pack) {
+                        string stage = ZanIDE.ResetStage(bd + "/pub_win_arm64");
+                        string sexe = stage + "/" + baseName + "-windows-arm64.exe";
+                        ZanIDE.CopyResources(root, stage, log);
+                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64")
+                            + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
+                    } else {
+                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64") + ")";
+                    }
+                    exes.Add(exe);
+                    log.Add("> Publishing windows-arm64 ...");
+                } else if (id == "macos-x64" || id == "macos-arm64") {
+                    // macOS: the host's own arch builds natively (full GUI/
+                    // threads/async); the other arch uses zanc's restricted macOS
+                    // cross path (console-only, links -lSystem via the bundled
+                    // libSystem stub). Both emit a bare Mach-O (no single-file pack).
+                    string exe = root + "/publish/" + baseName + "-" + id;
+                    if (seq != "") { seq = seq + sep; }
+                    if (id == hostId) {
+                        seq = seq + "(" + ZanIDE.CompileToExe(root, p, inputs, "", exe, true) + ")";
+                    } else {
+                        seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, id) + ")";
+                    }
+                    exes.Add(exe);
+                    log.Add("> Publishing " + id + " ...");
+                } else if (id == "linux-x64") {
+                    // Self-contained musl static single file (cross from any host).
+                    string exe = root + "/publish/" + baseName + "-linux-x64";
+                    if (seq != "") { seq = seq + sep; }
+                    seq = seq + "(" + zc + " --publish " + inputs
+                        + " --target linux-musl --link-mode static -o \"" + exe + "\")";
+                    exes.Add(exe);
+                    log.Add("> Publishing linux-x64 ...");
+                } else if (id == "linux-arm64") {
+                    // Same musl static path as linux-x64; only triple/sysroot differ.
+                    string exe = root + "/publish/" + baseName + "-linux-arm64";
+                    if (seq != "") { seq = seq + sep; }
+                    seq = seq + "(" + zc + " --publish " + inputs
+                        + " --target linux-arm64 --link-mode static -o \"" + exe + "\")";
+                    exes.Add(exe);
+                    log.Add("> Publishing linux-arm64 ...");
+                }
             }
-            exes.Add(exe);
-            log.Add("> Publishing windows-x64 ...");
-        }
-        if (sel.Count > 1 && sel[1] == 1) {
-            string exe = root + "/publish/" + baseName + "-windows-arm64.exe";
-            if (seq != "") { seq = seq + sep; }
-            // Cross-compile ARM64 through zanc's bundled toolchain (win-arm64
-            // target) exactly like the x64 path -- no external clang needed.
-            if (pack) {
-                string stage = ZanIDE.ResetStage(bd + "/pub_win_arm64");
-                string sexe = stage + "/" + baseName + "-windows-arm64.exe";
-                ZanIDE.CopyResources(root, stage, log);
-                seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, sexe, "win-arm64")
-                    + " && " + ZanIDE.PackCmd(root, stage, exe) + ")";
-            } else {
-                seq = seq + "(" + ZanIDE.CompileToExeCross(root, p, inputs, exe, "win-arm64") + ")";
-            }
-            exes.Add(exe);
-            log.Add("> Publishing windows-arm64 ...");
-        }
-        // Non-Windows targets: cross-compiled through zanc's own bundled linker
-        // (--target selects the triple; no external toolchain needed). Linux x64
-        // uses the musl static target so the result is a single portable file.
-        if (sel.Count > 2 && sel[2] == 1) {
-            string exe = root + "/publish/" + baseName + "-linux-x64";
-            if (seq != "") { seq = seq + sep; }
-            seq = seq + "(" + zc + " --publish " + inputs
-                + " --target linux-musl --link-mode static -o \"" + exe + "\")";
-            exes.Add(exe);
-            log.Add("> Publishing linux-x64 ...");
-        }
-        // Linux ARM64: same self-contained musl static path as linux-x64, only
-        // the target triple (and thus the bundled sysroot) differs.
-        if (sel.Count > 3 && sel[3] == 1) {
-            string exe = root + "/publish/" + baseName + "-linux-arm64";
-            if (seq != "") { seq = seq + sep; }
-            seq = seq + "(" + zc + " --publish " + inputs
-                + " --target linux-arm64 --link-mode static -o \"" + exe + "\")";
-            exes.Add(exe);
-            log.Add("> Publishing linux-arm64 ...");
+            ti = ti + 1;
         }
         if (seq == "") {
             log.Add("> No target selected; nothing published.");
