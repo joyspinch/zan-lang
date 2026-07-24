@@ -481,6 +481,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 fields[ASYNC_FRAME_RESULT] = i64;
                 fields[ASYNC_FRAME_CLEANUP] = g->co_step_ptr;
                 fields[ASYNC_FRAME_HCOUNT] = i32;
+                fields[ASYNC_FRAME_SELF_STEP] = g->co_step_ptr;
                 for (int k = 0; k < total_params; k++) {
                     fields[ASYNC_FRAME_FIRST_PARAM + k] = param_types[k];
                 }
@@ -644,6 +645,11 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_RESULT, "rs"));
             LLVMBuildStore(g->builder, cleanup_fn,
                 LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_CLEANUP, "cl"));
+            /* Record this frame's own resume fn so an awaiter can drive it
+             * without resolving `<ramp>$resume` by name -- the only way to await
+             * an indirect (delegate/function-pointer) async call. */
+            LLVMBuildStore(g->builder, resume_fn,
+                LLVMBuildStructGEP2(g->builder, frame_type, rframe, ASYNC_FRAME_SELF_STEP, "selfstep"));
             for (int k = 0; k < total_params; k++) {
                 LLVMValueRef pv = LLVMGetParam(ramp_fn, (unsigned)k);
                 LLVMValueRef slot = LLVMBuildStructGEP2(g->builder, frame_type, rframe,

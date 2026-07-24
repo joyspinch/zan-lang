@@ -69,6 +69,8 @@ struct zan_type {
     zan_type_t *delegate_ret_type;
     zan_type_t **delegate_param_types;
     int delegate_param_count;
+    int delegate_is_async;           /* declared `async delegate`: invocation
+                                      * yields a task handle (i8*) and is awaited */
 };
 
 /* ---- symbol table entry ---- */

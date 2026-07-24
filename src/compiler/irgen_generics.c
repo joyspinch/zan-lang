@@ -343,9 +343,12 @@ static LLVMValueRef emit_delegate_call(zan_irgen_t *g,
         param_types[k] = map_type(
             g, delegate_type->delegate_param_types[k]);
     }
-    LLVMTypeRef ret = delegate_type->delegate_ret_type
-        ? map_type(g, delegate_type->delegate_ret_type)
-        : LLVMVoidTypeInContext(g->ctx);
+    /* async delegate: invocation returns an i8* task handle (see map_type). */
+    LLVMTypeRef ret = delegate_type->delegate_is_async
+        ? LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)
+        : (delegate_type->delegate_ret_type
+            ? map_type(g, delegate_type->delegate_ret_type)
+            : LLVMVoidTypeInContext(g->ctx));
     LLVMTypeRef fn_type = LLVMFunctionType(
         ret, param_types, (unsigned)pc, 0);
     int argc = call->call.args.count;

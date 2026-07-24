@@ -2757,16 +2757,34 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
         LLVMValueRef sub_resume = NULL;
         if (LLVMIsACallInst(sub)) {
+            /* Direct async call: the callee is a known function (the ramp), so
+             * its resume is the sibling symbol `<ramp>$resume`. An *indirect*
+             * async call (a delegate / function pointer, e.g. `await handler(req)`)
+             * has a non-function callee (a loaded value) -- do not mistake its
+             * SSA temp name for a function name. */
             LLVMValueRef callee = LLVMGetCalledValue(sub);
-            if (callee) {
+            LLVMValueRef callee_fn = callee ? LLVMIsAFunction(callee) : NULL;
+            if (callee_fn) {
                 size_t nl = 0;
-                const char *cn = LLVMGetValueName2(callee, &nl);
+                const char *cn = LLVMGetValueName2(callee_fn, &nl);
                 if (cn && nl > 0 && nl < 240) {
                     char rn[256];
                     memcpy(rn, cn, nl);
                     memcpy(rn + nl, "$resume", 8); /* includes NUL */
                     sub_resume = LLVMGetNamedFunction(g->mod, rn);
                 }
+            }
+            /* Indirect async call: the `<ramp>$resume` symbol cannot be recovered
+             * from the call. Every async ramp stores its own resume fn in the
+             * frame header (ASYNC_FRAME_SELF_STEP), so read it from the returned
+             * task handle instead -- awaiting an async delegate then behaves
+             * exactly like a direct async call. */
+            if (!callee_fn && !sub_resume &&
+                LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
+                LLVMValueRef sub_hdr = LLVMBuildBitCast(g->builder, sub, i8ptr, "sub.hdr");
+                LLVMValueRef ssp = LLVMBuildStructGEP2(g->builder, hdr, sub_hdr,
+                    ASYNC_FRAME_SELF_STEP, "sub.selfstep.p");
+                sub_resume = LLVMBuildLoad2(g->builder, g->co_step_ptr, ssp, "sub.selfstep");
             }
         }
 

@@ -444,6 +444,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
         zan_type_t *type = sym->type;
 
         register_type_param_list(b, &node->method_decl.type_params);
+        type->delegate_is_async = (node->method_decl.modifiers & MOD_ASYNC) != 0;
         type->delegate_ret_type = node->method_decl.return_type
             ? zan_binder_resolve_type(b, node->method_decl.return_type)
             : b->type_void;

@@ -42,7 +42,12 @@ enum {
     ASYNC_FRAME_RESULT = 4,       /* i64: return value (scalars are i64 here) */
     ASYNC_FRAME_CLEANUP = 5,      /* void(i8*)*: releases owned slots + frees the frame */
     ASYNC_FRAME_HCOUNT = 6,       /* i32: try handlers currently armed by this frame */
-    ASYNC_FRAME_FIRST_PARAM = 7
+    ASYNC_FRAME_SELF_STEP = 7,    /* void(i8*)*: this frame's own resume/step fn.
+                                   * The ramp stores its $resume here so an awaiter
+                                   * can drive the sub-task without knowing its name
+                                   * -- required for awaiting an indirect (delegate)
+                                   * async call, whose callee has no static name. */
+    ASYNC_FRAME_FIRST_PARAM = 8
 };
 static LLVMValueRef coerce_to_i64(zan_irgen_t *g, LLVMValueRef v);
 static void emit_async_save_slots(zan_irgen_t *g);

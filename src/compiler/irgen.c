@@ -972,10 +972,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef co_hdr_fields[] = {
         LLVMInt32TypeInContext(g->ctx), LLVMInt32TypeInContext(g->ctx),
         i8ptr, g->co_step_ptr, i64,
-        g->co_step_ptr, LLVMInt32TypeInContext(g->ctx)
+        g->co_step_ptr, LLVMInt32TypeInContext(g->ctx),
+        g->co_step_ptr /* SELF_STEP: frame's own resume fn */
     };
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
-    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 7, 0);
+    LLVMStructSetBody(g->co_header_type, co_hdr_fields, 8, 0);
     g->current_async_frame = NULL;
     g->current_async_frame_type = NULL;
     g->current_async_resume_fn = NULL;
@@ -1397,9 +1398,14 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
         for (int i = 0; i < pc; i++) {
             param_types[i] = map_type(g, type->delegate_param_types[i]);
         }
-        LLVMTypeRef ret = type->delegate_ret_type
-            ? map_type(g, type->delegate_ret_type)
-            : LLVMVoidTypeInContext(g->ctx);
+        /* An `async delegate` lowers like an async method's ramp: invoking it
+         * returns an i8* task handle (the coroutine frame), which `await` then
+         * drives -- not the declared return type directly. */
+        LLVMTypeRef ret = type->delegate_is_async
+            ? LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)
+            : (type->delegate_ret_type
+                ? map_type(g, type->delegate_ret_type)
+                : LLVMVoidTypeInContext(g->ctx));
         LLVMTypeRef fn_type = LLVMFunctionType(ret, param_types, (unsigned)pc, 0);
         free(param_types);
         return LLVMPointerType(fn_type, 0);
