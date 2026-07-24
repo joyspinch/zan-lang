@@ -136,8 +136,11 @@ class Collection {
     }
 
     // Binary record value tags: 0 null, 1 false, 2 true, 3 non-negative int
-    // (varint), 8 negative int (varint of the magnitude), 4 number-as-text
-    // (non-integer), 5 string, 6 array, 7 object.
+    // (varint), 8 negative int (varint of the magnitude), 9 integer zero (no
+    // payload), 4 number-as-text (non-integer), 5 string, 10 empty string (no
+    // payload), 6 array, 7 object. Tags 9/10 give SQLite-style "value in the
+    // type" for the two overwhelmingly common cells (0 and "") -- they also
+    // keep 0x00 out of the record so the NUL escaping below almost never fires.
     static bool IsIntStr(string s) {
         int n = s.Length;
         if (n == 0) { return false; }
@@ -182,7 +185,8 @@ class Collection {
             string raw = v.AsString("");
             if (Collection.IsIntStr(raw)) {
                 int iv = Collection.ParseI64(raw);
-                if (iv < 0) { b.WriteU8(8); b.WriteVarInt(0 - iv); }
+                if (iv == 0) { b.WriteU8(9); }
+                else if (iv < 0) { b.WriteU8(8); b.WriteVarInt(0 - iv); }
                 else { b.WriteU8(3); b.WriteVarInt(iv); }
             } else {
                 b.WriteU8(4);
@@ -191,8 +195,9 @@ class Collection {
             return;
         }
         if (v.IsString()) {
-            b.WriteU8(5);
-            b.WriteString(v.AsString(""));
+            string sv = v.AsString("");
+            if (sv.Length == 0) { b.WriteU8(10); }
+            else { b.WriteU8(5); b.WriteString(sv); }
             return;
         }
         if (v.IsArray()) {
@@ -264,8 +269,10 @@ class Collection {
         if (tag == 2) { return JsonValue.NewBool(true); }
         if (tag == 3) { return JsonValue.NewNum(Convert.ToString(b.ReadVarInt())); }
         if (tag == 8) { return JsonValue.NewNum(Convert.ToString(0 - b.ReadVarInt())); }
+        if (tag == 9) { return JsonValue.NewNum("0"); }
         if (tag == 4) { return JsonValue.NewNum(b.ReadString()); }
         if (tag == 5) { return JsonValue.NewStr(b.ReadString()); }
+        if (tag == 10) { return JsonValue.NewStr(""); }
         if (tag == 6) {
             JsonValue a = JsonValue.NewArray();
             int c = b.ReadVarInt();
