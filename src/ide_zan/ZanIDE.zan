@@ -1216,6 +1216,15 @@ partial class ZanIDE {
         // into the Output tab so output shows in both places.
         int runLogLen = 0;
         bool runStreaming = false;
+        // Detached (non-blocking) build behind the Run/Build ribbon actions:
+        // the compile runs in a separate shell so the UI never freezes; the
+        // main loop polls a done-marker, then applies diagnostics and launches.
+        bool buildBusy = false;
+        int buildLogLen = 0;
+        string buildExe = "";
+        bool buildIsGui = false;
+        bool buildThenRun = false;
+        string buildTargetPath = "";
         // Hot reload: when ON, saving rebuilds and restarts the running app.
         bool autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
         SignalInt treeSel = SignalInt.Create(-1);
@@ -1711,25 +1720,40 @@ partial class ZanIDE {
                     }
                     Layer.Msg(ZanIDE.T("Saved", "已保存"), 3);
                     rescan = true;
-                } else if (rc == 4) {
-                    Layer.Msg(ZanIDE.T("Building & running…", "正在构建并运行…"), 2);
+                } else if (rc == 4 || rc == 5) {
+                    // Run (4) and Build (5) compile the active target in a
+                    // DETACHED shell so a slow compile never freezes the IDE;
+                    // completion is handled by the buildBusy poll below.
                     ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                    string runExe = ZanIDE.RunBuildActive(tabPaths, activeTab, root, log, editor);
-                    if (runExe != "") {
-                        // Console programs run in their own console window (real
-                        // stdin, so Console.ReadLine works) with output teed into
-                        // the Output tab so it is visible in both places.
-                        bottomTab.Set(0);
-                        log.Add("> " + runExe);
-                        ZanIDE.RunConsole(runExe);
-                        runLogLen = 0;
-                        runStreaming = true;
-                        app.RequestRedraw();
+                    if (buildBusy) {
+                        Layer.Msg(ZanIDE.T("Build already running…", "构建进行中…"), 2);
+                    } else {
+                        int atB = activeTab.Get();
+                        string apB = "";
+                        if (atB >= 0 && atB < tabPaths.Count) { apB = tabPaths[atB]; }
+                        string rpB = ZanIDE.RibbonRunTarget(apB, root);
+                        if (rpB == "") {
+                            log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
+                        } else {
+                            string bdB = ZanIDE.EnsureBuildDir(root);
+                            string exeB = bdB + "/.zanrun" + ZanIDE.ExeSuffix();
+                            if (File.Exists(exeB)) { File.Delete(exeB); }
+                            string inB = ZanIDE.SmartInputs(root, ZanIDE.DirOf(rpB), rpB);
+                            string cmdB = ZanIDE.CompileToExe(root, rpB, inB, bdB + "/.zanrun.ll", exeB, false);
+                            ZanIDE.BuildDetach(cmdB);
+                            buildBusy = true;
+                            buildThenRun = (rc == 4);
+                            buildExe = exeB;
+                            buildIsGui = ZanIDE.IsGuiTarget(root, rpB);
+                            buildTargetPath = apB;
+                            buildLogLen = 0;
+                            bottomTab.Set(0);
+                            log.Add("> Building " + rpB + " ...");
+                            if (rc == 4) { Layer.Msg(ZanIDE.T("Building & running…", "正在构建并运行…"), 2); }
+                            else { Layer.Msg(ZanIDE.T("Building…", "正在构建…"), 2); }
+                            app.RequestAnimationFrame(80);
+                        }
                     }
-                } else if (rc == 5) {
-                    Layer.Msg(ZanIDE.T("Building…", "正在构建…"), 2);
-                    ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                    ZanIDE.BuildActive(tabPaths, activeTab, root, log, editor);
                 } else if (rc == 6) {
                     ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     pubSel = ZanIDE.ReadProjectPlatforms(root);
@@ -3482,6 +3506,49 @@ partial class ZanIDE {
                         app.RequestRedraw();
                     }
                     app.RequestAnimationFrame(250);
+                }
+                // Poll the in-flight detached build (Run/Build ribbon): stream
+                // compiler output and, when the done-marker appears, apply
+                // diagnostics and (for Run) launch the program -- no UI freeze.
+                if (buildBusy) {
+                    int bConsumed = ZanIDE.BuildPoll(buildLogLen, log);
+                    if (bConsumed != buildLogLen) {
+                        buildLogLen = bConsumed;
+                        coScroll = 0;
+                        app.RequestRedraw();
+                    }
+                    if (File.Exists(ZanIDE.BuildDonePath())) {
+                        File.Delete(ZanIDE.BuildDonePath());
+                        buildLogLen = ZanIDE.BuildPoll(buildLogLen, log);
+                        buildBusy = false;
+                        List<string> bout = CodeEditor.SplitLines(File.ReadAllText(ZanIDE.BuildLogPath()));
+                        ZanIDE.ApplyDiagnostics(editor, buildTargetPath, bout, log);
+                        if (!File.Exists(buildExe)) {
+                            log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
+                        } else if (buildThenRun) {
+                            if (buildIsGui) {
+                                #if WINDOWS
+                                Process.Run("cmd /c start \"\" \"" + buildExe + "\"");
+                                #else
+                                Process.Run("\"" + buildExe + "\" >/dev/null 2>&1 &");
+                                #endif
+                                log.Add(ZanIDE.T("> GUI app started.", "> GUI 应用已启动。"));
+                            } else {
+                                // Console programs run in their own console window
+                                // (real stdin, so Console.ReadLine works) with
+                                // output teed into the Output tab.
+                                log.Add("> " + buildExe);
+                                ZanIDE.RunConsole(buildExe);
+                                runLogLen = 0;
+                                runStreaming = true;
+                            }
+                        } else {
+                            log.Add(ZanIDE.T("> Build succeeded.", "> 构建成功。"));
+                        }
+                        coScroll = 0;
+                        app.RequestRedraw();
+                    }
+                    app.RequestAnimationFrame(80);
                 }
                 // Poll the in-flight detached publish: compiler output streams
                 // into the Output tab and a done-marker file signals completion,
