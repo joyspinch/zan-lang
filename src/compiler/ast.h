@@ -111,6 +111,16 @@ struct zan_ast_node {
     zan_ast_kind_t kind;
     zan_loc_t loc;
 
+    /* [Attr(...)] usages attached to a declaration; empty list if none. */
+    zan_ast_list_t attributes;
+
+    /* Namespace context, stamped per top-level declaration before binding
+     * so namespace-aware resolution can tell apart same-named types in
+     * different namespaces (see nsresolve.c).  Empty/NULL for global. */
+    zan_istr_t ns_name;         /* enclosing namespace, dotted ("A.B") */
+    zan_istr_t orig_name;       /* pre-mangling simple name, if renamed */
+    zan_ast_list_t *ns_usings;  /* the file's `using` decls; NULL if none */
+
     union {
         /* literals */
         int64_t int_val;

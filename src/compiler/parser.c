@@ -149,6 +149,28 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     } else if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
         name = p->previous.str_val;
+        /* qualified type name: A.B.C  (dotted). Build the dotted spelling;
+         * the namespace resolver (nsresolve.c) maps it to the real type.
+         * Only enter when '.' is directly followed by an identifier, so
+         * member access on values elsewhere is unaffected. */
+        if (parser_check(p, TK_DOT) &&
+            zan_lexer_peek(p->lex).kind == TK_IDENT) {
+            char qbuf[512];
+            size_t qn = 0;
+            for (uint32_t qi = 0; qi < name.len && qn < sizeof qbuf; qi++)
+                qbuf[qn++] = name.str[qi];
+            while (parser_check(p, TK_DOT) &&
+                   zan_lexer_peek(p->lex).kind == TK_IDENT) {
+                parser_advance(p); /* '.' */
+                parser_advance(p); /* IDENT */
+                if (qn < sizeof qbuf - 1) qbuf[qn++] = '.';
+                for (uint32_t qi = 0; qi < p->previous.str_val.len &&
+                     qn < sizeof qbuf; qi++)
+                    qbuf[qn++] = p->previous.str_val.str[qi];
+            }
+            name.str = zan_arena_strdup(p->arena, qbuf, qn);
+            name.len = (uint32_t)qn;
+        }
     } else {
         zan_diag_emit(p->diag, DIAG_ERROR, loc, "expected type");
         return parser_error_node(p);
@@ -1037,6 +1059,46 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         if (peek.kind == TK_IDENT || peek.kind == TK_LESS) {
             return true;
         }
+        /* qualified type decl: `A.B.C name` / `A.B<T> name` / `A.B[] name`.
+         * Scan the raw source across the dotted chain, then check what
+         * follows so `a.b.c()` / `a.b = x` stay expressions. */
+        if (peek.kind == TK_DOT) {
+            const char *s = p->lex->source;
+            size_t q = p->lex->pos, n = p->lex->source_len;
+            #define ZAN_WS(ch) ((ch)==' '||(ch)=='\t'||(ch)=='\r'||(ch)=='\n')
+            #define ZAN_IDSTART(ch) (((ch)>='a'&&(ch)<='z')||((ch)>='A'&&(ch)<='Z')||(ch)=='_')
+            #define ZAN_IDCONT(ch) (ZAN_IDSTART(ch)||((ch)>='0'&&(ch)<='9'))
+            for (;;) {
+                while (q < n && ZAN_WS(s[q])) q++;
+                if (q >= n || s[q] != '.') break;
+                q++;
+                while (q < n && ZAN_WS(s[q])) q++;
+                if (q >= n || !ZAN_IDSTART(s[q])) return false;
+                while (q < n && ZAN_IDCONT(s[q])) q++;
+            }
+            while (q < n && ZAN_WS(s[q])) q++;
+            if (q < n && s[q] == '<') return true;
+            if (q < n && s[q] == '[') {
+                size_t r = q + 1;
+                while (r < n && ZAN_WS(s[r])) r++;
+                if (r < n && s[r] == ']') return true;
+                return false;
+            }
+            if (q < n && ZAN_IDSTART(s[q])) {
+                char w[8]; size_t wl = 0; size_t r = q;
+                while (r < n && ZAN_IDCONT(s[r]) && wl < sizeof w - 1) w[wl++] = s[r++];
+                w[wl] = 0;
+                if ((wl==2 && (w[0]=='i'&&w[1]=='s')) ||
+                    (wl==2 && (w[0]=='a'&&w[1]=='s')) ||
+                    (wl==2 && (w[0]=='i'&&w[1]=='n')))
+                    return false;
+                return true;
+            }
+            #undef ZAN_WS
+            #undef ZAN_IDSTART
+            #undef ZAN_IDCONT
+            return false;
+        }
         /* `Ident[] name` (array-typed decl) vs `arr[i]` (index expression):
          * only a declaration when the brackets are empty. Scan the raw source
          * after the current identifier for a `[` immediately followed by `]`. */
@@ -1736,51 +1798,91 @@ static void desugar_yield_method(zan_parser_t *p, zan_ast_node_t *m) {
     zan_ast_list_push(&body->block.stmts, ret, p->arena);
 }
 
-static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
-    /* parse [DllImport("lib")] attribute if present */
-    zan_istr_t dll_import_lib = {NULL, 0};
-    zan_istr_t dll_entry_point = {NULL, 0};
+static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
+                              zan_istr_t *out_lib, zan_istr_t *out_entry) {
+    /* Parse zero or more `[A, B(...)]` attribute groups; append each as an
+     * AST_ATTRIBUTE (name = last dotted segment; args = positional expressions
+     * and AST_ASSIGNMENT nodes for `Name = value`). Retained on the following
+     * declaration for the compile-time attribute evaluator / routegen.
+     * `[DllImport(...)]` is also decoded into *out_lib / *out_entry. */
     while (parser_check(p, TK_LBRACKET)) {
-        parser_advance(p); /* consume [ */
-        if (parser_check(p, TK_IDENT) &&
-            p->current.str_val.len == 9 &&
-            memcmp(p->current.str_val.str, "DllImport", 9) == 0) {
-            parser_advance(p); /* consume DllImport */
-            if (parser_match(p, TK_LPAREN)) {
-                if (parser_check(p, TK_STRING_LIT)) {
-                    dll_import_lib = p->current.str_val;
+        parser_advance(p); /* [ */
+        for (;;) {
+            zan_loc_t aloc = p->current.loc;
+            zan_istr_t aname = {NULL, 0};
+            if (parser_check(p, TK_IDENT)) {
+                aname = p->current.str_val;
+                parser_advance(p);
+                while (parser_check(p, TK_DOT)) {
                     parser_advance(p);
+                    if (parser_check(p, TK_IDENT)) { aname = p->current.str_val; parser_advance(p); }
+                    else break;
                 }
-                /* optional: EntryPoint = "name" */
-                if (parser_match(p, TK_COMMA)) {
-                    /* skip EntryPoint = "name" for now, just consume to ) */
-                    while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
-                        if (parser_check(p, TK_IDENT) &&
-                            p->current.str_val.len == 10 &&
-                            memcmp(p->current.str_val.str, "EntryPoint", 10) == 0) {
-                            parser_advance(p); /* EntryPoint */
-                            parser_expect(p, TK_EQ); /* = */
-                            if (parser_check(p, TK_STRING_LIT)) {
-                                dll_entry_point = p->current.str_val;
-                                parser_advance(p);
-                            }
-                        } else {
-                            parser_advance(p);
+            }
+            zan_ast_node_t *attr = zan_ast_new(p->arena, AST_ATTRIBUTE, aloc);
+            zan_ast_node_t *nameNode = zan_ast_new(p->arena, AST_IDENTIFIER, aloc);
+            nameNode->ident.name = aname;
+            attr->attribute.name = nameNode;
+            zan_ast_list_init(&attr->attribute.args);
+            bool is_dll = (aname.str && aname.len == 9 &&
+                           memcmp(aname.str, "DllImport", 9) == 0);
+            if (parser_match(p, TK_LPAREN)) {
+                while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
+                    if (parser_check(p, TK_IDENT) && zan_lexer_peek(p->lex).kind == TK_EQ) {
+                        zan_loc_t nloc = p->current.loc;
+                        zan_istr_t argname = p->current.str_val;
+                        parser_advance(p); /* ident */
+                        parser_advance(p); /* = */
+                        zan_ast_node_t *val = parse_expression(p);
+                        zan_ast_node_t *asn = zan_ast_new(p->arena, AST_ASSIGNMENT, nloc);
+                        zan_ast_node_t *lhs = zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
+                        lhs->ident.name = argname;
+                        asn->binary.op = TK_EQ;
+                        asn->binary.left = lhs;
+                        asn->binary.right = val;
+                        zan_ast_list_push(&attr->attribute.args, asn, p->arena);
+                        if (is_dll && out_entry && argname.str && argname.len == 10 &&
+                            memcmp(argname.str, "EntryPoint", 10) == 0 &&
+                            val->kind == AST_STRING_LITERAL) {
+                            *out_entry = val->str_val;
                         }
-                        if (!parser_match(p, TK_COMMA)) break;
+                    } else {
+                        zan_ast_node_t *val = parse_expression(p);
+                        zan_ast_list_push(&attr->attribute.args, val, p->arena);
+                        if (is_dll && out_lib && !out_lib->str &&
+                            val->kind == AST_STRING_LITERAL) {
+                            *out_lib = val->str_val;
+                        }
                     }
+                    if (!parser_match(p, TK_COMMA)) break;
                 }
                 parser_expect(p, TK_RPAREN);
             }
-        } else {
-            /* skip unknown attributes */
-            while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
-                parser_advance(p);
-            }
+            if (out) zan_ast_list_push(out, attr, p->arena);
+            if (!parser_match(p, TK_COMMA)) break;
         }
         parser_expect(p, TK_RBRACKET);
     }
+}
 
+static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
+                                               zan_istr_t dll_import_lib,
+                                               zan_istr_t dll_entry_point);
+
+static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
+    zan_ast_list_t attrs;
+    zan_ast_list_init(&attrs);
+    zan_istr_t dll_import_lib = {NULL, 0};
+    zan_istr_t dll_entry_point = {NULL, 0};
+    parse_attr_usages(p, &attrs, &dll_import_lib, &dll_entry_point);
+    zan_ast_node_t *n = parse_member_decl_inner(p, dll_import_lib, dll_entry_point);
+    if (n) n->attributes = attrs;
+    return n;
+}
+
+static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
+                                               zan_istr_t dll_import_lib,
+                                               zan_istr_t dll_entry_point) {
     uint32_t mods = parse_modifiers(p);
     if (dll_import_lib.str) mods |= MOD_EXTERN;
     /* `event` is contextual: only a modifier when introducing an event field
@@ -2205,19 +2307,15 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
 
     /* type declarations */
     while (!parser_check(p, TK_EOF) && !parser_check(p, TK_RBRACE)) {
-        /* parse attributes: [StructLayout(...)] */
+        /* parse attributes: retained on the type; [StructLayout] also toggles C layout */
         bool has_c_layout = false;
-        while (parser_check(p, TK_LBRACKET)) {
-            parser_advance(p);
-            if (parser_check(p, TK_IDENT) &&
-                p->current.str_val.len == 12 &&
-                memcmp(p->current.str_val.str, "StructLayout", 12) == 0) {
+        zan_ast_list_t type_attrs;
+        zan_ast_list_init(&type_attrs);
+        parse_attr_usages(p, &type_attrs, NULL, NULL);
+        for (int _ai = 0; _ai < type_attrs.count; _ai++) {
+            zan_istr_t _n = type_attrs.items[_ai]->attribute.name->ident.name;
+            if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0)
                 has_c_layout = true;
-            }
-            while (!parser_check(p, TK_RBRACKET) && !parser_check(p, TK_EOF)) {
-                parser_advance(p);
-            }
-            parser_expect(p, TK_RBRACKET);
         }
 
         uint32_t mods = parse_modifiers(p);
@@ -2249,6 +2347,7 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
             parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
             zan_ast_node_t *decl = parse_type_decl(p, mods);
             decl->type_decl.is_c_layout = has_c_layout;
+            decl->attributes = type_attrs;
             zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
         } else if (parser_check(p, TK_DELEGATE)) {
             /* delegate ReturnType Name(params); */

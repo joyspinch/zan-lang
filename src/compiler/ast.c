@@ -9,6 +9,10 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     zan_ast_node_t *node = (zan_ast_node_t *)zan_arena_alloc(arena, sizeof(zan_ast_node_t));
     node->kind = kind;
     node->loc = loc;
+    zan_ast_list_init(&node->attributes);
+    node->ns_name.str = NULL; node->ns_name.len = 0;
+    node->orig_name.str = NULL; node->orig_name.len = 0;
+    node->ns_usings = NULL;
     return node;
 }
 

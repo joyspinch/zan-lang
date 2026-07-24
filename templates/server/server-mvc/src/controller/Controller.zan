@@ -3,19 +3,90 @@ using System;
 namespace ZanWeb;
 
 /// <summary>
-/// Base helpers shared by all controllers: uniform JSON envelopes so individual
-/// actions stay thin. Actions are static methods with the HttpHandler signature
-/// (void action(HttpContext)), grouped per resource in the sibling files.
+/// Rich per-request controller base. The attribute-driven router creates ONE
+/// instance per request, binds the <see cref="HttpContext"/>, runs the
+/// controller-level hook, invokes the matched action, then runs the after hook.
+/// Actions are instance methods that read/write through <c>this</c>:
+///
+///   [HttpPost]
+///   [Description("登录")]
+///   void Login() {
+///       string user = this.In("user");
+///       ...
+///       this.Ok("{\"token\":\"" + token + "\"}");
+///   }
+///
+/// Cross-cutting auth (login / permission / rank) is declared with attributes
+/// ([Custom(Authorization = ...)]) and enforced centrally by the dispatcher
+/// before the action runs. Override <see cref="OnBefore"/> / <see cref="OnAfter"/>
+/// for controller-scoped setup / teardown (the equivalent of the reference
+/// project's per-controller hooks).
 /// </summary>
 class Controller {
-    /// <summary>{"code":"0000","msg":"ok","data": &lt;data&gt;} -- data must
-    /// already be a JSON value.</summary>
-    static void Ok(HttpContext ctx, string data) {
-        ctx.Api("0000", "ok", data);
+    HttpContext ctx;     // the live request/response context for this instance
+    string uid;          // resolved principal id ("" when anonymous)
+    string __viewKey;    // "<Controller>.<Action>" -- injected by the router each request
+
+    /// <summary>Bind the request context (called by the generated trampoline).</summary>
+    void __Bind(HttpContext c) {
+        this.ctx = c;
+        this.uid = c.state.Get("uid");
     }
 
-    static void Fail(HttpContext ctx, int status, string code, string msg) {
-        ctx.Status(status, msg);
-        ctx.Api(code, msg, "null");
+    /// <summary>Runs before the action; return false to short-circuit.
+    /// Delegates to the overridable <see cref="OnBefore"/>.</summary>
+    bool __Before() { return this.OnBefore(); }
+
+    /// <summary>Runs after the action (only when __Before returned true).</summary>
+    void __After() { this.OnAfter(); }
+
+    /// <summary>Controller-level hook; override to guard/prepare every action
+    /// in this controller. Return false to stop the request.</summary>
+    virtual bool OnBefore() { return true; }
+
+    /// <summary>Controller-level teardown hook; override as needed.</summary>
+    virtual void OnAfter() { }
+
+    // ---- request context accessors ----
+    HttpContext Ctx() { return this.ctx; }
+    bool IsLogin() { return this.uid.Length > 0; }
+
+    // ---- input (all values go through the central Filter) ----
+    string In(string name) { return this.ctx.In(name); }
+    string InText(string name) { return this.ctx.InText(name); }
+    int InInt(string name, int def) { return this.ctx.InInt(name, def); }
+    bool HasIn(string name) { return this.ctx.HasIn(name); }
+    string Param(string name) { return this.ctx.Param(name); }
+    string Body() { return this.ctx.Body(); }
+
+    // ---- uniform responses ----
+    /// <summary>{"code":"0000","msg":"ok","data": &lt;data&gt;} -- data must
+    /// already be a JSON value.</summary>
+    void Ok(string data) { this.ctx.Api("0000", "ok", data); }
+
+    void Fail(int status, string code, string msg) {
+        this.ctx.Status(status, msg);
+        this.ctx.Api(code, msg, "null");
+    }
+
+    void Json(string json) { this.ctx.Json(json); }
+    void Text(string text) { this.ctx.Text(text); }
+    void Html(string html) { this.ctx.Html(html); }
+
+    // ---- views: the template follows the controller ----
+    // The router injects this action's view id ("<Controller>.<Action>") via
+    // __SetView before the action runs, so View(data) renders the .html that
+    // sits next to this controller (<Module>/View/<Controller>.<Action>.html)
+    // with zero wiring -- no per-action template name to pass.
+    void __SetView(string key) { this.__viewKey = key; }
+
+    /// <summary>Render this action's co-located template.</summary>
+    void View(ViewData data) {
+        this.ctx.Html(App.Web().RenderPage(this.__viewKey, data));
+    }
+
+    /// <summary>Render an explicitly named template instead of the convention one.</summary>
+    void ViewOf(string name, ViewData data) {
+        this.ctx.Html(App.Web().RenderPage(name, data));
     }
 }

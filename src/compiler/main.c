@@ -10,6 +10,8 @@
 #include "parser.h"
 #include "jsongen.h"
 #include "dbgen.h"
+#include "routegen.h"
+#include "nsresolve.h"
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
@@ -1221,6 +1223,7 @@ int main(int argc, char **argv) {
         zan_parser_init(&parser, &lex, arena, diag);
 
         zan_ast_node_t *unit = zan_parser_parse(&parser);
+        zan_nsresolve_stamp(unit, arena);
 
         if (!ast) {
             ast = unit;
@@ -1238,8 +1241,10 @@ int main(int argc, char **argv) {
     if (!zan_diag_has_errors(diag)) {
         zan_parser_merge_partials(ast, arena, diag);
         zan_parser_desugar_events(ast, arena, diag);
+        zan_nsresolve_run(ast, arena, diag);
         zan_jsongen_run(ast, arena, diag);
         zan_dbgen_run(ast, arena, diag);
+        zan_routegen_run(ast, arena, diag);
     }
 
     if (do_dump_ast) {

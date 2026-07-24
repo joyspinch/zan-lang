@@ -59,6 +59,8 @@ add_executable(zanc
     src/compiler/parser.c
     src/compiler/jsongen.c
     src/compiler/dbgen.c
+    src/compiler/routegen.c
+    src/compiler/nsresolve.c
     src/compiler/binder.c
     src/compiler/checker.c
     src/compiler/irgen.c
