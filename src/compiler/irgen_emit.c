@@ -54,6 +54,40 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
     LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 0), g_argc);
     LLVMBuildStore(g->builder, LLVMGetParam(main_fn, 1), g_argv);
 
+    /* Make stdout flush promptly so a long-running program's output (a
+     * server's startup/request logs, progress prints, ...) is visible
+     * immediately instead of sitting in a block buffer until the process
+     * exits. The Windows CRT does not honor line buffering (it treats
+     * _IOLBF as full buffering), so use unbuffered there; ELF libc gets
+     * line buffering (flush on newline), which is cheap. Mirrors C#'s
+     * Console.Out.AutoFlush = true. */
+    {
+        LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef svi32 = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef svi64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMValueRef stdout_ptr;
+        if (g->target_is_windows) {
+            LLVMTypeRef iob_type = LLVMFunctionType(i8p, (LLVMTypeRef[]){ svi32 }, 1, 0);
+            LLVMValueRef iobfn = LLVMGetNamedFunction(g->mod, "__acrt_iob_func");
+            if (!iobfn) iobfn = LLVMAddFunction(g->mod, "__acrt_iob_func", iob_type);
+            LLVMValueRef one = LLVMConstInt(svi32, 1, 0);
+            stdout_ptr = zan_call2(g->builder, iob_type, iobfn, &one, 1, "stdout");
+        } else {
+            LLVMValueRef sg = LLVMGetNamedGlobal(g->mod, "stdout");
+            if (!sg) sg = LLVMAddGlobal(g->mod, i8p, "stdout");
+            stdout_ptr = LLVMBuildLoad2(g->builder, i8p, sg, "stdout");
+        }
+        LLVMTypeRef sv_type = LLVMFunctionType(svi32,
+            (LLVMTypeRef[]){ i8p, i8p, svi32, svi64 }, 4, 0);
+        LLVMValueRef sv = LLVMGetNamedFunction(g->mod, "setvbuf");
+        if (!sv) sv = LLVMAddFunction(g->mod, "setvbuf", sv_type);
+        int sv_mode = g->target_is_windows ? 4 /* _IONBF */ : 1 /* _IOLBF */;
+        LLVMValueRef sv_args[] = { stdout_ptr, LLVMConstNull(i8p),
+            LLVMConstInt(svi32, sv_mode, 0),
+            LLVMConstInt(svi64, g->target_is_windows ? 0 : 4096, 0) };
+        zan_call2(g->builder, sv_type, sv, sv_args, 4, "");
+    }
+
     /* Programs emit UTF-8 bytes; the Windows console defaults to the legacy
      * OEM/ANSI code page, which renders CJK/accented output as mojibake.
      * Switch the console to UTF-8 (65001). Only affects console rendering:
