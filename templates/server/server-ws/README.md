@@ -13,7 +13,7 @@ src/gateway/
 src/worker/
   ChatWorker.zan            business logic (OnOpen / OnMessage / OnClose)
 src/framework/Config.zan  loads config/app.json
-client.html               open in a browser to test (chat room)
+wwwroot/client.html       open in a browser to test (chat room)
 ```
 
 ## Why gateway + worker
@@ -27,7 +27,7 @@ API. This separation is what lets you evolve either side independently.
 ## Run & test
 
 Run from the IDE (output streams into the terminal panel), then open
-`client.html` in a browser (or several tabs) and chat — every tab sees each
+`wwwroot/client.html` in a browser (or several tabs) and chat — every tab sees each
 other's messages via `Gateway.Broadcast`.
 
 ```
