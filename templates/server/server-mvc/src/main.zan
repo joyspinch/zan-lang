@@ -5,24 +5,29 @@ using ZanWeb;
 //
 // main.zan only bootstraps the server and wires routes. Request handling lives
 // in controllers (src/controller), data access in models (src/model), and the
-// cross-cutting plumbing in the framework (src/framework). Runtime settings are
-// read from config/app.json and are NOT compiled into the binary -- edit the
-// file and restart to change host / port / limits / database / cache.
+// cross-cutting plumbing in the framework (src/framework). All runtime settings
+// are parsed ONCE from config/app.json into the typed Cfg entity (Cfg.Server.*,
+// Cfg.Db.*, Cfg.Worker.*, ...) and are NOT compiled into the binary -- edit the
+// file and restart to change host / port / limits / database / cache / workers.
 class Program {
+    // Slow-request threshold (ms), loaded from [log].slowMs at startup.
+    static int slowMs = 1000;
+
     static void Main() {
-        Config.Load("config/app.json");
+        Cfg.Load("config/app.json");
 
-        WebApp app = WebApp.Create(
-            Config.Str("server", "host", "127.0.0.1"),
-            Config.Int("server", "port", 8080));
-        App.Use(app);
-
-        app.Views("src/controller");   // templates live next to their controllers                                        // loaded ONCE at startup
-        app.MaxBody(Config.Int("server", "maxBodyMB", 2) * 1024 * 1024);
-        app.GlobalLimit(Config.Int("server", "globalLimitPerSec", 0));
+        WebApp app = WebApp.Create();   // reads Cfg.Server.* (host / port / limits)
+        WebHost.Use(app);
+        app.Views("src/controller");    // templates live next to their controllers
 
         // ---- lifecycle hooks (compile-time typed, run in order) ----
-        app.Before(Program.AccessLog);
+        // Access logging is OFF by default: a synchronous console write on every
+        // request is a real throughput/CPU cost under load. Turn on [log].access
+        // in app.json when you need to watch requests live.
+        if (Cfg.Log.access) {
+            app.Before(Program.AccessLog);
+        }
+        Program.slowMs = Cfg.Log.slowMs;
         app.After(Program.Metrics);
 
         // ---- routes ----
@@ -47,7 +52,7 @@ class Program {
     }
 
     static void Metrics(HttpContext ctx, int elapsedMs) {
-        if (elapsedMs > 1000) {
+        if (elapsedMs > Program.slowMs) {
             Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
                 + Convert.ToString(elapsedMs) + "ms");
         }
