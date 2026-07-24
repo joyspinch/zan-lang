@@ -39,7 +39,13 @@ partial class Irgen {
     public int brkTarget;
     public int contTarget;
     public List<string> tparamNames;
+    // method-level monomorphization: specialized clones pending emission
+    public List<Node> specMs;
+    public List<Node> specClss;
+    public List<string> specSyms;
     public StringBuilder deferred; // hoisted lambda function definitions
+    public StringBuilder entryAllocas; // per-function allocas hoisted to entry
+    public bool eaActive;
     public int lamCount;
     public List<string> stmtTemps;
     public List<Node> stmtTempTypes;
@@ -51,6 +57,7 @@ partial class Irgen {
     public int curAwaitSeq;
     public bool usesAsync;
     public bool usesDirList;
+    public bool usesStrOps; // Trim/ToUpper/ToLower/Replace/LastIndexOf helpers
     List<string> mgTargets; // method-group thunks already emitted
     public List<string> asyncSlotReg;
     public List<Node> asyncSlotTy;
@@ -66,6 +73,7 @@ partial class Irgen {
         binder = b; diags = d;
         head = new StringBuilder(); body = new StringBuilder();
         deferred = new StringBuilder(); lamCount = 0;
+        entryAllocas = new StringBuilder(); eaActive = false;
         tmp = 0; lbl = 0; strn = 0; term = false;
         curClass = ""; curRet = "void"; curHasThis = false;
         locName = new List<string>();
@@ -73,11 +81,14 @@ partial class Irgen {
         locReg = new List<string>();
         locSeq = 0;
         qdotSeq = 0;
-        curAsync = false; usesAsync = false; usesDirList = false;
+        curAsync = false; usesAsync = false; usesDirList = false; usesStrOps = false;
         mgTargets = new List<string>();
         curLbl = "entry";
         brkTarget = 0; contTarget = 0;
         tparamNames = new List<string>();
+        specMs = new List<Node>();
+        specClss = new List<Node>();
+        specSyms = new List<string>();
         stmtTemps = new List<string>();
         stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
@@ -140,6 +151,13 @@ partial class Irgen {
     string NT() { tmp = tmp + 1; return "%t" + tmp; }
     int NL() { lbl = lbl + 1; return lbl; }
     void L(string s) { body.Append(s); body.Append("\n"); }
+    // Emit an alloca into the function's entry block when a hoist buffer is
+    // active, so locals declared inside loop bodies reuse one stack slot per
+    // call instead of growing the stack every iteration at -O0.
+    void EA(string reg, string lt) {
+        if (eaActive) { entryAllocas.Append("  " + reg + " = alloca " + lt + "\n"); }
+        else { L("  " + reg + " = alloca " + lt); }
+    }
     void H(string s) { head.Append(s); head.Append("\n"); }
     void Label(int n) { body.Append("L" + n + ":\n"); term = false; curLbl = "L" + n; }
 
@@ -485,6 +503,18 @@ partial class Irgen {
         return null;
     }
 
+    // per-class type descriptor: the global's address is the type identity
+    // and its value links to the base class's descriptor (chain walk for
+    // catch-clause matching; see GenTry).
+    void EmitTid(Node d) {
+        Node bt = BaseClassOf(d);
+        if (bt != null) {
+            H("@__tid_" + d.sval + " = global i8* bitcast (i8** @__tid_" + bt.sval + " to i8*)");
+        } else {
+            H("@__tid_" + d.sval + " = global i8* null");
+        }
+    }
+
     // ---- inheritance / virtual dispatch helpers ----
     Node BaseClassOf(Node cls) {
         if (cls == null) { return null; }
@@ -772,6 +802,8 @@ partial class Irgen {
         H("@__exc_sp = global i64 0");
         H("@__exc_stack = global [64 x i8*] zeroinitializer");
         H("@__exc_val = global i8* null");
+        H("@__exc_tid = global i8* null");
+        H("@__exc_bufs = global [64 x [32 x i64]] zeroinitializer");
         H("@__zan_argc = global i32 0");
         H("@__zan_argv = global i8** null");
         H("@.mode_rb = private unnamed_addr constant [3 x i8] c\"rb\\00\"");
@@ -796,7 +828,7 @@ partial class Irgen {
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
-            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitStruct(d); EmitStaticGlobals(d); }
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitStruct(d); EmitStaticGlobals(d); EmitTid(d); }
             i = i + 1;
         }
         // vtables for polymorphic classes
@@ -821,8 +853,16 @@ partial class Irgen {
             i = i + 1;
         }
         GenMainWrapper(unit);
+        // emit queued generic-method specializations (a specialized body may
+        // queue further specializations, so drain until the list stops growing)
+        int sp = 0;
+        while (sp < specMs.Count) {
+            GenMethod(specClss[sp], specMs[sp], false);
+            sp = sp + 1;
+        }
         if (usesAsync) { EmitAsyncRuntime(); }
         if (usesDirList) { EmitDirRuntime(); }
+        if (usesStrOps) { EmitStrOpsRuntime(); }
         return head.ToString() + body.ToString() + deferred.ToString();
     }
 
@@ -879,6 +919,39 @@ partial class Irgen {
         H("  %data2 = load i64*, i64** %dptr2");
         H("  %datai8 = bitcast i64* %data2 to i8*");
         H("  call void @free(i8* %datai8)");
+        H("  ret void");
+        H("}");
+        H("define void @zlist_reverse(i8* %p) {");
+        H("entry:");
+        H("  %l = bitcast i8* %p to %zlist*");
+        H("  %cptr = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %dptr = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
+        H("  %data = load i64*, i64** %dptr");
+        H("  %lo = alloca i64");
+        H("  store i64 0, i64* %lo");
+        H("  %hi = alloca i64");
+        H("  %h0 = sub i64 %count, 1");
+        H("  store i64 %h0, i64* %hi");
+        H("  br label %cond");
+        H("cond:");
+        H("  %lv = load i64, i64* %lo");
+        H("  %hv = load i64, i64* %hi");
+        H("  %c = icmp slt i64 %lv, %hv");
+        H("  br i1 %c, label %body, label %done");
+        H("body:");
+        H("  %ls = getelementptr i64, i64* %data, i64 %lv");
+        H("  %hs = getelementptr i64, i64* %data, i64 %hv");
+        H("  %a = load i64, i64* %ls");
+        H("  %b = load i64, i64* %hs");
+        H("  store i64 %b, i64* %ls");
+        H("  store i64 %a, i64* %hs");
+        H("  %l1 = add i64 %lv, 1");
+        H("  store i64 %l1, i64* %lo");
+        H("  %h1 = sub i64 %hv, 1");
+        H("  store i64 %h1, i64* %hi");
+        H("  br label %cond");
+        H("done:");
         H("  ret void");
         H("}");
         H("define i8* @zlist_new(i64 %owns) {");
@@ -1296,6 +1369,300 @@ partial class Irgen {
         H("}");
     }
 
+    // String helpers needing loops: LastIndexOf, Replace, Trim, ToUpper/ToLower.
+    // Emitted only when a program uses one of them (usesStrOps).
+    void EmitStrOpsRuntime() {
+        if (!ExternSeen("strstr")) { externDecls.Add("strstr"); H("declare i8* @strstr(i8*, i8*)"); }
+        if (!ExternSeen("strncmp")) { externDecls.Add("strncmp"); H("declare i32 @strncmp(i8*, i8*, i64)"); }
+        H("define i64 @zstr_lastidx(i8* %s, i8* %sub) {");
+        H("entry:");
+        H("  %best = alloca i64");
+        H("  store i64 -1, i64* %best");
+        H("  %i = alloca i64");
+        H("  store i64 0, i64* %i");
+        H("  %ls = call i64 @strlen(i8* %s)");
+        H("  %lsub = call i64 @strlen(i8* %sub)");
+        H("  %end = sub i64 %ls, %lsub");
+        H("  br label %loop");
+        H("loop:");
+        H("  %iv = load i64, i64* %i");
+        H("  %cond = icmp sle i64 %iv, %end");
+        H("  br i1 %cond, label %bdy, label %done");
+        H("bdy:");
+        H("  %p = getelementptr i8, i8* %s, i64 %iv");
+        H("  %c = call i32 @strncmp(i8* %p, i8* %sub, i64 %lsub)");
+        H("  %hit = icmp eq i32 %c, 0");
+        H("  br i1 %hit, label %sethit, label %next");
+        H("sethit:");
+        H("  store i64 %iv, i64* %best");
+        H("  br label %next");
+        H("next:");
+        H("  %iv1 = add i64 %iv, 1");
+        H("  store i64 %iv1, i64* %i");
+        H("  br label %loop");
+        H("done:");
+        H("  %r = load i64, i64* %best");
+        H("  ret i64 %r");
+        H("}");
+        H("define i8* @zstr_replace(i8* %s, i8* %from, i8* %to) {");
+        H("entry:");
+        H("  %lf = call i64 @strlen(i8* %from)");
+        H("  %lt = call i64 @strlen(i8* %to)");
+        H("  %ls = call i64 @strlen(i8* %s)");
+        H("  %g0 = mul i64 %ls, %lt");
+        H("  %g1 = add i64 %g0, %ls");
+        H("  %g2 = add i64 %g1, %lt");
+        H("  %cap = add i64 %g2, 1");
+        H("  %buf = call i8* @malloc(i64 %cap)");
+        H("  %cur = alloca i8*");
+        H("  store i8* %s, i8** %cur");
+        H("  %out = alloca i64");
+        H("  store i64 0, i64* %out");
+        H("  %fempty = icmp eq i64 %lf, 0");
+        H("  br i1 %fempty, label %rest, label %loop");
+        H("loop:");
+        H("  %c = load i8*, i8** %cur");
+        H("  %hit = call i8* @strstr(i8* %c, i8* %from)");
+        H("  %miss = icmp eq i8* %hit, null");
+        H("  br i1 %miss, label %rest, label %copyseg");
+        H("copyseg:");
+        H("  %ov = load i64, i64* %out");
+        H("  %hi = ptrtoint i8* %hit to i64");
+        H("  %ci = ptrtoint i8* %c to i64");
+        H("  %seg = sub i64 %hi, %ci");
+        H("  %dst = getelementptr i8, i8* %buf, i64 %ov");
+        H("  call i8* @memcpy(i8* %dst, i8* %c, i64 %seg)");
+        H("  %ov1 = add i64 %ov, %seg");
+        H("  %dst2 = getelementptr i8, i8* %buf, i64 %ov1");
+        H("  call i8* @memcpy(i8* %dst2, i8* %to, i64 %lt)");
+        H("  %ov2 = add i64 %ov1, %lt");
+        H("  store i64 %ov2, i64* %out");
+        H("  %ncur = getelementptr i8, i8* %hit, i64 %lf");
+        H("  store i8* %ncur, i8** %cur");
+        H("  br label %loop");
+        H("rest:");
+        H("  %rc = load i8*, i8** %cur");
+        H("  %rl = call i64 @strlen(i8* %rc)");
+        H("  %rov = load i64, i64* %out");
+        H("  %rdst = getelementptr i8, i8* %buf, i64 %rov");
+        H("  call i8* @memcpy(i8* %rdst, i8* %rc, i64 %rl)");
+        H("  %rov1 = add i64 %rov, %rl");
+        H("  %endp = getelementptr i8, i8* %buf, i64 %rov1");
+        H("  store i8 0, i8* %endp");
+        H("  ret i8* %buf");
+        H("}");
+        H("define i8* @zstr_trim(i8* %s) {");
+        H("entry:");
+        H("  %n = call i64 @strlen(i8* %s)");
+        H("  %b = alloca i64");
+        H("  store i64 0, i64* %b");
+        H("  %e = alloca i64");
+        H("  store i64 %n, i64* %e");
+        H("  br label %l1");
+        H("l1:");
+        H("  %bv = load i64, i64* %b");
+        H("  %c1 = icmp slt i64 %bv, %n");
+        H("  br i1 %c1, label %l1chk, label %l2");
+        H("l1chk:");
+        H("  %p1 = getelementptr i8, i8* %s, i64 %bv");
+        H("  %ch1 = load i8, i8* %p1");
+        H("  %sp1 = icmp eq i8 %ch1, 32");
+        H("  %tb1 = icmp eq i8 %ch1, 9");
+        H("  %cr1 = icmp eq i8 %ch1, 13");
+        H("  %nl1 = icmp eq i8 %ch1, 10");
+        H("  %w1a = or i1 %sp1, %tb1");
+        H("  %w1b = or i1 %cr1, %nl1");
+        H("  %w1 = or i1 %w1a, %w1b");
+        H("  br i1 %w1, label %l1inc, label %l2");
+        H("l1inc:");
+        H("  %bv1 = add i64 %bv, 1");
+        H("  store i64 %bv1, i64* %b");
+        H("  br label %l1");
+        H("l2:");
+        H("  %ev = load i64, i64* %e");
+        H("  %bv2 = load i64, i64* %b");
+        H("  %c2 = icmp sgt i64 %ev, %bv2");
+        H("  br i1 %c2, label %l2chk, label %fin");
+        H("l2chk:");
+        H("  %em1 = sub i64 %ev, 1");
+        H("  %p2 = getelementptr i8, i8* %s, i64 %em1");
+        H("  %ch2 = load i8, i8* %p2");
+        H("  %sp2 = icmp eq i8 %ch2, 32");
+        H("  %tb2 = icmp eq i8 %ch2, 9");
+        H("  %cr2 = icmp eq i8 %ch2, 13");
+        H("  %nl2 = icmp eq i8 %ch2, 10");
+        H("  %w2a = or i1 %sp2, %tb2");
+        H("  %w2b = or i1 %cr2, %nl2");
+        H("  %w2 = or i1 %w2a, %w2b");
+        H("  br i1 %w2, label %l2dec, label %fin");
+        H("l2dec:");
+        H("  store i64 %em1, i64* %e");
+        H("  br label %l2");
+        H("fin:");
+        H("  %bv3 = load i64, i64* %b");
+        H("  %ev3 = load i64, i64* %e");
+        H("  %len = sub i64 %ev3, %bv3");
+        H("  %bsz = add i64 %len, 1");
+        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  %srcp = getelementptr i8, i8* %s, i64 %bv3");
+        H("  call i8* @memcpy(i8* %buf, i8* %srcp, i64 %len)");
+        H("  %endp = getelementptr i8, i8* %buf, i64 %len");
+        H("  store i8 0, i8* %endp");
+        H("  ret i8* %buf");
+        H("}");
+        H("define i8* @zstr_case(i8* %s, i64 %up) {");
+        H("entry:");
+        H("  %n = call i64 @strlen(i8* %s)");
+        H("  %bsz = add i64 %n, 1");
+        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  %i = alloca i64");
+        H("  store i64 0, i64* %i");
+        H("  %isup = icmp ne i64 %up, 0");
+        H("  br label %loop");
+        H("loop:");
+        H("  %iv = load i64, i64* %i");
+        H("  %cond = icmp slt i64 %iv, %n");
+        H("  br i1 %cond, label %bdy, label %done");
+        H("bdy:");
+        H("  %p = getelementptr i8, i8* %s, i64 %iv");
+        H("  %c = load i8, i8* %p");
+        H("  %gea = icmp sge i8 %c, 97");
+        H("  %lez = icmp sle i8 %c, 122");
+        H("  %islow = and i1 %gea, %lez");
+        H("  %cup = sub i8 %c, 32");
+        H("  %vup = select i1 %islow, i8 %cup, i8 %c");
+        H("  %geA = icmp sge i8 %c, 65");
+        H("  %leZ = icmp sle i8 %c, 90");
+        H("  %isupc = and i1 %geA, %leZ");
+        H("  %cdn = add i8 %c, 32");
+        H("  %vdn = select i1 %isupc, i8 %cdn, i8 %c");
+        H("  %v = select i1 %isup, i8 %vup, i8 %vdn");
+        H("  %dp = getelementptr i8, i8* %buf, i64 %iv");
+        H("  store i8 %v, i8* %dp");
+        H("  %iv1 = add i64 %iv, 1");
+        H("  store i64 %iv1, i64* %i");
+        H("  br label %loop");
+        H("done:");
+        H("  %endp = getelementptr i8, i8* %buf, i64 %n");
+        H("  store i8 0, i8* %endp");
+        H("  ret i8* %buf");
+        H("}");
+        H("define i8* @zstr_split(i8* %s, i8* %sep) {");
+        H("entry:");
+        H("  %lsep = call i64 @strlen(i8* %sep)");
+        H("  %lst = call i8* @zlist_new(i64 0)");
+        H("  %cur = alloca i8*");
+        H("  store i8* %s, i8** %cur");
+        H("  %empty = icmp eq i64 %lsep, 0");
+        H("  br i1 %empty, label %last, label %loop");
+        H("loop:");
+        H("  %c = load i8*, i8** %cur");
+        H("  %hit = call i8* @strstr(i8* %c, i8* %sep)");
+        H("  %miss = icmp eq i8* %hit, null");
+        H("  br i1 %miss, label %last, label %seg");
+        H("seg:");
+        H("  %hi = ptrtoint i8* %hit to i64");
+        H("  %ci = ptrtoint i8* %c to i64");
+        H("  %n = sub i64 %hi, %ci");
+        H("  %bsz = add i64 %n, 1");
+        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  call i8* @memcpy(i8* %buf, i8* %c, i64 %n)");
+        H("  %endp = getelementptr i8, i8* %buf, i64 %n");
+        H("  store i8 0, i8* %endp");
+        H("  %bi = ptrtoint i8* %buf to i64");
+        H("  call void @zlist_add(i8* %lst, i64 %bi)");
+        H("  %ncur = getelementptr i8, i8* %hit, i64 %lsep");
+        H("  store i8* %ncur, i8** %cur");
+        H("  br label %loop");
+        H("last:");
+        H("  %lc = load i8*, i8** %cur");
+        H("  %n2 = call i64 @strlen(i8* %lc)");
+        H("  %bsz2 = add i64 %n2, 1");
+        H("  %buf2 = call i8* @malloc(i64 %bsz2)");
+        H("  call i8* @memcpy(i8* %buf2, i8* %lc, i64 %bsz2)");
+        H("  %bi2 = ptrtoint i8* %buf2 to i64");
+        H("  call void @zlist_add(i8* %lst, i64 %bi2)");
+        H("  ret i8* %lst");
+        H("}");
+        H("define i8* @zstr_join(i8* %sep, i8* %lst) {");
+        H("entry:");
+        H("  %n = call i64 @zlist_count(i8* %lst)");
+        H("  %lsep = call i64 @strlen(i8* %sep)");
+        H("  %tot = alloca i64");
+        H("  store i64 0, i64* %tot");
+        H("  %i = alloca i64");
+        H("  store i64 0, i64* %i");
+        H("  br label %mcond");
+        H("mcond:");
+        H("  %iv = load i64, i64* %i");
+        H("  %mdone = icmp sge i64 %iv, %n");
+        H("  br i1 %mdone, label %alloc, label %mbody");
+        H("mbody:");
+        H("  %sl = call i64 @zlist_get(i8* %lst, i64 %iv)");
+        H("  %sp = inttoptr i64 %sl to i8*");
+        H("  %l = call i64 @strlen(i8* %sp)");
+        H("  %t0 = load i64, i64* %tot");
+        H("  %t1 = add i64 %t0, %l");
+        H("  %t2 = add i64 %t1, %lsep");
+        H("  store i64 %t2, i64* %tot");
+        H("  %ni = add i64 %iv, 1");
+        H("  store i64 %ni, i64* %i");
+        H("  br label %mcond");
+        H("alloc:");
+        H("  %tv = load i64, i64* %tot");
+        H("  %bsz = add i64 %tv, 1");
+        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  store i64 0, i64* %i");
+        H("  %out = alloca i64");
+        H("  store i64 0, i64* %out");
+        H("  br label %ccond");
+        H("ccond:");
+        H("  %iv2 = load i64, i64* %i");
+        H("  %cdone = icmp sge i64 %iv2, %n");
+        H("  br i1 %cdone, label %fin, label %cbody");
+        H("cbody:");
+        H("  %first = icmp eq i64 %iv2, 0");
+        H("  br i1 %first, label %citem, label %csep");
+        H("csep:");
+        H("  %ov = load i64, i64* %out");
+        H("  %dst = getelementptr i8, i8* %buf, i64 %ov");
+        H("  call i8* @memcpy(i8* %dst, i8* %sep, i64 %lsep)");
+        H("  %ov1 = add i64 %ov, %lsep");
+        H("  store i64 %ov1, i64* %out");
+        H("  br label %citem");
+        H("citem:");
+        H("  %sl2 = call i64 @zlist_get(i8* %lst, i64 %iv2)");
+        H("  %sp2 = inttoptr i64 %sl2 to i8*");
+        H("  %l2 = call i64 @strlen(i8* %sp2)");
+        H("  %ov2 = load i64, i64* %out");
+        H("  %dst2 = getelementptr i8, i8* %buf, i64 %ov2");
+        H("  call i8* @memcpy(i8* %dst2, i8* %sp2, i64 %l2)");
+        H("  %ov3 = add i64 %ov2, %l2");
+        H("  store i64 %ov3, i64* %out");
+        H("  %ni2 = add i64 %iv2, 1");
+        H("  store i64 %ni2, i64* %i");
+        H("  br label %ccond");
+        H("fin:");
+        H("  %ovf = load i64, i64* %out");
+        H("  %fend = getelementptr i8, i8* %buf, i64 %ovf");
+        H("  store i8 0, i8* %fend");
+        H("  ret i8* %buf");
+        H("}");
+        H("define i64 @zstr_isempty(i8* %s) {");
+        H("entry:");
+        H("  %isn = icmp eq i8* %s, null");
+        H("  br i1 %isn, label %yes, label %chk");
+        H("chk:");
+        H("  %c = load i8, i8* %s");
+        H("  %z = icmp eq i8 %c, 0");
+        H("  br i1 %z, label %yes, label %no");
+        H("yes:");
+        H("  ret i64 1");
+        H("no:");
+        H("  ret i64 0");
+        H("}");
+    }
+
     // Dictionary<string,V>: growable parallel arrays { count, cap, i8** keys,
     // i64* values } with linear-scan lookup. Set updates in place on an existing
     // key, otherwise appends (capacity doubling). Keys are strings (strcmp).
@@ -1353,6 +1720,57 @@ partial class Irgen {
         H("  %op = getelementptr %zdict, %zdict* %d, i32 0, i32 4");
         H("  store i64 %owns, i64* %op");
         H("  ret i8* %p");
+        H("}");
+        H("define i8* @zdict_keys(i8* %p) {");
+        H("entry:");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %kptr = getelementptr %zdict, %zdict* %d, i32 0, i32 2");
+        H("  %keys = load i8**, i8*** %kptr");
+        H("  %out = call i8* @zlist_new(i64 0)");
+        H("  %ia = alloca i64");
+        H("  store i64 0, i64* %ia");
+        H("  br label %cond");
+        H("cond:");
+        H("  %i = load i64, i64* %ia");
+        H("  %more = icmp slt i64 %i, %count");
+        H("  br i1 %more, label %body, label %done");
+        H("body:");
+        H("  %ks = getelementptr i8*, i8** %keys, i64 %i");
+        H("  %k = load i8*, i8** %ks");
+        H("  %kv = ptrtoint i8* %k to i64");
+        H("  call void @zlist_add(i8* %out, i64 %kv)");
+        H("  %i1 = add i64 %i, 1");
+        H("  store i64 %i1, i64* %ia");
+        H("  br label %cond");
+        H("done:");
+        H("  ret i8* %out");
+        H("}");
+        H("define i8* @zdict_values(i8* %p) {");
+        H("entry:");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %vptr = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %vals = load i64*, i64** %vptr");
+        H("  %out = call i8* @zlist_new(i64 0)");
+        H("  %ia = alloca i64");
+        H("  store i64 0, i64* %ia");
+        H("  br label %cond");
+        H("cond:");
+        H("  %i = load i64, i64* %ia");
+        H("  %more = icmp slt i64 %i, %count");
+        H("  br i1 %more, label %body, label %done");
+        H("body:");
+        H("  %vs = getelementptr i64, i64* %vals, i64 %i");
+        H("  %v = load i64, i64* %vs");
+        H("  call void @zlist_add(i8* %out, i64 %v)");
+        H("  %i1 = add i64 %i, 1");
+        H("  store i64 %i1, i64* %ia");
+        H("  br label %cond");
+        H("done:");
+        H("  ret i8* %out");
         H("}");
         H("define i64 @zdict_index(i8* %p, i8* %key) {");
         H("entry:");
@@ -1477,6 +1895,56 @@ partial class Irgen {
         H("  %ge = icmp sge i64 %idx, 0");
         H("  %r = zext i1 %ge to i64");
         H("  ret i64 %r");
+        H("}");
+        H("define i64 @zdict_remove(i8* %p, i8* %key) {");
+        H("entry:");
+        H("  %idx = call i64 @zdict_index(i8* %p, i8* %key)");
+        H("  %nf = icmp slt i64 %idx, 0");
+        H("  br i1 %nf, label %ret0, label %doit");
+        H("ret0:");
+        H("  ret i64 0");
+        H("doit:");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %kptr = getelementptr %zdict, %zdict* %d, i32 0, i32 2");
+        H("  %keys = load i8**, i8*** %kptr");
+        H("  %vptr = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %vals = load i64*, i64** %vptr");
+        H("  %optr = getelementptr %zdict, %zdict* %d, i32 0, i32 4");
+        H("  %owns = load i64, i64* %optr");
+        H("  %doarc = icmp ne i64 %owns, 0");
+        H("  br i1 %doarc, label %arc, label %shiftinit");
+        H("arc:");
+        H("  %vs = getelementptr i64, i64* %vals, i64 %idx");
+        H("  %ov = load i64, i64* %vs");
+        H("  %op = inttoptr i64 %ov to i8*");
+        H("  call void @zrelease(i8* %op)");
+        H("  br label %shiftinit");
+        H("shiftinit:");
+        H("  %ia = alloca i64");
+        H("  store i64 %idx, i64* %ia");
+        H("  %last = sub i64 %count, 1");
+        H("  br label %cond");
+        H("cond:");
+        H("  %i = load i64, i64* %ia");
+        H("  %done = icmp sge i64 %i, %last");
+        H("  br i1 %done, label %fin, label %body");
+        H("body:");
+        H("  %i1 = add i64 %i, 1");
+        H("  %ks = getelementptr i8*, i8** %keys, i64 %i1");
+        H("  %kv = load i8*, i8** %ks");
+        H("  %kd = getelementptr i8*, i8** %keys, i64 %i");
+        H("  store i8* %kv, i8** %kd");
+        H("  %vss = getelementptr i64, i64* %vals, i64 %i1");
+        H("  %vv = load i64, i64* %vss");
+        H("  %vd = getelementptr i64, i64* %vals, i64 %i");
+        H("  store i64 %vv, i64* %vd");
+        H("  store i64 %i1, i64* %ia");
+        H("  br label %cond");
+        H("fin:");
+        H("  store i64 %last, i64* %cptr");
+        H("  ret i64 1");
         H("}");
         H("define i64 @zdict_count(i8* %p) {");
         H("  %d = bitcast i8* %p to %zdict*");

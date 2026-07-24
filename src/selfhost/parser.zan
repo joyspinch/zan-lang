@@ -651,7 +651,14 @@ class Parser {
         d.mods = mods;
         d.type = ParseType(); // return type
         if (At(TK.Ident())) { d.sval = Next().text; }
-        if (At(TK.Less())) { while (!At(TK.Greater()) && !At(TK.Eof())) { Next(); } Expect(TK.Greater()); }
+        if (At(TK.Less())) {
+            Next();
+            while (!At(TK.Greater()) && !At(TK.Eof())) {
+                if (At(TK.Ident())) { Node tp = new Node(AK.TypeParam()); tp.sval = Next().text; d.Add(tp); }
+                else { Next(); }
+            }
+            Expect(TK.Greater());
+        }
         ParseParams(d);
         Expect(TK.Semicolon());
         return d;
@@ -782,6 +789,20 @@ class Parser {
             ctor.mods = mods;
             ctor.sval = Next().text;
             ParseParams(ctor);
+            // ctor initializer: `: base(args)` stored as a Call node in
+            // ctor.b; `: this(...)` chaining is parsed and skipped.
+            if (Eat(TK.Colon())) {
+                bool isBase = At(TK.Base());
+                Next();
+                Node ba = new Node(AK.Call());
+                Expect(TK.LParen());
+                while (!At(TK.RParen()) && !At(TK.Eof())) {
+                    ba.Add(ParseExpr());
+                    Eat(TK.Comma());
+                }
+                Expect(TK.RParen());
+                if (isBase) { ctor.b = ba; }
+            }
             ctor.d = ParseBlock();
             return ctor;
         }
@@ -1124,12 +1145,12 @@ class Parser {
 
     // try { } catch (T e) { } finally { }
     // n.a = try body, n.b = first catch clause (or null), n.c = finally body (or null)
-    // Additional catch clauses are parsed and discarded (single-catch subset).
+    // Additional catch clauses chain through each clause's .b slot.
     Node ParseTry() {
         Next(); // try
         Node n = new Node(AK.TryStmt());
         n.a = ParseBlock();
-        bool first = true;
+        Node last = null;
         while (At(TK.Catch())) {
             Next();
             Node cc = new Node(AK.CatchClause());
@@ -1142,7 +1163,8 @@ class Parser {
             }
             Node body = ParseBlock();
             cc.a = body;
-            if (first) { n.b = cc; first = false; }
+            if (last == null) { n.b = cc; } else { last.b = cc; }
+            last = cc;
         }
         if (At(TK.Finally())) { Next(); n.c = ParseBlock(); }
         return n;
@@ -1494,6 +1516,16 @@ class Parser {
     void ParseArgs(Node call) {
         Expect(TK.LParen());
         while (!At(TK.RParen()) && !At(TK.Eof())) {
+            // out argument: `out T name` declares, `out name` references
+            if (At(TK.Ident()) && Cur().text == "out" && (IsTypeKeyword(K1()) || K1() == TK.Ident())) {
+                Next();
+                Node oa = new Node(AK.OutArg());
+                if (IsTypeKeyword(K()) || (At(TK.Ident()) && K1() == TK.Ident())) { oa.type = ParseType(); }
+                if (At(TK.Ident())) { oa.sval = Next().text; }
+                call.Add(oa);
+                if (!Eat(TK.Comma())) { }
+                continue;
+            }
             // named argument:  name: expr
             string aname = "";
             if (At(TK.Ident()) && K1() == TK.Colon()) { aname = Next().text; Next(); }

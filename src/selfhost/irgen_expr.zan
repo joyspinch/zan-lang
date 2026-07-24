@@ -73,6 +73,13 @@ partial class Irgen {
             if (scls != null && FindStaticField(scls, e.sval) != null) {
                 return LoadStaticField(scls, e.sval);
             }
+            // bare static method group used as a delegate value
+            if (scls != null) {
+                Node mg = FindMethodUp(scls, e.sval);
+                if (mg != null && HasMod(mg, MOD.Static()) && !HasMod(mg, MOD.Extern())) {
+                    return EmitMethodGroup(curClass, scls, mg);
+                }
+            }
         }
         return new ExprVal("0", MkType("int"));
     }
@@ -759,7 +766,7 @@ partial class Irgen {
             }
             if (IsDictType(obj.ty)) {
                 string sv = ToSlot(v, DictVal(obj.ty));
-                L("  call void @zdict_set(i8* " + obj.op + ", i8* " + idx.op + ", i64 " + sv + ")");
+                L("  call void @zdict_set(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ", i64 " + sv + ")");
                 return;
             }
             if (IsStr(obj.ty)) {
@@ -887,7 +894,7 @@ partial class Irgen {
         Node scls = binder.FindType(sty);
         if (e.sval != "") {
             string reg = AddLocal(e.sval, e.type);
-            L("  " + reg + " = alloca %" + tname + "*");
+            EA(reg, "%" + tname + "*");
             string bc = NT();
             L("  " + bc + " = bitcast " + MapType(obj.ty) + " " + obj.op + " to %" + tname + "*");
             L("  store %" + tname + "* " + bc + ", %" + tname + "** " + reg);
@@ -967,7 +974,7 @@ partial class Irgen {
             ExprVal ev = FromSlot(raw, ety);
             string lt = MapType(ety);
             string reg = AddLocal(tgt.sval, ety);
-            L("  " + reg + " = alloca " + lt);
+            EA(reg, lt);
             L("  store " + lt + " " + Coerce(ev, lt) + ", " + lt + "* " + reg);
             i = i + 1;
         }
@@ -991,7 +998,7 @@ partial class Irgen {
         qdotSeq = qdotSeq + 1;
         string nm = "__qdot" + qdotSeq;
         string reg = AddLocal(nm, obj.ty);
-        L("  " + reg + " = alloca " + ot);
+        EA(reg, ot);
         L("  store " + ot + " " + obj.op + ", " + ot + "* " + reg);
         Node ident = new Node(AK.Ident());
         ident.sval = nm; ident.line = qmem.line; ident.col = qmem.col;
@@ -1082,6 +1089,22 @@ partial class Irgen {
             L("  " + raw + " = load i64, i64* " + slot);
             return FromSlot(raw, ety);
         }
+        if ((e.sval == "Length" || e.sval == "Count") && obj.ty != null && obj.ty.ival == 1) {
+            string lp = NT();
+            L("  " + lp + " = getelementptr i64, i64* " + obj.op + ", i64 -1");
+            string t = NT();
+            L("  " + t + " = load i64, i64* " + lp);
+            return new ExprVal(t, MkType("int"));
+        }
+        if (e.sval == "Length" && IsSbType(obj.ty)) {
+            string bp = NT();
+            L("  " + bp + " = bitcast i8* " + obj.op + " to %zsb*");
+            string cp = NT();
+            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 0");
+            string t = NT();
+            L("  " + t + " = load i64, i64* " + cp);
+            return new ExprVal(t, MkType("int"));
+        }
         if (e.sval == "Length" && IsStr(obj.ty)) {
             string t = NT();
             L("  " + t + " = call i64 @strlen(i8* " + obj.op + ")");
@@ -1096,6 +1119,19 @@ partial class Irgen {
             string t = NT();
             L("  " + t + " = call i64 @zdict_count(i8* " + obj.op + ")");
             return new ExprVal(t, MkType("int"));
+        }
+        if ((e.sval == "Keys" || e.sval == "Values") && IsDictType(obj.ty)) {
+            string t = NT();
+            if (e.sval == "Keys") { L("  " + t + " = call i8* @zdict_keys(i8* " + obj.op + ")"); }
+            else { L("  " + t + " = call i8* @zdict_values(i8* " + obj.op + ")"); }
+            Node lt = MkType("List");
+            Node et = MkType("string");
+            if (obj.ty.kids.Count >= 2) {
+                if (e.sval == "Keys") { et = obj.ty.kids[0]; } else { et = obj.ty.kids[1]; }
+            }
+            lt.kids.Add(et);
+            AddTemp(t, lt);
+            return new ExprVal(t, lt);
         }
         Node cls = ClassOf(obj.ty);
         if (cls != null && FieldIndex(cls, e.sval) >= 0) {
@@ -1128,7 +1164,7 @@ partial class Irgen {
         }
         if (IsDictType(obj.ty)) {
             string slot = NT();
-            L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + idx.op + ")");
+            L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ")");
             return FromSlot(slot, DictVal(obj.ty));
         }
         string p2 = NT();
@@ -1144,15 +1180,20 @@ partial class Irgen {
     ExprVal GenNew(Node e) {
         Node ty = e.type;
         if (e.ival == 1) {
-            // array new: T[n] as i64* (n slots)
+            // array new: T[n] as i64* (n zeroed slots after an i64 length header)
             ExprVal nsz = new ExprVal("0", MkType("int"));
             if (e.b != null) { nsz = GenExpr(e.b); }
             string bytes = NT();
             L("  " + bytes + " = mul i64 " + nsz.op + ", 8");
+            string tot = NT();
+            L("  " + tot + " = add i64 " + bytes + ", 8");
             string raw = NT();
-            L("  " + raw + " = call i8* @malloc(i64 " + bytes + ")");
+            L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
+            string hdr = NT();
+            L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
+            L("  store i64 " + nsz.op + ", i64* " + hdr);
             string arr = NT();
-            L("  " + arr + " = bitcast i8* " + raw + " to i64*");
+            L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 1");
             Node at = MkType(ty.sval); at.ival = 1;
             return new ExprVal(arr, at);
         }
@@ -1550,13 +1591,16 @@ partial class Irgen {
 
     List<Node> DelegParams(Node dty) {
         List<Node> r = new List<Node>();
-        // named delegate: signature comes from its declaration
+        // named delegate: signature comes from its declaration, with the
+        // delegate's own type parameters bound to the use-site type arguments
         if (dty.sval != "Func" && dty.sval != "Action") {
             Node d = binder.FindDelegate(dty.sval);
             if (d != null) {
+                List<string> dtn = TParams(d);
+                List<Node> dta = DelegTArgs(d, dty, dtn);
                 int j = 0;
                 while (j < d.kids.Count) {
-                    if (d.kids[j].kind == AK.Param()) { r.Add(d.kids[j].type); }
+                    if (d.kids[j].kind == AK.Param()) { r.Add(SubstTP(d.kids[j].type, dtn, dta)); }
                     j = j + 1;
                 }
                 return r;
@@ -1570,10 +1614,26 @@ partial class Irgen {
         return r;
     }
 
+    // positional type arguments for a named delegate use (missing args stay
+    // as the declared type-parameter names so unbound uses keep erased slots)
+    List<Node> DelegTArgs(Node d, Node dty, List<string> dtn) {
+        List<Node> dta = new List<Node>();
+        int q = 0;
+        while (q < dtn.Count) {
+            if (q < dty.kids.Count) { dta.Add(dty.kids[q]); }
+            else { dta.Add(MkType(dtn[q])); }
+            q = q + 1;
+        }
+        return dta;
+    }
+
     Node DelegRet(Node dty) {
         if (dty.sval != "Func" && dty.sval != "Action") {
             Node d = binder.FindDelegate(dty.sval);
-            if (d != null && d.type != null) { return d.type; }
+            if (d != null && d.type != null) {
+                List<string> dtn = TParams(d);
+                return SubstTP(d.type, dtn, DelegTArgs(d, dty, dtn));
+            }
         }
         if (dty.sval == "Func" && dty.kids.Count > 0) { return dty.kids[dty.kids.Count - 1]; }
         return MkType("void");
@@ -1682,8 +1742,11 @@ partial class Irgen {
         int sLoopScope = loopScopeBase;
         List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
 
+        StringBuilder sEa = entryAllocas; bool sEaAct = eaActive;
+        bool sAsync = curAsync;
         body = new StringBuilder();
-        tmp = 0; lbl = 0; term = false; curLbl = "entry";
+        entryAllocas = new StringBuilder(); eaActive = true;
+        tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
         locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
         curRet = MapType(retTy); curClass = ""; curHasThis = false; brkTarget = 0; contTarget = 0;
 
@@ -1691,8 +1754,6 @@ partial class Irgen {
         int a = 0;
         while (a < pn.Count) { sig = sig + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
         sig = sig + ") {";
-        L(sig);
-        L("entry:");
         a = 0;
         while (a < pn.Count) {
             string lt = MapType(pt[a]);
@@ -1737,16 +1798,31 @@ partial class Irgen {
                 ReleaseLocalsFrom(0);
                 L("  ret void");
             } else {
-                string rvs = Coerce(rv, curRet);
-                EmitArcRetain(rvs, rv.ty);
+                string rvs = "";
+                if (IsErasedType(retTy) && MapType(rv.ty) != "i64") {
+                    // erased return slot: pack the concrete value (double via
+                    // bitcast, pointers via ptrtoint) instead of Coerce
+                    EmitArcRetain(rv.op, rv.ty);
+                    rvs = ToSlot(rv, rv.ty);
+                } else {
+                    rvs = Coerce(rv, curRet);
+                    EmitArcRetain(rvs, rv.ty);
+                }
                 EmitTempReleases();
                 ReleaseLocalsFrom(0);
                 L("  ret " + curRet + " " + rvs);
             }
         }
         L("}");
+        // append the whole function at once so a nested lambda emitted while
+        // this body was being generated does not interleave with our text
+        deferred.Append(sig); deferred.Append("\n");
+        deferred.Append("entry:\n");
+        deferred.Append(entryAllocas.ToString());
         deferred.Append(body.ToString());
 
+        entryAllocas = sEa; eaActive = sEaAct;
+        curAsync = sAsync;
         body = savedBody;
         tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
         curRet = sRet; curClass = sClass; curHasThis = sHasThis;
@@ -1938,6 +2014,19 @@ partial class Irgen {
                 string s = ToCStr(a);
                 return new ExprVal(s, MkType("string"));
             }
+            if (callee.sval == "ToDouble" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                if (IsStr(a.ty)) {
+                    if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
+                    string r = NT();
+                    L("  " + r + " = call double @strtod(i8* " + a.op + ", i8** null)");
+                    return new ExprVal(r, MkType("double"));
+                }
+                if (IsDbl(a.ty)) { return a; }
+                string c = NT();
+                L("  " + c + " = sitofp i64 " + a.op + " to double");
+                return new ExprVal(c, MkType("double"));
+            }
             if ((callee.sval == "ToInt32" || callee.sval == "ToInt") && e.kids.Count == 1) {
                 ExprVal a = GenExpr(e.kids[0]);
                 string r0 = NT();
@@ -1949,6 +2038,122 @@ partial class Irgen {
                 string r3 = NT();
                 L("  " + r3 + " = ashr i64 " + r2 + ", 32");
                 return new ExprVal(r3, MkType("int"));
+            }
+        }
+        // int/long.Parse(s), double/float.Parse(s) and matching
+        // TryParse(s, out v) -> strtoll/strtod (mirrors the C host)
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && LocalIdx(callee.a.sval) < 0) {
+            string prn = callee.a.sval;
+            bool intRecv = prn == "int" || prn == "long" || prn == "Int32" || prn == "Int64";
+            bool dblRecv = prn == "double" || prn == "float" || prn == "Double" || prn == "Single";
+            if ((intRecv || dblRecv) && callee.sval == "Parse" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string r = NT();
+                if (intRecv) {
+                    if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
+                    L("  " + r + " = call i64 @strtoll(i8* " + a.op + ", i8** null, i32 10)");
+                    return new ExprVal(r, MkType("int"));
+                }
+                if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
+                L("  " + r + " = call double @strtod(i8* " + a.op + ", i8** null)");
+                return new ExprVal(r, MkType("double"));
+            }
+            if ((intRecv || dblRecv) && callee.sval == "TryParse" && e.kids.Count == 2
+                && e.kids[1].kind == AK.OutArg()) {
+                ExprVal a = GenExpr(e.kids[0]);
+                Node oa = e.kids[1];
+                Node oty = null;
+                string outp = "";
+                if (oa.type != null) {
+                    oty = oa.type;
+                    outp = AddLocal(oa.sval, oty);
+                    EA(outp, MapType(oty));
+                } else {
+                    int li = LocalIdx(oa.sval);
+                    if (li >= 0) { oty = locType[li]; outp = locReg[li]; }
+                }
+                string endp = NT();
+                EA(endp, "i8*");
+                L("  store i8* null, i8** " + endp);
+                string v = NT();
+                if (intRecv) {
+                    if (!ExternSeen("strtoll")) { externDecls.Add("strtoll"); H("declare i64 @strtoll(i8*, i8**, i32)"); }
+                    L("  " + v + " = call i64 @strtoll(i8* " + a.op + ", i8** " + endp + ", i32 10)");
+                } else {
+                    if (!ExternSeen("strtod")) { externDecls.Add("strtod"); H("declare double @strtod(i8*, i8**)"); }
+                    L("  " + v + " = call double @strtod(i8* " + a.op + ", i8** " + endp + ")");
+                }
+                string ep = NT();
+                L("  " + ep + " = load i8*, i8** " + endp);
+                string moved = NT();
+                L("  " + moved + " = icmp ne i8* " + ep + ", " + a.op);
+                string ch = NT();
+                L("  " + ch + " = load i8, i8* " + ep);
+                string atend = NT();
+                L("  " + atend + " = icmp eq i8 " + ch + ", 0");
+                string ok = NT();
+                L("  " + ok + " = and i1 " + moved + ", " + atend);
+                if (outp != "") {
+                    string zero = "0";
+                    string vty = "i64";
+                    if (dblRecv) { zero = "0.0"; vty = "double"; }
+                    string stv = NT();
+                    L("  " + stv + " = select i1 " + ok + ", " + vty + " " + v + ", " + vty + " " + zero);
+                    L("  store " + vty + " " + stv + ", " + vty + "* " + outp);
+                }
+                string okz = NT();
+                L("  " + okz + " = zext i1 " + ok + " to i64");
+                return new ExprVal(okz, MkType("bool"));
+            }
+        }
+        // Math.Round(x[, digits]) -> libm round; digits scale by 10^d
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Math" && LocalIdx("Math") < 0 && binder.FindType("Math") == null
+            && callee.sval == "Round" && e.kids.Count >= 1 && e.kids.Count <= 2) {
+            if (!ExternSeen("round")) { externDecls.Add("round"); H("declare double @round(double)"); }
+            ExprVal a = GenExpr(e.kids[0]);
+            string av = a.op;
+            if (!IsDbl(a.ty)) { string c = NT(); L("  " + c + " = sitofp i64 " + av + " to double"); av = c; }
+            if (e.kids.Count == 1) {
+                string r = NT();
+                L("  " + r + " = call double @round(double " + av + ")");
+                return new ExprVal(r, MkType("double"));
+            }
+            if (!ExternSeen("pow")) { externDecls.Add("pow"); H("declare double @pow(double, double)"); }
+            ExprVal d = GenExpr(e.kids[1]);
+            string dv = d.op;
+            if (!IsDbl(d.ty)) { string dc = NT(); L("  " + dc + " = sitofp i64 " + dv + " to double"); dv = dc; }
+            string sc = NT();
+            L("  " + sc + " = call double @pow(double 1.0e1, double " + dv + ")");
+            string sd = NT();
+            L("  " + sd + " = fmul double " + av + ", " + sc);
+            string rr = NT();
+            L("  " + rr + " = call double @round(double " + sd + ")");
+            string res = NT();
+            L("  " + res + " = fdiv double " + rr + ", " + sc);
+            return new ExprVal(res, MkType("double"));
+        }
+        // string.IsNullOrEmpty / string.Join / string.Format statics
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && (callee.a.sval == "string" || callee.a.sval == "String") && LocalIdx(callee.a.sval) < 0) {
+            if (callee.sval == "IsNullOrEmpty" && e.kids.Count == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                usesStrOps = true;
+                string r = NT();
+                L("  " + r + " = call i64 @zstr_isempty(i8* " + a.op + ")");
+                return new ExprVal(r, MkType("bool"));
+            }
+            if (callee.sval == "Join" && e.kids.Count == 2) {
+                ExprVal sep = GenExpr(e.kids[0]);
+                ExprVal lst = GenExpr(e.kids[1]);
+                usesStrOps = true;
+                string r = NT();
+                L("  " + r + " = call i8* @zstr_join(i8* " + sep.op + ", i8* " + lst.op + ")");
+                return new ExprVal(r, MkType("string"));
+            }
+            if (callee.sval == "Format" && e.kids.Count >= 1 && e.kids[0].kind == AK.StringLit()) {
+                return EmitStrFormat(e);
             }
         }
         // NativeMemory.* -> inline raw-memory intrinsics (no external symbol)
@@ -1975,10 +2180,31 @@ partial class Irgen {
             }
             // evaluate receiver
             ExprVal recv = GenExpr(obj);
+            // scalar ToString: bool -> "true"/"false", numbers via snprintf
+            if (mname == "ToString" && e.kids.Count == 0 && !IsStr(recv.ty)
+                && ClassOf(recv.ty) == null && !IsListType(recv.ty) && !IsDictType(recv.ty) && !IsSbType(recv.ty)) {
+                if (recv.ty.sval == "bool") {
+                    ExprVal ts = GenStr("true");
+                    ExprVal fs = GenStr("false");
+                    string c = NT(); L("  " + c + " = icmp ne i64 " + recv.op + ", 0");
+                    string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
+                    return new ExprVal(r, MkType("string"));
+                }
+                return new ExprVal(ToCStr(recv), MkType("string"));
+            }
+            // builtin in-place List.Reverse wins over the copying extension
+            if (IsListType(recv.ty) && mname == "Reverse" && e.kids.Count == 0) {
+                L("  call void @zlist_reverse(i8* " + recv.op + ")");
+                return new ExprVal("0", MkType("void"));
+            }
             // extension methods: static method with a `this` receiver of recv's type
-            List<string> extOwner = new List<string>();
-            Node extm = binder.FindExtension(recv.ty.sval, mname, extOwner);
-            if (extm != null) { return EmitExtensionCall(recv, extOwner[0], extm, e); }
+            List<Node> extMs = new List<Node>();
+            List<string> extOwners = new List<string>();
+            binder.FindExtensionAll(recv.ty.sval, mname, extMs, extOwners);
+            if (extMs.Count > 0) {
+                int pick = PickExtension(extMs, recv.ty, e);
+                return EmitExtensionCall(recv, extOwners[pick], extMs[pick], e);
+            }
             // string methods
             if (IsStr(recv.ty)) { return EmitStrMethod(recv, mname, e); }
             // list methods
@@ -2170,8 +2396,20 @@ partial class Irgen {
         Node m = ResolveMethod(cls, name, e, true);
         string sym = clsName + "_" + name;
         if (m != null) { sym = MethodSym(clsName, m); }
+        bool spec = false;
+        List<string> stns = new List<string>();
+        List<Node> strs = new List<Node>();
+        if (m != null && CanSpecialize(m)) {
+            List<string> mtps = TParams(m);
+            if (mtps.Count > 0) {
+                BindFromArgs(m, e, 0, mtps, stns, strs);
+                string tag = SpecTag(m, mtps, stns, strs);
+                if (tag != "") { sym = SpecQueue(clsName, m, stns, strs, tag); spec = true; }
+            }
+        }
         string rt = "i64";
         if (m != null) { rt = MapType(m.type); }
+        if (spec) { rt = MapType(SubstTP(m.type, stns, strs)); }
         bool isAsyncCall = (m != null && IsAsync(m));
         if (isAsyncCall) { rt = "i8*"; }
         string args = "";
@@ -2180,6 +2418,7 @@ partial class Irgen {
         int i = 0;
         while (i < aargs.Count) {
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
+            if (spec) { pty = SubstTP(pty, stns, strs); }
             ExprVal av = GenArgExpr(aargs[i], pty);
             if (i == 0 && IsStr(av.ty)) { freeArgIsStr = true; }
             if (i > 0) { args = args + ", "; }
@@ -2225,39 +2464,292 @@ partial class Irgen {
             return new ExprVal(res, m.type);
         }
         if (isAsyncCall) { Node tt = MkType("__task"); tt.a = m.type; return new ExprVal(t, tt); }
+        if (spec) {
+            Node srt = SubstTP(m.type, stns, strs);
+            AddTemp(t, srt);
+            return new ExprVal(t, srt);
+        }
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, m.type); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);
         return new ExprVal(t, retTy);
     }
 
+    // choose the extension overload matching the call's arg count, preferring
+    // receivers whose concrete type arguments match over generic wildcards
+    int PickExtension(List<Node> ms, Node recvTy, Node e) {
+        int best = 0; int bestScore = -1;
+        int i = 0;
+        while (i < ms.Count) {
+            Node m = ms[i];
+            int np = 0;
+            int k = 0;
+            while (k < m.kids.Count) { if (m.kids[k].kind == AK.Param()) { np = np + 1; } k = k + 1; }
+            int score = 0;
+            if (np - 1 == e.kids.Count) { score = 100; }
+            score = score + MatchTypeScore(ParamTypeNode(m, 0), recvTy, TParams(m));
+            score = score + LambdaArgScore(m, recvTy, e);
+            if (score > bestScore) { bestScore = score; best = i; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    // score an extension candidate's lambda arguments: bind the method type
+    // parameters from the receiver, then compare each expression-bodied
+    // lambda's inferred result type against the delegate's return type so
+    // same-name overloads differing only in key type resolve correctly
+    int LambdaArgScore(Node m, Node recvTy, Node e) {
+        List<string> mtps = TParams(m);
+        List<string> tns = new List<string>();
+        List<Node> trs = new List<Node>();
+        UnifyTP(ParamTypeNode(m, 0), recvTy, mtps, tns, trs);
+        int score = 0;
+        int k = 0;
+        while (k < e.kids.Count) {
+            Node arg = e.kids[k];
+            if (arg != null && arg.kind == AK.Lambda() && arg.d == null) {
+                Node pty = SubstTP(ParamTypeNode(m, k + 1), tns, trs);
+                Node dd = null;
+                if (pty != null) { dd = binder.FindDelegate(pty.sval); }
+                if (dd != null) {
+                    List<string> dtn = TParams(dd);
+                    Node drt = SubstTP(dd.type, dtn, DelegTArgs(dd, pty, dtn));
+                    if (drt != null && !MentionsTypeParam(drt)) {
+                        List<Node> dps = DelegParams(pty);
+                        int mark = locName.Count;
+                        int pi = 0; int j = 0;
+                        while (j < arg.kids.Count) {
+                            if (arg.kids[j].kind == AK.Param()) {
+                                Node pt2 = null;
+                                if (pi < dps.Count) { pt2 = dps[pi]; }
+                                locName.Add(arg.kids[j].sval); locType.Add(pt2); locReg.Add("");
+                                pi = pi + 1;
+                            }
+                            j = j + 1;
+                        }
+                        Node lrt = ArgTypeNode(arg.a);
+                        while (locName.Count > mark) {
+                            locName.RemoveAt(locName.Count - 1);
+                            locType.RemoveAt(locType.Count - 1);
+                            locReg.RemoveAt(locReg.Count - 1);
+                        }
+                        if (lrt != null) {
+                            if (TypeTag(lrt) == TypeTag(drt)) { score = score + 8; }
+                            else { score = score - 4; }
+                        }
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        return score;
+    }
+
+    // deep receiver-shape match: concrete equality scores above a
+    // type-parameter wildcard; a mismatch scores zero
+    int MatchTypeScore(Node shape, Node conc, List<string> mtps) {
+        if (shape == null || conc == null) { return 0; }
+        if (IndexOfStr(mtps, shape.sval) >= 0 && shape.kids.Count == 0) { return 1; }
+        if (shape.sval != conc.sval) { return 0; }
+        int s = 2;
+        int i = 0;
+        while (i < shape.kids.Count && i < conc.kids.Count) {
+            s = s + MatchTypeScore(shape.kids[i], conc.kids[i], mtps);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // bind a generic shape (e.g. List<T>) against a concrete type
+    // (List<User>), recording each method type-parameter binding found
+    void UnifyTP(Node shape, Node conc, List<string> mtps, List<string> names, List<Node> reps) {
+        if (shape == null || conc == null) { return; }
+        if (IndexOfStr(mtps, shape.sval) >= 0 && shape.kids.Count == 0) {
+            if (IndexOfStr(names, shape.sval) < 0) { names.Add(shape.sval); reps.Add(conc); }
+            return;
+        }
+        int i = 0;
+        while (i < shape.kids.Count && i < conc.kids.Count) {
+            UnifyTP(shape.kids[i], conc.kids[i], mtps, names, reps);
+            i = i + 1;
+        }
+    }
+
+    Node SubstTP(Node t, List<string> names, List<Node> reps) {
+        if (t == null) { return null; }
+        if (t.kids.Count == 0) {
+            int hit = IndexOfStr(names, t.sval);
+            if (hit >= 0) { return reps[hit]; }
+            return t;
+        }
+        Node n = new Node(t.kind);
+        n.sval = t.sval;
+        int i = 0;
+        while (i < t.kids.Count) { n.Add(SubstTP(t.kids[i], names, reps)); i = i + 1; }
+        return n;
+    }
+
+    // ---- method-level monomorphization ----
+    // deep-clone a method AST substituting its type parameters with the
+    // concrete bindings so the specialized body lowers with concrete types
+    Node CloneSubst(Node n, List<string> tns, List<Node> trs) {
+        if (n == null) { return null; }
+        Node c = new Node(n.kind);
+        c.op = n.op; c.ival = n.ival; c.sval = n.sval; c.sval2 = n.sval2;
+        c.mods = n.mods; c.line = n.line; c.col = n.col;
+        c.type = SubstTP(n.type, tns, trs);
+        c.a = CloneSubst(n.a, tns, trs);
+        c.b = CloneSubst(n.b, tns, trs);
+        c.c = CloneSubst(n.c, tns, trs);
+        c.d = CloneSubst(n.d, tns, trs);
+        int i = 0;
+        while (i < n.kids.Count) { c.Add(CloneSubst(n.kids[i], tns, trs)); i = i + 1; }
+        return c;
+    }
+
+    // "" when the binding is incomplete or still generic; otherwise a tag
+    // encoding both the concrete type arguments and the declared param shapes
+    // (so same-name overloads specialize to distinct symbols)
+    string SpecTag(Node m, List<string> mtps, List<string> tns, List<Node> trs) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < mtps.Count) {
+            int hit = IndexOfStr(tns, mtps[i]);
+            if (hit < 0) { return ""; }
+            if (MentionsTypeParam(trs[hit])) { return ""; }
+            sb.Append("_");
+            sb.Append(TypeTag(trs[hit]));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { sb.Append("_"); sb.Append(TypeTag(p.type)); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // queue (once) a specialized clone of `m` under owner and return the
+    // specialized symbol; the drain loop in Gen emits the bodies
+    string SpecQueue(string owner, Node m, List<string> tns, List<Node> trs, string tag) {
+        string sname = m.sval + "__SP" + tag;
+        string sym = owner + "_" + sname;
+        if (IndexOfStr(specSyms, sym) < 0) {
+            specSyms.Add(sym);
+            Node clone = CloneSubst(m, tns, trs);
+            clone.sval = sname;
+            specMs.Add(clone);
+            specClss.Add(binder.FindType(owner));
+        }
+        return sym;
+    }
+
+    // infer the static type of an expression-bodied lambda's result with its
+    // parameters bound to the delegate's (possibly substituted) param types
+    Node LambdaBodyType(Node lam, List<Node> dps) {
+        int mark = locName.Count;
+        int pi = 0; int j = 0;
+        while (j < lam.kids.Count) {
+            if (lam.kids[j].kind == AK.Param()) {
+                Node pt2 = lam.kids[j].type;
+                if (pt2 == null && pi < dps.Count) { pt2 = dps[pi]; }
+                locName.Add(lam.kids[j].sval); locType.Add(pt2); locReg.Add("");
+                pi = pi + 1;
+            }
+            j = j + 1;
+        }
+        Node lrt = ArgTypeNode(lam.a);
+        while (locName.Count > mark) {
+            locName.RemoveAt(locName.Count - 1);
+            locType.RemoveAt(locType.Count - 1);
+            locReg.RemoveAt(locReg.Count - 1);
+        }
+        return lrt;
+    }
+
+    // extend a receiver-derived binding with bindings inferred from the call
+    // arguments: plain args unify their static type against the declared
+    // param shape; expression-bodied lambdas unify their inferred body type
+    // against the delegate's return shape
+    void BindFromArgs(Node m, Node e, int base0, List<string> mtps, List<string> tns, List<Node> trs) {
+        int k = 0;
+        while (k < e.kids.Count) {
+            Node arg = e.kids[k];
+            Node pty = SubstTP(ParamTypeNode(m, k + base0), tns, trs);
+            if (arg != null && pty != null) {
+                if (arg.kind == AK.Lambda()) {
+                    Node dd = binder.FindDelegate(pty.sval);
+                    if (dd != null && arg.d == null && arg.a != null) {
+                        List<Node> dps = DelegParams(pty);
+                        Node lrt = LambdaBodyType(arg, dps);
+                        List<string> dtn = TParams(dd);
+                        Node drs = SubstTP(dd.type, dtn, DelegTArgs(dd, pty, dtn));
+                        if (lrt != null) { UnifyTP(drs, lrt, mtps, tns, trs); }
+                    }
+                } else {
+                    Node aty = ArgTypeNode(arg);
+                    if (aty != null) { UnifyTP(pty, aty, mtps, tns, trs); }
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    bool CanSpecialize(Node m) {
+        if (m == null || m.d == null) { return false; }
+        if (HasMod(m, MOD.Extern())) { return false; }
+        if (IsAsync(m)) { return false; }
+        return true;
+    }
+
     // extension call: static method invoked as recv.M(args) -> M(recv, args).
+    // The method's own type parameters are bound from the receiver's static
+    // type so lambda arguments and the result see concrete types; the call
+    // ABI itself stays on the declared (erased) parameter types.
     ExprVal EmitExtensionCall(ExprVal recv, string owner, Node m, Node e) {
-        string rt = MapType(m.type);
+        List<string> mtps = TParams(m);
+        List<string> tns = new List<string>();
+        List<Node> trs = new List<Node>();
+        UnifyTP(ParamTypeNode(m, 0), recv.ty, mtps, tns, trs);
+        string sym = MethodSym(owner, m);
+        bool spec = false;
+        if (mtps.Count > 0 && CanSpecialize(m)) {
+            BindFromArgs(m, e, 1, mtps, tns, trs);
+            string tag = SpecTag(m, mtps, tns, trs);
+            if (tag != "") { sym = SpecQueue(owner, m, tns, trs, tag); spec = true; }
+        }
+        Node mrt = m.type;
         Node p0 = ParamTypeNode(m, 0);
+        if (spec) { mrt = SubstTP(m.type, tns, trs); p0 = SubstTP(p0, tns, trs); }
+        string rt = MapType(mrt);
         string args = MapType(p0) + " " + CallArg(recv, p0);
         int i = 0;
         while (i < e.kids.Count) {
             Node pty = ParamTypeNode(m, i + 1);
-            ExprVal av = GenArgExpr(e.kids[i], pty);
+            Node spty = SubstTP(pty, tns, trs);
+            if (spec) { pty = spty; }
+            ExprVal av = GenArgExpr(e.kids[i], spty);
             args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;
         }
         if (rt == "void") {
-            L("  call void @" + MethodSym(owner, m) + "(" + args + ")");
+            L("  call void @" + sym + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + MethodSym(owner, m) + "(" + args + ")");
-        if (IsErasedType(m.type)) { return FromSlot(t, m.type); }
-        AddTemp(t, m.type);
-        return new ExprVal(t, m.type);
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        Node retTy = SubstTP(m.type, tns, trs);
+        if (!spec && IsErasedType(m.type)) { return FromSlot(t, retTy); }
+        AddTemp(t, retTy);
+        return new ExprVal(t, retTy);
     }
 
     ExprVal EmitInstanceCall(ExprVal recv, string clsName, string name, Node e) {
         Node cls = binder.FindType(clsName);
         Node m = ResolveMethodUp(cls, name, e, false);
-        if (m != null && IsPolyClass(cls) && VSlotIndex(cls, name) >= 0) {
+        if (m != null && IsPolyClass(cls) && VSlotIndexM(cls, m) >= 0) {
             return EmitVirtualCall(recv, cls, name, m, e);
         }
         string owner = MethodOwner(cls, name);
@@ -2298,7 +2790,7 @@ partial class Irgen {
 
     ExprVal EmitVirtualCall(ExprVal recv, Node cls, string name, Node m, Node e) {
         string clsName = cls.sval;
-        int slot = VSlotIndex(cls, name);
+        int slot = VSlotIndexM(cls, m);
         string rt = MapType(m.type);
         string vtp = NT();
         L("  " + vtp + " = getelementptr %" + clsName + ", %" + clsName + "* " + recv.op + ", i32 0, i32 0");
@@ -2332,6 +2824,45 @@ partial class Irgen {
         return new ExprVal(t, m.type);
     }
 
+    // literal format string: expand {N} placeholders through a StringBuilder
+    ExprVal EmitStrFormat(Node e) {
+        string sb = NT();
+        L("  " + sb + " = call i8* @zsb_new()");
+        string f = e.kids[0].sval;
+        string seg = "";
+        int i = 0;
+        while (i < f.Length) {
+            bool subst = false;
+            if (f[i] == 123) {
+                int j = i + 1;
+                int idx = 0;
+                bool has = false;
+                while (j < f.Length && f[j] >= 48 && f[j] <= 57) { idx = idx * 10 + (f[j] - 48); j = j + 1; has = true; }
+                if (has && j < f.Length && f[j] == 125 && idx + 1 < e.kids.Count) {
+                    if (seg != "") {
+                        ExprVal sl = GenStr(seg);
+                        L("  call void @zsb_append(i8* " + sb + ", i8* " + sl.op + ")");
+                        seg = "";
+                    }
+                    ExprVal av = GenExpr(e.kids[idx + 1]);
+                    string s = ToCStr(av);
+                    L("  call void @zsb_append(i8* " + sb + ", i8* " + s + ")");
+                    i = j + 1;
+                    subst = true;
+                }
+            }
+            if (!subst) { seg = seg + f.Substring(i, 1); i = i + 1; }
+        }
+        if (seg != "") {
+            ExprVal sl = GenStr(seg);
+            L("  call void @zsb_append(i8* " + sb + ", i8* " + sl.op + ")");
+        }
+        string r = NT();
+        L("  " + r + " = call i8* @zsb_tostring(i8* " + sb + ")");
+        L("  call void @zrelease(i8* " + sb + ")");
+        return new ExprVal(r, MkType("string"));
+    }
+
     ExprVal EmitStrMethod(ExprVal recv, string name, Node e) {
         if (name == "Substring") {
             ExprVal start = GenExpr(e.kids[0]);
@@ -2350,8 +2881,97 @@ partial class Irgen {
             L("  store i8 0, i8* " + endp);
             return new ExprVal(buf, MkType("string"));
         }
+        if (name == "Contains" && e.kids.Count == 1) {
+            ExprVal sub = GenExpr(e.kids[0]);
+            DeclStrstr();
+            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + sub.op + ")");
+            string r = NT(); L("  " + r + " = icmp ne i8* " + hit + ", null");
+            string z = NT(); L("  " + z + " = zext i1 " + r + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "IndexOf" && e.kids.Count == 1) {
+            ExprVal sub = GenExpr(e.kids[0]);
+            DeclStrstr();
+            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + sub.op + ")");
+            string hi = NT(); L("  " + hi + " = ptrtoint i8* " + hit + " to i64");
+            string si = NT(); L("  " + si + " = ptrtoint i8* " + recv.op + " to i64");
+            string diff = NT(); L("  " + diff + " = sub i64 " + hi + ", " + si);
+            string miss = NT(); L("  " + miss + " = icmp eq i8* " + hit + ", null");
+            string r = NT(); L("  " + r + " = select i1 " + miss + ", i64 -1, i64 " + diff);
+            return new ExprVal(r, MkType("int"));
+        }
+        if (name == "LastIndexOf" && e.kids.Count == 1) {
+            ExprVal sub = GenExpr(e.kids[0]);
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i64 @zstr_lastidx(i8* " + recv.op + ", i8* " + sub.op + ")");
+            return new ExprVal(r, MkType("int"));
+        }
+        if ((name == "StartsWith" || name == "EndsWith") && e.kids.Count == 1) {
+            ExprVal p = GenExpr(e.kids[0]);
+            DeclStrncmp();
+            string lp = NT(); L("  " + lp + " = call i64 @strlen(i8* " + p.op + ")");
+            string z = NT();
+            if (name == "StartsWith") {
+                string cmp = NT(); L("  " + cmp + " = call i32 @strncmp(i8* " + recv.op + ", i8* " + p.op + ", i64 " + lp + ")");
+                string r = NT(); L("  " + r + " = icmp eq i32 " + cmp + ", 0");
+                L("  " + z + " = zext i1 " + r + " to i64");
+            } else {
+                string ls = NT(); L("  " + ls + " = call i64 @strlen(i8* " + recv.op + ")");
+                string off = NT(); L("  " + off + " = sub i64 " + ls + ", " + lp);
+                string fits = NT(); L("  " + fits + " = icmp sge i64 " + off + ", 0");
+                string offc = NT(); L("  " + offc + " = select i1 " + fits + ", i64 " + off + ", i64 0");
+                string tail = NT(); L("  " + tail + " = getelementptr i8, i8* " + recv.op + ", i64 " + offc);
+                string cmp = NT(); L("  " + cmp + " = call i32 @strcmp(i8* " + tail + ", i8* " + p.op + ")");
+                string eq = NT(); L("  " + eq + " = icmp eq i32 " + cmp + ", 0");
+                string r = NT(); L("  " + r + " = and i1 " + fits + ", " + eq);
+                L("  " + z + " = zext i1 " + r + " to i64");
+            }
+            return new ExprVal(z, MkType("bool"));
+        }
+        if (name == "Replace" && e.kids.Count == 2) {
+            ExprVal from = GenExpr(e.kids[0]);
+            ExprVal to = GenExpr(e.kids[1]);
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i8* @zstr_replace(i8* " + recv.op + ", i8* " + from.op + ", i8* " + to.op + ")");
+            return new ExprVal(r, MkType("string"));
+        }
+        if (name == "Trim" && e.kids.Count == 0) {
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i8* @zstr_trim(i8* " + recv.op + ")");
+            return new ExprVal(r, MkType("string"));
+        }
+        if ((name == "ToUpper" || name == "ToLower") && e.kids.Count == 0) {
+            usesStrOps = true;
+            string up = "1"; if (name == "ToLower") { up = "0"; }
+            string r = NT(); L("  " + r + " = call i8* @zstr_case(i8* " + recv.op + ", i64 " + up + ")");
+            return new ExprVal(r, MkType("string"));
+        }
+        if (name == "Split" && e.kids.Count == 1) {
+            ExprVal sep = GenExpr(e.kids[0]);
+            usesStrOps = true;
+            string r = NT(); L("  " + r + " = call i8* @zstr_split(i8* " + recv.op + ", i8* " + sep.op + ")");
+            Node lt = MkType("List");
+            lt.kids.Add(MkType("string"));
+            AddTemp(r, lt);
+            return new ExprVal(r, lt);
+        }
+        if (name == "ToString" && e.kids.Count == 0) {
+            // owned copy of the receiver
+            string n = NT(); L("  " + n + " = call i64 @strlen(i8* " + recv.op + ")");
+            string bsz = NT(); L("  " + bsz + " = add i64 " + n + ", 1");
+            string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
+            L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + bsz + ")");
+            return new ExprVal(buf, MkType("string"));
+        }
         // unknown string method: return receiver
         return recv;
+    }
+
+    void DeclStrstr() {
+        if (!ExternSeen("strstr")) { externDecls.Add("strstr"); H("declare i8* @strstr(i8*, i8*)"); }
+    }
+    void DeclStrncmp() {
+        if (!ExternSeen("strncmp")) { externDecls.Add("strncmp"); H("declare i32 @strncmp(i8*, i8*, i64)"); }
     }
 
     ExprVal EmitListMethod(ExprVal recv, string name, Node e) {
@@ -2378,18 +2998,30 @@ partial class Irgen {
         return new ExprVal("0", MkType("int"));
     }
 
+    // dict keys are stored as C strings; scalar keys use their decimal image
+    string DictKeyOp(ExprVal k) {
+        if (IsStr(k.ty)) { return k.op; }
+        return ToCStr(k);
+    }
+
     ExprVal EmitDictMethod(ExprVal recv, string name, Node e) {
         if (name == "Add" || name == "set_Item") {
             ExprVal key = GenExpr(e.kids[0]);
             ExprVal val = GenExpr(e.kids[1]);
             string sv = ToSlot(val, DictVal(recv.ty));
-            L("  call void @zdict_set(i8* " + recv.op + ", i8* " + key.op + ", i64 " + sv + ")");
+            L("  call void @zdict_set(i8* " + recv.op + ", i8* " + DictKeyOp(key) + ", i64 " + sv + ")");
             return new ExprVal("0", MkType("void"));
         }
         if (name == "ContainsKey") {
             ExprVal key = GenExpr(e.kids[0]);
             string t = NT();
-            L("  " + t + " = call i64 @zdict_contains(i8* " + recv.op + ", i8* " + key.op + ")");
+            L("  " + t + " = call i64 @zdict_contains(i8* " + recv.op + ", i8* " + DictKeyOp(key) + ")");
+            return new ExprVal(t, MkType("bool"));
+        }
+        if (name == "Remove") {
+            ExprVal key = GenExpr(e.kids[0]);
+            string t = NT();
+            L("  " + t + " = call i64 @zdict_remove(i8* " + recv.op + ", i8* " + DictKeyOp(key) + ")");
             return new ExprVal(t, MkType("bool"));
         }
         if (name == "get_Count" || name == "Count") {
@@ -2401,9 +3033,22 @@ partial class Irgen {
     }
 
     ExprVal EmitSbMethod(ExprVal recv, string name, Node e) {
+        if (name == "AppendLine") {
+            if (e.kids.Count >= 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string s = a.op;
+                if (!IsStr(a.ty)) { s = ToCStr(a); }
+                L("  call void @zsb_append(i8* " + recv.op + ", i8* " + s + ")");
+            }
+            ExprVal nl = GenStr("\n");
+            L("  call void @zsb_append(i8* " + recv.op + ", i8* " + nl.op + ")");
+            return recv;
+        }
         if (name == "Append") {
             ExprVal a = GenExpr(e.kids[0]);
-            L("  call void @zsb_append(i8* " + recv.op + ", i8* " + a.op + ")");
+            string s = a.op;
+            if (!IsStr(a.ty)) { s = ToCStr(a); }
+            L("  call void @zsb_append(i8* " + recv.op + ", i8* " + s + ")");
             return recv;
         }
         if (name == "ToString") {

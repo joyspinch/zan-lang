@@ -124,21 +124,55 @@ partial class Irgen {
     }
 
     // ---- vtable emission for polymorphic classes ----
+    // Slots are matched by name AND parameter tags so overloaded virtual
+    // methods each get their own slot bound to the right definition symbol.
     void EmitVtable(Node cls) {
-        List<string> slots = new List<string>();
-        CollectVSlots(cls, slots);
-        string s = "@" + cls.sval + "_vtable = global [" + slots.Count + " x i8*] [";
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        string s = "@" + cls.sval + "_vtable = global [" + ms.Count + " x i8*] [";
         int i = 0;
-        while (i < slots.Count) {
-            string sl = slots[i];
-            string impl = ResolveImpl(cls, sl);
-            Node m = FindMethodUp(cls, sl);
+        while (i < ms.Count) {
+            Node sm = ms[i];
+            string tags = ParamTags(sm);
+            string impl = "";
+            Node im = null;
+            Node c = cls;
+            while (c != null) {
+                Node f = FindMethodSig(c, sm.sval, tags);
+                if (f != null && !IsAbstract(f)) { impl = c.sval; im = f; c = null; }
+                else { c = BaseClassOf(c); }
+            }
+            if (im == null) { impl = ResolveImpl(cls, sm.sval); im = FindMethodUp(cls, sm.sval); }
             if (i > 0) { s = s + ", "; }
-            s = s + "i8* bitcast (" + MethodFnTypeThis(m, impl) + " @" + impl + "_" + sl + " to i8*)";
+            s = s + "i8* bitcast (" + MethodFnTypeThis(im, impl) + " @" + MethodSym(impl, im) + " to i8*)";
             i = i + 1;
         }
         s = s + "]";
         H(s);
+    }
+
+    // "_tag1_tag2" parameter-type signature of a method, for overload matching.
+    string ParamTags(Node m) {
+        string s = "";
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTag(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // method declared directly on cls with the given name and parameter tags
+    Node FindMethodSig(Node cls, string name, string tags) {
+        if (cls == null) { return null; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == name && ParamTags(m) == tags) { return m; }
+            i = i + 1;
+        }
+        return null;
     }
 
     Node FindMethodUp(Node cls, string name) {
@@ -177,7 +211,36 @@ partial class Irgen {
     string TypeTag(Node t) {
         if (t == null) { return "v"; }
         if (t.sval == "") { return "v"; }
-        return t.sval;
+        string s = t.sval;
+        int i = 0;
+        while (i < t.kids.Count) { s = s + "." + TypeTag(t.kids[i]); i = i + 1; }
+        return s;
+    }
+
+    // does a type reference mention an unbound generic type parameter?
+    bool MentionsTypeParam(Node t) {
+        if (t == null) { return false; }
+        if (binder.IsTypeParam(t.sval)) { return true; }
+        int i = 0;
+        while (i < t.kids.Count) { if (MentionsTypeParam(t.kids[i])) { return true; } i = i + 1; }
+        return false;
+    }
+
+    // static type of an expression-bodied lambda's result, with its typed
+    // parameters visible (only same-name parameter references are resolved).
+    Node LambdaRetType(Node lam) {
+        if (lam == null || lam.a == null) { return null; }
+        Node b = lam.a;
+        if (b.kind == AK.Ident()) {
+            int i = 0;
+            while (i < lam.kids.Count) {
+                Node p = lam.kids[i];
+                if (p.kind == AK.Param() && p.sval == b.sval) { return p.type; }
+                i = i + 1;
+            }
+            return null;
+        }
+        return ArgTypeNode(b);
     }
 
     // The LLVM symbol for a method. Non-overloaded names stay `Owner_Name`
@@ -256,7 +319,9 @@ partial class Irgen {
         return null;
     }
 
-    string ArgTag(Node e) { Node t = ArgTypeNode(e); if (t == null) { return ""; } return t.sval; }
+    // Full tag (including generic arguments) so e.g. List<int> vs List<double>
+    // overloads score an exact match instead of tying as ambiguous.
+    string ArgTag(Node e) { Node t = ArgTypeNode(e); if (t == null) { return ""; } return TypeTag(t); }
 
     // How well candidate `m` fits the call `e`: +1 for matching the caller's
     // static/instance context, +4 for each exact argument-type match, -1 for a
@@ -267,9 +332,27 @@ partial class Irgen {
         if (IsStatic(m) == wantStatic) { score = score + 1; }
         int a = 0;
         while (a < argc) {
-            string at = ArgTag(e.kids[a]);
+            Node pt = ParamTypeNode(m, a);
+            Node arg = e.kids[a];
+            if (arg.kind == AK.Lambda()) {
+                // score a lambda argument by its result type against the
+                // delegate parameter's declared return type
+                Node dd = null;
+                if (pt != null) { dd = binder.FindDelegate(pt.sval); }
+                if (dd != null) {
+                    Node lrt = LambdaRetType(arg);
+                    if (lrt != null && !MentionsTypeParam(dd.type)) {
+                        if (TypeTag(lrt) == TypeTag(dd.type)) { score = score + 4; }
+                        else { score = score - 1; }
+                    }
+                }
+                a = a + 1;
+                continue;
+            }
+            string at = ArgTag(arg);
             if (at != "") {
-                if (at == TypeTag(ParamTypeNode(m, a))) { score = score + 4; }
+                if (at == TypeTag(pt)) { score = score + 4; }
+                else if (MentionsTypeParam(pt)) { score = score + 2; }
                 else { score = score - 1; }
             }
             a = a + 1;
@@ -358,11 +441,43 @@ partial class Irgen {
         }
     }
 
+    void CollectVSlotNodes(Node cls, List<Node> ms) {
+        if (cls == null) { return; }
+        CollectVSlotNodes(BaseClassOf(cls), ms);
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && IsVSlotIntro(m)) { ms.Add(m); }
+            i = i + 1;
+        }
+    }
+
     int VSlotIndex(Node cls, string name) {
         List<string> slots = new List<string>();
         CollectVSlots(cls, slots);
         int i = 0;
         while (i < slots.Count) { if (slots[i] == name) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // slot index of the specific overload m; falls back to a unique name match
+    int VSlotIndexM(Node cls, Node m) {
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        string tags = ParamTags(m);
+        int i = 0;
+        while (i < ms.Count) {
+            if (ms[i].sval == m.sval && ParamTags(ms[i]) == tags) { return i; }
+            i = i + 1;
+        }
+        int hit = 0 - 1;
+        int n = 0;
+        i = 0;
+        while (i < ms.Count) {
+            if (ms[i].sval == m.sval) { hit = i; n = n + 1; }
+            i = i + 1;
+        }
+        if (n == 1) { return hit; }
         return -1;
     }
 
@@ -418,7 +533,7 @@ partial class Irgen {
         if (ty == null) { ty = init.ty; }
         string lt = MapType(ty);
         string reg = AddLocal(s.sval, ty);
-        L("  " + reg + " = alloca " + lt);
+        EA(reg, lt);
         if (hasInit) {
             if (IsNullableValue(ty)) {
                 L("  store i8* " + BoxFor(init, ty) + ", i8** " + reg);
@@ -581,10 +696,10 @@ partial class Irgen {
         L("  " + list + " = call i8* @zlist_new(i64 " + ow + ")");
         if (!IsListType(coll.ty)) { AddTemp(list, resListTy); return new ExprVal(list, resListTy); }
         string idx = NT();
-        L("  " + idx + " = alloca i64");
+        EA(idx, "i64");
         L("  store i64 0, i64* " + idx);
         string ereg = AddLocal(e.sval, srcElem);
-        L("  " + ereg + " = alloca " + selt);
+        EA(ereg, selt);
         if (ArcManaged(srcElem)) { L("  store " + selt + " null, " + selt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         L("  br label %L" + lc);
@@ -635,10 +750,10 @@ partial class Irgen {
         if (elemTy == null) { elemTy = ListElem(coll.ty); }
         string elt = MapType(elemTy);
         string idx = NT();
-        L("  " + idx + " = alloca i64");
+        EA(idx, "i64");
         L("  store i64 0, i64* " + idx);
         string ereg = AddLocal(s.sval, elemTy);
-        L("  " + ereg + " = alloca " + elt);
+        EA(ereg, elt);
         if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
@@ -694,7 +809,26 @@ partial class Irgen {
             L("  " + t + " = bitcast " + vt + " " + ev + " to i8*");
             ev = t;
         }
+        Node tc = ClassOf(v.ty);
+        if (tc != null) {
+            L("  store i8* bitcast (i8** @__tid_" + tc.sval + " to i8*), i8** @__exc_tid");
+        } else {
+            L("  store i8* null, i8** @__exc_tid");
+        }
         L("  store i8* " + ev + ", i8** @__exc_val");
+        EmitRaise();
+    }
+
+    // pop the innermost handler and longjmp into its try (the exception
+    // object/tid globals already hold the in-flight exception).
+    void EmitRaise() {
+        if (curAsync) {
+            // the longjmp may skip suspended coroutine frames: persist this
+            // frame's locals (the handler reloads them) and release/free the
+            // frames the jump bypasses (stops at the first armed handler).
+            EmitAsyncSaveSlots();
+            L("  call void @__zan_async_unwind(i8* %fp)");
+        }
         string sp = NT();
         L("  " + sp + " = load i64, i64* @__exc_sp");
         string sp1 = NT();
@@ -719,19 +853,29 @@ partial class Irgen {
 
     // try { } catch (T e) { } finally { }  — setjmp/longjmp based
     void GenTry(Node s) {
-        string buf = NT();
-        L("  " + buf + " = alloca [32 x i64]");
-        string bufp = NT();
-        L("  " + bufp + " = bitcast [32 x i64]* " + buf + " to i8*");
-        // push handler
+        // the jmp_buf lives in a global array slot (not a stack alloca): in a
+        // coroutine the resume invocation that armed the handler may have
+        // returned by the time a throw longjmps here, so its stack is dead.
         string sp = NT();
         L("  " + sp + " = load i64, i64* @__exc_sp");
+        string bufe = NT();
+        L("  " + bufe + " = getelementptr [64 x [32 x i64]], [64 x [32 x i64]]* @__exc_bufs, i64 0, i64 " + sp);
+        string bufp = NT();
+        L("  " + bufp + " = bitcast [32 x i64]* " + bufe + " to i8*");
         string slot = NT();
         L("  " + slot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + sp);
         L("  store i8* " + bufp + ", i8** " + slot);
         string sp1 = NT();
         L("  " + sp1 + " = add i64 " + sp + ", 1");
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
+        if (curAsync) {
+            // arm: unwind stops at a frame with hcount > 0 (the handler
+            // resumes inside it); keep the heap frame authoritative across
+            // this try -- a throw crossing a suspension longjmps into a stale
+            // invocation whose stack allocas are garbage.
+            EmitAsyncHcAdd(1);
+            EmitAsyncSaveSlots();
+        }
         // setjmp
         string fp = NT();
         L("  " + fp + " = call i8* @llvm.frameaddress.p0(i32 0)");
@@ -745,37 +889,116 @@ partial class Irgen {
         GenStmt(s.a);
         if (!term) {
             EmitExcPop();
+            if (curAsync) { EmitAsyncHcAdd(-1); }
             if (s.c != null) { GenStmt(s.c); }
             if (!term) { L("  br label %L" + lend); }
         }
         term = false;
         Label(lcatch);
-        // handler already popped by throw; bind catch variable to @__exc_val
+        if (curAsync) {
+            // disarm, then reload frame-resident locals: if the throw crossed
+            // a suspension this invocation's stack allocas are stale -- the
+            // frame (saved at try entry, every suspension and every async
+            // throw) is the authoritative copy.
+            EmitAsyncHcAdd(-1);
+            EmitAsyncReloadSlots();
+        }
+        // handler already popped by throw; dispatch to the first clause whose
+        // type matches the thrown tid (walking the base chain), rethrowing to
+        // the outer handler when no clause matches. A null tid (string/legacy
+        // throw) matches the first clause.
+        int lfin = NL();
         if (s.b != null) {
-            int catchScope = locName.Count;
+            int lrethrow = NL();
+            string tidSlot = NT();
+            L("  " + tidSlot + " = alloca i8*");
             Node cc = s.b;
-            if (cc.sval != "" && cc.type != null) {
-                string exv = NT();
-                L("  " + exv + " = load i8*, i8** @__exc_val");
-                string ct = MapType(cc.type);
-                string reg = AddLocal(cc.sval, cc.type);
-                L("  " + reg + " = alloca " + ct);
-                string cv = exv;
-                if (ct != "i8*") {
-                    string t = NT();
-                    L("  " + t + " = bitcast i8* " + exv + " to " + ct);
-                    cv = t;
+            bool first = true;
+            bool sawAll = false;
+            while (cc != null) {
+                int lbody = NL();
+                int lmiss = lrethrow;
+                if (cc.b != null) { lmiss = NL(); }
+                Node ct = ClassOf(cc.type);
+                if (ct != null && !sawAll) {
+                    string tid0 = NT();
+                    L("  " + tid0 + " = load i8*, i8** @__exc_tid");
+                    if (first) {
+                        int lw = NL();
+                        string zn = NT();
+                        L("  " + zn + " = icmp eq i8* " + tid0 + ", null");
+                        L("  br i1 " + zn + ", label %L" + lbody + ", label %L" + lw);
+                        Label(lw);
+                        string tid1 = NT();
+                        L("  " + tid1 + " = load i8*, i8** @__exc_tid");
+                        tid0 = tid1;
+                    }
+                    L("  store i8* " + tid0 + ", i8** " + tidSlot);
+                    int lloop = NL(); int lcmp = NL(); int lstep = NL();
+                    L("  br label %L" + lloop);
+                    Label(lloop);
+                    string cur = NT();
+                    L("  " + cur + " = load i8*, i8** " + tidSlot);
+                    string cn = NT();
+                    L("  " + cn + " = icmp eq i8* " + cur + ", null");
+                    L("  br i1 " + cn + ", label %L" + lmiss + ", label %L" + lcmp);
+                    Label(lcmp);
+                    string hit = NT();
+                    L("  " + hit + " = icmp eq i8* " + cur + ", bitcast (i8** @__tid_" + ct.sval + " to i8*)");
+                    L("  br i1 " + hit + ", label %L" + lbody + ", label %L" + lstep);
+                    Label(lstep);
+                    string curpp = NT();
+                    L("  " + curpp + " = bitcast i8* " + cur + " to i8**");
+                    string nx = NT();
+                    L("  " + nx + " = load i8*, i8** " + curpp);
+                    L("  store i8* " + nx + ", i8** " + tidSlot);
+                    L("  br label %L" + lloop);
+                } else {
+                    // untyped clause (or unknown type): catches everything
+                    L("  br label %L" + lbody);
+                    sawAll = true;
                 }
-                L("  store " + ct + " " + cv + ", " + ct + "* " + reg);
+                Label(lbody);
+                int catchScope = locName.Count;
+                if (cc.sval != "" && cc.type != null) {
+                    string exv = NT();
+                    L("  " + exv + " = load i8*, i8** @__exc_val");
+                    string cty = MapType(cc.type);
+                    string reg = AddLocal(cc.sval, cc.type);
+                    L("  " + reg + " = alloca " + cty);
+                    string cv = exv;
+                    if (cty != "i8*") {
+                        string t = NT();
+                        L("  " + t + " = bitcast i8* " + exv + " to " + cty);
+                        cv = t;
+                    }
+                    L("  store " + cty + " " + cv + ", " + cty + "* " + reg);
+                }
+                GenStmt(cc.a);
+                if (!term) {
+                    ReleaseLocalsFrom(catchScope);
+                    L("  br label %L" + lfin);
+                }
+                term = false;
+                TrimLocals(catchScope);
+                first = false;
+                if (sawAll) { cc = null; } else { cc = cc.b; }
+                if (cc != null && lmiss != lrethrow) { Label(lmiss); }
             }
-            GenStmt(cc.a);
-            if (!term) { ReleaseLocalsFrom(catchScope); }
-            TrimLocals(catchScope);
+            // no clause matched: re-raise to the next outer handler (this
+            // try's frame was already popped by the throw); note the finally
+            // body is bypassed on this path (mirrors the C host).
+            if (!sawAll) {
+                Label(lrethrow);
+                EmitRaise();
+                term = false;
+            }
+        } else {
+            L("  br label %L" + lfin);
         }
-        if (!term) {
-            if (s.c != null) { GenStmt(s.c); }
-            if (!term) { L("  br label %L" + lend); }
-        }
+        Label(lfin);
+        if (s.c != null) { GenStmt(s.c); }
+        if (!term) { L("  br label %L" + lend); }
         Label(lend);
         term = false;
     }

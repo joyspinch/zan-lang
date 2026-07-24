@@ -8,8 +8,15 @@ partial class Irgen {
     // ===== async / await CPS lowering =====
     // Uniform heap frame is a flat i64 array. Fixed header (all i64):
     //   0=state 1=done 2=awaiter 3=awaiter_step 4=result 5=own_resume
+    //   6=cleanup 7=hcount
     // then (for instance methods) the receiver, then params, then
     // frame-resident locals, then one sub-task slot per await point.
+    // `cleanup` is a void(i8*) fn releasing every owned slot and freeing the
+    // frame; `hcount` counts this frame's armed try handlers. Both drive
+    // @__zan_async_unwind: an exception longjmps straight to its handler,
+    // skipping suspended frames in between, and the unwinder walks the
+    // awaiter chain calling each skipped frame's cleanup, stopping at the
+    // first frame with an armed handler (execution resumes there).
     //
     // Ownership across suspension: the frame owns exactly one +1 reference for
     // every live ARC value it captures. The receiver and ARC params are
@@ -57,6 +64,15 @@ partial class Irgen {
             L("  store i64 " + vi + ", i64* " + p);
             i = i + 1;
         }
+    }
+    // adjust this frame's armed-try-handler count (header slot 7)
+    void EmitAsyncHcAdd(int d) {
+        string p = FrameGep("%ff", 7);
+        string v = NT();
+        L("  " + v + " = load i64, i64* " + p);
+        string v1 = NT();
+        L("  " + v1 + " = add i64 " + v + ", " + d);
+        L("  store i64 " + v1 + ", i64* " + p);
     }
     void EmitAsyncReloadSlots() {
         int i = 0;
@@ -362,6 +378,7 @@ partial class Irgen {
         if (c.a == null || c.a.kind != AK.Ident()) { return false; }
         string cn = c.a.sval; string mn = c.sval;
         if (cn == "Task" && mn == "Delay") { return true; }
+        if (cn == "Gate" && mn == "Park") { return true; }
         if (cn != "Socket") { return false; }
         return mn == "ReadReady" || mn == "WriteReady" || mn == "RecvOv" || mn == "AcceptOv";
     }
@@ -379,6 +396,18 @@ partial class Irgen {
             EmitAsyncSaveSlots();
             L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
             L("  call void @zan_co_delay(i64 " + ms + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
+            L("  ret void");
+            L("resume_" + st + ":");
+            term = false; curLbl = "resume_" + st;
+            EmitAsyncReloadSlots();
+            return new ExprVal("0", MkType("int"));
+        }
+        if (cn == "Gate" && mn == "Park") {
+            // event-driven wait: the frame is re-readied by zan_gate_signal
+            string gh = ArgI64(callExpr.kids[0]);
+            EmitAsyncSaveSlots();
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  call void @zan_gate_park(i64 " + gh + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
@@ -618,7 +647,7 @@ partial class Irgen {
         List<Node> ltypes = new List<Node>();
         if (m.d != null) { PrescanAsyncLocals(m.d, lnames, ltypes); }
         int awaitCount = 0; if (m.d != null) { awaitCount = CountAwaits(m.d); }
-        int header = 6;
+        int header = 8;
         int thisSlot = header;
         int paramBase = header + thisExtra;
         int localBase = paramBase + pn.Count;
@@ -657,6 +686,9 @@ partial class Irgen {
         string orp = FrameGep("%ff", 5);
         string ori = NT(); L("  " + ori + " = ptrtoint void(i8*)* @" + resumeSym + " to i64");
         L("  store i64 " + ori + ", i64* " + orp);
+        string clp = FrameGep("%ff", 6);
+        string cli = NT(); L("  " + cli + " = ptrtoint void(i8*)* @" + sym + "$cleanup to i64");
+        L("  store i64 " + cli + ", i64* " + clp);
         if (!stat) {
             string ti = ToI64("%this", MapType(thisTy));
             L("  store i64 " + ti + ", i64* " + FrameGep("%ff", thisSlot));
@@ -728,6 +760,41 @@ partial class Irgen {
         curAsync = false;
         curAsyncThis = false;
         curAsyncThisTy = null;
+
+        // ---- cleanup: release every owned rc slot from the heap frame and
+        // free it. Called by @__zan_async_unwind when an exception longjmps
+        // past this suspended frame (slots are saved at every suspension and
+        // async throw, so the frame is authoritative).
+        StartFn();
+        L("define internal void @" + sym + "$cleanup(i8* %fp) {");
+        L("entry:");
+        L("  %ff = bitcast i8* %fp to i64*");
+        if (!stat && ArcManaged(thisTy)) {
+            string ctp = FrameGep("%ff", thisSlot);
+            string cti = NT(); L("  " + cti + " = load i64, i64* " + ctp);
+            EmitArcRelease(FromI64(cti, MapType(thisTy)), thisTy);
+        }
+        j = 0;
+        while (j < pn.Count) {
+            if (ArcManaged(pt[j])) {
+                string cpp = FrameGep("%ff", paramBase + j);
+                string cpi = NT(); L("  " + cpi + " = load i64, i64* " + cpp);
+                EmitArcRelease(FromI64(cpi, MapType(pt[j])), pt[j]);
+            }
+            j = j + 1;
+        }
+        j = 0;
+        while (j < lnames.Count) {
+            if (ArcManaged(ltypes[j])) {
+                string clp2 = FrameGep("%ff", localBase + j);
+                string cli2 = NT(); L("  " + cli2 + " = load i64, i64* " + clp2);
+                EmitArcRelease(FromI64(cli2, MapType(ltypes[j])), ltypes[j]);
+            }
+            j = j + 1;
+        }
+        L("  call void @free(i8* %fp)");
+        L("  ret void");
+        L("}");
     }
     // Directory listing + exe-path helpers (Windows host). @zan_dir_list
     // returns the file names matching a glob pattern joined by '\n' (empty
@@ -750,7 +817,49 @@ partial class Irgen {
         H("}");
     }
     void EmitAsyncRuntime() {
+        // Exception unwinder for suspended coroutines: a throw longjmps
+        // straight to its handler, skipping suspended CPS frames in between.
+        // Walk the awaiter chain from the throwing frame calling each frame's
+        // cleanup (releases owned slots + frees the frame), stopping at the
+        // first frame with an armed try handler (hcount > 0) -- the handler
+        // resumes inside it.
+        H("define internal void @__zan_async_unwind(i8* %self) {");
+        H("entry:");
+        H("  %cur.a = alloca i8*");
+        H("  store i8* %self, i8** %cur.a");
+        H("  br label %head");
+        H("head:");
+        H("  %cur = load i8*, i8** %cur.a");
+        H("  %nn = icmp ne i8* %cur, null");
+        H("  br i1 %nn, label %body, label %done");
+        H("body:");
+        H("  %hf = bitcast i8* %cur to i64*");
+        H("  %hcp = getelementptr i64, i64* %hf, i64 7");
+        H("  %hc = load i64, i64* %hcp");
+        H("  %armed = icmp sgt i64 %hc, 0");
+        H("  br i1 %armed, label %done, label %clean");
+        H("clean:");
+        H("  %awp = getelementptr i64, i64* %hf, i64 2");
+        H("  %awi = load i64, i64* %awp");
+        H("  %aw = inttoptr i64 %awi to i8*");
+        H("  %det = icmp eq i8* %aw, %cur");
+        H("  %nxt = select i1 %det, i8* null, i8* %aw");
+        H("  %clp = getelementptr i64, i64* %hf, i64 6");
+        H("  %cli = load i64, i64* %clp");
+        H("  %cl = inttoptr i64 %cli to void(i8*)*");
+        H("  %has = icmp ne void(i8*)* %cl, null");
+        H("  br i1 %has, label %docall, label %next");
+        H("docall:");
+        H("  call void %cl(i8* %cur)");
+        H("  br label %next");
+        H("next:");
+        H("  store i8* %nxt, i8** %cur.a");
+        H("  br label %head");
+        H("done:");
+        H("  ret void");
+        H("}");
         H("declare void @zan_io_wait_co(i64, i32, i8*, void(i8*)*)");
+        H("declare void @zan_gate_park(i64, i8*, void(i8*)*)");
         H("declare void @zan_io_recv_co(i64, i8*, i32, i8*, void(i8*)*, i64*)");
         H("declare void @zan_io_accept_co(i64, i8*, void(i8*)*, i64*)");
         if (hostWin) {
@@ -1022,6 +1131,8 @@ partial class Irgen {
         sig = sig + ") {";
         L(sig);
         L("entry:");
+        StringBuilder obody = body; StringBuilder oea = entryAllocas; bool oact = eaActive;
+        body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
@@ -1039,6 +1150,9 @@ partial class Irgen {
             else { L("  ret " + curRet + " null"); }
         }
         L("}");
+        obody.Append(entryAllocas.ToString());
+        obody.Append(body.ToString());
+        body = obody; entryAllocas = oea; eaActive = oact;
     }
 
     void GenCtor(Node cls, Node m) {
@@ -1063,6 +1177,8 @@ partial class Irgen {
         sig = sig + ") {";
         L(sig);
         L("entry:");
+        StringBuilder obody = body; StringBuilder oea = entryAllocas; bool oact = eaActive;
+        body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
@@ -1072,12 +1188,36 @@ partial class Irgen {
             EmitArcRetain("%p" + j, pt[j]);
             j = j + 1;
         }
+        // chain to the base constructor: `: base(args)` explicitly, or the
+        // parameterless base ctor implicitly (base fields are a layout prefix)
+        Node bcls = BaseClassOf(cls);
+        if (bcls != null) {
+            Node bctor = binder.FindCtor(bcls);
+            if (bctor != null && (m.b != null || CtorParamCount(bctor) == 0)) {
+                string bthis = NT();
+                L("  " + bthis + " = bitcast %" + cls.sval + "* %this to %" + bcls.sval + "*");
+                string bargs = "%" + bcls.sval + "* " + bthis;
+                if (m.b != null) {
+                    int k = 0;
+                    while (k < m.b.kids.Count) {
+                        Node bpty = CtorParamType(bctor, k);
+                        ExprVal av = GenArgExpr(m.b.kids[k], bpty);
+                        bargs = bargs + ", " + MapType(bpty) + " " + CallArg(av, bpty);
+                        k = k + 1;
+                    }
+                }
+                L("  call void @" + bcls.sval + "_ctor(" + bargs + ")");
+            }
+        }
         if (m.d != null) { GenStmt(m.d); }
         if (!term) {
             ReleaseLocalsFrom(0);
             L("  ret void");
         }
         L("}");
+        obody.Append(entryAllocas.ToString());
+        obody.Append(body.ToString());
+        body = obody; entryAllocas = oea; eaActive = oact;
     }
 
     // Emit: if `cond` (an i1) holds, print `msg` and exit(1) -- never falling
@@ -1111,6 +1251,8 @@ partial class Irgen {
         if (owner == "") { return; }
         L("define i32 @main(i32 %argc, i8** %argv) {");
         L("entry:");
+        StringBuilder obody = body; StringBuilder oea = entryAllocas; bool oact = eaActive;
+        body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
         L("  store i32 %argc, i32* @__zan_argc");
         L("  store i8** %argv, i8*** @__zan_argv");
         // Programs emit UTF-8 bytes; switch the Windows console to code page
@@ -1146,5 +1288,8 @@ partial class Irgen {
         L("  call i32 (i8*, ...) @printf(i8* " + mp + ", i8* " + xm + ")");
         L("  ret i32 1");
         L("}");
+        obody.Append(entryAllocas.ToString());
+        obody.Append(body.ToString());
+        body = obody; entryAllocas = oea; eaActive = oact;
     }
 }

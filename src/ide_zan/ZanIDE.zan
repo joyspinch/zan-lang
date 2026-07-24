@@ -1145,42 +1145,16 @@ partial class ZanIDE {
         List<string> aiProfLists = new List<string>();
         int aiProfActive = ZanIDE.AiProfilesLoad(aiProfNames, aiProfBases,
             aiProfKeys, aiProfModels, aiProfLists);
-        SignalInt aiCfgShow = SignalInt.Create(0);
-        SignalInt aiModelsBusy = SignalInt.Create(0);
-        int aiUiProf = aiProfActive;  // profile shown in the config editor
-        bool aiUiLoaded = false;      // inputs already filled for aiUiProf
+        // The unified AI configuration lives in its own child window
+        // (AiSettingsWindow, UiDoc-based like the editor settings).
+        AiSettingsWindow aiWindow = null;
         // Chat model switcher: the dropdown lists the active profile's models
         // (default model first); no selection = the profile's default model.
         SelectBox aiModelSel = SelectBox.Create(ZanIDE.T("Model (default)", "模型（默认）"));
         List<string> aiModelOpts = new List<string>();
         int aiModelSelProf = 0 - 1;
-        Input aiNameIn = Input.Bind(SignalString.Create(""), ZanIDE.T("Profile name", "配置名称"));
-        Input aiBaseIn = Input.Bind(SignalString.Create(""), "https://api.openai.com/v1");
-        Input aiKeyIn = Input.Bind(SignalString.Create(""), "API Key");
-        Input aiModelIn = Input.Bind(SignalString.Create(""), ZanIDE.T("Default model", "默认模型"));
         Button aiCfgBtn = Button.Create(ZanIDE.T("Config", "配置")).SetSize(1);
         Button aiPredictBtn = Button.Create(ZanIDE.T("Continue", "续写")).SetSize(1);
-        Button aiProfPrevBtn = Button.Create("<").SetSize(1);
-        Button aiProfNextBtn = Button.Create(">").SetSize(1);
-        Button aiProfAddBtn = Button.Create(ZanIDE.T("Add", "新增")).SetSize(1);
-        Button aiProfDelBtn = Button.Create(ZanIDE.T("Delete", "删除")).SetSize(1);
-        Button aiProfUseBtn = Button.Primary(ZanIDE.T("Save & enable", "保存并启用")).SetSize(1);
-        Button aiFetchBtn = Button.Create(ZanIDE.T("Fetch models", "获取模型")).SetSize(1);
-        // Official provider presets: one click adds a profile with the
-        // provider's base URL + default model; "Sign up" opens its portal.
-        List<string> aiPreNames = new List<string>();
-        List<string> aiPreBases = new List<string>();
-        List<string> aiPreModels = new List<string>();
-        List<string> aiPreRegs = new List<string>();
-        ZanIDE.AiPresetsInto(aiPreNames, aiPreBases, aiPreModels, aiPreRegs);
-        SelectBox aiPresetSel = SelectBox.Create(ZanIDE.T("Official presets", "官方预设"));
-        int preI = 0;
-        while (preI < aiPreNames.Count) {
-            aiPresetSel.AddOption(aiPreNames[preI]);
-            preI = preI + 1;
-        }
-        Button aiPresetAddBtn = Button.Create(ZanIDE.T("Use preset", "用预设新增")).SetSize(1);
-        Button aiRegBtn = Button.Create(ZanIDE.T("Sign up", "注册")).SetSize(1);
         // Chat sessions: switch / new / clear the transcript context. Inactive
         // sessions are kept serialized in `aiSessions` (\u0002-joined records).
         List<string> aiSessions = new List<string>();
@@ -1263,6 +1237,9 @@ partial class ZanIDE {
                 if (settingsWindow != null && settingsWindow.IsOpen()) {
                     settingsWindow.FollowSkin(lastSkinIdx);
                 }
+                if (aiWindow != null && aiWindow.IsOpen()) {
+                    aiWindow.FollowSkin(lastSkinIdx);
+                }
             }
             // Opacity follow: the appearance drawer sets it on the main
             // window; children inherit it and the value is persisted.
@@ -1271,6 +1248,9 @@ partial class ZanIDE {
                 if (dlg != null) { dlg.SetWindowOpacity(winOpacity); }
                 if (settingsWindow != null && settingsWindow.IsOpen()) {
                     settingsWindow.FollowOpacity(winOpacity);
+                }
+                if (aiWindow != null && aiWindow.IsOpen()) {
+                    aiWindow.FollowOpacity(winOpacity);
                 }
             }
             // One shared event pump drives BOTH the main window and any open
@@ -1283,6 +1263,9 @@ partial class ZanIDE {
             }
             if (!pathPicker.IsOpen() && settingsWindow != null) {
                 if (settingsWindow.NeedsRedraw()) { want = true; }
+            }
+            if (!pathPicker.IsOpen() && aiWindow != null) {
+                if (aiWindow.NeedsRedraw()) { want = true; }
             }
             int r;
             if (want) {
@@ -1350,6 +1333,10 @@ partial class ZanIDE {
                     && settingsWindow.OwnsWindow(evh)) {
                     settingsWindow.ApplyEvent(evh);
                     app.RequestRedraw();
+                } else if (aiWindow != null
+                    && aiWindow.OwnsWindow(evh)) {
+                    aiWindow.ApplyEvent(evh);
+                    app.RequestRedraw();
                 } else if (pathPicker.OwnsWindow(evh)) {
                     pathPicker.ApplyEvent(evh);
                 } else if (!pathPicker.IsOpen()) {
@@ -1372,6 +1359,9 @@ partial class ZanIDE {
                 if (dlg != null) { dlg.ApplyEvent(evh); }
                 if (settingsWindow != null) {
                     settingsWindow.ApplyEvent(evh);
+                }
+                if (aiWindow != null) {
+                    aiWindow.ApplyEvent(evh);
                 }
             }
             // The form designer is bound to .zform tabs (C#-style form files):
@@ -2943,8 +2933,9 @@ partial class ZanIDE {
                     int aiCfgId = aiCfgBtn.Render(app,
                         rBody.x + rPad * 3 + aiSelW + aiSmBtnW, rBody.y + app.Scale(4), aiSmBtnW);
                     if (Button.WasClicked(app, aiCfgId)) {
-                        aiCfgShow.Set(1 - aiCfgShow.Get());
-                        aiUiLoaded = false;
+                        if (aiWindow == null || !aiWindow.IsOpen()) {
+                            aiWindow = AiSettingsWindow.Open(app, ZanIDE.uiLang);
+                        }
                         app.RequestRedraw();
                     }
                     // ---- Session row: switch / new / clear chat contexts ----
@@ -3002,165 +2993,8 @@ partial class ZanIDE {
                     string chatModel = aiProfModels[aiProfActive];
                     int selMi = aiModelSel.Selected();
                     if (selMi >= 0 && selMi < aiModelOpts.Count) { chatModel = aiModelOpts[selMi]; }
-                    // ---- Provider profiles editor (toggled by Config) ----
-                    int aiCfgH = 0;
-                    if (aiCfgShow.Get() == 1) {
-                        int cRowH = app.Scale(28);
-                        int cGap = app.Scale(4);
-                        aiCfgH = cRowH * 7 + cGap * 8;
-                        int cx = rBody.x + rPad;
-                        int cw = rBody.width - rPad * 2;
-                        int cy = rBody.y + aiHdrH + cGap;
-                        c.FillRect(rBody.x, rBody.y + aiHdrH, rBody.width, aiCfgH, t.bgSecondary);
-                        if (aiUiProf < 0 || aiUiProf >= aiProfNames.Count) { aiUiProf = aiProfActive; }
-                        if (!aiUiLoaded) {
-                            aiNameIn.SetText(aiProfNames[aiUiProf]);
-                            aiBaseIn.SetText(aiProfBases[aiUiProf]);
-                            aiKeyIn.SetText(aiProfKeys[aiUiProf]);
-                            aiModelIn.SetText(aiProfModels[aiUiProf]);
-                            aiUiLoaded = true;
-                        }
-                        int navBtnW = app.Scale(26);
-                        int addBtnW = app.Scale(52);
-                        int pPrevId = aiProfPrevBtn.Render(app, cx, cy, navBtnW);
-                        int pNextId = aiProfNextBtn.Render(app, cx + navBtnW + cGap, cy, navBtnW);
-                        string profLbl = Convert.ToString(aiUiProf + 1) + "/"
-                            + Convert.ToString(aiProfNames.Count) + " " + aiProfNames[aiUiProf];
-                        if (aiUiProf == aiProfActive) {
-                            profLbl = profLbl + ZanIDE.T(" (enabled)", "（已启用）");
-                        }
-                        c.DrawText(cx + navBtnW * 2 + cGap * 3, cy + app.Scale(6),
-                            profLbl, t.textPrimary, t.fontSizeSmall);
-                        int pAddId = aiProfAddBtn.Render(app, cx + cw - addBtnW * 2 - cGap, cy, addBtnW);
-                        int pDelId = aiProfDelBtn.Render(app, cx + cw - addBtnW, cy, addBtnW);
-                        if (Button.WasClicked(app, pPrevId) && aiProfNames.Count > 1) {
-                            aiUiProf = aiUiProf - 1;
-                            if (aiUiProf < 0) { aiUiProf = aiProfNames.Count - 1; }
-                            aiUiLoaded = false;
-                            app.RequestRedraw();
-                        }
-                        if (Button.WasClicked(app, pNextId) && aiProfNames.Count > 1) {
-                            aiUiProf = aiUiProf + 1;
-                            if (aiUiProf >= aiProfNames.Count) { aiUiProf = 0; }
-                            aiUiLoaded = false;
-                            app.RequestRedraw();
-                        }
-                        if (Button.WasClicked(app, pAddId)) {
-                            aiProfNames.Add(ZanIDE.T("AI ", "配置 ") + Convert.ToString(aiProfNames.Count + 1));
-                            aiProfBases.Add("https://api.openai.com/v1");
-                            aiProfKeys.Add("");
-                            aiProfModels.Add("");
-                            aiProfLists.Add("");
-                            aiUiProf = aiProfNames.Count - 1;
-                            aiUiLoaded = false;
-                            ZanIDE.AiProfilesSave(aiProfActive, aiProfNames, aiProfBases,
-                                aiProfKeys, aiProfModels, aiProfLists);
-                            app.RequestRedraw();
-                        }
-                        if (Button.WasClicked(app, pDelId) && aiProfNames.Count > 1) {
-                            aiProfNames.RemoveAt(aiUiProf);
-                            aiProfBases.RemoveAt(aiUiProf);
-                            aiProfKeys.RemoveAt(aiUiProf);
-                            aiProfModels.RemoveAt(aiUiProf);
-                            aiProfLists.RemoveAt(aiUiProf);
-                            if (aiProfActive >= aiProfNames.Count) { aiProfActive = 0; }
-                            if (aiUiProf >= aiProfNames.Count) { aiUiProf = aiProfNames.Count - 1; }
-                            aiUiLoaded = false;
-                            aiModelSelProf = 0 - 1;
-                            ZanIDE.AiProfilesSave(aiProfActive, aiProfNames, aiProfBases,
-                                aiProfKeys, aiProfModels, aiProfLists);
-                            app.RequestRedraw();
-                        }
-                        aiNameIn.Render(app, cx, cy + (cRowH + cGap) * 1, cw, cRowH);
-                        aiBaseIn.Render(app, cx, cy + (cRowH + cGap) * 2, cw, cRowH);
-                        aiKeyIn.Render(app, cx, cy + (cRowH + cGap) * 3, cw, cRowH);
-                        aiModelIn.Render(app, cx, cy + (cRowH + cGap) * 4, cw, cRowH);
-                        // Official presets: pick a provider, "Use preset" adds a
-                        // profile with its base/default model, "Sign up" opens
-                        // the provider's key/registration portal.
-                        int preBtnW = app.Scale(84);
-                        int regBtnW = app.Scale(52);
-                        int preSelW = cw - preBtnW - regBtnW - cGap * 2;
-                        int preY = cy + (cRowH + cGap) * 5;
-                        aiPresetSel.Render(app, cx, preY, preSelW);
-                        int preAddId = aiPresetAddBtn.Render(app, cx + preSelW + cGap, preY, preBtnW);
-                        int regId = aiRegBtn.Render(app, cx + preSelW + preBtnW + cGap * 2, preY, regBtnW);
-                        int preSel = aiPresetSel.Selected();
-                        if (preSel < 0) { preSel = 0; }
-                        if (Button.WasClicked(app, preAddId) && preSel < aiPreNames.Count) {
-                            aiProfNames.Add(aiPreNames[preSel]);
-                            aiProfBases.Add(aiPreBases[preSel]);
-                            aiProfKeys.Add("");
-                            aiProfModels.Add(aiPreModels[preSel]);
-                            aiProfLists.Add("");
-                            aiUiProf = aiProfNames.Count - 1;
-                            aiUiLoaded = false;
-                            ZanIDE.AiProfilesSave(aiProfActive, aiProfNames, aiProfBases,
-                                aiProfKeys, aiProfModels, aiProfLists);
-                            log.Add(ZanIDE.T("> AI: added preset ", "> AI：已添加预设 ")
-                                + aiPreNames[preSel]
-                                + ZanIDE.T(" - fill in the API key and Save & enable.",
-                                    " —— 请填入 API 密钥后“保存并启用”。"));
-                            app.RequestRedraw();
-                        }
-                        if (Button.WasClicked(app, regId) && preSel < aiPreRegs.Count) {
-                            ZanIDE.OpenExternal(aiPreRegs[preSel]);
-                        }
-                        int halfW = (cw - cGap) / 2;
-                        int useId = aiProfUseBtn.Render(app, cx, cy + (cRowH + cGap) * 6, halfW);
-                        int fetchId = aiFetchBtn.Render(app, cx + halfW + cGap, cy + (cRowH + cGap) * 6, halfW);
-                        if (Button.WasClicked(app, useId)) {
-                            aiProfNames[aiUiProf] = aiNameIn.GetText();
-                            aiProfBases[aiUiProf] = aiBaseIn.GetText();
-                            aiProfKeys[aiUiProf] = aiKeyIn.GetText();
-                            aiProfModels[aiUiProf] = aiModelIn.GetText();
-                            aiProfActive = aiUiProf;
-                            aiModelSelProf = 0 - 1;
-                            ZanIDE.AiProfilesSave(aiProfActive, aiProfNames, aiProfBases,
-                                aiProfKeys, aiProfModels, aiProfLists);
-                            log.Add(ZanIDE.T("> AI: enabled profile ", "> AI：已启用配置 ")
-                                + aiProfNames[aiUiProf] + ".");
-                            app.RequestRedraw();
-                        }
-                        if (Button.WasClicked(app, fetchId) && aiModelsBusy.Get() == 0) {
-                            string ferr = ZanIDE.AiFetchModels(aiBaseIn.GetText(), aiKeyIn.GetText());
-                            if (ferr != "") {
-                                log.Add("> AI: " + ferr);
-                            } else {
-                                aiModelsBusy.Set(1);
-                                log.Add(ZanIDE.T("> AI: fetching model list...", "> AI：正在获取模型列表..."));
-                            }
-                            app.RequestRedraw();
-                        }
-                    }
-                    // Poll the in-flight /models request.
-                    if (aiModelsBusy.Get() == 1) {
-                        if (File.Exists(ZanIDE.AiModelsDonePath())) {
-                            File.Delete(ZanIDE.AiModelsDonePath());
-                            string gotModels = ZanIDE.AiReadModels();
-                            if (gotModels != "") {
-                                aiProfLists[aiUiProf] = gotModels;
-                                if (aiProfModels[aiUiProf] == "") {
-                                    List<string> gm = ZanIDE.SplitList(gotModels);
-                                    aiProfModels[aiUiProf] = gm[0];
-                                    aiModelIn.SetText(gm[0]);
-                                }
-                                ZanIDE.AiProfilesSave(aiProfActive, aiProfNames, aiProfBases,
-                                    aiProfKeys, aiProfModels, aiProfLists);
-                                aiModelSelProf = 0 - 1;
-                                log.Add(ZanIDE.T("> AI: fetched ", "> AI：已获取 ")
-                                    + Convert.ToString(ZanIDE.SplitList(gotModels).Count)
-                                    + ZanIDE.T(" models.", " 个模型。"));
-                            } else {
-                                log.Add(ZanIDE.T("> AI: could not fetch models (check base URL / key).",
-                                    "> AI：获取模型失败（请检查接口地址和密钥）。"));
-                            }
-                            aiModelsBusy.Set(0);
-                        }
-                        app.RequestRedraw();
-                    }
-                    Rect aiChat = Rect.Create(rBody.x, rBody.y + aiHdrH + aiCfgH,
-                        rBody.width, rBody.height - aiHdrH - aiCfgH);
+                    Rect aiChat = Rect.Create(rBody.x, rBody.y + aiHdrH,
+                        rBody.width, rBody.height - aiHdrH);
                     // Wheel-scroll the transcript (lines up from the bottom).
                     bool ownsAiWheel = app.CaptureWheel(aiChat.x, aiChat.y, aiChat.width, aiChat.height);
                     if (ownsAiWheel) {
@@ -3949,6 +3783,30 @@ partial class ZanIDE {
                 }
                 if (!settingsWindow.IsOpen()) {
                     settingsWindow = null;
+                }
+            }
+
+            if (aiWindow != null) {
+                // Same fixed id baseline trick as the settings window above.
+                int savedSeqA = WidgetId.SeqValue();
+                WidgetId.SetSeq(885000);
+                aiWindow.Render();
+                WidgetId.SetSeq(savedSeqA);
+                if (aiWindow.TakeSaved()) {
+                    // Reload the chat's profile lists from disk so the enabled
+                    // profile / model dropdown follow the dialog immediately.
+                    aiProfNames = new List<string>();
+                    aiProfBases = new List<string>();
+                    aiProfKeys = new List<string>();
+                    aiProfModels = new List<string>();
+                    aiProfLists = new List<string>();
+                    aiProfActive = ZanIDE.AiProfilesLoad(aiProfNames, aiProfBases,
+                        aiProfKeys, aiProfModels, aiProfLists);
+                    aiModelSelProf = 0 - 1;
+                    app.RequestRedraw();
+                }
+                if (!aiWindow.IsOpen()) {
+                    aiWindow = null;
                 }
             }
 

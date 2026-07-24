@@ -678,9 +678,276 @@ static LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
 
+/* ---- Binding<T> lowering --------------------------------------------------
+ * When the assignment target is a Binding<T>-typed field/local and the RHS is
+ * not itself a Binding, the assignment is sugar for constructing a binding:
+ *   comp.prop = user.name;   ->  live binding (Get/Set access User.name)
+ *   comp.prop = <expr>;      ->  const binding storing the evaluated value
+ * The synthesized accessor pair reads/writes the model field with normal ARC
+ * semantics, so the model and the UI observe each other with no extra code. */
+
+static int type_is_binding(zan_type_t *t) {
+    return t && t->kind == TYPE_CLASS && t->name.len == 7 &&
+           memcmp(t->name.str, "Binding", 7) == 0;
+}
+
+/* Static type of an assignment target (NULL when unknown). */
+static zan_type_t *assign_lhs_type(zan_irgen_t *g, zan_ast_node_t *lhs,
+                                   local_scope_t *locals) {
+    if (!lhs) return NULL;
+    if (lhs->kind == AST_IDENTIFIER) {
+        local_var_t *lv = local_find(locals, lhs->ident.name);
+        if (lv) return lv->type;
+        if (g->current_type_sym) {
+            zan_symbol_t *fs = get_field_sym(g->current_type_sym, lhs->ident.name);
+            if (fs) return fs->type;
+        }
+        return NULL;
+    }
+    if (lhs->kind == AST_MEMBER_ACCESS)
+        return member_access_field_type(g, locals, lhs);
+    return NULL;
+}
+
+/* Synthesize (or fetch cached) accessor functions for one class field:
+ *   <T'> __zbind_get_<Class>_<field>(i8* obj)      returns a +1 value
+ *   void __zbind_set_<Class>_<field>(i8* obj, T'v) retains new/releases old */
+static void get_binding_accessors(zan_irgen_t *g, zan_symbol_t *cls,
+        zan_symbol_t *fs, LLVMValueRef *out_get, LLVMValueRef *out_set) {
+    *out_get = NULL;
+    *out_set = NULL;
+    for (int i = 0; i < g->bind_acc_count; i++) {
+        if (g->bind_accs[i].cls == cls && g->bind_accs[i].field == fs) {
+            *out_get = g->bind_accs[i].get_fn;
+            *out_set = g->bind_accs[i].set_fn;
+            return;
+        }
+    }
+    LLVMTypeRef st = get_struct_llvm_type(g, cls);
+    int fi = get_field_index(cls, fs->name);
+    if (!st || fi < 0 || !fs->type) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef vt = map_type(g, fs->type);
+
+    /* remember where we were emitting */
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+
+    char name[512];
+    snprintf(name, sizeof(name), "__zbind_get_%.*s_%.*s",
+             (int)cls->name.len, cls->name.str, (int)fs->name.len, fs->name.str);
+    LLVMTypeRef get_ty = LLVMFunctionType(vt, &i8ptr, 1, 0);
+    LLVMValueRef get_fn = LLVMAddFunction(g->mod, name, get_ty);
+    LLVMSetLinkage(get_fn, LLVMInternalLinkage);
+    {
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, get_fn, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        g->current_fn = get_fn;
+        LLVMValueRef obj = LLVMBuildBitCast(g->builder, LLVMGetParam(get_fn, 0),
+            LLVMPointerType(st, 0), "obj");
+        LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, obj, (unsigned)fi, "fld");
+        LLVMValueRef val = LLVMBuildLoad2(g->builder, vt, fptr, "val");
+        if (is_rc_managed_type(fs->type))
+            emit_rc_retain_for_type(g, fs->type, val);
+        LLVMBuildRet(g->builder, val);
+    }
+
+    snprintf(name, sizeof(name), "__zbind_set_%.*s_%.*s",
+             (int)cls->name.len, cls->name.str, (int)fs->name.len, fs->name.str);
+    LLVMTypeRef set_params[2] = { i8ptr, vt };
+    LLVMTypeRef set_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), set_params, 2, 0);
+    LLVMValueRef set_fn = LLVMAddFunction(g->mod, name, set_ty);
+    LLVMSetLinkage(set_fn, LLVMInternalLinkage);
+    {
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, set_fn, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        g->current_fn = set_fn;
+        LLVMValueRef obj = LLVMBuildBitCast(g->builder, LLVMGetParam(set_fn, 0),
+            LLVMPointerType(st, 0), "obj");
+        LLVMValueRef v = LLVMGetParam(set_fn, 1);
+        LLVMValueRef fptr = LLVMBuildStructGEP2(g->builder, st, obj, (unsigned)fi, "fld");
+        if (is_rc_managed_type(fs->type)) {
+            /* borrowed param: retain incoming, release the previous occupant */
+            LLVMValueRef old = LLVMBuildLoad2(g->builder, vt, fptr, "old");
+            emit_rc_retain_for_type(g, fs->type, v);
+            LLVMBuildStore(g->builder, v, fptr);
+            emit_rc_release_for_type(g, fs->type, old);
+        } else {
+            LLVMBuildStore(g->builder, v, fptr);
+        }
+        LLVMBuildRetVoid(g->builder);
+    }
+
+    g->current_fn = saved_fn;
+    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+
+    if (g->bind_acc_count < 512) {
+        g->bind_accs[g->bind_acc_count].cls = cls;
+        g->bind_accs[g->bind_acc_count].field = fs;
+        g->bind_accs[g->bind_acc_count].get_fn = get_fn;
+        g->bind_accs[g->bind_acc_count].set_fn = set_fn;
+        g->bind_acc_count++;
+    }
+    *out_get = get_fn;
+    *out_set = set_fn;
+}
+
+/* Construct a Binding<T> object for `rhs` (owned +1 result, or NULL when the
+ * lowering does not apply and the caller should emit a plain assignment). */
+static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
+        zan_ast_node_t *rhs, local_scope_t *locals) {
+    zan_symbol_t *bsym = bind_t->sym;
+    if (!bsym) {
+        zan_istr_t bn = { (char *)"Binding", 7 };
+        bsym = zan_binder_lookup(g->binder, bn);
+    }
+    if (!bsym) return NULL;
+    LLVMTypeRef st = get_struct_llvm_type(g, bsym);
+    if (!st) return NULL;
+    zan_istr_t n_target = { (char *)"target", 6 };
+    zan_istr_t n_getter = { (char *)"getter", 6 };
+    zan_istr_t n_setter = { (char *)"setter", 6 };
+    zan_istr_t n_live = { (char *)"live", 4 };
+    zan_istr_t n_const = { (char *)"constVal", 8 };
+    int fi_target = get_field_index(bsym, n_target);
+    int fi_getter = get_field_index(bsym, n_getter);
+    int fi_setter = get_field_index(bsym, n_setter);
+    int fi_live = get_field_index(bsym, n_live);
+    int fi_const = get_field_index(bsym, n_const);
+    if (fi_target < 0 || fi_getter < 0 || fi_setter < 0 ||
+        fi_live < 0 || fi_const < 0) return NULL;
+    zan_type_t *T = bind_t->type_arg_count > 0 ? bind_t->type_args[0] : NULL;
+
+    /* is the RHS a live-bindable field lvalue? */
+    zan_symbol_t *cls = NULL;
+    zan_symbol_t *ffs = NULL;
+    if (rhs && rhs->kind == AST_MEMBER_ACCESS && !rhs->member.null_cond) {
+        cls = expr_class_sym(g, rhs->member.object, locals);
+        if (cls) {
+            ffs = get_field_sym(cls, rhs->member.name);
+            if (ffs && field_member_is_static(ffs)) ffs = NULL;
+            if (ffs && !ffs->type) ffs = NULL;
+            /* only bind live when the field's representation matches T */
+            if (ffs && T && ffs->type->kind != T->kind) ffs = NULL;
+        }
+    }
+    LLVMValueRef get_fn = NULL, set_fn = NULL;
+    if (ffs) {
+        get_binding_accessors(g, cls, ffs, &get_fn, &set_fn);
+        if (!get_fn || !set_fn) ffs = NULL;
+    }
+
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+
+    /* heap-allocate the Binding object (same path as `new Binding<T>()`) */
+    LLVMValueRef site_name = LLVMConstNull(i8ptr);
+    LLVMValueRef site_val = LLVMConstInt(i64, 0, 0);
+    {
+        int site_idx = g->leak_site_count;
+        if (site_idx >= ZAN_MAX_LEAK_SITES) site_idx = ZAN_MAX_LEAK_SITES - 1;
+        else g->leak_site_count++;
+        if (g->site_syms) g->site_syms[site_idx] = bsym;
+        site_val = LLVMConstInt(i64, (unsigned long long)site_idx, 0);
+        if (g->check_leaks) {
+            char site_buf[600];
+            const char *sfile = leak_site_file(g, rhs->loc);
+            snprintf(site_buf, sizeof(site_buf), "%s:%u:%u",
+                     sfile, rhs->loc.line, rhs->loc.col);
+            site_name = LLVMBuildGlobalStringPtr(g->builder, site_buf, "site");
+        }
+    }
+    LLVMTypeRef alloc_fn_type = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i64, i64, i8ptr }, 3, 0);
+    LLVMValueRef alloc_args[] = { LLVMSizeOf(st), site_val, site_name };
+    LLVMValueRef raw = zan_call2(g->builder, alloc_fn_type, g->rt_alloc,
+        alloc_args, 3, "bindobj");
+    LLVMValueRef objp = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(st, 0), "bindp");
+    LLVMBuildStore(g->builder, LLVMConstNull(st), objp);
+
+    LLVMValueRef live_ptr = LLVMBuildStructGEP2(g->builder, st, objp, (unsigned)fi_live, "b.live");
+    LLVMTypeRef live_t = LLVMStructGetTypeAtIndex(st, (unsigned)fi_live);
+
+    if (ffs) {
+        /* live binding: capture the target object and the accessor pair */
+        LLVMValueRef obj_val = emit_expr(g, rhs->member.object, locals);
+        LLVMValueRef tptr = LLVMBuildStructGEP2(g->builder, st, objp, (unsigned)fi_target, "b.tgt");
+        LLVMTypeRef tgt_t = LLVMStructGetTypeAtIndex(st, (unsigned)fi_target);
+        LLVMValueRef obj_cast = obj_val;
+        if (LLVMTypeOf(obj_cast) != tgt_t &&
+            LLVMGetTypeKind(LLVMTypeOf(obj_cast)) == LLVMPointerTypeKind)
+            obj_cast = LLVMBuildBitCast(g->builder, obj_cast, tgt_t, "b.tgt.bc");
+        /* non-owning target reference (like a weak field): the binding must
+         * not keep the model alive, or model<->component graphs would leak */
+        LLVMBuildStore(g->builder, obj_cast, tptr);
+        {
+            /* an owned temp (e.g. `f().name`) is still released normally */
+            zan_type_t *ot = infer_expr_type(g, rhs->member.object, locals);
+            if (ot && is_rc_managed_type(ot) &&
+                expr_yields_owned_rc_value(g, rhs->member.object, locals))
+                emit_rc_release_for_type(g, ot, obj_val);
+        }
+
+        LLVMValueRef gptr = LLVMBuildStructGEP2(g->builder, st, objp, (unsigned)fi_getter, "b.get");
+        LLVMTypeRef gslot_t = LLVMStructGetTypeAtIndex(st, (unsigned)fi_getter);
+        LLVMBuildStore(g->builder,
+            LLVMBuildBitCast(g->builder, get_fn, gslot_t, "b.get.bc"), gptr);
+        LLVMValueRef sptr = LLVMBuildStructGEP2(g->builder, st, objp, (unsigned)fi_setter, "b.set");
+        LLVMTypeRef sslot_t = LLVMStructGetTypeAtIndex(st, (unsigned)fi_setter);
+        LLVMBuildStore(g->builder,
+            LLVMBuildBitCast(g->builder, set_fn, sslot_t, "b.set.bc"), sptr);
+        LLVMBuildStore(g->builder, LLVMConstInt(live_t, 1, 0), live_ptr);
+    } else {
+        /* const binding: evaluate the RHS once and store it */
+        LLVMValueRef v = emit_expr(g, rhs, locals);
+        LLVMValueRef cptr = LLVMBuildStructGEP2(g->builder, st, objp, (unsigned)fi_const, "b.cv");
+        LLVMTypeRef cslot_t = LLVMStructGetTypeAtIndex(st, (unsigned)fi_const);
+        LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(v));
+        if (LLVMGetTypeKind(cslot_t) == LLVMIntegerTypeKind &&
+            vk == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(LLVMTypeOf(v)) != LLVMGetIntTypeWidth(cslot_t)) {
+            v = coerce_int_to(g, v, cslot_t);
+        } else if (vk == LLVMPointerTypeKind &&
+                   LLVMGetTypeKind(cslot_t) == LLVMPointerTypeKind &&
+                   LLVMTypeOf(v) != cslot_t) {
+            v = LLVMBuildBitCast(g->builder, v, cslot_t, "b.cv.bc");
+        }
+        if (T && is_rc_managed_type(T) &&
+            !expr_yields_owned_rc_value(g, rhs, locals))
+            emit_rc_retain_for_type(g, T, v);
+        LLVMBuildStore(g->builder, v, cptr);
+        LLVMBuildStore(g->builder, LLVMConstInt(live_t, 0, 0), live_ptr);
+    }
+    return LLVMBuildBitCast(g->builder, objp, i8ptr, "bindv");
+}
+
 static LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
-        LLVMValueRef right = emit_expr(g, expr->binary.right, locals);
+        LLVMValueRef right;
+        {
+            zan_type_t *lt = assign_lhs_type(g, expr->binary.left, locals);
+            if (type_is_binding(lt) &&
+                !type_is_binding(infer_expr_type(g, expr->binary.right, locals))) {
+                LLVMValueRef bv = emit_binding_value(g, lt, expr->binary.right, locals);
+                if (bv) {
+                    /* the binding object is freshly owned (+1): swap in a
+                     * dummy `new` node so the store paths below treat it as
+                     * an owned value (no extra retain). */
+                    zan_ast_node_t *dummy = zan_ast_new(g->arena, AST_NEW_EXPR,
+                        expr->binary.right->loc);
+                    zan_ast_node_t *clone = zan_ast_new(g->arena, AST_ASSIGNMENT,
+                        expr->loc);
+                    clone->binary.op = expr->binary.op;
+                    clone->binary.left = expr->binary.left;
+                    clone->binary.right = dummy;
+                    expr = clone;
+                    right = bv;
+                    goto binding_lowered;
+                }
+            }
+            right = emit_expr(g, expr->binary.right, locals);
+        }
+binding_lowered:
         if (expr->binary.left->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
             if (local && local_owns_arc(local)) {

@@ -1,0 +1,453 @@
+using System;
+using System.IO;
+using System.Json;
+using Gui;
+
+/// @component AI settings window
+/// The unified AI configuration window (UiDoc + WindowShell, same scheme as
+/// EditorSettingsWindow): the saved provider profiles as a selectable list,
+/// editable fields, add/delete, official presets, model-list fetching and a
+/// default-model picker. Persists to ai_profiles.json via ZanIDE.AiProfilesSave.
+class AiSettingsWindow {
+    App host;
+    UiDoc ui;
+    JsonValue model;
+    bool open;
+    bool saved;
+    int lang;
+
+    List<string> names;
+    List<string> bases;
+    List<string> keys;
+    List<string> models;
+    List<string> lists;
+    int active;
+    int sel;
+
+    List<string> preNames;
+    List<string> preBases;
+    List<string> preModels;
+    List<string> preRegs;
+
+    bool fetchBusy;
+
+    static bool done;
+    static bool add;
+    static bool del;
+    static bool save;
+    static bool enable;
+    static bool fetch;
+    static bool preAdd;
+    static bool reg;
+    static bool pick;
+
+    static string T(int lang, string en, string zh) {
+        if (lang == 1) { return zh; }
+        return en;
+    }
+
+    static string JsonEsc(string s) {
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") { outp = outp + "\\\\"; }
+            else if (ch == "\"") { outp = outp + "\\\""; }
+            else { outp = outp + ch; }
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    static void OnDone() { AiSettingsWindow.done = true; }
+    static void OnAdd() { AiSettingsWindow.add = true; }
+    static void OnDel() { AiSettingsWindow.del = true; }
+    static void OnSave() { AiSettingsWindow.save = true; }
+    static void OnEnable() { AiSettingsWindow.enable = true; }
+    static void OnFetch() { AiSettingsWindow.fetch = true; }
+    static void OnPreAdd() { AiSettingsWindow.preAdd = true; }
+    static void OnReg() { AiSettingsWindow.reg = true; }
+    static void OnPick() { AiSettingsWindow.pick = true; }
+
+    /// `a|b|c` options text for a Select from a string list.
+    static string OptionsText(List<string> xs) {
+        string s = "";
+        int i = 0;
+        while (i < xs.Count) {
+            if (i > 0) { s = s + "|"; }
+            s = s + xs[i];
+            i = i + 1;
+        }
+        return s;
+    }
+
+    string DocJson() {
+        string s = "{ \"type\":\"WindowShell\", \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(
+                lang, "AI Settings", "AI 配置"))
+            + "\", \"onClose\":\"done\", \"children\":[";
+        s = s + "{ \"type\":\"Column\", \"dock\":\"fill\", \"pad\":18, \"gap\":8, \"children\":[";
+        // Saved profiles as a selectable list; the enabled one is marked.
+        s = s + "{ \"type\":\"Label\", \"variant\":2, \"dock\":\"top\", \"height\":20, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(
+                lang, "Configurations", "配置列表")) + "\" },";
+        int i = 0;
+        while (i < names.Count) {
+            string label = names[i];
+            if (i == active) {
+                label = label + AiSettingsWindow.T(lang, "  (enabled)", "（已启用）");
+            }
+            s = s + "{ \"type\":\"Segment\", \"index\":" + Convert.ToString(i)
+                + ", \"label\":\"" + AiSettingsWindow.JsonEsc(label)
+                + "\", \"dock\":\"top\", \"height\":30, \"bind\":\"sel\" },";
+            i = i + 1;
+        }
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":34, \"gap\":8, \"children\":[";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"add\", \"dock\":\"left\", \"width\":110, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Add", "新增")) + "\" },";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"preAdd\", \"dock\":\"left\", \"width\":130, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Add preset", "用预设新增")) + "\" },";
+        s = s + "{ \"type\":\"Select\", \"dock\":\"left\", \"width\":150, \"bind\":\"preset\", \"options\":[";
+        int p = 0;
+        while (p < preNames.Count) {
+            if (p > 0) { s = s + ","; }
+            s = s + "\"" + AiSettingsWindow.JsonEsc(preNames[p]) + "\"";
+            p = p + 1;
+        }
+        s = s + "] },";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"reg\", \"dock\":\"left\", \"width\":80, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Sign up", "注册")) + "\" },";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"del\", \"dock\":\"right\", \"width\":80, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Delete", "删除")) + "\" } ] },";
+        // Editable fields of the selected profile.
+        s = s + "{ \"type\":\"Label\", \"dock\":\"top\", \"height\":16, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Name", "名称")) + "\" },";
+        s = s + "{ \"type\":\"Input\", \"dock\":\"top\", \"height\":30, \"bind\":\"name\" },";
+        s = s + "{ \"type\":\"Label\", \"dock\":\"top\", \"height\":16, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(
+                lang, "Endpoint (OpenAI-compatible, /v1)", "接口地址（兼容 OpenAI，/v1）")) + "\" },";
+        s = s + "{ \"type\":\"Input\", \"dock\":\"top\", \"height\":30, \"bind\":\"base\", \"hint\":\"https://api.openai.com/v1\" },";
+        s = s + "{ \"type\":\"Label\", \"dock\":\"top\", \"height\":16, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "API Key / Token", "API 密钥 / Token")) + "\" },";
+        s = s + "{ \"type\":\"Input\", \"dock\":\"top\", \"height\":30, \"bind\":\"key\", \"hint\":\"sk-...\" },";
+        s = s + "{ \"type\":\"Label\", \"dock\":\"top\", \"height\":16, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Default model", "默认模型")) + "\" },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":30, \"gap\":8, \"children\":[";
+        s = s + "{ \"type\":\"Input\", \"dock\":\"fill\", \"bind\":\"model\", \"hint\":\"gpt-4o-mini\" },";
+        List<string> mopts = ZanIDE.SplitList(lists[SelClamped()]);
+        if (mopts.Count > 0) {
+            s = s + "{ \"type\":\"Select\", \"dock\":\"right\", \"width\":200, \"bind\":\"picksel\", \"onChange\":\"pick\", \"hint\":\""
+                + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Pick a model", "选择模型")) + "\", \"options\":[";
+            int m = 0;
+            while (m < mopts.Count) {
+                if (m > 0) { s = s + ","; }
+                s = s + "\"" + AiSettingsWindow.JsonEsc(mopts[m]) + "\"";
+                m = m + 1;
+            }
+            s = s + "] },";
+        }
+        string fetchLbl = AiSettingsWindow.T(lang, "Fetch models", "获取模型");
+        if (fetchBusy) { fetchLbl = AiSettingsWindow.T(lang, "Fetching...", "获取中..."); }
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"fetch\", \"dock\":\"right\", \"width\":110, \"text\":\""
+            + AiSettingsWindow.JsonEsc(fetchLbl) + "\" } ] },";
+        // Status line + actions.
+        s = s + "{ \"type\":\"Label\", \"dock\":\"top\", \"height\":18, \"bind\":{\"path\":\"status\",\"prop\":\"text\"} },";
+        s = s + "{ \"type\":\"Row\", \"dock\":\"top\", \"height\":40, \"gap\":10, \"children\":[";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"save\", \"dock\":\"left\", \"width\":110, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Save", "保存")) + "\" },";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"enable\", \"dock\":\"left\", \"width\":150, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Save & enable", "保存并启用")) + "\" },";
+        s = s + "{ \"type\":\"Button\", \"onClick\":\"done\", \"dock\":\"right\", \"width\":110, \"text\":\""
+            + AiSettingsWindow.JsonEsc(AiSettingsWindow.T(lang, "Done", "完成")) + "\" } ] }";
+        s = s + "] }] }";
+        return s;
+    }
+
+    int SelClamped() {
+        if (sel < 0 || sel >= names.Count) { return 0; }
+        return sel;
+    }
+
+    void BuildUi() {
+        ui = UiDoc.FromJson(DocJson()).Bind(model);
+        ui.Handle("done", AiSettingsWindow.OnDone);
+        ui.Handle("add", AiSettingsWindow.OnAdd);
+        ui.Handle("del", AiSettingsWindow.OnDel);
+        ui.Handle("save", AiSettingsWindow.OnSave);
+        ui.Handle("enable", AiSettingsWindow.OnEnable);
+        ui.Handle("fetch", AiSettingsWindow.OnFetch);
+        ui.Handle("preAdd", AiSettingsWindow.OnPreAdd);
+        ui.Handle("reg", AiSettingsWindow.OnReg);
+        ui.Handle("pick", AiSettingsWindow.OnPick);
+        ui.Wire();
+    }
+
+    /// Pushes the selected profile's fields into the bound model (state -> UI).
+    void LoadFields() {
+        int i = SelClamped();
+        model.Set("name", JsonValue.NewStr(names[i]));
+        model.Set("base", JsonValue.NewStr(bases[i]));
+        model.Set("key", JsonValue.NewStr(keys[i]));
+        model.Set("model", JsonValue.NewStr(models[i]));
+        model.Set("picksel", JsonValue.NewNum("0"));
+    }
+
+    /// Reads the bound inputs back into the selected profile (UI -> lists).
+    void CommitFields() {
+        int i = SelClamped();
+        names[i] = model.PathGet("name").AsString(names[i]);
+        bases[i] = model.PathGet("base").AsString(bases[i]);
+        keys[i] = model.PathGet("key").AsString(keys[i]);
+        models[i] = model.PathGet("model").AsString(models[i]);
+    }
+
+    void Persist() {
+        ZanIDE.AiProfilesSave(active, names, bases, keys, models, lists);
+        saved = true;
+    }
+
+    void SetStatus(string text) {
+        model.Set("status", JsonValue.NewStr(text));
+    }
+
+    static AiSettingsWindow Open(App parent, int uiLang) {
+        AiSettingsWindow w = new AiSettingsWindow();
+        w.lang = uiLang;
+        w.open = true;
+        w.saved = false;
+        w.fetchBusy = false;
+        AiSettingsWindow.done = false;
+        AiSettingsWindow.add = false;
+        AiSettingsWindow.del = false;
+        AiSettingsWindow.save = false;
+        AiSettingsWindow.enable = false;
+        AiSettingsWindow.fetch = false;
+        AiSettingsWindow.preAdd = false;
+        AiSettingsWindow.reg = false;
+        AiSettingsWindow.pick = false;
+        w.names = new List<string>();
+        w.bases = new List<string>();
+        w.keys = new List<string>();
+        w.models = new List<string>();
+        w.lists = new List<string>();
+        w.active = ZanIDE.AiProfilesLoad(w.names, w.bases, w.keys, w.models, w.lists);
+        w.sel = w.active;
+        w.preNames = new List<string>();
+        w.preBases = new List<string>();
+        w.preModels = new List<string>();
+        w.preRegs = new List<string>();
+        ZanIDE.AiPresetsInto(w.preNames, w.preBases, w.preModels, w.preRegs);
+        w.model = JsonValue.NewObject();
+        w.model.Set("sel", JsonValue.NewNum(Convert.ToString(w.sel)));
+        w.model.Set("preset", JsonValue.NewNum("0"));
+        w.model.Set("status", JsonValue.NewStr(""));
+        w.LoadFields();
+        w.BuildUi();
+        w.host = App.CreateDark(
+            AiSettingsWindow.T(uiLang, "AI Settings", "AI 配置"), 560, 720);
+        w.host.ApplySkin(parent.ThemeMenuIndex());
+        w.host.Show();
+        w.host.SetWindowOpacity(parent.WindowOpacity());
+        return w;
+    }
+
+    void FollowSkin(int i) {
+        if (!open) { return; }
+        host.ApplySkin(i);
+        host.RequestRedraw();
+    }
+
+    void FollowOpacity(int percent) {
+        if (!open) { return; }
+        host.SetWindowOpacity(percent);
+    }
+
+    bool IsOpen() { return open; }
+
+    bool OwnsWindow(int hwnd) {
+        return open && hwnd == host.WindowHandle();
+    }
+
+    bool NeedsRedraw() {
+        return open && (host.needsRedraw || fetchBusy);
+    }
+
+    void ApplyEvent(int hwnd) {
+        if (!this.OwnsWindow(hwnd)) { return; }
+        if (host.window.EventKind() == 8) {
+            open = false;
+            return;
+        }
+        host.ApplyEvent(hwnd);
+    }
+
+    /// Rebuilds the document (profile rows / model options changed) keeping
+    /// the bound state.
+    void Rebuild() {
+        this.BuildUi();
+        host.RequestRedraw();
+    }
+
+    int PresetIndex() {
+        int p = model.PathGet("preset").AsInt(0);
+        if (p < 0 || p >= preNames.Count) { p = 0; }
+        return p;
+    }
+
+    void Render() {
+        if (!this.NeedsRedraw()) { return; }
+        host.BeginFrame();
+        ui.RenderInto(host, 0, 0, host.canvas.Width(), host.canvas.Height());
+        host.PresentFrame();
+
+        // Selecting another profile in the list: keep edits in memory, then
+        // load the newly selected profile into the inputs.
+        int nextSel = model.PathGet("sel").AsInt(sel);
+        if (nextSel != sel && nextSel >= 0 && nextSel < names.Count) {
+            this.CommitFields();
+            sel = nextSel;
+            this.LoadFields();
+            this.Rebuild();
+        }
+
+        if (AiSettingsWindow.add) {
+            AiSettingsWindow.add = false;
+            this.CommitFields();
+            names.Add(AiSettingsWindow.T(lang, "AI ", "配置 ")
+                + Convert.ToString(names.Count + 1));
+            bases.Add("https://api.openai.com/v1");
+            keys.Add("");
+            models.Add("");
+            lists.Add("");
+            sel = names.Count - 1;
+            model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
+            this.LoadFields();
+            this.Persist();
+            this.Rebuild();
+        }
+        if (AiSettingsWindow.preAdd) {
+            AiSettingsWindow.preAdd = false;
+            int p = PresetIndex();
+            this.CommitFields();
+            names.Add(preNames[p]);
+            bases.Add(preBases[p]);
+            keys.Add("");
+            models.Add(preModels[p]);
+            lists.Add("");
+            sel = names.Count - 1;
+            model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
+            this.LoadFields();
+            this.Persist();
+            this.SetStatus(AiSettingsWindow.T(
+                lang, "Preset added - fill in the API key and Save & enable.",
+                "已添加预设——请填入 API 密钥后“保存并启用”。"));
+            this.Rebuild();
+        }
+        if (AiSettingsWindow.reg) {
+            AiSettingsWindow.reg = false;
+            ZanIDE.OpenExternal(preRegs[PresetIndex()]);
+        }
+        if (AiSettingsWindow.del) {
+            AiSettingsWindow.del = false;
+            if (names.Count > 1) {
+                int i = SelClamped();
+                names.RemoveAt(i);
+                bases.RemoveAt(i);
+                keys.RemoveAt(i);
+                models.RemoveAt(i);
+                lists.RemoveAt(i);
+                if (active >= names.Count) { active = 0; }
+                if (sel >= names.Count) { sel = names.Count - 1; }
+                model.Set("sel", JsonValue.NewNum(Convert.ToString(sel)));
+                this.LoadFields();
+                this.Persist();
+                this.Rebuild();
+            } else {
+                this.SetStatus(AiSettingsWindow.T(
+                    lang, "At least one configuration is required.",
+                    "至少保留一个配置。"));
+                host.RequestRedraw();
+            }
+        }
+        if (AiSettingsWindow.save || AiSettingsWindow.enable) {
+            bool en = AiSettingsWindow.enable;
+            AiSettingsWindow.save = false;
+            AiSettingsWindow.enable = false;
+            this.CommitFields();
+            if (en) { active = SelClamped(); }
+            this.Persist();
+            if (en) {
+                this.SetStatus(AiSettingsWindow.T(lang, "Saved and enabled ", "已保存并启用 ")
+                    + names[SelClamped()]);
+            } else {
+                this.SetStatus(AiSettingsWindow.T(lang, "Saved.", "已保存。"));
+            }
+            this.Rebuild();
+        }
+        if (AiSettingsWindow.pick) {
+            AiSettingsWindow.pick = false;
+            List<string> mopts = ZanIDE.SplitList(lists[SelClamped()]);
+            int mi = model.PathGet("picksel").AsInt(0);
+            if (mi >= 0 && mi < mopts.Count) {
+                model.Set("model", JsonValue.NewStr(mopts[mi]));
+                host.RequestRedraw();
+            }
+        }
+        if (AiSettingsWindow.fetch && !fetchBusy) {
+            AiSettingsWindow.fetch = false;
+            this.CommitFields();
+            int i = SelClamped();
+            string ferr = ZanIDE.AiFetchModels(bases[i], keys[i]);
+            if (ferr != "") {
+                this.SetStatus(ferr);
+            } else {
+                fetchBusy = true;
+                this.SetStatus(AiSettingsWindow.T(
+                    lang, "Fetching model list...", "正在获取模型列表..."));
+            }
+            this.Rebuild();
+        }
+        AiSettingsWindow.fetch = false;
+        if (fetchBusy) {
+            if (File.Exists(ZanIDE.AiModelsDonePath())) {
+                File.Delete(ZanIDE.AiModelsDonePath());
+                fetchBusy = false;
+                string gotModels = ZanIDE.AiReadModels();
+                int i = SelClamped();
+                if (gotModels != "") {
+                    lists[i] = gotModels;
+                    List<string> gm = ZanIDE.SplitList(gotModels);
+                    if (models[i] == "") {
+                        models[i] = gm[0];
+                        model.Set("model", JsonValue.NewStr(gm[0]));
+                    }
+                    this.Persist();
+                    this.SetStatus(AiSettingsWindow.T(lang, "Fetched ", "已获取 ")
+                        + Convert.ToString(gm.Count)
+                        + AiSettingsWindow.T(lang, " models.", " 个模型。"));
+                } else {
+                    this.SetStatus(AiSettingsWindow.T(
+                        lang, "Could not fetch models (check base URL / key).",
+                        "获取模型失败（请检查接口地址和密钥）。"));
+                }
+                this.Rebuild();
+            }
+            host.RequestRedraw();
+        }
+        if (AiSettingsWindow.done) {
+            AiSettingsWindow.done = false;
+            this.CommitFields();
+            this.Persist();
+            open = false;
+            host.window.Close();
+        }
+    }
+
+    int Active() { return active; }
+
+    bool TakeSaved() {
+        bool v = saved;
+        saved = false;
+        return v;
+    }
+}

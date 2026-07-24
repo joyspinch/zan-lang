@@ -192,6 +192,17 @@ struct zan_irgen {
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
     bool         check_leaks;     /* emit a leak report at program exit */
 
+    /* Binding<T> lowering: synthesized per-(class,field) accessor functions
+     * (see emit_binding_value in irgen_expr.c), cached so each field pair is
+     * emitted once per module. */
+    struct {
+        zan_symbol_t *cls;
+        zan_symbol_t *field;
+        LLVMValueRef get_fn;
+        LLVMValueRef set_fn;
+    } bind_accs[512];
+    int bind_acc_count;
+
     /* vtable registry (for virtual dispatch) */
     struct {
         zan_symbol_t *type_sym;
