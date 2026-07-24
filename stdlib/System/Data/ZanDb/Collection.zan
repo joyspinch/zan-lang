@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Json;
 using System.Text;
 using System.Threading;
@@ -90,9 +91,8 @@ class Collection {
     // Object keys repeat in every document, so storing them verbatim wastes
     // space proportional to collection size. Each collection keeps a
     // persistent field-name dictionary; on disk object keys are 1-based
-    // dictionary ids (a few digits) instead of the full name. Encoded bodies
-    // carry a "K" prefix; legacy plain-JSON bodies (starting with '{') are
-    // still decoded as-is.
+    // dictionary ids, and document bodies are a compact binary record with
+    // typed varint-encoded values (not JSON text) -- see EncodeDoc/DecodeDoc.
 
     void LoadKeyDict() {
         this.keyDict = new List<string>();
@@ -135,72 +135,177 @@ class Collection {
         this.keyDictDirty = false;
     }
 
-    void WriteEnc(StringBuilder sb, JsonValue v) {
-        if (v.IsObject()) {
-            sb.Append("{");
-            int i = 0;
-            while (i < v.Count()) {
-                if (i > 0) { sb.Append(","); }
-                sb.Append("\"");
-                sb.Append(Convert.ToString(KeyId(v.KeyAt(i))));
-                sb.Append("\":");
-                WriteEnc(sb, v.ValAt(i));
-                i = i + 1;
+    // Binary record value tags: 0 null, 1 false, 2 true, 3 int (zigzag
+    // varint), 4 number-as-text (non-integer), 5 string, 6 array, 7 object.
+    static bool IsIntStr(string s) {
+        int n = s.Length;
+        if (n == 0) { return false; }
+        int i = 0;
+        if ((s[0] & 255) == 45) { i = 1; if (n == 1) { return false; } }
+        if (n - i > 18) { return false; }   // keep within zigzag varint range
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    static int ZigZag(int v) { return (v << 1) ^ (v >> 63); }
+    static int UnZig(int z) { return (z >> 1) ^ (-(z & 1)); }
+
+    void WriteVal(ByteBuffer b, JsonValue v) {
+        if (v.IsNull()) { b.WriteU8(0); return; }
+        if (v.IsBool()) {
+            if (v.AsBool(false)) { b.WriteU8(2); } else { b.WriteU8(1); }
+            return;
+        }
+        if (v.IsNumber()) {
+            string raw = v.AsString("");
+            if (Collection.IsIntStr(raw)) {
+                b.WriteU8(3);
+                b.WriteVarInt(Collection.ZigZag(Convert.ToInt(raw)));
+            } else {
+                b.WriteU8(4);
+                b.WriteString(raw);
             }
-            sb.Append("}");
+            return;
+        }
+        if (v.IsString()) {
+            b.WriteU8(5);
+            b.WriteString(v.AsString(""));
             return;
         }
         if (v.IsArray()) {
-            sb.Append("[");
+            b.WriteU8(6);
+            b.WriteVarInt(v.Count());
             int i = 0;
-            while (i < v.Count()) {
-                if (i > 0) { sb.Append(","); }
-                WriteEnc(sb, v.At(i));
-                i = i + 1;
-            }
-            sb.Append("]");
+            while (i < v.Count()) { WriteVal(b, v.At(i)); i = i + 1; }
             return;
         }
-        v.WriteTo(sb);
+        b.WriteU8(7);
+        b.WriteVarInt(v.Count());
+        int i = 0;
+        while (i < v.Count()) {
+            b.WriteVarInt(KeyId(v.KeyAt(i)));
+            WriteVal(b, v.ValAt(i));
+            i = i + 1;
+        }
     }
 
-    /// <summary>Serializes a document with dictionary-id keys. Must run inside
-    /// a kv transaction: new field names are persisted alongside the body.</summary>
+    /// <summary>Serializes a document into a compact binary record: a 'B'
+    /// format byte, then the top-level object's fields (dictionary-id key +
+    /// typed value). The redundant "_id" is omitted -- it is the row key and is
+    /// re-attached on read. Must run inside a kv transaction: new field names
+    /// are persisted alongside the body.</summary>
     string EncodeDoc(JsonValue doc) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("K");
-        WriteEnc(sb, doc);
+        ByteBuffer b = ByteBuffer.Alloc(64);
+        b.WriteU8(66);   // 'B'
+        int n = 0;
+        int i = 0;
+        while (i < doc.Count()) {
+            if (doc.KeyAt(i) != "_id") { n = n + 1; }
+            i = i + 1;
+        }
+        b.WriteVarInt(n);
+        i = 0;
+        while (i < doc.Count()) {
+            string k = doc.KeyAt(i);
+            if (k != "_id") {
+                b.WriteVarInt(KeyId(k));
+                WriteVal(b, doc.ValAt(i));
+            }
+            i = i + 1;
+        }
         PersistKeyDict();
-        return sb.ToString();
+        // Escape to a NUL-free byte stream. The runtime string type (and
+        // NativeMemory.GetString, used by both ToStr and the B+Tree's own
+        // ReadString) stops at the first 0x00, so a raw record -- which
+        // routinely contains 0x00 bytes (e.g. the integer 0, an empty string,
+        // a zero count) -- cannot survive a string round-trip. 0xFF is the
+        // escape: 0x00 -> FF 01, 0xFF -> FF 02; all other bytes pass through.
+        ByteBuffer e = ByteBuffer.Alloc(b.Length() + 8);
+        b.SeekRead(0);
+        while (b.Remaining() > 0) {
+            int by = b.ReadU8();
+            if (by == 0) { e.WriteU8(255); e.WriteU8(1); }
+            else if (by == 255) { e.WriteU8(255); e.WriteU8(2); }
+            else { e.WriteU8(by); }
+        }
+        string s = e.ToStr();
+        b.Free();
+        e.Free();
+        return s;
     }
 
-    JsonValue RemapDecode(JsonValue v) {
-        if (v.IsObject()) {
-            JsonValue o = JsonValue.NewObject();
-            int i = 0;
-            while (i < v.Count()) {
-                o.Set(KeyName(Convert.ToInt(v.KeyAt(i))), RemapDecode(v.ValAt(i)));
-                i = i + 1;
-            }
-            return o;
-        }
-        if (v.IsArray()) {
+    JsonValue ReadVal(ByteBuffer b) {
+        int tag = b.ReadU8();
+        if (tag == 0) { return JsonValue.NewNull(); }
+        if (tag == 1) { return JsonValue.NewBool(false); }
+        if (tag == 2) { return JsonValue.NewBool(true); }
+        if (tag == 3) { return JsonValue.NewNum(Convert.ToString(Collection.UnZig(b.ReadVarInt()))); }
+        if (tag == 4) { return JsonValue.NewNum(b.ReadString()); }
+        if (tag == 5) { return JsonValue.NewStr(b.ReadString()); }
+        if (tag == 6) {
             JsonValue a = JsonValue.NewArray();
+            int c = b.ReadVarInt();
             int i = 0;
-            while (i < v.Count()) {
-                a.Append(RemapDecode(v.At(i)));
-                i = i + 1;
-            }
+            while (i < c) { a.Append(ReadVal(b)); i = i + 1; }
             return a;
         }
-        return v;
+        JsonValue o = JsonValue.NewObject();
+        int c = b.ReadVarInt();
+        int i = 0;
+        while (i < c) {
+            int kid = b.ReadVarInt();
+            o.Set(KeyName(kid), ReadVal(b));
+            i = i + 1;
+        }
+        return o;
     }
 
-    JsonValue DecodeDoc(string body) {
-        if (body.Length > 0 && (body[0] & 255) == 75) {
-            return RemapDecode(JsonValue.ParseLenient(body.Substring(1, body.Length - 1)));
+    static string IdFromKey(string key) {
+        int p = -1;
+        int i = key.Length - 1;
+        while (i >= 0) {
+            if ((key[i] & 255) == 58) { p = i; break; }   // ':'
+            i = i - 1;
         }
-        return JsonValue.ParseLenient(body);
+        string suf = key.Substring(p + 1, key.Length - p - 1);
+        return Convert.ToString(Convert.ToInt(suf));
+    }
+
+    /// <summary>Decodes a binary record body (see EncodeDoc) back into a
+    /// JsonValue object. "_id" is not stored in the body; callers attach it
+    /// from the row key.</summary>
+    JsonValue DecodeDoc(string body) {
+        // Reverse the NUL-free escaping applied by EncodeDoc.
+        ByteBuffer e = ByteBuffer.FromStr(body);
+        ByteBuffer b = ByteBuffer.Alloc(body.Length + 4);
+        e.SeekRead(0);
+        while (e.Remaining() > 0) {
+            int by = e.ReadU8();
+            if (by == 255) {
+                int nx = e.ReadU8();
+                if (nx == 1) { b.WriteU8(0); } else { b.WriteU8(255); }
+            } else {
+                b.WriteU8(by);
+            }
+        }
+        e.Free();
+        b.SeekRead(0);
+        int fmt = b.ReadU8();   // 'B' = 66
+        JsonValue o = JsonValue.NewObject();
+        int n = b.ReadVarInt();
+        int i = 0;
+        while (i < n) {
+            int kid = b.ReadVarInt();
+            JsonValue v = ReadVal(b);
+            o.Set(KeyName(kid), v);
+            i = i + 1;
+        }
+        b.Free();
+        return o;
     }
 
     void AddIndexEntries(int id, JsonValue doc) {
@@ -270,7 +375,9 @@ class Collection {
     JsonValue FindById(int id) {
         string body = this.kv.Get(DocKey(id));
         if (body.Length == 0) { return null; }
-        return DecodeDoc(body);
+        JsonValue doc = DecodeDoc(body);
+        doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+        return doc;
     }
 
     bool Exists(int id) { return this.kv.Contains(DocKey(id)); }
@@ -400,7 +507,9 @@ class Collection {
         int i = 0;
         while (i < vs.Count) {
             if (ks[i].Length > 2 && ks[i].Substring(0, 2) == "c:") {
-                docs.Add(DecodeDoc(vs[i]));
+                JsonValue doc = DecodeDoc(vs[i]);
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(ks[i])));
+                docs.Add(doc);
             }
             i = i + 1;
         }
