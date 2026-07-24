@@ -9,25 +9,26 @@ using System.Text;
 
 namespace System.Net;
 
-/// <summary>Invoked when a client connection is established.</summary>
-delegate void ConnectionHandler(Connection conn);
+/// <summary>Invoked when a client connection is established. Async so the
+/// handler can await I/O (Db/Redis/etc.) without blocking the event loop.</summary>
+async delegate void ConnectionHandler(Connection conn);
 
 /// <summary>Invoked for every complete inbound message on a TCP or WebSocket
 /// connection. The returned string (when non-empty) is sent back to the peer
-/// as the reply; return "" to send nothing.</summary>
-delegate string MessageHandler(Connection conn, string data);
+/// as the reply; return "" to send nothing. Async: may await I/O.</summary>
+async delegate string MessageHandler(Connection conn, string data);
 
 /// <summary>Invoked after a connection is closed (peer disconnect or
-/// conn.Close()).</summary>
-delegate void ConnectionCloseHandler(Connection conn);
+/// conn.Close()). Async: may await I/O.</summary>
+async delegate void ConnectionCloseHandler(Connection conn);
 
 /// <summary>Invoked per UDP datagram. The returned string (when non-empty) is
-/// sent back to the datagram's sender; return "" to send nothing.</summary>
-delegate string DatagramHandler(string data);
+/// sent back to the datagram's sender; return "" to send nothing. Async.</summary>
+async delegate string DatagramHandler(string data);
 
 /// <summary>Invoked when an SSE subscriber completes its handshake. The
-/// application keeps the SseConnection and pushes events through it.</summary>
-delegate void SseSubscriberHandler(SseConnection conn);
+/// application keeps the SseConnection and pushes events through it. Async.</summary>
+async delegate void SseSubscriberHandler(SseConnection conn);
 
 /// <summary>
 /// Workerman-style multi-protocol server: one Worker per listen address,
@@ -925,7 +926,7 @@ class Worker {
     async void HandleTcp(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         Connection conn = NewConnection(clientSock);
-        if (this.onConnect != null) { this.onConnect(conn); }
+        if (this.onConnect != null) { await this.onConnect(conn); }
 
         bool active = true;
         while (active && !conn.closed) {
@@ -936,7 +937,7 @@ class Worker {
                 BumpStat();
                 string response = "";
                 if (this.onMessage != null) {
-                    response = this.onMessage(conn, data);
+                    response = await this.onMessage(conn, data);
                 } else {
                     response = data;   // default: echo
                 }
@@ -948,7 +949,7 @@ class Worker {
         client.Close();
         conn.closed = true;
         this.connectionCount = this.connectionCount - 1;
-        if (this.onClose != null) { this.onClose(conn); }
+        if (this.onClose != null) { await this.onClose(conn); }
     }
 
     // ---- http ----
@@ -1013,7 +1014,7 @@ class Worker {
 
             HttpResponse response = null;
             if (this.onHttpRequest != null) {
-                response = this.onHttpRequest(request);
+                response = await this.onHttpRequest(request);
             } else {
                 response = HttpResponse.Ok("<h1>Zan Worker - " + this.name + "</h1>");
             }
@@ -1048,7 +1049,7 @@ class Worker {
         int _hs = await client.SendAsync(sb.ToString());
 
         Connection conn = NewConnection(clientSock);
-        if (this.onConnect != null) { this.onConnect(conn); }
+        if (this.onConnect != null) { await this.onConnect(conn); }
 
         // Reassemble whole frames via WsReader (handles partial and coalesced
         // frames), rather than assuming one recv == one frame.
@@ -1073,7 +1074,7 @@ class Worker {
                 BumpStat();
                 string response = "";
                 if (this.onMessage != null) {
-                    response = this.onMessage(conn, frame.payload);
+                    response = await this.onMessage(conn, frame.payload);
                 } else {
                     response = frame.payload;   // default: echo
                 }
@@ -1101,7 +1102,7 @@ class Worker {
         client.Close();
         conn.closed = true;
         this.connectionCount = this.connectionCount - 1;
-        if (this.onClose != null) { this.onClose(conn); }
+        if (this.onClose != null) { await this.onClose(conn); }
     }
 
     // ---- sse ----
@@ -1134,7 +1135,7 @@ class Worker {
         BumpStat();
         SseConnection sse = SseConnection.Of(client, path);
         if (this.onSseSubscriber != null) {
-            this.onSseSubscriber(sse);
+            await this.onSseSubscriber(sse);
         } else {
             sse.Close();
         }
@@ -1161,7 +1162,7 @@ class Worker {
                 int peerPort = Socket.PeerPort();
                 string response = "";
                 if (this.onUdpMessage != null) {
-                    response = this.onUdpMessage(data);
+                    response = await this.onUdpMessage(data);
                 } else {
                     response = data;   // default: echo
                 }
