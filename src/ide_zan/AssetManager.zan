@@ -466,76 +466,98 @@ class AssetManager {
         Directory.Delete(path);
     }
 
-    /// Renders the modal manager. Returns 0 open, 1 close,
-    /// 2 = caller should open a file picker (import file),
-    /// 3 = caller should open a folder picker (import folder).
+    /// Renders the manager. Returns 0 open, 1 close,
+    /// 2 = caller should open a file picker (import file, copied into assets/),
+    /// 3 = caller should open a folder picker (import folder, recursive),
+    /// 4 = caller should open a file picker (link a resource in place).
     int Render(App app, string root, List<string> log) {
+        // Rendered into its OWN top-level child window (App.CreateDark): fills the
+        // client area below the title-bar chrome. No scrim / hit-blocking -- the
+        // OS routes events, so nothing can fall through to the main window.
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int W = c.Width();
-        int H = c.Height();
-        c.FillRect(0, 0, W, H, t.overlay);
-        app.BlockHitsBelow();
-
-        int w = app.Scale(880);
-        int h = app.Scale(620);
-        if (w > W - app.Scale(20)) { w = W - app.Scale(20); }
-        if (h > H - app.Scale(20)) { h = H - app.Scale(20); }
-        int x = (W - w) / 2;
-        int y = (H - h) / 2;
-        c.FillRoundRect(x + 2, y + 3, w, h, app.Scale(6), t.shadowColor);
-        Panel.FillSurface(app, x, y, w, h, t.bgPrimary);
+        int top = app.ContentTop();
+        int x = 0;
+        int y = top;
+        int w = c.Width();
+        int h = c.Height() - top;
 
         int pad = app.Scale(16);
-        c.DrawText(x + pad, y + pad, T("Asset Manager", "资源管理器"), t.textPrimary, t.fontSizeLarge);
         string crumb = "assets/";
         if (this.curRel.Length > 0) { crumb = crumb + this.curRel; }
         c.DrawText(x + pad, y + pad + app.Scale(24), crumb, t.textSecondary, t.fontSizeSmall);
-        c.FillRect(x + 1, y + app.Scale(58), w - 2, 1, t.divider);
 
         int action = 0;
         string ad = this.curDir(root);
         Directory.CreateDirectoryRecursive(root + "/assets");
 
-        // ---- toolbar ----
-        int bY = y + app.Scale(66);
-        int bW = app.Scale(108);
+        // ---- toolbar (two rows so controls never overflow the window) ----
+        // Row 1: navigation/import actions (left) + publish strategy (right).
+        // Row 2: the new-folder input + create button.
+        // One control height (ctlH) and GetAutoWidth for every button so labels
+        // stay aligned on a shared baseline and never ellipsize.
+        int ctlH = t.heightSmall;
+        int gap = app.Scale(8);
+        int bY = y + app.Scale(60);
+        int bY2 = bY + ctlH + app.Scale(10);
         int bX = x + pad;
-        int impId = Button.Primary(T("Import file...", "导入文件...")).SetSize(1).Render(app, bX, bY, bW);
-        bX = bX + bW + app.Scale(8);
-        int impDirId = Button.Primary(T("Import folder...", "导入文件夹...")).SetSize(1).Render(app, bX, bY, bW);
-        bX = bX + bW + app.Scale(8);
-        int upW = app.Scale(64);
-        int upId = Button.Create(T("Up", "上级")).SetSize(1).Render(app, bX, bY, upW);
-        bX = bX + upW + app.Scale(16);
-        int nfW = app.Scale(140);
-        this.folderIn.Render(app, bX, bY - app.Scale(2), nfW, app.Scale(26));
-        bX = bX + nfW + app.Scale(6);
-        int mkW = app.Scale(96);
-        int mkId = Button.Create(T("New folder", "新建文件夹")).SetSize(1).Render(app, bX, bY, mkW);
 
-        // Publish packing toggle: encrypted .zrp vs plain copied files.
+        Button impBtn = Button.Primary(T("Import file", "导入文件")).SetSize(1);
+        int impW = impBtn.GetAutoWidth(t);
+        int impId = impBtn.Render(app, bX, bY, impW);
+        bX = bX + impW + gap;
+
+        Button impDirBtn = Button.Primary(T("Import folder", "导入文件夹")).SetSize(1);
+        int impDirW = impDirBtn.GetAutoWidth(t);
+        int impDirId = impDirBtn.Render(app, bX, bY, impDirW);
+        bX = bX + impDirW + gap;
+
+        Button lnkBtn = Button.Create(T("Link file", "链接文件")).SetSize(1);
+        int lnkW = lnkBtn.GetAutoWidth(t);
+        int lnkId = lnkBtn.Render(app, bX, bY, lnkW);
+        bX = bX + lnkW + gap;
+
+        Button upBtn = Button.Create(T("Up", "上级")).SetSize(1);
+        int upW = upBtn.GetAutoWidth(t);
+        int upId = upBtn.Render(app, bX, bY, upW);
+
+        // Row 2: new-folder input + create button, then the publish-strategy
+        // toggle. All left-anchored with accumulated x so nothing depends on the
+        // canvas width (which differs across child windows) and never overflows.
+        int bX2 = x + pad;
+        int nfW = app.Scale(200);
+        this.folderIn.Render(app, bX2, bY2, nfW, ctlH);
+        bX2 = bX2 + nfW + gap;
+
+        Button mkBtn = Button.Create(T("New folder", "新建文件夹")).SetSize(1);
+        int mkW = mkBtn.GetAutoWidth(t);
+        int mkId = mkBtn.Render(app, bX2, bY2, mkW);
+        bX2 = bX2 + mkW + app.Scale(24);
+
+        // Publish strategy toggle: embed (encrypted .zrp) vs plain copied files.
+        // This is the single "embed vs copy" choice for all bundled assets.
         bool packOn = AssetManager.PackEnabled(root);
-        int pkW = app.Scale(170);
-        int pkX = x + w - pad - pkW;
-        string pkLabel = T("Publish: plain copy", "发布：原样复制");
-        if (packOn) { pkLabel = T("Publish: encrypted .zrp", "发布：加密 .zrp"); }
-        int pkId = 0;
-        if (packOn) {
-            pkId = Button.Primary(pkLabel).SetSize(1).Render(app, pkX, bY, pkW);
-        } else {
-            pkId = Button.Create(pkLabel).SetSize(1).Render(app, pkX, bY, pkW);
-        }
+        string pkLabel = T("Publish: copy files", "发布：复制文件");
+        if (packOn) { pkLabel = T("Publish: embed (encrypted)", "发布：嵌入(加密)"); }
+        Button pkBtn = Button.Create(pkLabel).SetSize(1);
+        if (packOn) { pkBtn = Button.Primary(pkLabel).SetSize(1); }
+        int pkW = pkBtn.GetAutoWidth(t);
+        int pkId = pkBtn.Render(app, bX2, bY2, pkW);
 
         // ---- listing (left) ----
         List<string> dirs = Directory.GetDirectories(ad);
         List<string> files = Directory.GetFiles(ad);
-        int total = dirs.Count + files.Count;
+        // Linked (referenced-in-place) resources are project-global, so they are
+        // listed only at the assets root as a third segment after dirs+files.
+        List<string> lnks = new List<string>();
+        if (this.curRel == "") { lnks = ZanIDE.ProjLinks(root); }
+        int dfCount = dirs.Count + files.Count;
+        int total = dfCount + lnks.Count;
         int listX = x + pad;
-        int listY = y + app.Scale(104);
+        int listY = bY2 + ctlH + app.Scale(16);
         int listW = w - pad - pad - app.Scale(310);
         int rowH = app.Scale(28);
-        int maxRows = (h - app.Scale(104) - app.Scale(64)) / rowH;
+        int maxRows = (h - (listY - y) - app.Scale(64)) / rowH;
         if (this.scroll > total - maxRows) { this.scroll = total - maxRows; }
         if (this.scroll < 0) { this.scroll = 0; }
         if (this.selIdx >= total) { this.selIdx = -1; }
@@ -557,8 +579,11 @@ class AssetManager {
             int idx = this.scroll + r;
             int ry = listY + r * rowH;
             bool isDir = idx < dirs.Count;
+            bool isLink = idx >= dfCount;
             string nm = "";
-            if (isDir) { nm = dirs[idx]; } else { nm = files[idx - dirs.Count]; }
+            if (isDir) { nm = dirs[idx]; }
+            else if (isLink) { nm = Path.GetFileName(lnks[idx - dfCount]); }
+            else { nm = files[idx - dirs.Count]; }
             int rowBg = t.bgSecondary;
             if (idx == this.selIdx) { rowBg = t.bgTertiary; }
             c.FillRoundRect(listX, ry, listW, rowH - app.Scale(4), app.Scale(4), rowBg);
@@ -566,6 +591,13 @@ class AssetManager {
                 c.DrawText(listX + app.Scale(8), ry + app.Scale(5), "[" + T("DIR", "目录") + "]",
                     t.warning, t.fontSizeTiny);
                 c.DrawText(listX + app.Scale(52), ry + app.Scale(5), nm, t.textPrimary, t.fontSizeSmall);
+            } else if (isLink) {
+                string tag = T("LINK", "链接");
+                int tagW = Canvas.MeasureText(tag, t.fontSizeTiny) + app.Scale(10);
+                c.DrawRect(listX + app.Scale(6), ry + app.Scale(4), tagW,
+                    rowH - app.Scale(12), t.borderPrimary, 1);
+                c.DrawText(listX + app.Scale(11), ry + app.Scale(6), tag, t.textTertiary, t.fontSizeTiny);
+                c.DrawText(listX + app.Scale(12) + tagW, ry + app.Scale(5), nm, t.textPrimary, t.fontSizeSmall);
             } else {
                 int ty = typeOf(nm);
                 string tag = typeLabel(ty);
@@ -612,7 +644,7 @@ class AssetManager {
         int dX = x + w - pad - app.Scale(290);
         int dW = app.Scale(290);
         int dY = listY;
-        c.FillRoundRect(dX, dY, dW, h - app.Scale(104) - app.Scale(64), app.Scale(5), t.bgSecondary);
+        c.FillRoundRect(dX, dY, dW, h - (listY - y) - app.Scale(64), app.Scale(5), t.bgSecondary);
         int inPad = app.Scale(10);
         int cy = dY + inPad;
         int delId = -1;
@@ -621,14 +653,25 @@ class AssetManager {
         int loopBtnId = -1;
         bool selValid = this.selIdx >= 0 && this.selIdx < total;
         bool selIsDir = selValid && this.selIdx < dirs.Count;
+        bool selIsLink = selValid && this.selIdx >= dfCount;
         string selName = "";
+        string selLinkPath = "";
         if (selValid) {
             if (selIsDir) { selName = dirs[this.selIdx]; }
+            else if (selIsLink) {
+                selLinkPath = lnks[this.selIdx - dfCount];
+                selName = Path.GetFileName(selLinkPath);
+            }
             else { selName = files[this.selIdx - dirs.Count]; }
             c.DrawText(dX + inPad, cy, selName, t.textPrimary, t.fontSizeMedium);
             cy = cy + app.Scale(22);
             if (selIsDir) {
                 c.DrawText(dX + inPad, cy, T("Folder", "文件夹"), t.textSecondary, t.fontSizeSmall);
+            } else if (selIsLink) {
+                c.DrawText(dX + inPad, cy, T("Linked resource (referenced in place)", "链接资源（引用原位置）"),
+                    t.textSecondary, t.fontSizeSmall);
+                cy = cy + app.Scale(18);
+                c.DrawText(dX + inPad, cy, selLinkPath, t.textTertiary, t.fontSizeTiny);
             } else {
                 int ty = typeOf(selName);
                 c.DrawText(dX + inPad, cy, typeLabel(ty) + "  "
@@ -637,24 +680,27 @@ class AssetManager {
             }
             cy = cy + app.Scale(26);
 
-            // rename
-            if (this.renameFor != selName) {
-                this.renameIn.SetText(selName);
-                this.renameFor = selName;
+            // rename (files/folders only; links have no on-disk name here)
+            if (!selIsLink) {
+                if (this.renameFor != selName) {
+                    this.renameIn.SetText(selName);
+                    this.renameFor = selName;
+                }
+                this.renameIn.Render(app, dX + inPad, cy, dW - inPad - inPad - app.Scale(66), app.Scale(26));
+                renApplyId = Button.Create(T("Rename", "重命名")).SetSize(1)
+                    .Render(app, dX + dW - inPad - app.Scale(62), cy, app.Scale(62));
+                cy = cy + app.Scale(34);
             }
-            this.renameIn.Render(app, dX + inPad, cy, dW - inPad - inPad - app.Scale(66), app.Scale(26));
-            renApplyId = Button.Create(T("Rename", "重命名")).SetSize(1)
-                .Render(app, dX + dW - inPad - app.Scale(62), cy, app.Scale(62));
-            cy = cy + app.Scale(34);
 
             string delLabel = T("Delete", "删除");
+            if (selIsLink) { delLabel = T("Remove link", "移除链接"); }
             if (this.confirmDel) { delLabel = T("Confirm delete", "确认删除"); }
             delId = Button.Create(delLabel).SetSize(1).SetColor(t.error)
                 .Render(app, dX + inPad, cy, app.Scale(110));
             cy = cy + app.Scale(38);
 
             // anim clip editor for image files
-            if (!selIsDir && typeOf(selName) == 0) {
+            if (!selIsDir && !selIsLink && typeOf(selName) == 0) {
                 c.FillRect(dX + inPad, cy, dW - inPad - inPad, 1, t.divider);
                 cy = cy + app.Scale(8);
                 c.DrawText(dX + inPad, cy, T("Animation clip (.anim)", "动画剪辑 (.anim)"),
@@ -708,6 +754,8 @@ class AssetManager {
             action = 2;
         } else if (Button.WasClicked(app, impDirId)) {
             action = 3;
+        } else if (Button.WasClicked(app, lnkId)) {
+            action = 4;
         } else if (Button.WasClicked(app, upId)) {
             if (this.curRel.Length > 0) {
                 this.curRel = dirPart(this.curRel);
@@ -744,7 +792,14 @@ class AssetManager {
                 app.RequestRedraw();
             }
         } else if (delId >= 0 && Button.WasClicked(app, delId)) {
-            if (!this.confirmDel) {
+            if (selIsLink) {
+                ZanIDE.RemoveProjLink(root, selLinkPath);
+                log.Add("> Removed linked resource: " + selLinkPath);
+                this.msg = T("Link removed", "已移除链接");
+                this.confirmDel = false;
+                this.selIdx = -1;
+                app.RequestRedraw();
+            } else if (!this.confirmDel) {
                 this.confirmDel = true;
                 app.RequestRedraw();
             } else {
@@ -776,6 +831,7 @@ class AssetManager {
         } else if (Button.WasClicked(app, clId)) {
             action = 1;
         }
+        app.RenderChrome(T("Asset Manager", "资源管理器"));
         return action;
     }
 

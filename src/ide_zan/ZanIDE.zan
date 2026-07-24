@@ -959,10 +959,9 @@ partial class ZanIDE {
         Button replAllBtn = Button.Create(ZanIDE.T("Repl All", "全部替换")).SetSize(1);
         Button gotoBtn = Button.Primary(ZanIDE.T("Go", "跳转")).SetSize(1);
         // Start-page quick-action buttons (framework Button components).
-        Button startNewProjBtn = Button.WithIcon(ZanIDE.T("New Project...", "新建项目..."), "plus");
-        startNewProjBtn.SetType(1);
-        Button startNewFileBtn = Button.WithIcon(ZanIDE.T("New File...", "新建文件..."), "file");
-        Button startOpenBtn = Button.WithIcon(ZanIDE.T("Open...", "打开..."), "folder");
+        Button startNewProjBtn = Button.WithIcon(ZanIDE.T("New Project", "新建项目"), "plus");
+        Button startNewFileBtn = Button.WithIcon(ZanIDE.T("New File", "新建文件"), "file");
+        Button startOpenBtn = Button.WithIcon(ZanIDE.T("Open", "打开"), "folder");
         SignalInt startNewsScroll = SignalInt.Create(0);
         StartPage startPage = new StartPage();
         Button debugContinueBtn = Button.IconTextTyped(
@@ -983,7 +982,7 @@ partial class ZanIDE {
         // PlatformCsv (windows-x64, windows-arm64, linux-x64, linux-arm64,
         // macos-x64, macos-arm64). All targets are cross-compiled by zanc
         // via --target, so non-Windows targets are selectable too.
-        bool pubOpen = false;
+        App pubWin = null;
         bool pubPending = false;
         List<int> pubSel = new List<int>();
         // In-flight detached publish: exe paths to verify on completion plus
@@ -995,9 +994,9 @@ partial class ZanIDE {
         // ---- Editor appearance (color theme + font size) ----
         // edThemeIdx selects a syntax-color preset (see EditorThemeName); edFontPx
         // is the code font size (0 = follow the UI theme). Persisted to editor.cfg.
-        bool cfgOpen = false;
-        // Asset Manager overlay (browse/import/organize assets/ recursively).
-        bool assetMgrOpen = false;
+        App cfgWin = null;
+        // Asset Manager child window (browse/import/organize assets/ recursively).
+        App assetWin = null;
         int edThemeIdx = ZanIDE.ReadEditorTheme();
         int edFontPx = ZanIDE.ReadEditorFont();
         int defFontPx = app.theme.fontSizeMedium;
@@ -1237,6 +1236,9 @@ partial class ZanIDE {
                     dlg.ApplySkin(lastSkinIdx);
                     dlg.RequestRedraw();
                 }
+                if (pubWin != null) { pubWin.ApplySkin(lastSkinIdx); pubWin.SetChromeButtons(false, false, false, false); pubWin.RequestRedraw(); }
+                if (cfgWin != null) { cfgWin.ApplySkin(lastSkinIdx); cfgWin.SetChromeButtons(false, false, false, false); cfgWin.RequestRedraw(); }
+                if (assetWin != null) { assetWin.ApplySkin(lastSkinIdx); assetWin.SetChromeButtons(false, false, true, true); assetWin.RequestRedraw(); }
                 if (settingsWindow != null && settingsWindow.IsOpen()) {
                     settingsWindow.FollowSkin(lastSkinIdx);
                 }
@@ -1249,6 +1251,9 @@ partial class ZanIDE {
             if (app.WindowOpacity() != winOpacity) {
                 winOpacity = app.WindowOpacity();
                 if (dlg != null) { dlg.SetWindowOpacity(winOpacity); }
+                if (pubWin != null) { pubWin.SetWindowOpacity(winOpacity); }
+                if (cfgWin != null) { cfgWin.SetWindowOpacity(winOpacity); }
+                if (assetWin != null) { assetWin.SetWindowOpacity(winOpacity); }
                 if (settingsWindow != null && settingsWindow.IsOpen()) {
                     settingsWindow.FollowOpacity(winOpacity);
                 }
@@ -1264,6 +1269,9 @@ partial class ZanIDE {
             if (!pathPicker.IsOpen() && dlg != null) {
                 if (dlg.needsRedraw) { want = true; }
             }
+            if (!pathPicker.IsOpen() && pubWin != null && pubWin.needsRedraw) { want = true; }
+            if (!pathPicker.IsOpen() && cfgWin != null && cfgWin.needsRedraw) { want = true; }
+            if (!pathPicker.IsOpen() && assetWin != null && assetWin.needsRedraw) { want = true; }
             if (!pathPicker.IsOpen() && settingsWindow != null) {
                 if (settingsWindow.NeedsRedraw()) { want = true; }
             }
@@ -1340,6 +1348,17 @@ partial class ZanIDE {
                     && aiWindow.OwnsWindow(evh)) {
                     aiWindow.ApplyEvent(evh);
                     app.RequestRedraw();
+                } else if (pubWin != null && evh == pubWin.WindowHandle()) {
+                    pubWin = null;
+                    app.RequestRedraw();
+                } else if (cfgWin != null && evh == cfgWin.WindowHandle()) {
+                    cfgWin = null;
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
+                } else if (assetWin != null && evh == assetWin.WindowHandle()) {
+                    assetWin = null;
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
                 } else if (pathPicker.OwnsWindow(evh)) {
                     pathPicker.ApplyEvent(evh);
                 } else if (!pathPicker.IsOpen()) {
@@ -1360,6 +1379,9 @@ partial class ZanIDE {
             } else {
                 app.ApplyEvent(evh);
                 if (dlg != null) { dlg.ApplyEvent(evh); }
+                if (pubWin != null) { pubWin.ApplyEvent(evh); }
+                if (cfgWin != null) { cfgWin.ApplyEvent(evh); }
+                if (assetWin != null) { assetWin.ApplyEvent(evh); }
                 if (settingsWindow != null) {
                     settingsWindow.ApplyEvent(evh);
                 }
@@ -1459,13 +1481,15 @@ partial class ZanIDE {
                     // Escape = close find/replace/goto
                     findMode = 0;
                     app.RequestRedraw();
-                } else if (kc == 27 && pubOpen) {
-                    // Escape = close publish dialog
-                    pubOpen = false;
+                } else if (kc == 27 && pubWin != null) {
+                    // Escape = close publish window
+                    pubWin.window.Close();
+                    pubWin = null;
                     app.RequestRedraw();
-                } else if (kc == 27 && assetMgrOpen) {
+                } else if (kc == 27 && assetWin != null) {
                     // Escape = close the asset manager
-                    assetMgrOpen = false;
+                    assetWin.window.Close();
+                    assetWin = null;
                     app.RequestRedraw();
                 } else if (kc == 123 && !designerMode && dbgState == 0) {
                     // F12 = Go to Definition
@@ -1680,7 +1704,13 @@ partial class ZanIDE {
                 } else if (rc == 6) {
                     ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
                     pubSel = ZanIDE.ReadProjectPlatforms(root);
-                    pubOpen = true;
+                    if (pubWin == null) {
+                        pubWin = App.CreateDark(ZanIDE.T("Publish Project", "发布项目"), 470, 340);
+                        pubWin.ApplySkin(app.ThemeMenuIndex());
+                        pubWin.SetChromeButtons(false, false, false, false);
+                        pubWin.Show();
+                        pubWin.SetWindowOpacity(app.WindowOpacity());
+                    }
                     app.RequestRedraw();
                 } else if (rc == 7) {
                     // Debug (F5)
@@ -1780,7 +1810,13 @@ partial class ZanIDE {
                     // Open the visual Project Configuration panel (icon + static
                     // resources bundled with the app).
                     if (File.Exists(root + "/zan.proj")) {
-                        cfgOpen = true;
+                        if (cfgWin == null) {
+                            cfgWin = App.CreateDark(ZanIDE.T("Project Configuration", "项目配置"), 560, 580);
+                            cfgWin.ApplySkin(app.ThemeMenuIndex());
+                            cfgWin.SetChromeButtons(false, false, false, false);
+                            cfgWin.Show();
+                            cfgWin.SetWindowOpacity(app.WindowOpacity());
+                        }
                     } else {
                         log.Add("> Open or create a project first to configure it.");
                     }
@@ -1795,7 +1831,13 @@ partial class ZanIDE {
                 } else if (rc == 15) {
                     // Open the Asset Manager (assets/ browser + batch import).
                     if (File.Exists(root + "/zan.proj")) {
-                        assetMgrOpen = true;
+                        if (assetWin == null) {
+                            assetWin = App.CreateDark(ZanIDE.T("Asset Manager", "资源管理器"), 900, 660);
+                            assetWin.ApplySkin(app.ThemeMenuIndex());
+                            assetWin.SetChromeButtons(false, false, true, true);
+                            assetWin.Show();
+                            assetWin.SetWindowOpacity(app.WindowOpacity());
+                        }
                     } else {
                         log.Add("> Open or create a project first to manage its assets.");
                     }
@@ -3555,97 +3597,16 @@ partial class ZanIDE {
                     }
                 }
 
-                // Publish dialog overlay (modal, topmost).
-                if (pubOpen) {
-                    string pubName = Path.GetFileName(root);
-                    if (pubName == "") { pubName = "project"; }
-                    // Pin the dialog's widget ids to a fixed baseline: the main
-                    // window's widget count varies frame to frame, and drifting
-                    // ids would leave the dialog's buttons dead (see the wizard
-                    // child-window comment below).
-                    int savedSeqP = WidgetId.SeqValue();
-                    WidgetId.SetSeq(860000);
-                    int pAct = Dialogs.RenderPublishDialog(app, pubName, pubSel);
-                    WidgetId.SetSeq(savedSeqP);
-                    if (pAct == 1) {
-                        // Close the dialog first, then publish on the next frame so
-                        // the (blocking) cross-compile never leaves a frozen modal.
-                        pubOpen = false;
-                        pubPending = true;
-                        app.RequestRedraw();
-                    } else if (pAct == 2) {
-                        pubOpen = false;
-                        app.RequestRedraw();
-                    }
-                } else if (pubPending && !pubBusy) {
+                // Publish / Project Configuration / Asset Manager now render in
+                // their own top-level child windows (App.CreateDark) -- see the
+                // pumps right after the main frame below. Only the deferred
+                // publish kick-off (started once the window has closed) stays here.
+                if (pubPending && !pubBusy) {
                     pubPending = false;
                     pubExes = ZanIDE.PublishPlatformsBegin(tabNames, tabPaths, activeTab, root, pubSel, log);
                     pubBusy = pubExes.Count > 0;
                     pubLogLen = 0;
                     app.RequestRedraw();
-                }
-
-                // Project configuration overlay (modal): icon + static resources.
-                if (cfgOpen) {
-                    // Same fixed id baseline trick as the publish dialog above.
-                    int savedSeqC = WidgetId.SeqValue();
-                    WidgetId.SetSeq(870000);
-                    int cAct = Dialogs.RenderProjectConfigDialog(app, root, log);
-                    WidgetId.SetSeq(savedSeqC);
-                    if (cAct == 1) {
-                        cfgOpen = false;
-                        lastActive = 0 - 1;
-                        app.RequestRedraw();
-                    } else if (cAct == 2) {
-                        pathPicker.BeginOpenFile(
-                            ZanIDE.ReadLastPickerDirectory(root), ".ico",
-                            ZanIDE.T("Select application icon (.ico)", "选择应用图标 (.ico)"));
-                        pathPickerOwner = 2;
-                        app.RequestRedraw();
-                    } else if (cAct == 3) {
-                        pathPicker.BeginOpenFile(
-                            ZanIDE.ReadLastPickerDirectory(root), "",
-                            ZanIDE.T("Add a static resource (copy)", "导入静态资源（复制）"));
-                        pathPickerOwner = 3;
-                        app.RequestRedraw();
-                    } else if (cAct == 4) {
-                        pathPicker.BeginOpenFile(
-                            ZanIDE.ReadLastPickerDirectory(root), "",
-                            ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
-                        pathPickerOwner = 5;
-                        app.RequestRedraw();
-                    } else if (cAct == 5) {
-                        cfgOpen = false;
-                        assetMgrOpen = true;
-                        app.RequestRedraw();
-                    }
-                }
-
-                // Asset Manager overlay (modal): recursive assets/ browser,
-                // batch folder import and .anim clip authoring.
-                if (assetMgrOpen) {
-                    AssetManager.lang = ZanIDE.uiLang;
-                    int savedSeqA = WidgetId.SeqValue();
-                    WidgetId.SetSeq(890000);
-                    int aAct = assetMgr.Render(app, root, log);
-                    WidgetId.SetSeq(savedSeqA);
-                    if (aAct == 1) {
-                        assetMgrOpen = false;
-                        lastActive = 0 - 1;
-                        app.RequestRedraw();
-                    } else if (aAct == 2) {
-                        pathPicker.BeginOpenFile(
-                            ZanIDE.ReadLastPickerDirectory(root), "",
-                            ZanIDE.T("Import an asset file", "导入素材文件"));
-                        pathPickerOwner = 6;
-                        app.RequestRedraw();
-                    } else if (aAct == 3) {
-                        pathPicker.BeginFolder(
-                            ZanIDE.ReadLastPickerDirectory(root),
-                            ZanIDE.T("Import an asset folder (recursive)", "导入素材文件夹（递归）"));
-                        pathPickerOwner = 7;
-                        app.RequestRedraw();
-                    }
                 }
                 string windowTitle = "Zan IDE";
                 if (haveProject) { windowTitle = windowTitle + "  —  " + root; }
@@ -3757,6 +3718,113 @@ partial class ZanIDE {
                 }
             }
 
+            // ---------------- publish child window ----------------
+            if (pubWin != null && pubWin.needsRedraw && !pathPicker.IsOpen()) {
+                string pubName = Path.GetFileName(root);
+                if (pubName == "") { pubName = "project"; }
+                pubWin.BeginFrame();
+                int savedSeqP = WidgetId.SeqValue();
+                WidgetId.SetSeq(860000);
+                int pAct = Dialogs.RenderPublishDialog(pubWin, pubName, pubSel);
+                WidgetId.SetSeq(savedSeqP);
+                pubWin.PresentFrame();
+                lastPresent = Window.GetTickMs();
+                if (pAct == 1) {
+                    // Close first, then publish next frame so the (blocking)
+                    // cross-compile never leaves a frozen window.
+                    pubWin.window.Close();
+                    pubWin = null;
+                    pubPending = true;
+                    app.RequestRedraw();
+                } else if (pAct == 2) {
+                    pubWin.window.Close();
+                    pubWin = null;
+                    app.RequestRedraw();
+                }
+            }
+
+            // ---------------- project configuration child window ----------------
+            if (cfgWin != null && cfgWin.needsRedraw && !pathPicker.IsOpen()) {
+                cfgWin.BeginFrame();
+                int savedSeqC = WidgetId.SeqValue();
+                WidgetId.SetSeq(870000);
+                int cAct = Dialogs.RenderProjectConfigDialog(cfgWin, root, log);
+                WidgetId.SetSeq(savedSeqC);
+                cfgWin.PresentFrame();
+                lastPresent = Window.GetTickMs();
+                if (cAct == 1) {
+                    cfgWin.window.Close();
+                    cfgWin = null;
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
+                } else if (cAct == 2) {
+                    pathPicker.BeginOpenFile(
+                        ZanIDE.ReadLastPickerDirectory(root), ".ico",
+                        ZanIDE.T("Select application icon (.ico)", "选择应用图标 (.ico)"));
+                    pathPickerOwner = 2;
+                    app.RequestRedraw();
+                } else if (cAct == 3) {
+                    pathPicker.BeginOpenFile(
+                        ZanIDE.ReadLastPickerDirectory(root), "",
+                        ZanIDE.T("Add a static resource (copy)", "导入静态资源（复制）"));
+                    pathPickerOwner = 3;
+                    app.RequestRedraw();
+                } else if (cAct == 4) {
+                    pathPicker.BeginOpenFile(
+                        ZanIDE.ReadLastPickerDirectory(root), "",
+                        ZanIDE.T("Add a linked resource (referenced in place)", "导入链接资源（引用原位置）"));
+                    pathPickerOwner = 5;
+                    app.RequestRedraw();
+                } else if (cAct == 5) {
+                    cfgWin.window.Close();
+                    cfgWin = null;
+                    if (assetWin == null) {
+                        assetWin = App.CreateDark(ZanIDE.T("Asset Manager", "资源管理器"), 900, 660);
+                        assetWin.ApplySkin(app.ThemeMenuIndex());
+                        assetWin.SetChromeButtons(false, false, true, true);
+                        assetWin.Show();
+                        assetWin.SetWindowOpacity(app.WindowOpacity());
+                    }
+                    app.RequestRedraw();
+                }
+            }
+
+            // ---------------- asset manager child window ----------------
+            if (assetWin != null && assetWin.needsRedraw && !pathPicker.IsOpen()) {
+                AssetManager.lang = ZanIDE.uiLang;
+                assetWin.BeginFrame();
+                int savedSeqA2 = WidgetId.SeqValue();
+                WidgetId.SetSeq(890000);
+                int aAct = assetMgr.Render(assetWin, root, log);
+                WidgetId.SetSeq(savedSeqA2);
+                assetWin.PresentFrame();
+                lastPresent = Window.GetTickMs();
+                if (aAct == 1) {
+                    assetWin.window.Close();
+                    assetWin = null;
+                    lastActive = 0 - 1;
+                    app.RequestRedraw();
+                } else if (aAct == 2) {
+                    pathPicker.BeginOpenFile(
+                        ZanIDE.ReadLastPickerDirectory(root), "",
+                        ZanIDE.T("Import an asset file", "导入素材文件"));
+                    pathPickerOwner = 6;
+                    app.RequestRedraw();
+                } else if (aAct == 3) {
+                    pathPicker.BeginFolder(
+                        ZanIDE.ReadLastPickerDirectory(root),
+                        ZanIDE.T("Import an asset folder (recursive)", "导入素材文件夹（递归）"));
+                    pathPickerOwner = 7;
+                    app.RequestRedraw();
+                } else if (aAct == 4) {
+                    pathPicker.BeginOpenFile(
+                        ZanIDE.ReadLastPickerDirectory(root), "",
+                        ZanIDE.T("Link a resource (referenced in place)", "链接资源（引用原位置）"));
+                    pathPickerOwner = 8;
+                    app.RequestRedraw();
+                }
+            }
+
             if (settingsWindow != null) {
                 // Pin the child window's widget ids to a fixed baseline (the
                 // main window's per-frame widget count varies, and drifting
@@ -3845,7 +3913,7 @@ partial class ZanIDE {
                 } else if (pathPickerOwner == 7) {
                     assetMgr.ImportFolder(picked, root, log);
                     Layer.Msg(ZanIDE.T("Folder imported", "文件夹已导入"), 3);
-                } else if (pathPickerOwner == 5) {
+                } else if (pathPickerOwner == 5 || pathPickerOwner == 8) {
                     ZanIDE.AddProjLink(root, picked);
                     log.Add("> Linked resource: " + picked);
                     Layer.Msg(ZanIDE.T("Resource linked: ", "已链接资源：") + Path.GetFileName(picked), 3);
@@ -3866,10 +3934,14 @@ partial class ZanIDE {
                     log.Add("> Opened " + picked + ".");
                 }
                 pathPickerOwner = 0;
+                if (cfgWin != null) { cfgWin.RequestRedraw(); }
+                if (assetWin != null) { assetWin.RequestRedraw(); }
                 app.RequestRedraw();
             } else if (pickerResult == 2) {
                 pathPickerOwner = 0;
                 if (dlg != null) { dlg.RequestRedraw(); }
+                if (cfgWin != null) { cfgWin.RequestRedraw(); }
+                if (assetWin != null) { assetWin.RequestRedraw(); }
                 app.RequestRedraw();
             }
 
