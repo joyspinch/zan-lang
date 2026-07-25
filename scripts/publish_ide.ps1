@@ -82,6 +82,14 @@ if (Test-Path $sdlDll) { Copy-Item $sdlDll (Join-Path $dist 'SDL3.dll') }
 else { Write-Output "PUBLISH_FAILED: build\SDL3.dll missing (IDE needs it to run)"; exit 1 }
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 
+# ---- copy the app icon so the IDE can stamp new projects with it ----
+$assetsIco = Join-Path $root 'assets\zan.ico'
+if (Test-Path $assetsIco) {
+    $distAssets = Join-Path $dist 'assets'
+    New-Item -ItemType Directory -Force -Path $distAssets | Out-Null
+    Copy-Item $assetsIco (Join-Path $distAssets 'zan.ico')
+}
+
 # Everything the compiler needs travels together in dist\toolchain, laid out
 # exactly as next to zanc in the build tree: the IDE resolves zanc here, and
 # zanc finds its linker / sysroot / runtime objects as its own siblings (no

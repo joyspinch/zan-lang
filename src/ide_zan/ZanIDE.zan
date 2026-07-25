@@ -625,6 +625,30 @@ partial class ZanIDE {
     static string ToolchainDir() { return ZanIDE.BaseDir() + "/toolchain"; }
     static string StdlibDir() { return ZanIDE.BaseDir() + "/stdlib"; }
 
+    /// Locates the shipped assets folder (with zan.ico): next to the IDE when
+    /// published (<BaseDir>/assets), or one level up in the build tree.
+    static string AssetsDir() {
+        string a = ZanIDE.BaseDir() + "/assets";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../assets";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    /// The Zan application icon (.ico) copied into new projects by default so a
+    /// freshly created project already carries an icon its exe links in.
+    /// Returns "" when no shipped icon is found.
+    static string ZanIconSource() {
+        string ad = ZanIDE.AssetsDir();
+        if (ad != "") {
+            string c = ad + "/zan.ico";
+            if (File.Exists(c)) { return c; }
+        }
+        string t = ZanIDE.ToolchainDir() + "/zan.ico";
+        if (File.Exists(t)) { return t; }
+        return "";
+    }
+
     /// Shipped example programs. Published next to the IDE as <BaseDir>/examples
     /// (scripts/publish_ide.ps1); when running from the build tree it sits one
     /// level up at the repo root. Returns "" when neither exists.
@@ -916,7 +940,8 @@ partial class ZanIDE {
             new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
             new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
             new WizardItem(ZanIDE.T("Form (Designer)", "表单 (设计器)"), "layout", ZanIDE.T("Form: creates Name.zform (visual layout) + Name.zan (code-behind).", "表单：创建 Name.zform（可视化布局）+ Name.zan（代码后置）。")),
-            new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")) };
+            new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.zscene, a free-canvas game window layout.", "场景：创建 Name.zscene，自由画布式游戏窗口布局。")),
+            new WizardItem(ZanIDE.T("Folder", "文件夹"), "folder", ZanIDE.T("Creates a new folder under src/.", "在 src/ 下创建一个新文件夹。")) };
 
         // ---- Dialog state ----
         // The New Project / New File wizards are REAL secondary top-level windows
@@ -2123,7 +2148,11 @@ partial class ZanIDE {
                 if (exSc > exMaxScroll) { exSc = exMaxScroll; }
                 if (exSc < 0) { exSc = 0; }
                 exTreeScrollY.Set(exSc);
-                TreeView.Render(app, exArea, exShow, exSel, exSc);
+                int exRight = TreeView.Render(app, exArea, exShow, exSel, exSc);
+                if (exRight >= 0) {
+                    ctxKind = 2; ctxX = app.mouseX; ctxY = app.mouseY;
+                    ctxTarget = exRight; app.RequestRedraw();
+                }
 
                 int sel = treeSel.Get();
                 if (sel != lastTreeSel) {
@@ -3702,8 +3731,17 @@ partial class ZanIDE {
                     List<string> cmLabels = new List<string>();
                     if (ctxKind == 1) {
                         cmLabels.Add(ZanIDE.T("New File", "新建文件"));
-                        cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
+                        cmLabels.Add(ZanIDE.T("New Folder", "新建文件夹"));
                         cmLabels.Add("-");
+                        cmLabels.Add(ZanIDE.T("Delete", "删除"));
+                        cmLabels.Add("-");
+                        cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
+                        cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+                        cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+                    } else if (ctxKind == 2) {
+                        cmLabels.Add(ZanIDE.T("Open", "打开"));
+                        cmLabels.Add("-");
+                        cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
                         cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
                         cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
                     } else if (ctxKind == 3) {
@@ -3721,16 +3759,51 @@ partial class ZanIDE {
                             if (chosen == 0 && dlg == null) {
                                 dlg = ZanIDE.OpenWizard(app, ZanIDE.T("New File", "新建文件"), fSel, fNameInput, "NewFile");
                                 dlgMode = 2;
-                            } else if (chosen == 1) {
-                                rescan = true;
+                            } else if (chosen == 1 && dlg == null) {
+                                dlg = ZanIDE.OpenWizard(app, ZanIDE.T("New Folder", "新建文件夹"), fSel, fNameInput, "NewFolder");
+                                fSel.Set(7);
+                                dlgMode = 2;
                             } else if (chosen == 3) {
+                                if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
+                                    string dp = treeShow[ctxTarget].path;
+                                    if (haveProject && ZanIDE.StartsWith(dp, root) && dp != root) {
+                                        ZanIDE.DeletePathRecursive(dp);
+                                        log.Add("> Deleted " + dp + ".");
+                                        Layer.Notify(ZanIDE.T("Deleted: ", "已删除：") + Path.GetFileName(dp), 3);
+                                        rescan = true;
+                                    }
+                                }
+                            } else if (chosen == 5) {
+                                rescan = true;
+                            } else if (chosen == 6) {
                                 if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
                                     Clipboard.SetText(treeShow[ctxTarget].path);
                                     log.Add("> Copied path: " + treeShow[ctxTarget].path);
                                 }
-                            } else if (chosen == 4) {
+                            } else if (chosen == 7) {
                                 if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
                                     ZanIDE.RevealInFileManager(treeShow[ctxTarget].path);
+                                }
+                            }
+                        } else if (ctxKind == 2) {
+                            if (ctxTarget >= 0 && ctxTarget < exShow.Count) {
+                                TreeNode exn = exShow[ctxTarget];
+                                bool exReal = exn.path != "" && !ZanIDE.StartsWith(exn.path, "@");
+                                if (chosen == 0) {
+                                    if (exReal && !exn.isDir) {
+                                        ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, exn.path, exn.label);
+                                        log.Add("> Opened " + exn.path + ".");
+                                    }
+                                } else if (chosen == 2) {
+                                    exTree = ZanIDE.BuildStdlibTree();
+                                    log.Add("> Refreshed standard library / tools / examples.");
+                                } else if (chosen == 3) {
+                                    if (exReal) {
+                                        Clipboard.SetText(exn.path);
+                                        log.Add("> Copied path: " + exn.path);
+                                    }
+                                } else if (chosen == 4) {
+                                    if (exReal) { ZanIDE.RevealInFileManager(exn.path); }
                                 }
                             }
                         } else if (ctxKind == 3) {
@@ -3854,8 +3927,10 @@ partial class ZanIDE {
                                 dlgDone = false;
                             } else {
                                 string p = ZanIDE.CreateFile(fSel.Get(), root, name, log);
-                                ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
-                                Layer.Notify(ZanIDE.T("File created: ", "文件已创建：") + Path.GetFileName(p), 3);
+                                if (!Directory.Exists(p)) {
+                                    ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, p, Path.GetFileName(p));
+                                }
+                                Layer.Notify(ZanIDE.T("Created: ", "已创建：") + Path.GetFileName(p), 3);
                             }
                         }
                         if (dlgDone) {
