@@ -865,6 +865,26 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
     free(wtitle);
     if (!g_main_hwnd) {
         g_main_hwnd = hwnd;
+        /* Center the primary window on its monitor's work area. Win32 places
+         * CW_USEDEFAULT windows cascaded near the top-left; designers expect a
+         * window to open centered (horizontally and vertically) by default. */
+        RECT wr;
+        if (GetWindowRect(hwnd, &wr)) {
+            int win_w = wr.right - wr.left;
+            int win_h = wr.bottom - wr.top;
+            MONITORINFO mi = { sizeof(MONITORINFO) };
+            HMONITOR hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+            if (GetMonitorInfoW(hm, &mi)) {
+                int wa_w = mi.rcWork.right - mi.rcWork.left;
+                int wa_h = mi.rcWork.bottom - mi.rcWork.top;
+                int x = mi.rcWork.left + (wa_w - win_w) / 2;
+                int y = mi.rcWork.top + (wa_h - win_h) / 2;
+                if (x < mi.rcWork.left) x = mi.rcWork.left;
+                if (y < mi.rcWork.top) y = mi.rcWork.top;
+                SetWindowPos(hwnd, NULL, x, y, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
     } else {
         RECT parent_rect;
         RECT child_rect;
@@ -900,6 +920,36 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
     SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     return (i64)(intptr_t)hwnd;
+}
+
+/* Move a window's top-left to (x, y) in screen (work-area) pixels. Used when a
+ * designer configures a manual window position instead of the default center. */
+EXPORT i64 zan_gui_set_window_pos(i64 hwnd_val, i64 x, i64 y) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    if (!hwnd) return 0;
+    SetWindowPos(hwnd, NULL, (int)x, (int)y, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return 1;
+}
+
+/* Re-center a window on its monitor work area (designer "center" position). */
+EXPORT i64 zan_gui_center_window(i64 hwnd_val) {
+    HWND hwnd = (HWND)(intptr_t)hwnd_val;
+    if (!hwnd) return 0;
+    RECT wr;
+    if (!GetWindowRect(hwnd, &wr)) return 0;
+    int win_w = wr.right - wr.left;
+    int win_h = wr.bottom - wr.top;
+    MONITORINFO mi = { sizeof(MONITORINFO) };
+    HMONITOR hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    if (!GetMonitorInfoW(hm, &mi)) return 0;
+    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - win_w) / 2;
+    int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - win_h) / 2;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
+    SetWindowPos(hwnd, NULL, x, y, 0, 0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return 1;
 }
 
 EXPORT i64 zan_gui_show_window(i64 hwnd_val) {
