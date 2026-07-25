@@ -112,26 +112,35 @@ class WsFrame {
     }
 
     static WsFrame Decode(string data, int dataLen) {
-        WsFrame f = new WsFrame();
-        if (dataLen < 2) { return f; }
+        return WsFrame.DecodeAt(data, 0, dataLen);
+    }
 
-        int byte0 = data[0] & 255;
-        int byte1 = data[1] & 255;
+    /// <summary>Decodes the frame that starts at `offset`; `frameLen` is its
+    /// total byte length. Reading in place lets a reader hold several pipelined
+    /// frames in one buffer instead of shifting the rest down after each.</summary>
+    static WsFrame DecodeAt(string data, int offset0, int frameLen) {
+        WsFrame f = new WsFrame();
+        if (frameLen < 2) { return f; }
+        int dataLen = offset0 + frameLen;
+
+        int byte0 = data[offset0] & 255;
+        int byte1 = data[offset0 + 1] & 255;
 
         f.fin = (byte0 & 128) != 0;
         f.opcode = byte0 & 15;
         f.masked = (byte1 & 128) != 0;
 
         int payloadLen = byte1 & 127;
-        int offset = 2;
+        int offset = offset0 + 2;
 
         if (payloadLen == 126) {
-            payloadLen = ((data[2] & 255) << 8) + (data[3] & 255);
-            offset = 4;
+            payloadLen = ((data[offset0 + 2] & 255) << 8) + (data[offset0 + 3] & 255);
+            offset = offset0 + 4;
         } else if (payloadLen == 127) {
-            payloadLen = ((data[6] & 255) << 24) + ((data[7] & 255) << 16) +
-                         ((data[8] & 255) << 8) + (data[9] & 255);
-            offset = 10;
+            payloadLen = ((data[offset0 + 6] & 255) << 24) +
+                         ((data[offset0 + 7] & 255) << 16) +
+                         ((data[offset0 + 8] & 255) << 8) + (data[offset0 + 9] & 255);
+            offset = offset0 + 10;
         }
 
         f.payloadLen = payloadLen;
@@ -185,6 +194,10 @@ class WsReader {
     int len;
     int cap;
     string tmp;
+    // Cursor of the next unread frame. Consumed frames are skipped by moving
+    // it forward; the buffer is compacted only when more bytes must be read,
+    // so a batch of pipelined frames costs one shift instead of one per frame.
+    int start;
 
     [DllImport("crt")]
     static extern string calloc(int count, int size);
@@ -196,7 +209,21 @@ class WsReader {
         this.cap = 65536;
         this.buf = calloc(this.cap + 1, 1);
         this.len = 0;
+        this.start = 0;
         this.tmp = calloc(65537, 1);
+    }
+
+    /// <summary>Moves any unread bytes to the front so the cursor is zero.</summary>
+    void Compact() {
+        if (this.start == 0) { return; }
+        int rem = this.len - this.start;
+        int i = 0;
+        while (i < rem) {
+            this.buf[i] = this.buf[this.start + i];
+            i = i + 1;
+        }
+        this.len = rem;
+        this.start = 0;
     }
 
     /// <summary>Grows the accumulation buffer to hold at least `need` bytes.</summary>
@@ -219,6 +246,7 @@ class WsReader {
     /// bytes to the buffer. Returns bytes read; 0 means the peer closed (EOF).</summary>
     async int FillMore() {
         int got = 0;
+        this.Compact();
         while (got == 0) {
             await Socket.ReadReady(this.sock);
             int n = 0;
@@ -257,31 +285,43 @@ class WsReader {
     /// <summary>Total byte length of the frame at the front of the buffer, or -1
     /// if a complete frame is not yet buffered.</summary>
     int FrameSize() {
-        if (this.len < 2) { return -1; }
-        int b1 = this.buf[1] & 255;
+        int s = this.start;
+        int avail = this.len - s;
+        if (avail < 2) { return -1; }
+        int b1 = this.buf[s + 1] & 255;
         bool masked = (b1 & 128) != 0;
         int payloadLen = b1 & 127;
         int offset = 2;
         if (payloadLen == 126) {
-            if (this.len < 4) { return -1; }
-            payloadLen = ((this.buf[2] & 255) << 8) + (this.buf[3] & 255);
+            if (avail < 4) { return -1; }
+            payloadLen = ((this.buf[s + 2] & 255) << 8) + (this.buf[s + 3] & 255);
             offset = 4;
         } else if (payloadLen == 127) {
-            if (this.len < 10) { return -1; }
-            payloadLen = ((this.buf[6] & 255) << 24) + ((this.buf[7] & 255) << 16) +
-                         ((this.buf[8] & 255) << 8) + (this.buf[9] & 255);
+            if (avail < 10) { return -1; }
+            payloadLen = ((this.buf[s + 6] & 255) << 24) +
+                         ((this.buf[s + 7] & 255) << 16) +
+                         ((this.buf[s + 8] & 255) << 8) + (this.buf[s + 9] & 255);
             offset = 10;
         }
         int maskLen = 0;
         if (masked) { maskLen = 4; }
         int total = offset + maskLen + payloadLen;
-        if (this.len < total) { return -1; }
+        if (avail < total) { return -1; }
         return total;
+    }
+
+    /// <summary>Decodes the frame at the cursor (its size from FrameSize) and
+    /// advances past it.</summary>
+    WsFrame TakeFrame(int total) {
+        WsFrame frame = WsFrame.DecodeAt(this.buf, this.start, total);
+        this.Consume(total);
+        return frame;
     }
 
     /// <summary>Appends externally received bytes (e.g. plaintext decrypted by
     /// a TLS stream) to the accumulation buffer, bypassing the socket.</summary>
     void Append(string data, int n) {
+        this.Compact();
         this.Ensure(this.len + n);
         int i = 0;
         while (i < n) {
@@ -291,16 +331,13 @@ class WsReader {
         this.len = this.len + n;
     }
 
-    /// <summary>Drops the first `total` bytes (one consumed frame), shifting any
-    /// remaining buffered frames to the front.</summary>
+    /// <summary>Drops the frame at the cursor by stepping over it.</summary>
     void Consume(int total) {
-        int rem = this.len - total;
-        int i = 0;
-        while (i < rem) {
-            this.buf[i] = this.buf[total + i];
-            i = i + 1;
+        this.start = this.start + total;
+        if (this.start >= this.len) {
+            this.start = 0;
+            this.len = 0;
         }
-        this.len = rem;
     }
 }
 
@@ -387,8 +424,7 @@ class WebSocketServer {
             }
             if (!connected) { break; }
 
-            WsFrame frame = WsFrame.Decode(reader.buf, total);
-            reader.Consume(total);
+            WsFrame frame = reader.TakeFrame(total);
 
             if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
                 string response = await OnMessage(frame.payload);
