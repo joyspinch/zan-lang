@@ -1,0 +1,73 @@
+// Route attributes and per-route statistics over shared memory, addressed by a
+// hash computed once per request.
+using System;
+using System.Web;
+using System.Threading;
+
+class Program {
+    static void Main() {
+        RouteTable routes = RouteTable.Create("zan.test.routes", 64);
+        RouteStats stats = RouteStats.Create("zan.test.stats", 64);
+        if (routes == null || stats == null) {
+            Console.WriteLine("create failed");
+            return;
+        }
+
+        routes.Add("GET", "/user/list", 1, 1, 1, "User.List");
+        routes.Add("POST", "/user/save", 1, 1, 0, "User.Save");
+        routes.Add("GET", "/login", 0, 0, 0, "Auth.Login");
+        // A deep path stays a 16-byte key: only the hash is stored as the key.
+        routes.Add("GET", "/api/v1/tenant/42/department/7/user/9/profile/settings/notifications",
+            1, 0, 0, "Profile.Notify");
+        Console.WriteLine("count " + Convert.ToString(routes.Count()));
+
+        // The method is part of the key: same path, different attributes.
+        int getSave = RouteTable.Key("GET", "/user/save");
+        Console.WriteLine("GET /user/save found " +
+            Convert.ToString(routes.Has(getSave, "GET_/user/save")));
+
+        int postSave = RouteTable.Key("POST", "/user/save");
+        RouteInfo save = routes.Lookup(postSave, "POST_/user/save");
+        Console.WriteLine("POST /user/save found " + Convert.ToString(save.found) +
+            " auth " + Convert.ToString(save.auth) +
+            " perm " + Convert.ToString(save.perm) +
+            " menu " + Convert.ToString(save.menu) +
+            " handler " + save.handler);
+
+        int login = RouteTable.Key("GET", "/login");
+        Console.WriteLine("login auth " + Convert.ToString(routes.NeedsAuth(login)));
+
+        int deep = RouteTable.Key("GET",
+            "/api/v1/tenant/42/department/7/user/9/profile/settings/notifications");
+        Console.WriteLine("deep found " + Convert.ToString(routes.Has(deep,
+            "GET_/api/v1/tenant/42/department/7/user/9/profile/settings/notifications")));
+
+        int unknown = RouteTable.Key("GET", "/missing");
+        Console.WriteLine("unknown found " +
+            Convert.ToString(routes.Has(unknown, "GET_/missing")));
+
+        // A row exists under this hash, but the text belongs to another route:
+        // that must read as absent rather than inherit the route's flags.
+        Console.WriteLine("collision guard " +
+            Convert.ToString(routes.Has(postSave, "POST_/other/route")));
+
+        // ---- statistics ----
+        int h = stats.Register("GET", "/user/list");
+        stats.Record(h, 900, true, 5000);
+        stats.Record(h, 300, true, 5000);
+        stats.Record(h, 7200, false, 5000);
+        Console.WriteLine("calls " + Convert.ToString(stats.Calls(h)) +
+            " avg " + Convert.ToString(stats.AvgUs(h)) +
+            " min " + Convert.ToString(stats.MinUs(h)) +
+            " max " + Convert.ToString(stats.MaxUs(h)) +
+            " errors " + Convert.ToString(stats.Errors(h)) +
+            " slow " + Convert.ToString(stats.Slow(h)));
+        Console.WriteLine(stats.ToJson());
+
+        stats.Reset();
+        Console.WriteLine("after reset calls " + Convert.ToString(stats.Calls(h)));
+
+        stats.Destroy();
+        routes.Destroy();
+    }
+}

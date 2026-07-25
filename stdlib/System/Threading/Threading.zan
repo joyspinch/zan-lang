@@ -270,6 +270,16 @@ class Stopwatch {
     #endif
     #endif
 
+    [DllImport("crt", EntryPoint = "zan_monotonic_us")]
+    static extern int NativeMonotonicUs();
+
+    /// <summary>Monotonic microseconds. Unlike GetMilliseconds this resolves
+    /// individual requests (GetTickCount64 steps by ~15ms on Windows) and does
+    /// not allocate, so it is usable on the request path.</summary>
+    static int GetMicroseconds() {
+        return NativeMonotonicUs();
+    }
+
     /// <summary>Returns current tick count in milliseconds.</summary>
     static int GetMilliseconds() {
         #if WINDOWS
@@ -412,6 +422,37 @@ class SharedTable {
     [DllImport("crt", EntryPoint = "zan_shared_table_clear")]
     static extern void NativeClear(int handle);
 
+    [DllImport("crt", EntryPoint = "zan_shared_table_hash")]
+    static extern int NativeHash(string text);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_int_at")]
+    static extern int NativeSetIntAt(int handle, int keyHash, string column, int newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_int_at")]
+    static extern int NativeGetIntAt(int handle, int keyHash, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_increment_at")]
+    static extern int NativeIncrementAt(int handle, int keyHash, string column, int delta);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_extreme_at")]
+    static extern int NativeExtremeAt(
+        int handle, int keyHash, string column, int newValue, int keepLarger);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_set_string_at")]
+    static extern int NativeSetStringAt(int handle, int keyHash, string column, string newValue);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_get_string_at")]
+    static extern string NativeGetStringAt(int handle, int keyHash, string column);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_match_at")]
+    static extern int NativeMatchAt(int handle, int keyHash, string column, string text);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_exists_at")]
+    static extern int NativeExistsAt(int handle, int keyHash);
+
+    [DllImport("crt", EntryPoint = "zan_shared_table_delete_at")]
+    static extern int NativeDeleteAt(int handle, int keyHash);
+
     SharedTable(string name, int capacity) {
         this.handle = 0;
         this.tableName = name;
@@ -523,6 +564,67 @@ class SharedTable {
 
     void Clear() {
         NativeClear(this.handle);
+    }
+
+    // ---- rows addressed by a precomputed hash ----
+    //
+    // A request handler hashes its key once ("GET_/user/list") and passes that
+    // value to every table it touches, so the key is never formatted into a
+    // string and no key bytes are compared. Rows are then identified by the
+    // hash alone: use a table either by key or by hash, not both, and keep the
+    // original text in a column when a collision would be dangerous.
+
+    /// <summary>Hashes a key the same way the table does (FNV-1a, 64-bit).</summary>
+    static int Hash(string text) {
+        return NativeHash(text);
+    }
+
+    bool SetIntAt(int keyHash, string column, int newValue) {
+        return NativeSetIntAt(this.handle, keyHash, column, newValue) != 0;
+    }
+
+    int GetIntAt(int keyHash, string column) {
+        return NativeGetIntAt(this.handle, keyHash, column);
+    }
+
+    int IncrementAt(int keyHash, string column, int delta) {
+        return NativeIncrementAt(this.handle, keyHash, column, delta);
+    }
+
+    /// <summary>Stores `newValue` if it is smaller than what is there (zero
+    /// counts as unset), in one atomic step. For "fastest response so far".</summary>
+    int MinAt(int keyHash, string column, int newValue) {
+        return NativeExtremeAt(this.handle, keyHash, column, newValue, 0);
+    }
+
+    /// <summary>Stores `newValue` if it is larger than what is there, in one
+    /// atomic step. For "slowest response so far".</summary>
+    int MaxAt(int keyHash, string column, int newValue) {
+        return NativeExtremeAt(this.handle, keyHash, column, newValue, 1);
+    }
+
+    bool SetStringAt(int keyHash, string column, string newValue) {
+        return NativeSetStringAt(this.handle, keyHash, column, newValue) != 0;
+    }
+
+    string GetStringAt(int keyHash, string column) {
+        string text = NativeGetStringAt(this.handle, keyHash, column);
+        return text.Substring(0, text.Length);
+    }
+
+    /// <summary>Whether a string column equals `text`, without copying the
+    /// stored bytes out. Verifying a key's original text on every lookup would
+    /// otherwise allocate a string per call.</summary>
+    bool MatchAt(int keyHash, string column, string text) {
+        return NativeMatchAt(this.handle, keyHash, column, text) != 0;
+    }
+
+    bool ExistsAt(int keyHash) {
+        return NativeExistsAt(this.handle, keyHash) != 0;
+    }
+
+    bool DeleteAt(int keyHash) {
+        return NativeDeleteAt(this.handle, keyHash) != 0;
     }
 }
 

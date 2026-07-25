@@ -448,6 +448,57 @@ static unsigned char *zan_row_for(
     return row;
 }
 
+/* ---- rows addressed by a caller-computed hash ----
+ * A server hashes "GET_/user/list" once per request and reuses that value for
+ * the route attribute table and the statistics table, instead of formatting it
+ * back into a key string and having the table hash it again. Identity is the
+ * hash itself, so a table is used either by key or by hash, never both. */
+
+static unsigned char *zan_find_row_hash(
+    zan_shared_header *header, uint64_t hash, int create) {
+    if (!hash) hash = 1;
+    uint64_t first_tombstone = UINT64_MAX;
+    for (uint64_t probe = 0; probe < header->capacity; probe++) {
+        uint64_t index = (hash + probe) & (header->capacity - 1);
+        unsigned char *row = zan_row_at(header, index);
+        uint32_t state = zan_load_state(row);
+        if (state == ZAN_SLOT_USED) {
+            if (*zan_row_hash(row) == hash) return row;
+            continue;
+        }
+        if (state == ZAN_SLOT_TOMBSTONE) {
+            if (first_tombstone == UINT64_MAX) first_tombstone = index;
+            continue;
+        }
+        if (!create) return NULL;
+        if (first_tombstone != UINT64_MAX) row = zan_row_at(header, first_tombstone);
+        memset(row, 0, header->row_stride);
+        *zan_row_hash(row) = hash;
+        zan_publish_state(row, ZAN_SLOT_USED);
+        header->count++;
+        return row;
+    }
+    if (create && first_tombstone != UINT64_MAX) {
+        unsigned char *row = zan_row_at(header, first_tombstone);
+        memset(row, 0, header->row_stride);
+        *zan_row_hash(row) = hash;
+        zan_publish_state(row, ZAN_SLOT_USED);
+        header->count++;
+        return row;
+    }
+    return NULL;
+}
+
+static unsigned char *zan_row_for_hash(
+    zan_shared_header *header, uint64_t hash, int create) {
+    unsigned char *row = zan_find_row_hash(header, hash, 0);
+    if (row || !create) return row;
+    zan_struct_lock(header);
+    row = zan_find_row_hash(header, hash, 1);
+    zan_struct_unlock(header);
+    return row;
+}
+
 static void zan_shared_table_free(zan_shared_table *table) {
     if (!table) return;
 #ifdef _WIN32
@@ -1000,6 +1051,189 @@ int64_t zan_shared_table_increment(
     memcpy(row + column->offset, &value, sizeof(value));
     zan_row_unlock(row);
     return value;
+}
+
+/* Monotonic microseconds. Per-request timing needs better resolution than
+ * GetTickCount64's ~15ms and must not allocate, which the Zan-side
+ * clock_gettime wrapper does on every call. */
+int64_t zan_monotonic_us(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (int64_t)((now.QuadPart * 1000000) / frequency.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000;
+#endif
+}
+
+/* ---- the same operations against a caller-computed hash ---- */
+
+int64_t zan_shared_table_hash(const char *value) {
+    return (int64_t)zan_hash_bytes(value);
+}
+
+int64_t zan_shared_table_set_int_at(
+    int64_t handle, int64_t key_hash, const char *column_name, int64_t value) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table) return 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_INT);
+    unsigned char *row =
+        column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    memcpy(row + column->offset, &value, sizeof(value));
+    zan_row_unlock(row);
+    return 1;
+}
+
+int64_t zan_shared_table_get_int_at(
+    int64_t handle, int64_t key_hash, const char *column_name) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table) return 0;
+    int64_t value = 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_INT);
+    unsigned char *row =
+        column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    memcpy(&value, row + column->offset, sizeof(value));
+    zan_row_unlock(row);
+    return value;
+}
+
+int64_t zan_shared_table_increment_at(
+    int64_t handle, int64_t key_hash, const char *column_name, int64_t delta) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table) return 0;
+    int64_t value = 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_INT);
+    unsigned char *row =
+        column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    memcpy(&value, row + column->offset, sizeof(value));
+    value += delta;
+    memcpy(row + column->offset, &value, sizeof(value));
+    zan_row_unlock(row);
+    return value;
+}
+
+/* Keeps the smaller (or larger, when `keep_larger`) of the stored value and
+ * `value`, in one row-locked step. Slowest/fastest response times are the
+ * reason the statistics table exists and read-modify-write from Zan would race
+ * between processes. A zero stored value counts as unset for the minimum. */
+int64_t zan_shared_table_extreme_at(
+    int64_t handle, int64_t key_hash, const char *column_name, int64_t value,
+    int64_t keep_larger) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table) return 0;
+    int64_t stored = 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_INT);
+    unsigned char *row =
+        column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    memcpy(&stored, row + column->offset, sizeof(stored));
+    int replace = keep_larger ? (value > stored) : (stored == 0 || value < stored);
+    if (replace) {
+        memcpy(row + column->offset, &value, sizeof(value));
+        stored = value;
+    }
+    zan_row_unlock(row);
+    return stored;
+}
+
+int64_t zan_shared_table_set_string_at(
+    int64_t handle, int64_t key_hash, const char *column_name,
+    const char *value) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !value) return 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_STRING);
+    size_t value_len = column ? strlen(value) : 0;
+    unsigned char *row =
+        column && value_len < column->size
+            ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1)
+            : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    char *destination = (char *)(row + column->offset);
+    memset(destination, 0, column->size);
+    memcpy(destination, value, value_len);
+    zan_row_unlock(row);
+    return 1;
+}
+
+const char *zan_shared_table_get_string_at(
+    int64_t handle, int64_t key_hash, const char *column_name) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    char *result = zan_get_shared_string();
+    result[0] = '\0';
+    if (!table) return result;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_STRING);
+    unsigned char *row =
+        column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
+    if (!row) return result;
+    zan_row_lock(row);
+    size_t max_len = column->size - 1u;
+    size_t len = zan_strnlen((const char *)(row + column->offset), max_len);
+    memcpy(result, row + column->offset, len);
+    result[len] = '\0';
+    zan_row_unlock(row);
+    return result;
+}
+
+/* Compares a string column against `text` without handing the stored bytes
+ * back to the caller. The route table verifies the original path on every
+ * lookup to rule out a hash collision, and returning the column would allocate
+ * a string per request just to throw it away. */
+int64_t zan_shared_table_match_at(
+    int64_t handle, int64_t key_hash, const char *column_name,
+    const char *text) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table || !text) return 0;
+    zan_shared_column *column = zan_find_column(
+        table->header, column_name, ZAN_TABLE_STRING);
+    unsigned char *row =
+        column ? zan_find_row_hash(table->header, (uint64_t)key_hash, 0) : NULL;
+    if (!row) return 0;
+    zan_row_lock(row);
+    int equal = strncmp(
+        (const char *)(row + column->offset), text, column->size) == 0;
+    zan_row_unlock(row);
+    return equal ? 1 : 0;
+}
+
+int64_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table) return 0;
+    return zan_find_row_hash(table->header, (uint64_t)key_hash, 0) != NULL;
+}
+
+int64_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
+    zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
+    if (!table) return 0;
+    zan_struct_lock(table->header);
+    unsigned char *row = zan_find_row_hash(
+        table->header, (uint64_t)key_hash, 0);
+    if (row) {
+        zan_row_lock(row);
+        memset(row, 0, table->header->row_stride);
+        zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
+        table->header->count--;
+        zan_row_unlock(row);
+    }
+    zan_struct_unlock(table->header);
+    return row != NULL;
 }
 
 int64_t zan_shared_table_delete(int64_t handle, const char *key) {

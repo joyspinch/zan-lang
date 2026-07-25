@@ -1,0 +1,172 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.Web;
+
+/// <summary>
+/// Per-route service statistics in cross-process shared memory: call count,
+/// total/min/max latency, errors and slow calls, aggregated across every worker
+/// process without a coordinator.
+///
+/// Counters are updated with the same hash the route lookup already computed, so
+/// recording a request costs a handful of row-locked adds. A supervisor dumps
+/// the table on an interval and zeroes it, which turns the counters into an
+/// hourly or daily profile of the service -- enough to see which endpoints are
+/// slow or unstable without any per-request logging.
+///
+/// <code>
+/// RouteStats stats = RouteStats.Create("app.stats", 4096);
+/// int h = stats.Register("GET", "/user/list");     // once, at startup
+/// ...
+/// int t0 = Stopwatch.GetMicroseconds();
+/// HttpResponse res = await Handle(req);
+/// stats.Record(h, Stopwatch.GetMicroseconds() - t0, res.statusCode &lt; 500, 200000);
+/// ...
+/// stats.DumpJson("logs/api-2026-07-25-14.json");   // hourly, then zeroed
+/// </code>
+/// </summary>
+class RouteStats {
+    SharedTable table;
+    List<string> keys;
+    List<int> hashes;
+
+    RouteStats() {
+        this.table = null;
+        this.keys = new List<string>();
+        this.hashes = new List<int>();
+    }
+
+    /// <summary>Creates the table. `capacity` is the number of routes.</summary>
+    static RouteStats Create(string name, int capacity) {
+        RouteStats s = new RouteStats();
+        SharedTable t = new SharedTable(name, capacity);
+        t.KeySize(16);
+        t.ColumnInt("calls");
+        t.ColumnInt("total_us");
+        t.ColumnInt("min_us");
+        t.ColumnInt("max_us");
+        t.ColumnInt("errors");
+        t.ColumnInt("slow");
+        if (!t.Create()) { return null; }
+        s.table = t;
+        return s;
+    }
+
+    /// <summary>Opens the table created by another process. The caller still
+    /// registers the routes it wants to dump.</summary>
+    static RouteStats Open(string name) {
+        RouteStats s = new RouteStats();
+        SharedTable t = SharedTable.Open(name);
+        if (!t.IsOpen()) { return null; }
+        s.table = t;
+        return s;
+    }
+
+    /// <summary>Declares a route and returns its hash; keep that value and pass
+    /// it to Record. Registration is what lets Dump name the rows.</summary>
+    int Register(string method, string path) {
+        string key = RouteTable.KeyOf(method, path);
+        int h = SharedTable.Hash(key);
+        this.keys.Add(key);
+        this.hashes.Add(h);
+        return h;
+    }
+
+    /// <summary>Records one served request: `elapsedUs` microseconds, `ok` false
+    /// counts an error, and anything at or above `slowUs` counts as slow.</summary>
+    void Record(int keyHash, int elapsedUs, bool ok, int slowUs) {
+        this.table.IncrementAt(keyHash, "calls", 1);
+        this.table.IncrementAt(keyHash, "total_us", elapsedUs);
+        this.table.MinAt(keyHash, "min_us", elapsedUs);
+        this.table.MaxAt(keyHash, "max_us", elapsedUs);
+        if (!ok) { this.table.IncrementAt(keyHash, "errors", 1); }
+        if (elapsedUs >= slowUs) { this.table.IncrementAt(keyHash, "slow", 1); }
+    }
+
+    int Calls(int keyHash) { return this.table.GetIntAt(keyHash, "calls"); }
+    int TotalUs(int keyHash) { return this.table.GetIntAt(keyHash, "total_us"); }
+    int MinUs(int keyHash) { return this.table.GetIntAt(keyHash, "min_us"); }
+    int MaxUs(int keyHash) { return this.table.GetIntAt(keyHash, "max_us"); }
+    int Errors(int keyHash) { return this.table.GetIntAt(keyHash, "errors"); }
+    int Slow(int keyHash) { return this.table.GetIntAt(keyHash, "slow"); }
+
+    /// <summary>Average microseconds per call, 0 when never called.</summary>
+    int AvgUs(int keyHash) {
+        int calls = this.table.GetIntAt(keyHash, "calls");
+        if (calls == 0) { return 0; }
+        return this.table.GetIntAt(keyHash, "total_us") / calls;
+    }
+
+    /// <summary>Zeroes one route's counters.</summary>
+    void ResetAt(int keyHash) {
+        this.table.SetIntAt(keyHash, "calls", 0);
+        this.table.SetIntAt(keyHash, "total_us", 0);
+        this.table.SetIntAt(keyHash, "min_us", 0);
+        this.table.SetIntAt(keyHash, "max_us", 0);
+        this.table.SetIntAt(keyHash, "errors", 0);
+        this.table.SetIntAt(keyHash, "slow", 0);
+    }
+
+    /// <summary>Zeroes every registered route.</summary>
+    void Reset() {
+        int i = 0;
+        while (i < this.hashes.Count) {
+            this.ResetAt(this.hashes[i]);
+            i = i + 1;
+        }
+    }
+
+    /// <summary>Renders the registered routes as a JSON array. Routes that were
+    /// never called are skipped.</summary>
+    string ToJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        int i = 0;
+        bool first = true;
+        while (i < this.hashes.Count) {
+            int h = this.hashes[i];
+            int calls = this.table.GetIntAt(h, "calls");
+            if (calls > 0) {
+                if (!first) { sb.Append(","); }
+                first = false;
+                sb.Append("{\"route\":\"");
+                sb.Append(this.keys[i]);
+                sb.Append("\",\"calls\":");
+                sb.Append(Convert.ToString(calls));
+                sb.Append(",\"total_us\":");
+                sb.Append(Convert.ToString(this.table.GetIntAt(h, "total_us")));
+                sb.Append(",\"avg_us\":");
+                sb.Append(Convert.ToString(this.AvgUs(h)));
+                sb.Append(",\"min_us\":");
+                sb.Append(Convert.ToString(this.table.GetIntAt(h, "min_us")));
+                sb.Append(",\"max_us\":");
+                sb.Append(Convert.ToString(this.table.GetIntAt(h, "max_us")));
+                sb.Append(",\"errors\":");
+                sb.Append(Convert.ToString(this.table.GetIntAt(h, "errors")));
+                sb.Append(",\"slow\":");
+                sb.Append(Convert.ToString(this.table.GetIntAt(h, "slow")));
+                sb.Append("}");
+            }
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    /// <summary>Writes the current counters to `path` and zeroes them, so each
+    /// dump covers exactly the interval since the previous one.</summary>
+    void DumpJson(string path) {
+        string json = this.ToJson();
+        File.WriteAllText(path, json);
+        this.Reset();
+    }
+
+    int Count() {
+        return this.table.Count();
+    }
+
+    bool Destroy() {
+        return this.table.Destroy();
+    }
+}
