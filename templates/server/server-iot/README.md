@@ -2,12 +2,15 @@
 
 An MQTT 3.1.1 message broker **plus** an attribute-driven web management console,
 in one Zan binary. Devices speak MQTT on `:1883`; operators use the HTTP console
-and JSON API on `:8080`. Built on the same `ZanWeb` framework as `server-mvc`
-(convention routing, unified input filtering, auth/rank/lock, in-memory views).
+and JSON API on `:8080`. Both halves come from the standard library: the broker
+is `System.Net.Mqtt.MqttBroker`, the console is `System.Web` (convention
+routing, unified input filtering, auth/rank/lock, in-memory views) — the same
+web stack `server-mvc` uses. The template itself only holds config, DB, cache,
+controllers, routes and views.
 
 ## Features
 
-- **MQTT 3.1.1 broker** (`src/broker/`): CONNECT/CONNACK, PUBLISH (QoS 0 & 1),
+- **MQTT 3.1.1 broker** (`System.Net.Mqtt`): CONNECT/CONNACK, PUBLISH (QoS 0 & 1),
   SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT.
 - **Topic routing** with `+` (single-level) and `#` (multi-level) wildcards.
 - **Client / device management**: live session registry (client id, address,
@@ -20,7 +23,7 @@ and JSON API on `:8080`. Built on the same `ZanWeb` framework as `server-mvc`
   vs. cumulative clients, subscription/topic counts, message + byte throughput,
   and the full HTTP runtime metrics snapshot.
 - **Attribute-driven routes** (`[Get]`/`[Post]`/`[Route]`/`[Auth]`/`[Rank]`/
-  `[Lock]`/`[Menu]`/`[Title]`) generated into `src/framework/Routes.gen.zan`.
+  `[Lock]`/`[Menu]`/`[Title]`) collected into `src/framework/Routes.gen.zan`.
   These can also be collapsed into one combined attribute, e.g.
   `[Api(post, route="/iot/clients/{id}/kick", title="踢下线", auth, rank=9, lock="global")]`
   (bare flags + `key=value`; the single attributes still work and can be mixed).
@@ -31,25 +34,20 @@ and JSON API on `:8080`. Built on the same `ZanWeb` framework as `server-mvc`
 config/app.json            server + mqtt ports (edit, no recompile)
 views/index.html           dashboard (polls the /iot/* APIs)
 src/main.zan               boots the broker (Task.Spawn) + HTTP console
-src/broker/Mqtt.zan        packet codec, framing reader, topic matcher
-src/broker/Client.zan      connected session + subscriptions
-src/broker/Broker.zan      registries, routing, metrics, mgmt snapshots
-src/controller/            HTTP actions (Iot / Auth / Home)
-src/framework/             ZanWeb framework (shared with server-mvc)
-tools/routegen/            attribute scanner -> Routes.gen.zan
+src/controller/            HTTP actions (Iot / Auth / Home) + Reply helpers
+src/framework/Config.zan   config/app.json loader
+src/framework/Db.zan       DbConnection bootstrap
+src/framework/Cache.zan    in-memory TTL cache (Redis optional)
+src/framework/Routes.gen.zan  route table built from the controller attributes
 ```
 
 ## Build & run
 
 ```
-# 1. (re)generate the route table from controller attributes
-zanc tools/routegen/RouteGen.zan --auto-stdlib -o routegen.exe
-routegen.exe                      # run from the project root
-
-# 2. compile everything
+# 1. compile everything
 zanc (all src/**/*.zan) --auto-stdlib -o app.exe
 
-# 3. run — MQTT on :1883, console on http://127.0.0.1:8080
+# 2. run — MQTT on :1883, console on http://127.0.0.1:8080
 app.exe
 ```
 

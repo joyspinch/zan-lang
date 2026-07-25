@@ -1,44 +1,42 @@
 # {{NAME}} — ZanWeb Web MVC Framework
 
 Enterprise web application skeleton modeled on a production swoole (ZxPHP)
-framework, rebuilt on Zan's coroutine runtime — now with a layered
-controller/model/framework structure, an external config file, and the ORM and
-cache wired in by default.
+framework, rebuilt on Zan's coroutine runtime — a layered controller/model
+structure, an external config file, and the ORM and cache wired in by default.
+
+The framework itself is **not** part of the template: routing, request context,
+hooks, views, filters, validation, sessions, rate limiting, request locks and
+the server bootstrap live in the standard library under `System.Web`
+(`WebApp`, `Router`, `HttpContext`, `Controller`, `View`, `WebServer`, …) next
+to `RouteTable` / `RouteStats` / `PermTable`. The template keeps only what is
+its own: config, DB, cache, controllers, models and views.
 
 ## Layout
 
 ```
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
-src/main.zan            bootstrap only — routes come from Routes.gen.zan
+src/main.zan            bootstrap only — routes come from controller attributes
 src/controller/         request handlers, grouped per resource
-  Controller.zan          shared response helpers (Ok / Fail envelopes)
-  HomeController.zan       HTML landing page
-  ApiController.zan        status / echo / login / me / gather / upload
-  UserController.zan       ORM + cache demo (/users, /user/{id})
-  AdminController.zan      /admin/menu — menu built from [Menu] routes
+                        (they derive from System.Web.Controller / ApiController)
+  Index/Index.zan         HTML landing page
+  Api/                    status / echo / login / me / gather / upload
+  User/Users.zan          ORM + cache demo (/users, /user/{id})
+  Admin/                  /admin/menu — menu built from [Menu] routes
 src/model/              data access on System.Data.Orm
   User.zan                example model (auto-creates + seeds its table)
-src/framework/          reusable plumbing
-  Config.zan              loads config/app.json (System.Json)
-  App.zan                 global accessor for the running WebApp
+src/framework/          application wiring that belongs to this app
+  Cfg.zan                 loads config/app.json into the typed Cfg entity
   Db.zan                  DbConnection bootstrap from [database]
   Cache.zan               in-memory TTL cache (Redis optional)
-  Security.zan            request-lock manager + rank/RBAC resolver
-  Filter.zan              unified input sanitising (Clean / Html / ToInt)
-  Menu.zan                admin menu JSON built from the route table
-  Routes.gen.zan          GENERATED route table (do not edit by hand)
-  Router / Hooks / View / WebApp / HttpContext / Validate / StrMap
-tools/routegen/         RouteGen.zan — scans attributes -> Routes.gen.zan
-views/                  in-memory HTML templates
+views/                  in-memory HTML templates (next to their controllers)
 ```
 
 ## Attribute-driven routes
 
 Controllers declare routing with **attributes** instead of hand-wiring in
 `main.zan` (the Zan equivalent of the PHP `@title/@auth/@rank` docblocks). A
-build-time generator (`tools/routegen`) scans the controllers and emits
-`src/framework/Routes.gen.zan`, which `main.zan` registers with a single
-`Routes.Map(app)`.
+compiler pass scans the controllers and synthesizes `__AttrRoutes.Register(app)`,
+which `main.zan` calls once — no generated file to maintain, no reflection.
 
 ```zan
 class ApiController {
@@ -82,13 +80,6 @@ single attributes above still work and can be mixed with `[Api(...)]`.
 lower-cased — `ApiController.Status` → `/api/status`, `Admin/UserController.List`
 → `/admin/user/list`. `Index` maps to the folder root. `[Route("...")]` overrides
 the convention when you need an exception.
-
-Regenerate after editing controller attributes:
-
-```
-zanc tools/routegen/RouteGen.zan --auto-stdlib -o routegen.exe
-./routegen.exe        # run from the project root; rewrites Routes.gen.zan
-```
 
 Custom rank/RBAC logic plugs in without touching the framework:
 `app.RankResolver(fn)` where `fn(uid) -> int` (default: uid "1" is rank 9).
@@ -139,14 +130,15 @@ crashing.
 | Layered controllers | `src/controller/` | thin `main.zan`, one class per resource |
 | Default ORM | `src/model/`, `framework/Db.zan` | `System.Data.Orm` models, config-driven engine |
 | Default cache | `framework/Cache.zan` | in-memory TTL; Redis via `System.Data.Redis` on async path |
-| External config | `config/app.json`, `framework/Config.zan` | runtime-loaded, not compiled in |
-| High-performance routing | `framework/Router.zan` | static-first match + `{param}`, 404/405 |
-| Rate limiting | `framework/Hooks.zan` | global + per-route fixed windows, 429 |
+| External config | `config/app.json`, `framework/Cfg.zan` | runtime-loaded, not compiled in |
+| High-performance routing | `System.Web.Router` | static-first match + `{param}`, 404/405 |
+| Rate limiting | `System.Web.Hooks` | global + per-route fixed windows, 429 |
 | Auth / sessions | `WebApp.AuthUser`, `Sessions` | Bearer token or session cookie, `.Auth()` guard |
-| Lifecycle hooks | `Hooks` | typed delegates, run in order |
-| In-memory views | `framework/View.zan` | templates loaded ONCE at startup |
+| Lifecycle hooks | `System.Web.Hooks` | typed delegates, run in order |
+| In-memory views | `System.Web.View` | templates loaded ONCE at startup |
 | Streaming uploads | `.Upload()` routes | body streamed to disk in 64KB chunks |
-| Validation | `framework/Validate.zan` | Require/MaxLen/IsInt/OneOf + SafeFileName |
+| Validation | `System.Web.Validate` | Require/MaxLen/IsInt/OneOf + SafeFileName |
+| Shared-memory tables | `System.Web.RouteTable` / `RouteStats` / `PermTable` | route attributes, per-route timings, role×route rights across workers |
 
 ## Workers & scaling
 
@@ -167,10 +159,13 @@ Set `worker.count` in `config/app.json`:
 Restart-on-crash is delegated to the process supervisor (systemd
 `Restart=always`, Docker `restart: unless-stopped`, Kubernetes), the standard
 way to supervise horizontally scaled services. `main.zan` boots via
-`Server.Run(app)` (see `src/framework/Server.zan`), which is now a thin wrapper
-over the standard library: PID/exe discovery, daemonization (`setsid`) and
-`SO_REUSEPORT` worker spawning all live in `System.Diagnostics.ProcessHost`, so
-the same capability is available to any server, not just this template.
+`WebServer.Run(app, count, daemon)` from the standard library; swapping it for
+`WebServer.RunCommand(app, count)` turns the binary into a service that answers
+`start`, `start -d`, `stop`, `restart`, `reload` (rolling worker replacement)
+and `status` on the command line. Listener handoff, respawn-on-crash,
+daemonization and the control port live in `System.Net.Worker` /
+`System.Diagnostics.ProcessHost`, so any server gets them, not just this
+template.
 
 ## Observability (`GET /admin/stats`)
 
