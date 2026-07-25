@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace ZanWeb;
+namespace System.Web;
 
 /// <summary>
 /// Named values for a render: string variables plus named lists of row maps
@@ -72,7 +72,12 @@ class View {
         this.devReload = false;
     }
 
-    /// <summary>Loads every .html under `dir` (one level) into memory.</summary>
+    /// <summary>Loads every .html under `dir` (recursively) into memory,
+    /// keyed by file name without extension. Views live next to their
+    /// controller as <c>&lt;Module&gt;/View/&lt;Controller&gt;.&lt;Action&gt;.html</c>,
+    /// so the key matches the "&lt;Module&gt;.&lt;Controller&gt;.&lt;Action&gt;"
+    /// view id the router injects into each controller instance (the view
+    /// follows the controller, mirroring the reference project layout).</summary>
     static View LoadDir(string dir) {
         View v = new View();
         v.dir = dir;
@@ -80,17 +85,41 @@ class View {
         return v;
     }
 
-    void LoadAll() {
-        if (!Directory.Exists(this.dir)) { return; }
-        List<string> files = Directory.GetFiles(this.dir);
+    void LoadAll() { this.LoadRec(this.dir, ""); }
+
+    // Recursively load templates, keying each by its module-qualified path so
+    // that same-named controllers in different modules don't collide. A file
+    // <Module>/View/<Controller>.<Action>.html becomes the key
+    // "<Module>.<Controller>.<Action>" (the "View" path segment is skipped),
+    // which matches the key the compiler-generated router injects via
+    // __SetView. layout.html stays reachable under the bare "layout" key.
+    void LoadRec(string d, string prefix) {
+        if (!Directory.Exists(d)) { return; }
+        List<string> files = Directory.GetFiles(d);
         int i = 0;
         while (i < files.Count) {
             string fn = files[i];
             if (fn.Length > 5 && fn.Substring(fn.Length - 5, 5) == ".html") {
-                string name = fn.Substring(0, fn.Length - 5);
-                this.templates.Set(name, File.ReadAllText(this.dir + "/" + fn));
+                string stem = fn.Substring(0, fn.Length - 5);
+                string body = File.ReadAllText(d + "/" + fn);
+                this.templates.Set(prefix + stem, body);
+                // Only a root-level layout.html (no module prefix) becomes the
+                // global fallback -- a per-module one (e.g. "Admin.layout")
+                // stays scoped to that module so it doesn't clobber others.
+                if (stem == "layout" && prefix.Length == 0) { this.templates.Set("layout", body); }
             }
             i = i + 1;
+        }
+        List<string> dirs = Directory.GetDirectories(d);
+        int j = 0;
+        while (j < dirs.Count) {
+            string sub = dirs[j];
+            if (sub == "View") {
+                this.LoadRec(d + "/" + sub, prefix);
+            } else {
+                this.LoadRec(d + "/" + sub, prefix + sub + ".");
+            }
+            j = j + 1;
         }
     }
 
@@ -102,10 +131,21 @@ class View {
         return View.RenderStr(tpl, data, null);
     }
 
-    /// <summary>Renders `name` and wraps it into layout.html ({{content}}).</summary>
+    /// <summary>Renders `name` wrapped in the nearest layout.html:
+    /// 1. "&lt;Module&gt;.layout"  (e.g. "Admin.layout") -- module-specific
+    /// 2. "layout"               -- root-level global fallback
+    /// Each module can therefore have its own look-and-feel while sharing a
+    /// global default when no per-module layout is present.</summary>
     string RenderPage(string name, ViewData data) {
         string inner = this.Render(name, data);
-        string layout = this.templates.Get("layout");
+        // Derive module from the first segment of the view key ("A.B.C" -> "A").
+        string layoutKey = "layout";
+        int dot = name.IndexOf(".");
+        if (dot > 0) {
+            string modLayout = name.Substring(0, dot) + ".layout";
+            if (this.templates.Get(modLayout).Length > 0) { layoutKey = modLayout; }
+        }
+        string layout = this.templates.Get(layoutKey);
         if (layout.Length == 0) { return inner; }
         return View.ReplaceOnce(View.RenderStr(layout, data, null), "{{content}}", inner);
     }
@@ -180,29 +220,43 @@ class View {
 
     /// <summary>Escapes &lt; &gt; &amp; " so variables are XSS-safe by default.</summary>
     static string HtmlEscape(string s) {
+        // Fast path: nothing to escape (the common case) -- avoid the
+        // per-character StringBuilder scan entirely.
+        if (s.IndexOf("<") < 0 && s.IndexOf(">") < 0
+            && s.IndexOf("&") < 0 && s.IndexOf("\"") < 0) {
+            return s;
+        }
         StringBuilder sb = new StringBuilder();
         int i = 0;
-        while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (ch == "<") { sb.Append("&lt;"); }
-            else if (ch == ">") { sb.Append("&gt;"); }
-            else if (ch == "&") { sb.Append("&amp;"); }
-            else if (ch == "\"") { sb.Append("&quot;"); }
-            else { sb.Append(ch); }
+        int n = s.Length;
+        int start = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            string esc = "";
+            if (c == 60) { esc = "&lt;"; }        // '<'
+            else if (c == 62) { esc = "&gt;"; }   // '>'
+            else if (c == 38) { esc = "&amp;"; }  // '&'
+            else if (c == 34) { esc = "&quot;"; } // '"'
+            if (esc.Length > 0) {
+                if (i > start) { sb.Append(s.Substring(start, i - start)); }
+                sb.Append(esc);
+                start = i + 1;
+            }
             i = i + 1;
         }
+        if (n > start) { sb.Append(s.Substring(start, n - start)); }
         return sb.ToString();
     }
 
     static int Find(string hay, string needle, int from) {
-        int n = needle.Length;
-        int h = hay.Length;
-        int i = from;
-        while (i + n <= h) {
-            if (hay.Substring(i, n) == needle) { return i; }
-            i = i + 1;
-        }
-        return -1;
+        // Native IndexOf (strstr) instead of an O(n*m) per-position scan that
+        // allocated a fresh substring at every index -- the old version was the
+        // dominant cost of rendering a page.
+        if (from <= 0) { return hay.IndexOf(needle); }
+        if (from >= hay.Length) { return -1; }
+        int p = hay.Substring(from, hay.Length - from).IndexOf(needle);
+        if (p < 0) { return -1; }
+        return from + p;
     }
 
     /// <summary>Finds a closing tag, skipping nested blocks of the same kind.</summary>

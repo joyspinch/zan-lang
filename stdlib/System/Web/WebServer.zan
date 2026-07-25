@@ -1,0 +1,65 @@
+using System;
+using System.Net;
+using System.Diagnostics;
+
+namespace System.Web;
+
+/// <summary>
+/// Boots a <see cref="WebApp"/>: one process running the coroutine event loop,
+/// or a master supervising `count` worker processes (System.Net.Worker), which
+/// is where the listener handoff, respawn-on-crash and the
+/// start/stop/restart/reload/status commands come from.
+///
+/// Single process is the development default -- every connection already runs
+/// in its own coroutine, so it serves thousands of concurrent connections and
+/// logs stream straight into the terminal. With count > 1 the same binary runs
+/// as master and workers; each worker gets connections from the kernel
+/// (SO_REUSEPORT on Linux/macOS) or from the master over a duplicate-socket
+/// channel (Windows).
+/// </summary>
+class WebServer {
+    /// <summary>Runs the app in the foreground: single process when count is 1,
+    /// otherwise a master plus `count` workers. daemon detaches on Linux.</summary>
+    static async int Run(WebApp app, int count, bool daemon) {
+        if (count <= 1) {
+            if (daemon && ProcessHost.Daemonize()) {
+                Console.WriteLine("[server] daemonized; parent process exiting.");
+                return 0;
+            }
+            app.InitStats(WebServer.StatsName(app));
+            int r = await app.Start();
+            return r;
+        }
+        WebServer.Prepare(app, count, daemon);
+        await Worker.RunAll();
+        return 0;
+    }
+
+    /// <summary>Same as <see cref="Run"/>, but the process also answers the
+    /// command line: `start`, `start -d`, `stop`, `restart`, `reload`,
+    /// `status`. Use this from Main when the app is deployed as a service.</summary>
+    static async int RunCommand(WebApp app, int count) {
+        int procs = count;
+        if (procs < 1) { procs = 1; }
+        WebServer.Prepare(app, procs, false);
+        await Worker.RunCommand();
+        return 0;
+    }
+
+    // Shared setup for the multi-process paths: the stats table must exist in
+    // every process (the master creates it, workers open the same memory), and
+    // the pipeline is plugged into the worker as a raw-connection handler so
+    // routing/hooks/uploads run exactly as they do single-process.
+    static void Prepare(WebApp app, int count, bool daemon) {
+        app.InitStats(WebServer.StatsName(app));
+        WebApp.SetActive(app);
+        Worker w = Worker.Create("http", app.Host(), app.Port());
+        w.SetCount(count);
+        w.onRawConnection = WebApp.ServeSock;
+        if (daemon) { Worker.SetDaemonize(true); }
+    }
+
+    static string StatsName(WebApp app) {
+        return "zanroute_" + Convert.ToString(app.Port());
+    }
+}

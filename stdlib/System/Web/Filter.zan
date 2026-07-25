@@ -1,0 +1,123 @@
+using System;
+using System.Text;
+
+namespace System.Web;
+
+/// <summary>
+/// Unified input filtering. Every frontend parameter fetched through
+/// HttpContext.In* runs through here, so sanitising is centralised instead of
+/// being repeated (and forgotten) in each controller:
+///   Clean  -- trim + strip CR/LF/TAB control chars (safe default)
+///   Html   -- Clean + HTML-entity escape (safe to echo into a page)
+///   ToInt  -- tolerant integer parse with a fallback
+///
+/// Implemented with Substring / Length / char comparison only (no string.Trim /
+/// Replace / IndexOf), matching the rest of the framework, so it stays correct
+/// on binary-safe, byte-length strings.
+/// </summary>
+class Filter {
+    static bool IsSpace(string c) {
+        return c == " " || c == "\t" || c == "\r" || c == "\n";
+    }
+
+    /// <summary>Trim surrounding whitespace and drop CR/LF (TAB -> space) so a
+    /// value cannot smuggle header/log-injection control characters.</summary>
+    static string Clean(string s) {
+        int n = s.Length;
+        if (n == 0) { return s; }
+        int start = 0;
+        while (start < n) {
+            int c = s[start] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            start = start + 1;
+        }
+        int end = n;
+        while (end > start) {
+            int c = s[end - 1] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            end = end - 1;
+        }
+        // Fast path: scan for any control chars in trimmed range.
+        bool hasControl = false;
+        int k = start;
+        while (k < end) {
+            int c = s[k] & 255;
+            if (c == 13 || c == 10 || c == 9) { hasControl = true; break; }
+            k = k + 1;
+        }
+        if (!hasControl) { return s.Substring(start, end - start); }
+        // Flush buffered runs: only allocate on control chars.
+        StringBuilder sb = new StringBuilder();
+        int flush = start;
+        int i = start;
+        while (i < end) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10) {
+                if (i > flush) { sb.Append(s.Substring(flush, i - flush)); }
+                flush = i + 1;
+            } else if (c == 9) {
+                if (i > flush) { sb.Append(s.Substring(flush, i - flush)); }
+                sb.Append(" ");
+                flush = i + 1;
+            }
+            i = i + 1;
+        }
+        if (end > flush) { sb.Append(s.Substring(flush, end - flush)); }
+        return sb.ToString();
+    }
+
+    /// <summary>Clean + escape the five HTML-significant characters. Use this
+    /// for any value that will be rendered back into HTML.</summary>
+    static string Html(string s) {
+        string t = Filter.Clean(s);
+        // Fast path: skip the builder entirely when no special chars are present.
+        if (t.IndexOf("&") < 0 && t.IndexOf("<") < 0 && t.IndexOf(">") < 0
+            && t.IndexOf("\"") < 0 && t.IndexOf("'") < 0) { return t; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int n = t.Length;
+        int start = 0;
+        while (i < n) {
+            int c = t[i] & 255;
+            string esc = "";
+            if (c == 38) { esc = "&amp;"; }       // '&'
+            else if (c == 60) { esc = "&lt;"; }   // '<'
+            else if (c == 62) { esc = "&gt;"; }   // '>'
+            else if (c == 34) { esc = "&quot;"; } // '"'
+            else if (c == 39) { esc = "&#39;"; }  // '\''
+            if (esc.Length > 0) {
+                if (i > start) { sb.Append(t.Substring(start, i - start)); }
+                sb.Append(esc);
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (n > start) { sb.Append(t.Substring(start, n - start)); }
+        return sb.ToString();
+    }
+
+    static int DigitValue(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        return -1;
+    }
+
+    /// <summary>Parses a (cleaned) decimal integer, returning def on any
+    /// non-numeric input. Accepts an optional leading '-'.</summary>
+    static int ToInt(string s, int def) {
+        string t = Filter.Clean(s);
+        if (t.Length == 0) { return def; }
+        int i = 0;
+        bool neg = false;
+        if ((t[0] & 255) == 45) { neg = true; i = 1; }  // '-'
+        if (i >= t.Length) { return def; }
+        int val = 0;
+        while (i < t.Length) {
+            int d = Filter.DigitValue(t[i] & 255);
+            if (d < 0) { return def; }
+            val = val * 10 + d;
+            i = i + 1;
+        }
+        if (neg) { return -val; }
+        return val;
+    }
+}

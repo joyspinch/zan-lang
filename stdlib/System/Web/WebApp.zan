@@ -4,7 +4,7 @@ using System.Net.Sockets;
 using System.Net.Http;
 using System.Diagnostics;
 
-namespace ZanWeb;
+namespace System.Web;
 
 /// <summary>
 /// The application server: coroutine-per-connection HTTP/1.1 event loop
@@ -31,6 +31,9 @@ class WebApp {
     [DllImport("crt")]
     static extern int fclose(int fp);
 
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
     string host;
     int port;
     bool running;
@@ -43,7 +46,6 @@ class WebApp {
     RateLimiter limiter;
     LockManager locks;
     RankFn rankResolver;
-    RouteStats stats;
     ServerMetrics metrics;
 
     int maxBodyBytes;      // in-memory request body cap (413 above this)
@@ -54,6 +56,10 @@ class WebApp {
     int totalRequests;
     int activeConnections;
     bool reusePort;       // bind with SO_REUSEPORT for multi-worker scaling
+
+    // The app serving this process, so the static Worker raw-connection
+    // callback (ServeSock) can reach it. Set by Server before Worker.RunAll.
+    static WebApp active;
 
     WebApp() {
         this.host = "0.0.0.0";
@@ -66,7 +72,6 @@ class WebApp {
         this.limiter = RateLimiter.Create(1);
         this.locks = LockManager.Create();
         this.rankResolver = null;
-        this.stats = RouteStats.Create();
         this.metrics = ServerMetrics.Global();
         this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
         this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
@@ -87,18 +92,27 @@ class WebApp {
 
     // ---- configuration ----
 
+    string Host() { return this.host; }
+    int Port() { return this.port; }
     WebApp Views(string dir) { this.views = View.LoadDir(dir); return this; }
     WebApp MaxBody(int bytes) { this.maxBodyBytes = bytes; return this; }
     WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
     WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
     WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
     WebApp ReusePort(bool on) { this.reusePort = on; return this; }
+    /// <summary>Initialise cross-process route stats. Call after all routes are
+    /// registered and before starting the server or running workers. Safe to
+    /// call in every process: the first call creates the shared table; subsequent
+    /// calls (workers) open it. name must be unique per server instance --
+    /// "zanroute_8080" by convention.</summary>
+    void InitStats(string name) { this.router.InitStats(name); }
     WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
     WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
     WebApp RankResolver(RankFn fn) { this.rankResolver = fn; return this; }
 
-    /// <summary>Generic route registration used by the generated route table
-    /// (Routes.Map). Returns the Route so attribute metadata can be chained.</summary>
+    /// <summary>Generic route registration used by the compiler-generated
+    /// __AttrRoutes.Register. Returns the Route so attribute metadata can be
+    /// chained.</summary>
     Route Map(string method, string pattern, HttpHandler h) {
         return this.router.Add(method, pattern, h);
     }
@@ -141,6 +155,24 @@ class WebApp {
         if (this.listener != null) { this.listener.Stop(); }
     }
 
+    /// <summary>Registers the app that ServeSock hands connections to. Called
+    /// in every process (master and each worker) before Worker.RunAll.</summary>
+    static void SetActive(WebApp app) {
+        active = app;
+    }
+
+    /// <summary>Worker raw-connection callback for multi-process serving: the
+    /// master (or POSIX SO_REUSEPORT worker) hands each accepted socket here;
+    /// it runs the full request pipeline via the active app's HandleConnection.
+    /// Static so it can be assigned to Worker.onRawConnection without needing
+    /// an instance-method delegate.</summary>
+    static async void ServeSock(int clientSock) {
+        WebApp app = active;
+        if (app == null) { Socket.Close(clientSock); return; }
+        app.activeConnections = app.activeConnections + 1;
+        await app.HandleConnection(clientSock);
+    }
+
     async void HandleConnection(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         // Connection-owned receive buffer. Socket.RecvIntoAsync reports the
@@ -152,6 +184,7 @@ class WebApp {
         while (keepAlive) {
             int firstN = await Socket.RecvIntoAsync(clientSock, connBuf, 65535);
             if (firstN <= 0) { break; }
+            connBuf[firstN] = 0;
             string rawData = connBuf;
 
             // Guard: header block must stay under the receive buffer (64KB).
@@ -270,10 +303,7 @@ class WebApp {
 
     /// <summary>Preallocates a reusable ARC-managed receive buffer.</summary>
     static string MakeBuffer(int size) {
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < size) { sb.Append(" "); i = i + 1; }
-        return sb.ToString();
+        return calloc(size + 1, 1);
     }
 
     /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.
@@ -289,11 +319,10 @@ class WebApp {
     }
 
     async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, int startMs) {
-        int startedAt = WebApp.NowSeconds();
 
         // Global rate limit (per second across all routes).
         if (this.globalLimit > 0
-            && !this.limiter.Allow("_global_", this.globalLimit, startedAt)) {
+            && !this.limiter.Allow("_global_", this.globalLimit, WebApp.NowSeconds())) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
             ctx.Json("{\"code\":\"429\",\"msg\":\"too many requests\"}");
             return ctx.BuildResponse(keepAlive);
@@ -315,11 +344,10 @@ class WebApp {
             return ctx.BuildResponse(keepAlive);
         }
 
-        string routeKey = route.Key();
-
-        // Per-route rate limit.
+        // Per-route rate limit. route.Key() is only materialised for routes
+        // that actually declare a limit -- an unlimited route never touches it.
         if (route.rateLimit > 0
-            && !this.limiter.Allow(routeKey, route.rateLimit, startedAt)) {
+            && !this.limiter.Allow(route.Key(), route.rateLimit, WebApp.NowSeconds())) {
             ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
             ctx.Json("{\"code\":\"429\",\"msg\":\"route rate limit exceeded\"}");
             return ctx.BuildResponse(keepAlive);
@@ -351,23 +379,27 @@ class WebApp {
 
         // Request lock ([Lock]): one in-flight request per (scope) key. Held for
         // the duration of the handler and released right after it returns.
-        string lockKey = LockManager.KeyFor(route, uid);
-        if (!this.locks.TryAcquire(lockKey)) {
-            ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
-            ctx.Json("{\"code\":\"429\",\"msg\":\"request already in progress\"}");
-            return ctx.BuildResponse(keepAlive);
+        string lockKey = "";
+        if (route.lockScope.Length > 0) {
+            lockKey = LockManager.KeyFor(route, uid);
+            if (!this.locks.TryAcquire(lockKey)) {
+                ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
+                ctx.Json("{\"code\":\"429\",\"msg\":\"request already in progress\"}");
+                return ctx.BuildResponse(keepAlive);
+            }
         }
 
+        int rIdx = route.idx;
         HttpHandler h = route.handler;
         await h(ctx);
-        this.locks.Release(lockKey);
+        if (lockKey.Length > 0) { this.locks.Release(lockKey); }
         if (!ctx.ended) {
             ctx.Status(500, "Internal Server Error");
             ctx.Json("{\"code\":\"500\",\"msg\":\"handler produced no response\"}");
         }
 
         int elapsedMs = ServerMetrics.MonoMillis() - startMs;
-        this.stats.Record(routeKey, elapsedMs);
+        this.router.RecordHit(rIdx, elapsedMs);
         this.hooks.RunAfter(ctx, elapsedMs);
         return ctx.BuildResponse(keepAlive);
     }
@@ -395,7 +427,7 @@ class WebApp {
     string StatusJson() {
         return "{\"total_requests\":" + Convert.ToString(this.totalRequests)
             + ",\"active_connections\":" + Convert.ToString(this.activeConnections)
-            + ",\"routes\":" + this.stats.ToJson() + "}";
+            + ",\"routes\":" + this.router.StatsJson() + "}";
     }
 
     /// <summary>Full runtime metrics snapshot (CPU, memory, request + query
@@ -413,12 +445,18 @@ class WebApp {
     }
 
     static int FindHeaderEnd(string raw) {
-        int i = 0;
         int n = raw.Length;
-        while (i + 4 <= n) {
-            if (raw.Substring(i, 4) == "\r\n\r\n") { return i; }
+        int i = 0;
+        while (i < n) {
+            if ((raw[i] & 255) == 10) {
+                // "\n\n"
+                if (i + 1 < n && (raw[i + 1] & 255) == 10) { return i + 2; }
+                // "\n\r\n"
+                if (i + 2 < n && (raw[i + 1] & 255) == 13 && (raw[i + 2] & 255) == 10) { return i + 3; }
+            }
             i = i + 1;
         }
         return -1;
     }
 }
+

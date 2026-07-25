@@ -1,6 +1,7 @@
 using System;
+using System.Threading;
 
-namespace ZanWeb;
+namespace System.Web;
 
 /// <summary>Request handler signature: fill the response on ctx. Async so an
 /// action can await I/O (Cache/Redis/async services) without blocking the
@@ -91,20 +92,31 @@ class Router {
     // never touched per request, so the hot path is a single hash lookup
     // instead of a linear scan over every static route.
     Dictionary<string, Route> staticIndex;
+    // Open-addressed index over the static routes: slot -> index into
+    // `statics`, -1 when empty. Rebuilt whenever a route is added, so the
+    // request path only probes it.
+    List<int> hashSlots;
+    int hashMask;
     // Every route by Route.idx (registration order).
     List<Route> flat;
-    // Per-route request stats as ONE flat int list, 4 ints per route:
-    //   [idx*4+0]=hits  [idx*4+1]=totMs  [idx*4+2]=minMs  [idx*4+3]=maxMs
-    // Recording a hit touches this single list only (no Route object), so the
-    // hot path has no per-request ARC on a heap object.
-    List<int> stats;
+    // Precomputed key string for each route in flat order.
+    // Stored separately so RecordHit never touches a Route object (no ARC).
+    List<string> flatKeys;
+    // Cross-process shared stats table (SharedTable backed by named shared
+    // memory). Columns: "hits" (int), "total_ms" (int). Keyed by route.key.
+    // Null until InitStats is called. All workers share the same table so
+    // /admin/stats reflects the aggregate across every worker process.
+    SharedTable routeStats;
 
     Router() {
         this.statics = new List<Route>();
         this.dynamics = new List<Route>();
         this.staticIndex = new Dictionary<string, Route>();
+        this.hashSlots = null;
+        this.hashMask = 0;
         this.flat = new List<Route>();
-        this.stats = new List<int>();
+        this.flatKeys = new List<string>();
+        this.routeStats = null;
     }
 
     static Router Create() { return new Router(); }
@@ -115,24 +127,57 @@ class Router {
             this.statics.Add(r);
             Dictionary<string, Route> idx = this.staticIndex;
             idx[method + " " + pattern] = r;
+            this.hashSlots = null;
         } else {
             this.dynamics.Add(r);
         }
         r.idx = this.flat.Count;
         this.flat.Add(r);
-        this.stats.Add(0);
-        this.stats.Add(0);
-        this.stats.Add(0);
-        this.stats.Add(0);
+        this.flatKeys.Add(r.key);
         return r;
     }
 
-    /// <summary>Record one served request by dense route index -- called after
-    /// the handler await from WebApp. Touches only the flat int stats list (no
-    /// Route object), keeping the matched route out of the coroutine frame and
-    /// off the per-request ARC hot path.</summary>
+    /// <summary>Create (master/single-process) or open (worker) the shared
+    /// route stats table. Call after all routes are registered and before the
+    /// first request. name should be unique per server instance, e.g.
+    /// "zanroute_8080". In multi-worker mode every worker calls this too;
+    /// Create falls back to Open when the master has already made the
+    /// table.</summary>
+    void InitStats(string name) {
+        int cap = this.flat.Count;
+        if (cap == 0) { return; }
+        SharedTable t = new SharedTable(name, cap + 4);
+        t.KeySize(128);
+        t.ColumnInt("hits");
+        t.ColumnInt("total_ms");
+        if (t.Create()) {
+            // Master (or single process): seed every route row so workers
+            // can Increment on a pre-existing row without triggering a
+            // capacity-limited auto-create under concurrent first requests.
+            int i = 0;
+            while (i < this.flatKeys.Count) {
+                t.SetInt(this.flatKeys[i], "hits", 0);
+                t.SetInt(this.flatKeys[i], "total_ms", 0);
+                i = i + 1;
+            }
+            this.routeStats = t;
+        } else {
+            // Worker (or shared-memory already exists): open the table the
+            // master created; all workers map the same backing store.
+            SharedTable existing = SharedTable.Open(name);
+            if (existing.IsOpen()) { this.routeStats = existing; }
+        }
+    }
+
+    /// <summary>Record one served request. Two atomic increments into the
+    /// shared stats table -- no Route object touched, no per-process
+    /// computation.</summary>
     void RecordHit(int idx, int ms) {
-        return;
+        if (this.routeStats == null) { return; }
+        if (idx < 0 || idx >= this.flatKeys.Count) { return; }
+        string key = this.flatKeys[idx];
+        this.routeStats.Increment(key, "hits", 1);
+        this.routeStats.Increment(key, "total_ms", ms);
     }
 
     /// <summary>Every registered route (statics then dynamics) -- used by the
@@ -146,33 +191,28 @@ class Router {
         return outp;
     }
 
-    /// <summary>Per-route request stats as a JSON array (only routes that have
-    /// served at least one request), sourced from the counters on each Route.
-    /// Replaces the old string-keyed RouteStats table that was scanned per
-    /// request; recording is now O(1) and this snapshot is built on demand.</summary>
+    /// <summary>Per-route request stats as a JSON array (only routes with at
+    /// least one hit), read from the cross-process shared table. Returns "[]"
+    /// when InitStats has not been called yet.</summary>
     string StatsJson() {
+        if (this.routeStats == null) { return "[]"; }
         StringBuilder sb = new StringBuilder();
         sb.Append("[");
-        List<Route> all = this.All();
         bool first = true;
         int i = 0;
-        while (i < all.Count) {
-            Route r = all[i];
-            int b = r.idx * 4;
-            int hits = this.stats[b];
+        while (i < this.flatKeys.Count) {
+            string key = this.flatKeys[i];
+            int hits = this.routeStats.GetInt(key, "hits");
             if (hits > 0) {
                 if (!first) { sb.Append(","); }
-                int avg = this.stats[b + 1] / hits;
+                int totalMs = this.routeStats.GetInt(key, "total_ms");
+                int avgMs = totalMs / hits;
                 sb.Append("{\"route\":\"");
-                sb.Append(JsonStr.Escape(r.key));
+                sb.Append(JsonStr.Escape(key));
                 sb.Append("\",\"count\":");
                 sb.Append(Convert.ToString(hits));
                 sb.Append(",\"avg_ms\":");
-                sb.Append(Convert.ToString(avg));
-                sb.Append(",\"min_ms\":");
-                sb.Append(Convert.ToString(this.stats[b + 2]));
-                sb.Append(",\"max_ms\":");
-                sb.Append(Convert.ToString(this.stats[b + 3]));
+                sb.Append(Convert.ToString(avgMs));
                 sb.Append("}");
                 first = false;
             }
@@ -187,19 +227,93 @@ class Router {
     Route Put(string pattern, HttpHandler handler) { return this.Add("PUT", pattern, handler); }
     Route Delete(string pattern, HttpHandler handler) { return this.Add("DELETE", pattern, handler); }
 
+    /// <summary>FNV-1a over "method path" without building the key string.
+    /// Folded to 30 bits so the multiply never overflows.</summary>
+    static int HashKey(string method, string path) {
+        int h = 2166136261;
+        int i = 0;
+        int n = method.Length;
+        while (i < n) {
+            h = ((h ^ (method[i] & 255)) * 16777619) & 1073741823;
+            i = i + 1;
+        }
+        h = ((h ^ 32) * 16777619) & 1073741823;
+        i = 0;
+        n = path.Length;
+        while (i < n) {
+            h = ((h ^ (path[i] & 255)) * 16777619) & 1073741823;
+            i = i + 1;
+        }
+        return h;
+    }
+
+    /// <summary>Rebuilds the open-addressed static-route index. Runs once
+    /// after registration (and again if a route is added later), never per
+    /// request. Slots hold indices into `statics`; -1 is empty.</summary>
+    void RebuildIndex() {
+        int cap = 16;
+        while (cap < this.statics.Count * 4) { cap = cap * 2; }
+        List<int> slots = new List<int>();
+        int i = 0;
+        while (i < cap) { slots.Add(-1); i = i + 1; }
+        int mask = cap - 1;
+        i = 0;
+        while (i < this.statics.Count) {
+            Route r = this.statics[i];
+            int h = Router.HashKey(r.method, r.pattern) & mask;
+            bool placed = false;
+            while (!placed) {
+                int si = slots[h];
+                if (si < 0) {
+                    slots[h] = i;
+                    placed = true;
+                } else {
+                    Route other = this.statics[si];
+                    if (other.method == r.method && other.pattern == r.pattern) {
+                        slots[h] = i;          // re-registration: last wins
+                        placed = true;
+                    } else {
+                        h = (h + 1) & mask;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        this.hashSlots = slots;
+        this.hashMask = mask;
+    }
+
+    /// <summary>Exact (method, path) static-route lookup: one hash and one
+    /// string compare in the common case, zero allocations.</summary>
+    Route FindStatic(string method, string path) {
+        if (this.hashSlots == null) { this.RebuildIndex(); }
+        int mask = this.hashMask;
+        int h = Router.HashKey(method, path) & mask;
+        int guard = 0;
+        while (guard <= mask) {
+            int si = this.hashSlots[h];
+            if (si < 0) { return null; }
+            Route r = this.statics[si];
+            if (r.method == method && r.pattern == path) { return r; }
+            h = (h + 1) & mask;
+            guard = guard + 1;
+        }
+        return null;
+    }
+
     /// <summary>Finds the route for method+path, filling ctx.routeParams.
     /// Returns null when nothing matches. `pathMatched` is set when some route
     /// has the path but not the method (405 vs 404).</summary>
     Route Match(HttpContext ctx) {
         string method = ctx.method;
         string path = ctx.path;
-        // Static routes: O(1) hash lookup on "METHOD path", then the "*"
-        // (any-method) fallback -- no scan over the static table.
-        Dictionary<string, Route> idx = this.staticIndex;
-        string k = method + " " + path;
-        if (idx.ContainsKey(k)) { return idx[k]; }
-        string kw = "* " + path;
-        if (idx.ContainsKey(kw)) { return idx[kw]; }
+        // Static routes: allocation-free probe into an open-addressed index
+        // over (method, path), then the "*" (any-method) fallback. Nothing
+        // per request builds a "METHOD path" key or scans the static table.
+        Route hit = this.FindStatic(method, path);
+        if (hit != null) { return hit; }
+        hit = this.FindStatic("*", path);
+        if (hit != null) { return hit; }
         List<string> segs = Router.SplitPath(path);
         int i = 0;
         while (i < this.dynamics.Count) {
@@ -235,7 +349,7 @@ class Router {
     static bool IsStatic(string pattern) {
         int i = 0;
         while (i < pattern.Length) {
-            if (pattern.Substring(i, 1) == "{") { return false; }
+            if ((pattern[i] & 255) == 123) { return false; }  // '{'
             i = i + 1;
         }
         return true;
@@ -246,8 +360,8 @@ class Router {
         int i = 0;
         while (i < pat.Count) {
             string p = pat[i];
-            if (p.Length > 2 && p.Substring(0, 1) == "{"
-                && p.Substring(p.Length - 1, 1) == "}") {
+            if (p.Length > 2 && (p[0] & 255) == 123
+                && (p[p.Length - 1] & 255) == 125) {  // '{' '}'
                 into.Set(p.Substring(1, p.Length - 2), segs[i]);
             } else if (p != segs[i]) {
                 return false;
@@ -262,9 +376,9 @@ class Router {
         int i = 0;
         int n = path.Length;
         while (i < n) {
-            while (i < n && path.Substring(i, 1) == "/") { i = i + 1; }
+            while (i < n && (path[i] & 255) == 47) { i = i + 1; }  // '/'
             int e = i;
-            while (e < n && path.Substring(e, 1) != "/") { e = e + 1; }
+            while (e < n && (path[e] & 255) != 47) { e = e + 1; }  // '/'
             if (e > i) { outp.Add(path.Substring(i, e - i)); }
             i = e;
         }

@@ -2,7 +2,7 @@ using System;
 using System.Text;
 using System.Net.Http;
 
-namespace ZanWeb;
+namespace System.Web;
 
 /// <summary>
 /// Per-request context: parsed request data (query / form / route params /
@@ -37,7 +37,7 @@ class HttpContext {
         this.statusText = "OK";
         this.contentType = "text/html; charset=utf-8";
         this.body = "";
-        this.headers = new List<string>();
+        this.headers = null;
         this.ended = false;
     }
 
@@ -75,16 +75,19 @@ class HttpContext {
     /// <summary>Reads one cookie from the Cookie header, or "".</summary>
     string Cookie(string name) {
         string all = this.request.GetHeader("Cookie");
-        if (all.Length == 0) { return ""; }
+        int allLen = all.Length;
+        if (allLen == 0) { return ""; }
         string prefix = name + "=";
         int i = 0;
-        while (i < all.Length) {
+        while (i < allLen) {
             // skip leading spaces / separators
-            while (i < all.Length && (all.Substring(i, 1) == " " || all.Substring(i, 1) == ";")) {
+            while (i < allLen) {
+                int c = all[i] & 255;
+                if (c != 32 && c != 59) { break; }  // ' ' or ';'
                 i = i + 1;
             }
             int e = i;
-            while (e < all.Length && all.Substring(e, 1) != ";") { e = e + 1; }
+            while (e < allLen && (all[e] & 255) != 59) { e = e + 1; }  // ';'
             string part = all.Substring(i, e - i);
             if (part.Length > prefix.Length && part.Substring(0, prefix.Length) == prefix) {
                 return part.Substring(prefix.Length);
@@ -137,11 +140,13 @@ class HttpContext {
     }
 
     HttpContext SetHeader(string name, string val) {
+        if (this.headers == null) { this.headers = new List<string>(); }
         this.headers.Add(name + ": " + val);
         return this;
     }
 
     HttpContext SetCookie(string name, string val, int maxAgeSeconds) {
+        if (this.headers == null) { this.headers = new List<string>(); }
         this.headers.Add("Set-Cookie: " + name + "=" + val
             + "; Max-Age=" + Convert.ToString(maxAgeSeconds) + "; Path=/; HttpOnly");
         return this;
@@ -175,6 +180,7 @@ class HttpContext {
     void Redirect(string url) {
         this.status = 302;
         this.statusText = "Found";
+        if (this.headers == null) { this.headers = new List<string>(); }
         this.headers.Add("Location: " + url);
         this.body = "";
         this.ended = true;
@@ -184,18 +190,20 @@ class HttpContext {
     string BuildResponse(bool keepAlive) {
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 ");
-        sb.Append(Convert.ToString(this.status));
+        sb.Append(HttpContext.Itoa(this.status));
         sb.Append(" ");
         sb.Append(this.statusText);
         sb.Append("\r\nContent-Type: ");
         sb.Append(this.contentType);
         sb.Append("\r\nContent-Length: ");
-        sb.Append(Convert.ToString(this.body.Length));
+        sb.Append(HttpContext.Itoa(this.body.Length));
         if (keepAlive) { sb.Append("\r\nConnection: keep-alive"); }
         else { sb.Append("\r\nConnection: close"); }
         sb.Append("\r\nServer: ZanWeb/0.1");
         int i = 0;
-        while (i < this.headers.Count) {
+        int hn = 0;
+        if (this.headers != null) { hn = this.headers.Count; }
+        while (i < hn) {
             sb.Append("\r\n");
             sb.Append(this.headers[i]);
             i = i + 1;
@@ -203,6 +211,40 @@ class HttpContext {
         sb.Append("\r\n\r\n");
         sb.Append(this.body);
         return sb.ToString();
+    }
+
+    /// <summary>Decimal formatting for the response line without going
+    /// through Convert.ToString (which formats via printf). Digits are
+    /// string literals, so the whole conversion is allocation-free apart
+    /// from the builder append.</summary>
+    static string Itoa(int v) {
+        if (v == 0) { return "0"; }
+        int x = v;
+        bool neg = false;
+        if (x < 0) { neg = true; x = 0 - x; }
+        int div = 1;
+        int t = x;
+        while (t >= 10) { div = div * 10; t = t / 10; }
+        StringBuilder sb = new StringBuilder();
+        if (neg) { sb.Append("-"); }
+        while (div > 0) {
+            sb.Append(HttpContext.Digit((x / div) % 10));
+            div = div / 10;
+        }
+        return sb.ToString();
+    }
+
+    static string Digit(int d) {
+        if (d == 0) { return "0"; }
+        if (d == 1) { return "1"; }
+        if (d == 2) { return "2"; }
+        if (d == 3) { return "3"; }
+        if (d == 4) { return "4"; }
+        if (d == 5) { return "5"; }
+        if (d == 6) { return "6"; }
+        if (d == 7) { return "7"; }
+        if (d == 8) { return "8"; }
+        return "9";
     }
 
     // ---- helpers ----
@@ -219,8 +261,10 @@ class HttpContext {
         while (i < n) {
             int eq = -1;
             int e = i;
-            while (e < n && s.Substring(e, 1) != "&") {
-                if (eq < 0 && s.Substring(e, 1) == "=") { eq = e; }
+            while (e < n) {
+                int c = s[e] & 255;
+                if (c == 38) { break; }           // '&'
+                if (eq < 0 && c == 61) { eq = e; } // '='
                 e = e + 1;
             }
             if (eq > i) {
@@ -238,16 +282,22 @@ class JsonStr {
     static string Escape(string s) {
         StringBuilder sb = new StringBuilder();
         int i = 0;
-        while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (ch == "\"") { sb.Append("\\\""); }
-            else if (ch == "\\") { sb.Append("\\\\"); }
-            else if (ch == "\n") { sb.Append("\\n"); }
-            else if (ch == "\r") { sb.Append("\\r"); }
-            else if (ch == "\t") { sb.Append("\\t"); }
-            else { sb.Append(ch); }
+        int n = s.Length;
+        int start = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 34 || c == 92 || c == 10 || c == 13 || c == 9) {
+                if (i > start) { sb.Append(s.Substring(start, i - start)); }
+                if (c == 34) { sb.Append("\\\""); }      // '"'
+                else if (c == 92) { sb.Append("\\\\"); }  // '\'
+                else if (c == 10) { sb.Append("\\n"); }   // '\n'
+                else if (c == 13) { sb.Append("\\r"); }   // '\r'
+                else { sb.Append("\\t"); }                // '\t'
+                start = i + 1;
+            }
             i = i + 1;
         }
+        if (n > start) { sb.Append(s.Substring(start, n - start)); }
         return sb.ToString();
     }
 }
