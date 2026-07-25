@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Net;
 using System.Net.Sockets;
 using System.Net.Http;
+using System.Threading;
 
 namespace System.Net.Http;
 
@@ -10,24 +12,31 @@ namespace System.Net.Http;
 async delegate HttpResponse HttpRequestHandler(HttpRequest request);
 
 /// <summary>
-/// Coroutine-based HTTP/1.1 server, inspired by Workerman.
-/// Each client connection is handled in its own coroutine,
-/// enabling massive concurrency without threads.
+/// Coroutine-based HTTP/1.1 server: the http facade over System.Net.Worker.
+/// Each client connection is served by its own coroutine, and Workers(n) runs
+/// the same server in n processes (SO_REUSEPORT on Linux/macOS, master accept
+/// plus WSADuplicateSocket handoff on Windows) exactly like workerman's
+/// $worker->count.
 ///
 /// Usage:
 ///   class MyApp {
 ///       static void Main() {
 ///           HttpServer server = HttpServer.Create("0.0.0.0", 8080);
-///           server.OnRequest(HandleRequest);
-///           server.Start();
+///           server.Workers(4);
+///           server.OnRequest(MyApp.HandleRequest);
+///           await server.Start();
 ///       }
-///       static HttpResponse HandleRequest(HttpRequest req) {
+///       static async HttpResponse HandleRequest(HttpRequest req) {
 ///           if (req.path == "/") {
 ///               return HttpResponse.Ok("<h1>Hello Zan!</h1>");
 ///           }
 ///           return HttpResponse.NotFound();
 ///       }
 ///   }
+///
+/// The connection loop (ServeConnection) is the single implementation of
+/// HTTP/1.1 framing and limits in the stdlib; Worker's "http" protocol runs
+/// the very same code, so the two never drift apart.
 /// </summary>
 class HttpServer {
     TcpListener listener;
@@ -38,6 +47,8 @@ class HttpServer {
     int activeConnections;
     int requestTimeout;
     int maxRequestBytes;
+    int maxHeaderBytes;
+    int workerCount;
     HttpRequestHandler requestHandler;
 
     HttpServer(string host, int port) {
@@ -48,6 +59,8 @@ class HttpServer {
         this.activeConnections = 0;
         this.requestTimeout = 30000;
         this.maxRequestBytes = 1048576;
+        this.maxHeaderBytes = 16384;
+        this.workerCount = 1;
         this.requestHandler = null;
     }
 
@@ -75,6 +88,22 @@ class HttpServer {
     /// unbounded request.</summary>
     HttpServer SetMaxRequestBytes(int bytes) {
         this.maxRequestBytes = bytes;
+        return this;
+    }
+
+    /// <summary>Sets the maximum size, in bytes, of the request header block.
+    /// A client that keeps sending headers without the terminating blank line
+    /// is answered with 431 and disconnected before the buffer can grow to the
+    /// whole-request limit.</summary>
+    HttpServer SetMaxHeaderBytes(int bytes) {
+        this.maxHeaderBytes = bytes;
+        return this;
+    }
+
+    /// <summary>Number of processes serving this port (workerman's
+    /// $worker->count). 1 (default) serves in this process.</summary>
+    HttpServer Workers(int count) {
+        this.workerCount = count;
         return this;
     }
 
@@ -108,10 +137,22 @@ class HttpServer {
         return this;
     }
 
-    /// <summary>Starts the HTTP server event loop.
-    /// Runs forever, accepting and handling connections; each accept and the
-    /// per-connection IO suspend on the IO reactor instead of busy-waiting.</summary>
+    /// <summary>Starts the server. With Workers(n>1) this hands the listener to
+    /// System.Net.Worker, which spawns and supervises n processes; otherwise it
+    /// runs the accept loop here. Never returns while the server is running;
+    /// each accept and every per-connection read suspends on the IO reactor
+    /// instead of busy-waiting.</summary>
     async void Start() {
+        if (this.workerCount > 1) {
+            Worker w = Worker.Create("http", this.host, this.port);
+            w.count = this.workerCount;
+            w.onHttpRequest = this.requestHandler;
+            w.SetMaxConnections(this.maxConnections);
+            w.SetHttpLimits(this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
+            await Worker.RunAll();
+            return;
+        }
+
         Socket.Initialize();
         this.listener = TcpListener.Create(this.host, this.port);
         this.listener.Start();
@@ -120,18 +161,55 @@ class HttpServer {
         while (this.running) {
             int clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
-                this.activeConnections = this.activeConnections + 1;
-                // Handle each connection on its own coroutine so the accept
-                // loop keeps accepting instead of serving one client at a time.
-                Task.Spawn(HandleConnection(clientSock));
+                if (this.activeConnections >= this.maxConnections) {
+                    // Over the limit: answer 503 and hang up rather than piling
+                    // up coroutines and buffers for connections we cannot serve.
+                    Task.Spawn(HttpServer.RejectOverloaded(clientSock));
+                } else {
+                    this.activeConnections = this.activeConnections + 1;
+                    // Handle each connection on its own coroutine so the accept
+                    // loop keeps accepting instead of serving one client at a time.
+                    Task.Spawn(HandleConnection(clientSock));
+                }
             }
         }
     }
 
-    /// <summary>Handles a single client connection.
-    /// Supports HTTP keep-alive for multiple requests.</summary>
-    async void HandleConnection(int clientSock) {
+    static async void RejectOverloaded(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
+        HttpResponse busy = HttpResponse.WithStatus(503, "Service Unavailable",
+            "server busy");
+        busy = busy.SetKeepAlive(false);
+        int _s = await client.SendAsync(busy.Build());
+        client.Close();
+    }
+
+    /// <summary>Handles a single client connection.</summary>
+    async void HandleConnection(int clientSock) {
+        await HttpServer.ServeConnection(clientSock, this.requestHandler,
+            this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
+        this.activeConnections = this.activeConnections - 1;
+    }
+
+    /// <summary>Serves one HTTP/1.1 connection to completion: framing (partial
+    /// reads, exact Content-Length bodies, pipelining), keep-alive, the limits
+    /// that keep a hostile client from consuming the process, and dispatch to
+    /// <paramref name="handler"/>.
+    ///
+    /// This is the stdlib's only HTTP connection loop: HttpServer and Worker's
+    /// "http" protocol both run it, so framing fixes and hardening apply to
+    /// both. Limits, all enforced before the offending bytes are buffered:
+    ///   431 -- header block larger than <paramref name="maxHeaderBytes"/>;
+    ///   413 -- request larger than <paramref name="maxRequestBytes"/>, decided
+    ///          from Content-Length instead of after buffering the body;
+    ///   hang-up -- a request that is not complete within
+    ///          <paramref name="timeoutMs"/> (slowloris: the deadline is set per
+    ///          request and is NOT refreshed by trickled bytes).</summary>
+    static async void ServeConnection(int clientSock, HttpRequestHandler handler,
+                                      int maxHeaderBytes, int maxRequestBytes,
+                                      int timeoutMs) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        int watch = HttpDeadline.Arm(clientSock, timeoutMs);
         bool keepAlive = true;
         // Bytes received but not yet consumed as a complete request. Persisting
         // this across the keep-alive loop is what makes framing correct: a read
@@ -144,13 +222,18 @@ class HttpServer {
         // copying it. The alias is only valid until the next receive, so it is
         // detached (copied) before any further RecvReuseAsync.
         bool aliased = false;
-        bool overflow = false;
+        int reject = 0;
 
         while (keepAlive) {
+            // A fresh deadline per request: a connection may idle between
+            // keep-alive requests, but once bytes start arriving the whole
+            // request has to land inside the window.
+            HttpDeadline.Touch(watch, timeoutMs);
+
             // 1) Read until the full header block has arrived.
             int headerEnd = HttpServer.FindHeaderEnd(buffer);
             while (headerEnd < 0) {
-                if (buffer.Length > this.maxRequestBytes) { overflow = true; break; }
+                if (buffer.Length > maxHeaderBytes) { reject = 431; break; }
                 if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
                 string chunk = await client.RecvReuseAsync();
                 if (chunk.Length == 0) { keepAlive = false; break; }
@@ -162,7 +245,7 @@ class HttpServer {
                 }
                 headerEnd = HttpServer.FindHeaderEnd(buffer);
             }
-            if (overflow) { break; }
+            if (reject != 0) { break; }
             if (!keepAlive) { break; }
 
             // 2) Parse once: the headers are complete here, so every header
@@ -172,7 +255,7 @@ class HttpServer {
             int bodyLen = request.contentLength;
             if (bodyLen < 0) { bodyLen = 0; }
             int need = headerEnd + bodyLen;
-            if (need > this.maxRequestBytes) { overflow = true; break; }
+            if (need > maxRequestBytes) { reject = 413; break; }
             while (buffer.Length < need) {
                 if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
                 string chunk = await client.RecvReuseAsync();
@@ -195,8 +278,15 @@ class HttpServer {
             }
             aliased = false;
             keepAlive = request.keepAlive;
+            Worker.BumpStat();
 
-            HttpResponse response = await ProcessRequest(request);
+            HttpResponse response = null;
+            if (handler != null) {
+                response = await handler(request);
+            } else {
+                response = HttpResponse.Ok(
+                    "<h1>Zan HTTP Server</h1><p>Register a handler with OnRequest.</p>");
+            }
             response = response.SetKeepAlive(keepAlive);
 
             string responseData = response.Build();
@@ -207,24 +297,20 @@ class HttpServer {
             }
         }
 
-        if (overflow) {
-            HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
+        if (reject == 431) {
+            HttpResponse big = HttpResponse.WithStatus(431,
+                "Request Header Fields Too Large", "header block exceeds limit");
+            big = big.SetKeepAlive(false);
+            int _h = await client.SendAsync(big.Build());
+        } else if (reject == 413) {
+            HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large",
+                "request exceeds limit");
             tooLarge = tooLarge.SetKeepAlive(false);
             int _s = await client.SendAsync(tooLarge.Build());
         }
 
+        HttpDeadline.Disarm(watch);
         client.Close();
-        this.activeConnections = this.activeConnections - 1;
-    }
-
-    /// <summary>Default request processor. Override this in subclasses
-    /// or use a routing table. Async: awaits the registered handler.</summary>
-    async HttpResponse ProcessRequest(HttpRequest request) {
-        HttpRequestHandler handler = this.requestHandler;
-        if (handler != null) {
-            return await handler(request);
-        }
-        return HttpResponse.Ok("<h1>Zan HTTP Server</h1><p>Override ProcessRequest to handle routes.</p>");
     }
 
     /// <summary>Stops the server.</summary>
@@ -243,6 +329,104 @@ class HttpServer {
     /// <summary>Returns whether the server is running.</summary>
     bool IsRunning() {
         return this.running;
+    }
+}
+
+/// <summary>
+/// Per-connection request deadlines, swept by one coroutine for the whole
+/// process.
+///
+/// A timeout cannot be taken on the receive itself: the connection coroutine is
+/// parked in the IO reactor with nothing else to run it. Instead each connection
+/// registers a deadline slot, and a single sweeper wakes once a second and hangs
+/// up on whoever is late. That is O(1) work per request (one integer store) and
+/// one coroutine per process, rather than a timer coroutine per connection.
+///
+/// The sweeper shuts the socket down instead of closing it, so the waiting
+/// coroutine is woken by a 0-byte read and unwinds through its normal
+/// disconnect path (freeing the slot); closing the descriptor here would strand
+/// that coroutine and leak the slot.
+/// </summary>
+class HttpDeadline {
+    static List<int> socks = new List<int>();
+    static List<int> deadlines = new List<int>();
+    static List<int> freeSlots = new List<int>();
+    static bool sweeping = false;
+    // Coarse clock kept by the sweeper: reading the real clock costs a syscall
+    // (and an allocation on POSIX), which is not worth paying per request when
+    // the timeout is measured in seconds.
+    static int nowMs = 0;
+
+    /// <summary>Registers a connection and returns its slot, or -1 when
+    /// deadlines are disabled (timeoutMs &lt;= 0).</summary>
+    static int Arm(int sock, int timeoutMs) {
+        if (timeoutMs <= 0) { return -1; }
+        if (!sweeping) {
+            sweeping = true;
+            nowMs = Stopwatch.GetMilliseconds();
+            Task.Spawn(HttpDeadline.Sweep());
+        }
+        int n = freeSlots.Count;
+        if (n > 0) {
+            int slot = freeSlots[n - 1];
+            freeSlots.RemoveAt(n - 1);
+            socks[slot] = sock;
+            deadlines[slot] = nowMs + timeoutMs;
+            return slot;
+        }
+        socks.Add(sock);
+        deadlines.Add(nowMs + timeoutMs);
+        return socks.Count - 1;
+    }
+
+    /// <summary>Restarts the window for a slot (called once per request).</summary>
+    static void Touch(int slot, int timeoutMs) {
+        if (slot < 0) { return; }
+        deadlines[slot] = nowMs + timeoutMs;
+    }
+
+    /// <summary>Releases a slot when the connection is done.</summary>
+    static void Disarm(int slot) {
+        if (slot < 0) { return; }
+        socks[slot] = -1;
+        freeSlots.Add(slot);
+    }
+
+    // One pass: refresh the coarse clock and hang up on late connections.
+    // Kept out of the coroutine because a static written from inside an async
+    // method is captured by value there -- the clock update would be lost and
+    // every connection would look overdue.
+    static bool SweepOnce() {
+        nowMs = Stopwatch.GetMilliseconds();
+        int i = 0;
+        int n = socks.Count;
+        while (i < n) {
+            int s = socks[i];
+            if (s >= 0 && nowMs > deadlines[i]) {
+                // Push the deadline out so a slot is only hung up once; the
+                // owning coroutine frees it via Disarm as it unwinds.
+                deadlines[i] = nowMs + 3600000;
+                Socket.ShutdownBoth(s);
+            }
+            i = i + 1;
+        }
+        return socks.Count > freeSlots.Count;
+    }
+
+    static void StopSweeping() {
+        sweeping = false;
+    }
+
+    // The sweeper only lives while connections are armed: a coroutine parked in
+    // a permanent timer loop would keep the scheduler (and so the process)
+    // alive after the last server task finished. Arm() restarts it.
+    static async void Sweep() {
+        bool live = true;
+        while (live) {
+            await Task.Delay(1000);
+            live = HttpDeadline.SweepOnce();
+        }
+        HttpDeadline.StopSweeping();
     }
 }
 

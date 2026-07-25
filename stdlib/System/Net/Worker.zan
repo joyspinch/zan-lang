@@ -85,6 +85,11 @@ class Worker {
     int connectionCount;
     int maxConnections;
 
+    // ---- http limits (see HttpServer.ServeConnection) ----
+    int maxHeaderBytes;
+    int maxRequestBytes;
+    int requestTimeout;
+
     /// <summary>Number of worker processes serving this Worker's port. The
     /// largest count of any registered Worker decides how many worker
     /// processes RunAll launches; 1 (default) = serve in-process.</summary>
@@ -170,6 +175,9 @@ class Worker {
         this.running = false;
         this.connectionCount = 0;
         this.maxConnections = 10000;
+        this.maxHeaderBytes = 16384;
+        this.maxRequestBytes = 1048576;
+        this.requestTimeout = 30000;
         this.count = 1;
         this.onConnect = null;
         this.onMessage = null;
@@ -227,6 +235,16 @@ class Worker {
     /// Connections over the limit are accepted and immediately closed.</summary>
     Worker SetMaxConnections(int max) {
         this.maxConnections = max;
+        return this;
+    }
+
+    /// <summary>Sets the HTTP limits enforced per connection: header block
+    /// size (431 past it), whole-request size (413), and the time a single
+    /// request may take before the connection is hung up (0 disables).</summary>
+    Worker SetHttpLimits(int maxHeaderBytes, int maxRequestBytes, int timeoutMs) {
+        this.maxHeaderBytes = maxHeaderBytes;
+        this.maxRequestBytes = maxRequestBytes;
+        this.requestTimeout = timeoutMs;
         return this;
     }
 
@@ -301,27 +319,71 @@ class Worker {
 
         int procs = MaxCount();
         if (procs <= 1) {
-            Console.WriteLine("[Worker] single process serving "
-                + Convert.ToString(workers.Count) + " listener(s)");
-            LogListeners();
+            PrintBanner(1);
             await RunAllLoopsInProcess(true);
             return;
         }
 
-        Console.WriteLine("[Worker] master pid=" + Convert.ToString(ProcessHost.Pid())
-            + " starting " + Convert.ToString(procs) + " workers");
-        LogListeners();
+        PrintBanner(procs);
         await RunAsMaster(procs);
     }
 
-    static void LogListeners() {
+    // Right-pads to a column width, so the listener table lines up like
+    // workerman's start-up screen.
+    static string Pad(string s, int width) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(s);
+        int i = s.Length;
+        while (i < width) {
+            sb.Append(" ");
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static string Rule(string title) {
+        StringBuilder sb = new StringBuilder();
+        int total = 76;
+        if (title.Length == 0) {
+            int k = 0;
+            while (k < total) { sb.Append("-"); k = k + 1; }
+            return sb.ToString();
+        }
+        int side = (total - title.Length - 2) / 2;
+        int i = 0;
+        while (i < side) { sb.Append("-"); i = i + 1; }
+        sb.Append(" ");
+        sb.Append(title);
+        sb.Append(" ");
+        i = sb.Length;
+        while (i < total) { sb.Append("-"); i = i + 1; }
+        return sb.ToString();
+    }
+
+    /// <summary>Prints the workerman-style start-up screen: runtime line, then
+    /// one row per listener with protocol, address, process count and
+    /// state.</summary>
+    static void PrintBanner(int procs) {
+        Console.WriteLine(Rule("ZAN"));
+        string mode = "single process";
+        if (procs > 1) { mode = "master + " + Convert.ToString(procs) + " workers"; }
+        Console.WriteLine(Pad("Zan runtime: native", 30)
+            + Pad("pid: " + Convert.ToString(ProcessHost.Pid()), 22)
+            + "mode: " + mode);
+        Console.WriteLine(Rule("WORKERS"));
+        Console.WriteLine(Pad("worker", 22) + Pad("listen", 32)
+            + Pad("processes", 12) + "status");
         int i = 0;
         while (i < workers.Count) {
             Worker w = workers[i];
-            Console.WriteLine("[Worker] " + w.name + " -> " + w.protocol + "://"
-                + w.host + ":" + Convert.ToString(w.port));
+            int c = w.count;
+            if (c < 1) { c = 1; }
+            Console.WriteLine(Pad(w.name, 22)
+                + Pad(w.protocol + "://" + w.host + ":" + Convert.ToString(w.port), 32)
+                + Pad(Convert.ToString(c), 12) + "[OK]");
             i = i + 1;
         }
+        Console.WriteLine(Rule(""));
     }
 
     /// <summary>Stops all workers in this process (single-process mode).</summary>
@@ -974,74 +1036,12 @@ class Worker {
 
     // ---- http ----
 
+    // HTTP framing, limits and dispatch live in exactly one place --
+    // HttpServer.ServeConnection -- which this protocol runs as-is, so the
+    // Worker path and a bare HttpServer cannot drift apart.
     async void HandleHttp(int clientSock) {
-        TcpClient client = TcpClient.FromSocket(clientSock);
-        bool keepAlive = true;
-        // Bytes received but not yet consumed as a complete request; correct
-        // framing across partial and pipelined requests (see HttpServer).
-        string buffer = "";
-        // When the whole request arrives in one receive (the common case),
-        // `buffer` aliases the connection's shared receive buffer instead of
-        // copying it. The alias is only valid until the next receive, so it is
-        // detached (copied) before any further RecvReuseAsync.
-        bool aliased = false;
-
-        while (keepAlive) {
-            int headerEnd = HttpServer.FindHeaderEnd(buffer);
-            while (headerEnd < 0) {
-                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
-                string chunk = await client.RecvReuseAsync();
-                if (chunk.Length == 0) { keepAlive = false; break; }
-                if (buffer.Length == 0) {
-                    buffer = chunk;
-                    aliased = true;
-                } else {
-                    buffer = buffer + chunk;
-                }
-                headerEnd = HttpServer.FindHeaderEnd(buffer);
-            }
-            if (!keepAlive) { break; }
-
-            // Parse once: the headers are complete here, so every header
-            // field is final; only the body may still be in flight. (The old
-            // code re-parsed the request a second time after buffering the
-            // body -- double work on the hot path.)
-            HttpRequest request = HttpRequest.Parse(buffer);
-            int bodyLen = request.contentLength;
-            if (bodyLen < 0) { bodyLen = 0; }
-            int need = headerEnd + bodyLen;
-            while (buffer.Length < need) {
-                if (aliased) { buffer = buffer.Substring(0, buffer.Length); aliased = false; }
-                string chunk = await client.RecvReuseAsync();
-                if (chunk.Length == 0) { keepAlive = false; break; }
-                buffer = buffer + chunk;
-            }
-            if (!keepAlive && buffer.Length < need) { break; }
-
-            if (bodyLen > 0) {
-                request.body = buffer.Substring(headerEnd, bodyLen);
-            } else {
-                request.body = "";
-            }
-            if (buffer.Length > need) {
-                buffer = buffer.Substring(need);
-            } else {
-                buffer = "";
-            }
-            aliased = false;
-            keepAlive = request.keepAlive;
-            BumpStat();
-
-            HttpResponse response = null;
-            if (this.onHttpRequest != null) {
-                response = await this.onHttpRequest(request);
-            } else {
-                response = HttpResponse.Ok("<h1>Zan Worker - " + this.name + "</h1>");
-            }
-            response = response.SetKeepAlive(keepAlive);
-            int _sent = await client.SendAsync(response.Build());
-        }
-        client.Close();
+        await HttpServer.ServeConnection(clientSock, this.onHttpRequest,
+            this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
         this.connectionCount = this.connectionCount - 1;
     }
 
