@@ -122,6 +122,19 @@ class Worker {
 
     static List<Worker> workers = new List<Worker>();
     static bool daemonize = false;
+    // Set by RunCommand: the process was started through the CLI, so it also
+    // answers stop/reload/status on the control port.
+    static bool cliMode = false;
+    // Set by a STOP command: workers that exit are not respawned.
+    static bool stopping = false;
+    // Live worker control connections, used to ask a worker to quit.
+    static List<TcpClient> ctlConn = new List<TcpClient>();
+    static List<int> ctlWid = new List<int>();
+    #if WINDOWS
+    // Worker side: the handoff channels this process reads accepted sockets
+    // from, closed when it is asked to quit so no new work arrives.
+    static List<TcpClient> wkChannels = new List<TcpClient>();
+    #endif
     static int controlPort = 0;
     static int nextConnId = 1;
     static string logDir = "";
@@ -348,6 +361,85 @@ class Worker {
         return 19999;
     }
 
+    /// <summary>Runs the process-management command line, workerman-style:
+    ///
+    ///   app                 -- start in the foreground (debug)
+    ///   app start           -- same
+    ///   app start -d        -- start as a daemon
+    ///   app stop            -- stop the running master and its workers
+    ///   app restart [-d]    -- stop, then start
+    ///   app reload          -- replace the workers one at a time, letting the
+    ///                          old ones finish what they are serving
+    ///   app status          -- print the running server's worker table
+    ///
+    /// The running instance is addressed through its control port, so no pid
+    /// file has to be kept in sync, and the same commands work on Windows,
+    /// where signals are not available.
+    ///
+    /// Start commands never return; the others exit when the master answers.
+    /// </summary>
+    static async void RunCommand() {
+        cliMode = true;
+        string cmd = "start";
+        bool detach = false;
+        int i = 0;
+        while (i < Environment.ArgCount()) {
+            string a = Environment.ArgAt(i);
+            if (a == "-d" || a == "--daemon") {
+                detach = true;
+            } else if (i == 0) {
+                cmd = a;
+            }
+            i = i + 1;
+        }
+
+        if (cmd == "stop") {
+            await SendCommand("STOP");
+            return;
+        }
+        if (cmd == "reload") {
+            await SendCommand("RELOAD");
+            return;
+        }
+        if (cmd == "status") {
+            await SendCommand("STATUS");
+            return;
+        }
+        if (cmd == "restart") {
+            await SendCommand("STOP");
+            // Give the old master time to drop the control port before the new
+            // one claims it exclusively.
+            await Task.Delay(1500);
+            cmd = "start";
+        }
+        if (cmd != "start") {
+            Console.WriteLine("usage: <app> [start [-d] | stop | restart [-d] | reload | status]");
+            return;
+        }
+        if (detach) { daemonize = true; }
+        await RunAll();
+    }
+
+    // Sends one command line to the running master and prints its answer.
+    static async void SendCommand(string cmd) {
+        Socket.Initialize();
+        TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
+        if (c == null || !c.IsConnected()) {
+            Console.WriteLine("[Worker] no server on control port "
+                + Convert.ToString(ControlPort()));
+            return;
+        }
+        int _s = await c.SendAsync(cmd + "\n");
+        string reply = "";
+        while (true) {
+            string chunk = await c.RecvAsync(4096);
+            if (chunk.Length == 0) { break; }
+            reply = reply + chunk;
+        }
+        c.Close();
+        if (reply.Length > 0) { Console.Write(reply); }
+    }
+
     /// <summary>Runs every registered Worker. Never returns. In the master
     /// process with count > 1 this spawns and supervises worker processes;
     /// in a worker process (or with count == 1) it serves connections.</summary>
@@ -368,6 +460,11 @@ class Worker {
         int procs = MaxCount();
         if (procs <= 1) {
             PrintBanner(1);
+            // stop/status/reload have to reach a single-process server too, so
+            // it listens on the control port just like a master does. Only
+            // under RunCommand: a program that just calls RunAll gets exactly
+            // the behaviour it had before, with no extra port bound.
+            if (cliMode) { Task.Spawn(SingleProcessControlLoop()); }
             await RunAllLoopsInProcess(true);
             return;
         }
@@ -512,6 +609,14 @@ class Worker {
         // master (e.g. env vars failed to propagate), its bind fails here and
         // it exits instead of spawning children of its own.
         int ctlSock = Socket.CreateTcp();
+        #if !WINDOWS
+        // Lets a restart rebind while the previous master's control
+        // connections are still in TIME_WAIT. On POSIX this does not allow a
+        // second listener on the port, so the exclusivity check below still
+        // catches a master that is actually running. (Not on Windows, where
+        // SO_REUSEADDR would let one process steal another's port.)
+        Socket.SetReuseAddr(ctlSock);
+        #endif
         int ctlBind = Socket.Bind(ctlSock, "127.0.0.1", ControlPort());
         if (ctlBind != 0) {
             Console.WriteLine("[Worker] FATAL: control port "
@@ -644,9 +749,17 @@ class Worker {
             if (chunk.Length == 0) { ok = false; break; }
             line = line + chunk;
         }
-        if (!ok || line.Length < 7) { conn.Close(); return; }
+        if (!ok) { conn.Close(); return; }
 
         List<string> f = SplitWords(line);
+        if (f.Count == 0) { conn.Close(); return; }
+
+        // Commands from the CLI (`app stop|reload|status`) share the control
+        // port with the worker handshake: they are single words.
+        if (f[0] == "STOP" || f[0] == "RELOAD" || f[0] == "STATUS") {
+            await HandleCliCommand(conn, f[0]);
+            return;
+        }
         if (f.Count < 3) { conn.Close(); return; }
 
         #if WINDOWS
@@ -670,6 +783,8 @@ class Worker {
 
         Console.WriteLine("[Worker] worker " + Convert.ToString(childWid)
             + " (pid " + Convert.ToString(childPid) + ") online");
+        ctlConn.Add(conn);
+        ctlWid.Add(childWid);
 
         // Supervise: the control connection stays open for the worker's whole
         // life and carries its periodic "STAT wid pid req cpuMs rss" reports;
@@ -687,6 +802,12 @@ class Worker {
             }
         }
         conn.Close();
+        DropCtl(conn);
+        if (stopping) {
+            Console.WriteLine("[Worker] worker " + Convert.ToString(childWid)
+                + " (pid " + Convert.ToString(childPid) + ") stopped");
+            return;
+        }
         Console.WriteLine("[Worker] worker " + Convert.ToString(childWid)
             + " (pid " + Convert.ToString(childPid) + ") exited; respawning");
         // Pace respawns so a worker that dies instantly on startup cannot
@@ -695,13 +816,228 @@ class Worker {
         SpawnChild(childWid);
     }
 
+    static void DropCtl(TcpClient conn) {
+        int i = 0;
+        while (i < ctlConn.Count) {
+            if (ctlConn[i] == conn) {
+                ctlConn.RemoveAt(i);
+                ctlWid.RemoveAt(i);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Master side of `app stop|reload|status`.
+    //
+    // stop:   ask every worker to quit (each finishes what it is serving),
+    //         wait for their control connections to close, then exit.
+    // reload: ask them to quit one at a time; the supervisor respawns each one,
+    //         so the port is served throughout.
+    // status: send back the same table the foreground master prints.
+    static async void HandleCliCommand(TcpClient conn, string cmd) {
+        if (cmd == "STATUS") {
+            int _s = await conn.SendAsync(StatusText());
+            conn.Close();
+            return;
+        }
+        if (cmd == "STOP") {
+            stopping = true;
+            int _r = await conn.SendAsync("stopping "
+                + Convert.ToString(ctlConn.Count) + " worker(s)\n");
+            conn.Close();
+            await StopWorkersAndExit();
+            return;
+        }
+        // RELOAD: answer right away and cycle the workers in the background,
+        // so the caller is not held for the whole rolling restart.
+        int _l = await conn.SendAsync("reloading "
+            + Convert.ToString(ctlConn.Count) + " worker(s)\n");
+        conn.Close();
+        Task.Spawn(ReloadWorkers());
+    }
+
+    static async void StopWorkersAndExit() {
+        int i = 0;
+        while (i < ctlConn.Count) {
+            int _q = await ctlConn[i].SendAsync("QUIT\n");
+            i = i + 1;
+        }
+        int waited = 0;
+        while (ctlConn.Count > 0 && waited < 30000) {
+            await Task.Delay(200);
+            waited = waited + 200;
+        }
+        Console.WriteLine("[Worker] master stopped");
+        exit(0);
+    }
+
+    // Replaces the workers one at a time: each is asked to quit, finishes what
+    // it is serving and exits, the supervisor respawns it, and only then is the
+    // next one touched -- so the listener is served throughout.
+    static async void ReloadWorkers() {
+        int total = ctlConn.Count;
+        int done = 0;
+        while (done < total && ctlConn.Count > 0) {
+            TcpClient victim = ctlConn[0];
+            int wid = ctlWid[0];
+            int before = ctlConn.Count;
+            int _q = await victim.SendAsync("QUIT\n");
+            int waited = 0;
+            while (waited < 30000 && ctlConn.Count >= before) {
+                await Task.Delay(100);
+                waited = waited + 100;
+            }
+            Console.WriteLine("[Worker] reloaded worker " + Convert.ToString(wid));
+            done = done + 1;
+            // Let the replacement report in before cycling the next one.
+            await Task.Delay(1500);
+        }
+        Console.WriteLine("[Worker] reload complete");
+    }
+
+    // The status table `app status` prints, built from the workers' last
+    // reports (master) or this process's own counters (single process).
+    static string StatusText() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(Rule("ZAN STATUS"));
+        sb.Append("\n");
+        sb.Append(Pad("master pid: " + Convert.ToString(ProcessHost.Pid()), 30));
+        sb.Append("control port: " + Convert.ToString(ControlPort()));
+        sb.Append("\n");
+        int i = 0;
+        while (i < workers.Count) {
+            Worker w = workers[i];
+            sb.Append(Pad(w.name, 22)
+                + Pad(w.protocol + "://" + w.host + ":" + Convert.ToString(w.port), 32)
+                + "[OK]\n");
+            i = i + 1;
+        }
+        sb.Append(Rule(""));
+        sb.Append("\n");
+        sb.Append(Pad("worker", 10) + Pad("pid", 10) + Pad("requests", 14)
+            + Pad("cpu ms", 12) + "memory\n");
+        if (stWid.Count == 0) {
+            int conns = 0;
+            int k = 0;
+            while (k < workers.Count) {
+                conns = conns + workers[k].connectionCount;
+                k = k + 1;
+            }
+            sb.Append(Pad("self", 10)
+                + Pad(Convert.ToString(ProcessHost.Pid()), 10)
+                + Pad(Convert.ToString(statRequests), 14)
+                + Pad(Convert.ToString(ServerMetrics.CpuMillis()), 12)
+                + Convert.ToString(ServerMetrics.MemoryRssBytes() / 1048576) + "MB\n");
+            sb.Append("connections: " + Convert.ToString(conns) + "\n");
+            return sb.ToString();
+        }
+        int total = 0;
+        int j = 0;
+        while (j < stWid.Count) {
+            total = total + stReq[j];
+            sb.Append(Pad("w" + Convert.ToString(stWid[j]), 10)
+                + Pad(Convert.ToString(stPid[j]), 10)
+                + Pad(Convert.ToString(stReq[j]), 14)
+                + Pad(Convert.ToString(stCpuMs[j]), 12)
+                + Convert.ToString(stRss[j] / 1048576) + "MB\n");
+            j = j + 1;
+        }
+        sb.Append("total requests: " + Convert.ToString(total) + "\n");
+        return sb.ToString();
+    }
+
+    // Control listener for a single-process server started through RunCommand:
+    // the same stop/reload/status commands, answered without a master.
+    static async void SingleProcessControlLoop() {
+        int ctlSock = Socket.CreateTcp();
+        #if !WINDOWS
+        Socket.SetReuseAddr(ctlSock);
+        #endif
+        if (Socket.Bind(ctlSock, "127.0.0.1", ControlPort()) != 0) {
+            Socket.Close(ctlSock);
+            return;
+        }
+        Socket.Listen(ctlSock, 16);
+        Socket.SetNonBlocking(ctlSock);
+        while (true) {
+            int s = await Socket.AcceptAsync(ctlSock);
+            if (s < 0) { continue; }
+            Socket.SetNonBlocking(s);
+            Task.Spawn(HandleSelfCommand(s));
+        }
+    }
+
+    static async void HandleSelfCommand(int sock) {
+        TcpClient conn = TcpClient.FromSocket(sock);
+        string line = "";
+        while (true) {
+            int nl = IndexOfByte(line, 10);
+            if (nl >= 0) { line = line.Substring(0, nl); break; }
+            string chunk = await conn.RecvAsync(64);
+            if (chunk.Length == 0) { conn.Close(); return; }
+            line = line + chunk;
+        }
+        List<string> f = SplitWords(line);
+        if (f.Count == 0) { conn.Close(); return; }
+        if (f[0] == "STATUS") {
+            int _s = await conn.SendAsync(StatusText());
+            conn.Close();
+            return;
+        }
+        if (f[0] == "STOP") {
+            StopAll();
+            int _r = await conn.SendAsync("stopped\n");
+            conn.Close();
+            await DrainThenExit();
+            return;
+        }
+        if (f[0] == "RELOAD") {
+            // Nothing to replace without worker processes; a single-process
+            // server is reloaded by restarting it.
+            int _l = await conn.SendAsync("single-process server: use restart\n");
+            conn.Close();
+            return;
+        }
+        conn.Close();
+    }
+
+    // Stops accepting and leaves once the connections in flight are done (or
+    // the grace period is over), so a stop/reload does not cut off a response
+    // that is halfway out.
+    static async void DrainThenExit() {
+        StopAll();
+        #if WINDOWS
+        // Drop the handoff channels so the master stops giving this worker new
+        // connections while it finishes the ones it already has.
+        int c = 0;
+        while (c < wkChannels.Count) {
+            wkChannels[c].Close();
+            c = c + 1;
+        }
+        #endif
+        int waited = 0;
+        while (waited < 30000) {
+            int conns = 0;
+            int i = 0;
+            while (i < workers.Count) {
+                conns = conns + workers[i].connectionCount;
+                i = i + 1;
+            }
+            if (conns <= 0) { break; }
+            await Task.Delay(100);
+            waited = waited + 100;
+        }
+        exit(0);
+    }
+
     // ======================================================================
     // worker process: obtain listeners, serve, exit with master
     // ======================================================================
 
     static async void RunAsWorkerProcess() {
         TcpClient ctl = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
-        if (!ctl.IsConnected()) {
+        if (ctl == null || !ctl.IsConnected()) {
             Console.WriteLine("[Worker] worker cannot reach master; exiting");
             exit(1);
         }
@@ -716,12 +1052,13 @@ class Worker {
         while (i < workers.Count) {
             if (workers[i].protocol != "udp") {
                 TcpClient ch = await TcpClient.ConnectAsync("127.0.0.1", ControlPort());
-                if (!ch.IsConnected()) {
+                if (ch == null || !ch.IsConnected()) {
                     Console.WriteLine("[Worker] channel connect failed; exiting");
                     exit(1);
                 }
                 int _c = await ch.SendAsync("CHAN " + Convert.ToString(ProcessHost.Pid())
                     + " " + Convert.ToString(i) + "\n");
+                wkChannels.Add(ch);
                 Task.Spawn(ChannelLoop(ch, workers[i]));
             }
             i = i + 1;
@@ -748,10 +1085,17 @@ class Worker {
         Task.Spawn(StatReportLoop(ctl));
 
         // Liveness watch: the master holds this connection open for our whole
-        // life; when it closes (master exited), leave too.
+        // life; when it closes (master exited), leave too. It also sends QUIT
+        // for a stop or a reload, which means "stop accepting and leave once
+        // the requests in flight are answered".
         while (true) {
             string beat = await ctl.RecvAsync(64);
             if (beat.Length == 0) { break; }
+            if (IndexOfByte(beat, 81) >= 0) {   // 'Q'
+                ctl.Close();
+                await DrainThenExit();
+                return;
+            }
         }
         exit(0);
     }
