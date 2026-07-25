@@ -30,6 +30,14 @@ async delegate string DatagramHandler(string data);
 /// application keeps the SseConnection and pushes events through it. Async.</summary>
 async delegate void SseSubscriberHandler(SseConnection conn);
 
+/// <summary>Invoked with a freshly accepted (and, on Windows, handed-off)
+/// client socket. When set it overrides the built-in per-protocol handling:
+/// the callback owns the socket and drives the whole connection itself. Lets
+/// an application server (e.g. an MVC framework) reuse the master/worker
+/// accept + WSADuplicateSocket handoff + supervision while keeping its own
+/// request pipeline. Async so it can await I/O.</summary>
+async delegate void RawConnHandler(int sock);
+
 /// <summary>
 /// Workerman-style multi-protocol server: one Worker per listen address,
 /// per-event callbacks, and a master + N worker-processes runtime that
@@ -89,6 +97,7 @@ class Worker {
     HttpRequestHandler onHttpRequest;
     DatagramHandler onUdpMessage;
     SseSubscriberHandler onSseSubscriber;
+    RawConnHandler onRawConnection;
 
     static List<Worker> workers = new List<Worker>();
     static bool daemonize = false;
@@ -168,6 +177,7 @@ class Worker {
         this.onHttpRequest = null;
         this.onUdpMessage = null;
         this.onSseSubscriber = null;
+        this.onRawConnection = null;
     }
 
     /// <summary>Creates and registers a Worker for the given protocol
@@ -294,9 +304,6 @@ class Worker {
             Console.WriteLine("[Worker] single process serving "
                 + Convert.ToString(workers.Count) + " listener(s)");
             LogListeners();
-            if (statusInterval > 0 && !daemonize) {
-                Task.Spawn(SelfStatusLoop());
-            }
             await RunAllLoopsInProcess(true);
             return;
         }
@@ -434,9 +441,6 @@ class Worker {
             wid = wid + 1;
         }
 
-        if (statusInterval > 0 && !daemonize) {
-            Task.Spawn(MasterStatusLoop());
-        }
 
         // Accept control connections forever: first HELLO from each worker gets
         // the listener handoff, then the connection doubles as a liveness watch
@@ -897,6 +901,13 @@ class Worker {
     // Starts serving one accepted client on its own coroutine, so the caller
     // (accept loop or handoff channel) immediately moves to the next one.
     void Dispatch(int clientSock) {
+        // Application-owned socket: the raw handler drives the whole
+        // connection (its own request loop and connection accounting), so it
+        // bypasses the built-in per-protocol handlers and connectionCount gate.
+        if (this.onRawConnection != null) {
+            Task.Spawn(this.RunRaw(clientSock));
+            return;
+        }
         if (this.connectionCount >= this.maxConnections) {
             Socket.Close(clientSock);
             return;
@@ -913,6 +924,15 @@ class Worker {
         } else {
             Task.Spawn(HandleTcp(clientSock));
         }
+    }
+
+    // Spawnable async wrapper around the raw-connection delegate. Task.Spawn
+    // needs a concrete async method frame; awaiting the delegate here uses the
+    // proven indirect async-call path (spawning the delegate call directly does
+    // not build a task frame).
+    async void RunRaw(int clientSock) {
+        Worker.BumpStat();
+        await this.onRawConnection(clientSock);
     }
 
     Connection NewConnection(int sock) {

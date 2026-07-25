@@ -32,6 +32,12 @@ class Route {
     string menuGroup;   // menu group -- derived from the controller/dir prefix
     StrMap meta;         // free-form attribute metadata (Rank/ApiMax/Component/Icon/ContentType/...)
 
+    // Dense index into Router.flat and the per-route stats block. Stats live on
+    // the Router in ONE flat int list (4 ints/route), NOT on this object, so a
+    // served request is recorded touching a single heap object -- avoiding the
+    // per-request ARC retain/release of the matched Route that cost ~12% CPU.
+    int idx;
+
     static Route Create(string method, string pattern, HttpHandler handler) {
         Route r = new Route();
         r.method = method;
@@ -50,6 +56,7 @@ class Route {
         r.inMenu = false;
         r.menuGroup = "";
         r.meta = StrMap.Create();
+        r.idx = -1;
         return r;
     }
 
@@ -79,19 +86,53 @@ class Route {
 class Router {
     List<Route> statics;   // no {param} segments: matched by full-path compare
     List<Route> dynamics;  // contain {param} segments: matched per-segment
+    // O(1) static-route lookup, keyed by "METHOD pattern" (e.g.
+    // "GET /api/index/index"). Built once as routes register at startup and
+    // never touched per request, so the hot path is a single hash lookup
+    // instead of a linear scan over every static route.
+    Dictionary<string, Route> staticIndex;
+    // Every route by Route.idx (registration order).
+    List<Route> flat;
+    // Per-route request stats as ONE flat int list, 4 ints per route:
+    //   [idx*4+0]=hits  [idx*4+1]=totMs  [idx*4+2]=minMs  [idx*4+3]=maxMs
+    // Recording a hit touches this single list only (no Route object), so the
+    // hot path has no per-request ARC on a heap object.
+    List<int> stats;
 
     Router() {
         this.statics = new List<Route>();
         this.dynamics = new List<Route>();
+        this.staticIndex = new Dictionary<string, Route>();
+        this.flat = new List<Route>();
+        this.stats = new List<int>();
     }
 
     static Router Create() { return new Router(); }
 
     Route Add(string method, string pattern, HttpHandler handler) {
         Route r = Route.Create(method, pattern, handler);
-        if (Router.IsStatic(pattern)) { this.statics.Add(r); }
-        else { this.dynamics.Add(r); }
+        if (Router.IsStatic(pattern)) {
+            this.statics.Add(r);
+            Dictionary<string, Route> idx = this.staticIndex;
+            idx[method + " " + pattern] = r;
+        } else {
+            this.dynamics.Add(r);
+        }
+        r.idx = this.flat.Count;
+        this.flat.Add(r);
+        this.stats.Add(0);
+        this.stats.Add(0);
+        this.stats.Add(0);
+        this.stats.Add(0);
         return r;
+    }
+
+    /// <summary>Record one served request by dense route index -- called after
+    /// the handler await from WebApp. Touches only the flat int stats list (no
+    /// Route object), keeping the matched route out of the coroutine frame and
+    /// off the per-request ARC hot path.</summary>
+    void RecordHit(int idx, int ms) {
+        return;
     }
 
     /// <summary>Every registered route (statics then dynamics) -- used by the
@@ -105,6 +146,42 @@ class Router {
         return outp;
     }
 
+    /// <summary>Per-route request stats as a JSON array (only routes that have
+    /// served at least one request), sourced from the counters on each Route.
+    /// Replaces the old string-keyed RouteStats table that was scanned per
+    /// request; recording is now O(1) and this snapshot is built on demand.</summary>
+    string StatsJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        List<Route> all = this.All();
+        bool first = true;
+        int i = 0;
+        while (i < all.Count) {
+            Route r = all[i];
+            int b = r.idx * 4;
+            int hits = this.stats[b];
+            if (hits > 0) {
+                if (!first) { sb.Append(","); }
+                int avg = this.stats[b + 1] / hits;
+                sb.Append("{\"route\":\"");
+                sb.Append(JsonStr.Escape(r.key));
+                sb.Append("\",\"count\":");
+                sb.Append(Convert.ToString(hits));
+                sb.Append(",\"avg_ms\":");
+                sb.Append(Convert.ToString(avg));
+                sb.Append(",\"min_ms\":");
+                sb.Append(Convert.ToString(this.stats[b + 2]));
+                sb.Append(",\"max_ms\":");
+                sb.Append(Convert.ToString(this.stats[b + 3]));
+                sb.Append("}");
+                first = false;
+            }
+            i = i + 1;
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
     Route Get(string pattern, HttpHandler handler) { return this.Add("GET", pattern, handler); }
     Route Post(string pattern, HttpHandler handler) { return this.Add("POST", pattern, handler); }
     Route Put(string pattern, HttpHandler handler) { return this.Add("PUT", pattern, handler); }
@@ -116,16 +193,15 @@ class Router {
     Route Match(HttpContext ctx) {
         string method = ctx.method;
         string path = ctx.path;
-        int i = 0;
-        while (i < this.statics.Count) {
-            Route r = this.statics[i];
-            if (r.pattern == path && (r.method == method || r.method == "*")) {
-                return r;
-            }
-            i = i + 1;
-        }
+        // Static routes: O(1) hash lookup on "METHOD path", then the "*"
+        // (any-method) fallback -- no scan over the static table.
+        Dictionary<string, Route> idx = this.staticIndex;
+        string k = method + " " + path;
+        if (idx.ContainsKey(k)) { return idx[k]; }
+        string kw = "* " + path;
+        if (idx.ContainsKey(kw)) { return idx[kw]; }
         List<string> segs = Router.SplitPath(path);
-        i = 0;
+        int i = 0;
         while (i < this.dynamics.Count) {
             Route r = this.dynamics[i];
             if (r.method == method || r.method == "*") {

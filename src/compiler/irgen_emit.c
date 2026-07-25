@@ -127,6 +127,13 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
      * non-async programs (it just nulls an already-empty queue). */
     zan_call2(g->builder, g->rt_co_sched_init_type, g->rt_co_sched_init, NULL, 0, "");
 
+    /* The static-field initializers below emit calls into Main's entry block.
+     * Anchor them to Main's source location so that, under -g, calls to
+     * (possibly always-inlined) generated helpers such as Foo_Defaults carry a
+     * !dbg location; the LLVM verifier rejects inlinable calls without one in a
+     * function that has debug info. No-op when debug info is disabled. */
+    di_set_loc(g, method->loc);
+
     /* Apply static-field initializers once, at program entry, into their
      * backing globals. Runs before the Main body so every subsequent read
      * (in Main or in any method/coroutine) observes the initialized value. */

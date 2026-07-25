@@ -393,7 +393,6 @@ partial class ZanIDE {
         cmds.Add(RibbonCmd.Group("home", ZanIDE.T("Start", "开始")));
         cmds.Add(RibbonCmd.Group("play", ZanIDE.T("Run", "运行")));
         cmds.Add(RibbonCmd.Create("bug", ZanIDE.T("Debug", "调试")));
-        cmds.Add(RibbonCmd.Create("check", ZanIDE.T("Build", "构建")));
         cmds.Add(RibbonCmd.Create("upload", ZanIDE.T("Publish", "发布")));
         cmds.Add(RibbonCmd.Create("refresh", ZanIDE.T("Hot", "热重载")));
         cmds.Add(RibbonCmd.Group("layout", ZanIDE.T("Design/Code", "设计/代码")));
@@ -406,21 +405,18 @@ partial class ZanIDE {
     }
 
     /// Maps a ribbon position (from Ribbon.Render) to its stable action id.
-    /// Action ids: 0 Project, 1 New, 2 Open, 3 Save, 4 Run, 5 Build,
+    /// Action ids: 0 Project, 1 New, 2 Open, 3 Save, 4 Run,
     /// 6 Publish, 7 Debug, 8 Template, 9 Designer, 10 Start, 11 Hot,
     /// 12 Config, 13 Settings, 14 Help, 15 Assets.
     static int RibbonAction(int pos) {
         if (pos == 4) { return 10; }
         if (pos == 5) { return 4; }
         if (pos == 6) { return 7; }
-        if (pos == 7) { return 5; }
-        if (pos == 8) { return 6; }
-        if (pos == 9) { return 11; }
-        if (pos == 10) { return 9; }
-        if (pos == 11) { return 8; }
-        if (pos == 13) { return 15; }
-        if (pos == 14) { return 13; }
-        if (pos == 15) { return 14; }
+        if (pos == 7) { return 6; }
+        if (pos == 8) { return 11; }
+        if (pos == 10) { return 8; }
+        if (pos == 11) { return 12; }
+        if (pos == 12) { return 15; }
         return pos;
     }
 
@@ -1226,6 +1222,9 @@ partial class ZanIDE {
         string buildTargetPath = "";
         // Hot reload: when ON, saving rebuilds and restarts the running app.
         bool autoRun = ZanIDE.CfgInt(cfg, "autoRun", 0) == 1;
+        // Set by a save when autoRun is ON; consumed once per loop to kick off a
+        // DETACHED rebuild (never a synchronous compile on the UI thread).
+        bool hotReloadReq = false;
         SignalInt treeSel = SignalInt.Create(-1);
         int lastTreeSel = -1;
 
@@ -1625,7 +1624,7 @@ partial class ZanIDE {
                         Layer.Msg(ZanIDE.T("Saved", "已保存"), 3);
                     } else if (!designerMode && !sceneMode && aSv >= 0 && aSv < tabPaths.Count && tabPaths[aSv] != "@start") {
                         ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                        if (autoRun) { ZanIDE.HotReloadRun(tabPaths, activeTab, root, log); }
+                        if (autoRun) { hotReloadReq = true; }
                         rescan = true;
                         Layer.Msg(ZanIDE.T("Saved", "已保存"), 3);
                     }
@@ -1715,11 +1714,11 @@ partial class ZanIDE {
                         log.Add("> Saved " + tabPaths[aSv3] + ".");
                     } else {
                         ZanIDE.SaveActive(editor, tabNames, tabBodies, tabPaths, activeTab, root, log);
-                        if (autoRun) { ZanIDE.HotReloadRun(tabPaths, activeTab, root, log); }
+                        if (autoRun) { hotReloadReq = true; }
                     }
                     Layer.Msg(ZanIDE.T("Saved", "已保存"), 3);
                     rescan = true;
-                } else if (rc == 4 || rc == 5) {
+                } else if (rc == 4) {
                     // Run (4) and Build (5) compile the active target in a
                     // DETACHED shell so a slow compile never freezes the IDE;
                     // completion is handled by the buildBusy poll below.
@@ -1741,7 +1740,7 @@ partial class ZanIDE {
                             string cmdB = ZanIDE.CompileToExe(root, rpB, inB, bdB + "/.zanrun.ll", exeB, false);
                             ZanIDE.BuildDetach(cmdB);
                             buildBusy = true;
-                            buildThenRun = (rc == 4);
+                            buildThenRun = true;
                             buildExe = exeB;
                             buildIsGui = ZanIDE.IsGuiTarget(root, rpB);
                             buildTargetPath = apB;
@@ -3505,6 +3504,37 @@ partial class ZanIDE {
                         app.RequestRedraw();
                     }
                     app.RequestAnimationFrame(250);
+                }
+                // Save-triggered hot reload (autoRun ON): rebuild + restart the
+                // active target in a DETACHED shell so saving never freezes the
+                // IDE. The buildBusy poll below streams output and relaunches on
+                // completion, exactly like the Run action.
+                if (hotReloadReq) {
+                    hotReloadReq = false;
+                    if (!buildBusy) {
+                        int atHr = activeTab.Get();
+                        string apHr = "";
+                        if (atHr >= 0 && atHr < tabPaths.Count) { apHr = tabPaths[atHr]; }
+                        string rpHr = ZanIDE.RibbonRunTarget(apHr, root);
+                        if (rpHr != "") {
+                            string bdHr = ZanIDE.EnsureBuildDir(root);
+                            string exeHr = bdHr + "/.zanrun" + ZanIDE.ExeSuffix();
+                            ZanIDE.HotKillRunExe(exeHr);
+                            if (File.Exists(exeHr)) { File.Delete(exeHr); }
+                            string inHr = ZanIDE.SmartInputs(root, ZanIDE.DirOf(rpHr), rpHr);
+                            string cmdHr = ZanIDE.CompileToExe(root, rpHr, inHr, bdHr + "/.zanrun.ll", exeHr, false);
+                            ZanIDE.BuildDetach(cmdHr);
+                            buildBusy = true;
+                            buildThenRun = true;
+                            buildExe = exeHr;
+                            buildIsGui = ZanIDE.IsGuiTarget(root, rpHr);
+                            buildTargetPath = apHr;
+                            buildLogLen = 0;
+                            bottomTab.Set(0);
+                            log.Add("> [Hot] Rebuilding " + rpHr + " ...");
+                            app.RequestAnimationFrame(80);
+                        }
+                    }
                 }
                 // Poll the in-flight detached build (Run/Build ribbon): stream
                 // compiler output and, when the done-marker appears, apply

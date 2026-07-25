@@ -411,7 +411,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             LLVMValueRef ri = NULL;
             if (stmt->ret.value) {
                 LLVMValueRef rv = emit_expr(g, stmt->ret.value, locals);
-                zan_type_t *ret_type = infer_expr_type(g, stmt->ret.value, locals);
+                zan_type_t *ret_type = concretize(g,
+                    infer_expr_type(g, stmt->ret.value, locals));
                 if (is_rc_managed_type(ret_type) &&
                     !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
                     emit_rc_retain_for_type(g, ret_type, rv);
@@ -426,7 +427,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             /* ARC: hand the caller an owned (+1) reference, then release our
              * owning locals. Retaining a borrowed return value first keeps it
              * alive when it aliases a local about to be released. */
-            zan_type_t *ret_type = infer_expr_type(g, stmt->ret.value, locals);
+            zan_type_t *ret_type = concretize(g,
+                infer_expr_type(g, stmt->ret.value, locals));
             if (is_rc_managed_type(ret_type) &&
                 !expr_yields_owned_rc_value(g, stmt->ret.value, locals)) {
                 emit_rc_retain_for_type(g, ret_type, val);

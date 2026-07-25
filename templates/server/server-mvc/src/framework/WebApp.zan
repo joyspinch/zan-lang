@@ -31,6 +31,9 @@ class WebApp {
     [DllImport("crt")]
     static extern int fclose(int fp);
 
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
     string host;
     int port;
     bool running;
@@ -43,7 +46,6 @@ class WebApp {
     RateLimiter limiter;
     LockManager locks;
     RankFn rankResolver;
-    RouteStats stats;
     ServerMetrics metrics;
 
     int maxBodyBytes;      // in-memory request body cap (413 above this)
@@ -54,6 +56,10 @@ class WebApp {
     int totalRequests;
     int activeConnections;
     bool reusePort;       // bind with SO_REUSEPORT for multi-worker scaling
+
+    // The app serving this process, so the static Worker raw-connection
+    // callback (ServeSock) can reach it. Set by Server before Worker.RunAll.
+    static WebApp active;
 
     WebApp() {
         this.host = "0.0.0.0";
@@ -66,7 +72,6 @@ class WebApp {
         this.limiter = RateLimiter.Create(1);
         this.locks = LockManager.Create();
         this.rankResolver = null;
-        this.stats = RouteStats.Create();
         this.metrics = ServerMetrics.Global();
         this.maxBodyBytes = 2 * 1024 * 1024;      // 2MB default
         this.maxUploadBytes = 512 * 1024 * 1024;  // 512MB streamed-upload default
@@ -144,6 +149,24 @@ class WebApp {
         if (this.listener != null) { this.listener.Stop(); }
     }
 
+    /// <summary>Registers the app that ServeSock hands connections to. Called
+    /// in every process (master and each worker) before Worker.RunAll.</summary>
+    static void SetActive(WebApp app) {
+        active = app;
+    }
+
+    /// <summary>Worker raw-connection callback for multi-process serving: the
+    /// master (or POSIX SO_REUSEPORT worker) hands each accepted socket here;
+    /// it runs the full request pipeline via the active app's HandleConnection.
+    /// Static so it can be assigned to Worker.onRawConnection without needing
+    /// an instance-method delegate.</summary>
+    static async void ServeSock(int clientSock) {
+        WebApp app = active;
+        if (app == null) { Socket.Close(clientSock); return; }
+        app.activeConnections = app.activeConnections + 1;
+        await app.HandleConnection(clientSock);
+    }
+
     async void HandleConnection(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         // Connection-owned receive buffer. Socket.RecvIntoAsync reports the
@@ -155,6 +178,7 @@ class WebApp {
         while (keepAlive) {
             int firstN = await Socket.RecvIntoAsync(clientSock, connBuf, 65535);
             if (firstN <= 0) { break; }
+            connBuf[firstN] = 0;
             string rawData = connBuf;
 
             // Guard: header block must stay under the receive buffer (64KB).
@@ -273,10 +297,7 @@ class WebApp {
 
     /// <summary>Preallocates a reusable ARC-managed receive buffer.</summary>
     static string MakeBuffer(int size) {
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < size) { sb.Append(" "); i = i + 1; }
-        return sb.ToString();
+        return calloc(size + 1, 1);
     }
 
     /// <summary>Full request pipeline: hooks -> rate limit -> auth -> route.
@@ -360,6 +381,7 @@ class WebApp {
             return ctx.BuildResponse(keepAlive);
         }
 
+        int rIdx = route.idx;
         HttpHandler h = route.handler;
         await h(ctx);
         this.locks.Release(lockKey);
@@ -369,7 +391,7 @@ class WebApp {
         }
 
         int elapsedMs = ServerMetrics.MonoMillis() - startMs;
-        this.stats.Record(routeKey, elapsedMs);
+        this.router.RecordHit(rIdx, elapsedMs);
         this.hooks.RunAfter(ctx, elapsedMs);
         return ctx.BuildResponse(keepAlive);
     }
@@ -397,7 +419,7 @@ class WebApp {
     string StatusJson() {
         return "{\"total_requests\":" + Convert.ToString(this.totalRequests)
             + ",\"active_connections\":" + Convert.ToString(this.activeConnections)
-            + ",\"routes\":" + this.stats.ToJson() + "}";
+            + ",\"routes\":" + this.router.StatsJson() + "}";
     }
 
     /// <summary>Full runtime metrics snapshot (CPU, memory, request + query
@@ -424,3 +446,4 @@ class WebApp {
         return -1;
     }
 }
+
