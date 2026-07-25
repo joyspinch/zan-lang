@@ -310,7 +310,12 @@ zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
                     LLVMCreateEnumAttribute(LLVMGetModuleContext(mod),
                         LLVMGetEnumAttributeKindForName("alwaysinline", 12), 0));
                 stats.functions_inlined++;
-            } else if (bb_count <= 10 && level >= ZAN_OPT_FULL) {
+            } else if (bb_count <= 10 &&
+                       (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE)) {
+                /* Size builds (Os) skip the larger inline-hint: hinting
+                 * 5-10 block functions bloats .text via duplication, which is
+                 * exactly what --publish must avoid. Small (<=4 bb) bodies are
+                 * still always-inlined above since they rarely grow code. */
                 LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1),
                     LLVMCreateEnumAttribute(LLVMGetModuleContext(mod),
                         LLVMGetEnumAttributeKindForName("inlinehint", 10), 0));

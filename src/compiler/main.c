@@ -1322,7 +1322,11 @@ int main(int argc, char **argv) {
     if (opt_level >= 0) {
         effective_opt = (zan_opt_level_t)opt_level;
     } else if (publish_mode) {
-        effective_opt = ZAN_OPT_FULL; /* O2 for --publish */
+        /* Release builds optimize for SIZE (Os): the prior O2 default inlined
+         * ~1400 functions and tripled .text, making --publish binaries larger
+         * than debug ones. Os keeps the release binary small while still
+         * folding/DCE-ing; speed-critical builds can pass -O2/-O3 explicitly. */
+        effective_opt = ZAN_OPT_SIZE;
     }
     /* Optimization reorders/folds instructions and drops locals, which makes
      * DWARF line tables and variable locations unreliable. Debug builds stay at
