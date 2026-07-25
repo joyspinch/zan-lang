@@ -49,13 +49,20 @@ async delegate void RawConnHandler(int sock);
 ///   Worker.RunAll();                    // never returns
 ///
 /// Protocols: "tcp", "udp", "http", "websocket" (or "ws"), "sse", "mqtt".
-/// Callbacks (assign what the protocol needs):
-///   onConnect / onMessage / onClose     -- tcp, websocket
-///   onHttpRequest                       -- http
-///   onUdpMessage                        -- udp
+/// Callbacks (assign what the protocol needs); the second name is an alias
+/// reading the way that protocol usually does:
+///   onConnect / onOpen                  -- tcp, websocket: connection up
+///   onMessage / onReceive               -- tcp, websocket: data in, reply out
+///   onClose                             -- tcp, websocket: connection gone
+///   onHttpRequest / onRequest           -- http
+///   onUdpMessage / onPacket             -- udp
 ///   onSseSubscriber                     -- sse
 ///   (none)                              -- mqtt: connections are served by
 ///                                          the built-in MqttBroker.Global()
+///
+/// An "http" worker with onOpen/onMessage set also serves WebSocket on that
+/// same port: a request asking to upgrade becomes a frame loop, everything else
+/// is answered by onRequest.
 ///
 /// MULTI-PROCESS MODEL (count > 1). The initially launched process becomes the
 /// MASTER: it spawns `count` worker copies of this executable and supervises
@@ -103,6 +110,15 @@ class Worker {
     DatagramHandler onUdpMessage;
     SseSubscriberHandler onSseSubscriber;
     RawConnHandler onRawConnection;
+
+    // Protocol-flavoured names for the same events, so each protocol reads the
+    // way it does elsewhere: a WebSocket server talks about open/message/close,
+    // a TCP server about connect/receive/close. Whichever is set wins; setting
+    // both is pointless, not harmful.
+    ConnectionHandler onOpen;        // websocket: connection established
+    MessageHandler onReceive;        // tcp: bytes arrived
+    DatagramHandler onPacket;        // udp: datagram arrived
+    HttpRequestHandler onRequest;    // http: request parsed
 
     static List<Worker> workers = new List<Worker>();
     static bool daemonize = false;
@@ -186,6 +202,38 @@ class Worker {
         this.onUdpMessage = null;
         this.onSseSubscriber = null;
         this.onRawConnection = null;
+        this.onOpen = null;
+        this.onReceive = null;
+        this.onPacket = null;
+        this.onRequest = null;
+    }
+
+    ConnectionHandler OpenHandler() {
+        if (this.onOpen != null) { return this.onOpen; }
+        return this.onConnect;
+    }
+
+    MessageHandler MessageHandlerOf() {
+        if (this.onMessage != null) { return this.onMessage; }
+        return this.onReceive;
+    }
+
+    DatagramHandler PacketHandler() {
+        if (this.onPacket != null) { return this.onPacket; }
+        return this.onUdpMessage;
+    }
+
+    HttpRequestHandler RequestHandler() {
+        if (this.onRequest != null) { return this.onRequest; }
+        return this.onHttpRequest;
+    }
+
+    // Whether this worker can serve WebSocket connections, i.e. whether an HTTP
+    // port should honour an Upgrade request instead of answering it as HTTP.
+    bool HasWsHandlers() {
+        if (this.onOpen != null) { return true; }
+        if (this.onMessage != null) { return true; }
+        return false;
     }
 
     /// <summary>Creates and registers a Worker for the given protocol
@@ -977,7 +1025,13 @@ class Worker {
         }
         this.connectionCount = this.connectionCount + 1;
         if (this.protocol == "http") {
-            Task.Spawn(HandleHttp(clientSock));
+            // An HTTP port with WebSocket callbacks answers both, the way
+            // swoole's WebSocket\Server does: the request head decides.
+            if (this.HasWsHandlers()) {
+                Task.Spawn(HandleWebSocket(clientSock));
+            } else {
+                Task.Spawn(HandleHttp(clientSock));
+            }
         } else if (this.protocol == "websocket" || this.protocol == "ws") {
             Task.Spawn(HandleWebSocket(clientSock));
         } else if (this.protocol == "sse") {
@@ -1009,8 +1063,10 @@ class Worker {
     async void HandleTcp(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         Connection conn = NewConnection(clientSock);
-        if (this.onConnect != null) { await this.onConnect(conn); }
+        ConnectionHandler onUp = this.OpenHandler();
+        if (onUp != null) { await onUp(conn); }
 
+        MessageHandler onData = this.MessageHandlerOf();
         bool active = true;
         while (active && !conn.closed) {
             string data = await client.RecvReuseAsync();
@@ -1019,8 +1075,8 @@ class Worker {
             } else {
                 BumpStat();
                 string response = "";
-                if (this.onMessage != null) {
-                    response = await this.onMessage(conn, data);
+                if (onData != null) {
+                    response = await onData(conn, data);
                 } else {
                     response = data;   // default: echo
                 }
@@ -1041,24 +1097,48 @@ class Worker {
     // HttpServer.ServeConnection -- which this protocol runs as-is, so the
     // Worker path and a bare HttpServer cannot drift apart.
     async void HandleHttp(int clientSock) {
-        await HttpServer.ServeConnection(clientSock, this.onHttpRequest,
+        await HttpServer.ServeConnection(clientSock, this.RequestHandler(),
             this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
         this.connectionCount = this.connectionCount - 1;
     }
 
     // ---- websocket ----
 
+    // A WebSocket port is an HTTP port until the client asks to upgrade, so the
+    // request head is read and parsed first: an Upgrade request becomes a frame
+    // loop, anything else is served as HTTP (swoole's WebSocket\Server does the
+    // same). The bytes consumed here are handed to whichever path takes over.
     async void HandleWebSocket(int clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
 
-        string rawReq = await client.RecvAsync(65536);
-        if (rawReq.Length == 0) {
-            client.Close();
-            this.connectionCount = this.connectionCount - 1;
-            return;
+        string rawReq = "";
+        int headerEnd = -1;
+        while (headerEnd < 0) {
+            if (rawReq.Length > this.maxHeaderBytes) {
+                client.Close();
+                this.connectionCount = this.connectionCount - 1;
+                return;
+            }
+            string chunk = await client.RecvAsync(65536);
+            if (chunk.Length == 0) {
+                client.Close();
+                this.connectionCount = this.connectionCount - 1;
+                return;
+            }
+            rawReq = rawReq + chunk;
+            headerEnd = HttpServer.FindHeaderEnd(rawReq);
         }
         HttpRequest req = HttpRequest.Parse(rawReq);
         string wsKey = req.GetHeader("Sec-WebSocket-Key");
+
+        if (wsKey.Length == 0) {
+            // Plain HTTP on the same port. The head is already consumed, so it
+            // is replayed into the HTTP loop rather than re-read.
+            await HttpServer.ServePrimed(clientSock, this.RequestHandler(), rawReq,
+                this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
+            this.connectionCount = this.connectionCount - 1;
+            return;
+        }
 
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
@@ -1070,12 +1150,18 @@ class Worker {
         int _hs = await client.SendAsync(sb.ToString());
 
         Connection conn = NewConnection(clientSock);
-        if (this.onConnect != null) { await this.onConnect(conn); }
+        ConnectionHandler onUp = this.OpenHandler();
+        if (onUp != null) { await onUp(conn); }
 
         // Reassemble whole frames via WsReader (handles partial and coalesced
         // frames), rather than assuming one recv == one frame.
         WsReader reader = new WsReader(clientSock);
+        if (rawReq.Length > headerEnd) {
+            // The client pipelined frames behind the handshake.
+            reader.Prime(rawReq.Substring(headerEnd), rawReq.Length - headerEnd);
+        }
         WsWriter writer = new WsWriter();
+        MessageHandler onFrameData = this.MessageHandlerOf();
         bool active = true;
         while (active && !conn.closed) {
             int total = reader.FrameSize();
@@ -1097,8 +1183,8 @@ class Worker {
             if (frame.opcode == WsOpcode.Text || frame.opcode == WsOpcode.Binary) {
                 BumpStat();
                 string response = "";
-                if (this.onMessage != null) {
-                    response = await this.onMessage(conn, frame.payload);
+                if (onFrameData != null) {
+                    response = await onFrameData(conn, frame.payload);
                 } else {
                     response = frame.payload;   // default: echo
                 }
@@ -1179,6 +1265,7 @@ class Worker {
     // ---- udp ----
 
     async void RunUdp(int sock) {
+        DatagramHandler onDatagram = this.PacketHandler();
         while (this.running) {
             string data = await Socket.RecvFromPeerAsync(sock, 65536);
             if (data.Length > 0) {
@@ -1186,8 +1273,8 @@ class Worker {
                 string peerIp = Socket.PeerIp();
                 int peerPort = Socket.PeerPort();
                 string response = "";
-                if (this.onUdpMessage != null) {
-                    response = await this.onUdpMessage(data);
+                if (onDatagram != null) {
+                    response = await onDatagram(data);
                 } else {
                     response = data;   // default: echo
                 }
