@@ -294,14 +294,17 @@ partial class ZanIDE {
                     string body = File.ReadAllText(dir + "/src/App.zan");
                     File.WriteAllText(dir + "/src/" + name + ".zan", body);
                     File.Delete(dir + "/src/App.zan");
-                    entry = "src/" + name + ".zan";
                 }
                 if (File.Exists(dir + "/src/App.zform")) {
                     string body = File.ReadAllText(dir + "/src/App.zform");
                     File.WriteAllText(dir + "/src/" + name + ".zform", body);
                     File.Delete(dir + "/src/App.zform");
                 }
+                // Generate each form's strongly-typed layout file (Name.g.zan)
+                // from its .zform, and ensure the business file exists. The
+                // window's Main lives in the generated file, so that is the entry.
                 ZanIDE.SyncFormCodeBehinds(dir + "/src");
+                entry = "src/" + name + ".g.zan";
             }
         } else {
             typeName = "empty";
@@ -330,19 +333,28 @@ partial class ZanIDE {
         while (i < files.Count) {
             string fp = srcDir + "/" + files[i];
             i = i + 1;
-            if (!ZanIDE.IsFormPath(fp)) { continue; }
-            string fbase = ZanIDE.FormBaseName(fp);
-            Designer d = Designer.Create();
-            d.LoadJson(File.ReadAllText(fp));
-            string region = ZanIDE.FieldsRegion(fbase, d.fields, d.winW, d.winH);
-            string cbp = ZanIDE.CodeBehindPath(fp);
-            string cbNew;
-            if (File.Exists(cbp)) {
-                cbNew = ZanIDE.ReplaceDesignerRegion(File.ReadAllText(cbp), region);
-            } else {
-                cbNew = ZanIDE.CodeBehindShell(fbase, region);
+            if (ZanIDE.IsFormPath(fp)) {
+                string fbase = ZanIDE.FormBaseName(fp);
+                Designer d = Designer.Create();
+                d.LoadJson(File.ReadAllText(fp));
+                // The generated layout file is rewritten wholesale from the design.
+                File.WriteAllText(ZanIDE.GenFilePath(fp),
+                    ZanIDE.GenFormFile(fbase, d.fields, d.winW, d.winH, d.winTitleSig.Get()));
+                // The business file is created only if absent - never overwritten.
+                string cbp = ZanIDE.CodeBehindPath(fp);
+                if (!File.Exists(cbp)) {
+                    File.WriteAllText(cbp, ZanIDE.GenBusinessShell(fbase));
+                }
+            } else if (ZanIDE.IsScenePath(fp)) {
+                string sbase = ZanIDE.SceneBaseName(fp);
+                SceneDoc sd = SceneDoc.Parse(File.ReadAllText(fp));
+                File.WriteAllText(ZanIDE.SceneGenFilePath(fp),
+                    ZanIDE.GenSceneFile(sbase, sd));
+                string scbp = ZanIDE.SceneCodeBehindPath(fp);
+                if (!File.Exists(scbp)) {
+                    File.WriteAllText(scbp, ZanIDE.GenSceneBusinessShell(sbase));
+                }
             }
-            File.WriteAllText(cbp, cbNew);
         }
     }
 
@@ -354,19 +366,27 @@ partial class ZanIDE {
         Directory.CreateDirectory(root + "/src");
         if (kind == 6) {
             string scenePath = root + "/src/" + name + ".zscene";
-            File.WriteAllText(scenePath, SceneDoc.Create(name, 1280, 720).ToJson());
-            log.Add("> Created scene " + scenePath + ".");
+            string sgenPath = ZanIDE.SceneGenFilePath(scenePath);
+            string scbPath = ZanIDE.SceneCodeBehindPath(scenePath);
+            SceneDoc sdoc = SceneDoc.Create(name, 1280, 720);
+            File.WriteAllText(scenePath, sdoc.ToJson());
+            File.WriteAllText(sgenPath, ZanIDE.GenSceneFile(name, sdoc));
+            if (!File.Exists(scbPath)) {
+                File.WriteAllText(scbPath, ZanIDE.GenSceneBusinessShell(name));
+            }
+            log.Add("> Created scene " + scenePath + " (+ " + sgenPath + ", " + scbPath + ").");
             return scenePath;
         }
         if (kind == 5) {
             string formPath = root + "/src/" + name + ".zform";
-            string cbPath = root + "/src/" + name + ".zan";
+            string genPath = ZanIDE.GenFilePath(formPath);
+            string cbPath = ZanIDE.CodeBehindPath(formPath);
             File.WriteAllText(formPath, "{\"name\":\"" + name + "\",\"winW\":480,\"winH\":520,\"fields\":[]}");
+            File.WriteAllText(genPath, ZanIDE.GenFormFile(name, new List<FormField>(), 480, 520, name));
             if (!File.Exists(cbPath)) {
-                File.WriteAllText(cbPath, ZanIDE.CodeBehindShell(name,
-                    ZanIDE.FieldsRegion(name, new List<FormField>(), 480, 520)));
+                File.WriteAllText(cbPath, ZanIDE.GenBusinessShell(name));
             }
-            log.Add("> Created form " + formPath + " + code-behind " + cbPath + ".");
+            log.Add("> Created form " + formPath + " (+ " + genPath + ", " + cbPath + ").");
             return formPath;
         }
         string path = root + "/src/" + name + ".zan";
@@ -531,11 +551,25 @@ partial class ZanIDE {
             return "";
         }
         if (ZanIDE.IsFormPath(p)) {
+            string gen = ZanIDE.GenFilePath(p);
+            if (File.Exists(gen)) { return gen; }
             string cb = ZanIDE.CodeBehindPath(p);
             if (File.Exists(cb)) { return cb; }
             return ZanIDE.ProjectEntry(root);
         }
-        if (ZanIDE.IsScenePath(p)) { return ZanIDE.ProjectEntry(root); }
+        if (ZanIDE.IsScenePath(p)) {
+            string sgen = ZanIDE.SceneGenFilePath(p);
+            if (File.Exists(sgen)) { return sgen; }
+            string scb = ZanIDE.SceneCodeBehindPath(p);
+            if (File.Exists(scb)) { return scb; }
+            return ZanIDE.ProjectEntry(root);
+        }
+        // A form's business file (Name.zan) has no Main; compile via its
+        // generated sibling (Name.g.zan), which owns the window's entry point.
+        if (ZanIDE.IsZanFilePath(p) && !ZanIDE.IsGenPath(p)) {
+            string gen = p.Substring(0, p.Length - 4) + ".g.zan";
+            if (File.Exists(gen)) { return gen; }
+        }
         return p;
     }
 

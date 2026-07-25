@@ -1,0 +1,239 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Game.Scene;
+
+// Runtime renderer for a .zscene document. The IDE scene designer previews a
+// SceneDoc while authoring; SceneView draws the exact same elements at run time
+// onto a real window's content area, honouring the design resolution, scale
+// mode and per-element anchors (via SceneDoc.Metrics / SceneDoc.Resolve). This
+// is what generated Name.g.zan code uses so a designed scene runs as designed.
+class SceneView {
+    static int PackColor(int r, int g, int b, int a) {
+        return a * 16777216 + r * 65536 + g * 256 + b;
+    }
+
+    static bool IsSlotKind(string kind) {
+        return kind == "skillslot" || kind == "quickslot"
+            || kind == "bagslot" || kind == "itemslot";
+    }
+
+    static List<string> SplitItems(string items) {
+        List<string> o = new List<string>();
+        string cur = "";
+        int i = 0;
+        while (i < items.Length) {
+            string c = items.Substring(i, 1);
+            if (c == ";") { o.Add(cur); cur = ""; }
+            else { cur = cur + c; }
+            i = i + 1;
+        }
+        if (cur.Length > 0) { o.Add(cur); }
+        return o;
+    }
+
+    // A copy of the element list sorted by ascending z (stable-ish insertion),
+    // so lower z draws first (underneath).
+    static List<SceneElement> OrderByZ(SceneDoc doc) {
+        List<SceneElement> o = new List<SceneElement>();
+        int n = doc.Count();
+        if (n == 0) { return o; }
+        int lo = doc.ElementAt(0).Z();
+        int hi = lo;
+        int i = 1;
+        while (i < n) {
+            int z = doc.ElementAt(i).Z();
+            if (z < lo) { lo = z; }
+            if (z > hi) { hi = z; }
+            i = i + 1;
+        }
+        // Bucket by z (low first); stable within equal z. Draw orders are small.
+        int zv = lo;
+        while (zv <= hi) {
+            int j = 0;
+            while (j < n) {
+                if (doc.ElementAt(j).Z() == zv) { o.Add(doc.ElementAt(j)); }
+                j = j + 1;
+            }
+            zv = zv + 1;
+        }
+        return o;
+    }
+
+    // Renders the whole scene into the window's content region (below the
+    // title bar chrome) for the current backbuffer size.
+    static void Render(App app, SceneDoc doc) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int top = app.ContentTop();
+        int W = app.canvas.Width();
+        int H = app.canvas.Height();
+        int cw = W;
+        int ch = H - top;
+        if (ch < 1) { ch = 1; }
+        c.FillRect(0, top, cw, ch,
+            SceneView.PackColor(doc.ClearR(), doc.ClearG(), doc.ClearB(), 255));
+        SceneMetrics m = doc.Metrics(cw, ch);
+        int psMilli = (int)(m.ScaleX() * 1000.0);
+        if (psMilli < 1) { psMilli = 1; }
+        List<SceneElement> ord = SceneView.OrderByZ(doc);
+        int i = 0;
+        while (i < ord.Count) {
+            SceneElement e = ord[i];
+            i = i + 1;
+            if (!e.Visible()) { continue; }
+            SceneRect r = doc.Resolve(e, cw, ch);
+            SceneView.DrawElement(app, c, t, e,
+                r.Xi(), r.Yi() + top, r.Wi(), r.Hi(), psMilli);
+        }
+    }
+
+    static void DrawElement(App app, Canvas c, Theme t, SceneElement e,
+            int ex, int ey, int exw, int exh, int psMilli) {
+        string kind = e.Kind();
+        int alpha = e.A();
+        int fill = SceneView.PackColor(e.R(), e.G(), e.B(), alpha);
+        string cap = e.Text();
+        if (cap.Length == 0) { cap = e.Name(); }
+
+        if (SceneView.IsSlotKind(kind)) {
+            int cwc = e.W() * psMilli / 1000;
+            int chh = e.H() * psMilli / 1000;
+            int gx = e.GapX() * psMilli / 1000;
+            int gy = e.GapY() * psMilli / 1000;
+            int r = 0;
+            while (r < e.Rows()) {
+                int col = 0;
+                while (col < e.Cols()) {
+                    int sx = ex + col * (cwc + gx);
+                    int sy = ey + r * (chh + gy);
+                    c.FillRoundRect(sx, sy, cwc, chh, app.Scale(3), fill);
+                    c.DrawRect(sx, sy, cwc, chh, t.borderSecondary, 1);
+                    col = col + 1;
+                }
+                r = r + 1;
+            }
+            return;
+        }
+        if (kind == "circle") {
+            int rad = exw;
+            if (exh < rad) { rad = exh; }
+            rad = rad / 2;
+            c.FillCircle(ex + exw / 2, ey + exh / 2, rad, fill);
+            return;
+        }
+        if (kind == "progressbar" || kind == "slider" || kind == "scrollbar") {
+            int v = e.Value();
+            if (v < 0) { v = 0; }
+            if (v > 100) { v = 100; }
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
+                SceneView.PackColor(20, 22, 34, alpha));
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            if (kind == "progressbar") {
+                c.FillRoundRect(ex, ey, exw * v / 100, exh, app.Scale(3), fill);
+            } else if (kind == "slider") {
+                int kx = ex + (exw - app.Scale(8)) * v / 100;
+                c.FillRect(ex, ey + exh / 2 - 1, exw, 2, t.borderPrimary);
+                c.FillRoundRect(kx, ey, app.Scale(8), exh, app.Scale(3), t.primary);
+            } else {
+                int th = exh / 4;
+                int ty = ey + (exh - th) * v / 100;
+                c.FillRoundRect(ex + 1, ty, exw - 2, th, app.Scale(3), t.primary);
+            }
+            return;
+        }
+        if (kind == "text" || kind == "label") {
+            c.DrawText(ex, ey, cap, fill, t.fontSizeMedium);
+            return;
+        }
+        if (kind == "arttext") {
+            c.DrawText(ex + 2, ey + 2, cap, SceneView.PackColor(20, 12, 4, alpha), t.fontSizeLarge);
+            c.DrawText(ex, ey, cap, fill, t.fontSizeLarge);
+            return;
+        }
+        if (kind == "checkbox") {
+            int bs = exh;
+            if (bs > app.Scale(18)) { bs = app.Scale(18); }
+            c.DrawRect(ex, ey + (exh - bs) / 2, bs, bs, t.borderPrimary, 1);
+            if (e.Value() != 0) {
+                c.FillRect(ex + 3, ey + (exh - bs) / 2 + 3, bs - 6, bs - 6, t.primary);
+            }
+            c.DrawText(ex + bs + app.Scale(6), ey + (exh - t.fontSizeSmall) / 2 - 2,
+                cap, t.textPrimary, t.fontSizeSmall);
+            return;
+        }
+        if (kind == "tabbox") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            List<string> tabs = SceneView.SplitItems(e.Items());
+            int th = app.Scale(20);
+            int tx = ex;
+            int i = 0;
+            while (i < tabs.Count) {
+                int tw = app.Scale(12) + tabs[i].Length * t.fontSizeTiny;
+                int tc = t.bgTertiary;
+                if (i == 0) { tc = t.primary; }
+                c.FillRoundRect(tx, ey, tw, th, app.Scale(3), tc);
+                c.DrawText(tx + app.Scale(6), ey + app.Scale(3), tabs[i], t.textInverse, t.fontSizeTiny);
+                tx = tx + tw + app.Scale(2);
+                i = i + 1;
+            }
+            return;
+        }
+        if (kind == "combobox" || kind == "input") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
+                SceneView.PackColor(20, 22, 34, alpha));
+            c.DrawRect(ex, ey, exw, exh, t.borderPrimary, 1);
+            string txt = e.Text();
+            if (kind == "combobox") {
+                List<string> its = SceneView.SplitItems(e.Items());
+                if (its.Count > 0) { txt = its[0]; }
+                c.DrawText(ex + exw - app.Scale(14), ey + app.Scale(2), "v", t.textTertiary, t.fontSizeSmall);
+            }
+            c.DrawText(ex + app.Scale(5), ey + app.Scale(4), txt, t.textPrimary, t.fontSizeSmall);
+            return;
+        }
+        if (kind == "listbox") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(3),
+                SceneView.PackColor(20, 22, 34, alpha));
+            c.DrawRect(ex, ey, exw, exh, t.borderPrimary, 1);
+            List<string> its = SceneView.SplitItems(e.Items());
+            int iy = ey + app.Scale(3);
+            int i = 0;
+            while (i < its.Count && iy < ey + exh - app.Scale(10)) {
+                c.DrawText(ex + app.Scale(5), iy, its[i], t.textPrimary, t.fontSizeTiny);
+                iy = iy + app.Scale(14);
+                i = i + 1;
+            }
+            return;
+        }
+        if (kind == "minimap") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            c.FillCircle(ex + exw / 2, ey + exh / 2, app.Scale(3), t.primary);
+            c.DrawRect(ex + exw / 4, ey + exh / 4, exw / 2, exh / 2, t.borderPrimary, 1);
+            return;
+        }
+        if (kind == "avatarbox") {
+            c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+            c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+            int ps = exh - app.Scale(8);
+            c.FillCircle(ex + app.Scale(4) + ps / 2, ey + app.Scale(4) + ps / 2, ps / 2,
+                SceneView.PackColor(90, 130, 220, alpha));
+            return;
+        }
+        // generic box-like kinds: button, imagebox, animbox, textbox, container,
+        // sprite, rect, anim, legacy bar/panel...
+        c.FillRoundRect(ex, ey, exw, exh, app.Scale(4), fill);
+        c.DrawRect(ex, ey, exw, exh, t.borderSecondary, 1);
+        if (kind == "imagebox" || kind == "sprite") {
+            c.DrawText(ex + app.Scale(4), ey + app.Scale(3),
+                "IMG " + e.ImageId(), t.textInverse, t.fontSizeTiny);
+        } else if (kind == "animbox" || kind == "anim") {
+            c.DrawText(ex + app.Scale(4), ey + app.Scale(3), "ANIM", t.textInverse, t.fontSizeTiny);
+        } else {
+            c.DrawText(ex + app.Scale(4), ey + app.Scale(3), cap, t.textInverse, t.fontSizeTiny);
+        }
+    }
+}
