@@ -1,0 +1,1561 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Widget;
+
+// -----------------------------------------------------------------------------
+// MGE -- Mir Game Editor: a small GUI toolbox for authoring the data of a
+// Legend/Mir style game (角色 / 道具 / 技能 / 地图).
+//
+// Every sheet edits plain JSON under <data-dir>/ (npc.json, item.json,
+// skill.json, map.json) so the files stay diffable and scriptable, and the
+// "导出 Zan" action generates <data-dir>/ZgmData.zan -- a ZgmProject builder
+// written against Game.Zgm (NpcConfig / ItemConfig / SkillConfig / MapConfig),
+// which the game can compile in directly:
+//
+//     ZgmEngine engine = ZgmEngine.FromProject(MgeData.Build());
+//
+//   Build: zanc tools/mge/Mge.zan --auto-stdlib -o build/mge.exe
+//   Run  : mge.exe [data-dir]        (data-dir defaults to "mge-data")
+//
+// The three record sheets share one schema-driven editor (FieldSpec), so adding
+// a field is one line in Mge.BuildSheets -- no new UI code. The map sheet adds
+// a grid painter for 障碍 / 透明 cells plus 刷怪点 placement.
+// -----------------------------------------------------------------------------
+
+/// <summary>String helpers built on Substring/Length only.</summary>
+class Str {
+    static bool IsDigit(string c) {
+        return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+            || c == "5" || c == "6" || c == "7" || c == "8" || c == "9";
+    }
+
+    /// Keeps digits (and a leading '-' when signed), so a numeric field cannot
+    /// be corrupted by stray keystrokes.
+    static string Digits(string s, bool signed) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (Str.IsDigit(c)) { sb.Append(c); }
+            else if (signed && c == "-" && i == 0) { sb.Append(c); }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static int ToInt(string s) {
+        string d = Str.Digits(s, true);
+        if (d == "" || d == "-") { return 0; }
+        return Convert.ToInt(d);
+    }
+
+    static string FromInt(int v) { return Convert.ToString(v); }
+
+    /// Splits on ',' and trims blanks; used for the comma-separated list fields.
+    static List<string> SplitList(string s) {
+        List<string> parts = new List<string>();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i <= s.Length) {
+            bool end = i == s.Length;
+            string c = "";
+            if (!end) { c = s.Substring(i, 1); }
+            if (end || c == "," || c == "，") {
+                string p = Str.Trim(sb.ToString());
+                if (p != "") { parts.Add(p); }
+                sb = new StringBuilder();
+            } else {
+                sb.Append(c);
+            }
+            i = i + 1;
+        }
+        return parts;
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b && Str.IsSpace(s.Substring(a, 1))) { a = a + 1; }
+        while (b > a && Str.IsSpace(s.Substring(b - 1, 1))) { b = b - 1; }
+        if (b <= a) { return ""; }
+        return s.Substring(a, b - a);
+    }
+
+    static bool IsSpace(string c) {
+        return c == " " || c == "\t" || c == "\r" || c == "\n";
+    }
+
+    static bool Contains(string s, string sub) {
+        if (sub.Length == 0) { return true; }
+        int i = 0;
+        while (i + sub.Length <= s.Length) {
+            if (s.Substring(i, sub.Length) == sub) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// Escapes a string for embedding in generated Zan source.
+    static string Quote(string s) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        int i = 0;
+        while (i < s.Length) {
+            string c = s.Substring(i, 1);
+            if (c == "\"") { sb.Append("\\\""); }
+            else if (c == "\\") { sb.Append("\\\\"); }
+            else if (c == "\n") { sb.Append("\\n"); }
+            else if (c == "\r") { sb.Append(""); }
+            else if (c == "\t") { sb.Append("\\t"); }
+            else { sb.Append(c); }
+            i = i + 1;
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+}
+
+/// <summary>One editable property of a record: how it is stored (JSON key),
+/// labelled, and rendered (text / int / bool / enum).</summary>
+class FieldSpec {
+    string label;
+    string key;
+    int kind;             // 0 text, 1 int, 2 bool, 3 enum
+    List<string> options; // enum choices (kind 3)
+    int dfltInt;
+    string dfltText;
+
+    static FieldSpec Text(string label, string key, string dflt) {
+        FieldSpec f = new FieldSpec();
+        f.label = label;
+        f.key = key;
+        f.kind = 0;
+        f.options = new List<string>();
+        f.dfltInt = 0;
+        f.dfltText = dflt;
+        return f;
+    }
+
+    static FieldSpec Int(string label, string key, int dflt) {
+        FieldSpec f = FieldSpec.Text(label, key, "");
+        f.kind = 1;
+        f.dfltInt = dflt;
+        return f;
+    }
+
+    static FieldSpec Bool(string label, string key, bool dflt) {
+        FieldSpec f = FieldSpec.Text(label, key, "");
+        f.kind = 2;
+        if (dflt) { f.dfltInt = 1; }
+        return f;
+    }
+
+    static FieldSpec Enum(string label, string key, List<string> opts, int dflt) {
+        FieldSpec f = FieldSpec.Text(label, key, "");
+        f.kind = 3;
+        f.options = opts;
+        f.dfltInt = dflt;
+        return f;
+    }
+}
+
+/// <summary>A record sheet: its schema, its rows (JSON objects), the selection
+/// and the input widgets bound to the currently selected row.</summary>
+class Sheet {
+    string title;
+    string file;              // file name inside the data dir
+    List<FieldSpec> specs;
+    List<JsonValue> rows;
+    int sel;
+    int scroll;
+    List<Input> inputs;       // one per spec (used by text / int fields)
+    int formScroll;
+    Input search;
+    bool dirty;
+
+    static Sheet Create(string title, string file, List<FieldSpec> specs) {
+        Sheet s = new Sheet();
+        s.title = title;
+        s.file = file;
+        s.specs = specs;
+        s.rows = new List<JsonValue>();
+        s.sel = -1;
+        s.scroll = 0;
+        s.formScroll = 0;
+        s.inputs = new List<Input>();
+        int i = 0;
+        while (i < specs.Count) {
+            s.inputs.Add(Input.Create(""));
+            i = i + 1;
+        }
+        s.search = Input.Create("搜索名称...");
+        s.dirty = false;
+        return s;
+    }
+
+    /// A blank row filled with the schema defaults.
+    JsonValue NewRow() {
+        JsonValue row = JsonValue.NewObject();
+        int i = 0;
+        while (i < specs.Count) {
+            FieldSpec f = specs[i];
+            if (f.kind == 0) { row.Set(f.key, JsonValue.NewStr(f.dfltText)); }
+            if (f.kind == 1) { row.Set(f.key, JsonValue.NewNum(Str.FromInt(f.dfltInt))); }
+            if (f.kind == 2) { row.Set(f.key, JsonValue.NewBool(f.dfltInt == 1)); }
+            if (f.kind == 3) { row.Set(f.key, JsonValue.NewNum(Str.FromInt(f.dfltInt))); }
+            i = i + 1;
+        }
+        row.Set("name", JsonValue.NewStr(this.UniqueName("new")));
+        return row;
+    }
+
+    string UniqueName(string stem) {
+        int n = 1;
+        while (n < 10000) {
+            string candidate = stem + Str.FromInt(n);
+            if (this.FindByName(candidate) < 0) { return candidate; }
+            n = n + 1;
+        }
+        return stem;
+    }
+
+    int FindByName(string name) {
+        int i = 0;
+        while (i < rows.Count) {
+            if (rows[i].Str("name", "") == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    JsonValue Selected() {
+        if (sel < 0 || sel >= rows.Count) { return null; }
+        return rows[sel];
+    }
+
+    /// Pushes the selected row into the input widgets (called on selection
+    /// change; the reverse direction is pulled every frame by Mge.PullForm).
+    void PushForm() {
+        JsonValue row = this.Selected();
+        int i = 0;
+        while (i < specs.Count) {
+            FieldSpec f = specs[i];
+            string v = "";
+            if (row != null) {
+                if (f.kind == 0) { v = row.Str(f.key, f.dfltText); }
+                if (f.kind == 1) { v = Str.FromInt(row.Int(f.key, f.dfltInt)); }
+            }
+            inputs[i].SetText(v);
+            i = i + 1;
+        }
+    }
+}
+
+/// <summary>One map document: grid metadata, the per-cell flags and the
+/// 刷怪点 (spawn) list.</summary>
+class MapDoc {
+    string name;
+    int cellW;
+    int cellH;
+    int cols;
+    int rows;
+    int startX;
+    int startY;
+    bool isDefault;
+    List<int> cells;        // cols*rows flags: 0 none, 1 障碍, 2 透明, 3 both
+    List<JsonValue> spawns; // {name,x,y,range,count,level,faction}
+
+    static MapDoc Create(string name, int cols, int rows) {
+        MapDoc m = new MapDoc();
+        m.name = name;
+        m.cellW = 64;
+        m.cellH = 32;
+        m.cols = cols;
+        m.rows = rows;
+        m.startX = 0;
+        m.startY = 0;
+        m.isDefault = false;
+        m.cells = new List<int>();
+        m.spawns = new List<JsonValue>();
+        int i = 0;
+        while (i < cols * rows) {
+            m.cells.Add(0);
+            i = i + 1;
+        }
+        return m;
+    }
+
+    int CellAt(int x, int y) {
+        if (x < 0 || y < 0 || x >= cols || y >= rows) { return 0; }
+        return cells[y * cols + x];
+    }
+
+    void SetCell(int x, int y, int flags) {
+        if (x < 0 || y < 0 || x >= cols || y >= rows) { return; }
+        cells[y * cols + x] = flags;
+    }
+
+    /// Reshapes the grid, keeping the cells that still fit.
+    void Resize(int newCols, int newRows) {
+        if (newCols < 1) { newCols = 1; }
+        if (newRows < 1) { newRows = 1; }
+        if (newCols == cols && newRows == rows) { return; }
+        List<int> next = new List<int>();
+        int y = 0;
+        while (y < newRows) {
+            int x = 0;
+            while (x < newCols) {
+                next.Add(this.CellAt(x, y));
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        cells = next;
+        cols = newCols;
+        rows = newRows;
+        if (startX >= cols) { startX = cols - 1; }
+        if (startY >= rows) { startY = rows - 1; }
+    }
+
+    /// Cells serialize as one digit per cell so a map stays one JSON line.
+    string CellString() {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < cells.Count) {
+            sb.Append(Str.FromInt(cells[i]));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    void LoadCellString(string s) {
+        int i = 0;
+        while (i < cells.Count) {
+            int v = 0;
+            if (i < s.Length) { v = Str.ToInt(s.Substring(i, 1)); }
+            cells[i] = v;
+            i = i + 1;
+        }
+    }
+
+    int SpawnIndexAt(int x, int y) {
+        int i = 0;
+        while (i < spawns.Count) {
+            if (spawns[i].Int("x", -1) == x && spawns[i].Int("y", -1) == y) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+/// <summary>The application: four sheets (角色 / 道具 / 技能 / 地图), JSON
+/// persistence and the ZgmProject code generator.</summary>
+class Mge {
+    static App app;
+    static string dataDir;
+    static string status;
+
+    static List<Sheet> sheets;      // 0 npc, 1 item, 2 skill
+    static int tab;                 // 0..2 sheets, 3 map
+
+    static List<MapDoc> maps;
+    static int mapSel;
+    static int mapScroll;
+    static int brush;               // 0 空地, 1 障碍, 2 透明, 3 障碍+透明
+    static int mapTool;             // 0 画格子, 1 刷怪点, 2 起点, 3 擦除刷怪点
+    static bool mapDirty;
+    static List<Input> mapInputs;   // 名称/格宽/格高/列数/行数/起点X/起点Y
+    static Input spawnCount;
+    static Input spawnRange;
+
+    static void Main() {
+        Mge.dataDir = "mge-data";
+        if (Environment.ArgCount() > 0) { Mge.dataDir = Environment.ArgAt(0); }
+        Mge.status = "数据目录: " + Mge.dataDir;
+        Mge.tab = 0;
+        Mge.brush = 1;
+        Mge.mapTool = 0;
+        Mge.mapSel = -1;
+        Mge.mapScroll = 0;
+        Mge.mapDirty = false;
+
+        Mge.BuildSheets();
+        Mge.mapInputs = new List<Input>();
+        int i = 0;
+        while (i < 7) {
+            Mge.mapInputs.Add(Input.Create(""));
+            i = i + 1;
+        }
+        Mge.spawnCount = Input.Create("");
+        Mge.spawnCount.SetText("5");
+        Mge.spawnRange = Input.Create("");
+        Mge.spawnRange.SetText("3");
+
+        Mge.maps = new List<MapDoc>();
+        Mge.LoadAll();
+
+        App a = App.CreateDark("MGE · 传奇编辑器", 1280, 800);
+        Mge.app = a;
+        a.Show();
+        WidgetId.Mark();
+        while (a.isRunning) {
+            if (!a.ProcessEvent()) { break; }
+            a.BeginFrame();
+            WidgetId.ResetFrame();
+            Mge.Render(a);
+            a.RenderChrome("MGE · 传奇编辑器");
+            a.PresentFrame();
+        }
+    }
+
+    // ---- schema -------------------------------------------------------------
+
+    static void BuildSheets() {
+        Mge.sheets = new List<Sheet>();
+
+        List<FieldSpec> npc = new List<FieldSpec>();
+        npc.Add(FieldSpec.Text("名称", "name", "npc"));
+        npc.Add(FieldSpec.Text("显示名", "displayName", ""));
+        npc.Add(FieldSpec.Bool("默认主角", "hero", false));
+        npc.Add(FieldSpec.Int("等级", "level", 1));
+        npc.Add(FieldSpec.Int("最大HP", "maxhp", 100));
+        npc.Add(FieldSpec.Int("最大MP", "maxmp", 50));
+        npc.Add(FieldSpec.Int("命中", "hit", 100));
+        npc.Add(FieldSpec.Int("躲避", "dodge", 0));
+        npc.Add(FieldSpec.Int("暴击", "crit", 0));
+        npc.Add(FieldSpec.Int("经验值", "expReward", 0));
+        npc.Add(FieldSpec.Int("智能等级", "aiLevel", 0));
+        npc.Add(FieldSpec.Int("自动反击", "autoCounter", -1));
+        npc.Add(FieldSpec.Int("掉落几率", "dropChance", 100));
+        npc.Add(FieldSpec.Text("成长组件", "growth", ""));
+        npc.Add(FieldSpec.Text("技能表(逗号分隔)", "skills", ""));
+        Mge.sheets.Add(Sheet.Create("角色", "npc.json", npc));
+
+        List<string> cats = new List<string>();
+        cats.Add("装备");
+        cats.Add("道具");
+        cats.Add("特殊");
+        List<string> subs = new List<string>();
+        subs.Add("武器");
+        subs.Add("衣服");
+        subs.Add("头盔");
+        subs.Add("项链");
+        subs.Add("手镯");
+        subs.Add("戒指");
+        subs.Add("消耗");
+        subs.Add("其他");
+
+        List<FieldSpec> item = new List<FieldSpec>();
+        item.Add(FieldSpec.Text("名称", "name", "item"));
+        item.Add(FieldSpec.Text("显示名", "displayName", ""));
+        item.Add(FieldSpec.Enum("分类", "category", cats, 0));
+        item.Add(FieldSpec.Enum("子类", "subtype", subs, 0));
+        item.Add(FieldSpec.Int("等级需求", "levelReq", 0));
+        item.Add(FieldSpec.Int("最大叠加", "maxStack", 1));
+        item.Add(FieldSpec.Bool("禁止丢弃", "noDrop", false));
+        item.Add(FieldSpec.Int("攻击", "攻击", 0));
+        item.Add(FieldSpec.Int("魔法", "魔法", 0));
+        item.Add(FieldSpec.Int("道术", "道术", 0));
+        item.Add(FieldSpec.Int("防御", "防御", 0));
+        item.Add(FieldSpec.Int("魔御", "魔御", 0));
+        item.Add(FieldSpec.Text("图标", "icon", ""));
+        item.Add(FieldSpec.Text("气泡提示", "tooltip", ""));
+        Mge.sheets.Add(Sheet.Create("道具", "item.json", item));
+
+        List<string> factions = new List<string>();
+        factions.Add("敌方");
+        factions.Add("友方");
+        factions.Add("不限");
+        List<string> targets = new List<string>();
+        targets.Add("角色目标");
+        targets.Add("鼠标格子");
+        targets.Add("角色或格子");
+        targets.Add("自身");
+
+        List<FieldSpec> skill = new List<FieldSpec>();
+        skill.Add(FieldSpec.Text("名称", "name", "skill"));
+        skill.Add(FieldSpec.Text("显示名", "displayName", ""));
+        skill.Add(FieldSpec.Enum("目标阵营", "faction", factions, 0));
+        skill.Add(FieldSpec.Enum("目标位置", "target", targets, 0));
+        skill.Add(FieldSpec.Int("攻击距离", "attackRange", 1));
+        skill.Add(FieldSpec.Int("最小距离", "minRange", 0));
+        skill.Add(FieldSpec.Int("范围半径", "areaRadius", 0));
+        skill.Add(FieldSpec.Int("HP消耗", "costHp", 0));
+        skill.Add(FieldSpec.Int("MP消耗", "costMp", 0));
+        skill.Add(FieldSpec.Int("怒气消耗", "costRage", 0));
+        skill.Add(FieldSpec.Int("冷却间隔(ms)", "interval", 0));
+        skill.Add(FieldSpec.Int("伤害延迟(ms)", "damageDelay", 0));
+        skill.Add(FieldSpec.Int("优先级", "priority", 0));
+        skill.Add(FieldSpec.Int("伤害系数(%)", "damageScale", 100));
+        skill.Add(FieldSpec.Text("伤害公式", "formula", ""));
+        skill.Add(FieldSpec.Text("图标", "icon", ""));
+        Mge.sheets.Add(Sheet.Create("技能", "skill.json", skill));
+    }
+
+    // ---- persistence --------------------------------------------------------
+
+    static string PathOf(string file) {
+        return Mge.dataDir + "/" + file;
+    }
+
+    static void LoadAll() {
+        if (!Directory.Exists(Mge.dataDir)) { Directory.CreateDirectory(Mge.dataDir); }
+        int i = 0;
+        while (i < Mge.sheets.Count) {
+            Mge.LoadSheet(Mge.sheets[i]);
+            i = i + 1;
+        }
+        Mge.LoadMaps();
+        if (Mge.maps.Count > 0) { Mge.SelectMap(0); }
+        int k = 0;
+        while (k < Mge.sheets.Count) {
+            Sheet s = Mge.sheets[k];
+            if (s.rows.Count > 0) {
+                s.sel = 0;
+                s.PushForm();
+            }
+            k = k + 1;
+        }
+    }
+
+    static void LoadSheet(Sheet s) {
+        string path = Mge.PathOf(s.file);
+        if (!File.Exists(path)) { return; }
+        JsonValue doc = JsonValue.Parse(File.ReadAllText(path));
+        if (doc == null || !doc.IsArray()) { return; }
+        int i = 0;
+        while (i < doc.Count()) {
+            JsonValue row = doc.At(i);
+            if (row.IsObject()) { s.rows.Add(row); }
+            i = i + 1;
+        }
+    }
+
+    static void SaveSheet(Sheet s) {
+        JsonValue doc = JsonValue.NewArray();
+        int i = 0;
+        while (i < s.rows.Count) {
+            doc.Append(s.rows[i]);
+            i = i + 1;
+        }
+        File.WriteAllText(Mge.PathOf(s.file), doc.ToJson());
+        s.dirty = false;
+    }
+
+    static void LoadMaps() {
+        string path = Mge.PathOf("map.json");
+        if (!File.Exists(path)) { return; }
+        JsonValue doc = JsonValue.Parse(File.ReadAllText(path));
+        if (doc == null || !doc.IsArray()) { return; }
+        int i = 0;
+        while (i < doc.Count()) {
+            JsonValue o = doc.At(i);
+            MapDoc m = MapDoc.Create(o.Str("name", "map"),
+                o.Int("cols", 20), o.Int("rows", 20));
+            m.cellW = o.Int("cellW", 64);
+            m.cellH = o.Int("cellH", 32);
+            m.startX = o.Int("startX", 0);
+            m.startY = o.Int("startY", 0);
+            m.isDefault = o.Bool("default", false);
+            m.LoadCellString(o.Str("cells", ""));
+            JsonValue sp = o.Get("spawns");
+            if (sp != null && sp.IsArray()) {
+                int k = 0;
+                while (k < sp.Count()) {
+                    m.spawns.Add(sp.At(k));
+                    k = k + 1;
+                }
+            }
+            Mge.maps.Add(m);
+            i = i + 1;
+        }
+    }
+
+    static void SaveMaps() {
+        JsonValue doc = JsonValue.NewArray();
+        int i = 0;
+        while (i < Mge.maps.Count) {
+            MapDoc m = Mge.maps[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(m.name));
+            o.Set("cellW", JsonValue.NewNum(Str.FromInt(m.cellW)));
+            o.Set("cellH", JsonValue.NewNum(Str.FromInt(m.cellH)));
+            o.Set("cols", JsonValue.NewNum(Str.FromInt(m.cols)));
+            o.Set("rows", JsonValue.NewNum(Str.FromInt(m.rows)));
+            o.Set("startX", JsonValue.NewNum(Str.FromInt(m.startX)));
+            o.Set("startY", JsonValue.NewNum(Str.FromInt(m.startY)));
+            o.Set("default", JsonValue.NewBool(m.isDefault));
+            o.Set("cells", JsonValue.NewStr(m.CellString()));
+            JsonValue sp = JsonValue.NewArray();
+            int k = 0;
+            while (k < m.spawns.Count) {
+                sp.Append(m.spawns[k]);
+                k = k + 1;
+            }
+            o.Set("spawns", sp);
+            doc.Append(o);
+            i = i + 1;
+        }
+        File.WriteAllText(Mge.PathOf("map.json"), doc.ToJson());
+        Mge.mapDirty = false;
+    }
+
+    static void SaveAll() {
+        if (!Directory.Exists(Mge.dataDir)) { Directory.CreateDirectory(Mge.dataDir); }
+        int i = 0;
+        while (i < Mge.sheets.Count) {
+            Mge.SaveSheet(Mge.sheets[i]);
+            i = i + 1;
+        }
+        Mge.SaveMaps();
+        Mge.status = "已保存到 " + Mge.dataDir;
+    }
+
+    // ---- ZgmProject code generation ----------------------------------------
+
+    static void Export() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("// Generated by tools/mge -- do not edit by hand.\n");
+        sb.Append("// Regenerate: mge.exe " + Mge.dataDir + "  ->  \"导出 Zan\"\n\n");
+        sb.Append("using System;\n");
+        sb.Append("using Game.Zgm;\n\n");
+        sb.Append("/// The authored game data as a ready-to-run ZgmProject.\n");
+        sb.Append("class MgeData {\n");
+        sb.Append("    static ZgmProject Build() {\n");
+        sb.Append("        ZgmProject p = ZgmProject.Create();\n");
+        Mge.EmitNpcs(sb);
+        Mge.EmitItems(sb);
+        Mge.EmitSkills(sb);
+        Mge.EmitMaps(sb);
+        sb.Append("        return p;\n");
+        sb.Append("    }\n");
+        sb.Append("}\n");
+        File.WriteAllText(Mge.PathOf("ZgmData.zan"), sb.ToString());
+        Mge.status = "已导出 " + Mge.PathOf("ZgmData.zan");
+    }
+
+    static void EmitNpcs(StringBuilder sb) {
+        Sheet s = Mge.sheets[0];
+        int i = 0;
+        while (i < s.rows.Count) {
+            JsonValue r = s.rows[i];
+            string v = "n" + Str.FromInt(i);
+            sb.Append("\n        NpcConfig " + v + " = NpcConfig.Create("
+                + Str.Quote(r.Str("name", "npc")) + ");\n");
+            string dn = r.Str("displayName", "");
+            if (dn != "") {
+                sb.Append("        " + v + ".SetDisplayName(" + Str.Quote(dn) + ");\n");
+            }
+            if (r.Bool("hero", false)) { sb.Append("        " + v + ".SetHero(true);\n"); }
+            string growth = r.Str("growth", "");
+            if (growth != "") {
+                sb.Append("        " + v + ".SetGrowth(" + Str.Quote(growth) + ", "
+                    + Str.FromInt(r.Int("level", 1)) + ");\n");
+            }
+            int maxhp = r.Int("maxhp", 100);
+            int maxmp = r.Int("maxmp", 50);
+            sb.Append("        " + v + ".SetVitals(" + Str.FromInt(maxhp) + ", "
+                + Str.FromInt(maxhp) + ", " + Str.FromInt(maxmp) + ", "
+                + Str.FromInt(maxmp) + ");\n");
+            sb.Append("        " + v + ".SetCombat(" + Str.FromInt(r.Int("hit", 100))
+                + ", " + Str.FromInt(r.Int("dodge", 0)) + ", "
+                + Str.FromInt(r.Int("crit", 0)) + ");\n");
+            sb.Append("        " + v + ".SetBehavior(" + Str.FromInt(r.Int("aiLevel", 0))
+                + ", " + Str.FromInt(r.Int("autoCounter", -1)) + ");\n");
+            sb.Append("        " + v + ".SetExperience(0, "
+                + Str.FromInt(r.Int("expReward", 0)) + ");\n");
+            sb.Append("        " + v + ".SetDropChance("
+                + Str.FromInt(r.Int("dropChance", 100)) + ");\n");
+            List<string> skills = Str.SplitList(r.Str("skills", ""));
+            int k = 0;
+            while (k < skills.Count) {
+                sb.Append("        " + v + ".AddSkill(" + Str.Quote(skills[k]) + ");\n");
+                k = k + 1;
+            }
+            sb.Append("        p.AddNpc(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    static void EmitItems(StringBuilder sb) {
+        Sheet s = Mge.sheets[1];
+        List<string> cats = s.specs[2].options;
+        List<string> subs = s.specs[3].options;
+        int i = 0;
+        while (i < s.rows.Count) {
+            JsonValue r = s.rows[i];
+            string v = "it" + Str.FromInt(i);
+            string name = r.Str("name", "item");
+            string dn = r.Str("displayName", "");
+            if (dn == "") { dn = name; }
+            sb.Append("\n        ItemConfig " + v + " = ItemConfig.Create("
+                + Str.Quote(name) + ", " + Str.Quote(dn) + ");\n");
+            sb.Append("        " + v + ".SetCategory("
+                + Str.Quote(Mge.OptionOf(cats, r.Int("category", 0))) + ", "
+                + Str.Quote(Mge.OptionOf(subs, r.Int("subtype", 0))) + ");\n");
+            sb.Append("        " + v + ".SetLevelReq("
+                + Str.FromInt(r.Int("levelReq", 0)) + ");\n");
+            sb.Append("        " + v + ".SetMaxStack("
+                + Str.FromInt(r.Int("maxStack", 1)) + ");\n");
+            if (r.Bool("noDrop", false)) { sb.Append("        " + v + ".SetNoDrop(true);\n"); }
+            string icon = r.Str("icon", "");
+            if (icon != "") {
+                sb.Append("        " + v + ".SetIcon(" + Str.Quote(icon) + ");\n");
+            }
+            string tip = r.Str("tooltip", "");
+            if (tip != "") {
+                sb.Append("        " + v + ".SetTooltip(" + Str.Quote(tip) + ");\n");
+            }
+            Mge.EmitAttr(sb, v, r, "攻击");
+            Mge.EmitAttr(sb, v, r, "魔法");
+            Mge.EmitAttr(sb, v, r, "道术");
+            Mge.EmitAttr(sb, v, r, "防御");
+            Mge.EmitAttr(sb, v, r, "魔御");
+            sb.Append("        p.AddItem(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    static void EmitAttr(StringBuilder sb, string v, JsonValue r, string attr) {
+        int amount = r.Int(attr, 0);
+        if (amount == 0) { return; }
+        sb.Append("        " + v + ".AddAttr(" + Str.Quote(attr) + ", "
+            + Str.FromInt(amount) + ");\n");
+    }
+
+    static void EmitSkills(StringBuilder sb) {
+        Sheet s = Mge.sheets[2];
+        List<string> factions = s.specs[2].options;
+        int i = 0;
+        while (i < s.rows.Count) {
+            JsonValue r = s.rows[i];
+            string v = "sk" + Str.FromInt(i);
+            string name = r.Str("name", "skill");
+            string dn = r.Str("displayName", "");
+            if (dn == "") { dn = name; }
+            sb.Append("\n        SkillConfig " + v + " = SkillConfig.Create("
+                + Str.Quote(name) + ", " + Str.Quote(dn) + ");\n");
+            sb.Append("        " + v + ".SetFaction("
+                + Str.Quote(Mge.OptionOf(factions, r.Int("faction", 0))) + ");\n");
+            sb.Append("        " + v + ".SetTarget(" + Mge.TargetExpr(r.Int("target", 0))
+                + ");\n");
+            sb.Append("        " + v + ".SetRange("
+                + Str.FromInt(r.Int("attackRange", 1)) + ", "
+                + Str.FromInt(r.Int("minRange", 0)) + ");\n");
+            sb.Append("        " + v + ".SetArea("
+                + Str.FromInt(r.Int("areaRadius", 0)) + ");\n");
+            sb.Append("        " + v + ".SetCost(" + Str.FromInt(r.Int("costHp", 0))
+                + ", " + Str.FromInt(r.Int("costMp", 0)) + ", "
+                + Str.FromInt(r.Int("costRage", 0)) + ");\n");
+            sb.Append("        " + v + ".SetInterval("
+                + Str.FromInt(r.Int("interval", 0)) + ");\n");
+            sb.Append("        " + v + ".SetDamageDelay("
+                + Str.FromInt(r.Int("damageDelay", 0)) + ");\n");
+            sb.Append("        " + v + ".SetPriority("
+                + Str.FromInt(r.Int("priority", 0)) + ");\n");
+            sb.Append("        " + v + ".SetDamageScale("
+                + Mge.ScaleExpr(r.Int("damageScale", 100)) + ");\n");
+            string formula = r.Str("formula", "");
+            if (formula != "") {
+                sb.Append("        " + v + ".SetFormula(" + Str.Quote(formula) + ");\n");
+            }
+            string icon = r.Str("icon", "");
+            if (icon != "") {
+                sb.Append("        " + v + ".SetIcon(" + Str.Quote(icon) + ");\n");
+            }
+            sb.Append("        p.AddSkill(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    /// 100 -> "1.0", 175 -> "1.75": the editor stores the scale as a percent so
+    /// the UI can stay integer-only while SetDamageScale takes a double.
+    static string ScaleExpr(int percent) {
+        int whole = percent / 100;
+        int frac = percent - whole * 100;
+        if (frac < 0) { frac = -frac; }
+        string f = Str.FromInt(frac);
+        if (frac < 10) { f = "0" + f; }
+        return Str.FromInt(whole) + "." + f;
+    }
+
+    static string TargetExpr(int idx) {
+        if (idx == 1) { return "SkillTarget.MouseCell"; }
+        if (idx == 2) { return "SkillTarget.CharacterThenCell"; }
+        if (idx == 3) { return "SkillTarget.Self"; }
+        return "SkillTarget.Character";
+    }
+
+    static string FactionExpr(string camp) {
+        if (camp == "友方") { return "Faction.Friendly"; }
+        if (camp == "中立") { return "Faction.Neutral"; }
+        return "Faction.Enemy";
+    }
+
+    static void EmitMaps(StringBuilder sb) {
+        int i = 0;
+        while (i < Mge.maps.Count) {
+            MapDoc m = Mge.maps[i];
+            string v = "m" + Str.FromInt(i);
+            sb.Append("\n        MapConfig " + v + " = MapConfig.Create("
+                + Str.Quote(m.name) + ");\n");
+            sb.Append("        " + v + ".SetGrid(" + Str.FromInt(m.cellW) + ", "
+                + Str.FromInt(m.cellH) + ", " + Str.FromInt(m.cols) + ", "
+                + Str.FromInt(m.rows) + ");\n");
+            sb.Append("        " + v + ".SetStart(" + Str.FromInt(m.startX) + ", "
+                + Str.FromInt(m.startY) + ");\n");
+            if (m.isDefault) { sb.Append("        " + v + ".SetDefault(true);\n"); }
+            int y = 0;
+            while (y < m.rows) {
+                int x = 0;
+                while (x < m.cols) {
+                    int flags = m.CellAt(x, y);
+                    if (flags != 0) {
+                        sb.Append("        " + v + ".AddCell(MapCell.Of("
+                            + Str.FromInt(x) + ", " + Str.FromInt(y) + ", "
+                            + Str.FromInt(flags) + "));\n");
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            int k = 0;
+            while (k < m.spawns.Count) {
+                JsonValue sp = m.spawns[k];
+                sb.Append("        " + v + ".AddSpawn(MapSpawn.Of("
+                    + Str.Quote(sp.Str("name", "")) + ", "
+                    + Mge.FactionExpr(sp.Str("faction", "敌方")) + ", "
+                    + Str.FromInt(sp.Int("x", 0)) + ", "
+                    + Str.FromInt(sp.Int("y", 0)) + ", "
+                    + Str.FromInt(sp.Int("range", 3)) + ", "
+                    + Str.FromInt(sp.Int("count", 1)) + ")"
+                    + ".SetLevel(" + Str.FromInt(sp.Int("level", 0)) + "));\n");
+                k = k + 1;
+            }
+            sb.Append("        p.AddMap(" + v + ");\n");
+            i = i + 1;
+        }
+    }
+
+    static string OptionOf(List<string> opts, int idx) {
+        if (idx < 0 || idx >= opts.Count) { return ""; }
+        return opts[idx];
+    }
+
+    // ---- shared widgets -----------------------------------------------------
+
+    /// A flat text button drawn on the canvas; returns true on the click frame.
+    static bool TextButton(App a, int x, int y, int w, int h, string label,
+                           bool accent) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int id = WidgetId.Next();
+        a.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+        int bg = t.bgTertiary;
+        if (accent) { bg = t.primary; }
+        if (Ui.Hovered(a, id)) {
+            bg = t.bgHover;
+            if (accent) { bg = t.primaryHover; }
+        }
+        int fg = t.textPrimary;
+        if (accent) { fg = t.textInverse; }
+        c.FillRoundRect(x, y, w, h, t.borderRadiusSmall, bg);
+        c.DrawTextCentered(x, y, w, h, label, fg, t.fontSizeSmall);
+        return Ui.Clicked(a, id);
+    }
+
+    /// A checkbox-like toggle; returns true when the value was flipped.
+    static bool Toggle(App a, int x, int y, int w, int h, string label, bool on) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int id = WidgetId.Next();
+        a.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+        int box = a.Scale(16);
+        int by = y + (h - box) / 2;
+        int bg = t.bgTertiary;
+        if (on) { bg = t.primary; }
+        c.FillRoundRect(x, by, box, box, a.Scale(4), bg);
+        if (on) {
+            Icon.DrawCenteredIn(c, "check", x, by, box, box, a.Scale(8), t.textInverse);
+        }
+        c.DrawText(x + box + a.Scale(8), y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            label, t.textSecondary, t.fontSizeSmall);
+        return Ui.Clicked(a, id);
+    }
+
+    /// A click-to-cycle enum chip; returns the (possibly advanced) index.
+    static int EnumChip(App a, int x, int y, int w, int h, List<string> opts, int idx) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int id = WidgetId.Next();
+        a.hitTester.Register(HitRegion.Create(id, x, y, w, h, 0));
+        int bg = t.bgTertiary;
+        if (Ui.Hovered(a, id)) { bg = t.bgHover; }
+        c.FillRoundRect(x, y, w, h, t.borderRadiusSmall, bg);
+        c.DrawText(x + a.Scale(10), y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            Mge.OptionOf(opts, idx), t.textPrimary, t.fontSizeSmall);
+        Icon.DrawCenteredIn(c, "chevron-down", x + w - a.Scale(24), y, a.Scale(24), h,
+            a.Scale(9), t.textTertiary);
+        if (Ui.Clicked(a, id) && opts.Count > 0) {
+            int next = idx + 1;
+            if (next >= opts.Count) { next = 0; }
+            return next;
+        }
+        return idx;
+    }
+
+    static void SectionLabel(App a, int x, int y, string text) {
+        a.canvas.DrawText(x, y, text, a.theme.textTertiary, a.theme.fontSizeSmall);
+    }
+
+    // ---- rendering ----------------------------------------------------------
+
+    static void Render(App a) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int W = c.Width();
+        int H = c.Height();
+        int top = a.titlebarH;
+        int railW = a.Scale(150);
+        int statusH = a.Scale(28);
+
+        c.FillRect(0, top, W, H - top, t.bgPrimary);
+        Mge.RenderRail(a, 0, top, railW, H - top - statusH);
+
+        int bodyX = railW;
+        int bodyW = W - railW;
+        int bodyH = H - top - statusH;
+        if (Mge.tab == 3) {
+            Mge.RenderMapTab(a, bodyX, top, bodyW, bodyH);
+        } else {
+            Mge.RenderSheetTab(a, Mge.sheets[Mge.tab], bodyX, top, bodyW, bodyH);
+        }
+        Mge.RenderStatus(a, 0, H - statusH, W, statusH);
+    }
+
+    static void RenderRail(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawLine(x + w - 1, y, x + w - 1, y + h, t.divider, 1);
+
+        List<string> names = new List<string>();
+        names.Add("角色 NPC");
+        names.Add("道具 装备");
+        names.Add("技能");
+        names.Add("地图");
+        List<string> icons = new List<string>();
+        icons.Add("user");
+        icons.Add("layout");
+        icons.Add("star");
+        icons.Add("grid");
+
+        int itemH = a.Scale(40);
+        int iy = y + a.Scale(12);
+        int i = 0;
+        while (i < names.Count) {
+            int id = WidgetId.Next();
+            a.hitTester.Register(HitRegion.Create(id, x + a.Scale(8), iy,
+                w - a.Scale(16), itemH, 0));
+            bool active = Mge.tab == i;
+            int bg = t.bgSecondary;
+            if (active) { bg = t.bgActive; }
+            else if (Ui.Hovered(a, id)) { bg = t.bgHover; }
+            c.FillRoundRect(x + a.Scale(8), iy, w - a.Scale(16), itemH,
+                t.borderRadiusSmall, bg);
+            int fg = t.textSecondary;
+            if (active) { fg = t.textPrimary; }
+            Icon.DrawCenteredIn(c, icons[i], x + a.Scale(14), iy, a.Scale(24), itemH,
+                a.Scale(11), fg);
+            c.DrawText(x + a.Scale(42), iy + (itemH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                names[i], fg, t.fontSizeSmall);
+            if (Ui.Clicked(a, id)) {
+                Mge.tab = i;
+                a.RequestRedraw();
+            }
+            iy = iy + itemH + a.Scale(4);
+            i = i + 1;
+        }
+
+        int btnH = a.Scale(32);
+        int by = y + h - btnH * 2 - a.Scale(20);
+        if (Mge.TextButton(a, x + a.Scale(8), by, w - a.Scale(16), btnH, "保存全部", true)) {
+            Mge.SaveAll();
+        }
+        if (Mge.TextButton(a, x + a.Scale(8), by + btnH + a.Scale(8),
+                w - a.Scale(16), btnH, "导出 Zan", false)) {
+            Mge.SaveAll();
+            Mge.Export();
+        }
+    }
+
+    static void RenderStatus(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawLine(x, y, x + w, y, t.divider, 1);
+        string s = Mge.status;
+        if (Mge.Dirty()) { s = s + "   ·   有未保存修改"; }
+        c.DrawText(x + a.Scale(12), y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            s, t.textSecondary, t.fontSizeSmall);
+    }
+
+    static bool Dirty() {
+        if (Mge.mapDirty) { return true; }
+        int i = 0;
+        while (i < Mge.sheets.Count) {
+            if (Mge.sheets[i].dirty) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // ---- record sheets ------------------------------------------------------
+
+    static void RenderSheetTab(App a, Sheet s, int x, int y, int w, int h) {
+        int listW = a.Scale(240);
+        Mge.RenderSheetList(a, s, x, y, listW, h);
+        Mge.RenderSheetForm(a, s, x + listW, y, w - listW, h);
+    }
+
+    static void RenderSheetList(App a, Sheet s, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgPrimary);
+        c.DrawLine(x + w - 1, y, x + w - 1, y + h, t.divider, 1);
+
+        int pad = a.Scale(10);
+        int rowH = t.heightMedium;
+        s.search.Render(a, x + pad, y + pad, w - pad * 2, rowH);
+
+        int btnY = y + pad + rowH + a.Scale(8);
+        int btnW = (w - pad * 2 - a.Scale(8) * 2) / 3;
+        if (Mge.TextButton(a, x + pad, btnY, btnW, rowH, "新建", false)) {
+            s.rows.Add(s.NewRow());
+            s.sel = s.rows.Count - 1;
+            s.dirty = true;
+            s.PushForm();
+        }
+        if (Mge.TextButton(a, x + pad + btnW + a.Scale(8), btnY, btnW, rowH, "复制", false)) {
+            JsonValue cur = s.Selected();
+            if (cur != null) {
+                JsonValue copy = JsonValue.Parse(cur.ToJson());
+                copy.Set("name", JsonValue.NewStr(s.UniqueName(cur.Str("name", "row"))));
+                s.rows.Add(copy);
+                s.sel = s.rows.Count - 1;
+                s.dirty = true;
+                s.PushForm();
+            }
+        }
+        if (Mge.TextButton(a, x + pad + (btnW + a.Scale(8)) * 2, btnY, btnW, rowH,
+                "删除", false)) {
+            if (s.sel >= 0 && s.sel < s.rows.Count) {
+                s.rows.RemoveAt(s.sel);
+                if (s.sel >= s.rows.Count) { s.sel = s.rows.Count - 1; }
+                s.dirty = true;
+                s.PushForm();
+            }
+        }
+
+        int listY = btnY + rowH + a.Scale(10);
+        int listH = y + h - listY - pad;
+        c.PushClip(x, listY, w, listH);
+        string filter = s.search.GetText();
+        int itemH = a.Scale(30);
+        int iy = listY - s.scroll;
+        int i = 0;
+        while (i < s.rows.Count) {
+            JsonValue r = s.rows[i];
+            string name = r.Str("name", "");
+            string dn = r.Str("displayName", "");
+            bool match = filter == "" || Str.Contains(name, filter)
+                || Str.Contains(dn, filter);
+            if (match) {
+                if (iy + itemH > listY && iy < listY + listH) {
+                    int id = WidgetId.Next();
+                    a.hitTester.Register(HitRegion.Create(id, x + pad, iy,
+                        w - pad * 2, itemH, 0));
+                    int bg = t.bgPrimary;
+                    if (s.sel == i) { bg = t.bgActive; }
+                    else if (Ui.Hovered(a, id)) { bg = t.bgHover; }
+                    c.FillRoundRect(x + pad, iy, w - pad * 2, itemH,
+                        t.borderRadiusSmall, bg);
+                    string label = name;
+                    if (dn != "") { label = name + "  ·  " + dn; }
+                    c.DrawText(x + pad + a.Scale(10),
+                        iy + (itemH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                        label, t.textPrimary, t.fontSizeSmall);
+                    if (Ui.Clicked(a, id)) {
+                        s.sel = i;
+                        s.formScroll = 0;
+                        s.PushForm();
+                        a.RequestRedraw();
+                    }
+                }
+                iy = iy + itemH + a.Scale(2);
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+
+        int contentH = iy + s.scroll - listY;
+        if (a.CaptureWheel(x, listY, w, listH)) {
+            s.scroll = s.scroll - Ui.WheelDelta(a) * a.Scale(30);
+        }
+        int maxScroll = contentH - listH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (s.scroll > maxScroll) { s.scroll = maxScroll; }
+        if (s.scroll < 0) { s.scroll = 0; }
+    }
+
+    static void RenderSheetForm(App a, Sheet s, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgPrimary);
+        int pad = a.Scale(18);
+        JsonValue row = s.Selected();
+        if (row == null) {
+            c.DrawTextCentered(x, y, w, h, "左侧选择或新建一条 " + s.title + " 数据",
+                t.textTertiary, t.fontSizeMedium);
+            return;
+        }
+
+        c.DrawText(x + pad, y + pad, s.title + " · " + row.Str("name", ""),
+            t.textPrimary, t.fontSizeLarge);
+
+        int avail = w - pad * 2;
+        int cols = avail / a.Scale(300);
+        if (cols < 1) { cols = 1; }
+        int colW = avail / cols;
+        int rowH = t.heightMedium;
+        int cellH = rowH + a.Scale(30);
+        int viewY = y + pad + a.Scale(36);
+        int viewH = y + h - viewY - pad;
+        int lines = (s.specs.Count + cols - 1) / cols;
+        int maxScroll = lines * cellH - viewH;
+        if (maxScroll < 0) { maxScroll = 0; }
+        if (a.CaptureWheel(x, viewY, w, viewH)) {
+            s.formScroll = s.formScroll - Ui.WheelDelta(a) * a.Scale(40);
+        }
+        if (s.formScroll > maxScroll) { s.formScroll = maxScroll; }
+        if (s.formScroll < 0) { s.formScroll = 0; }
+        int gridY = viewY - s.formScroll;
+
+        c.PushClip(x, viewY, w, viewH);
+        int i = 0;
+        while (i < s.specs.Count) {
+            FieldSpec f = s.specs[i];
+            int col = i - (i / cols) * cols;
+            int line = i / cols;
+            int fx = x + pad + col * colW;
+            int fy = gridY + line * cellH;
+            int fw = colW - a.Scale(20);
+            Mge.SectionLabel(a, fx, fy, f.label);
+            int iy = fy + a.Scale(20);
+            if (f.kind == 0 || f.kind == 1) {
+                s.inputs[i].Render(a, fx, iy, fw, rowH);
+            }
+            if (f.kind == 2) {
+                bool on = row.Bool(f.key, f.dfltInt == 1);
+                if (Mge.Toggle(a, fx, iy, fw, rowH, "", on)) {
+                    row.Set(f.key, JsonValue.NewBool(!on));
+                    s.dirty = true;
+                }
+            }
+            if (f.kind == 3) {
+                int idx = row.Int(f.key, f.dfltInt);
+                int next = Mge.EnumChip(a, fx, iy, fw, rowH, f.options, idx);
+                if (next != idx) {
+                    row.Set(f.key, JsonValue.NewNum(Str.FromInt(next)));
+                    s.dirty = true;
+                }
+            }
+            i = i + 1;
+        }
+        c.PopClip();
+        Mge.PullForm(s, row);
+    }
+
+    /// Reads the text/int inputs back into the selected row (the inputs own the
+    /// keystrokes, the JSON row owns the truth).
+    static void PullForm(Sheet s, JsonValue row) {
+        int i = 0;
+        while (i < s.specs.Count) {
+            FieldSpec f = s.specs[i];
+            if (f.kind == 0) {
+                string v = s.inputs[i].GetText();
+                if (v != row.Str(f.key, "")) {
+                    row.Set(f.key, JsonValue.NewStr(v));
+                    s.dirty = true;
+                }
+            }
+            if (f.kind == 1) {
+                string raw = s.inputs[i].GetText();
+                string clean = Str.Digits(raw, true);
+                if (clean != raw) { s.inputs[i].SetText(clean); }
+                int v = Str.ToInt(clean);
+                if (v != row.Int(f.key, f.dfltInt)) {
+                    row.Set(f.key, JsonValue.NewNum(Str.FromInt(v)));
+                    s.dirty = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // ---- map sheet ----------------------------------------------------------
+
+    static MapDoc CurrentMap() {
+        if (Mge.mapSel < 0 || Mge.mapSel >= Mge.maps.Count) { return null; }
+        return Mge.maps[Mge.mapSel];
+    }
+
+    static void SelectMap(int i) {
+        Mge.mapSel = i;
+        MapDoc m = Mge.CurrentMap();
+        if (m == null) { return; }
+        Mge.mapInputs[0].SetText(m.name);
+        Mge.mapInputs[1].SetText(Str.FromInt(m.cellW));
+        Mge.mapInputs[2].SetText(Str.FromInt(m.cellH));
+        Mge.mapInputs[3].SetText(Str.FromInt(m.cols));
+        Mge.mapInputs[4].SetText(Str.FromInt(m.rows));
+        Mge.mapInputs[5].SetText(Str.FromInt(m.startX));
+        Mge.mapInputs[6].SetText(Str.FromInt(m.startY));
+    }
+
+    static void RenderMapTab(App a, int x, int y, int w, int h) {
+        int listW = a.Scale(200);
+        int propW = a.Scale(260);
+        Mge.RenderMapList(a, x, y, listW, h);
+        Mge.RenderMapProps(a, x + w - propW, y, propW, h);
+        Mge.RenderGrid(a, x + listW, y, w - listW - propW, h);
+    }
+
+    static void RenderMapList(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgPrimary);
+        c.DrawLine(x + w - 1, y, x + w - 1, y + h, t.divider, 1);
+        int pad = a.Scale(10);
+        int rowH = t.heightMedium;
+
+        int btnW = (w - pad * 2 - a.Scale(8)) / 2;
+        if (Mge.TextButton(a, x + pad, y + pad, btnW, rowH, "新建地图", false)) {
+            MapDoc m = MapDoc.Create("map" + Str.FromInt(Mge.maps.Count + 1), 24, 24);
+            Mge.maps.Add(m);
+            Mge.SelectMap(Mge.maps.Count - 1);
+            Mge.mapDirty = true;
+        }
+        if (Mge.TextButton(a, x + pad + btnW + a.Scale(8), y + pad, btnW, rowH,
+                "删除", false)) {
+            if (Mge.mapSel >= 0 && Mge.mapSel < Mge.maps.Count) {
+                Mge.maps.RemoveAt(Mge.mapSel);
+                int next = Mge.mapSel;
+                if (next >= Mge.maps.Count) { next = Mge.maps.Count - 1; }
+                Mge.SelectMap(next);
+                Mge.mapDirty = true;
+            }
+        }
+
+        int iy = y + pad + rowH + a.Scale(10) - Mge.mapScroll;
+        int itemH = a.Scale(30);
+        int i = 0;
+        while (i < Mge.maps.Count) {
+            MapDoc m = Mge.maps[i];
+            int id = WidgetId.Next();
+            a.hitTester.Register(HitRegion.Create(id, x + pad, iy, w - pad * 2, itemH, 0));
+            int bg = t.bgPrimary;
+            if (Mge.mapSel == i) { bg = t.bgActive; }
+            else if (Ui.Hovered(a, id)) { bg = t.bgHover; }
+            c.FillRoundRect(x + pad, iy, w - pad * 2, itemH, t.borderRadiusSmall, bg);
+            string label = m.name + "  " + Str.FromInt(m.cols) + "x" + Str.FromInt(m.rows);
+            if (m.isDefault) { label = label + "  (默认)"; }
+            c.DrawText(x + pad + a.Scale(10),
+                iy + (itemH - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                label, t.textPrimary, t.fontSizeSmall);
+            if (Ui.Clicked(a, id)) {
+                Mge.SelectMap(i);
+                a.RequestRedraw();
+            }
+            iy = iy + itemH + a.Scale(2);
+            i = i + 1;
+        }
+    }
+
+    static void RenderMapProps(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawLine(x, y, x, y + h, t.divider, 1);
+        MapDoc m = Mge.CurrentMap();
+        int pad = a.Scale(14);
+        if (m == null) {
+            c.DrawTextCentered(x, y, w, h, "新建一张地图", t.textTertiary, t.fontSizeSmall);
+            return;
+        }
+        int rowH = t.heightMedium;
+        int fy = y + pad;
+
+        List<string> labels = new List<string>();
+        labels.Add("名称");
+        labels.Add("格子宽度");
+        labels.Add("格子高度");
+        labels.Add("列数");
+        labels.Add("行数");
+        labels.Add("初始位置 X");
+        labels.Add("初始位置 Y");
+        int i = 0;
+        while (i < labels.Count) {
+            Mge.SectionLabel(a, x + pad, fy, labels[i]);
+            Mge.mapInputs[i].Render(a, x + pad, fy + a.Scale(18), w - pad * 2, rowH);
+            fy = fy + a.Scale(18) + rowH + a.Scale(10);
+            i = i + 1;
+        }
+        if (Mge.Toggle(a, x + pad, fy, w - pad * 2, rowH, "默认地图", m.isDefault)) {
+            m.isDefault = !m.isDefault;
+            Mge.mapDirty = true;
+        }
+        fy = fy + rowH + a.Scale(14);
+
+        Mge.SectionLabel(a, x + pad, fy, "刷怪点参数（数量 / 范围）");
+        fy = fy + a.Scale(18);
+        int half = (w - pad * 2 - a.Scale(8)) / 2;
+        Mge.spawnCount.Render(a, x + pad, fy, half, rowH);
+        Mge.spawnRange.Render(a, x + pad + half + a.Scale(8), fy, half, rowH);
+        fy = fy + rowH + a.Scale(10);
+
+        Sheet npcSheet = Mge.sheets[0];
+        string npcName = "(先在角色页选中一个角色)";
+        JsonValue npcRow = npcSheet.Selected();
+        if (npcRow != null) { npcName = npcRow.Str("name", ""); }
+        c.DrawText(x + pad, fy, "刷怪角色: " + npcName, t.textSecondary, t.fontSizeSmall);
+        fy = fy + a.Scale(22);
+
+        c.DrawText(x + pad, fy, "刷怪点 " + Str.FromInt(m.spawns.Count) + " 个",
+            t.textTertiary, t.fontSizeSmall);
+        fy = fy + a.Scale(20);
+        int k = 0;
+        while (k < m.spawns.Count && fy + rowH < y + h) {
+            JsonValue sp = m.spawns[k];
+            string line = sp.Str("name", "") + " @" + Str.FromInt(sp.Int("x", 0))
+                + "," + Str.FromInt(sp.Int("y", 0)) + " x" + Str.FromInt(sp.Int("count", 1));
+            c.DrawText(x + pad, fy, line, t.textSecondary, t.fontSizeSmall);
+            if (Mge.TextButton(a, x + w - pad - a.Scale(40), fy - a.Scale(4),
+                    a.Scale(40), a.Scale(20), "删除", false)) {
+                m.spawns.RemoveAt(k);
+                Mge.mapDirty = true;
+                return;
+            }
+            fy = fy + a.Scale(22);
+            k = k + 1;
+        }
+
+        Mge.PullMapForm(m);
+    }
+
+    static void PullMapForm(MapDoc m) {
+        string name = Mge.mapInputs[0].GetText();
+        if (name != "" && name != m.name) {
+            m.name = name;
+            Mge.mapDirty = true;
+        }
+        int cellW = Mge.SanitizedInt(Mge.mapInputs[1], m.cellW);
+        int cellH = Mge.SanitizedInt(Mge.mapInputs[2], m.cellH);
+        int cols = Mge.SanitizedInt(Mge.mapInputs[3], m.cols);
+        int rows = Mge.SanitizedInt(Mge.mapInputs[4], m.rows);
+        int sx = Mge.SanitizedInt(Mge.mapInputs[5], m.startX);
+        int sy = Mge.SanitizedInt(Mge.mapInputs[6], m.startY);
+        if (cellW > 0 && cellW != m.cellW) { m.cellW = cellW; Mge.mapDirty = true; }
+        if (cellH > 0 && cellH != m.cellH) { m.cellH = cellH; Mge.mapDirty = true; }
+        if (cols > 0 && rows > 0 && (cols != m.cols || rows != m.rows)) {
+            m.Resize(cols, rows);
+            Mge.mapDirty = true;
+        }
+        if (sx != m.startX && sx >= 0 && sx < m.cols) { m.startX = sx; Mge.mapDirty = true; }
+        if (sy != m.startY && sy >= 0 && sy < m.rows) { m.startY = sy; Mge.mapDirty = true; }
+    }
+
+    static int SanitizedInt(Input inp, int dflt) {
+        string raw = inp.GetText();
+        string clean = Str.Digits(raw, false);
+        if (clean != raw) { inp.SetText(clean); }
+        if (clean == "") { return dflt; }
+        return Str.ToInt(clean);
+    }
+
+    static void RenderGrid(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgPrimary);
+        MapDoc m = Mge.CurrentMap();
+        int barH = a.Scale(78);
+        Mge.RenderPalette(a, x, y, w, barH);
+        int gx = x + a.Scale(12);
+        int gy = y + barH + a.Scale(12);
+        int gw = w - a.Scale(24);
+        int gh = h - barH - a.Scale(24);
+        if (m == null) { return; }
+
+        int cell = gw / m.cols;
+        int cellByH = gh / m.rows;
+        if (cellByH < cell) { cell = cellByH; }
+        if (cell < 4) { cell = 4; }
+        int gridW = cell * m.cols;
+        int gridH = cell * m.rows;
+
+        c.PushClip(gx, gy, gw, gh);
+        c.FillRect(gx, gy, gridW, gridH, t.bgTertiary);
+        int yy = 0;
+        while (yy < m.rows) {
+            int xx = 0;
+            while (xx < m.cols) {
+                int flags = m.CellAt(xx, yy);
+                if (flags != 0) {
+                    c.FillRect(gx + xx * cell, gy + yy * cell, cell, cell,
+                        Mge.FlagColor(t, flags));
+                }
+                xx = xx + 1;
+            }
+            yy = yy + 1;
+        }
+        int line = 0;
+        while (line <= m.cols) {
+            c.DrawLine(gx + line * cell, gy, gx + line * cell, gy + gridH, t.divider, 1);
+            line = line + 1;
+        }
+        line = 0;
+        while (line <= m.rows) {
+            c.DrawLine(gx, gy + line * cell, gx + gridW, gy + line * cell, t.divider, 1);
+            line = line + 1;
+        }
+
+        // start position + spawns
+        c.FillCircle(gx + m.startX * cell + cell / 2, gy + m.startY * cell + cell / 2,
+            cell / 3, t.success);
+        int k = 0;
+        while (k < m.spawns.Count) {
+            JsonValue sp = m.spawns[k];
+            int sxp = gx + sp.Int("x", 0) * cell + cell / 2;
+            int syp = gy + sp.Int("y", 0) * cell + cell / 2;
+            c.FillCircle(sxp, syp, cell / 3, t.warning);
+            c.DrawCircle(sxp, syp, sp.Int("range", 3) * cell, t.warning, 1);
+            k = k + 1;
+        }
+        c.PopClip();
+
+        Mge.HandleGridInput(a, m, gx, gy, cell, gridW, gridH);
+    }
+
+    static int FlagColor(Theme t, int flags) {
+        if (flags == 1) { return t.error; }
+        if (flags == 2) { return t.info; }
+        return t.warning;
+    }
+
+    static void HandleGridInput(App a, MapDoc m, int gx, int gy, int cell,
+                                int gridW, int gridH) {
+        int id = WidgetId.Next();
+        a.hitTester.Register(HitRegion.Create(id, gx, gy, gridW, gridH, 0));
+        bool press = Ui.PressedDown(a, id);
+        bool drag = Ui.Pressed(a, id) && a.window.EventKind() == 1;
+        if (!press && !drag) { return; }
+        int cx = (a.mouseX - gx) / cell;
+        int cy = (a.mouseY - gy) / cell;
+        if (cx < 0 || cy < 0 || cx >= m.cols || cy >= m.rows) { return; }
+
+        if (Mge.mapTool == 0) {
+            if (m.CellAt(cx, cy) != Mge.brush) {
+                m.SetCell(cx, cy, Mge.brush);
+                Mge.mapDirty = true;
+                a.RequestRedraw();
+            }
+            return;
+        }
+        if (!press) { return; }
+        if (Mge.mapTool == 1) {
+            JsonValue npcRow = Mge.sheets[0].Selected();
+            if (npcRow == null) {
+                Mge.status = "请先在“角色”页选中一个角色，再放置刷怪点";
+                return;
+            }
+            if (m.SpawnIndexAt(cx, cy) >= 0) { return; }
+            JsonValue sp = JsonValue.NewObject();
+            sp.Set("name", JsonValue.NewStr(npcRow.Str("name", "")));
+            sp.Set("faction", JsonValue.NewStr("敌方"));
+            sp.Set("x", JsonValue.NewNum(Str.FromInt(cx)));
+            sp.Set("y", JsonValue.NewNum(Str.FromInt(cy)));
+            sp.Set("range", JsonValue.NewNum(Str.FromInt(Mge.SanitizedInt(Mge.spawnRange, 3))));
+            sp.Set("count", JsonValue.NewNum(Str.FromInt(Mge.SanitizedInt(Mge.spawnCount, 1))));
+            sp.Set("level", JsonValue.NewNum(Str.FromInt(npcRow.Int("level", 1))));
+            m.spawns.Add(sp);
+            Mge.mapDirty = true;
+            a.RequestRedraw();
+            return;
+        }
+        if (Mge.mapTool == 2) {
+            m.startX = cx;
+            m.startY = cy;
+            Mge.mapInputs[5].SetText(Str.FromInt(cx));
+            Mge.mapInputs[6].SetText(Str.FromInt(cy));
+            Mge.mapDirty = true;
+            a.RequestRedraw();
+            return;
+        }
+        int idx = m.SpawnIndexAt(cx, cy);
+        if (idx >= 0) {
+            m.spawns.RemoveAt(idx);
+            Mge.mapDirty = true;
+            a.RequestRedraw();
+        }
+    }
+
+    static void RenderPalette(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawLine(x, y + h - 1, x + w, y + h - 1, t.divider, 1);
+
+        List<string> tools = new List<string>();
+        tools.Add("画格子");
+        tools.Add("放刷怪点");
+        tools.Add("设起点");
+        tools.Add("删刷怪点");
+        int bx = x + a.Scale(12);
+        int by = y + a.Scale(8);
+        int i = 0;
+        while (i < tools.Count) {
+            int bw = a.Scale(76);
+            if (bx + bw > x + w - a.Scale(8)) { break; }
+            if (Mge.TextButton(a, bx, by, bw, t.heightSmall, tools[i], Mge.mapTool == i)) {
+                Mge.mapTool = i;
+            }
+            bx = bx + bw + a.Scale(6);
+            i = i + 1;
+        }
+
+        // Brushes live on their own row so a narrow window never pushes them
+        // out from under the toolbar.
+        bx = x + a.Scale(12);
+        by = by + t.heightSmall + a.Scale(6);
+        List<string> brushes = new List<string>();
+        brushes.Add("空地");
+        brushes.Add("障碍");
+        brushes.Add("透明");
+        brushes.Add("障碍+透明");
+        int k = 0;
+        while (k < brushes.Count) {
+            int bw = a.Scale(78);
+            if (bx + bw > x + w - a.Scale(8)) { break; }
+            if (Mge.TextButton(a, bx, by, bw, t.heightSmall, brushes[k],
+                    Mge.mapTool == 0 && Mge.brush == k)) {
+                Mge.brush = k;
+                Mge.mapTool = 0;
+            }
+            bx = bx + bw + a.Scale(6);
+            k = k + 1;
+        }
+    }
+}
