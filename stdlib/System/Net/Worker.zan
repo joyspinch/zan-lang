@@ -1075,10 +1075,14 @@ class Worker {
         // Reassemble whole frames via WsReader (handles partial and coalesced
         // frames), rather than assuming one recv == one frame.
         WsReader reader = new WsReader(clientSock);
+        WsWriter writer = new WsWriter();
         bool active = true;
         while (active && !conn.closed) {
             int total = reader.FrameSize();
             while (total < 0) {
+                // Nothing more to answer from this batch: put the replies on the
+                // wire before parking on the reactor.
+                if (writer.Pending()) { int _f = await writer.Flush(client); }
                 int got = await reader.FillMore();
                 if (got == 0) {
                     active = false;
@@ -1105,16 +1109,17 @@ class Worker {
                     int hdrLen = 2;
                     if (response.Length > 65535) { hdrLen = 10; }
                     else if (response.Length > 125) { hdrLen = 4; }
-                    int _n = await client.SendBytesAsync(encoded, hdrLen + response.Length);
+                    writer.Append(encoded, hdrLen + response.Length);
                 }
             } else if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
                 string encoded = pong.Encode();
-                int _p = await client.SendBytesAsync(encoded, 2);
+                writer.Append(encoded, 2);
             } else if (frame.opcode == WsOpcode.Close) {
                 WsFrame closeResp = WsFrame.CloseFrame();
                 string enc2 = closeResp.Encode();
-                int _c = await client.SendBytesAsync(enc2, 2);
+                writer.Append(enc2, 2);
+                int _c = await writer.Flush(client);
                 active = false;
             }
         }

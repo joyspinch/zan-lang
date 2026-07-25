@@ -342,6 +342,70 @@ class WsReader {
 }
 
 /// <summary>
+/// Binary-safe output buffer for frames that are answered back to back.
+///
+/// A send() per frame costs more than encoding one: with 64 pipelined frames per
+/// recv the echo path spent its time in syscalls (130k messages/sec on a fully
+/// busy core, against 6.8M for the tcp path, which echoes a whole recv in one
+/// write). Responses are accumulated while more complete frames are already
+/// buffered and flushed once the reader runs dry.
+/// </summary>
+class WsWriter {
+    string buf;
+    int len;
+    int cap;
+
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+    [DllImport("crt")]
+    static extern void free(string ptr);
+
+    WsWriter() {
+        this.cap = 65536;
+        this.buf = calloc(this.cap + 1, 1);
+        this.len = 0;
+    }
+
+    void Ensure(int need) {
+        if (need <= this.cap) { return; }
+        int nc = this.cap * 2;
+        while (nc < need) { nc = nc * 2; }
+        string nb = calloc(nc + 1, 1);
+        int i = 0;
+        while (i < this.len) {
+            nb[i] = this.buf[i];
+            i = i + 1;
+        }
+        free(this.buf);
+        this.buf = nb;
+        this.cap = nc;
+    }
+
+    /// <summary>Appends `n` bytes of an encoded frame.</summary>
+    void Append(string data, int n) {
+        this.Ensure(this.len + n);
+        int i = 0;
+        while (i < n) {
+            this.buf[this.len + i] = data[i];
+            i = i + 1;
+        }
+        this.len = this.len + n;
+    }
+
+    bool Pending() {
+        return this.len > 0;
+    }
+
+    /// <summary>Writes everything buffered as a single send and resets.</summary>
+    async int Flush(TcpClient client) {
+        if (this.len == 0) { return 0; }
+        int n = await client.SendBytesAsync(this.buf, this.len);
+        this.len = 0;
+        return n;
+    }
+}
+
+/// <summary>
 /// WebSocket server.
 /// </summary>
 class WebSocketServer {
@@ -408,6 +472,7 @@ class WebSocketServer {
         await client.SendAsync(sb.ToString());
 
         WsReader reader = new WsReader(clientSock);
+        WsWriter writer = new WsWriter();
         bool connected = true;
         while (connected) {
             // Reassemble one complete frame, pulling more bytes as needed. A
@@ -415,6 +480,8 @@ class WebSocketServer {
             // (pipelined frames); the reader handles both.
             int total = reader.FrameSize();
             while (total < 0) {
+                // Batch answered, flush it before parking on the reactor.
+                if (writer.Pending()) { int _f = await writer.Flush(client); }
                 int n = await reader.FillMore();
                 if (n == 0) {
                     connected = false;
@@ -440,15 +507,16 @@ class WebSocketServer {
                 } else if (respLen > 125) {
                     hdrLen = 4;
                 }
-                await client.SendBytesAsync(encoded, hdrLen + respLen);
+                writer.Append(encoded, hdrLen + respLen);
             } else if (frame.opcode == WsOpcode.Ping) {
                 WsFrame pong = WsFrame.PongFrame();
                 string encoded = pong.Encode();
-                await client.SendBytesAsync(encoded, 2);
+                writer.Append(encoded, 2);
             } else if (frame.opcode == WsOpcode.Close) {
                 WsFrame closeResp = WsFrame.CloseFrame();
                 string encoded = closeResp.Encode();
-                await client.SendBytesAsync(encoded, 2);
+                writer.Append(encoded, 2);
+                int _c = await writer.Flush(client);
                 connected = false;
             }
         }
