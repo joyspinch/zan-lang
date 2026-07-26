@@ -35,6 +35,7 @@ partial class ZanIDE {
         string s = CodeEditor.LTrim(line);
         List<string> kws = new List<string>();
         kws.Add("class "); kws.Add("struct "); kws.Add("enum "); kws.Add("interface ");
+        kws.Add("namespace ");
         int i = 0;
         while (i < kws.Count) {
             string kw = kws[i];
@@ -434,6 +435,26 @@ partial class ZanIDE {
         return outp;
     }
 
+    /// First source file of the directory named `name` under `dir` (recursive),
+    /// or "". Namespaces map onto directories, so this is how a namespace name
+    /// -- which has no declaration line to jump to -- resolves to a file.
+    static string FindNamespaceDirFile(string dir, string name) {
+        if (!Directory.Exists(dir)) { return ""; }
+        List<string> subs = Directory.GetDirectories(dir);
+        int i = 0;
+        while (i < subs.Count) {
+            string sub = dir + "/" + subs[i];
+            if (subs[i] == name) {
+                List<string> inner = ZanIDE.ListZanFiles(sub);
+                if (inner.Count > 0) { return inner[0]; }
+            }
+            string deep = ZanIDE.FindNamespaceDirFile(sub, name);
+            if (deep != "") { return deep; }
+            i = i + 1;
+        }
+        return "";
+    }
+
     static void CollectZan(string dir, List<string> outp) {
         if (!Directory.Exists(dir)) { return; }
         List<string> files = Directory.GetFiles(dir);
@@ -485,21 +506,14 @@ partial class ZanIDE {
             i = i + 1;
         }
         List<string> files = ZanIDE.ListZanFiles(root + "/src");
-        // Stdlib sources are browsable and openable, but they live outside the
-        // project, so a symbol looked up from one used to report "not found in
-        // project". Search the stdlib too when the caret sits in a stdlib file.
-        bool inStd = false;
-        if (a >= 0 && a < tabPaths.Count) {
-            inStd = ZanIDE.NormPath(tabPaths[a]).StartsWith(
-                ZanIDE.NormPath(ZanIDE.StdlibDir()));
-        }
-        if (inStd) {
-            List<string> stdFiles = ZanIDE.ListZanFiles(ZanIDE.StdlibDir());
-            int si = 0;
-            while (si < stdFiles.Count) {
-                files.Add(stdFiles[si]);
-                si = si + 1;
-            }
+        // Most symbols a project uses are declared in the stdlib, and stdlib
+        // sources are browsable/openable here, so search them after the project
+        // instead of reporting "not found in project".
+        List<string> stdFiles = ZanIDE.ListZanFiles(ZanIDE.StdlibDir());
+        int si = 0;
+        while (si < stdFiles.Count) {
+            files.Add(stdFiles[si]);
+            si = si + 1;
         }
         int fi = 0;
         while (fi < files.Count) {
@@ -515,6 +529,20 @@ partial class ZanIDE {
                 }
             }
             fi = fi + 1;
+        }
+        // Namespaces (`using System.Web;`) declare nothing, so fall back to the
+        // directory that backs them and open its first source file.
+        string nsFile = ZanIDE.FindNamespaceDirFile(ZanIDE.StdlibDir(), word);
+        if (nsFile == "") { nsFile = ZanIDE.FindNamespaceDirFile(root + "/src", word); }
+        if (nsFile != "") {
+            if (tabPaths.IndexOf(nsFile) < 0) {
+                ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, active, nsFile,
+                    Path.GetFileName(nsFile));
+            } else {
+                active.Set(tabPaths.IndexOf(nsFile));
+            }
+            log.Add("> Namespace '" + word + "' -> " + Path.GetFileName(nsFile) + ".");
+            return 0;
         }
         log.Add("> Go to Definition: '" + word + "' not found in project.");
         return 0 - 1;
