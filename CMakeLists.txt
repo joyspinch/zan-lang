@@ -540,18 +540,6 @@ add_test(NAME conformance_multifile
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-# ---- RA2 example: asset-format tests compiled against examples/game/ra2 ----
-# The example's parsers are not stdlib, so they are passed explicitly. Sources
-# live in a subdirectory so the single-file glob above ignores them.
-add_test(NAME conformance_ra2_blowfish
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/ra2/blowfish.zan
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/game/ra2/formats/Blowfish.zan"
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/ra2/expected_blowfish.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ra2_blowfish${_exe_ext}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,
 #      clang-compile + run + diff stdout, and verify malformed input fails
 #      closed (non-zero, no .ll). clang is optional -- without it the stdout

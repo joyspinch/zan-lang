@@ -46,3 +46,15 @@ place your Red Alert 2 install in examples/game/ra2/data
 
 `data/` 的位置会相对可执行文件自动向上探测，所以从仓库根或 `build/`
 目录启动都能找到资源。
+
+## 测试
+
+`formats/` 下的解析器有一套回归测试，同样只用 zanc 编译，不经过 CMake：
+
+```
+bash examples/game/ra2/tests/run.sh
+```
+
+每个 `tests/<名字>.zan` 是独立程序，它的标准输出必须逐字匹配
+`tests/expected_<名字>.out`。测试只用公开测试向量和构造出来的缓冲区，
+**不读 `data/`**——那是你自己的游戏安装目录。
