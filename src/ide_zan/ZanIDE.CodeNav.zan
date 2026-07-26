@@ -692,6 +692,325 @@ partial class ZanIDE {
         return outp;
     }
 
+    // ================================================================
+    // Find/Replace in Files (project-wide, including unopened files)
+    // ================================================================
+
+    /// Searches every project source file for `needle`, filling parallel result
+    /// lists (`outPath`/`outLine` 0-based/`outText`) and logging one row per
+    /// hit. Open tabs are searched in their buffers so unsaved edits count.
+    /// Returns the number of hits (capped so a one-letter query cannot flood
+    /// the panel).
+    static int FindInFiles(string root, string needle, bool matchCase,
+                           List<string> tabPaths, List<string> tabBodies,
+                           List<string> outPath, List<string> outLine,
+                           List<string> outText, List<string> log) {
+        while (outPath.Count > 0) {
+            outPath.RemoveAt(outPath.Count - 1);
+            outLine.RemoveAt(outLine.Count - 1);
+            outText.RemoveAt(outText.Count - 1);
+        }
+        if (needle == "") { return 0; }
+        List<string> files = new List<string>();
+        ZanIDE.GatherZanFiles(root, files);
+        int hits = 0;
+        int scanned = 0;
+        int fi = 0;
+        while (fi < files.Count && hits < 2000) {
+            string fp = files[fi];
+            int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+            string text = "";
+            if (tab >= 0) {
+                text = tabBodies[tab];
+            } else if (File.Exists(fp)) {
+                text = File.ReadAllText(fp);
+            }
+            if (text != "") {
+                scanned = scanned + 1;
+                List<string> ls = CodeEditor.SplitLines(text);
+                int li = 0;
+                while (li < ls.Count && hits < 2000) {
+                    if (ZanIDE.LineContains(ls[li], needle, matchCase)) {
+                        outPath.Add(fp);
+                        outLine.Add(Convert.ToString(li));
+                        outText.Add(ZanIDE.TrimLead(ls[li]));
+                        log.Add("   " + fp + ":" + Convert.ToString(li + 1)
+                            + ": " + ZanIDE.TrimLead(ls[li]));
+                        hits = hits + 1;
+                    }
+                    li = li + 1;
+                }
+            }
+            fi = fi + 1;
+        }
+        log.Add("> " + Convert.ToString(hits) + " match(es) for '" + needle
+            + "' in " + Convert.ToString(scanned)
+            + " file(s). F8 = next match, Shift+F8 = previous.");
+        return hits;
+    }
+
+    /// Replaces every occurrence of `needle` with `repl` across the project.
+    /// Open tabs are changed in their buffers (save to persist); other files
+    /// are rewritten on disk. Returns the number of files changed.
+    static int ReplaceInFiles(string root, string needle, string repl,
+                              bool matchCase, List<string> tabPaths,
+                              List<string> tabBodies, List<string> log) {
+        if (needle == "" || needle == repl) { return 0; }
+        List<string> files = new List<string>();
+        ZanIDE.GatherZanFiles(root, files);
+        int bufs = 0;
+        int disk = 0;
+        int total = 0;
+        int fi = 0;
+        while (fi < files.Count) {
+            string fp = files[fi];
+            int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+            string text = "";
+            if (tab >= 0) {
+                text = tabBodies[tab];
+            } else if (File.Exists(fp)) {
+                text = File.ReadAllText(fp);
+            }
+            if (text != "") {
+                int n = ZanIDE.CountOccurrences(text, needle, matchCase);
+                if (n > 0) {
+                    string nt = ZanIDE.ReplaceAllText(text, needle, repl, matchCase);
+                    total = total + n;
+                    if (tab >= 0) {
+                        tabBodies[tab] = nt;
+                        bufs = bufs + 1;
+                    } else {
+                        File.WriteAllText(fp, nt);
+                        disk = disk + 1;
+                    }
+                }
+            }
+            fi = fi + 1;
+        }
+        log.Add("> Replaced " + Convert.ToString(total) + " occurrence(s) of '"
+            + needle + "' with '" + repl + "': "
+            + Convert.ToString(bufs) + " open tab(s), "
+            + Convert.ToString(disk) + " file(s) on disk.");
+        return bufs + disk;
+    }
+
+    /// Opens result `idx` of the last Find in Files run and jumps to its line.
+    /// Returns the 0-based line to move the caret to, or -1.
+    static int GotoSearchHit(List<string> resPath, List<string> resLine, int idx,
+                             List<string> tabNames, List<string> tabBodies,
+                             List<string> tabPaths, SignalInt active,
+                             List<string> log) {
+        if (idx < 0 || idx >= resPath.Count) { return 0 - 1; }
+        string fp = resPath[idx];
+        int ln = ZanIDE.ParseInt(resLine[idx]);
+        int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+        if (tab < 0) {
+            if (!File.Exists(fp)) { return 0 - 1; }
+            ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, active, fp,
+                Path.GetFileName(fp));
+            tab = tabPaths.Count - 1;
+        }
+        active.Set(tab);
+        log.Add("> Match " + Convert.ToString(idx + 1) + "/"
+            + Convert.ToString(resPath.Count) + ": " + Path.GetFileName(fp)
+            + ":" + Convert.ToString(ln + 1));
+        return ln;
+    }
+
+    /// True when `line` contains `needle` (case-insensitively unless asked).
+    static bool LineContains(string line, string needle, bool matchCase) {
+        return ZanIDE.FindOccurrence(line, needle, 0, matchCase) >= 0;
+    }
+
+    /// Offset of the first occurrence of `needle` in `hay` at or after `from`,
+    /// or -1.
+    static int FindOccurrence(string hay, string needle, int from, bool matchCase) {
+        int nl = needle.Length;
+        if (nl == 0) { return 0 - 1; }
+        int i = from;
+        while (i + nl <= hay.Length) {
+            string part = hay.Substring(i, nl);
+            if (part == needle) { return i; }
+            if (!matchCase && ZanIDE.LowerStr(part) == ZanIDE.LowerStr(needle)) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    static int CountOccurrences(string text, string needle, bool matchCase) {
+        int n = 0;
+        int p = ZanIDE.FindOccurrence(text, needle, 0, matchCase);
+        while (p >= 0) {
+            n = n + 1;
+            p = ZanIDE.FindOccurrence(text, needle, p + needle.Length, matchCase);
+        }
+        return n;
+    }
+
+    static string ReplaceAllText(string text, string needle, string repl,
+                                 bool matchCase) {
+        string outp = "";
+        int at = 0;
+        int p = ZanIDE.FindOccurrence(text, needle, 0, matchCase);
+        while (p >= 0) {
+            outp = outp + text.Substring(at, p - at) + repl;
+            at = p + needle.Length;
+            p = ZanIDE.FindOccurrence(text, needle, at, matchCase);
+        }
+        return outp + text.Substring(at, text.Length - at);
+    }
+
+    static string LowerStr(string s) {
+        string outp = "";
+        int i = 0;
+        while (i < s.Length) {
+            int c = s[i];
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            outp = outp + Text.CharStr(c);
+            i = i + 1;
+        }
+        return outp;
+    }
+
+    /// Drops leading spaces and tabs (search rows are shown unindented).
+    static string TrimLead(string s) {
+        int i = 0;
+        while (i < s.Length && (s[i] == 32 || s[i] == 9)) { i = i + 1; }
+        return s.Substring(i, s.Length - i);
+    }
+
+    /// Rename Symbol (F2) backed by zan-lsp: the server answers with a
+    /// project-wide WorkspaceEdit, so occurrences in files that were never
+    /// opened are rewritten on disk too. Open tabs are edited in their buffers
+    /// (save to persist); everything else is written immediately. Falls back to
+    /// the buffer-only textual rename when no language server is available.
+    static int RenameSymbolSmart(LspSession lsp, CodeEditor editor,
+                                 List<string> tabNames, List<string> tabBodies,
+                                 List<string> tabPaths, SignalInt active,
+                                 List<string> log, string word, string newName) {
+        if (word == "" || newName == "" || word == newName) { return 0; }
+        int a = active.Get();
+        if (lsp == null || !lsp.Alive() || a < 0 || a >= tabPaths.Count
+            || tabPaths[a].Length == 0) {
+            return ZanIDE.RenameSymbol(editor, tabNames, tabBodies, tabPaths,
+                active, log, word, newName);
+        }
+
+        tabBodies[a] = editor.GetText();
+        lsp.SyncDoc(tabPaths[a], tabBodies[a]);
+        List<string> rows = lsp.Rename(tabPaths[a], editor.CurLine(),
+            editor.CurCol(), newName);
+        if (rows.Count == 0) {
+            return ZanIDE.RenameSymbol(editor, tabNames, tabBodies, tabPaths,
+                active, log, word, newName);
+        }
+
+        // Group the edits by file, keeping the server's ascending order.
+        List<string> files = new List<string>();
+        int i = 0;
+        while (i < rows.Count) {
+            string fp = ZanIDE.RenameRowPath(rows[i]);
+            if (fp != "" && ZanIDE.IndexOfPath(files, fp) < 0) { files.Add(fp); }
+            i = i + 1;
+        }
+
+        int bufs = 0;
+        int disk = 0;
+        int fi = 0;
+        while (fi < files.Count) {
+            string fp = files[fi];
+            int tab = ZanIDE.IndexOfPath(tabPaths, fp);
+            string text = "";
+            if (tab >= 0) {
+                text = tabBodies[tab];
+            } else if (File.Exists(fp)) {
+                text = File.ReadAllText(fp);
+            } else {
+                fi = fi + 1;
+                continue;
+            }
+            string nt = ZanIDE.ApplyRenameEdits(text, rows, fp, word, newName);
+            if (nt != text) {
+                if (tab >= 0) {
+                    tabBodies[tab] = nt;
+                    bufs = bufs + 1;
+                } else {
+                    File.WriteAllText(fp, nt);
+                    disk = disk + 1;
+                }
+            }
+            fi = fi + 1;
+        }
+
+        if (a >= 0 && a < tabBodies.Count) {
+            int keepLine = editor.CurLine();
+            editor.LoadText(tabBodies[a]);
+            editor.GoToLine(keepLine);
+        }
+        log.Add("> Renamed '" + word + "' -> '" + newName + "' (semantic): "
+            + Convert.ToString(bufs) + " open tab(s), "
+            + Convert.ToString(disk) + " file(s) on disk.");
+        return bufs + disk;
+    }
+
+    /// Path part of a "path\tline\tcol" rename row.
+    static string RenameRowPath(string row) {
+        int sep = ZanIDE.IndexOfStr(row, "\t");
+        if (sep <= 0) { return ""; }
+        return row.Substring(0, sep);
+    }
+
+    /// Index of `path` in `paths` comparing with SamePath, or -1.
+    static int IndexOfPath(List<string> paths, string path) {
+        int i = 0;
+        while (i < paths.Count) {
+            if (ZanIDE.SamePath(paths[i], path)) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// Applies the rename rows belonging to `path` to `text`. Rows are walked
+    /// back to front so an earlier edit never shifts a later column, and a row
+    /// is only honoured when `word` really sits at its position (a stale
+    /// position from an edit that raced the request is skipped, not corrupted).
+    static string ApplyRenameEdits(string text, List<string> rows, string path,
+                                   string word, string newName) {
+        List<string> ls = CodeEditor.SplitLines(text);
+        int i = rows.Count - 1;
+        while (i >= 0) {
+            string row = rows[i];
+            int s1 = ZanIDE.IndexOfStr(row, "\t");
+            if (s1 > 0 && ZanIDE.SamePath(row.Substring(0, s1), path)) {
+                string rest = row.Substring(s1 + 1, row.Length - s1 - 1);
+                int s2 = ZanIDE.IndexOfStr(rest, "\t");
+                if (s2 > 0) {
+                    int ln = ZanIDE.ParseInt(rest.Substring(0, s2));
+                    int co = ZanIDE.ParseInt(rest.Substring(s2 + 1, rest.Length - s2 - 1));
+                    if (ln >= 0 && ln < ls.Count && co >= 0
+                        && co + word.Length <= ls[ln].Length
+                        && ls[ln].Substring(co, word.Length) == word) {
+                        string line = ls[ln];
+                        ls[ln] = line.Substring(0, co) + newName
+                            + line.Substring(co + word.Length,
+                                line.Length - co - word.Length);
+                    }
+                }
+            }
+            i = i - 1;
+        }
+        string outp = "";
+        int k = 0;
+        while (k < ls.Count) {
+            if (k > 0) { outp = outp + "\n"; }
+            outp = outp + ls[k];
+            k = k + 1;
+        }
+        return outp;
+    }
+
     /// Rename Symbol (F2): whole-word, comment/string-aware rename of the
     /// symbol under the caret across every open tab (buffers only; save to
     /// persist). Returns the number of tabs changed.

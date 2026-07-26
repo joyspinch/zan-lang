@@ -1177,9 +1177,18 @@ partial class ZanIDE {
             new WizardItem("Custom", "file", ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。")) };
 
         // ---- Find/Replace & GoToLine state ----
-        int findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename
+        int findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename,
+                             // 6=find in files, 7=replace in files
         string findText = "";
         string replText = "";
+        // Find in Files results (project-wide, F8/Shift+F8 walk them).
+        List<string> fifPath = new List<string>();
+        List<string> fifLine = new List<string>();
+        List<string> fifText = new List<string>();
+        string fifQuery = "";
+        string fifRepl = "";
+        bool fifReplFocus = false;   // Tab switches the Replace in Files field
+        int fifSel = 0 - 1;
         string gotoText = "";
         string renameText = "";
         string renameWord = "";
@@ -1826,6 +1835,29 @@ partial class ZanIDE {
                         log.Add("> Rename: no symbol under caret.");
                     }
                     app.RequestRedraw();
+                } else if (kc == 119 && !designerMode && dbgState == 0) {
+                    // F8 / Shift+F8 = walk the Find in Files results, opening
+                    // the file when the match is in one that is not open.
+                    if (fifPath.Count == 0) {
+                        log.Add(ZanIDE.T("> No search results. Ctrl+Shift+F searches the project.",
+                            "> 没有搜索结果。Ctrl+Shift+F 可搜索整个项目。"));
+                    } else {
+                        if (Modifiers.HasShift(app.window.EventMods())) {
+                            fifSel = fifSel - 1;
+                            if (fifSel < 0) { fifSel = fifPath.Count - 1; }
+                        } else {
+                            fifSel = fifSel + 1;
+                            if (fifSel >= fifPath.Count) { fifSel = 0; }
+                        }
+                        int hitLine = ZanIDE.GotoSearchHit(fifPath, fifLine, fifSel,
+                            tabNames, tabBodies, tabPaths, activeTab, log);
+                        if (hitLine >= 0) {
+                            pendingGotoLine = hitLine;
+                            pendingGotoCol = 0;
+                            lastActive = 0 - 1;
+                        }
+                    }
+                    app.RequestRedraw();
                 } else if (kc == 118 && !designerMode && dbgState == 0) {
                     // F7 = View Designer: open the .zform paired with this code-behind.
                     int actF7 = activeTab.Get();
@@ -1851,8 +1883,13 @@ partial class ZanIDE {
             if (kind == 6) {
                 int cc = app.window.EventKeyCode();
                 if (cc == 6) {
-                    // Ctrl+F = Find
-                    findMode = 1;
+                    // Ctrl+F = Find in this file, Ctrl+Shift+F = Find in Files
+                    if (Modifiers.HasShift(app.window.EventMods())) {
+                        findMode = 6;
+                        fifQuery = "";
+                    } else {
+                        findMode = 1;
+                    }
                     app.RequestRedraw();
                 } else if (cc == 7) {
                     // Ctrl+G = Go to Line
@@ -1860,8 +1897,14 @@ partial class ZanIDE {
                     gotoText = "";
                     app.RequestRedraw();
                 } else if (cc == 18) {
-                    // Ctrl+R = Replace (Ctrl+H is 8 which conflicts with Backspace)
-                    findMode = 2;
+                    // Ctrl+R = Replace (Ctrl+H is 8 which conflicts with
+                    // Backspace); Ctrl+Shift+R = Replace in Files
+                    if (Modifiers.HasShift(app.window.EventMods())) {
+                        findMode = 7;
+                        fifRepl = "";
+                    } else {
+                        findMode = 2;
+                    }
                     app.RequestRedraw();
                 } else if (cc == 2) {
                     // Ctrl+B = edit the breakpoint condition on the caret line
@@ -2778,7 +2821,7 @@ partial class ZanIDE {
                 // ---- Find / Replace / GoToLine overlay ----
                 if (findMode > 0 && !designerMode && !sceneMode && !activeIsStart && !activeIsDocs) {
                     int fpH = app.Scale(36);
-                    if (findMode == 2) { fpH = app.Scale(68); }
+                    if (findMode == 2 || findMode == 7) { fpH = app.Scale(68); }
                     int fpW = app.Scale(360);
                     int fpX = edRect.x + edRect.width - fpW - app.Scale(8);
                     int fpY = edRect.y + app.Scale(4);
@@ -2903,12 +2946,100 @@ partial class ZanIDE {
                                 renameText = renameText.Substring(0, renameText.Length - 1);
                                 app.RequestRedraw();
                             } else if (rcc == 13) {
-                                ZanIDE.RenameSymbol(editor, tabNames, tabBodies, tabPaths,
-                                    activeTab, log, renameWord, renameText);
+                                if (lspSess == null && !lspTried) {
+                                    lspTried = true;
+                                    lspSess = LspSession.Start(root);
+                                    if (lspSess != null) { log.Add("> zan-lsp connected: semantic rename enabled."); }
+                                }
+                                ZanIDE.RenameSymbolSmart(lspSess, editor, tabNames, tabBodies,
+                                    tabPaths, activeTab, log, renameWord, renameText);
                                 findMode = 0;
                                 app.RequestRedraw();
                             } else if (rcc > 31) {
                                 renameText = renameText + Text.CharStr(rcc);
+                                app.RequestRedraw();
+                            }
+                        }
+                    } else if (findMode == 6) {
+                        c.DrawText(fpX + app.Scale(4), fpY + app.Scale(2),
+                            ZanIDE.T("Find in Files (Ctrl+Shift+F)", "在文件中查找 (Ctrl+Shift+F)"),
+                            t.textTertiary, t.fontSizeSmall);
+                        ZanIDE.ShellField(app, inpX, inpY, inpW, inpH);
+                        c.DrawText(inpX + app.Scale(4), inpY + app.Scale(4), fifQuery, t.textPrimary, t.fontSizeSmall);
+                        if (kind == 6) {
+                            int qcc = app.window.EventKeyCode();
+                            if (qcc == 8 && fifQuery.Length > 0) {
+                                fifQuery = fifQuery.Substring(0, fifQuery.Length - 1);
+                                app.RequestRedraw();
+                            } else if (qcc == 13) {
+                                if (fifQuery.Length > 0) {
+                                    int act6 = activeTab.Get();
+                                    if (act6 >= 0 && act6 < tabBodies.Count) {
+                                        tabBodies[act6] = editor.GetText();
+                                    }
+                                    log.Add("> Find in Files: '" + fifQuery + "'");
+                                    ZanIDE.FindInFiles(root, fifQuery, false,
+                                        tabPaths, tabBodies, fifPath, fifLine, fifText, log);
+                                    fifSel = 0 - 1;
+                                    coScroll = 0;
+                                    dock.Focus("output");
+                                }
+                                findMode = 0;
+                                app.RequestRedraw();
+                            } else if (qcc > 31) {
+                                fifQuery = fifQuery + Text.CharStr(qcc);
+                                app.RequestRedraw();
+                            }
+                        }
+                    } else if (findMode == 7) {
+                        c.DrawText(fpX + app.Scale(4), fpY + app.Scale(2),
+                            ZanIDE.T("Replace in Files (Ctrl+Shift+R)", "在文件中替换 (Ctrl+Shift+R)"),
+                            t.textTertiary, t.fontSizeSmall);
+                        ZanIDE.ShellField(app, inpX, inpY, inpW, inpH);
+                        c.DrawText(inpX + app.Scale(4), inpY + app.Scale(4), fifQuery, t.textPrimary, t.fontSizeSmall);
+                        int rr2Y = inpY + inpH + app.Scale(6);
+                        ZanIDE.ShellField(app, inpX, rr2Y, inpW, inpH);
+                        c.DrawText(inpX + app.Scale(4), rr2Y + app.Scale(4), fifRepl, t.textPrimary, t.fontSizeSmall);
+                        if (kind == 6) {
+                            int rfc = app.window.EventKeyCode();
+                            if (rfc == 9) {
+                                fifReplFocus = !fifReplFocus;
+                                app.RequestRedraw();
+                            } else if (rfc == 8) {
+                                if (fifReplFocus && fifRepl.Length > 0) {
+                                    fifRepl = fifRepl.Substring(0, fifRepl.Length - 1);
+                                } else if (!fifReplFocus && fifQuery.Length > 0) {
+                                    fifQuery = fifQuery.Substring(0, fifQuery.Length - 1);
+                                }
+                                app.RequestRedraw();
+                            } else if (rfc == 13) {
+                                if (!fifReplFocus) {
+                                    fifReplFocus = true;
+                                } else if (fifQuery.Length > 0) {
+                                    int act7 = activeTab.Get();
+                                    if (act7 >= 0 && act7 < tabBodies.Count) {
+                                        tabBodies[act7] = editor.GetText();
+                                    }
+                                    ZanIDE.ReplaceInFiles(root, fifQuery, fifRepl,
+                                        false, tabPaths, tabBodies, log);
+                                    int actR = activeTab.Get();
+                                    if (actR >= 0 && actR < tabBodies.Count) {
+                                        int keepR = editor.CurLine();
+                                        editor.LoadText(tabBodies[actR]);
+                                        editor.GoToLine(keepR);
+                                    }
+                                    coScroll = 0;
+                                    dock.Focus("output");
+                                    fifReplFocus = false;
+                                    findMode = 0;
+                                }
+                                app.RequestRedraw();
+                            } else if (rfc > 31) {
+                                if (fifReplFocus) {
+                                    fifRepl = fifRepl + Text.CharStr(rfc);
+                                } else {
+                                    fifQuery = fifQuery + Text.CharStr(rfc);
+                                }
                                 app.RequestRedraw();
                             }
                         }

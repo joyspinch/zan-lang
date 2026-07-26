@@ -171,6 +171,70 @@ class LspSession {
         return outp;
     }
 
+    /// Semantic rename. Returns one "path\tline0\tcol0" row per edit the
+    /// server produced, project-wide -- including files that are not open in
+    /// the editor. Empty when the server refused the rename.
+    List<string> Rename(string path, int line0, int col0, string newName) {
+        List<string> outp = new List<string>();
+        string m = this.RequestWait("textDocument/rename",
+            "{\"textDocument\":{\"uri\":\"" + LspSession.PathToUri(path)
+            + "\"},\"position\":{\"line\":" + Convert.ToString(line0)
+            + ",\"character\":" + Convert.ToString(col0)
+            + "},\"newName\":\"" + DebugSession.JsonEsc(newName) + "\"}");
+        if (m.Length == 0) { return outp; }
+        return LspSession.ParseWorkspaceEdit(m);
+    }
+
+    /// Flattens a WorkspaceEdit response into "path\tline0\tcol0" rows.
+    static List<string> ParseWorkspaceEdit(string m) {
+        List<string> outp = new List<string>();
+        int ch = DebugSession.IndexOf(m, "\"changes\"", 0);
+        if (ch < 0) { return outp; }
+        // In a WorkspaceEdit the file URI is an object KEY, not a "uri" field,
+        // so walk key by key and attribute the ranges that follow to it.
+        int p = ch;
+        int files = 0;
+        while (files < 4096) {
+            int k = DebugSession.IndexOf(m, "\"file:", p);
+            if (k < 0) { break; }
+            int qe = LspSession.QuoteEnd(m, k + 1);
+            if (qe < 0) { break; }
+            string fp = LspSession.UriToPath(m.Substring(k + 1, qe - k - 1));
+            int next = DebugSession.IndexOf(m, "\"file:", qe + 1);
+            int scan = qe + 1;
+            int edits = 0;
+            while (edits < 4096) {
+                int li = DebugSession.IndexOf(m, "\"line\":", scan);
+                if (li < 0) { break; }
+                if (next >= 0 && li > next) { break; }
+                int ln = DebugSession.JsonInt(m, "line", li);
+                int co = DebugSession.JsonInt(m, "character", li);
+                outp.Add(fp + "\t" + Convert.ToString(ln) + "\t" + Convert.ToString(co));
+                // Skip this edit's end position (a second line/character pair).
+                int li2 = DebugSession.IndexOf(m, "\"line\":", li + 7);
+                if (li2 < 0) { break; }
+                scan = li2 + 7;
+                edits = edits + 1;
+            }
+            if (next < 0) { break; }
+            p = next;
+            files = files + 1;
+        }
+        return outp;
+    }
+
+    /// Offset of the closing quote of the string starting at `from`, or -1.
+    static int QuoteEnd(string s, int from) {
+        int i = from;
+        while (i < s.Length) {
+            int c = s[i];
+            if (c == 92) { i = i + 2; continue; }
+            if (c == 34) { return i; }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
     /// Hover text for the symbol at the position ("" when none).
     string Hover(string path, int line0, int col0) {
         string m = this.RequestWait("textDocument/hover",

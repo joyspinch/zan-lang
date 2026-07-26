@@ -937,29 +937,63 @@ static int find_text_references(const char *text, const char *word,
     return count;
 }
 
-/* NEW: Find all references handler */
-static void handle_references(lsp_server_t *s, json_value *id, json_value *params) {
-    const char *uri; int line, character;
-    if (!get_position(params, &uri, &line, &character)) {
-        send_response(s, id, json_new_arr());
-        return;
+/* Reads a whole file into a malloc'd NUL-terminated buffer (NULL on failure). */
+static char *read_file_all(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, (size_t)n, f);
+    buf[rd] = '\0';
+    fclose(f);
+    return buf;
+}
+
+/* file:// URI for a native path, separators normalized to '/'. */
+static void fspath_to_uri(const char *path, char *out, size_t cap) {
+    if (strncmp(path, "file://", 7) == 0) {
+        snprintf(out, cap, "%s", path);
+    } else if (path[0] == '/') {
+        snprintf(out, cap, "file://%s", path);
+    } else {
+        snprintf(out, cap, "file:///%s", path);
     }
-    lsp_doc_t *doc = lsp_find_doc(s, uri);
-    if (!doc) { send_response(s, id, json_new_arr()); return; }
+    for (char *p = out; *p; p++) if (*p == '\\') *p = '/';
+}
 
-    size_t off = pos_to_offset(doc->text, line, character);
-    char word[128];
-    word_at(doc->text, off, word, sizeof(word));
-    if (!word[0]) { send_response(s, id, json_new_arr()); return; }
+/* Two URIs naming the same file: separators and case are irrelevant on the
+ * platforms zan targets (Windows paths differ in drive-letter case, and the
+ * client may send either separator). */
+static bool same_uri_ci(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a == '\\' ? '/' : (char)tolower((unsigned char)*a);
+        char cb = *b == '\\' ? '/' : (char)tolower((unsigned char)*b);
+        if (ca != cb) return false;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
 
+/* True when `uri` is one of the currently open documents. */
+static bool uri_is_open(lsp_server_t *s, const char *uri) {
+    for (int i = 0; i < s->doc_count; i++)
+        if (same_uri_ci(s->docs[i].uri, uri)) return true;
+    return false;
+}
+
+/* One Location per whole-word occurrence of `word` in `text`. Returns the
+ * number appended to `arr`. */
+static int add_locations(json_value *arr, const char *uri,
+                         const char *text, const char *word) {
     size_t offsets[512];
-    int ref_count = find_text_references(doc->text, word, offsets, 512);
-
-    json_value *arr = json_new_arr();
-    for (int i = 0; i < ref_count; i++) {
+    int n = find_text_references(text, word, offsets, 512);
+    for (int i = 0; i < n; i++) {
         int rl, rc;
-        offset_to_linecol(doc->text, (int)offsets[i], &rl, &rc);
-
+        offset_to_linecol(text, (int)offsets[i], &rl, &rc);
         json_value *loc = json_new_obj();
         json_obj_set(loc, "uri", json_new_str(uri));
         json_value *range = json_new_obj();
@@ -974,6 +1008,63 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
         json_obj_set(loc, "range", range);
         json_arr_add(arr, loc);
     }
+    return n;
+}
+
+/* Runs `visit` over every project file that is not currently open, reading it
+ * from disk. Open documents are skipped because their in-memory text (which
+ * includes unsaved edits) is authoritative. */
+typedef void (*project_file_fn)(void *ctx, const char *uri, const char *text);
+
+static void for_each_unopened_project_file(lsp_server_t *s, void *ctx,
+                                           project_file_fn visit) {
+    ensure_project_indexed(s);
+    if (!g_project_intel) return;
+    for (int f = 0; f < g_project_intel->indexed_file_count; f++) {
+        const char *fp = g_project_intel->indexed_files[f];
+        if (!fp[0]) continue;
+        char furi[600];
+        fspath_to_uri(fp, furi, sizeof(furi));
+        if (uri_is_open(s, furi)) continue;
+        char *text = read_file_all(fp);
+        if (!text) continue;
+        visit(ctx, furi, text);
+        free(text);
+    }
+}
+
+typedef struct {
+    json_value *arr;
+    const char *word;
+} refs_ctx_t;
+
+static void refs_visit(void *ctx, const char *uri, const char *text) {
+    refs_ctx_t *rc = (refs_ctx_t *)ctx;
+    add_locations(rc->arr, uri, text, rc->word);
+}
+
+/* Find all references, project-wide: every open document plus every indexed
+ * project file on disk, so references in files the editor never opened are
+ * reported too. */
+static void handle_references(lsp_server_t *s, json_value *id, json_value *params) {
+    const char *uri; int line, character;
+    if (!get_position(params, &uri, &line, &character)) {
+        send_response(s, id, json_new_arr());
+        return;
+    }
+    lsp_doc_t *doc = lsp_find_doc(s, uri);
+    if (!doc) { send_response(s, id, json_new_arr()); return; }
+
+    size_t off = pos_to_offset(doc->text, line, character);
+    char word[128];
+    word_at(doc->text, off, word, sizeof(word));
+    if (!word[0]) { send_response(s, id, json_new_arr()); return; }
+
+    json_value *arr = json_new_arr();
+    for (int d = 0; d < s->doc_count; d++)
+        add_locations(arr, s->docs[d].uri, s->docs[d].text, word);
+    refs_ctx_t rc; rc.arr = arr; rc.word = word;
+    for_each_unopened_project_file(s, &rc, refs_visit);
     send_response(s, id, arr);
 }
 
@@ -1093,6 +1184,46 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
     send_response(s, id, arr);
 }
 
+/* One TextEdit per whole-word occurrence of `word`, or NULL when there is
+ * none in this text. */
+static json_value *rename_edits_for(const char *text, const char *word,
+                                    const char *new_name) {
+    size_t offsets[512];
+    int n = find_text_references(text, word, offsets, 512);
+    if (n == 0) return NULL;
+    json_value *edits = json_new_arr();
+    for (int i = 0; i < n; i++) {
+        int rl, rc;
+        offset_to_linecol(text, (int)offsets[i], &rl, &rc);
+        json_value *edit = json_new_obj();
+        json_value *range = json_new_obj();
+        json_value *start = json_new_obj();
+        json_value *endp  = json_new_obj();
+        json_obj_set(start, "line", json_new_num(rl));
+        json_obj_set(start, "character", json_new_num(rc));
+        json_obj_set(endp, "line", json_new_num(rl));
+        json_obj_set(endp, "character", json_new_num(rc + (int)strlen(word)));
+        json_obj_set(range, "start", start);
+        json_obj_set(range, "end", endp);
+        json_obj_set(edit, "range", range);
+        json_obj_set(edit, "newText", json_new_str(new_name));
+        json_arr_add(edits, edit);
+    }
+    return edits;
+}
+
+typedef struct {
+    json_value *changes;
+    const char *word;
+    const char *new_name;
+} rename_ctx_t;
+
+static void rename_visit(void *ctx, const char *uri, const char *text) {
+    rename_ctx_t *rc = (rename_ctx_t *)ctx;
+    json_value *edits = rename_edits_for(text, rc->word, rc->new_name);
+    if (edits) json_obj_set(rc->changes, uri, edits);
+}
+
 /* Rename handler: whole-word, comment/string-aware textual rename across
  * every open document, returned as a WorkspaceEdit. */
 static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
@@ -1118,32 +1249,20 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_null()); return; }
 
+    /* Every open document (their unsaved text wins) plus every indexed project
+     * file on disk, so a rename also lands in files the editor never opened. */
     json_value *changes = json_new_obj();
     for (int d = 0; d < s->doc_count; d++) {
         lsp_doc_t *dd = &s->docs[d];
-        size_t offsets[512];
-        int n = find_text_references(dd->text, word, offsets, 512);
-        if (n == 0) continue;
-        json_value *edits = json_new_arr();
-        for (int i = 0; i < n; i++) {
-            int rl, rc;
-            offset_to_linecol(dd->text, (int)offsets[i], &rl, &rc);
-            json_value *edit = json_new_obj();
-            json_value *range = json_new_obj();
-            json_value *start = json_new_obj();
-            json_value *endp  = json_new_obj();
-            json_obj_set(start, "line", json_new_num(rl));
-            json_obj_set(start, "character", json_new_num(rc));
-            json_obj_set(endp, "line", json_new_num(rl));
-            json_obj_set(endp, "character", json_new_num(rc + (int)strlen(word)));
-            json_obj_set(range, "start", start);
-            json_obj_set(range, "end", endp);
-            json_obj_set(edit, "range", range);
-            json_obj_set(edit, "newText", json_new_str(new_name));
-            json_arr_add(edits, edit);
-        }
-        json_obj_set(changes, dd->uri, edits);
+        json_value *edits = rename_edits_for(dd->text, word, new_name);
+        if (edits) json_obj_set(changes, dd->uri, edits);
     }
+    rename_ctx_t rctx;
+    rctx.changes = changes;
+    rctx.word = word;
+    rctx.new_name = new_name;
+    for_each_unopened_project_file(s, &rctx, rename_visit);
+
     json_value *we = json_new_obj();
     json_obj_set(we, "changes", changes);
     send_response(s, id, we);
