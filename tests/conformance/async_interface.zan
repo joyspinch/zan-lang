@@ -1,0 +1,87 @@
+using System;
+using System.Threading;
+
+// Async methods reached through an interface: the dispatch yields the callee's
+// coroutine frame, and `await` has to drive it exactly as it drives a direct
+// call. Also covers interfaces that extend another interface, whose inherited
+// members must dispatch too.
+
+interface ICounter {
+    int Tag();
+}
+
+interface IWorker : ICounter {
+    async int DoubleAsync(int x);
+    async string NameAsync();
+    async void TouchAsync();
+    int Touched();
+}
+
+class Worker : IWorker {
+    int tag;
+    int touched;
+
+    Worker(int tag) {
+        this.tag = tag;
+        this.touched = 0;
+    }
+
+    int Tag() { return this.tag; }
+
+    async int DoubleAsync(int x) {
+        await Task.Delay(1);
+        return x * 2;
+    }
+
+    async string NameAsync() {
+        await Task.Delay(1);
+        return "worker-" + Convert.ToString(this.tag);
+    }
+
+    async void TouchAsync() {
+        await Task.Delay(1);
+        this.touched = this.touched + 1;
+    }
+
+    int Touched() { return this.touched; }
+}
+
+class Other : IWorker {
+    int Tag() { return 99; }
+    async int DoubleAsync(int x) { return x * 3; }
+    async string NameAsync() { return "other"; }
+    async void TouchAsync() { }
+    int Touched() { return 0; }
+}
+
+class Program {
+    // Awaiting through an interface from inside another coroutine takes the
+    // suspend/resume path, not the root drive.
+    static async int NestedAsync(IWorker w) {
+        int a = await w.DoubleAsync(10);
+        int b = await w.DoubleAsync(a);
+        return a + b;
+    }
+
+    static void Main() {
+        Worker worker = new Worker(7);
+        IWorker w = worker;
+
+        Console.WriteLine(await w.DoubleAsync(21));      // int result: 42
+        string name = await w.NameAsync();               // object result
+        Console.WriteLine(name);
+        Console.WriteLine(w.Tag());                      // inherited member
+        ICounter c = worker;
+        Console.WriteLine(c.Tag());                      // base interface
+
+        await w.TouchAsync();                            // async void
+        Console.WriteLine(worker.Touched());
+
+        Console.WriteLine(await Program.NestedAsync(w)); // 20 + 40
+
+        // Dispatch still picks the implementation by concrete class.
+        IWorker o = new Other();
+        Console.WriteLine(await o.DoubleAsync(5));
+        Console.WriteLine(o.Tag());
+    }
+}

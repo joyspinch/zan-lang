@@ -2880,8 +2880,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_type_t *obj_ty = infer_expr_type(g, callee->member.object, locals);
             if (obj_ty && obj_ty->kind == TYPE_INTERFACE && obj_ty->sym && g->current_fn) {
                 zan_symbol_t *iface = obj_ty->sym;
-                zan_symbol_t *iface_m = resolve_overload(iface, callee->member.name,
-                                                         expr->call.args.count);
+                zan_symbol_t *iface_m = resolve_iface_overload(iface,
+                                            callee->member.name,
+                                            expr->call.args.count);
                 if (iface_m) {
                     LLVMContextRef c = g->ctx;
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
@@ -2890,8 +2891,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         iface_m->decl->method_decl.return_type)
                         rty = zan_binder_resolve_type(g->binder,
                                   iface_m->decl->method_decl.return_type);
-                    bool has_res = rty && rty->kind != TYPE_VOID;
-                    LLVMTypeRef res_ty = has_res ? map_type(g, rty) : NULL;
+                    /* An async method's ramp hands back a coroutine frame, not
+                     * the declared return value, so dispatching one has to keep
+                     * the handle as a pointer for `await` to drive -- coercing
+                     * it to the declared type would turn the frame into an
+                     * integer and the await would yield that raw address. */
+                    bool m_async = iface_m->decl &&
+                        iface_m->decl->kind == AST_METHOD_DECL &&
+                        (iface_m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+                    bool has_res = m_async || (rty && rty->kind != TYPE_VOID);
+                    LLVMTypeRef res_ty = m_async ? i8ptr
+                                                 : (has_res ? map_type(g, rty) : NULL);
 
                     int uargc = expr->call.args.count;
                     /* emit receiver + argument values once, before branching */

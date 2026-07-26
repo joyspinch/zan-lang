@@ -1556,6 +1556,26 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, i
     return NULL;
 }
 
+/* Overload resolution for a receiver whose static type is an interface. An
+ * interface re-exports the members of the interfaces it extends
+ * (`interface IDbConnection : IDbExecutor`), and those live in the extends
+ * list rather than in base_type, so resolve_overload alone would miss an
+ * inherited method and the call would dispatch to nothing. */
+static zan_symbol_t *resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name,
+                                            int argc) {
+    if (!iface) return NULL;
+    zan_symbol_t *m = resolve_overload(iface, name, argc);
+    if (m) return m;
+    if (!iface->type) return NULL;
+    for (int i = 0; i < iface->type->interface_count; i++) {
+        zan_type_t *it = iface->type->interfaces[i];
+        if (!it || !it->sym || it->sym == iface) continue;
+        m = resolve_iface_overload(it->sym, name, argc);
+        if (m) return m;
+    }
+    return NULL;
+}
+
 static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     if (g->struct_type_count >= 256) return;
     if (get_struct_llvm_type(g, sym)) return;

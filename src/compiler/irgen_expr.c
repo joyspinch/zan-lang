@@ -2464,6 +2464,22 @@ static LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }
 
+/* True when `e` is a call dispatched through an interface to a method the
+ * interface declares `async`. Interface dispatch cannot name the callee at
+ * compile time, so the frame arrives in a phi over the implementations rather
+ * than in a call instruction -- `await` recognises it from the AST instead. */
+static bool is_async_iface_call(zan_irgen_t *g, zan_ast_node_t *e,
+                                local_scope_t *locals) {
+    if (!e || e->kind != AST_CALL || !e->call.callee ||
+        e->call.callee->kind != AST_MEMBER_ACCESS) return false;
+    zan_type_t *ot = infer_expr_type(g, e->call.callee->member.object, locals);
+    if (!ot || ot->kind != TYPE_INTERFACE || !ot->sym) return false;
+    zan_symbol_t *m = resolve_iface_overload(ot->sym, e->call.callee->member.name,
+                                             e->call.args.count);
+    return m && m->decl && m->decl->kind == AST_METHOD_DECL &&
+           (m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+}
+
 static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* await Task.Delay(ms) — time-based suspension (no sub-frame). Inside an
@@ -2764,6 +2780,18 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     ASYNC_FRAME_SELF_STEP, "sub.selfstep.p");
                 sub_resume = LLVMBuildLoad2(g->builder, g->co_step_ptr, ssp, "sub.selfstep");
             }
+        }
+
+        /* Interface-dispatched async call: the frame comes out of a phi, so
+         * neither the `<ramp>$resume` symbol nor a called value is available;
+         * take the resume fn out of the frame header as for a delegate. */
+        if (!sub_resume &&
+            LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind &&
+            is_async_iface_call(g, expr->await_expr.expr, locals)) {
+            LLVMValueRef sub_hdr = LLVMBuildBitCast(g->builder, sub, i8ptr, "sub.hdr");
+            LLVMValueRef ssp = LLVMBuildStructGEP2(g->builder, hdr, sub_hdr,
+                ASYNC_FRAME_SELF_STEP, "sub.selfstep.p");
+            sub_resume = LLVMBuildLoad2(g->builder, g->co_step_ptr, ssp, "sub.selfstep");
         }
 
         if (sub_resume && LLVMGetTypeKind(LLVMTypeOf(sub)) == LLVMPointerTypeKind) {
