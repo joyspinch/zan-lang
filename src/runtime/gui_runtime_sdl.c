@@ -430,6 +430,26 @@ EXPORT i64 zan_gui_create_window(const char *title, i64 width, i64 height) {
             MARGINS m = { 1, 1, 1, 1 };
             DwmExtendFrameIntoClientArea(hwnd, &m);
         }
+        /* SDL only ever shows the icon handed to SDL_SetWindowIcon, so a
+         * program carrying an icon resource (zanc embeds one into every
+         * Windows exe) would still run with the blank default in the taskbar
+         * and Alt-Tab. Load resource id 1 -- what zanc's RT_GROUP_ICON uses --
+         * and hand it to the native window. */
+        if (hwnd) {
+            HINSTANCE inst = GetModuleHandleW(NULL);
+            HICON ico_big = (HICON)LoadImageW(
+                inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+                LR_DEFAULTCOLOR);
+            HICON ico_small = (HICON)LoadImageW(
+                inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                LR_DEFAULTCOLOR);
+            if (ico_big)
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)ico_big);
+            if (ico_small)
+                SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)ico_small);
+        }
     }
 #endif
 

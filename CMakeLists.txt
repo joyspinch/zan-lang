@@ -27,6 +27,30 @@ configure_file(
     "${CMAKE_SOURCE_DIR}/stdlib/System/ZanVersion.zan" @ONLY)
 message(STATUS "Zan version: ${ZAN_VERSION}")
 
+# ---- Default Windows executable icon ----
+# assets/zan.ico is compiled into zanc as a byte array, so every Windows
+# executable it produces carries an icon even when no --icon is passed (the
+# IDE's Run/Build/Publish flows and hand-written zanc invocations alike). The
+# icon travels inside the compiler, so no loose assets folder has to ship with
+# a redistributable toolchain.
+set(ZAN_DEFAULT_ICON "${CMAKE_SOURCE_DIR}/assets/zan.ico")
+set(ZAN_DEFAULT_ICON_H "${CMAKE_BINARY_DIR}/generated/zan_default_icon.h")
+if(EXISTS "${ZAN_DEFAULT_ICON}")
+    file(READ "${ZAN_DEFAULT_ICON}" ZAN_DEFAULT_ICON_HEX HEX)
+    string(REGEX REPLACE "(..)" "0x\\1," ZAN_DEFAULT_ICON_BYTES "${ZAN_DEFAULT_ICON_HEX}")
+else()
+    message(WARNING "assets/zan.ico missing; produced .exe files get no default icon")
+    set(ZAN_DEFAULT_ICON_BYTES "")
+endif()
+file(WRITE "${ZAN_DEFAULT_ICON_H}"
+"/* Generated from assets/zan.ico by CMake -- do not edit. */\n"
+"#ifndef ZAN_DEFAULT_ICON_H\n"
+"#define ZAN_DEFAULT_ICON_H\n"
+"static const unsigned char zan_default_icon[] = { ${ZAN_DEFAULT_ICON_BYTES} 0 };\n"
+"#define ZAN_DEFAULT_ICON_LEN (sizeof(zan_default_icon) - 1)\n"
+"#endif\n")
+
+
 # ---- Find LLVM ----
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -74,6 +98,7 @@ add_executable(zanc
     src/compiler/package.c
     src/compiler/stdlib_ext.c
     src/compiler/crosscomp.c
+    src/compiler/winres.c
 )
 target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
 if(MSVC)
@@ -513,6 +538,18 @@ add_test(NAME conformance_multifile
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/box.zan;${CMAKE_SOURCE_DIR}/tests/conformance/multifile/util.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+# ---- RA2 example: asset-format tests compiled against examples/game/ra2 ----
+# The example's parsers are not stdlib, so they are passed explicitly. Sources
+# live in a subdirectory so the single-file glob above ignores them.
+add_test(NAME conformance_ra2_blowfish
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/ra2/blowfish.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/game/ra2/formats/Blowfish.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/ra2/expected_blowfish.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_ra2_blowfish${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- Self-hosting: build gen1 with the C host, emit IR for a real program,

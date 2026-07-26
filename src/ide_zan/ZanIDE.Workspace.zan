@@ -640,53 +640,6 @@ partial class ZanIDE {
         }
     }
 
-    static void RunActive(List<string> paths, SignalInt active, string root, List<string> log, CodeEditor editor) {
-        int a = active.Get();
-        if (a < 0 || a >= paths.Count) {
-            log.Add("> Nothing to run (open a source file first).");
-            return;
-        }
-        ZanIDE.RunFile(paths[a], root, log, editor);
-    }
-
-    /// Compiles and runs one source file (or a tab sentinel/.zform mapped via
-    /// RunTarget). Also used by the Tools panel to run a tool on double-click.
-    static void RunFile(string activePath, string root, List<string> log, CodeEditor editor) {
-        string p = activePath;
-        p = ZanIDE.RunTarget(p, root);
-        if (p == "") {
-            log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
-            return;
-        }
-        string bd = ZanIDE.EnsureBuildDir(root);
-        string ll = bd + "/.zanrun.ll";
-        string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
-        if (File.Exists(exe)) { File.Delete(exe); }
-        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(p), p);
-        bool isGui = ZanIDE.IsGuiTarget(root, p);
-        string cmd = ZanIDE.CompileToExe(root, p, inputs, ll, exe, false);
-        log.Add("> Building " + p + " ...");
-        List<string> outp = Process.RunCapture(cmd);
-        ZanIDE.AppendAll(log, outp);
-        ZanIDE.ApplyDiagnostics(editor, activePath, outp, log);
-        if (!File.Exists(exe)) {
-            log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
-            return;
-        }
-        // Launch the program detached so the IDE never blocks: a console app may
-        // be a long-running server (e.g. a web server) that never returns, which
-        // would otherwise freeze the UI. Console apps get their own persistent
-        // window so output is visible and Ctrl+C can stop them; GUI apps launch
-        // windowless.
-        #if WINDOWS
-        if (isGui) { Process.Run("cmd /c start \"\" \"" + exe + "\""); }
-        else { Process.Run("cmd /c start \"Zan Run\" cmd /k \"" + exe + "\""); }
-        #else
-        Process.Run("\"" + exe + "\" >/dev/null 2>&1 &");
-        #endif
-        log.Add(ZanIDE.T("> Started (running in a separate window).", "> 已启动（在独立窗口中运行）。"));
-    }
-
     /// Builds the active run target and returns the executable path so the caller
     /// can stream it through the IDE terminal (non-blocking). GUI apps open their
     /// own window, so they are launched windowless here and "" is returned.
@@ -1011,6 +964,20 @@ partial class ZanIDE {
     static string BuildLogPath() { return ZanIDE.UserConfigDir() + "/build.log"; }
     static string BuildDonePath() { return ZanIDE.UserConfigDir() + "/build_done.txt"; }
 
+    /// Starts a DETACHED Run build of `target` and returns the executable it
+    /// will produce, so every caller (Run ribbon, hot reload, the Tools panel)
+    /// only has to record the poll state. The stale exe is removed first so a
+    /// failed compile cannot look like a successful one.
+    static string RunBuildBegin(string root, string target) {
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string exe = bd + "/.zanrun" + ZanIDE.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
+        string inputs = ZanIDE.SmartInputs(root, ZanIDE.DirOf(target), target);
+        ZanIDE.BuildDetach(
+            ZanIDE.CompileToExe(root, target, inputs, bd + "/.zanrun.ll", exe, false));
+        return exe;
+    }
+
     /// Runs `cmd` detached, teeing its output into BuildLogPath and dropping
     /// BuildDonePath on completion. The main loop polls both to stream compiler
     /// output and, once done, apply diagnostics + launch the built program.
@@ -1053,10 +1020,15 @@ partial class ZanIDE {
     /// The packer invocation appended after a Windows publish compile: wraps
     /// the staged exe + resources into one self-extracting exe at `outExe`.
     static string PackCmd(string root, string stage, string outExe) {
-        return "powershell -NoProfile -ExecutionPolicy Bypass -File \""
+        string cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File \""
             + ZanIDE.ToolchainDir() + "/pack_single.ps1\""
             + " -Stage \"" + stage + "\" -Stub \"" + ZanIDE.ToolchainDir() + "/pkg_stub.exe\""
-            + " -Out \"" + outExe + "\" -Icon \"" + ZanIDE.AssetsDir(root) + "/app.ico\"";
+            + " -Out \"" + outExe + "\"";
+        // The launcher stub is a prebuilt exe, so its icon is stamped by the
+        // packer; use the very icon the payload exe was built with.
+        string ico = ZanIDE.IconFile(root);
+        if (ico != "") { cmd = cmd + " -Icon \"" + ico + "\""; }
+        return cmd;
     }
 
     /// Starts publishing the selected targets in a DETACHED shell so the UI

@@ -83,11 +83,15 @@ else { Write-Output "PUBLISH_FAILED: build\SDL3.dll missing (IDE needs it to run
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
 
 # ---- copy the app icon so the IDE can stamp new projects with it ----
+# zanc also carries a compiled-in copy (see CMakeLists.txt), so a produced .exe
+# has an icon even when this file is missing.
 $assetsIco = Join-Path $root 'assets\zan.ico'
 if (Test-Path $assetsIco) {
     $distAssets = Join-Path $dist 'assets'
     New-Item -ItemType Directory -Force -Path $distAssets | Out-Null
     Copy-Item $assetsIco (Join-Path $distAssets 'zan.ico')
+} else {
+    Write-Output "PUBLISH_WARN: assets\zan.ico missing (new projects get no icon file)"
 }
 
 # Everything the compiler needs travels together in dist\toolchain, laid out

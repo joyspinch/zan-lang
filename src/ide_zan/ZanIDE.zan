@@ -70,23 +70,6 @@ partial class ZanIDE {
     [DllImport("crt")]
     static extern string calloc(int count, int size);
 
-    // Raw (nint-buffer) binary file I/O, used only by WriteIconResFromIco
-    // below to read a .ico and write a .res without going through the
-    // string-based System.IO.File helpers (which are not NUL-safe for
-    // arbitrary binary data). Mirrors the nint-typed fread/fwrite pattern
-    // already used by System.Data.ZanDb.PageFile.
-    [DllImport("crt", EntryPoint = "fopen")]
-    static extern int BinFOpen(string path, string mode);
-
-    [DllImport("crt", EntryPoint = "fclose")]
-    static extern int BinFClose(int fp);
-
-    [DllImport("crt", EntryPoint = "fread")]
-    static extern int BinFRead(nint buf, int size, int count, int fp);
-
-    [DllImport("crt", EntryPoint = "fwrite")]
-    static extern int BinFWrite(nint buf, int size, int count, int fp);
-
     /// Full path of the running IDE executable. Platform-specific: Win32
     /// GetModuleFileNameA, macOS _NSGetExecutablePath, Linux /proc/self/exe.
     /// The buffer is calloc-zeroed so the returned path stays NUL-terminated.
@@ -881,11 +864,6 @@ partial class ZanIDE {
             + " -lzan_gui -llegacy_stdio_definitions"
             + " -Xlinker /SUBSYSTEM:WINDOWS -Xlinker /ENTRY:mainCRTStartup"
             + " -Xlinker /STACK:268435456";
-        string res = "";
-        if (ZanIDE.IsGuiProject(root)) {
-            res = ZanIDE.EnsureProjectIconRes(root);
-        }
-        if (res != "") { args = args + " \"" + res + "\""; }
         return args;
     }
 
@@ -924,15 +902,9 @@ partial class ZanIDE {
         string pub = "";
         if (publish) { pub = " --publish"; }
         string sub = "";
-        string icon = "";
-        if (ZanIDE.IsGuiTarget(root, p)) {
-            sub = " --subsystem windows";
-            if (ZanIDE.IsGuiProject(root)) {
-                string res = ZanIDE.EnsureProjectIconRes(root);
-                if (res != "") { icon = " --link-input \"" + res + "\""; }
-            }
-        }
-        return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"" + sub + icon;
+        if (ZanIDE.IsGuiTarget(root, p)) { sub = " --subsystem windows"; }
+        return ZanIDE.ZancCmd() + pub + " " + inputs + " -o \"" + exe + "\"" + sub
+            + ZanIDE.IconArg(root);
     }
 
     /// Like CompileToExe but cross-compiles for an explicit `--target` (e.g.
@@ -943,7 +915,8 @@ partial class ZanIDE {
         string sub = "";
         if (ZanIDE.IsGuiTarget(root, p)) { sub = " --subsystem windows"; }
         return ZanIDE.ZancCmd() + " --publish --target " + target
-            + " --link-mode static " + inputs + " -o \"" + exe + "\"" + sub;
+            + " --link-mode static " + inputs + " -o \"" + exe + "\"" + sub
+            + ZanIDE.IconArg(root);
     }
 
     /// Reads a `key = value` field from the project's zan.proj, or "" if absent.
@@ -1031,122 +1004,26 @@ partial class ZanIDE {
         return ZanIDE.ProjField(root, "singleFile") != "false";
     }
 
-    /// Writes a 32-byte .res resource-entry header (numeric type and name).
-    /// dataSize  : size of the data that follows (not counting padding)
-    /// typeId    : RT_ICON = 3, RT_GROUP_ICON = 14, 0 for the null entry
-    /// nameId    : 1-based icon ID (0 for the null entry)
-    /// memFlags  : 0x1010 for RT_ICON, 0x1030 for RT_GROUP_ICON, 0 for null
-    static void WriteResHeader(ByteBuffer b, int dataSize, int typeId, int nameId, int memFlags) {
-        b.WriteU32(dataSize);        // DataSize
-        b.WriteU32(32);              // HeaderSize is always 32 for numeric type+name
-        b.WriteU16(0xFFFF);          // numeric type marker
-        b.WriteU16(typeId);          // resource type id
-        b.WriteU16(0xFFFF);          // numeric name marker
-        b.WriteU16(nameId);          // resource name id
-        b.WriteU32(0);               // DataVersion
-        b.WriteU16(memFlags);        // MemoryFlags
-        b.WriteU16(0);               // LanguageId = neutral
-        b.WriteU32(0);               // Version
-        b.WriteU32(0);               // Characteristics
-    }
-
-    /// Builds a Windows COFF .res binary directly from a .ico file and writes
-    /// it to resPath. No external tool (llvm-rc / windres) required.
-    ///
-    /// .res layout:
-    ///   [null resource header — 32 bytes]
-    ///   [RT_ICON entry × N]   one raw image blob per image in the .ico
-    ///   [RT_GROUP_ICON entry]  the icon-group directory the linker reads
-    ///
-    /// Returns true on success, false when the .ico is unreadable / malformed
-    /// or the output file cannot be written.
-    static bool WriteIconResFromIco(string icoPath, string resPath) {
-        // Read the whole .ico into an off-heap buffer (NUL-safe binary read).
-        int icoSize = File.GetSize(icoPath);
-        if (icoSize < 22) { return false; }   // header (6) + at least 1 entry (16)
-        nint ico = NativeMemory.Alloc(icoSize + 1);
-        int rfp = ZanIDE.BinFOpen(icoPath, "rb");
-        if (rfp == 0) { NativeMemory.Free(ico); return false; }
-        ZanIDE.BinFRead(ico, 1, icoSize, rfp);
-        ZanIDE.BinFClose(rfp);
-
-        // ICO header: reserved(2) type=1(2) count(2)
-        int count = NativeMemory.GetU16(ico, 4);
-        if (count <= 0 || count > 256 || icoSize < 6 + count * 16) {
-            NativeMemory.Free(ico); return false;
-        }
-
-        // Build the .res binary in a ByteBuffer.
-        ByteBuffer res = ByteBuffer.Alloc(icoSize + 256);
-
-        // ── null resource (32 zero bytes) ──────────────────────────────────
-        ZanIDE.WriteResHeader(res, 0, 0, 0, 0);
-
-        // ── RT_ICON resources (one per image in the .ico) ──────────────────
-        int i = 0;
-        while (i < count) {
-            int eBase = 6 + i * 16;
-            int imgSize = NativeMemory.GetU32(ico, eBase + 8);
-            int imgOff  = NativeMemory.GetU32(ico, eBase + 12);
-            if (imgOff + imgSize > icoSize) {
-                NativeMemory.Free(ico); res.Free(); return false;
-            }
-            ZanIDE.WriteResHeader(res, imgSize, 3, i + 1, 0x1010);
-            res.WriteBytes(ico + imgOff, imgSize);
-            // align data to DWORD boundary
-            int pad = (4 - (imgSize & 3)) & 3;
-            int p = 0;
-            while (p < pad) { res.WriteU8(0); p = p + 1; }
-            i = i + 1;
-        }
-
-        // ── RT_GROUP_ICON resource ─────────────────────────────────────────
-        int grpData = 6 + count * 14;          // GRPICONDIR size
-        ZanIDE.WriteResHeader(res, grpData, 14, 1, 0x1030);
-        res.WriteU16(0);                        // reserved
-        res.WriteU16(1);                        // type = icon
-        res.WriteU16(count);                    // count
-        i = 0;
-        while (i < count) {
-            int eBase = 6 + i * 16;
-            res.WriteU8(NativeMemory.GetByte(ico, eBase));          // width
-            res.WriteU8(NativeMemory.GetByte(ico, eBase + 1));      // height
-            res.WriteU8(NativeMemory.GetByte(ico, eBase + 2));      // colorCount
-            res.WriteU8(0);                                          // reserved
-            res.WriteU16(NativeMemory.GetU16(ico, eBase + 4));      // planes
-            res.WriteU16(NativeMemory.GetU16(ico, eBase + 6));      // bitCount
-            res.WriteU32(NativeMemory.GetU32(ico, eBase + 8));      // bytesInRes
-            res.WriteU16(i + 1);                                     // id (1-based)
-            i = i + 1;
-        }
-        // align group data to DWORD boundary
-        int grpPad = (4 - (grpData & 3)) & 3;
-        int q = 0;
-        while (q < grpPad) { res.WriteU8(0); q = q + 1; }
-
-        NativeMemory.Free(ico);
-
-        // Write the finished .res to disk.
-        int wfp = ZanIDE.BinFOpen(resPath, "wb");
-        if (wfp == 0) { res.Free(); return false; }
-        ZanIDE.BinFWrite(res.Raw(), 1, res.Length(), wfp);
-        ZanIDE.BinFClose(wfp);
-        res.Free();
-        return true;
-    }
-
-    /// Builds (or refreshes) the project's icon .res file in the build dir.
-    /// Returns the .res path for --link-input, or "" when no icon is configured,
-    /// the .ico is missing, or the .res could not be written.
-    static string EnsureProjectIconRes(string root) {
+    /// The icon a produced executable should carry: the project's configured
+    /// one (zan.proj `icon = ...`), then assets/app.ico, then the shipped Zan
+    /// icon -- so every program the IDE builds, tools and samples included,
+    /// gets an icon. Returns "" when none of them exists.
+    static string IconFile(string root) {
         string rel = ZanIDE.ProjField(root, "icon");
-        if (rel == "") { return ""; }
-        string ico = root + "/" + rel;
-        if (!File.Exists(ico)) { return ""; }
-        string bd = ZanIDE.EnsureBuildDir(root);
-        string res = bd + "/app.res";
-        if (!ZanIDE.WriteIconResFromIco(ico, res)) { return ""; }
-        return res;
+        if (rel != "") {
+            string ico = root + "/" + rel;
+            if (File.Exists(ico)) { return ico; }
+        }
+        string a = ZanIDE.AssetsDir(root) + "/app.ico";
+        if (File.Exists(a)) { return a; }
+        return ZanIDE.ZanIconSource();
+    }
+
+    /// The same icon as a zanc `--icon` argument, or "" when there is none.
+    static string IconArg(string root) {
+        string f = ZanIDE.IconFile(root);
+        if (f == "") { return ""; }
+        return " --icon \"" + f + "\"";
     }
 
     static void Main() {
@@ -2123,15 +2000,9 @@ partial class ZanIDE {
                         if (rpB == "") {
                             log.Add(ZanIDE.T("> Nothing to run (open and save a source file first).", "> 没有可运行的目标（请先打开并保存源文件）。"));
                         } else {
-                            string bdB = ZanIDE.EnsureBuildDir(root);
-                            string exeB = bdB + "/.zanrun" + ZanIDE.ExeSuffix();
-                            if (File.Exists(exeB)) { File.Delete(exeB); }
-                            string inB = ZanIDE.SmartInputs(root, ZanIDE.DirOf(rpB), rpB);
-                            string cmdB = ZanIDE.CompileToExe(root, rpB, inB, bdB + "/.zanrun.ll", exeB, false);
-                            ZanIDE.BuildDetach(cmdB);
                             buildBusy = true;
                             buildThenRun = true;
-                            buildExe = exeB;
+                            buildExe = ZanIDE.RunBuildBegin(root, rpB);
                             buildIsGui = ZanIDE.IsGuiTarget(root, rpB);
                             buildTargetPath = apB;
                             buildLogLen = 0;
@@ -3396,22 +3267,16 @@ partial class ZanIDE {
                         }
                         aiModelSelProf = aiProfActive;
                     }
-                    // Two breathing rows: model + actions, then the session
-                    // switcher. Every control keeps the same gutter, so nothing
-                    // touches the panel edge or its neighbour.
-                    int aiGap = app.Scale(8);
-                    int aiRowH = app.Scale(30);
-                    int aiRow1Y = rBody.y + aiGap;
-                    int aiRow2Y = aiRow1Y + aiRowH + aiGap;
-                    int aiHdrH = aiRowH * 2 + aiGap * 3;
-                    int aiSmBtnW = app.Scale(56);
-                    int aiSelW = rBody.width - aiGap * 4 - aiSmBtnW * 2;
+                    int aiRow2H = app.Scale(30);
+                    int aiHdrH = app.Scale(34) + aiRow2H;
+                    int aiSmBtnW = app.Scale(52);
+                    int aiSelW = rBody.width - rPad * 4 - aiSmBtnW * 2;
                     if (aiSelW < app.Scale(60)) { aiSelW = app.Scale(60); }
-                    aiModelSel.Render(app, rBody.x + aiGap, aiRow1Y, aiSelW);
+                    aiModelSel.Render(app, rBody.x + rPad, rBody.y + app.Scale(4), aiSelW);
                     int aiPredId = aiPredictBtn.Render(app,
-                        rBody.x + aiGap * 2 + aiSelW, aiRow1Y, aiSmBtnW);
+                        rBody.x + rPad * 2 + aiSelW, rBody.y + app.Scale(4), aiSmBtnW);
                     int aiCfgId = aiCfgBtn.Render(app,
-                        rBody.x + aiGap * 3 + aiSelW + aiSmBtnW, aiRow1Y, aiSmBtnW);
+                        rBody.x + rPad * 3 + aiSelW + aiSmBtnW, rBody.y + app.Scale(4), aiSmBtnW);
                     if (Button.WasClicked(app, aiCfgId)) {
                         if (aiWindow == null || !aiWindow.IsOpen()) {
                             aiWindow = AiSettingsWindow.Open(app, ZanIDE.uiLang);
@@ -3421,17 +3286,17 @@ partial class ZanIDE {
                     // ---- Session row: switch / new / clear chat contexts ----
                     int sNavW = app.Scale(24);
                     int sBtnW = app.Scale(62);
-                    int sy = aiRow2Y;
-                    int sPrevId = aiSessPrevBtn.Render(app, rBody.x + aiGap, sy, sNavW);
+                    int sy = rBody.y + app.Scale(34) + app.Scale(2);
+                    int sPrevId = aiSessPrevBtn.Render(app, rBody.x + rPad, sy, sNavW);
                     int sNextId = aiSessNextBtn.Render(app,
-                        rBody.x + aiGap + sNavW + app.Scale(6), sy, sNavW);
-                    c.DrawText(rBody.x + aiGap + sNavW * 2 + app.Scale(16), sy + app.Scale(6),
+                        rBody.x + rPad + sNavW + app.Scale(4), sy, sNavW);
+                    c.DrawText(rBody.x + rPad + sNavW * 2 + app.Scale(12), sy + app.Scale(6),
                         ZanIDE.T("Chat ", "会话 ") + Convert.ToString(aiSessCur + 1) + "/"
                         + Convert.ToString(aiSessions.Count), t.textSecondary, t.fontSizeSmall);
                     int sNewId = aiSessNewBtn.Render(app,
-                        rBody.x + rBody.width - aiGap * 2 - sBtnW * 2, sy, sBtnW);
+                        rBody.x + rBody.width - rPad * 2 - sBtnW * 2, sy, sBtnW);
                     int sClrId = aiSessClearBtn.Render(app,
-                        rBody.x + rBody.width - aiGap - sBtnW, sy, sBtnW);
+                        rBody.x + rBody.width - rPad - sBtnW, sy, sBtnW);
                     bool sessSwitch = false;
                     int sessTarget = aiSessCur;
                     if (Button.WasClicked(app, sPrevId) && aiSessions.Count > 1) {
@@ -3860,8 +3725,23 @@ partial class ZanIDE {
                             TreeNode rtn = rtShow[rtSelV];
                             if (!rtn.isDir && rtn.path != "" && !ZanIDE.StartsWith(rtn.path, "@")) {
                                 if (rTab == 1) {
-                                    log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtn.path + " ...");
-                                    ZanIDE.RunFile(rtn.path, root, log, editor);
+                                    // Same DETACHED pipeline as the Run ribbon:
+                                    // compiling a tool takes as long as any
+                                    // other program, and must not freeze the UI.
+                                    string rtT = ZanIDE.RunTarget(rtn.path, root);
+                                    if (buildBusy) {
+                                        Layer.Msg(ZanIDE.T("Build already running…", "构建进行中…"), 2);
+                                    } else if (rtT != "") {
+                                        log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtn.path + " ...");
+                                        buildBusy = true;
+                                        buildThenRun = true;
+                                        buildExe = ZanIDE.RunBuildBegin(root, rtT);
+                                        buildIsGui = ZanIDE.IsGuiTarget(root, rtT);
+                                        buildTargetPath = rtn.path;
+                                        buildLogLen = 0;
+                                        dock.Focus("output");
+                                        app.RequestAnimationFrame(80);
+                                    }
                                 } else {
                                     ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, rtn.path, rtn.label);
                                     log.Add("> Opened " + rtn.path + ".");
@@ -3909,13 +3789,9 @@ partial class ZanIDE {
                             string bdHr = ZanIDE.EnsureBuildDir(root);
                             string exeHr = bdHr + "/.zanrun" + ZanIDE.ExeSuffix();
                             ZanIDE.HotKillRunExe(exeHr);
-                            if (File.Exists(exeHr)) { File.Delete(exeHr); }
-                            string inHr = ZanIDE.SmartInputs(root, ZanIDE.DirOf(rpHr), rpHr);
-                            string cmdHr = ZanIDE.CompileToExe(root, rpHr, inHr, bdHr + "/.zanrun.ll", exeHr, false);
-                            ZanIDE.BuildDetach(cmdHr);
                             buildBusy = true;
                             buildThenRun = true;
-                            buildExe = exeHr;
+                            buildExe = ZanIDE.RunBuildBegin(root, rpHr);
                             buildIsGui = ZanIDE.IsGuiTarget(root, rpHr);
                             buildTargetPath = apHr;
                             buildLogLen = 0;
@@ -4197,8 +4073,20 @@ partial class ZanIDE {
                                         ZanIDE.OpenPath(tabNames, tabBodies, tabPaths, activeTab, rtrn.path, rtrn.label);
                                         log.Add("> Opened " + rtrn.path + ".");
                                     } else if (chosen == 1) {
-                                        log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtrn.path + " ...");
-                                        ZanIDE.RunFile(rtrn.path, root, log, editor);
+                                        string rtcT = ZanIDE.RunTarget(rtrn.path, root);
+                                        if (buildBusy) {
+                                            Layer.Msg(ZanIDE.T("Build already running…", "构建进行中…"), 2);
+                                        } else if (rtcT != "") {
+                                            log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtrn.path + " ...");
+                                            buildBusy = true;
+                                            buildThenRun = true;
+                                            buildExe = ZanIDE.RunBuildBegin(root, rtcT);
+                                            buildIsGui = ZanIDE.IsGuiTarget(root, rtcT);
+                                            buildTargetPath = rtrn.path;
+                                            buildLogLen = 0;
+                                            dock.Focus("output");
+                                            app.RequestAnimationFrame(80);
+                                        }
                                     } else if (chosen == 3) {
                                         Clipboard.SetText(rtrn.path);
                                         log.Add("> Copied path: " + rtrn.path);
