@@ -2174,4 +2174,318 @@ partial class DataTable {
         st.order.RemoveAt(from);
         st.order.Insert(to, v);
     }
+
+    // ---------- keyboard navigation ----------
+
+    /// The display slot at or after `from` that holds a data row, walking by
+    /// `step`. Group headers are skipped, so the arrow keys move between cells
+    /// rather than stalling on a caption. Returns -1 when the walk runs out.
+    static int NextDataSlot(DataTableState st, int from, int step) {
+        int i = from;
+        while (i >= 0 && i < st.dispRows.Count) {
+            if (st.dispRows[i].kind == 0) { return i; }
+            i = i + step;
+        }
+        return -1;
+    }
+
+    static int FirstDataSlot(DataTableState st) {
+        return DataTable.NextDataSlot(st, 0, 1);
+    }
+
+    static int LastDataSlot(DataTableState st) {
+        return DataTable.NextDataSlot(st, st.dispRows.Count - 1, -1);
+    }
+
+    /// Position in `vorder` of the visible column `col`, or -1 when the column
+    /// is hidden. Navigation moves through the visible order, so a hidden or
+    /// reordered column never traps the cursor.
+    static int VisPos(List<int> vorder, int col) {
+        return vorder.IndexOf(col);
+    }
+
+    static bool IsNavKey(int kc) {
+        return kc == 37 || kc == 38 || kc == 39 || kc == 40
+            || kc == 33 || kc == 34 || kc == 35 || kc == 36 || kc == 9;
+    }
+
+    /// Where a navigation key should put the cursor: a two-element list holding
+    /// the target display slot (0) and column index (1), or -1/-1 when the grid
+    /// has nowhere to go. Pure decision logic, kept out of the render path so it
+    /// can be exercised headlessly.
+    ///
+    /// Rows move in display slots so group headers are stepped over; columns
+    /// move in visible-order positions so hidden and reordered columns behave.
+    static List<int> NavTarget(DataTableState st, List<int> vorder, int visRows,
+                               int kc, int emods) {
+        List<int> outp = new List<int>();
+        outp.Add(-1);
+        outp.Add(-1);
+        if (vorder.Count == 0 || !DataTable.IsNavKey(kc)) { return outp; }
+        bool shift = Modifiers.HasShift(emods);
+        bool ctrl = Modifiers.HasCtrl(emods);
+
+        // A first press with no cursor yet lands on the top-left cell rather
+        // than doing nothing.
+        if (st.hitOrder < 0 || st.hitCol < 0) {
+            int firstSlot = DataTable.FirstDataSlot(st);
+            if (firstSlot < 0) { return outp; }
+            outp[0] = firstSlot;
+            outp[1] = vorder[0];
+            return outp;
+        }
+
+        int vp = DataTable.VisPos(vorder, st.hitCol);
+        if (vp < 0) { vp = 0; }
+        int slot = st.hitOrder;
+        int newSlot = slot;
+        int newVp = vp;
+
+        if (kc == 38) {                                   // Up
+            newSlot = DataTable.NextDataSlot(st, slot - 1, -1);
+            if (ctrl) { newSlot = DataTable.FirstDataSlot(st); }
+        } else if (kc == 40) {                            // Down
+            newSlot = DataTable.NextDataSlot(st, slot + 1, 1);
+            if (ctrl) { newSlot = DataTable.LastDataSlot(st); }
+        } else if (kc == 37) {                            // Left
+            newVp = vp - 1;
+            if (ctrl) { newVp = 0; }
+        } else if (kc == 39) {                            // Right
+            newVp = vp + 1;
+            if (ctrl) { newVp = vorder.Count - 1; }
+        } else if (kc == 33) {                            // PageUp
+            newSlot = DataTable.NextDataSlot(st, slot - visRows, -1);
+            if (newSlot < 0) { newSlot = DataTable.FirstDataSlot(st); }
+        } else if (kc == 34) {                            // PageDown
+            newSlot = DataTable.NextDataSlot(st, slot + visRows, 1);
+            if (newSlot < 0) { newSlot = DataTable.LastDataSlot(st); }
+        } else if (kc == 36) {                            // Home: row start,
+            newVp = 0;                                    // Ctrl+Home: grid start
+            if (ctrl) { newSlot = DataTable.FirstDataSlot(st); }
+        } else if (kc == 35) {                            // End: row end,
+            newVp = vorder.Count - 1;                     // Ctrl+End: grid end
+            if (ctrl) { newSlot = DataTable.LastDataSlot(st); }
+        } else if (kc == 9) {
+            // Tab walks cell by cell, wrapping to the next row at the edge —
+            // the way a spreadsheet moves through a form.
+            if (shift) {
+                newVp = vp - 1;
+                if (newVp < 0) {
+                    int prev = DataTable.NextDataSlot(st, slot - 1, -1);
+                    if (prev >= 0) { newSlot = prev; newVp = vorder.Count - 1; }
+                    else { newVp = 0; }
+                }
+            } else {
+                newVp = vp + 1;
+                if (newVp >= vorder.Count) {
+                    int next = DataTable.NextDataSlot(st, slot + 1, 1);
+                    if (next >= 0) { newSlot = next; newVp = 0; }
+                    else { newVp = vorder.Count - 1; }
+                }
+            }
+        }
+
+        // Running off an edge holds position rather than wrapping or clearing.
+        if (newSlot < 0) { newSlot = slot; }
+        if (newVp < 0) { newVp = 0; }
+        if (newVp >= vorder.Count) { newVp = vorder.Count - 1; }
+        if (newSlot == slot && newVp == vp) { return outp; }
+        outp[0] = newSlot;
+        outp[1] = vorder[newVp];
+        return outp;
+    }
+
+    /// Move the cell cursor to display slot `oi`, column `col`. `extend` grows
+    /// the current range from the anchor instead of collapsing to one cell.
+    /// Returns false when the target isn't a navigable cell.
+    static bool MoveCursor(DataTableState st, int oi, int col, bool extend) {
+        if (oi < 0 || oi >= st.dispRows.Count) { return false; }
+        if (st.dispRows[oi].kind != 0) { return false; }
+        if (col < 0) { return false; }
+        st.hitOrder = oi;
+        st.hitRow = st.dispRows[oi].row;
+        st.hitCol = col;
+        if (extend) {
+            // The anchor is whatever the range started from; only the far
+            // corner follows the cursor.
+            if (st.rangeR0 < 0 || st.rangeC0 < 0) {
+                st.rangeR0 = oi;
+                st.rangeC0 = col;
+            }
+            st.rangeR1 = oi;
+            st.rangeC1 = col;
+        } else {
+            st.rangeR0 = oi;
+            st.rangeR1 = oi;
+            st.rangeC0 = col;
+            st.rangeC1 = col;
+            st.selAnchor = oi;
+        }
+        return true;
+    }
+
+    /// Scroll the minimum amount that brings display slot `oi` into view.
+    /// In paged mode the page containing it is selected instead.
+    static void ScrollSlotIntoView(DataTableState st, int oi, int visRows) {
+        if (oi < 0 || visRows < 1) { return; }
+        if (st.paged) {
+            if (st.pageRows > 0) { st.pageModel.Set(oi / st.pageRows + 1); }
+            return;
+        }
+        if (oi < st.scrollRow) {
+            st.scrollRow = oi;
+            st.ScrollChanged.Raise();
+        } else if (oi >= st.scrollRow + visRows) {
+            st.scrollRow = oi - visRows + 1;
+            st.ScrollChanged.Raise();
+        }
+    }
+
+    /// Pan horizontally so column `col` is fully visible. `vorder`/`dispW` give
+    /// the column's offset inside the scrolling data band.
+    static void ScrollColIntoView(DataTableState st, List<int> vorder, int col,
+                                  int dataViewW, int pinnedW) {
+        int off = 0;
+        int i = 0;
+        int w = 0;
+        bool found = false;
+        while (i < vorder.Count) {
+            int cc = vorder[i];
+            if (cc == col) { w = st.dispW[cc]; found = true; i = vorder.Count; }
+            else { off = off + st.dispW[cc]; i = i + 1; }
+        }
+        if (!found) { return; }
+        // A pinned column is always on screen: it sits left of the scroll band.
+        if (off < pinnedW) { return; }
+        if (off < st.scrollX + pinnedW) {
+            st.scrollX = off - pinnedW;
+        } else if (off + w > st.scrollX + dataViewW) {
+            st.scrollX = off + w - dataViewW;
+        }
+        if (st.scrollX < 0) { st.scrollX = 0; }
+    }
+
+    // ---------- clipboard ----------
+
+    /// Tab-separated text for the current cell range (or selection). This is
+    /// what Ctrl+C puts on the clipboard.
+    static string CopyText(DataTableState st, List<DataColumn> cols, DataSource src) {
+        return DataTable.BuildText(st, cols, src, false, false);
+    }
+
+    /// Paste tab-separated text into the grid starting at the cursor, filling
+    /// down and right. Only editable, non-bool columns take a value; a bool
+    /// column reads the pasted text through ParseBool so "Yes"/"1" both land.
+    /// Returns the number of cells actually written.
+    static int PasteText(DataTableState st, List<DataColumn> cols, DataSource src, string text) {
+        if (text.Length == 0) { return 0; }
+        int r0 = st.hitOrder;
+        int c0 = st.hitCol;
+        if (DataTable.HasRange(st)) {
+            r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+            c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+        }
+        if (r0 < 0 || c0 < 0) { return 0; }
+
+        // The anchor may be a group header (e.g. the cursor sits on a caption);
+        // start writing at the first data row from there.
+        r0 = DataTable.NextDataSlot(st, r0, 1);
+        if (r0 < 0) { return 0; }
+
+        List<string> lines = DataTable.SplitLines(text);
+        int written = 0;
+        int li = 0;
+        int slot = r0;
+        while (li < lines.Count) {
+            // Trailing newline yields one empty line; pasting it would blank a
+            // row the user never pointed at.
+            if (lines[li].Length == 0 && li == lines.Count - 1) { li = li + 1; }
+            else {
+                slot = DataTable.NextDataSlot(st, slot, 1);
+                if (slot < 0) { li = lines.Count; }
+                else {
+                    int row = st.dispRows[slot].row;
+                    List<string> fields = DataTable.SplitTabs(lines[li]);
+                    int fi = 0;
+                    while (fi < fields.Count && c0 + fi < cols.Count) {
+                        int col = c0 + fi;
+                        if (cols[col].editable) {
+                            string v = fields[fi];
+                            if (cols[col].isBool) {
+                                if (DataTable.ParseBool(v)) { v = cols[col].boolTrue; }
+                                else { v = cols[col].boolFalse; }
+                            }
+                            src.SetCell(row, col, v);
+                            written = written + 1;
+                        }
+                        fi = fi + 1;
+                    }
+                    slot = slot + 1;
+                    li = li + 1;
+                }
+            }
+        }
+        if (written > 0) {
+            st.editRow = st.dispRows[r0].row;
+            st.editCol = c0;
+            st.CellEdit.Raise();
+            st.dirty = true;
+        }
+        return written;
+    }
+
+    /// Clear every editable cell in the current range (the Delete key).
+    /// Returns the number of cells cleared.
+    static int ClearRangeCells(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int r0 = st.hitOrder;
+        int r1 = st.hitOrder;
+        int c0 = st.hitCol;
+        int c1 = st.hitCol;
+        if (DataTable.HasRange(st)) {
+            r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+            r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+            c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        }
+        if (r0 < 0 || c0 < 0) { return 0; }
+        // The reported edit row must be a data row, not a group caption the
+        // range happens to start on.
+        r0 = DataTable.NextDataSlot(st, r0, 1);
+        if (r0 < 0 || r0 > r1) { return 0; }
+        int cleared = 0;
+        int rr = r0;
+        while (rr <= r1) {
+            if (rr >= 0 && rr < st.dispRows.Count && st.dispRows[rr].kind == 0) {
+                int row = st.dispRows[rr].row;
+                int cc = c0;
+                while (cc <= c1) {
+                    if (cc < cols.Count && cols[cc].editable) {
+                        string blank = "";
+                        if (cols[cc].isBool) { blank = cols[cc].boolFalse; }
+                        src.SetCell(row, cc, blank);
+                        cleared = cleared + 1;
+                    }
+                    cc = cc + 1;
+                }
+            }
+            rr = rr + 1;
+        }
+        if (cleared > 0) {
+            st.editRow = st.dispRows[r0].row;
+            st.editCol = c0;
+            st.CellEdit.Raise();
+            st.dirty = true;
+        }
+        return cleared;
+    }
+
+    /// Split on '\n', dropping any '\r' — clipboard text arrives with either
+    /// line ending depending on where it was copied from.
+    static List<string> SplitLines(string s) {
+        return s.Replace("\r", "").Split("\n");
+    }
+
+    static List<string> SplitTabs(string s) {
+        return s.Split("\t");
+    }
 }

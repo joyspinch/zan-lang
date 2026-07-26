@@ -946,6 +946,23 @@ partial class DataTable {
             }
         }
 
+        // ---------------- cell-cursor keyboard navigation ----------------
+        // Arrows / PgUp / PgDn / Home / End move the cursor, Shift extends the
+        // range, and Ctrl+C/V/X/A act on it. Gated on the grid having been
+        // interacted with (st.hitRow), since the widget has no keyboard focus of
+        // its own — otherwise an untouched grid would swallow Tab and the arrow
+        // keys from every other widget on the page. Also yields whenever
+        // something else owns the keyboard: an open editor, a focused filter-row
+        // cell, or a modal popup.
+        if (!st.editing && ek == 4 && st.hitRow >= 0
+            && st.filterRowFocusCol < 0 && st.openMenu < 0) {
+            if (DataTable.HandleNavKey(app, cols, src, st, vorder, visRows,
+                                       dataViewW, pinnedW, app.window.EventKeyCode(), emods)) {
+                ek = 0;
+                app.RequestRedraw();
+            }
+        }
+
         // left press
         if (ek == 2 && eb == 0 && ptrOi >= 0) {
             if (st.dispRows[ptrOi].kind == 1) {
@@ -1370,9 +1387,9 @@ partial class DataTable {
         int sepH = app.Scale(9);
 
         // menu items: label, accelerator, kind (0 item, 1 separator)
-        // 0 copy, 1 copy-with-headers, 2 export csv, 3 chart-from-selection,
-        // sep, 4 select all, sep, 5 clear
-        int nItems = 6;
+        // 0 copy, 1 copy-with-headers, 2 paste, 3 clear cells, 4 export csv,
+        // 5 chart-from-selection, sep, 6 select all, sep, 7 clear selection
+        int nItems = 8;
         int mh = ih * nItems + sepH * 2 + app.Scale(8);
 
         int mx = st.ctxX;
@@ -1402,6 +1419,24 @@ partial class DataTable {
         if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
             Clipboard.SetText(DataTable.BuildText(st, cols, src, false, true));
             DataTable.Flash(st, "已复制（含表头）");
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "粘贴  Paste", "Ctrl+V");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            int pn = DataTable.PasteText(st, cols, src, Clipboard.GetText());
+            if (pn > 0) { DataTable.Flash(st, "已粘贴 " + Convert.ToString(pn) + " 个单元格"); }
+            else { DataTable.Flash(st, "无可粘贴的可编辑单元格"); }
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, "清空所选单元格", "Delete");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            int dn = DataTable.ClearRangeCells(st, cols, src);
+            if (dn > 0) { DataTable.Flash(st, "已清空 " + Convert.ToString(dn) + " 个单元格"); }
+            else { DataTable.Flash(st, "所选区域没有可编辑单元格"); }
             st.ctxOpen = false;
             app.RequestRedraw();
         }
@@ -1806,6 +1841,77 @@ partial class DataTable {
         }
     }
 
+    /// Handle one key-down for the cell cursor. Returns true when the key was
+    /// consumed, so the caller can stop it reaching scroll/selection handling.
+    ///
+    /// Movement works in display slots (so group headers are stepped over) and
+    /// in visible-column positions (so hidden and reordered columns behave).
+    /// Shift extends the range from its anchor; Ctrl jumps to the edge.
+    static bool HandleNavKey(App app, List<DataColumn> cols, DataSource src,
+                             DataTableState st, List<int> vorder, int visRows,
+                             int dataViewW, int pinnedW, int kc, int emods) {
+        if (vorder.Count == 0) { return false; }
+        bool shift = Modifiers.HasShift(emods);
+        bool ctrl = Modifiers.HasCtrl(emods);
+
+        // ---- clipboard / selection shortcuts ----
+        if (ctrl && kc == 67) {                     // Ctrl+C
+            Clipboard.SetText(DataTable.CopyText(st, cols, src));
+            DataTable.Flash(st, "已复制到剪贴板");
+            return true;
+        }
+        if (ctrl && kc == 88) {                     // Ctrl+X: copy, then blank
+            Clipboard.SetText(DataTable.CopyText(st, cols, src));
+            int cut = DataTable.ClearRangeCells(st, cols, src);
+            if (cut > 0) { DataTable.Flash(st, "已剪切 " + Convert.ToString(cut) + " 个单元格"); }
+            else { DataTable.Flash(st, "已复制到剪贴板"); }
+            return true;
+        }
+        if (ctrl && kc == 86) {                     // Ctrl+V
+            int n = DataTable.PasteText(st, cols, src, Clipboard.GetText());
+            if (n > 0) { DataTable.Flash(st, "已粘贴 " + Convert.ToString(n) + " 个单元格"); }
+            else { DataTable.Flash(st, "无可粘贴的可编辑单元格"); }
+            return true;
+        }
+        if (ctrl && kc == 65) {                     // Ctrl+A: whole grid
+            DataTable.SelectAllRows(st, true);
+            int firstSlot = DataTable.FirstDataSlot(st);
+            int lastSlot = DataTable.LastDataSlot(st);
+            if (firstSlot >= 0) {
+                st.rangeR0 = firstSlot;
+                st.rangeR1 = lastSlot;
+                st.rangeC0 = vorder[0];
+                st.rangeC1 = vorder[vorder.Count - 1];
+            }
+            st.SelectionChanged.Raise();
+            return true;
+        }
+        if (kc == 46 && !ctrl) {                    // Delete blanks the range
+            return DataTable.ClearRangeCells(st, cols, src) > 0;
+        }
+        if (kc == 32 && st.hitRow >= 0) {           // Space checks the row
+            st.selected[st.hitRow] = !st.selected[st.hitRow];
+            st.SelectionChanged.Raise();
+            return true;
+        }
+
+        if (!DataTable.IsNavKey(kc)) { return false; }
+        // A navigation key is claimed even when the cursor is already at the
+        // edge, so an arrow can't fall through and scroll the page instead.
+        List<int> tgt = DataTable.NavTarget(st, vorder, visRows, kc, emods);
+        int newSlot = tgt[0];
+        int newCol = tgt[1];
+        if (newSlot < 0 || newCol < 0) { return true; }
+        // Tab commits like a form field, so it always collapses the range even
+        // when Shift is held (Shift+Tab means "backwards", not "extend").
+        bool extend = shift && kc != 9;
+        if (!DataTable.MoveCursor(st, newSlot, newCol, extend)) { return true; }
+        DataTable.ScrollSlotIntoView(st, newSlot, visRows);
+        DataTable.ScrollColIntoView(st, vorder, newCol, dataViewW, pinnedW);
+        st.CellClick.Raise();
+        return true;
+    }
+
     /// A small pill that reads as selected when `on`. Used for the rule chips,
     /// which are radio-like: clicking the active one turns the rule off.
     static bool Chip(App app, int bx, int by, int bw, int bh, string label, bool on) {
@@ -1826,6 +1932,32 @@ partial class DataTable {
 
     /// The "Rules" filter tab: value comparison, relative date presets (date
     /// columns only) and top-N. Returns the y below the content it drew.
+    // Height RenderRulesTab will occupy for this filter/column pair. Kept
+    // beside the renderer so the two stay in step: every `cy` advance there has
+    // a matching term here, including the sections that only appear for date
+    // columns or once a counted top/bottom mode is picked.
+    static int RulesTabHeight(App app, ColFilter f, DataColumn col) {
+        int chipH = app.Scale(22);
+        int gap = app.Scale(4);
+        int boxH = app.Scale(26);
+        int lblH = Canvas.FontHeight(app.theme.fontSizeSmall) + app.Scale(4);
+
+        int h = lblH;                            // "Compare"
+        h = h + (chipH + gap) * 2;               // eight operator chips
+        h = h + chipH + app.Scale(6);            // is empty / not empty
+        if (f.cmpMode != 0 && f.cmpMode != 9 && f.cmpMode != 10) {
+            h = h + boxH + app.Scale(4);         // one or two operand boxes
+        }
+        h = h + app.Scale(6);
+        if (col.isDate) {
+            h = h + lblH + (chipH + gap) * 4 + app.Scale(6);
+        }
+        h = h + lblH;                            // "Top / bottom"
+        h = h + (chipH + gap) * 2;               // six top/bottom chips
+        if (f.topMode >= 1 && f.topMode <= 4) { h = h + boxH; }
+        return h;
+    }
+
     static int RenderRulesTab(App app, int mx, int cy, int menuW, int pad,
                               ColFilter f, DataColumn col, DataTableState st) {
         Canvas c = app.canvas;
@@ -1981,11 +2113,14 @@ partial class DataTable {
         int rowH = app.Scale(28);
         int menuW = app.Scale(256);
         int menuH = app.Scale(348);
-        // The Rules tab stacks several sections, so it needs a taller panel;
-        // date columns add the preset section on top of that.
+        // The Rules tab stacks several sections of varying height, so its panel
+        // is sized from the same layout math the tab itself uses rather than a
+        // hand-tuned constant that would clip when the theme's metrics change.
         if (st.filterTab == 3) {
-            menuH = app.Scale(392);
-            if (cols[mi].isDate) { menuH = app.Scale(486); }
+            menuH = app.Scale(8) + rowH + app.Scale(6)      // title row
+                  + rowH + app.Scale(8)                      // tab strip
+                  + DataTable.RulesTabHeight(app, f, cols[mi])
+                  + app.Scale(40);                           // footer
         }
 
         // anchor under the column, clamp fully inside the window
