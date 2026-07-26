@@ -1,0 +1,123 @@
+using System;
+using System.Collections.Generic;
+
+namespace Ra2.Formats;
+
+// A map (.MAP/.MPR) -- an INI file whose [Map] section frames the playable
+// area and whose IsoMapPack5 section holds the terrain.
+//
+// [Map] Size is the full grid "0,0,w,h" while LocalSize is the visible window
+// "x,y,w,h" inside it; the border between them is off-limits scenery.
+//
+// IsoMapPack5 cell coordinates are not bounded by the declared size. The map
+// is a diamond rotated into cell space, so its bounding box runs to w+h on
+// both axes -- a 40x80 map reaches (119,119). Sizing the grid by the declared
+// width instead throws away every cell past it: on MP07T4 that silently
+// dropped 3660 of 14340 records.
+class MapFile {
+    IniDocument doc;
+    string theater;
+    int width;
+    int height;
+    int localX;
+    int localY;
+    int localWidth;
+    int localHeight;
+    IsoMap terrain;
+
+    static MapFile Parse(string text) {
+        MapFile m = new MapFile();
+        m.doc = IniParser.Parse(text);
+        m.theater = m.doc.GetOr("Map", "Theater", "TEMPERATE");
+
+        List<int> size = MapFile.ParseCsv(m.doc.GetOr("Map", "Size", "0,0,0,0"));
+        if (size.Count >= 4) {
+            m.width = size[2];
+            m.height = size[3];
+        }
+        List<int> local = MapFile.ParseCsv(m.doc.GetOr("Map", "LocalSize", "0,0,0,0"));
+        if (local.Count >= 4) {
+            m.localX = local[0];
+            m.localY = local[1];
+            m.localWidth = local[2];
+            m.localHeight = local[3];
+        }
+
+        string packed = MapPack.JoinSection(m.doc, "IsoMapPack5");
+        if (packed.Length > 0) {
+            List<int> len = new List<int>();
+            len.Add(0);
+            string raw = MapPack.Decode(packed, len);
+            int span = m.width + m.height;
+            m.terrain = IsoMap.Parse(raw, len[0], span, span);
+            // IsoMap copies each record into an IsoTile, so the decoded pack is
+            // dead once it returns. Freeing matters: a map's pack is a few
+            // hundred kilobytes and loading a handful of maps without this
+            // exhausts the heap.
+            MapFile.free(raw);
+        } else {
+            int span = m.width + m.height;
+            m.terrain = IsoMap.Parse("", 0, span, span);
+        }
+        return m;
+    }
+
+    [DllImport("crt")]
+    static extern void free(string p);
+
+    /// <summary>Splits a "a,b,c,d" value into integers, ignoring blanks.</summary>
+    static List<int> ParseCsv(string s) {
+        List<int> parts = new List<int>();
+        int start = 0;
+        int i = 0;
+        while (i <= s.Length) {
+            if (i == s.Length || s.Substring(i, 1) == ",") {
+                if (i > start) {
+                    parts.Add(Convert.ToInt32(s.Substring(start, i - start).Trim()));
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return parts;
+    }
+
+    IniDocument Document() { return this.doc; }
+    string Theater() { return this.theater; }
+    int Width() { return this.width; }
+    int Height() { return this.height; }
+    int LocalX() { return this.localX; }
+    int LocalY() { return this.localY; }
+    int LocalWidth() { return this.localWidth; }
+    int LocalHeight() { return this.localHeight; }
+    IsoMap Terrain() { return this.terrain; }
+
+    string Name() { return this.doc.GetOr("Basic", "Name", ""); }
+
+    /// <summary>The number of starting positions declared in [Waypoints].
+    /// RA2 reserves waypoints 0-7 for player starts.</summary>
+    int StartCount() {
+        IniSection w = this.doc.Section("Waypoints");
+        if (w == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < 8) {
+            if (w.Contains(Convert.ToString(i))) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    /// <summary>The cell of a starting position, as (x, y) appended to out.
+    /// Waypoint values are packed as y * 1000 + x.</summary>
+    bool StartCell(int index, List<int> outXy) {
+        IniSection w = this.doc.Section("Waypoints");
+        if (w == null) { return false; }
+        string v = w.GetOr(Convert.ToString(index), "");
+        if (v.Length == 0) { return false; }
+        int packed = Convert.ToInt32(v);
+        outXy.Add(packed % 1000);
+        outXy.Add(packed / 1000);
+        return true;
+    }
+}

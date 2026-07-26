@@ -1,0 +1,115 @@
+using System;
+using System.Collections.Generic;
+
+namespace Ra2.Formats;
+
+// Format80 (LCW), Westwood's general-purpose compressor. It backs SHP/TMP
+// pixel data and the IsoMapPack5 map chunks. Clean-room: the format is
+// documented in every open C&C tool; nothing here is derived from game code.
+//
+// The stream is a sequence of commands, each introduced by a flag byte:
+//
+//   0cccpppp pppppppp  copy ccc+3 bytes from ppppppppppppp bytes *back*
+//   10cccccc           cccccc literal bytes follow; cccccc == 0 ends the stream
+//   11cccccc oooooooo oooooooo
+//                      copy cccccc+3 bytes from absolute output offset oooo
+//   11111110 nnnn cc   write colour cc nnnn times
+//   11111111 nnnn oooo copy nnnn bytes from absolute output offset oooo
+//
+// Copies are byte-at-a-time and may overlap the write cursor -- that is how a
+// run is encoded, so the loops below must not be turned into a block move.
+class Format80 {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    /// <summary>Writes v to outLen[0], growing the list when the caller passed
+    /// an empty one. Length-out lists are spelled both ways across the code
+    /// base -- stdlib assigns to slot 0, callers here tend to pass a fresh
+    /// list -- and assigning to slot 0 of an empty list reads out of bounds
+    /// rather than failing, so normalise it in one place.</summary>
+    static void SetOut(List<int> outLen, int v) {
+        if (outLen.Count == 0) { outLen.Add(v); } else { outLen[0] = v; }
+    }
+
+    /// <summary>Decompresses a Format80 stream into a fresh buffer of at most
+    /// destCap bytes. The decoded length is written to outLen[0].</summary>
+    static string Decompress(string src, int srcStart, int srcLen, int destCap, List<int> outLen) {
+        string dest = Format80.calloc(destCap + 1, 1);
+        int n = Format80.DecompressInto(src, srcStart, srcLen, dest, destCap);
+        Format80.SetOut(outLen, n);
+        return dest;
+    }
+
+    /// <summary>Decompresses into a caller-supplied buffer and returns the
+    /// number of bytes written. Truncates instead of overrunning: a stream that
+    /// ends early, points backwards past the start, or asks for more than
+    /// destCap simply stops.</summary>
+    static int DecompressInto(string src, int srcStart, int srcLen, string dest, int destCap) {
+        int p = srcStart;
+        int end = srcStart + srcLen;
+        int d = 0;
+
+        while (p < end && d < destCap) {
+            int flag = src[p] & 0xFF;
+            p = p + 1;
+
+            if ((flag & 0x80) == 0) {
+                if (p >= end) { return d; }
+                int count = ((flag & 0x70) >> 4) + 3;
+                int rel = ((flag & 0x0F) << 8) | (src[p] & 0xFF);
+                p = p + 1;
+                int from = d - rel;
+                if (from < 0) { return d; }
+                int i = 0;
+                while (i < count && d < destCap) {
+                    dest[d] = (char)(dest[from + i] & 0xFF);
+                    d = d + 1;
+                    i = i + 1;
+                }
+            } else if ((flag & 0x40) == 0) {
+                int count = flag & 0x3F;
+                if (count == 0) { return d; }
+                int i = 0;
+                while (i < count && d < destCap && p < end) {
+                    dest[d] = (char)(src[p] & 0xFF);
+                    d = d + 1;
+                    p = p + 1;
+                    i = i + 1;
+                }
+            } else if (flag == 0xFE) {
+                if (p + 2 >= end) { return d; }
+                int count = (src[p] & 0xFF) | ((src[p + 1] & 0xFF) << 8);
+                int colour = src[p + 2] & 0xFF;
+                p = p + 3;
+                int i = 0;
+                while (i < count && d < destCap) {
+                    dest[d] = (char)colour;
+                    d = d + 1;
+                    i = i + 1;
+                }
+            } else {
+                int count = 0;
+                int from = 0;
+                if (flag == 0xFF) {
+                    if (p + 3 >= end) { return d; }
+                    count = (src[p] & 0xFF) | ((src[p + 1] & 0xFF) << 8);
+                    from = (src[p + 2] & 0xFF) | ((src[p + 3] & 0xFF) << 8);
+                    p = p + 4;
+                } else {
+                    if (p + 1 >= end) { return d; }
+                    count = (flag & 0x3F) + 3;
+                    from = (src[p] & 0xFF) | ((src[p + 1] & 0xFF) << 8);
+                    p = p + 2;
+                }
+                if (from >= destCap) { return d; }
+                int i = 0;
+                while (i < count && d < destCap && from + i < destCap) {
+                    dest[d] = (char)(dest[from + i] & 0xFF);
+                    d = d + 1;
+                    i = i + 1;
+                }
+            }
+        }
+        return d;
+    }
+}

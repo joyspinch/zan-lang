@@ -1,0 +1,187 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace Ra2.Formats;
+
+// The packed sections of a map file -- IsoMapPack5 (terrain), OverlayPack and
+// OverlayDataPack. On disk each is an INI section whose keys are "1", "2", ...
+// holding base64 in 70-character lines; concatenating the values and decoding
+// yields a chunked stream ("Format5"):
+//
+//   chunk: compressedSize(u16), uncompressedSize(u16), then compressedSize bytes
+//
+// Chunks repeat until the input is exhausted. The payload is LZO1X, not
+// Format80 -- the shared "Format5" name refers to the chunk framing only.
+// IsoMapPack5 chunks decode to 8192 bytes each; the decoded whole is an array
+// of 11-byte tile records.
+class MapPack {
+    [DllImport("crt")]
+    static extern string calloc(int count, int size);
+
+    /// <summary>Joins the numbered keys of a packed section back into one
+    /// base64 string. Returns "" when the section is absent.</summary>
+    static string JoinSection(IniDocument doc, string section) {
+        IniSection s = doc.Section(section);
+        if (s == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        // The keys are 1..n in order, but read them positionally rather than by
+        // name so a map with a gap still concatenates in file order.
+        int i = 0;
+        while (i < s.Count()) {
+            sb.Append(s.EntryAt(i).Value());
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Decodes a base64 Format5 blob: base64 -> chunks -> Format80.
+    /// The decoded length is appended to outLen.</summary>
+    static string Decode(string base64, List<int> outLen) {
+        // Base64.Decode assigns to slot 0 rather than appending, so the slot
+        // has to exist before the call.
+        List<int> rawLenOut = new List<int>();
+        rawLenOut.Add(0);
+        string raw = Base64.Decode(base64, rawLenOut);
+        int rawLen = rawLenOut[0];
+        string result = MapPack.DecodeChunks(raw, rawLen, outLen);
+        free(raw);
+        return result;
+    }
+
+    /// <summary>Decodes an already-base64-decoded Format5 stream.</summary>
+    static string DecodeChunks(string raw, int rawLen, List<int> outLen) {
+        // Size the destination from the chunk headers rather than guessing, so
+        // a map of any dimension lands in an exactly-sized buffer.
+        int total = 0;
+        int p = 0;
+        while (p + 4 <= rawLen) {
+            int cSize = (raw[p] & 0xFF) | ((raw[p + 1] & 0xFF) << 8);
+            int uSize = (raw[p + 2] & 0xFF) | ((raw[p + 3] & 0xFF) << 8);
+            if (cSize <= 0 || p + 4 + cSize > rawLen) { break; }
+            total = total + uSize;
+            p = p + 4 + cSize;
+        }
+
+        string dest = MapPack.calloc(total + 1, 1);
+        int written = 0;
+        p = 0;
+        while (p + 4 <= rawLen && written < total) {
+            int cSize = (raw[p] & 0xFF) | ((raw[p + 1] & 0xFF) << 8);
+            int uSize = (raw[p + 2] & 0xFF) | ((raw[p + 3] & 0xFF) << 8);
+            if (cSize <= 0 || p + 4 + cSize > rawLen) { break; }
+            // Decompress each chunk into its own slot in the output. Match
+            // back-references are chunk-local, so this cannot be one long call.
+            string slot = MapPack.calloc(uSize + 1, 1);
+            int n = Lzo.DecompressInto(raw, p + 4, cSize, slot, uSize);
+            int i = 0;
+            while (i < n && written < total) {
+                dest[written] = (char)(slot[i] & 0xFF);
+                written = written + 1;
+                i = i + 1;
+            }
+            free(slot);
+            p = p + 4 + cSize;
+        }
+        Format80.SetOut(outLen, written);
+        return dest;
+    }
+
+    [DllImport("crt")]
+    static extern void free(string p);
+}
+
+// One terrain cell from IsoMapPack5. Records are 11 bytes:
+//   x(u16), y(u16), tile(i32), subTile(u8), level(u8), iceGrowth(u8)
+// The tile field is nominally 32 bits but the upper half is always zero in
+// shipped maps; 0xFFFF is the "no tile set" sentinel, which the game draws as
+// the theater's default clear ground.
+class IsoTile {
+    int x;
+    int y;
+    int tile;
+    int subTile;
+    int level;
+    int iceGrowth;
+
+    int X() { return this.x; }
+    int Y() { return this.y; }
+    int Tile() { return this.tile; }
+    int SubTile() { return this.subTile; }
+    int Level() { return this.level; }
+    int IceGrowth() { return this.iceGrowth; }
+
+    /// <summary>True when the cell carries no explicit tile and should fall
+    /// back to the theater's clear ground.</summary>
+    bool IsClear() { return this.tile == 0xFFFF || this.tile == 0; }
+}
+
+/// <summary>The terrain grid of a map: the decoded IsoMapPack5 indexed by
+/// cell coordinate.</summary>
+class IsoMap {
+    int width;
+    int height;
+    List<IsoTile> tiles;
+    // Cell -> index into tiles, +1 so that 0 means "empty". A flat array beats
+    // a dictionary here: the grid is dense and known up front, lookup is a
+    // single index, and a Dictionary this large (~20k entries) is not reclaimed
+    // when it goes out of scope -- loading seven maps exhausts the heap.
+    List<int> cellIndex;
+
+    static int RecordSize() { return 11; }
+
+    static IsoMap Parse(string data, int length, int width, int height) {
+        IsoMap m = new IsoMap();
+        m.width = width;
+        m.height = height;
+        m.tiles = new List<IsoTile>();
+        m.cellIndex = new List<int>();
+
+        List<int> idx = m.cellIndex;
+        int cells = width * height;
+        int c = 0;
+        while (c < cells) {
+            idx.Add(0);
+            c = c + 1;
+        }
+        List<IsoTile> list = m.tiles;
+
+        int rec = IsoMap.RecordSize();
+        int p = 0;
+        while (p + rec <= length) {
+            IsoTile t = new IsoTile();
+            t.x = (data[p] & 0xFF) | ((data[p + 1] & 0xFF) << 8);
+            t.y = (data[p + 2] & 0xFF) | ((data[p + 3] & 0xFF) << 8);
+            t.tile = (data[p + 4] & 0xFF) | ((data[p + 5] & 0xFF) << 8)
+                   | ((data[p + 6] & 0xFF) << 16) | ((data[p + 7] & 0xFF) << 24);
+            t.subTile = data[p + 8] & 0xFF;
+            t.level = data[p + 9] & 0xFF;
+            t.iceGrowth = data[p + 10] & 0xFF;
+            p = p + rec;
+
+            // Unused cells are padding, not terrain -- the pack is a dense
+            // array over the bounding box, most of which is outside the
+            // diamond-shaped playable area.
+            if (t.x == 0 && t.y == 0) { continue; }
+            if (t.x >= width || t.y >= height) { continue; }
+
+            list.Add(t);
+            idx[t.y * width + t.x] = list.Count;
+        }
+        return m;
+    }
+
+    int Width() { return this.width; }
+    int Height() { return this.height; }
+    int Count() { return this.tiles.Count; }
+    IsoTile TileAt(int index) { return this.tiles[index]; }
+
+    /// <summary>The tile occupying a cell, or null when the cell is outside
+    /// the playable area.</summary>
+    IsoTile At(int x, int y) {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) { return null; }
+        int slot = this.cellIndex[y * this.width + x];
+        if (slot == 0) { return null; }
+        return this.tiles[slot - 1];
+    }
+}

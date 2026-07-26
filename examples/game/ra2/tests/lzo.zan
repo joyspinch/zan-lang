@@ -1,0 +1,106 @@
+// LZO1X decompression and the Format5 chunk container used by map packs.
+//
+// Clean-room: the stream below is hand-built to exercise the leading literal
+// run, an overlapping short match, an extended-length literal and the
+// end-of-stream marker, and was cross-checked against an independent decoder.
+// No game data is embedded.
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace T;
+
+class Program {
+    [DllImport("crt")] static extern string calloc(int count, int size);
+
+    // Lowercase hex digit -> value.
+    static int HexVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        return (c - 97) + 10;
+    }
+
+    static string FromHex(string hex, List<int> outLen) {
+        int n = hex.Length / 2;
+        string buf = Program.calloc(n + 1, 1);
+        int i = 0;
+        while (i < n) {
+            // Takes the character's code, not the character: passing a char
+            // where a string is declared makes the callee index it as a pointer.
+            int hi = Program.HexVal(hex[i * 2] & 0xFF);
+            int lo = Program.HexVal(hex[i * 2 + 1] & 0xFF);
+            buf[i] = (char)((hi << 4) | lo);
+            i = i + 1;
+        }
+        outLen.Add(n);
+        return buf;
+    }
+
+    // Substring is the way to turn an indexed byte back into a string: `str +
+    // buf[i]` would append the numeric value, not the character.
+    static string Hex(string buf, int len) {
+        string digits = "0123456789abcdef";
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < len) {
+            int v = buf[i] & 0xFF;
+            sb.Append(digits.Substring(v >> 4, 1));
+            sb.Append(digits.Substring(v & 0x0F, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static void Main() {
+        string srcHex = "1b0102030405060708090a64000005c8c9cacbccc8c9cacbcc"
+                      + "c8c9cacbccc8c9cacbccc8c9ca110000";
+        List<int> srcLenOut = new List<int>();
+        string src = Program.FromHex(srcHex, srcLenOut);
+        int srcLen = srcLenOut[0];
+
+        List<int> outLen = new List<int>();
+        string plain = Lzo.Decompress(src, 0, srcLen, 512, outLen);
+        Console.WriteLine("len=" + Convert.ToString(outLen[0]));
+        Console.WriteLine("out=" + Program.Hex(plain, outLen[0]));
+
+        // A destination smaller than the stream must truncate, not overrun.
+        List<int> capOut = new List<int>();
+        Lzo.Decompress(src, 0, srcLen, 8, capOut);
+        Console.WriteLine("capped=" + Convert.ToString(capOut[0]));
+
+        // A stream cut mid-command stops at the last whole one.
+        List<int> shortOut = new List<int>();
+        Lzo.Decompress(src, 0, 6, 512, shortOut);
+        Console.WriteLine("short=" + Convert.ToString(shortOut[0]));
+
+        // The same payload wrapped as two Format5 chunks, base64 exactly as it
+        // would appear in a map's IsoMapPack5 section.
+        string b64 = "KQAlABsBAgMEBQYHCAkKZAAABcjJysvMyMnKy8zIycrLzMjJysvMyMnKEQAA"
+                   + "KQAlABsBAgMEBQYHCAkKZAAABcjJysvMyMnKy8zIycrLzMjJysvMyMnKEQAA";
+        List<int> packLen = new List<int>();
+        string pack = MapPack.Decode(b64, packLen);
+        Console.WriteLine("packlen=" + Convert.ToString(packLen[0]));
+        Console.WriteLine("pack=" + Program.Hex(pack, packLen[0]));
+
+        // Tile records: two synthetic cells plus an unused (0,0) padding slot,
+        // which must not become a tile.
+        string recHex = "0300040015000000020600"
+                      + "0400040016000000000600"
+                      + "0000000000000000000000";
+        List<int> recLen = new List<int>();
+        string rec = Program.FromHex(recHex, recLen);
+        IsoMap map = IsoMap.Parse(rec, recLen[0], 64, 64);
+        Console.WriteLine("tiles=" + Convert.ToString(map.Count()));
+        IsoTile t = map.At(3, 4);
+        Console.WriteLine("at34 tile=" + Convert.ToString(t.Tile())
+            + " sub=" + Convert.ToString(t.SubTile())
+            + " lvl=" + Convert.ToString(t.Level()));
+        Console.WriteLine("at44 tile=" + Convert.ToString(map.At(4, 4).Tile()));
+        Console.WriteLine("at34 clear=" + Convert.ToString(t.IsClear()));
+        Console.WriteLine("at00 null=" + Convert.ToString(map.At(0, 0) == null));
+        Console.WriteLine("oob null=" + Convert.ToString(map.At(99, 99) == null));
+        // A cell inside the grid that no record covers is empty, not tile 0 --
+        // the index stores slot+1 so that 0 can mean "nothing here".
+        Console.WriteLine("gap null=" + Convert.ToString(map.At(10, 10) == null));
+        Console.WriteLine("neg null=" + Convert.ToString(map.At(-1, 4) == null));
+    }
+}
