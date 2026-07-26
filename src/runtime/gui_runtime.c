@@ -1058,6 +1058,115 @@ EXPORT void *zan_gui_get_pixels(i64 surface_id) {
     return (void *)g_surfaces[surface_id]->pixels;
 }
 
+/* ========================================================================
+ * Sprite-sheet image blitter (stb_image, path-keyed FIFO cache)
+ * ======================================================================== */
+#define STB_IMAGE_IMPLEMENTATION
+#include "../../stdlib/SDL3/native/stb_image.h"
+
+#define ZAN_IMG_CACHE_CAP 16
+typedef struct {
+    char path[512];
+    u32 *pix;   /* ARGB32: (a<<24)|(r<<16)|(g<<8)|b */
+    int  w, h;
+} zan_img_t;
+static zan_img_t g_imgs[ZAN_IMG_CACHE_CAP];
+static int       g_img_n = 0;
+
+static zan_img_t *zan_img_find(const char *path) {
+    int i;
+    for (i = 0; i < g_img_n; i++)
+        if (strncmp(g_imgs[i].path, path, 511) == 0) return &g_imgs[i];
+    return NULL;
+}
+static zan_img_t *zan_img_load(const char *path) {
+    zan_img_t *e;
+    int i, w, h, n;
+    unsigned char *data;
+    u32 *pix;
+    if (!path || !path[0]) return NULL;
+    e = zan_img_find(path);
+    if (e) return e;
+    data = stbi_load(path, &w, &h, &n, 4);
+    if (!data) return NULL;
+    pix = (u32 *)malloc((size_t)w * h * sizeof(u32));
+    if (!pix) { stbi_image_free(data); return NULL; }
+    for (i = 0; i < w * h; i++) {
+        unsigned char r = data[i*4], g = data[i*4+1],
+                      b = data[i*4+2], a = data[i*4+3];
+        pix[i] = ((u32)a << 24) | ((u32)r << 16) | ((u32)g << 8) | b;
+    }
+    stbi_image_free(data);
+    if (g_img_n >= ZAN_IMG_CACHE_CAP) {
+        free(g_imgs[0].pix);
+        memmove(&g_imgs[0], &g_imgs[1], sizeof(zan_img_t) * (ZAN_IMG_CACHE_CAP - 1));
+        g_img_n = ZAN_IMG_CACHE_CAP - 1;
+    }
+    e = &g_imgs[g_img_n++];
+    strncpy(e->path, path, 511); e->path[511] = '\0';
+    e->pix = pix; e->w = w; e->h = h;
+    return e;
+}
+
+EXPORT i64 zan_gui_image_width(const char *path) {
+    zan_img_t *e = zan_img_load(path);
+    return e ? (i64)e->w : 0;
+}
+EXPORT i64 zan_gui_image_height(const char *path) {
+    zan_img_t *e = zan_img_load(path);
+    return e ? (i64)e->h : 0;
+}
+
+/* Evict cached pixels for a path (call after the source file changes). */
+EXPORT void zan_gui_image_evict(const char *path) {
+    int i;
+    if (!path) return;
+    for (i = 0; i < g_img_n; i++) {
+        if (strncmp(g_imgs[i].path, path, 511) == 0) {
+            free(g_imgs[i].pix);
+            memmove(&g_imgs[i], &g_imgs[i+1], sizeof(zan_img_t) * (g_img_n - i - 1));
+            g_img_n--;
+            return;
+        }
+    }
+}
+
+/* Blit a region of an image file onto a GUI surface (nearest-neighbour scale).
+ * sx/sy/sw/sh = source rect in the image (all zero = use the full image).
+ * dx/dy/dw/dh = destination rect on the surface. */
+EXPORT void zan_gui_blit_image(i64 surf_id, const char *path,
+    i64 dx, i64 dy, i64 dw, i64 dh,
+    i64 sx, i64 sy, i64 sw, i64 sh)
+{
+    zan_img_t *img;
+    zan_surface_t *s;
+    int isx, isy, isw, ish, idx2, idy, idw, idh, x0, y0, x1, y1, py, px;
+    if (surf_id < 0 || surf_id >= g_surface_count || !g_surfaces[surf_id]) return;
+    img = zan_img_load(path);
+    if (!img) return;
+    s = g_surfaces[surf_id];
+    isx = (int)sx; isy = (int)sy; isw = (int)sw; ish = (int)sh;
+    if (isw <= 0) { isx = 0; isw = img->w; }
+    if (ish <= 0) { isy = 0; ish = img->h; }
+    idx2 = (int)dx; idy = (int)dy; idw = (int)dw; idh = (int)dh;
+    if (idw <= 0) idw = isw;
+    if (idh <= 0) idh = ish;
+    x0 = idx2 > s->clip_x0 ? idx2 : s->clip_x0;
+    y0 = idy  > s->clip_y0 ? idy  : s->clip_y0;
+    x1 = idx2 + idw < s->clip_x1 ? idx2 + idw : s->clip_x1;
+    y1 = idy  + idh < s->clip_y1 ? idy  + idh : s->clip_y1;
+    for (py = y0; py < y1; py++) {
+        int sry = isy + (py - idy) * ish / idh;
+        if (sry < 0 || sry >= img->h) continue;
+        for (px = x0; px < x1; px++) {
+            int srx = isx + (px - idx2) * isw / idw;
+            if (srx < 0 || srx >= img->w) continue;
+            s->pixels[py * s->stride + px] =
+                blend_over(s->pixels[py * s->stride + px], img->pix[sry * img->w + srx]);
+        }
+    }
+}
+
 /* ---- gui_runtime translation-unit parts (order matters) ----------------
  * The GUI runtime is split by backend/concern into the files below; they
  * are plain #include'd here so shared statics and preprocessor context
