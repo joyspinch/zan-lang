@@ -282,6 +282,20 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
     return LLVMBuildCall2(b, ty, fn, args, n, nm);
 }
 
+/* Grow one of the IR registries to hold `need` entries. */
+static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
+    if (need <= *cap) return base;
+    int ncap = *cap ? *cap * 2 : 256;
+    while (ncap < need) ncap *= 2;
+    void *p = realloc(base, (size_t)ncap * elem);
+    if (!p) {
+        fprintf(stderr, "zanc: out of memory growing an IR registry\n");
+        exit(1);
+    }
+    *cap = ncap;
+    return p;
+}
+
 static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
                                     LLVMValueRef fn, LLVMTypeRef fn_type) {
     if (g->function_count >= g->function_cap) {
@@ -1343,6 +1357,15 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->functions = NULL;
     g->function_count = 0;
     g->function_cap = 0;
+    free(g->struct_types);
+    g->struct_types = NULL;
+    g->struct_type_count = g->struct_type_cap = 0;
+    free(g->class_release);
+    g->class_release = NULL;
+    g->class_release_count = g->class_release_cap = 0;
+    free(g->ctors);
+    g->ctors = NULL;
+    g->ctor_count = g->ctor_cap = 0;
     free(g->generic_fns);
     g->generic_fns = NULL;
     g->generic_fn_count = g->generic_fn_cap = 0;
@@ -1589,8 +1612,10 @@ static zan_symbol_t *resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name
 }
 
 static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
-    if (g->struct_type_count >= 256) return;
     if (get_struct_llvm_type(g, sym)) return;
+    g->struct_types = irgen_grow(g->struct_types, &g->struct_type_cap,
+                                 g->struct_type_count + 1,
+                                 sizeof(*g->struct_types));
 
     /* Create and register the named struct *before* resolving field types,
      * so that a self- or mutually-referential class field (a pointer to this

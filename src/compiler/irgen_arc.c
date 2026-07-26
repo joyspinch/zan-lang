@@ -91,9 +91,11 @@ static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym) {
     if (!sym) return NULL;
     for (int i = 0; i < g->class_release_count; i++)
         if (g->class_release[i].sym == sym) return g->class_release[i].fn;
-    if (g->class_release_count >= 256) return NULL;
     /* only classes with a registered struct layout can be walked */
     if (!get_struct_llvm_type(g, sym)) return NULL;
+    g->class_release = irgen_grow(g->class_release, &g->class_release_cap,
+                                  g->class_release_count + 1,
+                                  sizeof(*g->class_release));
     char name[320];
     snprintf(name, sizeof(name), "__zan_release_%.*s_%d",
              (int)sym->name.len, sym->name.str, g->class_release_count);

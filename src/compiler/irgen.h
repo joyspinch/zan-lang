@@ -55,21 +55,24 @@ struct zan_irgen {
     LLVMValueRef fn_strcpy;
     LLVMValueRef fn_strcat;
 
-    /* struct type registry */
-    struct {
+    /* struct type registry (grown on demand: a class whose layout does not fit
+     * would silently lower to a non-pointer and fail LLVM verification) */
+    struct zan_struct_type_entry {
         zan_symbol_t *sym;
         LLVMTypeRef llvm_type;
-    } struct_types[256];
+    } *struct_types;
     int struct_type_count;
+    int struct_type_cap;
 
     /* per-class ARC release functions: __zan_release_<T>(i8*) releases the
      * object's RC-managed fields when its refcount reaches zero, then frees it
      * via zan_rt_release. Built lazily and cached by class symbol. */
-    struct {
+    struct zan_class_release_entry {
         zan_symbol_t *sym;
         LLVMValueRef  fn;
-    } class_release[256];
+    } *class_release;
     int class_release_count;
+    int class_release_cap;
 
     /* user-defined functions (dynamically grown) */
     struct zan_fn_entry {
@@ -88,13 +91,14 @@ struct zan_irgen {
     int loop_locals_base;
 
     /* constructors */
-    struct {
+    struct zan_ctor_entry {
         zan_symbol_t *type_sym;
         LLVMValueRef fn;
         LLVMTypeRef fn_type;
         int param_count;
-    } ctors[256];
+    } *ctors;
     int ctor_count;
+    int ctor_cap;
 
     /* generic monomorphization: specialized copies of a user generic class's
      * methods/constructors, one per concrete instantiation (e.g. HashSet<string>).

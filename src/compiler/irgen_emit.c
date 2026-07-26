@@ -528,7 +528,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     add_generic_ctor(g, type_sym, cur_variant->type_args,
                                      cur_variant->type_arg_count, param_count,
                                      fn, fn_type);
-                } else if (g->ctor_count < 256) {
+                } else {
+                    g->ctors = irgen_grow(g->ctors, &g->ctor_cap,
+                                          g->ctor_count + 1,
+                                          sizeof(*g->ctors));
                     g->ctors[g->ctor_count].type_sym = type_sym;
                     g->ctors[g->ctor_count].fn = fn;
                     g->ctors[g->ctor_count].fn_type = fn_type;
