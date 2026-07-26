@@ -69,6 +69,73 @@ partial class DataTable {
         return v;
     }
 
+    // ---- real (fixed-decimal) numeric support ----
+    // Cells stay strings on the wire, but numeric columns with `decimals > 0`
+    // are parsed to double for sorting / aggregating / conditional formatting
+    // and re-rendered at a fixed scale, so 1.5 and 1.9 no longer compare equal
+    // and totals keep their fractional part.
+
+    static double Pow10(int n) {
+        double p = 1.0;
+        int i = 0;
+        while (i < n) { p = p * 10.0; i = i + 1; }
+        return p;
+    }
+
+    /// Loose real parse: optional leading '-', decimal digits and at most one
+    /// '.'; thousands separators, currency symbols and unit suffixes are
+    /// skipped, so "¥1,234.56" and "-98%" both read correctly. "" reads as 0.
+    static double ParseReal(string s) {
+        int n = s.Length;
+        int i = 0;
+        bool neg = false;
+        if (i < n && (int)s[i] == 45) { neg = true; i = i + 1; }
+        double v = 0.0;
+        bool seenDot = false;
+        double scale = 1.0;
+        while (i < n) {
+            int c = (int)s[i];
+            if (c >= 48 && c <= 57) {
+                if (seenDot) { scale = scale * 10.0; v = v + (double)(c - 48) / scale; }
+                else { v = v * 10.0 + (double)(c - 48); }
+            } else if (c == 46 && !seenDot) {
+                seenDot = true;
+            }
+            i = i + 1;
+        }
+        if (neg) { return 0.0 - v; }
+        return v;
+    }
+
+    // Left-pad a fractional part to `decimals` digits ("5" at 2 -> "05").
+    static string PadFrac(int fp, int decimals) {
+        string fs = Convert.ToString(fp);
+        while (fs.Length < decimals) { fs = "0" + fs; }
+        return fs;
+    }
+
+    /// Render a double with exactly `decimals` fractional digits (half-up).
+    /// `Convert.ToString(double)` only carries ~6 significant digits, so the
+    /// grid never routes cell values through it.
+    static string FormatReal(double v, int decimals) {
+        bool neg = v < 0.0;
+        double a = v;
+        if (neg) { a = 0.0 - a; }
+        if (decimals <= 0) {
+            int r = (int)(a + 0.5);
+            string s0 = Convert.ToString(r);
+            if (neg && r != 0) { s0 = "-" + s0; }
+            return s0;
+        }
+        int iscale = (int)DataTable.Pow10(decimals);
+        int total = (int)(a * (double)iscale + 0.5);
+        int ip = total / iscale;
+        int fp = total - ip * iscale;
+        string s = Convert.ToString(ip) + "." + DataTable.PadFrac(fp, decimals);
+        if (neg && total != 0) { s = "-" + s; }
+        return s;
+    }
+
     // Insert thousands separators into a run of digits. Left untouched if the
     // string contains any non-digit (so it never mangles a non-numeric cell).
     static string GroupDigits(string ipart) {
@@ -98,6 +165,11 @@ partial class DataTable {
     static string FormatCell(DataColumn col, string raw) {
         if (col.fmt == 0) { return raw; }
         if (raw.Length == 0) { return raw; }
+        // Fixed-decimal columns re-render from the parsed value so every cell
+        // shows the same scale ("5" -> "5.00") regardless of how it was typed.
+        if (col.decimals > 0) {
+            raw = DataTable.FormatReal(DataTable.ParseReal(raw), col.decimals);
+        }
         string sign = "";
         string body = raw;
         if ((int)raw[0] == 45) { sign = "-"; body = raw.Substring(1); }
@@ -227,16 +299,11 @@ partial class DataTable {
         return DataTable.ContainsCI(v, q);
     }
 
-    // Build a one-character string from an ASCII code (printable range only).
-    static string CharStr(int code) {
-        if (code < 32 || code > 126) { return ""; }
-        string tbl = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
-        return tbl.Substring(code - 32, 1);
-    }
-
+    // Remove the last character (not the last byte) so multi-byte characters
+    // are deleted whole.
     static string Backspace(string s) {
-        if (s.Length <= 1) { return ""; }
-        return s.Substring(0, s.Length - 1);
+        if (s.Length == 0) { return ""; }
+        return Text.Left(s, Text.PrevCharStart(s, s.Length));
     }
 
     // Whether a single cell value survives every stage of the column filter.
@@ -273,6 +340,20 @@ partial class DataTable {
             return 0;
         }
         return DataTable.CompareStr(a, b);
+    }
+
+    // Column-aware cell comparison: fractional columns compare as doubles so
+    // 1.5 and 1.9 no longer tie, integer columns keep the exact int path, and
+    // everything else compares as text.
+    static int CompareCellCol(DataColumn col, string a, string b) {
+        if (col.numeric && col.decimals > 0) {
+            double da = DataTable.ParseReal(a);
+            double db = DataTable.ParseReal(b);
+            if (da < db) { return -1; }
+            if (da > db) { return 1; }
+            return 0;
+        }
+        return DataTable.CompareCell(a, b, col.numeric);
     }
 
     static string Truncate(string text, int fontSize, int maxW) {
@@ -612,6 +693,22 @@ partial class DataTable {
         return a;
     }
 
+    // Real counterpart of DeriveValue: percent and ratio keep their fraction
+    // instead of truncating to an int.
+    static double DeriveReal(DataColumn col, List<double> agg) {
+        double a = 0.0;
+        double b = 0.0;
+        if (col.deriveA >= 0 && col.deriveA < agg.Count) { a = agg[col.deriveA]; }
+        if (col.deriveB >= 0 && col.deriveB < agg.Count) { b = agg[col.deriveB]; }
+        int op = col.deriveOp;
+        if (op == 0) { if (b != 0.0) { return a * 100.0 / b; } return 0.0; }
+        if (op == 1) { if (b != 0.0) { return a / b; } return 0.0; }
+        if (op == 2) { return a - b; }
+        if (op == 3) { return a + b; }
+        if (op == 4) { return a * b; }
+        return a;
+    }
+
     // ---------- row grouping ----------
     static bool IsGrouped(DataTableState st) { return st.groupCols.Count > 0; }
     static int GroupCount(DataTableState st) { return st.groupCols.Count; }
@@ -656,7 +753,7 @@ partial class DataTable {
     // `level` — the concatenation of its group-column values down to that level,
     // joined by a control separator so distinct paths never collide.
     static string PathKey(DataTableState st, DataSource src, int rowIdx, int level) {
-        string sep = DataTable.CharStr(31);
+        string sep = Text.ByteChar(31);
         string k = "";
         int g = 0;
         while (g <= level && g < st.groupCols.Count) {
@@ -672,9 +769,10 @@ partial class DataTable {
         int g = 0;
         while (g < st.groupCols.Count) {
             int gc = st.groupCols[g];
-            bool num = false;
-            if (gc >= 0 && gc < cols.Count) { num = cols[gc].numeric; }
-            int cmp = DataTable.CompareCell(src.CellText(ra, gc), src.CellText(rb, gc), num);
+            int cmp = DataTable.CompareStr(src.CellText(ra, gc), src.CellText(rb, gc));
+            if (gc >= 0 && gc < cols.Count) {
+                cmp = DataTable.CompareCellCol(cols[gc], src.CellText(ra, gc), src.CellText(rb, gc));
+            }
             if (cmp != 0) { return cmp; }
             g = g + 1;
         }
@@ -736,27 +834,35 @@ partial class DataTable {
             int m = 0;
             if (col < st.aggMode.Count) { m = st.aggMode[col]; }
             if (m == 0 || m == 6) { col = col + 1; continue; }
-            int s = 0;
-            int mn = 0;
-            int mx = 0;
+            int dec = cols[col].decimals;
+            double s = 0.0;
+            double mn = 0.0;
+            double mx = 0.0;
             int cnt2 = 0;
             int k = lo;
             while (k < hi && k < st.order.Count) {
-                int v = src.CellNum(st.order[k], col);
+                double v = 0.0;
+                if (dec > 0) { v = src.CellReal(st.order[k], col); }
+                else { v = (double)src.CellNum(st.order[k], col); }
                 if (cnt2 == 0) { mn = v; mx = v; }
                 else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
                 s = s + v;
                 cnt2 = cnt2 + 1;
                 k = k + 1;
             }
-            int av = 0;
+            double av = 0.0;
             if (m == 1) { av = s; }
-            else if (m == 2) { if (cnt2 > 0) { av = s / cnt2; } }
+            else if (m == 2) { if (cnt2 > 0) { av = s / (double)cnt2; } }
             else if (m == 3) { av = mn; }
             else if (m == 4) { av = mx; }
-            else if (m == 5) { av = cnt2; }
-            grp.aggValues[col] = av;
-            grp.aggTexts[col] = DataTable.FormatCell(cols[col], Convert.ToString(av));
+            else if (m == 5) { av = (double)cnt2; }
+            grp.aggValues[col] = (int)av;
+            // Averages keep a fraction even on integer columns (DevExpress does
+            // the same), so a whole-number column still reads e.g. "3.5".
+            int showDec = dec;
+            if (m == 2 && showDec == 0) { showDec = 2; }
+            if (m == 5) { showDec = 0; }
+            grp.aggTexts[col] = DataTable.FormatCell(cols[col], DataTable.FormatReal(av, showDec));
             col = col + 1;
         }
     }
@@ -846,15 +952,15 @@ partial class DataTable {
         int n = st.order.Count;
 
         // per-column accumulators + the compact set of columns that need a scan
-        List<int> sumV = new List<int>();
-        List<int> minV = new List<int>();
-        List<int> maxV = new List<int>();
+        List<double> sumV = new List<double>();
+        List<double> minV = new List<double>();
+        List<double> maxV = new List<double>();
         List<int> baseCols = new List<int>();
         int col = 0;
         while (col < nc) {
-            sumV.Add(0);
-            minV.Add(0);
-            maxV.Add(0);
+            sumV.Add(0.0);
+            minV.Add(0.0);
+            maxV.Add(0.0);
             int m = st.aggMode[col];
             if (m >= 1 && m <= 4) { baseCols.Add(col); }
             col = col + 1;
@@ -870,12 +976,15 @@ partial class DataTable {
         int bi = 0;
         while (bi < baseCols.Count) {
             int bc = baseCols[bi];
-            int s = 0;
-            int mn = 0;
-            int mx = 0;
+            bool realCol = cols[bc].decimals > 0;
+            double s = 0.0;
+            double mn = 0.0;
+            double mx = 0.0;
             int k = 0;
             while (k < n) {
-                int v = src.CellNum(st.order[k], bc);
+                double v = 0.0;
+                if (realCol) { v = src.CellReal(st.order[k], bc); }
+                else { v = (double)src.CellNum(st.order[k], bc); }
                 s = s + v;
                 if (k == 0) { mn = v; mx = v; }
                 else {
@@ -891,23 +1000,30 @@ partial class DataTable {
         }
 
         // resolve each column's raw aggregate value (base first, then derived so
-        // derived columns read finished aggregates)
+        // derived columns read finished aggregates). aggReal carries the exact
+        // value; aggValue keeps its historical int form for DeriveValue and any
+        // caller that reads it.
         st.aggValue.Clear();
+        st.aggReal.Clear();
         col = 0;
-        while (col < nc) { st.aggValue.Add(0); col = col + 1; }
+        while (col < nc) { st.aggValue.Add(0); st.aggReal.Add(0.0); col = col + 1; }
         col = 0;
         while (col < nc) {
             int m = st.aggMode[col];
-            if (m == 1) { st.aggValue[col] = sumV[col]; }
-            else if (m == 2) { if (n > 0) { st.aggValue[col] = sumV[col] / n; } }
-            else if (m == 3) { st.aggValue[col] = minV[col]; }
-            else if (m == 4) { st.aggValue[col] = maxV[col]; }
-            else if (m == 5) { st.aggValue[col] = n; }
+            if (m == 1) { st.aggReal[col] = sumV[col]; }
+            else if (m == 2) { if (n > 0) { st.aggReal[col] = sumV[col] / (double)n; } }
+            else if (m == 3) { st.aggReal[col] = minV[col]; }
+            else if (m == 4) { st.aggReal[col] = maxV[col]; }
+            else if (m == 5) { st.aggReal[col] = (double)n; }
+            st.aggValue[col] = (int)st.aggReal[col];
             col = col + 1;
         }
         col = 0;
         while (col < nc) {
-            if (st.aggMode[col] == 6) { st.aggValue[col] = DataTable.DeriveValue(cols[col], st.aggValue); }
+            if (st.aggMode[col] == 6) {
+                st.aggValue[col] = DataTable.DeriveValue(cols[col], st.aggValue);
+                st.aggReal[col] = DataTable.DeriveReal(cols[col], st.aggReal);
+            }
             col = col + 1;
         }
 
@@ -916,15 +1032,24 @@ partial class DataTable {
         col = 0;
         while (col < nc) {
             int m = st.aggMode[col];
+            int dec = cols[col].decimals;
+            // Averages always carry a fraction, even on integer columns.
+            int showDec = dec;
+            if (m == 2 && showDec == 0) { showDec = 2; }
+            string val = DataTable.FormatCell(cols[col], DataTable.FormatReal(st.aggReal[col], showDec));
             string txt = "";
-            if (m == 1) { txt = "Σ " + DataTable.FormatCell(cols[col], Convert.ToString(st.aggValue[col])); }
-            else if (m == 2) { txt = "avg " + DataTable.FormatCell(cols[col], Convert.ToString(st.aggValue[col])); }
-            else if (m == 3) { txt = "min " + DataTable.FormatCell(cols[col], Convert.ToString(st.aggValue[col])); }
-            else if (m == 4) { txt = "max " + DataTable.FormatCell(cols[col], Convert.ToString(st.aggValue[col])); }
+            if (m == 1) { txt = "Σ " + val; }
+            else if (m == 2) { txt = "avg " + val; }
+            else if (m == 3) { txt = "min " + val; }
+            else if (m == 4) { txt = "max " + val; }
             else if (m == 5) { txt = "n " + Convert.ToString(n); }
             else if (m == 6) {
-                if (cols[col].deriveOp == 0) { txt = Convert.ToString(st.aggValue[col]) + "%"; }
-                else { txt = Convert.ToString(st.aggValue[col]); }
+                int ddec = dec;
+                if (cols[col].deriveOp == 0 || cols[col].deriveOp == 1) {
+                    if (ddec == 0) { ddec = 2; }
+                }
+                txt = DataTable.FormatReal(st.aggReal[col], ddec);
+                if (cols[col].deriveOp == 0) { txt = txt + "%"; }
             }
             st.summaryText.Add(txt);
             col = col + 1;
@@ -936,22 +1061,29 @@ partial class DataTable {
     static void ComputeColStats(DataTableState st, List<DataColumn> cols, DataSource src) {
         st.cfMin.Clear();
         st.cfMax.Clear();
+        st.cfMinR.Clear();
+        st.cfMaxR.Clear();
         int n = st.order.Count;
         int col = 0;
         while (col < cols.Count) {
-            int mn = 0;
-            int mx = 0;
+            double mn = 0.0;
+            double mx = 0.0;
             if (cols[col].cfMode == 1 || cols[col].cfMode == 2) {
+                bool realCol = cols[col].decimals > 0;
                 int k = 0;
                 while (k < n) {
-                    int v = src.CellNum(st.order[k], col);
+                    double v = 0.0;
+                    if (realCol) { v = src.CellReal(st.order[k], col); }
+                    else { v = (double)src.CellNum(st.order[k], col); }
                     if (k == 0) { mn = v; mx = v; }
                     else { if (v < mn) { mn = v; } if (v > mx) { mx = v; } }
                     k = k + 1;
                 }
             }
-            st.cfMin.Add(mn);
-            st.cfMax.Add(mx);
+            st.cfMinR.Add(mn);
+            st.cfMaxR.Add(mx);
+            st.cfMin.Add((int)mn);
+            st.cfMax.Add((int)mx);
             col = col + 1;
         }
     }
@@ -993,47 +1125,61 @@ partial class DataTable {
     // so a comparison is a plain int/string compare instead of re-fetching the
     // cell and re-parsing it on every one of the ~n*log2(n) comparisons.
 
-    static void MergeKeyed(bool numeric, int dir,
-                           List<int> order, List<int> nkey, List<string> skey,
+    // `kind` selects the decorated key array: 0 string, 1 int, 2 real.
+    static void MergeKeyed(int kind, int dir,
+                           List<int> order, List<int> nkey, List<string> skey, List<double> rkey,
                            int lo, int mid, int hi,
-                           List<int> otmp, List<int> ntmp, List<string> stmp) {
+                           List<int> otmp, List<int> ntmp, List<string> stmp, List<double> rtmp) {
         int i = lo;
         int j = mid;
         int k = lo;
         while (i < mid && j < hi) {
             int cmp = 0;
-            if (numeric) {
+            if (kind == 1) {
                 if (nkey[i] < nkey[j]) { cmp = -1; }
                 else if (nkey[i] > nkey[j]) { cmp = 1; }
+            } else if (kind == 2) {
+                if (rkey[i] < rkey[j]) { cmp = -1; }
+                else if (rkey[i] > rkey[j]) { cmp = 1; }
             } else {
                 cmp = DataTable.CompareStr(skey[i], skey[j]);
             }
             if (dir == 2) { cmp = 0 - cmp; }
             if (cmp <= 0) {
                 otmp[k] = order[i];
-                if (numeric) { ntmp[k] = nkey[i]; } else { stmp[k] = skey[i]; }
+                if (kind == 1) { ntmp[k] = nkey[i]; }
+                else if (kind == 2) { rtmp[k] = rkey[i]; }
+                else { stmp[k] = skey[i]; }
                 i = i + 1;
             } else {
                 otmp[k] = order[j];
-                if (numeric) { ntmp[k] = nkey[j]; } else { stmp[k] = skey[j]; }
+                if (kind == 1) { ntmp[k] = nkey[j]; }
+                else if (kind == 2) { rtmp[k] = rkey[j]; }
+                else { stmp[k] = skey[j]; }
                 j = j + 1;
             }
             k = k + 1;
         }
         while (i < mid) {
             otmp[k] = order[i];
-            if (numeric) { ntmp[k] = nkey[i]; } else { stmp[k] = skey[i]; }
+            if (kind == 1) { ntmp[k] = nkey[i]; }
+            else if (kind == 2) { rtmp[k] = rkey[i]; }
+            else { stmp[k] = skey[i]; }
             i = i + 1; k = k + 1;
         }
         while (j < hi) {
             otmp[k] = order[j];
-            if (numeric) { ntmp[k] = nkey[j]; } else { stmp[k] = skey[j]; }
+            if (kind == 1) { ntmp[k] = nkey[j]; }
+            else if (kind == 2) { rtmp[k] = rkey[j]; }
+            else { stmp[k] = skey[j]; }
             j = j + 1; k = k + 1;
         }
         k = lo;
         while (k < hi) {
             order[k] = otmp[k];
-            if (numeric) { nkey[k] = ntmp[k]; } else { skey[k] = stmp[k]; }
+            if (kind == 1) { nkey[k] = ntmp[k]; }
+            else if (kind == 2) { rkey[k] = rtmp[k]; }
+            else { skey[k] = stmp[k]; }
             k = k + 1;
         }
     }
@@ -1103,7 +1249,7 @@ partial class DataTable {
         foreach (SortKey sk in st.sortKeys) {
             int sc = sk.col;
             if (sc >= 0 && sc < cols.Count) {
-                int cmp = DataTable.CompareCell(src.CellText(ra, sc), src.CellText(rb, sc), cols[sc].numeric);
+                int cmp = DataTable.CompareCellCol(cols[sc], src.CellText(ra, sc), src.CellText(rb, sc));
                 if (sk.dir == 2) { cmp = 0 - cmp; }
                 if (cmp != 0) { return cmp; }
             }
@@ -1154,18 +1300,22 @@ partial class DataTable {
     static void SortOrder(DataTableState st, List<DataColumn> cols, DataSource src) {
         int n = st.order.Count;
         if (n < 2) { return; }
-        bool numeric = cols[st.sortCol].numeric;
         int dir = st.sortDir;
         int sc = st.sortCol;
+        // key kind: 0 string, 1 int, 2 real (fractional numeric column)
+        int kind = 0;
+        if (cols[sc].numeric) { if (cols[sc].decimals > 0) { kind = 2; } else { kind = 1; } }
 
         // decorate: pull the sort key for each visible row once (O(n)), so a
-        // comparison is a plain int/string compare rather than a per-compare
-        // CellNum/CellText call.
+        // comparison is a plain int/double/string compare rather than a
+        // per-compare CellNum/CellReal/CellText call.
         List<int> nkey = new List<int>();
         List<string> skey = new List<string>();
+        List<double> rkey = new List<double>();
         int q = 0;
         while (q < n) {
-            if (numeric) { nkey.Add(src.CellNum(st.order[q], sc)); }
+            if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
+            else if (kind == 2) { rkey.Add(src.CellReal(st.order[q], sc)); }
             else { skey.Add(src.CellText(st.order[q], sc)); }
             q = q + 1;
         }
@@ -1173,10 +1323,13 @@ partial class DataTable {
         List<int> otmp = new List<int>();
         List<int> ntmp = new List<int>();
         List<string> stmp = new List<string>();
+        List<double> rtmp = new List<double>();
         int p = 0;
         while (p < n) {
             otmp.Add(0);
-            if (numeric) { ntmp.Add(0); } else { stmp.Add(""); }
+            if (kind == 1) { ntmp.Add(0); }
+            else if (kind == 2) { rtmp.Add(0.0); }
+            else { stmp.Add(""); }
             p = p + 1;
         }
 
@@ -1188,7 +1341,7 @@ partial class DataTable {
                 if (mid > n) { mid = n; }
                 int hi = lo + width * 2;
                 if (hi > n) { hi = n; }
-                if (mid < hi) { DataTable.MergeKeyed(numeric, dir, st.order, nkey, skey, lo, mid, hi, otmp, ntmp, stmp); }
+                if (mid < hi) { DataTable.MergeKeyed(kind, dir, st.order, nkey, skey, rkey, lo, mid, hi, otmp, ntmp, stmp, rtmp); }
                 lo = lo + width * 2;
             }
             width = width * 2;

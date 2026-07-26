@@ -39,6 +39,12 @@ class DataColumn {
     string prefix; // leading text, e.g. a currency symbol
     string suffix; // trailing text, e.g. "%"
 
+    // Fractional digits for a numeric column. 0 keeps the historical integer
+    // path (sort/aggregate via CellNum); > 0 switches the column to the real
+    // path: values are parsed as double, compared and totalled without losing
+    // the fraction, and rendered at exactly this many decimal places.
+    int decimals;
+
     // ---- editing ----
     bool editable; // cell values can be edited inline (opt-in)
 
@@ -69,6 +75,7 @@ class DataColumn {
         col.grouped = false;
         col.prefix = "";
         col.suffix = "";
+        col.decimals = 0;
         col.editable = false;
         col.pinned = false;
         return col;
@@ -87,9 +94,27 @@ class DataColumn {
     }
 
     // ---- display-format configurators (compose onto any column) ----
+    /// Fractional digits for a numeric column: switches sorting, aggregation
+    /// and conditional formatting onto the real (double) path and renders at
+    /// exactly `n` decimal places. `Decimals(c, 0)` restores the integer path.
+    static DataColumn Decimals(DataColumn c, int n) {
+        if (n < 0) { n = 0; }
+        c.decimals = n; c.numeric = true; c.align = 2;
+        if (n > 0) { c.fmt = 1; }
+        return c;
+    }
+
+    /// A fractional numeric column, e.g. `DataColumn.Real("Rate", 90, 2)`.
+    static DataColumn Real(string title, int width, int decimals) {
+        return DataColumn.Decimals(DataColumn.Create(title, width), decimals);
+    }
+
     /// Currency: thousands-grouped digits with a leading symbol, right-aligned.
+    /// Defaults to 2 decimal places; use `Decimals` afterwards to override.
     static DataColumn Money(DataColumn c, string symbol) {
-        c.fmt = 1; c.grouped = true; c.prefix = symbol; c.numeric = true; c.align = 2; return c;
+        c.fmt = 1; c.grouped = true; c.prefix = symbol; c.numeric = true; c.align = 2;
+        if (c.decimals == 0) { c.decimals = 2; }
+        return c;
     }
     /// Percent: appends "%", right-aligned.
     static DataColumn Percent(DataColumn c) {
@@ -369,12 +394,17 @@ class DataTableState {
     bool showSummary;
     List<int> aggMode;         // per column: 0 none,1 sum,2 avg,3 min,4 max,5 count,6 derived
     List<int> aggValue;        // cached raw aggregate value per column (feeds derived columns)
+    List<double> aggReal;      // exact aggregate per column (fractional columns / averages)
     List<string> summaryText;  // cached formatted aggregate per column
 
     // ---- conditional formatting: per-column min/max over the filtered set,
     // cached so data-bar / color-scale cells normalise without a per-frame scan ----
     List<int> cfMin;
     List<int> cfMax;
+    // Same range as cfMin/cfMax but exact, so data bars and colour scales on
+    // fractional columns normalise without collapsing to integer buckets.
+    List<double> cfMinR;
+    List<double> cfMaxR;
 
     // ---- pagination ----
     bool paged;
@@ -504,9 +534,12 @@ class DataTableState {
         s.showSummary = false;
         s.aggMode = new List<int>();
         s.aggValue = new List<int>();
+        s.aggReal = new List<double>();
         s.summaryText = new List<string>();
         s.cfMin = new List<int>();
         s.cfMax = new List<int>();
+        s.cfMinR = new List<double>();
+        s.cfMaxR = new List<double>();
         s.paged = false;
         s.pageModel = SignalInt.Create(1);
         s.pageRows = 0;
@@ -605,6 +638,13 @@ class DataSource {
     /// Numeric key for a cell, used for sorting/aggregating numeric columns.
     /// Return 0 for non-numeric columns.
     virtual int CellNum(int row, int col) { return 0; }
+
+    /// Fractional key for a cell, used by columns declared with `decimals > 0`.
+    /// The default parses CellText, so existing sources gain decimal support
+    /// for free; override it when the backing store already holds doubles.
+    virtual double CellReal(int row, int col) {
+        return DataTable.ParseReal(this.CellText(row, col));
+    }
 
     /// Write a cell value back into the underlying data (inline editing).
     /// Read-only sources ignore the write.

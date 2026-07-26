@@ -1,0 +1,76 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableTest;
+
+/// Headless verification of DataTable's fractional-number pipeline: loose
+/// ParseReal, half-up FormatReal, decimal-aware cell compare/format, and a
+/// full sort + footer-aggregate pass where fractions must survive (a sum keeps
+/// its cents, an average is not truncated to an int).
+class Program {
+    static DataRow Row(string a, string b, string c) {
+        DataRow r = DataRow.Create();
+        r.Push(a);
+        r.Push(b);
+        r.Push(c);
+        return r;
+    }
+
+    static void Main() {
+        // ---- ParseReal accepts separators / currency / sign; FormatReal is half-up ----
+        Console.WriteLine(DataTable.FormatReal(DataTable.ParseReal("1234.5678"), 4));
+        Console.WriteLine(DataTable.FormatReal(DataTable.ParseReal("$1,234.50"), 2));
+        Console.WriteLine(DataTable.FormatReal(DataTable.ParseReal("-0.75"), 2));
+        Console.WriteLine(DataTable.FormatReal(2.345, 2));
+        Console.WriteLine(DataTable.FormatReal(7.6, 0));
+
+        // ---- a decimals>0 column compares by value, so 1.5 and 1.9 no longer tie ----
+        DataColumn rc = DataColumn.Real("v", 60, 2);
+        Console.WriteLine(DataTable.CompareCellCol(rc, "1.5", "1.9"));
+        Console.WriteLine(DataTable.CompareCellCol(rc, "1.9", "1.5"));
+        Console.WriteLine(DataTable.CompareCellCol(rc, "1.5", "1.50"));
+
+        // ---- FormatCell renders to the column's declared decimals ----
+        Console.WriteLine(DataTable.FormatCell(rc, "3.5"));
+        Console.WriteLine(DataTable.FormatCell(rc, "3.567"));
+
+        // ---- sort + aggregate through the grid pipeline ----
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Create("name", 80));
+        cols.Add(DataColumn.Sum(DataColumn.Real("val", 80, 2)));
+        cols.Add(DataColumn.Avg(DataColumn.Numeric("qty", 80)));
+
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Row("a", "1.9", "3"));
+        rows.Add(Row("b", "1.5", "4"));
+        rows.Add(Row("c", "10.25", "0"));
+
+        DataSource src = RowListSource.Create(rows);
+        DataTableState st = DataTableState.Create();
+        DataTable.EnsureInit(st, cols, src);
+
+        DataTable.SortBy(st, 1, 1);
+        st.dirty = true;
+        DataTable.Recompute(st, cols, src);
+        string seq = "";
+        foreach (int oi in st.order) { seq = seq + src.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        DataTable.SortBy(st, 1, 2);
+        st.dirty = true;
+        DataTable.Recompute(st, cols, src);
+        seq = "";
+        foreach (int oi in st.order) { seq = seq + src.CellText(oi, 0); }
+        Console.WriteLine(seq);
+
+        // sum keeps its cents; avg of 3+4+0 is 2.3333, not the truncated 2
+        DataTable.ComputeSummary(st, cols, src);
+        Console.WriteLine(DataTable.FormatReal(st.aggReal[1], 2));
+        Console.WriteLine(DataTable.FormatReal(st.aggReal[2], 4));
+        // The footer strings carry a non-ASCII sigma, so compare in-program and
+        // print the verdict — the golden file stays pure ASCII.
+        Console.WriteLine(st.summaryText[1] == Text.CharStr(931) + " 13.65");
+        Console.WriteLine(st.summaryText[2]);
+    }
+}
