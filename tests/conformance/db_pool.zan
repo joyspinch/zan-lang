@@ -1,0 +1,261 @@
+// Conformance: coroutine connection pool semantics (System.Data.DbPool),
+// exercised without any database server. A fake connector hands out fake
+// connections whose health can be flipped, so growth, reuse, the size cap,
+// coroutine parking/wakeup, eviction and close are all observable.
+using System;
+using System.Data;
+using System.Threading;
+
+class FakeConnection : IDbConnection {
+    int id;
+    bool alive;
+
+    FakeConnection(int id) {
+        this.id = id;
+        this.alive = true;
+    }
+
+    int Id() { return this.id; }
+
+    DbResult Query(string sql) {
+        DbResult r = DbResult.Create();
+        r.SetColumnCount(1);
+        r.AddColumnName("id");
+        List<string> row = new List<string>();
+        row.Add(Convert.ToString(this.id));
+        r.AddRow(row);
+        return r;
+    }
+
+    DbResult Query(string sql, DbParams prms) { return this.Query(sql); }
+    // "KILL" stands in for the server dropping the link, so a test can break a
+    // connection through the same interface the pool sees.
+    int Execute(string sql) {
+        if (sql == "KILL") {
+            this.alive = false;
+            return 0;
+        }
+        return 1;
+    }
+
+    int Execute(string sql, DbParams prms) { return this.Execute(sql); }
+    string ExecuteScalar(string sql) { return Convert.ToString(this.id); }
+    bool IsConnected() { return this.alive; }
+    void Close() { this.alive = false; }
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class FakeConnector : IDbConnector {
+    int opened;
+    bool failing;
+
+    FakeConnector(bool failing) {
+        this.opened = 0;
+        this.failing = failing;
+    }
+
+    static FakeConnector Create() { return new FakeConnector(false); }
+    static FakeConnector Failing() { return new FakeConnector(true); }
+
+    int Opened() { return this.opened; }
+
+    async IDbConnection ConnectAsync() {
+        // A real driver suspends here on the reactor; the delay stands in for
+        // that so the pool is exercised across a genuine suspend/resume.
+        await Task.Delay(1);
+        this.opened = this.opened + 1;
+        FakeConnection c = new FakeConnection(this.opened);
+        if (this.failing) {
+            c.Close();
+        }
+        return c;
+    }
+
+    int GetProvider() { return DbProvider.SQLite; }
+}
+
+class Check {
+    static int passed = 0;
+    static int failed = 0;
+
+    static void Eq(int got, int want, string what) {
+        if (got == want) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+                + ", want " + Convert.ToString(want));
+        }
+    }
+
+    static void EqStr(string got, string want, string what) {
+        if (got == want) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL " + what + ": got " + got + ", want " + want);
+        }
+    }
+
+    static void True(bool cond, string what) {
+        if (cond) {
+            Check.passed = Check.passed + 1;
+        } else {
+            Check.failed = Check.failed + 1;
+            Console.WriteLine("FAIL " + what);
+        }
+    }
+}
+
+class Program {
+    // Parked coroutine: blocks on a saturated pool until a connection comes
+    // back (or the pool closes, which hands it a null).
+    static async void Borrow(DbPool pool, List<string> log) {
+        IDbConnection c = await pool.AcquireAsync();
+        if (c == null) {
+            log.Add("closed");
+            return;
+        }
+        log.Add(c.ExecuteScalar("SELECT 1"));
+        pool.Release(c);
+    }
+
+    static async void Basics() {
+        FakeConnector f = FakeConnector.Create();
+        DbPool pool = DbPool.Create(f, 2);
+        Check.Eq(pool.MaxSize(), 2, "max size");
+        Check.Eq(pool.GetProvider(), DbProvider.SQLite, "provider passthrough");
+
+        IDbConnection a = await pool.AcquireAsync();
+        Check.Eq(f.Opened(), 1, "opened one connection");
+        Check.Eq(pool.LiveCount(), 1, "live after first acquire");
+        Check.Eq(pool.IdleCount(), 0, "nothing idle while checked out");
+
+        // A pooled connection is directly usable as an executor: no downcast.
+        DbResult r = a.Query("SELECT id");
+        Check.Eq(r.RowCount(), 1, "query through the interface");
+
+        pool.Release(a);
+        Check.Eq(pool.IdleCount(), 1, "released connection is pooled");
+        Check.Eq(pool.LiveCount(), 1, "release keeps the connection live");
+
+        IDbConnection b = await pool.AcquireAsync();
+        Check.Eq(f.Opened(), 1, "idle connection reused, none opened");
+        Check.EqStr(b.ExecuteScalar("x"), "1", "same connection handed back");
+        pool.Release(b);
+
+        pool.Close();
+        Check.True(pool.IsClosed(), "closed flag");
+        Check.Eq(pool.IdleCount(), 0, "close drains the free list");
+        Check.Eq(pool.LiveCount(), 0, "close drops the live count");
+        IDbConnection dead = await pool.AcquireAsync();
+        Check.True(dead == null, "acquire on a closed pool yields null");
+    }
+
+    static async void CapAndWait() {
+        FakeConnector f = FakeConnector.Create();
+        DbPool pool = DbPool.Create(f, 2);
+
+        IDbConnection a = await pool.AcquireAsync();
+        IDbConnection b = await pool.AcquireAsync();
+        Check.Eq(pool.LiveCount(), 2, "grew to the cap");
+
+        // A third acquirer cannot make progress until something is released.
+        List<string> log = new List<string>();
+        Task.Spawn(Program.Borrow(pool, log));
+        await Task.Delay(20);
+        Check.Eq(log.Count, 0, "waiter parked while saturated");
+        Check.Eq(pool.WaitingCount(), 1, "one coroutine waiting");
+        Check.Eq(f.Opened(), 2, "cap respected, no third connection opened");
+
+        pool.Release(a);
+        await Task.Delay(20);
+        Check.Eq(log.Count, 1, "waiter resumed on release");
+        Check.EqStr(log[0], "1", "waiter got the released connection");
+        Check.Eq(f.Opened(), 2, "still only two connections ever opened");
+        Check.Eq(pool.WaitingCount(), 0, "no waiters left");
+
+        pool.Release(b);
+        pool.Close();
+    }
+
+    static async void Eviction() {
+        FakeConnector f = FakeConnector.Create();
+        DbPool pool = DbPool.Create(f, 2);
+
+        IDbConnection a = await pool.AcquireAsync();
+        // Broken while checked out: dropped instead of pooled, and its slot is
+        // handed back so the pool can reopen.
+        a.Close();
+        pool.Release(a);
+        Check.Eq(pool.IdleCount(), 0, "broken connection not pooled");
+        Check.Eq(pool.LiveCount(), 0, "broken connection freed its slot");
+
+        IDbConnection b = await pool.AcquireAsync();
+        Check.Eq(f.Opened(), 2, "reopened after eviction");
+        Check.Eq(pool.LiveCount(), 1, "live count back to one");
+
+        // Died while idle (server restart / idle timeout): skipped on the next
+        // acquire and replaced rather than handed to the caller.
+        pool.Release(b);
+        b.Execute("KILL");
+        IDbConnection c = await pool.AcquireAsync();
+        Check.Eq(f.Opened(), 3, "dead idle connection replaced");
+        Check.True(c.IsConnected(), "acquired connection is healthy");
+        Check.Eq(pool.LiveCount(), 1, "dead idle connection did not leak a slot");
+        pool.Release(c);
+        pool.Close();
+    }
+
+    static async void FailedOpen() {
+        // Every open fails: the reserved slot must be given back, otherwise the
+        // pool would wedge at liveCount == maxSize with nothing to release.
+        DbPool pool = DbPool.Create(FakeConnector.Failing(), 1);
+        IDbConnection a = await pool.AcquireAsync();
+        Check.True(a != null, "failed open still returns the connection");
+        Check.True(!a.IsConnected(), "failed open is not connected");
+        Check.Eq(pool.LiveCount(), 0, "failed open released its slot");
+
+        IDbConnection b = await pool.AcquireAsync();
+        Check.True(!b.IsConnected(), "second attempt also reports failure");
+        Check.Eq(pool.LiveCount(), 0, "still no live connections");
+        pool.Close();
+    }
+
+    static async void CloseWakesWaiters() {
+        FakeConnector f = FakeConnector.Create();
+        DbPool pool = DbPool.Create(f, 1);
+        IDbConnection a = await pool.AcquireAsync();
+
+        List<string> log = new List<string>();
+        Task.Spawn(Program.Borrow(pool, log));
+        Task.Spawn(Program.Borrow(pool, log));
+        await Task.Delay(20);
+        Check.Eq(pool.WaitingCount(), 2, "two coroutines parked");
+
+        pool.Close();
+        await Task.Delay(20);
+        Check.Eq(log.Count, 2, "both waiters woke up");
+        Check.EqStr(log[0], "closed", "first waiter saw the closed pool");
+        Check.EqStr(log[1], "closed", "second waiter saw the closed pool");
+
+        // Releasing after close hands the connection back to the driver.
+        pool.Release(a);
+        Check.True(!a.IsConnected(), "checked-out connection closed on release");
+        Check.Eq(pool.LiveCount(), 0, "no live connections after close");
+    }
+
+    static async void RunAll() {
+        await Program.Basics();
+        await Program.CapAndWait();
+        await Program.Eviction();
+        await Program.FailedOpen();
+        await Program.CloseWakesWaiters();
+    }
+
+    static void Main() {
+        await Program.RunAll();
+        Console.WriteLine("pass: " + Convert.ToString(Check.passed));
+        Console.WriteLine("fail: " + Convert.ToString(Check.failed));
+    }
+}
