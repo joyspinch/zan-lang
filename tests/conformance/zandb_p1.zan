@@ -2,9 +2,9 @@ using System;
 using System.Data.ZanDb;
 using System.IO;
 
-// ZanDB P1: pager + LRU cache + WAL. Covers commit/reopen persistence,
-// freelist reuse, cache eviction correctness, WAL crash recovery (committed
-// transactions re-applied, uncommitted tails discarded).
+// ZanDB P1: the MVCC pager -- copy-on-write pages, the two alternating meta
+// pages that make a commit atomic without a redo log, transaction rollback,
+// free-page reclamation and reuse, and the LRU page cache.
 class Program {
     static int pass = 0;
     static int fail = 0;
@@ -21,135 +21,160 @@ class Program {
         pg.SetLength(4096);
     }
 
+    static bool PageIs(ByteBuffer pg, int stamp, string tag) {
+        pg.SeekRead(0);
+        return pg.ReadU32() == stamp && pg.ReadString() == tag;
+    }
+
     static void Main() {
         string path = "zandb_p1.tmp.db";
         File.Delete(path);
-        File.Delete(path + "-wal");
+        File.Delete(path + "-lock");
 
-        // 1. Create, write pages, commit, close, reopen.
+        // 1. A fresh file is two meta pages at transaction 1; a write
+        //    transaction allocates pages beyond them and commits as one unit.
         Pager p = Pager.Open(path, 8);
-        Check("open", p.IsOpen());
+        Check("open", p.IsOpen() && p.PageCount() == 2 && p.CommitId() == 1);
+        Check("begin-write", p.BeginWrite() && p.InWrite());
         int a = p.AllocPage();
         int b = p.AllocPage();
         int c = p.AllocPage();
-        Check("alloc-ids", a == 1 && b == 2 && c == 3);
+        Check("alloc-ids", a == 2 && b == 3 && c == 4);
+        Check("alloc-is-fresh", p.IsFresh(a) && p.IsFresh(b) && !p.IsFresh(1));
         FillPage(p.GetPage(a), 111, "alpha");
-        p.MarkDirty(a);
         FillPage(p.GetPage(b), 222, "beta");
-        p.MarkDirty(b);
         FillPage(p.GetPage(c), 333, "gamma");
-        p.MarkDirty(c);
-        Check("commit", p.Commit());
+        p.SetRoot(a);
+        Check("commit", p.Commit() && !p.InWrite());
         int cid = p.CommitId();
+        Check("commit-id-advanced", cid == 2);
         p.Close();
 
+        // 2. Everything the transaction wrote is on disk, root included.
         Pager p2 = Pager.Open(path, 8);
-        Check("reopen", p2.IsOpen() && p2.PageCount() == 4 && p2.CommitId() == cid);
-        ByteBuffer pg = p2.GetPage(b);
-        pg.SeekRead(0);
-        Check("persisted", pg.ReadU32() == 222 && pg.ReadString() == "beta");
+        Check("reopen", p2.IsOpen() && p2.PageCount() == 5
+            && p2.CommitId() == cid && p2.RootId() == a);
+        Check("persisted", PageIs(p2.GetPage(b), 222, "beta"));
 
-        // 2. Freelist reuse.
-        p2.FreePage(b);
-        p2.Commit();
+        // 3. Copy-on-write: a page of the committed snapshot is never modified
+        //    in place. The writer gets a copy, the original stays readable for
+        //    snapshots still pointing at it, and it is only queued for reuse.
+        p2.BeginWrite();
+        int nb = p2.PageForWrite(b);
+        Check("cow-new-page", nb != b && p2.IsFresh(nb) && !p2.IsFresh(b));
+        Check("cow-copies-content", PageIs(p2.GetPage(nb), 222, "beta"));
+        Check("cow-idempotent", p2.PageForWrite(nb) == nb);
+        FillPage(p2.GetPage(nb), 444, "rewritten");
+        p2.SetRoot(nb);
+        Check("cow-commit", p2.Commit());
+        Check("cow-old-page-untouched", PageIs(p2.GetPage(b), 222, "beta"));
+        Check("cow-new-page-visible", PageIs(p2.GetPage(nb), 444, "rewritten"));
+
+        // 4. Rollback: the new pages are dropped and the snapshot stays where
+        //    the last commit left it -- nothing durable was touched.
+        int beforeTxn = p2.CommitId();
+        int beforePages = p2.PageCount();
+        p2.BeginWrite();
+        int doomed = p2.AllocPage();
+        FillPage(p2.GetPage(doomed), 666, "doomed");
+        p2.SetRoot(doomed);
+        p2.Rollback();
+        Check("rollback-not-in-write", !p2.InWrite());
+        Check("rollback-keeps-snapshot", p2.CommitId() == beforeTxn
+            && p2.PageCount() == beforePages && p2.RootId() == nb);
+
+        // 5. The page freed by the copy-on-write above is reclaimed once no
+        //    reader can reach that version, and the next allocation reuses it
+        //    instead of growing the file.
+        p2.BeginWrite();
+        Check("freelist-has-pages", p2.FreePages() > 0);
+        int grownTo = p2.PageCount();
         int reused = p2.AllocPage();
-        Check("freelist-reuse", reused == b);
-        FillPage(p2.GetPage(reused), 444, "recycled");
-        p2.MarkDirty(reused);
+        Check("freelist-reuse", reused < grownTo);
+        FillPage(p2.GetPage(reused), 555, "recycled");
+        p2.SetRoot(reused);
         p2.Commit();
+        Check("reuse-commit", PageIs(p2.GetPage(reused), 555, "recycled"));
+        Check("page-writes-counted", p2.PageWrites() > 0);
         p2.Close();
 
-        // 3. Cache eviction correctness: tiny cache, many pages.
+        // 6. Cache eviction correctness: many pages through a 4-slot cache.
         Pager p3 = Pager.Open(path, 4);
+        p3.BeginWrite();
         List<int> ids = new List<int>();
         int i = 0;
         while (i < 20) {
             int id = p3.AllocPage();
             ids.Add(id);
             FillPage(p3.GetPage(id), 1000 + i, "pg" + Convert.ToString(i));
-            p3.MarkDirty(id);
             i = i + 1;
         }
         Check("evict-commit", p3.Commit());
-        // Read them all back through the 4-slot cache.
         bool allOk = true;
         i = 0;
         while (i < 20) {
-            ByteBuffer q = p3.GetPage(ids[i]);
-            q.SeekRead(0);
-            if (q.ReadU32() != 1000 + i) { allOk = false; }
-            if (q.ReadString() != "pg" + Convert.ToString(i)) { allOk = false; }
+            if (!PageIs(p3.GetPage(ids[i]), 1000 + i, "pg" + Convert.ToString(i))) {
+                allOk = false;
+            }
             i = i + 1;
         }
         Check("evict-readback", allOk);
+        int liveTxn = p3.CommitId();
+        int liveRoot = p3.RootId();
         p3.Close();
 
-        // 4. Crash recovery: craft a WAL with a committed change to page 1
-        //    that never reached the main file.
-        ByteBuffer newPage = ByteBuffer.Alloc(4096);
-        FillPage(newPage, 999, "recovered");
-        PageFile wal = PageFile.Open(path + "-wal");
-        ByteBuffer hdr = ByteBuffer.Alloc(20);
-        hdr.WriteU32(1);                       // FRAME_PAGE
-        hdr.WriteU64(1);                       // pageId 1
-        hdr.WriteU32(4096);
-        hdr.WriteU32(newPage.Crc32(4096));
-        wal.Append(hdr.Raw(), 20);
-        wal.Append(newPage.Raw(), 4096);
-        hdr.Clear();
-        hdr.WriteU32(2);                       // FRAME_COMMIT
-        hdr.WriteU64(77);
-        hdr.WriteU32(0);
-        hdr.WriteU32(0);
-        wal.Append(hdr.Raw(), 20);
-        // Uncommitted tail: another frame with no commit record.
-        ByteBuffer junk = ByteBuffer.Alloc(4096);
-        FillPage(junk, 31337, "should-not-apply");
-        hdr.Clear();
-        hdr.WriteU32(1);
-        hdr.WriteU64(3);                       // pageId 3
-        hdr.WriteU32(4096);
-        hdr.WriteU32(junk.Crc32(4096));
-        wal.Append(hdr.Raw(), 20);
-        wal.Append(junk.Raw(), 4096);
-        wal.Sync();
-        wal.Close();
-
+        // 7. Atomic commit without a redo log: the two meta pages alternate by
+        //    transaction parity, so a commit that tore while writing the newest
+        //    meta page leaves the previous one intact and the database opens on
+        //    the version before it.
         Pager p4 = Pager.Open(path, 8);
-        ByteBuffer r1 = p4.GetPage(1);
-        r1.SeekRead(0);
-        Check("wal-recovered", r1.ReadU32() == 999 && r1.ReadString() == "recovered");
-        ByteBuffer r3 = p4.GetPage(3);
-        r3.SeekRead(0);
-        Check("wal-tail-discarded", r3.ReadU32() == 333 && r3.ReadString() == "gamma");
-        Check("wal-truncated", !File.Exists(path + "-wal") || File.GetSize(path + "-wal") == 0);
-
-        // 5. Grouped sync mode: durability comes from the WAL between syncs.
-        p4.SetSyncEvery(4);
-        int k = 0;
-        while (k < 6) {
-            ByteBuffer g = p4.GetPage(2);
-            FillPage(g, 5000 + k, "grouped");
-            p4.MarkDirty(2);
-            p4.Commit();
-            k = k + 1;
-        }
-        ByteBuffer gg = p4.GetPage(2);
-        gg.SeekRead(0);
-        Check("grouped-sync", gg.ReadU32() == 5005);
+        p4.BeginWrite();
+        int extra = p4.PageForWrite(liveRoot);
+        FillPage(p4.GetPage(extra), 777, "newest");
+        p4.SetRoot(extra);
+        p4.Commit();
+        int newestTxn = p4.CommitId();
+        Check("meta-alternates", (newestTxn & 1) != (liveTxn & 1));
         p4.Close();
 
+        ByteBuffer junk = ByteBuffer.Alloc(4096);
+        FillPage(junk, 31337, "torn-meta");
+        PageFile raw = PageFile.Open(path);
+        raw.WriteAt((newestTxn & 1) * 4096, junk.Raw(), 4096);
+        raw.Sync();
+        raw.Close();
+        junk.Free();
+
         Pager p5 = Pager.Open(path, 8);
-        ByteBuffer g2 = p5.GetPage(2);
-        g2.SeekRead(0);
-        Check("grouped-persisted", g2.ReadU32() == 5005 && g2.ReadString() == "grouped");
+        Check("torn-commit-discarded", p5.IsOpen()
+            && p5.CommitId() == liveTxn && p5.RootId() == liveRoot);
+        Check("previous-version-readable", PageIs(p5.GetPage(ids[0]), 1000, "pg0"));
         p5.Close();
 
-        newPage.Free();
-        junk.Free();
-        hdr.Free();
+        // 8. Grouped fsync: data pages are synced every N commits, the meta
+        //    page always -- so the newest committed version is still there.
+        Pager p6 = Pager.Open(path, 8);
+        p6.SetSyncEvery(4);
+        int root = p6.RootId();
+        int k = 0;
+        while (k < 6) {
+            p6.BeginWrite();
+            root = p6.PageForWrite(root);
+            FillPage(p6.GetPage(root), 5000 + k, "grouped");
+            p6.SetRoot(root);
+            p6.Commit();
+            k = k + 1;
+        }
+        Check("grouped-sync", PageIs(p6.GetPage(root), 5005, "grouped"));
+        p6.Close();
+
+        Pager p7 = Pager.Open(path, 8);
+        Check("grouped-persisted", p7.RootId() == root
+            && PageIs(p7.GetPage(p7.RootId()), 5005, "grouped"));
+        p7.Close();
+
         File.Delete(path);
-        File.Delete(path + "-wal");
+        File.Delete(path + "-lock");
         Console.WriteLine("pass: " + Convert.ToString(pass));
         Console.WriteLine("fail: " + Convert.ToString(fail));
     }
