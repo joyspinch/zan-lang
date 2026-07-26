@@ -20,6 +20,11 @@ configure_file(
     "${CMAKE_SOURCE_DIR}/cmake/zan_version.h.in"
     "${CMAKE_BINARY_DIR}/generated/zan_version.h" @ONLY)
 include_directories("${CMAKE_BINARY_DIR}/generated")
+# The standard library ships as source, so its copy of the version lives in the
+# source tree (System.ZanVersion; printed by the server start-up banner).
+configure_file(
+    "${CMAKE_SOURCE_DIR}/stdlib/System/ZanVersion.zan.in"
+    "${CMAKE_SOURCE_DIR}/stdlib/System/ZanVersion.zan" @ONLY)
 message(STATUS "Zan version: ${ZAN_VERSION}")
 
 # ---- Find LLVM ----
