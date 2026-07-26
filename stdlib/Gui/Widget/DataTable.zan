@@ -953,7 +953,7 @@ partial class DataTable {
                 st.aggMode.Add(cols[i].summary);
                 st.summaryText.Add("");
                 st.colHidden.Add(false);
-                st.colPinned.Add(cols[i].pinned);
+                st.colFreeze.Add(cols[i].freeze);
                 st.colOrder.Add(i);
                 if (cols[i].summary > 0) { st.showSummary = true; }
                 i = i + 1;
@@ -969,7 +969,7 @@ partial class DataTable {
         }
         while (st.selected.Count < src.RowCount()) { st.selected.Add(false); }
         while (st.colHidden.Count < cols.Count) { st.colHidden.Add(false); }
-        while (st.colPinned.Count < cols.Count) { st.colPinned.Add(false); }
+        while (st.colFreeze.Count < cols.Count) { st.colFreeze.Add(0); }
         while (st.filterRowText.Count < cols.Count) { st.filterRowText.Add(""); }
         // colOrder tracks every column exactly once; append any not yet listed.
         int co = 0;
@@ -1340,27 +1340,61 @@ partial class DataTable {
     }
 
     // ---------- column pinning / freeze ----------
+    // Freeze codes: 0 scrolls, 1 pinned to the left edge, 2 pinned to the right.
+    // A frozen column leaves the scrolling band entirely — it is not merely
+    // hoisted in the order, it is drawn in its own pass at a fixed x.
+
+    static void FreezeColumn(DataTableState st, int col, int side) {
+        if (col < 0 || col >= st.colFreeze.Count) { return; }
+        if (side < 0 || side > 2) { side = 0; }
+        st.colFreeze[col] = side;
+        st.dirty = true;
+    }
 
     static void PinColumn(DataTableState st, int col) {
-        if (col >= 0 && col < st.colPinned.Count) { st.colPinned[col] = true; }
+        DataTable.FreezeColumn(st, col, 1);
+    }
+
+    static void PinColumnRight(DataTableState st, int col) {
+        DataTable.FreezeColumn(st, col, 2);
     }
 
     static void UnpinColumn(DataTableState st, int col) {
-        if (col >= 0 && col < st.colPinned.Count) { st.colPinned[col] = false; }
+        DataTable.FreezeColumn(st, col, 0);
     }
 
+    /// Cycle a column through none → left → right → none, which is what a
+    /// single menu entry or a repeated shortcut needs.
     static void TogglePin(DataTableState st, int col) {
-        if (col >= 0 && col < st.colPinned.Count) { st.colPinned[col] = !st.colPinned[col]; }
+        if (col < 0 || col >= st.colFreeze.Count) { return; }
+        DataTable.FreezeColumn(st, col, (st.colFreeze[col] + 1) % 3);
     }
 
-    // Column indices in on-screen order: active group columns are hoisted to the
-    // front (right after the #/select gutter), then the remaining columns in
-    // their natural order. Hidden columns are excluded. Every layout pass
-    // (header / cells / hit-test / summary) iterates this so the grouped columns
-    // read as the row's leading key, DevExpress/ag-Grid style.
-    static bool IsPinned(DataTableState st, int col) {
-        return col >= 0 && col < st.colPinned.Count && st.colPinned[col];
+    static int FreezeOf(DataTableState st, int col) {
+        if (col < 0 || col >= st.colFreeze.Count) { return 0; }
+        return st.colFreeze[col];
     }
+
+    static bool IsPinned(DataTableState st, int col) {
+        return DataTable.FreezeOf(st, col) == 1;
+    }
+
+    static bool IsPinnedRight(DataTableState st, int col) {
+        return DataTable.FreezeOf(st, col) == 2;
+    }
+
+    /// Freeze a named column to a side (0 none, 1 left, 2 right). Unknown
+    /// field: no-op, like every other field-addressed operation.
+    static void FreezeField(DataTableState st, List<DataColumn> cols, string field, int side) {
+        int c = DataTable.Col(cols, field);
+        if (c >= 0) { DataTable.FreezeColumn(st, c, side); }
+    }
+
+    // Column indices in on-screen order: left-frozen first, then active group
+    // columns, then the scrolling columns, and finally the right-frozen ones.
+    // Hidden columns are excluded. Every layout pass (header / filter row /
+    // cells / hit-test / summary) iterates this one list, so they stay aligned
+    // by construction rather than by four copies of the same arithmetic.
 
     static List<int> VisibleOrder(DataTableState st, List<DataColumn> cols) {
         // Master sequence is the user column order (drag-reorderable); pinned and
@@ -1380,30 +1414,62 @@ partial class DataTable {
         }
 
         List<int> ord = new List<int>();
-        // 1) frozen (pinned-left) columns first, in user order.
+        // 1) frozen-left columns first, in user order.
         int p = 0;
         while (p < seq.Count) {
             int pc = seq[p];
             if (!st.colHidden[pc] && DataTable.IsPinned(st, pc) && ord.IndexOf(pc) < 0) { ord.Add(pc); }
             p = p + 1;
         }
-        // 2) active group columns (unless already pinned) hoisted next.
+        // 2) active group columns hoisted next — but never a right-frozen one:
+        // grouping by a column parked at the right edge would drag it back to
+        // the left, which is the opposite of what freezing it asked for.
         int g = 0;
         while (g < st.groupCols.Count) {
             int gc = st.groupCols[g];
-            if (gc >= 0 && gc < cols.Count && !st.colHidden[gc] && ord.IndexOf(gc) < 0) {
+            if (gc >= 0 && gc < cols.Count && !st.colHidden[gc]
+                && !DataTable.IsPinnedRight(st, gc) && ord.IndexOf(gc) < 0) {
                 ord.Add(gc);
             }
             g = g + 1;
         }
-        // 3) the remaining visible columns in user order.
+        // 3) the scrolling columns in user order.
         int i = 0;
         while (i < seq.Count) {
             int rc = seq[i];
-            if (!st.colHidden[rc] && ord.IndexOf(rc) < 0) { ord.Add(rc); }
+            if (!st.colHidden[rc] && !DataTable.IsPinnedRight(st, rc) && ord.IndexOf(rc) < 0) {
+                ord.Add(rc);
+            }
             i = i + 1;
         }
+        // 4) frozen-right columns last, so the order still reads left-to-right.
+        int q = 0;
+        while (q < seq.Count) {
+            int qc = seq[q];
+            if (!st.colHidden[qc] && DataTable.IsPinnedRight(st, qc) && ord.IndexOf(qc) < 0) {
+                ord.Add(qc);
+            }
+            q = q + 1;
+        }
         return ord;
+    }
+
+    /// How many entries at the front of `vorder` are frozen to the left edge.
+    /// The render passes slice the order into [left | scrolling | right] with
+    /// this and RightFrozenCount, so a column can never be drawn in two bands.
+    static int LeftFrozenCount(DataTableState st, List<int> vorder) {
+        int n = 0;
+        while (n < vorder.Count && DataTable.IsPinned(st, vorder[n])) { n = n + 1; }
+        return n;
+    }
+
+    /// How many entries at the end of `vorder` are frozen to the right edge.
+    static int RightFrozenCount(DataTableState st, List<int> vorder) {
+        int n = 0;
+        while (n < vorder.Count && DataTable.IsPinnedRight(st, vorder[vorder.Count - 1 - n])) {
+            n = n + 1;
+        }
+        return n;
     }
 
     // Reorder a column in the user column order: move `from` so it sits just
@@ -1424,7 +1490,7 @@ partial class DataTable {
         st.dirty = true;
     }
 
-    // Combined width of the frozen (pinned-left) columns at their natural size.
+    // Combined width of the frozen-left columns at their natural size.
     static int PinnedWidth(DataTableState st) {
         int w = 0;
         int i = 0;
@@ -1433,6 +1499,55 @@ partial class DataTable {
             i = i + 1;
         }
         return w;
+    }
+
+    // Combined width of the frozen-right columns.
+    static int PinnedRightWidth(DataTableState st) {
+        int w = 0;
+        int i = 0;
+        while (i < st.colWidths.Count) {
+            if (!st.colHidden[i] && DataTable.IsPinnedRight(st, i)) { w = w + st.colWidths[i]; }
+            i = i + 1;
+        }
+        return w;
+    }
+
+    /// Screen x of a column relative to the table's data origin, given the
+    /// scroll offset — the single place that knows a frozen column ignores
+    /// `scrollX` and a right-frozen one is measured back from the right edge.
+    ///
+    /// `dataViewW` is the width of the whole data region (gutters excluded).
+    /// Returns the offset from the data origin; the caller adds firstDataX.
+    static int ColumnOffset(DataTableState st, List<int> vorder, int col,
+                            int dataViewW, int scrollX) {
+        int nL = DataTable.LeftFrozenCount(st, vorder);
+        int nR = DataTable.RightFrozenCount(st, vorder);
+        int pos = vorder.IndexOf(col);
+        if (pos < 0) { return -1; }
+        int off = 0;
+        int i = 0;
+        if (pos < nL) {
+            while (i < pos) { off = off + st.dispW[vorder[i]]; i = i + 1; }
+            return off;
+        }
+        if (pos >= vorder.Count - nR) {
+            // Measured back from the right edge, so the band stays glued there
+            // however wide the table is.
+            int rw = 0;
+            i = vorder.Count - nR;
+            while (i < vorder.Count) { rw = rw + st.dispW[vorder[i]]; i = i + 1; }
+            off = dataViewW - rw;
+            i = vorder.Count - nR;
+            while (i < pos) { off = off + st.dispW[vorder[i]]; i = i + 1; }
+            return off;
+        }
+        // Scrolling band: starts after the left band and pans with scrollX.
+        i = 0;
+        while (i < nL) { off = off + st.dispW[vorder[i]]; i = i + 1; }
+        int mid = 0;
+        i = nL;
+        while (i < pos) { mid = mid + st.dispW[vorder[i]]; i = i + 1; }
+        return off + mid - scrollX;
     }
 
     // Widest rendered cell (title + data) for a column, used by auto-fit. Scans
@@ -2924,26 +3039,36 @@ partial class DataTable {
         }
     }
 
-    /// Pan horizontally so column `col` is fully visible. `vorder`/`dispW` give
-    /// the column's offset inside the scrolling data band.
+    /// Pan horizontally so column `col` is fully visible.
+    ///
+    /// A frozen column — either edge — is on screen by definition, so this is a
+    /// no-op for one. For a scrolling column the visible band is narrowed by
+    /// both frozen bands: scrolling it merely past `pinnedW` would still leave
+    /// it hidden underneath the right-hand band.
     static void ScrollColIntoView(DataTableState st, List<int> vorder, int col,
                                   int dataViewW, int pinnedW) {
+        int pos = vorder.IndexOf(col);
+        if (pos < 0) { return; }
+        int nL = DataTable.LeftFrozenCount(st, vorder);
+        int nR = DataTable.RightFrozenCount(st, vorder);
+        if (pos < nL || pos >= vorder.Count - nR) { return; }
+
+        // Offset of the column within the scrolling band alone, and the band's
+        // own width — the frozen columns are not part of either.
         int off = 0;
-        int i = 0;
-        int w = 0;
-        bool found = false;
-        while (i < vorder.Count) {
-            int cc = vorder[i];
-            if (cc == col) { w = st.dispW[cc]; found = true; i = vorder.Count; }
-            else { off = off + st.dispW[cc]; i = i + 1; }
-        }
-        if (!found) { return; }
-        // A pinned column is always on screen: it sits left of the scroll band.
-        if (off < pinnedW) { return; }
-        if (off < st.scrollX + pinnedW) {
-            st.scrollX = off - pinnedW;
-        } else if (off + w > st.scrollX + dataViewW) {
-            st.scrollX = off + w - dataViewW;
+        int i = nL;
+        while (i < pos) { off = off + st.dispW[vorder[i]]; i = i + 1; }
+        int w = st.dispW[col];
+        int rightW = 0;
+        i = vorder.Count - nR;
+        while (i < vorder.Count) { rightW = rightW + st.dispW[vorder[i]]; i = i + 1; }
+        int bandW = dataViewW - pinnedW - rightW;
+        if (bandW < 1) { bandW = 1; }
+
+        if (off < st.scrollX) {
+            st.scrollX = off;
+        } else if (off + w > st.scrollX + bandW) {
+            st.scrollX = off + w - bandW;
         }
         if (st.scrollX < 0) { st.scrollX = 0; }
     }

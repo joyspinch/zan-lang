@@ -18,6 +18,16 @@ class Program {
         return r;
     }
 
+    static DataRow Row5(string a, string b, string c, string d, string e) {
+        DataRow r = DataRow.Create();
+        r.Push(a);
+        r.Push(b);
+        r.Push(c);
+        r.Push(d);
+        r.Push(e);
+        return r;
+    }
+
     static DataRow Row2(string a, string b) {
         DataRow r = DataRow.Create();
         r.Push(a);
@@ -533,6 +543,7 @@ class Program {
         Program.StylerTests();
         Program.FieldTests();
         Program.RowEditTests();
+        Program.FreezeTests();
     }
 
     // Rejection counter for the CellValidating handler below. Static fields so
@@ -1109,6 +1120,138 @@ class Program {
         Console.WriteLine(DataTable.AppendRow(rost, rcols, ro) == -1);
         Console.WriteLine(DataTable.DeleteRow(rost, rcols, ro, 0) == false);
         Console.WriteLine(DataTable.UndoDepth(rost) == 0);  // nothing journalled
+    }
+
+    /// Column freezing. The grid draws the data region as three bands —
+    /// [frozen-left | scrolling | frozen-right] — and every layout pass slices
+    /// `vorder` with LeftFrozenCount/RightFrozenCount, so those counts and the
+    /// offsets derived from them are what has to hold.
+    static void FreezeTests() {
+        Console.WriteLine("-- freeze --");
+
+        List<DataColumn> zc = new List<DataColumn>();
+        zc.Add(DataColumn.Field(DataColumn.Pin(DataColumn.Text("Name", 100)), "name"));
+        zc.Add(DataColumn.Field(DataColumn.Text("A", 100), "a"));
+        zc.Add(DataColumn.Field(DataColumn.Text("B", 100), "b"));
+        zc.Add(DataColumn.Field(DataColumn.Text("C", 100), "c"));
+        zc.Add(DataColumn.Field(DataColumn.PinRight(DataColumn.Text("Total", 100)), "total"));
+        List<DataRow> zrows = new List<DataRow>();
+        zrows.Add(Program.Row5("Ann", "1", "2", "3", "6"));
+        zrows.Add(Program.Row5("Bob", "4", "5", "6", "15"));
+        RowListSource zsrc = RowListSource.Create(zrows);
+        DataTableState zst = DataTableState.Create();
+        DataTable.EnsureInit(zst, zc, zsrc);
+        DataTable.Recompute(zst, zc, zsrc);
+        // dispW mirrors colWidths; the render pass fills it, so do it here too.
+        zst.dispW.Clear();
+        int w = 0;
+        while (w < zc.Count) { zst.dispW.Add(100); w = w + 1; }
+
+        // ---- the builders seed the state's freeze flags ----
+        Console.WriteLine(DataTable.FreezeOf(zst, 0) == 1);
+        Console.WriteLine(DataTable.FreezeOf(zst, 1) == 0);
+        Console.WriteLine(DataTable.FreezeOf(zst, 4) == 2);
+        Console.WriteLine(DataTable.IsPinned(zst, 0));
+        Console.WriteLine(DataTable.IsPinnedRight(zst, 4));
+        Console.WriteLine(DataTable.IsPinned(zst, 4) == false);   // not both
+
+        // ---- order is [left | scrolling | right] ----
+        List<int> vo = DataTable.VisibleOrder(zst, zc);
+        Console.WriteLine(vo.Count == 5);
+        Console.WriteLine(vo[0] == 0);                            // pinned left
+        Console.WriteLine(vo[4] == 4);                            // pinned right
+        Console.WriteLine(DataTable.LeftFrozenCount(zst, vo) == 1);
+        Console.WriteLine(DataTable.RightFrozenCount(zst, vo) == 1);
+        Console.WriteLine(DataTable.PinnedWidth(zst) == 100);
+        Console.WriteLine(DataTable.PinnedRightWidth(zst) == 100);
+
+        // ---- offsets: only the middle band moves with scrollX ----
+        // A 350-wide data region: left band 0..100, middle 100..250, right
+        // band 250..350.
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 0, 350, 0) == 0);
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 1, 350, 0) == 100);
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 4, 350, 0) == 250);
+        // scroll the middle by 60: the frozen columns do not budge
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 0, 350, 60) == 0);
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 1, 350, 60) == 40);
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 2, 350, 60) == 140);
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 4, 350, 60) == 250);
+        // a wider region pushes the right band out, not the left
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 0, 500, 0) == 0);
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 4, 500, 0) == 400);
+        // an unknown column has no offset rather than a plausible-looking 0
+        Console.WriteLine(DataTable.ColumnOffset(zst, vo, 99, 350, 0) == -1);
+
+        // ---- scrolling into view ----
+        // A frozen column is on screen by definition: asking must not scroll.
+        zst.scrollX = 40;
+        DataTable.ScrollColIntoView(zst, vo, 0, 350, 100);
+        Console.WriteLine(zst.scrollX == 40);
+        DataTable.ScrollColIntoView(zst, vo, 4, 350, 100);
+        Console.WriteLine(zst.scrollX == 40);
+        // Column 3 sits at 200..300 within the 150-wide middle band, so it
+        // needs scrollX 150 — NOT the 50 a full-width view would have given,
+        // which would have left it hidden under the right-hand band.
+        zst.scrollX = 0;
+        DataTable.ScrollColIntoView(zst, vo, 3, 350, 100);
+        Console.WriteLine(zst.scrollX == 150);
+        // scrolling back to a column left of the window
+        DataTable.ScrollColIntoView(zst, vo, 1, 350, 100);
+        Console.WriteLine(zst.scrollX == 0);
+
+        // ---- freezing is a three-way choice, and one side at a time ----
+        DataTable.PinColumnRight(zst, 1);
+        Console.WriteLine(DataTable.FreezeOf(zst, 1) == 2);
+        List<int> vo2 = DataTable.VisibleOrder(zst, zc);
+        Console.WriteLine(DataTable.RightFrozenCount(zst, vo2) == 2);
+        Console.WriteLine(vo2[0] == 0);                           // still leftmost
+        Console.WriteLine(vo2[1] == 2);                           // b slid left
+        Console.WriteLine(vo2[3] == 1);                           // a joined the right band
+        Console.WriteLine(vo2[4] == 4);
+        // pinning it left moves it out of the right band, it doesn't add it to both
+        DataTable.PinColumn(zst, 1);
+        List<int> vo3 = DataTable.VisibleOrder(zst, zc);
+        Console.WriteLine(DataTable.LeftFrozenCount(zst, vo3) == 2);
+        Console.WriteLine(DataTable.RightFrozenCount(zst, vo3) == 1);
+        DataTable.UnpinColumn(zst, 1);
+        Console.WriteLine(DataTable.FreezeOf(zst, 1) == 0);
+
+        // TogglePin cycles none -> left -> right -> none
+        DataTable.TogglePin(zst, 2);
+        Console.WriteLine(DataTable.FreezeOf(zst, 2) == 1);
+        DataTable.TogglePin(zst, 2);
+        Console.WriteLine(DataTable.FreezeOf(zst, 2) == 2);
+        DataTable.TogglePin(zst, 2);
+        Console.WriteLine(DataTable.FreezeOf(zst, 2) == 0);
+
+        // ---- grouping must not drag a right-frozen column back to the left ----
+        DataTable.GroupBy(zst, 4);
+        List<int> vo4 = DataTable.VisibleOrder(zst, zc);
+        Console.WriteLine(vo4[vo4.Count - 1] == 4);   // stayed at the right edge
+        Console.WriteLine(DataTable.RightFrozenCount(zst, vo4) == 1);
+        DataTable.Ungroup(zst);
+
+        // ---- a hidden frozen column leaves its band entirely ----
+        zst.colHidden[4] = true;
+        List<int> vo5 = DataTable.VisibleOrder(zst, zc);
+        Console.WriteLine(vo5.Count == 4);
+        Console.WriteLine(DataTable.RightFrozenCount(zst, vo5) == 0);
+        // and its width no longer reserves space
+        Console.WriteLine(DataTable.PinnedRightWidth(zst) == 0);
+        zst.colHidden[4] = false;
+
+        // ---- field-addressed freezing ----
+        DataTable.FreezeField(zst, zc, "b", 2);
+        Console.WriteLine(DataTable.FreezeOf(zst, 2) == 2);
+        DataTable.FreezeField(zst, zc, "b", 0);
+        DataTable.FreezeField(zst, zc, "nope", 1);      // unknown: no-op
+        Console.WriteLine(DataTable.FreezeOf(zst, 0) == 1);   // untouched
+        // an out-of-range side is coerced rather than stored
+        DataTable.FreezeColumn(zst, 2, 7);
+        Console.WriteLine(DataTable.FreezeOf(zst, 2) == 0);
+        // an out-of-range column is not a crash
+        DataTable.FreezeColumn(zst, 99, 1);
+        Console.WriteLine(DataTable.FreezeOf(zst, 99) == 0);
     }
 }
 

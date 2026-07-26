@@ -157,6 +157,38 @@ partial class DataTable {
         c.DrawText(tx, ty, shown, color, fs);
     }
 
+    // ---------- frozen-band geometry ----------
+    // The data region is three side-by-side strips: 0 frozen-left, 1 scrolling,
+    // 2 frozen-right. Every pass asks these three for its strip rather than
+    // recomputing the arithmetic, so the header, filter row, cells and summary
+    // cannot drift apart.
+
+    static int BandLeft(int band, int firstDataX, int bandX, int rightX) {
+        if (band == 0) { return firstDataX; }
+        if (band == 2) { return rightX; }
+        return bandX;
+    }
+
+    static int BandRight(int band, int firstDataX, int bandX, int bandW,
+                         int rightX, int pinnedW, int pinnedRW, int clipRight) {
+        if (band == 0) { return firstDataX + pinnedW; }
+        if (band == 2) { return rightX + pinnedRW; }
+        int r = bandX + bandW;
+        if (r > clipRight) { r = clipRight; }
+        return r;
+    }
+
+    static void PushBandClip(Canvas c, int band, int firstDataX, int bandX, int bandW,
+                             int rightX, int pinnedW, int pinnedRW,
+                             int y, int h, int clipRight) {
+        int l = DataTable.BandLeft(band, firstDataX, bandX, rightX);
+        int r = DataTable.BandRight(band, firstDataX, bandX, bandW, rightX,
+                                    pinnedW, pinnedRW, clipRight);
+        int w = r - l;
+        if (w < 0) { w = 0; }
+        c.PushClip(l, y, w, h);
+    }
+
     // ---------- main render ----------
 
     /// Convenience overload: render an in-memory List<DataRow> (wraps it in a
@@ -219,11 +251,6 @@ partial class DataTable {
         // hoisted to the front of the visible order.
         int availData = clipRight - (x + numW + selW);
         if (availData < app.Scale(80)) { availData = app.Scale(80); }
-        int pinnedW = DataTable.PinnedWidth(st);
-        int flexNatW = dataW - pinnedW;                 // unpinned natural total
-        int flexAvail = availData - pinnedW;            // space left for unpinned
-        int minFlex = app.Scale(40);
-        if (flexAvail < minFlex) { flexAvail = minFlex; }
         st.dispW.Clear();
         int di = 0;
         while (di < st.colWidths.Count) {
@@ -231,17 +258,62 @@ partial class DataTable {
             else { st.dispW.Add(st.colWidths[di]); }
             di = di + 1;
         }
-        int maxScrollX = dataW - availData;
-        if (maxScrollX < 0) { maxScrollX = 0; }
-        if (st.scrollX > maxScrollX) { st.scrollX = maxScrollX; }
-        if (st.scrollX < 0) { st.scrollX = 0; }
         int firstDataX = x + numW + selW;
         int dataViewW = clipRight - firstDataX;
 
-        // Column display order (group columns hoisted to the front). Computed
-        // once and shared by every layout pass so header / cells / hit-test /
-        // summary stay perfectly aligned.
+        // Column display order, sliced into three bands: [frozen-left |
+        // scrolling | frozen-right]. Computed once and shared by every layout
+        // pass so header / filter row / cells / hit-test / summary stay aligned
+        // by construction.
         List<int> vorder = DataTable.VisibleOrder(st, cols);
+        int nLeft = DataTable.LeftFrozenCount(st, vorder);
+        int nRight = DataTable.RightFrozenCount(st, vorder);
+        int pinnedW = DataTable.PinnedWidth(st);
+        int pinnedRW = DataTable.PinnedRightWidth(st);
+        // The frozen bands may not eat the whole table: past that point there
+        // would be nothing left to scroll and the middle would be unreachable,
+        // so the right band yields first (it is the one the user just added).
+        int minBand = app.Scale(80);
+        while (nRight > 0 && dataViewW - pinnedW - pinnedRW < minBand) {
+            pinnedRW = pinnedRW - st.dispW[vorder[vorder.Count - nRight]];
+            nRight = nRight - 1;
+        }
+        while (nLeft > 1 && dataViewW - pinnedW - pinnedRW < minBand) {
+            nLeft = nLeft - 1;
+            pinnedW = pinnedW - st.dispW[vorder[nLeft]];
+        }
+        // Only the middle band scrolls, so only its overflow sets the range.
+        int bandX = firstDataX + pinnedW;                  // left edge of the middle
+        int bandW = dataViewW - pinnedW - pinnedRW;        // its width
+        if (bandW < 1) { bandW = 1; }
+        int bandNatW = 0;
+        int bi = nLeft;
+        while (bi < vorder.Count - nRight) { bandNatW = bandNatW + st.dispW[vorder[bi]]; bi = bi + 1; }
+        int maxScrollX = bandNatW - bandW;
+        if (maxScrollX < 0) { maxScrollX = 0; }
+        if (st.scrollX > maxScrollX) { st.scrollX = maxScrollX; }
+        if (st.scrollX < 0) { st.scrollX = 0; }
+        int rightX = firstDataX + dataViewW - pinnedRW;    // left edge of the right band
+
+        // Screen x and owning band for every entry of `vorder`, computed once.
+        // Each band is clipped to its own strip, so a scrolled middle column can
+        // never paint (or register a hit region) over a frozen one — which makes
+        // the drawing order between the bands irrelevant, and keeps all four
+        // passes below to a single loop each.
+        List<int> colX = new List<int>();
+        List<int> colBand = new List<int>();
+        int cxAcc = firstDataX;
+        int bpos = 0;
+        while (bpos < vorder.Count) {
+            if (bpos == nLeft) { cxAcc = bandX - st.scrollX; }
+            if (bpos == vorder.Count - nRight) { cxAcc = rightX; }
+            colX.Add(cxAcc);
+            if (bpos < nLeft) { colBand.Add(0); }
+            else if (bpos >= vorder.Count - nRight) { colBand.Add(2); }
+            else { colBand.Add(1); }
+            cxAcc = cxAcc + st.dispW[vorder[bpos]];
+            bpos = bpos + 1;
+        }
 
         // outer border
         c.FillRoundRect(x, y, viewW, viewH, t.borderRadiusMedium, t.bgPrimary);
@@ -294,13 +366,23 @@ partial class DataTable {
         int dropVisLocal = -1;
         int dropX = -1;
 
-        c.PushClip(firstDataX, y, dataViewW, headerH);
         int hoi = 0;
-        int hcl = firstDataX - st.scrollX;
+        int hcl = firstDataX;
+        int hBand = -1;
         while (hoi < vorder.Count) {
             int i = vorder[hoi];
             DataColumn col = cols[i];
             int cw = st.dispW[i];
+            // Each band gets its own clip strip, entered when the band changes.
+            // The middle is clipped between the two frozen bands, so a panned
+            // column is cut off at their edges instead of drawing over them.
+            if (colBand[hoi] != hBand) {
+                if (hBand >= 0) { c.PopClip(); }
+                hBand = colBand[hoi];
+                DataTable.PushBandClip(c, hBand, firstDataX, bandX, bandW, rightX,
+                                       pinnedW, pinnedRW, y, headerH, clipRight);
+            }
+            hcl = colX[hoi];
             // Ids are allocated for every column — visible or not — so the id
             // sequence stays identical across frames while panning; otherwise
             // widgets registered after the header (scrollbars) would change id
@@ -309,16 +391,21 @@ partial class DataTable {
             int menuId = -1;
             if (col.filterable || col.sortable) { menuId = app.focus.AllocId(); }
             int rzId = app.focus.AllocId();
-            if (hcl + cw <= firstDataX || hcl >= clipRight) {
-                hcl = hcl + cw;
+            // Clip the hit region to the band as well as the viewport: a middle
+            // column scrolled under the frozen band must not stay clickable
+            // there, or the user would hit a column they cannot see.
+            int bandL = DataTable.BandLeft(colBand[hoi], firstDataX, bandX, rightX);
+            int bandR = DataTable.BandRight(colBand[hoi], firstDataX, bandX, bandW,
+                                            rightX, pinnedW, pinnedRW, clipRight);
+            if (hcl + cw <= bandL || hcl >= bandR) {
                 hoi = hoi + 1;
             } else {
             hx = hcl;
             // visible slice of this column (for hit regions / hover fill)
             int visX = hx;
-            if (visX < firstDataX) { visX = firstDataX; }
+            if (visX < bandL) { visX = bandL; }
             int visR = hx + cw;
-            if (visR > clipRight) { visR = clipRight; }
+            if (visR > bandR) { visR = bandR; }
             int visW = visR - visX;
             // drag-reorder drop slot: first column whose left half contains the
             // pointer becomes the insertion target.
@@ -462,11 +549,10 @@ partial class DataTable {
             }
 
             c.FillRect(hx + cw, y, 1, headerH, gridColor);
-            hcl = hcl + cw;
             hoi = hoi + 1;
             }
         }
-        c.PopClip();
+        if (hBand >= 0) { c.PopClip(); }
         c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
 
         // Column drag feedback + drop: a 2px accent line marks the insertion
@@ -559,13 +645,22 @@ partial class DataTable {
                 Icon.DrawCenteredIn(c, "filter", x, fry, numW, filterRowH, app.Scale(12), t.textTertiary);
             }
 
-            c.PushClip(firstDataX, fry, dataViewW, filterRowH);
             int froi = 0;
-            int frcl = firstDataX - st.scrollX;
+            int frBand = -1;
             while (froi < vorder.Count) {
                 int fri = vorder[froi];
                 int fcw = st.dispW[fri];
-                if (frcl + fcw > firstDataX && frcl < clipRight) {
+                if (colBand[froi] != frBand) {
+                    if (frBand >= 0) { c.PopClip(); }
+                    frBand = colBand[froi];
+                    DataTable.PushBandClip(c, frBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, fry, filterRowH, clipRight);
+                }
+                int frcl = colX[froi];
+                int frBandL = DataTable.BandLeft(colBand[froi], firstDataX, bandX, rightX);
+                int frBandR = DataTable.BandRight(colBand[froi], firstDataX, bandX, bandW,
+                                                  rightX, pinnedW, pinnedRW, clipRight);
+                if (frcl + fcw > frBandL && frcl < frBandR) {
                     int pad2 = t.paddingSmall;
                     bool frFoc = st.filterRowFocusCol == fri;
                     string frTxt = st.filterRowText[fri];
@@ -573,8 +668,8 @@ partial class DataTable {
                     int frid2 = app.focus.AllocId();
                     int frX = frcl;
                     int frW = fcw;
-                    if (frX < firstDataX) { frW = frW - (firstDataX - frX); frX = firstDataX; }
-                    if (frX + frW > clipRight) { frW = clipRight - frX; }
+                    if (frX < frBandL) { frW = frW - (frBandL - frX); frX = frBandL; }
+                    if (frX + frW > frBandR) { frW = frBandR - frX; }
                     bool frAct = frTxt.Length > 0 || frFoc;
                     int frBg = t.bgPrimary;
                     if (frAct) { frBg = t.bgSecondary; }
@@ -609,10 +704,9 @@ partial class DataTable {
                         app.RequestRedraw();
                     }
                 }
-                frcl = frcl + fcw;
                 froi = froi + 1;
             }
-            c.PopClip();
+            if (frBand >= 0) { c.PopClip(); }
             c.FillRect(x + 1, fry + filterRowH - 1, viewW - 2, 1, gridColor);
         }
 
@@ -721,13 +815,22 @@ partial class DataTable {
                 cx2 = cx2 + selW;
             }
 
-            c.PushClip(firstDataX, ry, dataViewW, rowH);
             int coi = 0;
-            int ccl = firstDataX - st.scrollX;
-            while (coi < vorder.Count && ccl < clipRight) {
+            int cBand = -1;
+            while (coi < vorder.Count) {
                 int cc = vorder[coi];
                 int cw = st.dispW[cc];
-                if (ccl + cw > firstDataX) {
+                if (colBand[coi] != cBand) {
+                    if (cBand >= 0) { c.PopClip(); }
+                    cBand = colBand[coi];
+                    DataTable.PushBandClip(c, cBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, ry, rowH, clipRight);
+                }
+                int ccl = colX[coi];
+                int cBandL = DataTable.BandLeft(colBand[coi], firstDataX, bandX, rightX);
+                int cBandR = DataTable.BandRight(colBand[coi], firstDataX, bandX, bandW,
+                                                 rightX, pinnedW, pinnedRW, clipRight);
+                if (ccl + cw > cBandL && ccl < cBandR) {
                     // A per-cell style background paints under the range
                     // highlight, so a selected cell still reads as selected.
                     int cellBg = DataTable.CellBackground(st, src, rowIdx, cc);
@@ -766,10 +869,9 @@ partial class DataTable {
                         }
                     }
                 }
-                ccl = ccl + cw;
                 coi = coi + 1;
             }
-            c.PopClip();
+            if (cBand >= 0) { c.PopClip(); }
 
             c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
             r = r + 1;
@@ -812,13 +914,15 @@ partial class DataTable {
             }
         }
 
-        // ---------------- freeze boundary ----------------
-        // A subtle accent divider marks where the frozen (pinned) columns end.
-        if (pinnedW > 0) {
-            int freezeX = x + numW + selW + pinnedW;
-            if (freezeX < clipRight) {
-                c.FillRect(freezeX, y, app.Scale(2), bodyTop + bodyH - y, t.borderPrimary);
-            }
+        // ---------------- freeze boundaries ----------------
+        // A divider on the inner edge of each frozen band marks where the
+        // scrolling region begins and ends, so the columns that stay put read
+        // as deliberately parked rather than as a rendering glitch.
+        if (pinnedW > 0 && bandX < clipRight) {
+            c.FillRect(bandX, y, app.Scale(2), bodyTop + bodyH - y, t.borderPrimary);
+        }
+        if (pinnedRW > 0 && rightX > firstDataX) {
+            c.FillRect(rightX - app.Scale(2), y, app.Scale(2), bodyTop + bodyH - y, t.borderPrimary);
         }
 
         // ---------------- row-drag drop indicator ----------------
@@ -848,13 +952,21 @@ partial class DataTable {
         }
         int ptrCol = -1;
         if (ptrOi >= 0 && app.mouseX >= firstDataX) {
-            int colL = firstDataX - st.scrollX;
-            int pci = 0;
-            while (pci < vorder.Count) {
+            // Scanned back-to-front so the frozen bands win: a middle column
+            // scrolled underneath one occupies the same x, and the column the
+            // user can actually see is the one they meant to hit.
+            int pci = vorder.Count - 1;
+            while (pci >= 0) {
                 int cci = vorder[pci];
-                int cwv = st.dispW[cci];
-                if (app.mouseX >= colL && app.mouseX < colL + cwv) { ptrCol = cci; pci = vorder.Count; }
-                else { colL = colL + cwv; pci = pci + 1; }
+                int colL = colX[pci];
+                int colR = colL + st.dispW[cci];
+                int pbL = DataTable.BandLeft(colBand[pci], firstDataX, bandX, rightX);
+                int pbR = DataTable.BandRight(colBand[pci], firstDataX, bandX, bandW,
+                                              rightX, pinnedW, pinnedRW, clipRight);
+                if (colL < pbL) { colL = pbL; }
+                if (colR > pbR) { colR = pbR; }
+                if (app.mouseX >= colL && app.mouseX < colR) { ptrCol = cci; pci = -1; }
+                else { pci = pci - 1; }
             }
         }
         int ek = app.window.EventKind();
@@ -1200,13 +1312,22 @@ partial class DataTable {
             if (st.showRowNum || st.showSelect) {
                 c.DrawTextCentered(x, sumY, numW + selW, summaryH, "Σ", t.textTertiary, t.fontSizeSmall);
             }
-            c.PushClip(firstDataX, sumY, dataViewW, summaryH);
             int soi = 0;
-            sx = firstDataX - st.scrollX;
-            while (soi < vorder.Count && sx < clipRight) {
+            int sBand = -1;
+            while (soi < vorder.Count) {
                 int sc = vorder[soi];
                 int cw = st.dispW[sc];
-                if (sx + cw > firstDataX) {
+                if (colBand[soi] != sBand) {
+                    if (sBand >= 0) { c.PopClip(); }
+                    sBand = colBand[soi];
+                    DataTable.PushBandClip(c, sBand, firstDataX, bandX, bandW, rightX,
+                                           pinnedW, pinnedRW, sumY, summaryH, clipRight);
+                }
+                sx = colX[soi];
+                int sBandL = DataTable.BandLeft(colBand[soi], firstDataX, bandX, rightX);
+                int sBandR = DataTable.BandRight(colBand[soi], firstDataX, bandX, bandW,
+                                                 rightX, pinnedW, pinnedRW, clipRight);
+                if (sx + cw > sBandL && sx < sBandR) {
                     string stxt = "";
                     if (sc < st.summaryText.Count) { stxt = st.summaryText[sc]; }
                     if (stxt.Length > 0) {
@@ -1220,10 +1341,9 @@ partial class DataTable {
                         c.DrawText(tx, ty, shown, t.textPrimary, fs);
                     }
                 }
-                sx = sx + cw;
                 soi = soi + 1;
             }
-            c.PopClip();
+            if (sBand >= 0) { c.PopClip(); }
         }
 
         // ---------------- pager footer (reuses the Pagination widget) ----------------
@@ -1337,9 +1457,12 @@ partial class DataTable {
         if (maxScrollX > 0) {
             int hbH = app.Scale(8);
             int hbY = bodyTop + bodyH - hbH - app.Scale(2);
-            int htrackX = firstDataX + app.Scale(2);
-            int htrackW = dataViewW - app.Scale(4);
-            int thumbW = htrackW * availData / dataW;
+            // The bar spans only the band that actually scrolls, so its thumb
+            // stays a truthful picture of where the middle is.
+            int htrackX = bandX + app.Scale(2);
+            int htrackW = bandW - app.Scale(4);
+            if (htrackW < app.Scale(24)) { htrackW = app.Scale(24); }
+            int thumbW = htrackW * bandW / bandNatW;
             if (thumbW < app.Scale(24)) { thumbW = app.Scale(24); }
             int thumbX = htrackX + (htrackW - thumbW) * st.scrollX / maxScrollX;
             int hbId = app.focus.AllocId();
@@ -1772,7 +1895,7 @@ partial class DataTable {
         if (canClear) { nItems = nItems + 1; }
         nItems = nItems + 1;                  // group by this column
         if (st.groupCols.Count > 0) { nItems = nItems + 1; }  // ungroup all
-        nItems = nItems + 1;                  // pin / unpin column
+        nItems = nItems + 2;                  // freeze left / freeze right
         nItems = nItems + 1;                  // hide column
         if (anyHidden) { nItems = nItems + 1; }
         if (canAgg) { nItems = nItems + 6; }  // sum/avg/min/max/count/none total
@@ -1859,11 +1982,26 @@ partial class DataTable {
 
         c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, t.divider);
         iy = iy + sepH;
-        string pinLbl = "冻结此列  Freeze Column";
-        if (DataTable.IsPinned(st, col)) { pinLbl = "取消冻结  Unfreeze Column"; }
+        // Two explicit entries rather than one cycling toggle: which edge a
+        // column is frozen to is a choice, and a menu that makes the user click
+        // twice to guess their way to the right one is worse than showing both.
+        int frz = DataTable.FreezeOf(st, col);
+        string pinLbl = "冻结到左侧  Freeze Left";
+        if (frz == 1) { pinLbl = "取消冻结  Unfreeze"; }
         DataTable.CtxItem(app, mx, iy, mw, ih, pinLbl, "");
         if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
-            DataTable.TogglePin(st, col);
+            if (frz == 1) { DataTable.UnpinColumn(st, col); }
+            else { DataTable.PinColumn(st, col); }
+            st.hitCol = col; st.ColumnResize.Raise();
+            st.hdrCtxOpen = false; app.RequestRedraw();
+        }
+        iy = iy + ih;
+        string pinRLbl = "冻结到右侧  Freeze Right";
+        if (frz == 2) { pinRLbl = "取消冻结  Unfreeze"; }
+        DataTable.CtxItem(app, mx, iy, mw, ih, pinRLbl, "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            if (frz == 2) { DataTable.UnpinColumn(st, col); }
+            else { DataTable.PinColumnRight(st, col); }
             st.hitCol = col; st.ColumnResize.Raise();
             st.hdrCtxOpen = false; app.RequestRedraw();
         }
